@@ -1,16 +1,17 @@
 import hashlib
-import time
-import numpy as np
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
-from dwave.system import DWaveSampler
-from dwave.samplers import SimulatedAnnealingSampler
 import os
-from dotenv import load_dotenv
-import threading
 import queue
+import threading
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
 import matplotlib.pyplot as plt
+import numpy as np
 import seaborn as sns
+from dotenv import load_dotenv
+from dwave.samplers import SimulatedAnnealingSampler
+from dwave.system import DWaveSampler
 
 # Load environment variables
 load_dotenv()
@@ -18,6 +19,7 @@ load_dotenv()
 
 @dataclass
 class MiningResult:
+    miner_id: str
     miner_type: str
     nonce: int
     solutions: List[List[int]]
@@ -38,6 +40,7 @@ class Block:
     energy: Optional[float] = None
     diversity: Optional[float] = None  # Average Hamming distance
     num_valid_solutions: Optional[int] = None
+    miner_id: Optional[str] = None  # e.g., QPU-1, SA-2
     miner_type: Optional[str] = None  # QPU or SA
     mining_time: Optional[float] = None
     hash: Optional[str] = None
@@ -54,15 +57,23 @@ class Block:
 
 
 class Miner:
-    def __init__(self, miner_type: str, sampler, difficulty_energy: float, 
+    def __init__(self, miner_id: str, miner_type: str, sampler, difficulty_energy: float, 
                  min_diversity: float, min_solutions: int):
-        """Initialize a miner."""
+        """
+        Initialize a miner with unique ID.
+        
+        Note: For GPU miners, integrate gpu_benchmark_modal.py which uses Modal Labs
+        for cost-effective GPU acceleration. Modal provides $30/month free credits.
+        """
+        self.miner_id = miner_id
         self.miner_type = miner_type
         self.sampler = sampler
         self.difficulty_energy = difficulty_energy
         self.min_diversity = min_diversity
         self.min_solutions = min_solutions
         self.mining = False
+        self.blocks_won = 0
+        self.total_rewards = 0
         
     def calculate_hamming_distance(self, s1: List[int], s2: List[int]) -> int:
         """Calculate Hamming distance between two binary strings."""
@@ -111,12 +122,12 @@ class Miner:
         nonce = 0
         start_time = time.time()
         
-        print(f"{self.miner_type} miner started...")
+        print(f"{self.miner_id} started...")
         
         while self.mining and not stop_event.is_set():
             # Check if we should stop before generating model
             if stop_event.is_set():
-                print(f"{self.miner_type} miner interrupted")
+                print(f"{self.miner_id} interrupted")
                 return
                 
             # Generate quantum model
@@ -124,7 +135,7 @@ class Miner:
             
             # Check again before sampling
             if stop_event.is_set():
-                print(f"{self.miner_type} miner interrupted")
+                print(f"{self.miner_id} interrupted")
                 return
             
             # Sample from quantum/simulated annealer
@@ -136,15 +147,15 @@ class Miner:
                     sampleset = self.sampler.sample_ising(h, J, num_reads=200, num_sweeps=2048)
             except Exception as e:
                 if stop_event.is_set():
-                    print(f"{self.miner_type} miner interrupted during sampling")
+                    print(f"{self.miner_id} interrupted during sampling")
                     return
-                print(f"{self.miner_type} sampling error: {e}")
+                print(f"{self.miner_id} sampling error: {e}")
                 nonce += 1
                 continue
             
             # Check if interrupted before processing results
             if stop_event.is_set():
-                print(f"{self.miner_type} miner interrupted")
+                print(f"{self.miner_id} interrupted")
                 return
                 
             # Find all solutions meeting energy threshold
@@ -170,6 +181,7 @@ class Miner:
                     min_energy = float(np.min(sampleset.record.energy[valid_indices]))
                     
                     result = MiningResult(
+                        miner_id=self.miner_id,
                         miner_type=self.miner_type,
                         nonce=nonce,
                         solutions=valid_solutions[:self.min_solutions],
@@ -180,7 +192,7 @@ class Miner:
                     )
                     
                     result_queue.put(result)
-                    print(f"{self.miner_type} found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
+                    print(f"{self.miner_id} found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
                     return
             
             nonce += 1
@@ -188,18 +200,20 @@ class Miner:
             # Progress update
             if nonce % 10 == 0 and len(sampleset.record.energy) > 0:
                 min_energy = float(np.min(sampleset.record.energy))
-                print(f"{self.miner_type} - Nonce: {nonce}, Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}")
+                print(f"{self.miner_id} - Nonce: {nonce}, Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}")
         
         # If we exit the loop due to stop event
         if stop_event.is_set():
-            print(f"{self.miner_type} miner stopped")
+            print(f"{self.miner_id} stopped")
 
 
 class QuantumBlockchain:
     def __init__(self, competitive: bool = False, 
                  base_difficulty_energy: float = -1200.0,
-                 base_min_diversity: float = 0.50,
-                 base_min_solutions: int = 30):
+                 base_min_diversity: float = 0.45,
+                 base_min_solutions: int = 20,
+                 num_qpu_miners: int = 1,
+                 num_sa_miners: int = 1):
         """
         Initialize the quantum blockchain.
         
@@ -208,10 +222,14 @@ class QuantumBlockchain:
             base_difficulty_energy: Base energy threshold for all miners
             base_min_diversity: Base diversity requirement for all miners
             base_min_solutions: Base minimum solutions requirement for all miners
+            num_qpu_miners: Number of QPU miners to create (competitive mode)
+            num_sa_miners: Number of SA miners to create (competitive mode)
         """
         self.chain: List[Block] = []
         self.competitive = competitive
-        self.mining_stats = {"QPU": 0, "SA": 0}
+        self.mining_stats = {}  # Will track all miners
+        self.num_qpu_miners = num_qpu_miners
+        self.num_sa_miners = num_sa_miners
         
         # Base difficulty parameters
         self.base_difficulty_energy = base_difficulty_energy
@@ -236,38 +254,54 @@ class QuantumBlockchain:
         if competitive:
             # Initialize competitive miners with SAME parameters
             self.miners = []
+            self.miners_by_id = {}  # Track miners by ID
             
-            # Try to initialize QPU miner
+            # Try to initialize QPU miners
             try:
                 qpu_sampler = DWaveSampler()
-                print(f"QPU miner connected to: {qpu_sampler.properties['chip_id']}")
-                self.qpu_miner = Miner(
-                    "QPU", 
-                    qpu_sampler,
+                print(f"QPU connected to: {qpu_sampler.properties['chip_id']}")
+                
+                # Create multiple QPU miners sharing the same sampler
+                for i in range(self.num_qpu_miners):
+                    miner_id = f"QPU-{i+1}"
+                    qpu_miner = Miner(
+                        miner_id,
+                        "QPU", 
+                        qpu_sampler,
+                        difficulty_energy=self.difficulty_energy,
+                        min_diversity=self.min_diversity,
+                        min_solutions=self.min_solutions
+                    )
+                    self.miners.append(qpu_miner)
+                    self.miners_by_id[miner_id] = qpu_miner
+                print(f"✓ Initialized {self.num_qpu_miners} QPU miner(s)")
+            except Exception as e:
+                print(f"QPU not available: {e}")
+                
+            # Initialize SA miners with SAME parameters
+            for i in range(self.num_sa_miners):
+                miner_id = f"SA-{i+1}"
+                sa_sampler = SimulatedAnnealingSampler()
+                sa_miner = Miner(
+                    miner_id,
+                    "SA",
+                    sa_sampler,
                     difficulty_energy=self.difficulty_energy,
                     min_diversity=self.min_diversity,
                     min_solutions=self.min_solutions
                 )
-                self.miners.append(self.qpu_miner)
-            except Exception as e:
-                print(f"QPU not available: {e}")
-                self.qpu_miner = None
-                
-            # Initialize SA miner with SAME parameters
-            sa_sampler = SimulatedAnnealingSampler()
-            self.sa_miner = Miner(
-                "SA",
-                sa_sampler,
-                difficulty_energy=self.difficulty_energy,
-                min_diversity=self.min_diversity,
-                min_solutions=self.min_solutions
-            )
-            self.miners.append(self.sa_miner)
+                self.miners.append(sa_miner)
+                self.miners_by_id[miner_id] = sa_miner
+            print(f"✓ Initialized {self.num_sa_miners} SA miner(s)")
+            
+            # Initialize mining stats for all miners
+            for miner in self.miners:
+                self.mining_stats[miner.miner_id] = 0
         else:
             # Single miner mode (legacy)
-            self.difficulty_energy = -180.0
+            self.difficulty_energy = -1000.0
             self.min_diversity = 0.25
-            self.min_solutions = 3
+            self.min_solutions = 10
             self.sampler = SimulatedAnnealingSampler()
             
         # Create genesis block
@@ -495,16 +529,23 @@ class QuantumBlockchain:
                 print(f"Warning: Thread {thread.name} did not stop cleanly")
         
         # Update stats
-        self.mining_stats[winning_result.miner_type] += 1
+        self.mining_stats[winning_result.miner_id] += 1
+        
+        # Update miner's personal stats
+        winning_miner = self.miners_by_id[winning_result.miner_id]
+        winning_miner.blocks_won += 1
         
         # Calculate block reward
         base_reward = 50  # Base QUIP tokens
         actual_reward = base_reward * self.streak_multiplier
         
-        print(f"\n🏆 WINNER: {winning_result.miner_type}")
+        print(f"\n🏆 WINNER: {winning_result.miner_id} ({winning_result.miner_type})")
         print(f"Energy: {winning_result.energy:.2f}, Diversity: {winning_result.diversity:.3f}")
         print(f"Time: {winning_result.mining_time:.2f}s")
         print(f"💰 Block Reward: {actual_reward:.1f} QUIP (Base: {base_reward}, Multiplier: {self.streak_multiplier}x)")
+        
+        # Update miner's rewards
+        winning_miner.total_rewards += actual_reward
         
         # Adjust difficulty for next block
         self.adjust_difficulty(winning_result.miner_type)
@@ -548,6 +589,7 @@ class QuantumBlockchain:
             new_block.energy = result.energy
             new_block.diversity = result.diversity
             new_block.num_valid_solutions = result.num_valid
+            new_block.miner_id = result.miner_id
             new_block.miner_type = result.miner_type
             new_block.mining_time = result.mining_time
         else:
@@ -611,7 +653,10 @@ class QuantumBlockchain:
                 print(f"  Quantum Energy: {block.energy:.2f}")
                 print(f"  Diversity: {block.diversity:.3f}")
                 print(f"  Valid Solutions: {block.num_valid_solutions}")
-                if block.miner_type:
+                if block.miner_id:
+                    print(f"  Miner: {block.miner_id} ({block.miner_type})")
+                    print(f"  Mining Time: {block.mining_time:.2f}s")
+                elif block.miner_type:
                     print(f"  Miner: {block.miner_type}")
                     print(f"  Mining Time: {block.mining_time:.2f}s")
     
@@ -624,11 +669,29 @@ class QuantumBlockchain:
         print("COMPETITIVE MINING SUMMARY")
         print("="*60)
         
+        # Individual miner stats
+        print("\nIndividual Miner Performance:")
         total_blocks = sum(self.mining_stats.values())
         
-        for miner_type, wins in self.mining_stats.items():
+        for miner_id, wins in sorted(self.mining_stats.items()):
+            if wins > 0:
+                percentage = (wins / total_blocks * 100) if total_blocks > 0 else 0
+                miner = self.miners_by_id.get(miner_id)
+                if miner:
+                    print(f"  {miner_id}: {wins} blocks ({percentage:.1f}%), {miner.total_rewards:.1f} QUIP earned")
+                else:
+                    print(f"  {miner_id}: {wins} blocks ({percentage:.1f}%)")
+        
+        # Type summary
+        print("\nSummary by Miner Type:")
+        type_stats = {"QPU": 0, "SA": 0}
+        for miner_id, wins in self.mining_stats.items():
+            miner_type = miner_id.split('-')[0]
+            type_stats[miner_type] = type_stats.get(miner_type, 0) + wins
+        
+        for miner_type, wins in type_stats.items():
             percentage = (wins / total_blocks * 100) if total_blocks > 0 else 0
-            print(f"{miner_type}: {wins} blocks ({percentage:.1f}%)")
+            print(f"  {miner_type}: {wins} blocks ({percentage:.1f}%)")
         
         print(f"\nTotal blocks mined: {total_blocks}")
         
@@ -684,6 +747,34 @@ class QuantumBlockchain:
         # Set style
         plt.style.use('seaborn-v0_8-darkgrid')
         
+        # Create color mapping for individual miners
+        def get_miner_color(miner_id: str) -> str:
+            """Get unique color shade for each miner based on their ID."""
+            base_qpu_color = '#4285F4'  # Google blue
+            base_sa_color = '#FF8C00'    # Dark orange
+            
+            if miner_id.startswith('QPU'):
+                # Extract miner number (e.g., QPU-1 -> 1)
+                miner_num = int(miner_id.split('-')[1])
+                # Create shades of blue - lighter for higher numbers
+                # Adjust lightness: 0% = base color, 40% = much lighter
+                lightness_factor = min(0.4, (miner_num - 1) * 0.15)
+                # Convert hex to RGB, lighten, then back to hex
+                r, g, b = int(base_qpu_color[1:3], 16), int(base_qpu_color[3:5], 16), int(base_qpu_color[5:7], 16)
+                r = int(r + (255 - r) * lightness_factor)
+                g = int(g + (255 - g) * lightness_factor)
+                b = int(b + (255 - b) * lightness_factor)
+                return f'#{r:02x}{g:02x}{b:02x}'
+            else:  # SA miner
+                miner_num = int(miner_id.split('-')[1])
+                # Create shades of orange - darker for higher numbers
+                darkness_factor = min(0.4, (miner_num - 1) * 0.15)
+                r, g, b = int(base_sa_color[1:3], 16), int(base_sa_color[3:5], 16), int(base_sa_color[5:7], 16)
+                r = int(r * (1 - darkness_factor))
+                g = int(g * (1 - darkness_factor))
+                b = int(b * (1 - darkness_factor))
+                return f'#{r:02x}{g:02x}{b:02x}'
+        
         # Collect data
         blocks = self.chain[1:]  # Skip genesis
         block_numbers = []
@@ -691,6 +782,7 @@ class QuantumBlockchain:
         diversities = []
         mining_times = []
         miner_types = []
+        miner_ids = []  # Track individual miner IDs
         difficulties = []
         rewards = []
         
@@ -700,6 +792,7 @@ class QuantumBlockchain:
             diversities.append(block.diversity)
             mining_times.append(block.mining_time)
             miner_types.append(block.miner_type)
+            miner_ids.append(block.miner_id)  # Track individual miner
             
             # Calculate difficulty at time of mining
             if i == 1:
@@ -735,21 +828,21 @@ class QuantumBlockchain:
         # Create figure with subplots
         fig = plt.figure(figsize=(20, 16))
         
-        # Define softer blue color (like in streak analysis)
+        # Define base colors for backward compatibility
         qpu_color = '#4285F4'  # Google blue - softer than pure blue
         sa_color = 'orange'
         
-        # 1. Mining time by miner type over blocks
+        # 1. Mining time by individual miner over blocks
         ax1 = plt.subplot(3, 3, 1)
-        for miner in sorted(set(miner_types)):
-            miner_blocks = [i for i, m in enumerate(miner_types) if m == miner]
-            miner_times = [mining_times[i] for i in miner_blocks]
-            color = qpu_color if miner == 'QPU' else sa_color
-            ax1.plot([block_numbers[i] for i in miner_blocks], miner_times, 
-                    'o-', label=miner, markersize=8, linewidth=2, color=color)
+        for miner_id in sorted(set(miner_ids)):
+            miner_blocks = [i for i, m in enumerate(miner_ids) if m == miner_id]
+            miner_times_subset = [mining_times[i] for i in miner_blocks]
+            color = get_miner_color(miner_id)
+            ax1.plot([block_numbers[i] for i in miner_blocks], miner_times_subset, 
+                    'o-', label=miner_id, markersize=8, linewidth=2, color=color)
         ax1.set_xlabel('Block Number')
         ax1.set_ylabel('Mining Time (s)')
-        ax1.set_title('Mining Time Evolution')
+        ax1.set_title('Mining Time Evolution by Individual Miner')
         ax1.legend()
         
         # 2. Energy achieved by each miner
@@ -775,30 +868,31 @@ class QuantumBlockchain:
         # 3. Difficulty evolution
         ax3 = plt.subplot(3, 3, 3)
         ax3.plot(block_numbers, difficulties, 'k-', linewidth=2)
-        # Color points by winner
-        colors = [qpu_color if m == 'QPU' else sa_color for m in miner_types]
+        # Color points by individual winner
+        colors = [get_miner_color(m_id) for m_id in miner_ids]
         ax3.scatter(block_numbers, difficulties, c=colors, s=50, alpha=0.7)
         ax3.set_xlabel('Block Number')
         ax3.set_ylabel('Difficulty (Energy Threshold)')
         ax3.set_title('Difficulty Adjustment Over Time')
-        # Create custom legend with correct colors
+        # Create custom legend with miner colors
         from matplotlib.patches import Patch
-        legend_elements = [plt.Line2D([0], [0], color='k', linewidth=2, label='Difficulty'),
-                          Patch(facecolor=qpu_color, label='QPU wins'),
-                          Patch(facecolor=sa_color, label='SA wins')]
+        legend_elements = [plt.Line2D([0], [0], color='k', linewidth=2, label='Difficulty')]
+        # Add legend entries for each unique miner
+        for miner_id in sorted(set(miner_ids)):
+            legend_elements.append(Patch(facecolor=get_miner_color(miner_id), label=miner_id))
         ax3.legend(handles=legend_elements)
         
-        # 4. Diversity scores
+        # 4. Diversity scores by individual miner
         ax4 = plt.subplot(3, 3, 4)
-        for miner in sorted(set(miner_types)):
-            miner_blocks = [i for i, m in enumerate(miner_types) if m == miner]
+        for miner_id in sorted(set(miner_ids)):
+            miner_blocks = [i for i, m in enumerate(miner_ids) if m == miner_id]
             miner_diversities = [diversities[i] for i in miner_blocks]
-            color = qpu_color if miner == 'QPU' else sa_color
+            color = get_miner_color(miner_id)
             ax4.scatter([block_numbers[i] for i in miner_blocks], miner_diversities, 
-                       label=miner, s=50, alpha=0.7, color=color)
+                       label=miner_id, s=50, alpha=0.7, color=color)
         ax4.set_xlabel('Block Number')
         ax4.set_ylabel('Diversity Score')
-        ax4.set_title('Solution Diversity by Miner')
+        ax4.set_title('Solution Diversity by Individual Miner')
         ax4.legend()
         
         # 5. Block rewards over time
@@ -808,13 +902,27 @@ class QuantumBlockchain:
         ax5.set_ylabel('Block Reward (QUIP)')
         ax5.set_title('Block Rewards with Streak Multipliers')
         
-        # 6. Win distribution pie chart
+        # 6. Win distribution pie chart by individual miner
         ax6 = plt.subplot(3, 3, 6)
-        win_counts = [self.mining_stats.get('QPU', 0), self.mining_stats.get('SA', 0)]
-        win_labels = ['QPU', 'SA']
-        ax6.pie(win_counts, labels=win_labels, autopct='%1.1f%%', startangle=90, 
-                colors=[qpu_color, sa_color])
-        ax6.set_title('Overall Win Distribution')
+        # Get individual miner wins
+        individual_wins = []
+        individual_labels = []
+        individual_colors = []
+        
+        for miner_id in sorted(self.mining_stats.keys()):
+            wins = self.mining_stats[miner_id]
+            if wins > 0:
+                individual_wins.append(wins)
+                individual_labels.append(f"{miner_id} ({wins})")
+                individual_colors.append(get_miner_color(miner_id))
+        
+        # Only create pie chart if there are wins
+        if individual_wins:
+            ax6.pie(individual_wins, labels=individual_labels, autopct='%1.1f%%', 
+                   startangle=90, colors=individual_colors)
+        else:
+            ax6.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax6.transAxes)
+        ax6.set_title('Win Distribution by Individual Miner')
         
         # 7. Streak analysis
         ax7 = plt.subplot(3, 3, 7)
@@ -849,40 +957,41 @@ class QuantumBlockchain:
         ax7.set_title('Mining Streak Analysis')
         ax7.legend()
         
-        # 8. Mining efficiency (energy per second)
+        # 8. Mining efficiency (energy per second) by individual miner
         ax8 = plt.subplot(3, 3, 8)
         efficiency = [abs(e)/t for e, t in zip(energies, mining_times)]
-        for miner in sorted(set(miner_types)):
-            miner_blocks = [i for i, m in enumerate(miner_types) if m == miner]
+        for miner_id in sorted(set(miner_ids)):
+            miner_blocks = [i for i, m in enumerate(miner_ids) if m == miner_id]
             miner_efficiency = [efficiency[i] for i in miner_blocks]
-            color = qpu_color if miner == 'QPU' else sa_color
+            color = get_miner_color(miner_id)
             ax8.scatter([block_numbers[i] for i in miner_blocks], miner_efficiency, 
-                       label=miner, s=50, alpha=0.7, color=color)
+                       label=miner_id, s=50, alpha=0.7, color=color)
         ax8.set_xlabel('Block Number')
         ax8.set_ylabel('|Energy| / Time')
-        ax8.set_title('Mining Efficiency')
+        ax8.set_title('Mining Efficiency by Individual Miner')
         ax8.legend()
         
-        # 9. Cumulative rewards
+        # 9. Cumulative rewards by individual miner
         ax9 = plt.subplot(3, 3, 9)
-        qpu_cumulative = []
-        sa_cumulative = []
-        qpu_total = 0
-        sa_total = 0
+        # Track cumulative rewards for each miner
+        miner_cumulative = {miner_id: [] for miner_id in set(miner_ids)}
+        miner_totals = {miner_id: 0 for miner_id in set(miner_ids)}
         
-        for i, (miner, reward) in enumerate(zip(miner_types, rewards)):
-            if miner == 'QPU':
-                qpu_total += reward
-            else:
-                sa_total += reward
-            qpu_cumulative.append(qpu_total)
-            sa_cumulative.append(sa_total)
+        for i, (miner_id, reward) in enumerate(zip(miner_ids, rewards)):
+            miner_totals[miner_id] += reward
+            # Update cumulative for all miners at this point
+            for m_id in miner_cumulative:
+                miner_cumulative[m_id].append(miner_totals[m_id])
         
-        ax9.plot(block_numbers, qpu_cumulative, color=qpu_color, linestyle='-', label='QPU', linewidth=2)
-        ax9.plot(block_numbers, sa_cumulative, color=sa_color, linestyle='-', label='SA', linewidth=2)
+        # Plot cumulative rewards for each miner
+        for miner_id in sorted(set(miner_ids)):
+            color = get_miner_color(miner_id)
+            ax9.plot(block_numbers, miner_cumulative[miner_id], color=color, 
+                    linestyle='-', label=miner_id, linewidth=2)
+        
         ax9.set_xlabel('Block Number')
         ax9.set_ylabel('Cumulative Rewards (QUIP)')
-        ax9.set_title('Cumulative Earnings')
+        ax9.set_title('Cumulative Earnings by Individual Miner')
         ax9.legend()
         
         plt.tight_layout()
@@ -905,14 +1014,15 @@ class QuantumBlockchain:
         ax1.set_title('Mining Time Analysis')
         ax1.legend()
         
-        # Time distribution histograms
-        if qpu_times := [t for t, m in zip(mining_times, miner_types) if m == 'QPU']:
-            ax2.hist(qpu_times, bins=10, alpha=0.5, label='QPU', color=qpu_color)
-        if sa_times := [t for t, m in zip(mining_times, miner_types) if m == 'SA']:
-            ax2.hist(sa_times, bins=10, alpha=0.5, label='SA', color=sa_color)
+        # Time distribution histograms by individual miner
+        for miner_id in sorted(set(miner_ids)):
+            miner_times = [t for t, m_id in zip(mining_times, miner_ids) if m_id == miner_id]
+            if miner_times:
+                color = get_miner_color(miner_id)
+                ax2.hist(miner_times, bins=10, alpha=0.5, label=miner_id, color=color)
         ax2.set_xlabel('Mining Time (s)')
         ax2.set_ylabel('Frequency')
-        ax2.set_title('Mining Time Distribution')
+        ax2.set_title('Mining Time Distribution by Individual Miner')
         ax2.legend()
         
         plt.tight_layout()
@@ -922,21 +1032,35 @@ class QuantumBlockchain:
 
 def main():
     """Demonstrate quantum blockchain."""
+    import argparse
     import sys
     
-    competitive = '--competitive' in sys.argv
+    parser = argparse.ArgumentParser(description='Quantum Blockchain Demo')
+    parser.add_argument('--competitive', action='store_true', 
+                       help='Run competitive mining between QPU and SA miners')
+    parser.add_argument('--num-qpu', type=int, default=1,
+                       help='Number of QPU miners (default: 1)')
+    parser.add_argument('--num-sa', type=int, default=1,
+                       help='Number of SA miners (default: 1)')
+    parser.add_argument('--blocks', type=int, default=20,
+                       help='Number of blocks to mine (default: 20)')
+    
+    args = parser.parse_args()
+    competitive = args.competitive
     
     if competitive:
         print("Competitive Quantum Mining Demo")
-        print("QPU vs Simulated Annealing")
+        print(f"QPU Miners: {args.num_qpu}, SA Miners: {args.num_sa}")
         print("=" * 60)
         
         # Inverted difficulty: starts HARD (QPU-favored) and eases with streaks
         blockchain = QuantumBlockchain(
             competitive=True,
-            base_difficulty_energy=-1150.0,   # Challenging for SA, easy for QPU
-            base_min_diversity=0.45,          # Moderate-high diversity
-            base_min_solutions=15             # Reasonable starting point
+            base_difficulty_energy=-1200.0,   # Very challenging for SA, easy for QPU
+            base_min_diversity=0.45,          # High diversity requirement
+            base_min_solutions=20,            # High solution count requirement
+            num_qpu_miners=args.num_qpu,
+            num_sa_miners=args.num_sa
         )
         
         # Mine several blocks competitively
@@ -963,7 +1087,9 @@ def main():
             "Tara finalizes quantum consensus"
         ]
         
-        for tx in transactions:
+        # Limit transactions to requested number of blocks
+        for i, tx in enumerate(transactions[:args.blocks]):
+            print(f"\n📝 Transaction {i+1}/{args.blocks}: {tx}")
             blockchain.add_block(tx)
             time.sleep(0.5)  # Brief pause between blocks
         

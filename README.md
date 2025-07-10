@@ -7,9 +7,11 @@ This project implements a quantum blockchain using quantum annealing for proof-o
 The blockchain demonstrates:
 - **Quantum Annealing PoW**: Using Ising model optimization as the mining puzzle
 - **Competitive Mining**: Multiple miners (QPU and SA) compete to mine blocks
+- **Multi-Miner Support**: Configure any number of QPU and SA miners
 - **Dynamic Difficulty**: Inverted difficulty mechanism that prevents miner monopolization
 - **Streak Rewards**: Consecutive wins increase block rewards
 - **Solution Diversity**: Requires multiple diverse solutions to prevent trivial mining
+- **Individual Miner Tracking**: Each miner has unique ID and performance stats
 
 ## Setup
 
@@ -52,10 +54,24 @@ quip-protocol/
 ### Run the Quantum Blockchain Demo
 
 ```bash
+# Basic competitive mining (1 QPU vs 1 SA miner)
+python quantum_blockchain.py --competitive
+
+# Multiple miners (2 QPU miners vs 4 SA miners)
+python quantum_blockchain.py --competitive --num-qpu 2 --num-sa 4
+
+# Custom number of blocks
+python quantum_blockchain.py --competitive --num-qpu 2 --num-sa 3 --blocks 10
+
+# Non-competitive mode (single miner)
 python quantum_blockchain.py
 ```
 
-This runs a competitive mining simulation between QPU and SA miners with dynamic difficulty adjustment.
+Parameters:
+- `--competitive`: Enable competitive mining mode
+- `--num-qpu N`: Number of QPU miners (default: 1)
+- `--num-sa N`: Number of SA miners (default: 1)
+- `--blocks N`: Number of blocks to mine (default: 20)
 
 ### Run Reference Implementation Tests
 
@@ -163,6 +179,28 @@ max_streak_multiplier = 5      # Maximum reward multiplier
 4. **Performance Monitoring**: Comprehensive metrics and visualizations
 5. **Solution Quality**: Enforces diversity to prevent trivial solutions
 
+## GPU Benchmarking (Optional)
+
+The project includes GPU benchmarking capabilities using Modal Labs for cost-effective cloud GPU access:
+
+```bash
+# Install Modal
+pip install modal
+
+# Authenticate (get $30/month free credits)
+modal token new
+
+# Run GPU benchmarks
+modal run gpu_benchmark_modal.py
+```
+
+GPU options with Modal Labs:
+- **T4 GPU**: ~$0.10/hour (good for testing)
+- **A10G GPU**: ~$0.30/hour (balanced performance)
+- **A100 GPU**: ~$1.00/hour (maximum performance)
+
+The GPU benchmark compares simulated annealing performance across different GPU types against QPU results.
+
 ## Future Enhancements
 
 - Network layer for distributed mining
@@ -171,6 +209,8 @@ max_streak_multiplier = 5      # Maximum reward multiplier
 - Multiple QPU support
 - Advanced difficulty algorithms
 - Real-time mining pool statistics
+- Full GPU miner integration
+- Mining pool protocol
 
 ## License
 
