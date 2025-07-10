@@ -1,93 +1,177 @@
-# Quip Protocol
+# Quantum Proof-of-Work Blockchain Implementation
 
+This project implements a quantum blockchain using quantum annealing for proof-of-work consensus. It features competitive mining between quantum computers (QPU) and classical simulated annealing (SA) with a dynamic difficulty adjustment mechanism.
 
+## Overview
 
-## Getting started
+The blockchain demonstrates:
+- **Quantum Annealing PoW**: Using Ising model optimization as the mining puzzle
+- **Competitive Mining**: Multiple miners (QPU and SA) compete to mine blocks
+- **Dynamic Difficulty**: Inverted difficulty mechanism that prevents miner monopolization
+- **Streak Rewards**: Consecutive wins increase block rewards
+- **Solution Diversity**: Requires multiple diverse solutions to prevent trivial mining
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## Setup
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+1. Create and activate a Python 3.13 virtual environment:
+   ```bash
+   python3.13 -m venv venv
+   source venv/bin/activate
+   ```
 
-## Add your files
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+3. Set up D-Wave API credentials (optional, for QPU access):
+   ```bash
+   echo "DWAVE_API_KEY=your_api_key_here" > .env
+   ```
+
+## Project Structure
 
 ```
-cd existing_repo
-git remote add origin https://gitlab.com/piqued/quip-protocol.git
-git branch -M main
-git push -uf origin main
+quip-protocol/
+├── quantum_blockchain.py       # Main blockchain implementation
+├── reference/                  # Reference implementation tests
+│   ├── test_quantum_pow.py    # Tests showing optimal SA parameters
+│   └── reference_test_results.png
+├── benchmarks/                 # Performance benchmarking suite
+│   ├── benchmark_quantum_pow.py
+│   ├── energy_distributions.png
+│   ├── performance_metrics.png
+│   ├── blockchain_benchmark_comprehensive.png
+│   ├── blockchain_benchmark_timing.png
+│   └── benchmark_results.json
+└── venv/                      # Python virtual environment
 ```
-
-## Integrate with your tools
-
-- [ ] [Set up project integrations](https://gitlab.com/piqued/quip-protocol/-/settings/integrations)
-
-## Collaborate with your team
-
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
-
-## Test and Deploy
-
-Use the built-in continuous integration in GitLab.
-
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
 
 ## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+### Run the Quantum Blockchain Demo
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+```bash
+python quantum_blockchain.py
+```
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+This runs a competitive mining simulation between QPU and SA miners with dynamic difficulty adjustment.
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+### Run Reference Implementation Tests
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+```bash
+python reference/test_quantum_pow.py
+```
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+Tests the reference implementation with different `num_sweeps` values. Results show SA achieves optimal performance at `num_sweeps=4096`.
+
+![Reference Test Results](reference/reference_test_results.png)
+
+### Run Performance Benchmarks
+
+```bash
+python benchmarks/benchmark_quantum_pow.py
+```
+
+Generates comprehensive benchmarks comparing QPU vs SA performance:
+
+![Performance Metrics](benchmarks/performance_metrics.png)
+![Energy Distributions](benchmarks/energy_distributions.png)
+
+## Quantum Proof-of-Work Mechanism
+
+### Core Concepts
+
+1. **Ising Model Generation**: Each block generates a unique Ising problem based on:
+   - Block header hash
+   - Mining nonce
+   - Deterministic random seed
+
+2. **Solution Requirements**:
+   - **Energy Threshold**: Solutions must have energy < difficulty_energy
+   - **Solution Diversity**: Multiple solutions with minimum Hamming distance
+   - **Minimum Solutions**: At least N valid solutions required
+
+3. **Mining Process**:
+   - Miners iterate through nonces
+   - For each nonce, sample the quantum annealer
+   - Check if solutions meet all criteria
+   - First miner to find valid solutions wins
+
+### Dynamic Difficulty (Inverted Mechanism)
+
+The blockchain implements an inverted difficulty adjustment:
+
+```
+Initial State: HARD (QPU-favored)
+├── Energy: -1150
+├── Diversity: 0.45
+└── Solutions: 15
+
+Consecutive Wins → EASIER
+└── Reduces requirements progressively
+
+New Winner → HARDER
+└── Increases difficulty based on previous streak
+```
+
+This mechanism:
+- Starts with QPU-favorable difficulty
+- Makes mining easier for consecutive winners
+- Immediately hardens when a new miner wins
+- Prevents long-term monopolization
+
+### Competitive Mining Results
+
+The inverted difficulty mechanism produces balanced mining distribution:
+
+![Blockchain Mining Results](benchmarks/blockchain_benchmark_comprehensive.png)
+
+Key outcomes:
+- **QPU**: ~70% of blocks (leverages quantum advantage initially)
+- **SA**: ~30% of blocks (catches up as difficulty eases)
+- **Streak Rewards**: Up to 5x multiplier for consecutive wins
+- **Dynamic Balance**: Self-adjusting difficulty maintains competition
+
+![Mining Time Analysis](benchmarks/blockchain_benchmark_timing.png)
+
+## Technical Parameters
+
+### Shared Mining Parameters
+```python
+base_difficulty_energy = -1150  # Energy threshold
+min_diversity = 0.45           # Solution diversity requirement
+min_solutions = 15             # Minimum valid solutions
+```
+
+### Miner-Specific Settings
+- **QPU**: Uses D-Wave quantum processor (when available)
+- **SA**: num_sweeps=4096 for optimal performance
+- **Both**: 64 reads per mining attempt
+
+### Difficulty Adjustment
+```python
+energy_adjustment_rate = 0.10  # 10% change per streak level
+max_streak_multiplier = 5      # Maximum reward multiplier
+```
+
+## Key Features
+
+1. **Decentralized Consensus**: All miners use identical difficulty parameters
+2. **Quantum-Classical Competition**: Fair competition between QPU and SA
+3. **Anti-Monopolization**: Dynamic difficulty prevents single miner dominance
+4. **Performance Monitoring**: Comprehensive metrics and visualizations
+5. **Solution Quality**: Enforces diversity to prevent trivial solutions
+
+## Future Enhancements
+
+- Network layer for distributed mining
+- Persistent blockchain storage
+- Transaction validation and smart contracts
+- Multiple QPU support
+- Advanced difficulty algorithms
+- Real-time mining pool statistics
 
 ## License
-For open source projects, say how it is licensed.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+MIT License - See LICENSE file for details
