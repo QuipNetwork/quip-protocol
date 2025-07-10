@@ -771,7 +771,7 @@ class QuantumBlockchain:
         ax3 = plt.subplot(3, 3, 3)
         ax3.plot(block_numbers, difficulties, 'k-', linewidth=2)
         # Color points by winner
-        colors = ['red' if m == 'QPU' else 'blue' for m in miner_types]
+        colors = ['blue' if m == 'QPU' else 'orange' for m in miner_types]
         ax3.scatter(block_numbers, difficulties, c=colors, s=50, alpha=0.7)
         ax3.set_xlabel('Block Number')
         ax3.set_ylabel('Difficulty (Energy Threshold)')
@@ -801,7 +801,8 @@ class QuantumBlockchain:
         ax6 = plt.subplot(3, 3, 6)
         win_counts = [self.mining_stats.get('QPU', 0), self.mining_stats.get('SA', 0)]
         win_labels = ['QPU', 'SA']
-        ax6.pie(win_counts, labels=win_labels, autopct='%1.1f%%', startangle=90)
+        ax6.pie(win_counts, labels=win_labels, autopct='%1.1f%%', startangle=90, 
+                colors=['blue', 'orange'])
         ax6.set_title('Overall Win Distribution')
         
         # 7. Streak analysis
@@ -865,8 +866,8 @@ class QuantumBlockchain:
             qpu_cumulative.append(qpu_total)
             sa_cumulative.append(sa_total)
         
-        ax9.plot(block_numbers, qpu_cumulative, 'r-', label='QPU', linewidth=2)
-        ax9.plot(block_numbers, sa_cumulative, 'b-', label='SA', linewidth=2)
+        ax9.plot(block_numbers, qpu_cumulative, 'b-', label='QPU', linewidth=2)
+        ax9.plot(block_numbers, sa_cumulative, color='orange', linestyle='-', label='SA', linewidth=2)
         ax9.set_xlabel('Block Number')
         ax9.set_ylabel('Cumulative Rewards (QUIP)')
         ax9.set_title('Cumulative Earnings')
@@ -894,9 +895,9 @@ class QuantumBlockchain:
         
         # Time distribution histograms
         if qpu_times := [t for t, m in zip(mining_times, miner_types) if m == 'QPU']:
-            ax2.hist(qpu_times, bins=10, alpha=0.5, label='QPU', color='red')
+            ax2.hist(qpu_times, bins=10, alpha=0.5, label='QPU', color='blue')
         if sa_times := [t for t, m in zip(mining_times, miner_types) if m == 'SA']:
-            ax2.hist(sa_times, bins=10, alpha=0.5, label='SA', color='blue')
+            ax2.hist(sa_times, bins=10, alpha=0.5, label='SA', color='orange')
         ax2.set_xlabel('Mining Time (s)')
         ax2.set_ylabel('Frequency')
         ax2.set_title('Mining Time Distribution')

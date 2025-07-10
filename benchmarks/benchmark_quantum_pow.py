@@ -154,6 +154,12 @@ class QuantumPowBenchmark:
             print("No results to plot")
             return
             
+        # Define consistent color mapping
+        color_map = {'QPU': 'blue'}
+        # Add orange for all SA variants
+        for key in ['SA', 'SA_1024', 'SA_2048', 'SA_4096', 'SA_8192']:
+            color_map[key] = 'orange'
+        
         # Convert to DataFrame
         data = []
         for result in self.results:
@@ -172,22 +178,23 @@ class QuantumPowBenchmark:
         
         # Plot 1: Box plot by sampler
         ax1 = axes[0, 0]
-        sns.boxplot(data=df, x='Sampler', y='Energy', ax=ax1)
+        sns.boxplot(data=df, x='Sampler', y='Energy', ax=ax1, palette=color_map)
         ax1.set_title('Energy Distribution by Sampler')
         ax1.set_xticklabels(ax1.get_xticklabels(), rotation=45)
         
         # Plot 2: Violin plot by sampler
         ax2 = axes[0, 1]
-        sns.violinplot(data=df, x='Sampler', y='Energy', ax=ax2)
+        sns.violinplot(data=df, x='Sampler', y='Energy', ax=ax2, palette=color_map)
         ax2.set_title('Energy Density by Sampler')
         ax2.set_xticklabels(ax2.get_xticklabels(), rotation=45)
         
         # Plot 3: Energy vs Seed for each sampler
         ax3 = axes[1, 0]
-        for sampler in df['Sampler'].unique():
+        for sampler in sorted(df['Sampler'].unique()):
             sampler_df = df[df['Sampler'] == sampler]
             mean_energies = sampler_df.groupby('Seed')['Energy'].mean()
-            ax3.plot(mean_energies.index, mean_energies.values, marker='o', label=sampler)
+            color = color_map.get(sampler, 'gray')
+            ax3.plot(mean_energies.index, mean_energies.values, marker='o', label=sampler, color=color)
         ax3.set_xlabel('Seed')
         ax3.set_ylabel('Mean Energy')
         ax3.set_title('Mean Energy by Seed')
@@ -195,9 +202,10 @@ class QuantumPowBenchmark:
         
         # Plot 4: Histogram comparison
         ax4 = axes[1, 1]
-        for sampler in df['Sampler'].unique():
+        for sampler in sorted(df['Sampler'].unique()):
             sampler_energies = df[df['Sampler'] == sampler]['Energy']
-            ax4.hist(sampler_energies, alpha=0.5, label=sampler, bins=30)
+            color = color_map.get(sampler, 'gray')
+            ax4.hist(sampler_energies, alpha=0.5, label=sampler, bins=30, color=color)
         ax4.set_xlabel('Energy')
         ax4.set_ylabel('Count')
         ax4.set_title('Energy Histogram Comparison')
@@ -213,6 +221,12 @@ class QuantumPowBenchmark:
             print("No results to plot")
             return
             
+        # Define consistent color mapping
+        color_map = {'QPU': 'blue'}
+        # Add orange for all SA variants
+        for key in ['SA', 'SA_1024', 'SA_2048', 'SA_4096', 'SA_8192']:
+            color_map[key] = 'orange'
+        
         # Aggregate results by sampler
         sampler_stats = {}
         for result in self.results:
@@ -232,10 +246,11 @@ class QuantumPowBenchmark:
         
         # Plot 1: Average minimum energy
         ax1 = axes[0, 0]
-        samplers = list(sampler_stats.keys())
+        samplers = sorted(list(sampler_stats.keys()))
         avg_min_energies = [np.mean(sampler_stats[s]['min_energies']) for s in samplers]
         std_min_energies = [np.std(sampler_stats[s]['min_energies']) for s in samplers]
-        ax1.bar(samplers, avg_min_energies, yerr=std_min_energies, capsize=5)
+        colors = [color_map.get(s, 'gray') for s in samplers]
+        ax1.bar(samplers, avg_min_energies, yerr=std_min_energies, capsize=5, color=colors)
         ax1.set_ylabel('Average Minimum Energy')
         ax1.set_title('Solution Quality (Lower is Better)')
         ax1.set_xticklabels(ax1.get_xticklabels(), rotation=45)
@@ -244,15 +259,15 @@ class QuantumPowBenchmark:
         ax2 = axes[0, 1]
         avg_times = [np.mean(sampler_stats[s]['times']) for s in samplers]
         std_times = [np.std(sampler_stats[s]['times']) for s in samplers]
-        ax2.bar(samplers, avg_times, yerr=std_times, capsize=5)
+        ax2.bar(samplers, avg_times, yerr=std_times, capsize=5, color=colors)
         ax2.set_ylabel('Average Runtime (seconds)')
         ax2.set_title('Computation Time')
         ax2.set_xticklabels(ax2.get_xticklabels(), rotation=45)
         
         # Plot 3: Quality vs Time tradeoff
         ax3 = axes[1, 0]
-        ax3.scatter(avg_times, avg_min_energies, s=100)
         for i, sampler in enumerate(samplers):
+            ax3.scatter(avg_times[i], avg_min_energies[i], s=100, color=colors[i], label=sampler)
             ax3.annotate(sampler, (avg_times[i], avg_min_energies[i]), 
                         xytext=(5, 5), textcoords='offset points')
         ax3.set_xlabel('Average Runtime (seconds)')
@@ -267,7 +282,7 @@ class QuantumPowBenchmark:
             min_energies = sampler_stats[sampler]['min_energies']
             success_rate = sum(e < threshold for e in min_energies) / len(min_energies) * 100
             success_rates.append(success_rate)
-        ax4.bar(samplers, success_rates)
+        ax4.bar(samplers, success_rates, color=colors)
         ax4.set_ylabel('Success Rate (%)')
         ax4.set_title(f'Success Rate (Energy < {threshold})')
         ax4.set_xticklabels(ax4.get_xticklabels(), rotation=45)
