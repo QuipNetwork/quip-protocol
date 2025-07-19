@@ -1,21 +1,43 @@
-import numpy as np
-import time
-import json
-import matplotlib.pyplot as plt
-import seaborn as sns
-from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass, asdict
 import hashlib
-from dwave.system import DWaveSampler
-from dwave.samplers import SimulatedAnnealingSampler
-import pandas as pd
+import json
 import os
+import time
+from dataclasses import asdict, dataclass
+from typing import Dict, List, Optional, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
 from dotenv import load_dotenv
+from dwave.samplers import SimulatedAnnealingSampler
+from dwave.system import DWaveSampler
+from dwave.system.testing import MockDWaveSampler
 
 # Load environment variables
 load_dotenv()
 
+class SimulatedAnnealingStructuredSampler(MockDWaveSampler):
+    """Replace the MockSampler by an MCMC sampler with identical structure
 
+    """
+    def __init__(
+        self, qpu=None
+    ):
+        if qpu is None:
+            qpu = DWaveSampler()
+        
+        substitute_sampler = SimulatedAnnealingSampler()
+        super().__init__(
+            nodelist=qpu.nodelist,
+            edgelist=qpu.edgelist,
+            properties=qpu.properties,
+            substitute_sampler=substitute_sampler
+        )
+        self.sampler_type = "mock"
+        self.parameters.update(substitute_sampler.parameters)  # Do not warn when SA parameters are seen.
+        self.mocked_parameters.add('num_sweeps')  # Do not warn when this SA parameter is seen.
+        
 @dataclass
 class BenchmarkResult:
     sampler_type: str
@@ -49,26 +71,15 @@ class QuantumPowBenchmark:
         """
         np.random.seed(seed)
         
-        if hasattr(sampler, 'nodelist'):
-            # QPU sampler
-            h = {i: 0 for i in sampler.nodelist}
-            J = {edge: 2*np.random.randint(2)-1 for edge in sampler.edgelist}
-            problem_size = len(sampler.nodelist)
-        else:
-            # Simulated annealing
-            num_vars = 64
-            h = {i: 0 for i in range(num_vars)}
-            J = {}
-            for i in range(num_vars):
-                for j in range(i+1, num_vars):
-                    if np.random.random() < 0.3:
-                        J[(i, j)] = 2*np.random.randint(2)-1
-            problem_size = num_vars
+        # QPU sampler
+        h = {i: 0 for i in sampler.nodelist}
+        J = {edge: 2*np.random.randint(2)-1 for edge in sampler.edgelist}
+        problem_size = len(sampler.nodelist)
             
         return h, J, problem_size
     
     def benchmark_sampler(self, sampler, sampler_name: str, seeds: List[int], 
-                         num_reads: int = 64, num_sweeps: Optional[int] = None) -> None:
+                         num_reads: int = 100, num_sweeps: Optional[int] = None) -> None:
         """
         Benchmark a sampler across multiple seeds.
         
@@ -91,9 +102,9 @@ class QuantumPowBenchmark:
             start_time = time.time()
             
             if sampler_name == "QPU":
-                sampleset = sampler.sample_ising(h, J, num_reads=num_reads, answer_mode='raw')
+                sampleset = sampler.sample_ising(h, J, num_reads=100, answer_mode='raw')
             else:
-                sampleset = sampler.sample_ising(h, J, num_reads=num_reads, num_sweeps=num_sweeps)
+                sampleset = sampler.sample_ising(h, J, num_reads=100, num_sweeps=num_sweeps)
             
             elapsed_time = time.time() - start_time
             
@@ -117,8 +128,8 @@ class QuantumPowBenchmark:
             self.results.append(result)
             print(f"Done. Min energy: {result.min_energy:.2f}, Time: {elapsed_time:.2f}s")
     
-    def compare_samplers(self, seeds: List[int], num_reads: int = 64, 
-                        sweep_values: List[int] = [1024, 2048, 4096, 8192]) -> None:
+    def compare_samplers(self, seeds: List[int], num_reads: int = 100, 
+                        sweep_values: List[int] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]) -> None:
         """
         Compare QPU vs SA performance.
         
@@ -138,11 +149,11 @@ class QuantumPowBenchmark:
             print("Skipping QPU benchmarks")
         
         # Benchmark SA with different sweep values
-        sa_sampler = SimulatedAnnealingSampler()
+        sa_sampler = SimulatedAnnealingStructuredSampler()
         for num_sweeps in sweep_values:
             self.benchmark_sampler(
                 sa_sampler, 
-                f"SA_{num_sweeps}", 
+                f"SA_{num_sweeps:04d}", 
                 seeds, 
                 num_reads, 
                 num_sweeps
@@ -155,10 +166,10 @@ class QuantumPowBenchmark:
             return
             
         # Define consistent color mapping
-        color_map = {'QPU': 'blue'}
+        color_map = {'QPU': '#4285F4'}
         # Add orange for all SA variants
-        for key in ['SA', 'SA_1024', 'SA_2048', 'SA_4096', 'SA_8192']:
-            color_map[key] = 'orange'
+        for index, key in enumerate(['SA', 'SA_0008', 'SA_0016', 'SA_0032', 'SA_0064', 'SA_0128', 'SA_0256', 'SA_0512', 'SA_1024', 'SA_2048', 'SA_4096', 'SA_8192']):
+            color_map[key] = (1.0, 0.45 + 0.05*index, 0.25 + 0.05*index)
         
         # Convert to DataFrame
         data = []
@@ -222,10 +233,10 @@ class QuantumPowBenchmark:
             return
             
         # Define consistent color mapping
-        color_map = {'QPU': 'blue'}
+        color_map = {'QPU': '#4285F4'}
         # Add orange for all SA variants
-        for key in ['SA', 'SA_1024', 'SA_2048', 'SA_4096', 'SA_8192']:
-            color_map[key] = 'orange'
+        for index, key in enumerate(['SA', 'SA_0008', 'SA_0016', 'SA_0032', 'SA_0064', 'SA_0128', 'SA_0256', 'SA_0512', 'SA_1024', 'SA_2048', 'SA_4096', 'SA_8192']):
+            color_map[key] = (1.0, 0.45 + 0.05*index, 0.25 + 0.05*index)
         
         # Aggregate results by sampler
         sampler_stats = {}
@@ -276,7 +287,7 @@ class QuantumPowBenchmark:
         
         # Plot 4: Success rate (finding energy below threshold)
         ax4 = axes[1, 1]
-        threshold = -50  # Example threshold
+        threshold = -15600  # Example threshold
         success_rates = []
         for sampler in samplers:
             min_energies = sampler_stats[sampler]['min_energies']
@@ -349,9 +360,9 @@ def main():
     benchmark = QuantumPowBenchmark()
     
     # Set up test parameters
-    seeds = list(range(10))  # Test 10 different problems
-    num_reads = 64
-    sweep_values = [1024, 2048, 4096, 8192]
+    seeds = list(range(100))  # Test 10 different problems
+    num_reads = 100
+    sweep_values = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
     
     # Run comparisons
     benchmark.compare_samplers(seeds, num_reads, sweep_values)

@@ -1,8 +1,10 @@
 import hashlib
 import os
 import queue
+import random
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -12,10 +14,179 @@ import seaborn as sns
 from dotenv import load_dotenv
 from dwave.samplers import SimulatedAnnealingSampler
 from dwave.system import DWaveSampler
+from dwave.system.testing import MockDWaveSampler
+
+# Optional GPU support via Modal Labs
+try:
+    import modal
+    GPU_AVAILABLE = True
+except ImportError as e:
+    GPU_AVAILABLE = False
+    print(f"Modal not installed. GPU mining disabled. Install with: pip install modal. Error: {e}")
 
 # Load environment variables
 load_dotenv()
 
+
+# Define Modal app globally
+if GPU_AVAILABLE:
+    gpu_app = modal.App("quantum-blockchain-gpu-miner")
+    
+    # GPU container image - simplified without CuPy for faster startup
+    gpu_image = modal.Image.debian_slim().pip_install(
+        "numpy",
+        "numba",
+    )
+    
+    # Define GPU functions for each type
+    @gpu_app.function(
+        image=gpu_image,
+        gpu="t4",
+        timeout=300,
+    )
+    def gpu_sample_t4(h_dict, J_dict, num_reads, num_sweeps):
+        """GPU sampling on T4 using Numba acceleration."""
+        import time
+
+        import numpy as np
+        from numba import cuda, jit
+        
+        start_time = time.time()
+        
+        # Convert to arrays
+        num_vars = max(max(h_dict.keys()), max(max(j) for j in J_dict.keys())) + 1
+        h = np.zeros(num_vars)
+        for i, val in h_dict.items():
+            h[i] = val
+        
+        # Create coupling matrix
+        J_matrix = np.zeros((num_vars, num_vars))
+        for (i, j), val in J_dict.items():
+            J_matrix[i, j] = val
+            J_matrix[j, i] = val
+        
+        # Numba-accelerated annealing
+        @jit(nopython=True)
+        def anneal(h, J_matrix, num_sweeps):
+            state = np.random.choice(np.array([-1, 1]), size=num_vars)
+            betas = np.linspace(0.1, 10.0, num_sweeps)
+            
+            for beta in betas:
+                for _ in range(num_vars):
+                    i = np.random.randint(0, num_vars)
+                    neighbors_sum = np.dot(J_matrix[i], state)
+                    delta_e = 2 * state[i] * (h[i] + neighbors_sum)
+                    if delta_e < 0 or np.random.random() < np.exp(-beta * delta_e):
+                        state[i] *= -1
+            
+            energy = -np.dot(state, h) - 0.5 * np.dot(state, np.dot(J_matrix, state))
+            return state, energy
+        
+        # Run parallel simulated annealing
+        samples = []
+        energies = []
+        
+        for read in range(num_reads):
+            state, energy = anneal(h, J_matrix, num_sweeps)
+            samples.append(state.tolist())
+            energies.append(float(energy))
+        
+        return {
+            "samples": samples,
+            "energies": energies,
+            "timing": {"total": time.time() - start_time}
+        }
+    
+    @gpu_app.function(
+        image=gpu_image,
+        gpu="a10g",
+        timeout=300,
+    )
+    def gpu_sample_a10g(h_dict, J_dict, num_reads, num_sweeps):
+        """GPU sampling on A10G - same implementation, different GPU."""
+        # Reuse T4 implementation
+        return gpu_sample_t4(h_dict, J_dict, num_reads, num_sweeps)
+    
+    @gpu_app.function(
+        image=gpu_image,
+        gpu="a100",
+        timeout=300,
+    )
+    def gpu_sample_a100(h_dict, J_dict, num_reads, num_sweeps):
+        """GPU sampling on A100 - same implementation, different GPU."""
+        # Reuse T4 implementation
+        return gpu_sample_t4(h_dict, J_dict, num_reads, num_sweeps)
+
+
+class GPUSampler:
+    """GPU-accelerated sampler using Modal Labs."""
+    
+    def __init__(self, gpu_type: str = "t4"):
+        """
+        Initialize GPU sampler.
+        
+        Args:
+            gpu_type: GPU type to use ('t4', 'a10g', 'a100')
+                     t4: ~$0.10/hour (budget option)
+                     a10g: ~$0.30/hour (balanced)
+                     a100: ~$1.00/hour (performance)
+        """
+        if not GPU_AVAILABLE:
+            raise ImportError("Modal not installed. Run: pip install modal")
+            
+        self.gpu_type = gpu_type
+        
+        # Map GPU type to function
+        self.gpu_functions = {
+            "t4": gpu_sample_t4,
+            "a10g": gpu_sample_a10g,
+            "a100": gpu_sample_a100
+        }
+        
+        if gpu_type not in self.gpu_functions:
+            raise ValueError(f"Invalid GPU type: {gpu_type}. Choose from: t4, a10g, a100")
+        
+        self._gpu_sample_func = self.gpu_functions[gpu_type]
+    
+    def sample_ising(self, h, J, num_reads=100, num_sweeps=512, **kwargs):
+        """Sample from Ising model using GPU acceleration."""
+        # Convert h and J to dictionaries if needed
+        h_dict = dict(h) if hasattr(h, 'items') else {i: h[i] for i in range(len(h))}
+        J_dict = dict(J) if hasattr(J, 'items') else J
+        
+        # Run on GPU via Modal (without context manager to avoid nested app.run)
+        result = self._gpu_sample_func.remote(h_dict, J_dict, num_reads, num_sweeps)
+        
+        # Format result to match D-Wave interface
+        class SampleSet:
+            def __init__(self, samples, energies):
+                self.record = type('Record', (), {
+                    'sample': np.array(samples),
+                    'energy': np.array(energies)  # Convert to numpy array
+                })()
+        
+        return SampleSet(result["samples"], result["energies"])
+
+class SimulatedAnnealingStructuredSampler(MockDWaveSampler):
+    """Replace the MockSampler by an MCMC sampler with identical structure
+
+    """
+    def __init__(
+        self, qpu=None
+    ):
+        if qpu is None:
+            qpu = DWaveSampler()
+        
+        substitute_sampler = SimulatedAnnealingSampler()
+        super().__init__(
+            nodelist=qpu.nodelist,
+            edgelist=qpu.edgelist,
+            properties=qpu.properties,
+            substitute_sampler=substitute_sampler
+        )
+        self.sampler_type = "mock"
+        self.parameters.update(substitute_sampler.parameters)  # Do not warn when SA parameters are seen.
+        self.mocked_parameters.add('num_sweeps')  # Do not warn when this SA parameter is seen.
 
 @dataclass
 class MiningResult:
@@ -60,7 +231,7 @@ class Miner:
     def __init__(self, miner_id: str, miner_type: str, sampler, difficulty_energy: float, 
                  min_diversity: float, min_solutions: int):
         """
-        Initialize a miner with unique ID.
+        Initialize a miner with unique ID
         
         Note: For GPU miners, integrate gpu_benchmark_modal.py which uses Modal Labs
         for cost-effective GPU acceleration. Modal provides $30/month free credits.
@@ -100,19 +271,9 @@ class Miner:
         seed = int(hashlib.sha256(seed_string.encode()).hexdigest()[:8], 16)
         np.random.seed(seed)
         
-        if hasattr(self.sampler, 'nodelist'):
-            # QPU sampler
-            h = {i: 0 for i in self.sampler.nodelist}
-            J = {edge: 2*np.random.randint(2)-1 for edge in self.sampler.edgelist}
-        else:
-            # Simulated annealing - scale problem size based on miner
-            num_vars = 200 if self.miner_type == "SA" else 64
-            h = {i: 0 for i in range(num_vars)}
-            J = {}
-            for i in range(num_vars):
-                for j in range(i+1, num_vars):
-                    if np.random.random() < 0.3:
-                        J[(i, j)] = 2*np.random.randint(2)-1
+        # QPU sampler
+        h = {i: 0 for i in self.sampler.nodelist}
+        J = {edge: 2*np.random.randint(2)-1 for edge in self.sampler.edgelist}
         
         return h, J
     
@@ -143,8 +304,7 @@ class Miner:
                 if self.miner_type == "QPU":
                     sampleset = self.sampler.sample_ising(h, J, num_reads=100, answer_mode='raw')
                 else:
-                    # SA gets more reads to compensate
-                    sampleset = self.sampler.sample_ising(h, J, num_reads=200, num_sweeps=2048)
+                    sampleset = self.sampler.sample_ising(h, J, num_reads=100, num_sweeps=pow(2,(6 + int(self.miner_id[-1]))))
             except Exception as e:
                 if stop_event.is_set():
                     print(f"{self.miner_id} interrupted during sampling")
@@ -209,11 +369,13 @@ class Miner:
 
 class QuantumBlockchain:
     def __init__(self, competitive: bool = False, 
-                 base_difficulty_energy: float = -1200.0,
-                 base_min_diversity: float = 0.45,
-                 base_min_solutions: int = 20,
+                 base_difficulty_energy: float = -15500.0,
+                 base_min_diversity: float = 0.46,
+                 base_min_solutions: int = 25,
                  num_qpu_miners: int = 1,
-                 num_sa_miners: int = 1):
+                 num_sa_miners: int = 1,
+                 num_gpu_miners: int = 0,
+                 gpu_types: List[str] = None):
         """
         Initialize the quantum blockchain.
         
@@ -224,12 +386,16 @@ class QuantumBlockchain:
             base_min_solutions: Base minimum solutions requirement for all miners
             num_qpu_miners: Number of QPU miners to create (competitive mode)
             num_sa_miners: Number of SA miners to create (competitive mode)
+            num_gpu_miners: Number of GPU miners to create (runs alongside SA miners)
+            gpu_types: List of GPU types for each GPU miner ['t4', 'a10g', 'a100']
         """
         self.chain: List[Block] = []
         self.competitive = competitive
         self.mining_stats = {}  # Will track all miners
         self.num_qpu_miners = num_qpu_miners
-        self.num_sa_miners = num_sa_miners
+        self.num_sa_miners = num_sa_miners  # Keep SA miners even with GPU miners
+        self.num_gpu_miners = num_gpu_miners
+        self.gpu_types = gpu_types or ['t4'] * num_gpu_miners
         
         # Base difficulty parameters
         self.base_difficulty_energy = base_difficulty_energy
@@ -247,8 +413,8 @@ class QuantumBlockchain:
         self.streak_multiplier = 1.0  # Block reward multiplier
         
         # Difficulty adjustment parameters
-        self.energy_adjustment_rate = 0.05  # 5% easier per consecutive win
-        self.diversity_adjustment_rate = 0.02  # 2% easier per consecutive win
+        self.energy_adjustment_rate = 0.01  # 1% easier per consecutive win
+        self.diversity_adjustment_rate = 0.01  # 2% easier per consecutive win
         self.solutions_adjustment_rate = 0.1  # 10% fewer solutions required
         
         if competitive:
@@ -280,8 +446,8 @@ class QuantumBlockchain:
                 
             # Initialize SA miners with SAME parameters
             for i in range(self.num_sa_miners):
-                miner_id = f"SA-{i+1}"
-                sa_sampler = SimulatedAnnealingSampler()
+                miner_id = f"CPU-{i+1}"
+                sa_sampler = SimulatedAnnealingStructuredSampler()
                 sa_miner = Miner(
                     miner_id,
                     "SA",
@@ -292,7 +458,59 @@ class QuantumBlockchain:
                 )
                 self.miners.append(sa_miner)
                 self.miners_by_id[miner_id] = sa_miner
-            print(f"✓ Initialized {self.num_sa_miners} SA miner(s)")
+            if self.num_sa_miners > 0:
+                print(f"✓ Initialized {self.num_sa_miners} SA miner(s)")
+            
+            # Initialize GPU miners if requested
+            if self.num_gpu_miners > 0 and GPU_AVAILABLE:
+                for i in range(self.num_gpu_miners):
+                    miner_id = f"GPU-{i+1}"
+                    gpu_type = self.gpu_types[i] if i < len(self.gpu_types) else 't4'
+                    try:
+                        gpu_sampler = GPUSampler(gpu_type)
+                        gpu_miner = Miner(
+                            miner_id,
+                            f"GPU-{gpu_type.upper()}",
+                            gpu_sampler,
+                            difficulty_energy=self.difficulty_energy,
+                            min_diversity=self.min_diversity,
+                            min_solutions=self.min_solutions
+                        )
+                        self.miners.append(gpu_miner)
+                        self.miners_by_id[miner_id] = gpu_miner
+                        print(f"✓ Initialized GPU-{i+1} ({gpu_type.upper()}) miner")
+                    except Exception as e:
+                        print(f"Failed to initialize GPU-{i+1}: {e}")
+                        # Fall back to SA miner
+                        sa_sampler = SimulatedAnnealingStructuredSampler()
+                        sa_miner = Miner(
+                            f"CPU-{self.num_sa_miners + i + 1}",
+                            "SA",
+                            sa_sampler,
+                            difficulty_energy=self.difficulty_energy,
+                            min_diversity=self.min_diversity,
+                            min_solutions=self.min_solutions
+                        )
+                        self.miners.append(sa_miner)
+                        self.miners_by_id[sa_miner.miner_id] = sa_miner
+                        print(f"  Falling back to SA miner")
+            elif self.num_gpu_miners > 0:
+                print("GPU mining requested but Modal not installed. Using SA miners instead.")
+                # Create SA miners as fallback
+                for i in range(self.num_gpu_miners):
+                    miner_id = f"CPU-{self.num_sa_miners + i + 1}"
+                    sa_sampler = SimulatedAnnealingStructuredSampler()
+                    sa_miner = Miner(
+                        miner_id,
+                        "SA",
+                        sa_sampler,
+                        difficulty_energy=self.difficulty_energy,
+                        min_diversity=self.min_diversity,
+                        min_solutions=self.min_solutions
+                    )
+                    self.miners.append(sa_miner)
+                    self.miners_by_id[miner_id] = sa_miner
+                print(f"✓ Initialized {self.num_gpu_miners} SA miner(s) as GPU fallback")
             
             # Initialize mining stats for all miners
             for miner in self.miners:
@@ -302,7 +520,7 @@ class QuantumBlockchain:
             self.difficulty_energy = -1000.0
             self.min_diversity = 0.25
             self.min_solutions = 10
-            self.sampler = SimulatedAnnealingSampler()
+            self.sampler = SimulatedAnnealingStructuredSampler()
             
         # Create genesis block
         self.create_genesis_block()
@@ -337,13 +555,12 @@ class QuantumBlockchain:
             self.streak_multiplier = 1.0 + (0.5 * self.win_streak)  # 50% bonus per streak
             
             # Make it EASIER (higher energy threshold, lower diversity/solutions)
-            easiness_factor = 1 - (self.energy_adjustment_rate * self.win_streak)
-            self.difficulty_energy = self.base_difficulty_energy * max(0.5, easiness_factor)  # Cap at 50% easier
-            self.min_diversity = max(0.2, self.base_min_diversity * (1 - self.diversity_adjustment_rate * self.win_streak * 2))
-            self.min_solutions = max(3, int(self.base_min_solutions * (1 - self.solutions_adjustment_rate * self.win_streak * 2)))
+            self.difficulty_energy = min(-13500, self.base_difficulty_energy * (1 - (self.energy_adjustment_rate * self.win_streak)))  # Cap at -13500 energy 
+            self.min_diversity = max(0.2, self.base_min_diversity - self.diversity_adjustment_rate * self.win_streak)
+            self.min_solutions = max(10, int(self.base_min_solutions * (1 - self.solutions_adjustment_rate * self.win_streak)))
             
             print(f"\n🔥 {winner} win streak: {self.win_streak} (Reward multiplier: {self.streak_multiplier}x)")
-            print(f"   Difficulty EASED - Energy: {self.difficulty_energy:.1f}, Diversity: {self.min_diversity:.2f}, Solutions: {self.min_solutions}")
+            print(f"   Difficulty EASED to level {self.win_streak} - Energy: {self.difficulty_energy:.1f}, Diversity: {self.min_diversity:.2f}, Solutions: {self.min_solutions}")
         else:
             # Different miner won - make it HARDER
             if self.last_winner and self.win_streak > 0:
@@ -355,13 +572,11 @@ class QuantumBlockchain:
             self.streak_multiplier = 1.0
             
             # Make it HARDER by incrementing difficulty
-            hardness_level = min(5, old_streak)  # Cap at 5 levels harder
-            hardness_factor = 1 + (self.energy_adjustment_rate * hardness_level)
-            self.difficulty_energy = self.base_difficulty_energy * hardness_factor
-            self.min_diversity = min(0.7, self.base_min_diversity * (1 + self.diversity_adjustment_rate * hardness_level))
-            self.min_solutions = min(50, int(self.base_min_solutions * (1 + self.solutions_adjustment_rate * hardness_level)))
+            self.difficulty_energy = max(-15600, self.base_difficulty_energy * (1 + self.energy_adjustment_rate))
+            self.min_diversity = min(0.48, self.base_min_diversity + self.diversity_adjustment_rate)
+            self.min_solutions = min(50, int(self.base_min_solutions * (1 + self.solutions_adjustment_rate)))
             
-            print(f"   Difficulty HARDENED to level {hardness_level} - Energy: {self.difficulty_energy:.1f}, Diversity: {self.min_diversity:.2f}, Solutions: {self.min_solutions}")
+            print(f"   Difficulty HARDENED to level {old_streak - 1} - Energy: {self.difficulty_energy:.1f}, Diversity: {self.min_diversity:.2f}, Solutions: {self.min_solutions}")
             
         # Update all miners with new difficulty
         if self.competitive:
@@ -387,20 +602,9 @@ class QuantumBlockchain:
         seed = int(hashlib.sha256(seed_string.encode()).hexdigest()[:8], 16)
         np.random.seed(seed)
         
-        # Get sampler properties
-        if hasattr(self.sampler, 'nodelist'):
-            # QPU sampler
-            h = {i: 0 for i in self.sampler.nodelist}
-            J = {edge: 2*np.random.randint(2)-1 for edge in self.sampler.edgelist}
-        else:
-            # Simulated annealing - create a small fully connected graph
-            num_vars = 64  # Small problem size for demonstration
-            h = {i: 0 for i in range(num_vars)}
-            J = {}
-            for i in range(num_vars):
-                for j in range(i+1, num_vars):
-                    if np.random.random() < 0.3:  # 30% connectivity
-                        J[(i, j)] = 2*np.random.randint(2)-1
+        # QPU sampler
+        h = {i: 0 for i in self.sampler.nodelist}
+        J = {edge: 2*np.random.randint(2)-1 for edge in self.sampler.edgelist}
         
         return h, J
     
@@ -453,7 +657,7 @@ class QuantumBlockchain:
             if self.use_qpu:
                 sampleset = self.sampler.sample_ising(h, J, num_reads=100, answer_mode='raw')
             else:
-                sampleset = self.sampler.sample_ising(h, J, num_reads=100, num_sweeps=4096)
+                sampleset = self.sampler.sample_ising(h, J, num_reads=100, num_sweeps=512)
             
             # Find all solutions meeting energy threshold
             valid_indices = np.where(sampleset.record.energy < self.difficulty_energy)[0]
@@ -548,7 +752,7 @@ class QuantumBlockchain:
         winning_miner.total_rewards += actual_reward
         
         # Adjust difficulty for next block
-        self.adjust_difficulty(winning_result.miner_type)
+        self.adjust_difficulty(winning_result.miner_id)
         
         return winning_result
     
@@ -684,59 +888,69 @@ class QuantumBlockchain:
         
         # Type summary
         print("\nSummary by Miner Type:")
-        type_stats = {"QPU": 0, "SA": 0}
+        type_stats = {}
         for miner_id, wins in self.mining_stats.items():
             miner_type = miner_id.split('-')[0]
             type_stats[miner_type] = type_stats.get(miner_type, 0) + wins
         
-        for miner_type, wins in type_stats.items():
+        for miner_type, wins in sorted(type_stats.items()):
             percentage = (wins / total_blocks * 100) if total_blocks > 0 else 0
             print(f"  {miner_type}: {wins} blocks ({percentage:.1f}%)")
         
         print(f"\nTotal blocks mined: {total_blocks}")
         
-        # Analyze streaks
+        # Analyze streaks by individual miner
         current_winner = None
         current_streak = 0
-        max_streaks = {"QPU": 0, "SA": 0}
+        max_streaks_by_id = {}
+        max_streaks_by_type = {}
         
         for block in self.chain[1:]:  # Skip genesis
-            if block.miner_type == current_winner:
+            # Track by individual miner ID
+            if block.miner_id == current_winner:
                 current_streak += 1
             else:
                 if current_winner:
-                    max_streaks[current_winner] = max(max_streaks[current_winner], current_streak)
-                current_winner = block.miner_type
+                    max_streaks_by_id[current_winner] = max(max_streaks_by_id.get(current_winner, 0), current_streak)
+                current_winner = block.miner_id
                 current_streak = 1
+            
+            # Also track by type for summary
+            base_type = block.miner_type.split('-')[0] if block.miner_type else None
+            if base_type not in max_streaks_by_type:
+                max_streaks_by_type[base_type] = 0
         
         if current_winner:
-            max_streaks[current_winner] = max(max_streaks[current_winner], current_streak)
+            max_streaks_by_id[current_winner] = max(max_streaks_by_id.get(current_winner, 0), current_streak)
         
-        print(f"\nLongest streaks:")
-        for miner, streak in max_streaks.items():
+        # Update max streaks by type from individual streaks
+        for miner_id, streak in max_streaks_by_id.items():
+            miner_type = miner_id.split('-')[0]
+            max_streaks_by_type[miner_type] = max(max_streaks_by_type.get(miner_type, 0), streak)
+        
+        print(f"\nLongest streaks by individual miner:")
+        for miner, streak in sorted(max_streaks_by_id.items()):
             print(f"  {miner}: {streak} blocks")
         
-        # Analyze mining times
-        qpu_times = []
-        sa_times = []
+        print(f"\nLongest streaks by type:")
+        for miner, streak in sorted(max_streaks_by_type.items()):
+            print(f"  {miner}: {streak} blocks")
+        
+        # Analyze mining times by type
+        mining_times_by_type = {}
         
         for block in self.chain[1:]:  # Skip genesis
-            if block.miner_type == "QPU":
-                qpu_times.append(block.mining_time)
-            elif block.miner_type == "SA":
-                sa_times.append(block.mining_time)
+            base_type = block.miner_type.split('-')[0] if block.miner_type else block.miner_type
+            if base_type not in mining_times_by_type:
+                mining_times_by_type[base_type] = []
+            mining_times_by_type[base_type].append(block.mining_time)
         
-        if qpu_times:
-            print(f"\nQPU Mining Times:")
-            print(f"  Average: {np.mean(qpu_times):.2f}s")
-            print(f"  Min: {np.min(qpu_times):.2f}s")
-            print(f"  Max: {np.max(qpu_times):.2f}s")
-        
-        if sa_times:
-            print(f"\nSA Mining Times:")
-            print(f"  Average: {np.mean(sa_times):.2f}s")
-            print(f"  Min: {np.min(sa_times):.2f}s")
-            print(f"  Max: {np.max(sa_times):.2f}s")
+        for miner_type, times in sorted(mining_times_by_type.items()):
+            if times:
+                print(f"\n{miner_type} Mining Times:")
+                print(f"  Average: {np.mean(times):.2f}s")
+                print(f"  Min: {np.min(times):.2f}s")
+                print(f"  Max: {np.max(times):.2f}s")
     
     def generate_benchmark_plots(self, output_prefix: str = "benchmarks/blockchain_benchmark"):
         """Generate comprehensive benchmark plots."""
@@ -752,28 +966,41 @@ class QuantumBlockchain:
             """Get unique color shade for each miner based on their ID."""
             base_qpu_color = '#4285F4'  # Google blue
             base_sa_color = '#FF8C00'    # Dark orange
+            base_gpu_color = '#00C853'   # Green for GPU miners
             
             if miner_id.startswith('QPU'):
                 # Extract miner number (e.g., QPU-1 -> 1)
                 miner_num = int(miner_id.split('-')[1])
                 # Create shades of blue - lighter for higher numbers
                 # Adjust lightness: 0% = base color, 40% = much lighter
-                lightness_factor = min(0.4, (miner_num - 1) * 0.15)
+                lightness_factor = min(0.4, (miner_num - 1) * 0.20)
                 # Convert hex to RGB, lighten, then back to hex
                 r, g, b = int(base_qpu_color[1:3], 16), int(base_qpu_color[3:5], 16), int(base_qpu_color[5:7], 16)
                 r = int(r + (255 - r) * lightness_factor)
                 g = int(g + (255 - g) * lightness_factor)
                 b = int(b + (255 - b) * lightness_factor)
                 return f'#{r:02x}{g:02x}{b:02x}'
-            else:  # SA miner
+            elif miner_id.startswith('GPU'):
+                # Extract miner number (e.g., GPU-1 -> 1)
+                miner_num = int(miner_id.split('-')[1])
+                # Create shades of green - lighter for higher numbers
+                lightness_factor = min(0.4, (miner_num - 1) * 0.15)
+                r, g, b = int(base_gpu_color[1:3], 16), int(base_gpu_color[3:5], 16), int(base_gpu_color[5:7], 16)
+                r = int(r + (255 - r) * lightness_factor)
+                g = int(g + (255 - g) * lightness_factor)
+                b = int(b + (255 - b) * lightness_factor)
+                return f'#{r:02x}{g:02x}{b:02x}'
+            elif miner_id.startswith('CPU'):  # SA/CPU miner
                 miner_num = int(miner_id.split('-')[1])
                 # Create shades of orange - darker for higher numbers
-                darkness_factor = min(0.4, (miner_num - 1) * 0.15)
+                lightness_factor = min(0.4, (miner_num - 1) * 0.15)
                 r, g, b = int(base_sa_color[1:3], 16), int(base_sa_color[3:5], 16), int(base_sa_color[5:7], 16)
-                r = int(r * (1 - darkness_factor))
-                g = int(g * (1 - darkness_factor))
-                b = int(b * (1 - darkness_factor))
+                r = int(r + (255 - r) * lightness_factor)
+                g = int(g + (255 - g) * lightness_factor)
+                b = int(b + (255 - b) * lightness_factor)
                 return f'#{r:02x}{g:02x}{b:02x}'
+            else:  # Unknown miner type - use gray
+                return '#808080'
         
         # Collect data
         blocks = self.chain[1:]  # Skip genesis
@@ -812,14 +1039,14 @@ class QuantumBlockchain:
                     diff = self.base_difficulty_energy
                 difficulties.append(diff)
             
-            # Calculate reward
+            # Calculate reward based on individual miner streak
             base_reward = 50
             if i == 1:
                 rewards.append(base_reward)
             else:
                 streak = 1
                 for j in range(i-2, -1, -1):
-                    if blocks[j].miner_type == block.miner_type:
+                    if blocks[j].miner_id == block.miner_id:  # Compare by miner_id, not type
                         streak += 1
                     else:
                         break
@@ -849,6 +1076,7 @@ class QuantumBlockchain:
         ax2 = plt.subplot(3, 3, 2)
         qpu_energies = [e for e, m in zip(energies, miner_types) if m == 'QPU']
         sa_energies = [e for e, m in zip(energies, miner_types) if m == 'SA']
+        gpu_energies = [e for e, m in zip(energies, miner_types) if m and m.startswith('GPU')]
         
         data_for_violin = []
         labels = []
@@ -858,10 +1086,16 @@ class QuantumBlockchain:
         if sa_energies:
             data_for_violin.append(sa_energies)
             labels.append('SA')
+        if gpu_energies:
+            data_for_violin.append(gpu_energies)
+            labels.append('GPU')
         
-        parts = ax2.violinplot(data_for_violin, showmeans=True, showmedians=True)
-        ax2.set_xticks(range(1, len(labels) + 1))
-        ax2.set_xticklabels(labels)
+        if data_for_violin:
+            parts = ax2.violinplot(data_for_violin, showmeans=True, showmedians=True)
+            ax2.set_xticks(range(1, len(labels) + 1))
+            ax2.set_xticklabels(labels)
+        else:
+            ax2.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax2.transAxes)
         ax2.set_ylabel('Energy')
         ax2.set_title('Energy Distribution by Miner')
         
@@ -924,37 +1158,47 @@ class QuantumBlockchain:
             ax6.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax6.transAxes)
         ax6.set_title('Win Distribution by Individual Miner')
         
-        # 7. Streak analysis
+        # 7. Streak analysis by individual miner
         ax7 = plt.subplot(3, 3, 7)
-        streaks = []
-        current_miner = miner_types[0]
+        streaks_by_id = []
+        current_miner = miner_ids[0] if miner_ids else None
         current_streak = 1
         
-        for i in range(1, len(miner_types)):
-            if miner_types[i] == current_miner:
+        for i in range(1, len(miner_ids)):
+            if miner_ids[i] == current_miner:
                 current_streak += 1
             else:
-                streaks.append((current_miner, current_streak))
-                current_miner = miner_types[i]
+                streaks_by_id.append((current_miner, current_streak))
+                current_miner = miner_ids[i]
                 current_streak = 1
-        streaks.append((current_miner, current_streak))
+        if current_miner:
+            streaks_by_id.append((current_miner, current_streak))
         
-        qpu_streaks = [s[1] for s in streaks if s[0] == 'QPU']
-        sa_streaks = [s[1] for s in streaks if s[0] == 'SA']
+        # Group streaks by miner ID
+        miner_streak_data = {}
+        for miner_id, streak in streaks_by_id:
+            if miner_id not in miner_streak_data:
+                miner_streak_data[miner_id] = []
+            miner_streak_data[miner_id].append(streak)
         
-        x = ['QPU', 'SA']
-        y_mean = [np.mean(qpu_streaks) if qpu_streaks else 0, 
-                  np.mean(sa_streaks) if sa_streaks else 0]
-        y_max = [max(qpu_streaks) if qpu_streaks else 0, 
-                 max(sa_streaks) if sa_streaks else 0]
+        # Calculate stats for each miner
+        miner_labels = sorted(miner_streak_data.keys())
+        y_mean = [np.mean(miner_streak_data[m]) if miner_streak_data[m] else 0 for m in miner_labels]
+        y_max = [max(miner_streak_data[m]) if miner_streak_data[m] else 0 for m in miner_labels]
         
-        x_pos = np.arange(len(x))
-        ax7.bar(x_pos - 0.2, y_mean, 0.4, label='Average Streak', alpha=0.7)
-        ax7.bar(x_pos + 0.2, y_max, 0.4, label='Max Streak', alpha=0.7)
+        x_pos = np.arange(len(miner_labels))
+        width = 0.35
+        
+        # Use miner colors
+        mean_colors = [get_miner_color(m) for m in miner_labels]
+        max_colors = [get_miner_color(m) for m in miner_labels]
+        
+        ax7.bar(x_pos - width/2, y_mean, width, label='Average Streak', alpha=0.7, color=mean_colors)
+        ax7.bar(x_pos + width/2, y_max, width, label='Max Streak', alpha=0.9, color=max_colors)
         ax7.set_xticks(x_pos)
-        ax7.set_xticklabels(x)
+        ax7.set_xticklabels(miner_labels, rotation=45, ha='right')
         ax7.set_ylabel('Streak Length')
-        ax7.set_title('Mining Streak Analysis')
+        ax7.set_title('Mining Streak Analysis by Individual Miner')
         ax7.legend()
         
         # 8. Mining efficiency (energy per second) by individual miner
@@ -1030,22 +1274,8 @@ class QuantumBlockchain:
         print(f"Saved timing analysis plot to {output_prefix}_timing.png")
 
 
-def main():
-    """Demonstrate quantum blockchain."""
-    import argparse
-    import sys
-    
-    parser = argparse.ArgumentParser(description='Quantum Blockchain Demo')
-    parser.add_argument('--competitive', action='store_true', 
-                       help='Run competitive mining between QPU and SA miners')
-    parser.add_argument('--num-qpu', type=int, default=1,
-                       help='Number of QPU miners (default: 1)')
-    parser.add_argument('--num-sa', type=int, default=1,
-                       help='Number of SA miners (default: 1)')
-    parser.add_argument('--blocks', type=int, default=20,
-                       help='Number of blocks to mine (default: 20)')
-    
-    args = parser.parse_args()
+def run_blockchain(args):
+    """Run the blockchain demo."""
     competitive = args.competitive
     
     if competitive:
@@ -1056,39 +1286,79 @@ def main():
         # Inverted difficulty: starts HARD (QPU-favored) and eases with streaks
         blockchain = QuantumBlockchain(
             competitive=True,
-            base_difficulty_energy=-1200.0,   # Very challenging for SA, easy for QPU
-            base_min_diversity=0.45,          # High diversity requirement
-            base_min_solutions=20,            # High solution count requirement
+            base_difficulty_energy=-15500.0,   # Very challenging for SA, easy for QPU
+            base_min_diversity=0.46,          # High diversity requirement
+            base_min_solutions=25,            # High solution count requirement
             num_qpu_miners=args.num_qpu,
-            num_sa_miners=args.num_sa
+            num_sa_miners=args.num_sa,
+            num_gpu_miners=args.num_gpu,
+            gpu_types=args.gpu_types
         )
         
-        # Mine several blocks competitively
-        transactions = [
-            "Alice initializes quantum wallet",
-            "Bob creates entangled transaction",
-            "Charlie measures quantum state",
-            "Dave collapses superposition",
-            "Eve observes quantum channel",
-            "Frank teleports QUIP tokens",
-            "Grace implements BB84 protocol",
-            "Henry verifies quantum signature",
-            "Iris broadcasts quantum proof",
-            "Jack finalizes consensus",
-            "Kate entangles wallet states",
-            "Liam measures Bell inequality",
-            "Maya performs quantum swap",
-            "Noah validates superposition",
-            "Olivia completes quantum circuit",
-            "Paul initiates phase kickback",
-            "Quinn observes decoherence",
-            "Rachel applies Hadamard gate",
-            "Sam executes CNOT operation",
-            "Tara finalizes quantum consensus"
+        # Names in alphabetical order
+        names = [
+            "Alice", "Bob", "Charlie", "Dave", "Eve", "Frank", "Grace", "Henry", 
+            "Iris", "Jack", "Kate", "Liam", "Maya", "Noah", "Olivia", "Paul",
+            "Quinn", "Rachel", "Sam", "Tara", "Uma", "Victor", "Wendy", "Xavier",
+            "Yvonne", "Zachary", "Aaron", "Bella", "Carlos", "Diana", "Ethan",
+            "Fiona", "Gabriel", "Hannah", "Isaac", "Julia", "Kevin", "Luna",
+            "Marcus", "Nora", "Oscar", "Petra", "Quincy", "Rita", "Stefan",
+            "Tina", "Ulrich", "Vera", "Walter", "Xena", "Yuri", "Zara"
         ]
         
-        # Limit transactions to requested number of blocks
-        for i, tx in enumerate(transactions[:args.blocks]):
+        # Quantum-themed actions
+        quantum_actions = [
+            "initializes quantum wallet",
+            "creates entangled transaction",
+            "measures quantum state",
+            "collapses superposition",
+            "observes quantum channel",
+            "teleports QUIP tokens",
+            "implements BB84 protocol",
+            "verifies quantum signature",
+            "broadcasts quantum proof",
+            "finalizes consensus",
+            "entangles wallet states",
+            "measures Bell inequality",
+            "performs quantum swap",
+            "validates superposition",
+            "completes quantum circuit",
+            "initiates phase kickback",
+            "observes decoherence",
+            "applies Hadamard gate",
+            "executes CNOT operation",
+            "performs Grover search",
+            "applies Shor's algorithm",
+            "creates GHZ state",
+            "performs quantum error correction",
+            "implements quantum key distribution",
+            "executes quantum Fourier transform",
+            "creates cat state",
+            "performs amplitude amplification",
+            "implements variational quantum eigensolver",
+            "executes quantum phase estimation",
+            "creates cluster state",
+            "performs quantum annealing",
+            "implements QAOA circuit",
+            "validates quantum supremacy",
+            "performs quantum tomography",
+            "creates magic state",
+            "implements surface code",
+            "performs quantum bootstrapping",
+            "creates topological qubit",
+            "implements quantum machine learning",
+            "performs quantum sensing"
+        ]
+        
+        # Generate transactions for requested number of blocks
+        transactions = []
+        for i in range(args.blocks):
+            name = names[i % len(names)]
+            action = random.choice(quantum_actions)
+            transactions.append(f"{name} {action}")
+        
+        # Mine blocks with generated transactions
+        for i, tx in enumerate(transactions):
             print(f"\n📝 Transaction {i+1}/{args.blocks}: {tx}")
             blockchain.add_block(tx)
             time.sleep(0.5)  # Brief pause between blocks
@@ -1127,6 +1397,36 @@ def main():
     
     # Validate
     print(f"\nChain valid: {blockchain.validate_chain()}")
+
+
+def main():
+    """Demonstrate quantum blockchain."""
+    import argparse
+    import sys
+    
+    parser = argparse.ArgumentParser(description='Quantum Blockchain Demo')
+    parser.add_argument('--competitive', action='store_true', 
+                       help='Run competitive mining between QPU and SA miners')
+    parser.add_argument('--num-qpu', type=int, default=1,
+                       help='Number of QPU miners (default: 1)')
+    parser.add_argument('--num-sa', type=int, default=1,
+                       help='Number of SA miners (default: 1)')
+    parser.add_argument('--num-gpu', type=int, default=0,
+                       help='Number of GPU miners (runs concurrently with SA miners)')
+    parser.add_argument('--gpu-types', type=str, nargs='+', 
+                       default=['t4'],
+                       help='GPU types for each GPU miner: t4, a10g, a100')
+    parser.add_argument('--blocks', type=int, default=20,
+                       help='Number of blocks to mine (default: 20)')
+    
+    args = parser.parse_args()
+    
+    # If GPU miners are requested and Modal is available, run with Modal context
+    if args.num_gpu > 0 and GPU_AVAILABLE:
+        with gpu_app.run():
+            run_blockchain(args)
+    else:
+        run_blockchain(args)
 
 
 if __name__ == "__main__":

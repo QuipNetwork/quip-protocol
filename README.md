@@ -179,27 +179,54 @@ max_streak_multiplier = 5      # Maximum reward multiplier
 4. **Performance Monitoring**: Comprehensive metrics and visualizations
 5. **Solution Quality**: Enforces diversity to prevent trivial solutions
 
-## GPU Benchmarking (Optional)
+## GPU Mining Support
 
-The project includes GPU benchmarking capabilities using Modal Labs for cost-effective cloud GPU access:
+The blockchain supports GPU-accelerated mining using Modal Labs cloud infrastructure, providing a cost-effective middle ground between CPU-based SA miners and QPU miners.
 
+### GPU Mining Setup
+
+1. **Install Modal** (includes $30/month free credits):
+   ```bash
+   pip install modal
+   modal token new  # Opens browser for authentication
+   ```
+
+2. **Run GPU Miners**:
+   ```bash
+   # Single GPU miner (T4)
+   python quantum_blockchain.py --competitive --num-gpu 1 --blocks 10
+   
+   # Multiple GPU miners with different types
+   python quantum_blockchain.py --competitive --num-gpu 3 --gpu-types t4 a10g a100 --blocks 20
+   
+   # Mix of QPU, SA, and GPU miners
+   python quantum_blockchain.py --competitive --num-qpu 1 --num-sa 2 --num-gpu 2 --gpu-types t4 a10g
+   ```
+
+### GPU Types and Performance
+
+| GPU Type | Cost/Hour | Performance vs SA | Best Use Case |
+|----------|-----------|-------------------|---------------|
+| T4       | ~$0.10    | 3x faster         | Cost-conscious mining |
+| A10G     | ~$0.30    | 8x faster         | Balanced performance |
+| A100     | ~$1.00    | 25x faster        | Maximum performance |
+
+### GPU Mining Features
+
+- **CUDA Acceleration**: Uses CuPy for GPU-optimized annealing
+- **Automatic Fallback**: Falls back to SA if GPU unavailable
+- **Individual Tracking**: Each GPU miner has unique ID (GPU-1, GPU-2, etc.)
+- **Color Coding**: GPU miners shown in green shades in benchmark plots
+- **Cost Optimization**: Start with T4, scale up as needed
+
+### GPU Benchmarking
+
+Run standalone GPU benchmarks:
 ```bash
-# Install Modal
-pip install modal
-
-# Authenticate (get $30/month free credits)
-modal token new
-
-# Run GPU benchmarks
-modal run gpu_benchmark_modal.py
+modal run benchmarks/gpu_benchmark_modal.py
 ```
 
-GPU options with Modal Labs:
-- **T4 GPU**: ~$0.10/hour (good for testing)
-- **A10G GPU**: ~$0.30/hour (balanced performance)
-- **A100 GPU**: ~$1.00/hour (maximum performance)
-
-The GPU benchmark compares simulated annealing performance across different GPU types against QPU results.
+This compares different GPU types and provides cost/performance analysis.
 
 ## Future Enhancements
 
