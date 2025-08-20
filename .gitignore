@@ -21,3 +21,4 @@ ENV/
 *.log
 *.csv
 results/
+quip_protocol.egg-info/
