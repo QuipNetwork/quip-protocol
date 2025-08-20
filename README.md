@@ -17,8 +17,8 @@ The blockchain demonstrates:
 
 1. Create and activate a virtual environment (Python 3.10+):
    ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate  # Windows: .venv\Scripts\activate
+   python3 -m venv .quip
+   source .quip/bin/activate  # Windows: .venv\Scripts\activate
    ```
 
 2. Install the package in editable mode using the standardized requirements file:
@@ -59,6 +59,79 @@ quip-protocol/
 │   ├── blockchain_benchmark_timing.png
 │   └── benchmark_results.json
 └── venv/                      # Python virtual environment
+```
+
+## New Click-based CLIs
+
+Two new commands provide a friendlier CLI using Click while keeping existing scripts intact.
+
+### quip-network-node
+
+Run a single P2P node of a specific type. Subcommands: cpu, gpu, qpu.
+
+- Always enables competitive mode
+- Implies a single miner of that type (num-sa/num-gpu/num-qpu = 1)
+- Supports a top-level --config TOML that can choose a default subcommand
+- Global settings provide host, port, peer, and auto_mine
+- CPU supports --num-cpus to cap threads via OMP/MKL/BLAS env vars
+- GPU supports --device selector; in TOML you can list [gpu].devices
+- QPU supports D-Wave settings via CLI or TOML under [qpu]
+
+Examples:
+
+```bash
+# CPU node (bootstrap), limit to 4 threads
+quip-network-node cpu --port 8080 --num-cpus 4
+
+# GPU node joining bootstrap with device 0
+quip-network-node gpu --port 8082 --peer localhost:8080 --device 0
+
+# Use TOML config to choose default subcommand and flags
+quip-network-node --config ./quip-node.example.toml
+```
+
+TOML structure:
+
+```toml
+[global]
+default = "gpu"  # or "cpu"/"qpu"
+# Global network options
+host = "0.0.0.0"
+port = 8082
+peer = "localhost:8080"
+auto_mine = 0
+
+[cpu]
+# Limit CPU worker threads; max is number of logical CPUs
+num_cpus = 4
+
+[gpu]
+# Devices to mine with; first is used unless --device overrides
+# For CUDA, these can be ordinals like "0", "1"
+devices = ["0", "1"]
+
+[qpu]
+# Provide any of these to configure D-Wave access; can also pass on CLI
+# dwave_api_key = "..."
+# dwave_api_solver = "Advantage_system6.4"
+# dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"  # default
+```
+
+See a working example in quip-node.example.toml.
+
+### quip-network-simulator
+
+Mimics launch_network.py scenarios, but runs separate processes via quip-network-node and prints the exact commands:
+
+```bash
+# Mixed (approx. 3 CPU, 2 GPU, 1 QPU)
+quip-network-simulator --scenario mixed
+
+# CPU-only with 4 nodes
+quip-network-simulator --scenario cpu
+
+# GPU-only with overrides and base port (print only)
+quip-network-simulator --scenario gpu --num-gpu 2 --base-port 9000 --print-only
 ```
 
 ## Usage
@@ -207,10 +280,10 @@ The blockchain supports GPU-accelerated mining using Modal Labs cloud infrastruc
    ```bash
    # Single GPU miner (T4)
    python quantum_blockchain.py --competitive --num-gpu 1 --blocks 10
-   
+
    # Multiple GPU miners with different types
    python quantum_blockchain.py --competitive --num-gpu 3 --gpu-types t4 a10g a100 --blocks 20
-   
+
    # Mix of QPU, SA, and GPU miners
    python quantum_blockchain.py --competitive --num-qpu 1 --num-sa 2 --num-gpu 2 --gpu-types t4 a10g
    ```
@@ -268,7 +341,7 @@ The blockchain now includes a peer-to-peer networking layer that enables nodes t
    ```bash
    # Connect to bootstrap node
    python quantum_blockchain_p2p.py --port 8081 --peer localhost:8080 --competitive --num-sa 2
-   
+
    # Add GPU miners
    python quantum_blockchain_p2p.py --port 8082 --peer localhost:8080 --competitive --num-gpu 1 --num-sa 1
    ```
@@ -294,7 +367,7 @@ python quantum_blockchain_p2p.py --port 8080 --competitive
 # Terminal 2: SA mining node
 python quantum_blockchain_p2p.py --port 8081 --peer localhost:8080 --competitive --num-sa 3
 
-# Terminal 3: GPU mining node  
+# Terminal 3: GPU mining node
 python quantum_blockchain_p2p.py --port 8082 --peer localhost:8080 --competitive --num-gpu 2 --gpu-types t4 a10g
 
 # Terminal 4: Mixed mining node
@@ -387,7 +460,7 @@ python CPU/cpu_miner.py --id 2 --port 8081 --peer localhost:8080 --num-sweeps 81
 # Terminal 3: GPU node (T4)
 python GPU/gpu_miner.py --id 1 --port 8082 --peer localhost:8080
 
-# Terminal 4: GPU node (A10G) 
+# Terminal 4: GPU node (A10G)
 python GPU/gpu_miner.py --id 2 --port 8083 --peer localhost:8080 --gpu-type a10g
 
 # Terminal 5: QPU node

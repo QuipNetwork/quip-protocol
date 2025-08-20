@@ -1,0 +1,32 @@
+[global]
+# default subcommand to run when no subcommand is provided to `quip-network-node`
+# one of: cpu, gpu, qpu
+default = "gpu"
+
+# Global network settings
+host = "0.0.0.0"
+port = 8082
+peer = "localhost:8080"
+auto_mine = 0
+
+[cpu]
+# Limit CPU worker threads; max is number of logical CPUs on your system
+num_cpus = 4
+
+[gpu]
+# If provided, the first device is used unless --device is passed on CLI
+# For CUDA, these can be ordinals like "0", "1"
+devices = ["0", "1"]
+
+[qpu]
+# Credentials and region for D-Wave
+# If omitted here, can be supplied on CLI
+# Endpoint defaults to na-west-1 SAPI
+# DWAVE_API_TOKEN
+# DWAVE_API_SOLVER
+# DWAVE_API_ENDPOINT
+# Fill as desired:
+# dwave_api_key = "..."
+# dwave_api_solver = "Advantage_system6.4"
+# dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+
