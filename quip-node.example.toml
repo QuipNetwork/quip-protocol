@@ -14,9 +14,12 @@ auto_mine = 0
 num_cpus = 4
 
 [gpu]
-# If provided, the first device is used unless --device is passed on CLI
-# For CUDA, these can be ordinals like "0", "1"
+# Backend selection: "local" (default) uses local GPUs (CUDA/ROCm/MPS). "modal" uses Modal cloud GPUs.
+backend = "local"
+# For local backend: list devices to use (e.g., CUDA ordinals like "0", "1"). If omitted, runtime may auto-detect.
 devices = ["0", "1"]
+# For modal backend: list GPU types to use (e.g., ["t4", "a10g"]).
+# types = ["t4", "a10g"]
 
 [qpu]
 # Credentials and region for D-Wave

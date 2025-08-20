@@ -83,7 +83,7 @@ devices = ["1", "2"]
 
     # Act: explicitly pass device 0
     runner = CliRunner()
-    result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path), "gpu", "--device", "0"]) 
+    result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path), "gpu", "--device", "0"])
 
     # Assert
     assert result.exit_code == 0, result.output
@@ -118,7 +118,8 @@ devices = ["3", "4"]
     # Assert
     assert result.exit_code == 0, result.output
     assert captured["kind"] == "gpu"
-    assert captured["env"].get("CUDA_VISIBLE_DEVICES") == "3"
+    # With no --device, we export QUIP_GPU_DEVICES (comma-separated) rather than CUDA_VISIBLE_DEVICES
+    assert captured["env"].get("QUIP_GPU_DEVICES") == "3,4"
 
 
 def test_qpu_env_from_toml_and_defaults(tmp_path, monkeypatch):
@@ -165,4 +166,66 @@ def test_simulator_print_only_commands(tmp_path):
     out = result.output
     assert "Running: quip-network-node cpu --port 9000" in out
     assert "Running: quip-network-node cpu --port 9001 --peer localhost:9000" in out
+
+
+
+def test_gpu_modal_types_env(tmp_path, monkeypatch):
+    # Arrange: backend=modal with types
+    cfg = """
+[global]
+default = "gpu"
+
+[gpu]
+backend = "modal"
+types = ["t4", "a10g"]
+"""
+    cfg_path = write_toml(tmp_path, cfg)
+
+    captured: Dict[str, Any] = {}
+
+    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None):
+        captured.update({"kind": kind, "env": env_overrides or {}})
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_p2p_node", fake_run)
+
+    # Act
+    runner = CliRunner()
+    result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path)])
+
+    # Assert
+    assert result.exit_code == 0, result.output
+    assert captured["kind"] == "gpu"
+    assert captured["env"].get("QUIP_GPU_BACKEND") == "modal"
+    assert captured["env"].get("QUIP_GPU_TYPES") == "t4,a10g"
+
+
+
+def test_gpu_backend_cli_override(tmp_path, monkeypatch):
+    # Arrange: TOML says local, CLI overrides to modal
+    cfg = """
+[global]
+default = "gpu"
+
+[gpu]
+backend = "local"
+types = ["t4"]
+"""
+    cfg_path = write_toml(tmp_path, cfg)
+
+    captured: Dict[str, Any] = {}
+
+    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None):
+        captured.update({"kind": kind, "env": env_overrides or {}})
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_p2p_node", fake_run)
+
+    # Act: override via CLI
+    runner = CliRunner()
+    result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path), "gpu", "--gpu-backend", "modal"])
+
+    # Assert
+    assert result.exit_code == 0, result.output
+    assert captured["env"].get("QUIP_GPU_BACKEND") == "modal"
 

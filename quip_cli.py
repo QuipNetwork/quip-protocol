@@ -67,9 +67,8 @@ def quip_network_node(ctx: click.Context, config: Optional[str]):
         if default_cmd == "cpu":
             ctx.invoke(cpu, num_cpus=sub_cfg.get("num_cpus"), **common_kwargs)
         elif default_cmd == "gpu":
-            devices = sub_cfg.get("devices") or []
-            device = devices[0] if isinstance(devices, list) and devices else None
-            ctx.invoke(gpu, device=device, **common_kwargs)
+            # Defer device/backend handling to the gpu() command, which will read [gpu] config
+            ctx.invoke(gpu, device=None, **common_kwargs)
         else:
             qpu_kwargs = {
                 "dwave_api_key": sub_cfg.get("dwave_api_key"),
@@ -154,23 +153,40 @@ def cpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Opti
 @click.option("--peer", type=str, default=None, help="Peer address host:port to join (defaults from [global].peer)")
 @click.option("--auto-mine", type=int, default=None, help="Automatically mine N blocks (defaults from [global].auto_mine or 0)")
 @click.option("--device", type=str, help="GPU device selector (e.g., CUDA ordinal)")
+@click.option("--gpu-backend", type=click.Choice(["local", "modal"], case_sensitive=False), help="Override GPU backend (local or modal)")
 @click.pass_context
-def gpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Optional[str], auto_mine: Optional[int], device: Optional[str]):
-    """Run a GPU node (1 GPU miner)."""
+def gpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Optional[str], auto_mine: Optional[int], device: Optional[str], gpu_backend: Optional[str]):
+    """Run a GPU node (multi-GPU capable)."""
     global_cfg = ((ctx.obj or {}).get("config", {}) or {}).get("global", {})
     host = host if host is not None else global_cfg.get("host", "0.0.0.0")
     port = port if port is not None else int(global_cfg.get("port", 8080))
     peer = peer if peer is not None else global_cfg.get("peer")
     auto_mine = auto_mine if auto_mine is not None else int(global_cfg.get("auto_mine", 0))
 
-    # If config provided devices array and device not given, pick first
+    # Read GPU config
     cfg = (ctx.obj or {}).get("config", {}) if hasattr(ctx, "obj") else {}
-    if device is None:
-        devs = (cfg.get("gpu", {}) or {}).get("devices")
-        if isinstance(devs, list) and devs:
-            device = str(devs[0])
-    env = {"CUDA_VISIBLE_DEVICES": device} if device else None
-    sys.exit(_run_p2p_node("gpu", host, port, peer, auto_mine, env_overrides=env))
+    gpu_cfg = (cfg.get("gpu", {}) or {})
+    backend = (gpu_backend or str(gpu_cfg.get("backend", "local"))).lower()
+    devices_cfg = gpu_cfg.get("devices")  # list or None
+    types_cfg = gpu_cfg.get("types")      # list or None (for modal)
+
+    # If CLI --device provided, override to single device
+    env: Dict[str, Any] = {}
+    if device is not None:
+        env["QUIP_GPU_DEVICES"] = str(device)
+        # For backward compatibility with single device workflows
+        env["CUDA_VISIBLE_DEVICES"] = str(device)
+    else:
+        if isinstance(devices_cfg, list) and devices_cfg:
+            env["QUIP_GPU_DEVICES"] = ",".join(str(d) for d in devices_cfg)
+
+    # Backend selection (default local)
+    env["QUIP_GPU_BACKEND"] = backend
+    if backend == "modal":
+        if isinstance(types_cfg, list) and types_cfg:
+            env["QUIP_GPU_TYPES"] = ",".join(str(t) for t in types_cfg)
+
+    sys.exit(_run_p2p_node("gpu", host, port, peer, auto_mine, env_overrides=env or None))
 
 
 @quip_network_node.command(name="qpu")

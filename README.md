@@ -74,7 +74,7 @@ Run a single P2P node of a specific type. Subcommands: cpu, gpu, qpu.
 - Supports a top-level --config TOML that can choose a default subcommand
 - Global settings provide host, port, peer, and auto_mine
 - CPU supports --num-cpus to cap threads via OMP/MKL/BLAS env vars
-- GPU supports --device selector; in TOML you can list [gpu].devices
+- GPU supports multi-device via [gpu] in TOML (backend=local|modal); --device forces single device
 - QPU supports D-Wave settings via CLI or TOML under [qpu]
 
 Examples:
@@ -88,6 +88,11 @@ quip-network-node gpu --port 8082 --peer localhost:8080 --device 0
 
 # Use TOML config to choose default subcommand and flags
 quip-network-node --config ./quip-node.example.toml
+
+# Modal backend example via TOML
+# [gpu]
+# backend = "modal"
+# types = ["t4", "a10g"]
 ```
 
 TOML structure:
@@ -106,9 +111,12 @@ auto_mine = 0
 num_cpus = 4
 
 [gpu]
-# Devices to mine with; first is used unless --device overrides
-# For CUDA, these can be ordinals like "0", "1"
+# Backend selection: "local" (default) uses local GPUs (CUDA/ROCm/MPS). "modal" uses Modal cloud GPUs.
+backend = "local"
+# For local backend: list devices to use (CUDA ordinals like "0", "1"). If omitted, runtime may auto-detect.
 devices = ["0", "1"]
+# For modal backend: list GPU types to use (e.g., ["t4", "a10g"]).
+# types = ["t4", "a10g"]
 
 [qpu]
 # Provide any of these to configure D-Wave access; can also pass on CLI
