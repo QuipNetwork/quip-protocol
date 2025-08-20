@@ -15,16 +15,18 @@ The blockchain demonstrates:
 
 ## Setup
 
-1. Create and activate a Python 3.13 virtual environment:
+1. Create and activate a virtual environment (Python 3.10+):
    ```bash
-   python3.13 -m venv venv
-   source venv/bin/activate
+   python3 -m venv .venv
+   source .venv/bin/activate  # Windows: .venv\Scripts\activate
    ```
 
-2. Install dependencies:
+2. Install the package in editable mode using the standardized requirements file:
    ```bash
-   pip install -r requirements.txt
+   pip install -U pip setuptools wheel
+   pip install -e .
    ```
+   This will install all dependencies from requirements.txt and register console scripts.
 
 3. Set up D-Wave API credentials (optional, for QPU access):
    ```bash
