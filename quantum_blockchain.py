@@ -536,6 +536,11 @@ class Miner:
         # Track participation in current round
         self.current_round_attempted = False
         
+        # Track last block received time for difficulty adjustment
+        self.last_block_received_time = time.time()
+        self.no_block_timeout = 1800  # 30 minutes in seconds
+        self.difficulty_reduction_factor = 0.1  # Reduce difficulty by 10% per timeout
+        
         # Adaptive parameters for performance tuning
         # Initialize num_sweeps based on miner ID for SA miners
         initial_sweeps = 512
@@ -844,6 +849,37 @@ class Miner:
 
         return h, J
 
+    def check_and_adjust_difficulty_for_timeout(self):
+        """Check if no block has been received for 30 minutes and adjust difficulty."""
+        time_since_last_block = time.time() - self.last_block_received_time
+        
+        if time_since_last_block > self.no_block_timeout:
+            # Calculate how many 30-minute periods have passed
+            timeout_periods = int(time_since_last_block / self.no_block_timeout)
+            
+            # Reduce difficulty for each timeout period
+            original_difficulty = self.difficulty_energy
+            self.difficulty_energy = min(
+                -13000,  # Cap at easier difficulty
+                self.difficulty_energy * (1 + self.difficulty_reduction_factor * timeout_periods)
+            )
+            
+            # Also relax diversity and solution requirements
+            self.min_diversity = max(0.15, self.min_diversity * (1 - self.difficulty_reduction_factor * timeout_periods))
+            self.min_solutions = max(5, int(self.min_solutions * (1 - self.difficulty_reduction_factor * timeout_periods)))
+            
+            if original_difficulty != self.difficulty_energy:
+                print(f"{self.miner_id} adjusting difficulty due to {time_since_last_block/60:.1f} minutes without new block:")
+                print(f"  Energy: {original_difficulty:.2f} -> {self.difficulty_energy:.2f}")
+                print(f"  Diversity: {self.min_diversity:.3f}, Solutions: {self.min_solutions}")
+            
+            return True
+        return False
+    
+    def reset_block_received_time(self):
+        """Reset the last block received time when a new block is received."""
+        self.last_block_received_time = time.time()
+
     def mine_block(self, block_header: str, result_queue: queue.Queue, stop_event: threading.Event):
         """Mine a block in a separate thread.
         
@@ -853,6 +889,9 @@ class Miner:
         self.mining = True
         progress = 0  # Progress counter for logging
         start_time = time.time()
+        
+        # Check for timeout-based difficulty adjustment
+        self.check_and_adjust_difficulty_for_timeout()
         
         # Track current stage timing
         self.current_stage = None
@@ -1654,6 +1693,12 @@ class QuantumBlockchain:
 
         new_block.hash = new_block.compute_hash()
         self.chain.append(new_block)
+        
+        # Reset block received time for all miners when a new block is added
+        if self.competitive_mode:
+            for miner in self.miners:
+                miner.reset_block_received_time()
+        
         return new_block
 
     def validate_chain(self) -> bool:
