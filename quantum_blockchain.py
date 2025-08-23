@@ -510,6 +510,44 @@ class Miner:
         print(f"{miner_id} initialized with:")
         print(f"  ECDSA Public Key: {self.ecdsa_public_key_hex[:16]}...")
         print(f"  WOTS+ Public Key: {self.wots_plus_public_key_hex[:16]}...")
+        
+        # Initialize timing statistics
+        self.timing_stats = {
+            'preprocessing': [],
+            'sampling': [],
+            'postprocessing': [],
+            'quantum_annealing_time': [],
+            'per_sample_overhead': [],
+            'total_samples': 0,
+            'blocks_attempted': 0
+        }
+        
+        # Track timing history for graphing (block_number, timing_value)
+        self.timing_history = {
+            'block_numbers': [],
+            'preprocessing_times': [],
+            'sampling_times': [],
+            'postprocessing_times': [],
+            'total_times': [],
+            'win_rates': [],
+            'adaptive_params_history': []  # Track adaptive params over time
+        }
+        
+        # Track participation in current round
+        self.current_round_attempted = False
+        
+        # Adaptive parameters for performance tuning
+        # Initialize num_sweeps based on miner ID for SA miners
+        initial_sweeps = 512
+        if miner_type != "QPU" and miner_id and miner_id[-1].isdigit():
+            initial_sweeps = pow(2, 6 + int(miner_id[-1]))
+        
+        self.adaptive_params = {
+            'quantum_annealing_time': 20.0,  # microseconds for QPU
+            'beta_range': [0.1, 10.0],  # for SA
+            'beta_schedule': 'geometric',  # or 'linear'
+            'num_sweeps': initial_sweeps  # for SA
+        }
 
     def calculate_hamming_distance(self, s1: List[int], s2: List[int]) -> int:
         """Calculate symmetric Hamming distance between two binary strings.
@@ -656,6 +694,108 @@ class Miner:
         
         return [solutions[i] for i in selected_indices]
     
+    def capture_partial_timing(self):
+        """Capture timing for current mining attempt, including partial progress."""
+        current_time = time.time()
+        
+        # Initialize with zeros
+        preprocessing_time = 0
+        sampling_time = 0
+        postprocessing_time = 0
+        
+        # If we have completed preprocessing
+        if len(self.timing_stats['preprocessing']) > len(self.timing_stats['sampling']):
+            # Preprocessing was completed
+            preprocessing_time = self.timing_stats['preprocessing'][-1]
+            
+            # Check if sampling was started
+            if self.current_stage == 'sampling' and self.current_stage_start:
+                # Sampling was in progress
+                sampling_time = (current_time - self.current_stage_start) * 1e6
+                postprocessing_time = 0  # Not started
+            elif self.current_stage == 'postprocessing' and self.current_stage_start:
+                # Sampling was completed, postprocessing in progress
+                if self.timing_stats['sampling']:
+                    sampling_time = self.timing_stats['sampling'][-1]
+                postprocessing_time = (current_time - self.current_stage_start) * 1e6
+        elif self.current_stage == 'preprocessing' and self.current_stage_start:
+            # Still in preprocessing
+            preprocessing_time = (current_time - self.current_stage_start) * 1e6
+            sampling_time = 0
+            postprocessing_time = 0
+        
+        return preprocessing_time, sampling_time, postprocessing_time
+    
+    def get_timing_summary(self) -> str:
+        """Generate a summary of timing statistics for this miner."""
+        summary_lines = [f"\nTiming Statistics for {self.miner_id}:"]
+        
+        if self.timing_stats['blocks_attempted'] > 0:
+            summary_lines.append(f"  Blocks Attempted: {self.timing_stats['blocks_attempted']}")
+            summary_lines.append(f"  Total Samples: {self.timing_stats['total_samples']}")
+            summary_lines.append(f"  Blocks Won: {self.blocks_won}")
+            summary_lines.append(f"  Win Rate: {self.blocks_won / self.timing_stats['blocks_attempted'] * 100:.1f}%")
+        
+        # Calculate averages for each timing component
+        for component in ['preprocessing', 'sampling', 'postprocessing']:
+            if self.timing_stats[component]:
+                avg_time = np.mean(self.timing_stats[component])
+                std_time = np.std(self.timing_stats[component])
+                summary_lines.append(f"  {component.capitalize()} Time: {avg_time:.2f} ± {std_time:.2f} μs")
+        
+        # QPU-specific timing
+        if self.timing_stats['quantum_annealing_time']:
+            avg_anneal = np.mean(self.timing_stats['quantum_annealing_time'])
+            summary_lines.append(f"  Quantum Annealing Time: {avg_anneal:.2f} μs")
+        
+        # Show adaptive parameters
+        if self.miner_type == "QPU":
+            summary_lines.append(f"  Current Annealing Time: {self.adaptive_params['quantum_annealing_time']:.2f} μs")
+        else:
+            summary_lines.append(f"  Current Num Sweeps: {self.adaptive_params['num_sweeps']}")
+            summary_lines.append(f"  Beta Range: {self.adaptive_params['beta_range']}")
+            summary_lines.append(f"  Beta Schedule: {self.adaptive_params['beta_schedule']}")
+        
+        return "\n".join(summary_lines)
+    
+    def adapt_parameters(self, network_stats: dict):
+        """Adapt miner parameters based on performance relative to network.
+        
+        Args:
+            network_stats: Dict containing total_blocks, total_miners, avg_win_rate
+        """
+        if self.timing_stats['blocks_attempted'] < 5:
+            return  # Need enough data before adapting
+        
+        # Calculate expected win rate (fair share)
+        expected_win_rate = 1.0 / network_stats['total_miners']
+        actual_win_rate = self.blocks_won / self.timing_stats['blocks_attempted']
+        
+        # If winning less than expected, improve parameters
+        if actual_win_rate < expected_win_rate * 0.8:  # 20% below expected
+            if self.miner_type == "QPU":
+                # Increase annealing time for better solutions
+                self.adaptive_params['quantum_annealing_time'] *= 1.2
+                print(f"{self.miner_id} increasing annealing time to {self.adaptive_params['quantum_annealing_time']:.2f} μs")
+            else:
+                # For SA, increase sweeps or adjust beta range
+                self.adaptive_params['num_sweeps'] = int(self.adaptive_params['num_sweeps'] * 1.1)
+                # Widen beta range for better exploration
+                self.adaptive_params['beta_range'][0] *= 0.9
+                self.adaptive_params['beta_range'][1] *= 1.1
+                print(f"{self.miner_id} adapting: sweeps={self.adaptive_params['num_sweeps']}, beta_range={self.adaptive_params['beta_range']}")
+        
+        # If winning too much, can reduce parameters to save resources
+        elif actual_win_rate > expected_win_rate * 1.5:  # 50% above expected
+            if self.miner_type == "QPU":
+                # Reduce annealing time to save QPU resources
+                self.adaptive_params['quantum_annealing_time'] *= 0.9
+                print(f"{self.miner_id} reducing annealing time to {self.adaptive_params['quantum_annealing_time']:.2f} μs")
+            else:
+                # For SA, reduce sweeps for faster mining
+                self.adaptive_params['num_sweeps'] = int(self.adaptive_params['num_sweeps'] * 0.95)
+                print(f"{self.miner_id} reducing sweeps to {self.adaptive_params['num_sweeps']}")
+    
     def generate_new_wots_key(self):
         """Generate a new WOTS+ key pair after using the current one."""
         self.wots_plus = WOTSPlus()
@@ -713,6 +853,13 @@ class Miner:
         self.mining = True
         progress = 0  # Progress counter for logging
         start_time = time.time()
+        
+        # Track current stage timing
+        self.current_stage = None
+        self.current_stage_start = None
+        
+        # Mark that this miner is attempting this round
+        self.current_round_attempted = True
 
         print(f"{self.miner_id} started...")
 
@@ -733,12 +880,63 @@ class Miner:
                 print(f"{self.miner_id} interrupted")
                 return
 
+            # Track preprocessing time
+            preprocess_start = time.time()
+            self.current_stage = 'preprocessing'
+            self.current_stage_start = preprocess_start
+            
             # Sample from quantum/simulated annealer
             try:
                 if self.miner_type == "QPU":
-                    sampleset = self.sampler.sample_ising(h, J, num_reads=100, answer_mode='raw')
+                    sampleset = self.sampler.sample_ising(
+                        h, J, 
+                        num_reads=100, 
+                        answer_mode='raw',
+                        annealing_time=self.adaptive_params.get('quantum_annealing_time', 20.0)
+                    )
+                    # Extract QPU timing information if available
+                    if hasattr(sampleset, 'info') and 'timing' in sampleset.info:
+                        timing = sampleset.info['timing']
+                        if 'qpu_anneal_time_per_sample' in timing:
+                            self.timing_stats['quantum_annealing_time'].append(
+                                timing['qpu_anneal_time_per_sample']
+                            )
+                        if 'qpu_sampling_time' in timing:
+                            self.timing_stats['sampling'].append(timing['qpu_sampling_time'])
+                        if 'qpu_programming_time' in timing:
+                            self.timing_stats['preprocessing'].append(timing['qpu_programming_time'])
                 else:
-                    sampleset = self.sampler.sample_ising(h, J, num_reads=100, num_sweeps=pow(2,(6 + int(self.miner_id[-1]))))
+                    # For SA, use adaptive parameters
+                    num_sweeps = self.adaptive_params.get('num_sweeps', 512)
+                    
+                    sample_start = time.time()
+                    self.current_stage = 'sampling'
+                    self.current_stage_start = sample_start
+                    
+                    # Build sampling parameters based on sampler type
+                    sampling_params = {
+                        'h': h,
+                        'J': J,
+                        'num_reads': 100,
+                        'num_sweeps': num_sweeps
+                    }
+                    
+                    # Only add beta parameters for actual SimulatedAnnealingSampler
+                    # MockDWaveSampler doesn't support these parameters
+                    if hasattr(self.sampler, 'sampler_type') and self.sampler.sampler_type == 'mock':
+                        # MockDWaveSampler - don't add beta parameters
+                        pass
+                    else:
+                        # Actual SimulatedAnnealingSampler - add beta parameters
+                        sampling_params['beta_range'] = self.adaptive_params.get('beta_range', [0.1, 10.0])
+                        sampling_params['beta_schedule_type'] = self.adaptive_params.get('beta_schedule', 'geometric')
+                    
+                    sampleset = self.sampler.sample_ising(**sampling_params)
+                    sample_time = time.time() - sample_start
+                    
+                    # Estimate SA timing components
+                    self.timing_stats['sampling'].append(sample_time * 1e6)  # Convert to microseconds
+                    self.timing_stats['preprocessing'].append((time.time() - preprocess_start) * 1e6)
             except Exception as e:
                 if stop_event.is_set():
                     print(f"{self.miner_id} interrupted during sampling")
@@ -752,8 +950,17 @@ class Miner:
                 print(f"{self.miner_id} interrupted")
                 return
 
+            # Track postprocessing time
+            postprocess_start = time.time()
+            self.current_stage = 'postprocessing'
+            self.current_stage_start = postprocess_start
+            
             # Find all solutions meeting energy threshold
             valid_indices = np.where(sampleset.record.energy < self.difficulty_energy)[0]
+            
+            # Update sample counts
+            self.timing_stats['total_samples'] += len(sampleset.record.energy)
+            self.timing_stats['blocks_attempted'] += 1
 
             if len(valid_indices) >= self.min_solutions:
                 # Get unique solutions
@@ -777,6 +984,9 @@ class Miner:
                 final_diversity = self.calculate_diversity(filtered_solutions)
                 print(f"{self.miner_id} found sufficient solutions! Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}, Diversity: {diversity:.3f}, Final Diversity: {final_diversity:.3f}")
 
+                # Track postprocessing time
+                self.timing_stats['postprocessing'].append((time.time() - postprocess_start) * 1e6)
+                
                 # Check if diversity requirement is met
                 if final_diversity >= self.min_diversity and len(valid_solutions) >= self.min_solutions:
                     mining_time = time.time() - start_time
@@ -814,8 +1024,8 @@ class QuantumBlockchain:
         self,
         competitive: bool = False,
         base_difficulty_energy: float = -15500.0,
-        base_min_diversity: float = 0.40,
-        base_min_solutions: int = 80,
+        base_min_diversity: float = 0.38,
+        base_min_solutions: int = 75,
         num_qpu_miners: int = 1,
         num_sa_miners: int = 1,
         num_gpu_miners: int = 0,
@@ -999,6 +1209,16 @@ class QuantumBlockchain:
             self.min_solutions = 10
             self.sampler = SimulatedAnnealingStructuredSampler()
 
+        # Network compute tracking
+        self.network_stats = {
+            'total_blocks': 0,
+            'total_samples': 0,
+            'total_compute_time': 0.0,
+            'blocks_per_minute': 0.0
+        }
+        self.last_adaptation_block = 0
+        self.adaptation_interval = 5  # Adapt every 5 blocks
+        
         # Create genesis block
         self.create_genesis_block()
 
@@ -1295,6 +1515,61 @@ class QuantumBlockchain:
 
         # Adjust difficulty for next block
         self.adjust_difficulty(winning_result.miner_id)
+        
+        # Update network stats
+        self.network_stats['total_blocks'] += 1
+        
+        # Track which miners participated in this block
+        current_block_num = self.network_stats['total_blocks']
+        
+        # Capture timing for all miners, including partial progress
+        for miner in self.miners:
+            self.network_stats['total_samples'] += miner.timing_stats['total_samples']
+            
+            # Update timing history for miners that participated in this round
+            if miner.current_round_attempted:
+                # Capture partial timing for miners that were interrupted
+                preprocessing_time, sampling_time, postprocessing_time = miner.capture_partial_timing()
+                
+                miner.timing_history['block_numbers'].append(current_block_num)
+                
+                # Use captured timing (includes partial progress)
+                miner.timing_history['preprocessing_times'].append(preprocessing_time)
+                miner.timing_history['sampling_times'].append(sampling_time)
+                miner.timing_history['postprocessing_times'].append(postprocessing_time)
+                
+                # Calculate total time
+                total_time = preprocessing_time + sampling_time + postprocessing_time
+                
+                miner.timing_history['total_times'].append(total_time)
+                miner.timing_history['win_rates'].append(
+                    miner.blocks_won / miner.timing_stats['blocks_attempted'] if miner.timing_stats['blocks_attempted'] > 0 else 0
+                )
+                
+                # Track adaptive parameters history
+                if miner.miner_type == "QPU":
+                    miner.timing_history['adaptive_params_history'].append(
+                        miner.adaptive_params['quantum_annealing_time']
+                    )
+                else:
+                    miner.timing_history['adaptive_params_history'].append(
+                        miner.adaptive_params['num_sweeps']
+                    )
+                
+                # Reset the flag for next round
+                miner.current_round_attempted = False
+        
+        # Trigger adaptation every N blocks
+        if self.network_stats['total_blocks'] - self.last_adaptation_block >= self.adaptation_interval:
+            print("\n🔧 Adapting miner parameters based on performance...")
+            network_info = {
+                'total_miners': len(self.miners),
+                'total_blocks': self.network_stats['total_blocks'],
+                'avg_win_rate': 1.0 / len(self.miners)
+            }
+            for miner in self.miners:
+                miner.adapt_parameters(network_info)
+            self.last_adaptation_block = self.network_stats['total_blocks']
 
         return winning_result
 
@@ -1467,6 +1742,18 @@ class QuantumBlockchain:
             print(f"  {miner_type}: {wins} blocks ({percentage:.1f}%)")
 
         print(f"\nTotal blocks mined: {total_blocks}")
+        
+        # Print network compute statistics
+        print("\n" + "="*60)
+        print("NETWORK COMPUTE STATISTICS")
+        print("="*60)
+        total_network_samples = sum(miner.timing_stats['total_samples'] for miner in self.miners)
+        total_attempts = sum(miner.timing_stats['blocks_attempted'] for miner in self.miners)
+        
+        print(f"Total Network Samples: {total_network_samples:,}")
+        print(f"Total Mining Attempts: {total_attempts}")
+        print(f"Average Samples per Block: {total_network_samples / total_blocks:.1f}" if total_blocks > 0 else "N/A")
+        print(f"Network Efficiency: {total_blocks / total_attempts * 100:.2f}%" if total_attempts > 0 else "N/A")
 
         # Analyze streaks by individual miner
         current_winner = None
@@ -1505,6 +1792,13 @@ class QuantumBlockchain:
         for miner, streak in sorted(max_streaks_by_type.items()):
             print(f"  {miner}: {streak} blocks")
 
+        # Print detailed timing statistics for each miner
+        print("\n" + "="*60)
+        print("DETAILED TIMING STATISTICS")
+        print("="*60)
+        for miner in self.miners:
+            print(miner.get_timing_summary())
+        
         # Analyze mining times by type
         mining_times_by_type = {}
 
@@ -1841,6 +2135,237 @@ class QuantumBlockchain:
         plt.tight_layout()
         plt.savefig(f'{output_prefix}_timing.png', dpi=300, bbox_inches='tight')
         print(f"Saved timing analysis plot to {output_prefix}_timing.png")
+        
+        # Generate miner timing performance graphs
+        self.generate_timing_performance_plots(output_prefix)
+    
+    def generate_timing_performance_plots(self, output_prefix: str = "benchmarks/blockchain_benchmark"):
+        """Generate detailed timing performance plots for each miner over time."""
+        if not self.competitive or len(self.chain) < 2:
+            print("Not enough data for timing performance plots")
+            return
+        
+        # Set style
+        plt.style.use('seaborn-v0_8-darkgrid')
+        
+        # Create figure with subplots for timing performance
+        fig = plt.figure(figsize=(20, 12))
+        
+        # Color mapping for miners
+        def get_miner_color(miner_id: str) -> str:
+            """Get unique color for each miner."""
+            colors = {
+                'QPU': '#4285F4',  # Blue
+                'CPU': '#FF8C00',  # Orange  
+                'GPU': '#00C853'   # Green
+            }
+            base_type = miner_id.split('-')[0]
+            base_color = colors.get(base_type, '#808080')
+            
+            # Add shade variation for multiple miners of same type
+            if miner_id[-1].isdigit():
+                miner_num = int(miner_id[-1])
+                # Lighten color for higher numbers
+                import matplotlib.colors as mcolors
+                rgb = mcolors.hex2color(base_color)
+                lightness = min(1.0, 0.7 + 0.1 * miner_num)
+                rgb = tuple(min(1.0, c * lightness) for c in rgb)
+                return mcolors.rgb2hex(rgb)
+            return base_color
+        
+        # 1. Total timing per miner over samples (not just blocks)
+        ax1 = plt.subplot(2, 3, 1)
+        for miner in self.miners:
+            # Use raw timing_stats data to show all samples
+            if miner.timing_stats['preprocessing'] or miner.timing_stats['sampling']:
+                color = get_miner_color(miner.miner_id)
+                # Calculate total time for each sample
+                total_times = []
+                sample_indices = []
+                for i in range(max(len(miner.timing_stats['preprocessing']), 
+                                  len(miner.timing_stats['sampling']))):
+                    pre_time = miner.timing_stats['preprocessing'][i] if i < len(miner.timing_stats['preprocessing']) else 0
+                    samp_time = miner.timing_stats['sampling'][i] if i < len(miner.timing_stats['sampling']) else 0
+                    post_time = miner.timing_stats['postprocessing'][i] if i < len(miner.timing_stats['postprocessing']) else 0
+                    total_times.append(pre_time + samp_time + post_time)
+                    sample_indices.append(i + 1)
+                
+                if total_times:
+                    ax1.plot(sample_indices, total_times,
+                            'o-', label=miner.miner_id, color=color, markersize=4, linewidth=1, alpha=0.7)
+        ax1.set_xlabel('Sample Number')
+        ax1.set_ylabel('Total Time (μs)')
+        ax1.set_title('Total Processing Time per Sample')
+        ax1.legend()
+        ax1.set_yscale('log')  # Log scale for better visibility
+        
+        # 2. Sampling time evolution (all samples)
+        ax2 = plt.subplot(2, 3, 2)
+        for miner in self.miners:
+            if miner.timing_stats['sampling']:
+                color = get_miner_color(miner.miner_id)
+                sample_indices = list(range(1, len(miner.timing_stats['sampling']) + 1))
+                ax2.plot(sample_indices, miner.timing_stats['sampling'],
+                        'o-', label=miner.miner_id, color=color, markersize=4, linewidth=1, alpha=0.7)
+        ax2.set_xlabel('Sample Number')
+        ax2.set_ylabel('Sampling Time (μs)')
+        ax2.set_title('Sampling Time per Sample')
+        ax2.legend()
+        ax2.set_yscale('log')
+        
+        # 3. Violin plot of total processing times (from all samples)
+        ax3 = plt.subplot(2, 3, 3)
+        
+        # Prepare data for violin plot
+        total_time_data = []
+        labels = []
+        colors_list = []
+        
+        for miner in self.miners:
+            # Calculate total times from raw stats
+            if miner.timing_stats['preprocessing'] or miner.timing_stats['sampling']:
+                total_times = []
+                for i in range(max(len(miner.timing_stats['preprocessing']), 
+                                  len(miner.timing_stats['sampling']))):
+                    pre_time = miner.timing_stats['preprocessing'][i] if i < len(miner.timing_stats['preprocessing']) else 0
+                    samp_time = miner.timing_stats['sampling'][i] if i < len(miner.timing_stats['sampling']) else 0
+                    post_time = miner.timing_stats['postprocessing'][i] if i < len(miner.timing_stats['postprocessing']) else 0
+                    total_times.append(pre_time + samp_time + post_time)
+                
+                if total_times:
+                    total_time_data.append(total_times)
+                    labels.append(miner.miner_id)
+                    colors_list.append(get_miner_color(miner.miner_id))
+        
+        if total_time_data:
+            parts = ax3.violinplot(total_time_data, showmeans=True, showmedians=True, showextrema=True)
+            
+            # Color the violin plots
+            for i, pc in enumerate(parts['bodies']):
+                pc.set_facecolor(colors_list[i % len(colors_list)])
+                pc.set_alpha(0.7)
+            
+            ax3.set_xticks(range(1, len(labels) + 1))
+            ax3.set_xticklabels(labels, rotation=45, ha='right')
+            ax3.set_ylabel('Total Processing Time (μs)')
+            ax3.set_title('Total Processing Time Distribution')
+            ax3.set_yscale('log')
+            
+            # Add grid for better readability
+            ax3.grid(True, alpha=0.3, axis='y')
+        else:
+            ax3.text(0.5, 0.5, 'No timing data', ha='center', va='center', transform=ax3.transAxes)
+        
+        # 4. Preprocessing vs Postprocessing time (from all samples)
+        ax4 = plt.subplot(2, 3, 4)
+        for miner in self.miners:
+            color = get_miner_color(miner.miner_id)
+            
+            # Plot preprocessing times from raw stats
+            if miner.timing_stats['preprocessing']:
+                sample_indices = list(range(1, len(miner.timing_stats['preprocessing']) + 1))
+                ax4.plot(sample_indices, miner.timing_stats['preprocessing'],
+                        '--', label=f'{miner.miner_id} (pre)', color=color, alpha=0.5, 
+                        markersize=3, linewidth=1)
+            
+            # Plot postprocessing times from raw stats (may be shorter if not all attempts reached postprocessing)
+            if miner.timing_stats['postprocessing']:
+                sample_indices = list(range(1, len(miner.timing_stats['postprocessing']) + 1))
+                ax4.plot(sample_indices, miner.timing_stats['postprocessing'],
+                        '-', label=f'{miner.miner_id} (post)', color=color,
+                        markersize=3, linewidth=1)
+        
+        ax4.set_xlabel('Sample Number')
+        ax4.set_ylabel('Time (μs)')
+        ax4.set_title('Pre/Post Processing Times per Sample')
+        ax4.legend(fontsize=8)
+        ax4.set_yscale('log')
+        
+        # 5. Adaptive parameters evolution with dual axes
+        ax5 = plt.subplot(2, 3, 5)
+        
+        # Create second y-axis for annealing time
+        ax5_right = ax5.twinx()
+        
+        # Plot SA miners (num_sweeps) on left axis
+        for miner in self.miners:
+            if miner.timing_history['block_numbers'] and miner.timing_history['adaptive_params_history']:
+                color = get_miner_color(miner.miner_id)
+                
+                if miner.miner_type != "QPU":  # SA miners
+                    # Plot log(num_sweeps) on left axis
+                    log_sweeps = [np.log10(s) for s in miner.timing_history['adaptive_params_history']]
+                    ax5.plot(miner.timing_history['block_numbers'], log_sweeps,
+                            's-', label=f'{miner.miner_id}', color=color, 
+                            markersize=6, linewidth=1.5, alpha=0.7)
+        
+        # Plot QPU miners (annealing_time) on right axis  
+        for miner in self.miners:
+            if miner.timing_history['block_numbers'] and miner.timing_history['adaptive_params_history']:
+                color = get_miner_color(miner.miner_id)
+                
+                if miner.miner_type == "QPU":  # QPU miners
+                    ax5_right.plot(miner.timing_history['block_numbers'], 
+                                  miner.timing_history['adaptive_params_history'],
+                                  'o-', label=f'{miner.miner_id}', color=color,
+                                  markersize=6, linewidth=1.5, alpha=0.7)
+        
+        # Configure axes
+        ax5.set_xlabel('Block Number')
+        ax5.set_ylabel('log₁₀(Num Sweeps) - SA Miners', color='#FF8C00')
+        ax5.tick_params(axis='y', labelcolor='#FF8C00')
+        ax5.grid(True, alpha=0.3)
+        
+        ax5_right.set_ylabel('Annealing Time (μs) - QPU Miners', color='#4285F4')
+        ax5_right.tick_params(axis='y', labelcolor='#4285F4')
+        
+        ax5.set_title('Adaptive Parameters Evolution')
+        
+        # Combine legends from both axes
+        lines1, labels1 = ax5.get_legend_handles_labels()
+        lines2, labels2 = ax5_right.get_legend_handles_labels()
+        ax5.legend(lines1 + lines2, labels1 + labels2, loc='best', fontsize=8)
+        
+        # 6. Violin plot of sampling times (from all samples)
+        ax6 = plt.subplot(2, 3, 6)
+        
+        # Prepare data for violin plot
+        sampling_time_data = []
+        sampling_labels = []
+        sampling_colors = []
+        
+        for miner in self.miners:
+            if miner.timing_stats['sampling']:
+                # Use raw sampling data (all samples, not just per-block summaries)
+                non_zero_sampling = [t for t in miner.timing_stats['sampling'] if t > 0]
+                if non_zero_sampling:
+                    sampling_time_data.append(non_zero_sampling)
+                    sampling_labels.append(miner.miner_id)
+                    sampling_colors.append(get_miner_color(miner.miner_id))
+        
+        if sampling_time_data:
+            parts = ax6.violinplot(sampling_time_data, showmeans=True, showmedians=True, showextrema=True)
+            
+            # Color the violin plots
+            for i, pc in enumerate(parts['bodies']):
+                pc.set_facecolor(sampling_colors[i % len(sampling_colors)])
+                pc.set_alpha(0.7)
+            
+            ax6.set_xticks(range(1, len(sampling_labels) + 1))
+            ax6.set_xticklabels(sampling_labels, rotation=45, ha='right')
+            ax6.set_ylabel('Sampling Time (μs)')
+            ax6.set_title('Sampling Time Distribution')
+            ax6.set_yscale('log')
+            
+            # Add grid for better readability
+            ax6.grid(True, alpha=0.3, axis='y')
+        else:
+            ax6.text(0.5, 0.5, 'No sampling data', ha='center', va='center', transform=ax6.transAxes)
+        
+        plt.suptitle('Miner Timing Performance Analysis', fontsize=16, y=1.02)
+        plt.tight_layout()
+        plt.savefig(f'{output_prefix}_miner_timing_performance.png', dpi=300, bbox_inches='tight')
+        print(f"Saved miner timing performance plot to {output_prefix}_miner_timing_performance.png")
 
 
 def run_blockchain(args):
@@ -1856,8 +2381,8 @@ def run_blockchain(args):
         blockchain = QuantumBlockchain(
             competitive=True,
             base_difficulty_energy=-15500.0,   # Very challenging for SA, easy for QPU
-            base_min_diversity=0.40,          # High diversity requirement
-            base_min_solutions=80,            # High solution count requirement
+            base_min_diversity=0.38,          # High diversity requirement
+            base_min_solutions=75,            # High solution count requirement
             num_qpu_miners=args.num_qpu,
             num_sa_miners=args.num_sa,
             num_gpu_miners=args.num_gpu,
