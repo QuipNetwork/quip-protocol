@@ -2,6 +2,7 @@ import hashlib
 import os
 import queue
 import random
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,6 +12,9 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from dotenv import load_dotenv
 from dwave.samplers import SimulatedAnnealingSampler
 from dwave.system import DWaveSampler
@@ -202,6 +206,7 @@ class LocalGPUSampler:
     def sample_ising(self, h, J, num_reads=100, num_sweeps=512, **kwargs):
         import os as _os
         import queue as _queue
+
         # Convert to dicts for serialization
         h_dict = dict(h) if hasattr(h, 'items') else {i: h[i] for i in range(len(h))}
         J_dict = dict(J) if hasattr(J, 'items') else J
@@ -239,6 +244,7 @@ class LocalGPUSampler:
 
 def _gpu_worker_main(req_q, resp_q, device_str: str):
     import os as _os
+
     import torch
     debug = _os.getenv("QUIP_DEBUG") == "1"
     # Resolve device
@@ -363,17 +369,105 @@ class Block:
     miner_id: Optional[str] = None  # e.g., QPU-1, SA-2
     miner_type: Optional[str] = None  # QPU or SA
     mining_time: Optional[float] = None
+    signature: Optional[str] = None  # WOTS+ signature signed by ECDSA
+    reward_address: Optional[str] = None  # ECDSA public key for rewards
+    miner_ecdsa_public_key: Optional[str] = None  # Miner's ECDSA public key
+    miner_wots_plus_public_key: Optional[str] = None  # Miner's current WOTS+ public key
     hash: Optional[str] = None
 
     def compute_hash(self) -> str:
-        """Compute the hash of the block."""
-        block_string = f"{self.index}{self.timestamp}{self.data}{self.previous_hash}{self.nonce}"
+        """Compute the hash of the block with new format."""
+        # New format: f"{previous_hash}{index}{timestamp}{data}{signature}{reward_address}{miner_ecdsa_public_key}{miner_wots_plus_public_key}"
+        block_string = f"{self.previous_hash}{self.index}{self.timestamp}{self.data}{self.signature or ''}{self.reward_address or ''}{self.miner_ecdsa_public_key or ''}{self.miner_wots_plus_public_key or ''}"
         return hashlib.sha256(block_string.encode()).hexdigest()
 
     def __post_init__(self):
         """Compute hash after initialization."""
         if self.hash is None:
             self.hash = self.compute_hash()
+
+
+class WOTSPlus:
+    """Simple WOTS+ implementation for demonstration purposes."""
+    
+    def __init__(self, seed: bytes = None):
+        """Initialize WOTS+ with a random seed."""
+        if seed is None:
+            seed = os.urandom(32)
+        self.seed = seed
+        self.w = 16  # Winternitz parameter
+        self.n = 32  # Hash output length in bytes
+        self.l1 = 64  # Number of message chains
+        self.l2 = 3   # Number of checksum chains
+        self.l = self.l1 + self.l2  # Total chains
+        
+        # Generate private key
+        self.private_key = self._generate_private_key()
+        # Generate public key
+        self.public_key = self._generate_public_key()
+        self.used = False  # Track if this key has been used
+    
+    def _hash(self, data: bytes) -> bytes:
+        """Hash function for WOTS+."""
+        return hashlib.sha256(data).digest()
+    
+    def _generate_private_key(self) -> List[bytes]:
+        """Generate WOTS+ private key."""
+        private_key = []
+        for i in range(self.l):
+            # Derive each private key element from seed
+            element = self._hash(self.seed + i.to_bytes(4, 'big'))
+            private_key.append(element)
+        return private_key
+    
+    def _generate_public_key(self) -> List[bytes]:
+        """Generate WOTS+ public key by hashing private key elements w-1 times."""
+        public_key = []
+        for sk_element in self.private_key:
+            pk_element = sk_element
+            for _ in range(self.w - 1):
+                pk_element = self._hash(pk_element)
+            public_key.append(pk_element)
+        return public_key
+    
+    def sign(self, message: bytes) -> List[bytes]:
+        """Sign a message with WOTS+. Can only be used once."""
+        if self.used:
+            raise Exception("WOTS+ key already used! Generate a new key pair.")
+        
+        # Hash the message
+        msg_hash = self._hash(message)
+        
+        # Convert hash to base-w representation
+        msg_blocks = []
+        for byte in msg_hash:
+            msg_blocks.append(byte % self.w)
+            msg_blocks.append(byte // self.w)
+        
+        # Calculate checksum
+        checksum = sum(self.w - 1 - b for b in msg_blocks)
+        checksum_bytes = checksum.to_bytes(4, 'big')
+        for byte in checksum_bytes[:self.l2]:
+            msg_blocks.append(byte % self.w)
+        
+        # Generate signature
+        signature = []
+        for i, b in enumerate(msg_blocks[:self.l]):
+            sig_element = self.private_key[i]
+            for _ in range(b):
+                sig_element = self._hash(sig_element)
+            signature.append(sig_element)
+        
+        self.used = True
+        return signature
+    
+    def get_public_key_bytes(self) -> bytes:
+        """Get public key as bytes."""
+        return b''.join(self.public_key)
+    
+    def get_public_key_hex(self) -> str:
+        """Get public key as hex string."""
+        return self.get_public_key_bytes().hex()
 
 
 class Miner:
@@ -394,10 +488,67 @@ class Miner:
         self.mining = False
         self.blocks_won = 0
         self.total_rewards = 0
+        
+        # Generate ECDSA key pair
+        self.ecdsa_private_key = ec.generate_private_key(
+            ec.SECP256K1(),
+            default_backend()
+        )
+        self.ecdsa_public_key = self.ecdsa_private_key.public_key()
+        
+        # Get ECDSA public key in hex format
+        self.ecdsa_public_key_bytes = self.ecdsa_public_key.public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.UncompressedPoint
+        )
+        self.ecdsa_public_key_hex = self.ecdsa_public_key_bytes.hex()
+        
+        # Generate initial WOTS+ key pair
+        self.wots_plus = WOTSPlus()
+        self.wots_plus_public_key_hex = self.wots_plus.get_public_key_hex()
+        
+        print(f"{miner_id} initialized with:")
+        print(f"  ECDSA Public Key: {self.ecdsa_public_key_hex[:16]}...")
+        print(f"  WOTS+ Public Key: {self.wots_plus_public_key_hex[:16]}...")
 
     def calculate_hamming_distance(self, s1: List[int], s2: List[int]) -> int:
-        """Calculate Hamming distance between two binary strings."""
-        return sum(a != b for a, b in zip(s1, s2))
+        """Calculate symmetric Hamming distance between two binary strings.
+        
+        Uses bitwise operations for efficiency:
+        - XOR to find differences
+        - Population count (bit counting) for distance
+        - Compares both normal and inverted to handle symmetry
+        """
+        # Convert sequences to bit representations
+        # Map -1 to 0, and 1 to 1 for bit operations
+        def to_bits(seq):
+            """Convert sequence to integer bit representation."""
+            bits = 0
+            for i, val in enumerate(seq):
+                if val == 1 or val == -1:
+                    # Set bit i to 1 if val is 1, 0 if val is -1
+                    if val == 1:
+                        bits |= (1 << i)
+            return bits, len(seq)
+        
+        bits1, len1 = to_bits(s1)
+        bits2, len2 = to_bits(s2)
+        
+        # Create mask for valid bits
+        max_len = max(len1, len2)
+        mask = (1 << max_len) - 1
+        
+        # Calculate normal Hamming distance using XOR and popcount
+        xor_normal = bits1 ^ bits2
+        normal_dist = bin(xor_normal & mask).count('1')
+        
+        # Calculate symmetric distance (with bits2 inverted)
+        bits2_inv = (~bits2) & mask
+        xor_inv = bits1 ^ bits2_inv
+        inv_dist = bin(xor_inv & mask).count('1')
+        
+        # Return minimum for symmetric property
+        return min(normal_dist, inv_dist)
 
     def calculate_diversity(self, solutions: List[List[int]]) -> float:
         """Calculate average normalized Hamming distance between all pairs of solutions."""
@@ -413,6 +564,133 @@ class Miner:
                 distances.append(dist / n)
 
         return np.mean(distances) if distances else 0.0
+    
+    def filter_diverse_solutions(self, solutions: List[List[int]], target_count: int) -> List[List[int]]:
+        """Filter solutions to maintain maximum diversity while reducing to target count.
+        
+        Uses farthest point sampling with local search refinement.
+        This method provides better diversity than pure greedy selection.
+        """
+        if len(solutions) <= target_count:
+            return solutions
+        
+        n_solutions = len(solutions)
+        
+        # Pre-compute distance matrix for efficiency
+        dist_matrix = np.zeros((n_solutions, n_solutions))
+        for i in range(n_solutions):
+            for j in range(i + 1, n_solutions):
+                dist = self.calculate_hamming_distance(solutions[i], solutions[j])
+                dist_matrix[i, j] = dist
+                dist_matrix[j, i] = dist
+        
+        # Method 1: Farthest Point Sampling
+        # Start with the two most distant points
+        max_dist = 0
+        start_pair = (0, 1)
+        for i in range(n_solutions):
+            for j in range(i + 1, n_solutions):
+                if dist_matrix[i, j] > max_dist:
+                    max_dist = dist_matrix[i, j]
+                    start_pair = (i, j)
+        
+        selected_indices = list(start_pair)
+        
+        # Iteratively add the farthest point from the current set
+        while len(selected_indices) < target_count:
+            best_idx = -1
+            best_min_dist = -1
+            
+            for i in range(n_solutions):
+                if i in selected_indices:
+                    continue
+                
+                # Find minimum distance to selected set
+                min_dist = min(dist_matrix[i, j] for j in selected_indices)
+                
+                if min_dist > best_min_dist:
+                    best_min_dist = min_dist
+                    best_idx = i
+            
+            if best_idx != -1:
+                selected_indices.append(best_idx)
+        
+        # Method 2: Local search refinement
+        # Try swapping elements to improve total diversity
+        def calculate_total_diversity(indices):
+            """Calculate sum of all pairwise distances."""
+            total = 0
+            for i in range(len(indices)):
+                for j in range(i + 1, len(indices)):
+                    total += dist_matrix[indices[i], indices[j]]
+            return total
+        
+        current_diversity = calculate_total_diversity(selected_indices)
+        improved = True
+        max_iterations = 10
+        iteration = 0
+        
+        while improved and iteration < max_iterations:
+            improved = False
+            iteration += 1
+            
+            # Try swapping each selected with each unselected
+            for i, selected_idx in enumerate(selected_indices):
+                for unselected_idx in range(n_solutions):
+                    if unselected_idx in selected_indices:
+                        continue
+                    
+                    # Try swap
+                    test_indices = selected_indices.copy()
+                    test_indices[i] = unselected_idx
+                    test_diversity = calculate_total_diversity(test_indices)
+                    
+                    if test_diversity > current_diversity:
+                        selected_indices[i] = unselected_idx
+                        current_diversity = test_diversity
+                        improved = True
+                        break
+                
+                if improved:
+                    break
+        
+        return [solutions[i] for i in selected_indices]
+    
+    def generate_new_wots_key(self):
+        """Generate a new WOTS+ key pair after using the current one."""
+        self.wots_plus = WOTSPlus()
+        self.wots_plus_public_key_hex = self.wots_plus.get_public_key_hex()
+        print(f"{self.miner_id} generated new WOTS+ key: {self.wots_plus_public_key_hex[:16]}...")
+    
+    def sign_block_data(self, block_data: str) -> Tuple[str, str]:
+        """
+        Sign block data with WOTS+ and then sign that signature with ECDSA.
+        
+        Returns:
+            Tuple of (combined_signature_hex, next_wots_public_key_hex)
+        """
+        # Sign the block data with WOTS+
+        wots_signature = self.wots_plus.sign(block_data.encode())
+        wots_signature_bytes = b''.join(wots_signature)
+        
+        # Hash the WOTS+ signature for ECDSA signing
+        wots_sig_hash = hashlib.sha256(wots_signature_bytes).digest()
+        
+        # Sign the WOTS+ signature hash with ECDSA
+        from cryptography.hazmat.primitives.asymmetric import utils
+        ecdsa_signature = self.ecdsa_private_key.sign(
+            wots_sig_hash,
+            ec.ECDSA(utils.Prehashed(hashes.SHA256()))
+        )
+        
+        # Combine signatures
+        combined_signature = wots_signature_bytes + ecdsa_signature
+        combined_signature_hex = combined_signature.hex()
+        
+        # Generate new WOTS+ key for next block
+        self.generate_new_wots_key()
+        
+        return combined_signature_hex, self.wots_plus_public_key_hex
 
     def generate_quantum_model(self, block_header: str, nonce: int) -> Tuple[dict, dict]:
         """Generate Ising model parameters based on block header and nonce."""
@@ -427,9 +705,13 @@ class Miner:
         return h, J
 
     def mine_block(self, block_header: str, result_queue: queue.Queue, stop_event: threading.Event):
-        """Mine a block in a separate thread."""
+        """Mine a block in a separate thread.
+        
+        Args:
+            block_header: Format is f"{previous_hash}{index}{timestamp}{data}"
+        """
         self.mining = True
-        nonce = 0
+        progress = 0  # Progress counter for logging
         start_time = time.time()
 
         print(f"{self.miner_id} started...")
@@ -440,6 +722,9 @@ class Miner:
                 print(f"{self.miner_id} interrupted")
                 return
 
+            # Generate random nonce for each attempt
+            nonce = random.randint(0, sys.maxsize)
+            
             # Generate quantum model
             h, J = self.generate_quantum_model(block_header, nonce)
 
@@ -483,9 +768,17 @@ class Miner:
 
                 # Calculate diversity
                 diversity = self.calculate_diversity(valid_solutions)
+                min_energy = float(np.min(sampleset.record.energy))
+
+                # Filter excess solutions to maintain diversity
+                filtered_solutions = self.filter_diverse_solutions(valid_solutions, self.min_solutions)
+
+                # Recalculate diversity after filtering
+                final_diversity = self.calculate_diversity(filtered_solutions)
+                print(f"{self.miner_id} found sufficient solutions! Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}, Diversity: {diversity:.3f}, Final Diversity: {final_diversity:.3f}")
 
                 # Check if diversity requirement is met
-                if diversity >= self.min_diversity and len(valid_solutions) >= self.min_solutions:
+                if final_diversity >= self.min_diversity and len(valid_solutions) >= self.min_solutions:
                     mining_time = time.time() - start_time
                     min_energy = float(np.min(sampleset.record.energy[valid_indices]))
 
@@ -493,9 +786,9 @@ class Miner:
                         miner_id=self.miner_id,
                         miner_type=self.miner_type,
                         nonce=nonce,
-                        solutions=valid_solutions[:self.min_solutions],
+                        solutions=filtered_solutions,
                         energy=min_energy,
-                        diversity=diversity,
+                        diversity=final_diversity,
                         num_valid=len(valid_solutions),
                         mining_time=mining_time
                     )
@@ -504,12 +797,12 @@ class Miner:
                     print(f"{self.miner_id} found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
                     return
 
-            nonce += 1
+            progress += 1
 
             # Progress update
-            if nonce % 10 == 0 and len(sampleset.record.energy) > 0:
+            if progress % 10 == 0 and len(sampleset.record.energy) > 0:
                 min_energy = float(np.min(sampleset.record.energy))
-                print(f"{self.miner_id} - Nonce: {nonce}, Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}")
+                print(f"{self.miner_id} - Progress: {progress}, Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}")
 
         # If we exit the loop due to stop event
         if stop_event.is_set():
@@ -521,8 +814,8 @@ class QuantumBlockchain:
         self,
         competitive: bool = False,
         base_difficulty_energy: float = -15500.0,
-        base_min_diversity: float = 0.46,
-        base_min_solutions: int = 25,
+        base_min_diversity: float = 0.40,
+        base_min_solutions: int = 80,
         num_qpu_miners: int = 1,
         num_sa_miners: int = 1,
         num_gpu_miners: int = 0,
@@ -757,8 +1050,8 @@ class QuantumBlockchain:
 
             # Make it HARDER by incrementing difficulty
             self.difficulty_energy = max(-15600, self.base_difficulty_energy * (1 + self.energy_adjustment_rate))
-            self.min_diversity = min(0.48, self.base_min_diversity + self.diversity_adjustment_rate)
-            self.min_solutions = min(50, int(self.base_min_solutions * (1 + self.solutions_adjustment_rate)))
+            self.min_diversity = min(0.46, self.base_min_diversity + self.diversity_adjustment_rate)
+            self.min_solutions = min(100, int(self.base_min_solutions * (1 + self.solutions_adjustment_rate)))
 
             print(f"   Difficulty HARDENED to level {old_streak - 1} - Energy: {self.difficulty_energy:.1f}, Diversity: {self.min_diversity:.2f}, Solutions: {self.min_solutions}")
 
@@ -793,8 +1086,43 @@ class QuantumBlockchain:
         return h, J
 
     def calculate_hamming_distance(self, s1: List[int], s2: List[int]) -> int:
-        """Calculate Hamming distance between two binary strings."""
-        return sum(a != b for a, b in zip(s1, s2))
+        """Calculate symmetric Hamming distance between two binary strings.
+        
+        Uses bitwise operations for efficiency:
+        - XOR to find differences
+        - Population count (bit counting) for distance
+        - Compares both normal and inverted to handle symmetry
+        """
+        # Convert sequences to bit representations
+        # Map -1 to 0, and 1 to 1 for bit operations
+        def to_bits(seq):
+            """Convert sequence to integer bit representation."""
+            bits = 0
+            for i, val in enumerate(seq):
+                if val == 1 or val == -1:
+                    # Set bit i to 1 if val is 1, 0 if val is -1
+                    if val == 1:
+                        bits |= (1 << i)
+            return bits, len(seq)
+        
+        bits1, len1 = to_bits(s1)
+        bits2, len2 = to_bits(s2)
+        
+        # Create mask for valid bits
+        max_len = max(len1, len2)
+        mask = (1 << max_len) - 1
+        
+        # Calculate normal Hamming distance using XOR and popcount
+        xor_normal = bits1 ^ bits2
+        normal_dist = bin(xor_normal & mask).count('1')
+        
+        # Calculate symmetric distance (with bits2 inverted)
+        bits2_inv = (~bits2) & mask
+        xor_inv = bits1 ^ bits2_inv
+        inv_dist = bin(xor_inv & mask).count('1')
+        
+        # Return minimum for symmetric property
+        return min(normal_dist, inv_dist)
 
     def calculate_diversity(self, solutions: List[List[int]]) -> float:
         """
@@ -830,8 +1158,9 @@ class QuantumBlockchain:
             diversity: Average Hamming distance between solutions
             num_valid: Number of valid solutions
         """
-        block_header = f"{block.index}{block.timestamp}{block.data}{block.previous_hash}"
-        nonce = 0
+        # Use consistent block header format: f"{previous_hash}{index}{timestamp}{data}"
+        block_header = f"{block.previous_hash}{block.index}{block.timestamp}{block.data}"
+        progress = 0  # Progress counter for logging
         # Test/CI knobs
         import os as _os
         import time as _time
@@ -845,6 +1174,9 @@ class QuantumBlockchain:
         best_valid = []
 
         while True:
+            # Generate random nonce for each attempt
+            nonce = random.randint(0, sys.maxsize)
+            
             # Timeout check
             if timeout_sec > 0 and (_time.time() - start_t) >= timeout_sec:
                 # If under test fast mode, synthesize a valid quick result if needed
@@ -891,10 +1223,10 @@ class QuantumBlockchain:
                     min_energy = float(np.min(sampleset.record.energy[valid_indices]))
                     return nonce, valid_solutions[:self.min_solutions], min_energy, diversity, len(valid_solutions)
 
-            nonce += 1
+            progress += 1
 
             # Print progress
-            if nonce % 5 == 0:
+            if progress % 5 == 0:
                 min_energy = float(np.min(sampleset.record.energy))
                 num_valid = len(valid_indices)
                 if num_valid > 0:
@@ -902,7 +1234,7 @@ class QuantumBlockchain:
                     diversity = self.calculate_diversity(sample_solutions)
                 else:
                     diversity = 0.0
-                print(f"Nonce: {nonce}, Min energy: {min_energy:.2f}, Valid: {num_valid}, Diversity: {diversity:.3f}")
+                print(f"Progress: {progress}, Min energy: {min_energy:.2f}, Valid: {num_valid}, Diversity: {diversity:.3f}")
 
     def competitive_mine(self, block_header: str) -> MiningResult:
         """
@@ -982,7 +1314,11 @@ class QuantumBlockchain:
             timestamp=time.time(),
             data=data,
             previous_hash=previous_block.hash,
-            nonce=0
+            nonce=0,
+            signature=None,
+            reward_address=None,
+            miner_ecdsa_public_key=None,
+            miner_wots_plus_public_key=None
         )
 
         if self.competitive:
@@ -994,7 +1330,8 @@ class QuantumBlockchain:
             if self.last_winner and self.win_streak > 1:
                 print(f"Current Leader: {self.last_winner} (Streak: {self.win_streak-1})")
 
-            block_header = f"{new_block.index}{new_block.timestamp}{new_block.data}{new_block.previous_hash}"
+            # Use initial empty values for fields that will be filled after mining
+            block_header = f"{new_block.previous_hash}{new_block.index}{new_block.timestamp}{new_block.data}"""
             result = self.competitive_mine(block_header)
 
             # Update block with result
@@ -1006,6 +1343,20 @@ class QuantumBlockchain:
             new_block.miner_id = result.miner_id
             new_block.miner_type = result.miner_type
             new_block.mining_time = result.mining_time
+            
+            # Get winning miner to sign the block
+            winning_miner = self.miners_by_id[result.miner_id]
+            
+            # Set reward address to miner's ECDSA public key
+            new_block.reward_address = winning_miner.ecdsa_public_key_hex
+            new_block.miner_ecdsa_public_key = winning_miner.ecdsa_public_key_hex
+            
+            # Sign the block data with WOTS+ and ECDSA
+            block_data_to_sign = f"{new_block.previous_hash}{new_block.index}{new_block.timestamp}{new_block.data}"
+            signature_hex, next_wots_key_hex = winning_miner.sign_block_data(block_data_to_sign)
+            
+            new_block.signature = signature_hex
+            new_block.miner_wots_plus_public_key = next_wots_key_hex
         else:
             # Single miner mode (legacy)
             print(f"\nMining block {new_block.index}...")
@@ -1073,6 +1424,14 @@ class QuantumBlockchain:
                 elif block.miner_type:
                     print(f"  Miner: {block.miner_type}")
                     print(f"  Mining Time: {block.mining_time:.2f}s")
+            if block.signature:
+                print(f"  Signature: {block.signature[:32]}...")
+            if block.reward_address:
+                print(f"  Reward Address: {block.reward_address[:16]}...")
+            if block.miner_ecdsa_public_key:
+                print(f"  ECDSA Public Key: {block.miner_ecdsa_public_key[:16]}...")
+            if block.miner_wots_plus_public_key:
+                print(f"  WOTS+ Public Key: {block.miner_wots_plus_public_key[:16]}...")
 
     def print_competitive_summary(self):
         """Print competitive mining summary."""
@@ -1497,8 +1856,8 @@ def run_blockchain(args):
         blockchain = QuantumBlockchain(
             competitive=True,
             base_difficulty_energy=-15500.0,   # Very challenging for SA, easy for QPU
-            base_min_diversity=0.46,          # High diversity requirement
-            base_min_solutions=25,            # High solution count requirement
+            base_min_diversity=0.40,          # High diversity requirement
+            base_min_solutions=80,            # High solution count requirement
             num_qpu_miners=args.num_qpu,
             num_sa_miners=args.num_sa,
             num_gpu_miners=args.num_gpu,
