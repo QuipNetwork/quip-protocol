@@ -12,9 +12,7 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from shared.crypto_utils import CryptoManager, WOTSPlus
 from dotenv import load_dotenv
 from dwave.samplers import SimulatedAnnealingSampler
 from dwave.system import DWaveSampler
@@ -387,88 +385,7 @@ class Block:
             self.hash = self.compute_hash()
 
 
-class WOTSPlus:
-    """Simple WOTS+ implementation for demonstration purposes."""
-    
-    def __init__(self, seed: bytes = None):
-        """Initialize WOTS+ with a random seed."""
-        if seed is None:
-            seed = os.urandom(32)
-        self.seed = seed
-        self.w = 16  # Winternitz parameter
-        self.n = 32  # Hash output length in bytes
-        self.l1 = 64  # Number of message chains
-        self.l2 = 3   # Number of checksum chains
-        self.l = self.l1 + self.l2  # Total chains
-        
-        # Generate private key
-        self.private_key = self._generate_private_key()
-        # Generate public key
-        self.public_key = self._generate_public_key()
-        self.used = False  # Track if this key has been used
-    
-    def _hash(self, data: bytes) -> bytes:
-        """Hash function for WOTS+."""
-        return hashlib.sha256(data).digest()
-    
-    def _generate_private_key(self) -> List[bytes]:
-        """Generate WOTS+ private key."""
-        private_key = []
-        for i in range(self.l):
-            # Derive each private key element from seed
-            element = self._hash(self.seed + i.to_bytes(4, 'big'))
-            private_key.append(element)
-        return private_key
-    
-    def _generate_public_key(self) -> List[bytes]:
-        """Generate WOTS+ public key by hashing private key elements w-1 times."""
-        public_key = []
-        for sk_element in self.private_key:
-            pk_element = sk_element
-            for _ in range(self.w - 1):
-                pk_element = self._hash(pk_element)
-            public_key.append(pk_element)
-        return public_key
-    
-    def sign(self, message: bytes) -> List[bytes]:
-        """Sign a message with WOTS+. Can only be used once."""
-        if self.used:
-            raise Exception("WOTS+ key already used! Generate a new key pair.")
-        
-        # Hash the message
-        msg_hash = self._hash(message)
-        
-        # Convert hash to base-w representation
-        msg_blocks = []
-        for byte in msg_hash:
-            msg_blocks.append(byte % self.w)
-            msg_blocks.append(byte // self.w)
-        
-        # Calculate checksum
-        checksum = sum(self.w - 1 - b for b in msg_blocks)
-        checksum_bytes = checksum.to_bytes(4, 'big')
-        for byte in checksum_bytes[:self.l2]:
-            msg_blocks.append(byte % self.w)
-        
-        # Generate signature
-        signature = []
-        for i, b in enumerate(msg_blocks[:self.l]):
-            sig_element = self.private_key[i]
-            for _ in range(b):
-                sig_element = self._hash(sig_element)
-            signature.append(sig_element)
-        
-        self.used = True
-        return signature
-    
-    def get_public_key_bytes(self) -> bytes:
-        """Get public key as bytes."""
-        return b''.join(self.public_key)
-    
-    def get_public_key_hex(self) -> str:
-        """Get public key as hex string."""
-        return self.get_public_key_bytes().hex()
-
+# WOTSPlus class moved to shared.crypto_utils
 
 class Miner:
     def __init__(self, miner_id: str, miner_type: str, sampler, difficulty_energy: float,
@@ -489,23 +406,15 @@ class Miner:
         self.blocks_won = 0
         self.total_rewards = 0
         
-        # Generate ECDSA key pair
-        self.ecdsa_private_key = ec.generate_private_key(
-            ec.SECP256K1(),
-            default_backend()
-        )
-        self.ecdsa_public_key = self.ecdsa_private_key.public_key()
+        # Initialize crypto manager
+        self.crypto = CryptoManager()
+        self.ecdsa_public_key_hex = self.crypto.ecdsa_public_key_hex
+        self.wots_plus_public_key_hex = self.crypto.wots_plus_public_key_hex
         
-        # Get ECDSA public key in hex format
-        self.ecdsa_public_key_bytes = self.ecdsa_public_key.public_bytes(
-            encoding=serialization.Encoding.X962,
-            format=serialization.PublicFormat.UncompressedPoint
-        )
-        self.ecdsa_public_key_hex = self.ecdsa_public_key_bytes.hex()
-        
-        # Generate initial WOTS+ key pair
-        self.wots_plus = WOTSPlus()
-        self.wots_plus_public_key_hex = self.wots_plus.get_public_key_hex()
+        # Keep backward compatibility references
+        self.ecdsa_private_key = self.crypto.ecdsa_private_key
+        self.ecdsa_public_key = self.crypto.ecdsa_public_key
+        self.wots_plus = self.crypto.wots_plus
         
         print(f"{miner_id} initialized with:")
         print(f"  ECDSA Public Key: {self.ecdsa_public_key_hex[:16]}...")
@@ -803,8 +712,10 @@ class Miner:
     
     def generate_new_wots_key(self):
         """Generate a new WOTS+ key pair after using the current one."""
-        self.wots_plus = WOTSPlus()
-        self.wots_plus_public_key_hex = self.wots_plus.get_public_key_hex()
+        self.crypto.wots_plus = WOTSPlus()
+        self.wots_plus = self.crypto.wots_plus
+        self.wots_plus_public_key_hex = self.crypto.wots_plus.get_public_key_hex()
+        self.crypto.wots_plus_public_key_hex = self.wots_plus_public_key_hex
         print(f"{self.miner_id} generated new WOTS+ key: {self.wots_plus_public_key_hex[:16]}...")
     
     def sign_block_data(self, block_data: str) -> Tuple[str, str]:
@@ -814,28 +725,14 @@ class Miner:
         Returns:
             Tuple of (combined_signature_hex, next_wots_public_key_hex)
         """
-        # Sign the block data with WOTS+
-        wots_signature = self.wots_plus.sign(block_data.encode())
-        wots_signature_bytes = b''.join(wots_signature)
+        # Use crypto manager to sign
+        signature_hex, next_wots_key_hex = self.crypto.sign_block_data(block_data)
         
-        # Hash the WOTS+ signature for ECDSA signing
-        wots_sig_hash = hashlib.sha256(wots_signature_bytes).digest()
+        # Update local references
+        self.wots_plus_public_key_hex = next_wots_key_hex
+        self.wots_plus = self.crypto.wots_plus
         
-        # Sign the WOTS+ signature hash with ECDSA
-        from cryptography.hazmat.primitives.asymmetric import utils
-        ecdsa_signature = self.ecdsa_private_key.sign(
-            wots_sig_hash,
-            ec.ECDSA(utils.Prehashed(hashes.SHA256()))
-        )
-        
-        # Combine signatures
-        combined_signature = wots_signature_bytes + ecdsa_signature
-        combined_signature_hex = combined_signature.hex()
-        
-        # Generate new WOTS+ key for next block
-        self.generate_new_wots_key()
-        
-        return combined_signature_hex, self.wots_plus_public_key_hex
+        return signature_hex, next_wots_key_hex
 
     def generate_quantum_model(self, block_header: str, nonce: int) -> Tuple[dict, dict]:
         """Generate Ising model parameters based on block header and nonce."""
