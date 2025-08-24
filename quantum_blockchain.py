@@ -12,11 +12,11 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
-from shared.crypto_utils import CryptoManager, WOTSPlus
 from dotenv import load_dotenv
 from dwave.samplers import SimulatedAnnealingSampler
 from dwave.system import DWaveSampler
 from dwave.system.testing import MockDWaveSampler
+from shared.crypto_utils import CryptoManager, WOTSPlus
 
 # Optional GPU support via Modal Labs
 try:
@@ -961,7 +961,7 @@ class QuantumBlockchain:
         competitive: bool = False,
         base_difficulty_energy: float = -15500.0,
         base_min_diversity: float = 0.38,
-        base_min_solutions: int = 75,
+        base_min_solutions: int = 70,
         num_qpu_miners: int = 1,
         num_sa_miners: int = 1,
         num_gpu_miners: int = 0,
@@ -1592,7 +1592,7 @@ class QuantumBlockchain:
         self.chain.append(new_block)
         
         # Reset block received time for all miners when a new block is added
-        if self.competitive_mode:
+        if self.competitive:
             for miner in self.miners:
                 miner.reset_block_received_time()
         
@@ -2324,7 +2324,7 @@ def run_blockchain(args):
             competitive=True,
             base_difficulty_energy=-15500.0,   # Very challenging for SA, easy for QPU
             base_min_diversity=0.38,          # High diversity requirement
-            base_min_solutions=75,            # High solution count requirement
+            base_min_solutions=70,            # High solution count requirement
             num_qpu_miners=args.num_qpu,
             num_sa_miners=args.num_sa,
             num_gpu_miners=args.num_gpu,
