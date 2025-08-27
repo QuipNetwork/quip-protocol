@@ -1,0 +1,20 @@
+{
+  "genesis_block": {
+    "index": 0,
+    "data": "Genesis Block - Easy Configuration",
+    "previous_hash": "0",
+    "nonce": 0
+  },
+  "mining_parameters": {
+    "base_difficulty_energy": -12000.0,
+    "base_min_diversity": 0.0,
+    "base_min_solutions": 1,
+    "description": "Very easy parameters for quick mining demos"
+  },
+  "adaptive_parameters": {
+    "energy_adjustment_rate": 0.01,
+    "diversity_adjustment_rate": 0.01,
+    "solutions_adjustment_rate": 0.15,
+    "description": "Rates for difficulty adjustment based on consecutive wins"
+  }
+}

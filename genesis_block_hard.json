@@ -1,0 +1,20 @@
+{
+  "genesis_block": {
+    "index": 0,
+    "data": "Genesis Block - Hard Configuration",
+    "previous_hash": "0",
+    "nonce": 0
+  },
+  "mining_parameters": {
+    "base_difficulty_energy": -15500.0,
+    "base_min_diversity": 0.38,
+    "base_min_solutions": 70,
+    "description": "Original challenging parameters favoring QPU miners"
+  },
+  "adaptive_parameters": {
+    "energy_adjustment_rate": 0.01,
+    "diversity_adjustment_rate": 0.01,
+    "solutions_adjustment_rate": 0.15,
+    "description": "Rates for difficulty adjustment based on consecutive wins"
+  }
+}

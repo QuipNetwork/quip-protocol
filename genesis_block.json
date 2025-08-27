@@ -1,0 +1,20 @@
+{
+  "genesis_block": {
+    "index": 0,
+    "data": "Genesis Block - Quip Protocol",
+    "previous_hash": "0",
+    "nonce": 0
+  },
+  "mining_parameters": {
+    "base_difficulty_energy": -14500.0,
+    "base_min_diversity": 0.25,
+    "base_min_solutions": 25,
+    "description": "Balanced parameters based on SA miner performance benchmarks"
+  },
+  "adaptive_parameters": {
+    "energy_adjustment_rate": 0.01,
+    "diversity_adjustment_rate": 0.01,
+    "solutions_adjustment_rate": 0.15,
+    "description": "Rates for difficulty adjustment based on consecutive wins"
+  }
+}
