@@ -1351,8 +1351,10 @@ class QuantumBlockchain:
             # Generate quantum model
             h, J = self.generate_quantum_model(block_header, nonce)
 
+            print(f"Num QPU: {self.num_qpu_miners}, Num SA: {self.num_sa_miners}, Num GPU: {self.num_gpu_miners}")
+
             # Sample from quantum/simulated annealer
-            if self.use_qpu:
+            if self.num_qpu_miners > 0:
                 sampleset = self.sampler.sample_ising(h, J, num_reads=reads, answer_mode='raw')
             else:
                 sampleset = self.sampler.sample_ising(h, J, num_reads=reads, num_sweeps=sweeps)
@@ -2415,7 +2417,11 @@ def run_blockchain(args):
         print("Run with --competitive flag for QPU vs SA competition")
 
         # Create blockchain with diversity requirements
-        blockchain = QuantumBlockchain(competitive=False)
+        blockchain = QuantumBlockchain(competitive=False, 
+                                       num_qpu_miners=args.num_qpu,
+                                       num_sa_miners=args.num_sa,
+                                       num_gpu_miners=args.num_gpu,
+                                       gpu_types=args.gpu_types)
 
         # Add some blocks
         transactions = [
