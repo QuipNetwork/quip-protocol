@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import threading
+import time
 from typing import Optional, List
 from quantum_blockchain import QuantumBlockchain, Block
 from quantum_blockchain_network import P2PNode
@@ -210,6 +211,55 @@ class P2PBlockchainNode:
         }
 
 
+def get_latest_block_from_network(node: P2PBlockchainNode) -> Optional[Block]:
+    """Attempt to get the latest block from connected peers."""
+    if not node.node.nodes:
+        logger.info("No peers connected - will start from genesis block")
+        return None
+    
+    # Try to get latest block info from peers
+    # For now, this is a placeholder - in a full implementation,
+    # this would query peers for their latest block
+    logger.info(f"Connected to {len(node.node.nodes)} peers")
+    
+    # Check if we have any blocks beyond genesis
+    if len(node.blockchain.chain) > 1:
+        return node.blockchain.chain[-1]
+    
+    return None
+
+
+def start_mining_process(node: P2PBlockchainNode):
+    """Start the mining process - check network, get latest block, then start mining."""
+    latest_block = get_latest_block_from_network(node)
+    
+    if latest_block is None:
+        logger.info("Starting mining from genesis block")
+    else:
+        logger.info(f"Latest block: {latest_block.index}, starting mining on block {latest_block.index + 1}")
+    
+    # Start continuous mining in a background thread
+    def mining_loop():
+        block_count = 1
+        while True:
+            try:
+                data = f"Mined block {block_count}"
+                logger.info(f"Mining block {len(node.blockchain.chain)}...")
+                block = node.mine_block(data)
+                logger.info(f"✅ Block {block.index} mined by {block.miner_id}")
+                block_count += 1
+                # Small delay between mining attempts
+                time.sleep(1)
+            except Exception as e:
+                logger.error(f"Mining error: {e}")
+                time.sleep(5)
+    
+    # Start mining in background thread
+    mining_thread = threading.Thread(target=mining_loop, daemon=True)
+    mining_thread.start()
+    logger.info("Mining process started in background")
+
+
 def interactive_menu(node: P2PBlockchainNode):
     """Interactive menu for P2P blockchain node."""
     while True:
@@ -277,6 +327,76 @@ def interactive_menu(node: P2PBlockchainNode):
             print(f"Error: {e}")
 
 
+def run_cli_node(
+    host: str = "0.0.0.0",
+    port: int = 8080,
+    peer: Optional[str] = None,
+    competitive: bool = True,
+    num_qpu: int = 0,
+    num_sa: int = 1,
+    num_gpu: int = 0
+):
+    """Run a node for CLI usage - starts mining and keeps process alive without interactive menu."""
+    
+    # Configure GPU settings from environment
+    backend = os.getenv("QUIP_GPU_BACKEND", "local").lower()
+    devices_csv = os.getenv("QUIP_GPU_DEVICES")
+    types_csv = os.getenv("QUIP_GPU_TYPES")
+
+    gpu_devices: List[str] = [d.strip() for d in devices_csv.split(",")] if devices_csv else []
+    gpu_types: List[str] = [t.strip() for t in types_csv.split(",")] if types_csv else []
+
+    if backend == "local":
+        if not gpu_devices:
+            gpu_devices = ["0"]  # Default device
+    elif backend == "modal":
+        if not gpu_types:
+            gpu_types = ["t4"]  # Default type
+
+    # Create P2P node
+    node = P2PBlockchainNode(
+        host=host,
+        port=port,
+        competitive=competitive,
+        num_qpu=num_qpu,
+        num_sa=num_sa,
+        num_gpu=num_gpu,
+        gpu_backend=backend,
+        gpu_devices=gpu_devices,
+        gpu_types=gpu_types,
+    )
+
+    # Attach gpu config onto blockchain for downstream use
+    node.blockchain.gpu_backend = backend
+    node.blockchain.gpu_devices = gpu_devices
+    node.blockchain.gpu_types = gpu_types
+
+    try:
+        node.start()
+
+        # Connect to peer if specified
+        if peer:
+            logger.info(f"Connecting to peer: {peer}")
+            if node.connect_to_peer(peer):
+                logger.info("✅ Successfully joined network!")
+            else:
+                logger.info("❌ Failed to join network!")
+
+        # Start mining process
+        start_mining_process(node)
+
+        # Keep the CLI process alive without interactive menu
+        logger.info(f"Node running at {host}:{port} (CLI mode)")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Shutting down gracefully...")
+
+    finally:
+        node.stop()
+
+
 def main():
     """Main entry point for P2P quantum blockchain."""
     import argparse
@@ -293,8 +413,6 @@ def main():
                        help='Number of SA miners')
     parser.add_argument('--num-gpu', type=int, default=0,
                        help='Number of GPU miners')
-    parser.add_argument('--auto-mine', type=int, default=0,
-                       help='Automatically mine N blocks')
 
     args = parser.parse_args()
 
@@ -329,20 +447,6 @@ def main():
         gpu_types=gpu_types,
     )
 
-    # For tests, optionally reduce difficulty to ensure CPU can mine quickly
-    if os.getenv("QUIP_TEST_EASE_DIFFICULTY") == "1":
-        # Much easier difficulty and fewer solutions/diversity
-        node.blockchain.base_difficulty_energy = -215.0
-        node.blockchain.base_min_diversity = 0.0
-        node.blockchain.base_min_solutions = 1
-        node.blockchain.difficulty_energy = node.blockchain.base_difficulty_energy
-        node.blockchain.min_diversity = node.blockchain.base_min_diversity
-        node.blockchain.min_solutions = node.blockchain.base_min_solutions
-        # Propagate to existing miner instances
-        for m in getattr(node.blockchain, "miners", []):
-            m.difficulty_energy = node.blockchain.difficulty_energy
-            m.min_diversity = node.blockchain.min_diversity
-            m.min_solutions = node.blockchain.min_solutions
 
 
     # Attach gpu config onto blockchain for downstream use
@@ -361,17 +465,8 @@ def main():
             else:
                 print("❌ Failed to join network!")
 
-        # Auto-mine blocks if requested
-        if args.auto_mine > 0:
-            print(f"\nAuto-mining {args.auto_mine} blocks...")
-            for i in range(args.auto_mine):
-                data = f"Auto-mined block {i+1}"
-                block = node.mine_block(data)
-                print(f"  Block {block.index} mined by {block.miner_id}")
-            # In tests, exit after auto-mine to keep runtime short
-            if os.getenv("QUIP_TEST_EXIT_AFTER_AUTOMINE") == "1":
-                node.stop()
-                return
+        # Start mining process
+        start_mining_process(node)
 
         # Run interactive menu
         print(f"\nNode running at {args.host}:{args.port}")

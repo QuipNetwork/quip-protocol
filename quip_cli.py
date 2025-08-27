@@ -60,7 +60,6 @@ def quip_network_node(ctx: click.Context, config: Optional[str]):
             "host": global_cfg.get("host", "0.0.0.0"),
             "port": int(global_cfg.get("port", 8080)),
             "peer": global_cfg.get("peer"),
-            "auto_mine": int(global_cfg.get("auto_mine", 0)),
         }
         # Optional per-type config
         sub_cfg = cfg.get(default_cmd, {}) or {}
@@ -83,58 +82,64 @@ def _run_p2p_node(
     host: str,
     port: int,
     peer: Optional[str],
-    auto_mine: int,
     env_overrides: Optional[dict] = None,
 ) -> int:
-    """Run quantum_blockchain_p2p.py as a subprocess for a single node of given kind.
+    """Run a P2P node directly without subprocess for a single node of given kind.
 
     kind: one of 'cpu', 'gpu', 'qpu'
     """
-    script = os.path.join(os.path.dirname(__file__), "quantum_blockchain_p2p.py")
-    cmd = [
-        sys.executable,
-        script,
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--competitive",
-    ]
+    # Update environment if needed
+    if env_overrides:
+        for k, v in env_overrides.items():
+            if v is not None:
+                os.environ[k] = str(v)
+    
+    # Import and call the CLI node function
+    from quantum_blockchain_p2p import run_cli_node
+    
+    # Configure miners based on kind
     if kind == "cpu":
-        cmd += ["--num-sa", "1"]
+        num_qpu, num_sa, num_gpu = 0, 1, 0
     elif kind == "gpu":
-        cmd += ["--num-gpu", "1"]
+        num_qpu, num_sa, num_gpu = 0, 0, 1
     elif kind == "qpu":
-        cmd += ["--num-qpu", "1"]
+        num_qpu, num_sa, num_gpu = 1, 0, 0
     else:
         raise ValueError(f"Unknown kind: {kind}")
 
-    if peer:
-        cmd += ["--peer", peer]
-    if auto_mine and int(auto_mine) > 0:
-        cmd += ["--auto-mine", str(int(auto_mine))]
-
-    click.echo(f"Running: {' '.join(cmd)}")
-    env = os.environ.copy()
-    if env_overrides:
-        env.update({k: str(v) for k, v in env_overrides.items() if v is not None})
-    return subprocess.call(cmd, env=env)
+    click.echo(f"Starting {kind} node at {host}:{port}")
+    
+    try:
+        run_cli_node(
+            host=host,
+            port=port,
+            peer=peer,
+            competitive=True,
+            num_qpu=num_qpu,
+            num_sa=num_sa,
+            num_gpu=num_gpu
+        )
+        return 0
+    except KeyboardInterrupt:
+        click.echo("Interrupted by user")
+        return 130
+    except Exception as e:
+        click.echo(f"Error: {e}")
+        return 1
 
 
 @quip_network_node.command(name="cpu")
 @click.option("--host", type=str, default=None, help="Host to bind to (defaults from [global].host or 0.0.0.0)")
 @click.option("--port", type=int, default=None, help="Port to bind to (defaults from [global].port or 8080)")
 @click.option("--peer", type=str, default=None, help="Peer address host:port to join (defaults from [global].peer)")
-@click.option("--auto-mine", type=int, default=None, help="Automatically mine N blocks (defaults from [global].auto_mine or 0)")
 @click.option("--num-cpus", type=int, help="Limit CPU threads via OMP/MKL/BLAS env vars")
 @click.pass_context
-def cpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Optional[str], auto_mine: Optional[int], num_cpus: Optional[int]):
+def cpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Optional[str], num_cpus: Optional[int]):
     """Run a CPU node (1 SA miner)."""
     global_cfg = ((ctx.obj or {}).get("config", {}) or {}).get("global", {})
     host = host if host is not None else global_cfg.get("host", "0.0.0.0")
     port = port if port is not None else int(global_cfg.get("port", 8080))
     peer = peer if peer is not None else global_cfg.get("peer")
-    auto_mine = auto_mine if auto_mine is not None else int(global_cfg.get("auto_mine", 0))
 
     env = None
     if num_cpus:
@@ -144,24 +149,22 @@ def cpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Opti
             "OPENBLAS_NUM_THREADS": num_cpus,
             "NUMEXPR_NUM_THREADS": num_cpus,
         }
-    sys.exit(_run_p2p_node("cpu", host, port, peer, auto_mine, env_overrides=env))
+    sys.exit(_run_p2p_node("cpu", host, port, peer, env_overrides=env))
 
 
 @quip_network_node.command(name="gpu")
 @click.option("--host", type=str, default=None, help="Host to bind to (defaults from [global].host or 0.0.0.0)")
 @click.option("--port", type=int, default=None, help="Port to bind to (defaults from [global].port or 8080)")
 @click.option("--peer", type=str, default=None, help="Peer address host:port to join (defaults from [global].peer)")
-@click.option("--auto-mine", type=int, default=None, help="Automatically mine N blocks (defaults from [global].auto_mine or 0)")
 @click.option("--device", type=str, help="GPU device selector (e.g., CUDA ordinal)")
 @click.option("--gpu-backend", type=click.Choice(["local", "modal"], case_sensitive=False), help="Override GPU backend (local or modal)")
 @click.pass_context
-def gpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Optional[str], auto_mine: Optional[int], device: Optional[str], gpu_backend: Optional[str]):
+def gpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Optional[str], device: Optional[str], gpu_backend: Optional[str]):
     """Run a GPU node (multi-GPU capable)."""
     global_cfg = ((ctx.obj or {}).get("config", {}) or {}).get("global", {})
     host = host if host is not None else global_cfg.get("host", "0.0.0.0")
     port = port if port is not None else int(global_cfg.get("port", 8080))
     peer = peer if peer is not None else global_cfg.get("peer")
-    auto_mine = auto_mine if auto_mine is not None else int(global_cfg.get("auto_mine", 0))
 
     # Read GPU config
     cfg = (ctx.obj or {}).get("config", {}) if hasattr(ctx, "obj") else {}
@@ -186,14 +189,13 @@ def gpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Opti
         if isinstance(types_cfg, list) and types_cfg:
             env["QUIP_GPU_TYPES"] = ",".join(str(t) for t in types_cfg)
 
-    sys.exit(_run_p2p_node("gpu", host, port, peer, auto_mine, env_overrides=env or None))
+    sys.exit(_run_p2p_node("gpu", host, port, peer, env_overrides=env or None))
 
 
 @quip_network_node.command(name="qpu")
 @click.option("--host", type=str, default=None, help="Host to bind to (defaults from [global].host or 0.0.0.0)")
 @click.option("--port", type=int, default=None, help="Port to bind to (defaults from [global].port or 8080)")
 @click.option("--peer", type=str, default=None, help="Peer address host:port to join (defaults from [global].peer)")
-@click.option("--auto-mine", type=int, default=None, help="Automatically mine N blocks (defaults from [global].auto_mine or 0)")
 @click.option("--dwave-api-key", type=str, help="D-Wave API key (DWAVE_API_TOKEN)")
 @click.option("--dwave-api-solver", type=str, help="D-Wave solver name (DWAVE_API_SOLVER)")
 @click.option("--dwave-region-url", type=str, default=None, help="D-Wave region SAPI endpoint URL")
@@ -203,7 +205,6 @@ def qpu(
     host: Optional[str],
     port: Optional[int],
     peer: Optional[str],
-    auto_mine: Optional[int],
     dwave_api_key: Optional[str],
     dwave_api_solver: Optional[str],
     dwave_region_url: Optional[str],
@@ -213,7 +214,6 @@ def qpu(
     host = host if host is not None else global_cfg.get("host", "0.0.0.0")
     port = port if port is not None else int(global_cfg.get("port", 8080))
     peer = peer if peer is not None else global_cfg.get("peer")
-    auto_mine = auto_mine if auto_mine is not None else int(global_cfg.get("auto_mine", 0))
 
     # Fill from config if not provided
     cfg = (ctx.obj or {}).get("config", {}) if hasattr(ctx, "obj") else {}
@@ -232,7 +232,7 @@ def qpu(
     }
     # Remove None values
     env = {k: v for k, v in env.items() if v}
-    sys.exit(_run_p2p_node("qpu", host, port, peer, auto_mine, env_overrides=env))
+    sys.exit(_run_p2p_node("qpu", host, port, peer, env_overrides=env))
 
 
 # -----------------------------
