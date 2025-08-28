@@ -6,8 +6,10 @@ Cost-optimized GPU simulated annealing for quantum blockchain mining
 
 import modal
 import numpy as np
+import subprocess
 from typing import Tuple, Dict, Any
 import time
+from numba import cuda, jit
 
 # Define Modal app for GPU execution
 app = modal.App("quantum-blockchain-gpu-benchmark")
@@ -44,9 +46,6 @@ def gpu_simulated_annealing(
     Returns:
         Dictionary with samples, energies, and timing info
     """
-    import numpy as np
-    from numba import cuda, jit
-    import subprocess
     
     # Get GPU info
     try:
