@@ -1,5 +1,6 @@
 """QPU (Quantum Processing Unit) miner for quantum blockchain using D-Wave."""
 
+import argparse
 import asyncio
 import logging
 import sys
@@ -21,7 +22,6 @@ except ImportError:
 
 async def main():
     """Main entry point for QPU miner."""
-    import argparse
 
     parser = argparse.ArgumentParser(description='QPU Mining Node')
     parser.add_argument('--id', type=int, default=1, help='Node ID')
@@ -108,8 +108,7 @@ async def main():
 
 def cli():
     """Console-script entry point."""
-    import asyncio as _asyncio
-    _asyncio.run(main())
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
