@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Launch script for quantum blockchain network with different miner types."""
 
+import argparse
 import subprocess
 import time
 import sys
@@ -159,7 +160,6 @@ def scenario_gpu_competition():
 
 def main():
     """Main entry point."""
-    import argparse
     
     parser = argparse.ArgumentParser(description='Launch Quantum Blockchain Network')
     parser.add_argument('--scenario', default='mixed',
