@@ -10,7 +10,6 @@ except ImportError:
     torch = None
 
 from shared.miner import Miner, MiningResult
-from GPU import LocalGPUSampler, GPUSampler
 
 
 def gpu_mine_block_process(miner_data, block_header: str, result_queue, stop_event):
@@ -28,8 +27,12 @@ def gpu_mine_block_process(miner_data, block_header: str, result_queue, stop_eve
     
     # Create appropriate GPU sampler
     if miner_type.startswith('GPU-LOCAL'):
+        # Local GPU miner - import locally to avoid circular import
+        from .sampler import LocalGPUSampler
         sampler = LocalGPUSampler(miner_type.split(':')[1])
     elif miner_type.startswith('GPU-MODAL'):
+        # Modal GPU miner - import locally to avoid circular import  
+        from .modal_sampler import GPUSampler
         sampler = GPUSampler(miner_type.split(':')[1])
     else:
         raise ValueError(f"Unknown GPU miner type: {miner_type}")

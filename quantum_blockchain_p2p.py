@@ -6,7 +6,8 @@ import sys
 import threading
 import time
 from typing import Optional, List
-from quantum_blockchain import QuantumBlockchain, Block
+from quantum_blockchain import QuantumBlockchain
+from shared.block import Block
 from quantum_blockchain_network import P2PNode
 import logging
 
