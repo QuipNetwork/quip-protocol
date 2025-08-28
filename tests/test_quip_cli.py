@@ -30,7 +30,7 @@ num_cpus = 2
 
     captured: Dict[str, Any] = {}
 
-    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None):
+    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None, genesis_config_file: str = "genesis_block.json"):
         captured.update(
             {
                 "kind": kind,
@@ -39,6 +39,7 @@ num_cpus = 2
                 "peer": peer,
                 "auto_mine": auto_mine,
                 "env": env_overrides or {},
+                "genesis_config_file": genesis_config_file,
             }
         )
         return 0
@@ -75,7 +76,7 @@ devices = ["1", "2"]
 
     captured: Dict[str, Any] = {}
 
-    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None):
+    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None, genesis_config_file: str = "genesis_block.json"):
         captured.update({"kind": kind, "port": port, "env": env_overrides or {}})
         return 0
 
@@ -105,7 +106,7 @@ devices = ["3", "4"]
 
     captured: Dict[str, Any] = {}
 
-    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None):
+    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None, genesis_config_file: str = "genesis_block.json"):
         captured.update({"kind": kind, "env": env_overrides or {}})
         return 0
 
@@ -137,7 +138,7 @@ dwave_api_solver = "Advantage_system6.4"
 
     captured: Dict[str, Any] = {}
 
-    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None):
+    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None, genesis_config_file: str = "genesis_block.json"):
         captured.update({"kind": kind, "env": env_overrides or {}})
         return 0
 
@@ -183,7 +184,7 @@ types = ["t4", "a10g"]
 
     captured: Dict[str, Any] = {}
 
-    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None):
+    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None, genesis_config_file: str = "genesis_block.json"):
         captured.update({"kind": kind, "env": env_overrides or {}})
         return 0
 
@@ -215,7 +216,7 @@ types = ["t4"]
 
     captured: Dict[str, Any] = {}
 
-    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None):
+    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None, genesis_config_file: str = "genesis_block.json"):
         captured.update({"kind": kind, "env": env_overrides or {}})
         return 0
 

@@ -1,6 +1,7 @@
 import os
 import socket
 import contextlib
+from tempfile import TemporaryDirectory
 from typing import Optional
 
 from click.testing import CliRunner
@@ -47,13 +48,12 @@ devices = ["0"]
 
     captured = {}
 
-    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None):
+    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None, genesis_config_file: str = "genesis_block.json"):
         captured.update({"kind": kind, "env": env_overrides or {}})
         return 0
 
     monkeypatch.setattr(quip_cli, "_run_p2p_node", fake_run)
 
-    from tempfile import TemporaryDirectory
     with TemporaryDirectory() as td:
         cfg_path = os.path.join(td, "cfg.toml")
         with open(cfg_path, "w") as f:
