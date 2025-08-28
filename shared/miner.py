@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from shared.block_signer import BlockSigner, HashSigsWrapper
+from shared.block_signer import BlockSigner
 
 
 @dataclass
@@ -48,12 +48,12 @@ class Miner:
         self.crypto = BlockSigner()
         self.ecdsa_public_key_hex = self.crypto.ecdsa_public_key_hex
         self.wots_plus_public_key_hex = self.crypto.wots_plus_public_key_hex
-        
+
         # Keep backward compatibility references
         self.ecdsa_private_key = self.crypto.ecdsa_private_key
         self.ecdsa_public_key = self.crypto.ecdsa_public_key
         self.wots_plus = self.crypto.wots_plus
-        
+
         print(f"{miner_id} initialized with:")
         print(f"  ECDSA Public Key: {self.ecdsa_public_key_hex[:16]}...")
         print(f"  WOTS+ Public Key: {self.wots_plus_public_key_hex[:16]}...")
@@ -350,10 +350,11 @@ class Miner:
     
     def generate_new_wots_key(self):
         """Generate a new WOTS+ key pair after using the current one."""
-        self.crypto.wots_plus = HashSigsWrapper()
+        self.crypto.generate_new_wots_key()
+
+        # Update local references
         self.wots_plus = self.crypto.wots_plus
-        self.wots_plus_public_key_hex = self.crypto.wots_plus.get_public_key_hex()
-        self.crypto.wots_plus_public_key_hex = self.wots_plus_public_key_hex
+        self.wots_plus_public_key_hex = self.crypto.wots_plus_public_key_hex
         print(f"{self.miner_id} generated new WOTS+ key: {self.wots_plus_public_key_hex[:16]}...")
     
     def sign_block_data(self, block_data: str) -> Tuple[str, str]:
@@ -365,7 +366,7 @@ class Miner:
         """
         # Use crypto manager to sign
         signature_hex, next_wots_key_hex = self.crypto.sign_block_data(block_data)
-        
+
         # Update local references
         self.wots_plus_public_key_hex = next_wots_key_hex
         self.wots_plus = self.crypto.wots_plus
