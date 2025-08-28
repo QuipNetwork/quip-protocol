@@ -1,5 +1,6 @@
 """GPU-accelerated miner for quantum blockchain using Modal."""
 
+import argparse
 import asyncio
 import logging
 import sys
@@ -12,15 +13,16 @@ logger = logging.getLogger(__name__)
 # Check if Modal is available
 try:
     import modal
+    from quantum_blockchain import gpu_app
     GPU_AVAILABLE = True
 except ImportError:
     GPU_AVAILABLE = False
+    gpu_app = None
     logger.warning("Modal not installed. GPU mining disabled.")
 
 
 async def main():
     """Main entry point for GPU miner."""
-    import argparse
     
     parser = argparse.ArgumentParser(description='GPU Mining Node')
     parser.add_argument('--id', type=int, default=1, help='Node ID')
@@ -101,8 +103,7 @@ async def main():
 
 def run_with_modal():
     """Run the miner with Modal context if available."""
-    if GPU_AVAILABLE:
-        from quantum_blockchain import gpu_app
+    if GPU_AVAILABLE and gpu_app:
         with gpu_app.run():
             asyncio.run(main())
     else:
