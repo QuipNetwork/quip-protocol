@@ -333,7 +333,6 @@ class BaseMiner:
     
     async def mine_block_async(self, block_data: dict) -> Optional[dict]:
         """Async mining implementation for P2P network compatibility."""
-        import asyncio
         
         self.mining = True
         self.current_block = block_data
@@ -596,7 +595,6 @@ class BaseMiner:
     def mine_block(self, block_data: dict) -> Optional[dict]:
         """Synchronous mining wrapper for compatibility."""
         # Run async mining synchronously
-        import asyncio
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
