@@ -1,26 +1,161 @@
+import argparse
 import hashlib
+import json
 import os
-import queue
+import multiprocessing
 import random
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
+from queue import Empty as QueueEmpty
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
+import math
 from dotenv import load_dotenv
 from dwave.samplers import SimulatedAnnealingSampler
 from dwave.system import DWaveSampler
 from dwave.system.testing import MockDWaveSampler
+from matplotlib.patches import Patch
 from shared.crypto_utils import CryptoManager, WOTSPlus
+
+# Optional imports
+try:
+    import modal
+except ImportError:
+    modal = None
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
+try:
+    from numba import cuda, jit
+except ImportError:
+    cuda = None
+    jit = None
+
+try:
+    import matplotlib.colors as mcolors
+except ImportError:
+    mcolors = None
+
+
+
+def _parse_block_header(block_header: str) -> Dict:
+    """Parse block header string back into block_data components.
+    
+    Args:
+        block_header: Format is f"{previous_hash}{index}{timestamp}{data}"
+        
+    Returns:
+        Dict with previous_hash, index, timestamp, data
+        
+    Raises:
+        ValueError: If block_header cannot be parsed properly
+    """
+    # Format: f"{previous_hash}{index}{timestamp}{data}"
+    # previous_hash is always 64 hex characters
+    if len(block_header) < 64:
+        raise ValueError(f"Block header too short: expected at least 64 chars, got {len(block_header)}")
+        
+    previous_hash = block_header[:64]
+    remainder = block_header[64:]
+    
+    # Find where index ends and timestamp begins
+    # Index is typically small, so look for the first decimal point (timestamp)
+    timestamp_start = -1
+    for i, char in enumerate(remainder):
+        if char == '.' and i > 0:  # Found decimal point, likely timestamp
+            timestamp_start = i
+            break
+    
+    if timestamp_start <= 0:
+        raise ValueError(f"Could not find timestamp in block header remainder: {remainder}")
+        
+    try:
+        index = int(remainder[:timestamp_start])
+    except ValueError:
+        raise ValueError(f"Could not parse index from: {remainder[:timestamp_start]}")
+        
+    timestamp_and_data = remainder[timestamp_start:]
+    
+    # Find where timestamp ends - look for end of float
+    timestamp_end = -1
+    for i, char in enumerate(timestamp_and_data):
+        if not (char.isdigit() or char == '.'):
+            timestamp_end = i
+            break
+    
+    if timestamp_end > 0:
+        try:
+            timestamp = float(timestamp_and_data[:timestamp_end])
+        except ValueError:
+            raise ValueError(f"Could not parse timestamp from: {timestamp_and_data[:timestamp_end]}")
+        data = timestamp_and_data[timestamp_end:]
+    else:
+        # Timestamp goes to end
+        try:
+            timestamp = float(timestamp_and_data)
+        except ValueError:
+            raise ValueError(f"Could not parse timestamp from: {timestamp_and_data}")
+        data = ""
+    
+    return {
+        "previous_hash": previous_hash,
+        "index": index, 
+        "timestamp": timestamp,
+        "data": data,
+    }
+
+
+def _mine_block_process(miner_data, block_header: str, result_queue: multiprocessing.Queue, stop_event: multiprocessing.Event):
+    """Standalone function for mining in a separate process.
+    
+    Args:
+        miner_data: Serialized miner data (type, id, config)
+        block_header: Block header to mine
+        result_queue: Queue to put results
+        stop_event: Event to signal stop
+    """
+    # Recreate miner object from serialized data
+    miner_type = miner_data['type']
+    miner_id = miner_data['id']
+    miner_config = miner_data.get('config', {})
+    
+    # We need to recreate the same Miner objects that were used in the original threading version
+    # These are the Miner class from quantum_blockchain.py, not BaseMiner from blockchain_base.py
+
+    sampler = SimulatedAnnealingStructuredSampler()
+    name = miner_config.get('name', miner_id)
+    
+    match miner_type.split(':')[0]:
+        case 'QPU':
+            sampler = DWaveSampler()
+        case 'GPU-LOCAL':
+            sampler = LocalGPUSampler(miner_type.split(':')[1])
+        case 'GPU-MODAL':
+            sampler = GPUSampler(miner_type.split(':')[1])
+        case 'SA':
+            pass
+        case _:
+            raise ValueError(f"Unknown miner type: {miner_type}")
+    
+    miner = Miner(miner_id, miner_id, sampler, 
+                difficulty_energy=miner_config['difficulty_energy'],  # Use test difficulty
+                min_diversity=miner_config['min_diversity'],
+                min_solutions=miner_config['min_solutions'])
+    
+    # Call the original Miner.mine_block method that expects multiprocessing objects
+    miner.mine_block(block_header, result_queue, stop_event)
 
 # Optional GPU support via Modal Labs
 try:
-    import modal
     GPU_AVAILABLE = True
 except ImportError as e:
     GPU_AVAILABLE = False
@@ -48,10 +183,6 @@ if GPU_AVAILABLE:
     )
     def gpu_sample_t4(h_dict, J_dict, num_reads, num_sweeps):
         """GPU sampling on T4 using Numba acceleration."""
-        import time
-
-        import numpy as np
-        from numba import cuda, jit
 
         start_time = time.time()
 
@@ -120,7 +251,7 @@ if GPU_AVAILABLE:
         return gpu_sample_t4(h_dict, J_dict, num_reads, num_sweeps)
 
 
-class GPUSampler:
+class GPUSampler(MockDWaveSampler):
     """GPU-accelerated sampler using Modal Labs."""
 
     def __init__(self, gpu_type: str = "t4"):
@@ -150,6 +281,16 @@ class GPUSampler:
 
         self._gpu_sample_func = self.gpu_functions[gpu_type]
 
+        # Use same topology as SimulatedAnnealingStructuredSampler
+        qpu = MockDWaveSampler()
+        super().__init__(
+            nodelist=qpu.nodelist,
+            edgelist=qpu.edgelist,
+            properties=qpu.properties,
+            substitute_sampler=self
+        )
+
+
     def sample_ising(self, h, J, num_reads=100, num_sweeps=512, **kwargs):
         """Sample from Ising model using GPU acceleration."""
         # Convert h and J to dictionaries if needed
@@ -170,22 +311,29 @@ class GPUSampler:
         return SampleSet(result["samples"], result["energies"])
 
 
-class LocalGPUSampler:
+class LocalGPUSampler(MockDWaveSampler):
     """Local GPU sampler using PyTorch (CUDA or MPS) in a persistent worker process."""
 
     def __init__(self, device: str):
-        import multiprocessing as _mp
-        import os as _os
         self._device = str(device)
-        self._debug = _os.getenv("QUIP_DEBUG") == "1"
-        self._ctx = _mp.get_context("spawn")
-        self._req_q: _mp.Queue = self._ctx.Queue()
-        self._resp_q: _mp.Queue = self._ctx.Queue()
+        self._debug = os.getenv("QUIP_DEBUG") == "1"
+        self._ctx = multiprocessing.get_context("spawn")
+        self._req_q: multiprocessing.Queue = self._ctx.Queue()
+        self._resp_q: multiprocessing.Queue = self._ctx.Queue()
         self._proc = self._ctx.Process(target=_gpu_worker_main, args=(self._req_q, self._resp_q, self._device))
         self._proc.daemon = True
         self._proc.start()
         if self._debug:
-            print(f"[GPU parent pid={_os.getpid()}] spawn worker pid={self._proc.pid} device={self._device}", flush=True)
+            print(f"[GPU parent pid={os.getpid()}] spawn worker pid={self._proc.pid} device={self._device}", flush=True)
+
+        # Use same topology as SimulatedAnnealingStructuredSampler
+        qpu = MockDWaveSampler()
+        super().__init__(
+            nodelist=qpu.nodelist,
+            edgelist=qpu.edgelist,
+            properties=qpu.properties,
+            substitute_sampler=self
+        )
 
     def close(self):
         try:
@@ -202,8 +350,6 @@ class LocalGPUSampler:
         self.close()
 
     def sample_ising(self, h, J, num_reads=100, num_sweeps=512, **kwargs):
-        import os as _os
-        import queue as _queue
 
         # Convert to dicts for serialization
         h_dict = dict(h) if hasattr(h, 'items') else {i: h[i] for i in range(len(h))}
@@ -216,35 +362,31 @@ class LocalGPUSampler:
             "num_sweeps": int(num_sweeps),
         }
         if self._debug:
-            print(f"[GPU parent pid={_os.getpid()}] send sample to worker pid={self._proc.pid} device={self._device} reads={payload['num_reads']} sweeps={payload['num_sweeps']}", flush=True)
+            print(f"[GPU parent pid={os.getpid()}] send sample to worker pid={self._proc.pid} device={self._device} reads={payload['num_reads']} sweeps={payload['num_sweeps']}", flush=True)
         self._req_q.put(payload)
-        timeout = float(_os.getenv("QUIP_GPU_WORKER_RESP_TIMEOUT", "5.0"))
+        timeout = float(os.getenv("QUIP_GPU_WORKER_RESP_TIMEOUT", "5.0"))
         try:
             msg = self._resp_q.get(timeout=timeout)
-        except _queue.Empty:
+        except QueueEmpty:
             raise RuntimeError(f"GPU worker timeout after {timeout}s (pid={self._proc.pid}, device={self._device})")
         if isinstance(msg, dict) and msg.get("status") == "error":
             raise RuntimeError(msg.get("message", "GPU worker error"))
         if self._debug:
-            print(f"[GPU parent pid={_os.getpid()}] received response from worker pid={self._proc.pid} device={self._device}", flush=True)
+            print(f"[GPU parent pid={os.getpid()}] received response from worker pid={self._proc.pid} device={self._device}", flush=True)
         samples = msg["samples"]
         energies = msg["energies"]
 
         class SampleSet:
             def __init__(self, samples, energies):
-                import numpy as _np
                 self.record = type('Record', (), {
-                    'sample': _np.array(samples),
-                    'energy': _np.array(energies)
+                    'sample': np.array(samples),
+                    'energy': np.array(energies)
                 })()
         return SampleSet(samples, energies)
 
 
 def _gpu_worker_main(req_q, resp_q, device_str: str):
-    import os as _os
-
-    import torch
-    debug = _os.getenv("QUIP_DEBUG") == "1"
+    debug = os.getenv("QUIP_DEBUG") == "1"
     # Resolve device
     dev: torch.device
     if device_str.lower() == "mps" or (getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()):
@@ -261,7 +403,7 @@ def _gpu_worker_main(req_q, resp_q, device_str: str):
         dev = torch.device(f"cuda:{idx}")
 
     if debug:
-        print(f"[GPU worker pid={_os.getpid()}] start device={dev}", flush=True)
+        print(f"[GPU worker pid={os.getpid()}] start device={dev}", flush=True)
 
     while True:
         msg = req_q.get()
@@ -269,16 +411,17 @@ def _gpu_worker_main(req_q, resp_q, device_str: str):
             continue
         if msg.get("op") == "stop":
             if debug:
-                print(f"[GPU worker pid={_os.getpid()}] stop", flush=True)
+                print(f"[GPU worker pid={os.getpid()}] stop", flush=True)
             break
         if msg.get("op") != "sample":
             continue
         try:
             if debug:
-                print(f"[GPU worker pid={_os.getpid()}] received sample", flush=True)
+                print(f"[GPU worker pid={os.getpid()}] received sample", flush=True)
             h = msg["h"]
             J = msg["J"]
             num_reads = int(msg.get("num_reads", 100))
+            num_sweeps = int(msg.get("num_sweeps", 512))
             # Build tensors
             n = 0
             if h:
@@ -288,7 +431,6 @@ def _gpu_worker_main(req_q, resp_q, device_str: str):
             if n <= 0:
                 resp_q.put({"status": "error", "message": "Invalid problem size"})
                 continue
-            import torch
             h_vec = torch.zeros(n, device=dev, dtype=torch.float32)
             for i, v in h.items():
                 h_vec[i] = float(v)
@@ -301,19 +443,65 @@ def _gpu_worker_main(req_q, resp_q, device_str: str):
             # Generate random spins {-1,1}
             spins = (torch.rand((num_reads, n), device=dev) > 0.5).to(torch.int8)
             spins = spins * 2 - 1  # {0,1} -> {-1,1}
-            # Energy: h term
-            energies = (spins.to(torch.float32) * h_vec).sum(dim=1)
-            # J term
+
+            # Simulated annealing using edge list (no dense J)
+            # Match CPU SA semantics: one sweep ≈ n spin updates per read.
+            # Use geometric beta schedule to mimic D-Wave SA behavior.
+            betas = torch.exp(torch.linspace(math.log(0.1), math.log(10.0), steps=num_sweeps, device=dev, dtype=torch.float32))
+            R = num_reads
+            ar = torch.arange(R, device=dev)
+            updates_per_sweep = int(os.getenv("QUIP_GPU_UPDATES_PER_SWEEP", str(n)))
+            recompute_interval = int(os.getenv("QUIP_GPU_RECOMPUTE_INTERVAL", "64"))
+
+            for beta in betas:
+                # Initial local field at this temperature
+                if i_idx is not None:
+                    sp_f = spins.to(torch.float32)
+                    neighbor_sum = torch.zeros((R, n), device=dev, dtype=torch.float32)
+                    # Contributions from edges (i -> j) and (j -> i)
+                    neighbor_sum.scatter_add_(1, i_idx.unsqueeze(0).expand(R, -1), sp_f[:, j_idx] * j_vals)
+                    neighbor_sum.scatter_add_(1, j_idx.unsqueeze(0).expand(R, -1), sp_f[:, i_idx] * j_vals)
+                else:
+                    neighbor_sum = torch.zeros((R, n), device=dev, dtype=torch.float32)
+                local_field = neighbor_sum + h_vec  # broadcasts h_vec over reads
+
+                # Perform ~n updates per sweep with periodic field recomputation
+                t = 0
+                while t < updates_per_sweep:
+                    chunk = min(recompute_interval, updates_per_sweep - t)
+                    for _ in range(chunk):
+                        idx = torch.randint(0, n, (R,), device=dev)
+                        s_i = spins[ar, idx].to(torch.float32)
+                        lf_i = local_field[ar, idx]
+                        delta_e = 2.0 * s_i * lf_i
+                        accept = (delta_e < 0) | (torch.rand(R, device=dev) < torch.exp(-beta * delta_e))
+                        # Flip accepted spins
+                        flips = torch.where(accept, torch.tensor(-1, dtype=spins.dtype, device=dev), torch.tensor(1, dtype=spins.dtype, device=dev))
+                        spins[ar, idx] = spins[ar, idx] * flips
+                    # Refresh local field after a chunk of updates
+                    if i_idx is not None:
+                        sp_f = spins.to(torch.float32)
+                        neighbor_sum = torch.zeros((R, n), device=dev, dtype=torch.float32)
+                        neighbor_sum.scatter_add_(1, i_idx.unsqueeze(0).expand(R, -1), sp_f[:, j_idx] * j_vals)
+                        neighbor_sum.scatter_add_(1, j_idx.unsqueeze(0).expand(R, -1), sp_f[:, i_idx] * j_vals)
+                    else:
+                        neighbor_sum = torch.zeros((R, n), device=dev, dtype=torch.float32)
+                    local_field = neighbor_sum + h_vec
+                    t += chunk
+
+            # Compute final energies with correct Ising sign convention
+            sp_f = spins.to(torch.float32)
+            energies = - (sp_f * h_vec).sum(dim=1)
             if i_idx is not None:
-                prod = spins[:, i_idx].to(torch.float32) * spins[:, j_idx].to(torch.float32)
-                energies = energies + (prod * j_vals).sum(dim=1)
+                prod = sp_f[:, i_idx] * sp_f[:, j_idx]
+                energies = energies - (prod * j_vals).sum(dim=1)
             # Move to CPU lists
             resp_q.put({
                 "samples": spins.to("cpu").to(torch.int8).tolist(),
                 "energies": energies.to("cpu").to(torch.float32).tolist(),
             })
             if debug:
-                print(f"[GPU worker pid={_os.getpid()}] responded", flush=True)
+                print(f"[GPU worker pid={os.getpid()}] responded", flush=True)
         except Exception as e:
             resp_q.put({"status": "error", "message": str(e)})
 
@@ -351,6 +539,51 @@ class MiningResult:
     diversity: float
     num_valid: int
     mining_time: float
+
+
+def load_genesis_config(config_file: Optional[str] = None) -> Dict:
+    """Load genesis block and mining parameters from a JSON file.
+    
+    Args:
+        config_file: Path to genesis config file. If None, defaults to genesis_block.json
+    
+    Returns:
+        Dictionary with genesis block and mining parameters
+        
+    Raises:
+        FileNotFoundError: If the specified config file is not found
+        KeyError: If required configuration keys are missing
+        json.JSONDecodeError: If JSON is malformed
+    """
+    if config_file is None:
+        config_file = Path(__file__).parent / "genesis_block.json"
+    else:
+        config_file = Path(config_file)
+        if not config_file.is_absolute():
+            config_file = Path(__file__).parent / config_file
+    
+    if not config_file.exists():
+        raise FileNotFoundError(f"Genesis configuration not found: {config_file}")
+    
+    with open(config_file, 'r') as f:
+        config = json.load(f)
+    
+    # Validate required keys
+    if 'genesis_block' not in config:
+        raise KeyError("Missing 'genesis_block' in genesis configuration")
+    if 'mining_parameters' not in config:
+        raise KeyError("Missing 'mining_parameters' in genesis configuration")
+    
+    result = {
+        'genesis_block': config['genesis_block'].copy(),
+        'mining_parameters': config['mining_parameters'].copy()
+    }
+    
+    print(f"Loaded genesis configuration from: {config_file.name}")
+    if 'description' in result['mining_parameters']:
+        print(f"Mining parameters: {result['mining_parameters']['description']}")
+    
+    return result
 
 
 @dataclass
@@ -777,11 +1010,13 @@ class Miner:
         """Reset the last block received time when a new block is received."""
         self.last_block_received_time = time.time()
 
-    def mine_block(self, block_header: str, result_queue: queue.Queue, stop_event: threading.Event):
-        """Mine a block in a separate thread.
+    def mine_block(self, block_header: str, result_queue: multiprocessing.Queue, stop_event: multiprocessing.Event):
+        """Mine a block in a separate process.
         
         Args:
             block_header: Format is f"{previous_hash}{index}{timestamp}{data}"
+            result_queue: Multiprocessing queue for results
+            stop_event: Multiprocessing event to signal stop
         """
         self.mining = True
         progress = 0  # Progress counter for logging
@@ -968,6 +1203,7 @@ class QuantumBlockchain:
         gpu_types: List[str] | None = None,
         gpu_devices: List[str] | None = None,
         gpu_backend: str | None = None,
+        genesis_config_file: Optional[str] = None,
     ):
         """
         Initialize the quantum blockchain.
@@ -983,7 +1219,20 @@ class QuantumBlockchain:
             gpu_types: List of GPU types for each GPU miner ['t4', 'a10g', 'a100']
             gpu_devices: List of local device ordinals (strings) for local backend
             gpu_backend: 'local' (default) or 'modal'
+            genesis_config_file: Path to genesis config JSON file to override defaults
         """
+        # Try to load genesis configuration to override defaults
+        try:
+            genesis_config = load_genesis_config(genesis_config_file)
+            mining_params = genesis_config['mining_parameters']
+            # Override parameters from genesis config
+            base_difficulty_energy = mining_params.get('base_difficulty_energy', base_difficulty_energy)
+            base_min_diversity = mining_params.get('base_min_diversity', base_min_diversity)
+            base_min_solutions = mining_params.get('base_min_solutions', base_min_solutions)
+        except (FileNotFoundError, KeyError, json.JSONDecodeError):
+            # Genesis config not found or invalid, use provided defaults
+            pass
+            
         self.chain: List[Block] = []
         self.competitive = competitive
         self.mining_stats = {}  # Will track all miners
@@ -1086,8 +1335,7 @@ class QuantumBlockchain:
                     # Warn if MPS (Apple) but >1 devices requested; collapse to single worker
                     use_mps = False
                     try:
-                        import torch  # noqa: F401
-                        use_mps = getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
+                        use_mps = getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available() if torch else False
                     except Exception:
                         use_mps = False
 
@@ -1097,24 +1345,22 @@ class QuantumBlockchain:
                         effective_devices = effective_devices[:1]
 
                     if not effective_devices:
-                        # Attempt simple autodetect via torch.cuda if available
-                        try:
-                            import torch
-                            if torch.cuda.is_available():
-                                count = torch.cuda.device_count()
-                                effective_devices = [str(i) for i in range(count)]
-                        except Exception:
-                            pass
+                        # Prefer Apple MPS if available; otherwise attempt CUDA autodetect
+                        if use_mps:
+                            effective_devices = ["mps"]
+                        else:
+                            try:
+                                if torch and torch.cuda.is_available():
+                                    count = torch.cuda.device_count()
+                                    effective_devices = [str(i) for i in range(count)]
+                            except Exception:
+                                pass
 
                     if not effective_devices:
                         raise RuntimeError("Local GPU backend selected but no GPUs detected or configured")
 
-                    # NOTE: Placeholder LocalGPUSampler stub; to be replaced with real local sampler
-                    class LocalGPUSampler:
-                        def __init__(self, device: str):
-                            self.device = device
-                        def sample_ising(self, h, J, num_reads=100, num_sweeps=512, **kwargs):
-                            raise NotImplementedError("LocalGPUSampler not yet implemented")
+                    # Use the fully-implemented LocalGPUSampler defined above
+                    # (spawns a persistent PyTorch worker on the selected device)
 
                     for i in range(min(self.num_gpu_miners, len(effective_devices))):
                         miner_id = f"GPU-{i+1}"
@@ -1318,14 +1564,12 @@ class QuantumBlockchain:
         block_header = f"{block.previous_hash}{block.index}{block.timestamp}{block.data}"
         progress = 0  # Progress counter for logging
         # Test/CI knobs
-        import os as _os
-        import time as _time
-        reads = int(_os.getenv("QUIP_MINING_NUM_READS", "100"))
-        sweeps = int(_os.getenv("QUIP_MINING_NUM_SWEEPS", "512"))
-        _timeout_env = float(_os.getenv("QUIP_MINING_TIMEOUT_SEC", "0"))
+        reads = int(os.getenv("QUIP_MINING_NUM_READS", "100"))
+        sweeps = int(os.getenv("QUIP_MINING_NUM_SWEEPS", "512"))
+        _timeout_env = float(os.getenv("QUIP_MINING_TIMEOUT_SEC", "0"))
         # Cap any configured timeout to a maximum of 5 seconds when enabled
         timeout_sec = min(_timeout_env, 5.0) if _timeout_env > 0 else 0.0
-        start_t = _time.time()
+        start_t = time.time()
         best_energy = None
         best_valid = []
 
@@ -1334,9 +1578,9 @@ class QuantumBlockchain:
             nonce = random.randint(0, sys.maxsize)
             
             # Timeout check
-            if timeout_sec > 0 and (_time.time() - start_t) >= timeout_sec:
+            if timeout_sec > 0 and (time.time() - start_t) >= timeout_sec:
                 # If under test fast mode, synthesize a valid quick result if needed
-                if _os.getenv("QUIP_TEST_FAST") == "1":
+                if os.getenv("QUIP_TEST_FAST") == "1":
                     target_num = max(1, self.min_solutions)
                     n = len(best_valid[0]) if best_valid else 16
                     synth = [[1]*n for _ in range(target_num)]
@@ -1407,18 +1651,30 @@ class QuantumBlockchain:
         print("\nStarting competitive mining...")
 
         # Create result queue and stop event
-        result_queue = queue.Queue()
-        stop_event = threading.Event()
+        result_queue = multiprocessing.Queue()
+        stop_event = multiprocessing.Event()
 
-        # Start miners in separate threads
-        threads = []
+        # Start miners in separate processes
+        processes = []
         for miner in self.miners:
-            thread = threading.Thread(
-                target=miner.mine_block,
-                args=(block_header, result_queue, stop_event)
+            # Serialize miner data for the subprocess
+            miner_data = {
+                'type': miner.miner_type,
+                'id': miner.miner_id,
+                'config': {
+                    'difficulty_energy': miner.difficulty_energy,
+                    'min_diversity': miner.min_diversity,
+                    'min_solutions': miner.min_solutions,
+                    'miner_type': miner.miner_type
+                }
+            }
+            
+            process = multiprocessing.Process(
+                target=_mine_block_process,
+                args=(miner_data, block_header, result_queue, stop_event)
             )
-            threads.append(thread)
-            thread.start()
+            processes.append(process)
+            process.start()
 
         # Wait for first valid result
         winning_result = result_queue.get()
@@ -1426,11 +1682,12 @@ class QuantumBlockchain:
         # Stop all miners immediately
         stop_event.set()
 
-        # Wait for threads to stop with timeout
-        for thread in threads:
-            thread.join(timeout=2.0)
-            if thread.is_alive():
-                print(f"Warning: Thread {thread.name} did not stop cleanly")
+        # Wait for processes to stop with timeout
+        for process in processes:
+            process.join(timeout=2.0)
+            if process.is_alive():
+                print(f"Warning: Process {process.name} did not stop cleanly")
+                process.terminate()  # Force terminate if still alive
 
         # Update stats
         self.mining_stats[winning_result.miner_id] += 1
@@ -1916,7 +2173,6 @@ class QuantumBlockchain:
         ax3.set_ylabel('Difficulty (Energy Threshold)')
         ax3.set_title('Difficulty Adjustment Over Time')
         # Create custom legend with miner colors
-        from matplotlib.patches import Patch
         legend_elements = [plt.Line2D([0], [0], color='k', linewidth=2, label='Difficulty')]
         # Add legend entries for each unique miner
         for miner_id in sorted(set(miner_ids)):
@@ -2110,11 +2366,10 @@ class QuantumBlockchain:
             if miner_id[-1].isdigit():
                 miner_num = int(miner_id[-1])
                 # Lighten color for higher numbers
-                import matplotlib.colors as mcolors
-                rgb = mcolors.hex2color(base_color)
+                rgb = mcolors.hex2color(base_color) if mcolors else (0.5, 0.5, 0.5)
                 lightness = min(1.0, 0.7 + 0.1 * miner_num)
                 rgb = tuple(min(1.0, c * lightness) for c in rgb)
-                return mcolors.rgb2hex(rgb)
+                return mcolors.rgb2hex(rgb) if mcolors else base_color
             return base_color
         
         # 1. Total timing per miner over samples (not just blocks)
@@ -2330,7 +2585,9 @@ def run_blockchain(args):
             num_qpu_miners=args.num_qpu,
             num_sa_miners=args.num_sa,
             num_gpu_miners=args.num_gpu,
-            gpu_types=args.gpu_types
+            gpu_types=args.gpu_types,
+            gpu_devices=args.gpu_devices,
+            gpu_backend=args.gpu_backend,
         )
 
         # Names in alphabetical order
@@ -2417,11 +2674,13 @@ def run_blockchain(args):
         print("Run with --competitive flag for QPU vs SA competition")
 
         # Create blockchain with diversity requirements
-        blockchain = QuantumBlockchain(competitive=False, 
+        blockchain = QuantumBlockchain(competitive=False,
                                        num_qpu_miners=args.num_qpu,
                                        num_sa_miners=args.num_sa,
                                        num_gpu_miners=args.num_gpu,
-                                       gpu_types=args.gpu_types)
+                                       gpu_types=args.gpu_types,
+                                       gpu_devices=args.gpu_devices,
+                                       gpu_backend=args.gpu_backend)
 
         # Add some blocks
         transactions = [
@@ -2443,8 +2702,6 @@ def run_blockchain(args):
 
 def main():
     """Demonstrate quantum blockchain."""
-    import argparse
-    import sys
 
     parser = argparse.ArgumentParser(description='Quantum Blockchain Demo')
     parser.add_argument('--competitive', action='store_true',
@@ -2458,13 +2715,18 @@ def main():
     parser.add_argument('--gpu-types', type=str, nargs='+',
                        default=['t4'],
                        help='GPU types for each GPU miner: t4, a10g, a100')
+    parser.add_argument('--gpu-backend', type=str, choices=['local', 'modal'], default=None,
+                       help='GPU backend to use: local (default) or modal. Can also set QUIP_GPU_BACKEND env var.')
+    parser.add_argument('--gpu-devices', type=str, nargs='+', default=None,
+                       help='Local GPU device list (e.g., 0 1 for CUDA; "mps" for Apple Metal). If omitted, autodetect.')
     parser.add_argument('--blocks', type=int, default=20,
                        help='Number of blocks to mine (default: 20)')
 
     args = parser.parse_args()
 
-    # If GPU miners are requested and Modal is available, run with Modal context
-    if args.num_gpu > 0 and GPU_AVAILABLE:
+    # Only use Modal when explicitly requested via backend selection
+    backend = (args.gpu_backend or os.getenv("QUIP_GPU_BACKEND", "local")).lower()
+    if args.num_gpu > 0 and backend == 'modal' and GPU_AVAILABLE:
         with gpu_app.run():
             run_blockchain(args)
     else:
