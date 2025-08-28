@@ -20,6 +20,8 @@ try:  # Python 3.11+
 except ModuleNotFoundError:  # Python 3.10
     import tomli as _toml  # type: ignore
 
+from quantum_blockchain_p2p import run_cli_node
+
 
 def _load_config(path: Optional[str]) -> Dict[str, Any]:
     if not path:
@@ -83,6 +85,7 @@ def _run_p2p_node(
     port: int,
     peer: Optional[str],
     env_overrides: Optional[dict] = None,
+    genesis_config_file: str = "genesis_block.json",
 ) -> int:
     """Run a P2P node directly without subprocess for a single node of given kind.
 
@@ -95,7 +98,6 @@ def _run_p2p_node(
                 os.environ[k] = str(v)
     
     # Import and call the CLI node function
-    from quantum_blockchain_p2p import run_cli_node
     
     # Configure miners based on kind
     if kind == "cpu":
@@ -117,7 +119,8 @@ def _run_p2p_node(
             competitive=True,
             num_qpu=num_qpu,
             num_sa=num_sa,
-            num_gpu=num_gpu
+            num_gpu=num_gpu,
+            genesis_config_file=genesis_config_file
         )
         return 0
     except KeyboardInterrupt:
@@ -133,8 +136,9 @@ def _run_p2p_node(
 @click.option("--port", type=int, default=None, help="Port to bind to (defaults from [global].port or 8080)")
 @click.option("--peer", type=str, default=None, help="Peer address host:port to join (defaults from [global].peer)")
 @click.option("--num-cpus", type=int, help="Limit CPU threads via OMP/MKL/BLAS env vars")
+@click.option("--genesis-config", type=str, default="genesis_block.json", help="Genesis block configuration file")
 @click.pass_context
-def cpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Optional[str], num_cpus: Optional[int]):
+def cpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Optional[str], num_cpus: Optional[int], genesis_config: str):
     """Run a CPU node (1 SA miner)."""
     global_cfg = ((ctx.obj or {}).get("config", {}) or {}).get("global", {})
     host = host if host is not None else global_cfg.get("host", "0.0.0.0")
@@ -149,7 +153,7 @@ def cpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Opti
             "OPENBLAS_NUM_THREADS": num_cpus,
             "NUMEXPR_NUM_THREADS": num_cpus,
         }
-    sys.exit(_run_p2p_node("cpu", host, port, peer, env_overrides=env))
+    sys.exit(_run_p2p_node("cpu", host, port, peer, env_overrides=env, genesis_config_file=genesis_config))
 
 
 @quip_network_node.command(name="gpu")
@@ -158,8 +162,9 @@ def cpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Opti
 @click.option("--peer", type=str, default=None, help="Peer address host:port to join (defaults from [global].peer)")
 @click.option("--device", type=str, help="GPU device selector (e.g., CUDA ordinal)")
 @click.option("--gpu-backend", type=click.Choice(["local", "modal"], case_sensitive=False), help="Override GPU backend (local or modal)")
+@click.option("--genesis-config", type=str, default="genesis_block.json", help="Genesis block configuration file")
 @click.pass_context
-def gpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Optional[str], device: Optional[str], gpu_backend: Optional[str]):
+def gpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Optional[str], device: Optional[str], gpu_backend: Optional[str], genesis_config: str):
     """Run a GPU node (multi-GPU capable)."""
     global_cfg = ((ctx.obj or {}).get("config", {}) or {}).get("global", {})
     host = host if host is not None else global_cfg.get("host", "0.0.0.0")
@@ -189,7 +194,7 @@ def gpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Opti
         if isinstance(types_cfg, list) and types_cfg:
             env["QUIP_GPU_TYPES"] = ",".join(str(t) for t in types_cfg)
 
-    sys.exit(_run_p2p_node("gpu", host, port, peer, env_overrides=env or None))
+    sys.exit(_run_p2p_node("gpu", host, port, peer, env_overrides=env or None, genesis_config_file=genesis_config))
 
 
 @quip_network_node.command(name="qpu")
@@ -199,6 +204,7 @@ def gpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Opti
 @click.option("--dwave-api-key", type=str, help="D-Wave API key (DWAVE_API_TOKEN)")
 @click.option("--dwave-api-solver", type=str, help="D-Wave solver name (DWAVE_API_SOLVER)")
 @click.option("--dwave-region-url", type=str, default=None, help="D-Wave region SAPI endpoint URL")
+@click.option("--genesis-config", type=str, default="genesis_block.json", help="Genesis block configuration file")
 @click.pass_context
 def qpu(
     ctx: click.Context,
@@ -208,6 +214,7 @@ def qpu(
     dwave_api_key: Optional[str],
     dwave_api_solver: Optional[str],
     dwave_region_url: Optional[str],
+    genesis_config: str,
 ):
     """Run a QPU node (1 QPU miner)."""
     global_cfg = ((ctx.obj or {}).get("config", {}) or {}).get("global", {})
@@ -232,7 +239,7 @@ def qpu(
     }
     # Remove None values
     env = {k: v for k, v in env.items() if v}
-    sys.exit(_run_p2p_node("qpu", host, port, peer, env_overrides=env))
+    sys.exit(_run_p2p_node("qpu", host, port, peer, env_overrides=env, genesis_config_file=genesis_config))
 
 
 # -----------------------------
