@@ -1,5 +1,6 @@
 """CPU-based Simulated Annealing miner for quantum blockchain."""
 
+import argparse
 import asyncio
 import logging
 import sys
@@ -12,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 async def main():
     """Main entry point for CPU miner."""
-    import argparse
 
     parser = argparse.ArgumentParser(description='CPU Mining Node')
     parser.add_argument('--id', type=int, default=1, help='Node ID')
@@ -75,8 +75,7 @@ async def main():
 
 def cli():
     """Console-script entry point."""
-    import asyncio as _asyncio
-    _asyncio.run(main())
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
