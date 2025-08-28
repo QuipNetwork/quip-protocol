@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 import time
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Set, Optional, Callable
@@ -390,7 +391,6 @@ class P2PNode:
 
 async def main():
     """Example usage of P2P node."""
-    import sys
     
     # Get port from command line or use default
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
