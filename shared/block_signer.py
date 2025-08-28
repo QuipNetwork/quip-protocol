@@ -1,4 +1,4 @@
-"""Cryptographic utilities for quantum blockchain."""
+"""Block signing utilities for quantum blockchain."""
 
 import os
 import hashlib
@@ -6,84 +6,44 @@ from typing import Tuple, List
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.backends import default_backend
+import hashsigs
 
 
-class WOTSPlus:
-    """WOTS+ (Winternitz One-Time Signature Plus) implementation."""
+class HashSigsWrapper:
+    """Wrapper for hashsigs WOTS+ implementation."""
     
     def __init__(self, seed: bytes = None):
-        """Initialize WOTS+ with a random seed."""
+        """Initialize hashsigs WOTS+ with a seed."""
         if seed is None:
             seed = os.urandom(32)
         self.seed = seed
-        self.w = 16  # Winternitz parameter
-        self.n = 32  # Hash output length in bytes
-        self.l1 = 64  # Number of message chains
-        self.l2 = 3   # Number of checksum chains
-        self.l = self.l1 + self.l2  # Total chains
         
-        # Generate private key
-        self.private_key = self._generate_private_key()
-        # Generate public key
-        self.public_key = self._generate_public_key()
+        # Create WOTS+ instance using SHA256
+        sha256_hash = lambda data: hashlib.sha256(data).digest()
+        self.wots_plus = hashsigs.WOTSPlus(sha256_hash)
+        
+        # Generate key pair
+        self.public_key, self.private_key = self.wots_plus.generate_key_pair(seed)
         self.used = False  # Track if this key has been used
     
-    def _hash(self, data: bytes) -> bytes:
-        """Hash function for WOTS+."""
-        return hashlib.sha256(data).digest()
-    
-    def _generate_private_key(self) -> List[bytes]:
-        """Generate WOTS+ private key."""
-        private_key = []
-        for i in range(self.l):
-            # Derive each private key element from seed
-            element = self._hash(self.seed + i.to_bytes(4, 'big'))
-            private_key.append(element)
-        return private_key
-    
-    def _generate_public_key(self) -> List[bytes]:
-        """Generate WOTS+ public key from private key."""
-        public_key = []
-        for sk_element in self.private_key:
-            # Hash chain of length w-1
-            pk_element = sk_element
-            for _ in range(self.w - 1):
-                pk_element = self._hash(pk_element)
-            public_key.append(pk_element)
-        return public_key
-    
     def sign(self, message: bytes) -> bytes:
-        """Sign a message with WOTS+."""
+        """Sign a message with hashsigs WOTS+."""
         if self.used:
             raise ValueError("WOTS+ key already used! Generate new key.")
         self.used = True
         
-        # For simplicity, return concatenated signature elements
-        # In production, would implement full WOTS+ signing
-        signature_elements = []
-        msg_hash = self._hash(message)
-        
-        for i, sk_element in enumerate(self.private_key[:32]):  # Simplified
-            # Hash chain based on message bits
-            sig_element = sk_element
-            if i < len(msg_hash):
-                iterations = msg_hash[i] % self.w
-                for _ in range(iterations):
-                    sig_element = self._hash(sig_element)
-            signature_elements.append(sig_element)
-        
-        return b''.join(signature_elements[:32])  # Return fixed size
+        # Hash the message to get exactly 32 bytes
+        message_hash = hashlib.sha256(message).digest()
+        signature = self.wots_plus.sign(self.private_key, message_hash)
+        return signature
     
     def get_public_key_hex(self) -> str:
         """Get the public key in hex format."""
-        # Concatenate and hash all public key elements
-        combined = b''.join(self.public_key)
-        public_key_hash = hashlib.sha256(combined).digest()
-        return public_key_hash.hex()
+        return self.public_key.to_bytes().hex()
 
 
-class CryptoManager:
-    """Manages ECDSA and WOTS+ cryptographic operations for miners."""
+class BlockSigner:
+    """Manages ECDSA and WOTS+ cryptographic operations for block signing."""
     
     def __init__(self):
         """Initialize cryptographic keys."""
@@ -101,8 +61,8 @@ class CryptoManager:
         )
         self.ecdsa_public_key_hex = self.ecdsa_public_key_bytes.hex()
         
-        # Generate initial WOTS+ key pair
-        self.wots_plus = WOTSPlus()
+        # Generate initial WOTS+ key pair using hashsigs
+        self.wots_plus = HashSigsWrapper()
         self.wots_plus_public_key_hex = self.wots_plus.get_public_key_hex()
     
     def sign_block_data(self, block_data: str) -> Tuple[str, str]:
@@ -124,7 +84,7 @@ class CryptoManager:
         )
         
         # Generate new WOTS+ key pair for next block (one-time signature)
-        self.wots_plus = WOTSPlus()
+        self.wots_plus = HashSigsWrapper()
         next_wots_key_hex = self.wots_plus.get_public_key_hex()
         
         # Combine signatures
@@ -162,7 +122,7 @@ class CryptoManager:
             return False
     
     def verify_wots_signature(self, public_key_hex: str, message: bytes, signature_hex: str) -> bool:
-        """Verify a WOTS+ signature.
+        """Verify a WOTS+ signature using hashsigs.
         
         Args:
             public_key_hex: Hex-encoded WOTS+ public key
@@ -173,9 +133,21 @@ class CryptoManager:
             True if signature is valid, False otherwise
         """
         try:
-            # In production, would use proper WOTS+ verification
-            # For now, this is a placeholder
-            return len(signature_hex) > 0 and len(public_key_hex) > 0
+            public_key_bytes = bytes.fromhex(public_key_hex)
+            signature_bytes = bytes.fromhex(signature_hex)
+            
+            # Create WOTSPlus instance for verification
+            sha256_hash = lambda data: hashlib.sha256(data).digest()
+            wots_plus = hashsigs.WOTSPlus(sha256_hash)
+            
+            # Reconstruct public key from bytes
+            public_key = hashsigs.PublicKey.from_bytes(public_key_bytes)
+            if public_key is None:
+                return False
+                
+            # Hash the message to get exactly 32 bytes (same as in sign method)
+            message_hash = hashlib.sha256(message).digest()
+            return wots_plus.verify(public_key, message_hash, signature_bytes)
         except Exception:
             return False
     

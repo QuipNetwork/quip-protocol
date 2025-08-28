@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 from quantum_blockchain_network import P2PNode, Message
-from shared.crypto_utils import CryptoManager
+from shared.block_signer import BlockSigner
 from dwave.samplers import SimulatedAnnealingSampler
 from dwave.system import DWaveSampler
 from dwave.system.testing import MockDWaveSampler
@@ -85,7 +85,7 @@ class BaseMiner:
         self.total_rewards = 0
         
         # Initialize crypto manager
-        self.crypto = CryptoManager()
+        self.crypto = BlockSigner()
         self.ecdsa_public_key_hex = self.crypto.ecdsa_public_key_hex
         self.wots_plus_public_key_hex = self.crypto.wots_plus_public_key_hex
         

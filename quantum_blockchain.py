@@ -22,7 +22,6 @@ from dwave.system import DWaveSampler
 from dwave.system.testing import MockDWaveSampler
 from matplotlib.patches import Patch
 from shared.block import Block, _parse_block_header, load_genesis_block
-from shared.crypto_utils import CryptoManager, WOTSPlus
 from shared.miner import Miner, MiningResult
 
 # Import modular components
@@ -77,7 +76,6 @@ load_dotenv()
 
 
 
-# WOTSPlus class moved to shared.crypto_utils
 # Miner class moved to shared.miner
 
 

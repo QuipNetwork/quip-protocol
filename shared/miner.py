@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from shared.crypto_utils import CryptoManager, WOTSPlus
+from shared.block_signer import BlockSigner, HashSigsWrapper
 
 
 @dataclass
@@ -45,7 +45,7 @@ class Miner:
         self.total_rewards = 0
         
         # Initialize crypto manager
-        self.crypto = CryptoManager()
+        self.crypto = BlockSigner()
         self.ecdsa_public_key_hex = self.crypto.ecdsa_public_key_hex
         self.wots_plus_public_key_hex = self.crypto.wots_plus_public_key_hex
         
@@ -350,7 +350,7 @@ class Miner:
     
     def generate_new_wots_key(self):
         """Generate a new WOTS+ key pair after using the current one."""
-        self.crypto.wots_plus = WOTSPlus()
+        self.crypto.wots_plus = HashSigsWrapper()
         self.wots_plus = self.crypto.wots_plus
         self.wots_plus_public_key_hex = self.crypto.wots_plus.get_public_key_hex()
         self.crypto.wots_plus_public_key_hex = self.wots_plus_public_key_hex
