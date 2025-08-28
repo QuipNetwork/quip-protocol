@@ -12,8 +12,7 @@ import aiohttp
 import sys
 sys.path.append('..')
 
-from quantum_blockchain import QuantumBlockchain
-from shared.block import Block
+from quantum_blockchain import QuantumBlockchain, Block
 from CPU import SimulatedAnnealingStructuredSampler
 from dwave.system import DWaveSampler
 try:
