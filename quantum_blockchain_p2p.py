@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 import os
@@ -89,6 +90,7 @@ class P2PBlockchainNode:
         base_difficulty_energy: Optional[float] = None,
         base_min_diversity: Optional[float] = None,
         base_min_solutions: Optional[int] = None,
+        genesis_config_file: Optional[str] = None,
     ):
         self.host = host
         self.port = port
@@ -106,6 +108,7 @@ class P2PBlockchainNode:
             gpu_backend=gpu_backend,
             gpu_devices=gpu_devices,
             gpu_types=gpu_types,
+            genesis_config_file=genesis_config_file,
         )
         if base_difficulty_energy is not None:
             qb_kwargs["base_difficulty_energy"] = base_difficulty_energy
@@ -244,14 +247,20 @@ def start_mining_process(node: P2PBlockchainNode):
         while True:
             try:
                 data = f"Mined block {block_count}"
-                logger.info(f"Mining block {len(node.blockchain.chain)}...")
+                logger.info(f"🔨 Starting mining attempt for block {len(node.blockchain.chain)}...")
+                logger.info(f"Mining parameters: Energy < {node.blockchain.difficulty_energy}, Diversity >= {node.blockchain.min_diversity}, Solutions >= {node.blockchain.min_solutions}")
+                
+                start_time = time.time()
                 block = node.mine_block(data)
-                logger.info(f"✅ Block {block.index} mined by {block.miner_id}")
+                mining_time = time.time() - start_time
+                
+                logger.info(f"✅ Block {block.index} successfully mined by {block.miner_id} in {mining_time:.2f}s")
+                logger.info(f"   Winning Block Details: {{ \"Energy\": {block.energy:.1f}, \"Diversity\": {block.diversity:.3f}, \"Solutions\": {block.num_valid_solutions} }}")
                 block_count += 1
                 # Small delay between mining attempts
                 time.sleep(1)
             except Exception as e:
-                logger.error(f"Mining error: {e}")
+                logger.error(f"❌ Mining failed: {e}")
                 time.sleep(5)
     
     # Start mining in background thread
@@ -334,7 +343,8 @@ def run_cli_node(
     competitive: bool = True,
     num_qpu: int = 0,
     num_sa: int = 1,
-    num_gpu: int = 0
+    num_gpu: int = 0,
+    genesis_config_file: Optional[str] = None
 ):
     """Run a node for CLI usage - starts mining and keeps process alive without interactive menu."""
     
@@ -364,6 +374,7 @@ def run_cli_node(
         gpu_backend=backend,
         gpu_devices=gpu_devices,
         gpu_types=gpu_types,
+        genesis_config_file=genesis_config_file,
     )
 
     # Attach gpu config onto blockchain for downstream use
@@ -399,7 +410,6 @@ def run_cli_node(
 
 def main():
     """Main entry point for P2P quantum blockchain."""
-    import argparse
 
     parser = argparse.ArgumentParser(description='P2P Quantum Blockchain Node')
     parser.add_argument('--host', default='0.0.0.0', help='Host to bind to')
