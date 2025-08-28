@@ -12,12 +12,15 @@ import aiohttp
 import sys
 sys.path.append('..')
 
-from quantum_blockchain import QuantumBlockchain, Block, SimulatedAnnealingStructuredSampler, DWaveSampler
+from quantum_blockchain import QuantumBlockchain, Block
+from CPU import SimulatedAnnealingStructuredSampler
+from dwave.system import DWaveSampler
 try:
-    from quantum_blockchain import GPUSampler
+    from GPU import GPUSampler
 except ImportError:
     GPUSampler = None
 from quantum_blockchain_network import P2PNode, Message
+from aiohttp import web
 
 logger = logging.getLogger(__name__)
 
@@ -432,7 +435,3 @@ class SharedMiningNode:
                 self.blockchain.quantum_proof_of_work,
                 block
             )
-
-
-# Import web for route handlers
-from aiohttp import web

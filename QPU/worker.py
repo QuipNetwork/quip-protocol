@@ -1,0 +1,34 @@
+"""QPU worker process for D-Wave quantum annealing mining."""
+
+from .dwave_sampler import DWaveSamplerWrapper
+from shared.miner import Miner, MiningResult
+
+
+def qpu_mine_block_process(miner_data, block_header: str, result_queue, stop_event):
+    """QPU-specific mining process function.
+    
+    Args:
+        miner_data: Serialized miner data (type, id, config)
+        block_header: Block header to mine
+        result_queue: Queue to put results
+        stop_event: Event to signal stop
+    """
+    miner_type = miner_data['type']
+    miner_id = miner_data['id']
+    miner_config = miner_data.get('config', {})
+    
+    # Create QPU sampler
+    sampler_wrapper = DWaveSamplerWrapper()
+    sampler = sampler_wrapper.sampler
+    
+    miner = Miner(
+        miner_id, 
+        miner_id, 
+        sampler, 
+        difficulty_energy=miner_config['difficulty_energy'],
+        min_diversity=miner_config['min_diversity'],
+        min_solutions=miner_config['min_solutions']
+    )
+    
+    # Call the original Miner.mine_block method
+    miner.mine_block(block_header, result_queue, stop_event)
