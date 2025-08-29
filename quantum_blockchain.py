@@ -348,12 +348,8 @@ class QuantumBlockchain:
 
             print(f"   Difficulty HARDENED to level {old_streak - 1} - Energy: {self.difficulty_energy:.1f}, Diversity: {self.min_diversity:.2f}, Solutions: {self.min_solutions}")
 
-        # Update all miners with new difficulty
-        if self.competitive:
-            for miner in self.miners:
-                miner.difficulty_energy = self.difficulty_energy
-                miner.min_diversity = self.min_diversity
-                miner.min_solutions = self.min_solutions
+        # Note: Difficulty parameters are now managed at blockchain level, not miner level
+        # Miners will access these parameters during mining through block context
 
     def generate_quantum_model(self, block_header: str, nonce: int) -> Tuple[dict, dict]:
         """

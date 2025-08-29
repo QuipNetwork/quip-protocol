@@ -65,19 +65,11 @@ class BlockData:
 class BaseMiner:
     """Base class for all miner types."""
     
-    def __init__(self, miner_id: str, miner_type: str, sampler=None,
-                 difficulty_energy: float = -15500.0,
-                 min_diversity: float = 0.46, 
-                 min_solutions: int = 25):
+    def __init__(self, miner_id: str, miner_type: str, sampler=None):
         self.miner_id = miner_id
         self.miner_type = miner_type
         self.sampler = sampler if sampler else SimulatedAnnealingStructuredSampler()
-        self.difficulty_energy = difficulty_energy
-        self.base_difficulty_energy = difficulty_energy
-        self.min_diversity = min_diversity
-        self.base_min_diversity = min_diversity
-        self.min_solutions = min_solutions
-        self.base_min_solutions = min_solutions
+        # Note: difficulty_energy, min_diversity, min_solutions are now managed at block level
         self.current_block = None
         self.mining = False
         self.mining_task = None
@@ -290,24 +282,9 @@ class BaseMiner:
         time_since_last_block = time.time() - self.last_block_received_time
         
         if time_since_last_block > self.no_block_timeout:
-            # Calculate how many 30-minute periods have passed
-            timeout_periods = int(time_since_last_block / self.no_block_timeout)
-            
-            # Reduce difficulty for each timeout period
-            original_difficulty = self.difficulty_energy
-            self.difficulty_energy = min(
-                -13000,  # Cap at easier difficulty
-                self.difficulty_energy * (1 + self.difficulty_reduction_factor * timeout_periods)
-            )
-            
-            # Also relax diversity and solution requirements
-            self.min_diversity = max(0.15, self.min_diversity * (1 - self.difficulty_reduction_factor * timeout_periods))
-            self.min_solutions = max(5, int(self.min_solutions * (1 - self.difficulty_reduction_factor * timeout_periods)))
-            
-            if original_difficulty != self.difficulty_energy:
-                logger.info(f"{self.miner_id} adjusting difficulty due to {time_since_last_block/60:.1f} minutes without new block:")
-                logger.info(f"  Energy: {original_difficulty:.2f} -> {self.difficulty_energy:.2f}")
-                logger.info(f"  Diversity: {self.min_diversity:.3f}, Solutions: {self.min_solutions}")
+            # Note: Difficulty parameters are now managed at block level, not miner level
+            logger.info(f"{self.miner_id}: Timeout-based difficulty adjustment needed after {time_since_last_block/60:.1f} minutes")
+            logger.info("  Note: Difficulty parameters are now managed at block level")
             
             return True
         return False

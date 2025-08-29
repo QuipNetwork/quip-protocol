@@ -2,9 +2,9 @@
 
 from .sampler import GPUSampler, LocalGPUSampler
 from .modal_sampler import ModalSampler, gpu_app
-from .gpu_metal import MetalMiner
-from .gpu_cuda import CudaMiner
-from .gpu_modal import ModalMiner
+from .metal_miner import MetalMiner
+from .cuda_miner import CudaMiner
+from .modal_miner import ModalMiner
 from .worker import gpu_mine_block_process
 
 # Check if GPU functionality is available

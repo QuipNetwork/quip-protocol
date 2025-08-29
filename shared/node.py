@@ -161,30 +161,11 @@ class Node:
         time_since_last_block = time.time() - self.last_block_received_time
 
         if time_since_last_block > self.no_block_timeout:
-            # Calculate how many 30-minute periods have passed
-            timeout_periods = int(time_since_last_block / self.no_block_timeout)
-
-            adjusted = False
-            for miner in self.miners:
-                # Reduce difficulty for each timeout period
-                original_difficulty = miner.difficulty_energy
-                miner.difficulty_energy = min(
-                    -13000,  # Cap at easier difficulty
-                    miner.difficulty_energy * (1 + self.difficulty_reduction_factor * timeout_periods)
-                )
-
-                # Also relax diversity and solution requirements
-                miner.min_diversity = max(0.15, miner.min_diversity * (1 - self.difficulty_reduction_factor * timeout_periods))
-                miner.min_solutions = max(5, int(miner.min_solutions * (1 - self.difficulty_reduction_factor * timeout_periods)))
-
-                if original_difficulty != miner.difficulty_energy:
-                    if not adjusted:
-                        print(f"Node {self.node_id} adjusting difficulty due to {time_since_last_block/60:.1f} minutes without new block:")
-                        adjusted = True
-                    print(f"  {miner.miner_id}: Energy {original_difficulty:.2f} -> {miner.difficulty_energy:.2f}")
-                    print(f"    Diversity: {miner.min_diversity:.3f}, Solutions: {miner.min_solutions}")
-
-            return adjusted
+            # Note: Difficulty parameters are now managed at block level, not miner level
+            # This method would need to be updated to adjust block-level difficulty parameters
+            print(f"Node {self.node_id}: Timeout-based difficulty adjustment needed after {time_since_last_block/60:.1f} minutes")
+            print("  Note: Difficulty parameters are now managed at block level")
+            return True
         return False
 
     def adapt_parameters(self, network_stats: dict):
