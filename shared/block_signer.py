@@ -1,8 +1,8 @@
 """Block signing utilities for quantum blockchain."""
 
 import os
-import hashlib
-from typing import Tuple, List
+from blake3 import blake3
+from typing import Tuple, List, Optional
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.backends import default_backend
@@ -12,13 +12,34 @@ import hashsigs
 class BlockSigner:
     """Manages ECDSA and WOTS+ cryptographic operations for block signing."""
 
-    def __init__(self):
-        """Initialize cryptographic keys."""
-        # Generate ECDSA key pair
-        self.ecdsa_private_key = ec.generate_private_key(
-            ec.SECP256K1(),
-            default_backend()
-        )
+    def __init__(self, seed: Optional[bytes] = None):
+        """Initialize cryptographic keys.
+        
+        Args:
+            seed: Optional seed for deterministic key generation (random if None)
+        """
+        # Use provided seed or generate random one
+        if seed is None:
+            seed = os.urandom(32)
+        
+        # Generate ECDSA key pair deterministically from seed if provided
+        if len(seed) == 32:
+            # Use first half of seed for ECDSA key generation
+            ecdsa_seed = int.from_bytes(seed[:16], byteorder='big')
+            # Use a deterministic approach for ECDSA key generation
+            private_value = ecdsa_seed % ec.SECP256K1().key_size
+            self.ecdsa_private_key = ec.derive_private_key(
+                private_value,
+                ec.SECP256K1(),
+                default_backend()
+            )
+        else:
+            # Fallback to random generation
+            self.ecdsa_private_key = ec.generate_private_key(
+                ec.SECP256K1(),
+                default_backend()
+            )
+        
         self.ecdsa_public_key = self.ecdsa_private_key.public_key()
 
         # Get ECDSA public key in hex format
@@ -29,10 +50,11 @@ class BlockSigner:
         self.ecdsa_public_key_hex = self.ecdsa_public_key_bytes.hex()
 
         # Generate initial WOTS+ key pair using hashsigs with keccak
-        seed = os.urandom(32)
-        keccak_hash = lambda data: hashlib.sha3_256(data).digest()
+        # WOTS+ requires a 32-byte private seed; if seed provided, reuse it; otherwise generate 32 bytes.
+        wots_seed = seed if len(seed) == 32 else os.urandom(32)
+        keccak_hash = lambda data: blake3(data).digest()
         self.wots_plus = hashsigs.WOTSPlus(keccak_hash)
-        self.wots_plus_public_key, self.wots_plus_private_key = self.wots_plus.generate_key_pair(seed)
+        self.wots_plus_public_key, self.wots_plus_private_key = self.wots_plus.generate_key_pair(wots_seed)
         self.wots_plus_public_key_hex = self.wots_plus_public_key.to_bytes().hex()
         self.wots_plus_used = False
     
@@ -51,7 +73,7 @@ class BlockSigner:
         self.wots_plus_used = True
 
         # Hash the message with keccak256 and sign with WOTS+
-        message_hash = hashlib.sha3_256(block_data.encode()).digest()
+        message_hash = blake3(block_data.encode()).digest()
         wots_signature = self.wots_plus.sign(self.wots_plus_private_key, message_hash)
 
         # Sign with ECDSA
@@ -72,7 +94,7 @@ class BlockSigner:
     def generate_new_wots_key(self):
         """Generate a new WOTS+ key pair after using the current one."""
         seed = os.urandom(32)
-        keccak_hash = lambda data: hashlib.sha3_256(data).digest()
+        keccak_hash = lambda data: blake3(data).digest()
         self.wots_plus = hashsigs.WOTSPlus(keccak_hash)
         self.wots_plus_public_key, self.wots_plus_private_key = self.wots_plus.generate_key_pair(seed)
         self.wots_plus_public_key_hex = self.wots_plus_public_key.to_bytes().hex()
@@ -123,7 +145,7 @@ class BlockSigner:
             signature_bytes = bytes.fromhex(signature_hex)
 
             # Create WOTSPlus instance for verification with keccak
-            keccak_hash = lambda data: hashlib.sha3_256(data).digest()
+            keccak_hash = lambda data: blake3(data).digest()
             wots_plus = hashsigs.WOTSPlus(keccak_hash)
 
             # Reconstruct public key from bytes
@@ -132,7 +154,7 @@ class BlockSigner:
                 return False
 
             # Hash the message with keccak (same as in sign method)
-            message_hash = hashlib.sha3_256(message).digest()
+            message_hash = blake3(message).digest()
             return wots_plus.verify(public_key, message_hash, signature_bytes)
         except Exception:
             return False

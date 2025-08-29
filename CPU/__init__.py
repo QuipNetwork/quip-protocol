@@ -2,5 +2,6 @@
 
 from .sa_sampler import SimulatedAnnealingStructuredSampler
 from .worker import cpu_mine_block_process
+from .sa_miner import SimulatedAnnealingMiner
 
-__all__ = ['SimulatedAnnealingStructuredSampler', 'cpu_mine_block_process']
+__all__ = ['SimulatedAnnealingStructuredSampler', 'cpu_mine_block_process', 'SimulatedAnnealingMiner']

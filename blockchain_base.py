@@ -1,7 +1,7 @@
 """Base classes and utilities for quantum blockchain miners."""
 
 import asyncio
-import hashlib
+from blake3 import blake3
 import time
 import logging
 import random
@@ -123,7 +123,7 @@ class BaseMiner:
     def generate_quantum_model(self, block_header: str, nonce: int) -> Tuple[dict, dict]:
         """Generate Ising model parameters based on block header and nonce."""
         seed_string = f"{block_header}{nonce}"
-        seed = int(hashlib.sha256(seed_string.encode()).hexdigest()[:8], 16)
+        seed = int(blake3(seed_string.encode()).hexdigest()[:8], 16)
         np.random.seed(seed)
         
         # Generate h and J for a small problem (suitable for all miners)
@@ -329,7 +329,7 @@ class BaseMiner:
         block_string = f"{block_data['previous_hash']}{block_data['index']}{block_data['timestamp']}{block_data['data']}"
         block_string += f"{block_data.get('signature', '')}{block_data.get('reward_address', '')}"
         block_string += f"{block_data.get('miner_ecdsa_public_key', '')}{block_data.get('miner_wots_plus_public_key', '')}"
-        return hashlib.sha256(block_string.encode()).hexdigest()
+        return blake3(block_string.encode()).hexdigest()
     
     async def mine_block_async(self, block_data: dict) -> Optional[dict]:
         """Async mining implementation for P2P network compatibility."""

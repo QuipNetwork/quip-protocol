@@ -1,19 +1,14 @@
 """Simulated Annealing sampler for CPU-based quantum blockchain mining."""
 
 from dwave.samplers import SimulatedAnnealingSampler
-from dwave.system import DWaveSampler
 from dwave.system.testing import MockDWaveSampler
 
 
 class SimulatedAnnealingStructuredSampler(MockDWaveSampler):
     """Replace the MockSampler by an MCMC sampler with identical structure."""
     
-    def __init__(self, qpu=None):
-        if qpu is None:
-            try:
-                qpu = DWaveSampler()
-            except Exception:
-                qpu = MockDWaveSampler()
+    def __init__(self):
+        qpu = MockDWaveSampler()
 
         substitute_sampler = SimulatedAnnealingSampler()
         super().__init__(

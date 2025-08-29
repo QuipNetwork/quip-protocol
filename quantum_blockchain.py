@@ -1,5 +1,5 @@
 import argparse
-import hashlib
+from blake3 import blake3
 import json
 import os
 import multiprocessing
@@ -369,7 +369,7 @@ class QuantumBlockchain:
         """
         # Create seed from block header and nonce
         seed_string = f"{block_header}{nonce}"
-        seed = int(hashlib.sha256(seed_string.encode()).hexdigest()[:8], 16)
+        seed = int(blake3(seed_string.encode()).hexdigest()[:8], 16)
         np.random.seed(seed)
 
         # QPU sampler

@@ -1,6 +1,6 @@
 """Block data structures and parsing utilities for quantum blockchain."""
 
-import hashlib
+from blake3 import blake3
 import json
 import time
 from dataclasses import dataclass
@@ -144,7 +144,7 @@ class Block:
         """Compute the hash of the block with new format."""
         # New format: f"{previous_hash}{index}{timestamp}{data}{signature}{reward_address}{miner_ecdsa_public_key}{miner_wots_plus_public_key}"
         block_string = f"{self.previous_hash}{self.index}{self.timestamp}{self.data}{self.signature or ''}{self.reward_address or ''}{self.miner_ecdsa_public_key or ''}{self.miner_wots_plus_public_key or ''}"
-        return hashlib.sha256(block_string.encode()).hexdigest()
+        return blake3(block_string.encode()).hexdigest()
 
     def __post_init__(self):
         """Compute hash after initialization."""

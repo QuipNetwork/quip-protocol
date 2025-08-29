@@ -31,15 +31,15 @@ def gpu_mine_block_process(miner_data, block_header: str, result_queue, stop_eve
         from .sampler import LocalGPUSampler
         sampler = LocalGPUSampler(miner_type.split(':')[1])
     elif miner_type.startswith('GPU-MODAL'):
-        # Modal GPU miner - import locally to avoid circular import  
-        from .modal_sampler import GPUSampler
-        sampler = GPUSampler(miner_type.split(':')[1])
+        # Modal GPU miner - import locally to avoid circular import
+        from .modal_sampler import ModalSampler
+        sampler = ModalSampler(miner_type.split(':')[1])
     else:
         raise ValueError(f"Unknown GPU miner type: {miner_type}")
     
     miner = Miner(
         miner_id, 
-        miner_id, 
+        miner_type, 
         sampler, 
         difficulty_energy=miner_config['difficulty_energy'],
         min_diversity=miner_config['min_diversity'],

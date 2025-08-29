@@ -1,6 +1,6 @@
 """Miner class for quantum blockchain mining."""
 
-import hashlib
+from blake3 import blake3
 import multiprocessing
 import random
 import sys
@@ -9,8 +9,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-
-from shared.block_signer import BlockSigner
 
 
 @dataclass
@@ -43,20 +41,8 @@ class Miner:
         self.mining = False
         self.blocks_won = 0
         self.total_rewards = 0
-        
-        # Initialize crypto manager
-        self.crypto = BlockSigner()
-        self.ecdsa_public_key_hex = self.crypto.ecdsa_public_key_hex
-        self.wots_plus_public_key_hex = self.crypto.wots_plus_public_key_hex
 
-        # Keep backward compatibility references
-        self.ecdsa_private_key = self.crypto.ecdsa_private_key
-        self.ecdsa_public_key = self.crypto.ecdsa_public_key
-        self.wots_plus = self.crypto.wots_plus
-
-        print(f"{miner_id} initialized with:")
-        print(f"  ECDSA Public Key: {self.ecdsa_public_key_hex[:16]}...")
-        print(f"  WOTS+ Public Key: {self.wots_plus_public_key_hex[:16]}...")
+        print(f"{miner_id} initialized ({miner_type})")
         
         # Initialize timing statistics
         self.timing_stats = {
@@ -82,11 +68,6 @@ class Miner:
         
         # Track participation in current round
         self.current_round_attempted = False
-        
-        # Track last block received time for difficulty adjustment
-        self.last_block_received_time = time.time()
-        self.no_block_timeout = 1800  # 30 minutes in seconds
-        self.difficulty_reduction_factor = 0.1  # Reduce difficulty by 10% per timeout
         
         # Adaptive parameters for performance tuning
         # Initialize num_sweeps based on miner ID for SA miners
@@ -153,7 +134,7 @@ class Miner:
                 dist = self.calculate_hamming_distance(solutions[i], solutions[j])
                 distances.append(dist / n)
 
-        return np.mean(distances) if distances else 0.0
+        return float(np.mean(distances)) if distances else 0.0
     
     def filter_diverse_solutions(self, solutions: List[List[int]], target_count: int) -> List[List[int]]:
         """Filter solutions to maintain maximum diversity while reducing to target count.
@@ -347,74 +328,17 @@ class Miner:
                 # For SA, reduce sweeps for faster mining
                 self.adaptive_params['num_sweeps'] = int(self.adaptive_params['num_sweeps'] * 0.95)
                 print(f"{self.miner_id} reducing sweeps to {self.adaptive_params['num_sweeps']}")
-    
-    def generate_new_wots_key(self):
-        """Generate a new WOTS+ key pair after using the current one."""
-        self.crypto.generate_new_wots_key()
-
-        # Update local references
-        self.wots_plus = self.crypto.wots_plus
-        self.wots_plus_public_key_hex = self.crypto.wots_plus_public_key_hex
-        print(f"{self.miner_id} generated new WOTS+ key: {self.wots_plus_public_key_hex[:16]}...")
-    
-    def sign_block_data(self, block_data: str) -> Tuple[str, str]:
-        """
-        Sign block data with WOTS+ and then sign that signature with ECDSA.
-        
-        Returns:
-            Tuple of (combined_signature_hex, next_wots_public_key_hex)
-        """
-        # Use crypto manager to sign
-        signature_hex, next_wots_key_hex = self.crypto.sign_block_data(block_data)
-
-        # Update local references
-        self.wots_plus_public_key_hex = next_wots_key_hex
-        self.wots_plus = self.crypto.wots_plus
-        
-        return signature_hex, next_wots_key_hex
 
     def generate_quantum_model(self, block_header: str, nonce: int) -> Tuple[dict, dict]:
         """Generate Ising model parameters based on block header and nonce."""
         seed_string = f"{block_header}{nonce}"
-        seed = int(hashlib.sha256(seed_string.encode()).hexdigest()[:8], 16)
+        seed = int(blake3(seed_string.encode()).hexdigest()[:8], 16)
         np.random.seed(seed)
 
-        # QPU sampler
         h = {i: 0 for i in self.sampler.nodelist}
         J = {edge: 2*np.random.randint(2)-1 for edge in self.sampler.edgelist}
 
         return h, J
-
-    def check_and_adjust_difficulty_for_timeout(self):
-        """Check if no block has been received for 30 minutes and adjust difficulty."""
-        time_since_last_block = time.time() - self.last_block_received_time
-        
-        if time_since_last_block > self.no_block_timeout:
-            # Calculate how many 30-minute periods have passed
-            timeout_periods = int(time_since_last_block / self.no_block_timeout)
-            
-            # Reduce difficulty for each timeout period
-            original_difficulty = self.difficulty_energy
-            self.difficulty_energy = min(
-                -13000,  # Cap at easier difficulty
-                self.difficulty_energy * (1 + self.difficulty_reduction_factor * timeout_periods)
-            )
-            
-            # Also relax diversity and solution requirements
-            self.min_diversity = max(0.15, self.min_diversity * (1 - self.difficulty_reduction_factor * timeout_periods))
-            self.min_solutions = max(5, int(self.min_solutions * (1 - self.difficulty_reduction_factor * timeout_periods)))
-            
-            if original_difficulty != self.difficulty_energy:
-                print(f"{self.miner_id} adjusting difficulty due to {time_since_last_block/60:.1f} minutes without new block:")
-                print(f"  Energy: {original_difficulty:.2f} -> {self.difficulty_energy:.2f}")
-                print(f"  Diversity: {self.min_diversity:.3f}, Solutions: {self.min_solutions}")
-            
-            return True
-        return False
-    
-    def reset_block_received_time(self):
-        """Reset the last block received time when a new block is received."""
-        self.last_block_received_time = time.time()
 
     def mine_block(self, block_header: str, result_queue: multiprocessing.Queue, stop_event: multiprocessing.Event):
         """Mine a block in a separate process.
@@ -428,8 +352,6 @@ class Miner:
         progress = 0  # Progress counter for logging
         start_time = time.time()
         
-        # Check for timeout-based difficulty adjustment
-        self.check_and_adjust_difficulty_for_timeout()
         
         # Track current stage timing
         self.current_stage = None

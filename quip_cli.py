@@ -10,6 +10,8 @@ import os
 import signal
 import subprocess
 import sys
+import json
+import time
 from typing import Any, Dict, Optional
 
 import click
@@ -21,6 +23,7 @@ except ModuleNotFoundError:  # Python 3.10
     import tomli as _toml  # type: ignore
 
 from quantum_blockchain_p2p import run_cli_node
+from shared.node import Node
 
 
 def _load_config(path: Optional[str]) -> Dict[str, Any]:
@@ -96,9 +99,9 @@ def _run_p2p_node(
         for k, v in env_overrides.items():
             if v is not None:
                 os.environ[k] = str(v)
-    
+
     # Import and call the CLI node function
-    
+
     # Configure miners based on kind
     if kind == "cpu":
         num_qpu, num_sa, num_gpu = 0, 1, 0
@@ -110,7 +113,7 @@ def _run_p2p_node(
         raise ValueError(f"Unknown kind: {kind}")
 
     click.echo(f"Starting {kind} node at {host}:{port}")
-    
+
     try:
         run_cli_node(
             host=host,
@@ -246,15 +249,23 @@ def qpu(
 # quip-network-simulator
 # -----------------------------
 
-@click.command(name="quip-network-simulator")
+@click.group(name="quip-network-simulator", invoke_without_command=True)
 @click.option("--scenario", type=click.Choice(["mixed", "cpu", "gpu"], case_sensitive=False), default="mixed", show_default=True, help="Network scenario to launch")
 @click.option("--num-cpu", type=int, default=None, help="Override: number of CPU nodes")
 @click.option("--num-gpu", type=int, default=None, help="Override: number of GPU nodes")
 @click.option("--num-qpu", type=int, default=None, help="Override: number of QPU nodes")
 @click.option("--base-port", type=int, default=8080, show_default=True, help="Starting port for first node")
 @click.option("--print-only", is_flag=True, help="Only print commands, do not execute")
-def quip_network_simulator(scenario: str, num_cpu: Optional[int], num_gpu: Optional[int], num_qpu: Optional[int], base_port: int, print_only: bool):
-    """Launch a local multi-node network using quip-network-node (separate processes)."""
+@click.pass_context
+def quip_network_simulator(ctx: click.Context, scenario: str, num_cpu: Optional[int], num_gpu: Optional[int], num_qpu: Optional[int], base_port: int, print_only: bool):
+    """Launch a local multi-node network using quip-network-node (separate processes).
+
+    Subcommands:
+      smoketest [cpu|gpu-local|gpu-metal|gpu-modal|qpu]  Run a single-node smoke test
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+
     scenario = scenario.lower()
     # Defaults modeled after launch_network.py
     if scenario == "mixed":
@@ -333,9 +344,71 @@ def quip_network_simulator(scenario: str, num_cpu: Optional[int], num_gpu: Optio
                     pass
 
 
+@quip_network_simulator.command(name="smoketest")
+@click.argument("target", type=click.Choice(["cpu", "gpu-local", "gpu-metal", "gpu-modal", "qpu"], case_sensitive=False))
+@click.option("--print-only", is_flag=True, help="Only print command, do not execute")
+def quip_network_smoketest(target: str, print_only: bool):
+    """Run a single-node smoke test.
+
+    Targets:
+      cpu, gpu-local, gpu-metal, gpu-modal, qpu
+    """
+    target = target.lower()
+    if target == "cpu":
+        cmd = ["python", "-m", "tests.smoke_node_cpu_only"]
+    elif target == "gpu-local":
+        cmd = ["python", "-m", "tests.smoke_node_gpu_local"]
+    elif target == "gpu-metal":
+        cmd = ["python", "-m", "tests.smoke_node_gpu_metal"]
+    elif target == "gpu-modal":
+        cmd = ["python", "-m", "tests.smoke_node_gpu_modal"]
+    elif target == "qpu":
+        cmd = ["python", "-m", "tests.smoke_node_qpu"]
+    else:
+        raise click.ClickException(f"Unknown smoketest: {target}")
+    click.echo("Running: " + " ".join(cmd))
+    if print_only:
+        return
+    try:
+        p = subprocess.Popen(cmd)
+        p.wait()
+    except KeyboardInterrupt:
+        pass
+
+
 # Entry points for console_scripts
 
 def network_node_main():
+    quip_network_node(standalone_mode=False)
+
+# -----------------------------
+# quip-node-stats (experimental)
+# -----------------------------
+
+@click.command()
+@click.option("--config", type=click.Path(exists=True, dir_okay=False), help="Path to TOML config file")
+@click.option("--interval", type=float, default=5.0, help="Seconds between stats prints")
+@click.pass_context
+def quip_node_stats(ctx: click.Context, config: Optional[str], interval: float):
+    """Run a single in-process node and periodically print stats to stdout.
+
+    This is an experimental helper that constructs Node directly from TOML config
+    and prints Node.get_stats() every --interval seconds. Ctrl-C to stop.
+    """
+    cfg = _load_config(config)
+    miners_config = cfg or {}
+    node = Node(node_id="stats-node", miners_config=miners_config)
+    click.echo("Starting stats loop (Ctrl-C to stop)...")
+    try:
+        while True:
+            stats = node.get_stats()
+            click.echo(json.dumps(stats, indent=2))
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        click.echo("Stopping...")
+    finally:
+        node.close()
+
     quip_network_node(standalone_mode=False)
 
 

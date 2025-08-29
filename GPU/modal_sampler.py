@@ -108,7 +108,7 @@ if GPU_AVAILABLE:
         return gpu_sample_t4(h_dict, J_dict, num_reads, num_sweeps)
 
 
-class GPUSampler(MockDWaveSampler):
+class ModalSampler(MockDWaveSampler):
     """GPU-accelerated sampler using Modal Labs."""
 
     def __init__(self, gpu_type: str = "t4"):

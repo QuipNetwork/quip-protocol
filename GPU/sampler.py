@@ -15,7 +15,7 @@ except ImportError:
     torch = None
 
 
-class LocalGPUSampler(MockDWaveSampler):
+class GPUSampler(MockDWaveSampler):
     """Local GPU sampler using PyTorch (CUDA or MPS) in a persistent worker process."""
 
     def __init__(self, device: str):
@@ -24,7 +24,7 @@ class LocalGPUSampler(MockDWaveSampler):
         self._ctx = multiprocessing.get_context("spawn")
         self._req_q: multiprocessing.Queue = self._ctx.Queue()
         self._resp_q: multiprocessing.Queue = self._ctx.Queue()
-        
+
         self._proc = self._ctx.Process(target=gpu_worker_main, args=(self._req_q, self._resp_q, self._device))
         self._proc.daemon = True
         self._proc.start()
@@ -87,3 +87,8 @@ class LocalGPUSampler(MockDWaveSampler):
                     'energy': np.array(energies)
                 })()
         return SampleSet(samples, energies)
+
+
+# Backward compatibility alias
+LocalGPUSampler = GPUSampler
+

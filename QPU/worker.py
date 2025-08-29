@@ -23,7 +23,7 @@ def qpu_mine_block_process(miner_data, block_header: str, result_queue, stop_eve
     
     miner = Miner(
         miner_id, 
-        miner_id, 
+        miner_type, 
         sampler, 
         difficulty_energy=miner_config['difficulty_energy'],
         min_diversity=miner_config['min_diversity'],
