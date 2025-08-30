@@ -27,7 +27,7 @@ class MiningResult:
     miner_id: str
     miner_type: str
     nonce: int
-    timestamp: float
+    timestamp: int
     solutions: List[List[int]]
     energy: float
     diversity: float
