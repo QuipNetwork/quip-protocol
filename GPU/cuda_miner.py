@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import multiprocessing.synchronize
 import random
 import sys
 import time
@@ -15,20 +16,22 @@ from GPU.sampler import LocalGPUSampler as GPUSampler  # temporary alias until r
 
 class CudaMiner(BaseMiner):
     def __init__(self, miner_id: str, device: str = "0", **cfg):
-        super().__init__(miner_id)
+        sampler = GPUSampler(str(device))
+        super().__init__(miner_id, sampler)
         self.miner_type = f"GPU-LOCAL:{device}"
-        self.sampler = GPUSampler(str(device))
         
     def mine_block(
         self,
-        block_header: str,
+        block,
+        requirements,
         result_queue: multiprocessing.Queue,
-        stop_event: multiprocessing.Event,
+        stop_event: multiprocessing.synchronize.Event,
     ) -> Optional[MiningResult]:
         """Mine a block using CUDA GPU acceleration.
         
         Args:
-            block_header: Format is f"{previous_hash}{index}{timestamp}{data}"
+            block: Block object containing header, data, and other block information
+            requirements: NextBlockRequirements object with difficulty settings
             result_queue: Multiprocessing queue for results
             stop_event: Multiprocessing event to signal stop
         """
@@ -40,6 +43,11 @@ class CudaMiner(BaseMiner):
         self.current_round_attempted = True
         print(f"{self.miner_id} started...")
 
+        # Extract requirements from NextBlockRequirements object
+        difficulty_energy = requirements.difficulty_energy
+        min_diversity = requirements.min_diversity
+        min_solutions = requirements.min_solutions
+
         while self.mining and not stop_event.is_set():
             # Check if we should stop before generating model
             if stop_event.is_set():
@@ -49,8 +57,11 @@ class CudaMiner(BaseMiner):
             # Generate random nonce for each attempt
             nonce = random.randint(0, sys.maxsize)
             
-            # Generate quantum model
-            h, J = self.generate_quantum_model(block_header, nonce)
+            # Update block with current nonce for deterministic model generation
+            block.quantum_proof.nonce = nonce
+            
+            # Generate quantum model using deterministic block-based seeding
+            h, J = self.generate_ising_model(block)
 
             # Check again before sampling
             if stop_event.is_set():
@@ -107,13 +118,13 @@ class CudaMiner(BaseMiner):
             self.current_stage_start = postprocess_start
             
             # Find all solutions meeting energy threshold
-            valid_indices = np.where(sampleset.record.energy < self.difficulty_energy)[0]
+            valid_indices = np.where(sampleset.record.energy < difficulty_energy)[0]
             
             # Update sample counts
             self.timing_stats['total_samples'] += len(sampleset.record.energy)
             self.timing_stats['blocks_attempted'] += 1
 
-            if len(valid_indices) >= self.min_solutions:
+            if len(valid_indices) >= min_solutions:
                 # Get unique solutions
                 valid_solutions = []
                 seen = set()
@@ -129,7 +140,7 @@ class CudaMiner(BaseMiner):
                 min_energy = float(np.min(sampleset.record.energy))
 
                 # Filter excess solutions to maintain diversity
-                filtered_solutions = self.filter_diverse_solutions(valid_solutions, self.min_solutions)
+                filtered_solutions = self.filter_diverse_solutions(valid_solutions, min_solutions)
 
                 # Recalculate diversity after filtering
                 final_diversity = self.calculate_diversity(filtered_solutions)
@@ -139,7 +150,7 @@ class CudaMiner(BaseMiner):
                 self.timing_stats['postprocessing'].append((time.time() - postprocess_start) * 1e6)
                 
                 # Check if diversity requirement is met
-                if final_diversity >= self.min_diversity and len(valid_solutions) >= self.min_solutions:
+                if final_diversity >= min_diversity and len(valid_solutions) >= min_solutions:
                     mining_time = time.time() - start_time
                     min_energy = float(np.min(sampleset.record.energy[valid_indices]))
 

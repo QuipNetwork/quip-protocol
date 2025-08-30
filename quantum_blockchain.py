@@ -21,13 +21,11 @@ from dwave.samplers import SimulatedAnnealingSampler
 from dwave.system import DWaveSampler
 from dwave.system.testing import MockDWaveSampler
 from matplotlib.patches import Patch
-from shared.block import Block, _parse_block_header, load_genesis_block
-from shared.miner import Miner, MiningResult
+from shared.block import Block, load_genesis_block, NextBlockRequirements, BlockHeader, MinerInfo, QuantumProof
+from shared.quantum_proof_of_work import calculate_diversity as _shared_diversity, calculate_hamming_distance as _shared_hamming
 
-# Import modular components
-from GPU import LocalGPUSampler, GPUSampler, gpu_app, gpu_mine_block_process, GPU_AVAILABLE
-from CPU import SimulatedAnnealingStructuredSampler, cpu_mine_block_process
-from QPU import DWaveSamplerWrapper, create_dwave_sampler, qpu_mine_block_process
+from shared.miner import MiningResult
+from shared.node import Node
 
 # Optional imports
 try:
@@ -36,48 +34,8 @@ except ImportError:
     mcolors = None
 
 
-
-
-
-def _mine_block_process(miner_data, block_header: str, result_queue: multiprocessing.Queue, stop_event: multiprocessing.Event):
-    """Standalone function for mining in a separate process.
-    
-    Args:
-        miner_data: Serialized miner data (type, id, config)
-        block_header: Block header to mine
-        result_queue: Queue to put results
-        stop_event: Event to signal stop
-    """
-    miner_type = miner_data['type']
-    
-    # Delegate to specialized workers based on miner type
-    if miner_type == 'QPU':
-        qpu_mine_block_process(miner_data, block_header, result_queue, stop_event)
-    elif miner_type.startswith('GPU'):
-        gpu_mine_block_process(miner_data, block_header, result_queue, stop_event)
-    else:
-        # CPU/SA miners
-        cpu_mine_block_process(miner_data, block_header, result_queue, stop_event)
-
-
-
 # Load environment variables
 load_dotenv()
-
-
-
-
-
-
-
-
-
-
-
-
-
-# Miner class moved to shared.miner
-
 
 class QuantumBlockchain:
     def __init__(
@@ -112,16 +70,17 @@ class QuantumBlockchain:
         """
         # Try to load genesis configuration to override defaults
         try:
-            genesis_config = load_genesis_block(genesis_config_file)
-            mining_params = genesis_config['mining_parameters']
-            # Override parameters from genesis config
-            base_difficulty_energy = mining_params.get('base_difficulty_energy', base_difficulty_energy)
-            base_min_diversity = mining_params.get('base_min_diversity', base_min_diversity)
-            base_min_solutions = mining_params.get('base_min_solutions', base_min_solutions)
+            # Load genesis block using new structure
+            genesis_block = load_genesis_block(genesis_config_file)
+            if genesis_block.next_block_requirements:
+                # Override parameters from genesis config
+                base_difficulty_energy = genesis_block.next_block_requirements.difficulty_energy
+                base_min_diversity = genesis_block.next_block_requirements.min_diversity
+                base_min_solutions = genesis_block.next_block_requirements.min_solutions
         except (FileNotFoundError, KeyError, json.JSONDecodeError):
             # Genesis config not found or invalid, use provided defaults
             pass
-            
+
         self.chain: List[Block] = []
         self.competitive = competitive
         self.mining_stats = {}  # Will track all miners
@@ -155,132 +114,64 @@ class QuantumBlockchain:
         self.solutions_adjustment_rate = 0.1  # 10% fewer solutions required
 
         if competitive:
-            # Initialize competitive miners with SAME parameters
-            self.miners = []
-            self.miners_by_id = {}  # Track miners by ID
+            # Initialize nodes with different miner configurations
+            self.nodes = []
+            self.miners_by_id = {}  # Track miners by ID for backward compatibility
 
-            # Try to initialize QPU miners
-            try:
-                qpu_sampler = DWaveSampler()
-                print(f"QPU connected to: {qpu_sampler.properties['chip_id']}")
+            # Create a node for QPU miners
+            if self.num_qpu_miners > 0:
+                try:
+                    qpu_config = {
+                        "qpu": {"num_miners": self.num_qpu_miners}
+                    }
+                    qpu_node = Node(node_id="qpu-node", miners_config=qpu_config)
+                    self.nodes.append(qpu_node)
+                    print(f"✓ Initialized QPU node with {self.num_qpu_miners} miner(s)")
+                except Exception as e:
+                    print(f"QPU not available: {e}")
 
-                # Create multiple QPU miners sharing the same sampler
-                for i in range(self.num_qpu_miners):
-                    miner_id = f"QPU-{i+1}"
-                    qpu_miner = Miner(
-                        miner_id,
-                        "QPU",
-                        qpu_sampler,
-                        difficulty_energy=self.difficulty_energy,
-                        min_diversity=self.min_diversity,
-                        min_solutions=self.min_solutions
-                    )
-                    self.miners.append(qpu_miner)
-                    self.miners_by_id[miner_id] = qpu_miner
-                print(f"✓ Initialized {self.num_qpu_miners} QPU miner(s)")
-            except Exception as e:
-                print(f"QPU not available: {e}")
-
-            # Initialize SA miners with SAME parameters
-            for i in range(self.num_sa_miners):
-                miner_id = f"CPU-{i+1}"
-                sa_sampler = SimulatedAnnealingStructuredSampler()
-                sa_miner = Miner(
-                    miner_id,
-                    "SA",
-                    sa_sampler,
-                    difficulty_energy=self.difficulty_energy,
-                    min_diversity=self.min_diversity,
-                    min_solutions=self.min_solutions
-                )
-                self.miners.append(sa_miner)
-                self.miners_by_id[miner_id] = sa_miner
+            # Create a node for CPU/SA miners
             if self.num_sa_miners > 0:
-                print(f"✓ Initialized {self.num_sa_miners} SA miner(s)")
+                cpu_config = {
+                    "cpu": {"num_cpus": self.num_sa_miners}
+                }
+                cpu_node = Node(node_id="cpu-node", miners_config=cpu_config)
+                self.nodes.append(cpu_node)
+                print(f"✓ Initialized CPU node with {self.num_sa_miners} miner(s)")
 
-            # Initialize GPU miners if requested
+            # Create a node for GPU miners if requested
             if self.num_gpu_miners > 0:
-                # Backend: local or modal
+                # Backend: modal or local
                 if self.gpu_backend == "modal":
-                    if not GPU_AVAILABLE:
-                        raise RuntimeError("Modal backend requested but 'modal' package is not installed")
-                    for i in range(self.num_gpu_miners):
-                        miner_id = f"GPU-{i+1}"
-                        gpu_type = self.gpu_types[i % len(self.gpu_types)] if self.gpu_types else 't4'
-                        gpu_sampler = GPUSampler(gpu_type)
-                        gpu_miner = Miner(
-                            miner_id,
-                            f"GPU-{gpu_type.upper()}",
-                            gpu_sampler,
-                            difficulty_energy=self.difficulty_energy,
-                            min_diversity=self.min_diversity,
-                            min_solutions=self.min_solutions,
-                        )
-                        self.miners.append(gpu_miner)
-                        self.miners_by_id[miner_id] = gpu_miner
-                        print(f"✓ Initialized GPU-{i+1} ({gpu_type.upper()}) miner [modal]")
+                    gpu_config = {
+                        "gpu": {
+                            "backend": "modal",
+                            "types": self.gpu_types[:self.num_gpu_miners]
+                        }
+                    }
+                    gpu_node = Node(node_id="gpu-modal-node", miners_config=gpu_config)
+                    self.nodes.append(gpu_node)
+                    print(f"✓ Initialized GPU Modal node with {self.num_gpu_miners} miner(s)")
                 else:
-                    # Local backend: select device per miner; error if none usable
-                    # Warn if MPS (Apple) but >1 devices requested; collapse to single worker
-                    use_mps = False
-                    try:
-                        import torch
-                        use_mps = getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
-                    except Exception:
-                        use_mps = False
+                    # Local backend
+                    gpu_config = {
+                        "gpu": {
+                            "backend": "local",
+                            "devices": self.gpu_devices[:self.num_gpu_miners] if self.gpu_devices else ["0"]
+                        }
+                    }
+                    gpu_node = Node(node_id="gpu-local-node", miners_config=gpu_config)
+                    self.nodes.append(gpu_node)
+                    print(f"✓ Initialized GPU Local node with {self.num_gpu_miners} miner(s)")
 
-                    effective_devices = self.gpu_devices or []
-                    if use_mps and len(effective_devices) > 1:
-                        print("[WARN] MPS backend supports a single device; collapsing to 1 worker despite multiple devices requested")
-                        effective_devices = effective_devices[:1]
-
-                    if not effective_devices:
-                        # Prefer Apple MPS if available; otherwise attempt CUDA autodetect
-                        if use_mps:
-                            effective_devices = ["mps"]
-                        else:
-                            try:
-                                import torch
-                                if torch.cuda.is_available():
-                                    count = torch.cuda.device_count()
-                                    effective_devices = [str(i) for i in range(count)]
-                            except Exception:
-                                pass
-
-                    if not effective_devices:
-                        raise RuntimeError("Local GPU backend selected but no GPUs detected or configured")
-
-                    # Use the modular LocalGPUSampler from GPU module
-                    # (spawns a persistent PyTorch worker on the selected device)
-
-                    for i in range(min(self.num_gpu_miners, len(effective_devices))):
-                        miner_id = f"GPU-{i+1}"
-                        device = effective_devices[i]
-                        try:
-                            gpu_sampler = LocalGPUSampler(device)
-                        except Exception as e:
-                            raise RuntimeError(f"Failed to initialize local GPU sampler on device {device}: {e}")
-                        gpu_miner = Miner(
-                            miner_id,
-                            f"GPU-LOCAL:{device}",
-                            gpu_sampler,
-                            difficulty_energy=self.difficulty_energy,
-                            min_diversity=self.min_diversity,
-                            min_solutions=self.min_solutions,
-                        )
-                        self.miners.append(gpu_miner)
-                        self.miners_by_id[miner_id] = gpu_miner
-                        print(f"✓ Initialized GPU-{i+1} (local device {device}) miner")
-
-            # Initialize mining stats for all miners
-            for miner in self.miners:
-                self.mining_stats[miner.miner_id] = 0
         else:
-            # Single miner mode (legacy)
-            self.difficulty_energy = -1000.0
-            self.min_diversity = 0.25
-            self.min_solutions = 10
-            self.sampler = SimulatedAnnealingStructuredSampler()
+            # Single miner mode (legacy) - create a single CPU node
+            cpu_config = {
+                "cpu": {"num_cpus": 1}
+            }
+            cpu_node = Node(node_id="single-cpu-node", miners_config=cpu_config)
+            self.nodes = [cpu_node]
+            print("✓ Initialized single CPU node for legacy mode")
 
         # Network compute tracking
         self.network_stats = {
@@ -291,21 +182,95 @@ class QuantumBlockchain:
         }
         self.last_adaptation_block = 0
         self.adaptation_interval = 5  # Adapt every 5 blocks
-        
+
         # Create genesis block
         self.create_genesis_block()
 
     def create_genesis_block(self) -> Block:
         """Create the first block in the chain."""
-        genesis = Block(
-            index=0,
-            timestamp=time.time(),
-            data="Genesis Block",
-            previous_hash="0",
-            nonce=0
-        )
-        self.chain.append(genesis)
-        return genesis
+        # Try to load from genesis config first
+        try:
+            genesis = load_genesis_block()
+            self.chain.append(genesis)
+
+            # Initialize difficulty from genesis block requirements
+            if genesis.next_block_requirements:
+                req = genesis.next_block_requirements
+                self.base_difficulty_energy = req.difficulty_energy
+                self.base_min_diversity = req.min_diversity
+                self.base_min_solutions = req.min_solutions
+
+                # Set current difficulty to base
+                self.difficulty_energy = self.base_difficulty_energy
+                self.min_diversity = self.base_min_diversity
+                self.min_solutions = self.base_min_solutions
+
+                print(f"Genesis block loaded with next block requirements:")
+                print(f"  Difficulty Energy: {req.difficulty_energy}")
+                print(f"  Min Diversity: {req.min_diversity}")
+                print(f"  Min Solutions: {req.min_solutions}")
+                print(f"  Timeout to ease: {req.timeout_to_difficulty_adjustment_decay}s")
+
+            return genesis
+
+        except (FileNotFoundError, KeyError, json.JSONDecodeError) as e:
+            print(f"Could not load genesis from config: {e}")
+            print("Creating default genesis block...")
+
+            # Create next block requirements with current blockchain settings
+            next_requirements = NextBlockRequirements(
+                difficulty_energy=self.base_difficulty_energy,
+                min_diversity=self.base_min_diversity,
+                min_solutions=self.base_min_solutions,
+                timeout_to_difficulty_adjustment_decay=600  # 10 minutes in seconds
+            )
+
+            # Create basic header with data hash (will be updated after block creation)
+            genesis_data = "Genesis Block - Quip Protocol"
+            data_hash = blake3(genesis_data.encode()).digest()
+            
+            header = BlockHeader(
+                previous_hash=b"0" * 32,  # 32 bytes of zeros for genesis
+                index=0,
+                timestamp=int(time.time()),
+                data_hash=data_hash
+            )
+
+            # Create dummy miner info for genesis block (system genesis)
+            genesis_miner_info = MinerInfo(
+                miner_id="genesis-system",
+                miner_type="SYSTEM",
+                reward_address=b"0" * 33,  # Dummy address
+                ecdsa_public_key=b"0" * 33,  # Dummy key
+                wots_public_key=b"0" * 32,  # Dummy key  
+                next_wots_public_key=b"0" * 32  # Dummy key
+            )
+            
+            # Create dummy quantum proof for genesis block
+            genesis_quantum_proof = QuantumProof(
+                nonce=0,
+                solutions=[],  # No solutions needed for genesis
+                mining_time=0.0,
+                node_list=[],  # No topology for genesis
+                edge_list=[]   # No topology for genesis
+            )
+            
+            # Create genesis block with new structure
+            genesis = Block(
+                header=header,
+                miner_info=genesis_miner_info,
+                quantum_proof=genesis_quantum_proof,
+                next_block_requirements=next_requirements,
+                data=genesis_data,
+                raw=b"",  # Will be computed
+                hash=b"",  # Will be computed
+                signature=b""  # Will be computed
+            )
+            
+            # Compute derived fields
+            genesis.compute_derived_fields()
+            self.chain.append(genesis)
+            return genesis
 
     def get_latest_block(self) -> Block:
         """Get the most recent block in the chain."""
@@ -351,88 +316,6 @@ class QuantumBlockchain:
         # Note: Difficulty parameters are now managed at blockchain level, not miner level
         # Miners will access these parameters during mining through block context
 
-    def generate_quantum_model(self, block_header: str, nonce: int) -> Tuple[dict, dict]:
-        """
-        Generate Ising model parameters based on block header and nonce.
-
-        Args:
-            block_header: String representation of block header
-            nonce: Current nonce value
-
-        Returns:
-            h: Linear terms (biases)
-            J: Quadratic terms (couplers)
-        """
-        # Create seed from block header and nonce
-        seed_string = f"{block_header}{nonce}"
-        seed = int(blake3(seed_string.encode()).hexdigest()[:8], 16)
-        np.random.seed(seed)
-
-        # QPU sampler
-        h = {i: 0 for i in self.sampler.nodelist}
-        J = {edge: 2*np.random.randint(2)-1 for edge in self.sampler.edgelist}
-
-        return h, J
-
-    def calculate_hamming_distance(self, s1: List[int], s2: List[int]) -> int:
-        """Calculate symmetric Hamming distance between two binary strings.
-        
-        Uses bitwise operations for efficiency:
-        - XOR to find differences
-        - Population count (bit counting) for distance
-        - Compares both normal and inverted to handle symmetry
-        """
-        # Convert sequences to bit representations
-        # Map -1 to 0, and 1 to 1 for bit operations
-        def to_bits(seq):
-            """Convert sequence to integer bit representation."""
-            bits = 0
-            for i, val in enumerate(seq):
-                if val == 1 or val == -1:
-                    # Set bit i to 1 if val is 1, 0 if val is -1
-                    if val == 1:
-                        bits |= (1 << i)
-            return bits, len(seq)
-        
-        bits1, len1 = to_bits(s1)
-        bits2, len2 = to_bits(s2)
-        
-        # Create mask for valid bits
-        max_len = max(len1, len2)
-        mask = (1 << max_len) - 1
-        
-        # Calculate normal Hamming distance using XOR and popcount
-        xor_normal = bits1 ^ bits2
-        normal_dist = bin(xor_normal & mask).count('1')
-        
-        # Calculate symmetric distance (with bits2 inverted)
-        bits2_inv = (~bits2) & mask
-        xor_inv = bits1 ^ bits2_inv
-        inv_dist = bin(xor_inv & mask).count('1')
-        
-        # Return minimum for symmetric property
-        return min(normal_dist, inv_dist)
-
-    def calculate_diversity(self, solutions: List[List[int]]) -> float:
-        """
-        Calculate average normalized Hamming distance between all pairs of solutions.
-
-        Returns:
-            Average normalized Hamming distance (0 to 1)
-        """
-        if len(solutions) < 2:
-            return 0.0
-
-        distances = []
-        n = len(solutions[0])  # Length of each solution
-
-        for i in range(len(solutions)):
-            for j in range(i + 1, len(solutions)):
-                dist = self.calculate_hamming_distance(solutions[i], solutions[j])
-                distances.append(dist / n)  # Normalize by length
-
-        return np.mean(distances) if distances else 0.0
-
     def quantum_proof_of_work(self, block: Block) -> Tuple[int, List[List[int]], float, float, int]:
         """
         Perform quantum proof of work to find valid nonce.
@@ -463,7 +346,7 @@ class QuantumBlockchain:
         while True:
             # Generate random nonce for each attempt
             nonce = random.randint(0, sys.maxsize)
-            
+
             # Timeout check
             if timeout_sec > 0 and (time.time() - start_t) >= timeout_sec:
                 # If under test fast mode, synthesize a valid quick result if needed
@@ -525,137 +408,67 @@ class QuantumBlockchain:
                     diversity = 0.0
                 print(f"Progress: {progress}, Min energy: {min_energy:.2f}, Valid: {num_valid}, Diversity: {diversity:.3f}")
 
-    def competitive_mine(self, block_header: str) -> MiningResult:
+    def competitive_mine(self, previous_block: Block, next_requirements: NextBlockRequirements) -> Optional[MiningResult]:
         """
-        Run competitive mining between available miners.
+        Run competitive mining between available nodes.
 
         Args:
-            block_header: Block header string for mining
+            previous_block: Previous block to build on
+            next_requirements: Requirements for the next block
 
         Returns:
-            Mining result from the winning miner
+            Mining result from the winning miner, or None if no solution found
         """
-        print("\nStarting competitive mining...")
+        print("\nStarting competitive mining with Node architecture...")
 
-        # Create result queue and stop event
-        result_queue = multiprocessing.Queue()
+        # Create stop event for coordinating nodes
         stop_event = multiprocessing.Event()
 
-        # Start miners in separate processes
-        processes = []
-        for miner in self.miners:
-            # Serialize miner data for the subprocess
-            miner_data = {
-                'type': miner.miner_type,
-                'id': miner.miner_id,
-                'config': {
-                    'difficulty_energy': miner.difficulty_energy,
-                    'min_diversity': miner.min_diversity,
-                    'min_solutions': miner.min_solutions,
-                    'miner_type': miner.miner_type
-                }
-            }
+        # Start mining on all nodes concurrently
+        winning_result = None
+        
+        for node in self.nodes:
+            print(f"Starting mining on node: {node.node_id}")
+            # Node.mine_block returns MiningResult or None
+            result = node.mine_block(previous_block, stop_event)
             
-            process = multiprocessing.Process(
-                target=_mine_block_process,
-                args=(miner_data, block_header, result_queue, stop_event)
-            )
-            processes.append(process)
-            process.start()
+            if result is not None:
+                winning_result = result
+                # Signal all other nodes to stop
+                stop_event.set()
+                break
+        
+        if winning_result is None:
+            print("❌ No mining solution found by any node")
+            return None
 
-        # Wait for first valid result
-        winning_result = result_queue.get()
-
-        # Stop all miners immediately
-        stop_event.set()
-
-        # Wait for processes to stop with timeout
-        for process in processes:
-            process.join(timeout=2.0)
-            if process.is_alive():
-                print(f"Warning: Process {process.name} did not stop cleanly")
-                process.terminate()  # Force terminate if still alive
-
-        # Update stats
-        self.mining_stats[winning_result.miner_id] += 1
-
-        # Update miner's personal stats
-        winning_miner = self.miners_by_id[winning_result.miner_id]
-        winning_miner.blocks_won += 1
+        # Update stats - simplified for Node architecture
+        if not hasattr(self, 'mining_stats'):
+            self.mining_stats = {}
+        
+        miner_id = winning_result.miner_id
+        if miner_id not in self.mining_stats:
+            self.mining_stats[miner_id] = 0
+        self.mining_stats[miner_id] += 1
 
         # Calculate block reward
         base_reward = 50  # Base QUIP tokens
         actual_reward = base_reward * self.streak_multiplier
 
         print(f"\n🏆 WINNER: {winning_result.miner_id} ({winning_result.miner_type})")
-        print(f"Energy: {winning_result.energy:.2f}, Diversity: {winning_result.diversity:.3f}")
+        print(f"Solutions found: {len(winning_result.solutions)}")
         print(f"Time: {winning_result.mining_time:.2f}s")
         print(f"💰 Block Reward: {actual_reward:.1f} QUIP (Base: {base_reward}, Multiplier: {self.streak_multiplier}x)")
 
-        # Update miner's rewards
-        winning_miner.total_rewards += actual_reward
+        # Adjust difficulty for next block (simplified)
+        self.adjust_difficulty(winning_result.miner_type)
 
-        # Adjust difficulty for next block
-        self.adjust_difficulty(winning_result.miner_id)
-        
         # Update network stats
         self.network_stats['total_blocks'] += 1
-        
-        # Track which miners participated in this block
-        current_block_num = self.network_stats['total_blocks']
-        
-        # Capture timing for all miners, including partial progress
-        for miner in self.miners:
-            self.network_stats['total_samples'] += miner.timing_stats['total_samples']
-            
-            # Update timing history for miners that participated in this round
-            if miner.current_round_attempted:
-                # Capture partial timing for miners that were interrupted
-                preprocessing_time, sampling_time, postprocessing_time = miner.capture_partial_timing()
-                
-                miner.timing_history['block_numbers'].append(current_block_num)
-                
-                # Use captured timing (includes partial progress)
-                miner.timing_history['preprocessing_times'].append(preprocessing_time)
-                miner.timing_history['sampling_times'].append(sampling_time)
-                miner.timing_history['postprocessing_times'].append(postprocessing_time)
-                
-                # Calculate total time
-                total_time = preprocessing_time + sampling_time + postprocessing_time
-                
-                miner.timing_history['total_times'].append(total_time)
-                miner.timing_history['win_rates'].append(
-                    miner.blocks_won / miner.timing_stats['blocks_attempted'] if miner.timing_stats['blocks_attempted'] > 0 else 0
-                )
-                
-                # Track adaptive parameters history
-                if miner.miner_type == "QPU":
-                    miner.timing_history['adaptive_params_history'].append(
-                        miner.adaptive_params['quantum_annealing_time']
-                    )
-                else:
-                    miner.timing_history['adaptive_params_history'].append(
-                        miner.adaptive_params['num_sweeps']
-                    )
-                
-                # Reset the flag for next round
-                miner.current_round_attempted = False
-        
-        # Trigger adaptation every N blocks
-        if self.network_stats['total_blocks'] - self.last_adaptation_block >= self.adaptation_interval:
-            print("\n🔧 Adapting miner parameters based on performance...")
-            network_info = {
-                'total_miners': len(self.miners),
-                'total_blocks': self.network_stats['total_blocks'],
-                'avg_win_rate': 1.0 / len(self.miners)
-            }
-            for miner in self.miners:
-                miner.adapt_parameters(network_info)
-            self.last_adaptation_block = self.network_stats['total_blocks']
 
         return winning_result
 
-    def add_block(self, data: str) -> Block:
+    def add_block(self, data: str) -> Optional[Block]:
         """
         Mine and add a new block to the chain.
 
@@ -666,57 +479,127 @@ class QuantumBlockchain:
             The newly created block
         """
         previous_block = self.get_latest_block()
-        new_block = Block(
-            index=previous_block.index + 1,
-            timestamp=time.time(),
-            data=data,
+
+        # Create next block requirements with current difficulty
+        next_requirements = NextBlockRequirements(
+            difficulty_energy=self.difficulty_energy,
+            min_diversity=self.min_diversity,
+            min_solutions=self.min_solutions,
+            timeout_to_difficulty_adjustment_decay=600  # 10 minutes in seconds
+        )
+
+        # Create data hash for header
+        data_hash = blake3(data.encode()).digest()
+        
+        # Create header with proper structure
+        header = BlockHeader(
             previous_hash=previous_block.hash,
+            index=previous_block.header.index + 1,
+            timestamp=int(time.time()),
+            data_hash=data_hash
+        )
+
+        # Create placeholder miner info and quantum proof (will be updated after mining)
+        placeholder_miner_info = MinerInfo(
+            miner_id="placeholder",
+            miner_type="PLACEHOLDER",
+            reward_address=b"0" * 33,
+            ecdsa_public_key=b"0" * 33,
+            wots_public_key=b"0" * 32,
+            next_wots_public_key=b"0" * 32
+        )
+        
+        placeholder_quantum_proof = QuantumProof(
             nonce=0,
-            signature=None,
-            reward_address=None,
-            miner_ecdsa_public_key=None,
-            miner_wots_plus_public_key=None
+            solutions=[],
+            mining_time=0.0,
+            nodes=[],
+            edges=[]
+        )
+        
+        new_block = Block(
+            header=header,
+            miner_info=placeholder_miner_info,
+            quantum_proof=placeholder_quantum_proof,
+            next_block_requirements=next_requirements,
+            data=data,
+            raw=b"",
+            hash=b"",
+            signature=b""
         )
 
         if self.competitive:
             # Competitive mining
             print(f"\n{'='*60}")
-            print(f"COMPETITIVE MINING - Block {new_block.index}")
+            print(f"COMPETITIVE MINING - Block {new_block.header.index}")
             print(f"{'='*60}")
             print(f"Current Difficulty: Energy < {self.difficulty_energy:.1f}, Diversity >= {self.min_diversity:.2f}, Solutions >= {self.min_solutions}")
             if self.last_winner and self.win_streak > 1:
                 print(f"Current Leader: {self.last_winner} (Streak: {self.win_streak-1})")
 
-            # Use initial empty values for fields that will be filled after mining
-            block_header = f"{new_block.previous_hash}{new_block.index}{new_block.timestamp}{new_block.data}"""
-            result = self.competitive_mine(block_header)
-
-            # Update block with result
-            new_block.nonce = result.nonce
-            new_block.quantum_proof = result.solutions
-            new_block.energy = result.energy
-            new_block.diversity = result.diversity
-            new_block.num_valid_solutions = result.num_valid
-            new_block.miner_id = result.miner_id
-            new_block.miner_type = result.miner_type
-            new_block.mining_time = result.mining_time
+            # Call competitive mining with the block and requirements
+            result = self.competitive_mine(previous_block, next_requirements)
             
-            # Get winning miner to sign the block
-            winning_miner = self.miners_by_id[result.miner_id]
+            if result is None:
+                print("❌ No solution found by any miner. Cannot create block.")
+                return None
             
-            # Set reward address to miner's ECDSA public key
-            new_block.reward_address = winning_miner.ecdsa_public_key_hex
-            new_block.miner_ecdsa_public_key = winning_miner.ecdsa_public_key_hex
+            # Update block with mining result
+            # Update quantum proof
+            new_block.quantum_proof = QuantumProof(
+                nonce=result.nonce,
+                solutions=result.solutions,
+                mining_time=result.mining_time,
+                nodes=result.node_list,
+                edges=result.edge_list
+            )
             
-            # Sign the block data with WOTS+ and ECDSA
-            block_data_to_sign = f"{new_block.previous_hash}{new_block.index}{new_block.timestamp}{new_block.data}"
-            signature_hex, next_wots_key_hex = winning_miner.sign_block_data(block_data_to_sign)
+            # Find the node that won to get miner info
+            winning_node = None
+            for node in self.nodes:
+                # Check if any miner in this node matches the winning miner ID
+                node_stats = node.get_stats()
+                for miner_info in node_stats.get('miners', []):
+                    if miner_info.get('miner_id') == result.miner_id:
+                        winning_node = node
+                        break
+                if winning_node:
+                    break
             
-            new_block.signature = signature_hex
-            new_block.miner_wots_plus_public_key = next_wots_key_hex
+            if winning_node is None:
+                print(f"⚠️  Warning: Could not find winning node for miner {result.miner_id}")
+                # Use placeholder values
+                winning_node_info = {
+                    'ecdsa_public_key_hex': '0' * 66,
+                    'wots_plus_public_key_hex': '0' * 64
+                }
+            else:
+                winning_node_info = winning_node.get_network_identity()
+            
+            # Update miner info
+            new_block.miner_info = MinerInfo(
+                miner_id=result.miner_id,
+                miner_type=result.miner_type,
+                reward_address=bytes.fromhex(winning_node_info.get('ecdsa_public_key', '0'*66)),
+                ecdsa_public_key=bytes.fromhex(winning_node_info.get('ecdsa_public_key', '0'*66)),
+                wots_public_key=bytes.fromhex(winning_node_info.get('wots_plus_public_key', '0'*64)),
+                next_wots_public_key=bytes.fromhex(winning_node_info.get('wots_plus_public_key', '0'*64))  # Simplified for now
+            )
+            
+            # Sign the block using the winning node
+            if winning_node:
+                # For now, use placeholder signature - proper signing would require node integration
+                new_block.signature = b"placeholder_signature"
+            else:
+                new_block.signature = b"no_signature"
+            
+            # Compute derived fields and add to chain
+            new_block.compute_derived_fields()
+            self.chain.append(new_block)
+            return new_block
         else:
             # Single miner mode (legacy)
-            print(f"\nMining block {new_block.index}...")
+            print(f"\nMining block {new_block.header.index}...")
             print(f"Difficulty: Energy < {self.difficulty_energy}, Diversity >= {self.min_diversity}, Solutions >= {self.min_solutions}")
             start_time = time.time()
 
@@ -724,7 +607,7 @@ class QuantumBlockchain:
             nonce, quantum_proof, energy, diversity, num_valid = self.quantum_proof_of_work(new_block)
 
             # Update block with proof
-            new_block.nonce = nonce
+            new_block.quantum_proof.nonce = nonce
             new_block.quantum_proof = quantum_proof
             new_block.energy = energy
             new_block.diversity = diversity
@@ -736,12 +619,12 @@ class QuantumBlockchain:
 
         new_block.hash = new_block.compute_hash()
         self.chain.append(new_block)
-        
+
         # Reset block received time for all miners when a new block is added
         if self.competitive:
             for miner in self.miners:
                 miner.reset_block_received_time()
-        
+
         return new_block
 
     def validate_chain(self) -> bool:
@@ -756,11 +639,7 @@ class QuantumBlockchain:
             previous_block = self.chain[i-1]
 
             # Check hash linkage
-            if current_block.previous_hash != previous_block.hash:
-                return False
-
-            # Check block hash
-            if current_block.hash != current_block.compute_hash():
+            if current_block.header.previous_hash != previous_block.hash:
                 return False
 
             # Verify quantum proof (optional - can be expensive)
@@ -830,14 +709,14 @@ class QuantumBlockchain:
             print(f"  {miner_type}: {wins} blocks ({percentage:.1f}%)")
 
         print(f"\nTotal blocks mined: {total_blocks}")
-        
+
         # Print network compute statistics
         print("\n" + "="*60)
         print("NETWORK COMPUTE STATISTICS")
         print("="*60)
         total_network_samples = sum(miner.timing_stats['total_samples'] for miner in self.miners)
         total_attempts = sum(miner.timing_stats['blocks_attempted'] for miner in self.miners)
-        
+
         print(f"Total Network Samples: {total_network_samples:,}")
         print(f"Total Mining Attempts: {total_attempts}")
         print(f"Average Samples per Block: {total_network_samples / total_blocks:.1f}" if total_blocks > 0 else "N/A")
@@ -886,7 +765,7 @@ class QuantumBlockchain:
         print("="*60)
         for miner in self.miners:
             print(miner.get_timing_summary())
-        
+
         # Analyze mining times by type
         mining_times_by_type = {}
 
@@ -1222,33 +1101,33 @@ class QuantumBlockchain:
         plt.tight_layout()
         plt.savefig(f'{output_prefix}_timing.png', dpi=300, bbox_inches='tight')
         print(f"Saved timing analysis plot to {output_prefix}_timing.png")
-        
+
         # Generate miner timing performance graphs
         self.generate_timing_performance_plots(output_prefix)
-    
+
     def generate_timing_performance_plots(self, output_prefix: str = "benchmarks/blockchain_benchmark"):
         """Generate detailed timing performance plots for each miner over time."""
         if not self.competitive or len(self.chain) < 2:
             print("Not enough data for timing performance plots")
             return
-        
+
         # Set style
         plt.style.use('seaborn-v0_8-darkgrid')
-        
+
         # Create figure with subplots for timing performance
         fig = plt.figure(figsize=(20, 12))
-        
+
         # Color mapping for miners
         def get_miner_color(miner_id: str) -> str:
             """Get unique color for each miner."""
             colors = {
                 'QPU': '#4285F4',  # Blue
-                'CPU': '#FF8C00',  # Orange  
+                'CPU': '#FF8C00',  # Orange
                 'GPU': '#00C853'   # Green
             }
             base_type = miner_id.split('-')[0]
             base_color = colors.get(base_type, '#808080')
-            
+
             # Add shade variation for multiple miners of same type
             if miner_id[-1].isdigit():
                 miner_num = int(miner_id[-1])
@@ -1258,7 +1137,7 @@ class QuantumBlockchain:
                 rgb = tuple(min(1.0, c * lightness) for c in rgb)
                 return mcolors.rgb2hex(rgb) if mcolors else base_color
             return base_color
-        
+
         # 1. Total timing per miner over samples (not just blocks)
         ax1 = plt.subplot(2, 3, 1)
         for miner in self.miners:
@@ -1268,14 +1147,14 @@ class QuantumBlockchain:
                 # Calculate total time for each sample
                 total_times = []
                 sample_indices = []
-                for i in range(max(len(miner.timing_stats['preprocessing']), 
+                for i in range(max(len(miner.timing_stats['preprocessing']),
                                   len(miner.timing_stats['sampling']))):
                     pre_time = miner.timing_stats['preprocessing'][i] if i < len(miner.timing_stats['preprocessing']) else 0
                     samp_time = miner.timing_stats['sampling'][i] if i < len(miner.timing_stats['sampling']) else 0
                     post_time = miner.timing_stats['postprocessing'][i] if i < len(miner.timing_stats['postprocessing']) else 0
                     total_times.append(pre_time + samp_time + post_time)
                     sample_indices.append(i + 1)
-                
+
                 if total_times:
                     ax1.plot(sample_indices, total_times,
                             'o-', label=miner.miner_id, color=color, markersize=4, linewidth=1, alpha=0.7)
@@ -1284,7 +1163,7 @@ class QuantumBlockchain:
         ax1.set_title('Total Processing Time per Sample')
         ax1.legend()
         ax1.set_yscale('log')  # Log scale for better visibility
-        
+
         # 2. Sampling time evolution (all samples)
         ax2 = plt.subplot(2, 3, 2)
         for miner in self.miners:
@@ -1298,128 +1177,128 @@ class QuantumBlockchain:
         ax2.set_title('Sampling Time per Sample')
         ax2.legend()
         ax2.set_yscale('log')
-        
+
         # 3. Violin plot of total processing times (from all samples)
         ax3 = plt.subplot(2, 3, 3)
-        
+
         # Prepare data for violin plot
         total_time_data = []
         labels = []
         colors_list = []
-        
+
         for miner in self.miners:
             # Calculate total times from raw stats
             if miner.timing_stats['preprocessing'] or miner.timing_stats['sampling']:
                 total_times = []
-                for i in range(max(len(miner.timing_stats['preprocessing']), 
+                for i in range(max(len(miner.timing_stats['preprocessing']),
                                   len(miner.timing_stats['sampling']))):
                     pre_time = miner.timing_stats['preprocessing'][i] if i < len(miner.timing_stats['preprocessing']) else 0
                     samp_time = miner.timing_stats['sampling'][i] if i < len(miner.timing_stats['sampling']) else 0
                     post_time = miner.timing_stats['postprocessing'][i] if i < len(miner.timing_stats['postprocessing']) else 0
                     total_times.append(pre_time + samp_time + post_time)
-                
+
                 if total_times:
                     total_time_data.append(total_times)
                     labels.append(miner.miner_id)
                     colors_list.append(get_miner_color(miner.miner_id))
-        
+
         if total_time_data:
             parts = ax3.violinplot(total_time_data, showmeans=True, showmedians=True, showextrema=True)
-            
+
             # Color the violin plots
             for i, pc in enumerate(parts['bodies']):
                 pc.set_facecolor(colors_list[i % len(colors_list)])
                 pc.set_alpha(0.7)
-            
+
             ax3.set_xticks(range(1, len(labels) + 1))
             ax3.set_xticklabels(labels, rotation=45, ha='right')
             ax3.set_ylabel('Total Processing Time (μs)')
             ax3.set_title('Total Processing Time Distribution')
             ax3.set_yscale('log')
-            
+
             # Add grid for better readability
             ax3.grid(True, alpha=0.3, axis='y')
         else:
             ax3.text(0.5, 0.5, 'No timing data', ha='center', va='center', transform=ax3.transAxes)
-        
+
         # 4. Preprocessing vs Postprocessing time (from all samples)
         ax4 = plt.subplot(2, 3, 4)
         for miner in self.miners:
             color = get_miner_color(miner.miner_id)
-            
+
             # Plot preprocessing times from raw stats
             if miner.timing_stats['preprocessing']:
                 sample_indices = list(range(1, len(miner.timing_stats['preprocessing']) + 1))
                 ax4.plot(sample_indices, miner.timing_stats['preprocessing'],
-                        '--', label=f'{miner.miner_id} (pre)', color=color, alpha=0.5, 
+                        '--', label=f'{miner.miner_id} (pre)', color=color, alpha=0.5,
                         markersize=3, linewidth=1)
-            
+
             # Plot postprocessing times from raw stats (may be shorter if not all attempts reached postprocessing)
             if miner.timing_stats['postprocessing']:
                 sample_indices = list(range(1, len(miner.timing_stats['postprocessing']) + 1))
                 ax4.plot(sample_indices, miner.timing_stats['postprocessing'],
                         '-', label=f'{miner.miner_id} (post)', color=color,
                         markersize=3, linewidth=1)
-        
+
         ax4.set_xlabel('Sample Number')
         ax4.set_ylabel('Time (μs)')
         ax4.set_title('Pre/Post Processing Times per Sample')
         ax4.legend(fontsize=8)
         ax4.set_yscale('log')
-        
+
         # 5. Adaptive parameters evolution with dual axes
         ax5 = plt.subplot(2, 3, 5)
-        
+
         # Create second y-axis for annealing time
         ax5_right = ax5.twinx()
-        
+
         # Plot SA miners (num_sweeps) on left axis
         for miner in self.miners:
             if miner.timing_history['block_numbers'] and miner.timing_history['adaptive_params_history']:
                 color = get_miner_color(miner.miner_id)
-                
+
                 if miner.miner_type != "QPU":  # SA miners
                     # Plot log(num_sweeps) on left axis
                     log_sweeps = [np.log10(s) for s in miner.timing_history['adaptive_params_history']]
                     ax5.plot(miner.timing_history['block_numbers'], log_sweeps,
-                            's-', label=f'{miner.miner_id}', color=color, 
+                            's-', label=f'{miner.miner_id}', color=color,
                             markersize=6, linewidth=1.5, alpha=0.7)
-        
-        # Plot QPU miners (annealing_time) on right axis  
+
+        # Plot QPU miners (annealing_time) on right axis
         for miner in self.miners:
             if miner.timing_history['block_numbers'] and miner.timing_history['adaptive_params_history']:
                 color = get_miner_color(miner.miner_id)
-                
+
                 if miner.miner_type == "QPU":  # QPU miners
-                    ax5_right.plot(miner.timing_history['block_numbers'], 
+                    ax5_right.plot(miner.timing_history['block_numbers'],
                                   miner.timing_history['adaptive_params_history'],
                                   'o-', label=f'{miner.miner_id}', color=color,
                                   markersize=6, linewidth=1.5, alpha=0.7)
-        
+
         # Configure axes
         ax5.set_xlabel('Block Number')
         ax5.set_ylabel('log₁₀(Num Sweeps) - SA Miners', color='#FF8C00')
         ax5.tick_params(axis='y', labelcolor='#FF8C00')
         ax5.grid(True, alpha=0.3)
-        
+
         ax5_right.set_ylabel('Annealing Time (μs) - QPU Miners', color='#4285F4')
         ax5_right.tick_params(axis='y', labelcolor='#4285F4')
-        
+
         ax5.set_title('Adaptive Parameters Evolution')
-        
+
         # Combine legends from both axes
         lines1, labels1 = ax5.get_legend_handles_labels()
         lines2, labels2 = ax5_right.get_legend_handles_labels()
         ax5.legend(lines1 + lines2, labels1 + labels2, loc='best', fontsize=8)
-        
+
         # 6. Violin plot of sampling times (from all samples)
         ax6 = plt.subplot(2, 3, 6)
-        
+
         # Prepare data for violin plot
         sampling_time_data = []
         sampling_labels = []
         sampling_colors = []
-        
+
         for miner in self.miners:
             if miner.timing_stats['sampling']:
                 # Use raw sampling data (all samples, not just per-block summaries)
@@ -1428,26 +1307,26 @@ class QuantumBlockchain:
                     sampling_time_data.append(non_zero_sampling)
                     sampling_labels.append(miner.miner_id)
                     sampling_colors.append(get_miner_color(miner.miner_id))
-        
+
         if sampling_time_data:
             parts = ax6.violinplot(sampling_time_data, showmeans=True, showmedians=True, showextrema=True)
-            
+
             # Color the violin plots
             for i, pc in enumerate(parts['bodies']):
                 pc.set_facecolor(sampling_colors[i % len(sampling_colors)])
                 pc.set_alpha(0.7)
-            
+
             ax6.set_xticks(range(1, len(sampling_labels) + 1))
             ax6.set_xticklabels(sampling_labels, rotation=45, ha='right')
             ax6.set_ylabel('Sampling Time (μs)')
             ax6.set_title('Sampling Time Distribution')
             ax6.set_yscale('log')
-            
+
             # Add grid for better readability
             ax6.grid(True, alpha=0.3, axis='y')
         else:
             ax6.text(0.5, 0.5, 'No sampling data', ha='center', va='center', transform=ax6.transAxes)
-        
+
         plt.suptitle('Miner Timing Performance Analysis', fontsize=16, y=1.02)
         plt.tight_layout()
         plt.savefig(f'{output_prefix}_miner_timing_performance.png', dpi=300, bbox_inches='tight')

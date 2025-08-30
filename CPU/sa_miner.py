@@ -12,35 +12,56 @@ import numpy as np
 
 from shared.base_miner import BaseMiner, MiningResult
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
+from shared.block import Block, BlockHeader
+from shared.quantum_proof_of_work import generate_ising_model_from_seed, ising_seed_from_block
+# Removed _parse_block_header import - function no longer exists
 
 
 class SimulatedAnnealingMiner(BaseMiner):
     def __init__(self, miner_id: str, **cfg):
-        super().__init__(miner_id)
+        sampler = SimulatedAnnealingStructuredSampler()
+        super().__init__(miner_id, sampler)
         self.miner_type = "CPU"
-        self.sampler = SimulatedAnnealingStructuredSampler()
         
     def mine_block(
         self,
-        block_header: str,
+        prev_block,
+        requirements,
         result_queue: multiprocessing.Queue,
         stop_event: multiprocessing.synchronize.Event,
     ) -> Optional[MiningResult]:
         """Mine a block using simulated annealing.
         
         Args:
-            block_header: Format is f"{previous_hash}{index}{timestamp}{data}"
+            block: Block object containing header, data, and other block information  
+            requirements: NextBlockRequirements object with difficulty settings
             result_queue: Multiprocessing queue for results
             stop_event: Multiprocessing event to signal stop
         """
         self.mining = True
         progress = 0  # Progress counter for logging
-        start_time = time.time()
+        start_time = time.time()        
+
+        print("requirements: ", requirements)
+
+        cur_index = prev_block.header.index + 1
         
         # Mark that this miner is attempting this round
         self.current_round_attempted = True
-        print(f"{self.miner_id} started...")
+        print(f"{self.miner_id} mining block {cur_index}...")
 
+        # Extract requirements from NextBlockRequirements object
+        difficulty_energy = requirements.difficulty_energy
+        min_diversity = requirements.min_diversity
+        min_solutions = requirements.min_solutions
+
+        params = adapt_parameters(difficulty_energy, min_diversity, min_solutions)
+        print(f"{self.miner_id} adaptive params: {params}")
+        
+        # Get topology information from sampler
+        nodes = self.sampler.nodelist
+        edges = self.sampler.edgelist
+        
         while self.mining and not stop_event.is_set():
             # Check if we should stop before generating model
             if stop_event.is_set():
@@ -50,8 +71,11 @@ class SimulatedAnnealingMiner(BaseMiner):
             # Generate random nonce for each attempt
             nonce = random.randint(0, sys.maxsize)
             
-            # Generate quantum model
-            h, J = self.generate_quantum_model(block_header, nonce)
+            # Generate quantum model using deterministic block-based seeding
+            # Use 64 variables to match original working energy scale
+            timestamp = int(time.time())
+            seed = ising_seed_from_block(prev_block.header.previous_hash, timestamp, cur_index, nonce)
+            h, J = generate_ising_model_from_seed(seed, nodes, edges)  
 
             # Check again before sampling
             if stop_event.is_set():
@@ -66,7 +90,8 @@ class SimulatedAnnealingMiner(BaseMiner):
             # Sample from simulated annealer
             try:
                 # For SA, use adaptive parameters
-                num_sweeps = self.adaptive_params.get('num_sweeps', 512)
+                num_sweeps = params.get('num_sweeps', 512)
+                num_reads = params.get('num_reads', 100)
                 
                 sample_start = time.time()
                 self.current_stage = 'sampling'
@@ -76,7 +101,7 @@ class SimulatedAnnealingMiner(BaseMiner):
                 sampling_params = {
                     'h': h,
                     'J': J,
-                    'num_reads': 100,
+                    'num_reads': num_reads,
                     'num_sweeps': num_sweeps
                 }
                 
@@ -87,8 +112,8 @@ class SimulatedAnnealingMiner(BaseMiner):
                     pass
                 else:
                     # Actual SimulatedAnnealingSampler - add beta parameters
-                    sampling_params['beta_range'] = self.adaptive_params.get('beta_range', [0.1, 10.0])
-                    sampling_params['beta_schedule_type'] = self.adaptive_params.get('beta_schedule', 'geometric')
+                    sampling_params['beta_range'] = params.get('beta_range', [0.1, 10.0])
+                    sampling_params['beta_schedule_type'] = params.get('beta_schedule', 'geometric')
                 
                 sampleset = self.sampler.sample_ising(**sampling_params)
                 sample_time = time.time() - sample_start
@@ -114,13 +139,13 @@ class SimulatedAnnealingMiner(BaseMiner):
             self.current_stage_start = postprocess_start
             
             # Find all solutions meeting energy threshold
-            valid_indices = np.where(sampleset.record.energy < self.difficulty_energy)[0]
+            valid_indices = np.where(sampleset.record.energy < difficulty_energy)[0]
             
             # Update sample counts
             self.timing_stats['total_samples'] += len(sampleset.record.energy)
             self.timing_stats['blocks_attempted'] += 1
 
-            if len(valid_indices) >= self.min_solutions:
+            if len(valid_indices) >= min_solutions:
                 # Get unique solutions
                 valid_solutions = []
                 seen = set()
@@ -136,7 +161,7 @@ class SimulatedAnnealingMiner(BaseMiner):
                 min_energy = float(np.min(sampleset.record.energy))
 
                 # Filter excess solutions to maintain diversity
-                filtered_solutions = self.filter_diverse_solutions(valid_solutions, self.min_solutions)
+                filtered_solutions = self.filter_diverse_solutions(valid_solutions, min_solutions)
 
                 # Recalculate diversity after filtering
                 final_diversity = self.calculate_diversity(filtered_solutions)
@@ -146,7 +171,7 @@ class SimulatedAnnealingMiner(BaseMiner):
                 self.timing_stats['postprocessing'].append((time.time() - postprocess_start) * 1e6)
                 
                 # Check if diversity requirement is met
-                if final_diversity >= self.min_diversity and len(valid_solutions) >= self.min_solutions:
+                if final_diversity >= min_diversity and len(valid_solutions) >= min_solutions:
                     mining_time = time.time() - start_time
                     min_energy = float(np.min(sampleset.record.energy[valid_indices]))
 
@@ -158,7 +183,9 @@ class SimulatedAnnealingMiner(BaseMiner):
                         energy=min_energy,
                         diversity=final_diversity,
                         num_valid=len(valid_solutions),
-                        mining_time=mining_time
+                        mining_time=mining_time,
+                        node_list=nodes,
+                        edge_list=edges
                     )
 
                     result_queue.put(result)
@@ -176,3 +203,31 @@ class SimulatedAnnealingMiner(BaseMiner):
         if stop_event.is_set():
             print(f"{self.miner_id} stopped")
         return None
+    
+def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutions: int):
+    """Calculate adaptive mining parameters based on difficulty requirements.
+
+    Supports either a NextBlockRequirements object or a dict with keys:
+    'difficulty_energy', 'min_diversity', 'min_solutions'.
+    """
+    # Normalize difficulty factor (more negative = harder)
+    difficulty_factor = abs(difficulty_energy) / 1000.0  # Base around -1000
+
+    # Simulated Annealing parameters
+    base_sweeps = 512
+    num_sweeps = int(base_sweeps * (difficulty_factor ** 1.8))  # Exponential scaling
+    num_reads = max(int(min_solutions) * 3, 100)  # At least 3x required solutions
+
+    # Beta schedule adjustment for harder problems
+    if difficulty_factor > 10:  # Very hard problems
+        beta_range = [0.05, 15.0]  # Wider exploration
+    else:
+        beta_range = [0.1, 10.0]   # Standard range
+
+    return {
+        'num_sweeps': max(256, min(num_sweeps, 32768)),  # Reasonable bounds
+        'num_reads': max(64, min(num_reads, 1000)),      # Reasonable bounds
+        'beta_range': beta_range,
+        'beta_schedule': 'geometric'
+    }
+

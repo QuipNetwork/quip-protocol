@@ -1,7 +1,7 @@
 """Shared persistent miner worker process and factory.
 
 This worker runs a loop handling commands from the parent process:
-- mine_block {block_header}
+- mine_block {block, requirements}
 - stop_mining
 - get_stats
 - shutdown
@@ -42,7 +42,7 @@ def build_miner_from_spec(spec: Dict[str, Any]):
 
 def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any]):
     miner = build_miner_from_spec(spec)
-    current_stop: mpsync.Event | None = None
+    current_stop: mpsync.Event = mp.Event()
 
     while True:
         msg = req_q.get()
@@ -51,28 +51,22 @@ def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any]):
         op = msg.get("op")
 
         if op == "shutdown":
-            miner.shutdown()
-            break
+            print(f"Shutting down miner {miner.miner_id}")
+            current_stop.set()
+            return
         elif op == "get_stats":
-            try:
-                data = miner.get_stats()
-                resp_q.put({"op": "stats", "data": data, "id": spec.get("id")})
-            except Exception as e:
-                resp_q.put({"op": "error", "message": str(e), "id": spec.get("id")})
+            data = miner.get_stats()
+            resp_q.put({"op": "stats", "data": data, "id": spec.get("id")})
         elif op == "stop_mining":
-            if current_stop is not None:
-                current_stop.set()
+            current_stop.set()
         elif op == "mine_block":
-            block_header = msg.get("block_header")
-            if block_header is None:
-                resp_q.put({"op": "error", "message": "No block header", "id": spec.get("id")})
+            block = msg.get("block")
+            requirements = msg.get("requirements")
+            if block is None or requirements is None:
+                resp_q.put({"op": "error", "message": "Missing block or requirements", "id": spec.get("id")})
                 continue
             current_stop = mp.Event()
-            try:
-                # Miner.mine_block is expected to put a MiningResult on resp_q
-                miner.mine_block(block_header, resp_q, current_stop)
-            except Exception as e:
-                resp_q.put({"op": "error", "message": str(e), "id": spec.get("id")})
+            miner.mine_block(block, requirements, resp_q, current_stop)
         else:
             resp_q.put({"op": "error", "message": f"Unknown op {op}", "id": spec.get("id")})
             print(f"{miner.miner_id}: Unknown op {op}")
@@ -112,8 +106,8 @@ class MinerHandle:
             return "GPU-MPS"
         return k.upper()
 
-    def mine(self, block_header: str):
-        self.req.put({"op": "mine_block", "block_header": block_header})
+    def mine(self, block, requirements):
+        self.req.put({"op": "mine_block", "block": block, "requirements": requirements})
 
     def cancel(self):
         self.req.put({"op": "stop_mining"})

@@ -2,11 +2,19 @@
 """Launch script for quantum blockchain network with different miner types."""
 
 import argparse
-import subprocess
+import multiprocessing
 import time
 import sys
 import signal
 import os
+from typing import List, Optional
+
+from node_worker import (
+    node_worker_main, 
+    create_cpu_node_config, 
+    create_gpu_node_config, 
+    create_qpu_node_config
+)
 
 
 class NetworkLauncher:
@@ -16,24 +24,51 @@ class NetworkLauncher:
         self.processes = []
         
     def launch_node(self, miner_type: str, node_id: int, port: int, peer_port: int = None, **kwargs):
-        """Launch a mining node."""
-        cmd = [sys.executable, f"{miner_type}/{miner_type.lower()}_miner.py",
-               "--id", str(node_id),
-               "--port", str(port)]
+        """Launch a mining node with attached miner."""
+        peer_address = f"localhost:{peer_port}" if peer_port else None
         
-        if peer_port:
-            cmd.extend(["--peer", f"localhost:{peer_port}"])
-            
-        # Add additional arguments
-        for key, value in kwargs.items():
-            cmd.extend([f"--{key.replace('_', '-')}", str(value)])
+        # Create node configuration based on miner type
+        if miner_type == 'CPU':
+            config = create_cpu_node_config(
+                node_id=node_id,
+                port=port,
+                peer_address=peer_address,
+                **kwargs
+            )
+        elif miner_type == 'GPU':
+            config = create_gpu_node_config(
+                node_id=node_id,
+                port=port,
+                peer_address=peer_address,
+                **kwargs
+            )
+        elif miner_type == 'QPU':
+            config = create_qpu_node_config(
+                node_id=node_id,
+                port=port,
+                peer_address=peer_address,
+                **kwargs
+            )
+        else:
+            raise ValueError(f"Unknown miner type: {miner_type}")
         
         print(f"Launching {miner_type} node {node_id} on port {port}...")
         
-        process = subprocess.Popen(cmd)
+        # Launch node worker process
+        process = node_worker_main(config)
         self.processes.append(process)
         
-        # Give node time to start
+        # Wait for startup confirmation
+        try:
+            startup_result = process.result_queue.get(timeout=15)
+            if startup_result['status'] == 'started':
+                print(f"✅ {miner_type} node {node_id} started successfully")
+            else:
+                print(f"❌ {miner_type} node {node_id} startup failed: {startup_result}")
+        except Exception as e:
+            print(f"⚠️  {miner_type} node {node_id} startup timeout or error: {e}")
+        
+        # Give additional time for P2P connections
         time.sleep(2)
         
         return process
@@ -41,15 +76,19 @@ class NetworkLauncher:
     def stop_all(self):
         """Stop all launched processes."""
         print("\nStopping all nodes...")
+        
+        # Signal all nodes to stop gracefully
         for process in self.processes:
-            process.terminate()
+            if hasattr(process, 'stop_event'):
+                process.stop_event.set()
         
         # Wait for graceful shutdown
         for process in self.processes:
             try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
+                process.join(timeout=5)
+            except Exception:
+                if process.is_alive():
+                    process.terminate()
         
         print("All nodes stopped.")
     

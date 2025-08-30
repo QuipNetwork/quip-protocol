@@ -12,12 +12,13 @@ except ImportError:
 from shared.miner import Miner, MiningResult
 
 
-def gpu_mine_block_process(miner_data, block_header: str, result_queue, stop_event):
+def gpu_mine_block_process(miner_data, block, requirements, result_queue, stop_event):
     """GPU-specific mining process function.
     
     Args:
         miner_data: Serialized miner data (type, id, config)
-        block_header: Block header to mine
+        block: Block object to mine
+        requirements: NextBlockRequirements object with difficulty settings
         result_queue: Queue to put results
         stop_event: Event to signal stop
     """
@@ -25,29 +26,23 @@ def gpu_mine_block_process(miner_data, block_header: str, result_queue, stop_eve
     miner_id = miner_data['id']
     miner_config = miner_data.get('config', {})
     
-    # Create appropriate GPU sampler
-    if miner_type.startswith('GPU-LOCAL'):
-        # Local GPU miner - import locally to avoid circular import
-        from .sampler import LocalGPUSampler
-        sampler = LocalGPUSampler(miner_type.split(':')[1])
-    elif miner_type.startswith('GPU-MODAL'):
-        # Modal GPU miner - import locally to avoid circular import
-        from .modal_sampler import ModalSampler
-        sampler = ModalSampler(miner_type.split(':')[1])
+    # Determine GPU miner type
+    if miner_type == 'GPU-MODAL':
+        from GPU.modal_miner import ModalMiner
+        gpu_type = miner_config.get('gpu_type', 't4')
+        miner = ModalMiner(miner_id=miner_id, gpu_type=gpu_type)
+    elif miner_type == 'GPU-LOCAL-CUDA':
+        from GPU.cuda_miner import CudaMiner
+        device = miner_config.get('device', '0')
+        miner = CudaMiner(miner_id=miner_id, device=device)
+    elif miner_type == 'GPU-LOCAL-MPS':
+        from GPU.metal_miner import MetalMiner
+        miner = MetalMiner(miner_id=miner_id)
     else:
         raise ValueError(f"Unknown GPU miner type: {miner_type}")
     
-    miner = Miner(
-        miner_id, 
-        miner_type, 
-        sampler, 
-        difficulty_energy=miner_config['difficulty_energy'],
-        min_diversity=miner_config['min_diversity'],
-        min_solutions=miner_config['min_solutions']
-    )
-    
-    # Call the original Miner.mine_block method
-    miner.mine_block(block_header, result_queue, stop_event)
+    # Call the mine_block method
+    miner.mine_block(block, requirements, result_queue, stop_event)
 
 
 def gpu_worker_main(req_q, resp_q, device_str: str):

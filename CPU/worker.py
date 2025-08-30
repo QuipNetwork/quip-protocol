@@ -9,12 +9,13 @@ from CPU.sa_miner import SimulatedAnnealingMiner
 from shared.base_miner import MiningResult
 
 
-def cpu_mine_block_process(miner_data, block_header: str, result_queue, stop_event):
+def cpu_mine_block_process(miner_data, block, requirements, result_queue, stop_event):
     """CPU-specific mining process function.
     
     Args:
         miner_data: Serialized miner data (type, id, config)
-        block_header: Block header to mine
+        block: Block object to mine
+        requirements: NextBlockRequirements object with difficulty settings
         result_queue: Queue to put results
         stop_event: Event to signal stop
     """
@@ -27,4 +28,4 @@ def cpu_mine_block_process(miner_data, block_header: str, result_queue, stop_eve
     )
     
     # Call the mine_block method
-    miner.mine_block(block_header, result_queue, stop_event)
+    miner.mine_block(block, requirements, result_queue, stop_event)

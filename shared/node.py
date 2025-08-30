@@ -4,11 +4,14 @@ import multiprocessing
 import os
 import time
 from blake3 import blake3
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
 from multiprocessing.synchronize import Event as EventType
 
+if TYPE_CHECKING:
+    pass
 
 from shared.block_signer import BlockSigner
+from shared.block import Block
 from shared.miner import Miner, MiningResult
 
 
@@ -179,16 +182,19 @@ class Node:
         # For persistent workers, nothing to notify here; miners read network state indirectly
         # via difficulty adjustments before next round.
 
-    def mine_block(self, block_header: str, stop_event: EventType) -> Optional[MiningResult]:
+    def mine_block(self, previous_block: Block, stop_event: EventType) -> Optional[MiningResult]:
         """
         Coordinate mining across all miners of this node for a block.
 
         Args:
-            block_header: Block header to mine
+            previous_block: Previous block (contains next block requirements)
 
         Returns:
             MiningResult if successful, None if stopped/failed
         """
+        # Send the full previous block and its next-block requirements to miners
+        block = previous_block
+        requirements = previous_block.next_block_requirements
         handles = getattr(self, 'miner_handles', [])
         if not handles:
             print(f"Node {self.node_id}: No miners configured")
@@ -204,9 +210,9 @@ class Node:
 
         print(f"Node {self.node_id} starting mining with {len(handles)} miners...")
 
-        # Command all workers to start mining
+        # Command all workers to start mining with full context
         for h in handles:
-            h.mine(block_header)
+            h.mine(block, requirements)
 
         result = None
         try:
