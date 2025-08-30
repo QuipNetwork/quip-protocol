@@ -69,6 +69,13 @@ class Node:
         self.no_block_timeout = 1800  # 30 minutes in seconds
         self.difficulty_reduction_factor = 0.1
 
+        # Mining state for async coordination
+        self._mining_stop_event: Optional[EventType] = None
+        self._is_mining = False
+        self._current_mining_task: Optional[asyncio.Task] = None
+
+
+
         print(f"Node {node_id} initialized with {len(getattr(self, 'miner_handles', []))} miners:")
         print(f"  ECDSA Public Key: {self.crypto.ecdsa_public_key_hex[:16]}...")
         print(f"  WOTS+ Public Key: {self.crypto.wots_plus_public_key.to_bytes().hex()[:16]}...")
@@ -167,9 +174,9 @@ class Node:
             next_wots_public_key=self.crypto.wots_plus_public_key.to_bytes()
         )
 
-    def mine_block(self, previous_block: Block, stop_mining: EventType) -> Optional[Block]:
+    async def mine_block(self, previous_block: Block) -> Optional[Block]:
         """
-        Coordinate mining across all miners of this node for a block.
+        Async method to coordinate mining across all miners of this node for a block.
 
         Args:
             previous_block: Previous block (contains next block requirements)
@@ -177,6 +184,9 @@ class Node:
         Returns:
             Block if successful, None if stopped/failed
         """
+        if self._is_mining or self._mining_stop_event is not None:
+            raise RuntimeError(f"Node {self.node_id}: Already mining")
+
         # Send the full previous block and its next-block requirements to miners
         requirements = previous_block.next_block_requirements
 
@@ -184,6 +194,9 @@ class Node:
         if not handles:
             raise ValueError(f"Node {self.node_id}: No miners configured")
 
+        # Set mining state
+        self._is_mining = True
+        self._mining_stop_event = multiprocessing.Event()
 
         # Start timing
         start_time = time.time()
@@ -202,7 +215,7 @@ class Node:
         try:
             # Wait for first result or timeout
             deadline = time.time() + self.no_block_timeout
-            while time.time() < deadline and not stop_mining.is_set():
+            while time.time() < deadline and not self._mining_stop_event.is_set():
                 # Poll each handle's response queue quickly
                 for h in handles:
                     try:
@@ -214,21 +227,29 @@ class Node:
                         continue
                     if hasattr(msg, 'miner_id') and hasattr(msg, 'solutions'):
                         result = msg
-                        stop_mining.set()
+                        self._mining_stop_event.set()
                         break
                     if isinstance(msg, dict) and msg.get('op') == 'error':
                         # Log or collect errors as needed
                         pass
                 if result is not None:
                     break
+                # Async sleep to allow other coroutines to run
+                await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            print(f"Node {self.node_id}: Mining cancelled")
+            self._mining_stop_event.set()
         except KeyboardInterrupt:
             print(f"Node {self.node_id}: Mining interrupted")
-            stop_mining.set()
+            self._mining_stop_event.set()
         finally:
             # Signal cancellation to all workers if result found
             if result is not None:
                 for h in handles:
                     h.cancel()
+            # Reset mining state
+            self._is_mining = False
+            self._mining_stop_event = None
 
         # Record timing and statistics
         total_time = time.time() - start_time
@@ -248,6 +269,25 @@ class Node:
             print(f"Node {self.node_id}: No solution found in {total_time:.2f}s")
 
         return result
+
+    async def stop_mining(self) -> None:
+        """
+        Async method to stop the current mining operation.
+
+        NOTE: You should await this if you want to wait for the node to actually stop mining. 
+        """
+        if not self._is_mining or self._mining_stop_event is None:
+            return
+
+        print(f"Node {self.node_id}: Stopping mining...")
+        self._mining_stop_event.set()
+
+        # Wait for mining to stop before clearing the mining event.
+        while self._is_mining:
+            await asyncio.sleep(0.1)
+
+        # Reset state
+        self._mining_stop_event = None
     
     def build_block(self, previous_block: Block, mining_result: MiningResult, block_data: bytes):
         """Build a block from a mining result."""
