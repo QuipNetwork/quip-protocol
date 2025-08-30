@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 from blake3 import blake3
 import json
 import os
@@ -114,7 +115,7 @@ class QuantumBlockchain:
                 for i in range(self.num_sa_miners):
                     cpu_node = Node(node_id=f"cpu-node{i+1}", miners_config=cpu_config)
                     self.nodes.append(cpu_node)
-                    print(f"✓ Initialized CPU node {cpu_node.node_id} with {self.num_sa_miners} miner(s)")
+                    print(f"✓ Initialized CPU node {cpu_node.node_id}")
 
             # Create a node for GPU miners if requested
             if self.num_gpu_miners > 0:
@@ -333,7 +334,7 @@ class QuantumBlockchain:
                     diversity = 0.0
                 print(f"Progress: {progress}, Min energy: {min_energy:.2f}, Valid: {num_valid}, Diversity: {diversity:.3f}")
 
-    def competitive_mine(self, previous_block: Block, next_requirements: NextBlockRequirements) -> Optional[MiningResult]:
+    async def competitive_mine(self, previous_block: Block, next_requirements: NextBlockRequirements) -> Optional[MiningResult]:
         """
         Run competitive mining between available nodes.
 
@@ -346,23 +347,52 @@ class QuantumBlockchain:
         """
         print("\nStarting competitive mining with Node architecture...")
 
-        # Create stop event for coordinating nodes
-        stop_event = multiprocessing.Event()
-
         # Start mining on all nodes concurrently
-        winning_result = None
-        
+        mining_tasks = []
+
         for node in self.nodes:
             print(f"Starting mining on node: {node.node_id}")
-            # Node.mine_block returns MiningResult or None
-            result = node.mine_block(previous_block, stop_event)
+            # Create async task for each node's mining
+            task = asyncio.create_task(node.mine_block(previous_block))
+            mining_tasks.append(task)
+
+        winning_result = None
+        try:
+            # Wait for the first successful result
+            done, pending = await asyncio.wait(mining_tasks, return_when=asyncio.FIRST_COMPLETED)
+
+            # Get the first completed result
+            for task in done:
+                result = await task
+                if result is not None:
+                    winning_result = result
+                    break
             
-            if result is not None:
-                winning_result = result
-                # Signal all other nodes to stop
-                stop_event.set()
-                break
-        
+            # Call stop_mining on all nodes to ensure they stop
+            for node in self.nodes:
+                await node.stop_mining()
+
+            # Wait for all remaining mining tasks to stop
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+
+        except Exception as e:
+            print(f"Error during competitive mining: {e}")
+            # Cancel all tasks on error
+            for task in mining_tasks:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+            raise
+
         if winning_result is None:
             print("❌ No mining solution found by any node")
             return None
@@ -463,8 +493,8 @@ class QuantumBlockchain:
                 print(f"Current Leader: {self.last_winner} (Streak: {self.win_streak-1})")
 
             # Call competitive mining with the block and requirements
-            result = self.competitive_mine(previous_block, next_requirements)
-            
+            result = asyncio.run(self.competitive_mine(previous_block, next_requirements))
+
             if result is None:
                 print("❌ No solution found by any miner. Cannot create block.")
                 return None
