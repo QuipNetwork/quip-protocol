@@ -1,5 +1,7 @@
 """Node class for quantum blockchain network participation."""
 
+import asyncio
+import json
 import multiprocessing
 import os
 import time
@@ -10,8 +12,9 @@ from multiprocessing.synchronize import Event as EventType
 if TYPE_CHECKING:
     pass
 
+from shared import block
 from shared.block_signer import BlockSigner
-from shared.block import Block
+from shared.block import Block, BlockHeader, MinerInfo, NextBlockRequirements
 from shared.miner import Miner, MiningResult
 
 
@@ -40,15 +43,6 @@ class Node:
         seed = blake3(secret.encode()).digest()
         self.crypto = BlockSigner(seed=seed)
 
-        # Expose public keys for network operations
-        self.ecdsa_public_key_hex = self.crypto.ecdsa_public_key_hex
-        self.wots_plus_public_key_hex = self.crypto.wots_plus_public_key_hex
-
-        # Keep backward compatibility references
-        self.ecdsa_private_key = self.crypto.ecdsa_private_key
-        self.ecdsa_public_key = self.crypto.ecdsa_public_key
-        self.wots_plus = self.crypto.wots_plus
-
         # Initialize miners based on config
         self.miners: List[Miner] = []
         self._initialize_miners(cfg=miners_config)
@@ -76,8 +70,8 @@ class Node:
         self.difficulty_reduction_factor = 0.1
 
         print(f"Node {node_id} initialized with {len(getattr(self, 'miner_handles', []))} miners:")
-        print(f"  ECDSA Public Key: {self.ecdsa_public_key_hex[:16]}...")
-        print(f"  WOTS+ Public Key: {self.wots_plus_public_key_hex[:16]}...")
+        print(f"  ECDSA Public Key: {self.crypto.ecdsa_public_key_hex[:16]}...")
+        print(f"  WOTS+ Public Key: {self.crypto.wots_plus_public_key.to_bytes().hex()[:16]}...")
         for h in getattr(self, 'miner_handles', []):
             print(f"  - {h.miner_id} ({h.miner_type})")
 
@@ -139,26 +133,6 @@ class Node:
         # Back-compat summary list for logs (do not assign to typed self.miners)
         self._summary_miners = [(h.miner_id, h.miner_type) for h in self.miner_handles]
 
-
-    def sign_block_data(self, block_data: str) -> Tuple[str, str]:
-        """Sign block data with WOTS+ and ECDSA."""
-        signature_hex, next_wots_key_hex = self.crypto.sign_block_data(block_data)
-
-        # Update local reference to new WOTS+ key
-        self.wots_plus_public_key_hex = next_wots_key_hex
-        self.wots_plus = self.crypto.wots_plus
-
-        return signature_hex, next_wots_key_hex
-
-    def generate_new_wots_key(self):
-        """Generate a new WOTS+ key pair after using the current one."""
-        self.crypto.generate_new_wots_key()
-
-        # Update local references
-        self.wots_plus = self.crypto.wots_plus
-        self.wots_plus_public_key_hex = self.crypto.wots_plus_public_key_hex
-        print(f"Node {self.node_id} generated new WOTS+ key: {self.wots_plus_public_key_hex[:16]}...")
-
     def check_and_adjust_difficulty_for_timeout(self):
         """Check if no block has been received for 30 minutes and adjust difficulty."""
         time_since_last_block = time.time() - self.last_block_received_time
@@ -182,7 +156,18 @@ class Node:
         # For persistent workers, nothing to notify here; miners read network state indirectly
         # via difficulty adjustments before next round.
 
-    def mine_block(self, previous_block: Block, stop_event: EventType) -> Optional[MiningResult]:
+    def info(self) -> MinerInfo:
+        """Get information about this node."""
+        return MinerInfo(
+            miner_id=self.node_id,
+            miner_type=f"{json.dumps(self.miners_config)}",
+            reward_address=self.crypto.ecdsa_public_key_bytes,
+            ecdsa_public_key=self.crypto.ecdsa_public_key_bytes,
+            wots_public_key=self.crypto.wots_plus_public_key.to_bytes(),
+            next_wots_public_key=self.crypto.wots_plus_public_key.to_bytes()
+        )
+
+    def mine_block(self, previous_block: Block, stop_mining: EventType) -> Optional[Block]:
         """
         Coordinate mining across all miners of this node for a block.
 
@@ -190,15 +175,14 @@ class Node:
             previous_block: Previous block (contains next block requirements)
 
         Returns:
-            MiningResult if successful, None if stopped/failed
+            Block if successful, None if stopped/failed
         """
         # Send the full previous block and its next-block requirements to miners
-        block = previous_block
         requirements = previous_block.next_block_requirements
-        handles = getattr(self, 'miner_handles', [])
+
+        handles = self.miner_handles
         if not handles:
-            print(f"Node {self.node_id}: No miners configured")
-            return None
+            raise ValueError(f"Node {self.node_id}: No miners configured")
 
 
         # Start timing
@@ -212,13 +196,13 @@ class Node:
 
         # Command all workers to start mining with full context
         for h in handles:
-            h.mine(block, requirements)
+            h.mine(previous_block, requirements)
 
         result = None
         try:
             # Wait for first result or timeout
             deadline = time.time() + self.no_block_timeout
-            while time.time() < deadline and not stop_event.is_set():
+            while time.time() < deadline and not stop_mining.is_set():
                 # Poll each handle's response queue quickly
                 for h in handles:
                     try:
@@ -230,7 +214,7 @@ class Node:
                         continue
                     if hasattr(msg, 'miner_id') and hasattr(msg, 'solutions'):
                         result = msg
-                        stop_event.set()
+                        stop_mining.set()
                         break
                     if isinstance(msg, dict) and msg.get('op') == 'error':
                         # Log or collect errors as needed
@@ -239,7 +223,7 @@ class Node:
                     break
         except KeyboardInterrupt:
             print(f"Node {self.node_id}: Mining interrupted")
-            stop_event.set()
+            stop_mining.set()
         finally:
             # Signal cancellation to all workers if result found
             if result is not None:
@@ -264,6 +248,120 @@ class Node:
             print(f"Node {self.node_id}: No solution found in {total_time:.2f}s")
 
         return result
+    
+    def build_block(self, previous_block: Block, mining_result: MiningResult, block_data: bytes):
+        """Build a block from a mining result."""
+        if previous_block.hash is None:
+            raise ValueError("Previous block hash is empty, unsigned/finalized block?")
+
+        header = block.BlockHeader(
+            previous_hash=previous_block.hash,
+            index=previous_block.header.index + 1,
+            timestamp=mining_result.timestamp,
+            data_hash=blake3(block_data).digest()
+        )
+        miner_info = self.info()
+        quantum_proof = block.QuantumProof(
+            nonce=mining_result.nonce,
+            nodes=mining_result.node_list,
+            edges=mining_result.edge_list,
+            solutions=mining_result.solutions,
+            mining_time=mining_result.mining_time,
+            energy=mining_result.energy,
+            diversity=mining_result.diversity,
+            num_valid_solutions=mining_result.num_valid
+        )
+        next_block_requirements = self.compute_next_block_requirements(previous_block, mining_result)
+        next_block = block.Block(
+            header=header,
+            miner_info=miner_info,
+            quantum_proof=quantum_proof,
+            next_block_requirements=next_block_requirements,
+            data=block_data,
+            raw=b"",
+            hash=b"",
+            signature=b""
+        )
+        next_block.finalize()
+        return next_block
+
+    def sign_block(self, block: Block):
+        """Sign a block."""
+        block.finalize()
+        block_data = block.to_network()
+        block.signature = self.crypto.sign_block_data(block_data)
+        if not self.crypto.verify_combined_signature(
+            block.miner_info.ecdsa_public_key,
+            block.miner_info.wots_public_key,
+            block_data,
+            block.signature
+        ):
+            raise ValueError("Failed to verify signature")
+        return block
+
+    def compute_next_block_requirements(self, previous_block: Block, mining_result: MiningResult) -> NextBlockRequirements:
+        """
+        Compute the next block requirements based on the previous block and mining result.
+
+        This implements difficulty adjustment logic similar to quantum_blockchain.py:
+        - If the same miner type wins consecutively, make it EASIER
+        - If a different miner type wins, make it HARDER
+
+        Args:
+            previous_block: The previous block in the chain
+            mining_result: The result from mining the current block
+
+        Returns:
+            NextBlockRequirements for the next block
+        """
+        # Get current requirements from previous block
+        prev_req = previous_block.next_block_requirements
+        if not prev_req:
+            raise ValueError("Previous block has no next block requirements")
+
+        # Extract miner type from mining result
+        current_winner = mining_result.miner_id.split('-')[1] if '-' in mining_result.miner_id else mining_result.miner_id
+
+        # Get the previous winner from the previous block's miner info
+        prev_winner = None
+        if previous_block.miner_info:
+            prev_miner_id = previous_block.miner_info.miner_id
+            prev_winner = prev_miner_id.split('-')[1] if '-' in prev_miner_id else prev_miner_id
+
+        # Base adjustment rates (similar to quantum_blockchain.py)
+        energy_adjustment_rate = 0.05  # 5% adjustment
+        diversity_adjustment_rate = 0.02  # 2% adjustment
+        solutions_adjustment_rate = 0.1  # 10% adjustment
+
+        if current_winner == prev_winner:
+            # Same miner won again - make it EASIER
+            # Higher energy threshold (less negative), lower diversity/solutions
+            new_difficulty_energy = min(-13500, prev_req.difficulty_energy * (1 + energy_adjustment_rate))
+            new_min_diversity = max(0.2, prev_req.min_diversity - diversity_adjustment_rate)
+            new_min_solutions = max(10, int(prev_req.min_solutions * (1 - solutions_adjustment_rate)))
+
+            print(f"Node {self.node_id}: Same miner type ({current_winner}) won - EASING difficulty")
+            print(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
+            print(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
+            print(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
+        else:
+            # Different miner won - make it HARDER
+            # Lower energy threshold (more negative), higher diversity/solutions
+            new_difficulty_energy = max(-15600, prev_req.difficulty_energy * (1 - energy_adjustment_rate))
+            new_min_diversity = min(0.46, prev_req.min_diversity + diversity_adjustment_rate)
+            new_min_solutions = min(100, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
+
+            print(f"Node {self.node_id}: Different miner type won ({prev_winner} -> {current_winner}) - HARDENING difficulty")
+            print(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
+            print(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
+            print(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
+
+        return NextBlockRequirements(
+            difficulty_energy=new_difficulty_energy,
+            min_diversity=new_min_diversity,
+            min_solutions=new_min_solutions,
+            timeout_to_difficulty_adjustment_decay=prev_req.timeout_to_difficulty_adjustment_decay
+        )
 
     def get_mining_summary(self) -> str:
         """Get a summary of mining statistics for this node."""
@@ -293,26 +391,11 @@ class Node:
 
     def close(self):
         """Shutdown all persistent miner workers."""
-        for h in getattr(self, 'miner_handles', []):
+        for h in self.miner_handles:
             try:
                 h.close()
             except Exception:
                 pass
-
-    def get_network_identity(self) -> dict:
-        """Get network identity information for this node."""
-        return {
-            "node_id": self.node_id,
-            "ecdsa_public_key": self.ecdsa_public_key_hex,
-            "wots_plus_public_key": self.wots_plus_public_key_hex,
-            "miners": [
-                {
-                    "miner_id": mid,
-                    "miner_type": mtype
-                }
-                for (mid, mtype) in getattr(self, '_summary_miners', [])
-            ]
-        }
 
     def get_stats(self) -> dict:
         """Aggregate stats from all miner handles."""
@@ -331,11 +414,3 @@ class Node:
             except Exception:
                 stats["miners"].append({"miner_id": h.miner_id, "miner_type": h.miner_type})
         return stats
-
-    def verify_signature(self, message: str, signature: str, public_key: str) -> bool:
-        """Verify a signature using the crypto manager."""
-        return self.crypto.verify_ecdsa_signature(
-            public_key,
-            message.encode(),
-            bytes.fromhex(signature)
-        )

@@ -151,7 +151,7 @@ def test_block_to_from_network_roundtrip():
 
 def test_block_compute_derived_fields_sets_hash_and_raw():
     blk = make_sample_block()
-    blk.compute_derived_fields()
+    blk.finalize()
     assert blk.raw == blk.to_network()[:-len(blk.signature)]
     assert blk.hash == blake3(blk.raw).digest()
 

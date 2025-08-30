@@ -6,23 +6,15 @@ import multiprocessing
 import random
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
-from pathlib import Path
-from queue import Empty as QueueEmpty
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
-import seaborn as sns
-import math
 from dotenv import load_dotenv
-from dwave.samplers import SimulatedAnnealingSampler
-from dwave.system import DWaveSampler
-from dwave.system.testing import MockDWaveSampler
 from matplotlib.patches import Patch
-from shared.block import Block, load_genesis_block, NextBlockRequirements, BlockHeader, MinerInfo, QuantumProof
-from shared.quantum_proof_of_work import calculate_diversity as _shared_diversity, calculate_hamming_distance as _shared_hamming
+from shared.block import Block, load_genesis_block, create_genesis_block, NextBlockRequirements, BlockHeader, MinerInfo, QuantumProof
+from shared.quantum_proof_of_work import calculate_diversity as _shared_diversity, calculate_hamming_distance as _shared_hamming, generate_ising_model_from_seed, ising_seed_from_block
 
 from shared.miner import MiningResult
 from shared.node import Node
@@ -68,19 +60,6 @@ class QuantumBlockchain:
             gpu_backend: 'local' (default) or 'modal'
             genesis_config_file: Path to genesis config JSON file to override defaults
         """
-        # Try to load genesis configuration to override defaults
-        try:
-            # Load genesis block using new structure
-            genesis_block = load_genesis_block(genesis_config_file)
-            if genesis_block.next_block_requirements:
-                # Override parameters from genesis config
-                base_difficulty_energy = genesis_block.next_block_requirements.difficulty_energy
-                base_min_diversity = genesis_block.next_block_requirements.min_diversity
-                base_min_solutions = genesis_block.next_block_requirements.min_solutions
-        except (FileNotFoundError, KeyError, json.JSONDecodeError):
-            # Genesis config not found or invalid, use provided defaults
-            pass
-
         self.chain: List[Block] = []
         self.competitive = competitive
         self.mining_stats = {}  # Will track all miners
@@ -92,8 +71,6 @@ class QuantumBlockchain:
         self.gpu_backend = (gpu_backend or os.getenv("QUIP_GPU_BACKEND", "local")).lower()
         self.num_gpu_miners = num_gpu_miners
         self.gpu_types = gpu_types or ['t4'] * num_gpu_miners
-
-        # Base difficulty parameters
         self.base_difficulty_energy = base_difficulty_energy
         self.base_min_diversity = base_min_diversity
         self.base_min_solutions = base_min_solutions
@@ -120,24 +97,24 @@ class QuantumBlockchain:
 
             # Create a node for QPU miners
             if self.num_qpu_miners > 0:
-                try:
-                    qpu_config = {
-                        "qpu": {"num_miners": self.num_qpu_miners}
-                    }
-                    qpu_node = Node(node_id="qpu-node", miners_config=qpu_config)
-                    self.nodes.append(qpu_node)
-                    print(f"✓ Initialized QPU node with {self.num_qpu_miners} miner(s)")
-                except Exception as e:
-                    print(f"QPU not available: {e}")
+                qpu_config = {
+                    "qpu": {"num_miners": self.num_qpu_miners}
+                }
+                qpu_node = Node(node_id="qpu-node", miners_config=qpu_config)
+                self.nodes.append(qpu_node)
+                print(f"✓ Initialized QPU node with {self.num_qpu_miners} miner(s)")
+                if self.num_qpu_miners > 1:
+                    print("WARNING: Multiple QPU miners not yet supported")
 
             # Create a node for CPU/SA miners
             if self.num_sa_miners > 0:
                 cpu_config = {
-                    "cpu": {"num_cpus": self.num_sa_miners}
+                    "cpu": {"num_cpus": 1}
                 }
-                cpu_node = Node(node_id="cpu-node", miners_config=cpu_config)
-                self.nodes.append(cpu_node)
-                print(f"✓ Initialized CPU node with {self.num_sa_miners} miner(s)")
+                for i in range(self.num_sa_miners):
+                    cpu_node = Node(node_id=f"cpu-node{i+1}", miners_config=cpu_config)
+                    self.nodes.append(cpu_node)
+                    print(f"✓ Initialized CPU node {cpu_node.node_id} with {self.num_sa_miners} miner(s)")
 
             # Create a node for GPU miners if requested
             if self.num_gpu_miners > 0:
@@ -163,6 +140,8 @@ class QuantumBlockchain:
                     gpu_node = Node(node_id="gpu-local-node", miners_config=gpu_config)
                     self.nodes.append(gpu_node)
                     print(f"✓ Initialized GPU Local node with {self.num_gpu_miners} miner(s)")
+                if self.num_gpu_miners > 1:
+                    print("WARNING: Multiple GPU miner nodes not yet supported")
 
         else:
             # Single miner mode (legacy) - create a single CPU node
@@ -184,93 +163,40 @@ class QuantumBlockchain:
         self.adaptation_interval = 5  # Adapt every 5 blocks
 
         # Create genesis block
-        self.create_genesis_block()
+        self.initialize_genesis_block(genesis_config_file)
 
-    def create_genesis_block(self) -> Block:
-        """Create the first block in the chain."""
-        # Try to load from genesis config first
-        try:
-            genesis = load_genesis_block()
-            self.chain.append(genesis)
+    def initialize_genesis_block(self, genesis_config_file: Optional[str] = None) -> Block:
+        """Initialize the genesis block for the blockchain."""
+        genesis_data = {
+            "index": 0,
+            "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": int(time.time()),
+            "data": "Genesis Block - Quip Protocol",
+            "next_block_requirements": {
+                "difficulty_energy": self.base_difficulty_energy,
+                "min_diversity": self.base_min_diversity,
+                "min_solutions": self.base_min_solutions,
+                "timeout_to_difficulty_adjustment_decay": 600
+            },
+            "quantum_proof": None,
+            "miner_info": None,
+            "signature": None
+        }
+        genesis = create_genesis_block(genesis_data)
 
-            # Initialize difficulty from genesis block requirements
-            if genesis.next_block_requirements:
-                req = genesis.next_block_requirements
-                self.base_difficulty_energy = req.difficulty_energy
-                self.base_min_diversity = req.min_diversity
-                self.base_min_solutions = req.min_solutions
+        # If a genesis config file is provided, load it instead
+        if genesis_config_file:
+            genesis = load_genesis_block(genesis_config_file)
 
-                # Set current difficulty to base
-                self.difficulty_energy = self.base_difficulty_energy
-                self.min_diversity = self.base_min_diversity
-                self.min_solutions = self.base_min_solutions
+        self.chain.append(genesis)
 
-                print(f"Genesis block loaded with next block requirements:")
-                print(f"  Difficulty Energy: {req.difficulty_energy}")
-                print(f"  Min Diversity: {req.min_diversity}")
-                print(f"  Min Solutions: {req.min_solutions}")
-                print(f"  Timeout to ease: {req.timeout_to_difficulty_adjustment_decay}s")
+        print(f"Genesis block loaded with next block requirements:")
+        print(f"  Difficulty Energy: {genesis.next_block_requirements.difficulty_energy}")
+        print(f"  Min Diversity: {genesis.next_block_requirements.min_diversity}")
+        print(f"  Min Solutions: {genesis.next_block_requirements.min_solutions}")
+        print(f"  Timeout to ease: {genesis.next_block_requirements.timeout_to_difficulty_adjustment_decay}s")
 
-            return genesis
-
-        except (FileNotFoundError, KeyError, json.JSONDecodeError) as e:
-            print(f"Could not load genesis from config: {e}")
-            print("Creating default genesis block...")
-
-            # Create next block requirements with current blockchain settings
-            next_requirements = NextBlockRequirements(
-                difficulty_energy=self.base_difficulty_energy,
-                min_diversity=self.base_min_diversity,
-                min_solutions=self.base_min_solutions,
-                timeout_to_difficulty_adjustment_decay=600  # 10 minutes in seconds
-            )
-
-            # Create basic header with data hash (will be updated after block creation)
-            genesis_data = "Genesis Block - Quip Protocol"
-            data_hash = blake3(genesis_data.encode()).digest()
-            
-            header = BlockHeader(
-                previous_hash=b"0" * 32,  # 32 bytes of zeros for genesis
-                index=0,
-                timestamp=int(time.time()),
-                data_hash=data_hash
-            )
-
-            # Create dummy miner info for genesis block (system genesis)
-            genesis_miner_info = MinerInfo(
-                miner_id="genesis-system",
-                miner_type="SYSTEM",
-                reward_address=b"0" * 33,  # Dummy address
-                ecdsa_public_key=b"0" * 33,  # Dummy key
-                wots_public_key=b"0" * 32,  # Dummy key  
-                next_wots_public_key=b"0" * 32  # Dummy key
-            )
-            
-            # Create dummy quantum proof for genesis block
-            genesis_quantum_proof = QuantumProof(
-                nonce=0,
-                solutions=[],  # No solutions needed for genesis
-                mining_time=0.0,
-                node_list=[],  # No topology for genesis
-                edge_list=[]   # No topology for genesis
-            )
-            
-            # Create genesis block with new structure
-            genesis = Block(
-                header=header,
-                miner_info=genesis_miner_info,
-                quantum_proof=genesis_quantum_proof,
-                next_block_requirements=next_requirements,
-                data=genesis_data,
-                raw=b"",  # Will be computed
-                hash=b"",  # Will be computed
-                signature=b""  # Will be computed
-            )
-            
-            # Compute derived fields
-            genesis.compute_derived_fields()
-            self.chain.append(genesis)
-            return genesis
+        return genesis
 
     def get_latest_block(self) -> Block:
         """Get the most recent block in the chain."""
@@ -330,8 +256,6 @@ class QuantumBlockchain:
             diversity: Average Hamming distance between solutions
             num_valid: Number of valid solutions
         """
-        # Use consistent block header format: f"{previous_hash}{index}{timestamp}{data}"
-        block_header = f"{block.previous_hash}{block.index}{block.timestamp}{block.data}"
         progress = 0  # Progress counter for logging
         # Test/CI knobs
         reads = int(os.getenv("QUIP_MINING_NUM_READS", "100"))
@@ -363,7 +287,8 @@ class QuantumBlockchain:
                 return nonce, [], float("inf"), 0.0, 0
 
             # Generate quantum model
-            h, J = self.generate_quantum_model(block_header, nonce)
+            seed = ising_seed_from_block(block.header.previous_hash, block.header.timestamp, block.header.index, nonce)
+            h, J = generate_ising_model_from_seed(seed, block.quantum_proof.nodes, block.quantum_proof.edges)
 
             print(f"Num QPU: {self.num_qpu_miners}, Num SA: {self.num_sa_miners}, Num GPU: {self.num_gpu_miners}")
 
@@ -522,7 +447,7 @@ class QuantumBlockchain:
             miner_info=placeholder_miner_info,
             quantum_proof=placeholder_quantum_proof,
             next_block_requirements=next_requirements,
-            data=data,
+            data=data.encode(),
             raw=b"",
             hash=b"",
             signature=b""
@@ -569,22 +494,19 @@ class QuantumBlockchain:
             if winning_node is None:
                 print(f"⚠️  Warning: Could not find winning node for miner {result.miner_id}")
                 # Use placeholder values
-                winning_node_info = {
-                    'ecdsa_public_key_hex': '0' * 66,
-                    'wots_plus_public_key_hex': '0' * 64
-                }
+                winning_node_info = MinerInfo(
+                    miner_id="unknown",
+                    miner_type="unknown",
+                    reward_address=b"0" * 32,
+                    ecdsa_public_key=b"0" * 64,
+                    wots_public_key=b"0" * 64,
+                    next_wots_public_key=b"0" * 64
+                )
             else:
-                winning_node_info = winning_node.get_network_identity()
+                winning_node_info = winning_node.info()
             
             # Update miner info
-            new_block.miner_info = MinerInfo(
-                miner_id=result.miner_id,
-                miner_type=result.miner_type,
-                reward_address=bytes.fromhex(winning_node_info.get('ecdsa_public_key', '0'*66)),
-                ecdsa_public_key=bytes.fromhex(winning_node_info.get('ecdsa_public_key', '0'*66)),
-                wots_public_key=bytes.fromhex(winning_node_info.get('wots_plus_public_key', '0'*64)),
-                next_wots_public_key=bytes.fromhex(winning_node_info.get('wots_plus_public_key', '0'*64))  # Simplified for now
-            )
+            new_block.miner_info = winning_node_info
             
             # Sign the block using the winning node
             if winning_node:
@@ -594,7 +516,7 @@ class QuantumBlockchain:
                 new_block.signature = b"no_signature"
             
             # Compute derived fields and add to chain
-            new_block.compute_derived_fields()
+            new_block.finalize()
             self.chain.append(new_block)
             return new_block
         else:
@@ -612,8 +534,8 @@ class QuantumBlockchain:
             new_block.energy = energy
             new_block.diversity = diversity
             new_block.num_valid_solutions = num_valid
-            new_block.miner_type = "SA"  # Legacy mode uses SA
-            new_block.mining_time = time.time() - start_time
+            new_block.miner_info.miner_type = "SA"  # Legacy mode uses SA
+            new_block.quantum_proof.mining_time = time.time() - start_time
 
             print(f"Block mined! Nonce: {nonce}, Energy: {energy:.2f}, Diversity: {diversity:.3f}, Valid solutions: {num_valid}, Time: {new_block.mining_time:.2f}s")
 
@@ -650,30 +572,30 @@ class QuantumBlockchain:
     def print_chain(self):
         """Print the blockchain."""
         for block in self.chain:
-            print(f"\nBlock {block.index}:")
-            print(f"  Timestamp: {block.timestamp}")
+            print(f"\nBlock {block.header.index}:")
+            print(f"  Timestamp: {block.header.timestamp}")
             print(f"  Data: {block.data}")
-            print(f"  Previous Hash: {block.previous_hash[:16]}...")
+            print(f"  Previous Hash: {block.header.previous_hash[:16]}...")
             print(f"  Hash: {block.hash[:16]}...")
-            print(f"  Nonce: {block.nonce}")
+            print(f"  Nonce: {block.quantum_proof.nonce}")
             if block.energy is not None:
                 print(f"  Quantum Energy: {block.energy:.2f}")
                 print(f"  Diversity: {block.diversity:.3f}")
                 print(f"  Valid Solutions: {block.num_valid_solutions}")
-                if block.miner_id:
-                    print(f"  Miner: {block.miner_id} ({block.miner_type})")
-                    print(f"  Mining Time: {block.mining_time:.2f}s")
-                elif block.miner_type:
-                    print(f"  Miner: {block.miner_type}")
-                    print(f"  Mining Time: {block.mining_time:.2f}s")
+                if block.miner_info.miner_id:
+                    print(f"  Miner: {block.miner_info.miner_id} ({block.miner_info.miner_type})")
+                    print(f"  Mining Time: {block.quantum_proof.mining_time:.2f}s")
+                elif block.miner_info.miner_type:
+                    print(f"  Miner: {block.miner_info.miner_type}")
+                    print(f"  Mining Time: {block.quantum_proof.mining_time:.2f}s")
             if block.signature:
                 print(f"  Signature: {block.signature[:32]}...")
-            if block.reward_address:
-                print(f"  Reward Address: {block.reward_address[:16]}...")
-            if block.miner_ecdsa_public_key:
-                print(f"  ECDSA Public Key: {block.miner_ecdsa_public_key[:16]}...")
-            if block.miner_wots_plus_public_key:
-                print(f"  WOTS+ Public Key: {block.miner_wots_plus_public_key[:16]}...")
+            if block.miner_info.reward_address:
+                print(f"  Reward Address: {block.miner_info.reward_address[:16]}...")
+            if block.miner_info.ecdsa_public_key:
+                print(f"  ECDSA Public Key: {block.miner_info.ecdsa_public_key[:16]}...")
+            if block.miner_info.wots_public_key:
+                print(f"  WOTS+ Public Key: {block.miner_info.wots_public_key[:16]}...")
 
     def print_competitive_summary(self):
         """Print competitive mining summary."""
@@ -1468,7 +1390,6 @@ def run_blockchain(args):
 
 def main():
     """Demonstrate quantum blockchain."""
-
     parser = argparse.ArgumentParser(description='Quantum Blockchain Demo')
     parser.add_argument('--competitive', action='store_true',
                        help='Run competitive mining between QPU and SA miners')
@@ -1487,16 +1408,8 @@ def main():
                        help='Local GPU device list (e.g., 0 1 for CUDA; "mps" for Apple Metal). If omitted, autodetect.')
     parser.add_argument('--blocks', type=int, default=20,
                        help='Number of blocks to mine (default: 20)')
-
     args = parser.parse_args()
-
-    # Only use Modal when explicitly requested via backend selection
-    backend = (args.gpu_backend or os.getenv("QUIP_GPU_BACKEND", "local")).lower()
-    if args.num_gpu > 0 and backend == 'modal' and GPU_AVAILABLE:
-        with gpu_app.run():
-            run_blockchain(args)
-    else:
-        run_blockchain(args)
+    run_blockchain(args)
 
 
 if __name__ == "__main__":

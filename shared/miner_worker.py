@@ -114,19 +114,14 @@ class MinerHandle:
 
     def get_stats(self) -> dict:
         self.req.put({"op": "get_stats"})
-        try:
-            msg = self.resp.get(timeout=2.0)
-            if isinstance(msg, dict) and msg.get("op") == "stats":
-                return msg.get("data", {})
-        except Exception:
-            pass
-        return {"miner_id": self.miner_id, "miner_type": self.miner_type}
+        msg = self.resp.get(timeout=2.0)
+        if isinstance(msg, dict) and msg.get("op") == "stats":
+            return msg.get("data", {})
+        else:
+            raise ValueError(f"Miner {self.miner_id} did not respond to get_stats: {msg}")
 
     def close(self):
-        try:
-            self.req.put({"op": "shutdown"})
-        except Exception:
-            pass
+        self.req.put({"op": "shutdown"})
         try:
             if self.proc.is_alive():
                 self.proc.join(timeout=2)

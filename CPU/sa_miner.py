@@ -59,8 +59,20 @@ class SimulatedAnnealingMiner(BaseMiner):
         print(f"{self.miner_id} adaptive params: {params}")
         
         # Get topology information from sampler
-        nodes = self.sampler.nodelist
-        edges = self.sampler.edgelist
+        # NOTE: these are of type List[Variable], which we can't change, but AFAICT they are always ints.
+        #.      it might be the case they are floats or something strange one day.
+        nodes = []
+        for node in self.sampler.nodelist:
+            if not isinstance(node, int):
+                raise ValueError(f"Expected node index to be int, got {type(node)}")
+            nodes.append(int(node))
+        edges = []
+        for edge in self.sampler.edgelist:
+            if not isinstance(edge, tuple) or len(edge) != 2:
+                raise ValueError(f"Expected edge to be tuple of length 2, got {edge}")
+            if not isinstance(edge[0], int) or not isinstance(edge[1], int):
+                raise ValueError(f"Expected edge indices to be int, got {type(edge[0])} and {type(edge[1])}")
+            edges.append((int(edge[0]), int(edge[1])))
         
         while self.mining and not stop_event.is_set():
             # Check if we should stop before generating model
@@ -104,16 +116,6 @@ class SimulatedAnnealingMiner(BaseMiner):
                     'num_reads': num_reads,
                     'num_sweeps': num_sweeps
                 }
-                
-                # Only add beta parameters for actual SimulatedAnnealingSampler
-                # MockDWaveSampler doesn't support these parameters
-                if hasattr(self.sampler, 'sampler_type') and self.sampler.sampler_type == 'mock':
-                    # MockDWaveSampler - don't add beta parameters
-                    pass
-                else:
-                    # Actual SimulatedAnnealingSampler - add beta parameters
-                    sampling_params['beta_range'] = params.get('beta_range', [0.1, 10.0])
-                    sampling_params['beta_schedule_type'] = params.get('beta_schedule', 'geometric')
                 
                 sampleset = self.sampler.sample_ising(**sampling_params)
                 sample_time = time.time() - sample_start
@@ -179,6 +181,7 @@ class SimulatedAnnealingMiner(BaseMiner):
                         miner_id=self.miner_id,
                         miner_type=self.miner_type,
                         nonce=nonce,
+                        timestamp=timestamp,
                         solutions=filtered_solutions,
                         energy=min_energy,
                         diversity=final_diversity,
@@ -214,20 +217,13 @@ def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutio
     difficulty_factor = abs(difficulty_energy) / 1000.0  # Base around -1000
 
     # Simulated Annealing parameters
-    base_sweeps = 512
-    num_sweeps = int(base_sweeps * (difficulty_factor ** 1.8))  # Exponential scaling
-    num_reads = max(int(min_solutions) * 3, 100)  # At least 3x required solutions
+    base_sweeps = 32
+    num_sweeps = int(base_sweeps * (difficulty_factor ** 1.5))  # Exponential scaling
+    num_reads = max(int(min_solutions) * 3, 32)  # At least 3x required solutions
 
-    # Beta schedule adjustment for harder problems
-    if difficulty_factor > 10:  # Very hard problems
-        beta_range = [0.05, 15.0]  # Wider exploration
-    else:
-        beta_range = [0.1, 10.0]   # Standard range
-
+    # NOTE: beta_range and beta_schedule are not used by the structured sampler
     return {
-        'num_sweeps': max(256, min(num_sweeps, 32768)),  # Reasonable bounds
-        'num_reads': max(64, min(num_reads, 1000)),      # Reasonable bounds
-        'beta_range': beta_range,
-        'beta_schedule': 'geometric'
+        'num_sweeps': max(32, min(num_sweeps, 32768)),  # Reasonable bounds
+        'num_reads': max(32, min(num_reads, 1000)),      # Reasonable bounds
     }
 

@@ -1,5 +1,6 @@
 """Block signing utilities for quantum blockchain."""
 
+import hashlib
 import os
 from blake3 import blake3
 from typing import Tuple, List, Optional
@@ -51,14 +52,24 @@ class BlockSigner:
 
         # Generate initial WOTS+ key pair using hashsigs with keccak
         # WOTS+ requires a 32-byte private seed; if seed provided, reuse it; otherwise generate 32 bytes.
-        wots_seed = seed if len(seed) == 32 else os.urandom(32)
+        self.wots_seed = seed if len(seed) == 32 else os.urandom(32)
         keccak_hash = lambda data: blake3(data).digest()
         self.wots_plus = hashsigs.WOTSPlus(keccak_hash)
-        self.wots_plus_public_key, self.wots_plus_private_key = self.wots_plus.generate_key_pair(wots_seed)
-        self.wots_plus_public_key_hex = self.wots_plus_public_key.to_bytes().hex()
-        self.wots_plus_used = False
+        self.wots_plus_public_key, self.wots_plus_private_key = self.wots_plus.generate_key_pair(self.wots_seed)
+
+        self.next_wots_seed = blake3(self.wots_seed).digest()
+        self.next_wots_plus_public_key, self.next_wots_plus_private_key = self.wots_plus.generate_key_pair(self.next_wots_seed)
     
-    def sign_block_data(self, block_data: str) -> Tuple[str, str]:
+    # FIXME: Because we need to sign lots of candidate messages before iterating our key we need to switch
+    #.       either to an XMSS system, SPHINCS, etc for this to be secure.
+    def iterate_wots_key(self):
+        """Iterate to the next WOTS+ key pair."""
+        self.wots_seed = self.next_wots_seed
+        self.wots_plus_public_key, self.wots_plus_private_key = self.next_wots_plus_public_key, self.next_wots_plus_private_key
+        self.next_wots_seed = blake3(self.wots_seed).digest()
+        self.next_wots_plus_public_key, self.next_wots_plus_private_key = self.wots_plus.generate_key_pair(self.next_wots_seed)
+    
+    def sign_block_data(self, block_data: bytes) -> bytes:
         """Sign block data with both WOTS+ and ECDSA, generate new WOTS+ key.
 
         Args:
@@ -67,40 +78,22 @@ class BlockSigner:
         Returns:
             Tuple of (combined_signature_hex, next_wots_public_key_hex)
         """
-        # Check if WOTS+ key has been used
-        if self.wots_plus_used:
-            raise ValueError("WOTS+ key already used! Generate new key.")
-        self.wots_plus_used = True
-
         # Hash the message with keccak256 and sign with WOTS+
-        message_hash = blake3(block_data.encode()).digest()
+        # FIXME: this is a hack as the hashsigs library doesn't do the hashing for us when it should.
+        message_hash = blake3(block_data).digest()
         wots_signature = self.wots_plus.sign(self.wots_plus_private_key, message_hash)
 
         # Sign with ECDSA
         ecdsa_signature = self.ecdsa_private_key.sign(
-            block_data.encode(),
+            block_data,
             ec.ECDSA(hashes.SHA256())
         )
-
-        # Generate new WOTS+ key pair for next block (one-time signature)
-        self.generate_new_wots_key()
-        next_wots_key_hex = self.wots_plus_public_key_hex
-
         # Combine signatures
-        combined_signature = wots_signature.hex() + ecdsa_signature.hex()
+        combined_signature = ecdsa_signature + wots_signature 
 
-        return combined_signature, next_wots_key_hex
+        return combined_signature
 
-    def generate_new_wots_key(self):
-        """Generate a new WOTS+ key pair after using the current one."""
-        seed = os.urandom(32)
-        keccak_hash = lambda data: blake3(data).digest()
-        self.wots_plus = hashsigs.WOTSPlus(keccak_hash)
-        self.wots_plus_public_key, self.wots_plus_private_key = self.wots_plus.generate_key_pair(seed)
-        self.wots_plus_public_key_hex = self.wots_plus_public_key.to_bytes().hex()
-        self.wots_plus_used = False
-
-    def verify_ecdsa_signature(self, public_key_hex: str, message: bytes, signature: bytes) -> bool:
+    def verify_ecdsa_signature(self, ecdsa_public_key: bytes, message: bytes, signature: bytes) -> bool:
         """Verify an ECDSA signature.
         
         Args:
@@ -113,10 +106,9 @@ class BlockSigner:
         """
         try:
             # Convert hex public key back to EC public key object
-            public_key_bytes = bytes.fromhex(public_key_hex)
             public_key = ec.EllipticCurvePublicKey.from_encoded_point(
                 ec.SECP256K1(),
-                public_key_bytes
+                ecdsa_public_key
             )
             
             # Verify signature
@@ -129,7 +121,7 @@ class BlockSigner:
         except Exception:
             return False
     
-    def verify_wots_signature(self, public_key_hex: str, message: bytes, signature_hex: str) -> bool:
+    def verify_wots_signature(self, wots_public_key: bytes, message: bytes, signature: bytes) -> bool:
         """Verify a WOTS+ signature using hashsigs with keccak.
 
         Args:
@@ -141,25 +133,18 @@ class BlockSigner:
             True if signature is valid, False otherwise
         """
         try:
-            public_key_bytes = bytes.fromhex(public_key_hex)
-            signature_bytes = bytes.fromhex(signature_hex)
-
-            # Create WOTSPlus instance for verification with keccak
-            keccak_hash = lambda data: blake3(data).digest()
-            wots_plus = hashsigs.WOTSPlus(keccak_hash)
-
-            # Reconstruct public key from bytes
-            public_key = hashsigs.PublicKey.from_bytes(public_key_bytes)
+            public_key = hashsigs.PublicKey.from_bytes(wots_public_key)
             if public_key is None:
-                return False
-
+                raise ValueError("Invalid WOTS+ public key")
+            
             # Hash the message with keccak (same as in sign method)
+            # FIXME: should not need to do this...
             message_hash = blake3(message).digest()
-            return wots_plus.verify(public_key, message_hash, signature_bytes)
+            return self.wots_plus.verify(public_key, message_hash, signature)
         except Exception:
             return False
     
-    def verify_combined_signature(self, block_data: dict) -> bool:
+    def verify_combined_signature(self, ecdsa_public_key: bytes, wots_public_key: bytes, message: bytes, signature: bytes) -> bool:
         """Verify the combined WOTS+ and ECDSA signatures in a block.
 
         Args:
@@ -168,21 +153,6 @@ class BlockSigner:
         Returns:
             True if all signatures are valid, False otherwise
         """
-        if 'signature' not in block_data or not block_data['signature']:
-            return False
-
-        try:
-            # Extract signature components (combined as wots+ecdsa)
-            combined_sig = block_data['signature']
-
-            # In production, would properly parse and verify both signatures
-            # For now, check basic validity
-            if len(combined_sig) < 128:  # Minimum expected length
-                return False
-
-            # In production, would reconstruct the signed message and verify signatures
-            # For now, just return True for basic validity check
-            return True
-
-        except Exception:
-            return False
+        ecdsa_signature = signature[:64]
+        wots_signature = signature[64:]
+        return self.verify_ecdsa_signature(ecdsa_public_key, message, ecdsa_signature) and self.verify_wots_signature(wots_public_key, message, wots_signature)

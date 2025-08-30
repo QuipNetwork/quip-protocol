@@ -302,22 +302,26 @@ class Block:
     quantum_proof: QuantumProof
     next_block_requirements: NextBlockRequirements
 
-    data: str  # Arbitrary data, eventually a merkle tree most likely.
+    data: bytes  # Arbitrary data, eventually a merkle tree most likely.
+
+    # NOTE: Maybe move this to a separate "NetworkBlock" class which returns
+    #       Block, BlockHash, Signature on parse. 
+    #      For now, we keep this coupled, but it is usually a not great idea to 
+    #      couple signatures to the data they sign, network serialization, etc.
 
     # Computed Fields
     # Everything except the signature.
-    raw: bytes
+    raw: Optional[bytes]
     # Network hash (hash of the actual serialized network bytes)
-    hash: bytes
+    hash: Optional[bytes]
     # signature bytes
-    signature: bytes
+    signature: Optional[bytes]
 
     def to_network(self) -> bytes:
-        """Serialize to binary format, excluding derived fields (raw, hash)."""
-        def write_string(data: str) -> bytes:
-            utf8_bytes = data.encode('utf-8')
-            return struct.pack('!I', len(utf8_bytes)) + utf8_bytes
-
+        """Serialize to binary format, excluding derived fields (raw, hash).
+        External to this class, yous should only call this after finalization
+        (compute_hash) and signature is added.
+        """
         def write_bytes(data: bytes) -> bytes:
             return struct.pack('!I', len(data)) + data
 
@@ -326,8 +330,9 @@ class Block:
         result += self.miner_info.to_network()
         result += self.quantum_proof.to_network()
         result += self.next_block_requirements.to_network()
-        result += write_string(self.data)
-        result += write_bytes(self.signature)
+        result += write_bytes(self.data)
+        if self.signature: 
+            result += write_bytes(self.signature)
         return result
 
     @classmethod
@@ -374,17 +379,14 @@ class Block:
         offset += req_size
 
         # Read data and signature
-        block_data, offset = read_string(data, offset)
-        signature, offset = read_bytes(data, offset)
+        block_data, offset = read_bytes(data, offset)
 
         # Validate the block data is well formed.
         # TODO: Do this at the top of the function with a static signature size.
         header_block_data_hash = header.data_hash
-        raw_data = data[len(header_data):-len(signature)]
-        if blake3(raw_data).digest() != header_block_data_hash:
+        actual_data_hash = blake3(block_data).digest()
+        if actual_data_hash != header_block_data_hash:
             raise ValueError("Data hash mismatch")
-
-        #TODO: Validate the signature either here or in computed fields.
 
         # Create block with placeholder values for derived fields
         block = cls(
@@ -393,27 +395,36 @@ class Block:
             quantum_proof=quantum_proof,
             next_block_requirements=next_block_requirements,
             data=block_data,
-            raw=b'',  # Will be computed
-            hash=b'',  # Will be computed
-            signature=signature
+            raw=None,  # Will be computed
+            hash=None,  # Will be computed
+            signature=None  # Will be computed
         )
 
         # Compute derived fields
-        block.compute_derived_fields()
+        block.finalize()
+
+        signature, offset = read_bytes(data, offset)
+        block.signature = signature
 
         return block
 
-    def compute_derived_fields(self):
-        """Compute derived fields (raw, hash)."""
-        # Set raw to the network serialization
-        self.raw = self.to_network()[:-len(self.signature)]
-
-        # Compute hash from raw bytes
-        self.hash = blake3(self.raw).digest()
+    def finalize(self):
+        """Compute derived fields (raw, hash, etc) so the block can be signed."""
+        if self.signature:
+            raise ValueError("Block already signed")
 
         # Compute derived fields for quantum proof
         if self.quantum_proof:
             self.quantum_proof.compute_derived_fields(self.next_block_requirements, self)
+
+        # Compute data hash (TBD merkle tree..)
+        self.header.data_hash = blake3(self.data).digest()
+
+        # Set raw to the network serialization
+        self.raw = self.to_network()
+
+        # Compute hash from raw bytes
+        self.hash = blake3(self.raw).digest()
 
     def validate_block(self, previous_block: 'Block') -> bool:
         """Validate this block against the previous block requirements.
@@ -506,21 +517,14 @@ class Block:
 
         return sum(distances) / len(distances) if distances else 0.0
 
-    def compute_and_set_network_hash(self) -> bytes:
-        """Compute network hash from serialized bytes and store it."""
-        self.compute_derived_fields()
-        return self.hash
 
 
 
-
-
-def load_genesis_block(config_file: Optional[str] = None) -> 'Block':
+def load_genesis_block(genesis_block_filepath: str) -> 'Block':
     """Load genesis block from a JSON file.
 
     Args:
-        config_file: Path to genesis config file. If None, defaults to genesis_block.json
-
+        genesis_block_filepath: Path to genesis config file.
     Returns:
         Genesis Block object
 
@@ -529,21 +533,12 @@ def load_genesis_block(config_file: Optional[str] = None) -> 'Block':
         KeyError: If required configuration keys are missing
         json.JSONDecodeError: If JSON is malformed
     """
-    if config_file is None:
-        config_path = Path(__file__).parent.parent / "genesis_block.json"
-    else:
-        config_path = Path(config_file)
-        if not config_path.is_absolute():
-            config_path = Path(__file__).parent.parent / config_file
-
-    if not config_path.exists():
-        raise FileNotFoundError(f"Genesis configuration not found: {config_path}")
-
+    config_path = Path(genesis_block_filepath)
     with open(config_path, 'r') as f:
         genesis_data = json.load(f)
 
-    # Parse the genesis block using our new parsing functions
-    genesis_block = parse_block_json(genesis_data)
+    # Use create_genesis_block to parse and validate the data
+    genesis_block = create_genesis_block(genesis_data)
 
     print(f"Loaded genesis block from: {config_path.name}")
     # Note: adaptive_parameters not available in current NextBlockRequirements structure
@@ -552,12 +547,41 @@ def load_genesis_block(config_file: Optional[str] = None) -> 'Block':
     return genesis_block
 
 
+def create_genesis_block(genesis_data: Optional[dict] = None) -> Block:
+    """Create the genesis block for the blockchain.
 
+    Uses parse_block_json to create and validate the genesis block from the provided data.
+    If no data is provided, creates a default genesis block.
 
+    Args:
+        genesis_data: Dictionary containing genesis block configuration. If None, creates default.
 
+    Returns:
+        Genesis Block object
+    """
+    if genesis_data is not None:
+        # Use parse_block_json to create the block from the provided data
+        return parse_block_json(genesis_data)
 
+    # Create default genesis block data
+    default_genesis_data = {
+        "index": 0,
+        "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "timestamp": int(time.time()),
+        "data": "Genesis Block - Quip Protocol",
+        "next_block_requirements": {
+            "difficulty_energy": -1000.0,
+            "min_diversity": 0.28,
+            "min_solutions": 10,
+            "timeout_to_difficulty_adjustment_decay": 600
+        },
+        "quantum_proof": None,
+        "miner_info": None,
+        "signature": None
+    }
 
-
+    # Use parse_block_json to create and validate the default genesis block
+    return parse_block_json(default_genesis_data)
 
 
 def parse_block_json(block_data: dict) -> Block:
@@ -672,7 +696,7 @@ def parse_block_json(block_data: dict) -> Block:
         miner_info=miner_info,
         quantum_proof=quantum_proof,
         next_block_requirements=requirements,
-        data=block_data['data'],
+        data=block_data['data'].encode(),
         raw=b'',  # Will be computed
         hash=b'',  # Will be computed
         signature=signature_bytes
@@ -687,7 +711,7 @@ def parse_block_json(block_data: dict) -> Block:
         block.num_valid_solutions = block_data['num_valid_solutions']
 
     # Compute network hash from binary serialization
-    block.compute_and_set_network_hash()
+    block.finalize()
 
     return block
 
