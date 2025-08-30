@@ -88,7 +88,7 @@ class Node:
 
         print(f"Node {node_id} initialized with {len(getattr(self, 'miner_handles', []))} miners:")
         print(f"  ECDSA Public Key: {self.crypto.ecdsa_public_key_hex[:16]}...")
-        print(f"  WOTS+ Public Key: {self.crypto.wots_plus_public_key.to_bytes().hex()[:16]}...")
+        print(f"  WOTS+ Public Key: {self.crypto.wots_plus_public_key.hex()[:16]}...")
         for h in getattr(self, 'miner_handles', []):
             print(f"  - {h.miner_id} ({h.miner_type})")
 
@@ -277,8 +277,8 @@ class Node:
             miner_type=f"{json.dumps(self.miners_config)}",
             reward_address=self.crypto.ecdsa_public_key_bytes,
             ecdsa_public_key=self.crypto.ecdsa_public_key_bytes,
-            wots_public_key=self.crypto.wots_plus_public_key.to_bytes(),
-            next_wots_public_key=self.crypto.wots_plus_public_key.to_bytes()
+            wots_public_key=self.crypto.wots_plus_public_key,
+            next_wots_public_key=self.crypto.wots_plus_public_key
         )
 
     async def mine_block(self, previous_block: Block) -> Optional[Block]:

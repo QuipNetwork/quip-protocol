@@ -91,6 +91,9 @@ class QuantumBlockchain:
         self.diversity_adjustment_rate = 0.01  # 2% easier per consecutive win
         self.solutions_adjustment_rate = 0.1  # 10% fewer solutions required
 
+        # Create genesis block
+        self.initialize_genesis_block(genesis_config_file)
+
         if competitive:
             # Initialize nodes with different miner configurations
             self.nodes = []
@@ -163,9 +166,6 @@ class QuantumBlockchain:
         self.last_adaptation_block = 0
         self.adaptation_interval = 5  # Adapt every 5 blocks
 
-        # Create genesis block
-        self.initialize_genesis_block(genesis_config_file)
-
     def initialize_genesis_block(self, genesis_config_file: Optional[str] = None) -> Block:
         """Initialize the genesis block for the blockchain."""
         genesis_data = {
@@ -196,6 +196,13 @@ class QuantumBlockchain:
         print(f"  Min Diversity: {genesis.next_block_requirements.min_diversity}")
         print(f"  Min Solutions: {genesis.next_block_requirements.min_solutions}")
         print(f"  Timeout to ease: {genesis.next_block_requirements.timeout_to_difficulty_adjustment_decay}s")
+
+        self.base_difficulty_energy = genesis.next_block_requirements.difficulty_energy
+        self.base_min_diversity = genesis.next_block_requirements.min_diversity
+        self.base_min_solutions = genesis.next_block_requirements.min_solutions
+        self.difficulty_energy = genesis.next_block_requirements.difficulty_energy
+        self.min_diversity = genesis.next_block_requirements.min_diversity
+        self.min_solutions = genesis.next_block_requirements.min_solutions
 
         return genesis
 
@@ -346,6 +353,7 @@ class QuantumBlockchain:
             Mining result from the winning miner, or None if no solution found
         """
         print("\nStarting competitive mining with Node architecture...")
+        print(f"Current Difficulty: Energy < {self.difficulty_energy:.1f}, Diversity >= {self.min_diversity:.2f}, Solutions >= {self.min_solutions}")
 
         # Start mining on all nodes concurrently
         mining_tasks = []
@@ -443,52 +451,11 @@ class QuantumBlockchain:
             timeout_to_difficulty_adjustment_decay=600  # 10 minutes in seconds
         )
 
-        # Create data hash for header
-        data_hash = blake3(data.encode()).digest()
-        
-        # Create header with proper structure
-        header = BlockHeader(
-            previous_hash=previous_block.hash,
-            index=previous_block.header.index + 1,
-            timestamp=int(time.time()),
-            data_hash=data_hash
-        )
-
-        # Create placeholder miner info and quantum proof (will be updated after mining)
-        placeholder_miner_info = MinerInfo(
-            miner_id="placeholder",
-            miner_type="PLACEHOLDER",
-            reward_address=b"0" * 33,
-            ecdsa_public_key=b"0" * 33,
-            wots_public_key=b"0" * 32,
-            next_wots_public_key=b"0" * 32
-        )
-        
-        placeholder_quantum_proof = QuantumProof(
-            nonce=0,
-            solutions=[],
-            mining_time=0.0,
-            nodes=[],
-            edges=[]
-        )
-        
-        new_block = Block(
-            header=header,
-            miner_info=placeholder_miner_info,
-            quantum_proof=placeholder_quantum_proof,
-            next_block_requirements=next_requirements,
-            data=data.encode(),
-            raw=b"",
-            hash=b"",
-            signature=b""
-        )
-
         if self.competitive:
             # Competitive mining
             print(f"\n{'='*60}")
-            print(f"COMPETITIVE MINING - Block {new_block.header.index}")
+            print(f"COMPETITIVE MINING - Block {previous_block.header.index + 1}")
             print(f"{'='*60}")
-            print(f"Current Difficulty: Energy < {self.difficulty_energy:.1f}, Diversity >= {self.min_diversity:.2f}, Solutions >= {self.min_solutions}")
             if self.last_winner and self.win_streak > 1:
                 print(f"Current Leader: {self.last_winner} (Streak: {self.win_streak-1})")
 
@@ -498,16 +465,6 @@ class QuantumBlockchain:
             if result is None:
                 print("❌ No solution found by any miner. Cannot create block.")
                 return None
-            
-            # Update block with mining result
-            # Update quantum proof
-            new_block.quantum_proof = QuantumProof(
-                nonce=result.nonce,
-                solutions=result.solutions,
-                mining_time=result.mining_time,
-                nodes=result.node_list,
-                edges=result.edge_list
-            )
             
             # Find the node that won to get miner info
             winning_node = None
@@ -522,33 +479,14 @@ class QuantumBlockchain:
                     break
             
             if winning_node is None:
-                print(f"⚠️  Warning: Could not find winning node for miner {result.miner_id}")
-                # Use placeholder values
-                winning_node_info = MinerInfo(
-                    miner_id="unknown",
-                    miner_type="unknown",
-                    reward_address=b"0" * 32,
-                    ecdsa_public_key=b"0" * 64,
-                    wots_public_key=b"0" * 64,
-                    next_wots_public_key=b"0" * 64
-                )
-            else:
-                winning_node_info = winning_node.info()
+                raise ValueError(f"⚠️  Warning: Could not find winning node for miner {result.miner_id}")
+
+            winning_block = winning_node.build_block(previous_block, result, data.encode())
+            winning_block = winning_node.sign_block(winning_block)
+            for node in self.nodes:
+                node.receive_block(winning_block)
             
-            # Update miner info
-            new_block.miner_info = winning_node_info
-            new_block.finalize()
-            
-            # Sign the block using the winning node
-            if winning_node:
-                # For now, use placeholder signature - proper signing would require node integration
-                new_block.signature = b"placeholder_signature"
-            else:
-                new_block.signature = b"no_signature"
-            
-            # Compute derived fields and add to chain
-            self.chain.append(new_block)
-            return new_block
+            return winning_block
         else:
             # Single miner mode (legacy)
             print(f"\nMining block {new_block.header.index}...")
@@ -1306,6 +1244,7 @@ def run_blockchain(args):
             gpu_types=args.gpu_types,
             gpu_devices=args.gpu_devices,
             gpu_backend=args.gpu_backend,
+            genesis_config_file=args.genesis_config
         )
 
         # Names in alphabetical order
@@ -1397,7 +1336,8 @@ def run_blockchain(args):
                                        num_gpu_miners=args.num_gpu,
                                        gpu_types=args.gpu_types,
                                        gpu_devices=args.gpu_devices,
-                                       gpu_backend=args.gpu_backend)
+                                       gpu_backend=args.gpu_backend,
+                                       genesis_config_file=args.genesis_config)
 
         # Add some blocks
         transactions = [
@@ -1437,6 +1377,8 @@ def main():
                        help='Local GPU device list (e.g., 0 1 for CUDA; "mps" for Apple Metal). If omitted, autodetect.')
     parser.add_argument('--blocks', type=int, default=20,
                        help='Number of blocks to mine (default: 20)')
+    parser.add_argument('--genesis-config', type=str, default="genesis_block.json",
+                       help='Path to genesis config JSON file to override defaults')
     args = parser.parse_args()
     run_blockchain(args)
 

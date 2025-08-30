@@ -524,6 +524,7 @@ def load_genesis_block(genesis_block_filepath: str) -> 'Block':
         json.JSONDecodeError: If JSON is malformed
     """
     config_path = Path(genesis_block_filepath)
+    print(f"Loading genesis block from: {config_path.name}")
     with open(config_path, 'r') as f:
         genesis_data = json.load(f)
 
