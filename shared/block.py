@@ -338,12 +338,6 @@ class Block:
     @classmethod
     def from_network(cls, data: bytes) -> 'Block':
         """Deserialize from binary format."""
-        def read_string(data: bytes, offset: int) -> tuple[str, int]:
-            length = struct.unpack('!I', data[offset:offset+4])[0]
-            offset += 4
-            string = data[offset:offset+length].decode('utf-8')
-            return string, offset + length
-
         def read_bytes(data: bytes, offset: int) -> tuple[bytes, int]:
             length = struct.unpack('!I', data[offset:offset+4])[0]
             offset += 4
@@ -388,6 +382,11 @@ class Block:
         if actual_data_hash != header_block_data_hash:
             raise ValueError("Data hash mismatch")
 
+        raw = data[:offset]
+        hash = blake3(raw).digest()
+
+        signature, offset = read_bytes(data, offset)
+
         # Create block with placeholder values for derived fields
         block = cls(
             header=header,
@@ -395,16 +394,10 @@ class Block:
             quantum_proof=quantum_proof,
             next_block_requirements=next_block_requirements,
             data=block_data,
-            raw=None,  # Will be computed
-            hash=None,  # Will be computed
-            signature=None  # Will be computed
+            raw=raw,  
+            hash=hash,  
+            signature=signature
         )
-
-        # Compute derived fields
-        block.finalize()
-
-        signature, offset = read_bytes(data, offset)
-        block.signature = signature
 
         return block
 
@@ -429,11 +422,11 @@ class Block:
     def validate_block(self, previous_block: 'Block') -> bool:
         """Validate this block against the previous block requirements.
 
-        This method:
-        1. Validates the signature against miner_info
-        2. Validates quantum_proof against previous_block.next_block_requirements
-        3. Computes and sets energy, diversity, num_valid_solutions
-        4. Returns validation result
+        This method validates the quantum proof and other block artifacts.
+
+        The signature is not checked at this time, but it could be as 
+        all blocks have miner info, although checking signature is responsibility of 
+        the network node layer. 
 
         Args:
             previous_block: The previous block containing requirements
@@ -448,11 +441,8 @@ class Block:
         requirements = previous_block.next_block_requirements
         if not requirements:
             return False
-
-        # TODO: Implement signature validation here
-        # For now, assume signature is valid if present
-        if not self.signature:
-            return False
+        
+        # TODO: Validate difficulty adjustment for next block here. 
 
         # Validate quantum proof against requirements
         return self._validate_quantum_proof(requirements)
