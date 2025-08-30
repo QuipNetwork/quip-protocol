@@ -210,6 +210,31 @@ class MinerInfo:
             next_wots_public_key=next_wots_public_key
         )
 
+    def to_json(self) -> str:
+        """Serialize to JSON string with hex-encoded bytes fields."""
+        data = {
+            'miner_id': self.miner_id,
+            'miner_type': self.miner_type,
+            'reward_address': self.reward_address.hex(),
+            'ecdsa_public_key': self.ecdsa_public_key.hex(),
+            'wots_public_key': self.wots_public_key.hex(),
+            'next_wots_public_key': self.next_wots_public_key.hex(),
+        }
+        return json.dumps(data)
+
+    @classmethod
+    def from_json(cls, json_str: str) -> 'MinerInfo':
+        """Deserialize from JSON string with hex-encoded bytes fields."""
+        data = json.loads(json_str)
+        return cls(
+            miner_id=data['miner_id'],
+            miner_type=data['miner_type'],
+            reward_address=bytes.fromhex(data['reward_address']),
+            ecdsa_public_key=bytes.fromhex(data['ecdsa_public_key']),
+            wots_public_key=bytes.fromhex(data['wots_public_key']),
+            next_wots_public_key=bytes.fromhex(data['next_wots_public_key']),
+        )
+
 
 @dataclass
 class BlockHeader:

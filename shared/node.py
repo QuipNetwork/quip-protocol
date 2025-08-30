@@ -4,11 +4,13 @@ import asyncio
 import json
 import multiprocessing
 import os
+import socket
 from queue import Empty
 import time
 from blake3 import blake3
 from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING, Callable
 from multiprocessing.synchronize import Event as EventType
+import aiohttp
 
 if TYPE_CHECKING:
     pass
@@ -21,6 +23,56 @@ from shared.miner import Miner, MiningResult
 
 # Persistent miner handle and worker integration
 from shared.miner_worker import MinerHandle, miner_worker_main
+
+
+async def get_public_ip() -> Optional[str]:
+    """
+    Get the public IP address by querying external services.
+
+    Returns:
+        Public IP address as string, or None if unable to determine
+    """
+    # List of reliable IP detection services
+    services = [
+        "https://api.ipify.org",
+        "https://icanhazip.com",
+        "https://ipecho.net/plain",
+        "https://checkip.amazonaws.com",
+        "https://ident.me"
+    ]
+
+    for service in services:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(service, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status == 200:
+                        ip = (await response.text()).strip()
+                        # Basic validation - check if it looks like an IP
+                        if ip and '.' in ip and len(ip.split('.')) == 4:
+                            return ip
+        except Exception:
+            continue
+
+    return None
+
+
+def get_local_ip() -> str:
+    """
+    Get the local IP address (best guess).
+
+    Returns:
+        Local IP address as string
+    """
+    try:
+        # Connect to a remote address to determine which local interface would be used
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            # Use Google's DNS server - we don't actually send data
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            return local_ip
+    except Exception:
+        # Fallback to localhost
+        return "127.0.0.1"
 
 
 class Node:
@@ -43,6 +95,8 @@ class Node:
         """
         self.node_id = node_id
         self.miners_config = miners_config
+
+        self.peers: Dict[str, MinerInfo] = {}
 
         # Store event callbacks
         self.on_block_mined = on_block_mined
@@ -556,6 +610,29 @@ class Node:
                 h.close()
             except Exception:
                 pass
+
+    ## Peer tracking and statistics ##
+
+    def add_or_update_peer(self, peer_address: str, peer_info: MinerInfo) -> bool:
+        """Add or update a peer in the network."""
+        was_new = peer_address not in self.peers
+        self.peers[peer_address] = peer_info
+        return was_new
+    
+    def remove_peer(self, peer_address: str) -> bool:
+        """Remove a peer from the network."""
+        if peer_address in self.peers:
+            del self.peers[peer_address]
+            return True
+        return False
+    
+    def get_peer_info(self, peer_address: str) -> Optional[MinerInfo]:
+        """Get information about a peer."""
+        return self.peers.get(peer_address)
+    
+    def get_peers(self) -> Dict[str, MinerInfo]:
+        """Get all peers in the network."""
+        return self.peers
 
     def get_stats(self) -> dict:
         """Aggregate stats from all miner handles."""
