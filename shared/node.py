@@ -4,6 +4,7 @@ import asyncio
 import json
 import multiprocessing
 import os
+from queue import Empty
 import time
 from blake3 import blake3
 from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING, Callable
@@ -290,7 +291,7 @@ class Node:
         Returns:
             Block if successful, None if stopped/failed
         """
-        if self.chain is None:
+        if not self.chain:
             print(f"Node {self.node_id}: No existing chain, previous block is genesis")
             self.chain.append(previous_block)
 
@@ -334,7 +335,10 @@ class Node:
             while time.time() < deadline and not self._mining_stop_event.is_set():
                 # Poll each handle's response queue quickly
                 for h in handles:
-                    msg = h.resp.get(timeout=0.1)
+                    try:
+                        msg = h.resp.get(timeout=0.1)
+                    except Empty:
+                        continue
                     # MiningResult objects will be put by miners; if dict, may be stats/error
                     if msg is None:
                         continue

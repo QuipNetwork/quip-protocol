@@ -537,6 +537,7 @@ class QuantumBlockchain:
             
             # Update miner info
             new_block.miner_info = winning_node_info
+            new_block.finalize()
             
             # Sign the block using the winning node
             if winning_node:
@@ -546,7 +547,6 @@ class QuantumBlockchain:
                 new_block.signature = b"no_signature"
             
             # Compute derived fields and add to chain
-            new_block.finalize()
             self.chain.append(new_block)
             return new_block
         else:
@@ -1374,7 +1374,6 @@ def run_blockchain(args):
         for i, tx in enumerate(transactions):
             print(f"\n📝 Transaction {i+1}/{args.blocks}: {tx}")
             blockchain.add_block(tx)
-            time.sleep(0.5)  # Brief pause between blocks
 
         # Print the chain
         print("\nFinal Blockchain:")

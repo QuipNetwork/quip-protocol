@@ -4,9 +4,9 @@
   "timestamp": 1640995200.0,
   "data": "Genesis Block - Quip Protocol",
   "next_block_requirements": {
-    "difficulty_energy": -1000.0,
-    "min_diversity": 0.28,
-    "min_solutions": 10,
+    "difficulty_energy": -12000.0,
+    "min_diversity": 0.25,
+    "min_solutions": 15,
     "timeout_to_ease_difficulty": 10.0,
     "max_mining_time": 300.0,
     "adaptive_parameters": {

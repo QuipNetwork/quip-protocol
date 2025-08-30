@@ -1,20 +1,26 @@
 {
-  "genesis_block": {
-    "index": 0,
-    "data": "Genesis Block - Test Configuration",
-    "previous_hash": "0",
-    "nonce": 0
+  "index": 0,
+  "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "timestamp": 1640995200.0,
+  "data": "Genesis Block - Quip Protocol",
+  "next_block_requirements": {
+    "difficulty_energy": -1000.0,
+    "min_diversity": 0.28,
+    "min_solutions": 10,
+    "timeout_to_ease_difficulty": 10.0,
+    "max_mining_time": 300.0,
+    "adaptive_parameters": {
+      "energy_adjustment_rate": 0.01,
+      "diversity_adjustment_rate": 0.01,
+      "solutions_adjustment_rate": 0.15,
+      "description": "TEst parameters based on SA miner performance benchmarks"
+    }
   },
-  "mining_parameters": {
-    "base_difficulty_energy": -14500.0,
-    "base_min_diversity": 0.25,
-    "base_min_solutions": 25,
-    "description": "Very fast parameters for testing and development"
-  },
-  "adaptive_parameters": {
-    "energy_adjustment_rate": 0.01,
-    "diversity_adjustment_rate": 0.01,
-    "solutions_adjustment_rate": 0.15,
-    "description": "Rates for difficulty adjustment based on consecutive wins"
-  }
+  "quantum_proof": null,
+  "miner_info": null,
+  "signature": null,
+  "energy": null,
+  "diversity": null,
+  "num_valid_solutions": null,
+  "hash": null
 }
