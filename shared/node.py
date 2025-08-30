@@ -6,7 +6,7 @@ import multiprocessing
 import os
 import time
 from blake3 import blake3
-from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING, Callable
 from multiprocessing.synchronize import Event as EventType
 
 if TYPE_CHECKING:
@@ -25,7 +25,10 @@ from shared.miner_worker import MinerHandle, miner_worker_main
 class Node:
     """Node that manages multiple miners and handles blockchain network participation."""
 
-    def __init__(self, node_id: str, miners_config: Dict[str, Any], secret: Optional[str] = None):
+    def __init__(self, node_id: str, miners_config: Dict[str, Any], secret: Optional[str] = None,
+                 on_block_mined: Optional[Callable[[Block], None]] = None,
+                 on_mining_started: Optional[Callable[[Block], None]] = None,
+                 on_mining_stopped: Optional[Callable[[], None]] = None):
         """
         Initialize a blockchain node with multiple miners.
 
@@ -33,9 +36,17 @@ class Node:
             node_id: Unique identifier for this node
             miners_config: Configuration dict with cpu, gpu, qpu sections
             secret: Secret key for deterministic key generation (random if None)
+            on_block_mined: Callback when a block is successfully mined
+            on_mining_started: Callback when mining starts
+            on_mining_stopped: Callback when mining stops
         """
         self.node_id = node_id
         self.miners_config = miners_config
+
+        # Store event callbacks
+        self.on_block_mined = on_block_mined
+        self.on_mining_started = on_mining_started
+        self.on_mining_stopped = on_mining_stopped
 
         if not secret:
             secret = os.urandom(32).hex()
@@ -74,13 +85,14 @@ class Node:
         self._is_mining = False
         self._current_mining_task: Optional[asyncio.Task] = None
 
-
-
         print(f"Node {node_id} initialized with {len(getattr(self, 'miner_handles', []))} miners:")
         print(f"  ECDSA Public Key: {self.crypto.ecdsa_public_key_hex[:16]}...")
         print(f"  WOTS+ Public Key: {self.crypto.wots_plus_public_key.to_bytes().hex()[:16]}...")
         for h in getattr(self, 'miner_handles', []):
             print(f"  - {h.miner_id} ({h.miner_type})")
+
+        # Initialize blockchain
+        self.chain: List[Block] = []
 
     def _initialize_miners(self, cfg: Dict[str, Any]):
         """Initialize persistent miner workers based on configuration (TOML)."""
@@ -140,6 +152,100 @@ class Node:
         # Back-compat summary list for logs (do not assign to typed self.miners)
         self._summary_miners = [(h.miner_id, h.miner_type) for h in self.miner_handles]
 
+    ## Block Reception and Validation Logic ##
+
+    # For now, our chain logic is as follows:
+    # - Each node maintains a full copy of the blockchain in memory.
+    # - On receipt of a new block, we switch to it if: 
+    #   1. It's timestamp is newer than the current block we have at that index. (i.e., a trust me bro model, not secure)
+    #   2. We do not have more than 6 blocks after it.
+    #   3. It's signature is valid.
+    #   4. It meets the previous block quantum proof validation requirements (including difficulty decay)
+    # Wrappers around node are responsible for start/stop mining and broadcasting blocks to other nodes.
+
+    def get_block(self, index: int) -> Optional[Block]:
+        """Get a block from the blockchain."""
+        if len(self.chain) <= index:
+            return None
+        return self.chain[index]
+    
+    def get_latest_block(self) -> Block:
+        """Get the latest block from the blockchain."""
+        return self.chain[-1]
+
+    def receive_block(self, block: Block) -> bool:
+        """Receive a block from the network."""
+        # 1. Check if we already have this block or a newer one at this index
+        cur_block = self.get_block(block.header.index)
+        if cur_block is not None:
+            # Are we newer?
+            if cur_block.header.timestamp < block.header.timestamp:
+                return False
+            
+        # 2. Do we have more than 6 blocks after it?
+        head = self.get_latest_block()
+        if head.header.index > block.header.index + 6:
+            return False
+
+        prev_block = self.get_block(block.header.index - 1)
+        if prev_block is None:
+            return False
+
+        # 3. Check Signature
+        # FIXME: We are not even bothering with checking against known miner info right now.
+        block_bytes = block.raw
+        signature = block.signature
+        if not block_bytes or not signature:
+            return False
+        if not self.crypto.verify_combined_signature(
+            block.miner_info.ecdsa_public_key,
+            block.miner_info.wots_public_key,
+            block_bytes,
+            signature
+        ):
+            return False
+
+        # 4. Validate the Quantum Proof and other block artifacts.
+        if not block.validate_block(prev_block):
+            return False
+        
+        # Reset chain if needed
+        if head.header.index >= block.header.index:
+            print(f"Node {self.node_id}: Resetting chain to accept block {block.header.index} from previous head {head.header.index})")
+            self.chain = self.chain[:block.header.index]
+        # Accept the block
+        self.chain.append(block)
+        print(f"Node {self.node_id}: Accepted block {block.header.index} from {block.miner_info.miner_id}")
+
+        # Emit an event so we can stop mining and potentially broadcast to other nodes
+        self._emit_block_mined(block)
+
+        return True
+
+    def _emit_mining_started(self, block: Block) -> None:
+        """Emit mining started event."""
+        if self.on_mining_started:
+            try:
+                self.on_mining_started(block)
+            except Exception as e:
+                print(f"Node {self.node_id}: Error in mining_started callback: {e}")
+
+    def _emit_mining_stopped(self) -> None:
+        """Emit mining stopped event."""
+        if self.on_mining_stopped:
+            try:
+                self.on_mining_stopped()
+            except Exception as e:
+                print(f"Node {self.node_id}: Error in mining_stopped callback: {e}")
+
+    def _emit_block_mined(self, block: Block) -> None:
+        """Emit block mined event."""
+        if self.on_block_mined:
+            try:
+                self.on_block_mined(block)
+            except Exception as e:
+                print(f"Node {self.node_id}: Error in block_mined callback: {e}")
+
     def check_and_adjust_difficulty_for_timeout(self):
         """Check if no block has been received for 30 minutes and adjust difficulty."""
         time_since_last_block = time.time() - self.last_block_received_time
@@ -184,6 +290,13 @@ class Node:
         Returns:
             Block if successful, None if stopped/failed
         """
+        if self.chain is None:
+            print(f"Node {self.node_id}: No existing chain, previous block is genesis")
+            self.chain.append(previous_block)
+
+        if (previous_block.header.index) != self.get_latest_block().header.index:
+            raise ValueError(f"Node {self.node_id}: Previous block index {previous_block.header.index} does not match latest block index {self.get_latest_block().header.index}")
+
         if self._is_mining or self._mining_stop_event is not None:
             raise RuntimeError(f"Node {self.node_id}: Already mining")
 
@@ -207,6 +320,9 @@ class Node:
 
         print(f"Node {self.node_id} starting mining with {len(handles)} miners...")
 
+        # Emit mining started event
+        self._emit_mining_started(previous_block)
+
         # Command all workers to start mining with full context
         for h in handles:
             h.mine(previous_block, requirements)
@@ -218,10 +334,7 @@ class Node:
             while time.time() < deadline and not self._mining_stop_event.is_set():
                 # Poll each handle's response queue quickly
                 for h in handles:
-                    try:
-                        msg = h.resp.get(timeout=0.1)
-                    except Exception:
-                        continue
+                    msg = h.resp.get(timeout=0.1)
                     # MiningResult objects will be put by miners; if dict, may be stats/error
                     if msg is None:
                         continue
@@ -250,6 +363,9 @@ class Node:
             # Reset mining state
             self._is_mining = False
             self._mining_stop_event = None
+
+            # Emit mining stopped event
+            self._emit_mining_stopped()
 
         # Record timing and statistics
         total_time = time.time() - start_time
