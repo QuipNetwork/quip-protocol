@@ -3,7 +3,7 @@ node_name = "Quantum Node Name"  # Optional human-readable name for your node.
 
 # Local binding address (ip address) and port to listen to.
 listen = "0.0.0.0"
-port = 20049 # ("QN" -> little ending unsigned int is 0x514E -> 0x4E51 = 20049)
+port = 20049 # ("QN" -> little endian unsigned int is 0x514E -> 0x4E51 = 20049)
 
 #public_host = "my.dns.or.ip:public_port"
 
@@ -15,12 +15,15 @@ secret = "your-secret-here" # Used to generate a deterministic key pair for this
 # Defaults to exit if a peer cannot be found.
 # auto_mine = 1
 
+
 # Peers to try and connect to, defaults to "nodes.quip.network:20049"
 # peer = ["nodes.quip.network:20049", "peer2.quip.network:20049"]
 
-timeout = 3  # Timeout for peer connections and communications
-heartbeat_interval = 15  # Interval for sending heartbeats to peers
-heartbead_timeout = 300  # Timeout for waiting for heartbeats from peers
+timeout = 3  # Timeout for peer connections and communications in seconds
+heartbeat_interval = 15  # Interval for sending heartbeats to peers in seconds
+heartbeat_timeout = 300  # Timeout for waiting for heartbeats from peers in seconds
+# Number of peers to gossip to at a time. Defaults to 3, you should never need to change this.
+# fanout = 3 
 
 # if any of the following are defined then they will be spun up as miner processes to mine blocks.
 # By default a single CPU miner is created.

@@ -25,56 +25,6 @@ from shared.miner import Miner, MiningResult
 from shared.miner_worker import MinerHandle, miner_worker_main
 
 
-async def get_public_ip() -> Optional[str]:
-    """
-    Get the public IP address by querying external services.
-
-    Returns:
-        Public IP address as string, or None if unable to determine
-    """
-    # List of reliable IP detection services
-    services = [
-        "https://api.ipify.org",
-        "https://icanhazip.com",
-        "https://ipecho.net/plain",
-        "https://checkip.amazonaws.com",
-        "https://ident.me"
-    ]
-
-    for service in services:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(service, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                    if response.status == 200:
-                        ip = (await response.text()).strip()
-                        # Basic validation - check if it looks like an IP
-                        if ip and '.' in ip and len(ip.split('.')) == 4:
-                            return ip
-        except Exception:
-            continue
-
-    return None
-
-
-def get_local_ip() -> str:
-    """
-    Get the local IP address (best guess).
-
-    Returns:
-        Local IP address as string
-    """
-    try:
-        # Connect to a remote address to determine which local interface would be used
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            # Use Google's DNS server - we don't actually send data
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            return local_ip
-    except Exception:
-        # Fallback to localhost
-        return "127.0.0.1"
-
-
 class Node:
     """Node that manages multiple miners and handles blockchain network participation."""
 
@@ -148,6 +98,7 @@ class Node:
 
         # Initialize blockchain
         self.chain: List[Block] = []
+        self.chain_lock = asyncio.Lock()
 
     def _initialize_miners(self, cfg: Dict[str, Any]):
         """Initialize persistent miner workers based on configuration (TOML)."""
@@ -228,7 +179,7 @@ class Node:
         """Get the latest block from the blockchain."""
         return self.chain[-1]
 
-    def receive_block(self, block: Block) -> bool:
+    async def receive_block(self, block: Block) -> bool:
         """Receive a block from the network."""
         # 1. Check if we already have this block or a newer one at this index
         cur_block = self.get_block(block.header.index)
@@ -264,12 +215,14 @@ class Node:
         if not block.validate_block(prev_block):
             return False
         
-        # Reset chain if needed
-        if head.header.index >= block.header.index:
-            print(f"Node {self.node_id}: Resetting chain to accept block {block.header.index} from previous head {head.header.index})")
-            self.chain = self.chain[:block.header.index]
-        # Accept the block
-        self.chain.append(block)
+        async with self.chain_lock:
+            # Reset chain if needed
+            if head.header.index >= block.header.index:
+                print(f"Node {self.node_id}: Resetting chain to accept block {block.header.index} from previous head {head.header.index})")
+                self.chain = self.chain[:block.header.index]
+            # Accept the block
+            self.chain.append(block)
+
         print(f"Node {self.node_id}: Accepted block {block.header.index} from {block.miner_info.miner_id}")
 
         # Emit an event so we can stop mining and potentially broadcast to other nodes
@@ -577,32 +530,6 @@ class Node:
             timeout_to_difficulty_adjustment_decay=prev_req.timeout_to_difficulty_adjustment_decay
         )
 
-    def get_mining_summary(self) -> str:
-        """Get a summary of mining statistics for this node."""
-        lines = [f"\nMining Summary for Node {self.node_id}:"]
-        lines.append(f"  Total Blocks Attempted: {self.timing_stats['total_blocks_attempted']}")
-        lines.append(f"  Total Blocks Won: {self.timing_stats['total_blocks_won']}")
-
-        if self.timing_stats['total_blocks_attempted'] > 0:
-            win_rate = self.timing_stats['total_blocks_won'] / self.timing_stats['total_blocks_attempted'] * 100
-            lines.append(f"  Overall Win Rate: {win_rate:.1f}%")
-
-        if self.timing_stats['total_mining_time'] > 0 and self.timing_stats['total_blocks_attempted'] > 0:
-            avg_time = self.timing_stats['total_mining_time'] / self.timing_stats['total_blocks_attempted']
-            lines.append(f"  Average Mining Time: {avg_time:.2f}s")
-
-        # Per-miner win statistics
-        if self.timing_stats['wins_per_miner']:
-            lines.append("  Wins by Miner:")
-            for miner_id, wins in self.timing_stats['wins_per_miner'].items():
-                lines.append(f"    {miner_id}: {wins}")
-
-        # Summary miners from handles
-        for mid, mtype in getattr(self, '_summary_miners', []):
-            lines.append(f"  - {mid} ({mtype})")
-
-        return "\n".join(lines)
-
     def close(self):
         """Shutdown all persistent miner workers."""
         for h in self.miner_handles:
@@ -651,3 +578,29 @@ class Node:
             except Exception:
                 stats["miners"].append({"miner_id": h.miner_id, "miner_type": h.miner_type})
         return stats
+    
+    def get_mining_summary(self) -> str:
+        """Get a summary of mining statistics for this node."""
+        lines = [f"\nMining Summary for Node {self.node_id}:"]
+        lines.append(f"  Total Blocks Attempted: {self.timing_stats['total_blocks_attempted']}")
+        lines.append(f"  Total Blocks Won: {self.timing_stats['total_blocks_won']}")
+
+        if self.timing_stats['total_blocks_attempted'] > 0:
+            win_rate = self.timing_stats['total_blocks_won'] / self.timing_stats['total_blocks_attempted'] * 100
+            lines.append(f"  Overall Win Rate: {win_rate:.1f}%")
+
+        if self.timing_stats['total_mining_time'] > 0 and self.timing_stats['total_blocks_attempted'] > 0:
+            avg_time = self.timing_stats['total_mining_time'] / self.timing_stats['total_blocks_attempted']
+            lines.append(f"  Average Mining Time: {avg_time:.2f}s")
+
+        # Per-miner win statistics
+        if self.timing_stats['wins_per_miner']:
+            lines.append("  Wins by Miner:")
+            for miner_id, wins in self.timing_stats['wins_per_miner'].items():
+                lines.append(f"    {miner_id}: {wins}")
+
+        # Summary miners from handles
+        for mid, mtype in getattr(self, '_summary_miners', []):
+            lines.append(f"  - {mid} ({mtype})")
+
+        return "\n".join(lines)
