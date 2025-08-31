@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
-from shared.quantum_proof_of_work import calculate_diversity, generate_ising_model_from_seed, ising_seed_from_block
+from shared.quantum_proof_of_work import calculate_diversity, generate_ising_model_from_seed, ising_seed_from_block, energies_for_solutions
 
 
 @dataclass
@@ -563,17 +563,8 @@ class Block:
         seed = ising_seed_from_block(self.header.previous_hash, miner_id, self.header.index, self.quantum_proof.nonce)
         h, J = generate_ising_model_from_seed(seed, self.quantum_proof.nodes, self.quantum_proof.edges)
 
-        def energy_of(solution: List[int]) -> float:
-            spins = [1 if v > 0 else -1 for v in solution]
-            e = 0.0
-            for i in range(len(spins)):
-                e += h.get(i, 0.0) * spins[i]
-            for (i, j), Jij in J.items():
-                if i < len(spins) and j < len(spins):
-                    e += Jij * spins[i] * spins[j]
-            return float(e)
-
-        energies = [energy_of(sol) for sol in solutions]
+        # Compute energies respecting variable order (self.quantum_proof.nodes)
+        energies = energies_for_solutions(solutions, h, J, self.quantum_proof.nodes)
 
         # Find solutions meeting energy threshold
         valid_indices = [i for i, e in enumerate(energies) if e < requirements.difficulty_energy]

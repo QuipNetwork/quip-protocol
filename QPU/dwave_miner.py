@@ -163,7 +163,7 @@ class DWaveMiner(BaseMiner):
                         solutions=filtered_solutions,
                         energy=min_energy,
                         diversity=final_diversity,
-                        num_valid=len(valid_solutions),
+                        num_valid=len(filtered_solutions),
                         mining_time=mining_time
                     )
 

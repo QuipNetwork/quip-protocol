@@ -233,7 +233,9 @@ class Node:
         block.quantum_proof.compute_derived_fields(prev_block.next_block_requirements, block)
         if not block.validate_block(prev_block):
             logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid quantum proof")
-            logger.error(f"Quantum Proof: {block.quantum_proof.to_json()}, rq: {prev_block.next_block_requirements.to_json()}")
+            qpjson = block.quantum_proof.to_json()
+            qpjson['proof_data'] = qpjson['proof_data'][:10] + "..."
+            logger.error(f"Quantum Proof: {json.dumps(qpjson)}, rq: {prev_block.next_block_requirements.to_json()}")
             return False
         
         async with self.chain_lock:
