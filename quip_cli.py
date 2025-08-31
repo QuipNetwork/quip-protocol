@@ -1,7 +1,7 @@
 """Click-based CLI for quip-protocol.
 
 Provides two console commands:
-- quip-network-node: run a single P2P node (cpu/gpu/qpu) using quantum_blockchain_p2p.py
+- quip-network-node: run a single P2P node (cpu/gpu/qpu) backed by shared.network_node.NetworkNode
 - quip-network-simulator: launch multiple nodes using quip-network-node and connect them locally to each other
 """
 from __future__ import annotations
@@ -12,7 +12,8 @@ import subprocess
 import sys
 import json
 import time
-from typing import Any, Dict, Optional
+import asyncio
+from typing import Any, Dict, Optional, List
 
 import click
 
@@ -22,8 +23,9 @@ try:  # Python 3.11+
 except ModuleNotFoundError:  # Python 3.10
     import tomli as _toml  # type: ignore
 
-from quantum_blockchain_p2p import run_cli_node
 from shared.node import Node
+from shared.network_node import NetworkNode
+from shared.block import load_genesis_block
 
 
 def _load_config(path: Optional[str]) -> Dict[str, Any]:
@@ -31,6 +33,120 @@ def _load_config(path: Optional[str]) -> Dict[str, Any]:
         return {}
     with open(path, "rb") as f:
         return _toml.load(f)
+
+
+def _merge_globals_from_toml(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten [global] section of TOML into NetworkNode config keys.
+    Leaves 'cpu', 'gpu', 'qpu' sections as-is.
+    """
+    if not cfg:
+        return {}
+    g = dict(cfg.get("global", {}) or {})
+    out: Dict[str, Any] = {}
+    if "node_name" in g:
+        out["node_name"] = g["node_name"]
+    if "listen" in g:
+        out["listen"] = g["listen"]
+    if "port" in g:
+        out["port"] = int(g["port"])
+    if "public_host" in g:
+        out["public_host"] = g["public_host"]
+    if "secret" in g:
+        out["secret"] = g["secret"]
+    if "auto_mine" in g:
+        out["auto_mine"] = bool(g["auto_mine"])
+    # peers: allow string or list in TOML
+    peer = g.get("peer")
+    if peer is not None:
+        if isinstance(peer, list):
+            out["peer"] = [str(p) for p in peer]
+        else:
+            out["peer"] = [str(peer)]
+    # timeouts/heartbeat
+    if "timeout" in g:
+        out["node_timeout"] = int(g["timeout"])
+    if "node_timeout" in g:
+        out["node_timeout"] = int(g["node_timeout"])
+    if "heartbeat_interval" in g:
+        out["heartbeat_interval"] = int(g["heartbeat_interval"])
+    if "heartbeat_timeout" in g:
+        out["heartbeat_timeout"] = int(g["heartbeat_timeout"])
+    if "fanout" in g:
+        out["fanout"] = int(g["fanout"])
+    # carry-through miner sections
+    for k in ("cpu", "gpu", "qpu"):
+        if k in cfg:
+            out[k] = cfg[k]
+    return out
+
+
+def _apply_global_overrides(conf: Dict[str, Any],
+                            listen: Optional[str],
+                            port: Optional[int],
+                            public_host: Optional[str],
+                            node_name: Optional[str],
+                            secret: Optional[str],
+                            auto_mine: Optional[bool],
+                            peers: Optional[List[str]],
+                            timeout: Optional[int],
+                            heartbeat_interval: Optional[int],
+                            heartbeat_timeout: Optional[int],
+                            fanout: Optional[int]) -> Dict[str, Any]:
+    c = dict(conf)
+    if listen is not None:
+        c["listen"] = listen
+    if port is not None:
+        c["port"] = int(port)
+    if public_host is not None:
+        c["public_host"] = public_host
+    if node_name is not None:
+        c["node_name"] = node_name
+    if secret is not None:
+        c["secret"] = secret
+    if auto_mine is not None:
+        c["auto_mine"] = bool(auto_mine)
+    if peers:
+        c["peer"] = list(peers)
+    if timeout is not None:
+        c["node_timeout"] = int(timeout)
+    if heartbeat_interval is not None:
+        c["heartbeat_interval"] = int(heartbeat_interval)
+    if heartbeat_timeout is not None:
+        c["heartbeat_timeout"] = int(heartbeat_timeout)
+    if fanout is not None:
+        c["fanout"] = int(fanout)
+    return c
+
+
+async def _async_run_network_node(config: Dict[str, Any], genesis_config_file: str) -> int:
+    """Create NetworkNode with genesis, start server/tasks, and run until Ctrl-C."""
+    # Load genesis and pass to NetworkNode constructor
+    genesis = load_genesis_block(genesis_config_file)
+    node = NetworkNode(config, genesis)
+
+    await node.start()
+    try:
+        # Run until interrupted
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        pass
+    except KeyboardInterrupt:
+        click.echo("Interrupted by user")
+    finally:
+        await node.stop()
+    return 0
+
+
+def _run_network_node_sync(config: Dict[str, Any], genesis_config_file: str) -> int:
+    try:
+        return asyncio.run(_async_run_network_node(config, genesis_config_file))
+    except KeyboardInterrupt:
+        click.echo("Interrupted by user")
+        return 130
+    except Exception as e:
+        click.echo(f"Error: {e}")
+        return 1
 
 
 # -----------------------------
@@ -45,14 +161,15 @@ def quip_network_node(ctx: click.Context, config: Optional[str]):
 
     Subcommands: cpu, gpu, qpu
 
-    If invoked without a subcommand, --config must specify [global].default
-    to choose the default subcommand. Global settings also provide host/port/peer/auto_mine.
+    If invoked without a subcommand, --config may specify [global].default
+    to choose a default subcommand. Global settings provide listen/port/peer/auto_mine.
     """
     ctx.ensure_object(dict)
-    ctx.obj["config"] = _load_config(config)
+    ctx.obj["config_path"] = config
+    ctx.obj["toml"] = _load_config(config)
 
     if ctx.invoked_subcommand is None:
-        cfg = ctx.obj.get("config", {})
+        cfg = ctx.obj.get("toml", {})
         global_cfg = (cfg.get("global", {}) or {})
         default_cmd = (global_cfg or {}).get("default")
         if not default_cmd:
@@ -60,189 +177,183 @@ def quip_network_node(ctx: click.Context, config: Optional[str]):
         default_cmd = str(default_cmd).lower()
         if default_cmd not in {"cpu", "gpu", "qpu"}:
             raise click.UsageError(f"Invalid default subcommand '{default_cmd}' in config; expected cpu/gpu/qpu")
-        # Build common args from [global]
-        common_kwargs = {
-            "host": global_cfg.get("host", "0.0.0.0"),
-            "port": int(global_cfg.get("port", 8080)),
-            "peer": global_cfg.get("peer"),
-        }
-        # Optional per-type config
-        sub_cfg = cfg.get(default_cmd, {}) or {}
         if default_cmd == "cpu":
-            ctx.invoke(cpu, num_cpus=sub_cfg.get("num_cpus"), **common_kwargs)
+            ctx.invoke(cpu)
         elif default_cmd == "gpu":
-            # Defer device/backend handling to the gpu() command, which will read [gpu] config
-            ctx.invoke(gpu, device=None, **common_kwargs)
+            ctx.invoke(gpu)
         else:
-            qpu_kwargs = {
-                "dwave_api_key": sub_cfg.get("dwave_api_key"),
-                "dwave_api_solver": sub_cfg.get("dwave_api_solver"),
-                "dwave_region_url": sub_cfg.get("dwave_region_url", "https://na-west-1.cloud.dwavesys.com/sapi/v2/"),
-            }
-            ctx.invoke(qpu, **common_kwargs, **qpu_kwargs)
+            ctx.invoke(qpu)
 
 
-def _run_p2p_node(
-    kind: str,
-    host: str,
-    port: int,
-    peer: Optional[str],
-    env_overrides: Optional[dict] = None,
-    genesis_config_file: str = "genesis_block.json",
-) -> int:
-    """Run a P2P node directly without subprocess for a single node of given kind.
-
-    kind: one of 'cpu', 'gpu', 'qpu'
-    """
-    # Update environment if needed
-    if env_overrides:
-        for k, v in env_overrides.items():
-            if v is not None:
-                os.environ[k] = str(v)
-
-    # Import and call the CLI node function
-
-    # Configure miners based on kind
-    if kind == "cpu":
-        num_qpu, num_sa, num_gpu = 0, 1, 0
-    elif kind == "gpu":
-        num_qpu, num_sa, num_gpu = 0, 0, 1
-    elif kind == "qpu":
-        num_qpu, num_sa, num_gpu = 1, 0, 0
-    else:
-        raise ValueError(f"Unknown kind: {kind}")
-
-    click.echo(f"Starting {kind} node at {host}:{port}")
-
-    try:
-        run_cli_node(
-            host=host,
-            port=port,
-            peer=peer,
-            competitive=True,
-            num_qpu=num_qpu,
-            num_sa=num_sa,
-            num_gpu=num_gpu,
-            genesis_config_file=genesis_config_file
-        )
-        return 0
-    except KeyboardInterrupt:
-        click.echo("Interrupted by user")
-        return 130
-    except Exception as e:
-        click.echo(f"Error: {e}")
-        return 1
-
+# Subcommands: cpu/gpu/qpu. Each builds a NetworkNode config from TOML and CLI flags.
 
 @quip_network_node.command(name="cpu")
-@click.option("--host", type=str, default=None, help="Host to bind to (defaults from [global].host or 0.0.0.0)")
-@click.option("--port", type=int, default=None, help="Port to bind to (defaults from [global].port or 8080)")
-@click.option("--peer", type=str, default=None, help="Peer address host:port to join (defaults from [global].peer)")
-@click.option("--num-cpus", type=int, help="Limit CPU threads via OMP/MKL/BLAS env vars")
-@click.option("--genesis-config", type=str, default="genesis_block.json", help="Genesis block configuration file")
+# Global network options
+@click.option("--listen", type=str, default=None, help="Address to bind (defaults from [global].listen or 127.0.0.1)")
+@click.option("--port", type=int, default=None, help="Port to bind (defaults from [global].port or 20049)")
+@click.option("--public-host", type=str, default=None, help="Public host:port advertised to peers")
+@click.option("--node-name", type=str, default=None, help="Human-readable node name")
+@click.option("--secret", type=str, default=None, help="Deterministic secret for keypair")
+@click.option("--auto-mine/--no-auto-mine", default=None, help="Enable/disable auto-mining when no peers found")
+@click.option("--peer", "peers", multiple=True, help="Peer host:port (repeat for multiple)")
+@click.option("--timeout", type=int, default=None, help="Node/network timeout seconds")
+@click.option("--heartbeat-interval", type=int, default=None, help="Seconds between heartbeats")
+@click.option("--heartbeat-timeout", type=int, default=None, help="Peer heartbeat timeout seconds")
+@click.option("--fanout", type=int, default=None, help="Gossip fanout")
+# CPU options
+@click.option("--num-cpus", type=int, default=None, help="Number of CPU miners to spawn (default 1)")
+# Other
+@click.option("--genesis-config", type=str, default="genesis_block.json", show_default=True, help="Genesis block configuration file")
 @click.pass_context
-def cpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Optional[str], num_cpus: Optional[int], genesis_config: str):
-    """Run a CPU node (1 SA miner)."""
-    global_cfg = ((ctx.obj or {}).get("config", {}) or {}).get("global", {})
-    host = host if host is not None else global_cfg.get("host", "0.0.0.0")
-    port = port if port is not None else int(global_cfg.get("port", 8080))
-    peer = peer if peer is not None else global_cfg.get("peer")
+def cpu(
+    ctx: click.Context,
+    listen: Optional[str],
+    port: Optional[int],
+    public_host: Optional[str],
+    node_name: Optional[str],
+    secret: Optional[str],
+    auto_mine: Optional[bool],
+    peers: List[str],
+    timeout: Optional[int],
+    heartbeat_interval: Optional[int],
+    heartbeat_timeout: Optional[int],
+    fanout: Optional[int],
+    num_cpus: Optional[int],
+    genesis_config: str,
+):
+    """Run a CPU-only network node (NetworkNode + Node persistent CPU miners)."""
+    toml_cfg = (ctx.obj or {}).get("toml", {})
+    conf = _merge_globals_from_toml(toml_cfg)
+    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout)
+    # Ensure CPU-only
+    conf.pop("gpu", None)
+    conf.pop("qpu", None)
+    cpu_cfg = dict((conf.get("cpu") or {}))
+    if num_cpus is not None:
+        cpu_cfg["num_cpus"] = int(num_cpus)
+    if not cpu_cfg:
+        cpu_cfg = {"num_cpus": 1}
+    conf["cpu"] = cpu_cfg
 
-    env = None
-    if num_cpus:
-        env = {
-            "OMP_NUM_THREADS": num_cpus,
-            "MKL_NUM_THREADS": num_cpus,
-            "OPENBLAS_NUM_THREADS": num_cpus,
-            "NUMEXPR_NUM_THREADS": num_cpus,
-        }
-    sys.exit(_run_p2p_node("cpu", host, port, peer, env_overrides=env, genesis_config_file=genesis_config))
+    sys.exit(_run_network_node_sync(conf, genesis_config))
 
 
 @quip_network_node.command(name="gpu")
-@click.option("--host", type=str, default=None, help="Host to bind to (defaults from [global].host or 0.0.0.0)")
-@click.option("--port", type=int, default=None, help="Port to bind to (defaults from [global].port or 8080)")
-@click.option("--peer", type=str, default=None, help="Peer address host:port to join (defaults from [global].peer)")
-@click.option("--device", type=str, help="GPU device selector (e.g., CUDA ordinal)")
-@click.option("--gpu-backend", type=click.Choice(["local", "modal"], case_sensitive=False), help="Override GPU backend (local or modal)")
-@click.option("--genesis-config", type=str, default="genesis_block.json", help="Genesis block configuration file")
+# Global network options
+@click.option("--listen", type=str, default=None, help="Address to bind (defaults from [global].listen or 127.0.0.1)")
+@click.option("--port", type=int, default=None, help="Port to bind (defaults from [global].port or 20049)")
+@click.option("--public-host", type=str, default=None, help="Public host:port advertised to peers")
+@click.option("--node-name", type=str, default=None, help="Human-readable node name")
+@click.option("--secret", type=str, default=None, help="Deterministic secret for keypair")
+@click.option("--auto-mine/--no-auto-mine", default=None, help="Enable/disable auto-mining when no peers found")
+@click.option("--peer", "peers", multiple=True, help="Peer host:port (repeat for multiple)")
+@click.option("--timeout", type=int, default=None, help="Node/network timeout seconds")
+@click.option("--heartbeat-interval", type=int, default=None, help="Seconds between heartbeats")
+@click.option("--heartbeat-timeout", type=int, default=None, help="Peer heartbeat timeout seconds")
+@click.option("--fanout", type=int, default=None, help="Gossip fanout")
+# GPU options
+@click.option("--gpu-backend", type=click.Choice(["local", "modal", "mps"], case_sensitive=False), default=None, help="GPU backend: local|modal|mps")
+@click.option("--device", "devices", multiple=True, help="GPU device(s) for local backend (e.g., 0 1)")
+@click.option("--gpu-type", "gpu_types", multiple=True, help="GPU type(s) for modal backend (e.g., t4 a10g)")
+# Other
+@click.option("--genesis-config", type=str, default="genesis_block.json", show_default=True, help="Genesis block configuration file")
 @click.pass_context
-def gpu(ctx: click.Context, host: Optional[str], port: Optional[int], peer: Optional[str], device: Optional[str], gpu_backend: Optional[str], genesis_config: str):
-    """Run a GPU node (multi-GPU capable)."""
-    global_cfg = ((ctx.obj or {}).get("config", {}) or {}).get("global", {})
-    host = host if host is not None else global_cfg.get("host", "0.0.0.0")
-    port = port if port is not None else int(global_cfg.get("port", 8080))
-    peer = peer if peer is not None else global_cfg.get("peer")
+def gpu(
+    ctx: click.Context,
+    listen: Optional[str],
+    port: Optional[int],
+    public_host: Optional[str],
+    node_name: Optional[str],
+    secret: Optional[str],
+    auto_mine: Optional[bool],
+    peers: List[str],
+    timeout: Optional[int],
+    heartbeat_interval: Optional[int],
+    heartbeat_timeout: Optional[int],
+    fanout: Optional[int],
+    gpu_backend: Optional[str],
+    devices: List[str],
+    gpu_types: List[str],
+    genesis_config: str,
+):
+    """Run a GPU-only network node."""
+    toml_cfg = (ctx.obj or {}).get("toml", {})
+    conf = _merge_globals_from_toml(toml_cfg)
+    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout)
+    # Ensure GPU-only
+    conf.pop("cpu", None)
+    conf.pop("qpu", None)
+    gpu_cfg = dict((conf.get("gpu") or {}))
+    if gpu_backend is not None:
+        gpu_cfg["backend"] = str(gpu_backend).lower()
+    if devices:
+        gpu_cfg["devices"] = [str(d) for d in devices]
+    if gpu_types:
+        gpu_cfg["types"] = [str(t) for t in gpu_types]
+    if not gpu_cfg:
+        gpu_cfg = {"backend": "local"}
+    conf["gpu"] = gpu_cfg
 
-    # Read GPU config
-    cfg = (ctx.obj or {}).get("config", {}) if hasattr(ctx, "obj") else {}
-    gpu_cfg = (cfg.get("gpu", {}) or {})
-    backend = (gpu_backend or str(gpu_cfg.get("backend", "local"))).lower()
-    devices_cfg = gpu_cfg.get("devices")  # list or None
-    types_cfg = gpu_cfg.get("types")      # list or None (for modal)
-
-    # If CLI --device provided, override to single device
-    env: Dict[str, Any] = {}
-    if device is not None:
-        env["QUIP_GPU_DEVICES"] = str(device)
-        # For backward compatibility with single device workflows
-        env["CUDA_VISIBLE_DEVICES"] = str(device)
-    else:
-        if isinstance(devices_cfg, list) and devices_cfg:
-            env["QUIP_GPU_DEVICES"] = ",".join(str(d) for d in devices_cfg)
-
-    # Backend selection (default local)
-    env["QUIP_GPU_BACKEND"] = backend
-    if backend == "modal":
-        if isinstance(types_cfg, list) and types_cfg:
-            env["QUIP_GPU_TYPES"] = ",".join(str(t) for t in types_cfg)
-
-    sys.exit(_run_p2p_node("gpu", host, port, peer, env_overrides=env or None, genesis_config_file=genesis_config))
+    sys.exit(_run_network_node_sync(conf, genesis_config))
 
 
 @quip_network_node.command(name="qpu")
-@click.option("--host", type=str, default=None, help="Host to bind to (defaults from [global].host or 0.0.0.0)")
-@click.option("--port", type=int, default=None, help="Port to bind to (defaults from [global].port or 8080)")
-@click.option("--peer", type=str, default=None, help="Peer address host:port to join (defaults from [global].peer)")
-@click.option("--dwave-api-key", type=str, help="D-Wave API key (DWAVE_API_TOKEN)")
-@click.option("--dwave-api-solver", type=str, help="D-Wave solver name (DWAVE_API_SOLVER)")
-@click.option("--dwave-region-url", type=str, default=None, help="D-Wave region SAPI endpoint URL")
-@click.option("--genesis-config", type=str, default="genesis_block.json", help="Genesis block configuration file")
+# Global network options
+@click.option("--listen", type=str, default=None, help="Address to bind (defaults from [global].listen or 127.0.0.1)")
+@click.option("--port", type=int, default=None, help="Port to bind (defaults from [global].port or 20049)")
+@click.option("--public-host", type=str, default=None, help="Public host:port advertised to peers")
+@click.option("--node-name", type=str, default=None, help="Human-readable node name")
+@click.option("--secret", type=str, default=None, help="Deterministic secret for keypair")
+@click.option("--auto-mine/--no-auto-mine", default=None, help="Enable/disable auto-mining when no peers found")
+@click.option("--peer", "peers", multiple=True, help="Peer host:port (repeat for multiple)")
+@click.option("--timeout", type=int, default=None, help="Node/network timeout seconds")
+@click.option("--heartbeat-interval", type=int, default=None, help="Seconds between heartbeats")
+@click.option("--heartbeat-timeout", type=int, default=None, help="Peer heartbeat timeout seconds")
+@click.option("--fanout", type=int, default=None, help="Gossip fanout")
+# QPU options
+@click.option("--dwave-api-key", type=str, default=None, help="D-Wave API key")
+@click.option("--dwave-api-solver", type=str, default=None, help="D-Wave solver name")
+@click.option("--dwave-region-url", type=str, default=None, help="D-Wave SAPI region endpoint URL")
+# Other
+@click.option("--genesis-config", type=str, default="genesis_block.json", show_default=True, help="Genesis block configuration file")
 @click.pass_context
 def qpu(
     ctx: click.Context,
-    host: Optional[str],
+    listen: Optional[str],
     port: Optional[int],
-    peer: Optional[str],
+    public_host: Optional[str],
+    node_name: Optional[str],
+    secret: Optional[str],
+    auto_mine: Optional[bool],
+    peers: List[str],
+    timeout: Optional[int],
+    heartbeat_interval: Optional[int],
+    heartbeat_timeout: Optional[int],
+    fanout: Optional[int],
     dwave_api_key: Optional[str],
     dwave_api_solver: Optional[str],
     dwave_region_url: Optional[str],
     genesis_config: str,
 ):
-    """Run a QPU node (1 QPU miner)."""
-    global_cfg = ((ctx.obj or {}).get("config", {}) or {}).get("global", {})
-    host = host if host is not None else global_cfg.get("host", "0.0.0.0")
-    port = port if port is not None else int(global_cfg.get("port", 8080))
-    peer = peer if peer is not None else global_cfg.get("peer")
+    """Run a QPU-only network node."""
+    toml_cfg = (ctx.obj or {}).get("toml", {})
+    conf = _merge_globals_from_toml(toml_cfg)
+    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout)
+    # Ensure QPU-only
+    conf.pop("cpu", None)
+    conf.pop("gpu", None)
+    qpu_cfg = dict((conf.get("qpu") or {}))
+    if dwave_api_key is not None:
+        qpu_cfg["dwave_api_key"] = dwave_api_key
+    if dwave_api_solver is not None:
+        qpu_cfg["dwave_api_solver"] = dwave_api_solver
+    if dwave_region_url is not None:
+        qpu_cfg["dwave_region_url"] = dwave_region_url
+    if not qpu_cfg:
+        qpu_cfg = {}
+    conf["qpu"] = qpu_cfg
 
-    # Fill from config if not provided
-    cfg = (ctx.obj or {}).get("config", {}) if hasattr(ctx, "obj") else {}
-    qpu_cfg = (cfg.get("qpu", {}) or {})
-    if not dwave_api_key:
-        dwave_api_key = qpu_cfg.get("dwave_api_key")
-    if not dwave_api_solver:
-        dwave_api_solver = qpu_cfg.get("dwave_api_solver")
-    if not dwave_region_url:
-        dwave_region_url = qpu_cfg.get("dwave_region_url", "https://na-west-1.cloud.dwavesys.com/sapi/v2/")
-
-    env = {
-        "DWAVE_API_TOKEN": dwave_api_key,
-        "DWAVE_API_SOLVER": dwave_api_solver,
-        "DWAVE_API_ENDPOINT": dwave_region_url,
-    }
-    # Remove None values
-    env = {k: v for k, v in env.items() if v}
-    sys.exit(_run_p2p_node("qpu", host, port, peer, env_overrides=env, genesis_config_file=genesis_config))
+    sys.exit(_run_network_node_sync(conf, genesis_config))
 
 
 # -----------------------------

@@ -16,6 +16,7 @@ import copy
 
 from blake3 import blake3
 
+from shared.base_miner import MiningResult
 from shared.block import Block, MinerInfo
 from shared.node import Node
 
@@ -76,6 +77,8 @@ def get_local_ip() -> str:
         # Fallback to localhost
         return "127.0.0.1"
 
+
+
 @dataclass
 class Message:
     """Base message structure for gossip communication."""
@@ -89,22 +92,26 @@ class Message:
 class NetworkNode(Node):
     """Peer-to-peer node for quantum blockchain network."""
     
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, genesis_block: Block):
         self.bind_address = config.get("listen", "127.0.0.1")
         self.port = config.get("port", 20049)
 
         self.node_name = config.get("node_name", socket.getfqdn())
-        self.public_host = config.get("public_host", f"{get_public_ip()}:{self.port}")
-        
+        self.public_host = config.get("public_host", f"{get_local_ip()}:{self.port}")
+        # Default to local_ip only when we are listening on a local host.
+        if self.bind_address != "127.0.0.1":
+            self.public_host = config.get("public_host", f"{get_public_ip()}:{self.port}")
+
         self.secret = config.get("secret", f"quip network node secret {random.randint(0, 1000000)}")
         self.auto_mine = config.get("auto_mine", False)
 
-        self.heartbeat_interval = config.get("heartbeat_interval", 15)
-        self.heartbeat_timeout = config.get("heartbeat_timeout", 300)
-        self.node_timeout = config.get("node_timeout", 3)
+        # Durations as float seconds
+        self.heartbeat_interval = float(config.get("heartbeat_interval", 15))
+        self.heartbeat_timeout = float(config.get("heartbeat_timeout", 300))
+        self.node_timeout = float(config.get("node_timeout", 3))
 
         self.initial_peers = config.get("peer", ["nodes.quip.network:20049"])
-        self.fanout = config.get("fanout", 3)
+        self.fanout = int(config.get("fanout", 3))
 
         self.net_lock = asyncio.Lock()
         self.running = False
@@ -112,7 +119,7 @@ class NetworkNode(Node):
 
         self.gossip_lock = asyncio.Lock()
         self.recent_messages = set()
-        
+
         # Callbacks
         self.on_new_node: Optional[Callable] = None
         self.on_node_lost: Optional[Callable] = None
@@ -122,12 +129,12 @@ class NetworkNode(Node):
         self.on_block_mined = self._on_block_received
         self.on_mining_started = self._network_on_mining_started
         self.on_mining_stopped = self._network_on_mining_stopped
-        
+
         # Web server
         self.app = web.Application()
         self.setup_routes()
         self.runner = None
-        
+
         # Background tasks
         self.heartbeat_task = None
         self.cleanup_task = None
@@ -138,7 +145,7 @@ class NetworkNode(Node):
             "gpu": config.get("gpu", None),
             "qpu": config.get("qpu", None)
         }
-        super().__init__(self.node_name, self.miners_config, secret=self.secret)
+        super().__init__(self.node_name, self.miners_config, genesis_block, secret=self.secret)
 
     def setup_routes(self):
         """Setup HTTP routes for P2P communication."""
@@ -207,23 +214,23 @@ class NetworkNode(Node):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in heartbeat loop: {e}")
+                logger.exception("Error in heartbeat loop")
 
     async def node_cleanup_loop(self):
         """Remove dead nodes from registry."""
         while self.running:
             try:
-                await asyncio.sleep(self.node_timeout / 2)
-                
+                await asyncio.sleep(self.heartbeat_timeout / 2)
+
                 # Find dead nodes
                 current_time = time.time()
                 dead_nodes = []
-                
+
                 async with self.net_lock:
                     for host, node_info in list(self.peers.items()):
-                        if host not in self.heartbeats or current_time - self.heartbeats[host] > self.node_timeout:
+                        if host not in self.heartbeats or current_time - self.heartbeats[host] > self.heartbeat_timeout:
                             dead_nodes.append(host)
-                
+
                 # Remove dead nodes
                 for host in dead_nodes:
                     await self.remove_node(host)
@@ -231,7 +238,7 @@ class NetworkNode(Node):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in cleanup loop: {e}")
+                logger.exception("Error in cleanup loop")
 
     async def server_loop(self):
         """Main server loop."""
@@ -244,7 +251,7 @@ class NetworkNode(Node):
 
             # If we are not connected and not in auto-mine mode, sleep and retry
             if not connected and not self.auto_mine:
-                logger.error("Not connected to network, retrying in {self.node_timeout} seconds...")
+                logger.error(f"Not connected to network, retrying in {self.node_timeout} seconds...")
                 await asyncio.sleep(self.node_timeout)
                 continue
             elif not connected and self.auto_mine:
@@ -265,10 +272,28 @@ class NetworkNode(Node):
             # If we are synchronized, check if we are mining. If not, start mining on the next block.
             if not self._is_mining:
                 latest_block = self.get_latest_block()
-                await self.mine_block(latest_block)
-                logger.info("Started mining on next block {latest_block.header.index + 1}...")
+                # Create task with exception handler to crash on ValueError
+                task = asyncio.create_task(self.mine_block(latest_block))
+                task.add_done_callback(self._handle_mining_task_exception)
 
             await asyncio.sleep(5)
+
+    def _handle_mining_task_exception(self, task: asyncio.Task):
+        """Handle exceptions from mining tasks - crash on ValueError."""
+        if task.done() and not task.cancelled():
+            try:
+                task.result()  # This will raise the exception if one occurred
+            except ValueError as e:
+                # Shutdown miner workers and stop the event loop to crash the program
+                logger.error(f"ValueError in mining task - shutting down: {e}")
+                self.close()  # Shutdown miner workers first
+                loop = asyncio.get_event_loop()
+                loop.stop()
+                sys.exit(-1)
+            except Exception as e:
+                # Log other exceptions but don't crash
+                logger.error(f"Exception in mining task: {e}")
+
 
     #############################
     ## Internal Event Handlers ##
@@ -299,6 +324,30 @@ class NetworkNode(Node):
     #######################
     ## Control functions ##
     #######################
+
+    async def mine_block(self, previous_block: Block) -> Optional[MiningResult]:
+        """Mine a block and broadcast if successful."""
+        result = await super().mine_block(previous_block)
+        if not result:
+            return None
+
+        ## TODO: Pull current mempool and put it in here.
+        data = f"{self.node_id} was here"
+        wb = self.build_block(previous_block, result, data.encode())
+        wb = self.sign_block(wb)
+
+        if not wb.hash:
+            raise ValueError("Failed to finalize block")
+
+        logger.info(f"Block {wb.header.index}-{wb.hash.hex()[:8]} mined on this node!")
+        accepted = await self.receive_block(wb)
+        if not accepted:
+            logger.warning(f"Block {wb.header.index}-{wb.hash.hex()[:8]} rejected by network!")
+            return None
+        
+        asyncio.create_task(self.gossip_block(wb))
+        return result
+
 
     async def check_synchronized(self) -> int: 
         """Check if we are synchronized with the network.
@@ -338,28 +387,31 @@ class NetworkNode(Node):
         for block_number in range(my_latest_block.header.index + 1, current_head + 1):
             block = None
             tries = 0
+            backoff_sleep = 0.5
             while not block:
                 if tries > 3:
                     raise RuntimeError(f"Failed to get block {block_number} from any peer")
                 random_peer = random.choice(list(self.peers.keys()))
                 block = await self.get_peer_block(random_peer, block_number)
                 if not block:
+                    await asyncio.sleep(backoff_sleep * (tries + 1))
                     continue
                 status = await self.receive_block(block)
                 if not status:
                     logger.warning(f"Failed to add block {block_number} from {random_peer}")
                     block = None
                     tries += 1
+                    await asyncio.sleep(backoff_sleep * (tries + 1))
                     continue
                 logger.info(f"Added block {block_number} from {random_peer}")
 
     async def is_connected(self) -> bool:
         """Ensure we are connected to the network."""
         for _, status in self.heartbeats.items():
-            if time.time() - status < self.node_timeout:
+            if time.time() - status < self.heartbeat_timeout:
                 return True
         return False
-    
+
     async def connect_to_network(self) -> bool:
         """Connect to the network."""
         for peer_address in self.initial_peers:
@@ -376,37 +428,43 @@ class NetworkNode(Node):
             # Send join request
             async with aiohttp.ClientSession() as session:
                 data = {
-                    "address": self.public_host,
+                    "host": self.public_host,
                     "version": "0.0.0",
                     "capabilities": ["mining", "relay"],
-                    "info": self.info().to_network()
+                    # Serialize MinerInfo as JSON string for transport
+                    "info": self.info().to_json()
                 }
-                
-                async with session.post(f"http://{peer_address}/join", json=data) as resp:
+
+                async with session.post(
+                    f"http://{peer_address}/join",
+                    json=data,
+                    timeout=aiohttp.ClientTimeout(total=self.node_timeout)
+                ) as resp:
                     if resp.status == 200:
                         result = await resp.json()
-                        
+
                         # Add all nodes from the peer's node list
                         peers_found = 0
-                        for peers_data in result.get("peers", {}):
-                            for peer_host, peer_info in peers_data.items():
-                                # except ourselves
-                                if peer_host == self.public_host:
-                                    continue
-                                await self.add_peer(peer_host, peer_info)
-                                peers_found += 1
-                        
+                        peers_map = result.get("peers", {}) or {}
+                        for peer_host, peer_info_json in peers_map.items():
+                            # except ourselves
+                            if peer_host == self.public_host:
+                                continue
+                            info = MinerInfo.from_json(peer_info_json)
+                            await self.add_peer(peer_host, info)
+                            peers_found += 1
+
                         logger.info(f"Successfully joined network via {peer_address}")
-                        logger.info(f"Discovered {peers_found} peers") # type: ignore
+                        logger.info(f"Discovered {peers_found} peers")
                         return True
                     else:
                         logger.error(f"Failed to join via {peer_address}: {resp.status}")
                         return False
-                        
+
         except Exception as e:
-            logger.error(f"Error connecting to peer {peer_address}: {e}")
+            logger.warning(f"Failed to connect to peer {peer_address}: {e}")
             return False
-    
+
     async def add_peer(self, host: str, info: MinerInfo) -> bool:
         """Add a node to our registry."""
         if host == self.public_host:
@@ -441,10 +499,11 @@ class NetworkNode(Node):
                 async with session.post(
                     f"http://{node_host}/heartbeat",
                     json=data,
-                    timeout=aiohttp.ClientTimeout(total=3)
+                    timeout=aiohttp.ClientTimeout(total=self.node_timeout)
                 ) as resp:
                     return resp.status == 200
         except Exception:
+            logger.exception(f"Error sending heartbeat to {node_host}")
             return False
 
     async def get_peer_status(self, host: str) -> Optional[dict]:
@@ -453,17 +512,17 @@ class NetworkNode(Node):
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     f"http://{host}/status",
-                    timeout=aiohttp.ClientTimeout(total=5)
+                    timeout=aiohttp.ClientTimeout(total=self.node_timeout)
                 ) as resp:
                     if resp.status == 200:
                         return await resp.json()
                     else:
                         logger.debug(f"Failed to get status from {host}: HTTP {resp.status}")
                         return None
-        except Exception as e:
-            logger.debug(f"Error getting status from {host}: {e}")
+        except Exception:
+            logger.exception(f"Error getting status from {host}")
             return None
-        
+
     async def get_peer_block(self, host: str, block_number: int = 0) -> Optional[Block]:
         """Get a block from a peer node."""
         try:
@@ -472,8 +531,8 @@ class NetworkNode(Node):
                 req = f"/block/{block_number}"
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    req,
-                    timeout=aiohttp.ClientTimeout(total=5)
+                    f"http://{host}{req}",
+                    timeout=aiohttp.ClientTimeout(total=self.node_timeout)
                 ) as resp:
                     if resp.status == 200:
                         block_data = await resp.json()
@@ -483,8 +542,8 @@ class NetworkNode(Node):
                     else:
                         logger.debug(f"Failed to get block from {host}: HTTP {resp.status}")
                         return None
-        except Exception as e:
-            logger.debug(f"Error getting block from {host}: {e}")
+        except Exception:
+            logger.exception(f"Error getting block from {host}")
             return None
 
     async def refresh_peer_info(self, host: str) -> bool:
@@ -498,8 +557,8 @@ class NetworkNode(Node):
 
                 logger.debug(f"Refreshed info for peer {host}")
                 return True
-            except Exception as e:
-                logger.debug(f"Error parsing peer info from {host}: {e}")
+            except Exception:
+                logger.exception(f"Error parsing peer info from {host}")
                 return False
         return False
 
@@ -525,8 +584,8 @@ class NetworkNode(Node):
                     timeout=aiohttp.ClientTimeout(total=5)
                 ) as resp:
                     return resp.status == 200
-        except Exception as e:
-            logger.debug(f"Failed to send message to {host}: {e}")
+        except Exception:
+            logger.exception(f"Failed to send message to {host}")
             return False
 
     async def gossip(self, message: Message):
@@ -634,7 +693,7 @@ class NetworkNode(Node):
             return web.json_response({"status": status})
             
         except Exception as e:
-            logger.error(f"Error handling broadcast: {e}")
+            logger.exception("Error handling broadcast")
             return web.json_response({"error": str(e)}, status=500)
 
 
@@ -643,30 +702,36 @@ class NetworkNode(Node):
         try:
             data = await request.json()
             new_node_address = data.get("host")
-            new_node_info = MinerInfo.from_network(data.get("info"))
-            
-            if not new_node_address:
-                return web.json_response({"error": "Missing address"}, status=400)
-            
+            info_field = data.get("info")
+            # Expect MinerInfo as JSON string
+            new_node_info = MinerInfo.from_json(info_field) if info_field else None
+
+            if not new_node_address or not new_node_info:
+                return web.json_response({"error": "Missing host or info"}, status=400)
+
             # Add the new node
             await self.add_peer(new_node_address, new_node_info)
-            
-            # Return our node list
+
+            # Return our node list as JSON-serializable map host -> MinerInfo JSON string
             async with self.net_lock:
-                peers_data = copy.deepcopy(self.peers)
+                peers_snapshot = copy.deepcopy(self.peers)
+
+            peers_payload: Dict[str, str] = {}
+            for host, info in peers_snapshot.items():
+                peers_payload[host] = info.to_json()
 
             # Add ourself
-            peers_data[self.public_host] = self.info()
-            
+            peers_payload[self.public_host] = self.info().to_json()
+
             return web.json_response({
                 "status": "ok",
-                "peers": peers_data
+                "peers": peers_payload
             })
-            
+
         except Exception as e:
-            logger.error(f"Error handling join: {e}")
+            logger.exception("Error handling join")
             return web.json_response({"error": str(e)}, status=500)
-    
+
     async def handle_put_heartbeat(self, request: web.Request) -> web.Response:
         """Handle heartbeat from another node."""
         try:
@@ -685,9 +750,9 @@ class NetworkNode(Node):
             return web.json_response({"status": "ok"})
             
         except Exception as e:
-            logger.error(f"Error handling heartbeat: {e}")
+            logger.exception("Error handling heartbeat")
             return web.json_response({"error": str(e)}, status=500)
-            
+
     async def handle_put_block(self, request: web.Request) -> web.Response:
         """Handle new block - this is largely open for DEBUG purposes as new blocks
         should be sent via gossip."""
@@ -710,9 +775,9 @@ class NetworkNode(Node):
             return web.json_response({"status": status})
             
         except Exception as e:
-            logger.error(f"Error handling new block: {e}")
+            logger.exception("Error handling new block")
             return web.json_response({"error": str(e)}, status=500)
-    
+
     #######################
     ## HTTP GET Handlers ##
     #######################
@@ -756,7 +821,7 @@ class NetworkNode(Node):
                 return web.json_response(json.loads(block.to_json()))
 
         except Exception as e:
-            logger.error(f"Error getting latest block: {e}")
+            logger.exception("Error getting latest block")
             return web.json_response({"error": str(e)}, status=500)
 
     async def handle_get_block(self, request: web.Request) -> web.Response:
@@ -790,5 +855,5 @@ class NetworkNode(Node):
                 return web.json_response(json.loads(block.to_json()))
 
         except Exception as e:
-            logger.error(f"Error getting block {number_str}: {e}")
+            logger.exception(f"Error getting block {number_str}")
             return web.json_response({"error": str(e)}, status=500)

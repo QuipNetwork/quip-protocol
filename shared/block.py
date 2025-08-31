@@ -1,5 +1,6 @@
 """Block data structures and parsing utilities for quantum blockchain."""
 
+from venv import logger
 from blake3 import blake3
 import json
 import time
@@ -108,11 +109,9 @@ class QuantumProof:
 
     def to_json(self) -> dict:
         """Serialize to JSON-compatible dictionary."""
+        proof_data = self.to_network()
         return {
-            'nonce': self.nonce,
-            'nodes': self.nodes,
-            'edges': [(u, v) for u, v in self.edges],
-            'solutions': self.solutions,
+            'proof_data': proof_data.hex(),
             'mining_time': self.mining_time,
             'energy': self.energy,
             'diversity': self.diversity,
@@ -122,16 +121,14 @@ class QuantumProof:
     @classmethod
     def from_json(cls, data: dict) -> 'QuantumProof':
         """Deserialize from JSON-compatible dictionary."""
-        return cls(
-            nonce=data['nonce'],
-            nodes=data['nodes'],
-            edges=[tuple(edge) for edge in data['edges']],
-            solutions=data['solutions'],
-            mining_time=data['mining_time'],
-            energy=data.get('energy'),
-            diversity=data.get('diversity'),
-            num_valid_solutions=data.get('num_valid_solutions')
-        )
+        proof_data = bytes.fromhex(data['proof_data'])
+        quantum_proof = QuantumProof.from_network(proof_data)
+        # NOTE: kind of a hack...
+        quantum_proof.mining_time = data['mining_time']
+        quantum_proof.energy = data.get('energy')
+        quantum_proof.diversity = data.get('diversity')
+        quantum_proof.num_valid_solutions = data.get('num_valid_solutions')
+        return quantum_proof
 
     def compute_derived_fields(self, requirements: 'NextBlockRequirements', block: 'Block'):
         """Calculate derived fields from solutions and requirements using Ising model.
@@ -525,11 +522,13 @@ class Block:
             True if block is valid, False otherwise
         """
         if not self.quantum_proof or not self.miner_info:
+            logger.error(f"Block {self.header.index} rejected: missing quantum proof or miner info")
             return False
 
         # Get requirements from previous block
         requirements = previous_block.next_block_requirements
         if not requirements:
+            logger.error(f"Block {self.header.index} rejected: missing next block requirements")
             return False
         
         # TODO: Validate difficulty adjustment for next block here. 
@@ -540,10 +539,12 @@ class Block:
     def _validate_quantum_proof(self, requirements: NextBlockRequirements) -> bool:
         """Validate quantum proof against requirements and compute metrics."""
         if not self.quantum_proof:
+            logger.error(f"Block {self.header.index} rejected: no quantum proof")
             return False
 
         solutions = self.quantum_proof.solutions
         if not solutions:
+            logger.error(f"Block {self.header.index} rejected: no solutions in quantum proof")
             return False
 
         seed = ising_seed_from_block(self.header.previous_hash, self.header.timestamp, self.header.index, self.quantum_proof.nonce)
@@ -566,11 +567,13 @@ class Block:
         valid_solutions = [solutions[i] for i in valid_indices]
 
         if len(valid_solutions) < requirements.min_solutions:
+            logger.error(f"Block {self.header.index} rejected: insufficient valid solutions ({len(valid_solutions)} < {requirements.min_solutions})")
             return False
 
         # Calculate diversity using shared utility
         diversity = calculate_diversity(valid_solutions)
         if diversity < requirements.min_diversity:
+            logger.error(f"Block {self.header.index} rejected: insufficient diversity ({diversity} < {requirements.min_diversity})")
             return False
 
         # Set computed fields

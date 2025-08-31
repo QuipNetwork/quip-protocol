@@ -1,6 +1,7 @@
 """Node class for quantum blockchain network participation."""
 
 import asyncio
+from asyncio.log import logger
 import json
 import multiprocessing
 import os
@@ -28,7 +29,8 @@ from shared.miner_worker import MinerHandle, miner_worker_main
 class Node:
     """Node that manages multiple miners and handles blockchain network participation."""
 
-    def __init__(self, node_id: str, miners_config: Dict[str, Any], secret: Optional[str] = None,
+    def __init__(self, node_id: str, miners_config: Dict[str, Any], genesis_block: Block,
+                 secret: Optional[str] = None,
                  on_block_mined: Optional[Callable[[Block], None]] = None,
                  on_mining_started: Optional[Callable[[Block], None]] = None,
                  on_mining_stopped: Optional[Callable[[], None]] = None):
@@ -99,6 +101,7 @@ class Node:
         # Initialize blockchain
         self.chain: List[Block] = []
         self.chain_lock = asyncio.Lock()
+        self.chain.append(genesis_block)
 
     def _initialize_miners(self, cfg: Dict[str, Any]):
         """Initialize persistent miner workers based on configuration (TOML)."""
@@ -183,18 +186,31 @@ class Node:
         """Receive a block from the network."""
         # 1. Check if we already have this block or a newer one at this index
         cur_block = self.get_block(block.header.index)
+        if not block.hash or not block.raw or not block.signature:
+            logger.error(f"Block {block.header.index} rejected: missing hash, raw, or signature - it's not been finalized/signed.")
+            return False
+        
         if cur_block is not None:
+            if not cur_block.hash:
+                raise RuntimeError("Current block is not finalized!")
+
             # Are we newer?
             if cur_block.header.timestamp < block.header.timestamp:
+                logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have an older block at this index ({cur_block.header.timestamp} < {block.header.timestamp}), {cur_block.hash.hex()[:8]}")
                 return False
             
         # 2. Do we have more than 6 blocks after it?
         head = self.get_latest_block()
+        if not head.hash and head.header.index > 0:
+            raise RuntimeError("Head block is not finalized!")
+    
         if head.header.index > block.header.index + 6:
+            logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have more than 6 blocks after it ({head.header.index} > {block.header.index + 6})")
             return False
 
         prev_block = self.get_block(block.header.index - 1)
         if prev_block is None:
+            logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we do not have the previous block ({block.header.index - 1})")
             return False
 
         # 3. Check Signature
@@ -202,6 +218,7 @@ class Node:
         block_bytes = block.raw
         signature = block.signature
         if not block_bytes or not signature:
+            logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: missing block bytes or signature")
             return False
         if not self.crypto.verify_combined_signature(
             block.miner_info.ecdsa_public_key,
@@ -209,10 +226,14 @@ class Node:
             block_bytes,
             signature
         ):
+            logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid signature")
             return False
 
         # 4. Validate the Quantum Proof and other block artifacts.
+        block.quantum_proof.compute_derived_fields(prev_block.next_block_requirements, block)
         if not block.validate_block(prev_block):
+            logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid quantum proof")
+            logger.error(f"Quantum Proof: {block.quantum_proof.to_json()}, rq: {prev_block.next_block_requirements.to_json()}")
             return False
         
         async with self.chain_lock:
@@ -288,7 +309,7 @@ class Node:
             next_wots_public_key=self.crypto.wots_plus_public_key
         )
 
-    async def mine_block(self, previous_block: Block) -> Optional[Block]:
+    async def mine_block(self, previous_block: Block) -> Optional[MiningResult]:
         """
         Async method to coordinate mining across all miners of this node for a block.
 
@@ -438,6 +459,14 @@ class Node:
             diversity=mining_result.diversity,
             num_valid_solutions=mining_result.num_valid
         )
+        quantum_proof.compute_derived_fields(previous_block.next_block_requirements, previous_block)
+        if (quantum_proof.energy is None or quantum_proof.energy != mining_result.energy):
+            raise ValueError(f"Miner reported bad energy {mining_result.energy} but we computed {quantum_proof.energy}")
+        if (quantum_proof.diversity is None or quantum_proof.diversity != mining_result.diversity):
+            raise ValueError(f"Miner reported bad diversity {mining_result.diversity} but we computed {quantum_proof.diversity}")
+        if (quantum_proof.num_valid_solutions is None or quantum_proof.num_valid_solutions != mining_result.num_valid):
+            raise ValueError(f"Miner reported bad num_valid_solutions {mining_result.num_valid} but we computed {quantum_proof.num_valid_solutions}")
+
         next_block_requirements = self.compute_next_block_requirements(previous_block, mining_result)
         next_block = block.Block(
             header=header,
