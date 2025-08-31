@@ -106,6 +106,33 @@ class QuantumProof:
 
         return cls(nonce=nonce, nodes=nodes, edges=edges, solutions=solutions, mining_time=mining_time)
 
+    def to_json(self) -> dict:
+        """Serialize to JSON-compatible dictionary."""
+        return {
+            'nonce': self.nonce,
+            'nodes': self.nodes,
+            'edges': [(u, v) for u, v in self.edges],
+            'solutions': self.solutions,
+            'mining_time': self.mining_time,
+            'energy': self.energy,
+            'diversity': self.diversity,
+            'num_valid_solutions': self.num_valid_solutions
+        }
+
+    @classmethod
+    def from_json(cls, data: dict) -> 'QuantumProof':
+        """Deserialize from JSON-compatible dictionary."""
+        return cls(
+            nonce=data['nonce'],
+            nodes=data['nodes'],
+            edges=[tuple(edge) for edge in data['edges']],
+            solutions=data['solutions'],
+            mining_time=data['mining_time'],
+            energy=data.get('energy'),
+            diversity=data.get('diversity'),
+            num_valid_solutions=data.get('num_valid_solutions')
+        )
+
     def compute_derived_fields(self, requirements: 'NextBlockRequirements', block: 'Block'):
         """Calculate derived fields from solutions and requirements using Ising model.
         Requires the Block for deterministic model generation.
@@ -282,6 +309,25 @@ class BlockHeader:
             data_hash=data_hash
         )
 
+    def to_json(self) -> dict:
+        """Serialize to JSON-compatible dictionary."""
+        return {
+            'previous_hash': self.previous_hash.hex(),
+            'index': self.index,
+            'timestamp': self.timestamp,
+            'data_hash': self.data_hash.hex()
+        }
+
+    @classmethod
+    def from_json(cls, data: dict) -> 'BlockHeader':
+        """Deserialize from JSON-compatible dictionary."""
+        return cls(
+            previous_hash=bytes.fromhex(data['previous_hash']),
+            index=data['index'],
+            timestamp=data['timestamp'],
+            data_hash=bytes.fromhex(data['data_hash'])
+        )
+
 
 @dataclass
 class NextBlockRequirements:
@@ -317,6 +363,25 @@ class NextBlockRequirements:
             min_diversity=min_diversity,
             min_solutions=min_solutions,
             timeout_to_difficulty_adjustment_decay=timeout_to_difficulty_adjustment_decay
+        )
+
+    def to_json(self) -> dict:
+        """Serialize to JSON-compatible dictionary."""
+        return {
+            'difficulty_energy': self.difficulty_energy,
+            'min_diversity': self.min_diversity,
+            'min_solutions': self.min_solutions,
+            'timeout_to_difficulty_adjustment_decay': self.timeout_to_difficulty_adjustment_decay
+        }
+
+    @classmethod
+    def from_json(cls, data: dict) -> 'NextBlockRequirements':
+        """Deserialize from JSON-compatible dictionary."""
+        return cls(
+            difficulty_energy=data['difficulty_energy'],
+            min_diversity=data['min_diversity'],
+            min_solutions=data['min_solutions'],
+            timeout_to_difficulty_adjustment_decay=data['timeout_to_difficulty_adjustment_decay']
         )
 
 @dataclass
@@ -531,6 +596,52 @@ class Block:
                 distances.append(normalized_distance)
 
         return sum(distances) / len(distances) if distances else 0.0
+
+    def to_json(self) -> str:
+        """Serialize block to JSON string."""
+        data = {
+            'header': self.header.to_json(),
+            'miner_info': self.miner_info.to_json(),
+            'quantum_proof': self.quantum_proof.to_json(),
+            'next_block_requirements': self.next_block_requirements.to_json(),
+            'data': self.data.hex(),
+            'raw': self.raw.hex() if self.raw else None,
+            'hash': self.hash.hex() if self.hash else None,
+            'signature': self.signature.hex() if self.signature else None
+        }
+        return json.dumps(data, indent=2)
+
+    @classmethod
+    def from_json(cls, json_str: str) -> 'Block':
+        """Deserialize block from JSON string."""
+        data = json.loads(json_str)
+
+        # Parse components using their own from_json methods
+        header = BlockHeader.from_json(data['header'])
+        miner_info = MinerInfo.from_json(data['miner_info'])
+        quantum_proof = QuantumProof.from_json(data['quantum_proof'])
+        next_block_requirements = NextBlockRequirements.from_json(data['next_block_requirements'])
+
+        # Use preserved raw bytes if available, otherwise reconstruct
+        raw_bytes = bytes.fromhex(data['raw']) if data.get('raw') else b''
+
+        # Create block
+        block = cls(
+            header=header,
+            miner_info=miner_info,
+            quantum_proof=quantum_proof,
+            next_block_requirements=next_block_requirements,
+            data=bytes.fromhex(data['data']),
+            raw=raw_bytes,
+            hash=bytes.fromhex(data['hash']) if data.get('hash') else b'',
+            signature=bytes.fromhex(data['signature']) if data.get('signature') else b''
+        )
+
+        # If raw bytes weren't preserved, reconstruct them for signature verification
+        if not raw_bytes:
+            block.finalize()
+
+        return block
 
 
 

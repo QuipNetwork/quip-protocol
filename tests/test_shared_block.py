@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from blake3 import blake3
 import time
+import json
 
 from shared.block import (
     QuantumProof,
@@ -17,8 +18,8 @@ def sample_quantum_proof():
         nonce=123456789,
         solutions=[[1, -1, 0], [0, 1, -1], [-5], [3]],
         mining_time=1.234,
-        node_list=[0, 1, 2, 3],
-        edge_list=[(0, 1), (1, 2), (2, 3)],
+        nodes=[0, 1, 2, 3],
+        edges=[(0, 1), (1, 2), (2, 3)],
     )
 
 
@@ -43,10 +44,9 @@ def sample_requirements():
 
 
 def sample_header(data_hash: bytes | None = None):
-    # Block.from_network currently validates header.data_hash against an empty raw slice.
-    # Set data_hash to blake3(b"").digest() for compatibility.
+    # Use the hash of "hello world" to match the data in make_sample_block
     if data_hash is None:
-        data_hash = blake3(b"").digest()
+        data_hash = blake3(b"hello world").digest()
     return BlockHeader(
         previous_hash=b"\x00" * 32,
         index=1,
@@ -116,10 +116,28 @@ def make_sample_block():
         miner_info=mi,
         quantum_proof=qp,
         next_block_requirements=req,
-        data="hello world",
+        data=b"hello world",
         raw=b"",
         hash=b"",
         signature=b"SIG",
+    )
+
+
+def make_unsigned_sample_block():
+    """Create a sample block without signature for tests that need to finalize."""
+    hdr = sample_header()
+    mi = sample_miner_info()
+    qp = sample_quantum_proof()
+    req = sample_requirements()
+    return Block(
+        header=hdr,
+        miner_info=mi,
+        quantum_proof=qp,
+        next_block_requirements=req,
+        data=b"hello world",
+        raw=b"",
+        hash=b"",
+        signature=b"",  # No signature
     )
 
 
@@ -145,14 +163,17 @@ def test_block_to_from_network_roundtrip():
     assert blk2.signature == blk.signature
 
     # Derived fields are computed by .from_network
-    assert isinstance(blk2.raw, (bytes, bytearray)) and len(blk2.raw) >= 0
-    assert isinstance(blk2.hash, (bytes, bytearray)) and len(blk2.hash) == 32
+    assert blk2.raw is not None and isinstance(blk2.raw, (bytes, bytearray)) and len(blk2.raw) >= 0
+    assert blk2.hash is not None and isinstance(blk2.hash, (bytes, bytearray)) and len(blk2.hash) == 32
 
 
 def test_block_compute_derived_fields_sets_hash_and_raw():
-    blk = make_sample_block()
+    blk = make_unsigned_sample_block()
     blk.finalize()
-    assert blk.raw == blk.to_network()[:-len(blk.signature)]
+    assert blk.raw is not None
+    assert blk.hash is not None
+    # For unsigned blocks, raw should equal the network representation
+    assert blk.raw == blk.to_network()
     assert blk.hash == blake3(blk.raw).digest()
 
 
@@ -179,4 +200,234 @@ def test_block_validate_block_true_and_false():
     )
     prev.next_block_requirements = harsh
     assert blk.validate_block(prev) is False
+
+
+# JSON Serialization Tests
+
+def test_block_header_json_roundtrip():
+    """Test BlockHeader JSON serialization and deserialization."""
+    hdr = sample_header()
+
+    # Serialize to JSON dict
+    json_dict = hdr.to_json()
+    assert isinstance(json_dict, dict)
+    assert 'previous_hash' in json_dict
+    assert 'index' in json_dict
+    assert 'timestamp' in json_dict
+    assert 'data_hash' in json_dict
+
+    # Verify hex encoding
+    assert json_dict['previous_hash'] == hdr.previous_hash.hex()
+    assert json_dict['data_hash'] == hdr.data_hash.hex()
+
+    # Deserialize from JSON dict
+    hdr2 = BlockHeader.from_json(json_dict)
+
+    # Verify roundtrip
+    assert hdr2.previous_hash == hdr.previous_hash
+    assert hdr2.index == hdr.index
+    assert hdr2.timestamp == hdr.timestamp
+    assert hdr2.data_hash == hdr.data_hash
+
+
+def test_quantum_proof_json_roundtrip():
+    """Test QuantumProof JSON serialization and deserialization."""
+    qp = sample_quantum_proof()
+
+    # Serialize to JSON dict
+    json_dict = qp.to_json()
+    assert isinstance(json_dict, dict)
+    assert 'nonce' in json_dict
+    assert 'nodes' in json_dict
+    assert 'edges' in json_dict
+    assert 'solutions' in json_dict
+    assert 'mining_time' in json_dict
+
+    # Deserialize from JSON dict
+    qp2 = QuantumProof.from_json(json_dict)
+
+    # Verify roundtrip
+    assert qp2.nonce == qp.nonce
+    assert qp2.nodes == qp.nodes
+    assert qp2.edges == qp.edges
+    assert qp2.solutions == qp.solutions
+    assert qp2.mining_time == qp.mining_time
+    assert qp2.energy == qp.energy
+    assert qp2.diversity == qp.diversity
+    assert qp2.num_valid_solutions == qp.num_valid_solutions
+
+
+def test_next_block_requirements_json_roundtrip():
+    """Test NextBlockRequirements JSON serialization and deserialization."""
+    req = sample_requirements()
+
+    # Serialize to JSON dict
+    json_dict = req.to_json()
+    assert isinstance(json_dict, dict)
+    assert 'difficulty_energy' in json_dict
+    assert 'min_diversity' in json_dict
+    assert 'min_solutions' in json_dict
+    assert 'timeout_to_difficulty_adjustment_decay' in json_dict
+
+    # Deserialize from JSON dict
+    req2 = NextBlockRequirements.from_json(json_dict)
+
+    # Verify roundtrip
+    assert req2.difficulty_energy == req.difficulty_energy
+    assert req2.min_diversity == req.min_diversity
+    assert req2.min_solutions == req.min_solutions
+    assert req2.timeout_to_difficulty_adjustment_decay == req.timeout_to_difficulty_adjustment_decay
+
+
+def test_miner_info_json_roundtrip():
+    """Test MinerInfo JSON serialization and deserialization."""
+    mi = sample_miner_info()
+
+    # Serialize to JSON string
+    json_str = mi.to_json()
+    assert isinstance(json_str, str)
+
+    # Parse back to verify it's valid JSON
+    json_dict = json.loads(json_str)
+    assert 'miner_id' in json_dict
+    assert 'miner_type' in json_dict
+    assert 'reward_address' in json_dict
+    assert 'ecdsa_public_key' in json_dict
+    assert 'wots_public_key' in json_dict
+    assert 'next_wots_public_key' in json_dict
+
+    # Deserialize from JSON string
+    mi2 = MinerInfo.from_json(json_str)
+
+    # Verify roundtrip
+    assert mi2.miner_id == mi.miner_id
+    assert mi2.miner_type == mi.miner_type
+    assert mi2.reward_address == mi.reward_address
+    assert mi2.ecdsa_public_key == mi.ecdsa_public_key
+    assert mi2.wots_public_key == mi.wots_public_key
+    assert mi2.next_wots_public_key == mi.next_wots_public_key
+
+
+def test_block_json_roundtrip_with_raw_preservation():
+    """Test Block JSON serialization with raw field preservation."""
+    blk = make_sample_block()
+    blk.signature = b""  # Clear signature so we can finalize
+    blk.finalize()  # Generate raw bytes and hash
+
+    # Verify we have raw bytes and hash
+    assert blk.raw is not None and len(blk.raw) > 0
+    assert blk.hash is not None and len(blk.hash) == 32
+
+    # Serialize to JSON string
+    json_str = blk.to_json()
+    assert isinstance(json_str, str)
+
+    # Parse back to verify it's valid JSON
+    json_dict = json.loads(json_str)
+    assert 'header' in json_dict
+    assert 'miner_info' in json_dict
+    assert 'quantum_proof' in json_dict
+    assert 'next_block_requirements' in json_dict
+    assert 'data' in json_dict
+    assert 'raw' in json_dict  # Raw field should be present
+    assert 'hash' in json_dict
+    assert 'signature' in json_dict
+
+    # Verify raw field is hex-encoded
+    assert json_dict['raw'] == blk.raw.hex()
+
+    # Deserialize from JSON string
+    blk2 = Block.from_json(json_str)
+
+    # Verify raw bytes are preserved exactly
+    assert blk2.raw == blk.raw
+    assert blk2.hash == blk.hash
+    assert blk2.signature == blk.signature
+
+    # Verify all components match
+    assert blk2.header.previous_hash == blk.header.previous_hash
+    assert blk2.header.index == blk.header.index
+    assert blk2.miner_info.miner_id == blk.miner_info.miner_id
+    assert blk2.quantum_proof.nonce == blk.quantum_proof.nonce
+    assert blk2.data == blk.data
+
+
+def test_block_json_backward_compatibility():
+    """Test Block JSON deserialization from JSON without raw field."""
+    blk = make_sample_block()
+    blk.signature = b""  # Clear signature so we can finalize
+    blk.finalize()  # Generate raw bytes and hash
+
+    # Create JSON without raw field (simulate old format)
+    json_dict = {
+        'header': blk.header.to_json(),
+        'miner_info': blk.miner_info.to_json(),
+        'quantum_proof': blk.quantum_proof.to_json(),
+        'next_block_requirements': blk.next_block_requirements.to_json(),
+        'data': blk.data.hex(),
+        'hash': blk.hash.hex() if blk.hash else None,
+        'signature': blk.signature.hex() if blk.signature else None
+    }
+    json_str = json.dumps(json_dict)
+
+    # Deserialize from JSON without raw field
+    blk2 = Block.from_json(json_str)
+
+    # Verify raw bytes are reconstructed correctly
+    assert blk2.raw is not None and len(blk2.raw) > 0
+    assert blk2.hash == blk.hash  # Hash should match original
+
+    # Verify all components match
+    assert blk2.header.previous_hash == blk.header.previous_hash
+    assert blk2.header.index == blk.header.index
+    assert blk2.miner_info.miner_id == blk.miner_info.miner_id
+    assert blk2.quantum_proof.nonce == blk.quantum_proof.nonce
+    assert blk2.data == blk.data
+
+
+def test_block_json_raw_bytes_preservation():
+    """Test that raw bytes are preserved through JSON roundtrip."""
+    # Create a block and finalize it
+    blk = make_sample_block()
+    blk.signature = b""  # Clear signature so we can finalize
+    blk.finalize()
+
+    # Ensure we have raw bytes
+    assert blk.raw is not None
+    original_raw = blk.raw
+
+    # Serialize to JSON and back
+    json_str = blk.to_json()
+    blk2 = Block.from_json(json_str)
+
+    # Verify raw bytes are preserved exactly
+    assert blk2.raw is not None
+    assert blk2.raw == original_raw
+    assert blk2.hash == blk.hash
+
+
+def test_all_components_json_serialization():
+    """Test that all components can be serialized to JSON independently."""
+    hdr = sample_header()
+    mi = sample_miner_info()
+    qp = sample_quantum_proof()
+    req = sample_requirements()
+
+    # Test all components can serialize to JSON
+    assert isinstance(hdr.to_json(), dict)
+    assert isinstance(mi.to_json(), str)  # MinerInfo returns string
+    assert isinstance(qp.to_json(), dict)
+    assert isinstance(req.to_json(), dict)
+
+    # Test all components can deserialize from JSON
+    hdr2 = BlockHeader.from_json(hdr.to_json())
+    mi2 = MinerInfo.from_json(mi.to_json())
+    qp2 = QuantumProof.from_json(qp.to_json())
+    req2 = NextBlockRequirements.from_json(req.to_json())
+
+    # Verify they match originals
+    assert hdr2.previous_hash == hdr.previous_hash
+    assert mi2.miner_id == mi.miner_id
+    assert qp2.nonce == qp.nonce
+    assert req2.difficulty_energy == req.difficulty_energy
 

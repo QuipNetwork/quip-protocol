@@ -128,12 +128,14 @@ class NetworkNode(Node):
 
     def setup_routes(self):
         """Setup HTTP routes for P2P communication."""
-        self.app.router.add_post('/join', self.handle_join)
-        self.app.router.add_post('/heartbeat', self.handle_heartbeat)
+        self.app.router.add_post('/join', self.handle_put_join)
+        self.app.router.add_post('/heartbeat', self.handle_put_heartbeat)
         self.app.router.add_post('/peers', self.handle_get_peers)
-        self.app.router.add_post('/broadcast', self.handle_broadcast)
-        self.app.router.add_post('/block', self.handle_new_block)
-        self.app.router.add_get('/status', self.handle_status)
+        self.app.router.add_post('/broadcast', self.handle_put_broadcast)
+        self.app.router.add_post('/block', self.handle_put_block)
+        self.app.router.add_get('/status', self.handle_get_status)
+        self.app.router.add_get('/block/', self.handle_get_latest_block)
+        self.app.router.add_get('/block/{number}', self.handle_get_block)
     
     async def start(self):
         """Start the P2P node."""
@@ -166,6 +168,59 @@ class NetworkNode(Node):
             await self.runner.cleanup()
         
         logger.info("Network node stopped")
+
+    ##########################
+    ## Server logic threads ##
+    ##########################
+
+    async def heartbeat_loop(self):
+        """Send heartbeats to all known nodes."""
+        while self.running:
+            try:
+                await asyncio.sleep(self.heartbeat_interval)
+                
+                # Send heartbeat to all nodes
+                tasks = []
+                async with self.net_lock:
+                    for node_host in list(self.peers.keys()):
+                        task = asyncio.create_task(self.send_heartbeat(node_host))
+                        tasks.append(task)
+                
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in heartbeat loop: {e}")
+
+    async def cleanup_loop(self):
+        """Remove dead nodes from registry."""
+        while self.running:
+            try:
+                await asyncio.sleep(self.node_timeout / 2)
+                
+                # Find dead nodes
+                current_time = time.time()
+                dead_nodes = []
+                
+                async with self.net_lock:
+                    for host, node_info in list(self.peers.items()):
+                        if host not in self.heartbeats or current_time - self.heartbeats[host] > self.node_timeout:
+                            dead_nodes.append(host)
+                
+                # Remove dead nodes
+                for host in dead_nodes:
+                    await self.remove_node(host)
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in cleanup loop: {e}")
+
+    #######################
+    ## Control functions ##
+    #######################
     
     async def connect_to_peer(self, peer_address: str) -> bool:
         """Connect to a peer and join the network."""
@@ -273,26 +328,6 @@ class NetworkNode(Node):
             logger.debug(f"Failed to send message to {node_host}: {e}")
             return False
     
-    async def heartbeat_loop(self):
-        """Send heartbeats to all known nodes."""
-        while self.running:
-            try:
-                await asyncio.sleep(self.heartbeat_interval)
-                
-                # Send heartbeat to all nodes
-                tasks = []
-                async with self.net_lock:
-                    for node_host in list(self.peers.keys()):
-                        task = asyncio.create_task(self.send_heartbeat(node_host))
-                        tasks.append(task)
-                
-                if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in heartbeat loop: {e}")
     
     async def send_heartbeat(self, node_host: str) -> bool:
         """Send heartbeat to a specific node."""
@@ -348,34 +383,12 @@ class NetworkNode(Node):
 
         for host in peer_hosts:
             await self.refresh_peer_info(host)
+        
+    #######################
+    ## HTTP PUT Handlers ##
+    #######################
     
-    async def cleanup_loop(self):
-        """Remove dead nodes from registry."""
-        while self.running:
-            try:
-                await asyncio.sleep(self.node_timeout / 2)
-                
-                # Find dead nodes
-                current_time = time.time()
-                dead_nodes = []
-                
-                async with self.net_lock:
-                    for host, node_info in list(self.peers.items()):
-                        if host not in self.heartbeats or current_time - self.heartbeats[host] > self.node_timeout:
-                            dead_nodes.append(host)
-                
-                # Remove dead nodes
-                for host in dead_nodes:
-                    await self.remove_node(host)
-                    
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in cleanup loop: {e}")
-    
-    # HTTP Handlers
-    
-    async def handle_join(self, request: web.Request) -> web.Response:
+    async def handle_put_join(self, request: web.Request) -> web.Response:
         """Handle join request from a new node."""
         try:
             data = await request.json()
@@ -404,7 +417,7 @@ class NetworkNode(Node):
             logger.error(f"Error handling join: {e}")
             return web.json_response({"error": str(e)}, status=500)
     
-    async def handle_heartbeat(self, request: web.Request) -> web.Response:
+    async def handle_put_heartbeat(self, request: web.Request) -> web.Response:
         """Handle heartbeat from another node."""
         try:
             data = await request.json()
@@ -424,15 +437,8 @@ class NetworkNode(Node):
         except Exception as e:
             logger.error(f"Error handling heartbeat: {e}")
             return web.json_response({"error": str(e)}, status=500)
-    
-    async def handle_get_peers(self, request: web.Request) -> web.Response:
-        """Return list of known nodes."""
-        async with self.net_lock:
-            peers_data = copy.deepcopy(self.peers)
         
-        return web.json_response({"peers": peers_data})
-    
-    async def handle_broadcast(self, request: web.Request) -> web.Response:
+    async def handle_put_broadcast(self, request: web.Request) -> web.Response:
         """Handle broadcast message from another node."""
         try:
             data = await request.json()
@@ -455,7 +461,7 @@ class NetworkNode(Node):
             logger.error(f"Error handling broadcast: {e}")
             return web.json_response({"error": str(e)}, status=500)
     
-    async def handle_new_block(self, request: web.Request) -> web.Response:
+    async def handle_put_block(self, request: web.Request) -> web.Response:
         """Handle new block announcement."""
         try:
             block_data = await request.json()
@@ -469,7 +475,11 @@ class NetworkNode(Node):
             logger.error(f"Error handling new block: {e}")
             return web.json_response({"error": str(e)}, status=500)
     
-    async def handle_status(self, request: web.Request) -> web.Response:
+    #######################
+    ## HTTP GET Handlers ##
+    #######################
+    
+    async def handle_get_status(self, request: web.Request) -> web.Response:
         """Return node status."""
         
         return web.json_response({
@@ -479,7 +489,73 @@ class NetworkNode(Node):
             "total_peers": len(self.peers),
             "uptime": time.time() if self.running else 0
         })
-    
+
+    async def handle_get_peers(self, request: web.Request) -> web.Response:
+        """Return list of known nodes."""
+        async with self.net_lock:
+            peers_data = copy.deepcopy(self.peers)
+        
+        return web.json_response({"peers": peers_data})
+
+    async def handle_get_latest_block(self, request: web.Request) -> web.Response:
+        """Return the latest block."""
+        try:
+            block = self.get_latest_block()
+            if block is None:
+                return web.json_response({"error": "No blocks in chain"}, status=404)
+
+            # Check response format
+            format_param = request.query.get('format', 'json')
+            if format_param == 'network':
+                # Return network serialized binary data
+                return web.Response(
+                    body=block.to_network(),
+                    content_type='application/octet-stream',
+                    headers={'Content-Disposition': 'attachment; filename="latest_block.bin"'}
+                )
+            else:
+                # Return JSON (default)
+                return web.json_response(json.loads(block.to_json()))
+
+        except Exception as e:
+            logger.error(f"Error getting latest block: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_get_block(self, request: web.Request) -> web.Response:
+        """Return a specific block by number."""
+        number_str = request.match_info.get('number', 'unknown')
+        try:
+            # Get block number from URL path parameter
+            if number_str is None:
+                return web.json_response({"error": "Block number required"}, status=400)
+
+            try:
+                block_number = int(number_str)
+            except ValueError:
+                return web.json_response({"error": "Invalid block number"}, status=400)
+
+            block = self.get_block(block_number)
+            if block is None:
+                return web.json_response({"error": f"Block {block_number} not found"}, status=404)
+
+            # Check response format
+            format_param = request.query.get('format', 'json')
+            if format_param == 'network':
+                # Return network serialized binary data
+                return web.Response(
+                    body=block.to_network(),
+                    content_type='application/octet-stream',
+                    headers={'Content-Disposition': f'attachment; filename="block_{block_number}.bin"'}
+                )
+            else:
+                # Return JSON (default)
+                return web.json_response(json.loads(block.to_json()))
+
+        except Exception as e:
+            logger.error(f"Error getting block {number_str}: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+
     async def broadcast_block(self, block_data: dict):
         """Broadcast a new block to the network."""
         message = Message(
