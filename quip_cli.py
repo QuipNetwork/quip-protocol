@@ -7,6 +7,13 @@ Provides two console commands:
 from __future__ import annotations
 
 import os
+
+# Set default DWave environment variables before any DWave libraries are imported
+if "DWAVE_API_KEY" not in os.environ:
+    os.environ["DWAVE_API_KEY"] = "MISSING IN CONFIG"
+if "DWAVE_API_TOKEN" not in os.environ:
+    os.environ["DWAVE_API_TOKEN"] = "MISSING IN CONFIG"
+
 import signal
 import subprocess
 import sys
@@ -31,8 +38,19 @@ from shared.block import load_genesis_block
 def _load_config(path: Optional[str]) -> Dict[str, Any]:
     if not path:
         return {}
+
     with open(path, "rb") as f:
-        return _toml.load(f)
+        config = _toml.load(f)
+
+    # Set DWave environment variables from TOML config if present
+    qpu_config = config.get("qpu", {})
+    if "dwave_api_key" in qpu_config:
+        os.environ["DWAVE_API_KEY"] = qpu_config["dwave_api_key"]
+
+    if "dwave_api_token" in qpu_config:
+        os.environ["DWAVE_API_TOKEN"] = qpu_config["dwave_api_token"]
+
+    return config
 
 
 def _merge_globals_from_toml(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -222,6 +240,11 @@ def cpu(
     genesis_config: str,
 ):
     """Run a CPU-only network node (NetworkNode + Node persistent CPU miners)."""
+    # Fix for CPU sampler trying to connect to DWave without credentials
+    if "DWAVE_API_KEY" not in os.environ:
+        os.environ["DWAVE_API_KEY"] = "MISSING IN CONFIG"
+    if "DWAVE_API_TOKEN" not in os.environ:
+        os.environ["DWAVE_API_TOKEN"] = "MISSING IN CONFIG"
     toml_cfg = (ctx.obj or {}).get("toml", {})
     conf = _merge_globals_from_toml(toml_cfg)
     conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout)

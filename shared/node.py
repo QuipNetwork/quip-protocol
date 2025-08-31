@@ -451,7 +451,7 @@ class Node:
         miner_info = self.info()
         quantum_proof = block.QuantumProof(
             nonce=mining_result.nonce,
-            nodes=mining_result.node_list,
+            nodes=mining_result.variable_order or mining_result.node_list,
             edges=mining_result.edge_list,
             solutions=mining_result.solutions,
             mining_time=mining_result.mining_time,
@@ -459,7 +459,20 @@ class Node:
             diversity=mining_result.diversity,
             num_valid_solutions=mining_result.num_valid
         )
-        quantum_proof.compute_derived_fields(previous_block.next_block_requirements, previous_block)
+        # Store miner_id for deterministic seed generation
+        quantum_proof.miner_id = mining_result.miner_id
+        # Create a temporary block with the necessary fields for validation
+        temp_block = type('TempBlock', (), {
+            'header': type('Header', (), {
+                'previous_hash': previous_block.hash,
+                'timestamp': mining_result.timestamp,
+                'index': previous_block.header.index + 1
+            })()
+        })()
+        quantum_proof.compute_derived_fields(previous_block.next_block_requirements, temp_block)
+
+
+
         if (quantum_proof.energy is None or quantum_proof.energy != mining_result.energy):
             raise ValueError(f"Miner reported bad energy {mining_result.energy} but we computed {quantum_proof.energy}")
         if (quantum_proof.diversity is None or quantum_proof.diversity != mining_result.diversity):

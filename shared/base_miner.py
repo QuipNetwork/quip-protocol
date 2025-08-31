@@ -35,6 +35,7 @@ class MiningResult:
     mining_time: float
     node_list: List[int]
     edge_list: List[Tuple[int, int]]
+    variable_order: Optional[List[int]] = None
 
 Variable = collections.abc.Hashable
 Bias = float

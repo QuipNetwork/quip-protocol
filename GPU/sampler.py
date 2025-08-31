@@ -6,6 +6,7 @@ import numpy as np
 from queue import Empty as QueueEmpty
 
 from dwave.system.testing import MockDWaveSampler
+from shared.quantum_proof_of_work import create_topology_graph, get_topology_properties
 from .worker import gpu_worker_main
 
 # Optional torch import
@@ -31,12 +32,14 @@ class GPUSampler(MockDWaveSampler):
         if self._debug:
             print(f"[GPU parent pid={os.getpid()}] spawn worker pid={self._proc.pid} device={self._device}", flush=True)
 
-        # Use same topology as SimulatedAnnealingStructuredSampler
-        qpu = MockDWaveSampler()
+        # Use the default topology (Pegasus) from quantum_proof_of_work
+        topology_graph = create_topology_graph()  # Uses DEFAULT_TOPOLOGY (Pegasus)
+        properties = get_topology_properties()
+
         super().__init__(
-            nodelist=qpu.nodelist,
-            edgelist=qpu.edgelist,
-            properties=qpu.properties,
+            nodelist=list(topology_graph.nodes()),
+            edgelist=list(topology_graph.edges()),
+            properties=properties,
             substitute_sampler=self
         )
 

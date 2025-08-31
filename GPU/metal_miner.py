@@ -10,6 +10,11 @@ from typing import Optional
 import numpy as np
 
 from shared.base_miner import BaseMiner, MiningResult
+from shared.quantum_proof_of_work import (
+    ising_seed_from_block,
+    generate_ising_model_from_seed,
+    energies_for_solutions,
+)
 from GPU.sampler import LocalGPUSampler as GPUSampler  # temporary alias until rename
 
 
@@ -55,12 +60,17 @@ class MetalMiner(BaseMiner):
 
             # Generate random nonce for each attempt
             nonce = random.randint(0, sys.maxsize)
-            
-            # Update block with current nonce for deterministic model generation
-            block.quantum_proof.nonce = nonce
-            
-            # Generate quantum model using deterministic block-based seeding
-            h, J = self.generate_ising_model(block)
+
+            # Build topology lists from sampler
+            nodes = [int(n) for n in self.sampler.nodelist]
+            edges = [(int(u), int(v)) for (u, v) in self.sampler.edgelist]
+
+            # Deterministic seed
+            cur_index = block.header.index + 1
+            seed = ising_seed_from_block(block.hash, self.miner_id, cur_index, nonce)
+
+            # Deterministic Ising model
+            h, J = generate_ising_model_from_seed(seed, nodes, edges)
 
             # Check again before sampling
             if stop_event.is_set():
@@ -136,7 +146,10 @@ class MetalMiner(BaseMiner):
 
                 # Calculate diversity
                 diversity = self.calculate_diversity(valid_solutions)
-                min_energy = float(np.min(sampleset.record.energy))
+
+                # Deterministic energies with shared function
+                energies = energies_for_solutions(valid_solutions, h, J, nodes)
+                min_energy = float(min(energies)) if energies else 0.0
 
                 # Filter excess solutions to maintain diversity
                 filtered_solutions = self.filter_diverse_solutions(valid_solutions, min_solutions)
@@ -160,8 +173,11 @@ class MetalMiner(BaseMiner):
                         solutions=filtered_solutions,
                         energy=min_energy,
                         diversity=final_diversity,
-                        num_valid=len(valid_solutions),
-                        mining_time=mining_time
+                        num_valid=len(filtered_solutions),
+                        mining_time=mining_time,
+                        node_list=nodes,
+                        edge_list=edges,
+                        variable_order=nodes
                     )
 
                     result_queue.put(result)

@@ -2,6 +2,7 @@
 
 from dwave.system import DWaveSampler
 from dwave.system.testing import MockDWaveSampler
+from shared.quantum_proof_of_work import create_topology_graph, get_topology_properties
 
 
 def create_dwave_sampler():
@@ -12,8 +13,14 @@ def create_dwave_sampler():
         return sampler
     except Exception as e:
         print(f"QPU not available: {e}")
-        # Fall back to mock sampler
-        return MockDWaveSampler()
+        # Fall back to mock sampler with our default topology (Pegasus)
+        topology_graph = create_topology_graph()
+        properties = get_topology_properties()
+        return MockDWaveSampler(
+            nodelist=list(topology_graph.nodes()),
+            edgelist=list(topology_graph.edges()),
+            properties=properties
+        )
 
 
 class DWaveSamplerWrapper:

@@ -25,6 +25,7 @@ class QuantumProof:
     energy: Optional[float] = None
     diversity: Optional[float] = None
     num_valid_solutions: Optional[int] = None
+    miner_id: Optional[str] = None  # For deterministic seed generation
 
     def to_network(self) -> bytes:
         """Serialize to binary format, excluding derived fields.
@@ -141,28 +142,38 @@ class QuantumProof:
 
         # Generate model sized to the maximum solution length
         n_model = max(len(sol) for sol in self.solutions)
+        # For validation, we need the miner_id from the quantum proof
+        # This should be set by the miner when creating the proof
+        miner_id = getattr(self, 'miner_id', 'unknown')
         seed = ising_seed_from_block(prev_hash=block.header.previous_hash,
-                                     cur_timestamp=block.header.timestamp,
+                                     miner_id=miner_id,
                                      cur_index=block.header.index,
                                      nonce=self.nonce)
         h, J = generate_ising_model_from_seed(seed,
-                                              block.quantum_proof.nodes,
-                                              block.quantum_proof.edges)
+                                              self.nodes,
+                                              self.edges)
+        print(f"DEBUG validation: seed={seed}, miner_id={miner_id}, nonce={self.nonce}, prev_hash={block.header.previous_hash.hex()[:16]}, cur_index={block.header.index}")
 
         def energy_of(solution: List[int]) -> float:
             # Map values to spins in {-1, +1}
             spins = [1 if v > 0 else -1 for v in solution]
             e = 0.0
-            # Local fields up to this solution's length
-            for i in range(len(spins)):
-                e += h.get(i, 0.0) * spins[i]
-            # Couplers only if both endpoints exist in this solution
-            for (i, j), Jij in J.items():
-                if i < len(spins) and j < len(spins):
-                    e += Jij * spins[i] * spins[j]
+            # Build mapping from node id to position in solution vector
+            node_pos = {node_id: pos for pos, node_id in enumerate(self.nodes)}
+            # Local fields: use node ids from topology, positions from solution
+            for pos, node_id in enumerate(self.nodes[:len(spins)]):
+                e += float(h.get(node_id, 0.0)) * spins[pos]
+            # Couplers: only if both endpoints exist in this solution
+            for (u, v), Jij in J.items():
+                pu = node_pos.get(u)
+                pv = node_pos.get(v)
+                if pu is not None and pv is not None and pu < len(spins) and pv < len(spins):
+                    e += float(Jij) * spins[pu] * spins[pv]
             return float(e)
 
         energies = [energy_of(sol) for sol in self.solutions]
+        print(f"DEBUG validation: first 3 energies: {energies[:3]}")
+        print(f"DEBUG validation: min energy: {min(energies) if energies else 'N/A'}")
 
         # Solutions meeting difficulty threshold
         valid_indices = [i for i, e in enumerate(energies) if e < requirements.difficulty_energy]
@@ -547,7 +558,9 @@ class Block:
             logger.error(f"Block {self.header.index} rejected: no solutions in quantum proof")
             return False
 
-        seed = ising_seed_from_block(self.header.previous_hash, self.header.timestamp, self.header.index, self.quantum_proof.nonce)
+        # For block validation, use the miner_id from the quantum proof
+        miner_id = getattr(self.quantum_proof, 'miner_id', 'unknown')
+        seed = ising_seed_from_block(self.header.previous_hash, miner_id, self.header.index, self.quantum_proof.nonce)
         h, J = generate_ising_model_from_seed(seed, self.quantum_proof.nodes, self.quantum_proof.edges)
 
         def energy_of(solution: List[int]) -> float:

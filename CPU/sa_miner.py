@@ -86,8 +86,9 @@ class SimulatedAnnealingMiner(BaseMiner):
             # Generate quantum model using deterministic block-based seeding
             # Use 64 variables to match original working energy scale
             timestamp = int(time.time())
-            seed = ising_seed_from_block(prev_block.header.previous_hash, timestamp, cur_index, nonce)
-            h, J = generate_ising_model_from_seed(seed, nodes, edges)  
+            seed = ising_seed_from_block(prev_block.hash, self.miner_id, cur_index, nonce)
+            h, J = generate_ising_model_from_seed(seed, nodes, edges)
+            print(f"DEBUG miner: seed={seed}, miner_id={self.miner_id}, nonce={nonce}, prev_hash={prev_block.hash.hex()[:16]}, cur_index={cur_index}")
 
             # Check again before sampling
             if stop_event.is_set():
@@ -175,9 +176,29 @@ class SimulatedAnnealingMiner(BaseMiner):
                 # Check if diversity requirement is met
                 if final_diversity >= min_diversity and len(valid_solutions) >= min_solutions:
                     mining_time = time.time() - start_time
-                    min_energy = float(np.min(sampleset.record.energy[valid_indices]))
 
-                    result = MiningResult(
+                    # Compute energy for the filtered solutions using the same model
+                    node_pos = {node_id: pos for pos, node_id in enumerate(nodes)}
+                    def energy_of(solution: list[int]) -> float:
+                        spins = [1 if v > 0 else -1 for v in solution]
+                        e = 0.0
+                        # local fields
+                        for pos, node_id in enumerate(nodes[:len(spins)]):
+                            e += float(h.get(node_id, 0.0)) * spins[pos]
+                        # couplers
+                        for (u, v), Jij in J.items():
+                            pu = node_pos.get(u)
+                            pv = node_pos.get(v)
+                            if pu is not None and pv is not None and pu < len(spins) and pv < len(spins):
+                                e += float(Jij) * spins[pu] * spins[pv]
+                        return float(e)
+
+                    energies = [energy_of(sol) for sol in filtered_solutions]
+                    min_energy = float(min(energies)) if energies else 0.0
+                # print(f"DEBUG miner: first 3 sampler energies: {sampleset.record.energy[:3]}")
+                # print(f"DEBUG miner: min sampler energy: {min_energy}")
+
+                result = MiningResult(
                         miner_id=self.miner_id,
                         miner_type=self.miner_type,
                         nonce=nonce,
@@ -185,15 +206,16 @@ class SimulatedAnnealingMiner(BaseMiner):
                         solutions=filtered_solutions,
                         energy=min_energy,
                         diversity=final_diversity,
-                        num_valid=len(valid_solutions),
+                        num_valid=len(filtered_solutions),
                         mining_time=mining_time,
                         node_list=nodes,
-                        edge_list=edges
+                        edge_list=edges,
+                        variable_order=nodes
                     )
 
-                    result_queue.put(result)
-                    print(f"{self.miner_id} found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
-                    return result
+                result_queue.put(result)
+                print(f"{self.miner_id} found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
+                return result
 
             progress += 1
 

@@ -5,27 +5,149 @@ Extracted from BaseMiner to be reusable and stateless.
 from __future__ import annotations
 
 from blake3 import blake3
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional
 import numpy as np
 from typing import List
+import dwave_networkx as dnx
 
-def ising_seed_from_block(prev_hash: bytes, cur_timestamp: int, cur_index, nonce: int) -> int:
-    seed_string = f"{prev_hash.hex()}{cur_timestamp}{cur_index}{nonce}"
+# DWave Topology Configurations
+# These match real DWave systems for consistent energy scales
+
+# D-Wave 2000Q (Legacy) - Chimera topology
+CHIMERA_TOPOLOGY = {
+    'type': 'chimera',
+    'params': {'m': 16, 'n': 16, 't': 4},  # 16x16x4 Chimera
+    'graph_func': lambda: dnx.chimera_graph(16, 16, 4),
+    'chip_id': 'DW_2000Q_VFYC_1',
+    'description': 'Legacy D-Wave 2000Q Chimera topology (~2048 qubits)'
+}
+
+# D-Wave Advantage - Pegasus topology (DEFAULT)
+PEGASUS_TOPOLOGY = {
+    'type': 'pegasus',
+    'params': {'m': 16},  # P16 Pegasus
+    'graph_func': lambda: dnx.pegasus_graph(16),
+    'chip_id': 'Advantage_system6.4',
+    'description': 'D-Wave Advantage Pegasus topology (~5000 qubits)'
+}
+
+# D-Wave Advantage2 - Zephyr topology
+ZEPHYR_TOPOLOGY = {
+    'type': 'zephyr',
+    'params': {'m': 16, 't': 4},  # Z16,4 Zephyr
+    'graph_func': lambda: dnx.zephyr_graph(16, 4),
+    'chip_id': 'Advantage2_prototype',
+    'description': 'D-Wave Advantage2 Zephyr topology (~1000+ qubits)'
+}
+
+# Default topology for all miners
+DEFAULT_TOPOLOGY = PEGASUS_TOPOLOGY
+
+def get_topology_config(topology_name: Optional[str] = None):
+    """Get topology configuration by name, defaults to DEFAULT_TOPOLOGY."""
+    if topology_name is None:
+        return DEFAULT_TOPOLOGY
+
+    topologies = {
+        'chimera': CHIMERA_TOPOLOGY,
+        'pegasus': PEGASUS_TOPOLOGY,
+        'zephyr': ZEPHYR_TOPOLOGY
+    }
+
+    return topologies.get(topology_name.lower(), DEFAULT_TOPOLOGY)
+
+def create_topology_graph(topology_name: Optional[str] = None):
+    """Create a topology graph using the specified topology configuration."""
+    config = get_topology_config(topology_name)
+    return config['graph_func']()
+
+def get_topology_properties(topology_name: Optional[str] = None):
+    """Get mock DWave properties for the specified topology."""
+    config = get_topology_config(topology_name)
+    graph = create_topology_graph(topology_name)
+
+    # Format properties to match MockDWaveSampler expectations
+    if config['type'] == 'chimera':
+        topology_props = {
+            'type': 'chimera',
+            'shape': [config['params']['m'], config['params']['n'], config['params']['t']]
+        }
+    elif config['type'] == 'pegasus':
+        topology_props = {
+            'type': 'pegasus',
+            'shape': [config['params']['m']]
+        }
+    elif config['type'] == 'zephyr':
+        topology_props = {
+            'type': 'zephyr',
+            'shape': [config['params']['m'], config['params']['t']]
+        }
+    else:
+        # Fallback
+        topology_props = {
+            'type': config['type'],
+            'shape': []
+        }
+
+    return {
+        'topology': topology_props,
+        'num_qubits': len(graph.nodes()),
+        'num_couplers': len(graph.edges()),
+        'chip_id': config['chip_id'],
+        'supported_problem_types': ['qubo', 'ising'],
+        'description': config['description']
+    }
+
+def ising_seed_from_block(prev_hash: bytes, miner_id: str, cur_index: int, nonce: int) -> int:
+    """Generate deterministic seed for Ising model from block parameters.
+
+    Uses miner_id instead of timestamp to ensure reproducible seeds between
+    mining and validation phases.
+    """
+    seed_string = f"{prev_hash.hex()}{miner_id}{cur_index}{nonce}"
     return int(blake3(seed_string.encode()).hexdigest()[:8], 16)
 
 
 def generate_ising_model_from_seed(seed: int, nodes: List[int], edges: List[Tuple[int, int]]) -> Tuple[Dict[int, int], Dict[tuple, int]]:
     """Generate (h, J) Ising parameters deterministically from a block.
 
-    Mirrors blockchain_base.BaseMiner.generate_quantum_model: h ~ U(-1,1),
-    sparse local J in {-1,+1} for j in [i+1, i+3] with p=0.5.
+    Deterministic given seed, node list and edge list. We assign h=0 and J in {-1,+1} per edge.
     """
     np.random.seed(seed)
 
-    h = {i: 0 for i in nodes}
-    J = {edge: 2*np.random.randint(2)-1 for edge in edges}
+    h = {int(i): 0.0 for i in nodes}
+    J = { (int(u), int(v)) if isinstance(u, (int, np.integer)) and isinstance(v, (int, np.integer)) else (int(u), int(v)) : float(2*np.random.randint(2)-1) for (u, v) in edges }
 
     return h, J
+
+
+def energy_of_solution(solution: List[int], h: Dict[int, float], J: Dict[Tuple[int, int], float], nodes: List[int]) -> float:
+    """Compute Ising energy for a solution vector respecting node order.
+
+    - solution values are mapped to spins in {-1,+1}
+    - h, J dictionaries are keyed by node ids and node-id pairs respectively
+    - nodes defines the variable ordering used in the sampler
+    """
+    # Map values to spins in {-1, +1}
+    spins = [1 if v > 0 else -1 for v in solution]
+    e = 0.0
+    # Map node id -> position
+    node_pos = {int(node_id): pos for pos, node_id in enumerate(nodes)}
+    # Local fields
+    for pos, node_id in enumerate(nodes[:len(spins)]):
+        e += float(h.get(int(node_id), 0.0)) * spins[pos]
+    # Couplers
+    for (u, v), Jij in J.items():
+        pu = node_pos.get(int(u))
+        pv = node_pos.get(int(v))
+        if pu is not None and pv is not None and pu < len(spins) and pv < len(spins):
+            e += float(Jij) * spins[pu] * spins[pv]
+    return float(e)
+
+
+def energies_for_solutions(solutions: List[List[int]], h: Dict[int, float], J: Dict[Tuple[int, int], float], nodes: List[int]) -> List[float]:
+    """Compute energies for a list of solutions using energy_of_solution."""
+    return [energy_of_solution(sol, h, J, nodes) for sol in solutions]
 
 def calculate_hamming_distance(s1: List[int], s2: List[int]) -> int:
     """Calculate symmetric Hamming distance between two binary strings.

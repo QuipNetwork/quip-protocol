@@ -12,6 +12,14 @@ It constructs the correct concrete miner from a simple picklable spec dict:
 """
 from __future__ import annotations
 
+import os
+
+# Set default DWave environment variables before any DWave libraries are imported
+if "DWAVE_API_KEY" not in os.environ:
+    os.environ["DWAVE_API_KEY"] = "MISSING IN CONFIG"
+if "DWAVE_API_TOKEN" not in os.environ:
+    os.environ["DWAVE_API_TOKEN"] = "MISSING IN CONFIG"
+
 import multiprocessing as mp
 import multiprocessing.synchronize as mpsync
 from typing import Any, Dict
