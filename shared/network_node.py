@@ -23,6 +23,7 @@ from shared.block import Block, MinerInfo
 from shared.node import Node
 
 # Configure logging
+import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -145,6 +146,9 @@ class NetworkNode(Node):
         self.secret = config.get("secret", f"quip network node secret {random.randint(0, 1000000)}")
         self.auto_mine = config.get("auto_mine", False)
 
+        # Logger will be set from CLI after construction
+        self.logger = logger
+
         # Durations as float seconds
         self.heartbeat_interval = float(config.get("heartbeat_interval", 15))
         self.heartbeat_timeout = float(config.get("heartbeat_timeout", 300))
@@ -211,7 +215,7 @@ class NetworkNode(Node):
         site = web.TCPSite(self.runner, self.bind_address, self.port)
         await site.start()
 
-        logger.info(f"Network node {self.node_name} ({self.crypto.ecdsa_public_key_hex[:8]}) started at {self.bind_address}:{self.port} with public address {self.public_host}")
+        self.logger.info(f"Network node {self.node_name} ({self.crypto.ecdsa_public_key_hex[:8]}) started at {self.bind_address}:{self.port} with public address {self.public_host}")
 
         # Start background tasks
         self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
@@ -232,7 +236,7 @@ class NetworkNode(Node):
         if self.runner:
             await self.runner.cleanup()
 
-        logger.info("Network node stopped")
+        self.logger.info("Network node stopped")
 
     ##########################
     ## Server logic threads ##
@@ -343,22 +347,22 @@ class NetworkNode(Node):
     #############################
 
     async def _on_new_node(self, host, info: MinerInfo):
-        logger.info(f"🌟 New node joined: {host} {info.miner_id} ({info.ecdsa_public_key.hex()[:8]})")
+        logger.info(f"New node joined: {host} {info.miner_id} ({info.ecdsa_public_key.hex()[:8]})")
         if self.on_new_node:
             asyncio.create_task(self.on_new_node(host, info))
 
     async def _on_node_lost(self, host):
-        logger.info(f"💔 Node lost: {host}")
+        logger.info(f"Node lost: {host}")
         if self.on_node_lost:
             asyncio.create_task(self.on_node_lost(host))
 
     async def _on_block_received(self, block: Block):
-        logger.info(f"📦 New block mined: {block.header.index}")
+        logger.info(f"New block mined: {block.header.index}")
         if self.on_block_received:
             asyncio.create_task(self.on_block_received(block))
 
     async def _network_on_mining_started(self, prev: Block):
-        logger.info(f"⛏️ Mining started on block {prev.header.index + 1} with previous block hash {prev.hash}")
+        logger.info(f"Mining started on block {prev.header.index + 1} with previous block hash {prev.hash}")
 
     async def _network_on_mining_stopped(self):
         logger.info(f"🛑 Mining stopped")

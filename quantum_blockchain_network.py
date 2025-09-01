@@ -20,7 +20,7 @@ class NodeInfo:
     address: str  # host:port
     last_seen: float
     version: str = "1.0.0"
-    capabilities: List[str] = None
+    capabilities: Optional[List[str]] = None
     
     def __post_init__(self):
         if self.capabilities is None:
@@ -400,13 +400,13 @@ async def main():
     
     # Define callbacks
     async def on_new_node(address):
-        print(f"🌟 New node joined: {address}")
-    
+        logger.info(f"New node joined: {address}")
+
     async def on_node_lost(address):
-        print(f"💔 Node lost: {address}")
-    
+        logger.info(f"Node lost: {address}")
+
     async def on_block_received(block_data):
-        print(f"📦 New block received: {block_data.get('index', 'unknown')}")
+        logger.info(f"New block received: {block_data.get('index', 'unknown')}")
     
     node.on_new_node = on_new_node
     node.on_node_lost = on_node_lost
@@ -418,20 +418,20 @@ async def main():
     # If peer address provided, connect to it
     if len(sys.argv) > 2:
         peer_address = sys.argv[2]
-        print(f"Connecting to peer: {peer_address}")
+        logger.info(f"Connecting to peer: {peer_address}")
         success = await node.connect_to_peer(peer_address)
         if not success:
-            print("Failed to connect to peer!")
-    
-    print(f"Node running at {node.address}")
-    print("Press Ctrl+C to stop")
-    
+            logger.warning("Failed to connect to peer!")
+
+    logger.info(f"Node running at {node.address}")
+    logger.info("Press Ctrl+C to stop")
+
     # Keep running
     try:
         while True:
             await asyncio.sleep(1)
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        logger.info("Shutting down...")
         await node.stop()
 
 

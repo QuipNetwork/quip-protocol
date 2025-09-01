@@ -19,6 +19,7 @@ from shared.quantum_proof_of_work import (
     calculate_diversity as _shared_diversity,
     filter_diverse_solutions as _shared_filter,
 )
+from shared.logging_config import get_logger
 
 
 
@@ -76,7 +77,10 @@ class BaseMiner(ABC):
         self.total_rewards = 0
         self.sampler = sampler
 
-        print(f"{miner_id} initialized ({self.miner_type})")
+        # Initialize logger
+        self.logger = get_logger('base_miner')
+
+        self.logger.debug(f"{miner_id} initialized ({self.miner_type})")
 
         # Initialize timing statistics
         self.timing_stats = {
@@ -211,25 +215,25 @@ class BaseMiner(ABC):
             if self.miner_type == "QPU":
                 # Increase annealing time for better solutions
                 self.adaptive_params['quantum_annealing_time'] *= 1.2
-                print(f"{self.miner_id} increasing annealing time to {self.adaptive_params['quantum_annealing_time']:.2f} μs")
+                self.logger.info(f"{self.miner_id} increasing annealing time to {self.adaptive_params['quantum_annealing_time']:.2f} μs")
             else:
                 # For SA, increase sweeps or adjust beta range
                 self.adaptive_params['num_sweeps'] = int(self.adaptive_params['num_sweeps'] * 1.1)
                 # Widen beta range for better exploration
                 self.adaptive_params['beta_range'][0] *= 0.9
                 self.adaptive_params['beta_range'][1] *= 1.1
-                print(f"{self.miner_id} adapting: sweeps={self.adaptive_params['num_sweeps']}, beta_range={self.adaptive_params['beta_range']}")
+                self.logger.info(f"{self.miner_id} adapting: sweeps={self.adaptive_params['num_sweeps']}, beta_range={self.adaptive_params['beta_range']}")
 
         # If winning too much, can reduce parameters to save resources
         elif actual_win_rate > expected_win_rate * 1.5:  # 50% above expected
             if self.miner_type == "QPU":
                 # Reduce annealing time to save QPU resources
                 self.adaptive_params['quantum_annealing_time'] *= 0.9
-                print(f"{self.miner_id} reducing annealing time to {self.adaptive_params['quantum_annealing_time']:.2f} μs")
+                self.logger.info(f"{self.miner_id} reducing annealing time to {self.adaptive_params['quantum_annealing_time']:.2f} μs")
             else:
                 # For SA, reduce sweeps for faster mining
                 self.adaptive_params['num_sweeps'] = int(self.adaptive_params['num_sweeps'] * 0.95)
-                print(f"{self.miner_id} reducing sweeps to {self.adaptive_params['num_sweeps']}")
+                self.logger.info(f"{self.miner_id} reducing sweeps to {self.adaptive_params['num_sweeps']}")
 
     @abstractmethod
     def mine_block(

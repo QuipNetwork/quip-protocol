@@ -2,14 +2,16 @@
 
 import hashlib
 import os
-from venv import logger
 from blake3 import blake3
+from shared.logging_config import get_logger
 from typing import Tuple, List, Optional
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
 import hashsigs
+
+logger = get_logger('block_signer')
 
 
 class BlockSigner:

@@ -90,6 +90,13 @@ def _merge_globals_from_toml(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # HTTP server settings
     if "client_max_size_mb" in g:
         out["client_max_size_mb"] = int(g["client_max_size_mb"])
+    # Logging settings
+    if "log_level" in g:
+        out["log_level"] = g["log_level"]
+    if "node_log" in g:
+        out["node_log"] = g["node_log"]
+    if "http_log" in g:
+        out["http_log"] = g["http_log"]
     # carry-through miner sections
     for k in ("cpu", "gpu", "qpu"):
         if k in cfg:
@@ -98,17 +105,20 @@ def _merge_globals_from_toml(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _apply_global_overrides(conf: Dict[str, Any],
-                            listen: Optional[str],
-                            port: Optional[int],
-                            public_host: Optional[str],
-                            node_name: Optional[str],
-                            secret: Optional[str],
-                            auto_mine: Optional[bool],
-                            peers: Optional[List[str]],
-                            timeout: Optional[int],
-                            heartbeat_interval: Optional[int],
-                            heartbeat_timeout: Optional[int],
-                            fanout: Optional[int]) -> Dict[str, Any]:
+                             listen: Optional[str],
+                             port: Optional[int],
+                             public_host: Optional[str],
+                             node_name: Optional[str],
+                             secret: Optional[str],
+                             auto_mine: Optional[bool],
+                             peers: Optional[List[str]],
+                             timeout: Optional[int],
+                             heartbeat_interval: Optional[int],
+                             heartbeat_timeout: Optional[int],
+                             fanout: Optional[int],
+                             log_level: Optional[str] = None,
+                             node_log: Optional[str] = None,
+                             http_log: Optional[str] = None) -> Dict[str, Any]:
     c = dict(conf)
     if listen is not None:
         c["listen"] = listen
@@ -132,14 +142,39 @@ def _apply_global_overrides(conf: Dict[str, Any],
         c["heartbeat_timeout"] = int(heartbeat_timeout)
     if fanout is not None:
         c["fanout"] = int(fanout)
+    if log_level is not None:
+        c["log_level"] = log_level
+    if node_log is not None:
+        c["node_log"] = node_log
+    if http_log is not None:
+        c["http_log"] = http_log
     return c
 
 
 async def _async_run_network_node(config: Dict[str, Any], genesis_config_file: str) -> int:
     """Create NetworkNode with genesis, start server/tasks, and run until Ctrl-C."""
+    # Setup logging before creating NetworkNode
+    from shared.logging_config import setup_logging
+
+    log_level = config.get("log_level", "INFO")
+    node_log_file = config.get("node_log")
+    http_log_file = config.get("http_log")
+    node_name = config.get("node_name", "quip-node")
+
+    # Setup logging with our custom configuration
+    loggers = setup_logging(
+        log_level=log_level,
+        node_log_file=node_log_file,
+        http_log_file=http_log_file,
+        node_name=node_name
+    )
+
     # Load genesis and pass to NetworkNode constructor
     genesis = load_genesis_block(genesis_config_file)
     node = NetworkNode(config, genesis)
+
+    # Set the logger for the NetworkNode
+    node.logger = loggers['network_node']
 
     await node.start()
     try:
@@ -218,6 +253,10 @@ def quip_network_node(ctx: click.Context, config: Optional[str]):
 @click.option("--heartbeat-interval", type=int, default=None, help="Seconds between heartbeats")
 @click.option("--heartbeat-timeout", type=int, default=None, help="Peer heartbeat timeout seconds")
 @click.option("--fanout", type=int, default=None, help="Gossip fanout")
+# Logging options
+@click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default=None, help="Logging level")
+@click.option("--node-log", type=str, default=None, help="Path to main node log file (defaults to stderr)")
+@click.option("--http-log", type=str, default=None, help="Path to HTTP log file (suppresses aiohttp logs if not set)")
 # CPU options
 @click.option("--num-cpus", type=int, default=None, help="Number of CPU miners to spawn (default 1)")
 # Other
@@ -236,6 +275,9 @@ def cpu(
     heartbeat_interval: Optional[int],
     heartbeat_timeout: Optional[int],
     fanout: Optional[int],
+    log_level: Optional[str],
+    node_log: Optional[str],
+    http_log: Optional[str],
     num_cpus: Optional[int],
     genesis_config: str,
 ):
@@ -247,7 +289,8 @@ def cpu(
         os.environ["DWAVE_API_TOKEN"] = "MISSING IN CONFIG"
     toml_cfg = (ctx.obj or {}).get("toml", {})
     conf = _merge_globals_from_toml(toml_cfg)
-    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout)
+    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
+
     # Ensure CPU-only
     conf.pop("gpu", None)
     conf.pop("qpu", None)

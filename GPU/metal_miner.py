@@ -45,7 +45,7 @@ class MetalMiner(BaseMiner):
         
         # Mark that this miner is attempting this round
         self.current_round_attempted = True
-        print(f"{self.miner_id} started...")
+        self.logger.info("Started...")
 
         # Extract requirements from NextBlockRequirements object
         difficulty_energy = requirements.difficulty_energy
@@ -55,7 +55,7 @@ class MetalMiner(BaseMiner):
         while self.mining and not stop_event.is_set():
             # Check if we should stop before generating model
             if stop_event.is_set():
-                print(f"{self.miner_id} interrupted")
+                self.logger.info("Interrupted")
                 return None
 
             # Generate random nonce for each attempt
@@ -74,7 +74,7 @@ class MetalMiner(BaseMiner):
 
             # Check again before sampling
             if stop_event.is_set():
-                print(f"{self.miner_id} interrupted")
+                self.logger.info("Interrupted")
                 return None
 
             # Track preprocessing time
@@ -111,14 +111,14 @@ class MetalMiner(BaseMiner):
                 self.timing_stats['preprocessing'].append((time.time() - preprocess_start) * 1e6)
             except Exception as e:
                 if stop_event.is_set():
-                    print(f"{self.miner_id} interrupted during sampling")
+                    self.logger.info("Interrupted during sampling")
                     return None
-                print(f"{self.miner_id} sampling error: {e}")
+                self.logger.error(f"Sampling error: {e}")
                 continue
 
             # Check if interrupted before processing results
             if stop_event.is_set():
-                print(f"{self.miner_id} interrupted")
+                self.logger.info("Interrupted")
                 return None
 
             # Track postprocessing time
@@ -156,7 +156,7 @@ class MetalMiner(BaseMiner):
 
                 # Recalculate diversity after filtering
                 final_diversity = self.calculate_diversity(filtered_solutions)
-                print(f"{self.miner_id} found sufficient solutions! Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}, Diversity: {diversity:.3f}, Final Diversity: {final_diversity:.3f}")
+                self.logger.info(f"Found sufficient solutions! Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}, Diversity: {diversity:.3f}, Final Diversity: {final_diversity:.3f}")
 
                 # Track postprocessing time
                 self.timing_stats['postprocessing'].append((time.time() - postprocess_start) * 1e6)

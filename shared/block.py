@@ -1,6 +1,5 @@
 """Block data structures and parsing utilities for quantum blockchain."""
 
-from venv import logger
 from blake3 import blake3
 import json
 import time
@@ -11,6 +10,10 @@ from typing import Dict, List, Optional, Any, Tuple
 
 from shared.quantum_proof_of_work import calculate_diversity, generate_ising_model_from_nonce, ising_nonce_from_block, energies_for_solutions
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce, calculate_diversity
+from shared.logging_config import get_logger
+
+# Initialize logger
+logger = get_logger('block')
 
 
 @dataclass
@@ -692,16 +695,16 @@ def load_genesis_block(genesis_block_filepath: str) -> 'Block':
         json.JSONDecodeError: If JSON is malformed
     """
     config_path = Path(genesis_block_filepath)
-    print(f"Loading genesis block from: {config_path.name}")
+    logger.info(f"Loading genesis block from: {config_path.name}")
     with open(config_path, 'r') as f:
         genesis_data = json.load(f)
 
     # Use create_genesis_block to parse and validate the data
     genesis_block = create_genesis_block(genesis_data)
 
-    print(f"Loaded genesis block from: {config_path.name}")
+    logger.info(f"Loaded genesis block from: {config_path.name}")
     # Note: adaptive_parameters not available in current NextBlockRequirements structure
-    print(f"Mining parameters: difficulty_energy={genesis_block.next_block_requirements.difficulty_energy}")
+    logger.info(f"Mining parameters: difficulty_energy={genesis_block.next_block_requirements.difficulty_energy}")
 
     return genesis_block
 

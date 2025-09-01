@@ -2,13 +2,13 @@
 
 import argparse
 import asyncio
-import logging
 import sys
 sys.path.append('..')
 
 from shared.blockchain_shared import SharedMiningNode
+from shared.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger('cpu_miner')
 
 
 async def main():
@@ -26,11 +26,7 @@ async def main():
 
     args = parser.parse_args()
 
-    # Configure logging
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
+    # Logging is now configured globally
 
     # Create CPU mining node
     node = SharedMiningNode(

@@ -20,6 +20,11 @@ if "DWAVE_API_KEY" not in os.environ:
 if "DWAVE_API_TOKEN" not in os.environ:
     os.environ["DWAVE_API_TOKEN"] = "MISSING IN CONFIG"
 
+from shared.logging_config import get_logger
+
+# Initialize logger
+logger = get_logger('miner_worker')
+
 import multiprocessing as mp
 import multiprocessing.synchronize as mpsync
 from typing import Any, Dict
@@ -59,7 +64,7 @@ def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any]):
         op = msg.get("op")
 
         if op == "shutdown":
-            print(f"Shutting down miner {miner.miner_id}")
+            logger.info(f"Shutting down miner {miner.miner_id}")
             current_stop.set()
             return
         elif op == "get_stats":
@@ -78,7 +83,7 @@ def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any]):
             miner.mine_block(block, node_info, requirements, resp_q, current_stop)
         else:
             resp_q.put({"op": "error", "message": f"Unknown op {op}", "id": spec.get("id")})
-            print(f"{miner.miner_id}: Unknown op {op}")
+            logger.info(f"{miner.miner_id}: Unknown op {op}")
             continue
 
 class MinerHandle:

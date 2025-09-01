@@ -1,7 +1,6 @@
 """Node class for quantum blockchain network participation."""
 
 import asyncio
-from asyncio.log import logger
 import json
 import multiprocessing
 import os
@@ -20,6 +19,7 @@ from shared import block
 from shared.block_signer import BlockSigner
 from shared.block import Block, BlockHeader, MinerInfo, NextBlockRequirements
 from shared.miner import Miner, MiningResult
+from shared.logging_config import get_logger
 
 
 # Persistent miner handle and worker integration
@@ -92,11 +92,14 @@ class Node:
         self._is_mining = False
         self._current_mining_task: Optional[asyncio.Task] = None
 
-        print(f"Node {node_id} initialized with {len(getattr(self, 'miner_handles', []))} miners:")
-        print(f"  ECDSA Public Key: {self.crypto.ecdsa_public_key_hex[:16]}...")
-        print(f"  WOTS+ Public Key: {self.crypto.wots_plus_public_key.hex()[:16]}...")
+        # Initialize logger
+        self.logger = get_logger('node')
+
+        self.logger.info(f"Node {node_id} initialized with {len(getattr(self, 'miner_handles', []))} miners")
+        self.logger.debug(f"  ECDSA Public Key: {self.crypto.ecdsa_public_key_hex[:16]}...")
+        self.logger.debug(f"  WOTS+ Public Key: {self.crypto.wots_plus_public_key.hex()[:16]}...")
         for h in getattr(self, 'miner_handles', []):
-            print(f"  - {h.miner_id} ({h.miner_type})")
+            self.logger.debug(f"  - {h.miner_id} ({h.miner_type})")
 
         # Initialize blockchain
         self.chain: List[Block] = []
@@ -187,7 +190,7 @@ class Node:
         # 1. Check if we already have this block or a newer one at this index
         cur_block = self.get_block(block.header.index)
         if not block.hash or not block.raw or not block.signature:
-            logger.error(f"Block {block.header.index} rejected: missing hash, raw, or signature - it's not been finalized/signed.")
+            self.logger.error(f"Block {block.header.index} rejected: missing hash, raw, or signature - it's not been finalized/signed.")
             return False
         
         if cur_block is not None:
@@ -196,7 +199,7 @@ class Node:
 
             # Are we newer?
             if cur_block.header.timestamp < block.header.timestamp:
-                logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have an older block at this index ({cur_block.header.timestamp} < {block.header.timestamp}), {cur_block.hash.hex()[:8]}")
+                self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have an older block at this index ({cur_block.header.timestamp} < {block.header.timestamp}), {cur_block.hash.hex()[:8]}")
                 return False
             
         # 2. Do we have more than 6 blocks after it?
@@ -205,12 +208,12 @@ class Node:
             raise RuntimeError("Head block is not finalized!")
     
         if head.header.index > block.header.index + 6:
-            logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have more than 6 blocks after it ({head.header.index} > {block.header.index + 6})")
+            self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have more than 6 blocks after it ({head.header.index} > {block.header.index + 6})")
             return False
 
         prev_block = self.get_block(block.header.index - 1)
         if prev_block is None:
-            logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we do not have the previous block ({block.header.index - 1})")
+            self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we do not have the previous block ({block.header.index - 1})")
             return False
 
         # 3. Check Signature
@@ -218,7 +221,7 @@ class Node:
         block_bytes = block.raw
         signature = block.signature
         if not block_bytes or not signature:
-            logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: missing block bytes or signature")
+            self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: missing block bytes or signature")
             return False
         if not self.crypto.verify_combined_signature(
             block.miner_info.ecdsa_public_key,
@@ -226,27 +229,27 @@ class Node:
             block_bytes,
             signature
         ):
-            logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid signature")
+            self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid signature")
             return False
 
         # 4. Validate the Quantum Proof and other block artifacts.
         block.quantum_proof.compute_derived_fields()
         if not block.validate_block(prev_block):
-            logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid quantum proof")
+            self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid quantum proof")
             qpjson = block.quantum_proof.to_json()
             qpjson['proof_data'] = qpjson['proof_data'][:10] + "..."
-            logger.error(f"Quantum Proof: {json.dumps(qpjson)}, rq: {prev_block.next_block_requirements.to_json()}")
+            self.logger.error(f"Quantum Proof: {json.dumps(qpjson)}, rq: {prev_block.next_block_requirements.to_json()}")
             return False
         
         async with self.chain_lock:
             # Reset chain if needed
             if head.header.index >= block.header.index:
-                print(f"Node {self.node_id}: Resetting chain to accept block {block.header.index} from previous head {head.header.index})")
+                self.logger.warning(f"Resetting chain to accept block {block.header.index} from previous head {head.header.index})")
                 self.chain = self.chain[:block.header.index]
             # Accept the block
             self.chain.append(block)
 
-        print(f"Node {self.node_id}: Accepted block {block.header.index} from {block.miner_info.miner_id}")
+        self.logger.info(f"Accepted block {block.header.index} from {block.miner_info.miner_id}")
 
         # Emit an event so we can stop mining and potentially broadcast to other nodes
         self._emit_block_mined(block)
@@ -259,7 +262,7 @@ class Node:
             try:
                 self.on_mining_started(block)
             except Exception as e:
-                print(f"Node {self.node_id}: Error in mining_started callback: {e}")
+                self.logger.error(f"Error in mining_started callback: {e}")
 
     def _emit_mining_stopped(self) -> None:
         """Emit mining stopped event."""
@@ -267,7 +270,7 @@ class Node:
             try:
                 self.on_mining_stopped()
             except Exception as e:
-                print(f"Node {self.node_id}: Error in mining_stopped callback: {e}")
+                self.logger.error(f"Error in mining_stopped callback: {e}")
 
     def _emit_block_mined(self, block: Block) -> None:
         """Emit block mined event."""
@@ -275,7 +278,7 @@ class Node:
             try:
                 self.on_block_mined(block)
             except Exception as e:
-                print(f"Node {self.node_id}: Error in block_mined callback: {e}")
+                self.logger.error(f"Error in block_mined callback: {e}")
 
     def check_and_adjust_difficulty_for_timeout(self):
         """Check if no block has been received for 30 minutes and adjust difficulty."""
@@ -284,8 +287,8 @@ class Node:
         if time_since_last_block > self.no_block_timeout:
             # Note: Difficulty parameters are now managed at block level, not miner level
             # This method would need to be updated to adjust block-level difficulty parameters
-            print(f"Node {self.node_id}: Timeout-based difficulty adjustment needed after {time_since_last_block/60:.1f} minutes")
-            print("  Note: Difficulty parameters are now managed at block level")
+            self.logger.warning(f"Timeout-based difficulty adjustment needed after {time_since_last_block/60:.1f} minutes")
+            self.logger.info("  Note: Difficulty parameters are now managed at block level")
             return True
         return False
 
@@ -322,7 +325,7 @@ class Node:
             Block if successful, None if stopped/failed
         """
         if not self.chain:
-            print(f"Node {self.node_id}: No existing chain, previous block is genesis")
+            self.logger.info("No existing chain, previous block is genesis")
             self.chain.append(previous_block)
 
         if (previous_block.header.index) != self.get_latest_block().header.index:
@@ -349,7 +352,7 @@ class Node:
         # Check for timeout-based difficulty adjustment
         self.check_and_adjust_difficulty_for_timeout()
 
-        print(f"Node {self.node_id} starting mining with {len(handles)} miners...")
+        self.logger.info(f"Starting mining with {len(handles)} miners...")
 
         # Emit mining started event
         self._emit_mining_started(previous_block)
@@ -384,10 +387,10 @@ class Node:
                 # Async sleep to allow other coroutines to run
                 await asyncio.sleep(0.1)
         except asyncio.CancelledError:
-            print(f"Node {self.node_id}: Mining cancelled")
+            self.logger.info("Mining cancelled")
             self._mining_stop_event.set()
         except KeyboardInterrupt:
-            print(f"Node {self.node_id}: Mining interrupted")
+            self.logger.info("Mining interrupted")
             self._mining_stop_event.set()
         finally:
             # Signal cancellation to all workers if result found
@@ -414,9 +417,9 @@ class Node:
                 self.timing_stats['wins_per_miner'][winning_miner_id] = 0
             self.timing_stats['wins_per_miner'][winning_miner_id] += 1
 
-            print(f"Node {self.node_id}: {winning_miner_id} won block in {total_time:.2f}s")
+            self.logger.info(f"{winning_miner_id} won block in {total_time:.2f}s")
         else:
-            print(f"Node {self.node_id}: No solution found in {total_time:.2f}s")
+            self.logger.info(f"No solution found in {total_time:.2f}s")
 
         return result
 
@@ -429,7 +432,7 @@ class Node:
         if not self._is_mining or self._mining_stop_event is None:
             return
 
-        print(f"Node {self.node_id}: Stopping mining...")
+        self.logger.info("Stopping mining...")
         self._mining_stop_event.set()
 
         # Wait for mining to stop before clearing the mining event.
@@ -540,10 +543,10 @@ class Node:
             new_min_diversity = max(0.2, prev_req.min_diversity - diversity_adjustment_rate)
             new_min_solutions = max(10, int(prev_req.min_solutions * (1 - solutions_adjustment_rate)))
 
-            print(f"Node {self.node_id}: Same miner type ({current_winner}) won - EASING difficulty")
-            print(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
-            print(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
-            print(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
+            self.logger.info(f"Same miner type ({current_winner}) won - EASING difficulty")
+            self.logger.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
+            self.logger.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
+            self.logger.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
         else:
             # Different miner won - make it HARDER
             # Lower energy threshold (more negative), higher diversity/solutions
@@ -551,10 +554,10 @@ class Node:
             new_min_diversity = min(0.46, prev_req.min_diversity + diversity_adjustment_rate)
             new_min_solutions = min(100, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
 
-            print(f"Node {self.node_id}: Different miner type won ({prev_winner} -> {current_winner}) - HARDENING difficulty")
-            print(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
-            print(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
-            print(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
+            self.logger.info(f"Different miner type won ({prev_winner} -> {current_winner}) - HARDENING difficulty")
+            self.logger.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
+            self.logger.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
+            self.logger.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
 
         return NextBlockRequirements(
             difficulty_energy=new_difficulty_energy,

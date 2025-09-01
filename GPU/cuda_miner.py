@@ -46,7 +46,7 @@ class CudaMiner(BaseMiner):
         
         # Mark that this miner is attempting this round
         self.current_round_attempted = True
-        print(f"{self.miner_id} started...")
+        self.logger.info("Started...")
 
         # Extract requirements from NextBlockRequirements object
         difficulty_energy = requirements.difficulty_energy
@@ -56,7 +56,7 @@ class CudaMiner(BaseMiner):
         while self.mining and not stop_event.is_set():
             # Check if we should stop before generating model
             if stop_event.is_set():
-                print(f"{self.miner_id} interrupted")
+                self.logger.info("Interrupted")
                 return None
 
             # Generate random nonce for each attempt
@@ -75,7 +75,7 @@ class CudaMiner(BaseMiner):
 
             # Check again before sampling
             if stop_event.is_set():
-                print(f"{self.miner_id} interrupted")
+                self.logger.info("Interrupted")
                 return None
 
             # Track preprocessing time
@@ -112,14 +112,14 @@ class CudaMiner(BaseMiner):
                 self.timing_stats['preprocessing'].append((time.time() - preprocess_start) * 1e6)
             except Exception as e:
                 if stop_event.is_set():
-                    print(f"{self.miner_id} interrupted during sampling")
+                    self.logger.info("Interrupted during sampling")
                     return None
-                print(f"{self.miner_id} sampling error: {e}")
+                self.logger.error(f"Sampling error: {e}")
                 continue
 
             # Check if interrupted before processing results
             if stop_event.is_set():
-                print(f"{self.miner_id} interrupted")
+                self.logger.info("Interrupted")
                 return None
 
             # Track postprocessing time
@@ -157,7 +157,7 @@ class CudaMiner(BaseMiner):
 
                 # Recalculate diversity after filtering
                 final_diversity = self.calculate_diversity(filtered_solutions)
-                print(f"{self.miner_id} found sufficient solutions! Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}, Diversity: {diversity:.3f}, Final Diversity: {final_diversity:.3f}")
+                self.logger.info(f"Found sufficient solutions! Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}, Diversity: {diversity:.3f}, Final Diversity: {final_diversity:.3f}")
 
                 # Track postprocessing time
                 self.timing_stats['postprocessing'].append((time.time() - postprocess_start) * 1e6)
@@ -182,7 +182,7 @@ class CudaMiner(BaseMiner):
                     )
 
                     result_queue.put(result)
-                    print(f"{self.miner_id} found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
+                    self.logger.info(f"Found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
                     return result
 
             progress += 1
@@ -190,9 +190,9 @@ class CudaMiner(BaseMiner):
             # Progress update
             if progress % 10 == 0 and len(sampleset.record.energy) > 0:
                 min_energy = float(np.min(sampleset.record.energy))
-                print(f"{self.miner_id} - Progress: {progress}, Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}")
+                self.logger.debug(f"Progress: {progress}, Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}")
 
         # If we exit the loop due to stop event
         if stop_event.is_set():
-            print(f"{self.miner_id} stopped")
+            self.logger.info("Stopped")
         return None

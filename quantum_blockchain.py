@@ -19,6 +19,7 @@ from shared.quantum_proof_of_work import calculate_diversity as _shared_diversit
 
 from shared.miner import MiningResult
 from shared.node import Node
+from shared.logging_config import get_logger
 
 # Optional imports
 try:
@@ -61,6 +62,9 @@ class QuantumBlockchain:
             gpu_backend: 'local' (default) or 'modal'
             genesis_config_file: Path to genesis config JSON file to override defaults
         """
+        # Initialize logger
+        self.logger = get_logger('blockchain')
+
         self.chain: List[Block] = []
         self.competitive = competitive
         self.mining_stats = {}  # Will track all miners
@@ -106,9 +110,9 @@ class QuantumBlockchain:
                 }
                 qpu_node = Node(node_id="qpu-node", miners_config=qpu_config)
                 self.nodes.append(qpu_node)
-                print(f"✓ Initialized QPU node with {self.num_qpu_miners} miner(s)")
+                self.logger.info(f"✓ Initialized QPU node with {self.num_qpu_miners} miner(s)")
                 if self.num_qpu_miners > 1:
-                    print("WARNING: Multiple QPU miners not yet supported")
+                    self.logger.info("WARNING: Multiple QPU miners not yet supported")
 
             # Create a node for CPU/SA miners
             if self.num_sa_miners > 0:
@@ -118,7 +122,7 @@ class QuantumBlockchain:
                 for i in range(self.num_sa_miners):
                     cpu_node = Node(node_id=f"cpu-node{i+1}", miners_config=cpu_config)
                     self.nodes.append(cpu_node)
-                    print(f"✓ Initialized CPU node {cpu_node.node_id}")
+                    self.logger.info(f"✓ Initialized CPU node {cpu_node.node_id}")
 
             # Create a node for GPU miners if requested
             if self.num_gpu_miners > 0:
@@ -132,7 +136,7 @@ class QuantumBlockchain:
                     }
                     gpu_node = Node(node_id="gpu-modal-node", miners_config=gpu_config)
                     self.nodes.append(gpu_node)
-                    print(f"✓ Initialized GPU Modal node with {self.num_gpu_miners} miner(s)")
+                    self.logger.info(f"✓ Initialized GPU Modal node with {self.num_gpu_miners} miner(s)")
                 else:
                     # Local backend
                     gpu_config = {
@@ -143,9 +147,9 @@ class QuantumBlockchain:
                     }
                     gpu_node = Node(node_id="gpu-local-node", miners_config=gpu_config)
                     self.nodes.append(gpu_node)
-                    print(f"✓ Initialized GPU Local node with {self.num_gpu_miners} miner(s)")
+                    self.logger.info(f"✓ Initialized GPU Local node with {self.num_gpu_miners} miner(s)")
                 if self.num_gpu_miners > 1:
-                    print("WARNING: Multiple GPU miner nodes not yet supported")
+                    self.logger.info("WARNING: Multiple GPU miner nodes not yet supported")
 
         else:
             # Single miner mode (legacy) - create a single CPU node
@@ -154,7 +158,7 @@ class QuantumBlockchain:
             }
             cpu_node = Node(node_id="single-cpu-node", miners_config=cpu_config)
             self.nodes = [cpu_node]
-            print("✓ Initialized single CPU node for legacy mode")
+            self.logger.info("✓ Initialized single CPU node for legacy mode")
 
         # Network compute tracking
         self.network_stats = {
@@ -191,11 +195,11 @@ class QuantumBlockchain:
 
         self.chain.append(genesis)
 
-        print(f"Genesis block loaded with next block requirements:")
-        print(f"  Difficulty Energy: {genesis.next_block_requirements.difficulty_energy}")
-        print(f"  Min Diversity: {genesis.next_block_requirements.min_diversity}")
-        print(f"  Min Solutions: {genesis.next_block_requirements.min_solutions}")
-        print(f"  Timeout to ease: {genesis.next_block_requirements.timeout_to_difficulty_adjustment_decay}s")
+        self.logger.info(f"Genesis block loaded with next block requirements:")
+        self.logger.info(f"  Difficulty Energy: {genesis.next_block_requirements.difficulty_energy}")
+        self.logger.info(f"  Min Diversity: {genesis.next_block_requirements.min_diversity}")
+        self.logger.info(f"  Min Solutions: {genesis.next_block_requirements.min_solutions}")
+        self.logger.info(f"  Timeout to ease: {genesis.next_block_requirements.timeout_to_difficulty_adjustment_decay}s")
 
         self.base_difficulty_energy = genesis.next_block_requirements.difficulty_energy
         self.base_min_diversity = genesis.next_block_requirements.min_diversity
@@ -228,12 +232,12 @@ class QuantumBlockchain:
             self.min_diversity = max(0.2, self.base_min_diversity - self.diversity_adjustment_rate * self.win_streak)
             self.min_solutions = max(10, int(self.base_min_solutions * (1 - self.solutions_adjustment_rate * self.win_streak)))
 
-            print(f"\n🔥 {winner} win streak: {self.win_streak} (Reward multiplier: {self.streak_multiplier}x)")
-            print(f"   Difficulty EASED to level {self.win_streak} - Energy: {self.difficulty_energy:.1f}, Diversity: {self.min_diversity:.2f}, Solutions: {self.min_solutions}")
+            self.logger.info(f"\n🔥 {winner} win streak: {self.win_streak} (Reward multiplier: {self.streak_multiplier}x)")
+            self.logger.info(f"   Difficulty EASED to level {self.win_streak} - Energy: {self.difficulty_energy:.1f}, Diversity: {self.min_diversity:.2f}, Solutions: {self.min_solutions}")
         else:
             # Different miner won - make it HARDER
             if self.last_winner and self.win_streak > 0:
-                print(f"\n⚡ {winner} broke {self.last_winner}'s {self.win_streak}-block streak!")
+                self.logger.info(f"\n⚡ {winner} broke {self.last_winner}'s {self.win_streak}-block streak!")
 
             self.last_winner = winner
             old_streak = self.win_streak
@@ -245,7 +249,7 @@ class QuantumBlockchain:
             self.min_diversity = min(0.46, self.base_min_diversity + self.diversity_adjustment_rate)
             self.min_solutions = min(100, int(self.base_min_solutions * (1 + self.solutions_adjustment_rate)))
 
-            print(f"   Difficulty HARDENED to level {old_streak - 1} - Energy: {self.difficulty_energy:.1f}, Diversity: {self.min_diversity:.2f}, Solutions: {self.min_solutions}")
+            self.logger.info(f"   Difficulty HARDENED to level {old_streak - 1} - Energy: {self.difficulty_energy:.1f}, Diversity: {self.min_diversity:.2f}, Solutions: {self.min_solutions}")
 
         # Note: Difficulty parameters are now managed at blockchain level, not miner level
         # Miners will access these parameters during mining through block context
@@ -298,7 +302,7 @@ class QuantumBlockchain:
             seed = ising_nonce_from_block(block.header.previous_hash, block.header.timestamp, block.header.index, nonce)
             h, J = generate_ising_model_from_nonce(seed, block.quantum_proof.nodes, block.quantum_proof.edges)
 
-            print(f"Num QPU: {self.num_qpu_miners}, Num SA: {self.num_sa_miners}, Num GPU: {self.num_gpu_miners}")
+            self.logger.info(f"Num QPU: {self.num_qpu_miners}, Num SA: {self.num_sa_miners}, Num GPU: {self.num_gpu_miners}")
 
             # Sample from quantum/simulated annealer
             if self.num_qpu_miners > 0:
@@ -339,7 +343,7 @@ class QuantumBlockchain:
                     diversity = self.calculate_diversity(sample_solutions)
                 else:
                     diversity = 0.0
-                print(f"Progress: {progress}, Min energy: {min_energy:.2f}, Valid: {num_valid}, Diversity: {diversity:.3f}")
+                self.logger.info(f"Progress: {progress}, Min energy: {min_energy:.2f}, Valid: {num_valid}, Diversity: {diversity:.3f}")
 
     async def competitive_mine(self, previous_block: Block, next_requirements: NextBlockRequirements) -> Optional[MiningResult]:
         """
@@ -352,14 +356,14 @@ class QuantumBlockchain:
         Returns:
             Mining result from the winning miner, or None if no solution found
         """
-        print("\nStarting competitive mining with Node architecture...")
-        print(f"Current Difficulty: Energy < {self.difficulty_energy:.1f}, Diversity >= {self.min_diversity:.2f}, Solutions >= {self.min_solutions}")
+        self.logger.info("\nStarting competitive mining with Node architecture...")
+        self.logger.info(f"Current Difficulty: Energy < {self.difficulty_energy:.1f}, Diversity >= {self.min_diversity:.2f}, Solutions >= {self.min_solutions}")
 
         # Start mining on all nodes concurrently
         mining_tasks = []
 
         for node in self.nodes:
-            print(f"Starting mining on node: {node.node_id}")
+            self.logger.info(f"Starting mining on node: {node.node_id}")
             # Create async task for each node's mining
             task = asyncio.create_task(node.mine_block(previous_block))
             mining_tasks.append(task)
@@ -390,7 +394,7 @@ class QuantumBlockchain:
 
 
         except Exception as e:
-            print(f"Error during competitive mining: {e}")
+            self.logger.info(f"Error during competitive mining: {e}")
             # Cancel all tasks on error
             for task in mining_tasks:
                 if not task.done():
@@ -402,7 +406,7 @@ class QuantumBlockchain:
             raise
 
         if winning_result is None:
-            print("❌ No mining solution found by any node")
+            self.logger.info("❌ No mining solution found by any node")
             return None
 
         # Update stats - simplified for Node architecture
@@ -418,10 +422,10 @@ class QuantumBlockchain:
         base_reward = 50  # Base QUIP tokens
         actual_reward = base_reward * self.streak_multiplier
 
-        print(f"\n🏆 WINNER: {winning_result.miner_id} ({winning_result.miner_type})")
-        print(f"Solutions found: {len(winning_result.solutions)}")
-        print(f"Time: {winning_result.mining_time:.2f}s")
-        print(f"💰 Block Reward: {actual_reward:.1f} QUIP (Base: {base_reward}, Multiplier: {self.streak_multiplier}x)")
+        self.logger.info(f"\n🏆 WINNER: {winning_result.miner_id} ({winning_result.miner_type})")
+        self.logger.info(f"Solutions found: {len(winning_result.solutions)}")
+        self.logger.info(f"Time: {winning_result.mining_time:.2f}s")
+        self.logger.info(f"💰 Block Reward: {actual_reward:.1f} QUIP (Base: {base_reward}, Multiplier: {self.streak_multiplier}x)")
 
         # Adjust difficulty for next block (simplified)
         self.adjust_difficulty(winning_result.miner_type)
@@ -453,17 +457,17 @@ class QuantumBlockchain:
 
         if self.competitive:
             # Competitive mining
-            print(f"\n{'='*60}")
-            print(f"COMPETITIVE MINING - Block {previous_block.header.index + 1}")
-            print(f"{'='*60}")
+            self.logger.info(f"\n{'='*60}")
+            self.logger.info(f"COMPETITIVE MINING - Block {previous_block.header.index + 1}")
+            self.logger.info(f"{'='*60}")
             if self.last_winner and self.win_streak > 1:
-                print(f"Current Leader: {self.last_winner} (Streak: {self.win_streak-1})")
+                self.logger.info(f"Current Leader: {self.last_winner} (Streak: {self.win_streak-1})")
 
             # Call competitive mining with the block and requirements
             result = asyncio.run(self.competitive_mine(previous_block, next_requirements))
 
             if result is None:
-                print("❌ No solution found by any miner. Cannot create block.")
+                self.logger.info("❌ No solution found by any miner. Cannot create block.")
                 return None
             
             # Find the node that won to get miner info
@@ -489,8 +493,8 @@ class QuantumBlockchain:
             return winning_block
         else:
             # Single miner mode (legacy)
-            print(f"\nMining block {new_block.header.index}...")
-            print(f"Difficulty: Energy < {self.difficulty_energy}, Diversity >= {self.min_diversity}, Solutions >= {self.min_solutions}")
+            self.logger.info(f"\nMining block {new_block.header.index}...")
+            self.logger.info(f"Difficulty: Energy < {self.difficulty_energy}, Diversity >= {self.min_diversity}, Solutions >= {self.min_solutions}")
             start_time = time.time()
 
             # Perform quantum proof of work
@@ -505,7 +509,7 @@ class QuantumBlockchain:
             new_block.miner_info.miner_type = "SA"  # Legacy mode uses SA
             new_block.quantum_proof.mining_time = time.time() - start_time
 
-            print(f"Block mined! Nonce: {nonce}, Energy: {energy:.2f}, Diversity: {diversity:.3f}, Valid solutions: {num_valid}, Time: {new_block.mining_time:.2f}s")
+            self.logger.info(f"Block mined! Nonce: {nonce}, Energy: {energy:.2f}, Diversity: {diversity:.3f}, Valid solutions: {num_valid}, Time: {new_block.mining_time:.2f}s")
 
         new_block.hash = new_block.compute_hash()
         self.chain.append(new_block)
@@ -540,42 +544,42 @@ class QuantumBlockchain:
     def print_chain(self):
         """Print the blockchain."""
         for block in self.chain:
-            print(f"\nBlock {block.header.index}:")
-            print(f"  Timestamp: {block.header.timestamp}")
-            print(f"  Data: {block.data}")
-            print(f"  Previous Hash: {block.header.previous_hash[:16]}...")
-            print(f"  Hash: {block.hash[:16]}...")
-            print(f"  Nonce: {block.quantum_proof.nonce}")
+            self.logger.info(f"\nBlock {block.header.index}:")
+            self.logger.info(f"  Timestamp: {block.header.timestamp}")
+            self.logger.info(f"  Data: {block.data}")
+            self.logger.info(f"  Previous Hash: {block.header.previous_hash[:16]}...")
+            self.logger.info(f"  Hash: {block.hash[:16]}...")
+            self.logger.info(f"  Nonce: {block.quantum_proof.nonce}")
             if block.energy is not None:
-                print(f"  Quantum Energy: {block.energy:.2f}")
-                print(f"  Diversity: {block.diversity:.3f}")
-                print(f"  Valid Solutions: {block.num_valid_solutions}")
+                self.logger.info(f"  Quantum Energy: {block.energy:.2f}")
+                self.logger.info(f"  Diversity: {block.diversity:.3f}")
+                self.logger.info(f"  Valid Solutions: {block.num_valid_solutions}")
                 if block.miner_info.miner_id:
-                    print(f"  Miner: {block.miner_info.miner_id} ({block.miner_info.miner_type})")
-                    print(f"  Mining Time: {block.quantum_proof.mining_time:.2f}s")
+                    self.logger.info(f"  Miner: {block.miner_info.miner_id} ({block.miner_info.miner_type})")
+                    self.logger.info(f"  Mining Time: {block.quantum_proof.mining_time:.2f}s")
                 elif block.miner_info.miner_type:
-                    print(f"  Miner: {block.miner_info.miner_type}")
-                    print(f"  Mining Time: {block.quantum_proof.mining_time:.2f}s")
+                    self.logger.info(f"  Miner: {block.miner_info.miner_type}")
+                    self.logger.info(f"  Mining Time: {block.quantum_proof.mining_time:.2f}s")
             if block.signature:
-                print(f"  Signature: {block.signature[:32]}...")
+                self.logger.info(f"  Signature: {block.signature[:32]}...")
             if block.miner_info.reward_address:
-                print(f"  Reward Address: {block.miner_info.reward_address[:16]}...")
+                self.logger.info(f"  Reward Address: {block.miner_info.reward_address[:16]}...")
             if block.miner_info.ecdsa_public_key:
-                print(f"  ECDSA Public Key: {block.miner_info.ecdsa_public_key[:16]}...")
+                self.logger.info(f"  ECDSA Public Key: {block.miner_info.ecdsa_public_key[:16]}...")
             if block.miner_info.wots_public_key:
-                print(f"  WOTS+ Public Key: {block.miner_info.wots_public_key[:16]}...")
+                self.logger.info(f"  WOTS+ Public Key: {block.miner_info.wots_public_key[:16]}...")
 
     def print_competitive_summary(self):
         """Print competitive mining summary."""
         if not self.competitive:
             return
 
-        print("\n" + "="*60)
-        print("COMPETITIVE MINING SUMMARY")
-        print("="*60)
+        self.logger.info("\n" + "="*60)
+        self.logger.info("COMPETITIVE MINING SUMMARY")
+        self.logger.info("="*60)
 
         # Individual miner stats
-        print("\nIndividual Miner Performance:")
+        self.logger.info("\nIndividual Miner Performance:")
         total_blocks = sum(self.mining_stats.values())
 
         for miner_id, wins in sorted(self.mining_stats.items()):
@@ -583,12 +587,12 @@ class QuantumBlockchain:
                 percentage = (wins / total_blocks * 100) if total_blocks > 0 else 0
                 miner = self.miners_by_id.get(miner_id)
                 if miner:
-                    print(f"  {miner_id}: {wins} blocks ({percentage:.1f}%), {miner.total_rewards:.1f} QUIP earned")
+                    self.logger.info(f"  {miner_id}: {wins} blocks ({percentage:.1f}%), {miner.total_rewards:.1f} QUIP earned")
                 else:
-                    print(f"  {miner_id}: {wins} blocks ({percentage:.1f}%)")
+                    self.logger.info(f"  {miner_id}: {wins} blocks ({percentage:.1f}%)")
 
         # Type summary
-        print("\nSummary by Miner Type:")
+        self.logger.info("\nSummary by Miner Type:")
         type_stats = {}
         for miner_id, wins in self.mining_stats.items():
             miner_type = miner_id.split('-')[0]
@@ -596,21 +600,21 @@ class QuantumBlockchain:
 
         for miner_type, wins in sorted(type_stats.items()):
             percentage = (wins / total_blocks * 100) if total_blocks > 0 else 0
-            print(f"  {miner_type}: {wins} blocks ({percentage:.1f}%)")
+            self.logger.info(f"  {miner_type}: {wins} blocks ({percentage:.1f}%)")
 
-        print(f"\nTotal blocks mined: {total_blocks}")
+        self.logger.info(f"\nTotal blocks mined: {total_blocks}")
 
         # Print network compute statistics
-        print("\n" + "="*60)
-        print("NETWORK COMPUTE STATISTICS")
-        print("="*60)
+        self.logger.info("\n" + "="*60)
+        self.logger.info("NETWORK COMPUTE STATISTICS")
+        self.logger.info("="*60)
         total_network_samples = sum(miner.timing_stats['total_samples'] for miner in self.miners)
         total_attempts = sum(miner.timing_stats['blocks_attempted'] for miner in self.miners)
 
-        print(f"Total Network Samples: {total_network_samples:,}")
-        print(f"Total Mining Attempts: {total_attempts}")
-        print(f"Average Samples per Block: {total_network_samples / total_blocks:.1f}" if total_blocks > 0 else "N/A")
-        print(f"Network Efficiency: {total_blocks / total_attempts * 100:.2f}%" if total_attempts > 0 else "N/A")
+        self.logger.info(f"Total Network Samples: {total_network_samples:,}")
+        self.logger.info(f"Total Mining Attempts: {total_attempts}")
+        self.logger.info(f"Average Samples per Block: {total_network_samples / total_blocks:.1f}" if total_blocks > 0 else "N/A")
+        self.logger.info(f"Network Efficiency: {total_blocks / total_attempts * 100:.2f}%" if total_attempts > 0 else "N/A")
 
         # Analyze streaks by individual miner
         current_winner = None
@@ -641,20 +645,20 @@ class QuantumBlockchain:
             miner_type = miner_id.split('-')[0]
             max_streaks_by_type[miner_type] = max(max_streaks_by_type.get(miner_type, 0), streak)
 
-        print(f"\nLongest streaks by individual miner:")
+        self.logger.info(f"\nLongest streaks by individual miner:")
         for miner, streak in sorted(max_streaks_by_id.items()):
-            print(f"  {miner}: {streak} blocks")
+            self.logger.info(f"  {miner}: {streak} blocks")
 
-        print(f"\nLongest streaks by type:")
+        self.logger.info(f"\nLongest streaks by type:")
         for miner, streak in sorted(max_streaks_by_type.items()):
-            print(f"  {miner}: {streak} blocks")
+            self.logger.info(f"  {miner}: {streak} blocks")
 
         # Print detailed timing statistics for each miner
-        print("\n" + "="*60)
-        print("DETAILED TIMING STATISTICS")
-        print("="*60)
+        self.logger.info("\n" + "="*60)
+        self.logger.info("DETAILED TIMING STATISTICS")
+        self.logger.info("="*60)
         for miner in self.miners:
-            print(miner.get_timing_summary())
+            self.logger.info(miner.get_timing_summary())
 
         # Analyze mining times by type
         mining_times_by_type = {}
@@ -667,15 +671,15 @@ class QuantumBlockchain:
 
         for miner_type, times in sorted(mining_times_by_type.items()):
             if times:
-                print(f"\n{miner_type} Mining Times:")
-                print(f"  Average: {np.mean(times):.2f}s")
-                print(f"  Min: {np.min(times):.2f}s")
-                print(f"  Max: {np.max(times):.2f}s")
+                self.logger.info(f"\n{miner_type} Mining Times:")
+                self.logger.info(f"  Average: {np.mean(times):.2f}s")
+                self.logger.info(f"  Min: {np.min(times):.2f}s")
+                self.logger.info(f"  Max: {np.max(times):.2f}s")
 
     def generate_benchmark_plots(self, output_prefix: str = "benchmarks/blockchain_benchmark"):
         """Generate comprehensive benchmark plots."""
         if not self.competitive or len(self.chain) < 2:
-            print("Not enough data for benchmarking")
+            self.logger.info("Not enough data for benchmarking")
             return
 
         # Set style
@@ -959,7 +963,7 @@ class QuantumBlockchain:
 
         plt.tight_layout()
         plt.savefig(f'{output_prefix}_comprehensive.png', dpi=300, bbox_inches='tight')
-        print(f"Saved comprehensive benchmark plot to {output_prefix}_comprehensive.png")
+        self.logger.info(f"Saved comprehensive benchmark plot to {output_prefix}_comprehensive.png")
 
         # Additional detailed timing plot
         fig2, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
@@ -990,7 +994,7 @@ class QuantumBlockchain:
 
         plt.tight_layout()
         plt.savefig(f'{output_prefix}_timing.png', dpi=300, bbox_inches='tight')
-        print(f"Saved timing analysis plot to {output_prefix}_timing.png")
+        self.logger.info(f"Saved timing analysis plot to {output_prefix}_timing.png")
 
         # Generate miner timing performance graphs
         self.generate_timing_performance_plots(output_prefix)
@@ -998,7 +1002,7 @@ class QuantumBlockchain:
     def generate_timing_performance_plots(self, output_prefix: str = "benchmarks/blockchain_benchmark"):
         """Generate detailed timing performance plots for each miner over time."""
         if not self.competitive or len(self.chain) < 2:
-            print("Not enough data for timing performance plots")
+            self.logger.info("Not enough data for timing performance plots")
             return
 
         # Set style
@@ -1220,7 +1224,7 @@ class QuantumBlockchain:
         plt.suptitle('Miner Timing Performance Analysis', fontsize=16, y=1.02)
         plt.tight_layout()
         plt.savefig(f'{output_prefix}_miner_timing_performance.png', dpi=300, bbox_inches='tight')
-        print(f"Saved miner timing performance plot to {output_prefix}_miner_timing_performance.png")
+        self.logger.info(f"Saved miner timing performance plot to {output_prefix}_miner_timing_performance.png")
 
 
 def run_blockchain(args):
@@ -1228,9 +1232,9 @@ def run_blockchain(args):
     competitive = args.competitive
 
     if competitive:
-        print("Competitive Quantum Mining Demo")
-        print(f"QPU Miners: {args.num_qpu}, SA Miners: {args.num_sa}")
-        print("=" * 60)
+        self.logger.info("Competitive Quantum Mining Demo")
+        self.logger.info(f"QPU Miners: {args.num_qpu}, SA Miners: {args.num_sa}")
+        self.logger.info("=" * 60)
 
         # Inverted difficulty: starts HARD (QPU-favored) and eases with streaks
         blockchain = QuantumBlockchain(
@@ -1311,23 +1315,23 @@ def run_blockchain(args):
 
         # Mine blocks with generated transactions
         for i, tx in enumerate(transactions):
-            print(f"\n📝 Transaction {i+1}/{args.blocks}: {tx}")
+            self.logger.info(f"\n📝 Transaction {i+1}/{args.blocks}: {tx}")
             blockchain.add_block(tx)
 
         # Print the chain
-        print("\nFinal Blockchain:")
+        self.logger.info("\nFinal Blockchain:")
         blockchain.print_chain()
 
         # Print competitive summary
         blockchain.print_competitive_summary()
 
         # Generate benchmark plots
-        print("\nGenerating benchmark plots...")
+        self.logger.info("\nGenerating benchmark plots...")
         blockchain.generate_benchmark_plots()
     else:
-        print("Quantum Blockchain Demo")
-        print("=" * 50)
-        print("Run with --competitive flag for QPU vs SA competition")
+        self.logger.info("Quantum Blockchain Demo")
+        self.logger.info("=" * 50)
+        self.logger.info("Run with --competitive flag for QPU vs SA competition")
 
         # Create blockchain with diversity requirements
         blockchain = QuantumBlockchain(competitive=False,
@@ -1350,11 +1354,11 @@ def run_blockchain(args):
             blockchain.add_block(tx)
 
         # Print the chain
-        print("\nFinal Blockchain:")
+        self.logger.info("\nFinal Blockchain:")
         blockchain.print_chain()
 
     # Validate
-    print(f"\nChain valid: {blockchain.validate_chain()}")
+    self.logger.info(f"\nChain valid: {blockchain.validate_chain()}")
 
 
 def main():

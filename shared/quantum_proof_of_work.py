@@ -3,13 +3,15 @@
 Extracted from BaseMiner to be reusable and stateless.
 """
 from __future__ import annotations
-from venv import logger
 
 from blake3 import blake3
+from shared.logging_config import get_logger
 from typing import Tuple, Dict, Optional
 import numpy as np
 from typing import List
 import dwave_networkx as dnx
+
+logger = get_logger('quantum_proof_of_work')
 
 # DWave Topology Configurations
 # These match real DWave systems for consistent energy scales
@@ -108,7 +110,7 @@ def ising_nonce_from_block(prev_hash: bytes, miner_id: str, cur_index: int, salt
     seed = f"{prev_hash.hex()}{miner_id}{cur_index}".encode() + salt
     nonce_bytes = blake3(seed).digest()
     nonce = int.from_bytes(nonce_bytes[:4], 'big')
-    logger.warning(f"DEBUG: ising_nonce_from_block: prev_hash={prev_hash.hex()[:8]}, miner_id={miner_id}, cur_index={cur_index}, salt={salt.hex()[:8]}, nonce={nonce}")
+    logger.debug(f"ising_nonce_from_block: prev_hash={prev_hash.hex()[:8]}, miner_id={miner_id}, cur_index={cur_index}, salt={salt.hex()[:8]}, nonce={nonce}")
     return nonce
 
 
