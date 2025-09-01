@@ -540,7 +540,7 @@ class Node:
         solutions_adjustment_rate = 0.10  # 10% adjustment
 
         # If block was mined too quickly, always HARDEN
-        if mining_result.mining_time is not None and mining_result.mining_time < 60.0:
+        if mining_result.mining_time is not None and mining_result.mining_time < 10.0:
             new_difficulty_energy = prev_req.difficulty_energy * (1 + energy_adjustment_rate)
             new_min_diversity = min(0.46, prev_req.min_diversity + diversity_adjustment_rate)
             new_min_solutions = min(100, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
