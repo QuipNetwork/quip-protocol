@@ -5,7 +5,6 @@ Extracted from BaseMiner to be reusable and stateless.
 from __future__ import annotations
 
 from blake3 import blake3
-from shared.base_miner import MiningResult
 from shared.logging_config import get_logger
 from typing import Tuple, Dict, Optional
 import numpy as np
@@ -356,57 +355,5 @@ def calculate_requirements_decay(cur_requirements: dict) -> dict:
         'timeout_to_difficulty_adjustment_decay': decay,
     }
 
-def compare_mining_results(result_a: MiningResult, result_b: MiningResult, requirements: NextBlockRequirements) -> int:
-    """
-    Compare two mining results to determine which is better.
 
-    Returns:
-        -1 if A is better than B
-         0 if A and B are equal
-         1 if B is better than A
-
-    Comparison logic:
-    1. Higher num_valid_solutions is better
-    2. If equal (or both 0), compare average of top N solution energies
-       where N = requirements.min_solutions
-    3. If still equal, compare overall average solution energy
-    """
-    # Import here to avoid circular imports
-    from shared.base_miner import MiningResult
-
-    # 1. Compare number of valid solutions (higher is better)
-    if result_a.num_valid > result_b.num_valid:
-        return -1
-    elif result_b.num_valid > result_a.num_valid:
-        return 1
-
-    # 2. If equal (or both 0), compare average of top N solution energies
-    if result_a.num_valid > 0 and result_b.num_valid > 0:
-        # Generate Ising models for both results
-        h_a, J_a = generate_ising_model_from_nonce(result_a.nonce, result_a.node_list, result_a.edge_list)
-        h_b, J_b = generate_ising_model_from_nonce(result_b.nonce, result_b.node_list, result_b.edge_list)
-
-        # Calculate energies for top N solutions
-        n_solutions = min(requirements.min_solutions, len(result_a.solutions), len(result_b.solutions))
-        if n_solutions > 0:
-            energies_a = [energy_of_solution(sol, h_a, J_a, result_a.node_list)
-                         for sol in result_a.solutions[:n_solutions]]
-            energies_b = [energy_of_solution(sol, h_b, J_b, result_b.node_list)
-                         for sol in result_b.solutions[:n_solutions]]
-
-            avg_energy_a = np.mean(energies_a)
-            avg_energy_b = np.mean(energies_b)
-
-            if avg_energy_a < avg_energy_b:  # Lower energy is better
-                return -1
-            elif avg_energy_b < avg_energy_a:
-                return 1
-
-    # 3. If still equal, compare overall best energy (lower is better)
-    if result_a.energy < result_b.energy:
-        return -1
-    elif result_b.energy < result_a.energy:
-        return 1
-
-    return 0  # Equal
 

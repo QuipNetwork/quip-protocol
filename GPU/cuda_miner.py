@@ -39,7 +39,7 @@ class CudaMiner(BaseMiner):
         Args:
             prev_block: Previous block in the chain
             node_info: Node information containing miner_id and other details
-            requirements: NextBlockRequirements object with difficulty settings
+            requirements: BlockRequirements object with difficulty settings
             result_queue: Multiprocessing queue for results
             stop_event: Multiprocessing event to signal stop
         """
@@ -55,7 +55,7 @@ class CudaMiner(BaseMiner):
         self.current_round_attempted = True
         self.logger.info(f"Mining block {cur_index}...")
 
-        # Extract requirements from NextBlockRequirements object
+        # Extract requirements from BlockRequirements object
         difficulty_energy = requirements.difficulty_energy
         min_diversity = requirements.min_diversity
         min_solutions = requirements.min_solutions
@@ -230,7 +230,7 @@ class CudaMiner(BaseMiner):
 def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutions: int):
     """Calculate adaptive mining parameters based on difficulty requirements.
 
-    Supports either a NextBlockRequirements object or a dict with keys:
+    Supports either a BlockRequirements object or a dict with keys:
     'difficulty_energy', 'min_diversity', 'min_solutions'.
     """
     # Normalize difficulty factor (more negative = harder)

@@ -18,7 +18,8 @@ if TYPE_CHECKING:
 
 from shared import block
 from shared.block_signer import BlockSigner
-from shared.block import Block, BlockHeader, MinerInfo, NextBlockRequirements
+from shared.block import Block, BlockHeader, MinerInfo
+from shared.block_requirements import BlockRequirements
 from shared.miner import Miner, MiningResult
 from shared.logging_config import init_component_logger
 # Global logger for this module (set during Node initialization)
@@ -504,7 +505,7 @@ class Node:
             raise ValueError("Failed to verify signature")
         return block
 
-    def compute_next_block_requirements(self, previous_block: Block, mining_result: MiningResult) -> NextBlockRequirements:
+    def compute_next_block_requirements(self, previous_block: Block, mining_result: MiningResult) -> BlockRequirements:
         """
         Compute the next block requirements based on the previous block and mining result.
 
@@ -572,7 +573,7 @@ class Node:
                 self.logger.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
                 self.logger.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
 
-        return NextBlockRequirements(
+        return BlockRequirements(
             difficulty_energy=new_difficulty_energy,
             min_diversity=new_min_diversity,
             min_solutions=new_min_solutions,

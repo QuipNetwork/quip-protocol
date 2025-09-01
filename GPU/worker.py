@@ -18,7 +18,7 @@ def gpu_mine_block_process(miner_data, block, requirements, result_queue, stop_e
     Args:
         miner_data: Serialized miner data (type, id, config)
         block: Block object to mine
-        requirements: NextBlockRequirements object with difficulty settings
+        requirements: BlockRequirements object with difficulty settings
         result_queue: Queue to put results
         stop_event: Event to signal stop
     """

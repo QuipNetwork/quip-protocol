@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from shared.quantum_proof_of_work import calculate_diversity, generate_ising_model_from_nonce, ising_nonce_from_block, energies_for_solutions
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce, calculate_diversity
 from shared.quantum_proof_of_work import calculate_requirements_decay
+from shared.block_requirements import BlockRequirements
 from shared.logging_config import get_logger
 
 # Initialize logger
@@ -336,60 +337,7 @@ class BlockHeader:
         )
 
 
-@dataclass
-class NextBlockRequirements:
-    """Requirements that the next block must satisfy."""
-    difficulty_energy: float
-    min_diversity: float
-    min_solutions: int
-    timeout_to_difficulty_adjustment_decay: int
 
-    def to_network(self) -> bytes:
-        """Serialize to binary format."""
-        result = b''
-        result += struct.pack('!d', self.difficulty_energy)
-        result += struct.pack('!d', self.min_diversity)
-        result += struct.pack('!I', self.min_solutions)
-        result += struct.pack('!i', self.timeout_to_difficulty_adjustment_decay)
-        return result
-
-    @classmethod
-    def from_network(cls, data: bytes) -> 'NextBlockRequirements':
-        """Deserialize from binary format."""
-        offset = 0
-        difficulty_energy = struct.unpack('!d', data[offset:offset+8])[0]
-        offset += 8
-        min_diversity = struct.unpack('!d', data[offset:offset+8])[0]
-        offset += 8
-        min_solutions = struct.unpack('!I', data[offset:offset+4])[0]
-        offset += 4
-        timeout_to_difficulty_adjustment_decay = struct.unpack('!i', data[offset:offset+4])[0]
-
-        return cls(
-            difficulty_energy=difficulty_energy,
-            min_diversity=min_diversity,
-            min_solutions=min_solutions,
-            timeout_to_difficulty_adjustment_decay=timeout_to_difficulty_adjustment_decay
-        )
-
-    def to_json(self) -> dict:
-        """Serialize to JSON-compatible dictionary."""
-        return {
-            'difficulty_energy': self.difficulty_energy,
-            'min_diversity': self.min_diversity,
-            'min_solutions': self.min_solutions,
-            'timeout_to_difficulty_adjustment_decay': self.timeout_to_difficulty_adjustment_decay
-        }
-
-    @classmethod
-    def from_json(cls, data: dict) -> 'NextBlockRequirements':
-        """Deserialize from JSON-compatible dictionary."""
-        return cls(
-            difficulty_energy=float(data['difficulty_energy']),
-            min_diversity=float(data['min_diversity']),
-            min_solutions=int(data['min_solutions']),
-            timeout_to_difficulty_adjustment_decay=int(data['timeout_to_difficulty_adjustment_decay'])
-        )
 
 @dataclass
 class Block:
@@ -397,7 +345,7 @@ class Block:
 
     miner_info: MinerInfo
     quantum_proof: QuantumProof
-    next_block_requirements: NextBlockRequirements
+    next_block_requirements: BlockRequirements
 
     data: bytes  # Arbitrary data, eventually a merkle tree most likely.
 
@@ -465,7 +413,7 @@ class Block:
 
         # Read next_block_requirements
         req_data = data[offset:]
-        next_block_requirements = NextBlockRequirements.from_network(req_data)
+        next_block_requirements = BlockRequirements.from_network(req_data)
         req_size = len(next_block_requirements.to_network())
         offset += req_size
 
@@ -562,12 +510,12 @@ class Block:
                     f"solutions {before['min_solutions']} -> {cur['min_solutions']}"
                 )
                 # Overwrite a local copy of requirements for validation
-                requirements = NextBlockRequirements.from_json(cur)
+                requirements = BlockRequirements.from_json(cur)
 
         # Validate quantum proof against (possibly decayed) requirements
         return self._validate_quantum_proof(self.miner_info.miner_id, requirements)
 
-    def _validate_quantum_proof(self, miner_id: str, requirements: NextBlockRequirements) -> bool:
+    def _validate_quantum_proof(self, miner_id: str, requirements: BlockRequirements) -> bool:
         """Validate quantum proof against requirements and compute metrics."""
         if not self.quantum_proof:
             logger.error(f"Block {self.header.index} rejected: no quantum proof")
@@ -649,7 +597,7 @@ class Block:
 
         # Parse components using their own from_json methods
         header = BlockHeader.from_json(data['header'])
-        next_block_requirements = NextBlockRequirements.from_json(data['next_block_requirements'])
+        next_block_requirements = BlockRequirements.from_json(data['next_block_requirements'])
 
         if data['miner_info']:
             miner_info = MinerInfo.from_json(data['miner_info'])
@@ -721,7 +669,7 @@ def load_genesis_block(genesis_block_filepath: str) -> 'Block':
     genesis_block = create_genesis_block(genesis_data)
 
     logger.info(f"Loaded genesis block from: {config_path.name}")
-    # Note: adaptive_parameters not available in current NextBlockRequirements structure
+    # Note: adaptive_parameters not available in current BlockRequirements structure
     logger.info(f"Mining parameters: difficulty_energy={genesis_block.next_block_requirements.difficulty_energy}")
 
     return genesis_block

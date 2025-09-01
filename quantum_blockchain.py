@@ -14,7 +14,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from dotenv import load_dotenv
 from matplotlib.patches import Patch
-from shared.block import Block, load_genesis_block, create_genesis_block, NextBlockRequirements, BlockHeader, MinerInfo, QuantumProof
+from shared.block import Block, load_genesis_block, create_genesis_block, BlockHeader, MinerInfo, QuantumProof
+from shared.block_requirements import BlockRequirements
 from shared.quantum_proof_of_work import calculate_diversity as _shared_diversity, calculate_hamming_distance as _shared_hamming, generate_ising_model_from_nonce, ising_nonce_from_block
 
 from shared.miner import MiningResult
@@ -345,7 +346,7 @@ class QuantumBlockchain:
                     diversity = 0.0
                 self.logger.info(f"Progress: {progress}, Min energy: {min_energy:.2f}, Valid: {num_valid}, Diversity: {diversity:.3f}")
 
-    async def competitive_mine(self, previous_block: Block, next_requirements: NextBlockRequirements) -> Optional[MiningResult]:
+    async def competitive_mine(self, previous_block: Block, next_requirements: BlockRequirements) -> Optional[MiningResult]:
         """
         Run competitive mining between available nodes.
 
@@ -448,7 +449,7 @@ class QuantumBlockchain:
         previous_block = self.get_latest_block()
 
         # Create next block requirements with current difficulty
-        next_requirements = NextBlockRequirements(
+        next_requirements = BlockRequirements(
             difficulty_energy=self.difficulty_energy,
             min_diversity=self.min_diversity,
             min_solutions=self.min_solutions,

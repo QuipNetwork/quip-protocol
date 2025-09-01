@@ -8,9 +8,9 @@ from shared.block import (
     QuantumProof,
     MinerInfo,
     BlockHeader,
-    NextBlockRequirements,
     Block,
 )
+from shared.block_requirements import BlockRequirements
 
 
 def sample_quantum_proof():
@@ -36,7 +36,7 @@ def sample_miner_info():
 
 
 def sample_requirements():
-    return NextBlockRequirements(
+    return BlockRequirements(
         difficulty_energy=-20.0,
         min_diversity=0.5,
         min_solutions=2,
@@ -100,7 +100,7 @@ def test_block_header_network_roundtrip():
 def test_next_block_requirements_network_roundtrip():
     req = sample_requirements()
     data = req.to_network()
-    req2 = NextBlockRequirements.from_network(data)
+    req2 = BlockRequirements.from_network(data)
     assert req2.difficulty_energy == req.difficulty_energy
     assert req2.min_diversity == req.min_diversity
     assert req2.min_solutions == req.min_solutions
@@ -182,7 +182,7 @@ def test_block_validate_block_true_and_false():
     prev = make_sample_block()
 
     # Lenient requirements: very high energy threshold, low diversity, 1 solution
-    prev.next_block_requirements = NextBlockRequirements(
+    prev.next_block_requirements = BlockRequirements(
         difficulty_energy=1e9,
         min_diversity=0.0,
         min_solutions=1,
@@ -193,7 +193,7 @@ def test_block_validate_block_true_and_false():
     assert blk.validate_block(prev) is True
 
     # Harsher requirements should fail
-    harsh = NextBlockRequirements(
+    harsh = BlockRequirements(
         difficulty_energy=-60.0,  # Harder threshold
         min_diversity=1.0,
         min_solutions=3,
@@ -259,7 +259,7 @@ def test_quantum_proof_json_roundtrip():
 
 
 def test_next_block_requirements_json_roundtrip():
-    """Test NextBlockRequirements JSON serialization and deserialization."""
+    """Test BlockRequirements JSON serialization and deserialization."""
     req = sample_requirements()
 
     # Serialize to JSON dict
@@ -271,7 +271,7 @@ def test_next_block_requirements_json_roundtrip():
     assert 'timeout_to_difficulty_adjustment_decay' in json_dict
 
     # Deserialize from JSON dict
-    req2 = NextBlockRequirements.from_json(json_dict)
+    req2 = BlockRequirements.from_json(json_dict)
 
     # Verify roundtrip
     assert req2.difficulty_energy == req.difficulty_energy
@@ -424,7 +424,7 @@ def test_all_components_json_serialization():
     hdr2 = BlockHeader.from_json(hdr.to_json())
     mi2 = MinerInfo.from_json(mi.to_json())
     qp2 = QuantumProof.from_json(qp.to_json())
-    req2 = NextBlockRequirements.from_json(req.to_json())
+    req2 = BlockRequirements.from_json(req.to_json())
 
     # Verify they match originals
     assert hdr2.previous_hash == hdr.previous_hash
