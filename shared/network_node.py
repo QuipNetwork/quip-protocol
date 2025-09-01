@@ -108,7 +108,7 @@ class NetworkNode(Node):
         # Durations as float seconds
         self.heartbeat_interval = float(config.get("heartbeat_interval", 15))
         self.heartbeat_timeout = float(config.get("heartbeat_timeout", 300))
-        self.node_timeout = float(config.get("node_timeout", 3))
+        self.node_timeout = float(config.get("node_timeout", 10))
 
         self.initial_peers = config.get("peer", ["nodes.quip.network:20049"])
         self.fanout = int(config.get("fanout", 3))
@@ -392,7 +392,7 @@ class NetworkNode(Node):
 
         my_latest_block = self.get_latest_block()
        
-        logger.info(f"Syncing chain from {my_latest_block.header.index} to {current_head}...")
+        logger.info(f"Syncing chain from {my_latest_block.header.index+1} to {current_head}...")
         for block_number in range(my_latest_block.header.index + 1, current_head + 1):
             block = None
             tries = 0
@@ -528,6 +528,9 @@ class NetworkNode(Node):
                     else:
                         logger.debug(f"Failed to get status from {host}: HTTP {resp.status}")
                         return None
+        except TimeoutError:
+            logger.debug(f"Failed to get status from {host}: Timeout")
+            return None
         except Exception:
             logger.exception(f"Error getting status from {host}")
             return None
@@ -538,21 +541,23 @@ class NetworkNode(Node):
             req = "/block/"
             if block_number > 0:
                 req = f"/block/{block_number}"
+            url = f"http://{host}{req}?format=network"
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    f"http://{host}{req}",
+                    url,
                     timeout=aiohttp.ClientTimeout(total=self.node_timeout)
                 ) as resp:
                     if resp.status == 200:
-                        block_data = await resp.json()
-                        block_bytes = bytes.fromhex(block_data['raw'])
-                        signature = bytes.fromhex(block_data['signature'])
-                        return Block.from_network(block_bytes + signature)
+                        data = await resp.read()
+                        return Block.from_network(data)
                     else:
                         logger.debug(f"Failed to get block from {host}: HTTP {resp.status}")
                         return None
+        except TimeoutError:
+            logger.debug(f"Failed to get block from {host}: Timeout")
+            return None
         except Exception:
-            logger.warning(f"Error getting block from {host}")
+            logger.exception(f"Error getting block from {host}")
             return None
 
     async def refresh_peer_info(self, host: str) -> bool:
@@ -590,7 +595,7 @@ class NetworkNode(Node):
                 async with session.post(
                     f"http://{host}/gossip",
                     json=asdict(message),
-                    timeout=aiohttp.ClientTimeout(total=5)
+                    timeout=aiohttp.ClientTimeout(total=self.node_timeout)
                 ) as resp:
                     return resp.status == 200
         except Exception:

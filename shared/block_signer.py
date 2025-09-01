@@ -2,6 +2,7 @@
 
 import hashlib
 import os
+from venv import logger
 from blake3 import blake3
 from typing import Tuple, List, Optional
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -163,9 +164,20 @@ class BlockSigner:
         # WOTS signature is always 2144 bytes at the end
         WOTS_SIG_LEN = 2144
         if len(signature) < WOTS_SIG_LEN:
+            logger.error(f"Signature length {len(signature)} is shorter than WOTS signature length {WOTS_SIG_LEN}")
             return False
 
         wots_signature = signature[-WOTS_SIG_LEN:]
         ecdsa_signature = signature[:-WOTS_SIG_LEN]
 
-        return self.verify_ecdsa_signature(ecdsa_public_key, message, ecdsa_signature) and self.verify_wots_signature(wots_public_key, message, wots_signature)
+        valid_ecdsa = self.verify_ecdsa_signature(ecdsa_public_key, message, ecdsa_signature)
+        if not valid_ecdsa:
+            logger.error(f"Invalid ECDSA signature in combined signature verification")
+            return False
+        
+        valid_wots = self.verify_wots_signature(wots_public_key, message, wots_signature)
+        if not valid_wots:
+            logger.error(f"Invalid WOTS signature in combined signature verification")
+            return False
+
+        return True

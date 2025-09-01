@@ -478,7 +478,11 @@ class Block:
         raw = data[:offset]
         hash = blake3(raw).digest()
 
-        signature, offset = read_bytes(data, offset)
+        # If not genesis, read signature
+        if header.index > 0:
+            signature, offset = read_bytes(data, offset)
+        else:
+            signature = b""
 
         # Create block with placeholder values for derived fields
         block = cls(
