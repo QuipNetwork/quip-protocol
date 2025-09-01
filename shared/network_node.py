@@ -13,10 +13,12 @@ from datetime import datetime
 import aiohttp
 from aiohttp import web
 import logging
+import sys
 
 import copy
 
 from blake3 import blake3
+from packaging import version
 
 from shared.base_miner import MiningResult
 from shared.block import Block, BlockHeader, MinerInfo
@@ -254,6 +256,9 @@ class NetworkNode(Node):
         self.block_processor_task = asyncio.create_task(self.block_processor_loop())
         self.gossip_processor_task = asyncio.create_task(self.gossip_processor_loop())
         self.server_task = asyncio.create_task(self.server_loop())
+
+        # have we fully synchronized with the network at least one time?
+        self.synchronized = False
 
     async def stop(self):
         """Stop the P2P node."""
@@ -532,11 +537,13 @@ class NetworkNode(Node):
             await asyncio.sleep(1)
 
         if my_latest_block.header.index > net_latest.index:
+            self.synchronized = True
             return 0
         
         if my_latest_block.header.index == net_latest.index:
             # FIXME: maybe put hash in header?
             if my_latest_block.header.previous_hash == net_latest.previous_hash and my_latest_block.header.timestamp == net_latest.timestamp:
+                self.synchronized = True
                 return 0
             else:
                 logging.warning("Latest block prev_hash mismatch, need to synchronize")
@@ -634,7 +641,7 @@ class NetworkNode(Node):
                     self.logger.info(f"Discovered {peers_found} peers")
                     return True
                 else:
-                    self.logger.error(f"Failed to join via {peer_address}: {resp.status}")
+                    self.logger.warning(f"Failed to join via {peer_address}: {resp.status}")
                     return False
 
         except Exception as e:
@@ -668,10 +675,10 @@ class NetworkNode(Node):
 
     async def send_heartbeat(self, node_host: str) -> bool:
         """Send heartbeat to a specific node."""
-        if not self.http_session:
+        if not self.http_session or not self.synchronized:
             return False
         try:
-            data = {"sender": self.public_host}
+            data = {"sender": self.public_host, "version": get_version()}
             async with self.http_session.post(
                 f"http://{node_host}/heartbeat",
                 json=data
@@ -1002,11 +1009,27 @@ class NetworkNode(Node):
             data = await request.json()
             new_node_address = data.get("host")
             info_field = data.get("info")
+            version = data.get("version")
             # Expect MinerInfo as JSON string
             new_node_info = MinerInfo.from_json(info_field) if info_field else None
 
             if not new_node_address or not new_node_info:
                 return web.json_response({"error": "Missing host or info"}, status=400)
+
+            # Check version compatibility
+            if version:
+                local_version = get_version()
+                local_ver = version.parse(local_version)
+                peer_ver = version.parse(version)
+
+                if local_ver < peer_ver:
+                    # Local version is older than the joining node's version
+                    self.logger.error(f"Local version {local_version} is outdated compared to joining node {new_node_address} running version {version}")
+                    self.logger.error("Please run 'pip install quip-network' to get the latest version")
+
+                    # Stop the node and exit
+                    await self.stop()
+                    sys.exit(1)
 
             # Add the new node
             await self.add_peer(new_node_address, new_node_info)
@@ -1036,6 +1059,24 @@ class NetworkNode(Node):
         try:
             data = await request.json()
             sender = data.get("sender")
+            version = data.get("version")
+
+            if version:
+                local_version = get_version()
+                local_ver = version.parse(local_version)
+                peer_ver = version.parse(version)
+
+                if local_ver < peer_ver:
+                    # Local version is older than the peer's version
+                    self.logger.error(f"Local version {local_version} is outdated compared to peer {sender} running version {version}")
+                    self.logger.error("Please run 'pip install quip-network' to get the latest version")
+
+                    # Stop the node and exit
+                    await self.stop()
+                    sys.exit(1)
+                elif local_ver > peer_ver:
+                    # Peer version is older than local version
+                    self.logger.warning(f"Peer {sender} is running older version {version} (local: {local_version})")
 
             if sender:
                 async with self.net_lock:
