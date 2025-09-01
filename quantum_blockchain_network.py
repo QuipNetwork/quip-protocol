@@ -9,6 +9,8 @@ import aiohttp
 from aiohttp import web
 import logging
 
+from shared.version import get_version
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,12 +21,14 @@ class NodeInfo:
     """Information about a network node."""
     address: str  # host:port
     last_seen: float
-    version: str = "1.0.0"
+    version: Optional[str] = None  # Will be set dynamically
     capabilities: Optional[List[str]] = None
-    
+
     def __post_init__(self):
         if self.capabilities is None:
             self.capabilities = ["mining", "relay"]
+        if self.version is None:
+            self.version = get_version()
     
     def is_alive(self, timeout: float = 60.0) -> bool:
         """Check if node is still alive based on last heartbeat."""
@@ -118,7 +122,7 @@ class P2PNode:
             async with aiohttp.ClientSession() as session:
                 data = {
                     "address": self.address,
-                    "version": "1.0.0",
+                    "version": get_version(),
                     "capabilities": ["mining", "relay"]
                 }
                 

@@ -29,6 +29,7 @@ except ModuleNotFoundError:  # Python 3.10
 from shared.node import Node
 from shared.network_node import NetworkNode
 from shared.block import load_genesis_block
+from shared.version import get_version
 
 
 def _load_config(path: Optional[str]) -> Dict[str, Any]:
@@ -208,8 +209,9 @@ def _run_network_node_sync(config: Dict[str, Any], genesis_config_file: str) -> 
 
 @click.group(invoke_without_command=True)
 @click.option("--config", type=click.Path(exists=True, dir_okay=False), help="Path to TOML config file")
+@click.option("--version", is_flag=True, help="Show version and exit")
 @click.pass_context
-def quip_network_node(ctx: click.Context, config: Optional[str]):
+def quip_network_node(ctx: click.Context, config: Optional[str], version: bool):
     """Run a single quip network node.
 
     Subcommands: cpu, gpu, qpu
@@ -217,6 +219,10 @@ def quip_network_node(ctx: click.Context, config: Optional[str]):
     If invoked without a subcommand, --config may specify [global].default
     to choose a default subcommand. Global settings provide listen/port/peer/auto_mine.
     """
+    if version:
+        click.echo(f"quip-protocol {get_version()}")
+        return
+
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config
     ctx.obj["toml"] = _load_config(config)
@@ -433,13 +439,18 @@ def qpu(
 @click.option("--num-qpu", type=int, default=None, help="Override: number of QPU nodes")
 @click.option("--base-port", type=int, default=8080, show_default=True, help="Starting port for first node")
 @click.option("--print-only", is_flag=True, help="Only print commands, do not execute")
+@click.option("--version", is_flag=True, help="Show version and exit")
 @click.pass_context
-def quip_network_simulator(ctx: click.Context, scenario: str, num_cpu: Optional[int], num_gpu: Optional[int], num_qpu: Optional[int], base_port: int, print_only: bool):
+def quip_network_simulator(ctx: click.Context, scenario: str, num_cpu: Optional[int], num_gpu: Optional[int], num_qpu: Optional[int], base_port: int, print_only: bool, version: bool):
     """Launch a local multi-node network using quip-network-node (separate processes).
 
     Subcommands:
       smoketest [cpu|gpu-local|gpu-metal|gpu-modal|qpu]  Run a single-node smoke test
     """
+    if version:
+        click.echo(f"quip-protocol {get_version()}")
+        return
+
     if ctx.invoked_subcommand is not None:
         return
 

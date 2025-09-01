@@ -22,6 +22,7 @@ from shared.base_miner import MiningResult
 from shared.block import Block, BlockHeader, MinerInfo
 from shared.node import Node
 from shared.logging_config import init_component_logger
+from shared.version import get_version
 
 # Configure logging
 import logging
@@ -597,7 +598,7 @@ class NetworkNode(Node):
             # Send join request
             data = {
                 "host": self.public_host,
-                "version": "0.0.0",
+                "version": get_version(),
                 "capabilities": ["mining", "relay"],
                 # Serialize MinerInfo as JSON string for transport
                 "info": self.info().to_json()

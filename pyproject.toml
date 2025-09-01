@@ -1,3 +1,31 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "quip-protocol"
+version = "0.0.1"
+description = "Quantum Proof-of-Work Blockchain Implementation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.8.0",
+    "blake3>=0.3.0",
+    "click>=8.0.0",
+    "dimod>=0.12.0",
+    "dwave-system>=1.20.0",
+    "matplotlib>=3.5.0",
+    "numpy>=1.21.0",
+    "python-dotenv>=0.19.0",
+    "tomli>=2.0.1; python_version<'3.11'"
+]
+
+[project.scripts]
+quip-demo = "quantum_blockchain:main"
+quip-p2p = "quantum_blockchain_p2p:main"
+quip-cpu-miner = "CPU.cpu_miner:cli"
+quip-gpu-miner = "GPU.gpu_miner:run_with_modal"
+quip-qpu-miner = "QPU.qpu_miner:cli"
+quip-launch = "launch_network:main"
+quip-network-node = "quip_cli:network_node_main"
+quip-network-simulator = "quip_cli:network_simulator_main"
