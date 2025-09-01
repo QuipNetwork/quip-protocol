@@ -268,9 +268,6 @@ class NetworkNode(Node):
             self.running = False
         self.logger.info("Shutting down network node...")
 
-        # Stop miner workers
-        asyncio.create_task(self.stop_mining())
-
         # Cancel background tasks
         if self.heartbeat_task:
             self.heartbeat_task.cancel()
@@ -280,15 +277,34 @@ class NetworkNode(Node):
             self.block_processor_task.cancel()
         if self.gossip_processor_task:
             self.gossip_processor_task.cancel()
+        if self.server_task:
+            self.server_task.cancel()
 
+        self.logger.info("Cancelling HTTP session tasks...")
         # Close HTTP session
         if self.http_session:
             await self.http_session.close()
 
+        self.logger.info("Cancelling web server tasks...")
         # Stop web server
         if self.runner:
-            await self.runner.cleanup()
+            try:
+                # This forces cancellation of request processing
+                await asyncio.wait_for(self.runner.cleanup(), timeout=2.0)
+            except asyncio.TimeoutError:
+                self.logger.warning("HTTP server cleanup timed out")
+        
 
+        all_tasks = asyncio.all_tasks()
+        self.logger.info(f"Total active tasks: {len(all_tasks)}")
+        for task in all_tasks:
+            if not task.done():
+                self.logger.info(f"Active task: {task.get_coro().__name__}")
+
+        # Stop miner workers
+        self.logger.info("Cancelling miner workers...")
+        await self.stop_mining()
+        self.logger.info("Stopping miner worker processes...")
         self.close()
 
         self.logger.info("Network node stopped")
@@ -373,12 +389,11 @@ class NetworkNode(Node):
                 continue
 
             # If we are synchronized, check if we are mining. If not, start mining on the next block.
-            async with self.net_lock:
-                if not self._is_mining and self.running:
-                    latest_block = self.get_latest_block()
-                    # Create task with exception handler to crash on ValueError
-                    task = asyncio.create_task(self.mine_block(latest_block))
-                    task.add_done_callback(self._handle_mining_task_exception)
+            if not self._is_mining:
+                latest_block = self.get_latest_block()
+                # Create task with exception handler to crash on ValueError
+                task = asyncio.create_task(self.mine_block(latest_block))
+                task.add_done_callback(self._handle_mining_task_exception)
 
             await asyncio.sleep(5)
 

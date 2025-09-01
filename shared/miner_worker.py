@@ -13,6 +13,8 @@ It constructs the correct concrete miner from a simple picklable spec dict:
 from __future__ import annotations
 
 import os
+import sys
+import time
 
 # Set default DWave environment variables before any DWave libraries are imported
 if "DWAVE_API_KEY" not in os.environ:
@@ -180,7 +182,9 @@ class MinerHandle:
     def close(self):
         self.req.put({"op": "shutdown"})
         try:
+            time.sleep(1)
             if self.proc.is_alive():
-                self.proc.join(timeout=2)
+                self.proc.terminate()
+                self.proc.join(timeout=0.1)       
         except Exception:
             pass
