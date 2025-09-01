@@ -47,6 +47,8 @@ class Sampler(Protocol):
     edgelist: List[Tuple[Variable, Variable]]
     properties: Dict[str, Any]
     sampler_type: str
+    nodes: List[int]  # Integer nodes for quantum_proof_of_work functions
+    edges: List[Tuple[int, int]]  # Integer edges for quantum_proof_of_work functions
     def sample_ising(
         self,
         h: Union[Mapping[Variable, Bias], Sequence[Bias]],
@@ -66,12 +68,13 @@ class BaseMiner(ABC):
     def __init__(
         self,
         miner_id: str,
-        sampler: Sampler
+        sampler: Sampler,
+        miner_type: str = "UNKNOWN"
     ) -> None:
         if type(self) is BaseMiner:
             raise TypeError("BaseMiner is abstract; instantiate a concrete subclass")
         self.miner_id = miner_id
-        self.miner_type: str = "UNKNOWN"
+        self.miner_type = miner_type
         self.mining = False
         self.blocks_won = 0
         self.total_rewards = 0

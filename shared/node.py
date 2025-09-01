@@ -506,16 +506,15 @@ class Node:
         """
         Compute the next block requirements based on the previous block and mining result.
 
-        This implements difficulty adjustment logic similar to quantum_blockchain.py:
-        - If the same miner type wins consecutively, make it EASIER
-        - If a different miner type wins, make it HARDER
+        Rules:
+        - Always HARDEN difficulty if the last block was mined in under 60 seconds
+        - Otherwise:
+          - If the same miner type wins consecutively, EASE difficulty
+          - If a different miner type wins, HARDEN difficulty
 
-        Args:
-            previous_block: The previous block in the chain
-            mining_result: The result from mining the current block
-
-        Returns:
-            NextBlockRequirements for the next block
+        Notes on signs: energies are negative. HARDER means a more negative
+        threshold (multiply by 1 + rate). EASIER means a less negative threshold
+        (multiply by 1 - rate).
         """
         # Get current requirements from previous block
         prev_req = previous_block.next_block_requirements
@@ -531,33 +530,45 @@ class Node:
             prev_miner_id = previous_block.miner_info.miner_id
             prev_winner = prev_miner_id.split('-')[1] if '-' in prev_miner_id else prev_miner_id
 
-        # Base adjustment rates (similar to quantum_blockchain.py)
+        # Base adjustment rates
         energy_adjustment_rate = 0.05  # 5% adjustment
         diversity_adjustment_rate = 0.02  # 2% adjustment
-        solutions_adjustment_rate = 0.1  # 10% adjustment
+        solutions_adjustment_rate = 0.10  # 10% adjustment
 
-        if current_winner == prev_winner:
-            # Same miner won again - make it EASIER
-            # Higher energy threshold (less negative), lower diversity/solutions
-            new_difficulty_energy = min(-13500, prev_req.difficulty_energy * (1 + energy_adjustment_rate))
-            new_min_diversity = max(0.2, prev_req.min_diversity - diversity_adjustment_rate)
-            new_min_solutions = max(10, int(prev_req.min_solutions * (1 - solutions_adjustment_rate)))
+        # If block was mined too quickly, always HARDEN
+        if mining_result.mining_time is not None and mining_result.mining_time < 60.0:
+            new_difficulty_energy = prev_req.difficulty_energy * (1 + energy_adjustment_rate)
+            new_min_diversity = min(0.46, prev_req.min_diversity + diversity_adjustment_rate)
+            new_min_solutions = min(100, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
 
-            self.logger.info(f"Same miner type ({current_winner}) won - EASING difficulty")
+            self.logger.info(
+                f"Block was mined in {mining_result.mining_time:.2f}s (<60s) - HARDENING difficulty")
             self.logger.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
             self.logger.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
             self.logger.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
         else:
-            # Different miner won - make it HARDER
-            # Lower energy threshold (more negative), higher diversity/solutions
-            new_difficulty_energy = max(-15600, prev_req.difficulty_energy * (1 - energy_adjustment_rate))
-            new_min_diversity = min(0.46, prev_req.min_diversity + diversity_adjustment_rate)
-            new_min_solutions = min(100, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
+            if current_winner == prev_winner:
+                # Same miner won again - make it EASIER
+                # Higher energy threshold (less negative), lower diversity/solutions
+                new_difficulty_energy = prev_req.difficulty_energy * (1 - energy_adjustment_rate)
+                new_min_diversity = max(0.2, prev_req.min_diversity - diversity_adjustment_rate)
+                new_min_solutions = max(10, int(prev_req.min_solutions * (1 - solutions_adjustment_rate)))
 
-            self.logger.info(f"Different miner type won ({prev_winner} -> {current_winner}) - HARDENING difficulty")
-            self.logger.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
-            self.logger.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
-            self.logger.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
+                self.logger.info(f"Same miner type ({current_winner}) won - EASING difficulty")
+                self.logger.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
+                self.logger.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
+                self.logger.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
+            else:
+                # Different miner won - make it HARDER
+                # Lower energy threshold (more negative), higher diversity/solutions
+                new_difficulty_energy = prev_req.difficulty_energy * (1 + energy_adjustment_rate)
+                new_min_diversity = min(0.46, prev_req.min_diversity + diversity_adjustment_rate)
+                new_min_solutions = min(100, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
+
+                self.logger.info(f"Different miner type won ({prev_winner} -> {current_winner}) - HARDENING difficulty")
+                self.logger.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
+                self.logger.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
+                self.logger.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
 
         return NextBlockRequirements(
             difficulty_energy=new_difficulty_energy,

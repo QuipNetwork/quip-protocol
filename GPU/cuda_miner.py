@@ -14,9 +14,9 @@ from shared.base_miner import BaseMiner, MiningResult
 from shared.quantum_proof_of_work import (
     ising_nonce_from_block,
     generate_ising_model_from_nonce,
-    energies_for_solutions,
+    energy_of_solution,
 )
-from GPU.sampler import LocalGPUSampler as GPUSampler  # temporary alias until rename
+from GPU.sampler import GPUSampler
 
 
 class CudaMiner(BaseMiner):
@@ -27,7 +27,8 @@ class CudaMiner(BaseMiner):
         
     def mine_block(
         self,
-        block,
+        prev_block,
+        node_info,
         requirements,
         result_queue: multiprocessing.Queue,
         stop_event: multiprocessing.synchronize.Event,
@@ -35,7 +36,8 @@ class CudaMiner(BaseMiner):
         """Mine a block using CUDA GPU acceleration.
         
         Args:
-            block: Block object containing header, data, and other block information
+            prev_block: Previous block in the chain
+            node_info: Node information containing miner_id and other details
             requirements: NextBlockRequirements object with difficulty settings
             result_queue: Multiprocessing queue for results
             stop_event: Multiprocessing event to signal stop
@@ -44,14 +46,25 @@ class CudaMiner(BaseMiner):
         progress = 0  # Progress counter for logging
         start_time = time.time()
         
+        self.logger.debug(f"requirements: {requirements}")
+
+        cur_index = prev_block.header.index + 1
+
         # Mark that this miner is attempting this round
         self.current_round_attempted = True
-        self.logger.info("Started...")
+        self.logger.info(f"Mining block {cur_index}...")
 
         # Extract requirements from NextBlockRequirements object
         difficulty_energy = requirements.difficulty_energy
         min_diversity = requirements.min_diversity
         min_solutions = requirements.min_solutions
+
+        params = adapt_parameters(difficulty_energy, min_diversity, min_solutions)
+        self.logger.debug(f"Adaptive params: {params}")
+        
+        # Get topology information from sampler
+        nodes = self.sampler.nodes
+        edges = self.sampler.edges
 
         while self.mining and not stop_event.is_set():
             # Check if we should stop before generating model
@@ -59,19 +72,14 @@ class CudaMiner(BaseMiner):
                 self.logger.info("Interrupted")
                 return None
 
-            # Generate random nonce for each attempt
-            nonce = random.randint(0, sys.maxsize)
+            # Generate random salt for each attempt
+            salt = random.randbytes(32)
+            
+            # Generate quantum model using deterministic block-based seeding
+            timestamp = int(time.time())
+            nonce = ising_nonce_from_block(prev_block.hash, node_info.miner_id, cur_index, salt)
 
-            # Build topology lists from sampler (ensure ints)
-            nodes = [int(n) for n in self.sampler.nodelist]
-            edges = [(int(u), int(v)) for (u, v) in self.sampler.edgelist]
-
-            # Deterministic seed from previous block hash, miner_id, index and nonce
-            cur_index = block.header.index + 1
-            seed = ising_nonce_from_block(block.hash, self.miner_id, cur_index, nonce)
-
-            # Generate Ising model deterministically
-            h, J = generate_ising_model_from_nonce(seed, nodes, edges)
+            h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
 
             # Check again before sampling
             if stop_event.is_set():
@@ -86,23 +94,20 @@ class CudaMiner(BaseMiner):
             # Sample from GPU
             try:
                 # For GPU, use adaptive parameters
-                num_sweeps = self.adaptive_params.get('num_sweeps', 512)
+                num_sweeps = params.get('num_sweeps', 512)
+                num_reads = params.get('num_reads', 100)
                 
                 sample_start = time.time()
                 self.current_stage = 'sampling'
                 self.current_stage_start = sample_start
                 
-                # Build sampling parameters
+                # Build sampling parameters based on sampler type
                 sampling_params = {
                     'h': h,
                     'J': J,
-                    'num_reads': 100,
+                    'num_reads': num_reads,
                     'num_sweeps': num_sweeps
                 }
-                
-                # Add beta parameters for GPU samplers
-                sampling_params['beta_range'] = self.adaptive_params.get('beta_range', [0.1, 10.0])
-                sampling_params['beta_schedule_type'] = self.adaptive_params.get('beta_schedule', 'geometric')
                 
                 sampleset = self.sampler.sample_ising(**sampling_params)
                 sample_time = time.time() - sample_start
@@ -148,9 +153,8 @@ class CudaMiner(BaseMiner):
                 # Calculate diversity
                 diversity = self.calculate_diversity(valid_solutions)
 
-                # Compute energies with the same deterministic model used for validation
-                energies = energies_for_solutions(valid_solutions, h, J, nodes)
-                min_energy = float(min(energies)) if energies else 0.0
+                # Calculate diversity
+                min_energy = float(np.min(sampleset.record.energy))
 
                 # Filter excess solutions to maintain diversity
                 filtered_solutions = self.filter_diverse_solutions(valid_solutions, min_solutions)
@@ -167,10 +171,15 @@ class CudaMiner(BaseMiner):
                     mining_time = time.time() - start_time
                     min_energy = float(np.min(sampleset.record.energy[valid_indices]))
 
+                    energies = [energy_of_solution(sol, h, J, nodes) for sol in filtered_solutions]
+                    min_energy = float(min(energies)) if energies else 0.0
+
                     result = MiningResult(
                         miner_id=self.miner_id,
                         miner_type=self.miner_type,
                         nonce=nonce,
+                        salt=salt,
+                        timestamp=timestamp,
                         solutions=filtered_solutions,
                         energy=min_energy,
                         diversity=final_diversity,
@@ -196,3 +205,23 @@ class CudaMiner(BaseMiner):
         if stop_event.is_set():
             self.logger.info("Stopped")
         return None
+
+
+def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutions: int):
+    """Calculate adaptive mining parameters based on difficulty requirements.
+
+    Supports either a NextBlockRequirements object or a dict with keys:
+    'difficulty_energy', 'min_diversity', 'min_solutions'.
+    """
+    # Normalize difficulty factor (more negative = harder)
+    difficulty_factor = abs(difficulty_energy) / 1000.0  # Base around -1000
+
+    # GPU CUDA parameters
+    base_sweeps = 512
+    num_sweeps = int(base_sweeps * (difficulty_factor ** 1.5))  # Exponential scaling
+    num_reads = max(int(min_solutions) * 3, 64)  # At least 3x required solutions
+
+    return {
+        'num_sweeps': max(128, min(num_sweeps, 32768)),  # Reasonable bounds for GPU
+        'num_reads': max(64, min(num_reads, 1000)),      # Reasonable bounds
+    }

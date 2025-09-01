@@ -2,12 +2,16 @@
 
 import os
 import multiprocessing
-import numpy as np
+from typing import Any, Dict, List, Tuple
 from queue import Empty as QueueEmpty
+import collections.abc
 
+import dimod
 from dwave.system.testing import MockDWaveSampler
 from shared.quantum_proof_of_work import create_topology_graph, get_topology_properties
 from .worker import gpu_worker_main
+
+Variable = collections.abc.Hashable
 
 # Optional torch import
 try:
@@ -25,6 +29,7 @@ class GPUSampler(MockDWaveSampler):
         self._ctx = multiprocessing.get_context("spawn")
         self._req_q: multiprocessing.Queue = self._ctx.Queue()
         self._resp_q: multiprocessing.Queue = self._ctx.Queue()
+        self.sampler_type = "gpu"
 
         self._proc = self._ctx.Process(target=gpu_worker_main, args=(self._req_q, self._resp_q, self._device))
         self._proc.daemon = True
@@ -43,6 +48,26 @@ class GPUSampler(MockDWaveSampler):
             substitute_sampler=self
         )
 
+        self.nodelist: List[Variable] = list(topology_graph.nodes())
+        self.edgelist: List[Tuple[Variable, Variable]] = list(topology_graph.edges())
+        self.properties: Dict[str, Any] = properties
+        
+        # Type conversions to match protocol expectations (nodes should be ints for quantum_proof_of_work functions)
+        nodes = []
+        for node in self.nodelist:
+            if not isinstance(node, int):
+                raise ValueError(f"Expected node index to be int, got {type(node)}")
+            nodes.append(int(node))
+        edges = []
+        for edge in self.edgelist:
+            if not isinstance(edge, tuple) or len(edge) != 2:
+                raise ValueError(f"Expected edge to be tuple of length 2, got {edge}")
+            if not isinstance(edge[0], int) or not isinstance(edge[1], int):
+                raise ValueError(f"Expected edge indices to be int, got {type(edge[0])} and {type(edge[1])}")
+            edges.append((int(edge[0]), int(edge[1])))
+        self.nodes = nodes
+        self.edges = edges
+
     def close(self):
         try:
             self._req_q.put({"op": "stop"})
@@ -57,7 +82,7 @@ class GPUSampler(MockDWaveSampler):
     def __del__(self):
         self.close()
 
-    def sample_ising(self, h, J, num_reads=100, num_sweeps=512, **kwargs):
+    def sample_ising(self, h, J, num_reads=100, num_sweeps=512, **kwargs) -> dimod.SampleSet:
         # Convert to dicts for serialization
         h_dict = dict(h) if hasattr(h, 'items') else {i: h[i] for i in range(len(h))}
         J_dict = dict(J) if hasattr(J, 'items') else J
@@ -71,7 +96,7 @@ class GPUSampler(MockDWaveSampler):
         if self._debug:
             print(f"[GPU parent pid={os.getpid()}] send sample to worker pid={self._proc.pid} device={self._device} reads={payload['num_reads']} sweeps={payload['num_sweeps']}", flush=True)
         self._req_q.put(payload)
-        timeout = float(os.getenv("QUIP_GPU_WORKER_RESP_TIMEOUT", "5.0"))
+        timeout = float(os.getenv("QUIP_GPU_WORKER_RESP_TIMEOUT", "30.0"))
         try:
             msg = self._resp_q.get(timeout=timeout)
         except QueueEmpty:
@@ -83,15 +108,13 @@ class GPUSampler(MockDWaveSampler):
         samples = msg["samples"]
         energies = msg["energies"]
 
-        class SampleSet:
-            def __init__(self, samples, energies):
-                self.record = type('Record', (), {
-                    'sample': np.array(samples),
-                    'energy': np.array(energies)
-                })()
-        return SampleSet(samples, energies)
-
-
-# Backward compatibility alias
-LocalGPUSampler = GPUSampler
+        # Convert samples to the format expected by dimod.SampleSet.from_samples
+        # samples should be a list of dicts mapping variables to values
+        sample_dicts = []
+        for sample in samples:
+            sample_dict = {i: sample[i] for i in range(len(sample))}
+            sample_dicts.append(sample_dict)
+        
+        # Create proper dimod.SampleSet
+        return dimod.SampleSet.from_samples(sample_dicts, 'SPIN', energies)
 

@@ -2,6 +2,8 @@
 
 import time
 import numpy as np
+import collections.abc
+import dimod
 from dwave.system.testing import MockDWaveSampler
 from shared.quantum_proof_of_work import create_topology_graph, get_topology_properties
 
@@ -149,8 +151,24 @@ class ModalSampler(MockDWaveSampler):
             properties=properties,
             substitute_sampler=self
         )
+        
+        # Type conversions to match protocol expectations (nodes should be ints for quantum_proof_of_work functions)
+        nodes = []
+        for node in self.nodelist:
+            if not isinstance(node, int):
+                raise ValueError(f"Expected node index to be int, got {type(node)}")
+            nodes.append(int(node))
+        edges = []
+        for edge in self.edgelist:
+            if not isinstance(edge, tuple) or len(edge) != 2:
+                raise ValueError(f"Expected edge to be tuple of length 2, got {edge}")
+            if not isinstance(edge[0], int) or not isinstance(edge[1], int):
+                raise ValueError(f"Expected edge indices to be int, got {type(edge[0])} and {type(edge[1])}")
+            edges.append((int(edge[0]), int(edge[1])))
+        self.nodes = nodes
+        self.edges = edges
 
-    def sample_ising(self, h, J, num_reads=100, num_sweeps=512, **kwargs):
+    def sample_ising(self, h, J, num_reads=100, num_sweeps=512, **kwargs) -> dimod.SampleSet:
         """Sample from Ising model using GPU acceleration."""
         # Convert h and J to dictionaries if needed
         h_dict = dict(h) if hasattr(h, 'items') else {i: h[i] for i in range(len(h))}
@@ -160,11 +178,14 @@ class ModalSampler(MockDWaveSampler):
         result = self._gpu_sample_func.remote(h_dict, J_dict, num_reads, num_sweeps)
 
         # Format result to match D-Wave interface
-        class SampleSet:
-            def __init__(self, samples, energies):
-                self.record = type('Record', (), {
-                    'sample': np.array(samples),
-                    'energy': np.array(energies)  # Convert to numpy array
-                })()
-
-        return SampleSet(result["samples"], result["energies"])
+        samples = result["samples"]
+        energies = result["energies"]
+        
+        # Convert samples to the format expected by dimod.SampleSet.from_samples
+        sample_dicts = []
+        for sample in samples:
+            sample_dict = {i: sample[i] for i in range(len(sample))}
+            sample_dicts.append(sample_dict)
+        
+        # Create proper dimod.SampleSet
+        return dimod.SampleSet.from_samples(sample_dicts, 'SPIN', energies)

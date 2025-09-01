@@ -29,6 +29,23 @@ class DWaveSamplerWrapper:
     def __init__(self):
         self.sampler = create_dwave_sampler()
         self.is_qpu = not isinstance(self.sampler, MockDWaveSampler)
+        self.sampler_type = "qpu" if self.is_qpu else "mock"
+        
+        # Type conversions to match protocol expectations (nodes should be ints for quantum_proof_of_work functions)
+        nodes = []
+        for node in self.nodelist:
+            if not isinstance(node, int):
+                raise ValueError(f"Expected node index to be int, got {type(node)}")
+            nodes.append(int(node))
+        edges = []
+        for edge in self.edgelist:
+            if not isinstance(edge, tuple) or len(edge) != 2:
+                raise ValueError(f"Expected edge to be tuple of length 2, got {edge}")
+            if not isinstance(edge[0], int) or not isinstance(edge[1], int):
+                raise ValueError(f"Expected edge indices to be int, got {type(edge[0])} and {type(edge[1])}")
+            edges.append((int(edge[0]), int(edge[1])))
+        self.nodes = nodes
+        self.edges = edges
     
     def sample_ising(self, h, J, **kwargs):
         """Sample from the D-Wave QPU or mock sampler."""
