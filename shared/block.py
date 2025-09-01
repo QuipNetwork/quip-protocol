@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Any, Tuple
 
 from shared.quantum_proof_of_work import calculate_diversity, generate_ising_model_from_nonce, ising_nonce_from_block, energies_for_solutions
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce, calculate_diversity
+from shared.quantum_proof_of_work import calculate_requirements_decay
 from shared.logging_config import get_logger
 
 # Initialize logger
@@ -544,9 +545,26 @@ class Block:
             logger.error(f"Block {self.header.index} rejected: missing next block requirements")
             return False
         
-        # TODO: Validate difficulty adjustment for next block here. 
+        # Apply timeout-based difficulty decay based on elapsed time since previous block
+        if requirements.timeout_to_difficulty_adjustment_decay and requirements.timeout_to_difficulty_adjustment_decay > 0:
+            elapsed = max(0, int((self.header.timestamp - previous_block.header.timestamp) / requirements.timeout_to_difficulty_adjustment_decay))
+            if elapsed > 0:
+                before = requirements.to_json()
+                # Iterate decay step 'elapsed' times
+                cur = dict(before)
+                for _ in range(elapsed):
+                    cur = calculate_requirements_decay(cur)
+                # Log the change
+                logger.warning(
+                    f"Applying difficulty decay steps={elapsed}: "
+                    f"energy {before['difficulty_energy']:.4f} -> {cur['difficulty_energy']:.4f}, "
+                    f"diversity {before['min_diversity']:.4f} -> {cur['min_diversity']:.4f}, "
+                    f"solutions {before['min_solutions']} -> {cur['min_solutions']}"
+                )
+                # Overwrite a local copy of requirements for validation
+                requirements = NextBlockRequirements.from_json(cur)
 
-        # Validate quantum proof against requirements
+        # Validate quantum proof against (possibly decayed) requirements
         return self._validate_quantum_proof(self.miner_info.miner_id, requirements)
 
     def _validate_quantum_proof(self, miner_id: str, requirements: NextBlockRequirements) -> bool:

@@ -16,6 +16,7 @@ from shared.block import (
 def sample_quantum_proof():
     return QuantumProof(
         nonce=123456789,
+        salt=b"S",
         solutions=[[1, -1, 0], [0, 1, -1], [-5], [3]],
         mining_time=1.234,
         nodes=[0, 1, 2, 3],

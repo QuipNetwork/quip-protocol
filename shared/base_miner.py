@@ -10,6 +10,7 @@ from blake3 import blake3
 import logging
 import multiprocessing
 import multiprocessing.synchronize
+from shared.block import NextBlockRequirements
 from shared.logging_config import QuipFormatter
 
 # Global logger for this module (set during initialization)
@@ -157,6 +158,9 @@ class BaseMiner(ABC):
         self.current_stage: Optional[str] = None
         self.current_stage_start: Optional[float] = None
 
+        # Track top 3 mining results
+        self.top_results: List[MiningResult] = []
+
         # Adaptive parameters for performance tuning
         # Initialize num_sweeps based on miner ID for SA miners
         initial_sweeps = 512
@@ -169,6 +173,33 @@ class BaseMiner(ABC):
             'beta_schedule': 'geometric',  # or 'linear'
             'num_sweeps': initial_sweeps  # for SA
         }
+
+        # Track top 3 mining results
+        self.top_results: List[MiningResult] = []
+
+
+    def update_top_results(self, result: MiningResult, requirements: NextBlockRequirements):
+        """Update the top 3 results list with a new mining result."""
+        from shared.quantum_proof_of_work import compare_mining_results
+
+        # Add current result
+        self.top_results.append(result)
+
+        # Sort by quality using the comparison function
+        def sort_key(r):
+            # Create a dummy result to compare against for sorting
+            dummy = MiningResult(
+                miner_id="", miner_type="", nonce=0, salt=b"", timestamp=0,
+                solutions=[], energy=float('inf'), diversity=0.0, num_valid=0,
+                mining_time=0.0, node_list=[], edge_list=[]
+            )
+            comparison = compare_mining_results(r, dummy, requirements)
+            return comparison
+
+        self.top_results.sort(key=sort_key)
+
+        # Keep only top 3
+        self.top_results = self.top_results[:3]
 
     def calculate_hamming_distance(self, s1: List[int], s2: List[int]) -> int:
         return _shared_hamming(s1, s2)

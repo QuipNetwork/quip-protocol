@@ -5,6 +5,7 @@ Extracted from BaseMiner to be reusable and stateless.
 from __future__ import annotations
 
 from blake3 import blake3
+from shared.base_miner import MiningResult
 from shared.logging_config import get_logger
 from typing import Tuple, Dict, Optional
 import numpy as np
@@ -303,4 +304,109 @@ def filter_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
                 break
 
     return [solutions[i] for i in selected_indices]
+
+
+
+# --- Difficulty decay helpers ---
+# We keep these here to avoid coupling miners/validators to Node logic
+
+def calculate_requirements_decay(cur_requirements: dict) -> dict:
+    """
+    Apply one step of timeout-based difficulty decay to the given requirements.
+
+    Expects a dict-like with keys:
+      - difficulty_energy (float, typically negative)
+      - min_diversity (float)
+      - min_solutions (int)
+      - timeout_to_difficulty_adjustment_decay (int seconds)
+
+    Returns a new dict with eased (less strict) requirements.
+
+    Notes:
+    - Energies are negative; easing moves the threshold closer to 0.
+    - Diversity and min_solutions also ease downward within sensible floors.
+    - Rates are aligned with Node.compute_next_block_requirements but in the easing
+      direction to represent timeout-based relief.
+    """
+    # Base easing rates (mirror of Node adjustments, but always easing)
+    energy_ease_rate = 0.05       # 5% easier per decay step
+    diversity_ease_rate = 0.02    # 2% easier per decay step
+    solutions_ease_rate = 0.10    # 10% easier per decay step
+
+    # Floors to avoid collapsing difficulty entirely
+    MIN_DIVERSITY_FLOOR = 0.20
+    MIN_SOLUTIONS_FLOOR = 10
+
+    de = float(cur_requirements.get('difficulty_energy', 0.0))
+    md = float(cur_requirements.get('min_diversity', 0.0))
+    ms = int(cur_requirements.get('min_solutions', 0))
+    decay = int(cur_requirements.get('timeout_to_difficulty_adjustment_decay', 0))
+
+    # Apply easing: move negative energy closer to 0 (less negative)
+    new_de = de * (1 - energy_ease_rate)
+
+    # Ease diversity and solutions downward within floors
+    new_md = max(MIN_DIVERSITY_FLOOR, md - diversity_ease_rate)
+    new_ms = max(MIN_SOLUTIONS_FLOOR, int(ms * (1 - solutions_ease_rate)))
+
+    return {
+        'difficulty_energy': float(new_de),
+        'min_diversity': float(new_md),
+        'min_solutions': int(new_ms),
+        'timeout_to_difficulty_adjustment_decay': decay,
+    }
+
+def compare_mining_results(result_a: MiningResult, result_b: MiningResult, requirements: NextBlockRequirements) -> int:
+    """
+    Compare two mining results to determine which is better.
+
+    Returns:
+        -1 if A is better than B
+         0 if A and B are equal
+         1 if B is better than A
+
+    Comparison logic:
+    1. Higher num_valid_solutions is better
+    2. If equal (or both 0), compare average of top N solution energies
+       where N = requirements.min_solutions
+    3. If still equal, compare overall average solution energy
+    """
+    # Import here to avoid circular imports
+    from shared.base_miner import MiningResult
+
+    # 1. Compare number of valid solutions (higher is better)
+    if result_a.num_valid > result_b.num_valid:
+        return -1
+    elif result_b.num_valid > result_a.num_valid:
+        return 1
+
+    # 2. If equal (or both 0), compare average of top N solution energies
+    if result_a.num_valid > 0 and result_b.num_valid > 0:
+        # Generate Ising models for both results
+        h_a, J_a = generate_ising_model_from_nonce(result_a.nonce, result_a.node_list, result_a.edge_list)
+        h_b, J_b = generate_ising_model_from_nonce(result_b.nonce, result_b.node_list, result_b.edge_list)
+
+        # Calculate energies for top N solutions
+        n_solutions = min(requirements.min_solutions, len(result_a.solutions), len(result_b.solutions))
+        if n_solutions > 0:
+            energies_a = [energy_of_solution(sol, h_a, J_a, result_a.node_list)
+                         for sol in result_a.solutions[:n_solutions]]
+            energies_b = [energy_of_solution(sol, h_b, J_b, result_b.node_list)
+                         for sol in result_b.solutions[:n_solutions]]
+
+            avg_energy_a = np.mean(energies_a)
+            avg_energy_b = np.mean(energies_b)
+
+            if avg_energy_a < avg_energy_b:  # Lower energy is better
+                return -1
+            elif avg_energy_b < avg_energy_a:
+                return 1
+
+    # 3. If still equal, compare overall best energy (lower is better)
+    if result_a.energy < result_b.energy:
+        return -1
+    elif result_b.energy < result_a.energy:
+        return 1
+
+    return 0  # Equal
 

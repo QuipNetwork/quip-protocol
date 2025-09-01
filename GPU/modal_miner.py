@@ -8,6 +8,7 @@ import time
 from typing import Optional
 
 import numpy as np
+import json
 
 from shared.base_miner import BaseMiner, MiningResult
 from shared.quantum_proof_of_work import (
@@ -189,6 +190,13 @@ class ModalMiner(BaseMiner):
 
                     result_queue.put(result)
                     self.logger.info(f"Found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
+
+                    # Log mining attempt results
+                    self.logger.info(f"Mining attempt completed - Best Energy: {result.energy:.2f}, Valid Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Params: {json.dumps(params)}")
+
+                    # Update top results
+                    self.update_top_results(result, requirements)
+
                     return result
 
             progress += 1
