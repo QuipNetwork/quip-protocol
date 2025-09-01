@@ -546,7 +546,7 @@ class Node:
             new_min_solutions = min(100, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
 
             self.logger.info(
-                f"Block was mined in {mining_result.mining_time:.2f}s (<60s) - HARDENING difficulty")
+                f"Block was mined in {mining_result.mining_time:.2f}s (<10s) - HARDENING difficulty")
             self.logger.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
             self.logger.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
             self.logger.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
