@@ -555,6 +555,9 @@ class NetworkNode(Node):
                     timeout=aiohttp.ClientTimeout(total=self.node_timeout)
                 ) as resp:
                     return resp.status == 200
+        except TimeoutError:
+            logger.debug(f"Failed to send heartbeat to {node_host}: Timeout")
+            return False
         except Exception:
             logger.exception(f"Error sending heartbeat to {node_host}")
             return False
