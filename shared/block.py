@@ -71,9 +71,12 @@ class QuantumProof:
         # Basic fields
         nonce = struct.unpack('!Q', data[offset:offset+8])[0]
         offset += 8
+        # Read salt length and salt bytes
         salt_length = struct.unpack('!I', data[offset:offset+4])[0]
+        offset += 4
         salt = data[offset:offset+salt_length]
-        offset += 8
+        offset += salt_length
+        # Mining time
         mining_time = struct.unpack('!d', data[offset:offset+8])[0]
         offset += 8
 

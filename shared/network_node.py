@@ -131,7 +131,10 @@ class NetworkNode(Node):
         self.on_mining_stopped = self._network_on_mining_stopped
 
         # Web server
-        self.app = web.Application()
+        # Allow large gossip payloads (e.g., full signed blocks encoded as hex in JSON)
+        # Default to 64 MB unless overridden via config['client_max_size_mb']
+        self.client_max_size_mb = int(config.get("client_max_size_mb", 64))
+        self.app = web.Application(client_max_size=self.client_max_size_mb * 1024 * 1024)
         self.setup_routes()
         self.runner = None
 
@@ -259,12 +262,12 @@ class NetworkNode(Node):
 
             # Check if we are in synchronized state with peers
             # If not, stop mining and synchronize. 
-            synchronized = await self.check_synchronized()
-            if not synchronized:
+            latest_block = await self.check_synchronized()
+            if latest_block != 0:
                 if self._is_mining:
                     await self.stop_mining()
                     logger.info("Stopped mining to synchronize with network...")
-                await self.synchronize_blockchain()
+                await self.synchronize_blockchain(latest_block)
                 # NOTE: It's possible we can get triggered again if the sync takes too long, but that's OK 
                 # as we will be closer to the goal.
                 continue
@@ -358,14 +361,20 @@ class NetworkNode(Node):
         if not self.peers:
             if self.auto_mine:
                 logger.debug("No connected peers, but auto-mine is enabled so we are synchronized by default")
-                return True
+                return 0
             else:
                 raise RuntimeError("No peers to synchronize with")
 
         net_latest_block = None
+        tries = 0
         while not net_latest_block:
             random_peer = random.choice(list(self.peers.keys()))
             net_latest_block = await self.get_peer_block(random_peer)
+            tries += 1
+            if tries > 3:
+                logging.warning("Unable to get latest block from peers, assuming we are synchronized")
+                return 0
+            await asyncio.sleep(3)
 
         if my_latest_block.header.index >= net_latest_block.header.index:
             return 0
@@ -526,7 +535,7 @@ class NetworkNode(Node):
     async def get_peer_block(self, host: str, block_number: int = 0) -> Optional[Block]:
         """Get a block from a peer node."""
         try:
-            req = "/block"
+            req = "/block/"
             if block_number > 0:
                 req = f"/block/{block_number}"
             async with aiohttp.ClientSession() as session:
@@ -543,7 +552,7 @@ class NetworkNode(Node):
                         logger.debug(f"Failed to get block from {host}: HTTP {resp.status}")
                         return None
         except Exception:
-            logger.exception(f"Error getting block from {host}")
+            logger.warning(f"Error getting block from {host}")
             return None
 
     async def refresh_peer_info(self, host: str) -> bool:

@@ -87,6 +87,9 @@ def _merge_globals_from_toml(cfg: Dict[str, Any]) -> Dict[str, Any]:
         out["heartbeat_timeout"] = int(g["heartbeat_timeout"])
     if "fanout" in g:
         out["fanout"] = int(g["fanout"])
+    # HTTP server settings
+    if "client_max_size_mb" in g:
+        out["client_max_size_mb"] = int(g["client_max_size_mb"])
     # carry-through miner sections
     for k in ("cpu", "gpu", "qpu"):
         if k in cfg:
