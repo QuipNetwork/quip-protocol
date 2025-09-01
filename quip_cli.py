@@ -256,7 +256,7 @@ def quip_network_node(ctx: click.Context, config: Optional[str]):
 # Logging options
 @click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default=None, help="Logging level")
 @click.option("--node-log", type=str, default=None, help="Path to main node log file (defaults to stderr)")
-@click.option("--http-log", type=str, default=None, help="Path to HTTP log file (suppresses aiohttp logs if not set)")
+@click.option("--http-log", type=str, default=None, help="Path to HTTP log file or 'stderr'/'stdout' for console (suppresses aiohttp logs if not set)")
 # CPU options
 @click.option("--num-cpus", type=int, default=None, help="Number of CPU miners to spawn (default 1)")
 # Other

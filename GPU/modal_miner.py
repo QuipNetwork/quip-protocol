@@ -30,6 +30,7 @@ class ModalMiner(BaseMiner):
         prev_block,
         node_info,
         requirements,
+        prev_timestamp: int,
         result_queue: multiprocessing.Queue,
         stop_event: multiprocessing.Event,
     ) -> Optional[MiningResult]:
@@ -186,6 +187,7 @@ class ModalMiner(BaseMiner):
                         nonce=nonce,
                         salt=salt,
                         timestamp=timestamp,
+                        prev_timestamp=prev_timestamp,
                         solutions=filtered_solutions,
                         energy=min_energy,
                         diversity=final_diversity,

@@ -146,11 +146,7 @@ def setup_logging(
 
     # Configure aiohttp logging
     if http_log_file:
-        # Ensure directory exists
-        http_log_path = Path(http_log_file)
-        http_log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Create aiohttp logger with file handler
+        # Create aiohttp logger
         aiohttp_logger = logging.getLogger('aiohttp')
         aiohttp_logger.setLevel(logging.DEBUG)
 
@@ -158,17 +154,32 @@ def setup_logging(
         for handler in aiohttp_logger.handlers[:]:
             aiohttp_logger.removeHandler(handler)
 
-        http_file_handler = logging.handlers.RotatingFileHandler(
-            http_log_file,
-            maxBytes=10*1024*1024,  # 10MB
-            backupCount=3
-        )
-        http_file_handler.setLevel(logging.DEBUG)
-        http_file_handler.setFormatter(formatter)
-        aiohttp_logger.addHandler(http_file_handler)
+        # Support special values 'stderr' and 'stdout' to route HTTP logs to console
+        target = str(http_log_file).strip().lower()
+        if target in ("stderr", "stdout"):
+            stream = sys.stderr if target == "stderr" else sys.stdout
+            http_stream_handler = logging.StreamHandler(stream)
+            http_stream_handler.setLevel(logging.DEBUG)
+            http_stream_handler.setFormatter(formatter)
+            aiohttp_logger.addHandler(http_stream_handler)
+            # Do not propagate to root to avoid duplicate messages
+            aiohttp_logger.propagate = False
+        else:
+            # Ensure directory exists for file logging
+            http_log_path = Path(http_log_file)
+            http_log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Prevent aiohttp logs from propagating to root logger
-        aiohttp_logger.propagate = False
+            http_file_handler = logging.handlers.RotatingFileHandler(
+                http_log_file,
+                maxBytes=10*1024*1024,  # 10MB
+                backupCount=3
+            )
+            http_file_handler.setLevel(logging.DEBUG)
+            http_file_handler.setFormatter(formatter)
+            aiohttp_logger.addHandler(http_file_handler)
+
+            # Prevent aiohttp logs from propagating to root logger
+            aiohttp_logger.propagate = False
     else:
         # Suppress aiohttp logs entirely
         aiohttp_logger = logging.getLogger('aiohttp')

@@ -361,8 +361,9 @@ class Node:
         self._emit_mining_started(previous_block)
 
         # Command all workers to start mining with full context
+        prev_timestamp = previous_block.header.timestamp
         for h in handles:
-            h.mine(previous_block, self.info(), requirements)
+            h.mine(previous_block, self.info(), requirements, prev_timestamp)
 
         result = None
         try:
@@ -372,7 +373,7 @@ class Node:
                 # Poll each handle's response queue quickly
                 for h in handles:
                     try:
-                        msg = h.resp.get(timeout=0.1)
+                        msg = h.resp.get_nowait()
                     except Empty:
                         continue
                     # MiningResult objects will be put by miners; if dict, may be stats/error

@@ -33,6 +33,7 @@ class MiningResult:
     nonce: int
     salt: bytes
     timestamp: int
+    prev_timestamp: int
     solutions: List[List[int]]
     energy: float
     diversity: float
@@ -188,7 +189,7 @@ class BaseMiner(ABC):
         def sort_key(r):
             # Create a dummy result to compare against for sorting
             dummy = MiningResult(
-                miner_id="", miner_type="", nonce=0, salt=b"", timestamp=0,
+                miner_id="", miner_type="", nonce=0, salt=b"", timestamp=0, prev_timestamp=0,
                 solutions=[], energy=float('inf'), diversity=0.0, num_valid=0,
                 mining_time=0.0, node_list=[], edge_list=[]
             )
@@ -308,14 +309,17 @@ class BaseMiner(ABC):
         prev_block,
         node_info,
         requirements,
+        prev_timestamp: int,
         result_queue: multiprocessing.Queue,
         stop_event: multiprocessing.synchronize.Event,
     ) -> Optional[MiningResult]:
         """Abstract method for miner-specific mining implementation.
 
         Args:
-            block: Block object containing header, data, and other block information
-            requirements: NextBlockRequirements object with difficulty settings
+            prev_block: Previous block object containing header, data, and other block information
+            node_info: Node information containing miner_id and other details
+            requirements: BlockRequirements object with difficulty settings
+            prev_timestamp: Timestamp from the previous block header
             result_queue: Multiprocessing queue for results
             stop_event: Multiprocessing event to signal stop
         """

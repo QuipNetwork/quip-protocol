@@ -31,6 +31,7 @@ class SimulatedAnnealingMiner(BaseMiner):
         prev_block,
         node_info,
         requirements,
+        prev_timestamp: int,
         result_queue: multiprocessing.Queue,
         stop_event: multiprocessing.synchronize.Event,
     ) -> Optional[MiningResult]:
@@ -58,6 +59,25 @@ class SimulatedAnnealingMiner(BaseMiner):
         difficulty_energy = requirements.difficulty_energy
         min_diversity = requirements.min_diversity
         min_solutions = requirements.min_solutions
+
+        # Apply difficulty decay based on elapsed time since previous block
+        current_time = int(time.time())
+        if requirements.timeout_to_difficulty_adjustment_decay > 0:
+            elapsed = max(0, int((current_time - prev_timestamp) / requirements.timeout_to_difficulty_adjustment_decay))
+            if elapsed > 0:
+                from shared.quantum_proof_of_work import calculate_requirements_decay
+                # Create requirements dict for decay calculation
+                req_dict = requirements.to_json()
+                # Apply decay for each elapsed step
+                for _ in range(elapsed):
+                    req_dict = calculate_requirements_decay(req_dict)
+
+                # Update local requirements with decayed values
+                difficulty_energy = req_dict['difficulty_energy']
+                min_diversity = req_dict['min_diversity']
+                min_solutions = req_dict['min_solutions']
+
+                self.logger.info(f"Applied {elapsed} difficulty decay steps: energy {requirements.difficulty_energy:.2f} -> {difficulty_energy:.2f}, diversity {requirements.min_diversity:.3f} -> {min_diversity:.3f}, solutions {requirements.min_solutions} -> {min_solutions}")
 
         params = adapt_parameters(difficulty_energy, min_diversity, min_solutions)
         self.logger.info(f"{self.miner_id} - Adaptive params: {params}")
@@ -182,20 +202,21 @@ class SimulatedAnnealingMiner(BaseMiner):
                     min_energy = float(min(energies)) if energies else 0.0
 
                     result = MiningResult(
-                            miner_id=self.miner_id,
-                            miner_type=self.miner_type,
-                            nonce=nonce,
-                            salt=salt,
-                            timestamp=timestamp,
-                            solutions=filtered_solutions,
-                            energy=min_energy,
-                            diversity=final_diversity,
-                            num_valid=len(filtered_solutions),
-                            mining_time=mining_time,
-                            node_list=nodes,
-                            edge_list=edges,
-                            variable_order=nodes
-                        )
+                             miner_id=self.miner_id,
+                             miner_type=self.miner_type,
+                             nonce=nonce,
+                             salt=salt,
+                             timestamp=timestamp,
+                             prev_timestamp=prev_timestamp,
+                             solutions=filtered_solutions,
+                             energy=min_energy,
+                             diversity=final_diversity,
+                             num_valid=len(filtered_solutions),
+                             mining_time=mining_time,
+                             node_list=nodes,
+                             edge_list=edges,
+                             variable_order=nodes
+                         )
 
                     result_queue.put(result)
                     self.logger.info(f"Found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")

@@ -353,13 +353,19 @@ class P2PNode:
     async def handle_new_block(self, request: web.Request) -> web.Response:
         """Handle new block announcement."""
         try:
-            block_data = await request.json()
-            
+            # Read raw JSON to count bytes
+            raw_json = await request.read()
+            bytes_received = len(raw_json)
+            block_data = json.loads(raw_json.decode('utf-8'))
+
+            block_index = block_data.get('index', 'unknown')
+            logger.info(f"📥 Received block {block_index}: {bytes_received} bytes")
+
             if self.on_block_received:
                 asyncio.create_task(self.on_block_received(block_data))
-            
+
             return web.json_response({"status": "ok"})
-            
+
         except Exception as e:
             logger.error(f"Error handling new block: {e}")
             return web.json_response({"error": str(e)}, status=500)
@@ -385,7 +391,13 @@ class P2PNode:
             timestamp=time.time(),
             data=block_data
         )
-        
+
+        # Count bytes in JSON payload
+        json_payload = json.dumps(asdict(message))
+        bytes_sent = len(json_payload.encode('utf-8'))
+        block_index = block_data.get('index', 'unknown')
+        logger.info(f"📤 Broadcasting block {block_index}: {bytes_sent} bytes")
+
         await self.broadcast_message(message)
 
 

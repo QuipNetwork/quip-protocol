@@ -618,7 +618,6 @@ class NetworkNode(Node):
     async def add_peer(self, host: str, info: MinerInfo) -> bool:
         """Add a node to our registry."""
         if host == self.public_host:
-            self.logger.warning(f"Skipping adding ourselves as a peer: {host}")
             return False
 
         async with self.net_lock:
@@ -668,36 +667,48 @@ class NetworkNode(Node):
                 if resp.status == 200:
                     return await resp.json()
                 else:
-                    logger.debug(f"Failed to get status from {host}: HTTP {resp.status}")
+                    logging.debug(f"Failed to get status from {host}: HTTP {resp.status}")
                     return None
         except asyncio.TimeoutError:
-            logger.debug(f"Failed to get status from {host}: Timeout")
+            logging.debug(f"Failed to get status from {host}: Timeout")
             return None
         except Exception:
-            logger.debug(f"Error getting status from {host}")
+            logging.debug(f"Error getting status from {host}")
             return None
 
     async def get_peer_block(self, host: str, block_number: int = 0) -> Optional[Block]:
-        """Get a block from a peer node."""
+        """Get a block from a peer node and log precise download timings."""
         if not self.http_session:
             return None
+        t0 = time.perf_counter()
         try:
             req = "/block/"
             if block_number > 0:
                 req = f"/block/{block_number}"
             url = f"http://{host}{req}?format=network"
             async with self.http_session.get(url) as resp:
+                t_headers = time.perf_counter()  # time to response headers
                 if resp.status == 200:
                     data = await resp.read()
-                    return Block.from_network(data)
+                    t_done = time.perf_counter()
+                    bytes_received = len(data)
+                    block = Block.from_network(data)
+                    block_index = getattr(getattr(block, 'header', None), 'index', block_number)
+                    headers_ms = (t_headers - t0) * 1000.0
+                    body_ms = (t_done - t_headers) * 1000.0
+                    total_ms = (t_done - t0) * 1000.0
+                    self.logger.info(f"📥 Downloaded block {block_index} from {host}: {bytes_received} bytes in {total_ms:.1f} ms (headers {headers_ms:.1f} ms, body {body_ms:.1f} ms) url={url}")
+                    return block
                 else:
-                    logger.debug(f"Failed to get block from {host}: HTTP {resp.status}")
+                    self.logger.debug(f"Failed to get block from {host}: HTTP {resp.status} url={url}")
                     return None
         except asyncio.TimeoutError:
-            logger.debug(f"Failed to get block from {host}: Timeout")
+            t_to = time.perf_counter()
+            self.logger.debug(f"Failed to get block from {host}: Timeout after {(t_to - t0)*1000.0:.1f} ms")
             return None
-        except Exception:
-            logger.debug(f"Error getting block from {host}")
+        except Exception as e:
+            t_err = time.perf_counter()
+            self.logger.debug(f"Error getting block from {host} after {(t_err - t0)*1000.0:.1f} ms: {e}")
             return None
 
     async def refresh_peer_info(self, host: str) -> bool:
@@ -709,10 +720,10 @@ class NetworkNode(Node):
                 async with self.net_lock:
                     self.peers[host] = info
 
-                logger.debug(f"Refreshed info for peer {host}")
+                self.logger.debug(f"Refreshed info for peer {host}")
                 return True
             except Exception:
-                logger.exception(f"Error parsing peer info from {host}")
+                self.logger.exception(f"Error parsing peer info from {host}")
                 return False
         return False
 
@@ -729,23 +740,43 @@ class NetworkNode(Node):
     #####################
 
     async def gossip_to(self, host: str, message: Message) -> bool:
-        """Send a message to a specific node."""
+        """Send a message to a specific node and log precise timings."""
         if not self.http_session:
             return False
+        t0 = time.perf_counter()
+        url = f"http://{host}/gossip"
         try:
             payload = message.to_network()
+            bytes_sent = len(payload)
             headers = {'Content-Type': 'application/octet-stream'}
-            async with self.http_session.post(
-                f"http://{host}/gossip",
-                data=payload,
-                headers=headers
-            ) as resp:
-                return resp.status == 200
+            async with self.http_session.post(url, data=payload, headers=headers) as resp:
+                t_headers = time.perf_counter()
+                # Read small JSON body to measure full roundtrip
+                try:
+                    await resp.read()
+                except Exception:
+                    pass
+                t_done = time.perf_counter()
+                headers_ms = (t_headers - t0) * 1000.0
+                body_ms = (t_done - t_headers) * 1000.0
+                total_ms = (t_done - t0) * 1000.0
+                ok = resp.status == 200
+                if ok:
+                    self.logger.info(
+                        f"📨 Gossip to {host} type={message.type} id={(message.id or '')[:8]}: {bytes_sent} bytes in {total_ms:.1f} ms (headers {headers_ms:.1f} ms, body {body_ms:.1f} ms) url={url}"
+                    )
+                else:
+                    self.logger.debug(
+                        f"Failed to send message to {host}: HTTP {resp.status} in {total_ms:.1f} ms url={url}"
+                    )
+                return ok
         except asyncio.TimeoutError:
-            logger.debug(f"Failed to send message to {host}: Timeout")
+            t_to = time.perf_counter()
+            self.logger.debug(f"Failed to send message to {host}: Timeout after {(t_to - t0)*1000.0:.1f} ms url={url}")
             return False
-        except Exception:
-            logger.debug(f"Failed to send message to {host}")
+        except Exception as e:
+            t_err = time.perf_counter()
+            self.logger.debug(f"Failed to send message to {host} after {(t_err - t0)*1000.0:.1f} ms url={url}: {e}")
             return False
 
     async def gossip(self, message: Message):
@@ -808,12 +839,19 @@ class NetworkNode(Node):
         """Broadcast a new block to the network.
         Data encoding: raw block network bytes.
         """
+        binary_data = block_data.to_network()
+        bytes_sent = len(binary_data)
+
         message = Message(
             type="block",
             sender=self.public_host,
             timestamp=time.time(),
-            data=block_data.to_network()
+            data=binary_data
         )
+
+        # Log byte count for gossiped block
+        logging.info(f"📤 Gossiped block {block_data.header.index}: {bytes_sent} bytes")
+
         await self.gossip(message)
 
     async def handle_gossip(self, message: Message) -> str:
@@ -883,7 +921,7 @@ class NetworkNode(Node):
                 return web.json_response({"error": "processing timeout"}, status=504)
 
         except Exception as e:
-            logger.exception("Error handling broadcast")
+            self.logger.exception("Error handling broadcast")
             return web.json_response({"error": str(e)}, status=500)
 
 
@@ -919,7 +957,7 @@ class NetworkNode(Node):
             })
 
         except Exception as e:
-            logger.exception("Error handling join")
+            self.logger.exception("Error handling join")
             return web.json_response({"error": str(e)}, status=500)
 
     async def handle_put_heartbeat(self, request: web.Request) -> web.Response:
@@ -934,13 +972,13 @@ class NetworkNode(Node):
                         self.heartbeats[sender] = time.time()
                     else:
                         # New node discovered via heartbeat - get their info in background
-                        logger.info(f"New node discovered via heartbeat: {sender}")
+                        self.logger.info(f"New node discovered via heartbeat: {sender}")
                         asyncio.create_task(self.refresh_peer_info(sender))
 
             return web.json_response({"status": "ok"})
 
         except Exception as e:
-            logger.exception("Error handling heartbeat")
+            self.logger.exception("Error handling heartbeat")
             return web.json_response({"error": str(e)}, status=500)
 
     async def handle_put_block(self, request: web.Request) -> web.Response:
@@ -972,7 +1010,7 @@ class NetworkNode(Node):
                 return web.json_response({"error": "processing timeout"}, status=504)
 
         except Exception as e:
-            logger.exception("Error handling new block")
+            self.logger.exception("Error handling new block")
             return web.json_response({"error": str(e)}, status=500)
 
     #######################
@@ -1018,7 +1056,7 @@ class NetworkNode(Node):
                 return web.json_response(json.loads(block.to_json()))
 
         except Exception as e:
-            logger.exception("Error getting latest block")
+            self.logger.exception("Error getting latest block")
             return web.json_response({"error": str(e)}, status=500)
 
     async def handle_get_block(self, request: web.Request) -> web.Response:
@@ -1052,5 +1090,5 @@ class NetworkNode(Node):
                 return web.json_response(json.loads(block.to_json()))
 
         except Exception as e:
-            logger.exception(f"Error getting block {number_str}")
+            self.logger.exception(f"Error getting block {number_str}")
             return web.json_response({"error": str(e)}, status=500)

@@ -6,7 +6,6 @@ from .modal_sampler import ModalSampler, gpu_app
 from .metal_miner import MetalMiner
 from .cuda_miner import CudaMiner
 from .modal_miner import ModalMiner
-from .worker import gpu_mine_block_process
 
 # Check if GPU functionality is available
 try:
@@ -18,5 +17,5 @@ except ImportError:
 __all__ = [
     'GPUSampler', 'MetalSampler', 'ModalSampler',
     'MetalMiner', 'CudaMiner', 'ModalMiner',
-    'gpu_app', 'gpu_mine_block_process', 'GPU_AVAILABLE'
+    'gpu_app', 'GPU_AVAILABLE'
 ]

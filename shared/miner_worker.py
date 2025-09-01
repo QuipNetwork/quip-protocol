@@ -115,11 +115,12 @@ def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any]):
             prev_block = msg.get("block")
             requirements = msg.get("requirements")
             node_info = msg.get("node_info")
+            prev_timestamp = msg.get("prev_timestamp", 0)
             if prev_block is None or requirements is None or node_info is None:
                 resp_q.put({"op": "error", "message": "Missing node_info, block or requirements", "id": spec.get("id")})
                 continue
             current_stop = mp.Event()
-            miner.mine_block(prev_block, node_info, requirements, resp_q, current_stop)
+            miner.mine_block(prev_block, node_info, requirements, prev_timestamp, resp_q, current_stop)
         else:
             resp_q.put({"op": "error", "message": f"Unknown op {op}", "id": spec.get("id")})
             if log:
@@ -162,8 +163,8 @@ class MinerHandle:
             return "GPU-MPS"
         return k.upper()
 
-    def mine(self, block, node_info, requirements):
-        self.req.put({"op": "mine_block", "block": block, "node_info": node_info, "requirements": requirements})
+    def mine(self, block, node_info, requirements, prev_timestamp: int = 0):
+        self.req.put({"op": "mine_block", "block": block, "node_info": node_info, "requirements": requirements, "prev_timestamp": prev_timestamp})
 
     def cancel(self):
         self.req.put({"op": "stop_mining"})
