@@ -19,7 +19,7 @@ import copy
 from blake3 import blake3
 
 from shared.base_miner import MiningResult
-from shared.block import Block, MinerInfo
+from shared.block import Block, BlockHeader, MinerInfo
 from shared.node import Node
 from shared.logging_config import init_component_logger
 
@@ -219,6 +219,9 @@ class NetworkNode(Node):
         self.app.router.add_get('/status', self.handle_get_status)
         self.app.router.add_get('/block/', self.handle_get_latest_block)
         self.app.router.add_get('/block/{number}', self.handle_get_block)
+        # Lightweight header-only endpoints
+        self.app.router.add_get('/block_header/', self.handle_get_latest_block_header)
+        self.app.router.add_get('/block_header/{number}', self.handle_get_block_header)
 
     async def start(self):
         """Start the P2P node."""
@@ -403,10 +406,21 @@ class NetworkNode(Node):
                 except asyncio.TimeoutError:
                     continue
 
-                # Process the gossip message in background
-                message, response_future = gossip_data
+                # Expect instrumented tuple: (message, response_future, t_enq)
+                message, response_future, t_enq = gossip_data
+
+                t_deq = time.perf_counter()
                 try:
+                    t0 = time.perf_counter()
                     result = await self.handle_gossip(message)
+                    t1 = time.perf_counter()
+                    wait_ms = ((t_deq - t_enq) * 1000.0) if t_enq is not None else None
+                    proc_ms = (t1 - t0) * 1000.0
+                    qsize = self.gossip_processing_queue.qsize()
+                    wait_str = f"{wait_ms:.1f} ms" if wait_ms is not None else "n/a"
+                    self.logger.info(
+                        f"🧩 Gossip handled id={(message.id or '')[:8]} type={message.type}: wait={wait_str}, process={proc_ms:.1f} ms, qsize={qsize}"
+                    )
                     response_future.set_result(result)
                 except Exception as e:
                     self.logger.exception(f"Error processing gossip: {e}")
@@ -490,7 +504,7 @@ class NetworkNode(Node):
 
 
     async def check_synchronized(self) -> int:
-        """Check if we are synchronized with the network.
+        """Check if we are synchronized with the network using header-only fetch.
 
         Returns 0 if synchronized or the latest network block index if not.
         """
@@ -502,20 +516,23 @@ class NetworkNode(Node):
             else:
                 raise RuntimeError("No peers to synchronize with")
 
-        net_latest_block = None
+        net_latest_index: Optional[int] = None
         tries = 0
-        while not net_latest_block:
+        while net_latest_index is None:
             random_peer = random.choice(list(self.peers.keys()))
-            net_latest_block = await self.get_peer_block(random_peer)
+            header = await self.get_peer_block_header(random_peer)
+            if header:
+                net_latest_index = header.index
+                break
             tries += 1
             if tries > 3:
-                logging.warning("Unable to get latest block from peers, assuming we are synchronized")
+                logging.warning("Unable to get latest block header from peers, assuming we are synchronized")
                 return 0
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)
 
-        if my_latest_block.header.index >= net_latest_block.header.index:
+        if my_latest_block.header.index >= net_latest_index:
             return 0
-        return net_latest_block.header.index
+        return net_latest_index
 
     async def synchronize_blockchain(self, current_head: int = 0):
         """Synchronize the blockchain with the network."""
@@ -708,7 +725,44 @@ class NetworkNode(Node):
             return None
         except Exception as e:
             t_err = time.perf_counter()
+
             self.logger.debug(f"Error getting block from {host} after {(t_err - t0)*1000.0:.1f} ms: {e}")
+            return None
+
+    async def get_peer_block_header(self, host: str, block_number: int = 0) -> Optional[BlockHeader]:
+        """Get only the block header from a peer node (lighter and faster)."""
+        if not self.http_session:
+            return None
+        t0 = time.perf_counter()
+        try:
+            req = "/block_header/"
+            if block_number > 0:
+                req = f"/block_header/{block_number}"
+            url = f"http://{host}{req}?format=network"
+            async with self.http_session.get(url) as resp:
+                t_headers = time.perf_counter()
+                if resp.status == 200:
+                    data = await resp.read()
+                    t_done = time.perf_counter()
+                    bytes_received = len(data)
+                    header = BlockHeader.from_network(data)
+                    headers_ms = (t_headers - t0) * 1000.0
+                    body_ms = (t_done - t_headers) * 1000.0
+                    total_ms = (t_done - t0) * 1000.0
+                    self.logger.info(
+                        f"📥 Downloaded block header {header.index} from {host}: {bytes_received} bytes in {total_ms:.1f} ms (headers {headers_ms:.1f} ms, body {body_ms:.1f} ms) url={url}"
+                    )
+                    return header
+                else:
+                    self.logger.debug(f"Failed to get block header from {host}: HTTP {resp.status} url={url}")
+                    return None
+        except asyncio.TimeoutError:
+            t_to = time.perf_counter()
+            self.logger.debug(f"Failed to get block header from {host}: Timeout after {(t_to - t0)*1000.0:.1f} ms")
+            return None
+        except Exception as e:
+            t_err = time.perf_counter()
+            self.logger.debug(f"Error getting block header from {host} after {(t_err - t0)*1000.0:.1f} ms: {e}")
             return None
 
     async def refresh_peer_info(self, host: str) -> bool:
@@ -780,10 +834,11 @@ class NetworkNode(Node):
             return False
 
     async def gossip(self, message: Message):
-        """Gossip a new message"""
+        """Gossip a new message and log timings for the broadcast."""
         if message.id:
             raise ValueError("Message already has an ID, cannot originate a gossip message!")
 
+        t0 = time.perf_counter()
         hasher = blake3()
         hasher.update(message.type.encode('utf-8'))
         hasher.update(b'\x00')
@@ -791,7 +846,13 @@ class NetworkNode(Node):
         hasher.update(struct.pack('!d', float(message.timestamp)))
         hasher.update(message.data or b'')
         message.id = hasher.hexdigest()
-        await self.gossip_broadcast(message, min(self.fanout * 2, len(self.peers)))
+        target_count = min(self.fanout * 2, len(self.peers))
+        await self.gossip_broadcast(message, target_count)
+        t1 = time.perf_counter()
+        total_ms = (t1 - t0) * 1000.0
+        self.logger.info(
+            f"🗣️ Originated gossip type={message.type} id={message.id[:8]} to {target_count} peers: payload={len(message.data or b'')} bytes in {total_ms:.1f} ms"
+        )
 
     async def gossip_broadcast(self, message: Message, fanout: int = 3):
         """Rebroadcast a message to random subset of peers"""
@@ -910,8 +971,9 @@ class NetworkNode(Node):
 
             # Queue for background processing to avoid blocking
             response_future = asyncio.Future()
+            t_enq = time.perf_counter()
             try:
-                self.gossip_processing_queue.put_nowait((message, response_future))
+                self.gossip_processing_queue.put_nowait((message, response_future, t_enq))
                 # Wait for background processing with timeout
                 status = await asyncio.wait_for(response_future, timeout=5.0)
                 return web.json_response({"status": status})
@@ -1054,9 +1116,57 @@ class NetworkNode(Node):
             else:
                 # Return JSON (default)
                 return web.json_response(json.loads(block.to_json()))
-
         except Exception as e:
             self.logger.exception("Error getting latest block")
+            return web.json_response({"error": str(e)}, status=500)
+
+
+    async def handle_get_latest_block_header(self, request: web.Request) -> web.Response:
+        """Return only the latest block header (binary or JSON)."""
+        try:
+            block = self.get_latest_block()
+            if block is None:
+                return web.json_response({"error": "No blocks in chain"}, status=404)
+            header = block.header
+            fmt = request.query.get('format', 'json')
+            if fmt == 'network':
+                return web.Response(
+                    body=header.to_network(),
+                    content_type='application/octet-stream',
+                    headers={'Content-Disposition': 'attachment; filename="latest_block_header.bin"'}
+                )
+            else:
+                return web.json_response(header.to_json())
+        except Exception as e:
+            self.logger.exception("Error getting latest block header")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_get_block_header(self, request: web.Request) -> web.Response:
+        """Return only a specific block header by number (binary or JSON)."""
+        number_str = request.match_info.get('number', 'unknown')
+        try:
+            if number_str is None:
+                return web.json_response({"error": "Block number required"}, status=400)
+            try:
+                block_number = int(number_str)
+            except ValueError:
+                return web.json_response({"error": "Invalid block number"}, status=400)
+
+            block = self.get_block(block_number)
+            if block is None:
+                return web.json_response({"error": f"Block {block_number} not found"}, status=404)
+            header = block.header
+            fmt = request.query.get('format', 'json')
+            if fmt == 'network':
+                return web.Response(
+                    body=header.to_network(),
+                    content_type='application/octet-stream',
+                    headers={'Content-Disposition': f'attachment; filename="block_{block_number}_header.bin"'}
+                )
+            else:
+                return web.json_response(header.to_json())
+        except Exception as e:
+            self.logger.exception(f"Error getting block header {number_str}")
             return web.json_response({"error": str(e)}, status=500)
 
     async def handle_get_block(self, request: web.Request) -> web.Response:

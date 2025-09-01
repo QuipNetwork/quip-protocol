@@ -18,6 +18,25 @@ from shared.logging_config import get_logger
 logger = get_logger('block')
 
 
+def write_string(data: str) -> bytes:
+    utf8_bytes = data.encode('utf-8')
+    return struct.pack('!I', len(utf8_bytes)) + utf8_bytes
+
+def read_string(data: bytes, offset: int) -> tuple[str, int]:
+    length = struct.unpack('!I', data[offset:offset+4])[0]
+    offset += 4
+    string = data[offset:offset+length].decode('utf-8')
+    return string, offset + length
+
+def write_bytes(data: bytes) -> bytes:
+    return struct.pack('!I', len(data)) + data
+
+def read_bytes(data: bytes, offset: int) -> tuple[bytes, int]:
+    length = struct.unpack('!I', data[offset:offset+4])[0]
+    offset += 4
+    bytes_data = data[offset:offset+length]
+    return bytes_data, offset + length
+
 @dataclass
 class QuantumProof:
     """Quantum mining proof containing the essential mining result data."""
@@ -197,13 +216,6 @@ class MinerInfo:
 
     def to_network(self) -> bytes:
         """Serialize to binary format."""
-        def write_string(data: str) -> bytes:
-            utf8_bytes = data.encode('utf-8')
-            return struct.pack('!I', len(utf8_bytes)) + utf8_bytes
-
-        def write_bytes(data: bytes) -> bytes:
-            return struct.pack('!I', len(data)) + data
-
         result = b''
         result += write_string(self.miner_id)
         result += write_string(self.miner_type)
@@ -216,18 +228,6 @@ class MinerInfo:
     @classmethod
     def from_network(cls, data: bytes) -> 'MinerInfo':
         """Deserialize from binary format."""
-        def read_string(data: bytes, offset: int) -> tuple[str, int]:
-            length = struct.unpack('!I', data[offset:offset+4])[0]
-            offset += 4
-            string = data[offset:offset+length].decode('utf-8')
-            return string, offset + length
-
-        def read_bytes(data: bytes, offset: int) -> tuple[bytes, int]:
-            length = struct.unpack('!I', data[offset:offset+4])[0]
-            offset += 4
-            bytes_data = data[offset:offset+length]
-            return bytes_data, offset + length
-
         offset = 0
         miner_id, offset = read_string(data, offset)
         miner_type, offset = read_string(data, offset)
@@ -367,9 +367,6 @@ class Block:
         External to this class, yous should only call this after finalization
         (compute_hash) and signature is added.
         """
-        def write_bytes(data: bytes) -> bytes:
-            return struct.pack('!I', len(data)) + data
-
         result = b''
         result += self.header.to_network()
         result += self.miner_info.to_network()
@@ -383,11 +380,7 @@ class Block:
     @classmethod
     def from_network(cls, data: bytes) -> 'Block':
         """Deserialize from binary format."""
-        def read_bytes(data: bytes, offset: int) -> tuple[bytes, int]:
-            length = struct.unpack('!I', data[offset:offset+4])[0]
-            offset += 4
-            bytes_data = data[offset:offset+length]
-            return bytes_data, offset + length
+
 
         offset = 0
 
