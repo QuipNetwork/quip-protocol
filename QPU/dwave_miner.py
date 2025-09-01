@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import multiprocessing.synchronize
 import random
 import sys
 import time
@@ -21,7 +22,7 @@ from QPU.dwave_sampler import create_dwave_sampler
 class DWaveMiner(BaseMiner):
     def __init__(self, miner_id: str, **cfg):
         sampler = create_dwave_sampler()
-        super().__init__(miner_id, sampler)
+        super().__init__(miner_id, sampler, miner_type="QPU")
         self.miner_type = "QPU"
         
     def mine_block(

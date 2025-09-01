@@ -16,14 +16,22 @@ from shared.quantum_proof_of_work import (
     generate_ising_model_from_nonce,
     energy_of_solution,
 )
-from GPU.sampler import GPUSampler  # temporary alias until rename
+from GPU.metal_sampler import MetalSampler
 
 
 class MetalMiner(BaseMiner):
     def __init__(self, miner_id: str, **cfg):
-        sampler = GPUSampler("mps")
-        super().__init__(miner_id, sampler, miner_type="GPU-MPS")
-        self.miner_type = "GPU-MPS"
+        try:
+            sampler = MetalSampler("mps")
+            super().__init__(miner_id, sampler, miner_type="GPU-MPS")
+            self.miner_type = "GPU-MPS"
+            print(f"INFO: Using optimized MetalSampler (64 sweeps, ~13s mining time)")
+        except Exception as e:
+            print(f"Metal GPU initialization failed, falling back to CPU: {e}")
+            from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
+            sampler = SimulatedAnnealingStructuredSampler()
+            super().__init__(miner_id, sampler, miner_type="CPU-FALLBACK")
+            self.miner_type = "CPU-FALLBACK"
         
     def mine_block(
         self,
@@ -94,7 +102,11 @@ class MetalMiner(BaseMiner):
             # Sample from Metal GPU
             try:
                 # For Metal, use adaptive parameters
-                num_sweeps = params.get('num_sweeps', 512)
+                # Metal compromise: Balance between performance and quality
+                # CPU uses 4096, GPU uses 512, Metal uses 64 as reasonable middle ground
+                num_sweeps = params.get('num_sweeps', 64)
+                if self.sampler.sampler_type == "metal":
+                    print(f"[METAL] Using {num_sweeps} sweeps (optimized for MPS performance)")
                 num_reads = params.get('num_reads', 100)
                 
                 sample_start = time.time()
@@ -111,6 +123,11 @@ class MetalMiner(BaseMiner):
                 
                 sampleset = self.sampler.sample_ising(**sampling_params)
                 sample_time = time.time() - sample_start
+                
+                # Metal performance info
+                if self.sampler.sampler_type == "metal":
+                    energies = sampleset.data_vectors['energy']
+                    print(f"[METAL] Sampling completed: {sample_time:.2f}s, energy range: {min(energies):.1f} to {max(energies):.1f}")
                 
                 # Estimate Metal timing components
                 self.timing_stats['sampling'].append(sample_time * 1e6)  # Convert to microseconds
@@ -134,6 +151,15 @@ class MetalMiner(BaseMiner):
             
             # Find all solutions meeting energy threshold
             valid_indices = np.where(sampleset.record.energy < difficulty_energy)[0]
+            
+            # Print intermediate results regardless of success
+            all_energies = sampleset.record.energy
+            best_energy = float(np.min(all_energies)) if len(all_energies) > 0 else float('inf')
+            num_below_threshold = len(valid_indices)
+            
+            print(f"[METAL] Attempt {progress + 1}: nonce={nonce}")
+            print(f"[METAL]   Samples: {len(all_energies)}, Best energy: {best_energy:.1f}")
+            print(f"[METAL]   Below threshold ({difficulty_energy:.1f}): {num_below_threshold} samples")
             
             # Update sample counts
             self.timing_stats['total_samples'] += len(sampleset.record.energy)
@@ -159,6 +185,12 @@ class MetalMiner(BaseMiner):
 
                 # Recalculate diversity after filtering
                 final_diversity = self.calculate_diversity(filtered_solutions)
+                
+                print(f"[METAL]   → Sufficient samples found! Processing...")
+                print(f"[METAL]   → Unique solutions: {len(valid_solutions)}")
+                print(f"[METAL]   → Initial diversity: {diversity:.3f}")
+                print(f"[METAL]   → Final diversity: {final_diversity:.3f} (need {min_diversity:.3f})")
+                
                 self.logger.info(f"Found sufficient solutions! Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}, Diversity: {diversity:.3f}, Final Diversity: {final_diversity:.3f}")
 
                 # Track postprocessing time
@@ -188,8 +220,13 @@ class MetalMiner(BaseMiner):
                     )
 
                     result_queue.put(result)
+                    print(f"[METAL] ✅ BLOCK FOUND! Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
                     self.logger.info(f"Found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
                     return result
+                else:
+                    print(f"[METAL]   ❌ Insufficient diversity: {final_diversity:.3f} < {min_diversity:.3f}")
+            else:
+                print(f"[METAL]   → Not enough samples below threshold (need {min_solutions}, got {num_below_threshold})")
 
             progress += 1
 
@@ -198,9 +235,13 @@ class MetalMiner(BaseMiner):
                 min_energy = float(np.min(sampleset.record.energy))
                 self.logger.debug(f"Progress: {progress}, Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}")
 
-        # If we exit the loop due to stop event
+        # If we exit the loop due to stop event or completion
+        total_time = time.time() - start_time
         if stop_event.is_set():
+            print(f"[METAL] ⏹️ Mining stopped after {progress} attempts ({total_time:.1f}s)")
             self.logger.info("Stopped")
+        else:
+            print(f"[METAL] ⏰ Mining completed: {progress} attempts, {total_time:.1f}s, no valid block found")
         return None
     
 
@@ -213,12 +254,13 @@ def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutio
     # Normalize difficulty factor (more negative = harder)
     difficulty_factor = abs(difficulty_energy) / 1000.0  # Base around -1000
 
-    # GPU Metal parameters
-    base_sweeps = 512
-    num_sweeps = int(base_sweeps * (difficulty_factor ** 1.5))  # Exponential scaling
-    num_reads = max(int(min_solutions) * 3, 64)  # At least 3x required solutions
+    # Metal MPS parameters - fast convergence for multiple nonce strategy
+    # Strategy: Quick convergence to local minimum (~-13800), then try multiple nonces
+    base_sweeps = 80   # Fast convergence - we'll do multiple attempts
+    num_sweeps = int(base_sweeps * min(2.0, difficulty_factor ** 0.3))  # Light scaling
+    num_reads = max(int(min_solutions), 32)  # Modest reads per attempt
 
     return {
-        'num_sweeps': max(128, min(num_sweeps, 32768)),  # Reasonable bounds for GPU
-        'num_reads': max(64, min(num_reads, 1000)),      # Reasonable bounds
+        'num_sweeps': max(80, min(num_sweeps, 150)),    # Fast convergence range
+        'num_reads': max(32, min(num_reads, 64)),       # Efficient reads per attempt
     }

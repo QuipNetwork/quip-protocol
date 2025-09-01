@@ -1229,12 +1229,13 @@ class QuantumBlockchain:
 
 def run_blockchain(args):
     """Run the blockchain demo."""
+    logger = get_logger('blockchain_demo')
     competitive = args.competitive
 
     if competitive:
-        self.logger.info("Competitive Quantum Mining Demo")
-        self.logger.info(f"QPU Miners: {args.num_qpu}, SA Miners: {args.num_sa}")
-        self.logger.info("=" * 60)
+        logger.info("Competitive Quantum Mining Demo")
+        logger.info(f"QPU Miners: {args.num_qpu}, SA Miners: {args.num_sa}")
+        logger.info("=" * 60)
 
         # Inverted difficulty: starts HARD (QPU-favored) and eases with streaks
         blockchain = QuantumBlockchain(
