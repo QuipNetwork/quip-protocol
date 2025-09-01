@@ -373,11 +373,12 @@ class NetworkNode(Node):
                 continue
 
             # If we are synchronized, check if we are mining. If not, start mining on the next block.
-            if not self._is_mining:
-                latest_block = self.get_latest_block()
-                # Create task with exception handler to crash on ValueError
-                task = asyncio.create_task(self.mine_block(latest_block))
-                task.add_done_callback(self._handle_mining_task_exception)
+            async with self.net_lock:
+                if not self._is_mining and self.running:
+                    latest_block = self.get_latest_block()
+                    # Create task with exception handler to crash on ValueError
+                    task = asyncio.create_task(self.mine_block(latest_block))
+                    task.add_done_callback(self._handle_mining_task_exception)
 
             await asyncio.sleep(5)
 
