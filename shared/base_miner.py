@@ -62,7 +62,7 @@ from shared.quantum_proof_of_work import (
     calculate_diversity as _shared_diversity,
     filter_diverse_solutions as _shared_filter,
 )
-from shared.logging_config import get_logger
+from shared.logging_config import get_logger, init_component_logger
 
 # Global logger for this module
 log = None
@@ -90,14 +90,8 @@ class BaseMiner(ABC):
         self.total_rewards = 0
         self.sampler = sampler
 
-        # Initialize logger with miner ID
-        self.logger = logging.getLogger(f'miner.{miner_id}')
-        # Ensure propagation to root logger for proper formatting
-        self.logger.propagate = True
-
-        # Set global logger for static functions in this module
-        global log
-        log = self.logger
+        # Initialize logger with helper function
+        self.logger = init_component_logger('miner', miner_id)
 
         # Setup multiprocessing logging compatibility
         self._setup_multiprocess_logging()

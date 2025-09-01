@@ -20,6 +20,7 @@ from shared import block
 from shared.block_signer import BlockSigner
 from shared.block import Block, BlockHeader, MinerInfo, NextBlockRequirements
 from shared.miner import Miner, MiningResult
+from shared.logging_config import init_component_logger
 # Global logger for this module (set during Node initialization)
 log = None
 
@@ -93,12 +94,8 @@ class Node:
         self._is_mining = False
         self._current_mining_task: Optional[asyncio.Task] = None
 
-        # Initialize logger with node ID
-        self.logger = logging.getLogger(f'node.{node_id}')
-
-        # Set global logger for static functions in this module
-        global log
-        log = self.logger
+        # Initialize logger with helper function
+        self.logger = init_component_logger('node', node_id)
 
         self.logger.info(f"Node {node_id} initialized with {len(getattr(self, 'miner_handles', []))} miners")
         self.logger.debug(f"  ECDSA Public Key: {self.crypto.ecdsa_public_key_hex[:16]}...")

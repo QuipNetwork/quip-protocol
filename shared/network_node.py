@@ -21,6 +21,7 @@ from blake3 import blake3
 from shared.base_miner import MiningResult
 from shared.block import Block, MinerInfo
 from shared.node import Node
+from shared.logging_config import init_component_logger
 
 # Configure logging
 import logging
@@ -152,12 +153,8 @@ class NetworkNode(Node):
         self.secret = config.get("secret", f"quip network node secret {random.randint(0, 1000000)}")
         self.auto_mine = config.get("auto_mine", False)
 
-        # Create logger with node ID
-        self.logger = logging.getLogger(f'network_node.{self.node_name}')
-
-        # Set global logger for static functions in this module
-        global log
-        log = self.logger
+        # Initialize logger with helper function
+        self.logger = init_component_logger('network_node', self.node_name)
 
         # Durations as float seconds
         self.heartbeat_interval = float(config.get("heartbeat_interval", 15))

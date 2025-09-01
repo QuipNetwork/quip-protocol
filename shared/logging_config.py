@@ -276,6 +276,34 @@ def setup_multiprocess_logging() -> Tuple[mp.Queue, QueueListener]:
     return log_queue, listener
 
 
+def init_component_logger(component: str, identifier: str) -> logging.Logger:
+    """
+    Initialize a component logger with proper setup.
+
+    This function creates a logger with the standard naming convention,
+    ensures proper propagation, and sets up the global log variable
+    for use by static functions in the module.
+
+    Args:
+        component: Component type (e.g., 'network_node', 'miner', 'node')
+        identifier: Unique identifier for this instance
+
+    Returns:
+        Configured logger instance
+    """
+    # Create logger with standard naming convention
+    logger = logging.getLogger(f'{component}.{identifier}')
+
+    # Ensure propagation to root logger for proper formatting
+    logger.propagate = True
+
+    # Set global logger for static functions in this module
+    global log
+    log = logger
+
+    return logger
+
+
 def shutdown_logging():
     """Shutdown logging system and close all handlers."""
     logging.shutdown()
