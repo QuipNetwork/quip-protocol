@@ -262,7 +262,14 @@ class NetworkNode(Node):
 
     async def stop(self):
         """Stop the P2P node."""
-        self.running = False
+        async with self.net_lock:
+            if not self.running:
+                return
+            self.running = False
+        self.logger.info("Shutting down network node...")
+
+        # Stop miner workers
+        asyncio.create_task(self.stop_mining())
 
         # Cancel background tasks
         if self.heartbeat_task:
@@ -282,7 +289,10 @@ class NetworkNode(Node):
         if self.runner:
             await self.runner.cleanup()
 
+        self.close()
+
         self.logger.info("Network node stopped")
+        sys.exit(0)
 
     ##########################
     ## Server logic threads ##
@@ -1009,27 +1019,11 @@ class NetworkNode(Node):
             data = await request.json()
             new_node_address = data.get("host")
             info_field = data.get("info")
-            version = data.get("version")
             # Expect MinerInfo as JSON string
             new_node_info = MinerInfo.from_json(info_field) if info_field else None
 
             if not new_node_address or not new_node_info:
                 return web.json_response({"error": "Missing host or info"}, status=400)
-
-            # Check version compatibility
-            if version:
-                local_version = get_version()
-                local_ver = version.parse(local_version)
-                peer_ver = version.parse(version)
-
-                if local_ver < peer_ver:
-                    # Local version is older than the joining node's version
-                    self.logger.error(f"Local version {local_version} is outdated compared to joining node {new_node_address} running version {version}")
-                    self.logger.error("Please run 'pip install quip-network' to get the latest version")
-
-                    # Stop the node and exit
-                    await self.stop()
-                    sys.exit(1)
 
             # Add the new node
             await self.add_peer(new_node_address, new_node_info)
@@ -1059,24 +1053,23 @@ class NetworkNode(Node):
         try:
             data = await request.json()
             sender = data.get("sender")
-            version = data.get("version")
+            net_version = data.get("version")
 
             if version:
                 local_version = get_version()
                 local_ver = version.parse(local_version)
-                peer_ver = version.parse(version)
+                peer_ver = version.parse(net_version)
 
                 if local_ver < peer_ver:
                     # Local version is older than the peer's version
-                    self.logger.error(f"Local version {local_version} is outdated compared to peer {sender} running version {version}")
+                    self.logger.error(f"Local version {local_version} is outdated compared to peer {sender} running version {net_version}")
                     self.logger.error("Please run 'pip install quip-network' to get the latest version")
 
                     # Stop the node and exit
                     await self.stop()
-                    sys.exit(1)
                 elif local_ver > peer_ver:
                     # Peer version is older than local version
-                    self.logger.warning(f"Peer {sender} is running older version {version} (local: {local_version})")
+                    self.logger.warning(f"Peer {sender} is running older version {net_version} (local: {local_version})")
 
             if sender:
                 async with self.net_lock:
