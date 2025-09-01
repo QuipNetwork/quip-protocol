@@ -543,6 +543,7 @@ class Block:
 
         if len(valid_solutions) < requirements.min_solutions:
             logger.error(f"Block {self.header.index} rejected: insufficient valid solutions ({len(valid_solutions)} < {requirements.min_solutions})")
+            logger.error(f"Solutions presented in result: {len(solutions)} - json.dumps({energies})")
             return False
 
         # Calculate diversity using shared utility

@@ -254,19 +254,23 @@ class MetalSampler(MockDWaveSampler):
         if self._debug:
             print(f"[MetalSampler] Annealing completed in {anneal_time:.3f}s", flush=True)
 
-        # Final energy computation
+        # Final energy computation - use the correct energy calculation from quantum_proof_of_work
         energy_start = time.time()
-        
-        h_energy = (spins.to(torch.float32) * h_vec).sum(dim=1)
-        if i_idx is not None:
-            j_energy = (spins[:, i_idx] * spins[:, j_idx] * j_vals).sum(dim=1)
-        else:
-            j_energy = torch.zeros(R, device=self._device)
-        energies = h_energy + j_energy
 
-        # Convert to Python lists and return only requested number of samples
+        # Convert to Python lists first
         all_samples = spins.cpu().tolist()
-        all_energies = energies.cpu().tolist()
+
+        # Calculate energies using the correct method from quantum_proof_of_work
+        # This ensures consistency with the validation logic
+        from shared.quantum_proof_of_work import energy_of_solution
+
+        all_energies = []
+        for sample in all_samples:
+            # Convert sample to the format expected by energy_of_solution
+            # MetalSampler uses {-1, +1} spins directly, so we need to convert to solution format
+            solution = sample  # Already in {-1, +1} format
+            energy = energy_of_solution(solution, h, J, self.nodes)
+            all_energies.append(energy)
         
         # If we used PMSA with more chains, select the best samples
         if len(all_energies) > original_reads:

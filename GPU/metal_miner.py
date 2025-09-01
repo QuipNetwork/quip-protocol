@@ -13,6 +13,8 @@ import json
 
 from shared.base_miner import BaseMiner, MiningResult
 from shared.quantum_proof_of_work import (
+    calculate_diversity,
+    filter_diverse_solutions,
     ising_nonce_from_block,
     generate_ising_model_from_nonce,
     energy_of_solution,
@@ -91,7 +93,6 @@ class MetalMiner(BaseMiner):
             # Generate quantum model using deterministic block-based seeding
             timestamp = int(time.time())
             nonce = ising_nonce_from_block(prev_block.hash, node_info.miner_id, cur_index, salt)
-
             h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
 
             # Check again before sampling
@@ -186,14 +187,14 @@ class MetalMiner(BaseMiner):
                         valid_solutions.append(list(solution))
 
                 # Calculate diversity
-                diversity = self.calculate_diversity(valid_solutions)
+                diversity = calculate_diversity(valid_solutions)
                 min_energy = float(np.min(sampleset.record.energy))
 
                 # Filter excess solutions to maintain diversity
-                filtered_solutions = self.filter_diverse_solutions(valid_solutions, min_solutions)
+                filtered_solutions = filter_diverse_solutions(valid_solutions, min_solutions)
 
                 # Recalculate diversity after filtering
-                final_diversity = self.calculate_diversity(filtered_solutions)
+                final_diversity = calculate_diversity(filtered_solutions)
                 
                 print(f"[METAL]   → Sufficient samples found! Processing...")
                 print(f"[METAL]   → Unique solutions: {len(valid_solutions)}")

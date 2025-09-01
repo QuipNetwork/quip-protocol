@@ -200,15 +200,6 @@ class BaseMiner(ABC):
         # Keep only top 3
         self.top_results = self.top_results[:3]
 
-    def calculate_hamming_distance(self, s1: List[int], s2: List[int]) -> int:
-        return _shared_hamming(s1, s2)
-
-    def calculate_diversity(self, solutions: List[List[int]]) -> float:
-        return _shared_diversity(solutions)
-
-    def filter_diverse_solutions(self, solutions: List[List[int]], target_count: int) -> List[List[int]]:
-        return _shared_filter(solutions, target_count)
-
     def capture_partial_timing(self):
         """Capture timing for current mining attempt, including partial progress."""
         current_time = time.time()

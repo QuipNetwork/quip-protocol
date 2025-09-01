@@ -339,7 +339,7 @@ def calculate_requirements_decay(cur_requirements: dict) -> dict:
     de = float(cur_requirements.get('difficulty_energy', 0.0))
     md = float(cur_requirements.get('min_diversity', 0.0))
     ms = int(cur_requirements.get('min_solutions', 0))
-    decay = int(cur_requirements.get('timeout_to_difficulty_adjustment_decay', 0))
+    decay = int(cur_requirements.get('timeout_to_difficulty_adjustment_decay', 30))
 
     # Apply easing: move negative energy closer to 0 (less negative)
     new_de = de * (1 - energy_ease_rate)

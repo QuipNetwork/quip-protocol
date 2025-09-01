@@ -72,7 +72,14 @@ if GPU_AVAILABLE:
                     if delta_e < 0 or np.random.random() < np.exp(-beta * delta_e):
                         state[i] *= -1
 
-            energy = -np.dot(state, h) - 0.5 * np.dot(state, np.dot(J_matrix, state))
+            # Use the correct energy calculation from quantum_proof_of_work
+            # Convert state to solution format and calculate energy properly
+            from shared.quantum_proof_of_work import energy_of_solution
+
+            # Get the node ordering from the sampler (this should be passed in)
+            # For now, assume sequential ordering [0, 1, 2, ..., n-1]
+            nodes = list(range(len(state)))
+            energy = energy_of_solution(state.tolist(), h_dict, J_dict, nodes)
             return state, energy
 
         # Run parallel simulated annealing
