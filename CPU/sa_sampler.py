@@ -36,8 +36,27 @@ class SimulatedAnnealingStructuredSampler(MockDWaveSampler):
         self.sampler_type = "mock"
         self.parameters.update(substitute_sampler.parameters)
         self.mocked_parameters.add('num_sweeps')
+
+        # Type conversions to match protocol
+        self.nodelist: List[Variable] = nodelist
+        self.edgelist: List[Tuple[Variable, Variable]] = edgelist
+        self.properties: Dict[str, Any] = properties
+
+        # NOTE: these are of type List[Variable], which we can't change, but AFAICT they are always ints.
+        #.      it might be the case they are floats or something strange one day.
+        nodes = []
+        for node in self.nodelist:
+            if not isinstance(node, int):
+                raise ValueError(f"Expected node index to be int, got {type(node)}")
+            nodes.append(int(node))
+        edges = []
+        for edge in self.edgelist:
+            if not isinstance(edge, tuple) or len(edge) != 2:
+                raise ValueError(f"Expected edge to be tuple of length 2, got {edge}")
+            if not isinstance(edge[0], int) or not isinstance(edge[1], int):
+                raise ValueError(f"Expected edge indices to be int, got {type(edge[0])} and {type(edge[1])}")
+            edges.append((int(edge[0]), int(edge[1])))
+        self.nodes = nodes
+        self.edges = edges
+
         
-        # Override with actual attributes that match Sampler protocol types
-        self.nodelist: List[Variable] = list(nodelist)
-        self.edgelist: List[Tuple[Variable, Variable]] = list(edgelist)
-        self.properties: Dict[str, Any] = dict(properties)

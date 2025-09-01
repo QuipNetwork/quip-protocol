@@ -11,8 +11,8 @@ import numpy as np
 
 from shared.base_miner import BaseMiner, MiningResult
 from shared.quantum_proof_of_work import (
-    ising_seed_from_block,
-    generate_ising_model_from_seed,
+    ising_nonce_from_block,
+    generate_ising_model_from_nonce,
     energies_for_solutions,
 )
 from QPU.dwave_sampler import create_dwave_sampler
@@ -67,8 +67,8 @@ class DWaveMiner(BaseMiner):
 
             # Deterministic seed and model
             cur_index = block.header.index + 1
-            seed = ising_seed_from_block(block.hash, self.miner_id, cur_index, nonce)
-            h, J = generate_ising_model_from_seed(seed, nodes, edges)
+            seed = ising_nonce_from_block(block.hash, self.miner_id, cur_index, nonce)
+            h, J = generate_ising_model_from_nonce(seed, nodes, edges)
 
             # Check again before sampling
             if stop_event.is_set():

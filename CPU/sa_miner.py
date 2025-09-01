@@ -13,19 +13,22 @@ import numpy as np
 from shared.base_miner import BaseMiner, MiningResult
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
 from shared.block import Block, BlockHeader
-from shared.quantum_proof_of_work import generate_ising_model_from_seed, ising_seed_from_block
+from shared.quantum_proof_of_work import energy_of_solution, generate_ising_model_from_nonce, ising_nonce_from_block
 # Removed _parse_block_header import - function no longer exists
 
 
 class SimulatedAnnealingMiner(BaseMiner):
     def __init__(self, miner_id: str, **cfg):
         sampler = SimulatedAnnealingStructuredSampler()
+        self.nodes = sampler.nodes
+        self.edges = sampler.edges
         super().__init__(miner_id, sampler)
         self.miner_type = "CPU"
         
     def mine_block(
         self,
         prev_block,
+        node_info,
         requirements,
         result_queue: multiprocessing.Queue,
         stop_event: multiprocessing.synchronize.Event,
@@ -59,20 +62,8 @@ class SimulatedAnnealingMiner(BaseMiner):
         print(f"{self.miner_id} adaptive params: {params}")
         
         # Get topology information from sampler
-        # NOTE: these are of type List[Variable], which we can't change, but AFAICT they are always ints.
-        #.      it might be the case they are floats or something strange one day.
-        nodes = []
-        for node in self.sampler.nodelist:
-            if not isinstance(node, int):
-                raise ValueError(f"Expected node index to be int, got {type(node)}")
-            nodes.append(int(node))
-        edges = []
-        for edge in self.sampler.edgelist:
-            if not isinstance(edge, tuple) or len(edge) != 2:
-                raise ValueError(f"Expected edge to be tuple of length 2, got {edge}")
-            if not isinstance(edge[0], int) or not isinstance(edge[1], int):
-                raise ValueError(f"Expected edge indices to be int, got {type(edge[0])} and {type(edge[1])}")
-            edges.append((int(edge[0]), int(edge[1])))
+        nodes = self.nodes
+        edges = self.edges
         
         while self.mining and not stop_event.is_set():
             # Check if we should stop before generating model
@@ -80,15 +71,14 @@ class SimulatedAnnealingMiner(BaseMiner):
                 print(f"{self.miner_id} interrupted")
                 return None
 
-            # Generate random nonce for each attempt
-            nonce = random.randint(0, sys.maxsize)
+            # Generate random salt for each attempt
+            salt = random.randbytes(32)
             
             # Generate quantum model using deterministic block-based seeding
             # Use 64 variables to match original working energy scale
             timestamp = int(time.time())
-            seed = ising_seed_from_block(prev_block.hash, self.miner_id, cur_index, nonce)
-            h, J = generate_ising_model_from_seed(seed, nodes, edges)
-            print(f"DEBUG miner: seed={seed}, miner_id={self.miner_id}, nonce={nonce}, prev_hash={prev_block.hash.hex()[:16]}, cur_index={cur_index}")
+            nonce = ising_nonce_from_block(prev_block.hash, node_info.miner_id, cur_index, salt)
+            h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
 
             # Check again before sampling
             if stop_event.is_set():
@@ -177,45 +167,28 @@ class SimulatedAnnealingMiner(BaseMiner):
                 if final_diversity >= min_diversity and len(valid_solutions) >= min_solutions:
                     mining_time = time.time() - start_time
 
-                    # Compute energy for the filtered solutions using the same model
-                    node_pos = {node_id: pos for pos, node_id in enumerate(nodes)}
-                    def energy_of(solution: list[int]) -> float:
-                        spins = [1 if v > 0 else -1 for v in solution]
-                        e = 0.0
-                        # local fields
-                        for pos, node_id in enumerate(nodes[:len(spins)]):
-                            e += float(h.get(node_id, 0.0)) * spins[pos]
-                        # couplers
-                        for (u, v), Jij in J.items():
-                            pu = node_pos.get(u)
-                            pv = node_pos.get(v)
-                            if pu is not None and pv is not None and pu < len(spins) and pv < len(spins):
-                                e += float(Jij) * spins[pu] * spins[pv]
-                        return float(e)
-
-                    energies = [energy_of(sol) for sol in filtered_solutions]
+                    energies = [energy_of_solution(sol, h, J, nodes) for sol in filtered_solutions]
                     min_energy = float(min(energies)) if energies else 0.0
-                # print(f"DEBUG miner: first 3 sampler energies: {sampleset.record.energy[:3]}")
-                # print(f"DEBUG miner: min sampler energy: {min_energy}")
 
-                result = MiningResult(
-                        miner_id=self.miner_id,
-                        miner_type=self.miner_type,
-                        nonce=nonce,
-                        timestamp=timestamp,
-                        solutions=filtered_solutions,
-                        energy=min_energy,
-                        diversity=final_diversity,
-                        num_valid=len(filtered_solutions),
-                        mining_time=mining_time,
-                        node_list=nodes,
-                        edge_list=edges,
-                        variable_order=nodes
-                    )
+                    result = MiningResult(
+                            miner_id=self.miner_id,
+                            miner_type=self.miner_type,
+                            nonce=nonce,
+                            salt=salt,
+                            timestamp=timestamp,
+                            solutions=filtered_solutions,
+                            energy=min_energy,
+                            diversity=final_diversity,
+                            num_valid=len(filtered_solutions),
+                            mining_time=mining_time,
+                            node_list=nodes,
+                            edge_list=edges,
+                            variable_order=nodes
+                        )
 
-                result_queue.put(result)
-                print(f"{self.miner_id} found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
-                return result
+                    result_queue.put(result)
+                    print(f"{self.miner_id} found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
+                    return result
 
             progress += 1
 

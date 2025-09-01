@@ -27,6 +27,7 @@ class MiningResult:
     miner_id: str
     miner_type: str
     nonce: int
+    salt: bytes
     timestamp: int
     solutions: List[List[int]]
     energy: float
@@ -234,6 +235,7 @@ class BaseMiner(ABC):
     def mine_block(
         self,
         prev_block,
+        node_info,
         requirements,
         result_queue: multiprocessing.Queue,
         stop_event: multiprocessing.synchronize.Event,

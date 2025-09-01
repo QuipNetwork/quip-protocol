@@ -15,7 +15,7 @@ import numpy as np
 from dotenv import load_dotenv
 from matplotlib.patches import Patch
 from shared.block import Block, load_genesis_block, create_genesis_block, NextBlockRequirements, BlockHeader, MinerInfo, QuantumProof
-from shared.quantum_proof_of_work import calculate_diversity as _shared_diversity, calculate_hamming_distance as _shared_hamming, generate_ising_model_from_seed, ising_seed_from_block
+from shared.quantum_proof_of_work import calculate_diversity as _shared_diversity, calculate_hamming_distance as _shared_hamming, generate_ising_model_from_nonce, ising_nonce_from_block
 
 from shared.miner import MiningResult
 from shared.node import Node
@@ -295,8 +295,8 @@ class QuantumBlockchain:
                 return nonce, [], float("inf"), 0.0, 0
 
             # Generate quantum model
-            seed = ising_seed_from_block(block.header.previous_hash, block.header.timestamp, block.header.index, nonce)
-            h, J = generate_ising_model_from_seed(seed, block.quantum_proof.nodes, block.quantum_proof.edges)
+            seed = ising_nonce_from_block(block.header.previous_hash, block.header.timestamp, block.header.index, nonce)
+            h, J = generate_ising_model_from_nonce(seed, block.quantum_proof.nodes, block.quantum_proof.edges)
 
             print(f"Num QPU: {self.num_qpu_miners}, Num SA: {self.num_sa_miners}, Num GPU: {self.num_gpu_miners}")
 

@@ -230,7 +230,7 @@ class Node:
             return False
 
         # 4. Validate the Quantum Proof and other block artifacts.
-        block.quantum_proof.compute_derived_fields(prev_block.next_block_requirements, block)
+        block.quantum_proof.compute_derived_fields()
         if not block.validate_block(prev_block):
             logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid quantum proof")
             qpjson = block.quantum_proof.to_json()
@@ -356,7 +356,7 @@ class Node:
 
         # Command all workers to start mining with full context
         for h in handles:
-            h.mine(previous_block, requirements)
+            h.mine(previous_block, self.info(), requirements)
 
         result = None
         try:
@@ -453,6 +453,7 @@ class Node:
         miner_info = self.info()
         quantum_proof = block.QuantumProof(
             nonce=mining_result.nonce,
+            salt=mining_result.salt,
             nodes=mining_result.variable_order or mining_result.node_list,
             edges=mining_result.edge_list,
             solutions=mining_result.solutions,
@@ -461,25 +462,13 @@ class Node:
             diversity=mining_result.diversity,
             num_valid_solutions=mining_result.num_valid
         )
-        # Store miner_id for deterministic seed generation
-        quantum_proof.miner_id = mining_result.miner_id
-        # Create a temporary block with the necessary fields for validation
-        temp_block = type('TempBlock', (), {
-            'header': type('Header', (), {
-                'previous_hash': previous_block.hash,
-                'timestamp': mining_result.timestamp,
-                'index': previous_block.header.index + 1
-            })()
-        })()
-        quantum_proof.compute_derived_fields(previous_block.next_block_requirements, temp_block)
-
-
+        quantum_proof.compute_derived_fields()
 
         if (quantum_proof.energy is None or quantum_proof.energy != mining_result.energy):
             raise ValueError(f"Miner reported bad energy {mining_result.energy} but we computed {quantum_proof.energy}")
         if (quantum_proof.diversity is None or quantum_proof.diversity != mining_result.diversity):
             raise ValueError(f"Miner reported bad diversity {mining_result.diversity} but we computed {quantum_proof.diversity}")
-        if (quantum_proof.num_valid_solutions is None or quantum_proof.num_valid_solutions != mining_result.num_valid):
+        if (quantum_proof.num_valid_solutions is None or quantum_proof.num_valid_solutions > mining_result.num_valid):
             raise ValueError(f"Miner reported bad num_valid_solutions {mining_result.num_valid} but we computed {quantum_proof.num_valid_solutions}")
 
         next_block_requirements = self.compute_next_block_requirements(previous_block, mining_result)

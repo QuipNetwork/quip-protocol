@@ -367,7 +367,7 @@ class NetworkNode(Node):
             random_peer = random.choice(list(self.peers.keys()))
             net_latest_block = await self.get_peer_block(random_peer)
 
-        if my_latest_block.header.index == net_latest_block.header.index:
+        if my_latest_block.header.index >= net_latest_block.header.index:
             return 0
         return net_latest_block.header.index
 

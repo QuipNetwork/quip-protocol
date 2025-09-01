@@ -9,13 +9,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
-from shared.quantum_proof_of_work import calculate_diversity, generate_ising_model_from_seed, ising_seed_from_block, energies_for_solutions
+from shared.quantum_proof_of_work import calculate_diversity, generate_ising_model_from_nonce, ising_nonce_from_block, energies_for_solutions
+from shared.quantum_proof_of_work import generate_ising_model_from_nonce, calculate_diversity
 
 
 @dataclass
 class QuantumProof:
     """Quantum mining proof containing the essential mining result data."""
     nonce: int
+    salt: bytes
     nodes: List[int]  # List of nodes in the Ising model
     edges: List[Tuple[int, int]]  # List of edges in the Ising model
     solutions: List[List[int]]  # List of quantum solutions found
@@ -25,7 +27,6 @@ class QuantumProof:
     energy: Optional[float] = None
     diversity: Optional[float] = None
     num_valid_solutions: Optional[int] = None
-    miner_id: Optional[str] = None  # For deterministic seed generation
 
     def to_network(self) -> bytes:
         """Serialize to binary format, excluding derived fields.
@@ -38,6 +39,7 @@ class QuantumProof:
         """
         result = b''
         result += struct.pack('!Q', self.nonce)
+        result += struct.pack('!I', len(self.salt)) + self.salt
         result += struct.pack('!d', self.mining_time)
 
         # Nodes
@@ -68,6 +70,9 @@ class QuantumProof:
 
         # Basic fields
         nonce = struct.unpack('!Q', data[offset:offset+8])[0]
+        offset += 8
+        salt_length = struct.unpack('!I', data[offset:offset+4])[0]
+        salt = data[offset:offset+salt_length]
         offset += 8
         mining_time = struct.unpack('!d', data[offset:offset+8])[0]
         offset += 8
@@ -106,13 +111,15 @@ class QuantumProof:
                 solution.append(value)
             solutions.append(solution)
 
-        return cls(nonce=nonce, nodes=nodes, edges=edges, solutions=solutions, mining_time=mining_time)
+        return cls(nonce=nonce, salt=salt, nodes=nodes, edges=edges, solutions=solutions, mining_time=mining_time)
 
     def to_json(self) -> dict:
         """Serialize to JSON-compatible dictionary."""
         proof_data = self.to_network()
         return {
             'proof_data': proof_data.hex(),
+            'nonce': self.nonce,
+            'salt': self.salt.hex(),
             'mining_time': self.mining_time,
             'energy': self.energy,
             'diversity': self.diversity,
@@ -125,34 +132,25 @@ class QuantumProof:
         proof_data = bytes.fromhex(data['proof_data'])
         quantum_proof = QuantumProof.from_network(proof_data)
         # NOTE: kind of a hack...
+        quantum_proof.nonce = data['nonce']
+        quantum_proof.salt = bytes.fromhex(data['salt'])
         quantum_proof.mining_time = data['mining_time']
         quantum_proof.energy = data.get('energy')
         quantum_proof.diversity = data.get('diversity')
         quantum_proof.num_valid_solutions = data.get('num_valid_solutions')
         return quantum_proof
 
-    def compute_derived_fields(self, requirements: 'NextBlockRequirements', block: 'Block'):
+    def compute_derived_fields(self):
         """Calculate derived fields from solutions and requirements using Ising model.
         Requires the Block for deterministic model generation.
         """
         if not self.solutions:
             return
 
-        from shared.quantum_proof_of_work import generate_ising_model_from_seed, calculate_diversity
-
         # Generate model sized to the maximum solution length
-        n_model = max(len(sol) for sol in self.solutions)
-        # For validation, we need the miner_id from the quantum proof
-        # This should be set by the miner when creating the proof
-        miner_id = getattr(self, 'miner_id', 'unknown')
-        seed = ising_seed_from_block(prev_hash=block.header.previous_hash,
-                                     miner_id=miner_id,
-                                     cur_index=block.header.index,
-                                     nonce=self.nonce)
-        h, J = generate_ising_model_from_seed(seed,
+        h, J = generate_ising_model_from_nonce(self.nonce,
                                               self.nodes,
                                               self.edges)
-        print(f"DEBUG validation: seed={seed}, miner_id={miner_id}, nonce={self.nonce}, prev_hash={block.header.previous_hash.hex()[:16]}, cur_index={block.header.index}")
 
         def energy_of(solution: List[int]) -> float:
             # Map values to spins in {-1, +1}
@@ -172,17 +170,11 @@ class QuantumProof:
             return float(e)
 
         energies = [energy_of(sol) for sol in self.solutions]
-        print(f"DEBUG validation: first 3 energies: {energies[:3]}")
-        print(f"DEBUG validation: min energy: {min(energies) if energies else 'N/A'}")
-
-        # Solutions meeting difficulty threshold
-        valid_indices = [i for i, e in enumerate(energies) if e < requirements.difficulty_energy]
-        valid_solutions = [self.solutions[i] for i in valid_indices]
 
         # Set computed fields
         self.energy = min(energies) if energies else None
-        self.num_valid_solutions = len(valid_solutions)
-        self.diversity = calculate_diversity(valid_solutions) if len(valid_solutions) >= 2 else 0.0
+        self.num_valid_solutions = len(self.solutions)
+        self.diversity = calculate_diversity(self.solutions)
 
 
 @dataclass
@@ -332,7 +324,7 @@ class BlockHeader:
         return cls(
             previous_hash=bytes.fromhex(data['previous_hash']),
             index=data['index'],
-            timestamp=data['timestamp'],
+            timestamp=int(data['timestamp']),
             data_hash=bytes.fromhex(data['data_hash'])
         )
 
@@ -386,10 +378,10 @@ class NextBlockRequirements:
     def from_json(cls, data: dict) -> 'NextBlockRequirements':
         """Deserialize from JSON-compatible dictionary."""
         return cls(
-            difficulty_energy=data['difficulty_energy'],
-            min_diversity=data['min_diversity'],
-            min_solutions=data['min_solutions'],
-            timeout_to_difficulty_adjustment_decay=data['timeout_to_difficulty_adjustment_decay']
+            difficulty_energy=float(data['difficulty_energy']),
+            min_diversity=float(data['min_diversity']),
+            min_solutions=int(data['min_solutions']),
+            timeout_to_difficulty_adjustment_decay=int(data['timeout_to_difficulty_adjustment_decay'])
         )
 
 @dataclass
@@ -506,7 +498,7 @@ class Block:
 
         # Compute derived fields for quantum proof
         if self.quantum_proof:
-            self.quantum_proof.compute_derived_fields(self.next_block_requirements, self)
+            self.quantum_proof.compute_derived_fields()
 
         # Compute data hash (TBD merkle tree..)
         self.header.data_hash = blake3(self.data).digest()
@@ -545,9 +537,9 @@ class Block:
         # TODO: Validate difficulty adjustment for next block here. 
 
         # Validate quantum proof against requirements
-        return self._validate_quantum_proof(requirements)
+        return self._validate_quantum_proof(self.miner_info.miner_id, requirements)
 
-    def _validate_quantum_proof(self, requirements: NextBlockRequirements) -> bool:
+    def _validate_quantum_proof(self, miner_id: str, requirements: NextBlockRequirements) -> bool:
         """Validate quantum proof against requirements and compute metrics."""
         if not self.quantum_proof:
             logger.error(f"Block {self.header.index} rejected: no quantum proof")
@@ -559,9 +551,12 @@ class Block:
             return False
 
         # For block validation, use the miner_id from the quantum proof
-        miner_id = getattr(self.quantum_proof, 'miner_id', 'unknown')
-        seed = ising_seed_from_block(self.header.previous_hash, miner_id, self.header.index, self.quantum_proof.nonce)
-        h, J = generate_ising_model_from_seed(seed, self.quantum_proof.nodes, self.quantum_proof.edges)
+        nonce = ising_nonce_from_block(self.header.previous_hash, miner_id, self.header.index, self.quantum_proof.salt)
+        if self.quantum_proof.nonce != nonce:
+            logger.error(f"Block {self.header.index} rejected: invalid nonce {self.quantum_proof.nonce} != {nonce}")
+            return False
+
+        h, J = generate_ising_model_from_nonce(nonce, self.quantum_proof.nodes, self.quantum_proof.edges)
 
         # Compute energies respecting variable order (self.quantum_proof.nodes)
         energies = energies_for_solutions(solutions, h, J, self.quantum_proof.nodes)
@@ -579,11 +574,6 @@ class Block:
         if diversity < requirements.min_diversity:
             logger.error(f"Block {self.header.index} rejected: insufficient diversity ({diversity} < {requirements.min_diversity})")
             return False
-
-        # Set computed fields
-        self.energy = min(energies) if energies else None
-        self.diversity = diversity
-        self.num_valid_solutions = len(valid_solutions)
 
         return True
 
@@ -623,14 +613,42 @@ class Block:
         """Deserialize block from JSON string."""
         data = json.loads(json_str)
 
+        if 'header' not in data:
+            raise ValueError("Missing header in JSON data")
+        
+        if 'next_block_requirements' not in data:
+            raise ValueError("Missing next_block_requirements in JSON data")
+
         # Parse components using their own from_json methods
         header = BlockHeader.from_json(data['header'])
-        miner_info = MinerInfo.from_json(data['miner_info'])
-        quantum_proof = QuantumProof.from_json(data['quantum_proof'])
         next_block_requirements = NextBlockRequirements.from_json(data['next_block_requirements'])
+
+        if data['miner_info']:
+            miner_info = MinerInfo.from_json(data['miner_info'])
+        else:
+            miner_info = MinerInfo(miner_id='',
+                                   miner_type='', 
+                                   reward_address=b'',
+                                   ecdsa_public_key=b'',
+                                   wots_public_key=b'',
+                                  next_wots_public_key=b'')
+        if data['quantum_proof']:
+            quantum_proof = QuantumProof.from_json(data['quantum_proof'])
+        else:
+            quantum_proof = QuantumProof(nonce=0, 
+                                         salt=b'',
+                                         nodes=[],
+                                         edges=[],
+                                         solutions=[],
+                                         mining_time=0.0)
 
         # Use preserved raw bytes if available, otherwise reconstruct
         raw_bytes = bytes.fromhex(data['raw']) if data.get('raw') else b''
+
+        try:
+            block_data = bytes.fromhex(data['data'])
+        except ValueError:
+            block_data = data['data'].encode()
 
         # Create block
         block = cls(
@@ -638,7 +656,7 @@ class Block:
             miner_info=miner_info,
             quantum_proof=quantum_proof,
             next_block_requirements=next_block_requirements,
-            data=bytes.fromhex(data['data']),
+            data=block_data,
             raw=raw_bytes,
             hash=bytes.fromhex(data['hash']) if data.get('hash') else b'',
             signature=bytes.fromhex(data['signature']) if data.get('signature') else b''
@@ -695,7 +713,7 @@ def create_genesis_block(genesis_data: Optional[dict] = None) -> Block:
     """
     if genesis_data is not None:
         # Use parse_block_json to create the block from the provided data
-        return parse_block_json(genesis_data)
+        return Block.from_json(json.dumps(genesis_data))
 
     # Create default genesis block data
     default_genesis_data = {
@@ -715,145 +733,7 @@ def create_genesis_block(genesis_data: Optional[dict] = None) -> Block:
     }
 
     # Use parse_block_json to create and validate the default genesis block
-    return parse_block_json(default_genesis_data)
-
-
-def parse_block_json(block_data: dict) -> Block:
-    """Parse a block from JSON/dictionary format (for JSON derivation).
-
-    Args:
-        block_data: Dictionary containing block data
-
-    Returns:
-        Block object with network hash computed from binary serialization
-
-    Raises:
-        KeyError: If required fields are missing
-        ValueError: If field values are invalid
-    """
-    # Handle both new format (flat) and legacy format (with header)
-    if 'header' in block_data:
-        # Legacy format with header
-        header_data = block_data['header']
-        index = header_data['index']
-        previous_hash = header_data['previous_hash']
-        timestamp = header_data['timestamp']
-    else:
-        # New flat format
-        index = block_data['index']
-        previous_hash = block_data['previous_hash']
-        timestamp = block_data['timestamp']
-
-    # Parse next block requirements (required)
-    if 'next_block_requirements' not in block_data:
-        raise KeyError("Missing required 'next_block_requirements' field")
-
-    req_data = block_data['next_block_requirements']
-    requirements = NextBlockRequirements(
-        difficulty_energy=req_data['difficulty_energy'],
-        min_diversity=req_data['min_diversity'],
-        min_solutions=req_data['min_solutions'],
-        timeout_to_difficulty_adjustment_decay=req_data.get('timeout_to_difficulty_adjustment_decay', 10)
-    )
-
-    # Parse data (required)
-    if 'data' not in block_data:
-        raise KeyError("Missing required 'data' field")
-
-    # Parse optional quantum proof
-    quantum_proof = None
-    if 'quantum_proof' in block_data and block_data['quantum_proof']:
-        proof_data = block_data['quantum_proof']
-        quantum_proof = QuantumProof(
-            nonce=proof_data['nonce'],
-            nodes=proof_data.get('nodes', []),
-            edges=[tuple(edge) for edge in proof_data.get('edges', [])],
-            solutions=proof_data['solutions'],
-            mining_time=proof_data['mining_time']
-        )
-
-    # Parse optional miner info
-    miner_info = None
-    if 'miner_info' in block_data and block_data['miner_info']:
-        miner_data = block_data['miner_info']
-        miner_info = MinerInfo(
-            miner_id=miner_data['miner_id'],
-            miner_type=miner_data['miner_type'],
-            reward_address=miner_data['reward_address'],
-            ecdsa_public_key=miner_data['ecdsa_public_key'],
-            wots_public_key=miner_data['wots_public_key'],
-            next_wots_public_key=miner_data['next_wots_public_key']
-        )
-
-    # Create header from parsed values - for genesis, previous_hash and timestamp are strings, need to convert
-    if isinstance(previous_hash, str):
-        previous_hash = bytes.fromhex(previous_hash) if previous_hash != "0000000000000000000000000000000000000000000000000000000000000000" else b'\\x00' * 32
-    if isinstance(timestamp, float):
-        timestamp = int(timestamp)
-
-    # Compute data hash placeholder for genesis
-    data_hash = blake3(block_data['data'].encode()).digest()
-
-    header = BlockHeader(
-        previous_hash=previous_hash,
-        index=index,
-        timestamp=timestamp,
-        data_hash=data_hash
-    )
-
-    # Create placeholder objects for required fields if None
-    if quantum_proof is None:
-        quantum_proof = QuantumProof(nonce=0, nodes=[], edges=[], solutions=[], mining_time=0.0)
-
-    if miner_info is None:
-        miner_info = MinerInfo(
-            miner_id="genesis",
-            miner_type="genesis",
-            reward_address=b'\\x00' * 32,
-            ecdsa_public_key=b'\\x00' * 64,
-            wots_public_key=b'\\x00' * 64,
-            next_wots_public_key=b'\\x00' * 64
-        )
-
-    # Handle signature conversion
-    signature_bytes = b''
-    if 'signature' in block_data and block_data['signature']:
-        sig = block_data['signature']
-        if isinstance(sig, str):
-            signature_bytes = bytes.fromhex(sig) if sig else b''
-        else:
-            signature_bytes = sig or b''
-
-    # Create block
-    block = Block(
-        header=header,
-        miner_info=miner_info,
-        quantum_proof=quantum_proof,
-        next_block_requirements=requirements,
-        data=block_data['data'].encode(),
-        raw=b'',  # Will be computed
-        hash=b'',  # Will be computed
-        signature=signature_bytes
-    )
-
-    # Set computed fields if present (but these should be derived from validation)
-    if 'energy' in block_data:
-        block.energy = block_data['energy']
-    if 'diversity' in block_data:
-        block.diversity = block_data['diversity']
-    if 'num_valid_solutions' in block_data:
-        block.num_valid_solutions = block_data['num_valid_solutions']
-
-    # Compute network hash from binary serialization
-    block.finalize()
-
-    return block
-
-
-
-
-
-
+    return Block.from_json(json.dumps(default_genesis_data))
 
 
 def calculate_adaptive_parameters(requirements: Dict[str, Any], miner_type: str) -> Dict[str, Any]:

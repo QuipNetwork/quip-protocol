@@ -8,12 +8,6 @@ from __future__ import annotations
 
 import os
 
-# Set default DWave environment variables before any DWave libraries are imported
-if "DWAVE_API_KEY" not in os.environ:
-    os.environ["DWAVE_API_KEY"] = "MISSING IN CONFIG"
-if "DWAVE_API_TOKEN" not in os.environ:
-    os.environ["DWAVE_API_TOKEN"] = "MISSING IN CONFIG"
-
 import signal
 import subprocess
 import sys
@@ -23,6 +17,8 @@ import asyncio
 from typing import Any, Dict, Optional, List
 
 import click
+import traceback
+
 
 # TOML loader supporting Python 3.10 via tomli and 3.11+ via tomllib
 try:  # Python 3.11+
@@ -164,6 +160,7 @@ def _run_network_node_sync(config: Dict[str, Any], genesis_config_file: str) -> 
         return 130
     except Exception as e:
         click.echo(f"Error: {e}")
+        click.echo(traceback.format_exc())
         return 1
 
 

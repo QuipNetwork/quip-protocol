@@ -3,6 +3,7 @@
 Extracted from BaseMiner to be reusable and stateless.
 """
 from __future__ import annotations
+from venv import logger
 
 from blake3 import blake3
 from typing import Tuple, Dict, Optional
@@ -98,22 +99,25 @@ def get_topology_properties(topology_name: Optional[str] = None):
         'description': config['description']
     }
 
-def ising_seed_from_block(prev_hash: bytes, miner_id: str, cur_index: int, nonce: int) -> int:
+def ising_nonce_from_block(prev_hash: bytes, miner_id: str, cur_index: int, salt: bytes) -> int:
     """Generate deterministic seed for Ising model from block parameters.
 
     Uses miner_id instead of timestamp to ensure reproducible seeds between
     mining and validation phases.
     """
-    seed_string = f"{prev_hash.hex()}{miner_id}{cur_index}{nonce}"
-    return int(blake3(seed_string.encode()).hexdigest()[:8], 16)
+    seed = f"{prev_hash.hex()}{miner_id}{cur_index}".encode() + salt
+    nonce_bytes = blake3(seed).digest()
+    nonce = int.from_bytes(nonce_bytes[:4], 'big')
+    logger.warning(f"DEBUG: ising_nonce_from_block: prev_hash={prev_hash.hex()[:8]}, miner_id={miner_id}, cur_index={cur_index}, salt={salt.hex()[:8]}, nonce={nonce}")
+    return nonce
 
 
-def generate_ising_model_from_seed(seed: int, nodes: List[int], edges: List[Tuple[int, int]]) -> Tuple[Dict[int, int], Dict[tuple, int]]:
+def generate_ising_model_from_nonce(nonce: int, nodes: List[int], edges: List[Tuple[int, int]]) -> Tuple[Dict[int, float], Dict[tuple, float]]:
     """Generate (h, J) Ising parameters deterministically from a block.
 
     Deterministic given seed, node list and edge list. We assign h=0 and J in {-1,+1} per edge.
     """
-    np.random.seed(seed)
+    np.random.seed(nonce)
 
     h = {int(i): 0.0 for i in nodes}
     J = { (int(u), int(v)) if isinstance(u, (int, np.integer)) and isinstance(v, (int, np.integer)) else (int(u), int(v)) : float(2*np.random.randint(2)-1) for (u, v) in edges }
