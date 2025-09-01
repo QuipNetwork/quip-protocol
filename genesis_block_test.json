@@ -7,14 +7,8 @@
     "difficulty_energy": -1000.0,
     "min_diversity": 0.28,
     "min_solutions": 10,
-    "timeout_to_ease_difficulty": 10.0,
-    "max_mining_time": 300.0,
-    "adaptive_parameters": {
-      "energy_adjustment_rate": 0.01,
-      "diversity_adjustment_rate": 0.01,
-      "solutions_adjustment_rate": 0.15,
-      "description": "TEst parameters based on SA miner performance benchmarks"
-    }
+    "timeout_to_ease_difficulty": 20.0,
+    "max_mining_time": 300.0
   },
   "quantum_proof": null,
   "miner_info": null,

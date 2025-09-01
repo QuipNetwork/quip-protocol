@@ -7,17 +7,12 @@
   },
   "data": "Genesis Block - Quip Protocol",
   "next_block_requirements": {
-    "difficulty_energy": -12000.0,
+    "difficulty_energy": -1000.0,
     "min_diversity": 0.25,
     "min_solutions": 15,
-    "timeout_to_difficulty_adjustment_decay": 10.0,
+    "timeout_to_difficulty_adjustment_decay": 20.0,
     "max_mining_time": 300.0
   },
   "quantum_proof": null,
-  "miner_info": null,
-  "signature": null,
-  "energy": null,
-  "diversity": null,
-  "num_valid_solutions": null,
-  "hash": null
+  "miner_info": null
 }
