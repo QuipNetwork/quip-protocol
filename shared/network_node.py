@@ -517,13 +517,13 @@ class NetworkNode(Node):
             else:
                 raise RuntimeError("No peers to synchronize with")
 
-        net_latest_index: Optional[int] = None
+        net_latest: Optional[BlockHeader] = None
         tries = 0
-        while net_latest_index is None:
+        while net_latest is None:
             random_peer = random.choice(list(self.peers.keys()))
             header = await self.get_peer_block_header(random_peer)
             if header:
-                net_latest_index = header.index
+                net_latest = header
                 break
             tries += 1
             if tries > 3:
@@ -531,9 +531,17 @@ class NetworkNode(Node):
                 return 0
             await asyncio.sleep(1)
 
-        if my_latest_block.header.index >= net_latest_index:
+        if my_latest_block.header.index > net_latest.index:
             return 0
-        return net_latest_index
+        
+        if my_latest_block.header.index == net_latest.index:
+            # FIXME: maybe put hash in header?
+            if my_latest_block.header.previous_hash == net_latest.previous_hash and my_latest_block.header.timestamp == net_latest.timestamp:
+                return 0
+            else:
+                logging.warning("Latest block prev_hash mismatch, need to synchronize")
+
+        return net_latest.index
 
     async def synchronize_blockchain(self, current_head: int = 0):
         """Synchronize the blockchain with the network."""
