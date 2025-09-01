@@ -5,7 +5,9 @@ import random
 import socket
 import sys
 import time
-from dataclasses import dataclass, asdict
+import struct
+
+from dataclasses import dataclass
 from typing import Dict, List, Set, Optional, Callable, Tuple
 from datetime import datetime
 import aiohttp
@@ -85,13 +87,51 @@ class Message:
     type: str
     sender: str
     timestamp: float
-    data: dict
+    data: bytes
     id: Optional[str] = None
+
+    def to_network(self) -> bytes:
+        """Serialize message to binary: [u16 type][u16 sender][f64 ts][u16 id][u32 data_len][data]."""
+        import struct as _st
+        def _u16(n: int) -> bytes: return _st.pack('!H', max(0, min(int(n), 0xFFFF)))
+        def _u32(n: int) -> bytes: return _st.pack('!I', max(0, min(int(n), 0xFFFFFFFF)))
+        def _f64(x: float) -> bytes: return _st.pack('!d', float(x))
+        def _str(s: Optional[str]) -> bytes:
+            if not s: return _u16(0)
+            b = s.encode('utf-8'); return _u16(len(b)) + b
+        payload = self.data or b''
+        out = b''
+        out += _str(self.type)
+        out += _str(self.sender)
+        out += _f64(self.timestamp)
+        out += _str(self.id or '')
+        out += _u32(len(payload)) + payload
+        return out
+
+    @classmethod
+    def from_network(cls, data: bytes) -> 'Message':
+        """Deserialize message from binary: [u16 type][u16 sender][f64 ts][u16 id][u32 data_len][data]."""
+        import struct as _st
+        def _r_u16(buf: bytes, o: int): return _st.unpack('!H', buf[o:o+2])[0], o+2
+        def _r_u32(buf: bytes, o: int): return _st.unpack('!I', buf[o:o+4])[0], o+4
+        def _r_f64(buf: bytes, o: int): return _st.unpack('!d', buf[o:o+8])[0], o+8
+        def _r_str(buf: bytes, o: int):
+            ln, o = _r_u16(buf, o)
+            if ln == 0: return '', o
+            s = buf[o:o+ln].decode('utf-8'); return s, o+ln
+        o = 0
+        typ, o = _r_str(data, o)
+        sender, o = _r_str(data, o)
+        ts, o = _r_f64(data, o)
+        mid, o = _r_str(data, o)
+        dlen, o = _r_u32(data, o)
+        payload = data[o:o+dlen] if dlen > 0 else b''
+        return cls(type=typ or 'unknown', sender=sender or '', timestamp=ts, data=payload, id=(mid or None))
 
 
 class NetworkNode(Node):
     """Peer-to-peer node for quantum blockchain network."""
-    
+
     def __init__(self, config: dict, genesis_block: Block):
         self.bind_address = config.get("listen", "127.0.0.1")
         self.port = config.get("port", 20049)
@@ -160,38 +200,38 @@ class NetworkNode(Node):
         self.app.router.add_get('/status', self.handle_get_status)
         self.app.router.add_get('/block/', self.handle_get_latest_block)
         self.app.router.add_get('/block/{number}', self.handle_get_block)
-    
+
     async def start(self):
         """Start the P2P node."""
         self.running = True
-        
+
         # Start web server
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
         site = web.TCPSite(self.runner, self.bind_address, self.port)
         await site.start()
-        
+
         logger.info(f"Network node {self.node_name} ({self.crypto.ecdsa_public_key_hex[:8]}) started at {self.bind_address}:{self.port} with public address {self.public_host}")
-        
+
         # Start background tasks
         self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
         self.cleanup_task = asyncio.create_task(self.node_cleanup_loop())
         self.server_task = asyncio.create_task(self.server_loop())
-    
+
     async def stop(self):
         """Stop the P2P node."""
         self.running = False
-        
+
         # Cancel background tasks
         if self.heartbeat_task:
             self.heartbeat_task.cancel()
         if self.cleanup_task:
             self.cleanup_task.cancel()
-        
+
         # Stop web server
         if self.runner:
             await self.runner.cleanup()
-        
+
         logger.info("Network node stopped")
 
     ##########################
@@ -203,17 +243,17 @@ class NetworkNode(Node):
         while self.running:
             try:
                 await asyncio.sleep(self.heartbeat_interval)
-                
+
                 # Send heartbeat to all nodes
                 tasks = []
                 async with self.net_lock:
                     for node_host in list(self.peers.keys()):
                         task = asyncio.create_task(self.send_heartbeat(node_host))
                         tasks.append(task)
-                
+
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
-                    
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -237,7 +277,7 @@ class NetworkNode(Node):
                 # Remove dead nodes
                 for host in dead_nodes:
                     await self.remove_node(host)
-                    
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -246,8 +286,8 @@ class NetworkNode(Node):
     async def server_loop(self):
         """Main server loop."""
         while self.running:
-            # Check if we are connected to any active peers, if not, try to reconnect to known peers in our 
-            # heartbeats list or, if empty, the initial peers list. 
+            # Check if we are connected to any active peers, if not, try to reconnect to known peers in our
+            # heartbeats list or, if empty, the initial peers list.
             connected = await self.is_connected()
             if not connected:
                 connected = await self.connect_to_network()
@@ -261,14 +301,14 @@ class NetworkNode(Node):
                 logger.info("No peers connected, automining...")
 
             # Check if we are in synchronized state with peers
-            # If not, stop mining and synchronize. 
+            # If not, stop mining and synchronize.
             latest_block = await self.check_synchronized()
             if latest_block != 0:
                 if self._is_mining:
                     await self.stop_mining()
                     logger.info("Stopped mining to synchronize with network...")
                 await self.synchronize_blockchain(latest_block)
-                # NOTE: It's possible we can get triggered again if the sync takes too long, but that's OK 
+                # NOTE: It's possible we can get triggered again if the sync takes too long, but that's OK
                 # as we will be closer to the goal.
                 continue
 
@@ -304,14 +344,14 @@ class NetworkNode(Node):
 
     async def _on_new_node(self, host, info: MinerInfo):
         logger.info(f"🌟 New node joined: {host} {info.miner_id} ({info.ecdsa_public_key.hex()[:8]})")
-        if self.on_new_node:                
+        if self.on_new_node:
             asyncio.create_task(self.on_new_node(host, info))
 
     async def _on_node_lost(self, host):
         logger.info(f"💔 Node lost: {host}")
         if self.on_node_lost:
             asyncio.create_task(self.on_node_lost(host))
-    
+
     async def _on_block_received(self, block: Block):
         logger.info(f"📦 New block mined: {block.header.index}")
         if self.on_block_received:
@@ -347,14 +387,14 @@ class NetworkNode(Node):
         if not accepted:
             logger.warning(f"Block {wb.header.index}-{wb.hash.hex()[:8]} rejected by network!")
             return None
-        
+
         asyncio.create_task(self.gossip_block(wb))
         return result
 
 
-    async def check_synchronized(self) -> int: 
+    async def check_synchronized(self) -> int:
         """Check if we are synchronized with the network.
-        
+
         Returns 0 if synchronized or the latest network block index if not.
         """
         my_latest_block = self.get_latest_block()
@@ -384,16 +424,20 @@ class NetworkNode(Node):
         """Synchronize the blockchain with the network."""
         if self._is_mining:
             raise RuntimeError("Cannot synchronize while mining")
-        
+
         if current_head == 0:
             current_head = await self.check_synchronized()
         if current_head == 0:
             return
 
         my_latest_block = self.get_latest_block()
-       
-        logger.info(f"Syncing chain from {my_latest_block.header.index+1} to {current_head}...")
-        for block_number in range(my_latest_block.header.index + 1, current_head + 1):
+        start_index = my_latest_block.header.index + 1
+        end_index = current_head
+        if start_index > end_index:
+            return
+
+        logger.info(f"Syncing chain from {start_index} to {end_index}...")
+        for block_number in range(start_index, end_index + 1):
             block = None
             tries = 0
             backoff_sleep = 0.5
@@ -478,28 +522,28 @@ class NetworkNode(Node):
         """Add a node to our registry."""
         if host == self.public_host:
             logger.warning(f"Skipping adding ourselves as a peer: {host}")
-            return False 
-        
+            return False
+
         async with self.net_lock:
             is_new = self.add_or_update_peer(host, info)
-            
+
             if is_new:
                 logger.info(f"New peer discovered: {host}: {info.miner_id} ({info.ecdsa_public_key.hex()[:8]})")
                 await self._on_new_node(host, info)
 
                 # Broadcast new node to all other nodes
                 asyncio.create_task(self.gossip_new_node(host, info))
-            
+
             return is_new
-    
+
     async def remove_node(self, host: str):
         """Remove a node from our registry."""
         async with self.net_lock:
             if host in self.peers:
                 del self.peers[host]
                 logger.info(f"Node removed: {host}")
-                await self._on_node_lost(host)    
-    
+                await self._on_node_lost(host)
+
     async def send_heartbeat(self, node_host: str) -> bool:
         """Send heartbeat to a specific node."""
         try:
@@ -591,13 +635,19 @@ class NetworkNode(Node):
     async def gossip_to(self, host: str, message: Message) -> bool:
         """Send a message to a specific node."""
         try:
+            payload = message.to_network()
+            headers = {'Content-Type': 'application/octet-stream'}
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"http://{host}/gossip",
-                    json=asdict(message),
+                    data=payload,
+                    headers=headers,
                     timeout=aiohttp.ClientTimeout(total=self.node_timeout)
                 ) as resp:
                     return resp.status == 200
+        except TimeoutError:
+            logger.warning(f"Failed to send message to {host}: Timeout")
+            return False
         except Exception:
             logger.exception(f"Failed to send message to {host}")
             return False
@@ -606,15 +656,21 @@ class NetworkNode(Node):
         """Gossip a new message"""
         if message.id:
             raise ValueError("Message already has an ID, cannot originate a gossip message!")
-        
-        message.id = blake3(json.dumps(message.__dict__).encode()).hexdigest()
+
+        hasher = blake3()
+        hasher.update(message.type.encode('utf-8'))
+        hasher.update(b'\x00')
+        hasher.update(message.sender.encode('utf-8'))
+        hasher.update(struct.pack('!d', float(message.timestamp)))
+        hasher.update(message.data or b'')
+        message.id = hasher.hexdigest()
         await self.gossip_broadcast(message, min(self.fanout * 2, len(self.peers)))
 
     async def gossip_broadcast(self, message: Message, fanout: int = 3):
         """Rebroadcast a message to random subset of peers"""
         if not message.id:
             raise ValueError("Message must have an ID to gossip!")
-        
+
         # FIXME: some sort of validation the message has not been changed since origination
         # e.g., a signature. We could also at least check the id against the hash maybe?
         # Anyone can initiate a broadcast so it does not help to do this right now.
@@ -635,30 +691,33 @@ class NetworkNode(Node):
         # Send to selected peers
         tasks = [self.gossip_to(peer, message) for peer in targets]
         await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     async def gossip_new_node(self, new_node_address: str, new_node_info: MinerInfo):
-        """Broadcast a new node to all known nodes."""
+        """Broadcast a new node to all known nodes.
+        Data encoding: [u16 host_len][host utf-8][u32 info_len][info json utf-8]
+        """
+        import struct as _st
+        host_b = new_node_address.encode('utf-8')
+        info_json = new_node_info.to_json().encode('utf-8')
+        payload = _st.pack('!H', len(host_b)) + host_b + _st.pack('!I', len(info_json)) + info_json
         message = Message(
             type="new_node",
             sender=self.public_host,
             timestamp=time.time(),
-            data={
-                "host": new_node_address,
-                "info": new_node_info.to_json()
-            }
+            data=payload
         )
-        
         await self.gossip(message)
 
     async def gossip_block(self, block_data: Block):
-        """Broadcast a new block to the network."""
+        """Broadcast a new block to the network.
+        Data encoding: raw block network bytes.
+        """
         message = Message(
             type="block",
             sender=self.public_host,
             timestamp=time.time(),
-            data={"signed_block": block_data.to_network().hex()}
+            data=block_data.to_network()
         )
-        
         await self.gossip(message)
 
     async def handle_gossip(self, message: Message) -> str:
@@ -669,22 +728,32 @@ class NetworkNode(Node):
             if message.id in self.recent_messages:
                 return "ok"  # Already processed
             # NOTE: We only check and do not add to the processing list,
-            #       as that happens during gossip_broadcast. 
+            #       as that happens during gossip_broadcast.
 
         if message.type == "new_node":
-            new_host = message.data.get("host")
-            new_info = MinerInfo.from_json(message.data.get("info", "{}"))
-            if new_host:
-                await self.add_peer(new_host, new_info)
-        
+            import struct as _st
+            o = 0
+            if len(message.data) < 2:
+                return "rejected"
+            host_len = _st.unpack('!H', message.data[o:o+2])[0]
+            o += 2
+            if len(message.data) < o + host_len + 4:
+                return "rejected"
+            host = message.data[o:o+host_len].decode('utf-8')
+            o += host_len
+            info_len = _st.unpack('!I', message.data[o:o+4])[0]
+            o += 4
+            if len(message.data) < o + info_len:
+                return "rejected"
+            info_json = message.data[o:o+info_len].decode('utf-8')
+            new_info = MinerInfo.from_json(info_json)
+            if host:
+                await self.add_peer(host, new_info)
+
         elif message.type == "block":
-            block_data = message.data.get("signed_block")
-            # skip rebroadcast if invalid data field.
-            if not block_data:
-                return "rejected, missing signed_block field in data"
-            
-            block_bytes = bytes.fromhex(block_data)
-            block = Block.from_network(block_bytes)
+            if not message.data:
+                return "rejected, missing block data"
+            block = Block.from_network(message.data)
             # Don't rebroadcast if we reject
             if not await self.receive_block(block):
                 return "rejected"
@@ -695,17 +764,19 @@ class NetworkNode(Node):
     #######################
     ## HTTP PUT Handlers ##
     #######################
-    
+
     async def handle_put_gossip(self, request: web.Request) -> web.Response:
-        """Handle a gossip message from another node."""
+        """Handle a gossip message from another node (binary only)."""
         try:
-            data = await request.json()
-            message = Message(**data)
+            if request.content_type != 'application/octet-stream':
+                return web.json_response({"error": "unsupported content-type"}, status=415)
+
+            raw = await request.read()
+            message = Message.from_network(raw)
 
             status = await self.handle_gossip(message)
-
             return web.json_response({"status": status})
-            
+
         except Exception as e:
             logger.exception("Error handling broadcast")
             return web.json_response({"error": str(e)}, status=500)
@@ -751,7 +822,7 @@ class NetworkNode(Node):
         try:
             data = await request.json()
             sender = data.get("sender")
-            
+
             if sender:
                 async with self.net_lock:
                     if sender in self.peers:
@@ -760,9 +831,9 @@ class NetworkNode(Node):
                         # New node discovered via heartbeat - get their info in background
                         logger.info(f"New node discovered via heartbeat: {sender}")
                         asyncio.create_task(self.refresh_peer_info(sender))
-            
+
             return web.json_response({"status": "ok"})
-            
+
         except Exception as e:
             logger.exception("Error handling heartbeat")
             return web.json_response({"error": str(e)}, status=500)
@@ -787,7 +858,7 @@ class NetworkNode(Node):
                 status = "ok"
 
             return web.json_response({"status": status})
-            
+
         except Exception as e:
             logger.exception("Error handling new block")
             return web.json_response({"error": str(e)}, status=500)
@@ -795,10 +866,10 @@ class NetworkNode(Node):
     #######################
     ## HTTP GET Handlers ##
     #######################
-    
+
     async def handle_get_status(self, request: web.Request) -> web.Response:
         """Return node status."""
-        
+
         return web.json_response({
             "host": self.public_host,
             "info": self.info().to_json(),
@@ -811,7 +882,7 @@ class NetworkNode(Node):
         """Return list of known nodes."""
         async with self.net_lock:
             peers_data = copy.deepcopy(self.peers)
-        
+
         return web.json_response({"peers": peers_data})
 
     async def handle_get_latest_block(self, request: web.Request) -> web.Response:
