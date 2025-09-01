@@ -62,23 +62,11 @@ class CudaMiner(BaseMiner):
         min_solutions = requirements.min_solutions
 
         # Apply difficulty decay based on elapsed time since previous block
-        current_time = int(time.time())
-        if requirements.timeout_to_difficulty_adjustment_decay > 0:
-            elapsed = max(0, int((current_time - prev_timestamp) / requirements.timeout_to_difficulty_adjustment_decay))
-            if elapsed > 0:
-                from shared.quantum_proof_of_work import calculate_requirements_decay
-                # Create requirements dict for decay calculation
-                req_dict = requirements.to_json()
-                # Apply decay for each elapsed step
-                for _ in range(elapsed):
-                    req_dict = calculate_requirements_decay(req_dict)
-
-                # Update local requirements with decayed values
-                difficulty_energy = req_dict['difficulty_energy']
-                min_diversity = req_dict['min_diversity']
-                min_solutions = req_dict['min_solutions']
-
-                self.logger.info(f"Applied {elapsed} difficulty decay steps: energy {requirements.difficulty_energy:.2f} -> {difficulty_energy:.2f}, diversity {requirements.min_diversity:.3f} -> {min_diversity:.3f}, solutions {requirements.min_solutions} -> {min_solutions}")
+        from shared.block_requirements import compute_current_requirements
+        current_requirements = compute_current_requirements(requirements, prev_timestamp, self.logger)
+        difficulty_energy = current_requirements.difficulty_energy
+        min_diversity = current_requirements.min_diversity
+        min_solutions = current_requirements.min_solutions
 
         params = adapt_parameters(difficulty_energy, min_diversity, min_solutions)
         self.logger.debug(f"Adaptive params: {params}")
@@ -114,6 +102,19 @@ class CudaMiner(BaseMiner):
                 else:
                     self.logger.info("Stopping mining, no results found")
                 return None
+
+            # Update requirements if necessary.
+            updated_requirements = compute_current_requirements(requirements, prev_timestamp, self.logger)
+            if current_requirements != updated_requirements:
+                current_requirements = updated_requirements
+                # Check if any existing results meet the new requirements
+                for result in self.top_results:
+                    if result.energy <= current_requirements.difficulty_energy and result.diversity >= current_requirements.min_diversity and result.num_valid >= current_requirements.min_solutions:
+                        self.logger.info(f"Had a valid block! Nonce: {result.nonce}, Energy: {result.energy:.2f}, Time: {result.mining_time:.2f}s")
+                        return result
+                difficulty_energy = current_requirements.difficulty_energy
+                min_diversity = current_requirements.min_diversity
+                min_solutions = current_requirements.min_solutions
 
             # Track preprocessing time
             preprocess_start = time.time()

@@ -487,23 +487,8 @@ class Block:
             return False
         
         # Apply timeout-based difficulty decay based on elapsed time since previous block
-        if requirements.timeout_to_difficulty_adjustment_decay and requirements.timeout_to_difficulty_adjustment_decay > 0:
-            elapsed = max(0, int((self.header.timestamp - previous_block.header.timestamp) / requirements.timeout_to_difficulty_adjustment_decay))
-            if elapsed > 0:
-                before = requirements.to_json()
-                # Iterate decay step 'elapsed' times
-                cur = dict(before)
-                for _ in range(elapsed):
-                    cur = calculate_requirements_decay(cur)
-                # Log the change
-                logger.warning(
-                    f"Applying difficulty decay steps={elapsed}: "
-                    f"energy {before['difficulty_energy']:.4f} -> {cur['difficulty_energy']:.4f}, "
-                    f"diversity {before['min_diversity']:.4f} -> {cur['min_diversity']:.4f}, "
-                    f"solutions {before['min_solutions']} -> {cur['min_solutions']}"
-                )
-                # Overwrite a local copy of requirements for validation
-                requirements = BlockRequirements.from_json(cur)
+        from shared.block_requirements import compute_current_requirements
+        requirements = compute_current_requirements(requirements, previous_block.header.timestamp, logger)
 
         # Validate quantum proof against (possibly decayed) requirements
         return self._validate_quantum_proof(self.miner_info.miner_id, requirements)

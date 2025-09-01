@@ -71,6 +71,13 @@ class MetalMiner(BaseMiner):
         min_diversity = requirements.min_diversity
         min_solutions = requirements.min_solutions
 
+        # Apply difficulty decay based on elapsed time since previous block
+        from shared.block_requirements import compute_current_requirements
+        current_requirements = compute_current_requirements(requirements, prev_timestamp, self.logger)
+        difficulty_energy = current_requirements.difficulty_energy
+        min_diversity = current_requirements.min_diversity
+        min_solutions = current_requirements.min_solutions
+
         params = adapt_parameters(difficulty_energy, min_diversity, min_solutions)
         self.logger.debug(f"Adaptive params: {params}")
         
@@ -104,6 +111,19 @@ class MetalMiner(BaseMiner):
                 else:
                     self.logger.info("Stopping mining, no results found")
                 return None
+
+            # Update requirements if necessary.
+            updated_requirements = compute_current_requirements(requirements, prev_timestamp, self.logger)
+            if current_requirements != updated_requirements:
+                current_requirements = updated_requirements
+                # Check if any existing results meet the new requirements
+                for result in self.top_results:
+                    if result.energy <= current_requirements.difficulty_energy and result.diversity >= current_requirements.min_diversity and result.num_valid >= current_requirements.min_solutions:
+                        self.logger.info(f"Had a valid block! Nonce: {result.nonce}, Energy: {result.energy:.2f}, Time: {result.mining_time:.2f}s")
+                        return result
+                difficulty_energy = current_requirements.difficulty_energy
+                min_diversity = current_requirements.min_diversity
+                min_solutions = current_requirements.min_solutions
 
             # Track preprocessing time
             preprocess_start = time.time()

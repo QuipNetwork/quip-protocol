@@ -1,8 +1,10 @@
 """Block requirements data structure for quantum blockchain."""
 
+import logging
 import struct
+import time
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 
 @dataclass
@@ -59,6 +61,53 @@ class BlockRequirements:
             min_solutions=int(data['min_solutions']),
             timeout_to_difficulty_adjustment_decay=int(data['timeout_to_difficulty_adjustment_decay'])
         )
+
+
+def compute_current_requirements(
+    initial_requirements: BlockRequirements,
+    prev_timestamp: int,
+    logger: Optional[logging.Logger] = None
+) -> BlockRequirements:
+    """
+    Compute current block requirements with timeout-based difficulty decay applied.
+
+    Args:
+        initial_requirements: The original block requirements
+        prev_timestamp: Timestamp of the previous block
+        logger: Optional logger for recording decay changes
+
+    Returns:
+        BlockRequirements with decay applied if elapsed time warrants it
+    """
+    from shared.quantum_proof_of_work import calculate_requirements_decay
+
+    current_time = int(time.time())
+
+    if initial_requirements.timeout_to_difficulty_adjustment_decay <= 0:
+        return initial_requirements
+
+    elapsed = max(0, int((current_time - prev_timestamp) / initial_requirements.timeout_to_difficulty_adjustment_decay))
+
+    if elapsed == 0:
+        return initial_requirements
+
+    # Apply decay for each elapsed step
+    req_dict = initial_requirements.to_json()
+    for _ in range(elapsed):
+        req_dict = calculate_requirements_decay(req_dict)
+
+    decayed_requirements = BlockRequirements.from_json(req_dict)
+
+    # Log changes only if decay was applied
+    if logger and elapsed > 0:
+        logger.info(
+            f"Applied {elapsed} difficulty decay steps: "
+            f"energy {initial_requirements.difficulty_energy:.2f} -> {decayed_requirements.difficulty_energy:.2f}, "
+            f"diversity {initial_requirements.min_diversity:.3f} -> {decayed_requirements.min_diversity:.3f}, "
+            f"solutions {initial_requirements.min_solutions} -> {decayed_requirements.min_solutions}"
+        )
+
+    return decayed_requirements
 
 
 # For backward compatibility, create an alias
