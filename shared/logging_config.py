@@ -11,38 +11,78 @@ This module provides:
 
 import logging
 import logging.handlers
+import multiprocessing as mp
 import sys
 from datetime import datetime
+from logging.handlers import QueueListener
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 
 class QuipFormatter(logging.Formatter):
     """Custom formatter for QuIP Protocol logs with readable timestamps."""
 
     def format(self, record: logging.LogRecord) -> str:
-        # Format timestamp as MM/DD/YYYY HH:MMAM/PM UTC
+        # Format timestamp as ISO 8601 extended: YYYY-MM-DDTHH:MM:SS.ffffff+00:00
         dt = datetime.fromtimestamp(record.created)
-        timestamp = dt.strftime("%m/%d/%Y %I:%M%p UTC")
+        timestamp = dt.strftime("%Y-%m-%dT%H:%M:%S.%f+00:00")
 
-        # Get logger name (remove 'shared.' prefix if present)
-        logger_name = record.name
-        if logger_name.startswith('shared.'):
-            logger_name = logger_name[7:]
-        if logger_name.startswith('CPU.') or logger_name.startswith('GPU.') or logger_name.startswith('QPU.'):
-            # Extract miner type from path
-            parts = logger_name.split('.')
-            if len(parts) >= 2:
-                logger_name = parts[1]  # e.g., 'cpu_miner' -> 'cpu_miner'
+        # Get log level
+        level_name = record.levelname
 
-        # Format: [LoggerName] MM/DD/YYYY HH:MMAM UTC - Message
-        formatted = f"[{logger_name}] {timestamp} - {record.getMessage()}"
+        # Parse logger context for component and identifier
+        component, identifier = self._parse_logger_context(record)
+
+        # Format: [filename:lineno][identifier] TIMESTAMP LEVEL - Message
+        location = f"{record.filename}:{record.lineno}"
+        formatted = f"[{location}][{identifier}] {timestamp} {level_name} - {record.getMessage()}"
 
         # Add exception info if present
         if record.exc_info:
             formatted += f"\n{self.formatException(record.exc_info)}"
 
         return formatted
+
+    def _parse_logger_context(self, record: logging.LogRecord) -> tuple[str, str]:
+        """Parse logger name and extract component and identifier."""
+        logger_name = record.name
+
+        # Handle miner loggers: miner.{miner_id}
+        if logger_name.startswith('miner.'):
+            miner_id = logger_name.split('.', 1)[1]
+            return 'miner', miner_id
+
+        # Handle network node loggers: network_node.{node_id}
+        if logger_name.startswith('network_node.'):
+            node_id = logger_name.split('.', 1)[1]
+            return 'network_node', node_id
+
+        # Handle node loggers: node.{node_id}
+        if logger_name.startswith('node.'):
+            node_id = logger_name.split('.', 1)[1]
+            return 'node', node_id
+
+        # Handle legacy shared.* loggers for backward compatibility
+        if logger_name.startswith('shared.'):
+            component = logger_name[7:]  # Remove 'shared.' prefix
+            return component, 'legacy'
+
+        # Handle other module-level loggers by extracting meaningful names
+        if '.' in logger_name:
+            parts = logger_name.split('.')
+            if len(parts) >= 2:
+                # For loggers like 'quantum_blockchain_network', 'blockchain_base', etc.
+                if 'blockchain' in logger_name:
+                    return 'blockchain', parts[-1]
+                elif 'network' in logger_name:
+                    return 'network', parts[-1]
+                elif 'miner' in logger_name:
+                    return 'miner', parts[-1]
+                else:
+                    return parts[0], parts[-1]
+
+        # Fallback for other loggers
+        return 'unknown', logger_name
 
 
 def setup_logging(
@@ -138,20 +178,27 @@ def setup_logging(
     # Create component-specific loggers
     loggers = {}
 
-    # NetworkNode logger
-    network_node_logger = logging.getLogger('shared.network_node')
+    # NetworkNode logger - use node_name parameter
+    network_node_logger = logging.getLogger(f'network_node.{node_name}')
     network_node_logger.setLevel(numeric_level)
     loggers['network_node'] = network_node_logger
 
-    # Node logger
-    node_logger = logging.getLogger('shared.node')
+    # Node logger - use node_name parameter
+    node_logger = logging.getLogger(f'node.{node_name}')
     node_logger.setLevel(numeric_level)
     loggers['node'] = node_logger
 
-    # Miner loggers
+    # Configure miner parent logger to ensure all miner.* loggers inherit proper formatting
+    miner_parent_logger = logging.getLogger('miner')
+    miner_parent_logger.setLevel(numeric_level)
+    # Ensure propagation is enabled (should be default, but let's be explicit)
+    miner_parent_logger.propagate = True
+    loggers['miner'] = miner_parent_logger
+
+    # Keep individual miner type loggers for backward compatibility
     miner_types = ['cpu_miner', 'gpu_miner', 'qpu_miner', 'sa_miner']
     for miner_type in miner_types:
-        miner_logger = logging.getLogger(f'shared.{miner_type}')
+        miner_logger = logging.getLogger(f'miner.{miner_type}')
         miner_logger.setLevel(numeric_level)
         loggers[miner_type] = miner_logger
 
@@ -197,6 +244,36 @@ def update_log_level(loggers: Dict[str, logging.Logger], level: str):
     # Update component loggers
     for logger in loggers.values():
         logger.setLevel(numeric_level)
+
+
+def setup_multiprocess_logging() -> Tuple[mp.Queue, QueueListener]:
+    """Set up logging for multiprocessing environment.
+
+    Returns:
+        Tuple of (log_queue, listener) for multiprocessing logging.
+    """
+    from logging.handlers import QueueHandler, QueueListener
+
+    # Create queue for inter-process communication
+    log_queue = mp.Queue()
+
+    # Handler that sends log records to queue
+    queue_handler = QueueHandler(log_queue)
+
+    # Get root logger and add queue handler
+    root_logger = logging.getLogger()
+    root_logger.addHandler(queue_handler)
+    root_logger.setLevel(logging.INFO)
+
+    # Create listener that processes queue in main process
+    formatter = QuipFormatter()
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    listener = QueueListener(log_queue, console_handler)
+    listener.start()
+
+    return log_queue, listener
 
 
 def shutdown_logging():

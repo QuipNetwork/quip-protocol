@@ -173,8 +173,8 @@ async def _async_run_network_node(config: Dict[str, Any], genesis_config_file: s
     genesis = load_genesis_block(genesis_config_file)
     node = NetworkNode(config, genesis)
 
-    # Set the logger for the NetworkNode
-    node.logger = loggers['network_node']
+    # Note: NetworkNode creates its own logger in constructor with proper node ID
+    # The setup_logging loggers are kept for other components that may need them
 
     await node.start()
     try:

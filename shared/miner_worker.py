@@ -20,10 +20,43 @@ if "DWAVE_API_KEY" not in os.environ:
 if "DWAVE_API_TOKEN" not in os.environ:
     os.environ["DWAVE_API_TOKEN"] = "MISSING IN CONFIG"
 
-from shared.logging_config import get_logger
+from shared.logging_config import QuipFormatter
+import logging
 
-# Initialize logger
-logger = get_logger('miner_worker')
+# Global logger for this module
+log = None
+
+def _setup_child_process_logging():
+    """Set up logging for child processes to use QuipFormatter."""
+    global log
+
+    # Get root logger
+    root_logger = logging.getLogger()
+
+    # Check if QuipFormatter is already configured
+    has_quip_formatter = any(
+        isinstance(handler.formatter, QuipFormatter)
+        for handler in root_logger.handlers
+    )
+
+    if not has_quip_formatter:
+        # Clear existing handlers
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+
+        # Add QuipFormatter
+        formatter = QuipFormatter()
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        root_logger.addHandler(handler)
+        root_logger.setLevel(logging.INFO)
+
+    # Create module logger that will inherit from root
+    module_logger = logging.getLogger(__name__)
+    log = module_logger
+
+# Initialize module logger
+logger = logging.getLogger(__name__)
 
 import multiprocessing as mp
 import multiprocessing.synchronize as mpsync
@@ -54,6 +87,9 @@ def build_miner_from_spec(spec: Dict[str, Any]):
 
 
 def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any]):
+    # Set up logging for child process
+    _setup_child_process_logging()
+
     miner = build_miner_from_spec(spec)
     current_stop: mpsync.Event = mp.Event()
 
@@ -64,7 +100,10 @@ def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any]):
         op = msg.get("op")
 
         if op == "shutdown":
-            logger.info(f"Shutting down miner {miner.miner_id}")
+            if log:
+                log.info(f"Shutting down miner {miner.miner_id}")
+            else:
+                logger.info(f"Shutting down miner {miner.miner_id}")
             current_stop.set()
             return
         elif op == "get_stats":
@@ -73,17 +112,20 @@ def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any]):
         elif op == "stop_mining":
             current_stop.set()
         elif op == "mine_block":
-            block = msg.get("block")
+            prev_block = msg.get("block")
             requirements = msg.get("requirements")
             node_info = msg.get("node_info")
-            if block is None or requirements is None or node_info is None:
+            if prev_block is None or requirements is None or node_info is None:
                 resp_q.put({"op": "error", "message": "Missing node_info, block or requirements", "id": spec.get("id")})
                 continue
             current_stop = mp.Event()
-            miner.mine_block(block, node_info, requirements, resp_q, current_stop)
+            miner.mine_block(prev_block, node_info, requirements, resp_q, current_stop)
         else:
             resp_q.put({"op": "error", "message": f"Unknown op {op}", "id": spec.get("id")})
-            logger.info(f"{miner.miner_id}: Unknown op {op}")
+            if log:
+                log.info(f"{miner.miner_id}: Unknown op {op}")
+            else:
+                logger.info(f"{miner.miner_id}: Unknown op {op}")
             continue
 
 class MinerHandle:

@@ -7,24 +7,26 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import collections.abc
 from blake3 import blake3
+import logging
 import multiprocessing
 import multiprocessing.synchronize
+from shared.logging_config import QuipFormatter
+
+# Global logger for this module (set during initialization)
+log = None
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Protocol, Any, Union
 
 import numpy as np
-from shared.quantum_proof_of_work import (
-    calculate_hamming_distance as _shared_hamming,
-    calculate_diversity as _shared_diversity,
-    filter_diverse_solutions as _shared_filter,
-)
-from shared.logging_config import get_logger
 
-
+# Type definitions for quantum computing
+Variable = collections.abc.Hashable
+Bias = float
 
 @dataclass
 class MiningResult:
+    """Result of a mining operation."""
     miner_id: str
     miner_type: str
     nonce: int
@@ -39,8 +41,6 @@ class MiningResult:
     edge_list: List[Tuple[int, int]]
     variable_order: Optional[List[int]] = None
 
-Variable = collections.abc.Hashable
-Bias = float
 class Sampler(Protocol):
     """Protocol defining the D-Wave sampler interface."""
     nodelist: List[Variable]
@@ -49,6 +49,7 @@ class Sampler(Protocol):
     sampler_type: str
     nodes: List[int]  # Integer nodes for quantum_proof_of_work functions
     edges: List[Tuple[int, int]]  # Integer edges for quantum_proof_of_work functions
+
     def sample_ising(
         self,
         h: Union[Mapping[Variable, Bias], Sequence[Bias]],
@@ -56,6 +57,15 @@ class Sampler(Protocol):
         **kwargs
     ) -> Any:
         ...
+from shared.quantum_proof_of_work import (
+    calculate_hamming_distance as _shared_hamming,
+    calculate_diversity as _shared_diversity,
+    filter_diverse_solutions as _shared_filter,
+)
+from shared.logging_config import get_logger
+
+# Global logger for this module
+log = None
 
 class BaseMiner(ABC):
     """Abstract base class for concrete miners.
@@ -80,8 +90,17 @@ class BaseMiner(ABC):
         self.total_rewards = 0
         self.sampler = sampler
 
-        # Initialize logger
-        self.logger = get_logger('base_miner')
+        # Initialize logger with miner ID
+        self.logger = logging.getLogger(f'miner.{miner_id}')
+        # Ensure propagation to root logger for proper formatting
+        self.logger.propagate = True
+
+        # Set global logger for static functions in this module
+        global log
+        log = self.logger
+
+        # Setup multiprocessing logging compatibility
+        self._setup_multiprocess_logging()
 
         self.logger.debug(f"{miner_id} initialized ({self.miner_type})")
 
@@ -95,6 +114,36 @@ class BaseMiner(ABC):
             'total_samples': 0,
             'blocks_attempted': 0
         }
+
+    def _setup_multiprocess_logging(self):
+        """Ensure logger works in multiprocessing context."""
+        # Force propagation to root logger
+        self.logger.propagate = True
+
+        # If in child process, ensure proper handler setup
+        if (hasattr(multiprocessing, 'current_process') and
+            multiprocessing.current_process().name != 'MainProcess'):
+            self._configure_child_logging()
+
+    def _configure_child_logging(self):
+        """Configure logging for child processes."""
+        from shared.logging_config import QuipFormatter
+        formatter_class = QuipFormatter
+
+        root_logger = logging.getLogger()
+
+        # Check if QuipFormatter is present
+        has_quip_formatter = any(
+            isinstance(getattr(handler, 'formatter', None), formatter_class)
+            for handler in root_logger.handlers
+        )
+
+        if not has_quip_formatter:
+            # Add QuipFormatter handler
+            formatter = QuipFormatter()
+            handler = logging.StreamHandler()
+            handler.setFormatter(formatter)
+            root_logger.addHandler(handler)
 
         # Track timing history for graphing (block_number, timing_value)
         self.timing_history = {
@@ -117,8 +166,8 @@ class BaseMiner(ABC):
         # Adaptive parameters for performance tuning
         # Initialize num_sweeps based on miner ID for SA miners
         initial_sweeps = 512
-        if miner_id and miner_id[-1].isdigit():
-            initial_sweeps = pow(2, 6 + int(miner_id[-1]))
+        if self.miner_id and self.miner_id[-1].isdigit():
+            initial_sweeps = pow(2, 6 + int(self.miner_id[-1]))
 
         self.adaptive_params = {
             'quantum_annealing_time': 20.0,  # microseconds for QPU

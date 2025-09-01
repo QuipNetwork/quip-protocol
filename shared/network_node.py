@@ -25,7 +25,9 @@ from shared.node import Node
 # Configure logging
 import logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+
+# Global logger for this module (set during NetworkNode initialization)
+log = None
 
 
 async def get_public_ip() -> Optional[str]:
@@ -35,9 +37,13 @@ async def get_public_ip() -> Optional[str]:
     Returns:
         Public IP address as string, or None if unable to determine
     """
+    # Use module-level logger
+    logger = logging.getLogger(__name__)
+
     # List of reliable IP detection services
     services = [
         "https://api.ipify.org",
+        "https://icanhazip.com",
         "https://icanhazip.com",
         "https://ipecho.net/plain",
         "https://checkip.amazonaws.com",
@@ -146,8 +152,12 @@ class NetworkNode(Node):
         self.secret = config.get("secret", f"quip network node secret {random.randint(0, 1000000)}")
         self.auto_mine = config.get("auto_mine", False)
 
-        # Logger will be set from CLI after construction
-        self.logger = logger
+        # Create logger with node ID
+        self.logger = logging.getLogger(f'network_node.{self.node_name}')
+
+        # Set global logger for static functions in this module
+        global log
+        log = self.logger
 
         # Durations as float seconds
         self.heartbeat_interval = float(config.get("heartbeat_interval", 15))
@@ -291,7 +301,7 @@ class NetworkNode(Node):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.exception("Error in heartbeat loop")
+                self.logger.exception("Error in heartbeat loop")
 
     async def node_cleanup_loop(self):
         """Remove dead nodes from registry."""
@@ -315,7 +325,7 @@ class NetworkNode(Node):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.exception("Error in cleanup loop")
+                self.logger.exception("Error in cleanup loop")
 
     async def server_loop(self):
         """Main server loop."""
@@ -328,11 +338,11 @@ class NetworkNode(Node):
 
             # If we are not connected and not in auto-mine mode, sleep and retry
             if not connected and not self.auto_mine:
-                logger.error(f"Not connected to network, retrying in {self.node_timeout} seconds...")
+                self.logger.error(f"Not connected to network, retrying in {self.node_timeout} seconds...")
                 await asyncio.sleep(self.node_timeout)
                 continue
             elif not connected and self.auto_mine:
-                logger.info("No peers connected, automining...")
+                self.logger.info("No peers connected, automining...")
 
             # Check if we are in synchronized state with peers
             # If not, stop mining and synchronize.
@@ -340,7 +350,7 @@ class NetworkNode(Node):
             if latest_block != 0:
                 if self._is_mining:
                     await self.stop_mining()
-                    logger.info("Stopped mining to synchronize with network...")
+                    self.logger.info("Stopped mining to synchronize with network...")
                 await self.synchronize_blockchain(latest_block)
                 # NOTE: It's possible we can get triggered again if the sync takes too long, but that's OK
                 # as we will be closer to the goal.
@@ -374,14 +384,14 @@ class NetworkNode(Node):
                     result = await self.receive_block(block)
                     response_future.set_result(result)
                 except Exception as e:
-                    logger.exception(f"Error processing block: {e}")
+                    self.logger.exception(f"Error processing block: {e}")
                     if not response_future.done():
                         response_future.set_result(False)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.exception("Error in block processor loop")
+                self.logger.exception("Error in block processor loop")
 
     async def gossip_processor_loop(self):
         """Background loop to process gossip messages without blocking HTTP handlers."""
@@ -402,14 +412,14 @@ class NetworkNode(Node):
                     result = await self.handle_gossip(message)
                     response_future.set_result(result)
                 except Exception as e:
-                    logger.exception(f"Error processing gossip: {e}")
+                    self.logger.exception(f"Error processing gossip: {e}")
                     if not response_future.done():
                         response_future.set_result("error")
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.exception("Error in gossip processor loop")
+                self.logger.exception("Error in gossip processor loop")
 
     def _handle_mining_task_exception(self, task: asyncio.Task):
         """Handle exceptions from mining tasks - crash on ValueError."""
@@ -418,14 +428,14 @@ class NetworkNode(Node):
                 task.result()  # This will raise the exception if one occurred
             except ValueError as e:
                 # Shutdown miner workers and stop the event loop to crash the program
-                logger.error(f"ValueError in mining task - shutting down: {e}")
+                self.logger.error(f"ValueError in mining task - shutting down: {e}")
                 self.close()  # Shutdown miner workers first
                 loop = asyncio.get_event_loop()
                 loop.stop()
                 sys.exit(-1)
             except Exception as e:
                 # Log other exceptions but don't crash
-                logger.error(f"Exception in mining task: {e}")
+                self.logger.error(f"Exception in mining task: {e}")
 
 
     #############################
@@ -433,25 +443,25 @@ class NetworkNode(Node):
     #############################
 
     async def _on_new_node(self, host, info: MinerInfo):
-        logger.info(f"New node joined: {host} {info.miner_id} ({info.ecdsa_public_key.hex()[:8]})")
+        self.logger.info(f"New node joined: {host} {info.miner_id} ({info.ecdsa_public_key.hex()[:8]})")
         if self.on_new_node:
             asyncio.create_task(self.on_new_node(host, info))
 
     async def _on_node_lost(self, host):
-        logger.info(f"Node lost: {host}")
+        self.logger.info(f"Node lost: {host}")
         if self.on_node_lost:
             asyncio.create_task(self.on_node_lost(host))
 
     async def _on_block_received(self, block: Block):
-        logger.info(f"New block mined: {block.header.index}")
+        self.logger.info(f"New block mined: {block.header.index}")
         if self.on_block_received:
             asyncio.create_task(self.on_block_received(block))
 
     async def _network_on_mining_started(self, prev: Block):
-        logger.info(f"Mining started on block {prev.header.index + 1} with previous block hash {prev.hash}")
+        self.logger.info(f"Mining started on block {prev.header.index + 1} with previous block hash {prev.hash}")
 
     async def _network_on_mining_stopped(self):
-        logger.info(f"🛑 Mining stopped")
+        self.logger.info(f"🛑 Mining stopped")
 
 
     #######################
@@ -472,10 +482,10 @@ class NetworkNode(Node):
         if not wb.hash:
             raise ValueError("Failed to finalize block")
 
-        logger.info(f"Block {wb.header.index}-{wb.hash.hex()[:8]} mined on this node!")
+        self.logger.info(f"Block {wb.header.index}-{wb.hash.hex()[:8]} mined on this node!")
         accepted = await self.receive_block(wb)
         if not accepted:
-            logger.warning(f"Block {wb.header.index}-{wb.hash.hex()[:8]} rejected by network!")
+            self.logger.warning(f"Block {wb.header.index}-{wb.hash.hex()[:8]} rejected by network!")
             return None
 
         asyncio.create_task(self.gossip_block(wb))
@@ -490,7 +500,7 @@ class NetworkNode(Node):
         my_latest_block = self.get_latest_block()
         if not self.peers:
             if self.auto_mine:
-                logger.debug("No connected peers, but auto-mine is enabled so we are synchronized by default")
+                self.logger.debug("No connected peers, but auto-mine is enabled so we are synchronized by default")
                 return 0
             else:
                 raise RuntimeError("No peers to synchronize with")
@@ -526,7 +536,7 @@ class NetworkNode(Node):
         if start_index > end_index:
             return
 
-        logger.info(f"Syncing chain from {start_index} to {end_index}...")
+        self.logger.info(f"Syncing chain from {start_index} to {end_index}...")
         for block_number in range(start_index, end_index + 1):
             block = None
             tries = 0
@@ -541,12 +551,12 @@ class NetworkNode(Node):
                     continue
                 status = await self.receive_block(block)
                 if not status:
-                    logger.warning(f"Failed to add block {block_number} from {random_peer}")
+                    self.logger.warning(f"Failed to add block {block_number} from {random_peer}")
                     block = None
                     tries += 1
                     await asyncio.sleep(backoff_sleep * (tries + 1))
                     continue
-                logger.info(f"Added block {block_number} from {random_peer}")
+                self.logger.info(f"Added block {block_number} from {random_peer}")
 
     async def is_connected(self) -> bool:
         """Ensure we are connected to the network."""
@@ -597,28 +607,28 @@ class NetworkNode(Node):
                         await self.add_peer(peer_host, info)
                         peers_found += 1
 
-                    logger.info(f"Successfully joined network via {peer_address}")
-                    logger.info(f"Discovered {peers_found} peers")
+                    self.logger.info(f"Successfully joined network via {peer_address}")
+                    self.logger.info(f"Discovered {peers_found} peers")
                     return True
                 else:
-                    logger.error(f"Failed to join via {peer_address}: {resp.status}")
+                    self.logger.error(f"Failed to join via {peer_address}: {resp.status}")
                     return False
 
         except Exception as e:
-            logger.warning(f"Failed to connect to peer {peer_address}: {e}")
+            self.logger.warning(f"Failed to connect to peer {peer_address}: {e}")
             return False
 
     async def add_peer(self, host: str, info: MinerInfo) -> bool:
         """Add a node to our registry."""
         if host == self.public_host:
-            logger.warning(f"Skipping adding ourselves as a peer: {host}")
+            self.logger.warning(f"Skipping adding ourselves as a peer: {host}")
             return False
 
         async with self.net_lock:
             is_new = self.add_or_update_peer(host, info)
 
             if is_new:
-                logger.info(f"New peer discovered: {host}: {info.miner_id} ({info.ecdsa_public_key.hex()[:8]})")
+                self.logger.info(f"New peer discovered: {host}: {info.miner_id} ({info.ecdsa_public_key.hex()[:8]})")
                 await self._on_new_node(host, info)
 
                 # Broadcast new node to all other nodes
@@ -631,7 +641,7 @@ class NetworkNode(Node):
         async with self.net_lock:
             if host in self.peers:
                 del self.peers[host]
-                logger.info(f"Node removed: {host}")
+                self.logger.info(f"Node removed: {host}")
                 await self._on_node_lost(host)
 
     async def send_heartbeat(self, node_host: str) -> bool:
@@ -646,10 +656,10 @@ class NetworkNode(Node):
             ) as resp:
                 return resp.status == 200
         except asyncio.TimeoutError:
-            logger.debug(f"Failed to send heartbeat to {node_host}: Timeout")
+            self.logger.debug(f"Failed to send heartbeat to {node_host}: Timeout")
             return False
         except Exception:
-            logger.debug(f"Error sending heartbeat to {node_host}")
+            self.logger.debug(f"Error sending heartbeat to {node_host}")
             return False
 
     async def get_peer_status(self, host: str) -> Optional[dict]:

@@ -59,12 +59,14 @@ class SimulatedAnnealingMiner(BaseMiner):
         min_solutions = requirements.min_solutions
 
         params = adapt_parameters(difficulty_energy, min_diversity, min_solutions)
-        self.logger.debug(f"Adaptive params: {params}")
+        self.logger.info(f"{self.miner_id} - Adaptive params: {params}")
         
         # Get topology information from sampler
         nodes = self.nodes
         edges = self.edges
         
+
+
         while self.mining and not stop_event.is_set():
             # Check if we should stop before generating model
             if stop_event.is_set():
