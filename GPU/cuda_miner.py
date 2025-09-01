@@ -70,7 +70,11 @@ class CudaMiner(BaseMiner):
         while self.mining and not stop_event.is_set():
             # Check if we should stop before generating model
             if stop_event.is_set():
-                self.logger.info("Interrupted")
+                if self.top_results:
+                    best_result = self.top_results[0]
+                    self.logger.info(f"Stopping mining, best result was - Energy: {best_result.energy:.2f}, Valid Solutions: {best_result.num_valid}, Diversity: {best_result.diversity:.3f}")
+                else:
+                    self.logger.info("Stopping mining, no results found")
                 return None
 
             # Generate random salt for each attempt
@@ -84,7 +88,11 @@ class CudaMiner(BaseMiner):
 
             # Check again before sampling
             if stop_event.is_set():
-                self.logger.info("Interrupted")
+                if self.top_results:
+                    best_result = self.top_results[0]
+                    self.logger.info(f"Stopping mining, best result was - Energy: {best_result.energy:.2f}, Valid Solutions: {best_result.num_valid}, Diversity: {best_result.diversity:.3f}")
+                else:
+                    self.logger.info("Stopping mining, no results found")
                 return None
 
             # Track preprocessing time
@@ -211,7 +219,11 @@ class CudaMiner(BaseMiner):
 
         # If we exit the loop due to stop event
         if stop_event.is_set():
-            self.logger.info("Stopped")
+            if self.top_results:
+                best_result = self.top_results[0]
+                self.logger.info(f"Stopping mining, best result was - Energy: {best_result.energy:.2f}, Valid Solutions: {best_result.num_valid}, Diversity: {best_result.diversity:.3f}")
+            else:
+                self.logger.info("Stopping mining, no results found")
         return None
 
 
