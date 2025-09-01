@@ -145,7 +145,7 @@ class MetalSampler(MockDWaveSampler):
         # Metal optimization: Original optimized parameters for 60ms/sweep performance
         # Fixed: Now correctly minimizes energy (was maximizing before)
         # Use original working parameters that achieved ~60ms per sweep  
-        updates_per_sweep = max(n // 400, 15)  # Ultra-minimal updates for sub-5s target
+        updates_per_sweep = max(n // 10, 100)  # Balanced: more updates than before, but not full sweep
         
         # Fast convergence: Don't overdo parallel chains - focus on speed
         original_reads = num_reads
@@ -163,9 +163,12 @@ class MetalSampler(MockDWaveSampler):
         if self._debug:
             print(f"[MetalSampler] Metal params: updates_per_sweep={updates_per_sweep} (corrected SA minimization)", flush=True)
 
-        # Aggressive temperature schedule for deep energy exploration
-        # Much hotter start, much colder end to reach -15500 target
-        betas = torch.exp(torch.linspace(math.log(0.01), math.log(25.0), steps=num_sweeps, device=self._device, dtype=torch.float32))
+        # D-Wave style geometric beta schedule for proper simulated annealing
+        # Conservative range similar to D-Wave's adaptive schedule
+        beta_start = 0.1   # Higher temperature start (like D-Wave ~0.35)
+        beta_end = 3.0     # Lower temperature end (like D-Wave ~2.65)  
+        # Use exp(linspace(log)) to create geometric schedule (MPS compatible)
+        betas = torch.exp(torch.linspace(math.log(beta_start), math.log(beta_end), steps=num_sweeps, device=self._device, dtype=torch.float32))
         R = num_reads
         ar = torch.arange(R, device=self._device, dtype=torch.int32)  # Use int32 for MPS performance
         
@@ -189,21 +192,19 @@ class MetalSampler(MockDWaveSampler):
                 neighbor_sum = torch.zeros((R, n), device=self._device, dtype=torch.float32)
             local_field = neighbor_sum + h_vec
 
-            # Vectorized batch updates with local field recomputation
+            # Random updates with proper SA: best of both worlds
             if updates_per_sweep > 0:
-                # Pre-generate random indices and decisions
+                # Pre-generate random indices for efficiency
                 all_idx = torch.randint(0, n, (R, updates_per_sweep), device=self._device, dtype=torch.int32)
-                rand_vals = torch.rand((R, updates_per_sweep), device=self._device)
-                
-                # Update loop with periodic local field refresh 
                 recompute_freq = max(1, updates_per_sweep // 4)  # Recompute 4 times per sweep
                 for u in range(updates_per_sweep):
-                    cur_idx = all_idx[:, u]  # Shape: (R,)
+                    cur_idx = all_idx[:, u]  # Random spin selection per chain
                     s_i = spins[ar, cur_idx].to(torch.float32)
                     lf_i = local_field[ar, cur_idx]
                     delta_e = 2.0 * s_i * lf_i  # This is -delta_E in the physics convention
-                    # CRITICAL FIX: For minimization, accept when delta_e > 0 (i.e., real delta_E < 0)
-                    accept = delta_e > 0
+                    # Proper Metropolis acceptance: accept improvements OR with probability exp(-β*|ΔE|)
+                    rand_vals_batch = torch.rand(R, device=self._device)
+                    accept = (delta_e > 0) | (rand_vals_batch < torch.exp(-beta * torch.abs(delta_e)))
                     # Vectorized flip
                     spins[ar[accept], cur_idx[accept]] *= -1
                     
