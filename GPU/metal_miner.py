@@ -41,6 +41,7 @@ class MetalMiner(BaseMiner):
         prev_block,
         node_info,
         requirements,
+        prev_timestamp: int,
         result_queue: multiprocessing.Queue,
         stop_event: multiprocessing.synchronize.Event,
     ) -> Optional[MiningResult]:
@@ -219,6 +220,7 @@ class MetalMiner(BaseMiner):
                         nonce=nonce,
                         salt=salt,
                         timestamp=timestamp,
+                        prev_timestamp=prev_timestamp,
                         solutions=filtered_solutions,
                         energy=min_energy,
                         diversity=final_diversity,
