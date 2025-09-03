@@ -144,7 +144,7 @@ class SimulatedAnnealingMiner(BaseMiner):
             self.timing_stats['total_samples'] += len(all_energies)
             self.timing_stats['blocks_attempted'] += 1
 
-            result = self.evaluate_sampleset(sampleset, requirements, nodes, edges, nonce, salt, prev_timestamp, start_time)
+            result = self.evaluate_sampleset(sampleset, current_requirements, nodes, edges, nonce, salt, prev_timestamp, start_time)
 
             # Track postprocessing time
             self.timing_stats['postprocessing'].append((time.time() - postprocess_start) * 1e6)
@@ -154,7 +154,7 @@ class SimulatedAnnealingMiner(BaseMiner):
                 return result
                         
             # Update top samples with this one
-            self.update_top_samples(sampleset, nonce, salt, requirements)
+            self.update_top_samples(sampleset, nonce, salt, current_requirements)
 
             progress += 1
 
