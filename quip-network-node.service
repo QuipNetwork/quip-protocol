@@ -1,0 +1,33 @@
+[Unit]
+Description=QuIP Network Node
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=quip
+Group=quip
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=/usr/local/lib/python3.10/site-packages
+ExecStart=/usr/local/bin/quip-network-node cpu --config /etc/quip.network/config.toml
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=quip-network-node
+
+# Security settings
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log/quip-node /var/lib/quip-node
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+
+# Resource limits
+MemoryLimit=2G
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target

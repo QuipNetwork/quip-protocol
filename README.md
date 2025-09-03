@@ -87,7 +87,7 @@ quip-network-node cpu --port 8080 --num-cpus 4
 quip-network-node gpu --port 8082 --peer localhost:8080 --device 0
 
 # Use TOML config to choose default subcommand and flags
-quip-network-node --config ./quip-node.example.toml
+quip-network-node --config ./QUIP-node.example.toml
 
 # Modal backend example via TOML
 # [gpu]
@@ -125,7 +125,7 @@ devices = ["0", "1"]
 # dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"  # default
 ```
 
-See a working example in quip-node.example.toml.
+See a working example in QUIP-node.example.toml.
 
 ### quip-network-simulator
 
@@ -141,6 +141,138 @@ quip-network-simulator --scenario cpu
 # GPU-only with overrides and base port (print only)
 quip-network-simulator --scenario gpu --num-gpu 2 --base-port 9000 --print-only
 ```
+
+## Systemd Service Installation
+
+You can run quip-network-node as a systemd service for production deployment with automatic restarts and proper logging.
+
+### Service Configuration
+
+Create the systemd service file at `/etc/systemd/system/quip-network-node.service`:
+
+```ini
+[Unit]
+Description=QUIP Network Node
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=QUIP
+Group=QUIP
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=/usr/local/lib/python3.10/site-packages
+ExecStart=/usr/local/bin/quip-network-node cpu --config /etc/QUIP.network/config.toml
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=quip-network-node
+
+# Security settings
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log/QUIP-node /var/lib/QUIP-node
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+
+# Resource limits
+MemoryLimit=2G
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Installation Steps
+
+1. **Create directories and user**:
+   ```bash
+   sudo mkdir -p /etc/QUIP.network
+   sudo mkdir -p /var/log/QUIP-node
+   sudo mkdir -p /var/lib/QUIP-node
+   sudo useradd --system --shell /bin/false --home /var/lib/QUIP-node --create-home QUIP
+   sudo chown -R QUIP:QUIP /var/log/QUIP-node /var/lib/QUIP-node
+   ```
+
+2. **Copy and configure**:
+   ```bash
+   sudo cp QUIP-node.example.toml /etc/QUIP.network/config.toml
+   sudo chown QUIP:QUIP /etc/QUIP.network/config.toml
+   # Edit /etc/QUIP.network/config.toml as needed - all configuration goes here
+   ```
+
+3. **Install and enable service**:
+   ```bash
+   sudo cp quip-network-node.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable quip-network-node
+   sudo systemctl start quip-network-node
+   ```
+
+4. **Monitor the service**:
+   ```bash
+   sudo systemctl status quip-network-node
+   journalctl -u quip-network-node -f
+   ```
+
+### Configuration Options
+
+The service can be customized by modifying the `ExecStart` line:
+
+- **CPU mining**: `quip-network-node cpu --config /etc/QUIP.network/config.toml`
+- **GPU mining**: `quip-network-node gpu --config /etc/QUIP.network/config.toml`
+- **QPU mining**: `quip-network-node qpu --config /etc/QUIP.network/config.toml`
+
+All miner-specific configuration (D-Wave credentials, GPU settings, CPU limits, etc.) should be set in `/etc/QUIP.network/config.toml`:
+
+```toml
+[global]
+node_name = "Production Node"
+listen = "0.0.0.0"
+port = 20049
+log_level = "INFO"
+node_log = "/var/log/QUIP-node/node.log"
+http_log = "/var/log/QUIP-node/http.log"
+
+[cpu]
+num_cpus = 4
+
+[gpu]
+backend = "local"
+devices = ["0", "1"]
+
+[qpu]
+dwave_api_key = "your_key_here"
+dwave_api_solver = "Advantage_system6.4"
+```
+
+### Service Management
+
+```bash
+# View logs
+sudo journalctl -u quip-network-node -n 50
+
+# Restart service
+sudo systemctl restart quip-network-node
+
+# Stop service
+sudo systemctl stop quip-network-node
+
+# Disable service
+sudo systemctl disable quip-network-node
+```
+
+### Troubleshooting
+
+- **Service fails to start**: Check permissions on `/etc/QUIP.network/config.toml`
+- **Python import errors**: Verify PYTHONPATH and package installation
+- **Permission denied**: Ensure the `QUIP` user has access to necessary directories
+- **Network issues**: Check firewall settings for the configured port (default: 20049)
+
+The systemd service provides production-ready deployment with automatic restarts, proper logging, and security hardening. All configuration is centralized in the TOML file for easier management.
 
 ## Usage
 
