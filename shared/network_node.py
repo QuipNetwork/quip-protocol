@@ -581,10 +581,11 @@ class NetworkNode(Node):
 
         if my_latest_block.header.index == net_latest.index:
             # FIXME: maybe put hash in header?
-            if my_latest_block.header.previous_hash == net_latest.previous_hash and my_latest_block.header.timestamp == net_latest.timestamp:
+            # Our prev_hashes match and our timestamps match and my timestamp is older or equal, I am good.
+            if my_latest_block.header.previous_hash == net_latest.previous_hash and my_latest_block.header.timestamp <= net_latest.timestamp:
                 self.set_synchronized()
                 return 0
-            else:
+            else:                    
                 self.logger.warning("Latest block prev_hash mismatch, need to synchronize")
 
         return net_latest.index
@@ -600,7 +601,8 @@ class NetworkNode(Node):
             return
 
         my_latest_block = self.get_latest_block()
-        start_index = max(1, my_latest_block.header.index)
+        # Always go back at least 2 blocks.
+        start_index = max(1, my_latest_block.header.index-2)
         end_index = current_head
         if start_index > end_index:
             return
