@@ -13,7 +13,7 @@ from quantum_blockchain_network import P2PNode, Message
 from shared.quantum_proof_of_work import (
     calculate_hamming_distance,
     calculate_diversity,
-    filter_diverse_solutions,
+    select_diverse_solutions,
 )
 
 from shared.block_signer import BlockSigner
@@ -298,7 +298,7 @@ class BaseMiner:
                             valid_solutions.append(list(solution))
 
                     # Filter excess solutions to maintain diversity
-                    filtered_solutions = filter_diverse_solutions(valid_solutions, self.min_solutions)
+                    filtered_solutions = select_diverse_solutions(valid_solutions, self.min_solutions)
 
                     # Calculate diversity of filtered solutions
                     diversity = calculate_diversity(filtered_solutions)

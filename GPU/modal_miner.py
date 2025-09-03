@@ -13,9 +13,10 @@ import json
 from shared.base_miner import BaseMiner, MiningResult
 from shared.block_requirements import compute_current_requirements
 from shared.quantum_proof_of_work import (
+    calculate_diversity,
+    select_diverse_solutions,
     ising_nonce_from_block,
     generate_ising_model_from_nonce,
-    energy_of_solution,
 )
 from GPU.modal_sampler import ModalSampler
 
@@ -48,6 +49,7 @@ class ModalMiner(BaseMiner):
         """
         self.mining = True
         progress = 0  # Progress counter for logging
+        self.top_attempts = []
         start_time = time.time()
         
         self.logger.debug(f"requirements: {requirements}")
@@ -77,15 +79,6 @@ class ModalMiner(BaseMiner):
         edges = self.sampler.edges
 
         while self.mining and not stop_event.is_set():
-            # Check if we should stop before generating model
-            if stop_event.is_set():
-                if self.top_results:
-                    best_result = self.top_results[0]
-                    self.logger.info(f"Stopping mining, best result was - Energy: {best_result.energy:.2f}, Valid Solutions: {best_result.num_valid}, Diversity: {best_result.diversity:.3f}")
-                else:
-                    self.logger.info("Stopping mining, no results found")
-                return None
-
             # Generate random salt for each attempt
             salt = random.randbytes(32)
             
@@ -95,21 +88,12 @@ class ModalMiner(BaseMiner):
 
             h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
 
-            # Check again before sampling
-            if stop_event.is_set():
-                if self.top_results:
-                    best_result = self.top_results[0]
-                    self.logger.info(f"Stopping mining, best result was - Energy: {best_result.energy:.2f}, Valid Solutions: {best_result.num_valid}, Diversity: {best_result.diversity:.3f}")
-                else:
-                    self.logger.info("Stopping mining, no results found")
-                return None
-
             # Update requirements if necessary.
             updated_requirements = compute_current_requirements(requirements, prev_timestamp, self.logger)
             if current_requirements != updated_requirements:
                 current_requirements = updated_requirements
                 # Check if any existing results meet the new requirements
-                for result in self.top_results:
+                for result in self.top_attempts:
                     if result.energy <= current_requirements.difficulty_energy and result.diversity >= current_requirements.min_diversity and result.num_valid >= current_requirements.min_solutions:
                         self.logger.info(f"Had a valid block! Nonce: {result.nonce}, Energy: {result.energy:.2f}, Time: {result.mining_time:.2f}s")
                         return result
@@ -170,77 +154,83 @@ class ModalMiner(BaseMiner):
             self.timing_stats['total_samples'] += len(sampleset.record.energy)
             self.timing_stats['blocks_attempted'] += 1
 
-            if len(valid_indices) >= min_solutions:
-                # Get unique solutions
-                valid_solutions = []
-                seen = set()
-
-                for idx in valid_indices:
-                    solution = tuple(sampleset.record.sample[idx])
-                    if solution not in seen:
-                        seen.add(solution)
-                        valid_solutions.append(list(solution))
-
-                # Calculate diversity
-                diversity = self.calculate_diversity(valid_solutions)
-                min_energy = float(np.min(sampleset.record.energy))
-
-                # Filter excess solutions to maintain diversity
-                filtered_solutions = self.filter_diverse_solutions(valid_solutions, min_solutions)
-
-                # Recalculate diversity after filtering
-                final_diversity = self.calculate_diversity(filtered_solutions)
-                self.logger.info(f"Found sufficient solutions! Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}, Diversity: {diversity:.3f}, Final Diversity: {final_diversity:.3f}")
-
-                # Track postprocessing time
-                self.timing_stats['postprocessing'].append((time.time() - postprocess_start) * 1e6)
+            # Process results from this mining attempt
+            all_energies = sampleset.record.energy
+            best_energy = float(np.min(all_energies)) if len(all_energies) > 0 else float('inf')
+            
+            # Create mining result for this attempt
+            mining_time = time.time() - start_time
+            
+            # Get unique solutions that meet energy threshold
+            valid_solutions = []
+            seen = set()
+            for idx in valid_indices:
+                solution = tuple(sampleset.record.sample[idx])
+                if solution not in seen:
+                    seen.add(solution)
+                    valid_solutions.append(list(solution))
+            
+            # Calculate diversity for valid solutions
+            diversity = calculate_diversity(valid_solutions) if valid_solutions else 0.0
+            
+            # Filter solutions if we have enough
+            if len(valid_solutions) >= min_solutions:
+                filtered_solutions = select_diverse_solutions(valid_solutions, min_solutions)
+                final_diversity = calculate_diversity(filtered_solutions)
+            else:
+                filtered_solutions = valid_solutions
+                final_diversity = diversity
+            
+            # Create result for this attempt
+            attempt_result = MiningResult(
+                miner_id=self.miner_id,
+                miner_type=self.miner_type,
+                nonce=nonce,
+                salt=salt,
+                timestamp=int(time.time()),
+                prev_timestamp=prev_timestamp,
+                solutions=filtered_solutions,
+                energy=best_energy,
+                diversity=final_diversity,
+                num_valid=len(valid_solutions),
+                mining_time=mining_time,
+                node_list=nodes,
+                edge_list=edges,
+                variable_order=nodes
+            )
+            
+            # Track postprocessing time
+            self.timing_stats['postprocessing'].append((time.time() - postprocess_start) * 1e6)
+            
+            # Update top results with this attempt
+            self.update_top_samples(attempt_result, requirements)
+            
+            # Check if this result meets current requirements
+            if (len(valid_solutions) >= min_solutions and 
+                final_diversity >= min_diversity and 
+                best_energy <= difficulty_energy):
                 
-                # Check if diversity requirement is met
-                if final_diversity >= min_diversity and len(valid_solutions) >= min_solutions:
-                    mining_time = time.time() - start_time
-                    min_energy = float(np.min(sampleset.record.energy[valid_indices]))
-
-                    energies = [energy_of_solution(sol, h, J, nodes) for sol in filtered_solutions]
-                    min_energy = float(min(energies)) if energies else 0.0
-
-                    result = MiningResult(
-                        miner_id=self.miner_id,
-                        miner_type=self.miner_type,
-                        nonce=nonce,
-                        salt=salt,
-                        timestamp=timestamp,
-                        prev_timestamp=prev_timestamp,
-                        solutions=filtered_solutions,
-                        energy=min_energy,
-                        diversity=final_diversity,
-                        num_valid=len(filtered_solutions),
-                        mining_time=mining_time,
-                        node_list=nodes,
-                        edge_list=edges,
-                        variable_order=nodes
-                    )
-
-                    self.logger.info(f"Found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
-
-                    # Log mining attempt results
-                    self.logger.info(f"Mining attempt completed - Best Energy: {result.energy:.2f}, Valid Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Params: {json.dumps(params)}")
-
-                    # Update top results
-                    self.update_top_results(result, requirements)
-
-                    return result
+                self.logger.info(f"Found valid block! Nonce: {nonce}, Energy: {best_energy:.2f}, Time: {mining_time:.2f}s")
+                self.logger.info(f"Mining attempt completed - Best Energy: {best_energy:.2f}, Valid Solutions: {len(valid_solutions)}, Diversity: {final_diversity:.3f}, Params: {json.dumps(params)}")
+                return attempt_result
+            else:
+                # Log this attempt but continue mining
+                self.logger.debug(f"Mining attempt - Energy: {best_energy:.2f}, Valid: {len(valid_solutions)}, Diversity: {final_diversity:.3f} (requirements: energy<={difficulty_energy:.2f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
 
             progress += 1
 
             # Progress update
-            if progress % 10 == 0 and len(sampleset.record.energy) > 0:
-                min_energy = float(np.min(sampleset.record.energy))
-                self.logger.debug(f"Progress: {progress}, Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}")
+            if progress % 10 == 0:
+                if self.top_attempts:
+                    best_result = self.top_attempts[0]
+                    self.logger.info(f"Progress: {progress} attempts, best result so far - Energy: {best_result.energy:.2f}, Valid Solutions: {best_result.num_valid}, Diversity: {best_result.diversity:.3f}")
+                else:
+                    self.logger.info(f"Progress: {progress} attempts, no results yet")
 
         # If we exit the loop due to stop event
         if stop_event.is_set():
-            if self.top_results:
-                best_result = self.top_results[0]
+            if self.top_attempts:
+                best_result = self.top_attempts[0]
                 self.logger.info(f"Stopping mining, best result was - Energy: {best_result.energy:.2f}, Valid Solutions: {best_result.num_valid}, Diversity: {best_result.diversity:.3f}")
             else:
                 self.logger.info("Stopping mining, no results found")
