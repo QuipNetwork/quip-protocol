@@ -10,6 +10,8 @@ from blake3 import blake3
 import logging
 import multiprocessing
 import multiprocessing.synchronize
+
+import dimod
 from shared.block_requirements import BlockRequirements
 from shared.logging_config import QuipFormatter
 
@@ -43,6 +45,12 @@ class MiningResult:
     edge_list: List[Tuple[int, int]]
     variable_order: Optional[List[int]] = None
 
+@dataclass
+class IsingSample:
+    nonce: int
+    salt: bytes
+    sampleset: dimod.SampleSet
+
 class Sampler(Protocol):
     """Protocol defining the D-Wave sampler interface."""
     nodelist: List[Variable]
@@ -57,13 +65,9 @@ class Sampler(Protocol):
         h: Union[Mapping[Variable, Bias], Sequence[Bias]],
         J: Mapping[Tuple[Variable, Variable], Bias],
         **kwargs
-    ) -> Any:
+    ) -> dimod.SampleSet:
         ...
 from shared.quantum_proof_of_work import (
-    calculate_hamming_distance as _shared_hamming,
-    calculate_diversity as _shared_diversity,
-    filter_diverse_solutions as _shared_filter,
-    generate_ising_model_from_nonce,
     energy_of_solution,
 )
 from shared.logging_config import get_logger, init_component_logger
@@ -160,9 +164,6 @@ class BaseMiner(ABC):
         self.current_stage: Optional[str] = None
         self.current_stage_start: Optional[float] = None
 
-        # Track top 3 mining results
-        self.top_results: List[MiningResult] = []
-
         # Adaptive parameters for performance tuning
         # Initialize num_sweeps based on miner ID for SA miners
         initial_sweeps = 512
@@ -177,30 +178,19 @@ class BaseMiner(ABC):
         }
 
         # Track top 3 mining results
-        self.top_results: List[MiningResult] = []
+        self.top_attempts: List[IsingSample] = []
 
 
-    def update_top_results(self, result: MiningResult, requirements: BlockRequirements):
+    def update_top_samples(self, sampleset: dimod.SampleSet, nonce: int, salt: bytes, requirements: BlockRequirements):
         """Update the top 3 results list with a new mining result."""
 
         # Add current result
-        self.top_results.append(result)
-
-        # Sort by quality using the comparison function
-        def sort_key(r):
-            # Create a dummy result to compare against for sorting
-            dummy = MiningResult(
-                miner_id="", miner_type="", nonce=0, salt=b"", timestamp=0, prev_timestamp=0,
-                solutions=[], energy=float('inf'), diversity=0.0, num_valid=0,
-                mining_time=0.0, node_list=[], edge_list=[]
-            )
-            comparison = compare_mining_results(r, dummy, requirements)
-            return comparison
-
-        self.top_results.sort(key=sort_key)
+        attempt = IsingSample(nonce, salt, sampleset)
+        self.top_attempts.append(attempt)
+        self.top_attempts.sort(key=lambda r: compare_mining_samples(r, attempt, requirements))
 
         # Keep only top 3
-        self.top_results = self.top_results[:3]
+        self.top_attempts = self.top_attempts[:3]
 
     def capture_partial_timing(self):
         """Capture timing for current mining attempt, including partial progress."""
@@ -337,7 +327,7 @@ class BaseMiner(ABC):
         return stats
 
 
-def compare_mining_results(result_a: MiningResult, result_b: MiningResult, requirements: BlockRequirements) -> int:
+def compare_mining_samples(sample_a: IsingSample, sample_b: IsingSample, requirements: BlockRequirements) -> int:
     """
     Compare two mining results to determine which is better.
 
@@ -347,43 +337,32 @@ def compare_mining_results(result_a: MiningResult, result_b: MiningResult, requi
          1 if B is better than A
 
     Comparison logic:
-    1. Higher num_valid_solutions is better
-    2. If equal (or both 0), compare average of top N solution energies
+    1. Compare average of top N energies
        where N = requirements.min_solutions
-    3. If still equal, compare overall average solution energy
+    2. If still equal, compare overall average solution energy
     """
-    # 1. Compare number of valid solutions (higher is better)
-    if result_a.num_valid > result_b.num_valid:
+
+    # 1. Compare average of top N solution energies
+    a_energies = list(sample_a.sampleset.record.energy)
+    b_energies = list(sample_b.sampleset.record.energy)
+    n_energies = min(requirements.min_solutions, len(a_energies), len(b_energies))
+    if n_energies > 0:
+        energies_a = a_energies[:n_energies]
+        energies_b = b_energies[:n_energies]
+        avg_energy_a = np.mean(energies_a)
+        avg_energy_b = np.mean(energies_b)
+
+        if avg_energy_a < avg_energy_b:  # Lower energy is better
+            return -1
+        elif avg_energy_b < avg_energy_a:
+            return 1
+
+    # 2. If still equal, compare overall best energy (lower is better)
+    best_energy_a = min(a_energies)
+    best_energy_b = min(b_energies)
+    if best_energy_a < best_energy_b:
         return -1
-    elif result_b.num_valid > result_a.num_valid:
-        return 1
-
-    # 2. If equal (or both 0), compare average of top N solution energies
-    if result_a.num_valid > 0 and result_b.num_valid > 0:
-        # Generate Ising models for both results
-        h_a, J_a = generate_ising_model_from_nonce(result_a.nonce, result_a.node_list, result_a.edge_list)
-        h_b, J_b = generate_ising_model_from_nonce(result_b.nonce, result_b.node_list, result_b.edge_list)
-
-        # Calculate energies for top N solutions
-        n_solutions = min(requirements.min_solutions, len(result_a.solutions), len(result_b.solutions))
-        if n_solutions > 0:
-            energies_a = [energy_of_solution(sol, h_a, J_a, result_a.node_list)
-                         for sol in result_a.solutions[:n_solutions]]
-            energies_b = [energy_of_solution(sol, h_b, J_b, result_b.node_list)
-                         for sol in result_b.solutions[:n_solutions]]
-
-            avg_energy_a = np.mean(energies_a)
-            avg_energy_b = np.mean(energies_b)
-
-            if avg_energy_a < avg_energy_b:  # Lower energy is better
-                return -1
-            elif avg_energy_b < avg_energy_a:
-                return 1
-
-    # 3. If still equal, compare overall best energy (lower is better)
-    if result_a.energy < result_b.energy:
-        return -1
-    elif result_b.energy < result_a.energy:
+    elif best_energy_b < best_energy_a:
         return 1
 
     return 0  # Equal
