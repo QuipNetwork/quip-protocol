@@ -461,7 +461,7 @@ class NetworkNode(Node):
                     proc_ms = (t1 - t0) * 1000.0
                     qsize = self.gossip_processing_queue.qsize()
                     wait_str = f"{wait_ms:.1f} ms" if wait_ms is not None else "n/a"
-                    self.logger.info(
+                    self.logger.debug(
                         f"🧩 Gossip handled id={(message.id or '')[:8]} type={message.type}: wait={wait_str}, process={proc_ms:.1f} ms, qsize={qsize}"
                     )
                     response_future.set_result(result)
@@ -571,7 +571,7 @@ class NetworkNode(Node):
                 break
             tries += 1
             if tries > 3:
-                logging.warning("Unable to get latest block header from peers, assuming we are synchronized")
+                self.logger.warning("Unable to get latest block header from peers, assuming we are synchronized")
                 return 0
             await asyncio.sleep(1)
 
@@ -585,7 +585,7 @@ class NetworkNode(Node):
                 self.set_synchronized()
                 return 0
             else:
-                logging.warning("Latest block prev_hash mismatch, need to synchronize")
+                self.logger.warning("Latest block prev_hash mismatch, need to synchronize")
 
         return net_latest.index
 
@@ -600,32 +600,38 @@ class NetworkNode(Node):
             return
 
         my_latest_block = self.get_latest_block()
-        start_index = my_latest_block.header.index
+        start_index = max(1, my_latest_block.header.index)
         end_index = current_head
         if start_index > end_index:
             return
 
         self.logger.info(f"Syncing chain from {start_index} to {end_index}...")
+        peers = list(self.peers.keys())
         for block_number in range(start_index, end_index + 1):
             block = None
             tries = 0
             backoff_sleep = 0.5
             while not block:
-                if tries > 3:
-                    raise RuntimeError(f"Failed to get block {block_number} from any peer")
-                random_peer = random.choice(list(self.peers.keys()))
-                block = await self.get_peer_block(random_peer, block_number)
-                if not block:
-                    await asyncio.sleep(backoff_sleep * (tries + 1))
-                    continue
+                if tries > 3 or len(peers) == 0:
+                    raise RuntimeError(f"Failed to get block {block_number} from any peer, {tries} tries, {len(peers)} peers remaining")
+                # Pop of queue first, otherwise fetch
+                if block_number in self.sync_block_cache:
+                    block = self.sync_block_cache.pop(block_number)
+                else:
+                    random_peer = random.choice(peers)
+                    block = await self.get_peer_block(random_peer, block_number)
+                    if not block:
+                        tries += 1
+                        peers.remove(random_peer)
+                        await asyncio.sleep(backoff_sleep * (tries + 1))
+                        continue
                 status = await self.receive_block(block)
                 if not status:
-                    self.logger.warning(f"Failed to add block {block_number} from {random_peer}")
+                    self.logger.warning(f"Failed to add block {block_number} from {block.miner_info.miner_id}")
                     block = None
                     tries += 1
                     await asyncio.sleep(backoff_sleep * (tries + 1))
                     continue
-                self.logger.info(f"Added block {block_number} from {random_peer}")
 
     async def is_connected(self) -> bool:
         """Ensure we are connected to the network."""
@@ -739,13 +745,13 @@ class NetworkNode(Node):
                 if resp.status == 200:
                     return await resp.json()
                 else:
-                    logging.debug(f"Failed to get status from {host}: HTTP {resp.status}")
+                    self.logger.debug(f"Failed to get status from {host}: HTTP {resp.status}")
                     return None
         except asyncio.TimeoutError:
-            logging.debug(f"Failed to get status from {host}: Timeout")
+            self.logger.debug(f"Failed to get status from {host}: Timeout")
             return None
         except Exception:
-            logging.debug(f"Error getting status from {host}")
+            self.logger.debug(f"Error getting status from {host}")
             return None
 
     async def get_peer_block(self, host: str, block_number: int = 0) -> Optional[Block]:
@@ -769,7 +775,7 @@ class NetworkNode(Node):
                     headers_ms = (t_headers - t0) * 1000.0
                     body_ms = (t_done - t_headers) * 1000.0
                     total_ms = (t_done - t0) * 1000.0
-                    self.logger.info(f"📥 Downloaded block {block_index} from {host}: {bytes_received} bytes in {total_ms:.1f} ms (headers {headers_ms:.1f} ms, body {body_ms:.1f} ms) url={url}")
+                    self.logger.debug(f"📥 Downloaded block {block_index} from {host}: {bytes_received} bytes in {total_ms:.1f} ms (headers {headers_ms:.1f} ms, body {body_ms:.1f} ms) url={url}")
                     return block
                 else:
                     self.logger.debug(f"Failed to get block from {host}: HTTP {resp.status} url={url}")
@@ -804,7 +810,7 @@ class NetworkNode(Node):
                     headers_ms = (t_headers - t0) * 1000.0
                     body_ms = (t_done - t_headers) * 1000.0
                     total_ms = (t_done - t0) * 1000.0
-                    self.logger.info(
+                    self.logger.debug(
                         f"📥 Downloaded block header {header.index} from {host}: {bytes_received} bytes in {total_ms:.1f} ms (headers {headers_ms:.1f} ms, body {body_ms:.1f} ms) url={url}"
                     )
                     return header
@@ -871,7 +877,7 @@ class NetworkNode(Node):
                 total_ms = (t_done - t0) * 1000.0
                 ok = resp.status == 200
                 if ok:
-                    self.logger.info(
+                    self.logger.debug(
                         f"📨 Gossip to {host} type={message.type} id={(message.id or '')[:8]}: {bytes_sent} bytes in {total_ms:.1f} ms (headers {headers_ms:.1f} ms, body {body_ms:.1f} ms) url={url}"
                     )
                 else:
@@ -905,7 +911,7 @@ class NetworkNode(Node):
         await self.gossip_broadcast(message, target_count)
         t1 = time.perf_counter()
         total_ms = (t1 - t0) * 1000.0
-        self.logger.info(
+        self.logger.debug(
             f"🗣️ Originated gossip type={message.type} id={message.id[:8]} to {target_count} peers: payload={len(message.data or b'')} bytes in {total_ms:.1f} ms"
         )
 
@@ -966,7 +972,7 @@ class NetworkNode(Node):
         )
 
         # Log byte count for gossiped block
-        logging.info(f"📤 Gossiped block {block_data.header.index}: {bytes_sent} bytes")
+        self.logger.debug(f"📤 Gossiped block {block_data.header.index}: {bytes_sent} bytes")
 
         await self.gossip(message)
 
@@ -1007,6 +1013,7 @@ class NetworkNode(Node):
             # Don't rebroadcast if we reject or are synchronizing
             if not self.synchronized:
                 self.sync_block_cache[block.header.index] = block
+                return "ok"
             if not await self.receive_block(block):
                 return "rejected"
 
