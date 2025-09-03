@@ -63,6 +63,8 @@ from shared.quantum_proof_of_work import (
     calculate_hamming_distance as _shared_hamming,
     calculate_diversity as _shared_diversity,
     filter_diverse_solutions as _shared_filter,
+    generate_ising_model_from_nonce,
+    energy_of_solution,
 )
 from shared.logging_config import get_logger, init_component_logger
 
@@ -123,7 +125,6 @@ class BaseMiner(ABC):
 
     def _configure_child_logging(self):
         """Configure logging for child processes."""
-        from shared.logging_config import QuipFormatter
         formatter_class = QuipFormatter
 
         root_logger = logging.getLogger()
@@ -350,9 +351,6 @@ def compare_mining_results(result_a: MiningResult, result_b: MiningResult, requi
        where N = requirements.min_solutions
     3. If still equal, compare overall average solution energy
     """
-    # Import here to avoid circular imports
-    from shared.quantum_proof_of_work import generate_ising_model_from_nonce, energy_of_solution
-
     # 1. Compare number of valid solutions (higher is better)
     if result_a.num_valid > result_b.num_valid:
         return -1

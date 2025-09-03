@@ -30,6 +30,7 @@ from shared.node import Node
 from shared.network_node import NetworkNode
 from shared.block import load_genesis_block
 from shared.version import get_version
+from shared.logging_config import setup_logging
 
 
 def _load_config(path: Optional[str]) -> Dict[str, Any]:
@@ -169,8 +170,6 @@ def _apply_global_overrides(conf: Dict[str, Any],
 async def _async_run_network_node(config: Dict[str, Any], genesis_config_file: str) -> int:
     """Create NetworkNode with genesis, start server/tasks, and run until Ctrl-C."""
     # Setup logging before creating NetworkNode
-    from shared.logging_config import setup_logging
-
     log_level = config.get("log_level", "INFO")
     node_log_file = config.get("node_log")
     http_log_file = config.get("http_log")

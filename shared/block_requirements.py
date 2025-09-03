@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+from shared.quantum_proof_of_work import calculate_requirements_decay
+
 
 @dataclass
 class BlockRequirements:
@@ -66,7 +68,8 @@ class BlockRequirements:
 def compute_current_requirements(
     initial_requirements: BlockRequirements,
     prev_timestamp: int,
-    logger: Optional[logging.Logger] = None
+    logger: Optional[logging.Logger] = None,
+    current_time: Optional[int] = None
 ) -> BlockRequirements:
     """
     Compute current block requirements with timeout-based difficulty decay applied.
@@ -79,9 +82,9 @@ def compute_current_requirements(
     Returns:
         BlockRequirements with decay applied if elapsed time warrants it
     """
-    from shared.quantum_proof_of_work import calculate_requirements_decay
 
-    current_time = int(time.time())
+    if current_time is None:
+        current_time = int(time.time())
 
     if initial_requirements.timeout_to_difficulty_adjustment_decay <= 0:
         return initial_requirements

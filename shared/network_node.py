@@ -103,7 +103,7 @@ class Message:
 
     def to_network(self) -> bytes:
         """Serialize message to binary: [u16 type][u16 sender][f64 ts][u16 id][u32 data_len][data]."""
-        import struct as _st
+        _st = struct
         def _u16(n: int) -> bytes: return _st.pack('!H', max(0, min(int(n), 0xFFFF)))
         def _u32(n: int) -> bytes: return _st.pack('!I', max(0, min(int(n), 0xFFFFFFFF)))
         def _f64(x: float) -> bytes: return _st.pack('!d', float(x))
@@ -122,7 +122,7 @@ class Message:
     @classmethod
     def from_network(cls, data: bytes) -> 'Message':
         """Deserialize message from binary: [u16 type][u16 sender][f64 ts][u16 id][u32 data_len][data]."""
-        import struct as _st
+        _st = struct
         def _r_u16(buf: bytes, o: int): return _st.unpack('!H', buf[o:o+2])[0], o+2
         def _r_u32(buf: bytes, o: int): return _st.unpack('!I', buf[o:o+4])[0], o+4
         def _r_f64(buf: bytes, o: int): return _st.unpack('!d', buf[o:o+8])[0], o+8
@@ -299,7 +299,7 @@ class NetworkNode(Node):
         self.logger.info(f"Total active tasks: {len(all_tasks)}")
         for task in all_tasks:
             if not task.done():
-                self.logger.info(f"Active task: {task.get_coro().__name__}")
+                self.logger.info(f"Active task: {task.get_coro().__name__}") # type: ignore
 
         # Stop miner workers
         self.logger.info("Cancelling miner workers...")
@@ -550,8 +550,10 @@ class NetworkNode(Node):
 
         net_latest: Optional[BlockHeader] = None
         tries = 0
+        peers = list(self.peers.keys())
         while net_latest is None:
-            random_peer = random.choice(list(self.peers.keys()))
+            random_peer = random.choice(peers)
+            peers.remove(random_peer)
             header = await self.get_peer_block_header(random_peer)
             if header:
                 net_latest = header
@@ -926,7 +928,7 @@ class NetworkNode(Node):
         """Broadcast a new node to all known nodes.
         Data encoding: [u16 host_len][host utf-8][u32 info_len][info json utf-8]
         """
-        import struct as _st
+        _st = struct
         host_b = new_node_address.encode('utf-8')
         info_json = new_node_info.to_json().encode('utf-8')
         payload = _st.pack('!H', len(host_b)) + host_b + _st.pack('!I', len(info_json)) + info_json
@@ -968,7 +970,7 @@ class NetworkNode(Node):
             #       as that happens during gossip_broadcast.
 
         if message.type == "new_node":
-            import struct as _st
+            _st = struct
             o = 0
             if len(message.data) < 2:
                 return "rejected"

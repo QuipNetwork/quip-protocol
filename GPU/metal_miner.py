@@ -12,6 +12,7 @@ import numpy as np
 import json
 
 from shared.base_miner import BaseMiner, MiningResult
+from shared.block_requirements import compute_current_requirements
 from shared.quantum_proof_of_work import (
     calculate_diversity,
     filter_diverse_solutions,
@@ -20,6 +21,7 @@ from shared.quantum_proof_of_work import (
     energy_of_solution,
 )
 from GPU.metal_sampler import MetalSampler
+from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
 
 
 class MetalMiner(BaseMiner):
@@ -28,10 +30,9 @@ class MetalMiner(BaseMiner):
             sampler = MetalSampler("mps")
             super().__init__(miner_id, sampler, miner_type="GPU-MPS")
             self.miner_type = "GPU-MPS"
-            print(f"INFO: Using optimized MetalSampler (64 sweeps, ~13s mining time)")
+            self.logger.info(f"Using MetalSampler (MPS)")
         except Exception as e:
-            print(f"Metal GPU initialization failed, falling back to CPU: {e}")
-            from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
+            self.logger.warning(f"Metal GPU initialization failed, falling back to CPU: {e}")
             sampler = SimulatedAnnealingStructuredSampler()
             super().__init__(miner_id, sampler, miner_type="CPU-FALLBACK")
             self.miner_type = "CPU-FALLBACK"
@@ -72,14 +73,13 @@ class MetalMiner(BaseMiner):
         min_solutions = requirements.min_solutions
 
         # Apply difficulty decay based on elapsed time since previous block
-        from shared.block_requirements import compute_current_requirements
         current_requirements = compute_current_requirements(requirements, prev_timestamp, self.logger)
         difficulty_energy = current_requirements.difficulty_energy
         min_diversity = current_requirements.min_diversity
         min_solutions = current_requirements.min_solutions
 
         params = adapt_parameters(difficulty_energy, min_diversity, min_solutions)
-        self.logger.debug(f"Adaptive params: {params}")
+        self.logger.info(f"{self.miner_id} - Adaptive params: {params}")
         
         # Get topology information from sampler
         nodes = self.sampler.nodes
@@ -137,7 +137,7 @@ class MetalMiner(BaseMiner):
                 # CPU uses 4096, GPU uses 512, Metal uses 64 as reasonable middle ground
                 num_sweeps = params.get('num_sweeps', 64)
                 if self.sampler.sampler_type == "metal":
-                    print(f"[METAL] Using {num_sweeps} sweeps (optimized for MPS performance)")
+                    self.logger.debug(f"Using {num_sweeps} sweeps (optimized for MPS performance)")
                 num_reads = params.get('num_reads', 100)
                 
                 sample_start = time.time()
@@ -158,7 +158,7 @@ class MetalMiner(BaseMiner):
                 # Metal performance info
                 if self.sampler.sampler_type == "metal":
                     energies = sampleset.data_vectors['energy']
-                    print(f"[METAL] Sampling completed: {sample_time:.2f}s, energy range: {min(energies):.1f} to {max(energies):.1f}")
+                    self.logger.debug(f"Sampling completed: {sample_time:.2f}s, energy range: {min(energies):.1f} to {max(energies):.1f}")
                 
                 # Estimate Metal timing components
                 self.timing_stats['sampling'].append(sample_time * 1e6)  # Convert to microseconds
@@ -188,9 +188,9 @@ class MetalMiner(BaseMiner):
             best_energy = float(np.min(all_energies)) if len(all_energies) > 0 else float('inf')
             num_below_threshold = len(valid_indices)
             
-            print(f"[METAL] Attempt {progress + 1}: nonce={nonce}")
-            print(f"[METAL]   Samples: {len(all_energies)}, Best energy: {best_energy:.1f}")
-            print(f"[METAL]   Below threshold ({difficulty_energy:.1f}): {num_below_threshold} samples")
+            self.logger.debug(f"Attempt {progress + 1}: nonce={nonce}")
+            self.logger.debug(f"  Samples: {len(all_energies)}, Best energy: {best_energy:.1f}")
+            self.logger.debug(f"  Below threshold ({difficulty_energy:.1f}): {num_below_threshold} samples")
             
             # Update sample counts
             self.timing_stats['total_samples'] += len(sampleset.record.energy)
@@ -217,10 +217,10 @@ class MetalMiner(BaseMiner):
                 # Recalculate diversity after filtering
                 final_diversity = calculate_diversity(filtered_solutions)
                 
-                print(f"[METAL]   → Sufficient samples found! Processing...")
-                print(f"[METAL]   → Unique solutions: {len(valid_solutions)}")
-                print(f"[METAL]   → Initial diversity: {diversity:.3f}")
-                print(f"[METAL]   → Final diversity: {final_diversity:.3f} (need {min_diversity:.3f})")
+                self.logger.debug(f"  → Sufficient samples found! Processing...")
+                self.logger.debug(f"  → Unique solutions: {len(valid_solutions)}")
+                self.logger.debug(f"  → Initial diversity: {diversity:.3f}")
+                self.logger.debug(f"  → Final diversity: {final_diversity:.3f} (need {min_diversity:.3f})")
                 
                 self.logger.info(f"Found sufficient solutions! Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}, Diversity: {diversity:.3f}, Final Diversity: {final_diversity:.3f}")
 
@@ -239,7 +239,7 @@ class MetalMiner(BaseMiner):
                         miner_type=self.miner_type,
                         nonce=nonce,
                         salt=salt,
-                        timestamp=timestamp,
+                        timestamp=int(time.time()),
                         prev_timestamp=prev_timestamp,
                         solutions=filtered_solutions,
                         energy=min_energy,
@@ -252,7 +252,7 @@ class MetalMiner(BaseMiner):
                     )
 
                     result_queue.put(result)
-                    print(f"[METAL] ✅ BLOCK FOUND! Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
+                    self.logger.info(f"BLOCK FOUND! Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
                     self.logger.info(f"Found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
 
                     # Log mining attempt results
@@ -263,9 +263,9 @@ class MetalMiner(BaseMiner):
 
                     return result
                 else:
-                    print(f"[METAL]   ❌ Insufficient diversity: {final_diversity:.3f} < {min_diversity:.3f}")
+                    self.logger.debug(f"  ❌ Insufficient diversity: {final_diversity:.3f} < {min_diversity:.3f}")
             else:
-                print(f"[METAL]   → Not enough samples below threshold (need {min_solutions}, got {num_below_threshold})")
+                self.logger.debug(f"  → Not enough samples below threshold (need {min_solutions}, got {num_below_threshold})")
 
             progress += 1
 
@@ -277,14 +277,14 @@ class MetalMiner(BaseMiner):
         # If we exit the loop due to stop event or completion
         total_time = time.time() - start_time
         if stop_event.is_set():
-            print(f"[METAL] ⏹️ Mining stopped after {progress} attempts ({total_time:.1f}s)")
+            self.logger.debug(f"Mining stopped after {progress} attempts ({total_time:.1f}s)")
             if self.top_results:
                 best_result = self.top_results[0]
                 self.logger.info(f"Stopping mining, best result was - Energy: {best_result.energy:.2f}, Valid Solutions: {best_result.num_valid}, Diversity: {best_result.diversity:.3f}")
             else:
                 self.logger.info("Stopping mining, no results found")
         else:
-            print(f"[METAL] ⏰ Mining completed: {progress} attempts, {total_time:.1f}s, no valid block found")
+            self.logger.debug(f"Mining completed: {progress} attempts, {total_time:.1f}s, no valid block found")
         return None
     
 

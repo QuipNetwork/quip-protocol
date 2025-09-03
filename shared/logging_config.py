@@ -14,7 +14,7 @@ import logging.handlers
 import multiprocessing as mp
 import sys
 from datetime import datetime
-from logging.handlers import QueueListener
+from logging.handlers import QueueListener, QueueHandler
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 
@@ -263,8 +263,6 @@ def setup_multiprocess_logging() -> Tuple[mp.Queue, QueueListener]:
     Returns:
         Tuple of (log_queue, listener) for multiprocessing logging.
     """
-    from logging.handlers import QueueHandler, QueueListener
-
     # Create queue for inter-process communication
     log_queue = mp.Queue()
 

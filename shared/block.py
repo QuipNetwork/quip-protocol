@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from shared.quantum_proof_of_work import calculate_diversity, generate_ising_model_from_nonce, ising_nonce_from_block, energies_for_solutions
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce, calculate_diversity
 from shared.quantum_proof_of_work import calculate_requirements_decay
-from shared.block_requirements import BlockRequirements
+from shared.block_requirements import BlockRequirements, compute_current_requirements
 from shared.logging_config import get_logger
 
 # Initialize logger
@@ -487,8 +487,21 @@ class Block:
             return False
         
         # Apply timeout-based difficulty decay based on elapsed time since previous block
-        from shared.block_requirements import compute_current_requirements
-        requirements = compute_current_requirements(requirements, previous_block.header.timestamp, logger)
+        if previous_block.header.index > 0:
+            requirements = compute_current_requirements(requirements, previous_block.header.timestamp, logger, self.header.timestamp)
+
+        #Validate the timestamps in the block. 
+        cur_time = int(time.time())
+        if self.header.timestamp < previous_block.header.timestamp:
+            logger.error(f"Block {self.header.index} rejected: timestamp {self.header.timestamp} < previous block timestamp {previous_block.header.timestamp}")
+            return False
+        if self.header.timestamp > cur_time:
+            logger.error(f"Block {self.header.index} rejected: timestamp {self.header.timestamp} > current time {cur_time}")
+            return False
+        min_gap = self.header.timestamp - (self.header.timestamp - self.quantum_proof.mining_time)
+        if (self.header.timestamp - min_gap) < previous_block.header.timestamp:
+            logger.error(f"Block {self.header.index} rejected: timestamp {self.header.timestamp} - min_gap {min_gap} <= previous block timestamp {previous_block.header.timestamp}")
+            return False
 
         # Validate quantum proof against (possibly decayed) requirements
         return self._validate_quantum_proof(self.miner_info.miner_id, requirements)

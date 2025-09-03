@@ -117,8 +117,8 @@ def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any]):
             prev_block = msg.get("block")
             requirements = msg.get("requirements")
             node_info = msg.get("node_info")
-            prev_timestamp = msg.get("prev_timestamp", 0)
-            if prev_block is None or requirements is None or node_info is None:
+            prev_timestamp = msg.get("prev_timestamp")
+            if prev_block is None or requirements is None or node_info is None or prev_timestamp is None:
                 resp_q.put({"op": "error", "message": "Missing node_info, block or requirements", "id": spec.get("id")})
                 continue
             current_stop = mp.Event()

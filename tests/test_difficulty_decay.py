@@ -2,6 +2,7 @@ import time
 
 from shared.block import Block, BlockHeader, MinerInfo, QuantumProof
 from shared.block_requirements import BlockRequirements
+from shared.quantum_proof_of_work import calculate_requirements_decay
 
 
 def make_prev_and_cur_blocks(requirements: BlockRequirements, gap_seconds: int):
@@ -63,7 +64,6 @@ def test_decay_one_step_applied():
     expected_solutions = max(10, int(20 * (1 - 0.10)))
 
     # Build decayed requirements like validator does
-    from shared.quantum_proof_of_work import calculate_requirements_decay
     cur_req = req.to_json()
     cur_req = calculate_requirements_decay(cur_req)
 
@@ -80,7 +80,6 @@ def test_decay_multiple_steps_flooring():
     cur.validate_block(prev)
 
     # Apply four steps manually and verify floors
-    from shared.quantum_proof_of_work import calculate_requirements_decay
     cur_req = req.to_json()
     for _ in range(4):
         cur_req = calculate_requirements_decay(cur_req)

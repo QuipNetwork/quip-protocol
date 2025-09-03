@@ -56,11 +56,6 @@ class SimulatedAnnealingMiner(BaseMiner):
         self.current_round_attempted = True
         self.logger.info(f"Mining block {cur_index}...")
 
-        # Extract requirements from BlockRequirements object
-        difficulty_energy = requirements.difficulty_energy
-        min_diversity = requirements.min_diversity
-        min_solutions = requirements.min_solutions
-
         # Apply difficulty decay based on elapsed time since previous block
         current_requirements = compute_current_requirements(requirements, prev_timestamp, self.logger)
         difficulty_energy = current_requirements.difficulty_energy
@@ -88,7 +83,6 @@ class SimulatedAnnealingMiner(BaseMiner):
             
             # Generate quantum model using deterministic block-based seeding
             # Use 64 variables to match original working energy scale
-            timestamp = int(time.time())
             nonce = ising_nonce_from_block(prev_block.hash, node_info.miner_id, cur_index, salt)
             h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
 
@@ -204,7 +198,7 @@ class SimulatedAnnealingMiner(BaseMiner):
                              miner_type=self.miner_type,
                              nonce=nonce,
                              salt=salt,
-                             timestamp=timestamp,
+                             timestamp=int(time.time()),
                              prev_timestamp=prev_timestamp,
                              solutions=filtered_solutions,
                              energy=min_energy,

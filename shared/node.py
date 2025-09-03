@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 from shared import block
 from shared.block_signer import BlockSigner
 from shared.block import Block, BlockHeader, MinerInfo
-from shared.block_requirements import BlockRequirements
+from shared.block_requirements import BlockRequirements, compute_current_requirements
 from shared.miner import Miner, MiningResult
 from shared.logging_config import init_component_logger
 # Global logger for this module (set during Node initialization)
@@ -86,7 +86,6 @@ class Node:
         }
 
         # Difficulty and network management
-        self.last_block_received_time = time.time()
         self.no_block_timeout = 1800  # 30 minutes in seconds
         self.difficulty_reduction_factor = 0.1
 
@@ -283,29 +282,6 @@ class Node:
             except Exception as e:
                 self.logger.error(f"Error in block_mined callback: {e}")
 
-    def check_and_adjust_difficulty_for_timeout(self):
-        """Check if no block has been received for 30 minutes and adjust difficulty."""
-        time_since_last_block = time.time() - self.last_block_received_time
-
-        if time_since_last_block > self.no_block_timeout:
-            # Note: Difficulty parameters are now managed at block level, not miner level
-            # This method would need to be updated to adjust block-level difficulty parameters
-            self.logger.warning(f"Timeout-based difficulty adjustment needed after {time_since_last_block/60:.1f} minutes")
-            self.logger.info("  Note: Difficulty parameters are now managed at block level")
-            return True
-        return False
-
-    def adapt_parameters(self, network_stats: dict):
-        """Adapt all miners' parameters based on network performance."""
-        for miner in self.miners:
-            miner.adapt_parameters(network_stats)
-
-    def reset_block_received_time(self):
-        """Reset the last block received time when a new block is received."""
-        self.last_block_received_time = time.time()
-        # For persistent workers, nothing to notify here; miners read network state indirectly
-        # via difficulty adjustments before next round.
-
     def info(self) -> MinerInfo:
         """Get information about this node."""
         return MinerInfo(
@@ -352,9 +328,6 @@ class Node:
         start_time = time.time()
         self.timing_stats['total_blocks_attempted'] += 1
 
-        # Check for timeout-based difficulty adjustment
-        self.check_and_adjust_difficulty_for_timeout()
-
         self.logger.info(f"Starting mining with {len(handles)} miners...")
 
         # Emit mining started event
@@ -362,6 +335,8 @@ class Node:
 
         # Command all workers to start mining with full context
         prev_timestamp = previous_block.header.timestamp
+        if previous_block.header.index == 0:
+            prev_timestamp = int(start_time)
         for h in handles:
             h.mine(previous_block, self.info(), requirements, prev_timestamp)
 
@@ -524,6 +499,9 @@ class Node:
         prev_req = previous_block.next_block_requirements
         if not prev_req:
             raise ValueError("Previous block has no next block requirements")
+        
+        if previous_block.header.index > 0:
+            prev_req = compute_current_requirements(prev_req, previous_block.header.timestamp, self.logger, mining_result.timestamp)
 
         # Extract miner type from mining result
         current_winner = mining_result.miner_id.split('-')[1] if '-' in mining_result.miner_id else mining_result.miner_id

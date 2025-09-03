@@ -12,6 +12,7 @@ import numpy as np
 import json
 
 from shared.base_miner import BaseMiner, MiningResult
+from shared.block_requirements import compute_current_requirements
 from shared.quantum_proof_of_work import (
     calculate_diversity,
     filter_diverse_solutions,
@@ -64,7 +65,6 @@ class DWaveMiner(BaseMiner):
         min_solutions = requirements.min_solutions
 
         # Apply difficulty decay based on elapsed time since previous block
-        from shared.block_requirements import compute_current_requirements
         current_requirements = compute_current_requirements(requirements, prev_timestamp, self.logger)
         difficulty_energy = current_requirements.difficulty_energy
         min_diversity = current_requirements.min_diversity

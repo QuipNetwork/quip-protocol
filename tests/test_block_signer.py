@@ -49,9 +49,6 @@ class TestBlockSigner:
 
     def test_verify_ecdsa_signature_valid(self):
         """Test ECDSA signature verification with valid signature."""
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import ec
-
         signer = BlockSigner()
         message = b"test message"
         signature = signer.ecdsa_private_key.sign(
@@ -69,9 +66,6 @@ class TestBlockSigner:
 
     def test_verify_ecdsa_signature_invalid(self):
         """Test ECDSA signature verification with invalid signature."""
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import ec
-
         signer = BlockSigner()
         message = b"test message"
         wrong_message = b"wrong message"
