@@ -68,8 +68,10 @@ class Sampler(Protocol):
     ) -> dimod.SampleSet:
         ...
 from shared.quantum_proof_of_work import (
+    energies_for_solutions,
     energy_of_solution,
     calculate_diversity,
+    generate_ising_model_from_nonce,
     select_diverse_solutions,
 )
 from shared.logging_config import get_logger, init_component_logger
@@ -348,14 +350,22 @@ class BaseMiner(ABC):
             if best_energy > difficulty_energy:
                 raise ValueError(f"Best energy {best_energy} exceeds difficulty energy {difficulty_energy}")
                 
+
+            # NOTE: we use the same energy function to ensure consistency. Unfortunately
+            # it disagrees with energies created by different sampler impls, but not significantly.
+            solutions = list(sampleset.record.sample)
+            h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+            energies = np.array(energies_for_solutions(solutions, h, J, nodes))
+            best_energy = min(energies)
+
             # Process results from this mining attempt
             # Find all solutions meeting energy threshold
-            valid_indices = np.where(all_energies < difficulty_energy)[0]
+            valid_indices = np.where(energies < difficulty_energy)[0]
             # Get unique solutions that meet energy threshold
             valid_solutions = []
             seen = set()
             for idx in valid_indices:
-                solution = tuple(sampleset.record.sample[idx])
+                solution = tuple(solutions[idx])
                 if solution not in seen:
                     seen.add(solution)
                     valid_solutions.append(list(solution))
@@ -369,7 +379,7 @@ class BaseMiner(ABC):
                 selected_solutions_indices = select_diverse_solutions(valid_solutions, min_solutions)
                 filtered_solutions = [valid_solutions[i] for i in selected_solutions_indices]
                 final_diversity = calculate_diversity(filtered_solutions)
-                best_energy = min(all_energies[selected_solutions_indices])
+                best_energy = min(energies[selected_solutions_indices])
 
             if final_diversity < min_diversity:
                 raise ValueError(f"Insufficient diversity: {final_diversity} < {min_diversity}")
