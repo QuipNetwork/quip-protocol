@@ -91,6 +91,9 @@ def compute_current_requirements(
 
     elapsed = max(0, int((current_time - prev_timestamp) / initial_requirements.timeout_to_difficulty_adjustment_decay))
 
+    if logger:
+        logger.info(f"Elapsed time: {elapsed} steps ({current_time - prev_timestamp}s, {initial_requirements.timeout_to_difficulty_adjustment_decay}s per step)")
+
     if elapsed == 0:
         return initial_requirements
 

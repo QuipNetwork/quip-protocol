@@ -429,7 +429,7 @@ class Node:
         header = block.BlockHeader(
             previous_hash=previous_block.hash,
             index=previous_block.header.index + 1,
-            timestamp=mining_result.timestamp,
+            timestamp=int(time.time()),
             data_hash=blake3(block_data).digest()
         )
         miner_info = self.info()

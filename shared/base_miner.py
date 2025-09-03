@@ -311,7 +311,6 @@ class BaseMiner(ABC):
         node_info,
         requirements,
         prev_timestamp: int,
-        result_queue: multiprocessing.Queue,
         stop_event: multiprocessing.synchronize.Event,
     ) -> Optional[MiningResult]:
         """Abstract method for miner-specific mining implementation.
@@ -321,8 +320,10 @@ class BaseMiner(ABC):
             node_info: Node information containing miner_id and other details
             requirements: BlockRequirements object with difficulty settings
             prev_timestamp: Timestamp from the previous block header
-            result_queue: Multiprocessing queue for results
             stop_event: Multiprocessing event to signal stop
+
+        Returns:
+            MiningResult if successful, None if stopped or failed
         """
         pass
 

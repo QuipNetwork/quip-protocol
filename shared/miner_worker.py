@@ -122,7 +122,9 @@ def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any]):
                 resp_q.put({"op": "error", "message": "Missing node_info, block or requirements", "id": spec.get("id")})
                 continue
             current_stop = mp.Event()
-            miner.mine_block(prev_block, node_info, requirements, prev_timestamp, resp_q, current_stop)
+            result = miner.mine_block(prev_block, node_info, requirements, prev_timestamp, current_stop)
+            if result is not None:
+                resp_q.put(result)
         else:
             resp_q.put({"op": "error", "message": f"Unknown op {op}", "id": spec.get("id")})
             if log:

@@ -43,17 +43,19 @@ class MetalMiner(BaseMiner):
         node_info,
         requirements,
         prev_timestamp: int,
-        result_queue: multiprocessing.Queue,
         stop_event: multiprocessing.synchronize.Event,
     ) -> Optional[MiningResult]:
         """Mine a block using Metal/MPS GPU acceleration.
-        
+
         Args:
             prev_block: Previous block in the chain
             node_info: Node information containing miner_id and other details
             requirements: NextBlockRequirements object with difficulty settings
-            result_queue: Multiprocessing queue for results
+            prev_timestamp: Timestamp from the previous block header
             stop_event: Multiprocessing event to signal stop
+
+        Returns:
+            MiningResult if successful, None if stopped or failed
         """
         self.mining = True
         progress = 0  # Progress counter for logging
@@ -229,7 +231,7 @@ class MetalMiner(BaseMiner):
                 
                 # Check if diversity requirement is met
                 if final_diversity >= min_diversity and len(valid_solutions) >= min_solutions:
-                    mining_time = time.time() - start_time
+                    mining_time = int(time.time()) - int(start_time)
 
                     energies = [energy_of_solution(sol, h, J, nodes) for sol in filtered_solutions]
                     min_energy = float(min(energies)) if energies else 0.0
@@ -251,7 +253,6 @@ class MetalMiner(BaseMiner):
                         variable_order=nodes
                     )
 
-                    result_queue.put(result)
                     self.logger.info(f"BLOCK FOUND! Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
                     self.logger.info(f"Found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
 

@@ -6,9 +6,10 @@ import socket
 import sys
 import time
 import struct
+import threading
 
 from dataclasses import dataclass
-from typing import Dict, List, Set, Optional, Callable, Tuple
+from typing import Dict, Optional, Callable
 from datetime import datetime
 import aiohttp
 from aiohttp import web
@@ -258,7 +259,17 @@ class NetworkNode(Node):
         self.server_task = asyncio.create_task(self.server_loop())
 
         # have we fully synchronized with the network at least one time?
-        self.synchronized = False
+        self._synchronized = threading.Event()
+        self.sync_block_cache = {}  # Regular dict is thread-safe for simple assignments in CPython
+
+    @property
+    def synchronized(self) -> bool:
+        """Check if node is synchronized with the network."""
+        return self._synchronized.is_set()
+
+    def set_synchronized(self) -> None:
+        """Mark node as synchronized with the network."""
+        self._synchronized.set()
 
     async def stop(self):
         """Stop the P2P node."""
@@ -565,13 +576,13 @@ class NetworkNode(Node):
             await asyncio.sleep(1)
 
         if my_latest_block.header.index > net_latest.index:
-            self.synchronized = True
+            self.set_synchronized()
             return 0
-        
+
         if my_latest_block.header.index == net_latest.index:
             # FIXME: maybe put hash in header?
             if my_latest_block.header.previous_hash == net_latest.previous_hash and my_latest_block.header.timestamp == net_latest.timestamp:
-                self.synchronized = True
+                self.set_synchronized()
                 return 0
             else:
                 logging.warning("Latest block prev_hash mismatch, need to synchronize")
@@ -589,7 +600,7 @@ class NetworkNode(Node):
             return
 
         my_latest_block = self.get_latest_block()
-        start_index = my_latest_block.header.index + 1
+        start_index = my_latest_block.header.index
         end_index = current_head
         if start_index > end_index:
             return
@@ -993,7 +1004,9 @@ class NetworkNode(Node):
             if not message.data:
                 return "rejected, missing block data"
             block = Block.from_network(message.data)
-            # Don't rebroadcast if we reject
+            # Don't rebroadcast if we reject or are synchronizing
+            if not self.synchronized:
+                self.sync_block_cache[block.header.index] = block
             if not await self.receive_block(block):
                 return "rejected"
 

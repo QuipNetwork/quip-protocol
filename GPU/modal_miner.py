@@ -32,17 +32,19 @@ class ModalMiner(BaseMiner):
         node_info,
         requirements,
         prev_timestamp: int,
-        result_queue: multiprocessing.Queue,
         stop_event: multiprocessing.Event,
     ) -> Optional[MiningResult]:
         """Mine a block using Modal cloud GPU acceleration.
-        
+
         Args:
             prev_block: Previous block in the chain
             node_info: Node information containing miner_id and other details
             requirements: NextBlockRequirements object with difficulty settings
-            result_queue: Multiprocessing queue for results
+            prev_timestamp: Timestamp from the previous block header
             stop_event: Multiprocessing event to signal stop
+
+        Returns:
+            MiningResult if successful, None if stopped or failed
         """
         self.mining = True
         progress = 0  # Progress counter for logging
@@ -218,7 +220,6 @@ class ModalMiner(BaseMiner):
                         variable_order=nodes
                     )
 
-                    result_queue.put(result)
                     self.logger.info(f"Found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
 
                     # Log mining attempt results

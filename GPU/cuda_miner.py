@@ -14,6 +14,8 @@ import json
 from shared.base_miner import BaseMiner, MiningResult
 from shared.block_requirements import compute_current_requirements
 from shared.quantum_proof_of_work import (
+    calculate_diversity,
+    filter_diverse_solutions,
     ising_nonce_from_block,
     generate_ising_model_from_nonce,
     energy_of_solution,
@@ -33,17 +35,19 @@ class CudaMiner(BaseMiner):
         node_info,
         requirements,
         prev_timestamp: int,
-        result_queue: multiprocessing.Queue,
         stop_event: multiprocessing.synchronize.Event,
     ) -> Optional[MiningResult]:
         """Mine a block using CUDA GPU acceleration.
-        
+
         Args:
             prev_block: Previous block in the chain
             node_info: Node information containing miner_id and other details
             requirements: BlockRequirements object with difficulty settings
-            result_queue: Multiprocessing queue for results
+            prev_timestamp: Timestamp from the previous block header
             stop_event: Multiprocessing event to signal stop
+
+        Returns:
+            MiningResult if successful, None if stopped or failed
         """
         self.mining = True
         progress = 0  # Progress counter for logging
@@ -181,16 +185,16 @@ class CudaMiner(BaseMiner):
                         valid_solutions.append(list(solution))
 
                 # Calculate diversity
-                diversity = self.calculate_diversity(valid_solutions)
+                diversity = calculate_diversity(valid_solutions)
 
                 # Calculate diversity
                 min_energy = float(np.min(sampleset.record.energy))
 
                 # Filter excess solutions to maintain diversity
-                filtered_solutions = self.filter_diverse_solutions(valid_solutions, min_solutions)
+                filtered_solutions = filter_diverse_solutions(valid_solutions, min_solutions)
 
                 # Recalculate diversity after filtering
-                final_diversity = self.calculate_diversity(filtered_solutions)
+                final_diversity = calculate_diversity(filtered_solutions)
                 self.logger.info(f"Found sufficient solutions! Best energy: {min_energy:.2f}, Valid: {len(valid_indices)}, Diversity: {diversity:.3f}, Final Diversity: {final_diversity:.3f}")
 
                 # Track postprocessing time
@@ -198,7 +202,7 @@ class CudaMiner(BaseMiner):
                 
                 # Check if diversity requirement is met
                 if final_diversity >= min_diversity and len(valid_solutions) >= min_solutions:
-                    mining_time = time.time() - start_time
+                    mining_time = int(time.time()) - int(start_time)
                     min_energy = float(np.min(sampleset.record.energy[valid_indices]))
 
                     energies = [energy_of_solution(sol, h, J, nodes) for sol in filtered_solutions]
@@ -209,7 +213,7 @@ class CudaMiner(BaseMiner):
                         miner_type=self.miner_type,
                         nonce=nonce,
                         salt=salt,
-                        timestamp=timestamp,
+                        timestamp=int(time.time()),
                         prev_timestamp=prev_timestamp,
                         solutions=filtered_solutions,
                         energy=min_energy,
@@ -221,7 +225,6 @@ class CudaMiner(BaseMiner):
                         variable_order=nodes
                     )
 
-                    result_queue.put(result)
                     self.logger.info(f"Found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
 
                     # Log mining attempt results
