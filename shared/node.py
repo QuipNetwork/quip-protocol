@@ -355,6 +355,11 @@ class Node:
                     if msg is None:
                         continue
                     if hasattr(msg, 'miner_id') and hasattr(msg, 'solutions'):
+                        # Sometimes the miners finish a block from the last mine
+                        # so we drop those results.
+                        if (msg.prev_timestamp != prev_timestamp):
+                            self.logger.debug(f"Miner {msg.miner_id} returned result for wrong block timestamp {msg.prev_timestamp} (expected {prev_timestamp})")
+                            continue
                         result = msg
                         self._mining_stop_event.set()
                         break
