@@ -50,6 +50,20 @@ def _load_config(path: Optional[str]) -> Dict[str, Any]:
     return config
 
 
+def _print_final_config(config: Dict[str, Any], miner_type: str):
+    """Print the final configuration as JSON for debugging."""
+    # Create a clean copy for display
+    display_config = dict(config)
+
+    # Add metadata
+    display_config["_miner_type"] = miner_type
+    display_config["_config_source"] = "merged_toml_and_cli"
+
+    click.echo("Final configuration:")
+    click.echo(json.dumps(display_config, indent=2, default=str))
+    click.echo()
+
+
 def _merge_globals_from_toml(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Flatten [global] section of TOML into NetworkNode config keys.
     Leaves 'cpu', 'gpu', 'qpu' sections as-is.
@@ -210,8 +224,9 @@ def _run_network_node_sync(config: Dict[str, Any], genesis_config_file: str) -> 
 @click.group(invoke_without_command=True)
 @click.option("--config", type=click.Path(exists=True, dir_okay=False), help="Path to TOML config file")
 @click.option("--version", is_flag=True, help="Show version and exit")
+@click.option("--debug-config", is_flag=True, help="Print final configuration as JSON")
 @click.pass_context
-def quip_network_node(ctx: click.Context, config: Optional[str], version: bool):
+def quip_network_node(ctx: click.Context, config: Optional[str], version: bool, debug_config: bool):
     """Run a single quip network node.
 
     Subcommands: cpu, gpu, qpu
@@ -226,6 +241,7 @@ def quip_network_node(ctx: click.Context, config: Optional[str], version: bool):
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config
     ctx.obj["toml"] = _load_config(config)
+    ctx.obj["debug_config"] = debug_config
 
     if ctx.invoked_subcommand is None:
         cfg = ctx.obj.get("toml", {})
@@ -267,6 +283,7 @@ def quip_network_node(ctx: click.Context, config: Optional[str], version: bool):
 @click.option("--num-cpus", type=int, default=None, help="Number of CPU miners to spawn (default 1)")
 # Other
 @click.option("--genesis-config", type=str, default="genesis_block.json", show_default=True, help="Genesis block configuration file")
+@click.option("--debug-config", is_flag=True, help="Print final configuration as JSON")
 @click.pass_context
 def cpu(
     ctx: click.Context,
@@ -286,6 +303,7 @@ def cpu(
     http_log: Optional[str],
     num_cpus: Optional[int],
     genesis_config: str,
+    debug_config: bool,
 ):
     """Run a CPU-only network node (NetworkNode + Node persistent CPU miners)."""
     # Fix for CPU sampler trying to connect to DWave without credentials
@@ -293,19 +311,32 @@ def cpu(
         os.environ["DWAVE_API_KEY"] = "MISSING IN CONFIG"
     if "DWAVE_API_TOKEN" not in os.environ:
         os.environ["DWAVE_API_TOKEN"] = "MISSING IN CONFIG"
+
+    # Load full TOML config
     toml_cfg = (ctx.obj or {}).get("toml", {})
-    conf = _merge_globals_from_toml(toml_cfg)
+
+    # Filter to CPU-only by removing other miner sections
+    filtered_toml = dict(toml_cfg)
+    filtered_toml.pop("gpu", None)
+    filtered_toml.pop("qpu", None)
+
+    # Merge globals from filtered TOML
+    conf = _merge_globals_from_toml(filtered_toml)
+
+    # Apply CLI overrides (these take precedence)
     conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
 
-    # Ensure CPU-only
-    conf.pop("gpu", None)
-    conf.pop("qpu", None)
-    cpu_cfg = dict((conf.get("cpu") or {}))
+    # Handle CPU-specific configuration
+    cpu_cfg = dict((filtered_toml.get("cpu") or {}))
     if num_cpus is not None:
         cpu_cfg["num_cpus"] = int(num_cpus)
     if not cpu_cfg:
         cpu_cfg = {"num_cpus": 1}
     conf["cpu"] = cpu_cfg
+
+    # Print final configuration if requested
+    if debug_config or ctx.obj.get("debug_config", False):
+        _print_final_config(conf, "cpu")
 
     sys.exit(_run_network_node_sync(conf, genesis_config))
 
@@ -323,12 +354,17 @@ def cpu(
 @click.option("--heartbeat-interval", type=int, default=None, help="Seconds between heartbeats")
 @click.option("--heartbeat-timeout", type=int, default=None, help="Peer heartbeat timeout seconds")
 @click.option("--fanout", type=int, default=None, help="Gossip fanout")
+# Logging options
+@click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default=None, help="Logging level")
+@click.option("--node-log", type=str, default=None, help="Path to main node log file (defaults to stderr)")
+@click.option("--http-log", type=str, default=None, help="Path to HTTP log file or 'stderr'/'stdout' for console (suppresses aiohttp logs if not set)")
 # GPU options
 @click.option("--gpu-backend", type=click.Choice(["local", "modal", "mps"], case_sensitive=False), default=None, help="GPU backend: local|modal|mps")
 @click.option("--device", "devices", multiple=True, help="GPU device(s) for local backend (e.g., 0 1)")
 @click.option("--gpu-type", "gpu_types", multiple=True, help="GPU type(s) for modal backend (e.g., t4 a10g)")
 # Other
 @click.option("--genesis-config", type=str, default="genesis_block.json", show_default=True, help="Genesis block configuration file")
+@click.option("--debug-config", is_flag=True, help="Print final configuration as JSON")
 @click.pass_context
 def gpu(
     ctx: click.Context,
@@ -343,19 +379,32 @@ def gpu(
     heartbeat_interval: Optional[int],
     heartbeat_timeout: Optional[int],
     fanout: Optional[int],
+    log_level: Optional[str],
+    node_log: Optional[str],
+    http_log: Optional[str],
     gpu_backend: Optional[str],
     devices: List[str],
     gpu_types: List[str],
     genesis_config: str,
+    debug_config: bool,
 ):
     """Run a GPU-only network node."""
+    # Load full TOML config
     toml_cfg = (ctx.obj or {}).get("toml", {})
-    conf = _merge_globals_from_toml(toml_cfg)
+
+    # Filter to GPU-only by removing other miner sections
+    filtered_toml = dict(toml_cfg)
+    filtered_toml.pop("cpu", None)
+    filtered_toml.pop("qpu", None)
+
+    # Merge globals from filtered TOML
+    conf = _merge_globals_from_toml(filtered_toml)
+
+    # Apply CLI overrides
     conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout)
-    # Ensure GPU-only
-    conf.pop("cpu", None)
-    conf.pop("qpu", None)
-    gpu_cfg = dict((conf.get("gpu") or {}))
+
+    # Handle GPU-specific configuration
+    gpu_cfg = dict((filtered_toml.get("gpu") or {}))
     if gpu_backend is not None:
         gpu_cfg["backend"] = str(gpu_backend).lower()
     if devices:
@@ -365,6 +414,10 @@ def gpu(
     if not gpu_cfg:
         gpu_cfg = {"backend": "local"}
     conf["gpu"] = gpu_cfg
+
+    # Print final configuration if requested
+    if debug_config or ctx.obj.get("debug_config", False):
+        _print_final_config(conf, "gpu")
 
     sys.exit(_run_network_node_sync(conf, genesis_config))
 
@@ -382,12 +435,17 @@ def gpu(
 @click.option("--heartbeat-interval", type=int, default=None, help="Seconds between heartbeats")
 @click.option("--heartbeat-timeout", type=int, default=None, help="Peer heartbeat timeout seconds")
 @click.option("--fanout", type=int, default=None, help="Gossip fanout")
+# Logging options
+@click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default=None, help="Logging level")
+@click.option("--node-log", type=str, default=None, help="Path to main node log file (defaults to stderr)")
+@click.option("--http-log", type=str, default=None, help="Path to HTTP log file or 'stderr'/'stdout' for console (suppresses aiohttp logs if not set)")
 # QPU options
 @click.option("--dwave-api-key", type=str, default=None, help="D-Wave API key")
 @click.option("--dwave-api-solver", type=str, default=None, help="D-Wave solver name")
 @click.option("--dwave-region-url", type=str, default=None, help="D-Wave SAPI region endpoint URL")
 # Other
 @click.option("--genesis-config", type=str, default="genesis_block.json", show_default=True, help="Genesis block configuration file")
+@click.option("--debug-config", is_flag=True, help="Print final configuration as JSON")
 @click.pass_context
 def qpu(
     ctx: click.Context,
@@ -402,19 +460,32 @@ def qpu(
     heartbeat_interval: Optional[int],
     heartbeat_timeout: Optional[int],
     fanout: Optional[int],
+    log_level: Optional[str],
+    node_log: Optional[str],
+    http_log: Optional[str],
     dwave_api_key: Optional[str],
     dwave_api_solver: Optional[str],
     dwave_region_url: Optional[str],
     genesis_config: str,
+    debug_config: bool,
 ):
     """Run a QPU-only network node."""
+    # Load full TOML config
     toml_cfg = (ctx.obj or {}).get("toml", {})
-    conf = _merge_globals_from_toml(toml_cfg)
+
+    # Filter to QPU-only by removing other miner sections
+    filtered_toml = dict(toml_cfg)
+    filtered_toml.pop("cpu", None)
+    filtered_toml.pop("gpu", None)
+
+    # Merge globals from filtered TOML
+    conf = _merge_globals_from_toml(filtered_toml)
+
+    # Apply CLI overrides
     conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout)
-    # Ensure QPU-only
-    conf.pop("cpu", None)
-    conf.pop("gpu", None)
-    qpu_cfg = dict((conf.get("qpu") or {}))
+
+    # Handle QPU-specific configuration
+    qpu_cfg = dict((filtered_toml.get("qpu") or {}))
     if dwave_api_key is not None:
         qpu_cfg["dwave_api_key"] = dwave_api_key
     if dwave_api_solver is not None:
@@ -424,6 +495,10 @@ def qpu(
     if not qpu_cfg:
         qpu_cfg = {}
     conf["qpu"] = qpu_cfg
+
+    # Print final configuration if requested
+    if debug_config or ctx.obj.get("debug_config", False):
+        _print_final_config(conf, "qpu")
 
     sys.exit(_run_network_node_sync(conf, genesis_config))
 
