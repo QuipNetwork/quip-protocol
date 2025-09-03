@@ -221,14 +221,14 @@ def _calculate_set_diversity(indices: List[int], dist_matrix: np.ndarray) -> flo
     return total_dist / count if count > 0 else 0.0
 
 
-def filter_diverse_solutions(solutions: List[List[int]], target_count: int) -> List[List[int]]:
+def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> List[int]:
     """Filter solutions to maintain maximum diversity using farthest point sampling.
 
     Uses farthest point sampling with local search refinement.
     This method provides better diversity than pure greedy selection.
     """
     if len(solutions) <= target_count:
-        return solutions
+        return list(range(0, len(solutions)))
 
     n_solutions = len(solutions)
 
@@ -302,7 +302,7 @@ def filter_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
             if improved:
                 break
 
-    return [solutions[i] for i in selected_indices]
+    return selected_indices
 
 
 
