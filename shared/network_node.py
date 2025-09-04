@@ -406,7 +406,7 @@ class NetworkNode(Node):
                 # Wait for any outstanding blocks to be processed
                 if self.block_processing_queue.qsize() > 0:
                     self.logger.info(f"Waiting for {self.block_processing_queue.qsize()} blocks to be processed before mining...")
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.1)
                     continue
 
                 # Check if we are in synchronized state with peers
