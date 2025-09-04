@@ -180,11 +180,6 @@ class NetworkNode(Node):
         self.on_node_lost: Optional[Callable] = None
         self.on_block_received: Optional[Callable] = None
 
-        # Registered callback handlers from Node
-        self.on_block_mined = self._on_block_received
-        self.on_mining_started = self._network_on_mining_started
-        self.on_mining_stopped = self._network_on_mining_stopped
-
         # Web server
         # Allow large gossip payloads (e.g., full signed blocks encoded as hex in JSON)
         # Default to 64 MB unless overridden via config['client_max_size_mb']
@@ -206,12 +201,21 @@ class NetworkNode(Node):
         # Connection pooling for better performance
         self.http_session = None
 
+        # Reset mechanism state variables
+        self.reset_timer_task = None
+        self.reset_scheduled = False  
+        self.reset_start_time = None
+        self.genesis_block = genesis_block
+
         self.miners_config = {
             "cpu": config.get("cpu", None),
             "gpu": config.get("gpu", None),
             "qpu": config.get("qpu", None)
         }
-        super().__init__(self.node_name, self.miners_config, genesis_block, secret=self.secret)
+        super().__init__(self.node_name, self.miners_config, genesis_block, secret=self.secret,
+                         on_block_mined=self._on_block_received,
+                         on_mining_started=self._network_on_mining_started,
+                         on_mining_stopped=self._network_on_mining_stopped)
 
     def setup_routes(self):
         """Setup HTTP routes for P2P communication."""
@@ -290,6 +294,8 @@ class NetworkNode(Node):
             self.gossip_processor_task.cancel()
         if self.server_task:
             self.server_task.cancel()
+        if self.reset_timer_task:
+            self.reset_timer_task.cancel()
 
         self.logger.info("Cancelling HTTP session tasks...")
         # Close HTTP session
@@ -502,27 +508,83 @@ class NetworkNode(Node):
     ## Internal Event Handlers ##
     #############################
 
-    async def _on_new_node(self, host, info: MinerInfo):
+    def _on_new_node(self, host, info: MinerInfo):
         self.logger.info(f"New node joined: {host} {info.miner_id} ({info.ecdsa_public_key.hex()[:8]})")
         if self.on_new_node:
             asyncio.create_task(self.on_new_node(host, info))
 
-    async def _on_node_lost(self, host):
+    def _on_node_lost(self, host):
         self.logger.info(f"Node lost: {host}")
         if self.on_node_lost:
             asyncio.create_task(self.on_node_lost(host))
 
-    async def _on_block_received(self, block: Block):
-        self.logger.info(f"New block mined: {block.header.index}")
+    def _on_block_received(self, block: Block):       
+        # Check if we've reached block 1024 and need to initiate reset
+        if block.header.index == 1024 and not self.reset_scheduled:
+            self.logger.info("Block 1024 reached - starting 5-minute reset coordination timer")
+            self.reset_scheduled = True
+            self.reset_start_time = time.time()
+            
+            # Start the 5-minute reset timer
+            self.reset_timer_task = asyncio.create_task(self._reset_coordination_timer())
+        
         if self.on_block_received:
             asyncio.create_task(self.on_block_received(block))
 
-    async def _network_on_mining_started(self, prev: Block):
+    def _network_on_mining_started(self, prev: Block):
         self.logger.info(f"Mining started on block {prev.header.index + 1} with previous block hash {prev.hash}")
 
-    async def _network_on_mining_stopped(self):
+    def _network_on_mining_stopped(self):
         self.logger.info(f"🛑 Mining stopped")
 
+    #######################
+    ## Reset Coordination ##
+    #######################
+
+    async def _reset_coordination_timer(self):
+        """5-minute timer for reset coordination period."""
+        try:
+            # Execute the reset after timer expires
+            self.logger.info("Reset coordination period complete - executing chain reset in 5 minutes")
+
+            # Wait 5 minutes (300 seconds)
+            await asyncio.sleep(300)
+            
+            await self._execute_chain_reset()
+            
+        except asyncio.CancelledError:
+            self.logger.debug("Reset coordination timer cancelled")
+        except Exception as e:
+            self.logger.error(f"Error in reset coordination timer: {e}")
+
+    async def _execute_chain_reset(self):
+        """Execute the chain reset back to genesis block."""
+        try:
+            # Stop any active mining
+            if self._is_mining:
+                await self.stop_mining()
+                self.logger.info("Stopped mining for chain reset")
+            
+            # Reset blockchain state
+            async with self.chain_lock:
+                self.chain = [self.genesis_block]
+                self.logger.info("Chain reset to genesis block completed")
+            
+            # Reset synchronization state if it exists (only after start() is called)
+            if hasattr(self, '_synchronized'):
+                self._synchronized.clear()
+            if hasattr(self, 'sync_block_cache'):
+                self.sync_block_cache.clear()
+            
+            # Reset coordination state
+            self.reset_scheduled = False
+            self.reset_start_time = None
+            self.reset_timer_task = None
+            
+            self.logger.info("📄 Chain reset to genesis completed - resuming normal operation")
+            
+        except Exception as e:
+            self.logger.error(f"Error executing chain reset: {e}")
 
     #######################
     ## Control functions ##
@@ -711,7 +773,7 @@ class NetworkNode(Node):
 
             if is_new:
                 self.logger.info(f"New peer discovered: {host}: {info.miner_id} ({info.ecdsa_public_key.hex()[:8]})")
-                await self._on_new_node(host, info)
+                self._on_new_node(host, info)
 
                 # Broadcast new node to all other nodes
                 asyncio.create_task(self.gossip_new_node(host, info))
@@ -724,7 +786,7 @@ class NetworkNode(Node):
             if host in self.peers:
                 del self.peers[host]
                 self.logger.info(f"Node removed: {host}")
-                await self._on_node_lost(host)
+                self._on_node_lost(host)
 
     async def send_heartbeat(self, node_host: str) -> bool:
         """Send heartbeat to a specific node."""

@@ -1,6 +1,7 @@
 """Node class for quantum blockchain network participation."""
 
 import asyncio
+import inspect
 import json
 import logging
 import multiprocessing
@@ -9,7 +10,7 @@ import socket
 from queue import Empty
 import time
 from blake3 import blake3
-from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING, Callable
+from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING, Callable, Awaitable, Union
 from multiprocessing.synchronize import Event as EventType
 import aiohttp
 
@@ -34,9 +35,9 @@ class Node:
 
     def __init__(self, node_id: str, miners_config: Dict[str, Any], genesis_block: Block,
                  secret: Optional[str] = None,
-                 on_block_mined: Optional[Callable[[Block], None]] = None,
-                 on_mining_started: Optional[Callable[[Block], None]] = None,
-                 on_mining_stopped: Optional[Callable[[], None]] = None):
+                 on_block_mined: Optional[Callable] = None,
+                 on_mining_started: Optional[Callable] = None,
+                 on_mining_stopped: Optional[Callable] = None):
         """
         Initialize a blockchain node with multiple miners.
 
@@ -259,10 +260,10 @@ class Node:
         return True
 
     def _emit_mining_started(self, block: Block) -> None:
-        """Emit mining started event."""
+        """Async wrapper for mining started event."""
         if self.on_mining_started:
             try:
-                self.on_mining_started(block)
+                asyncio.create_task(self.on_mining_started(block))
             except Exception as e:
                 self.logger.error(f"Error in mining_started callback: {e}")
 
@@ -270,7 +271,7 @@ class Node:
         """Emit mining stopped event."""
         if self.on_mining_stopped:
             try:
-                self.on_mining_stopped()
+                asyncio.create_task(self.on_mining_stopped())
             except Exception as e:
                 self.logger.error(f"Error in mining_stopped callback: {e}")
 
@@ -278,7 +279,7 @@ class Node:
         """Emit block mined event."""
         if self.on_block_mined:
             try:
-                self.on_block_mined(block)
+                asyncio.create_task(self.on_block_mined(block))
             except Exception as e:
                 self.logger.error(f"Error in block_mined callback: {e}")
 
