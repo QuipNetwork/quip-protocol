@@ -265,7 +265,9 @@ class Node:
             # Accept the block
             self.chain.append(block)
 
-        self.logger.info(f"Accepted block {block.header.index} from {block.miner_info.miner_id}")
+        assert block.hash is not None
+
+        self.logger.info(f"Accepted block {block.header.index}-{block.hash.hex()[:8]} from {block.miner_info.miner_id}")
 
         # Emit an event so we can stop mining and potentially broadcast to other nodes
         asyncio.create_task(self._emit_block_mined(block))
