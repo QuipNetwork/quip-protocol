@@ -58,12 +58,12 @@ class BlockSynchronizer:
         num_producers = min(self.max_workers, len(self.node_client.peers), end_index - start_index + 1)
         num_producers = max(1, num_producers)  # At least 1 producer
         
+        producer_processes = []
         try:
             # Create shared data for worker processes
             peers_list = list(self.node_client.peers.keys())
             
             # Start producer processes
-            producer_processes = []
             self.logger.debug(f"🚀 Starting {num_producers} producer processes for concurrent downloads")
             for i in range(num_producers):
                 p = mp.Process(
@@ -76,20 +76,6 @@ class BlockSynchronizer:
                 
             # Run consumer in main process to handle block validation
             success = await self._consumer_async(completed_queue, start_index, end_index, download_queue)
-            
-            # Signal producers to stop and wait for them to finish
-            self.logger.debug("🛑 Signaling producer processes to stop")
-            for _ in range(num_producers):
-                download_queue.put(None)  # Sentinel value to stop producers
-                
-            for p in producer_processes:
-                p.join(timeout=30)  # Wait up to 30 seconds
-                if p.is_alive():
-                    self.logger.warning(f"⚠️ Force terminating producer process {p.pid}")
-                    p.terminate()
-                    p.join()
-                else:
-                    self.logger.debug(f"✅ Producer process {p.pid} stopped gracefully")
                     
             if success:
                 self.logger.debug(f"🎉 Successfully synced {total_blocks} blocks from {start_index} to {end_index}")
@@ -98,9 +84,45 @@ class BlockSynchronizer:
                     
             return success
             
+        except KeyboardInterrupt:
+            self.logger.warning("🛑 Block synchronization interrupted by user")
+            return False
         except Exception as e:
             self.logger.error(f"Block sync failed: {e}")
             return False
+        finally:
+            # Always cleanup producer processes
+            self.logger.debug("🛑 Signaling producer processes to stop")
+            for _ in range(num_producers):
+                try:
+                    download_queue.put(None)  # Sentinel value to stop producers
+                except:
+                    pass  # Queue might be full or closed
+                    
+            for p in producer_processes:
+                if p.is_alive():
+                    p.join(timeout=2)  # Short timeout for graceful shutdown
+                    if p.is_alive():
+                        self.logger.warning(f"⚠️ Force terminating producer process {p.pid}")
+                        p.terminate()
+                        p.join(timeout=1)
+                        if p.is_alive():
+                            self.logger.warning(f"🔥 Sending SIGKILL to producer process {p.pid}")
+                            try:
+                                import os
+                                os.kill(p.pid, 9)  # SIGKILL
+                                p.join(timeout=1)
+                                if p.is_alive():
+                                    self.logger.error(f"❌ Failed to kill producer process {p.pid}")
+                                else:
+                                    self.logger.debug(f"✅ Producer process {p.pid} killed")
+                            except (OSError, ProcessLookupError):
+                                # Process already dead
+                                self.logger.debug(f"✅ Producer process {p.pid} already terminated")
+                        else:
+                            self.logger.debug(f"✅ Producer process {p.pid} terminated gracefully")
+                    else:
+                        self.logger.debug(f"✅ Producer process {p.pid} stopped gracefully")
             
     @staticmethod
     def _producer_worker(download_queue: mp.Queue, 
@@ -117,8 +139,13 @@ class BlockSynchronizer:
             node_timeout: Timeout for HTTP requests
         """
         # Set up signal handling for graceful shutdown
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        shutdown_flag = False
+        def signal_handler(_signum, _frame):
+            nonlocal shutdown_flag
+            shutdown_flag = True
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
         
         # Create new event loop for this process
         loop = asyncio.new_event_loop()
@@ -132,6 +159,10 @@ class BlockSynchronizer:
             
             try:
                 while True:
+                    # Check shutdown flag first
+                    if shutdown_flag:
+                        break
+                        
                     block_number = None  # Initialize to handle potential exceptions
                     try:
                         # Get next block number to download (timeout to prevent hanging)
@@ -147,7 +178,11 @@ class BlockSynchronizer:
                         download_start = time.perf_counter()
                         logger.debug(f"🔽 Starting download of block {block_number}")
                         
-                        block = await _download_single_block(client, block_number, peers)
+                        # Check shutdown flag before starting download
+                        if shutdown_flag:
+                            break
+                            
+                        block = await _download_single_block(client, block_number, peers, lambda: shutdown_flag)
                         
                         # Log download completion with timing
                         download_time = time.perf_counter() - download_start
@@ -156,18 +191,40 @@ class BlockSynchronizer:
                         else:
                             logger.warning(f"❌ Failed download of block {block_number} after {download_time:.3f}s")
                         
-                        completed_queue.put((block_number, block))
+                        # Check shutdown flag before putting result
+                        if shutdown_flag:
+                            break
+                            
+                        try:
+                            # Use timeout to avoid hanging on queue put
+                            completed_queue.put((block_number, block), timeout=1.0)
+                        except Exception:
+                            # Queue might be full or closed, exit gracefully
+                            break
 
                     except queue.Empty:
                         continue
                     except Exception:
+                        if shutdown_flag:
+                            break
                         if block_number is None:
                             block_number = -1
-                        # Put error result in completed queue
-                        completed_queue.put((block_number, None))
+                        # Put error result in completed queue with timeout
+                        try:
+                            completed_queue.put((block_number, None), timeout=1.0)
+                        except Exception:
+                            # Queue might be closed, exit gracefully
+                            break
                         
             finally:
-                await client.stop()
+                try:
+                    await asyncio.wait_for(client.stop(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    # Force close if client.stop() hangs
+                    pass
+                except Exception:
+                    # Ignore any other errors during cleanup
+                    pass
                 
         try:
             loop.run_until_complete(download_worker())
@@ -194,78 +251,82 @@ class BlockSynchronizer:
         retry_count = {}
         max_retries = 3
         
-        while next_expected <= end_index:
-            try:
-                # Get completed download (with timeout) - run in executor to avoid blocking
-                loop = asyncio.get_event_loop()
+        try:
+            while next_expected <= end_index:
                 try:
-                    block_number, block = await loop.run_in_executor(
-                        None, lambda: completed_queue.get(timeout=30.0)
-                    )
-                except Exception:
-                    # Handle queue timeout or other errors
-                    self.logger.error("Timeout waiting for block download completion")
-                    return False
-                
-                if block is None:
-                    # Download failed
-                    retry_count[block_number] = retry_count.get(block_number, 0) + 1
-                    if retry_count[block_number] <= max_retries:
-                        self.logger.warning(f"🔄 Retrying download for block {block_number} ({retry_count[block_number]}/{max_retries})")
-                        download_queue.put(block_number)  # Retry download
-                        continue
-                    else:
-                        self.logger.error(f"❌ Failed to download block {block_number} after {max_retries} retries")
+                    # Get completed download (with timeout) - run in executor to avoid blocking
+                    loop = asyncio.get_event_loop()
+                    try:
+                        block_number, block = await loop.run_in_executor(
+                            None, lambda: completed_queue.get(timeout=30.0)
+                        )
+                    except Exception:
+                        # Handle queue timeout or other errors
+                        self.logger.error("Timeout waiting for block download completion")
                         return False
-                        
-                # Log block received from producer
-                self.logger.debug(f"📨 Received block {block_number} from producer, storing for sequential processing")
-                        
-                # Store block for sequential processing
-                pending_blocks[block_number] = block
-                
-                # Process blocks in sequential order
-                while next_expected in pending_blocks:
-                    block_to_process = pending_blocks.pop(next_expected)
                     
-                        
-                    # Log block processing start
-                    self.logger.debug(f"🔄 Processing block {next_expected} sequentially")
-                    
-                    # Validate and add block using async callback
-                    status = await self.receive_block_callback(block_to_process)
-                    
-                    # Log block processing completion
-                    if status:
-                        self.logger.debug(f"✅ Successfully processed block {next_expected}")
-                    else:
-                        self.logger.warning(f"❌ Failed to process block {next_expected}")
-                        
-                    if not status:
-                        retry_count[next_expected] = retry_count.get(next_expected, 0) + 1
-                        if retry_count[next_expected] <= max_retries:
-                            self.logger.warning(f"Block {next_expected} validation failed, retrying ({retry_count[next_expected]}/{max_retries})")
-                            download_queue.put(next_expected)  # Retry download
+                    if block is None:
+                        # Download failed
+                        retry_count[block_number] = retry_count.get(block_number, 0) + 1
+                        if retry_count[block_number] <= max_retries:
+                            self.logger.warning(f"🔄 Retrying download for block {block_number} ({retry_count[block_number]}/{max_retries})")
+                            download_queue.put(block_number)  # Retry download
                             continue
                         else:
-                            self.logger.error(f"Block {next_expected} validation failed after {max_retries} retries")
+                            self.logger.error(f"❌ Failed to download block {block_number} after {max_retries} retries")
                             return False
+                            
+                    # Log block received from producer
+                    self.logger.debug(f"📨 Received block {block_number} from producer, storing for sequential processing")
+                            
+                    # Store block for sequential processing
+                    pending_blocks[block_number] = block
                     
-                    next_expected += 1
+                    # Process blocks in sequential order
+                    while next_expected in pending_blocks:
+                        block_to_process = pending_blocks.pop(next_expected)
+                        
+                        # Log block processing start
+                        self.logger.debug(f"🔄 Processing block {next_expected} sequentially")
+                        
+                        # Validate and add block using async callback
+                        status = await self.receive_block_callback(block_to_process)
+                        
+                        # Log block processing completion
+                        if status:
+                            self.logger.debug(f"✅ Successfully processed block {next_expected}")
+                        else:
+                            self.logger.warning(f"❌ Failed to process block {next_expected}")
+                            
+                        if not status:
+                            retry_count[next_expected] = retry_count.get(next_expected, 0) + 1
+                            if retry_count[next_expected] <= max_retries:
+                                self.logger.warning(f"Block {next_expected} validation failed, retrying ({retry_count[next_expected]}/{max_retries})")
+                                download_queue.put(next_expected)  # Retry download
+                                continue
+                            else:
+                                self.logger.error(f"Block {next_expected} validation failed after {max_retries} retries")
+                                return False
+                        
+                        next_expected += 1
+                        
+                except queue.Empty:
+                    self.logger.error("Timeout waiting for block download completion")
+                    return False
+                except Exception as e:
+                    self.logger.error(f"Consumer error: {e}")
+                    return False
+        except KeyboardInterrupt:
+            self.logger.warning("🛑 Block processing interrupted by user")
+            return False
                     
-            except queue.Empty:
-                self.logger.error("Timeout waiting for block download completion")
-                return False
-            except Exception as e:
-                self.logger.error(f"Consumer error: {e}")
-                return False
-                
         return True
 
 
 async def _download_single_block(client: NodeClient, 
                                 block_number: int, 
-                                peers: List[str]) -> Optional[Block]:
+                                peers: List[str],
+                                is_shutdown_requested = None) -> Optional[Block]:
     """
     Download a single block from peers with retry logic.
     
@@ -283,17 +344,27 @@ async def _download_single_block(client: NodeClient,
     available_peers = peers.copy()
     
     while tries <= max_tries and available_peers:
+        # Check for shutdown request
+        if is_shutdown_requested and is_shutdown_requested():
+            return None
+            
         # Download from random peer
         random_peer = random.choice(available_peers)
-        block = await client.get_peer_block(random_peer, block_number)
-        
-        if block:
-            return block
+        try:
+            # Use a shorter timeout for HTTP operations during shutdown
+            block = await client.get_peer_block(random_peer, block_number)
+            
+            if block:
+                return block
+        except Exception:
+            # Continue to next peer on any exception
+            pass
             
         # Remove failed peer and retry
         tries += 1
         available_peers.remove(random_peer)
-        if available_peers:  # Only sleep if we have more peers to try
+        if available_peers and (not is_shutdown_requested or not is_shutdown_requested()):
+            # Only sleep if we have more peers to try and not shutting down
             await asyncio.sleep(backoff_sleep * tries)
             
     return None
