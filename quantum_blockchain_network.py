@@ -1,5 +1,6 @@
 import asyncio
 import json
+import ssl
 import sys
 import time
 from dataclasses import dataclass, asdict
@@ -48,12 +49,17 @@ class P2PNode:
     """Peer-to-peer node for quantum blockchain network."""
     
     def __init__(self, host: str = "0.0.0.0", port: int = 8080, 
-                 node_timeout: float = 60.0, heartbeat_interval: float = 15.0):
+                 node_timeout: float = 60.0, heartbeat_interval: float = 15.0,
+                 verify_ssl: bool = True):
         self.host = host
         self.port = port
         self.address = f"{host}:{port}"
         self.node_timeout = node_timeout
         self.heartbeat_interval = heartbeat_interval
+        self.verify_ssl = verify_ssl
+        
+        # Connection string mapping: host -> full connection string (https://host:port or http://host:port)
+        self.conn_str: Dict[str, str] = {}
         
         # Node registry
         self.nodes: Dict[str, NodeInfo] = {}
@@ -115,18 +121,103 @@ class P2PNode:
         
         logger.info("P2P node stopped")
     
-    async def connect_to_peer(self, peer_address: str) -> bool:
-        """Connect to a peer and join the network."""
+    def _create_client_session(self) -> aiohttp.ClientSession:
+        """Create an aiohttp client session with SSL support."""
+        ssl_context = None
+        if self.verify_ssl:
+            ssl_context = ssl.create_default_context()
+        else:
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+        
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        return aiohttp.ClientSession(connector=connector)
+    
+    async def _establish_connection_string(self, peer_address: str) -> Optional[str]:
+        """
+        Establish connection string for a peer, trying HTTPS first, then HTTP.
+        
+        Args:
+            peer_address: Host:port string
+            
+        Returns:
+            Full connection string (https://host:port or http://host:port) or None if both fail
+        """
+        # Try HTTPS first
+        https_url = f"https://{peer_address}"
         try:
-            # Send join request
-            async with aiohttp.ClientSession() as session:
+            async with self._create_client_session() as session:
+                data = {
+                    "address": self.address,
+                    "version": get_version(),
+                    "capabilities": ["mining", "relay"]
+                }
+                async with session.post(f"{https_url}/join", json=data, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        logger.info(f"🔒 Established secure TLS connection to {peer_address}")
+                        return https_url
+        except (aiohttp.ClientError, asyncio.TimeoutError, ssl.SSLError) as e:
+            logger.debug(f"HTTPS connection to {peer_address} failed: {e}")
+        
+        # Fall back to HTTP
+        http_url = f"http://{peer_address}"
+        try:
+            async with self._create_client_session() as session:
+                data = {
+                    "address": self.address,
+                    "version": get_version(),
+                    "capabilities": ["mining", "relay"]
+                }
+                async with session.post(f"{http_url}/join", json=data, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        logger.warning(f"⚠️  Falling back to PLAINTEXT HTTP connection to {peer_address} (TLS unavailable)")
+                        return http_url
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.debug(f"HTTP connection to {peer_address} failed: {e}")
+        
+        logger.error(f"❌ Both HTTPS and HTTP connections failed to {peer_address}")
+        return None
+    
+    async def _ensure_connection_string(self, peer_address: str) -> Optional[str]:
+        """
+        Ensure we have a connection string for a peer, establishing one if needed.
+        
+        Args:
+            peer_address: Host:port string
+            
+        Returns:
+            Connection string or None if connection fails
+        """
+        if peer_address in self.conn_str:
+            return self.conn_str[peer_address]
+        
+        # Try to establish connection string
+        conn_str = await self._establish_connection_string(peer_address)
+        if conn_str:
+            self.conn_str[peer_address] = conn_str
+        return conn_str
+    
+    async def connect_to_peer(self, peer_address: str) -> bool:
+        """Connect to a peer and join the network using TLS-first approach."""
+        # Establish connection string (this handles the actual join request)
+        conn_str = await self._establish_connection_string(peer_address)
+        if not conn_str:
+            return False
+        
+        # Store the connection string for future use
+        self.conn_str[peer_address] = conn_str
+        
+        try:
+            # Get the join response (we already sent the join request in _establish_connection_string)
+            async with self._create_client_session() as session:
                 data = {
                     "address": self.address,
                     "version": get_version(),
                     "capabilities": ["mining", "relay"]
                 }
                 
-                async with session.post(f"http://{peer_address}/join", json=data) as resp:
+                async with session.post(f"{conn_str}/join", json=data) as resp:
                     if resp.status == 200:
                         result = await resp.json()
                         
@@ -177,6 +268,9 @@ class P2PNode:
         async with self.nodes_lock:
             if address in self.nodes:
                 del self.nodes[address]
+                # Also remove connection string if it exists
+                if address in self.conn_str:
+                    del self.conn_str[address]
                 logger.info(f"Node removed: {address}")
                 if self.on_node_lost:
                     asyncio.create_task(self.on_node_lost(address))
@@ -207,10 +301,15 @@ class P2PNode:
     
     async def send_message(self, node_address: str, message: Message) -> bool:
         """Send a message to a specific node."""
+        # Ensure we have a connection string for this node
+        conn_str = await self._ensure_connection_string(node_address)
+        if not conn_str:
+            return False
+        
         try:
-            async with aiohttp.ClientSession() as session:
+            async with self._create_client_session() as session:
                 async with session.post(
-                    f"http://{node_address}/broadcast",
+                    f"{conn_str}/broadcast",
                     json=asdict(message),
                     timeout=aiohttp.ClientTimeout(total=5)
                 ) as resp:
@@ -242,11 +341,16 @@ class P2PNode:
     
     async def send_heartbeat(self, node_address: str) -> bool:
         """Send heartbeat to a specific node."""
+        # Ensure we have a connection string for this node
+        conn_str = await self._ensure_connection_string(node_address)
+        if not conn_str:
+            return False
+        
         try:
-            async with aiohttp.ClientSession() as session:
+            async with self._create_client_session() as session:
                 data = {"sender": self.address}
                 async with session.post(
-                    f"http://{node_address}/heartbeat",
+                    f"{conn_str}/heartbeat",
                     json=data,
                     timeout=aiohttp.ClientTimeout(total=3)
                 ) as resp:

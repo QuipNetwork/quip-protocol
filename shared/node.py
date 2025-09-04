@@ -203,7 +203,7 @@ class Node:
             # We should not process duplicates...
             if cur_block.hash == block.hash:
                 self.logger.warning(f"Block {block.header.index}-{block.hash.hex()[:8]} is a duplicate, ignoring...")
-                return True
+                return False
 
             # Compare timestamps first - prefer older blocks
             if cur_block.header.timestamp < block.header.timestamp:

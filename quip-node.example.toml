@@ -23,7 +23,11 @@ timeout = 3  # Timeout for peer connections and communications in seconds
 heartbeat_interval = 15  # Interval for sending heartbeats to peers in seconds
 heartbeat_timeout = 300  # Timeout for waiting for heartbeats from peers in seconds
 # Number of peers to gossip to at a time. Defaults to 3, you should never need to change this.
-# fanout = 3 
+# fanout = 3
+
+# TLS/SSL Configuration
+verify_ssl = true  # Verify SSL/TLS certificates when connecting to peers
+# ca_bundle = "/path/to/ca-certificates.crt"  # Custom CA certificate bundle (optional) 
 
 # Logging configuration
 log_level = "INFO"  # DEBUG, INFO, WARNING, ERROR

@@ -1,5 +1,6 @@
 import asyncio
 import random
+import ssl
 import time
 import logging
 from typing import Dict, List, Optional, Any, TYPE_CHECKING
@@ -14,22 +15,35 @@ if TYPE_CHECKING:
 class NodeClient:
     """HTTP client for peer communication with connection pooling and timeout handling."""
     
-    def __init__(self, node_timeout: float = 10.0, logger: Optional[logging.Logger] = None):
+    def __init__(self, node_timeout: float = 10.0, logger: Optional[logging.Logger] = None, verify_ssl: bool = True):
         self.node_timeout = node_timeout
         self.logger = logger or logging.getLogger(__name__)
+        self.verify_ssl = verify_ssl
         self.http_session: Optional[aiohttp.ClientSession] = None
         self.peers: Dict[str, MinerInfo] = {}
+        # Connection string mapping: host -> full connection string (https://host:port or http://host:port)
+        self.conn_str: Dict[str, str] = {}
         
     async def start(self):
         """Initialize HTTP session with connection pooling."""
         if self.http_session:
             return
+        
+        # Create SSL context
+        ssl_context = None
+        if self.verify_ssl:
+            ssl_context = ssl.create_default_context()
+        else:
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
             
         connector = aiohttp.TCPConnector(
             limit=100,  # Total connection pool size
             limit_per_host=10,  # Max connections per host
             ttl_dns_cache=300,  # DNS cache TTL
             use_dns_cache=True,
+            ssl=ssl_context,
         )
         self.http_session = aiohttp.ClientSession(
             connector=connector,
@@ -54,37 +68,113 @@ class NodeClient:
         """Remove a peer from the client."""
         if host in self.peers:
             del self.peers[host]
+        # Also remove connection string if it exists
+        if host in self.conn_str:
+            del self.conn_str[host]
+    
+    async def _establish_connection_string(self, peer_address: str) -> Optional[str]:
+        """
+        Establish connection string for a peer, trying HTTPS first, then HTTP.
+        
+        Args:
+            peer_address: Host:port string
             
-    async def connect_to_peer(self, peer_address: str) -> bool:
-        """Connect to a peer and verify connection."""
+        Returns:
+            Full connection string (https://host:port or http://host:port) or None if both fail
+        """
         if not self.http_session:
             self.logger.error("HTTP session not initialized")
-            return False
+            return None
         
+        # Try HTTPS first using /status endpoint (lightweight connection test)
+        https_url = f"https://{peer_address}"
         try:
-            url = f"http://{peer_address}/connect"
-            # Simple connection test - just check if peer responds
-            async with self.http_session.post(
-                url, 
-                json={"test": "connection"}, 
+            async with self.http_session.get(
+                f"{https_url}/status",
                 timeout=aiohttp.ClientTimeout(total=5)
             ) as resp:
-                return resp.status == 200
-        except Exception as e:
-            self.logger.debug(f"Failed to connect to {peer_address}: {e}")
-            return False
+                if resp.status == 200:
+                    self.logger.info(f"🔒 Established secure TLS connection to {peer_address}")
+                    return https_url
+        except (aiohttp.ClientError, asyncio.TimeoutError, ssl.SSLError) as e:
+            self.logger.debug(f"HTTPS connection to {peer_address} failed: {e}")
+        
+        # Fall back to HTTP
+        http_url = f"http://{peer_address}"
+        try:
+            async with self.http_session.get(
+                f"{http_url}/status",
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    self.logger.warning(f"⚠️  Falling back to PLAINTEXT HTTP connection to {peer_address} (TLS unavailable)")
+                    return http_url
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            self.logger.debug(f"HTTP connection to {peer_address} failed: {e}")
+        
+        self.logger.error(f"❌ Both HTTPS and HTTP connections failed to {peer_address}")
+        return None
+    
+    async def _ensure_connection_string(self, host: str) -> Optional[str]:
+        """
+        Ensure we have a connection string for a host, establishing one if needed.
+        
+        Args:
+            host: Host:port string
+            
+        Returns:
+            Connection string or None if connection fails
+        """
+        if host in self.conn_str:
+            return self.conn_str[host]
+        
+        # Try to establish connection string
+        conn_str = await self._establish_connection_string(host)
+        if conn_str:
+            self.conn_str[host] = conn_str
+        return conn_str
+            
+    async def connect_to_peer(self, peer_address: str) -> bool:
+        """Connect to a peer and verify connection using TLS-first approach."""
+        # Check if we already have a connection string for this peer
+        if peer_address in self.conn_str:
+            try:
+                # Test existing connection using /status endpoint
+                async with self.http_session.get(
+                    f"{self.conn_str[peer_address]}/status",
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    return resp.status == 200
+            except Exception as e:
+                self.logger.debug(f"Existing connection to {peer_address} failed: {e}")
+                # Remove stale connection string and try to re-establish
+                del self.conn_str[peer_address]
+        
+        # Establish new connection string
+        conn_str = await self._establish_connection_string(peer_address)
+        if conn_str:
+            self.conn_str[peer_address] = conn_str
+            return True
+        
+        return False
             
     async def send_heartbeat(self, node_host: str, public_host: str, miner_info: MinerInfo) -> bool:
         """Send heartbeat to a specific node."""
         if not self.http_session:
             return False
+        
+        # Ensure we have a connection string for this host
+        conn_str = await self._ensure_connection_string(node_host)
+        if not conn_str:
+            return False
+            
         try:
             # Import here to avoid circular imports
             from .version import get_version
             
             data = {"sender": public_host, "version": get_version()}
             async with self.http_session.post(
-                f"http://{node_host}/heartbeat",
+                f"{conn_str}/heartbeat",
                 json=data,
                 timeout=aiohttp.ClientTimeout(total=5)
             ) as resp:
@@ -97,9 +187,14 @@ class NodeClient:
         """Get status from a peer node."""
         if not self.http_session:
             return None
+        
+        # Ensure we have a connection string for this host
+        conn_str = await self._ensure_connection_string(host)
+        if not conn_str:
+            return None
             
         try:
-            async with self.http_session.get(f"http://{host}/status") as resp:
+            async with self.http_session.get(f"{conn_str}/status") as resp:
                 if resp.status == 200:
                     return await resp.json()
                 return None
@@ -111,6 +206,11 @@ class NodeClient:
         """Get a block from a peer node and log precise download timings."""
         if not self.http_session:
             return None
+        
+        # Ensure we have a connection string for this host
+        conn_str = await self._ensure_connection_string(host)
+        if not conn_str:
+            return None
             
         import time  # Local import to avoid issues
         t0 = time.perf_counter()
@@ -119,7 +219,7 @@ class NodeClient:
             req = "/block/"
             if block_number > 0:
                 req = f"/block/{block_number}"
-            url = f"http://{host}{req}?format=network"
+            url = f"{conn_str}{req}?format=network"
             
             async with self.http_session.get(url) as resp:
                 t_headers = time.perf_counter()  # time to response headers
@@ -145,6 +245,11 @@ class NodeClient:
         """Get only the block header from a peer node (lighter and faster)."""
         if not self.http_session:
             return None
+        
+        # Ensure we have a connection string for this host
+        conn_str = await self._ensure_connection_string(host)
+        if not conn_str:
+            return None
             
         import time  # Local import to avoid issues
         t0 = time.perf_counter()
@@ -153,7 +258,7 @@ class NodeClient:
             req = "/block_header/"
             if block_number > 0:
                 req = f"/block_header/{block_number}"
-            url = f"http://{host}{req}?format=network"
+            url = f"{conn_str}{req}?format=network"
             
             async with self.http_session.get(url) as resp:
                 t_headers = time.perf_counter()
@@ -202,10 +307,15 @@ class NodeClient:
         """Send a message to a specific node and log precise timings."""
         if not self.http_session:
             return False
+        
+        # Ensure we have a connection string for this host
+        conn_str = await self._ensure_connection_string(host)
+        if not conn_str:
+            return False
             
         import time  # Local import to avoid issues
         t0 = time.perf_counter()
-        url = f"http://{host}/gossip"
+        url = f"{conn_str}/gossip"
         
         try:
             payload = message.to_network()
