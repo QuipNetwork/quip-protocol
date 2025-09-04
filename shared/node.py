@@ -205,9 +205,9 @@ class Node:
                 self.logger.warning(f"Block {block.header.index}-{block.hash.hex()[:8]} is a duplicate, ignoring...")
                 return True
 
-            # Compare timestamps first - prefer newer blocks
-            if cur_block.header.timestamp > block.header.timestamp:
-                self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have a newer block at this index ({cur_block.header.timestamp} > {block.header.timestamp}), {cur_block.hash.hex()[:8]}")
+            # Compare timestamps first - prefer older blocks
+            if cur_block.header.timestamp < block.header.timestamp:
+                self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have an older block at this index ({cur_block.header.timestamp} > {block.header.timestamp}), {cur_block.hash.hex()[:8]}")
                 return False
             elif cur_block.header.timestamp == block.header.timestamp:
                 if cur_block.hash > block.hash:
