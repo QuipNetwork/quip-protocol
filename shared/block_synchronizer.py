@@ -284,7 +284,7 @@ class BlockSynchronizer:
                         block_to_process = pending_blocks.pop(next_expected)
                         
                         # Log block processing start
-                        self.logger.info(f"🔄 Processing block {next_expected} sequentially")
+                        self.logger.debug(f"🔄 Processing block {next_expected} sequentially")
                         
                         # Put block in queue for consumer task to process
                         dummy_future = asyncio.Future()
