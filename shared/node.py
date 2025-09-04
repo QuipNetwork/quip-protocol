@@ -188,9 +188,9 @@ class Node:
         """Get the latest block from the blockchain."""
         return self.chain[-1]
 
-    async def receive_block(self, block: Block) -> bool:
-        """Receive a block from the network."""
-        # 1. Check if we already have this block or a newer one at this index
+    async def check_block(self, block: Block) -> bool:
+        """Check if a block is valid and can be accepted."""
+                # 1. Check if we already have this block or a newer one at this index
         cur_block = self.get_block(block.header.index)
         if not block.hash or not block.raw or not block.signature:
             self.logger.error(f"Block {block.header.index} rejected: missing hash, raw, or signature - it's not been finalized/signed.")
@@ -243,7 +243,16 @@ class Node:
             qpjson['proof_data'] = qpjson['proof_data'][:10] + "..."
             self.logger.error(f"Quantum Proof: {json.dumps(qpjson)}, rq: {prev_block.next_block_requirements.to_json()}")
             return False
-        
+
+        return True
+
+    async def receive_block(self, block: Block) -> bool:
+        """Receive a block from the network."""
+
+        if not await self.check_block(block):
+            return False
+
+        head = self.get_latest_block()
         async with self.chain_lock:
             # Reset chain if needed
             if head.header.index >= block.header.index:
