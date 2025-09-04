@@ -40,7 +40,7 @@ class MiningResult:
     energy: float
     diversity: float
     num_valid: int
-    mining_time: float
+    mining_time: int
     node_list: List[int]
     edge_list: List[Tuple[int, int]]
     variable_order: Optional[List[int]] = None
@@ -401,7 +401,7 @@ class BaseMiner(ABC):
                 energy=best_energy,
                 diversity=final_diversity,
                 num_valid=len(valid_solutions),
-                mining_time=mining_time,
+                mining_time=int(mining_time),
                 node_list=nodes,
                 edge_list=edges,
                 variable_order=nodes
