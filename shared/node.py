@@ -215,8 +215,12 @@ class Node:
             return False
 
         prev_block = self.get_block(block.header.index - 1)
-        if prev_block is None:
+        if prev_block is None or prev_block.hash is None:
             self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we do not have the previous block ({block.header.index - 1})")
+            return False
+        
+        if prev_block.hash != block.header.previous_hash:
+            self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: previous hash mismatch ({prev_block.hash.hex()[:8]} != {block.header.previous_hash.hex()[:8]})")
             return False
 
         # 3. Check Signature
