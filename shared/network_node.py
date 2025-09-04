@@ -763,11 +763,12 @@ class NetworkNode(Node):
                 self.set_synchronized()
                 return 0
             else:                    
-                self.logger.warning("Latest block prev_hash mismatch, need to synchronize")
+                self.logger.debug("Latest block prev_hash mismatch, may need to synchronize")
+                return 0
 
         return net_latest.index
 
-    async def synchronize_blockchain(self, current_head: int = 0):
+    async def  synchronize_blockchain(self, current_head: int = 0):
         """Synchronize the blockchain with the network using BlockSynchronizer."""
         if self._is_mining:
             raise RuntimeError("Cannot synchronize while mining")
@@ -783,12 +784,14 @@ class NetworkNode(Node):
         if current_head > self.max_sync_block_index:
             self.logger.warning(f"Refusing to synchronize beyond max_sync_block_index {self.max_sync_block_index}, requested: {current_head}")
             return
-        
+
         # Always go back at least 2 blocks.
         start_index = max(1, my_latest_block.header.index-1)
         end_index = current_head
         if start_index > end_index:
             return
+
+        self.logger.info(f"Syncing with network from block {start_index} to {end_index}...")
 
         # Use BlockSynchronizer for concurrent block downloads and sequential processing
         if not self.node_client:
@@ -809,6 +812,8 @@ class NetworkNode(Node):
         success = await synchronizer.sync_blocks(start_index, end_index)
         if not success:
             raise RuntimeError(f"Failed to synchronize blocks {start_index} to {end_index}")
+        else:
+            self.logger.info(f"Successfully synchronized blocks {start_index} to {end_index}")
             
 
     async def is_connected(self) -> bool:
