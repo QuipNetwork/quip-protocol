@@ -625,6 +625,105 @@ min_diversity = 0.46         # Solution diversity
 min_solutions = 25           # Required solutions
 ```
 
+## TLS/HTTPS Support
+
+The network nodes support TLS encryption for secure communication between peers. TLS is automatically enabled when certificate files are provided in the configuration.
+
+### Quick Setup with Let's Encrypt (Certbot)
+
+1. **Install Certbot** (for domain-based certificates):
+   ```bash
+   # Ubuntu/Debian
+   sudo apt update && sudo apt install certbot
+   
+   # CentOS/RHEL
+   sudo yum install certbot
+   
+   # macOS
+   brew install certbot
+   ```
+
+2. **Obtain TLS Certificates**:
+   ```bash
+   # Replace with your actual domain
+   sudo certbot certonly --standalone -d your-node.example.com
+   
+   # Certificates will be saved to:
+   # Certificate: /etc/letsencrypt/live/your-node.example.com/fullchain.pem
+   # Private Key: /etc/letsencrypt/live/your-node.example.com/privkey.pem
+   ```
+
+3. **Configure TLS in TOML**:
+   ```toml
+   [global]
+   node_name = "Secure Node"
+   listen = "0.0.0.0"
+   port = 20049
+   tls_cert_file = "/etc/letsencrypt/live/your-node.example.com/fullchain.pem"
+   tls_key_file = "/etc/letsencrypt/live/your-node.example.com/privkey.pem"
+   ```
+
+4. **Run with TLS**:
+   ```bash
+   quip-network-node --config config.toml cpu
+   ```
+
+### Self-Signed Certificates (Development)
+
+For testing or private networks, you can generate self-signed certificates:
+
+```bash
+# Generate private key and certificate
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes \
+  -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
+
+# Use in configuration
+echo 'tls_cert_file = "cert.pem"' >> config.toml
+echo 'tls_key_file = "key.pem"' >> config.toml
+```
+
+### TLS Configuration Options
+
+Add these options to your configuration file:
+
+```toml
+[global]
+# Required for TLS
+tls_cert_file = "/path/to/certificate.pem"
+tls_key_file = "/path/to/private_key.pem"
+
+# When TLS is enabled, nodes will use https:// for peer communication
+# Make sure peer URLs use https:// scheme when connecting to TLS-enabled nodes
+peer = "https://secure-node.example.com:20049"
+```
+
+### Security Features
+
+The TLS implementation uses modern security standards:
+- **TLS 1.3 only**: Ensures forward secrecy and latest security features
+- **Strong cipher suites**: ECDHE+AESGCM, ECDHE+CHACHA20, DHE+AESGCM, DHE+CHACHA20
+- **Perfect Forward Secrecy**: Ephemeral key exchange protects past communications
+- **No weak algorithms**: Explicitly excludes aNULL, MD5, and DSS
+
+### Certificate Renewal
+
+Set up automatic renewal for Let's Encrypt certificates:
+
+```bash
+# Add to crontab
+sudo crontab -e
+
+# Add this line for automatic renewal (checks twice daily)
+0 12,0 * * * certbot renew --quiet --post-hook "systemctl reload quip-network-node"
+```
+
+### Troubleshooting TLS
+
+- **Certificate errors**: Verify certificate paths and permissions
+- **Connection refused**: Ensure firewall allows the configured port
+- **Mixed HTTP/HTTPS**: All peers must use the same protocol (HTTP or HTTPS)
+- **Self-signed warnings**: Use `--insecure` flag for development testing
+
 ## Future Enhancements
 
 - Consensus mechanism for longest chain rule
@@ -634,7 +733,7 @@ min_solutions = 25           # Required solutions
 - Multiple QPU support
 - Advanced difficulty algorithms
 - Real-time mining pool statistics
-- TLS/Authentication for secure node communication
+- Client certificate authentication for enhanced security
 
 ## License
 

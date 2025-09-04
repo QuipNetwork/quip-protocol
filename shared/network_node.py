@@ -3,6 +3,7 @@ import json
 import math
 import random
 import socket
+import ssl
 import sys
 import time
 import struct
@@ -168,6 +169,11 @@ class NetworkNode(Node):
         self.secret = config.get("secret", f"quip network node secret {random.randint(0, 1000000)}")
         self.auto_mine = config.get("auto_mine", False)
 
+        # TLS configuration
+        self.tls_cert_file = config.get("tls_cert_file")
+        self.tls_key_file = config.get("tls_key_file")
+        self.tls_enabled = bool(self.tls_cert_file and self.tls_key_file)
+
         # Initialize logger with helper function
         self.logger = init_component_logger('network_node', self.node_name)
 
@@ -264,10 +270,22 @@ class NetworkNode(Node):
         # Start web server
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
-        site = web.TCPSite(self.runner, self.bind_address, self.port)
+        
+        # Create SSL context if TLS is enabled
+        ssl_context = None
+        if self.tls_enabled:
+            ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            # Configure for modern TLS with forward secrecy
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_3
+            ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS')
+            ssl_context.load_cert_chain(self.tls_cert_file, self.tls_key_file)
+            self.logger.info(f"TLS enabled with certificate: {self.tls_cert_file}")
+            
+        site = web.TCPSite(self.runner, self.bind_address, self.port, ssl_context=ssl_context)
         await site.start()
 
-        self.logger.info(f"Network node {self.node_name} ({self.crypto.ecdsa_public_key_hex[:8]}) started at {self.bind_address}:{self.port} with public address {self.public_host}")
+        protocol = "https" if self.tls_enabled else "http"
+        self.logger.info(f"Network node {self.node_name} ({self.crypto.ecdsa_public_key_hex[:8]}) started at {protocol}://{self.bind_address}:{self.port} with public address {self.public_host}")
 
         # Start background tasks
         self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
