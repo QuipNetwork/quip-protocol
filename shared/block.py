@@ -179,24 +179,7 @@ class QuantumProof:
                                               self.nodes,
                                               self.edges)
 
-        def energy_of(solution: List[int]) -> float:
-            # Map values to spins in {-1, +1}
-            spins = [1 if v > 0 else -1 for v in solution]
-            e = 0.0
-            # Build mapping from node id to position in solution vector
-            node_pos = {node_id: pos for pos, node_id in enumerate(self.nodes)}
-            # Local fields: use node ids from topology, positions from solution
-            for pos, node_id in enumerate(self.nodes[:len(spins)]):
-                e += float(h.get(node_id, 0.0)) * spins[pos]
-            # Couplers: only if both endpoints exist in this solution
-            for (u, v), Jij in J.items():
-                pu = node_pos.get(u)
-                pv = node_pos.get(v)
-                if pu is not None and pv is not None and pu < len(spins) and pv < len(spins):
-                    e += float(Jij) * spins[pu] * spins[pv]
-            return float(e)
-
-        energies = [energy_of(sol) for sol in self.solutions]
+        energies = energies_for_solutions(self.solutions, h, J, self.nodes)
 
         # Set computed fields
         self.energy = min(energies) if energies else None

@@ -93,7 +93,7 @@ class SimulatedAnnealingMiner(BaseMiner):
                         result = self.evaluate_sampleset(sample.sampleset, requirements, nodes, edges, 
                                                          sample.nonce, sample.salt, prev_timestamp, start_time)
                         if result:
-                            self.logger.info(f"Found valid block! Nonce: {nonce}, Energy: {result.energy:.2f}, Time: {result.mining_time:.2f}s")
+                            self.logger.info(f"[Block-{cur_index}] Already Mined at this difficulty! Nonce: {sample.nonce}, Salt: {sample.salt.hex()[:4]}..., Energy: {result.energy:.2f}, Time: {result.mining_time:.2f}s")
                             return result
 
             # Track preprocessing time

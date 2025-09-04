@@ -602,7 +602,7 @@ class NetworkNode(Node):
 
         my_latest_block = self.get_latest_block()
         # Always go back at least 2 blocks.
-        start_index = max(1, my_latest_block.header.index-2)
+        start_index = max(1, my_latest_block.header.index-1)
         end_index = current_head
         if start_index > end_index:
             return
