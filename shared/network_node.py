@@ -234,6 +234,10 @@ class NetworkNode(Node):
                          on_mining_started=self._network_on_mining_started,
                          on_mining_stopped=self._network_on_mining_stopped)
 
+        # Stats caching infrastructure
+        self._stats_cache = None
+        self._stats_cache_lock = asyncio.Lock()
+
     def setup_routes(self):
         """Setup HTTP routes for P2P communication."""
         self.app.router.add_post('/join', self.handle_put_join)
@@ -242,6 +246,7 @@ class NetworkNode(Node):
         self.app.router.add_post('/gossip', self.handle_put_gossip)
         self.app.router.add_post('/block', self.handle_put_block)
         self.app.router.add_get('/status', self.handle_get_status)
+        self.app.router.add_get('/stats', self.handle_get_stats)
         self.app.router.add_get('/block/', self.handle_get_latest_block)
         self.app.router.add_get('/block/{number}', self.handle_get_block)
         # Lightweight header-only endpoints
@@ -274,6 +279,9 @@ class NetworkNode(Node):
         # have we fully synchronized with the network at least one time?
         self._synchronized = threading.Event()
         self.sync_block_cache = {}  # Regular dict is thread-safe for simple assignments in CPython
+        
+        # Initialize stats cache
+        asyncio.create_task(self._update_stats_cache())
 
     @property
     def synchronized(self) -> bool:
@@ -585,6 +593,14 @@ class NetworkNode(Node):
                 # No event loop running, skip reset timer
                 self.logger.warning("No event loop running, cannot schedule reset timer")
         
+        # Trigger stats cache update in background
+        try:
+            loop = asyncio.get_event_loop()
+            asyncio.create_task(self._update_stats_cache())
+        except RuntimeError:
+            # No event loop running, skip cache update
+            pass
+        
         # Call sync callback directly (no async task needed)
         if self.on_block_received:
             try:
@@ -668,6 +684,38 @@ class NetworkNode(Node):
     #######################
     ## Control functions ##
     #######################
+
+    async def _update_stats_cache(self):
+        """Update stats cache in background without blocking."""
+        try:
+            # Get fresh stats (potentially expensive operation)
+            fresh_stats = self.get_stats()
+            
+            # Add network-specific information
+            fresh_stats.update({
+                "network": {
+                    "host": self.public_host,
+                    "running": self.running,
+                    "total_peers": len(self.peers),
+                    "synchronized": self.synchronized,
+                    "auto_mine": self.auto_mine,
+                    "heartbeat_interval": self.heartbeat_interval,
+                    "heartbeat_timeout": self.heartbeat_timeout,
+                    "queue_sizes": {
+                        "block_processing": self.block_processing_queue.qsize(),
+                        "gossip_processing": self.gossip_processing_queue.qsize(),
+                    }
+                }
+            })
+            
+            # Atomically update the cache
+            async with self._stats_cache_lock:
+                self._stats_cache = fresh_stats
+                
+            self.logger.debug("Stats cache updated successfully")
+            
+        except Exception as e:
+            self.logger.exception(f"Error updating stats cache: {e}")
 
     async def receive_block(self, block: Block) -> bool:
         """Receive a block from the network with epoch validation and max block limit."""
@@ -1368,4 +1416,21 @@ class NetworkNode(Node):
 
         except Exception as e:
             self.logger.exception(f"Error getting block {number_str}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_get_stats(self, request: web.Request) -> web.Response:
+        """Return node statistics from cache."""
+        try:
+            async with self._stats_cache_lock:
+                if self._stats_cache is None:
+                    # Cache not initialized yet, return empty stats
+                    return web.json_response({
+                        "node_id": self.node_id,
+                        "error": "Stats cache not initialized"
+                    }, status=503)
+                
+                # Return cached stats immediately
+                return web.json_response(self._stats_cache)
+        except Exception as e:
+            self.logger.exception("Error getting stats")
             return web.json_response({"error": str(e)}, status=500)
