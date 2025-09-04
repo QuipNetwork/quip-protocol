@@ -373,38 +373,44 @@ class NetworkNode(Node):
     async def server_loop(self):
         """Main server loop."""
         while self.running:
-            # Check if we are connected to any active peers, if not, try to reconnect to known peers in our
-            # heartbeats list or, if empty, the initial peers list.
-            connected = await self.is_connected()
-            if not connected:
-                connected = await self.connect_to_network()
+            try:
+                # Check if we are connected to any active peers, if not, try to reconnect to known peers in our
+                # heartbeats list or, if empty, the initial peers list.
+                connected = await self.is_connected()
+                if not connected:
+                    connected = await self.connect_to_network()
 
-            # If we are not connected and not in auto-mine mode, sleep and retry
-            if not connected and not self.auto_mine:
-                self.logger.error(f"Not connected to network, retrying in {self.node_timeout} seconds...")
-                await asyncio.sleep(self.node_timeout)
-                continue
-            elif not connected and self.auto_mine:
-                self.logger.info("No peers connected, automining...")
+                # If we are not connected and not in auto-mine mode, sleep and retry
+                if not connected and not self.auto_mine:
+                    self.logger.error(f"Not connected to network, retrying in {self.node_timeout} seconds...")
+                    await asyncio.sleep(self.node_timeout)
+                    continue
+                elif not connected and self.auto_mine:
+                    self.logger.info("No peers connected, automining...")
 
-            # Check if we are in synchronized state with peers
-            # If not, stop mining and synchronize.
-            latest_block = await self.check_synchronized()
-            if latest_block != 0:
-                if self._is_mining:
-                    await self.stop_mining()
-                    self.logger.info("Stopped mining to synchronize with network...")
-                await self.synchronize_blockchain(latest_block)
-                # NOTE: It's possible we can get triggered again if the sync takes too long, but that's OK
-                # as we will be closer to the goal.
-                continue
+                # Check if we are in synchronized state with peers
+                # If not, stop mining and synchronize.
+                latest_block = await self.check_synchronized()
+                if latest_block != 0:
+                    if self._is_mining:
+                        await self.stop_mining()
+                        self.logger.info("Stopped mining to synchronize with network...")
+                    await self.synchronize_blockchain(latest_block)
+                    # NOTE: It's possible we can get triggered again if the sync takes too long, but that's OK
+                    # as we will be closer to the goal.
+                    continue
 
-            # If we are synchronized, check if we are mining. If not, start mining on the next block.
-            if not self._is_mining:
-                latest_block = self.get_latest_block()
-                # Create task with exception handler to crash on ValueError
-                task = asyncio.create_task(self.mine_block(latest_block))
-                task.add_done_callback(self._handle_mining_task_exception)
+                # If we are synchronized, check if we are mining. If not, start mining on the next block.
+                if not self._is_mining:
+                    latest_block = self.get_latest_block()
+                    # Create task with exception handler to crash on ValueError
+                    task = asyncio.create_task(self.mine_block(latest_block))
+                    task.add_done_callback(self._handle_mining_task_exception)
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
+            except Exception as e:
+                self.logger.exception(f"Error in server loop: {e}")
 
             await asyncio.sleep(5)
 
