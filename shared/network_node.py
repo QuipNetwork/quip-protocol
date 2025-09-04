@@ -403,6 +403,12 @@ class NetworkNode(Node):
                 elif not connected and self.auto_mine:
                     self.logger.info("No peers connected, automining...")
 
+                # Wait for any outstanding blocks to be processed
+                if self.block_processing_queue.qsize() > 0:
+                    self.logger.info(f"Waiting for {self.block_processing_queue.qsize()} blocks to be processed before mining...")
+                    await asyncio.sleep(1.0)
+                    continue
+
                 # Check if we are in synchronized state with peers
                 # If not, stop mining and synchronize.
                 latest_block = await self.check_synchronized()
@@ -448,7 +454,7 @@ class NetworkNode(Node):
                     latest = self.get_latest_block()
                     # Cache out of order blocks for later processing
                     # NOTE: older blocks need processing to determine chain fork
-                    if latest.header.index+1 > block.header.index:
+                    if latest.header.index+1 < block.header.index:
                         self.sync_block_cache[block.header.index] = block
                         # WE return failure, but thats only to signal we didn't process it.
                         response_future.set_result(False)
@@ -706,11 +712,13 @@ class NetworkNode(Node):
             raise ValueError("Failed to finalize block")
 
         self.logger.info(f"Candidate Block {wb.header.index}-{wb.hash.hex()[:8]} mined on this node!")
-
-        # Create a dummy future for locally mined blocks (we don't need the result)
-        dummy_future = asyncio.Future()
-        self.block_processing_queue.put_nowait((wb, dummy_future))
-        asyncio.create_task(self.gossip_block(wb))
+    
+        if wb.header.index == self.get_latest_block().header.index + 1:
+            await self.receive_block(wb)
+            self.logger.info(f"Accepted block {wb.header.index}-{wb.hash.hex()[:8]} from {wb.miner_info.miner_id}")
+            asyncio.create_task(self.gossip_block(wb))
+        else:
+            self.logger.info(f"Candidate Block {wb.header.index}-{wb.hash.hex()[:8]} sniped by another miner!")
 
         return result
 

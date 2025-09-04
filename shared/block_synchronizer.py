@@ -5,10 +5,13 @@ import random
 import signal
 import time
 import logging
-from typing import List, Optional, Callable
+from typing import List, Optional
 
 from shared.block import Block
 from shared.node_client import NodeClient
+import os
+import logging
+import time
 
 
 class BlockSynchronizer:
@@ -171,9 +174,6 @@ class BlockSynchronizer:
                             break
 
                         # Log download start with timing
-                        import os
-                        import logging
-                        import time
                         logger = logging.getLogger(f"BlockSync.Producer.{os.getpid()}")
                         download_start = time.perf_counter()
                         logger.debug(f"🔽 Starting download of block {block_number}")
@@ -191,10 +191,6 @@ class BlockSynchronizer:
                         else:
                             logger.warning(f"❌ Failed download of block {block_number} after {download_time:.3f}s")
                         
-                        # Check shutdown flag before putting result
-                        if shutdown_flag:
-                            break
-                            
                         try:
                             # Use timeout to avoid hanging on queue put
                             completed_queue.put((block_number, block), timeout=1.0)
@@ -288,11 +284,14 @@ class BlockSynchronizer:
                         block_to_process = pending_blocks.pop(next_expected)
                         
                         # Log block processing start
-                        self.logger.debug(f"🔄 Processing block {next_expected} sequentially")
+                        self.logger.info(f"🔄 Processing block {next_expected} sequentially")
                         
                         # Put block in queue for consumer task to process
                         dummy_future = asyncio.Future()
                         self.receive_block_queue.put_nowait((block_to_process, dummy_future))
+
+                        # Give consumer task a chance to run
+                        await asyncio.sleep(0.01)
                                                 
                         next_expected += 1
                         
