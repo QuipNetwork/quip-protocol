@@ -139,6 +139,7 @@ class NodeClient:
         # Check if we already have a connection string for this peer
         if peer_address in self.conn_str:
             try:
+                assert self.http_session
                 # Test existing connection using /status endpoint
                 async with self.http_session.get(
                     f"{self.conn_str[peer_address]}/status",
