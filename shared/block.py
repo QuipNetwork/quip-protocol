@@ -483,7 +483,7 @@ class Block:
             return False
         min_gap = self.header.timestamp - (self.header.timestamp - self.quantum_proof.mining_time)
         if (self.header.timestamp - min_gap) < previous_block.header.timestamp:
-            logger.error(f"Block {self.header.index} rejected: timestamp {self.header.timestamp} - min_gap {min_gap} <= previous block timestamp {previous_block.header.timestamp}")
+            logger.error(f"Block {self.header.index} rejected: timestamp {self.header.timestamp} - min_gap {min_gap} < previous block timestamp {previous_block.header.timestamp}")
             return False
 
         # Validate quantum proof against (possibly decayed) requirements
