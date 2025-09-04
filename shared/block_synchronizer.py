@@ -187,7 +187,7 @@ class BlockSynchronizer:
                         # Log download completion with timing
                         download_time = time.perf_counter() - download_start
                         if block:
-                            logger.info(f"✅ Completed download of block {block_number} in {download_time:.3f}s")
+                            logger.debug(f"✅ Completed download of block {block_number} in {download_time:.3f}s")
                         else:
                             logger.warning(f"❌ Failed download of block {block_number} after {download_time:.3f}s")
                         
