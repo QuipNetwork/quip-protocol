@@ -200,10 +200,19 @@ class Node:
             if not cur_block.hash:
                 raise RuntimeError("Current block is not finalized!")
 
-            # Are we newer?
-            if cur_block.header.timestamp < block.header.timestamp:
-                self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have an older block at this index ({cur_block.header.timestamp} < {block.header.timestamp}), {cur_block.hash.hex()[:8]}")
+            # We should not process duplicates...
+            if cur_block.hash == block.hash:
+                self.logger.warning(f"Block {block.header.index}-{block.hash.hex()[:8]} is a duplicate, ignoring...")
+                return True
+
+            # Compare timestamps first - prefer newer blocks
+            if cur_block.header.timestamp > block.header.timestamp:
+                self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have a newer block at this index ({cur_block.header.timestamp} > {block.header.timestamp}), {cur_block.hash.hex()[:8]}")
                 return False
+            elif cur_block.header.timestamp == block.header.timestamp:
+                if cur_block.hash > block.hash:
+                    self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have a block with same timestamp and larger hash at this index, {cur_block.hash.hex()[:8]}")
+                    return False
             
         # 2. Do we have more than 6 blocks after it?
         head = self.get_latest_block()
@@ -550,7 +559,7 @@ class Node:
             self.logger.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
             self.logger.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
         else:
-            self.logger.info("Last winner: {prev_winner}, current winner: {current_winner}")
+            self.logger.info(f"Last winner: {prev_winner}, current winner: {current_winner}")
             if current_winner == prev_winner:
                 # Same miner won again - make it EASIER
                 # Higher energy threshold (less negative), lower diversity/solutions
@@ -613,21 +622,57 @@ class Node:
         return self.peers
 
     def get_stats(self) -> dict:
-        """Aggregate stats from all miner handles."""
+        """Aggregate comprehensive stats from all miner handles and blockchain state."""
+        # Get latest block for blockchain stats
+        latest_block = self.get_latest_block()
+        
+        # Calculate win rate
+        win_rate = 0.0
+        if self.timing_stats['total_blocks_attempted'] > 0:
+            win_rate = self.timing_stats['total_blocks_won'] / self.timing_stats['total_blocks_attempted']
+        
+        # Calculate average mining time
+        avg_mining_time = 0.0
+        if self.timing_stats['total_blocks_attempted'] > 0:
+            avg_mining_time = self.timing_stats['total_mining_time'] / self.timing_stats['total_blocks_attempted']
+        
         stats = {
+            # Node identification
             "node_id": self.node_id,
-            "total_blocks_attempted": self.timing_stats['total_blocks_attempted'],
-            "total_blocks_won": self.timing_stats['total_blocks_won'],
-            "total_mining_time": self.timing_stats['total_mining_time'],
-            "wins_per_miner": dict(self.timing_stats['wins_per_miner']),
+            "timestamp": int(time.time()),
+            
+            # Mining statistics
+            "mining": {
+                "total_blocks_attempted": self.timing_stats['total_blocks_attempted'],
+                "total_blocks_won": self.timing_stats['total_blocks_won'],
+                "total_mining_time": self.timing_stats['total_mining_time'],
+                "win_rate": win_rate,
+                "average_mining_time": avg_mining_time,
+                "wins_per_miner": dict(self.timing_stats['wins_per_miner']),
+                "is_mining": self._is_mining,
+            },
+            
+            # Blockchain state
+            "blockchain": {
+                "chain_length": len(self.chain),
+                "latest_block_index": latest_block.header.index,
+                "latest_block_timestamp": latest_block.header.timestamp,
+                "latest_block_hash": latest_block.hash.hex() if latest_block.hash else None,
+                "latest_block_miner": latest_block.miner_info.miner_id if latest_block.miner_info else None,
+            },
+            
+            # Individual miner statistics
             "miners": [],
         }
+        
+        # Add individual miner stats
         for h in getattr(self, 'miner_handles', []):
             try:
                 m = h.get_stats()
                 stats["miners"].append(m)
             except Exception:
                 stats["miners"].append({"miner_id": h.miner_id, "miner_type": h.miner_type})
+                
         return stats
     
     def get_mining_summary(self) -> str:
