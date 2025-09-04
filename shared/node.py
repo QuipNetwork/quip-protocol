@@ -190,7 +190,7 @@ class Node:
 
     async def check_block(self, block: Block) -> bool:
         """Check if a block is valid and can be accepted."""
-                # 1. Check if we already have this block or a newer one at this index
+        # 1. Check if we already have this block or a newer one at this index
         cur_block = self.get_block(block.header.index)
         if not block.hash or not block.raw or not block.signature:
             self.logger.error(f"Block {block.header.index} rejected: missing hash, raw, or signature - it's not been finalized/signed.")

@@ -9,7 +9,7 @@ import struct
 import threading
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional, Callable, Set
 from datetime import datetime
 import aiohttp
 from aiohttp import web
@@ -28,6 +28,15 @@ from shared.logging_config import init_component_logger
 from shared.version import get_version
 from shared.node_client import NodeClient
 from shared.block_synchronizer import BlockSynchronizer
+
+
+@dataclass(frozen=True)
+class EpochInfo:
+    """Information about a previous chain epoch to prevent block acceptance from old epochs."""
+    first_hash: bytes      # Hash of block 1 from this epoch
+    last_timestamp: int    # Timestamp of the last block before reset
+    last_index: int        # Index of the last block before reset
+    last_hash: bytes       # Hash of the last block before reset
 
 # Configure logging
 import logging
@@ -208,6 +217,12 @@ class NetworkNode(Node):
         self.reset_scheduled = False  
         self.reset_start_time = None
         self.genesis_block = genesis_block
+        
+        # Epoch tracking to prevent accepting blocks from previous chain epochs
+        self.previous_epochs: Set[EpochInfo] = set()
+        
+        # Maximum block index to synchronize with (prevents syncing with peers too far ahead)
+        self.max_sync_block_index = 1024
 
         self.miners_config = {
             "cpu": config.get("cpu", None),
@@ -576,6 +591,23 @@ class NetworkNode(Node):
             
             # Reset blockchain state
             async with self.chain_lock:
+                # Capture current epoch info before reset
+                if len(self.chain) > 1:  # Only if we have blocks beyond genesis
+                    head_block = self.get_latest_block()
+                    block_1 = self.get_block(1) if len(self.chain) > 1 else None
+                    
+                    if head_block and block_1 and block_1.hash and head_block.hash:
+                        epoch_info = EpochInfo(
+                            first_hash=block_1.hash,
+                            last_timestamp=head_block.header.timestamp,
+                            last_index=head_block.header.index,
+                            last_hash=head_block.hash
+                        )
+                        self.previous_epochs.add(epoch_info)
+                        self.logger.info(f"Recorded previous epoch: block 1 hash {block_1.hash.hex()[:8]}..., "
+                                       f"last block {head_block.header.index} hash {head_block.hash.hex()[:8]}...")
+                
+                # Reset to original genesis block (no more new genesis creation)
                 self.chain = [self.genesis_block]
                 self.logger.info("Chain reset to genesis block completed")
             
@@ -598,6 +630,34 @@ class NetworkNode(Node):
     #######################
     ## Control functions ##
     #######################
+
+    async def receive_block(self, block: Block) -> bool:
+        """Receive a block from the network with epoch validation and max block limit."""
+        # Reject blocks that are too far in the future (beyond max sync limit)
+        if block.header.index > self.max_sync_block_index:
+            self.logger.debug(f"Block {block.header.index} rejected: index > max_sync_block_index {self.max_sync_block_index}")
+            return False
+        
+        # Check against previous epochs to prevent accepting blocks from old chain epochs
+        async with self.chain_lock:
+            for epoch_info in self.previous_epochs:
+                # Reject if this is block 1 from a previous epoch
+                if block.header.index == 1 and block.hash and block.hash == epoch_info.first_hash:
+                    self.logger.warning(f"Block 1 rejected: hash {block.hash.hex()[:8]}... matches previous epoch first_hash")
+                    return False
+                
+                # Reject if this block hash matches the last block from a previous epoch  
+                if block.hash and block.hash == epoch_info.last_hash:
+                    self.logger.warning(f"Block {block.header.index} rejected: hash {block.hash.hex()[:8]}... matches previous epoch last_hash")
+                    return False
+                
+                # Reject if timestamp is older than the last timestamp from a previous epoch
+                if block.header.timestamp <= epoch_info.last_timestamp:
+                    self.logger.warning(f"Block {block.header.index} rejected: timestamp {block.header.timestamp} <= previous epoch last_timestamp {epoch_info.last_timestamp}")
+                    return False
+        
+        # If all validations pass, call parent receive_block
+        return await super().receive_block(block)
 
     async def mine_block(self, previous_block: Block) -> Optional[MiningResult]:
         """Mine a block and broadcast if successful."""
@@ -640,10 +700,18 @@ class NetworkNode(Node):
         tries = 0
         peers = list(self.peers.keys())
         while net_latest is None:
+            if not peers:
+                self.logger.warning("No valid peers to synchronize with (all peers may have >max_sync_block_index blocks)")
+                return 0
+                
             random_peer = random.choice(peers)
             peers.remove(random_peer)
             header = await self.get_peer_block_header(random_peer)
             if header:
+                # Ignore peers with blocks beyond our max sync limit
+                if header.index > self.max_sync_block_index:
+                    self.logger.debug(f"Ignoring peer {random_peer} with block index {header.index} > max_sync_block_index {self.max_sync_block_index}")
+                    continue
                 net_latest = header
                 break
             tries += 1
@@ -678,6 +746,12 @@ class NetworkNode(Node):
             return
 
         my_latest_block = self.get_latest_block()
+        
+        # Enforce maximum sync block limit
+        if current_head > self.max_sync_block_index:
+            self.logger.warning(f"Refusing to synchronize beyond max_sync_block_index {self.max_sync_block_index}, requested: {current_head}")
+            return
+        
         # Always go back at least 2 blocks.
         start_index = max(1, my_latest_block.header.index-1)
         end_index = current_head
