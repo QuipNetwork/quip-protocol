@@ -242,10 +242,9 @@ class BlockSynchronizer:
         Returns:
             bool: True if all blocks processed successfully
         """
-        next_expected = start_index
-        pending_blocks = {}
         retry_count = {}
         max_retries = 3
+        next_expected = start_index
         
         try:
             while next_expected <= end_index:
@@ -275,26 +274,14 @@ class BlockSynchronizer:
                     # Log block received from producer
                     self.logger.debug(f"📨 Received block {block_number} from producer, storing for sequential processing")
                             
-                    # Store block for sequential processing
-                    pending_blocks[block_number] = block
-                    
-                    # NOTE: we do this in order so as not to exhaust the parent queue. 
-                    # Process blocks in sequential order
-                    while next_expected in pending_blocks:
-                        block_to_process = pending_blocks.pop(next_expected)
-                        
-                        # Log block processing start
-                        self.logger.debug(f"🔄 Processing block {next_expected} sequentially")
-                        
-                        # Put block in queue for consumer task to process
-                        dummy_future = asyncio.Future()
-                        self.receive_block_queue.put_nowait((block_to_process, dummy_future))
+                    # Put block in queue for consumer task to process
+                    dummy_future = asyncio.Future()
+                    self.receive_block_queue.put_nowait((block, dummy_future))
+                    next_expected += 1
 
-                        # Give consumer task a chance to run
-                        await asyncio.sleep(0.01)
-                                                
-                        next_expected += 1
-                        
+                    # Give consumer task a chance to run
+                    await asyncio.sleep(0.01)
+                                                                        
                 except queue.Empty:
                     self.logger.error("Timeout waiting for block download completion")
                     return False
