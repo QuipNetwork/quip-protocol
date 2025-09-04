@@ -556,7 +556,7 @@ class NetworkNode(Node):
                 self.logger.error(f"Error in on_block_received callback: {e}")
 
     def _network_on_mining_started(self, prev: Block):
-        self.logger.info(f"Mining started on block {prev.header.index + 1} with previous block hash {prev.hash}")
+        self.logger.info(f"Mining started on block {prev.header.index + 1} with previous block hash {prev.hash.hex()[:8]}...")
 
     def _network_on_mining_stopped(self):
         self.logger.info(f"🛑 Mining stopped")
