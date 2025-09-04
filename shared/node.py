@@ -264,31 +264,31 @@ class Node:
         self.logger.info(f"Accepted block {block.header.index} from {block.miner_info.miner_id}")
 
         # Emit an event so we can stop mining and potentially broadcast to other nodes
-        self._emit_block_mined(block)
+        asyncio.create_task(self._emit_block_mined(block))
 
         return True
 
-    def _emit_mining_started(self, block: Block) -> None:
-        """Async wrapper for mining started event."""
+    async def _emit_mining_started(self, block: Block) -> None:
+        """Emit mining started event with sync callback."""
         if self.on_mining_started:
             try:
-                asyncio.create_task(self.on_mining_started(block))
+                self.on_mining_started(block)
             except Exception as e:
                 self.logger.error(f"Error in mining_started callback: {e}")
 
-    def _emit_mining_stopped(self) -> None:
-        """Emit mining stopped event."""
+    async def _emit_mining_stopped(self) -> None:
+        """Emit mining stopped event with sync callback."""
         if self.on_mining_stopped:
             try:
-                asyncio.create_task(self.on_mining_stopped())
+                self.on_mining_stopped()
             except Exception as e:
                 self.logger.error(f"Error in mining_stopped callback: {e}")
 
-    def _emit_block_mined(self, block: Block) -> None:
-        """Emit block mined event."""
+    async def _emit_block_mined(self, block: Block) -> None:
+        """Emit block mined event with sync callback."""
         if self.on_block_mined:
             try:
-                asyncio.create_task(self.on_block_mined(block))
+                self.on_block_mined(block)
             except Exception as e:
                 self.logger.error(f"Error in block_mined callback: {e}")
 
@@ -341,7 +341,7 @@ class Node:
         self.logger.info(f"Starting mining with {len(handles)} miners...")
 
         # Emit mining started event
-        self._emit_mining_started(previous_block)
+        asyncio.create_task(self._emit_mining_started(previous_block))
 
         # Command all workers to start mining with full context
         prev_timestamp = previous_block.header.timestamp
@@ -396,7 +396,7 @@ class Node:
             self._mining_stop_event = None
 
             # Emit mining stopped event
-            self._emit_mining_stopped()
+            asyncio.create_task(self._emit_mining_stopped())
 
         # Record timing and statistics
         total_time = time.time() - start_time
