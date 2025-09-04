@@ -481,7 +481,7 @@ class Block:
         if self.header.timestamp > cur_time:
             logger.error(f"Block {self.header.index} rejected: timestamp {self.header.timestamp} > current time {cur_time}")
             return False
-        min_gap = self.header.timestamp - (self.header.timestamp - self.quantum_proof.mining_time)
+        min_gap = self.header.timestamp - (self.header.timestamp - int(self.quantum_proof.mining_time))
         if (self.header.timestamp - min_gap) < previous_block.header.timestamp:
             logger.error(f"Block {self.header.index} rejected: timestamp {self.header.timestamp} - min_gap {min_gap} < previous block timestamp {previous_block.header.timestamp}")
             return False
