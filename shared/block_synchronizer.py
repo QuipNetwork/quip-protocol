@@ -16,7 +16,7 @@ class BlockSynchronizer:
     
     def __init__(self, 
                  node_client: NodeClient,
-                 receive_block_callback: Callable,
+                 receive_block_queue: asyncio.Queue,
                  logger: Optional[logging.Logger] = None,
                  max_workers: Optional[int] = None):
         """
@@ -24,12 +24,12 @@ class BlockSynchronizer:
         
         Args:
             node_client: NodeClient for peer communication
-            receive_block_callback: Callback to process/validate blocks
+            receive_block_queue: Callback to process/validate blocks
             logger: Logger instance
             max_workers: Max number of worker processes (default: min(30, cpu_count))
         """
         self.node_client = node_client
-        self.receive_block_callback = receive_block_callback
+        self.receive_block_queue = receive_block_queue
         self.logger = logger or logging.getLogger(__name__)
         self.max_workers = max_workers or min(30, mp.cpu_count())
         
@@ -282,6 +282,7 @@ class BlockSynchronizer:
                     # Store block for sequential processing
                     pending_blocks[block_number] = block
                     
+                    # NOTE: we do this in order so as not to exhaust the parent queue. 
                     # Process blocks in sequential order
                     while next_expected in pending_blocks:
                         block_to_process = pending_blocks.pop(next_expected)
@@ -289,25 +290,10 @@ class BlockSynchronizer:
                         # Log block processing start
                         self.logger.debug(f"🔄 Processing block {next_expected} sequentially")
                         
-                        # Validate and add block using async callback
-                        status = await self.receive_block_callback(block_to_process)
-                        
-                        # Log block processing completion
-                        if status:
-                            self.logger.debug(f"✅ Successfully processed block {next_expected}")
-                        else:
-                            self.logger.warning(f"❌ Failed to process block {next_expected}")
-                            
-                        if not status:
-                            retry_count[next_expected] = retry_count.get(next_expected, 0) + 1
-                            if retry_count[next_expected] <= max_retries:
-                                self.logger.warning(f"Block {next_expected} validation failed, retrying ({retry_count[next_expected]}/{max_retries})")
-                                download_queue.put(next_expected)  # Retry download
-                                continue
-                            else:
-                                self.logger.error(f"Block {next_expected} validation failed after {max_retries} retries")
-                                return False
-                        
+                        # Put block in queue for consumer task to process
+                        dummy_future = asyncio.Future()
+                        self.receive_block_queue.put_nowait((block_to_process, dummy_future))
+                                                
                         next_expected += 1
                         
                 except queue.Empty:

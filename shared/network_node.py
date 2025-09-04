@@ -206,7 +206,7 @@ class NetworkNode(Node):
         self.running = False
 
         # Background processing queues
-        self.block_processing_queue = asyncio.Queue(maxsize=100)
+        self.block_processing_queue = asyncio.Queue(maxsize=1000)
         self.gossip_processing_queue = asyncio.Queue(maxsize=1000)
 
         # Node client for HTTP communication
@@ -445,12 +445,24 @@ class NetworkNode(Node):
                 # Process the block in background
                 block, response_future = block_data
                 try:
+                    latest = self.get_latest_block()
+                    # Cache out of order blocks for later processing
+                    # NOTE: older blocks need processing to determine chain fork
+                    if latest.header.index+1 > block.header.index:
+                        self.sync_block_cache[block.header.index] = block
+                        # WE return failure, but thats only to signal we didn't process it.
+                        response_future.set_result(False)
+                        continue
+                    # Base case we can process the block
                     result = await self.receive_block(block)
                     response_future.set_result(result)
                 except Exception as e:
-                    self.logger.exception(f"Error processing block: {e}")
+                    self.logger.info(f"Error processing block: {e}")
                     if not response_future.done():
                         response_future.set_result(False)
+
+                # Try to process any cached blocks
+                await self._exhaust_block_cache()
 
             except asyncio.CancelledError:
                 break
@@ -512,6 +524,25 @@ class NetworkNode(Node):
                 # Log other exceptions but don't crash
                 self.logger.error(f"Exception in mining task: {e}")
 
+    async def _exhaust_block_cache(self):
+        """Exhaust the block cache by processing all blocks in order."""
+        # Pause gossip and process the current block cache. 
+        async with self.gossip_lock:
+            # Process cached blocks starting from end_index + 1
+            next_block_index = self.get_latest_block().header.index + 1
+            while next_block_index in self.sync_block_cache:
+                cached_block = self.sync_block_cache.pop(next_block_index)
+                self.logger.info(f"Processing cached block {next_block_index} received during sync")
+                
+                # Process the cached block
+                success = await self.receive_block(cached_block)
+                if not success:
+                    self.logger.error(f"Failed to process cached block {next_block_index}")
+                    break
+                    
+                next_block_index += 1
+
+
 
     #############################
     ## Internal Event Handlers ##
@@ -556,7 +587,8 @@ class NetworkNode(Node):
                 self.logger.error(f"Error in on_block_received callback: {e}")
 
     def _network_on_mining_started(self, prev: Block):
-        self.logger.info(f"Mining started on block {prev.header.index + 1} with previous block hash {prev.hash.hex()[:8]}...")
+        assert prev.hash
+        self.logger.info(f"🏁 Mining started on block {prev.header.index + 1} with previous block hash {prev.hash.hex()[:8]}...")
 
     def _network_on_mining_stopped(self):
         self.logger.info(f"🛑 Mining stopped")
@@ -673,13 +705,13 @@ class NetworkNode(Node):
         if not wb.hash:
             raise ValueError("Failed to finalize block")
 
-        self.logger.info(f"Block {wb.header.index}-{wb.hash.hex()[:8]} mined on this node!")
-        accepted = await self.receive_block(wb)
-        if not accepted:
-            self.logger.warning(f"Block {wb.header.index}-{wb.hash.hex()[:8]} rejected by network!")
-            return None
+        self.logger.info(f"Candidate Block {wb.header.index}-{wb.hash.hex()[:8]} mined on this node!")
 
+        # Create a dummy future for locally mined blocks (we don't need the result)
+        dummy_future = asyncio.Future()
+        self.block_processing_queue.put_nowait((wb, dummy_future))
         asyncio.create_task(self.gossip_block(wb))
+
         return result
 
 
@@ -769,7 +801,7 @@ class NetworkNode(Node):
         # Create block synchronizer
         synchronizer = BlockSynchronizer(
             node_client=self.node_client,
-            receive_block_callback=self.receive_block,
+            receive_block_queue=self.block_processing_queue,
             logger=self.logger
         )
         
@@ -778,23 +810,6 @@ class NetworkNode(Node):
         if not success:
             raise RuntimeError(f"Failed to synchronize blocks {start_index} to {end_index}")
             
-        # After successful sync, process any blocks that were gossiped during sync
-        async with self.gossip_lock:
-            # Process cached blocks starting from end_index + 1
-            next_block_index = end_index + 1
-            while next_block_index in self.sync_block_cache:
-                cached_block = self.sync_block_cache.pop(next_block_index)
-                self.logger.info(f"Processing cached block {next_block_index} received during sync")
-                
-                # Process the cached block
-                success = await self.receive_block(cached_block)
-                if not success:
-                    self.logger.error(f"Failed to process cached block {next_block_index}")
-                    # Put it back in cache for potential retry
-                    self.sync_block_cache[next_block_index] = cached_block
-                    break
-                    
-                next_block_index += 1
 
     async def is_connected(self) -> bool:
         """Ensure we are connected to the network."""
@@ -1063,12 +1078,17 @@ class NetworkNode(Node):
             if not message.data:
                 return "rejected, missing block data"
             block = Block.from_network(message.data)
-            # Don't rebroadcast if we reject or are synchronizing
+            # Don't rebroadcast if we are not synchronized yet
             if not self.synchronized:
                 self.sync_block_cache[block.header.index] = block
                 return "ok"
-            if not await self.receive_block(block):
-                return "rejected"
+            # Don't rebroadcast if we likely already saw it and its a little old
+            if self.get_latest_block().header.index-2 >= block.header.index:
+                return "ok"
+            # Queue for background processing to avoid blocking
+            # Create a dummy future for gossip blocks (we don't need the result)
+            dummy_future = asyncio.Future()
+            self.block_processing_queue.put_nowait((block, dummy_future))
 
         asyncio.create_task(self.gossip_broadcast(message, self.fanout))
         return "ok"
