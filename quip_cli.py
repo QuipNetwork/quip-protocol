@@ -246,9 +246,7 @@ def quip_network_node(ctx: click.Context, config: Optional[str], version: bool, 
     ctx.obj["debug_config"] = debug_config
 
     if ctx.invoked_subcommand is None:
-        toml = ctx.obj.get("toml", {})
-        # Merge globals from filtered TOML
-        cfg = _merge_globals_from_toml(toml)
+        cfg = ctx.obj.get("toml", {})
 
         # Check if any miner sections are present
         has_miners = any(k in cfg for k in ("cpu", "gpu", "qpu"))
@@ -263,7 +261,7 @@ def quip_network_node(ctx: click.Context, config: Optional[str], version: bool, 
             _print_final_config(conf, "auto-configured")
         
         # Use genesis_block.json as default genesis config
-        genesis_config = cfg.get("genesis_config", "None")
+        genesis_config = conf.get("genesis_config", "None")
         
         sys.exit(_run_network_node_sync(conf, genesis_config))
 

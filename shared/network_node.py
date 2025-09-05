@@ -245,6 +245,8 @@ class NetworkNode(Node):
         self._stats_cache = None
         self._stats_cache_lock = asyncio.Lock()
 
+        self.logger.info(f"Network node {self.node_name} initialized with config {json.dumps(config)}")
+
     def setup_routes(self):
         """Setup HTTP routes for P2P communication."""
         self.app.router.add_post('/join', self.handle_put_join)
