@@ -163,8 +163,9 @@ class NetworkNode(Node):
         self.node_name = config.get("node_name", socket.getfqdn())
         self.public_host = config.get("public_host", f"{get_local_ip()}:{self.port}")
         # Default to local_ip only when we are listening on a local host.
-        if self.bind_address != "127.0.0.1":
-            self.public_host = config.get("public_host", f"{get_public_ip()}:{self.port}")
+        if self.bind_address != "127.0.0.1" and "public_host" not in config:
+            public_ip = asyncio.run(get_public_ip())
+            self.public_host = config.get("public_host", f"{public_ip}:{self.port}")
 
         self.secret = config.get("secret", f"quip network node secret {random.randint(0, 1000000)}")
         self.auto_mine = config.get("auto_mine", False)
