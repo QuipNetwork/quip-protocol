@@ -13,7 +13,7 @@ secret = "your-secret-here" # Used to generate a deterministic key pair for this
 
 # Enable mining on startup when no peers can be found.
 # Defaults to exit if a peer cannot be found.
-# auto_mine = 1
+# auto_mine = true
 
 # Genesis block configuration file path
 # Defaults to "genesis_block.json" if not specified

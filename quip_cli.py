@@ -48,7 +48,24 @@ def _load_config(path: Optional[str]) -> Dict[str, Any]:
     if "dwave_api_token" in qpu_config:
         os.environ["DWAVE_API_TOKEN"] = qpu_config["dwave_api_token"]
 
-    return config
+    conf = _merge_globals_from_toml(config)
+
+    return conf
+
+def _merge_globals_from_toml(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten [global] section of TOML into NetworkNode config keys.
+    Leaves 'cpu', 'gpu', 'qpu' sections as-is.
+    """
+    if not cfg:
+        return {}
+    g = dict(cfg.get("global", {}) or {})
+    out: Dict[str, Any] = {}
+    for k, v in g.items():
+        if k not in ["cpu", "gpu", "qpu"]:
+            out[k] = v
+        else:
+            out[f"global.k"] = v
+    return out
 
 
 def _print_final_config(config: Dict[str, Any], miner_type: str):
@@ -64,63 +81,6 @@ def _print_final_config(config: Dict[str, Any], miner_type: str):
     click.echo(json.dumps(display_config, indent=2, default=str))
     click.echo()
 
-
-def _merge_globals_from_toml(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Flatten [global] section of TOML into NetworkNode config keys.
-    Leaves 'cpu', 'gpu', 'qpu' sections as-is.
-    """
-    if not cfg:
-        return {}
-    g = dict(cfg.get("global", {}) or {})
-    out: Dict[str, Any] = {}
-    if "node_name" in g:
-        out["node_name"] = g["node_name"]
-    if "listen" in g:
-        out["listen"] = g["listen"]
-    if "port" in g:
-        out["port"] = int(g["port"])
-    if "public_host" in g:
-        out["public_host"] = g["public_host"]
-    if "secret" in g:
-        out["secret"] = g["secret"]
-    if "auto_mine" in g:
-        out["auto_mine"] = bool(g["auto_mine"])
-    # peers: allow string or list in TOML
-    peer = g.get("peer")
-    if peer is not None:
-        if isinstance(peer, list):
-            out["peer"] = [str(p) for p in peer]
-        else:
-            out["peer"] = [str(peer)]
-    # timeouts/heartbeat
-    if "timeout" in g:
-        out["node_timeout"] = int(g["timeout"])
-    if "node_timeout" in g:
-        out["node_timeout"] = int(g["node_timeout"])
-    if "heartbeat_interval" in g:
-        out["heartbeat_interval"] = int(g["heartbeat_interval"])
-    if "heartbeat_timeout" in g:
-        out["heartbeat_timeout"] = int(g["heartbeat_timeout"])
-    if "fanout" in g:
-        out["fanout"] = int(g["fanout"])
-    # HTTP server settings
-    if "client_max_size_mb" in g:
-        out["client_max_size_mb"] = int(g["client_max_size_mb"])
-    # Logging settings
-    if "log_level" in g:
-        out["log_level"] = g["log_level"]
-    if "node_log" in g:
-        out["node_log"] = g["node_log"]
-    if "http_log" in g:
-        out["http_log"] = g["http_log"]
-    # Genesis block configuration
-    if "genesis_config" in g:
-        out["genesis_config"] = g["genesis_config"]
-    # carry-through miner sections
-    for k in ("cpu", "gpu", "qpu"):
-        if k in cfg:
-            out[k] = cfg[k]
-    return out
 
 
 def _apply_global_overrides(conf: Dict[str, Any],
@@ -179,7 +139,7 @@ async def _async_run_network_node(config: Dict[str, Any], genesis_config_file: s
     node_name = config.get("node_name", "quip-node")
 
     # Setup logging with our custom configuration
-    loggers = setup_logging(
+    setup_logging(
         log_level=log_level,
         node_log_file=node_log_file,
         http_log_file=http_log_file,
@@ -242,28 +202,25 @@ def quip_network_node(ctx: click.Context, config: Optional[str], version: bool, 
 
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config
-    ctx.obj["toml"] = _load_config(config)
+    ctx.obj["config"] = _load_config(config)
     ctx.obj["debug_config"] = debug_config
 
     if ctx.invoked_subcommand is None:
-        cfg = ctx.obj.get("toml", {})
+        cfg = ctx.obj.get("config", {})
 
         # Check if any miner sections are present
         has_miners = any(k in cfg for k in ("cpu", "gpu", "qpu"))
         if not has_miners:
             raise click.UsageError("No subcommand given and no miner sections ([cpu], [gpu], [qpu]) found in config")
         
-        # Auto-configure: merge globals with all available miner sections
-        conf = _merge_globals_from_toml(cfg)
-        
         # Apply debug config from global options
         if ctx.obj.get("debug_config", False):
-            _print_final_config(conf, "auto-configured")
+            _print_final_config(cfg, "auto-configured")
         
         # Use genesis_block.json as default genesis config
-        genesis_config = conf.get("genesis_config", "None")
+        genesis_config = cfg.get("genesis_config", "genesis_block.json")
         
-        sys.exit(_run_network_node_sync(conf, genesis_config))
+        sys.exit(_run_network_node_sync(cfg, genesis_config))
 
 
 # Subcommands: cpu/gpu/qpu. Each builds a NetworkNode config from TOML and CLI flags.
@@ -319,21 +276,15 @@ def cpu(
         os.environ["DWAVE_API_TOKEN"] = "MISSING IN CONFIG"
 
     # Load full TOML config
-    toml_cfg = (ctx.obj or {}).get("toml", {})
+    toml_cfg = (ctx.obj or {}).get("config", {})
 
     # Filter to CPU-only by removing other miner sections
-    filtered_toml = dict(toml_cfg)
-    filtered_toml.pop("gpu", None)
-    filtered_toml.pop("qpu", None)
-
-    # Merge globals from filtered TOML
-    conf = _merge_globals_from_toml(filtered_toml)
-
-    # Apply CLI overrides (these take precedence)
-    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
+    conf = dict(toml_cfg)
+    conf.pop("gpu", None)
+    conf.pop("qpu", None)
 
     # Handle CPU-specific configuration
-    cpu_cfg = dict((filtered_toml.get("cpu") or {}))
+    cpu_cfg = dict((conf.get("cpu") or {}))
     if num_cpus is not None:
         cpu_cfg["num_cpus"] = int(num_cpus)
     if not cpu_cfg:
@@ -400,21 +351,18 @@ def gpu(
 ):
     """Run a GPU-only network node."""
     # Load full TOML config
-    toml_cfg = (ctx.obj or {}).get("toml", {})
+    toml_cfg = (ctx.obj or {}).get("config", {})
 
     # Filter to GPU-only by removing other miner sections
-    filtered_toml = dict(toml_cfg)
-    filtered_toml.pop("cpu", None)
-    filtered_toml.pop("qpu", None)
-
-    # Merge globals from filtered TOML
-    conf = _merge_globals_from_toml(filtered_toml)
+    conf = dict(toml_cfg)
+    conf.pop("cpu", None)
+    conf.pop("qpu", None)
 
     # Apply CLI overrides
-    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout)
+    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
 
     # Handle GPU-specific configuration
-    gpu_cfg = dict((filtered_toml.get("gpu") or {}))
+    gpu_cfg = dict((conf.get("gpu") or {}))
     if gpu_backend is not None:
         gpu_cfg["backend"] = str(gpu_backend).lower()
     if devices:
@@ -485,21 +433,17 @@ def qpu(
 ):
     """Run a QPU-only network node."""
     # Load full TOML config
-    toml_cfg = (ctx.obj or {}).get("toml", {})
+    toml_cfg = (ctx.obj or {}).get("config", {})
 
-    # Filter to QPU-only by removing other miner sections
-    filtered_toml = dict(toml_cfg)
-    filtered_toml.pop("cpu", None)
-    filtered_toml.pop("gpu", None)
-
-    # Merge globals from filtered TOML
-    conf = _merge_globals_from_toml(filtered_toml)
+    conf = dict(toml_cfg)
+    conf.pop("gpu", None)
+    conf.pop("cpu", None)
 
     # Apply CLI overrides
-    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout)
+    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
 
     # Handle QPU-specific configuration
-    qpu_cfg = dict((filtered_toml.get("qpu") or {}))
+    qpu_cfg = dict((conf.get("qpu") or {}))
     if dwave_api_key is not None:
         qpu_cfg["dwave_api_key"] = dwave_api_key
     if dwave_api_solver is not None:
@@ -584,7 +528,7 @@ def quip_network_simulator(ctx: click.Context, scenario: str, num_cpu: Optional[
     # Build command list
     peer_addr = None
     for kind, count in order:
-        for i in range(count):
+        for _ in range(count):
             if kind == bootstrap_kind and peer_addr is None:
                 cmds.append(_cmd_for(kind, port, None))
                 peer_addr = f"localhost:{port}"
@@ -670,7 +614,7 @@ def network_node_main():
 @click.option("--config", type=click.Path(exists=True, dir_okay=False), help="Path to TOML config file")
 @click.option("--interval", type=float, default=5.0, help="Seconds between stats prints")
 @click.pass_context
-def quip_node_stats(ctx: click.Context, config: Optional[str], interval: float):
+def quip_node_stats(_: click.Context, config: Optional[str], interval: float):
     """Run a single in-process node and periodically print stats to stdout.
 
     This is an experimental helper that constructs Node directly from TOML config
