@@ -275,6 +275,7 @@ class NetworkNode(Node):
         # Create SSL context if TLS is enabled
         ssl_context = None
         if self.tls_enabled:
+            assert self.tls_cert_file and self.tls_key_file
             ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
             # Configure for modern TLS with forward secrecy
             ssl_context.minimum_version = ssl.TLSVersion.TLSv1_3

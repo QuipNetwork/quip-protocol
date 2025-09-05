@@ -113,6 +113,9 @@ def _merge_globals_from_toml(cfg: Dict[str, Any]) -> Dict[str, Any]:
         out["node_log"] = g["node_log"]
     if "http_log" in g:
         out["http_log"] = g["http_log"]
+    # Genesis block configuration
+    if "genesis_config" in g:
+        out["genesis_config"] = g["genesis_config"]
     # carry-through miner sections
     for k in ("cpu", "gpu", "qpu"):
         if k in cfg:
@@ -244,14 +247,11 @@ def quip_network_node(ctx: click.Context, config: Optional[str], version: bool, 
 
     if ctx.invoked_subcommand is None:
         cfg = ctx.obj.get("toml", {})
-        global_cfg = (cfg.get("global", {}) or {})
-        default_cmd = (global_cfg or {}).get("default")
-        
 
         # Check if any miner sections are present
         has_miners = any(k in cfg for k in ("cpu", "gpu", "qpu"))
         if not has_miners:
-            raise click.UsageError("No subcommand given, no [global].default in config, and no miner sections ([cpu], [gpu], [qpu]) found in config")
+            raise click.UsageError("No subcommand given and no miner sections ([cpu], [gpu], [qpu]) found in config")
         
         # Auto-configure: merge globals with all available miner sections
         conf = _merge_globals_from_toml(cfg)
@@ -261,7 +261,7 @@ def quip_network_node(ctx: click.Context, config: Optional[str], version: bool, 
             _print_final_config(conf, "auto-configured")
         
         # Use genesis_block.json as default genesis config
-        genesis_config = "genesis_block.json"
+        genesis_config = cfg.get("genesis_config", "genesis_block.json")
         
         sys.exit(_run_network_node_sync(conf, genesis_config))
 
@@ -339,6 +339,10 @@ def cpu(
     if not cpu_cfg:
         cpu_cfg = {"num_cpus": 1}
     conf["cpu"] = cpu_cfg
+
+    # Use genesis config from TOML if CLI option is default and TOML has it
+    if genesis_config == "genesis_block.json" and "genesis_config" in conf:
+        genesis_config = conf["genesis_config"]
 
     # Print final configuration if requested
     if debug_config or ctx.obj.get("debug_config", False):
@@ -421,6 +425,10 @@ def gpu(
         gpu_cfg = {"backend": "local"}
     conf["gpu"] = gpu_cfg
 
+    # Use genesis config from TOML if CLI option is default and TOML has it
+    if genesis_config == "genesis_block.json" and "genesis_config" in conf:
+        genesis_config = conf["genesis_config"]
+
     # Print final configuration if requested
     if debug_config or ctx.obj.get("debug_config", False):
         _print_final_config(conf, "gpu")
@@ -501,6 +509,10 @@ def qpu(
     if not qpu_cfg:
         qpu_cfg = {}
     conf["qpu"] = qpu_cfg
+
+    # Use genesis config from TOML if CLI option is default and TOML has it
+    if genesis_config == "genesis_block.json" and "genesis_config" in conf:
+        genesis_config = conf["genesis_config"]
 
     # Print final configuration if requested
     if debug_config or ctx.obj.get("debug_config", False):
@@ -666,7 +678,8 @@ def quip_node_stats(ctx: click.Context, config: Optional[str], interval: float):
     """
     cfg = _load_config(config)
     miners_config = cfg or {}
-    node = Node(node_id="stats-node", miners_config=miners_config)
+    genesis_block=load_genesis_block(cfg.get("genesis_config", "genesis_block.json"))
+    node = Node(node_id="stats-node", miners_config=miners_config, genesis_block=genesis_block)
     click.echo("Starting stats loop (Ctrl-C to stop)...")
     try:
         while True:
