@@ -55,7 +55,8 @@ def _load_config(path: Optional[str]) -> Dict[str, Any]:
 
     _print_final_config(cfg, "load_config")
 
-    return conf
+    return cfg
+
 
 def _merge_globals_from_toml(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Flatten [global] section of TOML into NetworkNode config keys.
