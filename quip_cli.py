@@ -246,17 +246,24 @@ def quip_network_node(ctx: click.Context, config: Optional[str], version: bool, 
         cfg = ctx.obj.get("toml", {})
         global_cfg = (cfg.get("global", {}) or {})
         default_cmd = (global_cfg or {}).get("default")
-        if not default_cmd:
-            raise click.UsageError("No subcommand given and no [global].default in config")
-        default_cmd = str(default_cmd).lower()
-        if default_cmd not in {"cpu", "gpu", "qpu"}:
-            raise click.UsageError(f"Invalid default subcommand '{default_cmd}' in config; expected cpu/gpu/qpu")
-        if default_cmd == "cpu":
-            ctx.invoke(cpu)
-        elif default_cmd == "gpu":
-            ctx.invoke(gpu)
-        else:
-            ctx.invoke(qpu)
+        
+
+        # Check if any miner sections are present
+        has_miners = any(k in cfg for k in ("cpu", "gpu", "qpu"))
+        if not has_miners:
+            raise click.UsageError("No subcommand given, no [global].default in config, and no miner sections ([cpu], [gpu], [qpu]) found in config")
+        
+        # Auto-configure: merge globals with all available miner sections
+        conf = _merge_globals_from_toml(cfg)
+        
+        # Apply debug config from global options
+        if ctx.obj.get("debug_config", False):
+            _print_final_config(conf, "auto-configured")
+        
+        # Use genesis_block.json as default genesis config
+        genesis_config = "genesis_block.json"
+        
+        sys.exit(_run_network_node_sync(conf, genesis_config))
 
 
 # Subcommands: cpu/gpu/qpu. Each builds a NetworkNode config from TOML and CLI flags.
