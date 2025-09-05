@@ -21,12 +21,12 @@ The blockchain demonstrates:
    source .quip/bin/activate  # Windows: .venv\Scripts\activate
    ```
 
-2. Install the package in editable mode using the standardized requirements file:
+2. Install the package in editable mode:
    ```bash
    pip install -U pip setuptools wheel
    pip install -e .
    ```
-   This will install all dependencies from requirements.txt and register console scripts.
+   This will install all dependencies from pyproject.toml and register console scripts.
 
 3. Set up D-Wave API credentials (optional, for QPU access):
    ```bash
@@ -190,21 +190,37 @@ WantedBy=multi-user.target
 
 1. **Create directories and user**:
    ```bash
-   sudo mkdir -p /etc/QUIP.network
-   sudo mkdir -p /var/log/QUIP-node
-   sudo mkdir -p /var/lib/QUIP-node
-   sudo useradd --system --shell /bin/false --home /var/lib/QUIP-node --create-home QUIP
-   sudo chown -R QUIP:QUIP /var/log/QUIP-node /var/lib/QUIP-node
+   sudo mkdir -p /etc/quip.network
+   sudo mkdir -p /var/log/quip.network
+   sudo mkdir -p /var/lib/quip.network
+   sudo mkdir -p /opt/quip
+   sudo useradd --system --shell /bin/false --home /var/lib/quip.network --create-home quip
+   sudo chown -R quip:quip /var/log/quip.network /var/lib/quip.network /etc/quip.network /opt/quip
    ```
 
-2. **Copy and configure**:
+2. **Install Python virtual environment**:
    ```bash
-   sudo cp QUIP-node.example.toml /etc/QUIP.network/config.toml
-   sudo chown QUIP:QUIP /etc/QUIP.network/config.toml
-   # Edit /etc/QUIP.network/config.toml as needed - all configuration goes here
+   # Create virtual environment at /opt/quip
+   sudo -u quip python3 -m venv /opt/quip
+   
+   # Install quip-protocol in the virtual environment (includes all dependencies)
+   sudo -u quip /opt/quip/bin/pip install -U pip setuptools wheel
+   sudo cp -r /path/to/quip-protocol /opt/quip/src
+   sudo chown -R quip:quip /opt/quip/src
+   sudo -u quip /opt/quip/bin/pip install -e /opt/quip/src
+   
+   # Note: Replace /path/to/quip-protocol with actual path to your source code
+   # The pip install -e command will automatically install all dependencies from pyproject.toml
    ```
 
-3. **Install and enable service**:
+3. **Copy and configure**:
+   ```bash
+   sudo cp quip-node.example.toml /etc/quip.network/config.toml
+   sudo chown quip:quip /etc/quip.network/config.toml
+   # Edit /etc/quip.network/config.toml as needed - all configuration goes here
+   ```
+
+4. **Install and enable service**:
    ```bash
    sudo cp quip-network-node.service /etc/systemd/system/
    sudo systemctl daemon-reload
@@ -212,7 +228,7 @@ WantedBy=multi-user.target
    sudo systemctl start quip-network-node
    ```
 
-4. **Monitor the service**:
+5. **Monitor the service**:
    ```bash
    sudo systemctl status quip-network-node
    journalctl -u quip-network-node -f

@@ -1,5 +1,5 @@
 [Unit]
-Description=QuIP Network Node
+Description=Quip Network Node
 After=network.target
 Wants=network.target
 
@@ -7,9 +7,9 @@ Wants=network.target
 Type=simple
 User=quip
 Group=quip
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
-Environment=PYTHONPATH=/usr/local/lib/python3.10/site-packages
-ExecStart=/usr/local/bin/quip-network-node cpu --config /etc/quip.network/config.toml
+Environment=PATH=/opt/quip/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=/opt/quip/lib/python3.13/site-packages
+ExecStart=/opt/quip/bin/quip-network-node --config /etc/quip.network/config.toml
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -21,7 +21,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/log/quip-node /var/lib/quip-node
+ReadWritePaths=/var/log/quip.network /var/lib/quip.network
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 
