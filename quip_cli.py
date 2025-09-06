@@ -49,9 +49,12 @@ def _load_config(path: Optional[str]) -> Dict[str, Any]:
         os.environ["DWAVE_API_TOKEN"] = qpu_config["dwave_api_token"]
 
     cfg = _merge_globals_from_toml(config)
-    cfg["qpu"] = qpu_config
-    cfg["gpu"] = config.get("gpu", {})
-    cfg["cpu"] = config.get("cpu", {})
+    if qpu_config:
+        cfg["qpu"] = qpu_config
+    if "gpu" in config:
+        cfg["gpu"] = config["gpu"]
+    if "cpu" in config:
+        cfg["cpu"] = config["cpu"]
 
     _print_final_config(cfg, "load_config")
 
