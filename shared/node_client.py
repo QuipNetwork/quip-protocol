@@ -347,6 +347,24 @@ class NodeClient:
             self.logger.debug(f"Error gossiping to {host} after {(t_err - t0)*1000.0:.1f} ms: {e}")
             return False
             
+    async def join_network_via_peer(self, peer_address: str, join_data: dict) -> Optional[dict]:
+        """Connect to peer and get network join response using proper SSL-aware connection."""
+        if not self.http_session:
+            return None
+
+        # Use proper SSL-aware connection establishment
+        conn_str = await self._ensure_connection_string(peer_address)
+        if not conn_str:
+            return None
+
+        try:
+            async with self.http_session.post(f"{conn_str}/join", json=join_data) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return None
+        except Exception:
+            return None
+
     async def _send_gossip_message(self, host: str, message: 'Message'):
         """Send a single gossip message to a peer (legacy wrapper)."""
         return await self.gossip_to(host, message)

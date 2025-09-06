@@ -913,11 +913,11 @@ class NetworkNode(Node):
 
     async def connect_to_peer(self, peer_address: str) -> bool:
         """Connect to a peer and join the network."""
-        if not self.node_client or not self.node_client.http_session:
+        if not self.node_client:
             return False
+
         try:
-            # Send join request using node_client's HTTP session
-            data = {
+            join_data = {
                 "host": self.public_host,
                 "version": get_version(),
                 "capabilities": ["mining", "relay"],
@@ -925,30 +925,26 @@ class NetworkNode(Node):
                 "info": self.info().to_json()
             }
 
-            async with self.node_client.http_session.post(
-                f"http://{peer_address}/join",
-                json=data
-            ) as resp:
-                if resp.status == 200:
-                    result = await resp.json()
+            # Use NodeClient's SSL-aware connection method
+            result = await self.node_client.join_network_via_peer(peer_address, join_data)
+            if not result:
+                self.logger.warning(f"Failed to join via {peer_address}")
+                return False
 
-                    # Add all nodes from the peer's node list
-                    peers_found = 0
-                    peers_map = result.get("peers", {}) or {}
-                    for peer_host, peer_info_json in peers_map.items():
-                        # except ourselves
-                        if peer_host == self.public_host:
-                            continue
-                        info = MinerInfo.from_json(peer_info_json)
-                        await self.add_peer(peer_host, info)
-                        peers_found += 1
+            # Add all nodes from the peer's node list
+            peers_found = 0
+            peers_map = result.get("peers", {}) or {}
+            for peer_host, peer_info_json in peers_map.items():
+                # except ourselves
+                if peer_host == self.public_host:
+                    continue
+                info = MinerInfo.from_json(peer_info_json)
+                await self.add_peer(peer_host, info)
+                peers_found += 1
 
-                    self.logger.info(f"Successfully joined network via {peer_address}")
-                    self.logger.info(f"Discovered {peers_found} peers")
-                    return True
-                else:
-                    self.logger.warning(f"Failed to join via {peer_address}: {resp.status}")
-                    return False
+            self.logger.info(f"Successfully joined network via {peer_address}")
+            self.logger.info(f"Discovered {peers_found} peers")
+            return True
 
         except Exception as e:
             self.logger.warning(f"Failed to connect to peer {peer_address}: {e}")
