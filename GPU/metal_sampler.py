@@ -3,6 +3,7 @@
 import os
 import math
 import time
+import logging
 from typing import Any, Dict, List, Tuple, Optional
 import collections.abc
 
@@ -22,9 +23,9 @@ except ImportError:
 class MetalSampler(MockDWaveSampler):
     """Metal-specific GPU sampler with performance debugging."""
 
-    def __init__(self, device: str = "mps"):
+    def __init__(self, device: str = "mps", logger: Optional[logging.Logger] = None):
         self._device_str = str(device)
-        self._debug = os.getenv("QUIP_DEBUG") == "1"
+        self.logger = logger or logging.getLogger(__name__)
         self.sampler_type = "metal"
         
         if torch is None:
@@ -33,8 +34,7 @@ class MetalSampler(MockDWaveSampler):
         # Initialize Metal device
         self._device = self._init_metal_device()
         
-        if self._debug:
-            print(f"[MetalSampler] Initialized device={self._device}", flush=True)
+        self.logger.debug(f"[MetalSampler] Initialized device={self._device}")
 
         # Use the default topology (Pegasus) from quantum_proof_of_work
         topology_graph = create_topology_graph()
@@ -85,8 +85,7 @@ class MetalSampler(MockDWaveSampler):
     
     def sample_ising(self, h, J, num_reads=100, num_sweeps=512, **kwargs) -> dimod.SampleSet:
         """Run Metal-optimized simulated annealing with debugging."""
-        if self._debug:
-            print(f"[MetalSampler] Starting sampling: reads={num_reads}, sweeps={num_sweeps}", flush=True)
+        self.logger.debug(f"[MetalSampler] Starting sampling: reads={num_reads}, sweeps={num_sweeps}")
         
         # Convert to dicts for processing
         h_dict = dict(h) if hasattr(h, 'items') else {i: h[i] for i in range(len(h))}
@@ -98,8 +97,7 @@ class MetalSampler(MockDWaveSampler):
         samples, energies = self._metal_simulated_annealing(h_dict, J_dict, num_reads, num_sweeps)
         
         total_time = time.time() - start_time
-        if self._debug:
-            print(f"[MetalSampler] Completed in {total_time:.3f}s ({total_time/num_sweeps*1000:.2f}ms per sweep)", flush=True)
+        self.logger.debug(f"[MetalSampler] Completed in {total_time:.3f}s ({total_time/num_sweeps*1000:.2f}ms per sweep)")
 
         # Convert samples to the format expected by dimod.SampleSet.from_samples
         sample_dicts = []
@@ -126,8 +124,7 @@ class MetalSampler(MockDWaveSampler):
         if n <= 0:
             raise ValueError("Invalid problem size")
             
-        if self._debug:
-            print(f"[MetalSampler] Problem size: {n} variables, {len(J)} couplings", flush=True)
+        self.logger.debug(f"[MetalSampler] Problem size: {n} variables, {len(J)} couplings")
             
         # CRITICAL FIX: Create node_id → position mapping for non-sequential Pegasus topology
         # Pegasus nodes are like [30,31,...,2849,2910,...,5729] with gaps, not [0,1,2,...,n-1]
@@ -170,7 +167,7 @@ class MetalSampler(MockDWaveSampler):
         # Only use moderate PMSA for very small read counts
         if num_reads < 32:  
             num_reads = max(num_reads * 2, 32)  # Minimal PMSA
-            print(f"[MetalSampler] PMSA: Using {num_reads} parallel chains (was {original_reads})")
+            self.logger.debug(f"[MetalSampler] PMSA: Using {num_reads} parallel chains (was {original_reads})")
         
         R = num_reads
         
@@ -178,8 +175,7 @@ class MetalSampler(MockDWaveSampler):
         spins = (torch.rand((R, n), device=self._device) > 0.5).to(torch.int8)
         spins = spins * 2 - 1  # {0,1} -> {-1,1}
         
-        if self._debug:
-            print(f"[MetalSampler] Metal params: updates_per_sweep={updates_per_sweep} (corrected SA minimization)", flush=True)
+        self.logger.debug(f"[MetalSampler] Metal params: updates_per_sweep={updates_per_sweep} (corrected SA minimization)")
 
         # Exact D-Wave beta schedule for proper simulated annealing
         # D-Wave uses: β = 0.0231 to 6.6214 (temps 43.3 to 0.15)
@@ -192,8 +188,7 @@ class MetalSampler(MockDWaveSampler):
         ar = torch.arange(R, device=self._device, dtype=torch.int32)  # Use int32 for MPS performance
         
         setup_time = time.time() - setup_start
-        if self._debug:
-            print(f"[MetalSampler] Setup completed in {setup_time:.3f}s", flush=True)
+        self.logger.debug(f"[MetalSampler] Setup completed in {setup_time:.3f}s")
 
         # Annealing loop with timing
         anneal_start = time.time()
@@ -271,12 +266,11 @@ class MetalSampler(MockDWaveSampler):
                             local_field = neighbor_sum + h_vec
             
             sweep_time = time.time() - sweep_start
-            if self._debug and (sweep_idx < 3 or sweep_idx % max(num_sweeps // 10, 1) == 0):
-                print(f"[MetalSampler] Sweep {sweep_idx}/{num_sweeps} took {sweep_time*1000:.1f}ms", flush=True)
+            if sweep_idx < 3 or sweep_idx % max(num_sweeps // 10, 1) == 0:
+                self.logger.debug(f"[MetalSampler] Sweep {sweep_idx}/{num_sweeps} took {sweep_time*1000:.1f}ms")
 
         anneal_time = time.time() - anneal_start
-        if self._debug:
-            print(f"[MetalSampler] Annealing completed in {anneal_time:.3f}s", flush=True)
+        self.logger.debug(f"[MetalSampler] Annealing completed in {anneal_time:.3f}s")
 
         # Final energy computation - OPTIMIZED GPU version instead of slow CPU loops
         energy_start = time.time()
@@ -305,8 +299,7 @@ class MetalSampler(MockDWaveSampler):
             energies_cpu = all_energies
         
         energy_time = time.time() - energy_start
-        if self._debug:
-            print(f"[MetalSampler] Energy computation: {energy_time:.3f}s", flush=True)
-            print(f"[MetalSampler] Timing breakdown: setup={setup_time:.3f}s, anneal={anneal_time:.3f}s, energy={energy_time:.3f}s", flush=True)
+        self.logger.debug(f"[MetalSampler] Energy computation: {energy_time:.3f}s")
+        self.logger.debug(f"[MetalSampler] Timing breakdown: setup={setup_time:.3f}s, anneal={anneal_time:.3f}s, energy={energy_time:.3f}s")
         
         return samples_cpu, energies_cpu

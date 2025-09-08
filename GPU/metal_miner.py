@@ -23,15 +23,20 @@ from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
 class MetalMiner(BaseMiner):
     def __init__(self, miner_id: str, **cfg):
         try:
+            # Initialize base miner first to get the logger
             sampler = MetalSampler("mps")
             super().__init__(miner_id, sampler, miner_type="GPU-MPS")
+            # Now update sampler with our logger
+            sampler.logger = self.logger
             self.miner_type = "GPU-MPS"
             self.logger.info(f"Using MetalSampler (MPS)")
         except Exception as e:
-            self.logger.warning(f"Metal GPU initialization failed, falling back to CPU: {e}")
+            # For fallback case, we can't use logger yet since super().__init__() wasn't called
             sampler = SimulatedAnnealingStructuredSampler()
             super().__init__(miner_id, sampler, miner_type="CPU-FALLBACK")
             self.miner_type = "CPU-FALLBACK"
+            # Now we can use logger
+            self.logger.warning(f"Metal GPU initialization failed, falling back to CPU: {e}")
         
     def mine_block(
         self,
