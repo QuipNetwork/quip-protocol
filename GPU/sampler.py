@@ -92,31 +92,29 @@ class GPUSampler(MockDWaveSampler):
     def _gpu_simulated_annealing(self, h: Dict[int, float], J: Dict[Tuple[int, int], float], 
                                 num_reads: int, num_sweeps: int) -> Tuple[List[List[int]], List[float]]:
         """Run simulated annealing on GPU."""
-        print(f"[GPU annealing] Starting with |h|={len(h)}, |J|={len(J)}", flush=True)
+        self.logger.debug(f"[GPU annealing] Starting with |h|={len(h)}, |J|={len(J)}")
         
         # Build tensors
-        print(f"[GPU annealing] Building tensors...", flush=True)
-        # CRITICAL FIX: Use actual number of nodes, not max node ID + 1
+        self.logger.debug(f"[GPU annealing] Building tensors...")
         # Pegasus topology has 5640 nodes but max node ID is 5729 (gaps in numbering)
         # We need tensor size = number of actual nodes, not max ID + 1
         n = len(self.nodes)  # Use actual node count (5640) not max node ID + 1 (5730)
-        print(f"[GPU annealing] Problem size n={n} (corrected from max node ID approach)", flush=True)
+        self.logger.debug(f"[GPU annealing] Problem size n={n} (corrected from max node ID approach)")
         
-        # CRITICAL FIX: Create node_id → position mapping for non-sequential Pegasus topology  
         # Pegasus nodes are like [30,31,...,2849,2910,...,5729] with gaps, not [0,1,2,...,n-1]
         node_to_pos = {int(node_id): pos for pos, node_id in enumerate(self.nodes)}
-        print(f"[GPU annealing] Created node mapping for {len(self.nodes)} Pegasus nodes", flush=True)
+        self.logger.debug(f"[GPU annealing] Created node mapping for {len(self.nodes)} Pegasus nodes")
             
-        print(f"[GPU annealing] Creating h_vec tensor with proper node mapping...", flush=True)
+        self.logger.debug(f"[GPU annealing] Creating h_vec tensor with proper node mapping...")
         h_vec = torch.zeros(n, device=self._device, dtype=torch.float32)
         for node_id, v in h.items():
             pos = node_to_pos.get(int(node_id))
             if pos is not None:
                 h_vec[pos] = float(v)
-        print(f"[GPU annealing] h_vec created with {len(h)} nonzero elements correctly mapped", flush=True)
+        self.logger.debug(f"[GPU annealing] h_vec created with {len(h)} nonzero elements correctly mapped")
             
         if J:
-            print(f"[GPU annealing] Creating J tensors with proper node mapping...", flush=True)
+            self.logger.debug(f"[GPU annealing] Creating J tensors with proper node mapping...")
             # Convert node IDs to tensor positions using the mapping
             i_pos = []
             j_pos = []
@@ -135,40 +133,39 @@ class GPUSampler(MockDWaveSampler):
             i_idx = torch.tensor(i_pos, device=self._device, dtype=torch.long)
             j_idx = torch.tensor(j_pos, device=self._device, dtype=torch.long)
             j_vals = torch.tensor(j_vals_list, device=self._device, dtype=torch.float32)
-            print(f"[GPU annealing] J tensors created with {len(j_vals_list)}/{len(J)} edges correctly mapped", flush=True)
+            self.logger.debug(f"[GPU annealing] J tensors created with {len(j_vals_list)}/{len(J)} edges correctly mapped")
         else:
             i_idx = j_idx = j_vals = None
-            print(f"[GPU annealing] No J coupling terms", flush=True)
+            self.logger.debug(f"[GPU annealing] No J coupling terms")
             
         # Generate random spins {-1,1}
-        print(f"[GPU annealing] Generating initial spins ({num_reads} x {n})...", flush=True)
+        self.logger.debug(f"[GPU annealing] Generating initial spins ({num_reads} x {n})...")
         spins = (torch.rand((num_reads, n), device=self._device) > 0.5).to(torch.int8)
         spins = spins * 2 - 1  # {0,1} -> {-1,1}
-        print(f"[GPU annealing] Initial spins generated", flush=True)
+        self.logger.debug(f"[GPU annealing] Initial spins generated")
 
         # Highly optimized simulated annealing for GPU
-        print(f"[GPU annealing] Starting optimized annealing loop...", flush=True)
+        self.logger.debug(f"[GPU annealing] Starting optimized annealing loop...")
         
         # CPU-LIKE: Match working CPU SA parameters for correctness
         target_sweeps = num_sweeps  # Use full sweep count like CPU
-        print(f"[GPU annealing] CPU-LIKE: Using full {target_sweeps} sweeps for SA correctness", flush=True)
+        self.logger.debug(f"[GPU annealing] CPU-LIKE: Using full {target_sweeps} sweeps for SA correctness")
         
-        # OPTIMIZED cooling schedule - match DWave's proven SA approach  
+        # OPTIMIZED cooling schedule - match DWave's SA approach  
         # Use the actual DWave temperature range that works for CPU
         beta_start = 0.1   # DWave standard start (T=10)
         beta_end = 10.0    # Higher end temp for better fine-tuning (T=0.1)
         betas = torch.logspace(math.log10(beta_start), math.log10(beta_end), steps=target_sweeps, device=self._device, dtype=torch.float32)
         
-        # INCREASED parallelism: Use GPU's strength to run more chains in parallel
         R = max(num_reads, 64)  # More parallel chains for better solutions
         if R != num_reads:
-            print(f"[GPU annealing] Using {R} parallel chains (was {num_reads}) to find best solutions", flush=True)
+            self.logger.debug(f"[GPU annealing] Using {R} parallel chains (was {num_reads}) to find best solutions")
         
         ar = torch.arange(R, device=self._device)
         
         # BALANCED updates per sweep - not too many to avoid inefficiency
         updates_per_sweep = max(n // 8, 128)  # Moderate updates for efficiency
-        print(f"[GPU annealing] Using {updates_per_sweep} updates per sweep (balanced approach)", flush=True)
+        self.logger.debug(f"[GPU annealing] Using {updates_per_sweep} updates per sweep (balanced approach)")
         
         # Pre-allocate tensors with the optimized dimensions
         neighbor_sum = torch.zeros((R, n), device=self._device, dtype=torch.float32)
@@ -180,11 +177,11 @@ class GPUSampler(MockDWaveSampler):
             spins = spins * 2 - 1  # {0,1} -> {-1,1}
             ar = torch.arange(R, device=self._device)  # Update ar as well
         
-        print(f"[GPU annealing] Pre-allocated tensors ({R}, {n})", flush=True)
+        self.logger.debug(f"[GPU annealing] Pre-allocated tensors ({R}, {n})")
 
         for sweep_idx, beta in enumerate(betas):
             if sweep_idx % max(target_sweeps // 5, 1) == 0:
-                print(f"[GPU annealing] Sweep {sweep_idx}/{target_sweeps}", flush=True)
+                self.logger.debug(f"[GPU annealing] Sweep {sweep_idx}/{target_sweeps}")
                 
             # ULTRA-FAST: Use matrix multiplication instead of scatter operations
             if i_idx is not None:
@@ -248,7 +245,7 @@ class GPUSampler(MockDWaveSampler):
                         neighbor_sum.scatter_add_(1, i_idx.unsqueeze(0).expand(R, -1), spins_float[:, j_idx] * j_vals)
                         local_field = neighbor_sum + h_vec
 
-        print(f"[GPU annealing] Annealing loop completed, computing final energies...", flush=True)
+        self.logger.debug(f"[GPU annealing] Annealing loop completed, computing final energies...")
         
         # OPTIMIZED energy computation - minimize GPU->CPU transfers
         spins_float = spins.to(torch.float32)  # Convert once
@@ -275,7 +272,7 @@ class GPUSampler(MockDWaveSampler):
             final_spins = spins
             final_energies = total_energies
         
-        print(f"[GPU annealing] Returning {len(final_energies)} best samples from {R} parallel chains", flush=True)
+        self.logger.debug(f"[GPU annealing] Returning {len(final_energies)} best samples from {R} parallel chains")
         
         # Convert to Python lists (matches expected interface)
         samples_cpu = final_spins.cpu().tolist()
@@ -285,20 +282,20 @@ class GPUSampler(MockDWaveSampler):
 
     def sample_ising(self, h, J, num_reads=100, num_sweeps=512, **kwargs) -> dimod.SampleSet:
         """Run simulated annealing on GPU directly."""
-        print(f"[GPU sampler] Starting sampling on device={self._device} reads={num_reads} sweeps={num_sweeps}", flush=True)
+        self.logger.debug(f"[GPU sampler] Starting sampling on device={self._device} reads={num_reads} sweeps={num_sweeps}")
         
         self.logger.debug(f"[GPU sampler pid={os.getpid()}] sampling device={self._device} reads={num_reads} sweeps={num_sweeps}")
         
         # Convert to dicts for processing
-        print(f"[GPU sampler] Converting h,J to dicts...", flush=True)
+        self.logger.debug(f"[GPU sampler] Converting h,J to dicts...")
         h_dict = dict(h) if hasattr(h, 'items') else {i: h[i] for i in range(len(h))}
         J_dict = dict(J) if hasattr(J, 'items') else J
-        print(f"[GPU sampler] Converted to dicts: |h|={len(h_dict)}, |J|={len(J_dict)}", flush=True)
+        self.logger.debug(f"[GPU sampler] Converted to dicts: |h|={len(h_dict)}, |J|={len(J_dict)}")
         
         # Run GPU simulated annealing
-        print(f"[GPU sampler] Calling _gpu_simulated_annealing...", flush=True)
+        self.logger.debug(f"[GPU sampler] Calling _gpu_simulated_annealing...")
         samples, energies = self._gpu_simulated_annealing(h_dict, J_dict, num_reads, num_sweeps)
-        print(f"[GPU sampler] GPU annealing completed, got {len(samples)} samples", flush=True)
+        self.logger.debug(f"[GPU sampler] GPU annealing completed, got {len(samples)} samples")
 
         # Convert samples to the format expected by dimod.SampleSet.from_samples
         # samples should be a list of dicts mapping variables to values
