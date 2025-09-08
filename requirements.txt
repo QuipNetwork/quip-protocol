@@ -9,3 +9,6 @@ click>=8.1.7
 tomli>=2.0.1; python_version<'3.11'
 hashsigs>=0.0.2
 blake3>=1.0.5
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
