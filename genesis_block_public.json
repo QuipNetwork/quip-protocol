@@ -1,0 +1,18 @@
+{
+  "header": {
+    "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "index": 0,
+    "timestamp": 1640995200.0,
+    "data_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "data": "Genesis Block - Quip Protocol",
+  "next_block_requirements": {
+    "difficulty_energy": -12200.0,
+    "min_diversity": 0.25,
+    "min_solutions": 15,
+    "timeout_to_difficulty_adjustment_decay": 120.0,
+    "max_mining_time": 3600.0
+  },
+  "quantum_proof": null,
+  "miner_info": null
+}
