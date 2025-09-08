@@ -77,14 +77,21 @@ class CudaMiner(BaseMiner):
         edges = self.sampler.edges
 
         while self.mining and not stop_event.is_set():
+            self.logger.debug(f"[GPU-CUDA] Starting mining attempt {progress+1}")
+            
             # Generate random salt for each attempt
             salt = random.randbytes(32)
+            self.logger.debug(f"[GPU-CUDA] Generated salt: {salt.hex()[:8]}...")
             
             # Generate quantum model using deterministic block-based seeding
             timestamp = int(time.time())
+            self.logger.debug(f"[GPU-CUDA] Generating nonce for timestamp {timestamp}")
             nonce = ising_nonce_from_block(prev_block.hash, node_info.miner_id, cur_index, salt)
+            self.logger.debug(f"[GPU-CUDA] Generated nonce: {nonce}")
 
+            self.logger.debug(f"[GPU-CUDA] Generating Ising model from nonce")
             h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+            self.logger.debug(f"[GPU-CUDA] Generated model: |h|={len(h)}, |J|={len(J)}")
 
             # Update requirements if necessary.
             updated_requirements = compute_current_requirements(requirements, prev_timestamp, self.logger)
@@ -112,10 +119,12 @@ class CudaMiner(BaseMiner):
                 # For GPU, use adaptive parameters
                 num_sweeps = params.get('num_sweeps', 512)
                 num_reads = params.get('num_reads', 100)
+                self.logger.debug(f"[GPU-CUDA] Using sampling params: sweeps={num_sweeps}, reads={num_reads}")
                 
                 sample_start = time.time()
                 self.current_stage = 'sampling'
                 self.current_stage_start = sample_start
+                self.logger.debug(f"[GPU-CUDA] Starting GPU sampling...")
                 
                 # Build sampling parameters based on sampler type
                 sampling_params = {
@@ -125,8 +134,10 @@ class CudaMiner(BaseMiner):
                     'num_sweeps': num_sweeps
                 }
                 
+                self.logger.debug(f"[GPU-CUDA] Calling sampler.sample_ising...")
                 sampleset = self.sampler.sample_ising(**sampling_params)
                 sample_time = time.time() - sample_start
+                self.logger.debug(f"[GPU-CUDA] GPU sampling completed in {sample_time:.2f}s")
                 
                 # Estimate GPU timing components
                 self.timing_stats['sampling'].append(sample_time * 1e6)  # Convert to microseconds
@@ -187,18 +198,20 @@ class CudaMiner(BaseMiner):
 def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutions: int):
     """Calculate adaptive mining parameters based on difficulty requirements.
 
-    Supports either a BlockRequirements object or a dict with keys:
-    'difficulty_energy', 'min_diversity', 'min_solutions'.
+    Optimized for GPU CUDA performance - uses much lower sweep counts than CPU
+    since GPU parallelism allows faster convergence with fewer sweeps.
     """
     # Normalize difficulty factor (more negative = harder)
     difficulty_factor = abs(difficulty_energy) / 1000.0  # Base around -1000
 
-    # GPU CUDA parameters
-    base_sweeps = 512
-    num_sweeps = int(base_sweeps * (difficulty_factor ** 1.5))  # Exponential scaling
-    num_reads = max(int(min_solutions) * 3, 64)  # At least 3x required solutions
+    # GPU CUDA parameters - optimized for fast convergence
+    # GPU can afford fewer sweeps due to massive parallelism
+    base_sweeps = 64  # Much lower base than CPU (was 512, now 8x faster)
+    # Use square root scaling instead of exponential to prevent explosion
+    num_sweeps = int(base_sweeps * (difficulty_factor ** 0.5))  # Gentler scaling
+    num_reads = max(int(min_solutions) * 2, 32)  # Reduce reads slightly
 
     return {
-        'num_sweeps': max(128, min(num_sweeps, 32768)),  # Reasonable bounds for GPU
-        'num_reads': max(64, min(num_reads, 1000)),      # Reasonable bounds
+        'num_sweeps': max(32, min(num_sweeps, 512)),     # Much lower max (was 32768)
+        'num_reads': max(32, min(num_reads, 200)),       # Reasonable bounds
     }
