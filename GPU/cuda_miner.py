@@ -21,8 +21,11 @@ from GPU.sampler import GPUSampler
 
 class CudaMiner(BaseMiner):
     def __init__(self, miner_id: str, device: str = "0", **cfg):
+        # Initialize base miner first to get the logger
         sampler = GPUSampler(str(device))
         super().__init__(miner_id, sampler)
+        # Now update sampler with our logger
+        sampler.logger = self.logger
         self.miner_type = f"GPU-LOCAL:{device}"
         
     def mine_block(
@@ -206,7 +209,7 @@ def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutio
 
     # GPU CUDA parameters - optimized for fast convergence
     # GPU can afford fewer sweeps due to massive parallelism
-    base_sweeps = 64  # Much lower base than CPU (was 512, now 8x faster)
+    base_sweeps = 512  # Much lower base than CPU (was 512, now 8x faster)
     # Use square root scaling instead of exponential to prevent explosion
     num_sweeps = int(base_sweeps * (difficulty_factor ** 0.5))  # Gentler scaling
     num_reads = max(int(min_solutions) * 2, 32)  # Reduce reads slightly

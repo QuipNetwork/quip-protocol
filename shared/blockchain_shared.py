@@ -411,7 +411,7 @@ class SharedMiningNode:
             )
             
         try:
-            gpu_sampler = GPUSampler(self.gpu_type)
+            gpu_sampler = GPUSampler(self.gpu_type, logger=logger)
             
             # Override blockchain sampler temporarily
             original_sampler = self.blockchain.sampler
