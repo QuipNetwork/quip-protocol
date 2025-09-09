@@ -28,25 +28,25 @@ import logging
 # Global logger for this module
 log = None
 
-def _setup_child_process_logging():
-    """Set up logging for child processes to use QuipFormatter."""
+def _setup_child_process_logging(log_queue=None):
+    """Set up logging for child processes to use QuipFormatter and optionally queue logging."""
     global log
 
     # Get root logger
     root_logger = logging.getLogger()
 
-    # Check if QuipFormatter is already configured
-    has_quip_formatter = any(
-        isinstance(handler.formatter, QuipFormatter)
-        for handler in root_logger.handlers
-    )
+    # Clear existing handlers to avoid duplicates
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
 
-    if not has_quip_formatter:
-        # Clear existing handlers
-        for handler in root_logger.handlers[:]:
-            root_logger.removeHandler(handler)
-
-        # Add QuipFormatter
+    if log_queue is not None:
+        # Use queue handler to send logs to parent process
+        from logging.handlers import QueueHandler
+        queue_handler = QueueHandler(log_queue)
+        root_logger.addHandler(queue_handler)
+        root_logger.setLevel(logging.DEBUG)  # Let parent process filter
+    else:
+        # Fallback to console logging with QuipFormatter
         formatter = QuipFormatter()
         handler = logging.StreamHandler()
         handler.setFormatter(formatter)
@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 
 import multiprocessing as mp
 import multiprocessing.synchronize as mpsync
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import CPU
 import GPU
@@ -88,9 +88,9 @@ def build_miner_from_spec(spec: Dict[str, Any]):
         raise ValueError(f"Unknown miner kind '{kind}'")
 
 
-def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any]):
+def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any], log_queue: Optional[mp.Queue] = None):
     # Set up logging for child process
-    _setup_child_process_logging()
+    _setup_child_process_logging(log_queue)
 
     miner = build_miner_from_spec(spec)
     current_stop: mpsync.Event = mp.Event()
@@ -135,13 +135,13 @@ def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any]):
 
 class MinerHandle:
     """Wrapper around a persistent miner worker process."""
-    def __init__(self, ctx, spec: dict):
+    def __init__(self, ctx, spec: dict, log_queue: Optional[mp.Queue] = None):
         self.spec = spec
         self.req: mp.Queue = ctx.Queue()
         self.resp: mp.Queue = ctx.Queue()
         self.proc: mp.Process = ctx.Process(
             target=miner_worker_main,
-            args=(self.req, self.resp, spec),
+            args=(self.req, self.resp, spec, log_queue),
         )
 
         self.proc.start()

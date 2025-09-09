@@ -12,6 +12,7 @@ import time
 from blake3 import blake3
 from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING, Callable, Awaitable, Union
 from multiprocessing.synchronize import Event as EventType
+from logging.handlers import QueueListener
 import aiohttp
 
 if TYPE_CHECKING:
@@ -65,6 +66,14 @@ class Node:
         seed = blake3(secret.encode()).digest()
         self.crypto = BlockSigner(seed=seed)
 
+        # Set up multiprocessing logging first (before initializing miners)
+        self._log_queue = None
+        self._log_listener = None
+        self._setup_multiprocess_logging()
+
+        # Initialize logger with helper function
+        self.logger = init_component_logger('node', node_id)
+
         # Initialize miners based on config
         self.miners: List[Miner] = []
         self._initialize_miners(cfg=miners_config)
@@ -95,9 +104,6 @@ class Node:
         self._is_mining = False
         self._current_mining_task: Optional[asyncio.Task] = None
 
-        # Initialize logger with helper function
-        self.logger = init_component_logger('node', node_id)
-
         self.logger.info(f"Node {node_id} initialized with {len(getattr(self, 'miner_handles', []))} miners")
         self.logger.debug(f"  ECDSA Public Key: {self.crypto.ecdsa_public_key_hex[:16]}...")
         self.logger.debug(f"  WOTS+ Public Key: {self.crypto.wots_plus_public_key.hex()[:16]}...")
@@ -108,6 +114,24 @@ class Node:
         self.chain: List[Block] = []
         self.chain_lock = asyncio.Lock()
         self.chain.append(genesis_block)
+
+    def _setup_multiprocess_logging(self):
+        """Set up logging queue and listener for multiprocessing."""
+        # Create queue for inter-process logging
+        self._log_queue = multiprocessing.Queue()
+
+        # Get the current root logger's handlers to replicate them in the listener
+        root_logger = logging.getLogger()
+        handlers = []
+
+        # Copy existing handlers from root logger
+        for handler in root_logger.handlers:
+            handlers.append(handler)
+
+        if handlers:
+            # Create listener that will process logs from child processes
+            self._log_listener = QueueListener(self._log_queue, *handlers, respect_handler_level=True)
+            self._log_listener.start()
 
     def _initialize_miners(self, cfg: Dict[str, Any]):
         """Initialize persistent miner workers based on configuration (TOML)."""
@@ -123,7 +147,7 @@ class Node:
                     "kind": "cpu"
                 }
                 # CPU requires no config at this time.
-                self.miner_handles.append(MinerHandle(ctx, spec))
+                self.miner_handles.append(MinerHandle(ctx, spec, self._log_queue))
 
         # GPU Miners, 1 per device or type
         if cfg.get("gpu") is not None:
@@ -137,7 +161,7 @@ class Node:
                         "kind": "cuda",
                         "args": {"device": str(d)}
                     }
-                    self.miner_handles.append(MinerHandle(ctx, spec))
+                    self.miner_handles.append(MinerHandle(ctx, spec, self._log_queue))
             elif gpu_backend == "modal":
                 gpu_types = list(gpu_cfg.get("types") or [])
                 for t in gpu_types:
@@ -146,15 +170,15 @@ class Node:
                         "kind": "modal",
                         "args": {"gpu_type": str(t)}
                     }
-                    self.miner_handles.append(MinerHandle(ctx, spec))
+                    self.miner_handles.append(MinerHandle(ctx, spec, self._log_queue))
             elif gpu_backend == "mps":
                 # can only have one metal miner
                 spec = {
-                    "id": f"{self.node_id}-GPU-MPS", 
+                    "id": f"{self.node_id}-GPU-MPS",
                     "kind": "metal",
                     "args": {"device": "mps"}
                 }
-                self.miner_handles.append(MinerHandle(ctx, spec))
+                self.miner_handles.append(MinerHandle(ctx, spec, self._log_queue))
             else:
                 raise ValueError(f"Unknown GPU backend: {gpu_backend}")
             
@@ -162,7 +186,7 @@ class Node:
         if cfg.get("qpu") is not None:
             spec = {"id": f"{self.node_id}-QPU-1", "kind": "qpu"}
             # QPU requires no config at this time.
-            self.miner_handles.append(MinerHandle(ctx, spec))
+            self.miner_handles.append(MinerHandle(ctx, spec, self._log_queue))
 
         # Back-compat summary list for logs (do not assign to typed self.miners)
         self._summary_miners = [(h.miner_id, h.miner_type) for h in self.miner_handles]
@@ -592,10 +616,17 @@ class Node:
         )
 
     def close(self):
-        """Shutdown all persistent miner workers."""
+        """Shutdown all persistent miner workers and logging."""
         for h in self.miner_handles:
             try:
                 h.close()
+            except Exception:
+                pass
+
+        # Stop the logging listener
+        if self._log_listener:
+            try:
+                self._log_listener.stop()
             except Exception:
                 pass
 
