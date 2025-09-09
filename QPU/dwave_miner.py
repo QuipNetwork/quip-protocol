@@ -63,8 +63,8 @@ class DWaveMiner(BaseMiner):
         min_solutions = current_requirements.min_solutions
 
         params = adapt_parameters(difficulty_energy, min_diversity, min_solutions)
-        self.logger.debug(f"Adaptive params: {params}")
-        
+        self.logger.info(f"{self.miner_id} - Adaptive params: {params}")
+
         # Get topology information from sampler
         nodes = self.sampler.nodes
         edges = self.sampler.edges
@@ -73,6 +73,9 @@ class DWaveMiner(BaseMiner):
             # Check if we should stop before generating model
             if stop_event.is_set():
                 break
+
+            attempt_no = progress + 1
+            self.logger.info(f"[QPU] Starting mining attempt {attempt_no} (reads={params.get('num_reads', 100)}, anneal={params.get('quantum_annealing_time', 20.0)}µs)")
 
             # Generate random salt for each attempt
             salt = random.randbytes(32)
@@ -122,6 +125,7 @@ class DWaveMiner(BaseMiner):
                     annealing_time=annealing_time
                 )
                 sample_time = time.time() - sample_start
+                self.logger.debug(f"QPU sampling completed in {sample_time:.2f}s")
                 
                 # Estimate QPU timing components  
                 self.timing_stats['sampling'].append(sample_time * 1e6)  # Convert to microseconds
@@ -155,6 +159,7 @@ class DWaveMiner(BaseMiner):
             self.timing_stats['blocks_attempted'] += 1
 
             result = self.evaluate_sampleset(sampleset, current_requirements, nodes, edges, nonce, salt, prev_timestamp, start_time)
+            self.logger.debug(f"QPU sampleset evaluated in {time.time() - postprocess_start:.2f}s")
 
             # Track postprocessing time
             self.timing_stats['postprocessing'].append((time.time() - postprocess_start) * 1e6)
@@ -168,9 +173,12 @@ class DWaveMiner(BaseMiner):
 
             progress += 1
 
-            # Progress update
-            if progress % 10 == 0:
-                self.logger.info(f"Progress: {progress} attempts, best result so far - Energy: {min(self.top_attempts[0].sampleset.record.energy):.2f}")
+            # Progress update every attempt (QPU attempts are slower)
+            if self.top_attempts:
+                best_energy = min(self.top_attempts[0].sampleset.record.energy)
+                self.logger.info(f"Progress: {progress} attempts, best energy so far {best_energy:.2f}")
+            else:
+                self.logger.info(f"Progress: {progress} attempts, awaiting first results...")
 
         self.logger.info("Stopping mining, no results found")
         return None
@@ -190,14 +198,14 @@ def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutio
     difficulty_factor = abs(difficulty_energy) / 1000.0  # Base around -1000
 
     # QPU parameters (D-Wave quantum processor optimized)
-    base_reads = 100  # QPU uses reads instead of sweeps
-    num_reads = max(int(base_reads * (difficulty_factor ** 1.2)), int(min_solutions) * 2)  # Scale with difficulty
+    base_reads = 32  # QPU uses reads instead of sweeps
+    num_reads = min(int(base_reads * (difficulty_factor ** 0.05)), 256)
     
     # QPU-specific annealing time (microseconds)
     base_annealing_time = 20.0
     annealing_time = min(base_annealing_time * (difficulty_factor ** 0.5), 2000.0)  # Max 2ms
 
     return {
-        'num_reads': max(64, min(num_reads, 10000)),     # Reasonable bounds for QPU
+        'num_reads': max(min_solutions*2, num_reads),
         'quantum_annealing_time': max(5.0, annealing_time),  # Min 5 microseconds
     }

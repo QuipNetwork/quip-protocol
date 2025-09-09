@@ -942,8 +942,9 @@ class NetworkNode(Node):
                 await self.add_peer(peer_host, info)
                 peers_found += 1
 
-            self.logger.info(f"Successfully joined network via {peer_address}")
-            self.logger.info(f"Discovered {peers_found} peers")
+            if peers_found > 0:
+                self.logger.info(f"Successfully joined network via {peer_address}")
+                self.logger.info(f"Discovered {peers_found} peers")
             return True
 
         except Exception as e:
