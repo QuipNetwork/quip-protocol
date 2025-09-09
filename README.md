@@ -192,7 +192,6 @@ WantedBy=multi-user.target
    ```bash
    sudo mkdir -p /etc/quip.network
    sudo mkdir -p /var/log/quip.network
-   sudo mkdir -p /var/lib/quip.network
    sudo mkdir -p /opt/quip
    sudo useradd --system --shell /bin/false --home /var/lib/quip.network --create-home quip
    sudo chown -R quip:quip /var/log/quip.network /var/lib/quip.network /etc/quip.network /opt/quip
@@ -205,7 +204,8 @@ WantedBy=multi-user.target
    
    # Install quip-protocol in the virtual environment (includes all dependencies)
    sudo -u quip /opt/quip/bin/pip install -U pip setuptools wheel
-   sudo cp -r /path/to/quip-protocol /opt/quip/src
+   cd /path/to/quip-protocol
+   sudo cp -r . /opt/quip/src
    sudo chown -R quip:quip /opt/quip/src
    sudo -u quip /opt/quip/bin/pip install -e /opt/quip/src
    
@@ -217,6 +217,8 @@ WantedBy=multi-user.target
    ```bash
    sudo cp quip-node.example.toml /etc/quip.network/config.toml
    sudo chown quip:quip /etc/quip.network/config.toml
+   sudo cp genesis_block_public.json /etc/quip.network/genesis_block.json
+   sudo chown quip:quip /etc/quip.network/genesis_block.json
    # Edit /etc/quip.network/config.toml as needed - all configuration goes here
    ```
 
