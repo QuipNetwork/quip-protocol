@@ -82,7 +82,6 @@ def build_miner_from_spec(spec: Dict[str, Any]):
 def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any], log_queue: Optional[mp.Queue] = None):
     # Set up logging for child process
     _setup_child_process_logging(log_queue)
-
     miner = build_miner_from_spec(spec)
     current_stop: mpsync.Event = mp.Event()
 
@@ -93,10 +92,7 @@ def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any], l
         op = msg.get("op")
 
         if op == "shutdown":
-            if log:
-                log.info(f"Shutting down miner {miner.miner_id}")
-            else:
-                logger.info(f"Shutting down miner {miner.miner_id}")
+            logger.info(f"Shutting down miner {miner.miner_id}")
             current_stop.set()
             return
         elif op == "get_stats":
@@ -118,10 +114,7 @@ def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any], l
                 resp_q.put(result)
         else:
             resp_q.put({"op": "error", "message": f"Unknown op {op}", "id": spec.get("id")})
-            if log:
-                log.info(f"{miner.miner_id}: Unknown op {op}")
-            else:
-                logger.info(f"{miner.miner_id}: Unknown op {op}")
+            logger.info(f"{miner.miner_id}: Unknown op {op}")
             continue
 
 class MinerHandle:

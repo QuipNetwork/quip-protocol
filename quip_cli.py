@@ -456,6 +456,7 @@ def qpu(
         qpu_cfg["dwave_api_key"] = dwave_api_key
         # Set environment variable for child processes
         os.environ["DWAVE_API_KEY"] = dwave_api_key
+        os.environ["DWAVE_API_TOKEN"] = dwave_api_key
     if dwave_api_solver is not None:
         qpu_cfg["dwave_api_solver"] = dwave_api_solver
         # Set environment variable for child processes
