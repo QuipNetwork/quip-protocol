@@ -48,6 +48,12 @@ def _load_config(path: Optional[str]) -> Dict[str, Any]:
     if "dwave_api_token" in qpu_config:
         os.environ["DWAVE_API_TOKEN"] = qpu_config["dwave_api_token"]
 
+    if "dwave_api_solver" in qpu_config:
+        os.environ["DWAVE_API_SOLVER"] = qpu_config["dwave_api_solver"]
+
+    if "dwave_region_url" in qpu_config:
+        os.environ["DWAVE_REGION_URL"] = qpu_config["dwave_region_url"]
+
     cfg = _merge_globals_from_toml(config)
     if qpu_config:
         cfg["qpu"] = qpu_config
@@ -359,6 +365,12 @@ def gpu(
     debug_config: bool,
 ):
     """Run a GPU-only network node."""
+    # Fix for GPU sampler trying to connect to DWave without credentials
+    if "DWAVE_API_KEY" not in os.environ:
+        os.environ["DWAVE_API_KEY"] = "MISSING IN CONFIG"
+    if "DWAVE_API_TOKEN" not in os.environ:
+        os.environ["DWAVE_API_TOKEN"] = "MISSING IN CONFIG"
+
     # Load full TOML config
     toml_cfg = (ctx.obj or {}).get("config", {})
 
@@ -453,12 +465,31 @@ def qpu(
 
     # Handle QPU-specific configuration
     qpu_cfg = dict((conf.get("qpu") or {}))
+
+    # Set environment variables from CLI arguments
     if dwave_api_key is not None:
         qpu_cfg["dwave_api_key"] = dwave_api_key
+        # Set environment variable for child processes
+        os.environ["DWAVE_API_KEY"] = dwave_api_key
     if dwave_api_solver is not None:
         qpu_cfg["dwave_api_solver"] = dwave_api_solver
+        # Set environment variable for child processes
+        os.environ["DWAVE_API_SOLVER"] = dwave_api_solver
     if dwave_region_url is not None:
         qpu_cfg["dwave_region_url"] = dwave_region_url
+        # Set environment variable for child processes
+        os.environ["DWAVE_REGION_URL"] = dwave_region_url
+
+    # Ensure environment variables are set from TOML config values (if not already set by CLI)
+    if "dwave_api_key" in qpu_cfg and "DWAVE_API_KEY" not in os.environ:
+        os.environ["DWAVE_API_KEY"] = qpu_cfg["dwave_api_key"]
+    if "dwave_api_token" in qpu_cfg and "DWAVE_API_TOKEN" not in os.environ:
+        os.environ["DWAVE_API_TOKEN"] = qpu_cfg["dwave_api_token"]
+    if "dwave_api_solver" in qpu_cfg and "DWAVE_API_SOLVER" not in os.environ:
+        os.environ["DWAVE_API_SOLVER"] = qpu_cfg["dwave_api_solver"]
+    if "dwave_region_url" in qpu_cfg and "DWAVE_REGION_URL" not in os.environ:
+        os.environ["DWAVE_REGION_URL"] = qpu_cfg["dwave_region_url"]
+
     if not qpu_cfg:
         qpu_cfg = {}
     conf["qpu"] = qpu_cfg
