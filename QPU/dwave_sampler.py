@@ -1,69 +1,44 @@
 """D-Wave QPU sampler wrapper and configuration for quantum blockchain mining."""
 
+from typing import Dict, List, Tuple, Any, Union, Mapping, Sequence, cast
+import collections.abc
 from dwave.system import DWaveSampler
 from dwave.system.testing import MockDWaveSampler
-from shared.quantum_proof_of_work import create_topology_graph, get_topology_properties
+import dimod
 
-
-def create_dwave_sampler():
-    """Create a D-Wave sampler with proper error handling."""
-    try:
-        sampler = DWaveSampler()
-        print(f"QPU connected to: {sampler.properties['chip_id']}")
-        return sampler
-    except Exception as e:
-        print(f"QPU not available: {e}")
-        # Fall back to mock sampler with our default topology (Pegasus)
-        topology_graph = create_topology_graph()
-        properties = get_topology_properties()
-        return MockDWaveSampler(
-            nodelist=list(topology_graph.nodes()),
-            edgelist=list(topology_graph.edges()),
-            properties=properties
-        )
+# Type definitions to match base_miner
+Variable = collections.abc.Hashable
 
 
 class DWaveSamplerWrapper:
     """Wrapper class for D-Wave sampler with configuration management."""
-    
+
     def __init__(self):
-        self.sampler = create_dwave_sampler()
+        self.sampler = DWaveSampler()
         self.is_qpu = not isinstance(self.sampler, MockDWaveSampler)
         self.sampler_type = "qpu" if self.is_qpu else "mock"
-        
-        # Type conversions to match protocol expectations (nodes should be ints for quantum_proof_of_work functions)
-        nodes = []
-        for node in self.nodelist:
-            if not isinstance(node, int):
-                raise ValueError(f"Expected node index to be int, got {type(node)}")
-            nodes.append(int(node))
-        edges = []
-        for edge in self.edgelist:
-            if not isinstance(edge, tuple) or len(edge) != 2:
-                raise ValueError(f"Expected edge to be tuple of length 2, got {edge}")
-            if not isinstance(edge[0], int) or not isinstance(edge[1], int):
-                raise ValueError(f"Expected edge indices to be int, got {type(edge[0])} and {type(edge[1])}")
-            edges.append((int(edge[0]), int(edge[1])))
-        self.nodes = nodes
-        self.edges = edges
-    
-    def sample_ising(self, h, J, **kwargs):
+
+        # Store nodelist and edgelist as lists to match protocol expectations
+        # D-Wave samplers use int nodes/edges which are compatible with Variable (Hashable)
+        self.nodelist: List[Variable] = list(self.sampler.nodelist)
+        self.edgelist: List[Tuple[Variable, Variable]] = list(self.sampler.edgelist)
+        self.properties: Dict[str, Any] = dict(self.sampler.properties)
+
+        # For quantum_proof_of_work functions, nodes and edges should be int lists
+        # D-Wave samplers already use ints, so we can safely cast
+        self.nodes: List[int] = cast(List[int], self.nodelist)
+        self.edges: List[Tuple[int, int]] = cast(List[Tuple[int, int]], self.edgelist)
+
+    def sample_ising(
+        self,
+        h: Union[Mapping[Variable, float], Sequence[float]],
+        J: Mapping[Tuple[Variable, Variable], float],
+        **kwargs
+    ) -> dimod.SampleSet:
         """Sample from the D-Wave QPU or mock sampler."""
         if self.is_qpu:
             # QPU-specific parameters
             kwargs.setdefault('answer_mode', 'raw')
             kwargs.setdefault('annealing_time', 20.0)
-        
+
         return self.sampler.sample_ising(h, J, **kwargs)
-    
-    @property
-    def nodelist(self):
-        return self.sampler.nodelist
-    
-    @property
-    def edgelist(self):
-        return self.sampler.edgelist
-    
-    @property
-    def properties(self):
-        return self.sampler.properties

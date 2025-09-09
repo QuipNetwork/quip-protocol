@@ -4,27 +4,22 @@ from __future__ import annotations
 import multiprocessing
 import multiprocessing.synchronize
 import random
-import sys
 import time
-from typing import Optional
+from typing import Optional, cast
 
-import numpy as np
-import json
-
+from QPU.dwave_sampler import DWaveSamplerWrapper
 from shared.base_miner import BaseMiner, MiningResult
 from shared.block_requirements import compute_current_requirements
 from shared.quantum_proof_of_work import (
-    calculate_diversity,
-    select_diverse_solutions,
     ising_nonce_from_block,
     generate_ising_model_from_nonce,
 )
-from QPU.dwave_sampler import create_dwave_sampler
-
 
 class DWaveMiner(BaseMiner):
     def __init__(self, miner_id: str, **cfg):
-        sampler = create_dwave_sampler()
+        # cfg parameter is reserved for future configuration options
+        _ = cfg  # Suppress unused parameter warning
+        sampler = DWaveSamplerWrapper()
         super().__init__(miner_id, sampler, miner_type="QPU")
         self.miner_type = "QPU"
         
@@ -81,9 +76,8 @@ class DWaveMiner(BaseMiner):
 
             # Generate random salt for each attempt
             salt = random.randbytes(32)
-            
+
             # Generate quantum model using deterministic block-based seeding
-            timestamp = int(time.time())
             nonce = ising_nonce_from_block(prev_block.hash, node_info.miner_id, cur_index, salt)
 
             h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
@@ -116,9 +110,14 @@ class DWaveMiner(BaseMiner):
                 self.current_stage = 'sampling'
                 self.current_stage_start = sample_start
                 
+                # Cast h and J to match protocol expectations (int is a valid Variable type)
+                from typing import Mapping, Tuple, Any
+                h_cast = cast(Mapping[Any, float], h)
+                J_cast = cast(Mapping[Tuple[Any, Any], float], J)
+
                 sampleset = self.sampler.sample_ising(
-                    h, J, 
-                    num_reads=num_reads, 
+                    h_cast, J_cast,
+                    num_reads=num_reads,
                     answer_mode='raw',
                     annealing_time=annealing_time
                 )
@@ -180,9 +179,13 @@ class DWaveMiner(BaseMiner):
 def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutions: int):
     """Calculate adaptive mining parameters based on difficulty requirements.
 
-    Supports either a NextBlockRequirements object or a dict with keys:
-    'difficulty_energy', 'min_diversity', 'min_solutions'.
+    Args:
+        difficulty_energy: Target energy threshold
+        min_diversity: Minimum diversity requirement (reserved for future use)
+        min_solutions: Minimum number of valid solutions required
     """
+    # min_diversity parameter is reserved for future adaptive parameter tuning
+    _ = min_diversity  # Suppress unused parameter warning
     # Normalize difficulty factor (more negative = harder)
     difficulty_factor = abs(difficulty_energy) / 1000.0  # Base around -1000
 

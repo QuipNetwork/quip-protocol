@@ -1,13 +1,5 @@
 """Simulated Annealing sampler for CPU-based quantum blockchain mining."""
 
-import os
-
-# Set default DWave environment variables before any DWave libraries are imported
-if "DWAVE_API_KEY" not in os.environ:
-    os.environ["DWAVE_API_KEY"] = "MISSING IN CONFIG"
-if "DWAVE_API_TOKEN" not in os.environ:
-    os.environ["DWAVE_API_TOKEN"] = "MISSING IN CONFIG"
-
 from typing import Any, Dict, List, Tuple
 from dwave.samplers import SimulatedAnnealingSampler
 from dwave.system.testing import MockDWaveSampler
