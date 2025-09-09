@@ -333,7 +333,8 @@ class Node:
             self.chain.append(previous_block)
 
         if (previous_block.header.index) != self.get_latest_block().header.index:
-            raise ValueError(f"Node {self.node_id}: Previous block index {previous_block.header.index} does not match latest block index {self.get_latest_block().header.index}")
+            self.logger.info(f"Node {self.node_id}: Previous block index {previous_block.header.index} does not match latest block index {self.get_latest_block().header.index}, exiting mining task...")
+            return None
 
         if self._is_mining or self._mining_stop_event is not None:
             raise RuntimeError(f"Node {self.node_id}: Already mining")
