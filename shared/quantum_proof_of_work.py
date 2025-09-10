@@ -15,36 +15,67 @@ logger = get_logger('quantum_proof_of_work')
 
 # DWave Topology Configurations
 # These match real DWave systems for consistent energy scales
+# Each topology includes official D-Wave documentation links
 
-# D-Wave 2000Q (Legacy) - Chimera topology
-CHIMERA_TOPOLOGY = {
+# D-Wave 2000Q (Legacy) - C16 Chimera topology
+CHIMERA_C16_TOPOLOGY = {
     'type': 'chimera',
-    'params': {'m': 16, 'n': 16, 't': 4},  # 16x16x4 Chimera
+    'params': {'m': 16, 'n': 16, 't': 4},  # C16 Chimera (16x16x4)
     'graph_func': lambda: dnx.chimera_graph(16, 16, 4),
     'chip_id': 'DW_2000Q_VFYC_1',
-    'description': 'Legacy D-Wave 2000Q Chimera topology (~2048 qubits)'
+    'description': 'D-Wave 2000Q C16 Chimera topology (~2048 qubits)',
+    'docs': {
+        'topology': 'https://support.dwavesys.com/hc/en-us/articles/360003695354-What-Is-the-Chimera-Topology',
+        'solver': 'https://docs.dwavesys.com/docs/latest/c_solver_properties.html',
+        'overview': 'https://docs.ocean.dwavesys.com/en/latest/concepts/topology.html'
+    }
 }
 
-# D-Wave Advantage - Pegasus topology (DEFAULT)
-PEGASUS_TOPOLOGY = {
+# D-Wave Advantage - P16 Pegasus topology
+PEGASUS_P16_TOPOLOGY = {
     'type': 'pegasus',
     'params': {'m': 16},  # P16 Pegasus
     'graph_func': lambda: dnx.pegasus_graph(16),
     'chip_id': 'Advantage_system6.4',
-    'description': 'D-Wave Advantage Pegasus topology (~5000 qubits)'
+    'description': 'D-Wave Advantage P16 Pegasus topology (~5000 qubits)',
+    'docs': {
+        'topology': 'https://github.com/dwave-examples/pegasus-notebook',
+        'solver': 'https://support.dwavesys.com/hc/en-us/articles/360056364753-Introducing-the-Advantage-System',
+        'overview': 'https://docs.dwavequantum.com/en/latest/quantum_research/topologies.html'
+    }
 }
 
-# D-Wave Advantage2 - Zephyr topology
-ZEPHYR_TOPOLOGY = {
+# D-Wave Advantage2 - Z12 Zephyr topology (matches Advantage2-System1.6)
+ZEPHYR_Z12_TOPOLOGY = {
+    'type': 'zephyr',
+    'params': {'m': 12, 't': 4},  # Z12,4 Zephyr
+    'graph_func': lambda: dnx.zephyr_graph(12, 4),
+    'chip_id': 'Advantage2-System1.6',
+    'description': 'D-Wave Advantage2 Z12 Zephyr topology (~4500 qubits)',
+    'docs': {
+        'topology': 'https://support.dwavesys.com/hc/en-us/articles/6820989477911-What-Is-the-Zephyr-Topology',
+        'technical_pdf': 'https://www.dwavequantum.com/media/2uznec4s/14-1056a-a_zephyr_topology_of_d-wave_quantum_processors.pdf',
+        'solver': 'https://support.dwavesys.com/hc/en-us/articles/32105885880087-D-Wave-s-Advantage2-Quantum-Computer-Now-Generally-Available',
+        'overview': 'https://docs.dwavequantum.com/en/latest/quantum_research/topologies.html'
+    }
+}
+
+# D-Wave Advantage2 - Z16 Zephyr topology (larger theoretical system)
+ZEPHYR_Z16_TOPOLOGY = {
     'type': 'zephyr',
     'params': {'m': 16, 't': 4},  # Z16,4 Zephyr
     'graph_func': lambda: dnx.zephyr_graph(16, 4),
     'chip_id': 'Advantage2_prototype',
-    'description': 'D-Wave Advantage2 Zephyr topology (~1000+ qubits)'
+    'description': 'D-Wave Advantage2 Z16 Zephyr topology (~8000+ qubits)',
+    'docs': {
+        'topology': 'https://support.dwavesys.com/hc/en-us/articles/6820989477911-What-Is-the-Zephyr-Topology',
+        'technical_pdf': 'https://www.dwavequantum.com/media/2uznec4s/14-1056a-a_zephyr_topology_of_d-wave_quantum_processors.pdf',
+        'overview': 'https://docs.dwavequantum.com/en/latest/quantum_research/topologies.html'
+    }
 }
 
-# Default topology for all miners
-DEFAULT_TOPOLOGY = ZEPHYR_TOPOLOGY
+# Default topology for all miners - matches Advantage2-System1.6 hardware
+DEFAULT_TOPOLOGY = ZEPHYR_Z12_TOPOLOGY
 
 def get_topology_config(topology_name: Optional[str] = None):
     """Get topology configuration by name, defaults to DEFAULT_TOPOLOGY."""
@@ -52,9 +83,15 @@ def get_topology_config(topology_name: Optional[str] = None):
         return DEFAULT_TOPOLOGY
 
     topologies = {
-        'chimera': CHIMERA_TOPOLOGY,
-        'pegasus': PEGASUS_TOPOLOGY,
-        'zephyr': ZEPHYR_TOPOLOGY
+        # Standard naming with size parameters
+        'c16': CHIMERA_C16_TOPOLOGY,
+        'p16': PEGASUS_P16_TOPOLOGY,
+        'z12': ZEPHYR_Z12_TOPOLOGY,
+        'z16': ZEPHYR_Z16_TOPOLOGY,
+        # Legacy names for backward compatibility
+        'chimera': CHIMERA_C16_TOPOLOGY,
+        'pegasus': PEGASUS_P16_TOPOLOGY,
+        'zephyr': ZEPHYR_Z12_TOPOLOGY  # Default changed from Z16 to Z12
     }
 
     return topologies.get(topology_name.lower(), DEFAULT_TOPOLOGY)
