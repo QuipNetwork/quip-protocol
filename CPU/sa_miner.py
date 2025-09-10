@@ -96,7 +96,6 @@ class SimulatedAnnealingMiner(BaseMiner):
                     if min(sample.sampleset.record.energy) <= current_requirements.difficulty_energy:
                         result = self.evaluate_sampleset(sample.sampleset, current_requirements, nodes, edges, 
                                                          sample.nonce, sample.salt, prev_timestamp, start_time)
-                        result.timestamp = int(time.time())
                         if result:
                             self.logger.info(f"[Block-{cur_index}] Already Mined at this difficulty! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., Min Energy: {result.energy:.2f}, Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Attempt Time: {result.mining_time:.2f}s, Total Mining Time: {time.time() - start_time:.2f}s")
                             return result
@@ -185,8 +184,12 @@ def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutio
     max_observed_energy = -14200
 
     num_sweeps = min_sweeps
+    # Maximize work when at the hardest minumum difficulty. 
     if difficulty_energy <= min_observed_energy:
         num_sweeps = max_sweeps
+    # Minimize work when at the hardest minumum difficulty. 
+    elif difficulty_energy >= max_observed_energy:
+        num_sweeps = min_sweeps
     else:
         # Linear interpolation in log2 space for the declining part
         fraction = (knee_energy - difficulty_energy) / (knee_energy - min_observed_energy)
