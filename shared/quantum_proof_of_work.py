@@ -158,6 +158,15 @@ def generate_ising_model_from_nonce(nonce: int, nodes: List[int], edges: List[Tu
     """
     np.random.seed(nonce)
 
+    # HACK - limit nodes and edges to match Advantage2-System1.6
+    max_nodes = 4593
+    max_edges = 41796
+
+    if len(nodes) > max_nodes:
+        nodes = nodes[:max_nodes]
+    if len(edges) > max_edges:
+        edges = edges[:max_edges]
+
     h = {int(i): 0.0 for i in nodes}
     J = { (int(u), int(v)) if isinstance(u, (int, np.integer)) and isinstance(v, (int, np.integer)) else (int(u), int(v)) : float(2*np.random.randint(2)-1) for (u, v) in edges }
 

@@ -112,6 +112,9 @@ class MetalSampler(MockDWaveSampler):
                                   num_reads: int, num_sweeps: int) -> Tuple[List[List[int]], List[float]]:
         """Metal-optimized simulated annealing with detailed timing."""
         
+        # Detailed timing instrumentation
+        timing_data = {}
+        
         # Setup phase
         setup_start = time.time()
         
@@ -128,16 +131,21 @@ class MetalSampler(MockDWaveSampler):
             
         # CRITICAL FIX: Create node_id → position mapping for non-sequential Pegasus topology
         # Pegasus nodes are like [30,31,...,2849,2910,...,5729] with gaps, not [0,1,2,...,n-1]
+        mapping_start = time.time()
         node_to_pos = {int(node_id): pos for pos, node_id in enumerate(self.nodes)}
+        timing_data['node_mapping'] = time.time() - mapping_start
         
         # Build h vector using position mapping
+        h_build_start = time.time()
         h_vec = torch.zeros(n, device=self._device, dtype=torch.float32)
         for node_id, v in h.items():
             pos = node_to_pos.get(int(node_id))
             if pos is not None:
                 h_vec[pos] = float(v)
+        timing_data['h_vector_build'] = time.time() - h_build_start
             
         # Build J coupling tensors with position mapping - USE INT32 for MPS performance
+        j_build_start = time.time()
         if J:
             # Convert node IDs to tensor positions
             i_pos = []
@@ -156,6 +164,7 @@ class MetalSampler(MockDWaveSampler):
             j_vals = torch.tensor(j_vals_list, device=self._device, dtype=torch.float32)
         else:
             i_idx = j_idx = j_vals = None
+        timing_data['j_tensor_build'] = time.time() - j_build_start
             
         # Metal optimization: Original optimized parameters for 60ms/sweep performance
         # Fixed: Now correctly minimizes energy (was maximizing before)
@@ -172,8 +181,10 @@ class MetalSampler(MockDWaveSampler):
         R = num_reads
         
         # Initialize random spins {-1,1} with correct dimensions
+        init_start = time.time()
         spins = (torch.rand((R, n), device=self._device) > 0.5).to(torch.int8)
         spins = spins * 2 - 1  # {0,1} -> {-1,1}
+        timing_data['spin_initialization'] = time.time() - init_start
         
         self.logger.debug(f"[MetalSampler] Metal params: updates_per_sweep={updates_per_sweep} (corrected SA minimization)")
 
@@ -182,21 +193,27 @@ class MetalSampler(MockDWaveSampler):
         beta_start = 0.0231  # D-Wave actual start (high temp = 43.3)
         beta_end = 6.6214    # D-Wave actual end (low temp = 0.15)  
         # Use CPU generation + MPS transfer for maximum compatibility
+        schedule_start = time.time()
         cpu_betas = torch.logspace(math.log10(beta_start), math.log10(beta_end), steps=num_sweeps)
         betas = cpu_betas.to(self._device, dtype=torch.float32)
         R = num_reads
         ar = torch.arange(R, device=self._device, dtype=torch.int32)  # Use int32 for MPS performance
+        timing_data['schedule_setup'] = time.time() - schedule_start
         
         setup_time = time.time() - setup_start
         self.logger.debug(f"[MetalSampler] Setup completed in {setup_time:.3f}s")
 
         # Annealing loop with timing
         anneal_start = time.time()
+        timing_data['sweep_times'] = []
+        timing_data['field_computation_times'] = []
+        timing_data['update_times'] = []
         
         for sweep_idx, beta in enumerate(betas):
             sweep_start = time.time()
             
             # Compute local field once per sweep
+            field_start = time.time()
             if i_idx is not None:
                 sp_f = spins.to(torch.float32)
                 neighbor_sum = torch.zeros((R, n), device=self._device, dtype=torch.float32)
@@ -205,20 +222,25 @@ class MetalSampler(MockDWaveSampler):
             else:
                 neighbor_sum = torch.zeros((R, n), device=self._device, dtype=torch.float32)
             local_field = neighbor_sum + h_vec
+            field_time = time.time() - field_start
+            timing_data['field_computation_times'].append(field_time)
 
             # FULLY VECTORIZED SA: All spins updated in parallel per sweep
             # This trades some SA accuracy for massive speed improvement
+            update_start = time.time()
             if updates_per_sweep > 0:
                 # STRATEGY: Update each spin position once per sweep, all chains in parallel
                 # This is equivalent to D-Wave's systematic sweep but vectorized
                 
                 # Create systematic sweep order (0, 1, 2, ..., n-1) 
+                permutation_start = time.time()
                 spin_order = torch.arange(n, device=self._device, dtype=torch.int32)
                 # OPTIMIZATION: Generate permutation on CPU then transfer (1000ms → 1ms speedup)
                 # MPS randperm is extremely slow, CPU+transfer is much faster
                 shuffle_idx_cpu = torch.randperm(n)
                 shuffle_idx = shuffle_idx_cpu.to(self._device, dtype=torch.int32)
                 spin_order = spin_order[shuffle_idx]
+                permutation_time = time.time() - permutation_start
                 
                 # Process spins in vectorized chunks
                 chunk_size = min(128, n)  # Process 128 spins at once
@@ -265,7 +287,11 @@ class MetalSampler(MockDWaveSampler):
                             neighbor_sum.scatter_add_(1, j_idx.unsqueeze(0).expand(R, -1), sp_f[:, i_idx] * j_vals)
                             local_field = neighbor_sum + h_vec
             
+            update_time = time.time() - update_start
+            timing_data['update_times'].append(update_time)
+            
             sweep_time = time.time() - sweep_start
+            timing_data['sweep_times'].append(sweep_time)
             if sweep_idx < 3 or sweep_idx % max(num_sweeps // 10, 1) == 0:
                 self.logger.debug(f"[MetalSampler] Sweep {sweep_idx}/{num_sweeps} took {sweep_time*1000:.1f}ms")
 
@@ -299,7 +325,17 @@ class MetalSampler(MockDWaveSampler):
             energies_cpu = all_energies
         
         energy_time = time.time() - energy_start
+        timing_data['energy_computation'] = energy_time
+        
+        # Detailed timing analysis
+        total_field_time = sum(timing_data['field_computation_times'])
+        total_update_time = sum(timing_data['update_times'])
+        avg_sweep_time = sum(timing_data['sweep_times']) / len(timing_data['sweep_times']) if timing_data['sweep_times'] else 0
+        
         self.logger.debug(f"[MetalSampler] Energy computation: {energy_time:.3f}s")
         self.logger.debug(f"[MetalSampler] Timing breakdown: setup={setup_time:.3f}s, anneal={anneal_time:.3f}s, energy={energy_time:.3f}s")
+        self.logger.debug(f"[MetalSampler] Setup breakdown: mapping={timing_data.get('node_mapping', 0):.4f}s, h_build={timing_data.get('h_vector_build', 0):.4f}s, j_build={timing_data.get('j_tensor_build', 0):.4f}s, init={timing_data.get('spin_initialization', 0):.4f}s, schedule={timing_data.get('schedule_setup', 0):.4f}s")
+        self.logger.debug(f"[MetalSampler] Sweep breakdown: avg_sweep={avg_sweep_time*1000:.2f}ms, total_field={total_field_time:.3f}s, total_update={total_update_time:.3f}s")
+        self.logger.debug(f"[MetalSampler] Parallelization opportunity: {R} parallel chains, {n} spins, {len(J) if J else 0} couplings")
         
         return samples_cpu, energies_cpu
