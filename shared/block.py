@@ -769,62 +769,67 @@ def _adjust_energy_along_curve(current_energy: float, adjustment_rate: float, di
         adjustment_rate: Percentage to move (e.g., 0.05 for 5%)
         direction: 'harder' (more negative) or 'easier' (less negative)
     """
-    min_energy = -16000.0  # Hardest
+    min_energy = -16000.0  # Hardest (approximate, not hard limit)
     knee_energy = -15600.0  # Knee point
-    max_energy = -14000.0  # Easiest
+    max_energy = -14000.0  # Easiest (approximate, not hard limit)
     
-    # Clamp current energy to valid range
-    current_energy = max(min_energy, min(current_energy, max_energy))
+    # Don't clamp - allow adjustments beyond the observed range
+    # current_energy = max(min_energy, min(current_energy, max_energy))
     
-    # Convert energy to normalized position [0, 1]
+    # Convert energy to normalized position [0, 1] for observed range
     total_range = max_energy - min_energy
     linear_position = (current_energy - min_energy) / total_range
     
-    # Apply sqrt curve transformation to compress adjustments near boundaries
-    # sqrt gives more space in the middle, less at the extremes
     import math
-    curved_position = math.sqrt(linear_position)
     
-    # Calculate the derivative (adjustment scaling factor) at current position
-    # For sqrt(x), derivative is 1/(2*sqrt(x)), so adjustments get smaller near x=0
-    # We'll use a modified approach that scales the adjustment based on distance from extremes
+    min_adjustment = 5.0  # Define this early for use in out-of-bounds cases
     
-    # Distance from boundaries (0 at boundary, 1 at center)
-    distance_from_min = linear_position
-    distance_from_max = 1.0 - linear_position
-    min_distance = min(distance_from_min, distance_from_max)
-    
-    # Scale adjustment based on distance from boundaries
-    # Near boundaries (min_distance near 0): smaller adjustments
-    # Near center (min_distance near 0.5): larger adjustments
-    scaling_factor = math.sqrt(min_distance * 2.0)  # Range [0, 1]
-    scaled_adjustment = adjustment_rate * scaling_factor
-    
-    # Apply adjustment in the specified direction
-    if direction == 'harder':
-        # Move toward harder (more negative, lower position)
-        new_curved_position = max(0.0, curved_position - scaled_adjustment)
-    else:  # 'easier'
-        # Move toward easier (less negative, higher position)
-        new_curved_position = min(1.0, curved_position + scaled_adjustment)
-    
-    # Convert back through inverse curve (square the curved position)
-    new_linear_position = new_curved_position ** 2
-    
-    # Convert back to energy value
-    new_energy = min_energy + (new_linear_position * total_range)
-    
-    # Apply minimum adjustment of 5 units when not at absolute boundaries
-    # This ensures meaningful adjustments even when scaling factor is very small
-    energy_delta = new_energy - current_energy
-    min_adjustment = 5.0
-    
-    if abs(energy_delta) > 0 and abs(energy_delta) < min_adjustment:
-        # We have a non-zero but very small adjustment - enforce minimum
+    # Handle positions outside the observed range differently
+    if linear_position < 0.0 or linear_position > 1.0:
+        # Beyond observed limits - use simpler linear adjustment with minimum
+        # This ensures we can continue adjusting beyond our observed boundaries
         if direction == 'harder':
-            new_energy = max(min_energy, current_energy - min_adjustment)
+            new_energy = current_energy - min_adjustment
         else:  # 'easier'
-            new_energy = min(max_energy, current_energy + min_adjustment)
+            new_energy = current_energy + min_adjustment
+    else:
+        # Within observed range - use normal curve-based adjustment
+        # Apply sqrt curve transformation to compress adjustments near boundaries
+        curved_position = math.sqrt(linear_position)
+        
+        # Distance from boundaries (0 at boundary, 1 at center)
+        distance_from_min = linear_position
+        distance_from_max = 1.0 - linear_position
+        min_distance = min(distance_from_min, distance_from_max)
+        
+        # Scale adjustment based on distance from boundaries
+        scaling_factor = math.sqrt(min_distance * 2.0)  # Range [0, 1]
+        scaled_adjustment = adjustment_rate * scaling_factor
+        
+        # Apply adjustment in the specified direction
+        if direction == 'harder':
+            new_curved_position = max(0.0, curved_position - scaled_adjustment)
+        else:  # 'easier'
+            new_curved_position = min(1.0, curved_position + scaled_adjustment)
+        
+        # Convert back through inverse curve (square the curved position)
+        new_linear_position = new_curved_position ** 2
+        
+        # Convert back to energy value
+        new_energy = min_energy + (new_linear_position * total_range)
+    
+    # Apply minimum adjustment of 5 units when adjustments are very small
+    # This ensures meaningful adjustments even when scaling factor is very small
+    # (Only applies to within-range calculations, out-of-bounds already uses min_adjustment)
+    if linear_position >= 0.0 and linear_position <= 1.0:
+        energy_delta = new_energy - current_energy
+        
+        if abs(energy_delta) > 0 and abs(energy_delta) < min_adjustment:
+            # We have a non-zero but very small adjustment - enforce minimum
+            if direction == 'harder':
+                new_energy = current_energy - min_adjustment
+            else:  # 'easier'
+                new_energy = current_energy + min_adjustment
     
     return new_energy
 
