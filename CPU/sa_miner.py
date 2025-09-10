@@ -1,6 +1,7 @@
 """CPU miner using SimulatedAnnealingStructuredSampler."""
 from __future__ import annotations
 
+import math
 import multiprocessing
 import multiprocessing.synchronize
 import random
@@ -170,17 +171,31 @@ def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutio
     Supports either a BlockRequirements object or a dict with keys:
     'difficulty_energy', 'min_diversity', 'min_solutions'.
     """
-    # Normalize difficulty factor (more negative = harder)
-    difficulty_factor = abs(difficulty_energy) / 1000.0  # Base around -1000
+    min_sweeps = 32
+    knee_sweeps = 2048
+    max_sweeps = 16384
 
-    # Simulated Annealing parameters
-    base_sweeps = 32
-    num_sweeps = int(base_sweeps * (difficulty_factor ** 1.5))  # Exponential scaling
-    num_reads = max(int(min_solutions) * 3, 32)  # At least 3x required solutions
+    #TODO: get a more precise fit on this model (i.e. either run experiment or look up theory)
+    min_observed_energy = -15700
+    knee_energy = -15500
+    max_observed_energy = -14200
+
+    num_sweeps = min_sweeps
+    if difficulty_energy <= min_observed_energy:
+        num_sweeps = max_sweeps
+    else:
+        # Linear interpolation in log2 space for the declining part
+        fraction = (knee_energy - difficulty_energy) / (knee_energy - min_observed_energy)
+        log2_threshold = math.log2(knee_sweeps)  # 11 for 2048
+        log2_max = math.log2(max_sweeps)  # 14 for 16384
+        log2_sweeps = log2_threshold + fraction * (log2_max - log2_threshold)
+        num_sweeps = 2 ** log2_sweeps
+
+    num_reads = max(int(min_solutions) * 4, int(num_sweeps / 16))
 
     # NOTE: beta_range and beta_schedule are not used by the structured sampler
     return {
-        'num_sweeps': max(32, min(num_sweeps, 32768)),  # Reasonable bounds
-        'num_reads': max(32, min(num_reads, 1000)),      # Reasonable bounds
+        'num_sweeps': int(num_sweeps),
+        'num_reads': int(num_reads),
     }
 
