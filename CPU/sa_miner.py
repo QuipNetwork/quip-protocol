@@ -176,7 +176,7 @@ def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutio
     """
     min_sweeps = 32
     knee_sweeps = 2048
-    max_sweeps = 16384
+    max_sweeps = 8192
 
     #TODO: get a more precise fit on this model (i.e. either run experiment or look up theory)
     min_observed_energy = -15700
@@ -191,14 +191,15 @@ def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutio
     elif difficulty_energy >= max_observed_energy:
         num_sweeps = min_sweeps
     else:
-        # Linear interpolation in log2 space for the declining part
-        fraction = (knee_energy - difficulty_energy) / (knee_energy - min_observed_energy)
-        log2_threshold = math.log2(knee_sweeps)  # 11 for 2048
-        log2_max = math.log2(max_sweeps)  # 14 for 16384
-        log2_sweeps = log2_threshold + fraction * (log2_max - log2_threshold)
+        # Linear interpolation in log2 space
+        # For energies between knee_energy and max_observed_energy, interpolate between knee_sweeps and min_sweeps
+        fraction = (difficulty_energy - knee_energy) / (max_observed_energy - knee_energy)
+        log2_knee = math.log2(knee_sweeps)  # 11 for 2048
+        log2_min = math.log2(min_sweeps)   # 5 for 32
+        log2_sweeps = log2_knee + fraction * (log2_min - log2_knee)
         num_sweeps = 2 ** log2_sweeps
 
-    num_reads = max(int(min_solutions) * 4, int(num_sweeps / 16))
+    num_reads = max(int(min_solutions) * 4, int(num_sweeps / 8))
 
     # NOTE: beta_range and beta_schedule are not used by the structured sampler
     return {
