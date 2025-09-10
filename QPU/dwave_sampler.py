@@ -15,8 +15,8 @@ class DWaveSamplerWrapper:
 
     def __init__(self):
         self.sampler = DWaveSampler()
-        self.is_qpu = not isinstance(self.sampler, MockDWaveSampler)
-        self.sampler_type = "qpu" if self.is_qpu else "mock"
+        self.is_qpu = True
+        self.sampler_type = "qpu"
 
         # Store nodelist and edgelist as lists to match protocol expectations
         # D-Wave samplers use int nodes/edges which are compatible with Variable (Hashable)
@@ -36,9 +36,4 @@ class DWaveSamplerWrapper:
         **kwargs
     ) -> dimod.SampleSet:
         """Sample from the D-Wave QPU or mock sampler."""
-        if self.is_qpu:
-            # QPU-specific parameters
-            kwargs.setdefault('answer_mode', 'raw')
-            kwargs.setdefault('annealing_time', 20.0)
-
         return self.sampler.sample_ising(h, J, **kwargs)

@@ -289,6 +289,8 @@ def cpu(
     conf.pop("gpu", None)
     conf.pop("qpu", None)
 
+    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
+
     # Handle CPU-specific configuration
     cpu_cfg = dict((conf.get("cpu") or {}))
     if num_cpus is not None:
@@ -296,6 +298,7 @@ def cpu(
     if not cpu_cfg:
         cpu_cfg = {"num_cpus": 1}
     conf["cpu"] = cpu_cfg
+
 
     # Use genesis config from TOML if CLI option is default and TOML has it
     if genesis_config == "genesis_block.json" and "genesis_config" in conf:

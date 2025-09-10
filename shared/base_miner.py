@@ -102,11 +102,8 @@ class BaseMiner(ABC):
         self.total_rewards = 0
         self.sampler = sampler
 
-        # Initialize logger with helper function
-        self.logger = init_component_logger('miner', miner_id)
-
-        # Setup multiprocessing logging compatibility
-        self._setup_multiprocess_logging()
+        # Initialize logger that inherits parent process configuration
+        self.logger = logging.getLogger(f'miner.{miner_id}')
 
         self.logger.debug(f"{miner_id} initialized ({self.miner_type})")
 
@@ -120,35 +117,6 @@ class BaseMiner(ABC):
             'total_samples': 0,
             'blocks_attempted': 0
         }
-
-    def _setup_multiprocess_logging(self):
-        """Ensure logger works in multiprocessing context."""
-        # Force propagation to root logger
-        self.logger.propagate = True
-
-        # If in child process, ensure proper handler setup
-        if (hasattr(multiprocessing, 'current_process') and
-            multiprocessing.current_process().name != 'MainProcess'):
-            self._configure_child_logging()
-
-    def _configure_child_logging(self):
-        """Configure logging for child processes."""
-        formatter_class = QuipFormatter
-
-        root_logger = logging.getLogger()
-
-        # Check if QuipFormatter is present
-        has_quip_formatter = any(
-            isinstance(getattr(handler, 'formatter', None), formatter_class)
-            for handler in root_logger.handlers
-        )
-
-        if not has_quip_formatter:
-            # Add QuipFormatter handler
-            formatter = QuipFormatter()
-            handler = logging.StreamHandler()
-            handler.setFormatter(formatter)
-            root_logger.addHandler(handler)
 
         # Track timing history for graphing (block_number, timing_value)
         self.timing_history = {

@@ -44,7 +44,7 @@ ZEPHYR_TOPOLOGY = {
 }
 
 # Default topology for all miners
-DEFAULT_TOPOLOGY = PEGASUS_TOPOLOGY
+DEFAULT_TOPOLOGY = ZEPHYR_TOPOLOGY
 
 def get_topology_config(topology_name: Optional[str] = None):
     """Get topology configuration by name, defaults to DEFAULT_TOPOLOGY."""

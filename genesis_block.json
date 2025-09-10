@@ -7,8 +7,8 @@
   },
   "data": "Genesis Block - Quip Protocol",
   "next_block_requirements": {
-    "difficulty_energy": -12200.0,
-    "min_diversity": 0.25,
+    "difficulty_energy": -15700.0,
+    "min_diversity": 0.3,
     "min_solutions": 15,
     "timeout_to_difficulty_adjustment_decay": 20.0,
     "max_mining_time": 300.0

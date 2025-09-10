@@ -105,7 +105,7 @@ class MetalMiner(BaseMiner):
                         result = self.evaluate_sampleset(sample.sampleset, current_requirements, nodes, edges, 
                                                          sample.nonce, sample.salt, prev_timestamp, start_time)
                         if result:
-                            self.logger.info(f"[Block-{cur_index}] Already Mined at this difficulty! Nonce: {sample.nonce}, Salt: {sample.salt.hex()[:4]}..., Energy: {result.energy:.2f}, Time: {result.mining_time:.2f}s")
+                            self.logger.info(f"[Block-{cur_index}] Already Mined at this difficulty! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., Min Energy: {result.energy:.2f}, Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Attempt Time: {result.mining_time:.2f}s, Total Mining Time: {time.time() - start_time:.2f}s")
                             return result
                 difficulty_energy = current_requirements.difficulty_energy
                 min_diversity = current_requirements.min_diversity
@@ -176,7 +176,7 @@ class MetalMiner(BaseMiner):
             self.timing_stats['postprocessing'].append((time.time() - postprocess_start) * 1e6)
 
             if result:
-                self.logger.info(f"[Block-{cur_index}] Mined! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., Energy: {result.energy:.2f}, Time: {result.mining_time:.2f}s")
+                self.logger.info(f"[Block-{cur_index}] Mined! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., Min Energy: {result.energy:.2f}, Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Attempt Time: {result.mining_time:.2f}s, Total Mining Time: {time.time() - start_time:.2f}s")
                 return result
                         
             # Update top samples with this one

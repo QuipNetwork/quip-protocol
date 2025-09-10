@@ -93,7 +93,7 @@ class SimulatedAnnealingMiner(BaseMiner):
                         result = self.evaluate_sampleset(sample.sampleset, requirements, nodes, edges, 
                                                          sample.nonce, sample.salt, prev_timestamp, start_time)
                         if result:
-                            self.logger.info(f"[Block-{cur_index}] Already Mined at this difficulty! Nonce: {sample.nonce}, Salt: {sample.salt.hex()[:4]}..., Energy: {result.energy:.2f}, Time: {result.mining_time:.2f}s")
+                            self.logger.info(f"[Block-{cur_index}] Already Mined at this difficulty! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., Min Energy: {result.energy:.2f}, Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Attempt Time: {result.mining_time:.2f}s, Total Mining Time: {time.time() - start_time:.2f}s")
                             return result
 
             # Track preprocessing time
@@ -143,12 +143,13 @@ class SimulatedAnnealingMiner(BaseMiner):
             self.timing_stats['blocks_attempted'] += 1
 
             result = self.evaluate_sampleset(sampleset, current_requirements, nodes, edges, nonce, salt, prev_timestamp, start_time)
+            self.logger.info(f"CPU len(nodes)={len(nodes)}, len(edges)={len(edges)}, len(energies)={len(all_energies)}")
 
             # Track postprocessing time
             self.timing_stats['postprocessing'].append((time.time() - postprocess_start) * 1e6)
 
             if result:
-                self.logger.info(f"[Block-{cur_index}] Mined! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., Energy: {result.energy:.2f}, Time: {result.mining_time:.2f}s")
+                self.logger.info(f"[Block-{cur_index}] Mined! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., Min Energy: {result.energy:.2f}, Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Attempt Time: {result.mining_time:.2f}s, Total Mining Time: {time.time() - start_time:.2f}s")
                 return result
                         
             # Update top samples with this one

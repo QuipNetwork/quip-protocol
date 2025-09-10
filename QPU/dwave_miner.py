@@ -95,7 +95,7 @@ class DWaveMiner(BaseMiner):
                         result = self.evaluate_sampleset(sample.sampleset, requirements, nodes, edges, 
                                                          sample.nonce, sample.salt, prev_timestamp, start_time)
                         if result:
-                            self.logger.info(f"[Block-{cur_index}] Already Mined at this difficulty! Nonce: {sample.nonce}, Salt: {sample.salt.hex()[:4]}..., Energy: {result.energy:.2f}, Time: {result.mining_time:.2f}s")
+                            self.logger.info(f"[Block-{cur_index}] Already Mined at this difficulty! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., Min Energy: {result.energy:.2f}, Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Attempt Time: {result.mining_time:.2f}s, Total Mining Time: {time.time() - start_time:.2f}s")
                             return result
 
             # Track preprocessing time
@@ -160,12 +160,13 @@ class DWaveMiner(BaseMiner):
 
             result = self.evaluate_sampleset(sampleset, current_requirements, nodes, edges, nonce, salt, prev_timestamp, start_time)
             self.logger.debug(f"QPU sampleset evaluated in {time.time() - postprocess_start:.2f}s")
+            self.logger.info(f"QPU len(nodes)={len(nodes)}, len(edges)={len(edges)}, len(energies)={len(all_energies)}")
 
             # Track postprocessing time
             self.timing_stats['postprocessing'].append((time.time() - postprocess_start) * 1e6)
 
             if result:
-                self.logger.info(f"[Block-{cur_index}] Mined! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., Energy: {result.energy:.2f}, Time: {result.mining_time:.2f}s")
+                self.logger.info(f"[Block-{cur_index}] Mined! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., Min Energy: {result.energy:.2f}, Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Attempt Time: {result.mining_time:.2f}s, Total Mining Time: {time.time() - start_time:.2f}s")
                 return result
                         
             # Update top samples with this one
@@ -198,14 +199,15 @@ def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutio
     difficulty_factor = abs(difficulty_energy) / 1000.0  # Base around -1000
 
     # QPU parameters (D-Wave quantum processor optimized)
-    base_reads = 32  # QPU uses reads instead of sweeps
-    num_reads = min(int(base_reads * (difficulty_factor ** 0.05)), 256)
+    base_reads = 256  # QPU uses reads instead of sweeps
+    num_reads = min(int(base_reads * (difficulty_factor ** 0.5)), 256)
     
     # QPU-specific annealing time (microseconds)
-    base_annealing_time = 20.0
-    annealing_time = min(base_annealing_time * (difficulty_factor ** 0.5), 2000.0)  # Max 2ms
+    base_annealing_time = 5.0
+    annealing_time = min(base_annealing_time * (difficulty_factor ** 0.05), 1000.0)  # Max 1ms per D-WAve Docs
 
     return {
-        'num_reads': max(min_solutions*2, num_reads),
+        # 'num_reads': max(min_solutions*2, num_reads),
+        'num_reads': 2048,
         'quantum_annealing_time': max(5.0, annealing_time),  # Min 5 microseconds
     }
