@@ -9,7 +9,6 @@ from pathlib import Path
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evaluate_sampleset
 from shared.block_requirements import BlockRequirements
 import random
@@ -61,8 +60,8 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, target_energy=-155
     
     # QPU test configurations - vary num_reads, keep annealing time constant
     # QPU architecture doesn't benefit from longer annealing times - 5µs is optimal
-    read_counts = [256, 512]
-    annealing_time = 200.0
+    read_counts = [128, 256, 512]
+    annealing_time = 5.0
     
     print(f"\n🧪 Testing QPU configurations:")
     print(f"Read counts to test: {read_counts}")
@@ -141,11 +140,23 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, target_energy=-155
             num_solutions = 0
             meets_requirements = False
 
+            # Calculate diversity of top 10 solutions by energy
+            from shared.quantum_proof_of_work import calculate_diversity
+            solutions = list(sampleset.record.sample)
+            energies = list(sampleset.record.energy)
+
+            # Sort solutions by energy and take top 10
+            solution_energy_pairs = list(zip(solutions, energies))
+            solution_energy_pairs.sort(key=lambda x: x[1])  # Sort by energy (ascending = better)
+            top_10_solutions = [sol for sol, _ in solution_energy_pairs[:10]]
+
+            top_10_diversity = calculate_diversity(top_10_solutions)
+            print(f"    🌈 diversity (top 10) = {top_10_diversity:.3f}")
+
             if mining_result:
                 diversity = mining_result.diversity
                 num_solutions = mining_result.num_valid
                 meets_requirements = True
-                print(f"    🌈 diversity = {diversity:.3f}")
                 print(f"    🔢 num_solutions = {num_solutions}")
                 print(f"    ✅ Meets mining requirements!")
             else:
@@ -189,6 +200,7 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, target_energy=-155
                 'target_reached': target_reached,
                 'target_reached_bool': target_reached_bool,
                 'diversity': float(diversity),
+                'diversity_top_10': float(top_10_diversity),
                 'num_solutions': int(num_solutions),
                 'meets_requirements': bool(meets_requirements),
                 'qpu_timing': qpu_timing

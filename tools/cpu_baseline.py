@@ -107,11 +107,23 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None):
             num_solutions = 0
             meets_requirements = False
 
+            # Calculate diversity of top 10 solutions by energy
+            from shared.quantum_proof_of_work import calculate_diversity
+            solutions = list(sampleset.record.sample)
+            energies = list(sampleset.record.energy)
+
+            # Sort solutions by energy and take top 10
+            solution_energy_pairs = list(zip(solutions, energies))
+            solution_energy_pairs.sort(key=lambda x: x[1])  # Sort by energy (ascending = better)
+            top_10_solutions = [sol for sol, _ in solution_energy_pairs[:10]]
+
+            top_10_diversity = calculate_diversity(top_10_solutions)
+            print(f"  🌈 diversity (top 10) = {top_10_diversity:.3f}")
+
             if mining_result:
                 diversity = mining_result.diversity
                 num_solutions = mining_result.num_valid
                 meets_requirements = True
-                print(f"  🌈 diversity = {diversity:.3f}")
                 print(f"  🔢 num_solutions = {num_solutions}")
                 print(f"  ✅ Meets mining requirements!")
             else:
@@ -142,6 +154,7 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None):
                 'std_energy': std_energy,
                 'target_reached': target_reached,
                 'diversity': float(diversity),
+                'diversity_top_10': float(top_10_diversity),
                 'num_solutions': int(num_solutions),
                 'meets_requirements': bool(meets_requirements)
             }
