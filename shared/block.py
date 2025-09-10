@@ -758,6 +758,77 @@ def calculate_adaptive_parameters(requirements: Dict[str, Any], miner_type: str)
             'beta_range': [0.1, 10.0]
         }
     
+def _adjust_energy_along_curve(current_energy: float, adjustment_rate: float, direction: str) -> float:
+    """Adjust energy along a curve that compresses adjustments near boundaries.
+    
+    Uses a sqrt-based curve from min_energy (-16000) to max_energy (-14000) with knee at -15600.
+    Adjustments become smaller as we approach the extremes, larger near the knee point.
+    
+    Args:
+        current_energy: Current energy value
+        adjustment_rate: Percentage to move (e.g., 0.05 for 5%)
+        direction: 'harder' (more negative) or 'easier' (less negative)
+    """
+    min_energy = -16000.0  # Hardest
+    knee_energy = -15600.0  # Knee point
+    max_energy = -14000.0  # Easiest
+    
+    # Clamp current energy to valid range
+    current_energy = max(min_energy, min(current_energy, max_energy))
+    
+    # Convert energy to normalized position [0, 1]
+    total_range = max_energy - min_energy
+    linear_position = (current_energy - min_energy) / total_range
+    
+    # Apply sqrt curve transformation to compress adjustments near boundaries
+    # sqrt gives more space in the middle, less at the extremes
+    import math
+    curved_position = math.sqrt(linear_position)
+    
+    # Calculate the derivative (adjustment scaling factor) at current position
+    # For sqrt(x), derivative is 1/(2*sqrt(x)), so adjustments get smaller near x=0
+    # We'll use a modified approach that scales the adjustment based on distance from extremes
+    
+    # Distance from boundaries (0 at boundary, 1 at center)
+    distance_from_min = linear_position
+    distance_from_max = 1.0 - linear_position
+    min_distance = min(distance_from_min, distance_from_max)
+    
+    # Scale adjustment based on distance from boundaries
+    # Near boundaries (min_distance near 0): smaller adjustments
+    # Near center (min_distance near 0.5): larger adjustments
+    scaling_factor = math.sqrt(min_distance * 2.0)  # Range [0, 1]
+    scaled_adjustment = adjustment_rate * scaling_factor
+    
+    # Apply adjustment in the specified direction
+    if direction == 'harder':
+        # Move toward harder (more negative, lower position)
+        new_curved_position = max(0.0, curved_position - scaled_adjustment)
+    else:  # 'easier'
+        # Move toward easier (less negative, higher position)
+        new_curved_position = min(1.0, curved_position + scaled_adjustment)
+    
+    # Convert back through inverse curve (square the curved position)
+    new_linear_position = new_curved_position ** 2
+    
+    # Convert back to energy value
+    new_energy = min_energy + (new_linear_position * total_range)
+    
+    # Apply minimum adjustment of 5 units when not at absolute boundaries
+    # This ensures meaningful adjustments even when scaling factor is very small
+    energy_delta = new_energy - current_energy
+    min_adjustment = 5.0
+    
+    if abs(energy_delta) > 0 and abs(energy_delta) < min_adjustment:
+        # We have a non-zero but very small adjustment - enforce minimum
+        if direction == 'harder':
+            new_energy = max(min_energy, current_energy - min_adjustment)
+        else:  # 'easier'
+            new_energy = min(max_energy, current_energy + min_adjustment)
+    
+    return new_energy
+
+
 def compute_next_block_requirements(previous_block: Block, mining_result: MiningResult,
                                     log: logging.Logger = logger) -> BlockRequirements:
     """
@@ -769,9 +840,8 @@ def compute_next_block_requirements(previous_block: Block, mining_result: Mining
         - If the same miner type wins consecutively, EASE difficulty
         - If a different miner type wins, HARDEN difficulty
 
-    Notes on signs: energies are negative. HARDER means a more negative
-    threshold (multiply by 1 + rate). EASIER means a less negative threshold
-    (multiply by 1 - rate).
+    Uses curve-based energy adjustments instead of flat multiplication.
+    Energy curve: min (-16000) to max (-14000) with knee at (-15600).
     """
     # Get current requirements from previous block
     prev_req = previous_block.next_block_requirements
@@ -791,13 +861,13 @@ def compute_next_block_requirements(previous_block: Block, mining_result: Mining
         prev_winner = prev_miner_id.split('-')[1] if '-' in prev_miner_id else prev_miner_id
 
     # Base adjustment rates
-    energy_adjustment_rate = 0.05  # 5% adjustment
+    energy_adjustment_rate = 0.05  # 5% adjustment along curve
     diversity_adjustment_rate = 0.02  # 2% adjustment
     solutions_adjustment_rate = 0.10  # 10% adjustment
 
     # If block was mined too quickly, always HARDEN
     if mining_result.mining_time is not None and mining_result.mining_time < 10.0:
-        new_difficulty_energy = prev_req.difficulty_energy * (1 + energy_adjustment_rate)
+        new_difficulty_energy = _adjust_energy_along_curve(prev_req.difficulty_energy, energy_adjustment_rate, 'harder')
         new_min_diversity = min(0.46, prev_req.min_diversity + diversity_adjustment_rate)
         new_min_solutions = min(100, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
 
@@ -811,7 +881,7 @@ def compute_next_block_requirements(previous_block: Block, mining_result: Mining
         if current_winner == prev_winner:
             # Same miner won again - make it EASIER
             # Higher energy threshold (less negative), lower diversity/solutions
-            new_difficulty_energy = prev_req.difficulty_energy * (1 - energy_adjustment_rate)
+            new_difficulty_energy = _adjust_energy_along_curve(prev_req.difficulty_energy, energy_adjustment_rate, 'easier')
             new_min_diversity = max(0.2, prev_req.min_diversity - diversity_adjustment_rate)
             new_min_solutions = max(10, int(prev_req.min_solutions * (1 - solutions_adjustment_rate)))
 
@@ -822,7 +892,7 @@ def compute_next_block_requirements(previous_block: Block, mining_result: Mining
         else:
             # Different miner won - make it HARDER
             # Lower energy threshold (more negative), higher diversity/solutions
-            new_difficulty_energy = prev_req.difficulty_energy * (1 + energy_adjustment_rate)
+            new_difficulty_energy = _adjust_energy_along_curve(prev_req.difficulty_energy, energy_adjustment_rate, 'harder')
             new_min_diversity = min(0.46, prev_req.min_diversity + diversity_adjustment_rate)
             new_min_solutions = min(100, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
 
