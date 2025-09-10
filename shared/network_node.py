@@ -10,7 +10,7 @@ import struct
 import threading
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Callable, Set
+from typing import Dict, Optional, Callable
 from datetime import datetime
 import aiohttp
 from aiohttp import web
@@ -29,6 +29,7 @@ from shared.logging_config import init_component_logger
 from shared.version import get_version
 from shared.node_client import NodeClient
 from shared.block_synchronizer import BlockSynchronizer
+from shared.block_store import BlockStore
 
 
 @dataclass(frozen=True)
@@ -169,6 +170,12 @@ class NetworkNode(Node):
 
         self.secret = config.get("secret", f"quip network node secret {random.randint(0, 1000000)}")
         self.auto_mine = config.get("auto_mine", False)
+        
+        # Chain storage configuration
+        self.enable_epoch_storage = config.get("enable_epoch_storage", False)
+        self.epoch_storage_dir = config.get("epoch_storage_dir", "epoch_storage")
+        self.epoch_storage_format = config.get("epoch_storage_format", "pickle")  # 'json' or 'pickle'
+        self.epoch_storage_compress = config.get("epoch_storage_compress", True)
 
         # TLS configuration
         self.tls_cert_file = config.get("tls_cert_file")
@@ -226,7 +233,24 @@ class NetworkNode(Node):
         self.genesis_block = genesis_block
         
         # Epoch tracking to prevent accepting blocks from previous chain epochs
-        self.previous_epochs: Set[EpochInfo] = set()
+        # Changed to store only the most recent previous epoch instead of all epochs
+        self.previous_epoch: Optional[EpochInfo] = None
+        
+        # Initialize block store for epoch storage if enabled
+        if self.enable_epoch_storage:
+            try:
+                self.epoch_block_store = BlockStore(
+                    storage_dir=self.epoch_storage_dir,
+                    format_type=self.epoch_storage_format,
+                    compress=self.epoch_storage_compress
+                )
+                self.logger.info(f"Epoch storage enabled: {self.epoch_storage_dir}")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize epoch storage: {e}")
+                self.enable_epoch_storage = False
+                self.epoch_block_store = None
+        else:
+            self.epoch_block_store = None
         
         # Maximum block index to synchronize with (prevents syncing with peers too far ahead)
         self.max_sync_block_index = 1024
@@ -602,8 +626,8 @@ class NetworkNode(Node):
 
     def _on_block_received(self, block: Block):       
         # Check if we've reached block 1024 and need to initiate reset
-        if block.header.index == 1024 and not self.reset_scheduled:
-            self.logger.info("Block 1024 reached - starting 5-minute reset coordination timer")
+        if block.header.index == self.max_sync_block_index and not self.reset_scheduled:
+            self.logger.info(f"Block limit ({self.max_sync_block_index}) reached - starting 5-minute reset coordination timer")
             self.reset_scheduled = True
             self.reset_start_time = time.time()
             
@@ -667,19 +691,28 @@ class NetworkNode(Node):
             
             # Reset blockchain state
             async with self.chain_lock:
+                # Save previous epoch to disk if storage is enabled and we have one
+                if self.enable_epoch_storage and self.epoch_block_store and self.previous_epoch:
+                    try:
+                        # Save current chain as the previous epoch
+                        saved_path = self.epoch_block_store.save(self.chain)
+                        self.logger.info(f"Previous epoch chain saved to disk: {saved_path}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to save previous epoch to disk: {e}")
+                
                 # Capture current epoch info before reset
                 if len(self.chain) > 1:  # Only if we have blocks beyond genesis
                     head_block = self.get_latest_block()
                     block_1 = self.get_block(1) if len(self.chain) > 1 else None
                     
                     if head_block and block_1 and block_1.hash and head_block.hash:
-                        epoch_info = EpochInfo(
+                        # Store current epoch as the new previous epoch (replacing any existing one)
+                        self.previous_epoch = EpochInfo(
                             first_hash=block_1.hash,
                             last_timestamp=head_block.header.timestamp,
                             last_index=head_block.header.index,
                             last_hash=head_block.hash
                         )
-                        self.previous_epochs.add(epoch_info)
                         self.logger.info(f"Recorded previous epoch: block 1 hash {block_1.hash.hex()[:8]}..., "
                                        f"last block {head_block.header.index} hash {head_block.hash.hex()[:8]}...")
                 
@@ -746,22 +779,22 @@ class NetworkNode(Node):
             self.logger.debug(f"Block {block.header.index} rejected: index > max_sync_block_index {self.max_sync_block_index}")
             return False
         
-        # Check against previous epochs to prevent accepting blocks from old chain epochs
+        # Check against previous epoch to prevent accepting blocks from old chain epoch
         async with self.chain_lock:
-            for epoch_info in self.previous_epochs:
-                # Reject if this is block 1 from a previous epoch
-                if block.header.index == 1 and block.hash and block.hash == epoch_info.first_hash:
+            if self.previous_epoch:
+                # Reject if this is block 1 from the previous epoch
+                if block.header.index == 1 and block.hash and block.hash == self.previous_epoch.first_hash:
                     self.logger.warning(f"Block 1 rejected: hash {block.hash.hex()[:8]}... matches previous epoch first_hash")
                     return False
                 
-                # Reject if this block hash matches the last block from a previous epoch  
-                if block.hash and block.hash == epoch_info.last_hash:
+                # Reject if this block hash matches the last block from the previous epoch  
+                if block.hash and block.hash == self.previous_epoch.last_hash:
                     self.logger.warning(f"Block {block.header.index} rejected: hash {block.hash.hex()[:8]}... matches previous epoch last_hash")
                     return False
                 
-                # Reject if timestamp is older than the last timestamp from a previous epoch
-                if block.header.timestamp <= epoch_info.last_timestamp:
-                    self.logger.warning(f"Block {block.header.index} rejected: timestamp {block.header.timestamp} <= previous epoch last_timestamp {epoch_info.last_timestamp}")
+                # Reject if timestamp is older than the last timestamp from the previous epoch
+                if block.header.timestamp <= self.previous_epoch.last_timestamp:
+                    self.logger.warning(f"Block {block.header.index} rejected: timestamp {block.header.timestamp} <= previous epoch last_timestamp {self.previous_epoch.last_timestamp}")
                     return False
         
         # If all validations pass, call parent receive_block
