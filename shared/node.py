@@ -116,8 +116,11 @@ class Node:
 
     def _setup_multiprocess_logging(self):
         """Set up logging queue and listener for multiprocessing."""
-        # Create queue for inter-process logging
-        self._log_queue = multiprocessing.Queue()
+        # Use spawn context consistently for all multiprocessing objects
+        self._mp_context = multiprocessing.get_context("spawn")
+
+        # Create queue for inter-process logging using the same context
+        self._log_queue = self._mp_context.Queue()
 
         # Get the current root logger's handlers to replicate them in the listener
         root_logger = logging.getLogger()
@@ -136,7 +139,8 @@ class Node:
         """Initialize persistent miner workers based on configuration (TOML)."""
 
         self.miner_handles: list[MinerHandle] = []
-        ctx = multiprocessing.get_context("spawn")
+        # Use the same context that was used for logging
+        ctx = self._mp_context
 
         # CPU Miners, 1 per cpu
         if cfg.get("cpu") is not None:
@@ -371,7 +375,7 @@ class Node:
 
         # Set mining state
         self._is_mining = True
-        self._mining_stop_event = multiprocessing.Event()
+        self._mining_stop_event = self._mp_context.Event()
 
         # Start timing
         start_time = time.time()

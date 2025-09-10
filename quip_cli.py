@@ -7,7 +7,7 @@ Provides two console commands:
 from __future__ import annotations
 
 import os
-
+import multiprocessing
 import signal
 import subprocess
 import sys
@@ -632,6 +632,9 @@ def quip_network_smoketest(target: str, print_only: bool):
 # Entry points for console_scripts
 
 def network_node_main():
+    # Set multiprocessing start method to 'spawn' to avoid context mixing issues
+    multiprocessing.set_start_method('spawn', force=True)
+
     quip_network_node(standalone_mode=False)
 
 # -----------------------------
@@ -648,6 +651,9 @@ def quip_node_stats(_: click.Context, config: Optional[str], interval: float):
     This is an experimental helper that constructs Node directly from TOML config
     and prints Node.get_stats() every --interval seconds. Ctrl-C to stop.
     """
+    # Set multiprocessing start method to 'spawn' to avoid context mixing issues
+    multiprocessing.set_start_method('spawn', force=True)
+
     cfg = _load_config(config)
     miners_config = cfg or {}
     genesis_block=load_genesis_block(cfg.get("genesis_config", "genesis_block.json"))
@@ -663,9 +669,10 @@ def quip_node_stats(_: click.Context, config: Optional[str], interval: float):
     finally:
         node.close()
 
-    quip_network_node(standalone_mode=False)
-
 
 def network_simulator_main():
+    # Set multiprocessing start method to 'spawn' to avoid context mixing issues
+    multiprocessing.set_start_method('spawn', force=True)
+
     quip_network_simulator(standalone_mode=False)
 

@@ -14,6 +14,7 @@ from shared.quantum_proof_of_work import calculate_diversity, generate_ising_mod
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce, calculate_diversity
 from shared.block_requirements import BlockRequirements, compute_current_requirements
 from shared.logging_config import get_logger
+from shared.energy_utils import adjust_energy_along_curve
 
 # Initialize logger
 logger = get_logger('block')
@@ -758,68 +759,6 @@ def calculate_adaptive_parameters(requirements: Dict[str, Any], miner_type: str)
             'beta_range': [0.1, 10.0]
         }
     
-def adjust_energy_along_curve(current_energy: float, adjustment_rate: float, direction: str) -> float:
-    """Adjust energy along a curve that compresses adjustments near boundaries.
-    
-    Uses a sqrt-based curve from min_energy (-16000) to max_energy (-14000) with knee at -15600.
-    Adjustments become smaller as we approach the extremes, larger near the knee point.
-    Beyond observed limits, returns a simple linear adjustment that calling functions can handle.
-    
-    Args:
-        current_energy: Current energy value
-        adjustment_rate: Percentage to move (e.g., 0.05 for 5%)
-        direction: 'harder' (more negative) or 'easier' (less negative)
-    
-    Returns:
-        New energy value after curve-based adjustment
-    """
-    min_energy = -16000.0  # Hardest (approximate, not hard limit)
-    knee_energy = -15600.0  # Knee point
-    max_energy = -14000.0  # Easiest (approximate, not hard limit)
-    
-    # Convert energy to normalized position [0, 1] for observed range
-    total_range = max_energy - min_energy
-    linear_position = (current_energy - min_energy) / total_range
-    
-    import math
-    
-    # Handle positions outside the observed range with simple linear adjustment
-    if linear_position < 0.0 or linear_position > 1.0:
-        # Beyond observed limits - return simple linear adjustment
-        # Calling function will handle minimum adjustment logic
-        base_adjustment = adjustment_rate * total_range  # Scale adjustment to energy range
-        if direction == 'harder':
-            return current_energy - base_adjustment
-        else:  # 'easier'
-            return current_energy + base_adjustment
-    else:
-        # Within observed range - use curve-based adjustment
-        # Apply sqrt curve transformation to compress adjustments near boundaries
-        curved_position = math.sqrt(linear_position)
-        
-        # Distance from boundaries (0 at boundary, 1 at center)
-        distance_from_min = linear_position
-        distance_from_max = 1.0 - linear_position
-        min_distance = min(distance_from_min, distance_from_max)
-        
-        # Scale adjustment based on distance from boundaries
-        scaling_factor = math.sqrt(min_distance * 2.0)  # Range [0, 1]
-        scaled_adjustment = adjustment_rate * scaling_factor
-        
-        # Apply adjustment in the specified direction
-        if direction == 'harder':
-            new_curved_position = max(0.0, curved_position - scaled_adjustment)
-        else:  # 'easier'
-            new_curved_position = min(1.0, curved_position + scaled_adjustment)
-        
-        # Convert back through inverse curve (square the curved position)
-        new_linear_position = new_curved_position ** 2
-        
-        # Convert back to energy value
-        new_energy = min_energy + (new_linear_position * total_range)
-        
-        return new_energy
-
 
 def compute_next_block_requirements(previous_block: Block, mining_result: MiningResult,
                                     log: logging.Logger = logger) -> BlockRequirements:

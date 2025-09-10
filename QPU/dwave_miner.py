@@ -5,7 +5,7 @@ import multiprocessing
 import multiprocessing.synchronize
 import random
 import time
-from typing import Optional, cast
+from typing import Optional, cast, Mapping, Tuple, Any
 
 from QPU.dwave_sampler import DWaveSamplerWrapper
 from shared.base_miner import BaseMiner, MiningResult
@@ -117,7 +117,6 @@ class DWaveMiner(BaseMiner):
                 self.current_stage_start = sample_start
                 
                 # Cast h and J to match protocol expectations (int is a valid Variable type)
-                from typing import Mapping, Tuple, Any
                 h_cast = cast(Mapping[Any, float], h)
                 J_cast = cast(Mapping[Tuple[Any, Any], float], J)
 

@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+from shared.energy_utils import adjust_energy_along_curve
+
 internal_logger = logging.getLogger(__name__)
 
 @dataclass
@@ -131,8 +133,6 @@ def calculate_requirements_decay(cur_requirements: dict) -> dict:
     - Diversity and min_solutions also ease downward within sensible floors.
     - Minimum energy adjustment is 3 (vs 5 for difficulty adjustments).
     """
-    from shared.block import adjust_energy_along_curve
-    
     # Base easing rates (half the rate of difficulty adjustments)
     energy_ease_rate = 0.025      # 2.5% easier per decay step (half of 5%)
     diversity_ease_rate = 0.01    # 1% easier per decay step (half of 2%)

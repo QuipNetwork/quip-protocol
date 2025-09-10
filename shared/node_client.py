@@ -212,8 +212,7 @@ class NodeClient:
         conn_str = await self._ensure_connection_string(host)
         if not conn_str:
             return None
-            
-        import time  # Local import to avoid issues
+
         t0 = time.perf_counter()
         
         try:
