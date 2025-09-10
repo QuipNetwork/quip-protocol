@@ -20,8 +20,7 @@ if TYPE_CHECKING:
 
 from shared import block
 from shared.block_signer import BlockSigner
-from shared.block import Block, BlockHeader, MinerInfo
-from shared.block_requirements import BlockRequirements, compute_current_requirements
+from shared.block import Block, MinerInfo, compute_next_block_requirements
 from shared.miner import Miner, MiningResult
 from shared.logging_config import init_component_logger
 # Global logger for this module (set during Node initialization)
@@ -508,7 +507,7 @@ class Node:
         if (quantum_proof.num_valid_solutions is None or quantum_proof.num_valid_solutions > mining_result.num_valid):
             raise ValueError(f"Miner reported bad num_valid_solutions {mining_result.num_valid} but we computed {quantum_proof.num_valid_solutions}")
 
-        next_block_requirements = self.compute_next_block_requirements(previous_block, mining_result)
+        next_block_requirements = compute_next_block_requirements(previous_block, mining_result, self.logger)
         next_block = block.Block(
             header=header,
             miner_info=miner_info,
@@ -535,85 +534,6 @@ class Node:
         ):
             raise ValueError("Failed to verify signature")
         return block
-
-    def compute_next_block_requirements(self, previous_block: Block, mining_result: MiningResult) -> BlockRequirements:
-        """
-        Compute the next block requirements based on the previous block and mining result.
-
-        Rules:
-        - Always HARDEN difficulty if the last block was mined in under 60 seconds
-        - Otherwise:
-          - If the same miner type wins consecutively, EASE difficulty
-          - If a different miner type wins, HARDEN difficulty
-
-        Notes on signs: energies are negative. HARDER means a more negative
-        threshold (multiply by 1 + rate). EASIER means a less negative threshold
-        (multiply by 1 - rate).
-        """
-        # Get current requirements from previous block
-        prev_req = previous_block.next_block_requirements
-        if not prev_req:
-            raise ValueError("Previous block has no next block requirements")
-        
-        if previous_block.header.index > 0:
-            prev_req = compute_current_requirements(prev_req, previous_block.header.timestamp, self.logger, mining_result.timestamp)
-
-        # Extract miner type from mining result
-        current_winner = mining_result.miner_id.split('-')[1] if '-' in mining_result.miner_id else mining_result.miner_id
-
-        # Get the previous winner from the previous block's miner info
-        prev_winner = None
-        if previous_block.miner_info:
-            prev_miner_id = previous_block.miner_info.miner_id
-            prev_winner = prev_miner_id.split('-')[1] if '-' in prev_miner_id else prev_miner_id
-
-        # Base adjustment rates
-        energy_adjustment_rate = 0.05  # 5% adjustment
-        diversity_adjustment_rate = 0.02  # 2% adjustment
-        solutions_adjustment_rate = 0.10  # 10% adjustment
-
-        # If block was mined too quickly, always HARDEN
-        if mining_result.mining_time is not None and mining_result.mining_time < 10.0:
-            new_difficulty_energy = prev_req.difficulty_energy * (1 + energy_adjustment_rate)
-            new_min_diversity = min(0.46, prev_req.min_diversity + diversity_adjustment_rate)
-            new_min_solutions = min(100, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
-
-            self.logger.info(
-                f"Block was mined in {mining_result.mining_time:.2f}s (<10s) - HARDENING difficulty")
-            self.logger.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
-            self.logger.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
-            self.logger.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
-        else:
-            self.logger.info(f"Last winner: {prev_winner}, current winner: {current_winner}")
-            if current_winner == prev_winner:
-                # Same miner won again - make it EASIER
-                # Higher energy threshold (less negative), lower diversity/solutions
-                new_difficulty_energy = prev_req.difficulty_energy * (1 - energy_adjustment_rate)
-                new_min_diversity = max(0.2, prev_req.min_diversity - diversity_adjustment_rate)
-                new_min_solutions = max(10, int(prev_req.min_solutions * (1 - solutions_adjustment_rate)))
-
-                self.logger.info(f"Same miner type ({current_winner}) won - EASING difficulty")
-                self.logger.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
-                self.logger.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
-                self.logger.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
-            else:
-                # Different miner won - make it HARDER
-                # Lower energy threshold (more negative), higher diversity/solutions
-                new_difficulty_energy = prev_req.difficulty_energy * (1 + energy_adjustment_rate)
-                new_min_diversity = min(0.46, prev_req.min_diversity + diversity_adjustment_rate)
-                new_min_solutions = min(100, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
-
-                self.logger.info(f"Different miner type won ({prev_winner} -> {current_winner}) - HARDENING difficulty")
-                self.logger.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
-                self.logger.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
-                self.logger.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
-
-        return BlockRequirements(
-            difficulty_energy=new_difficulty_energy,
-            min_diversity=new_min_diversity,
-            min_solutions=new_min_solutions,
-            timeout_to_difficulty_adjustment_decay=prev_req.timeout_to_difficulty_adjustment_decay
-        )
 
     def close(self):
         """Shutdown all persistent miner workers and logging."""

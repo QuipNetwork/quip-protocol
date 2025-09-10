@@ -4,10 +4,9 @@ import logging
 import struct
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Optional
 
-from shared.quantum_proof_of_work import calculate_requirements_decay
-
+internal_logger = logging.getLogger(__name__)
 
 @dataclass
 class BlockRequirements:
@@ -68,7 +67,7 @@ class BlockRequirements:
 def compute_current_requirements(
     initial_requirements: BlockRequirements,
     prev_timestamp: int,
-    logger: Optional[logging.Logger] = None,
+    log: logging.Logger = internal_logger,
     current_time: Optional[int] = None
 ) -> BlockRequirements:
     """
@@ -82,7 +81,6 @@ def compute_current_requirements(
     Returns:
         BlockRequirements with decay applied if elapsed time warrants it
     """
-
     if current_time is None:
         current_time = int(time.time())
 
@@ -95,8 +93,7 @@ def compute_current_requirements(
     if elapsed == 0:
         return initial_requirements
 
-    if logger:
-        logger.debug(f"Elapsed time: {elapsed} steps ({current_time - prev_timestamp}s, {initial_requirements.timeout_to_difficulty_adjustment_decay}s per step)")
+    log.debug(f"Elapsed time: {elapsed} steps ({current_time - prev_timestamp}s, {initial_requirements.timeout_to_difficulty_adjustment_decay}s per step)")
 
     # Apply decay for each elapsed step
     req_dict = initial_requirements.to_json()
@@ -106,8 +103,8 @@ def compute_current_requirements(
     decayed_requirements = BlockRequirements.from_json(req_dict)
 
     # Log changes only if decay was applied
-    if logger and elapsed > 0:
-        logger.info(
+    if elapsed > 0:
+        log.info(
             f"Applied {elapsed} difficulty decay steps: "
             f"energy {initial_requirements.difficulty_energy:.2f} -> {decayed_requirements.difficulty_energy:.2f}, "
             f"diversity {initial_requirements.min_diversity:.3f} -> {decayed_requirements.min_diversity:.3f}, "
@@ -116,6 +113,49 @@ def compute_current_requirements(
 
     return decayed_requirements
 
+def calculate_requirements_decay(cur_requirements: dict) -> dict:
+    """
+    Apply one step of timeout-based difficulty decay to the given requirements.
 
-# For backward compatibility, create an alias
-NextBlockRequirements = BlockRequirements
+    Expects a dict-like with keys:
+      - difficulty_energy (float, typically negative)
+      - min_diversity (float)
+      - min_solutions (int)
+      - timeout_to_difficulty_adjustment_decay (int seconds)
+
+    Returns a new dict with eased (less strict) requirements.
+
+    Notes:
+    - Energies are negative; easing moves the threshold closer to 0.
+    - Diversity and min_solutions also ease downward within sensible floors.
+    - Rates are aligned with Node.compute_next_block_requirements but in the easing
+      direction to represent timeout-based relief.
+    """
+    # Base easing rates (mirror of Node adjustments, but always easing)
+    energy_ease_rate = 0.05       # 5% easier per decay step
+    diversity_ease_rate = 0.02    # 2% easier per decay step
+    solutions_ease_rate = 0.10    # 10% easier per decay step
+
+    # Floors to avoid collapsing difficulty entirely
+    MIN_DIVERSITY_FLOOR = 0.20
+    MIN_SOLUTIONS_FLOOR = 10
+
+    de = float(cur_requirements.get('difficulty_energy', 0.0))
+    md = float(cur_requirements.get('min_diversity', 0.0))
+    ms = int(cur_requirements.get('min_solutions', 0))
+    decay = int(cur_requirements.get('timeout_to_difficulty_adjustment_decay', 30))
+
+    # Apply easing: move negative energy closer to 0 (less negative)
+    new_de = de * (1 - energy_ease_rate)
+
+    # Ease diversity and solutions downward within floors
+    new_md = max(MIN_DIVERSITY_FLOOR, md - diversity_ease_rate)
+    new_ms = max(MIN_SOLUTIONS_FLOOR, int(ms * (1 - solutions_ease_rate)))
+
+    return {
+        'difficulty_energy': float(new_de),
+        'min_diversity': float(new_md),
+        'min_solutions': int(new_ms),
+        'timeout_to_difficulty_adjustment_decay': decay,
+    }
+

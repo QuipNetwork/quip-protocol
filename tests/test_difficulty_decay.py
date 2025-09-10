@@ -2,7 +2,7 @@ import time
 
 from shared.block import Block, BlockHeader, MinerInfo, QuantumProof
 from shared.block_requirements import BlockRequirements
-from shared.quantum_proof_of_work import calculate_requirements_decay
+from shared.block_requirements import calculate_requirements_decay
 
 
 def make_prev_and_cur_blocks(requirements: BlockRequirements, gap_seconds: int):

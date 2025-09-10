@@ -5,79 +5,28 @@ Contains core mining logic and defines abstract methods for miner-specific imple
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-import collections.abc
-from blake3 import blake3
 import logging
 import multiprocessing
 import multiprocessing.synchronize
 
 import dimod
 from shared.block_requirements import BlockRequirements
-from shared.logging_config import QuipFormatter
+from shared.miner_types import IsingSample, MiningResult, Sampler
 
 # Global logger for this module (set during initialization)
 log = None
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Protocol, Any, Union
-
+from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
-
-# Type definitions for quantum computing
-Variable = collections.abc.Hashable
-Bias = float
-
-@dataclass
-class MiningResult:
-    """Result of a mining operation."""
-    miner_id: str
-    miner_type: str
-    nonce: int
-    salt: bytes
-    timestamp: int
-    prev_timestamp: int
-    solutions: List[List[int]]
-    energy: float
-    diversity: float
-    num_valid: int
-    mining_time: int
-    node_list: List[int]
-    edge_list: List[Tuple[int, int]]
-    variable_order: Optional[List[int]] = None
-
-@dataclass
-class IsingSample:
-    nonce: int
-    salt: bytes
-    sampleset: dimod.SampleSet
-
-class Sampler(Protocol):
-    """Protocol defining the D-Wave sampler interface."""
-    nodelist: List[Variable]
-    edgelist: List[Tuple[Variable, Variable]]
-    properties: Dict[str, Any]
-    sampler_type: str
-    nodes: List[int]  # Integer nodes for quantum_proof_of_work functions
-    edges: List[Tuple[int, int]]  # Integer edges for quantum_proof_of_work functions
-
-    def sample_ising(
-        self,
-        h: Union[Mapping[Variable, Bias], Sequence[Bias]],
-        J: Mapping[Tuple[Variable, Variable], Bias],
-        **kwargs
-    ) -> dimod.SampleSet:
-        ...
 from shared.quantum_proof_of_work import (
     energies_for_solutions,
-    energy_of_solution,
     calculate_diversity,
     generate_ising_model_from_nonce,
     select_diverse_solutions,
 )
-from shared.logging_config import get_logger, init_component_logger
-
 # Global logger for this module
-log = None
+log = logging.getLogger(__name__)
 
 class BaseMiner(ABC):
     """Abstract base class for concrete miners.
