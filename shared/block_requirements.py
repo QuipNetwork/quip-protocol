@@ -126,15 +126,17 @@ def calculate_requirements_decay(cur_requirements: dict) -> dict:
     Returns a new dict with eased (less strict) requirements.
 
     Notes:
+    - Uses curve-based energy adjustment at half the rate of difficulty increases
     - Energies are negative; easing moves the threshold closer to 0.
     - Diversity and min_solutions also ease downward within sensible floors.
-    - Rates are aligned with Node.compute_next_block_requirements but in the easing
-      direction to represent timeout-based relief.
+    - Minimum energy adjustment is 3 (vs 5 for difficulty adjustments).
     """
-    # Base easing rates (mirror of Node adjustments, but always easing)
-    energy_ease_rate = 0.05       # 5% easier per decay step
-    diversity_ease_rate = 0.02    # 2% easier per decay step
-    solutions_ease_rate = 0.10    # 10% easier per decay step
+    from shared.block import adjust_energy_along_curve
+    
+    # Base easing rates (half the rate of difficulty adjustments)
+    energy_ease_rate = 0.025      # 2.5% easier per decay step (half of 5%)
+    diversity_ease_rate = 0.01    # 1% easier per decay step (half of 2%)
+    solutions_ease_rate = 0.05    # 5% easier per decay step (half of 10%)
 
     # Floors to avoid collapsing difficulty entirely
     MIN_DIVERSITY_FLOOR = 0.20
@@ -145,8 +147,16 @@ def calculate_requirements_decay(cur_requirements: dict) -> dict:
     ms = int(cur_requirements.get('min_solutions', 0))
     decay = int(cur_requirements.get('timeout_to_difficulty_adjustment_decay', 30))
 
-    # Apply easing: move negative energy closer to 0 (less negative)
-    new_de = de * (1 - energy_ease_rate)
+    # Apply curve-based easing for energy (move toward easier/less negative)
+    curve_energy = adjust_energy_along_curve(de, energy_ease_rate, 'easier')
+    
+    # Apply minimum adjustment of 3 units for decay
+    energy_delta = curve_energy - de
+    min_adjustment = 3.0
+    if abs(energy_delta) > 0 and abs(energy_delta) < min_adjustment:
+        new_de = de + min_adjustment  # Always easier for decay
+    else:
+        new_de = curve_energy
 
     # Ease diversity and solutions downward within floors
     new_md = max(MIN_DIVERSITY_FLOOR, md - diversity_ease_rate)
