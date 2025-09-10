@@ -19,12 +19,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
-from shared.quantum_proof_of_work import (
-    energies_for_solutions,
-    calculate_diversity,
-    generate_ising_model_from_nonce,
-    select_diverse_solutions,
-)
+from shared.quantum_proof_of_work import evaluate_sampleset
 # Global logger for this module
 log = logging.getLogger(__name__)
 
@@ -249,85 +244,7 @@ class BaseMiner(ABC):
 
     def evaluate_sampleset(self, sampleset: dimod.SampleSet, requirements: BlockRequirements, nodes: List[int], edges: List[Tuple[int, int]], nonce: int, salt: bytes, prev_timestamp: int, start_time: float) -> Optional[MiningResult]:
         """Convert a sample set into a mining result if it meets requirements, otherwise return None."""
-        difficulty_energy = requirements.difficulty_energy
-        min_diversity = requirements.min_diversity
-        min_solutions = requirements.min_solutions
-        best_energy = float('inf')
-        valid_solutions = []
-        diversity = 0.0
-        result = None
-
-        try:
-            # Best Energy
-            all_energies = sampleset.record.energy
-            if len(all_energies) == 0:
-                raise ValueError("No samples in sampleset")
-
-            best_energy = float(np.min(all_energies))
-
-            # NOTE: we use the same energy function to ensure consistency. Unfortunately
-            # it disagrees with energies created by different sampler impls, but not significantly.
-            solutions = list(sampleset.record.sample)
-            h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
-            best_energy = min(energies_for_solutions(solutions, h, J, nodes))                
-
-            if best_energy > difficulty_energy:
-                raise ValueError(f"Best energy {best_energy} exceeds difficulty energy {difficulty_energy}")
-
-            # Process results from this mining attempt
-            # Find all solutions meeting energy threshold
-            valid_indices = np.where(all_energies < difficulty_energy)[0]
-            # Get unique solutions that meet energy threshold
-            valid_solutions = []
-            seen = set()
-            for idx in valid_indices:
-                solution = tuple(sampleset.record.sample[idx])
-                if solution not in seen:
-                    seen.add(solution)
-                    valid_solutions.append(list(solution))
-            if len(valid_solutions) < min_solutions:
-                raise ValueError(f"Insufficient valid solutions: {len(valid_solutions)} < {min_solutions}")
-            
-            # Filter solutions if we have too many
-            filtered_solutions = valid_solutions
-            final_diversity = diversity
-            if len(valid_solutions) >= min_solutions:
-                selected_solutions_indices = select_diverse_solutions(valid_solutions, min_solutions)
-                filtered_solutions = [valid_solutions[i] for i in selected_solutions_indices]
-                final_diversity = calculate_diversity(filtered_solutions)
-
-
-            # Recalculate best energy from filtered solutions
-            best_energy = min(energies_for_solutions(filtered_solutions, h, J, nodes))
-
-            if final_diversity < min_diversity:
-                raise ValueError(f"Insufficient diversity: {final_diversity} < {min_diversity}")
-
-            # Create mining result for this attempt
-            mining_time = time.time() - start_time
-            
-            # Create result for this attempt
-            result = MiningResult(
-                miner_id=self.miner_id,
-                miner_type=self.miner_type,
-                nonce=nonce,
-                salt=salt,
-                timestamp=int(time.time()),
-                prev_timestamp=prev_timestamp,
-                solutions=filtered_solutions,
-                energy=best_energy,
-                diversity=final_diversity,
-                num_valid=len(valid_solutions),
-                mining_time=int(mining_time),
-                node_list=nodes,
-                edge_list=edges,
-                variable_order=nodes
-            )
-        except ValueError as e:
-            self.logger.debug(f"Failed to meet requirements: {e}")
-        finally:
-            self.logger.info(f"Mining attempt - Energy: {best_energy:.2f}, Valid: {len(valid_solutions)}, Diversity: {diversity:.3f} (requirements: energy<={difficulty_energy:.2f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
-        return result
+        return evaluate_sampleset(sampleset, requirements, nodes, edges, nonce, salt, prev_timestamp, start_time, self.miner_id, self.miner_type)
 
 
 def compare_mining_samples(sample_a: IsingSample, sample_b: IsingSample, requirements: BlockRequirements) -> int:

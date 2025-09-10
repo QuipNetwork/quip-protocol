@@ -10,7 +10,9 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
-from shared.quantum_proof_of_work import generate_ising_model_from_nonce
+from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evaluate_sampleset
+from shared.block_requirements import BlockRequirements
+import random
 
 try:
     from QPU.dwave_sampler import DWaveSamplerWrapper
@@ -40,22 +42,15 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, target_energy=-155
         print(f"❌ QPU failed: {e}")
         return None
     
-    # Generate test problem (same as CPU/Metal baseline)
+    # Get topology information from sampler
     nodes = sampler.nodes
     edges = sampler.edges
-    seed = 12345  # Fixed seed for reproducible results
-    h, J = generate_ising_model_from_nonce(seed, nodes, edges)
-    print(f"📊 Problem: {len(h)} variables, {len(J)} couplings")
+    print(f"📊 Topology: {len(nodes)} nodes, {len(edges)} edges")
     
     results = {
         'timeout_minutes': float(timeout_minutes),
         'min_runtime_minutes': float(min_runtime_minutes),
         'target_energy': float(target_energy),
-        'problem_info': {
-            'num_variables': int(len(h)),
-            'num_couplings': int(len(J)),
-            'seed': int(seed)
-        },
         'qpu_info': {
             'num_qpu_nodes': int(len(sampler.nodes)),
             'num_qpu_edges': int(len(sampler.edges)),
@@ -88,6 +83,10 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, target_energy=-155
         print(f"\n  Testing {num_reads} reads, {annealing_time}µs annealing...")
 
         try:
+            # Generate the Ising model for this test (like the real miners do)
+            nonce = random.randint(0, 2**32 - 1)
+            h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+
             start_time = time.time()
 
             # Cast h and J to match protocol expectations (int is a valid Variable type)
@@ -111,6 +110,46 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, target_energy=-155
             print(f"    ⏱️  {runtime/60:.1f} min ({runtime:.1f}s)")
             print(f"    🎯 min_energy = {min_energy:.1f}")
             print(f"    📊 avg_energy = {avg_energy:.1f} (±{std_energy:.1f})")
+
+            # Verify energy calculation consistency
+            from shared.quantum_proof_of_work import energies_for_solutions
+            solutions = list(sampleset.record.sample)
+            recalc_energies = energies_for_solutions(solutions, h, J, nodes)
+            recalc_min = min(recalc_energies)
+            print(f"    ✓ Energy verification: sampler={min_energy:.1f}, recalc={recalc_min:.1f}, diff={abs(min_energy - recalc_min):.1f}")
+
+            # Use evaluate_sampleset to get diversity and num_solutions
+            # Create test requirements (using dummy values to ensure they pass)
+            requirements = BlockRequirements(
+                difficulty_energy=0.0,       # Very lenient difficulty (allow positive energies)
+                min_diversity=0.1,           # Low diversity requirement
+                min_solutions=1,             # Low solution count requirement
+                timeout_to_difficulty_adjustment_decay=600  # 10 minutes
+            )
+
+            # Use the same nonce and generate test salt for evaluation
+            salt = b"test_salt_qpu_baseline"
+            prev_timestamp = int(time.time()) - 600  # 10 minutes ago
+
+            # Evaluate the sampleset
+            mining_result = evaluate_sampleset(
+                sampleset, requirements, nodes, edges, nonce, salt,
+                prev_timestamp, start_time, f"qpu-baseline-{num_reads}", "QPU"
+            )
+
+            diversity = 0.0
+            num_solutions = 0
+            meets_requirements = False
+
+            if mining_result:
+                diversity = mining_result.diversity
+                num_solutions = mining_result.num_valid
+                meets_requirements = True
+                print(f"    🌈 diversity = {diversity:.3f}")
+                print(f"    🔢 num_solutions = {num_solutions}")
+                print(f"    ✅ Meets mining requirements!")
+            else:
+                print(f"    ❌ Does not meet mining requirements")
 
             # Energy target analysis
             target_reached = "none"
@@ -149,6 +188,9 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, target_energy=-155
                 'std_energy': std_energy,
                 'target_reached': target_reached,
                 'target_reached_bool': target_reached_bool,
+                'diversity': float(diversity),
+                'num_solutions': int(num_solutions),
+                'meets_requirements': bool(meets_requirements),
                 'qpu_timing': qpu_timing
             }
             results['tests'].append(test_result)

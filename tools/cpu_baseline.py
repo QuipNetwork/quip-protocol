@@ -10,10 +10,12 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
-from shared.quantum_proof_of_work import generate_ising_model_from_nonce
+from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evaluate_sampleset
+from shared.block_requirements import BlockRequirements
+import random
 
 
-def cpu_baseline_test(timeout_minutes=10, output_file=None):
+def cpu_baseline_test(timeout_minutes=10.0, output_file=None):
     """Test CPU performance with configurable timeout."""
     print("🔬 CPU Baseline Parameter Test")
     print("=" * 40)
@@ -61,6 +63,10 @@ def cpu_baseline_test(timeout_minutes=10, output_file=None):
         print(f"\n{desc}: {sweeps} sweeps, {reads} reads")
         
         try:
+            # Generate the Ising model first (like the real miners do)
+            nonce = random.randint(0, 2**32 - 1)
+            h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+
             start_time = time.time()
             sampleset = cpu_sampler.sample_ising(
                 h=h, J=J,
@@ -68,16 +74,49 @@ def cpu_baseline_test(timeout_minutes=10, output_file=None):
                 num_sweeps=sweeps
             )
             runtime = time.time() - start_time
-            
+
             energies = list(sampleset.record.energy)
-            min_energy = min(energies)
-            avg_energy = sum(energies) / len(energies)
-            std_energy = (sum((e - avg_energy)**2 for e in energies) / len(energies)) ** 0.5
-            
+            min_energy = float(min(energies))
+            avg_energy = float(sum(energies) / len(energies))
+            std_energy = float((sum((e - avg_energy)**2 for e in energies) / len(energies)) ** 0.5)
+
             print(f"  ⏱️  {runtime/60:.1f} min ({runtime:.1f}s)")
             print(f"  🎯 min_energy = {min_energy:.1f}")
             print(f"  📊 avg_energy = {avg_energy:.1f} (±{std_energy:.1f})")
-            
+
+            # Use evaluate_sampleset to get diversity and num_solutions
+            # Create test requirements (using dummy values to ensure they pass)
+            requirements = BlockRequirements(
+                difficulty_energy=0.0,       # Very lenient difficulty (allow positive energies)
+                min_diversity=0.1,           # Low diversity requirement
+                min_solutions=1,             # Low solution count requirement
+                timeout_to_difficulty_adjustment_decay=600  # 10 minutes
+            )
+
+            # Use the same nonce and generate test salt for evaluation
+            salt = b"test_salt_cpu_baseline"
+            prev_timestamp = int(time.time()) - 600  # 10 minutes ago
+
+            # Evaluate the sampleset
+            mining_result = evaluate_sampleset(
+                sampleset, requirements, nodes, edges, nonce, salt,
+                prev_timestamp, start_time, f"cpu-baseline-{sweeps}-{reads}", "CPU"
+            )
+
+            diversity = 0.0
+            num_solutions = 0
+            meets_requirements = False
+
+            if mining_result:
+                diversity = mining_result.diversity
+                num_solutions = mining_result.num_valid
+                meets_requirements = True
+                print(f"  🌈 diversity = {diversity:.3f}")
+                print(f"  🔢 num_solutions = {num_solutions}")
+                print(f"  ✅ Meets mining requirements!")
+            else:
+                print(f"  ❌ Does not meet mining requirements")
+
             # Energy target analysis
             target_reached = "none"
             if min_energy <= -15650:
@@ -88,20 +127,23 @@ def cpu_baseline_test(timeout_minutes=10, output_file=None):
                 target_reached = "good"
             elif min_energy <= -15300:
                 target_reached = "fair"
-            
+
             if target_reached != "none":
                 print(f"  🎖️  Quality: {target_reached}")
-            
+
             test_result = {
                 'description': desc,
-                'num_sweeps': sweeps,
-                'num_reads': reads,
-                'runtime_seconds': runtime,
-                'runtime_minutes': runtime / 60,
+                'num_sweeps': int(sweeps),
+                'num_reads': int(reads),
+                'runtime_seconds': float(runtime),
+                'runtime_minutes': float(runtime / 60),
                 'min_energy': min_energy,
                 'avg_energy': avg_energy,
                 'std_energy': std_energy,
-                'target_reached': target_reached
+                'target_reached': target_reached,
+                'diversity': float(diversity),
+                'num_solutions': int(num_solutions),
+                'meets_requirements': bool(meets_requirements)
             }
             results['tests'].append(test_result)
             
@@ -182,8 +224,8 @@ def main():
         output_file = f"cpu_baseline_results_{timestamp}.json"
     
     # Run test
-    results = cpu_baseline_test(timeout_minutes=timeout, output_file=output_file)
-    
+    cpu_baseline_test(timeout_minutes=timeout, output_file=output_file)
+
     print(f"\n✅ CPU baseline test complete!")
 
 
