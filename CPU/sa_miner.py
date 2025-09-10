@@ -88,11 +88,15 @@ class SimulatedAnnealingMiner(BaseMiner):
             updated_requirements = compute_current_requirements(requirements, prev_timestamp, self.logger)
             if current_requirements != updated_requirements:
                 current_requirements = updated_requirements
+                params = adapt_parameters(difficulty_energy, min_diversity, min_solutions)
+                self.logger.info(f"{self.miner_id} - updated adaptive params: {params}")
+
                 # Check if any existing results meet the new requirements
                 for sample in self.top_attempts:
                     if min(sample.sampleset.record.energy) <= current_requirements.difficulty_energy:
-                        result = self.evaluate_sampleset(sample.sampleset, requirements, nodes, edges, 
+                        result = self.evaluate_sampleset(sample.sampleset, current_requirements, nodes, edges, 
                                                          sample.nonce, sample.salt, prev_timestamp, start_time)
+                        result.timestamp = int(time.time())
                         if result:
                             self.logger.info(f"[Block-{cur_index}] Already Mined at this difficulty! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., Min Energy: {result.energy:.2f}, Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Attempt Time: {result.mining_time:.2f}s, Total Mining Time: {time.time() - start_time:.2f}s")
                             return result
