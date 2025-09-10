@@ -116,11 +116,11 @@ class Node:
 
     def _setup_multiprocess_logging(self):
         """Set up logging queue and listener for multiprocessing."""
-        # Use spawn context consistently for all multiprocessing objects
-        self._mp_context = multiprocessing.get_context("spawn")
+        # Use default multiprocessing context (should be spawn after CLI sets it)
+        self._mp_context = multiprocessing
 
-        # Create queue for inter-process logging using the same context
-        self._log_queue = self._mp_context.Queue()
+        # Create queue for inter-process logging
+        self._log_queue = multiprocessing.Queue()
 
         # Get the current root logger's handlers to replicate them in the listener
         root_logger = logging.getLogger()
@@ -139,8 +139,6 @@ class Node:
         """Initialize persistent miner workers based on configuration (TOML)."""
 
         self.miner_handles: list[MinerHandle] = []
-        # Use the same context that was used for logging
-        ctx = self._mp_context
 
         # CPU Miners, 1 per cpu
         if cfg.get("cpu") is not None:
@@ -150,7 +148,7 @@ class Node:
                     "kind": "cpu"
                 }
                 # CPU requires no config at this time.
-                self.miner_handles.append(MinerHandle(ctx, spec, self._log_queue))
+                self.miner_handles.append(MinerHandle(spec, self._log_queue))
 
         # GPU Miners, 1 per device or type
         if cfg.get("gpu") is not None:
@@ -164,7 +162,7 @@ class Node:
                         "kind": "cuda",
                         "args": {"device": str(d)}
                     }
-                    self.miner_handles.append(MinerHandle(ctx, spec, self._log_queue))
+                    self.miner_handles.append(MinerHandle(spec, self._log_queue))
             elif gpu_backend == "modal":
                 gpu_types = list(gpu_cfg.get("types") or [])
                 for t in gpu_types:
@@ -173,7 +171,7 @@ class Node:
                         "kind": "modal",
                         "args": {"gpu_type": str(t)}
                     }
-                    self.miner_handles.append(MinerHandle(ctx, spec, self._log_queue))
+                    self.miner_handles.append(MinerHandle(spec, self._log_queue))
             elif gpu_backend == "mps":
                 # can only have one metal miner
                 spec = {
@@ -181,15 +179,15 @@ class Node:
                     "kind": "metal",
                     "args": {"device": "mps"}
                 }
-                self.miner_handles.append(MinerHandle(ctx, spec, self._log_queue))
+                self.miner_handles.append(MinerHandle(spec, self._log_queue))
             else:
                 raise ValueError(f"Unknown GPU backend: {gpu_backend}")
-            
+
         # QPU Miners, 1 per qpu section
         if cfg.get("qpu") is not None:
             spec = {"id": f"{self.node_id}-QPU-1", "kind": "qpu"}
             # QPU requires no config at this time.
-            self.miner_handles.append(MinerHandle(ctx, spec, self._log_queue))
+            self.miner_handles.append(MinerHandle(spec, self._log_queue))
 
         # Back-compat summary list for logs (do not assign to typed self.miners)
         self._summary_miners = [(h.miner_id, h.miner_type) for h in self.miner_handles]
@@ -375,7 +373,7 @@ class Node:
 
         # Set mining state
         self._is_mining = True
-        self._mining_stop_event = self._mp_context.Event()
+        self._mining_stop_event = multiprocessing.Event()
 
         # Start timing
         start_time = time.time()

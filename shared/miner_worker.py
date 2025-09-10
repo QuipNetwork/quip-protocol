@@ -119,11 +119,11 @@ def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any], l
 
 class MinerHandle:
     """Wrapper around a persistent miner worker process."""
-    def __init__(self, ctx, spec: dict, log_queue: Optional[mp.Queue] = None):
+    def __init__(self, spec: dict, log_queue: Optional[mp.Queue] = None):
         self.spec = spec
-        self.req: mp.Queue = ctx.Queue()
-        self.resp: mp.Queue = ctx.Queue()
-        self.proc: mp.Process = ctx.Process(
+        self.req: mp.Queue = mp.Queue()
+        self.resp: mp.Queue = mp.Queue()
+        self.proc: mp.Process = mp.Process(
             target=miner_worker_main,
             args=(self.req, self.resp, spec, log_queue),
         )

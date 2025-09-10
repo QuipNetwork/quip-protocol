@@ -16,15 +16,15 @@ import time
 
 class BlockSynchronizer:
     """Multiprocessing block synchronizer with producer/consumer pattern."""
-    
-    def __init__(self, 
+
+    def __init__(self,
                  node_client: NodeClient,
                  receive_block_queue: asyncio.Queue,
                  logger: Optional[logging.Logger] = None,
                  max_workers: Optional[int] = None):
         """
         Initialize BlockSynchronizer.
-        
+
         Args:
             node_client: NodeClient for peer communication
             receive_block_queue: Callback to process/validate blocks
