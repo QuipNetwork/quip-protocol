@@ -18,9 +18,14 @@ def adjust_energy_along_curve(current_energy: float, adjustment_rate: float, dir
     Returns:
         New energy value after curve-based adjustment
     """
-    min_energy = -16000.0  # Hardest (approximate, not hard limit)
-    knee_energy = -15600.0  # Knee point
-    max_energy = -14000.0  # Easiest (approximate, not hard limit)
+    # Old Pegasus/Z12 pure SA parameters
+    #min_energy = -16000.0  # Hardest (approximate, not hard limit)
+    #knee_energy = -15600.0  # Knee point
+    #max_energy = -14000.0  # Easiest (approximate, not hard limit)
+
+    min_energy = -15000.0  # Hardest (approximate, not hard limit)
+    knee_energy = -14350.0  # Knee point
+    max_energy = -13900.0  # Easiest (approximate, not hard limit)
     
     # Convert energy to normalized position [0, 1] for observed range
     total_range = max_energy - min_energy

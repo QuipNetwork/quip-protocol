@@ -179,9 +179,13 @@ def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutio
     max_sweeps = 8192
 
     #TODO: get a more precise fit on this model (i.e. either run experiment or look up theory)
-    min_observed_energy = -15700
-    knee_energy = -15500
-    max_observed_energy = -14200
+    # Old pegasus/Z12 pure SA parameters
+    #min_observed_energy = -15700
+    #knee_energy = -15500
+    #max_observed_energy = -14200
+    min_observed_energy = -14600
+    knee_energy = -14350
+    max_observed_energy = -13900
 
     num_sweeps = min_sweeps
     # Maximize work when at the hardest minumum difficulty. 

@@ -14,8 +14,7 @@ import math
 import numpy as np
 import statistics
 import time
-from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 
 from shared.quantum_proof_of_work import (
     generate_ising_model_from_nonce,
