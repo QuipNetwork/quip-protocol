@@ -9,7 +9,7 @@ import collections.abc
 
 import dimod
 from dwave.system.testing import MockDWaveSampler
-from shared.quantum_proof_of_work import create_topology_graph, get_topology_properties
+from shared.quantum_proof_of_work import DEFAULT_TOPOLOGY
 
 Variable = collections.abc.Hashable
 
@@ -37,8 +37,8 @@ class MetalSampler(MockDWaveSampler):
         self.logger.debug(f"[MetalSampler] Initialized device={self._device}")
 
         # Use the default topology (Pegasus) from quantum_proof_of_work
-        topology_graph = create_topology_graph()
-        properties = get_topology_properties()
+        topology_graph = DEFAULT_TOPOLOGY.graph
+        properties = DEFAULT_TOPOLOGY.properties
 
         super().__init__(
             nodelist=list(topology_graph.nodes()),

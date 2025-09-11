@@ -8,7 +8,7 @@ import collections.abc
 
 import dimod
 from dwave.system.testing import MockDWaveSampler
-from shared.quantum_proof_of_work import create_topology_graph, get_topology_properties
+from shared.quantum_proof_of_work import DEFAULT_TOPOLOGY
 
 Variable = collections.abc.Hashable
 
@@ -35,9 +35,9 @@ class GPUSampler(MockDWaveSampler):
         
         self.logger.debug(f"[GPU sampler pid={os.getpid()}] initialized device={self._device}")
 
-        # Use the default topology (Pegasus) from quantum_proof_of_work
-        topology_graph = create_topology_graph()  # Uses DEFAULT_TOPOLOGY (Pegasus)
-        properties = get_topology_properties()
+        # Use the default topology (Advantage2) from quantum_proof_of_work
+        topology_graph = DEFAULT_TOPOLOGY.graph
+        properties = DEFAULT_TOPOLOGY.properties
 
         super().__init__(
             nodelist=list(topology_graph.nodes()),
@@ -68,6 +68,7 @@ class GPUSampler(MockDWaveSampler):
         
     def _init_device(self, device_str: str):
         """Initialize PyTorch device."""
+        
         if device_str.lower() == "mps":
             if hasattr(torch, 'backends') and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                 return torch.device("mps")

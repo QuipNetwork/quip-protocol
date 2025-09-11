@@ -16,9 +16,11 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import dwave_networkx as dnx
 
-from shared.quantum_proof_of_work import (
-    get_topology_config,
-    get_topology_properties,
+from dwave.topologies import (
+    CHIMERA_C16_TOPOLOGY,
+    PEGASUS_P16_TOPOLOGY,
+    ZEPHYR_Z12_TOPOLOGY,
+    ADVANTAGE2_SYSTEM1_6_TOPOLOGY
 )
 
 
@@ -42,36 +44,53 @@ def pretty_nodes(nodes: Iterable[int], limit: int = 10) -> str:
 
 
 def report_topology(name: str, quiet: bool = False):
-    base_cfg = get_topology_config(name)
-    props = get_topology_properties(name)
-    base_graph = build_graph(base_cfg["type"], base_cfg["params"])
+    # Map topology names to topology objects
+    topology_map = {
+        'c16': CHIMERA_C16_TOPOLOGY,
+        'chimera': CHIMERA_C16_TOPOLOGY,
+        'p16': PEGASUS_P16_TOPOLOGY,
+        'pegasus': PEGASUS_P16_TOPOLOGY,
+        'z12': ZEPHYR_Z12_TOPOLOGY,
+        'zephyr': ADVANTAGE2_SYSTEM1_6_TOPOLOGY,  # Use real Advantage2
+        'advantage2': ADVANTAGE2_SYSTEM1_6_TOPOLOGY,
+    }
+
+    topology_obj = topology_map.get(name.lower())
+    if topology_obj is None:
+        print(f"Unknown topology: {name}")
+        return
+
+    base_graph = topology_obj.graph
     base_nodes = set(base_graph.nodes())
     base_edges = set(base_graph.edges())
+    props = topology_obj.properties
 
     print(
         f"== {name.upper()} (type={props['topology']['type']}, shape={props['topology']['shape']}) =="
     )
     print(
-        f"Base: num_qubits(num_nodes)={len(base_nodes)} num_couplers(num_edges)={len(base_edges)} chip_id={props['chip_id']}"  # noqa: E501
+        f"Base: num_qubits(num_nodes)={len(base_nodes)} num_couplers(num_edges)={len(base_edges)} chip_id={props.get('chip_id', 'Unknown')}"  # noqa: E501
     )
     if not quiet:
         print(f"Base node sample: {pretty_nodes(base_nodes)}")
 
     # Define parameter sweeps per topology
     sweeps: List[Tuple[str, Dict[str, int]]] = []
-    t = base_cfg["type"].lower()
+    t = topology_obj.topology_type.lower()
+    topo_shape = props['topology']['shape']
+
     if t == "chimera":
-        m0, n0, t0 = base_cfg["params"]["m"], base_cfg["params"]["n"], base_cfg["params"]["t"]
+        m0, n0, t0 = topo_shape[0], topo_shape[1], topo_shape[2]
         for m in [max(2, m0 - 4), m0, m0 + 4]:
             sweeps.append((f"m={m},n={m0},t={t0}", {"m": m, "n": n0, "t": t0}))
         for tt in [max(2, t0 - 2), t0, t0 + 2]:
             sweeps.append((f"m={m0},n={n0},t={tt}", {"m": m0, "n": n0, "t": tt}))
     elif t == "pegasus":
-        m0 = base_cfg["params"]["m"]
+        m0 = topo_shape[0]
         for m in [max(4, m0 - 6), m0, m0 + 8]:
             sweeps.append((f"m={m}", {"m": m}))
     elif t == "zephyr":
-        m0, t0 = base_cfg["params"]["m"], base_cfg["params"]["t"]
+        m0, t0 = topo_shape[0], topo_shape[1]
         for m in [max(4, m0 - 4), m0, m0 + 4]:
             sweeps.append((f"m={m},t={t0}", {"m": m, "t": t0}))
         # Many Zephyr installs use t=2 or t=4; try both safely

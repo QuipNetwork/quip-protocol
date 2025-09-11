@@ -18,33 +18,37 @@ from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
 
 from shared.quantum_proof_of_work import (
-    CHIMERA_C16_TOPOLOGY,
-    PEGASUS_P16_TOPOLOGY, 
-    ZEPHYR_Z12_TOPOLOGY,
-    ZEPHYR_Z16_TOPOLOGY,
-    get_topology_config,
-    create_topology_graph,
     generate_ising_model_from_nonce,
     energy_of_solution
+)
+
+from dwave.topologies import (
+    CHIMERA_C16_TOPOLOGY,
+    PEGASUS_P16_TOPOLOGY,
+    ZEPHYR_Z12_TOPOLOGY,
+    ADVANTAGE2_SYSTEM1_6_TOPOLOGY
 )
 
 # Available topologies for analysis
 AVAILABLE_TOPOLOGIES = {
     'c16': CHIMERA_C16_TOPOLOGY,
     'p16': PEGASUS_P16_TOPOLOGY,
-    'z12': ZEPHYR_Z12_TOPOLOGY,
-    'z16': ZEPHYR_Z16_TOPOLOGY
+    'z12': ZEPHYR_Z12_TOPOLOGY,  # Generic Z12 topology
+    'advantage2': ADVANTAGE2_SYSTEM1_6_TOPOLOGY,  # Real Advantage2-System1.6 topology
 }
 
-def analyze_topology(topology_name: str, topology_config: Dict) -> Dict:
+def analyze_topology(topology_name: str, topology_obj) -> Dict:
     """Analyze a specific topology's properties and energy bounds."""
-    print(f"\n=== {topology_name.upper()} {topology_config['description']} ===")
-    
-    # Create the topology graph
-    graph = topology_config['graph_func']()
-    nodes = list(graph.nodes())
-    edges = list(graph.edges())
-    
+    print(f"\n=== {topology_name.upper()} {topology_obj.solver_name} ===")
+
+    # Get the topology graph and data
+    graph = topology_obj.graph
+    nodes = topology_obj.nodes
+    edges = topology_obj.edges
+
+    # Note: advantage2 topology uses real Advantage2-System1.6 data (4593 nodes, 41796 edges)
+    # while z12 uses generic dwave_networkx.zephyr_graph(12, 4) (4800 nodes, 45864 edges)
+
     print(f"Number of nodes: {len(nodes):,}")
     print(f"Number of edges: {len(edges):,}")
     print(f"Average degree: {2 * len(edges) / len(nodes):.2f}")
@@ -53,7 +57,7 @@ def analyze_topology(topology_name: str, topology_config: Dict) -> Dict:
     
     return {
         'topology_name': topology_name,
-        'config': topology_config,
+        'topology_obj': topology_obj,
         'graph': graph,
         'nodes': nodes,
         'edges': edges,
@@ -193,37 +197,37 @@ def calculate_sa_theoretical_bounds(topology_data: Dict, energy_data: Dict) -> D
     print(f"\n=== Simulated Annealing Theoretical Bounds for {topology_name.upper()} ===")
     
     # Research-based approximation factors that better match observed reality
-    # Your observed -15,700 vs perfect -45,864 suggests SA achieves ~34% of optimal
+    # Observed -15,700 vs perfect minimum suggests SA achieves ~34% of optimal for Advantage2
     # Let's use factors that put bounds in the realistic range
-    
-    sqrt_n_factor = math.sqrt(num_edges)  # ~214 for Z12
-    n_two_thirds_factor = num_edges ** (2/3)  # ~1,340 for Z12
-    
-    # For observed -15,700, we're about 30,164 away from perfect -45,864
+
+    sqrt_n_factor = math.sqrt(num_edges)  # ~204 for Advantage2, ~214 for generic Z12
+    n_two_thirds_factor = num_edges ** (2/3)  # ~1,300 for Advantage2, ~1,340 for generic Z12
+
+    # For observed -15,700 on Advantage2, we're about 26,096 away from perfect -41,796
     # This suggests SA performance is more like: optimal + O(n^0.7) rather than O(√n)
-    
-    # Use the exact complexity-theoretic bounds from your original analysis:
-    # Conservative estimate: -16,000 to -18,000 
+
+    # Use the exact complexity-theoretic bounds from analysis:
+    # Conservative estimate: -16,000 to -18,000
     # Optimistic estimate: -20,000 to -25,000
-    
-    # For Z12: perfect = -45,864, observed = -15,700
+
+    # For Advantage2: perfect = -41,796, observed = -15,700
     # These should be independent of the perfect minimum and based on problem structure
-    conservative_bound = -sqrt_n_factor * 75   # ~-214 * 75 = -16,050 for Z12
-    optimistic_bound = -sqrt_n_factor * 110    # ~-214 * 110 = -23,540 for Z12
-    
+    conservative_bound = -sqrt_n_factor * 75   # ~-204 * 75 = -15,300 for Advantage2
+    optimistic_bound = -sqrt_n_factor * 110    # ~-204 * 110 = -22,440 for Advantage2
+
     # Use these as practical estimates
     practical_conservative = conservative_bound
     practical_optimistic = optimistic_bound
-    
+
     # Theoretical limit: Use n^(2/3) factor for best case
-    theoretical_limit = -n_two_thirds_factor * 20  # ~-1340 * 20 = -26,800 for Z12
-    
+    theoretical_limit = -n_two_thirds_factor * 20  # ~-1300 * 20 = -26,000 for Advantage2
+
     print(f"Perfect theoretical minimum: {perfect_min:.0f}")
     print(f"\nSA Complexity-Theoretic Bounds (closer to observed reality):")
     print(f"  Conservative (O(√n), polynomial-time): {conservative_bound:.0f}")
     print(f"  Optimistic (O(n^(2/3)), exponential-time): {optimistic_bound:.0f}")
     print(f"  Theoretical limit (O(n^(1/2)) from optimal): {theoretical_limit:.0f}")
-    print(f"\nNote: These bounds better match observed SA performance of ~-15,700 for Z12")
+    print(f"\nNote: These bounds better match observed SA performance of ~-15,700 for Advantage2")
         
     return {
         'perfect_min': perfect_min,
@@ -267,24 +271,25 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Available topologies:
-  c16  - Chimera C16 topology (~2048 qubits)
-  p16  - Pegasus P16 topology (~5000 qubits) 
-  z12  - Zephyr Z12 topology (~4500 qubits)
-  z16  - Zephyr Z16 topology (~8000+ qubits)
-  all  - Analyze all topologies
+  c16        - Chimera C16 topology (~2048 qubits)
+  p16        - Pegasus P16 topology (~5000 qubits)
+  z12        - Generic Zephyr Z12 topology (~4800 qubits)
+  advantage2 - Real Advantage2-System1.6 topology (~4593 qubits) [DEFAULT]
+  z16        - Zephyr Z16 topology (~8000+ qubits)
+  all        - Analyze all topologies
 
 Examples:
-  python analyze_topology_minimum_energy.py --topology z12
+  python analyze_topology_minimum_energy.py --topology advantage2
   python analyze_topology_minimum_energy.py --topology all --samples 100
-  python analyze_topology_minimum_energy.py --topology c16 p16 z12
+  python analyze_topology_minimum_energy.py --topology c16 p16 advantage2
         """
     )
     
-    parser.add_argument('--topology', '-t', 
-                       nargs='+', 
-                       choices=['c16', 'p16', 'z12', 'z16', 'all'],
-                       default=['z12'],
-                       help='Topology(ies) to analyze (default: z12)')
+    parser.add_argument('--topology', '-t',
+                       nargs='+',
+                       choices=['c16', 'p16', 'z12', 'advantage2', 'z16', 'all'],
+                       default=['advantage2'],
+                       help='Topology(ies) to analyze (default: advantage2)')
     
     parser.add_argument('--samples', '-s',
                        type=int,
@@ -314,10 +319,10 @@ Examples:
             print(f"Warning: Unknown topology '{topology_name}', skipping...")
             continue
             
-        topology_config = AVAILABLE_TOPOLOGIES[topology_name]
-        
+        topology_obj = AVAILABLE_TOPOLOGIES[topology_name]
+
         # Step 1: Analyze topology structure
-        topology_data = analyze_topology(topology_name, topology_config)
+        topology_data = analyze_topology(topology_name, topology_obj)
         
         # Step 2: Calculate theoretical energy bounds
         energy_data = calculate_theoretical_minimum_energy(topology_data, args.samples)

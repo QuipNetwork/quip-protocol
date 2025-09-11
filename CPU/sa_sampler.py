@@ -3,7 +3,8 @@
 from typing import Any, Dict, List, Tuple
 from dwave.samplers import SimulatedAnnealingSampler
 from dwave.system.testing import MockDWaveSampler
-from shared.quantum_proof_of_work import create_topology_graph, get_topology_properties
+from shared.quantum_proof_of_work import DEFAULT_TOPOLOGY
+
 import collections.abc
 
 Variable = collections.abc.Hashable
@@ -11,9 +12,9 @@ class SimulatedAnnealingStructuredSampler(MockDWaveSampler):
     """Replace the MockSampler by an MCMC sampler with identical structure."""
     
     def __init__(self):
-        # Use the default topology (Pegasus) from quantum_proof_of_work
-        topology_graph = create_topology_graph()  # Uses DEFAULT_TOPOLOGY (Pegasus)
-        properties = get_topology_properties()
+        # Use the default topology (Advantage2) from quantum_proof_of_work
+        topology_graph = DEFAULT_TOPOLOGY.graph
+        properties = DEFAULT_TOPOLOGY.properties
 
         substitute_sampler = SimulatedAnnealingSampler()
         nodelist = list(topology_graph.nodes())
