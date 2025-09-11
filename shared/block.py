@@ -782,7 +782,7 @@ def compute_next_block_requirements(previous_block: Block, mining_result: Mining
         prev_req = compute_current_requirements(prev_req, previous_block.header.timestamp, log, mining_result.timestamp)
 
     # Extract miner type from mining result
-    current_winner = mining_result.miner_id.split('-')[1] if '-' in mining_result.miner_id else mining_result.miner_id
+    current_winner = mining_result.miner_id
 
     # Get the previous winner from the previous block's miner info
     prev_winner = None
@@ -806,7 +806,7 @@ def compute_next_block_requirements(previous_block: Block, mining_result: Mining
         return new_energy
 
     # If block was mined too quickly, always HARDEN
-    if mining_result.mining_time is not None and mining_result.mining_time < 10.0:
+    if mining_result.mining_time is not None and mining_result.mining_time < 360.0:
         curve_energy = adjust_energy_along_curve(prev_req.difficulty_energy, energy_adjustment_rate, 'harder')
         new_difficulty_energy = apply_min_adjustment(prev_req.difficulty_energy, curve_energy, 'harder')
         new_min_diversity = min(0.46, prev_req.min_diversity + diversity_adjustment_rate)
