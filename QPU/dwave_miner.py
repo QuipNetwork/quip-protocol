@@ -19,9 +19,14 @@ class DWaveMiner(BaseMiner):
     def __init__(self, miner_id: str, **cfg):
         # cfg parameter is reserved for future configuration options
         _ = cfg  # Suppress unused parameter warning
+
         sampler = DWaveSamplerWrapper()
         super().__init__(miner_id, sampler, miner_type="QPU")
         self.miner_type = "QPU"
+
+        # QPU rate limiting configuration (hard-coded for now)
+        self.qpu_timeout = 360.0  # Minimum 60 seconds between QPU attempts
+        self.last_qpu_attempt_time = 0.0  # Track last QPU sampling time
         
     def mine_block(
         self,
@@ -108,13 +113,35 @@ class DWaveMiner(BaseMiner):
             
             # Sample from QPU
             try:
+                # QPU rate limiting: wait if we've run too recently
+                current_time = time.time()
+                time_since_last_attempt = current_time - self.last_qpu_attempt_time
+
+                if time_since_last_attempt < self.qpu_timeout:
+                    wait_time = self.qpu_timeout - time_since_last_attempt
+                    self.logger.info(f"[QPU] Rate limiting: waiting {wait_time:.1f}s before next attempt (timeout={self.qpu_timeout}s)")
+
+                    # Check stop event during wait to allow early termination
+                    while wait_time > 0 and not stop_event.is_set():
+                        sleep_duration = min(1.0, wait_time)  # Sleep in 1-second chunks
+                        time.sleep(sleep_duration)
+                        wait_time -= sleep_duration
+
+                    # If stop event was set during wait, exit
+                    if stop_event.is_set():
+                        self.logger.info("Stop event received during QPU rate limiting wait")
+                        break
+
                 # For QPU, use adaptive parameters
                 num_reads = params.get('num_reads', 100)
                 annealing_time = params.get('quantum_annealing_time', 20.0)
-                
+
                 sample_start = time.time()
                 self.current_stage = 'sampling'
                 self.current_stage_start = sample_start
+
+                # Update last attempt time before sampling
+                self.last_qpu_attempt_time = sample_start
                 
                 # Cast h and J to match protocol expectations (int is a valid Variable type)
                 h_cast = cast(Mapping[Any, float], h)
