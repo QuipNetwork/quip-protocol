@@ -39,3 +39,6 @@ quip-qpu-miner = "QPU.qpu_miner:cli"
 quip-launch = "launch_network:main"
 quip-network-node = "quip_cli:network_node_main"
 quip-network-simulator = "quip_cli:network_simulator_main"
+
+[tool.setuptools.packages.find]
+include = ["shared*", "dwave*", "CPU*", "GPU*", "QPU*"]
