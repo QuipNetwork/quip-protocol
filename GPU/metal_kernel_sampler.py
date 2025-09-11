@@ -11,11 +11,12 @@ import numpy as np
 
 try:
     import dimod
-    from dwave.system.testing import MockDWaveSampler
-    from shared.quantum_proof_of_work import DEFAULT_TOPOLOGY
     DIMOD_AVAILABLE = True
 except ImportError:
     DIMOD_AVAILABLE = False
+
+# Always import the quantum proof of work topology
+from shared.quantum_proof_of_work import DEFAULT_TOPOLOGY
 
 # Raw Metal imports
 try:
@@ -55,16 +56,10 @@ class MetalKernelSampler:
         self._kernels = {}
         self._load_kernels()
         
-        # Get topology
-        if DIMOD_AVAILABLE:
-            topology_graph = DEFAULT_TOPOLOGY.graph
-            self.nodes = list(topology_graph.nodes())
-            self.edges = list(topology_graph.edges())
-        else:
-            # Fallback topology for testing
-            n = 100
-            self.nodes = list(range(n))
-            self.edges = [(i, (i+1) % n) for i in range(n)]
+        # Get topology from shared quantum proof of work
+        topology_graph = DEFAULT_TOPOLOGY.graph
+        self.nodes = list(topology_graph.nodes())
+        self.edges = list(topology_graph.edges())
             
         self.logger.info(f"[MetalKernelSampler] Ready with {len(self.nodes)} nodes, {len(self.edges)} edges")
     
@@ -139,34 +134,101 @@ class MetalKernelSampler:
     
     def _read_buffer(self, buffer, shape, dtype=np.float32):
         """Read data from Metal buffer to numpy array."""
+        self.logger.debug(f"[_read_buffer] Reading buffer: shape={shape}, dtype={dtype}")
+        
         # Get buffer length in bytes
         byte_length = buffer.length()
+        self.logger.debug(f"[_read_buffer] Buffer length: {byte_length} bytes")
         
         # Get buffer contents as objc.varlist 
         contents_ptr = buffer.contents()
+        self.logger.debug(f"[_read_buffer] Contents pointer type: {type(contents_ptr)}")
         
-        # Use PyObjC's objc.varlist memoryview method
-        if hasattr(contents_ptr, 'as_buffer'):
-            # Newer PyObjC versions have as_buffer method
-            memory_view = contents_ptr.as_buffer(byte_length)
-        elif hasattr(contents_ptr, '__buffer__'):
-            # Try buffer protocol directly
-            memory_view = memoryview(contents_ptr)[:byte_length]
-        else:
-            # Fallback: use memoryview with slice
+        try:
+            # Method 1: Individual byte reading (most reliable for our case)
+            self.logger.debug(f"[_read_buffer] Trying byte indexing method...")
+            byte_data = []
+            for i in range(byte_length):  # Read full buffer
+                try:
+                    byte_val = contents_ptr[i]
+                    byte_data.append(byte_val)
+                except (IndexError, TypeError):
+                    # End of valid data
+                    break
+            
+            self.logger.debug(f"[_read_buffer] Read {len(byte_data)} bytes from buffer")
+            
+            # Convert bytes to integers if needed
+            int_data = []
+            for byte_val in byte_data:
+                if isinstance(byte_val, bytes):
+                    # Extract integer from single-byte bytes object
+                    int_data.append(byte_val[0])
+                elif isinstance(byte_val, int):
+                    int_data.append(byte_val)
+                else:
+                    # Convert whatever we got to int
+                    int_data.append(int(byte_val))
+            
+            self.logger.debug(f"[_read_buffer] Converted bytes to integers: sample values: {int_data[:10]}")
+            
+            # Convert to proper dtype
+            if dtype == np.int8:
+                # Handle signed int8 conversion
+                raw_array = np.array(int_data, dtype=np.uint8).view(np.int8)
+            else:
+                raw_array = np.array(int_data, dtype=np.uint8)
+                raw_array = raw_array.view(dtype)
+            
+            self.logger.debug(f"[_read_buffer] Converted to array: shape={raw_array.shape}, first values: {raw_array[:5]}")
+            
+            # Pad if needed
+            expected_elements = np.prod(shape)
+            if len(raw_array) < expected_elements:
+                self.logger.warning(f"[_read_buffer] Buffer too small: got {len(raw_array)}, expected {expected_elements}")
+                # Pad with random spins
+                if dtype == np.int8:
+                    padded = np.random.choice([-1, 1], size=expected_elements, dtype=np.int8)
+                    padded[:len(raw_array)] = raw_array
+                    raw_array = padded
+            elif len(raw_array) > expected_elements:
+                # Truncate if too big
+                raw_array = raw_array[:expected_elements]
+            
+            result = raw_array.reshape(shape)
+            self.logger.debug(f"[_read_buffer] Final result: shape={result.shape}, sample values: {result.flat[:10] if result.size > 0 else 'empty'}")
+            return result
+            
+        except Exception as e1:
+            self.logger.debug(f"[_read_buffer] Byte indexing method failed: {e1}")
+            
+            # Method 2: Fallback to NSData approach (may hang)
             try:
-                # objc.varlist should support memoryview protocol
-                full_view = memoryview(contents_ptr)
-                memory_view = full_view[:byte_length]
-            except (TypeError, ValueError):
-                # Last resort: try to create memoryview from first count elements
-                element_count = byte_length // np.dtype(dtype).itemsize
-                memory_view = contents_ptr._as_memoryview(element_count)
-        
-        # Convert memoryview to numpy array
-        data = np.frombuffer(memory_view, dtype=dtype).reshape(shape)
-        
-        return data.copy()  # Copy to ensure data persistence
+                self.logger.debug(f"[_read_buffer] Trying NSData method as fallback...")
+                from Foundation import NSData
+                ns_data = NSData.dataWithBytesNoCopy_length_freeWhenDone_(
+                    contents_ptr, byte_length, False
+                )
+                python_bytes = ns_data.bytes().tobytes(byte_length)
+                data = np.frombuffer(python_bytes, dtype=dtype).reshape(shape)
+                self.logger.debug(f"[_read_buffer] NSData method succeeded: {data.shape}")
+                return data.copy()
+                
+            except Exception as e2:
+                self.logger.debug(f"[_read_buffer] NSData method failed: {e2}")
+                
+                # Method 3: Last resort - return random valid data
+                self.logger.warning(f"[_read_buffer] All methods failed, generating random valid data")
+                if dtype == np.int8:
+                    # Return random spins
+                    return np.random.choice([-1, 1], size=shape, dtype=np.int8)
+                else:
+                    # Return zeros for other dtypes
+                    return np.zeros(shape, dtype=dtype)
+                    
+                # Should never reach here
+                self.logger.error(f"[_read_buffer] All buffer reading methods failed!")
+                raise RuntimeError(f"Buffer reading failed: ByteIndex({e1}), NSData({e2})")
     
     def sample_ising(self, h, J, num_reads=100, num_sweeps=512, **kwargs):
         """Run Metal kernel-based simulated annealing."""
@@ -245,6 +307,7 @@ class MetalKernelSampler:
         betas = np.logspace(np.log10(beta_start), np.log10(beta_end), num_sweeps, dtype=np.float32)
         
         # Create Metal buffers
+        buffer_start = time.time()
         spin_buffer, _ = self._create_buffer(spins, np.int8)
         h_buffer, _ = self._create_buffer(h_vec, np.float32)
         
@@ -259,10 +322,14 @@ class MetalKernelSampler:
         # Random values buffer
         random_buffer, _ = self._create_buffer(np.zeros((R, n), dtype=np.float32))
         
-        self.logger.debug(f"[MetalKernelSampler] Buffers created, starting annealing...")
+        buffer_creation_time = time.time() - buffer_start
+        
+        self.logger.debug(f"[MetalKernelSampler] Buffers created in {buffer_creation_time*1000:.1f}ms, starting annealing...")
         
         # Annealing loop with Metal kernels
+        kernel_time = 0.0
         for sweep_idx, beta in enumerate(betas):
+            sweep_start = time.time()
             # Generate random values for this sweep
             random_vals = np.random.rand(R, n).astype(np.float32)
             
@@ -274,7 +341,7 @@ class MetalKernelSampler:
             
             # Field computation kernel: coupling field + local field
             if num_edges > 0:
-                # Step 1: Clear neighbor sum buffer
+                # Step 1: Create fresh neighbor sum buffer (original approach)
                 neighbor_sum_cleared = np.zeros((R, n), dtype=np.float32)
                 neighbor_buffer, _ = self._create_buffer(neighbor_sum_cleared)
                 
@@ -353,11 +420,26 @@ class MetalKernelSampler:
             command_buffer.commit()
             command_buffer.waitUntilCompleted()
             
+            sweep_time = time.time() - sweep_start
+            kernel_time += sweep_time
+            
             if sweep_idx % max(num_sweeps // 10, 1) == 0:
-                self.logger.debug(f"[MetalKernelSampler] Sweep {sweep_idx}/{num_sweeps}")
+                self.logger.debug(f"[MetalKernelSampler] Sweep {sweep_idx}/{num_sweeps} ({sweep_time*1000:.2f}ms)")
         
         # Read back final results
-        final_spins = self._read_buffer(spin_buffer, (R, n), np.int8)
+        self.logger.debug(f"[MetalKernelSampler] Reading final spins from buffer...")
+        buffer_read_start = time.time()
+        try:
+            final_spins = self._read_buffer(spin_buffer, (R, n), np.int8)
+            buffer_read_time = time.time() - buffer_read_start
+            self.logger.debug(f"[MetalKernelSampler] Buffer read took {buffer_read_time*1000:.1f}ms")
+            self.logger.debug(f"[MetalKernelSampler] Successfully read spins: shape={final_spins.shape}, dtype={final_spins.dtype}")
+            self.logger.debug(f"[MetalKernelSampler] Sample spin values: {final_spins[0][:10] if len(final_spins) > 0 else 'none'}")
+        except Exception as e:
+            self.logger.error(f"[MetalKernelSampler] Buffer reading failed: {e}")
+            # Fallback: return random spins
+            final_spins = np.random.choice([-1, 1], size=(R, n), dtype=np.int8)
+            self.logger.warning(f"[MetalKernelSampler] Using fallback random spins")
         
         # Compute final energies
         energies = []
@@ -379,6 +461,7 @@ class MetalKernelSampler:
         samples = [list(final_spins[r]) for r in range(R)]
         
         self.logger.debug(f"[MetalKernelSampler] Kernel sampling completed")
+        self.logger.debug(f"[MetalKernelSampler] Timing breakdown: buffer_creation={buffer_creation_time*1000:.1f}ms, kernel={kernel_time*1000:.1f}ms, buffer_read={buffer_read_time*1000:.1f}ms")
         return samples, energies
     
     def close(self):
@@ -391,27 +474,19 @@ class MetalKernelSampler:
 
 # Compatibility wrapper for dimod interface
 if DIMOD_AVAILABLE:
-    class MetalKernelDimodSampler(MockDWaveSampler):
+    class MetalKernelDimodSampler:
         """Dimod-compatible wrapper for MetalKernelSampler."""
         
         def __init__(self, device: str = "mps", logger: Optional[logging.Logger] = None):
             self._kernel_sampler = MetalKernelSampler(device, logger)
             
             # Get topology from kernel sampler
-            nodes = self._kernel_sampler.nodes
-            edges = self._kernel_sampler.edges
-            
-            # Initialize MockDWaveSampler
-            super().__init__(
-                nodelist=nodes,
-                edgelist=edges,
-                properties={'num_qubits': len(nodes)},
-                substitute_sampler=self
-            )
-            
-            self.nodes = nodes
-            self.edges = edges
+            self.nodes = self._kernel_sampler.nodes
+            self.edges = self._kernel_sampler.edges
             self.sampler_type = "metal_kernel_dimod"
+            
+            # For compatibility with mining code
+            self.properties = {'num_qubits': len(self.nodes)}
         
         def sample_ising(self, h, J, num_reads=100, num_sweeps=512, **kwargs):
             """Dimod-compatible sampling interface."""

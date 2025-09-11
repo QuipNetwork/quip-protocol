@@ -28,8 +28,8 @@ kernel void fused_metropolis_update(
     // Fused Metropolis computation
     float delta_e = 2.0 * float(current_spin) * field;
     
-    // Accept/reject decision in single operation
-    bool accept = (delta_e > 0.0) || (rand_val < exp(-beta * abs(delta_e)));
+    // Accept/reject decision in single operation - for ENERGY MINIMIZATION
+    bool accept = (delta_e < 0.0) || (rand_val < exp(-beta * delta_e));
     
     // Conditional spin flip
     if (accept) {

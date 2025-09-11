@@ -14,7 +14,7 @@ import dwave_networkx as dnx
 logger = get_logger('quantum_proof_of_work')
 
 # Import the default topology from the new topology system
-from dwave.topologies import DEFAULT_TOPOLOGY
+from dwave_topologies import DEFAULT_TOPOLOGY
 
 
 
