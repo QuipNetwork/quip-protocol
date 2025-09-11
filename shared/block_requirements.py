@@ -2,11 +2,11 @@
 
 import logging
 import struct
-import time
 from dataclasses import dataclass
 from typing import Optional
 
 from shared.energy_utils import adjust_energy_along_curve
+from shared.time_utils import utc_timestamp
 
 internal_logger = logging.getLogger(__name__)
 
@@ -84,7 +84,7 @@ def compute_current_requirements(
         BlockRequirements with decay applied if elapsed time warrants it
     """
     if current_time is None:
-        current_time = int(time.time())
+        current_time = utc_timestamp()
 
     if initial_requirements.timeout_to_difficulty_adjustment_decay <= 0:
         return initial_requirements

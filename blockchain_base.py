@@ -17,6 +17,7 @@ from shared.quantum_proof_of_work import (
 )
 
 from shared.block_signer import BlockSigner
+from shared.time_utils import utc_timestamp_float
 from dwave.samplers import SimulatedAnnealingSampler
 from dwave.system import DWaveSampler
 from dwave.system.testing import MockDWaveSampler
@@ -92,7 +93,7 @@ class BaseMiner:
         logger.info(f"  WOTS+ Public Key: {self.wots_plus_public_key_hex[:16]}...")
 
         # Track last block received time for difficulty adjustment
-        self.last_block_received_time = time.time()
+        self.last_block_received_time = utc_timestamp_float()
         self.no_block_timeout = 1800  # 30 minutes in seconds
         self.difficulty_reduction_factor = 0.1  # Reduce difficulty by 10% per timeout
 
@@ -143,7 +144,7 @@ class BaseMiner:
     # moved to shared/quantum_proof_of_work.py: _calculate_set_diversity
     def check_and_adjust_difficulty_for_timeout(self):
         """Check if no block has been received for 30 minutes and adjust difficulty."""
-        time_since_last_block = time.time() - self.last_block_received_time
+        time_since_last_block = utc_timestamp_float() - self.last_block_received_time
 
         if time_since_last_block > self.no_block_timeout:
             # Note: Difficulty parameters are now managed at block level, not miner level
@@ -155,7 +156,7 @@ class BaseMiner:
 
     def reset_block_received_time(self):
         """Reset the last block received time when a new block is received."""
-        self.last_block_received_time = time.time()
+        self.last_block_received_time = utc_timestamp_float()
 
     def sign_block_data(self, block_data: str) -> Tuple[str, str]:
         """Sign block data with both WOTS+ and ECDSA, generate new WOTS+ key."""
@@ -177,7 +178,7 @@ class BaseMiner:
 
         self.mining = True
         self.current_block = block_data
-        start_time = time.time()
+        start_time = utc_timestamp_float()
 
         # Check for timeout-based difficulty adjustment
         self.check_and_adjust_difficulty_for_timeout()

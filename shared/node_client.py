@@ -172,8 +172,13 @@ class NodeClient:
         try:
             # Import here to avoid circular imports
             from .version import get_version
-            
-            data = {"sender": public_host, "version": get_version()}
+            from .time_utils import utc_timestamp_float
+
+            data = {
+                "sender": public_host,
+                "version": get_version(),
+                "timestamp": utc_timestamp_float()
+            }
             async with self.http_session.post(
                 f"{conn_str}/heartbeat",
                 json=data,

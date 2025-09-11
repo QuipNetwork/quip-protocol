@@ -30,6 +30,10 @@ from shared.version import get_version
 from shared.node_client import NodeClient
 from shared.block_synchronizer import BlockSynchronizer
 from shared.block_store import BlockStore
+from shared.time_utils import (
+    utc_timestamp_float, utc_timestamp, get_network_time_offset,
+    is_clock_synchronized, sync_time_with_network, NETWORK_TIME_SYNC_INTERVAL
+)
 
 
 @dataclass(frozen=True)
@@ -199,6 +203,11 @@ class NetworkNode(Node):
 
         self.gossip_lock = asyncio.Lock()
         self.recent_messages = set()
+
+        # Time synchronization tracking
+        self.peer_timestamps = []  # Recent timestamps from peers
+        self.last_time_sync_check = 0.0
+        self.time_sync_warnings = 0
 
         # Callbacks
         self.on_new_node: Optional[Callable] = None
@@ -422,7 +431,7 @@ class NetworkNode(Node):
                 await asyncio.sleep(self.heartbeat_timeout / 2)
 
                 # Find dead nodes
-                current_time = time.time()
+                current_time = utc_timestamp_float()
                 dead_nodes = []
 
                 async with self.net_lock:
@@ -629,7 +638,7 @@ class NetworkNode(Node):
         if block.header.index == self.max_sync_block_index and not self.reset_scheduled:
             self.logger.info(f"Block limit ({self.max_sync_block_index}) reached - starting 5-minute reset coordination timer")
             self.reset_scheduled = True
-            self.reset_start_time = time.time()
+            self.reset_start_time = utc_timestamp_float()
             
             # Start the 5-minute reset timer - schedule in event loop from sync context
             try:
@@ -927,10 +936,50 @@ class NetworkNode(Node):
             self.logger.info(f"Successfully synchronized blocks {start_index} to {end_index}")
             
 
+    def _track_peer_timestamp(self, timestamp: float):
+        """Track a peer timestamp for time synchronization."""
+        current_time = utc_timestamp_float()
+
+        # Only track recent timestamps (within last 5 minutes)
+        if abs(current_time - timestamp) < 300:
+            self.peer_timestamps.append(int(timestamp))
+
+            # Keep only recent timestamps (last 50)
+            if len(self.peer_timestamps) > 50:
+                self.peer_timestamps = self.peer_timestamps[-50:]
+
+            # Check time synchronization periodically
+            if current_time - self.last_time_sync_check > NETWORK_TIME_SYNC_INTERVAL:
+                self._check_time_synchronization()
+                self.last_time_sync_check = current_time
+
+    def _check_time_synchronization(self):
+        """Check if local clock is synchronized with network."""
+        if len(self.peer_timestamps) < 3:
+            return  # Not enough data
+
+        if not is_clock_synchronized(self.peer_timestamps):
+            offset = get_network_time_offset(self.peer_timestamps)
+            self.time_sync_warnings += 1
+
+            if self.time_sync_warnings <= 3:  # Limit warnings
+                self.logger.warning(
+                    f"⚠️  Clock synchronization issue detected! "
+                    f"Local time is {offset} seconds {'ahead' if offset > 0 else 'behind'} network time. "
+                    f"Consider synchronizing your system clock with NTP."
+                )
+            elif self.time_sync_warnings == 4:
+                self.logger.warning("⚠️  Clock sync warnings suppressed (fix your system clock)")
+        else:
+            # Reset warning counter if synchronized
+            if self.time_sync_warnings > 0:
+                self.logger.info("✅ Clock synchronization restored")
+                self.time_sync_warnings = 0
+
     async def is_connected(self) -> bool:
         """Ensure we are connected to the network."""
         for _, status in self.heartbeats.items():
-            if time.time() - status < self.heartbeat_timeout:
+            if utc_timestamp_float() - status < self.heartbeat_timeout:
                 return True
         return False
 
@@ -1133,7 +1182,7 @@ class NetworkNode(Node):
         message = Message(
             type="new_node",
             sender=self.public_host,
-            timestamp=time.time(),
+            timestamp=utc_timestamp_float(),
             data=payload
         )
         await self.gossip(message)
@@ -1148,7 +1197,7 @@ class NetworkNode(Node):
         message = Message(
             type="block",
             sender=self.public_host,
-            timestamp=time.time(),
+            timestamp=utc_timestamp_float(),
             data=binary_data
         )
 
@@ -1160,6 +1209,9 @@ class NetworkNode(Node):
     async def handle_gossip(self, message: Message) -> str:
         """Main gossip logic to handle a gossip message from another node and rebroadcast."""
         # NOTE: we don't try/except here as it's caught in the handle_put_gossip call.
+
+        # Track peer timestamp for time synchronization
+        self._track_peer_timestamp(message.timestamp)
 
         async with self.gossip_lock:
             if message.id in self.recent_messages:
@@ -1278,6 +1330,7 @@ class NetworkNode(Node):
             data = await request.json()
             sender = data.get("sender")
             net_version = data.get("version")
+            timestamp = data.get("timestamp", utc_timestamp_float())
 
             if version:
                 local_version = get_version()
@@ -1298,7 +1351,10 @@ class NetworkNode(Node):
             if sender:
                 async with self.net_lock:
                     if sender in self.peers:
-                        self.heartbeats[sender] = time.time()
+                        self.heartbeats[sender] = utc_timestamp_float()
+
+                        # Track peer timestamp for time synchronization
+                        self._track_peer_timestamp(timestamp)
                     else:
                         # New node discovered via heartbeat - get their info in background
                         self.logger.info(f"New node discovered via heartbeat: {sender}")
@@ -1354,7 +1410,7 @@ class NetworkNode(Node):
             "info": self.info().to_json(),
             "running": self.running,
             "total_peers": len(self.peers),
-            "uptime": time.time() if self.running else 0
+            "uptime": utc_timestamp_float() if self.running else 0
         })
 
     async def handle_get_peers(self, request: web.Request) -> web.Response:

@@ -23,6 +23,7 @@ from shared.block_signer import BlockSigner
 from shared.block import Block, MinerInfo, compute_next_block_requirements
 from shared.miner import Miner, MiningResult
 from shared.logging_config import init_component_logger
+from shared.time_utils import utc_timestamp_float, utc_timestamp
 # Global logger for this module (set during Node initialization)
 log = None
 
@@ -376,7 +377,7 @@ class Node:
         self._mining_stop_event = multiprocessing.Event()
 
         # Start timing
-        start_time = time.time()
+        start_time = utc_timestamp_float()
         self.timing_stats['total_blocks_attempted'] += 1
 
         self.logger.info(f"Starting mining with {len(handles)} miners...")
@@ -394,8 +395,8 @@ class Node:
         result = None
         try:
             # Wait for first result or timeout
-            deadline = time.time() + self.no_block_timeout
-            while time.time() < deadline and not self._mining_stop_event.is_set():
+            deadline = utc_timestamp_float() + self.no_block_timeout
+            while utc_timestamp_float() < deadline and not self._mining_stop_event.is_set():
                 # Poll each handle's response queue quickly
                 for h in handles:
                     try:
@@ -440,7 +441,7 @@ class Node:
             asyncio.create_task(self._emit_mining_stopped())
 
         # Record timing and statistics
-        total_time = time.time() - start_time
+        total_time = utc_timestamp_float() - start_time
         self.timing_stats['total_mining_time'] += total_time
 
         if result:
@@ -485,7 +486,7 @@ class Node:
         header = block.BlockHeader(
             previous_hash=previous_block.hash,
             index=previous_block.header.index + 1,
-            timestamp=int(time.time()),
+            timestamp=utc_timestamp(),
             data_hash=blake3(block_data).digest()
         )
         miner_info = self.info()
@@ -593,7 +594,7 @@ class Node:
         stats = {
             # Node identification
             "node_id": self.node_id,
-            "timestamp": int(time.time()),
+            "timestamp": utc_timestamp(),
             
             # Mining statistics
             "mining": {

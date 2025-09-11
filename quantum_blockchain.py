@@ -17,6 +17,7 @@ from matplotlib.patches import Patch
 from shared.block import Block, load_genesis_block, create_genesis_block, BlockHeader, MinerInfo, QuantumProof
 from shared.block_requirements import BlockRequirements
 from shared.quantum_proof_of_work import calculate_diversity as _shared_diversity, calculate_hamming_distance as _shared_hamming, generate_ising_model_from_nonce, ising_nonce_from_block
+from shared.time_utils import utc_timestamp
 
 from shared.miner import MiningResult
 from shared.node import Node
@@ -176,7 +177,7 @@ class QuantumBlockchain:
         genesis_data = {
             "index": 0,
             "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
-            "timestamp": int(time.time()),
+            "timestamp": utc_timestamp(),
             "data": "Genesis Block - Quip Protocol",
             "next_block_requirements": {
                 "difficulty_energy": self.base_difficulty_energy,

@@ -3,11 +3,12 @@
 import logging
 from blake3 import blake3
 import json
-import time
 import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
+
+from shared.time_utils import utc_timestamp, validate_block_timestamp
 
 from shared.miner_types import MiningResult
 from shared.quantum_proof_of_work import calculate_diversity, generate_ising_model_from_nonce, ising_nonce_from_block, energies_for_solutions
@@ -475,13 +476,9 @@ class Block:
         if previous_block.header.index > 0:
             requirements = compute_current_requirements(requirements, previous_block.header.timestamp, logger, self.header.timestamp)
 
-        #Validate the timestamps in the block. 
-        cur_time = int(time.time())
-        if self.header.timestamp < previous_block.header.timestamp:
-            logger.info(f"Block {self.header.index} rejected: timestamp {self.header.timestamp} < previous block timestamp {previous_block.header.timestamp}")
-            return False
-        if self.header.timestamp > cur_time:
-            logger.info(f"Block {self.header.index} rejected: timestamp {self.header.timestamp} > current time {cur_time}")
+        #Validate the timestamps in the block using UTC time
+        if not validate_block_timestamp(self.header.timestamp, previous_block.header.timestamp):
+            logger.info(f"Block {self.header.index} rejected: invalid timestamp {self.header.timestamp}")
             return False
         min_gap = self.header.timestamp - (self.header.timestamp - int(self.quantum_proof.mining_time))
         if (self.header.timestamp - min_gap) < previous_block.header.timestamp:
@@ -668,11 +665,14 @@ def create_genesis_block(genesis_data: Optional[dict] = None) -> Block:
         # Use parse_block_json to create the block from the provided data
         return Block.from_json(json.dumps(genesis_data))
 
-    # Create default genesis block data
+    # Create default genesis block data in the correct format
     default_genesis_data = {
-        "index": 0,
-        "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
-        "timestamp": int(time.time()),
+        "header": {
+            "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "index": 0,
+            "timestamp": utc_timestamp(),
+            "data_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
         "data": "Genesis Block - Quip Protocol",
         "next_block_requirements": {
             "difficulty_energy": -1000.0,
@@ -681,8 +681,7 @@ def create_genesis_block(genesis_data: Optional[dict] = None) -> Block:
             "timeout_to_difficulty_adjustment_decay": 600
         },
         "quantum_proof": None,
-        "miner_info": None,
-        "signature": None
+        "miner_info": None
     }
 
     # Use parse_block_json to create and validate the default genesis block
