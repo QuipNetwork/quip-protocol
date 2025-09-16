@@ -11,8 +11,10 @@ from typing import Dict, List, Optional, Any, Tuple
 from shared.time_utils import utc_timestamp, validate_block_timestamp
 
 from shared.miner_types import MiningResult
-from shared.quantum_proof_of_work import calculate_diversity, generate_ising_model_from_nonce, ising_nonce_from_block, energies_for_solutions
-from shared.quantum_proof_of_work import generate_ising_model_from_nonce, calculate_diversity
+from shared.quantum_proof_of_work import (
+    calculate_diversity, generate_ising_model_from_nonce, ising_nonce_from_block, 
+    energies_for_solutions, validate_quantum_proof
+)
 from shared.block_requirements import BlockRequirements, compute_current_requirements
 from shared.logging_config import get_logger
 from shared.energy_utils import adjust_energy_along_curve
@@ -486,63 +488,15 @@ class Block:
             return False
 
         # Validate quantum proof against (possibly decayed) requirements
-        return self._validate_quantum_proof(self.miner_info.miner_id, requirements)
+        return validate_quantum_proof(
+            self.quantum_proof, 
+            self.miner_info.miner_id, 
+            requirements, 
+            self.header.index, 
+            self.header.previous_hash
+        )
 
-    def _validate_quantum_proof(self, miner_id: str, requirements: BlockRequirements) -> bool:
-        """Validate quantum proof against requirements and compute metrics."""
-        if not self.quantum_proof:
-            logger.error(f"Block {self.header.index} rejected: no quantum proof")
-            return False
 
-        solutions = self.quantum_proof.solutions
-        if not solutions:
-            logger.error(f"Block {self.header.index} rejected: no solutions in quantum proof")
-            return False
-
-        # For block validation, use the miner_id from the quantum proof
-        nonce = ising_nonce_from_block(self.header.previous_hash, miner_id, self.header.index, self.quantum_proof.salt)
-        if self.quantum_proof.nonce != nonce:
-            logger.error(f"Block {self.header.index} rejected: invalid nonce {self.quantum_proof.nonce} != {nonce}")
-            return False
-
-        h, J = generate_ising_model_from_nonce(nonce, self.quantum_proof.nodes, self.quantum_proof.edges)
-
-        # Compute energies respecting variable order (self.quantum_proof.nodes)
-        energies = energies_for_solutions(solutions, h, J, self.quantum_proof.nodes)
-
-        # Find solutions meeting energy threshold
-        valid_indices = [i for i, e in enumerate(energies) if e < requirements.difficulty_energy]
-        valid_solutions = [solutions[i] for i in valid_indices]
-
-        if len(valid_solutions) < requirements.min_solutions:
-            logger.error(f"Block {self.header.index} rejected: insufficient valid solutions ({len(valid_solutions)} < {requirements.min_solutions})")
-            logger.error(f"Solutions presented in result: {len(solutions)} - json.dumps({energies})")
-            return False
-
-        # Calculate diversity using shared utility
-        diversity = calculate_diversity(valid_solutions)
-        if diversity < requirements.min_diversity:
-            logger.error(f"Block {self.header.index} rejected: insufficient diversity ({diversity} < {requirements.min_diversity})")
-            return False
-
-        return True
-
-    def _calculate_diversity(self, solutions: List[List[int]]) -> float:
-        """Calculate average normalized Hamming distance between solutions."""
-        if len(solutions) < 2:
-            return 0.0
-
-        distances = []
-        n = len(solutions[0]) if solutions else 0
-
-        for i in range(len(solutions)):
-            for j in range(i + 1, len(solutions)):
-                # Calculate Hamming distance
-                distance = sum(1 for a, b in zip(solutions[i], solutions[j]) if a != b)
-                normalized_distance = distance / n if n > 0 else 0
-                distances.append(normalized_distance)
-
-        return sum(distances) / len(distances) if distances else 0.0
 
     def to_json(self) -> str:
         """Serialize block to JSON string."""
