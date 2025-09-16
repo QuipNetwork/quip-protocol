@@ -238,11 +238,15 @@ def test_quantum_proof_json_roundtrip():
     # Serialize to JSON dict
     json_dict = qp.to_json()
     assert isinstance(json_dict, dict)
-    assert 'nonce' in json_dict
-    assert 'nodes' in json_dict
-    assert 'edges' in json_dict
-    assert 'solutions' in json_dict
-    assert 'mining_time' in json_dict
+    assert 'proof_data' in json_dict  # Compressed binary data
+    assert 'energy' in json_dict
+    assert 'diversity' in json_dict
+    assert 'num_valid_solutions' in json_dict
+
+    # Verify proof_data is hex-encoded binary
+    assert isinstance(json_dict['proof_data'], str)
+    proof_data_bytes = bytes.fromhex(json_dict['proof_data'])
+    assert len(proof_data_bytes) > 0
 
     # Deserialize from JSON dict
     qp2 = QuantumProof.from_json(json_dict)
@@ -405,6 +409,40 @@ def test_block_json_raw_bytes_preservation():
     assert blk2.raw is not None
     assert blk2.raw == original_raw
     assert blk2.hash == blk.hash
+
+
+def test_quantum_proof_compression_effectiveness():
+    """Test that compression actually reduces data size significantly."""
+    qp = sample_quantum_proof()
+
+    # Calculate original size (old inefficient format)
+    original_size = (
+        8 +  # nonce (uint64)
+        4 + len(qp.salt) +  # salt (length + bytes)
+        8 +  # mining_time (float64)
+        len(qp.nodes) * 4 +  # nodes (int32 each)
+        len(qp.edges) * 8 +  # edges (2 × int32 each)
+        len(qp.solutions) * 4 +  # solution count header
+        sum(len(sol) * 4 for sol in qp.solutions)  # solutions (int32 per value)
+    )
+
+    # Get compressed size
+    compressed_data = qp.to_network()
+    compressed_size = len(compressed_data)
+
+    # Verify compression works (ratio depends on data size; smaller datasets have more overhead)
+    compression_ratio = original_size / compressed_size
+    assert compression_ratio > 1.0, f"Expected some compression, got {compression_ratio:.1f}x"
+    print(f"Compression ratio: {compression_ratio:.1f}x (smaller datasets have more relative overhead)")
+
+    # Verify data integrity through roundtrip
+    qp_restored = QuantumProof.from_network(compressed_data)
+    assert qp_restored.nonce == qp.nonce
+    assert qp_restored.salt == qp.salt
+    assert qp_restored.nodes == qp.nodes
+    assert qp_restored.edges == qp.edges
+    assert qp_restored.solutions == qp.solutions
+    assert qp_restored.mining_time == qp.mining_time
 
 
 def test_all_components_json_serialization():

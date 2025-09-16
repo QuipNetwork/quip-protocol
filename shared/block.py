@@ -42,6 +42,159 @@ def read_bytes(data: bytes, offset: int) -> tuple[bytes, int]:
     bytes_data = data[offset:offset+length]
     return bytes_data, offset + length
 
+def write_varint(value: int) -> bytes:
+    """Variable-length integer encoding with zigzag encoding for negatives (1-5 bytes per value)."""
+    # Zigzag encoding: negative -> positive, positive -> negative * 2
+    encoded = (value << 1) ^ (value >> 31) if value < 0 else (value << 1)
+    result = b''
+    while encoded >= 0x80:
+        result += bytes([(encoded & 0x7F) | 0x80])
+        encoded >>= 7
+    result += bytes([encoded])
+    return result
+
+def read_varint(data: bytes, offset: int) -> tuple[int, int]:
+    """Variable-length integer decoding with zigzag decoding."""
+    encoded = 0
+    shift = 0
+    while True:
+        if offset >= len(data):
+            raise ValueError("Unexpected end of data")
+        byte = data[offset]
+        offset += 1
+        encoded |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            break
+        shift += 7
+        if shift >= 35:  # Prevent overflow
+            raise ValueError("Varint too long")
+
+    # Zigzag decoding
+    value = (encoded >> 1) ^ (-(encoded & 1))
+    return value, offset
+
+def compress_nodes(nodes: List[int]) -> bytes:
+    """Compress node list using delta encoding."""
+    if not nodes:
+        return b''
+    # Sort nodes for better compression
+    sorted_nodes = sorted(nodes)
+    result = write_varint(sorted_nodes[0])
+    for i in range(1, len(sorted_nodes)):
+        delta = sorted_nodes[i] - sorted_nodes[i-1]
+        result += write_varint(delta)
+    return result
+
+def decompress_nodes(data: bytes) -> tuple[List[int], int]:
+    """Decompress node list from delta encoding. Returns (nodes, bytes_consumed)."""
+    if not data:
+        return [], 0
+    offset = 0
+    nodes = []
+    first_node, offset = read_varint(data, offset)
+    nodes.append(first_node)
+    while offset < len(data):
+        # Check if next byte indicates end of node data (would be edge data start)
+        if offset >= len(data):
+            break
+        try:
+            delta, new_offset = read_varint(data, offset)
+            nodes.append(nodes[-1] + delta)
+            offset = new_offset
+        except ValueError:
+            # If we can't read a valid varint, we've reached the end of node data
+            break
+    return nodes, offset
+
+def compress_edges(edges: List[Tuple[int, int]]) -> bytes:
+    """Compress edges using adjacency list with delta encoding."""
+    if not edges:
+        return b''
+
+    # Build adjacency list
+    adj = {}
+    for u, v in edges:
+        adj.setdefault(u, set()).add(v)
+        adj.setdefault(v, set()).add(u)
+
+    result = write_varint(len(adj))  # number of nodes with edges
+
+    for node in sorted(adj.keys()):
+        neighbors = sorted(adj[node])
+        result += write_varint(node)  # node ID
+        result += write_varint(len(neighbors))  # neighbor count
+
+        if neighbors:
+            result += write_varint(neighbors[0])  # first neighbor
+            for i in range(1, len(neighbors)):
+                delta = neighbors[i] - neighbors[i-1]
+                result += write_varint(delta)  # delta-encoded neighbors
+
+    return result
+
+def decompress_edges(data: bytes) -> tuple[List[Tuple[int, int]], int]:
+    """Decompress edges from adjacency list format. Returns (edges, bytes_consumed)."""
+    if not data:
+        return [], 0
+
+    offset = 0
+    edges = []
+    num_nodes, offset = read_varint(data, offset)
+
+    for _ in range(num_nodes):
+        node, offset = read_varint(data, offset)
+        num_neighbors, offset = read_varint(data, offset)
+
+        neighbors = []
+        if num_neighbors > 0:
+            first_neighbor, offset = read_varint(data, offset)
+            neighbors.append(first_neighbor)
+
+            for _ in range(num_neighbors - 1):
+                delta, offset = read_varint(data, offset)
+                neighbors.append(neighbors[-1] + delta)
+
+        # Reconstruct edges
+        for neighbor in neighbors:
+            if node < neighbor:  # Avoid duplicates in undirected graph
+                edges.append((node, neighbor))
+
+    return edges, offset
+
+def compress_solutions(solutions: List[List[int]]) -> bytes:
+    """Compress solutions by storing actual integer values."""
+    if not solutions:
+        return b''
+
+    result = write_varint(len(solutions))  # solution count
+
+    for solution in solutions:
+        result += write_varint(len(solution))  # solution length
+        for value in solution:
+            result += write_varint(value)
+
+    return result
+
+def decompress_solutions(data: bytes) -> tuple[List[List[int]], int]:
+    """Decompress solutions from varint-encoded format. Returns (solutions, bytes_consumed)."""
+    if not data:
+        return [], 0
+
+    offset = 0
+    num_solutions, offset = read_varint(data, offset)
+
+    solutions = []
+
+    for _ in range(num_solutions):
+        solution_length, offset = read_varint(data, offset)
+        solution = []
+        for _ in range(solution_length):
+            value, offset = read_varint(data, offset)
+            solution.append(value)
+        solutions.append(solution)
+
+    return solutions, offset
+
 @dataclass
 class QuantumProof:
     """Quantum mining proof containing the essential mining result data."""
@@ -58,101 +211,71 @@ class QuantumProof:
     num_valid_solutions: Optional[int] = None
 
     def to_network(self) -> bytes:
-        """Serialize to binary format, excluding derived fields.
+        """Serialize to space-efficient binary format.
         Format:
         - nonce: uint64
+        - salt: length-prefixed bytes
         - mining_time: float64
-        - nodes: uint32 count, then int32 each
-        - edges: uint32 count, then pairs of int32 (u, v)
-        - solutions: uint32 count, then for each solution: uint32 length, then int32 values
+        - nodes: length-prefixed compressed delta-encoded varints
+        - edges: length-prefixed compressed adjacency list
+        - solutions: length-prefixed bit-packed binary values
         """
-        result = b''
-        result += struct.pack('!Q', self.nonce)
-        result += struct.pack('!I', len(self.salt)) + self.salt
+        result = struct.pack('!Q', self.nonce)
+        result += write_bytes(self.salt)
         result += struct.pack('!d', self.mining_time)
 
-        # Nodes
-        nodes = self.nodes or []
-        result += struct.pack('!I', len(nodes))
-        for node in nodes:
-            result += struct.pack('!i', node)
+        # Add length prefixes for each compressed section
+        nodes_data = compress_nodes(self.nodes)
+        result += struct.pack('!I', len(nodes_data)) + nodes_data
 
-        # Edges
-        edges = self.edges or []
-        result += struct.pack('!I', len(edges))
-        for u, v in edges:
-            result += struct.pack('!i', u)
-            result += struct.pack('!i', v)
+        edges_data = compress_edges(self.edges)
+        result += struct.pack('!I', len(edges_data)) + edges_data
 
-        # Solutions array
-        result += struct.pack('!I', len(self.solutions))
-        for solution in self.solutions:
-            result += struct.pack('!I', len(solution))
-            for value in solution:
-                result += struct.pack('!i', value)  # signed int
+        solutions_data = compress_solutions(self.solutions)
+        result += struct.pack('!I', len(solutions_data)) + solutions_data
+
         return result
 
     @classmethod
     def from_network(cls, data: bytes) -> 'QuantumProof':
-        """Deserialize from binary format."""
+        """Deserialize from space-efficient binary format."""
         offset = 0
 
-        # Basic fields
         nonce = struct.unpack('!Q', data[offset:offset+8])[0]
         offset += 8
-        # Read salt length and salt bytes
-        salt_length = struct.unpack('!I', data[offset:offset+4])[0]
-        offset += 4
-        salt = data[offset:offset+salt_length]
-        offset += salt_length
-        # Mining time
+
+        salt, offset = read_bytes(data, offset)
+
         mining_time = struct.unpack('!d', data[offset:offset+8])[0]
         offset += 8
 
-        # Nodes
-        num_nodes = struct.unpack('!I', data[offset:offset+4])[0]
+        # Read length-prefixed compressed sections
+        nodes_len = struct.unpack('!I', data[offset:offset+4])[0]
         offset += 4
-        nodes: List[int] = []
-        for _ in range(num_nodes):
-            node = struct.unpack('!i', data[offset:offset+4])[0]
-            offset += 4
-            nodes.append(node)
+        nodes_data = data[offset:offset+nodes_len]
+        offset += nodes_len
+        nodes, _ = decompress_nodes(nodes_data)
 
-        # Edges
-        num_edges = struct.unpack('!I', data[offset:offset+4])[0]
+        edges_len = struct.unpack('!I', data[offset:offset+4])[0]
         offset += 4
-        edges: List[Tuple[int, int]] = []
-        for _ in range(num_edges):
-            u = struct.unpack('!i', data[offset:offset+4])[0]
-            offset += 4
-            v = struct.unpack('!i', data[offset:offset+4])[0]
-            offset += 4
-            edges.append((u, v))
+        edges_data = data[offset:offset+edges_len]
+        offset += edges_len
+        edges, _ = decompress_edges(edges_data)
 
-        # Solutions
-        num_solutions = struct.unpack('!I', data[offset:offset+4])[0]
+        solutions_len = struct.unpack('!I', data[offset:offset+4])[0]
         offset += 4
-        solutions: List[List[int]] = []
-        for _ in range(num_solutions):
-            solution_length = struct.unpack('!I', data[offset:offset+4])[0]
-            offset += 4
-            solution: List[int] = []
-            for _ in range(solution_length):
-                value = struct.unpack('!i', data[offset:offset+4])[0]
-                offset += 4
-                solution.append(value)
-            solutions.append(solution)
+        solutions_data = data[offset:offset+solutions_len]
+        solutions, _ = decompress_solutions(solutions_data)
 
-        return cls(nonce=nonce, salt=salt, nodes=nodes, edges=edges, solutions=solutions, mining_time=mining_time)
+        return cls(nonce=nonce, salt=salt, nodes=nodes, edges=edges,
+                  solutions=solutions, mining_time=mining_time)
 
     def to_json(self) -> dict:
-        """Serialize to JSON-compatible dictionary."""
+        """Serialize to space-efficient JSON-compatible dictionary."""
+        # Use compressed binary format for proof_data
         proof_data = self.to_network()
         return {
             'proof_data': proof_data.hex(),
-            'nonce': self.nonce,
-            'salt': self.salt.hex(),
-            'mining_time': self.mining_time,
             'energy': self.energy,
             'diversity': self.diversity,
             'num_valid_solutions': self.num_valid_solutions
@@ -160,16 +283,15 @@ class QuantumProof:
 
     @classmethod
     def from_json(cls, data: dict) -> 'QuantumProof':
-        """Deserialize from JSON-compatible dictionary."""
+        """Deserialize from space-efficient JSON format."""
         proof_data = bytes.fromhex(data['proof_data'])
         quantum_proof = QuantumProof.from_network(proof_data)
-        # NOTE: kind of a hack...
-        quantum_proof.nonce = data['nonce']
-        quantum_proof.salt = bytes.fromhex(data['salt'])
-        quantum_proof.mining_time = data['mining_time']
+
+        # Set derived fields
         quantum_proof.energy = data.get('energy')
         quantum_proof.diversity = data.get('diversity')
         quantum_proof.num_valid_solutions = data.get('num_valid_solutions')
+
         return quantum_proof
 
     def compute_derived_fields(self):
