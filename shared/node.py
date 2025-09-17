@@ -15,7 +15,7 @@ from multiprocessing.synchronize import Event as EventType
 from logging.handlers import QueueListener
 import aiohttp
 
-from shared.block_requirements import compute_current_requirements, compute_next_block_requirements, validate_block
+from shared.block_requirements import compute_next_block_requirements, validate_block
 
 if TYPE_CHECKING:
     pass

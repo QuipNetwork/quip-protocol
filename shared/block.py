@@ -7,11 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
-from shared.time_utils import utc_timestamp, validate_block_timestamp
+from shared.time_utils import utc_timestamp
 
 from shared.quantum_proof_of_work import (
     calculate_diversity, generate_ising_model_from_nonce, 
-    energies_for_solutions, validate_quantum_proof
+    energies_for_solutions
 )
 from shared.logging_config import get_logger
 
