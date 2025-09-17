@@ -513,17 +513,16 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
 
         # Filter solutions if we have too many
         filtered_solutions = valid_solutions
-        final_diversity = diversity
         if len(valid_solutions) >= min_solutions:
             selected_solutions_indices = select_diverse_solutions(valid_solutions, min_solutions)
             filtered_solutions = [valid_solutions[i] for i in selected_solutions_indices]
-            final_diversity = calculate_diversity(filtered_solutions)
+            diversity = calculate_diversity(filtered_solutions)
 
         # Recalculate best energy from filtered solutions
         best_energy = min(energies_for_solutions(filtered_solutions, h, J, nodes))
 
-        if final_diversity < min_diversity:
-            raise ValueError(f"Insufficient diversity: {final_diversity} < {min_diversity}")
+        if diversity < min_diversity:
+            raise ValueError(f"Insufficient diversity: {diversity} < {min_diversity}")
 
         # Create mining result for this attempt
         mining_time = time.time() - start_time
@@ -538,7 +537,7 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
             prev_timestamp=prev_timestamp,
             solutions=filtered_solutions,
             energy=best_energy,
-            diversity=final_diversity,
+            diversity=diversity,
             num_valid=len(valid_solutions),
             mining_time=int(mining_time),
             node_list=nodes,
