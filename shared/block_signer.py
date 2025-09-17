@@ -4,7 +4,7 @@ import hashlib
 import os
 from blake3 import blake3
 from shared.logging_config import get_logger
-from typing import Tuple, List, Optional
+from typing import Optional
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF

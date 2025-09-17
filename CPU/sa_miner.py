@@ -13,8 +13,7 @@ import json
 
 from shared.base_miner import BaseMiner, MiningResult
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
-from shared.block_requirements import compute_current_requirements
-from shared.quantum_proof_of_work import generate_ising_model_from_nonce, ising_nonce_from_block
+from shared.quantum_proof_of_work import compute_current_requirements, generate_ising_model_from_nonce, ising_nonce_from_block
 # Removed _parse_block_header import - function no longer exists
 
 

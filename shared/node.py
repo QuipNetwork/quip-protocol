@@ -15,12 +15,14 @@ from multiprocessing.synchronize import Event as EventType
 from logging.handlers import QueueListener
 import aiohttp
 
+from shared.quantum_proof_of_work import compute_next_block_requirements
+
 if TYPE_CHECKING:
     pass
 
 from shared import block
 from shared.block_signer import BlockSigner
-from shared.block import Block, MinerInfo, compute_next_block_requirements
+from shared.block import Block, MinerInfo
 from shared.miner import Miner, MiningResult
 from shared.logging_config import init_component_logger
 from shared.time_utils import utc_timestamp_float, utc_timestamp
