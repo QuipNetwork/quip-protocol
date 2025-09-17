@@ -29,7 +29,12 @@ class MetalMiner(BaseMiner):
             # Now update sampler with our logger
             sampler.logger = self.logger
             self.miner_type = "GPU-MPS"
-            self.logger.info(f"Using MetalSampler (MPS)")
+
+            # Extract hierarchical configuration
+            self.use_hierarchical = cfg.get('use_hierarchical', True)  # Default to hierarchical mode
+            self.block_size = cfg.get('block_size', None)  # Auto-select optimal block size
+
+            self.logger.info(f"Using MetalSampler (MPS) - Hierarchical: {self.use_hierarchical}, Block Size: {self.block_size}")
         except Exception as e:
             # For fallback case, we can't use logger yet since super().__init__() wasn't called
             sampler = SimulatedAnnealingStructuredSampler()
@@ -138,7 +143,9 @@ class MetalMiner(BaseMiner):
                     'h': h,
                     'J': J,
                     'num_reads': num_reads,
-                    'num_sweeps': num_sweeps
+                    'num_sweeps': num_sweeps,
+                    'use_hierarchical': self.use_hierarchical,
+                    'block_size': self.block_size
                 }
                 
                 sampleset = self.sampler.sample_ising(**sampling_params)

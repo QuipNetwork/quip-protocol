@@ -92,7 +92,8 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None):
             sampleset = metal_sampler.sample_ising(
                 h=h, J=J,
                 num_reads=reads,
-                num_sweeps=sweeps
+                num_sweeps=sweeps,
+                use_hierarchical=True
             )
             runtime = time.time() - start_time
 
