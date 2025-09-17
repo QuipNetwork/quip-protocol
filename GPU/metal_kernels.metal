@@ -31,10 +31,12 @@ kernel void fused_metropolis_update(
     float field = local_fields[flat_idx];
     float rand_val = random_values[flat_idx];
     
-    // Fused Metropolis computation
+    // Fused Metropolis computation for energy minimization
+    // delta_e is energy change if we flip the spin
     float delta_e = 2.0 * float(current_spin) * field;
     
     // Accept/reject decision for ENERGY MINIMIZATION
+    // Accept if energy decreases (delta_e < 0) or with probability exp(-beta * delta_e)
     bool accept = (delta_e < 0.0) || (rand_val < exp(-beta * delta_e));
     
     // Conditional spin flip
@@ -203,7 +205,7 @@ kernel void pbit_parallel_update(
     // Apply variability to field calculation
     float modified_field = (fields[flat_idx] + offset) * intensity_factor * timing_factor;
     
-    // P-bit parallel Metropolis criterion
+    // P-bit parallel Metropolis criterion for energy minimization
     int8_t current_spin = spins[flat_idx];
     float delta_e = 2.0f * float(current_spin) * modified_field;
     
@@ -254,7 +256,7 @@ kernel void pbit_sequential_update(
         
         float modified_field = (fields[flat_idx] + offset) * intensity_factor * timing_factor;
         
-        // Sequential Metropolis update
+        // Sequential Metropolis update for energy minimization
         int8_t current_spin = spins[flat_idx];
         float delta_e = 2.0f * float(current_spin) * modified_field;
         
@@ -304,13 +306,13 @@ kernel void pbit_optimized_parallel_update(
     float base_field = fields[flat_idx];
     float modified_field = (base_field + offset) * intensity_factor * timing_factor;
     
-    // Vectorized Metropolis computation
+    // Vectorized Metropolis computation for energy minimization
     int8_t current_spin = spins[flat_idx];
     float delta_e = 2.0f * float(current_spin) * modified_field;
     
-    // Optimized acceptance probability
-    float exp_factor = exp(-beta * max(0.0f, delta_e));
-    bool accept = (delta_e <= 0.0f) || (random_decisions[flat_idx] < exp_factor);
+    // Standard Metropolis acceptance for energy minimization
+    float rand_val = random_decisions[flat_idx];
+    bool accept = (delta_e < 0.0f) || (rand_val < exp(-beta * delta_e));
     
     // Conditional update with memory optimization
     if (accept) {
