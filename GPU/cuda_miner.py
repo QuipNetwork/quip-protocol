@@ -13,9 +13,10 @@ import numpy as np
 from shared.base_miner import BaseMiner, MiningResult
 from shared.quantum_proof_of_work import (
     ising_nonce_from_block,
-    generate_ising_model_from_nonce,
-    compute_current_requirements
+    generate_ising_model_from_nonce
 )
+from shared.block_requirements import compute_current_requirements
+
 from GPU.sampler import GPUSampler
 
 

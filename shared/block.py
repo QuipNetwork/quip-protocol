@@ -10,10 +10,9 @@ from typing import Dict, List, Optional, Any, Tuple
 from shared.time_utils import utc_timestamp, validate_block_timestamp
 
 from shared.quantum_proof_of_work import (
-    calculate_diversity, compute_current_requirements, generate_ising_model_from_nonce, 
+    calculate_diversity, generate_ising_model_from_nonce, 
     energies_for_solutions, validate_quantum_proof
 )
-from shared.block_requirements import BlockRequirements
 from shared.logging_config import get_logger
 
 # Initialize logger
@@ -191,6 +190,61 @@ def decompress_solutions(data: bytes) -> tuple[List[List[int]], int]:
         solutions.append(solution)
 
     return solutions, offset
+
+@dataclass
+class BlockRequirements:
+    """Requirements that the next block must satisfy."""
+    difficulty_energy: float
+    min_diversity: float
+    min_solutions: int
+    timeout_to_difficulty_adjustment_decay: int
+
+    def to_network(self) -> bytes:
+        """Serialize to binary format."""
+        result = b''
+        result += struct.pack('!d', self.difficulty_energy)
+        result += struct.pack('!d', self.min_diversity)
+        result += struct.pack('!I', self.min_solutions)
+        result += struct.pack('!i', self.timeout_to_difficulty_adjustment_decay)
+        return result
+
+    @classmethod
+    def from_network(cls, data: bytes) -> 'BlockRequirements':
+        """Deserialize from binary format."""
+        offset = 0
+        difficulty_energy = struct.unpack('!d', data[offset:offset+8])[0]
+        offset += 8
+        min_diversity = struct.unpack('!d', data[offset:offset+8])[0]
+        offset += 8
+        min_solutions = struct.unpack('!I', data[offset:offset+4])[0]
+        offset += 4
+        timeout_to_difficulty_adjustment_decay = struct.unpack('!i', data[offset:offset+4])[0]
+
+        return cls(
+            difficulty_energy=difficulty_energy,
+            min_diversity=min_diversity,
+            min_solutions=min_solutions,
+            timeout_to_difficulty_adjustment_decay=timeout_to_difficulty_adjustment_decay
+        )
+
+    def to_json(self) -> dict:
+        """Serialize to JSON-compatible dictionary."""
+        return {
+            'difficulty_energy': self.difficulty_energy,
+            'min_diversity': self.min_diversity,
+            'min_solutions': self.min_solutions,
+            'timeout_to_difficulty_adjustment_decay': self.timeout_to_difficulty_adjustment_decay
+        }
+
+    @classmethod
+    def from_json(cls, data: dict) -> 'BlockRequirements':
+        """Deserialize from JSON-compatible dictionary."""
+        return cls(
+            difficulty_energy=float(data['difficulty_energy']),
+            min_diversity=float(data['min_diversity']),
+            min_solutions=int(data['min_solutions']),
+            timeout_to_difficulty_adjustment_decay=int(data['timeout_to_difficulty_adjustment_decay'])
+        )
 
 @dataclass
 class QuantumProof:
@@ -567,54 +621,6 @@ class Block:
 
         # Compute hash from raw bytes
         self.hash = blake3(self.raw).digest()
-
-    def validate_block(self, previous_block: 'Block') -> bool:
-        """Validate this block against the previous block requirements.
-
-        This method validates the quantum proof and other block artifacts.
-
-        The signature is not checked at this time, but it could be as 
-        all blocks have miner info, although checking signature is responsibility of 
-        the network node layer. 
-
-        Args:
-            previous_block: The previous block containing requirements
-
-        Returns:
-            True if block is valid, False otherwise
-        """
-        if not self.quantum_proof or not self.miner_info:
-            logger.error(f"Block {self.header.index} rejected: missing quantum proof or miner info")
-            return False
-
-        # Get requirements from previous block
-        requirements = previous_block.next_block_requirements
-        if not requirements:
-            logger.error(f"Block {self.header.index} rejected: missing next block requirements")
-            return False
-        
-        # Apply timeout-based difficulty decay based on elapsed time since previous block
-        if previous_block.header.index > 0:
-            requirements = compute_current_requirements(requirements, previous_block.header.timestamp, logger, self.header.timestamp)
-
-        #Validate the timestamps in the block using UTC time
-        if not validate_block_timestamp(self.header.timestamp, previous_block.header.timestamp):
-            logger.info(f"Block {self.header.index} rejected: invalid timestamp {self.header.timestamp}")
-            return False
-        min_gap = self.header.timestamp - (self.header.timestamp - int(self.quantum_proof.mining_time))
-        if (self.header.timestamp - min_gap) < previous_block.header.timestamp:
-            logger.info(f"Block {self.header.index} rejected: timestamp {self.header.timestamp} - min_gap {min_gap} < previous block timestamp {previous_block.header.timestamp}")
-            return False
-
-        # Validate quantum proof against (possibly decayed) requirements
-        return validate_quantum_proof(
-            self.quantum_proof, 
-            self.miner_info.miner_id, 
-            requirements, 
-            self.header.index, 
-            self.header.previous_hash
-        )
-
 
 
     def to_json(self) -> str:

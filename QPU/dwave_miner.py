@@ -12,8 +12,8 @@ from shared.base_miner import BaseMiner, MiningResult
 from shared.quantum_proof_of_work import (
     ising_nonce_from_block,
     generate_ising_model_from_nonce,
-    compute_current_requirements
 )
+from shared.block_requirements import compute_current_requirements
 
 class DWaveMiner(BaseMiner):
     def __init__(self, miner_id: str, **cfg):

@@ -5,17 +5,14 @@ import math
 import multiprocessing
 import multiprocessing.synchronize
 import random
-import sys
 import time
 from typing import Optional
 
-import json
 
 from shared.base_miner import BaseMiner, MiningResult
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
-from shared.quantum_proof_of_work import compute_current_requirements, generate_ising_model_from_nonce, ising_nonce_from_block
-# Removed _parse_block_header import - function no longer exists
-
+from shared.quantum_proof_of_work import generate_ising_model_from_nonce, ising_nonce_from_block
+from shared.block_requirements import compute_current_requirements
 
 class SimulatedAnnealingMiner(BaseMiner):
     def __init__(self, miner_id: str, **cfg):

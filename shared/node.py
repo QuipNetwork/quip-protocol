@@ -10,12 +10,12 @@ import socket
 from queue import Empty
 import time
 from blake3 import blake3
-from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING, Callable, Awaitable, Union
+from typing import Dict, List, Optional, Any, TYPE_CHECKING, Callable
 from multiprocessing.synchronize import Event as EventType
 from logging.handlers import QueueListener
 import aiohttp
 
-from shared.quantum_proof_of_work import compute_next_block_requirements
+from shared.block_requirements import compute_current_requirements, compute_next_block_requirements, validate_block
 
 if TYPE_CHECKING:
     pass
@@ -278,7 +278,7 @@ class Node:
 
         # 4. Validate the Quantum Proof and other block artifacts.
         block.quantum_proof.compute_derived_fields()
-        if not block.validate_block(prev_block):
+        if not validate_block(block, prev_block):
             self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid quantum proof")
             qpjson = block.quantum_proof.to_json()
             qpjson['proof_data'] = qpjson['proof_data'][:10] + "..."
@@ -660,3 +660,4 @@ class Node:
             lines.append(f"  - {mid} ({mtype})")
 
         return "\n".join(lines)
+
