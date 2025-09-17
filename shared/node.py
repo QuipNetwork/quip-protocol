@@ -397,8 +397,13 @@ class Node:
             # Wait for first result or timeout
             deadline = utc_timestamp_float() + self.no_block_timeout
             while utc_timestamp_float() < deadline and not self._mining_stop_event.is_set():
+                # Async sleep to allow other coroutines to run
+                await asyncio.sleep(0.1)
+
                 # Poll each handle's response queue quickly
                 for h in handles:
+                    # Async sleep to allow other coroutines to run
+                    await asyncio.sleep(0.1)
                     try:
                         msg = h.resp.get_nowait()
                     except Empty:
@@ -420,8 +425,6 @@ class Node:
                         pass
                 if result is not None:
                     break
-                # Async sleep to allow other coroutines to run
-                await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             self.logger.info("Mining cancelled")
             self._mining_stop_event.set()
