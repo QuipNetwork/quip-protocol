@@ -657,7 +657,7 @@ def calculate_requirements_decay(cur_requirements: dict) -> dict:
     else:
         new_de = curve_energy
 
-    # Ease diversity and solutions downward within floors
+    # Ease diversity and solutions downward within limits
     new_md = min(MAX_DIVERSITY_CEILING, max(MIN_DIVERSITY_FLOOR, md - diversity_ease_rate))
     new_ms = min(MAX_SOLUTIONS_CEILING, max(MIN_SOLUTIONS_FLOOR, int(ms * (1 - solutions_ease_rate))))
 
