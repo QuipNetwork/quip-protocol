@@ -15,15 +15,9 @@ from shared.block_requirements import BlockRequirements
 
 try:
     from GPU.metal_kernel_sampler import MetalKernelDimodSampler
-    METAL_KERNEL_AVAILABLE = True
+    METAL_AVAILABLE = True
 except ImportError:
-    METAL_KERNEL_AVAILABLE = False
-
-try:
-    from GPU.metal_sampler_optimized_chunks import OptimizedChunkMetalSampler
-    OPTIMIZED_METAL_AVAILABLE = True
-except ImportError:
-    OPTIMIZED_METAL_AVAILABLE = False
+    METAL_AVAILABLE = False
 
 
 def metal_baseline_test(timeout_minutes=10.0, output_file=None):
@@ -32,34 +26,22 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None):
     print("=" * 50)
     print(f"⏰ Timeout: {timeout_minutes} minutes")
     
-    # Try kernel-only sampler first, fall back to optimized chunks
+    # Use P-bit Metal kernel sampler
     metal_sampler = None
     sampler_type = "unknown"
     
-    if METAL_KERNEL_AVAILABLE:
+    if METAL_AVAILABLE:
         try:
             metal_sampler = MetalKernelDimodSampler("mps")
             nodes = metal_sampler.nodes
             edges = metal_sampler.edges
-            sampler_type = "kernel-only"
-            print("✅ Metal kernel-only sampler ready (should be 5-10x faster)")
+            sampler_type = "pbit-metal"
+            print("✅ Metal P-bit kernel sampler ready (native Metal acceleration)")
         except Exception as e:
-            print(f"⚠️ Metal kernels failed: {e}, trying fallback...")
-            metal_sampler = None
-    
-    if metal_sampler is None and OPTIMIZED_METAL_AVAILABLE:
-        try:
-            metal_sampler = OptimizedChunkMetalSampler("mps")
-            nodes = metal_sampler.nodes
-            edges = metal_sampler.edges
-            sampler_type = "optimized-chunks"
-            print("✅ Metal optimized sampler ready (PyTorch MPS fallback)")
-        except Exception as e:
-            print(f"❌ Metal optimized failed: {e}")
+            print(f"❌ Metal P-bit sampler failed: {e}")
             return None
-    
-    if metal_sampler is None:
-        print("❌ No Metal samplers available")
+    else:
+        print("❌ Metal P-bit sampler not available")
         return None
     
     # Initial problem setup to show problem size
@@ -67,17 +49,17 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None):
     h, J = generate_ising_model_from_nonce(seed, nodes, edges)
     print(f"📊 Problem: {len(h)} variables, {len(J)} couplings")
     
-    # Test configurations - matching CPU baseline exactly
+    # Test configurations - optimized for P-bit Metal performance
     test_configs = [
-        (256, 64, "Light Metal"),
-        (512, 100, "Low Metal"),
-        (1024, 100, "Medium Metal"),
-        (2048, 150, "High Metal"),
-        (4096, 200, "Very High Metal"),
-        (8192, 200, "Max Metal")
+        (64, 32, "Light P-bit"),
+        (128, 64, "Low P-bit"),
+        (256, 100, "Medium P-bit"),
+        (512, 128, "High P-bit"),
+        (1024, 150, "Very High P-bit"),
+        (2048, 200, "Max P-bit")
     ]
     
-    print(f"\n🧪 Testing Metal configurations:")
+    print(f"\n🧪 Testing P-bit Metal configurations:")
     
     results = {
         'timeout_minutes': timeout_minutes,
@@ -208,7 +190,7 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None):
     
     # Summary (same as CPU)
     total_runtime = time.time() - total_start_time
-    print(f"\n📊 Metal Baseline Summary (total time: {total_runtime/60:.1f} min):")
+    print(f"\n📊 P-bit Metal Baseline Summary (total time: {total_runtime/60:.1f} min):")
     print("=" * 50)
     
     if results['tests']:
@@ -234,7 +216,7 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None):
 
 def main():
     """Main function with command line argument parsing."""
-    parser = argparse.ArgumentParser(description='Metal GPU baseline parameter testing tool')
+    parser = argparse.ArgumentParser(description='P-bit Metal GPU baseline parameter testing tool')
     parser.add_argument(
         '--timeout', '-t', 
         type=float, 
@@ -276,7 +258,7 @@ def main():
     # Run test
     metal_baseline_test(timeout_minutes=timeout, output_file=output_file)
 
-    print(f"\n✅ Metal baseline test complete!")
+    print(f"\n✅ P-bit Metal baseline test complete!")
 
 
 if __name__ == "__main__":

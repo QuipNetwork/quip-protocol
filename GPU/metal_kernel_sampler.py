@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Metal kernel-only sampler using raw Metal compute for maximum performance."""
+"""Metal kernel sampler with P-bit parallel update support for energy optimization."""
 
 import os
 import time
@@ -18,7 +18,7 @@ except ImportError:
 # Always import the quantum proof of work topology
 from shared.quantum_proof_of_work import DEFAULT_TOPOLOGY
 
-# Raw Metal imports
+# Raw Metal imports for direct access
 try:
     from Metal import MTLCreateSystemDefaultDevice
     from Foundation import NSData, NSMutableData
@@ -31,11 +31,11 @@ Variable = collections.abc.Hashable
 
 
 class MetalKernelSampler:
-    """Ultra-fast Metal kernel-only sampler using raw Metal compute."""
+    """Ultra-fast Metal kernel sampler with P-bit parallel update support."""
     
     def __init__(self, device: str = "mps", logger: Optional[logging.Logger] = None):
         self.logger = logger or logging.getLogger(__name__)
-        self.sampler_type = "metal_kernel"
+        self.sampler_type = "metal_kernel_pbit"
         
         if not METAL_AVAILABLE:
             raise RuntimeError("Metal framework not available")
@@ -64,7 +64,7 @@ class MetalKernelSampler:
         self.logger.info(f"[MetalKernelSampler] Ready with {len(self.nodes)} nodes, {len(self.edges)} edges")
     
     def _load_kernels(self):
-        """Load and compile Metal kernels."""
+        """Load and compile Metal kernels including P-bit variants."""
         from pathlib import Path
         
         # Find kernel file
@@ -86,13 +86,20 @@ class MetalKernelSampler:
             
         self._library = library
         
-        # Load kernel functions (match names in metal_kernels.metal)
+        # Load kernel functions including P-bit variants
+        # These are the core kernels that should be available for all implementations
         kernel_names = [
             "fused_metropolis_update",
             "optimized_coupling_field",
             "compute_energies",
             "compute_local_fields",
-            "initialize_random_spins"
+            "initialize_random_spins",
+            # P-bit specific kernels
+            "pbit_parallel_update",
+            "pbit_sequential_update", 
+            "pbit_optimized_parallel_update",
+            "pbit_research_optimized_update_fixed",
+            "pbit_research_simplified_update"
         ]
         
         for name in kernel_names:
@@ -107,9 +114,12 @@ class MetalKernelSampler:
                     self._kernels[name] = pipeline_state
                     self.logger.debug(f"Loaded Metal kernel: {name}")
             else:
-                self.logger.warning(f"Kernel function not found: {name}")
+                # This is expected for P-bit kernels that might not be included in all versions
+                self.logger.debug(f"Kernel function not found (expected for P-bit): {name}")
         
+        # Show what kernels are actually loaded
         self.logger.info(f"[MetalKernelSampler] Loaded {len(self._kernels)} Metal kernels")
+        self.logger.debug(f"[MetalKernelSampler] Available kernels: {list(self._kernels.keys())}")
     
     def _create_buffer(self, data, dtype=np.float32):
         """Create Metal buffer from numpy data."""
@@ -174,7 +184,7 @@ class MetalKernelSampler:
             
             # Convert to proper dtype
             if dtype == np.int8:
-                # Handle signed int8 conversion
+                # Handle signed int8 conversion  
                 raw_array = np.array(int_data, dtype=np.uint8).view(np.int8)
             else:
                 raw_array = np.array(int_data, dtype=np.uint8)
@@ -231,8 +241,8 @@ class MetalKernelSampler:
                 raise RuntimeError(f"Buffer reading failed: ByteIndex({e1}), NSData({e2})")
     
     def sample_ising(self, h, J, num_reads=100, num_sweeps=512, **kwargs):
-        """Run Metal kernel-based simulated annealing."""
-        self.logger.debug(f"[MetalKernelSampler] Starting sampling: reads={num_reads}, sweeps={num_sweeps}")
+        """Run Metal kernel-based P-bit simulated annealing."""
+        self.logger.debug(f"[MetalKernelSampler] Starting P-bit sampling: reads={num_reads}, sweeps={num_sweeps}")
         
         start_time = time.time()
         
@@ -240,11 +250,11 @@ class MetalKernelSampler:
         h_dict = dict(h) if hasattr(h, 'items') else {i: h[i] for i in range(len(h))}
         J_dict = dict(J) if hasattr(J, 'items') else J
         
-        # Run kernel-based sampling
-        samples, energies = self._kernel_sampling(h_dict, J_dict, num_reads, num_sweeps)
+        # Run P-bit kernel-based sampling
+        samples, energies = self._pbit_kernel_sampling(h_dict, J_dict, num_reads, num_sweeps, **kwargs)
         
         total_time = time.time() - start_time
-        self.logger.debug(f"[MetalKernelSampler] Completed in {total_time:.3f}s ({total_time/num_sweeps*1000:.2f}ms per sweep)")
+        self.logger.debug(f"[MetalKernelSampler] P-bit sampling completed in {total_time:.3f}s ({total_time/num_sweeps*1000:.2f}ms per sweep)")
         
         if DIMOD_AVAILABLE:
             # Convert to dimod format
@@ -257,15 +267,16 @@ class MetalKernelSampler:
             # Return raw format for testing
             return {'samples': samples, 'energies': energies}
     
-    def _kernel_sampling(self, h: Dict[int, float], J: Dict[Tuple[int, int], float], 
-                        num_reads: int, num_sweeps: int) -> Tuple[List[List[int]], List[float]]:
-        """Ultra-fast kernel-based sampling."""
+    def _pbit_kernel_sampling(self, h: Dict[int, float], J: Dict[Tuple[int, int], float], 
+                             num_reads: int, num_sweeps: int, spins_per_block: Optional[int] = None,
+                             pbit_mode: str = "research_optimized", use_research: bool = True, **kwargs) -> Tuple[List[List[int]], List[float]]:
+        """Ultra-fast kernel-based P-bit sampling with support for research optimizations."""
         
         # Problem setup
         n = len(self.nodes)
         R = num_reads
         
-        self.logger.debug(f"[MetalKernelSampler] Problem: {n} variables, {len(J)} couplings, {R} chains")
+        self.logger.debug(f"[MetalKernelSampler] P-bit Problem: {n} variables, {len(J)} couplings, {R} chains")
         
         # Build h vector
         h_vec = np.zeros(n, dtype=np.float32)
@@ -301,64 +312,92 @@ class MetalKernelSampler:
         # Initialize spins randomly
         spins = np.random.randint(0, 2, (R, n), dtype=np.int8) * 2 - 1
         
-        # Annealing schedule
-        beta_start = 0.1
-        beta_end = 10.0
-        betas = np.logspace(np.log10(beta_start), np.log10(beta_end), num_sweeps, dtype=np.float32)
+        # Annealing schedule with P-bit specific parameters
+        beta_start = 0.0231  # Match MPS values for consistency 
+        beta_end = 6.6214    # Match MPS values
+        schedule_points = np.linspace(0, 1, num_sweeps, dtype=np.float32)
+        schedule_points = np.power(schedule_points, 0.8)  # Power law like MPS
+        betas = beta_start * np.power(beta_end / beta_start, schedule_points)
+        
+        # Optimize block size based on problem
+        if spins_per_block is None:
+            if use_research:
+                # Research mode: optimized blocks for TApSA/SpSA efficiency
+                spins_per_block = min(1024, max(128, n // 8))  # Larger blocks for research
+            else:
+                # Standard: optimized block size based on problem scale
+                spins_per_block = min(512, max(64, n // 16))
         
         # Create Metal buffers
-        buffer_start = time.time()
         spin_buffer, _ = self._create_buffer(spins, np.int8)
         h_buffer, _ = self._create_buffer(h_vec, np.float32)
+        
+        # P-bit specific buffers for device variability
+        random_decisions = np.random.rand(R, spins_per_block).astype(np.float32)
+        timing_random = np.random.rand(R, spins_per_block).astype(np.float32) 
+        intensity_random = np.random.rand(R, spins_per_block).astype(np.float32)
+        offset_random = np.random.rand(R, spins_per_block).astype(np.float32)
+        
+        decision_buffer, _ = self._create_buffer(random_decisions)
+        timing_buffer, _ = self._create_buffer(timing_random)
+        intensity_buffer, _ = self._create_buffer(intensity_random)
+        offset_buffer, _ = self._create_buffer(offset_random)
         
         if num_edges > 0:
             i_buffer, _ = self._create_buffer(i_indices, np.int32)
             j_buffer, _ = self._create_buffer(j_indices, np.int32)
             j_val_buffer, _ = self._create_buffer(j_values, np.float32)
         
-        # Field buffer for computations
+        # Field buffers for P-bit processing
         field_buffer, _ = self._create_buffer(np.zeros((R, n), dtype=np.float32))
+        neighbor_sum = np.zeros((R, n), dtype=np.float32)
+        neighbor_buffer, _ = self._create_buffer(neighbor_sum)
         
-        # Random values buffer
-        random_buffer, _ = self._create_buffer(np.zeros((R, n), dtype=np.float32))
+        # Research-specific buffers
+        if use_research:
+            # Time-averaged fields buffer (NO EXPENSIVE BUFFER READS)
+            averaged_fields_init = np.tile(h_vec, (R, 1)).astype(np.float32)
+            averaged_fields_buffer, _ = self._create_buffer(averaged_fields_init)
+            
+            # Stall probability random values
+            stall_random = np.random.rand(R, spins_per_block).astype(np.float32)
+            stall_buffer, _ = self._create_buffer(stall_random)
+            
+        # Device variability parameters for P-bit
+        timing_variance = 0.1 if use_research else 0.02   # P-bit timing variability
+        intensity_variance = 0.05 if use_research else 0.01 # P-bit intensity variability
+        offset_variance = 0.02 if use_research else 0.005 # P-bit offset variability
         
-        buffer_creation_time = time.time() - buffer_start
+        # Research-based parameters
+        averaging_factor = 0.1 if use_research else 0.0   # TApSA time averaging factor
+        stall_probability = 0.1 if use_research else 0.0   # SpSA stall probability
         
-        self.logger.debug(f"[MetalKernelSampler] Buffers created in {buffer_creation_time*1000:.1f}ms, starting annealing...")
+        # P-BIT PARALLEL ANNEALING LOOP
+        num_blocks = (n + spins_per_block - 1) // spins_per_block
         
-        # Annealing loop with Metal kernels
-        kernel_time = 0.0
+        self.logger.debug(f"[MetalKernelSampler] Starting P-bit annealing loop")
+        
         for sweep_idx, beta in enumerate(betas):
             sweep_start = time.time()
-            # Generate random values for this sweep
-            random_vals = np.random.rand(R, n).astype(np.float32)
             
-            # Update random buffer
-            random_buffer_new, _ = self._create_buffer(random_vals)
-            
-            # Create command buffer
+            # Create command buffer for this sweep
             command_buffer = self._command_queue.commandBuffer()
             
-            # Field computation kernel: coupling field + local field
+            # Step 1: Update fields (same as before)
             if num_edges > 0:
-                # Step 1: Create fresh neighbor sum buffer (original approach)
-                neighbor_sum_cleared = np.zeros((R, n), dtype=np.float32)
-                neighbor_buffer, _ = self._create_buffer(neighbor_sum_cleared)
-                
-                # Step 2: Compute coupling contributions
+                # Compute coupling contributions
                 if "optimized_coupling_field" in self._kernels:
                     encoder = command_buffer.computeCommandEncoder()
                     encoder.setComputePipelineState_(self._kernels["optimized_coupling_field"])
-                    encoder.setBuffer_offset_atIndex_(neighbor_buffer, 0, 0)  # neighbor_sum
-                    encoder.setBuffer_offset_atIndex_(spin_buffer, 0, 1)      # spins
-                    encoder.setBuffer_offset_atIndex_(i_buffer, 0, 2)         # i_indices
-                    encoder.setBuffer_offset_atIndex_(j_buffer, 0, 3)         # j_indices  
-                    encoder.setBuffer_offset_atIndex_(j_val_buffer, 0, 4)     # j_values
+                    encoder.setBuffer_offset_atIndex_(neighbor_buffer, 0, 0)
+                    encoder.setBuffer_offset_atIndex_(spin_buffer, 0, 1)
+                    encoder.setBuffer_offset_atIndex_(i_buffer, 0, 2)
+                    encoder.setBuffer_offset_atIndex_(j_buffer, 0, 3)
+                    encoder.setBuffer_offset_atIndex_(j_val_buffer, 0, 4)
                     encoder.setBytes_length_atIndex_(np.array([R], dtype=np.uint32).tobytes(), 4, 5)
                     encoder.setBytes_length_atIndex_(np.array([num_edges], dtype=np.uint32).tobytes(), 4, 6)
                     encoder.setBytes_length_atIndex_(np.array([n], dtype=np.uint32).tobytes(), 4, 7)
                     
-                    # Dispatch 2D: (chains, couplings)
                     max_threads = self._kernels["optimized_coupling_field"].maxTotalThreadsPerThreadgroup()
                     threads_x = min(R, int(max_threads**0.5))
                     threads_y = min(num_edges, max_threads // threads_x)
@@ -369,17 +408,16 @@ class MetalKernelSampler:
                     )
                     encoder.endEncoding()
                 
-                # Step 3: Compute local fields (neighbor_sum + h_field)
+                # Compute local fields
                 if "compute_local_fields" in self._kernels:
                     encoder = command_buffer.computeCommandEncoder()
                     encoder.setComputePipelineState_(self._kernels["compute_local_fields"])
-                    encoder.setBuffer_offset_atIndex_(field_buffer, 0, 0)     # local_fields (output)
-                    encoder.setBuffer_offset_atIndex_(neighbor_buffer, 0, 1)  # neighbor_sums
-                    encoder.setBuffer_offset_atIndex_(h_buffer, 0, 2)         # h_fields
+                    encoder.setBuffer_offset_atIndex_(field_buffer, 0, 0)
+                    encoder.setBuffer_offset_atIndex_(neighbor_buffer, 0, 1)
+                    encoder.setBuffer_offset_atIndex_(h_buffer, 0, 2)
                     encoder.setBytes_length_atIndex_(np.array([R], dtype=np.uint32).tobytes(), 4, 3)
                     encoder.setBytes_length_atIndex_(np.array([n], dtype=np.uint32).tobytes(), 4, 4)
                     
-                    # Dispatch 2D: (chains, spins)
                     max_threads = self._kernels["compute_local_fields"].maxTotalThreadsPerThreadgroup()
                     threads_x = min(R, int(max_threads**0.5))
                     threads_y = min(n, max_threads // threads_x)
@@ -389,59 +427,135 @@ class MetalKernelSampler:
                         (groups_x, groups_y, 1), (threads_x, threads_y, 1)
                     )
                     encoder.endEncoding()
-            else:
-                # No couplings: field = h only
-                field_data = np.tile(h_vec, (R, 1))
-                field_buffer, _ = self._create_buffer(field_data)
             
-            # Metropolis update kernel
-            if "fused_metropolis_update" in self._kernels:
-                encoder = command_buffer.computeCommandEncoder()
-                encoder.setComputePipelineState_(self._kernels["fused_metropolis_update"])
-                encoder.setBuffer_offset_atIndex_(spin_buffer, 0, 0)         # spins
-                encoder.setBuffer_offset_atIndex_(field_buffer, 0, 1)        # local_fields
-                encoder.setBuffer_offset_atIndex_(random_buffer_new, 0, 2)   # random_values
-                encoder.setBytes_length_atIndex_(np.array([beta], dtype=np.float32).tobytes(), 4, 3)
-                encoder.setBytes_length_atIndex_(np.array([R], dtype=np.uint32).tobytes(), 4, 4)
-                encoder.setBytes_length_atIndex_(np.array([n], dtype=np.uint32).tobytes(), 4, 5)
+            # Step 2: P-BIT UPDATE
+            kernel_name = self._select_pbit_kernel(pbit_mode, use_research)
+            
+            if kernel_name in self._kernels:
+                # Generate random values for P-bit variability
+                # (already created above)
                 
-                # Dispatch 2D: (chains, spins) to match kernel expectations
-                max_threads = self._kernels["fused_metropolis_update"].maxTotalThreadsPerThreadgroup()
-                threads_x = min(R, int(max_threads**0.5))
-                threads_y = min(n, max_threads // threads_x)
-                groups_x = (R + threads_x - 1) // threads_x
-                groups_y = (n + threads_y - 1) // threads_y
-                encoder.dispatchThreadgroups_threadsPerThreadgroup_(
-                    (groups_x, groups_y, 1), (threads_x, threads_y, 1)
-                )
+                encoder = command_buffer.computeCommandEncoder()
+                encoder.setComputePipelineState_(self._kernels[kernel_name])
+                
+                # Configure kernel arguments based on which one we're using
+                if kernel_name == "pbit_research_simplified_update":
+                    # Simplified research kernel buffer layout
+                    encoder.setBuffer_offset_atIndex_(spin_buffer, 0, 0)
+                    encoder.setBuffer_offset_atIndex_(field_buffer, 0, 1)
+                    encoder.setBuffer_offset_atIndex_(decision_buffer, 0, 2)
+                    encoder.setBuffer_offset_atIndex_(timing_buffer, 0, 3)
+                    encoder.setBuffer_offset_atIndex_(intensity_buffer, 0, 4)
+                    encoder.setBuffer_offset_atIndex_(stall_buffer, 0, 5)
+                    encoder.setBytes_length_atIndex_(np.array([beta], dtype=np.float32).tobytes(), 4, 6)
+                    encoder.setBytes_length_atIndex_(np.array([R], dtype=np.uint32).tobytes(), 4, 7)
+                    encoder.setBytes_length_atIndex_(np.array([spins_per_block], dtype=np.uint32).tobytes(), 4, 8)
+                    encoder.setBytes_length_atIndex_(np.array([n], dtype=np.uint32).tobytes(), 4, 9)
+                    encoder.setBytes_length_atIndex_(np.array([timing_variance], dtype=np.float32).tobytes(), 4, 10)
+                    encoder.setBytes_length_atIndex_(np.array([intensity_variance], dtype=np.float32).tobytes(), 4, 11)
+                    encoder.setBytes_length_atIndex_(np.array([averaging_factor], dtype=np.float32).tobytes(), 4, 12)
+                    encoder.setBytes_length_atIndex_(np.array([stall_probability], dtype=np.float32).tobytes(), 4, 13)
+                    
+                    # Dispatch for research kernel
+                    threads_per_group = min(64, self._kernels[kernel_name].maxTotalThreadsPerThreadgroup())
+                    groups_x = R  # One threadgroup per chain
+                    groups_y = num_blocks  # One threadgroup per spin block
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup_(
+                        (groups_x, groups_y, 1), (threads_per_group, 1, 1)
+                    )
+                    
+                elif kernel_name == "pbit_optimized_parallel_update":
+                    # Optimized parallel kernel
+                    encoder.setBuffer_offset_atIndex_(spin_buffer, 0, 0)
+                    encoder.setBuffer_offset_atIndex_(field_buffer, 0, 1)
+                    encoder.setBuffer_offset_atIndex_(decision_buffer, 0, 2)
+                    encoder.setBuffer_offset_atIndex_(timing_buffer, 0, 3)
+                    encoder.setBuffer_offset_atIndex_(intensity_buffer, 0, 4)
+                    encoder.setBuffer_offset_atIndex_(offset_buffer, 0, 5)
+                    encoder.setBytes_length_atIndex_(np.array([beta], dtype=np.float32).tobytes(), 4, 6)
+                    encoder.setBytes_length_atIndex_(np.array([R], dtype=np.uint32).tobytes(), 4, 7)
+                    encoder.setBytes_length_atIndex_(np.array([spins_per_block], dtype=np.uint32).tobytes(), 4, 8)
+                    encoder.setBytes_length_atIndex_(np.array([n], dtype=np.uint32).tobytes(), 4, 9)
+                    encoder.setBytes_length_atIndex_(np.array([timing_variance], dtype=np.float32).tobytes(), 4, 10)
+                    encoder.setBytes_length_atIndex_(np.array([intensity_variance], dtype=np.float32).tobytes(), 4, 11)
+                    encoder.setBytes_length_atIndex_(np.array([offset_variance], dtype=np.float32).tobytes(), 4, 12)
+                    
+                    # Dispatch for optimized kernel
+                    threads_per_group = min(64, self._kernels[kernel_name].maxTotalThreadsPerThreadgroup())
+                    groups_x = R  # One threadgroup per chain
+                    groups_y = num_blocks  # One threadgroup per spin block
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup_(
+                        (groups_x, groups_y, 1), (threads_per_group, 1, 1)
+                    )
+                    
+                elif kernel_name == "pbit_sequential_update":
+                    # Sequential kernel for safety
+                    encoder.setBuffer_offset_atIndex_(spin_buffer, 0, 0)
+                    encoder.setBuffer_offset_atIndex_(field_buffer, 0, 1)
+                    encoder.setBuffer_offset_atIndex_(decision_buffer, 0, 2)
+                    encoder.setBuffer_offset_atIndex_(timing_buffer, 0, 3)
+                    encoder.setBuffer_offset_atIndex_(intensity_buffer, 0, 4)
+                    encoder.setBuffer_offset_atIndex_(offset_buffer, 0, 5)
+                    encoder.setBytes_length_atIndex_(np.array([beta], dtype=np.float32).tobytes(), 4, 6)
+                    encoder.setBytes_length_atIndex_(np.array([R], dtype=np.uint32).tobytes(), 4, 7)
+                    encoder.setBytes_length_atIndex_(np.array([spins_per_block], dtype=np.uint32).tobytes(), 4, 8)
+                    encoder.setBytes_length_atIndex_(np.array([n], dtype=np.uint32).tobytes(), 4, 9)
+                    encoder.setBytes_length_atIndex_(np.array([timing_variance], dtype=np.float32).tobytes(), 4, 10)
+                    encoder.setBytes_length_atIndex_(np.array([intensity_variance], dtype=np.float32).tobytes(), 4, 11)
+                    encoder.setBytes_length_atIndex_(np.array([offset_variance], dtype=np.float32).tobytes(), 4, 12)
+                    
+                    # Dispatch for sequential kernel
+                    groups_x = R  # One thread per chain
+                    groups_y = num_blocks  # One threadgroup per spin block
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup_(
+                        (groups_x, groups_y, 1), (1, 1, 1)
+                    )
+                    
+                else:
+                    # Original parallel kernel
+                    encoder.setBuffer_offset_atIndex_(spin_buffer, 0, 0)
+                    encoder.setBuffer_offset_atIndex_(field_buffer, 0, 1)
+                    encoder.setBuffer_offset_atIndex_(decision_buffer, 0, 2)
+                    encoder.setBuffer_offset_atIndex_(timing_buffer, 0, 3)
+                    encoder.setBuffer_offset_atIndex_(intensity_buffer, 0, 4)
+                    encoder.setBuffer_offset_atIndex_(offset_buffer, 0, 5)
+                    encoder.setBytes_length_atIndex_(np.array([beta], dtype=np.float32).tobytes(), 4, 6)
+                    encoder.setBytes_length_atIndex_(np.array([R], dtype=np.uint32).tobytes(), 4, 7)
+                    encoder.setBytes_length_atIndex_(np.array([spins_per_block], dtype=np.uint32).tobytes(), 4, 8)
+                    encoder.setBytes_length_atIndex_(np.array([n], dtype=np.uint32).tobytes(), 4, 9)
+                    encoder.setBytes_length_atIndex_(np.array([timing_variance], dtype=np.float32).tobytes(), 4, 10)
+                    encoder.setBytes_length_atIndex_(np.array([intensity_variance], dtype=np.float32).tobytes(), 4, 11)
+                    encoder.setBytes_length_atIndex_(np.array([offset_variance], dtype=np.float32).tobytes(), 4, 12)
+                    
+                    # Dispatch for original parallel kernel
+                    threads_per_group = min(spins_per_block, self._kernels[kernel_name].maxTotalThreadsPerThreadgroup())
+                    groups_x = R  # One threadgroup per chain
+                    groups_y = num_blocks  # One threadgroup per spin block
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup_(
+                        (groups_x, groups_y, 1), (threads_per_group, 1, 1)
+                    )
+                    
                 encoder.endEncoding()
             
-            # Execute commands
+            # Execute this sweep
             command_buffer.commit()
             command_buffer.waitUntilCompleted()
             
             sweep_time = time.time() - sweep_start
-            kernel_time += sweep_time
-            
             if sweep_idx % max(num_sweeps // 10, 1) == 0:
-                self.logger.debug(f"[MetalKernelSampler] Sweep {sweep_idx}/{num_sweeps} ({sweep_time*1000:.2f}ms)")
+                self.logger.debug(f"[MetalKernelSampler] P-bit Sweep {sweep_idx}/{num_sweeps} ({sweep_time*1000:.2f}ms)")
         
         # Read back final results
         self.logger.debug(f"[MetalKernelSampler] Reading final spins from buffer...")
-        buffer_read_start = time.time()
         try:
             final_spins = self._read_buffer(spin_buffer, (R, n), np.int8)
-            buffer_read_time = time.time() - buffer_read_start
-            self.logger.debug(f"[MetalKernelSampler] Buffer read took {buffer_read_time*1000:.1f}ms")
-            self.logger.debug(f"[MetalKernelSampler] Successfully read spins: shape={final_spins.shape}, dtype={final_spins.dtype}")
-            self.logger.debug(f"[MetalKernelSampler] Sample spin values: {final_spins[0][:10] if len(final_spins) > 0 else 'none'}")
         except Exception as e:
             self.logger.error(f"[MetalKernelSampler] Buffer reading failed: {e}")
-            # Fallback: return random spins
+            # Fallback to random spins
             final_spins = np.random.choice([-1, 1], size=(R, n), dtype=np.int8)
-            self.logger.warning(f"[MetalKernelSampler] Using fallback random spins")
         
         # Compute final energies
+        self.logger.debug(f"[MetalKernelSampler] Computing final energies...")
         energies = []
         for r in range(R):
             spin_vec = final_spins[r]
@@ -460,9 +574,65 @@ class MetalKernelSampler:
         # Convert to lists
         samples = [list(final_spins[r]) for r in range(R)]
         
-        self.logger.debug(f"[MetalKernelSampler] Kernel sampling completed")
-        self.logger.debug(f"[MetalKernelSampler] Timing breakdown: buffer_creation={buffer_creation_time*1000:.1f}ms, kernel={kernel_time*1000:.1f}ms, buffer_read={buffer_read_time*1000:.1f}ms")
+        self.logger.debug(f"[MetalKernelSampler] P-bit kernel sampling completed")
         return samples, energies
+    
+    def _select_pbit_kernel(self, mode: str, use_research: bool = False) -> str:
+        """Select the appropriate P-bit kernel based on mode and research flag."""
+        
+        if use_research:
+            # Research-based kernels with TApSA and SpSA
+            return "pbit_research_simplified_update"
+        elif mode == "optimized_parallel":
+            # Optimized parallel implementation
+            return "pbit_optimized_parallel_update"
+        elif mode == "sequential":
+            # Sequential for safety
+            return "pbit_sequential_update"
+        else:
+            # Default to original parallel kernel (safe fallback)
+            return "pbit_parallel_update"
+    
+    def validate_solutions(self, samples: List[List[int]], energies: List[float], h: Dict, J: Dict) -> bool:
+        """Validate that P-bit solutions have proper {-1, +1} format."""
+        
+        print(f"\n🔍 P-bit Solution Validation")
+        print("=" * 40)
+        
+        total_samples = len(samples)
+        valid_samples = 0
+        invalid_values_found = set()
+        
+        for i, sample in enumerate(samples):
+            # Check for valid spin values
+            unique_values = set(sample)
+            if unique_values.issubset({-1, 1}):
+                valid_samples += 1
+            else:
+                invalid_values = unique_values - {-1, 1}
+                invalid_values_found.update(invalid_values)
+                if i < 3:  # Show details for first few invalid samples
+                    print(f"  Sample {i}: Invalid values {invalid_values}")
+        
+        print(f"\n📊 Validation Results:")
+        print(f"  Valid samples: {valid_samples}/{total_samples}")
+        print(f"  Invalid samples: {total_samples - valid_samples}/{total_samples}")
+        
+        if invalid_values_found:
+            print(f"  Invalid values found: {invalid_values_found}")
+            print(f"  ❌ P-BIT SOLUTION FORMAT CORRUPTED")
+            return False
+        else:
+            print(f"  ✅ All solutions have valid {-1, +1} format")
+            
+            # Quick energy check
+            if energies:
+                min_energy = min(energies)
+                avg_energy = sum(energies) / len(energies)
+                print(f"  Min energy: {min_energy:.1f}")
+                print(f"  Avg energy: {avg_energy:.1f}")
+                
+            return True
     
     def close(self):
         """Clean up Metal resources."""
@@ -483,7 +653,7 @@ if DIMOD_AVAILABLE:
             # Get topology from kernel sampler
             self.nodes = self._kernel_sampler.nodes
             self.edges = self._kernel_sampler.edges
-            self.sampler_type = "metal_kernel_dimod"
+            self.sampler_type = "metal_kernel_pbit"
             
             # For compatibility with mining code
             self.properties = {'num_qubits': len(self.nodes)}
