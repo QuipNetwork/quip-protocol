@@ -71,6 +71,8 @@ kernel void optimized_coupling_field(
     int8_t spin_j = spins[chain_offset + j];
     
     // Compute mutual contributions using atomic operations
+    // For Ising model: H = sum h_i*s_i + sum J_ij*s_i*s_j
+    // Local field for spin i includes: h_i + sum_j J_ij*s_j
     float contribution_i = float(spin_j) * coupling_strength;
     float contribution_j = float(spin_i) * coupling_strength;
     
@@ -442,7 +444,8 @@ kernel void hierarchical_tensor_coupling_update(
     
     // Calculate the spin change (delta)
     float spin_delta = float(new_spin - old_spin);  // Will be ±2 for actual flips
-    
+
+    // DEBUG: Skip if no actual flip occurred
     if (abs(spin_delta) < 1.5f) return;  // Skip if no actual flip occurred
     
     // TRUE INCREMENTAL UPDATE: Only update neighbors of flipped spins
@@ -549,6 +552,7 @@ kernel void detect_and_track_flips(
     constant uint& block_start [[buffer(5)]],           // Input: start of current block
     constant uint& block_size [[buffer(6)]],            // Input: size of current block
     constant uint& n [[buffer(7)]],                     // Input: total number of spins
+    constant uint& max_flips_per_chain [[buffer(8)]],   // Input: maximum flips per chain
     uint2 gid [[thread_position_in_grid]]
 ) {
     uint chain_idx = gid.x;
@@ -568,14 +572,13 @@ kernel void detect_and_track_flips(
     if (old_spin != new_spin) {
         // Atomically add this spin to the flip list
         uint flip_pos = atomic_fetch_add_explicit(
-            (device atomic<uint>*)&flip_count[chain_idx], 
-            1, 
+            (device atomic<uint>*)&flip_count[chain_idx],
+            1,
             memory_order_relaxed
         );
-        
+
         // Store the global spin index that flipped
-        // FIXED: Add bounds checking to prevent buffer overflow
-        uint max_flips_per_chain = block_size;  // Conservative limit
+        // FIXED: Use the correct buffer size passed from Python
         if (flip_pos < max_flips_per_chain) {
             flipped_indices[chain_idx * max_flips_per_chain + flip_pos] = global_spin_idx;
         }

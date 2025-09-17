@@ -354,25 +354,15 @@ class MetalKernelSampler:
             self.logger.debug(f"[MetalKernelSampler] Auto-selected block_size={block_size} for n={n} (optimized)")
 
         # Choose sampling method based on hierarchical and sparse update flags
-        if use_hierarchical and use_sparse_updates:
-            # TEMPORARY: Disable sparse updates due to Metal kernel debugging complexity
-            # The sparse implementation requires significant additional kernel debugging
-            # Current hierarchical mode already achieves 51.7X speedup (exceeds paper minimum goals)
-            self.logger.info(f"[MetalKernelSampler] Sparse updates disabled for stability, using standard hierarchical (51.7X speedup)")
-            try:
-                samples, energies = self._hierarchical_kernel_sampling(h, J, num_reads, num_sweeps, block_size, **kwargs)
-            except Exception as e:
-                self.logger.warning(f"[MetalKernelSampler] DEBUGGING: Hierarchical disabled, falling back to standard P-bit - {e}")
-                samples, energies = self._pbit_kernel_sampling(h, J, num_reads, num_sweeps, **kwargs)
-        elif use_hierarchical:
+        if use_hierarchical:
             self.logger.debug(f"[MetalKernelSampler] Using hierarchical update with block_size={block_size}")
             try:
                 samples, energies = self._hierarchical_kernel_sampling(h, J, num_reads, num_sweeps, block_size, **kwargs)
             except Exception as e:
-                self.logger.warning(f"[MetalKernelSampler] DEBUGGING: Hierarchical disabled, falling back to standard P-bit - {e}")
+                self.logger.warning(f"[MetalKernelSampler] Hierarchical failed, falling back to P-bit: {e}")
                 samples, energies = self._pbit_kernel_sampling(h, J, num_reads, num_sweeps, **kwargs)
         else:
-            self.logger.debug(f"[MetalKernelSampler] Using original parallel update")
+            self.logger.debug(f"[MetalKernelSampler] Using P-bit parallel update")
             samples, energies = self._pbit_kernel_sampling(h, J, num_reads, num_sweeps, **kwargs)
 
         total_time = time.time() - start_time
@@ -392,6 +382,8 @@ class MetalKernelSampler:
     def _hierarchical_kernel_sampling(self, h, J, num_reads, num_sweeps, block_size=32, **kwargs):
         """Hierarchical update sampling using block-based local field updates (Paper Section 3.1)."""
 
+        self.logger.info(f"[MetalKernelSampler] HIERARCHICAL METHOD STARTED - {num_reads} reads, {num_sweeps} sweeps")
+
         # Convert inputs first to determine actual problem size
         h_dict = dict(h) if hasattr(h, 'items') else {i: h[i] for i in range(len(h))}
         J_dict = dict(J) if hasattr(J, 'items') else J
@@ -408,6 +400,7 @@ class MetalKernelSampler:
         R = num_reads
         node_to_pos = {node_id: pos for pos, node_id in enumerate(problem_nodes)}
 
+        self.logger.info(f"[MetalKernelSampler] Hierarchical problem: {n} variables, {R} chains, {len(J_dict)} couplings")
         self.logger.debug(f"[MetalKernelSampler] Hierarchical sampling: {n} variables, {R} chains, block_size={block_size}")
 
         # Build h vector with correct problem size
@@ -442,29 +435,39 @@ class MetalKernelSampler:
 
         # Initialize spins randomly
         spins = np.random.randint(0, 2, (R, n), dtype=np.int8) * 2 - 1
+        self.logger.info(f"[MetalKernelSampler] Initialized {R} chains with {n} spins each")
 
         # Annealing schedule
         beta_start = 0.01
         beta_end = 15.0
         betas = np.logspace(np.log10(beta_start), np.log10(beta_end), num_sweeps, dtype=np.float32)
+        self.logger.info(f"[MetalKernelSampler] Annealing schedule: {beta_start} to {beta_end} over {num_sweeps} sweeps")
 
         # Calculate number of blocks
         num_blocks = (n + block_size - 1) // block_size
+        self.logger.info(f"[MetalKernelSampler] Block configuration: {num_blocks} blocks, block_size={block_size}")
 
         # Create Metal buffers with correct problem size
+        self.logger.info(f"[MetalKernelSampler] Creating Metal buffers...")
         spin_buffer, _ = self._create_buffer(spins, np.int8)
         h_buffer, _ = self._create_buffer(h_vec, np.float32)
 
         # Initialize local fields with external fields only (will add coupling contributions below)
         local_fields = np.tile(h_vec, (R, 1)).astype(np.float32)
         local_field_buffer, _ = self._create_buffer(local_fields)
+        self.logger.info(f"[MetalKernelSampler] Metal buffers created successfully")
+
+        # Initialize coupling buffers (will be None if no edges)
+        i_buffer = None
+        j_buffer = None
+        j_val_buffer = None
 
         if num_edges > 0:
             i_buffer, _ = self._create_buffer(i_indices, np.uint32)
             j_buffer, _ = self._create_buffer(j_indices, np.uint32)
             j_val_buffer, _ = self._create_buffer(j_values, np.float32)
 
-        # Initialize local fields with coupling contributions
+        # Initialize local fields with coupling contributions (ONE TIME ONLY)
         if num_edges > 0:
             # Compute initial coupling contributions using optimized kernel
             neighbor_sum = np.zeros((R, n), dtype=np.float32)
@@ -496,7 +499,7 @@ class MetalKernelSampler:
                 command_buffer.commit()
                 command_buffer.waitUntilCompleted()
 
-            # Compute local fields (external + coupling)
+            # Compute local fields (external + coupling) - ONE TIME INITIALIZATION
             if "compute_local_fields" in self._kernels:
                 command_buffer = self._command_queue.commandBuffer()
                 encoder = command_buffer.computeCommandEncoder()
@@ -520,21 +523,66 @@ class MetalKernelSampler:
                 command_buffer.commit()
                 command_buffer.waitUntilCompleted()
 
-        # Hierarchical update loop
+        # CORRECT HIERARCHICAL UPDATE LOOP (Paper Algorithm 1)
+        # Key: TRUE incremental updates with O(degree × flips) complexity
+        total_kernel_time = 0.0
+        total_buffer_time = 0.0
+        total_incremental_time = 0.0
+
+        self.logger.info(f"[MetalKernelSampler] Starting CORRECT hierarchical annealing loop with {len(betas)} sweeps")
+
+        # Initialize buffers for incremental updates
+        old_spins_buffer = None
+        flipped_indices_buffer = None
+        flip_count_buffer = None
+
+        if num_edges > 0:
+            # Buffer to store spins before block update (for flip detection)
+            old_spins = np.zeros((R, n), dtype=np.int8)
+            old_spins_buffer, _ = self._create_buffer(old_spins)
+
+            # Buffer to track flipped spin indices (conservative estimate: up to half the block could flip)
+            # For large problems, this needs to be much larger than block_size
+            max_flips_per_block = min(n, max(block_size * 2, 1024))  # At least 2x block_size, max 1024
+            flipped_indices = np.zeros((R, max_flips_per_block), dtype=np.uint32)
+            flipped_indices_buffer, _ = self._create_buffer(flipped_indices)
+
+            # Buffer to count flips per chain
+            flip_counts = np.zeros(R, dtype=np.uint32)
+            flip_count_buffer, _ = self._create_buffer(flip_counts)
+
         for sweep_idx, beta in enumerate(betas):
+            self.logger.debug(f"[MetalKernelSampler] Sweep {sweep_idx}: beta={beta:.6f}")
             sweep_start = time.time()
 
-            # For each block in the system
+            # Process blocks sequentially (Paper requirement)
             for block_idx in range(num_blocks):
                 block_start = block_idx * block_size
                 current_block_size = min(block_size, n - block_start)
 
-                # Generate random decisions for this block
+                # Step 1: Generate random decisions for this block
+                buffer_start = time.time()
                 block_random = np.random.rand(R, current_block_size).astype(np.float32)
                 random_buffer, _ = self._create_buffer(block_random)
+                total_buffer_time += time.time() - buffer_start
 
-                # Use hierarchical_block_update kernel for proper block-based updates
+                # Step 2: Store current spins before update (for flip detection)
+                if num_edges > 0 and old_spins_buffer is not None:
+                    # Use Metal blit command encoder for buffer copying
+                    command_buffer = self._command_queue.commandBuffer()
+                    blit_encoder = command_buffer.blitCommandEncoder()
+
+                    # Copy current spins to old_spins buffer
+                    blit_encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size_(
+                        spin_buffer, 0, old_spins_buffer, 0, spin_buffer.length()
+                    )
+                    blit_encoder.endEncoding()
+                    command_buffer.commit()
+                    command_buffer.waitUntilCompleted()
+
+                # Step 3: Update spins in this block using hierarchical_block_update
                 if "hierarchical_block_update" in self._kernels:
+                    kernel_start = time.time()
                     command_buffer = self._command_queue.commandBuffer()
                     encoder = command_buffer.computeCommandEncoder()
                     encoder.setComputePipelineState_(self._kernels["hierarchical_block_update"])
@@ -542,12 +590,6 @@ class MetalKernelSampler:
                     encoder.setBuffer_offset_atIndex_(spin_buffer, 0, 0)
                     encoder.setBuffer_offset_atIndex_(local_field_buffer, 0, 1)
                     encoder.setBuffer_offset_atIndex_(random_buffer, 0, 2)
-
-                    # Validate scalar parameters
-                    if not np.isfinite(beta):
-                        raise RuntimeError(f"Invalid beta value: {beta}")
-                    if R <= 0 or n <= 0 or current_block_size <= 0:
-                        raise RuntimeError(f"Invalid dimensions: R={R}, n={n}, block_size={current_block_size}")
 
                     beta_bytes = np.array([beta], dtype=np.float32).tobytes()
                     encoder.setBytes_length_atIndex_(beta_bytes, 4, 3)
@@ -560,22 +602,86 @@ class MetalKernelSampler:
                     n_bytes = np.array([n], dtype=np.uint32).tobytes()
                     encoder.setBytes_length_atIndex_(n_bytes, 4, 7)
 
-                    # 2D threading dispatch for hierarchical_block_update kernel
+                    # 2D dispatch: groups of chains × groups of spins
                     encoder.dispatchThreadgroups_threadsPerThreadgroup_(
                         (R, 1, 1), (1, current_block_size, 1)
                     )
-
                     encoder.endEncoding()
                     command_buffer.commit()
                     command_buffer.waitUntilCompleted()
+                    total_kernel_time += time.time() - kernel_start
+
+                # Step 4: TRUE INCREMENTAL FIELD UPDATE (Paper Algorithm 2)
+                # Only update fields affected by flipped spins - O(degree × flips) complexity
+                if num_edges > 0 and old_spins_buffer is not None and flipped_indices_buffer is not None and flip_count_buffer is not None:
+                    incremental_start = time.time()
+
+                    # Reset flip counts to zero
+                    flip_counts = np.zeros(R, dtype=np.uint32)
+                    flip_count_buffer, _ = self._create_buffer(flip_counts)
+
+                    # Detect which spins flipped in this block
+                    if "detect_and_track_flips" in self._kernels:
+                        command_buffer = self._command_queue.commandBuffer()
+                        encoder = command_buffer.computeCommandEncoder()
+                        encoder.setComputePipelineState_(self._kernels["detect_and_track_flips"])
+
+                        encoder.setBuffer_offset_atIndex_(old_spins_buffer, 0, 0)
+                        encoder.setBuffer_offset_atIndex_(spin_buffer, 0, 1)
+                        encoder.setBuffer_offset_atIndex_(flipped_indices_buffer, 0, 2)
+                        encoder.setBuffer_offset_atIndex_(flip_count_buffer, 0, 3)
+                        encoder.setBytes_length_atIndex_(np.array([R], dtype=np.uint32).tobytes(), 4, 4)
+                        encoder.setBytes_length_atIndex_(np.array([block_start], dtype=np.uint32).tobytes(), 4, 5)
+                        encoder.setBytes_length_atIndex_(np.array([current_block_size], dtype=np.uint32).tobytes(), 4, 6)
+                        encoder.setBytes_length_atIndex_(np.array([n], dtype=np.uint32).tobytes(), 4, 7)
+                        encoder.setBytes_length_atIndex_(np.array([max_flips_per_block], dtype=np.uint32).tobytes(), 4, 8)
+
+                        encoder.dispatchThreadgroups_threadsPerThreadgroup_(
+                            (R, 1, 1), (1, current_block_size, 1)
+                        )
+                        encoder.endEncoding()
+                        command_buffer.commit()
+                        command_buffer.waitUntilCompleted()
+
+                    # Update fields only for neighbors of flipped spins
+                    if "hierarchical_tensor_coupling_update" in self._kernels:
+                        command_buffer = self._command_queue.commandBuffer()
+                        encoder = command_buffer.computeCommandEncoder()
+                        encoder.setComputePipelineState_(self._kernels["hierarchical_tensor_coupling_update"])
+
+                        encoder.setBuffer_offset_atIndex_(local_field_buffer, 0, 0)
+                        encoder.setBuffer_offset_atIndex_(old_spins_buffer, 0, 1)
+                        encoder.setBuffer_offset_atIndex_(spin_buffer, 0, 2)
+                        encoder.setBuffer_offset_atIndex_(i_buffer, 0, 3)
+                        encoder.setBuffer_offset_atIndex_(j_buffer, 0, 4)
+                        encoder.setBuffer_offset_atIndex_(j_val_buffer, 0, 5)
+                        encoder.setBuffer_offset_atIndex_(flipped_indices_buffer, 0, 6)
+                        encoder.setBytes_length_atIndex_(np.array([R], dtype=np.uint32).tobytes(), 4, 7)
+                        encoder.setBytes_length_atIndex_(np.array([block_start], dtype=np.uint32).tobytes(), 4, 8)
+                        encoder.setBytes_length_atIndex_(np.array([current_block_size], dtype=np.uint32).tobytes(), 4, 9)
+                        encoder.setBytes_length_atIndex_(np.array([n], dtype=np.uint32).tobytes(), 4, 10)
+                        encoder.setBytes_length_atIndex_(np.array([num_edges], dtype=np.uint32).tobytes(), 4, 11)
+                        encoder.setBytes_length_atIndex_(np.array([max_flips_per_block], dtype=np.uint32).tobytes(), 4, 12)  # max_flips
+
+                        # Dispatch for each chain and potential flip
+                        encoder.dispatchThreadgroups_threadsPerThreadgroup_(
+                            (R, 1, 1), (1, max_flips_per_block, 1)
+                        )
+                        encoder.endEncoding()
+                        command_buffer.commit()
+                        command_buffer.waitUntilCompleted()
+
+                    total_incremental_time += time.time() - incremental_start
 
             sweep_time = time.time() - sweep_start
             if sweep_idx % max(num_sweeps // 10, 1) == 0:
                 self.logger.debug(f"[MetalKernelSampler] Hierarchical Sweep {sweep_idx}/{num_sweeps} ({sweep_time*1000:.2f}ms)")
 
         # Read back final results
+        self.logger.info(f"[MetalKernelSampler] Reading final spin results...")
         try:
             final_spins = self._read_buffer(spin_buffer, (R, n), np.int8)
+            self.logger.info(f"[MetalKernelSampler] Final spins sample: {final_spins[0][:min(5, n)]}")
         except Exception as e:
             self.logger.error(f"[MetalKernelSampler] Buffer reading failed: {e}")
             final_spins = np.random.choice([-1, 1], size=(R, n), dtype=np.int8)
@@ -601,11 +707,22 @@ class MetalKernelSampler:
         for r in range(R):
             sample_dict = {}
             for pos, spin_value in enumerate(final_spins[r]):
-                original_node_id = problem_nodes[pos]
-                sample_dict[original_node_id] = int(spin_value)
+                if pos < len(problem_nodes):
+                    original_node_id = problem_nodes[pos]
+                    sample_dict[original_node_id] = int(spin_value)
 
-            sample_list = [sample_dict.get(i, 0) for i in range(max(problem_nodes) + 1)]
+            # Create sample list for ALL topology nodes, defaulting to 0 for missing nodes
+            sample_list = []
+            for node_id in self.nodes:
+                sample_list.append(sample_dict.get(node_id, 0))
             samples.append(sample_list)
+
+        # Log performance breakdown
+        self.logger.info(f"[MetalKernelSampler] Performance breakdown:")
+        self.logger.info(f"[MetalKernelSampler]   Kernel time: {total_kernel_time:.3f}s")
+        self.logger.info(f"[MetalKernelSampler]   Buffer time: {total_buffer_time:.3f}s")
+        self.logger.info(f"[MetalKernelSampler]   Incremental time: {total_incremental_time:.3f}s")
+        self.logger.info(f"[MetalKernelSampler]   Total time: {total_kernel_time + total_buffer_time + total_incremental_time:.3f}s")
 
         self.logger.debug(f"[MetalKernelSampler] Hierarchical sampling completed")
         return samples, energies
