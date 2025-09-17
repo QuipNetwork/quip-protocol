@@ -567,7 +567,6 @@ class NetworkNode(Node):
                         f"🧩 Gossip handled id={(message.id or '')[:8]} type={message.type}: wait={wait_str}, process={proc_ms:.1f} ms, qsize={qsize}"
                     )
                     if response_future and not response_future.done():
-                        self.logger.info(f"Setting result on future for gossip message {message.id}")
                         try:
                             response_future.set_result(result)
                         except Exception as e:
@@ -575,7 +574,6 @@ class NetworkNode(Node):
                 except Exception as e:
                     self.logger.exception(f"Error processing gossip: {e}")
                     if response_future and not response_future.done():
-                        self.logger.info(f"Setting error result on future for gossip message {message.id} due to exception")
                         try:
                             response_future.set_result("error")
                         except Exception as e:
