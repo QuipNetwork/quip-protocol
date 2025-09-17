@@ -566,16 +566,23 @@ class NetworkNode(Node):
                     self.logger.debug(
                         f"🧩 Gossip handled id={(message.id or '')[:8]} type={message.type}: wait={wait_str}, process={proc_ms:.1f} ms, qsize={qsize}"
                     )
-                    response_future.set_result(result)
+                    if response_future and not response_future.done():
+                        self.logger.info(f"Setting result on future for gossip message {message.id}")
+                        try:
+                            response_future.set_result(result)
+                        except Exception as e:
+                            self.logger.warning(f"Failed to set result on future: {e}")
                 except Exception as e:
                     self.logger.exception(f"Error processing gossip: {e}")
-                    if not response_future.done():
-                        response_future.set_result("error")
+                    if response_future and not response_future.done():
+                        self.logger.info(f"Setting error result on future for gossip message {message.id} due to exception")
+                        try:
+                            response_future.set_result("error")
+                        except Exception as e:
+                            self.logger.warning(f"Failed to set error result on future: {e}")
 
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                self.logger.exception("Error in gossip processor loop")
 
     def _handle_mining_task_exception(self, task: asyncio.Task):
         """Handle exceptions from mining tasks - crash on ValueError."""
@@ -1141,6 +1148,7 @@ class NetworkNode(Node):
         await self.gossip_broadcast(message, target_count)
         t1 = time.perf_counter()
         total_ms = (t1 - t0) * 1000.0
+        assert message.id
         self.logger.debug(
             f"🗣️ Originated gossip type={message.type} id={message.id[:8]} to {target_count} peers: payload={len(message.data or b'')} bytes in {total_ms:.1f} ms"
         )
