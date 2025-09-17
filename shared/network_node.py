@@ -1021,8 +1021,8 @@ class NetworkNode(Node):
                 if peer_host == self.public_host:
                     continue
                 info = MinerInfo.from_json(peer_info_json)
-                await self.add_peer(peer_host, info)
-                peers_found += 1
+                if await self.add_peer(peer_host, info):
+                    peers_found += 1
 
             if peers_found > 0:
                 self.logger.info(f"Successfully joined network via {peer_address}")
