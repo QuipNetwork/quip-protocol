@@ -25,13 +25,13 @@ The implementation supports multiple P-bit algorithm variants:
 - **pbit_parallel_update**: Basic parallel P-bit updates
 - **pbit_sequential_update**: Sequential updates to avoid race conditions
 - **pbit_optimized_parallel_update**: Optimized parallel version with better performance
-- **pbit_research_simplified_update**: Simplified research version with TApSA and SpSA
+
 
 ## Technical Implementation
 
 ### Metal Kernels
 
-The implementation uses 9 Metal compute kernels:
+The implementation uses 8 Metal compute kernels:
 
 #### Core Kernels (Required for basic operation)
 1. **fused_metropolis_update**: Vectorized Metropolis acceptance criterion
@@ -44,7 +44,6 @@ The implementation uses 9 Metal compute kernels:
 6. **pbit_parallel_update**: Basic P-bit parallel updates with device variability
 7. **pbit_sequential_update**: Race-condition safe sequential updates
 8. **pbit_optimized_parallel_update**: Enhanced performance parallel version
-9. **pbit_research_simplified_update**: Research-optimized with TApSA/SpSA
 
 ### Performance Characteristics
 

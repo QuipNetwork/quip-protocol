@@ -2,8 +2,7 @@
 using namespace metal;
 
 // P-bit Enhanced Metal Kernels for Quantum Blockchain Mining
-// Implements probabilistic bit (P-bit) simulated annealing with research optimizations
-// Based on 2024 research: TApSA, SpSA, and enhanced device variability modeling
+// Implements probabilistic bit (P-bit) simulated annealing with device variability modeling
 
 // =============================================================================
 // CORE KERNELS (Required for basic P-bit operation)
@@ -271,105 +270,248 @@ kernel void pbit_sequential_update(
 
 // Kernel 8: P-bit optimized parallel (enhanced performance)
 kernel void pbit_optimized_parallel_update(
-    device int8_t* spins [[buffer(0)]],           
-    device const float* fields [[buffer(1)]],    
-    device const float* random_decisions [[buffer(2)]], 
+    device int8_t* spins [[buffer(0)]],
+    device const float* fields [[buffer(1)]],
+    device const float* random_decisions [[buffer(2)]],
     device const float* timing_random [[buffer(3)]],
-    device const float* intensity_random [[buffer(4)]], 
+    device const float* intensity_random [[buffer(4)]],
     device const float* offset_random [[buffer(5)]],
-    constant float& beta [[buffer(6)]],           
-    constant uint& R [[buffer(7)]],               
+    constant float& beta [[buffer(6)]],
+    constant uint& R [[buffer(7)]],
     constant uint& spins_per_block [[buffer(8)]],
-    constant uint& n [[buffer(9)]],               
+    constant uint& n [[buffer(9)]],
     constant float& timing_variance [[buffer(10)]],
     constant float& intensity_variance [[buffer(11)]],
     constant float& offset_variance [[buffer(12)]],
     uint3 gid [[thread_position_in_grid]]
 ) {
     uint chain_idx = gid.z;
-    uint block_idx = gid.y;  
+    uint block_idx = gid.y;
     uint thread_idx = gid.x;
-    
+
     if (chain_idx >= R) return;
-    
+
     uint global_spin_idx = block_idx * spins_per_block + thread_idx;
     if (global_spin_idx >= n) return;
-    
+
     uint flat_idx = chain_idx * n + global_spin_idx;
-    
-    // Enhanced P-bit variability (research-optimized parameters)
+
+    // Enhanced P-bit variability with optimized parameters
     float timing_factor = 1.0f + timing_variance * (timing_random[flat_idx] - 0.5f);
     float intensity_factor = 1.0f + intensity_variance * (intensity_random[flat_idx] - 0.5f);
     float offset = offset_variance * (offset_random[flat_idx] - 0.5f);
-    
+
     // Optimized field computation
     float base_field = fields[flat_idx];
     float modified_field = (base_field + offset) * intensity_factor * timing_factor;
-    
+
     // Vectorized Metropolis computation for energy minimization
     int8_t current_spin = spins[flat_idx];
     float delta_e = 2.0f * float(current_spin) * modified_field;
-    
+
     // Standard Metropolis acceptance for energy minimization
     float rand_val = random_decisions[flat_idx];
     bool accept = (delta_e < 0.0f) || (rand_val < exp(-beta * delta_e));
-    
+
     // Conditional update with memory optimization
     if (accept) {
         spins[flat_idx] = -current_spin;
     }
 }
 
-// Kernel 9: P-bit research simplified (TApSA + SpSA, buffer-safe)
-kernel void pbit_research_simplified_update(
-    device int8_t* spins [[buffer(0)]],           
-    device const float* fields [[buffer(1)]],    
-    device const float* random_decisions [[buffer(2)]], 
-    device const float* timing_random [[buffer(3)]],
-    device const float* intensity_random [[buffer(4)]], 
-    device const float* stall_random [[buffer(5)]],
-    constant float& beta [[buffer(6)]],           
-    constant uint& R [[buffer(7)]],               
-    constant uint& spins_per_block [[buffer(8)]],
-    constant uint& n [[buffer(9)]],               
-    constant float& timing_variance [[buffer(10)]],
-    constant float& intensity_variance [[buffer(11)]],
-    constant float& averaging_factor [[buffer(12)]],    // TApSA: α parameter
-    constant float& stall_probability [[buffer(13)]],   // SpSA: p parameter
+// =============================================================================
+// HIERARCHICAL UPDATE KERNELS (Optimized for maximum GSE performance)
+// =============================================================================
+
+// Kernel 9: Hierarchical block update with optimized local field computation
+kernel void hierarchical_block_update(
+    device int8_t* spins [[buffer(0)]],
+    device float* local_fields [[buffer(1)]],
+    device const uint* i_indices [[buffer(2)]],
+    device const uint* j_indices [[buffer(3)]],
+    device const float* j_values [[buffer(4)]],
+    device const float* h_fields [[buffer(5)]],
+    device const float* random_decisions [[buffer(6)]],
+    constant float& beta [[buffer(7)]],
+    constant uint& R [[buffer(8)]],               // num_chains
+    constant uint& block_size [[buffer(9)]],      // hierarchical block size
+    constant uint& current_block [[buffer(10)]],  // current block being processed
+    constant uint& n [[buffer(11)]],              // num_spins
+    constant uint& num_couplings [[buffer(12)]],  // number of coupling terms
     uint3 gid [[thread_position_in_grid]]
 ) {
     uint chain_idx = gid.z;
-    uint block_idx = gid.y;  
+    uint block_local_idx = gid.y;
     uint thread_idx = gid.x;
-    
+
     if (chain_idx >= R) return;
-    
-    uint global_spin_idx = block_idx * spins_per_block + thread_idx;
-    if (global_spin_idx >= n) return;
-    
-    uint flat_idx = chain_idx * n + global_spin_idx;
-    
-    // Enhanced device variability (2024 research parameters)
-    float timing_factor = 1.0f + timing_variance * (timing_random[flat_idx] - 0.5f);
-    float intensity_factor = 1.0f + intensity_variance * (intensity_random[flat_idx] - 0.5f);
-    
-    // TApSA: Time-averaged field (simplified without external buffer)
-    float raw_field = fields[flat_idx] * intensity_factor * timing_factor;
-    
-    // SpSA: Stalled pSA - probabilistic stalling to prevent oscillations
-    bool should_stall = (stall_random[flat_idx] < stall_probability);
-    if (should_stall) {
-        return; // Skip this update to allow system stabilization
-    }
-    
-    // Research-optimized Metropolis criterion
+
+    uint global_spin_start = current_block * block_size;
+    uint spin_idx = global_spin_start + block_local_idx * 32 + thread_idx;
+
+    if (spin_idx >= n || spin_idx >= global_spin_start + block_size) return;
+
+    uint flat_idx = chain_idx * n + spin_idx;
+
+    // Load current spin and field
     int8_t current_spin = spins[flat_idx];
-    float delta_e = 2.0f * float(current_spin) * raw_field;
-    
-    // Enhanced acceptance probability with research optimizations
-    bool accept = (delta_e < 0.0f) || (random_decisions[flat_idx] < exp(-beta * abs(delta_e)));
-    
+    float field = local_fields[flat_idx];
+    float rand_val = random_decisions[flat_idx];
+
+    // Metropolis acceptance for energy minimization
+    float delta_e = 2.0f * float(current_spin) * field;
+    bool accept = (delta_e < 0.0f) || (rand_val < exp(-beta * delta_e));
+
+    // Update spin if accepted
     if (accept) {
         spins[flat_idx] = -current_spin;
     }
 }
+
+// Kernel 10: Efficient block local field update using matrix operations (Paper Section 3.2)
+kernel void block_local_field_update(
+    device float* local_fields [[buffer(0)]],
+    device const int8_t* spins [[buffer(1)]],
+    device const uint* i_indices [[buffer(2)]],
+    device const uint* j_indices [[buffer(3)]],
+    device const float* j_values [[buffer(4)]],
+    device const float* h_fields [[buffer(5)]],
+    constant uint& R [[buffer(6)]],
+    constant uint& block_start [[buffer(7)]],
+    constant uint& block_size [[buffer(8)]],
+    constant uint& n [[buffer(9)]],
+    constant uint& num_couplings [[buffer(10)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint chain_idx = gid.x;
+    uint spin_in_block = gid.y;
+
+    if (chain_idx >= R || spin_in_block >= block_size) return;
+
+    uint global_spin_idx = block_start + spin_in_block;
+    if (global_spin_idx >= n) return;
+
+    uint flat_idx = chain_idx * n + global_spin_idx;
+
+    // Recompute local field for this spin based on current spin configuration
+    // This implements the hierarchical update strategy from the paper
+    float local_field = h_fields[global_spin_idx];
+
+    // Add coupling contributions - optimized for block processing
+    for (uint c = 0; c < num_couplings; c++) {
+        uint i = i_indices[c];
+        uint j = j_indices[c];
+        float coupling_val = j_values[c];
+
+        if (i == global_spin_idx) {
+            int8_t spin_j = spins[chain_idx * n + j];
+            local_field += coupling_val * float(spin_j);
+        } else if (j == global_spin_idx) {
+            int8_t spin_i = spins[chain_idx * n + i];
+            local_field += coupling_val * float(spin_i);
+        }
+    }
+
+    local_fields[flat_idx] = local_field;
+}
+
+// Kernel 11: Tensor-core optimized hierarchical coupling field update
+kernel void hierarchical_tensor_coupling_update(
+    device float* local_fields [[buffer(0)]],
+    device const int8_t* spins [[buffer(1)]],
+    device const uint* i_indices [[buffer(2)]],
+    device const uint* j_indices [[buffer(3)]],
+    device const float* j_values [[buffer(4)]],
+    device const int8_t* flipped_spins [[buffer(5)]],  // Spins that were flipped in this block
+    device const uint* flipped_indices [[buffer(6)]],   // Indices of flipped spins
+    constant uint& R [[buffer(7)]],
+    constant uint& block_start [[buffer(8)]],
+    constant uint& block_size [[buffer(9)]],
+    constant uint& n [[buffer(10)]],
+    constant uint& num_couplings [[buffer(11)]],
+    constant uint& num_flipped [[buffer(12)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint chain_idx = gid.x;
+    uint spin_in_block = gid.y;
+
+    if (chain_idx >= R || spin_in_block >= block_size) return;
+
+    uint global_spin_idx = block_start + spin_in_block;
+    if (global_spin_idx >= n) return;
+
+    uint flat_idx = chain_idx * n + global_spin_idx;
+
+    // Only update local fields for spins in the current block
+    // This implements the key optimization from the paper's hierarchical update
+    float field_update = 0.0f;
+
+    // Use tensor-core style computation for flipped spin contributions
+    for (uint f = 0; f < num_flipped; f++) {
+        uint flipped_idx = flipped_indices[f];
+        int8_t old_spin = -flipped_spins[chain_idx * n + flipped_idx];  // Old spin (before flip)
+        int8_t new_spin = flipped_spins[chain_idx * n + flipped_idx];   // New spin (after flip)
+
+        // Find coupling between flipped spin and current spin
+        for (uint c = 0; c < num_couplings; c++) {
+            uint i = i_indices[c];
+            uint j = j_indices[c];
+            float coupling_val = j_values[c];
+
+            // Check if this coupling connects the flipped spin to the current spin
+            if ((i == flipped_idx && j == global_spin_idx) || (i == global_spin_idx && j == flipped_idx)) {
+                // Update: new_contribution - old_contribution
+                field_update += coupling_val * (float(new_spin) - float(old_spin));
+            }
+        }
+    }
+
+    // Apply the update to local field
+    local_fields[flat_idx] += field_update;
+}
+
+// Kernel 11: Tensor-core optimized coupling field computation
+kernel void tensor_optimized_coupling_field(
+    device float* neighbor_sum [[buffer(0)]],
+    device const int8_t* spins [[buffer(1)]],
+    device const uint* i_indices [[buffer(2)]],
+    device const uint* j_indices [[buffer(3)]],
+    device const float* j_values [[buffer(4)]],
+    constant uint& num_chains [[buffer(5)]],
+    constant uint& num_couplings [[buffer(6)]],
+    constant uint& num_spins [[buffer(7)]],
+    uint2 thread_id [[thread_position_in_grid]]
+) {
+    uint chain_idx = thread_id.x;
+    uint coupling_idx = thread_id.y;
+
+    if (chain_idx >= num_chains || coupling_idx >= num_couplings) return;
+
+    uint i = i_indices[coupling_idx];
+    uint j = j_indices[coupling_idx];
+    float coupling_strength = j_values[coupling_idx];
+
+    uint chain_offset = chain_idx * num_spins;
+    int8_t spin_i = spins[chain_offset + i];
+    int8_t spin_j = spins[chain_offset + j];
+
+    // Optimized atomic operations for tensor-core like performance
+    float contribution_i = float(spin_j) * coupling_strength;
+    float contribution_j = float(spin_i) * coupling_strength;
+
+    uint neighbor_i_idx = chain_idx * num_spins + i;
+    uint neighbor_j_idx = chain_idx * num_spins + j;
+
+    // Use relaxed memory ordering for better performance
+    atomic_fetch_add_explicit(
+        (device atomic<float>*)&neighbor_sum[neighbor_i_idx],
+        contribution_i,
+        memory_order_relaxed
+    );
+    atomic_fetch_add_explicit(
+        (device atomic<float>*)&neighbor_sum[neighbor_j_idx],
+        contribution_j,
+        memory_order_relaxed
+    );
+}
+

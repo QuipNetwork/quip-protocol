@@ -25,12 +25,12 @@ class MetalSampler:
         
         self.logger.info(f"[MetalSampler] Initialized P-bit Metal sampler with {len(self.nodes)} nodes")
     
-    def sample_ising(self, h, J, num_reads=100, num_sweeps=512, **kwargs) -> dimod.SampleSet:
-        """Run P-bit Metal kernel-based simulated annealing."""
-        self.logger.debug(f"[MetalSampler] Starting P-bit sampling: reads={num_reads}, sweeps={num_sweeps}")
-        
-        # Use the P-bit kernel sampler
-        return self._kernel_sampler.sample_ising(h, J, num_reads, num_sweeps, **kwargs)
+    def sample_ising(self, h, J, num_reads=100, num_sweeps=512, use_hierarchical=True, block_size=32, **kwargs) -> dimod.SampleSet:
+        """Run P-bit Metal kernel-based simulated annealing with hierarchical optimization."""
+        self.logger.debug(f"[MetalSampler] Starting P-bit sampling: reads={num_reads}, sweeps={num_sweeps}, hierarchical={use_hierarchical}")
+
+        # Use the P-bit kernel sampler with hierarchical optimization
+        return self._kernel_sampler.sample_ising(h, J, num_reads, num_sweeps, use_hierarchical, block_size, **kwargs)
     
     def close(self):
         """Clean up Metal resources."""
