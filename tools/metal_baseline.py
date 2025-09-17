@@ -25,11 +25,11 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None):
     print("🔬 Metal GPU Baseline Parameter Test (Kernel-Only)")
     print("=" * 50)
     print(f"⏰ Timeout: {timeout_minutes} minutes")
-    
+
     # Use P-bit Metal kernel sampler
     metal_sampler = None
     sampler_type = "unknown"
-    
+
     if METAL_AVAILABLE:
         try:
             metal_sampler = MetalKernelDimodSampler("mps")
@@ -43,7 +43,7 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None):
     else:
         print("❌ Metal P-bit sampler not available")
         return None
-    
+
     # Initial problem setup to show problem size
     seed = 12345  # Fixed seed for reproducible results
     h, J = generate_ising_model_from_nonce(seed, nodes, edges)
@@ -74,15 +74,15 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None):
     
     timeout_seconds = timeout_minutes * 60
     total_start_time = time.time()
-    
+
     for sweeps, reads, desc in test_configs:
         elapsed_total = time.time() - total_start_time
         if elapsed_total > timeout_seconds:
             print(f"\n⏰ Total timeout ({timeout_minutes} min) reached, stopping")
             break
-            
+
         print(f"\n{desc}: {sweeps} sweeps, {reads} reads")
-        
+
         try:
             # Generate the Ising model first (like the real miners do)
             nonce = random.randint(0, 2**32 - 1)
@@ -179,12 +179,114 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None):
                 'meets_requirements': bool(meets_requirements)
             }
             results['tests'].append(test_result)
-            
+
             # Individual test timeout check
             if runtime > timeout_seconds * 0.8:  # 80% of total timeout
                 print(f"  ⏰ Single test approaching timeout, stopping further tests")
                 break
-                
+
+        except Exception as e:
+            print(f"  ❌ Error: {e}")
+            break
+
+        try:
+            start_time = time.time()
+            sampleset = metal_sampler.sample_ising(
+                h=h, J=J,
+                num_reads=reads,
+                num_sweeps=sweeps,
+                use_hierarchical=True
+            )
+            runtime = time.time() - start_time
+
+            energies = list(sampleset.record.energy)
+            min_energy = float(min(energies))
+            avg_energy = float(sum(energies) / len(energies))
+            std_energy = float((sum((e - avg_energy)**2 for e in energies) / len(energies)) ** 0.5)
+
+            print(f"  ⏱️  {runtime/60:.1f} min ({runtime:.1f}s)")
+            print(f"  🎯 min_energy = {min_energy:.1f}")
+            print(f"  📊 avg_energy = {avg_energy:.1f} (±{std_energy:.1f})")
+
+            # Use evaluate_sampleset to get diversity and num_solutions (same as CPU)
+            requirements = BlockRequirements(
+                difficulty_energy=0.0,       # Very lenient difficulty (allow positive energies)
+                min_diversity=0.1,           # Low diversity requirement
+                min_solutions=1,             # Low solution count requirement
+                timeout_to_difficulty_adjustment_decay=600  # 10 minutes
+            )
+
+            # Use the same nonce and generate test salt for evaluation
+            salt = b"test_salt_metal_baseline"
+            prev_timestamp = int(time.time()) - 600  # 10 minutes ago
+
+            # Evaluate the sampleset
+            mining_result = evaluate_sampleset(
+                sampleset, requirements, nodes, edges, nonce, salt,
+                prev_timestamp, start_time, f"metal-baseline-{sweeps}-{reads}", "Metal"
+            )
+
+            diversity = 0.0
+            num_solutions = 0
+            meets_requirements = False
+
+            # Calculate diversity of top 10 solutions by energy (same as CPU)
+            solutions = list(sampleset.record.sample)
+            energies = list(sampleset.record.energy)
+
+            # Sort solutions by energy and take top 10
+            solution_energy_pairs = list(zip(solutions, energies))
+            solution_energy_pairs.sort(key=lambda x: x[1])  # Sort by energy (ascending = better)
+            top_10_solutions = [sol for sol, _ in solution_energy_pairs[:10]]
+
+            top_10_diversity = calculate_diversity(top_10_solutions)
+            print(f"  🌈 diversity (top 10) = {top_10_diversity:.3f}")
+
+            if mining_result:
+                diversity = mining_result.diversity
+                num_solutions = mining_result.num_valid
+                meets_requirements = True
+                print(f"  🔢 num_solutions = {num_solutions}")
+                print(f"  ✅ Meets mining requirements!")
+            else:
+                print(f"  ❌ Does not meet mining requirements")
+
+            # Energy target analysis (same as CPU)
+            target_reached = "none"
+            if min_energy <= -15650:
+                target_reached = "excellent"
+            elif min_energy <= -15500:
+                target_reached = "very_good"
+            elif min_energy <= -15400:
+                target_reached = "good"
+            elif min_energy <= -15300:
+                target_reached = "fair"
+
+            if target_reached != "none":
+                print(f"  🎖️  Quality: {target_reached}")
+
+            test_result = {
+                'description': desc,
+                'num_sweeps': int(sweeps),
+                'num_reads': int(reads),
+                'runtime_seconds': float(runtime),
+                'runtime_minutes': float(runtime / 60),
+                'min_energy': min_energy,
+                'avg_energy': avg_energy,
+                'std_energy': std_energy,
+                'target_reached': target_reached,
+                'diversity': float(diversity),
+                'diversity_top_10': float(top_10_diversity),
+                'num_solutions': int(num_solutions),
+                'meets_requirements': bool(meets_requirements)
+            }
+            results['tests'].append(test_result)
+
+            # Individual test timeout check
+            if runtime > timeout_seconds * 0.8:  # 80% of total timeout
+                print(f"  ⏰ Single test approaching timeout, stopping further tests")
+                break
+
         except Exception as e:
             print(f"  ❌ Error: {e}")
             break
@@ -236,7 +338,7 @@ def main():
     )
     parser.add_argument(
         '--extended',
-        action='store_true', 
+        action='store_true',
         help='Extended test mode (30 minute timeout)'
     )
     

@@ -9,13 +9,13 @@ from pathlib import Path
 from basic_ising_problems import BASIC_ISING_PROBLEMS
 
 try:
-    from GPU.metal_kernel_sampler import MetalKernelDimodSampler
+    from GPU.metal_sampler import MetalSampler
     METAL_AVAILABLE = True
 except ImportError:
     METAL_AVAILABLE = False
 
 
-def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None):
+def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, problem=None, block_size=None, use_sparse_updates=True, timing_variance=0.1, intensity_variance=0.1, offset_variance=0.1, spins_per_block=96, beta_start=0.01, beta_end=15.0, max_flips_per_block=None, initial_temperature=None, temperature_decay_rate=None, annealing_schedule_type="logspace", num_trotters=None, gamma=1.0, total_annealing_steps=None):
     """Test Metal sampler hierarchical vs original on known problems."""
     print("🔬 Metal Hierarchical vs Original P-bit Tester")
     print("=" * 60)
@@ -28,7 +28,7 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None):
 
     if metal_available:
         try:
-            metal_sampler = MetalKernelDimodSampler("mps")
+            metal_sampler = MetalSampler("mps")
             print("✅ Metal P-bit kernel sampler ready")
         except Exception as e:
             print(f"❌ Metal P-bit sampler failed: {e}")
@@ -96,9 +96,12 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None):
             override_info.append(f"sweeps={sweeps}")
         print(f"⚙️  Parameter overrides: {', '.join(override_info)}")
 
+    if problem is not None:
+        print(f"🎯 Testing only problem {problem}")
+
     results = []
 
-    def test_hierarchical(h, J, num_reads, num_sweeps, timeout_seconds, optimal_energy):
+    def test_hierarchical(h, J, num_reads, num_sweeps, timeout_seconds, optimal_energy, debug=False):
         """Test hierarchical method. Returns (success, runtime) tuple."""
         try:
             start_time = time.time()
@@ -106,7 +109,22 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None):
                 h=h, J=J,
                 num_reads=num_reads,
                 num_sweeps=num_sweeps,
-                use_hierarchical=True
+                use_hierarchical=True,
+                block_size=block_size,
+                use_sparse_updates=use_sparse_updates,
+                timing_variance=timing_variance,
+                intensity_variance=intensity_variance,
+                offset_variance=offset_variance,
+                spins_per_block=spins_per_block,
+                beta_start=beta_start,
+                beta_end=beta_end,
+                max_flips_per_block=max_flips_per_block,
+                initial_temperature=initial_temperature,
+                temperature_decay_rate=temperature_decay_rate,
+                annealing_schedule_type=annealing_schedule_type,
+                num_trotters=num_trotters,
+                gamma=gamma,
+                total_annealing_steps=total_annealing_steps
             )
             runtime = time.time() - start_time
 
@@ -115,6 +133,15 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None):
 
             print(f"      ⏱️  {runtime:.1f}s, Min energy: {min_energy:.1f}")
             print(f"      ✅ Success: {success}")
+
+            if debug and hasattr(sampleset, 'record'):
+                energies = sampleset.record.energy
+                if len(energies) > 0:
+                    print(f"      🔍 Energy range: {min(energies):.1f} to {max(energies):.1f}")
+                    print(f"      🔍 Unique energies: {len(set(energies))}")
+                    # Show distribution of top 5 energies
+                    sorted_energies = sorted(set(energies))[:5]
+                    print(f"      🔍 Best energies: {sorted_energies}")
 
             if runtime > timeout_seconds:
                 print(f"      ⏰ Timeout exceeded ({timeout_seconds}s)")
@@ -126,7 +153,7 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None):
             print(f"      ❌ Hierarchical error: {e}")
             return False, 0.0
 
-    def test_original(h, J, num_reads, num_sweeps, timeout_seconds, optimal_energy):
+    def test_original(h, J, num_reads, num_sweeps, timeout_seconds, optimal_energy, debug=False):
         """Test original p-bit method. Returns (success, runtime) tuple."""
         try:
             start_time = time.time()
@@ -134,7 +161,22 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None):
                 h=h, J=J,
                 num_reads=num_reads,
                 num_sweeps=num_sweeps,
-                use_hierarchical=False
+                use_hierarchical=False,
+                block_size=block_size,
+                use_sparse_updates=use_sparse_updates,
+                timing_variance=timing_variance,
+                intensity_variance=intensity_variance,
+                offset_variance=offset_variance,
+                spins_per_block=spins_per_block,
+                beta_start=beta_start,
+                beta_end=beta_end,
+                max_flips_per_block=max_flips_per_block,
+                initial_temperature=initial_temperature,
+                temperature_decay_rate=temperature_decay_rate,
+                annealing_schedule_type=annealing_schedule_type,
+                num_trotters=num_trotters,
+                gamma=gamma,
+                total_annealing_steps=total_annealing_steps
             )
             runtime = time.time() - start_time
 
@@ -143,6 +185,15 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None):
 
             print(f"      ⏱️  {runtime:.1f}s, Min energy: {min_energy:.1f}")
             print(f"      ✅ Success: {success}")
+
+            if debug and hasattr(sampleset, 'record'):
+                energies = sampleset.record.energy
+                if len(energies) > 0:
+                    print(f"      🔍 Energy range: {min(energies):.1f} to {max(energies):.1f}")
+                    print(f"      🔍 Unique energies: {len(set(energies))}")
+                    # Show distribution of top 5 energies
+                    sorted_energies = sorted(set(energies))[:5]
+                    print(f"      🔍 Best energies: {sorted_energies}")
 
             if runtime > timeout_seconds:
                 print(f"      ⏰ Timeout exceeded ({timeout_seconds}s)")
@@ -157,12 +208,21 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None):
     for idx, (h, J, optimal_energy, description) in enumerate(BASIC_ISING_PROBLEMS):
         if idx < skip:
             continue
+        if problem is not None and idx != problem:
+            continue
         num_variables = len(h)
         num_reads, num_sweeps, timeout_seconds = get_test_params(num_variables)
 
         print(f"\n🧪 Problem {idx}: {description}")
         print(f"   Variables: {num_variables}, Couplings: {len(J)}, Optimal GSE: {optimal_energy}")
         print(f"   📊 Config: {num_reads} reads, {num_sweeps} sweeps, {timeout_seconds}s timeout")
+
+        if debug:
+            print(f"   🔍 Debug: h={dict(list(h.items())[:5])}..." if len(h) > 5 else f"   🔍 Debug: h={h}")
+            print(f"   🔍 Debug: J has {len(J)} couplings")
+            if J:
+                sample_couplings = list(J.items())[:3]
+                print(f"   🔍 Debug: Sample couplings: {sample_couplings}")
 
         problem_results = {
             'problem_idx': idx,
@@ -182,7 +242,7 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None):
             for attempt in range(retry + 1):  # +1 for initial attempt
                 if attempt > 0:
                     print(f"   🔄 Original retry {attempt}/{retry}...")
-                success, runtime = test_original(h, J, num_reads, num_sweeps, timeout_seconds, optimal_energy)
+                success, runtime = test_original(h, J, num_reads, num_sweeps, timeout_seconds, optimal_energy, debug)
                 if success:
                     original_success = True
                     original_runtime = runtime
@@ -199,7 +259,7 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None):
             for attempt in range(retry + 1):  # +1 for initial attempt
                 if attempt > 0:
                     print(f"   🔄 Hierarchical retry {attempt}/{retry}...")
-                success, runtime = test_hierarchical(h, J, num_reads, num_sweeps, timeout_seconds, optimal_energy)
+                success, runtime = test_hierarchical(h, J, num_reads, num_sweeps, timeout_seconds, optimal_energy, debug)
                 if success:
                     hierarchical_success = True
                     hierarchical_runtime = runtime
@@ -259,13 +319,66 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test Metal sampler hierarchical vs original on known problems")
     parser.add_argument("--skip", type=int, default=0,
-                       help="Number of problems to skip (default: 0)")
+                        help="Number of problems to skip (default: 0)")
     parser.add_argument("--retry", type=int, default=3,
-                       help="Number of retry attempts per test (default: 3)")
+                        help="Number of retry attempts per test (default: 3)")
     parser.add_argument("--reads", type=int, default=None,
-                       help="Override number of reads (default: auto-scaled)")
+                        help="Override number of reads (default: auto-scaled)")
     parser.add_argument("--sweeps", type=int, default=None,
-                       help="Override number of sweeps (default: auto-scaled)")
+                        help="Override number of sweeps (default: auto-scaled)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable detailed debugging output")
+    parser.add_argument("--problem", type=int, default=None,
+                        help="Test only specific problem number (0-based indexing)")
+
+    # New Metal performance tuning parameters
+    parser.add_argument("--block-size", type=int, default=None,
+                        help="Block size for hierarchical updates (default: auto-scaled)")
+    parser.add_argument("--use-sparse-updates", type=lambda x: x.lower() in ('true', '1', 'yes'), default=True,
+                        help="Enable sparse incremental field updates (default: True)")
+    parser.add_argument("--timing-variance", type=float, default=0.1,
+                        help="Timing variance for P-bit updates (default: 0.1)")
+    parser.add_argument("--intensity-variance", type=float, default=0.1,
+                        help="Intensity variance for P-bit updates (default: 0.1)")
+    parser.add_argument("--offset-variance", type=float, default=0.1,
+                        help="Offset variance for P-bit updates (default: 0.1)")
+    parser.add_argument("--spins-per-block", type=int, default=96,
+                        help="Spins per block for P-bit parallel updates (default: 96)")
+    parser.add_argument("--beta-start", type=float, default=0.01,
+                        help="Starting inverse temperature for annealing (default: 0.01)")
+    parser.add_argument("--beta-end", type=float, default=15.0,
+                        help="Ending inverse temperature for annealing (default: 15.0)")
+    parser.add_argument("--max-flips-per-block", type=int, default=None,
+                        help="Maximum expected spin flips per block (default: auto-calculated)")
+
+    # New SQA convergence parameters from literature review
+    parser.add_argument("--initial-temperature", type=float, default=None,
+                        help="Initial temperature for annealing (default: auto-scaled)")
+    parser.add_argument("--temperature-decay-rate", type=float, default=None,
+                        help="Temperature decay rate per MC step (default: auto)")
+    parser.add_argument("--annealing-schedule-type", type=str, default="logspace",
+                        choices=["linear", "exponential", "cosine", "logspace"],
+                        help="Type of annealing schedule (default: logspace)")
+    parser.add_argument("--num-trotters", type=int, default=None,
+                        help="Number of trotters/replicas (default: auto from num_reads)")
+    parser.add_argument("--gamma", type=float, default=1.0,
+                        help="Transverse field strength for quantum annealing (default: 1.0)")
+    parser.add_argument("--total-annealing-steps", type=int, default=None,
+                        help="Total annealing steps (default: num_sweeps)")
+
     args = parser.parse_args()
 
-    test_metal_sampler(skip=args.skip, retry=args.retry, reads=args.reads, sweeps=args.sweeps)
+    test_metal_sampler(
+        skip=args.skip, retry=args.retry, reads=args.reads, sweeps=args.sweeps,
+        debug=args.debug, problem=args.problem, block_size=args.block_size,
+        use_sparse_updates=args.use_sparse_updates, timing_variance=args.timing_variance,
+        intensity_variance=args.intensity_variance, offset_variance=args.offset_variance,
+        spins_per_block=args.spins_per_block, beta_start=args.beta_start,
+        beta_end=args.beta_end, max_flips_per_block=args.max_flips_per_block,
+        initial_temperature=args.initial_temperature,
+        temperature_decay_rate=args.temperature_decay_rate,
+        annealing_schedule_type=args.annealing_schedule_type,
+        num_trotters=args.num_trotters,
+        gamma=args.gamma,
+        total_annealing_steps=args.total_annealing_steps
+    )
