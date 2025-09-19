@@ -762,3 +762,69 @@ kernel void tensor_optimized_coupling_field(
     );
 }
 
+
+// PROPER HIERARCHICAL BLOCK UPDATE KERNEL
+// Implements the true hierarchical strategy from the paper:
+// 1. Process one block at a time
+// 2. Update spins within block sequentially
+// 3. Only update local fields within the current block during processing
+// 4. After block completion: global field update happens separately
+kernel void hierarchical_block_update_proper(
+    device int8_t* spins [[buffer(0)]],           // R x n spin array
+    device float* local_fields [[buffer(1)]],    // R x n local field array
+    device float* random_decisions [[buffer(2)]], // R x block_size random values
+    device uint* neighbor_offsets [[buffer(3)]],  // n+1 neighbor offset array
+    device uint* neighbor_indices [[buffer(4)]],  // neighbor indices (CSR format)
+    device float* neighbor_weights [[buffer(5)]], // neighbor weights (CSR format)
+    constant float& beta [[buffer(6)]],
+    constant uint& R [[buffer(7)]],               // number of chains
+    constant uint& block_start [[buffer(8)]],     // starting spin index for this block
+    constant uint& block_size [[buffer(9)]],      // number of spins in this block
+    constant uint& n [[buffer(10)]],              // total number of spins
+    uint3 thread_position_in_grid [[thread_position_in_grid]]
+) {
+    uint chain_idx = thread_position_in_grid.x;
+    uint block_spin_idx = thread_position_in_grid.y;
+
+    if (chain_idx >= R || block_spin_idx >= block_size) return;
+
+    uint spin_idx = block_start + block_spin_idx;
+    if (spin_idx >= n) return;
+
+    uint flat_idx = chain_idx * n + spin_idx;
+
+    // Load current spin and field
+    int8_t current_spin = spins[flat_idx];
+    float current_field = local_fields[flat_idx];
+
+    // Metropolis acceptance for energy minimization
+    float delta_e = 2.0f * float(current_spin) * current_field;
+    float rand_val = random_decisions[chain_idx * block_size + block_spin_idx];
+    bool accept = (delta_e < 0.0f) || (rand_val < exp(-beta * delta_e));
+
+    if (!accept) return;
+
+    // Flip the spin
+    int8_t new_spin = -current_spin;
+    spins[flat_idx] = new_spin;
+
+    // HIERARCHICAL KEY: Only update local fields within the current block
+    // This is what makes it O(block_size) instead of O(degree) per flip
+    uint neighbor_start = neighbor_offsets[spin_idx];
+    uint neighbor_end = neighbor_offsets[spin_idx + 1];
+
+    float spin_change = 2.0f * float(current_spin); // old_spin - new_spin = 2 * old_spin
+
+    for (uint neighbor_idx = neighbor_start; neighbor_idx < neighbor_end; neighbor_idx++) {
+        uint neighbor_spin = neighbor_indices[neighbor_idx];
+
+        // HIERARCHICAL CONSTRAINT: Only update neighbors within current block
+        if (neighbor_spin >= block_start && neighbor_spin < (block_start + block_size)) {
+            float weight = neighbor_weights[neighbor_idx];
+            uint neighbor_flat_idx = chain_idx * n + neighbor_spin;
+
+            // Update neighbor's local field: field += J_ij * (old_spin - new_spin)
+            local_fields[neighbor_flat_idx] += weight * spin_change;
+        }
+    }
+}

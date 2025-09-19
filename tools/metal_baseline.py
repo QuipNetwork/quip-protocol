@@ -20,7 +20,7 @@ except ImportError:
     METAL_AVAILABLE = False
 
 
-def metal_baseline_test(timeout_minutes=10.0, output_file=None):
+def metal_baseline_test(timeout_minutes=10.0, output_file=None, sequential_block=False, recompute_fields_each_sweep=True, block_size=None):
     """Test Metal GPU performance with CPU baseline format and evaluation logic."""
     print("🔬 Metal GPU Baseline Parameter Test (Kernel-Only)")
     print("=" * 50)
@@ -51,12 +51,12 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None):
     
     # Test configurations - optimized for P-bit Metal performance
     test_configs = [
-        (64, 32, "Light P-bit"),
-        (128, 64, "Low P-bit"),
-        (256, 100, "Medium P-bit"),
-        (512, 128, "High P-bit"),
-        (1024, 150, "Very High P-bit"),
-        (2048, 200, "Max P-bit")
+        (64, 500, "Light P-bit"),      # Increased sweeps for hierarchical quality
+        (128, 750, "Low P-bit"),       # Paper uses 1000 steps for quality
+        (256, 1000, "Medium P-bit"),
+        (512, 1000, "High P-bit"),
+        (1024, 1000, "Very High P-bit"),
+        (2048, 1000, "Max P-bit")
     ]
     
     print(f"\n🧪 Testing P-bit Metal configurations:")
@@ -93,7 +93,10 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None):
                 h=h, J=J,
                 num_reads=reads,
                 num_sweeps=sweeps,
-                use_hierarchical=True
+                use_hierarchical=True,
+                block_size=block_size,
+                sequential_block=sequential_block,
+                recompute_fields_each_sweep=recompute_fields_each_sweep
             )
             runtime = time.time() - start_time
 
@@ -195,7 +198,10 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None):
                 h=h, J=J,
                 num_reads=reads,
                 num_sweeps=sweeps,
-                use_hierarchical=True
+                use_hierarchical=True,
+                block_size=block_size,
+                sequential_block=sequential_block,
+                recompute_fields_each_sweep=recompute_fields_each_sweep
             )
             runtime = time.time() - start_time
 
@@ -341,7 +347,25 @@ def main():
         action='store_true',
         help='Extended test mode (30 minute timeout)'
     )
-    
+
+    # Hierarchical algorithm control flags
+    parser.add_argument(
+        '--sequential-block',
+        action='store_true',
+        help='Use sequential (Gauss-Seidel) updates within blocks for better convergence'
+    )
+    parser.add_argument(
+        '--no-recompute-fields',
+        action='store_true',
+        help='Disable per-sweep global field recompute for performance mode'
+    )
+    parser.add_argument(
+        '--block-size',
+        type=int,
+        default=None,
+        help='Block size for hierarchical updates (default: auto-selected)'
+    )
+
     args = parser.parse_args()
     
     # Handle preset timeouts
@@ -359,7 +383,13 @@ def main():
         output_file = f"metal_baseline_results_{timestamp}.json"
     
     # Run test
-    metal_baseline_test(timeout_minutes=timeout, output_file=output_file)
+    metal_baseline_test(
+        timeout_minutes=timeout,
+        output_file=output_file,
+        sequential_block=args.sequential_block,
+        recompute_fields_each_sweep=not args.no_recompute_fields,
+        block_size=args.block_size
+    )
 
     print(f"\n✅ P-bit Metal baseline test complete!")
 

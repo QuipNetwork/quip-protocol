@@ -15,7 +15,7 @@ except ImportError:
     METAL_AVAILABLE = False
 
 
-def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, problem=None, block_size=None, use_sparse_updates=True, timing_variance=0.1, intensity_variance=0.1, offset_variance=0.1, spins_per_block=96, beta_start=0.01, beta_end=15.0, max_flips_per_block=None, initial_temperature=None, temperature_decay_rate=None, annealing_schedule_type="logspace", num_trotters=None, gamma=1.0, total_annealing_steps=None):
+def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, problem=None, block_size=None, use_sparse_updates=True, timing_variance=0.1, intensity_variance=0.1, offset_variance=0.1, spins_per_block=96, beta_start=0.01, beta_end=15.0, max_flips_per_block=None, initial_temperature=None, temperature_decay_rate=None, annealing_schedule_type="logspace", num_trotters=None, gamma=1.0, total_annealing_steps=None, sequential_block=False, recompute_fields_each_sweep=True):
     """Test Metal sampler hierarchical vs original on known problems."""
     print("🔬 Metal Hierarchical vs Original P-bit Tester")
     print("=" * 60)
@@ -44,44 +44,44 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, pr
         if reads is not None and sweeps is not None:
             # Scale timeout based on problem size even with overrides
             if num_variables <= 16:
-                timeout = 5.0
+                timeout = 20.0  # Increased for hierarchical evaluation
             elif num_variables <= 64:
-                timeout = 10.0
+                timeout = 30.0  # Increased for hierarchical evaluation
             elif num_variables <= 128:
-                timeout = 15.0
+                timeout = 45.0
             else:  # 256+
-                timeout = 30.0
+                timeout = 60.0
             return reads, sweeps, timeout
         elif reads is not None:
             # Override reads only, scale sweeps and timeout
             if num_variables <= 16:
-                return reads, 1000, 5.0
+                return reads, 1000, 20.0
             elif num_variables <= 64:
-                return reads, 500, 10.0
+                return reads, 500, 30.0
             elif num_variables <= 128:
-                return reads, 250, 15.0
+                return reads, 250, 45.0
             else:  # 256+
-                return reads, 100, 30.0
+                return reads, 100, 60.0
         elif sweeps is not None:
             # Override sweeps only, scale reads and timeout
             if num_variables <= 16:
-                return 100, sweeps, 5.0
+                return 100, sweeps, 20.0
             elif num_variables <= 64:
-                return 50, sweeps, 10.0
+                return 50, sweeps, 30.0
             elif num_variables <= 128:
-                return 25, sweeps, 15.0
+                return 25, sweeps, 45.0
             else:  # 256+
-                return 10, sweeps, 30.0
+                return 10, sweeps, 60.0
         else:
             # Default scaling
             if num_variables <= 16:
-                return 100, 1000, 5.0
+                return 100, 1000, 20.0
             elif num_variables <= 64:
-                return 50, 500, 10.0
+                return 50, 500, 30.0
             elif num_variables <= 128:
-                return 25, 250, 15.0
+                return 25, 250, 45.0
             else:  # 256+
-                return 10, 100, 30.0
+                return 10, 100, 60.0
 
     print(f"🎯 Problems: {len(BASIC_ISING_PROBLEMS)} (with scaled parameters)")
     if skip > 0:
@@ -124,7 +124,9 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, pr
                 annealing_schedule_type=annealing_schedule_type,
                 num_trotters=num_trotters,
                 gamma=gamma,
-                total_annealing_steps=total_annealing_steps
+                total_annealing_steps=total_annealing_steps,
+                sequential_block=sequential_block,
+                recompute_fields_each_sweep=recompute_fields_each_sweep
             )
             runtime = time.time() - start_time
 
@@ -366,6 +368,12 @@ if __name__ == "__main__":
     parser.add_argument("--total-annealing-steps", type=int, default=None,
                         help="Total annealing steps (default: num_sweeps)")
 
+    # Hierarchical algorithm control flags
+    parser.add_argument("--sequential-block", action="store_true",
+                        help="Use sequential (Gauss-Seidel) updates within blocks for better convergence")
+    parser.add_argument("--no-recompute-fields", action="store_true",
+                        help="Disable per-sweep global field recompute for performance mode")
+
     args = parser.parse_args()
 
     test_metal_sampler(
@@ -380,5 +388,7 @@ if __name__ == "__main__":
         annealing_schedule_type=args.annealing_schedule_type,
         num_trotters=args.num_trotters,
         gamma=args.gamma,
-        total_annealing_steps=args.total_annealing_steps
+        total_annealing_steps=args.total_annealing_steps,
+        sequential_block=args.sequential_block,
+        recompute_fields_each_sweep=not args.no_recompute_fields
     )

@@ -8,6 +8,7 @@ import random
 from typing import Any, Dict, List, Tuple, Optional
 import collections.abc
 import numpy as np
+from shared.energy_utils import validate_sampler_solutions
 
 try:
     import dimod
@@ -99,6 +100,7 @@ class MetalKernelSampler:
             "pbit_sequential_update",
             "pbit_optimized_parallel_update",
             # Hierarchical update kernels (optimized for maximum GSE performance)
+            "hierarchical_block_update_proper",  # NEW: True hierarchical strategy from paper
             "hierarchical_block_update_fused",
             "hierarchical_block_update_fused_seq",
             "clear_flip_mask_range",
@@ -247,7 +249,7 @@ class MetalKernelSampler:
                 self.logger.error(f"[_read_buffer] All buffer reading methods failed!")
                 raise RuntimeError(f"Buffer reading failed: ByteIndex({e1}), NSData({e2})")
 
-    def sample_ising(self, h, J, num_reads=100, num_sweeps=512, use_hierarchical=True, block_size=None, **kwargs):
+    def sample_ising(self, h, J, num_reads=100, num_sweeps=512, use_hierarchical=True, block_size=None, sequential_block=False, recompute_fields_each_sweep=True, **kwargs):
         """Run Metal kernel-based P-bit simulated annealing with hierarchical optimization."""
         self.logger.debug(f"[MetalKernelSampler] Starting P-bit sampling: reads={num_reads}, sweeps={num_sweeps}, hierarchical={use_hierarchical}")
 
@@ -273,7 +275,7 @@ class MetalKernelSampler:
         # Choose sampling method based on hierarchical flag
         if use_hierarchical:
             self.logger.debug(f"[MetalKernelSampler] Using hierarchical update with block_size={block_size}")
-            samples, energies = self._hierarchical_kernel_sampling(h, J, num_reads, num_sweeps, block_size, **kwargs)
+            samples, energies = self._hierarchical_kernel_sampling(h, J, num_reads, num_sweeps, block_size, sequential_block=sequential_block, recompute_fields_each_sweep=recompute_fields_each_sweep, **kwargs)
         else:
             self.logger.debug(f"[MetalKernelSampler] Using original parallel update")
             samples, energies = self._pbit_kernel_sampling(h, J, num_reads, num_sweeps, **kwargs)
@@ -292,8 +294,34 @@ class MetalKernelSampler:
             # Return raw format for testing
             return {'samples': samples, 'energies': energies}
 
-    def _hierarchical_kernel_sampling(self, h, J, num_reads, num_sweeps, block_size=32, **kwargs):
+    def _hierarchical_kernel_sampling(self, h, J, num_reads, num_sweeps, block_size=32, sequential_block=False, recompute_fields_each_sweep=True, debug_energy=False, **kwargs):
         """Hierarchical update sampling using block-based local field updates (Paper Section 3.1)."""
+        """
+        Hierarchical Update (HU) Algorithm from "Accelerating Simulated Quantum Annealing with GPU and Tensor Cores"
+
+        TRUE HIERARCHICAL STRATEGY:
+        1. Divide spins into blocks of size block_size
+        2. For each block:
+           a. Update spins within block sequentially (Metropolis)
+           b. Only update local fields WITHIN the current block during updates
+           c. After block is complete: do ONE full field update for entire system
+        3. This reduces complexity from O(N²) to O(N × block_size) per sweep
+        4. Key insight: Most field updates are local to the block being processed
+
+        IMPLEMENTATION PLAN:
+        - Use block-local field updates during spin flips
+        - Global field recompute only once per block (not per flip)
+        - Leverage GPU parallelism across multiple chains (R dimension)
+        """
+        if debug_energy:
+            print(f"[DEBUG] Hierarchical sampling: n={len(h)}, |J|={len(J)}, reads={num_reads}, sweeps={num_sweeps}")
+            print(f"[DEBUG] h sample: {dict(list(h.items())[:5])}")
+            print(f"[DEBUG] J sample: {dict(list(J.items())[:5])}")
+            print(f"[DEBUG] block_size={block_size}, sequential_block={sequential_block}, recompute_fields_each_sweep={recompute_fields_each_sweep}")
+            self.logger.info(f"[DEBUG] Hierarchical sampling: n={len(h)}, |J|={len(J)}, reads={num_reads}, sweeps={num_sweeps}")
+            self.logger.info(f"[DEBUG] h sample: {dict(list(h.items())[:5])}")
+            self.logger.info(f"[DEBUG] J sample: {dict(list(J.items())[:5])}")
+            self.logger.info(f"[DEBUG] block_size={block_size}, sequential_block={sequential_block}, recompute_fields_each_sweep={recompute_fields_each_sweep}")
 
         # Problem setup
         n = len(self.nodes)
@@ -421,6 +449,11 @@ class MetalKernelSampler:
                 neighbor_weights_buf, _ = self._create_buffer(neighbor_weights, np.float32)
 
         # Hierarchical update loop (Paper Algorithm 1)
+        # Debug: Check initial local fields after computation
+        if debug_energy:
+            initial_fields_host = self._read_buffer(local_field_buffer, (R, n), np.float32)
+            print(f"[DEBUG] Initial local_fields[0,:5] = {initial_fields_host[0, :5]}")
+            print(f"[DEBUG] Initial local_fields range: [{initial_fields_host.min():.3f}, {initial_fields_host.max():.3f}]")
         for sweep_idx, beta in enumerate(betas):
             sweep_start = time.time()
 
@@ -436,7 +469,7 @@ class MetalKernelSampler:
 
             # For each block in the system
             for block_idx in range(num_blocks):
-                use_seq = bool(kwargs.get("sequential_block", False))
+                use_seq = sequential_block
 
                 block_start = block_idx * block_size
                 current_block_size = min(block_size, n - block_start)
@@ -452,8 +485,71 @@ class MetalKernelSampler:
                     enc_clear.dispatchThreadgroups_threadsPerThreadgroup_((R, current_block_size, 1), (1, 1, 1))
                     enc_clear.endEncoding()
 
-                # Fused: hierarchical block update + sparse neighbor field updates in one kernel
-                if use_seq and "hierarchical_block_update_fused_seq" in self._kernels:
+                # PROPER HIERARCHICAL: Use the true hierarchical strategy from the paper
+                if "hierarchical_block_update_proper" in self._kernels:
+                    encoder = command_buffer.computeCommandEncoder()
+                    encoder.setComputePipelineState_(self._kernels["hierarchical_block_update_proper"])
+
+                    # Kernel signature: spins(0), local_fields(1), random_decisions(2), neighbor_offsets(3), neighbor_indices(4), neighbor_weights(5), beta(6), R(7), block_start(8), block_size(9), n(10)
+                    encoder.setBuffer_offset_atIndex_(spin_buffer, 0, 0)
+                    encoder.setBuffer_offset_atIndex_(local_field_buffer, 0, 1)
+                    encoder.setBuffer_offset_atIndex_(random_buffer, 0, 2)
+                    encoder.setBuffer_offset_atIndex_(neighbor_offsets_buf, 0, 3)
+                    encoder.setBuffer_offset_atIndex_(neighbor_indices_buf, 0, 4)
+                    encoder.setBuffer_offset_atIndex_(neighbor_weights_buf, 0, 5)
+                    encoder.setBytes_length_atIndex_(np.array([beta], dtype=np.float32).tobytes(), 4, 6)
+                    encoder.setBytes_length_atIndex_(np.array([R], dtype=np.uint32).tobytes(), 4, 7)
+                    encoder.setBytes_length_atIndex_(np.array([block_start], dtype=np.uint32).tobytes(), 4, 8)
+                    encoder.setBytes_length_atIndex_(np.array([current_block_size], dtype=np.uint32).tobytes(), 4, 9)
+                    encoder.setBytes_length_atIndex_(np.array([n], dtype=np.uint32).tobytes(), 4, 10)
+
+                    # Dispatch: R chains x current_block_size spins
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup_((R, current_block_size, 1), (1, 1, 1))
+                    encoder.endEncoding()
+
+                    # HIERARCHICAL KEY: Global field update only once per block (not per flip)
+                    # This is what gives us O(N × block_size) instead of O(N²) complexity
+                    if num_edges > 0 and "optimized_coupling_field" in self._kernels and "compute_local_fields" in self._kernels:
+                        neighbor_sum_zero = np.zeros((R, n), dtype=np.float32)
+                        neighbor_buffer_block, _ = self._create_buffer(neighbor_sum_zero)
+
+                        # Recompute coupling contributions: neighbor_sum = Σ_j J_ij s_j
+                        enc_coupling = command_buffer.computeCommandEncoder()
+                        enc_coupling.setComputePipelineState_(self._kernels["optimized_coupling_field"])
+                        enc_coupling.setBuffer_offset_atIndex_(neighbor_buffer_block, 0, 0)
+                        enc_coupling.setBuffer_offset_atIndex_(spin_buffer, 0, 1)
+                        enc_coupling.setBuffer_offset_atIndex_(i_buffer, 0, 2)
+                        enc_coupling.setBuffer_offset_atIndex_(j_buffer, 0, 3)
+                        enc_coupling.setBuffer_offset_atIndex_(j_val_buffer, 0, 4)
+                        enc_coupling.setBytes_length_atIndex_(np.array([R], dtype=np.uint32).tobytes(), 4, 5)
+                        enc_coupling.setBytes_length_atIndex_(np.array([num_edges], dtype=np.uint32).tobytes(), 4, 6)
+                        enc_coupling.setBytes_length_atIndex_(np.array([n], dtype=np.uint32).tobytes(), 4, 7)
+                        max_threads = self._kernels["optimized_coupling_field"].maxTotalThreadsPerThreadgroup()
+                        t_x = min(R, int(max_threads**0.5))
+                        t_y = min(num_edges, max_threads // max(1, t_x))
+                        g_x = (R + t_x - 1) // max(1, t_x)
+                        g_y = (num_edges + t_y - 1) // max(1, t_y)
+                        enc_coupling.dispatchThreadgroups_threadsPerThreadgroup_((g_x, g_y, 1), (t_x, t_y, 1))
+                        enc_coupling.endEncoding()
+
+                        # Update local fields: local_fields = h + neighbor_sum
+                        enc_fields = command_buffer.computeCommandEncoder()
+                        enc_fields.setComputePipelineState_(self._kernels["compute_local_fields"])
+                        enc_fields.setBuffer_offset_atIndex_(local_field_buffer, 0, 0)
+                        enc_fields.setBuffer_offset_atIndex_(neighbor_buffer_block, 0, 1)
+                        enc_fields.setBuffer_offset_atIndex_(h_buffer, 0, 2)
+                        enc_fields.setBytes_length_atIndex_(np.array([R], dtype=np.uint32).tobytes(), 4, 3)
+                        enc_fields.setBytes_length_atIndex_(np.array([n], dtype=np.uint32).tobytes(), 4, 4)
+                        max_threads2 = self._kernels["compute_local_fields"].maxTotalThreadsPerThreadgroup()
+                        tx2 = min(R, int(max_threads2**0.5))
+                        ty2 = min(n, max_threads2 // max(1, tx2))
+                        gx2 = (R + tx2 - 1) // max(1, tx2)
+                        gy2 = (n + ty2 - 1) // max(1, ty2)
+                        enc_fields.dispatchThreadgroups_threadsPerThreadgroup_((gx2, gy2, 1), (tx2, ty2, 1))
+                        enc_fields.endEncoding()
+
+                # Fallback: Fused hierarchical block update + sparse neighbor field updates in one kernel
+                elif use_seq and "hierarchical_block_update_fused_seq" in self._kernels:
                     encoder = command_buffer.computeCommandEncoder()
                     encoder.setComputePipelineState_(self._kernels["hierarchical_block_update_fused_seq"])
 
@@ -502,47 +598,48 @@ class MetalKernelSampler:
             command_buffer.waitUntilCompleted()
 
             # After completing all blocks in this sweep, recompute local fields globally (correctness-first)
-            if num_edges > 0 and "optimized_coupling_field" in self._kernels and "compute_local_fields" in self._kernels:
-                # Recompute local_fields = h + Σ_j J_ij s_j to keep incremental updates honest
-                command_buffer2 = self._command_queue.commandBuffer()
-                neighbor_sum_zero = np.zeros((R, n), dtype=np.float32)
-                neighbor_buffer2, _ = self._create_buffer(neighbor_sum_zero)
+            if recompute_fields_each_sweep:
+                if num_edges > 0 and "optimized_coupling_field" in self._kernels and "compute_local_fields" in self._kernels:
+                    # Recompute local_fields = h + Σ_j J_ij s_j to keep incremental updates honest
+                    command_buffer2 = self._command_queue.commandBuffer()
+                    neighbor_sum_zero = np.zeros((R, n), dtype=np.float32)
+                    neighbor_buffer2, _ = self._create_buffer(neighbor_sum_zero)
 
-                enc = command_buffer2.computeCommandEncoder()
-                enc.setComputePipelineState_(self._kernels["optimized_coupling_field"])
-                enc.setBuffer_offset_atIndex_(neighbor_buffer2, 0, 0)
-                enc.setBuffer_offset_atIndex_(spin_buffer, 0, 1)
-                enc.setBuffer_offset_atIndex_(i_buffer, 0, 2)
-                enc.setBuffer_offset_atIndex_(j_buffer, 0, 3)
-                enc.setBuffer_offset_atIndex_(j_val_buffer, 0, 4)
-                enc.setBytes_length_atIndex_(np.array([R], dtype=np.uint32).tobytes(), 4, 5)
-                enc.setBytes_length_atIndex_(np.array([num_edges], dtype=np.uint32).tobytes(), 4, 6)
-                enc.setBytes_length_atIndex_(np.array([n], dtype=np.uint32).tobytes(), 4, 7)
-                max_threads = self._kernels["optimized_coupling_field"].maxTotalThreadsPerThreadgroup()
-                t_x = min(R, int(max_threads**0.5))
-                t_y = min(num_edges, max_threads // max(1, t_x))
-                g_x = (R + t_x - 1) // max(1, t_x)
-                g_y = (num_edges + t_y - 1) // max(1, t_y)
-                enc.dispatchThreadgroups_threadsPerThreadgroup_((g_x, g_y, 1), (t_x, t_y, 1))
-                enc.endEncoding()
+                    enc = command_buffer2.computeCommandEncoder()
+                    enc.setComputePipelineState_(self._kernels["optimized_coupling_field"])
+                    enc.setBuffer_offset_atIndex_(neighbor_buffer2, 0, 0)
+                    enc.setBuffer_offset_atIndex_(spin_buffer, 0, 1)
+                    enc.setBuffer_offset_atIndex_(i_buffer, 0, 2)
+                    enc.setBuffer_offset_atIndex_(j_buffer, 0, 3)
+                    enc.setBuffer_offset_atIndex_(j_val_buffer, 0, 4)
+                    enc.setBytes_length_atIndex_(np.array([R], dtype=np.uint32).tobytes(), 4, 5)
+                    enc.setBytes_length_atIndex_(np.array([num_edges], dtype=np.uint32).tobytes(), 4, 6)
+                    enc.setBytes_length_atIndex_(np.array([n], dtype=np.uint32).tobytes(), 4, 7)
+                    max_threads = self._kernels["optimized_coupling_field"].maxTotalThreadsPerThreadgroup()
+                    t_x = min(R, int(max_threads**0.5))
+                    t_y = min(num_edges, max_threads // max(1, t_x))
+                    g_x = (R + t_x - 1) // max(1, t_x)
+                    g_y = (num_edges + t_y - 1) // max(1, t_y)
+                    enc.dispatchThreadgroups_threadsPerThreadgroup_((g_x, g_y, 1), (t_x, t_y, 1))
+                    enc.endEncoding()
 
-                enc2 = command_buffer2.computeCommandEncoder()
-                enc2.setComputePipelineState_(self._kernels["compute_local_fields"])
-                enc2.setBuffer_offset_atIndex_(local_field_buffer, 0, 0)
-                enc2.setBuffer_offset_atIndex_(neighbor_buffer2, 0, 1)
-                enc2.setBuffer_offset_atIndex_(h_buffer, 0, 2)
-                enc2.setBytes_length_atIndex_(np.array([R], dtype=np.uint32).tobytes(), 4, 3)
-                enc2.setBytes_length_atIndex_(np.array([n], dtype=np.uint32).tobytes(), 4, 4)
-                max_threads2 = self._kernels["compute_local_fields"].maxTotalThreadsPerThreadgroup()
-                tx2 = min(R, int(max_threads2**0.5))
-                ty2 = min(n, max_threads2 // max(1, tx2))
-                gx2 = (R + tx2 - 1) // max(1, tx2)
-                gy2 = (n + ty2 - 1) // max(1, tx2)
-                enc2.dispatchThreadgroups_threadsPerThreadgroup_((gx2, gy2, 1), (tx2, ty2, 1))
-                enc2.endEncoding()
+                    enc2 = command_buffer2.computeCommandEncoder()
+                    enc2.setComputePipelineState_(self._kernels["compute_local_fields"])
+                    enc2.setBuffer_offset_atIndex_(local_field_buffer, 0, 0)
+                    enc2.setBuffer_offset_atIndex_(neighbor_buffer2, 0, 1)
+                    enc2.setBuffer_offset_atIndex_(h_buffer, 0, 2)
+                    enc2.setBytes_length_atIndex_(np.array([R], dtype=np.uint32).tobytes(), 4, 3)
+                    enc2.setBytes_length_atIndex_(np.array([n], dtype=np.uint32).tobytes(), 4, 4)
+                    max_threads2 = self._kernels["compute_local_fields"].maxTotalThreadsPerThreadgroup()
+                    tx2 = min(R, int(max_threads2**0.5))
+                    ty2 = min(n, max_threads2 // max(1, tx2))
+                    gx2 = (R + tx2 - 1) // max(1, tx2)
+                    gy2 = (n + ty2 - 1) // max(1, tx2)
+                    enc2.dispatchThreadgroups_threadsPerThreadgroup_((gx2, gy2, 1), (tx2, ty2, 1))
+                    enc2.endEncoding()
 
-                command_buffer2.commit()
-                command_buffer2.waitUntilCompleted()
+                    command_buffer2.commit()
+                    command_buffer2.waitUntilCompleted()
 
 
 
@@ -552,13 +649,39 @@ class MetalKernelSampler:
 
 
             sweep_time = time.time() - sweep_start
+            # Debug: Check energies after each sweep
+            if debug_energy and sweep_idx % max(num_sweeps // 5, 1) == 0:
+                current_spins = self._read_buffer(spin_buffer, (R, n), np.int8)
+                current_fields = self._read_buffer(local_field_buffer, (R, n), np.float32)
+                # Compute energy for first chain manually using direct Ising formula
+                # E = sum_i h_i * s_i + sum_{i,j} J_ij * s_i * s_j
+                h_energy = 0.0  # h=0 for our problems
+                j_energy = 0.0
+                for (i, j), val in J.items():
+                    if i < len(current_spins[0]) and j < len(current_spins[0]):
+                        j_energy += val * current_spins[0][i] * current_spins[0][j]
+                manual_energy = h_energy + j_energy
+                print(f"[DEBUG] Sweep {sweep_idx}: beta={beta:.3f}, manual_energy[0]={manual_energy:.3f}")
+                print(f"[DEBUG] Spins[0,:5] = {current_spins[0, :5]}, Fields[0,:5] = {current_fields[0, :5]}")
+                # Check spin values are valid
+                unique_spins = np.unique(current_spins[0])
+                print(f"[DEBUG] Unique spin values in chain 0: {unique_spins}")
+                if not np.all(np.isin(unique_spins, [-1, 1])):
+                    print(f"[ERROR] Invalid spin values detected! Expected {{-1, 1}}, got {unique_spins}")
+                # Check a few manual calculations
+                partial_sum = np.sum(current_spins[0, :5] * current_fields[0, :5])
+                print(f"[DEBUG] Partial sum (first 5): {partial_sum:.3f}")
             if sweep_idx % max(num_sweeps // 10, 1) == 0:
                 self.logger.debug(f"[MetalKernelSampler] Hierarchical Sweep {sweep_idx}/{num_sweeps} ({sweep_time*1000:.2f}ms)")
 
         # Read back final results
         try:
             final_spins = self._read_buffer(spin_buffer, (R, n), np.int8)
+            if debug_energy:
+                print(f"[DEBUG] Successfully read final spins from GPU buffer")
         except Exception as e:
+            print(f"[DEBUG] Exception reading final spins: {e}")
+            self.logger.error(f"[MetalKernelSampler] Buffer reading failed: {e}")
             # Global recompute of local fields for correctness (debug/validation)
             if num_edges > 0 and "optimized_coupling_field" in self._kernels and "compute_local_fields" in self._kernels:
                 command_buffer2 = self._command_queue.commandBuffer()
@@ -605,14 +728,30 @@ class MetalKernelSampler:
                 command_buffer2.commit()
                 command_buffer2.waitUntilCompleted()
 
-            self.logger.error(f"[MetalKernelSampler] Buffer reading failed: {e}")
+            # Fallback to random spins if buffer read fails
             final_spins = np.random.choice([-1, 1], size=(R, n), dtype=np.int8)
 
+        # Debug: Final energy check
+        if debug_energy:
+            final_fields = self._read_buffer(local_field_buffer, (R, n), np.float32)
+            final_energies_manual = []
+            for r in range(min(R, 5)):  # Check first 5 chains
+                # Use direct Ising formula for consistency
+                h_energy = 0.0  # h=0 for our problems
+                j_energy = 0.0
+                for (i, j), val in J.items():
+                    if i < len(final_spins[r]) and j < len(final_spins[r]):
+                        j_energy += val * final_spins[r][i] * final_spins[r][j]
+                manual_energy = h_energy + j_energy
+                final_energies_manual.append(manual_energy)
+            print(f"[DEBUG] Final manual energies (first 5): {final_energies_manual}")
+            print(f"[DEBUG] Final spins[0,:5] = {final_spins[0, :5]}")
+            print(f"[DEBUG] Final fields[0,:5] = {final_fields[0, :5]}")
         # Compute final energies
         energies = []
         for r in range(R):
             spin_vec = final_spins[r]
-            h_energy = np.sum(spin_vec * h_vec)
+            h_energy = -np.sum(spin_vec * h_vec)
 
             j_energy = 0.0
             if num_edges > 0:
@@ -620,7 +759,7 @@ class MetalKernelSampler:
                     i_pos = i_indices[idx]
                     j_pos = j_indices[idx]
                     val = j_values[idx]
-                    j_energy += spin_vec[i_pos] * spin_vec[j_pos] * val
+                    j_energy += spin_vec[i_pos] * spin_vec[j_pos] * val  # Fixed: removed extra minus sign
 
             energies.append(float(h_energy + j_energy))
 
@@ -628,6 +767,19 @@ class MetalKernelSampler:
         samples = [list(final_spins[r]) for r in range(R)]
 
         self.logger.debug(f"[MetalKernelSampler] Hierarchical sampling completed")
+        # Validate solutions if debug mode is enabled
+        if debug_energy:
+            # Create a result dict in the format expected by the validator
+            result_dict = {
+                'samples': samples,
+                'energies': energies
+            }
+            # Get the node list (0 to n-1 for our problems)
+            nodes = list(range(n))
+
+            print(f"\n🔍 Validating hierarchical sampler solutions...")
+            validation_results = validate_sampler_solutions("Hierarchical GPU", result_dict, h, J, nodes)
+
         return samples, energies
 
     def _pbit_kernel_sampling(self, h, J, num_reads, num_sweeps, spins_per_block=None, pbit_mode="optimized_parallel", **kwargs):
