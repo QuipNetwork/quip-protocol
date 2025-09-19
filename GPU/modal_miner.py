@@ -4,6 +4,8 @@ from __future__ import annotations
 import multiprocessing
 import multiprocessing.synchronize
 import random
+import signal
+import sys
 import time
 from typing import Optional
 
@@ -21,6 +23,40 @@ class ModalMiner(BaseMiner):
         sampler = ModalSampler(gpu_type)
         super().__init__(miner_id, sampler)
         self.miner_type = f"GPU-{gpu_type.upper()}"
+        self.gpu_type = gpu_type
+        
+        # Register SIGTERM handler for graceful cleanup
+        signal.signal(signal.SIGTERM, self._cleanup_handler)
+    
+    def _cleanup_handler(self, signum, frame):
+        """Handle SIGTERM signal for graceful cleanup of Modal cloud resources."""
+        if hasattr(self, 'logger'):
+            self.logger.info(f"Modal miner {self.miner_id} received SIGTERM, cleaning up cloud GPU resources ({self.gpu_type})...")
+        
+        # Modal-specific cleanup
+        try:
+            # Terminate any running Modal functions
+            if hasattr(self, 'sampler') and hasattr(self.sampler, 'cleanup'):
+                self.sampler.cleanup()
+                if hasattr(self, 'logger'):
+                    self.logger.info("Modal functions terminated")
+            
+            # Close Modal connections/sessions
+            if hasattr(self, 'sampler') and hasattr(self.sampler, 'close'):
+                self.sampler.close()
+                if hasattr(self, 'logger'):
+                    self.logger.info("Modal connections closed")
+            
+            # Clear any cached data
+            if hasattr(self, 'top_attempts'):
+                self.top_attempts.clear()
+                
+        except Exception as e:
+            if hasattr(self, 'logger'):
+                self.logger.error(f"Error during Modal miner cleanup: {e}")
+        
+        # Exit gracefully
+        sys.exit(0)
         
     def mine_block(
         self,

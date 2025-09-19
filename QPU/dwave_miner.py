@@ -4,6 +4,8 @@ from __future__ import annotations
 import multiprocessing
 import multiprocessing.synchronize
 import random
+import signal
+import sys
 import time
 from typing import Optional, cast, Mapping, Tuple, Any
 
@@ -27,6 +29,39 @@ class DWaveMiner(BaseMiner):
         # QPU rate limiting configuration (hard-coded for now)
         self.qpu_timeout = 360.0  # Minimum 60 seconds between QPU attempts
         self.last_qpu_attempt_time = 0.0  # Track last QPU sampling time
+        
+        # Register SIGTERM handler for graceful cleanup
+        signal.signal(signal.SIGTERM, self._cleanup_handler)
+    
+    def _cleanup_handler(self, signum, frame):
+        """Handle SIGTERM signal for graceful cleanup of QPU resources."""
+        if hasattr(self, 'logger'):
+            self.logger.info(f"QPU miner {self.miner_id} received SIGTERM, cleaning up D-Wave resources...")
+        
+        # QPU-specific cleanup
+        try:
+            # Cancel any running D-Wave jobs
+            if hasattr(self, 'sampler') and hasattr(self.sampler, 'cancel_jobs'):
+                self.sampler.cancel_jobs()
+                if hasattr(self, 'logger'):
+                    self.logger.info("D-Wave jobs cancelled")
+            
+            # Close D-Wave connections
+            if hasattr(self, 'sampler') and hasattr(self.sampler, 'close'):
+                self.sampler.close()
+                if hasattr(self, 'logger'):
+                    self.logger.info("D-Wave connections closed")
+            
+            # Clear any cached data
+            if hasattr(self, 'top_attempts'):
+                self.top_attempts.clear()
+                
+        except Exception as e:
+            if hasattr(self, 'logger'):
+                self.logger.error(f"Error during QPU miner cleanup: {e}")
+        
+        # Exit gracefully
+        sys.exit(0)
         
     def mine_block(
         self,

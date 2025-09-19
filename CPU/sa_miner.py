@@ -5,6 +5,8 @@ import math
 import multiprocessing
 import multiprocessing.synchronize
 import random
+import signal
+import sys
 import time
 from typing import Optional
 
@@ -21,6 +23,31 @@ class SimulatedAnnealingMiner(BaseMiner):
         self.edges = sampler.edges
         super().__init__(miner_id, sampler)
         self.miner_type = "CPU"
+        
+        # Register SIGTERM handler for graceful cleanup
+        signal.signal(signal.SIGTERM, self._cleanup_handler)
+    
+    def _cleanup_handler(self, signum, frame):
+        """Handle SIGTERM signal for graceful cleanup of CPU resources."""
+        if hasattr(self, 'logger'):
+            self.logger.info(f"CPU miner {self.miner_id} received SIGTERM, cleaning up...")
+        
+        # CPU-specific cleanup
+        try:
+            # Reset any persistent library state
+            if hasattr(self, 'sampler') and hasattr(self.sampler, 'cleanup'):
+                self.sampler.cleanup()
+            
+            # Clear any cached data
+            if hasattr(self, 'top_attempts'):
+                self.top_attempts.clear()
+                
+        except Exception as e:
+            if hasattr(self, 'logger'):
+                self.logger.error(f"Error during CPU miner cleanup: {e}")
+        
+        # Exit gracefully
+        sys.exit(0)
         
     def mine_block(
         self,

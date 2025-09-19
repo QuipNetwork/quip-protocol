@@ -4,6 +4,7 @@ from __future__ import annotations
 import multiprocessing
 import multiprocessing.synchronize
 import random
+import signal
 import sys
 import time
 from typing import Optional
@@ -28,6 +29,58 @@ class CudaMiner(BaseMiner):
         # Now update sampler with our logger
         sampler.logger = self.logger
         self.miner_type = f"GPU-LOCAL:{device}"
+        self.device = device
+        
+        # Register SIGTERM handler for graceful cleanup
+        signal.signal(signal.SIGTERM, self._cleanup_handler)
+    
+    def _cleanup_handler(self, signum, frame):
+        """Handle SIGTERM signal for graceful cleanup of CUDA resources."""
+        if hasattr(self, 'logger'):
+            self.logger.info(f"CUDA miner {self.miner_id} received SIGTERM, cleaning up GPU device {self.device}...")
+        
+        # CUDA-specific cleanup
+        try:
+            # Import CUDA modules for cleanup
+            try:
+                import cupy as cp
+                # Reset CUDA device to free all memory and contexts
+                cp.cuda.Device(int(self.device)).use()
+                cp.cuda.runtime.deviceReset()
+                if hasattr(self, 'logger'):
+                    self.logger.info(f"CUDA device {self.device} reset completed")
+            except ImportError:
+                # Try alternative CUDA cleanup if CuPy not available
+                try:
+                    import pycuda.driver as cuda
+                    # Initialize CUDA if not already done
+                    if not hasattr(cuda, '_initialized') or not cuda._initialized:
+                        cuda.init()
+                    # Get device and reset
+                    device = cuda.Device(int(self.device))
+                    context = device.make_context()
+                    context.pop()
+                    context.detach()
+                    if hasattr(self, 'logger'):
+                        self.logger.info(f"PyCUDA device {self.device} context cleanup completed")
+                except ImportError:
+                    if hasattr(self, 'logger'):
+                        self.logger.warning("No CUDA library available for device reset")
+            
+            # Clear any cached data
+            if hasattr(self, 'top_attempts'):
+                self.top_attempts.clear()
+            
+            # Reset sampler state if possible
+            if hasattr(self, 'sampler') and hasattr(self.sampler, 'cleanup'):
+                self.sampler.cleanup()
+                
+        except Exception as e:
+            if hasattr(self, 'logger'):
+                self.logger.error(f"Error during CUDA miner cleanup: {e}")
+        
+        # Exit gracefully
+        sys.exit(0)
         
     def mine_block(
         self,

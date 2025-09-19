@@ -4,6 +4,7 @@ from __future__ import annotations
 import multiprocessing
 import multiprocessing.synchronize
 import random
+import signal
 import sys
 import time
 from typing import Optional
@@ -42,6 +43,44 @@ class MetalMiner(BaseMiner):
             self.miner_type = "CPU-FALLBACK"
             # Now we can use logger
             self.logger.warning(f"Metal GPU initialization failed, falling back to CPU: {e}")
+        
+        # Register SIGTERM handler for graceful cleanup
+        signal.signal(signal.SIGTERM, self._cleanup_handler)
+    
+    def _cleanup_handler(self, signum, frame):
+        """Handle SIGTERM signal for graceful cleanup of Metal/MPS resources."""
+        if hasattr(self, 'logger'):
+            self.logger.info(f"Metal miner {self.miner_id} received SIGTERM, cleaning up MPS resources...")
+        
+        # Metal/MPS-specific cleanup
+        try:
+            # Release MPS command buffers and memory
+            if self.miner_type == "GPU-MPS":
+                try:
+                    import torch
+                    if torch.backends.mps.is_available():
+                        # Clear MPS cache
+                        torch.mps.empty_cache()
+                        if hasattr(self, 'logger'):
+                            self.logger.info("MPS cache cleared")
+                except ImportError:
+                    if hasattr(self, 'logger'):
+                        self.logger.warning("PyTorch not available for MPS cleanup")
+            
+            # Clear any cached data
+            if hasattr(self, 'top_attempts'):
+                self.top_attempts.clear()
+            
+            # Reset sampler state if possible
+            if hasattr(self, 'sampler') and hasattr(self.sampler, 'cleanup'):
+                self.sampler.cleanup()
+                
+        except Exception as e:
+            if hasattr(self, 'logger'):
+                self.logger.error(f"Error during Metal miner cleanup: {e}")
+        
+        # Exit gracefully
+        sys.exit(0)
         
     def mine_block(
         self,
