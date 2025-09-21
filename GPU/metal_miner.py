@@ -31,11 +31,13 @@ class MetalMiner(BaseMiner):
             sampler.logger = self.logger
             self.miner_type = "GPU-MPS"
 
-            # Extract hierarchical configuration
-            self.use_hierarchical = cfg.get('use_hierarchical', True)  # Default to hierarchical mode
-            self.block_size = cfg.get('block_size', None)  # Auto-select optimal block size
+            # Extract Parallel Tempering configuration
+            self.num_replicas = cfg.get('num_replicas', None)  # Auto-select based on num_reads
+            self.swap_interval = cfg.get('swap_interval', 15)  # Replica exchange frequency
+            self.T_min = cfg.get('T_min', 0.1)  # Minimum temperature
+            self.T_max = cfg.get('T_max', 5.0)  # Maximum temperature
 
-            self.logger.info(f"Using MetalSampler (MPS) - Hierarchical: {self.use_hierarchical}, Block Size: {self.block_size}")
+            self.logger.info(f"Using MetalSampler (Parallel Tempering) - Replicas: {self.num_replicas}, T=[{self.T_min}, {self.T_max}]")
         except Exception as e:
             # For fallback case, we can't use logger yet since super().__init__() wasn't called
             sampler = SimulatedAnnealingStructuredSampler()
@@ -183,7 +185,10 @@ class MetalMiner(BaseMiner):
                     'J': J,
                     'num_reads': num_reads,
                     'num_sweeps': num_sweeps,
-                    'use_hierarchical': self.use_hierarchical,
+                    'num_replicas': self.num_replicas,
+                    'swap_interval': self.swap_interval,
+                    'T_min': self.T_min,
+                    'T_max': self.T_max,
                     'block_size': self.block_size
                 }
                 

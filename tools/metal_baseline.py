@@ -20,13 +20,44 @@ except ImportError:
     METAL_AVAILABLE = False
 
 
-def metal_baseline_test(timeout_minutes=10.0, output_file=None, sequential_block=False, recompute_fields_each_sweep=True, block_size=None):
+def create_large_problem(size=4593):
+    """Create a large Ising problem to test memory usage."""
+    # Create a problem with specified size that approximates the topology used in production
+    num_vars = size
+    
+    # Create a grid-like structure with some random couplings to make it more interesting
+    h = {i: 0.0 for i in range(num_vars)}
+    
+    # Create a pattern that mimics real-world quantum annealing problems
+    J = {}
+    
+    # Add some grid-like couplings (simplified)
+    for i in range(num_vars):
+        # Connect to neighbors in a grid pattern (simplified)
+        if i + 1 < num_vars:
+            J[(i, i+1)] = -1.0
+        if i + 64 < num_vars:  # Connect to row below (approximate grid)
+            J[(i, i+64)] = -1.0
+    
+    # Add some random couplings to make it more complex
+    import random
+    for _ in range(1000):  # Add some random couplings  
+        i = random.randint(0, num_vars - 1)
+        j = random.randint(0, num_vars - 1)
+        if i != j and (i,j) not in J and (j,i) not in J:
+            # Use a small random coupling value
+            J[(i, j)] = random.uniform(-1.0, 1.0)
+    
+    return h, J
+
+
+def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=None, swap_interval=15, T_min=0.1, T_max=5.0, large_problem=False):
     """Test Metal GPU performance with CPU baseline format and evaluation logic."""
     print("🔬 Metal GPU Baseline Parameter Test (Kernel-Only)")
     print("=" * 50)
     print(f"⏰ Timeout: {timeout_minutes} minutes")
 
-    # Use P-bit Metal kernel sampler
+    # Use Metal Parallel Tempering kernel sampler
     metal_sampler = None
     sampler_type = "unknown"
 
@@ -35,31 +66,46 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, sequential_block
             metal_sampler = MetalKernelDimodSampler("mps")
             nodes = metal_sampler.nodes
             edges = metal_sampler.edges
-            sampler_type = "pbit-metal"
-            print("✅ Metal P-bit kernel sampler ready (native Metal acceleration)")
+            sampler_type = "metal-pt"
+            print("✅ Metal Parallel Tempering sampler ready (native Metal acceleration)")
         except Exception as e:
-            print(f"❌ Metal P-bit sampler failed: {e}")
+            print(f"❌ Metal Parallel Tempering sampler failed: {e}")
             return None
     else:
-        print("❌ Metal P-bit sampler not available")
+        print("❌ Metal Parallel Tempering sampler not available")
         return None
 
-    # Initial problem setup to show problem size
-    seed = 12345  # Fixed seed for reproducible results
-    h, J = generate_ising_model_from_nonce(seed, nodes, edges)
+    # Choose problem size
+    if large_problem:
+        print("🧪 Using large 4593-variable problem for memory testing")
+        h, J = create_large_problem(4593)
+    else:
+        # Initial problem setup to show problem size
+        seed = 12345  # Fixed seed for reproducible results
+        h, J = generate_ising_model_from_nonce(seed, nodes, edges)
+    
     print(f"📊 Problem: {len(h)} variables, {len(J)} couplings")
     
-    # Test configurations - optimized for P-bit Metal performance
-    test_configs = [
-        (64, 500, "Light P-bit"),      # Increased sweeps for hierarchical quality
-        (128, 750, "Low P-bit"),       # Paper uses 1000 steps for quality
-        (256, 1000, "Medium P-bit"),
-        (512, 1000, "High P-bit"),
-        (1024, 1000, "Very High P-bit"),
-        (2048, 1000, "Max P-bit")
-    ]
+    # Test configurations - optimized for Metal Parallel Tempering performance
+    if large_problem:
+        # For memory testing with larger problems, use more aggressive configurations
+        test_configs = [
+            (512, 32, "Small Large PT"),      # Start with smaller sweep count for memory testing
+            (1024, 32, "Medium Large PT"),
+            (2048, 32, "Large PT"),
+        ]
+    else:
+        # Standard configurations for small problems
+        test_configs = [
+            (64, 500, "Light PT"),      # Increased sweeps for PT quality
+            (128, 750, "Low PT"),       # Paper uses 1000 steps for quality
+            (256, 1000, "Medium PT"),
+            (512, 1000, "High PT"),
+            (1024, 1000, "Very High PT"),
+            (2048, 1000, "Max PT")
+        ]
     
-    print(f"\n🧪 Testing P-bit Metal configurations:")
+    print(f"\n🧪 Testing Metal Parallel Tempering configurations:")
     
     results = {
         'timeout_minutes': timeout_minutes,
@@ -67,7 +113,7 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, sequential_block
         'problem_info': {
             'num_variables': len(h),
             'num_couplings': len(J),
-            'seed': seed
+            'seed': 12345 if not large_problem else "large_problem"
         },
         'tests': []
     }
@@ -85,18 +131,23 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, sequential_block
 
         try:
             # Generate the Ising model first (like the real miners do)
-            nonce = random.randint(0, 2**32 - 1)
-            h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+            if large_problem:
+                # For large problems, we want to make sure they're deterministic
+                nonce = 1234567890  # Fixed for reproducible large problem tests
+                h, J = create_large_problem(4593)
+            else:
+                nonce = random.randint(0, 2**32 - 1)
+                h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
 
             start_time = time.time()
             sampleset = metal_sampler.sample_ising(
                 h=h, J=J,
                 num_reads=reads,
                 num_sweeps=sweeps,
-                use_hierarchical=True,
-                block_size=block_size,
-                sequential_block=sequential_block,
-                recompute_fields_each_sweep=recompute_fields_each_sweep
+                num_replicas=num_replicas,
+                swap_interval=swap_interval,
+                T_min=T_min,
+                T_max=T_max
             )
             runtime = time.time() - start_time
 
@@ -193,15 +244,16 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, sequential_block
             break
 
         try:
+            # Second run with same parameters (duplicate for testing)
             start_time = time.time()
             sampleset = metal_sampler.sample_ising(
                 h=h, J=J,
                 num_reads=reads,
                 num_sweeps=sweeps,
-                use_hierarchical=True,
-                block_size=block_size,
-                sequential_block=sequential_block,
-                recompute_fields_each_sweep=recompute_fields_each_sweep
+                num_replicas=num_replicas,
+                swap_interval=swap_interval,
+                T_min=T_min,
+                T_max=T_max
             )
             runtime = time.time() - start_time
 
@@ -299,7 +351,7 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, sequential_block
     
     # Summary (same as CPU)
     total_runtime = time.time() - total_start_time
-    print(f"\n📊 P-bit Metal Baseline Summary (total time: {total_runtime/60:.1f} min):")
+    print(f"\n📊 Parallel Tempering Metal Baseline Summary (total time: {total_runtime/60:.1f} min):")
     print("=" * 50)
     
     if results['tests']:
@@ -325,7 +377,7 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, sequential_block
 
 def main():
     """Main function with command line argument parsing."""
-    parser = argparse.ArgumentParser(description='P-bit Metal GPU baseline parameter testing tool')
+    parser = argparse.ArgumentParser(description='Parallel Tempering Metal GPU baseline parameter testing tool')
     parser.add_argument(
         '--timeout', '-t', 
         type=float, 
@@ -347,23 +399,36 @@ def main():
         action='store_true',
         help='Extended test mode (30 minute timeout)'
     )
+    parser.add_argument(
+        '--large-problem',
+        action='store_true',
+        help='Use large 4593-variable problem for memory testing'
+    )
 
-    # Hierarchical algorithm control flags
+    # Parallel Tempering algorithm control flags
     parser.add_argument(
-        '--sequential-block',
-        action='store_true',
-        help='Use sequential (Gauss-Seidel) updates within blocks for better convergence'
-    )
-    parser.add_argument(
-        '--no-recompute-fields',
-        action='store_true',
-        help='Disable per-sweep global field recompute for performance mode'
-    )
-    parser.add_argument(
-        '--block-size',
+        '--num-replicas',
         type=int,
         default=None,
-        help='Block size for hierarchical updates (default: auto-selected)'
+        help='Number of temperature replicas (default: auto-selected based on num_reads)'
+    )
+    parser.add_argument(
+        '--swap-interval',
+        type=int,
+        default=15,
+        help='Steps between replica exchanges (default: 15)'
+    )
+    parser.add_argument(
+        '--T-min',
+        type=float,
+        default=0.1,
+        help='Minimum temperature (default: 0.1)'
+    )
+    parser.add_argument(
+        '--T-max',
+        type=float,
+        default=5.0,
+        help='Maximum temperature (default: 5.0)'
     )
 
     args = parser.parse_args()
@@ -386,12 +451,14 @@ def main():
     metal_baseline_test(
         timeout_minutes=timeout,
         output_file=output_file,
-        sequential_block=args.sequential_block,
-        recompute_fields_each_sweep=not args.no_recompute_fields,
-        block_size=args.block_size
+        num_replicas=args.num_replicas,
+        swap_interval=args.swap_interval,
+        T_min=args.T_min,
+        T_max=args.T_max,
+        large_problem=args.large_problem
     )
 
-    print(f"\n✅ P-bit Metal baseline test complete!")
+    print(f"\n✅ Parallel Tempering Metal baseline test complete!")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Metal P-bit GPU sampler for quantum blockchain mining."""
+"""3D Edwards-Anderson Metal Parallel Tempering GPU sampler."""
 
 import logging
 from typing import Optional
@@ -7,35 +7,41 @@ from .metal_kernel_sampler import MetalKernelDimodSampler
 
 
 class MetalSampler:
-    """Metal P-bit GPU sampler using native Metal kernels."""
-    
+    """3D Edwards-Anderson Metal Parallel Tempering GPU sampler using native Metal kernels."""
+
     def __init__(self, device: str = "mps", logger: Optional[logging.Logger] = None):
         self.logger = logger or logging.getLogger(__name__)
-        self.sampler_type = "metal_pbit"
-        
-        # Use the new P-bit Metal kernel sampler
+        self.sampler_type = "metal_ea_3d"
+
+        # Use the 3D Edwards-Anderson Metal kernel sampler
         self._kernel_sampler = MetalKernelDimodSampler(device, logger)
-        
+
         # Expose properties for compatibility
         self.nodes = self._kernel_sampler.nodes
         self.edges = self._kernel_sampler.edges
         self.nodelist = self.nodes
         self.edgelist = self.edges
-        self.properties = self._kernel_sampler.properties
-        
-        self.logger.info(f"[MetalSampler] Initialized P-bit Metal sampler with {len(self.nodes)} nodes")
-    
-    def sample_ising(self, h, J, num_reads=100, num_sweeps=512, use_hierarchical=True, block_size=None, timing_variance=0.1, intensity_variance=0.1, offset_variance=0.1, spins_per_block=96, beta_start=0.01, beta_end=15.0, max_flips_per_block=None, **kwargs):
-        """Run P-bit Metal kernel-based simulated annealing with hierarchical optimization."""
-        self.logger.debug(f"[MetalSampler] Starting P-bit sampling: reads={num_reads}, sweeps={num_sweeps}, hierarchical={use_hierarchical}")
+        self.properties = getattr(self._kernel_sampler, 'properties', {})
 
-        # Use the P-bit kernel sampler with hierarchical optimization
-        return self._kernel_sampler.sample_ising(h, J, num_reads=num_reads, num_sweeps=num_sweeps, use_hierarchical=use_hierarchical, block_size=block_size, timing_variance=timing_variance, intensity_variance=intensity_variance, offset_variance=offset_variance, spins_per_block=spins_per_block, beta_start=beta_start, beta_end=beta_end, max_flips_per_block=max_flips_per_block, **kwargs)
-    
+        self.logger.info(f"[MetalSampler] Initialized 3D Edwards-Anderson Metal sampler with {len(self.nodes)} nodes")
+
+    def sample_ising(self, h, J, num_reads=256, num_sweeps=100000, num_replicas=None,
+                     swap_interval=15, cooling_interval=500, T_min=0.1, T_max=5.0,
+                     cooling_factor=0.999, **kwargs):
+        """Run 3D Edwards-Anderson Parallel Tempering sampling."""
+        self.logger.debug(f"[MetalSampler] Starting EA PT sampling: reads={num_reads}, sweeps={num_sweeps}")
+
+        # Use the 3D Edwards-Anderson kernel sampler
+        return self._kernel_sampler.sample_ising(
+            h, J, num_reads=num_reads, num_sweeps=num_sweeps, num_replicas=num_replicas,
+            swap_interval=swap_interval, cooling_interval=cooling_interval,
+            T_min=T_min, T_max=T_max, cooling_factor=cooling_factor, **kwargs
+        )
+
     def close(self):
         """Clean up Metal resources."""
         if hasattr(self, '_kernel_sampler'):
             self._kernel_sampler.close()
-    
+
     def __del__(self):
         self.close()
