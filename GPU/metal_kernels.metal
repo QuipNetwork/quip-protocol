@@ -101,6 +101,59 @@ kernel void ea_spin_flip_kernel(
     }
 }
 
+// Parallel spin flip kernel using 2D grid (replicas × spins) with double-buffering
+kernel void ea_parallel_spin_flip_kernel(
+    device const int8_t* replica_spins_src [[buffer(0)]], // [num_replicas * N] source spins (read-only)
+    device int8_t* replica_spins_dst [[buffer(1)]],       // [num_replicas * N] destination spins (write-only)
+    device const int* csr_row_ptr [[buffer(2)]],          // [N+1] CSR row pointers
+    device const int* csr_col_ind [[buffer(3)]],          // [nnz] CSR column indices
+    device const int8_t* csr_J_vals [[buffer(4)]],        // [nnz] CSR coupling values (sign only)
+    device const Temperatures* temperatures [[buffer(5)]], // [1] temperature array
+    device const GlobalData* global [[buffer(6)]],        // [1] global parameters
+    uint3 thread_id [[thread_position_in_grid]]
+) {
+    uint replica_id = thread_id.x;
+    uint spin_idx = thread_id.y;
+
+    if (replica_id >= (uint)global->num_replicas || spin_idx >= (uint)global->N) return;
+
+    int N = global->N;
+    float beta = 1.0f / temperatures->T[replica_id];
+
+    // Read from source buffer
+    device const int8_t* src_spins = &replica_spins_src[replica_id * N];
+    device int8_t* dst_spins = &replica_spins_dst[replica_id * N];
+
+    int8_t s_i = src_spins[spin_idx];
+
+    // Compute sum of J_ij * s_j for neighbors of spin i using CSR
+    float sum = 0.0f;
+    int start = csr_row_ptr[spin_idx];
+    int end = csr_row_ptr[spin_idx + 1];
+
+    for (int p = start; p < end; ++p) {
+        int j = csr_col_ind[p];
+        int8_t Jij = csr_J_vals[p];
+        sum += float(Jij) * float(src_spins[j]);  // Read from source
+    }
+
+    // ΔE = 2 s_i * sum_j J_ij s_j
+    float delta_E = 2.0f * float(s_i) * sum;
+
+    // Metropolis acceptance
+    bool accept = (delta_E <= 0.0f);
+    if (!accept) {
+        // Use unique thread ID for randomness (replica_id, spin_idx, step)
+        uint seed = replica_id * 12345u + spin_idx * 67890u + global->step * 98765u;
+        uint random_val = xorshift(seed);
+        float rand_val = float(random_val) / float(UINT_MAX);
+        accept = (rand_val < exp(-beta * delta_E));
+    }
+
+    // Write to destination buffer
+    dst_spins[spin_idx] = accept ? -s_i : s_i;
+}
+
 // Compute energies using CSR adjacency (avoid double counting via j>i)
 kernel void ea_compute_energies_kernel(
     device const int8_t* replica_spins [[buffer(0)]],     // [num_replicas * N] spins (flattened)
@@ -133,7 +186,7 @@ kernel void ea_compute_energies_kernel(
             if (j > i) {
                 int8_t Jij = csr_J_vals[p];
                 int8_t s_j = spins[j];
-                total_energy -= Jij * s_i * s_j;  // count each undirected edge once
+                total_energy += Jij * s_i * s_j;  // Standard Ising Hamiltonian: H = ∑ Jij si sj
             }
         }
     }

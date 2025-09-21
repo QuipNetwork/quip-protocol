@@ -50,7 +50,7 @@ for idx, (h, J, optimal_energy, description) in enumerate(BASIC_ISING_PROBLEMS):
         EA_COMPATIBLE_PROBLEMS.append((idx, h, J, optimal_energy, description))
 
 
-def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, problem=None, num_replicas=None, swap_interval=15, T_min=0.1, T_max=5.0, cooling_factor=0.999, spin_updates_per_sweep=None, synthetic_regular_n=None, synthetic_regular_degree=None):
+def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, problem=None, num_replicas=None, swap_interval=15, T_min=0.1, T_max=5.0, cooling_factor=0.999, spin_updates_per_sweep=None, parallel_spin_updates=True, synthetic_regular_n=None, synthetic_regular_degree=None):
     """Test Metal Parallel Tempering sampler on EA-compatible problems only."""
     print("🔬 Metal Parallel Tempering Performance Tester")
     print("=" * 70)
@@ -174,7 +174,8 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, pr
                 T_min=T_min,
                 T_max=T_max,
                 cooling_factor=cooling_factor,
-                spin_updates_per_sweep=k_updates
+                spin_updates_per_sweep=k_updates,
+                parallel_spin_updates=parallel_spin_updates
             )
             runtime = time.time() - start_time
 
@@ -365,6 +366,10 @@ if __name__ == "__main__":
                         help="Temperature cooling factor per step (default: 0.999)")
     parser.add_argument("--spin-updates-per-sweep", type=int, default=None,
                         help="Number of spin updates per sweep (default: N)")
+    parser.add_argument("--parallel-spin-updates", action="store_true", default=True,
+                        help="Use parallel spin updates with double-buffering (default: True)")
+    parser.add_argument("--sequential-spin-updates", dest="parallel_spin_updates", action="store_false",
+                        help="Use sequential spin updates (disable parallel optimization)")
 
     # Synthetic graph options
     parser.add_argument("--synthetic-regular-n", type=int, default=None,
@@ -379,5 +384,6 @@ if __name__ == "__main__":
         debug=args.debug, problem=args.problem, num_replicas=args.num_replicas,
         swap_interval=args.swap_interval, T_min=args.T_min, T_max=args.T_max,
         cooling_factor=args.cooling_factor, spin_updates_per_sweep=args.spin_updates_per_sweep,
+        parallel_spin_updates=args.parallel_spin_updates,
         synthetic_regular_n=args.synthetic_regular_n, synthetic_regular_degree=args.synthetic_regular_degree
     )
