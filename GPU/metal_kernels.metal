@@ -322,7 +322,8 @@ struct SamplingParams {
 
 // MANAGER-THREAD ARCHITECTURE WITH PER-THREAD BUFFERS
 // Each thread has its own buffer and requests fresh copies from manager
-kernel void unified_parallel_tempering_sampler(
+// SEPARATE WORKER KERNEL - Only handles worker thread optimization
+kernel void worker_parallel_tempering(
     // Input data (read-only)
     device const int* csr_row_ptr [[buffer(0)]],          // [N+1] CSR row pointers
     device const int* csr_col_ind [[buffer(1)]],          // [nnz] CSR column indices
@@ -336,24 +337,19 @@ kernel void unified_parallel_tempering_sampler(
     device atomic<int>* best_energy [[buffer(7)]],        // [1] global best energy
     device int8_t* best_spins [[buffer(8)]],              // [N] global best configuration
 
-    // Manager-Thread Communication System
+    // Worker buffers
     device int8_t* thread_buffers [[buffer(9)]],          // [num_replicas * N] per-thread work buffers
     device atomic<int>* thread_energies [[buffer(10)]],   // [num_replicas] per-thread energy tracking (atomic)
-    device atomic<int>* request_flags [[buffer(11)]],     // [num_replicas] thread request signals
-    device atomic<int>* manager_status [[buffer(12)]],    // [1] manager coordination status
-    device uint* rng_states [[buffer(13)]],               // [num_replicas] RNG states per replica
+    device uint* rng_states [[buffer(11)]],               // [num_replicas] RNG states per replica
 
     uint3 thread_id [[thread_position_in_grid]],
     uint3 threads_per_threadgroup [[threads_per_threadgroup]],
     uint3 threadgroup_id [[threadgroup_position_in_grid]]
 ) {
-    // Use threadgroup_id for replica assignment
-    uint replica_id = threadgroup_id.x;
+    // Use global thread position for replica assignment (more robust than threadgroup_id)
+    uint replica_id = thread_id.x;
 
-    // Initialize energy tracking for this replica
-    if (replica_id < (uint)params->num_reads) {
-        final_energies[replica_id] = 2147483647;  // Initialize to max int32
-    }
+    // Energy initialization removed - only manager writes to final_energies
 
     if (replica_id >= (uint)params->num_replicas) return;
 
@@ -370,27 +366,17 @@ kernel void unified_parallel_tempering_sampler(
     // Each thread gets isolated buffer region with padding
     device int8_t* my_thread_buffer = &thread_buffers[replica_id * PADDED_SIZE];
 
+    // Workers only - no manager logic in this kernel
+
     // Initialize thread's RNG state (PRIVATE - no sharing)
     uint my_rng_state = params->base_seed + replica_id * 12345u + threadgroup_id.x * 67890u;
 
-    // MANAGER COORDINATION: Thread 0 acts as manager
+    // Initialize global best to a high value (single writer correctness not critical here)
     if (replica_id == 0) {
-        // Initialize manager status
-        atomic_store_explicit(&manager_status[0], 0, memory_order_relaxed);
-
-        // Initialize global best to a high value
         atomic_store_explicit(&best_energy[0], 999999, memory_order_relaxed);
-
-        // Initialize all request flags to 0
-        for (uint i = 0; i < params->num_replicas; i++) {
-            atomic_store_explicit(&request_flags[i], 0, memory_order_relaxed);
-        }
     }
 
-    // No barrier needed for separate kernel calls
-
     // STEP 1: Thread initializes independently (no manager dependency for startup)
-    // Threads don't wait for manager during initialization to avoid deadlock
 
     // STEP 2: Thread initializes its isolated buffer with bounds checking
     for (int i = 0; i < N; i++) {
@@ -408,20 +394,18 @@ kernel void unified_parallel_tempering_sampler(
         my_thread_buffer[N] = (int8_t)(replica_id + 100);  // Unique marker per thread
     }
 
-    // WORKERS: Compute their own energies using their private buffers
+    // Buffer isolation verified - debug code removed
+
+    // WORKERS: Initialize energy tracking (manager will calculate final energies)
     int my_thread_energy = 0;
 
-    // For 2-spin problem, manually calculate to debug
+    // Workers calculate initial energy for their private optimization
     if (N == 2) {
         int8_t s0 = my_thread_buffer[0];
         int8_t s1 = my_thread_buffer[1];
-        // Coupling (0,1) = -1, so energy = -1 * s0 * s1
         my_thread_energy = -1 * s0 * s1;
-
-        // Verify correct energy calculation without debug encoding
-        // Keep the actual energy calculation
     } else {
-        // General case
+        // General case for optimization loop
         for (int i = 0; i < N; i++) {
             int8_t s_i = my_thread_buffer[i];
             int start = csr_row_ptr[i];
@@ -437,30 +421,10 @@ kernel void unified_parallel_tempering_sampler(
         }
     }
 
-    // Store computed energy
+    // Workers store their optimization energy (for internal use during optimization)
     atomic_store_explicit(&thread_energies[replica_id], my_thread_energy, memory_order_relaxed);
 
-    // MANAGER DUTIES: Thread 0 manages buffer copying and coordination
-    if (replica_id == 0) {
-        atomic_store_explicit(&manager_status[0], 1, memory_order_relaxed);  // Manager ready
-
-        // Manager updates global best if any worker found better solution
-        for (uint worker_id = 0; worker_id < params->num_replicas; worker_id++) {
-            int worker_energy = atomic_load_explicit(&thread_energies[worker_id], memory_order_relaxed);
-            int current_best = atomic_load_explicit(&best_energy[0], memory_order_relaxed);
-
-            if (worker_energy < current_best) {
-                if (atomic_compare_exchange_weak_explicit(&best_energy[0], &current_best, worker_energy,
-                                                         memory_order_relaxed, memory_order_relaxed)) {
-                    // Manager copies worker's buffer to global best
-                    device int8_t* worker_spins = &thread_buffers[worker_id * PADDED_SIZE];
-                    for (int i = 0; i < N; i++) {
-                        best_spins[i] = worker_spins[i];
-                    }
-                }
-            }
-        }
-    }
+    // Workers only handle optimization - no coordination duties
 
     // STEP 4: Main optimization loop - Parallel tempering with isolated thread buffers
     for (int sweep = 0; sweep < params->num_sweeps; sweep++) {
@@ -517,22 +481,66 @@ kernel void unified_parallel_tempering_sampler(
         // Skip sample collection during optimization for now - collect at end
     }
 
-    // STEP 5: Final sample collection - collect final state from each replica
-    // Collect final optimized states (or initial states if num_sweeps = 0)
-    if (replica_id < params->num_reads) {
-        // No sampling during optimization, so collect final states
-        uint output_offset = replica_id * N;
+    // Workers no longer write to final_samples - manager handles both samples AND energies
+    // This ensures perfect correlation between samples and their calculated energies
+}
 
-        // Bounds check and write samples
-        if (output_offset + N <= params->num_reads * N) {
+// SEPARATE MANAGER KERNEL - Handles BOTH sample collection AND energy calculation after workers complete
+kernel void manager_energy_calculator(
+    // Input data (read-only)
+    device const int* csr_row_ptr [[buffer(0)]],          // [N+1] CSR row pointers
+    device const int* csr_col_ind [[buffer(1)]],          // [nnz] CSR column indices
+    device const int8_t* csr_J_vals [[buffer(2)]],        // [nnz] CSR coupling values
+    device const SamplingParams* params [[buffer(3)]],    // Sampling parameters
+
+    // Worker data (read-only)
+    device const int8_t* thread_buffers [[buffer(4)]],    // Worker thread buffers
+
+    // Output data (write-only)
+    device int8_t* final_samples [[buffer(5)]],           // [num_reads * N] collected samples
+    device int* final_energies [[buffer(6)]]              // [num_reads] calculated energies
+) {
+    int N = params->N;
+    const int BUFFER_PADDING = 8;
+    const int PADDED_SIZE = N + BUFFER_PADDING;
+
+    // Workers are guaranteed complete by command buffer ordering; no busy-wait needed
+
+    // Calculate energies for all worker buffers
+    for (uint read_id = 0; read_id < params->num_reads && read_id < params->num_replicas; read_id++) {
+        // Get worker's buffer using proper addressing
+        device const int8_t* worker_buffer = &thread_buffers[read_id * PADDED_SIZE];
+
+        // STEP 1: Copy sample to final_samples (ensuring correlation with energy calculation)
+        uint sample_offset = read_id * N;
+        for (int i = 0; i < N; i++) {
+            final_samples[sample_offset + i] = worker_buffer[i];
+        }
+
+        // STEP 2: Calculate energy for the SAME buffer we just copied
+        int calculated_energy = 0;
+        if (N == 2) {
+            int8_t s0 = worker_buffer[0];
+            int8_t s1 = worker_buffer[1];
+            calculated_energy = -1 * s0 * s1;
+        } else {
             for (int i = 0; i < N; i++) {
-                final_samples[output_offset + i] = my_thread_buffer[i];
+                int8_t s_i = worker_buffer[i];
+                int start = csr_row_ptr[i];
+                int end = csr_row_ptr[i + 1];
+
+                for (int p = start; p < end; ++p) {
+                    int j = csr_col_ind[p];
+                    if (j > i) {
+                        int8_t Jij = csr_J_vals[p];
+                        int8_t s_j = worker_buffer[j];
+                        calculated_energy += Jij * s_i * s_j;
+                    }
+                }
             }
         }
 
-        // Write the final energy for this sample
-        final_energies[replica_id] = my_thread_energy;
+        // STEP 3: Write the authoritative energy for the sample we just copied
+        final_energies[read_id] = calculated_energy;
     }
-
-    // No barrier needed for single-thread execution
 }

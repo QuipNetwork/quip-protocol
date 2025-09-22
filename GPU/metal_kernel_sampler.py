@@ -12,6 +12,7 @@ import logging
 from typing import Optional, Tuple, Dict, Any
 import numpy as np
 import struct
+import ctypes
 
 try:
     import Metal
@@ -26,14 +27,28 @@ from shared.quantum_proof_of_work import DEFAULT_TOPOLOGY
 class MetalKernelDimodSampler:
     """Apple Metal GPU Parallel Tempering sampler for 3D Edwards-Anderson spin glasses."""
 
-    def __init__(self, device: str = "mps", logger: Optional[logging.Logger] = None):
+    def __init__(self, device: str = "mps", logger: Optional[logging.Logger] = None, verbose: bool = False):
         """Initialize Metal EA sampler.
 
         Args:
             device: Metal device ("mps" for Apple Metal Performance Shaders)
             logger: Optional logger instance
+            verbose: If True, enable DEBUG logging for this sampler
         """
         self.logger = logger or logging.getLogger(__name__)
+        self._verbose = verbose
+        # Configure logger level/handlers only if a logger wasn't provided
+        if logger is None:
+            self.logger.setLevel(logging.DEBUG if verbose else logging.WARNING)
+            if not self.logger.handlers:
+                handler = logging.StreamHandler()
+                formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                handler.setFormatter(formatter)
+                self.logger.addHandler(handler)
+        else:
+            # Respect provided logger but elevate to DEBUG if verbose explicitly requested
+            if verbose:
+                self.logger.setLevel(logging.DEBUG)
         self.sampler_type = "metal_ea_3d"
 
         if not METAL_AVAILABLE:
@@ -53,7 +68,7 @@ class MetalKernelDimodSampler:
         self.nodes = list(topology_graph.nodes())
         self.edges = list(topology_graph.edges())
 
-        self.logger.info(f"[MetalEA] Initialized on device: {self._device.name()}")
+        self.logger.debug(f"[MetalEA] Initialized on device: {self._device.name()}")
 
     def _compile_kernels(self):
         """Compile Metal kernels from EA-specific Metal file."""
@@ -82,7 +97,8 @@ class MetalKernelDimodSampler:
                 "ea_track_best_kernel",
                 "ea_initialize_spins_kernel",
                 "ea_update_temperatures_kernel",
-                "unified_parallel_tempering_sampler"
+                "worker_parallel_tempering",
+                "manager_energy_calculator"
             ]
 
             for name in kernel_names:
@@ -96,7 +112,7 @@ class MetalKernelDimodSampler:
 
                 self._kernels[name] = pipeline_state
 
-            self.logger.info(f"[MetalEA] Compiled {len(kernel_names)} kernels successfully")
+            self.logger.debug(f"[MetalEA] Compiled {len(kernel_names)} kernels successfully")
 
         except Exception as e:
             self.logger.error(f"[MetalEA] Kernel compilation failed: {e}")
@@ -226,14 +242,14 @@ class MetalKernelDimodSampler:
         if num_replicas is None:
             num_replicas = min(max(16, num_reads // 4), 64)  # Smaller default for unified kernel
 
-        self.logger.info(f"[MetalEA] Unified GPU sampling: N={N}, replicas={num_replicas}, sweeps={num_sweeps}")
+        self.logger.debug(f"[MetalEA] Unified GPU sampling: N={N}, replicas={num_replicas}, sweeps={num_sweeps}")
 
         # Convert problem to CSR format
         buffer_data = self._convert_problem_to_buffers(h, J, L, num_replicas)
 
         # Debug: Check CSR data
-        self.logger.info(f"[MetalEA] Debug - CSR edges: {len(buffer_data['csr_col_ind'])}")
-        self.logger.info(f"[MetalEA] Debug - CSR J values: {buffer_data['csr_J_vals'][:10]}")  # First 10
+        self.logger.debug(f"[MetalEA] Debug - CSR edges: {len(buffer_data['csr_col_ind'])}")
+        self.logger.debug(f"[MetalEA] Debug - CSR J values: {buffer_data['csr_J_vals'][:10]}")  # First 10
 
         # Debug: Count edges with j > i condition
         csr_row_ptr = buffer_data['csr_row_ptr']
@@ -247,7 +263,7 @@ class MetalKernelDimodSampler:
                 j = csr_col_ind[p]
                 if j > i:
                     edge_count += 1
-        self.logger.info(f"[MetalEA] Debug - Edges with j>i: {edge_count} (should be {len(J)})")
+        self.logger.debug(f"[MetalEA] Debug - Edges with j>i: {edge_count} (should be {len(J)})")
 
         # Create temperature ladder
         temperatures = self._create_adaptive_temperature_ladder(T_min, T_max, num_replicas).astype(np.float32)
@@ -255,33 +271,35 @@ class MetalKernelDimodSampler:
         # Create sampling parameters struct with proper data types
         sample_interval = max(1, num_sweeps // (num_reads // num_replicas + 1))
 
-        # Pack struct manually to match Metal layout exactly
-        sampling_params_bytes = struct.pack('<iiiiiiffI',
-            N,                    # int N
-            num_replicas,         # int num_replicas
-            num_sweeps,           # int num_sweeps
-            num_reads,            # int num_reads
-            swap_interval,        # int swap_interval
-            sample_interval,      # int sample_interval
-            T_min,                # float T_min
-            T_max,                # float T_max
-            12345                 # uint base_seed
-        )
-
-        # Convert to numpy array for buffer creation
-        sampling_params = np.frombuffer(sampling_params_bytes, dtype=np.uint8)
-
         try:
-            # Create input buffers
+            # Create input buffers (reused across passes)
             csr_row_ptr_buffer = self._create_buffer(buffer_data['csr_row_ptr'], "csr_row_ptr")
             csr_col_ind_buffer = self._create_buffer(buffer_data['csr_col_ind'], "csr_col_ind")
             csr_J_vals_buffer = self._create_buffer(buffer_data['csr_J_vals'], "csr_J_vals")
-            temperatures_buffer = self._create_buffer(temperatures, "temperatures")
-            params_buffer = self._create_buffer(sampling_params, "sampling_params")
+            # Create reusable params buffer (written in-place per pass)
+            params_size = struct.calcsize('<6i2fI')
+            params_buffer = self._device.newBufferWithLength_options_(params_size, 0)
+            if params_buffer is None:
+                raise RuntimeError("Failed to create Metal params buffer")
 
-            # Create output buffers
-            final_samples = np.zeros(num_reads * N, dtype=np.int8)
-            final_energies = np.zeros(num_reads, dtype=np.int32)
+            temperatures_buffer = self._create_buffer(temperatures, "temperatures")
+
+            # Allocate reusable buffers sized to num_replicas for multipass reuse
+            BUFFER_PADDING = 8  # Match kernel padding
+            padded_size = N + BUFFER_PADDING
+
+            # Communication buffers (reused across passes)
+            thread_buffers = np.zeros(num_replicas * padded_size, dtype=np.int8)
+            thread_energies = np.zeros(num_replicas, dtype=np.int32)
+            rng_states = np.zeros(num_replicas, dtype=np.uint32)
+
+            thread_buffers_buffer = self._create_buffer(thread_buffers, "thread_buffers")
+            thread_energies_buffer = self._create_buffer(thread_energies, "thread_energies")
+            rng_states_buffer = self._create_buffer(rng_states, "rng_states")
+
+            # Output buffers (sized to num_replicas; we'll slice to batch_reads per pass)
+            final_samples = np.zeros(num_replicas * N, dtype=np.int8)
+            final_energies = np.zeros(num_replicas, dtype=np.int32)
             best_energy = np.array([2147483647], dtype=np.int32)  # int32 max
             best_spins = np.zeros(N, dtype=np.int8)
 
@@ -290,81 +308,112 @@ class MetalKernelDimodSampler:
             best_energy_buffer = self._create_buffer(best_energy, "best_energy")
             best_spins_buffer = self._create_buffer(best_spins, "best_spins")
 
-            # Create manager-thread communication buffers with proper isolation
-            BUFFER_PADDING = 8  # Match kernel padding
-            padded_size = N + BUFFER_PADDING
-            thread_buffers = np.zeros(num_replicas * padded_size, dtype=np.int8)  # Padded per-thread buffers
-            thread_energies = np.zeros(num_replicas, dtype=np.int32)    # Per-thread energy tracking
-            request_flags = np.zeros(num_replicas, dtype=np.int32)      # Thread request signals
-            manager_status = np.zeros(1, dtype=np.int32)                # Manager coordination status
-            rng_states = np.zeros(num_replicas, dtype=np.uint32)        # RNG states per replica
+            all_samples = []
+            all_energies = []
+            produced = 0
+            pass_idx = 0
 
-            thread_buffers_buffer = self._create_buffer(thread_buffers, "thread_buffers")
-            thread_energies_buffer = self._create_buffer(thread_energies, "thread_energies")
-            request_flags_buffer = self._create_buffer(request_flags, "request_flags")
-            manager_status_buffer = self._create_buffer(manager_status, "manager_status")
-            rng_states_buffer = self._create_buffer(rng_states, "rng_states")
+            while produced < num_reads:
+                batch_reads = min(num_replicas, num_reads - produced)
 
-            # Single kernel dispatch - entire algorithm runs on GPU
-            self.logger.info(f"[MetalEA] Dispatching unified kernel with manager-thread architecture...")
+                # Pack struct for this pass (num_reads=batch_reads, vary base_seed)
+                base_seed = int(time.time() * 1000) ^ (pass_idx * 0x9E3779B1)
+                sampling_params_bytes = struct.pack('<6i2fI',
+                    N,                    # int N
+                    num_replicas,         # int num_replicas
+                    num_sweeps,           # int num_sweeps
+                    batch_reads,          # int num_reads (for this pass)
+                    swap_interval,        # int swap_interval
+                    sample_interval,      # int sample_interval
+                    T_min,                # float T_min
+                    T_max,                # float T_max
+                    base_seed & 0xFFFFFFFF  # uint base_seed
+                )
+                # Create a tiny staging buffer with current params; copy into persistent params_buffer via blit
+                staging_params = np.frombuffer(sampling_params_bytes, dtype=np.uint8)
+                staging_params_buffer = self._create_buffer(staging_params, "params_staging")
 
-            command_buffer = self._command_queue.commandBuffer()
-            encoder = command_buffer.computeCommandEncoder()
-            encoder.setComputePipelineState_(self._kernels["unified_parallel_tempering_sampler"])
 
-            # Set all buffers to match new kernel signature
-            encoder.setBuffer_offset_atIndex_(csr_row_ptr_buffer, 0, 0)
-            encoder.setBuffer_offset_atIndex_(csr_col_ind_buffer, 0, 1)
-            encoder.setBuffer_offset_atIndex_(csr_J_vals_buffer, 0, 2)
-            encoder.setBuffer_offset_atIndex_(temperatures_buffer, 0, 3)
-            encoder.setBuffer_offset_atIndex_(params_buffer, 0, 4)
-            encoder.setBuffer_offset_atIndex_(final_samples_buffer, 0, 5)
-            encoder.setBuffer_offset_atIndex_(final_energies_buffer, 0, 6)
-            encoder.setBuffer_offset_atIndex_(best_energy_buffer, 0, 7)
-            encoder.setBuffer_offset_atIndex_(best_spins_buffer, 0, 8)
-            # Manager-Thread Communication System
-            encoder.setBuffer_offset_atIndex_(thread_buffers_buffer, 0, 9)
-            encoder.setBuffer_offset_atIndex_(thread_energies_buffer, 0, 10)
-            encoder.setBuffer_offset_atIndex_(request_flags_buffer, 0, 11)
-            encoder.setBuffer_offset_atIndex_(manager_status_buffer, 0, 12)
-            encoder.setBuffer_offset_atIndex_(rng_states_buffer, 0, 13)
+                # Separated kernel dispatch - workers first, then manager
+                self.logger.debug(f"[MetalEA] Dispatching worker+manager (single command buffer) pass {pass_idx+1}...")
 
-            # SIMPLE MULTI-THREAD DISPATCH: Test where contamination begins
-            if num_replicas == 1:
-                # Single thread
+                # Single command buffer and encoder per pass
+                command_buffer = self._command_queue.commandBuffer()
+
+                # STEP 1: Dispatch worker kernel
+
+                # Set worker kernel buffers - matches worker_parallel_tempering signature
+                # Update persistent params_buffer using a blit from staging_params_buffer
+                blit = command_buffer.blitCommandEncoder()
+                blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size_(
+                    staging_params_buffer, 0, params_buffer, 0, params_size
+                )
+                blit.endEncoding()
+
+                encoder = command_buffer.computeCommandEncoder()
+                encoder.setComputePipelineState_(self._kernels["worker_parallel_tempering"])
+
+                encoder.setBuffer_offset_atIndex_(csr_row_ptr_buffer, 0, 0)
+                encoder.setBuffer_offset_atIndex_(csr_col_ind_buffer, 0, 1)
+                encoder.setBuffer_offset_atIndex_(csr_J_vals_buffer, 0, 2)
+                encoder.setBuffer_offset_atIndex_(temperatures_buffer, 0, 3)
+                encoder.setBuffer_offset_atIndex_(params_buffer, 0, 4)
+                encoder.setBuffer_offset_atIndex_(final_samples_buffer, 0, 5)
+                encoder.setBuffer_offset_atIndex_(final_energies_buffer, 0, 6)
+                encoder.setBuffer_offset_atIndex_(best_energy_buffer, 0, 7)
+                encoder.setBuffer_offset_atIndex_(best_spins_buffer, 0, 8)
+                # Worker communication buffers
+                encoder.setBuffer_offset_atIndex_(thread_buffers_buffer, 0, 9)
+                encoder.setBuffer_offset_atIndex_(thread_energies_buffer, 0, 10)
+                encoder.setBuffer_offset_atIndex_(rng_states_buffer, 0, 11)
+
+                # Worker dispatch: Each worker thread gets its own threadgroup for isolation
+                if num_replicas == 1:
+                    threads_per_group = Metal.MTLSize(width=1, height=1, depth=1)
+                    num_groups = Metal.MTLSize(width=1, height=1, depth=1)
+                else:
+                    threads_per_group = Metal.MTLSize(width=1, height=1, depth=1)  # 1 thread per group
+                    num_groups = Metal.MTLSize(width=num_replicas, height=1, depth=1)  # num_replicas groups
+
+                self.logger.debug(f"[MetalEA] Worker dispatch: {num_groups.width} groups × {threads_per_group.width} threads = {num_replicas} worker threads")
+                encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
+
+                # STEP 2: Dispatch manager kernel in the same encoder
+                encoder.setComputePipelineState_(self._kernels["manager_energy_calculator"])
+
+                # Set manager kernel buffers - matches manager_energy_calculator signature
+                encoder.setBuffer_offset_atIndex_(csr_row_ptr_buffer, 0, 0)
+                encoder.setBuffer_offset_atIndex_(csr_col_ind_buffer, 0, 1)
+                encoder.setBuffer_offset_atIndex_(csr_J_vals_buffer, 0, 2)
+                encoder.setBuffer_offset_atIndex_(params_buffer, 0, 3)
+                encoder.setBuffer_offset_atIndex_(thread_buffers_buffer, 0, 4)
+                encoder.setBuffer_offset_atIndex_(final_samples_buffer, 0, 5)
+                encoder.setBuffer_offset_atIndex_(final_energies_buffer, 0, 6)
+
+                # Manager dispatch: Single thread to calculate all energies
                 threads_per_group = Metal.MTLSize(width=1, height=1, depth=1)
                 num_groups = Metal.MTLSize(width=1, height=1, depth=1)
-            else:
-                # Multi-thread: Each thread gets its own threadgroup for isolation
-                threads_per_group = Metal.MTLSize(width=1, height=1, depth=1)  # 1 thread per group
-                num_groups = Metal.MTLSize(width=num_replicas, height=1, depth=1)  # num_replicas groups
+                self.logger.debug(f"[MetalEA] Manager dispatch: 1 group × 1 thread = 1 manager thread")
+                encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
 
-            print(f"[DEBUG] num_replicas={num_replicas}, num_reads={num_reads}")
-            print(f"[DEBUG] Dispatch: {num_groups.width} groups × {threads_per_group.width} threads = {num_replicas} total threads")
-            self.logger.info(f"[MetalEA] Dispatch: {num_groups.width} groups × {threads_per_group.width} threads = {num_replicas} total threads")
-            encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
-            encoder.endEncoding()
+                # Finish encoding and submit once
+                encoder.endEncoding()
+                command_buffer.commit()
+                command_buffer.waitUntilCompleted()
 
-            # CRITICAL: Commit and wait for GPU execution to complete
-            command_buffer.commit()
-            command_buffer.waitUntilCompleted()
+                # Read results for this pass
+                samples, gpu_energies = self._collect_unified_samples(final_samples_buffer, final_energies_buffer, batch_reads, N)
 
-            # Read results
-            samples, gpu_energies = self._collect_unified_samples(final_samples_buffer, final_energies_buffer, num_reads, N)
-
-            # TEMPORARY: Use GPU energies directly to test if sync fixes help
-            energies = gpu_energies
+                all_samples.extend(samples)
+                all_energies.extend(gpu_energies)
+                produced += batch_reads
+                pass_idx += 1
 
             runtime = time.time() - start_time
-            self.logger.info(f"[MetalEA] Unified sampling completed: {runtime:.2f}s")
-
-            # Debug: Check first few samples and energies
-            self.logger.info(f"[MetalEA] Debug - First 3 energies: {energies[:3]}")
-            self.logger.info(f"[MetalEA] Debug - First sample: {samples[0] if samples else 'None'}")
+            self.logger.debug(f"[MetalEA] Unified sampling completed (multi-pass): {runtime:.2f}s, reads={num_reads}")
 
             # Create SampleSet
-            sample_dict = {i: sample[i] for i in range(N) for sample in samples}
-            return dimod.SampleSet.from_samples(samples, 'SPIN', energies)
+            return dimod.SampleSet.from_samples(all_samples[:num_reads], 'SPIN', all_energies[:num_reads])
 
         except Exception as e:
             self.logger.error(f"[MetalEA] Unified sampling failed: {e}")
@@ -388,17 +437,13 @@ class MetalKernelDimodSampler:
             correct_energy_int = int(correct_energy)
             gpu_energy = gpu_energies[i] if i < len(gpu_energies) else 0
 
-            # Debug the first few samples
-            if i < 4:
-                print(f"   Debug sample {i}: {[sample[j] for j in range(len(sample))]} -> GPU: {gpu_energy}, Corrected: {correct_energy_int}")
 
             if abs(gpu_energy - correct_energy_int) > 1e-6:
                 corrections_made += 1
 
             corrected_energies.append(correct_energy_int)
 
-        print(f"🔧 Energy correction: Fixed {corrections_made}/{len(samples)} energies")
-        self.logger.info(f"[MetalEA] Energy correction: Fixed {corrections_made}/{len(samples)} energies")
+        self.logger.debug(f"[MetalEA] Energy correction: Fixed {corrections_made}/{len(samples)} energies")
         return corrected_energies
 
     def _recalculate_energies_with_separate_kernel(self, samples, J, N, num_samples):
@@ -459,7 +504,6 @@ class MetalKernelDimodSampler:
             energy = struct.unpack('<i', energy_bytes)[0]
             corrected_energies.append(energy)
 
-        print(f"🔧 Separate kernel energy correction: Recalculated {num_samples} energies")
         return corrected_energies
 
     def _collect_unified_samples(self, final_samples_buffer, final_energies_buffer, num_reads: int, N: int):
@@ -475,6 +519,9 @@ class MetalKernelDimodSampler:
             energy_bytes = bytes([energies_buffer_view[offset + j] for j in range(4)])
             energy = struct.unpack('<i', energy_bytes)[0]
             energies.append(energy)
+
+            # NOTE: Energy can legitimately be 0 for some graphs/samples; defer validation until samples are read
+
             if i < 4:  # Debug first 4 entries
                 self.logger.debug(f"[MetalEA] Python read sample {i}: energy = {energy}")
 
@@ -485,12 +532,11 @@ class MetalKernelDimodSampler:
         samples_bytes = bytes(samples_buffer_view)
         samples_flat = np.frombuffer(samples_bytes, dtype=np.int8)
 
-        # Reshape to [num_reads, N]
+        # Use only the first effective set of samples; allow larger buffer (e.g., allocated for original num_reads)
         expected_len = num_reads * N
         if samples_flat.size < expected_len:
-            samples_flat = np.pad(samples_flat, (0, expected_len - samples_flat.size), mode='constant')
-        elif samples_flat.size > expected_len:
-            samples_flat = samples_flat[:expected_len]
+            raise RuntimeError(f"THREAD EXECUTION FAILURE: Expected at least {expected_len} sample bytes, got {samples_flat.size}.")
+        samples_flat = samples_flat[:expected_len]
 
         samples = []
         for i in range(num_reads):
@@ -499,7 +545,15 @@ class MetalKernelDimodSampler:
             sample = samples_flat[start_idx:end_idx].tolist()
             samples.append(sample)
 
+        # Validate execution: zero energy is only a failure if the sample is all zeros
+        for i in range(num_reads):
+            if energies[i] == 0 and all(v == 0 for v in samples[i]):
+                raise RuntimeError(
+                    f"THREAD EXECUTION FAILURE: Read {i} has zero energy and zeroed sample (thread likely didn't execute)"
+                )
+
         return samples, energies
+
 
     def _get_problem_info_from_hJ(self, h, J, L):
         """Get problem info from h,J parameters."""
@@ -548,12 +602,12 @@ class MetalKernelDimodSampler:
         if num_replicas is None:
             num_replicas = min(max(32, num_reads // 2), 512)
 
-        self.logger.info(f"[MetalEA] Starting 3D EA sampling: L={L}, N={N}, replicas={num_replicas}, sweeps={num_sweeps}")
+        self.logger.debug(f"[MetalEA] Starting 3D EA sampling: L={L}, N={N}, replicas={num_replicas}, sweeps={num_sweeps}")
 
         # Convert provided h,J to Metal buffer format
         buffer_data = self._convert_problem_to_buffers(h, J, L, num_replicas)
         problem_info = self._get_problem_info_from_hJ(h, J, L)
-        self.logger.info(f"[MetalEA] Problem: {problem_info['num_couplings']} couplings, optimal energy: {problem_info['optimal_energy']}")
+        self.logger.debug(f"[MetalEA] Problem: {problem_info['num_couplings']} couplings, optimal energy: {problem_info['optimal_energy']}")
 
         # Create Metal buffers
         try:
@@ -705,7 +759,7 @@ class MetalKernelDimodSampler:
         runtime = time.time() - start_time
         spin_updates_per_sec = (num_sweeps * num_replicas * N) / runtime
 
-        self.logger.info(f"[MetalEA] Completed: {runtime:.2f}s, {spin_updates_per_sec:.0f} spin updates/sec")
+        self.logger.debug(f"[MetalEA] Completed: {runtime:.2f}s, {spin_updates_per_sec:.0f} spin updates/sec")
 
         # Create dimod SampleSet
         return dimod.SampleSet.from_samples(samples, 'SPIN', energies)
@@ -909,14 +963,11 @@ class MetalKernelDimodSampler:
         spins_bytes = bytes(spins_buffer_view)
         spins_flat = np.frombuffer(spins_bytes, dtype=np.int8)
 
-        # Safety check: ensure expected length
+        # NO FALLBACKS - crash on buffer size mismatch
         expected_len = num_replicas * N
-        if spins_flat.size < expected_len:
-            # Pad with zeros if buffer shorter than expected (shouldn't happen)
-            spins_flat = np.pad(spins_flat, (0, expected_len - spins_flat.size), mode='constant')
-        elif spins_flat.size > expected_len:
-            # Truncate if larger than expected (e.g., stale buffer sizing)
-            spins_flat = spins_flat[:expected_len]
+        if spins_flat.size != expected_len:
+            raise RuntimeError(f"REPLICA BUFFER FAILURE: Expected {expected_len} spin bytes, got {spins_flat.size}. "
+                             f"This indicates replica buffer allocation mismatch.")
 
         samples = []
         for read_idx in range(num_reads):
