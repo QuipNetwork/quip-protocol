@@ -60,7 +60,7 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, pr
     metal_sampler = None
 
     # Check availability and initialize
-    metal_available = 'METAL_AVAILABLE' in globals() and METAL_AVAILABLE
+    metal_available = METAL_AVAILABLE
 
     if metal_available:
         try:
@@ -163,8 +163,8 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, pr
         """Test Parallel Tempering method. Returns (success, runtime) tuple."""
         try:
             start_time = time.time()
-            # Determine spin updates per sweep: default to N unless override provided
-            k_updates = spin_updates_override if spin_updates_override is not None else len(h)
+
+            # Use default sample_ising method (unified GPU kernel)
             sampleset = metal_sampler.sample_ising(
                 h=h, J=J,
                 num_reads=num_reads,
@@ -172,18 +172,18 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, pr
                 num_replicas=num_replicas,
                 swap_interval=swap_interval,
                 T_min=T_min,
-                T_max=T_max,
-                cooling_factor=cooling_factor,
-                spin_updates_per_sweep=k_updates,
-                parallel_spin_updates=parallel_spin_updates
+                T_max=T_max
             )
+
             runtime = time.time() - start_time
 
             min_energy = float(min(sampleset.record.energy))
             success = True if optimal_energy is None else (abs(min_energy - optimal_energy) < 1e-6)
 
-            print(f"      ⏱️  {runtime:.1f}s, Min energy: {min_energy:.1f}")
+            print(f"      ⏱️  {runtime:.3f}s, Min energy: {min_energy:.1f}")
             print(f"      ✅ Success: {success}")
+            print(f"      🔍 Debug: sampleset has {len(sampleset.record.energy)} samples")
+            print(f"      🔍 Debug: energy range {min(sampleset.record.energy):.1f} to {max(sampleset.record.energy):.1f}")
 
             if debug and hasattr(sampleset, 'record'):
                 energies = sampleset.record.energy
@@ -202,6 +202,8 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, pr
 
         except Exception as e:
             print(f"      ❌ Parallel Tempering error: {e}")
+            import traceback
+            traceback.print_exc()
             return False, 0.0
 
 
@@ -370,6 +372,7 @@ if __name__ == "__main__":
                         help="Use parallel spin updates with double-buffering (default: True)")
     parser.add_argument("--sequential-spin-updates", dest="parallel_spin_updates", action="store_false",
                         help="Use sequential spin updates (disable parallel optimization)")
+
 
     # Synthetic graph options
     parser.add_argument("--synthetic-regular-n", type=int, default=None,
