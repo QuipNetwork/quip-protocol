@@ -36,18 +36,6 @@ class MetalSampler:
             swap_interval=swap_interval, T_min=T_min, T_max=T_max, **kwargs
         )
 
-    def sample_ising_slow_correct(self, h, J, num_reads=256, num_sweeps=100000, num_replicas=None,
-                                 swap_interval=15, cooling_interval=500, T_min=0.1, T_max=5.0,
-                                 cooling_factor=0.999, **kwargs):
-        """Run original multi-kernel Parallel Tempering sampling - FOR DEBUGGING ONLY."""
-        self.logger.debug(f"[MetalSampler] Starting original multi-kernel sampling: reads={num_reads}, sweeps={num_sweeps}")
-
-        # Use the original multi-kernel approach (for debugging only)
-        return self._kernel_sampler.sample_ising_slow_correct(
-            h, J, num_reads=num_reads, num_sweeps=num_sweeps, num_replicas=num_replicas,
-            swap_interval=swap_interval, cooling_interval=cooling_interval,
-            T_min=T_min, T_max=T_max, cooling_factor=cooling_factor, **kwargs
-        )
 
     def close(self):
         """Clean up Metal resources."""

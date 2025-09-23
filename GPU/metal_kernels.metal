@@ -1,20 +1,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// 3D Edwards-Anderson Spin Glass Metal Kernels
-// Implements the algorithm from CURRENT_PLAN.md for cubic lattice with 6 nearest neighbors
+// Metal Parallel Tempering Kernels
+// Optimized implementation using unified worker kernel
 
 // Constants
 constant int MAX_REPLICAS = 512;    // Max temperature replicas
-
-// Data Structures - dynamic sizing based on input topology
-// Note: Arrays are now passed as device buffers with dynamic sizing
-
-// Spin state: int8_t for memory efficiency (dynamic array via buffer)
-struct SpinState {
-    int N;                // actual N (number of spins in this replica)
-    // spins array passed separately as device buffer
-};
 
 // Global configuration data
 struct GlobalData {
@@ -30,9 +21,6 @@ struct GlobalData {
 struct Temperatures {
     float T[MAX_REPLICAS]; // Logarithmically spaced temperatures
 };
-
-// Debug: Atomic counter to track execution progress
-// Declare as kernel parameter — not global
 
 // Ensure Metal compiler recognizes atomic types
 typedef unsigned int uint;
@@ -53,260 +41,6 @@ float get_random(uint3 thread_id, uint step) {
     return float(rand_val & 0x7FFFFFFF) / 2147483647.0f;
 }
 
-// Spin Flip Kernel using CSR adjacency (arbitrary degree)
-kernel void ea_spin_flip_kernel(
-    device int8_t* replica_spins [[buffer(0)]],           // [num_replicas * N] spins (flattened)
-    device const int* csr_row_ptr [[buffer(1)]],          // [N+1] row pointers
-    device const int* csr_col_ind [[buffer(2)]],          // [2E] neighbor indices
-    device const int8_t* csr_J_vals [[buffer(3)]],        // [2E] ±1 couplings aligned with csr_col_ind
-    device const Temperatures* temperatures [[buffer(4)]],// [1] temperature array
-    device const GlobalData* global [[buffer(5)]],        // [1] global parameters
-    uint3 thread_id [[thread_position_in_grid]]
-) {
-    uint replica_id = thread_id.x;
-    if (replica_id >= (uint)global->num_replicas) return;
-
-    int N = global->N;
-    float beta = 1.0f / temperatures->T[replica_id];
-
-    // Pick random spin index for this replica
-    uint seed = replica_id * 12345u + global->step * 67890u;
-    uint random_val = xorshift(seed);
-    uint spin_idx = random_val % (uint)N;
-
-    device int8_t* spins = &replica_spins[replica_id * N];
-    int8_t s_i = spins[spin_idx];
-
-    // sum_j J_ij * s_j over neighbors from CSR
-    int start = csr_row_ptr[spin_idx];
-    int end   = csr_row_ptr[spin_idx + 1];
-    float sum = 0.0f;
-    for (int p = start; p < end; ++p) {
-        int j = csr_col_ind[p];
-        int8_t s_j = spins[j];
-        int8_t Jij = csr_J_vals[p];
-        sum += float(Jij) * float(s_j);
-    }
-
-    // ΔE = 2 s_i * sum_j J_ij s_j
-    float delta_E = 2.0f * float(s_i) * sum;
-
-    bool accept = (delta_E <= 0.0f);
-    if (!accept) {
-        float rand_val = get_random(thread_id, global->step);
-        accept = (rand_val < exp(-beta * delta_E));
-    }
-    if (accept) {
-        spins[spin_idx] = -s_i;
-    }
-}
-
-// Parallel spin flip kernel using 2D grid (replicas × spins) with double-buffering
-kernel void ea_parallel_spin_flip_kernel(
-    device const int8_t* replica_spins_src [[buffer(0)]], // [num_replicas * N] source spins (read-only)
-    device int8_t* replica_spins_dst [[buffer(1)]],       // [num_replicas * N] destination spins (write-only)
-    device const int* csr_row_ptr [[buffer(2)]],          // [N+1] CSR row pointers
-    device const int* csr_col_ind [[buffer(3)]],          // [nnz] CSR column indices
-    device const int8_t* csr_J_vals [[buffer(4)]],        // [nnz] CSR coupling values (sign only)
-    device const Temperatures* temperatures [[buffer(5)]], // [1] temperature array
-    device const GlobalData* global [[buffer(6)]],        // [1] global parameters
-    uint3 thread_id [[thread_position_in_grid]]
-) {
-    uint replica_id = thread_id.x;
-    uint spin_idx = thread_id.y;
-
-    if (replica_id >= (uint)global->num_replicas || spin_idx >= (uint)global->N) return;
-
-    int N = global->N;
-    float beta = 1.0f / temperatures->T[replica_id];
-
-    // Read from source buffer
-    device const int8_t* src_spins = &replica_spins_src[replica_id * N];
-    device int8_t* dst_spins = &replica_spins_dst[replica_id * N];
-
-    int8_t s_i = src_spins[spin_idx];
-
-    // Compute sum of J_ij * s_j for neighbors of spin i using CSR
-    float sum = 0.0f;
-    int start = csr_row_ptr[spin_idx];
-    int end = csr_row_ptr[spin_idx + 1];
-
-    for (int p = start; p < end; ++p) {
-        int j = csr_col_ind[p];
-        int8_t Jij = csr_J_vals[p];
-        sum += float(Jij) * float(src_spins[j]);  // Read from source
-    }
-
-    // ΔE = 2 s_i * sum_j J_ij s_j
-    float delta_E = 2.0f * float(s_i) * sum;
-
-    // Metropolis acceptance
-    bool accept = (delta_E <= 0.0f);
-    if (!accept) {
-        // Use unique thread ID for randomness (replica_id, spin_idx, step)
-        uint seed = replica_id * 12345u + spin_idx * 67890u + global->step * 98765u;
-        uint random_val = xorshift(seed);
-        float rand_val = float(random_val) / float(UINT_MAX);
-        accept = (rand_val < exp(-beta * delta_E));
-    }
-
-    // Write to destination buffer
-    dst_spins[spin_idx] = accept ? -s_i : s_i;
-}
-
-// Compute energies using CSR adjacency (avoid double counting via j>i)
-kernel void ea_compute_energies_kernel(
-    device const int8_t* replica_spins [[buffer(0)]],     // [num_replicas * N] spins (flattened)
-    device int* replica_energies [[buffer(1)]],           // [num_replicas] energies
-    device const int* csr_row_ptr [[buffer(2)]],          // [N+1]
-    device const int* csr_col_ind [[buffer(3)]],          // [2E]
-    device const int8_t* csr_J_vals [[buffer(4)]],        // [2E]
-    device const GlobalData* global [[buffer(5)]],        // [1]
-    uint thread_id [[thread_position_in_grid]]
-) {
-    uint replica_id = thread_id;
-    if (replica_id >= global->num_replicas) return;
-
-    int N = global->N;
-    device const int8_t* spins = &replica_spins[replica_id * N];
-    int total_energy = 0;
-
-    // Validate global->N before proceeding
-    if (global->N <= 0) {
-        replica_energies[replica_id] = -999;  // Sentinel value for corruption
-        return;
-    }
-
-    for (int i = 0; i < N; i++) {
-        int8_t s_i = spins[i];
-        int start = csr_row_ptr[i];
-        int end   = csr_row_ptr[i + 1];
-        for (int p = start; p < end; ++p) {
-            int j = csr_col_ind[p];
-            if (j > i) {
-                int8_t Jij = csr_J_vals[p];
-                int8_t s_j = spins[j];
-                total_energy += Jij * s_i * s_j;  // Standard Ising Hamiltonian: H = ∑ Jij si sj
-            }
-        }
-    }
-
-    replica_energies[replica_id] = total_energy;
-}
-
-// Replica exchange kernel - swap configurations between adjacent replicas (flattened spins)
-kernel void ea_replica_exchange_kernel(
-    device int8_t* replica_spins [[buffer(0)]],           // [num_replicas * N] flattened spins
-    device int* replica_energies [[buffer(1)]],           // [num_replicas] energies (int32)
-    device const Temperatures* temperatures [[buffer(2)]], // [1] temperature array
-    device const GlobalData* global [[buffer(3)]],        // [1] global parameters
-    uint thread_id [[thread_position_in_grid]]
-) {
-    uint replica_id = thread_id;
-
-    // Only process even-numbered replicas (they attempt swaps with replica_id + 1)
-    if (replica_id >= (uint)global->num_replicas - 1 || (replica_id % 2) != 0) return;
-
-    uint next_replica = replica_id + 1;
-    int N = global->N;
-
-    // Get energies and temperatures
-    int E_i_int = replica_energies[replica_id];
-    int E_j_int = replica_energies[next_replica];
-    float T_i = temperatures->T[replica_id];
-    float T_j = temperatures->T[next_replica];
-
-    // Compute exchange probability: exp(-(E_i - E_j) * (1/T_i - 1/T_j))
-    float beta_i = 1.0f / T_i;
-    float beta_j = 1.0f / T_j;
-    float log_prob = -(float)(E_i_int - E_j_int) * (beta_i - beta_j);
-
-    // Generate random number for exchange decision
-    uint3 fake_thread_id = uint3(replica_id, 0, 0);
-    float rand_val = get_random(fake_thread_id, global->step);
-
-    // Accept exchange if log_prob >= 0 or with probability exp(log_prob)
-    bool accept = (log_prob >= 0.0f) || (rand_val < exp(log_prob));
-
-    if (accept) {
-        // Swap flattened spin configurations
-        device int8_t* spins_i = &replica_spins[replica_id * N];
-        device int8_t* spins_j = &replica_spins[next_replica * N];
-        for (int spin_idx = 0; spin_idx < N; spin_idx++) {
-            int8_t temp = spins_i[spin_idx];
-            spins_i[spin_idx] = spins_j[spin_idx];
-            spins_j[spin_idx] = temp;
-        }
-
-        // Swap energies
-        replica_energies[replica_id] = E_j_int;
-        replica_energies[next_replica] = E_i_int;
-    }
-}
-
-// Track best energy and configuration across all replicas (flattened spins)
-kernel void ea_track_best_kernel(
-    device const int8_t* replica_spins [[buffer(0)]],     // [num_replicas * N] flattened spins
-    device const int* replica_energies [[buffer(1)]],     // [num_replicas] current energies (int32)
-    device atomic<int>* best_energy [[buffer(2)]],        // [1] best energy found so far (int32)
-    device int8_t* best_spins [[buffer(3)]],              // [N] best spin configuration
-    device const GlobalData* global [[buffer(4)]],        // [1] global parameters
-    uint thread_id [[thread_position_in_grid]]
-) {
-    uint replica_id = thread_id;
-    if (replica_id >= global->num_replicas) return;
-
-    int current_energy = replica_energies[replica_id];
-    int N = global->N;
-
-    // Check if this is the best energy so far
-    int current_best = atomic_load_explicit(best_energy, memory_order_relaxed);
-    if (current_energy < current_best) {
-        // Try to update best energy atomically
-        int expected = current_best;
-        if (atomic_compare_exchange_weak_explicit(
-            best_energy, &expected, current_energy,
-            memory_order_relaxed, memory_order_relaxed)) {
-            // Successfully updated best energy, copy configuration from flattened array
-            device const int8_t* spins = &replica_spins[replica_id * N];
-            for (int i = 0; i < N; i++) {
-                best_spins[i] = spins[i];
-            }
-        }
-    }
-}
-
-// Initialize random spin configurations for all replicas (flattened spins)
-kernel void ea_initialize_spins_kernel(
-    device int8_t* replica_spins [[buffer(0)]],           // [num_replicas * N] output spins (flattened)
-    device const GlobalData* global [[buffer(1)]],        // [1] global parameters
-    constant uint& seed [[buffer(2)]],                    // [1] random seed
-    uint3 thread_id [[thread_position_in_grid]]
-) {
-    uint replica_id = thread_id.x;
-    uint spin_idx = thread_id.y;
-
-    if (replica_id >= (uint)global->num_replicas || spin_idx >= (uint)global->N) return;
-
-    // Generate random spin: +1 or -1
-    float rand_val = get_random(thread_id, seed);
-    device int8_t* spins = &replica_spins[replica_id * global->N];
-    spins[spin_idx] = (rand_val < 0.5f) ? int8_t(-1) : int8_t(1);
-}
-
-// Update temperature schedule (cooling)
-kernel void ea_update_temperatures_kernel(
-    device Temperatures* temperatures [[buffer(0)]],      // [1] temperatures to update
-    constant float& cooling_factor [[buffer(1)]],         // [1] cooling factor (e.g., 0.999)
-    device const GlobalData* global [[buffer(2)]],        // [1] global parameters
-    uint thread_id [[thread_position_in_grid]]
-) {
-    uint replica_id = thread_id;
-    if (replica_id >= global->num_replicas) return;
-
-    temperatures->T[replica_id] *= cooling_factor;
-}
-
 // Sampling parameters for unified kernel
 struct SamplingParams {
     int N;                    // Number of spins
@@ -318,11 +52,15 @@ struct SamplingParams {
     float T_min;              // Minimum temperature
     float T_max;              // Maximum temperature
     uint base_seed;           // Base RNG seed
+    float cooling_factor;     // Temperature cooling factor (e.g., 0.999)
+    int cooling_start_sweep;  // Sweep to start cooling (for hybrid PT/SA)
+    float target_acceptance_ratio;  // Phase 1: Target acceptance ratio (0.25-0.35)
+    int adaptation_interval;        // Phase 1: Sweeps between temperature adaptations
+    int enable_replica_exchange;    // Phase 3: Enable intelligent replica exchange
+    float exchange_threshold;       // Phase 3: Energy gradient threshold for exchange
 };
 
-// MANAGER-THREAD ARCHITECTURE WITH PER-THREAD BUFFERS
-// Each thread has its own buffer and requests fresh copies from manager
-// SEPARATE WORKER KERNEL - Only handles worker thread optimization
+// Each thread has its own buffer and updates from a central copy
 kernel void worker_parallel_tempering(
     // Input data (read-only)
     device const int* csr_row_ptr [[buffer(0)]],          // [N+1] CSR row pointers
@@ -350,29 +88,22 @@ kernel void worker_parallel_tempering(
     // Use global thread position for replica assignment (more robust than threadgroup_id)
     uint replica_id = thread_id.x;
 
-    // Energy initialization removed - only manager writes to final_energies
-
     if (replica_id >= (uint)params->num_replicas) return;
 
     int N = params->N;
-    float beta = 1.0f / temperatures[replica_id];
-
-    // PROPER MEMORY ISOLATION: Add padding to prevent buffer overlap
-    const int BUFFER_PADDING = 8;  // 8-byte alignment padding
-    const int PADDED_SIZE = N + BUFFER_PADDING;
+    // Initial temperature for this replica (will be cooled during PT/SA hybrid)
+    float base_temperature = temperatures[replica_id];
 
     // Simplified bounds check - ensure we have enough space for this thread
     if (replica_id >= (uint)params->num_replicas) return;  // Should be redundant but explicit
 
-    // Each thread gets isolated buffer region with padding
-    device int8_t* my_thread_buffer = &thread_buffers[replica_id * PADDED_SIZE];
-
-    // Workers only - no manager logic in this kernel
+    // Each thread gets isolated buffer region
+    device int8_t* my_thread_buffer = &thread_buffers[replica_id * N];
 
     // Initialize thread's RNG state (PRIVATE - no sharing)
     uint my_rng_state = params->base_seed + replica_id * 12345u + threadgroup_id.x * 67890u;
 
-    // STEP 1: Thread initializes independently (no manager dependency for startup)
+    // STEP 1: Thread initializes independently
 
     // STEP 2: Thread initializes its isolated buffer with bounds checking
     for (int i = 0; i < N; i++) {
@@ -382,17 +113,7 @@ kernel void worker_parallel_tempering(
             my_thread_buffer[i] = (my_rng_state & 1) ? 1 : -1;
         }
     }
-
-    // No barrier needed for single-thread kernel calls
-
-    // INTEGRITY CHECK: Write unique pattern to padding area to detect buffer overlap
-    if (BUFFER_PADDING > 0) {
-        my_thread_buffer[N] = (int8_t)(replica_id + 100);  // Unique marker per thread
-    }
-
-    // Buffer isolation verified - debug code removed
-
-    // WORKERS: Initialize energy tracking (manager will calculate final energies)
+    // WORKERS: Initialize energy tracking
     int my_thread_energy = 0;
 
     // Workers calculate initial energy for their private optimization
@@ -426,6 +147,38 @@ kernel void worker_parallel_tempering(
     int sample_interval = params->sample_interval > 0 ? params->sample_interval : 1;
 
     for (int sweep = 0; sweep < params->num_sweeps; sweep++) {
+        // Phase 2: Multi-phase cooling strategy (exploration -> cooling -> quench)
+        float current_temperature = base_temperature;
+
+        // Define phase boundaries
+        float exploration_end = (float)params->num_sweeps * 0.4f;  // First 40% of sweeps
+        float cooling_end = (float)params->num_sweeps * 0.8f;      // Next 40% of sweeps
+        // Final 20% is quench phase
+
+        if ((float)sweep < exploration_end) {
+            // Phase 1: Exploration - maintain full PT temperature
+            current_temperature = base_temperature;
+        } else if ((float)sweep < cooling_end) {
+            // Phase 2: Moderate cooling
+            float cooling_progress = ((float)sweep - exploration_end) / (cooling_end - exploration_end);
+            current_temperature = base_temperature * pow(0.98f, cooling_progress * 100.0f);
+        } else {
+            // Phase 3: Aggressive quench
+            float quench_progress = ((float)sweep - cooling_end) / ((float)params->num_sweeps - cooling_end);
+            current_temperature = base_temperature * pow(0.9f, quench_progress * 200.0f);
+        }
+
+        // Temperature-dependent cooling rates (Phase 2 enhancement)
+        if (base_temperature < 0.1f) {
+            // Cooler replicas get more aggressive cooling
+            current_temperature *= pow(params->cooling_factor, 2.0f);
+        } else if (base_temperature > 0.5f) {
+            // Hotter replicas get less aggressive cooling
+            current_temperature *= sqrt(params->cooling_factor);
+        }
+
+        float beta = 1.0f / current_temperature;
+
         // Each thread optimizes its own isolated buffer
         for (int spin_idx = 0; spin_idx < N; spin_idx++) {
             // Try flipping spin at spin_idx
@@ -464,6 +217,66 @@ kernel void worker_parallel_tempering(
             }
         }
 
+
+        // Phase 3: Intelligent replica exchange at swap intervals
+        if (params->enable_replica_exchange && (sweep % params->swap_interval) == 0 && sweep > 0) {
+            // Only even-numbered replicas attempt exchanges with next replica
+            if ((replica_id % 2) == 0 && replica_id + 1 < (uint)params->num_replicas) {
+                uint partner_id = replica_id + 1;
+
+                // Calculate partner's energy using neighbor's buffer (simplified approximation)
+                int partner_energy = 0;
+                device int8_t* partner_buffer = &thread_buffers[partner_id * N];
+
+                // Quick energy calculation for partner
+                if (N == 2) {
+                    int8_t s0 = partner_buffer[0];
+                    int8_t s1 = partner_buffer[1];
+                    partner_energy = -1 * s0 * s1;
+                } else {
+                    for (int i = 0; i < N; i++) {
+                        int8_t s_i = partner_buffer[i];
+                        int start = csr_row_ptr[i];
+                        int end = csr_row_ptr[i + 1];
+                        for (int p = start; p < end; ++p) {
+                            int j = csr_col_ind[p];
+                            if (j > i) {
+                                int8_t Jij = csr_J_vals[p];
+                                int8_t s_j = partner_buffer[j];
+                                partner_energy += Jij * s_i * s_j;
+                            }
+                        }
+                    }
+                }
+
+                // Energy-gradient driven exchange decision
+                float my_temp = base_temperature;
+                float partner_temp = temperatures[partner_id];
+                float energy_diff = abs(my_thread_energy - partner_energy);
+                float temp_diff = abs(my_temp - partner_temp);
+
+                // Phase 3.1: Intelligent exchange criterion
+                bool should_exchange = false;
+                if (temp_diff > params->exchange_threshold) {
+                    float exchange_probability = exp(-energy_diff / temp_diff);
+                    my_rng_state = xorshift(my_rng_state);
+                    float rand_val = float(my_rng_state & 0x7FFFFFFF) / 2147483647.0f;
+                    should_exchange = (rand_val < exchange_probability);
+                }
+
+                // Simple buffer swap (atomic operation not needed for disjoint buffers)
+                if (should_exchange) {
+                    // Swap spin configurations
+                    for (int i = 0; i < N; i++) {
+                        int8_t temp_spin = my_thread_buffer[i];
+                        my_thread_buffer[i] = partner_buffer[i];
+                        partner_buffer[i] = temp_spin;
+                    }
+                    // Update my energy to partner's energy
+                    my_thread_energy = partner_energy;
+                }
+            }
+        }
 
         // Sample collection at specified intervals
         if (((sweep + 1) % sample_interval) == 0 && local_out < my_quota) {
@@ -535,4 +348,3 @@ kernel void worker_parallel_tempering(
         local_out++;
     }
 }
-

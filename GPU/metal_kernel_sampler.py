@@ -12,7 +12,6 @@ import logging
 from typing import Optional, Tuple, Dict, Any
 import numpy as np
 import struct
-import ctypes
 
 try:
     import Metal
@@ -96,13 +95,6 @@ class MetalKernelDimodSampler:
 
             # Create kernel pipeline states
             kernel_names = [
-                "ea_spin_flip_kernel",
-                "ea_parallel_spin_flip_kernel",
-                "ea_compute_energies_kernel",
-                "ea_replica_exchange_kernel",
-                "ea_track_best_kernel",
-                "ea_initialize_spins_kernel",
-                "ea_update_temperatures_kernel",
                 "worker_parallel_tempering"
             ]
 
@@ -220,39 +212,90 @@ class MetalKernelDimodSampler:
 
     def _create_adaptive_temperature_ladder(self, T_min, T_max, num_replicas):
         """
-        Create adaptive temperature ladder optimized for ~30% swap acceptance.
-        Uses geometric progression with adjustment for typical Ising energy scales.
+        Phase 1: Optimized geometric temperature ladder for ~25-35% swap acceptance.
+        Implements research-based optimal spacing for parallel tempering.
         """
         if num_replicas == 1:
             return np.array([T_min])
 
-        # For Ising models, optimal temperature spacing often follows:
-        # T_{i+1} / T_i ≈ constant, with ratio chosen for ~30% acceptance
-        # Empirical rule: ratio ≈ 1.2-1.5 for spin glasses
+        # Phase 1.1: Geometric spacing with optimal ratios
+        # Research shows optimal ratio depends on problem complexity and replica count
+        base_ratio = (T_max / T_min) ** (1.0 / (num_replicas - 1))
 
-        # Start with geometric progression
-        ratio = (T_max / T_min) ** (1.0 / (num_replicas - 1))
-
-        # Adjust ratio based on number of replicas for better acceptance
+        # Phase 1.2: Adaptive ratio adjustment for target acceptance
         if num_replicas <= 4:
-            ratio *= 1.1  # Closer spacing for few replicas
-        elif num_replicas >= 16:
-            ratio *= 0.95  # Tighter spacing for many replicas
+            # For few replicas, use tighter spacing to ensure good communication
+            adjustment_factor = 1.15
+        elif num_replicas <= 8:
+            # Moderate replica count - balanced spacing
+            adjustment_factor = 1.05
+        elif num_replicas <= 16:
+            # Many replicas - slightly tighter spacing
+            adjustment_factor = 0.98
+        else:
+            # Very many replicas - much tighter spacing for good overlap
+            adjustment_factor = 0.92
 
-        temperatures = np.array([T_min * (ratio ** i) for i in range(num_replicas)])
+        optimal_ratio = base_ratio * adjustment_factor
+
+        # Generate geometric ladder
+        temperatures = np.array([T_min * (optimal_ratio ** i) for i in range(num_replicas)])
 
         # Ensure we hit T_max exactly
         temperatures[-1] = T_max
 
-        self.logger.debug(f"[MetalEA] Adaptive temperature ladder: {temperatures}")
+        # Phase 1.3: Problem-complexity adaptive T_max (implemented here for convenience)
+        # This will be used when N is available in calling context
+
+        self.logger.debug(f"[MetalEA] Phase 1 geometric temperature ladder: {temperatures}")
         self.logger.debug(f"[MetalEA] Temperature ratios: {temperatures[1:] / temperatures[:-1]}")
+        self.logger.debug(f"[MetalEA] Adjustment factor: {adjustment_factor:.3f}, optimal ratio: {optimal_ratio:.3f}")
 
         return temperatures
+
+    def _calculate_optimal_replicas(self, problem_size, num_couplings, coupling_density):
+        """
+        Phase 3.2: Calculate optimal replica count based on problem characteristics.
+        Based on research findings for parallel tempering performance.
+        """
+        # Base replica count from problem size (logarithmic scaling)
+        base_replicas = max(8, int(np.log2(problem_size)) * 2)
+
+        # Adjust based on coupling density
+        if coupling_density > 0.1:  # Dense problems need more replicas for mixing
+            density_factor = 1.5
+        elif coupling_density < 0.01:  # Sparse problems can use fewer replicas
+            density_factor = 0.8
+        else:  # Medium density
+            density_factor = 1.0
+
+        # Adjust based on energy scale (larger problems with more couplings)
+        if num_couplings > 1000:  # Large energy scale problems
+            energy_factor = 1.3
+        elif num_couplings < 100:  # Small energy scale problems
+            energy_factor = 0.9
+        else:
+            energy_factor = 1.0
+
+        # Calculate optimal replica count
+        optimal_replicas = int(base_replicas * density_factor * energy_factor)
+
+        # Clamp to reasonable bounds (8-64 replicas)
+        optimal_replicas = min(max(optimal_replicas, 8), 64)
+
+        self.logger.debug(f"[MetalEA] Phase 3.2 adaptive replicas: problem_size={problem_size}, "
+                         f"coupling_density={coupling_density:.4f}, num_couplings={num_couplings}")
+        self.logger.debug(f"[MetalEA] Replica calculation: base={base_replicas}, "
+                         f"density_factor={density_factor:.2f}, energy_factor={energy_factor:.2f}")
+        self.logger.debug(f"[MetalEA] Optimal replica count: {optimal_replicas}")
+
+        return optimal_replicas
 
     def sample_ising(self, h, J, num_reads: int = 256, num_sweeps: int = 1000,
                             num_replicas: int = None, swap_interval: int = 15,
                             T_min: float = 0.01, T_max: float = 1.0,
                             sample_interval: Optional[int] = None,
+                            cooling_factor: float = 0.999, cooling_start_sweep: int = None,
                             **kwargs) -> dimod.SampleSet:
         """GPU-only unified parallel tempering sampler - single kernel dispatch (DEFAULT).
         Args:
@@ -264,8 +307,22 @@ class MetalKernelDimodSampler:
         N = len(h)
         L = int(round(N ** (1/3)))  # Approximate cube root for compatibility
 
+        # Calculate coupling density early for adaptive algorithms
+        coupling_density = len(J) / max(1, (N * (N - 1) / 2))  # Avoid division by zero
+
+        # Phase 3.2: Adaptive replica count based on problem size and energy scale
         if num_replicas is None:
-            num_replicas = min(max(16, num_reads // 4), 64)  # Smaller default for unified kernel
+            num_replicas = self._calculate_optimal_replicas(N, len(J), coupling_density)
+
+        # Speed optimization: Only scale replicas if we need more samples than replicas
+        # Don't over-parallelize - it creates overhead instead of speedup
+        if num_reads > num_replicas:
+            # Scale to have at least as many replicas as reads, but cap at reasonable limit
+            target_replicas = min(num_reads, 64)  # Cap at 64 to avoid overhead
+            if target_replicas > num_replicas:
+                original_replicas = num_replicas
+                num_replicas = target_replicas
+                self.logger.debug(f"[MetalEA] Speed optimization: Scaled replicas {original_replicas} → {num_replicas} to match read count")
 
         self.logger.debug(f"[MetalEA] Unified GPU sampling: N={N}, replicas={num_replicas}, sweeps={num_sweeps}")
 
@@ -290,8 +347,22 @@ class MetalKernelDimodSampler:
                     edge_count += 1
         self.logger.debug(f"[MetalEA] Debug - Edges with j>i: {edge_count} (should be {len(J)})")
 
+        # Phase 1.3: Problem-complexity adaptive temperature range
+        # Scale T_max with problem complexity and coupling density (already calculated above)
+        adaptive_T_max = max(T_max, 0.1 * np.sqrt(len(h) + len(J)))
+        adaptive_T_min = min(T_min, 0.001)  # Lower minimum for better final convergence
+
+        # Adjust based on coupling density
+        if coupling_density > 0.1:  # Dense problems need higher T_max
+            adaptive_T_max *= 1.5
+        elif coupling_density < 0.01:  # Sparse problems can use lower T_max
+            adaptive_T_max *= 0.8
+
+        self.logger.debug(f"[MetalEA] Phase 1 adaptive temperature range: T_min={adaptive_T_min:.4f}, T_max={adaptive_T_max:.4f}")
+        self.logger.debug(f"[MetalEA] Coupling density: {coupling_density:.4f}")
+
         # Create temperature ladder
-        temperatures = self._create_adaptive_temperature_ladder(T_min, T_max, num_replicas).astype(np.float32)
+        temperatures = self._create_adaptive_temperature_ladder(adaptive_T_min, adaptive_T_max, num_replicas).astype(np.float32)
 
         # Create sampling parameters struct with proper data types
         chosen_interval = sample_interval if sample_interval is not None else self._default_sample_interval
@@ -300,13 +371,33 @@ class MetalKernelDimodSampler:
         else:
             sample_interval_local = max(1, min(int(chosen_interval), int(num_sweeps)))
 
+        # Phase 2.2: Problem-adaptive cooling parameters
+        # Adjust cooling factor and start sweep based on problem characteristics
+        if coupling_density > 0.1:  # Dense problems need more cooling
+            adaptive_cooling_factor = 0.995
+            adaptive_cooling_start_sweep = max(1, int(num_sweeps * 0.3))  # Start cooling earlier
+        else:  # Sparse problems can start cooling later
+            adaptive_cooling_factor = 0.999
+            adaptive_cooling_start_sweep = max(1, int(num_sweeps * 0.5))  # Start cooling later
+
+        # Override if explicitly provided
+        final_cooling_factor = cooling_factor if cooling_factor != 0.999 else adaptive_cooling_factor
+        if cooling_start_sweep is None:
+            final_cooling_start_sweep = adaptive_cooling_start_sweep
+        else:
+            final_cooling_start_sweep = cooling_start_sweep
+
+        self.logger.debug(f"[MetalEA] Phase 2 adaptive cooling: factor={final_cooling_factor:.4f}, start_sweep={final_cooling_start_sweep}")
+        self.logger.debug(f"[MetalEA] Coupling density: {coupling_density:.4f} -> {'dense' if coupling_density > 0.1 else 'sparse'} problem type")
+
         try:
             # Create input buffers (reused across passes)
             csr_row_ptr_buffer = self._create_buffer(buffer_data['csr_row_ptr'], "csr_row_ptr")
             csr_col_ind_buffer = self._create_buffer(buffer_data['csr_col_ind'], "csr_col_ind")
             csr_J_vals_buffer = self._create_buffer(buffer_data['csr_J_vals'], "csr_J_vals")
             # Create reusable params buffer (written in-place per pass)
-            params_size = struct.calcsize('<6i2fI')
+            # Updated for Phase 3: Added enable_replica_exchange (int) + exchange_threshold (float)
+            params_size = struct.calcsize('<6i2fIfi1f1i1i1f')
             params_buffer = self._device.newBufferWithLength_options_(params_size, 0)
             if params_buffer is None:
                 raise RuntimeError("Failed to create Metal params buffer")
@@ -318,12 +409,8 @@ class MetalKernelDimodSampler:
 
             temperatures_buffer = self._create_buffer(temperatures, "temperatures")
 
-            # Allocate reusable buffers sized to num_replicas for multipass reuse
-            BUFFER_PADDING = 8  # Match kernel padding
-            padded_size = N + BUFFER_PADDING
-
             # Communication buffers (reused across passes)
-            thread_buffers = np.zeros(num_replicas * padded_size, dtype=np.int8)
+            thread_buffers = np.zeros(num_replicas * N, dtype=np.int8)
             rng_states = np.zeros(num_replicas, dtype=np.uint32)
 
             thread_buffers_buffer = self._create_buffer(thread_buffers, "thread_buffers")
@@ -341,21 +428,42 @@ class MetalKernelDimodSampler:
             produced = 0
             pass_idx = 0
 
+            # Speed optimization: Use larger batches to reduce kernel dispatch overhead
             while produced < num_reads:
                 batch_reads = min(num_replicas, num_reads - produced)
 
+                # If we have many replicas, we can produce all reads in one or few passes
+                if num_replicas >= num_reads:
+                    batch_reads = num_reads - produced
+                    self.logger.debug(f"[MetalEA] Speed optimization: Single-pass execution with {num_replicas} replicas for {batch_reads} reads")
+
                 # Pack struct for this pass (num_reads=batch_reads, vary base_seed)
                 base_seed = int(time.time() * 1000) ^ (pass_idx * 0x9E3779B1)
-                sampling_params_bytes = struct.pack('<6i2fI',
+
+                # Phase 1: Target acceptance ratio and adaptation interval
+                target_acceptance = 0.30  # Target 30% acceptance ratio for optimal mixing
+                adaptation_interval = max(50, num_sweeps // 20)  # Adapt every 5% of sweeps
+
+                # Phase 3: Intelligent replica exchange parameters
+                enable_replica_exchange = 1 if num_replicas > 1 else 0  # Enable only with multiple replicas
+                exchange_threshold = 0.05  # Temperature difference threshold for exchange consideration
+
+                sampling_params_bytes = struct.pack('<6i2fIfi1f1i1i1f',
                     N,                    # int N
                     num_replicas,         # int num_replicas
                     num_sweeps,           # int num_sweeps
                     batch_reads,          # int num_reads (for this pass)
                     swap_interval,        # int swap_interval
                     sample_interval_local,      # int sample_interval
-                    T_min,                # float T_min
-                    T_max,                # float T_max
-                    base_seed & 0xFFFFFFFF  # uint base_seed
+                    adaptive_T_min,       # float T_min (use adaptive values)
+                    adaptive_T_max,       # float T_max (use adaptive values)
+                    base_seed & 0xFFFFFFFF,  # uint base_seed
+                    final_cooling_factor, # float cooling_factor (adaptive)
+                    final_cooling_start_sweep,  # int cooling_start_sweep (adaptive)
+                    target_acceptance,    # float target_acceptance_ratio
+                    adaptation_interval,  # int adaptation_interval
+                    enable_replica_exchange,  # int enable_replica_exchange
+                    exchange_threshold    # float exchange_threshold
                 )
                 # Update reusable staging buffer with current params; blit into persistent params_buffer
                 self._write_buffer_bytes(params_staging_buffer, sampling_params_bytes, "params_staging")
@@ -378,7 +486,7 @@ class MetalKernelDimodSampler:
                 per_thread_quota_buffer = self._create_buffer(quotas, "per_thread_quota")
 
 
-                # Worker-only dispatch (no manager): single command buffer per pass
+                # Worker-only dispatch: single command buffer per pass
                 self.logger.debug(f"[MetalEA] Dispatching worker-only (producer-free) pass {pass_idx+1}...")
 
                 # Single command buffer and encoder per pass
@@ -411,15 +519,19 @@ class MetalKernelDimodSampler:
                 encoder.setBuffer_offset_atIndex_(per_thread_base_buffer, 0, 9)
                 encoder.setBuffer_offset_atIndex_(per_thread_quota_buffer, 0, 10)
 
-                # Worker dispatch: Each worker thread gets its own threadgroup for isolation
-                if num_replicas == 1:
-                    threads_per_group = Metal.MTLSize(width=1, height=1, depth=1)
+                # Speed optimization: Better GPU utilization with larger threadgroups
+                max_threads_per_group = 32  # Apple Silicon optimal threadgroup size
+                if num_replicas <= max_threads_per_group:
+                    # Small number of replicas: use single threadgroup with multiple threads
+                    threads_per_group = Metal.MTLSize(width=num_replicas, height=1, depth=1)
                     num_groups = Metal.MTLSize(width=1, height=1, depth=1)
                 else:
-                    threads_per_group = Metal.MTLSize(width=1, height=1, depth=1)  # 1 thread per group
-                    num_groups = Metal.MTLSize(width=num_replicas, height=1, depth=1)  # num_replicas groups
+                    # Large number of replicas: use multiple threadgroups
+                    threads_per_group = Metal.MTLSize(width=max_threads_per_group, height=1, depth=1)
+                    num_groups = Metal.MTLSize(width=(num_replicas + max_threads_per_group - 1) // max_threads_per_group, height=1, depth=1)
 
-                self.logger.debug(f"[MetalEA] Worker dispatch: {num_groups.width} groups × {threads_per_group.width} threads = {num_replicas} worker threads")
+                total_threads = num_groups.width * threads_per_group.width
+                self.logger.debug(f"[MetalEA] Optimized GPU dispatch: {num_groups.width} groups × {threads_per_group.width} threads = {total_threads} total threads")
                 encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
 
 
@@ -447,92 +559,6 @@ class MetalKernelDimodSampler:
             self.logger.error(f"[MetalEA] Unified sampling failed: {e}")
             raise
 
-    def _fix_energy_calculation_bug(self, samples, gpu_energies, J):
-        """Fix systematic energy calculation bug in Metal kernel multi-threading.
-
-        The Metal kernel has a threading bug where samples 0 and 3 exchange energies
-        when multiple replicas are used. This method detects and corrects this pattern.
-        """
-        corrected_energies = []
-
-        corrections_made = 0
-        for i, sample in enumerate(samples):
-            # Calculate correct energy for this sample
-            correct_energy = 0.0
-            for (node_i, node_j), coupling in J.items():
-                correct_energy += coupling * sample[node_i] * sample[node_j]
-
-            correct_energy_int = int(correct_energy)
-            gpu_energy = gpu_energies[i] if i < len(gpu_energies) else 0
-
-
-            if abs(gpu_energy - correct_energy_int) > 1e-6:
-                corrections_made += 1
-
-            corrected_energies.append(correct_energy_int)
-
-        self.logger.debug(f"[MetalEA] Energy correction: Fixed {corrections_made}/{len(samples)} energies")
-        return corrected_energies
-
-    def _recalculate_energies_with_separate_kernel(self, samples, J, N, num_samples):
-        """Recalculate energies using the separate energy calculation kernel to avoid threading bugs."""
-        # Convert samples back to Metal buffer format
-        samples_flat = []
-        for sample in samples:
-            samples_flat.extend(sample)
-
-        samples_array = np.array(samples_flat, dtype=np.int8)
-        samples_buffer = self._create_buffer(samples_array, "recalc_samples")
-
-        # Create output buffer for energies
-        energies_array = np.zeros(num_samples, dtype=np.int32)
-        energies_buffer = self._create_buffer(energies_array, "recalc_energies")
-
-        # Get CSR data
-        L = int(round(N ** (1/3)))
-        buffer_data = self._convert_problem_to_buffers({i: 0.0 for i in range(N)}, J, L, num_samples)
-
-        csr_row_ptr_buffer = self._create_buffer(buffer_data['csr_row_ptr'], "recalc_csr_row_ptr")
-        csr_col_ind_buffer = self._create_buffer(buffer_data['csr_col_ind'], "recalc_csr_col_ind")
-        csr_J_vals_buffer = self._create_buffer(buffer_data['csr_J_vals'], "recalc_csr_J_vals")
-
-        # Create global data for the kernel
-        global_data_bytes = buffer_data['global_data'].copy()
-        global_buffer = self._create_buffer(global_data_bytes, "recalc_global")
-
-        # Use the separate energy calculation kernel
-        command_buffer = self._command_queue.commandBuffer()
-        encoder = command_buffer.computeCommandEncoder()
-        encoder.setComputePipelineState_(self._kernels["ea_compute_energies_kernel"])
-
-        encoder.setBuffer_offset_atIndex_(samples_buffer, 0, 0)
-        encoder.setBuffer_offset_atIndex_(energies_buffer, 0, 1)
-        encoder.setBuffer_offset_atIndex_(csr_row_ptr_buffer, 0, 2)
-        encoder.setBuffer_offset_atIndex_(csr_col_ind_buffer, 0, 3)
-        encoder.setBuffer_offset_atIndex_(csr_J_vals_buffer, 0, 4)
-        encoder.setBuffer_offset_atIndex_(global_buffer, 0, 5)
-
-        threads_per_group = Metal.MTLSize(width=min(num_samples, 256), height=1, depth=1)
-        num_groups = Metal.MTLSize(width=max(1, (num_samples + 255) // 256), height=1, depth=1)
-        encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
-
-        encoder.endEncoding()
-        command_buffer.commit()
-        command_buffer.waitUntilCompleted()
-
-        # Read back the corrected energies
-        energies_contents = energies_buffer.contents()
-        energies_buffer_length = energies_buffer.length()
-        energies_buffer_view = energies_contents.as_buffer(energies_buffer_length)
-
-        corrected_energies = []
-        for i in range(num_samples):
-            offset = i * 4  # 4 bytes per int32
-            energy_bytes = bytes([energies_buffer_view[offset + j] for j in range(4)])
-            energy = struct.unpack('<i', energy_bytes)[0]
-            corrected_energies.append(energy)
-
-        return corrected_energies
 
     def _collect_unified_samples(self, final_samples_buffer, final_energies_buffer, num_reads: int, N: int):
         """Collect samples from unified kernel output buffers."""
@@ -583,433 +609,6 @@ class MetalKernelDimodSampler:
         return samples, energies
 
 
-    def _get_problem_info_from_hJ(self, h, J, L):
-        """Get problem info from h,J parameters."""
-        return {
-            'model': 'custom',
-            'L': L,
-            'N': len(h),
-            'num_couplings': len(J),
-            'optimal_energy': 'unknown'  # We don't know the optimal energy
-        }
-
-    def sample_ising_slow_correct(self, h, J, num_reads: int = 256, num_sweeps: int = 100000,
-                    num_replicas: int = None, swap_interval: int = 15, cooling_interval: int = 500,
-                    T_min: float = 0.1, T_max: float = 5.0, cooling_factor: float = 0.999,
-                    spin_updates_per_sweep: int | None = None, parallel_spin_updates: bool = True,
-                    **kwargs) -> dimod.SampleSet:
-        """Original multi-kernel parallel tempering sampler - FOR DEBUGGING ONLY.
-
-        Converts the provided h,J problem to Metal buffer format for GPU acceleration.
-
-        Args:
-            h: Linear biases
-            J: Quadratic couplings
-            num_reads: Number of solution samples to return
-            num_sweeps: Number of Monte Carlo sweeps
-            num_replicas: Number of temperature replicas (auto if None)
-            swap_interval: Steps between replica exchanges
-            cooling_interval: Steps between temperature cooling
-            T_min: Minimum temperature
-            T_max: Maximum temperature
-            cooling_factor: Temperature cooling factor
-
-        Returns:
-            dimod.SampleSet with solution samples and energies
-        """
-        # Validate input parameters
-        if not h or not J:
-            raise ValueError("Both h and J parameters are required")
-
-        # Determine problem size from h parameter count
-        N = len(h)
-        L = round(N ** (1/3))  # Approximate cube root for Metal buffer sizing
-
-        start_time = time.time()
-
-        if num_replicas is None:
-            num_replicas = min(max(32, num_reads // 2), 512)
-
-        self.logger.debug(f"[MetalEA] Starting 3D EA sampling: L={L}, N={N}, replicas={num_replicas}, sweeps={num_sweeps}")
-
-        # Convert provided h,J to Metal buffer format
-        buffer_data = self._convert_problem_to_buffers(h, J, L, num_replicas)
-        problem_info = self._get_problem_info_from_hJ(h, J, L)
-        self.logger.debug(f"[MetalEA] Problem: {problem_info['num_couplings']} couplings, optimal energy: {problem_info['optimal_energy']}")
-
-        # Create Metal buffers
-        try:
-            # Spin states: [num_replicas] SpinState structs
-            # Each SpinState has: int8_t spins[MAX_N] + int N
-            # Create flattened buffers for dynamic sizing (no more fixed MAX_N)
-
-            # Replica spins: [num_replicas * N] flattened array
-            replica_spins_data = np.random.choice([-1, 1], size=(num_replicas * N)).astype(np.int8)
-            replica_spins_buffer = self._create_buffer(replica_spins_data, "replica_spins")
-
-            # CSR adjacency buffers
-            csr_row_ptr_buffer = self._create_buffer(buffer_data['csr_row_ptr'], "csr_row_ptr")
-            csr_col_ind_buffer = self._create_buffer(buffer_data['csr_col_ind'], "csr_col_ind")
-            csr_J_vals_buffer = self._create_buffer(buffer_data['csr_J_vals'], "csr_J_vals")
-            temperatures_buffer = self._create_buffer(buffer_data['temperatures'], "temperatures")
-
-            # Global data - handle new byte array format
-            global_data_bytes = buffer_data['global_data'].copy()
-            # Reset step counter at byte offset 24 (4 ints + 2 floats = 16+8 = 24)
-            step_bytes = struct.pack('<i', 0)  # step = 0 as int32
-            global_data_bytes[24:28] = np.frombuffer(step_bytes, dtype=np.uint8)
-            global_buffer = self._create_buffer(global_data_bytes, "global_data")
-
-            # Energy and best state tracking
-            replica_energies = np.zeros(num_replicas, dtype=np.int32)
-            replica_energies_buffer = self._create_buffer(replica_energies, "replica_energies")
-
-            best_energy = np.array([2147483647], dtype=np.int32)  # int32 max as "infinity"
-            best_energy_buffer = self._create_buffer(best_energy, "best_energy")
-
-            best_spins = np.zeros(N, dtype=np.int8)
-            best_spins_buffer = self._create_buffer(best_spins, "best_spins")
-
-            # Create second buffer for double-buffering (parallel spin updates)
-            replica_spins_buffer_alt = None
-            if parallel_spin_updates:
-                replica_spins_buffer_alt = self._create_buffer(replica_spins_data.copy(), "replica_spins_alt")
-
-        except Exception as e:
-            self.logger.error(f"[MetalEA] Buffer creation failed: {e}")
-            raise
-
-        # Note: Buffer validation removed for production
-
-        # Initialize random spins using GPU kernel
-        self._initialize_spins_gpu(replica_spins_buffer, global_buffer, 12345, num_replicas, N)
-
-        # Initial energy computation
-        self._compute_energies_gpu(replica_spins_buffer, replica_energies_buffer,
-                                  csr_row_ptr_buffer, csr_col_ind_buffer, csr_J_vals_buffer, global_buffer, num_replicas)
-
-        # Main Parallel Tempering loop
-        self.logger.debug(f"[MetalEA] Starting {num_sweeps} PT sweeps...")
-
-        progress_interval = max(1000, num_sweeps // 100)
-        cooling_start_step = 10000
-
-        # Determine spin updates per sweep (default: N)
-        k_updates = spin_updates_per_sweep if spin_updates_per_sweep is not None else N
-        step_counter = 0  # used for GPU RNG seeding in kernels
-
-        # Energy caching: track when energies are valid to avoid recomputation
-        energies_valid = False
-
-        # Double-buffering state for parallel spin updates
-        current_buffer = replica_spins_buffer
-        alt_buffer = replica_spins_buffer_alt
-
-        for step in range(num_sweeps):
-            # Step 1: Perform k spin updates per sweep
-            if parallel_spin_updates and alt_buffer is not None:
-                # Use parallel spin updates with double-buffering
-                for _ in range(k_updates):
-                    # Update global step counter for randomness
-                    step_bytes = struct.pack('<i', step_counter)  # step as int32
-                    global_data_bytes[24:28] = np.frombuffer(step_bytes, dtype=np.uint8)
-                    global_buffer = self._create_buffer(global_data_bytes, "global_data")
-
-                    # Execute parallel spin flip update (all spins simultaneously)
-                    self._parallel_spin_flip_gpu(current_buffer, alt_buffer, csr_row_ptr_buffer, csr_col_ind_buffer,
-                                               csr_J_vals_buffer, temperatures_buffer, global_buffer, num_replicas, N)
-
-                    # Swap buffers for next iteration
-                    current_buffer, alt_buffer = alt_buffer, current_buffer
-                    step_counter += 1
-            else:
-                # Use sequential spin updates (original method)
-                for _ in range(k_updates):
-                    # Update global step counter for randomness
-                    step_bytes = struct.pack('<i', step_counter)  # step as int32
-                    global_data_bytes[24:28] = np.frombuffer(step_bytes, dtype=np.uint8)
-                    global_buffer = self._create_buffer(global_data_bytes, "global_data")
-
-                    # Execute one spin flip update per replica
-                    self._spin_flip_gpu(current_buffer, csr_row_ptr_buffer, csr_col_ind_buffer, csr_J_vals_buffer,
-                                       temperatures_buffer, global_buffer, num_replicas)
-                    step_counter += 1
-
-            # Spin updates invalidate cached energies
-            energies_valid = False
-
-            # Step 2: Replica exchange (every swap_interval sweeps)
-            if step % swap_interval == 0:
-                # Only compute energies if they're not already valid
-                if not energies_valid:
-                    self._compute_energies_gpu(current_buffer, replica_energies_buffer,
-                                              csr_row_ptr_buffer, csr_col_ind_buffer, csr_J_vals_buffer, global_buffer, num_replicas)
-                    energies_valid = True
-
-                self._replica_exchange_gpu(current_buffer, replica_energies_buffer,
-                                          temperatures_buffer, global_buffer, num_replicas)
-                # Note: energies remain valid after replica exchange (just swapped between replicas)
-
-            # Step 3: Track best state
-            if step % (swap_interval * 2) == 0:
-                # Ensure energies are computed before tracking best
-                if not energies_valid:
-                    self._compute_energies_gpu(current_buffer, replica_energies_buffer,
-                                              csr_row_ptr_buffer, csr_col_ind_buffer, csr_J_vals_buffer, global_buffer, num_replicas)
-                    energies_valid = True
-
-                self._track_best_gpu(current_buffer, replica_energies_buffer,
-                                    best_energy_buffer, best_spins_buffer, global_buffer, num_replicas)
-
-            # Step 4: Temperature cooling (after exploration phase)
-            if step % cooling_interval == 0 and step > cooling_start_step:
-                self._update_temperatures_gpu(temperatures_buffer, cooling_factor, global_buffer, num_replicas)
-
-            # Progress logging (per sweep)
-            if step % progress_interval == 0 and step > 0:
-                current_best = self._read_best_energy(best_energy_buffer)
-                self.logger.debug(f"[MetalEA] Step {step}: best energy = {current_best:.1f}")
-
-        # Final computations
-        if not energies_valid:
-            self._compute_energies_gpu(current_buffer, replica_energies_buffer,
-                                      csr_row_ptr_buffer, csr_col_ind_buffer, csr_J_vals_buffer, global_buffer, num_replicas)
-        self._track_best_gpu(current_buffer, replica_energies_buffer,
-                            best_energy_buffer, best_spins_buffer, global_buffer, num_replicas)
-
-        # Read back results
-        samples, gpu_energies = self._collect_samples(current_buffer, replica_energies_buffer,
-                                                     num_replicas, N, num_reads)
-
-        # WORKAROUND: Fix systematic energy calculation bug in Metal kernel
-        energies = self._fix_energy_calculation_bug(samples, gpu_energies, J)
-
-        runtime = time.time() - start_time
-        spin_updates_per_sec = (num_sweeps * num_replicas * N) / runtime
-
-        self.logger.debug(f"[MetalEA] Completed: {runtime:.2f}s, {spin_updates_per_sec:.0f} spin updates/sec")
-
-        # Create dimod SampleSet
-        return dimod.SampleSet.from_samples(samples, 'SPIN', energies)
-
-    def _initialize_spins_gpu(self, replica_spins_buffer, global_buffer, seed: int, num_replicas: int, N: int):
-        """Initialize random spins using Metal kernel."""
-        command_buffer = self._command_queue.commandBuffer()
-        encoder = command_buffer.computeCommandEncoder()
-        encoder.setComputePipelineState_(self._kernels["ea_initialize_spins_kernel"])
-
-        # Set buffers
-        encoder.setBuffer_offset_atIndex_(replica_spins_buffer, 0, 0)
-        encoder.setBuffer_offset_atIndex_(global_buffer, 0, 1)
-        encoder.setBytes_length_atIndex_(np.array([seed], dtype=np.uint32).tobytes(), 4, 2)
-
-        # Dispatch threads: 2D pattern (replica_id, spin_idx)
-        # Use optimal thread group size
-        threads_per_group = Metal.MTLSize(width=min(num_replicas, 16), height=min(N, 16), depth=1)
-        num_groups = Metal.MTLSize(
-            width=max(1, (num_replicas + 15) // 16),
-            height=max(1, (N + 15) // 16),
-            depth=1
-        )
-        encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
-
-        encoder.endEncoding()
-        command_buffer.commit()
-        command_buffer.waitUntilCompleted()
-
-    def _spin_flip_gpu(self, replica_spins_buffer, csr_row_ptr_buffer, csr_col_ind_buffer, csr_J_vals_buffer,
-                      temperatures_buffer, global_buffer, num_replicas):
-        """Execute spin flip kernel."""
-        command_buffer = self._command_queue.commandBuffer()
-        encoder = command_buffer.computeCommandEncoder()
-        encoder.setComputePipelineState_(self._kernels["ea_spin_flip_kernel"])
-
-        # Set buffers (match Metal kernel indices)
-        encoder.setBuffer_offset_atIndex_(replica_spins_buffer, 0, 0)
-        encoder.setBuffer_offset_atIndex_(csr_row_ptr_buffer, 0, 1)
-        encoder.setBuffer_offset_atIndex_(csr_col_ind_buffer, 0, 2)
-        encoder.setBuffer_offset_atIndex_(csr_J_vals_buffer, 0, 3)
-        encoder.setBuffer_offset_atIndex_(temperatures_buffer, 0, 4)
-        encoder.setBuffer_offset_atIndex_(global_buffer, 0, 5)
-
-        # Dispatch one thread per replica - use actual num_replicas
-        threads_per_group = Metal.MTLSize(width=min(num_replicas, 256), height=1, depth=1)
-        num_groups = Metal.MTLSize(width=max(1, (num_replicas + 255) // 256), height=1, depth=1)
-        encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
-
-        encoder.endEncoding()
-        command_buffer.commit()
-        command_buffer.waitUntilCompleted()
-
-    def _parallel_spin_flip_gpu(self, src_buffer, dst_buffer, csr_row_ptr_buffer, csr_col_ind_buffer, csr_J_vals_buffer,
-                               temperatures_buffer, global_buffer, num_replicas, N):
-        """Execute parallel spin flip kernel on GPU with double-buffering."""
-        command_buffer = self._command_queue.commandBuffer()
-        encoder = command_buffer.computeCommandEncoder()
-        encoder.setComputePipelineState_(self._kernels["ea_parallel_spin_flip_kernel"])
-
-        # Set buffers (match Metal kernel indices)
-        encoder.setBuffer_offset_atIndex_(src_buffer, 0, 0)
-        encoder.setBuffer_offset_atIndex_(dst_buffer, 0, 1)
-        encoder.setBuffer_offset_atIndex_(csr_row_ptr_buffer, 0, 2)
-        encoder.setBuffer_offset_atIndex_(csr_col_ind_buffer, 0, 3)
-        encoder.setBuffer_offset_atIndex_(csr_J_vals_buffer, 0, 4)
-        encoder.setBuffer_offset_atIndex_(temperatures_buffer, 0, 5)
-        encoder.setBuffer_offset_atIndex_(global_buffer, 0, 6)
-
-        # 2D dispatch: replicas × spins
-        threads_per_group = Metal.MTLSize(width=min(num_replicas, 8), height=min(N, 8), depth=1)
-        groups_x = max(1, (num_replicas + threads_per_group.width - 1) // threads_per_group.width)
-        groups_y = max(1, (N + threads_per_group.height - 1) // threads_per_group.height)
-        num_groups = Metal.MTLSize(width=groups_x, height=groups_y, depth=1)
-        encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
-
-        encoder.endEncoding()
-        command_buffer.commit()
-        command_buffer.waitUntilCompleted()
-
-    def _compute_energies_gpu(self, replica_spins_buffer, replica_energies_buffer,
-                             csr_row_ptr_buffer, csr_col_ind_buffer, csr_J_vals_buffer, global_buffer, num_replicas):
-        """Compute energies for all replicas."""
-        command_buffer = self._command_queue.commandBuffer()
-        encoder = command_buffer.computeCommandEncoder()
-        encoder.setComputePipelineState_(self._kernels["ea_compute_energies_kernel"])
-
-        # Set buffers (match Metal kernel indices)
-        encoder.setBuffer_offset_atIndex_(replica_spins_buffer, 0, 0)
-        encoder.setBuffer_offset_atIndex_(replica_energies_buffer, 0, 1)
-        encoder.setBuffer_offset_atIndex_(csr_row_ptr_buffer, 0, 2)
-        encoder.setBuffer_offset_atIndex_(csr_col_ind_buffer, 0, 3)
-        encoder.setBuffer_offset_atIndex_(csr_J_vals_buffer, 0, 4)
-        encoder.setBuffer_offset_atIndex_(global_buffer, 0, 5)
-
-        # Dispatch one thread per replica
-        threads_per_group = Metal.MTLSize(width=min(num_replicas, 256), height=1, depth=1)
-        num_groups = Metal.MTLSize(width=max(1, (num_replicas + 255) // 256), height=1, depth=1)
-        encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
-
-        encoder.endEncoding()
-        command_buffer.commit()
-        command_buffer.waitUntilCompleted()
-
-    def _replica_exchange_gpu(self, replica_spins_buffer, replica_energies_buffer,
-                             temperatures_buffer, global_buffer, num_replicas):
-        """Execute replica exchange kernel."""
-        command_buffer = self._command_queue.commandBuffer()
-        encoder = command_buffer.computeCommandEncoder()
-        encoder.setComputePipelineState_(self._kernels["ea_replica_exchange_kernel"])
-
-        # Set buffers
-        encoder.setBuffer_offset_atIndex_(replica_spins_buffer, 0, 0)
-        encoder.setBuffer_offset_atIndex_(replica_energies_buffer, 0, 1)
-        encoder.setBuffer_offset_atIndex_(temperatures_buffer, 0, 2)
-        encoder.setBuffer_offset_atIndex_(global_buffer, 0, 3)
-
-        # Dispatch one thread per replica (only even replicas process)
-        threads_per_group = Metal.MTLSize(width=min(num_replicas, 256), height=1, depth=1)
-        num_groups = Metal.MTLSize(width=max(1, (num_replicas + 255) // 256), height=1, depth=1)
-        encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
-
-        encoder.endEncoding()
-        command_buffer.commit()
-        command_buffer.waitUntilCompleted()
-
-    def _track_best_gpu(self, replica_spins_buffer, replica_energies_buffer,
-                       best_energy_buffer, best_spins_buffer, global_buffer, num_replicas):
-        """Track best energy and configuration."""
-        command_buffer = self._command_queue.commandBuffer()
-        encoder = command_buffer.computeCommandEncoder()
-        encoder.setComputePipelineState_(self._kernels["ea_track_best_kernel"])
-
-        # Set buffers
-        encoder.setBuffer_offset_atIndex_(replica_spins_buffer, 0, 0)
-        encoder.setBuffer_offset_atIndex_(replica_energies_buffer, 0, 1)
-        encoder.setBuffer_offset_atIndex_(best_energy_buffer, 0, 2)
-        encoder.setBuffer_offset_atIndex_(best_spins_buffer, 0, 3)
-        encoder.setBuffer_offset_atIndex_(global_buffer, 0, 4)
-
-        # Dispatch one thread per replica
-        threads_per_group = Metal.MTLSize(width=min(num_replicas, 256), height=1, depth=1)
-        num_groups = Metal.MTLSize(width=max(1, (num_replicas + 255) // 256), height=1, depth=1)
-        encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
-
-        encoder.endEncoding()
-        command_buffer.commit()
-        command_buffer.waitUntilCompleted()
-
-    def _update_temperatures_gpu(self, temperatures_buffer, cooling_factor: float, global_buffer, num_replicas):
-        """Update temperature schedule with cooling."""
-        command_buffer = self._command_queue.commandBuffer()
-        encoder = command_buffer.computeCommandEncoder()
-        encoder.setComputePipelineState_(self._kernels["ea_update_temperatures_kernel"])
-
-        # Set buffers
-        encoder.setBuffer_offset_atIndex_(temperatures_buffer, 0, 0)
-        encoder.setBytes_length_atIndex_(np.array([cooling_factor], dtype=np.float32).tobytes(), 4, 1)
-        encoder.setBuffer_offset_atIndex_(global_buffer, 0, 2)
-
-        # Dispatch one thread per replica
-        threads_per_group = Metal.MTLSize(width=min(num_replicas, 256), height=1, depth=1)
-        num_groups = Metal.MTLSize(width=max(1, (num_replicas + 255) // 256), height=1, depth=1)
-        encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
-
-        encoder.endEncoding()
-        command_buffer.commit()
-        command_buffer.waitUntilCompleted()
-
-    def _read_best_energy(self, best_energy_buffer) -> int:
-        """Read current best energy from GPU buffer."""
-        try:
-            contents = best_energy_buffer.contents()
-            buffer_length = best_energy_buffer.length()
-            buffer_view = contents.as_buffer(buffer_length)
-            energy_bytes = bytes([buffer_view[i] for i in range(4)])
-            energy = struct.unpack('<i', energy_bytes)[0]
-            return energy
-        except:
-            return 2147483647  # int32 max as "infinity"
-
-    def _collect_samples(self, replica_spins_buffer, replica_energies_buffer,
-                        num_replicas: int, N: int, num_reads: int) -> Tuple[list, list]:
-        """Collect final samples from GPU replicas."""
-        # Read replica energies using the fixed method
-        energies_contents = replica_energies_buffer.contents()
-        energies_buffer_length = replica_energies_buffer.length()
-        energies_buffer_view = energies_contents.as_buffer(energies_buffer_length)
-        energies = []
-
-        for r in range(num_replicas):
-            offset = r * 4  # 4 bytes per int32
-            energy_bytes = bytes([energies_buffer_view[offset + i] for i in range(4)])
-            energy = struct.unpack('<i', energy_bytes)[0]
-            energies.append(energy)
-
-        # Read replica spins from flattened array: [num_replicas * N] int8
-        spins_contents = replica_spins_buffer.contents()
-        spins_buffer_length = replica_spins_buffer.length()
-        spins_buffer_view = spins_contents.as_buffer(spins_buffer_length)
-        spins_bytes = bytes(spins_buffer_view)
-        spins_flat = np.frombuffer(spins_bytes, dtype=np.int8)
-
-        # NO FALLBACKS - crash on buffer size mismatch
-        expected_len = num_replicas * N
-        if spins_flat.size != expected_len:
-            raise RuntimeError(f"REPLICA BUFFER FAILURE: Expected {expected_len} spin bytes, got {spins_flat.size}. "
-                             f"This indicates replica buffer allocation mismatch.")
-
-        samples = []
-        for read_idx in range(num_reads):
-            replica_idx = read_idx % num_replicas
-            start = replica_idx * N
-            end = start + N
-            replica_spins = spins_flat[start:end]
-            sample = [int(spin) for spin in replica_spins]
-            samples.append(sample)
-
-        # Map energies to reads in the same round-robin way
-        sample_energies = [energies[read_idx % num_replicas] for read_idx in range(num_reads)]
-
-        return samples, sample_energies
 
     def close(self):
         """Clean up Metal resources."""
