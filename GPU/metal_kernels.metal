@@ -334,13 +334,14 @@ kernel void worker_parallel_tempering(
     // Output data (write-only)
     device int8_t* final_samples [[buffer(5)]],           // [num_reads * N] collected samples
     device int* final_energies [[buffer(6)]],             // [num_reads] sample energies
-    device atomic<int>* best_energy [[buffer(7)]],        // [1] global best energy
-    device int8_t* best_spins [[buffer(8)]],              // [N] global best configuration
 
     // Worker buffers
-    device int8_t* thread_buffers [[buffer(9)]],          // [num_replicas * N] per-thread work buffers
-    device atomic<int>* thread_energies [[buffer(10)]],   // [num_replicas] per-thread energy tracking (atomic)
-    device uint* rng_states [[buffer(11)]],               // [num_replicas] RNG states per replica
+    device int8_t* thread_buffers [[buffer(7)]],          // [num_replicas * N] per-thread work buffers
+    device uint* rng_states [[buffer(8)]],               // [num_replicas] RNG states per replica
+
+    // Output partitioning (per-thread base/quota)
+    device const int* per_thread_base [[buffer(9)]],     // [num_replicas] base output index per thread
+    device const int* per_thread_quota [[buffer(10)]],    // [num_replicas] number of samples to write per thread
 
     uint3 thread_id [[thread_position_in_grid]],
     uint3 threads_per_threadgroup [[threads_per_threadgroup]],
@@ -370,11 +371,6 @@ kernel void worker_parallel_tempering(
 
     // Initialize thread's RNG state (PRIVATE - no sharing)
     uint my_rng_state = params->base_seed + replica_id * 12345u + threadgroup_id.x * 67890u;
-
-    // Initialize global best to a high value (single writer correctness not critical here)
-    if (replica_id == 0) {
-        atomic_store_explicit(&best_energy[0], 999999, memory_order_relaxed);
-    }
 
     // STEP 1: Thread initializes independently (no manager dependency for startup)
 
@@ -421,12 +417,14 @@ kernel void worker_parallel_tempering(
         }
     }
 
-    // Workers store their optimization energy (for internal use during optimization)
-    atomic_store_explicit(&thread_energies[replica_id], my_thread_energy, memory_order_relaxed);
-
     // Workers only handle optimization - no coordination duties
 
     // STEP 4: Main optimization loop - Parallel tempering with isolated thread buffers
+    int my_quota = per_thread_quota[replica_id];
+    int my_base = per_thread_base[replica_id];
+    int local_out = 0;
+    int sample_interval = params->sample_interval > 0 ? params->sample_interval : 1;
+
     for (int sweep = 0; sweep < params->num_sweeps; sweep++) {
         // Each thread optimizes its own isolated buffer
         for (int spin_idx = 0; spin_idx < N; spin_idx++) {
@@ -466,81 +464,75 @@ kernel void worker_parallel_tempering(
             }
         }
 
-        // Update global best if this thread found a better solution
-        int current_best = atomic_load_explicit(&best_energy[0], memory_order_relaxed);
-        if (my_thread_energy < current_best) {
-            if (atomic_compare_exchange_weak_explicit(&best_energy[0], &current_best, my_thread_energy,
-                                                     memory_order_relaxed, memory_order_relaxed)) {
-                // Copy this thread's buffer to global best
+
+        // Sample collection at specified intervals
+        if (((sweep + 1) % sample_interval) == 0 && local_out < my_quota) {
+            // Compute energy from current buffer
+            int calculated_energy = 0;
+            if (N == 2) {
+                int8_t s0 = my_thread_buffer[0];
+                int8_t s1 = my_thread_buffer[1];
+                calculated_energy = -1 * s0 * s1;
+            } else {
                 for (int i = 0; i < N; i++) {
-                    best_spins[i] = my_thread_buffer[i];
+                    int8_t s_i = my_thread_buffer[i];
+                    int row_start = csr_row_ptr[i];
+                    int row_end = csr_row_ptr[i + 1];
+                    for (int p = row_start; p < row_end; ++p) {
+                        int j = csr_col_ind[p];
+                        if (j > i) {
+                            int8_t Jij = csr_J_vals[p];
+                            int8_t s_j = my_thread_buffer[j];
+                            calculated_energy += Jij * s_i * s_j;
+                        }
+                    }
                 }
             }
-        }
 
-        // Skip sample collection during optimization for now - collect at end
+            int out_idx = my_base + local_out;
+            if (out_idx < params->num_reads) {
+                // Write sample spins
+                uint sample_offset = (uint)out_idx * (uint)N;
+                for (int i = 0; i < N; i++) {
+                    final_samples[sample_offset + i] = my_thread_buffer[i];
+                }
+                final_energies[out_idx] = calculated_energy;
+                local_out++;
+            }
+        }
     }
 
-    // Workers no longer write to final_samples - manager handles both samples AND energies
-    // This ensures perfect correlation between samples and their calculated energies
-}
-
-// SEPARATE MANAGER KERNEL - Handles BOTH sample collection AND energy calculation after workers complete
-kernel void manager_energy_calculator(
-    // Input data (read-only)
-    device const int* csr_row_ptr [[buffer(0)]],          // [N+1] CSR row pointers
-    device const int* csr_col_ind [[buffer(1)]],          // [nnz] CSR column indices
-    device const int8_t* csr_J_vals [[buffer(2)]],        // [nnz] CSR coupling values
-    device const SamplingParams* params [[buffer(3)]],    // Sampling parameters
-
-    // Worker data (read-only)
-    device const int8_t* thread_buffers [[buffer(4)]],    // Worker thread buffers
-
-    // Output data (write-only)
-    device int8_t* final_samples [[buffer(5)]],           // [num_reads * N] collected samples
-    device int* final_energies [[buffer(6)]]              // [num_reads] calculated energies
-) {
-    int N = params->N;
-    const int BUFFER_PADDING = 8;
-    const int PADDED_SIZE = N + BUFFER_PADDING;
-
-    // Workers are guaranteed complete by command buffer ordering; no busy-wait needed
-
-    // Calculate energies for all worker buffers
-    for (uint read_id = 0; read_id < params->num_reads && read_id < params->num_replicas; read_id++) {
-        // Get worker's buffer using proper addressing
-        device const int8_t* worker_buffer = &thread_buffers[read_id * PADDED_SIZE];
-
-        // STEP 1: Copy sample to final_samples (ensuring correlation with energy calculation)
-        uint sample_offset = read_id * N;
-        for (int i = 0; i < N; i++) {
-            final_samples[sample_offset + i] = worker_buffer[i];
-        }
-
-        // STEP 2: Calculate energy for the SAME buffer we just copied
+    // If quota not met due to large sample_interval, emit remaining samples from final state
+    while (local_out < my_quota) {
         int calculated_energy = 0;
         if (N == 2) {
-            int8_t s0 = worker_buffer[0];
-            int8_t s1 = worker_buffer[1];
+            int8_t s0 = my_thread_buffer[0];
+            int8_t s1 = my_thread_buffer[1];
             calculated_energy = -1 * s0 * s1;
         } else {
             for (int i = 0; i < N; i++) {
-                int8_t s_i = worker_buffer[i];
-                int start = csr_row_ptr[i];
-                int end = csr_row_ptr[i + 1];
-
-                for (int p = start; p < end; ++p) {
+                int8_t s_i = my_thread_buffer[i];
+                int row_start = csr_row_ptr[i];
+                int row_end = csr_row_ptr[i + 1];
+                for (int p = row_start; p < row_end; ++p) {
                     int j = csr_col_ind[p];
                     if (j > i) {
                         int8_t Jij = csr_J_vals[p];
-                        int8_t s_j = worker_buffer[j];
+                        int8_t s_j = my_thread_buffer[j];
                         calculated_energy += Jij * s_i * s_j;
                     }
                 }
             }
         }
-
-        // STEP 3: Write the authoritative energy for the sample we just copied
-        final_energies[read_id] = calculated_energy;
+        int out_idx = my_base + local_out;
+        if (out_idx < params->num_reads) {
+            uint sample_offset = (uint)out_idx * (uint)N;
+            for (int i = 0; i < N; i++) {
+                final_samples[sample_offset + i] = my_thread_buffer[i];
+            }
+            final_energies[out_idx] = calculated_energy;
+        }
+        local_out++;
     }
 }
+

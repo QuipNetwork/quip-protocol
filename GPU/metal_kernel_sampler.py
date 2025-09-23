@@ -27,13 +27,17 @@ from shared.quantum_proof_of_work import DEFAULT_TOPOLOGY
 class MetalKernelDimodSampler:
     """Apple Metal GPU Parallel Tempering sampler for 3D Edwards-Anderson spin glasses."""
 
-    def __init__(self, device: str = "mps", logger: Optional[logging.Logger] = None, verbose: bool = False):
+    def __init__(self, device: str = "mps", logger: Optional[logging.Logger] = None,
+                 verbose: bool = False, default_sample_interval: Optional[int] = None):
         """Initialize Metal EA sampler.
 
         Args:
             device: Metal device ("mps" for Apple Metal Performance Shaders)
             logger: Optional logger instance
             verbose: If True, enable DEBUG logging for this sampler
+            default_sample_interval: Optional default sample interval (>=1) to use
+                for all calls unless overridden in sample_ising(). If None, a
+                heuristic is used per call.
         """
         self.logger = logger or logging.getLogger(__name__)
         self._verbose = verbose
@@ -49,6 +53,8 @@ class MetalKernelDimodSampler:
             # Respect provided logger but elevate to DEBUG if verbose explicitly requested
             if verbose:
                 self.logger.setLevel(logging.DEBUG)
+        # Default sampling behavior
+        self._default_sample_interval = default_sample_interval
         self.sampler_type = "metal_ea_3d"
 
         if not METAL_AVAILABLE:
@@ -97,8 +103,7 @@ class MetalKernelDimodSampler:
                 "ea_track_best_kernel",
                 "ea_initialize_spins_kernel",
                 "ea_update_temperatures_kernel",
-                "worker_parallel_tempering",
-                "manager_energy_calculator"
+                "worker_parallel_tempering"
             ]
 
             for name in kernel_names:
@@ -135,6 +140,21 @@ class MetalKernelDimodSampler:
             raise RuntimeError(f"Failed to create Metal buffer: {label}")
         return buffer
 
+    def _write_buffer_bytes(self, buffer: Any, byte_data: bytes, label: str = "") -> None:
+        """Write raw bytes into an existing Metal buffer (shared storage).
+        Length must not exceed buffer.length().
+        """
+        if not isinstance(byte_data, (bytes, bytearray)):
+            raise TypeError(f"Expected bytes/bytearray for {label} write, got {type(byte_data)}")
+        buf_len = buffer.length()
+        data_len = len(byte_data)
+        if data_len > buf_len:
+            raise ValueError(f"Write overflow for {label}: {data_len} > buffer.length {buf_len}")
+        contents = buffer.contents()
+        view = contents.as_buffer(buf_len)
+        mv = memoryview(view)
+        mv[:data_len] = bytearray(byte_data)
+
     def _convert_problem_to_buffers(self, h, J, L, num_replicas):
         """Convert arbitrary h,J problem to Metal buffer format."""
         N = len(h)  # Use actual problem size, not L^3
@@ -169,7 +189,7 @@ class MetalKernelDimodSampler:
         j_vals = np.array(j_vals_list, dtype=np.int8)
 
         # Create adaptive temperature schedule for parallel tempering
-        temperatures = self._create_adaptive_temperature_ladder(0.1, 5.0, num_replicas).astype(np.float32)
+        temperatures = self._create_adaptive_temperature_ladder(0.01, 1.0, num_replicas).astype(np.float32)
 
         # Create global data buffer (must match Metal GlobalData struct layout)
         # struct GlobalData { int N; int num_replicas; int swap_interval; int cooling_interval; float T_min, T_max; int step; };
@@ -181,8 +201,8 @@ class MetalKernelDimodSampler:
         ], dtype=np.int32)
 
         float_values = np.array([
-            0.1,                 # T_min
-            5.0,                 # T_max
+            0.01,                # T_min
+            1.0,                 # T_max
         ], dtype=np.float32)
 
         step_value = np.array([0], dtype=np.int32)  # step counter
@@ -231,9 +251,14 @@ class MetalKernelDimodSampler:
 
     def sample_ising(self, h, J, num_reads: int = 256, num_sweeps: int = 1000,
                             num_replicas: int = None, swap_interval: int = 15,
-                            T_min: float = 0.1, T_max: float = 5.0,
+                            T_min: float = 0.01, T_max: float = 1.0,
+                            sample_interval: Optional[int] = None,
                             **kwargs) -> dimod.SampleSet:
-        """GPU-only unified parallel tempering sampler - single kernel dispatch (DEFAULT)."""
+        """GPU-only unified parallel tempering sampler - single kernel dispatch (DEFAULT).
+        Args:
+            sample_interval: If provided, collect a sample every this many sweeps (>=1).
+                             If None, a heuristic based on num_reads/num_replicas is used.
+        """
 
         start_time = time.time()
         N = len(h)
@@ -269,7 +294,11 @@ class MetalKernelDimodSampler:
         temperatures = self._create_adaptive_temperature_ladder(T_min, T_max, num_replicas).astype(np.float32)
 
         # Create sampling parameters struct with proper data types
-        sample_interval = max(1, num_sweeps // (num_reads // num_replicas + 1))
+        chosen_interval = sample_interval if sample_interval is not None else self._default_sample_interval
+        if chosen_interval is None:
+            sample_interval_local = max(1, num_sweeps // (max(1, num_reads // num_replicas) + 1))
+        else:
+            sample_interval_local = max(1, min(int(chosen_interval), int(num_sweeps)))
 
         try:
             # Create input buffers (reused across passes)
@@ -282,6 +311,11 @@ class MetalKernelDimodSampler:
             if params_buffer is None:
                 raise RuntimeError("Failed to create Metal params buffer")
 
+            # Create reusable staging buffer for params
+            params_staging_buffer = self._device.newBufferWithLength_options_(params_size, 0)
+            if params_staging_buffer is None:
+                raise RuntimeError("Failed to create Metal params staging buffer")
+
             temperatures_buffer = self._create_buffer(temperatures, "temperatures")
 
             # Allocate reusable buffers sized to num_replicas for multipass reuse
@@ -290,23 +324,17 @@ class MetalKernelDimodSampler:
 
             # Communication buffers (reused across passes)
             thread_buffers = np.zeros(num_replicas * padded_size, dtype=np.int8)
-            thread_energies = np.zeros(num_replicas, dtype=np.int32)
             rng_states = np.zeros(num_replicas, dtype=np.uint32)
 
             thread_buffers_buffer = self._create_buffer(thread_buffers, "thread_buffers")
-            thread_energies_buffer = self._create_buffer(thread_energies, "thread_energies")
             rng_states_buffer = self._create_buffer(rng_states, "rng_states")
 
             # Output buffers (sized to num_replicas; we'll slice to batch_reads per pass)
             final_samples = np.zeros(num_replicas * N, dtype=np.int8)
             final_energies = np.zeros(num_replicas, dtype=np.int32)
-            best_energy = np.array([2147483647], dtype=np.int32)  # int32 max
-            best_spins = np.zeros(N, dtype=np.int8)
 
             final_samples_buffer = self._create_buffer(final_samples, "final_samples")
             final_energies_buffer = self._create_buffer(final_energies, "final_energies")
-            best_energy_buffer = self._create_buffer(best_energy, "best_energy")
-            best_spins_buffer = self._create_buffer(best_spins, "best_spins")
 
             all_samples = []
             all_energies = []
@@ -324,18 +352,34 @@ class MetalKernelDimodSampler:
                     num_sweeps,           # int num_sweeps
                     batch_reads,          # int num_reads (for this pass)
                     swap_interval,        # int swap_interval
-                    sample_interval,      # int sample_interval
+                    sample_interval_local,      # int sample_interval
                     T_min,                # float T_min
                     T_max,                # float T_max
                     base_seed & 0xFFFFFFFF  # uint base_seed
                 )
-                # Create a tiny staging buffer with current params; copy into persistent params_buffer via blit
-                staging_params = np.frombuffer(sampling_params_bytes, dtype=np.uint8)
-                staging_params_buffer = self._create_buffer(staging_params, "params_staging")
+                # Update reusable staging buffer with current params; blit into persistent params_buffer
+                self._write_buffer_bytes(params_staging_buffer, sampling_params_bytes, "params_staging")
+
+                # Compute per-thread base/quota to partition batch_reads across replicas
+                quotas = np.zeros(num_replicas, dtype=np.int32)
+                if batch_reads > 0:
+                    base_q = batch_reads // num_replicas
+                    rem_q = batch_reads % num_replicas
+                    if base_q > 0:
+                        quotas[:] = base_q
+                    if rem_q > 0:
+                        quotas[:rem_q] += 1
+                bases = np.zeros(num_replicas, dtype=np.int32)
+                if num_replicas > 1:
+                    # Prefix sum of quotas for base indices
+                    bases[1:] = np.cumsum(quotas[:-1], dtype=np.int32)
+
+                per_thread_base_buffer = self._create_buffer(bases, "per_thread_base")
+                per_thread_quota_buffer = self._create_buffer(quotas, "per_thread_quota")
 
 
-                # Separated kernel dispatch - workers first, then manager
-                self.logger.debug(f"[MetalEA] Dispatching worker+manager (single command buffer) pass {pass_idx+1}...")
+                # Worker-only dispatch (no manager): single command buffer per pass
+                self.logger.debug(f"[MetalEA] Dispatching worker-only (producer-free) pass {pass_idx+1}...")
 
                 # Single command buffer and encoder per pass
                 command_buffer = self._command_queue.commandBuffer()
@@ -346,7 +390,7 @@ class MetalKernelDimodSampler:
                 # Update persistent params_buffer using a blit from staging_params_buffer
                 blit = command_buffer.blitCommandEncoder()
                 blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size_(
-                    staging_params_buffer, 0, params_buffer, 0, params_size
+                    params_staging_buffer, 0, params_buffer, 0, params_size
                 )
                 blit.endEncoding()
 
@@ -360,12 +404,12 @@ class MetalKernelDimodSampler:
                 encoder.setBuffer_offset_atIndex_(params_buffer, 0, 4)
                 encoder.setBuffer_offset_atIndex_(final_samples_buffer, 0, 5)
                 encoder.setBuffer_offset_atIndex_(final_energies_buffer, 0, 6)
-                encoder.setBuffer_offset_atIndex_(best_energy_buffer, 0, 7)
-                encoder.setBuffer_offset_atIndex_(best_spins_buffer, 0, 8)
                 # Worker communication buffers
-                encoder.setBuffer_offset_atIndex_(thread_buffers_buffer, 0, 9)
-                encoder.setBuffer_offset_atIndex_(thread_energies_buffer, 0, 10)
-                encoder.setBuffer_offset_atIndex_(rng_states_buffer, 0, 11)
+                encoder.setBuffer_offset_atIndex_(thread_buffers_buffer, 0, 7)
+                encoder.setBuffer_offset_atIndex_(rng_states_buffer, 0, 8)
+                # Per-thread output partitioning
+                encoder.setBuffer_offset_atIndex_(per_thread_base_buffer, 0, 9)
+                encoder.setBuffer_offset_atIndex_(per_thread_quota_buffer, 0, 10)
 
                 # Worker dispatch: Each worker thread gets its own threadgroup for isolation
                 if num_replicas == 1:
@@ -378,23 +422,7 @@ class MetalKernelDimodSampler:
                 self.logger.debug(f"[MetalEA] Worker dispatch: {num_groups.width} groups × {threads_per_group.width} threads = {num_replicas} worker threads")
                 encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
 
-                # STEP 2: Dispatch manager kernel in the same encoder
-                encoder.setComputePipelineState_(self._kernels["manager_energy_calculator"])
 
-                # Set manager kernel buffers - matches manager_energy_calculator signature
-                encoder.setBuffer_offset_atIndex_(csr_row_ptr_buffer, 0, 0)
-                encoder.setBuffer_offset_atIndex_(csr_col_ind_buffer, 0, 1)
-                encoder.setBuffer_offset_atIndex_(csr_J_vals_buffer, 0, 2)
-                encoder.setBuffer_offset_atIndex_(params_buffer, 0, 3)
-                encoder.setBuffer_offset_atIndex_(thread_buffers_buffer, 0, 4)
-                encoder.setBuffer_offset_atIndex_(final_samples_buffer, 0, 5)
-                encoder.setBuffer_offset_atIndex_(final_energies_buffer, 0, 6)
-
-                # Manager dispatch: Single thread to calculate all energies
-                threads_per_group = Metal.MTLSize(width=1, height=1, depth=1)
-                num_groups = Metal.MTLSize(width=1, height=1, depth=1)
-                self.logger.debug(f"[MetalEA] Manager dispatch: 1 group × 1 thread = 1 manager thread")
-                encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
 
                 # Finish encoding and submit once
                 encoder.endEncoding()

@@ -50,7 +50,7 @@ for idx, (h, J, optimal_energy, description) in enumerate(BASIC_ISING_PROBLEMS):
         EA_COMPATIBLE_PROBLEMS.append((idx, h, J, optimal_energy, description))
 
 
-def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, problem=None, num_replicas=None, swap_interval=15, T_min=0.1, T_max=5.0, cooling_factor=0.999, spin_updates_per_sweep=None, parallel_spin_updates=True, synthetic_regular_n=None, synthetic_regular_degree=None):
+def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, problem=None, num_replicas=None, swap_interval=15, T_min=0.1, T_max=5.0, cooling_factor=0.999, spin_updates_per_sweep=None, parallel_spin_updates=True, synthetic_regular_n=None, synthetic_regular_degree=None, sample_interval=None):
     """Test Metal Parallel Tempering sampler on EA-compatible problems only."""
     print("🔬 Metal Parallel Tempering Performance Tester")
     print("=" * 70)
@@ -141,12 +141,14 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, pr
         print(f"⏭️  Skipping first {skip} problems")
     if retry > 0:
         print(f"🔄 Retry limit: {retry} attempts per test")
-    if reads is not None or sweeps is not None:
+    if any(v is not None for v in (reads, sweeps, sample_interval)):
         override_info = []
         if reads is not None:
             override_info.append(f"reads={reads}")
         if sweeps is not None:
             override_info.append(f"sweeps={sweeps}")
+        if sample_interval is not None:
+            override_info.append(f"sample_interval={sample_interval}")
         print(f"⚙️  Parameter overrides: {', '.join(override_info)}")
 
     if problem is not None and not (synthetic_regular_n is not None and synthetic_regular_degree is not None):
@@ -172,7 +174,8 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, pr
                 num_replicas=num_replicas,
                 swap_interval=swap_interval,
                 T_min=T_min,
-                T_max=T_max
+                T_max=T_max,
+                sample_interval=sample_interval
             )
 
             runtime = time.time() - start_time
@@ -366,6 +369,9 @@ if __name__ == "__main__":
                         help="Maximum temperature (default: 5.0)")
     parser.add_argument("--cooling-factor", type=float, default=0.999,
                         help="Temperature cooling factor per step (default: 0.999)")
+    parser.add_argument("--sample-interval", type=int, default=None,
+                        help="Collect a sample every K sweeps (default: heuristic if omitted)")
+
     parser.add_argument("--spin-updates-per-sweep", type=int, default=None,
                         help="Number of spin updates per sweep (default: N)")
     parser.add_argument("--parallel-spin-updates", action="store_true", default=True,
@@ -388,5 +394,6 @@ if __name__ == "__main__":
         swap_interval=args.swap_interval, T_min=args.T_min, T_max=args.T_max,
         cooling_factor=args.cooling_factor, spin_updates_per_sweep=args.spin_updates_per_sweep,
         parallel_spin_updates=args.parallel_spin_updates,
-        synthetic_regular_n=args.synthetic_regular_n, synthetic_regular_degree=args.synthetic_regular_degree
+        synthetic_regular_n=args.synthetic_regular_n, synthetic_regular_degree=args.synthetic_regular_degree,
+        sample_interval=args.sample_interval
     )
