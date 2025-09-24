@@ -19,18 +19,25 @@ try:
 except ImportError:
     METAL_AVAILABLE = False
 
+# Optional: new parallel sampler for A/B testing
+try:
+    from GPU.metal_kernel_sampler_parallel import MetalKernelDimodSamplerParallel
+    PARALLEL_AVAILABLE = True
+except Exception:
+    PARALLEL_AVAILABLE = False
+
 
 def create_large_problem(size=4593):
     """Create a large Ising problem to test memory usage."""
     # Create a problem with specified size that approximates the topology used in production
     num_vars = size
-    
+
     # Create a grid-like structure with some random couplings to make it more interesting
     h = {i: 0.0 for i in range(num_vars)}
-    
+
     # Create a pattern that mimics real-world quantum annealing problems
     J = {}
-    
+
     # Add some grid-like couplings (simplified)
     for i in range(num_vars):
         # Connect to neighbors in a grid pattern (simplified)
@@ -38,42 +45,56 @@ def create_large_problem(size=4593):
             J[(i, i+1)] = -1.0
         if i + 64 < num_vars:  # Connect to row below (approximate grid)
             J[(i, i+64)] = -1.0
-    
+
     # Add some random couplings to make it more complex
     import random
-    for _ in range(1000):  # Add some random couplings  
+    for _ in range(1000):  # Add some random couplings
         i = random.randint(0, num_vars - 1)
         j = random.randint(0, num_vars - 1)
         if i != j and (i,j) not in J and (j,i) not in J:
-            # Use a small random coupling value
-            J[(i, j)] = random.uniform(-1.0, 1.0)
-    
+            # Use binary ±1 couplings to conform to Ising model requirements
+            J[(i, j)] = float(random.choice([-1, 1]))
+
     return h, J
 
 
-def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=None, swap_interval=15, T_min=0.1, T_max=5.0, large_problem=False):
+def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=None, swap_interval=15, T_min=0.1, T_max=5.0, large_problem=False, only_label=None, sampler_choice: str = "original"):
     """Test Metal GPU performance with CPU baseline format and evaluation logic."""
     print("🔬 Metal GPU Baseline Parameter Test (Kernel-Only)")
     print("=" * 50)
     print(f"⏰ Timeout: {timeout_minutes} minutes")
 
-    # Use Metal Parallel Tempering kernel sampler
+    # Select sampler (production or parallel)
     metal_sampler = None
     sampler_type = "unknown"
 
-    if METAL_AVAILABLE:
+    if sampler_choice == "parallel":
+        if not PARALLEL_AVAILABLE:
+            print("❌ Parallel sampler not available")
+            return None
         try:
-            metal_sampler = MetalKernelDimodSampler("mps")
+            metal_sampler = MetalKernelDimodSamplerParallel("mps")
             nodes = metal_sampler.nodes
             edges = metal_sampler.edges
-            sampler_type = "metal-pt"
-            print("✅ Metal Parallel Tempering sampler ready (native Metal acceleration)")
+            sampler_type = "metal-parallel"
+            print("✅ Parallel sampler ready (new 2D kernel path)")
         except Exception as e:
-            print(f"❌ Metal Parallel Tempering sampler failed: {e}")
+            print(f"❌ Parallel sampler failed: {e}")
             return None
     else:
-        print("❌ Metal Parallel Tempering sampler not available")
-        return None
+        if METAL_AVAILABLE:
+            try:
+                metal_sampler = MetalKernelDimodSampler("mps")
+                nodes = metal_sampler.nodes
+                edges = metal_sampler.edges
+                sampler_type = "metal-pt"
+                print("✅ Metal Parallel Tempering sampler ready (production kernel)")
+            except Exception as e:
+                print(f"❌ Metal Parallel Tempering sampler failed: {e}")
+                return None
+        else:
+            print("❌ Metal Parallel Tempering sampler not available")
+            return None
 
     # Choose problem size
     if large_problem:
@@ -83,9 +104,9 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=Non
         # Initial problem setup to show problem size
         seed = 12345  # Fixed seed for reproducible results
         h, J = generate_ising_model_from_nonce(seed, nodes, edges)
-    
+
     print(f"📊 Problem: {len(h)} variables, {len(J)} couplings")
-    
+
     # Test configurations - optimized for Metal Parallel Tempering performance
     if large_problem:
         # For memory testing with larger problems, use more aggressive configurations
@@ -104,9 +125,18 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=Non
             (4096, 200, "Very High"),
             (8192, 200, "Max")
         ]
-    
+        # Optional filter: run only the requested label (e.g., "Light")
+        available_labels = [desc for _, _, desc in test_configs]
+        if only_label:
+            filtered = [cfg for cfg in test_configs if cfg[2].lower() == only_label.lower()]
+            if not filtered:
+                print(f"⚠️ No test config matched --only {only_label!r}; available: {available_labels}")
+                return None
+            test_configs = filtered
+
+
     print(f"\n🧪 Testing Metal Parallel Tempering configurations:")
-    
+
     results = {
         'timeout_minutes': timeout_minutes,
         'sampler_type': sampler_type,
@@ -117,7 +147,7 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=Non
         },
         'tests': []
     }
-    
+
     timeout_seconds = timeout_minutes * 60
     total_start_time = time.time()
 
@@ -135,9 +165,19 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=Non
                 # For large problems, we want to make sure they're deterministic
                 nonce = 1234567890  # Fixed for reproducible large problem tests
                 h, J = create_large_problem(4593)
+
+                # Validate binary couplings (±1)
+                if any(not (abs(v - 1.0) < 1e-8 or abs(v + 1.0) < 1e-8) for v in J.values()):
+                    raise ValueError("Non-binary coupling detected in baseline J; expected only ±1.")
+
             else:
                 nonce = random.randint(0, 2**32 - 1)
                 h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+
+                # Validate binary couplings (±1)
+                if any(not (abs(v - 1.0) < 1e-8 or abs(v + 1.0) < 1e-8) for v in J.values()):
+                    raise ValueError("Non-binary coupling detected in baseline J; expected only ±1.")
+
 
             start_time = time.time()
             sampleset = metal_sampler.sample_ising(
@@ -248,25 +288,25 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=Non
     total_runtime = time.time() - total_start_time
     print(f"\n📊 Parallel Tempering Metal Baseline Summary (total time: {total_runtime/60:.1f} min):")
     print("=" * 50)
-    
+
     if results['tests']:
         # Best energy achieved
         best_result = min(results['tests'], key=lambda r: r['min_energy'])
         print(f"🏆 Best energy: {best_result['min_energy']:.1f}")
         print(f"   Required: {best_result['num_sweeps']} sweeps, {best_result['runtime_minutes']:.1f} min")
-        
+
         # Time vs energy analysis
         print(f"\n⏱️ Time vs Energy Performance:")
         for result in results['tests']:
             quality = f"({result['target_reached']})" if result['target_reached'] != 'none' else ""
             print(f"  {result['runtime_minutes']:5.1f} min: {result['min_energy']:7.1f} energy {quality}")
-    
+
     # Save results if requested
     if output_file:
         with open(output_file, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"\n💾 Results saved to {output_file}")
-    
+
     return results
 
 
@@ -274,8 +314,8 @@ def main():
     """Main function with command line argument parsing."""
     parser = argparse.ArgumentParser(description='Parallel Tempering Metal GPU baseline parameter testing tool')
     parser.add_argument(
-        '--timeout', '-t', 
-        type=float, 
+        '--timeout', '-t',
+        type=float,
         default=10.0,
         help='Timeout in minutes (default: 10.0)'
     )
@@ -325,9 +365,22 @@ def main():
         default=5.0,
         help='Maximum temperature (default: 5.0)'
     )
+    parser.add_argument(
+        '--only',
+        type=str,
+        help='Run only the config with this description (e.g., "Light")'
+    )
+    parser.add_argument(
+        '--sampler',
+        type=str,
+        choices=['original', 'parallel'],
+        default='original',
+        help='Select sampler implementation (original production kernel or new parallel kernel)'
+    )
+
 
     args = parser.parse_args()
-    
+
     # Handle preset timeouts
     if args.quick:
         timeout = 3.0
@@ -335,13 +388,13 @@ def main():
         timeout = 30.0
     else:
         timeout = args.timeout
-    
+
     # Generate default output filename if not specified
     output_file = args.output
     if not output_file:
         timestamp = int(time.time())
         output_file = f"metal_baseline_results_{timestamp}.json"
-    
+
     # Run test
     metal_baseline_test(
         timeout_minutes=timeout,
@@ -350,7 +403,9 @@ def main():
         swap_interval=args.swap_interval,
         T_min=args.T_min,
         T_max=args.T_max,
-        large_problem=args.large_problem
+        large_problem=args.large_problem,
+        only_label=args.only,
+        sampler_choice=args.sampler
     )
 
     print(f"\n✅ Parallel Tempering Metal baseline test complete!")

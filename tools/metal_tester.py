@@ -166,6 +166,11 @@ def test_metal_sampler(skip=0, retry=3, reads=None, sweeps=None, debug=False, pr
         try:
             start_time = time.time()
 
+
+            # Validate binary couplings (±1)
+            if any(not (abs(v - 1.0) < 1e-8 or abs(v + 1.0) < 1e-8) for v in J.values()):
+                raise ValueError("Non-binary coupling detected; expected only ±1.")
+
             # Use default sample_ising method (unified GPU kernel)
             sampleset = metal_sampler.sample_ising(
                 h=h, J=J,
