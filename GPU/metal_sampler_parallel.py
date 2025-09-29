@@ -71,21 +71,22 @@ class MetalKernelDimodSampler:
         if not h and not J:
             raise ValueError("Either h or J must be non-empty")
 
-        self.logger.debug(f"[MetalParallel] Sampling: reads={num_reads}, sweeps={num_sweeps}, replicas={num_replicas}")
+        if sample_interval is None:
+            sample_interval = self._default_sample_interval
+        self.logger.debug(
+            f"[MetalParallel] Sampling: reads={num_reads}, sweeps={num_sweeps}, replicas={num_replicas}, interval={sample_interval}"
+        )
 
-        # Use the new unified Metal implementation
+        # Use the new unified Metal implementation (forward only supported args)
         sampleset = self._unified_sampler.sample_ising(
             h=h,
             J=J,
             num_reads=num_reads,
             num_sweeps=num_sweeps,
             num_replicas=num_replicas or max(8, num_reads // 8),  # Default replicas
-            swap_interval=swap_interval,
             T_min=T_min,
             T_max=T_max,
             sample_interval=sample_interval,
-            cooling_factor=cooling_factor,
-            cooling_start_sweep=cooling_start_sweep
         )
 
         runtime = time.time() - start_time

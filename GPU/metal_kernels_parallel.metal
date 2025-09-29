@@ -13,187 +13,9 @@ struct ProblemData {
     int max_node_index;
 };
 
-// 1. Build CSR from h,J dictionaries - matches _convert_problem_to_buffers()
-kernel void build_csr_from_hJ(
-    device const ProblemData* problem [[buffer(0)]],
-    device const int* J_edges [[buffer(1)]],        // [num_edges * 2] as (i,j) pairs
-    device const float* J_values [[buffer(2)]],     // [num_edges] coupling values
-    device int* csr_row_ptr [[buffer(3)]],          // [N+1] output row pointers
-    device int* csr_col_ind [[buffer(4)]],          // [nnz] output column indices
-    device int8_t* csr_J_vals [[buffer(5)]],        // [nnz] output coupling values
-    device int* nnz_out [[buffer(6)]],              // [1] output total non-zeros
-    device int* row_ptr_working [[buffer(7)]],      // [N] working copy for fill
-    uint thread_id [[thread_position_in_grid]]
-) {
-    if (thread_id != 0) return;  // Single thread does all work
 
-    int N = problem->max_node_index + 1;
 
-    // Initialize row_ptr to zero
-    for (int i = 0; i <= N; i++) {
-        csr_row_ptr[i] = 0;
-    }
 
-    // Count edges per node (undirected: both i->j and j->i)
-    for (int e = 0; e < problem->num_edges; e++) {
-        int i = J_edges[e * 2];
-        int j = J_edges[e * 2 + 1];
-        if (i < N && j < N) {
-            csr_row_ptr[i + 1]++;
-            csr_row_ptr[j + 1]++;
-        }
-    }
-
-    // Convert counts to cumulative (prefix sum)
-    for (int i = 1; i <= N; i++) {
-        csr_row_ptr[i] += csr_row_ptr[i - 1];
-    }
-
-    int nnz = csr_row_ptr[N];
-    *nnz_out = nnz;
-
-    // Build adjacency lists - need working copy of row pointers
-    for (int i = 0; i < N; i++) {
-        row_ptr_working[i] = csr_row_ptr[i];
-    }
-
-    // Fill edges
-    for (int e = 0; e < problem->num_edges; e++) {
-        int i = J_edges[e * 2];
-        int j = J_edges[e * 2 + 1];
-        float coupling = J_values[e];
-        int8_t coupling_sign = (coupling > 0) ? 1 : ((coupling < 0) ? -1 : 0);
-
-        if (i < N && j < N) {
-            // Add i->j
-            int pos_i = row_ptr_working[i]++;
-            csr_col_ind[pos_i] = j;
-            csr_J_vals[pos_i] = coupling_sign;
-
-            // Add j->i
-            int pos_j = row_ptr_working[j]++;
-            csr_col_ind[pos_j] = i;
-            csr_J_vals[pos_j] = coupling_sign;
-        }
-    }
-}
-
-// 2. Calculate optimal replica count - matches _calculate_optimal_replicas()
-kernel void calculate_optimal_replicas(
-    device const int* problem_size [[buffer(0)]],     // [1] N
-    device const int* num_couplings [[buffer(1)]],    // [1] number of J edges
-    device const float* coupling_density [[buffer(2)]], // [1] computed density
-    device const int* requested_replicas [[buffer(3)]], // [1] user request (0=auto)
-    device int* optimal_replicas [[buffer(4)]],       // [1] output
-    uint thread_id [[thread_position_in_grid]]
-) {
-    if (thread_id != 0) return;
-
-    if (*requested_replicas > 0) {
-        *optimal_replicas = min(*requested_replicas, 256);
-        return;
-    }
-
-    int N = *problem_size;
-    int num_edges = *num_couplings;
-    float density = *coupling_density;
-
-    // Base replica count from problem size (logarithmic scaling)
-    int base_replicas = max(8, int(log2(float(N))) * 2);
-
-    // Adjust based on coupling density
-    float density_factor = 1.0f;
-    if (density > 0.1f) {
-        density_factor = 1.5f;  // Dense problems need more replicas
-    } else if (density < 0.01f) {
-        density_factor = 0.8f;  // Sparse problems can use fewer
-    }
-
-    // Adjust based on energy scale
-    float energy_factor = 1.0f;
-    if (num_edges > 1000) {
-        energy_factor = 1.3f;   // Large energy scale
-    } else if (num_edges < 100) {
-        energy_factor = 0.9f;   // Small energy scale
-    }
-
-    int result = int(float(base_replicas) * density_factor * energy_factor);
-    *optimal_replicas = min(max(result, 8), 256);
-}
-
-// 3. Create temperature ladder - matches _create_adaptive_temperature_ladder()
-kernel void create_temperature_ladder(
-    device const float* T_min [[buffer(0)]],          // [1] minimum temperature
-    device const float* T_max [[buffer(1)]],          // [1] maximum temperature
-    device const int* num_replicas [[buffer(2)]],     // [1] number of replicas
-    device float* temperatures [[buffer(3)]],         // [num_replicas] output ladder
-    uint thread_id [[thread_position_in_grid]]
-) {
-    if (thread_id != 0) return;
-
-    float t_min = *T_min;
-    float t_max = *T_max;
-    int n_reps = *num_replicas;
-
-    if (n_reps == 1) {
-        temperatures[0] = t_min;
-        return;
-    }
-
-    // Geometric spacing with adaptive adjustment
-    float base_ratio = pow(t_max / t_min, 1.0f / float(n_reps - 1));
-
-    // Adaptive ratio adjustment for target acceptance
-    float adjustment_factor = 1.0f;
-    if (n_reps <= 4) {
-        adjustment_factor = 1.15f;      // Tighter spacing for few replicas
-    } else if (n_reps <= 8) {
-        adjustment_factor = 1.05f;      // Balanced spacing
-    } else if (n_reps <= 16) {
-        adjustment_factor = 0.98f;      // Slightly tighter
-    } else {
-        adjustment_factor = 0.92f;      // Much tighter for many replicas
-    }
-
-    float optimal_ratio = base_ratio * adjustment_factor;
-
-    // Generate geometric ladder
-    for (int i = 0; i < n_reps; i++) {
-        temperatures[i] = t_min * pow(optimal_ratio, float(i));
-    }
-
-    // Ensure we hit T_max exactly
-    temperatures[n_reps - 1] = t_max;
-}
-
-// 4. Partition reads across replicas - matches per_thread_base/quota calculation
-kernel void calculate_read_partitioning(
-    device const int* num_reads [[buffer(0)]],        // [1] total reads wanted
-    device const int* num_replicas [[buffer(1)]],     // [1] number of replicas
-    device int* per_replica_base [[buffer(2)]],       // [num_replicas] base index
-    device int* per_replica_quota [[buffer(3)]],      // [num_replicas] read count
-    uint thread_id [[thread_position_in_grid]]
-) {
-    if (thread_id != 0) return;
-
-    int total_reads = *num_reads;
-    int n_reps = *num_replicas;
-
-    // Calculate base quota and remainder
-    int base_quota = total_reads / n_reps;
-    int remainder = total_reads % n_reps;
-
-    // Assign quotas
-    for (int i = 0; i < n_reps; i++) {
-        per_replica_quota[i] = base_quota + (i < remainder ? 1 : 0);
-    }
-
-    // Calculate base indices (prefix sum)
-    per_replica_base[0] = 0;
-    for (int i = 1; i < n_reps; i++) {
-        per_replica_base[i] = per_replica_base[i-1] + per_replica_quota[i-1];
-    }
-}
 
 // Device helper functions for preprocess
 inline int clamp_int(int v, int lo, int hi) { return max(lo, min(hi, v)); }
@@ -321,135 +143,296 @@ kernel void preprocess_all(
     seed_and_init_spins_device(*base_seed, N, n_reps, rng_states, thread_buffers);
 }
 
-// 5. Main sampling kernel - uses pre-initialized buffers
-kernel void parallel_tempering_sampling(
-    // CSR data (pre-built)
+
+// 6. 2D skeleton kernel: initialize double buffers with deterministic RNG per (replica, spin)
+kernel void worker_parallel_updates(
+    // Sizes
+    device const int* N [[buffer(0)]],                 // [1]
+    device const int* num_replicas [[buffer(1)]],      // [1]
+    device const uint* base_seed [[buffer(2)]],        // [1]
+    // Double buffers
+    device int8_t* thread_buffers_src [[buffer(3)]],   // [num_replicas * N]
+    device int8_t* thread_buffers_dst [[buffer(4)]],   // [num_replicas * N]
+
+    uint3 tid3 [[thread_position_in_grid]]
+) {
+    int n = *N;
+    int rcount = *num_replicas;
+
+    int sid = int(tid3.x);
+    int rid = int(tid3.y);
+    if (rid >= rcount || sid >= n) return;
+
+    // Stateless RNG from (rid, sid, base_seed)
+    uint s = *base_seed ^ uint(rid * 2654435761u) ^ uint((sid + 1) * 974238197u);
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    int8_t spin = (s & 1u) ? int8_t(1) : int8_t(-1);
+
+    int idx = rid * n + sid;
+    thread_buffers_src[idx] = spin;
+    thread_buffers_dst[idx] = spin; // same initial content; ready for double-buffering
+}
+
+
+// 7. 2D synchronous Metropolis updates with double-buffering (Step 2)
+kernel void metropolis_2d_synchronous(
+    // CSR data
     device const int* csr_row_ptr [[buffer(0)]],      // [N+1]
     device const int* csr_col_ind [[buffer(1)]],      // [nnz]
     device const int8_t* csr_J_vals [[buffer(2)]],    // [nnz]
-    device const int* N [[buffer(3)]],                // [1] number of spins
+    device const int* N [[buffer(3)]],                // [1]
 
-    // Temperature ladder (pre-built)
+    // Temperatures and replicas
     device const float* temperatures [[buffer(4)]],   // [num_replicas]
     device const int* num_replicas [[buffer(5)]],     // [1]
 
-    // Sampling parameters
+    // Parameters
     device const int* num_sweeps [[buffer(6)]],       // [1]
-    device const int* sample_interval [[buffer(7)]],  // [1]
-    device const uint* base_seed [[buffer(8)]],       // [1]
+    device const uint* base_seed [[buffer(7)]],       // [1]
 
-    // Per-replica read partitioning
-    device const int* per_replica_base [[buffer(9)]],  // [num_replicas]
-    device const int* per_replica_quota [[buffer(10)]], // [num_replicas]
+    // Double buffers
+    device int8_t* thread_buffers_src [[buffer(8)]],  // [num_replicas * N]
+    device int8_t* thread_buffers_dst [[buffer(9)]],  // [num_replicas * N]
+    // Debug: accepted flip counts per replica
+    device atomic_int* flip_counts [[buffer(10)]],     // [num_replicas]
+    device atomic_int* pos_delta_counts [[buffer(11)]], // [num_replicas]
+    device atomic_int* neg_delta_counts [[buffer(12)]], // [num_replicas]
+    device int* energy_debug [[buffer(13)]],             // [num_replicas]
 
-    // Output
-    device int8_t* final_samples [[buffer(11)]],      // [total_reads * N]
-    device int* final_energies [[buffer(12)]],        // [total_reads]
-
-    // Per-replica persistent buffers and RNG state (device memory)
-    device int8_t* thread_buffers [[buffer(13)]],     // [num_replicas * N]
-    device uint* rng_states [[buffer(14)]],           // [num_replicas]
-
-    uint replica_id [[thread_position_in_grid]]
+    // Thread indices
+    uint3 tid3_tg [[thread_position_in_threadgroup]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tg_size [[threads_per_threadgroup]]
 ) {
+    int n = *N;
+    int rid = int(tg_pos.y);                // one threadgroup per replica
     int n_reps = *num_replicas;
-    if (replica_id >= uint(n_reps)) return;
+    if (rid >= n_reps) return;
 
-    int n_spins = *N;
-    float temperature = temperatures[replica_id];
-    int n_sweeps = *num_sweeps;
-    int samp_interval = *sample_interval;
+    float temperature = temperatures[rid];
+    float beta = 1.0f / max(temperature, 1e-6f);
 
-    int my_base = per_replica_base[replica_id];
-    int my_quota = per_replica_quota[replica_id];
+    // Local pointers to current source/dest buffers for this replica
+    device int8_t* src = &thread_buffers_src[rid * n];
+    device int8_t* dst = &thread_buffers_dst[rid * n];
 
-    // Each replica's private spin buffer lives in device memory
-    device int8_t* spins = &thread_buffers[replica_id * n_spins];
+    // Sweep loop
+    int sweeps = *num_sweeps;
+    for (int sweep = 0; sweep < sweeps; ++sweep) {
+        // Randomize starting parity per sweep to break patterns
+        threadgroup int start_parity;
+        if (tid3_tg.x == 0) {
+            uint s = *base_seed ^ uint((rid + 1) * 2654435761u) ^ uint((sweep + 1) * 362437u);
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            start_parity = int(s & 1u);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Use pre-initialized RNG state and spins from preprocess_all
-    uint rng_state = rng_states[replica_id];
+        // Two-phase Gauss-Seidel style update to avoid bipartite oscillations
+        for (int phase = 0; phase < 2; ++phase) {
+            int parity = start_parity ^ phase;
+            for (int tile = 0; tile < n; tile += int(tg_size.x)) {
+                int sid = tile + int(tid3_tg.x);
+                if (sid < n) {
+                    int8_t old_spin = src[sid];
+                    int8_t new_spin = -old_spin;
+                    if ((sid & 1) == parity) {
+                        // Compute energy change using neighbors from current source
+                        int delta_energy = 0;
+                        int start = csr_row_ptr[sid];
+                        int end = csr_row_ptr[sid + 1];
+                        for (int p = start; p < end; ++p) {
+                            int j = csr_col_ind[p];
+                            int8_t Jij = csr_J_vals[p];
+                            int8_t neighbor_spin = src[j];
+                            delta_energy += Jij * (new_spin - old_spin) * neighbor_spin;
+                        }
+                        // Debug counts for delta sign
+                        if (delta_energy > 0) {
+                            atomic_fetch_add_explicit(&pos_delta_counts[rid], 1, memory_order_relaxed);
+                        } else if (delta_energy < 0) {
+                            atomic_fetch_add_explicit(&neg_delta_counts[rid], 1, memory_order_relaxed);
+                        }
+                        // Metropolis accept
+                        bool accept = (delta_energy <= 0);
+                        if (!accept) {
+                            uint s2 = *base_seed ^ uint((rid + 1) * 2654435761u) ^ uint((sid + 1) * 974238197u) ^ uint((sweep + 1) * 362437u);
+                            s2 ^= s2 << 13; s2 ^= s2 >> 17; s2 ^= s2 << 5;
+                            float r = float(s2 & 0x7FFFFFFFu) / 2147483647.0f;
+                            float prob = exp(-float(delta_energy) * beta);
+                            accept = (r < prob);
+                        }
+                        if (accept) {
+                            dst[sid] = new_spin;
+                            atomic_fetch_add_explicit(&flip_counts[rid], 1, memory_order_relaxed);
+                        } else {
+                            dst[sid] = old_spin;
+                        }
+                    } else {
+                        // Carry forward unchanged spin for the opposite parity
+                        dst[sid] = old_spin;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_device);
+            }
+            // Make updates visible to next parity and use them as source
+            device int8_t* tmp = src; src = dst; dst = tmp;
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+        // After two parity phases, 'src' already points to the latest configuration
+    }
 
-    // Calculate initial energy
-    int energy = 0;
-    if (n_spins == 2) {
-        energy = -1 * spins[0] * spins[1];
-    } else {
-        for (int i = 0; i < n_spins; i++) {
-            int8_t s_i = spins[i];
+    // Ensure the latest configuration resides in thread_buffers_src
+    if (src != &thread_buffers_src[rid * n]) {
+        for (int tile = 0; tile < n; tile += int(tg_size.x)) {
+            int sid = tile + int(tid3_tg.x);
+            if (sid < n) {
+                thread_buffers_src[rid * n + sid] = src[sid];
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+    }
+
+    // Debug: compute per-replica energy using j>i convention on src buffer
+    if (tid3_tg.x == 0) {
+        int e = 0;
+        for (int i = 0; i < n; ++i) {
             int start = csr_row_ptr[i];
             int end = csr_row_ptr[i + 1];
-            for (int p = start; p < end; p++) {
+            int8_t s_i = src[i];
+            for (int p = start; p < end; ++p) {
                 int j = csr_col_ind[p];
                 if (j > i) {
                     int8_t Jij = csr_J_vals[p];
-                    int8_t s_j = spins[j];
-                    energy += Jij * s_i * s_j;
+                    e += Jij * s_i * src[j];
                 }
             }
         }
+        energy_debug[rid] = e;
     }
 
-    // Persist updated RNG state
-    rng_states[replica_id] = rng_state;
+}
 
-    // Sampling loop
-    float beta = 1.0f / temperature;
-    int samples_written = 0;
 
-    for (int sweep = 0; sweep < n_sweeps; sweep++) {
-        // Metropolis updates
-        for (int spin_idx = 0; spin_idx < n_spins; spin_idx++) {
-            int8_t old_spin = spins[spin_idx];
-            int8_t new_spin = -old_spin;
+// 8. Energy reduction per replica (parallel over replicas, tiled over spins)
+kernel void reduce_energies_2d(
+    device const int* csr_row_ptr [[buffer(0)]],      // [N+1]
+    device const int* csr_col_ind [[buffer(1)]],      // [nnz]
+    device const int8_t* csr_J_vals [[buffer(2)]],    // [nnz]
+    device const int* N [[buffer(3)]],                // [1]
+    device int8_t* thread_buffers_src [[buffer(4)]],  // [num_replicas * N]
+    device int* energies_out [[buffer(5)]],           // [num_replicas]
+    device const int* num_replicas [[buffer(6)]],     // [1]
 
-            // Calculate energy change
-            int delta_energy = 0;
-            int start = csr_row_ptr[spin_idx];
-            int end = csr_row_ptr[spin_idx + 1];
-            for (int p = start; p < end; p++) {
-                int j = csr_col_ind[p];
+    uint3 tid3_tg [[thread_position_in_threadgroup]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tg_size [[threads_per_threadgroup]]
+) {
+    int n = *N;
+    int rid = int(tg_pos.y);
+    if (rid >= *num_replicas) return;
+
+    if (tid3_tg.x != 0) return; // single lane computes energy serially for simplicity
+
+    device int8_t* spins = &thread_buffers_src[rid * n];
+
+    int e = 0;
+    for (int i = 0; i < n; ++i) {
+        int8_t s_i = spins[i];
+        int start = csr_row_ptr[i];
+        int end = csr_row_ptr[i + 1];
+        for (int p = start; p < end; ++p) {
+            int j = csr_col_ind[p];
+            if (j > i) {
                 int8_t Jij = csr_J_vals[p];
-                int8_t neighbor_spin = spins[j];
-                delta_energy += Jij * (new_spin - old_spin) * neighbor_spin;
+                e += Jij * s_i * spins[j];
             }
-
-            // Metropolis acceptance
-            bool accept = (delta_energy <= 0);
-            if (!accept) {
-                float prob = exp(-float(delta_energy) * beta);
-                rng_state = rng_state ^ (rng_state << 13);
-                rng_state = rng_state ^ (rng_state >> 17);
-                rng_state = rng_state ^ (rng_state << 5);
-                float rand_val = float(rng_state & 0x7FFFFFFF) / 2147483647.0f;
-                accept = (rand_val < prob);
-            }
-
-            if (accept) {
-                spins[spin_idx] = new_spin;
-                energy += delta_energy;
-            }
-        }
-
-        // Sample collection
-        if (((sweep + 1) % samp_interval) == 0 && samples_written < my_quota) {
-            int out_idx = my_base + samples_written;
-
-            // Write sample
-            for (int i = 0; i < n_spins; i++) {
-                final_samples[out_idx * n_spins + i] = spins[i];
-            }
-            final_energies[out_idx] = energy;
-            samples_written++;
         }
     }
+    energies_out[rid] = e;
+}
 
-    // Fill remaining quota if needed
-    while (samples_written < my_quota) {
-        int out_idx = my_base + samples_written;
-        for (int i = 0; i < n_spins; i++) {
-            final_samples[out_idx * n_spins + i] = spins[i];
+// 9. Adjacent replica swaps (even/odd parity pairs)
+kernel void pt_swap_adjacent(
+    device const int* N [[buffer(0)]],                // [1]
+    device const float* temperatures [[buffer(1)]],   // [num_replicas]
+    device const int* num_replicas [[buffer(2)]],     // [1]
+    device int8_t* thread_buffers_src [[buffer(3)]],  // [num_replicas * N]
+    device int* energies [[buffer(4)]],               // [num_replicas]
+    device const uint* base_seed [[buffer(5)]],       // [1]
+    device const int* swap_parity [[buffer(6)]],      // [1] 0=even pairs, 1=odd pairs
+    device atomic_int* swap_attempts [[buffer(7)]],   // [num_replicas-1]
+    device atomic_int* swap_accepts [[buffer(8)]],    // [num_replicas-1]
+
+    uint3 tid3_tg [[thread_position_in_threadgroup]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tg_size [[threads_per_threadgroup]]
+) {
+    int n = *N;
+    int parity = *swap_parity;
+    int pair_idx = int(tg_pos.y);
+    int rid0 = parity + 2 * pair_idx;
+    int rid1 = rid0 + 1;
+    int n_reps = *num_replicas;
+    if (rid1 >= n_reps) return;
+
+    // Compute acceptance in lane 0, broadcast via threadgroup var
+    threadgroup int do_swap;
+    do_swap = 0;
+    if (tid3_tg.x == 0) {
+        float beta0 = 1.0f / max(temperatures[rid0], 1e-6f);
+        float beta1 = 1.0f / max(temperatures[rid1], 1e-6f);
+        int E0 = energies[rid0];
+        int E1 = energies[rid1];
+        float x = (beta0 - beta1) * float(E1 - E0);
+        float p = exp(min(0.0f, x));
+        uint s = *base_seed ^ uint((pair_idx + 1) * 2654435761u) ^ uint((parity + 1) * 974238197u);
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        float r = float(s & 0x7FFFFFFFu) / 2147483647.0f;
+        int idx = rid0; // index into attempts/accepts arrays aligns with lower rid
+        atomic_fetch_add_explicit(&swap_attempts[idx], 1, memory_order_relaxed);
+        do_swap = (r < p) ? 1 : 0;
+        if (do_swap) {
+            atomic_fetch_add_explicit(&swap_accepts[idx], 1, memory_order_relaxed);
         }
-        final_energies[out_idx] = energy;
-        samples_written++;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Parallel swap across spins if accepted
+    if (do_swap) {
+        device int8_t* A = &thread_buffers_src[rid0 * n];
+        device int8_t* B = &thread_buffers_src[rid1 * n];
+        for (int sid = int(tid3_tg.x); sid < n; sid += int(tg_size.x)) {
+            int8_t tmp = A[sid];
+            A[sid] = B[sid];
+            B[sid] = tmp;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid3_tg.x == 0) {
+            int tmpE = energies[rid0];
+            energies[rid0] = energies[rid1];
+            energies[rid1] = tmpE;
+        }
+    }
+}
+
+
+
+// 10. Compute swap acceptance rates per adjacent pair
+kernel void compute_swap_stats(
+    device const int* num_replicas [[buffer(0)]],
+    device const atomic_int* swap_attempts [[buffer(1)]],
+    device const atomic_int* swap_accepts [[buffer(2)]],
+    device float* rates_out [[buffer(3)]],
+    uint3 tid3_tg [[thread_position_in_threadgroup]],
+    uint3 tg_pos [[threadgroup_position_in_grid]]
+) {
+    if (tid3_tg.x != 0) return;
+    int n_reps = *num_replicas;
+    int idx = int(tg_pos.y);
+    if (idx >= max(0, n_reps - 1)) return;
+    int a = atomic_load_explicit(&swap_attempts[idx], memory_order_relaxed);
+    int b = atomic_load_explicit(&swap_accepts[idx], memory_order_relaxed);
+    rates_out[idx] = (a > 0) ? (float(b) / float(a)) : 0.0f;
 }

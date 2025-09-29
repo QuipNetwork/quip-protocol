@@ -84,7 +84,11 @@ class UnifiedMetalSampler:
             # Create kernel pipeline states for all modular kernels
             kernel_names = [
                 "preprocess_all",
-                "parallel_tempering_sampling"
+                "worker_parallel_updates",
+                "metropolis_2d_synchronous",
+                "reduce_energies_2d",
+                "pt_swap_adjacent",
+                "compute_swap_stats",
             ]
 
             for name in kernel_names:
@@ -105,7 +109,7 @@ class UnifiedMetalSampler:
             self._pt_max_threads = 256
             self._pt_thread_exec_width = 32
             try:
-                pt_pipeline = self._kernels.get("parallel_tempering_sampling")
+                pt_pipeline = self._kernels.get("metropolis_2d_synchronous")
                 if pt_pipeline is not None:
                     # PyObjC may expose properties as callables; handle both forms
                     mtt = getattr(pt_pipeline, "maxTotalThreadsPerThreadgroup", None)
@@ -148,12 +152,9 @@ class UnifiedMetalSampler:
 
     def sample_ising(self, h: Dict[int, float], J: Dict[tuple, float],
                     num_reads: int = 256, num_sweeps: int = 1000,
-                    num_replicas: int = None, swap_interval: int = 15,
+                    num_replicas: Optional[int] = None,
                     T_min: float = 0.01, T_max: float = 1.0,
-                    sample_interval: int = None, cooling_factor: float = 0.999,
-                    cooling_start_sweep: int = None,
-                    threads_per_group_cap: Optional[int] = None,
-                    **kwargs) -> dimod.SampleSet:
+                    sample_interval: Optional[int] = None) -> dimod.SampleSet:
         """GPU-only pipeline: build CSR, choose replicas, make temperatures, partition reads, and sample — all on GPU."""
         start_time = time.time()
 
@@ -232,6 +233,9 @@ class UnifiedMetalSampler:
             per_replica_quota_buf = self._create_buffer(per_replica_quota, "per_replica_quota")
             rng_states_buf = self._create_buffer(rng_states, "rng_states")
             thread_buffers_buf = self._create_buffer(thread_buffers, "thread_buffers")
+            # Allocate alternate buffer for 2D double-buffering skeleton (step 1)
+            thread_buffers_alt = np.zeros(cap * N, dtype=np.int8)
+            thread_buffers_alt_buf = self._create_buffer(thread_buffers_alt, "thread_buffers_alt")
 
             # === Dispatch unified preprocess (single thread) ===
             cb = self._command_queue.commandBuffer()
@@ -272,103 +276,180 @@ class UnifiedMetalSampler:
             num_reps = struct.unpack('<i', bytes([opt_view[i] for i in range(4)]))[0]
             num_reps = max(1, int(num_reps))
 
-            # === Sampling dispatch (replica-parallel) ===
-            # Use GPU-computed sample_interval unless user provided a positive value
-            sweeps_buf = self._create_buffer(np.array([int(num_sweeps)], dtype=np.int32), "num_sweeps")
-            samp_int_buf = sample_interval_buf
+            # 2D kernel skeleton to initialize double buffers (step 1)
+            cb2d = self._command_queue.commandBuffer()
+            enc2d = cb2d.computeCommandEncoder()
+            enc2d.setComputePipelineState_(self._kernels["worker_parallel_updates"])
+            enc2d.setBuffer_offset_atIndex_(self._create_buffer(np.array([N], dtype=np.int32), "N"), 0, 0)
+            enc2d.setBuffer_offset_atIndex_(self._create_buffer(np.array([num_reps], dtype=np.int32), "num_reps"), 0, 1)
+            enc2d.setBuffer_offset_atIndex_(base_seed_buf, 0, 2)
+            enc2d.setBuffer_offset_atIndex_(thread_buffers_buf, 0, 3)
+            enc2d.setBuffer_offset_atIndex_(thread_buffers_alt_buf, 0, 4)
+            # 2D dispatch: X over spins, Y over replicas; one group per replica
+            exec_w = getattr(self, "_pt_thread_exec_width", 32)
+            tpg_x = max(1, int(exec_w))
+            threads_per_group = Metal.MTLSize(width=tpg_x, height=1, depth=1)
+            num_groups = Metal.MTLSize(width=1, height=num_reps, depth=1)
+            enc2d.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
+            enc2d.endEncoding(); cb2d.commit(); cb2d.waitUntilCompleted()
 
-            final_samples = np.zeros(num_reads * N, dtype=np.int8)
-            final_energies = np.zeros(num_reads, dtype=np.int32)
-            final_samples_buf = self._create_buffer(final_samples, "final_samples")
-            final_energies_buf = self._create_buffer(final_energies, "final_energies")
+            # Read back device-determined sample interval (if not provided)
+            samp_contents = sample_interval_buf.contents(); samp_view = samp_contents.as_buffer(sample_interval_buf.length())
+            sample_int_val = struct.unpack('<i', bytes([samp_view[i] for i in range(4)]))[0]
+            interval = int(sample_interval) if (sample_interval is not None and int(sample_interval) > 0) else max(1, int(sample_int_val) if sample_int_val > 0 else 1)
 
-            cb5 = self._command_queue.commandBuffer()
-            enc5 = cb5.computeCommandEncoder()
-            enc5.setComputePipelineState_(self._kernels["parallel_tempering_sampling"])
-            enc5.setBuffer_offset_atIndex_(csr_row_ptr_buf, 0, 0)
-            enc5.setBuffer_offset_atIndex_(csr_col_ind_buf, 0, 1)
-            enc5.setBuffer_offset_atIndex_(csr_J_vals_buf, 0, 2)
-            enc5.setBuffer_offset_atIndex_(self._create_buffer(np.array([N], dtype=np.int32), "N"), 0, 3)
-            enc5.setBuffer_offset_atIndex_(temps_buf, 0, 4)
-            enc5.setBuffer_offset_atIndex_(self._create_buffer(np.array([num_reps], dtype=np.int32), "num_reps"), 0, 5)
-            enc5.setBuffer_offset_atIndex_(sweeps_buf, 0, 6)
-            enc5.setBuffer_offset_atIndex_(samp_int_buf, 0, 7)
-            enc5.setBuffer_offset_atIndex_(base_seed_buf, 0, 8)  # unused but kept for signature stability
-            enc5.setBuffer_offset_atIndex_(per_replica_base_buf, 0, 9)
-            enc5.setBuffer_offset_atIndex_(per_replica_quota_buf, 0, 10)
-            enc5.setBuffer_offset_atIndex_(final_samples_buf, 0, 11)
-            enc5.setBuffer_offset_atIndex_(final_energies_buf, 0, 12)
-            enc5.setBuffer_offset_atIndex_(thread_buffers_buf, 0, 13)
-            enc5.setBuffer_offset_atIndex_(rng_states_buf, 0, 14)
+            # Allocate persistent debug/stat buffers once
+            flip_counts_buf = self._create_buffer(np.zeros(num_reps, dtype=np.int32), "flip_counts")
+            pos_counts_buf  = self._create_buffer(np.zeros(num_reps, dtype=np.int32), "pos_counts")
+            neg_counts_buf  = self._create_buffer(np.zeros(num_reps, dtype=np.int32), "neg_counts")
+            dbg_energy_buf  = self._create_buffer(np.zeros(num_reps, dtype=np.int32), "dbg_energy")
+            attempts        = self._create_buffer(np.zeros(max(0, num_reps-1), dtype=np.int32), "swap_attempts")
+            accepts         = self._create_buffer(np.zeros(max(0, num_reps-1), dtype=np.int32), "swap_accepts")
+            rates_buf       = self._create_buffer(np.zeros(max(0, num_reps-1), dtype=np.float32), "swap_rates")
 
-            # Determine effective per-group thread cap from pipeline, with optional user cap
-            cap = getattr(self, "_pt_max_threads", 256)
-            if threads_per_group_cap is not None:
-                try:
-                    cap = max(1, min(int(threads_per_group_cap), cap))
-                except Exception:
-                    pass
-            if num_reps <= cap:
-                threads_per_group = Metal.MTLSize(width=num_reps, height=1, depth=1)
-                num_groups = Metal.MTLSize(width=1, height=1, depth=1)
+
+            exec_w = getattr(self, "_pt_thread_exec_width", 32)
+            tpg_x = max(1, int(exec_w))
+            threads_per_group = Metal.MTLSize(width=tpg_x, height=1, depth=1)
+            tg_reps = Metal.MTLSize(width=1, height=num_reps, depth=1)
+
+            remaining = int(num_sweeps)
+            while remaining > 0:
+                sweeps_this = min(interval, remaining)
+                self.logger.debug(f"[UnifiedMetal] 2D update sweeps chunk={sweeps_this} (remaining {remaining - sweeps_this})")
+                sweeps2d_buf = self._create_buffer(np.array([sweeps_this], dtype=np.int32), "num_sweeps_2d")
+
+                # 2D update chunk
+                cb2u = self._command_queue.commandBuffer()
+                enc2u = cb2u.computeCommandEncoder()
+                enc2u.setComputePipelineState_(self._kernels["metropolis_2d_synchronous"])
+                enc2u.setBuffer_offset_atIndex_(csr_row_ptr_buf, 0, 0)
+                enc2u.setBuffer_offset_atIndex_(csr_col_ind_buf, 0, 1)
+                enc2u.setBuffer_offset_atIndex_(csr_J_vals_buf, 0, 2)
+                enc2u.setBuffer_offset_atIndex_(self._create_buffer(np.array([N], dtype=np.int32), "N"), 0, 3)
+                enc2u.setBuffer_offset_atIndex_(temps_buf, 0, 4)
+                enc2u.setBuffer_offset_atIndex_(num_reps_buf, 0, 5)
+                enc2u.setBuffer_offset_atIndex_(sweeps2d_buf, 0, 6)
+                enc2u.setBuffer_offset_atIndex_(base_seed_buf, 0, 7)
+                enc2u.setBuffer_offset_atIndex_(thread_buffers_buf, 0, 8)
+                enc2u.setBuffer_offset_atIndex_(thread_buffers_alt_buf, 0, 9)
+                enc2u.setBuffer_offset_atIndex_(flip_counts_buf, 0, 10)
+                enc2u.setBuffer_offset_atIndex_(pos_counts_buf, 0, 11)
+                enc2u.setBuffer_offset_atIndex_(neg_counts_buf, 0, 12)
+                enc2u.setBuffer_offset_atIndex_(dbg_energy_buf, 0, 13)
+                enc2u.dispatchThreadgroups_threadsPerThreadgroup_(tg_reps, threads_per_group)
+                enc2u.endEncoding(); cb2u.commit(); cb2u.waitUntilCompleted()
+
+                # Reduce energies after this chunk
+                cbRE = self._command_queue.commandBuffer()
+                encRE = cbRE.computeCommandEncoder()
+                encRE.setComputePipelineState_(self._kernels["reduce_energies_2d"])
+                encRE.setBuffer_offset_atIndex_(csr_row_ptr_buf, 0, 0)
+                encRE.setBuffer_offset_atIndex_(csr_col_ind_buf, 0, 1)
+                encRE.setBuffer_offset_atIndex_(csr_J_vals_buf, 0, 2)
+                encRE.setBuffer_offset_atIndex_(self._create_buffer(np.array([N], dtype=np.int32), "N"), 0, 3)
+                encRE.setBuffer_offset_atIndex_(thread_buffers_buf, 0, 4)
+                encRE.setBuffer_offset_atIndex_(dbg_energy_buf, 0, 5)
+                encRE.setBuffer_offset_atIndex_(num_reps_buf, 0, 6)
+                encRE.dispatchThreadgroups_threadsPerThreadgroup_(tg_reps, threads_per_group)
+                encRE.endEncoding(); cbRE.commit(); cbRE.waitUntilCompleted()
+
+                # Swaps: even then odd
+                def dispatch_swaps(parity:int, num_pairs:int):
+                    if num_pairs <= 0:
+                        return
+                    cbSW = self._command_queue.commandBuffer()
+                    encSW = cbSW.computeCommandEncoder()
+                    encSW.setComputePipelineState_(self._kernels["pt_swap_adjacent"])
+                    encSW.setBuffer_offset_atIndex_(self._create_buffer(np.array([N], dtype=np.int32), "N"), 0, 0)
+                    encSW.setBuffer_offset_atIndex_(temps_buf, 0, 1)
+                    encSW.setBuffer_offset_atIndex_(num_reps_buf, 0, 2)
+                    encSW.setBuffer_offset_atIndex_(thread_buffers_buf, 0, 3)
+                    encSW.setBuffer_offset_atIndex_(dbg_energy_buf, 0, 4)
+                    encSW.setBuffer_offset_atIndex_(base_seed_buf, 0, 5)
+                    encSW.setBuffer_offset_atIndex_(self._create_buffer(np.array([parity], dtype=np.int32), "swap_parity"), 0, 6)
+                    encSW.setBuffer_offset_atIndex_(attempts, 0, 7)
+                    encSW.setBuffer_offset_atIndex_(accepts, 0, 8)
+                    encSW.dispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSize(width=tpg_x, height=1, depth=1), Metal.MTLSize(width=1, height=num_pairs, depth=1))
+                    encSW.endEncoding(); cbSW.commit(); cbSW.waitUntilCompleted()
+
+                dispatch_swaps(0, num_reps // 2)
+                dispatch_swaps(1, (num_reps - 1) // 2)
+
+                remaining -= sweeps_this
+
+            # Read back stats and energies
+            def read_int32_array(buf, n):
+                view = buf.contents().as_buffer(buf.length())
+                out = []
+                for i in range(n):
+                    base = i * 4
+                    out.append(int.from_bytes(bytes([view[base+j] for j in range(4)]), 'little', signed=True))
+                return out
+            flips = read_int32_array(flip_counts_buf, num_reps)
+            posd  = read_int32_array(pos_counts_buf, num_reps)
+            negd  = read_int32_array(neg_counts_buf, num_reps)
+            energies2d = read_int32_array(dbg_energy_buf, num_reps)
+            self.logger.debug(f"[UnifiedMetal] flips: {flips}")
+            self.logger.debug(f"[UnifiedMetal] dE>0: {posd}")
+            self.logger.debug(f"[UnifiedMetal] dE<0: {negd}")
+            if num_reps > 1:
+                att = read_int32_array(attempts, max(0, num_reps-1))
+                acc = read_int32_array(accepts, max(0, num_reps-1))
+
+                # Compute acceptance rates per pair on device and read back
+                if num_reps > 1:
+                    cbST = self._command_queue.commandBuffer()
+                    encST = cbST.computeCommandEncoder()
+                    encST.setComputePipelineState_(self._kernels["compute_swap_stats"])
+                    encST.setBuffer_offset_atIndex_(num_reps_buf, 0, 0)
+                    encST.setBuffer_offset_atIndex_(attempts, 0, 1)
+                    encST.setBuffer_offset_atIndex_(accepts, 0, 2)
+                    encST.setBuffer_offset_atIndex_(rates_buf, 0, 3)
+                    encST.dispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSize(width=1, height=max(1, (num_reps - 1)), depth=1), Metal.MTLSize(width=1, height=1, depth=1))
+                    encST.endEncoding(); cbST.commit(); cbST.waitUntilCompleted()
+
+                    # Read back float rates
+                    viewf = rates_buf.contents().as_buffer(rates_buf.length())
+                    rates = []
+                    for i in range(max(0, num_reps-1)):
+                        base = i * 4
+                        rates.append(struct.unpack('<f', bytes([viewf[base+j] for j in range(4)]))[0])
+                    self.logger.debug(f"[UnifiedMetal] PT accept rates: {['{:.2f}'.format(r) for r in rates]}")
+
+                self.logger.debug(f"[UnifiedMetal] PT attempts: {att}")
+                self.logger.debug(f"[UnifiedMetal] PT accepts:  {acc}")
+
+            # Build final samples/energies on host from current 2D replica states
+            spins_view = thread_buffers_buf.contents().as_buffer(thread_buffers_buf.length())
+            spins_bytes = bytes(spins_view)
+            spins_flat = np.frombuffer(spins_bytes, dtype=np.int8)
+            spins_flat = spins_flat[:num_reps * N]
+
+            # Select replicas by ascending energy
+            idx_order = list(sorted(range(num_reps), key=lambda i: energies2d[i]))
+            if num_reads <= num_reps:
+                sel_indices = idx_order[:num_reads]
             else:
-                threads_per_group = Metal.MTLSize(width=cap, height=1, depth=1)
-                groups = (num_reps + cap - 1) // cap
-                num_groups = Metal.MTLSize(width=groups, height=1, depth=1)
+                reps = (num_reads + num_reps - 1) // num_reps
+                sel_indices = (idx_order * reps)[:num_reads]
 
-            self.logger.debug(f"[UnifiedMetal] Dispatch PT: {num_groups.width} groups × {threads_per_group.width} threads")
-            enc5.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
-            enc5.endEncoding(); cb5.commit(); cb5.waitUntilCompleted()
+            samples = []
+            energies = []
+            for rid in sel_indices:
+                start = rid * N
+                end = start + N
+                samples.append(spins_flat[start:end].astype(np.int8).tolist())
+                energies.append(int(energies2d[rid]))
 
-            # Collect results
-            samples, energies = self._collect_results(final_samples_buf, final_energies_buf, num_reads, N)
             runtime = time.time() - start_time
-            self.logger.debug(f"[UnifiedMetal] Full GPU sampling completed (2-dispatch): {runtime:.2f}s")
+            self.logger.debug(f"[UnifiedMetal] 2D-only sampling completed: {runtime:.2f}s")
             return dimod.SampleSet.from_samples(samples, 'SPIN', energies)
 
         except Exception as e:
             self.logger.error(f"[UnifiedMetal] Sampling failed: {e}")
             raise
 
-    def _collect_results(self, final_samples_buffer, final_energies_buffer, num_reads: int, N: int):
-        """Collect samples and energies from Metal buffers."""
-        # Read energies
-        energies_contents = final_energies_buffer.contents()
-        energies_buffer_length = final_energies_buffer.length()
-        energies_buffer_view = energies_contents.as_buffer(energies_buffer_length)
-        energies = []
-
-        for i in range(num_reads):
-            offset = i * 4  # 4 bytes per int32
-            energy_bytes = bytes([energies_buffer_view[offset + j] for j in range(4)])
-            energy = struct.unpack('<i', energy_bytes)[0]
-            energies.append(energy)
-
-        # Read samples
-        samples_contents = final_samples_buffer.contents()
-        samples_buffer_length = final_samples_buffer.length()
-        samples_buffer_view = samples_contents.as_buffer(samples_buffer_length)
-        samples_bytes = bytes(samples_buffer_view)
-        samples_flat = np.frombuffer(samples_bytes, dtype=np.int8)
-
-        expected_len = num_reads * N
-        if samples_flat.size < expected_len:
-            raise RuntimeError(f"Expected at least {expected_len} sample bytes, got {samples_flat.size}")
-        samples_flat = samples_flat[:expected_len]
-
-        samples = []
-        for i in range(num_reads):
-            start_idx = i * N
-            end_idx = start_idx + N
-            sample = samples_flat[start_idx:end_idx].tolist()
-            samples.append(sample)
-
-        # Validate execution
-        for i in range(num_reads):
-            if energies[i] == 0 and all(v == 0 for v in samples[i]):
-                raise RuntimeError(f"Thread execution failure: Read {i} has zero energy and zeroed sample")
-
-        return samples, energies
 
     def close(self):
         """Clean up Metal resources."""
