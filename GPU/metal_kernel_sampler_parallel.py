@@ -10,6 +10,8 @@ from typing import Optional, Dict, Any
 import numpy as np
 import struct
 
+from collections import deque
+
 try:
     import Metal
     METAL_AVAILABLE = True
@@ -86,9 +88,12 @@ class UnifiedMetalSampler:
                 "preprocess_all",
                 "worker_parallel_updates",
                 "metropolis_2d_synchronous",
+                "metropolis_color_phase",
                 "reduce_energies_2d",
                 "pt_swap_adjacent",
                 "compute_swap_stats",
+                "compute_graph_coloring",
+                "pack_selected_replicas",
             ]
 
             for name in kernel_names:
@@ -154,7 +159,12 @@ class UnifiedMetalSampler:
                     num_reads: int = 256, num_sweeps: int = 1000,
                     num_replicas: Optional[int] = None,
                     T_min: float = 0.01, T_max: float = 1.0,
-                    sample_interval: Optional[int] = None) -> dimod.SampleSet:
+                    sample_interval: Optional[int] = None,
+                    ladder_target_acceptance: float = 0.30,
+                    adapt_every: int = 2,
+                    stats_window: int = 4,
+                    max_replicas: Optional[int] = None,
+                    enable_color_updates: bool = False) -> dimod.SampleSet:
         """GPU-only pipeline: build CSR, choose replicas, make temperatures, partition reads, and sample — all on GPU."""
         start_time = time.time()
 
@@ -269,6 +279,8 @@ class UnifiedMetalSampler:
             enc.setBuffer_offset_atIndex_(sample_interval_buf, 0, 20)
 
             enc.dispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSize(width=1, height=1, depth=1), Metal.MTLSize(width=1, height=1, depth=1))
+
+
             enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
 
             # Read back num_reps
@@ -293,6 +305,37 @@ class UnifiedMetalSampler:
             enc2d.dispatchThreadgroups_threadsPerThreadgroup_(num_groups, threads_per_group)
             enc2d.endEncoding(); cb2d.commit(); cb2d.waitUntilCompleted()
 
+
+            # Read back initial temperatures into host array for adaptive ladder
+            def _read_float32_array(buf, n):
+                view = buf.contents().as_buffer(buf.length())
+                out = []
+                for i in range(n):
+                    base = i * 4
+                    out.append(struct.unpack('<f', bytes([view[base+j] for j in range(4)]))[0])
+                return out
+
+            def _read_int32_array(buf, n):
+                view = buf.contents().as_buffer(buf.length())
+                out = []
+                for i in range(n):
+                    base = i * 4
+                    out.append(int.from_bytes(bytes([view[base+j] for j in range(4)]), 'little', signed=True))
+                return out
+
+            temps_host = _read_float32_array(temps_buf, num_reps)
+
+            # Adaptive ladder parameters and state
+            intervals_since_adapt = 0
+
+            adapt_every_eff = int(adapt_every) if (adapt_every is not None and int(adapt_every) > 0) else 0
+            stats_window_eff = int(stats_window) if (stats_window is not None and int(stats_window) > 0) else 0
+            target_acc = float(ladder_target_acceptance)
+            attempts_prev = np.zeros(max(0, num_reps-1), dtype=np.int32)
+            accepts_prev = np.zeros(max(0, num_reps-1), dtype=np.int32)
+            window_attempts = []  # list of np.int32 arrays
+            window_accepts = []   # list of np.int32 arrays
+
             # Read back device-determined sample interval (if not provided)
             samp_contents = sample_interval_buf.contents(); samp_view = samp_contents.as_buffer(sample_interval_buf.length())
             sample_int_val = struct.unpack('<i', bytes([samp_view[i] for i in range(4)]))[0]
@@ -313,20 +356,32 @@ class UnifiedMetalSampler:
             threads_per_group = Metal.MTLSize(width=tpg_x, height=1, depth=1)
             tg_reps = Metal.MTLSize(width=1, height=num_reps, depth=1)
 
+
+            # Reusable small constant buffers
+            n_buf = self._create_buffer(np.array([N], dtype=np.int32), "N")
+            parity0_buf = self._create_buffer(np.array([0], dtype=np.int32), "parity0")
+            parity1_buf = self._create_buffer(np.array([1], dtype=np.int32), "parity1")
+            inflight_cbs = []
+            inflight_tmp_bufs = []
+            last_cb = None
+
             remaining = int(num_sweeps)
             while remaining > 0:
                 sweeps_this = min(interval, remaining)
                 self.logger.debug(f"[UnifiedMetal] 2D update sweeps chunk={sweeps_this} (remaining {remaining - sweeps_this})")
                 sweeps2d_buf = self._create_buffer(np.array([sweeps_this], dtype=np.int32), "num_sweeps_2d")
+                inflight_tmp_bufs.append(sweeps2d_buf)
+
+                # Batch per-interval work into a single command buffer; no wait here
+                cbI = self._command_queue.commandBuffer()
 
                 # 2D update chunk
-                cb2u = self._command_queue.commandBuffer()
-                enc2u = cb2u.computeCommandEncoder()
+                enc2u = cbI.computeCommandEncoder()
                 enc2u.setComputePipelineState_(self._kernels["metropolis_2d_synchronous"])
                 enc2u.setBuffer_offset_atIndex_(csr_row_ptr_buf, 0, 0)
                 enc2u.setBuffer_offset_atIndex_(csr_col_ind_buf, 0, 1)
                 enc2u.setBuffer_offset_atIndex_(csr_J_vals_buf, 0, 2)
-                enc2u.setBuffer_offset_atIndex_(self._create_buffer(np.array([N], dtype=np.int32), "N"), 0, 3)
+                enc2u.setBuffer_offset_atIndex_(n_buf, 0, 3)
                 enc2u.setBuffer_offset_atIndex_(temps_buf, 0, 4)
                 enc2u.setBuffer_offset_atIndex_(num_reps_buf, 0, 5)
                 enc2u.setBuffer_offset_atIndex_(sweeps2d_buf, 0, 6)
@@ -338,45 +393,127 @@ class UnifiedMetalSampler:
                 enc2u.setBuffer_offset_atIndex_(neg_counts_buf, 0, 12)
                 enc2u.setBuffer_offset_atIndex_(dbg_energy_buf, 0, 13)
                 enc2u.dispatchThreadgroups_threadsPerThreadgroup_(tg_reps, threads_per_group)
-                enc2u.endEncoding(); cb2u.commit(); cb2u.waitUntilCompleted()
+                enc2u.endEncoding()
 
-                # Reduce energies after this chunk
-                cbRE = self._command_queue.commandBuffer()
-                encRE = cbRE.computeCommandEncoder()
+                # Energy reduction after this chunk
+                encRE = cbI.computeCommandEncoder()
                 encRE.setComputePipelineState_(self._kernels["reduce_energies_2d"])
                 encRE.setBuffer_offset_atIndex_(csr_row_ptr_buf, 0, 0)
                 encRE.setBuffer_offset_atIndex_(csr_col_ind_buf, 0, 1)
                 encRE.setBuffer_offset_atIndex_(csr_J_vals_buf, 0, 2)
-                encRE.setBuffer_offset_atIndex_(self._create_buffer(np.array([N], dtype=np.int32), "N"), 0, 3)
+                encRE.setBuffer_offset_atIndex_(n_buf, 0, 3)
                 encRE.setBuffer_offset_atIndex_(thread_buffers_buf, 0, 4)
                 encRE.setBuffer_offset_atIndex_(dbg_energy_buf, 0, 5)
+
+                intervals_since_adapt += 1
+                if adapt_every_eff > 0 and intervals_since_adapt >= adapt_every_eff:
+                    # Sync and adapt ladder using windowed swap stats
+                    if last_cb is not None:
+                        last_cb.waitUntilCompleted()
+                    cur_att = np.array(_read_int32_array(attempts, max(0, num_reps-1)), dtype=np.int32)
+                    cur_acc = np.array(_read_int32_array(accepts, max(0, num_reps-1)), dtype=np.int32)
+                    delta_att = cur_att - attempts_prev
+                    delta_acc = cur_acc - accepts_prev
+                    attempts_prev = cur_att
+                    accepts_prev = cur_acc
+                    if stats_window_eff > 0:
+                        window_attempts.append(delta_att)
+                        window_accepts.append(delta_acc)
+                        if len(window_attempts) > stats_window_eff:
+                            window_attempts.pop(0)
+                            window_accepts.pop(0)
+                        sum_att = np.sum(window_attempts, axis=0) if window_attempts else np.zeros_like(delta_att)
+                        sum_acc = np.sum(window_accepts, axis=0) if window_accepts else np.zeros_like(delta_acc)
+                        # Compute windowed acceptance rates per adjacent pair
+                        rates = np.where(sum_att > 0, sum_acc / np.maximum(sum_att, 1), 0.0).astype(np.float32)
+                        if np.any(sum_att > 0) and len(temps_host) == num_reps:
+                            # Nudge gaps toward target acceptance while preserving total beta span
+                            betas = 1.0 / np.array(temps_host, dtype=np.float64)
+                            beta_min = float(np.min(betas)); beta_max = float(np.max(betas))
+                            gaps = np.diff(betas)
+                            if gaps.size > 0 and (beta_max > beta_min):
+                                # EMA-smooth acceptance rates and clamp per-step changes
+                                try:
+                                    ema_rates
+                                except NameError:
+                                    ema_rates = None
+                                ema_alpha = 0.5  # smoothing factor
+                                max_step = 0.15  # clamp per-adapt fractional change of each gap
+                                if ema_rates is None:
+                                    ema_rates = rates.astype(np.float64)
+                                else:
+                                    ema_rates = ema_alpha * rates.astype(np.float64) + (1.0 - ema_alpha) * ema_rates
+                                rates_eff = ema_rates
+
+                                k = 0.25  # nudge factor
+                                factors = [1.0 - k * (r - target_acc) for r in rates_eff]
+                                # clamp
+                                factors = [min(1.0 + max_step, max(1.0 - max_step, f)) for f in factors]
+                                new_gaps = np.array([max(1e-9, g * f) for g, f in zip(gaps, factors)], dtype=np.float64)
+                                scale = (beta_max - beta_min) / max(1e-12, float(np.sum(new_gaps)))
+                                new_gaps *= scale
+                                new_betas = [beta_min]
+                                for dg in new_gaps:
+                                    new_betas.append(new_betas[-1] + float(dg))
+                                new_betas[-1] = beta_max
+                                new_betas = np.array(new_betas, dtype=np.float64)
+                                new_temps = (1.0 / np.clip(new_betas, 1e-12, None)).astype(np.float32)
+                                temps_host = new_temps.tolist()
+                                # Write temperatures in-place to avoid buffer churn
+                                vieww = temps_buf.contents().as_buffer(temps_buf.length())
+                                for i, t in enumerate(new_temps):
+                                    bs = struct.pack('<f', float(t))
+                                    off = i * 4
+                                    for j in range(4):
+                                        vieww[off + j] = bs[j]
+                    intervals_since_adapt = 0
+
                 encRE.setBuffer_offset_atIndex_(num_reps_buf, 0, 6)
                 encRE.dispatchThreadgroups_threadsPerThreadgroup_(tg_reps, threads_per_group)
-                encRE.endEncoding(); cbRE.commit(); cbRE.waitUntilCompleted()
+                encRE.endEncoding()
 
                 # Swaps: even then odd
-                def dispatch_swaps(parity:int, num_pairs:int):
-                    if num_pairs <= 0:
-                        return
-                    cbSW = self._command_queue.commandBuffer()
-                    encSW = cbSW.computeCommandEncoder()
-                    encSW.setComputePipelineState_(self._kernels["pt_swap_adjacent"])
-                    encSW.setBuffer_offset_atIndex_(self._create_buffer(np.array([N], dtype=np.int32), "N"), 0, 0)
-                    encSW.setBuffer_offset_atIndex_(temps_buf, 0, 1)
-                    encSW.setBuffer_offset_atIndex_(num_reps_buf, 0, 2)
-                    encSW.setBuffer_offset_atIndex_(thread_buffers_buf, 0, 3)
-                    encSW.setBuffer_offset_atIndex_(dbg_energy_buf, 0, 4)
-                    encSW.setBuffer_offset_atIndex_(base_seed_buf, 0, 5)
-                    encSW.setBuffer_offset_atIndex_(self._create_buffer(np.array([parity], dtype=np.int32), "swap_parity"), 0, 6)
-                    encSW.setBuffer_offset_atIndex_(attempts, 0, 7)
-                    encSW.setBuffer_offset_atIndex_(accepts, 0, 8)
-                    encSW.dispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSize(width=tpg_x, height=1, depth=1), Metal.MTLSize(width=1, height=num_pairs, depth=1))
-                    encSW.endEncoding(); cbSW.commit(); cbSW.waitUntilCompleted()
+                int_even_pairs = (num_reps // 2)
+                if int_even_pairs > 0:
+                    encSW0 = cbI.computeCommandEncoder()
+                    encSW0.setComputePipelineState_(self._kernels["pt_swap_adjacent"])
+                    encSW0.setBuffer_offset_atIndex_(n_buf, 0, 0)
+                    encSW0.setBuffer_offset_atIndex_(temps_buf, 0, 1)
+                    encSW0.setBuffer_offset_atIndex_(num_reps_buf, 0, 2)
+                    encSW0.setBuffer_offset_atIndex_(thread_buffers_buf, 0, 3)
+                    encSW0.setBuffer_offset_atIndex_(dbg_energy_buf, 0, 4)
+                    encSW0.setBuffer_offset_atIndex_(base_seed_buf, 0, 5)
+                    encSW0.setBuffer_offset_atIndex_(parity0_buf, 0, 6)
+                    encSW0.setBuffer_offset_atIndex_(attempts, 0, 7)
+                    encSW0.setBuffer_offset_atIndex_(accepts, 0, 8)
+                    encSW0.dispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSize(width=tpg_x, height=1, depth=1), Metal.MTLSize(width=1, height=int_even_pairs, depth=1))
+                    encSW0.endEncoding()
+                int_odd_pairs = ((num_reps - 1) // 2)
+                if int_odd_pairs > 0:
+                    encSW1 = cbI.computeCommandEncoder()
+                    encSW1.setComputePipelineState_(self._kernels["pt_swap_adjacent"])
+                    encSW1.setBuffer_offset_atIndex_(n_buf, 0, 0)
+                    encSW1.setBuffer_offset_atIndex_(temps_buf, 0, 1)
+                    encSW1.setBuffer_offset_atIndex_(num_reps_buf, 0, 2)
+                    encSW1.setBuffer_offset_atIndex_(thread_buffers_buf, 0, 3)
+                    encSW1.setBuffer_offset_atIndex_(dbg_energy_buf, 0, 4)
+                    encSW1.setBuffer_offset_atIndex_(base_seed_buf, 0, 5)
+                    encSW1.setBuffer_offset_atIndex_(parity1_buf, 0, 6)
+                    encSW1.setBuffer_offset_atIndex_(attempts, 0, 7)
+                    encSW1.setBuffer_offset_atIndex_(accepts, 0, 8)
+                    encSW1.dispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSize(width=tpg_x, height=1, depth=1), Metal.MTLSize(width=1, height=int_odd_pairs, depth=1))
+                    encSW1.endEncoding()
 
-                dispatch_swaps(0, num_reps // 2)
-                dispatch_swaps(1, (num_reps - 1) // 2)
-
+                cbI.commit()
+                last_cb = cbI
+                inflight_cbs.append(cbI)
                 remaining -= sweeps_this
+
+
+            # Wait for all interval command buffers to complete before reading back
+            if last_cb is not None:
+                last_cb.waitUntilCompleted()
+            inflight_cbs.clear(); inflight_tmp_bufs.clear()
 
             # Read back stats and energies
             def read_int32_array(buf, n):
@@ -416,6 +553,42 @@ class UnifiedMetalSampler:
                         base = i * 4
                         rates.append(struct.unpack('<f', bytes([viewf[base+j] for j in range(4)]))[0])
                     self.logger.debug(f"[UnifiedMetal] PT accept rates: {['{:.2f}'.format(r) for r in rates]}")
+
+
+                # GPU packing of selected replicas to reduce host read size
+                # Select replicas by ascending energy (host-side selection only)
+                idx_order = list(sorted(range(num_reps), key=lambda i: energies2d[i]))
+                if num_reads <= num_reps:
+                    sel_indices = idx_order[:num_reads]
+                else:
+                    reps = (num_reads + num_reps - 1) // num_reps
+                    sel_indices = (idx_order * reps)[:num_reads]
+
+                sel_idx_buf = self._create_buffer(np.array(sel_indices, dtype=np.int32), "sel_indices")
+                num_reads_buf = self._create_buffer(np.array([int(num_reads)], dtype=np.int32), "num_reads")
+                packed_out = self._create_buffer(np.zeros(num_reads * N, dtype=np.int8), "packed_out")
+
+                cbPK = self._command_queue.commandBuffer()
+                encPK = cbPK.computeCommandEncoder()
+                encPK.setComputePipelineState_(self._kernels["pack_selected_replicas"])
+                encPK.setBuffer_offset_atIndex_(self._create_buffer(np.array([N], dtype=np.int32), "N"), 0, 0)
+                encPK.setBuffer_offset_atIndex_(sel_idx_buf, 0, 1)
+                encPK.setBuffer_offset_atIndex_(num_reads_buf, 0, 2)
+                encPK.setBuffer_offset_atIndex_(thread_buffers_buf, 0, 3)
+                encPK.setBuffer_offset_atIndex_(packed_out, 0, 4)
+                encPK.dispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSize(width=tpg_x, height=1, depth=1), Metal.MTLSize(width=1, height=int(num_reads), depth=1))
+                encPK.endEncoding(); cbPK.commit(); cbPK.waitUntilCompleted()
+
+                # Read back packed samples only (not the full buffer)
+                pview = packed_out.contents().as_buffer(packed_out.length())
+                spins_bytes = bytes(pview)
+                spins_flat = np.frombuffer(spins_bytes, dtype=np.int8)[:num_reads * N]
+
+                samples = []
+                energies = []
+                for k, rid in enumerate(sel_indices):
+                    samples.append(spins_flat[k*N:(k+1)*N].astype(np.int8).tolist())
+                    energies.append(int(energies2d[rid]))
 
                 self.logger.debug(f"[UnifiedMetal] PT attempts: {att}")
                 self.logger.debug(f"[UnifiedMetal] PT accepts:  {acc}")

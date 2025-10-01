@@ -419,6 +419,30 @@ kernel void pt_swap_adjacent(
 
 
 
+// 11. Pack selected replicas' spins into a compact buffer [num_reads * N]
+kernel void pack_selected_replicas(
+    device const int* N [[buffer(0)]],                 // [1]
+    device const int* sel_indices [[buffer(1)]],       // [num_reads]
+    device const int* num_reads [[buffer(2)]],         // [1]
+    device const int8_t* thread_buffers_src [[buffer(3)]], // [num_replicas * N]
+    device int8_t* packed_out [[buffer(4)]],          // [num_reads * N]
+
+    uint3 tid3_tg [[thread_position_in_threadgroup]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tg_size [[threads_per_threadgroup]]
+) {
+    int n = *N;
+    int k = int(tg_pos.y);             // output sample index
+    if (k >= *num_reads) return;
+    int rid = sel_indices[k];          // replica to pack
+
+    for (int sid = int(tid3_tg.x); sid < n; sid += int(tg_size.x)) {
+        int8_t v = thread_buffers_src[rid * n + sid];
+        packed_out[k * n + sid] = v;
+    }
+}
+
+
 // 10. Compute swap acceptance rates per adjacent pair
 kernel void compute_swap_stats(
     device const int* num_replicas [[buffer(0)]],
@@ -435,4 +459,243 @@ kernel void compute_swap_stats(
     int a = atomic_load_explicit(&swap_attempts[idx], memory_order_relaxed);
     int b = atomic_load_explicit(&swap_accepts[idx], memory_order_relaxed);
     rates_out[idx] = (a > 0) ? (float(b) / float(a)) : 0.0f;
+}
+
+// 12. Greedy graph coloring (distance-1) for multi-color updates
+kernel void compute_graph_coloring(
+    device const int* csr_row_ptr [[buffer(0)]],    // [N+1]
+    device const int* csr_col_ind [[buffer(1)]],    // [nnz]
+    device const int* N [[buffer(2)]],              // [1]
+    device const int* max_colors [[buffer(3)]],     // [1] maximum allowed colors
+    device int* node_colors [[buffer(4)]],          // [N] output: color per node
+    device int* num_colors_out [[buffer(5)]],       // [1] output: number of colors used
+    device int* use_coloring [[buffer(6)]],         // [1] output: 1=success, 0=fallback to parity
+    device int* node_degrees [[buffer(7)]],         // [N] temp: degree per node
+    uint tid [[thread_position_in_grid]]
+) {
+    int n = *N;
+    int max_col = *max_colors;
+
+    // Single-threaded greedy coloring for simplicity and correctness
+    if (tid != 0) return;
+
+    // Initialize: compute degrees
+    for (int i = 0; i < n; i++) {
+        node_colors[i] = -1;  // uncolored
+        node_degrees[i] = csr_row_ptr[i + 1] - csr_row_ptr[i];
+    }
+
+    int num_colors = 0;
+
+    // Greedy coloring in degree-descending order
+    // Process nodes by finding max degree uncolored node each iteration
+    for (int iter = 0; iter < n; iter++) {
+        // Find uncolored node with highest degree
+        int best_node = -1;
+        int best_degree = -1;
+        for (int i = 0; i < n; i++) {
+            if (node_colors[i] < 0 && node_degrees[i] > best_degree) {
+                best_node = i;
+                best_degree = node_degrees[i];
+            }
+        }
+
+        if (best_node < 0) break;  // all colored
+
+        // Find smallest available color for this node
+        bool neighbor_has_color[16];  // Support up to 16 colors (max_colors)
+        for (int c = 0; c < max_col; c++) {
+            neighbor_has_color[c] = false;
+        }
+
+        int start = csr_row_ptr[best_node];
+        int end = csr_row_ptr[best_node + 1];
+        for (int p = start; p < end; p++) {
+            int neighbor = csr_col_ind[p];
+            if (neighbor < n && node_colors[neighbor] >= 0 && node_colors[neighbor] < max_col) {
+                neighbor_has_color[node_colors[neighbor]] = true;
+            }
+        }
+
+        // Find first available color
+        int chosen_color = -1;
+        for (int c = 0; c < max_col; c++) {
+            if (!neighbor_has_color[c]) {
+                chosen_color = c;
+                break;
+            }
+        }
+
+        if (chosen_color < 0) {
+            // Exceeded max_colors, fallback to parity mode
+            *use_coloring = 0;
+            *num_colors_out = 0;
+            return;
+        }
+
+        node_colors[best_node] = chosen_color;
+        num_colors = max(num_colors, chosen_color + 1);
+    }
+
+    // Verify coloring is valid
+    for (int i = 0; i < n; i++) {
+        int my_color = node_colors[i];
+        int start = csr_row_ptr[i];
+        int end = csr_row_ptr[i + 1];
+        for (int p = start; p < end; p++) {
+            int neighbor = csr_col_ind[p];
+            if (neighbor < n && node_colors[neighbor] == my_color) {
+                // Invalid coloring detected
+                *use_coloring = 0;
+                *num_colors_out = 0;
+                return;
+            }
+        }
+    }
+
+    // Success
+    *num_colors_out = num_colors;
+    *use_coloring = 1;
+}
+
+// 13. Color-phase Metropolis updates (Phase 2 - multi-color updates)
+kernel void metropolis_color_phase(
+    // CSR data
+    device const int* csr_row_ptr [[buffer(0)]],      // [N+1]
+    device const int* csr_col_ind [[buffer(1)]],      // [nnz]
+    device const int8_t* csr_J_vals [[buffer(2)]],    // [nnz]
+    device const int* N [[buffer(3)]],                // [1]
+
+    // Temperatures and replicas
+    device const float* temperatures [[buffer(4)]],   // [num_replicas]
+    device const int* num_replicas [[buffer(5)]],     // [1]
+
+    // Coloring data
+    device const int* node_colors [[buffer(6)]],      // [N] color per node
+    device const int* num_colors [[buffer(7)]],       // [1] number of colors
+    device const int* color_order [[buffer(8)]],      // [num_colors] randomized color order for this sweep
+
+    // Parameters
+    device const int* num_sweeps [[buffer(9)]],       // [1]
+    device const uint* base_seed [[buffer(10)]],      // [1]
+
+    // Double buffers
+    device int8_t* thread_buffers_src [[buffer(11)]], // [num_replicas * N]
+    device int8_t* thread_buffers_dst [[buffer(12)]], // [num_replicas * N]
+
+    // Debug counters
+    device atomic_int* flip_counts [[buffer(13)]],         // [num_replicas]
+    device atomic_int* pos_delta_counts [[buffer(14)]],    // [num_replicas]
+    device atomic_int* neg_delta_counts [[buffer(15)]],    // [num_replicas]
+    device int* energy_debug [[buffer(16)]],               // [num_replicas]
+
+    // Thread indices
+    uint3 tid3_tg [[thread_position_in_threadgroup]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tg_size [[threads_per_threadgroup]]
+) {
+    int n = *N;
+    int rid = int(tg_pos.y);                // one threadgroup per replica
+    int n_reps = *num_replicas;
+    if (rid >= n_reps) return;
+
+    float temperature = temperatures[rid];
+    float beta = 1.0f / max(temperature, 1e-6f);
+
+    // Local pointers to current source/dest buffers for this replica
+    device int8_t* src = &thread_buffers_src[rid * n];
+    device int8_t* dst = &thread_buffers_dst[rid * n];
+
+    int sweeps = *num_sweeps;
+    int n_colors = *num_colors;
+
+    // Sweep loop
+    for (int sweep = 0; sweep < sweeps; ++sweep) {
+        // Iterate through colors in randomized order (color_order is pre-shuffled per sweep)
+        for (int color_idx = 0; color_idx < n_colors; ++color_idx) {
+            int current_color = color_order[color_idx];
+
+            // Update all spins with this color in parallel (they're independent!)
+            for (int tile = 0; tile < n; tile += int(tg_size.x)) {
+                int sid = tile + int(tid3_tg.x);
+                if (sid < n && node_colors[sid] == current_color) {
+                    int8_t old_spin = src[sid];
+                    int8_t new_spin = -old_spin;
+
+                    // Compute energy change using neighbors from current source
+                    int delta_energy = 0;
+                    int start = csr_row_ptr[sid];
+                    int end = csr_row_ptr[sid + 1];
+                    for (int p = start; p < end; ++p) {
+                        int j = csr_col_ind[p];
+                        int8_t Jij = csr_J_vals[p];
+                        int8_t neighbor_spin = src[j];
+                        delta_energy += Jij * (new_spin - old_spin) * neighbor_spin;
+                    }
+
+                    // Debug counts for delta sign
+                    if (delta_energy > 0) {
+                        atomic_fetch_add_explicit(&pos_delta_counts[rid], 1, memory_order_relaxed);
+                    } else if (delta_energy < 0) {
+                        atomic_fetch_add_explicit(&neg_delta_counts[rid], 1, memory_order_relaxed);
+                    }
+
+                    // Metropolis accept
+                    bool accept = (delta_energy <= 0);
+                    if (!accept) {
+                        uint s2 = *base_seed ^ uint((rid + 1) * 2654435761u) ^ uint((sid + 1) * 974238197u)
+                                             ^ uint((sweep + 1) * 362437u) ^ uint((color_idx + 1) * 987654321u);
+                        s2 ^= s2 << 13; s2 ^= s2 >> 17; s2 ^= s2 << 5;
+                        float r = float(s2 & 0x7FFFFFFFu) / 2147483647.0f;
+                        float prob = exp(-float(delta_energy) * beta);
+                        accept = (r < prob);
+                    }
+
+                    if (accept) {
+                        dst[sid] = new_spin;
+                        atomic_fetch_add_explicit(&flip_counts[rid], 1, memory_order_relaxed);
+                    } else {
+                        dst[sid] = old_spin;
+                    }
+                } else if (sid < n) {
+                    // Not this color, carry forward unchanged
+                    dst[sid] = src[sid];
+                }
+                threadgroup_barrier(mem_flags::mem_device);
+            }
+
+            // Swap src/dst for next color
+            device int8_t* tmp = src; src = dst; dst = tmp;
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+    }
+
+    // Ensure the latest configuration resides in thread_buffers_src
+    if (src != &thread_buffers_src[rid * n]) {
+        for (int tile = 0; tile < n; tile += int(tg_size.x)) {
+            int sid = tile + int(tid3_tg.x);
+            if (sid < n) {
+                thread_buffers_src[rid * n + sid] = src[sid];
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+    }
+
+    // Debug: compute per-replica energy
+    if (tid3_tg.x == 0) {
+        int e = 0;
+        for (int i = 0; i < n; ++i) {
+            int start = csr_row_ptr[i];
+            int end = csr_row_ptr[i + 1];
+            int8_t s_i = src[i];
+            for (int p = start; p < end; ++p) {
+                int j = csr_col_ind[p];
+                if (j > i) {
+                    int8_t Jij = csr_J_vals[p];
+                    e += Jij * s_i * src[j];
+                }
+            }
+        }
+        energy_debug[rid] = e;
+    }
 }
