@@ -288,6 +288,49 @@ class UnifiedMetalSampler:
             num_reps = struct.unpack('<i', bytes([opt_view[i] for i in range(4)]))[0]
             num_reps = max(1, int(num_reps))
 
+            # === Phase 2: Compute graph coloring ===
+            max_colors_val = 64  # Max colors (handle complete graphs and Zephyr deg~16)
+            node_colors = np.zeros(N, dtype=np.int32)
+            num_colors_out = np.zeros(1, dtype=np.int32)
+            use_coloring_out = np.zeros(1, dtype=np.int32)
+            node_degrees = np.zeros(N, dtype=np.int32)
+
+            n_buf_coloring = self._create_buffer(np.array([N], dtype=np.int32), "N_coloring")
+            max_colors_buf = self._create_buffer(np.array([max_colors_val], dtype=np.int32), "max_colors")
+            node_colors_buf = self._create_buffer(node_colors, "node_colors")
+            num_colors_buf_out = self._create_buffer(num_colors_out, "num_colors_out")
+            use_coloring_buf = self._create_buffer(use_coloring_out, "use_coloring_out")
+            node_degrees_buf = self._create_buffer(node_degrees, "node_degrees")
+
+            # Dispatch coloring kernel
+            cb_color = self._command_queue.commandBuffer()
+            enc_color = cb_color.computeCommandEncoder()
+            enc_color.setComputePipelineState_(self._kernels["compute_graph_coloring"])
+            enc_color.setBuffer_offset_atIndex_(csr_row_ptr_buf, 0, 0)
+            enc_color.setBuffer_offset_atIndex_(csr_col_ind_buf, 0, 1)
+            enc_color.setBuffer_offset_atIndex_(n_buf_coloring, 0, 2)
+            enc_color.setBuffer_offset_atIndex_(max_colors_buf, 0, 3)
+            enc_color.setBuffer_offset_atIndex_(node_colors_buf, 0, 4)
+            enc_color.setBuffer_offset_atIndex_(num_colors_buf_out, 0, 5)
+            enc_color.setBuffer_offset_atIndex_(use_coloring_buf, 0, 6)
+            enc_color.setBuffer_offset_atIndex_(node_degrees_buf, 0, 7)
+            enc_color.dispatchThreadgroups_threadsPerThreadgroup_(
+                Metal.MTLSize(width=1, height=1, depth=1),
+                Metal.MTLSize(width=1, height=1, depth=1)
+            )
+            enc_color.endEncoding(); cb_color.commit(); cb_color.waitUntilCompleted()
+
+            # Read back coloring results
+            nc_view = num_colors_buf_out.contents().as_buffer(num_colors_buf_out.length())
+            num_colors_val = struct.unpack('<i', bytes([nc_view[i] for i in range(4)]))[0]
+            uc_view = use_coloring_buf.contents().as_buffer(use_coloring_buf.length())
+            use_coloring = struct.unpack('<i', bytes([uc_view[i] for i in range(4)]))[0] == 1
+
+            if not use_coloring or num_colors_val == 0:
+                raise RuntimeError(f"[Phase2] Graph coloring failed: needed >{max_colors_val} colors or invalid graph structure")
+
+            self.logger.debug(f"[Phase2] Graph coloring successful: {num_colors_val} colors")
+
             # 2D kernel skeleton to initialize double buffers (step 1)
             cb2d = self._command_queue.commandBuffer()
             enc2d = cb2d.computeCommandEncoder()
@@ -359,8 +402,10 @@ class UnifiedMetalSampler:
 
             # Reusable small constant buffers
             n_buf = self._create_buffer(np.array([N], dtype=np.int32), "N")
+            nc_buf = self._create_buffer(np.array([num_colors_val], dtype=np.int32), "num_colors")
             parity0_buf = self._create_buffer(np.array([0], dtype=np.int32), "parity0")
             parity1_buf = self._create_buffer(np.array([1], dtype=np.int32), "parity1")
+            sweeps_buf_reusable = self._create_buffer(np.array([interval], dtype=np.int32), "sweeps_reusable")
             inflight_cbs = []
             inflight_tmp_bufs = []
             last_cb = None
@@ -368,30 +413,37 @@ class UnifiedMetalSampler:
             remaining = int(num_sweeps)
             while remaining > 0:
                 sweeps_this = min(interval, remaining)
-                self.logger.debug(f"[UnifiedMetal] 2D update sweeps chunk={sweeps_this} (remaining {remaining - sweeps_this})")
-                sweeps2d_buf = self._create_buffer(np.array([sweeps_this], dtype=np.int32), "num_sweeps_2d")
-                inflight_tmp_bufs.append(sweeps2d_buf)
+                self.logger.debug(f"[UnifiedMetal] Color-phase update sweeps chunk={sweeps_this} (remaining {remaining - sweeps_this})")
+
+                # Update sweeps buffer value if different from interval
+                if sweeps_this != interval:
+                    sweeps_view = sweeps_buf_reusable.contents().as_buffer(sweeps_buf_reusable.length())
+                    sweeps_bytes = struct.pack('<i', sweeps_this)
+                    for i in range(4):
+                        sweeps_view[i] = sweeps_bytes[i]
 
                 # Batch per-interval work into a single command buffer; no wait here
                 cbI = self._command_queue.commandBuffer()
 
-                # 2D update chunk
+                # Phase 2: Color-phase Metropolis update (randomization done in kernel)
                 enc2u = cbI.computeCommandEncoder()
-                enc2u.setComputePipelineState_(self._kernels["metropolis_2d_synchronous"])
+                enc2u.setComputePipelineState_(self._kernels["metropolis_color_phase"])
                 enc2u.setBuffer_offset_atIndex_(csr_row_ptr_buf, 0, 0)
                 enc2u.setBuffer_offset_atIndex_(csr_col_ind_buf, 0, 1)
                 enc2u.setBuffer_offset_atIndex_(csr_J_vals_buf, 0, 2)
                 enc2u.setBuffer_offset_atIndex_(n_buf, 0, 3)
                 enc2u.setBuffer_offset_atIndex_(temps_buf, 0, 4)
                 enc2u.setBuffer_offset_atIndex_(num_reps_buf, 0, 5)
-                enc2u.setBuffer_offset_atIndex_(sweeps2d_buf, 0, 6)
-                enc2u.setBuffer_offset_atIndex_(base_seed_buf, 0, 7)
-                enc2u.setBuffer_offset_atIndex_(thread_buffers_buf, 0, 8)
-                enc2u.setBuffer_offset_atIndex_(thread_buffers_alt_buf, 0, 9)
-                enc2u.setBuffer_offset_atIndex_(flip_counts_buf, 0, 10)
-                enc2u.setBuffer_offset_atIndex_(pos_counts_buf, 0, 11)
-                enc2u.setBuffer_offset_atIndex_(neg_counts_buf, 0, 12)
-                enc2u.setBuffer_offset_atIndex_(dbg_energy_buf, 0, 13)
+                enc2u.setBuffer_offset_atIndex_(node_colors_buf, 0, 6)
+                enc2u.setBuffer_offset_atIndex_(nc_buf, 0, 7)
+                enc2u.setBuffer_offset_atIndex_(sweeps_buf_reusable, 0, 8)
+                enc2u.setBuffer_offset_atIndex_(base_seed_buf, 0, 9)
+                enc2u.setBuffer_offset_atIndex_(thread_buffers_buf, 0, 10)
+                enc2u.setBuffer_offset_atIndex_(thread_buffers_alt_buf, 0, 11)
+                enc2u.setBuffer_offset_atIndex_(flip_counts_buf, 0, 12)
+                enc2u.setBuffer_offset_atIndex_(pos_counts_buf, 0, 13)
+                enc2u.setBuffer_offset_atIndex_(neg_counts_buf, 0, 14)
+                enc2u.setBuffer_offset_atIndex_(dbg_energy_buf, 0, 15)
                 enc2u.dispatchThreadgroups_threadsPerThreadgroup_(tg_reps, threads_per_group)
                 enc2u.endEncoding()
 

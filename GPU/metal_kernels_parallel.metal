@@ -502,8 +502,8 @@ kernel void compute_graph_coloring(
 
         if (best_node < 0) break;  // all colored
 
-        // Find smallest available color for this node
-        bool neighbor_has_color[16];  // Support up to 16 colors (max_colors)
+        // Find smallest available color for this node (max 64 for complete graphs)
+        bool neighbor_has_color[64];
         for (int c = 0; c < max_col; c++) {
             neighbor_has_color[c] = false;
         }
@@ -573,21 +573,20 @@ kernel void metropolis_color_phase(
     // Coloring data
     device const int* node_colors [[buffer(6)]],      // [N] color per node
     device const int* num_colors [[buffer(7)]],       // [1] number of colors
-    device const int* color_order [[buffer(8)]],      // [num_colors] randomized color order for this sweep
 
     // Parameters
-    device const int* num_sweeps [[buffer(9)]],       // [1]
-    device const uint* base_seed [[buffer(10)]],      // [1]
+    device const int* num_sweeps [[buffer(8)]],       // [1]
+    device const uint* base_seed [[buffer(9)]],      // [1]
 
     // Double buffers
-    device int8_t* thread_buffers_src [[buffer(11)]], // [num_replicas * N]
-    device int8_t* thread_buffers_dst [[buffer(12)]], // [num_replicas * N]
+    device int8_t* thread_buffers_src [[buffer(10)]], // [num_replicas * N]
+    device int8_t* thread_buffers_dst [[buffer(11)]], // [num_replicas * N]
 
     // Debug counters
-    device atomic_int* flip_counts [[buffer(13)]],         // [num_replicas]
-    device atomic_int* pos_delta_counts [[buffer(14)]],    // [num_replicas]
-    device atomic_int* neg_delta_counts [[buffer(15)]],    // [num_replicas]
-    device int* energy_debug [[buffer(16)]],               // [num_replicas]
+    device atomic_int* flip_counts [[buffer(12)]],         // [num_replicas]
+    device atomic_int* pos_delta_counts [[buffer(13)]],    // [num_replicas]
+    device atomic_int* neg_delta_counts [[buffer(14)]],    // [num_replicas]
+    device int* energy_debug [[buffer(15)]],               // [num_replicas]
 
     // Thread indices
     uint3 tid3_tg [[thread_position_in_threadgroup]],
@@ -611,7 +610,22 @@ kernel void metropolis_color_phase(
 
     // Sweep loop
     for (int sweep = 0; sweep < sweeps; ++sweep) {
-        // Iterate through colors in randomized order (color_order is pre-shuffled per sweep)
+        // Generate random color permutation per sweep using Fisher-Yates shuffle
+        int color_order[64];  // Max 64 colors
+        for (int i = 0; i < n_colors; ++i) {
+            color_order[i] = i;
+        }
+        // Fisher-Yates shuffle
+        uint shuffle_seed = *base_seed ^ uint((rid + 1) * 2654435761u) ^ uint((sweep + 1) * 987654321u);
+        for (int i = n_colors - 1; i > 0; --i) {
+            shuffle_seed ^= shuffle_seed << 13; shuffle_seed ^= shuffle_seed >> 17; shuffle_seed ^= shuffle_seed << 5;
+            int j = int(shuffle_seed % uint(i + 1));
+            int tmp = color_order[i];
+            color_order[i] = color_order[j];
+            color_order[j] = tmp;
+        }
+
+        // Iterate through colors in randomized order
         for (int color_idx = 0; color_idx < n_colors; ++color_idx) {
             int current_color = color_order[color_idx];
 
