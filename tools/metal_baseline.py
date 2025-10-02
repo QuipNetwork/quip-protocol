@@ -14,17 +14,10 @@ from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evalua
 from shared.block_requirements import BlockRequirements
 
 try:
-    from GPU.metal_kernel_sampler import MetalKernelDimodSampler
+    from GPU.metal_sampler import MetalSampler
     METAL_AVAILABLE = True
 except ImportError:
     METAL_AVAILABLE = False
-
-# Optional: new parallel sampler for A/B testing
-try:
-    from GPU.metal_kernel_sampler_parallel import MetalKernelDimodSamplerParallel
-    PARALLEL_AVAILABLE = True
-except Exception:
-    PARALLEL_AVAILABLE = False
 
 
 def create_large_problem(size=4593):
@@ -58,43 +51,30 @@ def create_large_problem(size=4593):
     return h, J
 
 
-def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=None, swap_interval=15, T_min=0.1, T_max=5.0, large_problem=False, only_label=None, sampler_choice: str = "original"):
+def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=None, sample_interval=15, T_min=0.1, T_max=5.0, large_problem=False, only_label=None, sampler_choice: str = "original"):
     """Test Metal GPU performance with CPU baseline format and evaluation logic."""
     print("🔬 Metal GPU Baseline Parameter Test (Kernel-Only)")
     print("=" * 50)
     print(f"⏰ Timeout: {timeout_minutes} minutes")
 
-    # Select sampler (production or parallel)
-    metal_sampler = None
-    sampler_type = "unknown"
+    # Initialize Metal sampler
+    if not METAL_AVAILABLE:
+        print("❌ Metal Parallel Tempering sampler not available")
+        return None
 
-    if sampler_choice == "parallel":
-        if not PARALLEL_AVAILABLE:
-            print("❌ Parallel sampler not available")
-            return None
-        try:
-            metal_sampler = MetalKernelDimodSamplerParallel("mps")
-            nodes = metal_sampler.nodes
-            edges = metal_sampler.edges
-            sampler_type = "metal-parallel"
-            print("✅ Parallel sampler ready (new 2D kernel path)")
-        except Exception as e:
-            print(f"❌ Parallel sampler failed: {e}")
-            return None
-    else:
-        if METAL_AVAILABLE:
-            try:
-                metal_sampler = MetalKernelDimodSampler("mps")
-                nodes = metal_sampler.nodes
-                edges = metal_sampler.edges
-                sampler_type = "metal-pt"
-                print("✅ Metal Parallel Tempering sampler ready (production kernel)")
-            except Exception as e:
-                print(f"❌ Metal Parallel Tempering sampler failed: {e}")
-                return None
-        else:
-            print("❌ Metal Parallel Tempering sampler not available")
-            return None
+    try:
+        metal_sampler = MetalSampler()
+        sampler_type = "metal-pt"
+        print("✅ Metal Parallel Tempering sampler ready")
+    except Exception as e:
+        print(f"❌ Metal Parallel Tempering sampler failed: {e}")
+        return None
+
+    # Get Zephyr topology
+    from dwave_topologies import DEFAULT_TOPOLOGY
+    topology_graph = DEFAULT_TOPOLOGY.graph
+    nodes = list(topology_graph.nodes())
+    edges = list(topology_graph.edges())
 
     # Choose problem size
     if large_problem:
@@ -185,7 +165,7 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=Non
                 num_reads=reads,
                 num_sweeps=sweeps,
                 num_replicas=num_replicas,
-                swap_interval=swap_interval,
+                sample_interval=sample_interval,
                 T_min=T_min,
                 T_max=T_max
             )
@@ -400,7 +380,7 @@ def main():
         timeout_minutes=timeout,
         output_file=output_file,
         num_replicas=args.num_replicas,
-        swap_interval=args.swap_interval,
+        sample_interval=args.swap_interval,
         T_min=args.T_min,
         T_max=args.T_max,
         large_problem=args.large_problem,
