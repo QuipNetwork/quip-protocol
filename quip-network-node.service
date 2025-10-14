@@ -26,8 +26,8 @@ ProtectKernelTunables=yes
 ProtectControlGroups=yes
 
 # Resource limits
-MemoryLimit=2G
-CPUQuota=200%
+#MemoryMax=32G
+#CPUQuota=800%
 
 [Install]
 WantedBy=multi-user.target
