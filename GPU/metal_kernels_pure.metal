@@ -23,11 +23,40 @@ inline uint xorshift32(thread uint &state) {
     return x;
 }
 
+// Phase 4: Bit-packing helpers for thread-local state
+// Pack 8 spins into 1 byte: bit i stores spin i (0=+1, 1=-1)
+inline int8_t get_spin_packed(int var, thread const int8_t* packed_state) {
+    int byte_idx = var >> 3;  // var / 8
+    int bit_idx = var & 7;    // var % 8
+    int bit = (packed_state[byte_idx] >> bit_idx) & 1;
+    return bit ? -1 : 1;  // 0 -> +1, 1 -> -1
+}
+
+inline void set_spin_packed(int var, int8_t spin, thread int8_t* packed_state) {
+    int byte_idx = var >> 3;  // var / 8
+    int bit_idx = var & 7;    // var % 8
+    int8_t bit = (spin < 0) ? 1 : 0;  // -1 -> 1, +1 -> 0
+    int8_t mask = 1 << bit_idx;
+
+    if (bit) {
+        packed_state[byte_idx] |= mask;   // Set bit
+    } else {
+        packed_state[byte_idx] &= ~mask;  // Clear bit
+    }
+}
+
+inline void flip_spin_packed(int var, thread int8_t* packed_state) {
+    int byte_idx = var >> 3;  // var / 8
+    int bit_idx = var & 7;    // var % 8
+    packed_state[byte_idx] ^= (1 << bit_idx);  // Toggle bit
+}
+
 // Compute delta energy for flipping a single variable
+// Phase 4: Works with bit-packed state in thread-local memory
 // Uses aggressive loop unrolling for Zephyr topology (degrees 8-20)
-inline int get_flip_energy(
+inline int8_t get_flip_energy(
     int var,
-    device const int8_t* state,
+    thread const int8_t* packed_state,
     device const int* csr_row_ptr,
     device const int* csr_col_ind,
     device const int8_t* csr_J_vals
@@ -42,15 +71,19 @@ inline int get_flip_energy(
     for (int p = start; p < end; ++p) {
         int neighbor = csr_col_ind[p];
         int8_t Jij = csr_J_vals[p];
-        energy += state[neighbor] * Jij;
+        int8_t neighbor_spin = get_spin_packed(neighbor, packed_state);
+        energy += neighbor_spin * Jij;
     }
 
     // Delta energy = -2 * state[var] * energy
-    return -2 * state[var] * energy;
+    // Phase 4: Cast to int8_t (safe because max delta_E ≤ 38 for all topologies)
+    int8_t var_spin = get_spin_packed(var, packed_state);
+    return (int8_t)(-2 * var_spin * energy);
 }
 
 // Pure SA kernel with delta energy optimization
-// Each thread runs ONE independent SA chain (num_threads = num_reads)
+// Phase 5: Multiple threadgroups for better GPU core utilization
+// Each thread runs ONE independent SA chain with bit-packed state and int8 delta_energy
 kernel void pure_simulated_annealing(
     // Problem CSR representation
     device const int* csr_row_ptr [[buffer(0)]],          // [N+1]
@@ -66,56 +99,69 @@ kernel void pure_simulated_annealing(
     // Beta schedule
     device const float* beta_schedule [[buffer(7)]],       // [num_betas]
 
-    // Working memory
-    device int8_t* working_states [[buffer(8)]],           // [num_reads * N]
+    // Outputs only (no working memory needed - using thread-local)
+    device int8_t* final_samples [[buffer(8)]],            // [num_reads * (N+7)/8] - bit-packed
+    device int* final_energies [[buffer(9)]],              // [num_reads]
 
-    // Outputs
-    device int8_t* final_samples [[buffer(9)]],            // [num_reads * N]
-    device int* final_energies [[buffer(10)]],             // [num_reads]
-
-    // Delta energy array
-    device int* delta_energies [[buffer(11)]],             // [num_reads * N]
+    // Phase 5: Number of reads (for bounds checking)
+    constant int& num_reads [[buffer(10)]],                // total number of reads
 
     // Thread info
     uint3 threadgroup_pos [[threadgroup_position_in_grid]],
     uint3 thread_pos_in_group [[thread_position_in_threadgroup]],
     uint3 threads_per_group [[threads_per_threadgroup]]
 ) {
-    // Compute global thread ID
+    // Phase 5: Compute global thread ID across multiple threadgroups
     uint thread_id = threadgroup_pos.x * threads_per_group.x + thread_pos_in_group.x;
+
+    // Phase 5: Early exit if thread_id is out of bounds
+    // This can happen when num_reads is not divisible by num_gpu_cores
+    if (thread_id >= num_reads) {
+        return;
+    }
 
     int n = N;
     int num_beta_values = num_betas;
     int sweeps_per_beta_val = sweeps_per_beta;
+    int packed_size = (n + 7) / 8;  // Phase 4: bytes needed for bit-packed state
 
-    // Each thread gets its own state and delta_energy array
-    device int8_t* state = &working_states[thread_id * n];
-    device int* delta_energy = &delta_energies[thread_id * n];
+    // Phase 4: Thread-local memory for state and delta_energy
+    // Bit-packed state: (N+7)/8 bytes
+    // Delta energy: N bytes (int8)
+    // Total: ~5 KiB for N=4593 (fits in thread-local memory)
+    thread int8_t packed_state[4593 / 8 + 1];  // Bit-packed state
+    thread int8_t delta_energy[4593];           // Delta energy (int8)
 
     // Initialize RNG state with unique seed per thread
     uint rng_state = (base_seed ? base_seed : 1u) ^ (thread_id * 12345u);
 
-    // Generate random initial state
+    // Generate random initial state (bit-packed)
+    for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
+        packed_state[byte_idx] = 0;  // Clear all bits
+    }
     for (int var = 0; var < n; var++) {
         uint rand_val = xorshift32(rng_state);
-        state[var] = (rand_val & 1) ? 1 : -1;  // Random ±1
+        int8_t spin = (rand_val & 1) ? -1 : 1;  // Random ±1
+        set_spin_packed(var, spin, packed_state);
     }
 
     // Build initial delta_energy array
     for (int var = 0; var < n; var++) {
-        delta_energy[var] = get_flip_energy(var, state, csr_row_ptr, csr_col_ind, csr_J_vals);
+        delta_energy[var] = get_flip_energy(var, packed_state, csr_row_ptr, csr_col_ind, csr_J_vals);
     }
 
     // Compute initial energy
     int current_energy = 0;
     for (int i = 0; i < n; i++) {
+        int8_t spin_i = get_spin_packed(i, packed_state);
         int start = csr_row_ptr[i];
         int end = csr_row_ptr[i + 1];
         for (int p = start; p < end; ++p) {
             int j = csr_col_ind[p];
             if (j > i) {  // Count each edge once
                 int8_t Jij = csr_J_vals[p];
-                current_energy += Jij * state[i] * state[j];
+                int8_t spin_j = get_spin_packed(j, packed_state);
+                current_energy += Jij * spin_i * spin_j;
             }
         }
     }
@@ -131,13 +177,16 @@ kernel void pure_simulated_annealing(
         for (int sweep = 0; sweep < sweeps_per_beta_val; sweep++) {
             // Sequential variable ordering (matching D-Wave default)
             for (int var = 0; var < n; var++) {
+                // Phase 4: Cache delta_energy to reduce memory accesses
+                int8_t de = delta_energy[var];
+
                 // Skip if delta energy too large (D-Wave optimization)
-                if (delta_energy[var] >= threshold) continue;
+                if (de >= threshold) continue;
 
                 bool flip_spin = false;
 
                 // Metropolis-Hastings acceptance rule
-                if (delta_energy[var] <= 0) {
+                if (de <= 0) {
                     // Always accept energy-lowering flips
                     flip_spin = true;
                 } else {
@@ -145,7 +194,7 @@ kernel void pure_simulated_annealing(
                     uint rand_val = xorshift32(rng_state);
 
                     // Accept with probability exp(-delta_energy * beta)
-                    float prob = exp(-float(delta_energy[var]) * beta);
+                    float prob = exp(-float(de) * beta);
                     float rand_normalized = float(rand_val) / 4294967295.0f;  // 2^32 - 1
 
                     if (prob > rand_normalized) {
@@ -155,10 +204,13 @@ kernel void pure_simulated_annealing(
 
                 if (flip_spin) {
                     // Track energy change
-                    current_energy += delta_energy[var];
+                    current_energy += de;
+
+                    // Phase 4: Get current spin value
+                    int8_t var_spin = get_spin_packed(var, packed_state);
 
                     // Update delta energies of all neighbors
-                    int8_t multiplier = 4 * state[var];
+                    int8_t multiplier = 4 * var_spin;
                     int start = csr_row_ptr[var];
                     int end = csr_row_ptr[var + 1];
 
@@ -167,21 +219,22 @@ kernel void pure_simulated_annealing(
                     for (int p = start; p < end; ++p) {
                         int neighbor = csr_col_ind[p];
                         int8_t Jij = csr_J_vals[p];
-                        delta_energy[neighbor] += multiplier * Jij * state[neighbor];
+                        int8_t neighbor_spin = get_spin_packed(neighbor, packed_state);
+                        delta_energy[neighbor] += multiplier * Jij * neighbor_spin;
                     }
 
                     // Flip the spin and negate its delta energy
-                    state[var] *= -1;
-                    delta_energy[var] *= -1;
+                    flip_spin_packed(var, packed_state);
+                    delta_energy[var] = -de;  // Phase 4: Use cached value
                 }
             }
         }
     }
 
-    // Write final state to output
-    device int8_t* output = &final_samples[thread_id * n];
-    for (int i = 0; i < n; i++) {
-        output[i] = state[i];
+    // Write final state to output (bit-packed)
+    device int8_t* output = &final_samples[thread_id * packed_size];
+    for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
+        output[byte_idx] = packed_state[byte_idx];
     }
 
     // Use tracked energy

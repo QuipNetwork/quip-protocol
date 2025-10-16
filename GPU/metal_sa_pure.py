@@ -262,22 +262,17 @@ class PureMetalSASampler:
         num_betas_bytes = np.int32(len(beta_schedule)).tobytes()
         sweeps_per_beta_bytes = np.int32(num_sweeps_per_beta).tobytes()
         base_seed_bytes = np.uint32(seed).tobytes()
+        num_reads_bytes = np.int32(num_reads).tobytes()  # Phase 5: for bounds checking
 
-        # Working states buffer (initial state generated in kernel)
-        working_states_buf = self.device.newBufferWithLength_options_(
-            num_reads * N, Metal.MTLResourceStorageModeShared
-        )
+        # Phase 4: No working memory buffers needed (using thread-local memory)
+        # Output buffers only
+        packed_size = (N + 7) // 8  # Bit-packed state size
 
         final_samples_buf = self.device.newBufferWithLength_options_(
-            num_reads * N, Metal.MTLResourceStorageModeShared
+            num_reads * packed_size, Metal.MTLResourceStorageModeShared
         )
         final_energies_buf = self.device.newBufferWithLength_options_(
             num_reads * 4, Metal.MTLResourceStorageModeShared
-        )
-
-        # Delta energy buffer (int32 per spin per read)
-        delta_energies_buf = self.device.newBufferWithLength_options_(
-            num_reads * N * 4, Metal.MTLResourceStorageModeShared
         )
 
         # Execute kernel
@@ -299,20 +294,28 @@ class PureMetalSASampler:
         # Beta schedule array
         encoder.setBuffer_offset_atIndex_(beta_schedule_buf, 0, 7)
 
-        # Working and output buffers
-        encoder.setBuffer_offset_atIndex_(working_states_buf, 0, 8)
-        encoder.setBuffer_offset_atIndex_(final_samples_buf, 0, 9)
-        encoder.setBuffer_offset_atIndex_(final_energies_buf, 0, 10)
-        encoder.setBuffer_offset_atIndex_(delta_energies_buf, 0, 11)
+        # Phase 4: Output buffers only (no working memory)
+        encoder.setBuffer_offset_atIndex_(final_samples_buf, 0, 8)
+        encoder.setBuffer_offset_atIndex_(final_energies_buf, 0, 9)
 
-        # Dispatch one thread per read
-        max_threads_per_threadgroup = 1024
-        threads_per_threadgroup = Metal.MTLSize(width=min(num_reads, max_threads_per_threadgroup), height=1, depth=1)
-        num_threadgroups = Metal.MTLSize(
-            width=(num_reads + threads_per_threadgroup.width - 1) // threads_per_threadgroup.width,
-            height=1,
-            depth=1
-        )
+        # Phase 5: Number of reads (for bounds checking)
+        encoder.setBytes_length_atIndex_(num_reads_bytes, len(num_reads_bytes), 10)
+
+        # Phase 5: Dispatch one threadgroup per GPU core
+        # Apple GPU has ~24 cores, each can execute one threadgroup in parallel
+        # Each threadgroup processes num_reads/num_cores reads
+        num_gpu_cores = 24  # Apple M1/M2/M3 have 24 GPU cores
+
+        # Calculate threads per threadgroup
+        # Each thread processes one read, so threads_per_threadgroup = num_reads / num_gpu_cores
+        threads_per_threadgroup_width = max(1, (num_reads + num_gpu_cores - 1) // num_gpu_cores)
+        threads_per_threadgroup = Metal.MTLSize(width=threads_per_threadgroup_width, height=1, depth=1)
+
+        # Dispatch one threadgroup per GPU core
+        num_threadgroups = Metal.MTLSize(width=num_gpu_cores, height=1, depth=1)
+
+        self.logger.debug(f"[PureMetalSA] Dispatch: {num_threadgroups.width} threadgroups × {threads_per_threadgroup.width} threads = {num_threadgroups.width * threads_per_threadgroup.width} total threads for {num_reads} reads")
+
         encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_threadgroups, threads_per_threadgroup)
 
         encoder.endEncoding()
@@ -325,10 +328,11 @@ class PureMetalSASampler:
             raise RuntimeError(f"Metal command buffer failed: {error}")
 
         # Read results
-        samples_data = np.frombuffer(
-            final_samples_buf.contents().as_buffer(num_reads * N),
+        # Phase 4: Unpack bit-packed state
+        packed_data = np.frombuffer(
+            final_samples_buf.contents().as_buffer(num_reads * packed_size),
             dtype=np.int8
-        ).reshape(num_reads, N)
+        ).reshape(num_reads, packed_size)
 
         energies_data = np.frombuffer(
             final_energies_buf.contents().as_buffer(num_reads * 4),
@@ -336,6 +340,15 @@ class PureMetalSASampler:
         )
 
         self.logger.debug(f"[PureMetalSA] Energy range: [{energies_data.min()}, {energies_data.max()}]")
+
+        # Phase 4: Unpack bit-packed samples
+        samples_data = np.zeros((num_reads, N), dtype=np.int8)
+        for read_idx in range(num_reads):
+            for var in range(N):
+                byte_idx = var >> 3  # var / 8
+                bit_idx = var & 7    # var % 8
+                bit = (packed_data[read_idx, byte_idx] >> bit_idx) & 1
+                samples_data[read_idx, var] = -1 if bit else 1
 
         # Build SampleSet
         samples_dict = []
