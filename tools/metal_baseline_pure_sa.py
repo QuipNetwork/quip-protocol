@@ -50,14 +50,14 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None,
 
     print(f"📊 Problem: {len(h)} variables, {len(J)} couplings")
 
-    # Test configurations - optimized for GPU Pure SA performance
-    # GPU favors more reads, fewer sweeps (opposite of CPU!)
-    # Optimal: 256-512 reads, 256-512 sweeps for best throughput
+    # Test configurations - matching CPU baseline for fair comparison
     test_configs = [
-        (256, 256, "Light"),    # Fast, good quality (7.9s, -14254 energy)
-        (512, 256, "Medium"),   # Optimal balance (7.7s, -14260 energy) ⭐ RECOMMENDED
-        (1024, 256, "Heavy"),   # Best quality (12.0s, -14332 energy)
-        (2048, 128, "Ultra"),   # Maximum quality (22.2s, -14336 energy)
+        (256, 64, "Light"),
+        (512, 100, "Low"),
+        (1024, 100, "Medium"),
+        (2048, 150, "High"),
+        (4096, 200, "Very High"),
+        (8192, 200, "Max")
     ]
 
     # Optional filter: run only the requested label
