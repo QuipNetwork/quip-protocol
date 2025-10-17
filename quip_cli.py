@@ -380,6 +380,12 @@ def gpu(
         gpu_cfg["types"] = [str(t) for t in gpu_types]
     if not gpu_cfg:
         gpu_cfg = {"backend": "local"}
+
+    # Default to device 0 if backend is local and no devices specified
+    backend = gpu_cfg.get("backend", "local")
+    if backend == "local" and "devices" not in gpu_cfg:
+        gpu_cfg["devices"] = ["0"]
+
     conf["gpu"] = gpu_cfg
 
     # Use genesis config from TOML if CLI option is default and TOML has it

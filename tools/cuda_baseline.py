@@ -14,40 +14,34 @@ from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evalua
 from shared.block_requirements import BlockRequirements
 
 try:
-    from GPU.metal_kernel_sampler import CUDAKernelDimodSampler
+    from GPU.cuda_sa import CudaSASampler
     CUDA_AVAILABLE = True
 except ImportError:
     CUDA_AVAILABLE = False
 
-try:
-    from GPU.cuda_sampler_optimized_chunks import OptimizedChunkCUDASampler
-    False  # Using base CUDA sampler = True
-except ImportError:
-    False  # Using base CUDA sampler = False
 
-
-def metal_baseline_test(timeout_minutes=10.0, output_file=None):
+def cuda_baseline_test(timeout_minutes=10.0, output_file=None):
     """Test CUDA GPU performance with CPU baseline format and evaluation logic."""
-    print("🔬 CUDA GPU Baseline Parameter Test (Kernel-Only)")
+    print("🔬 CUDA GPU Baseline Parameter Test (CuPy RawKernel)")
     print("=" * 50)
     print(f"⏰ Timeout: {timeout_minutes} minutes")
-    
-    # Try kernel-only sampler first, fall back to optimized chunks
+
+    # Initialize CUDA SA sampler
     cuda_sampler = None
     sampler_type = "unknown"
-    
+
     if CUDA_AVAILABLE:
         try:
-            cuda_sampler = CUDAKernelDimodSampler("mps")
+            cuda_sampler = CudaSASampler()
             nodes = cuda_sampler.nodes
             edges = cuda_sampler.edges
-            sampler_type = "cuda-base"
-            print("✅ CUDA kernel-only sampler ready (should be 5-10x faster)")
+            sampler_type = "cuda-sa"
+            print("✅ CUDA SA sampler ready (CuPy RawKernel)")
         except Exception as e:
-            print(f"⚠️ CUDA kernels failed: {e}, trying fallback...")
+            print(f"⚠️ CUDA SA sampler failed: {e}")
             cuda_sampler = None
-    
-    if cuda_sampler is None and False  # Using base CUDA sampler:
+
+    if cuda_sampler is None:
         try:
             cuda_sampler = OptimizedChunkCUDASampler("mps")
             nodes = cuda_sampler.nodes
@@ -274,7 +268,7 @@ def main():
         output_file = f"cuda_baseline_results_{timestamp}.json"
     
     # Run test
-    metal_baseline_test(timeout_minutes=timeout, output_file=output_file)
+    cuda_baseline_test(timeout_minutes=timeout, output_file=output_file)
 
     print(f"\n✅ CUDA baseline test complete!")
 
