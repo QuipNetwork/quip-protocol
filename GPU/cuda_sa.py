@@ -135,8 +135,21 @@ class CudaSASampler:
         assert len(csr_J_vals) == len(csr_col_ind), \
             f"CSR J_vals length {len(csr_J_vals)} != col_ind length {len(csr_col_ind)}"
 
-    def __init__(self):
+    def __init__(self, device: Optional[int] = None):
         self.logger = logging.getLogger(__name__)
+
+        # Set CUDA device if specified
+        if device is not None:
+            try:
+                cp.cuda.Device(device).use()
+                self.device_id = device
+                self.logger.info(f"CUDA SA sampler using device {device}")
+            except Exception as e:
+                self.logger.warning(f"Failed to set CUDA device {device}: {e}, using default device")
+                self.device_id = cp.cuda.runtime.getDevice()
+        else:
+            self.device_id = cp.cuda.runtime.getDevice()
+            self.logger.info(f"CUDA SA sampler using default device {self.device_id}")
 
         # Compile CUDA kernel
         try:
@@ -289,11 +302,15 @@ class CudaSASampler:
 
         self.logger.debug(f"[CudaSA] Beta schedule: {len(beta_schedule)} betas from {beta_schedule[0]:.4f} to {beta_schedule[-1]:.4f}")
 
-        # Build separate CSR arrays for each problem
-        # (Not truly concatenated - we process sequentially anyway)
+        # Build concatenated CSR arrays for all problems
+        # This matches the kernel's expectation for batched dispatch
         node_to_idx = {node: idx for idx, node in enumerate(self.nodes)}
 
-        csr_arrays_list = []  # List of (row_ptr, col_ind, J_vals) tuples
+        all_csr_row_ptr = []
+        all_csr_col_ind = []
+        all_csr_J_vals = []
+        row_ptr_offsets = [0]
+        col_ind_offsets = [0]
 
         for prob_idx, (h_prob, J_prob) in enumerate(zip(h, J)):
             # Build adjacency list for this problem
@@ -326,9 +343,30 @@ class CudaSASampler:
             # Validate this problem's CSR
             self._validate_csr(csr_row_ptr, csr_col_ind, csr_J_vals, n, 1)
 
-            csr_arrays_list.append((csr_row_ptr, csr_col_ind, csr_J_vals))
+            # Concatenate to global arrays (NO adjustment to row_ptr)
+            all_csr_row_ptr.extend(csr_row_ptr)
+            all_csr_col_ind.extend(csr_col_ind)
+            all_csr_J_vals.extend(csr_J_vals)
 
-            self.logger.debug(f"[CudaSA] Problem {prob_idx}: N={n}, edges={len(csr_col_ind_list)}")
+            # Track offset AFTER adding this problem's data
+            row_ptr_offsets.append(len(all_csr_row_ptr))
+            col_ind_offsets.append(len(all_csr_col_ind))
+
+            self.logger.debug(f"[CudaSA] Problem {prob_idx}: N={n}, edges={len(csr_col_ind_list)}, row_ptr_offset={row_ptr_offsets[-2]}, col_ind_offset={col_ind_offsets[-2]}")
+
+        # Convert arrays to numpy and then GPU arrays
+        all_csr_row_ptr = np.array(all_csr_row_ptr, dtype=np.int32)
+        all_csr_col_ind = np.array(all_csr_col_ind, dtype=np.int32)
+        all_csr_J_vals = np.array(all_csr_J_vals, dtype=np.int8)
+        row_ptr_offsets = np.array(row_ptr_offsets, dtype=np.int32)
+        col_ind_offsets = np.array(col_ind_offsets, dtype=np.int32)
+
+        # Copy concatenated arrays to GPU ONCE
+        d_all_csr_row_ptr = cp.asarray(all_csr_row_ptr)
+        d_all_csr_col_ind = cp.asarray(all_csr_col_ind)
+        d_all_csr_J_vals = cp.asarray(all_csr_J_vals)
+        d_row_ptr_offsets = cp.asarray(row_ptr_offsets)
+        d_col_ind_offsets = cp.asarray(col_ind_offsets)
 
         # Convert beta schedule to GPU array (shared across all problems)
         d_beta_schedule = cp.asarray(beta_schedule)
@@ -337,54 +375,46 @@ class CudaSASampler:
         if seed is None:
             seed = np.random.randint(0, 2**31)
 
-        # Process each problem sequentially with separate kernel launches
+        # Allocate output arrays for ALL problems at once
         packed_size = (n + 7) // 8
         total_reads = num_problems * num_reads
 
+        d_output_samples = cp.zeros((total_reads, packed_size), dtype=cp.int8)
+        d_output_energies = cp.zeros(total_reads, dtype=cp.float32)
+
         self.logger.debug(f"[CudaSA] Batch config: {num_problems} problems × {num_reads} reads = {total_reads} total reads")
-        self.logger.debug(f"[CudaSA] Using sequential kernel launches")
+        self.logger.debug(f"[CudaSA] Offset arrays: row_ptr={row_ptr_offsets}, col_ind={col_ind_offsets}")
 
-        all_samples_packed = []
-        all_energies = []
+        # Single kernel launch for ALL problems
+        block_size = min(num_reads, 256)
+        blocks_per_problem = (num_reads + block_size - 1) // block_size
+        grid_size = num_problems * blocks_per_problem
 
-        for prob_idx in range(num_problems):
-            # Get CSR arrays for this problem
-            prob_csr_row_ptr, prob_csr_col_ind, prob_csr_J_vals = csr_arrays_list[prob_idx]
+        self.logger.debug(f"[CudaSA] Grid: {grid_size} blocks × {block_size} threads/block")
 
-            # Copy to GPU
-            d_prob_csr_row_ptr = cp.asarray(prob_csr_row_ptr)
-            d_prob_csr_col_ind = cp.asarray(prob_csr_col_ind)
-            d_prob_csr_J_vals = cp.asarray(prob_csr_J_vals)
+        # Launch kernel with concatenated CSR arrays and offset arrays
+        self._kernel(
+            (grid_size,), (block_size,),
+            (d_all_csr_row_ptr, d_all_csr_col_ind, d_all_csr_J_vals,
+             d_row_ptr_offsets, d_col_ind_offsets,
+             num_problems, d_beta_schedule,
+             n, len(beta_schedule), num_sweeps_per_beta, num_reads, seed,
+             d_output_samples, d_output_energies, self._delta_energy_workspace,
+             self.max_threads_per_call)
+        )
 
-            # Output arrays for this problem
-            d_prob_output_samples = cp.zeros((num_reads, packed_size), dtype=cp.int8)
-            d_prob_output_energies = cp.zeros(num_reads, dtype=cp.float32)
-
-            # Launch kernel for this problem
-            prob_block_size = 256
-            prob_grid_size = (num_reads + prob_block_size - 1) // prob_block_size
-            prob_total_threads = prob_grid_size * prob_block_size
-
-            # Use pre-allocated workspace (reused across calls)
-            self._kernel(
-                (prob_grid_size,), (prob_block_size,),
-                (d_prob_csr_row_ptr, d_prob_csr_col_ind, d_prob_csr_J_vals,
-                 cp.asarray(np.zeros(n, dtype=np.float32)),  # h_vals (unused)
-                 d_beta_schedule,
-                 n, len(beta_schedule), num_sweeps_per_beta, num_reads, (seed or 0) ^ prob_idx,
-                 d_prob_output_samples, d_prob_output_energies, self._delta_energy_workspace,
-                 self.max_threads_per_call)  # workspace_capacity for bounds checking
-            )
-
-            # Copy results back
-            all_samples_packed.append(cp.asnumpy(d_prob_output_samples))
-            all_energies.append(cp.asnumpy(d_prob_output_energies))
+        # Copy results back
+        all_samples_packed = cp.asnumpy(d_output_samples)
+        all_energies = cp.asnumpy(d_output_energies)
 
         # Parse results into SampleSets
         samplesets = []
         for prob_idx in range(num_problems):
-            samples_packed = all_samples_packed[prob_idx]
-            energies = all_energies[prob_idx]
+            # Extract results for this problem from concatenated output
+            start_idx = prob_idx * num_reads
+            end_idx = (prob_idx + 1) * num_reads
+            samples_packed = all_samples_packed[start_idx:end_idx]
+            energies = all_energies[start_idx:end_idx]
 
             # Unpack samples
             samples = []

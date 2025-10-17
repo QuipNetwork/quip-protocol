@@ -22,8 +22,16 @@ from GPU.cuda_sa import CudaSASampler
 
 class CudaMiner(BaseMiner):
     def __init__(self, miner_id: str, device: str = "0", **cfg):
-        # Initialize CUDA SA sampler
-        sampler = CudaSASampler()
+        # Set CUDA device BEFORE creating sampler
+        try:
+            import cupy as cp
+            device_id = int(device)
+            cp.cuda.Device(device_id).use()
+        except Exception as e:
+            print(f"Warning: Failed to set CUDA device {device}: {e}")
+
+        # Initialize CUDA SA sampler on the selected device
+        sampler = CudaSASampler(device=int(device))
         super().__init__(miner_id, sampler)
         # Now update sampler with our logger
         sampler.logger = self.logger

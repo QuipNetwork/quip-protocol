@@ -72,42 +72,71 @@ __device__ int8_t get_flip_energy(
 }
 
 // CUDA Simulated Annealing kernel - with delta_energy array in global memory
+// Batched multi-problem evaluation for reduced kernel overhead
+//
+// BATCHED DISPATCH:
+// Each problem is assigned to a contiguous range of threads:
+// - problem_id = global_thread_id / num_reads
+// - read_id_in_problem = global_thread_id % num_reads
+// All problems are processed in parallel in a single kernel launch
 //
 // GUARDS:
-// 1. thread_id >= num_reads: Prevents out-of-bounds writes to output arrays.
-//    The kernel launch rounds up to full blocks, so total_threads may exceed num_reads.
+// 1. thread_id >= num_threads: Prevents out-of-bounds writes to output arrays.
+//    The kernel launch rounds up to full blocks, so total_threads may exceed num_threads.
 //    This guard is essential and always active.
 //
-// 2. thread_id >= 1024: Protects the fixed-size delta_energy_workspace (1024 threads max).
-//    Python asserts total_threads <= 1024 before launch, so this is a safety fallback.
-//    To support >1024 reads, either tile launches or dynamically resize the workspace.
+// 2. thread_id >= workspace_capacity: Protects the delta_energy_workspace.
+//    Python allocates workspace based on GPU SM count, this is a safety fallback.
 //
 // CSR VALIDATION:
 // The CSR structure (row_ptr, col_ind, J_vals) is validated on the host side,
 // so the kernel can skip bounds checks for performance.
 //
 __global__ void cuda_simulated_annealing(
-    const int* __restrict__ csr_row_ptr,
-    const int* __restrict__ csr_col_ind,
-    const int8_t* __restrict__ csr_J_vals,
-    const float* __restrict__ h_vals,
+    const int* __restrict__ all_csr_row_ptr,     // Concatenated row pointers for all problems
+    const int* __restrict__ all_csr_col_ind,     // Concatenated column indices for all problems
+    const int8_t* __restrict__ all_csr_J_vals,   // Concatenated J values for all problems
+    const int* __restrict__ row_ptr_offsets,     // [num_problems+1] offset into all_csr_row_ptr
+    const int* __restrict__ col_ind_offsets,     // [num_problems+1] offset into all_csr_col_ind
+    int num_problems,                             // Total number of problems in batch
     const float* __restrict__ beta_schedule,
     int N,
     int num_betas,
     int sweeps_per_beta,
-    int num_reads,
+    int num_reads,                                // Reads per individual problem
     unsigned int base_seed,
     int8_t* __restrict__ output_samples,
     float* __restrict__ output_energies,
     int8_t* __restrict__ delta_energy_workspace,  // Global memory: workspace_capacity * N bytes
     int workspace_capacity  // Maximum threads workspace can support
 ) {
-    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int global_thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_threads = num_problems * num_reads;  // Total threads needed for all problems
 
     // Guard 1: Prevent out-of-bounds writes to output arrays
-    if (thread_id >= num_reads) {
+    if (global_thread_id >= num_threads) {
         return;
     }
+
+    // Guard 2: Protect delta_energy_workspace from out-of-bounds access
+    // Workspace allocated in Python with size = workspace_capacity × N bytes
+    // This should never trigger if Python assertion works, but prevents GPU crash if it fails
+    if (global_thread_id >= workspace_capacity) {
+        return;
+    }
+
+    // Determine which problem this thread is working on
+    int problem_id = global_thread_id / num_reads;
+    int read_id_in_problem = global_thread_id % num_reads;
+
+    // Get CSR offsets for this specific problem
+    int row_ptr_start = row_ptr_offsets[problem_id];
+    int col_ind_start = col_ind_offsets[problem_id];
+
+    // Point to this problem's CSR data
+    const int* csr_row_ptr = &all_csr_row_ptr[row_ptr_start];
+    const int* csr_col_ind = &all_csr_col_ind[col_ind_start];
+    const int8_t* csr_J_vals = &all_csr_J_vals[col_ind_start];
 
     int n = N;
     int num_beta_values = num_betas;
@@ -117,14 +146,8 @@ __global__ void cuda_simulated_annealing(
     // Thread-local memory for state only (small enough to fit)
     int8_t packed_state[576];  // ~4600 bits / 8 = 575 bytes (for N=4600)
 
-    // Guard 2: Protect delta_energy_workspace from out-of-bounds access
-    // Workspace allocated in Python with size = workspace_capacity × N bytes
-    // This should never trigger if Python assertion works, but prevents GPU crash if it fails
-    if (thread_id >= workspace_capacity) {
-        return;
-    }
-
-    int8_t* delta_energy = &delta_energy_workspace[thread_id * n];
+    // Delta energy workspace for this thread
+    int8_t* delta_energy = &delta_energy_workspace[global_thread_id * n];
 
     // Initialize delta_energy array to zero
     for (int i = 0; i < n; i++) {
@@ -132,7 +155,7 @@ __global__ void cuda_simulated_annealing(
     }
 
     // Initialize RNG state with unique seed per thread
-    unsigned int rng_state = (base_seed ? base_seed : 1u) ^ (thread_id * 12345u);
+    unsigned int rng_state = (base_seed ? base_seed : 1u) ^ (global_thread_id * 12345u);
 
     // Generate random initial state (bit-packed)
     for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
@@ -225,9 +248,9 @@ __global__ void cuda_simulated_annealing(
     
     // Store output
     for (int i = 0; i < packed_size; i++) {
-        output_samples[thread_id * packed_size + i] = packed_state[i];
+        output_samples[global_thread_id * packed_size + i] = packed_state[i];
     }
-    output_energies[thread_id] = (float)current_energy;
+    output_energies[global_thread_id] = (float)current_energy;
 }
 
 }  // extern "C"
