@@ -5,6 +5,7 @@ import multiprocessing
 import multiprocessing.synchronize
 import random
 import signal
+import subprocess
 import sys
 import time
 from typing import Optional
@@ -17,27 +18,45 @@ from shared.quantum_proof_of_work import (
     generate_ising_model_from_nonce
 )
 from shared.block_requirements import compute_current_requirements
-from GPU.metal_sampler import MetalSampler
+from GPU.metal_sa import MetalSASampler
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
+
+
+def get_gpu_core_count() -> int:
+    """Detect Apple Silicon GPU core count programmatically."""
+    try:
+        # Use grep to filter ioreg output - much faster and avoids Unicode issues
+        result = subprocess.run(
+            "ioreg -l | grep gpu-core-count",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        if result.stdout:
+            # Parse line like: | |   |   |   "gpu-core-count" = 40
+            for line in result.stdout.splitlines():
+                if 'gpu-core-count' in line and '=' in line:
+                    parts = line.split('=')
+                    if len(parts) == 2:
+                        return int(parts[1].strip())
+    except Exception as e:
+        raise RuntimeError(f"Failed to detect GPU core count: {e}")
+
+    raise RuntimeError("Could not find gpu-core-count in ioreg output")
 
 
 class MetalMiner(BaseMiner):
     def __init__(self, miner_id: str, **cfg):
         try:
             # Initialize base miner first to get the logger
-            sampler = MetalSampler("mps")
-            super().__init__(miner_id, sampler, miner_type="GPU-MPS")
+            sampler = MetalSASampler()
+            super().__init__(miner_id, sampler, miner_type="GPU-Metal")
             # Now update sampler with our logger
             sampler.logger = self.logger
-            self.miner_type = "GPU-MPS"
+            self.miner_type = "GPU-Metal"
 
-            # Extract Parallel Tempering configuration
-            self.num_replicas = cfg.get('num_replicas', None)  # Auto-select based on num_reads
-            self.swap_interval = cfg.get('swap_interval', 15)  # Replica exchange frequency
-            self.T_min = cfg.get('T_min', 0.1)  # Minimum temperature
-            self.T_max = cfg.get('T_max', 5.0)  # Maximum temperature
-
-            self.logger.info(f"Using MetalSampler (Parallel Tempering) - Replicas: {self.num_replicas}, T=[{self.T_min}, {self.T_max}]")
+            self.logger.info(f"Using MetalSASampler (Simulated Annealing)")
         except Exception as e:
             # For fallback case, we can't use logger yet since super().__init__() wasn't called
             sampler = SimulatedAnnealingStructuredSampler()
@@ -50,37 +69,24 @@ class MetalMiner(BaseMiner):
         signal.signal(signal.SIGTERM, self._cleanup_handler)
     
     def _cleanup_handler(self, signum, frame):
-        """Handle SIGTERM signal for graceful cleanup of Metal/MPS resources."""
+        """Handle SIGTERM signal for graceful cleanup of Metal resources."""
         if hasattr(self, 'logger'):
-            self.logger.info(f"Metal miner {self.miner_id} received SIGTERM, cleaning up MPS resources...")
-        
-        # Metal/MPS-specific cleanup
+            self.logger.info(f"Metal miner {self.miner_id} received SIGTERM, cleaning up Metal resources...")
+
+        # Metal-specific cleanup
         try:
-            # Release MPS command buffers and memory
-            if self.miner_type == "GPU-MPS":
-                try:
-                    import torch
-                    if torch.backends.mps.is_available():
-                        # Clear MPS cache
-                        torch.mps.empty_cache()
-                        if hasattr(self, 'logger'):
-                            self.logger.info("MPS cache cleared")
-                except ImportError:
-                    if hasattr(self, 'logger'):
-                        self.logger.warning("PyTorch not available for MPS cleanup")
-            
             # Clear any cached data
             if hasattr(self, 'top_attempts'):
                 self.top_attempts.clear()
-            
+
             # Reset sampler state if possible
             if hasattr(self, 'sampler') and hasattr(self.sampler, 'cleanup'):
                 self.sampler.cleanup()
-                
+
         except Exception as e:
             if hasattr(self, 'logger'):
                 self.logger.error(f"Error during Metal miner cleanup: {e}")
-        
+
         # Exit gracefully
         sys.exit(0)
         
@@ -92,7 +98,7 @@ class MetalMiner(BaseMiner):
         prev_timestamp: int,
         stop_event: multiprocessing.synchronize.Event,
     ) -> Optional[MiningResult]:
-        """Mine a block using Metal/MPS GPU acceleration.
+        """Mine a block using Metal GPU acceleration.
 
         Args:
             prev_block: Previous block in the chain
@@ -108,7 +114,13 @@ class MetalMiner(BaseMiner):
         progress = 0  # Progress counter for logging
         self.top_attempts = []
         start_time = time.time()
-        
+
+        # Mining statistics
+        total_nonces_evaluated = 0
+        last_report_time = start_time
+        last_report_nonces = 0
+        report_interval = 10.0  # Report every 10 seconds
+
         self.logger.debug(f"requirements: {requirements}")
 
         cur_index = prev_block.header.index + 1
@@ -125,23 +137,33 @@ class MetalMiner(BaseMiner):
 
         params = adapt_parameters(difficulty_energy, min_diversity, min_solutions)
         self.logger.info(f"{self.miner_id} - Adaptive params: {params}")
-        
+
         # Get topology information from sampler
         nodes = self.sampler.nodes
         edges = self.sampler.edges
-        
-        while self.mining and not stop_event.is_set():
-            # Check if we should stop before generating model
-            if stop_event.is_set():
-                break
-            # Generate random salt for each attempt
+
+        # Batch size: number of nonces to evaluate simultaneously (one per GPU core)
+        batch_size = get_gpu_core_count()
+        self.logger.info(f"Detected {batch_size} GPU cores, will evaluate {batch_size} nonces per batch")
+
+        # Pregenerate first batch to start
+        next_batch_nonces = []
+        next_batch_salts = []
+        next_batch_problems = []
+        for _ in range(batch_size):
             salt = random.randbytes(32)
-            
-            # Generate quantum model using deterministic block-based seeding
             nonce = ising_nonce_from_block(prev_block.hash, node_info.miner_id, cur_index, salt)
             h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+            next_batch_nonces.append(nonce)
+            next_batch_salts.append(salt)
+            next_batch_problems.append((h, J))
 
-            # Update requirements if necessary.
+        while self.mining and not stop_event.is_set():
+            # Check if we should stop before generating models
+            if stop_event.is_set():
+                break
+
+            # Update requirements if necessary
             updated_requirements = compute_current_requirements(requirements, prev_timestamp, self.logger)
             if current_requirements != updated_requirements:
                 current_requirements = updated_requirements
@@ -154,52 +176,58 @@ class MetalMiner(BaseMiner):
                         result = self.evaluate_sampleset(sample.sampleset, current_requirements, nodes, edges,
                                                          sample.nonce, sample.salt, prev_timestamp, start_time)
                         if result:
-                            self.logger.info(f"[Block-{cur_index}] Already Mined at this difficulty! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., Min Energy: {result.energy:.2f}, Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Attempt Time: {result.mining_time:.2f}s, Total Mining Time: {time.time() - start_time:.2f}s")
+                            self.logger.info(f"[Block-{cur_index}] Already Mined at this difficulty! Nonce: {sample.nonce}, Salt: {sample.salt.hex()[:4]}..., Min Energy: {result.energy:.2f}, Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Attempt Time: {result.mining_time:.2f}s, Total Mining Time: {time.time() - start_time:.2f}s")
                             return result
                 difficulty_energy = current_requirements.difficulty_energy
                 min_diversity = current_requirements.min_diversity
                 min_solutions = current_requirements.min_solutions
 
+            # Use pregenerated batch (overlapping CPU work with GPU work)
+            batch_nonces = next_batch_nonces
+            batch_salts = next_batch_salts
+            batch_problems = next_batch_problems
+
+            # Pregenerate next batch while GPU is working (overlap computation)
+            next_batch_nonces = []
+            next_batch_salts = []
+            next_batch_problems = []
+
             # Track preprocessing time
             preprocess_start = time.time()
             self.current_stage = 'preprocessing'
             self.current_stage_start = preprocess_start
-            
-            # Sample from Metal GPU
+
+            # Sample from Metal GPU using batched evaluation
             try:
                 # For Metal, use adaptive parameters
-                # Metal compromise: Balance between performance and quality
-                # CPU uses 4096, GPU uses 512, Metal uses 64 as reasonable middle ground
                 num_sweeps = params.get('num_sweeps', 64)
-                if self.sampler.sampler_type == "metal":
-                    self.logger.debug(f"Using {num_sweeps} sweeps (optimized for MPS performance)")
                 num_reads = params.get('num_reads', 100)
-                
+
+                self.logger.debug(f"Batched: {batch_size} nonces × {num_reads} reads/nonce, {num_sweeps} sweeps")
+
                 sample_start = time.time()
                 self.current_stage = 'sampling'
                 self.current_stage_start = sample_start
-                
-                # Build sampling parameters based on sampler type
-                sampling_params = {
-                    'h': h,
-                    'J': J,
-                    'num_reads': num_reads,
-                    'num_sweeps': num_sweeps,
-                    'num_replicas': self.num_replicas,
-                    'swap_interval': self.swap_interval,
-                    'T_min': self.T_min,
-                    'T_max': self.T_max,
-                    'block_size': self.block_size
-                }
-                
-                sampleset = self.sampler.sample_ising(**sampling_params)
+
+                # Task 5: Batched kernel dispatch - evaluate all problems in one GPU call
+                h_list = [h for h, J in batch_problems]
+                J_list = [J for h, J in batch_problems]
+                batch_samplesets = self.sampler.sample_ising(h_list, J_list, num_reads=num_reads, num_sweeps=num_sweeps)
+
+                # Pregenerate next batch while waiting (or after GPU completes)
+                if len(next_batch_nonces) == 0:
+                    for _ in range(batch_size):
+                        salt = random.randbytes(32)
+                        nonce = ising_nonce_from_block(prev_block.hash, node_info.miner_id, cur_index, salt)
+                        h_next, J_next = generate_ising_model_from_nonce(nonce, nodes, edges)
+                        next_batch_nonces.append(nonce)
+                        next_batch_salts.append(salt)
+                        next_batch_problems.append((h_next, J_next))
+
                 sample_time = time.time() - sample_start
-                
-                # Metal performance info
-                if self.sampler.sampler_type == "metal":
-                    energies = sampleset.data_vectors['energy']
-                    self.logger.debug(f"Sampling completed: {sample_time:.2f}s, energy range: {min(energies):.1f} to {max(energies):.1f}")
-                
+
+                self.logger.debug(f"Batched sampling completed: {sample_time:.2f}s for {batch_size} problems")
+
                 # Estimate Metal timing components
                 self.timing_stats['sampling'].append(sample_time * 1e6)  # Convert to microseconds
                 self.timing_stats['preprocessing'].append((time.time() - preprocess_start) * 1e6)
@@ -219,28 +247,54 @@ class MetalMiner(BaseMiner):
             postprocess_start = time.time()
             self.current_stage = 'postprocessing'
             self.current_stage_start = postprocess_start
-            
-            # Update sample counts
-            self.timing_stats['total_samples'] += len(sampleset.record.energy)
-            self.timing_stats['blocks_attempted'] += 1
 
-            result = self.evaluate_sampleset(sampleset, current_requirements, nodes, edges, nonce, salt, prev_timestamp, start_time)
+            # Evaluate all results from the batch
+            for nonce, salt, sampleset in zip(batch_nonces, batch_salts, batch_samplesets):
+                # Update sample counts
+                self.timing_stats['total_samples'] += len(sampleset.record.energy)
+                self.timing_stats['blocks_attempted'] += 1
+
+                result = self.evaluate_sampleset(sampleset, current_requirements, nodes, edges, nonce, salt, prev_timestamp, start_time)
+
+                if result:
+                    # Track postprocessing time
+                    self.timing_stats['postprocessing'].append((time.time() - postprocess_start) * 1e6)
+
+                    self.logger.info(f"[Block-{cur_index}] Mined! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., Min Energy: {result.energy:.2f}, Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Attempt Time: {result.mining_time:.2f}s, Total Mining Time: {time.time() - start_time:.2f}s")
+                    return result
+
+                # Update top samples with this one
+                self.update_top_samples(sampleset, nonce, salt, current_requirements)
 
             # Track postprocessing time
             self.timing_stats['postprocessing'].append((time.time() - postprocess_start) * 1e6)
 
-            if result:
-                self.logger.info(f"[Block-{cur_index}] Mined! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., Min Energy: {result.energy:.2f}, Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Attempt Time: {result.mining_time:.2f}s, Total Mining Time: {time.time() - start_time:.2f}s")
-                return result
-                        
-            # Update top samples with this one
-            self.update_top_samples(sampleset, nonce, salt, current_requirements)
-
             progress += 1
+            total_nonces_evaluated += batch_size
 
-            # Progress update
-            if progress % 10 == 0:
-                self.logger.info(f"Progress: {progress} attempts, best result so far - Energy: {min(self.top_attempts[0].sampleset.record.energy):.2f}")
+            # Periodic progress report
+            current_time = time.time()
+            time_since_last_report = current_time - last_report_time
+
+            if time_since_last_report >= report_interval:
+                elapsed_total = current_time - start_time
+                nonces_since_last_report = total_nonces_evaluated - last_report_nonces
+                nonces_per_sec = nonces_since_last_report / time_since_last_report
+                avg_nonces_per_sec = total_nonces_evaluated / elapsed_total
+
+                best_energy = min(self.top_attempts[0].sampleset.record.energy) if self.top_attempts else float('inf')
+
+                self.logger.info(
+                    f"[Mining Stats] "
+                    f"Nonces: {total_nonces_evaluated} total, "
+                    f"{nonces_per_sec:.1f}/s recent, "
+                    f"{avg_nonces_per_sec:.1f}/s average | "
+                    f"Time: {elapsed_total:.1f}s | "
+                    f"Best energy: {best_energy:.0f}"
+                )
+
+                last_report_time = current_time
+                last_report_nonces = total_nonces_evaluated
 
         self.logger.info("Stopping mining, no results found")
         return None

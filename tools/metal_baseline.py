@@ -1,129 +1,74 @@
 #!/usr/bin/env python3
-"""Metal GPU baseline parameter testing tool."""
+"""Metal SA baseline parameter testing tool."""
 import argparse
 import sys
 import time
 import json
 from pathlib import Path
-import random
 
 # Add parent directory to path
-sys.path.append(str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evaluate_sampleset, calculate_diversity
 from shared.block_requirements import BlockRequirements
+from dwave_topologies import DEFAULT_TOPOLOGY
 
-try:
-    from GPU.metal_sampler import MetalSampler
-    METAL_AVAILABLE = True
-except ImportError:
-    METAL_AVAILABLE = False
+from GPU.metal_sa import MetalSASampler
 
 
-def create_large_problem(size=4593):
-    """Create a large Ising problem to test memory usage."""
-    # Create a problem with specified size that approximates the topology used in production
-    num_vars = size
-
-    # Create a grid-like structure with some random couplings to make it more interesting
-    h = {i: 0.0 for i in range(num_vars)}
-
-    # Create a pattern that mimics real-world quantum annealing problems
-    J = {}
-
-    # Add some grid-like couplings (simplified)
-    for i in range(num_vars):
-        # Connect to neighbors in a grid pattern (simplified)
-        if i + 1 < num_vars:
-            J[(i, i+1)] = -1.0
-        if i + 64 < num_vars:  # Connect to row below (approximate grid)
-            J[(i, i+64)] = -1.0
-
-    # Add some random couplings to make it more complex
-    import random
-    for _ in range(1000):  # Add some random couplings
-        i = random.randint(0, num_vars - 1)
-        j = random.randint(0, num_vars - 1)
-        if i != j and (i,j) not in J and (j,i) not in J:
-            # Use binary ±1 couplings to conform to Ising model requirements
-            J[(i, j)] = float(random.choice([-1, 1]))
-
-    return h, J
-
-
-def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=None, sample_interval=15, T_min=0.1, T_max=5.0, large_problem=False, only_label=None, sampler_choice: str = "original"):
-    """Test Metal GPU performance with CPU baseline format and evaluation logic."""
-    print("🔬 Metal GPU Baseline Parameter Test (Kernel-Only)")
+def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None):
+    """Test Metal SA performance with baseline format and evaluation logic."""
+    print(f"🔬 Metal SA Baseline Parameter Test")
     print("=" * 50)
     print(f"⏰ Timeout: {timeout_minutes} minutes")
 
-    # Initialize Metal sampler
-    if not METAL_AVAILABLE:
-        print("❌ Metal Parallel Tempering sampler not available")
-        return None
-
+    # Initialize sampler
     try:
-        metal_sampler = MetalSampler()
-        sampler_type = "metal-pt"
-        print("✅ Metal Parallel Tempering sampler ready")
+        metal_sampler = MetalSASampler()
+        print(f"✅ Metal SA sampler ready")
     except Exception as e:
-        print(f"❌ Metal Parallel Tempering sampler failed: {e}")
+        print(f"❌ Metal SA sampler failed: {e}")
         return None
 
-    # Get Zephyr topology
-    from dwave_topologies import DEFAULT_TOPOLOGY
+    # Get topology
     topology_graph = DEFAULT_TOPOLOGY.graph
     nodes = list(topology_graph.nodes())
     edges = list(topology_graph.edges())
 
-    # Choose problem size
-    if large_problem:
-        print("🧪 Using large 4593-variable problem for memory testing")
-        h, J = create_large_problem(4593)
-    else:
-        # Initial problem setup to show problem size
-        seed = 12345  # Fixed seed for reproducible results
-        h, J = generate_ising_model_from_nonce(seed, nodes, edges)
+    # Generate test problem
+    seed = 12345  # Fixed seed for reproducible results
+    h, J = generate_ising_model_from_nonce(seed, nodes, edges)
 
     print(f"📊 Problem: {len(h)} variables, {len(J)} couplings")
 
-    # Test configurations - optimized for Metal Parallel Tempering performance
-    if large_problem:
-        # For memory testing with larger problems, use more aggressive configurations
-        test_configs = [
-            (512, 32, "Small Large PT"),      # Start with smaller sweep count for memory testing
-            (1024, 32, "Medium Large PT"),
-            (2048, 32, "Large PT"),
-        ]
-    else:
-        # Standard configurations for small problems
-        test_configs = [
-            (256, 64, "Light"),
-            (512, 100, "Low"),
-            (1024, 100, "Medium"),
-            (2048, 150, "High"),
-            (4096, 200, "Very High"),
-            (8192, 200, "Max")
-        ]
-        # Optional filter: run only the requested label (e.g., "Light")
+    # Test configurations - matching CPU baseline for fair comparison
+    test_configs = [
+        (256, 64, "Light"),
+        (512, 100, "Low"),
+        (1024, 100, "Medium"),
+        (2048, 150, "High"),
+        (4096, 200, "Very High"),
+        (8192, 200, "Max")
+    ]
+
+    # Optional filter: run only the requested label
+    if only_label:
         available_labels = [desc for _, _, desc in test_configs]
-        if only_label:
-            filtered = [cfg for cfg in test_configs if cfg[2].lower() == only_label.lower()]
-            if not filtered:
-                print(f"⚠️ No test config matched --only {only_label!r}; available: {available_labels}")
-                return None
-            test_configs = filtered
+        filtered = [cfg for cfg in test_configs if cfg[2].lower() == only_label.lower()]
+        if not filtered:
+            print(f"⚠️ No test config matched --only {only_label!r}; available: {available_labels}")
+            return None
+        test_configs = filtered
 
-
-    print(f"\n🧪 Testing Metal Parallel Tempering configurations:")
+    print(f"\n🧪 Testing Metal SA configurations:")
 
     results = {
         'timeout_minutes': timeout_minutes,
-        'sampler_type': sampler_type,
+        'sampler_type': 'metal-sa',
         'problem_info': {
             'num_variables': len(h),
             'num_couplings': len(J),
-            'seed': 12345 if not large_problem else "large_problem"
+            'seed': 12345
         },
         'tests': []
     }
@@ -131,7 +76,12 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=Non
     timeout_seconds = timeout_minutes * 60
     total_start_time = time.time()
 
-    for sweeps, reads, desc in test_configs:
+    # Use deterministic seed sequence for reproducible comparisons
+    import random
+    random.seed(42)
+    test_nonces = [random.randint(0, 2**32 - 1) for _ in range(len(test_configs))]
+
+    for idx, (sweeps, reads, desc) in enumerate(test_configs):
         elapsed_total = time.time() - total_start_time
         if elapsed_total > timeout_seconds:
             print(f"\n⏰ Total timeout ({timeout_minutes} min) reached, stopping")
@@ -140,35 +90,18 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=Non
         print(f"\n{desc}: {sweeps} sweeps, {reads} reads")
 
         try:
-            # Generate the Ising model first (like the real miners do)
-            if large_problem:
-                # For large problems, we want to make sure they're deterministic
-                nonce = 1234567890  # Fixed for reproducible large problem tests
-                h, J = create_large_problem(4593)
-
-                # Validate binary couplings (±1)
-                if any(not (abs(v - 1.0) < 1e-8 or abs(v + 1.0) < 1e-8) for v in J.values()):
-                    raise ValueError("Non-binary coupling detected in baseline J; expected only ±1.")
-
-            else:
-                nonce = random.randint(0, 2**32 - 1)
-                h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
-
-                # Validate binary couplings (±1)
-                if any(not (abs(v - 1.0) < 1e-8 or abs(v + 1.0) < 1e-8) for v in J.values()):
-                    raise ValueError("Non-binary coupling detected in baseline J; expected only ±1.")
-
+            # Generate problem with deterministic nonce
+            nonce = test_nonces[idx]
+            h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
 
             start_time = time.time()
-            sampleset = metal_sampler.sample_ising(
-                h=h, J=J,
+            # Task 6: Wrap single problem in lists for batched API
+            samplesets = metal_sampler.sample_ising(
+                h=[h], J=[J],
                 num_reads=reads,
-                num_sweeps=sweeps,
-                num_replicas=num_replicas,
-                sample_interval=sample_interval,
-                T_min=T_min,
-                T_max=T_max
+                num_sweeps=sweeps
             )
+            sampleset = samplesets[0]  # Extract single result
             runtime = time.time() - start_time
 
             energies = list(sampleset.record.energy)
@@ -180,35 +113,32 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=Non
             print(f"  🎯 min_energy = {min_energy:.1f}")
             print(f"  📊 avg_energy = {avg_energy:.1f} (±{std_energy:.1f})")
 
-            # Use evaluate_sampleset to get diversity and num_solutions (same as CPU)
+            # Use evaluate_sampleset to get diversity and num_solutions
             requirements = BlockRequirements(
-                difficulty_energy=0.0,       # Very lenient difficulty (allow positive energies)
+                difficulty_energy=0.0,       # Very lenient difficulty
                 min_diversity=0.1,           # Low diversity requirement
                 min_solutions=1,             # Low solution count requirement
-                timeout_to_difficulty_adjustment_decay=600  # 10 minutes
+                timeout_to_difficulty_adjustment_decay=600
             )
 
-            # Use the same nonce and generate test salt for evaluation
-            salt = b"test_salt_metal_baseline"
-            prev_timestamp = int(time.time()) - 600  # 10 minutes ago
+            salt = b"test_salt_metal_baseline_sa"
+            prev_timestamp = int(time.time()) - 600
 
-            # Evaluate the sampleset
             mining_result = evaluate_sampleset(
                 sampleset, requirements, nodes, edges, nonce, salt,
-                prev_timestamp, start_time, f"metal-baseline-{sweeps}-{reads}", "Metal"
+                prev_timestamp, start_time, f"metal-sa-{sweeps}-{reads}", "Metal"
             )
 
             diversity = 0.0
             num_solutions = 0
             meets_requirements = False
 
-            # Calculate diversity of top 10 solutions by energy (same as CPU)
+            # Calculate diversity of top 10 solutions by energy
             solutions = list(sampleset.record.sample)
             energies = list(sampleset.record.energy)
 
-            # Sort solutions by energy and take top 10
             solution_energy_pairs = list(zip(solutions, energies))
-            solution_energy_pairs.sort(key=lambda x: x[1])  # Sort by energy (ascending = better)
+            solution_energy_pairs.sort(key=lambda x: x[1])
             top_10_solutions = [sol for sol, _ in solution_energy_pairs[:10]]
 
             top_10_diversity = calculate_diversity(top_10_solutions)
@@ -223,7 +153,7 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=Non
             else:
                 print(f"  ❌ Does not meet mining requirements")
 
-            # Energy target analysis (same as CPU)
+            # Energy target analysis
             target_reached = "none"
             if min_energy <= -15650:
                 target_reached = "excellent"
@@ -255,18 +185,19 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=Non
             results['tests'].append(test_result)
 
             # Individual test timeout check
-            if runtime > timeout_seconds * 0.8:  # 80% of total timeout
+            if runtime > timeout_seconds * 0.8:
                 print(f"  ⏰ Single test approaching timeout, stopping further tests")
                 break
 
         except Exception as e:
             print(f"  ❌ Error: {e}")
+            import traceback
+            traceback.print_exc()
             break
 
-
-    # Summary (same as CPU)
+    # Summary
     total_runtime = time.time() - total_start_time
-    print(f"\n📊 Parallel Tempering Metal Baseline Summary (total time: {total_runtime/60:.1f} min):")
+    print(f"\n📊 Metal SA Baseline Summary (total time: {total_runtime/60:.1f} min):")
     print("=" * 50)
 
     if results['tests']:
@@ -292,7 +223,7 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, num_replicas=Non
 
 def main():
     """Main function with command line argument parsing."""
-    parser = argparse.ArgumentParser(description='Parallel Tempering Metal GPU baseline parameter testing tool')
+    parser = argparse.ArgumentParser(description='Metal SA baseline parameter testing tool')
     parser.add_argument(
         '--timeout', '-t',
         type=float,
@@ -315,49 +246,10 @@ def main():
         help='Extended test mode (30 minute timeout)'
     )
     parser.add_argument(
-        '--large-problem',
-        action='store_true',
-        help='Use large 4593-variable problem for memory testing'
-    )
-
-    # Parallel Tempering algorithm control flags
-    parser.add_argument(
-        '--num-replicas',
-        type=int,
-        default=None,
-        help='Number of temperature replicas (default: auto-selected based on num_reads)'
-    )
-    parser.add_argument(
-        '--swap-interval',
-        type=int,
-        default=15,
-        help='Steps between replica exchanges (default: 15)'
-    )
-    parser.add_argument(
-        '--T-min',
-        type=float,
-        default=0.1,
-        help='Minimum temperature (default: 0.1)'
-    )
-    parser.add_argument(
-        '--T-max',
-        type=float,
-        default=5.0,
-        help='Maximum temperature (default: 5.0)'
-    )
-    parser.add_argument(
         '--only',
         type=str,
         help='Run only the config with this description (e.g., "Light")'
     )
-    parser.add_argument(
-        '--sampler',
-        type=str,
-        choices=['original', 'parallel'],
-        default='original',
-        help='Select sampler implementation (original production kernel or new parallel kernel)'
-    )
-
 
     args = parser.parse_args()
 
@@ -373,22 +265,16 @@ def main():
     output_file = args.output
     if not output_file:
         timestamp = int(time.time())
-        output_file = f"metal_baseline_results_{timestamp}.json"
+        output_file = f"metal_sa_baseline_results_{timestamp}.json"
 
     # Run test
     metal_baseline_test(
         timeout_minutes=timeout,
         output_file=output_file,
-        num_replicas=args.num_replicas,
-        sample_interval=args.swap_interval,
-        T_min=args.T_min,
-        T_max=args.T_max,
-        large_problem=args.large_problem,
-        only_label=args.only,
-        sampler_choice=args.sampler
+        only_label=args.only
     )
 
-    print(f"\n✅ Parallel Tempering Metal baseline test complete!")
+    print(f"\n✅ Metal SA baseline test complete!")
 
 
 if __name__ == "__main__":
