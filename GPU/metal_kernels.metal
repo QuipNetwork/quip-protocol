@@ -2,9 +2,9 @@
 using namespace metal;
 
 // ==============================================================================
-// PURE SIMULATED ANNEALING - Exact D-Wave Implementation
+// METAL SIMULATED ANNEALING - Based on the D-Wave Implementation
 // ==============================================================================
-// This kernel exactly mimics D-Wave's cpu_sa.cpp implementation:
+// This kernel mimics D-Wave's cpu_sa.cpp implementation:
 // 1. Delta energy array optimization (pre-compute, update incrementally)
 // 2. xorshift32 RNG
 // 3. Sequential variable ordering (spins 0..N-1)
@@ -13,7 +13,6 @@ using namespace metal;
 
 typedef unsigned int uint;
 
-// Simple xorshift32 RNG
 inline uint xorshift32(thread uint &state) {
     uint x = state;
     x ^= x << 13;
@@ -52,8 +51,7 @@ inline void flip_spin_packed(int var, thread int8_t* packed_state) {
 }
 
 // Compute delta energy for flipping a single variable
-// Works with bit-packed state in thread-local memory
-// Uses aggressive loop unrolling for Zephyr topology (degrees 8-20)
+// using the bit-packed state in thread-local memory
 inline int8_t get_flip_energy(
     int var,
     thread const int8_t* packed_state,
@@ -76,7 +74,9 @@ inline int8_t get_flip_energy(
     }
 
     // Delta energy = -2 * state[var] * energy
-    // Cast to int8_t (safe because max delta_E ≤ 38 to -38 for all topologies)
+    // Cast to int8_t (safe because -40 <= delta_E ≤ 40 for all topologies)
+    // Remember, it's a single flip, and J values are only ±1, so max energy is degree (~20 for Zephyr)
+    // Therefore, max delta_E = 2 * degree = 40, well within int8_t range
     int8_t var_spin = get_spin_packed(var, packed_state);
     return (int8_t)(-2 * var_spin * energy);
 }
@@ -85,30 +85,26 @@ inline int8_t get_flip_energy(
 // Batched multi-problem evaluation for reduced kernel overhead
 // Each problem gets its own CSR structure, threads process different problems in parallel
 kernel void pure_simulated_annealing(
-    // Batched problem CSR representation
     device const int* csr_row_ptr [[buffer(0)]],          // Concatenated [N+1] for all problems
     device const int* csr_col_ind [[buffer(1)]],          // Concatenated [nnz] for all problems
     device const int8_t* csr_J_vals [[buffer(2)]],        // Concatenated [nnz] for all problems
     device const int* row_ptr_offsets [[buffer(3)]],      // [num_problems+1] offset into csr_row_ptr
     device const int* col_ind_offsets [[buffer(4)]],      // [num_problems+1] offset into csr_col_ind
 
-    // Scalar parameters
     constant int& N [[buffer(5)]],                         // number of spins (same for all problems)
     constant int& num_betas [[buffer(6)]],                 // number of beta values
     constant int& sweeps_per_beta [[buffer(7)]],           // sweeps per beta
     constant uint& base_seed [[buffer(8)]],                // RNG seed
 
-    // Beta schedule
+    constant int& num_threads [[buffer(12)]],              // total number of threads
+    constant int& num_problems [[buffer(13)]],             // number of batched problems
+    constant int& num_reads [[buffer(14)]],                // reads per individual problem
+
     device const float* beta_schedule [[buffer(9)]],       // [num_betas]
 
     // Outputs only (no working memory needed - using thread-local)
-    device int8_t* final_samples [[buffer(10)]],           // [num_reads * (N+7)/8] - bit-packed
-    device int* final_energies [[buffer(11)]],             // [num_reads]
-
-    // Batched evaluation parameters
-    constant int& num_reads [[buffer(12)]],                // total number of reads
-    constant int& num_problems [[buffer(13)]],             // number of batched problems
-    constant int& reads_per_problem [[buffer(14)]],        // reads per individual problem
+    device int8_t* final_samples [[buffer(10)]],           // [num_threads * (N+7)/8] - bit-packed
+    device int* final_energies [[buffer(11)]],             // [num_threads]
 
     // Thread info
     uint3 threadgroup_pos [[threadgroup_position_in_grid]],
@@ -119,13 +115,12 @@ kernel void pure_simulated_annealing(
     uint thread_id = threadgroup_pos.x * threads_per_group.x + thread_pos_in_group.x;
 
     // Early exit if thread_id is out of bounds
-    if (thread_id >= num_reads) {
+    if (thread_id >= num_threads) {
         return;
     }
 
     // Determine which problem this thread is working on
-    uint problem_id = thread_id / reads_per_problem;
-    uint read_within_problem = thread_id % reads_per_problem;
+    uint problem_id = thread_id / num_reads;
 
     // Get CSR offsets for this specific problem
     int row_ptr_start = row_ptr_offsets[problem_id];
@@ -193,7 +188,6 @@ kernel void pure_simulated_annealing(
         for (int sweep = 0; sweep < sweeps_per_beta_val; sweep++) {
             // Sequential variable ordering (matching D-Wave default)
             for (int var = 0; var < n; var++) {
-                // Phase 4: Cache delta_energy to reduce memory accesses
                 int8_t de = delta_energy[var];
 
                 // Skip if delta energy too large (D-Wave optimization)
@@ -219,10 +213,9 @@ kernel void pure_simulated_annealing(
                 }
 
                 if (flip_spin) {
-                    // Track energy change
                     current_energy += de;
 
-                    // Phase 4: Get current spin value
+                    // Get current spin value
                     int8_t var_spin = get_spin_packed(var, packed_state);
 
                     // Update delta energies of all neighbors
@@ -241,7 +234,7 @@ kernel void pure_simulated_annealing(
 
                     // Flip the spin and negate its delta energy
                     flip_spin_packed(var, packed_state);
-                    delta_energy[var] = -de;  // Phase 4: Use cached value
+                    delta_energy[var] = -de;
                 }
             }
         }
@@ -253,6 +246,5 @@ kernel void pure_simulated_annealing(
         output[byte_idx] = packed_state[byte_idx];
     }
 
-    // Use tracked energy
     final_energies[thread_id] = current_energy;
 }

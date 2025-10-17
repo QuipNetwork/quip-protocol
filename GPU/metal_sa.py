@@ -190,7 +190,7 @@ class MetalSASampler:
 
         self.logger.debug(f"[MetalSA] Processing {num_problems} problems, {num_reads} reads each, {num_sweeps} sweeps")
 
-        # Task 1: Build concatenated CSR arrays for all problems
+        # Build concatenated CSR arrays for all problems
         all_csr_row_ptr = []
         all_csr_col_ind = []
         all_csr_J_vals = []
@@ -306,28 +306,28 @@ class MetalSASampler:
 
         beta_schedule_buf = self._create_buffer(beta_schedule, "beta_schedule")
 
-        # Task 2: Scalar parameters for batched problems
+        # Scalar parameters for batched problems
         N_bytes = np.int32(N).tobytes()
         num_betas_bytes = np.int32(len(beta_schedule)).tobytes()
         sweeps_per_beta_bytes = np.int32(num_sweeps_per_beta).tobytes()
         base_seed_bytes = np.uint32(seed).tobytes()
 
         # Batched parameters
-        total_reads = num_problems * num_reads
-        num_reads_bytes = np.int32(total_reads).tobytes()
+        num_threads = num_problems * num_reads
+        num_threads_bytes = np.int32(num_threads).tobytes()
         num_problems_bytes = np.int32(num_problems).tobytes()
-        reads_per_problem_bytes = np.int32(num_reads).tobytes()
+        num_reads_bytes = np.int32(num_reads).tobytes()
 
-        self.logger.debug(f"[MetalSA] Batch config: {num_problems} problems × {num_reads} reads = {total_reads} total reads")
+        self.logger.debug(f"[MetalSA] Batch config: {num_problems} problems × {num_reads} reads = {num_threads} total reads")
 
-        # Task 2: Output buffers for all problems
+        # Output buffers for all problems
         packed_size = (N + 7) // 8  # Bit-packed state size
 
         final_samples_buf = self.device.newBufferWithLength_options_(
-            total_reads * packed_size, Metal.MTLResourceStorageModeShared
+            num_threads * packed_size, Metal.MTLResourceStorageModeShared
         )
         final_energies_buf = self.device.newBufferWithLength_options_(
-            total_reads * 4, Metal.MTLResourceStorageModeShared
+            num_threads * 4, Metal.MTLResourceStorageModeShared
         )
 
         # Execute kernel
@@ -356,11 +356,11 @@ class MetalSASampler:
         encoder.setBuffer_offset_atIndex_(final_energies_buf, 0, 11)
 
         # Batch parameters
-        encoder.setBytes_length_atIndex_(num_reads_bytes, len(num_reads_bytes), 12)
+        encoder.setBytes_length_atIndex_(num_threads_bytes, len(num_threads_bytes), 12)
         encoder.setBytes_length_atIndex_(num_problems_bytes, len(num_problems_bytes), 13)
-        encoder.setBytes_length_atIndex_(reads_per_problem_bytes, len(reads_per_problem_bytes), 14)
+        encoder.setBytes_length_atIndex_(num_reads_bytes, len(num_reads_bytes), 14)
 
-        # Task 3: Dispatch configuration for batched problems
+        # Dispatch configuration for batched problems
         # One threadgroup per problem - optimal for cache locality
         max_threadgroups = self._pipeline.maxTotalThreadsPerThreadgroup()
 
@@ -373,7 +373,7 @@ class MetalSASampler:
         threads_per_threadgroup = Metal.MTLSize(width=threads_per_threadgroup_width, height=1, depth=1)
         num_threadgroups = Metal.MTLSize(width=num_threadgroups_width, height=1, depth=1)
 
-        self.logger.debug(f"[MetalSA] Dispatch: {num_threadgroups.width} threadgroups × {threads_per_threadgroup.width} threads = {num_threadgroups.width * threads_per_threadgroup.width} total threads for {total_reads} total reads ({num_problems} problems × {num_reads} reads)")
+        self.logger.debug(f"[MetalSA] Dispatch: {num_threadgroups.width} threadgroups × {threads_per_threadgroup.width} threads = {num_threadgroups.width * threads_per_threadgroup.width} total threads for {num_threads} total reads ({num_problems} problems × {num_reads} reads)")
 
         encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_threadgroups, threads_per_threadgroup)
 
@@ -386,15 +386,15 @@ class MetalSASampler:
             error = cmd_buf.error()
             raise RuntimeError(f"Metal command buffer failed: {error}")
 
-        # Task 4: Read batched results and parse into separate SampleSets
+        # Read batched results and parse into separate SampleSets
         # Read all results for all problems
         packed_data = np.frombuffer(
-            final_samples_buf.contents().as_buffer(total_reads * packed_size),
+            final_samples_buf.contents().as_buffer(num_threads * packed_size),
             dtype=np.int8
-        ).reshape(total_reads, packed_size)
+        ).reshape(num_threads, packed_size)
 
         energies_data = np.frombuffer(
-            final_energies_buf.contents().as_buffer(total_reads * 4),
+            final_energies_buf.contents().as_buffer(num_threads * 4),
             dtype=np.int32
         )
 
