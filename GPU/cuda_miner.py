@@ -6,8 +6,10 @@ import multiprocessing.synchronize
 import random
 import signal
 import sys
+import threading
 import time
 from typing import Optional
+from queue import Queue, Empty
 
 import numpy as np
 
@@ -109,6 +111,17 @@ class CudaMiner(BaseMiner):
         Returns:
             MiningResult if successful, None if stopped or failed
         """
+        # CRITICAL: Set device context at start of mine_block
+        # This is needed because mine_block runs in a separate process
+        try:
+            import cupy as cp
+            device_id = int(self.device)
+            cp.cuda.Device(device_id).use()
+            self.logger.debug(f"Device context set to {device_id}")
+        except Exception as e:
+            self.logger.error(f"Failed to set device context: {e}")
+            return None
+
         self.mining = True
         progress = 0  # Progress counter for logging
         self.top_attempts = []
@@ -180,6 +193,24 @@ class CudaMiner(BaseMiner):
             next_batch_salts.append(salt)
             next_batch_problems.append((h, J))
 
+        # GPU result queue for pipelined execution
+        gpu_result_queue = Queue(maxsize=1)
+        gpu_thread = None
+        gpu_exception = None
+
+        def run_gpu_batch(h_list, J_list, num_reads, num_sweeps):
+            """Run GPU batch in background thread."""
+            try:
+                # CRITICAL: Set device context in background thread
+                # Each thread needs its own device context
+                import cupy as cp
+                device_id = int(self.device)
+                cp.cuda.Device(device_id).use()
+
+                return self.sampler.sample_ising(h_list, J_list, num_reads=num_reads, num_sweeps=num_sweeps)
+            except Exception as e:
+                return e
+
         while self.mining and not stop_event.is_set():
             # Check if we should stop before generating models
             if stop_event.is_set():
@@ -215,51 +246,66 @@ class CudaMiner(BaseMiner):
             assert len(batch_problems) > 0, \
                 f"Batch should never be empty (batch_size={batch_size})"
 
-            # Pregenerate next batch while GPU is working (overlap computation)
-            next_batch_nonces = []
-            next_batch_salts = []
-            next_batch_problems = []
-
             # Track preprocessing time
             preprocess_start = time.time()
             self.current_stage = 'preprocessing'
             self.current_stage_start = preprocess_start
 
-            # Sample from CUDA GPU using batched evaluation
+            # For CUDA, use adaptive parameters
+            num_sweeps = params.get('num_sweeps', 512)
+            num_reads = params.get('num_reads', 100)
+            actual_batch_size = len(batch_problems)
+
+            # STEP 1: Kick off GPU batch in background thread
+            h_list = [h for h, J in batch_problems]
+            J_list = [J for h, J in batch_problems]
+
+            sample_start = time.time()
+            self.current_stage = 'sampling'
+            self.current_stage_start = sample_start
+
+            # Start GPU batch in background thread
+            gpu_thread = threading.Thread(
+                target=lambda: gpu_result_queue.put(run_gpu_batch(h_list, J_list, num_reads, num_sweeps)),
+                daemon=True
+            )
+            gpu_thread.start()
+            self.logger.debug(f"GPU batch started: {actual_batch_size} nonces × {num_reads} reads/nonce, {num_sweeps} sweeps")
+
+            # STEP 2: While GPU is running, pregenerate next batch on CPU
+            next_batch_nonces = []
+            next_batch_salts = []
+            next_batch_problems = []
+            for _ in range(batch_size):
+                salt = random.randbytes(32)
+                nonce = ising_nonce_from_block(prev_block.hash, node_info.miner_id, cur_index, salt)
+                h_next, J_next = generate_ising_model_from_nonce(nonce, nodes, edges)
+                next_batch_nonces.append(nonce)
+                next_batch_salts.append(salt)
+                next_batch_problems.append((h_next, J_next))
+
+            self.logger.debug(f"Next batch pregenerated while GPU was running")
+
+            # STEP 3: Wait for GPU to finish and get results
             try:
-                # For CUDA, use adaptive parameters
-                num_sweeps = params.get('num_sweeps', 512)
-                num_reads = params.get('num_reads', 100)
+                batch_samplesets = gpu_result_queue.get(timeout=300)  # 5 minute timeout
 
-                actual_batch_size = len(batch_problems)
-                self.logger.debug(f"Batched: {actual_batch_size} nonces × {num_reads} reads/nonce, {num_sweeps} sweeps")
-
-                sample_start = time.time()
-                self.current_stage = 'sampling'
-                self.current_stage_start = sample_start
-
-                # Batched kernel dispatch - evaluate all problems in one GPU call
-                h_list = [h for h, J in batch_problems]
-                J_list = [J for h, J in batch_problems]
-                batch_samplesets = self.sampler.sample_ising(h_list, J_list, num_reads=num_reads, num_sweeps=num_sweeps)
-
-                # Pregenerate next batch while waiting (or after GPU completes)
-                if len(next_batch_nonces) == 0:
-                    for _ in range(batch_size):
-                        salt = random.randbytes(32)
-                        nonce = ising_nonce_from_block(prev_block.hash, node_info.miner_id, cur_index, salt)
-                        h_next, J_next = generate_ising_model_from_nonce(nonce, nodes, edges)
-                        next_batch_nonces.append(nonce)
-                        next_batch_salts.append(salt)
-                        next_batch_problems.append((h_next, J_next))
+                # Check if GPU thread encountered an exception
+                if isinstance(batch_samplesets, Exception):
+                    raise batch_samplesets
 
                 sample_time = time.time() - sample_start
-
-                self.logger.debug(f"Batched sampling completed: {sample_time:.2f}s for {actual_batch_size} problems")
+                self.logger.debug(f"GPU batch completed: {sample_time:.2f}s for {actual_batch_size} problems")
 
                 # Estimate CUDA timing components
                 self.timing_stats['sampling'].append(sample_time * 1e6)  # Convert to microseconds
                 self.timing_stats['preprocessing'].append((time.time() - preprocess_start) * 1e6)
+
+            except Empty:
+                self.logger.error("GPU batch timeout - no results received")
+                if stop_event.is_set():
+                    return None
+                continue
             except Exception as e:
                 if stop_event.is_set():
                     self.logger.info("Interrupted during sampling")

@@ -490,13 +490,18 @@ class NetworkNode(Node):
                     # Create task with exception handler to crash on ValueError
                     task = asyncio.create_task(self.mine_block(latest_block))
                     task.add_done_callback(self._handle_mining_task_exception)
+                    # Short sleep to allow mining task to start
+                    await asyncio.sleep(0.1)
+                else:
+                    # If mining is active, sleep longer to avoid busy-waiting
+                    await asyncio.sleep(1)
             except asyncio.CancelledError:
                 if not self.running:
                     break
             except Exception as e:
                 self.logger.exception(f"Error in server loop: {e}")
-
-            await asyncio.sleep(5)
+                # Sleep on error to avoid tight loop
+                await asyncio.sleep(1)
 
     async def block_processor_loop(self):
         """Background loop to process blocks without blocking HTTP handlers."""
