@@ -1,6 +1,62 @@
 typedef signed char int8_t;
 typedef unsigned int uint;
 
+// Control flag values for persistent kernel
+#define CONTROL_RUNNING 0
+#define CONTROL_STOP 1
+#define CONTROL_DRAIN 2
+
+// Kernel state values (tracked by output controller)
+#define STATE_RUNNING 0
+#define STATE_IDLE 1
+
+// Debug flags
+#define DEBUG_KERNEL 1
+#define DEBUG_WORKERS 0  // Disabled in hot paths for performance
+#define DEBUG_VERBOSE 0  // Disabled - very expensive printf in SA loop
+
+// Fast math constants
+#define RNG_SCALE 2.32830643653869628906e-10f  // 1.0f / 2^32
+
+// Job descriptor for ring buffer
+struct JobDesc {
+    int job_id;
+    int num_reads;
+    int num_betas;             // Number of temperature steps (renamed from num_sweeps)
+    int num_sweeps_per_beta;
+
+    // CSR pointers (per-job CSR data)
+    const int* csr_row_ptr;    // Pointer to CSR row pointer array for this job
+    const int* csr_col_ind;    // Pointer to CSR column indices for this job
+    int N;
+
+    // Input arrays (device pointers)
+    float* h;                  // Linear bias array
+    int h_size;                // Size of h array
+    const int8_t* csr_J_vals;  // CSR values array (moved from J pointer)
+    int J_size;                // Size of J array
+    float* beta_schedule;      // Per-job beta schedule
+
+    // Output buffers
+    int8_t* output_samples;    // Output buffer for samples (num_reads * packed_size)
+    float* output_energies;    // Output buffer for energies (num_reads)
+
+    // RNG seed for reproducibility/randomness
+    unsigned int seed;         // Base seed for RNG initialization
+};
+
+// Output slot for per-block results (no ring buffer needed)
+struct OutputSlot {
+    volatile int ready;      // 0 = empty, 1 = has result, 2 = collected
+    int job_id;
+    float min_energy;
+    float avg_energy;
+    int num_reads;           // Number of samples/energies
+    int N;                   // Variables per sample
+    int samples_offset;      // Offset into samples pool (in floats)
+    int energies_offset;     // Offset into energies pool (in floats)
+};
+
 extern "C" {
 
 // Simple xorshift32 RNG
@@ -27,7 +83,7 @@ __device__ void set_spin_packed(int var, int8_t spin, int8_t* packed_state) {
     int bit_idx = var & 7;    // var % 8
     int8_t bit = (spin < 0) ? 1 : 0;  // -1 -> 1, +1 -> 0
     int8_t mask = 1 << bit_idx;
-    
+
     if (bit) {
         packed_state[byte_idx] |= mask;   // Set bit
     } else {
@@ -41,28 +97,65 @@ __device__ void flip_spin_packed(int var, int8_t* packed_state) {
     packed_state[byte_idx] ^= (1 << bit_idx);  // Toggle bit
 }
 
-// Compute delta energy for flipping a single variable
-// Delta energy = -2 * state[var] * energy
-// NOTE: CSR structure is validated on host side, so no bounds checks needed here
+// Compute delta energy for flipping a single variable (unpacked state version)
+__device__ int8_t get_flip_energy_unpacked(
+    int var,
+    const int8_t* unpacked_state,
+    const int* csr_row_ptr,
+    const int* csr_col_ind,
+    const int8_t* csr_J_vals,
+    int n,
+    const float* h = nullptr
+) {
+    // Use read-only cache for CSR reads (constant data)
+    const int start = __ldg(&csr_row_ptr[var]);
+    const int end = __ldg(&csr_row_ptr[var + 1]);
+
+    int energy = 0;
+
+    // Add linear bias term if provided
+    if (h != nullptr) {
+        energy += (int)__ldg(&h[var]);
+    }
+
+    #pragma unroll 20
+    for (int p = start; p < end; ++p) {
+        const int neighbor = __ldg(&csr_col_ind[p]);
+        const int8_t Jij = __ldg(&csr_J_vals[p]);
+        energy += unpacked_state[neighbor] * Jij;
+    }
+
+    // Delta energy = -2 * state[var] * energy
+    return (int8_t)(-2 * unpacked_state[var] * energy);
+}
+
+// Compute delta energy for flipping a single variable (packed state version - legacy)
 __device__ int8_t get_flip_energy(
     int var,
     const int8_t* packed_state,
     const int* csr_row_ptr,
     const int* csr_col_ind,
     const int8_t* csr_J_vals,
-    int n
+    int n,
+    const float* h = nullptr
 ) {
-    int start = csr_row_ptr[var];
-    int end = csr_row_ptr[var + 1];
+    // Use read-only cache for CSR reads (constant data)
+    const int start = __ldg(&csr_row_ptr[var]);
+    const int end = __ldg(&csr_row_ptr[var + 1]);
 
     int energy = 0;
 
+    // Add linear bias term if provided
+    if (h != nullptr) {
+        energy += (int)__ldg(&h[var]);
+    }
+
     #pragma unroll 20
     for (int p = start; p < end; ++p) {
-        int neighbor = csr_col_ind[p];
+        const int neighbor = __ldg(&csr_col_ind[p]);
         // CSR col_ind is validated on host to be in [0, n)
-        int8_t Jij = csr_J_vals[p];
-        int8_t neighbor_spin = get_spin_packed(neighbor, packed_state);
+        const int8_t Jij = __ldg(&csr_J_vals[p]);
+        const int8_t neighbor_spin = get_spin_packed(neighbor, packed_state);
         energy += neighbor_spin * Jij;
     }
 
@@ -71,187 +164,367 @@ __device__ int8_t get_flip_energy(
     return (int8_t)(-2 * var_spin * energy);
 }
 
-// CUDA Simulated Annealing kernel - with delta_energy array in global memory
-// Batched multi-problem evaluation for reduced kernel overhead
-//
-// BATCHED DISPATCH:
-// Each problem is assigned to a contiguous range of threads:
-// - problem_id = global_thread_id / num_reads
-// - read_id_in_problem = global_thread_id % num_reads
-// All problems are processed in parallel in a single kernel launch
-//
-// GUARDS:
-// 1. thread_id >= num_threads: Prevents out-of-bounds writes to output arrays.
-//    The kernel launch rounds up to full blocks, so total_threads may exceed num_threads.
-//    This guard is essential and always active.
-//
-// 2. thread_id >= workspace_capacity: Protects the delta_energy_workspace.
-//    Python allocates workspace based on GPU SM count, this is a safety fallback.
-//
-// CSR VALIDATION:
-// The CSR structure (row_ptr, col_ind, J_vals) is validated on the host side,
-// so the kernel can skip bounds checks for performance.
-//
-__global__ void cuda_simulated_annealing(
-    const int* __restrict__ all_csr_row_ptr,     // Concatenated row pointers for all problems
-    const int* __restrict__ all_csr_col_ind,     // Concatenated column indices for all problems
-    const int8_t* __restrict__ all_csr_J_vals,   // Concatenated J values for all problems
-    const int* __restrict__ row_ptr_offsets,     // [num_problems+1] offset into all_csr_row_ptr
-    const int* __restrict__ col_ind_offsets,     // [num_problems+1] offset into all_csr_col_ind
-    int num_problems,                             // Total number of problems in batch
-    const float* __restrict__ beta_schedule,
-    int N,
-    int num_betas,
-    int sweeps_per_beta,
-    int num_reads,                                // Reads per individual problem
-    unsigned int base_seed,
-    int8_t* __restrict__ output_samples,
-    float* __restrict__ output_energies,
-    int8_t* __restrict__ delta_energy_workspace,  // Global memory: workspace_capacity * N bytes
-    int workspace_capacity  // Maximum threads workspace can support
+
+// Persistent kernel with real simulated annealing
+// ARCHITECTURE:
+// - Thread 0: Input controller (dequeues jobs)
+// - Thread 1: Output controller (collects results, tracks state)
+// - Threads 2+: Worker threads (run real SA algorithm)
+__global__ void cuda_sa_persistent_real(
+    unsigned long long* input_ring_ptrs,  // Ring buffer of pointers to JobDesc
+    int input_ring_size,
+    volatile int* input_head,
+    volatile int* input_tail,
+    OutputSlot* output_slots,           // Per-block output slots
+    volatile int* control_flag,
+    volatile int* kernel_state,         // STATE_RUNNING or STATE_IDLE
+    float* samples_buffer_pool,         // Pre-allocated output buffer (float32)
+    float* energies_buffer_pool,        // Pre-allocated output buffer (float32)
+    int max_samples_per_job,            // Max floats for samples per job
+    int max_energies_per_job,           // Max floats for energies per job
+    int8_t* __restrict__ delta_energy_workspace,
+    int max_N                           // Max problem size (workspace capacity per thread)
 ) {
-    int global_thread_id = blockIdx.x * blockDim.x + threadIdx.x;
-    int num_threads = num_problems * num_reads;  // Total threads needed for all problems
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
 
-    // Guard 1: Prevent out-of-bounds writes to output arrays
-    if (global_thread_id >= num_threads) {
-        return;
+    // This block's dedicated output slot
+    OutputSlot* my_output = &output_slots[bid];
+
+    // Startup info (gated to block 0 only, once)
+    if (tid == 0 && bid == 0) {
+        printf("[KERNEL] Persistent SA kernel started (num_blocks=%d, threads_per_block=%d)\n", gridDim.x, blockDim.x);
+        *kernel_state = STATE_IDLE;
+        __threadfence_system();
     }
 
-    // Guard 2: Protect delta_energy_workspace from out-of-bounds access
-    // Workspace allocated in Python with size = workspace_capacity × N bytes
-    // This should never trigger if Python assertion works, but prevents GPU crash if it fails
-    if (global_thread_id >= workspace_capacity) {
-        return;
+    __shared__ JobDesc shared_job;
+    __shared__ bool has_job;
+    __shared__ int worker_results[1024];
+    __shared__ int exit_flag;
+    __shared__ int dequeue_mutex;  // Mutex for ring buffer dequeue
+
+    int job_output_offset = bid;
+    int loop_count = 0;
+
+    if (tid == 0) {
+        exit_flag = 0;
+        has_job = false;
+        dequeue_mutex = 0;
+        *kernel_state = STATE_IDLE;
+        __threadfence_system();
     }
+  
+    while (true) {
+        // Make sure we all see the same shared memory.
+        __syncthreads();
+        if (exit_flag) break;
 
-    // Determine which problem this thread is working on
-    int problem_id = global_thread_id / num_reads;
-    int read_id_in_problem = global_thread_id % num_reads;
+        // INPUT CONTROLLER (Thread 0 on every block): each block claims jobs via atomic head
+        if (tid == 0 && !has_job) {
+            loop_count++;
 
-    // Get CSR offsets for this specific problem
-    int row_ptr_start = row_ptr_offsets[problem_id];
-    int col_ind_start = col_ind_offsets[problem_id];
+            // Exit or drain the queue.
+            int control_top = *control_flag;
+            if (control_top == CONTROL_STOP) {
+                exit_flag = 1;
+            } else if (control_top == CONTROL_DRAIN) {
+                int head_top = *input_head;
+                int tail_top = *input_tail;
+                // DRAIN just processes queue, doesn't exit
+            }
 
-    // Point to this problem's CSR data
-    const int* csr_row_ptr = &all_csr_row_ptr[row_ptr_start];
-    const int* csr_col_ind = &all_csr_col_ind[col_ind_start];
-    const int8_t* csr_J_vals = &all_csr_J_vals[col_ind_start];
+            // Try dequeue using atomic CAS (with mutex to prevent race with Python)
+            int slot = -1;
 
-    int n = N;
-    int num_beta_values = num_betas;
-    int sweeps_per_beta_val = sweeps_per_beta;
-    int packed_size = (n + 7) / 8;  // bytes needed for bit-packed state
+            // Acquire mutex
+            while (atomicCAS(&dequeue_mutex, 0, 1) != 0) {
+                __nanosleep(1000);  // Spin with small sleep
+            }
 
-    // Thread-local memory for state only (small enough to fit)
-    int8_t packed_state[576];  // ~4600 bits / 8 = 575 bytes (for N=4600)
+            // Critical section: read head/tail and atomicCAS
+            int head = *input_head;
+            int tail = *input_tail;
 
-    // Delta energy workspace for this thread
-    int8_t* delta_energy = &delta_energy_workspace[global_thread_id * n];
+            if (head != tail) {
+                __threadfence_system();
+                int observed = atomicCAS((int*)input_head, head, head + 1);
+                if (observed == head) {
+                    slot = head % input_ring_size;
+                }
+            }
 
-    // Initialize delta_energy array to zero
-    for (int i = 0; i < n; i++) {
-        delta_energy[i] = 0;
-    }
+            // Release mutex
+            dequeue_mutex = 0;
+            __threadfence_system();
 
-    // Initialize RNG state with unique seed per thread
-    unsigned int rng_state = (base_seed ? base_seed : 1u) ^ (global_thread_id * 12345u);
+            if (slot != -1) {
+                // Read pointer from ring buffer (atomic 64-bit read)
+                unsigned long long jobdesc_ptr = input_ring_ptrs[slot];
 
-    // Generate random initial state (bit-packed)
-    for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
-        packed_state[byte_idx] = 0;  // Clear all bits
-    }
-    for (int var = 0; var < n; var++) {
-        unsigned int rand_val = xorshift32(rng_state);
-        int8_t spin = (rand_val & 1) ? -1 : 1;  // Random ±1
-        set_spin_packed(var, spin, packed_state);
-    }
+                // Dereference pointer to get JobDesc
+                JobDesc* job_ptr = (JobDesc*)jobdesc_ptr;
+                shared_job = *job_ptr;
 
-    // Build initial delta_energy array
-    for (int var = 0; var < n; var++) {
-        delta_energy[var] = get_flip_energy(var, packed_state, csr_row_ptr, csr_col_ind, csr_J_vals, n);
-    }
+                if (shared_job.num_reads > 0) {
+                    has_job = true;
+                    for (int i = 0; i < shared_job.num_reads; i++) {
+                        worker_results[i] = 0;
+                    }
 
-    // Compute initial energy (J contribution only - h is constant per spin)
-    int current_energy = 0;
-    for (int i = 0; i < n; i++) {
-        int8_t spin_i = get_spin_packed(i, packed_state);
-        int start = csr_row_ptr[i];
-        int end = csr_row_ptr[i + 1];
-        for (int p = start; p < end; ++p) {
-            int j = csr_col_ind[p];
-            if (j > i) {  // Count each edge once
-                int8_t Jij = csr_J_vals[p];
-                int8_t spin_j = get_spin_packed(j, packed_state);
-                current_energy += Jij * spin_i * spin_j;
+                    *kernel_state = STATE_RUNNING;
+                    __threadfence_system();
+
+                    // Event-driven debug: print when job is successfully dequeued
+                    printf("[KERNEL] Block %d dequeued job_id=%d with num_reads=%d, num_betas=%d\n",
+                           bid, shared_job.job_id, shared_job.num_reads, shared_job.num_betas);
+
+                    // One-time debug: verify CSR and h metadata for this job (on the block that dequeued)
+                    if (DEBUG_KERNEL) {
+                        int n = shared_job.N;
+                        const int* csr_row_ptr = shared_job.csr_row_ptr;
+                        const int* csr_col_ind = shared_job.csr_col_ind;
+                        const int8_t* csr_J_vals = shared_job.csr_J_vals;
+                        int nnz = csr_row_ptr[n] - csr_row_ptr[0];
+                        printf("[KERNEL] Dequeued job debug: h_ptr=%p h_size=%d N=%d | row_ptr[0]=%d row_ptr[n]=%d nnz=%d\n",
+                               shared_job.h, shared_job.h_size, n, csr_row_ptr[0], csr_row_ptr[n], nnz);
+                        if (n > 0) {
+                            int deg0 = csr_row_ptr[1] - csr_row_ptr[0];
+                            int deg_last = csr_row_ptr[n] - csr_row_ptr[n-1];
+                            printf("[KERNEL] Dequeued job debug: deg(first)=%d deg(last)=%d | first J=%d first col=%d\n",
+                                   deg0, deg_last, (int)csr_J_vals[0], csr_col_ind[0]);
+                        }
+                    }
+                }
             }
         }
-    }
+        // Ensure all threads see a new job (the zeroed worker_results and has_job) before they start
+        __syncthreads();
 
-    // Perform sweeps across beta schedule
-    for (int beta_idx = 0; beta_idx < num_beta_values; beta_idx++) {
-        float beta = beta_schedule[beta_idx];
+        // WORKER THREADS: Run real SA (on every block)
+        int worker_id = tid;
 
-        // D-Wave optimization: threshold to skip impossible flips
-        float threshold = 22.18f / beta;
+        // Only run if this worker hasn't completed yet
+        if (has_job && worker_id < shared_job.num_reads && worker_results[worker_id] == 0) {
+            int n = shared_job.N;
+            int num_reads = shared_job.num_reads;
+            int num_betas = shared_job.num_betas;
+            int sweeps_per_beta = shared_job.num_sweeps_per_beta;
 
-        for (int sweep = 0; sweep < sweeps_per_beta_val; sweep++) {
-            // Sequential variable ordering (matching D-Wave default)
+            #if DEBUG_VERBOSE
+            printf("[KERNEL] Block %d worker %d starting SA (job_id=%d, num_reads=%d)\n",
+                    bid, worker_id, shared_job.job_id, num_reads);
+            #endif
+
+            // Get CSR pointers from job (per-job CSR data)
+            const int* csr_row_ptr = shared_job.csr_row_ptr;
+            const int* csr_col_ind = shared_job.csr_col_ind;
+            const int8_t* csr_J_vals = shared_job.csr_J_vals;
+
+            int packed_size = (n + 7) / 8;
+            int8_t packed_state[640];  // Keep for final output only
+
+            // OPTIMIZATION: Use unpacked state during SA (much faster than bit operations)
+            int8_t unpacked_state[5000];  // Thread-local dense spin array
+
+            // Delta energy workspace for this thread (unique per global thread)
+            // Use max_N (workspace capacity) not n (actual problem size) to avoid overlapping workspaces
+            int global_thread_id = bid * blockDim.x + tid;
+            int8_t* delta_energy = &delta_energy_workspace[global_thread_id * max_N];
+
+            // Initialize RNG (ensure non-zero seed)
+            // Combine job seed with job_id and worker_id for uniqueness
+            unsigned int rng_state = (shared_job.seed ^ ((shared_job.job_id + 1) ^ (worker_id + 1))) * 12345u;
+            if (rng_state == 0) rng_state = 0xdeadbeef;
+
+            // Generate random initial state (directly to unpacked array)
             for (int var = 0; var < n; var++) {
-                // Use cached delta_energy value
-                int8_t de = delta_energy[var];
+                unsigned int rand_val = xorshift32(rng_state);
+                unpacked_state[var] = (rand_val & 1) ? -1 : 1;
+            }
 
-                // Skip if delta energy too large (D-Wave optimization)
-                if (de >= threshold) continue;
+            // Build initial delta_energy array using unpacked state
+            // Note: Matching Metal, do NOT include h in delta energy
+            for (int var = 0; var < n; var++) {
+                delta_energy[var] = get_flip_energy_unpacked(var, unpacked_state, csr_row_ptr, csr_col_ind, csr_J_vals, n, nullptr);
+            }
 
-                bool flip_spin = false;
+            // Compute initial energy (h + J terms)
+            int current_energy = 0;
+            for (int i = 0; i < n; i++) {
+                int8_t spin_i = unpacked_state[i];
 
-                // Metropolis-Hastings acceptance rule
-                if (de <= 0) {
-                    flip_spin = true;
-                } else {
-                    unsigned int rand_val = xorshift32(rng_state);
-                    float prob = exp(-float(de) * beta);
-                    float rand_normalized = float(rand_val) / 4294967295.0f;
-
-                    if (prob > rand_normalized) {
-                        flip_spin = true;
-                    }
+                // Add h term
+                if (shared_job.h != nullptr && i < shared_job.h_size) {
+                    current_energy += (int)(__ldg(&shared_job.h[i]) * spin_i);
                 }
 
-                if (flip_spin) {
-                    current_energy += de;
-
-                    // Get current spin value
-                    int8_t var_spin = get_spin_packed(var, packed_state);
-
-                    // Update delta energies of all neighbors
-                    // CSR structure is validated on host, so no bounds checks needed
-                    int multiplier = 4 * var_spin;
-                    int start = csr_row_ptr[var];
-                    int end = csr_row_ptr[var + 1];
-
-                    for (int p = start; p < end; ++p) {
-                        int neighbor = csr_col_ind[p];
-                        int8_t Jij = csr_J_vals[p];
-                        int8_t neighbor_spin = get_spin_packed(neighbor, packed_state);
-                        delta_energy[neighbor] += multiplier * Jij * neighbor_spin;
+                // Add J terms (only count each edge once with j > i)
+                const int start = __ldg(&csr_row_ptr[i]);
+                const int end = __ldg(&csr_row_ptr[i + 1]);
+                for (int p = start; p < end; ++p) {
+                    const int j = __ldg(&csr_col_ind[p]);
+                    if (j > i) {  // Count each edge once
+                        const int8_t Jij = __ldg(&csr_J_vals[p]);
+                        const int8_t spin_j = unpacked_state[j];
+                        current_energy += Jij * spin_i * spin_j;
                     }
-
-                    // Flip the spin and negate its delta energy
-                    flip_spin_packed(var, packed_state);
-                    delta_energy[var] = -de;
                 }
             }
+
+
+            // Perform SA sweeps
+
+            for (int beta_idx = 0; beta_idx < num_betas; beta_idx++) {
+                float beta = shared_job.beta_schedule[beta_idx];
+                float threshold = 22.18f / beta;
+
+                for (int sweep = 0; sweep < sweeps_per_beta; sweep++) {
+                    for (int var = 0; var < n; var++) {
+                        int8_t de = delta_energy[var];
+
+                        if (de >= threshold) continue;
+
+                        bool flip_spin = false;
+
+                        if (de <= 0) {
+                            flip_spin = true;
+                        } else {
+                            // Fast math: use __expf() and optimized RNG conversion
+                            const float accept_prob = __expf(-__int2float_rn(de) * beta);
+                            const float rand_uniform = __uint2float_rn(xorshift32(rng_state)) * RNG_SCALE;
+                            flip_spin = (accept_prob > rand_uniform);
+                        }
+
+                        if (flip_spin) {
+                            current_energy += de;
+
+                            // OPTIMIZATION: Use unpacked state (matching Metal logic)
+                            const int8_t var_spin = unpacked_state[var];  // BEFORE flip
+                            const int8_t multiplier = 4 * var_spin;  // Matching Metal
+                            const int start = __ldg(&csr_row_ptr[var]);
+                            const int end = __ldg(&csr_row_ptr[var + 1]);
+
+                            for (int p = start; p < end; ++p) {
+                                const int neighbor = __ldg(&csr_col_ind[p]);
+                                const int8_t Jij = __ldg(&csr_J_vals[p]);
+                                const int8_t neighbor_spin = unpacked_state[neighbor];
+                                delta_energy[neighbor] += multiplier * Jij * neighbor_spin;
+                            }
+
+                            // Flip spin (just negate, no bit packing)
+                            unpacked_state[var] = -var_spin;
+                            delta_energy[var] = -de;
+                        }
+                    }
+                }
+            }
+
+            // Pack final state back to bit format (for compatibility with existing code)
+            for (int i = 0; i < n; i++) {
+                set_spin_packed(i, unpacked_state[i], packed_state);
+            }
+
+            // Write results to output buffer
+            int base_samples_offset = job_output_offset * max_samples_per_job;
+            int base_energies_offset = job_output_offset * max_energies_per_job;
+
+            // Store final state as samples (directly from unpacked state)
+            int sample_idx = base_samples_offset + worker_id * n;
+            for (int i = 0; i < n; i++) {
+                samples_buffer_pool[sample_idx + i] = (float)unpacked_state[i];
+            }
+
+            // Store final energy
+            int energy_idx = base_energies_offset + worker_id;
+            energies_buffer_pool[energy_idx] = (float)current_energy;
+
+            #if DEBUG_VERBOSE
+            printf("[KERNEL] Block %d worker %d finished: energy=%.1f (job_id=%d)\n", bid, worker_id, (float)current_energy, shared_job.job_id);
+            #endif
+
+            worker_results[worker_id] = 1;
+        }
+
+        __syncthreads();
+
+        // OUTPUT CONTROLLER (Thread 0 on every block)
+        if (has_job && tid == 0) {
+            // Event-driven debug: print when output controller starts waiting
+            printf("[KERNEL] Block %d output controller: waiting for %d workers\n", bid, shared_job.num_reads);
+
+            // Wait for all workers to complete
+            bool all_done = false;
+            int wait_count = 0;
+            while (!all_done) {
+                all_done = true;
+                int completed = 0;
+                for (int i = 0; i < shared_job.num_reads; i++) {
+                    // Use volatile read to ensure we see latest value from workers
+                    int result_val = *(volatile int*)&worker_results[i];
+                    if (result_val == 1) {
+                        completed++;
+                    } else {
+                        all_done = false;
+                    }
+                }
+                if (!all_done) {
+                    wait_count++;
+                    __nanosleep(100000);  // 100us sleep between checks
+                }
+            }
+
+            // Compute min/avg energy
+            int base_energies_offset = job_output_offset * max_energies_per_job;
+            float min_e = 0.0f, sum_e = 0.0f;
+            for (int i = 0; i < shared_job.num_reads; i++) {
+                float e = energies_buffer_pool[base_energies_offset + i];
+                if (i == 0 || e < min_e) min_e = e;
+                sum_e += e;
+            }
+
+            // Wait for host to acknowledge previous result (ready==2 means host read it)
+            // or ready==0 means slot is fresh
+            while (my_output->ready == 1) {
+                __threadfence_system();
+                __nanosleep(100000);  // 100us
+            }
+
+            // Write to output slot
+            my_output->job_id = shared_job.job_id;
+            my_output->min_energy = min_e;
+            my_output->avg_energy = sum_e / shared_job.num_reads;
+            my_output->num_reads = shared_job.num_reads;
+            my_output->N = shared_job.N;
+            my_output->samples_offset = job_output_offset * max_samples_per_job;
+            my_output->energies_offset = job_output_offset * max_energies_per_job;
+
+            // Mark ready (host will poll this)
+            my_output->ready = 1;
+            __threadfence_system();
+
+            printf("[KERNEL] Block %d wrote result for job_id=%d, min_e=%.1f\n", bid, shared_job.job_id, min_e);
+
+            // Wait for host to collect (ready==2), then reset
+            while (my_output->ready != 2) {
+                __threadfence_system();
+                int control = *control_flag;
+                if (control == CONTROL_STOP) break;
+                __nanosleep(100000000);  // 100ms = 100 * 1,000,000 nanoseconds                
+            }
+            my_output->ready = 0;
+            has_job = false;
+            *kernel_state = STATE_IDLE;
+            __threadfence_system();
+            continue;
+        }
+
+        // OPTIMIZATION: Idle unused threads to reduce GPU resource contention
+        if (!has_job || worker_id >= shared_job.num_reads) {
+            // Thread is not needed - sleep to free up GPU resources
+            __nanosleep(500000000);  // 500ms
         }
     }
-    
-    // Store output
-    for (int i = 0; i < packed_size; i++) {
-        output_samples[global_thread_id * packed_size + i] = packed_state[i];
-    }
-    output_energies[global_thread_id] = (float)current_energy;
 }
 
 }  // extern "C"
-
