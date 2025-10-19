@@ -16,10 +16,114 @@ import numpy as np
 from shared.base_miner import BaseMiner, MiningResult
 from shared.quantum_proof_of_work import (
     ising_nonce_from_block,
-    generate_ising_model_from_nonce
+    generate_ising_model_from_nonce,
+    evaluate_sampleset,
+    calculate_diversity
 )
 from shared.block_requirements import compute_current_requirements
-from GPU.cuda_sa import CudaSASampler
+from GPU.cuda_sa import CudaSASampler, IsingJob
+
+
+def producer_thread_worker(
+    sampler: CudaSASampler,
+    prev_block,
+    node_info,
+    cur_index: int,
+    nodes,
+    edges,
+    batch_size: int,
+    num_reads: int,
+    num_sweeps: int,
+    num_sweeps_per_beta: int,
+    stop_event: multiprocessing.synchronize.Event,
+    job_metadata_dict: dict,
+    logger
+):
+    """Producer thread: generates Ising models and enqueues jobs to GPU asynchronously."""
+    logger.info(f"Producer thread started: batch_size={batch_size}, num_reads={num_reads}")
+
+    try:
+        while not stop_event.is_set():
+            jobs = []
+            batch_nonces = []
+            batch_salts = []
+
+            for _ in range(batch_size):
+                salt = random.randbytes(32)
+                nonce = ising_nonce_from_block(prev_block.hash, node_info.miner_id, cur_index, salt)
+                h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+
+                job = IsingJob(
+                    h=h, J=J,
+                    num_reads=num_reads,
+                    num_sweeps=num_sweeps,
+                    num_sweeps_per_beta=num_sweeps_per_beta,
+                    seed=None
+                )
+                jobs.append(job)
+                batch_nonces.append(nonce)
+                batch_salts.append(salt)
+
+            # Enqueue jobs asynchronously
+            job_ids = sampler.sample_ising_async(jobs)
+
+            # Track job metadata for result processing
+            for job_id, nonce, salt, job in zip(job_ids, batch_nonces, batch_salts, jobs):
+                job_metadata_dict[job_id] = {
+                    'nonce': nonce,
+                    'salt': salt,
+                    'h': job.h,
+                    'J': job.J,
+                }
+
+            logger.debug(f"Producer: enqueued {len(job_ids)} jobs")
+
+    except Exception as e:
+        logger.error(f"Producer thread error: {e}")
+    finally:
+        logger.info("Producer thread stopped")
+
+
+def consumer_thread_worker(
+    sampler: CudaSASampler,
+    nodes,
+    edges,
+    requirements,
+    prev_timestamp: int,
+    start_time: float,
+    stop_event: multiprocessing.synchronize.Event,
+    result_queue: Queue,
+    logger,
+    miner_id: str = "persistent-miner",
+    miner_type: str = "GPU-CUDA-SA"
+):
+    """Consumer thread: reads results from GPU and puts them in result queue."""
+    logger.info("Consumer thread started")
+
+    try:
+        while not stop_event.is_set():
+            # Dequeue results from GPU
+            results = sampler.dequeue_results(timeout=0.1)
+
+            if not results:
+                continue
+
+            logger.debug(f"Consumer: dequeued {len(results)} results")
+
+            for job_id, sampleset in results:
+                try:
+                    # Put result in queue for main mining loop
+                    result_queue.put({
+                        'job_id': job_id,
+                        'sampleset': sampleset,
+                    }, timeout=1.0)
+                except:
+                    logger.warning("Result queue full, dropping result")
+
+    except Exception as e:
+        logger.error(f"Consumer thread error: {e}")
+    finally:
+        logger.info("Consumer thread stopped")
 
 
 class CudaMiner(BaseMiner):
@@ -39,9 +143,40 @@ class CudaMiner(BaseMiner):
         sampler.logger = self.logger
         self.miner_type = "GPU-CUDA-SA"
         self.device = device
-        
+
         # Register SIGTERM handler for graceful cleanup
         signal.signal(signal.SIGTERM, self._cleanup_handler)
+
+    def _gpu_result_to_sampleset(self, gpu_result: dict, h, J, nodes: list) -> Optional[object]:
+        """Convert GPU result dict to dimod.SampleSet.
+
+        Args:
+            gpu_result: Dict with 'min_energy', 'avg_energy', 'num_reads_done'
+            h: Ising h biases
+            J: Ising J couplings
+            nodes: List of node indices
+
+        Returns:
+            dimod.SampleSet or None if conversion fails
+        """
+        try:
+            import dimod
+
+            # For now, create a dummy sampleset with the energy values
+            # In production, this would contain actual samples from GPU
+            num_reads = gpu_result.get('num_reads_done', 1)
+            min_energy = gpu_result.get('min_energy', 0.0)
+            avg_energy = gpu_result.get('avg_energy', 0.0)
+
+            # Create dummy samples (all +1) - in production, use actual GPU samples
+            samples = [{node: 1 for node in nodes} for _ in range(num_reads)]
+            energies = [min_energy + (avg_energy - min_energy) * i / max(1, num_reads - 1) for i in range(num_reads)]
+
+            sampleset = dimod.SampleSet.from_samples(samples, 'SPIN', energies)
+            return sampleset
+        except Exception as e:
+            self.logger.error(f"Failed to convert GPU result to sampleset: {e}")
+            return None
     
     def _cleanup_handler(self, signum, frame):
         """Handle SIGTERM signal for graceful cleanup of CUDA resources."""
@@ -99,7 +234,7 @@ class CudaMiner(BaseMiner):
         prev_timestamp: int,
         stop_event: multiprocessing.synchronize.Event,
     ) -> Optional[MiningResult]:
-        """Mine a block using CUDA GPU acceleration with batched multi-nonce evaluation.
+        """Mine a block using persistent CUDA kernel with producer/consumer threads.
 
         Args:
             prev_block: Previous block in the chain
@@ -112,7 +247,6 @@ class CudaMiner(BaseMiner):
             MiningResult if successful, None if stopped or failed
         """
         # CRITICAL: Set device context at start of mine_block
-        # This is needed because mine_block runs in a separate process
         try:
             import cupy as cp
             device_id = int(self.device)
@@ -123,15 +257,8 @@ class CudaMiner(BaseMiner):
             return None
 
         self.mining = True
-        progress = 0  # Progress counter for logging
-        self.top_attempts = []
         start_time = time.time()
-
-        # Mining statistics
-        total_nonces_evaluated = 0
-        last_report_time = start_time
-        last_report_nonces = 0
-        report_interval = 10.0  # Report every 10 seconds
+        self.top_attempts = []
 
         self.logger.debug(f"requirements: {requirements}")
 
@@ -139,7 +266,7 @@ class CudaMiner(BaseMiner):
 
         # Mark that this miner is attempting this round
         self.current_round_attempted = True
-        self.logger.info(f"Mining block {cur_index}...")
+        self.logger.info(f"Mining block {cur_index} with persistent kernel...")
 
         # Apply difficulty decay based on elapsed time since previous block
         current_requirements = compute_current_requirements(requirements, prev_timestamp, self.logger)
@@ -154,222 +281,137 @@ class CudaMiner(BaseMiner):
         nodes = self.sampler.nodes
         edges = self.sampler.edges
 
-        # Batch size: number of nonces to evaluate simultaneously
-        # Constrained by both GPU hardware and workspace allocation
-        num_reads = params.get('num_reads', 100)
-        max_workspace_threads = getattr(self.sampler, 'max_threads_per_call', 1024)
+        # Initialize persistent kernel
+        try:
+            persistent_sampler = CudaSASampler(device=int(self.device))
+            self.logger.info("Persistent kernel initialized")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize persistent kernel: {e}")
+            return None
+
+        # Create result queue for consumer thread
+        result_queue = Queue(maxsize=100)
+
+        # Dictionary to track job metadata (job_id -> {nonce, salt, h, J})
+        job_metadata_dict = {}
+
+        # Start producer and consumer threads
+        producer_stop = multiprocessing.Event()
+        consumer_stop = multiprocessing.Event()
+
+        producer = threading.Thread(
+            target=producer_thread_worker,
+            args=(
+                persistent_sampler, prev_block, node_info, cur_index, nodes, edges,
+                10,  # batch_size
+                params.get('num_reads', 100),
+                params.get('num_sweeps', 512),
+                10,  # num_sweeps_per_beta
+                producer_stop,
+                job_metadata_dict,
+                self.logger
+            ),
+            daemon=True
+        )
+
+        consumer = threading.Thread(
+            target=consumer_thread_worker,
+            args=(
+                persistent_sampler, nodes, edges, current_requirements, prev_timestamp,
+                start_time, consumer_stop, result_queue, self.logger
+            ),
+            daemon=True
+        )
+
+        producer.start()
+        consumer.start()
+        self.logger.info("Producer and consumer threads started")
+
+        # Main mining loop
+        last_requirement_check = time.time()
+        requirement_check_interval = 5.0  # Check every 5 seconds
 
         try:
-            import cupy as cp
-            # Get number of SM (streaming multiprocessors)
-            device_id = cp.cuda.runtime.getDevice()
-            device_props = cp.cuda.runtime.getDeviceProperties(device_id)
-            multiprocessor_count = device_props['multiProcessorCount']
+            while self.mining and not stop_event.is_set():
+                # Check if we should stop
+                if stop_event.is_set():
+                    break
 
-            # Limit batch size by workspace constraint: total_reads <= max_workspace_threads
-            # total_reads = batch_size * num_reads, so batch_size <= max_workspace_threads / num_reads
-            max_batch_by_workspace = max_workspace_threads // num_reads
+                # Try to get results from consumer thread
+                try:
+                    result = result_queue.get(timeout=0.5)
+                    job_id = result.get('job_id')
+                    sampleset = result.get('sampleset')
+                    self.logger.debug(f"Got result from queue: job_id={job_id}")
 
-            # Use minimum of SM count and workspace limit
-            batch_size = min(multiprocessor_count, max_batch_by_workspace)
-            batch_size = max(1, batch_size)  # At least 1
+                    # Get job metadata (nonce, salt)
+                    if job_id not in job_metadata_dict:
+                        self.logger.warning(f"No metadata for job_id {job_id}, skipping")
+                        continue
 
-            self.logger.info(f"Detected {multiprocessor_count} CUDA SMs, workspace limit {max_workspace_threads} threads")
-            self.logger.info(f"Batch size: {batch_size} nonces/batch (limited by workspace: {max_batch_by_workspace}, reads/nonce: {num_reads})")
+                    metadata = job_metadata_dict.pop(job_id)
+                    nonce = metadata['nonce']
+                    salt = metadata['salt']
+
+                    # Evaluate sampleset against current requirements
+                    mining_result = self.evaluate_sampleset(
+                        sampleset, current_requirements, nodes, edges,
+                        nonce, salt, prev_timestamp, start_time
+                    )
+
+                    if mining_result:
+                        # Found a valid result!
+                        self.logger.info(
+                            f"[Block-{cur_index}] Mined! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., "
+                            f"Min Energy: {mining_result.energy:.2f}, Solutions: {mining_result.num_valid}, "
+                            f"Diversity: {mining_result.diversity:.3f}, Mining Time: {time.time() - start_time:.2f}s"
+                        )
+                        return mining_result
+                    else:
+                        # Result didn't meet requirements, cache it for later
+                        self.logger.debug(f"Result didn't meet requirements: nonce={nonce}, salt={salt.hex()[:8]}...")
+                        # Cache for later if requirements change
+                        self.update_top_samples(sampleset, nonce, salt, current_requirements)
+
+                except Exception as e:
+                    if "Empty" not in str(type(e)):
+                        self.logger.debug(f"Result queue timeout or error: {e}")
+                    continue
+
+                # Periodically check if requirements have changed (every 5 seconds)
+                current_time = time.time()
+                if current_time - last_requirement_check >= requirement_check_interval:
+                    last_requirement_check = current_time
+
+                    # Update requirements if necessary
+                    updated_requirements = compute_current_requirements(requirements, prev_timestamp, self.logger)
+                    if current_requirements != updated_requirements:
+                        current_requirements = updated_requirements
+                        params = adapt_parameters(current_requirements.difficulty_energy, current_requirements.min_diversity, current_requirements.min_solutions)
+                        self.logger.info(f"{self.miner_id} - updated adaptive params: {params}")
+                        difficulty_energy = current_requirements.difficulty_energy
+                        min_diversity = current_requirements.min_diversity
+                        min_solutions = current_requirements.min_solutions
+
+                        # Check if any cached results now meet the new requirements
+                        for sample in self.top_attempts:
+                            if min(sample.sampleset.record.energy) <= current_requirements.difficulty_energy:
+                                result = self.evaluate_sampleset(sample.sampleset, current_requirements, nodes, edges,
+                                                                 sample.nonce, sample.salt, prev_timestamp, start_time)
+                                if result:
+                                    self.logger.info(f"[Block-{cur_index}] Already Mined at this difficulty! Nonce: {sample.nonce}, Salt: {sample.salt.hex()[:4]}..., Min Energy: {result.energy:.2f}, Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Mining Time: {time.time() - start_time:.2f}s")
+                                    return result
+
         except Exception as e:
-            # Fallback: ensure we don't exceed workspace
-            batch_size = max(1, max_workspace_threads // num_reads)
-            self.logger.warning(f"Could not detect CUDA SM count ({e}), using batch_size={batch_size}")
-
-        # Pregenerate first batch to start
-        next_batch_nonces = []
-        next_batch_salts = []
-        next_batch_problems = []
-        for _ in range(batch_size):
-            salt = random.randbytes(32)
-            nonce = ising_nonce_from_block(prev_block.hash, node_info.miner_id, cur_index, salt)
-            h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
-            next_batch_nonces.append(nonce)
-            next_batch_salts.append(salt)
-            next_batch_problems.append((h, J))
-
-        # GPU result queue for pipelined execution
-        gpu_result_queue = Queue(maxsize=1)
-        gpu_thread = None
-        gpu_exception = None
-
-        def run_gpu_batch(h_list, J_list, num_reads, num_sweeps):
-            """Run GPU batch in background thread."""
-            try:
-                # CRITICAL: Set device context in background thread
-                # Each thread needs its own device context
-                import cupy as cp
-                device_id = int(self.device)
-                cp.cuda.Device(device_id).use()
-
-                return self.sampler.sample_ising(h_list, J_list, num_reads=num_reads, num_sweeps=num_sweeps)
-            except Exception as e:
-                return e
-
-        while self.mining and not stop_event.is_set():
-            # Check if we should stop before generating models
-            if stop_event.is_set():
-                break
-
-            # Update requirements if necessary
-            updated_requirements = compute_current_requirements(requirements, prev_timestamp, self.logger)
-            if current_requirements != updated_requirements:
-                current_requirements = updated_requirements
-                # Recompute adaptive parameters based on updated requirements
-                params = adapt_parameters(current_requirements.difficulty_energy, current_requirements.min_diversity, current_requirements.min_solutions)
-                self.logger.info(f"{self.miner_id} - updated adaptive params: {params}")
-                # Check if any existing results meet the new requirements
-                for sample in self.top_attempts:
-                    if min(sample.sampleset.record.energy) <= current_requirements.difficulty_energy:
-                        result = self.evaluate_sampleset(sample.sampleset, current_requirements, nodes, edges,
-                                                         sample.nonce, sample.salt, prev_timestamp, start_time)
-                        if result:
-                            self.logger.info(f"[Block-{cur_index}] Already Mined at this difficulty! Nonce: {sample.nonce}, Salt: {sample.salt.hex()[:4]}..., Min Energy: {result.energy:.2f}, Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Attempt Time: {result.mining_time:.2f}s, Total Mining Time: {time.time() - start_time:.2f}s")
-                            return result
-                difficulty_energy = current_requirements.difficulty_energy
-                min_diversity = current_requirements.min_diversity
-                min_solutions = current_requirements.min_solutions
-
-            # Use pregenerated batch (overlapping CPU work with GPU work)
-            batch_nonces = next_batch_nonces
-            batch_salts = next_batch_salts
-            batch_problems = next_batch_problems
-
-            # Programming error if batch is invalid - fail fast
-            assert len(batch_nonces) == len(batch_salts) == len(batch_problems), \
-                f"Batch arrays must have same length: nonces={len(batch_nonces)}, salts={len(batch_salts)}, problems={len(batch_problems)}"
-            assert len(batch_problems) > 0, \
-                f"Batch should never be empty (batch_size={batch_size})"
-
-            # Track preprocessing time
-            preprocess_start = time.time()
-            self.current_stage = 'preprocessing'
-            self.current_stage_start = preprocess_start
-
-            # For CUDA, use adaptive parameters
-            num_sweeps = params.get('num_sweeps', 512)
-            num_reads = params.get('num_reads', 100)
-            actual_batch_size = len(batch_problems)
-
-            # STEP 1: Kick off GPU batch in background thread
-            h_list = [h for h, J in batch_problems]
-            J_list = [J for h, J in batch_problems]
-
-            sample_start = time.time()
-            self.current_stage = 'sampling'
-            self.current_stage_start = sample_start
-
-            # Start GPU batch in background thread
-            gpu_thread = threading.Thread(
-                target=lambda: gpu_result_queue.put(run_gpu_batch(h_list, J_list, num_reads, num_sweeps)),
-                daemon=True
-            )
-            gpu_thread.start()
-            self.logger.debug(f"GPU batch started: {actual_batch_size} nonces × {num_reads} reads/nonce, {num_sweeps} sweeps")
-
-            # STEP 2: While GPU is running, pregenerate next batch on CPU
-            next_batch_nonces = []
-            next_batch_salts = []
-            next_batch_problems = []
-            for _ in range(batch_size):
-                salt = random.randbytes(32)
-                nonce = ising_nonce_from_block(prev_block.hash, node_info.miner_id, cur_index, salt)
-                h_next, J_next = generate_ising_model_from_nonce(nonce, nodes, edges)
-                next_batch_nonces.append(nonce)
-                next_batch_salts.append(salt)
-                next_batch_problems.append((h_next, J_next))
-
-            self.logger.debug(f"Next batch pregenerated while GPU was running")
-
-            # STEP 3: Wait for GPU to finish and get results
-            try:
-                batch_samplesets = gpu_result_queue.get(timeout=300)  # 5 minute timeout
-
-                # Check if GPU thread encountered an exception
-                if isinstance(batch_samplesets, Exception):
-                    raise batch_samplesets
-
-                sample_time = time.time() - sample_start
-                self.logger.debug(f"GPU batch completed: {sample_time:.2f}s for {actual_batch_size} problems")
-
-                # Estimate CUDA timing components
-                self.timing_stats['sampling'].append(sample_time * 1e6)  # Convert to microseconds
-                self.timing_stats['preprocessing'].append((time.time() - preprocess_start) * 1e6)
-
-            except Empty:
-                self.logger.error("GPU batch timeout - no results received")
-                if stop_event.is_set():
-                    return None
-                continue
-            except Exception as e:
-                if stop_event.is_set():
-                    self.logger.info("Interrupted during sampling")
-                    return None
-                self.logger.error(f"Sampling error: {e}")
-                continue
-
-            # Check if interrupted before processing results
-            if stop_event.is_set():
-                self.logger.info("Interrupted")
-                return None
-
-            # Track postprocessing time
-            postprocess_start = time.time()
-            self.current_stage = 'postprocessing'
-            self.current_stage_start = postprocess_start
-
-            # Evaluate all results from the batch
-            for nonce, salt, sampleset in zip(batch_nonces, batch_salts, batch_samplesets):
-                # Update sample counts
-                self.timing_stats['total_samples'] += len(sampleset.record.energy)
-                self.timing_stats['blocks_attempted'] += 1
-
-                result = self.evaluate_sampleset(sampleset, current_requirements, nodes, edges, nonce, salt, prev_timestamp, start_time)
-
-                if result:
-                    # Track postprocessing time
-                    self.timing_stats['postprocessing'].append((time.time() - postprocess_start) * 1e6)
-
-                    self.logger.info(f"[Block-{cur_index}] Mined! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., Min Energy: {result.energy:.2f}, Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Attempt Time: {result.mining_time:.2f}s, Total Mining Time: {time.time() - start_time:.2f}s")
-                    return result
-
-                # Update top samples with this one
-                self.update_top_samples(sampleset, nonce, salt, current_requirements)
-
-            # Track postprocessing time
-            self.timing_stats['postprocessing'].append((time.time() - postprocess_start) * 1e6)
-
-            progress += 1
-            total_nonces_evaluated += actual_batch_size
-
-            # Periodic progress report
-            current_time = time.time()
-            time_since_last_report = current_time - last_report_time
-
-            if time_since_last_report >= report_interval:
-                elapsed_total = current_time - start_time
-                nonces_since_last_report = total_nonces_evaluated - last_report_nonces
-                nonces_per_sec = nonces_since_last_report / time_since_last_report
-                avg_nonces_per_sec = total_nonces_evaluated / elapsed_total
-
-                best_energy = min(self.top_attempts[0].sampleset.record.energy) if self.top_attempts else float('inf')
-
-                self.logger.info(
-                    f"[Mining Stats] "
-                    f"Nonces: {total_nonces_evaluated} total, "
-                    f"{nonces_per_sec:.1f}/s recent, "
-                    f"{avg_nonces_per_sec:.1f}/s average | "
-                    f"Time: {elapsed_total:.1f}s | "
-                    f"Best energy: {best_energy:.0f}"
-                )
-
-                last_report_time = current_time
-                last_report_nonces = total_nonces_evaluated
+            self.logger.error(f"Error in persistent mining loop: {e}")
+        finally:
+            # Stop producer and consumer threads
+            producer_stop.set()
+            consumer_stop.set()
+            persistent_sampler.stop(drain=True)
+            producer.join(timeout=5.0)
+            consumer.join(timeout=5.0)
+            self.logger.info("Persistent mining stopped")
 
         self.logger.info("Stopping mining, no results found")
         return None

@@ -203,7 +203,9 @@ __global__ void cuda_sa_persistent_real(
 
     // Startup info (gated to block 0 only, once)
     if (tid == 0 && bid == 0) {
+#if DEBUG_KERNEL
         printf("[KERNEL] Persistent SA kernel started (num_blocks=%d, threads_per_block=%d)\n", gridDim.x, blockDim.x);
+#endif
         *kernel_state = STATE_IDLE;
         __threadfence_system();
     }
@@ -244,16 +246,23 @@ __global__ void cuda_sa_persistent_real(
             int slot = -1;
 
             // Wait for host to signal batch ready (host_writing_mutex == 1)
-            while (*host_writing_mutex != 1) {
-                __threadfence_system();
-                __nanosleep(1000);  // Wait for host to finish writing batch
+            while (true) {
+                __threadfence_system();  // Ensure we see host writes
+
+                // Force volatile read from memory
+                int signal = *(volatile int*)host_writing_mutex;
+                if (signal == 1) {
+                    break;  // Batch ready
+                }
 
                 // Check if we should exit
-                int control = *control_flag;
+                int control = *(volatile int*)control_flag;
                 if (control == CONTROL_STOP) {
                     exit_flag = 1;
                     break;
                 }
+
+                __nanosleep(1000);  // Wait for host to finish writing batch
             }
 
             if (!exit_flag) {
@@ -278,9 +287,9 @@ __global__ void cuda_sa_persistent_real(
                         if (head + 1 == tail) {
                             // We just picked up the last job - signal host it can write next batch
                             atomicCAS((int*)host_writing_mutex, 1, 0);
-                            if (DEBUG_KERNEL) {
-                                printf("[KERNEL] Block %d picked up last job (head=%d, tail=%d), signaling host\n", bid, head, tail);
-                            }
+#if DEBUG_KERNEL
+                            printf("[KERNEL] Block %d picked up last job (head=%d, tail=%d), signaling host\n", bid, head, tail);
+#endif
                         }
                     }
                 }
@@ -309,25 +318,27 @@ __global__ void cuda_sa_persistent_real(
                     __threadfence_system();
 
                     // Event-driven debug: print when job is successfully dequeued
+#if DEBUG_KERNEL
                     printf("[KERNEL] Block %d dequeued job_id=%d with num_reads=%d, num_betas=%d\n",
                            bid, shared_job.job_id, shared_job.num_reads, shared_job.num_betas);
+#endif
 
                     // One-time debug: verify CSR and h metadata for this job (on the block that dequeued)
-                    if (DEBUG_KERNEL) {
-                        int n = shared_job.N;
-                        const int* csr_row_ptr = shared_job.csr_row_ptr;
-                        const int* csr_col_ind = shared_job.csr_col_ind;
-                        const int8_t* csr_J_vals = shared_job.csr_J_vals;
-                        int nnz = csr_row_ptr[n] - csr_row_ptr[0];
-                        printf("[KERNEL] Dequeued job debug: h_ptr=%p h_size=%d N=%d | row_ptr[0]=%d row_ptr[n]=%d nnz=%d\n",
-                               shared_job.h, shared_job.h_size, n, csr_row_ptr[0], csr_row_ptr[n], nnz);
-                        if (n > 0) {
-                            int deg0 = csr_row_ptr[1] - csr_row_ptr[0];
-                            int deg_last = csr_row_ptr[n] - csr_row_ptr[n-1];
-                            printf("[KERNEL] Dequeued job debug: deg(first)=%d deg(last)=%d | first J=%d first col=%d\n",
-                                   deg0, deg_last, (int)csr_J_vals[0], csr_col_ind[0]);
-                        }
+#if DEBUG_KERNEL
+                    int n = shared_job.N;
+                    const int* csr_row_ptr = shared_job.csr_row_ptr;
+                    const int* csr_col_ind = shared_job.csr_col_ind;
+                    const int8_t* csr_J_vals = shared_job.csr_J_vals;
+                    int nnz = csr_row_ptr[n] - csr_row_ptr[0];
+                    printf("[KERNEL] Dequeued job debug: h_ptr=%p h_size=%d N=%d | row_ptr[0]=%d row_ptr[n]=%d nnz=%d\n",
+                           shared_job.h, shared_job.h_size, n, csr_row_ptr[0], csr_row_ptr[n], nnz);
+                    if (n > 0) {
+                        int deg0 = csr_row_ptr[1] - csr_row_ptr[0];
+                        int deg_last = csr_row_ptr[n] - csr_row_ptr[n-1];
+                        printf("[KERNEL] Dequeued job debug: deg(first)=%d deg(last)=%d | first J=%d first col=%d\n",
+                               deg0, deg_last, (int)csr_J_vals[0], csr_col_ind[0]);
                     }
+#endif
                 }
             }
         }
@@ -484,7 +495,9 @@ __global__ void cuda_sa_persistent_real(
         // OUTPUT CONTROLLER (Thread 0 on every block)
         if (has_job && tid == 0) {
             // Event-driven debug: print when output controller starts waiting
+#if DEBUG_KERNEL
             printf("[KERNEL] Block %d output controller: waiting for %d workers\n", bid, shared_job.num_reads);
+#endif
 
             // Wait for all workers to complete
             bool all_done = false;
@@ -536,7 +549,9 @@ __global__ void cuda_sa_persistent_real(
             my_output->ready = 1;
             __threadfence_system();
 
+#if DEBUG_KERNEL
             printf("[KERNEL] Block %d wrote result for job_id=%d, min_e=%.1f\n", bid, shared_job.job_id, min_e);
+#endif
 
             // Wait for host to collect (ready==2), then reset
             while (my_output->ready != 2) {

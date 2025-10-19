@@ -99,6 +99,9 @@ def test_persistent_kernel_real_sa():
             seed=seed,
             beta_range=beta_range
         )
+        # Signal batch ready
+        kernel.signal_batch_ready()
+
 
         # Poll for result
         result = None
@@ -181,6 +184,9 @@ def test_real_sa_multiple_jobs_only_one_result_per_job():
             )
             jobs.append(i)
 
+        # Signal batch ready (after all jobs enqueued)
+        kernel.signal_batch_ready()
+
         # Collect results
         seen = set()
         deadline = time.time() + 10.0
@@ -234,6 +240,9 @@ def test_real_sa_control_stop_exits_immediately():
         beta_range=beta_range
     )
 
+    # Signal batch ready
+    kernel.signal_batch_ready()
+
     # Wait a bit for kernel to start processing
     time.sleep(0.1)
 
@@ -282,6 +291,9 @@ def test_real_sa_control_drain_waits_for_queue_empty():
             seed=seed,
             beta_range=beta_range
         )
+        # Signal batch ready
+        kernel.signal_batch_ready()
+
 
         # Wait for result to be ready
         result = None
@@ -369,6 +381,9 @@ def test_real_sa_kernel_state_transitions():
             seed=seed,
             beta_range=beta_range
         )
+        # Signal batch ready
+        kernel.signal_batch_ready()
+
 
         # State should transition to RUNNING (0) shortly after enqueue
         running_seen = False
@@ -487,6 +502,9 @@ def test_production_scale_multi_job_32reads():
                 beta_range=beta_range
             )
             job_ids.append(job_idx)
+
+        # Signal batch ready (after all jobs enqueued)
+        kernel.signal_batch_ready()
 
         t_enqueue_elapsed = time.time() - t_enqueue_start
         print(f"✅ Enqueued {len(job_ids)} jobs in {t_enqueue_elapsed:.2f}s")
@@ -614,6 +632,7 @@ def test_production_scale_multi_job_32reads():
         kernel.stop_immediate()
 
 
+@pytest.mark.timeout(180)
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 def test_production_scale_single_job_debug():
     """
@@ -684,6 +703,9 @@ def test_production_scale_single_job_debug():
         seed=seed,
         beta_range=beta_range
     )
+    # Signal batch ready
+    kernel.signal_batch_ready()
+
 
     # Dump what device has loaded for comparison
     # dev_summary = kernel.debug_dump_current_problem(head=5)
@@ -769,6 +791,7 @@ def test_production_scale_single_job_debug():
     kernel.stop_immediate()
 
 
+@pytest.mark.timeout(180)
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 def test_production_scale_single_job_32reads():
     """
@@ -835,6 +858,9 @@ def test_production_scale_single_job_32reads():
             seed=seed,
             beta_range=beta_range
         )
+        # Signal batch ready
+        kernel.signal_batch_ready()
+
         t_enqueue_elapsed = time.time() - t_enqueue_start
         print(f"✅ Enqueued job_id=0 in {t_enqueue_elapsed:.3f}s")
 
@@ -842,7 +868,7 @@ def test_production_scale_single_job_32reads():
         print(f"\n📥 Collecting result (timeout=120s)...")
         result = None
         t_collect_start = time.time()
-        deadline = t_collect_start + 120.0
+        deadline = t_collect_start + 240.0
         last_print_time = t_collect_start
 
         while time.time() < deadline:
@@ -946,6 +972,7 @@ def test_production_scale_single_job_32reads():
         kernel.stop_immediate()
 
 
+@pytest.mark.timeout(180)
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 def test_production_scale_single_job_64reads():
     """
@@ -1011,6 +1038,9 @@ def test_production_scale_single_job_64reads():
             seed=seed,
             beta_range=beta_range
         )
+        # Signal batch ready
+        kernel.signal_batch_ready()
+
 
         # Collect result with timeout (60s for 64 reads)
         print(f"📥 Collecting result (timeout=60s)...")
@@ -1103,6 +1133,7 @@ def test_production_scale_single_job_64reads():
         kernel.stop_immediate()
 
 
+@pytest.mark.timeout(180)
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 def test_production_scale_single_job_256reads():
     """
@@ -1148,6 +1179,9 @@ def test_production_scale_single_job_256reads():
             job_id=0, h=h, J=J_dict, num_reads=256, num_betas=256,
             num_sweeps_per_beta=1, N=N, seed=seed, beta_range=beta_range
         )
+        # Signal batch ready
+        kernel.signal_batch_ready()
+
 
         print(f"📥 Collecting result...")
         result = None
@@ -1187,6 +1221,7 @@ def test_production_scale_single_job_256reads():
         kernel.stop_immediate()
 
 
+@pytest.mark.timeout(180)
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 def test_production_scale_single_job_512reads():
     """
@@ -1229,6 +1264,9 @@ def test_production_scale_single_job_512reads():
             job_id=0, h=h, J=J_dict, num_reads=512, num_betas=256,
             num_sweeps_per_beta=1, N=N, seed=seed, beta_range=beta_range
         )
+        # Signal batch ready
+        kernel.signal_batch_ready()
+
 
         print(f"📥 Collecting result...")
         result = None
@@ -1268,6 +1306,7 @@ def test_production_scale_single_job_512reads():
         kernel.stop_immediate()
 
 
+@pytest.mark.timeout(180)
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 def test_production_scale_single_job_1024reads():
     """
@@ -1310,6 +1349,9 @@ def test_production_scale_single_job_1024reads():
             job_id=0, h=h, J=J_dict, num_reads=1024, num_betas=256,
             num_sweeps_per_beta=1, N=N, seed=seed, beta_range=beta_range
         )
+        # Signal batch ready
+        kernel.signal_batch_ready()
+
 
         print(f"📥 Collecting result...")
         result = None

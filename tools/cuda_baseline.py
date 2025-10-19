@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CUDA GPU baseline parameter testing tool."""
+"""CUDA GPU baseline parameter testing tool using persistent kernel."""
 import argparse
 import sys
 import time
@@ -10,51 +10,58 @@ import random
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
+import numpy as np
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evaluate_sampleset, calculate_diversity
 from shared.block_requirements import BlockRequirements
+from dwave_topologies import DEFAULT_TOPOLOGY
 
 try:
-    from GPU.cuda_sa import CudaSASampler
+    from GPU.cuda_kernel import CudaKernelRealSA
+    from GPU.cuda_sa import CudaSASamplerAsync, CudaKernelAdapter
     CUDA_AVAILABLE = True
 except ImportError:
     CUDA_AVAILABLE = False
 
 
-def cuda_baseline_test(timeout_minutes=10.0, output_file=None):
-    """Test CUDA GPU performance with CPU baseline format and evaluation logic."""
-    print("🔬 CUDA GPU Baseline Parameter Test (CuPy RawKernel)")
-    print("=" * 50)
+def cuda_baseline_test(timeout_minutes=10.0, output_file=None, light_only=False):
+    """Test CUDA GPU performance using CudaSASamplerAsync."""
+    print("🔬 CUDA GPU Baseline Parameter Test (CudaSASamplerAsync)")
+    print("=" * 60)
     print(f"⏰ Timeout: {timeout_minutes} minutes")
 
-    # Initialize CUDA SA sampler
-    cuda_sampler = None
-    sampler_type = "unknown"
-
-    if CUDA_AVAILABLE:
-        try:
-            cuda_sampler = CudaSASampler()
-            nodes = cuda_sampler.nodes
-            edges = cuda_sampler.edges
-            sampler_type = "cuda-sa"
-            print("✅ CUDA SA sampler ready (CuPy RawKernel)")
-        except Exception as e:
-            print(f"⚠️ CUDA SA sampler failed: {e}")
-            cuda_sampler = None
-
-    if cuda_sampler is None:
-        try:
-            cuda_sampler = OptimizedChunkCUDASampler("mps")
-            nodes = cuda_sampler.nodes
-            edges = cuda_sampler.edges
-            sampler_type = "optimized-chunks"
-            print("✅ CUDA optimized sampler ready (PyTorch MPS fallback)")
-        except Exception as e:
-            print(f"❌ CUDA optimized failed: {e}")
-            return None
-    
-    if cuda_sampler is None:
-        print("❌ No CUDA samplers available")
+    if not CUDA_AVAILABLE:
+        print("❌ CUDA not available")
         return None
+
+    try:
+        print("📦 Initializing CUDA sampler...")
+        # Use larger ring size to support many parallel jobs
+        # Max jobs = num_SMs * jobs_per_SM = ~48 * 4 = 192 for small jobs
+        # Disable verbose output for production use
+        kernel = CudaKernelRealSA(
+            ring_size=256,
+            max_threads_per_job=256,
+            max_N=5000,
+            debug_verbose=0,
+            debug_kernel=0,
+            debug_workers=0,
+            verbose=False
+        )
+        adapter = CudaKernelAdapter(kernel)
+        sampler = CudaSASamplerAsync(adapter)
+        print("✅ CUDA sampler ready")
+    except Exception as e:
+        print(f"❌ CUDA sampler initialization failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+    # Use production topology (same as CPU baseline)
+    nodes = list(DEFAULT_TOPOLOGY.graph.nodes)
+    edges = list(DEFAULT_TOPOLOGY.graph.edges)
+    sampler_type = "persistent-kernel"
+
+    print(f"📊 Using production topology: {len(nodes)} nodes, {len(edges)} edges")
     
     # Initial problem setup to show problem size
     seed = 12345  # Fixed seed for reproducible results
@@ -70,9 +77,13 @@ def cuda_baseline_test(timeout_minutes=10.0, output_file=None):
         (4096, 200, "Very High CUDA"),
         (8192, 200, "Max CUDA")
     ]
-    
+
+    # If light_only, only run the first test
+    if light_only:
+        test_configs = test_configs[:1]
+
     print(f"\n🧪 Testing CUDA configurations:")
-    
+
     results = {
         'timeout_minutes': timeout_minutes,
         'sampler_type': sampler_type,
@@ -83,39 +94,113 @@ def cuda_baseline_test(timeout_minutes=10.0, output_file=None):
         },
         'tests': []
     }
-    
+
     timeout_seconds = timeout_minutes * 60
     total_start_time = time.time()
-    
+
+    # Query GPU capabilities
+    num_sms = sampler.get_num_sms()
+    print(f"🔧 GPU has {num_sms} streaming multiprocessors (SMs)")
+
     for sweeps, reads, desc in test_configs:
         elapsed_total = time.time() - total_start_time
         if elapsed_total > timeout_seconds:
             print(f"\n⏰ Total timeout ({timeout_minutes} min) reached, stopping")
             break
-            
-        print(f"\n{desc}: {sweeps} sweeps, {reads} reads")
-        
+
+        # Batch size = number of SMs (each SM processes one job at a time)
+        # The persistent kernel has 48 blocks (1 per SM), and blocks process jobs sequentially
+        num_models = num_sms
+        problem_size = len(nodes)
+
+        print(f"\n{desc}: {sweeps} sweeps, {reads} reads, {num_models} models in parallel ({problem_size} nodes)")
+
         try:
-            # Generate the Ising model first (like the real miners do)
-            nonce = random.randint(0, 2**32 - 1)
-            h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+            # Generate multiple Ising problems
+            h_list = []
+            J_list = []
+            nonces = []
+
+            for _ in range(num_models):
+                nonce = random.randint(0, 2**32 - 1)
+                nonces.append(nonce)
+                h_dict, J_dict = generate_ising_model_from_nonce(nonce, nodes, edges)
+
+                # Compute N as max node ID + 1 (topology has sparse node IDs: 4593 nodes numbered 0-4799)
+                N = max(max(nodes), max(max(i, j) for i, j in edges)) + 1
+
+                # Convert h_dict to array indexed directly by node ID (NO remapping needed!)
+                # This ensures alignment with edge node IDs
+                h = np.zeros(N, dtype=np.float32)
+                for node, val in h_dict.items():
+                    h[node] = val
+
+                # Convert J_dict to array indexed by edges
+                J = np.zeros(len(edges), dtype=np.float32)
+                edge_to_idx = {edge: idx for idx, edge in enumerate(edges)}
+                for (i, j), val in J_dict.items():
+                    if (i, j) in edge_to_idx:
+                        J[edge_to_idx[(i, j)]] = val
+                    elif (j, i) in edge_to_idx:
+                        J[edge_to_idx[(j, i)]] = val
+
+                h_list.append(h)
+                J_list.append(J)
 
             start_time = time.time()
-            sampleset = cuda_sampler.sample_ising(
-                h=h, J=J,
-                num_reads=reads,
-                num_sweeps=sweeps
-            )
-            runtime = time.time() - start_time
 
+            # Use sample_ising API (synchronous, returns list of SampleSets)
+            samplesets = sampler.sample_ising(
+                h_list=h_list,
+                J_list=J_list,
+                num_reads=reads,
+                num_betas=sweeps,
+                num_sweeps_per_beta=1,
+                edges=edges
+            )
+
+            runtime = time.time() - start_time
+            throughput = num_models / runtime  # models per second
+
+            # Collect stats from all models
+            all_min_energies = []
+            all_avg_energies = []
+            for sampleset in samplesets:
+                energies = list(sampleset.record.energy)
+                all_min_energies.append(float(min(energies)))
+                all_avg_energies.append(float(sum(energies) / len(energies)))
+
+            # Use first sampleset for detailed analysis
+            sampleset = samplesets[0]
+
+            # Extract energies from sampleset
             energies = list(sampleset.record.energy)
             min_energy = float(min(energies))
             avg_energy = float(sum(energies) / len(energies))
             std_energy = float((sum((e - avg_energy)**2 for e in energies) / len(energies)) ** 0.5)
 
-            print(f"  ⏱️  {runtime/60:.1f} min ({runtime:.1f}s)")
-            print(f"  🎯 min_energy = {min_energy:.1f}")
-            print(f"  📊 avg_energy = {avg_energy:.1f} (±{std_energy:.1f})")
+            print(f"  ⏱️  {runtime:.2f}s ({num_models} models)")
+            print(f"  🚀 Throughput: {throughput:.2f} models/second")
+            print(f"  🎯 Best energy: {min(all_min_energies):.1f} (across {num_models} models)")
+            print(f"  📊 Avg energy (first model): {avg_energy:.1f} (±{std_energy:.1f})")
+
+            # Filter samples to only include actual topology nodes
+            # Samples have length N=4800 (max node ID + 1) but only 4593 nodes exist
+            # We need to extract only the values at the actual node indices
+            filtered_samples = []
+            for sample in sampleset.record.sample:
+                # Extract only the values at node indices that exist in the topology
+                filtered_sample = np.array([sample[node] for node in nodes], dtype=np.int8)
+                filtered_samples.append(filtered_sample)
+
+            # Create new SampleSet with filtered samples (correct length for validation)
+            import dimod
+            filtered_sampleset = dimod.SampleSet.from_samples(
+                filtered_samples,
+                vartype='SPIN',
+                energy=sampleset.record.energy,
+                info=sampleset.info
+            )
 
             # Use evaluate_sampleset to get diversity and num_solutions (same as CPU)
             requirements = BlockRequirements(
@@ -125,13 +210,13 @@ def cuda_baseline_test(timeout_minutes=10.0, output_file=None):
                 timeout_to_difficulty_adjustment_decay=600  # 10 minutes
             )
 
-            # Use the same nonce and generate test salt for evaluation
+            # Use the nonce and generate test salt for evaluation
             salt = b"test_salt_cuda_baseline"
             prev_timestamp = int(time.time()) - 600  # 10 minutes ago
 
-            # Evaluate the sampleset
+            # Evaluate the filtered sampleset
             mining_result = evaluate_sampleset(
-                sampleset, requirements, nodes, edges, nonce, salt,
+                filtered_sampleset, requirements, nodes, edges, nonces[0], salt,
                 prev_timestamp, start_time, f"cuda-baseline-{sweeps}-{reads}", "CUDA"
             )
 
@@ -140,8 +225,8 @@ def cuda_baseline_test(timeout_minutes=10.0, output_file=None):
             meets_requirements = False
 
             # Calculate diversity of top 10 solutions by energy (same as CPU)
-            solutions = list(sampleset.record.sample)
-            energies = list(sampleset.record.energy)
+            solutions = list(filtered_sampleset.record.sample)
+            energies = list(filtered_sampleset.record.energy)
 
             # Sort solutions by energy and take top 10
             solution_energy_pairs = list(zip(solutions, energies))
@@ -222,7 +307,10 @@ def cuda_baseline_test(timeout_minutes=10.0, output_file=None):
         with open(output_file, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"\n💾 Results saved to {output_file}")
-    
+
+    # Stop the persistent kernel
+    kernel.stop_immediate()
+
     return results
 
 
@@ -230,8 +318,8 @@ def main():
     """Main function with command line argument parsing."""
     parser = argparse.ArgumentParser(description='CUDA GPU baseline parameter testing tool')
     parser.add_argument(
-        '--timeout', '-t', 
-        type=float, 
+        '--timeout', '-t',
+        type=float,
         default=10.0,
         help='Timeout in minutes (default: 10.0)'
     )
@@ -247,12 +335,22 @@ def main():
     )
     parser.add_argument(
         '--extended',
-        action='store_true', 
+        action='store_true',
         help='Extended test mode (30 minute timeout)'
     )
-    
+    parser.add_argument(
+        '--light-only',
+        action='store_true',
+        help='Only run the Light CUDA test and exit'
+    )
     args = parser.parse_args()
-    
+
+    # Generate default output filename if not specified
+    output_file = args.output
+    if not output_file:
+        timestamp = int(time.time())
+        output_file = f"cuda_baseline_results_{timestamp}.json"
+
     # Handle preset timeouts
     if args.quick:
         timeout = 3.0
@@ -260,15 +358,13 @@ def main():
         timeout = 30.0
     else:
         timeout = args.timeout
-    
-    # Generate default output filename if not specified
-    output_file = args.output
-    if not output_file:
-        timestamp = int(time.time())
-        output_file = f"cuda_baseline_results_{timestamp}.json"
-    
-    # Run test
-    cuda_baseline_test(timeout_minutes=timeout, output_file=output_file)
+
+    # Run baseline test
+    cuda_baseline_test(
+        timeout_minutes=timeout,
+        output_file=output_file,
+        light_only=args.light_only
+    )
 
     print(f"\n✅ CUDA baseline test complete!")
 

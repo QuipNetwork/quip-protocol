@@ -471,7 +471,8 @@ class CudaKernelRealSA:
 
     def __init__(self, ring_size: int = 16, max_threads_per_job: int = 256,
                  max_h_size: int = 10000, max_J_size: int = 100000, max_N: int = 4600,
-                 debug_verbose: int = 0, debug_kernel: int = 0, debug_workers: int = 0):
+                 debug_verbose: int = 0, debug_kernel: int = 0, debug_workers: int = 0,
+                 verbose: bool = True):
         """
         Initialize persistent CUDA kernel with real SA.
 
@@ -484,9 +485,11 @@ class CudaKernelRealSA:
             debug_verbose: Enable DEBUG_VERBOSE (0 or 1)
             debug_kernel: Enable DEBUG_KERNEL (0 or 1)
             debug_workers: Enable DEBUG_WORKERS (0 or 1)
+            verbose: Enable Python print statements (default True)
         """
         self.ring_size = ring_size
         self.max_threads_per_job = max_threads_per_job
+        self.verbose = verbose
         self.max_h_size = max_h_size
         self.max_J_size = max_J_size
         self.max_N = max_N
@@ -620,13 +623,18 @@ class CudaKernelRealSA:
         # Each enqueue_job() will allocate new GPU memory and add it here
         self._job_data_refs = []
 
+        # Track current batch state
+        self._batch_start_tail = 0  # Tail value at start of current batch
+        self._batch_job_count = 0   # Number of jobs in current batch
+
         # Delta energy workspace (one slice per global thread across all blocks)
         workspace_capacity = max_N
         self.d_delta_energy_workspace = cp.zeros(self.num_blocks * max_threads_per_job * workspace_capacity, dtype=cp.int8)
 
         # Launch kernel (no global CSR arrays - each job has its own)
         self.stream = cp.cuda.Stream(non_blocking=True)
-        print(f"[PYTHON] Launching kernel with {self.num_blocks} blocks, {max_threads_per_job} threads/block", flush=True)
+        if self.verbose:
+            print(f"[PYTHON] Launching kernel with {self.num_blocks} blocks, {max_threads_per_job} threads/block", flush=True)
         self.kernel(
             (self.num_blocks,), (max_threads_per_job,),
             (
@@ -647,7 +655,8 @@ class CudaKernelRealSA:
             ),
             stream=self.stream
         )
-        print(f"[PYTHON] Kernel launched successfully", flush=True)
+        if self.verbose:
+            print(f"[PYTHON] Kernel launched successfully", flush=True)
 
     @staticmethod
     def _get_sm_count() -> int:
@@ -681,6 +690,12 @@ class CudaKernelRealSA:
             seed: RNG seed for reproducibility (if None, uses random seed)
             beta_range: (hot_beta, cold_beta) tuple or None for auto-compute from problem
         """
+        # Validate num_reads doesn't exceed thread capacity
+        if num_reads > self.max_threads_per_job:
+            raise ValueError(
+                f"num_reads={num_reads} exceeds max_threads_per_job={self.max_threads_per_job}. "
+                f"Each job can have at most {self.max_threads_per_job} reads."
+            )
         if h is None:
             h = {}
         if J is None:
@@ -816,6 +831,13 @@ class CudaKernelRealSA:
         # CRITICAL SECTION: Reserve slot and write pointer
         # Lock prevents multiple Python threads from getting same slot
         with self._enqueue_lock:
+            # Check if adding this job would overflow the ring buffer
+            if self._batch_job_count >= self.ring_size:
+                raise RuntimeError(
+                    f"Batch overflow: cannot enqueue more than {self.ring_size} jobs without calling signal_batch_ready(). "
+                    f"Current batch has {self._batch_job_count} jobs."
+                )
+
             # Wait for GPU to finish previous batch (signal == 0)
             wait_count = 0
             while self.h_host_writing_mutex[0] != 0:
@@ -835,18 +857,113 @@ class CudaKernelRealSA:
             # Increment tail (but don't signal yet - wait for batch complete)
             self.h_input_tail[0] = tail + 1
 
+            # Track batch state
+            self._batch_job_count += 1
+
             # Store for signal_batch_ready() call
             self._last_enqueued_slot = slot
             self._last_enqueued_tail = tail + 1
 
-        print(f"[PYTHON] Enqueued job_id={job_id}, num_reads={num_reads}, slot={slot}, tail={tail}->{tail+1}, ptr=0x{jobdesc_ptr:x}", flush=True)
+        if self.verbose:
+            print(f"[PYTHON] Enqueued job_id={job_id}, num_reads={num_reads}, slot={slot}, tail={tail}->{tail+1}, batch={self._batch_job_count}/{self.ring_size}, ptr=0x{jobdesc_ptr:x}", flush=True)
 
     def signal_batch_ready(self):
         """Signal to GPU that a batch of jobs is ready to be dequeued."""
         with self._enqueue_lock:
+            if self._batch_job_count == 0:
+                if self.verbose:
+                    print(f"[PYTHON] Warning: signal_batch_ready() called with no jobs in batch", flush=True)
+                return
+
             # Set signal to 1 to tell GPU batch is ready
             self.h_host_writing_mutex[0] = 1
-            print(f"[PYTHON] Signaled batch ready (tail={self.h_input_tail[0]})", flush=True)
+
+            # Force the write to commit by reading it back
+            # This ensures the value is visible to the GPU
+            readback = int(self.h_host_writing_mutex[0])
+            assert readback == 1, f"Signal write failed: expected 1, got {readback}"
+
+            if self.verbose:
+                print(f"[PYTHON] Signaled batch ready ({self._batch_job_count} jobs, tail={self.h_input_tail[0]})", flush=True)
+
+            # Reset batch counter for next batch
+            self._batch_start_tail = int(self.h_input_tail[0])
+            self._batch_job_count = 0
+
+    def signal_batch_notready(self):
+        """Signal to GPU to pause processing while host writes more jobs.
+
+        This allows the host to safely reset the signal and write additional jobs
+        to the ring buffer when space becomes available.
+        """
+        import time
+        with self._enqueue_lock:
+            # Only reset if currently signaled as ready
+            if self.h_host_writing_mutex[0] == 1:
+                self.h_host_writing_mutex[0] = 0
+
+                # Force the write to commit
+                readback = int(self.h_host_writing_mutex[0])
+                assert readback == 0, f"Signal write failed: expected 0, got {readback}"
+
+                if self.verbose:
+                    print(f"[PYTHON] Signaled batch not ready, waiting 200ms for GPU to pause", flush=True)
+
+                # Wait for GPU to see the signal and stop dequeuing
+                time.sleep(0.2)  # 200ms as requested
+
+    def enqueue_batch_streaming(self, jobs: list):
+        """Enqueue multiple jobs with automatic batching and streaming.
+
+        This implements the logic:
+        - If ringbuf not full, enqueue jobs up to ringbuf capacity
+        - If signal_ready, call signal_batch_notready() and wait 200ms
+        - Signal batch ready when batch is full or no more jobs
+        - If more jobs remain, poll until ringbuffer empties, then repeat
+
+        Args:
+            jobs: List of job specifications, each is a dict with keys:
+                  'job_id', 'h', 'J', 'num_reads', 'num_betas', 'num_sweeps_per_beta',
+                  and optionally 'N', 'seed', 'beta_range'
+        """
+        import time
+
+        jobs_remaining = list(jobs)  # Make a copy
+
+        while jobs_remaining:
+            # If signal is ready (GPU is processing), reset it to safely add more jobs
+            if self.h_host_writing_mutex[0] == 1:
+                self.signal_batch_notready()
+
+            # Enqueue jobs until ring buffer is full or no more jobs
+            batch_count = 0
+            while jobs_remaining and self._batch_job_count < self.ring_size:
+                job = jobs_remaining.pop(0)
+                self.enqueue_job(
+                    job_id=job['job_id'],
+                    h=job.get('h'),
+                    J=job.get('J'),
+                    num_reads=job['num_reads'],
+                    num_betas=job.get('num_betas', 256),
+                    num_sweeps_per_beta=job.get('num_sweeps_per_beta', 1),
+                    N=job.get('N'),
+                    seed=job.get('seed'),
+                    beta_range=job.get('beta_range')
+                )
+                batch_count += 1
+
+            # Signal batch ready to enable GPU processing
+            if batch_count > 0:
+                self.signal_batch_ready()
+
+            # If more jobs remain, poll until ring buffer has space
+            if jobs_remaining:
+                if self.verbose:
+                    print(f"[PYTHON] Waiting for ring buffer to empty ({len(jobs_remaining)} jobs remaining)...", flush=True)
+                while self.h_host_writing_mutex[0] != 0:
+                    time.sleep(0.01)  # Poll every 10ms
+                if self.verbose:
+                    print(f"[PYTHON] Ring buffer ready for next batch", flush=True)
 
     def try_dequeue_result(self) -> Optional[Dict]:
         """Poll all output slots for a ready result (non-blocking)."""
@@ -934,6 +1051,19 @@ class CudaKernelRealSA:
     def get_kernel_state(self) -> int:
         """Get current kernel state (0=STATE_RUNNING, 1=STATE_IDLE)."""
         return int(self.h_kernel_state[0])
+
+    def get_ring_buffer_state(self) -> dict:
+        """Get current ring buffer state for diagnostics."""
+        # Note: head is in device memory, need to copy to host
+        head_val = int(self.d_input_head_arr.get()[0])
+        return {
+            'head': head_val,
+            'tail': int(self.h_input_tail[0]),
+            'mutex': int(self.h_host_writing_mutex[0]),
+            'batch_job_count': self._batch_job_count,
+            'ring_size': self.ring_size,
+            'kernel_state': int(self.h_kernel_state[0])
+        }
 
     def get_samples(self, result: Dict) -> np.ndarray:
         """Get samples from result."""
