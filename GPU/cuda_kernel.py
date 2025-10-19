@@ -470,7 +470,8 @@ class CudaKernelRealSA:
     """Persistent CUDA kernel with real simulated annealing algorithm."""
 
     def __init__(self, ring_size: int = 16, max_threads_per_job: int = 256,
-                 max_h_size: int = 10000, max_J_size: int = 100000, max_N: int = 4600):
+                 max_h_size: int = 10000, max_J_size: int = 100000, max_N: int = 4600,
+                 debug_verbose: int = 0, debug_kernel: int = 0, debug_workers: int = 0):
         """
         Initialize persistent CUDA kernel with real SA.
 
@@ -480,6 +481,9 @@ class CudaKernelRealSA:
             max_h_size: Maximum size of h array
             max_J_size: Maximum size of J array
             max_N: Maximum number of variables
+            debug_verbose: Enable DEBUG_VERBOSE (0 or 1)
+            debug_kernel: Enable DEBUG_KERNEL (0 or 1)
+            debug_workers: Enable DEBUG_WORKERS (0 or 1)
         """
         self.ring_size = ring_size
         self.max_threads_per_job = max_threads_per_job
@@ -493,11 +497,20 @@ class CudaKernelRealSA:
         # Thread safety for enqueue operations
         self._enqueue_lock = threading.Lock()
 
+        # Build compile options with debug flags
+        options = ['--use_fast_math', '--maxrregcount=64']
+        if debug_verbose:
+            options.append('-DDEBUG_VERBOSE=1')
+        if debug_kernel:
+            options.append('-DDEBUG_KERNEL=1')
+        if debug_workers:
+            options.append('-DDEBUG_WORKERS=1')
+
         # Compile kernel with fast math optimizations
         # Note: NVRTC doesn't support -O3, uses --use_fast_math instead
         self.module = cp.RawModule(
             code=self._load_kernel_code(),
-            options=('--use_fast_math', '--maxrregcount=64')
+            options=tuple(options)
         )
         self.kernel = self.module.get_function('cuda_sa_persistent_real')
 
@@ -563,6 +576,9 @@ class CudaKernelRealSA:
         self.d_input_ring_ptrs = cp.ndarray(ring_size, dtype=cp.uint64,
                                              memptr=cp.cuda.MemoryPointer(cp.cuda.UnownedMemory(self.d_input_ring_ptr.value, ring_bytes, self), 0))
 
+        # Allocate host_writing_mutex (1 when Python is writing, 0 otherwise)
+        self.h_host_writing_mutex_ptr, self.d_host_writing_mutex_ptr, self.h_host_writing_mutex, self.d_host_writing_mutex_arr = _alloc_mapped_int32()
+
         self.h_input_tail_ptr, self.d_input_tail_ptr, self.h_input_tail, self.d_input_tail_arr = _alloc_mapped_int32()
         self.h_control_flag_ptr, self.d_control_flag_ptr, self.h_control_flag, self.d_control_flag_arr = _alloc_mapped_int32()
         self.h_kernel_state_ptr, self.d_kernel_state_ptr, self.h_kernel_state, self.d_kernel_state_arr = _alloc_mapped_int32()
@@ -571,6 +587,7 @@ class CudaKernelRealSA:
         self.h_input_tail[0] = 0
         self.h_control_flag[0] = 0
         self.h_kernel_state[0] = 1
+        self.h_host_writing_mutex[0] = 0  # Not writing initially
 
         # Head is device-only (kernel updates it with atomicCAS)
         self.d_input_head_arr = cp.zeros(1, dtype=cp.int32)
@@ -613,10 +630,11 @@ class CudaKernelRealSA:
         self.kernel(
             (self.num_blocks,), (max_threads_per_job,),
             (
-                self.d_input_ring_ptrs,  # Changed: now array of pointers
+                self.d_input_ring_ptrs,  # Array of pointers to JobDesc
                 self.ring_size,
-                self.d_input_head_arr,  # Now mapped memory, so kernel can update it
-                self.d_input_tail_arr,
+                self.d_input_head_arr,  # Device-only atomic counter
+                self.d_input_tail_arr,  # Mapped memory (host writes, kernel reads)
+                self.d_host_writing_mutex_arr,  # Mutex: 1=host writing, 0=idle
                 self.d_output_slots_bytes,
                 self.d_control_flag_arr,
                 self.d_kernel_state_arr,
@@ -795,22 +813,40 @@ class CudaKernelRealSA:
         }
         self._job_data_refs.append(job_data)
 
-        # CRITICAL SECTION: Atomically reserve slot and write pointer
-        # Lock prevents multiple threads from getting same slot
+        # CRITICAL SECTION: Reserve slot and write pointer
+        # Lock prevents multiple Python threads from getting same slot
         with self._enqueue_lock:
+            # Wait for GPU to finish previous batch (signal == 0)
+            wait_count = 0
+            while self.h_host_writing_mutex[0] != 0:
+                import time
+                time.sleep(0.001)  # 1ms
+                wait_count += 1
+                if wait_count > 10000:  # 10 second timeout
+                    raise RuntimeError("Timeout waiting for GPU to finish previous batch")
+
             # Read current tail
             tail = int(self.h_input_tail[0])
             slot = tail % self.ring_size
 
             # Write pointer to HOST side of mapped ring buffer
-            # This write is immediately visible to GPU kernel
             self.h_input_ring_ptrs[slot] = jobdesc_ptr
 
-            # Increment tail to make job visible
-            # Kernel will see both the pointer and tail update
+            # Increment tail (but don't signal yet - wait for batch complete)
             self.h_input_tail[0] = tail + 1
 
+            # Store for signal_batch_ready() call
+            self._last_enqueued_slot = slot
+            self._last_enqueued_tail = tail + 1
+
         print(f"[PYTHON] Enqueued job_id={job_id}, num_reads={num_reads}, slot={slot}, tail={tail}->{tail+1}, ptr=0x{jobdesc_ptr:x}", flush=True)
+
+    def signal_batch_ready(self):
+        """Signal to GPU that a batch of jobs is ready to be dequeued."""
+        with self._enqueue_lock:
+            # Set signal to 1 to tell GPU batch is ready
+            self.h_host_writing_mutex[0] = 1
+            print(f"[PYTHON] Signaled batch ready (tail={self.h_input_tail[0]})", flush=True)
 
     def try_dequeue_result(self) -> Optional[Dict]:
         """Poll all output slots for a ready result (non-blocking)."""

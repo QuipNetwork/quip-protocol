@@ -10,10 +10,19 @@ typedef unsigned int uint;
 #define STATE_RUNNING 0
 #define STATE_IDLE 1
 
-// Debug flags
-#define DEBUG_KERNEL 1
+// Debug flags (can be overridden via -D compiler flags from Python)
+// These defaults are used when not specified at compile time.
+// To enable debug output, pass debug_verbose=1, debug_kernel=1, or debug_workers=1
+// to CudaKernelRealSA constructor in cuda_kernel.py
+#ifndef DEBUG_KERNEL
+#define DEBUG_KERNEL 0
+#endif
+#ifndef DEBUG_WORKERS
 #define DEBUG_WORKERS 0  // Disabled in hot paths for performance
-#define DEBUG_VERBOSE 0  // Disabled - very expensive printf in SA loop
+#endif
+#ifndef DEBUG_VERBOSE
+#define DEBUG_VERBOSE 0 // Disabled - very expensive printf in SA loop
+#endif
 
 // Fast math constants
 #define RNG_SCALE 2.32830643653869628906e-10f  // 1.0f / 2^32
@@ -175,6 +184,7 @@ __global__ void cuda_sa_persistent_real(
     int input_ring_size,
     volatile int* input_head,
     volatile int* input_tail,
+    volatile int* host_writing_mutex,   // Mutex: 1 when host is writing, 0 otherwise
     OutputSlot* output_slots,           // Per-block output slots
     volatile int* control_flag,
     volatile int* kernel_state,         // STATE_RUNNING or STATE_IDLE
@@ -228,38 +238,61 @@ __global__ void cuda_sa_persistent_real(
             int control_top = *control_flag;
             if (control_top == CONTROL_STOP) {
                 exit_flag = 1;
-            } else if (control_top == CONTROL_DRAIN) {
-                int head_top = *input_head;
-                int tail_top = *input_tail;
-                // DRAIN just processes queue, doesn't exit
             }
 
-            // Try dequeue using atomic CAS (with mutex to prevent race with Python)
+            // Try dequeue using atomic CAS
             int slot = -1;
 
-            // Acquire mutex
-            while (atomicCAS(&dequeue_mutex, 0, 1) != 0) {
-                __nanosleep(1000);  // Spin with small sleep
-            }
-
-            // Critical section: read head/tail and atomicCAS
-            int head = *input_head;
-            int tail = *input_tail;
-
-            if (head != tail) {
+            // Wait for host to signal batch ready (host_writing_mutex == 1)
+            while (*host_writing_mutex != 1) {
                 __threadfence_system();
-                int observed = atomicCAS((int*)input_head, head, head + 1);
-                if (observed == head) {
-                    slot = head % input_ring_size;
+                __nanosleep(1000);  // Wait for host to finish writing batch
+
+                // Check if we should exit
+                int control = *control_flag;
+                if (control == CONTROL_STOP) {
+                    exit_flag = 1;
+                    break;
                 }
             }
 
-            // Release mutex
-            dequeue_mutex = 0;
-            __threadfence_system();
+            if (!exit_flag) {
+                // Acquire GPU-side dequeue mutex
+                while (atomicCAS(&dequeue_mutex, 0, 1) != 0) {
+                    __nanosleep(1000);  // Spin with small sleep
+                }
+
+                // Critical section: read head/tail and atomicCAS
+                __threadfence_system();  // Ensure we see host writes
+                int head = *(volatile int*)input_head;
+                int tail = *(volatile int*)input_tail;
+
+                if (head != tail) {
+                    // Jobs available - claim one atomically
+                    int observed = atomicCAS((int*)input_head, head, head + 1);
+                    if (observed == head) {
+                        // Successfully claimed job at position head
+                        slot = head % input_ring_size;
+
+                        // Check if this was the last job in the batch
+                        if (head + 1 == tail) {
+                            // We just picked up the last job - signal host it can write next batch
+                            atomicCAS((int*)host_writing_mutex, 1, 0);
+                            if (DEBUG_KERNEL) {
+                                printf("[KERNEL] Block %d picked up last job (head=%d, tail=%d), signaling host\n", bid, head, tail);
+                            }
+                        }
+                    }
+                }
+
+                // Release GPU-side mutex
+                dequeue_mutex = 0;
+                __threadfence_system();
+            }
 
             if (slot != -1) {
-                // Read pointer from ring buffer (atomic 64-bit read)
+                // Read pointer from ring buffer
+                // Safe because host_writing_mutex ensures Python isn't writing
                 unsigned long long jobdesc_ptr = input_ring_ptrs[slot];
 
                 // Dereference pointer to get JobDesc
