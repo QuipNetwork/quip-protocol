@@ -1,7 +1,5 @@
 """GPU mining components for quantum blockchain."""
 
-from .sampler import GPUSampler
-from .cuda_sa import CudaSASampler
 from .modal_sampler import ModalSampler, gpu_app
 from .cuda_miner import CudaMiner
 from .modal_miner import ModalMiner
@@ -24,7 +22,7 @@ except ImportError:
     GPU_AVAILABLE = False
 
 __all__ = [
-    'GPUSampler', 'CudaSASampler', 'ModalSampler',
+    'ModalSampler',
     'CudaMiner', 'ModalMiner',
     'gpu_app', 'GPU_AVAILABLE', 'METAL_AVAILABLE'
 ]
