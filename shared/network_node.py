@@ -1532,8 +1532,8 @@ class NetworkNode(Node):
             samples = []
             energies = []
             for sample, energy in sampleset.data(['sample', 'energy']):
-                # Convert sample dict to list of spins
-                sample_list = [sample[i] for i in sorted(sample.keys())]
+                # Convert sample dict to list of spins (convert numpy types to Python int)
+                sample_list = [int(sample[i]) for i in sorted(sample.keys())]
                 samples.append(sample_list)
                 energies.append(float(energy))
 
