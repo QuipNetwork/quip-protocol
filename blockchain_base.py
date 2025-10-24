@@ -336,6 +336,22 @@ class BaseMiner:
                         winning_block['hash'] = self.compute_block_hash(winning_block)
 
                         logger.info(f"{self.miner_id} found valid block! Nonce: {nonce}, Energy: {min_energy:.2f}, Time: {mining_time:.2f}s")
+
+                        # Log full block contents for QPU miner
+                        if self.miner_type == "QPU":
+                            logger.info(f"QPU Block Contents:")
+                            logger.info(f"  Index: {winning_block['index']}")
+                            logger.info(f"  Hash: {winning_block['hash'][:16]}...")
+                            logger.info(f"  Previous Hash: {winning_block['previous_hash'][:16]}...")
+                            logger.info(f"  Timestamp: {winning_block['timestamp']}")
+                            logger.info(f"  Nonce: {winning_block['nonce']}")
+                            logger.info(f"  Energy: {winning_block['energy']:.4f}")
+                            logger.info(f"  Diversity: {winning_block['diversity']:.4f}")
+                            logger.info(f"  Valid Solutions: {winning_block['num_valid_solutions']}")
+                            logger.info(f"  Mining Time: {winning_block['mining_time']:.2f}s")
+                            logger.info(f"  Reward Address: {winning_block['reward_address'][:16]}...")
+                            logger.info(f"  Signature: {winning_block['signature'][:16]}...")
+
                         return winning_block
 
                 nonce += 1

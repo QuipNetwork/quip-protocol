@@ -1490,17 +1490,18 @@ class NetworkNode(Node):
             J_dict = {(i, j): val for ((i, j), val) in J}
 
             # Use first available miner to solve
-            if not self.miners:
+            if not hasattr(self, 'miner_handles') or not self.miner_handles:
                 return web.json_response(
                     {"error": "No miners available"},
                     status=503
                 )
 
-            miner = self.miners[0]
-            self.logger.info(f"Solving BQM with {len(h)} variables, {len(J)} couplings, {num_samples} samples")
+            miner_handle = self.miner_handles[0]
+            self.logger.info(f"Solving BQM with {len(h)} variables, {len(J)} couplings, {num_samples} samples using {miner_handle.miner_id}")
 
-            # Sample the Ising problem
-            sampleset = miner.sampler.sample_ising(h_dict, J_dict, num_reads=num_samples)
+            # Sample the Ising problem using the miner handle
+            # MinerHandle provides a sampler property
+            sampleset = miner_handle.sampler.sample_ising(h_dict, J_dict, num_reads=num_samples)
 
             # Extract samples and energies
             samples = []
