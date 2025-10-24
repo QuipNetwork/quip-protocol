@@ -1499,9 +1499,34 @@ class NetworkNode(Node):
             miner_handle = self.miner_handles[0]
             self.logger.info(f"Solving BQM with {len(h)} variables, {len(J)} couplings, {num_samples} samples using {miner_handle.miner_id}")
 
-            # Sample the Ising problem using the miner handle
-            # MinerHandle provides a sampler property
-            sampleset = miner_handle.sampler.sample_ising(h_dict, J_dict, num_reads=num_samples)
+            # Create appropriate sampler based on miner type
+            # MinerHandle runs in a separate process, so we create a sampler here
+            sampler = None
+            miner_kind = miner_handle.spec.get("kind", "").lower()
+
+            if miner_kind == "qpu":
+                from dwave.system import DWaveSampler
+                try:
+                    sampler = DWaveSampler()
+                    self.logger.info(f"Using QPU sampler: {sampler.properties.get('chip_id', 'unknown')}")
+                except Exception as e:
+                    self.logger.error(f"Failed to create QPU sampler: {e}")
+                    return web.json_response(
+                        {"error": f"QPU not available: {e}"},
+                        status=503
+                    )
+            elif miner_kind in ["cpu", "metal", "cuda", "modal"]:
+                from dwave.samplers import SimulatedAnnealingSampler
+                sampler = SimulatedAnnealingSampler()
+                self.logger.info("Using simulated annealing sampler")
+            else:
+                return web.json_response(
+                    {"error": f"Unknown miner type: {miner_kind}"},
+                    status=503
+                )
+
+            # Sample the Ising problem
+            sampleset = sampler.sample_ising(h_dict, J_dict, num_reads=num_samples)
 
             # Extract samples and energies
             samples = []
