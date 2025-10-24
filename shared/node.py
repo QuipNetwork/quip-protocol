@@ -346,16 +346,19 @@ class Node:
             next_wots_public_key=self.crypto.wots_plus_public_key
         )
 
-    async def mine_block(self, previous_block: Block) -> Optional[MiningResult]:
+    async def mine_block(self, previous_block: Block, transactions: List = None) -> Optional[MiningResult]:
         """
         Async method to coordinate mining across all miners of this node for a block.
 
         Args:
             previous_block: Previous block (contains next block requirements)
+            transactions: Optional list of Transaction objects to include in the block
 
         Returns:
             Block if successful, None if stopped/failed
         """
+        if transactions is None:
+            transactions = []
         if not self.chain:
             self.logger.info("No existing chain, previous block is genesis")
             self.chain.append(previous_block)
@@ -483,8 +486,18 @@ class Node:
         # Reset state
         self._mining_stop_event = None
     
-    def build_block(self, previous_block: Block, mining_result: MiningResult, block_data: bytes):
-        """Build a block from a mining result."""
+    def build_block(self, previous_block: Block, mining_result: MiningResult, block_data: bytes, transactions: List = None):
+        """Build a block from a mining result.
+
+        Args:
+            previous_block: The previous block in the chain
+            mining_result: The result from the mining process
+            block_data: Arbitrary block data
+            transactions: Optional list of Transaction objects to include in the block
+        """
+        if transactions is None:
+            transactions = []
+
         if previous_block.hash is None:
             raise ValueError("Previous block hash is empty, unsigned/finalized block?")
 
@@ -522,6 +535,7 @@ class Node:
             quantum_proof=quantum_proof,
             next_block_requirements=next_block_requirements,
             data=block_data,
+            transactions=transactions,
             raw=b"",
             hash=b"",
             signature=b""
