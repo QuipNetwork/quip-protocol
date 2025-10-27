@@ -198,6 +198,12 @@ class BlockRequirements:
     min_diversity: float
     min_solutions: int
     timeout_to_difficulty_adjustment_decay: int
+    h_values: Optional[List[float]] = None
+
+    def __post_init__(self):
+        """Set defaults after initialization."""
+        if self.h_values is None:
+            self.h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
 
     def to_network(self) -> bytes:
         """Serialize to binary format."""
@@ -206,6 +212,13 @@ class BlockRequirements:
         result += struct.pack('!d', self.min_diversity)
         result += struct.pack('!I', self.min_solutions)
         result += struct.pack('!i', self.timeout_to_difficulty_adjustment_decay)
+
+        # Serialize h_values
+        h_vals = self.h_values if self.h_values is not None else [-1.0, 0.0, 1.0]
+        result += struct.pack('!I', len(h_vals))
+        for h_val in h_vals:
+            result += struct.pack('!d', h_val)
+
         return result
 
     @classmethod
@@ -219,12 +232,25 @@ class BlockRequirements:
         min_solutions = struct.unpack('!I', data[offset:offset+4])[0]
         offset += 4
         timeout_to_difficulty_adjustment_decay = struct.unpack('!i', data[offset:offset+4])[0]
+        offset += 4
+
+        # Deserialize h_values (backward compatible)
+        h_values = None
+        if offset < len(data):
+            h_count = struct.unpack('!I', data[offset:offset+4])[0]
+            offset += 4
+            h_values = []
+            for _ in range(h_count):
+                h_val = struct.unpack('!d', data[offset:offset+8])[0]
+                offset += 8
+                h_values.append(h_val)
 
         return cls(
             difficulty_energy=difficulty_energy,
             min_diversity=min_diversity,
             min_solutions=min_solutions,
-            timeout_to_difficulty_adjustment_decay=timeout_to_difficulty_adjustment_decay
+            timeout_to_difficulty_adjustment_decay=timeout_to_difficulty_adjustment_decay,
+            h_values=h_values
         )
 
     def to_json(self) -> dict:
@@ -233,7 +259,8 @@ class BlockRequirements:
             'difficulty_energy': self.difficulty_energy,
             'min_diversity': self.min_diversity,
             'min_solutions': self.min_solutions,
-            'timeout_to_difficulty_adjustment_decay': self.timeout_to_difficulty_adjustment_decay
+            'timeout_to_difficulty_adjustment_decay': self.timeout_to_difficulty_adjustment_decay,
+            'h_values': self.h_values if self.h_values is not None else [-1.0, 0.0, 1.0]
         }
 
     @classmethod
@@ -243,7 +270,8 @@ class BlockRequirements:
             difficulty_energy=float(data['difficulty_energy']),
             min_diversity=float(data['min_diversity']),
             min_solutions=int(data['min_solutions']),
-            timeout_to_difficulty_adjustment_decay=int(data['timeout_to_difficulty_adjustment_decay'])
+            timeout_to_difficulty_adjustment_decay=int(data['timeout_to_difficulty_adjustment_decay']),
+            h_values=data.get('h_values', None)  # Backward compatible: missing h_values → None → defaults to [-1, 0, 1]
         )
 
 @dataclass
@@ -918,7 +946,8 @@ def create_genesis_block(genesis_data: Optional[dict] = None) -> Block:
             "difficulty_energy": -1000.0,
             "min_diversity": 0.28,
             "min_solutions": 10,
-            "timeout_to_difficulty_adjustment_decay": 600
+            "timeout_to_difficulty_adjustment_decay": 600,
+            "h_values": [-1.0, 0.0, 1.0]
         },
         "quantum_proof": None,
         "miner_info": None
