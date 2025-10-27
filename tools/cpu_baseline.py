@@ -15,19 +15,29 @@ from shared.block_requirements import BlockRequirements
 import random
 
 
-def cpu_baseline_test(timeout_minutes=10.0, output_file=None):
+def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, only_label=None):
     """Test CPU performance with configurable timeout."""
+    if h_values is None:
+        h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
+
     print("🔬 CPU Baseline Parameter Test")
     print("=" * 40)
     print(f"⏰ Timeout: {timeout_minutes} minutes")
-    
+    print(f"🎲 h_values: {h_values}")
+
     # Initialize sampler
     cpu_sampler = SimulatedAnnealingStructuredSampler()
     nodes = cpu_sampler.nodes
     edges = cpu_sampler.edges
     seed = 12345  # Fixed seed for reproducible results
-    h, J = generate_ising_model_from_nonce(seed, nodes, edges)
+    h, J = generate_ising_model_from_nonce(seed, nodes, edges, h_values=h_values)
+
+    # Show h distribution
+    h_vals_set = sorted(set(h.values()))
+    h_counts = {v: list(h.values()).count(v) for v in h_vals_set}
+    h_dist_str = ", ".join([f"{v}: {h_counts[v]} ({100*h_counts[v]/len(h):.1f}%)" for v in h_vals_set])
     print(f"📊 Problem: {len(h)} variables, {len(J)} couplings")
+    print(f"   h distribution: {h_dist_str}")
     
     # Test configurations - from light to heavy
     test_configs = [
@@ -38,6 +48,15 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None):
         (4096, 200, "Very High CPU"),
         (8192, 200, "Max CPU")
     ]
+
+    # Optional filter: run only the requested label
+    if only_label:
+        available_labels = [desc for _, _, desc in test_configs]
+        filtered = [cfg for cfg in test_configs if cfg[2].lower() == only_label.lower()]
+        if not filtered:
+            print(f"⚠️ No test config matched --only {only_label!r}; available: {available_labels}")
+            return None
+        test_configs = filtered
     
     print(f"\n🧪 Testing CPU configurations:")
     
@@ -69,7 +88,7 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None):
         try:
             # Generate the Ising model with deterministic nonce
             nonce = test_nonces[idx]
-            h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+            h, J = generate_ising_model_from_nonce(nonce, nodes, edges, h_values=h_values)
 
             start_time = time.time()
             sampleset = cpu_sampler.sample_ising(
@@ -216,32 +235,53 @@ def main():
     parser.add_argument(
         '--quick',
         action='store_true',
-        help='Quick test mode (3 minute timeout)'
+        help='Quick test mode (only Light test)'
     )
     parser.add_argument(
         '--extended',
-        action='store_true', 
+        action='store_true',
         help='Extended test mode (30 minute timeout)'
     )
-    
+    parser.add_argument(
+        '--only',
+        type=str,
+        help='Run only the config with this description (e.g., "Light CPU")'
+    )
+    parser.add_argument(
+        '--h-values',
+        type=str,
+        default='-1,0,1',
+        help='Comma-separated h field values (default: -1,0,1). Use "0" for h=0 baseline.'
+    )
+
     args = parser.parse_args()
-    
-    # Handle preset timeouts
+
+    # Parse h_values
+    h_values = [float(v.strip()) for v in args.h_values.split(',')]
+
+    # Handle preset timeouts and filters
+    only_label = args.only
     if args.quick:
-        timeout = 3.0
+        timeout = 10.0
+        only_label = "Light CPU"  # Force Light test only
     elif args.extended:
         timeout = 30.0
     else:
         timeout = args.timeout
-    
+
     # Generate default output filename if not specified
     output_file = args.output
     if not output_file:
         timestamp = int(time.time())
         output_file = f"cpu_baseline_results_{timestamp}.json"
-    
+
     # Run test
-    cpu_baseline_test(timeout_minutes=timeout, output_file=output_file)
+    cpu_baseline_test(
+        timeout_minutes=timeout,
+        output_file=output_file,
+        h_values=h_values,
+        only_label=only_label
+    )
 
     print(f"\n✅ CPU baseline test complete!")
 

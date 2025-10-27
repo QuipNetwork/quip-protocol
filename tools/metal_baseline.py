@@ -14,13 +14,18 @@ from shared.block_requirements import BlockRequirements
 from dwave_topologies import DEFAULT_TOPOLOGY
 
 from GPU.metal_sa import MetalSASampler
+from GPU.metal_miner import get_gpu_core_count
 
 
-def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None):
+def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None, h_values=None, num_models=1):
     """Test Metal SA performance with baseline format and evaluation logic."""
+    if h_values is None:
+        h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
+
     print(f"🔬 Metal SA Baseline Parameter Test")
     print("=" * 50)
     print(f"⏰ Timeout: {timeout_minutes} minutes")
+    print(f"🎲 h_values: {h_values}")
 
     # Initialize sampler
     try:
@@ -35,20 +40,25 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None)
     nodes = list(topology_graph.nodes())
     edges = list(topology_graph.edges())
 
-    # Generate test problem
+    # Generate test problem with h_values
     seed = 12345  # Fixed seed for reproducible results
-    h, J = generate_ising_model_from_nonce(seed, nodes, edges)
+    h, J = generate_ising_model_from_nonce(seed, nodes, edges, h_values=h_values)
 
+    # Show h distribution
+    h_vals_set = sorted(set(h.values()))
+    h_counts = {v: list(h.values()).count(v) for v in h_vals_set}
+    h_dist_str = ", ".join([f"{v}: {h_counts[v]} ({100*h_counts[v]/len(h):.1f}%)" for v in h_vals_set])
     print(f"📊 Problem: {len(h)} variables, {len(J)} couplings")
+    print(f"   h distribution: {h_dist_str}")
 
     # Test configurations - matching CPU baseline for fair comparison
     test_configs = [
-        (256, 64, "Light"),
-        (512, 100, "Low"),
-        (1024, 100, "Medium"),
-        (2048, 150, "High"),
-        (4096, 200, "Very High"),
-        (8192, 200, "Max")
+        (256, 64, "Light Metal"),
+        (512, 100, "Low Metal"),
+        (1024, 100, "Medium Metal"),
+        (2048, 150, "High Metal"),
+        (4096, 200, "Very High Metal"),
+        (8192, 200, "Max Metal")
     ]
 
     # Optional filter: run only the requested label
@@ -87,31 +97,53 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None)
             print(f"\n⏰ Total timeout ({timeout_minutes} min) reached, stopping")
             break
 
-        print(f"\n{desc}: {sweeps} sweeps, {reads} reads")
+        print(f"\n{desc}: {sweeps} sweeps, {reads} reads, {num_models} models")
 
         try:
-            # Generate problem with deterministic nonce
-            nonce = test_nonces[idx]
-            h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+            # Generate problems with deterministic nonces
+            h_list = []
+            J_list = []
+            nonces = []
+
+            for _ in range(num_models):
+                nonce = test_nonces[idx]
+                nonces.append(nonce)
+                h, J = generate_ising_model_from_nonce(nonce, nodes, edges, h_values=h_values)
+                h_list.append(h)
+                J_list.append(J)
 
             start_time = time.time()
-            # Task 6: Wrap single problem in lists for batched API
+            # Process models in batch
             samplesets = metal_sampler.sample_ising(
-                h=[h], J=[J],
+                h=h_list, J=J_list,
                 num_reads=reads,
                 num_sweeps=sweeps
             )
-            sampleset = samplesets[0]  # Extract single result
             runtime = time.time() - start_time
+            throughput = num_models / runtime  # models per second
 
+            # Collect stats from all models
+            all_min_energies = []
+            all_avg_energies = []
+            for sampleset in samplesets:
+                energies = list(sampleset.record.energy)
+                all_min_energies.append(float(min(energies)))
+                all_avg_energies.append(float(sum(energies) / len(energies)))
+
+            # Use first sampleset for detailed analysis
+            sampleset = samplesets[0]
             energies = list(sampleset.record.energy)
             min_energy = float(min(energies))
             avg_energy = float(sum(energies) / len(energies))
             std_energy = float((sum((e - avg_energy)**2 for e in energies) / len(energies)) ** 0.5)
 
-            print(f"  ⏱️  {runtime/60:.1f} min ({runtime:.1f}s)")
-            print(f"  🎯 min_energy = {min_energy:.1f}")
-            print(f"  📊 avg_energy = {avg_energy:.1f} (±{std_energy:.1f})")
+            print(f"  ⏱️  {runtime:.2f}s ({num_models} models)")
+            if num_models > 1:
+                print(f"  🚀 Throughput: {throughput:.2f} models/second")
+                print(f"  🎯 Best energy: {min(all_min_energies):.1f} (across {num_models} models)")
+            else:
+                print(f"  🎯 min_energy = {min_energy:.1f}")
+            print(f"  📊 Avg energy (first model): {avg_energy:.1f} (±{std_energy:.1f})")
 
             # Use evaluate_sampleset to get diversity and num_solutions
             requirements = BlockRequirements(
@@ -125,7 +157,7 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None)
             prev_timestamp = int(time.time()) - 600
 
             mining_result = evaluate_sampleset(
-                sampleset, requirements, nodes, edges, nonce, salt,
+                sampleset, requirements, nodes, edges, nonces[0], salt,
                 prev_timestamp, start_time, f"metal-sa-{sweeps}-{reads}", "Metal"
             )
 
@@ -238,7 +270,7 @@ def main():
     parser.add_argument(
         '--quick',
         action='store_true',
-        help='Quick test mode (3 minute timeout)'
+        help='Quick test mode (only Light test)'
     )
     parser.add_argument(
         '--extended',
@@ -248,14 +280,41 @@ def main():
     parser.add_argument(
         '--only',
         type=str,
-        help='Run only the config with this description (e.g., "Light")'
+        help='Run only the config with this description (e.g., "Light Metal")'
+    )
+    parser.add_argument(
+        '--h-values',
+        type=str,
+        default='-1,0,1',
+        help='Comma-separated h field values (default: -1,0,1). Use "0" for h=0 baseline.'
+    )
+    parser.add_argument(
+        '--num-models',
+        type=int,
+        default=None,
+        help='Number of models to process in parallel (default: auto-detect GPU cores, typically 40)'
     )
 
     args = parser.parse_args()
 
-    # Handle preset timeouts
+    # Auto-detect GPU core count if not specified
+    if args.num_models is None:
+        try:
+            num_models = get_gpu_core_count()
+        except Exception as e:
+            print(f"⚠️ Could not detect GPU cores ({e}), defaulting to 40 models")
+            num_models = 40
+    else:
+        num_models = args.num_models
+
+    # Parse h_values
+    h_values = [float(v.strip()) for v in args.h_values.split(',')]
+
+    # Handle preset timeouts and filters
+    only_label = args.only
     if args.quick:
-        timeout = 3.0
+        timeout = 10.0
+        only_label = "Light Metal"  # Force Light test only
     elif args.extended:
         timeout = 30.0
     else:
@@ -271,7 +330,9 @@ def main():
     metal_baseline_test(
         timeout_minutes=timeout,
         output_file=output_file,
-        only_label=args.only
+        only_label=only_label,
+        h_values=h_values,
+        num_models=num_models
     )
 
     print(f"\n✅ Metal SA baseline test complete!")
