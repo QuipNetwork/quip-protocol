@@ -388,9 +388,9 @@ __global__ void cuda_sa_persistent_real(
             }
 
             // Build initial delta_energy array using unpacked state
-            // Note: Matching Metal, do NOT include h in delta energy
+            // Include h field in delta energy calculation
             for (int var = 0; var < n; var++) {
-                delta_energy[var] = get_flip_energy_unpacked(var, unpacked_state, csr_row_ptr, csr_col_ind, csr_J_vals, n, nullptr);
+                delta_energy[var] = get_flip_energy_unpacked(var, unpacked_state, csr_row_ptr, csr_col_ind, csr_J_vals, n, shared_job.h);
             }
 
             // Compute initial energy (h + J terms)

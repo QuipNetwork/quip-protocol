@@ -577,9 +577,9 @@ class CudaSASamplerAsync:
             samples = self.kernel.get_samples(result)
             energies = self.kernel.get_energies(result)
 
-            # CUDA kernel outputs {0, 1} binary values
-            # Convert to SPIN format {-1, +1}
-            samples_spin = (2 * samples - 1).astype(np.int8)
+            # CUDA kernel outputs SPIN format {-1, +1} directly (unpacked state)
+            # No conversion needed
+            samples_spin = samples.astype(np.int8)
 
             # Create SampleSet with SPIN vartype
             sampleset = dimod.SampleSet.from_samples(

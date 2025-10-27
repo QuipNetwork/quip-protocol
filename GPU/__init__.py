@@ -1,15 +1,13 @@
 """GPU mining components for quantum blockchain."""
 
-from .sampler import GPUSampler
-
 # Try to import CUDA components (only available with cupy)
 try:
-    from .cuda_sa import CudaSASampler
+    from .cuda_sa import CudaSASamplerAsync
     from .cuda_miner import CudaMiner
     CUDA_AVAILABLE = True
 except ImportError:
     CUDA_AVAILABLE = False
-    CudaSASampler = None
+    CudaSASamplerAsync = None
     CudaMiner = None
 
 # Try to import Modal components
@@ -44,7 +42,7 @@ __all__ = [
 
 # Add CUDA components if available
 if CUDA_AVAILABLE:
-    __all__.extend(['CudaSASampler', 'CudaMiner'])
+    __all__.extend(['CudaSASamplerAsync', 'CudaMiner'])
 
 # Add Modal components if available
 if MODAL_AVAILABLE:
