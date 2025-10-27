@@ -23,11 +23,15 @@ except ImportError:
     CUDA_AVAILABLE = False
 
 
-def cuda_baseline_test(timeout_minutes=10.0, output_file=None, light_only=False):
+def cuda_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None, h_values=None):
     """Test CUDA GPU performance using CudaSASamplerAsync."""
+    if h_values is None:
+        h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
+
     print("🔬 CUDA GPU Baseline Parameter Test (CudaSASamplerAsync)")
     print("=" * 60)
     print(f"⏰ Timeout: {timeout_minutes} minutes")
+    print(f"🎲 h_values: {h_values}")
 
     if not CUDA_AVAILABLE:
         print("❌ CUDA not available")
@@ -62,11 +66,17 @@ def cuda_baseline_test(timeout_minutes=10.0, output_file=None, light_only=False)
     sampler_type = "persistent-kernel"
 
     print(f"📊 Using production topology: {len(nodes)} nodes, {len(edges)} edges")
-    
+
     # Initial problem setup to show problem size
     seed = 12345  # Fixed seed for reproducible results
-    h, J = generate_ising_model_from_nonce(seed, nodes, edges)
+    h, J = generate_ising_model_from_nonce(seed, nodes, edges, h_values=h_values)
+
+    # Show h distribution
+    h_vals_set = sorted(set(h.values()))
+    h_counts = {v: list(h.values()).count(v) for v in h_vals_set}
+    h_dist_str = ", ".join([f"{v}: {h_counts[v]} ({100*h_counts[v]/len(h):.1f}%)" for v in h_vals_set])
     print(f"📊 Problem: {len(h)} variables, {len(J)} couplings")
+    print(f"   h distribution: {h_dist_str}")
     
     # Test configurations - matching CPU baseline exactly
     test_configs = [
@@ -78,9 +88,14 @@ def cuda_baseline_test(timeout_minutes=10.0, output_file=None, light_only=False)
         (8192, 200, "Max CUDA")
     ]
 
-    # If light_only, only run the first test
-    if light_only:
-        test_configs = test_configs[:1]
+    # Optional filter: run only the requested label
+    if only_label:
+        available_labels = [desc for _, _, desc in test_configs]
+        filtered = [cfg for cfg in test_configs if cfg[2].lower() == only_label.lower()]
+        if not filtered:
+            print(f"⚠️ No test config matched --only {only_label!r}; available: {available_labels}")
+            return None
+        test_configs = filtered
 
     print(f"\n🧪 Testing CUDA configurations:")
 
@@ -124,7 +139,7 @@ def cuda_baseline_test(timeout_minutes=10.0, output_file=None, light_only=False)
             for _ in range(num_models):
                 nonce = random.randint(0, 2**32 - 1)
                 nonces.append(nonce)
-                h_dict, J_dict = generate_ising_model_from_nonce(nonce, nodes, edges)
+                h_dict, J_dict = generate_ising_model_from_nonce(nonce, nodes, edges, h_values=h_values)
 
                 # Compute N as max node ID + 1 (topology has sparse node IDs: 4593 nodes numbered 0-4799)
                 N = max(max(nodes), max(max(i, j) for i, j in edges)) + 1
@@ -331,7 +346,7 @@ def main():
     parser.add_argument(
         '--quick',
         action='store_true',
-        help='Quick test mode (3 minute timeout)'
+        help='Quick test mode (only Light test)'
     )
     parser.add_argument(
         '--extended',
@@ -339,11 +354,20 @@ def main():
         help='Extended test mode (30 minute timeout)'
     )
     parser.add_argument(
-        '--light-only',
-        action='store_true',
-        help='Only run the Light CUDA test and exit'
+        '--only',
+        type=str,
+        help='Run only the config with this description (e.g., "Light CUDA")'
+    )
+    parser.add_argument(
+        '--h-values',
+        type=str,
+        default='-1,0,1',
+        help='Comma-separated h field values (default: -1,0,1). Use "0" for h=0 baseline.'
     )
     args = parser.parse_args()
+
+    # Parse h_values
+    h_values = [float(v.strip()) for v in args.h_values.split(',')]
 
     # Generate default output filename if not specified
     output_file = args.output
@@ -351,9 +375,11 @@ def main():
         timestamp = int(time.time())
         output_file = f"cuda_baseline_results_{timestamp}.json"
 
-    # Handle preset timeouts
+    # Handle preset timeouts and filters
+    only_label = args.only
     if args.quick:
-        timeout = 3.0
+        timeout = 10.0
+        only_label = "Light CUDA"  # Force Light test only
     elif args.extended:
         timeout = 30.0
     else:
@@ -363,7 +389,8 @@ def main():
     cuda_baseline_test(
         timeout_minutes=timeout,
         output_file=output_file,
-        light_only=args.light_only
+        only_label=only_label,
+        h_values=h_values
     )
 
     print(f"\n✅ CUDA baseline test complete!")

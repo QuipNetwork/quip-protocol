@@ -194,6 +194,7 @@ class MetalSASampler:
         all_csr_row_ptr = []
         all_csr_col_ind = []
         all_csr_J_vals = []
+        all_h_vals = []  # Concatenated h values for all problems
         row_ptr_offsets = [0]  # Offsets into csr_row_ptr array
         col_ind_offsets = [0]  # Offsets into csr_col_ind array
         node_to_idx_list = []
@@ -212,6 +213,12 @@ class MetalSASampler:
             csr_row_ptr = np.zeros(N + 1, dtype=np.int32)
             csr_col_ind = []
             csr_J_vals = []
+
+            # Extract h values in node order
+            h_vals_array = np.zeros(N, dtype=np.int8)
+            for node, h_val in h_prob.items():
+                if node in node_to_idx:
+                    h_vals_array[node_to_idx[node]] = int(h_val)
 
             # Count degrees
             degree = np.zeros(N, dtype=np.int32)
@@ -241,6 +248,7 @@ class MetalSASampler:
             all_csr_row_ptr.extend(csr_row_ptr)
             all_csr_col_ind.extend(csr_col_ind)
             all_csr_J_vals.extend(csr_J_vals)
+            all_h_vals.extend(h_vals_array)
 
             # Track offsets for next problem
             row_ptr_offsets.append(len(all_csr_row_ptr))
@@ -252,6 +260,7 @@ class MetalSASampler:
         all_csr_row_ptr = np.array(all_csr_row_ptr, dtype=np.int32)
         all_csr_col_ind = np.array(all_csr_col_ind, dtype=np.int32)
         all_csr_J_vals = np.array(all_csr_J_vals, dtype=np.int8)
+        all_h_vals = np.array(all_h_vals, dtype=np.int8)
         row_ptr_offsets = np.array(row_ptr_offsets, dtype=np.int32)
         col_ind_offsets = np.array(col_ind_offsets, dtype=np.int32)
 
@@ -301,6 +310,7 @@ class MetalSASampler:
         csr_row_ptr_buf = self._create_buffer(all_csr_row_ptr, "csr_row_ptr")
         csr_col_ind_buf = self._create_buffer(all_csr_col_ind, "csr_col_ind")
         csr_J_vals_buf = self._create_buffer(all_csr_J_vals, "csr_J_vals")
+        csr_h_vals_buf = self._create_buffer(all_h_vals, "csr_h_vals")
         row_ptr_offsets_buf = self._create_buffer(row_ptr_offsets, "row_ptr_offsets")
         col_ind_offsets_buf = self._create_buffer(col_ind_offsets, "col_ind_offsets")
 
@@ -359,6 +369,9 @@ class MetalSASampler:
         encoder.setBytes_length_atIndex_(num_threads_bytes, len(num_threads_bytes), 12)
         encoder.setBytes_length_atIndex_(num_problems_bytes, len(num_problems_bytes), 13)
         encoder.setBytes_length_atIndex_(num_reads_bytes, len(num_reads_bytes), 14)
+
+        # h field values (buffer 15)
+        encoder.setBuffer_offset_atIndex_(csr_h_vals_buf, 0, 15)
 
         # Dispatch configuration for batched problems
         # One threadgroup per problem - optimal for cache locality

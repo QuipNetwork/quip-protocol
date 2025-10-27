@@ -2,7 +2,168 @@
 
 import math
 import numpy as np
-from typing import Dict, Tuple, List, Any
+from typing import Dict, Tuple, List, Any, Optional
+
+
+def expected_solution_energy(
+    nodes: List[int],
+    edges: List[Tuple[int, int]],
+    c: float = 0.75,
+    h_values: Optional[List[float]] = None
+) -> float:
+    """Calculate expected ground state energy for random Ising problems on a given topology.
+
+    Based on empirical observations that expected energy density (GSE/N) scales with √(degree).
+    This formula accounts for topology dimensionality/connectivity effects on achievable energy.
+
+    Theory and Calibration:
+    -----------------------
+    For random Ising problems with J ∈ {-1, +1} couplings and h field params, the expected ground state
+    energy (GSE) follows an empirical scaling law:
+
+        GSE ≈ -c × √(avg_degree) × N
+
+    Where:
+        - N = number of nodes (qubits)
+        - M = number of edges (couplings)
+        - avg_degree = 2M / N (average node degree in the graph)
+        - c = empirical constant representing connectivity effects (default 0.75)
+
+    The √(degree) scaling captures how solution quality improves with connectivity, while
+    the linear N scaling reflects extensive energy growth with system size.
+
+    Example Calibration (Advantage2 topology):
+    --------------------------------------------
+    - N = 4,593 nodes
+    - M = 41,796 edges
+    - avg_degree = 2 × 41,796 / 4,593 ≈ 18.2
+    - √(avg_degree) ≈ 4.27
+    - Observed GSE ≈ -15,700
+    - Implied c ≈ 15,700 / (4.27 × 4,593) ≈ 0.80
+
+    Using c = 0.75 yields: -0.75 × 4.27 × 4,593 ≈ -14,709
+
+    Statistical Variation:
+    ---------------------
+    Individual nonces will fluctuate around this expectation by approximately ±√M due to
+    central limit theorem effects on independent random couplings. For Advantage2, this
+    means ±√41,796 ≈ ±204 energy units of nonce-to-nonce variation.
+
+    The above tracks well with our practical observations, which show energies around -14,200
+    with a standard deviation of ~200 when we aren't spending significant compute time 
+    on annealing, and better ranges when we do. You can run the tool in
+
+    Problem Bounds:
+    ------------------
+    - Theoretical minimum: -M (all edges satisfied, unachievable for frustrated systems)
+    - Practical SA solutions: Typically achieve ~35% of theoretical minimum (-14,709 vs -41,796)
+      but ~80% of the empirical expected energy (-14,200 vs -14,709 from formula) unless 
+      we work harder or search across random problems.
+    - This formula provides a statistical expectation for real-world performance
+
+    Args:
+        nodes: List of node indices for the topology
+        edges: List of edge tuples for the topology
+        c: Empirical constant (default 0.75, calibrated from Advantage2 data)
+        h_values: List of allowed h field values (default: [-1, 0, +1])
+                 Use [0] for h=0 baseline (backward compatible)
+
+    Returns:
+        Expected ground state energy (negative value)
+
+    Note on h_values impact:
+        For h=0: GSE ≈ -c × √(avg_degree) × N
+        For h≠0: h allows slightly deeper energy minima (h+J cooperation)
+                 Formula predicts ~400-500 units better than observed SA
+                 (due to local minima, limited sweeps, sample variance)
+
+    Example:
+        >>> # Advantage2 topology
+        >>> nodes = list(range(4593))
+        >>> edges = [(i, j) for i in range(4592) for j in range(i+1, 4593) if connected(i, j)]
+        >>> expected_energy = expected_solution_energy(nodes, edges)
+        >>> print(f"Expected GSE: {expected_energy:.1f}")
+        Expected GSE: -14709.0
+    """
+    if h_values is None:
+        h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
+
+    N = len(nodes)
+    M = len(edges)
+
+    # Handle edge cases
+    if N == 0 or M == 0:
+        return 0.0
+
+    # Calculate average node degree
+    avg_degree = (2.0 * M) / N
+
+    # Apply empirical scaling formula: GSE ≈ -c × √(avg_degree) × N
+    j_contribution = -c * math.sqrt(avg_degree) * N
+
+    # h field contribution (allows slightly smaller energies)
+    #
+    # Why h makes smaller gse:
+    # ---------------------------
+    # When h ≠ 0, nodes have local field biases (h_i wants spin s_i to align).
+    # For edges (i,j) with coupling J_ij, three scenarios occur:
+    #   1. h_i and J_ij cooperate (both want same spin alignment) → bonus energy reduction
+    #   2. h_i and J_ij conflict (want opposite alignments) → frustration
+    #   3. h_i = 0 (no local bias) → only J matters
+    #
+    # Since J ∈ {-1, +1} is 50/50 random and h is symmetric (zero mean):
+    #   - ~25% of edges have h+J cooperation (both nodes' h and J agree)
+    #   - SA can exploit these cooperative cases to achieve lower energies
+    #   - Net effect: h ≠ 0 allows deeper energy minima than h = 0
+    #
+    # Empirical observations (Advantage2, 10 samples, num_sweeps=256):
+    #   - h = 0:          SA achieves -14,286 (baseline)
+    #   - h ∈ {-1, 0, +1}: SA achieves -14,759 (-473 better, ternary: 67% nonzero)
+    #   - h ∈ {-1, +1}:    SA achieves -14,957 (-671 better, binary: 100% nonzero)
+    #
+    # Formula derivation:
+    # ------------------
+    # The h contribution scales as N/√(avg_degree) because:
+    #   - N nodes each have local h bias
+    #   - Higher degree → more J constraints → less freedom to satisfy h
+    #   - Lower degree → fewer J constraints → more freedom to satisfy h
+    #
+    # The contribution is also scaled by c (SA efficiency factor) because:
+    #   - Both J and h are optimization targets that SA tries to satisfy
+    #   - SA's ability to exploit h+J cooperation is limited by the same
+    #     algorithmic factors (temperature schedule, sweeps, local minima)
+    #   - Using the same c ensures consistent scaling across problem difficulties
+    if len(h_values) == 1 and h_values[0] == 0.0:
+        h_contribution = 0.0
+    else:
+        # NOTE: This might not work well if
+        # len(h) == 1 && h[0] = 1, for example...
+        # We assume h is going to be some variant of [1, -1], [-1, 0, 1]
+        # or equivalent.
+        # Fraction of non-zero h values (ternary: 2/3, binary: 1.0)
+        nonzero_fraction = sum(1 for v in h_values if v != 0) / len(h_values)
+
+        # Empirical constant calibrated from experimental data:
+        # - Binary h ∈ {-1, +1}: observed -671 units better than h=0
+        # - Ternary h ∈ {-1, 0, +1}: observed -473 units better than h=0
+        # - Ratio: -473/-671 ≈ 0.705 ≈ 2/3 (matches nonzero_fraction)
+        #
+        # This suggests linear scaling: h_contribution ∝ nonzero_fraction
+        # (Even single node with h≠0 can exploit favorable J alignments)
+        #
+        # Solving for α:
+        #   -671 ≈ -c × α × 1.0 × N/√(d)
+        #   -671 ≈ -0.75 × α × 1075
+        #   α ≈ 0.88
+        # (this is roughly half the 25% h, J cooperation noted above)
+        alpha = 0.88
+
+        # h contribution: -c × α × nonzero_fraction × N/√(avg_degree)
+        # Linear scaling with nonzero_fraction (not quadratic) because
+        # even a single node with h≠0 helps, not just h+h pairs
+        h_contribution = -c * alpha * nonzero_fraction * N / math.sqrt(avg_degree)
+
+    return j_contribution + h_contribution
 
 
 def adjust_energy_along_curve(current_energy: float, adjustment_rate: float, direction: str) -> float:

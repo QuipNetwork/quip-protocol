@@ -57,7 +57,8 @@ inline int8_t get_flip_energy(
     thread const int8_t* packed_state,
     device const int* csr_row_ptr,
     device const int* csr_col_ind,
-    device const int8_t* csr_J_vals
+    device const int8_t* csr_J_vals,
+    device const int8_t* h_vals
 ) {
     int start = csr_row_ptr[var];
     int end = csr_row_ptr[var + 1];
@@ -73,10 +74,14 @@ inline int8_t get_flip_energy(
         energy += neighbor_spin * Jij;
     }
 
+    // Add h field contribution
+    int8_t h_var = h_vals[var];
+    energy += h_var;
+
     // Delta energy = -2 * state[var] * energy
-    // Cast to int8_t (safe because -40 <= delta_E ≤ 40 for all topologies)
-    // Remember, it's a single flip, and J values are only ±1, so max energy is degree (~20 for Zephyr)
-    // Therefore, max delta_E = 2 * degree = 40, well within int8_t range
+    // Cast to int8_t (safe because -42 <= delta_E ≤ 42 for all topologies)
+    // Remember, it's a single flip, and J values are only ±1, so max energy is degree (~20 for Zephyr) + h (±1)
+    // Therefore, max delta_E = 2 * (degree + |h|) = 2 * 21 = 42, well within int8_t range
     int8_t var_spin = get_spin_packed(var, packed_state);
     return (int8_t)(-2 * var_spin * energy);
 }
@@ -101,6 +106,7 @@ kernel void pure_simulated_annealing(
     constant int& num_reads [[buffer(14)]],                // reads per individual problem
 
     device const float* beta_schedule [[buffer(9)]],       // [num_betas]
+    device const int8_t* csr_h_vals [[buffer(15)]],        // Concatenated [N] for all problems - h field values
 
     // Outputs only (no working memory needed - using thread-local)
     device int8_t* final_samples [[buffer(10)]],           // [num_threads * (N+7)/8] - bit-packed
@@ -130,6 +136,7 @@ kernel void pure_simulated_annealing(
     device const int* my_csr_row_ptr = &csr_row_ptr[row_ptr_start];
     device const int* my_csr_col_ind = &csr_col_ind[col_ind_start];
     device const int8_t* my_csr_J_vals = &csr_J_vals[col_ind_start];
+    device const int8_t* my_h_vals = &csr_h_vals[problem_id * N];  // h values for this problem
 
     int n = N;
     int num_beta_values = num_betas;
@@ -158,13 +165,18 @@ kernel void pure_simulated_annealing(
 
     // Build initial delta_energy array
     for (int var = 0; var < n; var++) {
-        delta_energy[var] = get_flip_energy(var, packed_state, my_csr_row_ptr, my_csr_col_ind, my_csr_J_vals);
+        delta_energy[var] = get_flip_energy(var, packed_state, my_csr_row_ptr, my_csr_col_ind, my_csr_J_vals, my_h_vals);
     }
 
     // Compute initial energy
     int current_energy = 0;
     for (int i = 0; i < n; i++) {
         int8_t spin_i = get_spin_packed(i, packed_state);
+
+        // Add h field contribution
+        current_energy += my_h_vals[i] * spin_i;
+
+        // Add J coupling contribution (count each edge once)
         int start = my_csr_row_ptr[i];
         int end = my_csr_row_ptr[i + 1];
         for (int p = start; p < end; ++p) {

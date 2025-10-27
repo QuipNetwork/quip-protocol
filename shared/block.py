@@ -198,6 +198,12 @@ class BlockRequirements:
     min_diversity: float
     min_solutions: int
     timeout_to_difficulty_adjustment_decay: int
+    h_values: Optional[List[float]] = None
+
+    def __post_init__(self):
+        """Set defaults after initialization."""
+        if self.h_values is None:
+            self.h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
 
     def to_network(self) -> bytes:
         """Serialize to binary format."""
@@ -206,6 +212,13 @@ class BlockRequirements:
         result += struct.pack('!d', self.min_diversity)
         result += struct.pack('!I', self.min_solutions)
         result += struct.pack('!i', self.timeout_to_difficulty_adjustment_decay)
+
+        # Serialize h_values
+        h_vals = self.h_values if self.h_values is not None else [-1.0, 0.0, 1.0]
+        result += struct.pack('!I', len(h_vals))
+        for h_val in h_vals:
+            result += struct.pack('!d', h_val)
+
         return result
 
     @classmethod
@@ -219,12 +232,25 @@ class BlockRequirements:
         min_solutions = struct.unpack('!I', data[offset:offset+4])[0]
         offset += 4
         timeout_to_difficulty_adjustment_decay = struct.unpack('!i', data[offset:offset+4])[0]
+        offset += 4
+
+        # Deserialize h_values (backward compatible)
+        h_values = None
+        if offset < len(data):
+            h_count = struct.unpack('!I', data[offset:offset+4])[0]
+            offset += 4
+            h_values = []
+            for _ in range(h_count):
+                h_val = struct.unpack('!d', data[offset:offset+8])[0]
+                offset += 8
+                h_values.append(h_val)
 
         return cls(
             difficulty_energy=difficulty_energy,
             min_diversity=min_diversity,
             min_solutions=min_solutions,
-            timeout_to_difficulty_adjustment_decay=timeout_to_difficulty_adjustment_decay
+            timeout_to_difficulty_adjustment_decay=timeout_to_difficulty_adjustment_decay,
+            h_values=h_values
         )
 
     def to_json(self) -> dict:
@@ -233,7 +259,8 @@ class BlockRequirements:
             'difficulty_energy': self.difficulty_energy,
             'min_diversity': self.min_diversity,
             'min_solutions': self.min_solutions,
-            'timeout_to_difficulty_adjustment_decay': self.timeout_to_difficulty_adjustment_decay
+            'timeout_to_difficulty_adjustment_decay': self.timeout_to_difficulty_adjustment_decay,
+            'h_values': self.h_values if self.h_values is not None else [-1.0, 0.0, 1.0]
         }
 
     @classmethod
@@ -243,7 +270,8 @@ class BlockRequirements:
             difficulty_energy=float(data['difficulty_energy']),
             min_diversity=float(data['min_diversity']),
             min_solutions=int(data['min_solutions']),
-            timeout_to_difficulty_adjustment_decay=int(data['timeout_to_difficulty_adjustment_decay'])
+            timeout_to_difficulty_adjustment_decay=int(data['timeout_to_difficulty_adjustment_decay']),
+            h_values=data.get('h_values', None)  # Backward compatible: missing h_values → None → defaults to [-1, 0, 1]
         )
 
 @dataclass
@@ -363,6 +391,135 @@ class QuantumProof:
         self.energy = min(energies) if energies else None
         self.num_valid_solutions = len(self.solutions)
         self.diversity = calculate_diversity(self.solutions)
+
+
+@dataclass
+class Transaction:
+    """Transaction record containing a solve request and its result."""
+    transaction_id: str  # Unique identifier
+    timestamp: int  # Unix timestamp
+    request_h: List[float]  # Linear bias coefficients
+    request_J: List[Tuple[Tuple[int, int], float]]  # Sparse coupling matrix as list of ((i, j), value)
+    num_samples: int  # Number of samples requested
+    samples: List[List[int]]  # Solution bitstrings/spin configurations
+    energies: List[float]  # Corresponding energies
+
+    def to_network(self) -> bytes:
+        """Serialize to binary format."""
+        result = b''
+        result += write_string(self.transaction_id)
+        result += struct.pack('!q', self.timestamp)
+
+        # Serialize h array
+        result += struct.pack('!I', len(self.request_h))
+        for h_val in self.request_h:
+            result += struct.pack('!d', h_val)
+
+        # Serialize J array
+        result += struct.pack('!I', len(self.request_J))
+        for ((i, j), j_val) in self.request_J:
+            result += struct.pack('!I', i)
+            result += struct.pack('!I', j)
+            result += struct.pack('!d', j_val)
+
+        result += struct.pack('!I', self.num_samples)
+
+        # Serialize samples
+        solutions_data = compress_solutions(self.samples)
+        result += struct.pack('!I', len(solutions_data)) + solutions_data
+
+        # Serialize energies
+        result += struct.pack('!I', len(self.energies))
+        for energy in self.energies:
+            result += struct.pack('!d', energy)
+
+        return result
+
+    @classmethod
+    def from_network(cls, data: bytes) -> 'Transaction':
+        """Deserialize from binary format."""
+        offset = 0
+
+        transaction_id, offset = read_string(data, offset)
+        timestamp = struct.unpack('!q', data[offset:offset+8])[0]
+        offset += 8
+
+        # Deserialize h
+        h_len = struct.unpack('!I', data[offset:offset+4])[0]
+        offset += 4
+        request_h = []
+        for _ in range(h_len):
+            h_val = struct.unpack('!d', data[offset:offset+8])[0]
+            offset += 8
+            request_h.append(h_val)
+
+        # Deserialize J
+        j_len = struct.unpack('!I', data[offset:offset+4])[0]
+        offset += 4
+        request_J = []
+        for _ in range(j_len):
+            i = struct.unpack('!I', data[offset:offset+4])[0]
+            offset += 4
+            j = struct.unpack('!I', data[offset:offset+4])[0]
+            offset += 4
+            j_val = struct.unpack('!d', data[offset:offset+8])[0]
+            offset += 8
+            request_J.append(((i, j), j_val))
+
+        num_samples = struct.unpack('!I', data[offset:offset+4])[0]
+        offset += 4
+
+        # Deserialize samples
+        solutions_len = struct.unpack('!I', data[offset:offset+4])[0]
+        offset += 4
+        solutions_data = data[offset:offset+solutions_len]
+        offset += solutions_len
+        samples, _ = decompress_solutions(solutions_data)
+
+        # Deserialize energies
+        energies_len = struct.unpack('!I', data[offset:offset+4])[0]
+        offset += 4
+        energies = []
+        for _ in range(energies_len):
+            energy = struct.unpack('!d', data[offset:offset+8])[0]
+            offset += 8
+            energies.append(energy)
+
+        return cls(
+            transaction_id=transaction_id,
+            timestamp=timestamp,
+            request_h=request_h,
+            request_J=request_J,
+            num_samples=num_samples,
+            samples=samples,
+            energies=energies
+        )
+
+    def to_json(self) -> dict:
+        """Serialize to JSON-compatible dictionary."""
+        return {
+            'transaction_id': self.transaction_id,
+            'timestamp': self.timestamp,
+            'request_h': self.request_h,
+            'request_J': [{'i': i, 'j': j, 'value': val} for ((i, j), val) in self.request_J],
+            'num_samples': self.num_samples,
+            'samples': self.samples,
+            'energies': self.energies
+        }
+
+    @classmethod
+    def from_json(cls, data: dict) -> 'Transaction':
+        """Deserialize from JSON-compatible dictionary."""
+        request_J = [((entry['i'], entry['j']), entry['value']) for entry in data['request_J']]
+        return cls(
+            transaction_id=data['transaction_id'],
+            timestamp=data['timestamp'],
+            request_h=data['request_h'],
+            request_J=request_J,
+            num_samples=data['num_samples'],
+            samples=data['samples'],
+            energies=data['energies']
+        )
 
 
 @dataclass
@@ -509,19 +666,25 @@ class Block:
     next_block_requirements: BlockRequirements
 
     data: bytes  # Arbitrary data, eventually a merkle tree most likely.
+    transactions: List[Transaction] = None  # Solve requests included in this block
 
     # NOTE: Maybe move this to a separate "NetworkBlock" class which returns
-    #       Block, BlockHash, Signature on parse. 
-    #      For now, we keep this coupled, but it is usually a not great idea to 
+    #       Block, BlockHash, Signature on parse.
+    #      For now, we keep this coupled, but it is usually a not great idea to
     #      couple signatures to the data they sign, network serialization, etc.
 
     # Computed Fields
     # Everything except the signature.
-    raw: Optional[bytes]
+    raw: Optional[bytes] = None
     # Network hash (hash of the actual serialized network bytes)
-    hash: Optional[bytes]
+    hash: Optional[bytes] = None
     # signature bytes
-    signature: Optional[bytes]
+    signature: Optional[bytes] = None
+
+    def __post_init__(self):
+        """Initialize default values for optional fields."""
+        if self.transactions is None:
+            self.transactions = []
 
     def to_network(self) -> bytes:
         """Serialize to binary format, excluding derived fields (raw, hash).
@@ -534,7 +697,14 @@ class Block:
         result += self.quantum_proof.to_network()
         result += self.next_block_requirements.to_network()
         result += write_bytes(self.data)
-        if self.signature: 
+
+        # Serialize transactions
+        result += struct.pack('!I', len(self.transactions))
+        for tx in self.transactions:
+            tx_data = tx.to_network()
+            result += struct.pack('!I', len(tx_data)) + tx_data
+
+        if self.signature:
             result += write_bytes(self.signature)
         return result
 
@@ -571,8 +741,19 @@ class Block:
         req_size = len(next_block_requirements.to_network())
         offset += req_size
 
-        # Read data and signature
+        # Read data
         block_data, offset = read_bytes(data, offset)
+
+        # Read transactions
+        num_transactions = struct.unpack('!I', data[offset:offset+4])[0]
+        offset += 4
+        transactions = []
+        for _ in range(num_transactions):
+            tx_len = struct.unpack('!I', data[offset:offset+4])[0]
+            offset += 4
+            tx_data = data[offset:offset+tx_len]
+            offset += tx_len
+            transactions.append(Transaction.from_network(tx_data))
 
         # Validate the block data is well formed.
         # TODO: Do this at the top of the function with a static signature size.
@@ -597,8 +778,9 @@ class Block:
             quantum_proof=quantum_proof,
             next_block_requirements=next_block_requirements,
             data=block_data,
-            raw=raw,  
-            hash=hash,  
+            transactions=transactions,
+            raw=raw,
+            hash=hash,
             signature=signature
         )
 
@@ -631,6 +813,7 @@ class Block:
             'quantum_proof': self.quantum_proof.to_json(),
             'next_block_requirements': self.next_block_requirements.to_json(),
             'data': self.data.hex(),
+            'transactions': [tx.to_json() for tx in self.transactions],
             'raw': self.raw.hex() if self.raw else None,
             'hash': self.hash.hex() if self.hash else None,
             'signature': self.signature.hex() if self.signature else None
@@ -679,6 +862,11 @@ class Block:
         except ValueError:
             block_data = data['data'].encode()
 
+        # Parse transactions
+        transactions = []
+        if 'transactions' in data and data['transactions']:
+            transactions = [Transaction.from_json(tx_data) for tx_data in data['transactions']]
+
         # Create block
         block = cls(
             header=header,
@@ -686,6 +874,7 @@ class Block:
             quantum_proof=quantum_proof,
             next_block_requirements=next_block_requirements,
             data=block_data,
+            transactions=transactions,
             raw=raw_bytes,
             hash=bytes.fromhex(data['hash']) if data.get('hash') else b'',
             signature=bytes.fromhex(data['signature']) if data.get('signature') else b''
@@ -757,7 +946,8 @@ def create_genesis_block(genesis_data: Optional[dict] = None) -> Block:
             "difficulty_energy": -1000.0,
             "min_diversity": 0.28,
             "min_solutions": 10,
-            "timeout_to_difficulty_adjustment_decay": 600
+            "timeout_to_difficulty_adjustment_decay": 600,
+            "h_values": [-1.0, 0.0, 1.0]
         },
         "quantum_proof": None,
         "miner_info": None
