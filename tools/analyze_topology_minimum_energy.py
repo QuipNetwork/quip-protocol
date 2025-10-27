@@ -68,28 +68,43 @@ def analyze_topology(topology_name: str, topology_obj) -> Dict:
         'edge_density': len(edges) / (len(nodes) * (len(nodes) - 1) // 2)
     }
 
-def calculate_theoretical_minimum_energy(topology_data: Dict, num_samples: int = 50,
-                                        num_reads: int = 64, num_sweeps: int = 256) -> Dict:
+def calculate_theoretical_minimum_energy(
+    topology_data: Dict,
+    num_samples: int = 50,
+    num_reads: int = 64,
+    num_sweeps: int = 256,
+    h_values: List[float] = None
+) -> Dict:
     """
     Calculate theoretical minimum energy bounds for random Ising problems.
 
     For each random Ising problem:
     - J values are +1 or -1 for each edge
-    - h fields are 0 for all nodes
-    - Theoretical minimum is when all couplings contribute negatively
+    - h fields are generated from h_values distribution
 
-    This function now tests both:
+    Args:
+        topology_data: Dictionary containing topology information
+        num_samples: Number of random Ising problems to sample
+        num_reads: Number of SA reads per problem
+        num_sweeps: Number of SA sweeps per read
+        h_values: List of allowed h field values (default: [-1, 0, +1])
+
+    This function tests both:
     1. Random guessing (baseline to show optimization is necessary)
     2. Simulated Annealing (what miners actually use)
     """
+    if h_values is None:
+        h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
+
     topology_name = topology_data['topology_name']
     nodes = topology_data['nodes']
     edges = topology_data['edges']
 
     print(f"\n=== Theoretical Energy Analysis for {topology_name.upper()} (n={num_samples} samples) ===")
+    print(f"h_values distribution: {h_values}")
 
     # Calculate expected ground state energy using shared formula
-    expected_gse = expected_solution_energy(nodes, edges, c=0.75)
+    expected_gse = expected_solution_energy(nodes, edges, c=0.75, h_values=h_values)
     print(f"Expected ground state energy (empirical formula): {expected_gse:.1f}")
     print(f"Running SA with num_reads={num_reads}, num_sweeps={num_sweeps}")
 
@@ -110,8 +125,8 @@ def calculate_theoretical_minimum_energy(topology_data: Dict, num_samples: int =
         if seed % 10 == 0:
             print(f"  Processing sample {seed}/{num_samples}...")
 
-        # Generate random Ising problem
-        h, J = generate_ising_model_from_nonce(seed, nodes, edges)
+        # Generate random Ising problem with specified h_values
+        h, J = generate_ising_model_from_nonce(seed, nodes, edges, h_values=h_values)
 
         # Calculate theoretical bounds
         # Theoretical minimum: all J values contribute negatively
@@ -206,7 +221,8 @@ def calculate_theoretical_minimum_energy(topology_data: Dict, num_samples: int =
         'expected_gse': expected_gse,
         'expected_variance': math.sqrt(len(edges)),
         'num_reads': num_reads,
-        'num_sweeps': num_sweeps
+        'num_sweeps': num_sweeps,
+        'h_values': h_values  # Record which distribution was used
     }
 
 def calculate_sa_theoretical_bounds(topology_data: Dict, energy_data: Dict) -> Dict:
@@ -369,8 +385,16 @@ Examples:
     parser.add_argument('--verbose', '-v',
                        action='store_true',
                        help='Enable verbose output')
-    
+
+    parser.add_argument('--h-values',
+                       type=str,
+                       default='-1,0,1',
+                       help='Comma-separated h field values (default: -1,0,1). Use "0" for h=0 baseline.')
+
     args = parser.parse_args()
+
+    # Parse h_values
+    h_values = [float(v) for v in args.h_values.split(',')]
     
     # Handle 'all' topology selection
     if 'all' in args.topology:
@@ -380,6 +404,7 @@ Examples:
     
     print(f"Analyzing topologies: {', '.join(selected_topologies)}")
     print(f"Number of samples per topology: {args.samples}")
+    print(f"Using h_values: {h_values}")
     
     start_time = time.time()
     results = []
@@ -396,7 +421,7 @@ Examples:
         
         # Step 2: Calculate theoretical energy bounds
         energy_data = calculate_theoretical_minimum_energy(
-            topology_data, args.samples, args.num_reads, args.num_sweeps
+            topology_data, args.samples, args.num_reads, args.num_sweeps, h_values=h_values
         )
         
         # Step 3: Calculate SA theoretical bounds

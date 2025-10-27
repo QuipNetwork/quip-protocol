@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from blake3 import blake3
 from shared.logging_config import get_logger
-from typing import Any, Tuple, Dict
+from typing import Any, Tuple, Dict, Optional
 import numpy as np
 from typing import List
 
@@ -28,15 +28,57 @@ def ising_nonce_from_block(prev_hash: bytes, miner_id: str, cur_index: int, salt
     return nonce
 
 
-def generate_ising_model_from_nonce(nonce: int, nodes: List[int], edges: List[Tuple[int, int]]) -> Tuple[Dict[int, float], Dict[tuple, float]]:
-    """Generate (h, J) Ising parameters deterministically from a block.
+def generate_ising_model_from_nonce(
+    nonce: int,
+    nodes: List[int],
+    edges: List[Tuple[int, int]],
+    h_values: Optional[List[float]] = None
+) -> Tuple[Dict[int, float], Dict[tuple, float]]:
+    """Generate (h, J) Ising parameters deterministically from a nonce.
 
-    Deterministic given seed, node list and edge list. We assign h=0 and J in {-1,+1} per edge.
+    Args:
+        nonce: Random seed for deterministic generation
+        nodes: List of node IDs in the topology
+        edges: List of edge tuples in the topology
+        h_values: List of allowed h field values (default: [-1, 0, +1])
+                 Use [0] for backward compatibility (h=0 everywhere)
+
+    Returns:
+        (h, J) where:
+          - h: Dict mapping node_id → field value from h_values
+          - J: Dict mapping (u,v) → coupling value in {-1, +1}
+
+    Note on h_values choice:
+        The default [-1, 0, +1] distribution is chosen because:
+        1. Very large |h| values make problems easier (h dominates, graph structure
+           becomes irrelevant, greedy solutions work)
+        2. Very small |h| values add little quantum advantage (h contributes nothing)
+        3. Continuous vs discrete h makes no computational difference for SA hardness
+           (both have same energy landscape topology, same local minima structure)
+        4. Discrete values are simpler (int8 efficient, easy validation, no float precision issues)
+        5. Including 0 keeps h contribution (~27%) balanced with J (~73%), preserving
+           graph-structured problem (favoring quantum hardware)
     """
+    if h_values is None:
+        h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
+
     np.random.seed(nonce)
 
-    h = {int(i): 0.0 for i in nodes}
-    J = { (int(u), int(v)) if isinstance(u, (int, np.integer)) and isinstance(v, (int, np.integer)) else (int(u), int(v)) : float(2*np.random.randint(2)-1) for (u, v) in edges }
+    # Generate J: random ±1 for each edge
+    J = {
+        (int(u), int(v)) if isinstance(u, (int, np.integer)) and isinstance(v, (int, np.integer)) else (int(u), int(v)):
+        float(2 * np.random.randint(2) - 1)
+        for (u, v) in edges
+    }
+
+    # Generate h: random selection from h_values for each node
+    if len(h_values) == 1 and h_values[0] == 0.0:
+        # Optimization: if h_values = [0], skip random generation
+        h = {int(i): 0.0 for i in nodes}
+    else:
+        # General case: sample from h_values distribution
+        h_vals = np.random.choice(h_values, size=len(nodes))
+        h = {int(node_id): float(h_vals[idx]) for idx, node_id in enumerate(nodes)}
 
     return h, J
 
@@ -219,23 +261,30 @@ def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
     return selected_indices
 
 
-def _validate_topology_consistency(h: Dict[int, float], J: Dict[Tuple[int, int], float], nodes: List[int]) -> List[str]:
+def _validate_topology_consistency(
+    h: Dict[int, float],
+    J: Dict[Tuple[int, int], float],
+    nodes: List[int],
+    allowed_h_values: Optional[List[float]] = None
+) -> List[str]:
     """Validate that h, J parameters match expected topology and constraints.
-    
+
     Args:
         h: Field parameters dictionary
         J: Coupling parameters dictionary
         nodes: List of node indices for the topology
-        
+        allowed_h_values: List of valid h values (default: any float)
+                         Set to validate h values are in allowed set
+
     Returns:
         List of error messages (empty if valid)
     """
     errors = []
-    
+
     # Get expected topology
     expected_nodes = set(DEFAULT_TOPOLOGY.graph.nodes())
     expected_edges = set(DEFAULT_TOPOLOGY.graph.edges())
-    
+
     # 1. Validate nodes match topology
     provided_nodes = set(nodes)
     if provided_nodes != expected_nodes:
@@ -245,15 +294,27 @@ def _validate_topology_consistency(h: Dict[int, float], J: Dict[Tuple[int, int],
             errors.append(f"Missing topology nodes: {sorted(missing_nodes)}")
         if extra_nodes:
             errors.append(f"Extra nodes not in topology: {sorted(extra_nodes)}")
-    
-    # 2. Validate h parameters (should be h=0 for all nodes)
+
+    # 2. Validate h parameters
     h_nodes = set(h.keys())
-    for node_id in h_nodes:
-        if node_id not in expected_nodes:
-            errors.append(f"h parameter for invalid node: {node_id}")
-        elif h[node_id] != 0.0:
-            errors.append(f"Non-zero field value h[{node_id}] = {h[node_id]} (expected 0.0)")
-    
+
+    # Validate h values are in allowed set (if specified)
+    if allowed_h_values is not None:
+        allowed_set = set(allowed_h_values)
+        for node_id in h_nodes:
+            if node_id not in expected_nodes:
+                errors.append(f"h parameter for invalid node: {node_id}")
+            elif h[node_id] not in allowed_set:
+                errors.append(
+                    f"Invalid h[{node_id}] = {h[node_id]}, "
+                    f"expected one of {allowed_h_values}"
+                )
+    else:
+        # No allowed_h_values specified, just check nodes are valid
+        for node_id in h_nodes:
+            if node_id not in expected_nodes:
+                errors.append(f"h parameter for invalid node: {node_id}")
+
     # Check for missing h parameters
     missing_h = expected_nodes - h_nodes
     if missing_h:
@@ -316,7 +377,15 @@ def validate_quantum_proof(quantum_proof, miner_id: str, requirements, block_ind
         logger.error(f"Block {block_index} rejected: invalid nonce {quantum_proof.nonce} != {nonce}")
         return False
 
-    h, J = generate_ising_model_from_nonce(nonce, quantum_proof.nodes, quantum_proof.edges)
+    # Get h_values from requirements
+    h_values = getattr(requirements, 'h_values', None)
+
+    h, J = generate_ising_model_from_nonce(
+        nonce,
+        quantum_proof.nodes,
+        quantum_proof.edges,
+        h_values=h_values
+    )
 
     # Validate each solution for correctness
     valid_solutions = []
@@ -466,7 +535,11 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         # NOTE: we use the same energy function to ensure consistency. Unfortunately
         # it disagrees with energies created by different sampler impls, but not significantly.
         solutions = list(sampleset.record.sample)
-        h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+
+        # Get h_values from requirements
+        h_values = getattr(requirements, 'h_values', None)
+
+        h, J = generate_ising_model_from_nonce(nonce, nodes, edges, h_values=h_values)
         best_energy = min(energies_for_solutions(solutions, h, J, nodes))
 
         if best_energy > difficulty_energy:
