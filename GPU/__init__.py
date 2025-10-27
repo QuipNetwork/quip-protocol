@@ -1,10 +1,27 @@
 """GPU mining components for quantum blockchain."""
 
 from .sampler import GPUSampler
-from .cuda_sa import CudaSASampler
-from .modal_sampler import ModalSampler, gpu_app
-from .cuda_miner import CudaMiner
-from .modal_miner import ModalMiner
+
+# Try to import CUDA components (only available with cupy)
+try:
+    from .cuda_sa import CudaSASampler
+    from .cuda_miner import CudaMiner
+    CUDA_AVAILABLE = True
+except ImportError:
+    CUDA_AVAILABLE = False
+    CudaSASampler = None
+    CudaMiner = None
+
+# Try to import Modal components
+try:
+    from .modal_sampler import ModalSampler, gpu_app
+    from .modal_miner import ModalMiner
+    MODAL_AVAILABLE = True
+except ImportError:
+    MODAL_AVAILABLE = False
+    ModalSampler = None
+    ModalMiner = None
+    gpu_app = None
 
 # Try to import Metal components (only available on macOS)
 try:
@@ -17,17 +34,19 @@ except ImportError:
     MetalMiner = None
 
 # Check if GPU functionality is available
-try:
-    import modal
-    GPU_AVAILABLE = True
-except ImportError:
-    GPU_AVAILABLE = False
+GPU_AVAILABLE = CUDA_AVAILABLE or MODAL_AVAILABLE
 
 __all__ = [
-    'GPUSampler', 'CudaSASampler', 'ModalSampler',
-    'CudaMiner', 'ModalMiner',
-    'gpu_app', 'GPU_AVAILABLE', 'METAL_AVAILABLE'
+    'GPUSampler', 'GPU_AVAILABLE', 'METAL_AVAILABLE', 'CUDA_AVAILABLE', 'MODAL_AVAILABLE'
 ]
+
+# Add CUDA components if available
+if CUDA_AVAILABLE:
+    __all__.extend(['CudaSASampler', 'CudaMiner'])
+
+# Add Modal components if available
+if MODAL_AVAILABLE:
+    __all__.extend(['ModalSampler', 'ModalMiner', 'gpu_app'])
 
 # Add Metal components if available
 if METAL_AVAILABLE:
