@@ -5,6 +5,89 @@ import numpy as np
 from typing import Dict, Tuple, List, Any
 
 
+def expected_solution_energy(nodes: List[int], edges: List[Tuple[int, int]], c: float = 0.75) -> float:
+    """Calculate expected ground state energy for random Ising problems on a given topology.
+
+    Based on empirical observations that expected energy density (GSE/N) scales with √(degree).
+    This formula accounts for topology dimensionality/connectivity effects on achievable energy.
+
+    Theory and Calibration:
+    -----------------------
+    For random Ising problems with J ∈ {-1, +1} couplings and h field params, the expected ground state
+    energy (GSE) follows an empirical scaling law:
+
+        GSE ≈ -c × √(avg_degree) × N
+
+    Where:
+        - N = number of nodes (qubits)
+        - M = number of edges (couplings)
+        - avg_degree = 2M / N (average node degree in the graph)
+        - c = empirical constant representing connectivity effects (default 0.75)
+
+    The √(degree) scaling captures how solution quality improves with connectivity, while
+    the linear N scaling reflects extensive energy growth with system size.
+
+    Example Calibration (Advantage2 topology):
+    --------------------------------------------
+    - N = 4,593 nodes
+    - M = 41,796 edges
+    - avg_degree = 2 × 41,796 / 4,593 ≈ 18.2
+    - √(avg_degree) ≈ 4.27
+    - Observed GSE ≈ -15,700
+    - Implied c ≈ 15,700 / (4.27 × 4,593) ≈ 0.80
+
+    Using c = 0.75 yields: -0.75 × 4.27 × 4,593 ≈ -14,709
+
+    Statistical Variation:
+    ---------------------
+    Individual nonces will fluctuate around this expectation by approximately ±√M due to
+    central limit theorem effects on independent random couplings. For Advantage2, this
+    means ±√41,796 ≈ ±204 energy units of nonce-to-nonce variation.
+
+    The above tracks well with our practical observations, which show energies around -14,200
+    with a standard deviation of ~200 when we aren't spending significant compute time 
+    on annealing, and better ranges when we do. You can run the tool in
+
+    Problem Bounds:
+    ------------------
+    - Theoretical minimum: -M (all edges satisfied, unachievable for frustrated systems)
+    - Practical SA solutions: Typically achieve ~35% of theoretical minimum (-14,709 vs -41,796)
+      but ~80% of the empirical expected energy (-14,200 vs -14,709 from formula) unless 
+      we work harder or search across random problems.
+    - This formula provides a statistical expectation for real-world performance
+
+    Args:
+        nodes: List of node indices for the topology
+        edges: List of edge tuples for the topology
+        c: Empirical constant (default 0.75, calibrated from Advantage2 data)
+
+    Returns:
+        Expected ground state energy (negative value)
+
+    Example:
+        >>> # Advantage2 topology
+        >>> nodes = list(range(4593))
+        >>> edges = [(i, j) for i in range(4592) for j in range(i+1, 4593) if connected(i, j)]
+        >>> expected_energy = expected_solution_energy(nodes, edges)
+        >>> print(f"Expected GSE: {expected_energy:.1f}")
+        Expected GSE: -14709.0
+    """
+    N = len(nodes)
+    M = len(edges)
+
+    # Handle edge cases
+    if N == 0 or M == 0:
+        return 0.0
+
+    # Calculate average node degree
+    avg_degree = (2.0 * M) / N
+
+    # Apply empirical scaling formula: GSE ≈ -c × √(avg_degree) × N
+    expected_gse = -c * math.sqrt(avg_degree) * N
+
+    return expected_gse
+
+
 def adjust_energy_along_curve(current_energy: float, adjustment_rate: float, direction: str) -> float:
     """Adjust energy along a curve that compresses adjustments near boundaries.
     
