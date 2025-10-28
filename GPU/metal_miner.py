@@ -150,14 +150,13 @@ class MetalMiner(BaseMiner):
         )
         self.logger.info(f"{self.miner_id} - Adaptive params: {params}")
 
-        # Track current sweeps/reads for incremental increase
+        # Track current sweeps for incremental increase (reads stay constant)
         current_num_sweeps = params.get('num_sweeps', 64)
-        current_num_reads = params.get('num_reads', 100)
-        max_num_sweeps = params.get('num_sweeps', 64)  # Target from adapt_parameters
-        max_num_reads = params.get('num_reads', 100)    # Target from adapt_parameters
+        num_reads = params.get('num_reads', 100)  # Constant - doesn't increment
+        max_num_sweeps = params.get('num_sweeps', 64)
 
-        # Increment rate: increase by 1% every 30 seconds
-        increment_interval = 30.0  # seconds
+        # Increment rate: increase by 5% every 30 seconds
+        increment_interval = 30.0
         last_increment_time = start_time
 
         # Batch size: number of nonces to evaluate simultaneously (one per GPU core)
@@ -221,19 +220,18 @@ class MetalMiner(BaseMiner):
             self.current_stage = 'preprocessing'
             self.current_stage_start = preprocess_start
 
-            # Increment sweeps/reads slowly over time
+            # Increment sweeps slowly over time (reads stay constant)
             current_time = time.time()
             if current_time - last_increment_time >= increment_interval:
-                # Increase by 1% toward max
-                current_num_sweeps = min(max_num_sweeps, int(current_num_sweeps * 1.01))
-                current_num_reads = min(max_num_reads, int(current_num_reads * 1.01))
+                # Increase sweeps by 1% toward max
+                current_num_sweeps = min(max_num_sweeps, int(current_num_sweeps * 1.05))
                 last_increment_time = current_time
 
             # Sample from Metal GPU using batched evaluation
             try:
-                # Use current (incrementing) parameters
+                # Use current sweeps (incrementing) and constant reads
                 num_sweeps = current_num_sweeps
-                num_reads = current_num_reads
+                # num_reads is constant throughout mining
 
                 self.logger.debug(f"Batched: {batch_size} nonces × {num_reads} reads/nonce, {num_sweeps} sweeps")
 
@@ -324,7 +322,7 @@ class MetalMiner(BaseMiner):
                     f"Time: {elapsed_total:.1f}s | "
                     f"Best energy: {best_energy:.0f} | "
                     f"Sweeps: {current_num_sweeps}/{max_num_sweeps}, "
-                    f"Reads: {current_num_reads}/{max_num_reads}"
+                    f"Reads: {num_reads}"
                 )
 
                 last_report_time = current_time
@@ -366,7 +364,7 @@ def adapt_parameters(
 
     # Metal calibration: Prefers fewer sweeps, more reads per calibration
     min_sweeps = 64      # Easiest difficulty (very fast convergence)
-    max_sweeps = 256     # Hardest difficulty (still relatively fast)
+    max_sweeps = 512     # Hardest difficulty (still relatively fast)
 
     # Direct linear scaling: difficulty × max_sweeps
     num_sweeps = max(min_sweeps, int(difficulty * max_sweeps))

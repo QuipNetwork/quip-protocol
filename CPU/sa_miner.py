@@ -101,13 +101,12 @@ class SimulatedAnnealingMiner(BaseMiner):
         )
         self.logger.info(f"{self.miner_id} - Adaptive params: {params}")
 
-        # Track current sweeps/reads for incremental increase
+        # Track current sweeps for incremental increase (reads stay constant)
         current_num_sweeps = params.get('num_sweeps', 64)
-        current_num_reads = params.get('num_reads', 100)
+        num_reads = params.get('num_reads', 100)  # Constant - doesn't increment
         max_num_sweeps = params.get('num_sweeps', 64)
-        max_num_reads = params.get('num_reads', 100)
 
-        # Increment rate: increase by 1% every 30 seconds
+        # Increment rate: increase by 5% every 30 seconds
         increment_interval = 30.0
         last_increment_time = start_time
 
@@ -146,12 +145,11 @@ class SimulatedAnnealingMiner(BaseMiner):
                             self.logger.info(f"[Block-{cur_index}] Already Mined at this difficulty! Nonce: {nonce}, Salt: {salt.hex()[:4]}..., Min Energy: {result.energy:.2f}, Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, Attempt Time: {result.mining_time:.2f}s, Total Mining Time: {time.time() - start_time:.2f}s")
                             return result
 
-            # Increment sweeps/reads slowly over time
+            # Increment sweeps slowly over time (reads stay constant)
             current_time = time.time()
             if current_time - last_increment_time >= increment_interval:
-                # Increase by 1% toward max
-                current_num_sweeps = min(max_num_sweeps, int(current_num_sweeps * 1.01))
-                current_num_reads = min(max_num_reads, int(current_num_reads * 1.01))
+                # Increase sweeps by 1% toward max
+                current_num_sweeps = min(max_num_sweeps, int(current_num_sweeps * 1.05))
                 last_increment_time = current_time
 
             # Track preprocessing time
@@ -161,9 +159,9 @@ class SimulatedAnnealingMiner(BaseMiner):
 
             # Sample from simulated annealer
             try:
-                # Use current (incrementing) parameters
+                # Use current sweeps (incrementing) and constant reads
                 num_sweeps = current_num_sweeps
-                num_reads = current_num_reads
+                # num_reads is constant throughout mining
                 
                 sample_start = time.time()
                 self.current_stage = 'sampling'
@@ -220,7 +218,7 @@ class SimulatedAnnealingMiner(BaseMiner):
                 best_energy = min(self.top_attempts[0].sampleset.record.energy) if self.top_attempts else float('inf')
                 self.logger.info(
                     f"Progress: {progress} attempts, best energy: {best_energy:.2f} | "
-                    f"Sweeps: {current_num_sweeps}/{max_num_sweeps}, Reads: {current_num_reads}/{max_num_reads}"
+                    f"Sweeps: {current_num_sweeps}/{max_num_sweeps}, Reads: {num_reads}"
                 )
 
         self.logger.info("Stopping mining, no results found")

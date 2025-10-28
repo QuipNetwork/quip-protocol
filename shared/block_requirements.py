@@ -2,6 +2,7 @@
 
 from asyncio.log import logger
 import logging
+import random
 from typing import Optional
 
 from shared.block import Block, BlockRequirements
@@ -15,6 +16,72 @@ internal_logger = logging.getLogger(__name__)
 ##
 # Block Requirements adjustments for QPoW
 ##
+
+
+def calculate_adjustment_rate_with_randomness(
+    mining_time: float,
+    direction: str
+) -> float:
+    """Calculate time-based randomized adjustment rate for difficulty changes.
+
+    Uses mining time to determine base adjustment rate and variance, with
+    linear interpolation for intermediate times.
+
+    Args:
+        mining_time: Time taken to mine the block in seconds
+        direction: Either 'harder' or 'easier'
+
+    Returns:
+        Randomized adjustment rate (e.g., 0.35 for 35%)
+
+    For HARDENING ('harder'):
+        - < 360s: 35% ± 30% (range: 5% to 65%)
+        - > 600s: 5% ± 4% (range: 1% to 9%)
+        - 360s-600s: Linear interpolation
+
+    For EASING ('easier'):
+        - > 1200s: 15% ± 14% (range: 1% to 29%)
+        - < 600s: 2.5% ± 2% (range: 0.5% to 4.5%)
+        - 600s-1200s: Linear interpolation
+    """
+    if direction == 'harder':
+        # HARDENING ranges
+        if mining_time < 360.0:
+            base_rate = 0.35
+            variance = 0.30
+        elif mining_time > 600.0:
+            base_rate = 0.05
+            variance = 0.04
+        else:
+            # Linear interpolation between 360s and 600s
+            # At 360s: rate=35%, variance=30%
+            # At 600s: rate=5%, variance=4%
+            progress = (mining_time - 360.0) / (600.0 - 360.0)
+            base_rate = 0.35 - progress * (0.35 - 0.05)
+            variance = 0.30 - progress * (0.30 - 0.04)
+
+    else:  # 'easier'
+        # EASING ranges
+        if mining_time > 1200.0:
+            base_rate = 0.15
+            variance = 0.14
+        elif mining_time < 600.0:
+            base_rate = 0.025
+            variance = 0.02
+        else:
+            # Linear interpolation between 600s and 1200s
+            # At 600s: rate=2.5%, variance=2%
+            # At 1200s: rate=15%, variance=14%
+            progress = (mining_time - 600.0) / (1200.0 - 600.0)
+            base_rate = 0.025 + progress * (0.15 - 0.025)
+            variance = 0.02 + progress * (0.14 - 0.02)
+
+    # Apply randomness within variance
+    min_rate = max(0.001, base_rate - variance)  # Ensure at least 0.1%
+    max_rate = base_rate + variance
+    adjustment_rate = random.uniform(min_rate, max_rate)
+
+    return adjustment_rate
 
 
 def compute_current_requirements(
@@ -162,10 +229,8 @@ def compute_next_block_requirements(previous_block: Block, mining_result: Mining
         prev_miner_id = previous_block.miner_info.miner_id
         prev_winner = prev_miner_id.split('-')[1] if '-' in prev_miner_id else prev_miner_id
 
-    # Base adjustment rates
-    energy_adjustment_rate = 0.05  # 5% adjustment along curve
-    diversity_adjustment_rate = 0.02  # 2% adjustment
-    solutions_adjustment_rate = 0.10  # 10% adjustment
+    # Get mining time for time-based adjustment calculation
+    mining_time = mining_result.mining_time if mining_result.mining_time is not None else 600.0
 
     # Use blockchain-defined ranges for constraints
     # Currently fixed at (0.3, 0.3) and (20, 20) but infrastructure ready for chain consensus
@@ -186,13 +251,16 @@ def compute_next_block_requirements(previous_block: Block, mining_result: Mining
 
     # If block was mined too quickly, always HARDEN
     if mining_result.mining_time is not None and mining_result.mining_time < 360.0:
+        # Calculate time-based randomized adjustment rate
+        energy_adjustment_rate = calculate_adjustment_rate_with_randomness(mining_time, 'harder')
+
         curve_energy = adjust_energy_along_curve(prev_req.difficulty_energy, energy_adjustment_rate, 'harder')
         new_difficulty_energy = apply_min_adjustment(prev_req.difficulty_energy, curve_energy, 'harder')
-        new_min_diversity = min(MAX_DIVERSITY, prev_req.min_diversity + diversity_adjustment_rate)
-        new_min_solutions = min(MAX_SOLUTIONS, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
+        new_min_diversity = min(MAX_DIVERSITY, prev_req.min_diversity + energy_adjustment_rate * 0.4)  # Scale for diversity
+        new_min_solutions = min(MAX_SOLUTIONS, int(prev_req.min_solutions * (1 + energy_adjustment_rate * 2)))  # Scale for solutions
 
         log.info(
-            f"Block was mined in {mining_result.mining_time:.2f}s (<360s) - HARDENING difficulty")
+            f"Block was mined in {mining_result.mining_time:.2f}s (<360s) - HARDENING difficulty (rate: {energy_adjustment_rate:.1%})")
         log.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
         log.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
         log.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
@@ -200,25 +268,31 @@ def compute_next_block_requirements(previous_block: Block, mining_result: Mining
         log.info(f"Last winner: {prev_winner}, current winner: {current_winner}")
         if current_winner == prev_winner:
             # Same miner won again - make it EASIER
+            # Calculate time-based randomized adjustment rate
+            energy_adjustment_rate = calculate_adjustment_rate_with_randomness(mining_time, 'easier')
+
             # Higher energy threshold (less negative), lower diversity/solutions
             curve_energy = adjust_energy_along_curve(prev_req.difficulty_energy, energy_adjustment_rate, 'easier')
             new_difficulty_energy = apply_min_adjustment(prev_req.difficulty_energy, curve_energy, 'easier')
-            new_min_diversity = max(MIN_DIVERSITY, prev_req.min_diversity - diversity_adjustment_rate)
-            new_min_solutions = max(MIN_SOLUTIONS, int(prev_req.min_solutions * (1 - solutions_adjustment_rate)))
+            new_min_diversity = max(MIN_DIVERSITY, prev_req.min_diversity - energy_adjustment_rate * 0.4)  # Scale for diversity
+            new_min_solutions = max(MIN_SOLUTIONS, int(prev_req.min_solutions * (1 - energy_adjustment_rate * 2)))  # Scale for solutions
 
-            log.info(f"Same miner type ({current_winner}) won - EASING difficulty")
+            log.info(f"Same miner type ({current_winner}) won - EASING difficulty (rate: {energy_adjustment_rate:.1%}, time: {mining_time:.1f}s)")
             log.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
             log.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
             log.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
         else:
             # Different miner won - make it HARDER
+            # Calculate time-based randomized adjustment rate
+            energy_adjustment_rate = calculate_adjustment_rate_with_randomness(mining_time, 'harder')
+
             # Lower energy threshold (more negative), higher diversity/solutions
             curve_energy = adjust_energy_along_curve(prev_req.difficulty_energy, energy_adjustment_rate, 'harder')
             new_difficulty_energy = apply_min_adjustment(prev_req.difficulty_energy, curve_energy, 'harder')
-            new_min_diversity = min(MAX_DIVERSITY, prev_req.min_diversity + diversity_adjustment_rate)
-            new_min_solutions = min(MAX_SOLUTIONS, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
+            new_min_diversity = min(MAX_DIVERSITY, prev_req.min_diversity + energy_adjustment_rate * 0.4)  # Scale for diversity
+            new_min_solutions = min(MAX_SOLUTIONS, int(prev_req.min_solutions * (1 + energy_adjustment_rate * 2)))  # Scale for solutions
 
-            log.info(f"Different miner type won ({prev_winner} -> {current_winner}) - HARDENING difficulty")
+            log.info(f"Different miner type won ({prev_winner} -> {current_winner}) - HARDENING difficulty (rate: {energy_adjustment_rate:.1%}, time: {mining_time:.1f}s)")
             log.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
             log.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
             log.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")

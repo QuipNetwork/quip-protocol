@@ -248,18 +248,17 @@ class CudaMiner(BaseMiner):
             num_edges=len(self.edges)
         )
 
-        # Track current sweeps/reads for incremental increase
+        # Track current sweeps for incremental increase (reads stay constant)
         current_num_sweeps = params['num_sweeps']
-        current_num_reads = params['num_reads']
+        num_reads = params['num_reads']  # Constant - doesn't increment
         max_num_sweeps = params['num_sweeps']
-        max_num_reads = params['num_reads']
         num_sweeps_per_beta = params['num_sweeps_per_beta']
 
-        # Increment rate: increase by 1% every 30 seconds
+        # Increment rate: increase by 5% every 30 seconds
         increment_interval = 30.0
         last_increment_time = start_time
 
-        self.logger.info(f"Adaptive params: {current_num_sweeps} sweeps, {current_num_reads} reads")
+        self.logger.info(f"Adaptive params: {current_num_sweeps} sweeps, {num_reads} reads")
 
         # Batch size: number of jobs to run in parallel
         # Use number of SMs (streaming multiprocessors) for optimal parallelism
@@ -270,12 +269,11 @@ class CudaMiner(BaseMiner):
 
         attempts = 0
         while not stop_event.is_set():
-            # Increment sweeps/reads slowly over time
+            # Increment sweeps slowly over time (reads stay constant)
             current_time = time.time()
             if current_time - last_increment_time >= increment_interval:
-                # Increase by 1% toward max
-                current_num_sweeps = min(max_num_sweeps, int(current_num_sweeps * 1.01))
-                current_num_reads = min(max_num_reads, int(current_num_reads * 1.01))
+                # Increase sweeps by 1% toward max
+                current_num_sweeps = min(max_num_sweeps, int(current_num_sweeps * 1.05))
                 last_increment_time = current_time
             # Generate batch of Ising problems
             h_list = []
@@ -314,8 +312,8 @@ class CudaMiner(BaseMiner):
                 samplesets = self.async_sampler.sample_ising(
                     h_list=h_list,
                     J_list=J_list,
-                    num_reads=current_num_reads,
-                    num_betas=current_num_sweeps,
+                    num_reads=num_reads,  # Constant
+                    num_betas=current_num_sweeps,  # Incrementing
                     num_sweeps_per_beta=num_sweeps_per_beta,
                     edges=self.edges,
                     timeout=300.0  # 5 minute timeout for production problems
@@ -361,7 +359,7 @@ class CudaMiner(BaseMiner):
                 rate = attempts / elapsed if elapsed > 0 else 0
                 self.logger.info(
                     f"Attempts: {attempts} ({rate:.1f}/s), elapsed: {elapsed:.1f}s | "
-                    f"Sweeps: {current_num_sweeps}/{max_num_sweeps}, Reads: {current_num_reads}/{max_num_reads}"
+                    f"Sweeps: {current_num_sweeps}/{max_num_sweeps}, Reads: {num_reads}"
                 )
 
         self.logger.info("Mining stopped by stop_event")
