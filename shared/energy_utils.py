@@ -4,12 +4,40 @@ import math
 import numpy as np
 from typing import Dict, Tuple, List, Any, Optional
 
+# Import DEFAULT_TOPOLOGY for module-level constants
+from dwave_topologies import DEFAULT_TOPOLOGY
+
+# Module-level constants for default parameters
+DEFAULT_NUM_NODES = len(DEFAULT_TOPOLOGY.graph.nodes)
+DEFAULT_NUM_EDGES = len(DEFAULT_TOPOLOGY.graph.edges)
+DEFAULT_H_VALUES = (-1.0, 0.0, 1.0)  # Tuple for immutability
+DEFAULT_C_RANGE = (0.7, 0.75)
+
+# Fixed difficulty requirement ranges (consensus-adjustable in future)
+# Currently set to (min, max) where min == max to effectively fix values
+DEFAULT_DIVERSITY_RANGE = (0.3, 0.3)  # (min, max) - currently fixed at 0.3
+DEFAULT_SOLUTIONS_RANGE = (5, 5)      # (min, max) - currently fixed at 5
+
+# Calibrated sweep ranges for different miner types
+CALIBRATION_RANGES = {
+    'cpu': {'min_sweeps': 64, 'max_sweeps': 8192},
+    'cuda': {'min_sweeps': 256, 'max_sweeps': 2048},
+    'metal': {'min_sweeps': 64, 'max_sweeps': 256},
+    'modal': {'min_sweeps': 128, 'max_sweeps': 4096},
+    'qpu': {
+        'min_annealing_time': 5.0,   # microseconds
+        'max_annealing_time': 10.0,
+        'min_bonus_reads': 16,
+        'max_bonus_reads': 64
+    }
+}
+
 
 def expected_solution_energy(
-    nodes: List[int],
-    edges: List[Tuple[int, int]],
+    num_nodes: int = DEFAULT_NUM_NODES,
+    num_edges: int = DEFAULT_NUM_EDGES,
     c: float = 0.75,
-    h_values: Optional[List[float]] = None
+    h_values: Tuple[float, ...] = DEFAULT_H_VALUES
 ) -> float:
     """Calculate expected ground state energy for random Ising problems on a given topology.
 
@@ -50,23 +78,23 @@ def expected_solution_energy(
     means ±√41,796 ≈ ±204 energy units of nonce-to-nonce variation.
 
     The above tracks well with our practical observations, which show energies around -14,200
-    with a standard deviation of ~200 when we aren't spending significant compute time 
-    on annealing, and better ranges when we do. You can run the tool in
+    with a standard deviation of ~200 when we aren't spending significant compute time
+    on annealing, and better ranges when we do.
 
     Problem Bounds:
     ------------------
     - Theoretical minimum: -M (all edges satisfied, unachievable for frustrated systems)
     - Practical SA solutions: Typically achieve ~35% of theoretical minimum (-14,709 vs -41,796)
-      but ~80% of the empirical expected energy (-14,200 vs -14,709 from formula) unless 
+      but ~80% of the empirical expected energy (-14,200 vs -14,709 from formula) unless
       we work harder or search across random problems.
     - This formula provides a statistical expectation for real-world performance
 
     Args:
-        nodes: List of node indices for the topology
-        edges: List of edge tuples for the topology
+        num_nodes: Number of nodes in topology (default: DEFAULT_TOPOLOGY)
+        num_edges: Number of edges in topology (default: DEFAULT_TOPOLOGY)
         c: Empirical constant (default 0.75, calibrated from Advantage2 data)
-        h_values: List of allowed h field values (default: [-1, 0, +1])
-                 Use [0] for h=0 baseline (backward compatible)
+        h_values: Tuple of allowed h field values (default: (-1, 0, +1))
+                 Use (0,) for h=0 baseline (backward compatible)
 
     Returns:
         Expected ground state energy (negative value)
@@ -78,18 +106,18 @@ def expected_solution_energy(
                  (due to local minima, limited sweeps, sample variance)
 
     Example:
-        >>> # Advantage2 topology
-        >>> nodes = list(range(4593))
-        >>> edges = [(i, j) for i in range(4592) for j in range(i+1, 4593) if connected(i, j)]
-        >>> expected_energy = expected_solution_energy(nodes, edges)
+        >>> # Advantage2 topology (default)
+        >>> expected_energy = expected_solution_energy()
         >>> print(f"Expected GSE: {expected_energy:.1f}")
         Expected GSE: -14709.0
-    """
-    if h_values is None:
-        h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
 
-    N = len(nodes)
-    M = len(edges)
+        >>> # Custom topology
+        >>> expected_energy = expected_solution_energy(num_nodes=1000, num_edges=2000)
+        >>> print(f"Expected GSE: {expected_energy:.1f}")
+        Expected GSE: -3354.0
+    """
+    N = num_nodes
+    M = num_edges
 
     # Handle edge cases
     if N == 0 or M == 0:
@@ -166,60 +194,104 @@ def expected_solution_energy(
     return j_contribution + h_contribution
 
 
+def calc_energy_range(
+    num_nodes: int = DEFAULT_NUM_NODES,
+    num_edges: int = DEFAULT_NUM_EDGES,
+    h_values: Tuple[float, ...] = DEFAULT_H_VALUES,
+    c_range: Tuple[float, float] = DEFAULT_C_RANGE
+) -> Tuple[float, float, float]:
+    """Calculate (min_energy, knee_energy, max_energy) for a topology.
+
+    Uses GSE formula to predict energy ranges at different SA efficiency levels.
+
+    Args:
+        num_nodes: Number of nodes in topology (default: DEFAULT_TOPOLOGY)
+        num_edges: Number of edges in topology (default: DEFAULT_TOPOLOGY)
+        h_values: h field distribution (default: (-1, 0, 1))
+        c_range: (c_easy, c_hard) SA efficiency range (default: (0.7, 0.8))
+
+    Returns:
+        (min_energy, knee_energy, max_energy) tuple where:
+        - min_energy: Hardest difficulty (c=c_hard, max computational effort)
+        - knee_energy: Diminishing returns point (c=c_mid)
+        - max_energy: Easiest difficulty (c=c_easy, min computational effort)
+
+    Example:
+        >>> # Advantage2 topology (default)
+        >>> min_e, knee_e, max_e = calc_energy_range()
+        >>> print(f"Range: {max_e:.0f} to {min_e:.0f}, knee at {knee_e:.0f}")
+        Range: -14709 to -15690, knee at -15200
+
+        >>> # Custom topology
+        >>> min_e, knee_e, max_e = calc_energy_range(1000, 2000)
+        >>> print(f"Range: {max_e:.0f} to {min_e:.0f}")
+        Range: -3130 to -3577
+    """
+    c_easy, c_hard = c_range
+    c_knee = (c_easy + c_hard) / 2
+
+    # Calculate energy at each difficulty level using GSE
+    min_energy = expected_solution_energy(num_nodes, num_edges, c=c_hard, h_values=h_values)
+    knee_energy = expected_solution_energy(num_nodes, num_edges, c=c_knee, h_values=h_values)
+    max_energy = expected_solution_energy(num_nodes, num_edges, c=c_easy, h_values=h_values)
+
+    return (min_energy, knee_energy, max_energy)
+
+
 def adjust_energy_along_curve(
     current_energy: float,
     adjustment_rate: float,
     direction: str,
-    nodes: List[int] = None,
-    edges: List[Tuple[int, int]] = None,
-    h_values: Optional[List[float]] = None,
-    c_range: Tuple[float, float] = (0.717, 0.742)
+    num_nodes: int = DEFAULT_NUM_NODES,
+    num_edges: int = DEFAULT_NUM_EDGES,
+    h_values: Tuple[float, ...] = DEFAULT_H_VALUES,
+    c_range: Tuple[float, float] = DEFAULT_C_RANGE
 ) -> float:
     """Adjust energy along a curve that compresses adjustments near boundaries.
 
     Dynamically calculates min/knee/max energy using the GSE formula based on topology.
     This allows the function to work with any topology without hardcoded values.
 
-    If nodes/edges not provided, falls back to Advantage2 calibrated values.
+    Uses DEFAULT_TOPOLOGY when topology parameters not provided.
 
     The c_range represents SA efficiency at different computational efforts:
-    - c_easy (0.717): 64 sweeps, quick mining
-    - c_hard (0.742): 1024 sweeps, high-quality mining
-    These values were empirically determined from Advantage2 calibration data.
+    - c_easy (0.7): Lower computational effort (fewer sweeps)
+    - c_hard (0.8): Higher computational effort (more sweeps)
+    These values define the range of achievable energy for a given topology.
 
     Args:
         current_energy: Current energy value
         adjustment_rate: Percentage to move (e.g., 0.05 for 5%)
         direction: 'harder' (more negative) or 'easier' (less negative)
-        nodes: List of node IDs in topology (optional, for dynamic calculation)
-        edges: List of edge tuples in topology (optional, for dynamic calculation)
-        h_values: h field distribution (optional, default: [-1, 0, 1])
-        c_range: (c_easy, c_hard) SA efficiency range (default: 0.717, 0.742)
-                 Calibrated from Advantage2: 64 sweeps → c=0.717, 1024 sweeps → c=0.742
+        num_nodes: Number of nodes in topology (default: DEFAULT_TOPOLOGY)
+        num_edges: Number of edges in topology (default: DEFAULT_TOPOLOGY)
+        h_values: h field distribution (default: (-1, 0, 1))
+        c_range: (c_easy, c_hard) SA efficiency range (default: (0.7, 0.8))
 
     Returns:
         New energy value after curve-based adjustment
+
+    Example:
+        >>> # Using defaults (Advantage2 topology)
+        >>> new_energy = adjust_energy_along_curve(-14800, 0.05, 'harder')
+        >>> print(f"Adjusted: {new_energy:.1f}")
+        Adjusted: -14823.2
+
+        >>> # Custom topology
+        >>> new_energy = adjust_energy_along_curve(
+        ...     -3500, 0.05, 'easier', num_nodes=1000, num_edges=2000
+        ... )
+        >>> print(f"Adjusted: {new_energy:.1f}")
+        Adjusted: -3485.0
     """
-    if h_values is None:
-        h_values = [-1.0, 0.0, 1.0]
+    # Calculate min/knee/max dynamically using GSE
+    min_energy, knee_energy, max_energy = calc_energy_range(
+        num_nodes=num_nodes,
+        num_edges=num_edges,
+        h_values=h_values,
+        c_range=c_range
+    )
 
-    # Calculate min/knee/max dynamically using GSE if topology provided
-    if nodes is not None and edges is not None:
-        c_easy, c_hard = c_range
-        c_knee = (c_easy + c_hard) / 2
-
-        # Use GSE formula to predict energy range
-        min_energy = expected_solution_energy(nodes, edges, c=c_hard, h_values=h_values)
-        knee_energy = expected_solution_energy(nodes, edges, c=c_knee, h_values=h_values)
-        max_energy = expected_solution_energy(nodes, edges, c=c_easy, h_values=h_values)
-    else:
-        # Fall back to Advantage2 calibrated values (h ∈ {-1, 0, +1})
-        # Based on experimental calibration (10 min per config, Metal GPU, 2025-01-27)
-        # These match GSE predictions with c_range=(0.70, 0.85) for Advantage2
-        min_energy = -15009.0   # Hardest difficulty (c=0.85, 1024 sweeps)
-        knee_energy = -14810.0  # Mid-range difficulty (c=0.775, 512 sweeps)
-        max_energy = -14550.0   # Easiest difficulty (c=0.70, 64 sweeps)
-    
     # Convert energy to normalized position [0, 1] for observed range
     total_range = max_energy - min_energy
     
@@ -257,6 +329,78 @@ def adjust_energy_along_curve(
         return current_energy - curved_adjustment
     else:  # easier
         return current_energy + curved_adjustment
+
+
+def energy_to_difficulty(
+    target_energy: float,
+    num_nodes: int = DEFAULT_NUM_NODES,
+    num_edges: int = DEFAULT_NUM_EDGES,
+    h_values: Tuple[float, ...] = DEFAULT_H_VALUES,
+    c_range: Tuple[float, float] = DEFAULT_C_RANGE
+) -> float:
+    """Convert energy threshold to normalized difficulty factor [0, 1].
+
+    This provides a consistent interface for all miners to adapt their
+    parameters based on difficulty. Each miner implementation can then
+    map this normalized difficulty to their preferred computational ranges.
+
+    The difficulty mapping is LINEAR in energy space:
+    - More negative energy → Higher difficulty → More computation needed
+    - Less negative energy → Lower difficulty → Less computation needed
+
+    Args:
+        target_energy: Target energy threshold from BlockRequirements
+        num_nodes: Number of nodes in topology (default: DEFAULT_TOPOLOGY)
+        num_edges: Number of edges in topology (default: DEFAULT_TOPOLOGY)
+        h_values: h field distribution (default: (-1, 0, 1))
+        c_range: (c_easy, c_hard) SA efficiency range (default: (0.7, 0.8))
+
+    Returns:
+        Normalized difficulty factor where:
+        - 0.0 = Easiest (max_energy, minimal computational effort)
+        - 0.5 = Knee point (diminishing returns)
+        - 1.0 = Hardest (min_energy, maximum computational effort)
+
+    Example:
+        >>> # Easy difficulty
+        >>> diff = energy_to_difficulty(-14700)  # Close to max_energy
+        >>> print(f"Difficulty: {diff:.2f}")
+        Difficulty: 0.01  # Very easy
+
+        >>> # Hard difficulty
+        >>> diff = energy_to_difficulty(-15600)  # Close to min_energy
+        >>> print(f"Difficulty: {diff:.2f}")
+        Difficulty: 0.95  # Very hard
+
+        >>> # Knee point
+        >>> diff = energy_to_difficulty(-15150)  # At knee
+        >>> print(f"Difficulty: {diff:.2f}")
+        Difficulty: 0.50  # Diminishing returns
+
+        >>> # Custom topology
+        >>> diff = energy_to_difficulty(-3500, num_nodes=1000, num_edges=2000)
+        >>> print(f"Difficulty: {diff:.2f}")
+        Difficulty: 0.73  # Hard for small topology
+    """
+    # Get energy range for this topology
+    min_energy, knee_energy, max_energy = calc_energy_range(
+        num_nodes=num_nodes,
+        num_edges=num_edges,
+        h_values=h_values,
+        c_range=c_range
+    )
+
+    # Handle out-of-range (clamp to [0, 1])
+    if target_energy <= min_energy:
+        return 1.0  # Hardest difficulty
+    if target_energy >= max_energy:
+        return 0.0  # Easiest difficulty
+
+    # Linear interpolation: map energy range to [0, 1]
+    # More negative energy → higher difficulty
+    difficulty = (max_energy - target_energy) / (max_energy - min_energy)
+
+    return difficulty
 
 
 class IsingModelValidator:

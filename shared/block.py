@@ -193,17 +193,53 @@ def decompress_solutions(data: bytes) -> tuple[List[List[int]], int]:
 
 @dataclass
 class BlockRequirements:
-    """Requirements that the next block must satisfy."""
+    """Requirements that the next block must satisfy.
+
+    Note: diversity_range and solutions_range are blockchain-level constraints
+    that define the allowable MAX values. They are stored here for convenience
+    but represent blockchain configuration rather than per-block requirements.
+    """
     difficulty_energy: float
-    min_diversity: float
-    min_solutions: int
+    min_diversity: float  # Set per block, constrained by diversity_range
+    min_solutions: int    # Set per block, constrained by solutions_range
     timeout_to_difficulty_adjustment_decay: int
     h_values: Optional[List[float]] = None
+
+    # Blockchain-level constraints (define allowable max values)
+    # Currently fixed at (0.3, 0.3) and (20, 20) but infrastructure ready for chain consensus
+    diversity_range: Optional[Tuple[float, float]] = None
+    solutions_range: Optional[Tuple[int, int]] = None
 
     def __post_init__(self):
         """Set defaults after initialization."""
         if self.h_values is None:
             self.h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
+
+        # Set range defaults from blockchain configuration
+        if self.diversity_range is None:
+            from shared.energy_utils import DEFAULT_DIVERSITY_RANGE
+            self.diversity_range = DEFAULT_DIVERSITY_RANGE
+
+        if self.solutions_range is None:
+            from shared.energy_utils import DEFAULT_SOLUTIONS_RANGE
+            self.solutions_range = DEFAULT_SOLUTIONS_RANGE
+
+        # Initialize min values from range if not already set
+        # (For now, ranges are fixed so this effectively sets them to the fixed values)
+        if self.min_diversity is None or self.min_diversity == 0:
+            self.min_diversity = self.diversity_range[0]
+        if self.min_solutions is None or self.min_solutions == 0:
+            self.min_solutions = self.solutions_range[0]
+
+    @property
+    def effective_diversity(self) -> float:
+        """Get the effective diversity requirement."""
+        return self.min_diversity
+
+    @property
+    def effective_solutions(self) -> int:
+        """Get the effective solutions requirement."""
+        return self.min_solutions
 
     def to_network(self) -> bytes:
         """Serialize to binary format."""

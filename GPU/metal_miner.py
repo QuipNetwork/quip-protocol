@@ -1,6 +1,7 @@
 """GPU miner using Metal/MPS via GPUSampler('mps')."""
 from __future__ import annotations
 
+import math
 import multiprocessing
 import multiprocessing.synchronize
 import random
@@ -18,6 +19,7 @@ from shared.quantum_proof_of_work import (
     generate_ising_model_from_nonce
 )
 from shared.block_requirements import compute_current_requirements
+from shared.energy_utils import energy_to_difficulty, DEFAULT_NUM_NODES, DEFAULT_NUM_EDGES
 from GPU.metal_sa import MetalSASampler
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
 
@@ -135,12 +137,28 @@ class MetalMiner(BaseMiner):
         min_diversity = current_requirements.min_diversity
         min_solutions = current_requirements.min_solutions
 
-        params = adapt_parameters(difficulty_energy, min_diversity, min_solutions)
-        self.logger.info(f"{self.miner_id} - Adaptive params: {params}")
-
         # Get topology information from sampler
         nodes = self.sampler.nodes
         edges = self.sampler.edges
+
+        params = adapt_parameters(
+            difficulty_energy,
+            min_diversity,
+            min_solutions,
+            num_nodes=len(nodes),
+            num_edges=len(edges)
+        )
+        self.logger.info(f"{self.miner_id} - Adaptive params: {params}")
+
+        # Track current sweeps/reads for incremental increase
+        current_num_sweeps = params.get('num_sweeps', 64)
+        current_num_reads = params.get('num_reads', 100)
+        max_num_sweeps = params.get('num_sweeps', 64)  # Target from adapt_parameters
+        max_num_reads = params.get('num_reads', 100)    # Target from adapt_parameters
+
+        # Increment rate: increase by 1% every 30 seconds
+        increment_interval = 30.0  # seconds
+        last_increment_time = start_time
 
         # Batch size: number of nonces to evaluate simultaneously (one per GPU core)
         batch_size = get_gpu_core_count()
@@ -168,7 +186,13 @@ class MetalMiner(BaseMiner):
             if current_requirements != updated_requirements:
                 current_requirements = updated_requirements
                 # Recompute adaptive parameters based on updated requirements
-                params = adapt_parameters(current_requirements.difficulty_energy, current_requirements.min_diversity, current_requirements.min_solutions)
+                params = adapt_parameters(
+                    current_requirements.difficulty_energy,
+                    current_requirements.min_diversity,
+                    current_requirements.min_solutions,
+                    num_nodes=len(nodes),
+                    num_edges=len(edges)
+                )
                 self.logger.info(f"{self.miner_id} - updated adaptive params: {params}")
                 # Check if any existing results meet the new requirements
                 for sample in self.top_attempts:
@@ -197,11 +221,19 @@ class MetalMiner(BaseMiner):
             self.current_stage = 'preprocessing'
             self.current_stage_start = preprocess_start
 
+            # Increment sweeps/reads slowly over time
+            current_time = time.time()
+            if current_time - last_increment_time >= increment_interval:
+                # Increase by 1% toward max
+                current_num_sweeps = min(max_num_sweeps, int(current_num_sweeps * 1.01))
+                current_num_reads = min(max_num_reads, int(current_num_reads * 1.01))
+                last_increment_time = current_time
+
             # Sample from Metal GPU using batched evaluation
             try:
-                # For Metal, use adaptive parameters
-                num_sweeps = params.get('num_sweeps', 64)
-                num_reads = params.get('num_reads', 100)
+                # Use current (incrementing) parameters
+                num_sweeps = current_num_sweeps
+                num_reads = current_num_reads
 
                 self.logger.debug(f"Batched: {batch_size} nonces × {num_reads} reads/nonce, {num_sweeps} sweeps")
 
@@ -290,7 +322,9 @@ class MetalMiner(BaseMiner):
                     f"{nonces_per_sec:.1f}/s recent, "
                     f"{avg_nonces_per_sec:.1f}/s average | "
                     f"Time: {elapsed_total:.1f}s | "
-                    f"Best energy: {best_energy:.0f}"
+                    f"Best energy: {best_energy:.0f} | "
+                    f"Sweeps: {current_num_sweeps}/{max_num_sweeps}, "
+                    f"Reads: {current_num_reads}/{max_num_reads}"
                 )
 
                 last_report_time = current_time
@@ -300,22 +334,49 @@ class MetalMiner(BaseMiner):
         return None
     
 
-def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutions: int):
+def adapt_parameters(
+    difficulty_energy: float,
+    min_diversity: float,
+    min_solutions: int,
+    num_nodes: int = DEFAULT_NUM_NODES,
+    num_edges: int = DEFAULT_NUM_EDGES
+):
     """Calculate adaptive mining parameters based on difficulty requirements.
 
-    Supports either a NextBlockRequirements object or a dict with keys:
-    'difficulty_energy', 'min_diversity', 'min_solutions'.
-    """
-    # Normalize difficulty factor (more negative = harder)
-    difficulty_factor = abs(difficulty_energy) / 1000.0  # Base around -1000
+    Metal MPS strategy: Fast convergence with MORE READS, FEWER SWEEPS.
+    Based on calibration showing Metal benefits from multiple quick attempts
+    rather than deep convergence per attempt.
 
-    # Metal MPS parameters - fast convergence for multiple nonce strategy
-    # Strategy: Quick convergence to local minimum (~-13800), then try multiple nonces
-    base_sweeps = 80   # Fast convergence - we'll do multiple attempts
-    num_sweeps = int(base_sweeps * min(2.0, difficulty_factor ** 0.3))  # Light scaling
-    num_reads = max(int(min_solutions), 32)  # Modest reads per attempt
+    Args:
+        difficulty_energy: Target energy threshold
+        min_diversity: Minimum solution diversity required (reserved)
+        min_solutions: Minimum number of valid solutions required
+        num_nodes: Number of nodes in topology (default: DEFAULT_TOPOLOGY)
+        num_edges: Number of edges in topology (default: DEFAULT_TOPOLOGY)
+
+    Returns:
+        Dictionary with num_sweeps and num_reads parameters
+    """
+    # Get normalized difficulty [0, 1]
+    difficulty = energy_to_difficulty(
+        difficulty_energy,
+        num_nodes=num_nodes,
+        num_edges=num_edges
+    )
+
+    # Metal calibration: Prefers fewer sweeps, more reads per calibration
+    min_sweeps = 64      # Easiest difficulty (very fast convergence)
+    max_sweeps = 256     # Hardest difficulty (still relatively fast)
+
+    # Direct linear scaling: difficulty × max_sweeps
+    num_sweeps = max(min_sweeps, int(difficulty * max_sweeps))
+
+    # Metal benefits from MORE READS (multiple nonce strategy)
+    min_reads = 32
+    max_reads = 1024
+    num_reads = max(min_reads, int(difficulty * max_reads))
 
     return {
-        'num_sweeps': max(80, min(num_sweeps, 150)),    # Fast convergence range
-        'num_reads': max(32, min(num_reads, 64)),       # Efficient reads per attempt
+        'num_sweeps': num_sweeps,
+        'num_reads': max(num_reads, min_solutions),
     }

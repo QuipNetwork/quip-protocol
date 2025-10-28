@@ -12,7 +12,7 @@ import math
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from CPU.sa_miner import adapt_parameters
-from shared.block import _adjust_energy_along_curve
+from shared.energy_utils import adjust_energy_along_curve
 
 
 def test_sa_miner_adapt_parameters():
@@ -60,7 +60,7 @@ def test_block_energy_adjustments():
     print("BLOCK ENERGY ADJUSTMENT CURVE TEST")
     print("=" * 80)
     
-    print("Testing _adjust_energy_along_curve with 5% adjustments")
+    print("Testing adjust_energy_along_curve with 5% adjustments")
     print(f"{'Current':>8} | {'Harder':>8} | {'Easier':>8} | {'Hard Δ':>8} | {'Easy Δ':>8} | {'Scaling':>8}")
     print("-" * 70)
     
@@ -69,8 +69,8 @@ def test_block_energy_adjustments():
     adjustment_rate = 0.05
     
     for energy in test_energies:
-        harder = _adjust_energy_along_curve(energy, adjustment_rate, 'harder')
-        easier = _adjust_energy_along_curve(energy, adjustment_rate, 'easier')
+        harder = adjust_energy_along_curve(energy, adjustment_rate, 'harder')
+        easier = adjust_energy_along_curve(energy, adjustment_rate, 'easier')
         hard_delta = harder - energy
         easy_delta = easier - energy
         
@@ -103,7 +103,7 @@ def test_consecutive_adjustments():
         
         current = start_energy
         for i in range(8):
-            new_energy = _adjust_energy_along_curve(current, 0.05, 'harder')
+            new_energy = adjust_energy_along_curve(current, 0.05, 'harder')
             delta = new_energy - current
             
             # Calculate scaling factor
@@ -147,8 +147,8 @@ def test_boundary_conditions():
     for energy in boundary_tests:
         # Test what happens when we clamp the input
         clamped = max(-16000.0, min(energy, -14000.0))
-        harder = _adjust_energy_along_curve(energy, 0.05, 'harder')
-        easier = _adjust_energy_along_curve(energy, 0.05, 'easier')
+        harder = adjust_energy_along_curve(energy, 0.05, 'harder')
+        easier = adjust_energy_along_curve(energy, 0.05, 'easier')
         hard_delta = harder - clamped
         easy_delta = easier - clamped
         
@@ -171,8 +171,8 @@ def test_adjustment_rates():
     print("-" * 50)
     
     for rate in adjustment_rates:
-        harder = _adjust_energy_along_curve(test_energy, rate, 'harder')
-        easier = _adjust_energy_along_curve(test_energy, rate, 'easier')
+        harder = adjust_energy_along_curve(test_energy, rate, 'harder')
+        easier = adjust_energy_along_curve(test_energy, rate, 'easier')
         hard_delta = harder - test_energy
         easy_delta = easier - test_energy
         

@@ -81,19 +81,22 @@ def calculate_requirements_decay(cur_requirements: dict) -> dict:
     Notes:
     - Uses curve-based energy adjustment at half the rate of difficulty increases
     - Energies are negative; easing moves the threshold closer to 0.
-    - Diversity and min_solutions also ease downward within sensible floors.
+    - Diversity and min_solutions ease downward within blockchain-defined range constraints
     - Minimum energy adjustment is 3 (vs 5 for difficulty adjustments).
     """
+    from shared.energy_utils import DEFAULT_DIVERSITY_RANGE, DEFAULT_SOLUTIONS_RANGE
+
     # Base easing rates (half the rate of difficulty adjustments)
     energy_ease_rate = 0.025      # 2.5% easier per decay step (half of 5%)
     diversity_ease_rate = 0.01    # 1% easier per decay step (half of 2%)
     solutions_ease_rate = 0.05    # 5% easier per decay step (half of 10%)
 
-    # Floors to avoid collapsing difficulty entirely
-    MIN_DIVERSITY_FLOOR = 0.20
-    MAX_DIVERSITY_CEILING = 0.30
-    MIN_SOLUTIONS_FLOOR = 10
-    MAX_SOLUTIONS_CEILING = 20
+    # Use blockchain-defined ranges for floors/ceilings
+    # Currently fixed at (0.3, 0.3) and (20, 20) but infrastructure ready for chain consensus
+    MIN_DIVERSITY_FLOOR = DEFAULT_DIVERSITY_RANGE[0]
+    MAX_DIVERSITY_CEILING = DEFAULT_DIVERSITY_RANGE[1]
+    MIN_SOLUTIONS_FLOOR = DEFAULT_SOLUTIONS_RANGE[0]
+    MAX_SOLUTIONS_CEILING = DEFAULT_SOLUTIONS_RANGE[1]
 
     de = float(cur_requirements.get('difficulty_energy', 0.0))
     md = float(cur_requirements.get('min_diversity', 0.0))
@@ -102,7 +105,7 @@ def calculate_requirements_decay(cur_requirements: dict) -> dict:
 
     # Apply curve-based easing for energy (move toward easier/less negative)
     curve_energy = adjust_energy_along_curve(de, energy_ease_rate, 'easier')
-    
+
     # Apply minimum adjustment of 3 units for decay
     energy_delta = curve_energy - de
     min_adjustment = 3.0
@@ -111,7 +114,7 @@ def calculate_requirements_decay(cur_requirements: dict) -> dict:
     else:
         new_de = curve_energy
 
-    # Ease diversity and solutions downward within limits
+    # Ease diversity and solutions downward within blockchain-defined limits
     new_md = min(MAX_DIVERSITY_CEILING, max(MIN_DIVERSITY_FLOOR, md - diversity_ease_rate))
     new_ms = min(MAX_SOLUTIONS_CEILING, max(MIN_SOLUTIONS_FLOOR, int(ms * (1 - solutions_ease_rate))))
 
@@ -136,12 +139,17 @@ def compute_next_block_requirements(previous_block: Block, mining_result: Mining
 
     Uses curve-based energy adjustments instead of flat multiplication.
     Energy curve: min (-16000) to max (-14000) with knee at (-15600).
+
+    Note: min_diversity and min_solutions are constrained by blockchain-defined ranges
+    (currently fixed at 0.3 and 20, but infrastructure ready for chain consensus).
     """
+    from shared.energy_utils import DEFAULT_DIVERSITY_RANGE, DEFAULT_SOLUTIONS_RANGE
+
     # Get current requirements from previous block
     prev_req = previous_block.next_block_requirements
     if not prev_req:
         raise ValueError("Previous block has no next block requirements")
-    
+
     if previous_block.header.index > 0:
         prev_req = compute_current_requirements(prev_req, previous_block.header.timestamp, log, mining_result.timestamp)
 
@@ -159,6 +167,13 @@ def compute_next_block_requirements(previous_block: Block, mining_result: Mining
     diversity_adjustment_rate = 0.02  # 2% adjustment
     solutions_adjustment_rate = 0.10  # 10% adjustment
 
+    # Use blockchain-defined ranges for constraints
+    # Currently fixed at (0.3, 0.3) and (20, 20) but infrastructure ready for chain consensus
+    MIN_DIVERSITY = DEFAULT_DIVERSITY_RANGE[0]
+    MAX_DIVERSITY = DEFAULT_DIVERSITY_RANGE[1]
+    MIN_SOLUTIONS = DEFAULT_SOLUTIONS_RANGE[0]
+    MAX_SOLUTIONS = DEFAULT_SOLUTIONS_RANGE[1]
+
     # Helper function to apply minimum adjustment for difficulty changes
     def apply_min_adjustment(old_energy: float, new_energy: float, direction: str, min_adj: float = 5.0) -> float:
         energy_delta = new_energy - old_energy
@@ -173,11 +188,11 @@ def compute_next_block_requirements(previous_block: Block, mining_result: Mining
     if mining_result.mining_time is not None and mining_result.mining_time < 360.0:
         curve_energy = adjust_energy_along_curve(prev_req.difficulty_energy, energy_adjustment_rate, 'harder')
         new_difficulty_energy = apply_min_adjustment(prev_req.difficulty_energy, curve_energy, 'harder')
-        new_min_diversity = min(0.46, prev_req.min_diversity + diversity_adjustment_rate)
-        new_min_solutions = min(100, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
+        new_min_diversity = min(MAX_DIVERSITY, prev_req.min_diversity + diversity_adjustment_rate)
+        new_min_solutions = min(MAX_SOLUTIONS, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
 
         log.info(
-            f"Block was mined in {mining_result.mining_time:.2f}s (<10s) - HARDENING difficulty")
+            f"Block was mined in {mining_result.mining_time:.2f}s (<360s) - HARDENING difficulty")
         log.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
         log.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
         log.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
@@ -188,8 +203,8 @@ def compute_next_block_requirements(previous_block: Block, mining_result: Mining
             # Higher energy threshold (less negative), lower diversity/solutions
             curve_energy = adjust_energy_along_curve(prev_req.difficulty_energy, energy_adjustment_rate, 'easier')
             new_difficulty_energy = apply_min_adjustment(prev_req.difficulty_energy, curve_energy, 'easier')
-            new_min_diversity = max(0.2, prev_req.min_diversity - diversity_adjustment_rate)
-            new_min_solutions = max(10, int(prev_req.min_solutions * (1 - solutions_adjustment_rate)))
+            new_min_diversity = max(MIN_DIVERSITY, prev_req.min_diversity - diversity_adjustment_rate)
+            new_min_solutions = max(MIN_SOLUTIONS, int(prev_req.min_solutions * (1 - solutions_adjustment_rate)))
 
             log.info(f"Same miner type ({current_winner}) won - EASING difficulty")
             log.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
@@ -200,8 +215,8 @@ def compute_next_block_requirements(previous_block: Block, mining_result: Mining
             # Lower energy threshold (more negative), higher diversity/solutions
             curve_energy = adjust_energy_along_curve(prev_req.difficulty_energy, energy_adjustment_rate, 'harder')
             new_difficulty_energy = apply_min_adjustment(prev_req.difficulty_energy, curve_energy, 'harder')
-            new_min_diversity = min(0.46, prev_req.min_diversity + diversity_adjustment_rate)
-            new_min_solutions = min(100, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
+            new_min_diversity = min(MAX_DIVERSITY, prev_req.min_diversity + diversity_adjustment_rate)
+            new_min_solutions = min(MAX_SOLUTIONS, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
 
             log.info(f"Different miner type won ({prev_winner} -> {current_winner}) - HARDENING difficulty")
             log.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")

@@ -16,12 +16,11 @@ from shared.quantum_proof_of_work import (
     generate_ising_model_from_nonce,
 )
 from shared.block_requirements import compute_current_requirements
+from shared.energy_utils import energy_to_difficulty, DEFAULT_NUM_NODES, DEFAULT_NUM_EDGES
 
 class DWaveMiner(BaseMiner):
     def __init__(self, miner_id: str, **cfg):
         # cfg parameter is reserved for future configuration options
-        _ = cfg  # Suppress unused parameter warning
-
         sampler = DWaveSamplerWrapper()
         super().__init__(miner_id, sampler, miner_type="QPU")
         self.miner_type = "QPU"
@@ -102,12 +101,18 @@ class DWaveMiner(BaseMiner):
         min_diversity = current_requirements.min_diversity
         min_solutions = current_requirements.min_solutions
 
-        params = adapt_parameters(difficulty_energy, min_diversity, min_solutions)
-        self.logger.info(f"{self.miner_id} - Adaptive params: {params}")
-
         # Get topology information from sampler
         nodes = self.sampler.nodes
         edges = self.sampler.edges
+
+        params = adapt_parameters(
+            difficulty_energy,
+            min_diversity,
+            min_solutions,
+            num_nodes=len(nodes),
+            num_edges=len(edges)
+        )
+        self.logger.info(f"{self.miner_id} - Adaptive params: {params}")
 
         while self.mining and not stop_event.is_set():
             # Check if we should stop before generating model
@@ -130,7 +135,13 @@ class DWaveMiner(BaseMiner):
             if current_requirements != updated_requirements:
                 current_requirements = updated_requirements
                 # Recompute adaptive parameters based on updated requirements
-                params = adapt_parameters(current_requirements.difficulty_energy, current_requirements.min_diversity, current_requirements.min_solutions)
+                params = adapt_parameters(
+                    current_requirements.difficulty_energy,
+                    current_requirements.min_diversity,
+                    current_requirements.min_solutions,
+                    num_nodes=len(nodes),
+                    num_edges=len(edges)
+                )
                 self.logger.info(f"{self.miner_id} - updated adaptive params: {params}")
                 # Check if any existing results meet the new requirements
                 for sample in self.top_attempts:
@@ -249,29 +260,53 @@ class DWaveMiner(BaseMiner):
         return None
 
 
-def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutions: int):
+def adapt_parameters(
+    difficulty_energy: float,
+    min_diversity: float,
+    min_solutions: int,
+    num_nodes: int = DEFAULT_NUM_NODES,
+    num_edges: int = DEFAULT_NUM_EDGES
+):
     """Calculate adaptive mining parameters based on difficulty requirements.
+
+    QPU strategy: Scales annealing time and read bonus (not sweeps).
+    Linear interpolation for both parameters.
+
+    Note: num_reads = min_solutions + bonus, where bonus ∈ [16, 64]
 
     Args:
         difficulty_energy: Target energy threshold
-        min_diversity: Minimum diversity requirement (reserved for future use)
+        min_diversity: Minimum solution diversity required (reserved)
         min_solutions: Minimum number of valid solutions required
-    """
-    # min_diversity parameter is reserved for future adaptive parameter tuning
-    _ = min_diversity  # Suppress unused parameter warning
-    # Normalize difficulty factor (more negative = harder)
-    difficulty_factor = abs(difficulty_energy) / 1000.0  # Base around -1000
+        num_nodes: Number of nodes in topology (default: DEFAULT_TOPOLOGY)
+        num_edges: Number of edges in topology (default: DEFAULT_TOPOLOGY)
 
-    # QPU parameters (D-Wave quantum processor optimized)
-    base_reads = 256  # QPU uses reads instead of sweeps
-    num_reads = min(int(base_reads * (difficulty_factor ** 0.5)), 256)
-    
-    # QPU-specific annealing time (microseconds)
-    base_annealing_time = 5.0
-    annealing_time = min(base_annealing_time * (difficulty_factor ** 0.05), 1000.0)  # Max 1ms per D-WAve Docs
+    Returns:
+        Dictionary with num_reads and annealing_time parameters
+    """
+    # Get normalized difficulty [0, 1]
+    difficulty = energy_to_difficulty(
+        difficulty_energy,
+        num_nodes=num_nodes,
+        num_edges=num_edges
+    )
+
+    # QPU annealing time range (microseconds)
+    min_annealing_time = 5.0    # Easiest difficulty
+    max_annealing_time = 10.0   # Hardest difficulty
+
+    # Linear interpolation for annealing time
+    annealing_time = min_annealing_time + difficulty * (max_annealing_time - min_annealing_time)
+
+    # QPU read bonus range (added to min_solutions)
+    min_bonus = 16    # Easiest difficulty
+    max_bonus = 64    # Hardest difficulty
+
+    # Linear interpolation for bonus reads
+    bonus_reads = int(min_bonus + difficulty * (max_bonus - min_bonus))
+    num_reads = min_solutions + bonus_reads
 
     return {
-        # 'num_reads': max(min_solutions*2, num_reads),
-        'num_reads': 2048,
-        'quantum_annealing_time': max(5.0, annealing_time),  # Min 5 microseconds
+        'num_reads': num_reads,
+        'annealing_time': annealing_time,
     }

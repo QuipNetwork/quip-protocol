@@ -4,16 +4,18 @@ Extracted from BaseMiner to be reusable and stateless.
 """
 from __future__ import annotations
 
+import logging
+import time
+from typing import Any, Tuple, Dict, Optional, List
+
 from blake3 import blake3
-from shared.logging_config import get_logger
-from typing import Any, Tuple, Dict, Optional
 import numpy as np
-from typing import List
+
+from shared.logging_config import get_logger
+from shared.miner_types import MiningResult
+from dwave_topologies import DEFAULT_TOPOLOGY
 
 logger = get_logger('quantum_proof_of_work')
-
-# Import the default topology from the new topology system
-from dwave_topologies import DEFAULT_TOPOLOGY
 
 def ising_nonce_from_block(prev_hash: bytes, miner_id: str, cur_index: int, salt: bytes) -> int:
     """Generate deterministic seed for Ising model from block parameters.
@@ -436,8 +438,6 @@ def validate_solution(spins: List[int], h: Dict[int, float], J: Dict[Tuple[int, 
     Returns:
         Dictionary with validation results including validity status and energy
     """
-    from typing import Any
-    
     n = len(nodes)
     node_to_pos = {node_id: pos for pos, node_id in enumerate(nodes)}
     
@@ -513,9 +513,6 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
     Returns:
         MiningResult if successful, None if requirements not met
     """
-    import time
-    from shared.miner_types import MiningResult
-
     difficulty_energy = requirements.difficulty_energy
     min_diversity = requirements.min_diversity
     min_solutions = requirements.min_solutions
@@ -571,7 +568,6 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         
         # Log any invalid solutions found
         if invalid_solutions:
-            import logging
             local_logger = logging.getLogger(__name__)
             local_logger.warning(f"Found {len(invalid_solutions)} invalid solutions with errors: {[s['errors'] for s in invalid_solutions[:3]]}")
         if len(valid_solutions) < min_solutions:
@@ -612,12 +608,10 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         )
     except ValueError as e:
         # Use a local logger since we don't have access to the miner's logger
-        import logging
         local_logger = logging.getLogger(__name__)
         local_logger.debug(f"Failed to meet requirements: {e}")
     finally:
         # Use a local logger since we don't have access to the miner's logger
-        import logging
         local_logger = logging.getLogger(__name__)
         local_logger.info(f"Mining attempt - Energy: {best_energy:.2f}, Valid: {len(valid_solutions)}, Diversity: {diversity:.3f} (requirements: energy<={difficulty_energy:.2f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
     return result

@@ -9,14 +9,18 @@ Low-level interface to CUDA test kernel for verification of:
 - Kernel state tracking (RUNNING/IDLE)
 """
 
-import cupy as cp
-import numpy as np
+import ctypes
+import os
+import random
 import struct
 import threading
-from typing import Optional, Dict, Tuple
-from collections import defaultdict
-import os
+import time
 import warnings
+from collections import defaultdict
+from typing import Optional, Dict, Tuple
+
+import cupy as cp
+import numpy as np
 
 
 def _default_ising_beta_range(
@@ -159,7 +163,6 @@ class CudaKernel:
         self.d_input_head_arr = cp.zeros(1, dtype=cp.int32)
 
         # Allocate mapped host memory for tail/control/state using CUDA runtime
-        import ctypes
         try:
             cudart = ctypes.CDLL('libcudart.so')
         except OSError:
@@ -300,7 +303,6 @@ class CudaKernel:
         """
         # Generate seed if not provided
         if seed is None:
-            import random
             seed = random.randint(0, 2**31 - 1)
 
         # Get current tail from host memory (no GPU sync needed!)
@@ -528,7 +530,6 @@ class CudaKernelRealSA:
         self._sizeof_outputslot = 32
 
         # Control/head/tail/state pointers
-        import ctypes
         try:
             cudart = ctypes.CDLL('libcudart.so')
         except OSError:
@@ -667,7 +668,6 @@ class CudaKernelRealSA:
     @staticmethod
     def _load_kernel_code() -> str:
         """Load CUDA kernel code from file."""
-        import os
         kernel_file = os.path.join(os.path.dirname(__file__), 'cuda_sa.cu')
         with open(kernel_file, 'r') as f:
             return f.read()
@@ -767,7 +767,6 @@ class CudaKernelRealSA:
 
         # Generate seed if not provided
         if seed is None:
-            import random
             seed = random.randint(0, 2**31 - 1)
 
         # Compute beta schedule (geometric, matching Metal/D-Wave)
@@ -841,7 +840,6 @@ class CudaKernelRealSA:
             # Wait for GPU to finish previous batch (signal == 0)
             wait_count = 0
             while self.h_host_writing_mutex[0] != 0:
-                import time
                 time.sleep(0.001)  # 1ms
                 wait_count += 1
                 if wait_count > 10000:  # 10 second timeout
@@ -896,7 +894,6 @@ class CudaKernelRealSA:
         This allows the host to safely reset the signal and write additional jobs
         to the ring buffer when space becomes available.
         """
-        import time
         with self._enqueue_lock:
             # Only reset if currently signaled as ready
             if self.h_host_writing_mutex[0] == 1:
@@ -926,8 +923,6 @@ class CudaKernelRealSA:
                   'job_id', 'h', 'J', 'num_reads', 'num_betas', 'num_sweeps_per_beta',
                   and optionally 'N', 'seed', 'beta_range'
         """
-        import time
-
         jobs_remaining = list(jobs)  # Make a copy
 
         while jobs_remaining:

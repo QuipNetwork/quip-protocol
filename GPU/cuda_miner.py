@@ -1,6 +1,7 @@
 """GPU miner using CUDA persistent kernel via CudaSASamplerAsync."""
 from __future__ import annotations
 
+import math
 import multiprocessing
 import multiprocessing.synchronize
 import random
@@ -19,41 +20,62 @@ from shared.quantum_proof_of_work import (
     evaluate_sampleset,
 )
 from shared.block_requirements import compute_current_requirements
+from shared.energy_utils import energy_to_difficulty, DEFAULT_NUM_NODES, DEFAULT_NUM_EDGES
 from GPU.cuda_kernel import CudaKernelRealSA
 from GPU.cuda_sa import CudaKernelAdapter, CudaSASamplerAsync
 from dwave_topologies import DEFAULT_TOPOLOGY
 
+try:
+    import cupy as cp
+except ImportError:
+    cp = None
 
-def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutions: int) -> dict:
+
+def adapt_parameters(
+    difficulty_energy: float,
+    min_diversity: float,
+    min_solutions: int,
+    num_nodes: int = DEFAULT_NUM_NODES,
+    num_edges: int = DEFAULT_NUM_EDGES
+) -> dict:
     """Adapt mining parameters based on difficulty.
+
+    Uses GSE-based difficulty calculation with log-linear interpolation
+    in sweep space, optimized for CUDA GPU performance.
 
     Args:
         difficulty_energy: Target energy threshold
-        min_diversity: Minimum solution diversity required
+        min_diversity: Minimum solution diversity required (reserved)
         min_solutions: Minimum number of valid solutions required
+        num_nodes: Number of nodes in topology (default: DEFAULT_TOPOLOGY)
+        num_edges: Number of edges in topology (default: DEFAULT_TOPOLOGY)
 
     Returns:
-        Dictionary with num_reads and num_sweeps parameters
+        Dictionary with num_sweeps, num_reads, and num_sweeps_per_beta
     """
-    # Scale parameters based on difficulty
-    # Higher difficulty (lower energy) = more sweeps
-    if difficulty_energy < -15500:
-        num_sweeps = 2048
-        num_reads = 150
-    elif difficulty_energy < -15400:
-        num_sweeps = 1024
-        num_reads = 100
-    elif difficulty_energy < -15000:
-        num_sweeps = 512
-        num_reads = 100
-    else:
-        num_sweeps = 256
-        num_reads = 64
+    # Get normalized difficulty [0, 1]
+    difficulty = energy_to_difficulty(
+        difficulty_energy,
+        num_nodes=num_nodes,
+        num_edges=num_edges
+    )
+
+    # CUDA GPU calibration ranges
+    min_sweeps = 256     # Easiest difficulty (fast GPU convergence)
+    max_sweeps = 2048    # Hardest difficulty
+
+    # Direct linear scaling: difficulty × max_sweeps
+    num_sweeps = max(min_sweeps, int(difficulty * max_sweeps))
+
+    # Reads scale linearly with difficulty
+    min_reads = 64
+    max_reads = 1024
+    num_reads = max(min_reads, int(difficulty * max_reads))
 
     return {
         'num_sweeps': num_sweeps,
-        'num_reads': num_reads,
-        'num_sweeps_per_beta': 1  # Use 1 sweep per beta (total sweeps = num_sweeps)
+        'num_reads': max(num_reads, min_solutions),
+        'num_sweeps_per_beta': 1
     }
 
 
@@ -75,7 +97,8 @@ class CudaMiner(BaseMiner):
         """
         # Set CUDA device BEFORE creating any CUDA objects
         try:
-            import cupy as cp
+            if cp is None:
+                raise ImportError("cupy not available")
             device_id = int(device)
             cp.cuda.Device(device_id).use()
         except Exception as e:
@@ -134,10 +157,10 @@ class CudaMiner(BaseMiner):
                 self.async_sampler.stop_immediate()
 
             # Reset CUDA device
-            import cupy as cp
-            cp.cuda.Device(int(self.device)).use()
-            cp.cuda.runtime.deviceReset()
-            self.logger.info(f"CUDA device {self.device} reset completed")
+            if cp is not None:
+                cp.cuda.Device(int(self.device)).use()
+                cp.cuda.runtime.deviceReset()
+                self.logger.info(f"CUDA device {self.device} reset completed")
 
         except Exception as e:
             self.logger.error(f"Error during CUDA miner cleanup: {e}")
@@ -198,8 +221,8 @@ class CudaMiner(BaseMiner):
         """
         # Set device context
         try:
-            import cupy as cp
-            cp.cuda.Device(int(self.device)).use()
+            if cp is not None:
+                cp.cuda.Device(int(self.device)).use()
         except Exception as e:
             self.logger.error(f"Failed to set device context: {e}")
             return None
@@ -217,12 +240,26 @@ class CudaMiner(BaseMiner):
         min_solutions = current_requirements.min_solutions
 
         # Adapt parameters based on difficulty
-        params = adapt_parameters(difficulty_energy, min_diversity, min_solutions)
-        num_reads = params['num_reads']
-        num_sweeps = params['num_sweeps']
+        params = adapt_parameters(
+            difficulty_energy,
+            min_diversity,
+            min_solutions,
+            num_nodes=len(self.nodes),
+            num_edges=len(self.edges)
+        )
+
+        # Track current sweeps/reads for incremental increase
+        current_num_sweeps = params['num_sweeps']
+        current_num_reads = params['num_reads']
+        max_num_sweeps = params['num_sweeps']
+        max_num_reads = params['num_reads']
         num_sweeps_per_beta = params['num_sweeps_per_beta']
 
-        self.logger.info(f"Adaptive params: {num_sweeps} sweeps, {num_reads} reads")
+        # Increment rate: increase by 1% every 30 seconds
+        increment_interval = 30.0
+        last_increment_time = start_time
+
+        self.logger.info(f"Adaptive params: {current_num_sweeps} sweeps, {current_num_reads} reads")
 
         # Batch size: number of jobs to run in parallel
         # Use number of SMs (streaming multiprocessors) for optimal parallelism
@@ -233,6 +270,13 @@ class CudaMiner(BaseMiner):
 
         attempts = 0
         while not stop_event.is_set():
+            # Increment sweeps/reads slowly over time
+            current_time = time.time()
+            if current_time - last_increment_time >= increment_interval:
+                # Increase by 1% toward max
+                current_num_sweeps = min(max_num_sweeps, int(current_num_sweeps * 1.01))
+                current_num_reads = min(max_num_reads, int(current_num_reads * 1.01))
+                last_increment_time = current_time
             # Generate batch of Ising problems
             h_list = []
             J_list = []
@@ -270,8 +314,8 @@ class CudaMiner(BaseMiner):
                 samplesets = self.async_sampler.sample_ising(
                     h_list=h_list,
                     J_list=J_list,
-                    num_reads=num_reads,
-                    num_betas=num_sweeps,
+                    num_reads=current_num_reads,
+                    num_betas=current_num_sweeps,
                     num_sweeps_per_beta=num_sweeps_per_beta,
                     edges=self.edges,
                     timeout=300.0  # 5 minute timeout for production problems
@@ -315,7 +359,10 @@ class CudaMiner(BaseMiner):
             if attempts % (10 * batch_size) == 0:
                 elapsed = time.time() - start_time
                 rate = attempts / elapsed if elapsed > 0 else 0
-                self.logger.info(f"Attempts: {attempts} ({rate:.1f}/s), elapsed: {elapsed:.1f}s")
+                self.logger.info(
+                    f"Attempts: {attempts} ({rate:.1f}/s), elapsed: {elapsed:.1f}s | "
+                    f"Sweeps: {current_num_sweeps}/{max_num_sweeps}, Reads: {current_num_reads}/{max_num_reads}"
+                )
 
         self.logger.info("Mining stopped by stop_event")
         return None

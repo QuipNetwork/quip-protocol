@@ -1,12 +1,15 @@
 import asyncio
+import logging
 import random
 import ssl
 import time
-import logging
 from typing import Dict, List, Optional, Any, TYPE_CHECKING
+
 import aiohttp
 
 from shared.block import Block, BlockHeader, MinerInfo
+from shared.version import get_version
+from shared.time_utils import utc_timestamp_float
 
 if TYPE_CHECKING:
     from shared.network_node import Message
@@ -168,12 +171,8 @@ class NodeClient:
         conn_str = await self._ensure_connection_string(node_host)
         if not conn_str:
             return False
-            
-        try:
-            # Import here to avoid circular imports
-            from .version import get_version
-            from .time_utils import utc_timestamp_float
 
+        try:
             data = {
                 "sender": public_host,
                 "version": get_version(),
@@ -255,8 +254,7 @@ class NodeClient:
         conn_str = await self._ensure_connection_string(host)
         if not conn_str:
             return None
-            
-        import time  # Local import to avoid issues
+
         t0 = time.perf_counter()
         
         try:
@@ -317,8 +315,7 @@ class NodeClient:
         conn_str = await self._ensure_connection_string(host)
         if not conn_str:
             return False
-            
-        import time  # Local import to avoid issues
+
         t0 = time.perf_counter()
         url = f"{conn_str}/gossip"
         

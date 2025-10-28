@@ -8,6 +8,7 @@ import signal
 import sys
 import time
 from typing import Optional
+from shared.energy_utils import energy_to_difficulty, DEFAULT_NUM_NODES, DEFAULT_NUM_EDGES
 
 from shared.base_miner import BaseMiner, MiningResult
 from shared.quantum_proof_of_work import (
@@ -102,14 +103,36 @@ class ModalMiner(BaseMiner):
         min_diversity = current_requirements.min_diversity
         min_solutions = current_requirements.min_solutions
 
-        params = adapt_parameters(difficulty_energy, min_diversity, min_solutions)
-        self.logger.debug(f"Adaptive params: {params}")
-        
         # Get topology information from sampler
         nodes = self.sampler.nodes
         edges = self.sampler.edges
 
+        params = adapt_parameters(
+            difficulty_energy,
+            min_solutions,
+            num_nodes=len(nodes),
+            num_edges=len(edges)
+        )
+        self.logger.debug(f"Adaptive params: {params}")
+
+        # Track current sweeps/reads for incremental increase
+        current_num_sweeps = params.get('num_sweeps', 128)
+        current_num_reads = params.get('num_reads', 100)
+        max_num_sweeps = params.get('num_sweeps', 128)
+        max_num_reads = params.get('num_reads', 100)
+
+        # Increment rate: increase by 1% every 30 seconds
+        increment_interval = 30.0
+        last_increment_time = start_time
+
         while self.mining and not stop_event.is_set():
+            # Increment sweeps/reads slowly over time
+            current_time = time.time()
+            if current_time - last_increment_time >= increment_interval:
+                # Increase by 1% toward max
+                current_num_sweeps = min(max_num_sweeps, int(current_num_sweeps * 1.01))
+                current_num_reads = min(max_num_reads, int(current_num_reads * 1.01))
+                last_increment_time = current_time
             # Generate random salt for each attempt
             salt = random.randbytes(32)
             
@@ -124,7 +147,12 @@ class ModalMiner(BaseMiner):
             if current_requirements != updated_requirements:
                 current_requirements = updated_requirements
                 # Recompute adaptive parameters based on updated requirements
-                params = adapt_parameters(current_requirements.difficulty_energy, current_requirements.min_diversity, current_requirements.min_solutions)
+                params = adapt_parameters(
+                    current_requirements.difficulty_energy,
+                    current_requirements.min_solutions,
+                    num_nodes=len(nodes),
+                    num_edges=len(edges)
+                )
                 self.logger.info(f"{self.miner_id} - updated adaptive params: {params}")
                 # Check if any existing results meet the new requirements
                 for sample in self.top_attempts:
@@ -145,14 +173,14 @@ class ModalMiner(BaseMiner):
             
             # Sample from Modal GPU
             try:
-                # For Modal GPU, use adaptive parameters
-                num_sweeps = params.get('num_sweeps', 512)
-                num_reads = params.get('num_reads', 100)
-                
+                # Use current (incrementing) parameters
+                num_sweeps = current_num_sweeps
+                num_reads = current_num_reads
+
                 sample_start = time.time()
                 self.current_stage = 'sampling'
                 self.current_stage_start = sample_start
-                
+
                 # Build sampling parameters based on sampler type
                 sampling_params = {
                     'h': h,
@@ -204,27 +232,55 @@ class ModalMiner(BaseMiner):
 
             # Progress update
             if progress % 10 == 0:
-                self.logger.info(f"Progress: {progress} attempts, best result so far - Energy: {min(self.top_attempts[0].sampleset.record.energy):.2f}")
+                best_energy = min(self.top_attempts[0].sampleset.record.energy) if self.top_attempts else float('inf')
+                self.logger.info(
+                    f"Progress: {progress} attempts, best energy: {best_energy:.2f} | "
+                    f"Sweeps: {current_num_sweeps}/{max_num_sweeps}, Reads: {current_num_reads}/{max_num_reads}"
+                )
 
         self.logger.info("Stopping mining, no results found")
         return None
 
 
-def adapt_parameters(difficulty_energy: float, min_diversity: float, min_solutions: int):
+def adapt_parameters(
+    difficulty_energy: float,
+    min_solutions: int,
+    num_nodes: int = DEFAULT_NUM_NODES,
+    num_edges: int = DEFAULT_NUM_EDGES
+):
     """Calculate adaptive mining parameters based on difficulty requirements.
 
-    Supports either a NextBlockRequirements object or a dict with keys:
-    'difficulty_energy', 'min_diversity', 'min_solutions'.
-    """
-    # Normalize difficulty factor (more negative = harder)
-    difficulty_factor = abs(difficulty_energy) / 1000.0  # Base around -1000
+    Cloud GPU strategy: Balanced approach optimized for Modal Labs GPUs.
 
-    # GPU Modal parameters (cloud GPU optimized)
-    base_sweeps = 512
-    num_sweeps = int(base_sweeps * (difficulty_factor ** 1.5))  # Exponential scaling
-    num_reads = max(int(min_solutions) * 3, 64)  # At least 3x required solutions
+    Args:
+        difficulty_energy: Target energy threshold
+        min_solutions: Minimum number of valid solutions required
+        num_nodes: Number of nodes in topology (default: DEFAULT_TOPOLOGY)
+        num_edges: Number of edges in topology (default: DEFAULT_TOPOLOGY)
+
+    Returns:
+        Dictionary with num_sweeps and num_reads parameters
+    """
+    # Get normalized difficulty [0, 1]
+    difficulty = energy_to_difficulty(
+        difficulty_energy,
+        num_nodes=num_nodes,
+        num_edges=num_edges
+    )
+
+    # Modal GPU calibration ranges (cloud GPU optimized)
+    min_sweeps = 128
+    max_sweeps = 4096
+
+    # Direct linear scaling: difficulty × max_sweeps
+    num_sweeps = max(min_sweeps, int(difficulty * max_sweeps))
+
+    # Reads scale linearly with difficulty
+    min_reads = 64
+    max_reads = 256
+    num_reads = max(min_reads, int(difficulty * max_reads))
 
     return {
-        'num_sweeps': max(128, min(num_sweeps, 32768)),  # Reasonable bounds for cloud GPU
-        'num_reads': max(64, min(num_reads, 1000)),      # Reasonable bounds
+        'num_sweeps': num_sweeps,
+        'num_reads': max(num_reads, min_solutions * 3),
     }
