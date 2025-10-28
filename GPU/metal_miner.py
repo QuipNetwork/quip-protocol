@@ -66,7 +66,12 @@ class MetalMiner(BaseMiner):
             self.miner_type = "CPU-FALLBACK"
             # Now we can use logger
             self.logger.warning(f"Metal GPU initialization failed, falling back to CPU: {e}")
-        
+
+        # GPU utilization control (0-100, default 100)
+        self.gpu_utilization = cfg.get('gpu_utilization', 100)
+        if not 0 < self.gpu_utilization <= 100:
+            raise ValueError(f"gpu_utilization must be between 1-100, got {self.gpu_utilization}")
+
         # Register SIGTERM handler for graceful cleanup
         signal.signal(signal.SIGTERM, self._cleanup_handler)
     
@@ -159,9 +164,11 @@ class MetalMiner(BaseMiner):
         increment_interval = 30.0
         last_increment_time = start_time
 
-        # Batch size: number of nonces to evaluate simultaneously (one per GPU core)
-        batch_size = get_gpu_core_count()
-        self.logger.info(f"Detected {batch_size} GPU cores, will evaluate {batch_size} nonces per batch")
+        # Batch size: number of nonces to evaluate simultaneously
+        # Scale batch size by utilization percentage to control GPU load
+        gpu_cores = get_gpu_core_count()
+        batch_size = max(1, int(gpu_cores * (self.gpu_utilization / 100.0)))
+        self.logger.info(f"Detected {gpu_cores} GPU cores, using {batch_size} nonces per batch ({self.gpu_utilization}% utilization)")
 
         # Pregenerate first batch to start
         next_batch_nonces = []

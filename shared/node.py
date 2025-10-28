@@ -158,11 +158,18 @@ class Node:
             gpu_cfg = cfg["gpu"]
             gpu_backend = (gpu_cfg.get("backend") or "local").lower()
             gpu_devices = list(gpu_cfg.get("devices") or [])
+
+            # Extract common GPU config (gpu_utilization, etc.)
+            miner_cfg = {}
+            if "gpu_utilization" in gpu_cfg:
+                miner_cfg["gpu_utilization"] = gpu_cfg["gpu_utilization"]
+
             if gpu_backend == "local":
                 for d in gpu_devices:
                     spec = {
                         "id": f"{self.node_id}-GPU-CUDA-{d}",
                         "kind": "cuda",
+                        "cfg": miner_cfg,
                         "args": {"device": str(d)}
                     }
                     self.miner_handles.append(MinerHandle(spec, self._log_queue))
@@ -172,6 +179,7 @@ class Node:
                     spec = {
                         "id": f"{self.node_id}-GPU-MODAL-{t}",
                         "kind": "modal",
+                        "cfg": miner_cfg,
                         "args": {"gpu_type": str(t)}
                     }
                     self.miner_handles.append(MinerHandle(spec, self._log_queue))
@@ -180,6 +188,7 @@ class Node:
                 spec = {
                     "id": f"{self.node_id}-GPU-MPS",
                     "kind": "metal",
+                    "cfg": miner_cfg,
                     "args": {"device": "mps"}
                 }
                 self.miner_handles.append(MinerHandle(spec, self._log_queue))

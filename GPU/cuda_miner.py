@@ -141,6 +141,11 @@ class CudaMiner(BaseMiner):
         self.miner_type = "GPU-CUDA-Persistent"
         self.device = device
 
+        # GPU utilization control (0-100, default 100)
+        self.gpu_utilization = cfg.get('gpu_utilization', 100)
+        if not 0 < self.gpu_utilization <= 100:
+            raise ValueError(f"gpu_utilization must be between 1-100, got {self.gpu_utilization}")
+
         # Register SIGTERM handler for graceful cleanup
         signal.signal(signal.SIGTERM, self._cleanup_handler)
 
@@ -261,8 +266,10 @@ class CudaMiner(BaseMiner):
         self.logger.info(f"Adaptive params: {current_num_sweeps} sweeps, {num_reads} reads")
 
         # Batch size: number of jobs to run in parallel
-        # Use number of SMs (streaming multiprocessors) for optimal parallelism
-        batch_size = self.kernel.num_blocks  # Typically 48 for most GPUs
+        # Scale batch size by utilization percentage to control GPU load
+        max_batch_size = self.kernel.num_blocks  # Typically 48 SMs for most GPUs
+        batch_size = max(1, int(max_batch_size * (self.gpu_utilization / 100.0)))
+        self.logger.info(f"GPU batch size: {batch_size}/{max_batch_size} parallel jobs ({self.gpu_utilization}% utilization)")
 
         # Compute N for sparse topology
         N = max(max(self.nodes), max(max(i, j) for i, j in self.edges)) + 1
@@ -307,7 +314,7 @@ class CudaMiner(BaseMiner):
                 salts.append(salt)
                 nonces.append(nonce)
 
-            # Submit batch to GPU (async, returns immediately)
+            # Submit batch to GPU
             try:
                 samplesets = self.async_sampler.sample_ising(
                     h_list=h_list,
