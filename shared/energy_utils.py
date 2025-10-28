@@ -166,29 +166,59 @@ def expected_solution_energy(
     return j_contribution + h_contribution
 
 
-def adjust_energy_along_curve(current_energy: float, adjustment_rate: float, direction: str) -> float:
+def adjust_energy_along_curve(
+    current_energy: float,
+    adjustment_rate: float,
+    direction: str,
+    nodes: List[int] = None,
+    edges: List[Tuple[int, int]] = None,
+    h_values: Optional[List[float]] = None,
+    c_range: Tuple[float, float] = (0.717, 0.742)
+) -> float:
     """Adjust energy along a curve that compresses adjustments near boundaries.
-    
-    Uses a sqrt-based curve from min_energy (-16000) to max_energy (-14000) with knee at -15600.
-    Adjustments become smaller as we approach the extremes, larger near the knee point.
-    Beyond observed limits, returns a simple linear adjustment that calling functions can handle.
-    
+
+    Dynamically calculates min/knee/max energy using the GSE formula based on topology.
+    This allows the function to work with any topology without hardcoded values.
+
+    If nodes/edges not provided, falls back to Advantage2 calibrated values.
+
+    The c_range represents SA efficiency at different computational efforts:
+    - c_easy (0.717): 64 sweeps, quick mining
+    - c_hard (0.742): 1024 sweeps, high-quality mining
+    These values were empirically determined from Advantage2 calibration data.
+
     Args:
         current_energy: Current energy value
         adjustment_rate: Percentage to move (e.g., 0.05 for 5%)
         direction: 'harder' (more negative) or 'easier' (less negative)
-    
+        nodes: List of node IDs in topology (optional, for dynamic calculation)
+        edges: List of edge tuples in topology (optional, for dynamic calculation)
+        h_values: h field distribution (optional, default: [-1, 0, 1])
+        c_range: (c_easy, c_hard) SA efficiency range (default: 0.717, 0.742)
+                 Calibrated from Advantage2: 64 sweeps → c=0.717, 1024 sweeps → c=0.742
+
     Returns:
         New energy value after curve-based adjustment
     """
-    # Old Pegasus/Z12 pure SA parameters
-    #min_energy = -16000.0  # Hardest (approximate, not hard limit)
-    #knee_energy = -15600.0  # Knee point
-    #max_energy = -14000.0  # Easiest (approximate, not hard limit)
+    if h_values is None:
+        h_values = [-1.0, 0.0, 1.0]
 
-    min_energy = -15000.0  # Hardest (approximate, not hard limit)
-    knee_energy = -14350.0  # Knee point
-    max_energy = -13900.0  # Easiest (approximate, not hard limit)
+    # Calculate min/knee/max dynamically using GSE if topology provided
+    if nodes is not None and edges is not None:
+        c_easy, c_hard = c_range
+        c_knee = (c_easy + c_hard) / 2
+
+        # Use GSE formula to predict energy range
+        min_energy = expected_solution_energy(nodes, edges, c=c_hard, h_values=h_values)
+        knee_energy = expected_solution_energy(nodes, edges, c=c_knee, h_values=h_values)
+        max_energy = expected_solution_energy(nodes, edges, c=c_easy, h_values=h_values)
+    else:
+        # Fall back to Advantage2 calibrated values (h ∈ {-1, 0, +1})
+        # Based on experimental calibration (10 min per config, Metal GPU, 2025-01-27)
+        # These match GSE predictions with c_range=(0.70, 0.85) for Advantage2
+        min_energy = -15009.0   # Hardest difficulty (c=0.85, 1024 sweeps)
+        knee_energy = -14810.0  # Mid-range difficulty (c=0.775, 512 sweeps)
+        max_energy = -14550.0   # Easiest difficulty (c=0.70, 64 sweeps)
     
     # Convert energy to normalized position [0, 1] for observed range
     total_range = max_energy - min_energy
