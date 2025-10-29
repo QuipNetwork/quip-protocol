@@ -18,9 +18,10 @@ Usage:
 import argparse
 import math
 import time
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 import dwave_networkx as dnx
 import numpy as np
+import networkx as nx
 from dwave.samplers import SimulatedAnnealingSampler
 
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce
@@ -252,9 +253,127 @@ def test_embedding_feasibility(config: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Advantage2_system1.6", timeout: int = 3600) -> Dict[str, Any]:
+def _find_embedding_worker(args):
     """
-    Precompute and save embedding for a topology (no time limit).
+    Worker function for parallel embedding attempts with automatic restarts.
+
+    Each worker keeps trying with new random seeds until either:
+    1. Success - valid embedding found
+    2. Worker timeout exceeded
+
+    Args:
+        args: Tuple of (worker_id, source_edges, target_edges, worker_timeout, try_timeout, verbose)
+
+    Returns:
+        Tuple of (worker_id, embedding, elapsed_time, num_tries)
+    """
+    import minorminer
+    import random
+    worker_id, source_edges, target_edges, worker_timeout, try_timeout, verbose = args
+
+    worker_start = time.perf_counter()
+    num_tries = 0
+    best_embedding = None
+
+    while True:
+        # Check if we've exceeded worker timeout
+        elapsed = time.perf_counter() - worker_start
+        if elapsed >= worker_timeout:
+            break
+
+        # Calculate remaining time for this try
+        remaining_time = worker_timeout - elapsed
+        this_try_timeout = min(try_timeout, remaining_time)
+
+        if this_try_timeout < 10:  # Not enough time for meaningful attempt
+            break
+
+        num_tries += 1
+
+        # Generate random seed for this try
+        random_seed = random.randint(0, 2**31 - 1)
+
+        try_start = time.perf_counter()
+        embedding = minorminer.find_embedding(
+            source_edges,
+            target_edges,
+            verbose=verbose if worker_id == 0 else 0,  # Only first worker shows progress
+            timeout=this_try_timeout,
+            tries=1,  # Single try per call - we handle restarts ourselves
+            threads=1,  # Single-threaded (threads parameter isn't effective anyway)
+            max_no_improvement=10,  # Exit faster if stuck
+            chainlength_patience=10,  # Exit faster if not improving chains
+            random_seed=random_seed,  # Fresh random seed each attempt
+        )
+        try_elapsed = time.perf_counter() - try_start
+
+        if embedding:
+            # Success! Return immediately
+            total_elapsed = time.perf_counter() - worker_start
+            if worker_id == 0 or verbose:
+                print(f"    Worker {worker_id}: Found embedding on try {num_tries} after {try_elapsed:.1f}s")
+            return (worker_id, embedding, total_elapsed, num_tries)
+
+        # No embedding found, log and continue
+        if worker_id == 0:
+            print(f"    Worker {worker_id}: Try {num_tries} failed after {try_elapsed:.1f}s, restarting...")
+
+    # All tries exhausted
+    total_elapsed = time.perf_counter() - worker_start
+    return (worker_id, None, total_elapsed, num_tries)
+
+
+def _find_native_subgraph_seed(source_graph: nx.Graph, target_graph: nx.Graph, max_m: int, max_t: int) -> Optional[Dict]:
+    """
+    Find a native Zephyr subgraph that exists perfectly in target (no embedding needed).
+    This can be used as a seed/initial_chains for faster embedding.
+
+    Returns:
+        Partial embedding dict (identity mapping for native nodes), or None
+    """
+    import dwave_networkx as dnx
+
+    print(f"  Searching for native Zephyr subgraph seed (up to Z({max_m},{max_t}))...")
+
+    # Try to find largest native subgraph
+    best_seed = None
+    best_size = 0
+
+    for m in range(max_m, 1, -1):  # Start from largest
+        for t in range(max_t, 0, -1):
+            test_graph = dnx.zephyr_graph(m, t)
+
+            # Check if all nodes and edges exist in target
+            nodes_present = all(n in target_graph.nodes() for n in test_graph.nodes())
+            edges_present = all(target_graph.has_edge(u, v) for u, v in test_graph.edges())
+
+            if nodes_present and edges_present:
+                # Found a perfect native subgraph
+                num_nodes = len(test_graph.nodes())
+                if num_nodes > best_size:
+                    # Create identity embedding for these nodes
+                    best_seed = {node: [node] for node in test_graph.nodes()}
+                    best_size = num_nodes
+                    print(f"    ✓ Found native Z({m},{t}) seed: {num_nodes:,} nodes")
+                    return best_seed
+
+    print(f"    ✗ No native subgraph found - starting from scratch")
+    return None
+
+
+def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Advantage2_system1.6", timeout: int = 3600, try_timeout: int = 600, num_processes: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Precompute and save embedding for a topology using parallel multiprocessing.
+
+    Uses multiple independent processes to search for embeddings in parallel.
+    Each process runs minorminer with automatic restarts on new random seeds.
+
+    Args:
+        config: Topology configuration dict
+        target_solver_name: Target solver name (default: Advantage2_system1.6)
+        timeout: Total timeout in seconds for all workers
+        try_timeout: Timeout per individual embedding attempt (default: 600s = 10min)
+        num_processes: Number of parallel processes (default: CPU count)
 
     Saves to: dwave_topologies/embeddings/{target_solver_name}/zephyr_z{m}_t{t}.json.gz
     """
@@ -262,6 +381,7 @@ def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Adva
     import json
     import gzip
     import minorminer
+    import multiprocessing as mp
     from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_6_TOPOLOGY
 
     # Get target topology
@@ -277,35 +397,79 @@ def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Adva
     print(f"{'='*80}")
     print(f"Source: Z({m},{t}) - {config['num_nodes']:,} nodes, {config['num_edges']:,} edges")
     print(f"Target: {target_solver_name} - {target_topology.num_nodes:,} qubits, {target_topology.num_edges:,} couplers")
-    print(f"\nRunning minorminer (no time limit)...")
-    print(f"This may take several minutes for large graphs.\n")
 
-    # Find embedding with maximally optimized parameters
-    # Detect available CPU cores and use all of them
-    import os
-    cpu_count = os.cpu_count() or 4
+    # Determine number of processes
+    if num_processes is None:
+        num_processes = os.cpu_count() or 4
 
-    print(f"Using {cpu_count} CPU threads for maximum parallelization\n")
+    # Each worker gets the FULL timeout - they run in parallel!
+    worker_timeout = timeout
+    max_tries_per_worker = max(1, worker_timeout // try_timeout)
+    total_attempts = num_processes * max_tries_per_worker
 
-    # For Zephyr-to-Zephyr embeddings, we can use more aggressive settings
-    print(f"Timeout: {timeout:,} seconds ({timeout/3600:.1f} hours)\n")
+    print(f"\nStrategy: Parallel multiprocess search with automatic restarts")
+    print(f"  Processes: {num_processes} (running in parallel)")
+    print(f"  Total timeout: {timeout:,}s ({timeout/3600:.1f}h)")
+    print(f"  Try timeout: {try_timeout:,}s ({try_timeout/60:.1f}m)")
+    print(f"  Max tries per worker: ~{max_tries_per_worker}")
+    print(f"  Total attempts (all workers): ~{total_attempts}")
+    print()
+
+    # Try to find a native subgraph seed for faster convergence
+    # Look for smaller native Zephyrs that might exist
+    seed_m = max(2, m - 3)  # Try 3 sizes smaller
+    seed_t = max(1, t - 1)  # Try 1 size smaller
+    initial_chains = _find_native_subgraph_seed(source_graph, target_graph, seed_m, seed_t)
+
+    # Prepare worker arguments
+    source_edges = list(source_graph.edges())
+    target_edges = list(target_graph.edges())
+
+    worker_args = [
+        (i, source_edges, target_edges, worker_timeout, try_timeout, 1)  # verbose=1 for first worker
+        for i in range(num_processes)
+    ]
+
+    print(f"Starting {num_processes} parallel workers (each will restart with new seeds automatically)...")
+    print(f"(First worker will show progress, others run silently)\n")
 
     start = time.perf_counter()
-    embedding = minorminer.find_embedding(
-        source_graph.edges(),
-        target_graph.edges(),
-        verbose=1,  # Show progress
-        timeout=timeout,  # User-configurable timeout
-        tries=50,  # Many restart attempts (default is 10)
-        threads=cpu_count,  # Use all available CPU cores
-        max_no_improvement=30,  # High patience (default is 10)
-        chainlength_patience=30,  # High patience for chain optimization
-    )
+
+    # Run parallel embedding search
+    with mp.Pool(processes=num_processes) as pool:
+        results = pool.map(_find_embedding_worker, worker_args)
+
     elapsed = time.perf_counter() - start
+
+    # Find best embedding (first one that succeeded)
+    embedding = None
+    best_worker = None
+    best_time = None
+    best_tries = None
+    total_tries = 0
+
+    for worker_id, emb, worker_elapsed, num_tries in results:
+        total_tries += num_tries
+        if emb:
+            if embedding is None:  # Take first successful embedding
+                embedding = emb
+                best_worker = worker_id
+                best_time = worker_elapsed
+                best_tries = num_tries
 
     if not embedding:
         print(f"\n✗ No embedding found after {elapsed:.2f}s")
+        print(f"  Total attempts across all workers: {total_tries}")
+        print(f"  Consider:")
+        print(f"    - Increasing --embedding-timeout (total time)")
+        print(f"    - Increasing --try-timeout (time per attempt)")
+        print(f"    - Using a smaller topology configuration")
+        print(f"    - Checking if topology fits on target hardware")
         return None
+
+    print(f"\n✓ Embedding found by worker {best_worker} after {best_tries} tries in {best_time:.2f}s")
+    print(f"  Wall clock time: {elapsed:.2f}s")
+    print(f"  Total attempts (all workers): {total_tries}")
 
     # Convert embedding dict to JSON-serializable format
     embedding_list = {str(k): list(v) for k, v in embedding.items()}
@@ -326,7 +490,6 @@ def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Adva
         if u not in embedding or v not in embedding:
             omitted_edges += 1
 
-    print(f"\n✓ Embedding found in {elapsed:.2f}s")
     print(f"  Embedded: {embedded_vars:,} / {total_vars:,} vars ({100*embedded_vars/total_vars:.1f}%)")
     print(f"  Omitted: {omitted_vars:,} vars, {omitted_edges:,} edges")
     print(f"  Avg chain length: {avg_chain_length:.1f}")
@@ -578,7 +741,12 @@ def main():
     parser.add_argument('--embedding-timeout',
                        type=str,
                        default='1h',
-                       help='Timeout for embedding (default: 1h). Examples: 30m, 2h, 1d, 1w')
+                       help='Total timeout for all embedding workers (default: 1h). Examples: 30m, 2h, 1d, 1w')
+
+    parser.add_argument('--try-timeout',
+                       type=str,
+                       default='10m',
+                       help='Timeout per individual embedding attempt (default: 10m). Examples: 30s, 5m, 30m')
 
     parser.add_argument('--generate-topology',
                        type=str,
@@ -635,9 +803,15 @@ def main():
         # Test or precompute embedding if requested
         embedding_result = {'embedding_tested': False}
         if args.precompute_embedding:
-            # Parse timeout and precompute embedding
+            # Parse timeouts and precompute embedding
             timeout_seconds = parse_timeout(args.embedding_timeout)
-            precompute_embedding(config_info, target_solver_name="Advantage2_system1.6", timeout=timeout_seconds)
+            try_timeout_seconds = parse_timeout(args.try_timeout)
+            precompute_embedding(
+                config_info,
+                target_solver_name="Advantage2_system1.6",
+                timeout=timeout_seconds,
+                try_timeout=try_timeout_seconds
+            )
         elif args.test_embedding:
             embedding_result = test_embedding_feasibility(config_info)
 
