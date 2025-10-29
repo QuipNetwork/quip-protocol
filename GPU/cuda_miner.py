@@ -67,9 +67,9 @@ def adapt_parameters(
     # Direct linear scaling: difficulty × max_sweeps
     num_sweeps = max(min_sweeps, int(difficulty * max_sweeps))
 
-    # Reads scale linearly with difficulty
+    # Reads scale linearly with difficulty (capped at 256 for CUDA hardware limit)
     min_reads = 64
-    max_reads = 1024
+    max_reads = 256  # CUDA max_threads_per_job limit
     num_reads = max(min_reads, int(difficulty * max_reads))
 
     return {
