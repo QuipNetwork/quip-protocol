@@ -15,6 +15,7 @@ from __future__ import annotations
 import time
 from shared.logging_config import QuipFormatter
 import logging
+import signal
 
 # Global logger for this module
 log = None
@@ -58,6 +59,36 @@ from typing import Any, Dict, Optional
 import CPU
 import GPU
 import QPU
+
+def _signal_aware_mining_worker(spec: Dict[str, Any], block, node_info, requirements, prev_timestamp: int, mining_queue: mp.Queue, result_queue: mp.Queue):
+    """Dedicated mining worker process that handles mining with signal awareness."""
+    # mining_queue is reserved for future use
+    _ = mining_queue
+    
+    try:
+        # Set up logging for child process
+        _setup_child_process_logging()
+        
+        # Build the miner
+        miner = build_miner_from_spec(spec)
+        
+        # Create a stop event that will never be set (child process doesn't monitor signals)
+        # The parent process will terminate this process via SIGTERM when needed
+        child_stop_event = mp.Event()
+        
+        # Perform the mining operation
+        result = miner.mine_block(block, node_info, requirements, prev_timestamp, child_stop_event)
+        
+        # Send result back to parent
+        if result is not None:
+            result_queue.put(result)
+            
+    except Exception as e:
+        # Log error and exit gracefully
+        logger.error(f"Mining worker error: {e}")
+    
+    # Process exits naturally
+
 
 def build_miner_from_spec(spec: Dict[str, Any]):
     kind = spec["kind"].lower()
@@ -164,6 +195,55 @@ class MinerHandle:
             return msg.get("data", {})
         else:
             raise ValueError(f"Miner {self.miner_id} did not respond to get_stats: {msg}")
+
+    def mine_with_timeout(self, block, node_info, requirements, prev_timestamp: int, stop_event) -> Optional[Any]:
+        """Mine a block with signal-responsive timeout using a dedicated child process."""
+        # Create a dedicated mining worker process for this operation
+        mining_queue = mp.Queue()
+        result_queue = mp.Queue()
+        
+        # Create mining process
+        mining_proc = mp.Process(
+            target=_signal_aware_mining_worker,
+            args=(self.spec, block, node_info, requirements, prev_timestamp, mining_queue, result_queue)
+        )
+        
+        mining_proc.start()
+        
+        try:
+            # Monitor stop_event while mining process runs
+            while mining_proc.is_alive():
+                if stop_event.is_set():
+                    # Send SIGTERM for graceful cleanup
+                    mining_proc.terminate()
+                    
+                    # Wait up to 2 seconds for graceful shutdown
+                    mining_proc.join(timeout=2.0)
+                    
+                    # Force kill if still alive
+                    if mining_proc.is_alive():
+                        mining_proc.kill()
+                        mining_proc.join(timeout=0.5)
+                    
+                    return None
+                
+                # Check every 100ms
+                time.sleep(0.1)
+            
+            # Process completed, get result
+            try:
+                result = result_queue.get_nowait()
+                return result
+            except:
+                return None
+                
+        finally:
+            # Cleanup: ensure process is terminated
+            if mining_proc.is_alive():
+                mining_proc.terminate()
+                mining_proc.join(timeout=1.0)
+                if mining_proc.is_alive():
+                    mining_proc.kill()
 
     def close(self):
         self.req.put({"op": "shutdown"})

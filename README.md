@@ -294,6 +294,26 @@ The systemd service provides production-ready deployment with automatic restarts
 
 ## Usage
 
+# Single-node blockchain
+
+Use these to test blockchain mining in an isolated single-node network on different platforms.
+
+# CPU node
+```
+quip-network-node cpu --listen 127.0.0.1 --port 8085 --public-host 127.0.0.1:8085 --auto-mine --peer 127.0.0.1:8085 --genesis-config genesis_block_public.json  
+```
+
+# GPU node (CUDA)
+```
+quip-network-node gpu --listen 127.0.0.1 --port 8085 --public-host 127.0.0.1:8085 --auto-mine --peer 127.0.0.1:8085 --gpu-backend local --genesis-config genesis_block_public.json  
+```
+
+# Mac Metal node
+```
+quip-network-node gpu --listen 127.0.0.1 --port 8085 --public-host 127.0.0.1:8085 --auto-mine --peer 127.0.0.1:8085 --gpu-backend mps --genesis-config genesis_block_public.json  
+```
+
+
 ### Run the Quantum Blockchain Demo
 
 ```bash

@@ -48,7 +48,7 @@ class Message:
 class P2PNode:
     """Peer-to-peer node for quantum blockchain network."""
     
-    def __init__(self, host: str = "0.0.0.0", port: int = 8080, 
+    def __init__(self, host: str = "0.0.0.0", port: int = 8080,
                  node_timeout: float = 60.0, heartbeat_interval: float = 15.0,
                  verify_ssl: bool = True):
         self.host = host
@@ -57,24 +57,32 @@ class P2PNode:
         self.node_timeout = node_timeout
         self.heartbeat_interval = heartbeat_interval
         self.verify_ssl = verify_ssl
-        
+
         # Connection string mapping: host -> full connection string (https://host:port or http://host:port)
         self.conn_str: Dict[str, str] = {}
-        
+
         # Node registry
         self.nodes: Dict[str, NodeInfo] = {}
         self.nodes_lock = asyncio.Lock()
-        
+
+        # Transaction queue for solve requests
+        self.pending_transactions = []
+        self.transactions_lock = asyncio.Lock()
+
+        # Miner reference (set by blockchain)
+        self.miner = None
+
         # Callbacks
         self.on_new_node: Optional[Callable] = None
         self.on_node_lost: Optional[Callable] = None
         self.on_block_received: Optional[Callable] = None
-        
+        self.on_solve_request: Optional[Callable] = None
+
         # Web server
         self.app = web.Application()
         self.setup_routes()
         self.runner = None
-        
+
         # Background tasks
         self.heartbeat_task = None
         self.cleanup_task = None
@@ -88,6 +96,7 @@ class P2PNode:
         self.app.router.add_post('/broadcast', self.handle_broadcast)
         self.app.router.add_post('/block', self.handle_new_block)
         self.app.router.add_get('/status', self.handle_status)
+        self.app.router.add_post('/solve', self.handle_solve)
     
     async def start(self):
         """Start the P2P node."""
@@ -482,7 +491,7 @@ class P2PNode:
         """Return node status."""
         async with self.nodes_lock:
             active_nodes = sum(1 for node in self.nodes.values() if node.is_alive(self.node_timeout))
-        
+
         return web.json_response({
             "address": self.address,
             "running": self.running,
@@ -490,7 +499,104 @@ class P2PNode:
             "active_nodes": active_nodes,
             "uptime": time.time() if self.running else 0
         })
-    
+
+    async def handle_solve(self, request: web.Request) -> web.Response:
+        """Handle quantum annealing solve request.
+
+        Request format:
+        {
+            "h": [array of linear bias coefficients],
+            "J": [[i, j, coupling_value], ...] or {key: value},
+            "num_samples": integer
+        }
+
+        Response format:
+        {
+            "samples": [array of solution bitstrings/spin configurations],
+            "energies": [array of corresponding energies],
+            "transaction_id": "unique identifier"
+        }
+        """
+        try:
+            data = await request.json()
+
+            # Validate request
+            if 'h' not in data or 'J' not in data or 'num_samples' not in data:
+                return web.json_response(
+                    {"error": "Missing required fields: h, J, num_samples"},
+                    status=400
+                )
+
+            h = data['h']
+            J_raw = data['J']
+            num_samples = int(data['num_samples'])
+
+            # Convert J to list of tuples format
+            if isinstance(J_raw, dict):
+                # Convert dict format {"(i,j)": value} to list format
+                J = [((int(k.split(',')[0].strip('()')), int(k.split(',')[1].strip('()'))), v)
+                     for k, v in J_raw.items()]
+            elif isinstance(J_raw, list):
+                # Already in list format [[i, j, value], ...]
+                J = [((entry[0], entry[1]), entry[2]) for entry in J_raw]
+            else:
+                return web.json_response(
+                    {"error": "Invalid J format. Must be dict or list."},
+                    status=400
+                )
+
+            # Generate transaction ID
+            transaction_id = f"{self.address}-{time.time()}-{hash((tuple(h), tuple(J)))}"
+
+            # Call the solve callback if provided
+            if self.on_solve_request:
+                result = await self.on_solve_request(h, J, num_samples, transaction_id)
+                if result:
+                    samples, energies = result
+
+                    # Create transaction record
+                    from shared.block import Transaction
+                    transaction = Transaction(
+                        transaction_id=transaction_id,
+                        timestamp=int(time.time()),
+                        request_h=h,
+                        request_J=J,
+                        num_samples=num_samples,
+                        samples=samples,
+                        energies=energies
+                    )
+
+                    # Add to pending transactions
+                    async with self.transactions_lock:
+                        self.pending_transactions.append(transaction)
+
+                    logger.info(f"Solve request completed: {transaction_id}, {len(samples)} samples")
+
+                    return web.json_response({
+                        "samples": samples,
+                        "energies": energies,
+                        "transaction_id": transaction_id,
+                        "status": "completed"
+                    })
+
+            return web.json_response(
+                {"error": "No solver configured for this node"},
+                status=503
+            )
+
+        except Exception as e:
+            logger.error(f"Error handling solve request: {e}")
+            import traceback
+            traceback.print_exc()
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def get_pending_transactions(self) -> List:
+        """Get and clear pending transactions."""
+        async with self.transactions_lock:
+            transactions = self.pending_transactions.copy()
+            self.pending_transactions.clear()
+            return transactions
+
     async def broadcast_block(self, block_data: dict):
         """Broadcast a new block to the network."""
         message = Message(

@@ -10,17 +10,19 @@ import socket
 from queue import Empty
 import time
 from blake3 import blake3
-from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING, Callable, Awaitable, Union
+from typing import Dict, List, Optional, Any, TYPE_CHECKING, Callable
 from multiprocessing.synchronize import Event as EventType
 from logging.handlers import QueueListener
 import aiohttp
+
+from shared.block_requirements import compute_next_block_requirements, validate_block
 
 if TYPE_CHECKING:
     pass
 
 from shared import block
 from shared.block_signer import BlockSigner
-from shared.block import Block, MinerInfo, compute_next_block_requirements
+from shared.block import Block, MinerInfo
 from shared.miner import Miner, MiningResult
 from shared.logging_config import init_component_logger
 from shared.time_utils import utc_timestamp_float, utc_timestamp
@@ -156,11 +158,18 @@ class Node:
             gpu_cfg = cfg["gpu"]
             gpu_backend = (gpu_cfg.get("backend") or "local").lower()
             gpu_devices = list(gpu_cfg.get("devices") or [])
+
+            # Extract common GPU config (gpu_utilization, etc.)
+            miner_cfg = {}
+            if "gpu_utilization" in gpu_cfg:
+                miner_cfg["gpu_utilization"] = gpu_cfg["gpu_utilization"]
+
             if gpu_backend == "local":
                 for d in gpu_devices:
                     spec = {
                         "id": f"{self.node_id}-GPU-CUDA-{d}",
                         "kind": "cuda",
+                        "cfg": miner_cfg,
                         "args": {"device": str(d)}
                     }
                     self.miner_handles.append(MinerHandle(spec, self._log_queue))
@@ -170,6 +179,7 @@ class Node:
                     spec = {
                         "id": f"{self.node_id}-GPU-MODAL-{t}",
                         "kind": "modal",
+                        "cfg": miner_cfg,
                         "args": {"gpu_type": str(t)}
                     }
                     self.miner_handles.append(MinerHandle(spec, self._log_queue))
@@ -178,6 +188,7 @@ class Node:
                 spec = {
                     "id": f"{self.node_id}-GPU-MPS",
                     "kind": "metal",
+                    "cfg": miner_cfg,
                     "args": {"device": "mps"}
                 }
                 self.miner_handles.append(MinerHandle(spec, self._log_queue))
@@ -276,7 +287,7 @@ class Node:
 
         # 4. Validate the Quantum Proof and other block artifacts.
         block.quantum_proof.compute_derived_fields()
-        if not block.validate_block(prev_block):
+        if not validate_block(block, prev_block):
             self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid quantum proof")
             qpjson = block.quantum_proof.to_json()
             qpjson['proof_data'] = qpjson['proof_data'][:10] + "..."
@@ -344,16 +355,19 @@ class Node:
             next_wots_public_key=self.crypto.wots_plus_public_key
         )
 
-    async def mine_block(self, previous_block: Block) -> Optional[MiningResult]:
+    async def mine_block(self, previous_block: Block, transactions: List = None) -> Optional[MiningResult]:
         """
         Async method to coordinate mining across all miners of this node for a block.
 
         Args:
             previous_block: Previous block (contains next block requirements)
+            transactions: Optional list of Transaction objects to include in the block
 
         Returns:
             Block if successful, None if stopped/failed
         """
+        if transactions is None:
+            transactions = []
         if not self.chain:
             self.logger.info("No existing chain, previous block is genesis")
             self.chain.append(previous_block)
@@ -397,8 +411,13 @@ class Node:
             # Wait for first result or timeout
             deadline = utc_timestamp_float() + self.no_block_timeout
             while utc_timestamp_float() < deadline and not self._mining_stop_event.is_set():
+                # Async sleep to allow other coroutines to run
+                await asyncio.sleep(0.1)
+
                 # Poll each handle's response queue quickly
                 for h in handles:
+                    # Async sleep to allow other coroutines to run
+                    await asyncio.sleep(0.1)
                     try:
                         msg = h.resp.get_nowait()
                     except Empty:
@@ -420,8 +439,6 @@ class Node:
                         pass
                 if result is not None:
                     break
-                # Async sleep to allow other coroutines to run
-                await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             self.logger.info("Mining cancelled")
             self._mining_stop_event.set()
@@ -478,8 +495,18 @@ class Node:
         # Reset state
         self._mining_stop_event = None
     
-    def build_block(self, previous_block: Block, mining_result: MiningResult, block_data: bytes):
-        """Build a block from a mining result."""
+    def build_block(self, previous_block: Block, mining_result: MiningResult, block_data: bytes, transactions: List = None):
+        """Build a block from a mining result.
+
+        Args:
+            previous_block: The previous block in the chain
+            mining_result: The result from the mining process
+            block_data: Arbitrary block data
+            transactions: Optional list of Transaction objects to include in the block
+        """
+        if transactions is None:
+            transactions = []
+
         if previous_block.hash is None:
             raise ValueError("Previous block hash is empty, unsigned/finalized block?")
 
@@ -517,6 +544,7 @@ class Node:
             quantum_proof=quantum_proof,
             next_block_requirements=next_block_requirements,
             data=block_data,
+            transactions=transactions,
             raw=b"",
             hash=b"",
             signature=b""
@@ -655,3 +683,4 @@ class Node:
             lines.append(f"  - {mid} ({mtype})")
 
         return "\n".join(lines)
+

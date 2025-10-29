@@ -1,73 +1,57 @@
 #!/usr/bin/env python3
-"""Metal GPU baseline parameter testing tool."""
+"""Metal SA baseline parameter testing tool."""
 import argparse
 import sys
 import time
 import json
 from pathlib import Path
-import random
 
 # Add parent directory to path
-sys.path.append(str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evaluate_sampleset, calculate_diversity
 from shared.block_requirements import BlockRequirements
+from dwave_topologies import DEFAULT_TOPOLOGY
 
-try:
-    from GPU.metal_kernel_sampler import MetalKernelDimodSampler
-    METAL_KERNEL_AVAILABLE = True
-except ImportError:
-    METAL_KERNEL_AVAILABLE = False
-
-try:
-    from GPU.metal_sampler_optimized_chunks import OptimizedChunkMetalSampler
-    OPTIMIZED_METAL_AVAILABLE = True
-except ImportError:
-    OPTIMIZED_METAL_AVAILABLE = False
+from GPU.metal_sa import MetalSASampler
+from GPU.metal_miner import get_gpu_core_count
 
 
-def metal_baseline_test(timeout_minutes=10.0, output_file=None):
-    """Test Metal GPU performance with CPU baseline format and evaluation logic."""
-    print("🔬 Metal GPU Baseline Parameter Test (Kernel-Only)")
+def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None, h_values=None, num_models=1):
+    """Test Metal SA performance with baseline format and evaluation logic."""
+    if h_values is None:
+        h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
+
+    print(f"🔬 Metal SA Baseline Parameter Test")
     print("=" * 50)
     print(f"⏰ Timeout: {timeout_minutes} minutes")
-    
-    # Try kernel-only sampler first, fall back to optimized chunks
-    metal_sampler = None
-    sampler_type = "unknown"
-    
-    if METAL_KERNEL_AVAILABLE:
-        try:
-            metal_sampler = MetalKernelDimodSampler("mps")
-            nodes = metal_sampler.nodes
-            edges = metal_sampler.edges
-            sampler_type = "kernel-only"
-            print("✅ Metal kernel-only sampler ready (should be 5-10x faster)")
-        except Exception as e:
-            print(f"⚠️ Metal kernels failed: {e}, trying fallback...")
-            metal_sampler = None
-    
-    if metal_sampler is None and OPTIMIZED_METAL_AVAILABLE:
-        try:
-            metal_sampler = OptimizedChunkMetalSampler("mps")
-            nodes = metal_sampler.nodes
-            edges = metal_sampler.edges
-            sampler_type = "optimized-chunks"
-            print("✅ Metal optimized sampler ready (PyTorch MPS fallback)")
-        except Exception as e:
-            print(f"❌ Metal optimized failed: {e}")
-            return None
-    
-    if metal_sampler is None:
-        print("❌ No Metal samplers available")
+    print(f"🎲 h_values: {h_values}")
+
+    # Initialize sampler
+    try:
+        metal_sampler = MetalSASampler()
+        print(f"✅ Metal SA sampler ready")
+    except Exception as e:
+        print(f"❌ Metal SA sampler failed: {e}")
         return None
-    
-    # Initial problem setup to show problem size
+
+    # Get topology
+    topology_graph = DEFAULT_TOPOLOGY.graph
+    nodes = list(topology_graph.nodes())
+    edges = list(topology_graph.edges())
+
+    # Generate test problem with h_values
     seed = 12345  # Fixed seed for reproducible results
-    h, J = generate_ising_model_from_nonce(seed, nodes, edges)
+    h, J = generate_ising_model_from_nonce(seed, nodes, edges, h_values=h_values)
+
+    # Show h distribution
+    h_vals_set = sorted(set(h.values()))
+    h_counts = {v: list(h.values()).count(v) for v in h_vals_set}
+    h_dist_str = ", ".join([f"{v}: {h_counts[v]} ({100*h_counts[v]/len(h):.1f}%)" for v in h_vals_set])
     print(f"📊 Problem: {len(h)} variables, {len(J)} couplings")
-    
-    # Test configurations - matching CPU baseline exactly
+    print(f"   h distribution: {h_dist_str}")
+
+    # Test configurations - matching CPU baseline for fair comparison
     test_configs = [
         (256, 64, "Light Metal"),
         (512, 100, "Low Metal"),
@@ -76,82 +60,117 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None):
         (4096, 200, "Very High Metal"),
         (8192, 200, "Max Metal")
     ]
-    
-    print(f"\n🧪 Testing Metal configurations:")
-    
+
+    # Optional filter: run only the requested label
+    if only_label:
+        available_labels = [desc for _, _, desc in test_configs]
+        filtered = [cfg for cfg in test_configs if cfg[2].lower() == only_label.lower()]
+        if not filtered:
+            print(f"⚠️ No test config matched --only {only_label!r}; available: {available_labels}")
+            return None
+        test_configs = filtered
+
+    print(f"\n🧪 Testing Metal SA configurations:")
+
     results = {
         'timeout_minutes': timeout_minutes,
-        'sampler_type': sampler_type,
+        'sampler_type': 'metal-sa',
         'problem_info': {
             'num_variables': len(h),
             'num_couplings': len(J),
-            'seed': seed
+            'seed': 12345
         },
         'tests': []
     }
-    
+
     timeout_seconds = timeout_minutes * 60
     total_start_time = time.time()
-    
-    for sweeps, reads, desc in test_configs:
+
+    # Use deterministic seed sequence for reproducible comparisons
+    import random
+    random.seed(42)
+    test_nonces = [random.randint(0, 2**32 - 1) for _ in range(len(test_configs))]
+
+    for idx, (sweeps, reads, desc) in enumerate(test_configs):
         elapsed_total = time.time() - total_start_time
         if elapsed_total > timeout_seconds:
             print(f"\n⏰ Total timeout ({timeout_minutes} min) reached, stopping")
             break
-            
-        print(f"\n{desc}: {sweeps} sweeps, {reads} reads")
-        
+
+        print(f"\n{desc}: {sweeps} sweeps, {reads} reads, {num_models} models")
+
         try:
-            # Generate the Ising model first (like the real miners do)
-            nonce = random.randint(0, 2**32 - 1)
-            h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+            # Generate problems with deterministic nonces
+            h_list = []
+            J_list = []
+            nonces = []
+
+            for _ in range(num_models):
+                nonce = test_nonces[idx]
+                nonces.append(nonce)
+                h, J = generate_ising_model_from_nonce(nonce, nodes, edges, h_values=h_values)
+                h_list.append(h)
+                J_list.append(J)
 
             start_time = time.time()
-            sampleset = metal_sampler.sample_ising(
-                h=h, J=J,
+            # Process models in batch
+            samplesets = metal_sampler.sample_ising(
+                h=h_list, J=J_list,
                 num_reads=reads,
                 num_sweeps=sweeps
             )
             runtime = time.time() - start_time
+            throughput = num_models / runtime  # models per second
 
+            # Collect stats from all models
+            all_min_energies = []
+            all_avg_energies = []
+            for sampleset in samplesets:
+                energies = list(sampleset.record.energy)
+                all_min_energies.append(float(min(energies)))
+                all_avg_energies.append(float(sum(energies) / len(energies)))
+
+            # Use first sampleset for detailed analysis
+            sampleset = samplesets[0]
             energies = list(sampleset.record.energy)
             min_energy = float(min(energies))
             avg_energy = float(sum(energies) / len(energies))
             std_energy = float((sum((e - avg_energy)**2 for e in energies) / len(energies)) ** 0.5)
 
-            print(f"  ⏱️  {runtime/60:.1f} min ({runtime:.1f}s)")
-            print(f"  🎯 min_energy = {min_energy:.1f}")
-            print(f"  📊 avg_energy = {avg_energy:.1f} (±{std_energy:.1f})")
+            print(f"  ⏱️  {runtime:.2f}s ({num_models} models)")
+            if num_models > 1:
+                print(f"  🚀 Throughput: {throughput:.2f} models/second")
+                print(f"  🎯 Best energy: {min(all_min_energies):.1f} (across {num_models} models)")
+            else:
+                print(f"  🎯 min_energy = {min_energy:.1f}")
+            print(f"  📊 Avg energy (first model): {avg_energy:.1f} (±{std_energy:.1f})")
 
-            # Use evaluate_sampleset to get diversity and num_solutions (same as CPU)
+            # Use evaluate_sampleset to get diversity and num_solutions
             requirements = BlockRequirements(
-                difficulty_energy=0.0,       # Very lenient difficulty (allow positive energies)
+                difficulty_energy=0.0,       # Very lenient difficulty
                 min_diversity=0.1,           # Low diversity requirement
                 min_solutions=1,             # Low solution count requirement
-                timeout_to_difficulty_adjustment_decay=600  # 10 minutes
+                timeout_to_difficulty_adjustment_decay=600
             )
 
-            # Use the same nonce and generate test salt for evaluation
-            salt = b"test_salt_metal_baseline"
-            prev_timestamp = int(time.time()) - 600  # 10 minutes ago
+            salt = b"test_salt_metal_baseline_sa"
+            prev_timestamp = int(time.time()) - 600
 
-            # Evaluate the sampleset
             mining_result = evaluate_sampleset(
-                sampleset, requirements, nodes, edges, nonce, salt,
-                prev_timestamp, start_time, f"metal-baseline-{sweeps}-{reads}", "Metal"
+                sampleset, requirements, nodes, edges, nonces[0], salt,
+                prev_timestamp, start_time, f"metal-sa-{sweeps}-{reads}", "Metal"
             )
 
             diversity = 0.0
             num_solutions = 0
             meets_requirements = False
 
-            # Calculate diversity of top 10 solutions by energy (same as CPU)
+            # Calculate diversity of top 10 solutions by energy
             solutions = list(sampleset.record.sample)
             energies = list(sampleset.record.energy)
 
-            # Sort solutions by energy and take top 10
             solution_energy_pairs = list(zip(solutions, energies))
-            solution_energy_pairs.sort(key=lambda x: x[1])  # Sort by energy (ascending = better)
+            solution_energy_pairs.sort(key=lambda x: x[1])
             top_10_solutions = [sol for sol, _ in solution_energy_pairs[:10]]
 
             top_10_diversity = calculate_diversity(top_10_solutions)
@@ -166,7 +185,7 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None):
             else:
                 print(f"  ❌ Does not meet mining requirements")
 
-            # Energy target analysis (same as CPU)
+            # Energy target analysis
             target_reached = "none"
             if min_energy <= -15650:
                 target_reached = "excellent"
@@ -196,48 +215,50 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None):
                 'meets_requirements': bool(meets_requirements)
             }
             results['tests'].append(test_result)
-            
+
             # Individual test timeout check
-            if runtime > timeout_seconds * 0.8:  # 80% of total timeout
+            if runtime > timeout_seconds * 0.8:
                 print(f"  ⏰ Single test approaching timeout, stopping further tests")
                 break
-                
+
         except Exception as e:
             print(f"  ❌ Error: {e}")
+            import traceback
+            traceback.print_exc()
             break
-    
-    # Summary (same as CPU)
+
+    # Summary
     total_runtime = time.time() - total_start_time
-    print(f"\n📊 Metal Baseline Summary (total time: {total_runtime/60:.1f} min):")
+    print(f"\n📊 Metal SA Baseline Summary (total time: {total_runtime/60:.1f} min):")
     print("=" * 50)
-    
+
     if results['tests']:
         # Best energy achieved
         best_result = min(results['tests'], key=lambda r: r['min_energy'])
         print(f"🏆 Best energy: {best_result['min_energy']:.1f}")
         print(f"   Required: {best_result['num_sweeps']} sweeps, {best_result['runtime_minutes']:.1f} min")
-        
+
         # Time vs energy analysis
         print(f"\n⏱️ Time vs Energy Performance:")
         for result in results['tests']:
             quality = f"({result['target_reached']})" if result['target_reached'] != 'none' else ""
             print(f"  {result['runtime_minutes']:5.1f} min: {result['min_energy']:7.1f} energy {quality}")
-    
+
     # Save results if requested
     if output_file:
         with open(output_file, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"\n💾 Results saved to {output_file}")
-    
+
     return results
 
 
 def main():
     """Main function with command line argument parsing."""
-    parser = argparse.ArgumentParser(description='Metal GPU baseline parameter testing tool')
+    parser = argparse.ArgumentParser(description='Metal SA baseline parameter testing tool')
     parser.add_argument(
-        '--timeout', '-t', 
-        type=float, 
+        '--timeout', '-t',
+        type=float,
         default=10.0,
         help='Timeout in minutes (default: 10.0)'
     )
@@ -249,34 +270,72 @@ def main():
     parser.add_argument(
         '--quick',
         action='store_true',
-        help='Quick test mode (3 minute timeout)'
+        help='Quick test mode (only Light test)'
     )
     parser.add_argument(
         '--extended',
-        action='store_true', 
+        action='store_true',
         help='Extended test mode (30 minute timeout)'
     )
-    
+    parser.add_argument(
+        '--only',
+        type=str,
+        help='Run only the config with this description (e.g., "Light Metal")'
+    )
+    parser.add_argument(
+        '--h-values',
+        type=str,
+        default='-1,0,1',
+        help='Comma-separated h field values (default: -1,0,1). Use "0" for h=0 baseline.'
+    )
+    parser.add_argument(
+        '--num-models',
+        type=int,
+        default=None,
+        help='Number of models to process in parallel (default: auto-detect GPU cores, typically 40)'
+    )
+
     args = parser.parse_args()
-    
-    # Handle preset timeouts
+
+    # Auto-detect GPU core count if not specified
+    if args.num_models is None:
+        try:
+            num_models = get_gpu_core_count()
+        except Exception as e:
+            print(f"⚠️ Could not detect GPU cores ({e}), defaulting to 40 models")
+            num_models = 40
+    else:
+        num_models = args.num_models
+
+    # Parse h_values
+    h_values = [float(v.strip()) for v in args.h_values.split(',')]
+
+    # Handle preset timeouts and filters
+    only_label = args.only
     if args.quick:
-        timeout = 3.0
+        timeout = 10.0
+        only_label = "Light Metal"  # Force Light test only
     elif args.extended:
         timeout = 30.0
     else:
         timeout = args.timeout
-    
+
     # Generate default output filename if not specified
     output_file = args.output
     if not output_file:
         timestamp = int(time.time())
-        output_file = f"metal_baseline_results_{timestamp}.json"
-    
-    # Run test
-    metal_baseline_test(timeout_minutes=timeout, output_file=output_file)
+        output_file = f"metal_sa_baseline_results_{timestamp}.json"
 
-    print(f"\n✅ Metal baseline test complete!")
+    # Run test
+    metal_baseline_test(
+        timeout_minutes=timeout,
+        output_file=output_file,
+        only_label=only_label,
+        h_values=h_values,
+        num_models=num_models
+    )
+
+    print(f"\n✅ Metal SA baseline test complete!")
 
 
 if __name__ == "__main__":

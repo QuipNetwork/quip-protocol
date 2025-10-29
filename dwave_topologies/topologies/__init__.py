@@ -26,19 +26,24 @@ Usage:
 from .chimera import CHIMERA_C16_TOPOLOGY
 from .pegasus import PEGASUS_P16_TOPOLOGY
 from .zephyr import ZEPHYR_Z12_TOPOLOGY
+from .zephyr_z8_t2 import ZEPHYR_Z8_T2_TOPOLOGY
+from .zephyr_z11_t4 import ZEPHYR_Z11_T4_TOPOLOGY
 from .advantage2_system1_6 import ADVANTAGE2_SYSTEM1_6_TOPOLOGY
 from .advantage2_system1_6 import ADVANTAGE2_SYSTEM1_6
 from .advantage_system4_1 import ADVANTAGE_SYSTEM4_1
 from .advantage_system6_4 import ADVANTAGE_SYSTEM6_4
 
-# Default topology (Advantage2 Zephyr Z12)
-DEFAULT_TOPOLOGY = ADVANTAGE2_SYSTEM1_6_TOPOLOGY
+# Default topology (Zephyr Z(8, 2) - smallest with confirmed Advantage2 embedding)
+# Precomputed embedding: dwave_topologies/embeddings/Advantage2_system1.6/zephyr_z8_t2.json.gz
+DEFAULT_TOPOLOGY = ZEPHYR_Z8_T2_TOPOLOGY
 
 __all__ = [
     # Topology objects (new type system)
     "CHIMERA_C16_TOPOLOGY",
     "PEGASUS_P16_TOPOLOGY",
     "ZEPHYR_Z12_TOPOLOGY",
+    "ZEPHYR_Z8_T2_TOPOLOGY",
+    "ZEPHYR_Z11_T4_TOPOLOGY",
     "ADVANTAGE2_SYSTEM1_6_TOPOLOGY",
 
     # Legacy dictionary format (backward compatibility)

@@ -1,20 +1,18 @@
 {
-  "index": 0,
-  "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
-  "timestamp": 1640995200.0,
-  "data": "Genesis Block - Quip Protocol",
+  "header": {
+    "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "index": 0,
+    "timestamp": 1640995200.0,
+    "data_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "data": "Genesis Block - Quip Protocol (Test)",
   "next_block_requirements": {
     "difficulty_energy": -1000.0,
-    "min_diversity": 0.28,
-    "min_solutions": 10,
-    "timeout_to_ease_difficulty": 20.0,
-    "max_mining_time": 300.0
+    "min_diversity": 0.3,
+    "min_solutions": 5,
+    "timeout_to_difficulty_adjustment_decay": 600,
+    "h_values": [-1.0, 0.0, 1.0]
   },
   "quantum_proof": null,
-  "miner_info": null,
-  "signature": null,
-  "energy": null,
-  "diversity": null,
-  "num_valid_solutions": null,
-  "hash": null
+  "miner_info": null
 }

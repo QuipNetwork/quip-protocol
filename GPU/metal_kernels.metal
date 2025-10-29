@@ -1,203 +1,262 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Optimized Metal kernels for simulated annealing
+// ==============================================================================
+// METAL SIMULATED ANNEALING - Based on the D-Wave Implementation
+// ==============================================================================
+// This kernel mimics D-Wave's cpu_sa.cpp implementation:
+// 1. Delta energy array optimization (pre-compute, update incrementally)
+// 2. xorshift32 RNG
+// 3. Sequential variable ordering (spins 0..N-1)
+// 4. Metropolis criterion with threshold optimization (skip if delta_E > 22.18/beta)
+// 5. Efficient neighbor update after each flip
 
-// Kernel 1: Fused Metropolis acceptance with vectorized operations
-kernel void fused_metropolis_update(
-    device int8_t* spins [[buffer(0)]],           // Input/Output: spin states
-    device const float* local_fields [[buffer(1)]], // Input: local field values
-    device const float* random_values [[buffer(2)]], // Input: pre-generated random values
-    constant float& beta [[buffer(3)]],           // Input: inverse temperature
-    constant uint& num_chains [[buffer(4)]],      // Input: number of parallel chains
-    constant uint& chunk_size [[buffer(5)]],      // Input: chunk size
-    uint3 thread_id [[thread_position_in_grid]]
-) {
-    uint chain_idx = thread_id.x;
-    uint spin_idx = thread_id.y;
-    
-    if (chain_idx >= num_chains || spin_idx >= chunk_size) return;
-    
-    uint flat_idx = chain_idx * chunk_size + spin_idx;
-    
-    // Load current spin and field
-    int8_t current_spin = spins[flat_idx];
-    float field = local_fields[flat_idx];
-    float rand_val = random_values[flat_idx];
-    
-    // Fused Metropolis computation
-    float delta_e = 2.0 * float(current_spin) * field;
-    
-    // Accept/reject decision in single operation
-    bool accept = (delta_e > 0.0) || (rand_val < exp(-beta * abs(delta_e)));
-    
-    // Conditional spin flip
-    if (accept) {
-        spins[flat_idx] = -current_spin;
+typedef unsigned int uint;
+
+inline uint xorshift32(thread uint &state) {
+    uint x = state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    state = x;
+    return x;
+}
+
+// Bit-packing helpers for thread-local state
+// Pack 8 spins into 1 byte: bit i stores spin i (0=+1, 1=-1)
+inline int8_t get_spin_packed(int var, thread const int8_t* packed_state) {
+    int byte_idx = var >> 3;  // var / 8
+    int bit_idx = var & 7;    // var % 8
+    int bit = (packed_state[byte_idx] >> bit_idx) & 1;
+    return bit ? -1 : 1;  // 0 -> +1, 1 -> -1
+}
+
+inline void set_spin_packed(int var, int8_t spin, thread int8_t* packed_state) {
+    int byte_idx = var >> 3;  // var / 8
+    int bit_idx = var & 7;    // var % 8
+    int8_t bit = (spin < 0) ? 1 : 0;  // -1 -> 1, +1 -> 0
+    int8_t mask = 1 << bit_idx;
+
+    if (bit) {
+        packed_state[byte_idx] |= mask;   // Set bit
+    } else {
+        packed_state[byte_idx] &= ~mask;  // Clear bit
     }
 }
 
-// Kernel 2: Optimized scatter-add for coupling field computation
-kernel void optimized_coupling_field(
-    device float* neighbor_sum [[buffer(0)]],     // Output: neighbor contribution sums
-    device const int8_t* spins [[buffer(1)]],     // Input: current spin states  
-    device const uint* i_indices [[buffer(2)]],   // Input: coupling i-indices
-    device const uint* j_indices [[buffer(3)]],   // Input: coupling j-indices
-    device const float* j_values [[buffer(4)]],   // Input: coupling strengths
-    constant uint& num_chains [[buffer(5)]],      // Input: number of parallel chains
-    constant uint& num_couplings [[buffer(6)]],   // Input: number of couplings
-    constant uint& num_spins [[buffer(7)]],       // Input: number of spins
-    uint2 thread_id [[thread_position_in_grid]]
-) {
-    uint chain_idx = thread_id.x;
-    uint coupling_idx = thread_id.y;
-    
-    if (chain_idx >= num_chains || coupling_idx >= num_couplings) return;
-    
-    uint i = i_indices[coupling_idx];
-    uint j = j_indices[coupling_idx]; 
-    float val = j_values[coupling_idx];
-    
-    uint spin_i_idx = chain_idx * num_spins + i;
-    uint spin_j_idx = chain_idx * num_spins + j;
-    
-    float spin_i = float(spins[spin_i_idx]);
-    float spin_j = float(spins[spin_j_idx]);
-    
-    // Optimized atomic operations for coupling contributions
-    uint neighbor_i_idx = chain_idx * num_spins + i;
-    uint neighbor_j_idx = chain_idx * num_spins + j;
-    
-    // Use atomic_fetch_add for thread safety across couplings
-    atomic_fetch_add_explicit(
-        (device atomic<float>*)&neighbor_sum[neighbor_i_idx], 
-        spin_j * val, 
-        memory_order_relaxed
-    );
-    atomic_fetch_add_explicit(
-        (device atomic<float>*)&neighbor_sum[neighbor_j_idx], 
-        spin_i * val, 
-        memory_order_relaxed  
-    );
+inline void flip_spin_packed(int var, thread int8_t* packed_state) {
+    int byte_idx = var >> 3;  // var / 8
+    int bit_idx = var & 7;    // var % 8
+    packed_state[byte_idx] ^= (1 << bit_idx);  // Toggle bit
 }
 
-// Kernel 3: Vectorized energy computation
-kernel void compute_energies(
-    device float* energies [[buffer(0)]],         // Output: total energies
-    device const int8_t* spins [[buffer(1)]],     // Input: final spin states
-    device const float* h_fields [[buffer(2)]],   // Input: linear field terms
-    device const uint* i_indices [[buffer(3)]],   // Input: coupling i-indices
-    device const uint* j_indices [[buffer(4)]],   // Input: coupling j-indices  
-    device const float* j_values [[buffer(5)]],   // Input: coupling strengths
-    constant uint& num_chains [[buffer(6)]],      // Input: number of parallel chains
-    constant uint& num_spins [[buffer(7)]],       // Input: number of spins
-    constant uint& num_couplings [[buffer(8)]],   // Input: number of couplings
-    uint thread_id [[thread_position_in_grid]]
+// Compute delta energy for flipping a single variable
+// using the bit-packed state in thread-local memory
+inline int8_t get_flip_energy(
+    int var,
+    thread const int8_t* packed_state,
+    device const int* csr_row_ptr,
+    device const int* csr_col_ind,
+    device const int8_t* csr_J_vals,
+    device const int8_t* h_vals
 ) {
-    uint chain_idx = thread_id;
-    
-    if (chain_idx >= num_chains) return;
-    
-    float h_energy = 0.0;
-    float j_energy = 0.0;
-    
-    uint chain_offset = chain_idx * num_spins;
-    
-    // Compute linear field energy
-    for (uint spin_idx = 0; spin_idx < num_spins; spin_idx++) {
-        h_energy += float(spins[chain_offset + spin_idx]) * h_fields[spin_idx];
+    int start = csr_row_ptr[var];
+    int end = csr_row_ptr[var + 1];
+
+    int energy = 0;
+
+    // Aggressive unrolling for typical Zephyr degrees (18-20)
+    #pragma unroll 20
+    for (int p = start; p < end; ++p) {
+        int neighbor = csr_col_ind[p];
+        int8_t Jij = csr_J_vals[p];
+        int8_t neighbor_spin = get_spin_packed(neighbor, packed_state);
+        energy += neighbor_spin * Jij;
     }
-    
-    // Compute coupling energy
-    for (uint coupling_idx = 0; coupling_idx < num_couplings; coupling_idx++) {
-        uint i = i_indices[coupling_idx];
-        uint j = j_indices[coupling_idx];
-        float val = j_values[coupling_idx];
-        
-        float spin_i = float(spins[chain_offset + i]);
-        float spin_j = float(spins[chain_offset + j]);
-        
-        j_energy += spin_i * spin_j * val;
+
+    // Add h field contribution
+    int8_t h_var = h_vals[var];
+    energy += h_var;
+
+    // Delta energy = -2 * state[var] * energy
+    // Cast to int8_t (safe because -42 <= delta_E ≤ 42 for all topologies)
+    // Remember, it's a single flip, and J values are only ±1, so max energy is degree (~20 for Zephyr) + h (±1)
+    // Therefore, max delta_E = 2 * (degree + |h|) = 2 * 21 = 42, well within int8_t range
+    int8_t var_spin = get_spin_packed(var, packed_state);
+    return (int8_t)(-2 * var_spin * energy);
+}
+
+// Pure SA kernel with delta energy optimization
+// Batched multi-problem evaluation for reduced kernel overhead
+// Each problem gets its own CSR structure, threads process different problems in parallel
+kernel void pure_simulated_annealing(
+    device const int* csr_row_ptr [[buffer(0)]],          // Concatenated [N+1] for all problems
+    device const int* csr_col_ind [[buffer(1)]],          // Concatenated [nnz] for all problems
+    device const int8_t* csr_J_vals [[buffer(2)]],        // Concatenated [nnz] for all problems
+    device const int* row_ptr_offsets [[buffer(3)]],      // [num_problems+1] offset into csr_row_ptr
+    device const int* col_ind_offsets [[buffer(4)]],      // [num_problems+1] offset into csr_col_ind
+
+    constant int& N [[buffer(5)]],                         // number of spins (same for all problems)
+    constant int& num_betas [[buffer(6)]],                 // number of beta values
+    constant int& sweeps_per_beta [[buffer(7)]],           // sweeps per beta
+    constant uint& base_seed [[buffer(8)]],                // RNG seed
+
+    constant int& num_threads [[buffer(12)]],              // total number of threads
+    constant int& num_problems [[buffer(13)]],             // number of batched problems
+    constant int& num_reads [[buffer(14)]],                // reads per individual problem
+
+    device const float* beta_schedule [[buffer(9)]],       // [num_betas]
+    device const int8_t* csr_h_vals [[buffer(15)]],        // Concatenated [N] for all problems - h field values
+
+    // Outputs only (no working memory needed - using thread-local)
+    device int8_t* final_samples [[buffer(10)]],           // [num_threads * (N+7)/8] - bit-packed
+    device int* final_energies [[buffer(11)]],             // [num_threads]
+
+    // Thread info
+    uint3 threadgroup_pos [[threadgroup_position_in_grid]],
+    uint3 thread_pos_in_group [[thread_position_in_threadgroup]],
+    uint3 threads_per_group [[threads_per_threadgroup]]
+) {
+    // Compute global thread ID
+    uint thread_id = threadgroup_pos.x * threads_per_group.x + thread_pos_in_group.x;
+
+    // Early exit if thread_id is out of bounds
+    if (thread_id >= num_threads) {
+        return;
     }
-    
-    energies[chain_idx] = h_energy + j_energy;
-}
 
-// Kernel 4: Efficient random spin initialization
-kernel void initialize_random_spins(
-    device int8_t* spins [[buffer(0)]],           // Output: initialized spins
-    device const float* random_values [[buffer(1)]], // Input: random values [0,1]
-    constant uint& num_chains [[buffer(2)]],      // Input: number of parallel chains
-    constant uint& num_spins [[buffer(3)]],       // Input: number of spins
-    uint2 thread_id [[thread_position_in_grid]]
-) {
-    uint chain_idx = thread_id.x;
-    uint spin_idx = thread_id.y;
-    
-    if (chain_idx >= num_chains || spin_idx >= num_spins) return;
-    
-    uint flat_idx = chain_idx * num_spins + spin_idx;
-    
-    // Convert [0,1] random value to {-1,+1} spin
-    spins[flat_idx] = (random_values[flat_idx] > 0.5) ? int8_t(1) : int8_t(-1);
-}
+    // Determine which problem this thread is working on
+    uint problem_id = thread_id / num_reads;
 
-// Kernel 5: Optimized field computation with local memory
-kernel void compute_local_fields(
-    device float* local_fields [[buffer(0)]],     // Output: local field values
-    device const float* neighbor_sums [[buffer(1)]], // Input: neighbor contributions
-    device const float* h_fields [[buffer(2)]],   // Input: linear field terms
-    constant uint& num_chains [[buffer(3)]],      // Input: number of parallel chains  
-    constant uint& num_spins [[buffer(4)]],       // Input: number of spins
-    uint2 thread_id [[thread_position_in_grid]]
-) {
-    uint chain_idx = thread_id.x;
-    uint spin_idx = thread_id.y;
-    
-    if (chain_idx >= num_chains || spin_idx >= num_spins) return;
-    
-    uint flat_idx = chain_idx * num_spins + spin_idx;
-    
-    // Simple addition: neighbor_sum + h_field
-    local_fields[flat_idx] = neighbor_sums[flat_idx] + h_fields[spin_idx];
-}
+    // Get CSR offsets for this specific problem
+    int row_ptr_start = row_ptr_offsets[problem_id];
+    int col_ind_start = col_ind_offsets[problem_id];
 
-// Kernel 6: Memory-optimized coupling computation with workgroup sharing
-kernel void optimized_coupling_field_shared(
-    device float* neighbor_sum [[buffer(0)]],     // Output: neighbor contribution sums
-    device const int8_t* spins [[buffer(1)]],     // Input: current spin states
-    device const uint* i_indices [[buffer(2)]],   // Input: coupling i-indices
-    device const uint* j_indices [[buffer(3)]],   // Input: coupling j-indices
-    device const float* j_values [[buffer(4)]],   // Input: coupling strengths
-    constant uint& num_chains [[buffer(5)]],      // Input: number of parallel chains
-    constant uint& num_couplings [[buffer(6)]],   // Input: number of couplings
-    constant uint& num_spins [[buffer(7)]],       // Input: number of spins
-    uint2 thread_id [[thread_position_in_grid]],
-    uint2 threads_per_group [[threads_per_threadgroup]]
-) {
-    uint chain_idx = thread_id.x;
-    uint coupling_start = thread_id.y * threads_per_group.y;
-    
-    if (chain_idx >= num_chains) return;
-    
-    uint chain_offset = chain_idx * num_spins;
-    
-    // Process multiple couplings per thread for better efficiency
-    uint couplings_per_thread = (num_couplings + threads_per_group.y - 1) / threads_per_group.y;
-    
-    for (uint c = 0; c < couplings_per_thread; c++) {
-        uint coupling_idx = coupling_start + c;
-        if (coupling_idx >= num_couplings) break;
-        
-        uint i = i_indices[coupling_idx];
-        uint j = j_indices[coupling_idx];
-        float val = j_values[coupling_idx];
-        
-        float spin_i = float(spins[chain_offset + i]);
-        float spin_j = float(spins[chain_offset + j]);
-        
-        // Direct memory access for better performance
-        neighbor_sum[chain_offset + i] += spin_j * val;
-        neighbor_sum[chain_offset + j] += spin_i * val;
+    // Point to this problem's CSR data
+    device const int* my_csr_row_ptr = &csr_row_ptr[row_ptr_start];
+    device const int* my_csr_col_ind = &csr_col_ind[col_ind_start];
+    device const int8_t* my_csr_J_vals = &csr_J_vals[col_ind_start];
+    device const int8_t* my_h_vals = &csr_h_vals[problem_id * N];  // h values for this problem
+
+    int n = N;
+    int num_beta_values = num_betas;
+    int sweeps_per_beta_val = sweeps_per_beta;
+    int packed_size = (n + 7) / 8;  // bytes needed for bit-packed state
+
+    // Thread-local memory for state and delta_energy
+    // Bit-packed state: (N+7)/8 bytes
+    // Delta energy: N bytes (int8)
+    // Total: ~5 KiB for N=4593 (fits in thread-local memory)
+    thread int8_t packed_state[4593 / 8 + 1];  // Bit-packed state
+    thread int8_t delta_energy[4593];           // Delta energy (int8)
+
+    // Initialize RNG state with unique seed per thread
+    uint rng_state = (base_seed ? base_seed : 1u) ^ (thread_id * 12345u);
+
+    // Generate random initial state (bit-packed)
+    for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
+        packed_state[byte_idx] = 0;  // Clear all bits
     }
+    for (int var = 0; var < n; var++) {
+        uint rand_val = xorshift32(rng_state);
+        int8_t spin = (rand_val & 1) ? -1 : 1;  // Random ±1
+        set_spin_packed(var, spin, packed_state);
+    }
+
+    // Build initial delta_energy array
+    for (int var = 0; var < n; var++) {
+        delta_energy[var] = get_flip_energy(var, packed_state, my_csr_row_ptr, my_csr_col_ind, my_csr_J_vals, my_h_vals);
+    }
+
+    // Compute initial energy
+    int current_energy = 0;
+    for (int i = 0; i < n; i++) {
+        int8_t spin_i = get_spin_packed(i, packed_state);
+
+        // Add h field contribution
+        current_energy += my_h_vals[i] * spin_i;
+
+        // Add J coupling contribution (count each edge once)
+        int start = my_csr_row_ptr[i];
+        int end = my_csr_row_ptr[i + 1];
+        for (int p = start; p < end; ++p) {
+            int j = my_csr_col_ind[p];
+            if (j > i) {  // Count each edge once
+                int8_t Jij = my_csr_J_vals[p];
+                int8_t spin_j = get_spin_packed(j, packed_state);
+                current_energy += Jij * spin_i * spin_j;
+            }
+        }
+    }
+
+    // Perform sweeps across beta schedule
+    for (int beta_idx = 0; beta_idx < num_beta_values; beta_idx++) {
+        float beta = beta_schedule[beta_idx];
+
+        // D-Wave optimization: threshold to skip impossible flips
+        // log(1/2^32) ≈ -22.18, so if delta_E > 22.18/beta, probability is < 2^-32
+        float threshold = 22.18f / beta;
+
+        for (int sweep = 0; sweep < sweeps_per_beta_val; sweep++) {
+            // Sequential variable ordering (matching D-Wave default)
+            for (int var = 0; var < n; var++) {
+                int8_t de = delta_energy[var];
+
+                // Skip if delta energy too large (D-Wave optimization)
+                if (de >= threshold) continue;
+
+                bool flip_spin = false;
+
+                // Metropolis-Hastings acceptance rule
+                if (de <= 0) {
+                    // Always accept energy-lowering flips
+                    flip_spin = true;
+                } else {
+                    // Get random number
+                    uint rand_val = xorshift32(rng_state);
+
+                    // Accept with probability exp(-delta_energy * beta)
+                    float prob = exp(-float(de) * beta);
+                    float rand_normalized = float(rand_val) / 4294967295.0f;  // 2^32 - 1
+
+                    if (prob > rand_normalized) {
+                        flip_spin = true;
+                    }
+                }
+
+                if (flip_spin) {
+                    current_energy += de;
+
+                    // Get current spin value
+                    int8_t var_spin = get_spin_packed(var, packed_state);
+
+                    // Update delta energies of all neighbors
+                    int8_t multiplier = 4 * var_spin;
+                    int start = my_csr_row_ptr[var];
+                    int end = my_csr_row_ptr[var + 1];
+
+                    // Aggressive unrolling for typical Zephyr degrees (18-20)
+                    #pragma unroll 20
+                    for (int p = start; p < end; ++p) {
+                        int neighbor = my_csr_col_ind[p];
+                        int8_t Jij = my_csr_J_vals[p];
+                        int8_t neighbor_spin = get_spin_packed(neighbor, packed_state);
+                        delta_energy[neighbor] += multiplier * Jij * neighbor_spin;
+                    }
+
+                    // Flip the spin and negate its delta energy
+                    flip_spin_packed(var, packed_state);
+                    delta_energy[var] = -de;
+                }
+            }
+        }
+    }
+
+    // Write final state to output (bit-packed)
+    device int8_t* output = &final_samples[thread_id * packed_size];
+    for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
+        output[byte_idx] = packed_state[byte_idx];
+    }
+
+    final_energies[thread_id] = current_energy;
 }

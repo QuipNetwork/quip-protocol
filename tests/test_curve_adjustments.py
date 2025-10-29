@@ -12,7 +12,7 @@ import math
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from CPU.sa_miner import adapt_parameters
-from shared.block import _adjust_energy_along_curve
+from shared.energy_utils import adjust_energy_along_curve, calc_energy_range
 
 
 def test_sa_miner_adapt_parameters():
@@ -60,7 +60,7 @@ def test_block_energy_adjustments():
     print("BLOCK ENERGY ADJUSTMENT CURVE TEST")
     print("=" * 80)
     
-    print("Testing _adjust_energy_along_curve with 5% adjustments")
+    print("Testing adjust_energy_along_curve with 5% adjustments")
     print(f"{'Current':>8} | {'Harder':>8} | {'Easier':>8} | {'Hard Δ':>8} | {'Easy Δ':>8} | {'Scaling':>8}")
     print("-" * 70)
     
@@ -69,8 +69,8 @@ def test_block_energy_adjustments():
     adjustment_rate = 0.05
     
     for energy in test_energies:
-        harder = _adjust_energy_along_curve(energy, adjustment_rate, 'harder')
-        easier = _adjust_energy_along_curve(energy, adjustment_rate, 'easier')
+        harder = adjust_energy_along_curve(energy, adjustment_rate, 'harder')
+        easier = adjust_energy_along_curve(energy, adjustment_rate, 'easier')
         hard_delta = harder - energy
         easy_delta = easier - energy
         
@@ -89,36 +89,49 @@ def test_block_energy_adjustments():
 
 def test_consecutive_adjustments():
     """Test consecutive adjustments to show dampening behavior"""
-    
+
     print("CONSECUTIVE ADJUSTMENTS TEST")
     print("=" * 80)
-    
-    # Test starting from different positions
-    start_positions = [-15000, -15500, -14500, -15800, -14300]
-    
+
+    # Get actual energy range from topology
+    min_e, knee_e, max_e = calc_energy_range()
+    print(f"Energy range: {max_e:.1f} (easy) to {min_e:.1f} (hard)")
+    print(f"Knee point: {knee_e:.1f}\n")
+
+    # Test from different starting points relative to the actual range
+    # Use percentages of the range to make tests topology-agnostic
+    total_range = max_e - min_e
+    start_positions = [
+        min_e + 0.25 * total_range,  # 25% from hardest
+        knee_e,                       # At knee point
+        max_e - 0.25 * total_range,  # 25% from easiest
+        min_e + 0.10 * total_range,  # Near hardest edge
+        max_e - 0.10 * total_range,  # Near easiest edge
+    ]
+
     for start_energy in start_positions:
         print(f"\nStarting from {start_energy:.0f} - making consecutive HARDER adjustments:")
         print(f"{'Step':>4} | {'Current':>8} | {'New':>8} | {'Delta':>6} | {'Scaling':>8}")
         print("-" * 40)
-        
+
         current = start_energy
         for i in range(8):
-            new_energy = _adjust_energy_along_curve(current, 0.05, 'harder')
+            new_energy = adjust_energy_along_curve(current, 0.05, 'harder')
             delta = new_energy - current
-            
-            # Calculate scaling factor
-            total_range = -14000.0 - (-16000.0)
-            linear_position = (current - (-16000.0)) / total_range
+
+            # Calculate scaling factor based on actual range
+            linear_position = (current - min_e) / total_range
             distance_from_min = linear_position
             distance_from_max = 1.0 - linear_position
             min_distance = min(distance_from_min, distance_from_max)
-            scaling_factor = math.sqrt(min_distance * 2.0)
-            
+            scaling_factor = math.sqrt(max(0, min_distance * 2.0))  # Ensure non-negative
+
             print(f'{i+1:>4} | {current:>8.0f} | {new_energy:>8.0f} | {delta:>6.0f} | {scaling_factor:>8.3f}')
-            
+
             current = new_energy
-            if abs(delta) < 1:  # Stop if adjustment becomes very small
-                print("     (adjustment too small, stopping)")
+            # Stop if we hit boundary or adjustment becomes very small
+            if abs(delta) < 1 or current <= min_e or current >= max_e:
+                print("     (boundary reached or adjustment too small, stopping)")
                 break
 
     print("\n" + "=" * 80)
@@ -147,8 +160,8 @@ def test_boundary_conditions():
     for energy in boundary_tests:
         # Test what happens when we clamp the input
         clamped = max(-16000.0, min(energy, -14000.0))
-        harder = _adjust_energy_along_curve(energy, 0.05, 'harder')
-        easier = _adjust_energy_along_curve(energy, 0.05, 'easier')
+        harder = adjust_energy_along_curve(energy, 0.05, 'harder')
+        easier = adjust_energy_along_curve(energy, 0.05, 'easier')
         hard_delta = harder - clamped
         easy_delta = easier - clamped
         
@@ -171,8 +184,8 @@ def test_adjustment_rates():
     print("-" * 50)
     
     for rate in adjustment_rates:
-        harder = _adjust_energy_along_curve(test_energy, rate, 'harder')
-        easier = _adjust_energy_along_curve(test_energy, rate, 'easier')
+        harder = adjust_energy_along_curve(test_energy, rate, 'harder')
+        easier = adjust_energy_along_curve(test_energy, rate, 'easier')
         hard_delta = harder - test_energy
         easy_delta = easier - test_energy
         

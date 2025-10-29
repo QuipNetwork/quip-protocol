@@ -1,6 +1,5 @@
 """Block data structures and parsing utilities for quantum blockchain."""
 
-import logging
 from blake3 import blake3
 import json
 import struct
@@ -8,14 +7,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
-from shared.time_utils import utc_timestamp, validate_block_timestamp
+from shared.time_utils import utc_timestamp
 
-from shared.miner_types import MiningResult
-from shared.quantum_proof_of_work import calculate_diversity, generate_ising_model_from_nonce, ising_nonce_from_block, energies_for_solutions
-from shared.quantum_proof_of_work import generate_ising_model_from_nonce, calculate_diversity
-from shared.block_requirements import BlockRequirements, compute_current_requirements
+from shared.quantum_proof_of_work import (
+    calculate_diversity, generate_ising_model_from_nonce, 
+    energies_for_solutions
+)
 from shared.logging_config import get_logger
-from shared.energy_utils import adjust_energy_along_curve
 
 # Initialize logger
 logger = get_logger('block')
@@ -40,6 +38,278 @@ def read_bytes(data: bytes, offset: int) -> tuple[bytes, int]:
     bytes_data = data[offset:offset+length]
     return bytes_data, offset + length
 
+def write_varint(value: int) -> bytes:
+    """Variable-length integer encoding with zigzag encoding for negatives (1-5 bytes per value)."""
+    # Zigzag encoding: negative -> positive, positive -> negative * 2
+    encoded = (value << 1) ^ (value >> 31) if value < 0 else (value << 1)
+    result = b''
+    while encoded >= 0x80:
+        result += bytes([(encoded & 0x7F) | 0x80])
+        encoded >>= 7
+    result += bytes([encoded])
+    return result
+
+def read_varint(data: bytes, offset: int) -> tuple[int, int]:
+    """Variable-length integer decoding with zigzag decoding."""
+    encoded = 0
+    shift = 0
+    while True:
+        if offset >= len(data):
+            raise ValueError("Unexpected end of data")
+        byte = data[offset]
+        offset += 1
+        encoded |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            break
+        shift += 7
+        if shift >= 35:  # Prevent overflow
+            raise ValueError("Varint too long")
+
+    # Zigzag decoding
+    value = (encoded >> 1) ^ (-(encoded & 1))
+    return value, offset
+
+def compress_nodes(nodes: List[int]) -> bytes:
+    """Compress node list using delta encoding."""
+    if not nodes:
+        return b''
+    # Sort nodes for better compression
+    sorted_nodes = sorted(nodes)
+    result = write_varint(sorted_nodes[0])
+    for i in range(1, len(sorted_nodes)):
+        delta = sorted_nodes[i] - sorted_nodes[i-1]
+        result += write_varint(delta)
+    return result
+
+def decompress_nodes(data: bytes) -> tuple[List[int], int]:
+    """Decompress node list from delta encoding. Returns (nodes, bytes_consumed)."""
+    if not data:
+        return [], 0
+    offset = 0
+    nodes = []
+    first_node, offset = read_varint(data, offset)
+    nodes.append(first_node)
+    while offset < len(data):
+        # Check if next byte indicates end of node data (would be edge data start)
+        if offset >= len(data):
+            break
+        try:
+            delta, new_offset = read_varint(data, offset)
+            nodes.append(nodes[-1] + delta)
+            offset = new_offset
+        except ValueError:
+            # If we can't read a valid varint, we've reached the end of node data
+            break
+    return nodes, offset
+
+def compress_edges(edges: List[Tuple[int, int]]) -> bytes:
+    """Compress edges using adjacency list with delta encoding."""
+    if not edges:
+        return b''
+
+    # Build adjacency list
+    adj = {}
+    for u, v in edges:
+        adj.setdefault(u, set()).add(v)
+        adj.setdefault(v, set()).add(u)
+
+    result = write_varint(len(adj))  # number of nodes with edges
+
+    for node in sorted(adj.keys()):
+        neighbors = sorted(adj[node])
+        result += write_varint(node)  # node ID
+        result += write_varint(len(neighbors))  # neighbor count
+
+        if neighbors:
+            result += write_varint(neighbors[0])  # first neighbor
+            for i in range(1, len(neighbors)):
+                delta = neighbors[i] - neighbors[i-1]
+                result += write_varint(delta)  # delta-encoded neighbors
+
+    return result
+
+def decompress_edges(data: bytes) -> tuple[List[Tuple[int, int]], int]:
+    """Decompress edges from adjacency list format. Returns (edges, bytes_consumed)."""
+    if not data:
+        return [], 0
+
+    offset = 0
+    edges = []
+    num_nodes, offset = read_varint(data, offset)
+
+    for _ in range(num_nodes):
+        node, offset = read_varint(data, offset)
+        num_neighbors, offset = read_varint(data, offset)
+
+        neighbors = []
+        if num_neighbors > 0:
+            first_neighbor, offset = read_varint(data, offset)
+            neighbors.append(first_neighbor)
+
+            for _ in range(num_neighbors - 1):
+                delta, offset = read_varint(data, offset)
+                neighbors.append(neighbors[-1] + delta)
+
+        # Reconstruct edges
+        for neighbor in neighbors:
+            if node < neighbor:  # Avoid duplicates in undirected graph
+                edges.append((node, neighbor))
+
+    return edges, offset
+
+def compress_solutions(solutions: List[List[int]]) -> bytes:
+    """Compress solutions by storing actual integer values."""
+    if not solutions:
+        return b''
+
+    result = write_varint(len(solutions))  # solution count
+
+    for solution in solutions:
+        result += write_varint(len(solution))  # solution length
+        for value in solution:
+            result += write_varint(value)
+
+    return result
+
+def decompress_solutions(data: bytes) -> tuple[List[List[int]], int]:
+    """Decompress solutions from varint-encoded format. Returns (solutions, bytes_consumed)."""
+    if not data:
+        return [], 0
+
+    offset = 0
+    num_solutions, offset = read_varint(data, offset)
+
+    solutions = []
+
+    for _ in range(num_solutions):
+        solution_length, offset = read_varint(data, offset)
+        solution = []
+        for _ in range(solution_length):
+            value, offset = read_varint(data, offset)
+            solution.append(value)
+        solutions.append(solution)
+
+    return solutions, offset
+
+@dataclass
+class BlockRequirements:
+    """Requirements that the next block must satisfy.
+
+    Note: diversity_range and solutions_range are blockchain-level constraints
+    that define the allowable MAX values. They are stored here for convenience
+    but represent blockchain configuration rather than per-block requirements.
+    """
+    difficulty_energy: float
+    min_diversity: float  # Set per block, constrained by diversity_range
+    min_solutions: int    # Set per block, constrained by solutions_range
+    timeout_to_difficulty_adjustment_decay: int
+    h_values: Optional[List[float]] = None
+
+    # Blockchain-level constraints (define allowable max values)
+    # Currently fixed at (0.3, 0.3) and (20, 20) but infrastructure ready for chain consensus
+    diversity_range: Optional[Tuple[float, float]] = None
+    solutions_range: Optional[Tuple[int, int]] = None
+
+    def __post_init__(self):
+        """Set defaults after initialization."""
+        if self.h_values is None:
+            self.h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
+
+        # Set range defaults from blockchain configuration
+        if self.diversity_range is None:
+            from shared.energy_utils import DEFAULT_DIVERSITY_RANGE
+            self.diversity_range = DEFAULT_DIVERSITY_RANGE
+
+        if self.solutions_range is None:
+            from shared.energy_utils import DEFAULT_SOLUTIONS_RANGE
+            self.solutions_range = DEFAULT_SOLUTIONS_RANGE
+
+        # Initialize min values from range if not already set
+        # (For now, ranges are fixed so this effectively sets them to the fixed values)
+        if self.min_diversity is None or self.min_diversity == 0:
+            self.min_diversity = self.diversity_range[0]
+        if self.min_solutions is None or self.min_solutions == 0:
+            self.min_solutions = self.solutions_range[0]
+
+    @property
+    def effective_diversity(self) -> float:
+        """Get the effective diversity requirement."""
+        return self.min_diversity
+
+    @property
+    def effective_solutions(self) -> int:
+        """Get the effective solutions requirement."""
+        return self.min_solutions
+
+    def to_network(self) -> bytes:
+        """Serialize to binary format."""
+        result = b''
+        result += struct.pack('!d', self.difficulty_energy)
+        result += struct.pack('!d', self.min_diversity)
+        result += struct.pack('!I', self.min_solutions)
+        result += struct.pack('!i', self.timeout_to_difficulty_adjustment_decay)
+
+        # Serialize h_values
+        h_vals = self.h_values if self.h_values is not None else [-1.0, 0.0, 1.0]
+        result += struct.pack('!I', len(h_vals))
+        for h_val in h_vals:
+            result += struct.pack('!d', h_val)
+
+        return result
+
+    @classmethod
+    def from_network(cls, data: bytes) -> 'BlockRequirements':
+        """Deserialize from binary format."""
+        offset = 0
+        difficulty_energy = struct.unpack('!d', data[offset:offset+8])[0]
+        offset += 8
+        min_diversity = struct.unpack('!d', data[offset:offset+8])[0]
+        offset += 8
+        min_solutions = struct.unpack('!I', data[offset:offset+4])[0]
+        offset += 4
+        timeout_to_difficulty_adjustment_decay = struct.unpack('!i', data[offset:offset+4])[0]
+        offset += 4
+
+        # Deserialize h_values (backward compatible)
+        h_values = None
+        if offset < len(data):
+            h_count = struct.unpack('!I', data[offset:offset+4])[0]
+            offset += 4
+            h_values = []
+            for _ in range(h_count):
+                h_val = struct.unpack('!d', data[offset:offset+8])[0]
+                offset += 8
+                h_values.append(h_val)
+
+        return cls(
+            difficulty_energy=difficulty_energy,
+            min_diversity=min_diversity,
+            min_solutions=min_solutions,
+            timeout_to_difficulty_adjustment_decay=timeout_to_difficulty_adjustment_decay,
+            h_values=h_values
+        )
+
+    def to_json(self) -> dict:
+        """Serialize to JSON-compatible dictionary."""
+        return {
+            'difficulty_energy': self.difficulty_energy,
+            'min_diversity': self.min_diversity,
+            'min_solutions': self.min_solutions,
+            'timeout_to_difficulty_adjustment_decay': self.timeout_to_difficulty_adjustment_decay,
+            'h_values': self.h_values if self.h_values is not None else [-1.0, 0.0, 1.0]
+        }
+
+    @classmethod
+    def from_json(cls, data: dict) -> 'BlockRequirements':
+        """Deserialize from JSON-compatible dictionary."""
+        return cls(
+            difficulty_energy=float(data['difficulty_energy']),
+            min_diversity=float(data['min_diversity']),
+            min_solutions=int(data['min_solutions']),
+            timeout_to_difficulty_adjustment_decay=int(data['timeout_to_difficulty_adjustment_decay']),
+            h_values=data.get('h_values', None)  # Backward compatible: missing h_values → None → defaults to [-1, 0, 1]
+        )
+
 @dataclass
 class QuantumProof:
     """Quantum mining proof containing the essential mining result data."""
@@ -56,101 +326,71 @@ class QuantumProof:
     num_valid_solutions: Optional[int] = None
 
     def to_network(self) -> bytes:
-        """Serialize to binary format, excluding derived fields.
+        """Serialize to space-efficient binary format.
         Format:
         - nonce: uint64
+        - salt: length-prefixed bytes
         - mining_time: float64
-        - nodes: uint32 count, then int32 each
-        - edges: uint32 count, then pairs of int32 (u, v)
-        - solutions: uint32 count, then for each solution: uint32 length, then int32 values
+        - nodes: length-prefixed compressed delta-encoded varints
+        - edges: length-prefixed compressed adjacency list
+        - solutions: length-prefixed bit-packed binary values
         """
-        result = b''
-        result += struct.pack('!Q', self.nonce)
-        result += struct.pack('!I', len(self.salt)) + self.salt
+        result = struct.pack('!Q', self.nonce)
+        result += write_bytes(self.salt)
         result += struct.pack('!d', self.mining_time)
 
-        # Nodes
-        nodes = self.nodes or []
-        result += struct.pack('!I', len(nodes))
-        for node in nodes:
-            result += struct.pack('!i', node)
+        # Add length prefixes for each compressed section
+        nodes_data = compress_nodes(self.nodes)
+        result += struct.pack('!I', len(nodes_data)) + nodes_data
 
-        # Edges
-        edges = self.edges or []
-        result += struct.pack('!I', len(edges))
-        for u, v in edges:
-            result += struct.pack('!i', u)
-            result += struct.pack('!i', v)
+        edges_data = compress_edges(self.edges)
+        result += struct.pack('!I', len(edges_data)) + edges_data
 
-        # Solutions array
-        result += struct.pack('!I', len(self.solutions))
-        for solution in self.solutions:
-            result += struct.pack('!I', len(solution))
-            for value in solution:
-                result += struct.pack('!i', value)  # signed int
+        solutions_data = compress_solutions(self.solutions)
+        result += struct.pack('!I', len(solutions_data)) + solutions_data
+
         return result
 
     @classmethod
     def from_network(cls, data: bytes) -> 'QuantumProof':
-        """Deserialize from binary format."""
+        """Deserialize from space-efficient binary format."""
         offset = 0
 
-        # Basic fields
         nonce = struct.unpack('!Q', data[offset:offset+8])[0]
         offset += 8
-        # Read salt length and salt bytes
-        salt_length = struct.unpack('!I', data[offset:offset+4])[0]
-        offset += 4
-        salt = data[offset:offset+salt_length]
-        offset += salt_length
-        # Mining time
+
+        salt, offset = read_bytes(data, offset)
+
         mining_time = struct.unpack('!d', data[offset:offset+8])[0]
         offset += 8
 
-        # Nodes
-        num_nodes = struct.unpack('!I', data[offset:offset+4])[0]
+        # Read length-prefixed compressed sections
+        nodes_len = struct.unpack('!I', data[offset:offset+4])[0]
         offset += 4
-        nodes: List[int] = []
-        for _ in range(num_nodes):
-            node = struct.unpack('!i', data[offset:offset+4])[0]
-            offset += 4
-            nodes.append(node)
+        nodes_data = data[offset:offset+nodes_len]
+        offset += nodes_len
+        nodes, _ = decompress_nodes(nodes_data)
 
-        # Edges
-        num_edges = struct.unpack('!I', data[offset:offset+4])[0]
+        edges_len = struct.unpack('!I', data[offset:offset+4])[0]
         offset += 4
-        edges: List[Tuple[int, int]] = []
-        for _ in range(num_edges):
-            u = struct.unpack('!i', data[offset:offset+4])[0]
-            offset += 4
-            v = struct.unpack('!i', data[offset:offset+4])[0]
-            offset += 4
-            edges.append((u, v))
+        edges_data = data[offset:offset+edges_len]
+        offset += edges_len
+        edges, _ = decompress_edges(edges_data)
 
-        # Solutions
-        num_solutions = struct.unpack('!I', data[offset:offset+4])[0]
+        solutions_len = struct.unpack('!I', data[offset:offset+4])[0]
         offset += 4
-        solutions: List[List[int]] = []
-        for _ in range(num_solutions):
-            solution_length = struct.unpack('!I', data[offset:offset+4])[0]
-            offset += 4
-            solution: List[int] = []
-            for _ in range(solution_length):
-                value = struct.unpack('!i', data[offset:offset+4])[0]
-                offset += 4
-                solution.append(value)
-            solutions.append(solution)
+        solutions_data = data[offset:offset+solutions_len]
+        solutions, _ = decompress_solutions(solutions_data)
 
-        return cls(nonce=nonce, salt=salt, nodes=nodes, edges=edges, solutions=solutions, mining_time=mining_time)
+        return cls(nonce=nonce, salt=salt, nodes=nodes, edges=edges,
+                  solutions=solutions, mining_time=mining_time)
 
     def to_json(self) -> dict:
-        """Serialize to JSON-compatible dictionary."""
+        """Serialize to space-efficient JSON-compatible dictionary."""
+        # Use compressed binary format for proof_data
         proof_data = self.to_network()
         return {
             'proof_data': proof_data.hex(),
-            'nonce': self.nonce,
-            'salt': self.salt.hex(),
-            'mining_time': self.mining_time,
             'energy': self.energy,
             'diversity': self.diversity,
             'num_valid_solutions': self.num_valid_solutions
@@ -158,16 +398,15 @@ class QuantumProof:
 
     @classmethod
     def from_json(cls, data: dict) -> 'QuantumProof':
-        """Deserialize from JSON-compatible dictionary."""
+        """Deserialize from space-efficient JSON format."""
         proof_data = bytes.fromhex(data['proof_data'])
         quantum_proof = QuantumProof.from_network(proof_data)
-        # NOTE: kind of a hack...
-        quantum_proof.nonce = data['nonce']
-        quantum_proof.salt = bytes.fromhex(data['salt'])
-        quantum_proof.mining_time = data['mining_time']
+
+        # Set derived fields
         quantum_proof.energy = data.get('energy')
         quantum_proof.diversity = data.get('diversity')
         quantum_proof.num_valid_solutions = data.get('num_valid_solutions')
+
         return quantum_proof
 
     def compute_derived_fields(self):
@@ -188,6 +427,135 @@ class QuantumProof:
         self.energy = min(energies) if energies else None
         self.num_valid_solutions = len(self.solutions)
         self.diversity = calculate_diversity(self.solutions)
+
+
+@dataclass
+class Transaction:
+    """Transaction record containing a solve request and its result."""
+    transaction_id: str  # Unique identifier
+    timestamp: int  # Unix timestamp
+    request_h: List[float]  # Linear bias coefficients
+    request_J: List[Tuple[Tuple[int, int], float]]  # Sparse coupling matrix as list of ((i, j), value)
+    num_samples: int  # Number of samples requested
+    samples: List[List[int]]  # Solution bitstrings/spin configurations
+    energies: List[float]  # Corresponding energies
+
+    def to_network(self) -> bytes:
+        """Serialize to binary format."""
+        result = b''
+        result += write_string(self.transaction_id)
+        result += struct.pack('!q', self.timestamp)
+
+        # Serialize h array
+        result += struct.pack('!I', len(self.request_h))
+        for h_val in self.request_h:
+            result += struct.pack('!d', h_val)
+
+        # Serialize J array
+        result += struct.pack('!I', len(self.request_J))
+        for ((i, j), j_val) in self.request_J:
+            result += struct.pack('!I', i)
+            result += struct.pack('!I', j)
+            result += struct.pack('!d', j_val)
+
+        result += struct.pack('!I', self.num_samples)
+
+        # Serialize samples
+        solutions_data = compress_solutions(self.samples)
+        result += struct.pack('!I', len(solutions_data)) + solutions_data
+
+        # Serialize energies
+        result += struct.pack('!I', len(self.energies))
+        for energy in self.energies:
+            result += struct.pack('!d', energy)
+
+        return result
+
+    @classmethod
+    def from_network(cls, data: bytes) -> 'Transaction':
+        """Deserialize from binary format."""
+        offset = 0
+
+        transaction_id, offset = read_string(data, offset)
+        timestamp = struct.unpack('!q', data[offset:offset+8])[0]
+        offset += 8
+
+        # Deserialize h
+        h_len = struct.unpack('!I', data[offset:offset+4])[0]
+        offset += 4
+        request_h = []
+        for _ in range(h_len):
+            h_val = struct.unpack('!d', data[offset:offset+8])[0]
+            offset += 8
+            request_h.append(h_val)
+
+        # Deserialize J
+        j_len = struct.unpack('!I', data[offset:offset+4])[0]
+        offset += 4
+        request_J = []
+        for _ in range(j_len):
+            i = struct.unpack('!I', data[offset:offset+4])[0]
+            offset += 4
+            j = struct.unpack('!I', data[offset:offset+4])[0]
+            offset += 4
+            j_val = struct.unpack('!d', data[offset:offset+8])[0]
+            offset += 8
+            request_J.append(((i, j), j_val))
+
+        num_samples = struct.unpack('!I', data[offset:offset+4])[0]
+        offset += 4
+
+        # Deserialize samples
+        solutions_len = struct.unpack('!I', data[offset:offset+4])[0]
+        offset += 4
+        solutions_data = data[offset:offset+solutions_len]
+        offset += solutions_len
+        samples, _ = decompress_solutions(solutions_data)
+
+        # Deserialize energies
+        energies_len = struct.unpack('!I', data[offset:offset+4])[0]
+        offset += 4
+        energies = []
+        for _ in range(energies_len):
+            energy = struct.unpack('!d', data[offset:offset+8])[0]
+            offset += 8
+            energies.append(energy)
+
+        return cls(
+            transaction_id=transaction_id,
+            timestamp=timestamp,
+            request_h=request_h,
+            request_J=request_J,
+            num_samples=num_samples,
+            samples=samples,
+            energies=energies
+        )
+
+    def to_json(self) -> dict:
+        """Serialize to JSON-compatible dictionary."""
+        return {
+            'transaction_id': self.transaction_id,
+            'timestamp': self.timestamp,
+            'request_h': self.request_h,
+            'request_J': [{'i': i, 'j': j, 'value': val} for ((i, j), val) in self.request_J],
+            'num_samples': self.num_samples,
+            'samples': self.samples,
+            'energies': self.energies
+        }
+
+    @classmethod
+    def from_json(cls, data: dict) -> 'Transaction':
+        """Deserialize from JSON-compatible dictionary."""
+        request_J = [((entry['i'], entry['j']), entry['value']) for entry in data['request_J']]
+        return cls(
+            transaction_id=data['transaction_id'],
+            timestamp=data['timestamp'],
+            request_h=data['request_h'],
+            request_J=request_J,
+            num_samples=data['num_samples'],
+            samples=data['samples'],
+            energies=data['energies']
+        )
 
 
 @dataclass
@@ -334,19 +702,25 @@ class Block:
     next_block_requirements: BlockRequirements
 
     data: bytes  # Arbitrary data, eventually a merkle tree most likely.
+    transactions: List[Transaction] = None  # Solve requests included in this block
 
     # NOTE: Maybe move this to a separate "NetworkBlock" class which returns
-    #       Block, BlockHash, Signature on parse. 
-    #      For now, we keep this coupled, but it is usually a not great idea to 
+    #       Block, BlockHash, Signature on parse.
+    #      For now, we keep this coupled, but it is usually a not great idea to
     #      couple signatures to the data they sign, network serialization, etc.
 
     # Computed Fields
     # Everything except the signature.
-    raw: Optional[bytes]
+    raw: Optional[bytes] = None
     # Network hash (hash of the actual serialized network bytes)
-    hash: Optional[bytes]
+    hash: Optional[bytes] = None
     # signature bytes
-    signature: Optional[bytes]
+    signature: Optional[bytes] = None
+
+    def __post_init__(self):
+        """Initialize default values for optional fields."""
+        if self.transactions is None:
+            self.transactions = []
 
     def to_network(self) -> bytes:
         """Serialize to binary format, excluding derived fields (raw, hash).
@@ -359,7 +733,14 @@ class Block:
         result += self.quantum_proof.to_network()
         result += self.next_block_requirements.to_network()
         result += write_bytes(self.data)
-        if self.signature: 
+
+        # Serialize transactions
+        result += struct.pack('!I', len(self.transactions))
+        for tx in self.transactions:
+            tx_data = tx.to_network()
+            result += struct.pack('!I', len(tx_data)) + tx_data
+
+        if self.signature:
             result += write_bytes(self.signature)
         return result
 
@@ -396,8 +777,19 @@ class Block:
         req_size = len(next_block_requirements.to_network())
         offset += req_size
 
-        # Read data and signature
+        # Read data
         block_data, offset = read_bytes(data, offset)
+
+        # Read transactions
+        num_transactions = struct.unpack('!I', data[offset:offset+4])[0]
+        offset += 4
+        transactions = []
+        for _ in range(num_transactions):
+            tx_len = struct.unpack('!I', data[offset:offset+4])[0]
+            offset += 4
+            tx_data = data[offset:offset+tx_len]
+            offset += tx_len
+            transactions.append(Transaction.from_network(tx_data))
 
         # Validate the block data is well formed.
         # TODO: Do this at the top of the function with a static signature size.
@@ -422,8 +814,9 @@ class Block:
             quantum_proof=quantum_proof,
             next_block_requirements=next_block_requirements,
             data=block_data,
-            raw=raw,  
-            hash=hash,  
+            transactions=transactions,
+            raw=raw,
+            hash=hash,
             signature=signature
         )
 
@@ -447,102 +840,6 @@ class Block:
         # Compute hash from raw bytes
         self.hash = blake3(self.raw).digest()
 
-    def validate_block(self, previous_block: 'Block') -> bool:
-        """Validate this block against the previous block requirements.
-
-        This method validates the quantum proof and other block artifacts.
-
-        The signature is not checked at this time, but it could be as 
-        all blocks have miner info, although checking signature is responsibility of 
-        the network node layer. 
-
-        Args:
-            previous_block: The previous block containing requirements
-
-        Returns:
-            True if block is valid, False otherwise
-        """
-        if not self.quantum_proof or not self.miner_info:
-            logger.error(f"Block {self.header.index} rejected: missing quantum proof or miner info")
-            return False
-
-        # Get requirements from previous block
-        requirements = previous_block.next_block_requirements
-        if not requirements:
-            logger.error(f"Block {self.header.index} rejected: missing next block requirements")
-            return False
-        
-        # Apply timeout-based difficulty decay based on elapsed time since previous block
-        if previous_block.header.index > 0:
-            requirements = compute_current_requirements(requirements, previous_block.header.timestamp, logger, self.header.timestamp)
-
-        #Validate the timestamps in the block using UTC time
-        if not validate_block_timestamp(self.header.timestamp, previous_block.header.timestamp):
-            logger.info(f"Block {self.header.index} rejected: invalid timestamp {self.header.timestamp}")
-            return False
-        min_gap = self.header.timestamp - (self.header.timestamp - int(self.quantum_proof.mining_time))
-        if (self.header.timestamp - min_gap) < previous_block.header.timestamp:
-            logger.info(f"Block {self.header.index} rejected: timestamp {self.header.timestamp} - min_gap {min_gap} < previous block timestamp {previous_block.header.timestamp}")
-            return False
-
-        # Validate quantum proof against (possibly decayed) requirements
-        return self._validate_quantum_proof(self.miner_info.miner_id, requirements)
-
-    def _validate_quantum_proof(self, miner_id: str, requirements: BlockRequirements) -> bool:
-        """Validate quantum proof against requirements and compute metrics."""
-        if not self.quantum_proof:
-            logger.error(f"Block {self.header.index} rejected: no quantum proof")
-            return False
-
-        solutions = self.quantum_proof.solutions
-        if not solutions:
-            logger.error(f"Block {self.header.index} rejected: no solutions in quantum proof")
-            return False
-
-        # For block validation, use the miner_id from the quantum proof
-        nonce = ising_nonce_from_block(self.header.previous_hash, miner_id, self.header.index, self.quantum_proof.salt)
-        if self.quantum_proof.nonce != nonce:
-            logger.error(f"Block {self.header.index} rejected: invalid nonce {self.quantum_proof.nonce} != {nonce}")
-            return False
-
-        h, J = generate_ising_model_from_nonce(nonce, self.quantum_proof.nodes, self.quantum_proof.edges)
-
-        # Compute energies respecting variable order (self.quantum_proof.nodes)
-        energies = energies_for_solutions(solutions, h, J, self.quantum_proof.nodes)
-
-        # Find solutions meeting energy threshold
-        valid_indices = [i for i, e in enumerate(energies) if e < requirements.difficulty_energy]
-        valid_solutions = [solutions[i] for i in valid_indices]
-
-        if len(valid_solutions) < requirements.min_solutions:
-            logger.error(f"Block {self.header.index} rejected: insufficient valid solutions ({len(valid_solutions)} < {requirements.min_solutions})")
-            logger.error(f"Solutions presented in result: {len(solutions)} - json.dumps({energies})")
-            return False
-
-        # Calculate diversity using shared utility
-        diversity = calculate_diversity(valid_solutions)
-        if diversity < requirements.min_diversity:
-            logger.error(f"Block {self.header.index} rejected: insufficient diversity ({diversity} < {requirements.min_diversity})")
-            return False
-
-        return True
-
-    def _calculate_diversity(self, solutions: List[List[int]]) -> float:
-        """Calculate average normalized Hamming distance between solutions."""
-        if len(solutions) < 2:
-            return 0.0
-
-        distances = []
-        n = len(solutions[0]) if solutions else 0
-
-        for i in range(len(solutions)):
-            for j in range(i + 1, len(solutions)):
-                # Calculate Hamming distance
-                distance = sum(1 for a, b in zip(solutions[i], solutions[j]) if a != b)
-                normalized_distance = distance / n if n > 0 else 0
-                distances.append(normalized_distance)
-
-        return sum(distances) / len(distances) if distances else 0.0
 
     def to_json(self) -> str:
         """Serialize block to JSON string."""
@@ -552,6 +849,7 @@ class Block:
             'quantum_proof': self.quantum_proof.to_json(),
             'next_block_requirements': self.next_block_requirements.to_json(),
             'data': self.data.hex(),
+            'transactions': [tx.to_json() for tx in self.transactions],
             'raw': self.raw.hex() if self.raw else None,
             'hash': self.hash.hex() if self.hash else None,
             'signature': self.signature.hex() if self.signature else None
@@ -600,6 +898,11 @@ class Block:
         except ValueError:
             block_data = data['data'].encode()
 
+        # Parse transactions
+        transactions = []
+        if 'transactions' in data and data['transactions']:
+            transactions = [Transaction.from_json(tx_data) for tx_data in data['transactions']]
+
         # Create block
         block = cls(
             header=header,
@@ -607,6 +910,7 @@ class Block:
             quantum_proof=quantum_proof,
             next_block_requirements=next_block_requirements,
             data=block_data,
+            transactions=transactions,
             raw=raw_bytes,
             hash=bytes.fromhex(data['hash']) if data.get('hash') else b'',
             signature=bytes.fromhex(data['signature']) if data.get('signature') else b''
@@ -678,7 +982,8 @@ def create_genesis_block(genesis_data: Optional[dict] = None) -> Block:
             "difficulty_energy": -1000.0,
             "min_diversity": 0.28,
             "min_solutions": 10,
-            "timeout_to_difficulty_adjustment_decay": 600
+            "timeout_to_difficulty_adjustment_decay": 600,
+            "h_values": [-1.0, 0.0, 1.0]
         },
         "quantum_proof": None,
         "miner_info": None
@@ -757,97 +1062,3 @@ def calculate_adaptive_parameters(requirements: Dict[str, Any], miner_type: str)
             'num_reads': 100,
             'beta_range': [0.1, 10.0]
         }
-    
-
-def compute_next_block_requirements(previous_block: Block, mining_result: MiningResult,
-                                    log: logging.Logger = logger) -> BlockRequirements:
-    """
-    Compute the next block requirements based on the previous block and mining result.
-
-    Rules:
-    - Always HARDEN difficulty if the last block was mined in under 60 seconds
-    - Otherwise:
-        - If the same miner type wins consecutively, EASE difficulty
-        - If a different miner type wins, HARDEN difficulty
-
-    Uses curve-based energy adjustments instead of flat multiplication.
-    Energy curve: min (-16000) to max (-14000) with knee at (-15600).
-    """
-    # Get current requirements from previous block
-    prev_req = previous_block.next_block_requirements
-    if not prev_req:
-        raise ValueError("Previous block has no next block requirements")
-    
-    if previous_block.header.index > 0:
-        prev_req = compute_current_requirements(prev_req, previous_block.header.timestamp, log, mining_result.timestamp)
-
-    # Extract miner type from mining result
-    current_winner = mining_result.miner_id
-
-    # Get the previous winner from the previous block's miner info
-    prev_winner = None
-    if previous_block.miner_info:
-        prev_miner_id = previous_block.miner_info.miner_id
-        prev_winner = prev_miner_id.split('-')[1] if '-' in prev_miner_id else prev_miner_id
-
-    # Base adjustment rates
-    energy_adjustment_rate = 0.05  # 5% adjustment along curve
-    diversity_adjustment_rate = 0.02  # 2% adjustment
-    solutions_adjustment_rate = 0.10  # 10% adjustment
-
-    # Helper function to apply minimum adjustment for difficulty changes
-    def apply_min_adjustment(old_energy: float, new_energy: float, direction: str, min_adj: float = 5.0) -> float:
-        energy_delta = new_energy - old_energy
-        if abs(energy_delta) > 0 and abs(energy_delta) < min_adj:
-            if direction == 'harder':
-                return old_energy - min_adj
-            else:  # 'easier'
-                return old_energy + min_adj
-        return new_energy
-
-    # If block was mined too quickly, always HARDEN
-    if mining_result.mining_time is not None and mining_result.mining_time < 360.0:
-        curve_energy = adjust_energy_along_curve(prev_req.difficulty_energy, energy_adjustment_rate, 'harder')
-        new_difficulty_energy = apply_min_adjustment(prev_req.difficulty_energy, curve_energy, 'harder')
-        new_min_diversity = min(0.46, prev_req.min_diversity + diversity_adjustment_rate)
-        new_min_solutions = min(100, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
-
-        log.info(
-            f"Block was mined in {mining_result.mining_time:.2f}s (<10s) - HARDENING difficulty")
-        log.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
-        log.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
-        log.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
-    else:
-        log.info(f"Last winner: {prev_winner}, current winner: {current_winner}")
-        if current_winner == prev_winner:
-            # Same miner won again - make it EASIER
-            # Higher energy threshold (less negative), lower diversity/solutions
-            curve_energy = adjust_energy_along_curve(prev_req.difficulty_energy, energy_adjustment_rate, 'easier')
-            new_difficulty_energy = apply_min_adjustment(prev_req.difficulty_energy, curve_energy, 'easier')
-            new_min_diversity = max(0.2, prev_req.min_diversity - diversity_adjustment_rate)
-            new_min_solutions = max(10, int(prev_req.min_solutions * (1 - solutions_adjustment_rate)))
-
-            log.info(f"Same miner type ({current_winner}) won - EASING difficulty")
-            log.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
-            log.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
-            log.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
-        else:
-            # Different miner won - make it HARDER
-            # Lower energy threshold (more negative), higher diversity/solutions
-            curve_energy = adjust_energy_along_curve(prev_req.difficulty_energy, energy_adjustment_rate, 'harder')
-            new_difficulty_energy = apply_min_adjustment(prev_req.difficulty_energy, curve_energy, 'harder')
-            new_min_diversity = min(0.46, prev_req.min_diversity + diversity_adjustment_rate)
-            new_min_solutions = min(100, int(prev_req.min_solutions * (1 + solutions_adjustment_rate)))
-
-            log.info(f"Different miner type won ({prev_winner} -> {current_winner}) - HARDENING difficulty")
-            log.info(f"  Energy: {prev_req.difficulty_energy:.1f} -> {new_difficulty_energy:.1f}")
-            log.info(f"  Diversity: {prev_req.min_diversity:.2f} -> {new_min_diversity:.2f}")
-            log.info(f"  Solutions: {prev_req.min_solutions} -> {new_min_solutions}")
-
-    return BlockRequirements(
-        difficulty_energy=new_difficulty_energy,
-        min_diversity=new_min_diversity,
-        min_solutions=new_min_solutions,
-        timeout_to_difficulty_adjustment_decay=prev_req.timeout_to_difficulty_adjustment_decay
-    )
-

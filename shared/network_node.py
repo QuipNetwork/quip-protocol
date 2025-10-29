@@ -168,9 +168,8 @@ class NetworkNode(Node):
         self.node_name = config.get("node_name", socket.getfqdn())
         self.public_host = config.get("public_host", f"{get_local_ip()}:{self.port}")
         # Default to local_ip only when we are listening on a local host.
-        if self.bind_address != "127.0.0.1" and "public_host" not in config:
-            public_ip = asyncio.run(get_public_ip())
-            self.public_host = config.get("public_host", f"{public_ip}:{self.port}")
+        # Note: We can't call asyncio.run() here since we're inside an async context.
+        # Public IP will be determined asynchronously during node startup if needed.
 
         self.secret = config.get("secret", f"quip network node secret {random.randint(0, 1000000)}")
         self.auto_mine = config.get("auto_mine", False)
@@ -231,6 +230,10 @@ class NetworkNode(Node):
         # Background processing queues
         self.block_processing_queue = asyncio.Queue(maxsize=1000)
         self.gossip_processing_queue = asyncio.Queue(maxsize=1000)
+
+        # Transaction queue for solve requests
+        self.pending_transactions = []
+        self.transactions_lock = asyncio.Lock()
 
         # Node client for HTTP communication
         self.node_client = None
@@ -294,6 +297,8 @@ class NetworkNode(Node):
         # Lightweight header-only endpoints
         self.app.router.add_get('/block_header/', self.handle_get_latest_block_header)
         self.app.router.add_get('/block_header/{number}', self.handle_get_block_header)
+        # Solve endpoint
+        self.app.router.add_post('/solve', self.handle_solve)
 
     async def start(self):
         """Start the P2P node."""
@@ -490,13 +495,18 @@ class NetworkNode(Node):
                     # Create task with exception handler to crash on ValueError
                     task = asyncio.create_task(self.mine_block(latest_block))
                     task.add_done_callback(self._handle_mining_task_exception)
+                    # Short sleep to allow mining task to start
+                    await asyncio.sleep(0.1)
+                else:
+                    # If mining is active, sleep longer to avoid busy-waiting
+                    await asyncio.sleep(1)
             except asyncio.CancelledError:
                 if not self.running:
                     break
             except Exception as e:
                 self.logger.exception(f"Error in server loop: {e}")
-
-            await asyncio.sleep(5)
+                # Sleep on error to avoid tight loop
+                await asyncio.sleep(1)
 
     async def block_processor_loop(self):
         """Background loop to process blocks without blocking HTTP handlers."""
@@ -566,16 +576,21 @@ class NetworkNode(Node):
                     self.logger.debug(
                         f"🧩 Gossip handled id={(message.id or '')[:8]} type={message.type}: wait={wait_str}, process={proc_ms:.1f} ms, qsize={qsize}"
                     )
-                    response_future.set_result(result)
+                    if response_future and not response_future.done():
+                        try:
+                            response_future.set_result(result)
+                        except Exception as e:
+                            self.logger.warning(f"Failed to set result on future: {e}")
                 except Exception as e:
                     self.logger.exception(f"Error processing gossip: {e}")
-                    if not response_future.done():
-                        response_future.set_result("error")
+                    if response_future and not response_future.done():
+                        try:
+                            response_future.set_result("error")
+                        except Exception as e:
+                            self.logger.warning(f"Failed to set error result on future: {e}")
 
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                self.logger.exception("Error in gossip processor loop")
 
     def _handle_mining_task_exception(self, task: asyncio.Task):
         """Handle exceptions from mining tasks - crash on ValueError."""
@@ -809,15 +824,22 @@ class NetworkNode(Node):
         # If all validations pass, call parent receive_block
         return await super().receive_block(block)
 
-    async def mine_block(self, previous_block: Block) -> Optional[MiningResult]:
+    async def mine_block(self, previous_block: Block, transactions=None) -> Optional[MiningResult]:
         """Mine a block and broadcast if successful."""
-        result = await super().mine_block(previous_block)
+        # Pull pending transactions if not provided
+        if transactions is None:
+            async with self.transactions_lock:
+                transactions = self.pending_transactions.copy()
+                self.pending_transactions.clear()
+            if transactions:
+                self.logger.info(f"Including {len(transactions)} transaction(s) in block")
+
+        result = await super().mine_block(previous_block, transactions)
         if not result:
             return None
 
-        ## TODO: Pull current mempool and put it in here.
         data = f"{self.node_id} was here"
-        wb = self.build_block(previous_block, result, data.encode())
+        wb = self.build_block(previous_block, result, data.encode(), transactions)
         wb = self.sign_block(wb)
 
         if not wb.hash:
@@ -1021,8 +1043,8 @@ class NetworkNode(Node):
                 if peer_host == self.public_host:
                     continue
                 info = MinerInfo.from_json(peer_info_json)
-                await self.add_peer(peer_host, info)
-                peers_found += 1
+                if await self.add_peer(peer_host, info):
+                    peers_found += 1
 
             if peers_found > 0:
                 self.logger.info(f"Successfully joined network via {peer_address}")
@@ -1141,6 +1163,7 @@ class NetworkNode(Node):
         await self.gossip_broadcast(message, target_count)
         t1 = time.perf_counter()
         total_ms = (t1 - t0) * 1000.0
+        assert message.id
         self.logger.debug(
             f"🗣️ Originated gossip type={message.type} id={message.id[:8]} to {target_count} peers: payload={len(message.data or b'')} bytes in {total_ms:.1f} ms"
         )
@@ -1412,6 +1435,140 @@ class NetworkNode(Node):
             "total_peers": len(self.peers),
             "uptime": utc_timestamp_float() if self.running else 0
         })
+
+    async def handle_solve(self, request: web.Request) -> web.Response:
+        """Handle quantum annealing solve request.
+
+        Request format:
+        {
+            "h": [array of linear bias coefficients],
+            "J": [[i, j, coupling_value], ...] or {key: value},
+            "num_samples": integer
+        }
+
+        Response format:
+        {
+            "samples": [array of solution bitstrings/spin configurations],
+            "energies": [array of corresponding energies],
+            "transaction_id": "unique identifier"
+        }
+        """
+        try:
+            data = await request.json()
+
+            # Validate request
+            if 'h' not in data or 'J' not in data or 'num_samples' not in data:
+                return web.json_response(
+                    {"error": "Missing required fields: h, J, num_samples"},
+                    status=400
+                )
+
+            h = data['h']
+            J_raw = data['J']
+            num_samples = int(data['num_samples'])
+
+            # Convert J to list of tuples format
+            if isinstance(J_raw, dict):
+                # Convert dict format {"(i,j)": value} to list format
+                J = [((int(k.split(',')[0].strip('()')), int(k.split(',')[1].strip('()'))), v)
+                     for k, v in J_raw.items()]
+            elif isinstance(J_raw, list):
+                # Already in list format [[i, j, value], ...]
+                J = [((entry[0], entry[1]), entry[2]) for entry in J_raw]
+            else:
+                return web.json_response(
+                    {"error": "Invalid J format. Must be dict or list."},
+                    status=400
+                )
+
+            # Generate transaction ID
+            transaction_id = f"{self.public_host}-{time.time()}-{hash((tuple(h), tuple(J)))}"
+
+            # Convert h and J to format needed by sampler
+            import dimod
+            h_dict = {i: val for i, val in enumerate(h)}
+            J_dict = {(i, j): val for ((i, j), val) in J}
+
+            # Use first available miner to solve
+            if not hasattr(self, 'miner_handles') or not self.miner_handles:
+                return web.json_response(
+                    {"error": "No miners available"},
+                    status=503
+                )
+
+            miner_handle = self.miner_handles[0]
+            self.logger.info(f"Solving BQM with {len(h)} variables, {len(J)} couplings, {num_samples} samples using {miner_handle.miner_id}")
+
+            # Create appropriate sampler based on miner type
+            # MinerHandle runs in a separate process, so we create a sampler here
+            sampler = None
+            miner_kind = miner_handle.spec.get("kind", "").lower()
+
+            if miner_kind == "qpu":
+                from dwave.system import DWaveSampler
+                try:
+                    sampler = DWaveSampler()
+                    self.logger.info(f"Using QPU sampler: {sampler.properties.get('chip_id', 'unknown')}")
+                except Exception as e:
+                    self.logger.error(f"Failed to create QPU sampler: {e}")
+                    return web.json_response(
+                        {"error": f"QPU not available: {e}"},
+                        status=503
+                    )
+            elif miner_kind in ["cpu", "metal", "cuda", "modal"]:
+                from dwave.samplers import SimulatedAnnealingSampler
+                sampler = SimulatedAnnealingSampler()
+                self.logger.info("Using simulated annealing sampler")
+            else:
+                return web.json_response(
+                    {"error": f"Unknown miner type: {miner_kind}"},
+                    status=503
+                )
+
+            # Sample the Ising problem
+            sampleset = sampler.sample_ising(h_dict, J_dict, num_reads=num_samples)
+
+            # Extract samples and energies
+            samples = []
+            energies = []
+            for sample, energy in sampleset.data(['sample', 'energy']):
+                # Convert sample dict to list of spins (convert numpy types to Python int)
+                sample_list = [int(sample[i]) for i in sorted(sample.keys())]
+                samples.append(sample_list)
+                energies.append(float(energy))
+
+            self.logger.info(f"Solve completed: {len(samples)} samples with energies ranging from {min(energies):.2f} to {max(energies):.2f}")
+
+            # Create transaction record
+            from shared.block import Transaction
+            transaction = Transaction(
+                transaction_id=transaction_id,
+                timestamp=utc_timestamp(),
+                request_h=h,
+                request_J=J,
+                num_samples=num_samples,
+                samples=samples[:num_samples],
+                energies=energies[:num_samples]
+            )
+
+            # Add to pending transactions
+            async with self.transactions_lock:
+                self.pending_transactions.append(transaction)
+
+            self.logger.info(f"Transaction {transaction_id} added to pending pool")
+
+            return web.json_response({
+                "samples": samples[:num_samples],
+                "energies": energies[:num_samples],
+                "transaction_id": transaction_id,
+                "status": "completed"
+            })
+
+        except Exception as e:
+            self.logger.error(f"Error handling solve request: {e}")
+            import traceback
+            traceback.print_exc()
+            return web.json_response({"error": str(e)}, status=500)
 
     async def handle_get_peers(self, request: web.Request) -> web.Response:
         """Return list of known nodes."""

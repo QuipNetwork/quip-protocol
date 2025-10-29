@@ -120,9 +120,74 @@ class P2PBlockchainNode:
         # Create blockchain
         self.blockchain = NetworkedQuantumBlockchain(**qb_kwargs)
 
+        # Set up solve callback
+        self.node.on_solve_request = self._handle_solve_request
+
         self.event_loop = None
         self.async_thread = None
         self.running = False
+
+    async def _handle_solve_request(self, h, J, num_samples, transaction_id):
+        """Handle a solve request using the blockchain's miners.
+
+        Args:
+            h: Linear bias coefficients (list of floats)
+            J: Coupling matrix (list of tuples ((i, j), value))
+            num_samples: Number of samples to return
+            transaction_id: Unique transaction identifier
+
+        Returns:
+            (samples, energies) tuple or None if solving fails
+        """
+        try:
+            import dimod
+
+            # Convert h and J to the format needed by the sampler
+            # h should be a dict mapping variable indices to bias values
+            h_dict = {i: val for i, val in enumerate(h)}
+
+            # J should be a dict mapping (i, j) tuples to coupling values
+            J_dict = {(i, j): val for ((i, j), val) in J}
+
+            # Get a miner from the blockchain to use for solving
+            # Use the first available miner
+            miner = None
+            if self.blockchain.competitive and self.blockchain.nodes:
+                # Get first miner from first node
+                node = self.blockchain.nodes[0]
+                if node.miners:
+                    miner = node.miners[0]
+            elif hasattr(self.blockchain, 'miner'):
+                miner = self.blockchain.miner
+
+            if not miner:
+                logger.error("No miner available for solve request")
+                return None
+
+            # Call the miner's sampler
+            logger.info(f"Solving BQM with {len(h)} variables, {len(J)} couplings, {num_samples} samples")
+
+            # Sample the Ising problem
+            sampleset = miner.sampler.sample_ising(h_dict, J_dict, num_reads=num_samples)
+
+            # Extract samples and energies
+            samples = []
+            energies = []
+            for sample, energy in sampleset.data(['sample', 'energy']):
+                # Convert sample dict to list of spins
+                sample_list = [sample[i] for i in sorted(sample.keys())]
+                samples.append(sample_list)
+                energies.append(float(energy))
+
+            logger.info(f"Solve completed: {len(samples)} samples with energies ranging from {min(energies):.2f} to {max(energies):.2f}")
+
+            return samples[:num_samples], energies[:num_samples]
+
+        except Exception as e:
+            logger.error(f"Error in solve request handler: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     def start(self):
         """Start the P2P blockchain node."""

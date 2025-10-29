@@ -22,7 +22,10 @@ dependencies = [
     "blake3>=1.0.5",
     "torch>=2.0.0",
     "torchvision>=0.15.0",
-    "torchaudio>=2.0.0"
+    "torchaudio>=2.0.0",
+    "cupy-cuda12x>=12.0.0; sys_platform == 'linux' or sys_platform == 'win32'",
+    "pyobjc-framework-Metal; sys_platform == 'darwin'",
+    "pyobjc-framework-MetalPerformanceShaders; sys_platform == 'darwin'"
 ]
 
 [project.optional-dependencies]
@@ -31,12 +34,6 @@ dev = [
 ]
 
 [project.scripts]
-quip-demo = "quantum_blockchain:main"
-quip-p2p = "quantum_blockchain_p2p:main"
-quip-cpu-miner = "CPU.cpu_miner:cli"
-quip-gpu-miner = "GPU.gpu_miner:run_with_modal"
-quip-qpu-miner = "QPU.qpu_miner:cli"
-quip-launch = "launch_network:main"
 quip-network-node = "quip_cli:network_node_main"
 quip-network-simulator = "quip_cli:network_simulator_main"
 
