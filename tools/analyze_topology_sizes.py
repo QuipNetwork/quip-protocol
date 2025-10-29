@@ -310,13 +310,11 @@ def _find_embedding_worker(args):
         if embedding:
             # Success! Return immediately
             total_elapsed = time.perf_counter() - worker_start
-            if worker_id == 0 or verbose:
-                print(f"    Worker {worker_id}: Found embedding on try {num_tries} after {try_elapsed:.1f}s")
+            print(f"    ✓ Worker {worker_id}: Found embedding on try {num_tries} after {try_elapsed:.1f}s")
             return (worker_id, embedding, total_elapsed, num_tries)
 
         # No embedding found, log and continue
-        if worker_id == 0:
-            print(f"    Worker {worker_id}: Try {num_tries} failed after {try_elapsed:.1f}s, restarting...")
+        print(f"    ✗ Worker {worker_id}: Try {num_tries} failed after {try_elapsed:.1f}s, restarting...")
 
     # All tries exhausted
     total_elapsed = time.perf_counter() - worker_start
