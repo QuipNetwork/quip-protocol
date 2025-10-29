@@ -23,18 +23,22 @@ from shared.quantum_proof_of_work import (
 from shared.energy_utils import expected_solution_energy
 from dwave.samplers import SimulatedAnnealingSampler
 
+from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies import (
     CHIMERA_C16_TOPOLOGY,
     PEGASUS_P16_TOPOLOGY,
     ZEPHYR_Z12_TOPOLOGY,
+    ZEPHYR_Z11_T4_TOPOLOGY,
     ADVANTAGE2_SYSTEM1_6_TOPOLOGY
 )
 
 # Available topologies for analysis
 AVAILABLE_TOPOLOGIES = {
+    'default': DEFAULT_TOPOLOGY,  # Current default topology (use this for consistency with miners)
     'c16': CHIMERA_C16_TOPOLOGY,
     'p16': PEGASUS_P16_TOPOLOGY,
-    'z12': ZEPHYR_Z12_TOPOLOGY,  # Generic Z12 topology
+    'z12': ZEPHYR_Z12_TOPOLOGY,  # Generic Z(12, 4) topology
+    'z11t4': ZEPHYR_Z11_T4_TOPOLOGY,  # Generic Z(11, 4) topology
     'advantage2': ADVANTAGE2_SYSTEM1_6_TOPOLOGY,  # Real Advantage2-System1.6 topology
 }
 
@@ -104,7 +108,7 @@ def calculate_theoretical_minimum_energy(
     print(f"h_values distribution: {h_values}")
 
     # Calculate expected ground state energy using shared formula
-    expected_gse = expected_solution_energy(nodes, edges, c=0.75, h_values=h_values)
+    expected_gse = expected_solution_energy(len(nodes), len(edges), c=0.75, h_values=h_values)
     print(f"Expected ground state energy (empirical formula): {expected_gse:.1f}")
     print(f"Running SA with num_reads={num_reads}, num_sweeps={num_sweeps}")
 
@@ -347,25 +351,26 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Available topologies:
+  default    - DEFAULT_TOPOLOGY from dwave_topologies (matches miners)
   c16        - Chimera C16 topology (~2048 qubits)
   p16        - Pegasus P16 topology (~5000 qubits)
-  z12        - Generic Zephyr Z12 topology (~4800 qubits)
-  advantage2 - Real Advantage2-System1.6 topology (~4593 qubits) [DEFAULT]
-  z16        - Zephyr Z16 topology (~8000+ qubits)
+  z12        - Generic Zephyr Z(12, 4) topology (~4800 qubits)
+  z11t4      - Generic Zephyr Z(11, 4) topology (~4048 qubits)
+  advantage2 - Real Advantage2-System1.6 topology (~4593 qubits)
   all        - Analyze all topologies
 
 Examples:
-  python analyze_topology_minimum_energy.py --topology advantage2
+  python analyze_topology_minimum_energy.py
   python analyze_topology_minimum_energy.py --topology all --samples 100
-  python analyze_topology_minimum_energy.py --topology c16 p16 advantage2
+  python analyze_topology_minimum_energy.py --topology default advantage2
         """
     )
     
     parser.add_argument('--topology', '-t',
                        nargs='+',
-                       choices=['c16', 'p16', 'z12', 'advantage2', 'z16', 'all'],
-                       default=['advantage2'],
-                       help='Topology(ies) to analyze (default: advantage2)')
+                       choices=['default', 'c16', 'p16', 'z12', 'z11t4', 'advantage2', 'all'],
+                       default=['default'],
+                       help='Topology(ies) to analyze (default: default)')
     
     parser.add_argument('--samples', '-s',
                        type=int,

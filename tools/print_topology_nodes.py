@@ -16,10 +16,12 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import dwave_networkx as dnx
 
-from dwave.topologies import (
+from dwave_topologies import DEFAULT_TOPOLOGY
+from dwave_topologies.topologies import (
     CHIMERA_C16_TOPOLOGY,
     PEGASUS_P16_TOPOLOGY,
     ZEPHYR_Z12_TOPOLOGY,
+    ZEPHYR_Z11_T4_TOPOLOGY,
     ADVANTAGE2_SYSTEM1_6_TOPOLOGY
 )
 
@@ -46,12 +48,14 @@ def pretty_nodes(nodes: Iterable[int], limit: int = 10) -> str:
 def report_topology(name: str, quiet: bool = False):
     # Map topology names to topology objects
     topology_map = {
+        'default': DEFAULT_TOPOLOGY,  # Current default topology (matches miners)
         'c16': CHIMERA_C16_TOPOLOGY,
         'chimera': CHIMERA_C16_TOPOLOGY,
         'p16': PEGASUS_P16_TOPOLOGY,
         'pegasus': PEGASUS_P16_TOPOLOGY,
         'z12': ZEPHYR_Z12_TOPOLOGY,
-        'zephyr': ADVANTAGE2_SYSTEM1_6_TOPOLOGY,  # Use real Advantage2
+        'z11t4': ZEPHYR_Z11_T4_TOPOLOGY,
+        'zephyr': DEFAULT_TOPOLOGY,  # Use default topology (currently Z11T4)
         'advantage2': ADVANTAGE2_SYSTEM1_6_TOPOLOGY,
     }
 
@@ -128,9 +132,13 @@ def report_topology(name: str, quiet: bool = False):
 def main():
     ap = argparse.ArgumentParser(description="Print node counts for D-Wave topologies and show changes when varying parameters.")
     ap.add_argument("--quiet", "-q", action="store_true", help="Reduce verbosity (hide sample node lists)")
+    ap.add_argument("--topology", "-t",
+                   nargs='+',
+                   default=["default"],
+                   help="Topology(ies) to analyze (default: default). Options: default, chimera, pegasus, zephyr, z11t4, z12, advantage2")
     args = ap.parse_args()
 
-    for topo in ["chimera", "pegasus", "zephyr"]:
+    for topo in args.topology:
         report_topology(topo, quiet=args.quiet)
 
 

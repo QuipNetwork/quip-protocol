@@ -19,11 +19,21 @@ from shared.block_requirements import compute_current_requirements
 from shared.energy_utils import energy_to_difficulty, DEFAULT_NUM_NODES, DEFAULT_NUM_EDGES
 
 class DWaveMiner(BaseMiner):
-    def __init__(self, miner_id: str, **cfg):
-        # cfg parameter is reserved for future configuration options
-        sampler = DWaveSamplerWrapper()
+    def __init__(self, miner_id: str, topology_name: Optional[str] = None, **cfg):
+        """
+        Initialize D-Wave QPU miner.
+
+        Args:
+            miner_id: Unique identifier for this miner
+            topology_name: Optional topology like "Z(10,2)" to use precomputed embedding.
+                          If None, uses full QPU topology.
+            **cfg: Additional configuration options (reserved for future use)
+        """
+        # Create sampler with topology and job label
+        sampler = DWaveSamplerWrapper(topology_name=topology_name, job_label_prefix="QUIP_MINE")
         super().__init__(miner_id, sampler, miner_type="QPU")
         self.miner_type = "QPU"
+        self.topology_name = topology_name
 
         # QPU rate limiting configuration (hard-coded for now)
         self.qpu_timeout = 360.0  # Minimum 60 seconds between QPU attempts
