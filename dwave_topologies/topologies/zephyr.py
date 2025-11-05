@@ -1,34 +1,154 @@
 """
-D-Wave Zephyr Z12 topology definition.
+Generic Zephyr topology factory and common Zephyr topologies.
 
-Loaded from static JSON file (zephyr_z12_t4.json).
-This represents a generic D-Wave Advantage2 topology structure.
+Provides a factory function to create any Zephyr(m, t) topology on-the-fly,
+plus pre-defined instances for commonly used configurations.
 
-Topology Information:
-- Type: zephyr
-- Shape: [12, 4]
-- Nodes: 4800
-- Edges: 45864
+Usage:
+    from dwave_topologies.topologies.zephyr import zephyr, ZEPHYR_Z8_T2_TOPOLOGY
+
+    # Use factory for any configuration
+    z5_t3 = zephyr(5, 3)
+
+    # Or use pre-defined common topologies
+    default = ZEPHYR_Z8_T2_TOPOLOGY
 """
 
 from typing import List, Tuple, Dict, Any
-from .json_loader import load_json_topology, json_topology_to_dict
+import dwave_networkx as dnx
+import networkx as nx
 
-# Load topology from JSON file
-_json_topology = load_json_topology('zephyr_z12_t4.json')
 
-# Export the topology instance directly
-ZEPHYR_Z12_TOPOLOGY = _json_topology
+class ZephyrTopology:
+    """Generated Zephyr topology (creates graph on first access)."""
 
-# Legacy dictionary format for backward compatibility
-ZEPHYR_Z12 = json_topology_to_dict(_json_topology)
+    def __init__(self, m: int, t: int):
+        """
+        Create a Zephyr(m, t) topology.
 
-# Convenience accessors
-NODES: List[int] = ZEPHYR_Z12['nodes']
-EDGES: List[Tuple[int, int]] = ZEPHYR_Z12['edges']
-PROPERTIES: Dict[str, Any] = ZEPHYR_Z12['properties']
-SOLVER_NAME: str = ZEPHYR_Z12['solver_name']
-TOPOLOGY_TYPE: str = ZEPHYR_Z12['topology_type']
-TOPOLOGY_SHAPE: str = ZEPHYR_Z12['topology_shape']
-NUM_NODES: int = ZEPHYR_Z12['num_nodes']
-NUM_EDGES: int = ZEPHYR_Z12['num_edges']
+        Args:
+            m: Zephyr m parameter (number of unit cells)
+            t: Zephyr t parameter (tile size)
+        """
+        self.m = m
+        self.t = t
+        self._graph = None
+        self._nodes = None
+        self._edges = None
+
+    @property
+    def graph(self) -> nx.Graph:
+        """Lazy-load the Zephyr graph."""
+        if self._graph is None:
+            self._graph = dnx.zephyr_graph(self.m, self.t)
+        return self._graph
+
+    @property
+    def nodes(self) -> List[int]:
+        """Get list of nodes."""
+        if self._nodes is None:
+            self._nodes = list(self.graph.nodes())
+        return self._nodes
+
+    @property
+    def edges(self) -> List[Tuple[int, int]]:
+        """Get list of edges."""
+        if self._edges is None:
+            self._edges = list(self.graph.edges())
+        return self._edges
+
+    @property
+    def num_nodes(self) -> int:
+        return len(self.nodes)
+
+    @property
+    def num_edges(self) -> int:
+        return len(self.edges)
+
+    @property
+    def solver_name(self) -> str:
+        return f"Zephyr_Z{self.m}_T{self.t}_Generic"
+
+    @property
+    def topology_type(self) -> str:
+        return "zephyr"
+
+    @property
+    def topology_shape(self) -> str:
+        return f"[{self.m}, {self.t}]"
+
+    @property
+    def properties(self) -> Dict[str, Any]:
+        return {
+            "topology": {"type": "zephyr", "shape": [self.m, self.t]},
+            "num_qubits": self.num_nodes,
+            "num_couplers": self.num_edges,
+            "chip_id": f"Generic_Z{self.m}_T{self.t}",
+            "supported_problem_types": ["qubo", "ising"]
+        }
+
+
+def zephyr(m: int, t: int) -> ZephyrTopology:
+    """
+    Factory function to create a Zephyr(m, t) topology.
+
+    Args:
+        m: Zephyr m parameter
+        t: Zephyr t parameter
+
+    Returns:
+        ZephyrTopology instance
+
+    Example:
+        >>> z = zephyr(8, 2)
+        >>> print(f"{z.num_nodes} nodes, {z.num_edges} edges")
+        1088 nodes, 6068 edges
+    """
+    return ZephyrTopology(m, t)
+
+
+# Pre-defined common Zephyr topologies
+ZEPHYR_Z8_T2_TOPOLOGY = ZephyrTopology(8, 2)   # 1,088 nodes - DEFAULT with precomputed embedding
+ZEPHYR_Z10_T2_TOPOLOGY = ZephyrTopology(10, 2)  # 1,680 nodes
+ZEPHYR_Z11_T4_TOPOLOGY = ZephyrTopology(11, 4)  # 4,048 nodes - largest that fits Advantage2 well
+ZEPHYR_Z12_T4_TOPOLOGY = ZephyrTopology(12, 4)  # 4,800 nodes - exceeds Advantage2, for reference
+
+
+def _to_dict(topology: ZephyrTopology) -> Dict[str, Any]:
+    """Convert topology to legacy dictionary format."""
+    return {
+        'solver_name': topology.solver_name,
+        'topology_type': topology.topology_type,
+        'topology_shape': topology.topology_shape,
+        'num_nodes': topology.num_nodes,
+        'num_edges': topology.num_edges,
+        'nodes': topology.nodes,
+        'edges': topology.edges,
+        'properties': topology.properties,
+    }
+
+
+# Legacy dictionary format (backward compatibility)
+ZEPHYR_Z8_T2 = _to_dict(ZEPHYR_Z8_T2_TOPOLOGY)
+ZEPHYR_Z10_T2 = _to_dict(ZEPHYR_Z10_T2_TOPOLOGY)
+ZEPHYR_Z11_T4 = _to_dict(ZEPHYR_Z11_T4_TOPOLOGY)
+ZEPHYR_Z12_T4 = _to_dict(ZEPHYR_Z12_T4_TOPOLOGY)
+
+
+__all__ = [
+    # Factory function
+    'zephyr',
+    'ZephyrTopology',
+
+    # Pre-defined topologies
+    'ZEPHYR_Z8_T2_TOPOLOGY',
+    'ZEPHYR_Z10_T2_TOPOLOGY',
+    'ZEPHYR_Z11_T4_TOPOLOGY',
+    'ZEPHYR_Z12_T4_TOPOLOGY',
+
+    # Legacy dictionary format
+    'ZEPHYR_Z8_T2',
+    'ZEPHYR_Z10_T2',
+    'ZEPHYR_Z11_T4',
+    'ZEPHYR_Z12_T4',
+]

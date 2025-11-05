@@ -11,11 +11,13 @@ Topology Information:
 - Edges: 40484
 """
 
+import os
 from typing import List, Tuple, Dict, Any
 from .json_loader import load_json_topology, json_topology_to_dict
 
-# Load topology from JSON file
-_json_topology = load_json_topology('pegasus_p16.json')
+# Load topology from JSON file in topologies/ directory
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+_json_topology = load_json_topology('pegasus_p16.json', topologies_dir=_current_dir)
 
 # Export the topology instance directly
 PEGASUS_P16_TOPOLOGY = _json_topology

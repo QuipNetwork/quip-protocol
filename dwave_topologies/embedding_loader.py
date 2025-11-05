@@ -2,7 +2,7 @@
 Embedding loader utility for precomputed topology embeddings.
 
 Loads precomputed embeddings from JSON files saved in:
-    dwave_topologies/embeddings/{solver_name}/zephyr_z{m}_t{t}.json.gz
+    dwave_topologies/embeddings/{solver_name}/zephyr_z{m}_t{t}.embed.json.gz
 """
 
 import os
@@ -40,10 +40,15 @@ def load_embedding(
         # Parse Z(m,t) format
         parts = topology_name[2:-1].split(",")
         m, t = int(parts[0].strip()), int(parts[1].strip())
-        filename = f"zephyr_z{m}_t{t}.json.gz"
+        filename = f"zephyr_z{m}_t{t}.embed.json.gz"
     elif topology_name.startswith("zephyr_z"):
         # Already in filename format
-        filename = topology_name if topology_name.endswith(".json.gz") else f"{topology_name}.json.gz"
+        if not topology_name.endswith(".embed.json.gz"):
+            # Add .embed.json.gz extension
+            base = topology_name.replace(".json.gz", "").replace(".embed.json.gz", "")
+            filename = f"{base}.embed.json.gz"
+        else:
+            filename = topology_name
     else:
         raise ValueError(f"Invalid topology name format: {topology_name}")
 
@@ -127,7 +132,7 @@ def list_available_embeddings(solver_name: str = "Advantage2_system1.6") -> List
 
     results = []
     for filename in os.listdir(embeddings_dir):
-        if filename.endswith('.json.gz'):
+        if filename.endswith('.embed.json.gz'):
             filepath = os.path.join(embeddings_dir, filename)
             try:
                 with gzip.open(filepath, 'rt', encoding='utf-8') as f:

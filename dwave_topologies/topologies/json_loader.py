@@ -61,7 +61,7 @@ class DWaveTopologyFromJSON:
         return self._graph
 
 
-def load_json_topology(filename: str, topologies_dir: str = None) -> DWaveTopologyFromJSON:
+def load_json_topology(filename: str, topologies_dir: str = None, from_embeddings: bool = False) -> DWaveTopologyFromJSON:
     """
     Load a topology from a JSON file (plain or gzipped).
 
@@ -70,19 +70,26 @@ def load_json_topology(filename: str, topologies_dir: str = None) -> DWaveTopolo
 
     Args:
         filename: Name of the JSON topology file (e.g., 'zephyr_z11_t4.json' or 'zephyr_z11_t4.json.gz')
-        topologies_dir: Directory containing topology files. If None, uses default.
+        topologies_dir: Directory containing topology files. If None, uses default based on from_embeddings.
+        from_embeddings: If True, load from embeddings/Advantage2_system1_6/. Otherwise load from topologies/.
 
     Returns:
         DWaveTopologyFromJSON instance
 
     Example:
-        >>> topology = load_json_topology('zephyr_z11_t4.json')  # Works for both .json and .json.gz
+        >>> topology = load_json_topology('zephyr_z11_t4.json', from_embeddings=True)  # Mined topologies
+        >>> topology = load_json_topology('zephyr_z12_t4.json')  # Pregenerated topologies
         >>> print(f"Loaded {topology.num_nodes} nodes, {topology.num_edges} edges")
     """
     if topologies_dir is None:
-        # Default to dwave_topologies/topologies directory
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        topologies_dir = current_dir
+        if from_embeddings:
+            # Mined topologies are in embeddings/Advantage2_system1_6/
+            parent_dir = os.path.dirname(current_dir)
+            topologies_dir = os.path.join(parent_dir, 'embeddings', 'Advantage2_system1_6')
+        else:
+            # Pregenerated topologies are in topologies/
+            topologies_dir = current_dir
 
     filepath = os.path.join(topologies_dir, filename)
 
