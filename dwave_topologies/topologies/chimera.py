@@ -114,22 +114,6 @@ def chimera(m: int, n: int = None, t: int = 4) -> ChimeraTopology:
 CHIMERA_C16_TOPOLOGY = ChimeraTopology(16, 16, 4)  # D-Wave 2000Q: 2048 nodes
 
 
-def _to_dict(topology: ChimeraTopology) -> Dict[str, Any]:
-    """Convert topology to legacy dictionary format."""
-    return {
-        'solver_name': topology.solver_name,
-        'topology_type': topology.topology_type,
-        'topology_shape': topology.topology_shape,
-        'num_nodes': topology.num_nodes,
-        'num_edges': topology.num_edges,
-        'nodes': topology.nodes,
-        'edges': topology.edges,
-        'properties': topology.properties,
-    }
-
-
-# Legacy dictionary format (backward compatibility)
-CHIMERA_C16 = _to_dict(CHIMERA_C16_TOPOLOGY)
 
 
 __all__ = [
@@ -139,7 +123,4 @@ __all__ = [
 
     # Pre-defined topologies
     'CHIMERA_C16_TOPOLOGY',
-
-    # Legacy dictionary format
-    'CHIMERA_C16',
 ]

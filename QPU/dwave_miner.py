@@ -19,17 +19,18 @@ from shared.block_requirements import compute_current_requirements
 from shared.energy_utils import energy_to_difficulty, DEFAULT_NUM_NODES, DEFAULT_NUM_EDGES
 
 class DWaveMiner(BaseMiner):
-    def __init__(self, miner_id: str, topology_name: Optional[str] = None, **cfg):
+    def __init__(self, miner_id: str, topology_name: Optional[str] = "Z(9,2)", **cfg):
         """
         Initialize D-Wave QPU miner.
 
         Args:
             miner_id: Unique identifier for this miner
-            topology_name: Optional topology like "Z(10,2)" to use precomputed embedding.
-                          If None, uses full QPU topology.
+            topology_name: Topology to embed on QPU (default: "Z(9,2)" with precomputed embedding).
+                          The QPU will use FixedEmbeddingComposite to map logical variables
+                          onto the physical Advantage2 hardware topology.
             **cfg: Additional configuration options (reserved for future use)
         """
-        # Create sampler with topology and job label
+        # Create sampler with embedding (default Z(9,2) matches DEFAULT_TOPOLOGY variable count)
         sampler = DWaveSamplerWrapper(topology_name=topology_name, job_label_prefix="QUIP_MINE")
         super().__init__(miner_id, sampler, miner_type="QPU")
         self.miner_type = "QPU"

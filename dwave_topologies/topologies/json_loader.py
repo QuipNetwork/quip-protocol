@@ -113,26 +113,3 @@ def load_json_topology(filename: str, topologies_dir: str = None, from_embedding
     return DWaveTopologyFromJSON(json_data)
 
 
-# Legacy dictionary format converter
-def json_topology_to_dict(topology: DWaveTopologyFromJSON) -> Dict[str, Any]:
-    """
-    Convert a JSON topology to legacy dictionary format.
-
-    Args:
-        topology: DWaveTopologyFromJSON instance
-
-    Returns:
-        Dictionary in legacy format for backward compatibility
-    """
-    return {
-        'solver_name': topology.solver_name,
-        'topology_type': topology.topology_type,
-        'topology_shape': topology.topology_shape,
-        'num_nodes': topology.num_nodes,
-        'num_edges': topology.num_edges,
-        'nodes': topology.nodes,
-        'edges': topology.edges,
-        'properties': topology.properties,
-        'generated_at': topology.generated_at,
-        'docs': topology.docs
-    }

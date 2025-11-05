@@ -108,22 +108,6 @@ def pegasus(m: int) -> PegasusTopology:
 PEGASUS_P16_TOPOLOGY = PegasusTopology(16)  # D-Wave Advantage: 5640 nodes
 
 
-def _to_dict(topology: PegasusTopology) -> Dict[str, Any]:
-    """Convert topology to legacy dictionary format."""
-    return {
-        'solver_name': topology.solver_name,
-        'topology_type': topology.topology_type,
-        'topology_shape': topology.topology_shape,
-        'num_nodes': topology.num_nodes,
-        'num_edges': topology.num_edges,
-        'nodes': topology.nodes,
-        'edges': topology.edges,
-        'properties': topology.properties,
-    }
-
-
-# Legacy dictionary format (backward compatibility)
-PEGASUS_P16 = _to_dict(PEGASUS_P16_TOPOLOGY)
 
 
 __all__ = [
@@ -133,7 +117,4 @@ __all__ = [
 
     # Pre-defined topologies
     'PEGASUS_P16_TOPOLOGY',
-
-    # Legacy dictionary format
-    'PEGASUS_P16',
 ]

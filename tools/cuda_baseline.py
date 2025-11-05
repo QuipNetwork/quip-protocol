@@ -14,6 +14,7 @@ import numpy as np
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evaluate_sampleset, calculate_diversity
 from shared.block_requirements import BlockRequirements
 from dwave_topologies import DEFAULT_TOPOLOGY
+from dwave_topologies.embedded_topology import create_embedded_topology
 
 try:
     from GPU.cuda_kernel import CudaKernelRealSA
@@ -23,8 +24,17 @@ except ImportError:
     CUDA_AVAILABLE = False
 
 
-def cuda_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None, h_values=None):
-    """Test CUDA GPU performance using CudaSASamplerAsync."""
+def cuda_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None, h_values=None, use_embedding=None):
+    """Test CUDA GPU performance using CudaSASamplerAsync.
+
+    Args:
+        timeout_minutes: Test timeout in minutes
+        output_file: Path to save JSON results
+        only_label: Run only specific config (e.g., "Light CUDA")
+        h_values: List of allowed h field values
+        use_embedding: If specified, use embedded hardware topology instead of perfect topology.
+                      Format: "Z(9,2)" for Z(9,2) embedding
+    """
     if h_values is None:
         h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
 
@@ -60,12 +70,21 @@ def cuda_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None, 
         traceback.print_exc()
         return None
 
-    # Use production topology (same as CPU baseline)
-    nodes = list(DEFAULT_TOPOLOGY.graph.nodes)
-    edges = list(DEFAULT_TOPOLOGY.graph.edges)
-    sampler_type = "persistent-kernel"
+    # Get topology
+    if use_embedding:
+        print(f"🔗 Using embedded hardware topology: {use_embedding}")
+        embedded_topo = create_embedded_topology(use_embedding)
+        nodes = embedded_topo.nodes
+        edges = embedded_topo.edges
+        topology_desc = f"{use_embedding} embedded ({len(nodes)} qubits, {len(edges)} couplers)"
+    else:
+        print(f"✨ Using perfect topology (default)")
+        nodes = list(DEFAULT_TOPOLOGY.graph.nodes)
+        edges = list(DEFAULT_TOPOLOGY.graph.edges)
+        topology_desc = f"perfect Z(9,2) ({len(nodes)} nodes, {len(edges)} edges)"
 
-    print(f"📊 Using production topology: {len(nodes)} nodes, {len(edges)} edges")
+    sampler_type = "persistent-kernel"
+    print(f"📐 Topology: {topology_desc}")
 
     # Initial problem setup to show problem size
     seed = 12345  # Fixed seed for reproducible results
@@ -102,6 +121,8 @@ def cuda_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None, 
     results = {
         'timeout_minutes': timeout_minutes,
         'sampler_type': sampler_type,
+        'topology': topology_desc,
+        'use_embedding': use_embedding if use_embedding else "none",
         'problem_info': {
             'num_variables': len(h),
             'num_couplings': len(J),
@@ -364,6 +385,11 @@ def main():
         default='-1,0,1',
         help='Comma-separated h field values (default: -1,0,1). Use "0" for h=0 baseline.'
     )
+    parser.add_argument(
+        '--embedding',
+        type=str,
+        help='Use embedded hardware topology instead of perfect topology (e.g., "Z(9,2)")'
+    )
     args = parser.parse_args()
 
     # Parse h_values
@@ -390,7 +416,8 @@ def main():
         timeout_minutes=timeout,
         output_file=output_file,
         only_label=only_label,
-        h_values=h_values
+        h_values=h_values,
+        use_embedding=args.embedding
     )
 
     print(f"\n✅ CUDA baseline test complete!")

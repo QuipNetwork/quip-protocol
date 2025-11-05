@@ -12,13 +12,24 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evaluate_sampleset, calculate_diversity
 from shared.block_requirements import BlockRequirements
 from dwave_topologies import DEFAULT_TOPOLOGY
+from dwave_topologies.embedded_topology import create_embedded_topology
 
 from GPU.metal_sa import MetalSASampler
 from GPU.metal_miner import get_gpu_core_count
 
 
-def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None, h_values=None, num_models=1):
-    """Test Metal SA performance with baseline format and evaluation logic."""
+def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None, h_values=None, num_models=1, use_embedding=None):
+    """Test Metal SA performance with baseline format and evaluation logic.
+
+    Args:
+        timeout_minutes: Test timeout in minutes
+        output_file: Path to save JSON results
+        only_label: Run only specific config (e.g., "Light Metal")
+        h_values: List of allowed h field values
+        num_models: Number of parallel models to run
+        use_embedding: If specified, use embedded hardware topology instead of perfect topology.
+                      Format: "Z(9,2)" for Z(9,2) embedding
+    """
     if h_values is None:
         h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
 
@@ -36,9 +47,20 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None,
         return None
 
     # Get topology
-    topology_graph = DEFAULT_TOPOLOGY.graph
-    nodes = list(topology_graph.nodes())
-    edges = list(topology_graph.edges())
+    if use_embedding:
+        print(f"🔗 Using embedded hardware topology: {use_embedding}")
+        embedded_topo = create_embedded_topology(use_embedding)
+        nodes = embedded_topo.nodes
+        edges = embedded_topo.edges
+        topology_desc = f"{use_embedding} embedded ({len(nodes)} qubits, {len(edges)} couplers)"
+    else:
+        print(f"✨ Using perfect topology (default)")
+        topology_graph = DEFAULT_TOPOLOGY.graph
+        nodes = list(topology_graph.nodes())
+        edges = list(topology_graph.edges())
+        topology_desc = f"perfect Z(9,2) ({len(nodes)} nodes, {len(edges)} edges)"
+
+    print(f"📐 Topology: {topology_desc}")
 
     # Generate test problem with h_values
     seed = 12345  # Fixed seed for reproducible results
@@ -75,6 +97,8 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None,
     results = {
         'timeout_minutes': timeout_minutes,
         'sampler_type': 'metal-sa',
+        'topology': topology_desc,
+        'use_embedding': use_embedding if use_embedding else "none",
         'problem_info': {
             'num_variables': len(h),
             'num_couplings': len(J),
@@ -294,6 +318,11 @@ def main():
         default=None,
         help='Number of models to process in parallel (default: auto-detect GPU cores, typically 40)'
     )
+    parser.add_argument(
+        '--embedding',
+        type=str,
+        help='Use embedded hardware topology instead of perfect topology (e.g., "Z(9,2)")'
+    )
 
     args = parser.parse_args()
 
@@ -332,7 +361,8 @@ def main():
         output_file=output_file,
         only_label=only_label,
         h_values=h_values,
-        num_models=num_models
+        num_models=num_models,
+        use_embedding=args.embedding
     )
 
     print(f"\n✅ Metal SA baseline test complete!")

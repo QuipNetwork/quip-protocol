@@ -108,31 +108,13 @@ def zephyr(m: int, t: int) -> ZephyrTopology:
 
 
 # Pre-defined common Zephyr topologies
-ZEPHYR_Z8_T2_TOPOLOGY = ZephyrTopology(8, 2)   # 1,088 nodes - DEFAULT with precomputed embedding
+ZEPHYR_Z8_T2_TOPOLOGY = ZephyrTopology(8, 2)   # 1,088 nodes - precomputed embedding available
+ZEPHYR_Z9_T2_TOPOLOGY = ZephyrTopology(9, 2)   # 1,368 nodes - DEFAULT with precomputed embedding
 ZEPHYR_Z10_T2_TOPOLOGY = ZephyrTopology(10, 2)  # 1,680 nodes
 ZEPHYR_Z11_T4_TOPOLOGY = ZephyrTopology(11, 4)  # 4,048 nodes - largest that fits Advantage2 well
 ZEPHYR_Z12_T4_TOPOLOGY = ZephyrTopology(12, 4)  # 4,800 nodes - exceeds Advantage2, for reference
 
 
-def _to_dict(topology: ZephyrTopology) -> Dict[str, Any]:
-    """Convert topology to legacy dictionary format."""
-    return {
-        'solver_name': topology.solver_name,
-        'topology_type': topology.topology_type,
-        'topology_shape': topology.topology_shape,
-        'num_nodes': topology.num_nodes,
-        'num_edges': topology.num_edges,
-        'nodes': topology.nodes,
-        'edges': topology.edges,
-        'properties': topology.properties,
-    }
-
-
-# Legacy dictionary format (backward compatibility)
-ZEPHYR_Z8_T2 = _to_dict(ZEPHYR_Z8_T2_TOPOLOGY)
-ZEPHYR_Z10_T2 = _to_dict(ZEPHYR_Z10_T2_TOPOLOGY)
-ZEPHYR_Z11_T4 = _to_dict(ZEPHYR_Z11_T4_TOPOLOGY)
-ZEPHYR_Z12_T4 = _to_dict(ZEPHYR_Z12_T4_TOPOLOGY)
 
 
 __all__ = [
@@ -142,13 +124,8 @@ __all__ = [
 
     # Pre-defined topologies
     'ZEPHYR_Z8_T2_TOPOLOGY',
+    'ZEPHYR_Z9_T2_TOPOLOGY',
     'ZEPHYR_Z10_T2_TOPOLOGY',
     'ZEPHYR_Z11_T4_TOPOLOGY',
     'ZEPHYR_Z12_T4_TOPOLOGY',
-
-    # Legacy dictionary format
-    'ZEPHYR_Z8_T2',
-    'ZEPHYR_Z10_T2',
-    'ZEPHYR_Z11_T4',
-    'ZEPHYR_Z12_T4',
 ]
