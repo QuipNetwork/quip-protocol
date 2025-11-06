@@ -186,7 +186,7 @@ Examples:
 Notes:
   - Uses minorminer's feasibility_filter (more accurate than manual checking)
   - Tests embedding feasibility (with chains), not just 1:1 subgraph matching
-  - Uses predownloaded Advantage2_system1.6 topology (no QPU access needed)
+  - Uses predownloaded Advantage2_system1.7 topology (no QPU access needed)
         """
     )
     parser.add_argument('--max-m', type=int, default=12,

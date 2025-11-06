@@ -77,7 +77,7 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
 
             # Load embedding data
             print(f"📁 Loading embedding from: {topology_file}")
-            embedding_data = load_embedding(topology_name, "Advantage2_system1.6")
+            embedding_data = load_embedding(topology_name, "Advantage2_system1.7")
             if not embedding_data:
                 print(f"❌ Failed to load embedding file")
                 return None
@@ -409,7 +409,7 @@ def main():
     parser.add_argument(
         '--topology',
         type=str,
-        help='Path to embedding file (e.g., "dwave_topologies/embeddings/Advantage2_system1.6/zephyr_z9_t2.embed.json.gz")'
+        help='Path to embedding file (e.g., "dwave_topologies/embeddings/Advantage2_system1.7/zephyr_z9_t2.embed.json.gz")'
     )
     parser.add_argument(
         '--use-embedding',

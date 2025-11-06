@@ -26,6 +26,15 @@ from typing import Dict, List, Optional, Tuple, Any
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    # Load .env from project root
+    env_path = Path(__file__).parent.parent / '.env'
+    load_dotenv(dotenv_path=env_path)
+except ImportError:
+    pass  # python-dotenv not installed, rely on system environment
+
 try:
     from dwave.system import DWaveSampler
     from dwave.cloud import Client
@@ -41,7 +50,7 @@ def normalize_solver_name(solver_name: str) -> str:
     Convert solver name to Python module name format.
     
     Examples:
-        Advantage2-System1.6 -> advantage2_system1_6
+        Advantage2-System1.7 -> advantage2_system1_7
         Advantage_system6.4 -> advantage_system6_4
         DW_2000Q_6 -> dw_2000q_6
     """

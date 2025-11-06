@@ -11,6 +11,10 @@ from typing import List, Dict
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
 from dataclasses import dataclass
 
 from shared.block import Block, BlockHeader, BlockRequirements, create_genesis_block

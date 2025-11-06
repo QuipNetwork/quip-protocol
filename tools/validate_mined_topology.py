@@ -36,7 +36,7 @@ def validate_topology(mined_topology_file: str, verbose: bool = True) -> bool:
         True if topology is valid, False otherwise
     """
     # Load the real QPU topology
-    qpu_topology = load_json_topology('advantage2_system1_6.json', from_embeddings=False)
+    qpu_topology = load_json_topology('advantage2_system1_7.json.gz', from_embeddings=False)
     qpu_nodes = set(qpu_topology.nodes)
     qpu_edges = set((min(u, v), max(u, v)) for u, v in qpu_topology.edges)  # Normalize edge direction
 
@@ -132,7 +132,7 @@ Examples:
 
     # Determine which topologies to validate
     if args.all:
-        embeddings_dir = Path(__file__).parent.parent / 'dwave_topologies' / 'embeddings' / 'Advantage2_system1_6'
+        embeddings_dir = Path(__file__).parent.parent / 'dwave_topologies' / 'embeddings' / 'Advantage2_system1_7'
         topology_files = sorted(embeddings_dir.glob('*.json.gz'))
         if not topology_files:
             print("No mined topologies found in embeddings directory")

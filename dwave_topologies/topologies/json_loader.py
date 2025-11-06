@@ -71,7 +71,7 @@ def load_json_topology(filename: str, topologies_dir: str = None, from_embedding
     Args:
         filename: Name of the JSON topology file (e.g., 'zephyr_z11_t4.json' or 'zephyr_z11_t4.json.gz')
         topologies_dir: Directory containing topology files. If None, uses default based on from_embeddings.
-        from_embeddings: If True, load from embeddings/Advantage2_system1_6/. Otherwise load from topologies/.
+        from_embeddings: If True, load from embeddings/Advantage2_system1_7/. Otherwise load from topologies/.
 
     Returns:
         DWaveTopologyFromJSON instance
@@ -84,9 +84,9 @@ def load_json_topology(filename: str, topologies_dir: str = None, from_embedding
     if topologies_dir is None:
         current_dir = os.path.dirname(os.path.abspath(__file__))
         if from_embeddings:
-            # Mined topologies are in embeddings/Advantage2_system1_6/
+            # Mined topologies are in embeddings/Advantage2_system1_7/
             parent_dir = os.path.dirname(current_dir)
-            topologies_dir = os.path.join(parent_dir, 'embeddings', 'Advantage2_system1_6')
+            topologies_dir = os.path.join(parent_dir, 'embeddings', 'Advantage2_system1_7')
         else:
             # Pregenerated topologies are in topologies/
             topologies_dir = current_dir
