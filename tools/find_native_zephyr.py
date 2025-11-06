@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import dwave_networkx as dnx
-from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_6_TOPOLOGY
+from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_7_TOPOLOGY
 
 try:
     from minorminer.utils.feasibility import embedding_feasibility_filter
@@ -197,7 +197,7 @@ Notes:
     args = parser.parse_args()
 
     # Load Advantage2 topology (no QPU access needed)
-    topology = ADVANTAGE2_SYSTEM1_6_TOPOLOGY
+    topology = ADVANTAGE2_SYSTEM1_7_TOPOLOGY
     target_graph = topology.graph
 
     print(f"Target QPU: {topology.solver_name}")

@@ -96,15 +96,21 @@ def get_topology_shape(properties: Dict[str, Any]) -> str:
     return 'unknown'
 
 
-def extract_solver_info(solver_name: str) -> Optional[Dict[str, Any]]:
+def extract_solver_info(solver_name: str, region: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Extract topology information from a D-Wave solver."""
     if not DWAVE_AVAILABLE or DWaveSampler is None:
         print("❌ D-Wave Ocean SDK not available")
         return None
 
     try:
-        print(f"🔍 Connecting to solver: {solver_name}")
-        sampler = DWaveSampler(solver=solver_name)
+        region_str = f" (region: {region})" if region else ""
+        print(f"🔍 Connecting to solver: {solver_name}{region_str}")
+
+        # Pass region if specified
+        kwargs = {'solver': solver_name}
+        if region:
+            kwargs['region'] = region
+        sampler = DWaveSampler(**kwargs)
         
         # Extract basic topology info
         nodes = list(sampler.nodelist)
@@ -163,15 +169,21 @@ def generate_topology_json(solver_info: Dict[str, Any]) -> Dict[str, Any]:
     return topology_json
 
 
-def list_available_solvers() -> List[str]:
+def list_available_solvers(region: Optional[str] = None) -> List[str]:
     """List all available D-Wave solvers."""
     if not DWAVE_AVAILABLE or Client is None:
         print("❌ D-Wave Ocean SDK not available")
         return []
 
     try:
-        print("🔍 Querying available D-Wave solvers...")
-        client = Client.from_config()
+        region_str = f" in region {region}" if region else ""
+        print(f"🔍 Querying available D-Wave solvers{region_str}...")
+
+        # Pass region if specified
+        kwargs = {}
+        if region:
+            kwargs['region'] = region
+        client = Client.from_config(**kwargs)
         solvers = client.get_solvers()
         
         solver_names = []
@@ -209,10 +221,10 @@ def list_available_solvers() -> List[str]:
         return []
 
 
-def dump_solver_topology(solver_name: str, output_dir: str = "dwave_topologies/topologies", use_gzip: bool = True) -> bool:
+def dump_solver_topology(solver_name: str, output_dir: str = "dwave_topologies/topologies", use_gzip: bool = True, region: Optional[str] = None) -> bool:
     """Dump a single solver topology to a JSON file (optionally gzipped)."""
     # Extract solver information
-    solver_info = extract_solver_info(solver_name)
+    solver_info = extract_solver_info(solver_name, region=region)
     if not solver_info:
         return False
 
@@ -364,22 +376,28 @@ Examples:
         action='store_true',
         help='Dump topologies for all available solvers'
     )
-    
+
+    parser.add_argument(
+        '--region', '-r',
+        type=str,
+        help='D-Wave region (e.g., "na-east-1", "na-west-1"). If not specified, uses default from config.'
+    )
+
     args = parser.parse_args()
-    
+
     if not DWAVE_AVAILABLE:
         print("❌ D-Wave Ocean SDK not available. Install with:")
         print("   pip install dwave-ocean-sdk")
         sys.exit(1)
-    
+
     # List solvers mode
     if args.list_solvers:
-        list_available_solvers()
+        list_available_solvers(region=args.region)
         return
     
     # All available solvers mode
     if args.all_available:
-        solver_names = list_available_solvers()
+        solver_names = list_available_solvers(region=args.region)
         if not solver_names:
             print("❌ No solvers available")
             sys.exit(1)
@@ -390,7 +408,7 @@ Examples:
 
         for solver_name in solver_names:
             print(f"\n--- Processing {solver_name} ---")
-            if dump_solver_topology(solver_name, args.output_dir, args.gzip):
+            if dump_solver_topology(solver_name, args.output_dir, args.gzip, region=args.region):
                 successful.append(solver_name)
 
         if successful:
@@ -405,7 +423,7 @@ Examples:
     if args.solver:
         print(f"🚀 Dumping topology for solver: {args.solver}")
         print(f"   Output format: {'JSON (gzip compressed)' if args.gzip else 'JSON (uncompressed)'}")
-        if dump_solver_topology(args.solver, args.output_dir, args.gzip):
+        if dump_solver_topology(args.solver, args.output_dir, args.gzip, region=args.region):
             create_readme_file(args.output_dir, [args.solver], args.gzip)
             print(f"\n✅ Successfully dumped topology for {args.solver}")
         else:

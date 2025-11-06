@@ -30,6 +30,7 @@ from .zephyr import (
     ZEPHYR_Z12_T4_TOPOLOGY,
 )
 from .advantage2_system1_7 import ADVANTAGE2_SYSTEM1_7_TOPOLOGY
+from .advantage2_system4_1 import ADVANTAGE2_SYSTEM4_1_TOPOLOGY
 
 # Default topology (Zephyr Z(9, 2) - logical problem size for all miners)
 # Topology: 1,368 nodes, 7,692 edges (perfect Zephyr graph structure)
@@ -51,6 +52,7 @@ __all__ = [
     "ZEPHYR_Z11_T4_TOPOLOGY",
     "ZEPHYR_Z12_T4_TOPOLOGY",
     "ADVANTAGE2_SYSTEM1_7_TOPOLOGY",
+    "ADVANTAGE2_SYSTEM4_1_TOPOLOGY",
 
     # Default
     "DEFAULT_TOPOLOGY",
