@@ -29,13 +29,13 @@ from .zephyr import (
     ZEPHYR_Z11_T4_TOPOLOGY,
     ZEPHYR_Z12_T4_TOPOLOGY,
 )
-from .advantage2_system1_6 import ADVANTAGE2_SYSTEM1_6_TOPOLOGY
+from .advantage2_system1_7 import ADVANTAGE2_SYSTEM1_7_TOPOLOGY
 
 # Default topology (Zephyr Z(9, 2) - logical problem size for all miners)
 # Topology: 1,368 nodes, 7,692 edges (perfect Zephyr graph structure)
 # - CPU/GPU/Metal: Sample on perfect Z(9,2) graph
-# - QPU: Uses Z(9,2) embedding to map onto Advantage2 hardware (4,593 qubits)
-# Precomputed embedding: dwave_topologies/embeddings/Advantage2_system1.6/zephyr_z9_t2.embed.json.gz
+# - QPU: Uses Z(9,2) embedding to map onto Advantage2 hardware (4,592 qubits)
+# Precomputed embedding: dwave_topologies/embeddings/Advantage2_system1_7/zephyr_z9_t2.embed.json.gz
 # All miners solve the same logical problem size, ensuring consistent GSE
 DEFAULT_TOPOLOGY = ZEPHYR_Z9_T2_TOPOLOGY
 
@@ -50,7 +50,7 @@ __all__ = [
     "ZEPHYR_Z10_T2_TOPOLOGY",
     "ZEPHYR_Z11_T4_TOPOLOGY",
     "ZEPHYR_Z12_T4_TOPOLOGY",
-    "ADVANTAGE2_SYSTEM1_6_TOPOLOGY",
+    "ADVANTAGE2_SYSTEM1_7_TOPOLOGY",
 
     # Default
     "DEFAULT_TOPOLOGY",

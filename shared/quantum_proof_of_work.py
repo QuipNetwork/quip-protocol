@@ -417,10 +417,14 @@ def validate_quantum_proof(quantum_proof, miner_id: str, requirements, block_ind
         logger.error(f"Solutions presented in result: {len(solutions)} - energies: {energies}")
         return False
 
-    # Calculate diversity using shared utility
-    diversity = calculate_diversity(energy_valid_solutions)
+    # Select most diverse subset of min_solutions and check diversity
+    # This ensures we find AT LEAST min_solutions with AT LEAST min_diversity
+    selected_solution_indices = select_diverse_solutions(energy_valid_solutions, requirements.min_solutions)
+    selected_solutions = [energy_valid_solutions[i] for i in selected_solution_indices]
+    diversity = calculate_diversity(selected_solutions)
+
     if diversity < requirements.min_diversity:
-        logger.error(f"Block {block_index} rejected: insufficient diversity ({diversity} < {requirements.min_diversity})")
+        logger.error(f"Block {block_index} rejected: insufficient diversity in best {requirements.min_solutions} solutions ({diversity:.3f} < {requirements.min_diversity})")
         return False
 
     return True
@@ -613,5 +617,6 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
     finally:
         # Use a local logger since we don't have access to the miner's logger
         local_logger = logging.getLogger(__name__)
-        local_logger.info(f"Mining attempt - Energy: {best_energy:.2f}, Valid: {len(valid_solutions)}, Diversity: {diversity:.3f} (requirements: energy<={difficulty_energy:.2f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
+        # Note: diversity is calculated from the BEST min_solutions subset, not all valid_solutions
+        local_logger.info(f"Mining attempt - Energy: {best_energy:.2f}, Valid: {len(valid_solutions)} (best {min_solutions} diversity: {diversity:.3f}) (requirements: energy<={difficulty_energy:.2f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
     return result

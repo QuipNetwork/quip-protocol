@@ -36,7 +36,7 @@ class DWaveSamplerWrapper:
         # Determine topology and embedding
         if topology_name:
             # Use precomputed embedding for specific topology
-            solver_name = base_sampler.properties.get('chip_id', 'Advantage2_system1.6')
+            solver_name = base_sampler.properties.get('chip_id', 'Advantage2_system1.7')
 
             # Normalize solver name for directory (remove special chars)
             solver_dir = solver_name.replace('-', '_').replace('.', '_')

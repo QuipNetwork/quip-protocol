@@ -19,7 +19,7 @@ from shared.block_requirements import compute_current_requirements
 from shared.energy_utils import energy_to_difficulty, DEFAULT_NUM_NODES, DEFAULT_NUM_EDGES
 
 class DWaveMiner(BaseMiner):
-    def __init__(self, miner_id: str, topology_name: Optional[str] = "Z(9,2)", **cfg):
+    def __init__(self, miner_id: str, topology_name: Optional[str] = "Z(9,2)", qpu_timeout: float = 360.0, **cfg):
         """
         Initialize D-Wave QPU miner.
 
@@ -28,6 +28,7 @@ class DWaveMiner(BaseMiner):
             topology_name: Topology to embed on QPU (default: "Z(9,2)" with precomputed embedding).
                           The QPU will use FixedEmbeddingComposite to map logical variables
                           onto the physical Advantage2 hardware topology.
+            qpu_timeout: Minimum seconds between QPU attempts (default: 360.0). Set to 0.0 to disable rate limiting.
             **cfg: Additional configuration options (reserved for future use)
         """
         # Create sampler with embedding (default Z(9,2) matches DEFAULT_TOPOLOGY variable count)
@@ -36,8 +37,8 @@ class DWaveMiner(BaseMiner):
         self.miner_type = "QPU"
         self.topology_name = topology_name
 
-        # QPU rate limiting configuration (hard-coded for now)
-        self.qpu_timeout = 360.0  # Minimum 60 seconds between QPU attempts
+        # QPU rate limiting configuration
+        self.qpu_timeout = qpu_timeout  # Minimum seconds between QPU attempts (0.0 = disabled)
         self.last_qpu_attempt_time = 0.0  # Track last QPU sampling time
         
         # Register SIGTERM handler for graceful cleanup
