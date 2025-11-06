@@ -17,25 +17,39 @@ from shared.quantum_proof_of_work import (
 )
 from shared.block_requirements import compute_current_requirements
 from shared.energy_utils import energy_to_difficulty, DEFAULT_NUM_NODES, DEFAULT_NUM_EDGES
+from dwave_topologies import DEFAULT_TOPOLOGY
+from dwave_topologies.topologies.dwave_topology import DWaveTopology
 
 class DWaveMiner(BaseMiner):
-    def __init__(self, miner_id: str, topology_name: Optional[str] = "Z(9,2)", qpu_timeout: float = 360.0, **cfg):
+    def __init__(
+        self,
+        miner_id: str,
+        topology: DWaveTopology = DEFAULT_TOPOLOGY,
+        embedding_file: Optional[str] = None,
+        qpu_timeout: float = 360.0,
+        **cfg
+    ):
         """
         Initialize D-Wave QPU miner.
 
         Args:
             miner_id: Unique identifier for this miner
-            topology_name: Topology to embed on QPU (default: "Z(9,2)" with precomputed embedding).
-                          The QPU will use FixedEmbeddingComposite to map logical variables
-                          onto the physical Advantage2 hardware topology.
+            topology: Topology object (default: DEFAULT_TOPOLOGY = Z(9,2)).
+                     Can be any DWaveTopology (Zephyr, Advantage2, etc.)
+            embedding_file: Optional path to embedding file. If None and topology requires
+                          embedding, will auto-discover precomputed embedding.
             qpu_timeout: Minimum seconds between QPU attempts (default: 360.0). Set to 0.0 to disable rate limiting.
             **cfg: Additional configuration options (reserved for future use)
         """
-        # Create sampler with embedding (default Z(9,2) matches DEFAULT_TOPOLOGY variable count)
-        sampler = DWaveSamplerWrapper(topology_name=topology_name, job_label_prefix="QUIP_MINE")
+        # Create sampler (encapsulates embedding internally)
+        sampler = DWaveSamplerWrapper(
+            topology=topology,
+            embedding_file=embedding_file,
+            job_label_prefix="QUIP_MINE"
+        )
         super().__init__(miner_id, sampler, miner_type="QPU")
         self.miner_type = "QPU"
-        self.topology_name = topology_name
+        self.topology = topology
 
         # QPU rate limiting configuration
         self.qpu_timeout = qpu_timeout  # Minimum seconds between QPU attempts (0.0 = disabled)
@@ -132,7 +146,7 @@ class DWaveMiner(BaseMiner):
                 break
 
             attempt_no = progress + 1
-            self.logger.info(f"[QPU] Starting mining attempt {attempt_no} (reads={params.get('num_reads', 100)}, anneal={params.get('quantum_annealing_time', 20.0)}µs)")
+            self.logger.info(f"[QPU] Starting mining attempt {attempt_no} (reads={params.get('num_reads', 100)}, anneal={params.get('annealing_time', 20.0)}µs)")
 
             # Generate random salt for each attempt
             salt = random.randbytes(32)
@@ -192,7 +206,7 @@ class DWaveMiner(BaseMiner):
 
                 # For QPU, use adaptive parameters
                 num_reads = params.get('num_reads', 100)
-                annealing_time = params.get('quantum_annealing_time', 20.0)
+                annealing_time = params.get('annealing_time', 20.0)
 
                 sample_start = time.time()
                 self.current_stage = 'sampling'

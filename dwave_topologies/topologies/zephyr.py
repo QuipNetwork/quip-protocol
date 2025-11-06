@@ -67,7 +67,7 @@ class ZephyrTopology:
 
     @property
     def solver_name(self) -> str:
-        return f"Zephyr_Z{self.m}_T{self.t}_Generic"
+        return f"Z({self.m},{self.t})"
 
     @property
     def topology_type(self) -> str:

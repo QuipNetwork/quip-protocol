@@ -2,8 +2,10 @@
 """Compare mining rates across different hardware at fixed difficulty."""
 import argparse
 import json
+import logging
 import multiprocessing
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import List, Dict
@@ -15,11 +17,54 @@ sys.path.append(str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv()
 
+# Configure logging to capture miner logs
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True  # Force reconfiguration if already configured
+)
+
+# Ensure unbuffered output
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 from dataclasses import dataclass
 
 from shared.block import Block, BlockHeader, BlockRequirements, create_genesis_block
 from shared.miner_types import MiningResult
 from shared.time_utils import utc_timestamp
+from dwave_topologies import DEFAULT_TOPOLOGY
+from dwave_topologies.topologies import load_topology
+
+
+def parse_duration(duration_str: str) -> float:
+    """
+    Parse duration string to minutes.
+
+    Supports: 30s, 5m, 2h, 1d, 1w
+    Examples:
+        "30s" -> 0.5 (minutes)
+        "5m" -> 5.0
+        "2h" -> 120.0
+        "1d" -> 1440.0
+        "1w" -> 10080.0
+    """
+    duration_str = duration_str.strip().lower()
+
+    if duration_str.endswith('s'):
+        return int(duration_str[:-1]) / 60.0
+    elif duration_str.endswith('m'):
+        return float(duration_str[:-1])
+    elif duration_str.endswith('h'):
+        return int(duration_str[:-1]) * 60.0
+    elif duration_str.endswith('d'):
+        return int(duration_str[:-1]) * 1440.0
+    elif duration_str.endswith('w'):
+        return int(duration_str[:-1]) * 10080.0
+    else:
+        # Try parsing as raw minutes
+        return float(duration_str)
 
 
 @dataclass
@@ -32,7 +77,7 @@ def mine_continuous(
     miner,
     difficulty_energy: float,
     duration_minutes: float,
-    min_diversity: float = 0.3,
+    min_diversity: float = 0.15,
     min_solutions: int = 5,
     log_file = None
 ) -> Dict:
@@ -88,29 +133,39 @@ def mine_continuous(
     # Update requirements for testing
     prev_block.next_block_requirements = requirements
 
+    # Create stop event that persists across mining attempts
+    stop_event = multiprocessing.Event()
+
+    # Start a timer thread to set stop_event after duration expires
+    def timer_thread():
+        time.sleep(duration_seconds)
+        log(f"\n✅ Duration limit reached ({duration_minutes} min)")
+        stop_event.set()
+
+    timer = threading.Thread(target=timer_thread, daemon=True)
+    timer.start()
+
     while True:
-        elapsed = time.time() - start_time
-        if elapsed >= duration_seconds:
-            log(f"\n✅ Duration limit reached ({duration_minutes} min)")
+        # Check if stop event was set by timer
+        if stop_event.is_set():
             break
 
         # Progress update
-        if time.time() - last_progress_time >= progress_interval:
+        current_time = time.time()
+        if current_time - last_progress_time >= progress_interval:
+            elapsed = current_time - start_time
             elapsed_min = elapsed / 60
             blocks_per_min = len(blocks_found) / elapsed_min if elapsed_min > 0 else 0
             log(f"   [{elapsed_min:.1f}/{duration_minutes:.0f} min] "
                   f"Blocks: {len(blocks_found)}, "
                   f"Attempts: {attempts}, "
                   f"Rate: {blocks_per_min:.2f} blocks/min")
-            last_progress_time = time.time()
+            last_progress_time = current_time
 
         attempts += 1
         prev_timestamp = prev_block.header.timestamp
 
-        # Create stop event
-        stop_event = multiprocessing.Event()
-
-        # Mine the block
+        # Mine the block (using shared stop_event)
         attempt_start = time.time()
         result = miner.mine_block(
             prev_block=prev_block,
@@ -120,6 +175,10 @@ def mine_continuous(
             stop_event=stop_event
         )
         attempt_time = time.time() - attempt_start
+
+        # Check if stop event was set during mining
+        if stop_event.is_set():
+            break
 
         if result:
             blocks_found.append(result)
@@ -191,15 +250,15 @@ def main():
     )
     parser.add_argument(
         '--duration',
-        type=float,
-        default=10.0,
-        help='Mining duration in minutes (default: 10.0)'
+        type=str,
+        default='10m',
+        help='Mining duration (default: 10m). Examples: 30s, 5m, 2h, 1d, 1w'
     )
     parser.add_argument(
         '--min-diversity',
         type=float,
-        default=0.3,
-        help='Minimum solution diversity (default: 0.3)'
+        default=0.15,
+        help='Minimum solution diversity (default: 0.15)'
     )
     parser.add_argument(
         '--min-solutions',
@@ -221,16 +280,36 @@ def main():
     parser.add_argument(
         '--topology',
         type=str,
-        help='QPU topology name (for qpu miner, e.g., "Z(10,2)")'
+        default=None,
+        help='Topology name (default: DEFAULT_TOPOLOGY=Z(9,2)). Examples: "Z(9,2)", "Z(10,2)", "Advantage2_system1.7"'
     )
 
     args = parser.parse_args()
 
+    # Parse duration
+    try:
+        duration_minutes = parse_duration(args.duration)
+    except (ValueError, IndexError):
+        print(f"❌ Invalid duration format: '{args.duration}'. Use formats like: 30s, 5m, 2h, 1d, 1w")
+        return 1
+
+    # Parse topology if specified
+    if args.topology:
+        try:
+            topology = load_topology(args.topology)
+            print(f"✅ Loaded topology: {topology.solver_name}")
+        except (ValueError, FileNotFoundError) as e:
+            print(f"❌ Failed to load topology '{args.topology}': {e}")
+            return 1
+    else:
+        topology = DEFAULT_TOPOLOGY
+
     print("🔬 Mining Rate Comparison Tool")
     print("=" * 50)
     print(f"Miner type: {args.miner_type.upper()}")
+    print(f"Topology: {topology.solver_name} ({len(topology.nodes)} nodes, {len(topology.edges)} edges)")
     print(f"Difficulty: {args.difficulty_energy:.1f}")
-    print(f"Duration: {args.duration} minutes")
+    print(f"Duration: {args.duration} ({duration_minutes:.1f} minutes)")
 
     # Initialize miner
     miner = None
@@ -245,7 +324,7 @@ def main():
         miner = MetalMiner(miner_id="rate-test-metal")
     elif args.miner_type == 'qpu':
         from QPU.dwave_miner import DWaveMiner
-        miner = DWaveMiner(miner_id="rate-test-qpu", topology_name=args.topology, qpu_timeout=0.0)
+        miner = DWaveMiner(miner_id="rate-test-qpu", topology=topology, qpu_timeout=0.0)
 
     if not miner:
         print(f"❌ Failed to initialize {args.miner_type} miner")
@@ -266,7 +345,7 @@ def main():
         stats = mine_continuous(
             miner=miner,
             difficulty_energy=args.difficulty_energy,
-            duration_minutes=args.duration,
+            duration_minutes=duration_minutes,
             min_diversity=args.min_diversity,
             min_solutions=args.min_solutions,
             log_file=log_file
@@ -308,7 +387,8 @@ def main():
     output_data = {
         'miner_type': args.miner_type,
         'difficulty_energy': args.difficulty_energy,
-        'duration_minutes': args.duration,
+        'duration_spec': args.duration,
+        'duration_minutes': duration_minutes,
         'min_diversity': args.min_diversity,
         'min_solutions': args.min_solutions,
         'statistics': stats,
