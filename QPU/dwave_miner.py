@@ -42,10 +42,10 @@ class DWaveMiner(BaseMiner):
             **cfg: Additional configuration options (reserved for future use)
         """
         # Create sampler (encapsulates embedding internally)
+        # job_label_prefix will be auto-generated as "Quip_Z{m}_T{t}" by DWaveSamplerWrapper
         sampler = DWaveSamplerWrapper(
             topology=topology,
-            embedding_file=embedding_file,
-            job_label_prefix="QUIP_MINE"
+            embedding_file=embedding_file
         )
         super().__init__(miner_id, sampler, miner_type="QPU")
         self.miner_type = "QPU"
@@ -219,16 +219,23 @@ class DWaveMiner(BaseMiner):
                 h_cast = cast(Mapping[Any, float], h)
                 J_cast = cast(Mapping[Tuple[Any, Any], float], J)
 
+                # Generate job label with topology and nonce
+                # Format: Quip_Z{m}_T{t}_{nonce_hex}
+                topology_label = self.sampler.job_label  # e.g., "Quip_Z9_T2"
+                nonce_hex = hex(nonce)[2:][:8]  # First 8 hex chars of nonce
+                job_label = f"{topology_label}_{nonce_hex}"
+
                 sampleset = self.sampler.sample_ising(
                     h_cast, J_cast,
                     num_reads=num_reads,
                     answer_mode='raw',
-                    annealing_time=annealing_time
+                    annealing_time=annealing_time,
+                    label=job_label
                 )
                 sample_time = time.time() - sample_start
                 self.logger.debug(f"QPU sampling completed in {sample_time:.2f}s")
                 
-                # Estimate QPU timing components  
+                # Estimate QPU timing components
                 self.timing_stats['sampling'].append(sample_time * 1e6)  # Convert to microseconds
                 self.timing_stats['preprocessing'].append((time.time() - preprocess_start) * 1e6)
                 # Extract QPU timing information if available
@@ -238,6 +245,13 @@ class DWaveMiner(BaseMiner):
                         self.timing_stats['quantum_annealing_time'].append(
                             timing['qpu_anneal_time_per_sample']
                         )
+                    # Track total QPU access time (programming + sampling)
+                    qpu_programming = timing.get('qpu_programming_time', 0)
+                    qpu_sampling = timing.get('qpu_sampling_time', 0)
+                    qpu_total_access = qpu_programming + qpu_sampling
+                    if qpu_total_access > 0:
+                        self.timing_stats['qpu_access_time'].append(qpu_total_access)
+
                     if 'qpu_sampling_time' in timing:
                         self.timing_stats['sampling'].append(timing['qpu_sampling_time'])
                     if 'qpu_programming_time' in timing:
@@ -319,13 +333,13 @@ def adapt_parameters(
 
     # QPU annealing time range (microseconds)
     min_annealing_time = 5.0    # Easiest difficulty
-    max_annealing_time = 10.0   # Hardest difficulty
+    max_annealing_time = 20.0   # Hardest difficulty
 
     # Linear interpolation for annealing time
     annealing_time = min_annealing_time + difficulty * (max_annealing_time - min_annealing_time)
 
     # QPU read bonus range (added to min_solutions)
-    min_bonus = 16    # Easiest difficulty
+    min_bonus = 32    # Easiest difficulty
     max_bonus = 64    # Hardest difficulty
 
     # Linear interpolation for bonus reads

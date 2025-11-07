@@ -87,12 +87,13 @@ class CudaMiner(BaseMiner):
     This eliminates kernel launch overhead and enables high job throughput.
     """
 
-    def __init__(self, miner_id: str, device: str = "0", **cfg):
+    def __init__(self, miner_id: str, device: str = "0", topology=None, **cfg):
         """Initialize CUDA miner.
 
         Args:
             miner_id: Unique identifier for this miner
             device: CUDA device ID (default "0")
+            topology: Optional topology object (default: DEFAULT_TOPOLOGY)
             **cfg: Additional configuration parameters
         """
         # Set CUDA device BEFORE creating any CUDA objects
@@ -104,9 +105,10 @@ class CudaMiner(BaseMiner):
         except Exception as e:
             print(f"Warning: Failed to set CUDA device {device}: {e}")
 
-        # Get topology from DEFAULT_TOPOLOGY first (needed for BaseMiner)
-        self.nodes = list(DEFAULT_TOPOLOGY.graph.nodes)
-        self.edges = list(DEFAULT_TOPOLOGY.graph.edges)
+        # Get topology (use provided or default)
+        topology_obj = topology if topology is not None else DEFAULT_TOPOLOGY
+        self.nodes = list(topology_obj.graph.nodes)
+        self.edges = list(topology_obj.graph.edges)
 
         # Initialize persistent kernel with large ring buffer for batched mining
         self.kernel = CudaKernelRealSA(
@@ -121,19 +123,19 @@ class CudaMiner(BaseMiner):
         # Create a minimal sampler interface for BaseMiner
         # BaseMiner expects a sampler with nodes/edges attributes
         class SamplerInterface:
-            def __init__(self, nodes, edges):
+            def __init__(self, nodes, edges, properties):
                 self.nodes = nodes
                 self.edges = edges
                 self.nodelist = nodes
                 self.edgelist = edges
-                self.properties = {'topology': 'Advantage2'}
+                self.properties = properties
                 self.sampler_type = "cuda-persistent"
 
             def sample_ising(self, h, J, **kwargs):
                 """Dummy sample_ising - not used in CudaMiner."""
                 raise NotImplementedError("CudaMiner handles sampling directly")
 
-        minimal_sampler = SamplerInterface(self.nodes, self.edges)
+        minimal_sampler = SamplerInterface(self.nodes, self.edges, topology_obj.properties)
 
         # Initialize base miner (sets up logger, miner_id, etc.)
         super().__init__(miner_id, minimal_sampler)

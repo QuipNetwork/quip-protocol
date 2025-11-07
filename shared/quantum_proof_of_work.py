@@ -267,6 +267,7 @@ def _validate_topology_consistency(
     h: Dict[int, float],
     J: Dict[Tuple[int, int], float],
     nodes: List[int],
+    edges: Optional[List[Tuple[int, int]]] = None,
     allowed_h_values: Optional[List[float]] = None
 ) -> List[str]:
     """Validate that h, J parameters match expected topology and constraints.
@@ -275,6 +276,7 @@ def _validate_topology_consistency(
         h: Field parameters dictionary
         J: Coupling parameters dictionary
         nodes: List of node indices for the topology
+        edges: List of edges in the topology (if None, uses DEFAULT_TOPOLOGY edges)
         allowed_h_values: List of valid h values (default: any float)
                          Set to validate h values are in allowed set
 
@@ -283,19 +285,14 @@ def _validate_topology_consistency(
     """
     errors = []
 
-    # Get expected topology
-    expected_nodes = set(DEFAULT_TOPOLOGY.graph.nodes())
-    expected_edges = set(DEFAULT_TOPOLOGY.graph.edges())
+    # Use provided nodes
+    expected_nodes = set(nodes)
 
-    # 1. Validate nodes match topology
-    provided_nodes = set(nodes)
-    if provided_nodes != expected_nodes:
-        missing_nodes = expected_nodes - provided_nodes
-        extra_nodes = provided_nodes - expected_nodes
-        if missing_nodes:
-            errors.append(f"Missing topology nodes: {sorted(missing_nodes)}")
-        if extra_nodes:
-            errors.append(f"Extra nodes not in topology: {sorted(extra_nodes)}")
+    # Use provided edges or fall back to DEFAULT_TOPOLOGY
+    if edges is not None:
+        expected_edges = set(edges)
+    else:
+        expected_edges = set(DEFAULT_TOPOLOGY.graph.edges())
 
     # 2. Validate h parameters
     h_nodes = set(h.keys())
@@ -394,7 +391,7 @@ def validate_quantum_proof(quantum_proof, miner_id: str, requirements, block_ind
     invalid_count = 0
     
     for solution in solutions:
-        validation_result = validate_solution(solution, h, J, quantum_proof.nodes)
+        validation_result = validate_solution(solution, h, J, quantum_proof.nodes, quantum_proof.edges)
         if validation_result["valid"]:
             valid_solutions.append(solution)
         else:
@@ -430,15 +427,16 @@ def validate_quantum_proof(quantum_proof, miner_id: str, requirements, block_ind
     return True
 
 
-def validate_solution(spins: List[int], h: Dict[int, float], J: Dict[Tuple[int, int], float], nodes: List[int]) -> Dict[str, Any]:
+def validate_solution(spins: List[int], h: Dict[int, float], J: Dict[Tuple[int, int], float], nodes: List[int], edges: Optional[List[Tuple[int, int]]] = None) -> Dict[str, Any]:
     """Validate an Ising model solution for correctness.
-    
+
     Args:
         spins: Spin configuration as list of {-1, +1} values
         h: Field parameters dictionary
-        J: Coupling parameters dictionary  
+        J: Coupling parameters dictionary
         nodes: List of node indices for the topology
-        
+        edges: List of edges in the topology (optional, for validation)
+
     Returns:
         Dictionary with validation results including validity status and energy
     """
@@ -467,7 +465,7 @@ def validate_solution(spins: List[int], h: Dict[int, float], J: Dict[Tuple[int, 
         return result
     
     # 3. Validate topology consistency
-    topology_errors = _validate_topology_consistency(h, J, nodes)
+    topology_errors = _validate_topology_consistency(h, J, nodes, edges)
     if topology_errors:
         result["valid"] = False
         result["errors"].extend(topology_errors)
@@ -561,7 +559,7 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
                 solution_list = list(solution)
                 
                 # Validate solution format and correctness
-                validation_result = validate_solution(solution_list, h, J, nodes)
+                validation_result = validate_solution(solution_list, h, J, nodes, edges)
                 if validation_result["valid"]:
                     valid_solutions.append(solution_list)
                 else:
@@ -611,12 +609,9 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
             variable_order=nodes
         )
     except ValueError as e:
-        # Use a local logger since we don't have access to the miner's logger
-        local_logger = logging.getLogger(__name__)
-        local_logger.debug(f"Failed to meet requirements: {e}")
+        # Use module logger for consistency
+        logger.debug(f"Failed to meet requirements: {e}")
     finally:
-        # Use a local logger since we don't have access to the miner's logger
-        local_logger = logging.getLogger(__name__)
-        # Note: diversity is calculated from the BEST min_solutions subset, not all valid_solutions
-        local_logger.info(f"Mining attempt - Energy: {best_energy:.2f}, Valid: {len(valid_solutions)} (best {min_solutions} diversity: {diversity:.3f}) (requirements: energy<={difficulty_energy:.2f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
+        # Log every mining attempt (successful or not) for analysis
+        logger.info(f"Mining attempt - Energy: {best_energy:.0f}, Valid: {len(valid_solutions)} (best {min_solutions} diversity: {diversity:.3f}) (requirements: energy<={difficulty_energy:.0f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
     return result

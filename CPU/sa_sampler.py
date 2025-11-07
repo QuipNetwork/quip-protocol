@@ -10,11 +10,12 @@ import collections.abc
 Variable = collections.abc.Hashable
 class SimulatedAnnealingStructuredSampler(MockDWaveSampler):
     """Replace the MockSampler by an MCMC sampler with identical structure."""
-    
-    def __init__(self):
-        # Use the default topology (Advantage2) from quantum_proof_of_work
-        topology_graph = DEFAULT_TOPOLOGY.graph
-        properties = DEFAULT_TOPOLOGY.properties
+
+    def __init__(self, topology=None):
+        # Use provided topology or fall back to default
+        topology_obj = topology if topology is not None else DEFAULT_TOPOLOGY
+        topology_graph = topology_obj.graph
+        properties = topology_obj.properties
 
         substitute_sampler = SimulatedAnnealingSampler()
         nodelist = list(topology_graph.nodes())

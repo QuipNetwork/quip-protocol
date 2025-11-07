@@ -319,9 +319,12 @@ def main():
     # Initialize miners
     print("Initializing miners...")
     from CPU.sa_miner import SimulatedAnnealingMiner
+    from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
     from QPU.dwave_miner import DWaveMiner
 
-    cpu_miner = SimulatedAnnealingMiner(miner_id="qpu-test-cpu")
+    # Create CPU sampler with matching topology
+    cpu_sampler = SimulatedAnnealingStructuredSampler(topology=topology)
+    cpu_miner = SimulatedAnnealingMiner(miner_id="qpu-test-cpu", sampler=cpu_sampler)
     qpu_miner = DWaveMiner(miner_id="qpu-test-qpu", topology=topology, qpu_timeout=0.0)
 
     print("✅ CPU miner initialized")

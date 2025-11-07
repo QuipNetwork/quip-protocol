@@ -166,11 +166,12 @@ class DWaveSamplerWrapper:
         Sample from the D-Wave QPU with automatic job labeling.
 
         Automatically adds 'label' parameter for D-Wave dashboard visibility.
+        Caller can override by passing 'label' in kwargs.
 
         For embedded samplers, converts Ising to BQM explicitly to ensure
         correct variable labeling during unembedding.
         """
-        # Add job label if not already specified
+        # Add default job label if not already specified
         if 'label' not in kwargs:
             kwargs['label'] = self.job_label
 

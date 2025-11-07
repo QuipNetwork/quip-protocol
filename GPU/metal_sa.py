@@ -100,7 +100,7 @@ class MetalSASampler:
     Exactly mimics D-Wave's SimulatedAnnealingSampler implementation.
     """
 
-    def __init__(self):
+    def __init__(self, topology=None):
         self.logger = logging.getLogger(__name__)
         self.device = Metal.MTLCreateSystemDefaultDevice()
         if not self.device:
@@ -108,12 +108,13 @@ class MetalSASampler:
 
         # Set up topology for mining compatibility
         from dwave_topologies import DEFAULT_TOPOLOGY
-        topology_graph = DEFAULT_TOPOLOGY.graph
+        topology_obj = topology if topology is not None else DEFAULT_TOPOLOGY
+        topology_graph = topology_obj.graph
         self.nodes = list(topology_graph.nodes())
         self.edges = list(topology_graph.edges())
         self.nodelist = self.nodes
         self.edgelist = self.edges
-        self.properties = {'topology': 'Zephyr'}
+        self.properties = topology_obj.properties
 
         # Load Metal library
         kernel_path = os.path.join(os.path.dirname(__file__), "metal_kernels.metal")

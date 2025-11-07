@@ -49,10 +49,10 @@ def get_gpu_core_count() -> int:
 
 
 class MetalMiner(BaseMiner):
-    def __init__(self, miner_id: str, **cfg):
+    def __init__(self, miner_id: str, topology=None, **cfg):
         try:
             # Initialize base miner first to get the logger
-            sampler = MetalSASampler()
+            sampler = MetalSASampler(topology=topology)
             super().__init__(miner_id, sampler, miner_type="GPU-Metal")
             # Now update sampler with our logger
             sampler.logger = self.logger
@@ -61,7 +61,7 @@ class MetalMiner(BaseMiner):
             self.logger.info(f"Using MetalSASampler (Simulated Annealing)")
         except Exception as e:
             # For fallback case, we can't use logger yet since super().__init__() wasn't called
-            sampler = SimulatedAnnealingStructuredSampler()
+            sampler = SimulatedAnnealingStructuredSampler(topology=topology)
             super().__init__(miner_id, sampler, miner_type="CPU-FALLBACK")
             self.miner_type = "CPU-FALLBACK"
             # Now we can use logger

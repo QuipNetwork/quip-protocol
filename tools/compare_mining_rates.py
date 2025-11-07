@@ -121,6 +121,9 @@ def mine_continuous(
     start_time = time.time()
     duration_seconds = duration_minutes * 60
 
+    # QPU time tracking
+    total_qpu_time_us = 0.0  # Total QPU time in microseconds
+
     # Progress tracking
     last_progress_time = start_time
     progress_interval = 60  # Print progress every minute
@@ -180,13 +183,23 @@ def mine_continuous(
         if stop_event.is_set():
             break
 
+        # Track QPU time for this attempt (if available)
+        attempt_qpu_time_us = 0.0
+        if hasattr(miner, 'timing_stats') and 'qpu_access_time' in miner.timing_stats:
+            # Get the most recent QPU access time
+            if miner.timing_stats['qpu_access_time']:
+                attempt_qpu_time_us = miner.timing_stats['qpu_access_time'][-1]
+                total_qpu_time_us += attempt_qpu_time_us
+
         if result:
             blocks_found.append(result)
+            qpu_time_msg = f", QPU: {attempt_qpu_time_us / 1e6:.3f}s, Total QPU: {total_qpu_time_us / 1e6:.2f}s" if attempt_qpu_time_us > 0 else ""
             log(f"   ✅ Block {len(blocks_found)} found! "
                   f"Energy: {result.energy:.1f}, "
                   f"Time: {attempt_time:.1f}s, "
                   f"Diversity: {result.diversity:.3f}, "
-                  f"Solutions: {result.num_valid}")
+                  f"Solutions: {result.num_valid}"
+                  f"{qpu_time_msg}")
 
     total_time = time.time() - start_time
 
@@ -224,7 +237,12 @@ def mine_continuous(
             'max': max(mining_times) if mining_times else None,
             'mean': sum(mining_times) / len(mining_times) if mining_times else None,
             'all_times': mining_times
-        }
+        },
+        'qpu_time_stats': {
+            'total_qpu_time_us': total_qpu_time_us,
+            'total_qpu_time_seconds': total_qpu_time_us / 1e6,
+            'avg_qpu_time_per_attempt_us': total_qpu_time_us / attempts if attempts > 0 else 0
+        } if total_qpu_time_us > 0 else None
     }
 
     return stats
@@ -315,13 +333,13 @@ def main():
     miner = None
     if args.miner_type == 'cpu':
         from CPU.sa_miner import SimulatedAnnealingMiner
-        miner = SimulatedAnnealingMiner(miner_id="rate-test-cpu")
+        miner = SimulatedAnnealingMiner(miner_id="rate-test-cpu", topology=topology)
     elif args.miner_type == 'cuda':
         from GPU.cuda_miner import CudaMiner
-        miner = CudaMiner(miner_id="rate-test-cuda", device=args.device)
+        miner = CudaMiner(miner_id="rate-test-cuda", device=args.device, topology=topology)
     elif args.miner_type == 'metal':
         from GPU.metal_miner import MetalMiner
-        miner = MetalMiner(miner_id="rate-test-metal")
+        miner = MetalMiner(miner_id="rate-test-metal", topology=topology)
     elif args.miner_type == 'qpu':
         from QPU.dwave_miner import DWaveMiner
         miner = DWaveMiner(miner_id="rate-test-qpu", topology=topology, qpu_timeout=0.0)
@@ -382,6 +400,16 @@ def main():
             print(f"   Min: {stats['mining_time_stats']['min']:.1f}s")
             print(f"   Max: {stats['mining_time_stats']['max']:.1f}s")
             print(f"   Mean: {stats['mining_time_stats']['mean']:.1f}s")
+
+    # QPU time reporting
+    if stats.get('qpu_time_stats'):
+        qpu_stats = stats['qpu_time_stats']
+        print(f"\n🔮 QPU Time Usage:")
+        print(f"   Total QPU time: {qpu_stats['total_qpu_time_seconds']:.2f}s ({qpu_stats['total_qpu_time_us'] / 1e6:.6f}s)")
+        print(f"   Average per attempt: {qpu_stats['avg_qpu_time_per_attempt_us'] / 1e6:.4f}s")
+        if stats['total_blocks_found'] > 0:
+            qpu_time_per_block = qpu_stats['total_qpu_time_seconds'] / stats['total_blocks_found']
+            print(f"   Average per block found: {qpu_time_per_block:.2f}s")
 
     # Save results
     output_data = {

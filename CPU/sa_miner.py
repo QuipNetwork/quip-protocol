@@ -17,13 +17,14 @@ from shared.quantum_proof_of_work import generate_ising_model_from_nonce, ising_
 from shared.block_requirements import compute_current_requirements
 
 class SimulatedAnnealingMiner(BaseMiner):
-    def __init__(self, miner_id: str, **cfg):
-        sampler = SimulatedAnnealingStructuredSampler()
+    def __init__(self, miner_id: str, sampler=None, topology=None, **cfg):
+        if sampler is None:
+            sampler = SimulatedAnnealingStructuredSampler(topology=topology)
         self.nodes = sampler.nodes
         self.edges = sampler.edges
         super().__init__(miner_id, sampler)
         self.miner_type = "CPU"
-        
+
         # Register SIGTERM handler for graceful cleanup
         signal.signal(signal.SIGTERM, self._cleanup_handler)
     
