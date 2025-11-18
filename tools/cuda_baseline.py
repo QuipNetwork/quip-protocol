@@ -15,6 +15,7 @@ from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evalua
 from shared.block_requirements import BlockRequirements
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.embedded_topology import create_embedded_topology
+from dwave_topologies.topologies.json_loader import load_topology
 
 try:
     from GPU.cuda_kernel import CudaKernelRealSA
@@ -24,7 +25,7 @@ except ImportError:
     CUDA_AVAILABLE = False
 
 
-def cuda_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None, h_values=None, use_embedding=None):
+def cuda_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None, h_values=None, use_embedding=None, topology_path=None):
     """Test CUDA GPU performance using CudaSASamplerAsync.
 
     Args:
@@ -34,6 +35,7 @@ def cuda_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None, 
         h_values: List of allowed h field values
         use_embedding: If specified, use embedded hardware topology instead of perfect topology.
                       Format: "Z(9,2)" for Z(9,2) embedding
+        topology_path: Path to topology file (JSON or JSON.gz). Takes precedence over use_embedding.
     """
     if h_values is None:
         h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
@@ -71,7 +73,14 @@ def cuda_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None, 
         return None
 
     # Get topology
-    if use_embedding:
+    if topology_path:
+        print(f"📂 Loading topology from file: {topology_path}")
+        topology = load_topology(topology_path)
+        nodes = list(topology.graph.nodes) if hasattr(topology, 'graph') else topology.nodes
+        edges = list(topology.graph.edges) if hasattr(topology, 'graph') else topology.edges
+        topology_name = getattr(topology, 'solver_name', None) or getattr(topology, 'topology_shape', Path(topology_path).stem)
+        topology_desc = f"{topology_name} from file ({len(nodes)} nodes, {len(edges)} edges)"
+    elif use_embedding:
         print(f"🔗 Using embedded hardware topology: {use_embedding}")
         embedded_topo = create_embedded_topology(use_embedding)
         nodes = embedded_topo.nodes
@@ -390,6 +399,13 @@ def main():
         type=str,
         help='Use embedded hardware topology instead of perfect topology (e.g., "Z(9,2)")'
     )
+    parser.add_argument(
+        '--topology',
+        type=str,
+        help='Topology to use. Can be: file path (e.g., "dwave_topologies/topologies/advantage2_system1_7.json.gz"), '
+             'hardware name (e.g., "Advantage2_system1.7"), or Zephyr format (e.g., "Z(12,4)"). '
+             'Takes precedence over --embedding.'
+    )
     args = parser.parse_args()
 
     # Parse h_values
@@ -417,7 +433,8 @@ def main():
         output_file=output_file,
         only_label=only_label,
         h_values=h_values,
-        use_embedding=args.embedding
+        use_embedding=args.embedding,
+        topology_path=args.topology
     )
 
     print(f"\n✅ CUDA baseline test complete!")
