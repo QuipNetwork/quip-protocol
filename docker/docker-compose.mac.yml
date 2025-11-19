@@ -1,0 +1,38 @@
+version: '3.8'
+
+# NOTE: Docker on macOS has limited Metal framework access
+# For production deployment on AWS EC2 Mac instances,
+# running directly on the host (without Docker) is recommended.
+# See aws/user_data_metal.sh for direct deployment.
+
+services:
+  # Metal miner service (macOS with Apple Silicon only)
+  metal-miner:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.metal
+      platform: linux/arm64
+    image: quip-protocol/metal-miner:latest
+    container_name: quip-metal-miner
+    platform: linux/arm64
+    environment:
+      - MINING_DURATION=${MINING_DURATION:-30m}
+      - DIFFICULTY_ENERGY=${DIFFICULTY_ENERGY:--14900}
+      - MIN_DIVERSITY=${MIN_DIVERSITY:-0.1}
+      - MIN_SOLUTIONS=${MIN_SOLUTIONS:-5}
+      - TOPOLOGY_FILE=${TOPOLOGY_FILE:-dwave_topologies/topologies/advantage2_system1_7.json.gz}
+      - S3_BUCKET=${S3_BUCKET:-}
+    volumes:
+      - ./output:/output
+      - ../dwave_topologies:/app/dwave_topologies:ro
+    restart: "no"
+    networks:
+      - quip-network
+
+networks:
+  quip-network:
+    driver: bridge
+
+volumes:
+  output:
+    driver: local
