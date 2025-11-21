@@ -1,6 +1,26 @@
 # AWS Deployment Guide - Quip Protocol Mining Experiments
 
-This guide provides comprehensive instructions for deploying large-scale mining rate comparison experiments across ~100 AWS EC2 instances.
+This guide provides comprehensive instructions for deploying large-scale mining rate comparison experiments.
+
+## 🚀 Quick Start
+
+**Run a 5-second test:**
+```bash
+export MINING_DURATION="5s" && ./aws/launch_all_fleets.sh
+```
+
+**Run a 1-hour test:**
+```bash
+export MINING_DURATION="1h" && ./aws/launch_all_fleets.sh
+```
+
+**Default Fleet Configuration:**
+- 60 H100 GPUs (8× p5.48xlarge)
+- 45 CPU instances (c6a.2xlarge)
+- 10 Mac Metal instances (auto-reuse)
+- 1 QPU (run locally)
+
+**Results:** Automatically collected with comparative performance graphs!
 
 ## Table of Contents
 
@@ -143,6 +163,102 @@ PUSH_TO_REGISTRY=1 \
 ---
 
 ## Quick Start
+
+### Master Deployment Script (Recommended)
+
+The `launch_all_fleets.sh` script orchestrates deployment of all hardware types in one command.
+
+**Default Configuration:**
+- **60 H100 GPUs** (8× p5.48xlarge instances @ 8 GPUs each)
+- **45 CPU instances** (c6a.2xlarge)
+- **10 Mac Metal instances** (mac2-m2.metal) - Reuses existing if available
+- **1 QPU** (run locally with D-Wave credentials)
+
+#### Quick 5-Second Test
+
+```bash
+# Set test duration
+export MINING_DURATION="5s"
+export DIFFICULTY_ENERGY="-14900"
+
+# Launch all fleets
+./launch_all_fleets.sh
+```
+
+#### Quick 1-Hour Test
+
+```bash
+# Set test duration
+export MINING_DURATION="1h"
+export DIFFICULTY_ENERGY="-14900"
+
+# Launch all fleets
+./launch_all_fleets.sh
+```
+
+#### What the Master Script Does
+
+1. **Setup S3 and IAM** - Creates bucket and roles automatically
+2. **Launch H100 Fleet** - 8× p5.48xlarge with spot pricing
+3. **Launch CPU Fleet** - 45× c6a.2xlarge with spot pricing
+4. **Check for Mac Instances** - Reuses existing to avoid 24h billing
+5. **Provides QPU Instructions** - Run locally with your D-Wave token
+
+**Mac Instance Reuse:**
+- Script automatically detects existing Mac instances
+- Provides SSH commands to trigger mining on existing instances
+- Only launches new Mac instances if needed (with confirmation)
+
+#### Run QPU Locally
+
+```bash
+source venv/bin/activate
+
+python tools/compare_mining_rates.py \
+  --miner-type qpu \
+  --difficulty-energy -14900 \
+  --duration 5s \
+  --topology dwave_topologies/topologies/advantage2_system1_7.json.gz \
+  --output docker/output/qpu_results.json
+
+aws s3 cp docker/output/qpu_results.json s3://quip-mining-results-$EXPERIMENT_ID/qpu/
+```
+
+#### Collect Results & Generate Visualizations
+
+```bash
+export S3_BUCKET="quip-mining-results-$EXPERIMENT_ID"
+./collect_results.sh
+```
+
+The script automatically:
+- Downloads all JSON/log files from S3
+- Generates summary statistics
+- Creates CSV export
+- **Generates comparative performance graphs (PDF)**
+- Opens the visualization
+
+**Output:** `./results/performance_comparison_$EXPERIMENT_ID.pdf`
+
+#### Cost Estimates
+
+**5-Second Test:**
+- H100 (spot): ~$0.11
+- CPU (spot): ~$0.00
+- **Total: ~$0.11** (after Mac initial cost)
+
+**1-Hour Test:**
+- H100 (spot): ~$392
+- CPU (spot): ~$4.59
+- **Total: ~$397** (after Mac initial cost)
+
+**Mac Initial Cost:** ~$400 for 24h (can run multiple tests!)
+
+---
+
+### Individual Fleet Deployment (Advanced)
+
+For more control, launch fleets individually:
 
 ### 1. Setup S3 Bucket and IAM Roles
 

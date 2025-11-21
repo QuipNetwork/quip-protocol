@@ -11,7 +11,8 @@ NC='\033[0m' # No Color
 
 # Configuration
 EXPERIMENT_ID="${EXPERIMENT_ID:-exp_$(date +%Y%m%d_%H%M%S)}"
-BUCKET_NAME="${BUCKET_NAME:-quip-mining-results-${EXPERIMENT_ID}}"
+# S3 bucket names cannot contain underscores - convert to hyphens
+BUCKET_NAME="${BUCKET_NAME:-quip-mining-results-${EXPERIMENT_ID//_/-}}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 
 echo -e "${BLUE}========================================${NC}"
@@ -39,16 +40,18 @@ fi
 # Create S3 bucket
 echo -e "${GREEN}Creating S3 bucket: $BUCKET_NAME${NC}"
 if [ "$AWS_REGION" == "us-east-1" ]; then
-    aws s3 mb "s3://$BUCKET_NAME" --region "$AWS_REGION"
+    aws s3api create-bucket --bucket "$BUCKET_NAME" --region "$AWS_REGION" 2>&1 | grep -v "BucketAlreadyOwnedByYou" || true
 else
-    aws s3 mb "s3://$BUCKET_NAME" --region "$AWS_REGION" \
-      --create-bucket-configuration LocationConstraint="$AWS_REGION"
+    aws s3api create-bucket --bucket "$BUCKET_NAME" --region "$AWS_REGION" \
+      --create-bucket-configuration LocationConstraint="$AWS_REGION" 2>&1 | grep -v "BucketAlreadyOwnedByYou" || true
 fi
 
-if [ $? -eq 0 ]; then
-    echo -e "${GREEN}✓ Bucket created successfully${NC}"
+# Check if bucket exists (either just created or already existed)
+if aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+    echo -e "${GREEN}✓ Bucket ready: $BUCKET_NAME${NC}"
 else
-    echo -e "${YELLOW}Warning: Bucket may already exist or creation failed${NC}"
+    echo -e "${RED}Error: Bucket creation failed${NC}"
+    exit 1
 fi
 echo ""
 
@@ -74,8 +77,9 @@ cat > /tmp/lifecycle-policy.json <<EOF
 {
   "Rules": [
     {
-      "Id": "ArchiveOldResults",
+      "ID": "ArchiveOldResults",
       "Status": "Enabled",
+      "Prefix": "",
       "Transitions": [
         {
           "Days": 90,

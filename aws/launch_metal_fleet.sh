@@ -12,7 +12,7 @@ NC='\033[0m' # No Color
 # Configuration
 EXPERIMENT_ID="${EXPERIMENT_ID:-exp_$(date +%Y%m%d_%H%M%S)}"
 FLEET_SIZE="${FLEET_SIZE:-10}"  # Note: Mac instances are expensive, default smaller
-INSTANCE_TYPE="${INSTANCE_TYPE:-mac2-m2.metal}"  # M2 with 10 GPU cores
+INSTANCE_TYPE="${INSTANCE_TYPE:-mac-m4.metal}"  # M4 with GPU cores
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AMI_ID="${AMI_ID:-}"  # Auto-detect macOS AMI
 KEY_NAME="${KEY_NAME:-}"  # SSH key name (recommended for debugging)
@@ -60,10 +60,20 @@ case $INSTANCE_TYPE in
         GPU_CORES=19
         CHIP="M2 Pro"
         ;;
-    *)
-        HOURLY_COST=0.6695
+    mac-m4.metal)
+        HOURLY_COST=0.90
         GPU_CORES=10
-        CHIP="M2"
+        CHIP="M4"
+        ;;
+    mac-m4pro.metal)
+        HOURLY_COST=1.20
+        GPU_CORES=16
+        CHIP="M4 Pro"
+        ;;
+    *)
+        HOURLY_COST=0.90
+        GPU_CORES=10
+        CHIP="M4"
         ;;
 esac
 
@@ -118,7 +128,7 @@ if [ -z "$SECURITY_GROUP" ]; then
         --group-name "$SG_NAME" \
         --description "Security group for Quip Metal mining experiment $EXPERIMENT_ID" \
         --vpc-id "$VPC_ID" \
-        --output text 2>&1 | grep -o 'sg-[a-z0-9]*' || true)
+        --output text 2>&1 | grep -o 'sg-[a-z0-9]*' | head -n1 || true)
 
     if [ -n "$SECURITY_GROUP" ]; then
         # Allow SSH (for debugging)

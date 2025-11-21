@@ -77,7 +77,7 @@ if [ -z "$SECURITY_GROUP" ]; then
         --group-name "$SG_NAME" \
         --description "Security group for Quip CPU mining experiment $EXPERIMENT_ID" \
         --vpc-id "$VPC_ID" \
-        --output text 2>&1 | grep -o 'sg-[a-z0-9]*' || true)
+        --output text 2>&1 | grep -o 'sg-[a-z0-9]*' | head -n1 || true)
 
     if [ -n "$SECURITY_GROUP" ]; then
         # Allow outbound traffic (needed for Docker pull, S3 upload)

@@ -23,6 +23,7 @@ COPY README.md ./
 COPY LICENSE ./
 COPY blockchain_base.py ./
 COPY CPU/ ./CPU/
+COPY shared/ ./shared/
 COPY tools/ ./tools/
 COPY dwave_topologies/ ./dwave_topologies/
 

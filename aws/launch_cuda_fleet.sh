@@ -79,7 +79,7 @@ if [ -z "$SECURITY_GROUP" ]; then
         --group-name "$SG_NAME" \
         --description "Security group for Quip CUDA mining experiment $EXPERIMENT_ID" \
         --vpc-id "$VPC_ID" \
-        --output text 2>&1 | grep -o 'sg-[a-z0-9]*' || true)
+        --output text 2>&1 | grep -o 'sg-[a-z0-9]*' | head -n1 || true)
 
     if [ -n "$SECURITY_GROUP" ]; then
         # Allow outbound traffic
@@ -194,7 +194,7 @@ if [ "$USE_SPOT" == "true" ]; then
             \"BlockDeviceMappings\": [{
                 \"DeviceName\": \"/dev/sda1\",
                 \"Ebs\": {
-                    \"VolumeSize\": 30,
+                    \"VolumeSize\": 100,
                     \"VolumeType\": \"gp3\",
                     \"DeleteOnTermination\": true
                 }
@@ -217,7 +217,7 @@ else
         --iam-instance-profile "Name=$IAM_ROLE_NAME" \
         --user-data "$USER_DATA" \
         --count "$FLEET_SIZE" \
-        --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":30,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
+        --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":100,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=quip-cuda-miner-$EXPERIMENT_ID},{Key=Experiment,Value=$EXPERIMENT_ID},{Key=MinerType,Value=cuda}]" \
         --query 'Instances[].InstanceId' \
         --output text)

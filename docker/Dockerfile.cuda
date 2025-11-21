@@ -1,6 +1,6 @@
 # Dockerfile for CUDA-based mining comparison
-# NVIDIA CUDA 13.2 with Ubuntu 22.04 for amd64 architecture
-FROM nvidia/cuda:13.2.0-devel-ubuntu22.04
+# NVIDIA CUDA 12.2 with Ubuntu 22.04 for amd64 architecture
+FROM nvidia/cuda:12.2.0-devel-ubuntu22.04
 
 LABEL maintainer="Quip Protocol"
 LABEL description="CUDA GPU miner for quantum blockchain mining rate comparison"
@@ -41,13 +41,14 @@ COPY README.md ./
 COPY LICENSE ./
 COPY blockchain_base.py ./
 COPY GPU/ ./GPU/
+COPY shared/ ./shared/
 COPY tools/ ./tools/
 COPY dwave_topologies/ ./dwave_topologies/
 
-# Install Python dependencies including CuPy for CUDA 13.x
+# Install Python dependencies including CuPy for CUDA 12.x
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir \
-    "cupy-cuda13x>=13.0.0" \
+    pip install --no-cache-dir --ignore-installed \
+    "cupy-cuda12x>=12.0.0" \
     "dwave-ocean-sdk>=6.0.0" \
     "numpy>=1.24.0" \
     "matplotlib>=3.6.0" \

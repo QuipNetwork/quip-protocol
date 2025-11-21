@@ -1,3 +1,6 @@
+Copyright (C) 2025 Postquant Labs
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, version 3. This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details. You should have received a copy of the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 # Quantum Proof-of-Work Blockchain Implementation
 
 This project implements a quantum blockchain using quantum annealing for proof-of-work consensus. It features competitive mining between quantum computers (QPU) and classical simulated annealing (SA) with a dynamic difficulty adjustment mechanism.
@@ -5,6 +8,7 @@ This project implements a quantum blockchain using quantum annealing for proof-o
 ## Overview
 
 The blockchain demonstrates:
+
 - **Quantum Annealing PoW**: Using Ising model optimization as the mining puzzle
 - **Competitive Mining**: Multiple miners (QPU and SA) compete to mine blocks
 - **Multi-Miner Support**: Configure any number of QPU and SA miners
@@ -16,16 +20,19 @@ The blockchain demonstrates:
 ## Setup
 
 1. Create and activate a virtual environment (Python 3.10+):
+
    ```bash
    python3 -m venv .quip
    source .quip/bin/activate  # Windows: .venv\Scripts\activate
    ```
 
 2. Install the package in editable mode:
+
    ```bash
    pip install -U pip setuptools wheel
    pip install -e .
    ```
+
    This will install all dependencies from pyproject.toml and register console scripts.
 
 3. Set up D-Wave API credentials (optional, for QPU access):
@@ -189,6 +196,7 @@ WantedBy=multi-user.target
 ### Installation Steps
 
 1. **Create directories and user**:
+
    ```bash
    sudo mkdir -p /etc/quip.network
    sudo mkdir -p /var/log/quip.network
@@ -198,22 +206,24 @@ WantedBy=multi-user.target
    ```
 
 2. **Install Python virtual environment**:
+
    ```bash
    # Create virtual environment at /opt/quip
    sudo -u quip python3 -m venv /opt/quip
-   
+
    # Install quip-protocol in the virtual environment (includes all dependencies)
    sudo -u quip /opt/quip/bin/pip install -U pip setuptools wheel
    cd /path/to/quip-protocol
    sudo cp -r . /opt/quip/src
    sudo chown -R quip:quip /opt/quip/src
    sudo -u quip /opt/quip/bin/pip install -e /opt/quip/src
-   
+
    # Note: Replace /path/to/quip-protocol with actual path to your source code
    # The pip install -e command will automatically install all dependencies from pyproject.toml
    ```
 
 3. **Copy and configure**:
+
    ```bash
    sudo cp quip-node.example.toml /etc/quip.network/config.toml
    sudo chown quip:quip /etc/quip.network/config.toml
@@ -223,6 +233,7 @@ WantedBy=multi-user.target
    ```
 
 4. **Install and enable service**:
+
    ```bash
    sudo cp quip-network-node.service /etc/systemd/system/
    sudo systemctl daemon-reload
@@ -299,20 +310,22 @@ The systemd service provides production-ready deployment with automatic restarts
 Use these to test blockchain mining in an isolated single-node network on different platforms.
 
 # CPU node
+
 ```
-quip-network-node cpu --listen 127.0.0.1 --port 8085 --public-host 127.0.0.1:8085 --auto-mine --peer 127.0.0.1:8085 --genesis-config genesis_block_public.json  
+quip-network-node cpu --listen 127.0.0.1 --port 8085 --public-host 127.0.0.1:8085 --auto-mine --peer 127.0.0.1:8085 --genesis-config genesis_block_public.json
 ```
 
 # GPU node (CUDA)
+
 ```
-quip-network-node gpu --listen 127.0.0.1 --port 8085 --public-host 127.0.0.1:8085 --auto-mine --peer 127.0.0.1:8085 --gpu-backend local --genesis-config genesis_block_public.json  
+quip-network-node gpu --listen 127.0.0.1 --port 8085 --public-host 127.0.0.1:8085 --auto-mine --peer 127.0.0.1:8085 --gpu-backend local --genesis-config genesis_block_public.json
 ```
 
 # Mac Metal node
-```
-quip-network-node gpu --listen 127.0.0.1 --port 8085 --public-host 127.0.0.1:8085 --auto-mine --peer 127.0.0.1:8085 --gpu-backend mps --genesis-config genesis_block_public.json  
-```
 
+```
+quip-network-node gpu --listen 127.0.0.1 --port 8085 --public-host 127.0.0.1:8085 --auto-mine --peer 127.0.0.1:8085 --gpu-backend mps --genesis-config genesis_block_public.json
+```
 
 ### Run the Quantum Blockchain Demo
 
@@ -331,6 +344,7 @@ python quantum_blockchain.py
 ```
 
 Parameters:
+
 - `--competitive`: Enable competitive mining mode
 - `--num-qpu N`: Number of QPU miners (default: 1)
 - `--num-sa N`: Number of SA miners (default: 1)
@@ -362,11 +376,13 @@ Generates comprehensive benchmarks comparing QPU vs SA performance:
 ### Core Concepts
 
 1. **Ising Model Generation**: Each block generates a unique Ising problem based on:
+
    - Block header hash
    - Mining nonce
    - Deterministic random seed
 
 2. **Solution Requirements**:
+
    - **Energy Threshold**: Solutions must have energy < difficulty_energy
    - **Solution Diversity**: Multiple solutions with minimum Hamming distance
    - **Minimum Solutions**: At least N valid solutions required
@@ -395,6 +411,7 @@ New Winner → HARDER
 ```
 
 This mechanism:
+
 - Starts with QPU-favorable difficulty
 - Makes mining easier for consecutive winners
 - Immediately hardens when a new miner wins
@@ -407,6 +424,7 @@ The inverted difficulty mechanism produces balanced mining distribution:
 ![Blockchain Mining Results](benchmarks/blockchain_benchmark_comprehensive.png)
 
 Key outcomes:
+
 - **QPU**: ~70% of blocks (leverages quantum advantage initially)
 - **SA**: ~30% of blocks (catches up as difficulty eases)
 - **Streak Rewards**: Up to 5x multiplier for consecutive wins
@@ -417,6 +435,7 @@ Key outcomes:
 ## Technical Parameters
 
 ### Shared Mining Parameters
+
 ```python
 base_difficulty_energy = -1150  # Energy threshold
 min_diversity = 0.45           # Solution diversity requirement
@@ -424,11 +443,13 @@ min_solutions = 15             # Minimum valid solutions
 ```
 
 ### Miner-Specific Settings
+
 - **QPU**: Uses D-Wave quantum processor (when available)
 - **SA**: num_sweeps=4096 for optimal performance
 - **Both**: 64 reads per mining attempt
 
 ### Difficulty Adjustment
+
 ```python
 energy_adjustment_rate = 0.10  # 10% change per streak level
 max_streak_multiplier = 5      # Maximum reward multiplier
@@ -449,12 +470,14 @@ The blockchain supports GPU-accelerated mining using Modal Labs cloud infrastruc
 ### GPU Mining Setup
 
 1. **Install Modal** (includes $30/month free credits):
+
    ```bash
    pip install modal
    modal token new  # Opens browser for authentication
    ```
 
 2. **Run GPU Miners**:
+
    ```bash
    # Single GPU miner (T4)
    python quantum_blockchain.py --competitive --num-gpu 1 --blocks 10
@@ -468,11 +491,11 @@ The blockchain supports GPU-accelerated mining using Modal Labs cloud infrastruc
 
 ### GPU Types and Performance
 
-| GPU Type | Cost/Hour | Performance vs SA | Best Use Case |
-|----------|-----------|-------------------|---------------|
+| GPU Type | Cost/Hour | Performance vs SA | Best Use Case         |
+| -------- | --------- | ----------------- | --------------------- |
 | T4       | ~$0.10    | 3x faster         | Cost-conscious mining |
-| A10G     | ~$0.30    | 8x faster         | Balanced performance |
-| A100     | ~$1.00    | 25x faster        | Maximum performance |
+| A10G     | ~$0.30    | 8x faster         | Balanced performance  |
+| A100     | ~$1.00    | 25x faster        | Maximum performance   |
 
 ### GPU Mining Features
 
@@ -485,6 +508,7 @@ The blockchain supports GPU-accelerated mining using Modal Labs cloud infrastruc
 ### GPU Benchmarking
 
 Run standalone GPU benchmarks:
+
 ```bash
 modal run benchmarks/gpu_benchmark_modal.py
 ```
@@ -506,16 +530,19 @@ The blockchain now includes a peer-to-peer networking layer that enables nodes t
 ### P2P Quick Start
 
 1. **Install P2P Dependencies**:
+
    ```bash
    pip install aiohttp
    ```
 
 2. **Start Bootstrap Node**:
+
    ```bash
    python quantum_blockchain_p2p.py --port 8080 --competitive --num-sa 2
    ```
 
 3. **Join Network**:
+
    ```bash
    # Connect to bootstrap node
    python quantum_blockchain_p2p.py --port 8081 --peer localhost:8080 --competitive --num-sa 2
@@ -577,6 +604,7 @@ python CPU/cpu_miner.py --id 2 --port 8081 --peer localhost:8080 --num-sweeps 81
 ```
 
 Options:
+
 - `--num-sweeps N`: Annealing sweeps (default: 4096)
 
 ### GPU Miner
@@ -594,6 +622,7 @@ python GPU/gpu_miner.py --id 2 --port 8081 --peer localhost:8080 --gpu-type a10g
 ```
 
 Options:
+
 - `--gpu-type TYPE`: GPU type - t4, a10g, a100 (default: t4)
 - `--num-sweeps N`: Annealing sweeps (default: 512)
 
@@ -648,6 +677,7 @@ python QPU/qpu_miner.py --id 1 --port 8084 --peer localhost:8080
 ### Common Miner Options
 
 All miners support:
+
 - `--id N`: Node ID (default: 1)
 - `--host HOST`: Bind address (default: 0.0.0.0)
 - `--port PORT`: Listen port (default: 8080)
@@ -657,6 +687,7 @@ All miners support:
 ### Mining Parameters
 
 All miners use the same difficulty parameters:
+
 ```python
 difficulty_energy = -15500.0  # Energy threshold
 min_diversity = 0.46         # Solution diversity
@@ -670,28 +701,31 @@ The network nodes support TLS encryption for secure communication between peers.
 ### Quick Setup with Let's Encrypt (Certbot)
 
 1. **Install Certbot** (for domain-based certificates):
+
    ```bash
    # Ubuntu/Debian
    sudo apt update && sudo apt install certbot
-   
+
    # CentOS/RHEL
    sudo yum install certbot
-   
+
    # macOS
    brew install certbot
    ```
 
 2. **Obtain TLS Certificates**:
+
    ```bash
    # Replace with your actual domain
    sudo certbot certonly --standalone -d your-node.example.com
-   
+
    # Certificates will be saved to:
    # Certificate: /etc/letsencrypt/live/your-node.example.com/fullchain.pem
    # Private Key: /etc/letsencrypt/live/your-node.example.com/privkey.pem
    ```
 
 3. **Configure TLS in TOML**:
+
    ```toml
    [global]
    node_name = "Secure Node"
@@ -738,6 +772,7 @@ peer = "https://secure-node.example.com:20049"
 ### Security Features
 
 The TLS implementation uses modern security standards:
+
 - **TLS 1.3 only**: Ensures forward secrecy and latest security features
 - **Strong cipher suites**: ECDHE+AESGCM, ECDHE+CHACHA20, DHE+AESGCM, DHE+CHACHA20
 - **Perfect Forward Secrecy**: Ephemeral key exchange protects past communications

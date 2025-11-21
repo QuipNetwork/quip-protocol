@@ -234,4 +234,47 @@ echo -e "${YELLOW}Next Steps:${NC}"
 echo "1. Review summary statistics in $SUMMARY_FILE"
 echo "2. Analyze individual results in $OUTPUT_DIR/{cpu,cuda,metal}/"
 echo "3. Import CSV into spreadsheet or analysis tools"
-echo "4. Generate visualizations with custom scripts"
+
+# ====================
+# Generate Visualizations
+# ====================
+echo ""
+echo -e "${GREEN}Generating visualizations...${NC}"
+
+# Find one representative JSON file from each miner type
+CPU_JSON=$(find "$OUTPUT_DIR/cpu" -name "*.json" 2>/dev/null | head -n1)
+CUDA_JSON=$(find "$OUTPUT_DIR/cuda" -name "*.json" 2>/dev/null | head -n1)
+METAL_JSON=$(find "$OUTPUT_DIR/metal" -name "*.json" 2>/dev/null | head -n1)
+QPU_JSON=$(find "$OUTPUT_DIR/qpu" -name "*.json" 2>/dev/null | head -n1)
+
+# Build visualization command
+VIZ_CMD="python tools/visualize_comparative_performance.py"
+VIZ_ARGS=""
+
+[ -n "$CPU_JSON" ] && VIZ_ARGS="$VIZ_ARGS --cpu-mining \"$CPU_JSON\""
+[ -n "$CUDA_JSON" ] && VIZ_ARGS="$VIZ_ARGS --cuda-mining \"$CUDA_JSON\""
+[ -n "$METAL_JSON" ] && VIZ_ARGS="$VIZ_ARGS --metal-mining \"$METAL_JSON\""
+[ -n "$QPU_JSON" ] && VIZ_ARGS="$VIZ_ARGS --qpu-mining \"$QPU_JSON\""
+
+VIZ_OUTPUT="$OUTPUT_DIR/performance_comparison_${EXPERIMENT_ID:-all}.pdf"
+VIZ_ARGS="$VIZ_ARGS --output \"$VIZ_OUTPUT\""
+
+if [ -n "$CPU_JSON" ] || [ -n "$CUDA_JSON" ] || [ -n "$METAL_JSON" ] || [ -n "$QPU_JSON" ]; then
+    echo -e "${BLUE}Running: $VIZ_CMD $VIZ_ARGS${NC}"
+    eval "$VIZ_CMD $VIZ_ARGS" 2>&1 | grep -E "(✅|❌|Error)" || true
+
+    if [ -f "$VIZ_OUTPUT" ]; then
+        echo -e "${GREEN}✓ Visualization saved to: $VIZ_OUTPUT${NC}"
+        echo ""
+        echo -e "${GREEN}Opening visualization...${NC}"
+        open "$VIZ_OUTPUT" 2>/dev/null || echo "  (Use: open $VIZ_OUTPUT)"
+    else
+        echo -e "${YELLOW}⚠️  Visualization generation failed${NC}"
+        echo "  Install required dependencies: pip install matplotlib seaborn pandas numpy"
+    fi
+else
+    echo -e "${YELLOW}⚠️  No JSON files found for visualization${NC}"
+fi
+
+echo ""
+echo "4. View visualization: $VIZ_OUTPUT"

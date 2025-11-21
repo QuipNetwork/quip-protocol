@@ -1,26 +1,26 @@
+# Copyright (C) 2025 Postquant Labs
+# This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, version 3. This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details. You should have received a copy of the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
 """Base classes and utilities for quantum blockchain miners."""
 
 import asyncio
-from blake3 import blake3
-import time
 import logging
 import random
 import sys
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-import numpy as np
-from quantum_blockchain_network import P2PNode, Message
-from shared.quantum_proof_of_work import (
-    calculate_hamming_distance,
-    calculate_diversity,
-    select_diverse_solutions,
-)
 
-from shared.block_signer import BlockSigner
-from shared.time_utils import utc_timestamp_float
+import numpy as np
+from blake3 import blake3
 from dwave.samplers import SimulatedAnnealingSampler
 from dwave.system import DWaveSampler
 from dwave.system.testing import MockDWaveSampler
+from quantum_blockchain_network import Message, P2PNode
+from shared.block_signer import BlockSigner
+from shared.quantum_proof_of_work import (calculate_diversity,
+                                          calculate_hamming_distance,
+                                          select_diverse_solutions)
+from shared.time_utils import utc_timestamp_float
 
 logger = logging.getLogger(__name__)
 
