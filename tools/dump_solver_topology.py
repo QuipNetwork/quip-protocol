@@ -221,8 +221,39 @@ def list_available_solvers(region: Optional[str] = None) -> List[str]:
         return []
 
 
+def generate_python_module(solver_info: Dict[str, Any], json_filename: str) -> str:
+    """Generate Python module content for the topology."""
+    solver_name = solver_info['solver_name']
+    module_name = normalize_solver_name(solver_name)
+    constant_name = normalize_constant_name(solver_name)
+
+    content = f'''"""
+D-Wave {solver_name} topology definition.
+
+Loaded from static JSON file ({json_filename}).
+This is the real {solver_name} solver topology with defects.
+
+Topology Information:
+- Solver: {solver_name}
+- Type: {solver_info['topology_type']}
+- Shape: {solver_info['topology_shape']}
+- Nodes: {solver_info['num_nodes']}
+- Edges: {solver_info['num_edges']}
+"""
+
+from .json_loader import load_json_topology
+
+# Load topology from JSON file
+_json_topology = load_json_topology('{json_filename}')
+
+# Export the topology instance directly
+{constant_name}_TOPOLOGY = _json_topology
+'''
+    return content
+
+
 def dump_solver_topology(solver_name: str, output_dir: str = "dwave_topologies/topologies", use_gzip: bool = True, region: Optional[str] = None) -> bool:
-    """Dump a single solver topology to a JSON file (optionally gzipped)."""
+    """Dump a single solver topology to a JSON file (optionally gzipped) and generate Python module."""
     # Extract solver information
     solver_info = extract_solver_info(solver_name, region=region)
     if not solver_info:
@@ -234,33 +265,47 @@ def dump_solver_topology(solver_name: str, output_dir: str = "dwave_topologies/t
 
     # Generate filename
     module_name = normalize_solver_name(solver_name)
-    filename = f"{module_name}.json"
+    json_filename = f"{module_name}.json"
     if use_gzip:
-        filename += ".gz"
-    filepath = output_path / filename
+        json_filename += ".gz"
+    json_filepath = output_path / json_filename
 
     # Generate JSON content
     topology_json = generate_topology_json(solver_info)
 
-    # Write file
+    # Write JSON file
     try:
         if use_gzip:
-            with gzip.open(filepath, 'wt', encoding='utf-8') as f:
+            with gzip.open(json_filepath, 'wt', encoding='utf-8') as f:
                 json.dump(topology_json, f, indent=2)
         else:
-            with open(filepath, 'w', encoding='utf-8') as f:
+            with open(json_filepath, 'w', encoding='utf-8') as f:
                 json.dump(topology_json, f, indent=2)
 
-        file_size = filepath.stat().st_size
+        file_size = json_filepath.stat().st_size
         size_str = f"{file_size / 1024:.1f} KB" if file_size < 1024 * 1024 else f"{file_size / (1024 * 1024):.1f} MB"
 
-        print(f"✅ Topology saved to: {filepath} ({size_str})")
-        print(f"   Load with: from dwave_topologies.topologies.json_loader import load_json_topology")
-        print(f"              topology = load_json_topology('{filename}')")
+        print(f"   JSON saved to: {json_filepath} ({size_str})")
+
+    except Exception as e:
+        print(f"   Failed to write JSON file {json_filepath}: {e}")
+        return False
+
+    # Generate and write Python module
+    py_filename = f"{module_name}.py"
+    py_filepath = output_path / py_filename
+
+    try:
+        py_content = generate_python_module(solver_info, json_filename)
+        with open(py_filepath, 'w', encoding='utf-8') as f:
+            f.write(py_content)
+
+        print(f"   Python module saved to: {py_filepath}")
+        print(f"   Import with: from dwave_topologies.topologies.{module_name} import {normalize_constant_name(solver_name)}_TOPOLOGY")
         return True
 
     except Exception as e:
-        print(f"❌ Failed to write file {filepath}: {e}")
+        print(f"   Failed to write Python module {py_filepath}: {e}")
         return False
 
 

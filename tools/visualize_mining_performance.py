@@ -860,7 +860,7 @@ Examples:
         '--topology',
         type=str,
         default='Z(9,2)',
-        help='Topology to load (e.g., "Z(9,2)", "Advantage2_system1.7", or path to .json/.json.gz file)'
+        help='Topology to load (e.g., "Z(9,2)", "Advantage2_system1.8", or path to .json/.json.gz file)'
     )
 
     args = parser.parse_args()
