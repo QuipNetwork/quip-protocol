@@ -66,7 +66,7 @@ class DWaveSamplerWrapper:
         self.qpu_solver = base_sampler
 
         # Get hardware info
-        solver_name = base_sampler.properties.get('chip_id', 'Advantage2_system1.7')
+        solver_name = base_sampler.properties.get('chip_id', 'Advantage2_system1.8')
         solver_dir = solver_name.replace('-', '_').replace('.', '_')
 
         # Determine if this topology needs embedding
@@ -131,7 +131,7 @@ class DWaveSamplerWrapper:
         Determine if a topology needs embedding to run on the QPU.
 
         Args:
-            topology_name: Name of the topology (e.g., "Z(9,2)" or "Advantage2_system1.7")
+            topology_name: Name of the topology (e.g., "Z(9,2)" or "Advantage2_system1.8")
             solver_name: Name of the QPU solver
 
         Returns:

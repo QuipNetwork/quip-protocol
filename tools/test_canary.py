@@ -38,6 +38,7 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 import numpy as np
+import dimod
 
 from shared.block import Block, BlockHeader, BlockRequirements, create_genesis_block
 from shared.miner_types import MiningResult
@@ -101,7 +102,7 @@ def determine_canary_params(num_sweeps: int = 4, num_reads: int = 10) -> Dict[st
 def process_batch(
     batch_h_list, batch_J_list, batch_nonces, batch_salts, batch_canary_results,
     miner, full_params, difficulty_energy, is_gpu, qpu_time_used, qpu_calls,
-    full_passed, full_failed, full_energies, full_times
+    full_passed, full_failed, full_energies, full_times, topology
 ):
     """Process a batch of problems through the full miner.
 
@@ -115,32 +116,122 @@ def process_batch(
     full_start = time.time()
 
     try:
-        # Build sampling parameters
-        sampling_params = {
-            'h': batch_h_list if is_gpu else batch_h_list[0],
-            'J': batch_J_list if is_gpu else batch_J_list[0],
-            'num_reads': full_params['num_reads']
-        }
+        # For CUDA/GPU miners, use async_sampler with proper array conversion
+        is_cuda = hasattr(miner, 'miner_type') and 'CUDA' in miner.miner_type
 
-        # Add type-specific parameters
-        if hasattr(miner, 'miner_type') and miner.miner_type == 'QPU':
-            if 'annealing_time' in full_params:
-                sampling_params['annealing_time'] = full_params['annealing_time']
-        elif hasattr(miner, 'miner_type') and any(t in miner.miner_type for t in ['CPU', 'CUDA', 'Metal', 'GPU']):
-            if 'num_sweeps' in full_params:
-                sampling_params['num_sweeps'] = full_params['num_sweeps']
+        if is_cuda and hasattr(miner, 'async_sampler'):
+            # Convert dict representations to arrays for CUDA
+            # Use topology from miner (which was initialized with the correct topology)
+            nodes = miner.nodes
+            edges = miner.edges
+            N = max(max(nodes), max(max(i, j) for i, j in edges)) + 1
 
-        # Debug: Log sampling params on first call (exclude h/J to avoid huge output)
-        if len(full_energies) == 0:
-            import logging
-            debug_params = {k: v for k, v in sampling_params.items() if k not in ['h', 'J']}
-            debug_params['h_size'] = len(sampling_params.get('h', {}))
-            debug_params['J_size'] = len(sampling_params.get('J', {}))
-            logging.info(f"DEBUG: Full sampling params: {debug_params}")
-            logging.info(f"DEBUG: Miner type: {getattr(miner, 'miner_type', 'UNKNOWN')}")
+            h_arrays = []
+            J_arrays = []
 
-        # Call sampler
-        full_samplesets = miner.sampler.sample_ising(**sampling_params)
+            for h_dict, J_dict in zip(batch_h_list, batch_J_list):
+                # Convert h dict to array
+                h = np.zeros(N, dtype=np.float32)
+                for node, val in h_dict.items():
+                    h[node] = val
+                h_arrays.append(h)
+
+                # Convert J dict to array
+                J = np.zeros(len(edges), dtype=np.float32)
+                edge_to_idx = {edge: idx for idx, edge in enumerate(edges)}
+                for (i, j), val in J_dict.items():
+                    if (i, j) in edge_to_idx:
+                        J[edge_to_idx[(i, j)]] = val
+                    elif (j, i) in edge_to_idx:
+                        J[edge_to_idx[(j, i)]] = val
+                J_arrays.append(J)
+
+            # Debug: Log sampling params
+            # Calculate batch number based on how many we've processed so far
+            batch_num = (full_passed + full_failed) // len(h_arrays) + 1
+
+            # Calculate num_betas from num_sweeps (like Metal does)
+            num_sweeps_per_beta = 1  # Default (matches Metal)
+            num_sweeps = full_params['num_sweeps']
+            num_betas = num_sweeps // num_sweeps_per_beta
+
+            print(f"")
+            print(f"🔷 CUDA Batch #{batch_num}: Sampling {len(h_arrays)} problems")
+            print(f"   Parameters: num_sweeps={num_sweeps}, num_reads={full_params['num_reads']}")
+            print(f"   Internal: num_betas={num_betas}, num_sweeps_per_beta={num_sweeps_per_beta}")
+            print(f"   Problem size: N={N}, nodes={len(nodes)}, edges={len(edges)}")
+            print(f"   Starting GPU sampling at {time.strftime('%H:%M:%S')}...")
+
+            # Use async_sampler for CUDA (with explicit timeout like the miner does)
+            batch_start = time.time()
+            full_samplesets = miner.async_sampler.sample_ising(
+                h_list=h_arrays,
+                J_list=J_arrays,
+                num_reads=full_params['num_reads'],
+                num_betas=num_betas,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+                edges=edges,
+                timeout=600.0  # 10 minute timeout for test workload
+            )
+            batch_elapsed = time.time() - batch_start
+            print(f"   ✅ GPU sampling completed in {batch_elapsed:.2f}s ({batch_elapsed/len(h_arrays):.3f}s per problem)")
+
+            # Filter samples for sparse topology (CUDA returns full N-sized samples)
+            filtered_samplesets = []
+            for sampleset in full_samplesets:
+                filtered_samples = []
+                for sample in sampleset.record.sample:
+                    # Extract only values at node indices that exist in topology
+                    filtered_sample = np.array([sample[node] for node in nodes], dtype=np.int8)
+                    filtered_samples.append(filtered_sample)
+
+                # Create new SampleSet with filtered samples
+                filtered_sampleset = dimod.SampleSet.from_samples(
+                    filtered_samples,
+                    vartype='SPIN',
+                    energy=sampleset.record.energy,
+                    info=sampleset.info
+                )
+                filtered_samplesets.append(filtered_sampleset)
+
+            full_samplesets = filtered_samplesets
+
+            # Log detailed per-problem results
+            batch_energies = []
+            print(f"   📊 Individual problem results:")
+            for prob_idx, (sampleset, canary_result) in enumerate(zip(full_samplesets, batch_canary_results)):
+                prob_energy = float(np.min(sampleset.record.energy))
+                batch_energies.append(prob_energy)
+                canary_energy = canary_result.get('energy', 'N/A')
+                passed_mark = "✅" if prob_energy < difficulty_energy else "❌"
+                print(f"      Problem {prob_idx+1:2d}: energy={prob_energy:8.1f} {passed_mark}  (canary: {canary_energy:8.1f})")
+
+            # Summary statistics
+            min_batch_energy = min(batch_energies)
+            max_batch_energy = max(batch_energies)
+            avg_batch_energy = sum(batch_energies) / len(batch_energies)
+            num_passed = sum(1 for e in batch_energies if e < difficulty_energy)
+            print(f"   📈 Batch summary: min={min_batch_energy:.1f}, max={max_batch_energy:.1f}, avg={avg_batch_energy:.1f}")
+            print(f"   Passed difficulty threshold ({difficulty_energy:.1f}): {num_passed}/{len(batch_energies)}")
+
+        else:
+            # For CPU/QPU/Metal, use regular sampler
+            sampling_params = {
+                'h': batch_h_list if is_gpu else batch_h_list[0],
+                'J': batch_J_list if is_gpu else batch_J_list[0],
+                'num_reads': full_params['num_reads']
+            }
+
+            # Add type-specific parameters
+            if hasattr(miner, 'miner_type') and miner.miner_type == 'QPU':
+                if 'annealing_time' in full_params:
+                    sampling_params['annealing_time'] = full_params['annealing_time']
+            elif hasattr(miner, 'miner_type') and any(t in miner.miner_type for t in ['CPU', 'Metal', 'GPU']):
+                if 'num_sweeps' in full_params:
+                    sampling_params['num_sweeps'] = full_params['num_sweeps']
+
+            # Call sampler
+            full_samplesets = miner.sampler.sample_ising(**sampling_params)
 
         # GPU returns list, others return single sampleset
         if not is_gpu:
@@ -278,6 +369,12 @@ def run_canary_test(
         num_nodes=len(nodes),
         num_edges=len(edges)
     )
+
+    # Cap num_reads at 256 for CUDA (hardware limit)
+    is_cuda = hasattr(miner, 'miner_type') and 'CUDA' in miner.miner_type
+    if is_cuda and full_params['num_reads'] > 256:
+        full_params['num_reads'] = 256
+
     log(f"🎯 Full params: {full_params}")
 
     # Initialize random seed for reproducible nonces
@@ -318,7 +415,15 @@ def run_canary_test(
 
     # Determine if we should use batching (for GPU miners)
     is_gpu = hasattr(miner, 'miner_type') and any(t in miner.miner_type for t in ['Metal', 'CUDA', 'GPU'])
-    batch_size = 10 if is_gpu else 1  # Process 10 problems at once on GPU
+
+    # For CUDA, use SM count for batch size (typically 48 for most GPUs)
+    # For other miners, process one at a time
+    if is_gpu and hasattr(miner, 'async_sampler') and hasattr(miner.async_sampler, 'get_num_sms'):
+        batch_size = miner.async_sampler.get_num_sms()  # Full SM utilization
+    elif is_gpu:
+        batch_size = 48  # Default for most modern GPUs
+    else:
+        batch_size = 1  # CPU/QPU: one at a time
 
     if is_gpu:
         log(f"   🚀 GPU batching enabled: {batch_size} problems per batch")
@@ -406,7 +511,7 @@ def run_canary_test(
             batch_results, qpu_time_used, qpu_calls, full_passed, full_failed, full_energies, full_times = process_batch(
                 batch_h_list, batch_J_list, batch_nonces, batch_salts, batch_canary_results,
                 miner, full_params, difficulty_energy, is_gpu, qpu_time_used, qpu_calls,
-                full_passed, full_failed, full_energies, full_times
+                full_passed, full_failed, full_energies, full_times, topology
             )
 
             nonce_results.extend(batch_results)
@@ -423,17 +528,29 @@ def run_canary_test(
         if current_time - last_progress_time >= progress_interval:
             elapsed = current_time - start_time
             elapsed_min = elapsed / 60
-            nonces_per_min = total_nonces / elapsed_min if elapsed_min > 0 else 0
+
+            # Rate based on completed full tests (both canary AND full completed)
+            completed_nonces = full_passed + full_failed
+            completed_per_min = completed_nonces / elapsed_min if elapsed_min > 0 else 0
 
             qpu_time_str = ""
             if qpu_calls > 0:
                 qpu_time_str = f", QPU: {qpu_time_used:.1f}s/{qpu_calls} calls"
 
+            # Show best energy achieved and gap to target
+            best_energy_str = ""
+            if full_energies:
+                best_energy = min(full_energies)
+                gap = best_energy - difficulty_energy
+                best_energy_str = f", Best: {best_energy:.1f} (gap: {gap:+.1f})"
+                if full_passed == 0 and completed_nonces >= 10:
+                    best_energy_str += " ⚠️"
+
             log(f"   [{elapsed_min:.1f}/{duration_minutes:.0f} min] "
-                f"Nonces: {total_nonces}, "
+                f"Generated: {total_nonces}, Completed: {completed_nonces}, "
                 f"Canary: {canary_passed}✅/{canary_failed}❌, "
-                f"Full: {full_passed}✅/{full_failed}❌, "
-                f"Rate: {nonces_per_min:.2f} nonces/min{qpu_time_str}")
+                f"Full: {full_passed}✅/{full_failed}❌{best_energy_str}, "
+                f"Rate: {completed_per_min:.2f} completed/min{qpu_time_str}")
             last_progress_time = current_time
 
     total_time = time.time() - start_time
@@ -733,7 +850,7 @@ def main():
         '--topology',
         type=str,
         default=None,
-        help='Topology name (default: DEFAULT_TOPOLOGY=Z(9,2)). Examples: "Z(9,2)", "Z(10,2)", "Advantage2_system1.7"'
+        help='Topology name (default: DEFAULT_TOPOLOGY=Z(9,2)). Examples: "Z(9,2)", "Z(10,2)", "Advantage2_system1.8"'
     )
     parser.add_argument(
         '--canary-num-sweeps',
@@ -809,7 +926,7 @@ def main():
     log_file = None
     if args.output:
         log_filename = args.output.replace('.json', '.log')
-        log_file = open(log_filename, 'w')
+        log_file = open(log_filename, 'w', encoding='utf-8')
         print(f"📝 Logging to {log_filename}")
 
     # Run canary tests
@@ -855,6 +972,17 @@ def main():
     print(f"   Avg time: {stats['full']['time_stats']['mean']:.3f}s")
     print(f"   Energy range: [{stats['full']['energy_stats']['min']:.1f}, {stats['full']['energy_stats']['max']:.1f}]")
     print(f"   Mean energy: {stats['full']['energy_stats']['mean']:.1f}")
+    print(f"   Difficulty target: {args.difficulty_energy:.1f}")
+
+    # Prominently warn if no solutions hit target
+    if stats['full']['passed'] == 0 and stats['total_nonces'] > 0:
+        gap = stats['full']['energy_stats']['min'] - args.difficulty_energy
+        print(f"\n   ⚠️  WARNING: No solutions hit target energy!")
+        print(f"   📊 Best energy achieved: {stats['full']['energy_stats']['min']:.1f}")
+        print(f"   📉 Gap to target: {gap:.1f} energy units ({gap/args.difficulty_energy*100:.1f}% relative)")
+        print(f"   🔍 Problems evaluated: {stats['total_nonces']}")
+        if gap > 100:
+            print(f"   💡 Consider: Target may be too aggressive, or num_sweeps too low")
 
     # Print QPU time usage if available
     if stats.get('qpu_calls') and stats['qpu_calls'] > 0:
