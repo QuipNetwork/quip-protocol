@@ -136,17 +136,17 @@ echo $GITHUB_TOKEN | docker login ghcr.io -u USERNAME --password-stdin
 export REGISTRY="ghcr.io/your-org"
 ```
 
-### 3. Build Multi-Platform Images
+### 3. Build Multi-Platform Images (amd64)
 
-Build images compatible with both CPU and GPU providers.
+**IMPORTANT: Akash providers run amd64 (x86_64) architecture.** If you're building on Apple Silicon (M1/M2/M3/M4), you must cross-compile for amd64. The build script handles this automatically using `docker buildx`.
 
-**IMPORTANT:** Run from the project root directory (not from `akash/`):
+**Run from the project root directory (not from `akash/`):**
 
 ```bash
 # Make sure you're in the project root
 cd /path/to/quip-protocol
 
-# Build all images (CPU and CUDA)
+# Build all images for amd64 (required for Akash)
 ./akash/build_akash_images.sh
 
 # This builds:
@@ -155,12 +155,49 @@ cd /path/to/quip-protocol
 ```
 
 **What this does:**
-- Builds Docker images for CPU and CUDA mining
-- Creates multi-platform images (AMD64)
+- Creates a `docker buildx` builder for cross-platform builds
+- Builds Docker images targeting `linux/amd64` architecture
+- Cross-compiles from arm64 to amd64 if you're on Apple Silicon
 - Tags with version and `latest`
-- Pushes to your container registry
+- Pushes to Docker Hub (docker.io/carback1 by default)
 
-**Build time:** ~10-15 minutes depending on internet speed
+**Build time:** ~10-15 minutes (may be longer on Apple Silicon due to cross-compilation)
+
+#### Manual Cross-Platform Build (if script fails)
+
+If you need to build manually or customize the build:
+
+```bash
+# One-time setup: create buildx builder for multi-arch
+docker buildx create --name quip-multiarch --use --bootstrap
+
+# Build and push CPU image for amd64
+docker buildx build \
+  --platform linux/amd64 \
+  -f akash/Dockerfile.akash-cpu \
+  -t carback1/quip-protocol-cpu-miner:latest \
+  --push \
+  .
+
+# Build and push CUDA image for amd64
+docker buildx build \
+  --platform linux/amd64 \
+  -f akash/Dockerfile.akash-cuda \
+  -t carback1/quip-protocol-cuda-miner:latest \
+  --push \
+  .
+```
+
+#### Verify Image Architecture
+
+After building, verify the images are amd64:
+
+```bash
+# Check architecture of pushed image
+docker buildx imagetools inspect carback1/quip-protocol-cpu-miner:latest
+
+# Look for: "Platform: linux/amd64"
+```
 
 **Verify images are pushed:**
 ```bash
@@ -647,6 +684,35 @@ docker buildx inspect --bootstrap
 # Try build again
 ./build_akash_images.sh
 ```
+
+### Image Pull Fails on Akash (Architecture Mismatch)
+
+**Error:** "exec format error" or "cannot execute binary"
+
+**Cause:** You pushed an arm64 image but Akash providers run amd64.
+
+**Solution:**
+```bash
+# Verify current image architecture
+docker buildx imagetools inspect carback1/quip-protocol-cpu-miner:latest
+
+# If it shows "linux/arm64", rebuild for amd64:
+docker buildx build \
+  --platform linux/amd64 \
+  -f akash/Dockerfile.akash-cpu \
+  -t carback1/quip-protocol-cpu-miner:latest \
+  --push \
+  .
+```
+
+**Error:** "pull access denied, repository does not exist"
+
+**Cause:** Wrong image name or image not pushed to registry.
+
+**Solution:**
+1. Verify image exists on Docker Hub: https://hub.docker.com/r/carback1/quip-protocol-cpu-miner
+2. Check the image name in `akash/web/src/config/constants.ts` matches Docker Hub
+3. Make sure the repository is public (not private)
 
 ### Keplr Connection Failed
 
