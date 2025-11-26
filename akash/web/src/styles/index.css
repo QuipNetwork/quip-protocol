@@ -1,0 +1,512 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  min-height: 100vh;
+  padding: 20px;
+}
+
+#root {
+  width: 100%;
+}
+
+.container {
+  max-width: 900px;
+  margin: 0 auto;
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+  overflow: hidden;
+}
+
+.header {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  padding: 30px;
+  text-align: center;
+}
+
+.header h1 {
+  font-size: 32px;
+  margin-bottom: 10px;
+}
+
+.header p,
+.header .subtitle {
+  opacity: 0.9;
+  font-size: 16px;
+}
+
+/* Card/Section Styles */
+.card {
+  margin: 20px;
+  padding: 20px;
+  background: #f7fafc;
+  border-radius: 8px;
+  border: 2px dashed #cbd5e0;
+}
+
+.card h2 {
+  margin-bottom: 15px;
+  color: #2d3748;
+}
+
+/* Wallet Section */
+.wallet-section {
+  margin: 20px;
+  padding: 20px;
+  background: #f7fafc;
+  border-radius: 8px;
+  border: 2px dashed #cbd5e0;
+}
+
+.wallet-section h2 {
+  margin-bottom: 15px;
+  color: #2d3748;
+}
+
+.wallet-state {
+  color: #718096;
+}
+
+.wallet-state p {
+  margin-bottom: 15px;
+}
+
+.wallet-connected {
+  background: #f0fff4;
+  border-color: #48bb78;
+}
+
+.wallet-info {
+  margin-bottom: 15px;
+}
+
+.info-row {
+  margin: 8px 0;
+}
+
+.info-row .label {
+  font-weight: 600;
+  margin-right: 8px;
+}
+
+.info-row .address {
+  font-family: monospace;
+  background: #edf2f7;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+/* Buttons */
+.btn {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  border: none;
+  padding: 12px 24px;
+  border-radius: 6px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.2s, box-shadow 0.2s;
+  width: 100%;
+  margin-top: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+}
+
+.btn:disabled {
+  background: #cbd5e0;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+}
+
+.btn-secondary {
+  background: #48bb78;
+}
+
+.btn-danger {
+  background: #f56565;
+}
+
+.btn-icon {
+  font-size: 18px;
+}
+
+/* Tabs */
+.tabs {
+  display: flex;
+  border-bottom: 2px solid #e2e8f0;
+  margin: 0 20px 20px;
+}
+
+.tab {
+  padding: 12px 24px;
+  cursor: pointer;
+  border: none;
+  background: none;
+  font-size: 16px;
+  font-weight: 600;
+  color: #718096;
+  transition: color 0.2s;
+}
+
+.tab:hover {
+  color: #667eea;
+}
+
+.tab.active {
+  color: #667eea;
+  border-bottom: 2px solid #667eea;
+  margin-bottom: -2px;
+}
+
+/* Tab Content */
+.tab-content {
+  padding: 0 20px 20px;
+}
+
+/* Forms */
+.form-group {
+  margin-bottom: 20px;
+}
+
+.form-group label {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 600;
+  color: #2d3748;
+}
+
+.form-group input,
+.form-group select {
+  width: 100%;
+  padding: 12px;
+  border: 2px solid #e2e8f0;
+  border-radius: 6px;
+  font-size: 14px;
+  transition: border-color 0.2s;
+}
+
+.form-group input:focus,
+.form-group select:focus {
+  outline: none;
+  border-color: #667eea;
+}
+
+.form-group small {
+  display: block;
+  margin-top: 4px;
+  color: #718096;
+  font-size: 13px;
+}
+
+/* Alerts */
+.alert {
+  padding: 12px 16px;
+  border-radius: 6px;
+  margin-bottom: 20px;
+}
+
+.alert-info {
+  background: #ebf8ff;
+  color: #2c5282;
+  border-left: 4px solid #4299e1;
+}
+
+.alert-success {
+  background: #f0fff4;
+  color: #22543d;
+  border-left: 4px solid #48bb78;
+}
+
+.alert-error {
+  background: #fed7d7;
+  color: #742a2a;
+  border-left: 4px solid #f56565;
+}
+
+.cost-estimate {
+  font-size: 16px;
+}
+
+/* Deployment List */
+.deployment-list {
+  margin-top: 20px;
+}
+
+.deployment-item {
+  background: #f7fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 12px;
+}
+
+.deployment-item h3 {
+  font-size: 18px;
+  margin-bottom: 8px;
+  color: #2d3748;
+}
+
+.deployment-item p {
+  color: #718096;
+  font-size: 14px;
+  margin: 4px 0;
+}
+
+.deployment-status {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.status-pending {
+  background: #fef5e7;
+  color: #f59e0b;
+}
+
+.status-active {
+  background: #f0fff4;
+  color: #48bb78;
+}
+
+.status-closed {
+  background: #fed7d7;
+  color: #f56565;
+}
+
+/* Empty State */
+.empty-state {
+  color: #718096;
+  text-align: center;
+  padding: 20px;
+}
+
+/* Loading Spinner */
+.loading {
+  text-align: center;
+  padding: 20px;
+}
+
+.spinner {
+  border: 3px solid #f3f3f3;
+  border-top: 3px solid #667eea;
+  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  animation: spin 1s linear infinite;
+  margin: 0 auto;
+}
+
+@keyframes spin {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+/* Results Output */
+.results-output {
+  background: #f7fafc;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+/* Wallet Modal */
+.wallet-modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+  backdrop-filter: blur(4px);
+}
+
+.wallet-modal {
+  background: white;
+  border-radius: 16px;
+  width: 90%;
+  max-width: 400px;
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+  overflow: hidden;
+  animation: modalSlideIn 0.2s ease-out;
+}
+
+@keyframes modalSlideIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95) translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.wallet-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 24px;
+  border-bottom: 1px solid #e2e8f0;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+}
+
+.wallet-modal-header h3 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: white;
+}
+
+.wallet-modal-close {
+  background: rgba(255, 255, 255, 0.2);
+  border: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  font-size: 24px;
+  color: white;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s;
+}
+
+.wallet-modal-close:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+.wallet-modal-body {
+  padding: 24px;
+}
+
+.wallet-modal-loading {
+  text-align: center;
+  padding: 40px 20px;
+}
+
+.wallet-modal-loading .spinner {
+  width: 48px;
+  height: 48px;
+  margin-bottom: 16px;
+}
+
+.wallet-modal-loading p {
+  color: #718096;
+  font-size: 14px;
+}
+
+.wallet-modal-error {
+  text-align: center;
+  padding: 20px;
+}
+
+.wallet-modal-error p {
+  color: #e53e3e;
+  margin-bottom: 16px;
+}
+
+.wallet-modal-qr {
+  text-align: center;
+}
+
+.qr-container {
+  background: white;
+  padding: 16px;
+  border-radius: 12px;
+  display: inline-block;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+  margin-bottom: 20px;
+}
+
+.qr-instructions {
+  font-size: 16px;
+  font-weight: 600;
+  color: #2d3748;
+  margin-bottom: 16px;
+}
+
+.qr-steps {
+  text-align: left;
+  padding-left: 24px;
+  margin: 0;
+  color: #718096;
+  font-size: 14px;
+  line-height: 1.8;
+}
+
+.qr-steps li {
+  margin-bottom: 4px;
+}
+
+/* Responsive */
+@media (max-width: 600px) {
+  body {
+    padding: 10px;
+  }
+
+  .header {
+    padding: 20px;
+  }
+
+  .header h1 {
+    font-size: 24px;
+  }
+
+  .tabs {
+    flex-direction: column;
+    margin: 0 10px 10px;
+  }
+
+  .tab {
+    padding: 10px 16px;
+    text-align: left;
+    border-bottom: 1px solid #e2e8f0;
+  }
+
+  .tab.active {
+    border-bottom: 1px solid #e2e8f0;
+    border-left: 3px solid #667eea;
+    margin-bottom: 0;
+  }
+
+  .card,
+  .wallet-section {
+    margin: 10px;
+    padding: 15px;
+  }
+
+  .tab-content {
+    padding: 0 10px 10px;
+  }
+}
