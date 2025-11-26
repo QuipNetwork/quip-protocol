@@ -1,0 +1,58 @@
+# Akash-optimized Dockerfile for CPU mining
+# Includes HTTP server for log/result retrieval
+FROM python:3.13-slim-bookworm
+
+LABEL maintainer="Quip Protocol"
+LABEL description="CPU miner for Akash Network with HTTP result server"
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    gcc \
+    g++ \
+    make \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Copy project files
+COPY pyproject.toml README.md LICENSE ./
+COPY blockchain_base.py ./
+COPY CPU/ ./CPU/
+COPY tools/ ./tools/
+COPY dwave_topologies/ ./dwave_topologies/
+
+# Create virtual environment and install project with dependencies
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -e .
+
+# Set environment variables
+ENV OMP_NUM_THREADS=4
+ENV MKL_NUM_THREADS=4
+ENV MINER_TYPE=cpu
+ENV MINING_DURATION=90m
+ENV DIFFICULTY_ENERGY=-14900
+ENV MIN_DIVERSITY=0.1
+ENV MIN_SOLUTIONS=5
+ENV TOPOLOGY_FILE=dwave_topologies/topologies/advantage2_system1_7.json.gz
+
+# Create output directory
+RUN mkdir -p /output
+
+# Copy Akash-specific entrypoint with IPFS support
+COPY akash/entrypoint-ipfs.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Expose HTTP port for result retrieval
+EXPOSE 8080
+
+# Health check via HTTP server
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:8080/ || exit 1
+
+ENTRYPOINT ["/entrypoint.sh"]
