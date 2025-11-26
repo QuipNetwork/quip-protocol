@@ -22,3 +22,29 @@ ENV/
 *.csv
 results/
 quip_protocol.egg-info/.quip/
+akash/web/localhost.pem
+node_modules
+# Dependencies (installed by bun/npm - developer only)
+node_modules/
+
+# Self-signed certificate (auto-generated per machine)
+localhost.pem
+
+# Cache files
+.cache
+*.tsbuildinfo
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea
+.vscode
+
+# OS
+.DS_Store
+
+# Logs
+*.log
