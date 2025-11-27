@@ -36,6 +36,8 @@ export function DeploymentList() {
   const [copiedDseq, setCopiedDseq] = useState<string | null>(null)
   const [closingDseq, setClosingDseq] = useState<string | null>(null)
   const [closeSuccess, setCloseSuccess] = useState<string | null>(null)
+  const [closingAll, setClosingAll] = useState(false)
+  const [closeAllProgress, setCloseAllProgress] = useState<{ current: number; total: number } | null>(null)
 
   // Generate default SDL config for existing deployments
   const defaultSdlConfig: SDLConfig = useMemo(() => ({
@@ -104,6 +106,75 @@ export function DeploymentList() {
     } finally {
       setClosingDseq(null)
     }
+  }
+
+  // Close all active deployments handler
+  const handleCloseAllDeployments = async () => {
+    if (!address) return
+
+    const activeDeployments = deployments.filter(d => d.deployment.state === 'active')
+    if (activeDeployments.length === 0) {
+      setError('No active deployments to close')
+      return
+    }
+
+    // Confirm before closing all
+    const confirmed = window.confirm(
+      `Are you sure you want to close ALL ${activeDeployments.length} active deployment(s)?\n\nThis will stop all containers and release all resources. Remaining balances will be returned to your account.\n\nYou will need to approve ${activeDeployments.length} transaction(s) in your wallet.`
+    )
+    if (!confirmed) return
+
+    setClosingAll(true)
+    setCloseAllProgress({ current: 0, total: activeDeployments.length })
+    setError(null)
+    setCloseSuccess(null)
+
+    const client = await getSigningClient()
+    if (!client) {
+      setError('Failed to get signing client')
+      setClosingAll(false)
+      setCloseAllProgress(null)
+      return
+    }
+
+    let successCount = 0
+    const errors: string[] = []
+
+    for (let i = 0; i < activeDeployments.length; i++) {
+      const deployment = activeDeployments[i]
+      setCloseAllProgress({ current: i + 1, total: activeDeployments.length })
+
+      try {
+        await closeDeployment(client, address, deployment.deployment.id.dseq)
+        successCount++
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unknown error'
+        if (message.includes('rejected') || message.includes('cancelled')) {
+          // User cancelled - stop the batch
+          errors.push(`Cancelled at deployment #${deployment.deployment.id.dseq}`)
+          break
+        }
+        errors.push(`#${deployment.deployment.id.dseq}: ${message}`)
+      }
+    }
+
+    setClosingAll(false)
+    setCloseAllProgress(null)
+
+    if (successCount > 0) {
+      setCloseSuccess(`Successfully closed ${successCount} deployment(s)`)
+    }
+    if (errors.length > 0) {
+      setError(`Failed to close some deployments:\n${errors.join('\n')}`)
+    }
+
+    // Refresh the list after a short delay
+    setTimeout(() => {
+      refresh()
+      if (errors.length === 0) {
+        setCloseSuccess(null)
+      }
+    }, 2000)
   }
 
   const refresh = async () => {
@@ -215,9 +286,25 @@ export function DeploymentList() {
         <strong>Active Deployments:</strong> View and manage your running deployments
       </div>
 
-      <button className="btn btn-secondary" onClick={refresh} disabled={loading}>
-        {loading ? 'Refreshing...' : 'Refresh Deployments'}
-      </button>
+      <div style={{ display: 'flex', gap: '12px', marginBottom: '16px', flexWrap: 'wrap', alignItems: 'center' }}>
+        <button className="btn btn-secondary" onClick={refresh} disabled={loading || closingAll}>
+          {loading ? 'Refreshing...' : 'Refresh Deployments'}
+        </button>
+
+        {deployments.filter(d => d.deployment.state === 'active').length > 0 && (
+          <button
+            className="btn btn-danger"
+            onClick={handleCloseAllDeployments}
+            disabled={loading || closingAll || !!closingDseq}
+            style={{ minWidth: '180px' }}
+          >
+            {closingAll
+              ? `Closing ${closeAllProgress?.current}/${closeAllProgress?.total}...`
+              : `Close All (${deployments.filter(d => d.deployment.state === 'active').length})`
+            }
+          </button>
+        )}
+      </div>
 
       {error && (
         <div className="alert alert-error">

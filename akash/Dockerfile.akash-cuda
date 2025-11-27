@@ -90,16 +90,8 @@ COPY --from=builder /build/blockchain_base.py /build/quip_cli.py ./
 COPY --from=builder /build/shared/ ./shared/
 COPY --from=builder /build/GPU/ ./GPU/
 
-# Copy only the specific topology files needed (not entire directory)
-# This saves ~15MB by excluding unused topology files
-COPY dwave_topologies/__init__.py ./dwave_topologies/
-COPY dwave_topologies/topologies/__init__.py ./dwave_topologies/topologies/
-COPY dwave_topologies/topologies/json_loader.py ./dwave_topologies/topologies/
-COPY dwave_topologies/topologies/advantage2_system1_8.json.gz ./dwave_topologies/topologies/
-COPY dwave_topologies/topologies/advantage2_system4_1.json.gz ./dwave_topologies/topologies/
-
-# Copy the mining tool script
-COPY tools/compare_mining_rates.py ./tools/
+COPY dwave_topologies ./dwave_topologies
+COPY tools ./tools
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

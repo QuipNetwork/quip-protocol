@@ -100,9 +100,13 @@ export function DeploymentForm() {
   // Load saved IPFS settings from localStorage
   useEffect(() => {
     const savedNode = localStorage.getItem('ipfs_node')
+    const savedApiKey = localStorage.getItem('ipfs_api_key')
     if (savedNode) {
       setIpfsNode(savedNode)
       setIpfsEnabled(true)
+    }
+    if (savedApiKey) {
+      setIpfsApiKey(savedApiKey)
     }
   }, [])
 
@@ -243,19 +247,21 @@ export function DeploymentForm() {
       const onlineCount = enrichedBids.filter(b => b.isOnline).length
       console.log(`Provider breakdown: ${reliableCount} reliable, ${onlineCount} online, ${enrichedBids.length} total`)
 
-      // Sort all providers by: reliability first, then audited, then active leases, then price
+      // Sort all providers by: price first, then reliability indicators
       const sortedProviders = [...enrichedBids]
         .sort((a, b) => {
-          // Reliable providers first
+          // Price first (lowest = best)
+          const priceA = parseFloat(a.bid.bid.price.amount)
+          const priceB = parseFloat(b.bid.bid.price.amount)
+          if (priceA !== priceB) return priceA - priceB
+          // Then reliable providers
           if (a.isReliable !== b.isReliable) return a.isReliable ? -1 : 1
           // Then online providers
           if (a.isOnline !== b.isOnline) return a.isOnline ? -1 : 1
-          // Audited providers first
+          // Audited providers
           if (a.isAudited !== b.isAudited) return a.isAudited ? -1 : 1
           // Then by active lease count (more = better)
-          if (a.activeLeaseCount !== b.activeLeaseCount) return b.activeLeaseCount - a.activeLeaseCount
-          // Then by price
-          return parseFloat(a.bid.bid.price.amount) - parseFloat(b.bid.bid.price.amount)
+          return b.activeLeaseCount - a.activeLeaseCount
         })
 
       // Show top 30 providers (mix of reliable and online)
@@ -432,8 +438,8 @@ export function DeploymentForm() {
   const handleFleetComplete = (state: FleetState) => {
     setFleetResult(state)
     setAlert({
-      type: state.stats.active > 0 ? 'success' : 'error',
-      message: `Fleet deployed: ${state.stats.active} active, ${state.stats.failed} failed`
+      type: state.stats.deploymentsActive > 0 ? 'success' : 'error',
+      message: `Fleet deployed: ${state.stats.deploymentsActive} active, ${state.stats.deploymentsFailed} failed`
     })
   }
 
@@ -856,11 +862,14 @@ export function DeploymentForm() {
                 type="password"
                 id="ipfsApiKey"
                 value={ipfsApiKey}
-                onChange={(e) => setIpfsApiKey(e.target.value)}
+                onChange={(e) => {
+                  setIpfsApiKey(e.target.value)
+                  localStorage.setItem('ipfs_api_key', e.target.value)
+                }}
                 placeholder="Your API key"
                 required={ipfsEnabled}
               />
-              <small>Bearer token for IPFS API authentication (not saved)</small>
+              <small>Bearer token for IPFS API authentication (saved locally)</small>
             </div>
           </>
         )}

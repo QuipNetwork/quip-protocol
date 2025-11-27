@@ -1,10 +1,21 @@
 /**
- * Fleet Manager - Intelligent allocation of deployments across Akash providers
+ * Fleet Manager - Adaptive fleet deployment across Akash providers
  *
- * This module handles:
- * 1. Querying provider capacity
- * 2. Planning optimal resource allocation across providers
- * 3. Executing fleet deployments
+ * Strategy (Iterative Consolidation):
+ * 1. Start with full request (e.g., 10 CPUs with count=10, or 10 GPUs)
+ * 2. Solicit bids from all providers
+ * 3. If no bids received, reduce count/GPUs and try again
+ * 4. User selects provider, deployment is created
+ * 5. Repeat for remaining resources until all allocated
+ *
+ * For CPUs: Use instance count (count=N) for parallel containers
+ * For GPUs: Request N GPUs in a single deployment
+ *
+ * Benefits:
+ * - Consolidates where possible (fewer deployments = less overhead)
+ * - Adapts to actual provider capacity via bid responses
+ * - User maintains provider selection control
+ * - Falls back gracefully when large requests can't be filled
  */
 
 import type { SigningStargateClient } from '@cosmjs/stargate'
@@ -19,37 +30,36 @@ import {
   type ProviderCapacity,
   type Bid
 } from './akashApi'
-import { generateSDLForAllocation, type SDLConfig } from './sdl'
+import { generateSDL, type SDLConfig } from './sdl'
 
 // ============================================================================
 // Types
 // ============================================================================
 
 /**
- * Allocation for a single provider in the fleet
+ * Capacity check result - ensures network can fill the request
  */
-export interface ProviderAllocation {
-  provider: ProviderCapacity
-  requestedCpu: number    // CPUs to request
-  requestedGpu: number    // GPUs to request
-  requestedMemoryGi: number  // Memory in GiB
-}
-
-/**
- * Complete allocation plan for a fleet deployment
- */
-export interface AllocationPlan {
-  allocations: ProviderAllocation[]
-  totalCpu: number
-  totalGpu: number
-  deploymentsNeeded: number
-  // What we wanted vs what we can get
+export interface CapacityCheck {
+  // Request
   requestedCpu: number
   requestedGpu: number
-  shortfall: {
-    cpu: number
-    gpu: number
-  }
+
+  // Network capacity
+  totalCpu: number           // Total CPUs available across all providers
+  totalGpu: number           // Total GPUs available
+  providerCount: number      // Number of suitable providers
+
+  // Providers that could potentially fill bids (top 10 by capacity)
+  topProviders: ProviderCapacity[]
+
+  // Can we likely fill the request?
+  canFill: boolean
+  capacityRatio: number      // Available / Requested (>1.5 is good)
+
+  // Initial deployment plan - will adapt based on bids
+  // For CPU: start with count=N instances
+  // For GPU: start with N GPUs per deployment
+  initialRequestSize: number  // How many CPUs/GPUs to request initially
 }
 
 /**
@@ -67,14 +77,26 @@ export type FleetDeploymentStatus =
 
 /**
  * State of a single deployment in the fleet
+ * For CPU: requestedCpu=1, instanceCount=N (N parallel containers)
+ * For GPU: requestedGpu=N, instanceCount=1 (1 container with N GPUs)
  */
 export interface FleetDeploymentItem {
   index: number
-  allocation: ProviderAllocation
   status: FleetDeploymentStatus
+  // Resources per instance
+  requestedCpu: number       // CPUs per instance (1 for CPU miners, 2 for GPU miners)
+  requestedGpu: number       // GPUs per instance (0 for CPU, N for GPU)
+  requestedMemoryGi: number  // Memory per instance
+  instanceCount: number      // Number of container instances (N for CPU, 1 for GPU)
+  // Deployment info
   dseq?: string
   transactionHash?: string
+  manifestJson?: string
+  // Bid info
+  availableBids?: Bid[]
   selectedBid?: Bid
+  selectedProviderName?: string
+  // Result
   serviceUrl?: string
   error?: string
   startedAt?: Date
@@ -85,17 +107,21 @@ export interface FleetDeploymentItem {
  * Overall fleet deployment state
  */
 export interface FleetState {
-  config: Omit<SDLConfig, 'cpuUnits' | 'gpuUnits' | 'memoryGi'>
-  plan: AllocationPlan
+  config: SDLConfig
+  capacityCheck: CapacityCheck
   deployments: FleetDeploymentItem[]
-  status: 'planning' | 'deploying' | 'completed' | 'cancelled'
+  status: 'checking' | 'ready' | 'deploying' | 'selecting-bids' | 'completed' | 'cancelled'
   startedAt: Date
   completedAt?: Date
+  // Tracking for adaptive deployment
+  remainingResources: number  // CPUs or GPUs still to be allocated
+  currentRequestSize: number  // Current deployment request size (may decrease if no bids)
   stats: {
-    total: number
-    active: number
-    failed: number
-    pending: number
+    totalRequested: number    // Total CPUs/GPUs requested
+    totalAllocated: number    // CPUs/GPUs successfully allocated
+    deploymentsCreated: number
+    deploymentsActive: number
+    deploymentsFailed: number
   }
 }
 
@@ -105,118 +131,79 @@ export interface FleetState {
 export type FleetProgressCallback = (state: FleetState) => void
 
 // ============================================================================
-// Allocation Algorithm
+// Capacity Check
 // ============================================================================
 
 /**
- * Plan fleet allocation across available providers
+ * Check network capacity before starting fleet deployment
  *
- * Strategy: Greedy allocation starting with largest providers
- * - Prefer fewer, larger deployments (less transaction overhead)
- * - Prioritize reliable providers (have active leases)
- * - Respect minimum resource requirements
+ * Returns info about available capacity and whether the request can likely be filled.
+ * We want at least 5-10 providers with capacity to ensure bids will come in.
  */
-export async function planFleetAllocation(
+export async function checkNetworkCapacity(
   targetCpu: number,
   targetGpu: number,
   options: {
-    minCpuPerDeployment?: number
-    minGpuPerDeployment?: number
-    memoryPerCpuGi?: number  // Memory per CPU in GiB
-    onlyReliable?: boolean
+    minProvidersRequired?: number  // Minimum providers needed (default: 5)
+    capacityMultiplier?: number    // How much excess capacity we want (default: 1.5x)
   } = {}
-): Promise<AllocationPlan> {
+): Promise<CapacityCheck> {
   const {
-    minCpuPerDeployment = 1,
-    minGpuPerDeployment = 1,
-    memoryPerCpuGi = 2,
-    onlyReliable = false
+    minProvidersRequired = 5,
+    capacityMultiplier = 1.5
   } = options
 
-  // Fetch all providers with capacity
+  const isGpuRequest = targetGpu > 0
+
+  // Fetch all providers
   const allProviders = await fetchAllProviders()
 
-  // Filter by requirements
+  // Filter by resource type
   const providers = filterProvidersByCapacity(allProviders, {
-    minCpu: targetGpu > 0 ? 0 : minCpuPerDeployment,
-    minGpu: targetGpu > 0 ? minGpuPerDeployment : 0,
-    onlyReliable,
+    minCpu: isGpuRequest ? 0 : 1,
+    minGpu: isGpuRequest ? 1 : 0,
     onlyOnline: true
   })
 
   console.log(`Found ${providers.length} suitable providers out of ${allProviders.length} total`)
 
-  // Get total capacity for reference
-  const totalCapacity = getTotalCapacity(providers)
-  console.log('Total available capacity:', totalCapacity)
+  // Get total capacity
+  const capacity = getTotalCapacity(providers)
+  console.log('Network capacity:', capacity)
 
-  const allocations: ProviderAllocation[] = []
-  let remainingCpu = targetCpu * 1000  // Convert to millicores
-  let remainingGpu = targetGpu
-
-  // Sort providers by capacity (largest first for CPU, or by GPU for GPU deployments)
+  // Get top providers by capacity (for display)
   const sortedProviders = [...providers].sort((a, b) => {
-    if (targetGpu > 0) {
-      // For GPU deployments, sort by GPU capacity
+    if (isGpuRequest) {
       return b.availableGpu - a.availableGpu
     }
-    // For CPU deployments, sort by CPU capacity
     return b.availableCpu - a.availableCpu
   })
+  const topProviders = sortedProviders.slice(0, 10)
 
-  for (const provider of sortedProviders) {
-    if (targetGpu > 0) {
-      // GPU allocation
-      if (remainingGpu <= 0) break
-      if (provider.availableGpu <= 0) continue
+  // Calculate if we can likely fill the request
+  const requestedAmount = isGpuRequest ? targetGpu : targetCpu
+  const availableAmount = isGpuRequest ? capacity.totalGpu : capacity.totalCpu
+  const capacityRatio = requestedAmount > 0 ? availableAmount / requestedAmount : 0
 
-      const gpusToAllocate = Math.min(provider.availableGpu, remainingGpu)
-      const cpusForGpus = gpusToAllocate * 2  // 2 CPUs per GPU
-      const memoryForGpus = gpusToAllocate * 4  // 4GiB per GPU
+  const canFill =
+    providers.length >= minProvidersRequired &&
+    capacityRatio >= capacityMultiplier
 
-      allocations.push({
-        provider,
-        requestedCpu: cpusForGpus,
-        requestedGpu: gpusToAllocate,
-        requestedMemoryGi: memoryForGpus
-      })
-
-      remainingGpu -= gpusToAllocate
-    } else {
-      // CPU allocation
-      if (remainingCpu <= 0) break
-      if (provider.availableCpu < minCpuPerDeployment * 1000) continue
-
-      const cpusToAllocate = Math.min(provider.availableCpu, remainingCpu)
-      const cpuUnits = Math.floor(cpusToAllocate / 1000)
-      const memoryGi = cpuUnits * memoryPerCpuGi
-
-      allocations.push({
-        provider,
-        requestedCpu: cpuUnits,
-        requestedGpu: 0,
-        requestedMemoryGi: memoryGi
-      })
-
-      remainingCpu -= cpuUnits * 1000
-    }
-  }
-
-  // Calculate totals
-  const totalAllocatedCpu = allocations.reduce((sum, a) => sum + a.requestedCpu, 0)
-  const totalAllocatedGpu = allocations.reduce((sum, a) => sum + a.requestedGpu, 0)
+  // Start with full request - will adapt based on bids received
+  // For CPU: request count=N instances (parallel containers on one provider)
+  // For GPU: request N GPUs (single container with multiple GPUs)
+  const initialRequestSize = requestedAmount
 
   return {
-    allocations,
-    totalCpu: totalAllocatedCpu,
-    totalGpu: totalAllocatedGpu,
-    deploymentsNeeded: allocations.length,
     requestedCpu: targetCpu,
     requestedGpu: targetGpu,
-    shortfall: {
-      cpu: Math.max(0, targetCpu - totalAllocatedCpu),
-      gpu: Math.max(0, targetGpu - totalAllocatedGpu)
-    }
+    totalCpu: capacity.totalCpu,
+    totalGpu: capacity.totalGpu,
+    providerCount: providers.length,
+    topProviders,
+    canFill,
+    capacityRatio,
+    initialRequestSize
   }
 }
 
@@ -225,146 +212,138 @@ export async function planFleetAllocation(
 // ============================================================================
 
 /**
- * Execute a fleet deployment plan
- *
- * @param signingClient - Cosmos signing client
- * @param owner - Wallet address
- * @param config - Base SDL configuration (without resource overrides)
- * @param plan - Allocation plan from planFleetAllocation
- * @param onProgress - Callback for progress updates
+ * Initialize fleet state for adaptive deployment
+ * Starts with full request, will create deployments dynamically based on bids
  */
-export async function deployFleet(
-  signingClient: SigningStargateClient,
-  owner: string,
-  config: Omit<SDLConfig, 'cpuUnits' | 'gpuUnits' | 'memoryGi'>,
-  plan: AllocationPlan,
-  onProgress?: FleetProgressCallback
-): Promise<FleetState> {
-  // Initialize fleet state
-  const state: FleetState = {
+export function initializeFleetState(
+  config: SDLConfig,
+  capacityCheck: CapacityCheck
+): FleetState {
+  const isGpu = config.minerType === 'cuda'
+  const totalRequested = isGpu ? capacityCheck.requestedGpu : capacityCheck.requestedCpu
+
+  return {
     config,
-    plan,
-    deployments: plan.allocations.map((allocation, index) => ({
-      index,
-      allocation,
-      status: 'pending' as FleetDeploymentStatus
-    })),
-    status: 'deploying',
+    capacityCheck,
+    deployments: [],  // Will be populated as deployments are created
+    status: 'ready',
     startedAt: new Date(),
+    remainingResources: totalRequested,
+    currentRequestSize: capacityCheck.initialRequestSize,
     stats: {
-      total: plan.allocations.length,
-      active: 0,
-      failed: 0,
-      pending: plan.allocations.length
+      totalRequested,
+      totalAllocated: 0,
+      deploymentsCreated: 0,
+      deploymentsActive: 0,
+      deploymentsFailed: 0
     }
   }
-
-  const updateState = () => {
-    state.stats = {
-      total: state.deployments.length,
-      active: state.deployments.filter(d => d.status === 'active').length,
-      failed: state.deployments.filter(d => d.status === 'failed').length,
-      pending: state.deployments.filter(d =>
-        !['active', 'failed'].includes(d.status)
-      ).length
-    }
-    onProgress?.(state)
-  }
-
-  updateState()
-
-  // Deploy each allocation sequentially
-  // (Could be parallelized in batches, but sequential is safer for wallet interactions)
-  for (const deployment of state.deployments) {
-    try {
-      await deployAllocation(
-        signingClient,
-        owner,
-        config,
-        deployment,
-        (updatedDeployment) => {
-          Object.assign(deployment, updatedDeployment)
-          updateState()
-        }
-      )
-    } catch (error) {
-      deployment.status = 'failed'
-      deployment.error = error instanceof Error ? error.message : String(error)
-      updateState()
-      // Continue with other deployments even if one fails
-    }
-  }
-
-  state.status = state.stats.failed === state.stats.total ? 'cancelled' : 'completed'
-  state.completedAt = new Date()
-  updateState()
-
-  return state
 }
 
 /**
- * Deploy a single allocation
+ * Create the next deployment item for the fleet
+ * For CPU: requests N CPUs in a single container (miner auto-parallelizes)
+ * For GPU: requests N GPUs in a single container
  */
-async function deployAllocation(
+export function createNextDeploymentItem(
+  state: FleetState,
+  requestSize: number
+): FleetDeploymentItem {
+  const isGpu = state.config.minerType === 'cuda'
+
+  // For CPU: N CPUs per instance, 1 instance (miner uses all available cores)
+  // For GPU: N GPUs per instance, 1 instance
+  const deployment: FleetDeploymentItem = {
+    index: state.deployments.length,
+    status: 'pending',
+    requestedCpu: isGpu ? 2 : requestSize,  // N CPUs for CPU miner, 2 for GPU
+    requestedGpu: isGpu ? requestSize : 0,  // N GPUs for GPU deployment
+    requestedMemoryGi: isGpu ? 4 * requestSize : 2 * requestSize,  // Scale memory with resources
+    instanceCount: 1  // Always 1 container - miner handles parallelization internally
+  }
+
+  return deployment
+}
+
+/**
+ * Create a single deployment and wait for bids
+ * Returns the deployment with available bids for user selection
+ */
+export async function createDeploymentAndGetBids(
   signingClient: SigningStargateClient,
   owner: string,
-  config: Omit<SDLConfig, 'cpuUnits' | 'gpuUnits' | 'memoryGi'>,
+  config: SDLConfig,
   deployment: FleetDeploymentItem,
-  onUpdate: (deployment: Partial<FleetDeploymentItem>) => void
-): Promise<void> {
-  const { allocation } = deployment
-
-  // Step 1: Generate SDL for this allocation
+  onUpdate: (update: Partial<FleetDeploymentItem>) => void
+): Promise<Bid[]> {
+  // Generate SDL for this deployment
+  // For CPU: 1 container with N CPUs (miner uses all cores)
+  // For GPU: 1 container with N GPUs
   onUpdate({ status: 'creating', startedAt: new Date() })
 
-  const sdl = generateSDLForAllocation(config, {
-    cpuUnits: allocation.requestedCpu,
-    gpuUnits: allocation.requestedGpu,
-    memoryGi: allocation.requestedMemoryGi
+  const isGpu = config.minerType === 'cuda'
+
+  const sdl = generateSDL({
+    ...config,
+    fleetSize: isGpu ? deployment.requestedGpu : deployment.requestedCpu,
+    cpuUnits: deployment.requestedCpu,
+    gpuUnits: isGpu ? deployment.requestedGpu : 0,
+    memoryGi: deployment.requestedMemoryGi,
+    instanceCount: 1  // Always 1 container - miner handles parallelization
   })
 
-  // Step 2: Create deployment
+  // Create deployment
   const deployResult = await createDeployment(signingClient, owner, sdl)
   onUpdate({
     dseq: deployResult.dseq,
     transactionHash: deployResult.transactionHash,
+    manifestJson: deployResult.manifestJson,
     status: 'waiting-bids'
   })
 
-  // Step 3: Wait for bids
+  // Wait for bids (2 minutes, polling every 5 seconds)
   const bids = await waitForBids(owner, deployResult.dseq, 120000, 5000)
 
-  if (bids.length === 0) {
-    throw new Error('No bids received')
+  onUpdate({
+    availableBids: bids,
+    status: bids.length > 0 ? 'selecting-bid' : 'failed',
+    error: bids.length === 0 ? 'No bids received' : undefined
+  })
+
+  return bids
+}
+
+/**
+ * Accept a bid and send manifest
+ */
+export async function acceptBidAndDeploy(
+  signingClient: SigningStargateClient,
+  owner: string,
+  deployment: FleetDeploymentItem,
+  selectedBid: Bid,
+  providerName: string,
+  onUpdate: (update: Partial<FleetDeploymentItem>) => void
+): Promise<void> {
+  if (!deployment.dseq || !deployment.manifestJson) {
+    throw new Error('Deployment not properly initialized')
   }
 
-  onUpdate({ status: 'selecting-bid' })
+  onUpdate({
+    selectedBid,
+    selectedProviderName: providerName,
+    status: 'accepting-bid'
+  })
 
-  // Step 4: Select best bid
-  // Prefer bid from our target provider, otherwise take lowest price
-  let selectedBid = bids.find(
-    b => b.bid.id.provider === allocation.provider.address
-  )
-
-  if (!selectedBid) {
-    // Fallback: select lowest price
-    selectedBid = [...bids].sort(
-      (a, b) => parseFloat(a.bid.price.amount) - parseFloat(b.bid.price.amount)
-    )[0]
-  }
-
-  onUpdate({ selectedBid, status: 'accepting-bid' })
-
-  // Step 5: Accept bid
+  // Accept the bid
   await acceptBid(signingClient, selectedBid)
   onUpdate({ status: 'sending-manifest' })
 
-  // Step 6: Send manifest
+  // Send manifest
   const manifestResult = await sendManifestViaConsole(
     owner,
-    deployResult.dseq,
+    deployment.dseq,
     selectedBid.bid.id.provider,
-    sdl
+    deployment.manifestJson
   )
 
   if (!manifestResult.success) {
@@ -375,6 +354,120 @@ async function deployAllocation(
     status: 'active',
     completedAt: new Date()
   })
+}
+
+/**
+ * Deploy fleet with automatic bid selection (lowest price)
+ *
+ * Adaptive deployment strategy:
+ * 1. Start with full request (e.g., 10 CPUs or 10 GPUs)
+ * 2. If no bids, halve the request and retry
+ * 3. Continue until all resources allocated or minimum reached
+ * 4. Auto-select lowest price bid for each deployment
+ */
+export async function deployFleetAutomatic(
+  signingClient: SigningStargateClient,
+  owner: string,
+  config: SDLConfig,
+  capacityCheck: CapacityCheck,
+  onProgress?: FleetProgressCallback
+): Promise<FleetState> {
+  const state = initializeFleetState(config, capacityCheck)
+  state.status = 'deploying'
+  const isGpu = config.minerType === 'cuda'
+
+  const updateStats = () => {
+    state.stats = {
+      totalRequested: isGpu ? capacityCheck.requestedGpu : capacityCheck.requestedCpu,
+      totalAllocated: state.deployments
+        .filter(d => d.status === 'active')
+        .reduce((sum, d) => sum + (isGpu ? d.requestedGpu : d.requestedCpu), 0),
+      deploymentsCreated: state.deployments.length,
+      deploymentsActive: state.deployments.filter(d => d.status === 'active').length,
+      deploymentsFailed: state.deployments.filter(d => d.status === 'failed').length
+    }
+    onProgress?.(state)
+  }
+
+  updateStats()
+
+  // Adaptive deployment loop
+  while (state.remainingResources > 0) {
+    // Create deployment for current request size
+    const requestSize = Math.min(state.currentRequestSize, state.remainingResources)
+    const deployment = createNextDeploymentItem(state, requestSize)
+    state.deployments.push(deployment)
+    updateStats()
+
+    try {
+      // Create deployment and get bids
+      const bids = await createDeploymentAndGetBids(
+        signingClient,
+        owner,
+        config,
+        deployment,
+        (update) => {
+          Object.assign(deployment, update)
+          updateStats()
+        }
+      )
+
+      if (bids.length === 0) {
+        // No bids - reduce request size and retry
+        deployment.status = 'failed'
+        deployment.error = `No bids for ${requestSize} ${isGpu ? 'GPU' : 'CPU'}${requestSize > 1 ? 's' : ''}`
+        updateStats()
+
+        // Halve the request size (minimum 1)
+        if (state.currentRequestSize > 1) {
+          state.currentRequestSize = Math.max(1, Math.floor(state.currentRequestSize / 2))
+          console.log(`No bids received, reducing request to ${state.currentRequestSize}`)
+          continue
+        } else {
+          // Already at minimum, give up on remaining
+          console.log('No bids at minimum size, stopping')
+          break
+        }
+      }
+
+      // Auto-select lowest price bid
+      const sortedBids = [...bids].sort(
+        (a, b) => parseFloat(a.bid.price.amount) - parseFloat(b.bid.price.amount)
+      )
+      const selectedBid = sortedBids[0]
+      const providerName = selectedBid.bid.id.provider.slice(0, 12) + '...'
+
+      // Accept bid and deploy
+      await acceptBidAndDeploy(
+        signingClient,
+        owner,
+        deployment,
+        selectedBid,
+        providerName,
+        (update) => {
+          Object.assign(deployment, update)
+          updateStats()
+        }
+      )
+
+      // Successfully allocated - update remaining
+      const allocated = isGpu ? deployment.requestedGpu : deployment.requestedCpu
+      state.remainingResources -= allocated
+      console.log(`Allocated ${allocated} ${isGpu ? 'GPU' : 'CPU'}(s), remaining: ${state.remainingResources}`)
+
+    } catch (error) {
+      deployment.status = 'failed'
+      deployment.error = error instanceof Error ? error.message : String(error)
+      updateStats()
+      // Continue trying with remaining resources
+    }
+  }
+
+  state.status = state.stats.deploymentsActive === 0 ? 'cancelled' : 'completed'
+  state.completedAt = new Date()
+  updateStats()
+
+  return state
 }
 
 // ============================================================================
@@ -391,9 +484,9 @@ export function cancelFleet(state: FleetState): FleetState {
     completedAt: new Date(),
     deployments: state.deployments.map(d => ({
       ...d,
-      status: d.status === 'pending' ? 'failed' : d.status,
-      error: d.status === 'pending' ? 'Cancelled by user' : d.error
-    }))
+      status: ['pending', 'selecting-bid'].includes(d.status) ? 'failed' : d.status,
+      error: ['pending', 'selecting-bid'].includes(d.status) ? 'Cancelled by user' : d.error
+    })) as FleetDeploymentItem[]
   }
 }
 
@@ -406,22 +499,57 @@ export function getFleetSummary(state: FleetState): {
   failedDeployments: number
   totalCpuDeployed: number
   totalGpuDeployed: number
+  totalInstancesDeployed: number
   dseqs: string[]
 } {
   const activeDeployments = state.deployments.filter(d => d.status === 'active')
+  const isGpu = state.config.minerType === 'cuda'
 
   return {
     totalDeployments: state.deployments.length,
     activeDeployments: activeDeployments.length,
     failedDeployments: state.deployments.filter(d => d.status === 'failed').length,
-    totalCpuDeployed: activeDeployments.reduce(
-      (sum, d) => sum + d.allocation.requestedCpu,
-      0
-    ),
-    totalGpuDeployed: activeDeployments.reduce(
-      (sum, d) => sum + d.allocation.requestedGpu,
-      0
-    ),
+    // For CPU: count requestedCpu, for GPU: count requestedGpu
+    totalCpuDeployed: activeDeployments.reduce((sum, d) => sum + d.requestedCpu, 0),
+    totalGpuDeployed: activeDeployments.reduce((sum, d) => sum + d.requestedGpu, 0),
+    totalInstancesDeployed: activeDeployments.reduce((sum, d) => sum + d.instanceCount, 0),
     dseqs: activeDeployments.map(d => d.dseq!).filter(Boolean)
+  }
+}
+
+// Legacy exports for backward compatibility
+export type { ProviderCapacity }
+export interface AllocationPlan {
+  allocations: { provider: ProviderCapacity; requestedCpu: number; requestedGpu: number; requestedMemoryGi: number }[]
+  totalCpu: number
+  totalGpu: number
+  deploymentsNeeded: number
+  requestedCpu: number
+  requestedGpu: number
+  shortfall: { cpu: number; gpu: number }
+}
+
+export async function planFleetAllocation(
+  targetCpu: number,
+  targetGpu: number,
+  _options: Record<string, unknown> = {}
+): Promise<AllocationPlan> {
+  const check = await checkNetworkCapacity(targetCpu, targetGpu)
+  return {
+    allocations: check.topProviders.map(p => ({
+      provider: p,
+      requestedCpu: targetGpu > 0 ? 2 : 1,
+      requestedGpu: targetGpu > 0 ? 1 : 0,
+      requestedMemoryGi: targetGpu > 0 ? 4 : 2
+    })),
+    totalCpu: check.totalCpu,
+    totalGpu: check.totalGpu,
+    deploymentsNeeded: check.deploymentsNeeded,
+    requestedCpu: targetCpu,
+    requestedGpu: targetGpu,
+    shortfall: {
+      cpu: Math.max(0, targetCpu - check.totalCpu),
+      gpu: Math.max(0, targetGpu - check.totalGpu)
+    }
   }
 }

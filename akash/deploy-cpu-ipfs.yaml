@@ -6,6 +6,10 @@ version: "2.0"
 services:
   cpu-miner:
     image: hub.docker.com/carback1/quip-protocol-cpu-miner:v0.0.1
+    # Don't restart when container exits (job-style workload)
+    # Container will exit after IPFS upload completes
+    # Note: You still need to close the deployment to release the lease
+    restart: "never"
     env:
       - MINING_DURATION=10m
       - DIFFICULTY_ENERGY=-14900

@@ -9,8 +9,9 @@ This guide covers building, testing, and deploying Dockerized mining experiments
 3. [Building Docker Images](#building-docker-images)
 4. [Testing Locally](#testing-locally)
 5. [AWS Deployment](#aws-deployment)
-6. [Configuration Reference](#configuration-reference)
-7. [Troubleshooting](#troubleshooting)
+6. [Akash Network Deployment](#akash-network-deployment)
+7. [Configuration Reference](#configuration-reference)
+8. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -509,6 +510,121 @@ cat results/results_${EXPERIMENT_ID}.csv
 For detailed AWS deployment instructions, see:
 - [aws/README_AWS_DEPLOYMENT.md](aws/README_AWS_DEPLOYMENT.md) - Complete AWS guide
 - [docker/README.md](docker/README.md) - Docker-specific documentation
+
+---
+
+## Akash Network Deployment
+
+**Akash** is a decentralized cloud computing marketplace offering 2-5x cost savings compared to AWS. It's perfect for 90-minute mining experiments with automatic result retrieval via HTTP.
+
+### Why Akash?
+
+✅ **70% cheaper** than AWS for GPU workloads
+✅ **Per-second billing** - no hourly minimums
+✅ **HTTP result retrieval** - download logs and JSON directly
+✅ **Decentralized** - no single point of failure
+✅ **Easy deployment** - simple YAML configuration
+
+### Quick Start
+
+**1. Install Akash CLI:**
+```bash
+# macOS
+brew tap ovrclk/tap
+brew install akash-provider-services
+
+# Linux
+curl -sSfL https://raw.githubusercontent.com/akash-network/node/master/install.sh | sh
+```
+
+**2. Setup wallet and fund with AKT:**
+```bash
+# Create wallet
+akash keys add default
+
+# Fund wallet (buy AKT on exchanges or use testnet faucet)
+# Minimum recommended: 10 AKT for testing
+```
+
+**3. Build and push Docker images:**
+```bash
+# Set your container registry
+export REGISTRY=ghcr.io/your-username
+
+# Build Akash-optimized images
+./akash/build_akash_images.sh
+
+# Push to registry
+docker push $REGISTRY/quip-protocol-cpu-miner:latest
+docker push $REGISTRY/quip-protocol-cuda-miner:latest
+```
+
+**4. Update SDL files with your registry:**
+Edit `akash/deploy-cpu.yaml` and `akash/deploy-cuda.yaml`:
+```yaml
+services:
+  cpu-miner:
+    image: ghcr.io/your-username/quip-protocol-cpu-miner:latest
+```
+
+**5. Deploy to Akash:**
+```bash
+# Deploy 10 CPU instances
+export MINER_TYPE=cpu
+export FLEET_SIZE=10
+./akash/deploy.sh
+
+# Or deploy CUDA GPU instances
+export MINER_TYPE=cuda
+export FLEET_SIZE=10
+./akash/deploy.sh
+```
+
+**6. Accept bids (follow on-screen instructions)**
+
+**7. Wait 90 minutes for mining to complete**
+
+**8. Retrieve results:**
+```bash
+# Download all results via HTTP
+./akash/retrieve_results.sh akash/deployments_cpu_20250119_120000.txt
+
+# Results saved to: ./akash_results/
+# - deployment_<id>.json (mining results)
+# - deployment_<id>.log (console logs)
+# - summary.txt (aggregated statistics)
+```
+
+**9. Close deployments to stop billing:**
+```bash
+./akash/close_deployments.sh akash/deployments_cpu_20250119_120000.txt
+```
+
+### Cost Comparison (90-minute experiment)
+
+| Configuration | Akash | AWS Spot | Savings |
+|---------------|-------|----------|---------|
+| 10 CPU instances | ~$0.30 | ~$0.63 | 52% |
+| 10 CUDA GPU instances | ~$2.25 | ~$7.89 | 71% |
+
+### Key Differences from AWS
+
+**Akash:**
+- Results available via HTTP endpoint (no S3 needed)
+- Marketplace bidding model (wait for providers)
+- Variable hardware specs
+- Lower cost but less guaranteed uptime
+
+**AWS:**
+- Results via S3 or SSH
+- Instant provisioning
+- Consistent hardware
+- Higher cost but enterprise-grade reliability
+
+### Complete Documentation
+
+For detailed Akash deployment instructions, see:
+- **[akash/README_AKASH.md](akash/README_AKASH.md)** - Complete Akash guide with troubleshooting
 
 ---
 

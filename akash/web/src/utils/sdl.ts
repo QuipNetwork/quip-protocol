@@ -6,15 +6,16 @@ import { DOCKER_IMAGES } from '../config/constants'
  */
 export interface SDLConfig {
   minerType: 'cpu' | 'cuda'
-  fleetSize: number  // Now represents total CPUs/GPUs wanted across fleet
+  fleetSize: number  // Total CPUs/GPUs wanted (becomes instance count)
   miningDuration: string
   difficultyEnergy: number
   minDiversity: number
   minSolutions: number
   // Optional: dynamic resource allocation for fleet deployments
-  cpuUnits?: number    // Override default CPU units
-  gpuUnits?: number    // Override default GPU units (for CUDA)
-  memoryGi?: number    // Override default memory in GiB
+  cpuUnits?: number    // Override default CPU units per instance
+  gpuUnits?: number    // Override default GPU units per instance (for CUDA)
+  memoryGi?: number    // Override default memory in GiB per instance
+  instanceCount?: number  // Number of container instances to run (default: 1)
   // Optional: IPFS configuration for result uploads
   ipfsNode?: string    // IPFS node API endpoint
   ipfsApiKey?: string  // Bearer token for IPFS API authentication
@@ -59,18 +60,26 @@ export function generateSDL(config: SDLConfig): object {
   // Service name that shows up in Akash Console
   const serviceName = `quip-${config.minerType}-miner`
 
-  // Calculate pricing based on resources
+  // Instance count - how many containers to run
+  const instanceCount = config.instanceCount ?? 1
+
+  // Calculate pricing based on resources PER INSTANCE
   // Base: 10000 uakt/block for 1 CPU
   // Scale with CPU count, add premium for GPU
   const basePricePerCpu = 10000
   const gpuPremium = 50000  // Additional per GPU
-  const priceAmount = (cpuUnits * basePricePerCpu) + (gpuUnits * gpuPremium)
+  const pricePerInstance = (cpuUnits * basePricePerCpu) + (gpuUnits * gpuPremium)
+  // Total price scales with instance count
+  const priceAmount = pricePerInstance * instanceCount
 
   return {
     version: '2.0',
     services: {
       [serviceName]: {
         image,
+        // Don't restart when container exits - this is a job-style workload
+        // Container will exit after mining completes and IPFS upload succeeds
+        restart: 'never',
         expose: [
           {
             port: 8080,
@@ -115,7 +124,7 @@ export function generateSDL(config: SDLConfig): object {
       [serviceName]: {
         dcloud: {
           profile: serviceName,
-          count: 1  // Single instance per deployment - use multiple deployments for fleet
+          count: instanceCount  // Number of container instances to run
         }
       }
     }
