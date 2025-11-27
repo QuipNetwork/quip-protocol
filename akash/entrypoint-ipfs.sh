@@ -66,31 +66,71 @@ upload_to_ipfs() {
     fi
 
     echo "Uploading $filename to IPFS..." | tee -a "$OUTPUT_LOG"
+    echo "  IPFS Node: $IPFS_NODE" | tee -a "$OUTPUT_LOG"
+    echo "  File size: $(ls -lh "$file" | awk '{print $5}')" | tee -a "$OUTPUT_LOG"
 
-    # Upload via IPFS HTTP API
-    local IPFS_RESPONSE=$(curl -X POST \
-        -H "Authorization: Bearer $IPFS_API_KEY" \
+    # Upload via IPFS HTTP API (capture both stdout and stderr)
+    local CURL_OUTPUT=$(mktemp)
+    local HTTP_CODE=$(curl -s -w "%{http_code}" -X POST \
+        -H "X-API-Key: $IPFS_API_KEY" \
         -F "file=@$file" \
         "${IPFS_NODE}/api/v0/add?pin=${IPFS_PIN}&wrap-with-directory=false" \
-        2>/dev/null)
+        -o "$CURL_OUTPUT" 2>&1)
+    local CURL_EXIT=$?
+    local IPFS_RESPONSE=$(cat "$CURL_OUTPUT")
+    rm -f "$CURL_OUTPUT"
 
-    if [ $? -eq 0 ]; then
-        # Extract CID (hash)
-        local CID=$(echo "$IPFS_RESPONSE" | grep -o '"Hash":"[^"]*' | cut -d'"' -f4)
+    echo "  Curl exit code: $CURL_EXIT, HTTP status: $HTTP_CODE" | tee -a "$OUTPUT_LOG"
 
-        if [ -n "$CID" ]; then
-            echo "✓ Uploaded to IPFS: $CID" | tee -a "$OUTPUT_LOG"
-            echo "  Gateway URL: https://ipfs.io/ipfs/$CID" | tee -a "$OUTPUT_LOG"
-            echo "  Your gateway: ${IPFS_NODE}/ipfs/$CID" | tee -a "$OUTPUT_LOG"
-
-            # Save CID to file for easy retrieval
-            echo "$CID" > "${file}.cid"
-
-            return 0
-        fi
+    if [ $CURL_EXIT -ne 0 ]; then
+        echo "  Curl error: $IPFS_RESPONSE" | tee -a "$OUTPUT_LOG"
+        echo "✗ IPFS upload failed for $filename (curl error)" | tee -a "$OUTPUT_LOG"
+        return 1
     fi
 
-    echo "✗ IPFS upload failed for $filename" | tee -a "$OUTPUT_LOG"
+    if [ "$HTTP_CODE" != "200" ]; then
+        echo "  HTTP error response: $IPFS_RESPONSE" | tee -a "$OUTPUT_LOG"
+        echo "✗ IPFS upload failed for $filename (HTTP $HTTP_CODE)" | tee -a "$OUTPUT_LOG"
+        return 1
+    fi
+
+    # Extract CID (hash)
+    local CID=$(echo "$IPFS_RESPONSE" | grep -o '"Hash":"[^"]*' | cut -d'"' -f4)
+
+    if [ -n "$CID" ]; then
+        echo "✓ Uploaded to IPFS: $CID" | tee -a "$OUTPUT_LOG"
+        echo "  Gateway URL: https://ipfs.io/ipfs/$CID" | tee -a "$OUTPUT_LOG"
+        echo "  Your gateway: ${IPFS_NODE}/ipfs/$CID" | tee -a "$OUTPUT_LOG"
+
+        # Save CID to file for easy retrieval
+        echo "$CID" > "${file}.cid"
+
+        # Add to MFS (Mutable File System) so it shows in IPFS Web UI Files view
+        local MFS_PATH="/${DEPLOYMENT_ID}/${filename}"
+        echo "  Adding to MFS: $MFS_PATH" | tee -a "$OUTPUT_LOG"
+
+        # Create directory if needed
+        curl -s -X POST \
+            -H "X-API-Key: $IPFS_API_KEY" \
+            "${IPFS_NODE}/api/v0/files/mkdir?arg=/${DEPLOYMENT_ID}&parents=true" \
+            > /dev/null 2>&1
+
+        # Copy file to MFS
+        local MFS_RESPONSE=$(curl -s -X POST \
+            -H "X-API-Key: $IPFS_API_KEY" \
+            "${IPFS_NODE}/api/v0/files/cp?arg=/ipfs/${CID}&arg=${MFS_PATH}" 2>&1)
+
+        if [ $? -eq 0 ]; then
+            echo "  ✓ Added to MFS: $MFS_PATH" | tee -a "$OUTPUT_LOG"
+        else
+            echo "  ⚠ MFS copy failed (file still available via CID): $MFS_RESPONSE" | tee -a "$OUTPUT_LOG"
+        fi
+
+        return 0
+    fi
+
+    echo "  Response (no CID found): $IPFS_RESPONSE" | tee -a "$OUTPUT_LOG"
+    echo "✗ IPFS upload failed for $filename (no CID in response)" | tee -a "$OUTPUT_LOG"
     return 1
 }
 

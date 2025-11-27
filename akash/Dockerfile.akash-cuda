@@ -1,21 +1,22 @@
 # Akash-optimized Dockerfile for CUDA mining
+# Multi-stage build for minimal image size (~4GB savings vs devel image)
 # Includes HTTP server for log/result retrieval
-FROM nvidia/cuda:13.0.2-devel-ubuntu22.04
 
-LABEL maintainer="Quip Protocol"
-LABEL description="CUDA GPU miner for Akash Network with HTTP result server"
+# =============================================================================
+# Stage 1: Builder - Install dependencies and compile with CUDA toolkit
+# =============================================================================
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install Python 3.13 and dependencies
-RUN apt-get update && apt-get install -y \
+# Install Python 3.13 and build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
     software-properties-common \
     && add-apt-repository ppa:deadsnakes/ppa \
-    && apt-get update && apt-get install -y \
+    && apt-get update && apt-get install -y --no-install-recommends \
     python3.13 \
     python3.13-dev \
     python3.13-venv \
-    python3-pip \
     build-essential \
     gcc \
     g++ \
@@ -31,29 +32,83 @@ RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.13 1
 # Install pip for Python 3.13
 RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.13
 
-# Set working directory
-WORKDIR /app
+WORKDIR /build
 
-# Copy project files
-COPY pyproject.toml README.md LICENSE ./
-COPY blockchain_base.py ./
-COPY GPU/ ./GPU/
-COPY tools/ ./tools/
-COPY dwave_topologies/ ./dwave_topologies/
-
-# Create virtual environment and install project with dependencies (including CuPy from pyproject.toml)
+# Create virtual environment
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+
+# Install Python dependencies first (better layer caching)
+COPY akash/requirements-mining-cuda.txt ./requirements.txt
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -e .
+    pip install --no-cache-dir -r requirements.txt
+
+# Copy source code
+COPY pyproject.toml README.md LICENSE ./
+COPY blockchain_base.py ./
+COPY quip_cli.py ./
+COPY shared/ ./shared/
+COPY GPU/ ./GPU/
+
+# Install the project (registers entry points)
+RUN pip install --no-cache-dir -e . --no-deps
+
+# =============================================================================
+# Stage 2: Runtime - Minimal CUDA runtime image (no compiler toolchain)
+# =============================================================================
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+
+LABEL maintainer="Quip Protocol"
+LABEL description="CUDA GPU miner for Akash Network with HTTP result server (optimized)"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Python 3.13 runtime and curl (for healthcheck)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3.13 \
+    python3.13-venv \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Set Python 3.13 as default
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.13 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.13 1
+
+WORKDIR /app
+
+# Copy virtual environment from builder (includes all compiled packages)
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy application code from builder
+COPY --from=builder /build/pyproject.toml /build/README.md /build/LICENSE ./
+COPY --from=builder /build/blockchain_base.py /build/quip_cli.py ./
+COPY --from=builder /build/shared/ ./shared/
+COPY --from=builder /build/GPU/ ./GPU/
+
+# Copy only the specific topology files needed (not entire directory)
+# This saves ~15MB by excluding unused topology files
+COPY dwave_topologies/__init__.py ./dwave_topologies/
+COPY dwave_topologies/topologies/__init__.py ./dwave_topologies/topologies/
+COPY dwave_topologies/topologies/json_loader.py ./dwave_topologies/topologies/
+COPY dwave_topologies/topologies/advantage2_system1_8.json.gz ./dwave_topologies/topologies/
+COPY dwave_topologies/topologies/advantage2_system4_1.json.gz ./dwave_topologies/topologies/
+
+# Copy the mining tool script
+COPY tools/compare_mining_rates.py ./tools/
 
 # Set environment variables
+ENV PYTHONUNBUFFERED=1
 ENV MINER_TYPE=cuda
 ENV MINING_DURATION=90m
 ENV DIFFICULTY_ENERGY=-14900
 ENV MIN_DIVERSITY=0.1
 ENV MIN_SOLUTIONS=5
-ENV TOPOLOGY_FILE=dwave_topologies/topologies/advantage2_system1_7.json.gz
+ENV TOPOLOGY_FILE=dwave_topologies/topologies/advantage2_system1_8.json.gz
 ENV GPU_DEVICE=0
 ENV CUDA_HOME=/usr/local/cuda
 ENV PATH=${CUDA_HOME}/bin:${PATH}

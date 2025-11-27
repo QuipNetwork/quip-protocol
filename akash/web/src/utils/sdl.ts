@@ -15,6 +15,10 @@ export interface SDLConfig {
   cpuUnits?: number    // Override default CPU units
   gpuUnits?: number    // Override default GPU units (for CUDA)
   memoryGi?: number    // Override default memory in GiB
+  // Optional: IPFS configuration for result uploads
+  ipfsNode?: string    // IPFS node API endpoint
+  ipfsApiKey?: string  // Bearer token for IPFS API authentication
+  ipfsPin?: boolean    // Whether to pin files permanently (default: true)
 }
 
 /**
@@ -82,7 +86,11 @@ export function generateSDL(config: SDLConfig): object {
           `MIN_SOLUTIONS=${config.minSolutions}`,
           // Pass resource info so container can auto-detect
           `REQUESTED_CPUS=${cpuUnits}`,
-          `REQUESTED_GPUS=${gpuUnits}`
+          `REQUESTED_GPUS=${gpuUnits}`,
+          // IPFS configuration (only if configured)
+          ...(config.ipfsNode ? [`IPFS_NODE=${config.ipfsNode}`] : []),
+          ...(config.ipfsApiKey ? [`IPFS_API_KEY=${config.ipfsApiKey}`] : []),
+          ...(config.ipfsNode ? [`IPFS_PIN=${config.ipfsPin ?? true}`] : [])
         ]
       }
     },

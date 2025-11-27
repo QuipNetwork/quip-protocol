@@ -1,0 +1,32 @@
+# Minimal dependencies for CUDA GPU mining on Akash
+# Excludes visualization (matplotlib, pandas, seaborn) and audio packages
+
+# Core D-Wave SDK for Ising model and sampling
+dwave-ocean-sdk>=6.0.0
+
+# Numerical computing
+numpy>=1.24.0
+
+# Async HTTP for P2P networking
+aiohttp>=3.9.0
+
+# CLI interface
+click>=8.1.7
+
+# Environment variable loading
+python-dotenv>=1.0.0
+
+# TOML config parsing (included in Python 3.11+, but listed for compatibility)
+tomli>=2.0.1; python_version<'3.11'
+
+# Post-quantum signatures (SPHINCS+)
+hashsigs>=0.0.2
+
+# Fast hashing
+blake3>=1.0.5
+
+# PyTorch for GPU tensor operations (CUDA version)
+torch>=2.0.0
+
+# CuPy for CUDA-accelerated operations
+cupy-cuda12x>=13.0.0

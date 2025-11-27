@@ -53,6 +53,11 @@ export function DeploymentForm() {
   const [minDiversity, setMinDiversity] = useState(DEFAULTS.diversity)
   const [minSolutions, setMinSolutions] = useState(DEFAULTS.minSolutions)
   const [estimatedCost, setEstimatedCost] = useState('0')
+
+  // IPFS Configuration
+  const [ipfsEnabled, setIpfsEnabled] = useState(false)
+  const [ipfsNode, setIpfsNode] = useState('')
+  const [ipfsApiKey, setIpfsApiKey] = useState('')
   const [isDeploying, setIsDeploying] = useState(false)
   const [deploymentStatus, setDeploymentStatus] = useState<string>('')
   const [alert, setAlert] = useState<{ type: 'info' | 'success' | 'error'; message: string } | null>(null)
@@ -91,6 +96,15 @@ export function DeploymentForm() {
       checkAndLoadCertificate()
     }
   }, [isConnected, address, checkAndLoadCertificate])
+
+  // Load saved IPFS settings from localStorage
+  useEffect(() => {
+    const savedNode = localStorage.getItem('ipfs_node')
+    if (savedNode) {
+      setIpfsNode(savedNode)
+      setIpfsEnabled(true)
+    }
+  }, [])
 
   // Update cost estimate when form values change
   // For fleet mode, estimate based on total resources
@@ -149,7 +163,11 @@ export function DeploymentForm() {
         miningDuration,
         difficultyEnergy,
         minDiversity,
-        minSolutions
+        minSolutions,
+        // Include IPFS config if enabled
+        ipfsNode: ipfsEnabled ? ipfsNode : undefined,
+        ipfsApiKey: ipfsEnabled ? ipfsApiKey : undefined,
+        ipfsPin: ipfsEnabled,
       })
 
       console.log('Generated SDL:', sdl)
@@ -431,7 +449,11 @@ export function DeploymentForm() {
     miningDuration,
     difficultyEnergy,
     minDiversity,
-    minSolutions
+    minSolutions,
+    // Include IPFS config if enabled
+    ipfsNode: ipfsEnabled ? ipfsNode : undefined,
+    ipfsApiKey: ipfsEnabled ? ipfsApiKey : undefined,
+    ipfsPin: ipfsEnabled,
   }
 
   // Show fleet deployment UI if in fleet mode
@@ -796,6 +818,52 @@ export function DeploymentForm() {
           />
           <small>Minimum number of valid solutions required</small>
         </div>
+
+        {/* IPFS Configuration */}
+        <div className="form-group">
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={ipfsEnabled}
+              onChange={(e) => setIpfsEnabled(e.target.checked)}
+            />
+            Enable IPFS Upload
+          </label>
+          <small>Upload mining results to IPFS for permanent storage</small>
+        </div>
+
+        {ipfsEnabled && (
+          <>
+            <div className="form-group">
+              <label htmlFor="ipfsNode">IPFS Node URL</label>
+              <input
+                type="url"
+                id="ipfsNode"
+                value={ipfsNode}
+                onChange={(e) => {
+                  setIpfsNode(e.target.value)
+                  localStorage.setItem('ipfs_node', e.target.value)
+                }}
+                placeholder="https://your-ipfs-node.example.com"
+                required={ipfsEnabled}
+              />
+              <small>Your IPFS node API endpoint (will be saved for future use)</small>
+            </div>
+
+            <div className="form-group">
+              <label htmlFor="ipfsApiKey">IPFS API Key</label>
+              <input
+                type="password"
+                id="ipfsApiKey"
+                value={ipfsApiKey}
+                onChange={(e) => setIpfsApiKey(e.target.value)}
+                placeholder="Your API key"
+                required={ipfsEnabled}
+              />
+              <small>Bearer token for IPFS API authentication (not saved)</small>
+            </div>
+          </>
+        )}
 
         <div className="alert alert-info cost-estimate">
           <strong>Estimated Cost:</strong> {estimatedCost} AKT for {miningDuration}
