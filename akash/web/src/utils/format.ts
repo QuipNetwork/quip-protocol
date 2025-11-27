@@ -19,10 +19,44 @@ export function truncateAddress(address: string | undefined): string {
 
 /**
  * Format a date for display
+ * Note: Akash API returns block heights for created_at, not timestamps
  */
-export function formatDate(date: Date | string): string {
+export function formatDate(date: Date | string | number): string {
+  // If it's a number or numeric string (block height), display as block #
+  if (typeof date === 'number' || (typeof date === 'string' && /^\d+$/.test(date))) {
+    return `Block #${date}`
+  }
   const d = typeof date === 'string' ? new Date(date) : date
+  if (isNaN(d.getTime())) {
+    return `Block #${date}`
+  }
   return d.toLocaleString()
+}
+
+/**
+ * Calculate uptime from block heights
+ * Akash blocks are approximately 6 seconds apart
+ */
+export function calculateUptime(createdAtBlock: string | number, currentBlock: number): string {
+  const created = typeof createdAtBlock === 'string' ? parseInt(createdAtBlock, 10) : createdAtBlock
+  if (isNaN(created) || created <= 0) return 'Unknown'
+
+  const blockDiff = currentBlock - created
+  if (blockDiff < 0) return 'Not started'
+
+  // ~6 seconds per block
+  const totalSeconds = blockDiff * 6
+  const days = Math.floor(totalSeconds / 86400)
+  const hours = Math.floor((totalSeconds % 86400) / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+
+  if (days > 0) {
+    return `${days}d ${hours}h ${minutes}m`
+  } else if (hours > 0) {
+    return `${hours}h ${minutes}m`
+  } else {
+    return `${minutes}m`
+  }
 }
 
 /**

@@ -2,19 +2,23 @@
 // Get your own at https://cloud.walletconnect.com/
 export const WALLETCONNECT_PROJECT_ID = '8f26f1d68dd60fa28cd4369dc06cdb79'
 
-// Akash Network - using CORS-enabled endpoints
-// Note: Many public RPC endpoints don't have CORS enabled for browser requests
-// These endpoints are known to work with browser-based apps
-export const AKASH_RPC = 'https://rpc.cosmos.directory/akash'
-export const AKASH_REST = 'https://rest.cosmos.directory/akash'
+// Detect development mode
+const isDev = import.meta.env.DEV
+
+// Akash Network endpoints
+// In development: use Vite proxy to avoid CORS issues
+// In production: use direct URLs (requires proper CORS or same-origin deployment)
+export const AKASH_RPC = 'https://akash-rpc.polkachu.com'
+export const AKASH_REST = isDev ? '/api/akash' : 'https://akash-api.polkachu.com'
+export const AKASH_CONSOLE_API = isDev ? '/api/console' : 'https://console-api.akash.network'
 export const AKASH_CHAIN_ID = 'akashnet-2'
 export const AKASH_DENOM = 'uakt'
 export const AKASH_DECIMALS = 6
 
-// Docker images
+// Docker images (must match Docker Hub repository names)
 export const DOCKER_IMAGES = {
-  cpu: 'carback1/quip-miner:cpu-latest',
-  cuda: 'carback1/quip-miner:cuda-latest',
+  cpu: 'carback1/quip-protocol-cpu-miner:latest',
+  cuda: 'carback1/quip-protocol-cuda-miner:latest',
 }
 
 // Mining defaults

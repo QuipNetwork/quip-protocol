@@ -1,38 +1,71 @@
 import { DOCKER_IMAGES } from '../config/constants'
 
+/**
+ * SDL configuration for single deployment
+ * Used by DeploymentForm for manual deployments
+ */
 export interface SDLConfig {
   minerType: 'cpu' | 'cuda'
-  fleetSize: number
+  fleetSize: number  // Now represents total CPUs/GPUs wanted across fleet
   miningDuration: string
   difficultyEnergy: number
   minDiversity: number
   minSolutions: number
+  // Optional: dynamic resource allocation for fleet deployments
+  cpuUnits?: number    // Override default CPU units
+  gpuUnits?: number    // Override default GPU units (for CUDA)
+  memoryGi?: number    // Override default memory in GiB
 }
 
 /**
  * Generate SDL configuration for Akash deployment
+ *
+ * Format matches Akash Console's Hello World SDL for proper events/logs visibility
+ *
+ * Resource allocation:
+ * - Default: 1 CPU, 2GiB memory for CPU miner; 2 CPU, 1 GPU, 4GiB for CUDA
+ * - Fleet mode: Use cpuUnits/gpuUnits/memoryGi to request specific resources
  */
 export function generateSDL(config: SDLConfig): object {
   const isCuda = config.minerType === 'cuda'
   const image = isCuda ? DOCKER_IMAGES.cuda : DOCKER_IMAGES.cpu
 
-  const resources = isCuda
-    ? {
-        cpu: { units: 2 },
-        memory: { size: '4Gi' },
-        storage: [{ size: '10Gi' }],
-        gpu: { units: 1, attributes: { vendor: { nvidia: {} } } }
-      }
-    : {
-        cpu: { units: 1 },
-        memory: { size: '2Gi' },
-        storage: [{ size: '5Gi' }]
-      }
+  // Determine resource allocation
+  // For fleet deployments, use explicit values; otherwise use defaults
+  const cpuUnits = config.cpuUnits ?? (isCuda ? 2 : 1)
+  const memoryGi = config.memoryGi ?? (isCuda ? 4 : 2)
+  const gpuUnits = config.gpuUnits ?? (isCuda ? 1 : 0)
+  const storageGi = isCuda ? 10 : 5
+
+  // Build resources object
+  const resources: Record<string, unknown> = {
+    cpu: { units: cpuUnits },
+    memory: { size: `${memoryGi}Gi` },
+    storage: { size: `${storageGi}Gi` }
+  }
+
+  // Add GPU resources for CUDA deployments
+  if (gpuUnits > 0) {
+    resources.gpu = {
+      units: gpuUnits,
+      attributes: { vendor: { nvidia: {} } }
+    }
+  }
+
+  // Service name that shows up in Akash Console
+  const serviceName = `quip-${config.minerType}-miner`
+
+  // Calculate pricing based on resources
+  // Base: 10000 uakt/block for 1 CPU
+  // Scale with CPU count, add premium for GPU
+  const basePricePerCpu = 10000
+  const gpuPremium = 50000  // Additional per GPU
+  const priceAmount = (cpuUnits * basePricePerCpu) + (gpuUnits * gpuPremium)
 
   return {
     version: '2.0',
     services: {
-      miner: {
+      [serviceName]: {
         image,
         expose: [
           {
@@ -46,32 +79,35 @@ export function generateSDL(config: SDLConfig): object {
           `MINING_DURATION=${config.miningDuration}`,
           `DIFFICULTY_ENERGY=${config.difficultyEnergy}`,
           `MIN_DIVERSITY=${config.minDiversity}`,
-          `MIN_SOLUTIONS=${config.minSolutions}`
+          `MIN_SOLUTIONS=${config.minSolutions}`,
+          // Pass resource info so container can auto-detect
+          `REQUESTED_CPUS=${cpuUnits}`,
+          `REQUESTED_GPUS=${gpuUnits}`
         ]
       }
     },
     profiles: {
       compute: {
-        miner: {
+        [serviceName]: {
           resources
         }
       },
       placement: {
-        akash: {
+        dcloud: {
           pricing: {
-            miner: {
+            [serviceName]: {
               denom: 'uakt',
-              amount: isCuda ? 10000 : 1000
+              amount: priceAmount
             }
           }
         }
       }
     },
     deployment: {
-      miner: {
-        akash: {
-          profile: 'miner',
-          count: config.fleetSize
+      [serviceName]: {
+        dcloud: {
+          profile: serviceName,
+          count: 1  // Single instance per deployment - use multiple deployments for fleet
         }
       }
     }
@@ -79,19 +115,87 @@ export function generateSDL(config: SDLConfig): object {
 }
 
 /**
+ * Generate SDL for a specific provider allocation
+ * Used by fleet manager to create optimized SDLs per provider
+ */
+export function generateSDLForAllocation(
+  baseConfig: Omit<SDLConfig, 'cpuUnits' | 'gpuUnits' | 'memoryGi'>,
+  allocation: {
+    cpuUnits: number
+    gpuUnits: number
+    memoryGi: number
+  }
+): object {
+  return generateSDL({
+    ...baseConfig,
+    cpuUnits: allocation.cpuUnits,
+    gpuUnits: allocation.gpuUnits,
+    memoryGi: allocation.memoryGi
+  })
+}
+
+/**
  * Estimate deployment cost in AKT (micro AKT per block converted to AKT)
- * Based on pricing in SDL: cuda = 10000 uakt/block, cpu = 1000 uakt/block
+ * Based on pricing in SDL
  * Akash blocks are ~6 seconds, so ~10 blocks/minute, ~600 blocks/hour
+ *
+ * @param minerType - cpu or cuda
+ * @param resourceUnits - number of CPUs (for cpu) or GPUs (for cuda)
+ * @param durationMinutes - deployment duration in minutes
  */
 export function estimateCostAKT(
   minerType: 'cpu' | 'cuda',
-  fleetSize: number,
+  resourceUnits: number,
   durationMinutes: number
 ): number {
-  const uaktPerBlock = minerType === 'cuda' ? 10000 : 1000
+  const basePricePerCpu = 10000
+  const gpuPremium = 50000
+
+  // Calculate price per block based on resources
+  let uaktPerBlock: number
+  if (minerType === 'cuda') {
+    // For CUDA: 2 CPUs base + GPU premium per GPU
+    uaktPerBlock = (2 * basePricePerCpu) + (resourceUnits * gpuPremium)
+  } else {
+    // For CPU: price scales with CPU count
+    uaktPerBlock = resourceUnits * basePricePerCpu
+  }
+
   const blocksPerMinute = 10
   const totalBlocks = durationMinutes * blocksPerMinute
-  const totalUakt = uaktPerBlock * fleetSize * totalBlocks
+  const totalUakt = uaktPerBlock * totalBlocks
+
   // Convert uakt to AKT (1 AKT = 1,000,000 uakt)
   return totalUakt / 1_000_000
+}
+
+/**
+ * Estimate fleet deployment cost
+ *
+ * @param minerType - cpu or cuda
+ * @param totalResources - total CPUs or GPUs wanted across fleet
+ * @param durationMinutes - deployment duration in minutes
+ * @param deploymentsNeeded - number of deployments in the fleet
+ */
+export function estimateFleetCostAKT(
+  minerType: 'cpu' | 'cuda',
+  totalResources: number,
+  durationMinutes: number,
+  deploymentsNeeded: number
+): {
+  perDeploymentCost: number
+  totalCost: number
+  costPerResource: number
+} {
+  // Average resources per deployment
+  const resourcesPerDeployment = Math.ceil(totalResources / deploymentsNeeded)
+  const perDeploymentCost = estimateCostAKT(minerType, resourcesPerDeployment, durationMinutes)
+  const totalCost = perDeploymentCost * deploymentsNeeded
+  const costPerResource = totalCost / totalResources
+
+  return {
+    perDeploymentCost,
+    totalCost,
+    costPerResource
+  }
 }

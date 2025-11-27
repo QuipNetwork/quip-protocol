@@ -1,12 +1,50 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useKeplr } from '../context/KeplrContext'
 import { DEFAULTS } from '../config/constants'
-import { generateSDL, estimateCostAKT } from '../utils/sdl'
+import { generateSDL, estimateCostAKT, estimateFleetCostAKT } from '../utils/sdl'
 import { parseDurationToMinutes } from '../utils/format'
-import { createDeployment } from '../utils/akashApi'
+import yaml from 'yaml'
+import {
+  createDeployment,
+  waitForBids,
+  acceptBid,
+  fetchProvider,
+  checkProviderHealth,
+  sendManifestViaConsole,
+  type Bid,
+  type ManifestSubmissionResult
+} from '../utils/akashApi'
+import type { SigningStargateClient } from '@cosmjs/stargate'
+import { FleetDeployment } from './FleetDeployment'
+import type { FleetState } from '../utils/fleetManager'
+
+// Bid with enriched provider info
+interface BidWithProvider {
+  bid: Bid
+  providerName: string
+  providerOrg?: string
+  isOnline: boolean
+  isReliable: boolean
+  isAudited: boolean
+  activeLeaseCount: number
+  uptime7d?: number
+}
 
 export function DeploymentForm() {
-  const { isConnected, address, getSigningClient } = useKeplr()
+  const {
+    isConnected,
+    address,
+    getSigningClient,
+    hasCertificateOnChain,
+    hasLocalCertificate,
+    certificateMismatch,
+    isCheckingCertificate,
+    isCertificateLoading,
+    checkAndLoadCertificate,
+    createAndPublishCertificate,
+    clearAndRegenerateCertificate,
+    error: certError
+  } = useKeplr()
 
   const [minerType, setMinerType] = useState<'cpu' | 'cuda'>(DEFAULTS.minerType)
   const [fleetSize, setFleetSize] = useState(DEFAULTS.fleetSize)
@@ -16,14 +54,59 @@ export function DeploymentForm() {
   const [minSolutions, setMinSolutions] = useState(DEFAULTS.minSolutions)
   const [estimatedCost, setEstimatedCost] = useState('0')
   const [isDeploying, setIsDeploying] = useState(false)
+  const [deploymentStatus, setDeploymentStatus] = useState<string>('')
   const [alert, setAlert] = useState<{ type: 'info' | 'success' | 'error'; message: string } | null>(null)
 
+  // Bid selection state
+  const [availableBids, setAvailableBids] = useState<BidWithProvider[]>([])
+  const [currentDseq, setCurrentDseq] = useState<string | null>(null)
+  const [signingClient, setSigningClient] = useState<SigningStargateClient | null>(null)
+  const [isAcceptingBid, setIsAcceptingBid] = useState(false)
+  const [currentSdl, setCurrentSdl] = useState<object | null>(null)
+  const [currentManifestJson, setCurrentManifestJson] = useState<string | null>(null)  // Pre-computed manifest
+  const [showSdl, setShowSdl] = useState(false)
+  const [manifestResult, setManifestResult] = useState<ManifestSubmissionResult | null>(null)
+
+  // Fleet deployment mode
+  const [isFleetMode, setIsFleetMode] = useState(false)
+  const [fleetResult, setFleetResult] = useState<FleetState | null>(null)
+
+  // Convert SDL to YAML for display
+  const sdlYaml = useMemo(() => {
+    if (!currentSdl) return ''
+    return yaml.stringify(currentSdl)
+  }, [currentSdl])
+
+  // Copy SDL to clipboard
+  const copySdlToClipboard = async () => {
+    if (sdlYaml) {
+      await navigator.clipboard.writeText(sdlYaml)
+      setAlert({ type: 'success', message: 'SDL copied to clipboard!' })
+    }
+  }
+
+  // Check for certificate when connected
+  useEffect(() => {
+    if (isConnected && address) {
+      checkAndLoadCertificate()
+    }
+  }, [isConnected, address, checkAndLoadCertificate])
+
   // Update cost estimate when form values change
+  // For fleet mode, estimate based on total resources
   useEffect(() => {
     const durationMinutes = parseDurationToMinutes(miningDuration)
-    const cost = estimateCostAKT(minerType, fleetSize, durationMinutes)
-    setEstimatedCost(cost.toString())
-  }, [minerType, fleetSize, miningDuration])
+    if (fleetSize > 1) {
+      // Fleet mode: estimate total cost across deployments
+      // Assume worst case: 1 resource per deployment = fleetSize deployments
+      const fleetCost = estimateFleetCostAKT(minerType, fleetSize, durationMinutes, fleetSize)
+      setEstimatedCost(fleetCost.totalCost.toFixed(2))
+    } else {
+      // Single deployment
+      const cost = estimateCostAKT(minerType, 1, durationMinutes)
+      setEstimatedCost(cost.toFixed(2))
+    }
+  }, [minerType, miningDuration, fleetSize])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -34,9 +117,32 @@ export function DeploymentForm() {
     }
 
     setIsDeploying(true)
+    setAvailableBids([])
+    setCurrentDseq(null)
+    setDeploymentStatus('Preparing deployment...')
     setAlert({ type: 'info', message: 'Preparing deployment...' })
 
     try {
+      // Step 0: Ensure certificate exists on-chain and matches our local cert
+      // If certificateMismatch is true, our local cert isn't registered yet
+      if (!hasCertificateOnChain || certificateMismatch) {
+        const statusMsg = certificateMismatch
+          ? 'Registering local certificate on-chain...'
+          : 'Creating certificate for provider authentication...'
+        setDeploymentStatus(statusMsg)
+        setAlert({ type: 'info', message: statusMsg + ' Please approve the transaction.' })
+
+        const certSuccess = await createAndPublishCertificate()
+        if (!certSuccess) {
+          setAlert({ type: 'error', message: 'Failed to create certificate. Please try again.' })
+          setIsDeploying(false)
+          setDeploymentStatus('')
+          return
+        }
+
+        setAlert({ type: 'success', message: 'Certificate registered! Proceeding with deployment...' })
+      }
+
       const sdl = generateSDL({
         minerType,
         fleetSize,
@@ -47,26 +153,132 @@ export function DeploymentForm() {
       })
 
       console.log('Generated SDL:', sdl)
-      setAlert({ type: 'info', message: 'Requesting wallet approval...' })
+      setCurrentSdl(sdl) // Store SDL for manifest sending later
+      setDeploymentStatus('Requesting wallet approval for deployment...')
+      setAlert({ type: 'info', message: 'Requesting wallet approval for deployment...' })
 
       // Get signing client from Keplr
-      const signingClient = await getSigningClient()
-      if (!signingClient) {
+      const client = await getSigningClient()
+      if (!client) {
         throw new Error('Failed to get signing client')
       }
+      setSigningClient(client)
 
-      // Create the deployment transaction
-      const result = await createDeployment(signingClient, address, sdl)
+      // Step 1: Create the deployment transaction
+      const deployResult = await createDeployment(client, address, sdl)
+      console.log('Deployment result:', deployResult)
+      setCurrentDseq(deployResult.dseq)
+      setCurrentManifestJson(deployResult.manifestJson)  // Store manifest for later
 
-      console.log('Deployment result:', result)
-      setAlert({
-        type: 'success',
-        message: `Deployment created! TX: ${result.transactionHash}`
+      // Step 2: Wait for bids from providers
+      setDeploymentStatus(`Deployment created (dseq: ${deployResult.dseq}). Waiting for bids...`)
+      setAlert({ type: 'info', message: `Waiting for provider bids... (dseq: ${deployResult.dseq})` })
+
+      // Wait up to 2 minutes for bids, polling every 5 seconds
+      const bids = await waitForBids(address, deployResult.dseq, 120000, 5000)
+
+      if (bids.length === 0) {
+        setAlert({
+          type: 'error',
+          message: `No bids received for deployment ${deployResult.dseq}. Try adjusting pricing or resources.`
+        })
+        setIsDeploying(false)
+        return
+      }
+
+      console.log(`Received ${bids.length} bids:`, bids)
+
+      // Sort by price - check ALL bids, not just top N
+      // We'll filter down after checking reliability
+      const sortedBids = [...bids].sort((a, b) => {
+        const priceA = parseFloat(a.bid.price.amount)
+        const priceB = parseFloat(b.bid.price.amount)
+        return priceA - priceB
       })
+
+      // Enrich bids with provider info and health status
+      // Process in batches to show progress
+      setDeploymentStatus(`Checking ${sortedBids.length} providers for reliability...`)
+      const enrichedBids: BidWithProvider[] = await Promise.all(
+        sortedBids.map(async (bid) => {
+          const [providerInfo, healthStatus] = await Promise.all([
+            fetchProvider(bid.bid.id.provider),
+            checkProviderHealth(bid.bid.id.provider)
+          ])
+          const providerOrg = providerInfo?.attributes?.find(a => a.key === 'organization')?.value
+          const providerName = providerOrg || bid.bid.id.provider.slice(0, 16) + '...'
+          return {
+            bid,
+            providerName,
+            providerOrg,
+            isOnline: healthStatus.isOnline,
+            isReliable: healthStatus.isReliable,
+            isAudited: healthStatus.isAudited,
+            activeLeaseCount: healthStatus.activeLeaseCount,
+            uptime7d: healthStatus.uptime7d
+          }
+        })
+      )
+
+      // Count by category
+      const reliableCount = enrichedBids.filter(b => b.isReliable).length
+      const onlineCount = enrichedBids.filter(b => b.isOnline).length
+      console.log(`Provider breakdown: ${reliableCount} reliable, ${onlineCount} online, ${enrichedBids.length} total`)
+
+      // Sort all providers by: reliability first, then audited, then active leases, then price
+      const sortedProviders = [...enrichedBids]
+        .sort((a, b) => {
+          // Reliable providers first
+          if (a.isReliable !== b.isReliable) return a.isReliable ? -1 : 1
+          // Then online providers
+          if (a.isOnline !== b.isOnline) return a.isOnline ? -1 : 1
+          // Audited providers first
+          if (a.isAudited !== b.isAudited) return a.isAudited ? -1 : 1
+          // Then by active lease count (more = better)
+          if (a.activeLeaseCount !== b.activeLeaseCount) return b.activeLeaseCount - a.activeLeaseCount
+          // Then by price
+          return parseFloat(a.bid.bid.price.amount) - parseFloat(b.bid.bid.price.amount)
+        })
+
+      // Show top 30 providers (mix of reliable and online)
+      const displayProviders = sortedProviders.slice(0, 30)
+
+      if (displayProviders.length === 0) {
+        setAlert({
+          type: 'error',
+          message: `${enrichedBids.length} bids received but no providers could be verified. Try again later.`
+        })
+        setIsDeploying(false)
+        return
+      }
+
+      // If we have no reliable providers, warn the user
+      const reliableInList = displayProviders.filter(b => b.isReliable).length
+      const onlineInList = displayProviders.filter(b => b.isOnline).length
+
+      setAvailableBids(displayProviders)
+      setDeploymentStatus('')
+
+      if (reliableInList === 0 && onlineInList > 0) {
+        setAlert({
+          type: 'info',
+          message: `${onlineInList} providers online but none verified reliable. Proceed with caution.`
+        })
+      } else if (reliableInList > 0) {
+        setAlert({
+          type: 'info',
+          message: `${reliableInList} verified reliable + ${onlineInList - reliableInList} online providers. Select one below.`
+        })
+      } else {
+        setAlert({
+          type: 'info',
+          message: `${displayProviders.length} providers found. Check status before selecting.`
+        })
+      }
+
     } catch (error) {
       console.error('Deployment error:', error)
       const message = error instanceof Error ? error.message : 'Unknown error'
-      // Check for user rejection
       if (message.includes('rejected') || message.includes('cancelled')) {
         setAlert({ type: 'info', message: 'Transaction cancelled by user' })
       } else {
@@ -75,13 +287,232 @@ export function DeploymentForm() {
           message: `Deployment failed: ${message}`
         })
       }
-    } finally {
+      setDeploymentStatus('')
       setIsDeploying(false)
     }
   }
 
+  const handleSelectBid = async (selectedBid: BidWithProvider) => {
+    if (!signingClient || !currentDseq || !address) {
+      setAlert({ type: 'error', message: 'No active deployment session' })
+      return
+    }
+
+    setIsAcceptingBid(true)
+    setDeploymentStatus(`Accepting bid from ${selectedBid.providerName}...`)
+    setAlert({
+      type: 'info',
+      message: `Accepting bid from ${selectedBid.providerName}. Please approve the transaction...`
+    })
+
+    try {
+      // Step 1: Accept bid (create lease)
+      const leaseResult = await acceptBid(signingClient, selectedBid.bid)
+      console.log('Lease created:', leaseResult)
+
+      // Step 2: Send manifest to provider
+      // This is critical - without it, the provider doesn't know what to deploy
+      if (currentManifestJson) {
+        setDeploymentStatus('Sending manifest to provider...')
+        setAlert({ type: 'info', message: 'Lease created! Sending manifest to provider...' })
+
+        try {
+          const result = await sendManifestViaConsole(
+            address,
+            currentDseq,
+            selectedBid.bid.bid.id.provider,
+            currentManifestJson  // Use the exact manifest JSON from deployment creation
+          )
+          console.log('Manifest submission result:', result)
+          setManifestResult(result)
+
+          if (result.success) {
+            console.log('Manifest sent successfully in', result.durationMs, 'ms')
+          }
+        } catch (manifestError) {
+          console.error('Failed to send manifest:', manifestError)
+          // Store the error for display
+          setManifestResult({
+            success: false,
+            timestamp: new Date().toISOString(),
+            durationMs: 0,
+            request: {
+              url: 'https://console-api.akash.network/v1/proxy/provider/manifest',
+              owner: address,
+              dseq: currentDseq,
+              provider: selectedBid.bid.bid.id.provider,
+              manifestSize: 0
+            },
+            response: {
+              status: 0,
+              statusText: 'Error',
+              body: manifestError instanceof Error ? manifestError.message : String(manifestError)
+            },
+            error: manifestError instanceof Error ? manifestError.message : String(manifestError)
+          })
+          // Don't fail the whole deployment - the lease is created
+          // User can try to send manifest again or use Console
+          setAlert({
+            type: 'info',
+            message: `Lease created but manifest send failed. Visit Akash Console to complete setup. DSEQ: ${currentDseq}`
+          })
+          setDeploymentStatus('')
+          setAvailableBids([])
+          setCurrentDseq(null)
+          setCurrentSdl(null)
+          setCurrentManifestJson(null)
+          setSigningClient(null)
+          setIsDeploying(false)
+          setIsAcceptingBid(false)
+          return
+        }
+      }
+
+      setAlert({
+        type: 'success',
+        message: `Deployment active! Provider: ${selectedBid.providerName}, DSEQ: ${currentDseq}. Container starting...`
+      })
+      setDeploymentStatus('')
+      setAvailableBids([])
+      setCurrentDseq(null)
+      setCurrentSdl(null)
+      setCurrentManifestJson(null)
+      setSigningClient(null)
+      setIsDeploying(false)
+
+    } catch (error) {
+      console.error('Accept bid error:', error)
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      if (message.includes('rejected') || message.includes('cancelled')) {
+        setAlert({ type: 'info', message: 'Transaction cancelled. You can still select a provider.' })
+      } else {
+        setAlert({ type: 'error', message: `Failed to accept bid: ${message}` })
+      }
+      setDeploymentStatus('')
+    } finally {
+      setIsAcceptingBid(false)
+    }
+  }
+
+  const handleCancelBidSelection = () => {
+    setAvailableBids([])
+    setCurrentDseq(null)
+    setCurrentSdl(null)
+    setCurrentManifestJson(null)
+    setSigningClient(null)
+    setIsDeploying(false)
+    setAlert({ type: 'info', message: 'Bid selection cancelled. Deployment remains open - you can close it from Manage Deployments.' })
+  }
+
+  // Fleet mode handlers
+  const handleStartFleet = () => {
+    setIsFleetMode(true)
+    setFleetResult(null)
+    setAlert(null)
+  }
+
+  const handleFleetComplete = (state: FleetState) => {
+    setFleetResult(state)
+    setAlert({
+      type: state.stats.active > 0 ? 'success' : 'error',
+      message: `Fleet deployed: ${state.stats.active} active, ${state.stats.failed} failed`
+    })
+  }
+
+  const handleFleetCancel = () => {
+    setIsFleetMode(false)
+    setFleetResult(null)
+  }
+
+  // Build config for fleet deployment
+  const fleetConfig = {
+    minerType,
+    fleetSize,
+    miningDuration,
+    difficultyEnergy,
+    minDiversity,
+    minSolutions
+  }
+
+  // Show fleet deployment UI if in fleet mode
+  if (isFleetMode && !fleetResult) {
+    return (
+      <div className="tab-content active">
+        <FleetDeployment
+          config={fleetConfig}
+          onComplete={handleFleetComplete}
+          onCancel={handleFleetCancel}
+        />
+      </div>
+    )
+  }
+
   return (
     <div className="tab-content active">
+      {/* Certificate Status */}
+      {isConnected && (
+        <div className={`alert ${hasCertificateOnChain && !certificateMismatch ? 'alert-success' : certError ? 'alert-error' : 'alert-info'}`} style={{ marginBottom: '16px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div>
+              <strong>Certificate Status:</strong>{' '}
+              {isCheckingCertificate ? (
+                'Checking...'
+              ) : isCertificateLoading ? (
+                'Creating certificate...'
+              ) : hasCertificateOnChain && !certificateMismatch ? (
+                <span style={{ color: '#48bb78' }}>✓ Valid certificate on-chain</span>
+              ) : certificateMismatch ? (
+                <span style={{ color: '#f6ad55' }}>⚠ Local certificate not registered</span>
+              ) : hasLocalCertificate ? (
+                <span style={{ color: '#f6ad55' }}>⚠ Certificate needs publishing</span>
+              ) : (
+                <span style={{ color: '#f6ad55' }}>⚠ No certificate found</span>
+              )}
+            </div>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              {(!hasCertificateOnChain || certificateMismatch) && !isCheckingCertificate && !isCertificateLoading && (
+                <button
+                  type="button"
+                  onClick={createAndPublishCertificate}
+                  className="btn btn-secondary"
+                  style={{ padding: '4px 12px', fontSize: '13px' }}
+                >
+                  {certificateMismatch ? 'Register Certificate' : hasLocalCertificate ? 'Publish Certificate' : 'Create Certificate'}
+                </button>
+              )}
+              {hasLocalCertificate && !isCheckingCertificate && !isCertificateLoading && (
+                <button
+                  type="button"
+                  onClick={clearAndRegenerateCertificate}
+                  className="btn btn-secondary"
+                  style={{ padding: '4px 12px', fontSize: '13px', background: '#718096' }}
+                  title="Clear local certificate and create a fresh one"
+                >
+                  Regenerate
+                </button>
+              )}
+            </div>
+          </div>
+          {certError && (
+            <small style={{ display: 'block', marginTop: '8px', color: '#fc8181' }}>
+              <strong>Error:</strong> {certError}
+            </small>
+          )}
+          {certificateMismatch && !isCheckingCertificate && !certError && (
+            <small style={{ display: 'block', marginTop: '8px', color: '#718096' }}>
+              Your local certificate is not registered on-chain. Click "Register Certificate" to publish it.
+              (Akash allows multiple certificates per address - your old certificate will remain valid.)
+            </small>
+          )}
+          {!hasCertificateOnChain && !certificateMismatch && !isCheckingCertificate && !certError && (
+            <small style={{ display: 'block', marginTop: '8px', color: '#718096' }}>
+              A certificate is required for providers to authenticate your deployments.
+              It will be created automatically when you deploy, or you can create it now.
+            </small>
+          )}
+        </div>
+      )}
+
       <div className="alert alert-info">
         <strong>Tip:</strong> Mining duration is set to 90 minutes by default. Results will be available via HTTP after completion.
       </div>
@@ -92,7 +523,193 @@ export function DeploymentForm() {
         </div>
       )}
 
-      <form onSubmit={handleSubmit}>
+      {deploymentStatus && (
+        <div className="alert alert-info" style={{ fontStyle: 'italic' }}>
+          <strong>Status:</strong> {deploymentStatus}
+        </div>
+      )}
+
+      {/* Manifest Submission Result */}
+      {manifestResult && (
+        <div className={`alert ${manifestResult.success ? 'alert-success' : 'alert-error'}`} style={{ marginBottom: '16px' }}>
+          <div style={{ marginBottom: '8px' }}>
+            <strong>Manifest Submission {manifestResult.success ? 'Succeeded' : 'Failed'}</strong>
+            <span style={{ marginLeft: '8px', fontSize: '12px', color: '#718096' }}>
+              {manifestResult.timestamp}
+            </span>
+          </div>
+          <div style={{ fontSize: '13px', fontFamily: 'monospace', background: 'rgba(0,0,0,0.1)', padding: '8px', borderRadius: '4px' }}>
+            <div><strong>URL:</strong> {manifestResult.request.url}</div>
+            <div><strong>Owner:</strong> {manifestResult.request.owner}</div>
+            <div><strong>DSEQ:</strong> {manifestResult.request.dseq}</div>
+            <div><strong>Provider:</strong> {manifestResult.request.provider}</div>
+            <div><strong>Manifest Size:</strong> {manifestResult.request.manifestSize} bytes</div>
+            <div><strong>Duration:</strong> {manifestResult.durationMs}ms</div>
+            <div style={{ marginTop: '8px', borderTop: '1px solid rgba(255,255,255,0.2)', paddingTop: '8px' }}>
+              <strong>Response:</strong> {manifestResult.response.status} {manifestResult.response.statusText}
+            </div>
+            {manifestResult.response.body && (
+              <div style={{ marginTop: '4px', wordBreak: 'break-all' }}>
+                <strong>Body:</strong> {manifestResult.response.body.substring(0, 500)}
+                {manifestResult.response.body.length > 500 && '...'}
+              </div>
+            )}
+            {manifestResult.error && (
+              <div style={{ marginTop: '4px', color: '#fc8181' }}>
+                <strong>Error:</strong> {manifestResult.error}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => setManifestResult(null)}
+            className="btn btn-secondary"
+            style={{ marginTop: '8px', padding: '4px 12px', fontSize: '12px' }}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Bid Selection UI */}
+      {availableBids.length > 0 && (
+        <div className="bid-selection">
+          <h3>Select a Provider ({availableBids.length} available)</h3>
+          <p className="bid-info">
+            <span style={{ color: '#48bb78' }}>●</span> Verified (active leases){' '}
+            <span style={{ color: '#f6ad55' }}>●</span> Available
+          </p>
+
+          <div className="bid-list">
+            {availableBids.map((bidInfo, index) => {
+              // Color based on verified status - green if reliable, orange otherwise
+              const statusColor = bidInfo.isReliable ? '#48bb78' : '#f6ad55'
+
+              return (
+                <div
+                  key={bidInfo.bid.bid.id.provider}
+                  className="bid-item"
+                  onClick={() => !isAcceptingBid && handleSelectBid(bidInfo)}
+                  style={{
+                    cursor: isAcceptingBid ? 'not-allowed' : 'pointer'
+                  }}
+                >
+                  <div className="bid-rank">#{index + 1}</div>
+                  <div className="bid-details">
+                    <div className="bid-provider">
+                      <span style={{ color: statusColor, marginRight: '6px' }}>●</span>
+                      <strong>{bidInfo.providerName}</strong>
+                      {bidInfo.isAudited && (
+                        <span style={{
+                          marginLeft: '8px',
+                          fontSize: '10px',
+                          background: '#667eea',
+                          color: 'white',
+                          padding: '2px 6px',
+                          borderRadius: '4px',
+                          fontWeight: 600
+                        }}>
+                          AUDITED
+                        </span>
+                      )}
+                    </div>
+                    <div className="bid-address">
+                      {bidInfo.bid.bid.id.provider.slice(0, 20)}...
+                      <span style={{ marginLeft: '8px', color: '#718096' }}>
+                        {bidInfo.activeLeaseCount > 0 && `${bidInfo.activeLeaseCount} active lease${bidInfo.activeLeaseCount !== 1 ? 's' : ''}`}
+                        {bidInfo.uptime7d !== undefined && ` • ${Math.round(bidInfo.uptime7d * 100)}% uptime`}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="bid-price">
+                    <strong>{bidInfo.bid.bid.price.amount}</strong>
+                    <span className="bid-price-unit">uakt/block</span>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={handleCancelBidSelection}
+            disabled={isAcceptingBid}
+            style={{ marginTop: '1rem' }}
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+
+      {/* SDL Display - show when deployment is in progress */}
+      {currentSdl && currentDseq && (
+        <div style={{
+          background: '#f7fafc',
+          borderRadius: '8px',
+          padding: '16px',
+          marginBottom: '20px',
+          border: '1px solid #e2e8f0'
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+            <h3 style={{ margin: 0, color: '#2d3748' }}>Deployment SDL (DSEQ: {currentDseq})</h3>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button
+                type="button"
+                onClick={copySdlToClipboard}
+                style={{
+                  background: '#667eea',
+                  color: 'white',
+                  border: 'none',
+                  padding: '6px 12px',
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                  fontSize: '13px'
+                }}
+              >
+                Copy SDL
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowSdl(!showSdl)}
+                style={{
+                  background: '#718096',
+                  color: 'white',
+                  border: 'none',
+                  padding: '6px 12px',
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                  fontSize: '13px'
+                }}
+              >
+                {showSdl ? 'Hide SDL' : 'Show SDL'}
+              </button>
+            </div>
+          </div>
+          <p style={{ color: '#718096', fontSize: '13px', marginBottom: '12px' }}>
+            Copy this SDL and paste it in Akash Console to complete the deployment setup.
+          </p>
+          {showSdl && (
+            <pre style={{
+              background: '#1a202c',
+              color: '#e2e8f0',
+              padding: '16px',
+              borderRadius: '6px',
+              overflow: 'auto',
+              maxHeight: '400px',
+              fontSize: '12px',
+              fontFamily: 'monospace',
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word'
+            }}>
+              {sdlYaml}
+            </pre>
+          )}
+        </div>
+      )}
+
+      {/* Hide form when showing bids */}
+      <form onSubmit={handleSubmit} style={{ display: availableBids.length > 0 ? 'none' : 'block' }}>
         <div className="form-group">
           <label htmlFor="minerType">Miner Type</label>
           <select
@@ -108,17 +725,23 @@ export function DeploymentForm() {
         </div>
 
         <div className="form-group">
-          <label htmlFor="fleetSize">Fleet Size</label>
+          <label htmlFor="fleetSize">
+            {minerType === 'cuda' ? 'Total GPUs' : 'Total CPUs'}
+          </label>
           <input
             type="number"
             id="fleetSize"
             value={fleetSize}
             onChange={(e) => setFleetSize(parseInt(e.target.value, 10) || 1)}
             min={1}
-            max={100}
+            max={1000}
             required
           />
-          <small>Number of instances to deploy (1-100)</small>
+          <small>
+            {fleetSize > 1
+              ? `Will deploy across multiple providers to get ${fleetSize} ${minerType === 'cuda' ? 'GPUs' : 'CPUs'}`
+              : 'Single deployment with 1 resource unit'}
+          </small>
         </div>
 
         <div className="form-group">
@@ -176,15 +799,43 @@ export function DeploymentForm() {
 
         <div className="alert alert-info cost-estimate">
           <strong>Estimated Cost:</strong> {estimatedCost} AKT for {miningDuration}
+          {fleetSize > 1 && ` (${fleetSize} ${minerType === 'cuda' ? 'GPUs' : 'CPUs'})`}
         </div>
 
-        <button
-          type="submit"
-          className="btn btn-primary"
-          disabled={!isConnected || isDeploying}
-        >
-          {isDeploying ? 'Deploying...' : 'Deploy to Akash'}
-        </button>
+        <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
+          {fleetSize > 1 ? (
+            <>
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={handleStartFleet}
+                disabled={!isConnected || isDeploying}
+              >
+                Smart Deploy Fleet
+              </button>
+              <button
+                type="submit"
+                className="btn btn-secondary"
+                disabled={!isConnected || isDeploying}
+              >
+                {isDeploying ? 'Deploying...' : 'Single Deploy (1 CPU)'}
+              </button>
+            </>
+          ) : (
+            <button
+              type="submit"
+              className="btn btn-primary"
+              disabled={!isConnected || isDeploying}
+            >
+              {isDeploying ? 'Deploying...' : 'Deploy to Akash'}
+            </button>
+          )}
+        </div>
+        {fleetSize > 1 && (
+          <small style={{ display: 'block', marginTop: '8px', color: '#718096' }}>
+            Smart Deploy will query provider capacity and create optimal allocations across providers.
+          </small>
+        )}
       </form>
     </div>
   )

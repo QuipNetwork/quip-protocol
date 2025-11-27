@@ -510,3 +510,405 @@ body {
     padding: 0 10px 10px;
   }
 }
+
+/* Bid Selection */
+.bid-selection {
+  background: #f7fafc;
+  border-radius: 8px;
+  padding: 20px;
+  margin-bottom: 20px;
+}
+
+.bid-selection h3 {
+  margin-bottom: 8px;
+  color: #2d3748;
+}
+
+.bid-info {
+  color: #718096;
+  font-size: 14px;
+  margin-bottom: 16px;
+}
+
+.bid-list {
+  max-height: 400px;
+  overflow-y: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: white;
+}
+
+.bid-item {
+  display: flex;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid #e2e8f0;
+  transition: background 0.2s;
+}
+
+.bid-item:last-child {
+  border-bottom: none;
+}
+
+.bid-item:hover {
+  background: #ebf8ff;
+}
+
+.bid-rank {
+  font-weight: 700;
+  font-size: 14px;
+  color: #667eea;
+  width: 40px;
+  flex-shrink: 0;
+}
+
+.bid-details {
+  flex: 1;
+  min-width: 0;
+}
+
+.bid-provider {
+  font-size: 14px;
+  color: #2d3748;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bid-address {
+  font-size: 12px;
+  color: #a0aec0;
+  font-family: monospace;
+}
+
+.bid-price {
+  text-align: right;
+  flex-shrink: 0;
+  margin-left: 16px;
+}
+
+.bid-price strong {
+  display: block;
+  font-size: 16px;
+  color: #48bb78;
+}
+
+.bid-price-unit {
+  font-size: 11px;
+  color: #a0aec0;
+}
+
+/* Forwarded Ports */
+.forwarded-ports {
+  margin: 8px 0;
+  padding: 12px;
+  background: #ebf8ff;
+  border-radius: 6px;
+  border-left: 4px solid #4299e1;
+}
+
+.forwarded-ports a:hover {
+  text-decoration: underline;
+}
+
+/* Deployment Actions */
+.deployment-actions {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.deployment-actions a {
+  text-decoration: none;
+  display: inline-block;
+}
+
+/* ============================================================================
+   Fleet Deployment Styles
+   ============================================================================ */
+
+.fleet-deployment {
+  padding: 20px 0;
+}
+
+.fleet-header {
+  margin-bottom: 24px;
+}
+
+.fleet-header h2 {
+  margin: 0 0 8px 0;
+  color: #2d3748;
+  font-size: 24px;
+}
+
+.fleet-subtitle {
+  color: #718096;
+  margin: 0;
+}
+
+.fleet-loading {
+  text-align: center;
+  padding: 40px;
+  color: #718096;
+}
+
+/* Capacity Overview */
+.capacity-overview {
+  background: #f7fafc;
+  border-radius: 8px;
+  padding: 20px;
+  margin-bottom: 20px;
+}
+
+.capacity-overview h3 {
+  margin: 0 0 16px 0;
+  color: #2d3748;
+}
+
+.capacity-stats,
+.plan-stats,
+.summary-stats {
+  display: flex;
+  gap: 24px;
+  margin-bottom: 20px;
+}
+
+.stat {
+  text-align: center;
+}
+
+.stat-value {
+  display: block;
+  font-size: 32px;
+  font-weight: 700;
+  color: #667eea;
+}
+
+.stat-label {
+  display: block;
+  font-size: 12px;
+  color: #718096;
+  text-transform: uppercase;
+}
+
+.stat-success .stat-value {
+  color: #48bb78;
+}
+
+.stat-error .stat-value {
+  color: #fc8181;
+}
+
+/* Provider List */
+.top-providers h4 {
+  margin: 0 0 12px 0;
+  color: #4a5568;
+  font-size: 14px;
+}
+
+.provider-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.provider-item {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: white;
+  border-radius: 4px;
+  border: 1px solid #e2e8f0;
+}
+
+.provider-name {
+  color: #2d3748;
+  font-weight: 500;
+}
+
+.reliable-badge {
+  color: #48bb78;
+  margin-right: 6px;
+}
+
+.provider-capacity {
+  color: #718096;
+  font-size: 14px;
+  font-family: monospace;
+}
+
+/* Allocation List */
+.allocation-list {
+  margin-top: 20px;
+}
+
+.allocation-list h4 {
+  margin: 0 0 12px 0;
+  color: #4a5568;
+  font-size: 14px;
+}
+
+.allocation-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: white;
+  border-radius: 4px;
+  border: 1px solid #e2e8f0;
+  margin-bottom: 8px;
+}
+
+.alloc-index {
+  font-weight: 700;
+  color: #667eea;
+  width: 30px;
+}
+
+.alloc-provider {
+  flex: 1;
+  color: #2d3748;
+}
+
+.alloc-resources {
+  color: #718096;
+  font-size: 14px;
+  font-family: monospace;
+}
+
+/* Progress */
+.progress-header {
+  margin-bottom: 20px;
+}
+
+.progress-bar {
+  height: 8px;
+  background: #e2e8f0;
+  border-radius: 4px;
+  overflow: hidden;
+  margin: 12px 0;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #667eea, #764ba2);
+  transition: width 0.3s ease;
+}
+
+.progress-text {
+  color: #718096;
+  font-size: 14px;
+  margin: 0;
+}
+
+/* Deployment Grid */
+.deployment-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.deployment-card {
+  background: white;
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+  padding: 12px;
+  transition: border-color 0.2s;
+}
+
+.deployment-card.status-active {
+  border-color: #48bb78;
+}
+
+.deployment-card.status-failed {
+  border-color: #fc8181;
+}
+
+.deployment-card.status-creating,
+.deployment-card.status-waiting-bids,
+.deployment-card.status-selecting-bid,
+.deployment-card.status-accepting-bid,
+.deployment-card.status-sending-manifest {
+  border-color: #667eea;
+}
+
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.card-index {
+  font-weight: 700;
+  color: #667eea;
+}
+
+.card-status {
+  font-size: 12px;
+  text-transform: capitalize;
+}
+
+.card-body {
+  font-size: 13px;
+}
+
+.card-provider {
+  color: #2d3748;
+  font-weight: 500;
+  margin-bottom: 4px;
+}
+
+.card-resources {
+  color: #718096;
+  font-family: monospace;
+  font-size: 12px;
+}
+
+.card-dseq {
+  color: #a0aec0;
+  font-family: monospace;
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+.card-error {
+  color: #fc8181;
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+/* Fleet Actions */
+.fleet-actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.fleet-actions .btn {
+  padding: 10px 20px;
+}
+
+/* Summary */
+.summary-header {
+  text-align: center;
+  margin-bottom: 20px;
+}
+
+.summary-header h3 {
+  margin: 0;
+  font-size: 24px;
+}
+
+/* Plan Summary */
+.plan-summary {
+  background: #f7fafc;
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.plan-summary h3 {
+  margin: 0 0 16px 0;
+  color: #2d3748;
+}
