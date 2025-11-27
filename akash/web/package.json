@@ -21,13 +21,16 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "@akashnetwork/akash-api": "^1.4.0",
-    "@akashnetwork/akashjs": "^0.10.0",
+    "@akashnetwork/chain-sdk": "1.0.0-alpha.18",
     "@cosmjs/encoding": "~0.36.1",
     "@cosmjs/proto-signing": "~0.36.1",
     "@cosmjs/stargate": "~0.36.1",
     "@keplr-wallet/wc-client": "^0.12.293",
     "@walletconnect/sign-client": "^2.23.0",
+    "asn1js": "^3.0.6",
+    "long": "^5.3.2",
+    "pkijs": "^3.3.3",
+    "pvutils": "^1.1.5",
     "qrcode.react": "^4.2.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
