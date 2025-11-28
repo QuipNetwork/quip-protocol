@@ -4,6 +4,33 @@ import { DOCKER_IMAGES } from '../config/constants'
  * SDL configuration for single deployment
  * Used by DeploymentForm for manual deployments
  */
+// Available GPU models for Akash deployments
+export const GPU_MODELS = {
+  any: { label: 'Any NVIDIA GPU', value: '' },
+  rtx3060: { label: 'RTX 3060', value: 'rtx3060' },
+  rtx3060ti: { label: 'RTX 3060 Ti', value: 'rtx3060ti' },
+  rtx3070: { label: 'RTX 3070', value: 'rtx3070' },
+  rtx3070ti: { label: 'RTX 3070 Ti', value: 'rtx3070ti' },
+  rtx3080: { label: 'RTX 3080', value: 'rtx3080' },
+  rtx3080ti: { label: 'RTX 3080 Ti', value: 'rtx3080ti' },
+  rtx3090: { label: 'RTX 3090', value: 'rtx3090' },
+  rtx3090ti: { label: 'RTX 3090 Ti', value: 'rtx3090ti' },
+  rtx4060: { label: 'RTX 4060', value: 'rtx4060' },
+  rtx4060ti: { label: 'RTX 4060 Ti', value: 'rtx4060ti' },
+  rtx4070: { label: 'RTX 4070', value: 'rtx4070' },
+  rtx4070ti: { label: 'RTX 4070 Ti', value: 'rtx4070ti' },
+  rtx4080: { label: 'RTX 4080', value: 'rtx4080' },
+  rtx4090: { label: 'RTX 4090', value: 'rtx4090' },
+  a10: { label: 'A10', value: 'a10' },
+  a10g: { label: 'A10G', value: 'a10g' },
+  a100: { label: 'A100', value: 'a100' },
+  h100: { label: 'H100', value: 'h100' },
+  t4: { label: 'T4', value: 't4' },
+  v100: { label: 'V100', value: 'v100' },
+} as const
+
+export type GpuModelKey = keyof typeof GPU_MODELS
+
 export interface SDLConfig {
   minerType: 'cpu' | 'cuda'
   fleetSize: number  // Total CPUs/GPUs wanted (becomes instance count)
@@ -16,6 +43,8 @@ export interface SDLConfig {
   gpuUnits?: number    // Override default GPU units per instance (for CUDA)
   memoryGi?: number    // Override default memory in GiB per instance
   instanceCount?: number  // Number of container instances to run (default: 1)
+  // Optional: GPU model selection for CUDA deployments
+  gpuModel?: GpuModelKey  // Specific GPU model to request
   // Optional: IPFS configuration for result uploads
   ipfsNode?: string    // IPFS node API endpoint
   ipfsApiKey?: string  // Bearer token for IPFS API authentication
@@ -51,9 +80,19 @@ export function generateSDL(config: SDLConfig): object {
 
   // Add GPU resources for CUDA deployments
   if (gpuUnits > 0) {
+    // Build GPU attributes - always require nvidia vendor
+    // Akash SDL expects GPU models as an ARRAY, not an object
+    // Format: nvidia: [{ model: "rtx3080" }] or nvidia: [] for any GPU
+    const gpuModelValue = config.gpuModel ? GPU_MODELS[config.gpuModel]?.value : ''
+
+    // GPU models must be an array - empty array means "any nvidia GPU"
+    const nvidiaModels: Array<{ model: string }> = gpuModelValue
+      ? [{ model: gpuModelValue }]
+      : []
+
     resources.gpu = {
       units: gpuUnits,
-      attributes: { vendor: { nvidia: {} } }
+      attributes: { vendor: { nvidia: nvidiaModels } }
     }
   }
 

@@ -26,6 +26,14 @@ import { MsgCreateLease } from '@akashnetwork/chain-sdk/private-types/akash.v1be
 // Certificate messages are in v1
 import { MsgCreateCertificate, MsgRevokeCertificate } from '@akashnetwork/chain-sdk/private-types/akash.v1'
 
+// Cosmos authz messages for session signing
+import { MsgGrant, MsgRevoke, MsgExec } from 'cosmjs-types/cosmos/authz/v1beta1/tx'
+import { GenericAuthorization } from 'cosmjs-types/cosmos/authz/v1beta1/authz'
+
+// Cosmos feegrant messages for session fee payment
+import { MsgGrantAllowance, MsgRevokeAllowance } from 'cosmjs-types/cosmos/feegrant/v1beta1/tx'
+import { BasicAllowance } from 'cosmjs-types/cosmos/feegrant/v1beta1/feegrant'
+
 // Certificate utilities
 import {
   generateCertificate,
@@ -53,6 +61,17 @@ function createAkashRegistry(): Registry {
   // Register certificate messages (v1)
   registry.register(`/${MsgCreateCertificate.$type}`, MsgCreateCertificate as never)
   registry.register(`/${MsgRevokeCertificate.$type}`, MsgRevokeCertificate as never)
+
+  // Register authz messages for session signing
+  registry.register('/cosmos.authz.v1beta1.MsgGrant', MsgGrant as never)
+  registry.register('/cosmos.authz.v1beta1.MsgRevoke', MsgRevoke as never)
+  registry.register('/cosmos.authz.v1beta1.MsgExec', MsgExec as never)
+  registry.register('/cosmos.authz.v1beta1.GenericAuthorization', GenericAuthorization as never)
+
+  // Register feegrant messages for session fee payment
+  registry.register('/cosmos.feegrant.v1beta1.MsgGrantAllowance', MsgGrantAllowance as never)
+  registry.register('/cosmos.feegrant.v1beta1.MsgRevokeAllowance', MsgRevokeAllowance as never)
+  registry.register('/cosmos.feegrant.v1beta1.BasicAllowance', BasicAllowance as never)
 
   return registry
 }

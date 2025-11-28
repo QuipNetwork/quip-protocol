@@ -1,7 +1,7 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { useKeplr } from '../context/KeplrContext'
 import { DEFAULTS } from '../config/constants'
-import { generateSDL, estimateCostAKT, estimateFleetCostAKT } from '../utils/sdl'
+import { generateSDL, estimateCostAKT, estimateFleetCostAKT, GPU_MODELS, type GpuModelKey } from '../utils/sdl'
 import { parseDurationToMinutes } from '../utils/format'
 import yaml from 'yaml'
 import {
@@ -14,21 +14,17 @@ import {
   type Bid,
   type ManifestSubmissionResult
 } from '../utils/akashApi'
+import {
+  selectBestBid,
+  getProviderDisplayName,
+  type BidWithProvider
+} from '../utils/bidSelection'
 import type { SigningStargateClient } from '@cosmjs/stargate'
 import { FleetDeployment } from './FleetDeployment'
 import type { FleetState } from '../utils/fleetManager'
 
-// Bid with enriched provider info
-interface BidWithProvider {
-  bid: Bid
-  providerName: string
-  providerOrg?: string
-  isOnline: boolean
-  isReliable: boolean
-  isAudited: boolean
-  activeLeaseCount: number
-  uptime7d?: number
-}
+// Auto-deploy countdown duration in seconds
+const AUTO_DEPLOY_COUNTDOWN_SECONDS = 5
 
 export function DeploymentForm() {
   const {
@@ -47,6 +43,7 @@ export function DeploymentForm() {
   } = useKeplr()
 
   const [minerType, setMinerType] = useState<'cpu' | 'cuda'>(DEFAULTS.minerType)
+  const [gpuModel, setGpuModel] = useState<GpuModelKey>('any')
   const [fleetSize, setFleetSize] = useState(DEFAULTS.fleetSize)
   const [miningDuration, setMiningDuration] = useState(DEFAULTS.duration)
   const [difficultyEnergy, setDifficultyEnergy] = useState(DEFAULTS.difficulty)
@@ -75,6 +72,74 @@ export function DeploymentForm() {
   // Fleet deployment mode
   const [isFleetMode, setIsFleetMode] = useState(false)
   const [fleetResult, setFleetResult] = useState<FleetState | null>(null)
+
+  // Auto-deploy mode
+  const [autoDeployEnabled, setAutoDeployEnabled] = useState(() => {
+    return localStorage.getItem('auto_deploy_enabled') === 'true'
+  })
+  const [autoDeployCountdown, setAutoDeployCountdown] = useState<number | null>(null)
+  const [autoDeploySelectedBid, setAutoDeploySelectedBid] = useState<BidWithProvider | null>(null)
+  const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  // Persist auto-deploy setting
+  const handleAutoDeployToggle = useCallback((enabled: boolean) => {
+    setAutoDeployEnabled(enabled)
+    localStorage.setItem('auto_deploy_enabled', enabled ? 'true' : 'false')
+  }, [])
+
+  // Cancel auto-deploy countdown
+  const cancelAutoDeployCountdown = useCallback(() => {
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current)
+      countdownIntervalRef.current = null
+    }
+    setAutoDeployCountdown(null)
+    setAutoDeploySelectedBid(null)
+  }, [])
+
+  // Start auto-deploy countdown when bids arrive and auto-deploy is enabled
+  const startAutoDeployCountdown = useCallback((bids: BidWithProvider[]) => {
+    // Select best bid using our algorithm
+    const bestBid = selectBestBid(bids, { preferReliable: true })
+    if (!bestBid) return
+
+    setAutoDeploySelectedBid(bestBid)
+    setAutoDeployCountdown(AUTO_DEPLOY_COUNTDOWN_SECONDS)
+
+    // Start countdown
+    countdownIntervalRef.current = setInterval(() => {
+      setAutoDeployCountdown(prev => {
+        if (prev === null || prev <= 1) {
+          // Countdown complete - will trigger auto-accept via effect
+          if (countdownIntervalRef.current) {
+            clearInterval(countdownIntervalRef.current)
+            countdownIntervalRef.current = null
+          }
+          return 0
+        }
+        return prev - 1
+      })
+    }, 1000)
+  }, [])
+
+  // Auto-accept bid when countdown reaches 0
+  useEffect(() => {
+    if (autoDeployCountdown === 0 && autoDeploySelectedBid && !isAcceptingBid) {
+      // Clear the countdown state before accepting
+      setAutoDeployCountdown(null)
+      // Accept the bid
+      handleSelectBid(autoDeploySelectedBid)
+    }
+  }, [autoDeployCountdown, autoDeploySelectedBid, isAcceptingBid])
+
+  // Cleanup interval on unmount
+  useEffect(() => {
+    return () => {
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current)
+      }
+    }
+  }, [])
 
   // Convert SDL to YAML for display
   const sdlYaml = useMemo(() => {
@@ -168,6 +233,8 @@ export function DeploymentForm() {
         difficultyEnergy,
         minDiversity,
         minSolutions,
+        // Include GPU model for CUDA deployments
+        gpuModel: minerType === 'cuda' ? gpuModel : undefined,
         // Include IPFS config if enabled
         ipfsNode: ipfsEnabled ? ipfsNode : undefined,
         ipfsApiKey: ipfsEnabled ? ipfsApiKey : undefined,
@@ -282,6 +349,20 @@ export function DeploymentForm() {
 
       setAvailableBids(displayProviders)
       setDeploymentStatus('')
+
+      // Check if auto-deploy is enabled
+      if (autoDeployEnabled && displayProviders.length > 0) {
+        const bestBid = selectBestBid(displayProviders, { preferReliable: true })
+        if (bestBid) {
+          const providerName = getProviderDisplayName(bestBid)
+          setAlert({
+            type: 'info',
+            message: `Auto-deploying to ${providerName} in ${AUTO_DEPLOY_COUNTDOWN_SECONDS}s... (Click Cancel to choose manually)`
+          })
+          startAutoDeployCountdown(displayProviders)
+          return
+        }
+      }
 
       if (reliableInList === 0 && onlineInList > 0) {
         setAlert({
@@ -419,6 +500,8 @@ export function DeploymentForm() {
   }
 
   const handleCancelBidSelection = () => {
+    // Cancel any auto-deploy countdown
+    cancelAutoDeployCountdown()
     setAvailableBids([])
     setCurrentDseq(null)
     setCurrentSdl(null)
@@ -456,6 +539,8 @@ export function DeploymentForm() {
     difficultyEnergy,
     minDiversity,
     minSolutions,
+    // Include GPU model for CUDA deployments
+    gpuModel: minerType === 'cuda' ? gpuModel : undefined,
     // Include IPFS config if enabled
     ipfsNode: ipfsEnabled ? ipfsNode : undefined,
     ipfsApiKey: ipfsEnabled ? ipfsApiKey : undefined,
@@ -602,6 +687,46 @@ export function DeploymentForm() {
       {/* Bid Selection UI */}
       {availableBids.length > 0 && (
         <div className="bid-selection">
+          {/* Auto-deploy countdown banner */}
+          {autoDeployCountdown !== null && autoDeploySelectedBid && (
+            <div style={{
+              background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+              color: 'white',
+              padding: '16px',
+              borderRadius: '8px',
+              marginBottom: '16px',
+              textAlign: 'center'
+            }}>
+              <div style={{ fontSize: '18px', fontWeight: 600, marginBottom: '8px' }}>
+                Auto-deploying in {autoDeployCountdown}s...
+              </div>
+              <div style={{ marginBottom: '12px' }}>
+                Selected: <strong>{getProviderDisplayName(autoDeploySelectedBid)}</strong>
+                {' '}- {autoDeploySelectedBid.bid.bid.price.amount} uakt/block
+                {autoDeploySelectedBid.isReliable && (
+                  <span style={{ marginLeft: '8px', background: 'rgba(255,255,255,0.2)', padding: '2px 8px', borderRadius: '4px', fontSize: '12px' }}>
+                    Reliable
+                  </span>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={cancelAutoDeployCountdown}
+                style={{
+                  background: 'rgba(255,255,255,0.2)',
+                  color: 'white',
+                  border: '1px solid rgba(255,255,255,0.4)',
+                  padding: '8px 24px',
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                  fontWeight: 500
+                }}
+              >
+                Cancel - Choose Manually
+              </button>
+            </div>
+          )}
+
           <h3>Select a Provider ({availableBids.length} available)</h3>
           <p className="bid-info">
             <span style={{ color: '#48bb78' }}>●</span> Verified (active leases){' '}
@@ -752,6 +877,22 @@ export function DeploymentForm() {
           <small>CPU miners are cheaper but slower. GPU miners are faster but cost more.</small>
         </div>
 
+        {minerType === 'cuda' && (
+          <div className="form-group">
+            <label htmlFor="gpuModel">GPU Model</label>
+            <select
+              id="gpuModel"
+              value={gpuModel}
+              onChange={(e) => setGpuModel(e.target.value as GpuModelKey)}
+            >
+              {Object.entries(GPU_MODELS).map(([key, { label }]) => (
+                <option key={key} value={key}>{label}</option>
+              ))}
+            </select>
+            <small>Select a specific GPU model or "Any" to accept any NVIDIA GPU. Specific models may have fewer available providers.</small>
+          </div>
+        )}
+
         <div className="form-group">
           <label htmlFor="fleetSize">
             {minerType === 'cuda' ? 'Total GPUs' : 'Total CPUs'}
@@ -873,6 +1014,43 @@ export function DeploymentForm() {
             </div>
           </>
         )}
+
+        {/* Auto-Deploy Toggle */}
+        <div className="form-group" style={{
+          background: autoDeployEnabled ? 'rgba(102, 126, 234, 0.1)' : 'transparent',
+          padding: '12px',
+          borderRadius: '8px',
+          border: autoDeployEnabled ? '1px solid rgba(102, 126, 234, 0.3)' : '1px solid transparent',
+          marginTop: '8px'
+        }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={autoDeployEnabled}
+              onChange={(e) => handleAutoDeployToggle(e.target.checked)}
+            />
+            <span style={{ fontWeight: autoDeployEnabled ? 600 : 400 }}>
+              Auto-Accept Best Bid
+            </span>
+            {autoDeployEnabled && (
+              <span style={{
+                background: '#667eea',
+                color: 'white',
+                fontSize: '10px',
+                padding: '2px 6px',
+                borderRadius: '4px',
+                fontWeight: 600
+              }}>
+                ON
+              </span>
+            )}
+          </label>
+          <small style={{ display: 'block', marginTop: '4px' }}>
+            {autoDeployEnabled
+              ? 'Will automatically select the lowest-price reliable provider after a 5-second countdown. You can cancel to choose manually.'
+              : 'When enabled, automatically accepts the best bid without manual selection.'}
+          </small>
+        </div>
 
         <div className="alert alert-info cost-estimate">
           <strong>Estimated Cost:</strong> {estimatedCost} AKT for {miningDuration}

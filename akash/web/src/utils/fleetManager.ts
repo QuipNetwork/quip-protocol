@@ -283,6 +283,13 @@ export async function createDeploymentAndGetBids(
 
   const isGpu = config.minerType === 'cuda'
 
+  console.log(`[Fleet] Creating deployment #${deployment.index + 1}:`, {
+    type: isGpu ? 'GPU' : 'CPU',
+    requestedCpu: deployment.requestedCpu,
+    requestedGpu: deployment.requestedGpu,
+    memoryGi: deployment.requestedMemoryGi
+  })
+
   const sdl = generateSDL({
     ...config,
     fleetSize: isGpu ? deployment.requestedGpu : deployment.requestedCpu,
@@ -292,25 +299,49 @@ export async function createDeploymentAndGetBids(
     instanceCount: 1  // Always 1 container - miner handles parallelization
   })
 
+  // Log SDL resources for debugging GPU/CPU configuration issues
+  const sdlAny = sdl as Record<string, unknown>
+  const profiles = sdlAny.profiles as Record<string, unknown> | undefined
+  const compute = profiles?.compute as Record<string, unknown> | undefined
+  const serviceName = `quip-${config.minerType}-miner`
+  const serviceCompute = compute?.[serviceName] as { resources?: unknown } | undefined
+  console.log(`[Fleet] Generated SDL for deployment #${deployment.index + 1}:`, {
+    resources: serviceCompute?.resources
+  })
+
   // Create deployment
-  const deployResult = await createDeployment(signingClient, owner, sdl)
-  onUpdate({
-    dseq: deployResult.dseq,
-    transactionHash: deployResult.transactionHash,
-    manifestJson: deployResult.manifestJson,
-    status: 'waiting-bids'
-  })
+  try {
+    const deployResult = await createDeployment(signingClient, owner, sdl)
+    console.log(`[Fleet] Deployment #${deployment.index + 1} created:`, {
+      dseq: deployResult.dseq,
+      txHash: deployResult.transactionHash
+    })
 
-  // Wait for bids (2 minutes, polling every 5 seconds)
-  const bids = await waitForBids(owner, deployResult.dseq, 120000, 5000)
+    onUpdate({
+      dseq: deployResult.dseq,
+      transactionHash: deployResult.transactionHash,
+      manifestJson: deployResult.manifestJson,
+      status: 'waiting-bids'
+    })
 
-  onUpdate({
-    availableBids: bids,
-    status: bids.length > 0 ? 'selecting-bid' : 'failed',
-    error: bids.length === 0 ? 'No bids received' : undefined
-  })
+    // Wait for bids (2 minutes, polling every 5 seconds)
+    console.log(`[Fleet] Waiting for bids on deployment #${deployment.index + 1} (DSEQ: ${deployResult.dseq})...`)
+    const bids = await waitForBids(owner, deployResult.dseq, 120000, 5000)
 
-  return bids
+    console.log(`[Fleet] Received ${bids.length} bids for deployment #${deployment.index + 1}`)
+
+    onUpdate({
+      availableBids: bids,
+      status: bids.length > 0 ? 'selecting-bid' : 'failed',
+      error: bids.length === 0 ? 'No bids received' : undefined
+    })
+
+    return bids
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error)
+    console.error(`[Fleet] Failed to create deployment #${deployment.index + 1}:`, errorMsg)
+    throw error
+  }
 }
 
 /**
@@ -328,6 +359,12 @@ export async function acceptBidAndDeploy(
     throw new Error('Deployment not properly initialized')
   }
 
+  console.log(`[Fleet] Accepting bid for deployment #${deployment.index + 1}:`, {
+    dseq: deployment.dseq,
+    provider: providerName,
+    price: selectedBid.bid.price.amount + ' ' + selectedBid.bid.price.denom
+  })
+
   onUpdate({
     selectedBid,
     selectedProviderName: providerName,
@@ -336,6 +373,7 @@ export async function acceptBidAndDeploy(
 
   // Accept the bid
   await acceptBid(signingClient, selectedBid)
+  console.log(`[Fleet] Bid accepted for deployment #${deployment.index + 1}, sending manifest...`)
   onUpdate({ status: 'sending-manifest' })
 
   // Send manifest
@@ -347,8 +385,11 @@ export async function acceptBidAndDeploy(
   )
 
   if (!manifestResult.success) {
+    console.error(`[Fleet] Manifest failed for deployment #${deployment.index + 1}:`, manifestResult.error)
     throw new Error(`Manifest failed: ${manifestResult.error}`)
   }
+
+  console.log(`[Fleet] Deployment #${deployment.index + 1} is now ACTIVE`)
 
   onUpdate({
     status: 'active',
@@ -376,6 +417,12 @@ export async function deployFleetAutomatic(
   state.status = 'deploying'
   const isGpu = config.minerType === 'cuda'
 
+  console.log('=== FLEET DEPLOYMENT STARTED ===')
+  console.log(`[Fleet] Type: ${isGpu ? 'GPU' : 'CPU'}`)
+  console.log(`[Fleet] Total requested: ${isGpu ? capacityCheck.requestedGpu : capacityCheck.requestedCpu}`)
+  console.log(`[Fleet] Initial request size: ${capacityCheck.initialRequestSize}`)
+  console.log(`[Fleet] Duration: ${config.miningDuration}`)
+
   const updateStats = () => {
     state.stats = {
       totalRequested: isGpu ? capacityCheck.requestedGpu : capacityCheck.requestedCpu,
@@ -391,12 +438,21 @@ export async function deployFleetAutomatic(
 
   updateStats()
 
+  let attemptCount = 0
+  const maxAttempts = 100 // Safety limit to prevent infinite loops
+
   // Adaptive deployment loop
-  while (state.remainingResources > 0) {
+  while (state.remainingResources > 0 && attemptCount < maxAttempts) {
+    attemptCount++
+
     // Create deployment for current request size
     const requestSize = Math.min(state.currentRequestSize, state.remainingResources)
     const deployment = createNextDeploymentItem(state, requestSize)
     state.deployments.push(deployment)
+
+    console.log(`[Fleet] Attempt ${attemptCount}: Creating deployment for ${requestSize} ${isGpu ? 'GPU' : 'CPU'}(s)`)
+    console.log(`[Fleet] Progress: ${state.stats.totalAllocated}/${state.stats.totalRequested} allocated, ${state.remainingResources} remaining`)
+
     updateStats()
 
     try {
@@ -421,11 +477,11 @@ export async function deployFleetAutomatic(
         // Halve the request size (minimum 1)
         if (state.currentRequestSize > 1) {
           state.currentRequestSize = Math.max(1, Math.floor(state.currentRequestSize / 2))
-          console.log(`No bids received, reducing request to ${state.currentRequestSize}`)
+          console.log(`[Fleet] No bids received, reducing request size to ${state.currentRequestSize}`)
           continue
         } else {
           // Already at minimum, give up on remaining
-          console.log('No bids at minimum size, stopping')
+          console.log('[Fleet] No bids at minimum size (1), stopping deployment')
           break
         }
       }
@@ -436,6 +492,8 @@ export async function deployFleetAutomatic(
       )
       const selectedBid = sortedBids[0]
       const providerName = selectedBid.bid.id.provider.slice(0, 12) + '...'
+
+      console.log(`[Fleet] Selected lowest price bid: ${selectedBid.bid.price.amount} ${selectedBid.bid.price.denom} from ${providerName}`)
 
       // Accept bid and deploy
       await acceptBidAndDeploy(
@@ -453,19 +511,41 @@ export async function deployFleetAutomatic(
       // Successfully allocated - update remaining
       const allocated = isGpu ? deployment.requestedGpu : deployment.requestedCpu
       state.remainingResources -= allocated
-      console.log(`Allocated ${allocated} ${isGpu ? 'GPU' : 'CPU'}(s), remaining: ${state.remainingResources}`)
+      console.log(`[Fleet] Successfully allocated ${allocated} ${isGpu ? 'GPU' : 'CPU'}(s), remaining: ${state.remainingResources}`)
 
     } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      console.error(`[Fleet] Deployment attempt ${attemptCount} failed:`, errorMsg)
       deployment.status = 'failed'
-      deployment.error = error instanceof Error ? error.message : String(error)
+      deployment.error = errorMsg
       updateStats()
-      // Continue trying with remaining resources
+
+      // If the same error keeps happening, reduce request size to break the loop
+      // This prevents infinite loops when there's a persistent error
+      if (state.currentRequestSize > 1) {
+        state.currentRequestSize = Math.max(1, Math.floor(state.currentRequestSize / 2))
+        console.log(`[Fleet] Reducing request size to ${state.currentRequestSize} after error`)
+      } else {
+        // At minimum size and still failing, stop
+        console.log('[Fleet] At minimum size and still failing, stopping deployment')
+        break
+      }
     }
+  }
+
+  if (attemptCount >= maxAttempts) {
+    console.error(`[Fleet] Stopped after ${maxAttempts} attempts (safety limit)`)
   }
 
   state.status = state.stats.deploymentsActive === 0 ? 'cancelled' : 'completed'
   state.completedAt = new Date()
   updateStats()
+
+  console.log('=== FLEET DEPLOYMENT COMPLETED ===')
+  console.log(`[Fleet] Status: ${state.status}`)
+  console.log(`[Fleet] Active deployments: ${state.stats.deploymentsActive}`)
+  console.log(`[Fleet] Failed deployments: ${state.stats.deploymentsFailed}`)
+  console.log(`[Fleet] Total allocated: ${state.stats.totalAllocated}/${state.stats.totalRequested}`)
 
   return state
 }

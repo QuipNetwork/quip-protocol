@@ -1,6 +1,7 @@
 import { AKASH_REST, AKASH_DENOM, AKASH_CONSOLE_API } from '../config/constants'
 import type { SigningStargateClient } from '@cosmjs/stargate'
 import Long from 'long'
+import { signAndBroadcastWithSession } from './sessionSigning'
 
 // Import v1beta4 message types from chain-sdk (the current Akash mainnet version)
 // Using chain-sdk ensures we stay compatible with API upgrades
@@ -261,6 +262,7 @@ export function selectBestBid(bids: Bid[]): Bid | null {
 
 /**
  * Accept a bid by creating a lease
+ * Uses session signing when available for automatic approval
  */
 export async function acceptBid(
   signingClient: SigningStargateClient,
@@ -280,7 +282,9 @@ export async function acceptBid(
 
   const typeUrl = `/${MsgCreateLease.$type}`
 
-  const result = await signingClient.signAndBroadcast(
+  // Use session signing if available
+  const result = await signAndBroadcastWithSession(
+    signingClient,
     owner,
     [{ typeUrl, value: msg }],
     'auto',
@@ -983,8 +987,9 @@ export async function publishCertificateToChain(
 
   console.log('Broadcasting MsgCreateCertificate...')
 
-  // Sign and broadcast
-  const result = await signingClient.signAndBroadcast(
+  // Sign and broadcast using session if available
+  const result = await signAndBroadcastWithSession(
+    signingClient,
     owner,
     [msg],
     'auto',
@@ -1024,8 +1029,9 @@ export async function revokeCertificateOnChain(
     }
   }
 
-  // Sign and broadcast
-  const result = await signingClient.signAndBroadcast(
+  // Sign and broadcast using session if available
+  const result = await signAndBroadcastWithSession(
+    signingClient,
     owner,
     [msg],
     'auto',
@@ -1098,8 +1104,9 @@ export async function createDeployment(
   // Get type URL from the message's $type property
   const typeUrl = `/${MsgCreateDeployment.$type}`
 
-  // Sign and broadcast transaction
-  const result = await signingClient.signAndBroadcast(
+  // Sign and broadcast transaction using session if available
+  const result = await signAndBroadcastWithSession(
+    signingClient,
     owner,
     [{ typeUrl, value: msg }],
     'auto',
@@ -1336,6 +1343,7 @@ export function getTotalCapacity(providers: ProviderCapacity[]): {
 /**
  * Close a deployment
  * This releases all resources and stops billing
+ * Uses session signing when available for automatic approval
  */
 export async function closeDeployment(
   signingClient: SigningStargateClient,
@@ -1351,7 +1359,9 @@ export async function closeDeployment(
 
   const typeUrl = `/${MsgCloseDeployment.$type}`
 
-  const result = await signingClient.signAndBroadcast(
+  // Use session signing if available
+  const result = await signAndBroadcastWithSession(
+    signingClient,
     owner,
     [{ typeUrl, value: msg }],
     'auto',

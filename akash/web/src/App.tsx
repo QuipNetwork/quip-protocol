@@ -1,4 +1,6 @@
 import { KeplrProvider } from './context/KeplrContext'
+import { MonitorProvider } from './context/MonitorContext'
+import { SessionProvider } from './context/SessionContext'
 import { WalletConnection } from './components/WalletConnectionKeplr'
 import { DeploymentForm } from './components/DeploymentForm'
 import { DeploymentList } from './components/DeploymentList'
@@ -11,7 +13,9 @@ export default function App() {
 
   return (
     <KeplrProvider>
-      <div className="container">
+      <SessionProvider>
+        <MonitorProvider>
+          <div className="container">
         <header className="header">
           <h1>Quip Protocol Mining</h1>
           <p className="subtitle">Deploy decentralized mining experiments on Akash Network</p>
@@ -22,10 +26,12 @@ export default function App() {
 
         <TabNavigation activeTab={activeTab} onTabChange={setActiveTab} />
 
-        {activeTab === 'deploy' && <DeploymentForm />}
-        {activeTab === 'manage' && <DeploymentList />}
-        {activeTab === 'results' && <ResultsRetrieval />}
-      </div>
+          {activeTab === 'deploy' && <DeploymentForm />}
+          {activeTab === 'manage' && <DeploymentList />}
+          {activeTab === 'results' && <ResultsRetrieval />}
+          </div>
+        </MonitorProvider>
+      </SessionProvider>
     </KeplrProvider>
   )
 }

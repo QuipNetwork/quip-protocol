@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo } from 'react'
 import yaml from 'yaml'
 import { useKeplr } from '../context/KeplrContext'
+import { useMonitor } from '../context/MonitorContext'
 import {
   fetchDeployments,
   fetchLeases,
@@ -14,6 +15,10 @@ import {
   type Lease,
   type ForwardedPort
 } from '../utils/akashApi'
+import {
+  getStatusMessage,
+  getStatusColor
+} from '../utils/deploymentMonitor'
 import { formatAKT, formatDate, calculateUptime } from '../utils/format'
 import { generateSDL, type SDLConfig } from '../utils/sdl'
 import { DEFAULTS } from '../config/constants'
@@ -28,6 +33,16 @@ interface DeploymentWithLease extends Deployment {
 
 export function DeploymentList() {
   const { address, isConnected, getSigningClient } = useKeplr()
+  const {
+    autoCloseEnabled,
+    setAutoCloseEnabled,
+    monitoredDeployments,
+    startMonitoring,
+    stopMonitoring,
+    cancelAutoClose,
+    isPolling
+  } = useMonitor()
+
   const [deployments, setDeployments] = useState<DeploymentWithLease[]>([])
   const [currentBlock, setCurrentBlock] = useState(0)
   const [loading, setLoading] = useState(false)
@@ -289,6 +304,7 @@ export function DeploymentList() {
       <div style={{ display: 'flex', gap: '12px', marginBottom: '16px', flexWrap: 'wrap', alignItems: 'center' }}>
         <button className="btn btn-secondary" onClick={refresh} disabled={loading || closingAll}>
           {loading ? 'Refreshing...' : 'Refresh Deployments'}
+          {isPolling && <span style={{ marginLeft: '8px', opacity: 0.7 }}>...</span>}
         </button>
 
         {deployments.filter(d => d.deployment.state === 'active').length > 0 && (
@@ -304,7 +320,52 @@ export function DeploymentList() {
             }
           </button>
         )}
+
+        {/* Auto-close toggle */}
+        <label style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '8px',
+          cursor: 'pointer',
+          padding: '8px 12px',
+          background: autoCloseEnabled ? 'rgba(102, 126, 234, 0.15)' : 'rgba(113, 128, 150, 0.1)',
+          borderRadius: '6px',
+          border: autoCloseEnabled ? '1px solid rgba(102, 126, 234, 0.3)' : '1px solid transparent',
+          transition: 'all 0.2s'
+        }}>
+          <input
+            type="checkbox"
+            checked={autoCloseEnabled}
+            onChange={(e) => setAutoCloseEnabled(e.target.checked)}
+          />
+          <span style={{ fontWeight: autoCloseEnabled ? 600 : 400, fontSize: '14px' }}>
+            Auto-Close Exited
+          </span>
+          {autoCloseEnabled && (
+            <span style={{
+              background: '#667eea',
+              color: 'white',
+              fontSize: '10px',
+              padding: '2px 6px',
+              borderRadius: '4px',
+              fontWeight: 600
+            }}>
+              ON
+            </span>
+          )}
+        </label>
       </div>
+
+      {autoCloseEnabled && (
+        <div className="alert alert-info" style={{ marginBottom: '16px' }}>
+          <strong>Auto-Close Enabled:</strong> Deployments will automatically close 60 seconds after containers exit.
+          {monitoredDeployments.size > 0 && (
+            <span style={{ marginLeft: '8px' }}>
+              Monitoring {monitoredDeployments.size} deployment(s).
+            </span>
+          )}
+        </div>
+      )}
 
       {error && (
         <div className="alert alert-error">
@@ -342,9 +403,95 @@ export function DeploymentList() {
             }
             const leaseStatus = getLeaseStatus()
 
+            // Get monitoring info if available
+            const monitorInfo = monitoredDeployments.get(d.deployment.id.dseq)
+            const isMonitored = !!monitorInfo
+            const hasAutoCloseCountdown = monitorInfo?.autoCloseCountdown !== null && monitorInfo?.autoCloseCountdown !== undefined
+
             return (
               <div key={d.deployment.id.dseq} className="deployment-item">
-                <h3>Deployment #{d.deployment.id.dseq}</h3>
+                {/* Auto-close countdown banner */}
+                {hasAutoCloseCountdown && (
+                  <div style={{
+                    background: 'linear-gradient(135deg, #f6ad55 0%, #fc8181 100%)',
+                    color: 'white',
+                    padding: '12px',
+                    borderRadius: '6px',
+                    marginBottom: '12px',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center'
+                  }}>
+                    <div>
+                      <strong>Auto-closing in {monitorInfo?.autoCloseCountdown}s</strong>
+                      <span style={{ marginLeft: '8px', opacity: 0.9 }}>
+                        Container exited - will close to recover escrow
+                      </span>
+                    </div>
+                    <button
+                      onClick={() => cancelAutoClose(d.deployment.id.dseq)}
+                      style={{
+                        background: 'rgba(255,255,255,0.2)',
+                        color: 'white',
+                        border: '1px solid rgba(255,255,255,0.4)',
+                        padding: '4px 12px',
+                        borderRadius: '4px',
+                        cursor: 'pointer',
+                        fontWeight: 500,
+                        fontSize: '13px'
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                  <h3>Deployment #{d.deployment.id.dseq}</h3>
+
+                  {/* Monitor toggle for active deployments */}
+                  {d.deployment.state === 'active' && autoCloseEnabled && (
+                    <label style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '6px',
+                      cursor: 'pointer',
+                      fontSize: '12px',
+                      padding: '4px 8px',
+                      background: isMonitored ? 'rgba(72, 187, 120, 0.15)' : 'transparent',
+                      borderRadius: '4px'
+                    }}>
+                      <input
+                        type="checkbox"
+                        checked={isMonitored}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            startMonitoring(d.deployment.id.dseq)
+                          } else {
+                            stopMonitoring(d.deployment.id.dseq)
+                          }
+                        }}
+                      />
+                      <span>Monitor</span>
+                    </label>
+                  )}
+                </div>
+
+                {/* Container status from monitor */}
+                {isMonitored && monitorInfo?.status && (
+                  <p style={{ marginBottom: '8px' }}>
+                    <strong>Container Status:</strong>{' '}
+                    <span style={{ color: getStatusColor(monitorInfo.status) }}>
+                      {getStatusMessage(monitorInfo.status)}
+                    </span>
+                    {monitorInfo.status.lastChecked && (
+                      <span style={{ marginLeft: '8px', fontSize: '11px', color: '#718096' }}>
+                        (checked {Math.round((Date.now() - monitorInfo.status.lastChecked.getTime()) / 1000)}s ago)
+                      </span>
+                    )}
+                  </p>
+                )}
+
                 <p>
                   <strong>Deployment State:</strong>{' '}
                   <span className={`deployment-status ${getStatusClass(d.deployment.state)}`}>

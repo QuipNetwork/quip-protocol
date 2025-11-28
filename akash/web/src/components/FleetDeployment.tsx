@@ -145,12 +145,14 @@ export function FleetDeployment({ config, onComplete, onCancel }: FleetDeploymen
   }
 
   // Cost estimate
+  // For adaptive deployment, we start with 1 deployment that requests all resources
+  // deploymentsNeeded defaults to 1 since we dynamically create deployments as needed
   const costEstimate = capacityCheck
     ? estimateFleetCostAKT(
         config.minerType,
         isGpuFleet ? capacityCheck.requestedGpu : capacityCheck.requestedCpu,
         parseDuration(config.miningDuration),
-        capacityCheck.deploymentsNeeded
+        1 // Initial estimate assumes 1 deployment (adaptive strategy may create more)
       )
     : null
 
