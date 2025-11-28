@@ -114,7 +114,7 @@ __device__ int8_t get_flip_energy_unpacked(
     const int* csr_col_ind,
     const int8_t* csr_J_vals,
     int n,
-    const float* h = nullptr
+    const float* h = NULL
 ) {
     // Use read-only cache for CSR reads (constant data)
     const int start = __ldg(&csr_row_ptr[var]);
@@ -123,7 +123,7 @@ __device__ int8_t get_flip_energy_unpacked(
     int energy = 0;
 
     // Add linear bias term if provided
-    if (h != nullptr) {
+    if (h != NULL) {
         energy += (int)__ldg(&h[var]);
     }
 
@@ -146,7 +146,7 @@ __device__ int8_t get_flip_energy(
     const int* csr_col_ind,
     const int8_t* csr_J_vals,
     int n,
-    const float* h = nullptr
+    const float* h = NULL
 ) {
     // Use read-only cache for CSR reads (constant data)
     const int start = __ldg(&csr_row_ptr[var]);
@@ -155,7 +155,7 @@ __device__ int8_t get_flip_energy(
     int energy = 0;
 
     // Add linear bias term if provided
-    if (h != nullptr) {
+    if (h != NULL) {
         energy += (int)__ldg(&h[var]);
     }
 
@@ -399,7 +399,7 @@ __global__ void cuda_sa_persistent_real(
                 int8_t spin_i = unpacked_state[i];
 
                 // Add h term
-                if (shared_job.h != nullptr && i < shared_job.h_size) {
+                if (shared_job.h != NULL && i < shared_job.h_size) {
                     current_energy += (int)(__ldg(&shared_job.h[i]) * spin_i);
                 }
 
