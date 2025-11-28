@@ -10,6 +10,101 @@ MIN_SOLUTIONS="${MIN_SOLUTIONS:-5}"
 TOPOLOGY_FILE="${TOPOLOGY_FILE:-dwave_topologies/topologies/advantage2_system1_7.json.gz}"
 GPU_DEVICE="${GPU_DEVICE:-0}"
 
+# ============================================================================
+# GPU DIAGNOSTICS - Run before mining to catch CUDA issues early
+# ============================================================================
+echo "========================================"
+echo "GPU Diagnostics"
+echo "========================================"
+
+# Check nvidia-smi
+if command -v nvidia-smi &> /dev/null; then
+    echo "nvidia-smi output:"
+    nvidia-smi || echo "  nvidia-smi FAILED (exit code: $?)"
+    echo ""
+else
+    echo "nvidia-smi: NOT FOUND"
+fi
+
+# Check CUDA environment
+echo "CUDA Environment:"
+echo "  CUDA_HOME: ${CUDA_HOME:-not set}"
+echo "  LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:-not set}"
+echo "  NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-not set}"
+echo ""
+
+# Check if CUDA libraries are accessible
+if [ -d "/usr/local/cuda/lib64" ]; then
+    echo "CUDA libraries found in /usr/local/cuda/lib64"
+    ls /usr/local/cuda/lib64/*.so* 2>/dev/null | head -5
+else
+    echo "CUDA libraries: NOT FOUND in /usr/local/cuda/lib64"
+fi
+echo ""
+
+# Python CUDA test
+echo "Python CUDA Test:"
+python3 -c "
+import sys
+try:
+    import cupy as cp
+    print(f'  CuPy version: {cp.__version__}')
+    print(f'  CUDA runtime version: {cp.cuda.runtime.runtimeGetVersion()}')
+    try:
+        device_count = cp.cuda.runtime.getDeviceCount()
+        print(f'  CUDA devices detected: {device_count}')
+        for i in range(device_count):
+            try:
+                cp.cuda.Device(i).use()
+                props = cp.cuda.runtime.getDeviceProperties(i)
+                print(f'    Device {i}: {props[\"name\"].decode()} ({props[\"totalGlobalMem\"] // 1024**3} GB)')
+                # Try allocation
+                _ = cp.zeros(1)
+                print(f'    Device {i}: Memory allocation OK')
+            except Exception as e:
+                print(f'    Device {i}: FAILED - {e}')
+    except Exception as e:
+        print(f'  Device enumeration failed: {e}')
+except ImportError as e:
+    print(f'  CuPy import failed: {e}')
+except Exception as e:
+    print(f'  CUDA test failed: {e}')
+" 2>&1
+echo ""
+echo "========================================"
+echo ""
+
+# If CUDA miner requested but CUDA not working, exit early with clear error
+if [ "$MINER_TYPE" = "cuda" ]; then
+    GPU_OK=$(python3 -c "
+import sys
+try:
+    import cupy as cp
+    cp.cuda.Device(0).use()
+    _ = cp.zeros(1)
+    print('OK')
+except:
+    print('FAIL')
+" 2>/dev/null)
+
+    if [ "$GPU_OK" != "OK" ]; then
+        echo "========================================"
+        echo "FATAL: CUDA requested but GPU not accessible"
+        echo ""
+        echo "Possible causes:"
+        echo "  1. Host driver too old (need driver 520+ for CUDA 11.8)"
+        echo "  2. NVIDIA Container Runtime not configured on this provider"
+        echo "  3. No GPU allocated to this container"
+        echo "  4. GPU not exposed to container (missing --gpus flag)"
+        echo ""
+        echo "This image uses CUDA 11.8 for good compatibility."
+        echo "If this still fails, try a different Akash provider,"
+        echo "or use the CPU image instead."
+        echo "========================================"
+        exit 1
+    fi
+fi
+
 # IPFS configuration
 IPFS_NODE="${IPFS_NODE:-}"  # e.g., https://carback-ipfs.ngrok.io
 IPFS_API_KEY="${IPFS_API_KEY:-}"
