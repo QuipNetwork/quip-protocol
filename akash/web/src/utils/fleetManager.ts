@@ -32,6 +32,7 @@ import {
 } from './akashApi'
 import { generateSDL, type SDLConfig } from './sdl'
 import { MAX_GPU_PER_DEPLOYMENT, MAX_CPU_PER_DEPLOYMENT } from '../config/constants'
+import { parseDurationToMinutes } from './format'
 
 // ============================================================================
 // Types
@@ -313,7 +314,8 @@ export async function createDeploymentAndGetBids(
 
   // Create deployment
   try {
-    const deployResult = await createDeployment(signingClient, owner, sdl)
+    const durationMinutes = parseDurationToMinutes(config.miningDuration)
+    const deployResult = await createDeployment(signingClient, owner, sdl, durationMinutes)
     console.log(`[Fleet] Deployment #${deployment.index + 1} created:`, {
       dseq: deployResult.dseq,
       txHash: deployResult.transactionHash
@@ -436,7 +438,12 @@ export async function deployFleetAutomatic(
       deploymentsActive: state.deployments.filter(d => d.status === 'active').length,
       deploymentsFailed: state.deployments.filter(d => d.status === 'failed').length
     }
-    onProgress?.(state)
+    // Deep clone state to trigger React re-render (new object references)
+    onProgress?.({
+      ...state,
+      deployments: state.deployments.map(d => ({ ...d })),
+      stats: { ...state.stats }
+    })
   }
 
   updateStats()

@@ -1045,10 +1045,50 @@ export async function revokeCertificateOnChain(
   return { transactionHash: result.transactionHash }
 }
 
+/**
+ * Calculate deposit amount for a deployment
+ * @param sdlConfig - SDL configuration object
+ * @param durationMinutes - Deployment duration in minutes
+ * @returns Deposit amount in uAKT (with 2x safety buffer)
+ */
+function calculateDeposit(sdlConfig: object, durationMinutes: number): string {
+  // Extract pricing from SDL
+  const config = sdlConfig as Record<string, unknown>
+  const profiles = config.profiles as Record<string, unknown> | undefined
+  const placement = profiles?.placement as Record<string, unknown> | undefined
+  const dcloud = placement?.dcloud as Record<string, unknown> | undefined
+  const pricing = dcloud?.pricing as Record<string, { amount: number }> | undefined
+
+  // Get the first service's pricing (should be only one)
+  let pricePerBlock = 10000 // Default fallback
+  if (pricing) {
+    const firstService = Object.values(pricing)[0]
+    if (firstService?.amount) {
+      pricePerBlock = firstService.amount
+    }
+  }
+
+  // Calculate: blocks needed * price per block * 2 (safety buffer)
+  // Akash blocks are ~6 seconds, so ~10 blocks/minute
+  const blocksPerMinute = 10
+  const totalBlocks = durationMinutes * blocksPerMinute
+  const depositUakt = pricePerBlock * totalBlocks * 2
+
+  // Minimum 5 AKT, maximum 50 AKT
+  const minDeposit = 5_000_000  // 5 AKT
+  const maxDeposit = 50_000_000 // 50 AKT
+  const finalDeposit = Math.max(minDeposit, Math.min(maxDeposit, depositUakt))
+
+  console.log(`Deposit calculation: ${pricePerBlock} uakt/block × ${totalBlocks} blocks × 2 = ${depositUakt} uakt (clamped to ${finalDeposit})`)
+
+  return finalDeposit.toString()
+}
+
 export async function createDeployment(
   signingClient: SigningStargateClient,
   owner: string,
-  sdlConfig: object
+  sdlConfig: object,
+  durationMinutes: number = 90  // Default 90 minutes if not specified
 ): Promise<{ transactionHash: string; dseq: string; manifestJson: string }> {
   // Convert SDL object to YAML string for akashjs
   const yaml = await import('yaml')
@@ -1081,6 +1121,9 @@ export async function createDeployment(
   const hash = new Uint8Array(hashBuffer)
   console.log('Computed manifest hash:', Array.from(hash.slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join(''))
 
+  // Calculate deposit based on duration and pricing (with 2x safety buffer)
+  const depositAmount = calculateDeposit(sdlConfig, durationMinutes)
+
   // Create v1beta4 deployment message
   // Note: v1beta4 uses 'hash' instead of 'version', and 'deposit' has 'sources'
   const groups = sdl.groups()
@@ -1094,7 +1137,7 @@ export async function createDeployment(
     deposit: {
       amount: {
         denom: AKASH_DENOM,
-        amount: '5000000' // 5 AKT deposit
+        amount: depositAmount
       },
       // Use both grant and balance as funding sources
       sources: [Source.grant, Source.balance]

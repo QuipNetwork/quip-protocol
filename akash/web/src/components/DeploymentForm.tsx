@@ -254,7 +254,8 @@ export function DeploymentForm() {
       setSigningClient(client)
 
       // Step 1: Create the deployment transaction
-      const deployResult = await createDeployment(client, address, sdl)
+      const durationMinutes = parseDurationToMinutes(miningDuration)
+      const deployResult = await createDeployment(client, address, sdl, durationMinutes)
       console.log('Deployment result:', deployResult)
       setCurrentDseq(deployResult.dseq)
       setCurrentManifestJson(deployResult.manifestJson)  // Store manifest for later
