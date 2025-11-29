@@ -39,7 +39,7 @@ profiles:
     cuda-miner:
       resources:
         cpu:
-          units: 4
+          units: 1  # Match GPU count - CUDA mining needs minimal CPU
         memory:
           size: 16Gi
         storage:

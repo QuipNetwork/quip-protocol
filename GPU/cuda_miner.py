@@ -109,6 +109,8 @@ class CudaMiner(BaseMiner):
         topology_obj = topology if topology is not None else DEFAULT_TOPOLOGY
         self.nodes = list(topology_obj.graph.nodes)
         self.edges = list(topology_obj.graph.edges)
+        # Precompute node indices as numpy array for fast filtering
+        self._node_indices = np.array(self.nodes, dtype=np.int32)
 
         # Initialize persistent kernel with large ring buffer for batched mining
         self.kernel = CudaKernelRealSA(
@@ -163,11 +165,13 @@ class CudaMiner(BaseMiner):
             if hasattr(self, 'async_sampler'):
                 self.async_sampler.stop_immediate()
 
-            # Reset CUDA device
+            # Synchronize and free memory pools (deviceReset doesn't exist in CuPy)
             if cp is not None:
                 cp.cuda.Device(int(self.device)).use()
-                cp.cuda.runtime.deviceReset()
-                self.logger.info(f"CUDA device {self.device} reset completed")
+                cp.cuda.Stream.null.synchronize()
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+                self.logger.info(f"CUDA device {self.device} cleanup completed")
 
         except Exception as e:
             self.logger.error(f"Error during CUDA miner cleanup: {e}")
@@ -188,11 +192,10 @@ class CudaMiner(BaseMiner):
         Returns:
             SampleSet with samples filtered to length 4593
         """
-        filtered_samples = []
-        for sample in sampleset.record.sample:
-            # Extract only values at node indices that exist in topology
-            filtered_sample = np.array([sample[node] for node in self.nodes], dtype=np.int8)
-            filtered_samples.append(filtered_sample)
+        # Use numpy advanced indexing for vectorized extraction
+        # self._node_indices is precomputed in __init__ for speed
+        samples = sampleset.record.sample
+        filtered_samples = samples[:, self._node_indices].astype(np.int8)
 
         # Create new SampleSet with filtered samples
         return dimod.SampleSet.from_samples(
@@ -209,7 +212,7 @@ class CudaMiner(BaseMiner):
         requirements,
         prev_timestamp: int,
         stop_event: multiprocessing.synchronize.Event,
-        drain_on_stop: bool = False,
+        drain: bool = False,
     ) -> Optional[MiningResult]:
         """Mine a block using persistent CUDA kernel.
 
@@ -223,10 +226,8 @@ class CudaMiner(BaseMiner):
             requirements: BlockRequirements object with difficulty settings
             prev_timestamp: Timestamp from previous block header
             stop_event: Multiprocessing event to signal stop
-            drain_on_stop: If True, when stop_event is set during batch evaluation,
-                continue evaluating remaining samples in the current batch and
-                return the best result found. Default False preserves original
-                behavior (return immediately when stop is signaled).
+            drain: If False (default), return immediately on first valid result.
+                If True, process entire batch and return best result.
 
         Returns:
             MiningResult if successful, None if stopped or failed
@@ -282,88 +283,90 @@ class CudaMiner(BaseMiner):
         N = max(max(self.nodes), max(max(i, j) for i, j in self.edges)) + 1
 
         attempts = 0
-        best_result = None  # Track best result for drain mode
-        draining = False    # Flag to indicate we're draining final batch
 
-        while not stop_event.is_set() or draining:
-            # If we're draining, we already have samplesets to evaluate
-            if draining:
-                draining = False  # Only drain once
-            else:
-                # Increment sweeps slowly over time (reads stay constant)
-                current_time = time.time()
-                if current_time - last_increment_time >= increment_interval:
-                    # Increase sweeps by 1% toward max
-                    current_num_sweeps = min(max_num_sweeps, int(current_num_sweeps * 1.05))
-                    last_increment_time = current_time
+        while not stop_event.is_set():
+            # Increment sweeps slowly over time (reads stay constant)
+            current_time = time.time()
+            if current_time - last_increment_time >= increment_interval:
+                # Increase sweeps by 1% toward max
+                current_num_sweeps = min(max_num_sweeps, int(current_num_sweeps * 1.05))
+                last_increment_time = current_time
 
-                # Generate batch of Ising problems
-                h_list = []
-                J_list = []
-                h_dicts = []  # Keep dict versions for evaluate_sampleset
-                J_dicts = []
-                salts = []
-                nonces = []
+            # Generate batch of Ising problems
+            h_list = []
+            J_list = []
+            h_dicts = []  # Keep dict versions for evaluate_sampleset
+            J_dicts = []
+            salts = []
+            nonces = []
 
-                for _ in range(batch_size):
-                    salt = random.randbytes(32)
-                    nonce = ising_nonce_from_block(
-                        prev_block.hash, node_info.miner_id, cur_index, salt
-                    )
+            for _ in range(batch_size):
+                salt = random.randbytes(32)
+                nonce = ising_nonce_from_block(
+                    prev_block.hash, node_info.miner_id, cur_index, salt
+                )
 
-                    h_dict, J_dict = generate_ising_model_from_nonce(nonce, self.nodes, self.edges)
-                    h_dicts.append(h_dict)
-                    J_dicts.append(J_dict)
+                h_dict, J_dict = generate_ising_model_from_nonce(nonce, self.nodes, self.edges)
+                h_dicts.append(h_dict)
+                J_dicts.append(J_dict)
 
-                    # Convert to arrays (using sparse indexing with N=4800)
-                    h = np.zeros(N, dtype=np.float32)
-                    for node, val in h_dict.items():
-                        h[node] = val
+                # Convert to arrays (using sparse indexing with N=4800)
+                h = np.zeros(N, dtype=np.float32)
+                for node, val in h_dict.items():
+                    h[node] = val
 
-                    J = np.zeros(len(self.edges), dtype=np.float32)
-                    edge_to_idx = {edge: idx for idx, edge in enumerate(self.edges)}
-                    for (i, j), val in J_dict.items():
-                        if (i, j) in edge_to_idx:
-                            J[edge_to_idx[(i, j)]] = val
-                        elif (j, i) in edge_to_idx:
-                            J[edge_to_idx[(j, i)]] = val
+                J = np.zeros(len(self.edges), dtype=np.float32)
+                edge_to_idx = {edge: idx for idx, edge in enumerate(self.edges)}
+                for (i, j), val in J_dict.items():
+                    if (i, j) in edge_to_idx:
+                        J[edge_to_idx[(i, j)]] = val
+                    elif (j, i) in edge_to_idx:
+                        J[edge_to_idx[(j, i)]] = val
 
-                    h_list.append(h)
-                    J_list.append(J)
-                    salts.append(salt)
-                    nonces.append(nonce)
+                h_list.append(h)
+                J_list.append(J)
+                salts.append(salt)
+                nonces.append(nonce)
 
-                # Submit batch to GPU (non-blocking)
-                try:
-                    job_ids = self.async_sampler.sample_ising_async(
-                        h_list=h_list,
-                        J_list=J_list,
-                        num_reads=num_reads,
-                        num_betas=current_num_sweeps,
-                        num_sweeps_per_beta=num_sweeps_per_beta,
-                        edges=self.edges,
-                    )
-                except Exception as e:
-                    self.logger.error(f"Sampling error: {e}")
-                    continue
+            # Submit batch to GPU (non-blocking)
+            try:
+                job_ids = self.async_sampler.sample_ising_async(
+                    h_list=h_list,
+                    J_list=J_list,
+                    num_reads=num_reads,
+                    num_betas=current_num_sweeps,
+                    num_sweeps_per_beta=num_sweeps_per_beta,
+                    edges=self.edges,
+                )
+            except Exception as e:
+                self.logger.error(f"Sampling error: {e}")
+                continue
 
             # Process results as they arrive (incremental, not waiting for all)
-            # This is more responsive than waiting for all 48 jobs
-            batch_best = None
-            batch_attempts = 0
             remaining_jobs = set(range(len(job_ids)))
             job_to_idx = {job_ids[i]: i for i in range(len(job_ids))}
+            best_batch_result = None
+            last_result_time = time.time()
+            drain_timeout = 0.5  # 500ms timeout for drain mode
 
             while remaining_jobs:
-                # Check stop conditions
-                if stop_event.is_set() and not drain_on_stop:
-                    break
+                # Exit immediately if stop requested
+                if stop_event.is_set():
+                    self.logger.info("Mining stopped by stop_event")
+                    return best_batch_result
 
                 # Poll for next result (non-blocking)
                 result = self.async_sampler.kernel.try_dequeue_result()
                 if result is None:
+                    # In drain mode with a valid result, exit if we've waited too long
+                    if drain and best_batch_result and (time.time() - last_result_time) > drain_timeout:
+                        self.logger.info(f"Drain timeout ({drain_timeout}s) - returning best result early")
+                        return best_batch_result
                     time.sleep(0.001)  # 1ms backoff
                     continue
+
+                # Reset timeout on each result received
+                last_result_time = time.time()
 
                 # Got a result - process it immediately
                 job_id = result['job_id']
@@ -377,20 +380,23 @@ class CudaMiner(BaseMiner):
 
                 remaining_jobs.remove(idx)
                 attempts += 1
-                batch_attempts += 1
 
-                # Convert result to SampleSet
+                # Convert result to SampleSet (with timing)
+                t0 = time.time()
                 samples = self.async_sampler.kernel.get_samples(result)
                 energies = self.async_sampler.kernel.get_energies(result)
+                t1 = time.time()
                 sampleset = dimod.SampleSet.from_samples(
                     samples.astype(np.int8),
                     vartype='SPIN',
                     energy=energies,
                     info={'job_id': job_id, 'min_energy': result['min_energy']}
                 )
+                t2 = time.time()
 
                 # Filter and evaluate (pass pre-computed h, J to avoid regeneration)
                 filtered_sampleset = self._filter_samples_for_sparse_topology(sampleset)
+                t3 = time.time()
                 mining_result = evaluate_sampleset(
                     filtered_sampleset,
                     current_requirements,
@@ -405,30 +411,34 @@ class CudaMiner(BaseMiner):
                     h=h_dicts[idx],
                     J=J_dicts[idx]
                 )
+                t4 = time.time()
+
+                # Log timing if any step took > 200ms (baseline is ~50ms for SampleSet overhead)
+                get_time = (t1 - t0) * 1000
+                sampleset_time = (t2 - t1) * 1000
+                filter_time = (t3 - t2) * 1000
+                eval_time = (t4 - t3) * 1000
+                total_time = (t4 - t0) * 1000
+                if total_time > 200:
+                    self.logger.warning(
+                        f"Slow processing ({total_time:.0f}ms): "
+                        f"get={get_time:.0f}ms, sampleset={sampleset_time:.0f}ms, "
+                        f"filter={filter_time:.0f}ms, eval={eval_time:.0f}ms"
+                    )
 
                 if mining_result:
-                    if drain_on_stop:
-                        # Drain mode: track best result in this batch (lowest energy)
-                        if batch_best is None or mining_result.energy < batch_best.energy:
-                            batch_best = mining_result
-                    else:
-                        # Default mode: return immediately on first valid result
-                        self.logger.info(f"✅ Found valid block after {attempts} attempts!")
-                        self.logger.info(f"   Energy: {mining_result.energy:.1f}")
-                        self.logger.info(f"   Diversity: {mining_result.diversity:.3f}")
-                        self.logger.info(f"   Solutions: {mining_result.num_valid}")
-                        return mining_result
+                    self.logger.info(f"✅ Found valid block after {attempts} attempts!")
+                    self.logger.info(f"   Energy: {mining_result.energy:.1f}")
+                    self.logger.info(f"   Diversity: {mining_result.diversity:.3f}")
+                    self.logger.info(f"   Solutions: {mining_result.num_valid}")
+                    # Track best result in this batch (lowest energy)
+                    if best_batch_result is None or mining_result.energy < best_batch_result.energy:
+                        best_batch_result = mining_result
 
-            # After processing batch (drain mode only)
-            if drain_on_stop and batch_best:
-                self.logger.info(f"✅ Best result from batch of {batch_attempts}:")
-                self.logger.info(f"   Energy: {batch_best.energy:.1f}")
-                self.logger.info(f"   Diversity: {batch_best.diversity:.3f}")
-                self.logger.info(f"   Solutions: {batch_best.num_valid}")
-
-                # Keep the best across all batches
-                if best_result is None or batch_best.energy < best_result.energy:
-                    best_result = batch_best
+                # Batch complete - return best result if we found one
+                if best_batch_result:
+                    if not drain or attempts % batch_size == 0:
+                        return best_batch_result
 
             # Log progress every 10 batches
             if attempts % (10 * batch_size) == 0:
@@ -438,11 +448,6 @@ class CudaMiner(BaseMiner):
                     f"Attempts: {attempts} ({rate:.1f}/s), elapsed: {elapsed:.1f}s | "
                     f"Sweeps: {current_num_sweeps}/{max_num_sweeps}, Reads: {num_reads}"
                 )
-
-        # If drain mode found results, return the best one
-        if drain_on_stop and best_result:
-            self.logger.info(f"Drain mode: returning best result (energy: {best_result.energy:.1f})")
-            return best_result
 
         self.logger.info("Mining stopped by stop_event")
         return None

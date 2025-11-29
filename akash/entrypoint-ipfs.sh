@@ -9,6 +9,7 @@ MIN_DIVERSITY="${MIN_DIVERSITY:-0.1}"
 MIN_SOLUTIONS="${MIN_SOLUTIONS:-5}"
 TOPOLOGY_FILE="${TOPOLOGY_FILE:-dwave_topologies/topologies/advantage2_system1_7.json.gz}"
 GPU_DEVICE="${GPU_DEVICE:-0}"
+NUM_CPUS="${NUM_CPUS:-}"  # Override auto-detected CPU count
 
 # ============================================================================
 # GPU DIAGNOSTICS - Run before mining to catch CUDA issues early
@@ -102,6 +103,20 @@ except:
         echo "or use the CPU image instead."
         echo "========================================"
         exit 1
+    fi
+
+    # Auto-set NUM_CPUS to match GPU count if not explicitly set
+    # This avoids reporting excessive CPU cores from the host
+    if [ -z "$NUM_CPUS" ]; then
+        GPU_COUNT=$(python3 -c "
+import cupy as cp
+try:
+    print(cp.cuda.runtime.getDeviceCount())
+except:
+    print(1)
+" 2>/dev/null)
+        export NUM_CPUS="$GPU_COUNT"
+        echo "Auto-setting NUM_CPUS=$NUM_CPUS (matching GPU count)"
     fi
 fi
 
@@ -360,14 +375,35 @@ if [ "$IPFS_UPLOAD_SUCCESS" = true ]; then
     echo "Retrieve your results with:" | tee -a "$OUTPUT_LOG"
     echo "  ./akash/collect_ipfs_results.sh \"$MANIFEST_CID\"" | tee -a "$OUTPUT_LOG"
     echo "" | tee -a "$OUTPUT_LOG"
-    echo "🛑 Auto-shutdown enabled - stopping container..." | tee -a "$OUTPUT_LOG"
-    echo "   (IPFS upload successful, no need to keep running)" | tee -a "$OUTPUT_LOG"
+    echo "✅ Mining and upload complete!" | tee -a "$OUTPUT_LOG"
+    echo "   Results saved to IPFS - deployment can be closed" | tee -a "$OUTPUT_LOG"
     echo "========================================" | tee -a "$OUTPUT_LOG"
 
-    # Kill HTTP server and exit
-    kill $HTTP_PID 2>/dev/null || true
-    sleep 2
-    exit $EXIT_CODE
+    # Write completion marker that deployment monitor can detect via HTTP
+    # This JSON file is served by the HTTP server on port 8080
+    cat > "${OUTPUT_DIR}/done.json" << EOF
+{
+  "status": "complete",
+  "exit_code": $EXIT_CODE,
+  "ipfs_cid": "$MANIFEST_CID",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "message": "Mining complete. Results uploaded to IPFS. Safe to close deployment."
+}
+EOF
+    echo "UPLOAD_COMPLETE" > "${OUTPUT_DIR}/upload_status.txt"
+    echo "$MANIFEST_CID" >> "${OUTPUT_DIR}/upload_status.txt"
+
+    # NOTE: We don't exit because Akash providers ignore restart:never
+    # and would restart the container. Instead, sleep forever and let
+    # the deployment monitor close the deployment externally.
+    echo "" | tee -a "$OUTPUT_LOG"
+    echo "💤 Sleeping until deployment is closed..." | tee -a "$OUTPUT_LOG"
+    echo "   (Akash does not support restart:never, so we stay alive)" | tee -a "$OUTPUT_LOG"
+
+    # Sleep forever - deployment monitor will close the lease
+    while true; do
+        sleep 3600
+    done
 
 else
     # IPFS upload failed or not configured - keep HTTP server running

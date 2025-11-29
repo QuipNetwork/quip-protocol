@@ -57,6 +57,7 @@ class SimulatedAnnealingMiner(BaseMiner):
         requirements,
         prev_timestamp: int,
         stop_event: multiprocessing.synchronize.Event,
+        drain: bool = False,
     ) -> Optional[MiningResult]:
         """Mine a block using simulated annealing.
 

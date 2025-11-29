@@ -39,24 +39,85 @@ sys.stderr.reconfigure(line_buffering=True)
 
 from dataclasses import dataclass
 
-from shared.block import Block, BlockHeader, BlockRequirements, create_genesis_block
-from shared.miner_types import MiningResult
+from shared.block import BlockRequirements, create_genesis_block
 from shared.time_utils import utc_timestamp
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies import load_topology
 
 import os
+import numpy as np
 from typing import Any, Optional
+
+
+class NumpyEncoder(json.JSONEncoder):
+    """Custom JSON encoder that handles numpy types."""
+    def default(self, obj):
+        if isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        if isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+
+def _get_cgroup_cpu_limit() -> Optional[int]:
+    """Try to read CPU limit from cgroup (for containers).
+
+    Returns:
+        CPU limit as integer, or None if not in a cgroup-limited container.
+    """
+    # cgroup v2
+    try:
+        with open('/sys/fs/cgroup/cpu.max', 'r') as f:
+            content = f.read().strip()
+            if content != 'max':
+                quota, period = content.split()
+                if quota != 'max':
+                    return max(1, int(int(quota) / int(period)))
+    except (FileNotFoundError, ValueError, PermissionError):
+        pass
+
+    # cgroup v1
+    try:
+        with open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', 'r') as f:
+            quota = int(f.read().strip())
+        with open('/sys/fs/cgroup/cpu/cpu.cfs_period_us', 'r') as f:
+            period = int(f.read().strip())
+        if quota > 0:
+            return max(1, quota // period)
+    except (FileNotFoundError, ValueError, PermissionError):
+        pass
+
+    return None
 
 
 def detect_hardware() -> Dict[str, Any]:
     """Auto-detect available hardware for mining.
 
+    Respects NUM_CPUS environment variable and cgroup limits for containers.
+
     Returns:
         Dict with keys: 'cpu_count', 'cuda_devices', 'has_metal'
     """
+    # CPU count priority: NUM_CPUS env var > cgroup limit > os.cpu_count()
+    cpu_count = os.cpu_count() or 1
+
+    # Check environment variable override first
+    env_cpus = os.environ.get('NUM_CPUS')
+    if env_cpus:
+        try:
+            cpu_count = int(env_cpus)
+        except ValueError:
+            pass
+    else:
+        # Try cgroup limits (for containers)
+        cgroup_limit = _get_cgroup_cpu_limit()
+        if cgroup_limit is not None:
+            cpu_count = cgroup_limit
+
     result = {
-        'cpu_count': os.cpu_count() or 1,
+        'cpu_count': cpu_count,
         'cuda_devices': [],
         'has_metal': False
     }
@@ -330,10 +391,17 @@ def mine_worker(
     prev_block = create_genesis_block()
     prev_block.next_block_requirements = requirements
 
+    # QPU time tracking
+    total_qpu_time_us = 0.0
+
+    # Progress tracking
+    last_progress_time = start_time
+    progress_interval = 60  # Print progress every minute
+
     # Helper to submit current results (can be called multiple times)
     def submit_results():
         total_time = time.time() - start_time
-        result_queue.put({
+        result = {
             'miner_id': miner_id,
             'miner_type': miner.miner_type,
             'blocks_found': len(blocks_found),
@@ -343,34 +411,56 @@ def mine_worker(
             'diversities': [b.diversity for b in blocks_found],
             'solution_counts': [b.num_valid for b in blocks_found],
             'mining_times': [b.mining_time for b in blocks_found if b.mining_time]
-        })
-
-    # For CUDA miners, use drain_on_stop to collect all pending GPU results
-    use_drain = kind == 'cuda'
+        }
+        # Include QPU stats if we have any
+        if total_qpu_time_us > 0:
+            result['qpu_time_stats'] = {
+                'total_qpu_time_us': total_qpu_time_us,
+                'total_qpu_time_seconds': total_qpu_time_us / 1e6,
+                'avg_qpu_time_per_attempt_us': total_qpu_time_us / attempts if attempts > 0 else 0
+            }
+        result_queue.put(result)
 
     while not stop_event.is_set():
+        # Progress update
+        current_time = time.time()
+        if current_time - last_progress_time >= progress_interval:
+            elapsed = current_time - start_time
+            elapsed_min = elapsed / 60
+            blocks_per_min = len(blocks_found) / elapsed_min if elapsed_min > 0 else 0
+            qpu_msg = f", QPU: {total_qpu_time_us / 1e6:.2f}s" if total_qpu_time_us > 0 else ""
+            print(f"   [{miner_id}] Progress: {elapsed_min:.1f} min, "
+                  f"Blocks: {len(blocks_found)}, "
+                  f"Attempts: {attempts}, "
+                  f"Rate: {blocks_per_min:.2f}/min{qpu_msg}")
+            last_progress_time = current_time
+
         attempts += 1
 
-        # Build kwargs for mine_block (CUDA miner supports drain_on_stop)
-        mine_kwargs = {
-            'prev_block': prev_block,
-            'node_info': node_info,
-            'requirements': requirements,
-            'prev_timestamp': prev_block.header.timestamp,
-            'stop_event': stop_event,
-        }
-        if use_drain:
-            mine_kwargs['drain_on_stop'] = True
+        result = miner.mine_block(
+            prev_block=prev_block,
+            node_info=node_info,
+            requirements=requirements,
+            prev_timestamp=prev_block.header.timestamp,
+            stop_event=stop_event,
+            drain=(kind == 'cuda'),
+        )
 
-        result = miner.mine_block(**mine_kwargs)
+        # Track QPU time for this attempt (if available)
+        if hasattr(miner, 'timing_stats') and 'qpu_access_time' in miner.timing_stats:
+            if miner.timing_stats['qpu_access_time']:
+                attempt_qpu_time_us = miner.timing_stats['qpu_access_time'][-1]
+                total_qpu_time_us += attempt_qpu_time_us
 
         if result:
             blocks_found.append(result)
-            print(f"   [{miner_id}] Block {len(blocks_found)} found! Energy: {result.energy:.1f}")
+            qpu_msg = f", QPU: {total_qpu_time_us / 1e6:.2f}s total" if total_qpu_time_us > 0 else ""
+            print(f"   [{miner_id}] Block {len(blocks_found)} found! "
+                  f"Energy: {result.energy:.1f}, "
+                  f"Diversity: {result.diversity:.3f}, "
+                  f"Solutions: {result.num_valid}{qpu_msg}")
 
         # Submit results after each attempt (so we don't lose them if terminated)
-        # Only keep the latest result in the queue (drain old ones first won't work
-        # across processes, so main process will take the last one)
         submit_results()
 
     # Final submission (in case stop_event was set between attempts)
@@ -382,10 +472,12 @@ def mine_worker(
             # Stop the persistent kernel
             if hasattr(miner, 'async_sampler') and hasattr(miner.async_sampler, 'stop_immediate'):
                 miner.async_sampler.stop_immediate()
-            # Reset CUDA device to release all resources
+            # Synchronize and free memory pools (deviceReset doesn't exist in CuPy)
             import cupy as cp
             cp.cuda.Device(int(miner_spec.get('args', {}).get('device', '0'))).use()
-            cp.cuda.runtime.deviceReset()
+            cp.cuda.Stream.null.synchronize()
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
         except Exception as e:
             print(f"   [{miner_id}] CUDA cleanup warning: {e}")
 
@@ -423,181 +515,6 @@ def parse_duration(duration_str: str) -> float:
 class NodeInfo:
     """Simple node info for testing."""
     miner_id: str
-
-
-def mine_continuous(
-    miner,
-    difficulty_energy: float,
-    duration_minutes: float,
-    min_diversity: float = 0.15,
-    min_solutions: int = 5,
-    log_file = None
-) -> Dict:
-    """Mine continuously for specified duration at fixed difficulty.
-
-    Args:
-        miner: Miner instance (CPU, CUDA, QPU, etc.)
-        difficulty_energy: Fixed difficulty energy threshold
-        duration_minutes: How long to mine (in minutes)
-        min_diversity: Minimum solution diversity requirement
-        min_solutions: Minimum number of solutions required
-        log_file: Optional file object to write logs to
-
-    Returns:
-        Dictionary with mining statistics
-    """
-    def log(msg):
-        """Print to console and optionally to log file."""
-        print(msg)
-        if log_file:
-            log_file.write(msg + '\n')
-            log_file.flush()
-
-    log(f"\n⛏️  Starting continuous mining:")
-    log(f"   Duration: {duration_minutes} minutes")
-    log(f"   Difficulty: {difficulty_energy:.1f}")
-    log(f"   Min diversity: {min_diversity}")
-    log(f"   Min solutions: {min_solutions}")
-
-    # Setup
-    requirements = BlockRequirements(
-        difficulty_energy=difficulty_energy,
-        min_diversity=min_diversity,
-        min_solutions=min_solutions,
-        timeout_to_difficulty_adjustment_decay=0  # Disable decay
-    )
-
-    node_info = NodeInfo(miner_id=f"rate-test-{miner.miner_type}-0")
-    blocks_found: List[MiningResult] = []
-    attempts = 0
-    start_time = time.time()
-    duration_seconds = duration_minutes * 60
-
-    # QPU time tracking
-    total_qpu_time_us = 0.0  # Total QPU time in microseconds
-
-    # Progress tracking
-    last_progress_time = start_time
-    progress_interval = 60  # Print progress every minute
-
-    log(f"\n⏱️  Mining started at {time.strftime('%H:%M:%S', time.localtime(start_time))}")
-    log(f"   Will run until {time.strftime('%H:%M:%S', time.localtime(start_time + duration_seconds))}")
-
-    # Create genesis block as prev_block
-    prev_block = create_genesis_block()
-    # Update requirements for testing
-    prev_block.next_block_requirements = requirements
-
-    # Create stop event that persists across mining attempts
-    stop_event = multiprocessing.Event()
-
-    # Start a timer thread to set stop_event after duration expires
-    def timer_thread():
-        time.sleep(duration_seconds)
-        log(f"\n✅ Duration limit reached ({duration_minutes} min)")
-        stop_event.set()
-
-    timer = threading.Thread(target=timer_thread, daemon=True)
-    timer.start()
-
-    while True:
-        # Check if stop event was set by timer
-        if stop_event.is_set():
-            break
-
-        # Progress update
-        current_time = time.time()
-        if current_time - last_progress_time >= progress_interval:
-            elapsed = current_time - start_time
-            elapsed_min = elapsed / 60
-            blocks_per_min = len(blocks_found) / elapsed_min if elapsed_min > 0 else 0
-            log(f"   [{elapsed_min:.1f}/{duration_minutes:.0f} min] "
-                  f"Blocks: {len(blocks_found)}, "
-                  f"Attempts: {attempts}, "
-                  f"Rate: {blocks_per_min:.2f} blocks/min")
-            last_progress_time = current_time
-
-        attempts += 1
-        prev_timestamp = prev_block.header.timestamp
-
-        # Mine the block (using shared stop_event)
-        attempt_start = time.time()
-        result = miner.mine_block(
-            prev_block=prev_block,
-            node_info=node_info,
-            requirements=requirements,
-            prev_timestamp=prev_timestamp,
-            stop_event=stop_event
-        )
-        attempt_time = time.time() - attempt_start
-
-        # Check if stop event was set during mining
-        if stop_event.is_set():
-            break
-
-        # Track QPU time for this attempt (if available)
-        attempt_qpu_time_us = 0.0
-        if hasattr(miner, 'timing_stats') and 'qpu_access_time' in miner.timing_stats:
-            # Get the most recent QPU access time
-            if miner.timing_stats['qpu_access_time']:
-                attempt_qpu_time_us = miner.timing_stats['qpu_access_time'][-1]
-                total_qpu_time_us += attempt_qpu_time_us
-
-        if result:
-            blocks_found.append(result)
-            qpu_time_msg = f", QPU: {attempt_qpu_time_us / 1e6:.3f}s, Total QPU: {total_qpu_time_us / 1e6:.2f}s" if attempt_qpu_time_us > 0 else ""
-            log(f"   ✅ Block {len(blocks_found)} found! "
-                  f"Energy: {result.energy:.1f}, "
-                  f"Time: {attempt_time:.1f}s, "
-                  f"Diversity: {result.diversity:.3f}, "
-                  f"Solutions: {result.num_valid}"
-                  f"{qpu_time_msg}")
-
-    total_time = time.time() - start_time
-
-    # Compute statistics
-    energies = [b.energy for b in blocks_found]
-    diversities = [b.diversity for b in blocks_found]
-    solution_counts = [b.num_valid for b in blocks_found]
-    mining_times = [b.mining_time for b in blocks_found if b.mining_time]
-
-    stats = {
-        'total_blocks_found': len(blocks_found),
-        'total_attempts': attempts,
-        'total_time_seconds': total_time,
-        'total_time_minutes': total_time / 60,
-        'success_rate': len(blocks_found) / attempts if attempts > 0 else 0,
-        'blocks_per_minute': len(blocks_found) / (total_time / 60) if total_time > 0 else 0,
-        'energy_stats': {
-            'min': min(energies) if energies else None,
-            'max': max(energies) if energies else None,
-            'mean': sum(energies) / len(energies) if energies else None,
-            'all_energies': energies
-        },
-        'diversity_stats': {
-            'min': min(diversities) if diversities else None,
-            'max': max(diversities) if diversities else None,
-            'mean': sum(diversities) / len(diversities) if diversities else None
-        },
-        'solution_count_stats': {
-            'min': min(solution_counts) if solution_counts else None,
-            'max': max(solution_counts) if solution_counts else None,
-            'mean': sum(solution_counts) / len(solution_counts) if solution_counts else None
-        },
-        'mining_time_stats': {
-            'min': min(mining_times) if mining_times else None,
-            'max': max(mining_times) if mining_times else None,
-            'mean': sum(mining_times) / len(mining_times) if mining_times else None,
-            'all_times': mining_times
-        },
-        'qpu_time_stats': {
-            'total_qpu_time_us': total_qpu_time_us,
-            'total_qpu_time_seconds': total_qpu_time_us / 1e6,
-            'avg_qpu_time_per_attempt_us': total_qpu_time_us / attempts if attempts > 0 else 0
-        } if total_qpu_time_us > 0 else None
-    }
-
-    return stats
 
 
 def main():
@@ -931,7 +848,7 @@ def main():
         output_file = f"mining_rate_{args.miner_type}_{args.duration}min_{timestamp}.json"
 
     with open(output_file, 'w') as f:
-        json.dump(output_data, f, indent=2)
+        json.dump(output_data, f, indent=2, cls=NumpyEncoder)
 
     print(f"\n💾 Results saved to {output_file}")
 
@@ -940,5 +857,4 @@ def main():
 
 
 if __name__ == "__main__":
-    from typing import Tuple
     sys.exit(main())

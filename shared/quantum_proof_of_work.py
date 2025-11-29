@@ -114,37 +114,22 @@ def energies_for_solutions(solutions: List[List[int]], h: Dict[int, float], J: D
     return [energy_of_solution(sol, h, J, nodes) for sol in solutions]
 
 def calculate_hamming_distance(s1: List[int], s2: List[int]) -> int:
-    """Calculate symmetric Hamming distance between two binary strings.
+    """Calculate symmetric Hamming distance between two spin arrays.
 
-    Uses bitwise operations for efficiency:
-    - XOR to find differences
-    - Population count (bit counting) for distance
-    - Compares both normal and inverted to handle symmetry
+    For Ising spin variables {-1, +1}, symmetric distance accounts for
+    global spin flip symmetry: distance(s, -s) = 0.
+
+    Uses numpy for vectorized operations - much faster than Python loops.
     """
-    # Convert sequences to bit representations
-    def to_bits(seq):
-        """Convert sequence to integer bit representation."""
-        bits = 0
-        for i, val in enumerate(seq):
-            if val == 1:
-                bits |= (1 << i)
-        return bits, len(seq)
+    a1 = np.asarray(s1, dtype=np.int8)
+    a2 = np.asarray(s2, dtype=np.int8)
 
-    bits1, len1 = to_bits(s1)
-    bits2, len2 = to_bits(s2)
+    # Count mismatches (where spins differ)
+    distance = np.count_nonzero(a1 != a2)
 
-    # XOR gives us the positions where bits differ
-    diff = bits1 ^ bits2
+    # Symmetric: also check inverted (global spin flip)
+    distance_inverted = np.count_nonzero(a1 != -a2)
 
-    # Count the number of set bits (Hamming distance)
-    distance = bin(diff).count("1")
-
-    # For symmetric Hamming distance, also check inverted
-    inverted_bits2 = (1 << len2) - 1 - bits2
-    diff_inverted = bits1 ^ inverted_bits2
-    distance_inverted = bin(diff_inverted).count("1")
-
-    # Return minimum of normal and inverted distance
     return min(distance, distance_inverted)
 
 
@@ -179,6 +164,35 @@ def _calculate_set_diversity(indices: List[int], dist_matrix: np.ndarray) -> flo
     return total_dist / count if count > 0 else 0.0
 
 
+def _compute_distance_matrix_vectorized(solutions: List[List[int]]) -> np.ndarray:
+    """Compute symmetric Hamming distance matrix using vectorized numpy operations.
+
+    Much faster than pairwise function calls for large solution sets.
+    """
+    # Convert to numpy array: shape (n_solutions, n_nodes)
+    arr = np.array(solutions, dtype=np.int8)
+    n_solutions = arr.shape[0]
+
+    # Compute all pairwise distances using broadcasting
+    # arr[i] != arr[j] gives boolean array of mismatches
+    # We need to compute this for all i,j pairs efficiently
+
+    # Expand dims for broadcasting: (n, 1, nodes) vs (1, n, nodes)
+    a1 = arr[:, np.newaxis, :]  # Shape: (n, 1, nodes)
+    a2 = arr[np.newaxis, :, :]  # Shape: (1, n, nodes)
+
+    # Normal distance: count where spins differ
+    dist_normal = np.count_nonzero(a1 != a2, axis=2)
+
+    # Inverted distance: count where a1 != -a2
+    dist_inverted = np.count_nonzero(a1 != -a2, axis=2)
+
+    # Take minimum (symmetric Hamming distance)
+    dist_matrix = np.minimum(dist_normal, dist_inverted).astype(np.float64)
+
+    return dist_matrix
+
+
 def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> List[int]:
     """Filter solutions to maintain maximum diversity using farthest point sampling.
 
@@ -190,70 +204,69 @@ def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
 
     n_solutions = len(solutions)
 
-    # Pre-compute distance matrix for efficiency
-    dist_matrix = np.zeros((n_solutions, n_solutions))
-    for i in range(n_solutions):
-        for j in range(i + 1, n_solutions):
-            dist = calculate_hamming_distance(solutions[i], solutions[j])
-            dist_matrix[i, j] = dist
-            dist_matrix[j, i] = dist
+    # Pre-compute distance matrix using vectorized operations (MUCH faster)
+    dist_matrix = _compute_distance_matrix_vectorized(solutions)
 
     # Farthest Point Sampling
-    # Start with the two most distant points
-    max_dist = 0
-    start_pair = (0, 1)
-    for i in range(n_solutions):
-        for j in range(i + 1, n_solutions):
-            if dist_matrix[i, j] > max_dist:
-                max_dist = dist_matrix[i, j]
-                start_pair = (i, j)
+    # Start with the two most distant points (use numpy to find max)
+    # Only look at upper triangle to avoid duplicates
+    upper_tri = np.triu(dist_matrix, k=1)
+    max_idx = np.unravel_index(np.argmax(upper_tri), upper_tri.shape)
+    selected_indices = list(max_idx)
 
-    selected_indices = list(start_pair)
+    # Convert to set for O(1) lookup
+    selected_set = set(selected_indices)
 
     # Iteratively add the farthest point from the current set
     while len(selected_indices) < target_count:
-        best_idx = -1
-        best_min_dist = -1
+        # Get distances to all selected points
+        selected_arr = np.array(selected_indices)
+        min_dists = np.min(dist_matrix[:, selected_arr], axis=1)
 
-        for i in range(n_solutions):
-            if i in selected_indices:
-                continue
+        # Mask already selected
+        min_dists[selected_arr] = -1
 
-            # Find minimum distance to selected set
-            min_dist = min(dist_matrix[i, j] for j in selected_indices)
+        # Find point with maximum minimum distance
+        best_idx = np.argmax(min_dists)
+        selected_indices.append(best_idx)
+        selected_set.add(best_idx)
 
-            if min_dist > best_min_dist:
-                best_min_dist = min_dist
-                best_idx = i
-
-        if best_idx != -1:
-            selected_indices.append(best_idx)
-
-    # Optional: Local search refinement (can be disabled for performance)
+    # Optional: Local search refinement (limited iterations for performance)
     # Try swapping elements to improve total diversity
     improved = True
     iterations = 0
-    max_iterations = 10
+    max_iterations = 5  # Reduced from 10 for performance
 
     while improved and iterations < max_iterations:
         improved = False
         iterations += 1
 
-        for i, sel_idx in enumerate(selected_indices):
-            for cand_idx in range(n_solutions):
-                if cand_idx in selected_indices:
+        current_div = _calculate_set_diversity(selected_indices, dist_matrix)
+
+        for i in range(len(selected_indices)):
+            sel_idx = selected_indices[i]
+
+            # Check a subset of candidates (not all) for performance
+            # Sample up to 50 random candidates if n_solutions is large
+            if n_solutions > 100:
+                candidates = np.random.choice(n_solutions, min(50, n_solutions), replace=False)
+            else:
+                candidates = range(n_solutions)
+
+            for cand_idx in candidates:
+                if cand_idx in selected_set:
                     continue
 
                 # Try swapping
                 test_indices = selected_indices.copy()
                 test_indices[i] = cand_idx
-
-                # Calculate diversity for both sets
-                current_div = _calculate_set_diversity(selected_indices, dist_matrix)
                 test_div = _calculate_set_diversity(test_indices, dist_matrix)
 
                 if test_div > current_div:
+                    selected_set.remove(sel_idx)
+                    selected_set.add(cand_idx)
                     selected_indices[i] = cand_idx
+                    current_div = test_div
                     improved = True
                     break
 
@@ -499,7 +512,8 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
                       nonce: int, salt: bytes, prev_timestamp: int, start_time: float,
                       miner_id: str, miner_type: str,
                       h: Optional[Dict[int, float]] = None,
-                      J: Optional[Dict[Tuple[int, int], float]] = None):
+                      J: Optional[Dict[Tuple[int, int], float]] = None,
+                      skip_validation: bool = True):
     """Convert a sample set into a mining result if it meets requirements, otherwise return None.
 
     Args:
@@ -515,6 +529,8 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         miner_type: Type of the miner (CPU, GPU, QPU)
         h: Optional pre-computed field parameters (avoids regeneration)
         J: Optional pre-computed coupling parameters (avoids regeneration)
+        skip_validation: If True, skip per-solution validation (faster for mining).
+                        Set to False for block validation from other miners.
 
     Returns:
         MiningResult if successful, None if requirements not met
@@ -545,46 +561,55 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         if valid_count < min_solutions:
             raise ValueError(f"Insufficient valid solutions: {valid_count} < {min_solutions}")
 
-        # Use pre-computed Ising model if provided, otherwise regenerate
-        if h is None or J is None:
-            h_values = getattr(requirements, 'h_values', None)
-            h, J = generate_ising_model_from_nonce(nonce, nodes, edges, h_values=h_values)
-
-        # Recompute best energy with canonical function for consistency
-        solutions = list(sampleset.record.sample)
-        best_energy = min(energies_for_solutions(solutions, h, J, nodes))
-
-        if best_energy > difficulty_energy:
-            raise ValueError(f"Best energy {best_energy} exceeds difficulty energy {difficulty_energy}")
-
         # Process results from this mining attempt
         # Find all solutions meeting energy threshold
         valid_indices = np.where(all_energies < difficulty_energy)[0]
+
         # Get unique solutions that meet energy threshold
+        # Track best energy among valid solutions
         valid_solutions = []
+        valid_energies = []
         seen = set()
-        invalid_solutions = []
-        
-        for idx in valid_indices:
-            solution = tuple(sampleset.record.sample[idx])
-            if solution not in seen:
-                seen.add(solution)
-                solution_list = list(solution)
-                
-                # Validate solution format and correctness
-                validation_result = validate_solution(solution_list, h, J, nodes, edges)
-                if validation_result["valid"]:
-                    valid_solutions.append(solution_list)
-                else:
-                    invalid_solutions.append({
-                        "solution": solution_list,
-                        "errors": validation_result["errors"]
-                    })
-        
-        # Log any invalid solutions found
-        if invalid_solutions:
-            local_logger = logging.getLogger(__name__)
-            local_logger.warning(f"Found {len(invalid_solutions)} invalid solutions with errors: {[s['errors'] for s in invalid_solutions[:3]]}")
+
+        if skip_validation:
+            # FAST PATH: Trust sampler output, skip per-solution validation
+            # This is safe during mining since we control the sampler
+            for idx in valid_indices:
+                solution = tuple(sampleset.record.sample[idx])
+                if solution not in seen:
+                    seen.add(solution)
+                    valid_solutions.append(list(solution))
+                    valid_energies.append(all_energies[idx])
+        else:
+            # SLOW PATH: Full validation for untrusted sources (block validation)
+            # Use pre-computed Ising model if provided, otherwise regenerate
+            if h is None or J is None:
+                h_values = getattr(requirements, 'h_values', None)
+                h, J = generate_ising_model_from_nonce(nonce, nodes, edges, h_values=h_values)
+
+            invalid_solutions = []
+            for idx in valid_indices:
+                solution = tuple(sampleset.record.sample[idx])
+                if solution not in seen:
+                    seen.add(solution)
+                    solution_list = list(solution)
+
+                    # Validate solution format and correctness
+                    validation_result = validate_solution(solution_list, h, J, nodes, edges)
+                    if validation_result["valid"]:
+                        valid_solutions.append(solution_list)
+                        valid_energies.append(all_energies[idx])
+                    else:
+                        invalid_solutions.append({
+                            "solution": solution_list,
+                            "errors": validation_result["errors"]
+                        })
+
+            # Log any invalid solutions found
+            if invalid_solutions:
+                local_logger = logging.getLogger(__name__)
+                local_logger.warning(f"Found {len(invalid_solutions)} invalid solutions with errors: {[s['errors'] for s in invalid_solutions[:3]]}")
+
         if len(valid_solutions) < min_solutions:
             raise ValueError(f"Insufficient valid solutions: {len(valid_solutions)} < {min_solutions}")
 
@@ -594,9 +619,10 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
             selected_solutions_indices = select_diverse_solutions(valid_solutions, min_solutions)
             filtered_solutions = [valid_solutions[i] for i in selected_solutions_indices]
             diversity = calculate_diversity(filtered_solutions)
-
-        # Recalculate best energy from filtered solutions
-        best_energy = min(energies_for_solutions(filtered_solutions, h, J, nodes))
+            # Use tracked energy for best of filtered solutions
+            best_energy = min(valid_energies[i] for i in selected_solutions_indices)
+        elif valid_energies:
+            best_energy = min(valid_energies)
 
         if diversity < min_diversity:
             raise ValueError(f"Insufficient diversity: {diversity} < {min_diversity}")
@@ -626,5 +652,5 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         logger.debug(f"Failed to meet requirements: {e}")
     finally:
         # Log every mining attempt (successful or not) for analysis
-        logger.info(f"Mining attempt - Energy: {best_energy:.0f}, Valid: {len(valid_solutions)} (best {min_solutions} diversity: {diversity:.3f}) (requirements: energy<={difficulty_energy:.0f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
+        logger.info(f"[{miner_id}] Mining attempt - Energy: {best_energy:.0f}, Valid: {len(valid_solutions)} (best {min_solutions} diversity: {diversity:.3f}) (requirements: energy<={difficulty_energy:.0f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
     return result

@@ -57,7 +57,7 @@ export interface SDLConfig {
  * Format matches Akash Console's Hello World SDL for proper events/logs visibility
  *
  * Resource allocation:
- * - Default: 1 CPU, 2GiB memory for CPU miner; 2 CPU, 1 GPU, 4GiB for CUDA
+ * - Default: 1 CPU, 2GiB memory for CPU miner; 1 CPU per GPU, 4GiB for CUDA
  * - Fleet mode: Use cpuUnits/gpuUnits/memoryGi to request specific resources
  */
 export function generateSDL(config: SDLConfig): object {
@@ -66,9 +66,10 @@ export function generateSDL(config: SDLConfig): object {
 
   // Determine resource allocation
   // For fleet deployments, use explicit values; otherwise use defaults
-  const cpuUnits = config.cpuUnits ?? (isCuda ? 2 : 1)
-  const memoryGi = config.memoryGi ?? (isCuda ? 4 : 2)
+  // For CUDA: CPU units match GPU units (minimal CPU needed for GPU coordination)
   const gpuUnits = config.gpuUnits ?? (isCuda ? 1 : 0)
+  const cpuUnits = config.cpuUnits ?? (isCuda ? gpuUnits : 1)
+  const memoryGi = config.memoryGi ?? (isCuda ? 4 : 2)
   const storageGi = isCuda ? 10 : 5
 
   // Build resources object
@@ -218,8 +219,8 @@ export function estimateCostAKT(
   // Calculate price per block based on resources
   let uaktPerBlock: number
   if (minerType === 'cuda') {
-    // For CUDA: 2 CPUs base + GPU premium per GPU
-    uaktPerBlock = (2 * basePricePerCpu) + (resourceUnits * gpuPremium)
+    // For CUDA: 1 CPU per GPU + GPU premium per GPU
+    uaktPerBlock = (resourceUnits * basePricePerCpu) + (resourceUnits * gpuPremium)
   } else {
     // For CPU: price scales with CPU count
     uaktPerBlock = resourceUnits * basePricePerCpu

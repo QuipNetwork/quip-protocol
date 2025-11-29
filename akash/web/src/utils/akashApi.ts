@@ -471,7 +471,7 @@ export async function sendManifestViaConsole(
 
   // Use the pre-computed manifest JSON from deployment creation
   // CRITICAL: This must be the exact same string used to compute the deployment hash
-  console.log('Using pre-computed manifest (first 500):', manifestJson.substring(0, 500) + '...')
+  console.log('Using pre-computed manifest:', manifestJson)
   console.log('Manifest size:', manifestJson.length, 'bytes')
 
   // Provider manifest endpoint
