@@ -558,7 +558,7 @@ __global__ void cuda_sa_persistent_real(
                 __threadfence_system();
                 int control = *control_flag;
                 if (control == CONTROL_STOP) break;
-                __nanosleep(100000000);  // 100ms = 100 * 1,000,000 nanoseconds                
+                __nanosleep(1000000);  // 1ms polling - was 100ms causing serialization
             }
             my_output->ready = 0;
             has_job = false;
@@ -570,7 +570,7 @@ __global__ void cuda_sa_persistent_real(
         // OPTIMIZATION: Idle unused threads to reduce GPU resource contention
         if (!has_job || worker_id >= shared_job.num_reads) {
             // Thread is not needed - sleep to free up GPU resources
-            __nanosleep(500000000);  // 500ms
+            __nanosleep(10000000);  // 10ms - was 500ms
         }
     }
 }

@@ -345,15 +345,24 @@ def mine_worker(
             'mining_times': [b.mining_time for b in blocks_found if b.mining_time]
         })
 
+    # For CUDA miners, use drain_on_stop to collect all pending GPU results
+    use_drain = kind == 'cuda'
+
     while not stop_event.is_set():
         attempts += 1
-        result = miner.mine_block(
-            prev_block=prev_block,
-            node_info=node_info,
-            requirements=requirements,
-            prev_timestamp=prev_block.header.timestamp,
-            stop_event=stop_event
-        )
+
+        # Build kwargs for mine_block (CUDA miner supports drain_on_stop)
+        mine_kwargs = {
+            'prev_block': prev_block,
+            'node_info': node_info,
+            'requirements': requirements,
+            'prev_timestamp': prev_block.header.timestamp,
+            'stop_event': stop_event,
+        }
+        if use_drain:
+            mine_kwargs['drain_on_stop'] = True
+
+        result = miner.mine_block(**mine_kwargs)
 
         if result:
             blocks_found.append(result)
@@ -366,6 +375,19 @@ def mine_worker(
 
     # Final submission (in case stop_event was set between attempts)
     submit_results()
+
+    # Cleanup CUDA resources to allow process to exit cleanly
+    if kind == 'cuda':
+        try:
+            # Stop the persistent kernel
+            if hasattr(miner, 'async_sampler') and hasattr(miner.async_sampler, 'stop_immediate'):
+                miner.async_sampler.stop_immediate()
+            # Reset CUDA device to release all resources
+            import cupy as cp
+            cp.cuda.Device(int(miner_spec.get('args', {}).get('device', '0'))).use()
+            cp.cuda.runtime.deviceReset()
+        except Exception as e:
+            print(f"   [{miner_id}] CUDA cleanup warning: {e}")
 
 
 def parse_duration(duration_str: str) -> float:

@@ -497,7 +497,9 @@ def validate_solution(spins: List[int], h: Dict[int, float], J: Dict[Tuple[int, 
 
 def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tuple[int, int]],
                       nonce: int, salt: bytes, prev_timestamp: int, start_time: float,
-                      miner_id: str, miner_type: str):
+                      miner_id: str, miner_type: str,
+                      h: Optional[Dict[int, float]] = None,
+                      J: Optional[Dict[Tuple[int, int], float]] = None):
     """Convert a sample set into a mining result if it meets requirements, otherwise return None.
 
     Args:
@@ -511,6 +513,8 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         start_time: Start time of mining attempt
         miner_id: ID of the miner
         miner_type: Type of the miner (CPU, GPU, QPU)
+        h: Optional pre-computed field parameters (avoids regeneration)
+        J: Optional pre-computed coupling parameters (avoids regeneration)
 
     Returns:
         MiningResult if successful, None if requirements not met
@@ -524,21 +528,30 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
     result = None
 
     try:
-        # Best Energy
+        # Best Energy - use sampler-reported energy for fast early exit
         all_energies = sampleset.record.energy
         if len(all_energies) == 0:
             raise ValueError("No samples in sampleset")
 
         best_energy = float(np.min(all_energies))
 
-        # NOTE: we use the same energy function to ensure consistency. Unfortunately
-        # it disagrees with energies created by different sampler impls, but not significantly.
+        # FAST PATH: Early exit if best energy doesn't meet threshold
+        # This avoids expensive Ising model regeneration and energy recalculation
+        if best_energy > difficulty_energy:
+            raise ValueError(f"Best energy {best_energy} exceeds difficulty energy {difficulty_energy}")
+
+        # Count how many samples meet threshold before expensive operations
+        valid_count = np.sum(all_energies <= difficulty_energy)
+        if valid_count < min_solutions:
+            raise ValueError(f"Insufficient valid solutions: {valid_count} < {min_solutions}")
+
+        # Use pre-computed Ising model if provided, otherwise regenerate
+        if h is None or J is None:
+            h_values = getattr(requirements, 'h_values', None)
+            h, J = generate_ising_model_from_nonce(nonce, nodes, edges, h_values=h_values)
+
+        # Recompute best energy with canonical function for consistency
         solutions = list(sampleset.record.sample)
-
-        # Get h_values from requirements
-        h_values = getattr(requirements, 'h_values', None)
-
-        h, J = generate_ising_model_from_nonce(nonce, nodes, edges, h_values=h_values)
         best_energy = min(energies_for_solutions(solutions, h, J, nodes))
 
         if best_energy > difficulty_energy:

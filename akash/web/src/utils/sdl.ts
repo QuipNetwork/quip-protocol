@@ -82,13 +82,21 @@ export function generateSDL(config: SDLConfig): object {
   if (gpuUnits > 0) {
     // Build GPU attributes - always require nvidia vendor
     // Akash SDL expects GPU models as an ARRAY, not an object
-    // Format: nvidia: [{ model: "rtx3080" }] or nvidia: [] for any GPU
+    // Format: nvidia: [{ model: "rtx3080" }] or nvidia: [{ model: "rtx4090" }, ...]
+    //
+    // NOTE: Empty array [] does NOT work in practice - providers don't bid on it.
+    // When no specific model is requested, we include all known GPU models.
     const gpuModelValue = config.gpuModel ? GPU_MODELS[config.gpuModel]?.value : ''
 
-    // GPU models must be an array - empty array means "any nvidia GPU"
+    // If no specific model, use ALL available GPU models
+    // This ensures any provider with a supported GPU can bid
+    const ALL_GPU_MODELS = Object.values(GPU_MODELS)
+      .filter(gpu => gpu.value !== '')  // Exclude 'any' which has empty value
+      .map(gpu => ({ model: gpu.value }))
+
     const nvidiaModels: Array<{ model: string }> = gpuModelValue
       ? [{ model: gpuModelValue }]
-      : []
+      : ALL_GPU_MODELS
 
     resources.gpu = {
       units: gpuUnits,
