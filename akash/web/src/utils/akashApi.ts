@@ -1070,7 +1070,7 @@ export async function createDeployment(
   // Note: manifestSortedJSON includes null values. We previously tried stripping them
   // to match Go's omitempty, but that didn't work. Trying with nulls intact.
   const manifestJson = sdl.manifestSortedJSON()
-  console.log('manifestSortedJSON (first 300):', manifestJson.substring(0, 300))
+  console.log('manifestSortedJSON:', manifestJson)
   console.log('Has null values:', manifestJson.includes(':null'))
   console.log('Manifest size:', manifestJson.length, 'bytes')
 

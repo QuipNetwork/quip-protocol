@@ -31,6 +31,7 @@ import {
   type Bid
 } from './akashApi'
 import { generateSDL, type SDLConfig } from './sdl'
+import { MAX_GPU_PER_DEPLOYMENT, MAX_CPU_PER_DEPLOYMENT } from '../config/constants'
 
 // ============================================================================
 // Types
@@ -189,10 +190,11 @@ export async function checkNetworkCapacity(
     providers.length >= minProvidersRequired &&
     capacityRatio >= capacityMultiplier
 
-  // Start with full request - will adapt based on bids received
+  // Start with capped request size - most providers can't fulfill large GPU/CPU requests
   // For CPU: request count=N instances (parallel containers on one provider)
   // For GPU: request N GPUs (single container with multiple GPUs)
-  const initialRequestSize = requestedAmount
+  const maxPerDeployment = isGpuRequest ? MAX_GPU_PER_DEPLOYMENT : MAX_CPU_PER_DEPLOYMENT
+  const initialRequestSize = Math.min(requestedAmount, maxPerDeployment)
 
   return {
     requestedCpu: targetCpu,
@@ -252,11 +254,11 @@ export function createNextDeploymentItem(
   const isGpu = state.config.minerType === 'cuda'
 
   // For CPU: N CPUs per instance, 1 instance (miner uses all available cores)
-  // For GPU: N GPUs per instance, 1 instance
+  // For GPU: N GPUs per instance, 1 instance, CPU count matches GPU count
   const deployment: FleetDeploymentItem = {
     index: state.deployments.length,
     status: 'pending',
-    requestedCpu: isGpu ? 2 : requestSize,  // N CPUs for CPU miner, 2 for GPU
+    requestedCpu: requestSize,  // CPU count = GPU count for CUDA, = N for CPU mining
     requestedGpu: isGpu ? requestSize : 0,  // N GPUs for GPU deployment
     requestedMemoryGi: isGpu ? 4 * requestSize : 2 * requestSize,  // Scale memory with resources
     instanceCount: 1  // Always 1 container - miner handles parallelization internally
@@ -324,9 +326,10 @@ export async function createDeploymentAndGetBids(
       status: 'waiting-bids'
     })
 
-    // Wait for bids (2 minutes, polling every 5 seconds)
+    // Wait for bids (15 seconds, polling every 3 seconds)
+    // Short timeout - if no bids, we'll reduce request size and retry quickly
     console.log(`[Fleet] Waiting for bids on deployment #${deployment.index + 1} (DSEQ: ${deployResult.dseq})...`)
-    const bids = await waitForBids(owner, deployResult.dseq, 120000, 5000)
+    const bids = await waitForBids(owner, deployResult.dseq, 15000, 3000)
 
     console.log(`[Fleet] Received ${bids.length} bids for deployment #${deployment.index + 1}`)
 

@@ -263,8 +263,8 @@ export function DeploymentForm() {
       setDeploymentStatus(`Deployment created (dseq: ${deployResult.dseq}). Waiting for bids...`)
       setAlert({ type: 'info', message: `Waiting for provider bids... (dseq: ${deployResult.dseq})` })
 
-      // Wait up to 2 minutes for bids, polling every 5 seconds
-      const bids = await waitForBids(address, deployResult.dseq, 120000, 5000)
+      // Wait up to 30 seconds for bids, polling every 3 seconds
+      const bids = await waitForBids(address, deployResult.dseq, 30000, 3000)
 
       if (bids.length === 0) {
         setAlert({

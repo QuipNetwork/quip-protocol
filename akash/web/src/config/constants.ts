@@ -21,6 +21,12 @@ export const DOCKER_IMAGES = {
   cuda: 'carback1/quip-protocol-cuda-miner:v0.0.7',
 }
 
+// Resource limits per deployment
+// Most Akash providers have 1-8 GPUs max, so requesting more won't get bids
+// Start at max realistic size - adaptive reduction will halve to 4, 2, 1 if no bids
+export const MAX_GPU_PER_DEPLOYMENT = 8  // Start high, reduce adaptively if no bids
+export const MAX_CPU_PER_DEPLOYMENT = 32 // Most providers have 32-64 cores
+
 // Mining defaults
 export const DEFAULTS = {
   minerType: 'cpu' as const,
