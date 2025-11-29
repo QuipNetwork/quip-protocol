@@ -123,18 +123,20 @@ class BaseMiner:
         """Generate Ising model parameters based on block header and nonce."""
         seed_string = f"{block_header}{nonce}"
         seed = int(blake3(seed_string.encode()).hexdigest()[:8], 16)
-        np.random.seed(seed)
+        # Use numpy's new Generator API instead of global np.random.seed()
+        # This is thread-safe and doesn't affect global state
+        rng = np.random.default_rng(seed)
 
         # Generate h and J for a small problem (suitable for all miners)
         num_vars = 64  # Small enough for CPU/GPU
-        h = {i: np.random.uniform(-1, 1) for i in range(num_vars)}
+        h = {i: rng.uniform(-1, 1) for i in range(num_vars)}
 
         # Generate sparse connections
         J = {}
         for i in range(num_vars):
             for j in range(i + 1, min(i + 4, num_vars)):  # Local connections
-                if np.random.random() < 0.5:
-                    J[(i, j)] = np.random.choice([-1, 1])
+                if rng.random() < 0.5:
+                    J[(i, j)] = rng.choice([-1, 1])
 
         return h, J
 

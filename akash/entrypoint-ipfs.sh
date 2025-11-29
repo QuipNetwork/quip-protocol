@@ -11,40 +11,55 @@ TOPOLOGY_FILE="${TOPOLOGY_FILE:-dwave_topologies/topologies/advantage2_system1_7
 GPU_DEVICE="${GPU_DEVICE:-0}"
 NUM_CPUS="${NUM_CPUS:-}"  # Override auto-detected CPU count
 
+# Suppress SyntaxWarnings from third-party packages (dwave-samplers, homebase on Python 3.13)
+export PYTHONWARNINGS="ignore::SyntaxWarning"
+
+# Set up output files early so diagnostics can be logged
+DEPLOYMENT_ID="${AKASH_DEPLOYMENT_ID:-$(hostname)}"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+OUTPUT_DIR="/output"
+mkdir -p "$OUTPUT_DIR"
+OUTPUT_JSON="${OUTPUT_DIR}/${MINER_TYPE}_${DEPLOYMENT_ID}_${TIMESTAMP}.json"
+OUTPUT_LOG="${OUTPUT_DIR}/${MINER_TYPE}_${DEPLOYMENT_ID}_${TIMESTAMP}.log"
+
+# Create symlinks for easy HTTP access
+ln -sf "$OUTPUT_JSON" "${OUTPUT_DIR}/latest.json"
+ln -sf "$OUTPUT_LOG" "${OUTPUT_DIR}/latest.log"
+
 # ============================================================================
 # GPU DIAGNOSTICS - Run before mining to catch CUDA issues early
 # ============================================================================
-echo "========================================"
-echo "GPU Diagnostics"
-echo "========================================"
+echo "========================================" | tee -a "$OUTPUT_LOG"
+echo "GPU Diagnostics" | tee -a "$OUTPUT_LOG"
+echo "========================================" | tee -a "$OUTPUT_LOG"
 
 # Check nvidia-smi
 if command -v nvidia-smi &> /dev/null; then
-    echo "nvidia-smi output:"
-    nvidia-smi || echo "  nvidia-smi FAILED (exit code: $?)"
-    echo ""
+    echo "nvidia-smi output:" | tee -a "$OUTPUT_LOG"
+    nvidia-smi 2>&1 | tee -a "$OUTPUT_LOG" || echo "  nvidia-smi FAILED (exit code: $?)" | tee -a "$OUTPUT_LOG"
+    echo "" | tee -a "$OUTPUT_LOG"
 else
-    echo "nvidia-smi: NOT FOUND"
+    echo "nvidia-smi: NOT FOUND" | tee -a "$OUTPUT_LOG"
 fi
 
 # Check CUDA environment
-echo "CUDA Environment:"
-echo "  CUDA_HOME: ${CUDA_HOME:-not set}"
-echo "  LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:-not set}"
-echo "  NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-not set}"
-echo ""
+echo "CUDA Environment:" | tee -a "$OUTPUT_LOG"
+echo "  CUDA_HOME: ${CUDA_HOME:-not set}" | tee -a "$OUTPUT_LOG"
+echo "  LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:-not set}" | tee -a "$OUTPUT_LOG"
+echo "  NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-not set}" | tee -a "$OUTPUT_LOG"
+echo "" | tee -a "$OUTPUT_LOG"
 
 # Check if CUDA libraries are accessible
 if [ -d "/usr/local/cuda/lib64" ]; then
-    echo "CUDA libraries found in /usr/local/cuda/lib64"
-    ls /usr/local/cuda/lib64/*.so* 2>/dev/null | head -5
+    echo "CUDA libraries found in /usr/local/cuda/lib64" | tee -a "$OUTPUT_LOG"
+    ls /usr/local/cuda/lib64/*.so* 2>/dev/null | head -5 | tee -a "$OUTPUT_LOG"
 else
-    echo "CUDA libraries: NOT FOUND in /usr/local/cuda/lib64"
+    echo "CUDA libraries: NOT FOUND in /usr/local/cuda/lib64" | tee -a "$OUTPUT_LOG"
 fi
-echo ""
+echo "" | tee -a "$OUTPUT_LOG"
 
 # Python CUDA test
-echo "Python CUDA Test:"
+echo "Python CUDA Test:" | tee -a "$OUTPUT_LOG"
 python3 -c "
 import sys
 try:
@@ -70,10 +85,140 @@ except ImportError as e:
     print(f'  CuPy import failed: {e}')
 except Exception as e:
     print(f'  CUDA test failed: {e}')
-" 2>&1
-echo ""
-echo "========================================"
-echo ""
+" 2>&1 | tee -a "$OUTPUT_LOG"
+echo "" | tee -a "$OUTPUT_LOG"
+echo "========================================" | tee -a "$OUTPUT_LOG"
+echo "" | tee -a "$OUTPUT_LOG"
+
+# ============================================================================
+# CPU DIAGNOSTICS - Show processor info for CPU mining
+# ============================================================================
+echo "========================================" | tee -a "$OUTPUT_LOG"
+echo "CPU Diagnostics" | tee -a "$OUTPUT_LOG"
+echo "========================================" | tee -a "$OUTPUT_LOG"
+
+# CPU model name
+if [ -f /proc/cpuinfo ]; then
+    CPU_MODEL=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | xargs)
+    if [ -n "$CPU_MODEL" ]; then
+        echo "CPU Model: $CPU_MODEL" | tee -a "$OUTPUT_LOG"
+    else
+        echo "CPU Model: (not detected)" | tee -a "$OUTPUT_LOG"
+    fi
+else
+    echo "CPU Model: (no /proc/cpuinfo)" | tee -a "$OUTPUT_LOG"
+fi
+
+# Physical cores and threads
+PHYSICAL_CORES=$(grep -c "^processor" /proc/cpuinfo 2>/dev/null || echo "unknown")
+echo "Logical CPUs (host): $PHYSICAL_CORES" | tee -a "$OUTPUT_LOG"
+
+# Check cgroup CPU limits (containers)
+echo "" | tee -a "$OUTPUT_LOG"
+echo "Container CPU Limits:" | tee -a "$OUTPUT_LOG"
+if [ -f /sys/fs/cgroup/cpu.max ]; then
+    CGROUP_CONTENT=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null)
+    if [ "$CGROUP_CONTENT" != "max 100000" ]; then
+        QUOTA=$(echo "$CGROUP_CONTENT" | cut -d' ' -f1)
+        PERIOD=$(echo "$CGROUP_CONTENT" | cut -d' ' -f2)
+        if [ "$QUOTA" != "max" ]; then
+            CGROUP_CPUS=$((QUOTA / PERIOD))
+            echo "  cgroup v2 limit: $CGROUP_CPUS CPUs ($QUOTA / $PERIOD)" | tee -a "$OUTPUT_LOG"
+        else
+            echo "  cgroup v2: no limit (max)" | tee -a "$OUTPUT_LOG"
+        fi
+    else
+        echo "  cgroup v2: no limit" | tee -a "$OUTPUT_LOG"
+    fi
+elif [ -f /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then
+    QUOTA=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || echo "-1")
+    PERIOD=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null || echo "100000")
+    if [ "$QUOTA" != "-1" ]; then
+        CGROUP_CPUS=$((QUOTA / PERIOD))
+        echo "  cgroup v1 limit: $CGROUP_CPUS CPUs ($QUOTA / $PERIOD)" | tee -a "$OUTPUT_LOG"
+    else
+        echo "  cgroup v1: no limit" | tee -a "$OUTPUT_LOG"
+    fi
+else
+    echo "  cgroup: not detected" | tee -a "$OUTPUT_LOG"
+fi
+
+# Environment overrides
+echo "" | tee -a "$OUTPUT_LOG"
+echo "Environment Settings:" | tee -a "$OUTPUT_LOG"
+echo "  NUM_CPUS: ${NUM_CPUS:-auto}" | tee -a "$OUTPUT_LOG"
+echo "  OMP_NUM_THREADS: ${OMP_NUM_THREADS:-not set}" | tee -a "$OUTPUT_LOG"
+echo "  MKL_NUM_THREADS: ${MKL_NUM_THREADS:-not set}" | tee -a "$OUTPUT_LOG"
+
+# Python detection of effective CPU count
+echo "" | tee -a "$OUTPUT_LOG"
+echo "Python CPU Detection:" | tee -a "$OUTPUT_LOG"
+python3 -c "
+import os
+import multiprocessing
+
+# Get base count
+cpu_count = os.cpu_count() or 1
+print(f'  os.cpu_count(): {cpu_count}')
+
+# Check cgroup v2
+try:
+    with open('/sys/fs/cgroup/cpu.max', 'r') as f:
+        content = f.read().strip()
+        if content != 'max 100000':
+            quota, period = content.split()
+            if quota != 'max':
+                cgroup_cpus = max(1, int(int(quota) / int(period)))
+                print(f'  cgroup v2 effective: {cgroup_cpus}')
+except:
+    pass
+
+# Check cgroup v1
+try:
+    with open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', 'r') as f:
+        quota = int(f.read().strip())
+    with open('/sys/fs/cgroup/cpu/cpu.cfs_period_us', 'r') as f:
+        period = int(f.read().strip())
+    if quota > 0:
+        cgroup_cpus = max(1, quota // period)
+        print(f'  cgroup v1 effective: {cgroup_cpus}')
+except:
+    pass
+
+# Check NUM_CPUS override
+env_cpus = os.environ.get('NUM_CPUS')
+if env_cpus:
+    print(f'  NUM_CPUS override: {env_cpus}')
+
+# Show what compare_mining_rates.py will use
+final_count = cpu_count
+if env_cpus:
+    final_count = int(env_cpus)
+else:
+    # Try cgroup limits
+    try:
+        with open('/sys/fs/cgroup/cpu.max', 'r') as f:
+            content = f.read().strip()
+            if content != 'max 100000':
+                quota, period = content.split()
+                if quota != 'max':
+                    final_count = max(1, int(int(quota) / int(period)))
+    except:
+        try:
+            with open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', 'r') as f:
+                quota = int(f.read().strip())
+            with open('/sys/fs/cgroup/cpu/cpu.cfs_period_us', 'r') as f:
+                period = int(f.read().strip())
+            if quota > 0:
+                final_count = max(1, quota // period)
+        except:
+            pass
+
+print(f'  => Will spawn {final_count} miner process(es)')
+" 2>&1 | tee -a "$OUTPUT_LOG"
+echo "" | tee -a "$OUTPUT_LOG"
+echo "========================================" | tee -a "$OUTPUT_LOG"
+echo "" | tee -a "$OUTPUT_LOG"
 
 # If CUDA miner requested but CUDA not working, exit early with clear error
 if [ "$MINER_TYPE" = "cuda" ]; then
@@ -128,20 +273,6 @@ IPFS_PIN="${IPFS_PIN:-false}"  # Pin to IPFS (keep permanently)
 # S3 configuration (optional fallback)
 S3_BUCKET="${S3_BUCKET:-}"
 
-# Akash deployment identifier
-DEPLOYMENT_ID="${AKASH_DEPLOYMENT_ID:-$(hostname)}"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-
-# Output files
-OUTPUT_DIR="/output"
-mkdir -p "$OUTPUT_DIR"
-OUTPUT_JSON="${OUTPUT_DIR}/${MINER_TYPE}_${DEPLOYMENT_ID}_${TIMESTAMP}.json"
-OUTPUT_LOG="${OUTPUT_DIR}/${MINER_TYPE}_${DEPLOYMENT_ID}_${TIMESTAMP}.log"
-
-# Create symlinks for easy HTTP access
-ln -sf "$OUTPUT_JSON" "${OUTPUT_DIR}/latest.json"
-ln -sf "$OUTPUT_LOG" "${OUTPUT_DIR}/latest.log"
-
 echo "========================================" | tee -a "$OUTPUT_LOG"
 echo "Quip Protocol - Akash Mining with IPFS" | tee -a "$OUTPUT_LOG"
 echo "========================================" | tee -a "$OUTPUT_LOG"
@@ -177,13 +308,20 @@ upload_to_ipfs() {
 
     echo "Uploading $filename to IPFS..." | tee -a "$OUTPUT_LOG"
     echo "  IPFS Node: $IPFS_NODE" | tee -a "$OUTPUT_LOG"
-    echo "  File size: $(ls -lh "$file" | awk '{print $5}')" | tee -a "$OUTPUT_LOG"
+    echo "  Original size: $(ls -lh "$file" | awk '{print $5}')" | tee -a "$OUTPUT_LOG"
+
+    # Compress file with gzip before upload
+    local compressed_file="${file}.gz"
+    gzip -c "$file" > "$compressed_file"
+    local upload_file="$compressed_file"
+    local upload_filename="${filename}.gz"
+    echo "  Compressed size: $(ls -lh "$compressed_file" | awk '{print $5}')" | tee -a "$OUTPUT_LOG"
 
     # Upload via IPFS HTTP API (capture both stdout and stderr)
     local CURL_OUTPUT=$(mktemp)
     local HTTP_CODE=$(curl -s -w "%{http_code}" -X POST \
         -H "X-API-Key: $IPFS_API_KEY" \
-        -F "file=@$file" \
+        -F "file=@$upload_file" \
         "${IPFS_NODE}/api/v0/add?pin=${IPFS_PIN}&wrap-with-directory=false" \
         -o "$CURL_OUTPUT" 2>&1)
     local CURL_EXIT=$?
@@ -195,12 +333,14 @@ upload_to_ipfs() {
     if [ $CURL_EXIT -ne 0 ]; then
         echo "  Curl error: $IPFS_RESPONSE" | tee -a "$OUTPUT_LOG"
         echo "✗ IPFS upload failed for $filename (curl error)" | tee -a "$OUTPUT_LOG"
+        rm -f "$compressed_file"
         return 1
     fi
 
     if [ "$HTTP_CODE" != "200" ]; then
         echo "  HTTP error response: $IPFS_RESPONSE" | tee -a "$OUTPUT_LOG"
         echo "✗ IPFS upload failed for $filename (HTTP $HTTP_CODE)" | tee -a "$OUTPUT_LOG"
+        rm -f "$compressed_file"
         return 1
     fi
 
@@ -216,7 +356,7 @@ upload_to_ipfs() {
         echo "$CID" > "${file}.cid"
 
         # Add to MFS (Mutable File System) so it shows in IPFS Web UI Files view
-        local MFS_PATH="/${DEPLOYMENT_ID}/${filename}"
+        local MFS_PATH="/${DEPLOYMENT_ID}/${upload_filename}"
         echo "  Adding to MFS: $MFS_PATH" | tee -a "$OUTPUT_LOG"
 
         # Create directory if needed
@@ -236,11 +376,15 @@ upload_to_ipfs() {
             echo "  ⚠ MFS copy failed (file still available via CID): $MFS_RESPONSE" | tee -a "$OUTPUT_LOG"
         fi
 
+        # Cleanup compressed file
+        rm -f "$compressed_file"
         return 0
     fi
 
     echo "  Response (no CID found): $IPFS_RESPONSE" | tee -a "$OUTPUT_LOG"
     echo "✗ IPFS upload failed for $filename (no CID in response)" | tee -a "$OUTPUT_LOG"
+    # Cleanup compressed file on failure
+    rm -f "$compressed_file"
     return 1
 }
 

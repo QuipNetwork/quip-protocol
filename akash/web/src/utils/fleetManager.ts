@@ -26,13 +26,16 @@ import {
   createDeployment,
   waitForBids,
   acceptBid,
+  topUpDeployment,
   sendManifestViaConsole,
+  fetchProviderCpuInfo,
   type ProviderCapacity,
   type Bid
 } from './akashApi'
 import { generateSDL, type SDLConfig } from './sdl'
 import { MAX_GPU_PER_DEPLOYMENT, MAX_CPU_PER_DEPLOYMENT } from '../config/constants'
 import { parseDurationToMinutes } from './format'
+import { getCpuScore } from '../config/cpuPerformance'
 
 // ============================================================================
 // Types
@@ -358,6 +361,7 @@ export async function acceptBidAndDeploy(
   deployment: FleetDeploymentItem,
   selectedBid: Bid,
   providerName: string,
+  config: SDLConfig,
   onUpdate: (update: Partial<FleetDeploymentItem>) => void
 ): Promise<void> {
   if (!deployment.dseq || !deployment.manifestJson) {
@@ -378,7 +382,17 @@ export async function acceptBidAndDeploy(
 
   // Accept the bid
   await acceptBid(signingClient, selectedBid)
-  console.log(`[Fleet] Bid accepted for deployment #${deployment.index + 1}, sending manifest...`)
+  console.log(`[Fleet] Bid accepted for deployment #${deployment.index + 1}`)
+
+  // Top up escrow based on actual bid price (if needed)
+  const bidPriceUakt = parseInt(selectedBid.bid.price.amount, 10)
+  const durationMinutes = parseDurationToMinutes(config.miningDuration)
+  const topUp = await topUpDeployment(signingClient, owner, deployment.dseq, bidPriceUakt, durationMinutes)
+  if (topUp) {
+    console.log(`[Fleet] Topped up escrow: +${topUp.depositAmount} uAKT`)
+  }
+
+  console.log(`[Fleet] Sending manifest for deployment #${deployment.index + 1}...`)
   onUpdate({ status: 'sending-manifest' })
 
   // Send manifest
@@ -496,8 +510,60 @@ export async function deployFleetAutomatic(
         }
       }
 
-      // Auto-select lowest price bid
-      const sortedBids = [...bids].sort(
+      // Filter bids by CPU score if minCpuScore is set (CPU deployments only)
+      let eligibleBids = bids
+      if (!isGpu && config.minCpuScore && config.minCpuScore > 0) {
+        console.log(`[Fleet] Filtering ${bids.length} bids by CPU score >= ${config.minCpuScore}...`)
+
+        // Fetch CPU info for all bidding providers in parallel
+        const bidsWithCpu = await Promise.all(
+          bids.map(async (bid) => {
+            const cpuInfo = await fetchProviderCpuInfo(bid.bid.id.provider)
+            const cpuScore = getCpuScore(cpuInfo)
+            return { bid, cpuInfo, cpuScore }
+          })
+        )
+
+        // Filter by minimum score
+        const filtered = bidsWithCpu.filter(b => b.cpuScore >= config.minCpuScore!)
+        console.log(`[Fleet] ${filtered.length}/${bids.length} bids meet CPU requirement (score >= ${config.minCpuScore})`)
+
+        // Log accepted bids for debugging
+        for (const f of filtered.slice(0, 3)) {
+          console.log(`[Fleet]   Accepted: ${f.cpuInfo || 'unknown CPU'} (score: ${f.cpuScore})`)
+        }
+
+        // Log rejected bids for debugging
+        const rejected = bidsWithCpu.filter(b => b.cpuScore < config.minCpuScore!)
+        for (const r of rejected.slice(0, 3)) {
+          console.log(`[Fleet]   Rejected: ${r.cpuInfo || 'unknown CPU'} (score: ${r.cpuScore})`)
+        }
+        if (rejected.length > 3) {
+          console.log(`[Fleet]   ... and ${rejected.length - 3} more rejected`)
+        }
+
+        if (filtered.length === 0) {
+          // No bids meet CPU requirement - fail this deployment
+          deployment.status = 'failed'
+          deployment.error = `No bids meet CPU requirement (score >= ${config.minCpuScore})`
+          updateStats()
+
+          // Try reducing request size to get more providers
+          if (state.currentRequestSize > 1) {
+            state.currentRequestSize = Math.max(1, Math.floor(state.currentRequestSize / 2))
+            console.log(`[Fleet] Reducing request to ${state.currentRequestSize} to find more providers`)
+            continue
+          } else {
+            console.log('[Fleet] No providers meet CPU requirements at minimum size')
+            break
+          }
+        }
+
+        eligibleBids = filtered.map(b => b.bid)
+      }
+
+      // Auto-select lowest price bid from eligible bids
+      const sortedBids = [...eligibleBids].sort(
         (a, b) => parseFloat(a.bid.price.amount) - parseFloat(b.bid.price.amount)
       )
       const selectedBid = sortedBids[0]
@@ -512,6 +578,7 @@ export async function deployFleetAutomatic(
         deployment,
         selectedBid,
         providerName,
+        config,
         (update) => {
           Object.assign(deployment, update)
           updateStats()
@@ -593,7 +660,6 @@ export function getFleetSummary(state: FleetState): {
   dseqs: string[]
 } {
   const activeDeployments = state.deployments.filter(d => d.status === 'active')
-  const isGpu = state.config.minerType === 'cuda'
 
   return {
     totalDeployments: state.deployments.length,
@@ -634,7 +700,7 @@ export async function planFleetAllocation(
     })),
     totalCpu: check.totalCpu,
     totalGpu: check.totalGpu,
-    deploymentsNeeded: check.deploymentsNeeded,
+    deploymentsNeeded: Math.ceil((targetGpu || targetCpu) / check.initialRequestSize),
     requestedCpu: targetCpu,
     requestedGpu: targetGpu,
     shortfall: {

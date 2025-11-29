@@ -187,7 +187,15 @@ class SimulatedAnnealingMiner(BaseMiner):
                 if stop_event.is_set():
                     self.logger.info("Interrupted during sampling")
                     return None
-                self.logger.error(f"Sampling error: {e}")
+                # Log detailed diagnostic info for debugging rare sampling errors
+                import traceback
+                self.logger.error(
+                    f"Sampling error: {e}\n"
+                    f"  Topology: nodes={len(nodes)}, edges={len(edges)}\n"
+                    f"  h keys: {len(h)}, J keys: {len(J)}\n"
+                    f"  Nonce: {nonce}, Salt: {salt.hex()[:8]}...\n"
+                    f"  Traceback:\n{traceback.format_exc()}"
+                )
                 continue
 
             # Track postprocessing time

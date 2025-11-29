@@ -8,8 +8,8 @@ import { signAndBroadcastWithSession } from './sessionSigning'
 import { MsgCreateDeployment, MsgCloseDeployment } from '@akashnetwork/chain-sdk/private-types/akash.v1beta4'
 // Market messages are in v1beta5
 import { MsgCreateLease } from '@akashnetwork/chain-sdk/private-types/akash.v1beta5'
-// Source enum is in the v1 base types
-import { Source } from '@akashnetwork/chain-sdk/private-types/akash.v1'
+// Source enum and escrow deposit message are in the v1 base types
+import { Source, MsgAccountDeposit } from '@akashnetwork/chain-sdk/private-types/akash.v1'
 
 // SDL parsing uses chain-sdk/web (browser-compatible version)
 // chain-sdk's manifestSortedJSON() omits null values like Go's omitempty,
@@ -1049,7 +1049,7 @@ export async function revokeCertificateOnChain(
  * Calculate deposit amount for a deployment
  * @param sdlConfig - SDL configuration object
  * @param durationMinutes - Deployment duration in minutes
- * @returns Deposit amount in uAKT (with 2x safety buffer)
+ * @returns Deposit amount in uAKT (with 4x safety buffer for initial deposit)
  */
 function calculateDeposit(sdlConfig: object, durationMinutes: number): string {
   // Extract pricing from SDL
@@ -1068,18 +1068,18 @@ function calculateDeposit(sdlConfig: object, durationMinutes: number): string {
     }
   }
 
-  // Calculate: blocks needed * price per block * 2 (safety buffer)
+  // Calculate: blocks needed * price per block * 1.5 (safety buffer)
   // Akash blocks are ~6 seconds, so ~10 blocks/minute
   const blocksPerMinute = 10
   const totalBlocks = durationMinutes * blocksPerMinute
-  const depositUakt = pricePerBlock * totalBlocks * 2
+  const depositUakt = pricePerBlock * totalBlocks * 1.5
 
   // Minimum 5 AKT, maximum 50 AKT
   const minDeposit = 5_000_000  // 5 AKT
   const maxDeposit = 50_000_000 // 50 AKT
   const finalDeposit = Math.max(minDeposit, Math.min(maxDeposit, depositUakt))
 
-  console.log(`Deposit calculation: ${pricePerBlock} uakt/block × ${totalBlocks} blocks × 2 = ${depositUakt} uakt (clamped to ${finalDeposit})`)
+  console.log(`Deposit calculation: ${pricePerBlock} uakt/block × ${totalBlocks} blocks × 1.5 = ${depositUakt} uakt (clamped to ${finalDeposit})`)
 
   return finalDeposit.toString()
 }
@@ -1416,4 +1416,185 @@ export async function closeDeployment(
   }
 
   return { transactionHash: result.transactionHash }
+}
+
+/**
+ * Fetch current escrow balance for a deployment
+ */
+async function fetchEscrowBalance(owner: string, dseq: string): Promise<number> {
+  try {
+    const response = await fetch(
+      `${AKASH_REST}/akash/deployment/v1beta4/deployments/list?filters.owner=${owner}&filters.dseq=${dseq}`
+    )
+    const data = await response.json()
+
+    if (data.deployments && data.deployments.length > 0) {
+      const deployment = data.deployments[0]
+      // Sum all deposit balances
+      const deposits = deployment.escrow_account?.state?.deposits || []
+      let totalBalance = 0
+      for (const deposit of deposits) {
+        if (deposit.balance?.denom === AKASH_DENOM) {
+          totalBalance += parseInt(deposit.balance.amount, 10)
+        }
+      }
+      return totalBalance
+    }
+    return 0
+  } catch (error) {
+    console.error('Failed to fetch escrow balance:', error)
+    return 0
+  }
+}
+
+/**
+ * Top up a deployment's escrow based on actual bid price
+ *
+ * After accepting a bid, we know the real cost per block. This function
+ * calculates if additional deposit is needed and adds it.
+ *
+ * @param signingClient - Signing client for transactions
+ * @param owner - Deployment owner address
+ * @param dseq - Deployment sequence number
+ * @param bidPriceUakt - Actual bid price per block in uAKT
+ * @param durationMinutes - Mining duration in minutes
+ * @returns Transaction result or null if no top-up needed
+ */
+export async function topUpDeployment(
+  signingClient: SigningStargateClient,
+  owner: string,
+  dseq: string,
+  bidPriceUakt: number,
+  durationMinutes: number
+): Promise<{ transactionHash: string; depositAmount: string } | null> {
+  // Calculate required escrow: bid price × blocks × 1.5 (safety buffer)
+  const blocksPerMinute = 10
+  const totalBlocks = durationMinutes * blocksPerMinute
+  const requiredBalance = Math.ceil(bidPriceUakt * totalBlocks * 1.5)
+
+  // Fetch current escrow balance
+  const currentBalance = await fetchEscrowBalance(owner, dseq)
+
+  console.log(`Escrow check: current=${currentBalance} uAKT, required=${requiredBalance} uAKT (${bidPriceUakt}/block × ${totalBlocks} blocks × 1.5)`)
+
+  // If we have enough, no top-up needed
+  if (currentBalance >= requiredBalance) {
+    console.log(`Escrow sufficient, no top-up needed`)
+    return null
+  }
+
+  // Calculate additional deposit needed
+  const additionalNeeded = requiredBalance - currentBalance
+
+  // Add a small buffer (10%) to avoid edge cases
+  const depositAmount = Math.ceil(additionalNeeded * 1.1)
+
+  console.log(`Topping up escrow: adding ${depositAmount} uAKT (${(depositAmount / 1_000_000).toFixed(4)} AKT)`)
+
+  // Create deposit message using MsgAccountDeposit (escrow deposit for v1)
+  // For deployment escrow: scope = 1 (deployment), xid = "owner/dseq"
+  const msg = MsgAccountDeposit.fromPartial({
+    signer: owner,
+    id: {
+      scope: 1,  // 1 = deployment
+      xid: `${owner}/${dseq}`
+    },
+    deposit: {
+      amount: {
+        denom: AKASH_DENOM,
+        amount: depositAmount.toString()
+      },
+      sources: [Source.balance]
+    }
+  })
+
+  const typeUrl = `/${MsgAccountDeposit.$type}`
+
+  // Sign and broadcast using session if available
+  const result = await signAndBroadcastWithSession(
+    signingClient,
+    owner,
+    [{ typeUrl, value: msg }],
+    'auto',
+    'Top up deposit via Quip Protocol'
+  )
+
+  if (result.code !== 0) {
+    throw new Error(`Failed to top up deployment: ${result.rawLog}`)
+  }
+
+  return {
+    transactionHash: result.transactionHash,
+    depositAmount: depositAmount.toString()
+  }
+}
+
+/**
+ * Fetch provider hardware info string from Console API.
+ *
+ * Scans ALL provider attributes and concatenates their values
+ * into a single string. This string is then matched against
+ * CPU performance patterns in cpuPerformance.ts to identify
+ * the provider's CPU type and score it.
+ *
+ * @param providerAddress - Provider's Akash address
+ * @returns Concatenated hardware info string, or null on error
+ */
+export async function fetchProviderCpuInfo(providerAddress: string): Promise<string | null> {
+  try {
+    const response = await fetch(
+      `${AKASH_CONSOLE_API}/v1/providers/${providerAddress}`,
+      { signal: AbortSignal.timeout(5000) }
+    )
+
+    if (!response.ok) {
+      return null
+    }
+
+    const data = await response.json()
+    const attributes: Array<{ key: string; value: string }> = data.attributes || []
+
+    if (attributes.length === 0) {
+      return null
+    }
+
+    // Concatenate ALL attribute values into a single searchable string
+    // Include both keys and values to catch patterns in either place
+    // Example: "hardware-cpu: Intel Xeon E5-2660 | region: us-west | ..."
+    const hardwareString = attributes
+      .map(attr => `${attr.key}: ${attr.value}`)
+      .join(' | ')
+
+    // Return the full string - getCpuScore() will find CPU patterns within it
+    return hardwareString || null
+  } catch (error) {
+    console.debug('Failed to fetch provider hardware info:', error)
+    return null
+  }
+}
+
+/**
+ * Batch fetch CPU info for multiple providers.
+ * More efficient than calling fetchProviderCpuInfo individually.
+ *
+ * @param providerAddresses - Array of provider addresses
+ * @returns Map of provider address to CPU info string
+ */
+export async function fetchProvidersCpuInfo(
+  providerAddresses: string[]
+): Promise<Map<string, string | null>> {
+  const results = new Map<string, string | null>()
+
+  // Fetch in parallel with concurrency limit
+  const batchSize = 5
+  for (let i = 0; i < providerAddresses.length; i += batchSize) {
+    const batch = providerAddresses.slice(i, i + batchSize)
+    const promises = batch.map(async (addr) => {
+      const cpuInfo = await fetchProviderCpuInfo(addr)
+      results.set(addr, cpuInfo)
+    })
+    await Promise.all(promises)
+  }
+
+  return results
 }

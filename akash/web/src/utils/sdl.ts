@@ -45,6 +45,8 @@ export interface SDLConfig {
   instanceCount?: number  // Number of container instances to run (default: 1)
   // Optional: GPU model selection for CUDA deployments
   gpuModel?: GpuModelKey  // Specific GPU model to request
+  // Optional: CPU performance requirement for CPU deployments
+  minCpuScore?: number  // Minimum CPU score (0=any, 2000=entry, 3000=good, 4000=high)
   // Optional: IPFS configuration for result uploads
   ipfsNode?: string    // IPFS node API endpoint
   ipfsApiKey?: string  // Bearer token for IPFS API authentication

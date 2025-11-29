@@ -1,5 +1,6 @@
 # Akash-optimized Dockerfile for CPU mining
-# Multi-stage build for minimal image size
+# Multi-stage build for minimal image size (~500MB vs 2.5GB+)
+# NO PyTorch - uses D-Wave SDK's built-in SimulatedAnnealingSampler
 # Includes HTTP server for log/result retrieval
 
 # =============================================================================
@@ -37,13 +38,18 @@ COPY CPU/ ./CPU/
 # Install the project in editable mode (registers entry points)
 RUN pip install --no-cache-dir -e . --no-deps
 
+# Clean up pip cache and unnecessary files in venv
+RUN rm -rf /root/.cache/pip && \
+    find /opt/venv -name "*.pyc" -delete && \
+    find /opt/venv -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+
 # =============================================================================
 # Stage 2: Runtime - Minimal production image
 # =============================================================================
 FROM python:3.13-slim-bookworm AS runtime
 
 LABEL maintainer="Quip Protocol"
-LABEL description="CPU miner for Akash Network with HTTP result server (optimized)"
+LABEL description="CPU miner for Akash (optimized, ~500MB)"
 
 # Install only runtime dependencies (curl for healthcheck)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -57,8 +63,7 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy application code from builder
-COPY --from=builder /build/pyproject.toml /build/README.md /build/LICENSE ./
+# Copy only necessary application code from builder
 COPY --from=builder /build/blockchain_base.py /build/quip_cli.py ./
 COPY --from=builder /build/shared/ ./shared/
 COPY --from=builder /build/CPU/ ./CPU/

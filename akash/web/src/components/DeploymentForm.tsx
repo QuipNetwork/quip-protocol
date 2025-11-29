@@ -8,9 +8,11 @@ import {
   createDeployment,
   waitForBids,
   acceptBid,
+  topUpDeployment,
   fetchProvider,
   checkProviderHealth,
   sendManifestViaConsole,
+  fetchProviderCpuInfo,
   type Bid,
   type ManifestSubmissionResult
 } from '../utils/akashApi'
@@ -19,6 +21,7 @@ import {
   getProviderDisplayName,
   type BidWithProvider
 } from '../utils/bidSelection'
+import { CPU_PERFORMANCE_LEVELS, getCpuScoreNormalized, getCpuTier } from '../config/cpuPerformance'
 import type { SigningStargateClient } from '@cosmjs/stargate'
 import { FleetDeployment } from './FleetDeployment'
 import type { FleetState } from '../utils/fleetManager'
@@ -44,6 +47,7 @@ export function DeploymentForm() {
 
   const [minerType, setMinerType] = useState<'cpu' | 'cuda'>(DEFAULTS.minerType)
   const [gpuModel, setGpuModel] = useState<GpuModelKey>('any')
+  const [minCpuPerformance, setMinCpuPerformance] = useState<string>('any')
   const [fleetSize, setFleetSize] = useState(DEFAULTS.fleetSize)
   const [miningDuration, setMiningDuration] = useState(DEFAULTS.duration)
   const [difficultyEnergy, setDifficultyEnergy] = useState(DEFAULTS.difficulty)
@@ -98,9 +102,9 @@ export function DeploymentForm() {
   }, [])
 
   // Start auto-deploy countdown when bids arrive and auto-deploy is enabled
-  const startAutoDeployCountdown = useCallback((bids: BidWithProvider[]) => {
+  const startAutoDeployCountdown = useCallback((bids: BidWithProvider[], preferHighPerfCpu = false) => {
     // Select best bid using our algorithm
-    const bestBid = selectBestBid(bids, { preferReliable: true })
+    const bestBid = selectBestBid(bids, { preferReliable: true, preferHighPerfCpu })
     if (!bestBid) return
 
     setAutoDeploySelectedBid(bestBid)
@@ -288,15 +292,22 @@ export function DeploymentForm() {
 
       // Enrich bids with provider info and health status
       // Process in batches to show progress
-      setDeploymentStatus(`Checking ${sortedBids.length} providers for reliability...`)
+      const fetchCpuInfo = minerType === 'cpu' && minCpuPerformance !== 'any'
+      setDeploymentStatus(`Checking ${sortedBids.length} providers for reliability${fetchCpuInfo ? ' and CPU info' : ''}...`)
       const enrichedBids: BidWithProvider[] = await Promise.all(
         sortedBids.map(async (bid) => {
-          const [providerInfo, healthStatus] = await Promise.all([
+          const [providerInfo, healthStatus, cpuInfo] = await Promise.all([
             fetchProvider(bid.bid.id.provider),
-            checkProviderHealth(bid.bid.id.provider)
+            checkProviderHealth(bid.bid.id.provider),
+            fetchCpuInfo ? fetchProviderCpuInfo(bid.bid.id.provider) : Promise.resolve(null)
           ])
           const providerOrg = providerInfo?.attributes?.find(a => a.key === 'organization')?.value
           const providerName = providerOrg || bid.bid.id.provider.slice(0, 16) + '...'
+
+          // Calculate CPU score if we have CPU info
+          const cpuScore = cpuInfo ? getCpuScoreNormalized(cpuInfo) : undefined
+          const cpuTier = cpuScore !== undefined ? getCpuTier(cpuScore * 40 + 1000) : undefined
+
           return {
             bid,
             providerName,
@@ -305,7 +316,10 @@ export function DeploymentForm() {
             isReliable: healthStatus.isReliable,
             isAudited: healthStatus.isAudited,
             activeLeaseCount: healthStatus.activeLeaseCount,
-            uptime7d: healthStatus.uptime7d
+            uptime7d: healthStatus.uptime7d,
+            cpuInfo,
+            cpuScore,
+            cpuTier
           }
         })
       )
@@ -315,8 +329,23 @@ export function DeploymentForm() {
       const onlineCount = enrichedBids.filter(b => b.isOnline).length
       console.log(`Provider breakdown: ${reliableCount} reliable, ${onlineCount} online, ${enrichedBids.length} total`)
 
+      // Filter by minimum CPU score if enabled
+      let filteredBids = enrichedBids
+      if (minerType === 'cpu' && minCpuPerformance !== 'any') {
+        const minTierLevel = CPU_PERFORMANCE_LEVELS.find(l => l.value === minCpuPerformance)
+        const minScore = minTierLevel?.minScore ?? (parseInt(minCpuPerformance, 10) || 0)
+        if (minScore > 0) {
+          filteredBids = enrichedBids.filter(b => {
+            if (!b.cpuScore) return false // No CPU info = filtered out
+            const rawScore = b.cpuScore * 40 + 1000 // Convert normalized back to raw
+            return rawScore >= minScore
+          })
+          console.log(`CPU filter (score >= ${minScore}): ${filteredBids.length}/${enrichedBids.length} providers meet minimum`)
+        }
+      }
+
       // Sort all providers by: price first, then reliability indicators
-      const sortedProviders = [...enrichedBids]
+      const sortedProviders = [...filteredBids]
         .sort((a, b) => {
           // Price first (lowest = best)
           const priceA = parseFloat(a.bid.bid.price.amount)
@@ -336,9 +365,13 @@ export function DeploymentForm() {
       const displayProviders = sortedProviders.slice(0, 30)
 
       if (displayProviders.length === 0) {
+        const selectedLevel = CPU_PERFORMANCE_LEVELS.find(l => l.value === minCpuPerformance)
+        const cpuFilterMsg = minerType === 'cpu' && minCpuPerformance !== 'any'
+          ? ` No providers meet the "${selectedLevel?.label || minCpuPerformance}" (score ${selectedLevel?.minScore}+) CPU requirement. Try lowering the requirement.`
+          : ' Try again later.'
         setAlert({
           type: 'error',
-          message: `${enrichedBids.length} bids received but no providers could be verified. Try again later.`
+          message: `${enrichedBids.length} bids received but no providers passed filters.${cpuFilterMsg}`
         })
         setIsDeploying(false)
         return
@@ -353,14 +386,18 @@ export function DeploymentForm() {
 
       // Check if auto-deploy is enabled
       if (autoDeployEnabled && displayProviders.length > 0) {
-        const bestBid = selectBestBid(displayProviders, { preferReliable: true })
+        const useCpuPref = minerType === 'cpu' && minCpuPerformance !== 'any'
+        const bestBid = selectBestBid(displayProviders, {
+          preferReliable: true,
+          preferHighPerfCpu: useCpuPref
+        })
         if (bestBid) {
           const providerName = getProviderDisplayName(bestBid)
           setAlert({
             type: 'info',
             message: `Auto-deploying to ${providerName} in ${AUTO_DEPLOY_COUNTDOWN_SECONDS}s... (Click Cancel to choose manually)`
           })
-          startAutoDeployCountdown(displayProviders)
+          startAutoDeployCountdown(displayProviders, useCpuPref)
           return
         }
       }
@@ -416,7 +453,15 @@ export function DeploymentForm() {
       const leaseResult = await acceptBid(signingClient, selectedBid.bid)
       console.log('Lease created:', leaseResult)
 
-      // Step 2: Send manifest to provider
+      // Step 2: Top up escrow based on actual bid price (if needed)
+      const bidPriceUakt = parseInt(selectedBid.bid.bid.price.amount, 10)
+      const durationMinutes = parseDurationToMinutes(miningDuration)
+      const topUp = await topUpDeployment(signingClient, address, currentDseq, bidPriceUakt, durationMinutes)
+      if (topUp) {
+        console.log(`Topped up escrow: +${topUp.depositAmount} uAKT`)
+      }
+
+      // Step 3: Send manifest to provider
       // This is critical - without it, the provider doesn't know what to deploy
       if (currentManifestJson) {
         setDeploymentStatus('Sending manifest to provider...')
@@ -533,6 +578,9 @@ export function DeploymentForm() {
   }
 
   // Build config for fleet deployment
+  // Convert minCpuPerformance dropdown value to numeric score
+  const minCpuScoreValue = minCpuPerformance === 'any' ? 0 : parseInt(minCpuPerformance, 10)
+
   const fleetConfig = {
     minerType,
     fleetSize,
@@ -542,6 +590,8 @@ export function DeploymentForm() {
     minSolutions,
     // Include GPU model for CUDA deployments
     gpuModel: minerType === 'cuda' ? gpuModel : undefined,
+    // Include CPU performance requirement for CPU deployments
+    minCpuScore: minerType === 'cpu' ? minCpuScoreValue : undefined,
     // Include IPFS config if enabled
     ipfsNode: ipfsEnabled ? ipfsNode : undefined,
     ipfsApiKey: ipfsEnabled ? ipfsApiKey : undefined,
@@ -891,6 +941,32 @@ export function DeploymentForm() {
               ))}
             </select>
             <small>Select a specific GPU model or "Any" to accept any NVIDIA GPU. Specific models may have fewer available providers.</small>
+          </div>
+        )}
+
+        {minerType === 'cpu' && (
+          <div className="form-group">
+            <label htmlFor="minCpuPerformance">Minimum CPU Performance</label>
+            <select
+              id="minCpuPerformance"
+              value={minCpuPerformance}
+              onChange={(e) => setMinCpuPerformance(e.target.value)}
+            >
+              {CPU_PERFORMANCE_LEVELS.map((level) => (
+                <option key={level.value} value={level.value}>
+                  {level.label}{level.clockRange ? ` (${level.clockRange})` : ''} - {level.description}
+                </option>
+              ))}
+            </select>
+            <small>
+              {(() => {
+                const selected = CPU_PERFORMANCE_LEVELS.find(l => l.value === minCpuPerformance)
+                if (!selected || minCpuPerformance === 'any') {
+                  return 'Accept any provider CPU (cheapest option)'
+                }
+                return `Score ${selected.minScore}+ required. Examples: ${selected.examples}`
+              })()}
+            </small>
           </div>
         )}
 

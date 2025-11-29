@@ -64,12 +64,13 @@ def generate_ising_model_from_nonce(
     if h_values is None:
         h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
 
-    np.random.seed(nonce)
+    # Use numpy's new Generator API instead of global np.random.seed()
+    # This is thread-safe and doesn't affect global state
+    rng = np.random.default_rng(nonce)
 
     # Generate J: random ±1 for each edge
     J = {
-        (int(u), int(v)) if isinstance(u, (int, np.integer)) and isinstance(v, (int, np.integer)) else (int(u), int(v)):
-        float(2 * np.random.randint(2) - 1)
+        (int(u), int(v)): float(2 * rng.integers(2) - 1)
         for (u, v) in edges
     }
 
@@ -79,7 +80,7 @@ def generate_ising_model_from_nonce(
         h = {int(i): 0.0 for i in nodes}
     else:
         # General case: sample from h_values distribution
-        h_vals = np.random.choice(h_values, size=len(nodes))
+        h_vals = rng.choice(h_values, size=len(nodes))
         h = {int(node_id): float(h_vals[idx]) for idx, node_id in enumerate(nodes)}
 
     return h, J
