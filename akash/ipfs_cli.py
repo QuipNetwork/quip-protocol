@@ -11,7 +11,7 @@ Usage:
     python akash/ipfs_cli.py delete <deployment_id> --yes   # Delete by deployment ID
     python akash/ipfs_cli.py delete <cid> --yes            # Delete by CID
 
-Cache: Manifests are cached in ~/.cache/quip-ipfs/ for 5 minutes.
+Cache: Manifests are cached in ~/.cache/quip-ipfs/ (use -r to refresh).
 """
 from __future__ import annotations
 
@@ -28,7 +28,6 @@ from typing import Any, Dict, List, Optional
 # Cache settings
 CACHE_DIR = Path.home() / ".cache" / "quip-ipfs"
 CACHE_FILE = CACHE_DIR / "manifests.json"
-CACHE_MAX_AGE = 300  # 5 minutes
 
 import click
 from dotenv import load_dotenv
@@ -136,15 +135,13 @@ def is_cid(value: str) -> bool:
 
 
 def load_cache(node: str) -> Optional[Dict[str, Any]]:
-    """Load cached manifests if valid and not expired."""
+    """Load cached manifests if valid for this node."""
     if not CACHE_FILE.exists():
         return None
     try:
         cache = json.loads(CACHE_FILE.read_text())
-        # Check if cache is for same node and not expired
+        # Check if cache is for same node
         if cache.get("node") != node:
-            return None
-        if time.time() - cache.get("timestamp", 0) > CACHE_MAX_AGE:
             return None
         return cache
     except (json.JSONDecodeError, OSError):
@@ -175,19 +172,19 @@ def get_all_manifests(
     verbose: bool = False,
     refresh: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Fetch all pinned manifests from IPFS node (uses cache unless refresh=True)."""
-    # Try cache first
+    """Fetch all pinned manifests from IPFS node (uses cache unless refresh=True).
+
+    Returns (manifests, from_cache) tuple.
+    """
+    # Try cache first (IPFS content is immutable, so cache never expires)
     if not refresh:
         cache = load_cache(node)
         if cache:
             manifests = cache["manifests"]
-            age = int(time.time() - cache["timestamp"])
-            if verbose:
-                click.echo(f"Using cached data ({age}s old, {len(manifests)} manifests)")
+            click.echo(f"Using cache ({len(manifests)} manifests). Use -r to refresh.")
             return manifests
 
-    if verbose:
-        click.echo("Fetching manifests from IPFS node...")
+    click.echo("Fetching manifests from IPFS node...")
 
     # List all pins
     try:
@@ -287,8 +284,6 @@ def list_manifests(ctx: click.Context, verbose: bool, refresh: bool):
     node = ctx.obj["node"]
     api_key = ctx.obj["api_key"]
     gateway = ctx.obj["gateway"]
-
-    click.echo(f"Connecting to IPFS node: {node}")
 
     manifests = get_all_manifests(node, api_key, gateway, verbose=verbose, refresh=refresh)
 
@@ -476,7 +471,6 @@ def download(ctx: click.Context, identifier: str, output_dir: str, latest: bool,
     else:
         # Deployment ID - search for matching manifests
         click.echo(f"Searching for deployment: {identifier}")
-        click.echo(f"Connecting to IPFS node: {node}")
 
         all_manifests = get_all_manifests(node, api_key, gateway, refresh=refresh)
         matching = find_manifests_by_deployment(all_manifests, identifier)
@@ -484,7 +478,7 @@ def download(ctx: click.Context, identifier: str, output_dir: str, latest: bool,
         if not matching:
             raise click.ClickException(
                 f"No manifests found for deployment ID: {identifier}\n"
-                "Use 'list' command to see available deployments."
+                "Use 'list -r' command to refresh and see available deployments."
             )
 
         # Sort by timestamp (most recent first)
@@ -568,7 +562,7 @@ def delete(ctx: click.Context, identifier: str, yes: bool, gc: bool, refresh: bo
         if not matching:
             raise click.ClickException(
                 f"No manifests found for deployment ID: {identifier}\n"
-                "Use 'list' command to see available deployments."
+                "Use 'list -r' command to refresh and see available deployments."
             )
 
         # Collect manifest CIDs and their associated result CIDs
