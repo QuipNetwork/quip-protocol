@@ -21,9 +21,9 @@ except RuntimeError:
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-# Load environment variables from .env file
+# Load environment variables from .env file (override=True so .env takes precedence)
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 # Configure logging to capture miner logs
 logging.basicConfig(
@@ -269,7 +269,8 @@ def mine_worker(
     min_solutions: int,
     topology_name: Optional[str],
     result_queue: multiprocessing.Queue,
-    stop_event: multiprocessing.Event
+    stop_event: multiprocessing.Event,
+    queue_depth: int = 10
 ):
     """Worker function for parallel mining.
 
@@ -282,6 +283,7 @@ def mine_worker(
         topology_name: Topology name to load (None for default)
         result_queue: Queue to send results back
         stop_event: Shared event to signal stop
+        queue_depth: QPU streaming queue depth (default: 10)
     """
     # Build miner from spec
     kind = miner_spec['kind']
@@ -365,7 +367,12 @@ def mine_worker(
             miner = MetalMiner(miner_id=miner_id, topology=topology)
         elif kind == 'qpu':
             from QPU.dwave_miner import DWaveMiner
-            miner = DWaveMiner(miner_id=miner_id, topology=topology, qpu_timeout=0.0)
+            miner = DWaveMiner(
+                miner_id=miner_id,
+                topology=topology,
+                qpu_timeout=0.0,  # Disable rate limiting for testing
+                queue_depth=queue_depth
+            )
         else:
             result_queue.put({'error': f'Unknown miner kind: {kind}', 'miner_id': miner_id})
             return
@@ -437,14 +444,18 @@ def mine_worker(
 
         attempts += 1
 
-        result = miner.mine_block(
-            prev_block=prev_block,
-            node_info=node_info,
-            requirements=requirements,
-            prev_timestamp=prev_block.header.timestamp,
-            stop_event=stop_event,
-            drain=(kind == 'cuda'),
-        )
+        # Build mine_block kwargs (drain only applies to CUDA)
+        mine_kwargs = {
+            'prev_block': prev_block,
+            'node_info': node_info,
+            'requirements': requirements,
+            'prev_timestamp': prev_block.header.timestamp,
+            'stop_event': stop_event,
+        }
+        if kind == 'cuda':
+            mine_kwargs['drain'] = True
+
+        result = miner.mine_block(**mine_kwargs)
 
         # Track QPU time for this attempt (if available)
         if hasattr(miner, 'timing_stats') and 'qpu_access_time' in miner.timing_stats:
@@ -582,6 +593,12 @@ def main():
         default=None,
         help='Comma-separated CUDA device IDs (e.g., "0,1,2"). Default: all detected GPUs'
     )
+    parser.add_argument(
+        '--queue-depth',
+        type=int,
+        default=10,
+        help='QPU streaming queue depth (default: 10). Higher values increase throughput but may waste QPU time.'
+    )
 
     args = parser.parse_args()
 
@@ -644,6 +661,9 @@ def main():
         print(f"❌ No {args.miner_type} hardware detected or specified")
         return 1
 
+    if args.miner_type == 'qpu':
+        print(f"QPU queue depth: {args.queue_depth}")
+
     print(f"\nUsing {len(miner_specs)} miner(s):")
     for spec in miner_specs:
         device_info = f" (device {spec['args']['device']})" if 'args' in spec and 'device' in spec['args'] else ""
@@ -666,7 +686,8 @@ def main():
                 args.min_solutions,
                 args.topology,
                 result_queue,
-                stop_event
+                stop_event,
+                args.queue_depth
             )
         )
         p.start()

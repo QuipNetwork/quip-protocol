@@ -1,11 +1,81 @@
 """D-Wave QPU sampler wrapper and configuration for quantum blockchain mining."""
 
-from typing import Dict, List, Tuple, Any, Union, Mapping, Sequence, cast, Optional
+from typing import Dict, List, Tuple, Any, Union, Mapping, Sequence, cast, Optional, TYPE_CHECKING
 import collections.abc
 from dwave.system import DWaveSampler, FixedEmbeddingComposite
 from dwave.system.testing import MockDWaveSampler
+from dwave.embedding import embed_bqm, unembed_sampleset
 import dimod
 import dwave_networkx as dnx
+
+if TYPE_CHECKING:
+    from dwave.cloud.computation import Future
+
+
+class EmbeddedFuture:
+    """Wrapper around a D-Wave Future that handles unembedding when sampleset is accessed.
+
+    This enables async submission of embedded problems while still getting properly
+    unembedded results when the future completes.
+    """
+
+    def __init__(self, future: 'Future', source_bqm: dimod.BinaryQuadraticModel,
+                 embedding: Dict[int, List[int]], chain_strength: Optional[float] = None):
+        """
+        Args:
+            future: The raw Future from the QPU sampler
+            source_bqm: The original (unembedded) BQM for variable reference
+            embedding: The embedding mapping {source_var: [target_qubits]}
+            chain_strength: Chain strength used (for broken chain handling)
+        """
+        self._future = future
+        self._source_bqm = source_bqm
+        self._embedding = embedding
+        self._chain_strength = chain_strength
+        self._cached_sampleset: Optional[dimod.SampleSet] = None
+
+    @property
+    def sampleset(self) -> dimod.SampleSet:
+        """Get the unembedded sampleset (blocks if not ready)."""
+        if self._cached_sampleset is None:
+            # Get raw embedded sampleset from QPU
+            embedded_sampleset = self._future.sampleset
+
+            # Unembed to get logical variable samples
+            self._cached_sampleset = unembed_sampleset(
+                embedded_sampleset,
+                self._embedding,
+                self._source_bqm,
+                chain_break_method='majority_vote'
+            )
+        return self._cached_sampleset
+
+    def done(self) -> bool:
+        """Check if the future is complete."""
+        return self._future.done()
+
+    def cancel(self) -> bool:
+        """Cancel the pending job."""
+        return self._future.cancel()
+
+    def wait(self, timeout: Optional[float] = None):
+        """Wait for the future to complete."""
+        return self._future.wait(timeout)
+
+    @property
+    def id(self):
+        """Get the job ID."""
+        return self._future.id
+
+    def __hash__(self):
+        """Make EmbeddedFuture hashable using the underlying future's id."""
+        return hash(id(self._future))
+
+    def __eq__(self, other):
+        """Compare by underlying future identity."""
+        if isinstance(other, EmbeddedFuture):
+            return self._future is other._future
+        return False
 
 from dwave_topologies.embedding_loader import get_embedding_dict, embedding_exists
 from dwave_topologies import DEFAULT_TOPOLOGY
@@ -211,3 +281,65 @@ class DWaveSamplerWrapper:
                 print(f"   Extra: {sorted(list(actual_vars - expected_vars))[:20]}", file=sys.stderr)
 
         return sampleset
+
+    def sample_ising_async(
+        self,
+        h: Union[Mapping[Variable, float], Sequence[float]],
+        J: Mapping[Tuple[Variable, Variable], float],
+        **kwargs
+    ) -> Union['Future', EmbeddedFuture]:
+        """
+        Submit Ising problem to QPU and return Future without blocking.
+
+        Same as sample_ising() but returns a Future-like object for async processing.
+        Caller must access future.sampleset to get results (which blocks on first access).
+
+        For embedded problems, returns an EmbeddedFuture that handles unembedding
+        automatically when the sampleset is accessed.
+
+        Args:
+            h: Linear biases (dict mapping variable to bias, or sequence)
+            J: Quadratic biases (dict mapping variable pairs to bias)
+            **kwargs: Additional parameters passed to the sampler (num_reads, annealing_time, etc.)
+
+        Returns:
+            Future-like object (Future or EmbeddedFuture) that resolves to SampleSet
+        """
+        # Add default job label if not already specified
+        if 'label' not in kwargs:
+            kwargs['label'] = self.job_label
+
+        if self.embedding is not None:
+            # Create BQM from Ising problem
+            source_bqm = dimod.BinaryQuadraticModel.from_ising(h, J)
+
+            # Calculate chain strength (using same logic as FixedEmbeddingComposite)
+            # Default to magnitude of strongest interaction
+            if source_bqm.num_interactions > 0:
+                chain_strength = max(abs(bias) for bias in source_bqm.quadratic.values()) * 1.5
+            else:
+                chain_strength = max(abs(bias) for bias in source_bqm.linear.values()) * 1.5 if source_bqm.linear else 1.0
+
+            # Manually embed the BQM
+            target_bqm = embed_bqm(
+                source_bqm,
+                self.embedding,
+                self.qpu_solver.adjacency,
+                chain_strength=chain_strength
+            )
+
+            # Submit embedded BQM directly to QPU's underlying solver (returns raw Future)
+            # DWaveSampler.sample() returns SampleSet, but solver.sample_bqm() returns Future
+            raw_future = self.qpu_solver.solver.sample_bqm(target_bqm, **kwargs)
+
+            # Wrap in EmbeddedFuture to handle unembedding on access
+            return EmbeddedFuture(
+                future=raw_future,
+                source_bqm=source_bqm,
+                embedding=self.embedding,
+                chain_strength=chain_strength
+            )
+        else:
+            # No embedding - submit to underlying solver directly (returns raw Future)
+            bqm = dimod.BinaryQuadraticModel.from_ising(h, J)
+            return self.qpu_solver.solver.sample_bqm(bqm, **kwargs)
