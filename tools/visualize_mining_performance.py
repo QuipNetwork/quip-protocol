@@ -138,15 +138,15 @@ def plot_threshold_probabilities(
     print(f"Saved threshold probability chart to {output_file}")
 
 
-def plot_blocks_by_threshold(
+def plot_nonces_by_threshold(
     df: pd.DataFrame,
     thresholds: List[float],
     topology_info: str,
     num_nodes: Optional[int] = None,
     num_edges: Optional[int] = None,
-    output_file: str = 'blocks_by_threshold.png'
+    output_file: str = 'nonces_by_threshold.png'
 ):
-    """Plot number of blocks that would be mined at each threshold."""
+    """Plot cumulative nonces meeting each threshold, normalized per unit."""
     plt.figure(figsize=(12, 7))
 
     colors = {
@@ -155,30 +155,52 @@ def plot_blocks_by_threshold(
         'QPU': '#2ecc71'
     }
 
+    # Get device counts for normalization
+    device_counts = get_device_counts(df)
+
     for miner_type in df['miner_type'].unique():
         display_type = normalize_miner_type(miner_type)
         miner_df = df[df['miner_type'] == miner_type]
         energies = miner_df['energy'].values
 
-        blocks_at_threshold = []
+        # Calculate normalization factor
+        # GPU: per GPU, CPU: per 32 cores, QPU: per QPU
+        raw_count = device_counts.get(display_type, 1)
+        if display_type == 'CPU':
+            # Normalize to 32-core units (each worker is ~1 core)
+            units = raw_count / 32
+            unit_label = f"~{{:.0f}} nonces per CPU (32 cores)"
+        elif display_type == 'GPU':
+            units = raw_count
+            unit_label = f"~{{:.0f}} nonces per GPU"
+        else:  # QPU
+            units = raw_count
+            unit_label = f"{{:.0f}} nonces per QPU"
+
+        nonces_at_threshold = []
         for threshold in thresholds:
-            num_blocks = np.sum(energies <= threshold)
-            blocks_at_threshold.append(num_blocks)
+            # Count all nonces with energy <= threshold
+            num_nonces = np.sum(energies <= threshold)
+            # Normalize to per-unit
+            nonces_per_unit = num_nonces / units if units > 0 else 0
+            nonces_at_threshold.append(nonces_per_unit)
 
         color = colors.get(display_type, '#95a5a6')
+        # Get final nonce count for legend
+        final_nonces = nonces_at_threshold[-1] if nonces_at_threshold else 0
         plt.plot(
             thresholds,
-            blocks_at_threshold,
+            nonces_at_threshold,
             marker='o',
             linewidth=2,
             markersize=6,
-            label=f'{display_type} (total={len(energies):,})',
+            label=f'{display_type} ({unit_label.format(final_nonces)})',
             color=color
         )
 
     plt.xlabel('Difficulty Threshold (Energy)', fontsize=12, fontweight='bold')
-    plt.ylabel('Cumulative Blocks Mined', fontsize=12, fontweight='bold')
-    plt.title(f'Blocks Mined by Difficulty Threshold\n{topology_info}', fontsize=14, fontweight='bold')
+    plt.ylabel('Cumulative Nonces Meeting Threshold Per Unit', fontsize=12, fontweight='bold')
+    plt.title(f'Nonces Meeting Energy Difficulty Threshold\n{topology_info}', fontsize=14, fontweight='bold')
     plt.legend(fontsize=11)
     plt.grid(True, alpha=0.3)
 
@@ -198,7 +220,7 @@ def plot_blocks_by_threshold(
 
     plt.tight_layout()
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"Saved blocks by threshold chart to {output_file}")
+    print(f"Saved nonces by threshold chart to {output_file}")
 
 
 def plot_proportion_by_threshold(
@@ -292,6 +314,110 @@ def get_device_counts(df: pd.DataFrame) -> dict:
     return counts
 
 
+def get_miner_tts_stats(df: pd.DataFrame) -> dict:
+    """
+    Calculate TTS (time-to-solution) statistics for each miner type.
+
+    Returns a dict keyed by display_type (CPU/GPU/QPU) with:
+    - energies: all energy values (for probability calculations)
+    - observed_tts: mean TTS at the observed threshold
+    - observed_tts_std: std dev of TTS
+    - tts_samples: raw TTS values for Monte Carlo sampling
+    - p_actual: probability of success at actual threshold
+    - device_count: number of devices
+    - min_tts: minimum observed TTS (floor for current fleet)
+    - spinup_time: time to produce first nonce (floor for projections)
+
+    This is used by both win rate calculations and expected time charts.
+    """
+    device_counts = get_device_counts(df)
+    stats = {}
+
+    for miner_type in df['miner_type'].unique():
+        display_type = normalize_miner_type(miner_type)
+        miner_df = df[df['miner_type'] == miner_type]
+        energies = miner_df['energy'].values
+
+        # Get observed TTS from successful block mining
+        successful_df = miner_df[miner_df['valid'] > 0]
+        tts_values = successful_df['time_to_solution'].values
+        valid_tts = tts_values[tts_values > 0]
+
+        if len(valid_tts) > 0:
+            observed_tts = np.mean(valid_tts)
+            observed_tts_std = np.std(valid_tts)
+            tts_samples = valid_tts
+            # Minimum TTS from actual data (floor for current fleet)
+            min_tts = np.min(valid_tts)
+        else:
+            observed_tts = float('inf')
+            observed_tts_std = 0
+            tts_samples = np.array([])
+            min_tts = float('inf')
+
+        # Spinup time - time to produce first nonce on an attempt
+        # For projections, this is the floor regardless of device count
+        # Estimate: spinup is approximately min_tts since most of min_tts is initialization
+        spinup_time = min_tts
+
+        # Probability of success at the actual threshold
+        actual_threshold = miner_df['threshold'].iloc[0] if 'threshold' in miner_df.columns else None
+        if actual_threshold is not None:
+            p_actual = np.sum(energies <= actual_threshold) / len(energies) if len(energies) > 0 else 0
+        else:
+            # Fallback: use success rate from data
+            p_actual = len(successful_df) / len(miner_df) if len(miner_df) > 0 else 0
+
+        stats[display_type] = {
+            'energies': energies,
+            'num_attempts': len(energies),
+            'observed_tts': observed_tts,
+            'observed_tts_std': observed_tts_std,
+            'tts_samples': tts_samples,
+            'p_actual': p_actual,
+            'device_count': device_counts.get(display_type, 1),
+            'min_tts': min_tts,
+            'spinup_time': spinup_time
+        }
+
+    return stats
+
+
+def calculate_expected_tts(miner_stats: dict, threshold: float) -> dict:
+    """
+    Calculate expected TTS at a given threshold for all miner types.
+
+    Uses the scaling formula: expected_tts = observed_tts * (p_actual / p_threshold)
+
+    Returns dict of {display_type: expected_tts} or float('inf') if impossible.
+    """
+    expected = {}
+
+    for display_type, stats in miner_stats.items():
+        if stats['observed_tts'] == float('inf') or stats['p_actual'] == 0:
+            expected[display_type] = float('inf')
+            continue
+
+        energies = stats['energies']
+        if len(energies) == 0:
+            expected[display_type] = float('inf')
+            continue
+
+        # Probability of meeting this threshold
+        p_threshold = np.sum(energies <= threshold) / len(energies)
+
+        if p_threshold > 0:
+            # Scale TTS: easier threshold = faster, harder = slower
+            scale = stats['p_actual'] / p_threshold
+            scaled_tts = stats['observed_tts'] * scale
+            # Apply floor: can't be faster than min_tts (minimum observed time to mine a block)
+            expected[display_type] = max(stats['min_tts'], scaled_tts)
+        else:
+            expected[display_type] = float('inf')
+
+    return expected
+
+
 def _calculate_win_rates(
     df: pd.DataFrame,
     thresholds: List[float],
@@ -317,50 +443,16 @@ def _calculate_win_rates(
     Returns:
         (miner_stats, win_rates) tuple
     """
-    # Step 1: Calculate per-miner statistics at observed threshold
-    miner_stats = {}
-    device_counts = get_device_counts(df)
-
-    for miner_type in df['miner_type'].unique():
-        display_type = normalize_miner_type(miner_type)
-        miner_df = df[df['miner_type'] == miner_type]
-        energies = miner_df['energy'].values
-
-        # Observed TTS distribution from successful mining
-        successful_df = miner_df[miner_df['valid'] > 0]
-        tts_values = successful_df['time_to_solution'].values
-        valid_tts = tts_values[tts_values > 0]
-
-        if len(valid_tts) > 0:
-            observed_tts_mean = np.mean(valid_tts)
-            observed_tts_std = np.std(valid_tts)
-            # Store actual TTS samples for Monte Carlo
-            tts_samples = valid_tts
-        else:
-            observed_tts_mean = float('inf')
-            observed_tts_std = 0
-            tts_samples = np.array([])
-
-        # Success rate at actual threshold (proxy for p_actual)
-        actual_probability = len(successful_df) / len(miner_df) if len(miner_df) > 0 else 0
-
-        miner_stats[display_type] = {
-            'energies': energies,
-            'num_attempts': len(energies),
-            'observed_tts_mean': observed_tts_mean,
-            'observed_tts_std': observed_tts_std,
-            'tts_samples': tts_samples,
-            'actual_probability': actual_probability,
-            'device_count': device_counts.get(display_type, 1)
-        }
+    # Step 1: Get per-miner statistics using shared function
+    miner_stats = get_miner_tts_stats(df)
 
     if debug:
         print("\n=== Win Rate Calculation Debug (Monte Carlo) ===")
         print("Miner statistics at observed threshold:")
         for name, stats in miner_stats.items():
-            cv = stats['observed_tts_std'] / stats['observed_tts_mean'] if stats['observed_tts_mean'] > 0 else 0
-            print(f"  {name}: TTS={stats['observed_tts_mean']:.1f}s ± {stats['observed_tts_std']:.1f}s "
-                  f"(CV={cv:.2f}), p_actual={stats['actual_probability']:.4f}, "
+            cv = stats['observed_tts_std'] / stats['observed_tts'] if stats['observed_tts'] > 0 else 0
+            print(f"  {name}: TTS={stats['observed_tts']:.1f}s ± {stats['observed_tts_std']:.1f}s "
+                  f"(CV={cv:.2f}), p_actual={stats['p_actual']:.4f}, "
                   f"devices={stats['device_count']}")
 
     # Step 2: Calculate win rates for each threshold via Monte Carlo
@@ -380,9 +472,9 @@ def _calculate_win_rates(
                     continue
 
                 p_threshold = np.sum(stats['energies'] <= threshold) / len(stats['energies'])
-                if p_threshold > 0 and stats['actual_probability'] > 0:
+                if p_threshold > 0 and stats['p_actual'] > 0:
                     # QPURT: ~45ms per nonce, scale by probability
-                    scale = stats['actual_probability'] / p_threshold
+                    scale = stats['p_actual'] / p_threshold
                     # Very low variance for QPURT (network latency dominated)
                     scaled_params[config_name] = {
                         'mean': 0.045 * scale,
@@ -395,7 +487,7 @@ def _calculate_win_rates(
                 continue
 
             stats = miner_stats[miner_type]
-            if stats['observed_tts_mean'] == float('inf') or stats['actual_probability'] == 0:
+            if stats['observed_tts'] == float('inf') or stats['p_actual'] == 0:
                 continue
             if len(stats['energies']) == 0:
                 continue
@@ -405,16 +497,29 @@ def _calculate_win_rates(
 
             if p_threshold > 0:
                 # Scale factor for TTS (both mean and std scale together)
-                scale = stats['actual_probability'] / p_threshold
+                scale = stats['p_actual'] / p_threshold
 
                 # Scale for device count (for projections)
                 actual_count = stats['device_count']
-                if count != actual_count and count > 0:
+                is_projection = (count != actual_count and count > 0)
+                if is_projection:
                     scale *= actual_count / count
 
+                # Choose floor based on whether this is a projection
+                # - For actual fleet: use min_tts (observed minimum)
+                # - For projections: use spinup_time (time to first nonce, doesn't scale with devices)
+                if is_projection:
+                    floor = stats['spinup_time']
+                else:
+                    floor = stats['min_tts']
+
+                scaled_mean = max(floor, stats['observed_tts'] * scale)
+                scaled_std = stats['observed_tts_std'] * scale
+
                 scaled_params[config_name] = {
-                    'mean': stats['observed_tts_mean'] * scale,
-                    'std': stats['observed_tts_std'] * scale,
+                    'mean': scaled_mean,
+                    'std': scaled_std,
+                    'floor': floor,  # Floor for sampling
                     'samples': stats['tts_samples'] * scale if len(stats['tts_samples']) > 0 else None,
                     'use_samples': len(stats['tts_samples']) >= 100  # Use samples if we have enough
                 }
@@ -431,13 +536,14 @@ def _calculate_win_rates(
             # Sample TTS for each miner
             sampled_tts = {}
             for name, params in scaled_params.items():
+                floor = params.get('floor', 0.001)
                 if params.get('use_samples') and params.get('samples') is not None:
-                    # Sample from actual distribution
-                    sampled_tts[name] = np.random.choice(params['samples'])
+                    # Sample from actual distribution, apply floor
+                    sampled_tts[name] = max(floor, np.random.choice(params['samples']))
                 else:
-                    # Sample from normal distribution (truncated at 0)
+                    # Sample from normal distribution, apply floor
                     sample = np.random.normal(params['mean'], params['std'])
-                    sampled_tts[name] = max(0.001, sample)  # Ensure positive
+                    sampled_tts[name] = max(floor, sample)
 
             # Determine winner (lowest TTS)
             winner = min(sampled_tts, key=sampled_tts.get)
@@ -563,12 +669,14 @@ def plot_win_rate_by_threshold_projection(
     num_nodes: Optional[int] = None,
     num_edges: Optional[int] = None,
     output_file: str = 'win_rate_by_threshold_projection.png',
-    include_qpurt: bool = False
+    projection_config: str = 'standard'
 ):
     """
     Plot probability of winning the mining race with projected device counts.
 
-    Shows projections like GPU (2^8), GPU (2^16), CPU (2^20), CPU (2^30).
+    Args:
+        projection_config: 'standard' for CPU 2^20 + GPU 2^15,
+                          'extreme' for CPU 2^40 + GPU 2^20
     """
     plt.figure(figsize=(12, 7))
 
@@ -585,8 +693,8 @@ def plot_win_rate_by_threshold_projection(
     # Generate configurations with projections
     configurations = []
 
-    if include_qpurt:
-        # QPURT projection version
+    if projection_config == 'extreme':
+        # Extreme projection: CPU 2^40 + GPU 2^20
         if 'QPU' in device_counts:
             configurations.append((f'QPU ({device_counts["QPU"]})', 'QPU', device_counts['QPU']))
         if 'CPU' in device_counts:
@@ -599,23 +707,19 @@ def plot_win_rate_by_threshold_projection(
                 (f'GPU ({device_counts["GPU"]} GPUs)', 'GPU', device_counts['GPU']),
                 ('GPU (2^20)', 'GPU', 1048576)
             ])
-        if 'QPU' in device_counts:
-            configurations.append(('QPURT', 'QPURT', device_counts['QPU']))
     else:
-        # Standard projection version
+        # Standard projection: CPU 2^20 + GPU 2^15
         if 'QPU' in device_counts:
             configurations.append((f'QPU ({device_counts["QPU"]})', 'QPU', device_counts['QPU']))
         if 'CPU' in device_counts:
             configurations.extend([
                 (f'CPU ({device_counts["CPU"]} CPUs)', 'CPU', device_counts['CPU']),
-                ('CPU (2^20)', 'CPU', 1048576),
-                ('CPU (2^30)', 'CPU', 1073741824)
+                ('CPU (2^20)', 'CPU', 1048576)
             ])
         if 'GPU' in device_counts:
             configurations.extend([
                 (f'GPU ({device_counts["GPU"]} GPUs)', 'GPU', device_counts['GPU']),
-                ('GPU (2^8)', 'GPU', 256),
-                ('GPU (2^16)', 'GPU', 65536)
+                ('GPU (2^10)', 'GPU', 1024)
             ])
 
     # Calculate win rates
@@ -623,11 +727,10 @@ def plot_win_rate_by_threshold_projection(
 
     # Plot styles for projections
     style_map = {
-        256: {'linestyle': '--', 'marker': 's', 'linewidth': 2.5, 'alpha': 0.7},
-        65536: {'linestyle': ':', 'marker': '^', 'linewidth': 2.5, 'alpha': 0.7},
-        1048576: {'linestyle': '--', 'marker': 'D', 'linewidth': 2.5, 'alpha': 0.7},
-        1073741824: {'linestyle': ':', 'marker': 'v', 'linewidth': 2.5, 'alpha': 0.7},
-        1099511627776: {'linestyle': ':', 'marker': 'X', 'linewidth': 2.5, 'alpha': 0.7}
+        1024: {'linestyle': '--', 'marker': 's', 'linewidth': 2.5, 'alpha': 0.7},        # 2^10
+        65536: {'linestyle': ':', 'marker': '^', 'linewidth': 2.5, 'alpha': 0.7},        # 2^16
+        1048576: {'linestyle': '--', 'marker': 'D', 'linewidth': 2.5, 'alpha': 0.7},     # 2^20
+        1099511627776: {'linestyle': ':', 'marker': 'X', 'linewidth': 2.5, 'alpha': 0.7} # 2^40
     }
 
     for config_name, miner_type, count in configurations:
@@ -703,29 +806,18 @@ def plot_expected_time_by_threshold(
         'QPU': '#2ecc71'
     }
 
-    for miner_type in df['miner_type'].unique():
-        display_type = normalize_miner_type(miner_type)
-        miner_df = df[df['miner_type'] == miner_type]
+    # Get TTS stats using shared function
+    miner_stats = get_miner_tts_stats(df)
 
-        energies = miner_df['energy'].values
-        tts_values = miner_df['time_to_solution'].values
-        valid_tts = tts_values[tts_values > 0]
-
-        if len(valid_tts) == 0:
+    for display_type, stats in miner_stats.items():
+        if stats['observed_tts'] == float('inf') or stats['p_actual'] == 0:
             continue
 
-        time_per_attempt = np.mean(valid_tts)
-
+        # Calculate expected TTS for each threshold
         expected_times = []
         for threshold in thresholds:
-            meets_threshold = np.sum(energies <= threshold)
-            probability = meets_threshold / len(energies)
-
-            if probability > 0:
-                expected_time = time_per_attempt / probability
-                expected_times.append(expected_time)
-            else:
-                expected_times.append(float('inf'))
+            expected = calculate_expected_tts({display_type: stats}, threshold)
+            expected_times.append(expected.get(display_type, float('inf')))
 
         valid_data = [(t, et) for t, et in zip(thresholds, expected_times) if et != float('inf')]
         if not valid_data:
@@ -740,7 +832,7 @@ def plot_expected_time_by_threshold(
             marker='o',
             linewidth=2,
             markersize=6,
-            label=f'{display_type} ({time_per_attempt:.2f}s/attempt)',
+            label=f'{display_type} (mean: {stats["observed_tts"]:.1f}s, floor: {stats["min_tts"]:.1f}s)',
             color=color
         )
 
@@ -773,8 +865,16 @@ def plot_nonces_per_block(
     topology_info: str,
     output_file: str = 'nonces_per_block.png'
 ):
-    """Plot histogram of nonces per block for each miner type."""
-    fig, ax = plt.subplots(figsize=(12, 7))
+    """Plot nonces per block with summary bar chart and distribution histograms."""
+    # Get the threshold used for mining (from the data)
+    threshold = df['threshold'].iloc[0] if 'threshold' in df.columns else None
+
+    # Create figure with 2 rows: bar chart on top, 3 histograms below
+    fig = plt.figure(figsize=(14, 10), constrained_layout=True)
+    gs = fig.add_gridspec(2, 3, height_ratios=[1, 1], hspace=0.15, wspace=0.15)
+
+    # Top row spans all 3 columns for the bar chart
+    ax_bar = fig.add_subplot(gs[0, :])
 
     colors = {
         'CPU': '#e74c3c',
@@ -810,24 +910,35 @@ def plot_nonces_per_block(
     miner_types = sorted(nonces_data.keys())
     positions = np.arange(len(miner_types))
 
+    # Calculate stats including skewness
+    from scipy import stats as scipy_stats
+
     stats_data = []
     for miner_type in miner_types:
         nonces = nonces_data[miner_type]
         if nonces:
+            arr = np.array(nonces)
+            skewness = scipy_stats.skew(arr)
             stats_data.append({
-                'mean': np.mean(nonces),
-                'median': np.median(nonces),
-                'min': np.min(nonces),
-                'max': np.max(nonces),
-                'std': np.std(nonces)
+                'mean': np.mean(arr),
+                'median': np.median(arr),
+                'min': np.min(arr),
+                'max': np.max(arr),
+                'std': np.std(arr),
+                'skew': skewness,
+                'p25': np.percentile(arr, 25),
+                'p75': np.percentile(arr, 75),
+                'p95': np.percentile(arr, 95)
             })
         else:
             stats_data.append({
-                'mean': 0, 'median': 0, 'min': 0, 'max': 0, 'std': 0
+                'mean': 0, 'median': 0, 'min': 0, 'max': 0, 'std': 0,
+                'skew': 0, 'p25': 0, 'p75': 0, 'p95': 0
             })
 
+    # ---- Top chart: Bar chart with summary stats ----
     means = [s['mean'] for s in stats_data]
-    bars = ax.bar(
+    bars = ax_bar.bar(
         positions,
         means,
         color=[colors.get(mt, '#95a5a6') for mt in miner_types],
@@ -836,38 +947,84 @@ def plot_nonces_per_block(
         linewidth=1.5
     )
 
-    stds = [s['std'] for s in stats_data]
-    ax.errorbar(
+    # Use asymmetric error bars - can't go below 1 nonce
+    lower_errors = [min(s['std'], s['mean'] - 1) for s in stats_data]  # Clamp at 1
+    upper_errors = [s['std'] for s in stats_data]
+    ax_bar.errorbar(
         positions,
         means,
-        yerr=stds,
+        yerr=[lower_errors, upper_errors],
         fmt='none',
         ecolor='black',
         capsize=5,
         capthick=2
     )
 
-    for i, (bar, stat) in enumerate(zip(bars, stats_data)):
+    for i, (bar, stat, mt) in enumerate(zip(bars, stats_data, miner_types)):
         height = bar.get_height()
-        ax.text(
+        # Position text above the error bar
+        text_y = height + stat['std'] + 0.5
+        ax_bar.text(
             bar.get_x() + bar.get_width() / 2,
-            height,
-            f"{stat['mean']:.1f}\n({stat['std']:.1f})",
+            text_y,
+            f"μ={stat['mean']:.1f}, med={stat['median']:.0f}\nskew={stat['skew']:.2f}",
             ha='center',
             va='bottom',
-            fontsize=10,
+            fontsize=9,
             fontweight='bold'
         )
 
-    ax.set_xlabel('Miner Type', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Average Nonces per Block', fontsize=12, fontweight='bold')
-    ax.set_title(f'Nonces Required to Mine a Block\n{topology_info}', fontsize=14, fontweight='bold')
-    ax.set_xticks(positions)
+    ax_bar.set_xlabel('Miner Type', fontsize=12, fontweight='bold')
+    ax_bar.set_ylabel('Average Nonces per Block', fontsize=12, fontweight='bold')
+    threshold_str = f' (threshold: {threshold:.0f})' if threshold else ''
+    ax_bar.set_title(f'Nonces Required to Mine a Block{threshold_str}\n{topology_info}', fontsize=14, fontweight='bold')
+    ax_bar.set_xticks(positions)
     labels_with_counts = [f'{mt}\n(n={block_counts.get(mt, 0):,} blocks)' for mt in miner_types]
-    ax.set_xticklabels(labels_with_counts, fontsize=11)
-    ax.grid(True, alpha=0.3, axis='y')
+    ax_bar.set_xticklabels(labels_with_counts, fontsize=11)
+    ax_bar.grid(True, alpha=0.3, axis='y')
 
-    plt.tight_layout()
+    # ---- Bottom row: Distribution histograms ----
+    # Ensure consistent order: CPU, GPU, QPU
+    ordered_types = ['CPU', 'GPU', 'QPU']
+    for i, mt in enumerate(ordered_types):
+        ax_hist = fig.add_subplot(gs[1, i])
+
+        if mt in nonces_data and nonces_data[mt]:
+            nonces = np.array(nonces_data[mt])
+            stat = stats_data[miner_types.index(mt)] if mt in miner_types else None
+
+            # Use log-spaced bins for skewed data
+            max_val = min(np.max(nonces), np.percentile(nonces, 99))
+            bins = np.arange(1, max_val + 2)  # Integer bins
+
+            ax_hist.hist(
+                nonces,
+                bins=bins,
+                color=colors.get(mt, '#95a5a6'),
+                alpha=0.7,
+                edgecolor='black',
+                linewidth=0.5
+            )
+
+            # Add vertical lines for mean and median
+            ax_hist.axvline(stat['mean'], color='red', linestyle='--', linewidth=2, label=f'Mean: {stat["mean"]:.1f}')
+            ax_hist.axvline(stat['median'], color='blue', linestyle='-', linewidth=2, label=f'Median: {stat["median"]:.0f}')
+
+            # Add percentile info
+            ax_hist.axvline(stat['p95'], color='orange', linestyle=':', linewidth=1.5, label=f'p95: {stat["p95"]:.0f}')
+
+            ax_hist.set_xlabel('Nonces per Block', fontsize=10)
+            ax_hist.set_ylabel('Frequency', fontsize=10)
+            ax_hist.set_title(f'{mt} Distribution\n(skew={stat["skew"]:.2f})', fontsize=11, fontweight='bold')
+            ax_hist.legend(fontsize=8, loc='upper right')
+            ax_hist.grid(True, alpha=0.3, axis='y')
+
+            # Limit x-axis to show most of the data clearly
+            ax_hist.set_xlim(0, stat['p95'] * 1.5)
+        else:
+            ax_hist.text(0.5, 0.5, f'No {mt} data', ha='center', va='center', transform=ax_hist.transAxes)
+            ax_hist.set_title(f'{mt} Distribution', fontsize=11, fontweight='bold')
+
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     print(f"Saved nonces per block chart to {output_file}")
 
@@ -976,10 +1133,10 @@ Examples:
         str(args.output_dir / 'threshold_probabilities.png')
     )
 
-    # Chart 2: Blocks by threshold
-    plot_blocks_by_threshold(
+    # Chart 2: Nonces by threshold
+    plot_nonces_by_threshold(
         df, thresholds, topology_desc, num_nodes, num_edges,
-        str(args.output_dir / 'blocks_by_threshold.png')
+        str(args.output_dir / 'nonces_by_threshold.png')
     )
 
     # Chart 3: Proportion by threshold
@@ -992,28 +1149,20 @@ Examples:
     plot_win_rate_by_threshold(
         df, thresholds, topology_desc, num_nodes, num_edges,
         str(args.output_dir / 'win_rate_by_threshold.png'),
-        include_qpurt=False
     )
 
-    # Chart 4b: Win rate with QPURT (actual device counts only)
-    plot_win_rate_by_threshold(
-        df, thresholds, topology_desc, num_nodes, num_edges,
-        str(args.output_dir / 'win_rate_by_threshold_qpurt.png'),
-        include_qpurt=True
-    )
-
-    # Chart 4c: Win rate projection (with 2^X device counts)
+    # Chart 4b: Win rate projection - standard (CPU 2^20, GPU 2^15)
     plot_win_rate_by_threshold_projection(
         df, thresholds, topology_desc, num_nodes, num_edges,
         str(args.output_dir / 'win_rate_by_threshold_projection.png'),
-        include_qpurt=False
+        projection_config='standard'
     )
 
-    # Chart 4d: Win rate projection with QPURT
+    # Chart 4c: Win rate projection - extreme (CPU 2^40, GPU 2^20)
     plot_win_rate_by_threshold_projection(
         df, thresholds, topology_desc, num_nodes, num_edges,
-        str(args.output_dir / 'win_rate_by_threshold_projection_qpurt.png'),
-        include_qpurt=True
+        str(args.output_dir / 'win_rate_by_threshold_extreme_projection.png'),
+        projection_config='extreme'
     )
 
     # Chart 5: Expected time

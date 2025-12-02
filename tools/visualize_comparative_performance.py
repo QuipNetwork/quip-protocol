@@ -27,7 +27,8 @@ import pandas as pd
 
 def load_mining_csv(filepath: str) -> pd.DataFrame:
     """Load mining data CSV into DataFrame."""
-    df = pd.read_csv(filepath, parse_dates=['start_time', 'end_time'])
+    # start_time/end_time are relative offsets (seconds from machine's test start)
+    df = pd.read_csv(filepath)
     return df
 
 
@@ -39,11 +40,60 @@ def normalize_miner_type(miner_type: str) -> str:
     return miner_type.upper()
 
 
+def get_device_counts(df: pd.DataFrame) -> dict:
+    """
+    Count actual devices per miner type from the data.
+
+    For GPU/CUDA: count unique (miner_machine, process) pairs = number of GPUs
+    For CPU: count unique (miner_machine, process) pairs = number of CPU workers
+    For QPU: count unique miner_machine = number of QPUs
+    """
+    counts = {}
+
+    for miner_type in df['miner_type'].unique():
+        display_type = normalize_miner_type(miner_type)
+        miner_df = df[df['miner_type'] == miner_type]
+
+        if miner_type == 'qpu':
+            # QPU: count unique machines
+            count = miner_df['miner_machine'].nunique()
+        else:
+            # CPU/GPU: count unique (machine, process) pairs
+            count = miner_df.groupby(['miner_machine', 'process']).ngroups
+
+        counts[display_type] = count
+
+    return counts
+
+
+def get_normalization_units(device_counts: dict) -> dict:
+    """
+    Get normalization units for each miner type.
+    CPU: per 32 cores, GPU: per GPU, QPU: per QPU
+    """
+    units = {}
+    for display_type, count in device_counts.items():
+        if display_type == 'CPU':
+            # Normalize to 32-core units (each worker is ~1 core)
+            units[display_type] = count / 32
+        else:
+            units[display_type] = count
+    return units
+
+
+def get_normalization_single_unit(device_counts: dict) -> dict:
+    """
+    Get normalization units for single device comparison.
+    All types normalized per device/worker for fair comparison.
+    """
+    return device_counts.copy()
+
+
 def plot_blocks_vs_time(ax, df: pd.DataFrame):
-    """Plot cumulative blocks found vs time."""
-    ax.set_title('Blocks Mined Over Time', fontsize=14, fontweight='bold')
+    """Plot cumulative blocks mined vs wall-clock time, normalized per single unit."""
+    ax.set_title('Blocks Mined Over Time in Isolation (Per Single Unit)', fontsize=14, fontweight='bold')
     ax.set_xlabel('Time (minutes)', fontsize=12)
-    ax.set_ylabel('Cumulative Blocks Found', fontsize=12)
+    ax.set_ylabel('Cumulative Blocks per Unit', fontsize=12)
     ax.grid(True, alpha=0.3)
 
     colors = {
@@ -52,8 +102,16 @@ def plot_blocks_vs_time(ax, df: pd.DataFrame):
         'QPU': '#2ecc71'
     }
 
-    # Get successful blocks only
+    # Get device counts for normalization (per single worker/GPU/QPU)
+    device_counts = get_device_counts(df)
+    norm_units = get_normalization_single_unit(device_counts)
+
+    # Get successful blocks only - first valid block per attempt
+    # (same machine, process, start_time = same mining attempt/SA run)
     successful_df = df[df['valid'] > 0].copy()
+    successful_df = successful_df.sort_values('end_time').groupby(
+        ['miner_type', 'miner_machine', 'process', 'start_time']
+    ).first().reset_index()
 
     for miner_type in successful_df['miner_type'].unique():
         display_type = normalize_miner_type(miner_type)
@@ -62,17 +120,33 @@ def plot_blocks_vs_time(ax, df: pd.DataFrame):
         if len(miner_df) == 0:
             continue
 
-        # Calculate relative time from first block
-        first_time = miner_df['end_time'].min()
-        relative_times = (miner_df['end_time'] - first_time).dt.total_seconds() / 60.0  # minutes
-        cumulative_blocks = np.arange(1, len(miner_df) + 1)
+        # Get normalization factor
+        units = norm_units.get(display_type, 1)
+        if units <= 0:
+            units = 1
+
+        # end_time is now relative offset (seconds from each machine's test start)
+        times_minutes = miner_df['end_time'].values / 60.0
+        cumulative_blocks = np.arange(1, len(miner_df) + 1) / units  # Normalize
+
+        # Add starting point at (0, 0)
+        times_minutes = np.concatenate([[0], times_minutes])
+        cumulative_blocks = np.concatenate([[0], cumulative_blocks])
+
+        # Create label
+        if display_type == 'CPU':
+            display_name = "CPU"
+        elif display_type == 'GPU':
+            display_name = "GPU"
+        else:
+            display_name = "QPU"
 
         ax.plot(
-            relative_times,
+            times_minutes,
             cumulative_blocks,
             marker='o',
             markersize=2,
-            label=f"{display_type} ({len(miner_df):,} blocks)",
+            label=f"{display_name} ({cumulative_blocks[-1]:.2f} blocks)",
             color=colors.get(display_type, 'gray'),
             linewidth=2,
             alpha=0.8
@@ -82,9 +156,9 @@ def plot_blocks_vs_time(ax, df: pd.DataFrame):
 
 
 def plot_mining_efficiency(ax, df: pd.DataFrame):
-    """Plot mining efficiency (blocks per minute)."""
-    ax.set_title('Mining Efficiency', fontsize=14, fontweight='bold')
-    ax.set_ylabel('Blocks per Minute', fontsize=12)
+    """Plot nonces evaluated per minute, normalized per unit."""
+    ax.set_title('Nonces Evaluated (Normalized per Unit)', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Nonces per Minute per Unit', fontsize=12)
     ax.grid(True, alpha=0.3, axis='y')
 
     colors = {
@@ -93,7 +167,9 @@ def plot_mining_efficiency(ax, df: pd.DataFrame):
         'QPU': '#2ecc71'
     }
 
-    successful_df = df[df['valid'] > 0]
+    # Get device counts for normalization
+    device_counts = get_device_counts(df)
+    norm_units = get_normalization_units(device_counts)
 
     miner_names = []
     rates = []
@@ -101,26 +177,40 @@ def plot_mining_efficiency(ax, df: pd.DataFrame):
 
     for miner_type in sorted(df['miner_type'].unique()):
         display_type = normalize_miner_type(miner_type)
-        miner_df = successful_df[successful_df['miner_type'] == miner_type]
+        miner_df = df[df['miner_type'] == miner_type]
 
         if len(miner_df) == 0:
             continue
 
-        # Calculate total time span
-        time_span_minutes = (miner_df['end_time'].max() - miner_df['start_time'].min()).total_seconds() / 60.0
-        blocks_found = len(miner_df)
+        # Get normalization factor
+        units = norm_units.get(display_type, 1)
+        if units <= 0:
+            units = 1
+
+        # Calculate total time span from all attempts
+        # start_time/end_time are already in seconds
+        time_span_minutes = (miner_df['end_time'].max() - miner_df['start_time'].min()) / 60.0
+        total_nonces = len(miner_df)
 
         if time_span_minutes > 0:
-            blocks_per_min = blocks_found / time_span_minutes
+            nonces_per_min = total_nonces / time_span_minutes / units
         else:
-            blocks_per_min = 0
+            nonces_per_min = 0
 
-        miner_names.append(display_type)
-        rates.append(blocks_per_min)
+        # Create label with unit info
+        if display_type == 'CPU':
+            display_name = "CPU (32c)"
+        elif display_type == 'GPU':
+            display_name = "GPU"
+        else:
+            display_name = "QPU"
+
+        miner_names.append(display_name)
+        rates.append(nonces_per_min)
         rate_colors.append(colors.get(display_type, 'gray'))
 
     if not rates:
-        ax.text(0.5, 0.5, 'No successful blocks', ha='center', va='center', transform=ax.transAxes)
+        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
         return
 
     bars = ax.bar(miner_names, rates, color=rate_colors, alpha=0.7, edgecolor='black')
@@ -131,7 +221,7 @@ def plot_mining_efficiency(ax, df: pd.DataFrame):
         ax.text(
             bar.get_x() + bar.get_width() / 2.0,
             height,
-            f'{rate:.2f}',
+            f'{rate:.1f}',
             ha='center',
             va='bottom',
             fontsize=10,
@@ -142,10 +232,10 @@ def plot_mining_efficiency(ax, df: pd.DataFrame):
 
 
 def plot_energy_distributions(ax, df: pd.DataFrame):
-    """Plot energy distribution histograms."""
-    ax.set_title('Energy Distribution (All Attempts)', fontsize=14, fontweight='bold')
+    """Plot energy distribution histograms normalized per unit."""
+    ax.set_title('Energy Distribution (Normalized per Unit)', fontsize=14, fontweight='bold')
     ax.set_xlabel('Energy', fontsize=12)
-    ax.set_ylabel('Frequency', fontsize=12)
+    ax.set_ylabel('Frequency per Unit', fontsize=12)
     ax.grid(True, alpha=0.3, axis='y')
 
     colors = {
@@ -153,6 +243,10 @@ def plot_energy_distributions(ax, df: pd.DataFrame):
         'GPU': '#3498db',
         'QPU': '#2ecc71'
     }
+
+    # Get device counts for normalization
+    device_counts = get_device_counts(df)
+    norm_units = get_normalization_units(device_counts)
 
     all_energies = df['energy'].values
     if len(all_energies) == 0:
@@ -166,12 +260,29 @@ def plot_energy_distributions(ax, df: pd.DataFrame):
         miner_df = df[df['miner_type'] == miner_type]
         energies = miner_df['energy'].values
 
+        # Get normalization factor
+        units = norm_units.get(display_type, 1)
+        if units <= 0:
+            units = 1
+
         if len(energies) > 0:
+            # Create label with unit info
+            if display_type == 'CPU':
+                display_name = "CPU (32c)"
+            elif display_type == 'GPU':
+                display_name = "GPU"
+            else:
+                display_name = "QPU"
+
+            # Use weights to normalize the histogram
+            weights = np.ones(len(energies)) / units
+
             ax.hist(
                 energies,
                 bins=bins,
+                weights=weights,
                 alpha=0.5,
-                label=f"{display_type} (n={len(energies):,}, mean={np.mean(energies):.0f})",
+                label=f"{display_name} (nonces={len(energies)/units:.0f})",
                 color=colors.get(display_type, 'gray'),
                 edgecolor='black',
                 linewidth=0.5
@@ -181,10 +292,10 @@ def plot_energy_distributions(ax, df: pd.DataFrame):
 
 
 def plot_time_to_solution(ax, df: pd.DataFrame):
-    """Plot time to solution distribution with variance statistics."""
-    ax.set_title('Time to Solution (Successful Blocks)', fontsize=14, fontweight='bold')
+    """Plot time to solution distribution normalized per unit."""
+    ax.set_title('Time to Solution (Normalized per Unit)', fontsize=14, fontweight='bold')
     ax.set_xlabel('Time (seconds)', fontsize=12)
-    ax.set_ylabel('Frequency', fontsize=12)
+    ax.set_ylabel('Frequency per Unit', fontsize=12)
     ax.grid(True, alpha=0.3, axis='y')
 
     colors = {
@@ -193,28 +304,59 @@ def plot_time_to_solution(ax, df: pd.DataFrame):
         'QPU': '#2ecc71'
     }
 
+    # Get device counts for normalization
+    device_counts = get_device_counts(df)
+    norm_units = get_normalization_units(device_counts)
+
     # Only successful attempts
     successful_df = df[(df['valid'] > 0) & (df['time_to_solution'] > 0)]
+
+    # Fixed bins: 0 to 1000s in 30s intervals
+    max_tts = 1000
+    bin_size = 30
+    bins = np.arange(0, max_tts + bin_size, bin_size)
 
     for miner_type in df['miner_type'].unique():
         display_type = normalize_miner_type(miner_type)
         miner_df = successful_df[successful_df['miner_type'] == miner_type]
         tts = miner_df['time_to_solution'].values
 
+        # Get normalization factor
+        units = norm_units.get(display_type, 1)
+        if units <= 0:
+            units = 1
+
         if len(tts) > 0:
             mean_tts = np.mean(tts)
             std_tts = np.std(tts)
             cv = std_tts / mean_tts if mean_tts > 0 else 0
+
+            # Clip TTS values at max for histogram (values > max go in last bin)
+            tts_clipped = np.clip(tts, 0, max_tts)
+
+            # Create label with unit info
+            if display_type == 'CPU':
+                display_name = "CPU (32c)"
+            elif display_type == 'GPU':
+                display_name = "GPU"
+            else:
+                display_name = "QPU"
+
+            # Use weights to normalize the histogram
+            weights = np.ones(len(tts_clipped)) / units
+
             ax.hist(
-                tts,
-                bins=30,
+                tts_clipped,
+                bins=bins,
+                weights=weights,
                 alpha=0.5,
-                label=f"{display_type} (μ={mean_tts:.1f}s, σ={std_tts:.1f}s, CV={cv:.2f})",
+                label=f"{display_name} (μ={mean_tts:.1f}s, CV={cv:.2f})",
                 color=colors.get(display_type, 'gray'),
                 edgecolor='black',
                 linewidth=0.5
             )
 
+    ax.set_xlim(0, max_tts)
     ax.legend(fontsize=9)
 
 
@@ -280,8 +422,8 @@ def plot_cpu_model_breakdown(ax, df: pd.DataFrame):
 
 
 def plot_speedup_vs_cpu(ax, df: pd.DataFrame):
-    """Plot speedup relative to CPU baseline."""
-    ax.set_title('Speedup vs CPU Baseline', fontsize=14, fontweight='bold')
+    """Plot speedup relative to CPU baseline (nonces per minute per unit)."""
+    ax.set_title('Speedup vs CPU Baseline (Nonces/min per Unit)', fontsize=14, fontweight='bold')
     ax.set_ylabel('Speedup Factor', fontsize=12)
     ax.grid(True, alpha=0.3, axis='y')
 
@@ -291,16 +433,23 @@ def plot_speedup_vs_cpu(ax, df: pd.DataFrame):
         'QPU': '#2ecc71'
     }
 
-    successful_df = df[df['valid'] > 0]
+    # Get device counts for normalization
+    device_counts = get_device_counts(df)
+    norm_units = get_normalization_units(device_counts)
 
-    # Calculate CPU baseline rate
-    cpu_df = successful_df[successful_df['miner_type'] == 'cpu']
+    # Calculate CPU baseline rate (nonces per minute per 32-core unit)
+    cpu_df = df[df['miner_type'] == 'cpu']
     if len(cpu_df) == 0:
         ax.text(0.5, 0.5, 'No CPU baseline available', ha='center', va='center', transform=ax.transAxes)
         return
 
-    cpu_time_span = (cpu_df['end_time'].max() - cpu_df['start_time'].min()).total_seconds() / 60.0
-    cpu_rate = len(cpu_df) / cpu_time_span if cpu_time_span > 0 else 0
+    cpu_units = norm_units.get('CPU', 1)
+    if cpu_units <= 0:
+        cpu_units = 1
+
+    # start_time/end_time are already in seconds
+    cpu_time_span = (cpu_df['end_time'].max() - cpu_df['start_time'].min()) / 60.0
+    cpu_rate = len(cpu_df) / cpu_time_span / cpu_units if cpu_time_span > 0 else 0
 
     if cpu_rate == 0:
         ax.text(0.5, 0.5, 'CPU rate is zero', ha='center', va='center', transform=ax.transAxes)
@@ -315,17 +464,29 @@ def plot_speedup_vs_cpu(ax, df: pd.DataFrame):
             continue
 
         display_type = normalize_miner_type(miner_type)
-        miner_df = successful_df[successful_df['miner_type'] == miner_type]
+        miner_df = df[df['miner_type'] == miner_type]
 
         if len(miner_df) == 0:
             continue
 
-        time_span = (miner_df['end_time'].max() - miner_df['start_time'].min()).total_seconds() / 60.0
-        miner_rate = len(miner_df) / time_span if time_span > 0 else 0
+        # Get normalization factor
+        units = norm_units.get(display_type, 1)
+        if units <= 0:
+            units = 1
+
+        time_span = (miner_df['end_time'].max() - miner_df['start_time'].min()) / 60.0
+        miner_rate = len(miner_df) / time_span / units if time_span > 0 else 0
 
         if miner_rate > 0:
             speedup = miner_rate / cpu_rate
-            miner_names.append(display_type)
+
+            # Create label with unit info
+            if display_type == 'GPU':
+                display_name = "GPU"
+            else:
+                display_name = "QPU"
+
+            miner_names.append(display_name)
             speedups.append(speedup)
             speedup_colors.append(colors.get(display_type, 'gray'))
 
@@ -349,7 +510,7 @@ def plot_speedup_vs_cpu(ax, df: pd.DataFrame):
         )
 
     # Add reference line at 1x (CPU baseline)
-    ax.axhline(y=1.0, color='red', linestyle='--', alpha=0.5, label='CPU baseline (1x)')
+    ax.axhline(y=1.0, color='red', linestyle='--', alpha=0.5, label='CPU (32c) baseline (1x)')
     ax.legend(fontsize=10)
     ax.set_xlabel('Miner Type', fontsize=12)
 
@@ -380,7 +541,7 @@ def generate_summary(df: pd.DataFrame) -> str:
 
         # Calculate rate
         if len(miner_successful) > 0:
-            time_span = (miner_successful['end_time'].max() - miner_successful['start_time'].min()).total_seconds() / 60.0
+            time_span = (miner_successful['end_time'].max() - miner_successful['start_time'].min()) / 60.0
             blocks_per_min = successful_blocks / time_span if time_span > 0 else 0
 
             if miner_type == 'cpu':
@@ -421,7 +582,7 @@ def generate_summary(df: pd.DataFrame) -> str:
             miner_successful = successful_df[successful_df['miner_type'] == miner_type]
 
             if len(miner_successful) > 0:
-                time_span = (miner_successful['end_time'].max() - miner_successful['start_time'].min()).total_seconds() / 60.0
+                time_span = (miner_successful['end_time'].max() - miner_successful['start_time'].min()) / 60.0
                 miner_rate = len(miner_successful) / time_span if time_span > 0 else 0
 
                 if miner_rate > 0:

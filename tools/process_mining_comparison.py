@@ -325,11 +325,33 @@ Examples:
     # Sort by miner_machine, process, start_time
     all_records.sort(key=lambda r: (r['miner_machine'], r['process'], r['start_time']))
 
+    # Normalize start_time and end_time to be offsets from each machine's test start
+    # (tests ran at different times on different machines)
+    print("\nNormalizing timestamps to relative offsets per machine...")
+    machine_start_times = {}
+    for record in all_records:
+        machine = record['miner_machine']
+        start_dt = datetime.strptime(record['start_time'], '%Y-%m-%d %H:%M:%S.%f')
+        if machine not in machine_start_times or start_dt < machine_start_times[machine]:
+            machine_start_times[machine] = start_dt
+
+    for record in all_records:
+        machine = record['miner_machine']
+        base_time = machine_start_times[machine]
+        start_dt = datetime.strptime(record['start_time'], '%Y-%m-%d %H:%M:%S.%f')
+        end_dt = datetime.strptime(record['end_time'], '%Y-%m-%d %H:%M:%S.%f')
+        # Keep absolute times and add relative offsets
+        record['absolute_start_time'] = record['start_time']
+        record['absolute_end_time'] = record['end_time']
+        # Relative offsets (seconds from machine's test start)
+        record['start_time'] = round((start_dt - base_time).total_seconds(), 3)
+        record['end_time'] = round((end_dt - base_time).total_seconds(), 3)
+
     # Write CSV
     fieldnames = [
         'miner_machine', 'miner_type', 'model', 'process', 'block_num',
-        'start_time', 'end_time', 'time_to_solution', 'energy',
-        'valid', 'diversity', 'threshold'
+        'start_time', 'end_time', 'absolute_start_time', 'absolute_end_time',
+        'time_to_solution', 'energy', 'valid', 'diversity', 'threshold'
     ]
 
     with open(args.output, 'w', newline='') as f:
