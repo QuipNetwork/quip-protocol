@@ -676,7 +676,7 @@ def plot_win_rate_by_threshold_projection(
     Plot probability of winning the mining race with projected device counts.
 
     Args:
-        projection_config: 'standard' for CPU 2^20 + GPU 2^15,
+        projection_config: 'standard' for CPU 2^20 + GPU 2^10,
                           'extreme' for CPU 2^40 + GPU 2^20
     """
     plt.figure(figsize=(12, 7))
@@ -1123,7 +1123,7 @@ Examples:
         n_simulations=args.mc_sims,
     )
 
-    # Chart 4b: Win rate projection - standard (CPU 2^20, GPU 2^15)
+    # Chart 4b: Win rate projection - standard (CPU 2^20, GPU 2^10)
     plot_win_rate_by_threshold_projection(
         df, thresholds, topology_desc, num_nodes, num_edges,
         str(args.output_dir / 'win_rate_by_threshold_projection.png'),
