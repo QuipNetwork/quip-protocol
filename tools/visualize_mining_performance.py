@@ -3,19 +3,18 @@
 Visualize mining performance across different miner types (CPU/GPU/QPU).
 
 Reads structured CSV data from process_mining_comparison.py and generates
-six analysis charts:
+analysis charts (8 PNG files total):
 
-1. Probability of Nonce Meeting Threshold - Shows probability that a random nonce
-   meets various difficulty thresholds for each miner type
-2. Blocks by Threshold - Shows cumulative blocks mined at each threshold
-3. Proportion by Threshold - Shows percentage of nonces that would mine at each
-   threshold (normalized to proportion of blocks)
-4. Win Rate by Threshold - Shows probability of winning the mining race at each
-   difficulty level, accounting for different attempt rates
-5. Expected Time by Threshold - Shows expected time to mine a block at each
-   threshold, directly comparing mining performance between platforms
-6. Nonces per Block - Histogram showing distribution of nonces required to mine
-   a block for each miner type
+1. Threshold Probabilities - Probability that a random nonce meets various
+   difficulty thresholds for each miner type
+2. Nonces by Threshold - Cumulative nonces meeting each threshold (normalized)
+3. Proportion by Threshold - Percentage of nonces meeting each threshold
+4. Win Rate Charts (3 files):
+   - Actual device counts
+   - Standard projection (CPU 2^20, GPU 2^10)
+   - Extreme projection (CPU 2^40, GPU 2^20)
+5. Expected Time by Threshold - Expected time to mine a block at each threshold
+6. Nonces per Block - Distribution of nonces required to mine a block
 
 Usage:
     python tools/visualize_mining_performance.py mining_data.csv --output-dir charts/
@@ -24,16 +23,72 @@ Usage:
 import argparse
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy import stats as scipy_stats
+
+# Standard color scheme for miner types
+MINER_COLORS = {
+    'CPU': '#e74c3c',
+    'GPU': '#3498db',
+    'QPU': '#2ecc71',
+}
+
+
+def _add_difficulty_annotations(
+    ax: plt.Axes,
+    num_nodes: Optional[int],
+    num_edges: Optional[int]
+) -> None:
+    """Add difficulty annotations to x-axis tick labels.
+
+    Converts energy values to difficulty scores and appends them to tick labels.
+    Silently skips if energy_utils module is not available.
+    """
+    if not num_nodes or not num_edges:
+        return
+
+    try:
+        from shared.energy_utils import energy_to_difficulty
+        xticks = ax.get_xticks()
+        new_labels = []
+        for energy in xticks:
+            difficulty = energy_to_difficulty(energy, num_nodes, num_edges)
+            new_labels.append(f'{energy:.0f}\n({difficulty:.2f})')
+        ax.set_xticks(xticks)
+        ax.set_xticklabels(new_labels)
+    except ImportError:
+        if not getattr(_add_difficulty_annotations, '_import_warned', False):
+            print("Note: Difficulty annotations disabled (shared.energy_utils not available)",
+                  file=sys.stderr)
+            _add_difficulty_annotations._import_warned = True
 
 
 def load_mining_csv(filepath: str) -> pd.DataFrame:
-    """Load mining data CSV into DataFrame."""
-    df = pd.read_csv(filepath, parse_dates=['start_time', 'end_time'])
+    """Load mining data CSV into DataFrame.
+
+    Required columns: miner_type, energy, valid, miner_machine, process,
+                      threshold, start_time, end_time, time_to_solution
+    """
+    df = pd.read_csv(filepath)
+
+    # Validate required columns
+    required_columns = {
+        'miner_type', 'energy', 'valid', 'miner_machine', 'process',
+        'threshold', 'start_time', 'end_time', 'time_to_solution'
+    }
+    missing = required_columns - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV missing required columns: {', '.join(sorted(missing))}")
+
+    # Parse date columns if present
+    for col in ['start_time', 'end_time']:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+
     return df
 
 
@@ -43,6 +98,14 @@ def normalize_miner_type(miner_type: str) -> str:
     if miner_type == 'cuda':
         return 'GPU'
     return miner_type.upper()
+
+
+def get_miner_groups(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Pre-group DataFrame by miner_type for efficiency.
+
+    Returns a dict mapping raw miner_type strings to their DataFrames.
+    """
+    return {miner_type: group for miner_type, group in df.groupby('miner_type')}
 
 
 def calculate_threshold_probabilities(
@@ -85,12 +148,6 @@ def plot_threshold_probabilities(
     """Plot probability of nonce meeting threshold for each miner type."""
     plt.figure(figsize=(12, 7))
 
-    colors = {
-        'CPU': '#e74c3c',
-        'GPU': '#3498db',
-        'QPU': '#2ecc71'
-    }
-
     for miner_type in df['miner_type'].unique():
         display_type = normalize_miner_type(miner_type)
         miner_df = df[df['miner_type'] == miner_type]
@@ -98,7 +155,7 @@ def plot_threshold_probabilities(
 
         probabilities = calculate_threshold_probabilities(energies, thresholds)
 
-        color = colors.get(display_type, '#95a5a6')
+        color = MINER_COLORS.get(display_type, '#95a5a6')
         n_attempts = len(energies)
 
         plt.plot(
@@ -118,20 +175,7 @@ def plot_threshold_probabilities(
     plt.grid(True, alpha=0.3)
     plt.gca().invert_xaxis()
 
-    # Add difficulty annotations if possible
-    if num_nodes and num_edges:
-        try:
-            from shared.energy_utils import energy_to_difficulty
-            ax = plt.gca()
-            xticks = ax.get_xticks()
-            new_labels = []
-            for energy in xticks:
-                difficulty = energy_to_difficulty(energy, num_nodes, num_edges)
-                new_labels.append(f'{energy:.0f}\n({difficulty:.2f})')
-            ax.set_xticks(xticks)
-            ax.set_xticklabels(new_labels)
-        except ImportError:
-            pass
+    _add_difficulty_annotations(plt.gca(), num_nodes, num_edges)
 
     plt.tight_layout()
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
@@ -148,12 +192,6 @@ def plot_nonces_by_threshold(
 ):
     """Plot cumulative nonces meeting each threshold, normalized per unit."""
     plt.figure(figsize=(12, 7))
-
-    colors = {
-        'CPU': '#e74c3c',
-        'GPU': '#3498db',
-        'QPU': '#2ecc71'
-    }
 
     # Get device counts for normalization
     device_counts = get_device_counts(df)
@@ -185,7 +223,7 @@ def plot_nonces_by_threshold(
             nonces_per_unit = num_nonces / units if units > 0 else 0
             nonces_at_threshold.append(nonces_per_unit)
 
-        color = colors.get(display_type, '#95a5a6')
+        color = MINER_COLORS.get(display_type, '#95a5a6')
         # Get final nonce count for legend
         final_nonces = nonces_at_threshold[-1] if nonces_at_threshold else 0
         plt.plot(
@@ -204,19 +242,7 @@ def plot_nonces_by_threshold(
     plt.legend(fontsize=11)
     plt.grid(True, alpha=0.3)
 
-    if num_nodes and num_edges:
-        try:
-            from shared.energy_utils import energy_to_difficulty
-            ax = plt.gca()
-            xticks = ax.get_xticks()
-            new_labels = []
-            for energy in xticks:
-                difficulty = energy_to_difficulty(energy, num_nodes, num_edges)
-                new_labels.append(f'{energy:.0f}\n({difficulty:.2f})')
-            ax.set_xticks(xticks)
-            ax.set_xticklabels(new_labels)
-        except ImportError:
-            pass
+    _add_difficulty_annotations(plt.gca(), num_nodes, num_edges)
 
     plt.tight_layout()
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
@@ -234,12 +260,6 @@ def plot_proportion_by_threshold(
     """Plot percentage of nonces that would mine at each threshold."""
     plt.figure(figsize=(12, 7))
 
-    colors = {
-        'CPU': '#e74c3c',
-        'GPU': '#3498db',
-        'QPU': '#2ecc71'
-    }
-
     for miner_type in df['miner_type'].unique():
         display_type = normalize_miner_type(miner_type)
         miner_df = df[df['miner_type'] == miner_type]
@@ -252,7 +272,7 @@ def plot_proportion_by_threshold(
             proportion = (num_blocks / total_attempts) * 100
             proportions.append(proportion)
 
-        color = colors.get(display_type, '#95a5a6')
+        color = MINER_COLORS.get(display_type, '#95a5a6')
         plt.plot(
             thresholds,
             proportions,
@@ -269,40 +289,34 @@ def plot_proportion_by_threshold(
     plt.legend(fontsize=11)
     plt.grid(True, alpha=0.3)
 
-    if num_nodes and num_edges:
-        try:
-            from shared.energy_utils import energy_to_difficulty
-            ax = plt.gca()
-            xticks = ax.get_xticks()
-            new_labels = []
-            for energy in xticks:
-                difficulty = energy_to_difficulty(energy, num_nodes, num_edges)
-                new_labels.append(f'{energy:.0f}\n({difficulty:.2f})')
-            ax.set_xticks(xticks)
-            ax.set_xticklabels(new_labels)
-        except ImportError:
-            pass
+    _add_difficulty_annotations(plt.gca(), num_nodes, num_edges)
 
     plt.tight_layout()
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     print(f"Saved proportion by threshold chart to {output_file}")
 
 
-def get_device_counts(df: pd.DataFrame) -> dict:
+def get_device_counts(df: pd.DataFrame, miner_groups: Optional[Dict[str, pd.DataFrame]] = None) -> Dict[str, int]:
     """
     Count actual devices per miner type from the data.
 
     For GPU/CUDA: count unique (miner_machine, process) pairs = number of GPUs
     For CPU: count unique (miner_machine, process) pairs = number of CPU workers
     For QPU: count unique miner_machine = number of QPUs
+
+    Args:
+        df: DataFrame with mining data
+        miner_groups: Optional pre-grouped dict from get_miner_groups() for efficiency
     """
     counts = {}
 
-    for miner_type in df['miner_type'].unique():
-        display_type = normalize_miner_type(miner_type)
-        miner_df = df[df['miner_type'] == miner_type]
+    if miner_groups is None:
+        miner_groups = get_miner_groups(df)
 
-        if miner_type == 'qpu':
+    for miner_type, miner_df in miner_groups.items():
+        display_type = normalize_miner_type(miner_type)
+
+        if display_type == 'QPU':
             # QPU: count unique machines
             count = miner_df['miner_machine'].nunique()
         else:
@@ -314,7 +328,7 @@ def get_device_counts(df: pd.DataFrame) -> dict:
     return counts
 
 
-def get_miner_tts_stats(df: pd.DataFrame) -> dict:
+def get_miner_tts_stats(df: pd.DataFrame, miner_groups: Optional[Dict[str, pd.DataFrame]] = None) -> Dict[str, Dict[str, Any]]:
     """
     Calculate TTS (time-to-solution) statistics for each miner type.
 
@@ -329,14 +343,27 @@ def get_miner_tts_stats(df: pd.DataFrame) -> dict:
     - spinup_time: time to produce first nonce (floor for projections)
 
     This is used by both win rate calculations and expected time charts.
+
+    Args:
+        df: DataFrame with mining data
+        miner_groups: Optional pre-grouped dict from get_miner_groups() for efficiency
     """
-    device_counts = get_device_counts(df)
+    if miner_groups is None:
+        miner_groups = get_miner_groups(df)
+
+    device_counts = get_device_counts(df, miner_groups)
     stats = {}
 
-    for miner_type in df['miner_type'].unique():
+    for miner_type, miner_df in miner_groups.items():
         display_type = normalize_miner_type(miner_type)
-        miner_df = df[df['miner_type'] == miner_type]
         energies = miner_df['energy'].values
+
+        # Validate single threshold per miner type
+        if 'threshold' in miner_df.columns and miner_df['threshold'].nunique() > 1:
+            raise ValueError(
+                f"Multiple thresholds found for miner type '{miner_type}'. "
+                "This script requires single-threshold CSVs per miner type."
+            )
 
         # Get observed TTS from successful block mining
         successful_df = miner_df[miner_df['valid'] > 0]
@@ -361,7 +388,7 @@ def get_miner_tts_stats(df: pd.DataFrame) -> dict:
         spinup_time = min_tts
 
         # Probability of success at the actual threshold
-        actual_threshold = miner_df['threshold'].iloc[0] if 'threshold' in miner_df.columns else None
+        actual_threshold = miner_df['threshold'].iloc[0] if ('threshold' in miner_df.columns and len(miner_df) > 0) else None
         if actual_threshold is not None:
             p_actual = np.sum(energies <= actual_threshold) / len(energies) if len(energies) > 0 else 0
         else:
@@ -383,7 +410,7 @@ def get_miner_tts_stats(df: pd.DataFrame) -> dict:
     return stats
 
 
-def calculate_expected_tts(miner_stats: dict, threshold: float) -> dict:
+def calculate_expected_tts(miner_stats: Dict[str, Dict[str, Any]], threshold: float) -> Dict[str, float]:
     """
     Calculate expected TTS at a given threshold for all miner types.
 
@@ -418,13 +445,49 @@ def calculate_expected_tts(miner_stats: dict, threshold: float) -> dict:
     return expected
 
 
+def _run_monte_carlo_race(
+    scaled_params: Dict[str, Dict[str, Any]],
+    n_simulations: int = 10000
+) -> Dict[str, int]:
+    """Run Monte Carlo simulation to determine race winners.
+
+    Args:
+        scaled_params: Dict mapping config names to TTS distribution parameters
+            Each entry has: mean, std, floor, samples (optional), use_samples
+        n_simulations: Number of simulations to run
+
+    Returns:
+        Dict mapping config names to win counts
+    """
+    wins = {name: 0 for name in scaled_params.keys()}
+
+    for _ in range(n_simulations):
+        # Sample TTS for each miner
+        sampled_tts = {}
+        for name, params in scaled_params.items():
+            floor = params.get('floor', 0.001)
+            if params.get('use_samples') and params.get('samples') is not None:
+                # Sample from actual distribution, apply floor
+                sampled_tts[name] = max(floor, np.random.choice(params['samples']))
+            else:
+                # Sample from normal distribution, apply floor
+                sample = np.random.normal(params['mean'], params['std'])
+                sampled_tts[name] = max(floor, sample)
+
+        # Determine winner (lowest TTS)
+        winner = min(sampled_tts, key=sampled_tts.get)
+        wins[winner] += 1
+
+    return wins
+
+
 def _calculate_win_rates(
     df: pd.DataFrame,
     thresholds: List[float],
-    configurations: List[tuple],
+    configurations: List[Tuple[str, str, int]],
     debug: bool = False,
     n_simulations: int = 10000
-) -> tuple:
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, List[float]]]:
     """
     Calculate win rates using Monte Carlo simulation with actual TTS distributions.
 
@@ -463,26 +526,6 @@ def _calculate_win_rates(
         scaled_params = {}
 
         for config_name, miner_type, count in configurations:
-            # Handle QPURT (hypothetical real-time QPU without queue latency)
-            if miner_type == 'QPURT':
-                if 'QPU' not in miner_stats:
-                    continue
-                stats = miner_stats['QPU']
-                if len(stats['energies']) == 0:
-                    continue
-
-                p_threshold = np.sum(stats['energies'] <= threshold) / len(stats['energies'])
-                if p_threshold > 0 and stats['p_actual'] > 0:
-                    # QPURT: ~45ms per nonce, scale by probability
-                    scale = stats['p_actual'] / p_threshold
-                    # Very low variance for QPURT (network latency dominated)
-                    scaled_params[config_name] = {
-                        'mean': 0.045 * scale,
-                        'std': 0.01 * scale,  # Low variance
-                        'use_samples': False
-                    }
-                continue
-
             if miner_type not in miner_stats:
                 continue
 
@@ -529,25 +572,8 @@ def _calculate_win_rates(
                 win_rates[config_name].append(0.0)
             continue
 
-        # Monte Carlo simulation
-        wins = {name: 0 for name in scaled_params.keys()}
-
-        for _ in range(n_simulations):
-            # Sample TTS for each miner
-            sampled_tts = {}
-            for name, params in scaled_params.items():
-                floor = params.get('floor', 0.001)
-                if params.get('use_samples') and params.get('samples') is not None:
-                    # Sample from actual distribution, apply floor
-                    sampled_tts[name] = max(floor, np.random.choice(params['samples']))
-                else:
-                    # Sample from normal distribution, apply floor
-                    sample = np.random.normal(params['mean'], params['std'])
-                    sampled_tts[name] = max(floor, sample)
-
-            # Determine winner (lowest TTS)
-            winner = min(sampled_tts, key=sampled_tts.get)
-            wins[winner] += 1
+        # Run Monte Carlo simulation
+        wins = _run_monte_carlo_race(scaled_params, n_simulations)
 
         # Convert to win rates
         for config_name, _, _ in configurations:
@@ -574,7 +600,7 @@ def plot_win_rate_by_threshold(
     num_nodes: Optional[int] = None,
     num_edges: Optional[int] = None,
     output_file: str = 'win_rate_by_threshold.png',
-    include_qpurt: bool = False
+    n_simulations: int = 10000,
 ):
     """
     Plot probability of winning the mining race at each threshold.
@@ -583,13 +609,6 @@ def plot_win_rate_by_threshold(
     Labels show actual counts: "GPU (8 GPUs)", "CPU (32 CPUs)", "QPU (1)".
     """
     plt.figure(figsize=(12, 7))
-
-    base_colors = {
-        'CPU': '#e74c3c',
-        'GPU': '#3498db',
-        'QPU': '#2ecc71',
-        'QPURT': '#27ae60'
-    }
 
     # Get actual device counts
     device_counts = get_device_counts(df)
@@ -605,50 +624,31 @@ def plot_win_rate_by_threshold(
             label = f'CPU ({count} CPUs)'
         configurations.append((label, display_type, count))
 
-    if include_qpurt and 'QPU' in device_counts:
-        configurations.append(('QPURT', 'QPURT', device_counts['QPU']))
-
     # Calculate win rates with Monte Carlo simulation (uses observed variance)
-    _, win_rates = _calculate_win_rates(df, thresholds, configurations, debug=False)
+    _, win_rates = _calculate_win_rates(
+        df, thresholds, configurations, debug=False, n_simulations=n_simulations
+    )
 
     # Plot each configuration
     for config_name, miner_type, count in configurations:
         win_rate_data = win_rates[config_name]
-
-        if miner_type == 'QPURT':
-            color = base_colors.get('QPURT', '#27ae60')
-            style = {'linestyle': '--', 'marker': '*', 'linewidth': 2.5, 'alpha': 0.85}
-        else:
-            color = base_colors.get(miner_type, '#95a5a6')
-            style = {'linestyle': '-', 'marker': 'o', 'linewidth': 2, 'alpha': 0.9}
+        color = MINER_COLORS.get(miner_type, '#95a5a6')
 
         plt.plot(
             thresholds,
             [wr * 100 for wr in win_rate_data],
-            marker=style['marker'],
-            linewidth=style['linewidth'],
+            marker='o',
+            linewidth=2,
             markersize=6,
             label=config_name,
             color=color,
-            linestyle=style['linestyle'],
-            alpha=style['alpha']
+            linestyle='-',
+            alpha=0.9
         )
 
     plt.gca().invert_xaxis()
 
-    if num_nodes and num_edges:
-        try:
-            from shared.energy_utils import energy_to_difficulty
-            ax = plt.gca()
-            xticks = ax.get_xticks()
-            new_labels = []
-            for energy in xticks:
-                difficulty = energy_to_difficulty(energy, num_nodes, num_edges)
-                new_labels.append(f'{energy:.0f}\n({difficulty:.2f})')
-            ax.set_xticks(xticks)
-            ax.set_xticklabels(new_labels)
-        except ImportError:
-            pass
+    _add_difficulty_annotations(plt.gca(), num_nodes, num_edges)
 
     plt.xlabel('Easier                                                     Harder (More Negative Energy)', fontsize=12, fontweight='bold')
     plt.ylabel('Win Rate (%)', fontsize=12, fontweight='bold')
@@ -669,7 +669,8 @@ def plot_win_rate_by_threshold_projection(
     num_nodes: Optional[int] = None,
     num_edges: Optional[int] = None,
     output_file: str = 'win_rate_by_threshold_projection.png',
-    projection_config: str = 'standard'
+    projection_config: str = 'standard',
+    n_simulations: int = 10000,
 ):
     """
     Plot probability of winning the mining race with projected device counts.
@@ -679,13 +680,6 @@ def plot_win_rate_by_threshold_projection(
                           'extreme' for CPU 2^40 + GPU 2^20
     """
     plt.figure(figsize=(12, 7))
-
-    base_colors = {
-        'CPU': '#e74c3c',
-        'GPU': '#3498db',
-        'QPU': '#2ecc71',
-        'QPURT': '#27ae60'
-    }
 
     # Get actual device counts for base comparison
     device_counts = get_device_counts(df)
@@ -723,7 +717,7 @@ def plot_win_rate_by_threshold_projection(
             ])
 
     # Calculate win rates
-    _, win_rates = _calculate_win_rates(df, thresholds, configurations)
+    _, win_rates = _calculate_win_rates(df, thresholds, configurations, n_simulations=n_simulations)
 
     # Plot styles for projections
     style_map = {
@@ -735,13 +729,8 @@ def plot_win_rate_by_threshold_projection(
 
     for config_name, miner_type, count in configurations:
         win_rate_data = win_rates[config_name]
-
-        if miner_type == 'QPURT':
-            color = base_colors.get('QPURT', '#27ae60')
-            style = {'linestyle': '--', 'marker': '*', 'linewidth': 2.5, 'alpha': 0.85}
-        else:
-            color = base_colors.get(miner_type, '#95a5a6')
-            style = style_map.get(count, {'linestyle': '-', 'marker': 'o', 'linewidth': 2, 'alpha': 0.9})
+        color = MINER_COLORS.get(miner_type, '#95a5a6')
+        style = style_map.get(count, {'linestyle': '-', 'marker': 'o', 'linewidth': 2, 'alpha': 0.9})
 
         plt.plot(
             thresholds,
@@ -757,19 +746,7 @@ def plot_win_rate_by_threshold_projection(
 
     plt.gca().invert_xaxis()
 
-    if num_nodes and num_edges:
-        try:
-            from shared.energy_utils import energy_to_difficulty
-            ax = plt.gca()
-            xticks = ax.get_xticks()
-            new_labels = []
-            for energy in xticks:
-                difficulty = energy_to_difficulty(energy, num_nodes, num_edges)
-                new_labels.append(f'{energy:.0f}\n({difficulty:.2f})')
-            ax.set_xticks(xticks)
-            ax.set_xticklabels(new_labels)
-        except ImportError:
-            pass
+    _add_difficulty_annotations(plt.gca(), num_nodes, num_edges)
 
     plt.xlabel('Easier                                                     Harder (More Negative Energy)', fontsize=12, fontweight='bold')
     plt.ylabel('Win Rate (%)', fontsize=12, fontweight='bold')
@@ -792,19 +769,7 @@ def plot_expected_time_by_threshold(
     output_file: str = 'expected_time_by_threshold.png'
 ):
     """Plot expected time to mine a block at each threshold."""
-    try:
-        from shared.energy_utils import energy_to_difficulty
-        has_difficulty_fn = True
-    except ImportError:
-        has_difficulty_fn = False
-
     plt.figure(figsize=(12, 7))
-
-    colors = {
-        'CPU': '#e74c3c',
-        'GPU': '#3498db',
-        'QPU': '#2ecc71'
-    }
 
     # Get TTS stats using shared function
     miner_stats = get_miner_tts_stats(df)
@@ -825,7 +790,7 @@ def plot_expected_time_by_threshold(
 
         valid_thresholds, valid_times = zip(*valid_data)
 
-        color = colors.get(display_type, '#95a5a6')
+        color = MINER_COLORS.get(display_type, '#95a5a6')
         plt.plot(
             valid_thresholds,
             valid_times,
@@ -838,15 +803,7 @@ def plot_expected_time_by_threshold(
 
     plt.gca().invert_xaxis()
 
-    if has_difficulty_fn and num_nodes and num_edges:
-        ax = plt.gca()
-        xticks = ax.get_xticks()
-        new_labels = []
-        for energy in xticks:
-            difficulty = energy_to_difficulty(energy, num_nodes, num_edges)
-            new_labels.append(f'{energy:.0f}\n({difficulty:.2f})')
-        ax.set_xticks(xticks)
-        ax.set_xticklabels(new_labels)
+    _add_difficulty_annotations(plt.gca(), num_nodes, num_edges)
 
     plt.xlabel('Easier                                                     Harder (More Negative Energy)', fontsize=12, fontweight='bold')
     plt.ylabel('Expected Time to Mine Block (seconds)', fontsize=12, fontweight='bold')
@@ -867,7 +824,7 @@ def plot_nonces_per_block(
 ):
     """Plot nonces per block with summary bar chart and distribution histograms."""
     # Get the threshold used for mining (from the data)
-    threshold = df['threshold'].iloc[0] if 'threshold' in df.columns else None
+    threshold = df['threshold'].iloc[0] if ('threshold' in df.columns and len(df) > 0) else None
 
     # Create figure with 2 rows: bar chart on top, 3 histograms below
     fig = plt.figure(figsize=(14, 10), constrained_layout=True)
@@ -875,12 +832,6 @@ def plot_nonces_per_block(
 
     # Top row spans all 3 columns for the bar chart
     ax_bar = fig.add_subplot(gs[0, :])
-
-    colors = {
-        'CPU': '#e74c3c',
-        'GPU': '#3498db',
-        'QPU': '#2ecc71'
-    }
 
     # Count attempts per (miner_machine, process, block_num) group
     # A "block" is mined when valid > 0
@@ -910,16 +861,14 @@ def plot_nonces_per_block(
     miner_types = sorted(nonces_data.keys())
     positions = np.arange(len(miner_types))
 
-    # Calculate stats including skewness
-    from scipy import stats as scipy_stats
-
-    stats_data = []
+    # Calculate stats including skewness - use dict for safe access
+    stats_by_type: Dict[str, Dict[str, float]] = {}
     for miner_type in miner_types:
         nonces = nonces_data[miner_type]
         if nonces:
             arr = np.array(nonces)
             skewness = scipy_stats.skew(arr)
-            stats_data.append({
+            stats_by_type[miner_type] = {
                 'mean': np.mean(arr),
                 'median': np.median(arr),
                 'min': np.min(arr),
@@ -929,26 +878,29 @@ def plot_nonces_per_block(
                 'p25': np.percentile(arr, 25),
                 'p75': np.percentile(arr, 75),
                 'p95': np.percentile(arr, 95)
-            })
+            }
         else:
-            stats_data.append({
+            stats_by_type[miner_type] = {
                 'mean': 0, 'median': 0, 'min': 0, 'max': 0, 'std': 0,
                 'skew': 0, 'p25': 0, 'p75': 0, 'p95': 0
-            })
+            }
+
+    # Build stats_data list in same order as miner_types for bar chart
+    stats_data = [stats_by_type[mt] for mt in miner_types]
 
     # ---- Top chart: Bar chart with summary stats ----
     means = [s['mean'] for s in stats_data]
     bars = ax_bar.bar(
         positions,
         means,
-        color=[colors.get(mt, '#95a5a6') for mt in miner_types],
+        color=[MINER_COLORS.get(mt, '#95a5a6') for mt in miner_types],
         alpha=0.7,
         edgecolor='black',
         linewidth=1.5
     )
 
-    # Use asymmetric error bars - can't go below 1 nonce
-    lower_errors = [min(s['std'], s['mean'] - 1) for s in stats_data]  # Clamp at 1
+    # Use asymmetric error bars - can't go below 1 nonce (clamp lower error to non-negative)
+    lower_errors = [min(s['std'], max(0.0, s['mean'] - 1.0)) for s in stats_data]
     upper_errors = [s['std'] for s in stats_data]
     ax_bar.errorbar(
         positions,
@@ -991,16 +943,20 @@ def plot_nonces_per_block(
 
         if mt in nonces_data and nonces_data[mt]:
             nonces = np.array(nonces_data[mt])
-            stat = stats_data[miner_types.index(mt)] if mt in miner_types else None
+            stat = stats_by_type.get(mt)
+            if stat is None:
+                ax_hist.text(0.5, 0.5, f'No {mt} stats', ha='center', va='center', transform=ax_hist.transAxes)
+                ax_hist.set_title(f'{mt} Distribution', fontsize=11, fontweight='bold')
+                continue
 
-            # Use log-spaced bins for skewed data
+            # Use integer bins, capped at 99th percentile for readability
             max_val = min(np.max(nonces), np.percentile(nonces, 99))
-            bins = np.arange(1, max_val + 2)  # Integer bins
+            bins = np.arange(1, max_val + 2)
 
             ax_hist.hist(
                 nonces,
                 bins=bins,
-                color=colors.get(mt, '#95a5a6'),
+                color=MINER_COLORS.get(mt, '#95a5a6'),
                 alpha=0.7,
                 edgecolor='black',
                 linewidth=0.5
@@ -1074,8 +1030,23 @@ Examples:
         default='Advantage2_system1.8',
         help='Topology name for chart titles (default: Advantage2_system1.8)'
     )
+    parser.add_argument(
+        '--mc-sims',
+        type=int,
+        default=10000,
+        help='Number of Monte Carlo simulations for win rate calculation (default: 10000)'
+    )
+    parser.add_argument(
+        '--mc-seed',
+        type=int,
+        default=42,
+        help='Random seed for Monte Carlo reproducibility (default: 42)'
+    )
 
     args = parser.parse_args()
+
+    # Seed RNG for reproducibility
+    np.random.seed(args.mc_seed)
 
     if not args.csv_file.exists():
         print(f"Error: CSV file '{args.csv_file}' not found")
@@ -1091,7 +1062,7 @@ Examples:
         num_edges = len(topology.graph.edges) if hasattr(topology.graph, 'edges') else topology.num_edges
         topology_desc = f"{args.topology} - {num_nodes:,} nodes, {num_edges:,} edges"
         print(f"Loaded topology: {topology_desc}")
-    except Exception as e:
+    except (ImportError, FileNotFoundError, KeyError, AttributeError) as e:
         print(f"Could not load topology '{args.topology}': {e}")
         topology_desc = args.topology
 
@@ -1149,20 +1120,23 @@ Examples:
     plot_win_rate_by_threshold(
         df, thresholds, topology_desc, num_nodes, num_edges,
         str(args.output_dir / 'win_rate_by_threshold.png'),
+        n_simulations=args.mc_sims,
     )
 
     # Chart 4b: Win rate projection - standard (CPU 2^20, GPU 2^15)
     plot_win_rate_by_threshold_projection(
         df, thresholds, topology_desc, num_nodes, num_edges,
         str(args.output_dir / 'win_rate_by_threshold_projection.png'),
-        projection_config='standard'
+        projection_config='standard',
+        n_simulations=args.mc_sims,
     )
 
     # Chart 4c: Win rate projection - extreme (CPU 2^40, GPU 2^20)
     plot_win_rate_by_threshold_projection(
         df, thresholds, topology_desc, num_nodes, num_edges,
         str(args.output_dir / 'win_rate_by_threshold_extreme_projection.png'),
-        projection_config='extreme'
+        projection_config='extreme',
+        n_simulations=args.mc_sims,
     )
 
     # Chart 5: Expected time

@@ -9,6 +9,10 @@ from pathlib import Path
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent / ".env")
+
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evaluate_sampleset
 from shared.block_requirements import BlockRequirements
 import random
@@ -20,13 +24,12 @@ except ImportError:
     QPU_AVAILABLE = False
 
 
-def qpu_baseline_test(timeout_minutes=20.0, output_file=None, target_energy=-15500.0, min_runtime_minutes=6.0):
+def qpu_baseline_test(timeout_minutes=20.0, output_file=None, min_runtime_minutes=6.0):
     """Test QPU performance with configurable timeout and minimum runtime."""
     print("🔬 QPU Baseline Parameter Test")
     print("=" * 40)
     print(f"⏰ Timeout: {timeout_minutes} minutes")
     print(f"⏰ Minimum runtime: {min_runtime_minutes} minutes")
-    print(f"🎯 Target energy: {target_energy}")
     
     if not QPU_AVAILABLE:
         print("❌ QPU not available")
@@ -49,7 +52,6 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, target_energy=-155
     results = {
         'timeout_minutes': float(timeout_minutes),
         'min_runtime_minutes': float(min_runtime_minutes),
-        'target_energy': float(target_energy),
         'qpu_info': {
             'num_qpu_nodes': int(len(sampler.nodes)),
             'num_qpu_edges': int(len(sampler.edges)),
@@ -176,11 +178,6 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, target_energy=-155
             if target_reached != "none":
                 print(f"    🎖️  Quality: {target_reached}")
 
-            # Check if we reached target
-            target_reached_bool = bool(min_energy <= target_energy)
-            if target_reached_bool:
-                print(f"    ✅ Target energy {target_energy} reached!")
-                
             # Extract QPU timing info if available
             qpu_timing = {}
             if hasattr(sampleset, 'info') and 'timing' in sampleset.info:
@@ -198,7 +195,6 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, target_energy=-155
                 'avg_energy': avg_energy,
                 'std_energy': std_energy,
                 'target_reached': target_reached,
-                'target_reached_bool': target_reached_bool,
                 'diversity': float(diversity),
                 'diversity_top_10': float(top_10_diversity),
                 'num_solutions': int(num_solutions),
@@ -237,28 +233,13 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, target_energy=-155
         best_result = min(results['tests'], key=lambda r: r['min_energy'])
         print(f"🏆 Best energy: {best_result['min_energy']:.1f}")
         print(f"   Required: {best_result['num_reads']} reads, {best_result['annealing_time_us']}µs, {best_result['runtime_minutes']:.1f} min")
-        
-        # Target achievement analysis
-        target_achievers = [r for r in results['tests'] if r['target_reached_bool']]
-        if target_achievers:
-            fastest_target = min(target_achievers, key=lambda r: r['runtime_seconds'])
-            print(f"🎯 Fastest to reach {target_energy}: {fastest_target['num_reads']} reads, {fastest_target['annealing_time_us']}µs ({fastest_target['runtime_minutes']:.1f} min)")
-        
-        # Quality tiers
-        quality_tiers = {}
+
+        # Time vs energy analysis
+        print(f"\n⏱️ Time vs Energy Performance:")
         for result in results['tests']:
-            tier = result['target_reached']
-            if tier != 'none':
-                if tier not in quality_tiers:
-                    quality_tiers[tier] = []
-                quality_tiers[tier].append(result)
-        
-        print(f"\n🏅 Quality Achievements:")
-        for tier in ['fair', 'good', 'very_good', 'excellent']:
-            if tier in quality_tiers:
-                fastest = min(quality_tiers[tier], key=lambda r: r['runtime_seconds'])
-                print(f"   {tier.title()}: {fastest['num_reads']} reads, {fastest['annealing_time_us']}µs ({fastest['runtime_minutes']:.1f} min)")
-        
+            quality = f"({result['target_reached']})" if result['target_reached'] != 'none' else ""
+            print(f"  {result['runtime_minutes']:5.1f} min: {result['min_energy']:7.1f} energy {quality}")
+
         # Runtime analysis
         min_runtime_met = any(r['runtime_seconds'] >= min_runtime_seconds for r in results['tests'])
         print(f"\n⏰ Minimum runtime requirement ({min_runtime_minutes} min): {'✅ Met' if min_runtime_met else '❌ Not met'}")
@@ -281,22 +262,16 @@ def main():
     """Main function with command line argument parsing."""
     parser = argparse.ArgumentParser(description='QPU baseline parameter testing tool')
     parser.add_argument(
-        '--timeout', '-t', 
-        type=float, 
+        '--timeout', '-t',
+        type=float,
         default=30.0,
         help='Timeout in minutes (default: 30.0)'
     )
     parser.add_argument(
-        '--min-runtime', 
+        '--min-runtime',
         type=float,
         default=6.0,
         help='Minimum runtime in minutes before allowing early termination (default: 6.0)'
-    )
-    parser.add_argument(
-        '--target', 
-        type=float,
-        default=-15500.0,
-        help='Target energy threshold (default: -15500.0)'
     )
     parser.add_argument(
         '--output', '-o',
@@ -306,41 +281,37 @@ def main():
     parser.add_argument(
         '--quick',
         action='store_true',
-        help='Quick test mode (15 min timeout, 3 min minimum, target -15300)'
+        help='Quick test mode (15 min timeout, 3 min minimum)'
     )
     parser.add_argument(
         '--extended',
-        action='store_true', 
-        help='Extended test mode (60 min timeout, 10 min minimum, target -15600)'
+        action='store_true',
+        help='Extended test mode (60 min timeout, 10 min minimum)'
     )
-    
+
     args = parser.parse_args()
-    
+
     # Handle preset modes
     if args.quick:
         timeout = 15.0
         min_runtime = 3.0
-        target = -15300.0
     elif args.extended:
         timeout = 60.0
         min_runtime = 10.0
-        target = -15600.0
     else:
         timeout = args.timeout
         min_runtime = args.min_runtime
-        target = args.target
-    
+
     # Generate default output filename if not specified
     output_file = args.output
     if not output_file:
         timestamp = int(time.time())
         output_file = f"qpu_baseline_results_{timestamp}.json"
-    
+
     # Run test
     results = qpu_baseline_test(
-        timeout_minutes=timeout, 
-        output_file=output_file, 
-        target_energy=target,
+        timeout_minutes=timeout,
+        output_file=output_file,
         min_runtime_minutes=min_runtime
     )
     

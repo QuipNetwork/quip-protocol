@@ -8,7 +8,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,14 +18,50 @@ import seaborn as sns
 sns.set_theme(style="whitegrid")
 plt.rcParams['figure.dpi'] = 100
 
+# Required keys in JSON data
+REQUIRED_JSON_KEYS = {
+    'seeds', 'num_reads_tested', 'annealing_time_tested',
+    'interval_tested', 'cpu_baseline', 'qpu_results', 'topology'
+}
 
-def load_results(filepath: str) -> Dict:
-    """Load QPU test results from JSON file."""
-    with open(filepath, 'r') as f:
-        return json.load(f)
+
+def load_results(filepath: str) -> Dict[str, Any]:
+    """Load QPU test results from JSON file.
+
+    Raises:
+        FileNotFoundError: If the file does not exist
+        json.JSONDecodeError: If the file contains invalid JSON
+        ValueError: If required keys are missing from the JSON data
+    """
+    with open(filepath, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    # Validate required keys
+    missing = REQUIRED_JSON_KEYS - set(data.keys())
+    if missing:
+        raise ValueError(f"JSON missing required keys: {', '.join(sorted(missing))}")
+
+    return data
 
 
-def create_heatmaps_per_seed(data: Dict, output_dir: str = '.'):
+def _calculate_grid_layout(n_items: int, max_cols: int = 3) -> tuple[int, int]:
+    """Calculate grid layout dimensions for subplots.
+
+    Args:
+        n_items: Number of items to display in the grid
+        max_cols: Maximum number of columns (default: 3)
+
+    Returns:
+        Tuple of (n_rows, n_cols)
+    """
+    if n_items <= 0:
+        return (1, 1)
+    n_cols = min(max_cols, n_items)
+    n_rows = (n_items + n_cols - 1) // n_cols
+    return (n_rows, n_cols)
+
+
+def create_heatmaps_per_seed(data: Dict[str, Any], output_dir: str = '.') -> None:
     """Create heatmap visualizations, one figure per seed.
 
     Each figure contains multiple subplots (one per interval) showing:
@@ -50,10 +86,7 @@ def create_heatmaps_per_seed(data: Dict, output_dir: str = '.'):
     # Create one figure per seed
     for seed in seeds:
         n_intervals = len(interval_list)
-
-        # Calculate grid layout (try to make roughly square)
-        n_cols = min(3, n_intervals)
-        n_rows = (n_intervals + n_cols - 1) // n_cols
+        n_rows, n_cols = _calculate_grid_layout(n_intervals)
 
         fig, axes = plt.subplots(
             n_rows, n_cols,
@@ -86,8 +119,13 @@ def create_heatmaps_per_seed(data: Dict, output_dir: str = '.'):
             energy_matrix = np.full((len(num_reads_list), len(annealing_time_list)), np.nan)
 
             for result in results:
-                nr_idx = num_reads_list.index(result['num_reads'])
-                at_idx = annealing_time_list.index(result['annealing_time'])
+                nr = result['num_reads']
+                at = result['annealing_time']
+                # Skip results with unexpected parameter values
+                if nr not in num_reads_list or at not in annealing_time_list:
+                    continue
+                nr_idx = num_reads_list.index(nr)
+                at_idx = annealing_time_list.index(at)
                 energy_matrix[nr_idx, at_idx] = result['energy_min']
 
             # Create heatmap
@@ -136,7 +174,7 @@ def create_heatmaps_per_seed(data: Dict, output_dir: str = '.'):
         plt.close(fig)
 
 
-def create_line_plots_per_seed(data: Dict, output_dir: str = '.'):
+def create_line_plots_per_seed(data: Dict[str, Any], output_dir: str = '.') -> None:
     """Create line plots showing energy vs num_reads, with lines per annealing_time.
 
     One figure per seed, with subplots for each interval.
@@ -158,10 +196,7 @@ def create_line_plots_per_seed(data: Dict, output_dir: str = '.'):
     # Create one figure per seed
     for seed in seeds:
         n_intervals = len(interval_list)
-
-        # Calculate grid layout
-        n_cols = min(3, n_intervals)
-        n_rows = (n_intervals + n_cols - 1) // n_cols
+        n_rows, n_cols = _calculate_grid_layout(n_intervals)
 
         fig, axes = plt.subplots(
             n_rows, n_cols,
@@ -231,7 +266,7 @@ def create_line_plots_per_seed(data: Dict, output_dir: str = '.'):
         plt.close(fig)
 
 
-def create_summary_comparison(data: Dict, output_dir: str = '.'):
+def create_summary_comparison(data: Dict[str, Any], output_dir: str = '.') -> None:
     """Create summary comparison showing best energy across all parameters.
 
     Shows how the best achievable energy varies across seeds and intervals.
@@ -257,7 +292,8 @@ def create_summary_comparison(data: Dict, output_dir: str = '.'):
             if key in qpu_results:
                 results = qpu_results[key]['results']
                 energies = [r['energy_min'] for r in results]
-                best_energies[seed_idx, interval_idx] = min(energies)
+                if energies:
+                    best_energies[seed_idx, interval_idx] = min(energies)
 
     # Create heatmap
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -306,7 +342,7 @@ def create_summary_comparison(data: Dict, output_dir: str = '.'):
     plt.close(fig)
 
 
-def main():
+def main() -> int:
     """Main entry point."""
     parser = argparse.ArgumentParser(
         description='Visualize QPU test results from test_qpu.py'
@@ -332,9 +368,27 @@ def main():
 
     args = parser.parse_args()
 
-    # Load data
-    print(f"📊 Loading results from {args.input_file}...")
-    data = load_results(args.input_file)
+    # Check file exists
+    input_path = Path(args.input_file)
+    if not input_path.exists():
+        print(f"Error: Input file not found: {args.input_file}")
+        return 1
+
+    # Load data with error handling
+    print(f"Loading results from {args.input_file}...")
+    try:
+        data = load_results(args.input_file)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in {args.input_file}: {e}")
+        return 1
+    except ValueError as e:
+        print(f"Error: {e}")
+        return 1
+
+    # Validate we have data to process
+    if not data['seeds']:
+        print("Warning: No seeds found in data, nothing to visualize")
+        return 0
 
     print(f"Found {len(data['seeds'])} seeds, {len(data['interval_tested'])} intervals")
     print(f"Parameters: {len(data['num_reads_tested'])} num_reads × {len(data['annealing_time_tested'])} annealing_time")
