@@ -21,7 +21,20 @@ ENV/
 *.log
 *.csv
 results/
-quip_protocol.egg-info/.quip/
+quip_protocol.egg-info/
+.quip/
+
+# Test results and data files
+test_results/
+*_results*.json
+mining_rate_*.json
+*.zip
+
+# Charts/images at repo root
+/*.png
+
+# Build outputs
+**/dist/
 akash/web/localhost.pem
 node_modules
 # Dependencies (installed by bun/npm - developer only)

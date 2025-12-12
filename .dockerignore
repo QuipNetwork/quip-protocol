@@ -1,0 +1,64 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+.eggs
+*.egg
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Virtual environments
+.venv
+venv
+.quip
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Testing
+tests/
+test_*.py
+*_test.py
+conftest.py
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Development tools (exclude most, but keep compare_mining_rates.py)
+tools/*
+!tools/compare_mining_rates.py
+benchmarks/
+reference/
+
+# Local development files
+*.log
+*.tmp
+.env
+.env.*
+
+# Large unused topology files (we copy specific ones)
+dwave_topologies/topologies/advantage_system*.py
+dwave_topologies/topologies/__pycache__
+
+# Build artifacts
+dist/
+build/
+*.whl
+
+# Other
+akash/web/
+*.gpg
+*.zip
