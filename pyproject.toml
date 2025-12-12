@@ -25,7 +25,9 @@ dependencies = [
     "torchaudio>=2.0.0",
     "cupy-cuda13x>=13.0.0; sys_platform == 'linux' or sys_platform == 'win32'",
     "pyobjc-framework-Metal; sys_platform == 'darwin'",
-    "pyobjc-framework-MetalPerformanceShaders; sys_platform == 'darwin'"
+    "pyobjc-framework-MetalPerformanceShaders; sys_platform == 'darwin'",
+    "aioquic>=1.3.0",
+    "cryptography>=42.0.0"
 ]
 
 [project.optional-dependencies]

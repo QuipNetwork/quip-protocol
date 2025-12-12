@@ -295,7 +295,7 @@ class BlockSynchronizer:
         return True
 
 
-async def _download_single_block(client: NodeClient, 
+async def _download_single_block(client: NodeClient,
                                 block_number: int, 
                                 peers: List[str],
                                 is_shutdown_requested = None) -> Optional[Block]:

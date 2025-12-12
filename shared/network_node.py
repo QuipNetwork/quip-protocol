@@ -1,25 +1,19 @@
 import asyncio
+import copy
 import json
 import math
 import random
 import socket
-import ssl
-import sys
-import time
 import struct
+import sys
 import threading
+import time
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Callable
-from datetime import datetime
-import aiohttp
-from aiohttp import web
-import logging
-import sys
-
-import copy
+from typing import Dict, Optional, Callable, Any
 
 from blake3 import blake3
+import logging
 from packaging import version
 
 from shared.base_miner import MiningResult
@@ -27,7 +21,15 @@ from shared.block import Block, BlockHeader, MinerInfo
 from shared.node import Node
 from shared.logging_config import init_component_logger
 from shared.version import get_version
-from shared.node_client import NodeClient
+from shared.node_client import (
+    NodeClient, QuicMessage, QuicMessageType,
+    generate_self_signed_cert, QUIP_ALPN_PROTOCOL, MAX_DATAGRAM_FRAME_SIZE,
+)
+from aioquic.asyncio import serve
+from aioquic.asyncio.protocol import QuicConnectionProtocol
+from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.connection import QuicConnection
+from aioquic.quic.events import QuicEvent, DatagramFrameReceived, ConnectionTerminated, HandshakeCompleted
 from shared.block_synchronizer import BlockSynchronizer
 from shared.block_store import BlockStore
 from shared.time_utils import (
@@ -59,6 +61,9 @@ async def get_public_ip() -> Optional[str]:
     Returns:
         Public IP address as string, or None if unable to determine
     """
+    import urllib.request
+    import ssl
+
     # Use module-level logger
     logger = logging.getLogger(__name__)
 
@@ -66,22 +71,29 @@ async def get_public_ip() -> Optional[str]:
     services = [
         "https://api.ipify.org",
         "https://icanhazip.com",
-        "https://icanhazip.com",
         "https://ipecho.net/plain",
         "https://checkip.amazonaws.com",
         "https://ident.me"
     ]
 
+    # Create SSL context that doesn't verify (for simplicity)
+    ssl_context = ssl.create_default_context()
+
     for service in services:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(service, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                    if response.status == 200:
-                        ip = (await response.text()).strip()
-                        # Basic validation - check if it looks like an IP
-                        if ip and '.' in ip and len(ip.split('.')) == 4:
-                            logger.info(f"Detected public IP: {ip}")
-                            return ip
+            # Run blocking request in executor
+            loop = asyncio.get_event_loop()
+
+            def fetch_ip():
+                req = urllib.request.Request(service, headers={'User-Agent': 'QuIP-Node/1.0'})
+                with urllib.request.urlopen(req, timeout=5, context=ssl_context) as response:
+                    return response.read().decode('utf-8').strip()
+
+            ip = await loop.run_in_executor(None, fetch_ip)
+            # Basic validation - check if it looks like an IP
+            if ip and '.' in ip and len(ip.split('.')) == 4:
+                logger.info(f"Detected public IP: {ip}")
+                return ip
         except Exception as e:
             logger.debug(f"Failed to get IP from {service}: {e}")
             continue
@@ -213,13 +225,8 @@ class NetworkNode(Node):
         self.on_node_lost: Optional[Callable] = None
         self.on_block_received: Optional[Callable] = None
 
-        # Web server
-        # Allow large gossip payloads (e.g., full signed blocks encoded as hex in JSON)
-        # Default to 64 MB unless overridden via config['client_max_size_mb']
-        self.client_max_size_mb = int(config.get("client_max_size_mb", 64))
-        self.app = web.Application(client_max_size=self.client_max_size_mb * 1024 * 1024)
-        self.setup_routes()
-        self.runner = None
+        # QUIC server (replaces aiohttp web server)
+        self.quic_server: Optional[QuicServer] = None
 
         # Background tasks
         self.heartbeat_task = None
@@ -283,51 +290,86 @@ class NetworkNode(Node):
 
         self.logger.info(f"Network node {self.node_name} initialized with config {json.dumps(config)}")
 
-    def setup_routes(self):
-        """Setup HTTP routes for P2P communication."""
-        self.app.router.add_post('/join', self.handle_put_join)
-        self.app.router.add_post('/heartbeat', self.handle_put_heartbeat)
-        self.app.router.add_post('/peers', self.handle_get_peers)
-        self.app.router.add_post('/gossip', self.handle_put_gossip)
-        self.app.router.add_post('/block', self.handle_put_block)
-        self.app.router.add_get('/status', self.handle_get_status)
-        self.app.router.add_get('/stats', self.handle_get_stats)
-        self.app.router.add_get('/block/', self.handle_get_latest_block)
-        self.app.router.add_get('/block/{number}', self.handle_get_block)
-        # Lightweight header-only endpoints
-        self.app.router.add_get('/block_header/', self.handle_get_latest_block_header)
-        self.app.router.add_get('/block_header/{number}', self.handle_get_block_header)
-        # Solve endpoint
-        self.app.router.add_post('/solve', self.handle_solve)
+    def _create_server_protocol(self, quic: QuicConnection) -> QuicConnectionProtocol:
+        """Create a QUIC protocol handler for incoming connections."""
+        node = self
+
+        class _ServerProtocol(QuicConnectionProtocol):
+            def __init__(self, quic_conn: QuicConnection):
+                super().__init__(quic_conn)
+                self._peer_address: Optional[str] = None
+
+            def quic_event_received(self, event: QuicEvent) -> None:
+                if isinstance(event, HandshakeCompleted):
+                    peername = self._quic._network_paths[0].addr if self._quic._network_paths else None
+                    if peername:
+                        self._peer_address = f"{peername[0]}:{peername[1]}"
+                    node.logger.debug(f"QUIC handshake completed with {self._peer_address}")
+                elif isinstance(event, DatagramFrameReceived):
+                    asyncio.create_task(self._handle_datagram(event.data))
+                elif isinstance(event, ConnectionTerminated):
+                    node.logger.debug(
+                        f"Connection terminated with {self._peer_address}: "
+                        f"error_code={event.error_code}, reason={event.reason_phrase}"
+                    )
+
+            async def _handle_datagram(self, data: bytes) -> None:
+                try:
+                    msg = QuicMessage.from_bytes(data)
+                    node.logger.debug(
+                        f"Received {msg.msg_type.name} (id={msg.request_id}) "
+                        f"from {self._peer_address}: {len(msg.payload)} bytes"
+                    )
+                    response = await node._handle_quic_message(msg, self)
+                    if response is not None:
+                        response_bytes = response.to_bytes()
+                        self._quic.send_datagram_frame(response_bytes)
+                        self.transmit()
+                        node.logger.debug(
+                            f"Sent {response.msg_type.name} (id={response.request_id}) "
+                            f"to {self._peer_address}: {len(response.payload)} bytes"
+                        )
+                except ValueError as e:
+                    node.logger.warning(f"Invalid datagram from {self._peer_address}: {e}")
+                except Exception as e:
+                    node.logger.exception(f"Error handling datagram from {self._peer_address}: {e}")
+
+        return _ServerProtocol(quic)
 
     async def start(self):
         """Start the P2P node."""
         self.running = True
 
-        # Initialize node client for HTTP communication
+        # Initialize QUIC client for peer communication
         self.node_client = NodeClient(node_timeout=self.node_timeout, logger=self.logger)
         await self.node_client.start()
 
-        # Start web server
-        self.runner = web.AppRunner(self.app)
-        await self.runner.setup()
-        
-        # Create SSL context if TLS is enabled
-        ssl_context = None
-        if self.tls_enabled:
-            assert self.tls_cert_file and self.tls_key_file
-            ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-            # Configure for modern TLS with forward secrecy
-            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_3
-            ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS')
-            ssl_context.load_cert_chain(self.tls_cert_file, self.tls_key_file)
-            self.logger.info(f"TLS enabled with certificate: {self.tls_cert_file}")
-            
-        site = web.TCPSite(self.runner, self.bind_address, self.port, ssl_context=ssl_context)
-        await site.start()
+        # Start QUIC server
+        cert_file = self.tls_cert_file if self.tls_enabled else None
+        key_file = self.tls_key_file if self.tls_enabled else None
+        if not cert_file or not key_file:
+            self.logger.warning("No TLS certificates provided, generating self-signed certificate")
+            cert_file, key_file = generate_self_signed_cert()
 
-        protocol = "https" if self.tls_enabled else "http"
-        self.logger.info(f"Network node {self.node_name} ({self.crypto.ecdsa_public_key_hex[:8]}) started at {protocol}://{self.bind_address}:{self.port} with public address {self.public_host}")
+        configuration = QuicConfiguration(
+            is_client=False,
+            max_datagram_frame_size=MAX_DATAGRAM_FRAME_SIZE,
+            alpn_protocols=[QUIP_ALPN_PROTOCOL],
+            idle_timeout=300.0,
+        )
+        configuration.load_cert_chain(cert_file, key_file)
+
+        self._quic_server = await serve(
+            host=self.bind_address,
+            port=self.port,
+            configuration=configuration,
+            create_protocol=self._create_server_protocol,
+        )
+
+        self.logger.info(
+            f"Network node {self.node_name} ({self.crypto.ecdsa_public_key_hex[:8]}) "
+            f"started at quic://{self.bind_address}:{self.port} with public address {self.public_host}"
+        )
 
         # Start background tasks
         self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
@@ -374,19 +416,15 @@ class NetworkNode(Node):
         if self.reset_timer_task:
             self.reset_timer_task.cancel()
 
-        self.logger.info("Cancelling HTTP session tasks...")
+        self.logger.info("Cancelling QUIC client tasks...")
         # Close node client
         if self.node_client:
             await self.node_client.stop()
 
-        self.logger.info("Cancelling web server tasks...")
-        # Stop web server
-        if self.runner:
-            try:
-                # This forces cancellation of request processing
-                await asyncio.wait_for(self.runner.cleanup(), timeout=2.0)
-            except asyncio.TimeoutError:
-                self.logger.warning("HTTP server cleanup timed out")
+        self.logger.info("Cancelling QUIC server tasks...")
+        # Stop QUIC server
+        if self._quic_server:
+            self._quic_server.close()
         
 
         all_tasks = asyncio.all_tasks()
@@ -1281,421 +1319,304 @@ class NetworkNode(Node):
         asyncio.create_task(self.gossip_broadcast(message, self.fanout))
         return "ok"
 
-    #######################
-    ## HTTP PUT Handlers ##
-    #######################
+    ############################
+    ## QUIC Message Handlers ##
+    ############################
 
-    async def handle_put_gossip(self, request: web.Request) -> web.Response:
-        """Handle a gossip message from another node (binary only)."""
+    async def _handle_quic_message(
+        self,
+        msg: QuicMessage,
+        protocol: Any
+    ) -> Optional[QuicMessage]:
+        """Dispatch incoming QUIC messages to appropriate handlers.
+
+        This replaces all the HTTP route handlers with a single dispatch point.
+        """
         try:
-            if request.content_type != 'application/octet-stream':
-                return web.json_response({"error": "unsupported content-type"}, status=415)
-
-            raw = await request.read()
-            message = Message.from_network(raw)
-
-            # Queue for background processing to avoid blocking
-            response_future = asyncio.Future()
-            t_enq = time.perf_counter()
-            try:
-                self.gossip_processing_queue.put_nowait((message, response_future, t_enq))
-                # Wait for background processing with timeout
-                status = await asyncio.wait_for(response_future, timeout=5.0)
-                return web.json_response({"status": status})
-            except asyncio.QueueFull:
-                return web.json_response({"error": "server overloaded"}, status=503)
-            except asyncio.TimeoutError:
-                return web.json_response({"error": "processing timeout"}, status=504)
+            if msg.msg_type == QuicMessageType.JOIN_REQUEST:
+                return await self._quic_handle_join(msg)
+            elif msg.msg_type == QuicMessageType.HEARTBEAT:
+                return await self._quic_handle_heartbeat(msg)
+            elif msg.msg_type == QuicMessageType.PEERS_REQUEST:
+                return await self._quic_handle_peers(msg)
+            elif msg.msg_type == QuicMessageType.GOSSIP:
+                return await self._quic_handle_gossip(msg)
+            elif msg.msg_type == QuicMessageType.BLOCK_SUBMIT:
+                return await self._quic_handle_block_submit(msg)
+            elif msg.msg_type == QuicMessageType.STATUS_REQUEST:
+                return await self._quic_handle_status(msg)
+            elif msg.msg_type == QuicMessageType.STATS_REQUEST:
+                return await self._quic_handle_stats(msg)
+            elif msg.msg_type == QuicMessageType.BLOCK_REQUEST:
+                return await self._quic_handle_block_request(msg)
+            elif msg.msg_type == QuicMessageType.BLOCK_HEADER_REQUEST:
+                return await self._quic_handle_block_header_request(msg)
+            elif msg.msg_type == QuicMessageType.SOLVE_REQUEST:
+                return await self._quic_handle_solve(msg)
+            else:
+                self.logger.warning(f"Unknown message type: {msg.msg_type}")
+                return msg.create_error_response(f"Unknown message type: {msg.msg_type}")
 
         except Exception as e:
-            self.logger.exception("Error handling broadcast")
-            return web.json_response({"error": str(e)}, status=500)
+            self.logger.exception(f"Error handling {msg.msg_type.name}: {e}")
+            return msg.create_error_response(str(e))
 
-
-    async def handle_put_join(self, request: web.Request) -> web.Response:
+    async def _quic_handle_join(self, msg: QuicMessage) -> QuicMessage:
         """Handle join request from a new node."""
-        try:
-            data = await request.json()
-            new_node_address = data.get("host")
-            info_field = data.get("info")
-            # Expect MinerInfo as JSON string
-            new_node_info = MinerInfo.from_json(info_field) if info_field else None
+        data = json.loads(msg.payload.decode('utf-8'))
+        new_node_address = data.get("host")
+        info_field = data.get("info")
+        new_node_info = MinerInfo.from_json(info_field) if info_field else None
 
-            if not new_node_address or not new_node_info:
-                return web.json_response({"error": "Missing host or info"}, status=400)
+        if not new_node_address or not new_node_info:
+            return msg.create_error_response("Missing host or info")
 
-            # Add the new node
-            await self.add_peer(new_node_address, new_node_info)
+        # Add the new node
+        await self.add_peer(new_node_address, new_node_info)
 
-            # Return our node list as JSON-serializable map host -> MinerInfo JSON string
-            async with self.net_lock:
-                peers_snapshot = copy.deepcopy(self.peers)
+        # Return our node list
+        async with self.net_lock:
+            peers_snapshot = copy.deepcopy(self.peers)
 
-            peers_payload: Dict[str, str] = {}
-            for host, info in peers_snapshot.items():
-                peers_payload[host] = info.to_json()
+        peers_payload: Dict[str, str] = {}
+        for host, info in peers_snapshot.items():
+            peers_payload[host] = info.to_json()
+        peers_payload[self.public_host] = self.info().to_json()
 
-            # Add ourself
-            peers_payload[self.public_host] = self.info().to_json()
+        response_data = json.dumps({"status": "ok", "peers": peers_payload})
+        return msg.create_response(response_data.encode('utf-8'))
 
-            return web.json_response({
-                "status": "ok",
-                "peers": peers_payload
-            })
-
-        except Exception as e:
-            self.logger.exception("Error handling join")
-            return web.json_response({"error": str(e)}, status=500)
-
-    async def handle_put_heartbeat(self, request: web.Request) -> web.Response:
+    async def _quic_handle_heartbeat(self, msg: QuicMessage) -> QuicMessage:
         """Handle heartbeat from another node."""
+        data = json.loads(msg.payload.decode('utf-8'))
+        sender = data.get("sender")
+        net_version = data.get("version")
+        timestamp = data.get("timestamp", utc_timestamp_float())
+
+        if net_version:
+            local_version = get_version()
+            local_ver = version.parse(local_version)
+            peer_ver = version.parse(net_version)
+
+            if local_ver < peer_ver:
+                self.logger.error(
+                    f"Local version {local_version} is outdated compared to "
+                    f"peer {sender} running version {net_version}"
+                )
+                self.logger.error("Please run 'pip install quip-network' to get the latest version")
+                await self.stop()
+            elif local_ver > peer_ver:
+                self.logger.warning(
+                    f"Peer {sender} is running older version {net_version} (local: {local_version})"
+                )
+
+        if sender:
+            async with self.net_lock:
+                if sender in self.peers:
+                    self.heartbeats[sender] = utc_timestamp_float()
+                    self._track_peer_timestamp(timestamp)
+                else:
+                    self.logger.info(f"New node discovered via heartbeat: {sender}")
+                    asyncio.create_task(self.refresh_peer_info(sender))
+
+        return msg.create_response(json.dumps({"status": "ok"}).encode('utf-8'))
+
+    async def _quic_handle_peers(self, msg: QuicMessage) -> QuicMessage:
+        """Return list of known nodes."""
+        async with self.net_lock:
+            peers_data = {host: info.to_json() for host, info in self.peers.items()}
+
+        return msg.create_response(json.dumps({"peers": peers_data}).encode('utf-8'))
+
+    async def _quic_handle_gossip(self, msg: QuicMessage) -> QuicMessage:
+        """Handle a gossip message from another node."""
+        # Parse the gossip Message from payload
+        gossip_message = Message.from_network(msg.payload)
+
+        # Queue for background processing
+        response_future: asyncio.Future[str] = asyncio.Future()
+        t_enq = time.perf_counter()
+
         try:
-            data = await request.json()
-            sender = data.get("sender")
-            net_version = data.get("version")
-            timestamp = data.get("timestamp", utc_timestamp_float())
+            self.gossip_processing_queue.put_nowait((gossip_message, response_future, t_enq))
+            status = await asyncio.wait_for(response_future, timeout=5.0)
+            return msg.create_response(json.dumps({"status": status}).encode('utf-8'))
+        except asyncio.QueueFull:
+            return msg.create_error_response("server overloaded")
+        except asyncio.TimeoutError:
+            return msg.create_error_response("processing timeout")
 
-            if version:
-                local_version = get_version()
-                local_ver = version.parse(local_version)
-                peer_ver = version.parse(net_version)
+    async def _quic_handle_block_submit(self, msg: QuicMessage) -> QuicMessage:
+        """Handle new block submission (DEBUG purposes)."""
+        data = json.loads(msg.payload.decode('utf-8'))
 
-                if local_ver < peer_ver:
-                    # Local version is older than the peer's version
-                    self.logger.error(f"Local version {local_version} is outdated compared to peer {sender} running version {net_version}")
-                    self.logger.error("Please run 'pip install quip-network' to get the latest version")
+        block_bytes = bytes.fromhex(data['raw'])
+        signature = bytes.fromhex(data['signature'])
+        net_data = block_bytes + signature
+        block = Block.from_network(net_data)
 
-                    # Stop the node and exit
-                    await self.stop()
-                elif local_ver > peer_ver:
-                    # Peer version is older than local version
-                    self.logger.warning(f"Peer {sender} is running older version {net_version} (local: {local_version})")
-
-            if sender:
-                async with self.net_lock:
-                    if sender in self.peers:
-                        self.heartbeats[sender] = utc_timestamp_float()
-
-                        # Track peer timestamp for time synchronization
-                        self._track_peer_timestamp(timestamp)
-                    else:
-                        # New node discovered via heartbeat - get their info in background
-                        self.logger.info(f"New node discovered via heartbeat: {sender}")
-                        asyncio.create_task(self.refresh_peer_info(sender))
-
-            return web.json_response({"status": "ok"})
-
-        except Exception as e:
-            self.logger.exception("Error handling heartbeat")
-            return web.json_response({"error": str(e)}, status=500)
-
-    async def handle_put_block(self, request: web.Request) -> web.Response:
-        """Handle new block - this is largely open for DEBUG purposes as new blocks
-        should be sent via gossip."""
+        response_future: asyncio.Future[bool] = asyncio.Future()
         try:
-            block_data = await request.json()
+            self.block_processing_queue.put_nowait((block, response_future))
+            result = await asyncio.wait_for(response_future, timeout=10.0)
+            status = "ok" if result else "rejected"
+            return msg.create_response(json.dumps({"status": status}).encode('utf-8'))
+        except asyncio.QueueFull:
+            return msg.create_error_response("server overloaded")
+        except asyncio.TimeoutError:
+            return msg.create_error_response("processing timeout")
 
-            block_bytes = bytes.fromhex(block_data['raw'])
-            signature = bytes.fromhex(block_data['signature'])
-
-            net_data = b''
-            net_data += block_bytes
-            net_data += signature
-
-            block = Block.from_network(net_data)
-
-            # Queue for background processing to avoid blocking
-            response_future = asyncio.Future()
-            try:
-                self.block_processing_queue.put_nowait((block, response_future))
-                # Wait for background processing with timeout
-                result = await asyncio.wait_for(response_future, timeout=10.0)
-                status = "ok" if result else "rejected"
-                return web.json_response({"status": status})
-            except asyncio.QueueFull:
-                return web.json_response({"error": "server overloaded"}, status=503)
-            except asyncio.TimeoutError:
-                return web.json_response({"error": "processing timeout"}, status=504)
-
-        except Exception as e:
-            self.logger.exception("Error handling new block")
-            return web.json_response({"error": str(e)}, status=500)
-
-    #######################
-    ## HTTP GET Handlers ##
-    #######################
-
-    async def handle_get_status(self, request: web.Request) -> web.Response:
+    async def _quic_handle_status(self, msg: QuicMessage) -> QuicMessage:
         """Return node status."""
-
-        return web.json_response({
+        status_data = {
             "host": self.public_host,
             "info": self.info().to_json(),
             "running": self.running,
             "total_peers": len(self.peers),
             "uptime": utc_timestamp_float() if self.running else 0
-        })
-
-    async def handle_solve(self, request: web.Request) -> web.Response:
-        """Handle quantum annealing solve request.
-
-        Request format:
-        {
-            "h": [array of linear bias coefficients],
-            "J": [[i, j, coupling_value], ...] or {key: value},
-            "num_samples": integer
         }
+        return msg.create_response(json.dumps(status_data).encode('utf-8'))
 
-        Response format:
-        {
-            "samples": [array of solution bitstrings/spin configurations],
-            "energies": [array of corresponding energies],
-            "transaction_id": "unique identifier"
-        }
-        """
-        try:
-            data = await request.json()
-
-            # Validate request
-            if 'h' not in data or 'J' not in data or 'num_samples' not in data:
-                return web.json_response(
-                    {"error": "Missing required fields: h, J, num_samples"},
-                    status=400
-                )
-
-            h = data['h']
-            J_raw = data['J']
-            num_samples = int(data['num_samples'])
-
-            # Convert J to list of tuples format
-            if isinstance(J_raw, dict):
-                # Convert dict format {"(i,j)": value} to list format
-                J = [((int(k.split(',')[0].strip('()')), int(k.split(',')[1].strip('()'))), v)
-                     for k, v in J_raw.items()]
-            elif isinstance(J_raw, list):
-                # Already in list format [[i, j, value], ...]
-                J = [((entry[0], entry[1]), entry[2]) for entry in J_raw]
-            else:
-                return web.json_response(
-                    {"error": "Invalid J format. Must be dict or list."},
-                    status=400
-                )
-
-            # Generate transaction ID
-            transaction_id = f"{self.public_host}-{time.time()}-{hash((tuple(h), tuple(J)))}"
-
-            # Convert h and J to format needed by sampler
-            import dimod
-            h_dict = {i: val for i, val in enumerate(h)}
-            J_dict = {(i, j): val for ((i, j), val) in J}
-
-            # Use first available miner to solve
-            if not hasattr(self, 'miner_handles') or not self.miner_handles:
-                return web.json_response(
-                    {"error": "No miners available"},
-                    status=503
-                )
-
-            miner_handle = self.miner_handles[0]
-            self.logger.info(f"Solving BQM with {len(h)} variables, {len(J)} couplings, {num_samples} samples using {miner_handle.miner_id}")
-
-            # Create appropriate sampler based on miner type
-            # MinerHandle runs in a separate process, so we create a sampler here
-            sampler = None
-            miner_kind = miner_handle.spec.get("kind", "").lower()
-
-            if miner_kind == "qpu":
-                from dwave.system import DWaveSampler
-                try:
-                    sampler = DWaveSampler()
-                    self.logger.info(f"Using QPU sampler: {sampler.properties.get('chip_id', 'unknown')}")
-                except Exception as e:
-                    self.logger.error(f"Failed to create QPU sampler: {e}")
-                    return web.json_response(
-                        {"error": f"QPU not available: {e}"},
-                        status=503
-                    )
-            elif miner_kind in ["cpu", "metal", "cuda", "modal"]:
-                from dwave.samplers import SimulatedAnnealingSampler
-                sampler = SimulatedAnnealingSampler()
-                self.logger.info("Using simulated annealing sampler")
-            else:
-                return web.json_response(
-                    {"error": f"Unknown miner type: {miner_kind}"},
-                    status=503
-                )
-
-            # Sample the Ising problem
-            sampleset = sampler.sample_ising(h_dict, J_dict, num_reads=num_samples)
-
-            # Extract samples and energies
-            samples = []
-            energies = []
-            for sample, energy in sampleset.data(['sample', 'energy']):
-                # Convert sample dict to list of spins (convert numpy types to Python int)
-                sample_list = [int(sample[i]) for i in sorted(sample.keys())]
-                samples.append(sample_list)
-                energies.append(float(energy))
-
-            self.logger.info(f"Solve completed: {len(samples)} samples with energies ranging from {min(energies):.2f} to {max(energies):.2f}")
-
-            # Create transaction record
-            from shared.block import Transaction
-            transaction = Transaction(
-                transaction_id=transaction_id,
-                timestamp=utc_timestamp(),
-                request_h=h,
-                request_J=J,
-                num_samples=num_samples,
-                samples=samples[:num_samples],
-                energies=energies[:num_samples]
-            )
-
-            # Add to pending transactions
-            async with self.transactions_lock:
-                self.pending_transactions.append(transaction)
-
-            self.logger.info(f"Transaction {transaction_id} added to pending pool")
-
-            return web.json_response({
-                "samples": samples[:num_samples],
-                "energies": energies[:num_samples],
-                "transaction_id": transaction_id,
-                "status": "completed"
-            })
-
-        except Exception as e:
-            self.logger.error(f"Error handling solve request: {e}")
-            import traceback
-            traceback.print_exc()
-            return web.json_response({"error": str(e)}, status=500)
-
-    async def handle_get_peers(self, request: web.Request) -> web.Response:
-        """Return list of known nodes."""
-        async with self.net_lock:
-            peers_data = copy.deepcopy(self.peers)
-
-        return web.json_response({"peers": peers_data})
-
-    async def handle_get_latest_block(self, request: web.Request) -> web.Response:
-        """Return the latest block."""
-        try:
-            block = self.get_latest_block()
-            if block is None:
-                return web.json_response({"error": "No blocks in chain"}, status=404)
-
-            # Check response format
-            format_param = request.query.get('format', 'json')
-            if format_param == 'network':
-                # Return network serialized binary data
-                return web.Response(
-                    body=block.to_network(),
-                    content_type='application/octet-stream',
-                    headers={'Content-Disposition': 'attachment; filename="latest_block.bin"'}
-                )
-            else:
-                # Return JSON (default)
-                return web.json_response(json.loads(block.to_json()))
-        except Exception as e:
-            self.logger.exception("Error getting latest block")
-            return web.json_response({"error": str(e)}, status=500)
-
-
-    async def handle_get_latest_block_header(self, request: web.Request) -> web.Response:
-        """Return only the latest block header (binary or JSON)."""
-        try:
-            block = self.get_latest_block()
-            if block is None:
-                return web.json_response({"error": "No blocks in chain"}, status=404)
-            header = block.header
-            fmt = request.query.get('format', 'json')
-            if fmt == 'network':
-                return web.Response(
-                    body=header.to_network(),
-                    content_type='application/octet-stream',
-                    headers={'Content-Disposition': 'attachment; filename="latest_block_header.bin"'}
-                )
-            else:
-                return web.json_response(header.to_json())
-        except Exception as e:
-            self.logger.exception("Error getting latest block header")
-            return web.json_response({"error": str(e)}, status=500)
-
-    async def handle_get_block_header(self, request: web.Request) -> web.Response:
-        """Return only a specific block header by number (binary or JSON)."""
-        number_str = request.match_info.get('number', 'unknown')
-        try:
-            if number_str is None:
-                return web.json_response({"error": "Block number required"}, status=400)
-            try:
-                block_number = int(number_str)
-            except ValueError:
-                return web.json_response({"error": "Invalid block number"}, status=400)
-
-            block = self.get_block(block_number)
-            if block is None:
-                return web.json_response({"error": f"Block {block_number} not found"}, status=404)
-            header = block.header
-            fmt = request.query.get('format', 'json')
-            if fmt == 'network':
-                return web.Response(
-                    body=header.to_network(),
-                    content_type='application/octet-stream',
-                    headers={'Content-Disposition': f'attachment; filename="block_{block_number}_header.bin"'}
-                )
-            else:
-                return web.json_response(header.to_json())
-        except Exception as e:
-            self.logger.exception(f"Error getting block header {number_str}")
-            return web.json_response({"error": str(e)}, status=500)
-
-    async def handle_get_block(self, request: web.Request) -> web.Response:
-        """Return a specific block by number."""
-        number_str = request.match_info.get('number', 'unknown')
-        try:
-            # Get block number from URL path parameter
-            if number_str is None:
-                return web.json_response({"error": "Block number required"}, status=400)
-
-            try:
-                block_number = int(number_str)
-            except ValueError:
-                return web.json_response({"error": "Invalid block number"}, status=400)
-
-            block = self.get_block(block_number)
-            if block is None:
-                return web.json_response({"error": f"Block {block_number} not found"}, status=404)
-
-            # Check response format
-            format_param = request.query.get('format', 'json')
-            if format_param == 'network':
-                # Return network serialized binary data
-                return web.Response(
-                    body=block.to_network(),
-                    content_type='application/octet-stream',
-                    headers={'Content-Disposition': f'attachment; filename="block_{block_number}.bin"'}
-                )
-            else:
-                # Return JSON (default)
-                return web.json_response(json.loads(block.to_json()))
-
-        except Exception as e:
-            self.logger.exception(f"Error getting block {number_str}")
-            return web.json_response({"error": str(e)}, status=500)
-
-    async def handle_get_stats(self, request: web.Request) -> web.Response:
+    async def _quic_handle_stats(self, msg: QuicMessage) -> QuicMessage:
         """Return node statistics from cache."""
-        try:
-            async with self._stats_cache_lock:
-                if self._stats_cache is None:
-                    # Cache not initialized yet, return empty stats
-                    return web.json_response({
-                        "node_id": self.node_id,
-                        "error": "Stats cache not initialized"
-                    }, status=503)
-                
-                # Return cached stats immediately
-                return web.json_response(self._stats_cache)
-        except Exception as e:
-            self.logger.exception("Error getting stats")
-            return web.json_response({"error": str(e)}, status=500)
+        async with self._stats_cache_lock:
+            if self._stats_cache is None:
+                return msg.create_error_response("Stats cache not initialized")
+            return msg.create_response(json.dumps(self._stats_cache).encode('utf-8'))
+
+    async def _quic_handle_block_request(self, msg: QuicMessage) -> QuicMessage:
+        """Return a specific block by number (binary format)."""
+        # Payload is 4-byte big-endian block number
+        if len(msg.payload) >= 4:
+            block_number = struct.unpack('!I', msg.payload[:4])[0]
+        else:
+            block_number = 0  # Latest block
+
+        if block_number == 0:
+            block = self.get_latest_block()
+        else:
+            block = self.get_block(block_number)
+
+        if block is None:
+            return msg.create_error_response(f"Block {block_number} not found")
+
+        # Return block in network binary format
+        return msg.create_response(block.to_network())
+
+    async def _quic_handle_block_header_request(self, msg: QuicMessage) -> QuicMessage:
+        """Return a specific block header by number (binary format)."""
+        # Payload is 4-byte big-endian block number
+        if len(msg.payload) >= 4:
+            block_number = struct.unpack('!I', msg.payload[:4])[0]
+        else:
+            block_number = 0  # Latest block
+
+        if block_number == 0:
+            block = self.get_latest_block()
+        else:
+            block = self.get_block(block_number)
+
+        if block is None:
+            return msg.create_error_response(f"Block {block_number} not found")
+
+        # Return header in network binary format
+        return msg.create_response(block.header.to_network())
+
+    async def _quic_handle_solve(self, msg: QuicMessage) -> QuicMessage:
+        """Handle quantum annealing solve request."""
+        data = json.loads(msg.payload.decode('utf-8'))
+
+        # Validate request
+        if 'h' not in data or 'J' not in data or 'num_samples' not in data:
+            return msg.create_error_response("Missing required fields: h, J, num_samples")
+
+        h = data['h']
+        J_raw = data['J']
+        num_samples = int(data['num_samples'])
+
+        # Convert J to list of tuples format
+        if isinstance(J_raw, dict):
+            J = [((int(k.split(',')[0].strip('()')), int(k.split(',')[1].strip('()'))), v)
+                 for k, v in J_raw.items()]
+        elif isinstance(J_raw, list):
+            J = [((entry[0], entry[1]), entry[2]) for entry in J_raw]
+        else:
+            return msg.create_error_response("Invalid J format. Must be dict or list.")
+
+        # Generate transaction ID
+        transaction_id = f"{self.public_host}-{time.time()}-{hash((tuple(h), tuple(J)))}"
+
+        # Convert h and J to format needed by sampler
+        h_dict = {i: val for i, val in enumerate(h)}
+        J_dict = {(i, j): val for ((i, j), val) in J}
+
+        # Use first available miner to solve
+        if not hasattr(self, 'miner_handles') or not self.miner_handles:
+            return msg.create_error_response("No miners available")
+
+        miner_handle = self.miner_handles[0]
+        self.logger.info(
+            f"Solving BQM with {len(h)} variables, {len(J)} couplings, "
+            f"{num_samples} samples using {miner_handle.miner_id}"
+        )
+
+        # Create appropriate sampler based on miner type
+        sampler = None
+        miner_kind = miner_handle.spec.get("kind", "").lower()
+
+        if miner_kind == "qpu":
+            from dwave.system import DWaveSampler
+            try:
+                sampler = DWaveSampler()
+                self.logger.info(f"Using QPU sampler: {sampler.properties.get('chip_id', 'unknown')}")
+            except Exception as e:
+                self.logger.error(f"Failed to create QPU sampler: {e}")
+                return msg.create_error_response(f"QPU not available: {e}")
+        elif miner_kind in ["cpu", "metal", "cuda", "modal"]:
+            from dwave.samplers import SimulatedAnnealingSampler
+            sampler = SimulatedAnnealingSampler()
+            self.logger.info("Using simulated annealing sampler")
+        else:
+            return msg.create_error_response(f"Unknown miner type: {miner_kind}")
+
+        # Sample the Ising problem
+        sampleset = sampler.sample_ising(h_dict, J_dict, num_reads=num_samples)
+
+        # Extract samples and energies
+        samples = []
+        energies = []
+        for sample, energy in sampleset.data(['sample', 'energy']):
+            sample_list = [int(sample[i]) for i in sorted(sample.keys())]
+            samples.append(sample_list)
+            energies.append(float(energy))
+
+        self.logger.info(
+            f"Solve completed: {len(samples)} samples with energies "
+            f"ranging from {min(energies):.2f} to {max(energies):.2f}"
+        )
+
+        # Create transaction record
+        from shared.block import Transaction
+        transaction = Transaction(
+            transaction_id=transaction_id,
+            timestamp=utc_timestamp(),
+            request_h=h,
+            request_J=J,
+            num_samples=num_samples,
+            samples=samples[:num_samples],
+            energies=energies[:num_samples]
+        )
+
+        # Add to pending transactions
+        async with self.transactions_lock:
+            self.pending_transactions.append(transaction)
+
+        self.logger.info(f"Transaction {transaction_id} added to pending pool")
+
+        response_data = {
+            "samples": samples[:num_samples],
+            "energies": energies[:num_samples],
+            "transaction_id": transaction_id,
+            "status": "completed"
+        }
+        return msg.create_response(json.dumps(response_data).encode('utf-8'))

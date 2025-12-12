@@ -1,371 +1,386 @@
-import asyncio
-import logging
-import random
-import ssl
-import time
-from typing import Dict, List, Optional, Any, TYPE_CHECKING
+"""QUIC client for QuIP P2P network peer communication."""
 
-import aiohttp
+import asyncio
+import datetime
+import ipaddress
+import json
+import logging
+import os
+import ssl
+import struct
+import tempfile
+import time
+from dataclasses import dataclass
+from enum import IntEnum
+from typing import Dict, Optional, Any, Tuple
+
+from aioquic.asyncio import connect
+from aioquic.asyncio.protocol import QuicConnectionProtocol
+from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.connection import QuicConnection
+from aioquic.quic.events import (
+    QuicEvent,
+    DatagramFrameReceived,
+    ConnectionTerminated,
+    HandshakeCompleted,
+)
 
 from shared.block import Block, BlockHeader, MinerInfo
 from shared.version import get_version
 from shared.time_utils import utc_timestamp_float
 
-if TYPE_CHECKING:
-    from shared.network_node import Message
+
+# QUIC protocol constants
+QUIP_ALPN_PROTOCOL = "quip-v1"
+DEFAULT_QUIC_PORT = 20049
+MAX_DATAGRAM_FRAME_SIZE = 65535
+
+
+class QuicMessageType(IntEnum):
+    """Message types for QUIC datagram protocol."""
+    # Request types (0x00-0x7F)
+    JOIN_REQUEST = 0x01
+    HEARTBEAT = 0x02
+    PEERS_REQUEST = 0x03
+    GOSSIP = 0x04
+    BLOCK_SUBMIT = 0x05
+    STATUS_REQUEST = 0x06
+    STATS_REQUEST = 0x07
+    BLOCK_REQUEST = 0x08
+    BLOCK_HEADER_REQUEST = 0x09
+    SOLVE_REQUEST = 0x0A
+
+    # Response types (0x80-0xFF)
+    JOIN_RESPONSE = 0x81
+    HEARTBEAT_RESPONSE = 0x82
+    PEERS_RESPONSE = 0x83
+    GOSSIP_RESPONSE = 0x84
+    BLOCK_SUBMIT_RESPONSE = 0x85
+    STATUS_RESPONSE = 0x86
+    STATS_RESPONSE = 0x87
+    BLOCK_RESPONSE = 0x88
+    BLOCK_HEADER_RESPONSE = 0x89
+    SOLVE_RESPONSE = 0x8A
+
+    ERROR_RESPONSE = 0xFF
+
+    @classmethod
+    def response_for(cls, request_type: 'QuicMessageType') -> 'QuicMessageType':
+        return cls(request_type | 0x80)
+
+    @property
+    def is_request(self) -> bool:
+        return self.value < 0x80
+
+
+@dataclass
+class QuicMessage:
+    """QUIC datagram message with framing.
+
+    Wire format: [1B msg_type][4B request_id][4B payload_len][payload...]
+    """
+    msg_type: QuicMessageType
+    request_id: int
+    payload: bytes
+
+    HEADER_SIZE = 9
+
+    def to_bytes(self) -> bytes:
+        header = struct.pack('!BII', self.msg_type, self.request_id, len(self.payload))
+        return header + self.payload
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> 'QuicMessage':
+        if len(data) < cls.HEADER_SIZE:
+            raise ValueError(f"Datagram too short: {len(data)}")
+        msg_type_raw, request_id, payload_len = struct.unpack('!BII', data[:cls.HEADER_SIZE])
+        msg_type = QuicMessageType(msg_type_raw)
+        payload = data[cls.HEADER_SIZE:cls.HEADER_SIZE + payload_len]
+        return cls(msg_type=msg_type, request_id=request_id, payload=payload)
+
+    def create_response(self, payload: bytes) -> 'QuicMessage':
+        return QuicMessage(
+            msg_type=QuicMessageType.response_for(self.msg_type),
+            request_id=self.request_id,
+            payload=payload
+        )
+
+    def create_error_response(self, error_message: str) -> 'QuicMessage':
+        return QuicMessage(
+            msg_type=QuicMessageType.ERROR_RESPONSE,
+            request_id=self.request_id,
+            payload=error_message.encode('utf-8')
+        )
+
+
+def generate_self_signed_cert(hostname: str = "localhost", cert_dir: Optional[str] = None) -> Tuple[str, str]:
+    """Generate self-signed certificate for QUIC TLS 1.3."""
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "QuIP Network"),
+        x509.NameAttribute(NameOID.COMMON_NAME, hostname),
+    ])
+
+    now = datetime.datetime.utcnow()
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .add_extension(
+            x509.SubjectAlternativeName([
+                x509.DNSName(hostname),
+                x509.DNSName("localhost"),
+                x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+            ]),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+
+    if cert_dir is None:
+        cert_dir = tempfile.gettempdir()
+
+    cert_path = os.path.join(cert_dir, "quip_quic_cert.pem")
+    key_path = os.path.join(cert_dir, "quip_quic_key.pem")
+
+    with open(cert_path, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    with open(key_path, "wb") as f:
+        f.write(key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+
+    return cert_path, key_path
+
+
+class _QuicClientProtocol(QuicConnectionProtocol):
+    """QUIC connection protocol handler for client."""
+
+    def __init__(self, quic: QuicConnection, stream_handler: Optional[Any] = None,
+                 logger: Optional[logging.Logger] = None):
+        super().__init__(quic, stream_handler)
+        self._logger = logger or logging.getLogger(__name__)
+        self._pending_requests: Dict[int, asyncio.Future] = {}
+        self._request_counter = 0
+        self._connected = asyncio.Event()
+        self._closed = False
+
+    def quic_event_received(self, event: QuicEvent) -> None:
+        if isinstance(event, HandshakeCompleted):
+            self._connected.set()
+        elif isinstance(event, DatagramFrameReceived):
+            self._handle_response(event.data)
+        elif isinstance(event, ConnectionTerminated):
+            self._closed = True
+            self._connected.clear()
+            for future in self._pending_requests.values():
+                if not future.done():
+                    future.set_exception(ConnectionError("Connection terminated"))
+            self._pending_requests.clear()
+
+    def _handle_response(self, data: bytes) -> None:
+        try:
+            msg = QuicMessage.from_bytes(data)
+            if msg.request_id in self._pending_requests:
+                future = self._pending_requests.pop(msg.request_id)
+                if not future.done():
+                    future.set_result(msg)
+        except Exception as e:
+            self._logger.warning(f"Invalid response: {e}")
+
+    async def wait_connected(self, timeout: float = 10.0) -> bool:
+        try:
+            await asyncio.wait_for(self._connected.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def send_request(self, msg_type: QuicMessageType, payload: bytes,
+                           timeout: float = 10.0) -> Optional[QuicMessage]:
+        if self._closed:
+            return None
+
+        self._request_counter += 1
+        request_id = self._request_counter
+        future: asyncio.Future[QuicMessage] = asyncio.get_event_loop().create_future()
+        self._pending_requests[request_id] = future
+
+        msg = QuicMessage(msg_type=msg_type, request_id=request_id, payload=payload)
+        try:
+            self._quic.send_datagram_frame(msg.to_bytes())
+            self.transmit()
+        except Exception as e:
+            self._pending_requests.pop(request_id, None)
+            return None
+
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._pending_requests.pop(request_id, None)
+            return None
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected.is_set() and not self._closed
 
 
 class NodeClient:
-    """HTTP client for peer communication with connection pooling and timeout handling."""
-    
-    def __init__(self, node_timeout: float = 10.0, logger: Optional[logging.Logger] = None, verify_ssl: bool = True):
+    """QUIC client for QuIP P2P networking with connection pooling."""
+
+    def __init__(self, node_timeout: float = 10.0, logger: Optional[logging.Logger] = None,
+                 verify_ssl: bool = False):
         self.node_timeout = node_timeout
         self.logger = logger or logging.getLogger(__name__)
         self.verify_ssl = verify_ssl
-        self.http_session: Optional[aiohttp.ClientSession] = None
+        self._connections: Dict[str, _QuicClientProtocol] = {}
+        self._connection_locks: Dict[str, asyncio.Lock] = {}
         self.peers: Dict[str, MinerInfo] = {}
-        # Connection string mapping: host -> full connection string (https://host:port or http://host:port)
-        self.conn_str: Dict[str, str] = {}
-        
-    async def start(self):
-        """Initialize HTTP session with connection pooling."""
-        if self.http_session:
-            return
-        
-        # Create SSL context
-        ssl_context = None
-        if self.verify_ssl:
-            ssl_context = ssl.create_default_context()
-        else:
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            
-        connector = aiohttp.TCPConnector(
-            limit=100,  # Total connection pool size
-            limit_per_host=10,  # Max connections per host
-            ttl_dns_cache=300,  # DNS cache TTL
-            use_dns_cache=True,
-            ssl=ssl_context,
-        )
-        self.http_session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=aiohttp.ClientTimeout(total=self.node_timeout)
-        )
-        
-    async def stop(self):
-        """Close HTTP session and cleanup resources."""
-        if self.http_session:
-            await self.http_session.close()
-            self.http_session = None
-            
-    def update_peers(self, peers: Dict[str, MinerInfo]):
-        """Update peer list from NetworkNode."""
-        self.peers = peers.copy()
-        
-    def add_peer(self, host: str, info: MinerInfo):
-        """Add a peer to the client."""
-        self.peers[host] = info
-        
-    def remove_peer(self, host: str):
-        """Remove a peer from the client."""
-        if host in self.peers:
-            del self.peers[host]
-        # Also remove connection string if it exists
-        if host in self.conn_str:
-            del self.conn_str[host]
-    
-    async def _establish_connection_string(self, peer_address: str) -> Optional[str]:
-        """
-        Establish connection string for a peer, trying HTTPS first, then HTTP.
-        
-        Args:
-            peer_address: Host:port string
-            
-        Returns:
-            Full connection string (https://host:port or http://host:port) or None if both fail
-        """
-        if not self.http_session:
-            self.logger.error("HTTP session not initialized")
-            return None
-        
-        # Try HTTPS first using /status endpoint (lightweight connection test)
-        https_url = f"https://{peer_address}"
-        try:
-            async with self.http_session.get(
-                f"{https_url}/status",
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as resp:
-                if resp.status == 200:
-                    self.logger.info(f"🔒 Established secure TLS connection to {peer_address}")
-                    return https_url
-        except (aiohttp.ClientError, asyncio.TimeoutError, ssl.SSLError) as e:
-            self.logger.debug(f"HTTPS connection to {peer_address} failed: {e}")
-        
-        # Fall back to HTTP
-        http_url = f"http://{peer_address}"
-        try:
-            async with self.http_session.get(
-                f"{http_url}/status",
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as resp:
-                if resp.status == 200:
-                    self.logger.warning(f"⚠️  Falling back to PLAINTEXT HTTP connection to {peer_address} (TLS unavailable)")
-                    return http_url
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            self.logger.debug(f"HTTP connection to {peer_address} failed: {e}")
-        
-        self.logger.error(f"❌ Both HTTPS and HTTP connections failed to {peer_address}")
-        return None
-    
-    async def _ensure_connection_string(self, host: str) -> Optional[str]:
-        """
-        Ensure we have a connection string for a host, establishing one if needed.
-        
-        Args:
-            host: Host:port string
-            
-        Returns:
-            Connection string or None if connection fails
-        """
-        if host in self.conn_str:
-            return self.conn_str[host]
-        
-        # Try to establish connection string
-        conn_str = await self._establish_connection_string(host)
-        if conn_str:
-            self.conn_str[host] = conn_str
-        return conn_str
-            
-    async def connect_to_peer(self, peer_address: str) -> bool:
-        """Connect to a peer and verify connection using TLS-first approach."""
-        # Check if we already have a connection string for this peer
-        if peer_address in self.conn_str:
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        for protocol in self._connections.values():
             try:
-                assert self.http_session
-                # Test existing connection using /status endpoint
-                async with self.http_session.get(
-                    f"{self.conn_str[peer_address]}/status",
-                    timeout=aiohttp.ClientTimeout(total=5)
-                ) as resp:
-                    return resp.status == 200
+                protocol.close()
+            except Exception:
+                pass
+        self._connections.clear()
+
+    def update_peers(self, peers: Dict[str, MinerInfo]) -> None:
+        self.peers = peers.copy()
+
+    def add_peer(self, host: str, info: MinerInfo) -> None:
+        self.peers[host] = info
+
+    def remove_peer(self, host: str) -> None:
+        self.peers.pop(host, None)
+        if host in self._connections:
+            try:
+                self._connections[host].close()
+            except Exception:
+                pass
+            del self._connections[host]
+
+    async def _get_connection(self, host: str) -> Optional[_QuicClientProtocol]:
+        if host not in self._connection_locks:
+            self._connection_locks[host] = asyncio.Lock()
+
+        async with self._connection_locks[host]:
+            if host in self._connections and self._connections[host].is_connected:
+                return self._connections[host]
+            self._connections.pop(host, None)
+
+            addr, port = (host.rsplit(':', 1) if ':' in host else (host, DEFAULT_QUIC_PORT))
+            port = int(port) if isinstance(port, str) else port
+
+            configuration = QuicConfiguration(
+                is_client=True,
+                max_datagram_frame_size=MAX_DATAGRAM_FRAME_SIZE,
+                alpn_protocols=[QUIP_ALPN_PROTOCOL],
+                idle_timeout=300.0,
+            )
+            if not self.verify_ssl:
+                configuration.verify_mode = ssl.CERT_NONE
+
+            try:
+                async with connect(
+                    host=addr, port=port, configuration=configuration,
+                    create_protocol=lambda *a, **k: _QuicClientProtocol(*a, logger=self.logger, **k),
+                ) as protocol:
+                    if await protocol.wait_connected(timeout=5.0):
+                        self._connections[host] = protocol
+                        self.logger.info(f"QUIC connection established to {host}")
+                        return protocol
+                    return None
             except Exception as e:
-                self.logger.debug(f"Existing connection to {peer_address} failed: {e}")
-                # Remove stale connection string and try to re-establish
-                del self.conn_str[peer_address]
-        
-        # Establish new connection string
-        conn_str = await self._establish_connection_string(peer_address)
-        if conn_str:
-            self.conn_str[peer_address] = conn_str
-            return True
-        
-        return False
-            
+                self.logger.warning(f"Failed to connect to {host}: {e}")
+                return None
+
     async def send_heartbeat(self, node_host: str, public_host: str, miner_info: MinerInfo) -> bool:
-        """Send heartbeat to a specific node."""
-        if not self.http_session:
+        protocol = await self._get_connection(node_host)
+        if not protocol:
             return False
-        
-        # Ensure we have a connection string for this host
-        conn_str = await self._ensure_connection_string(node_host)
-        if not conn_str:
-            return False
+        payload = json.dumps({
+            "sender": public_host, "version": get_version(), "timestamp": utc_timestamp_float()
+        }).encode('utf-8')
+        response = await protocol.send_request(QuicMessageType.HEARTBEAT, payload, timeout=5.0)
+        return response is not None and response.msg_type == QuicMessageType.HEARTBEAT_RESPONSE
 
-        try:
-            data = {
-                "sender": public_host,
-                "version": get_version(),
-                "timestamp": utc_timestamp_float()
-            }
-            async with self.http_session.post(
-                f"{conn_str}/heartbeat",
-                json=data,
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as resp:
-                return resp.status == 200
-        except Exception as e:
-            self.logger.debug(f"Heartbeat to {node_host} failed: {e}")
-            return False
-            
     async def get_peer_status(self, host: str) -> Optional[dict]:
-        """Get status from a peer node."""
-        if not self.http_session:
+        protocol = await self._get_connection(host)
+        if not protocol:
             return None
-        
-        # Ensure we have a connection string for this host
-        conn_str = await self._ensure_connection_string(host)
-        if not conn_str:
-            return None
-            
-        try:
-            async with self.http_session.get(f"{conn_str}/status") as resp:
-                if resp.status == 200:
-                    return await resp.json()
+        response = await protocol.send_request(QuicMessageType.STATUS_REQUEST, b'', timeout=self.node_timeout)
+        if response and response.msg_type == QuicMessageType.STATUS_RESPONSE:
+            try:
+                return json.loads(response.payload.decode('utf-8'))
+            except Exception:
                 return None
-        except Exception as e:
-            self.logger.debug(f"Failed to get status from {host}: {e}")
-            return None
-            
+        return None
+
     async def get_peer_block(self, host: str, block_number: int = 0) -> Optional[Block]:
-        """Get a block from a peer node and log precise download timings."""
-        if not self.http_session:
+        protocol = await self._get_connection(host)
+        if not protocol:
             return None
-        
-        # Ensure we have a connection string for this host
-        conn_str = await self._ensure_connection_string(host)
-        if not conn_str:
-            return None
-
         t0 = time.perf_counter()
-        
-        try:
-            req = "/block/"
-            if block_number > 0:
-                req = f"/block/{block_number}"
-            url = f"{conn_str}{req}?format=network"
-            
-            async with self.http_session.get(url) as resp:
-                t_headers = time.perf_counter()  # time to response headers
-                if resp.status == 200:
-                    data = await resp.read()
-                    t_done = time.perf_counter()
-                    bytes_received = len(data)
-                    block = Block.from_network(data)
-                    block_index = getattr(getattr(block, 'header', None), 'index', block_number)
-                    headers_ms = (t_headers - t0) * 1000.0
-                    body_ms = (t_done - t_headers) * 1000.0
-                    total_ms = (t_done - t0) * 1000.0
-                    self.logger.debug(f"📥 Downloaded block {block_index} from {host}: {bytes_received} bytes in {total_ms:.1f} ms (headers {headers_ms:.1f} ms, body {body_ms:.1f} ms) url={url}")
-                    return block
-                else:
-                    self.logger.debug(f"Failed to get block from {host}: HTTP {resp.status} url={url}")
-                    return None
-        except Exception as e:
-            self.logger.debug(f"Failed to get block {block_number} from {host}: {e}")
-            return None
-            
-    async def get_peer_block_header(self, host: str, block_number: int = 0) -> Optional[BlockHeader]:
-        """Get only the block header from a peer node (lighter and faster)."""
-        if not self.http_session:
-            return None
-        
-        # Ensure we have a connection string for this host
-        conn_str = await self._ensure_connection_string(host)
-        if not conn_str:
-            return None
-
-        t0 = time.perf_counter()
-        
-        try:
-            req = "/block_header/"
-            if block_number > 0:
-                req = f"/block_header/{block_number}"
-            url = f"{conn_str}{req}?format=network"
-            
-            async with self.http_session.get(url) as resp:
-                t_headers = time.perf_counter()
-                if resp.status == 200:
-                    data = await resp.read()
-                    t_done = time.perf_counter()
-                    bytes_received = len(data)
-                    header = BlockHeader.from_network(data)
-                    headers_ms = (t_headers - t0) * 1000.0
-                    body_ms = (t_done - t_headers) * 1000.0
-                    total_ms = (t_done - t0) * 1000.0
-                    self.logger.debug(f"📥 Downloaded block header {header.index} from {host}: {bytes_received} bytes in {total_ms:.1f} ms (headers {headers_ms:.1f} ms, body {body_ms:.1f} ms)")
-                    return header
-                else:
-                    self.logger.debug(f"Failed to get block header from {host}: HTTP {resp.status}")
-                    return None
-        except Exception as e:
-            self.logger.debug(f"Failed to get block header {block_number} from {host}: {e}")
-            return None
-            
-    async def gossip_broadcast(self, message: 'Message', sender_host: str, fanout: int = 3):
-        """Broadcast message to multiple peers using gossip protocol."""
-        if not self.http_session or not self.peers:
-            return
-            
-        # Select random subset of peers for gossip
-        available_peers = [host for host in self.peers.keys() if host != sender_host]
-        if not available_peers:
-            return
-            
-        selected_peers = random.sample(
-            available_peers, 
-            min(fanout, len(available_peers))
-        )
-        
-        # Broadcast to selected peers concurrently
-        tasks = []
-        for peer_host in selected_peers:
-            task = self._send_gossip_message(peer_host, message)
-            tasks.append(task)
-            
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-            
-    async def gossip_to(self, host: str, message: 'Message') -> bool:
-        """Send a message to a specific node and log precise timings."""
-        if not self.http_session:
-            return False
-        
-        # Ensure we have a connection string for this host
-        conn_str = await self._ensure_connection_string(host)
-        if not conn_str:
-            return False
-
-        t0 = time.perf_counter()
-        url = f"{conn_str}/gossip"
-        
-        try:
-            payload = message.to_network()
-            bytes_sent = len(payload)
-            headers = {'Content-Type': 'application/octet-stream'}
-            
-            async with self.http_session.post(url, data=payload, headers=headers) as resp:
-                t_headers = time.perf_counter()
-                # Read small JSON body to measure full roundtrip
-                try:
-                    await resp.read()
-                except Exception:
-                    pass
-                t_done = time.perf_counter()
-                headers_ms = (t_headers - t0) * 1000.0
-                body_ms = (t_done - t_headers) * 1000.0
-                total_ms = (t_done - t0) * 1000.0
-                ok = resp.status == 200
-                if ok:
-                    self.logger.debug(
-                        f"📨 Gossip to {host} type={message.type} id={(message.id or '')[:8]}: {bytes_sent} bytes in {total_ms:.1f} ms (headers {headers_ms:.1f} ms, body {body_ms:.1f} ms) url={url}"
-                    )
-                else:
-                    self.logger.debug(f"Failed gossip to {host}: HTTP {resp.status} url={url}")
-                return ok
-        except Exception as e:
-            t_err = time.perf_counter()
-            self.logger.debug(f"Error gossiping to {host} after {(t_err - t0)*1000.0:.1f} ms: {e}")
-            return False
-            
-    async def join_network_via_peer(self, peer_address: str, join_data: dict) -> Optional[dict]:
-        """Connect to peer and get network join response using proper SSL-aware connection."""
-        if not self.http_session:
-            return None
-
-        # Use proper SSL-aware connection establishment
-        conn_str = await self._ensure_connection_string(peer_address)
-        if not conn_str:
-            return None
-
-        try:
-            async with self.http_session.post(f"{conn_str}/join", json=join_data) as resp:
-                if resp.status == 200:
-                    return await resp.json()
+        payload = struct.pack('!I', block_number)
+        response = await protocol.send_request(QuicMessageType.BLOCK_REQUEST, payload, timeout=self.node_timeout)
+        if response and response.msg_type == QuicMessageType.BLOCK_RESPONSE:
+            try:
+                block = Block.from_network(response.payload)
+                self.logger.debug(f"Downloaded block {block.header.index} from {host} in {(time.perf_counter()-t0)*1000:.1f}ms")
+                return block
+            except Exception:
                 return None
-        except Exception:
-            return None
+        return None
 
-    async def _send_gossip_message(self, host: str, message: 'Message'):
-        """Send a single gossip message to a peer (legacy wrapper)."""
-        return await self.gossip_to(host, message)
+    async def get_peer_block_header(self, host: str, block_number: int = 0) -> Optional[BlockHeader]:
+        protocol = await self._get_connection(host)
+        if not protocol:
+            return None
+        payload = struct.pack('!I', block_number)
+        response = await protocol.send_request(QuicMessageType.BLOCK_HEADER_REQUEST, payload, timeout=self.node_timeout)
+        if response and response.msg_type == QuicMessageType.BLOCK_HEADER_RESPONSE:
+            try:
+                return BlockHeader.from_network(response.payload)
+            except Exception:
+                return None
+        return None
+
+    async def gossip_to(self, host: str, message: 'Message') -> bool:
+        from shared.network_node import Message
+        protocol = await self._get_connection(host)
+        if not protocol:
+            return False
+        payload = message.to_network()
+        response = await protocol.send_request(QuicMessageType.GOSSIP, payload, timeout=5.0)
+        return response is not None and response.msg_type == QuicMessageType.GOSSIP_RESPONSE
+
+    async def join_network_via_peer(self, peer_address: str, join_data: dict) -> Optional[dict]:
+        protocol = await self._get_connection(peer_address)
+        if not protocol:
+            return None
+        payload = json.dumps(join_data).encode('utf-8')
+        response = await protocol.send_request(QuicMessageType.JOIN_REQUEST, payload, timeout=self.node_timeout)
+        if response and response.msg_type == QuicMessageType.JOIN_RESPONSE:
+            try:
+                return json.loads(response.payload.decode('utf-8'))
+            except Exception:
+                return None
+        return None
+
+    async def connect_to_peer(self, peer_address: str) -> bool:
+        protocol = await self._get_connection(peer_address)
+        return protocol is not None and protocol.is_connected
