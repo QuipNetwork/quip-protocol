@@ -305,7 +305,7 @@ def cpu(
         genesis_config = conf["genesis_config"]
 
     # Print final configuration if requested
-    if debug_config or ctx.obj.get("debug_config", False):
+    if debug_config or (ctx.obj or {}).get("debug_config", False):
         _print_final_config(conf, "cpu")
 
     sys.exit(_run_network_node_sync(conf, genesis_config))
@@ -397,7 +397,7 @@ def gpu(
         genesis_config = conf["genesis_config"]
 
     # Print final configuration if requested
-    if debug_config or ctx.obj.get("debug_config", False):
+    if debug_config or (ctx.obj or {}).get("debug_config", False):
         _print_final_config(conf, "gpu")
 
     sys.exit(_run_network_node_sync(conf, genesis_config))
@@ -497,7 +497,7 @@ def qpu(
         genesis_config = conf["genesis_config"]
 
     # Print final configuration if requested
-    if debug_config or ctx.obj.get("debug_config", False):
+    if debug_config or (ctx.obj or {}).get("debug_config", False):
         _print_final_config(conf, "qpu")
 
     sys.exit(_run_network_node_sync(conf, genesis_config))

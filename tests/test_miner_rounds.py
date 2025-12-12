@@ -50,28 +50,26 @@ def test_cpu_auto_mine_quick():
 def test_gpu_auto_mine_quick_env_only(monkeypatch):
     # Only assert CLI/env wiring for a quick GPU auto-mine run (no actual GPU required)
     cfg = """
-[global]
-default = "gpu"
-port = 0
-
 [gpu]
 backend = "local"
 devices = ["0"]
 """
+    from typing import Dict, Any
     with TemporaryDirectory() as td:
         cfg_path = os.path.join(td, "cfg.toml")
         with open(cfg_path, "w") as f:
             f.write(cfg)
         # Patch runner to avoid actually spawning GPU work, just confirm exit path
-        captured = {}
-        def fake_run(kind, host, port, peer, auto_mine, env_overrides=None, genesis_config_file="genesis_block.json"):
-            captured.update({"env": env_overrides or {}, "auto": auto_mine})
+        captured: Dict[str, Any] = {}
+        def fake_run(config: Dict[str, Any], genesis_config_file: str = "genesis_block.json"):
+            captured.update({"config": config, "genesis_config_file": genesis_config_file})
             return 0
-        monkeypatch.setattr(quip_cli, "_run_p2p_node", fake_run)
+        monkeypatch.setattr(quip_cli, "_run_network_node_sync", fake_run)
         runner = CliRunner()
-        res = runner.invoke(quip_cli.quip_network_node, ["--config", cfg_path, "gpu", "--auto-mine", "5"])
+        res = runner.invoke(quip_cli.quip_network_node, ["--config", cfg_path, "gpu", "--auto-mine"])
         assert res.exit_code == 0
-        assert captured["env"].get("QUIP_GPU_BACKEND") == "local"
-        assert captured["env"].get("QUIP_GPU_DEVICES") == "0"
-        assert captured["auto"] == 5
+        config = captured["config"]
+        assert config["gpu"].get("backend") == "local"
+        assert config["gpu"].get("devices") == ["0"]
+        assert config.get("auto_mine") is True
 

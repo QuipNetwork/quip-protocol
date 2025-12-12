@@ -6,11 +6,37 @@ import pytest
 import time
 import sys
 import os
+from dataclasses import dataclass
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from shared.miner_worker import MinerHandle
+
+
+# Module-level mock classes that can be pickled
+@dataclass
+class MockHeader:
+    index: int = 0
+
+@dataclass
+class MockBlock:
+    hash: bytes = b'test_hash'
+    header: MockHeader = None
+
+    def __post_init__(self):
+        if self.header is None:
+            self.header = MockHeader()
+
+@dataclass
+class MockNodeInfo:
+    miner_id: str = 'test-miner'
+
+@dataclass
+class MockRequirements:
+    difficulty_energy: float = -14000.0
+    min_diversity: float = 0.3
+    min_solutions: int = 10
 
 def _cuda_available():
     """Check if CUDA is available for testing."""
@@ -56,25 +82,13 @@ def _modal_available():
 
 class TestSignalResponsiveMining:
     """Test suite for signal-responsive mining architecture."""
-    
+
     @pytest.fixture
     def mock_mining_objects(self):
         """Create mock objects for testing."""
-        mock_block = type('MockBlock', (), {
-            'hash': b'test_hash',
-            'header': type('Header', (), {'index': 0})()
-        })()
-        
-        mock_node_info = type('NodeInfo', (), {
-            'miner_id': 'test-miner'
-        })()
-        
-        mock_requirements = type('Requirements', (), {
-            'difficulty_energy': -14000.0,
-            'min_diversity': 0.3,
-            'min_solutions': 10
-        })()
-        
+        mock_block = MockBlock()
+        mock_node_info = MockNodeInfo()
+        mock_requirements = MockRequirements()
         return mock_block, mock_node_info, mock_requirements
     
     def test_cpu_signal_responsiveness(self, mock_mining_objects):
