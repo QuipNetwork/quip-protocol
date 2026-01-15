@@ -42,6 +42,9 @@ dev = [
 quip-network-node = "quip_cli:network_node_main"
 quip-network-simulator = "quip_cli:network_simulator_main"
 
+[tool.setuptools]
+py-modules = ["quip_cli"]
+
 [tool.setuptools.packages.find]
 include = ["shared*", "dwave*", "CPU*", "GPU*", "QPU*"]
 
