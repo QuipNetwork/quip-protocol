@@ -1,0 +1,914 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  min-height: 100vh;
+  padding: 20px;
+}
+
+#root {
+  width: 100%;
+}
+
+.container {
+  max-width: 900px;
+  margin: 0 auto;
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+  overflow: hidden;
+}
+
+.header {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  padding: 30px;
+  text-align: center;
+}
+
+.header h1 {
+  font-size: 32px;
+  margin-bottom: 10px;
+}
+
+.header p,
+.header .subtitle {
+  opacity: 0.9;
+  font-size: 16px;
+}
+
+/* Card/Section Styles */
+.card {
+  margin: 20px;
+  padding: 20px;
+  background: #f7fafc;
+  border-radius: 8px;
+  border: 2px dashed #cbd5e0;
+}
+
+.card h2 {
+  margin-bottom: 15px;
+  color: #2d3748;
+}
+
+/* Wallet Section */
+.wallet-section {
+  margin: 20px;
+  padding: 20px;
+  background: #f7fafc;
+  border-radius: 8px;
+  border: 2px dashed #cbd5e0;
+}
+
+.wallet-section h2 {
+  margin-bottom: 15px;
+  color: #2d3748;
+}
+
+.wallet-state {
+  color: #718096;
+}
+
+.wallet-state p {
+  margin-bottom: 15px;
+}
+
+.wallet-connected {
+  background: #f0fff4;
+  border-color: #48bb78;
+}
+
+.wallet-info {
+  margin-bottom: 15px;
+}
+
+.info-row {
+  margin: 8px 0;
+}
+
+.info-row .label {
+  font-weight: 600;
+  margin-right: 8px;
+}
+
+.info-row .address {
+  font-family: monospace;
+  background: #edf2f7;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+/* Buttons */
+.btn {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  border: none;
+  padding: 12px 24px;
+  border-radius: 6px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.2s, box-shadow 0.2s;
+  width: 100%;
+  margin-top: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+}
+
+.btn:disabled {
+  background: #cbd5e0;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+}
+
+.btn-secondary {
+  background: #48bb78;
+}
+
+.btn-danger {
+  background: #f56565;
+}
+
+.btn-icon {
+  font-size: 18px;
+}
+
+/* Tabs */
+.tabs {
+  display: flex;
+  border-bottom: 2px solid #e2e8f0;
+  margin: 0 20px 20px;
+}
+
+.tab {
+  padding: 12px 24px;
+  cursor: pointer;
+  border: none;
+  background: none;
+  font-size: 16px;
+  font-weight: 600;
+  color: #718096;
+  transition: color 0.2s;
+}
+
+.tab:hover {
+  color: #667eea;
+}
+
+.tab.active {
+  color: #667eea;
+  border-bottom: 2px solid #667eea;
+  margin-bottom: -2px;
+}
+
+/* Tab Content */
+.tab-content {
+  padding: 0 20px 20px;
+}
+
+/* Forms */
+.form-group {
+  margin-bottom: 20px;
+}
+
+.form-group label {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 600;
+  color: #2d3748;
+}
+
+.form-group input,
+.form-group select {
+  width: 100%;
+  padding: 12px;
+  border: 2px solid #e2e8f0;
+  border-radius: 6px;
+  font-size: 14px;
+  transition: border-color 0.2s;
+}
+
+.form-group input:focus,
+.form-group select:focus {
+  outline: none;
+  border-color: #667eea;
+}
+
+.form-group small {
+  display: block;
+  margin-top: 4px;
+  color: #718096;
+  font-size: 13px;
+}
+
+/* Alerts */
+.alert {
+  padding: 12px 16px;
+  border-radius: 6px;
+  margin-bottom: 20px;
+}
+
+.alert-info {
+  background: #ebf8ff;
+  color: #2c5282;
+  border-left: 4px solid #4299e1;
+}
+
+.alert-success {
+  background: #f0fff4;
+  color: #22543d;
+  border-left: 4px solid #48bb78;
+}
+
+.alert-error {
+  background: #fed7d7;
+  color: #742a2a;
+  border-left: 4px solid #f56565;
+}
+
+.cost-estimate {
+  font-size: 16px;
+}
+
+/* Deployment List */
+.deployment-list {
+  margin-top: 20px;
+}
+
+.deployment-item {
+  background: #f7fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 12px;
+}
+
+.deployment-item h3 {
+  font-size: 18px;
+  margin-bottom: 8px;
+  color: #2d3748;
+}
+
+.deployment-item p {
+  color: #718096;
+  font-size: 14px;
+  margin: 4px 0;
+}
+
+.deployment-status {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.status-pending {
+  background: #fef5e7;
+  color: #f59e0b;
+}
+
+.status-active {
+  background: #f0fff4;
+  color: #48bb78;
+}
+
+.status-closed {
+  background: #fed7d7;
+  color: #f56565;
+}
+
+/* Empty State */
+.empty-state {
+  color: #718096;
+  text-align: center;
+  padding: 20px;
+}
+
+/* Loading Spinner */
+.loading {
+  text-align: center;
+  padding: 20px;
+}
+
+.spinner {
+  border: 3px solid #f3f3f3;
+  border-top: 3px solid #667eea;
+  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  animation: spin 1s linear infinite;
+  margin: 0 auto;
+}
+
+@keyframes spin {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+/* Results Output */
+.results-output {
+  background: #f7fafc;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+/* Wallet Modal */
+.wallet-modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+  backdrop-filter: blur(4px);
+}
+
+.wallet-modal {
+  background: white;
+  border-radius: 16px;
+  width: 90%;
+  max-width: 400px;
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+  overflow: hidden;
+  animation: modalSlideIn 0.2s ease-out;
+}
+
+@keyframes modalSlideIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95) translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.wallet-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 24px;
+  border-bottom: 1px solid #e2e8f0;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+}
+
+.wallet-modal-header h3 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: white;
+}
+
+.wallet-modal-close {
+  background: rgba(255, 255, 255, 0.2);
+  border: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  font-size: 24px;
+  color: white;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s;
+}
+
+.wallet-modal-close:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+.wallet-modal-body {
+  padding: 24px;
+}
+
+.wallet-modal-loading {
+  text-align: center;
+  padding: 40px 20px;
+}
+
+.wallet-modal-loading .spinner {
+  width: 48px;
+  height: 48px;
+  margin-bottom: 16px;
+}
+
+.wallet-modal-loading p {
+  color: #718096;
+  font-size: 14px;
+}
+
+.wallet-modal-error {
+  text-align: center;
+  padding: 20px;
+}
+
+.wallet-modal-error p {
+  color: #e53e3e;
+  margin-bottom: 16px;
+}
+
+.wallet-modal-qr {
+  text-align: center;
+}
+
+.qr-container {
+  background: white;
+  padding: 16px;
+  border-radius: 12px;
+  display: inline-block;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+  margin-bottom: 20px;
+}
+
+.qr-instructions {
+  font-size: 16px;
+  font-weight: 600;
+  color: #2d3748;
+  margin-bottom: 16px;
+}
+
+.qr-steps {
+  text-align: left;
+  padding-left: 24px;
+  margin: 0;
+  color: #718096;
+  font-size: 14px;
+  line-height: 1.8;
+}
+
+.qr-steps li {
+  margin-bottom: 4px;
+}
+
+/* Responsive */
+@media (max-width: 600px) {
+  body {
+    padding: 10px;
+  }
+
+  .header {
+    padding: 20px;
+  }
+
+  .header h1 {
+    font-size: 24px;
+  }
+
+  .tabs {
+    flex-direction: column;
+    margin: 0 10px 10px;
+  }
+
+  .tab {
+    padding: 10px 16px;
+    text-align: left;
+    border-bottom: 1px solid #e2e8f0;
+  }
+
+  .tab.active {
+    border-bottom: 1px solid #e2e8f0;
+    border-left: 3px solid #667eea;
+    margin-bottom: 0;
+  }
+
+  .card,
+  .wallet-section {
+    margin: 10px;
+    padding: 15px;
+  }
+
+  .tab-content {
+    padding: 0 10px 10px;
+  }
+}
+
+/* Bid Selection */
+.bid-selection {
+  background: #f7fafc;
+  border-radius: 8px;
+  padding: 20px;
+  margin-bottom: 20px;
+}
+
+.bid-selection h3 {
+  margin-bottom: 8px;
+  color: #2d3748;
+}
+
+.bid-info {
+  color: #718096;
+  font-size: 14px;
+  margin-bottom: 16px;
+}
+
+.bid-list {
+  max-height: 400px;
+  overflow-y: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: white;
+}
+
+.bid-item {
+  display: flex;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid #e2e8f0;
+  transition: background 0.2s;
+}
+
+.bid-item:last-child {
+  border-bottom: none;
+}
+
+.bid-item:hover {
+  background: #ebf8ff;
+}
+
+.bid-rank {
+  font-weight: 700;
+  font-size: 14px;
+  color: #667eea;
+  width: 40px;
+  flex-shrink: 0;
+}
+
+.bid-details {
+  flex: 1;
+  min-width: 0;
+}
+
+.bid-provider {
+  font-size: 14px;
+  color: #2d3748;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bid-address {
+  font-size: 12px;
+  color: #a0aec0;
+  font-family: monospace;
+}
+
+.bid-price {
+  text-align: right;
+  flex-shrink: 0;
+  margin-left: 16px;
+}
+
+.bid-price strong {
+  display: block;
+  font-size: 16px;
+  color: #48bb78;
+}
+
+.bid-price-unit {
+  font-size: 11px;
+  color: #a0aec0;
+}
+
+/* Forwarded Ports */
+.forwarded-ports {
+  margin: 8px 0;
+  padding: 12px;
+  background: #ebf8ff;
+  border-radius: 6px;
+  border-left: 4px solid #4299e1;
+}
+
+.forwarded-ports a:hover {
+  text-decoration: underline;
+}
+
+/* Deployment Actions */
+.deployment-actions {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.deployment-actions a {
+  text-decoration: none;
+  display: inline-block;
+}
+
+/* ============================================================================
+   Fleet Deployment Styles
+   ============================================================================ */
+
+.fleet-deployment {
+  padding: 20px 0;
+}
+
+.fleet-header {
+  margin-bottom: 24px;
+}
+
+.fleet-header h2 {
+  margin: 0 0 8px 0;
+  color: #2d3748;
+  font-size: 24px;
+}
+
+.fleet-subtitle {
+  color: #718096;
+  margin: 0;
+}
+
+.fleet-loading {
+  text-align: center;
+  padding: 40px;
+  color: #718096;
+}
+
+/* Capacity Overview */
+.capacity-overview {
+  background: #f7fafc;
+  border-radius: 8px;
+  padding: 20px;
+  margin-bottom: 20px;
+}
+
+.capacity-overview h3 {
+  margin: 0 0 16px 0;
+  color: #2d3748;
+}
+
+.capacity-stats,
+.plan-stats,
+.summary-stats {
+  display: flex;
+  gap: 24px;
+  margin-bottom: 20px;
+}
+
+.stat {
+  text-align: center;
+}
+
+.stat-value {
+  display: block;
+  font-size: 32px;
+  font-weight: 700;
+  color: #667eea;
+}
+
+.stat-label {
+  display: block;
+  font-size: 12px;
+  color: #718096;
+  text-transform: uppercase;
+}
+
+.stat-success .stat-value {
+  color: #48bb78;
+}
+
+.stat-error .stat-value {
+  color: #fc8181;
+}
+
+/* Provider List */
+.top-providers h4 {
+  margin: 0 0 12px 0;
+  color: #4a5568;
+  font-size: 14px;
+}
+
+.provider-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.provider-item {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: white;
+  border-radius: 4px;
+  border: 1px solid #e2e8f0;
+}
+
+.provider-name {
+  color: #2d3748;
+  font-weight: 500;
+}
+
+.reliable-badge {
+  color: #48bb78;
+  margin-right: 6px;
+}
+
+.provider-capacity {
+  color: #718096;
+  font-size: 14px;
+  font-family: monospace;
+}
+
+/* Allocation List */
+.allocation-list {
+  margin-top: 20px;
+}
+
+.allocation-list h4 {
+  margin: 0 0 12px 0;
+  color: #4a5568;
+  font-size: 14px;
+}
+
+.allocation-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: white;
+  border-radius: 4px;
+  border: 1px solid #e2e8f0;
+  margin-bottom: 8px;
+}
+
+.alloc-index {
+  font-weight: 700;
+  color: #667eea;
+  width: 30px;
+}
+
+.alloc-provider {
+  flex: 1;
+  color: #2d3748;
+}
+
+.alloc-resources {
+  color: #718096;
+  font-size: 14px;
+  font-family: monospace;
+}
+
+/* Progress */
+.progress-header {
+  margin-bottom: 20px;
+}
+
+.progress-bar {
+  height: 8px;
+  background: #e2e8f0;
+  border-radius: 4px;
+  overflow: hidden;
+  margin: 12px 0;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #667eea, #764ba2);
+  transition: width 0.3s ease;
+}
+
+.progress-text {
+  color: #718096;
+  font-size: 14px;
+  margin: 0;
+}
+
+/* Deployment Grid */
+.deployment-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.deployment-card {
+  background: white;
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+  padding: 12px;
+  transition: border-color 0.2s;
+}
+
+.deployment-card.status-active {
+  border-color: #48bb78;
+}
+
+.deployment-card.status-failed {
+  border-color: #fc8181;
+}
+
+.deployment-card.status-creating,
+.deployment-card.status-waiting-bids,
+.deployment-card.status-selecting-bid,
+.deployment-card.status-accepting-bid,
+.deployment-card.status-sending-manifest {
+  border-color: #667eea;
+}
+
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.card-index {
+  font-weight: 700;
+  color: #667eea;
+}
+
+.card-status {
+  font-size: 12px;
+  text-transform: capitalize;
+}
+
+.card-body {
+  font-size: 13px;
+}
+
+.card-provider {
+  color: #2d3748;
+  font-weight: 500;
+  margin-bottom: 4px;
+}
+
+.card-resources {
+  color: #718096;
+  font-family: monospace;
+  font-size: 12px;
+}
+
+.card-dseq {
+  color: #a0aec0;
+  font-family: monospace;
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+.card-error {
+  color: #fc8181;
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+/* Fleet Actions */
+.fleet-actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.fleet-actions .btn {
+  padding: 10px 20px;
+}
+
+/* Summary */
+.summary-header {
+  text-align: center;
+  margin-bottom: 20px;
+}
+
+.summary-header h3 {
+  margin: 0;
+  font-size: 24px;
+}
+
+/* Plan Summary */
+.plan-summary {
+  background: #f7fafc;
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.plan-summary h3 {
+  margin: 0 0 16px 0;
+  color: #2d3748;
+}

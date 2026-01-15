@@ -12,7 +12,7 @@ Gzipped files are preferred as they significantly reduce file size (typically 10
 import json
 import gzip
 import os
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Union
 import networkx as nx
 
 
@@ -61,7 +61,7 @@ class DWaveTopologyFromJSON:
         return self._graph
 
 
-def load_json_topology(filename: str, topologies_dir: str = None) -> DWaveTopologyFromJSON:
+def load_json_topology(filename: str, topologies_dir: str = None, from_embeddings: bool = False) -> DWaveTopologyFromJSON:
     """
     Load a topology from a JSON file (plain or gzipped).
 
@@ -70,19 +70,26 @@ def load_json_topology(filename: str, topologies_dir: str = None) -> DWaveTopolo
 
     Args:
         filename: Name of the JSON topology file (e.g., 'zephyr_z11_t4.json' or 'zephyr_z11_t4.json.gz')
-        topologies_dir: Directory containing topology files. If None, uses default.
+        topologies_dir: Directory containing topology files. If None, uses default based on from_embeddings.
+        from_embeddings: If True, load from embeddings/Advantage2_system1_8/. Otherwise load from topologies/.
 
     Returns:
         DWaveTopologyFromJSON instance
 
     Example:
-        >>> topology = load_json_topology('zephyr_z11_t4.json')  # Works for both .json and .json.gz
+        >>> topology = load_json_topology('zephyr_z11_t4.json', from_embeddings=True)  # Mined topologies
+        >>> topology = load_json_topology('zephyr_z12_t4.json')  # Pregenerated topologies
         >>> print(f"Loaded {topology.num_nodes} nodes, {topology.num_edges} edges")
     """
     if topologies_dir is None:
-        # Default to dwave_topologies/topologies directory
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        topologies_dir = current_dir
+        if from_embeddings:
+            # Mined topologies are in embeddings/Advantage2_system1_8/
+            parent_dir = os.path.dirname(current_dir)
+            topologies_dir = os.path.join(parent_dir, 'embeddings', 'Advantage2_system1_8')
+        else:
+            # Pregenerated topologies are in topologies/
+            topologies_dir = current_dir
 
     filepath = os.path.join(topologies_dir, filename)
 
@@ -106,26 +113,110 @@ def load_json_topology(filename: str, topologies_dir: str = None) -> DWaveTopolo
     return DWaveTopologyFromJSON(json_data)
 
 
-# Legacy dictionary format converter
-def json_topology_to_dict(topology: DWaveTopologyFromJSON) -> Dict[str, Any]:
+def load_topology(topology_name: str) -> Any:
     """
-    Convert a JSON topology to legacy dictionary format.
+    Parse a topology name or filename and return the appropriate topology object.
+
+    This function handles:
+    - Zephyr topology names: "Z(9,2)" → generates ZephyrTopology on-the-fly
+    - Hardware topology names: "Advantage2_system1.8" → loads from JSON
+    - File paths: "path/to/topology.json" → loads from file
+    - Named topologies: "ZEPHYR_Z9_T2_TOPOLOGY" → returns from dwave_topologies module
 
     Args:
-        topology: DWaveTopologyFromJSON instance
+        topology_name: String identifying the topology. Can be:
+                      - Zephyr format: "Z(9,2)", "Z(10,2)", etc.
+                      - Hardware name: "Advantage2_system1.8", "Advantage2_system4_1"
+                      - File path: "path/to/custom_topology.json" or ".json.gz"
+                      - Named constant: "ZEPHYR_Z9_T2_TOPOLOGY"
 
     Returns:
-        Dictionary in legacy format for backward compatibility
+        DWaveTopology object (either ZephyrTopology or DWaveTopologyFromJSON)
+
+    Raises:
+        ValueError: If topology_name format is not recognized
+        FileNotFoundError: If a file path is provided but file doesn't exist
+
+    Examples:
+        >>> # Zephyr topologies (generated on-the-fly)
+        >>> topology = load_topology("Z(9,2)")
+        >>> topology = load_topology("Z(10,2)")
+
+        >>> # Hardware topologies (loaded from JSON)
+        >>> topology = load_topology("Advantage2_system1.8")
+        >>> topology = load_topology("Advantage2-system1.8")  # Also works
+
+        >>> # Custom file
+        >>> topology = load_topology("path/to/my_topology.json.gz")
+
+        >>> # Named constants
+        >>> topology = load_topology("ZEPHYR_Z9_T2_TOPOLOGY")
     """
-    return {
-        'solver_name': topology.solver_name,
-        'topology_type': topology.topology_type,
-        'topology_shape': topology.topology_shape,
-        'num_nodes': topology.num_nodes,
-        'num_edges': topology.num_edges,
-        'nodes': topology.nodes,
-        'edges': topology.edges,
-        'properties': topology.properties,
-        'generated_at': topology.generated_at,
-        'docs': topology.docs
-    }
+    from .zephyr import ZephyrTopology
+
+    # Case 1: File path (contains / or ends with .json/.json.gz)
+    if '/' in topology_name or topology_name.endswith(('.json', '.json.gz')):
+        if not os.path.exists(topology_name):
+            raise FileNotFoundError(f"Topology file not found: {topology_name}")
+        return load_json_topology(os.path.basename(topology_name),
+                                  topologies_dir=os.path.dirname(topology_name) or None)
+
+    # Case 2: Zephyr format Z(m,t) - generate on-the-fly
+    if topology_name.startswith("Z(") and topology_name.endswith(")"):
+        try:
+            # Parse Z(m,t) format
+            parts = topology_name[2:-1].split(",")
+            m = int(parts[0].strip())
+            t = int(parts[1].strip())
+
+            # Create Zephyr topology (graph generated lazily)
+            return ZephyrTopology(m, t)
+        except (ValueError, IndexError) as e:
+            raise ValueError(f"Invalid Zephyr format '{topology_name}'. Expected 'Z(m,t)' with integer m,t. Error: {e}")
+
+    # Case 2b: Old Zephyr format "Zephyr_Zm_Tt_Generic" (deprecated, for backward compatibility)
+    if topology_name.startswith("Zephyr_Z") and "_T" in topology_name:
+        import re
+        match = re.match(r'Zephyr_Z(\d+)_T(\d+)(?:_Generic)?', topology_name)
+        if match:
+            m = int(match.group(1))
+            t = int(match.group(2))
+            return ZephyrTopology(m, t)
+
+    # Case 3: Hardware topology name (e.g., "Advantage2_system1.8" or "Advantage2-system1.8")
+    # Normalize name to match JSON filename
+    normalized_name = topology_name.replace('-', '_').replace('.', '_').lower()
+
+    # Try to load as JSON file
+    try:
+        json_filename = f"{normalized_name}.json"
+        return load_json_topology(json_filename, from_embeddings=False)
+    except FileNotFoundError:
+        pass
+
+    # Case 4: Try loading from embeddings directory
+    try:
+        json_filename = f"{normalized_name}.json"
+        return load_json_topology(json_filename, from_embeddings=True)
+    except FileNotFoundError:
+        pass
+
+    # Case 5: Named constant from dwave_topologies module
+    try:
+        import dwave_topologies
+        if hasattr(dwave_topologies, topology_name):
+            return getattr(dwave_topologies, topology_name)
+    except Exception:
+        pass
+
+    # No match found
+    raise ValueError(
+        f"Could not parse topology name '{topology_name}'. "
+        f"Expected formats:\n"
+        f"  - Zephyr: Z(m,t) (e.g., 'Z(9,2)')\n"
+        f"  - Hardware: Advantage2_system1.8 or Advantage2-system1.8\n"
+        f"  - File path: path/to/topology.json or .json.gz\n"
+        f"  - Named constant: ZEPHYR_Z9_T2_TOPOLOGY"
+    )
+
+

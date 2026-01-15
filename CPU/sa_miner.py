@@ -17,13 +17,14 @@ from shared.quantum_proof_of_work import generate_ising_model_from_nonce, ising_
 from shared.block_requirements import compute_current_requirements
 
 class SimulatedAnnealingMiner(BaseMiner):
-    def __init__(self, miner_id: str, **cfg):
-        sampler = SimulatedAnnealingStructuredSampler()
+    def __init__(self, miner_id: str, sampler=None, topology=None, **cfg):
+        if sampler is None:
+            sampler = SimulatedAnnealingStructuredSampler(topology=topology)
         self.nodes = sampler.nodes
         self.edges = sampler.edges
         super().__init__(miner_id, sampler)
         self.miner_type = "CPU"
-        
+
         # Register SIGTERM handler for graceful cleanup
         signal.signal(signal.SIGTERM, self._cleanup_handler)
     
@@ -56,6 +57,7 @@ class SimulatedAnnealingMiner(BaseMiner):
         requirements,
         prev_timestamp: int,
         stop_event: multiprocessing.synchronize.Event,
+        drain: bool = False,
     ) -> Optional[MiningResult]:
         """Mine a block using simulated annealing.
 
@@ -185,7 +187,15 @@ class SimulatedAnnealingMiner(BaseMiner):
                 if stop_event.is_set():
                     self.logger.info("Interrupted during sampling")
                     return None
-                self.logger.error(f"Sampling error: {e}")
+                # Log detailed diagnostic info for debugging rare sampling errors
+                import traceback
+                self.logger.error(
+                    f"Sampling error: {e}\n"
+                    f"  Topology: nodes={len(nodes)}, edges={len(edges)}\n"
+                    f"  h keys: {len(h)}, J keys: {len(J)}\n"
+                    f"  Nonce: {nonce}, Salt: {salt.hex()[:8]}...\n"
+                    f"  Traceback:\n{traceback.format_exc()}"
+                )
                 continue
 
             # Track postprocessing time

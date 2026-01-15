@@ -1,97 +1,76 @@
 #!/usr/bin/env python3
 """
-Find the largest native Zephyr(m,t) subgraph within a defective QPU topology.
+Find which Zephyr(m,t) topologies are embeddable on Advantage2 using feasibility filter.
 
-This identifies a "clean" Zephyr configuration with NO missing nodes or edges,
-eliminating the need for embedding.
+Uses minorminer's feasibility_filter to check if a Zephyr topology can be embedded
+(even with chains, not just 1:1) onto the real QPU hardware.
+
+This is more accurate than manual node/edge checking, as it uses minorminer's
+heuristics to determine if an embedding is feasible.
 """
 
 import argparse
-import networkx as nx
+import sys
+from collections import defaultdict
+from typing import List, Dict
+
+# Add parent directory to path for imports
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import dwave_networkx as dnx
-from typing import Tuple, Set, List, Dict
-from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_6_TOPOLOGY
+from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_8_TOPOLOGY
+
+try:
+    from minorminer.utils.feasibility import embedding_feasibility_filter
+except ImportError:
+    print("ERROR: minorminer not installed or feasibility module not available")
+    print("Install with: pip install minorminer")
+    sys.exit(1)
 
 
-def get_zephyr_coordinates(m: int, t: int) -> Dict[Tuple[int, int, int, int], int]:
+def check_zephyr_feasibility(m: int, t: int, target_graph) -> bool:
     """
-    Get mapping from Zephyr coordinates (u, w, k, z) to linear node indices.
+    Check if Zephyr(m,t) can be embedded on target graph using feasibility filter.
 
-    Zephyr(m, t) coordinates:
-    - u ∈ [0, m): tile row/column
-    - w ∈ {0, 1}: internal/external qubits
-    - k ∈ [0, 2t): qubit position within tile
-    - z ∈ {0, 1, 2, 3}: qubit orientation
-    """
-    G = dnx.zephyr_graph(m, t)
-    coords = dnx.zephyr_coordinates(m, t)
-
-    # coords.linear_to_zephyr gives us the mapping
-    coord_to_node = {}
-    for node in G.nodes():
-        coord = coords.linear_to_zephyr(node)
-        coord_to_node[coord] = node
-
-    return coord_to_node
-
-
-def check_zephyr_subgraph(m: int, t: int, target_graph: nx.Graph) -> Tuple[bool, int, int]:
-    """
-    Check if a perfect Zephyr(m,t) subgraph exists in target graph.
+    Args:
+        m: Zephyr m parameter
+        t: Zephyr t parameter
+        target_graph: NetworkX graph of target hardware
 
     Returns:
-        (is_perfect, num_nodes_present, num_edges_present)
+        True if embedding is feasible, False otherwise
     """
-    # Generate the Zephyr(m,t) graph
-    zephyr = dnx.zephyr_graph(m, t)
-
-    # Check which nodes are present
-    missing_nodes = 0
-    for node in zephyr.nodes():
-        if node not in target_graph.nodes():
-            missing_nodes += 1
-
-    # Check which edges are present
-    missing_edges = 0
-    for u, v in zephyr.edges():
-        # Only count edge if both nodes exist
-        if u in target_graph.nodes() and v in target_graph.nodes():
-            if not target_graph.has_edge(u, v):
-                missing_edges += 1
-        else:
-            missing_edges += 1
-
-    is_perfect = (missing_nodes == 0 and missing_edges == 0)
-    nodes_present = len(zephyr.nodes()) - missing_nodes
-    edges_present = len(zephyr.edges()) - missing_edges
-
-    return is_perfect, nodes_present, edges_present
+    source_graph = dnx.zephyr_graph(m, t)
+    return embedding_feasibility_filter(S=source_graph, T=target_graph)
 
 
-def find_largest_native_zephyr(target_graph: nx.Graph, max_m: int = 12, max_t: int = 4) -> List[Dict]:
+def find_embeddable_zephyrs(target_graph, max_m: int = 12, max_t: int = 4) -> List[Dict]:
     """
-    Find all perfect Zephyr subgraphs within the target topology.
+    Find all Zephyr topologies that are embeddable on target graph.
 
     Returns:
-        List of dicts with keys: m, t, nodes, edges, is_perfect, utilization_pct
+        List of dicts with keys: m, t, nodes, edges, is_feasible
     """
     results = []
 
     target_nodes = len(target_graph.nodes())
     target_edges = len(target_graph.edges())
 
-    print(f"Searching for perfect Zephyr subgraphs in target topology...")
+    print(f"Testing Zephyr topologies for embedding feasibility...")
     print(f"Target: {target_nodes:,} nodes, {target_edges:,} edges\n")
 
     for m in range(2, max_m + 1):
         for t in range(1, max_t + 1):
-            print(f"Testing Z({m},{t})...", end=" ")
+            print(f"Testing Z({m},{t})...", end=" ", flush=True)
 
-            is_perfect, nodes_present, edges_present = check_zephyr_subgraph(m, t, target_graph)
-
+            # Generate Zephyr topology
             zephyr = dnx.zephyr_graph(m, t)
             total_nodes = len(zephyr.nodes())
             total_edges = len(zephyr.edges())
+
+            # Check feasibility
+            is_feasible = check_zephyr_feasibility(m, t, target_graph)
 
             node_util_pct = 100 * total_nodes / target_nodes
             edge_util_pct = 100 * total_edges / target_edges
@@ -102,21 +81,18 @@ def find_largest_native_zephyr(target_graph: nx.Graph, max_m: int = 12, max_t: i
                 'config': f'Z({m},{t})',
                 'total_nodes': total_nodes,
                 'total_edges': total_edges,
-                'nodes_present': nodes_present,
-                'edges_present': edges_present,
-                'is_perfect': is_perfect,
+                'is_feasible': is_feasible,
                 'node_utilization_pct': node_util_pct,
                 'edge_utilization_pct': edge_util_pct,
             }
 
             results.append(result)
 
-            if is_perfect:
-                print(f"✓ PERFECT ({nodes_present:,} nodes, {edges_present:,} edges)")
+            if is_feasible:
+                print(f"✓ FEASIBLE ({total_nodes:,} nodes, {total_edges:,} edges, "
+                      f"{node_util_pct:.1f}% node util)")
             else:
-                missing_nodes = total_nodes - nodes_present
-                missing_edges = total_edges - edges_present
-                print(f"✗ Missing {missing_nodes} nodes, {missing_edges} edges")
+                print(f"✗ INFEASIBLE ({total_nodes:,} nodes exceeds capacity or too dense)")
 
     return results
 
@@ -124,52 +100,94 @@ def find_largest_native_zephyr(target_graph: nx.Graph, max_m: int = 12, max_t: i
 def print_results(results: List[Dict]):
     """Print formatted results table."""
     print("\n" + "="*100)
-    print("PERFECT ZEPHYR SUBGRAPHS (No Embedding Needed)")
+    print("EMBEDDABLE ZEPHYR TOPOLOGIES")
     print("="*100)
 
-    perfect = [r for r in results if r['is_perfect']]
+    feasible = [r for r in results if r['is_feasible']]
+    infeasible = [r for r in results if not r['is_feasible']]
 
-    if not perfect:
-        print("✗ No perfect Zephyr subgraphs found")
-        print("\nClosest matches:")
-        # Sort by nodes_present descending
-        closest = sorted(results, key=lambda r: r['nodes_present'], reverse=True)[:5]
-        for r in closest:
-            missing_nodes = r['total_nodes'] - r['nodes_present']
-            missing_edges = r['total_edges'] - r['edges_present']
-            print(f"  {r['config']}: {r['nodes_present']:,}/{r['total_nodes']:,} nodes, "
-                  f"missing {missing_nodes} nodes + {missing_edges} edges")
+    if not feasible:
+        print("✗ No feasible Zephyr topologies found")
+        print("\nAll tested topologies are too large or too dense to embed.")
     else:
-        print(f"{'Config':<10} {'Nodes':<8} {'Edges':<8} {'Node%':<8} {'Edge%':<8}")
+        print(f"{'Config':<10} {'Nodes':<8} {'Edges':<8} {'Node%':<8} {'Edge%':<8} {'Status':<10}")
         print("-"*100)
 
         # Sort by nodes descending to show largest first
-        for r in sorted(perfect, key=lambda x: x['total_nodes'], reverse=True):
+        for r in sorted(feasible, key=lambda x: x['total_nodes'], reverse=True):
             print(f"{r['config']:<10} "
                   f"{r['total_nodes']:<8,} "
                   f"{r['total_edges']:<8,} "
                   f"{r['node_utilization_pct']:<7.1f}% "
-                  f"{r['edge_utilization_pct']:<7.1f}%")
+                  f"{r['edge_utilization_pct']:<7.1f}% "
+                  f"{'✓ Feasible':<10}")
+
+    if infeasible:
+        print("\nINFEASIBLE TOPOLOGIES (too large or dense):")
+        print("-"*100)
+        for r in infeasible:
+            print(f"{r['config']:<10} "
+                  f"{r['total_nodes']:<8,} "
+                  f"{r['total_edges']:<8,} "
+                  f"{r['node_utilization_pct']:<7.1f}% "
+                  f"{r['edge_utilization_pct']:<7.1f}% "
+                  f"{'✗ Infeasible':<10}")
+
+    if feasible:
+        print("\n" + "="*100)
+        print("LARGEST FEASIBLE M FOR EACH T")
+        print("="*100)
+
+        # Group feasible results by t and find max m for each
+        by_t = defaultdict(list)
+        for r in feasible:
+            by_t[r['t']].append(r)
+
+        # Print largest m for each t value
+        for t in sorted(by_t.keys()):
+            largest_for_t = max(by_t[t], key=lambda r: r['m'])
+            print(f"t={t}: m={largest_for_t['m']} → Z({largest_for_t['m']},{t}) "
+                  f"({largest_for_t['total_nodes']:,} nodes, {largest_for_t['total_edges']:,} edges, "
+                  f"{largest_for_t['node_utilization_pct']:.1f}% util)")
 
         print("\n" + "="*100)
         print("RECOMMENDATION")
         print("="*100)
 
-        # Recommend largest perfect subgraph
-        largest = max(perfect, key=lambda r: r['total_nodes'])
-        print(f"✓ Use {largest['config']} - largest perfect Zephyr subgraph")
+        # Recommend largest feasible topology
+        largest = max(feasible, key=lambda r: r['total_nodes'])
+        print(f"✓ Largest feasible: {largest['config']}")
         print(f"  - {largest['total_nodes']:,} nodes, {largest['total_edges']:,} edges")
         print(f"  - {largest['node_utilization_pct']:.1f}% node utilization")
-        print(f"  - NO EMBEDDING REQUIRED - native hardware support")
+        print(f"  - Requires embedding (use minorminer or precompute)")
+        print(f"\nTo precompute embedding:")
+        print(f"  python tools/analyze_topology_sizes.py \\")
+        print(f"    --configs \"{largest['m']},{largest['t']}\" \\")
+        print(f"    --precompute-embedding \\")
+        print(f"    --embedding-timeout 1w \\")
+        print(f"    --try-timeout 15m")
         print(f"\nUsage:")
-        print(f"  # In DEFAULT_TOPOLOGY:")
-        print(f"  from dwave_topologies.topologies.zephyr_z{largest['m']}_t{largest['t']} import ZEPHYR_Z{largest['m']}_T{largest['t']}_TOPOLOGY")
-        print(f"  DEFAULT_TOPOLOGY = ZEPHYR_Z{largest['m']}_T{largest['t']}_TOPOLOGY")
+        print(f"  from dwave_topologies import zephyr")
+        print(f"  topology = zephyr({largest['m']}, {largest['t']})")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Find largest native Zephyr subgraph in QPU topology"
+        description="Find embeddable Zephyr topologies using feasibility filter",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Test default range
+  python tools/find_native_zephyr.py
+
+  # Test larger topologies
+  python tools/find_native_zephyr.py --max-m 15 --max-t 5
+
+Notes:
+  - Uses minorminer's feasibility_filter (more accurate than manual checking)
+  - Tests embedding feasibility (with chains), not just 1:1 subgraph matching
+  - Uses predownloaded Advantage2_system1.8 topology (no QPU access needed)
+        """
     )
     parser.add_argument('--max-m', type=int, default=12,
                        help='Maximum m parameter to test (default: 12)')
@@ -178,18 +196,18 @@ def main():
 
     args = parser.parse_args()
 
-    # Load Advantage2 topology
-    topology = ADVANTAGE2_SYSTEM1_6_TOPOLOGY
+    # Load Advantage2 topology (no QPU access needed)
+    topology = ADVANTAGE2_SYSTEM1_8_TOPOLOGY
     target_graph = topology.graph
 
     print(f"Target QPU: {topology.solver_name}")
     print(f"  Physical qubits: {topology.num_nodes:,}")
     print(f"  Physical couplers: {topology.num_edges:,}")
-    print(f"  Topology type: {topology.properties.get('topology', {})}")
+    print(f"  Topology type: {topology.topology_type} {topology.topology_shape}")
     print()
 
-    # Find all perfect subgraphs
-    results = find_largest_native_zephyr(
+    # Find all embeddable topologies
+    results = find_embeddable_zephyrs(
         target_graph,
         max_m=args.max_m,
         max_t=args.max_t

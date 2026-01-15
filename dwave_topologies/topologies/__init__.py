@@ -6,51 +6,56 @@ including both real solver topologies extracted from the D-Wave API and
 general-purpose topology definitions for development and testing.
 
 Usage:
-    # Import a specific real solver topology
-    from dwave.topologies.advantage2_system1_6 import ADVANTAGE2_SYSTEM1_6
+    # Import topology objects
+    from dwave_topologies import DEFAULT_TOPOLOGY, ZEPHYR_Z9_T2_TOPOLOGY
+    from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_8_TOPOLOGY
 
-    # Import general-purpose topologies
-    from dwave.topologies.zephyr_z12 import ZEPHYR_Z12
-    from dwave.topologies.pegasus_p16 import PEGASUS_P16
-    from dwave.topologies.chimera_c16 import CHIMERA_C16
-
-    # Access topology data
-    nodes = ADVANTAGE2_SYSTEM1_6['nodes']
-    edges = ADVANTAGE2_SYSTEM1_6['edges']
-
-    # Or use convenience accessors
-    from dwave.topologies.advantage2_system1_6 import NODES, EDGES
+    # Access topology properties
+    nodes = DEFAULT_TOPOLOGY.nodes
+    edges = DEFAULT_TOPOLOGY.edges
+    num_nodes = DEFAULT_TOPOLOGY.num_nodes
+    properties = DEFAULT_TOPOLOGY.properties
 """
 
 # Import topology objects (new type system)
 from .chimera import CHIMERA_C16_TOPOLOGY
 from .pegasus import PEGASUS_P16_TOPOLOGY
-from .zephyr import ZEPHYR_Z12_TOPOLOGY
-from .zephyr_z8_t2 import ZEPHYR_Z8_T2_TOPOLOGY
-from .zephyr_z11_t4 import ZEPHYR_Z11_T4_TOPOLOGY
-from .advantage2_system1_6 import ADVANTAGE2_SYSTEM1_6_TOPOLOGY
-from .advantage2_system1_6 import ADVANTAGE2_SYSTEM1_6
-from .advantage_system4_1 import ADVANTAGE_SYSTEM4_1
-from .advantage_system6_4 import ADVANTAGE_SYSTEM6_4
+from .zephyr import (
+    zephyr,
+    ZephyrTopology,
+    ZEPHYR_Z8_T2_TOPOLOGY,
+    ZEPHYR_Z9_T2_TOPOLOGY,
+    ZEPHYR_Z10_T2_TOPOLOGY,
+    ZEPHYR_Z11_T4_TOPOLOGY,
+    ZEPHYR_Z12_T4_TOPOLOGY,
+)
+from .advantage2_system1_8 import ADVANTAGE2_SYSTEM1_8_TOPOLOGY
+from .advantage2_system4_1 import ADVANTAGE2_SYSTEM4_1_TOPOLOGY
+from .json_loader import load_topology
 
-# Default topology (Zephyr Z(8, 2) - smallest with confirmed Advantage2 embedding)
-# Precomputed embedding: dwave_topologies/embeddings/Advantage2_system1.6/zephyr_z8_t2.json.gz
-DEFAULT_TOPOLOGY = ZEPHYR_Z8_T2_TOPOLOGY
+# Default topology: Advantage2-System1.8 (real QPU hardware topology)
+# Topology: 4,591 qubits, 41,766 couplers (Zephyr Z(12,4) with defects)
+# All miners use the same topology - no embedding needed for QPU
+# Hardware topology file: dwave_topologies/topologies/advantage2_system1_8.json.gz
+DEFAULT_TOPOLOGY = ADVANTAGE2_SYSTEM1_8_TOPOLOGY
 
 __all__ = [
-    # Topology objects (new type system)
+    # Topology objects
     "CHIMERA_C16_TOPOLOGY",
     "PEGASUS_P16_TOPOLOGY",
-    "ZEPHYR_Z12_TOPOLOGY",
+    "zephyr",
+    "ZephyrTopology",
     "ZEPHYR_Z8_T2_TOPOLOGY",
+    "ZEPHYR_Z9_T2_TOPOLOGY",
+    "ZEPHYR_Z10_T2_TOPOLOGY",
     "ZEPHYR_Z11_T4_TOPOLOGY",
-    "ADVANTAGE2_SYSTEM1_6_TOPOLOGY",
-
-    # Legacy dictionary format (backward compatibility)
-    "ADVANTAGE2_SYSTEM1_6",
-    "ADVANTAGE_SYSTEM4_1",
-    "ADVANTAGE_SYSTEM6_4",
+    "ZEPHYR_Z12_T4_TOPOLOGY",
+    "ADVANTAGE2_SYSTEM1_8_TOPOLOGY",
+    "ADVANTAGE2_SYSTEM4_1_TOPOLOGY",
 
     # Default
     "DEFAULT_TOPOLOGY",
+
+    # Utilities
+    "load_topology",
 ]

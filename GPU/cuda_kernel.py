@@ -23,6 +23,38 @@ import cupy as cp
 import numpy as np
 
 
+def _load_cudart():
+    """Load CUDA runtime library with fallbacks for versioned names.
+
+    The runtime image only has versioned libraries like libcudart.so.11.0,
+    not the unversioned libcudart.so symlink (which is in devel images).
+    """
+    # Library names to try in order of preference
+    lib_names = [
+        'libcudart.so',           # Unversioned (works if symlink exists)
+        'libcudart.so.11.0',      # CUDA 11.x versioned
+        'libcudart.so.11',        # CUDA 11 major version
+        'libcudart.so.12.0',      # CUDA 12.x versioned
+        'libcudart.so.12',        # CUDA 12 major version
+        'cudart64_110.dll',       # Windows CUDA 11.x
+        'cudart64_12.dll',        # Windows CUDA 12.x
+    ]
+
+    errors = []
+    for lib_name in lib_names:
+        try:
+            return ctypes.CDLL(lib_name)
+        except OSError as e:
+            errors.append(f"{lib_name}: {e}")
+            continue
+
+    # If all failed, raise with details
+    raise OSError(
+        f"Could not load CUDA runtime library. Tried:\n" +
+        "\n".join(f"  - {err}" for err in errors)
+    )
+
+
 def _default_ising_beta_range(
     h: Dict[int, float],
     J: Dict[Tuple[int, int], float],
@@ -163,10 +195,7 @@ class CudaKernel:
         self.d_input_head_arr = cp.zeros(1, dtype=cp.int32)
 
         # Allocate mapped host memory for tail/control/state using CUDA runtime
-        try:
-            cudart = ctypes.CDLL('libcudart.so')
-        except OSError:
-            cudart = ctypes.CDLL('cudart64_110.dll')  # Windows fallback
+        cudart = _load_cudart()
 
         cudaHostAllocMapped = 2
         # Set arg/restype
@@ -530,10 +559,7 @@ class CudaKernelRealSA:
         self._sizeof_outputslot = 32
 
         # Control/head/tail/state pointers
-        try:
-            cudart = ctypes.CDLL('libcudart.so')
-        except OSError:
-            cudart = ctypes.CDLL('cudart64_110.dll')
+        cudart = _load_cudart()
 
         cudaHostAllocMapped = 2
         cudart.cudaHostAlloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint]

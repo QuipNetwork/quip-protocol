@@ -1,0 +1,55 @@
+---
+# Akash SDL for CPU Mining
+# Deploy with: akash tx deployment create deploy-cpu.yaml --from <wallet>
+version: "2.0"
+
+services:
+  cpu-miner:
+    image: ghcr.io/your-org/quip-protocol-cpu-miner:latest
+    env:
+      - MINING_DURATION=90m
+      - DIFFICULTY_ENERGY=-14900
+      - MIN_DIVERSITY=0.1
+      - MIN_SOLUTIONS=5
+      - TOPOLOGY_FILE=dwave_topologies/topologies/advantage2_system1_7.json.gz
+      - AUTO_TERMINATE=false
+      # Optional: Set these for S3 upload
+      # - S3_BUCKET=your-bucket-name
+      # - AWS_ACCESS_KEY_ID=your-key-id
+      # - AWS_SECRET_ACCESS_KEY=your-secret-key
+      # - AWS_DEFAULT_REGION=us-east-1
+    expose:
+      - port: 8080
+        as: 80
+        to:
+          - global: true
+        accept:
+          - webdis
+
+profiles:
+  compute:
+    cpu-miner:
+      resources:
+        cpu:
+          units: 4  # 4 vCPUs
+        memory:
+          size: 8Gi
+        storage:
+          size: 20Gi
+  placement:
+    akash:
+      attributes:
+        host: akash
+      signedBy:
+        anyOf:
+          - "akash1365yvmc4s7awdyj3n2sav7xfx76adc6dnmlx63"  # Akash verified provider
+      pricing:
+        cpu-miner:
+          denom: uakt
+          amount: 1000  # Max price in uAKT per block
+
+deployment:
+  cpu-miner:
+    akash:
+      profile: cpu-miner
+      count: 1  # Deploy 1 instance per SDL (launch multiple SDLs for fleet)

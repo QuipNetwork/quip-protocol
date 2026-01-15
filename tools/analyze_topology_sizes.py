@@ -177,11 +177,11 @@ def test_embedding_feasibility(config: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         import minorminer
-        from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_6_TOPOLOGY
+        from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_8_TOPOLOGY
 
         # Get target QPU topology from saved JSON (no live connection needed!)
         try:
-            target_topology = ADVANTAGE2_SYSTEM1_6_TOPOLOGY
+            target_topology = ADVANTAGE2_SYSTEM1_8_TOPOLOGY
             target_graph = target_topology.graph
 
             qpu_chip_id = target_topology.solver_name
@@ -310,13 +310,11 @@ def _find_embedding_worker(args):
         if embedding:
             # Success! Return immediately
             total_elapsed = time.perf_counter() - worker_start
-            if worker_id == 0 or verbose:
-                print(f"    Worker {worker_id}: Found embedding on try {num_tries} after {try_elapsed:.1f}s")
+            print(f"    ✓ Worker {worker_id}: Found embedding on try {num_tries} after {try_elapsed:.1f}s")
             return (worker_id, embedding, total_elapsed, num_tries)
 
         # No embedding found, log and continue
-        if worker_id == 0:
-            print(f"    Worker {worker_id}: Try {num_tries} failed after {try_elapsed:.1f}s, restarting...")
+        print(f"    ✗ Worker {worker_id}: Try {num_tries} failed after {try_elapsed:.1f}s, restarting...")
 
     # All tries exhausted
     total_elapsed = time.perf_counter() - worker_start
@@ -361,7 +359,7 @@ def _find_native_subgraph_seed(source_graph: nx.Graph, target_graph: nx.Graph, m
     return None
 
 
-def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Advantage2_system1.6", timeout: int = 3600, try_timeout: int = 600, num_processes: Optional[int] = None) -> Dict[str, Any]:
+def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Advantage2_system1_8", timeout: int = 3600, try_timeout: int = 600, num_processes: Optional[int] = None) -> Dict[str, Any]:
     """
     Precompute and save embedding for a topology using parallel multiprocessing.
 
@@ -370,7 +368,7 @@ def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Adva
 
     Args:
         config: Topology configuration dict
-        target_solver_name: Target solver name (default: Advantage2_system1.6)
+        target_solver_name: Target solver name (default: Advantage2_system1_8)
         timeout: Total timeout in seconds for all workers
         try_timeout: Timeout per individual embedding attempt (default: 600s = 10min)
         num_processes: Number of parallel processes (default: CPU count)
@@ -382,10 +380,10 @@ def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Adva
     import gzip
     import minorminer
     import multiprocessing as mp
-    from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_6_TOPOLOGY
+    from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_8_TOPOLOGY
 
     # Get target topology
-    target_topology = ADVANTAGE2_SYSTEM1_6_TOPOLOGY
+    target_topology = ADVANTAGE2_SYSTEM1_8_TOPOLOGY
     target_graph = target_topology.graph
 
     source_graph = config['graph']
@@ -431,35 +429,59 @@ def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Adva
     ]
 
     print(f"Starting {num_processes} parallel workers (each will restart with new seeds automatically)...")
-    print(f"(First worker will show progress, others run silently)\n")
+    print(f"(First worker will show progress, others run silently)")
+    print(f"(Will terminate ALL workers as soon as ANY worker succeeds)\n")
 
     start = time.perf_counter()
 
-    # Run parallel embedding search
-    with mp.Pool(processes=num_processes) as pool:
-        results = pool.map(_find_embedding_worker, worker_args)
-
-    elapsed = time.perf_counter() - start
-
-    # Find best embedding (first one that succeeded)
+    # Run parallel embedding search with early termination
+    # Use imap_unordered to process results as they come in
     embedding = None
     best_worker = None
     best_time = None
     best_tries = None
-    total_tries = 0
 
-    for worker_id, emb, worker_elapsed, num_tries in results:
-        total_tries += num_tries
-        if emb:
-            if embedding is None:  # Take first successful embedding
-                embedding = emb
-                best_worker = worker_id
-                best_time = worker_elapsed
-                best_tries = num_tries
+    with mp.Pool(processes=num_processes) as pool:
+        # Start all workers
+        async_results = [pool.apply_async(_find_embedding_worker, (args,)) for args in worker_args]
+
+        # Poll for results, terminate early on success
+        while async_results:
+            for i, result in enumerate(async_results):
+                if result.ready():
+                    worker_id, emb, worker_elapsed, num_tries = result.get()
+                    if emb:
+                        # Success! Terminate pool immediately
+                        embedding = emb
+                        best_worker = worker_id
+                        best_time = worker_elapsed
+                        best_tries = num_tries
+                        print(f"\n✓ Embedding found! Terminating all other workers...")
+                        pool.terminate()
+                        pool.join()
+                        break
+                    else:
+                        # Worker finished without success, remove from list
+                        async_results.pop(i)
+                        break
+            else:
+                # No result ready yet, sleep briefly
+                time.sleep(0.1)
+
+            # Break outer loop if we found embedding
+            if embedding:
+                break
+
+        # If we get here without embedding, all workers failed
+        if not embedding:
+            pool.close()
+            pool.join()
+
+    elapsed = time.perf_counter() - start
 
     if not embedding:
         print(f"\n✗ No embedding found after {elapsed:.2f}s")
-        print(f"  Total attempts across all workers: {total_tries}")
+        print(f"  All {num_processes} workers exhausted their attempts")
         print(f"  Consider:")
         print(f"    - Increasing --embedding-timeout (total time)")
         print(f"    - Increasing --try-timeout (time per attempt)")
@@ -468,8 +490,7 @@ def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Adva
         return None
 
     print(f"\n✓ Embedding found by worker {best_worker} after {best_tries} tries in {best_time:.2f}s")
-    print(f"  Wall clock time: {elapsed:.2f}s")
-    print(f"  Total attempts (all workers): {total_tries}")
+    print(f"  Wall clock time (includes early termination): {elapsed:.2f}s")
 
     # Convert embedding dict to JSON-serializable format
     embedding_list = {str(k): list(v) for k, v in embedding.items()}
@@ -524,7 +545,7 @@ def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Adva
     embeddings_dir = os.path.join("dwave_topologies", "embeddings", target_solver_name)
     os.makedirs(embeddings_dir, exist_ok=True)
 
-    filename = f"zephyr_z{m}_t{t}.json.gz"
+    filename = f"zephyr_z{m}_t{t}.embed.json.gz"
     filepath = os.path.join(embeddings_dir, filename)
 
     with gzip.open(filepath, 'wt', encoding='utf-8') as f:
@@ -808,7 +829,7 @@ def main():
             try_timeout_seconds = parse_timeout(args.try_timeout)
             precompute_embedding(
                 config_info,
-                target_solver_name="Advantage2_system1.6",
+                target_solver_name="Advantage2_system1_8",
                 timeout=timeout_seconds,
                 try_timeout=try_timeout_seconds
             )

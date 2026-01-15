@@ -58,6 +58,7 @@ class BaseMiner(ABC):
             'postprocessing': [],
             'quantum_annealing_time': [],
             'per_sample_overhead': [],
+            'qpu_access_time': [],  # Total QPU time (programming + sampling) in microseconds
             'total_samples': 0,
             'blocks_attempted': 0
         }

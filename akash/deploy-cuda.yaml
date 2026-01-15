@@ -1,0 +1,62 @@
+---
+# Akash SDL for CUDA GPU Mining
+# Deploy with: akash tx deployment create deploy-cuda.yaml --from <wallet>
+version: "2.0"
+
+services:
+  cuda-miner:
+    image: ghcr.io/your-org/quip-protocol-cuda-miner:latest
+    env:
+      - MINING_DURATION=90m
+      - DIFFICULTY_ENERGY=-14900
+      - MIN_DIVERSITY=0.1
+      - MIN_SOLUTIONS=5
+      - TOPOLOGY_FILE=dwave_topologies/topologies/advantage2_system1_7.json.gz
+      - GPU_DEVICE=0
+      - AUTO_TERMINATE=false
+      # Optional: Set these for S3 upload
+      # - S3_BUCKET=your-bucket-name
+      # - AWS_ACCESS_KEY_ID=your-key-id
+      # - AWS_SECRET_ACCESS_KEY=your-secret-key
+      # - AWS_DEFAULT_REGION=us-east-1
+    expose:
+      - port: 8080
+        as: 80
+        to:
+          - global: true
+        accept:
+          - webdis
+
+profiles:
+  compute:
+    cuda-miner:
+      resources:
+        cpu:
+          units: 1  # Match GPU count - CUDA mining needs minimal CPU
+        memory:
+          size: 16Gi
+        storage:
+          size: 30Gi
+        gpu:
+          units: 1
+          attributes:
+            vendor:
+              nvidia:
+                - model: rtx3090    # or rtx4090, a6000, etc.
+  placement:
+    akash:
+      attributes:
+        host: akash
+      signedBy:
+        anyOf:
+          - "akash1365yvmc4s7awdyj3n2sav7xfx76adc6dnmlx63"
+      pricing:
+        cuda-miner:
+          denom: uakt
+          amount: 10000  # Higher for GPU providers
+
+deployment:
+  cuda-miner:
+    akash:
+      profile: cuda-miner
+      count: 1

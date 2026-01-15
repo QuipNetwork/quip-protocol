@@ -1,0 +1,30 @@
+# Minimal dependencies for CUDA GPU mining on Akash
+# Optimized for driver compatibility (520+ with CUDA 11.8)
+# NO PyTorch - it's 2GB and not used for CUDA mining
+
+# Core D-Wave SDK for Ising model and sampling
+dwave-ocean-sdk>=6.0.0
+
+# Numerical computing (pin <2.0 for compatibility)
+numpy>=1.24.0,<2.0.0
+
+# Async HTTP for P2P networking
+aiohttp>=3.9.0
+
+# CLI interface
+click>=8.1.7
+
+# Environment variable loading
+python-dotenv>=1.0.0
+
+# Post-quantum signatures (SPHINCS+)
+hashsigs>=0.0.2
+
+# Fast hashing
+blake3>=1.0.5
+
+# CuPy for CUDA - naming convention: cupy-cuda{CUDA_VERSION}
+# Package name: cupy-cuda11x = built for CUDA 11.x (11.2-11.8)
+# Version: 12.x = CuPy library version (NOT CUDA version!)
+# We use CUDA 11.8 which requires driver 520+
+cupy-cuda11x>=12.0.0,<13.0.0

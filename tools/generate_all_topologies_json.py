@@ -108,12 +108,12 @@ def generate_generic_topology_json(topology_type: str, params: dict, output_dir:
 
 
 def generate_advantage2_system_json(output_dir: str):
-    """Generate JSON for real Advantage2-System1.6 topology."""
+    """Generate JSON for real Advantage2-System1.8 topology."""
 
     # Import the existing topology data
-    from dwave_topologies.topologies.advantage2_system1_6 import ADVANTAGE2_SYSTEM1_6_TOPOLOGY
+    from dwave_topologies.topologies.advantage2_system1_8 import ADVANTAGE2_SYSTEM1_8_TOPOLOGY
 
-    topo = ADVANTAGE2_SYSTEM1_6_TOPOLOGY
+    topo = ADVANTAGE2_SYSTEM1_8_TOPOLOGY
 
     # Calculate expected GSE
     from shared.energy_utils import expected_solution_energy
@@ -126,7 +126,7 @@ def generate_advantage2_system_json(output_dir: str):
     # Create JSON topology data
     topology_data = {
         "metadata": {
-            "description": "D-Wave Advantage2-System1.6 real solver topology",
+            "description": "D-Wave Advantage2-System1.7 real solver topology",
             "generated_from": "D-Wave API - real solver with defect pattern",
             "solver_name": topo.solver_name,
             "topology_type": topo.topology_type,
@@ -136,7 +136,7 @@ def generate_advantage2_system_json(output_dir: str):
             "avg_degree": round(2 * topo.num_edges / topo.num_nodes, 2),
             "expected_gse": round(expected_gse, 1),
             "notes": [
-                "Real Advantage2-System1.6 topology from D-Wave API",
+                "Real Advantage2-System1.7 topology from D-Wave API",
                 "Includes solver-specific defect pattern",
                 "Based on Zephyr Z(12,4) architecture with missing qubits/couplers"
             ]
@@ -148,7 +148,7 @@ def generate_advantage2_system_json(output_dir: str):
     }
 
     # Write JSON file
-    filename = "advantage2_system1_6.json"
+    filename = "advantage2_system1_7.json.gz"
     filepath = os.path.join(output_dir, filename)
 
     with open(filepath, 'w') as f:

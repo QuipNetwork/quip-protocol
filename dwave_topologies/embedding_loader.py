@@ -2,7 +2,7 @@
 Embedding loader utility for precomputed topology embeddings.
 
 Loads precomputed embeddings from JSON files saved in:
-    dwave_topologies/embeddings/{solver_name}/zephyr_z{m}_t{t}.json.gz
+    dwave_topologies/embeddings/{solver_name}/zephyr_z{m}_t{t}.embed.json.gz
 """
 
 import os
@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 
 def load_embedding(
     topology_name: str,
-    solver_name: str = "Advantage2_system1.6",
+    solver_name: str = "Advantage2_system1_8",
     embeddings_dir: Optional[str] = None
 ) -> Optional[Dict]:
     """
@@ -21,7 +21,7 @@ def load_embedding(
 
     Args:
         topology_name: Name like "zephyr_z10_t2" or "Z(10,2)"
-        solver_name: Target solver name (default: "Advantage2_system1.6")
+        solver_name: Target solver name (default: "Advantage2_system1_8")
         embeddings_dir: Optional custom embeddings directory
 
     Returns:
@@ -40,10 +40,15 @@ def load_embedding(
         # Parse Z(m,t) format
         parts = topology_name[2:-1].split(",")
         m, t = int(parts[0].strip()), int(parts[1].strip())
-        filename = f"zephyr_z{m}_t{t}.json.gz"
+        filename = f"zephyr_z{m}_t{t}.embed.json.gz"
     elif topology_name.startswith("zephyr_z"):
         # Already in filename format
-        filename = topology_name if topology_name.endswith(".json.gz") else f"{topology_name}.json.gz"
+        if not topology_name.endswith(".embed.json.gz"):
+            # Add .embed.json.gz extension
+            base = topology_name.replace(".json.gz", "").replace(".embed.json.gz", "")
+            filename = f"{base}.embed.json.gz"
+        else:
+            filename = topology_name
     else:
         raise ValueError(f"Invalid topology name format: {topology_name}")
 
@@ -71,7 +76,7 @@ def load_embedding(
 
 def get_embedding_dict(
     topology_name: str,
-    solver_name: str = "Advantage2_system1.6",
+    solver_name: str = "Advantage2_system1_8",
     convert_keys_to_int: bool = True
 ) -> Optional[Dict]:
     """
@@ -104,7 +109,7 @@ def get_embedding_dict(
     return embedding
 
 
-def list_available_embeddings(solver_name: str = "Advantage2_system1.6") -> List[Tuple[str, Dict]]:
+def list_available_embeddings(solver_name: str = "Advantage2_system1_8") -> List[Tuple[str, Dict]]:
     """
     List all available precomputed embeddings for a solver.
 
@@ -127,7 +132,7 @@ def list_available_embeddings(solver_name: str = "Advantage2_system1.6") -> List
 
     results = []
     for filename in os.listdir(embeddings_dir):
-        if filename.endswith('.json.gz'):
+        if filename.endswith('.embed.json.gz'):
             filepath = os.path.join(embeddings_dir, filename)
             try:
                 with gzip.open(filepath, 'rt', encoding='utf-8') as f:
@@ -139,7 +144,7 @@ def list_available_embeddings(solver_name: str = "Advantage2_system1.6") -> List
     return results
 
 
-def embedding_exists(topology_name: str, solver_name: str = "Advantage2_system1.6") -> bool:
+def embedding_exists(topology_name: str, solver_name: str = "Advantage2_system1_8") -> bool:
     """
     Check if a precomputed embedding exists.
 

@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
-"""CPU baseline parameter testing tool."""
+"""CPU baseline parameter testing tool.
+
+This tool tests CPU simulated annealing performance with various sweep/read configurations.
+
+EMBEDDING TESTING:
+------------------
+You can test embedding quality before using QPU time:
+
+1. Perfect mode (default):
+   python tools/cpu_baseline.py --topology <embedding_file>
+   - Solves on ideal Z(m,t) topology
+   - Establishes baseline performance
+
+2. Embedded mode:
+   python tools/cpu_baseline.py --topology <embedding_file> --use-embedding
+   - Applies embedding and solves on Advantage2 hardware topology
+   - Tests embedding structure and problem generation pipeline
+
+IMPORTANT: Embedded mode shows significant energy degradation (~16%) due to chain breaking
+in classical SA. This is a TESTING ARTIFACT - QPU quantum annealing maintains chain integrity
+much better. Use embedded mode to verify embedding structure, NOT to predict QPU performance.
+"""
 import argparse
 import sys
 import time
@@ -12,11 +33,25 @@ sys.path.append(str(Path(__file__).parent.parent))
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evaluate_sampleset
 from shared.block_requirements import BlockRequirements
+from dwave_topologies import ZEPHYR_Z9_T2_TOPOLOGY
+from dwave_topologies.embedded_topology import create_embedded_topology
+from dwave_topologies.embedding_loader import load_embedding
 import random
+import dimod
 
 
-def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, only_label=None):
-    """Test CPU performance with configurable timeout."""
+def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, only_label=None, topology_file=None, use_embedding=False):
+    """Test CPU performance with configurable timeout.
+
+    Args:
+        timeout_minutes: Test timeout in minutes
+        output_file: Path to save JSON results
+        h_values: List of allowed h field values
+        only_label: Run only specific config (e.g., "Light CPU")
+        topology_file: Path to embedding file (e.g., "dwave_topologies/embeddings/.../zephyr_z9_t2.embed.json.gz")
+        use_embedding: If True, apply embedding and solve on hardware topology.
+                      If False (default), solve on perfect logical topology.
+    """
     if h_values is None:
         h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
 
@@ -25,12 +60,110 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
     print(f"⏰ Timeout: {timeout_minutes} minutes")
     print(f"🎲 h_values: {h_values}")
 
-    # Initialize sampler
-    cpu_sampler = SimulatedAnnealingStructuredSampler()
-    nodes = cpu_sampler.nodes
-    edges = cpu_sampler.edges
+    # Load topology and embedding if specified
+    embedding_data = None
+    embedding_dict = None
+    source_topology = None
+    hardware_topology = None
+
+    if topology_file:
+        # Parse topology name from file path (e.g., "zephyr_z9_t2")
+        import os
+        filename = os.path.basename(topology_file)
+        if filename.startswith("zephyr_z") and filename.endswith(".embed.json.gz"):
+            # Extract m, t from filename like "zephyr_z9_t2.embed.json.gz"
+            parts = filename.replace("zephyr_z", "").replace(".embed.json.gz", "").split("_t")
+            topology_name = f"Z({parts[0]},{parts[1]})"
+
+            # Load embedding data
+            print(f"📁 Loading embedding from: {topology_file}")
+            embedding_data = load_embedding(topology_name, "Advantage2_system1.8")
+            if not embedding_data:
+                print(f"❌ Failed to load embedding file")
+                return None
+
+            embedding_dict = {int(k): v for k, v in embedding_data['embedding'].items()}
+            print(f"✅ Loaded embedding: {len(embedding_dict)} logical vars → avg chain length {embedding_data['statistics']['avg_chain_length']:.2f}")
+
+            # Get source (logical) topology
+            from dwave_topologies.topologies.zephyr import zephyr
+            m, t = int(parts[0]), int(parts[1])
+            source_topology = zephyr(m, t)
+
+            # Get hardware topology
+            from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_8_TOPOLOGY
+            hardware_topology = ADVANTAGE2_SYSTEM1_8_TOPOLOGY
+        else:
+            print(f"❌ Unsupported topology file format: {filename}")
+            return None
+
+    # Initialize topology and sampler based on mode
+    if topology_file and use_embedding:
+        print(f"🔗 Mode: EMBEDDED - Solving on Advantage2 hardware with embedding")
+        nodes = hardware_topology.nodes
+        edges = hardware_topology.edges
+        logical_nodes = source_topology.nodes
+        logical_edges = source_topology.edges
+        topology_desc = f"Advantage2 hardware ({len(nodes)} qubits, {len(edges)} couplers) via embedding"
+
+        # Create sampler with hardware topology
+        from dwave.samplers import SimulatedAnnealingSampler
+        from dwave.system.testing import MockDWaveSampler
+        substitute = SimulatedAnnealingSampler()
+        cpu_sampler = MockDWaveSampler(
+            nodelist=nodes,
+            edgelist=edges,
+            properties=hardware_topology.properties,
+            substitute_sampler=substitute
+        )
+        cpu_sampler.mocked_parameters.add('num_sweeps')
+        cpu_sampler.parameters.update(substitute.parameters)
+
+    elif topology_file:
+        print(f"✨ Mode: PERFECT - Solving on perfect logical topology")
+        nodes = source_topology.nodes
+        edges = source_topology.edges
+        logical_nodes = nodes
+        logical_edges = edges
+        topology_desc = f"Perfect {topology_name} ({len(nodes)} nodes, {len(edges)} edges)"
+        cpu_sampler = SimulatedAnnealingStructuredSampler()
+
+    else:
+        print(f"✨ Using default topology")
+        cpu_sampler = SimulatedAnnealingStructuredSampler()
+        nodes = cpu_sampler.nodes
+        edges = cpu_sampler.edges
+        logical_nodes = nodes
+        logical_edges = edges
+        topology_desc = f"Default Z(9,2) ({len(nodes)} nodes, {len(edges)} edges)"
+
+    print(f"📐 Topology: {topology_desc}")
+
+    # Generate problem on LOGICAL topology (always)
     seed = 12345  # Fixed seed for reproducible results
-    h, J = generate_ising_model_from_nonce(seed, nodes, edges, h_values=h_values)
+    if topology_file:
+        logical_h, logical_J = generate_ising_model_from_nonce(seed, logical_nodes, logical_edges, h_values=h_values)
+        print(f"📊 Generated problem: {len(logical_nodes)} logical variables, {len(logical_edges)} couplings")
+    else:
+        logical_h, logical_J = generate_ising_model_from_nonce(seed, nodes, edges, h_values=h_values)
+        logical_nodes = nodes
+        logical_edges = edges
+
+    # If using embedding, embed the problem onto hardware
+    if topology_file and use_embedding:
+        print(f"🔗 Embedding logical problem onto hardware...")
+        # Embed h and J from logical to hardware
+        from dwave.embedding import embed_ising
+        # Convert edge list to adjacency dict for embed_ising
+        target_adj = {u: set() for u in nodes}
+        for u, v in edges:
+            target_adj[u].add(v)
+            target_adj[v].add(u)
+        h, J = embed_ising(logical_h, logical_J, embedding_dict, target_adj)
+        print(f"✅ Embedded: {len(h)} hardware qubits, {len(J)} hardware couplers")
+    else:
+        h = logical_h
+        J = logical_J
 
     # Show h distribution
     h_vals_set = sorted(set(h.values()))
@@ -59,9 +192,11 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
         test_configs = filtered
     
     print(f"\n🧪 Testing CPU configurations:")
-    
+
     results = {
         'timeout_minutes': timeout_minutes,
+        'topology': topology_desc,
+        'use_embedding': use_embedding if use_embedding else "none",
         'problem_info': {
             'num_variables': len(h),
             'num_couplings': len(J),
@@ -86,16 +221,32 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
         print(f"\n{desc}: {sweeps} sweeps, {reads} reads")
 
         try:
-            # Generate the Ising model with deterministic nonce
+            # Generate the Ising model with deterministic nonce on LOGICAL topology
             nonce = test_nonces[idx]
-            h, J = generate_ising_model_from_nonce(nonce, nodes, edges, h_values=h_values)
+            if topology_file:
+                logical_h_test, logical_J_test = generate_ising_model_from_nonce(nonce, logical_nodes, logical_edges, h_values=h_values)
+            else:
+                logical_h_test, logical_J_test = generate_ising_model_from_nonce(nonce, nodes, edges, h_values=h_values)
+
+            # Embed if needed
+            if topology_file and use_embedding:
+                from dwave.embedding import embed_ising, unembed_sampleset
+                h_test, J_test = embed_ising(logical_h_test, logical_J_test, embedding_dict, target_adj)
+            else:
+                h_test, J_test = logical_h_test, logical_J_test
 
             start_time = time.time()
             sampleset = cpu_sampler.sample_ising(
-                h=h, J=J,
+                h=h_test, J=J_test,
                 num_reads=reads,
                 num_sweeps=sweeps
             )
+
+            # Unembed if needed
+            if topology_file and use_embedding:
+                from dwave.embedding import unembed_sampleset
+                sampleset = unembed_sampleset(sampleset, embedding_dict, source_bqm=dimod.BinaryQuadraticModel.from_ising(logical_h_test, logical_J_test))
+
             runtime = time.time() - start_time
 
             energies = list(sampleset.record.energy)
@@ -120,9 +271,11 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
             salt = b"test_salt_cpu_baseline"
             prev_timestamp = int(time.time()) - 600  # 10 minutes ago
 
-            # Evaluate the sampleset
+            # Evaluate the sampleset (always use logical topology for validation)
+            eval_nodes = logical_nodes if topology_file else nodes
+            eval_edges = logical_edges if topology_file else edges
             mining_result = evaluate_sampleset(
-                sampleset, requirements, nodes, edges, nonce, salt,
+                sampleset, requirements, eval_nodes, eval_edges, nonce, salt,
                 prev_timestamp, start_time, f"cpu-baseline-{sweeps}-{reads}", "CPU"
             )
 
@@ -253,6 +406,16 @@ def main():
         default='-1,0,1',
         help='Comma-separated h field values (default: -1,0,1). Use "0" for h=0 baseline.'
     )
+    parser.add_argument(
+        '--topology',
+        type=str,
+        help='Path to embedding file (e.g., "dwave_topologies/embeddings/Advantage2_system1_8/zephyr_z9_t2.embed.json.gz")'
+    )
+    parser.add_argument(
+        '--use-embedding',
+        action='store_true',
+        help='Apply embedding and solve on hardware topology (requires --topology)'
+    )
 
     args = parser.parse_args()
 
@@ -280,7 +443,9 @@ def main():
         timeout_minutes=timeout,
         output_file=output_file,
         h_values=h_values,
-        only_label=only_label
+        only_label=only_label,
+        topology_file=args.topology,
+        use_embedding=args.use_embedding
     )
 
     print(f"\n✅ CPU baseline test complete!")

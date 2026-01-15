@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-Tool to dump D-Wave solver topologies and save them as importable Python files.
+Tool to dump D-Wave solver topologies and save them as JSON files (optionally gzipped).
 
 This tool connects to D-Wave solvers, extracts their topology information,
-and saves them as Python files in the dwave/topologies/ directory for easy import.
+and saves them as JSON files that can be loaded with load_json_topology().
 
 Usage:
     python tools/dump_solver_topology.py --solver Advantage2-System1.6
     python tools/dump_solver_topology.py --solver Advantage_system6.4 --output-dir custom/path
     python tools/dump_solver_topology.py --list-solvers
     python tools/dump_solver_topology.py --all-available
+    python tools/dump_solver_topology.py --solver Advantage2-System1.6 --gzip
 """
 
 import argparse
+import gzip
+import json
 import os
 import re
 import sys
@@ -22,6 +25,15 @@ from typing import Dict, List, Optional, Tuple, Any
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    # Load .env from project root
+    env_path = Path(__file__).parent.parent / '.env'
+    load_dotenv(dotenv_path=env_path)
+except ImportError:
+    pass  # python-dotenv not installed, rely on system environment
 
 try:
     from dwave.system import DWaveSampler
@@ -38,7 +50,7 @@ def normalize_solver_name(solver_name: str) -> str:
     Convert solver name to Python module name format.
     
     Examples:
-        Advantage2-System1.6 -> advantage2_system1_6
+        Advantage2-System1.7 -> advantage2_system1_7
         Advantage_system6.4 -> advantage_system6_4
         DW_2000Q_6 -> dw_2000q_6
     """
@@ -84,15 +96,21 @@ def get_topology_shape(properties: Dict[str, Any]) -> str:
     return 'unknown'
 
 
-def extract_solver_info(solver_name: str) -> Optional[Dict[str, Any]]:
+def extract_solver_info(solver_name: str, region: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Extract topology information from a D-Wave solver."""
     if not DWAVE_AVAILABLE or DWaveSampler is None:
         print("❌ D-Wave Ocean SDK not available")
         return None
 
     try:
-        print(f"🔍 Connecting to solver: {solver_name}")
-        sampler = DWaveSampler(solver=solver_name)
+        region_str = f" (region: {region})" if region else ""
+        print(f"🔍 Connecting to solver: {solver_name}{region_str}")
+
+        # Pass region if specified
+        kwargs = {'solver': solver_name}
+        if region:
+            kwargs['region'] = region
+        sampler = DWaveSampler(**kwargs)
         
         # Extract basic topology info
         nodes = list(sampler.nodelist)
@@ -124,85 +142,48 @@ def extract_solver_info(solver_name: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def generate_topology_file_content(solver_info: Dict[str, Any]) -> str:
-    """Generate Python file content for the topology."""
+def generate_topology_json(solver_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate JSON data structure for the topology."""
     solver_name = solver_info['solver_name']
-    constant_name = normalize_constant_name(solver_name)
-    
-    # Format nodes and edges for Python (limit display for readability)
-    nodes_repr = repr(solver_info['nodes'])
-    edges_repr = repr(solver_info['edges'])
-    
-    # If lists are very long, we'll write them more efficiently
-    if len(solver_info['nodes']) > 100:
-        # Check if nodes are contiguous integers starting from 0 or min value
-        sorted_nodes = sorted(solver_info['nodes'])
-        min_node = min(sorted_nodes)
-        max_node = max(sorted_nodes)
-        expected_range = list(range(min_node, max_node + 1))
 
-        if sorted_nodes == expected_range:
-            nodes_repr = f"list(range({min_node}, {max_node + 1}))"
-        else:
-            # Nodes are not contiguous, keep the full list but truncate for readability
-            if len(solver_info['nodes']) > 1000:
-                # For very large lists, just show the pattern
-                nodes_repr = f"# {len(solver_info['nodes'])} nodes: {solver_info['nodes'][:20]} + ... + {solver_info['nodes'][-20:]}\n"
-                nodes_repr += f"    {repr(solver_info['nodes'])}"
-            else:
-                nodes_repr = repr(solver_info['nodes'])
-    
-    content = f'''"""
-D-Wave {solver_name} topology definition.
+    # Create JSON structure matching the format expected by load_json_topology()
+    topology_json = {
+        'metadata': {
+            'solver_name': solver_name,
+            'topology_type': solver_info['topology_type'],
+            'topology_shape': solver_info['topology_shape'],
+            'num_nodes': solver_info['num_nodes'],
+            'num_edges': solver_info['num_edges'],
+            'generated_from': f"D-Wave API via dump_solver_topology.py",
+            'generated_at': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+        },
+        'nodes': solver_info['nodes'],
+        'edges': solver_info['edges'],
+        'properties': solver_info['properties'],
+        'docs': {
+            'description': f"D-Wave {solver_name} topology definition",
+            'usage': f"from dwave_topologies.topologies.json_loader import load_json_topology\ntopology = load_json_topology('{normalize_solver_name(solver_name)}.json.gz')",
+        }
+    }
 
-Auto-generated by tools/dump_solver_topology.py on {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}.
-
-Topology Information:
-- Solver: {solver_name}
-- Type: {solver_info['topology_type']}
-- Shape: {solver_info['topology_shape']}
-- Nodes: {solver_info['num_nodes']}
-- Edges: {solver_info['num_edges']}
-"""
-
-from typing import List, Tuple, Dict, Any
-
-# Topology constant for import
-{constant_name} = {{
-    'solver_name': '{solver_name}',
-    'topology_type': '{solver_info['topology_type']}',
-    'topology_shape': '{solver_info['topology_shape']}',
-    'num_nodes': {solver_info['num_nodes']},
-    'num_edges': {solver_info['num_edges']},
-    'nodes': {nodes_repr},
-    'edges': {edges_repr},
-    'properties': {repr(solver_info['properties'])},
-    'generated_at': '{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}',
-}}
-
-# Convenience accessors
-NODES: List[int] = {constant_name}['nodes']
-EDGES: List[Tuple[int, int]] = {constant_name}['edges']
-PROPERTIES: Dict[str, Any] = {constant_name}['properties']
-SOLVER_NAME: str = '{solver_name}'
-TOPOLOGY_TYPE: str = '{solver_info['topology_type']}'
-TOPOLOGY_SHAPE: str = '{solver_info['topology_shape']}'
-NUM_NODES: int = {solver_info['num_nodes']}
-NUM_EDGES: int = {solver_info['num_edges']}
-'''
-    
-    return content
+    return topology_json
 
 
-def list_available_solvers() -> List[str]:
+def list_available_solvers(region: Optional[str] = None) -> List[str]:
     """List all available D-Wave solvers."""
     if not DWAVE_AVAILABLE or Client is None:
         print("❌ D-Wave Ocean SDK not available")
         return []
 
     try:
-        print("🔍 Querying available D-Wave solvers...")
-        client = Client.from_config()
+        region_str = f" in region {region}" if region else ""
+        print(f"🔍 Querying available D-Wave solvers{region_str}...")
+
+        # Pass region if specified
+        kwargs = {}
+        if region:
+            kwargs['region'] = region
+        client = Client.from_config(**kwargs)
         solvers = client.get_solvers()
         
         solver_names = []
@@ -240,87 +221,173 @@ def list_available_solvers() -> List[str]:
         return []
 
 
-def dump_solver_topology(solver_name: str, output_dir: str = "dwave/topologies") -> bool:
-    """Dump a single solver topology to a Python file."""
+def generate_python_module(solver_info: Dict[str, Any], json_filename: str) -> str:
+    """Generate Python module content for the topology."""
+    solver_name = solver_info['solver_name']
+    module_name = normalize_solver_name(solver_name)
+    constant_name = normalize_constant_name(solver_name)
+
+    content = f'''"""
+D-Wave {solver_name} topology definition.
+
+Loaded from static JSON file ({json_filename}).
+This is the real {solver_name} solver topology with defects.
+
+Topology Information:
+- Solver: {solver_name}
+- Type: {solver_info['topology_type']}
+- Shape: {solver_info['topology_shape']}
+- Nodes: {solver_info['num_nodes']}
+- Edges: {solver_info['num_edges']}
+"""
+
+from .json_loader import load_json_topology
+
+# Load topology from JSON file
+_json_topology = load_json_topology('{json_filename}')
+
+# Export the topology instance directly
+{constant_name}_TOPOLOGY = _json_topology
+'''
+    return content
+
+
+def dump_solver_topology(solver_name: str, output_dir: str = "dwave_topologies/topologies", use_gzip: bool = True, region: Optional[str] = None) -> bool:
+    """Dump a single solver topology to a JSON file (optionally gzipped) and generate Python module."""
     # Extract solver information
-    solver_info = extract_solver_info(solver_name)
+    solver_info = extract_solver_info(solver_name, region=region)
     if not solver_info:
         return False
-    
+
     # Create output directory
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    
+
     # Generate filename
     module_name = normalize_solver_name(solver_name)
-    filename = f"{module_name}.py"
-    filepath = output_path / filename
-    
-    # Generate file content
-    content = generate_topology_file_content(solver_info)
-    
-    # Write file
+    json_filename = f"{module_name}.json"
+    if use_gzip:
+        json_filename += ".gz"
+    json_filepath = output_path / json_filename
+
+    # Generate JSON content
+    topology_json = generate_topology_json(solver_info)
+
+    # Write JSON file
     try:
-        with open(filepath, 'w') as f:
-            f.write(content)
-        
-        print(f"✅ Topology saved to: {filepath}")
-        print(f"   Import as: from {output_dir.replace('/', '.')}.{module_name} import {normalize_constant_name(solver_name)}")
-        return True
-        
+        if use_gzip:
+            with gzip.open(json_filepath, 'wt', encoding='utf-8') as f:
+                json.dump(topology_json, f, indent=2)
+        else:
+            with open(json_filepath, 'w', encoding='utf-8') as f:
+                json.dump(topology_json, f, indent=2)
+
+        file_size = json_filepath.stat().st_size
+        size_str = f"{file_size / 1024:.1f} KB" if file_size < 1024 * 1024 else f"{file_size / (1024 * 1024):.1f} MB"
+
+        print(f"   JSON saved to: {json_filepath} ({size_str})")
+
     except Exception as e:
-        print(f"❌ Failed to write file {filepath}: {e}")
+        print(f"   Failed to write JSON file {json_filepath}: {e}")
+        return False
+
+    # Generate and write Python module
+    py_filename = f"{module_name}.py"
+    py_filepath = output_path / py_filename
+
+    try:
+        py_content = generate_python_module(solver_info, json_filename)
+        with open(py_filepath, 'w', encoding='utf-8') as f:
+            f.write(py_content)
+
+        print(f"   Python module saved to: {py_filepath}")
+        print(f"   Import with: from dwave_topologies.topologies.{module_name} import {normalize_constant_name(solver_name)}_TOPOLOGY")
+        return True
+
+    except Exception as e:
+        print(f"   Failed to write Python module {py_filepath}: {e}")
         return False
 
 
-def create_init_file(output_dir: str, solver_names: List[str]) -> None:
-    """Create __init__.py file for the topologies package."""
-    init_path = Path(output_dir) / "__init__.py"
-    
-    imports = []
-    all_exports = []
-    
+def create_readme_file(output_dir: str, solver_names: List[str], use_gzip: bool) -> None:
+    """Create README.md file documenting the dumped topologies."""
+    readme_path = Path(output_dir) / "README.md"
+
+    extension = ".json.gz" if use_gzip else ".json"
+    topology_list = []
+
     for solver_name in solver_names:
         module_name = normalize_solver_name(solver_name)
-        constant_name = normalize_constant_name(solver_name)
-        imports.append(f"from .{module_name} import {constant_name}")
-        all_exports.append(constant_name)
-    
-    content = f'''"""
-D-Wave solver topologies package.
+        topology_list.append(f"- `{module_name}{extension}` - {solver_name}")
 
-Auto-generated by tools/dump_solver_topology.py on {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}.
+    content = f'''# D-Wave Solver Topologies
 
-This package contains topology definitions for various D-Wave solvers,
-extracted directly from the D-Wave API.
-"""
+Auto-generated by `tools/dump_solver_topology.py` on {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}.
 
-{chr(10).join(imports)}
+This directory contains topology definitions for various D-Wave solvers,
+extracted directly from the D-Wave API and saved in JSON format.
 
-__all__ = [
-{chr(10).join(f'    "{name}",' for name in all_exports)}
-]
+## Available Topologies
+
+{chr(10).join(topology_list)}
+
+## Usage
+
+Load a topology using the `load_json_topology()` function:
+
+```python
+from dwave_topologies.topologies.json_loader import load_json_topology
+
+# Load topology
+topology = load_json_topology('{normalize_solver_name(solver_names[0]) if solver_names else "topology"}{extension}')
+
+# Access topology properties
+print(f"Solver: {{topology.solver_name}}")
+print(f"Nodes: {{topology.num_nodes}}")
+print(f"Edges: {{topology.num_edges}}")
+print(f"Type: {{topology.topology_type}}")
+
+# Access graph and data
+nodes = topology.nodes
+edges = topology.edges
+graph = topology.graph
+```
+
+## Updating Topologies
+
+To update or add new topologies, run:
+
+```bash
+# Dump a specific solver
+python tools/dump_solver_topology.py --solver Advantage2-System1.6 --gzip
+
+# List available solvers
+python tools/dump_solver_topology.py --list-solvers
+
+# Dump all available solvers
+python tools/dump_solver_topology.py --all-available --gzip
+```
 '''
-    
+
     try:
-        with open(init_path, 'w') as f:
+        with open(readme_path, 'w') as f:
             f.write(content)
-        print(f"✅ Package init file created: {init_path}")
+        print(f"✅ README file created: {readme_path}")
     except Exception as e:
-        print(f"❌ Failed to create init file: {e}")
+        print(f"❌ Failed to create README file: {e}")
 
 
 def main():
     """Main function with command line argument parsing."""
     parser = argparse.ArgumentParser(
-        description='Dump D-Wave solver topologies to importable Python files',
+        description='Dump D-Wave solver topologies to JSON files (optionally gzipped)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --solver Advantage2-System1.6
+  %(prog)s --solver Advantage2-System1.6 --gzip
   %(prog)s --solver Advantage_system6.4 --output-dir custom/path
   %(prog)s --list-solvers
-  %(prog)s --all-available
+  %(prog)s --all-available --gzip
         """
     )
     
@@ -333,62 +400,76 @@ Examples:
     parser.add_argument(
         '--output-dir', '-o',
         type=str,
-        default='dwave/topologies',
-        help='Output directory for topology files (default: dwave/topologies)'
+        default='dwave_topologies/topologies',
+        help='Output directory for topology files (default: dwave_topologies/topologies)'
     )
-    
+
+    parser.add_argument(
+        '--gzip', '-g',
+        action='store_true',
+        help='Compress output files with gzip (recommended, reduces file size ~10x)'
+    )
+
     parser.add_argument(
         '--list-solvers', '-l',
         action='store_true',
         help='List all available D-Wave solvers and exit'
     )
-    
+
     parser.add_argument(
         '--all-available', '-a',
         action='store_true',
         help='Dump topologies for all available solvers'
     )
-    
+
+    parser.add_argument(
+        '--region', '-r',
+        type=str,
+        help='D-Wave region (e.g., "na-east-1", "na-west-1"). If not specified, uses default from config.'
+    )
+
     args = parser.parse_args()
-    
+
     if not DWAVE_AVAILABLE:
         print("❌ D-Wave Ocean SDK not available. Install with:")
         print("   pip install dwave-ocean-sdk")
         sys.exit(1)
-    
+
     # List solvers mode
     if args.list_solvers:
-        list_available_solvers()
+        list_available_solvers(region=args.region)
         return
     
     # All available solvers mode
     if args.all_available:
-        solver_names = list_available_solvers()
+        solver_names = list_available_solvers(region=args.region)
         if not solver_names:
             print("❌ No solvers available")
             sys.exit(1)
-        
+
         print(f"\n🚀 Dumping topologies for {len(solver_names)} solvers...")
+        print(f"   Output format: {'JSON (gzip compressed)' if args.gzip else 'JSON (uncompressed)'}")
         successful = []
-        
+
         for solver_name in solver_names:
             print(f"\n--- Processing {solver_name} ---")
-            if dump_solver_topology(solver_name, args.output_dir):
+            if dump_solver_topology(solver_name, args.output_dir, args.gzip, region=args.region):
                 successful.append(solver_name)
-        
+
         if successful:
-            create_init_file(args.output_dir, successful)
+            create_readme_file(args.output_dir, successful, args.gzip)
             print(f"\n✅ Successfully dumped {len(successful)}/{len(solver_names)} solver topologies")
         else:
             print(f"\n❌ Failed to dump any solver topologies")
-        
+
         return
-    
+
     # Single solver mode
     if args.solver:
         print(f"🚀 Dumping topology for solver: {args.solver}")
-        if dump_solver_topology(args.solver, args.output_dir):
-            create_init_file(args.output_dir, [args.solver])
+        print(f"   Output format: {'JSON (gzip compressed)' if args.gzip else 'JSON (uncompressed)'}")
+        if dump_solver_topology(args.solver, args.output_dir, args.gzip, region=args.region):
+            create_readme_file(args.output_dir, [args.solver], args.gzip)
             print(f"\n✅ Successfully dumped topology for {args.solver}")
         else:
             print(f"\n❌ Failed to dump topology for {args.solver}")

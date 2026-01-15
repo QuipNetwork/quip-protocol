@@ -87,12 +87,13 @@ class CudaMiner(BaseMiner):
     This eliminates kernel launch overhead and enables high job throughput.
     """
 
-    def __init__(self, miner_id: str, device: str = "0", **cfg):
+    def __init__(self, miner_id: str, device: str = "0", topology=None, **cfg):
         """Initialize CUDA miner.
 
         Args:
             miner_id: Unique identifier for this miner
             device: CUDA device ID (default "0")
+            topology: Optional topology object (default: DEFAULT_TOPOLOGY)
             **cfg: Additional configuration parameters
         """
         # Set CUDA device BEFORE creating any CUDA objects
@@ -104,9 +105,12 @@ class CudaMiner(BaseMiner):
         except Exception as e:
             print(f"Warning: Failed to set CUDA device {device}: {e}")
 
-        # Get topology from DEFAULT_TOPOLOGY first (needed for BaseMiner)
-        self.nodes = list(DEFAULT_TOPOLOGY.graph.nodes)
-        self.edges = list(DEFAULT_TOPOLOGY.graph.edges)
+        # Get topology (use provided or default)
+        topology_obj = topology if topology is not None else DEFAULT_TOPOLOGY
+        self.nodes = list(topology_obj.graph.nodes)
+        self.edges = list(topology_obj.graph.edges)
+        # Precompute node indices as numpy array for fast filtering
+        self._node_indices = np.array(self.nodes, dtype=np.int32)
 
         # Initialize persistent kernel with large ring buffer for batched mining
         self.kernel = CudaKernelRealSA(
@@ -121,19 +125,19 @@ class CudaMiner(BaseMiner):
         # Create a minimal sampler interface for BaseMiner
         # BaseMiner expects a sampler with nodes/edges attributes
         class SamplerInterface:
-            def __init__(self, nodes, edges):
+            def __init__(self, nodes, edges, properties):
                 self.nodes = nodes
                 self.edges = edges
                 self.nodelist = nodes
                 self.edgelist = edges
-                self.properties = {'topology': 'Advantage2'}
+                self.properties = properties
                 self.sampler_type = "cuda-persistent"
 
             def sample_ising(self, h, J, **kwargs):
                 """Dummy sample_ising - not used in CudaMiner."""
                 raise NotImplementedError("CudaMiner handles sampling directly")
 
-        minimal_sampler = SamplerInterface(self.nodes, self.edges)
+        minimal_sampler = SamplerInterface(self.nodes, self.edges, topology_obj.properties)
 
         # Initialize base miner (sets up logger, miner_id, etc.)
         super().__init__(miner_id, minimal_sampler)
@@ -161,11 +165,13 @@ class CudaMiner(BaseMiner):
             if hasattr(self, 'async_sampler'):
                 self.async_sampler.stop_immediate()
 
-            # Reset CUDA device
+            # Synchronize and free memory pools (deviceReset doesn't exist in CuPy)
             if cp is not None:
                 cp.cuda.Device(int(self.device)).use()
-                cp.cuda.runtime.deviceReset()
-                self.logger.info(f"CUDA device {self.device} reset completed")
+                cp.cuda.Stream.null.synchronize()
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+                self.logger.info(f"CUDA device {self.device} cleanup completed")
 
         except Exception as e:
             self.logger.error(f"Error during CUDA miner cleanup: {e}")
@@ -186,11 +192,10 @@ class CudaMiner(BaseMiner):
         Returns:
             SampleSet with samples filtered to length 4593
         """
-        filtered_samples = []
-        for sample in sampleset.record.sample:
-            # Extract only values at node indices that exist in topology
-            filtered_sample = np.array([sample[node] for node in self.nodes], dtype=np.int8)
-            filtered_samples.append(filtered_sample)
+        # Use numpy advanced indexing for vectorized extraction
+        # self._node_indices is precomputed in __init__ for speed
+        samples = sampleset.record.sample
+        filtered_samples = samples[:, self._node_indices].astype(np.int8)
 
         # Create new SampleSet with filtered samples
         return dimod.SampleSet.from_samples(
@@ -207,6 +212,7 @@ class CudaMiner(BaseMiner):
         requirements,
         prev_timestamp: int,
         stop_event: multiprocessing.synchronize.Event,
+        drain: bool = False,
     ) -> Optional[MiningResult]:
         """Mine a block using persistent CUDA kernel.
 
@@ -220,6 +226,8 @@ class CudaMiner(BaseMiner):
             requirements: BlockRequirements object with difficulty settings
             prev_timestamp: Timestamp from previous block header
             stop_event: Multiprocessing event to signal stop
+            drain: If False (default), return immediately on first valid result.
+                If True, process entire batch and return best result.
 
         Returns:
             MiningResult if successful, None if stopped or failed
@@ -275,6 +283,7 @@ class CudaMiner(BaseMiner):
         N = max(max(self.nodes), max(max(i, j) for i, j in self.edges)) + 1
 
         attempts = 0
+
         while not stop_event.is_set():
             # Increment sweeps slowly over time (reads stay constant)
             current_time = time.time()
@@ -282,9 +291,12 @@ class CudaMiner(BaseMiner):
                 # Increase sweeps by 1% toward max
                 current_num_sweeps = min(max_num_sweeps, int(current_num_sweeps * 1.05))
                 last_increment_time = current_time
+
             # Generate batch of Ising problems
             h_list = []
             J_list = []
+            h_dicts = []  # Keep dict versions for evaluate_sampleset
+            J_dicts = []
             salts = []
             nonces = []
 
@@ -295,6 +307,8 @@ class CudaMiner(BaseMiner):
                 )
 
                 h_dict, J_dict = generate_ising_model_from_nonce(nonce, self.nodes, self.edges)
+                h_dicts.append(h_dict)
+                J_dicts.append(J_dict)
 
                 # Convert to arrays (using sparse indexing with N=4800)
                 h = np.zeros(N, dtype=np.float32)
@@ -314,51 +328,117 @@ class CudaMiner(BaseMiner):
                 salts.append(salt)
                 nonces.append(nonce)
 
-            # Submit batch to GPU
+            # Submit batch to GPU (non-blocking)
             try:
-                samplesets = self.async_sampler.sample_ising(
+                job_ids = self.async_sampler.sample_ising_async(
                     h_list=h_list,
                     J_list=J_list,
-                    num_reads=num_reads,  # Constant
-                    num_betas=current_num_sweeps,  # Incrementing
+                    num_reads=num_reads,
+                    num_betas=current_num_sweeps,
                     num_sweeps_per_beta=num_sweeps_per_beta,
                     edges=self.edges,
-                    timeout=300.0  # 5 minute timeout for production problems
                 )
             except Exception as e:
                 self.logger.error(f"Sampling error: {e}")
                 continue
 
-            # Evaluate each sampleset
-            for i, sampleset in enumerate(samplesets):
-                if stop_event.is_set():
-                    break
+            # Process results as they arrive (incremental, not waiting for all)
+            remaining_jobs = set(range(len(job_ids)))
+            job_to_idx = {job_ids[i]: i for i in range(len(job_ids))}
+            best_batch_result = None
+            last_result_time = time.time()
+            drain_timeout = 0.5  # 500ms timeout for drain mode
 
+            while remaining_jobs:
+                # Exit immediately if stop requested
+                if stop_event.is_set():
+                    self.logger.info("Mining stopped by stop_event")
+                    return best_batch_result
+
+                # Poll for next result (non-blocking)
+                result = self.async_sampler.kernel.try_dequeue_result()
+                if result is None:
+                    # In drain mode with a valid result, exit if we've waited too long
+                    if drain and best_batch_result and (time.time() - last_result_time) > drain_timeout:
+                        self.logger.info(f"Drain timeout ({drain_timeout}s) - returning best result early")
+                        return best_batch_result
+                    time.sleep(0.001)  # 1ms backoff
+                    continue
+
+                # Reset timeout on each result received
+                last_result_time = time.time()
+
+                # Got a result - process it immediately
+                job_id = result['job_id']
+
+                if job_id not in job_to_idx:
+                    continue  # Unexpected job (from previous batch?)
+
+                idx = job_to_idx[job_id]
+                if idx not in remaining_jobs:
+                    continue  # Already processed
+
+                remaining_jobs.remove(idx)
                 attempts += 1
 
-                # Filter samples to match expected topology size
-                filtered_sampleset = self._filter_samples_for_sparse_topology(sampleset)
+                # Convert result to SampleSet (with timing)
+                t0 = time.time()
+                samples = self.async_sampler.kernel.get_samples(result)
+                energies = self.async_sampler.kernel.get_energies(result)
+                t1 = time.time()
+                sampleset = dimod.SampleSet.from_samples(
+                    samples.astype(np.int8),
+                    vartype='SPIN',
+                    energy=energies,
+                    info={'job_id': job_id, 'min_energy': result['min_energy']}
+                )
+                t2 = time.time()
 
-                # Evaluate against requirements
+                # Filter and evaluate (pass pre-computed h, J to avoid regeneration)
+                filtered_sampleset = self._filter_samples_for_sparse_topology(sampleset)
+                t3 = time.time()
                 mining_result = evaluate_sampleset(
                     filtered_sampleset,
                     current_requirements,
                     self.nodes,
                     self.edges,
-                    nonces[i],
-                    salts[i],
+                    nonces[idx],
+                    salts[idx],
                     prev_timestamp,
                     start_time,
                     self.miner_id,
-                    self.miner_type
+                    self.miner_type,
+                    h=h_dicts[idx],
+                    J=J_dicts[idx]
                 )
+                t4 = time.time()
+
+                # Log timing if any step took > 200ms (baseline is ~50ms for SampleSet overhead)
+                get_time = (t1 - t0) * 1000
+                sampleset_time = (t2 - t1) * 1000
+                filter_time = (t3 - t2) * 1000
+                eval_time = (t4 - t3) * 1000
+                total_time = (t4 - t0) * 1000
+                if total_time > 200:
+                    self.logger.warning(
+                        f"Slow processing ({total_time:.0f}ms): "
+                        f"get={get_time:.0f}ms, sampleset={sampleset_time:.0f}ms, "
+                        f"filter={filter_time:.0f}ms, eval={eval_time:.0f}ms"
+                    )
 
                 if mining_result:
                     self.logger.info(f"✅ Found valid block after {attempts} attempts!")
                     self.logger.info(f"   Energy: {mining_result.energy:.1f}")
                     self.logger.info(f"   Diversity: {mining_result.diversity:.3f}")
                     self.logger.info(f"   Solutions: {mining_result.num_valid}")
-                    return mining_result
+                    # Track best result in this batch (lowest energy)
+                    if best_batch_result is None or mining_result.energy < best_batch_result.energy:
+                        best_batch_result = mining_result
+
+                # Batch complete - return best result if we found one
+                if best_batch_result:
+                    if not drain or attempts % batch_size == 0:
+                        return best_batch_result
 
             # Log progress every 10 batches
             if attempts % (10 * batch_size) == 0:
