@@ -850,7 +850,7 @@ def main():
         '--topology',
         type=str,
         default=None,
-        help='Topology name (default: DEFAULT_TOPOLOGY=Z(9,2)). Examples: "Z(9,2)", "Z(10,2)", "Advantage2_system1.8"'
+        help='Topology name (default: DEFAULT_TOPOLOGY=Z(9,2)). Examples: "Z(9,2)", "Z(10,2)", "Advantage2_system1.10"'
     )
     parser.add_argument(
         '--canary-num-sweeps',

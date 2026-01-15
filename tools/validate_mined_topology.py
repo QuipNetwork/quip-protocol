@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Validate that mined topologies are valid subgraphs of the Advantage2-System1.8 topology.
+Validate that mined topologies are valid subgraphs of the Advantage2-System1.10 topology.
 
 This tool verifies that:
 1. All nodes in the mined topology exist in the real QPU topology
@@ -26,7 +26,7 @@ from dwave_topologies.topologies.json_loader import load_json_topology
 
 def validate_topology(mined_topology_file: str, verbose: bool = True) -> bool:
     """
-    Validate that a mined topology is a valid subgraph of Advantage2-System1.8.
+    Validate that a mined topology is a valid subgraph of Advantage2-System1.10.
 
     Args:
         mined_topology_file: Filename of the mined topology (e.g., 'zephyr_z10_t2.json.gz')
@@ -36,7 +36,7 @@ def validate_topology(mined_topology_file: str, verbose: bool = True) -> bool:
         True if topology is valid, False otherwise
     """
     # Load the real QPU topology
-    qpu_topology = load_json_topology('advantage2_system1_8.json.gz', from_embeddings=False)
+    qpu_topology = load_json_topology('advantage2_system1_10.json.gz', from_embeddings=False)
     qpu_nodes = set(qpu_topology.nodes)
     qpu_edges = set((min(u, v), max(u, v)) for u, v in qpu_topology.edges)  # Normalize edge direction
 
@@ -49,7 +49,7 @@ def validate_topology(mined_topology_file: str, verbose: bool = True) -> bool:
         print(f"\n{'='*80}")
         print(f"Validating: {mined_topology_file}")
         print(f"{'='*80}")
-        print(f"\nReal QPU Topology (Advantage2-System1.8):")
+        print(f"\nReal QPU Topology (Advantage2-System1.10):")
         print(f"  Nodes: {len(qpu_nodes)}")
         print(f"  Edges: {len(qpu_edges)}")
         print(f"\nMined Topology:")
@@ -86,7 +86,7 @@ def validate_topology(mined_topology_file: str, verbose: bool = True) -> bool:
     # Success!
     if verbose:
         print(f"\n✅ VALIDATION PASSED: All nodes and edges are valid!")
-        print(f"   This topology is a proper subgraph of Advantage2-System1.8")
+        print(f"   This topology is a proper subgraph of Advantage2-System1.10")
         print(f"   and can be used for quantum annealing on the actual hardware.\n")
 
     return True
@@ -94,7 +94,7 @@ def validate_topology(mined_topology_file: str, verbose: bool = True) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Validate mined topologies against Advantage2-System1.8",
+        description="Validate mined topologies against Advantage2-System1.10",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -132,7 +132,7 @@ Examples:
 
     # Determine which topologies to validate
     if args.all:
-        embeddings_dir = Path(__file__).parent.parent / 'dwave_topologies' / 'embeddings' / 'Advantage2_system1_8'
+        embeddings_dir = Path(__file__).parent.parent / 'dwave_topologies' / 'embeddings' / 'Advantage2_system1_10'
         topology_files = sorted(embeddings_dir.glob('*.json.gz'))
         if not topology_files:
             print("No mined topologies found in embeddings directory")

@@ -15,7 +15,7 @@ services:
       - DIFFICULTY_ENERGY=-14900
       - MIN_DIVERSITY=0.1
       - MIN_SOLUTIONS=5
-      - TOPOLOGY_FILE=dwave_topologies/topologies/advantage2_system1_8.json.gz
+      - TOPOLOGY_FILE=dwave_topologies/topologies/advantage2_system1_10.json.gz
       - AUTO_TERMINATE=true
       # IPFS Configuration (REQUIRED)
       - IPFS_NODE=https://carback-ipfs.ngrok.io

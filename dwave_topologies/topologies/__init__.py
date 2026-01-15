@@ -8,7 +8,7 @@ general-purpose topology definitions for development and testing.
 Usage:
     # Import topology objects
     from dwave_topologies import DEFAULT_TOPOLOGY, ZEPHYR_Z9_T2_TOPOLOGY
-    from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_8_TOPOLOGY
+    from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_10_TOPOLOGY
 
     # Access topology properties
     nodes = DEFAULT_TOPOLOGY.nodes
@@ -29,15 +29,15 @@ from .zephyr import (
     ZEPHYR_Z11_T4_TOPOLOGY,
     ZEPHYR_Z12_T4_TOPOLOGY,
 )
-from .advantage2_system1_8 import ADVANTAGE2_SYSTEM1_8_TOPOLOGY
+from .advantage2_system1_10 import ADVANTAGE2_SYSTEM1_10_TOPOLOGY
 from .advantage2_system4_1 import ADVANTAGE2_SYSTEM4_1_TOPOLOGY
 from .json_loader import load_topology
 
-# Default topology: Advantage2-System1.8 (real QPU hardware topology)
-# Topology: 4,591 qubits, 41,766 couplers (Zephyr Z(12,4) with defects)
+# Default topology: Advantage2-System1.10 (real QPU hardware topology)
+# Topology: 4,589 qubits, 41,729 couplers (Zephyr Z(12,4) with defects)
 # All miners use the same topology - no embedding needed for QPU
-# Hardware topology file: dwave_topologies/topologies/advantage2_system1_8.json.gz
-DEFAULT_TOPOLOGY = ADVANTAGE2_SYSTEM1_8_TOPOLOGY
+# Hardware topology file: dwave_topologies/topologies/advantage2_system1_10.json.gz
+DEFAULT_TOPOLOGY = ADVANTAGE2_SYSTEM1_10_TOPOLOGY
 
 __all__ = [
     # Topology objects
@@ -50,7 +50,7 @@ __all__ = [
     "ZEPHYR_Z10_T2_TOPOLOGY",
     "ZEPHYR_Z11_T4_TOPOLOGY",
     "ZEPHYR_Z12_T4_TOPOLOGY",
-    "ADVANTAGE2_SYSTEM1_8_TOPOLOGY",
+    "ADVANTAGE2_SYSTEM1_10_TOPOLOGY",
     "ADVANTAGE2_SYSTEM4_1_TOPOLOGY",
 
     # Default
