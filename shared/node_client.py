@@ -22,6 +22,7 @@ from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import (
     QuicEvent,
     DatagramFrameReceived,
+    StreamDataReceived,
     ConnectionTerminated,
     HandshakeCompleted,
 )
@@ -38,6 +39,10 @@ if TYPE_CHECKING:
 QUIP_ALPN_PROTOCOL = "quip-v1"
 DEFAULT_QUIC_PORT = 20049
 MAX_DATAGRAM_FRAME_SIZE = 65535
+# Messages larger than this use QUIC streams instead of datagrams.
+# RFC 9000 Section 14 mandates 1200 bytes as the minimum supported UDP payload
+# to ensure compatibility across all network paths (IPv6 minimum MTU, broken PMTUD, etc.)
+MAX_DATAGRAM_MESSAGE_SIZE = 1200
 
 
 class QuicMessageType(IntEnum):
@@ -178,8 +183,10 @@ class _QuicClientProtocol(QuicConnectionProtocol):
         self._pending_requests: Dict[int, asyncio.Future] = {}
         self._request_counter = 0
         self._connected = asyncio.Event()
-        self._closed = False
+        self._connection_closed = False  # Renamed to avoid conflict with parent's _closed Event
         self._peer_certificate_der: Optional[bytes] = None
+        # Stream buffers for reassembling stream data
+        self._stream_buffers: Dict[int, bytearray] = {}
 
     def quic_event_received(self, event: QuicEvent) -> None:
         if isinstance(event, HandshakeCompleted):
@@ -187,14 +194,32 @@ class _QuicClientProtocol(QuicConnectionProtocol):
             self._extract_peer_certificate()
             self._connected.set()
         elif isinstance(event, DatagramFrameReceived):
+            self._logger.debug(f"DatagramFrameReceived: {len(event.data)} bytes")
             self._handle_response(event.data)
+        elif isinstance(event, StreamDataReceived):
+            self._handle_stream_data(event)
         elif isinstance(event, ConnectionTerminated):
-            self._closed = True
+            self._logger.info(f"ConnectionTerminated: code={event.error_code}, reason={event.reason_phrase}")
+            self._connection_closed = True
             self._connected.clear()
             for future in self._pending_requests.values():
                 if not future.done():
                     future.set_exception(ConnectionError("Connection terminated"))
             self._pending_requests.clear()
+            self._stream_buffers.clear()
+
+    def _handle_stream_data(self, event: StreamDataReceived) -> None:
+        """Handle data received on a QUIC stream."""
+        stream_id = event.stream_id
+        if stream_id not in self._stream_buffers:
+            self._stream_buffers[stream_id] = bytearray()
+        self._stream_buffers[stream_id].extend(event.data)
+
+        # Check if stream is complete (end_stream flag)
+        if event.end_stream:
+            data = bytes(self._stream_buffers.pop(stream_id))
+            self._logger.debug(f"StreamDataReceived complete: {len(data)} bytes on stream {stream_id}")
+            self._handle_response(data)
 
     def _extract_peer_certificate(self) -> None:
         """Extract peer certificate from TLS session for TOFU verification."""
@@ -220,10 +245,17 @@ class _QuicClientProtocol(QuicConnectionProtocol):
     def _handle_response(self, data: bytes) -> None:
         try:
             msg = QuicMessage.from_bytes(data)
+            self._logger.debug(
+                f"Received response: type={msg.msg_type.name}, id={msg.request_id}"
+            )
             if msg.request_id in self._pending_requests:
                 future = self._pending_requests.pop(msg.request_id)
                 if not future.done():
                     future.set_result(msg)
+            else:
+                self._logger.warning(
+                    f"Received response for unknown request_id={msg.request_id}"
+                )
         except Exception as e:
             self._logger.warning(f"Invalid response: {e}")
 
@@ -236,7 +268,8 @@ class _QuicClientProtocol(QuicConnectionProtocol):
 
     async def send_request(self, msg_type: QuicMessageType, payload: bytes,
                            timeout: float = 10.0) -> Optional[QuicMessage]:
-        if self._closed:
+        if self._connection_closed:
+            self._logger.warning(f"send_request: connection closed, not sending {msg_type.name}")
             return None
 
         self._request_counter += 1
@@ -245,22 +278,37 @@ class _QuicClientProtocol(QuicConnectionProtocol):
         self._pending_requests[request_id] = future
 
         msg = QuicMessage(msg_type=msg_type, request_id=request_id, payload=payload)
+        msg_bytes = msg.to_bytes()
+
         try:
-            self._quic.send_datagram_frame(msg.to_bytes())
+            # Use streams for large messages, datagrams for small ones
+            if len(msg_bytes) > MAX_DATAGRAM_MESSAGE_SIZE:
+                stream_id = self._quic.get_next_available_stream_id()
+                self._quic.send_stream_data(stream_id, msg_bytes, end_stream=True)
+                self._logger.debug(
+                    f"Sending {msg_type.name} (id={request_id}) via stream {stream_id}, size={len(msg_bytes)}"
+                )
+            else:
+                self._quic.send_datagram_frame(msg_bytes)
+                self._logger.debug(
+                    f"Sending {msg_type.name} (id={request_id}) via datagram, size={len(msg_bytes)}"
+                )
             self.transmit()
         except Exception as e:
+            self._logger.warning(f"Failed to send {msg_type.name}: {e}")
             self._pending_requests.pop(request_id, None)
             return None
 
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
+            self._logger.warning(f"Timeout waiting for response to {msg_type.name} (id={request_id})")
             self._pending_requests.pop(request_id, None)
             return None
 
     @property
     def is_connected(self) -> bool:
-        return self._connected.is_set() and not self._closed
+        return self._connected.is_set() and not self._connection_closed
 
     @property
     def peer_certificate_fingerprint(self) -> Optional[str]:
@@ -285,6 +333,7 @@ class NodeClient:
         self.verify_ssl = verify_ssl
         self.trust_store = trust_store
         self._connections: Dict[str, _QuicClientProtocol] = {}
+        self._connection_contexts: Dict[str, Any] = {}  # Store context managers to keep connections alive
         self._connection_locks: Dict[str, asyncio.Lock] = {}
         self.peers: Dict[str, MinerInfo] = {}
 
@@ -292,12 +341,27 @@ class NodeClient:
         pass
 
     async def stop(self) -> None:
-        for protocol in self._connections.values():
+        for host in list(self._connections.keys()):
+            await self._close_connection(host)
+        self._connections.clear()
+        self._connection_contexts.clear()
+
+    async def _close_connection(self, host: str) -> None:
+        """Close a connection and clean up its context manager."""
+        if host in self._connections:
+            self.logger.debug(f"Closing QUIC connection to {host}")
             try:
-                protocol.close()
+                self._connections[host].close()
             except Exception:
                 pass
-        self._connections.clear()
+            del self._connections[host]
+        if host in self._connection_contexts:
+            try:
+                ctx = self._connection_contexts[host]
+                await ctx.__aexit__(None, None, None)
+            except Exception:
+                pass
+            del self._connection_contexts[host]
 
     def update_peers(self, peers: Dict[str, MinerInfo]) -> None:
         self.peers = peers.copy()
@@ -305,23 +369,26 @@ class NodeClient:
     def add_peer(self, host: str, info: MinerInfo) -> None:
         self.peers[host] = info
 
-    def remove_peer(self, host: str) -> None:
+    async def remove_peer(self, host: str) -> None:
         self.peers.pop(host, None)
-        if host in self._connections:
-            try:
-                self._connections[host].close()
-            except Exception:
-                pass
-            del self._connections[host]
+        await self._close_connection(host)
 
     async def _get_connection(self, host: str) -> Optional[_QuicClientProtocol]:
         if host not in self._connection_locks:
             self._connection_locks[host] = asyncio.Lock()
 
         async with self._connection_locks[host]:
-            if host in self._connections and self._connections[host].is_connected:
-                return self._connections[host]
-            self._connections.pop(host, None)
+            if host in self._connections:
+                conn = self._connections[host]
+                if conn.is_connected:
+                    return conn
+                else:
+                    self.logger.warning(
+                        f"Connection to {host} exists but is_connected=False "
+                        f"(_connected={conn._connected.is_set()}, _connection_closed={conn._connection_closed})"
+                    )
+            # Clean up old connection if exists
+            await self._close_connection(host)
 
             addr, port = (host.rsplit(':', 1) if ':' in host else (host, DEFAULT_QUIC_PORT))
             port = int(port) if isinstance(port, str) else port
@@ -336,21 +403,32 @@ class NodeClient:
                 configuration.verify_mode = ssl.CERT_NONE
 
             try:
-                async with connect(
+                # Create connection context manager but don't use 'async with'
+                # since that would close connection when block exits
+                ctx = connect(
                     host=addr, port=port, configuration=configuration,
                     create_protocol=lambda *a, **k: _QuicClientProtocol(*a, logger=self.logger, **k),
-                ) as protocol:
-                    if await protocol.wait_connected(timeout=5.0):
-                        # TOFU verification if trust store is configured
-                        if self.trust_store:
-                            tofu_ok = await self._verify_tofu(host, protocol)
-                            if not tofu_ok:
-                                protocol.close()
-                                return None
+                )
+                # Manually enter the context to start the connection
+                protocol = await ctx.__aenter__()
 
-                        self._connections[host] = protocol
-                        self.logger.info(f"QUIC connection established to {host}")
-                        return protocol
+                if await protocol.wait_connected(timeout=5.0):
+                    # TOFU verification if trust store is configured
+                    if self.trust_store:
+                        tofu_ok = await self._verify_tofu(host, protocol)
+                        if not tofu_ok:
+                            protocol.close()
+                            await ctx.__aexit__(None, None, None)
+                            return None
+
+                    # Store both connection and context manager to keep connection alive
+                    self._connections[host] = protocol
+                    self._connection_contexts[host] = ctx
+                    self.logger.info(f"QUIC connection established to {host}")
+                    return protocol
+                else:
+                    # Connection failed, clean up
+                    await ctx.__aexit__(None, None, None)
                     return None
             except TofuVerificationError as e:
                 self.logger.error(f"TOFU verification failed for {host}: {e}")

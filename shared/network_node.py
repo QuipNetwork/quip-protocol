@@ -24,12 +24,13 @@ from shared.version import get_version
 from shared.node_client import (
     NodeClient, QuicMessage, QuicMessageType,
     generate_self_signed_cert, QUIP_ALPN_PROTOCOL, MAX_DATAGRAM_FRAME_SIZE,
+    MAX_DATAGRAM_MESSAGE_SIZE,
 )
 from aioquic.asyncio import serve
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
-from aioquic.quic.events import QuicEvent, DatagramFrameReceived, ConnectionTerminated, HandshakeCompleted
+from aioquic.quic.events import QuicEvent, DatagramFrameReceived, StreamDataReceived, ConnectionTerminated, HandshakeCompleted
 from shared.block_synchronizer import BlockSynchronizer
 from shared.block_store import BlockStore
 from shared.time_utils import (
@@ -300,14 +301,16 @@ class NetworkNode(Node):
 
         self.logger.info(f"Network node {self.node_name} initialized with config {json.dumps(config)}")
 
-    def _create_server_protocol(self, quic: QuicConnection) -> QuicConnectionProtocol:
+    def _create_server_protocol(self, quic: QuicConnection, **kwargs) -> QuicConnectionProtocol:
         """Create a QUIC protocol handler for incoming connections."""
+        # Note: aioquic passes stream_handler as kwarg, we accept but ignore it
         node = self
 
         class _ServerProtocol(QuicConnectionProtocol):
-            def __init__(self, quic_conn: QuicConnection):
-                super().__init__(quic_conn)
+            def __init__(self, quic_conn: QuicConnection, stream_handler=None):
+                super().__init__(quic_conn, stream_handler)
                 self._peer_address: Optional[str] = None
+                self._stream_buffers: Dict[int, bytearray] = {}
 
             def quic_event_received(self, event: QuicEvent) -> None:
                 if isinstance(event, HandshakeCompleted):
@@ -316,14 +319,31 @@ class NetworkNode(Node):
                         self._peer_address = f"{peername[0]}:{peername[1]}"
                     node.logger.debug(f"QUIC handshake completed with {self._peer_address}")
                 elif isinstance(event, DatagramFrameReceived):
-                    asyncio.create_task(self._handle_datagram(event.data))
+                    asyncio.create_task(self._handle_message(event.data))
+                elif isinstance(event, StreamDataReceived):
+                    self._handle_stream_data(event)
                 elif isinstance(event, ConnectionTerminated):
-                    node.logger.debug(
+                    node.logger.info(
                         f"Connection terminated with {self._peer_address}: "
                         f"error_code={event.error_code}, reason={event.reason_phrase}"
                     )
+                    self._stream_buffers.clear()
 
-            async def _handle_datagram(self, data: bytes) -> None:
+            def _handle_stream_data(self, event: StreamDataReceived) -> None:
+                """Handle data received on a QUIC stream."""
+                stream_id = event.stream_id
+                if stream_id not in self._stream_buffers:
+                    self._stream_buffers[stream_id] = bytearray()
+                self._stream_buffers[stream_id].extend(event.data)
+
+                # Check if stream is complete
+                if event.end_stream:
+                    data = bytes(self._stream_buffers.pop(stream_id))
+                    node.logger.debug(f"Stream {stream_id} complete: {len(data)} bytes from {self._peer_address}")
+                    asyncio.create_task(self._handle_message(data, response_stream_id=stream_id))
+
+            async def _handle_message(self, data: bytes, response_stream_id: Optional[int] = None) -> None:
+                """Handle incoming message (from datagram or stream)."""
                 try:
                     msg = QuicMessage.from_bytes(data)
                     node.logger.debug(
@@ -333,18 +353,31 @@ class NetworkNode(Node):
                     response = await node._handle_quic_message(msg, self)
                     if response is not None:
                         response_bytes = response.to_bytes()
-                        self._quic.send_datagram_frame(response_bytes)
-                        self.transmit()
-                        node.logger.debug(
-                            f"Sent {response.msg_type.name} (id={response.request_id}) "
-                            f"to {self._peer_address}: {len(response.payload)} bytes"
-                        )
+                        try:
+                            # Use streams for large responses, datagrams for small ones
+                            if len(response_bytes) > MAX_DATAGRAM_MESSAGE_SIZE:
+                                stream_id = self._quic.get_next_available_stream_id()
+                                self._quic.send_stream_data(stream_id, response_bytes, end_stream=True)
+                                node.logger.debug(
+                                    f"Sent {response.msg_type.name} (id={response.request_id}) "
+                                    f"via stream {stream_id}: {len(response_bytes)} bytes"
+                                )
+                            else:
+                                self._quic.send_datagram_frame(response_bytes)
+                                node.logger.debug(
+                                    f"Sent {response.msg_type.name} (id={response.request_id}) "
+                                    f"via datagram: {len(response_bytes)} bytes"
+                                )
+                            self.transmit()
+                        except Exception as send_err:
+                            node.logger.error(f"Failed to send response: {send_err}")
                 except ValueError as e:
-                    node.logger.warning(f"Invalid datagram from {self._peer_address}: {e}")
+                    node.logger.warning(f"Invalid message from {self._peer_address}: {e}")
                 except Exception as e:
-                    node.logger.exception(f"Error handling datagram from {self._peer_address}: {e}")
+                    node.logger.exception(f"Error handling message from {self._peer_address}: {e}")
 
-        return _ServerProtocol(quic)
+        stream_handler = kwargs.get('stream_handler')
+        return _ServerProtocol(quic, stream_handler)
 
     async def start(self):
         """Start the P2P node."""
@@ -1167,10 +1200,10 @@ class NetworkNode(Node):
                 del self.peers[host]
                 self.logger.info(f"Node removed: {host}")
                 self._on_node_lost(host)
-                
+
                 # Update node client to remove peer
                 if self.node_client:
-                    self.node_client.remove_peer(host)
+                    await self.node_client.remove_peer(host)
 
     async def send_heartbeat(self, node_host: str) -> bool:
         """Send heartbeat to a specific node."""
