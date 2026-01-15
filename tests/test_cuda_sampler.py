@@ -13,11 +13,15 @@ import time
 try:
     import cupy as cp
     from GPU.cuda_kernel import CudaKernelRealSA
+    from GPU.cuda_sa import CudaKernelMock, CudaSASamplerAsync, CudaKernelAdapter
     CUDA_AVAILABLE = True
 except ImportError:
     CUDA_AVAILABLE = False
 
-from GPU.cuda_sa import CudaKernelMock, CudaSASamplerAsync, CudaKernelAdapter
+# Skip entire module if CUDA is not available
+if not CUDA_AVAILABLE:
+    import pytest
+    pytest.skip("CUDA not available", allow_module_level=True)
 
 
 # ============================================================================

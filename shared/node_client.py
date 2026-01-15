@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime
+import hashlib
 import ipaddress
 import json
 import logging
@@ -12,7 +13,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Dict, Optional, Any, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Any, Tuple
 
 from aioquic.asyncio import connect
 from aioquic.asyncio.protocol import QuicConnectionProtocol
@@ -28,6 +29,9 @@ from aioquic.quic.events import (
 from shared.block import Block, BlockHeader, MinerInfo
 from shared.version import get_version
 from shared.time_utils import utc_timestamp_float
+
+if TYPE_CHECKING:
+    from shared.trust_store import TrustStore
 
 
 # QUIC protocol constants
@@ -126,7 +130,7 @@ def generate_self_signed_cert(hostname: str = "localhost", cert_dir: Optional[st
         x509.NameAttribute(NameOID.COMMON_NAME, hostname),
     ])
 
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.UTC)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -175,9 +179,12 @@ class _QuicClientProtocol(QuicConnectionProtocol):
         self._request_counter = 0
         self._connected = asyncio.Event()
         self._closed = False
+        self._peer_certificate_der: Optional[bytes] = None
 
     def quic_event_received(self, event: QuicEvent) -> None:
         if isinstance(event, HandshakeCompleted):
+            # Extract peer certificate for TOFU verification
+            self._extract_peer_certificate()
             self._connected.set()
         elif isinstance(event, DatagramFrameReceived):
             self._handle_response(event.data)
@@ -188,6 +195,27 @@ class _QuicClientProtocol(QuicConnectionProtocol):
                 if not future.done():
                     future.set_exception(ConnectionError("Connection terminated"))
             self._pending_requests.clear()
+
+    def _extract_peer_certificate(self) -> None:
+        """Extract peer certificate from TLS session for TOFU verification."""
+        try:
+            # Access the TLS session to get peer certificate
+            # aioquic stores the peer certificate chain after handshake
+            tls = getattr(self._quic, '_tls', None)
+            if tls is not None:
+                # Try to get peer certificate from TLS context
+                peer_cert = getattr(tls, 'peer_certificate', None)
+                if peer_cert is not None:
+                    # Certificate is already in DER format from aioquic
+                    self._peer_certificate_der = peer_cert
+                    return
+
+            # Alternative: try accessing via _peer_certificate attribute
+            peer_cert = getattr(self._quic, '_peer_certificate', None)
+            if peer_cert is not None:
+                self._peer_certificate_der = peer_cert
+        except Exception as e:
+            self._logger.debug(f"Could not extract peer certificate: {e}")
 
     def _handle_response(self, data: bytes) -> None:
         try:
@@ -234,15 +262,28 @@ class _QuicClientProtocol(QuicConnectionProtocol):
     def is_connected(self) -> bool:
         return self._connected.is_set() and not self._closed
 
+    @property
+    def peer_certificate_fingerprint(self) -> Optional[str]:
+        """Get SHA-256 fingerprint of peer certificate (hex encoded)."""
+        if self._peer_certificate_der:
+            return hashlib.sha256(self._peer_certificate_der).hexdigest()
+        return None
+
+
+class TofuVerificationError(Exception):
+    """Raised when TOFU verification fails (fingerprint mismatch)."""
+    pass
+
 
 class NodeClient:
-    """QUIC client for QuIP P2P networking with connection pooling."""
+    """QUIC client for QuIP P2P networking with connection pooling and TOFU verification."""
 
     def __init__(self, node_timeout: float = 10.0, logger: Optional[logging.Logger] = None,
-                 verify_ssl: bool = False):
+                 verify_ssl: bool = False, trust_store: Optional['TrustStore'] = None):
         self.node_timeout = node_timeout
         self.logger = logger or logging.getLogger(__name__)
         self.verify_ssl = verify_ssl
+        self.trust_store = trust_store
         self._connections: Dict[str, _QuicClientProtocol] = {}
         self._connection_locks: Dict[str, asyncio.Lock] = {}
         self.peers: Dict[str, MinerInfo] = {}
@@ -300,13 +341,55 @@ class NodeClient:
                     create_protocol=lambda *a, **k: _QuicClientProtocol(*a, logger=self.logger, **k),
                 ) as protocol:
                     if await protocol.wait_connected(timeout=5.0):
+                        # TOFU verification if trust store is configured
+                        if self.trust_store:
+                            tofu_ok = await self._verify_tofu(host, protocol)
+                            if not tofu_ok:
+                                protocol.close()
+                                return None
+
                         self._connections[host] = protocol
                         self.logger.info(f"QUIC connection established to {host}")
                         return protocol
                     return None
+            except TofuVerificationError as e:
+                self.logger.error(f"TOFU verification failed for {host}: {e}")
+                return None
             except Exception as e:
                 self.logger.warning(f"Failed to connect to {host}: {e}")
                 return None
+
+    async def _verify_tofu(self, host: str, protocol: _QuicClientProtocol) -> bool:
+        """
+        Verify peer certificate using TOFU model.
+
+        Returns True if verification passes (NEW or MATCH), False on MISMATCH.
+        """
+        from shared.trust_store import TofuResult
+
+        fingerprint = protocol.peer_certificate_fingerprint
+        if not fingerprint:
+            # No certificate available - can't verify, but allow connection
+            # This might happen with certain TLS configurations
+            self.logger.debug(f"No peer certificate available for {host}, skipping TOFU")
+            return True
+
+        result = await self.trust_store.verify_fingerprint(host, fingerprint)
+
+        if result == TofuResult.NEW:
+            self.logger.info(f"TOFU: First connection to {host}, fingerprint stored")
+            return True
+        elif result == TofuResult.MATCH:
+            self.logger.debug(f"TOFU: Fingerprint verified for {host}")
+            return True
+        else:  # MISMATCH
+            self.logger.error(
+                f"TOFU MISMATCH for {host}! Certificate fingerprint does not match "
+                f"previously stored value. This could indicate a man-in-the-middle attack. "
+                f"Connection refused. If the peer legitimately changed their certificate, "
+                f"remove the old fingerprint from the trust store."
+            )
+            return False
 
     async def send_heartbeat(self, node_host: str, public_host: str, miner_info: MinerInfo) -> bool:
         protocol = await self._get_connection(node_host)

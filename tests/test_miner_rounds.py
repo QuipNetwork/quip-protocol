@@ -1,50 +1,37 @@
 import os
-import signal
-import time
 from click.testing import CliRunner
 from tempfile import TemporaryDirectory
+from typing import Dict, Any
 
 import quip_cli
-from quip_cli import cpu
 
 
-def test_cpu_auto_mine_quick():
-    """Test CPU mining by running the CLI briefly and verifying it can find good energies."""
-    
-    runner = CliRunner()
-    
-    # Use a timeout approach - run for a short time then interrupt
-    def timeout_handler(signum, frame):
-        raise TimeoutError("Test timeout reached")
-    
-    # Set a 20-second timeout
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(120)
-    
-    try:
-        # Run the CPU command - it should start mining and show progress
-        result = runner.invoke(
-            cpu, 
-            ["--port", "0"],
-            catch_exceptions=False
-        )
-    except (KeyboardInterrupt, TimeoutError, SystemExit):
-        # This is expected - we're timing out the mining process
-        result = type('MockResult', (), {
-            'exit_code': 130,  # Interrupted
-            'output': 'Mining interrupted by timeout (expected for test)'
-        })()
-    finally:
-        signal.alarm(0)  # Clear the alarm
-    
-    print("CLI Output (may be truncated due to timeout):")
-    print(getattr(result, 'output', 'No output captured'))
-    
-    # For this test, we just want to verify the CLI can start successfully
-    # Exit codes: 0 = success, 130 = interrupted (both acceptable)
-    assert result.exit_code in [0, 130], f"Unexpected exit code: {result.exit_code}"
-    
-    print("✅ CPU mining test passed - CLI started successfully (mining interrupted as expected)")
+def test_cpu_auto_mine_quick(monkeypatch):
+    """Test CPU CLI wiring without actually starting the network node."""
+    cfg = """
+[cpu]
+num_cpus = 1
+"""
+    with TemporaryDirectory() as td:
+        cfg_path = os.path.join(td, "cfg.toml")
+        with open(cfg_path, "w") as f:
+            f.write(cfg)
+
+        # Patch to avoid actually spawning network node, just confirm config wiring
+        captured: Dict[str, Any] = {}
+        def fake_run(config: Dict[str, Any], genesis_config_file: str = "genesis_block.json"):
+            captured.update({"config": config, "genesis_config_file": genesis_config_file})
+            return 0
+        monkeypatch.setattr(quip_cli, "_run_network_node_sync", fake_run)
+
+        runner = CliRunner()
+        res = runner.invoke(quip_cli.quip_network_node, ["--config", cfg_path, "cpu", "--auto-mine"])
+
+        assert res.exit_code == 0, f"Unexpected exit code: {res.exit_code}"
+        config = captured["config"]
+        assert config["cpu"].get("num_cpus") == 1
+        assert config.get("auto_mine") is True
+        assert captured["genesis_config_file"] == "genesis_block.json"
 
 
 def test_gpu_auto_mine_quick_env_only(monkeypatch):

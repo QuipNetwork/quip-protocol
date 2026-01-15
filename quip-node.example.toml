@@ -28,9 +28,37 @@ heartbeat_timeout = 300  # Timeout for waiting for heartbeats from peers in seco
 # Number of peers to gossip to at a time. Defaults to 3, you should never need to change this.
 # fanout = 3
 
-# TLS/SSL Configuration
+# TLS/SSL Configuration for QUIC peer-to-peer
 verify_ssl = true  # Verify SSL/TLS certificates when connecting to peers
-# ca_bundle = "/path/to/ca-certificates.crt"  # Custom CA certificate bundle (optional) 
+# ca_bundle = "/path/to/ca-certificates.crt"  # Custom CA certificate bundle (optional)
+
+# TOFU (Trust On First Use) - Certificate pinning for peer-to-peer security
+[tofu]
+enabled = true  # Enable TOFU certificate fingerprint verification
+trust_db = "~/.quip/trust.db"  # SQLite database for storing peer fingerprints
+
+# REST API - HTTP/HTTPS server for browser and external access
+[rest_api]
+enabled = false  # Set to true to enable REST API
+host = "0.0.0.0"  # Bind address for REST API
+http_port = 8080  # HTTP port (non-TLS, for development/local access)
+https_port = 443  # HTTPS port (TLS, for production browser access)
+
+# Certificate acquisition priority:
+# 1. Use these files if provided and valid
+# rest_tls_cert_file = "/etc/letsencrypt/live/your-domain.com/fullchain.pem"
+# rest_tls_key_file = "/etc/letsencrypt/live/your-domain.com/privkey.pem"
+
+# 2. Attempt ACME/Let's Encrypt if domain and email are configured (requires port 80)
+# rest_domain = "api.your-node.example.com"
+# acme_email = "admin@example.com"
+# acme_staging = false  # Use Let's Encrypt staging server for testing
+
+# 3. If neither above works, a self-signed certificate is generated automatically
+# Browser users will see certificate warnings, but node-to-node QUIC is unaffected
+
+# Directory to store generated certificates
+cert_dir = "~/.quip/certs"
 
 # Logging configuration
 log_level = "INFO"  # DEBUG, INFO, WARNING, ERROR

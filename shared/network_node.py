@@ -192,10 +192,20 @@ class NetworkNode(Node):
         self.epoch_storage_format = config.get("epoch_storage_format", "pickle")  # 'json' or 'pickle'
         self.epoch_storage_compress = config.get("epoch_storage_compress", True)
 
-        # TLS configuration
+        # TLS configuration for QUIC
         self.tls_cert_file = config.get("tls_cert_file")
         self.tls_key_file = config.get("tls_key_file")
         self.tls_enabled = bool(self.tls_cert_file and self.tls_key_file)
+
+        # TOFU (Trust On First Use) configuration
+        self.tofu_config = config.get("tofu", {})
+        self.tofu_enabled = self.tofu_config.get("enabled", True)
+        self.trust_store = None  # Initialized in start()
+
+        # REST API configuration
+        self.rest_api_config = config.get("rest_api", {})
+        self.rest_api_enabled = self.rest_api_config.get("enabled", False)
+        self.rest_api_server = None  # Initialized in start()
 
         # Initialize logger with helper function
         self.logger = init_component_logger('network_node', self.node_name)
@@ -340,8 +350,23 @@ class NetworkNode(Node):
         """Start the P2P node."""
         self.running = True
 
-        # Initialize QUIC client for peer communication
-        self.node_client = NodeClient(node_timeout=self.node_timeout, logger=self.logger)
+        # Initialize TOFU trust store if enabled
+        if self.tofu_enabled:
+            import os
+            from shared.trust_store import TrustStore
+            trust_db_path = os.path.expanduser(
+                self.tofu_config.get("trust_db", "~/.quip/trust.db")
+            )
+            self.trust_store = TrustStore(trust_db_path, logger=self.logger)
+            await self.trust_store.initialize()
+            self.logger.info(f"TOFU trust store initialized at {trust_db_path}")
+
+        # Initialize QUIC client for peer communication (with TOFU support)
+        self.node_client = NodeClient(
+            node_timeout=self.node_timeout,
+            logger=self.logger,
+            trust_store=self.trust_store
+        )
         await self.node_client.start()
 
         # Start QUIC server
@@ -370,6 +395,22 @@ class NetworkNode(Node):
             f"Network node {self.node_name} ({self.crypto.ecdsa_public_key_hex[:8]}) "
             f"started at quic://{self.bind_address}:{self.port} with public address {self.public_host}"
         )
+
+        # Start REST API server if enabled
+        if self.rest_api_enabled:
+            from shared.rest_api import RestApiServer
+            from shared.certificate_manager import CertificateManager
+
+            cert_manager = CertificateManager(self.rest_api_config, logger=self.logger)
+            self.rest_api_server = RestApiServer(
+                network_node=self,
+                host=self.rest_api_config.get("host", "0.0.0.0"),
+                port=self.rest_api_config.get("http_port", 8080),
+                tls_port=self.rest_api_config.get("https_port", 443),
+                cert_manager=cert_manager,
+                logger=self.logger
+            )
+            await self.rest_api_server.start()
 
         # Start background tasks
         self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
@@ -415,6 +456,11 @@ class NetworkNode(Node):
             self.server_task.cancel()
         if self.reset_timer_task:
             self.reset_timer_task.cancel()
+
+        # Stop REST API server if running
+        if self.rest_api_server:
+            self.logger.info("Stopping REST API server...")
+            await self.rest_api_server.stop()
 
         self.logger.info("Cancelling QUIC client tasks...")
         # Close node client

@@ -131,8 +131,8 @@ def test_parameter_constraints():
         print("✅ All parameter constraints satisfied!")
     else:
         print("❌ Some parameter constraints violated!")
-    
-    return all_valid
+
+    assert all_valid, "Some parameter constraints violated"
 
 
 def test_monotonicity():
@@ -171,32 +171,30 @@ def test_monotonicity():
         print("✅ Monotonicity property satisfied!")
     else:
         print("❌ Monotonicity property violated!")
-    
-    return monotonic
+
+    assert monotonic, "Monotonicity property violated"
 
 
 if __name__ == "__main__":
     print("Adaptive Parameters Test Suite")
     print("=" * 80)
-    
+
     try:
-        # Run all tests
+        # Run all tests (assertions will raise on failure)
         test_adapt_parameters_range()
-        constraints_ok = test_parameter_constraints()
-        monotonic_ok = test_monotonicity()
-        
+        test_parameter_constraints()
+        test_monotonicity()
+
         print("\n" + "=" * 80)
         print("SUMMARY:")
-        print(f"Parameter constraints: {'✅ PASS' if constraints_ok else '❌ FAIL'}")
-        print(f"Monotonicity:         {'✅ PASS' if monotonic_ok else '❌ FAIL'}")
-        
-        if constraints_ok and monotonic_ok:
-            print("\n🎉 All tests PASSED!")
-            sys.exit(0)
-        else:
-            print("\n💥 Some tests FAILED!")
-            sys.exit(1)
-            
+        print("Parameter constraints: ✅ PASS")
+        print("Monotonicity:         ✅ PASS")
+        print("\n🎉 All tests PASSED!")
+        sys.exit(0)
+
+    except AssertionError as e:
+        print(f"\n💥 Test FAILED: {e}")
+        sys.exit(1)
     except Exception as e:
         print(f"Test failed with error: {e}")
         import traceback

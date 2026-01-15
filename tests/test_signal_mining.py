@@ -64,8 +64,8 @@ def _metal_available():
         import platform
         if platform.system() != "Darwin":
             return False
-        import GPU.metal_sampler
-        test_sampler = GPU.metal_sampler.MetalSampler("mps")
+        from GPU.metal_sa import MetalSASampler
+        test_sampler = MetalSASampler()
         del test_sampler
         return True
     except Exception:
