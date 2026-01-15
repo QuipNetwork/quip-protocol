@@ -32,35 +32,38 @@ def test_network_cpu_only_smoke():
 
 
 def test_network_cpu_plus_gpu_env_only(monkeypatch):
-    # Validate GPU env propagation in a mixed network without launching processes
-    cfg = """
+    # Validate GPU config propagation in a mixed network without launching processes
+    from typing import Dict, Any
+    port = _find_free_port()
+    peer_port = _find_free_port()
+    cfg = f"""
 [global]
-default = "gpu"
-port = {PORT}
-peer = "localhost:{PEER}"
+port = {port}
+peers = ["localhost:{peer_port}"]
 
 [gpu]
 backend = "local"
 devices = ["0"]
-""".replace("{PORT}", str(_find_free_port())).replace("{PEER}", str(_find_free_port()))
+"""
 
     runner = CliRunner()
 
-    captured = {}
+    captured: Dict[str, Any] = {}
 
-    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None, genesis_config_file: str = "genesis_block.json"):
-        captured.update({"kind": kind, "env": env_overrides or {}})
+    def fake_run(config: Dict[str, Any], genesis_config_file: str = "genesis_block.json"):
+        captured.update({"config": config, "genesis_config_file": genesis_config_file})
         return 0
 
-    monkeypatch.setattr(quip_cli, "_run_p2p_node", fake_run)
+    monkeypatch.setattr(quip_cli, "_run_network_node_sync", fake_run)
 
     with TemporaryDirectory() as td:
         cfg_path = os.path.join(td, "cfg.toml")
         with open(cfg_path, "w") as f:
             f.write(cfg)
-        result = runner.invoke(quip_cli.quip_network_node, ["--config", cfg_path])
+        result = runner.invoke(quip_cli.quip_network_node, ["--config", cfg_path, "gpu"])
         assert result.exit_code == 0
-        assert captured["kind"] == "gpu"
-        assert captured["env"].get("QUIP_GPU_BACKEND") == "local"
-        assert captured["env"].get("QUIP_GPU_DEVICES") == "0"
+        config = captured["config"]
+        assert "gpu" in config
+        assert config["gpu"].get("backend") == "local"
+        assert config["gpu"].get("devices") == ["0"]
 

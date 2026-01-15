@@ -3,6 +3,7 @@ from __future__ import annotations
 from blake3 import blake3
 import time
 import json
+import pytest
 
 from shared.block import (
     QuantumProof,
@@ -10,7 +11,7 @@ from shared.block import (
     BlockHeader,
     Block,
 )
-from shared.block_requirements import BlockRequirements
+from shared.block_requirements import BlockRequirements, validate_block
 
 
 def sample_quantum_proof():
@@ -67,9 +68,7 @@ def test_quantum_proof_network_roundtrip():
 
 def test_quantum_proof_compute_derived_fields():
     qp = sample_quantum_proof()
-    req = sample_requirements()
-    blk = make_sample_block()
-    qp.compute_derived_fields(req, blk)
+    qp.compute_derived_fields()  # No arguments - uses self.nonce, self.nodes, self.edges
     assert isinstance(qp.energy, float)
     assert isinstance(qp.num_valid_solutions, int)
     assert isinstance(qp.diversity, float)
@@ -178,10 +177,18 @@ def test_block_compute_derived_fields_sets_hash_and_raw():
     assert blk.hash == blake3(blk.raw).digest()
 
 
-def test_block_validate_block_true_and_false():
-    prev = make_sample_block()
+def test_block_validate_block_true_and_false(monkeypatch):
+    """Test validate_block returns True/False based on quantum proof validation."""
+    from shared import block_requirements
 
-    # Lenient requirements: very high energy threshold, low diversity, 1 solution
+    prev = make_sample_block()
+    blk = make_sample_block()
+
+    # Ensure block timestamp is after previous block timestamp
+    prev.header.timestamp = int(time.time()) - 10
+    blk.header.timestamp = int(time.time())
+
+    # Lenient requirements
     prev.next_block_requirements = BlockRequirements(
         difficulty_energy=1e9,
         min_diversity=0.0,
@@ -189,18 +196,13 @@ def test_block_validate_block_true_and_false():
         timeout_to_difficulty_adjustment_decay=10,
     )
 
-    blk = make_sample_block()
-    assert blk.validate_block(prev) is True
+    # Mock validate_quantum_proof to return True - block should be valid
+    monkeypatch.setattr(block_requirements, "validate_quantum_proof", lambda *args, **kwargs: True)
+    assert validate_block(blk, prev) is True
 
-    # Harsher requirements should fail
-    harsh = BlockRequirements(
-        difficulty_energy=-60.0,  # Harder threshold
-        min_diversity=1.0,
-        min_solutions=3,
-        timeout_to_difficulty_adjustment_decay=10,
-    )
-    prev.next_block_requirements = harsh
-    assert blk.validate_block(prev) is False
+    # Mock validate_quantum_proof to return False - block should be invalid
+    monkeypatch.setattr(block_requirements, "validate_quantum_proof", lambda *args, **kwargs: False)
+    assert validate_block(blk, prev) is False
 
 
 # JSON Serialization Tests

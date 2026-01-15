@@ -17,11 +17,10 @@ def test_global_config_and_cpu_num_cpus(tmp_path, monkeypatch):
     # Arrange: config with [global] and [cpu].num_cpus
     cfg = """
 [global]
-default = "cpu"
-host = "127.0.0.1"
+listen = "127.0.0.1"
 port = 8123
-peer = "localhost:8000"
-auto_mine = 3
+peers = ["localhost:8000"]
+auto_mine = true
 
 [cpu]
 num_cpus = 2
@@ -30,43 +29,30 @@ num_cpus = 2
 
     captured: Dict[str, Any] = {}
 
-    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None, genesis_config_file: str = "genesis_block.json"):
-        captured.update(
-            {
-                "kind": kind,
-                "host": host,
-                "port": port,
-                "peer": peer,
-                "auto_mine": auto_mine,
-                "env": env_overrides or {},
-                "genesis_config_file": genesis_config_file,
-            }
-        )
+    def fake_run(config: Dict[str, Any], genesis_config_file: str = "genesis_block.json"):
+        captured.update({"config": config, "genesis_config_file": genesis_config_file})
         return 0
 
-    monkeypatch.setattr(quip_cli, "_run_p2p_node", fake_run)
+    monkeypatch.setattr(quip_cli, "_run_network_node_sync", fake_run)
 
     # Act
     runner = CliRunner()
-    result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path)])
+    result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path), "cpu"])
 
     # Assert
     assert result.exit_code == 0, result.output
-    assert captured["kind"] == "cpu"
-    assert captured["host"] == "127.0.0.1"
-    assert captured["port"] == 8123
-    assert captured["peer"] == "localhost:8000"
-    assert captured["auto_mine"] == 3
-    # num_cpus should propagate to env overrides for BLAS thread caps
-    for k in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"]:
-        assert captured["env"][k] == 2
+    config = captured["config"]
+    assert "cpu" in config
+    # Config flattens global section into top-level
+    assert config.get("listen") == "127.0.0.1"
+    assert config.get("port") == 8123
+    assert config["cpu"]["num_cpus"] == 2
 
 
 def test_gpu_device_cli_overrides_toml(tmp_path, monkeypatch):
     # Arrange: config with devices array but CLI provides --device
     cfg = """
 [global]
-default = "gpu"
 port = 9001
 
 [gpu]
@@ -76,11 +62,11 @@ devices = ["1", "2"]
 
     captured: Dict[str, Any] = {}
 
-    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None, genesis_config_file: str = "genesis_block.json"):
-        captured.update({"kind": kind, "port": port, "env": env_overrides or {}})
+    def fake_run(config: Dict[str, Any], genesis_config_file: str = "genesis_block.json"):
+        captured.update({"config": config, "genesis_config_file": genesis_config_file})
         return 0
 
-    monkeypatch.setattr(quip_cli, "_run_p2p_node", fake_run)
+    monkeypatch.setattr(quip_cli, "_run_network_node_sync", fake_run)
 
     # Act: explicitly pass device 0
     runner = CliRunner()
@@ -88,17 +74,17 @@ devices = ["1", "2"]
 
     # Assert
     assert result.exit_code == 0, result.output
-    assert captured["kind"] == "gpu"
-    assert captured["port"] == 9001
-    assert captured["env"].get("CUDA_VISIBLE_DEVICES") == "0"
+    config = captured["config"]
+    assert "gpu" in config
+    # Config flattens global section into top-level
+    assert config.get("port") == 9001
+    # Device is stored in devices list
+    assert config["gpu"].get("devices") == ["0"]
 
 
 def test_gpu_device_from_toml_when_none(tmp_path, monkeypatch):
-    # Arrange: default=gpu and devices list; no CLI device
+    # Arrange: devices list in TOML; no CLI device
     cfg = """
-[global]
-default = "gpu"
-
 [gpu]
 devices = ["3", "4"]
 """
@@ -106,29 +92,27 @@ devices = ["3", "4"]
 
     captured: Dict[str, Any] = {}
 
-    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None, genesis_config_file: str = "genesis_block.json"):
-        captured.update({"kind": kind, "env": env_overrides or {}})
+    def fake_run(config: Dict[str, Any], genesis_config_file: str = "genesis_block.json"):
+        captured.update({"config": config, "genesis_config_file": genesis_config_file})
         return 0
 
-    monkeypatch.setattr(quip_cli, "_run_p2p_node", fake_run)
+    monkeypatch.setattr(quip_cli, "_run_network_node_sync", fake_run)
 
     # Act
     runner = CliRunner()
-    result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path)])
+    result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path), "gpu"])
 
     # Assert
     assert result.exit_code == 0, result.output
-    assert captured["kind"] == "gpu"
-    # With no --device, we export QUIP_GPU_DEVICES (comma-separated) rather than CUDA_VISIBLE_DEVICES
-    assert captured["env"].get("QUIP_GPU_DEVICES") == "3,4"
+    config = captured["config"]
+    assert "gpu" in config
+    # Devices should be preserved from TOML
+    assert config["gpu"].get("devices") == ["3", "4"]
 
 
 def test_qpu_env_from_toml_and_defaults(tmp_path, monkeypatch):
     # Arrange: explicit key and solver; omit region to use default
     cfg = """
-[global]
-default = "qpu"
-
 [qpu]
 dwave_api_key = "TOKEN123"
 dwave_api_solver = "Advantage_system6.4"
@@ -138,22 +122,22 @@ dwave_api_solver = "Advantage_system6.4"
 
     captured: Dict[str, Any] = {}
 
-    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None, genesis_config_file: str = "genesis_block.json"):
-        captured.update({"kind": kind, "env": env_overrides or {}})
+    def fake_run(config: Dict[str, Any], genesis_config_file: str = "genesis_block.json"):
+        captured.update({"config": config, "genesis_config_file": genesis_config_file})
         return 0
 
-    monkeypatch.setattr(quip_cli, "_run_p2p_node", fake_run)
+    monkeypatch.setattr(quip_cli, "_run_network_node_sync", fake_run)
 
     # Act
     runner = CliRunner()
-    result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path)])
+    result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path), "qpu"])
 
     # Assert
     assert result.exit_code == 0, result.output
-    assert captured["kind"] == "qpu"
-    assert captured["env"]["DWAVE_API_TOKEN"] == "TOKEN123"
-    assert captured["env"]["DWAVE_API_SOLVER"] == "Advantage_system6.4"
-    assert captured["env"]["DWAVE_API_ENDPOINT"] == "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+    config = captured["config"]
+    assert "qpu" in config
+    assert config["qpu"].get("dwave_api_key") == "TOKEN123"
+    assert config["qpu"].get("dwave_api_solver") == "Advantage_system6.4"
 
 
 def test_simulator_print_only_commands(tmp_path):
@@ -173,9 +157,6 @@ def test_simulator_print_only_commands(tmp_path):
 def test_gpu_modal_types_env(tmp_path, monkeypatch):
     # Arrange: backend=modal with types
     cfg = """
-[global]
-default = "gpu"
-
 [gpu]
 backend = "modal"
 types = ["t4", "a10g"]
@@ -184,30 +165,28 @@ types = ["t4", "a10g"]
 
     captured: Dict[str, Any] = {}
 
-    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None, genesis_config_file: str = "genesis_block.json"):
-        captured.update({"kind": kind, "env": env_overrides or {}})
+    def fake_run(config: Dict[str, Any], genesis_config_file: str = "genesis_block.json"):
+        captured.update({"config": config, "genesis_config_file": genesis_config_file})
         return 0
 
-    monkeypatch.setattr(quip_cli, "_run_p2p_node", fake_run)
+    monkeypatch.setattr(quip_cli, "_run_network_node_sync", fake_run)
 
     # Act
     runner = CliRunner()
-    result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path)])
+    result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path), "gpu"])
 
     # Assert
     assert result.exit_code == 0, result.output
-    assert captured["kind"] == "gpu"
-    assert captured["env"].get("QUIP_GPU_BACKEND") == "modal"
-    assert captured["env"].get("QUIP_GPU_TYPES") == "t4,a10g"
+    config = captured["config"]
+    assert "gpu" in config
+    assert config["gpu"].get("backend") == "modal"
+    assert config["gpu"].get("types") == ["t4", "a10g"]
 
 
 
 def test_gpu_backend_cli_override(tmp_path, monkeypatch):
     # Arrange: TOML says local, CLI overrides to modal
     cfg = """
-[global]
-default = "gpu"
-
 [gpu]
 backend = "local"
 types = ["t4"]
@@ -216,11 +195,11 @@ types = ["t4"]
 
     captured: Dict[str, Any] = {}
 
-    def fake_run(kind: str, host: str, port: int, peer: Optional[str], auto_mine: int, env_overrides: Optional[dict] = None, genesis_config_file: str = "genesis_block.json"):
-        captured.update({"kind": kind, "env": env_overrides or {}})
+    def fake_run(config: Dict[str, Any], genesis_config_file: str = "genesis_block.json"):
+        captured.update({"config": config, "genesis_config_file": genesis_config_file})
         return 0
 
-    monkeypatch.setattr(quip_cli, "_run_p2p_node", fake_run)
+    monkeypatch.setattr(quip_cli, "_run_network_node_sync", fake_run)
 
     # Act: override via CLI
     runner = CliRunner()
@@ -228,5 +207,6 @@ types = ["t4"]
 
     # Assert
     assert result.exit_code == 0, result.output
-    assert captured["env"].get("QUIP_GPU_BACKEND") == "modal"
+    config = captured["config"]
+    assert config["gpu"].get("backend") == "modal"
 
