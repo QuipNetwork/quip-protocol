@@ -1,0 +1,44 @@
+# GitLab CI/CD for Quip Network Node Docker Images
+# Builds and pushes to GitLab Container Registry
+
+stages:
+  - build
+
+variables:
+  DOCKER_TLS_CERTDIR: "/certs"
+  CPU_IMAGE: quip-network-node-cpu
+  CUDA_IMAGE: quip-network-node-cuda
+
+# Template for Docker builds
+.docker_build:
+  image: docker:24
+  services:
+    - docker:24-dind
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+
+# Build and push CPU network node image
+build-cpu:
+  extends: .docker_build
+  stage: build
+  script:
+    - docker build -f docker/Dockerfile.cpu -t $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA .
+    - docker tag $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE/$CPU_IMAGE:latest
+    - docker push $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
+    - docker push $CI_REGISTRY_IMAGE/$CPU_IMAGE:latest
+  only:
+    - main
+    - tags
+
+# Build and push CUDA network node image
+build-cuda:
+  extends: .docker_build
+  stage: build
+  script:
+    - docker build -f docker/Dockerfile.cuda -t $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA .
+    - docker tag $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
+    - docker push $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA
+    - docker push $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
+  only:
+    - main
+    - tags
