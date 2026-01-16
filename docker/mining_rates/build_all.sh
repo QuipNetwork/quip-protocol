@@ -20,7 +20,7 @@ echo ""
 # Build CPU image
 echo -e "${GREEN}Building CPU miner image...${NC}"
 docker build \
-  -f docker/Dockerfile.cpu \
+  -f docker/mining_rates/Dockerfile.cpu \
   -t quip-protocol/cpu-miner:${VERSION} \
   -t quip-protocol/cpu-miner:latest \
   .
@@ -36,7 +36,7 @@ echo ""
 # Build CUDA image
 echo -e "${GREEN}Building CUDA miner image...${NC}"
 docker build \
-  -f docker/Dockerfile.cuda \
+  -f docker/mining_rates/Dockerfile.cuda \
   -t quip-protocol/cuda-miner:${VERSION} \
   -t quip-protocol/cuda-miner:latest \
   .
@@ -49,17 +49,6 @@ else
 fi
 echo ""
 
-# Build Metal image (arm64 only)
-echo -e "${GREEN}Building Metal miner image (arm64)...${NC}"
-echo -e "${BLUE}Note: Metal image build may fail on non-macOS systems${NC}"
-docker build \
-  --platform linux/arm64 \
-  -f docker/Dockerfile.metal \
-  -t quip-protocol/metal-miner:${VERSION} \
-  -t quip-protocol/metal-miner:latest \
-  . || echo -e "${RED}Warning: Metal image build failed (expected on non-macOS)${NC}"
-
-echo ""
 echo -e "${BLUE}========================================${NC}"
 echo -e "${GREEN}Build Summary${NC}"
 echo -e "${BLUE}========================================${NC}"
@@ -74,12 +63,10 @@ if [ -n "$PUSH_TO_REGISTRY" ]; then
         # Tag for ECR
         docker tag quip-protocol/cpu-miner:${VERSION} ${ECR_REGISTRY}/cpu-miner:${VERSION}
         docker tag quip-protocol/cuda-miner:${VERSION} ${ECR_REGISTRY}/cuda-miner:${VERSION}
-        docker tag quip-protocol/metal-miner:${VERSION} ${ECR_REGISTRY}/metal-miner:${VERSION}
 
         # Push to ECR
         docker push ${ECR_REGISTRY}/cpu-miner:${VERSION}
         docker push ${ECR_REGISTRY}/cuda-miner:${VERSION}
-        docker push ${ECR_REGISTRY}/metal-miner:${VERSION} || true
 
         echo -e "${GREEN}✓ Images pushed to ECR: ${ECR_REGISTRY}${NC}"
     else

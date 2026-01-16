@@ -8,34 +8,53 @@ version = "0.0.1"
 description = "Quantum Proof-of-Work Blockchain Implementation"
 readme = "README.md"
 requires-python = ">=3.10"
+# Base dependencies required for all modes
 dependencies = [
     "dwave-ocean-sdk>=6.0.0",
     "numpy>=1.24.0",
-    "matplotlib>=3.6.0",
-    "pandas>=2.0.0",
-    "seaborn>=0.12.0",
     "python-dotenv>=1.0.0",
     "aiohttp>=3.9.0",
     "click>=8.1.7",
     "tomli>=2.0.1; python_version<'3.11'",
     "hashsigs>=0.0.2",
     "blake3>=1.0.5",
+    "aioquic>=1.3.0",
+    "cryptography>=42.0.0",
+]
+
+[project.optional-dependencies]
+# CPU mode - lightweight, no GPU dependencies
+cpu = []
+
+# CUDA mode - NVIDIA GPU support
+cuda = [
+    "cupy-cuda11x>=12.0.0,<13.0.0",
+]
+
+# Metal mode - Apple Silicon GPU support
+metal = [
+    "pyobjc-framework-Metal",
+    "pyobjc-framework-MetalPerformanceShaders",
+]
+
+# Full installation with all GPU backends + visualization
+full = [
     "torch>=2.0.0",
     "torchvision>=0.15.0",
     "torchaudio>=2.0.0",
     "cupy-cuda13x>=13.0.0; sys_platform == 'linux' or sys_platform == 'win32'",
     "pyobjc-framework-Metal; sys_platform == 'darwin'",
     "pyobjc-framework-MetalPerformanceShaders; sys_platform == 'darwin'",
-    "aioquic>=1.3.0",
-    "cryptography>=42.0.0",
+    "matplotlib>=3.6.0",
+    "pandas>=2.0.0",
+    "seaborn>=0.12.0",
     "acme>=2.0.0",
-    "josepy>=1.13.0"
+    "josepy>=1.13.0",
 ]
 
-[project.optional-dependencies]
 dev = [
     "pytest>=7.4,<9",
-    "pytest-asyncio>=0.23.0"
+    "pytest-asyncio>=0.23.0",
 ]
 
 [project.scripts]
@@ -46,7 +65,11 @@ quip-network-simulator = "quip_cli:network_simulator_main"
 py-modules = ["quip_cli"]
 
 [tool.setuptools.packages.find]
-include = ["shared*", "dwave*", "CPU*", "GPU*", "QPU*"]
+include = ["shared*", "dwave_topologies*", "CPU*", "GPU*", "QPU*"]
+
+[tool.setuptools.package-data]
+dwave_topologies = ["topologies/*.json.gz", "embeddings/*.json.gz"]
+"*" = ["genesis_block_public.json"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

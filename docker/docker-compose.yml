@@ -1,45 +1,70 @@
 version: '3.8'
 
+# Docker Compose for Quip Network Node testing
+# Run: docker-compose up cpu-bootstrap cpu-node-2
+
 services:
-  # CPU miner service
-  cpu-miner:
+  # Bootstrap CPU node (first node, no external peers needed)
+  cpu-bootstrap:
     build:
       context: ..
       dockerfile: docker/Dockerfile.cpu
-    image: quip-protocol/cpu-miner:latest
-    container_name: quip-cpu-miner
+    image: carback1/quip-network-node-cpu:latest
+    container_name: quip-cpu-bootstrap
     environment:
-      - MINING_DURATION=${MINING_DURATION:-30m}
-      - DIFFICULTY_ENERGY=${DIFFICULTY_ENERGY:--14900}
-      - MIN_DIVERSITY=${MIN_DIVERSITY:-0.1}
-      - MIN_SOLUTIONS=${MIN_SOLUTIONS:-5}
-      - TOPOLOGY_FILE=${TOPOLOGY_FILE:-dwave_topologies/topologies/advantage2_system1_7.json.gz}
-      - S3_BUCKET=${S3_BUCKET:-}
+      - QUIP_PORT=20049
+      - QUIP_LISTEN=0.0.0.0
+      - QUIP_PUBLIC_HOST=cpu-bootstrap:20049
+      - QUIP_NODE_NAME=cpu-bootstrap
+      - QUIP_AUTO_MINE=true
+      - QUIP_PEERS=
     volumes:
-      - ./output:/output
-      - ../dwave_topologies:/app/dwave_topologies:ro
-    restart: "no"
+      - cpu-bootstrap-data:/data
+    ports:
+      - "20049:20049/udp"
+      - "20049:20049/tcp"
     networks:
-      - quip-network
+      - quip-net
 
-  # CUDA miner service (requires NVIDIA GPU)
-  cuda-miner:
+  # Second CPU node (joins bootstrap)
+  cpu-node-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cpu
+    image: carback1/quip-network-node-cpu:latest
+    container_name: quip-cpu-2
+    environment:
+      - QUIP_PORT=20049
+      - QUIP_LISTEN=0.0.0.0
+      - QUIP_PUBLIC_HOST=cpu-node-2:20049
+      - QUIP_NODE_NAME=cpu-node-2
+      - QUIP_PEERS=cpu-bootstrap:20049
+      - QUIP_AUTO_MINE=true
+    volumes:
+      - cpu-node-2-data:/data
+    depends_on:
+      - cpu-bootstrap
+    networks:
+      - quip-net
+
+  # GPU node (requires NVIDIA runtime)
+  gpu-node:
     build:
       context: ..
       dockerfile: docker/Dockerfile.cuda
-    image: quip-protocol/cuda-miner:latest
-    container_name: quip-cuda-miner
+    image: carback1/quip-network-node-cuda:latest
+    container_name: quip-gpu-1
     environment:
-      - MINING_DURATION=${MINING_DURATION:-30m}
-      - DIFFICULTY_ENERGY=${DIFFICULTY_ENERGY:--14900}
-      - MIN_DIVERSITY=${MIN_DIVERSITY:-0.1}
-      - MIN_SOLUTIONS=${MIN_SOLUTIONS:-5}
-      - TOPOLOGY_FILE=${TOPOLOGY_FILE:-dwave_topologies/topologies/advantage2_system1_7.json.gz}
-      - GPU_DEVICE=${GPU_DEVICE:-0}
-      - S3_BUCKET=${S3_BUCKET:-}
+      - QUIP_PORT=20049
+      - QUIP_LISTEN=0.0.0.0
+      - QUIP_PUBLIC_HOST=gpu-node:20049
+      - QUIP_NODE_NAME=gpu-node-1
+      - QUIP_PEERS=cpu-bootstrap:20049
+      - QUIP_AUTO_MINE=true
     volumes:
-      - ./output:/output
-      - ../dwave_topologies:/app/dwave_topologies:ro
+      - gpu-node-data:/data
+    depends_on:
+      - cpu-bootstrap
     deploy:
       resources:
         reservations:
@@ -47,14 +72,14 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    restart: "no"
     networks:
-      - quip-network
+      - quip-net
 
 networks:
-  quip-network:
+  quip-net:
     driver: bridge
 
 volumes:
-  output:
-    driver: local
+  cpu-bootstrap-data:
+  cpu-node-2-data:
+  gpu-node-data:

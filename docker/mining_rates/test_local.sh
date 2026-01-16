@@ -30,7 +30,7 @@ echo "Topology: $TEST_TOPOLOGY"
 echo ""
 
 # Test CPU miner
-echo -e "${GREEN}[1/3] Testing CPU miner...${NC}"
+echo -e "${GREEN}[1/2] Testing CPU miner...${NC}"
 docker run --rm \
   -v "$(pwd)/docker/output:/output" \
   -v "$(pwd)/dwave_topologies:/app/dwave_topologies:ro" \
@@ -57,7 +57,7 @@ fi
 echo ""
 
 # Test CUDA miner (only if NVIDIA GPU is available)
-echo -e "${GREEN}[2/3] Testing CUDA miner...${NC}"
+echo -e "${GREEN}[2/2] Testing CUDA miner...${NC}"
 if command -v nvidia-smi &> /dev/null; then
     echo -e "${BLUE}NVIDIA GPU detected, testing CUDA miner...${NC}"
     docker run --rm \
@@ -87,40 +87,6 @@ if command -v nvidia-smi &> /dev/null; then
     fi
 else
     echo -e "${YELLOW}⊘ Skipping CUDA test (no NVIDIA GPU detected)${NC}"
-fi
-echo ""
-
-# Test Metal miner (only on macOS)
-echo -e "${GREEN}[3/3] Testing Metal miner...${NC}"
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    echo -e "${BLUE}macOS detected, testing Metal miner...${NC}"
-    echo -e "${YELLOW}Note: Metal may not work properly in Docker${NC}"
-    echo -e "${YELLOW}For production, use direct deployment (see aws/user_data_metal.sh)${NC}"
-
-    docker run --rm \
-      -v "$(pwd)/docker/output:/output" \
-      -v "$(pwd)/dwave_topologies:/app/dwave_topologies:ro" \
-      -e MINING_DURATION=$TEST_DURATION \
-      -e DIFFICULTY_ENERGY=$TEST_DIFFICULTY \
-      -e MIN_DIVERSITY=$TEST_DIVERSITY \
-      -e MIN_SOLUTIONS=$TEST_SOLUTIONS \
-      -e TOPOLOGY_FILE=$TEST_TOPOLOGY \
-      quip-protocol/metal-miner:latest || true
-
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✓ Metal miner test passed${NC}"
-        # Check if output file was created
-        if ls docker/output/metal_*.json 1> /dev/null 2>&1; then
-            LATEST_METAL=$(ls -t docker/output/metal_*.json | head -n1)
-            echo -e "${GREEN}  Output file: $LATEST_METAL${NC}"
-            echo -e "${BLUE}  Preview:${NC}"
-            cat "$LATEST_METAL" | head -n 20
-        fi
-    else
-        echo -e "${YELLOW}⚠ Metal miner test failed (expected in Docker)${NC}"
-    fi
-else
-    echo -e "${YELLOW}⊘ Skipping Metal test (not on macOS)${NC}"
 fi
 echo ""
 
