@@ -20,7 +20,7 @@ from shared.base_miner import MiningResult
 from shared.block import Block, BlockHeader, MinerInfo
 from shared.node import Node
 from shared.logging_config import init_component_logger
-from shared.version import get_version
+from shared.version import get_version, PROTOCOL_VERSION
 from shared.node_client import (
     NodeClient, QuicMessage, QuicMessageType,
     generate_self_signed_cert, QUIP_ALPN_PROTOCOL, MAX_DATAGRAM_FRAME_SIZE,
@@ -608,6 +608,11 @@ class NetworkNode(Node):
 
                 # If we are synchronized, check if we are mining. If not, start mining on the next block.
                 if not self._is_mining:
+                    # Guard: Don't start mining unless we're actually synchronized
+                    if not self.synchronized:
+                        self.logger.debug("Not starting mining - not synchronized with network")
+                        await asyncio.sleep(1)
+                        continue
                     latest_block = self.get_latest_block()
                     # Create task with exception handler to crash on ValueError
                     task = asyncio.create_task(self.mine_block(latest_block))
@@ -639,18 +644,23 @@ class NetworkNode(Node):
                     continue
 
                 # Process the block in background
-                block, response_future = block_data
+                # Unpack with optional force_reorg flag (default False for backward compat)
+                if len(block_data) == 3:
+                    block, response_future, force_reorg = block_data
+                else:
+                    block, response_future = block_data
+                    force_reorg = False
                 try:
                     latest = self.get_latest_block()
                     # Cache out of order blocks for later processing
                     # NOTE: older blocks need processing to determine chain fork
                     if latest.header.index+1 < block.header.index:
-                        self.sync_block_cache[block.header.index] = block
+                        self.sync_block_cache[block.header.index] = (block, force_reorg)
                         # WE return failure, but thats only to signal we didn't process it.
                         response_future.set_result(False)
                         continue
                     # Base case we can process the block
-                    result = await self.receive_block(block)
+                    result = await self.receive_block(block, force_reorg=force_reorg)
                     response_future.set_result(result)
                 except Exception as e:
                     self.logger.info(f"Error processing block: {e}")
@@ -727,20 +737,26 @@ class NetworkNode(Node):
 
     async def _exhaust_block_cache(self):
         """Exhaust the block cache by processing all blocks in order."""
-        # Pause gossip and process the current block cache. 
+        # Pause gossip and process the current block cache.
         async with self.gossip_lock:
             # Process cached blocks starting from end_index + 1
             next_block_index = self.get_latest_block().header.index + 1
             while next_block_index in self.sync_block_cache:
-                cached_block = self.sync_block_cache.pop(next_block_index)
+                cached_data = self.sync_block_cache.pop(next_block_index)
+                # Handle both old format (block only) and new format (block, force_reorg)
+                if isinstance(cached_data, tuple):
+                    cached_block, force_reorg = cached_data
+                else:
+                    cached_block = cached_data
+                    force_reorg = False
                 self.logger.info(f"Processing cached block {next_block_index} received during sync")
-                
+
                 # Process the cached block
-                success = await self.receive_block(cached_block)
+                success = await self.receive_block(cached_block, force_reorg=force_reorg)
                 if not success:
                     self.logger.error(f"Failed to process cached block {next_block_index}")
                     break
-                    
+
                 next_block_index += 1
 
 
@@ -1021,9 +1037,10 @@ class NetworkNode(Node):
             if my_latest_block.header.previous_hash == net_latest.previous_hash and my_latest_block.header.timestamp <= net_latest.timestamp:
                 self.set_synchronized()
                 return 0
-            else:                    
-                self.logger.debug("Latest block prev_hash mismatch, may need to synchronize")
-                return 0
+            else:
+                self.logger.warning(f"Fork detected at block {my_latest_block.header.index} - our prev_hash differs from network, triggering reorg sync")
+                # Return non-zero to trigger synchronization - longest chain wins
+                return net_latest.index
 
         return net_latest.index
 
@@ -1385,15 +1402,16 @@ class NetworkNode(Node):
             block = Block.from_network(message.data)
             # Don't rebroadcast if we are not synchronized yet
             if not self.synchronized:
-                self.sync_block_cache[block.header.index] = block
+                self.sync_block_cache[block.header.index] = (block, False)  # force_reorg=False for gossip
                 return "ok"
             # Don't rebroadcast if we likely already saw it and its a little old
             if self.get_latest_block().header.index-2 >= block.header.index:
                 return "ok"
             # Queue for background processing to avoid blocking
             # Create a dummy future for gossip blocks (we don't need the result)
+            # force_reorg=False because these are normal network propagation, not sync
             dummy_future = asyncio.Future()
-            self.block_processing_queue.put_nowait((block, dummy_future))
+            self.block_processing_queue.put_nowait((block, dummy_future, False))
 
         asyncio.create_task(self.gossip_broadcast(message, self.fanout))
         return "ok"
@@ -1412,6 +1430,11 @@ class NetworkNode(Node):
         This replaces all the HTTP route handlers with a single dispatch point.
         """
         try:
+            # Validate protocol version - reject incompatible nodes
+            if msg.protocol_version != PROTOCOL_VERSION:
+                self.logger.warning(f"Protocol version mismatch: expected {PROTOCOL_VERSION}, got {msg.protocol_version}")
+                return msg.create_error_response(f"Protocol version mismatch: expected {PROTOCOL_VERSION}, got {msg.protocol_version}")
+
             if msg.msg_type == QuicMessageType.JOIN_REQUEST:
                 return await self._quic_handle_join(msg)
             elif msg.msg_type == QuicMessageType.HEARTBEAT:
@@ -1536,7 +1559,8 @@ class NetworkNode(Node):
 
         response_future: asyncio.Future[bool] = asyncio.Future()
         try:
-            self.block_processing_queue.put_nowait((block, response_future))
+            # force_reorg=False for submitted blocks (normal propagation rules)
+            self.block_processing_queue.put_nowait((block, response_future, False))
             result = await asyncio.wait_for(response_future, timeout=10.0)
             status = "ok" if result else "rejected"
             return msg.create_response(json.dumps({"status": status}).encode('utf-8'))

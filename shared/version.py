@@ -1,13 +1,19 @@
 """
 Version management for QuIP Protocol.
 
-This module provides centralized access to the package version.
+This module provides centralized access to the package version and protocol version.
 """
 
 import importlib.metadata
 from typing import Optional
 
 __version__: Optional[str] = None
+
+# Protocol version - increment when making breaking changes to:
+# - Block serialization format
+# - Network message format
+# - Consensus rules
+PROTOCOL_VERSION = 1
 
 
 def get_version() -> str:

@@ -14,6 +14,7 @@ from shared.quantum_proof_of_work import (
     energies_for_solutions
 )
 from shared.logging_config import get_logger
+from shared.version import PROTOCOL_VERSION
 
 # Initialize logger
 logger = get_logger('block')
@@ -631,11 +632,14 @@ class BlockHeader:
     previous_hash: bytes
     index: int
     timestamp: int  # Unix timestamp
-    data_hash: bytes # hash of all non-header data fields
+    data_hash: bytes  # hash of all non-header data fields
+    version: int = PROTOCOL_VERSION  # Protocol version for compatibility checking
 
     def to_network(self) -> bytes:
         """Serialize to binary format."""
         result = b''
+        # Version first for easy detection of protocol changes
+        result += struct.pack('!H', self.version)  # unsigned 16-bit
         result += struct.pack('!I', len(self.previous_hash)) + self.previous_hash
         result += struct.pack('!Q', self.index)
         result += struct.pack('!q', self.timestamp)  # signed 64-bit for timestamp
@@ -646,6 +650,10 @@ class BlockHeader:
     def from_network(cls, data: bytes) -> 'BlockHeader':
         """Deserialize from binary format."""
         offset = 0
+
+        # Version (new field)
+        version = struct.unpack('!H', data[offset:offset+2])[0]
+        offset += 2
 
         # Previous hash
         hash_len = struct.unpack('!I', data[offset:offset+4])[0]
@@ -668,12 +676,14 @@ class BlockHeader:
             previous_hash=previous_hash,
             index=index,
             timestamp=timestamp,
-            data_hash=data_hash
+            data_hash=data_hash,
+            version=version
         )
 
     def to_json(self) -> dict:
         """Serialize to JSON-compatible dictionary."""
         return {
+            'version': self.version,
             'previous_hash': self.previous_hash.hex(),
             'index': self.index,
             'timestamp': self.timestamp,
@@ -687,7 +697,8 @@ class BlockHeader:
             previous_hash=bytes.fromhex(data['previous_hash']),
             index=data['index'],
             timestamp=int(data['timestamp']),
-            data_hash=bytes.fromhex(data['data_hash'])
+            data_hash=bytes.fromhex(data['data_hash']),
+            version=data.get('version', 1)  # Default to 1 for backward compat with old JSON
         )
 
 

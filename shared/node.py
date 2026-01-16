@@ -225,14 +225,20 @@ class Node:
         """Get the latest block from the blockchain."""
         return self.chain[-1]
 
-    async def check_block(self, block: Block) -> bool:
-        """Check if a block is valid and can be accepted."""
+    async def check_block(self, block: Block, force_reorg: bool = False) -> bool:
+        """Check if a block is valid and can be accepted.
+
+        Args:
+            block: The block to check.
+            force_reorg: If True, skip timestamp comparison to allow chain reorganization
+                        during sync (longest chain wins). Default False.
+        """
         # 1. Check if we already have this block or a newer one at this index
         cur_block = self.get_block(block.header.index)
         if not block.hash or not block.raw or not block.signature:
             self.logger.error(f"Block {block.header.index} rejected: missing hash, raw, or signature - it's not been finalized/signed.")
             return False
-        
+
         if cur_block is not None:
             if not cur_block.hash:
                 raise RuntimeError("Current block is not finalized!")
@@ -242,14 +248,18 @@ class Node:
                 self.logger.warning(f"Block {block.header.index}-{block.hash.hex()[:8]} is a duplicate, ignoring...")
                 return False
 
-            # Compare timestamps first - prefer older blocks
-            if cur_block.header.timestamp < block.header.timestamp:
-                self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have an older block at this index ({cur_block.header.timestamp} > {block.header.timestamp}), {cur_block.hash.hex()[:8]}")
-                return False
-            elif cur_block.header.timestamp == block.header.timestamp:
-                if cur_block.hash > block.hash:
-                    self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have a block with same timestamp and larger hash at this index, {cur_block.hash.hex()[:8]}")
+            # Skip timestamp comparison during forced reorg (sync mode - longest chain wins)
+            if not force_reorg:
+                # Compare timestamps first - prefer older blocks
+                if cur_block.header.timestamp < block.header.timestamp:
+                    self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have an older block at this index (ours: {cur_block.header.timestamp} < incoming: {block.header.timestamp}), keeping {cur_block.hash.hex()[:8]}")
                     return False
+                elif cur_block.header.timestamp == block.header.timestamp:
+                    if cur_block.hash > block.hash:
+                        self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have a block with same timestamp and larger hash at this index, {cur_block.hash.hex()[:8]}")
+                        return False
+            else:
+                self.logger.info(f"Block {block.header.index}-{block.hash.hex()[:8]} accepting via force_reorg (replacing {cur_block.hash.hex()[:8]})")
             
         # 2. Do we have more than 6 blocks after it?
         head = self.get_latest_block()
@@ -296,10 +306,15 @@ class Node:
 
         return True
 
-    async def receive_block(self, block: Block) -> bool:
-        """Receive a block from the network."""
+    async def receive_block(self, block: Block, force_reorg: bool = False) -> bool:
+        """Receive a block from the network.
 
-        if not await self.check_block(block):
+        Args:
+            block: The block to receive.
+            force_reorg: If True, skip timestamp comparison to allow chain reorganization
+                        during sync (longest chain wins). Default False.
+        """
+        if not await self.check_block(block, force_reorg=force_reorg):
             return False
 
         head = self.get_latest_block()
