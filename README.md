@@ -1,7 +1,6 @@
-Copyright (C) 2025 Postquant Labs
-This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, version 3. This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details. You should have received a copy of the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+# Quip Network Experimental Node
 
-# Quantum Proof-of-Work Blockchain Implementation
+> **WARNING: This is experimental demonstration software provided without warranty of any kind. It is not intended for production use. Use at your own risk.**
 
 This project implements a quantum blockchain using quantum annealing for proof-of-work consensus. It features competitive mining between quantum computers (QPU) and classical simulated annealing (SA) with a dynamic difficulty adjustment mechanism.
 
@@ -16,6 +15,45 @@ The blockchain demonstrates:
 - **Streak Rewards**: Consecutive wins increase block rewards
 - **Solution Diversity**: Requires multiple diverse solutions to prevent trivial mining
 - **Individual Miner Tracking**: Each miner has unique ID and performance stats
+
+## Current Scope
+
+The current implementation:
+- **Quantum PoW only** - No transactions, accounts, or other typical blockchain features
+- **Demonstration signatures** - The signature system is not yet production-secure; it demonstrates the hybrid ECDSA + WOTS+ approach but requires proper integration
+
+## Roadmap
+
+We plan to build a complete blockchain by forking an existing battle tested codebase to maximize development velocity.
+
+### Phase 1: Core Integration
+- Fork a battle-tested blockchain codebase
+- Integrate our quantum proof-of-work mechanism (Ising model optimization, difficulty adjustment, block time targets already defined)
+- Target: Testnet deployment
+
+### Phase 2: Signature System
+- Integrate our hybrid signature system: classical ECDSA combined with post-quantum WOTS+ signatures
+- Implement stateful signature management
+- Wire signatures into transaction processing and consensus
+
+### Phase 3: Subnet Architecture
+- Implement a subnet system with **objective, measurable metrics** for validation
+- Subnets will solve computational problems (scientific computing, cryptographic proofs, etc.) with verifiable results
+- Define subnet registration, validation mechanisms, and reward distribution
+
+### Phase 4: Smart Contracts
+- Add smart contract support via EVM compatibility (Solidity/Vyper) and/or Rust-based WebAssembly runtime
+- Later: Enable contracts to interact with subnet computational results
+
+### Open Technical Decisions
+1. Which blockchain codebase to fork?
+2. How to structure subnets for different computational problem types?
+3. How to validate objective metrics across the decentralized network?
+4. Performance targets (TPS, finality time, subnet throughput)?
+
+## Getting Started
+
+You can run your own node using the "latest" release, see the README in the `docker` directory for instructions on how to run the node in a container.
 
 ## Setup
 
@@ -44,35 +82,33 @@ The blockchain demonstrates:
 
 ```
 quip-protocol/
-├── quantum_blockchain.py       # Main blockchain implementation
-├── blockchain_base.py          # Base classes for miners and nodes
-├── quantum_blockchain_network.py  # P2P networking layer
-├── quantum_blockchain_p2p.py   # P2P-enabled blockchain
-├── CPU/                        # CPU-based miners
-│   └── cpu_miner.py           # Simulated annealing miner
-├── GPU/                        # GPU-accelerated miners
-│   └── gpu_miner.py           # Modal Labs GPU miner
-├── QPU/                        # Quantum processor miners
-│   └── qpu_miner.py           # D-Wave QPU miner
-├── launch_network.py           # Network launcher utility
-├── reference/                  # Reference implementation tests
-│   ├── test_quantum_pow.py    # Tests showing optimal SA parameters
-│   └── reference_test_results.png
-├── benchmarks/                 # Performance benchmarking suite
-│   ├── benchmark_quantum_pow.py
-│   ├── energy_distributions.png
-│   ├── performance_metrics.png
-│   ├── blockchain_benchmark_comprehensive.png
-│   ├── blockchain_benchmark_timing.png
-│   └── benchmark_results.json
-└── venv/                      # Python virtual environment
+├── quip_cli.py                # Main CLI entry point
+├── blockchain_base.py         # Base classes for miners
+├── shared/                    # Core modules
+│   ├── network_node.py       # P2P networking (QUIC protocol)
+│   ├── node.py               # Node state management
+│   ├── block.py              # Block and header dataclasses
+│   ├── block_signer.py       # ECDSA + WOTS+ signatures
+│   ├── quantum_proof_of_work.py  # Ising model PoW
+│   ├── base_miner.py         # Abstract miner interface
+│   └── ...                   # Additional utilities
+├── CPU/                       # CPU-based miners
+│   ├── sa_miner.py           # Simulated annealing miner
+│   └── sa_sampler.py         # SA sampler implementation
+├── GPU/                       # GPU-accelerated miners
+│   ├── cuda_miner.py         # CUDA GPU miner
+│   ├── metal_miner.py        # Apple Metal/MPS miner
+│   └── modal_miner.py        # Modal Labs cloud GPU
+├── QPU/                       # Quantum processor miners
+│   ├── dwave_miner.py        # D-Wave QPU miner
+│   └── dwave_sampler.py      # D-Wave sampler wrapper
+├── docker/                    # Docker deployment files
+├── tests/                     # Test suite
+├── reference/                 # Reference implementation
+└── benchmarks/                # Performance benchmarks
 ```
 
-## New Click-based CLIs
-
-Two new commands provide a friendlier CLI using Click while keeping existing scripts intact.
-
-### quip-network-node
+## quip-network-node
 
 Run a single P2P node of a specific type. Subcommands: cpu, gpu, qpu.
 
@@ -136,7 +172,7 @@ See a working example in QUIP-node.example.toml.
 
 ### quip-network-simulator
 
-Mimics launch_network.py scenarios, but runs separate processes via quip-network-node and prints the exact commands:
+Launches multiple nodes for testing different network scenarios:
 
 ```bash
 # Mixed (approx. 3 CPU, 2 GPU, 1 QPU)
@@ -327,39 +363,6 @@ quip-network-node gpu --listen 127.0.0.1 --port 8085 --public-host 127.0.0.1:808
 quip-network-node gpu --listen 127.0.0.1 --port 8085 --public-host 127.0.0.1:8085 --auto-mine --peer 127.0.0.1:8085 --gpu-backend mps --genesis-config genesis_block_public.json
 ```
 
-### Run the Quantum Blockchain Demo
-
-```bash
-# Basic competitive mining (1 QPU vs 1 SA miner)
-python quantum_blockchain.py --competitive
-
-# Multiple miners (2 QPU miners vs 4 SA miners)
-python quantum_blockchain.py --competitive --num-qpu 2 --num-sa 4
-
-# Custom number of blocks
-python quantum_blockchain.py --competitive --num-qpu 2 --num-sa 3 --blocks 10
-
-# Non-competitive mode (single miner)
-python quantum_blockchain.py
-```
-
-Parameters:
-
-- `--competitive`: Enable competitive mining mode
-- `--num-qpu N`: Number of QPU miners (default: 1)
-- `--num-sa N`: Number of SA miners (default: 1)
-- `--blocks N`: Number of blocks to mine (default: 20)
-
-### Run Reference Implementation Tests
-
-```bash
-python reference/test_quantum_pow.py
-```
-
-Tests the reference implementation with different `num_sweeps` values. Results show SA achieves optimal performance at `num_sweeps=4096`.
-
-![Reference Test Results](reference/reference_test_results.png)
-
 ### Run Performance Benchmarks
 
 ```bash
@@ -437,9 +440,9 @@ Key outcomes:
 ### Shared Mining Parameters
 
 ```python
-base_difficulty_energy = -1150  # Energy threshold
-min_diversity = 0.45           # Solution diversity requirement
-min_solutions = 15             # Minimum valid solutions
+difficulty_energy = -1000.0  # Energy threshold
+min_diversity = 0.28         # Solution diversity requirement
+min_solutions = 10           # Minimum valid solutions
 ```
 
 ### Miner-Specific Settings
@@ -476,17 +479,14 @@ The blockchain supports GPU-accelerated mining using Modal Labs cloud infrastruc
    modal token new  # Opens browser for authentication
    ```
 
-2. **Run GPU Miners**:
+2. **Run GPU Node**:
 
    ```bash
-   # Single GPU miner (T4)
-   python quantum_blockchain.py --competitive --num-gpu 1 --blocks 10
+   # Local CUDA GPU
+   quip-network-node gpu --gpu-backend local --auto-mine
 
-   # Multiple GPU miners with different types
-   python quantum_blockchain.py --competitive --num-gpu 3 --gpu-types t4 a10g a100 --blocks 20
-
-   # Mix of QPU, SA, and GPU miners
-   python quantum_blockchain.py --competitive --num-qpu 1 --num-sa 2 --num-gpu 2 --gpu-types t4 a10g
+   # Modal Labs cloud GPU
+   quip-network-node gpu --gpu-backend modal --auto-mine
    ```
 
 ### GPU Types and Performance
@@ -515,287 +515,76 @@ modal run benchmarks/gpu_benchmark_modal.py
 
 This compares different GPU types and provides cost/performance analysis.
 
-## P2P Network Support
+## P2P Network
 
-The blockchain now includes a peer-to-peer networking layer that enables nodes to discover each other, share blocks, and maintain network consensus.
+The blockchain uses QUIC protocol for peer-to-peer communication with built-in TLS 1.3 encryption.
 
-### P2P Features
+### Features
 
-- **Automatic Node Discovery**: Nodes broadcast new peers to the entire network
-- **Heartbeat Mechanism**: Nodes send regular heartbeats to track liveness (15s interval, 60s timeout)
-- **Block Propagation**: New blocks are automatically broadcast to all connected nodes
-- **Concurrent Mining**: Multiple nodes can mine simultaneously with different miner configurations
-- **Resilient Networking**: Nodes automatically remove dead peers and handle network partitions
+- **QUIC Protocol**: Low-latency UDP-based transport with TLS 1.3
+- **Automatic Node Discovery**: Nodes broadcast new peers to the network
+- **Heartbeat Mechanism**: 15s interval, 60s timeout for liveness
+- **Block Propagation**: New blocks broadcast via GOSSIP messages
+- **Chain Synchronization**: Automatic sync with peers on join
 
-### P2P Quick Start
+### Protocol Messages
 
-1. **Install P2P Dependencies**:
+The QUIC protocol uses binary message types:
+- `JOIN_REQUEST` / `JOIN_RESPONSE`: Node discovery
+- `HEARTBEAT`: Liveness checks
+- `GOSSIP`: Block propagation
+- `BLOCK_REQUEST` / `BLOCK_SUBMIT`: Block operations
+- `STATUS_REQUEST` / `STATS_REQUEST`: Node status
 
-   ```bash
-   pip install aiohttp
-   ```
+Default port: **20049**
 
-2. **Start Bootstrap Node**:
-
-   ```bash
-   python quantum_blockchain_p2p.py --port 8080 --competitive --num-sa 2
-   ```
-
-3. **Join Network**:
-
-   ```bash
-   # Connect to bootstrap node
-   python quantum_blockchain_p2p.py --port 8081 --peer localhost:8080 --competitive --num-sa 2
-
-   # Add GPU miners
-   python quantum_blockchain_p2p.py --port 8082 --peer localhost:8080 --competitive --num-gpu 1 --num-sa 1
-   ```
-
-4. **Run Demo**:
-   ```bash
-   python p2p_demo.py --demo
-   ```
-
-### P2P Network Protocol
-
-- **Join Request** (`/join`): New nodes announce themselves and receive node list
-- **Heartbeat** (`/heartbeat`): Regular liveness checks between nodes
-- **Block Broadcast** (`/block`): Propagates new blocks across network
-- **Node Broadcast** (`/broadcast`): Generic message broadcasting
-
-### Example P2P Network Setup
-
-```bash
-# Terminal 1: Bootstrap node
-python quantum_blockchain_p2p.py --port 8080 --competitive
-
-# Terminal 2: SA mining node
-python quantum_blockchain_p2p.py --port 8081 --peer localhost:8080 --competitive --num-sa 3
-
-# Terminal 3: GPU mining node
-python quantum_blockchain_p2p.py --port 8082 --peer localhost:8080 --competitive --num-gpu 2 --gpu-types t4 a10g
-
-# Terminal 4: Mixed mining node
-python quantum_blockchain_p2p.py --port 8083 --peer localhost:8081 --competitive --num-sa 1 --num-gpu 1
-```
-
-This creates a 4-node network with diverse mining configurations, automatic block propagation, and fault tolerance.
-
-## Modular Miner Architecture
-
-The blockchain now supports modular miners that can independently join the P2P network. Each miner type implements the same protocol:
-
-1. **Connects to P2P network** via peer discovery
-2. **Gets latest block** from network peers
-3. **Mines new blocks** using miner-specific algorithms
-4. **Broadcasts wins** to all network nodes
-5. **Stops mining** when receiving valid blocks from others
-
-### CPU Miner
-
-Pure Python implementation using simulated annealing:
-
-```bash
-# Start a CPU miner
-python CPU/cpu_miner.py --id 1 --port 8080
-
-# With custom parameters
-python CPU/cpu_miner.py --id 2 --port 8081 --peer localhost:8080 --num-sweeps 8192
-```
-
-Options:
-
-- `--num-sweeps N`: Annealing sweeps (default: 4096)
-
-### GPU Miner
-
-Cloud GPU acceleration using Modal Labs:
-
-```bash
-# Install Modal first
-pip install modal
-modal token new
-
-# Start GPU miners
-python GPU/gpu_miner.py --id 1 --port 8080 --gpu-type t4
-python GPU/gpu_miner.py --id 2 --port 8081 --peer localhost:8080 --gpu-type a10g
-```
-
-Options:
-
-- `--gpu-type TYPE`: GPU type - t4, a10g, a100 (default: t4)
-- `--num-sweeps N`: Annealing sweeps (default: 512)
-
-### QPU Miner
-
-D-Wave quantum annealer integration:
-
-```bash
-# Set D-Wave credentials
-export DWAVE_API_TOKEN=your_token_here
-
-# Start QPU miner
-python QPU/qpu_miner.py --id 1 --port 8080
-```
-
-Falls back to CPU if QPU unavailable.
-
-### Network Launcher
-
-Easy deployment of mixed networks:
-
-```bash
-# Launch mixed network (CPU + GPU + QPU)
-python launch_network.py --scenario mixed
-
-# Launch CPU-only network (4 nodes)
-python launch_network.py --scenario cpu
-
-# Launch GPU competition (different GPU types)
-python launch_network.py --scenario gpu
-```
-
-### Example Heterogeneous Network
+### Example Network Setup
 
 ```bash
 # Terminal 1: Bootstrap CPU node
-python CPU/cpu_miner.py --id 1 --port 8080
+quip-network-node cpu --port 20049 --auto-mine
 
-# Terminal 2: Fast CPU node
-python CPU/cpu_miner.py --id 2 --port 8081 --peer localhost:8080 --num-sweeps 8192
+# Terminal 2: Join as CPU miner
+quip-network-node cpu --port 20050 --peer localhost:20049 --auto-mine
 
-# Terminal 3: GPU node (T4)
-python GPU/gpu_miner.py --id 1 --port 8082 --peer localhost:8080
+# Terminal 3: Join as GPU miner (CUDA)
+quip-network-node gpu --port 20051 --peer localhost:20049 --auto-mine
 
-# Terminal 4: GPU node (A10G)
-python GPU/gpu_miner.py --id 2 --port 8083 --peer localhost:8080 --gpu-type a10g
-
-# Terminal 5: QPU node
-python QPU/qpu_miner.py --id 1 --port 8084 --peer localhost:8080
+# Terminal 4: Join as GPU miner (Metal/MPS on Mac)
+quip-network-node gpu --gpu-backend mps --port 20052 --peer localhost:20049 --auto-mine
 ```
 
-### Common Miner Options
+### Network Simulator
 
-All miners support:
-
-- `--id N`: Node ID (default: 1)
-- `--host HOST`: Bind address (default: 0.0.0.0)
-- `--port PORT`: Listen port (default: 8080)
-- `--peer HOST:PORT`: Bootstrap peer to connect to
-- `--log-level LEVEL`: Logging level (DEBUG, INFO, WARNING, ERROR)
-
-### Mining Parameters
-
-All miners use the same difficulty parameters:
-
-```python
-difficulty_energy = -15500.0  # Energy threshold
-min_diversity = 0.46         # Solution diversity
-min_solutions = 25           # Required solutions
-```
-
-## TLS/HTTPS Support
-
-The network nodes support TLS encryption for secure communication between peers. TLS is automatically enabled when certificate files are provided in the configuration.
-
-### Quick Setup with Let's Encrypt (Certbot)
-
-1. **Install Certbot** (for domain-based certificates):
-
-   ```bash
-   # Ubuntu/Debian
-   sudo apt update && sudo apt install certbot
-
-   # CentOS/RHEL
-   sudo yum install certbot
-
-   # macOS
-   brew install certbot
-   ```
-
-2. **Obtain TLS Certificates**:
-
-   ```bash
-   # Replace with your actual domain
-   sudo certbot certonly --standalone -d your-node.example.com
-
-   # Certificates will be saved to:
-   # Certificate: /etc/letsencrypt/live/your-node.example.com/fullchain.pem
-   # Private Key: /etc/letsencrypt/live/your-node.example.com/privkey.pem
-   ```
-
-3. **Configure TLS in TOML**:
-
-   ```toml
-   [global]
-   node_name = "Secure Node"
-   listen = "0.0.0.0"
-   port = 20049
-   tls_cert_file = "/etc/letsencrypt/live/your-node.example.com/fullchain.pem"
-   tls_key_file = "/etc/letsencrypt/live/your-node.example.com/privkey.pem"
-   ```
-
-4. **Run with TLS**:
-   ```bash
-   quip-network-node --config config.toml cpu
-   ```
-
-### Self-Signed Certificates (Development)
-
-For testing or private networks, you can generate self-signed certificates:
+Launch multiple nodes for testing:
 
 ```bash
-# Generate private key and certificate
-openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes \
-  -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
+# Mixed network (CPU + GPU)
+quip-network-simulator --scenario mixed
 
-# Use in configuration
-echo 'tls_cert_file = "cert.pem"' >> config.toml
-echo 'tls_key_file = "key.pem"' >> config.toml
+# CPU-only network
+quip-network-simulator --scenario cpu --base-port 9000
 ```
 
-### TLS Configuration Options
+## Security
 
-Add these options to your configuration file:
+### QUIC Transport Security
+
+The P2P network uses QUIC protocol which includes mandatory TLS 1.3 encryption:
+
+- **Built-in TLS 1.3**: All connections are encrypted by default
+- **Self-signed certificates**: Automatically generated for development
+- **TOFU (Trust On First Use)**: Peer certificates stored in `trust.db`
+
+### Production Certificates
+
+For production deployments, configure custom certificates in TOML:
 
 ```toml
 [global]
-# Required for TLS
 tls_cert_file = "/path/to/certificate.pem"
 tls_key_file = "/path/to/private_key.pem"
-
-# When TLS is enabled, nodes will use https:// for peer communication
-# Make sure peer URLs use https:// scheme when connecting to TLS-enabled nodes
-peer = "https://secure-node.example.com:20049"
 ```
-
-### Security Features
-
-The TLS implementation uses modern security standards:
-
-- **TLS 1.3 only**: Ensures forward secrecy and latest security features
-- **Strong cipher suites**: ECDHE+AESGCM, ECDHE+CHACHA20, DHE+AESGCM, DHE+CHACHA20
-- **Perfect Forward Secrecy**: Ephemeral key exchange protects past communications
-- **No weak algorithms**: Explicitly excludes aNULL, MD5, and DSS
-
-### Certificate Renewal
-
-Set up automatic renewal for Let's Encrypt certificates:
-
-```bash
-# Add to crontab
-sudo crontab -e
-
-# Add this line for automatic renewal (checks twice daily)
-0 12,0 * * * certbot renew --quiet --post-hook "systemctl reload quip-network-node"
-```
-
-### Troubleshooting TLS
-
-- **Certificate errors**: Verify certificate paths and permissions
-- **Connection refused**: Ensure firewall allows the configured port
-- **Mixed HTTP/HTTPS**: All peers must use the same protocol (HTTP or HTTPS)
-- **Self-signed warnings**: Use `--insecure` flag for development testing
 
 ## Future Enhancements
 
@@ -810,4 +599,4 @@ sudo crontab -e
 
 ## License
 
-MIT License - See LICENSE file for details
+GNU Affero General Public License v3.0 - See LICENSE file for details
