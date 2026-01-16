@@ -929,13 +929,19 @@ class NetworkNode(Node):
         except Exception as e:
             self.logger.exception(f"Error updating stats cache: {e}")
 
-    async def receive_block(self, block: Block) -> bool:
-        """Receive a block from the network with epoch validation and max block limit."""
+    async def receive_block(self, block: Block, force_reorg: bool = False) -> bool:
+        """Receive a block from the network with epoch validation and max block limit.
+
+        Args:
+            block: The block to receive.
+            force_reorg: If True, skip timestamp comparison to allow chain reorganization
+                        during sync (longest chain wins). Default False.
+        """
         # Reject blocks that are too far in the future (beyond max sync limit)
         if block.header.index > self.max_sync_block_index:
             self.logger.debug(f"Block {block.header.index} rejected: index > max_sync_block_index {self.max_sync_block_index}")
             return False
-        
+
         # Check against previous epoch to prevent accepting blocks from old chain epoch
         async with self.chain_lock:
             if self.previous_epoch:
@@ -943,19 +949,19 @@ class NetworkNode(Node):
                 if block.header.index == 1 and block.hash and block.hash == self.previous_epoch.first_hash:
                     self.logger.warning(f"Block 1 rejected: hash {block.hash.hex()[:8]}... matches previous epoch first_hash")
                     return False
-                
-                # Reject if this block hash matches the last block from the previous epoch  
+
+                # Reject if this block hash matches the last block from the previous epoch
                 if block.hash and block.hash == self.previous_epoch.last_hash:
                     self.logger.warning(f"Block {block.header.index} rejected: hash {block.hash.hex()[:8]}... matches previous epoch last_hash")
                     return False
-                
+
                 # Reject if timestamp is older than the last timestamp from the previous epoch
                 if block.header.timestamp <= self.previous_epoch.last_timestamp:
                     self.logger.warning(f"Block {block.header.index} rejected: timestamp {block.header.timestamp} <= previous epoch last_timestamp {self.previous_epoch.last_timestamp}")
                     return False
-        
+
         # If all validations pass, call parent receive_block
-        return await super().receive_block(block)
+        return await super().receive_block(block, force_reorg=force_reorg)
 
     async def mine_block(self, previous_block: Block, transactions=None) -> Optional[MiningResult]:
         """Mine a block and broadcast if successful."""
