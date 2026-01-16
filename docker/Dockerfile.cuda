@@ -1,79 +1,88 @@
-# Dockerfile for CUDA-based mining comparison
-# NVIDIA CUDA 11.8 for good driver compatibility (driver 520+)
-# Driver requirements: CUDA 11.2=450+, CUDA 11.8=520+, CUDA 12.x=525+
-FROM nvidia/cuda:11.8.0-devel-ubuntu22.04
+# Dockerfile for Quip Network Node - GPU (CUDA)
+# Uses all available NVIDIA GPUs for mining
+# Multi-stage build for smaller image size
 
-LABEL maintainer="Quip Protocol"
-LABEL description="CUDA GPU miner for quantum blockchain mining rate comparison"
+#############################################
+# Stage 1: Build the wheel
+#############################################
+FROM python:3.10-slim-bookworm AS builder
 
-# Prevent interactive prompts during installation
-ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /build
 
-# Install Python 3.10 (Ubuntu 22.04 default) and dependencies
-RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-dev \
-    python3-venv \
-    python3-pip \
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    gcc \
-    g++ \
-    make \
-    git \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
+# Copy source files needed for build
+COPY pyproject.toml README.md LICENSE ./
+COPY shared/ ./shared/
+COPY CPU/ ./CPU/
+COPY GPU/ ./GPU/
+COPY QPU/ ./QPU/
+COPY dwave_topologies/ ./dwave_topologies/
+COPY quip_cli.py ./
+COPY genesis_block_public.json ./
+
+# Build wheel
+RUN pip install --no-cache-dir build && \
+    python -m build --wheel --outdir /build/dist
+
+#############################################
+# Stage 2: Runtime image with CUDA
+#############################################
+FROM nvidia/cuda:11.8.0-runtime-ubuntu22.04
+
+LABEL maintainer="Quip Protocol"
+LABEL description="Quip Network Node - CUDA GPU Mining"
+LABEL org.opencontainers.image.source="https://gitlab.com/piqued/quip-protocol"
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Python and runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    openssl \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/python3 /usr/bin/python
+
 WORKDIR /app
 
-# Copy project files
-COPY pyproject.toml ./
-COPY README.md ./
-COPY LICENSE ./
-COPY blockchain_base.py ./
-COPY GPU/ ./GPU/
-COPY shared/ ./shared/
-COPY tools/ ./tools/
-COPY dwave_topologies/ ./dwave_topologies/
+# Copy wheel from builder and install with cuda extras
+COPY --from=builder /build/dist/*.whl /tmp/
+RUN WHEEL=$(ls /tmp/*.whl) && \
+    pip install --no-cache-dir "${WHEEL}[cuda]" && \
+    rm /tmp/*.whl
 
-# Install Python dependencies including CuPy for CUDA 11.2
-# cupy-cuda11x = built for CUDA 11.x, version 12.x = CuPy version (not CUDA!)
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir --ignore-installed \
-    "cupy-cuda11x>=12.0.0,<13.0.0" \
-    "dwave-ocean-sdk>=6.0.0" \
-    "numpy>=1.24.0" \
-    "matplotlib>=3.6.0" \
-    "pandas>=2.0.0" \
-    "seaborn>=0.12.0" \
-    "python-dotenv>=1.0.0" \
-    "click>=8.1.7" \
-    "hashsigs>=0.0.2" \
-    "blake3>=1.0.5"
+# Copy genesis block (needed at runtime)
+COPY genesis_block_public.json ./
 
-# Create output directory
-RUN mkdir -p /output
-
-# Set default environment variables (can be overridden at runtime)
-ENV MINING_DURATION=30m
-ENV DIFFICULTY_ENERGY=-14900
-ENV MIN_DIVERSITY=0.1
-ENV MIN_SOLUTIONS=5
-ENV TOPOLOGY_FILE=dwave_topologies/topologies/advantage2_system1_7.json.gz
-ENV MINER_TYPE=cuda
-ENV GPU_DEVICE=0
-
-# Set CUDA environment variables
+# CUDA environment variables
 ENV CUDA_HOME=/usr/local/cuda
 ENV PATH=${CUDA_HOME}/bin:${PATH}
 ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 
-# Copy entrypoint script
-COPY docker/entrypoint-cuda.sh /entrypoint.sh
+# Copy config template and entrypoint
+COPY docker/quip-node.cuda.toml /app/quip-node.docker.toml
+COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Volume for output files
-VOLUME ["/output"]
+# Quip environment variables with defaults
+ENV QUIP_MODE=gpu
+ENV QUIP_PEERS=nodes.quip.network:20049
+ENV QUIP_PORT=20049
+ENV QUIP_LISTEN=0.0.0.0
+ENV QUIP_PUBLIC_HOST=""
+ENV QUIP_NODE_NAME=""
+ENV QUIP_AUTO_MINE=false
 
-# Run the entrypoint script
+# Data volume for persistent config and secret
+VOLUME ["/data"]
+
+# Expose QUIC port
+EXPOSE 20049/udp
+EXPOSE 20049/tcp
+
 ENTRYPOINT ["/entrypoint.sh"]

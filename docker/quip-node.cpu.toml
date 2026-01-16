@@ -1,0 +1,26 @@
+# Quip Network Node - CPU Mode Configuration
+# Copied to /data/config.toml on first run
+
+[global]
+secret = "GENERATE_ON_FIRST_RUN"
+listen = "0.0.0.0"
+port = 20049
+timeout = 3
+heartbeat_interval = 15
+heartbeat_timeout = 300
+verify_ssl = true
+
+[tofu]
+enabled = true
+trust_db = "/data/trust.db"
+
+[rest_api]
+enabled = false
+host = "0.0.0.0"
+http_port = 8080
+cert_dir = "/data/certs"
+
+[cpu]
+# Number of CPU threads for mining
+# Auto-detected by entrypoint if not specified
+# num_cpus = 4
