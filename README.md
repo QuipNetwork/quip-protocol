@@ -1,7 +1,6 @@
-Copyright (C) 2025 Postquant Labs
-This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, version 3. This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details. You should have received a copy of the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+# Quip Network Experimental Node
 
-# Quantum Proof-of-Work Blockchain Implementation
+> **WARNING: This is experimental demonstration software provided without warranty of any kind. It is not intended for production use. Use at your own risk.**
 
 This project implements a quantum blockchain using quantum annealing for proof-of-work consensus. It features competitive mining between quantum computers (QPU) and classical simulated annealing (SA) with a dynamic difficulty adjustment mechanism.
 
@@ -16,6 +15,45 @@ The blockchain demonstrates:
 - **Streak Rewards**: Consecutive wins increase block rewards
 - **Solution Diversity**: Requires multiple diverse solutions to prevent trivial mining
 - **Individual Miner Tracking**: Each miner has unique ID and performance stats
+
+## Current Scope
+
+The current implementation:
+- **Quantum PoW only** - No transactions, accounts, or other typical blockchain features
+- **Demonstration signatures** - The signature system is not yet production-secure; it demonstrates the hybrid ECDSA + WOTS+ approach but requires proper integration
+
+## Roadmap
+
+We plan to build a complete blockchain by forking an existing battle tested codebase to maximize development velocity.
+
+### Phase 1: Core Integration
+- Fork a battle-tested blockchain codebase
+- Integrate our quantum proof-of-work mechanism (Ising model optimization, difficulty adjustment, block time targets already defined)
+- Target: Testnet deployment
+
+### Phase 2: Signature System
+- Integrate our hybrid signature system: classical ECDSA combined with post-quantum WOTS+ signatures
+- Implement stateful signature management
+- Wire signatures into transaction processing and consensus
+
+### Phase 3: Subnet Architecture
+- Implement a subnet system with **objective, measurable metrics** for validation
+- Subnets will solve computational problems (scientific computing, cryptographic proofs, etc.) with verifiable results
+- Define subnet registration, validation mechanisms, and reward distribution
+
+### Phase 4: Smart Contracts
+- Add smart contract support via EVM compatibility (Solidity/Vyper) and/or Rust-based WebAssembly runtime
+- Later: Enable contracts to interact with subnet computational results
+
+### Open Technical Decisions
+1. Which blockchain codebase to fork?
+2. How to structure subnets for different computational problem types?
+3. How to validate objective metrics across the decentralized network?
+4. Performance targets (TPS, finality time, subnet throughput)?
+
+## Getting Started
+
+You can run your own node using the "latest" release, see the README in the `docker` directory for instructions on how to run the node in a container.
 
 ## Setup
 
@@ -68,11 +106,7 @@ quip-protocol/
 └── venv/                      # Python virtual environment
 ```
 
-## New Click-based CLIs
-
-Two new commands provide a friendlier CLI using Click while keeping existing scripts intact.
-
-### quip-network-node
+## quip-network-node
 
 Run a single P2P node of a specific type. Subcommands: cpu, gpu, qpu.
 
