@@ -9,7 +9,7 @@ from shared.block import Block, BlockRequirements
 from shared.energy_utils import adjust_energy_along_curve
 from shared.miner_types import MiningResult
 from shared.quantum_proof_of_work import validate_quantum_proof
-from shared.time_utils import utc_timestamp, validate_block_timestamp
+from shared.time_utils import utc_timestamp, validate_block_timestamp, network_timestamp
 
 internal_logger = logging.getLogger(__name__)
 
@@ -102,7 +102,7 @@ def compute_current_requirements(
         BlockRequirements with decay applied if elapsed time warrants it
     """
     if current_time is None:
-        current_time = utc_timestamp()
+        current_time = network_timestamp()
 
     if initial_requirements.timeout_to_difficulty_adjustment_decay <= 0:
         return initial_requirements

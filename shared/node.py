@@ -25,7 +25,7 @@ from shared.block_signer import BlockSigner
 from shared.block import Block, MinerInfo
 from shared.miner import Miner, MiningResult
 from shared.logging_config import init_component_logger
-from shared.time_utils import utc_timestamp_float, utc_timestamp
+from shared.time_utils import utc_timestamp_float, utc_timestamp, network_timestamp
 # Global logger for this module (set during Node initialization)
 log = None
 
@@ -528,7 +528,7 @@ class Node:
         header = block.BlockHeader(
             previous_hash=previous_block.hash,
             index=previous_block.header.index + 1,
-            timestamp=utc_timestamp(),
+            timestamp=network_timestamp(),
             data_hash=blake3(block_data).digest()
         )
         miner_info = self.info()

@@ -35,8 +35,8 @@ from aioquic.quic.events import QuicEvent, DatagramFrameReceived, StreamDataRece
 from shared.block_synchronizer import BlockSynchronizer
 from shared.block_store import BlockStore
 from shared.time_utils import (
-    utc_timestamp_float, utc_timestamp, get_network_time_offset,
-    is_clock_synchronized, sync_time_with_network, NETWORK_TIME_SYNC_INTERVAL
+    utc_timestamp_float, is_clock_synchronized, NETWORK_TIME_SYNC_INTERVAL,
+    get_network_clock, network_timestamp
 )
 
 
@@ -940,6 +940,7 @@ class NetworkNode(Node):
             fresh_stats = self.get_stats()
             
             # Add network-specific information
+            clock = get_network_clock()
             fresh_stats.update({
                 "network": {
                     "host": self.public_host,
@@ -953,6 +954,10 @@ class NetworkNode(Node):
                         "block_processing": self.block_processing_queue.qsize(),
                         "gossip_processing": self.gossip_processing_queue.qsize(),
                     }
+                },
+                "network_clock": {
+                    "offset_seconds": round(clock.get_offset(), 1),
+                    "is_trusted": clock.is_trusted(),
                 }
             })
             
@@ -1138,6 +1143,9 @@ class NetworkNode(Node):
         """Track a peer timestamp for time synchronization."""
         current_time = utc_timestamp_float()
 
+        # Feed the global network clock for offset calculation
+        get_network_clock().record_peer_timestamp(timestamp)
+
         # Only track recent timestamps (within last 5 minutes)
         if abs(current_time - timestamp) < 300:
             self.peer_timestamps.append(int(timestamp))
@@ -1156,18 +1164,19 @@ class NetworkNode(Node):
         if len(self.peer_timestamps) < 3:
             return  # Not enough data
 
+        clock = get_network_clock()
         if not is_clock_synchronized(self.peer_timestamps):
-            offset = get_network_time_offset(self.peer_timestamps)
+            offset = clock.get_offset()
             self.time_sync_warnings += 1
 
             if self.time_sync_warnings <= 3:  # Limit warnings
                 self.logger.warning(
-                    f"⚠️  Clock synchronization issue detected! "
-                    f"Local time is {offset} seconds {'ahead' if offset > 0 else 'behind'} network time. "
-                    f"Consider synchronizing your system clock with NTP."
+                    f"⚠️  Clock drift detected: local time is {abs(offset):.0f}s "
+                    f"{'ahead' if offset > 0 else 'behind'} network time. "
+                    f"Network clock is compensating (timestamps adjusted by {-offset:.0f}s)."
                 )
             elif self.time_sync_warnings == 4:
-                self.logger.warning("⚠️  Clock sync warnings suppressed (fix your system clock)")
+                self.logger.info(f"Clock drift warnings suppressed (compensating by {-offset:.0f}s)")
         else:
             # Reset warning counter if synchronized
             if self.time_sync_warnings > 0:
@@ -1474,7 +1483,7 @@ class NetworkNode(Node):
         try:
             # Validate protocol version - reject incompatible nodes
             if msg.protocol_version != PROTOCOL_VERSION:
-                self.logger.warning(f"Protocol version mismatch: expected {PROTOCOL_VERSION}, got {msg.protocol_version}")
+                self.logger.warning(f"Protocol version mismatch from {protocol._peer_address}: expected {PROTOCOL_VERSION}, got {msg.protocol_version} (msg_type={msg.msg_type.name})")
                 return msg.create_error_response(f"Protocol version mismatch: expected {PROTOCOL_VERSION}, got {msg.protocol_version}")
 
             if msg.msg_type == QuicMessageType.JOIN_REQUEST:
@@ -1744,7 +1753,7 @@ class NetworkNode(Node):
         from shared.block import Transaction
         transaction = Transaction(
             transaction_id=transaction_id,
-            timestamp=utc_timestamp(),
+            timestamp=network_timestamp(),
             request_h=h,
             request_J=J,
             num_samples=num_samples,
