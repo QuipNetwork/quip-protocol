@@ -201,11 +201,12 @@ class CertificateManager:
             x509.NameAttribute(NameOID.COMMON_NAME, hostname),
         ])
 
-        # Build Subject Alternative Names
+        # Build Subject Alternative Names (IPv4 and IPv6 localhost)
         san_list = [
             x509.DNSName(hostname),
             x509.DNSName("localhost"),
             x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+            x509.IPAddress(ipaddress.IPv6Address("::1")),
         ]
 
         # Add domain if different from hostname
@@ -249,14 +250,26 @@ class CertificateManager:
 
     def _is_port_available(self, port: int) -> bool:
         """
-        Check if a port is available for binding.
+        Check if a port is available for binding on both IPv4 and IPv6.
 
         Args:
             port: Port number to check
 
         Returns:
-            True if port can be bound, False otherwise
+            True if port can be bound on at least one address family, False otherwise
         """
+        # Try IPv6 with dual-stack first (covers both IPv4 and IPv6 on most systems)
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # Enable dual-stack mode (accept both IPv4 and IPv6)
+                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                s.bind(('::', port))
+                return True
+        except OSError:
+            pass
+
+        # Fallback to IPv4-only check
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

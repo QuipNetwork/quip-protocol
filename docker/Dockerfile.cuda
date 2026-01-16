@@ -70,10 +70,11 @@ COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # Quip environment variables with defaults
+# QUIP_LISTEN=:: enables dual-stack (both IPv4 and IPv6)
 ENV QUIP_MODE=gpu
 ENV QUIP_PEERS=nodes.quip.network:20049
 ENV QUIP_PORT=20049
-ENV QUIP_LISTEN=0.0.0.0
+ENV QUIP_LISTEN=::
 ENV QUIP_PUBLIC_HOST=""
 ENV QUIP_NODE_NAME=""
 ENV QUIP_AUTO_MINE=false

@@ -13,7 +13,7 @@ services:
     container_name: quip-cpu-bootstrap
     environment:
       - QUIP_PORT=20049
-      - QUIP_LISTEN=0.0.0.0
+      - QUIP_LISTEN=::
       - QUIP_PUBLIC_HOST=cpu-bootstrap:20049
       - QUIP_NODE_NAME=cpu-bootstrap
       - QUIP_AUTO_MINE=true
@@ -35,7 +35,7 @@ services:
     container_name: quip-cpu-2
     environment:
       - QUIP_PORT=20049
-      - QUIP_LISTEN=0.0.0.0
+      - QUIP_LISTEN=::
       - QUIP_PUBLIC_HOST=cpu-node-2:20049
       - QUIP_NODE_NAME=cpu-node-2
       - QUIP_PEERS=cpu-bootstrap:20049
@@ -56,7 +56,7 @@ services:
     container_name: quip-gpu-1
     environment:
       - QUIP_PORT=20049
-      - QUIP_LISTEN=0.0.0.0
+      - QUIP_LISTEN=::
       - QUIP_PUBLIC_HOST=gpu-node:20049
       - QUIP_NODE_NAME=gpu-node-1
       - QUIP_PEERS=cpu-bootstrap:20049
@@ -78,6 +78,11 @@ services:
 networks:
   quip-net:
     driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+        - subnet: fd00:dead:beef::/64
 
 volumes:
   cpu-bootstrap-data:

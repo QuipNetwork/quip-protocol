@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import ipaddress
 import json
 import math
 import random
@@ -91,10 +92,15 @@ async def get_public_ip() -> Optional[str]:
                     return response.read().decode('utf-8').strip()
 
             ip = await loop.run_in_executor(None, fetch_ip)
-            # Basic validation - check if it looks like an IP
-            if ip and '.' in ip and len(ip.split('.')) == 4:
-                logger.info(f"Detected public IP: {ip}")
-                return ip
+            # Validate using ipaddress module (supports both IPv4 and IPv6)
+            if ip:
+                try:
+                    ipaddress.ip_address(ip)
+                    logger.info(f"Detected public IP: {ip}")
+                    return ip
+                except ValueError:
+                    logger.debug(f"Invalid IP format from {service}: {ip}")
+                    continue
         except Exception as e:
             logger.debug(f"Failed to get IP from {service}: {e}")
             continue
@@ -103,13 +109,22 @@ async def get_public_ip() -> Optional[str]:
     return None
 
 
-def get_local_ip() -> str:
+def get_local_ip(prefer_ipv6: bool = False) -> str:
     """
     Get the local IP address (best guess).
+
+    Args:
+        prefer_ipv6: If True, try IPv6 first, then fall back to IPv4
 
     Returns:
         Local IP address as string
     """
+    if prefer_ipv6:
+        # Try IPv6 first
+        ipv6 = get_local_ipv6()
+        if ipv6:
+            return ipv6
+
     try:
         # Connect to a remote address to determine which local interface would be used
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -120,6 +135,27 @@ def get_local_ip() -> str:
     except Exception:
         # Fallback to localhost
         return "127.0.0.1"
+
+
+def get_local_ipv6() -> Optional[str]:
+    """
+    Get the local IPv6 address (best guess).
+
+    Returns:
+        Local IPv6 address as string, or None if not available
+    """
+    try:
+        # Connect to Google's IPv6 DNS server to determine which local interface would be used
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
+            # Use Google's IPv6 DNS server - we don't actually send data
+            s.connect(("2001:4860:4860::8888", 80))
+            local_ip = s.getsockname()[0]
+            # Filter out link-local addresses (fe80::)
+            if local_ip and not local_ip.startswith('fe80'):
+                return local_ip
+    except Exception:
+        pass
+    return None
 
 
 

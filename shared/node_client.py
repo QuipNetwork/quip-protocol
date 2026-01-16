@@ -30,6 +30,7 @@ from aioquic.quic.events import (
 from shared.block import Block, BlockHeader, MinerInfo
 from shared.version import get_version, PROTOCOL_VERSION
 from shared.time_utils import utc_timestamp_float
+from shared.address_utils import parse_host_port
 
 if TYPE_CHECKING:
     from shared.trust_store import TrustStore
@@ -152,6 +153,7 @@ def generate_self_signed_cert(hostname: str = "localhost", cert_dir: Optional[st
                 x509.DNSName(hostname),
                 x509.DNSName("localhost"),
                 x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+                x509.IPAddress(ipaddress.IPv6Address("::1")),
             ]),
             critical=False,
         )
@@ -393,8 +395,7 @@ class NodeClient:
             # Clean up old connection if exists
             await self._close_connection(host)
 
-            addr, port = (host.rsplit(':', 1) if ':' in host else (host, DEFAULT_QUIC_PORT))
-            port = int(port) if isinstance(port, str) else port
+            addr, port = parse_host_port(host, DEFAULT_QUIC_PORT)
 
             configuration = QuicConfiguration(
                 is_client=True,
