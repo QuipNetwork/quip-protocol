@@ -23,10 +23,14 @@ from typing import Dict, List, Optional, Set, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tutte_test.tutte_to_ising import (GraphBuilder, TuttePolynomial,
-                                       compute_tutte_polynomial,
-                                       create_complete_graph,
-                                       create_cycle_graph, create_path_graph)
+from tutte_test.tutte_utils import (
+    GraphBuilder,
+    TuttePolynomial,
+    compute_tutte_polynomial,
+    create_complete_graph,
+    create_cycle_graph,
+    create_path_graph,
+)
 
 # =============================================================================
 # ENUMS AND DATA CLASSES

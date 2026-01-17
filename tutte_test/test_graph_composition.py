@@ -19,13 +19,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import networkx as nx
 
-from tutte_test.tutte_to_ising import (
+from tutte_test.tutte_utils import (
     TuttePolynomial,
     GraphBuilder,
     compute_tutte_polynomial,
     create_path_graph,
     create_cycle_graph,
     create_complete_graph,
+    networkx_to_graphbuilder,
 )
 from tutte_test.graph_composition import (
     disjoint_union,
@@ -46,7 +47,6 @@ from tutte_test.graph_composition import (
     tutte_disjoint_union,
     tutte_cut_vertex,
 )
-from tutte_test.tutte_utils import networkx_to_graphbuilder
 
 
 # =============================================================================
@@ -312,7 +312,7 @@ class TestRainbowTableConsistency(unittest.TestCase):
     def setUpClass(cls):
         """Load rainbow table once for all tests."""
         try:
-            from tutte_test.rainbow_table import RainbowTable
+            from tutte_test.build_rainbow_table import RainbowTable
             table_path = os.path.join(os.path.dirname(__file__), 'tutte_rainbow_table.json')
             cls.rainbow_table = RainbowTable.load(table_path)
         except Exception as e:
@@ -406,7 +406,7 @@ class TestCompositionWithRainbowTable(unittest.TestCase):
     def setUpClass(cls):
         """Load rainbow table."""
         try:
-            from tutte_test.rainbow_table import RainbowTable
+            from tutte_test.build_rainbow_table import RainbowTable
             table_path = os.path.join(os.path.dirname(__file__), 'tutte_rainbow_table.json')
             cls.rainbow_table = RainbowTable.load(table_path)
         except Exception:

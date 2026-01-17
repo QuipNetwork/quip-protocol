@@ -1,15 +1,15 @@
 """
-Tutte Polynomial Rainbow Table
+Tutte Polynomial Rainbow Table Builder
 
 Pre-compute and store Tutte polynomials for graph minors.
 Use for rapid lookup when analyzing larger graphs.
 
 Usage:
     # Build and save table
-    python -m tutte_test.rainbow_table
+    python -m tutte_test.build_rainbow_table
 
     # Use in code
-    from tutte_test.rainbow_table import RainbowTable
+    from tutte_test.build_rainbow_table import RainbowTable
     table = RainbowTable.load('tutte_test/tutte_rainbow_table.json')
     poly = table.lookup_by_name('K_4')
 """
@@ -27,10 +27,13 @@ import networkx as nx
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.setrecursionlimit(200000)
 
-from tutte_test.tutte_to_ising import (GraphBuilder, TuttePolynomial,
-                                       compute_tutte_polynomial)
-from tutte_test.tutte_utils import (graph_to_canonical_key,
-                                    networkx_to_graphbuilder)
+from tutte_test.tutte_utils import (
+    GraphBuilder,
+    TuttePolynomial,
+    compute_tutte_polynomial,
+    graph_to_canonical_key,
+    networkx_to_graphbuilder,
+)
 
 # Check D-Wave availability
 try:

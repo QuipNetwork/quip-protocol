@@ -37,7 +37,7 @@ from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tutte_test.tutte_to_ising import (
+from tutte_test.tutte_utils import (
     TuttePolynomial,
     GraphBuilder,
     compute_tutte_polynomial,
@@ -610,6 +610,69 @@ def _manual_k3_synthesis() -> SynthesisPlan:
 
 
 # =============================================================================
+# SPECIALIZED GRAPH SYNTHESIS
+# =============================================================================
+
+def synthesize_zephyr_z11() -> Tuple[GraphBuilder, TuttePolynomial, Dict]:
+    """
+    Synthesize Zephyr Z(1,1) from K_4 core + C_8 periphery + spoke connections.
+
+    Z(1,1) can be constructed as a composition of:
+    1. K_4 (complete graph on 4 nodes) as inner core
+    2. C_8 (8-cycle) as outer periphery
+    3. 8 spoke edges connecting pairs of periphery nodes to each core node
+
+    Structure:
+        Periphery: 0-1-2-3-4-5-6-7-0 (8-cycle)
+        Core: 8-9-10-11 (K_4)
+        Spokes: {0,1}->8, {2,3}->9, {4,5}->10, {6,7}->11
+
+    This creates:
+    - 12 nodes, 22 edges
+    - Degree sequence: [3,3,3,3,3,3,3,3,5,5,5,5]
+    - 69,360 spanning trees
+
+    Returns:
+        Tuple of (graph, tutte_polynomial, edge_info_dict)
+    """
+    g = GraphBuilder()
+    nodes = [g.add_node() for _ in range(12)]
+
+    edge_info = {
+        'core': [],      # K_4 edges
+        'cycle': [],     # C_8 edges
+        'spokes': [],    # Connection edges
+    }
+
+    # K_4 core (nodes 8-11): 6 edges
+    for i in range(8, 12):
+        for j in range(i+1, 12):
+            g.add_edge(nodes[i], nodes[j])
+            edge_info['core'].append((i, j))
+
+    # C_8 periphery (nodes 0-7): 8 edges
+    for i in range(8):
+        g.add_edge(nodes[i], nodes[(i+1) % 8])
+        edge_info['cycle'].append((i, (i+1) % 8))
+
+    # Spoke connections (periphery to core): 8 edges
+    # Each core node connects to 2 adjacent periphery nodes
+    spoke_pairs = [
+        (0, 8), (1, 8),   # nodes 0,1 connect to core node 8
+        (2, 9), (3, 9),   # nodes 2,3 connect to core node 9
+        (4, 10), (5, 10), # nodes 4,5 connect to core node 10
+        (6, 11), (7, 11), # nodes 6,7 connect to core node 11
+    ]
+    for u, v in spoke_pairs:
+        g.add_edge(nodes[u], nodes[v])
+        edge_info['spokes'].append((u, v))
+
+    poly = compute_tutte_polynomial(g)
+
+    return g, poly, edge_info
+
+
+# =============================================================================
 # RAINBOW TABLE INTEGRATION
 # =============================================================================
 
@@ -625,7 +688,7 @@ def find_motif_for_polynomial(
     if rainbow_table is None:
         # Try to load default table
         try:
-            from tutte_test.rainbow_table import RainbowTable
+            from tutte_test.build_rainbow_table import RainbowTable
             table_path = os.path.join(os.path.dirname(__file__), 'tutte_rainbow_table.json')
             rainbow_table = RainbowTable.load(table_path)
         except Exception:
@@ -692,7 +755,7 @@ def suggest_motifs_for_synthesis(
 
     if rainbow_table is None:
         try:
-            from tutte_test.rainbow_table import RainbowTable
+            from tutte_test.build_rainbow_table import RainbowTable
             table_path = os.path.join(os.path.dirname(__file__), 'tutte_rainbow_table.json')
             rainbow_table = RainbowTable.load(table_path)
         except Exception:
@@ -762,7 +825,7 @@ class SynthesisEngine:
         # Load rainbow table
         if rainbow_table is None:
             try:
-                from tutte_test.rainbow_table import RainbowTable
+                from tutte_test.build_rainbow_table import RainbowTable
                 table_path = os.path.join(os.path.dirname(__file__), 'tutte_rainbow_table.json')
                 self.rainbow_table = RainbowTable.load(table_path)
             except Exception as e:
@@ -1276,7 +1339,7 @@ def verify_against_rainbow_table():
     print("=" * 70)
 
     try:
-        from tutte_test.rainbow_table import RainbowTable
+        from tutte_test.build_rainbow_table import RainbowTable
         table_path = os.path.join(os.path.dirname(__file__), 'tutte_rainbow_table.json')
         rainbow_table = RainbowTable.load(table_path)
     except Exception as e:
@@ -1527,7 +1590,7 @@ def demo_rainbow_table_synthesis():
     print("=" * 70)
 
     try:
-        from tutte_test.rainbow_table import RainbowTable
+        from tutte_test.build_rainbow_table import RainbowTable
         table_path = os.path.join(os.path.dirname(__file__), 'tutte_rainbow_table.json')
         rainbow_table = RainbowTable.load(table_path)
         print(f"Loaded rainbow table with {len(rainbow_table)} entries")
@@ -1632,7 +1695,7 @@ def demo_efficient_synthesis():
 
     # Load rainbow table for test targets
     try:
-        from tutte_test.rainbow_table import RainbowTable
+        from tutte_test.build_rainbow_table import RainbowTable
         table_path = os.path.join(os.path.dirname(__file__), 'tutte_rainbow_table.json')
         rainbow_table = RainbowTable.load(table_path)
     except Exception as e:
@@ -1892,7 +1955,7 @@ def demo_complex_synthesis():
     # Test 5: Attempt Petersen graph (challenging)
     print("\n--- Test 5: Petersen graph synthesis ---")
     try:
-        from tutte_test.rainbow_table import RainbowTable
+        from tutte_test.build_rainbow_table import RainbowTable
         table_path = os.path.join(os.path.dirname(__file__), 'tutte_rainbow_table.json')
         rt = RainbowTable.load(table_path)
         petersen_entry = rt.get_entry('Petersen')

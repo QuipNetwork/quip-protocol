@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tutte_test.tutte_to_ising import TuttePolynomial
+from tutte_test.tutte_utils import TuttePolynomial
 
 
 class JoinOperation(Enum):
