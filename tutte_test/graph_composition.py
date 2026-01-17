@@ -3,7 +3,7 @@ Graph Composition and Synthesis for Tutte Polynomials.
 
 This module provides:
 1. Graph composition operations (disjoint union, cut vertex, 2-sum, clique-sum, products)
-2. Graph synthesis from motifs (building graphs with desired Tutte polynomial properties)
+2. Graph synthesis from minors (building graphs with desired Tutte polynomial properties)
 3. Analysis utilities (cut vertices, bridges, connectivity)
 
 Key theoretical results:
@@ -13,25 +13,20 @@ Key theoretical results:
 - k-clique sum: Glue on k-clique, formula depends on structure
 """
 
-import sys
-import os
-import json
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Dict, Set
-from enum import Enum
 import itertools
+import json
+import os
+import sys
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional, Set, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tutte_test.tutte_to_ising import (
-    TuttePolynomial,
-    GraphBuilder,
-    compute_tutte_polynomial,
-    create_path_graph,
-    create_cycle_graph,
-    create_complete_graph,
-)
-
+from tutte_test.tutte_to_ising import (GraphBuilder, TuttePolynomial,
+                                       compute_tutte_polynomial,
+                                       create_complete_graph,
+                                       create_cycle_graph, create_path_graph)
 
 # =============================================================================
 # ENUMS AND DATA CLASSES
@@ -63,7 +58,7 @@ class CompositionResult:
 
 @dataclass
 class SynthesizedGraph:
-    """A graph built from motif composition."""
+    """A graph built from minor composition."""
     graph: GraphBuilder
     tutte: TuttePolynomial
     recipe: List[str]  # Description of how it was built
@@ -619,6 +614,149 @@ def decompose_at_cut_vertex(g: GraphBuilder, v: int) -> List[GraphBuilder]:
     return subgraphs
 
 
+def analyze_k_cuts(g: GraphBuilder, max_k: int = 3) -> Dict[int, List[Tuple]]:
+    """
+    Analyze what k-cuts exist in a graph.
+
+    A k-cut is a set of k edges whose removal disconnects the graph.
+    Also identifies cut vertices (1-vertex cuts).
+
+    Args:
+        g: Graph to analyze
+        max_k: Maximum k to analyze (default 3)
+
+    Returns:
+        Dict mapping k -> list of k-cuts found.
+        Each cut is a tuple like ('edge', edge_id, endpoints) or ('vertex', v).
+    """
+    cuts = {k: [] for k in range(1, max_k + 1)}
+
+    # 1-cuts: bridges (edge cuts) and cut vertices
+    bridges = find_bridges(g)
+    for edge_id in bridges:
+        cuts[1].append(('edge', edge_id, g.edges[edge_id]))
+
+    cut_verts = find_cut_vertices(g)
+    for v in cut_verts:
+        cuts[1].append(('vertex', v))
+
+    if max_k < 2:
+        return cuts
+
+    # 2-cuts: pairs of edges whose removal disconnects
+    edges = list(g.edges.keys())
+    for i, e1 in enumerate(edges):
+        for e2 in edges[i+1:]:
+            if _is_k_edge_cut(g, [e1, e2]):
+                cuts[2].append(('edges', e1, e2))
+
+    if max_k < 3:
+        return cuts
+
+    # 3-cuts: only compute for small graphs (expensive)
+    if g.num_edges() <= 15:
+        for i, e1 in enumerate(edges):
+            for j, e2 in enumerate(edges[i+1:], i+1):
+                for e3 in edges[j+1:]:
+                    if _is_k_edge_cut(g, [e1, e2, e3]):
+                        cuts[3].append(('edges', e1, e2, e3))
+
+    return cuts
+
+
+def _is_k_edge_cut(g: GraphBuilder, edge_ids: List[int]) -> bool:
+    """Check if removing the given edges disconnects the graph."""
+    if g.num_nodes() <= 2:
+        return False
+
+    edge_set = set(edge_ids)
+    remaining_edges = {k: v for k, v in g.edges.items() if k not in edge_set}
+
+    if not remaining_edges:
+        return True  # No edges left
+
+    # BFS to check connectivity
+    nodes = set(g.nodes)
+    start = next(iter(nodes))
+    visited = {start}
+    stack = [start]
+
+    while stack:
+        curr = stack.pop()
+        for eid, (a, b) in remaining_edges.items():
+            if a == curr and b not in visited:
+                visited.add(b)
+                stack.append(b)
+            elif b == curr and a not in visited:
+                visited.add(a)
+                stack.append(a)
+
+    return len(visited) < len(nodes)
+
+
+def get_edge_connectivity(g: GraphBuilder) -> int:
+    """
+    Compute the edge connectivity of the graph.
+
+    Edge connectivity is the minimum number of edges whose removal
+    disconnects the graph.
+
+    Returns:
+        Edge connectivity (0 if graph is already disconnected)
+    """
+    if g.num_edges() == 0:
+        return 0
+
+    # Check if already disconnected
+    if not _is_connected(g):
+        return 0
+
+    # Check for bridges (1-connected)
+    if find_bridges(g):
+        return 1
+
+    # Check for 2-cuts
+    edges = list(g.edges.keys())
+    for i, e1 in enumerate(edges):
+        for e2 in edges[i+1:]:
+            if _is_k_edge_cut(g, [e1, e2]):
+                return 2
+
+    # Check for 3-cuts (only for small graphs)
+    if g.num_edges() <= 20:
+        for i, e1 in enumerate(edges):
+            for j, e2 in enumerate(edges[i+1:], i+1):
+                for e3 in edges[j+1:]:
+                    if _is_k_edge_cut(g, [e1, e2, e3]):
+                        return 3
+
+    # If no small cuts found, return a lower bound
+    return 3  # At least 3-edge-connected
+
+
+def _is_connected(g: GraphBuilder) -> bool:
+    """Check if graph is connected."""
+    if g.num_nodes() <= 1:
+        return True
+
+    nodes = set(g.nodes)
+    start = next(iter(nodes))
+    visited = {start}
+    stack = [start]
+
+    while stack:
+        curr = stack.pop()
+        for eid, (a, b) in g.edges.items():
+            if a == curr and b not in visited:
+                visited.add(b)
+                stack.append(b)
+            elif b == curr and a not in visited:
+                visited.add(a)
+                stack.append(a)
+
+    return len(visited) == len(nodes)
+
+
 def verify_composition(op: CompositionOp, g1: GraphBuilder, g2: GraphBuilder,
                        result: GraphBuilder, **kwargs) -> CompositionResult:
     """
@@ -837,7 +975,7 @@ def build_multi_clique_chain(clique_sizes: List[int], overlap: int = 2) -> Synth
 
 def build_zephyr_like(unit_cells: int = 2) -> SynthesizedGraph:
     """
-    Attempt to build a Zephyr-like structure from motifs.
+    Attempt to build a Zephyr-like structure from minors.
 
     Zephyr has:
     - Multiple 8-cycles interconnected
@@ -848,7 +986,7 @@ def build_zephyr_like(unit_cells: int = 2) -> SynthesizedGraph:
     """
     recipe = [f"Zephyr-like construction with {unit_cells} unit cells"]
 
-    # Start with an 8-cycle (common Zephyr motif)
+    # Start with an 8-cycle (common Zephyr minor)
     g = GraphBuilder()
     nodes = [g.add_node() for _ in range(8)]
     for i in range(8):

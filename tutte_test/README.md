@@ -5,6 +5,7 @@ This directory contains tools for analyzing graphs via their Tutte polynomials, 
 ## Overview
 
 The **Tutte polynomial** `T(G; x, y)` is a graph invariant that encodes structural information including:
+
 - Number of spanning trees: `T(1, 1)`
 - Number of spanning forests: `T(2, 1)`
 - Chromatic polynomial evaluations
@@ -18,71 +19,71 @@ For quantum proof-of-work, Tutte polynomials provide a principled way to charact
 
 The smallest Zephyr topology Z(1,1) has been fully characterized:
 
-| Property | Value |
-|----------|-------|
-| Nodes | 12 |
-| Edges | 22 |
-| Spanning trees T(1,1) | **69,360** |
-| Polynomial terms | 68 |
-| x-degree | 11 |
-| y-degree | 11 |
-| Computation time | ~1.4 seconds |
+| Property              | Value        |
+| --------------------- | ------------ |
+| Nodes                 | 12           |
+| Edges                 | 22           |
+| Spanning trees T(1,1) | **69,360**   |
+| Polynomial terms      | 68           |
+| x-degree              | 11           |
+| y-degree              | 11           |
+| Computation time      | ~1.4 seconds |
 
 Full polynomial stored in `z11_tutte_polynomial.json`.
 
 ### Computational Complexity
 
-| Edges | Recursive Calls | Time | Feasibility |
-|-------|-----------------|------|-------------|
-| 12 | 714 | 2ms | Easy |
-| 16 | 2,739 | 15ms | Easy |
-| 20 | 54,300 | 0.37s | Feasible |
-| 22 (Z(1,1)) | 318,170 | 1.4s | Feasible |
-| 13,716 (Z(12,2)) | ~10^4000 | ∞ | **Impossible** |
+| Edges            | Recursive Calls | Time  | Feasibility    |
+| ---------------- | --------------- | ----- | -------------- |
+| 12               | 714             | 2ms   | Easy           |
+| 16               | 2,739           | 15ms  | Easy           |
+| 20               | 54,300          | 0.37s | Feasible       |
+| 22 (Z(1,1))      | 318,170         | 1.4s  | Feasible       |
+| 13,716 (Z(12,2)) | ~10^4000        | ∞     | **Impossible** |
 
 The deletion-contraction algorithm is exponential in edge count, but practical for graphs with ≤25 edges.
 
 ### Rainbow Table
 
-Pre-computed Tutte polynomials for **161 graph motifs** are stored in `tutte_rainbow_table.json`:
+Pre-computed Tutte polynomials for **161 graph minors** are stored in `tutte_rainbow_table.json`:
 
-| Family | Count | Examples |
-|--------|-------|----------|
-| Complete graphs K_n | 7 | K_2 through K_8 |
-| Cycles C_n | 22 | C_3 through C_24 |
-| Paths P_n | 23 | P_2 through P_24 |
-| Complete bipartite | 10 | K_2,2 through K_5,5 |
-| Wheel graphs | 9 | W_3 through W_11 |
-| Grid graphs | 12 | 2×2 through 5×3 |
-| Hypercubes | 3 | Q_1 through Q_3 |
-| Ladder graphs | 7 | Ladder_2 through Ladder_8 |
-| Circulant graphs | 7 | Circ(5,[1,2]) through Circ(11,[1,2]) |
-| Special graphs | 2 | Petersen, Möbius-Kantor |
-| **Zephyr motifs** | 69 | 4-8 node induced subgraphs |
-| **Z(1,1)** | 1 | Complete Zephyr topology |
+| Family              | Count | Examples                             |
+| ------------------- | ----- | ------------------------------------ |
+| Complete graphs K_n | 7     | K_2 through K_8                      |
+| Cycles C_n          | 22    | C_3 through C_24                     |
+| Paths P_n           | 23    | P_2 through P_24                     |
+| Complete bipartite  | 10    | K_2,2 through K_5,5                  |
+| Wheel graphs        | 9     | W_3 through W_11                     |
+| Grid graphs         | 12    | 2×2 through 5×3                      |
+| Hypercubes          | 3     | Q_1 through Q_3                      |
+| Ladder graphs       | 7     | Ladder_2 through Ladder_8            |
+| Circulant graphs    | 7     | Circ(5,[1,2]) through Circ(11,[1,2]) |
+| Special graphs      | 2     | Petersen, Möbius-Kantor              |
+| **Zephyr minors**   | 69    | 4-8 node induced subgraphs           |
+| **Z(1,1)**          | 1     | Complete Zephyr topology             |
 
 ## Files
 
 ### Core Modules
 
-| File | Description |
-|------|-------------|
-| `tutte_to_ising.py` | Core Tutte polynomial computation, graph construction, Ising generation |
+| File                   | Description                                                              |
+| ---------------------- | ------------------------------------------------------------------------ |
+| `tutte_to_ising.py`    | Core Tutte polynomial computation, graph construction, Ising generation  |
 | `tutte_integration.py` | Advanced construction algorithms, polynomial parsing, difficulty scaling |
-| `tutte_utils.py` | Shared utilities (graph conversion, bridge detection, canonical keys) |
+| `tutte_utils.py`       | Shared utilities (graph conversion, bridge detection, canonical keys)    |
 
 ### Rainbow Table
 
-| File | Description |
-|------|-------------|
-| `rainbow_table.py` | Build and query pre-computed Tutte polynomials |
-| `tutte_rainbow_table.json` | Pre-computed polynomials (161 entries, ~122KB) |
-| `z11_tutte_polynomial.json` | Complete Z(1,1) Tutte polynomial |
+| File                        | Description                                    |
+| --------------------------- | ---------------------------------------------- |
+| `rainbow_table.py`          | Build and query pre-computed Tutte polynomials |
+| `tutte_rainbow_table.json`  | Pre-computed polynomials (161 entries, ~122KB) |
+| `z11_tutte_polynomial.json` | Complete Z(1,1) Tutte polynomial               |
 
 ### Integration
 
-| File | Description |
-|------|-------------|
+| File                                | Description                                                         |
+| ----------------------------------- | ------------------------------------------------------------------- |
 | `quantum_proof_of_work_extended.py` | Tutte-aware proof-of-work validation, energy/diversity calculations |
 
 ## Usage
@@ -176,11 +177,13 @@ z11 = get_zephyr_graph(1, 1)
 Tutte polynomials satisfy useful composition rules:
 
 ### Disjoint Union
+
 ```
 T(G₁ ∪ G₂) = T(G₁) × T(G₂)
 ```
 
 ### Deletion-Contraction
+
 ```
 T(G) = T(G-e) + T(G/e)     for regular edge e
 T(G) = x · T(G-e)          for bridge e
@@ -191,7 +194,7 @@ T(G) = y · T(G-e)          for loop e
 
 1. **Computational complexity**: Direct computation infeasible for graphs with >30 edges
 2. **Z(12,2) Zephyr**: 13,716 edges makes exact computation impossible
-3. **Subgraph matching**: Finding motifs in large graphs requires heuristics
+3. **Subgraph matching**: Finding minors in large graphs requires heuristics
 
 ## References
 

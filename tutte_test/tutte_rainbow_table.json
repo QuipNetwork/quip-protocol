@@ -2815,7 +2815,7 @@
       }
     },
     "437c0a": {
-      "name": "Zephyr_motif_4n_0",
+      "name": "Zephyr_minor_4n_0",
       "nodes": 4,
       "edges": 5,
       "spanning_trees": 8,
@@ -2833,7 +2833,7 @@
       }
     },
     "447b670a": {
-      "name": "Zephyr_motif_5n_0",
+      "name": "Zephyr_minor_5n_0",
       "nodes": 5,
       "edges": 6,
       "spanning_trees": 8,
@@ -2851,7 +2851,7 @@
       }
     },
     "457b695f0a": {
-      "name": "Zephyr_motif_6n_0",
+      "name": "Zephyr_minor_6n_0",
       "nodes": 6,
       "edges": 8,
       "spanning_trees": 20,
@@ -2873,7 +2873,7 @@
       }
     },
     "467b61643f0a": {
-      "name": "Zephyr_motif_7n_0",
+      "name": "Zephyr_minor_7n_0",
       "nodes": 7,
       "edges": 9,
       "spanning_trees": 20,
@@ -2895,7 +2895,7 @@
       }
     },
     "477a6144443f0a": {
-      "name": "Zephyr_motif_8n_0",
+      "name": "Zephyr_minor_8n_0",
       "nodes": 8,
       "edges": 11,
       "spanning_trees": 52,
@@ -2922,7 +2922,7 @@
       }
     },
     "437a0a": {
-      "name": "Zephyr_motif_4n_1",
+      "name": "Zephyr_minor_4n_1",
       "nodes": 4,
       "edges": 5,
       "spanning_trees": 8,
@@ -2940,7 +2940,7 @@
       }
     },
     "447a530a": {
-      "name": "Zephyr_motif_5n_1",
+      "name": "Zephyr_minor_5n_1",
       "nodes": 5,
       "edges": 7,
       "spanning_trees": 21,
@@ -2962,7 +2962,7 @@
       }
     },
     "457a545f0a": {
-      "name": "Zephyr_motif_6n_1",
+      "name": "Zephyr_minor_6n_1",
       "nodes": 6,
       "edges": 9,
       "spanning_trees": 52,
@@ -2989,7 +2989,7 @@
       }
     },
     "467a54523f0a": {
-      "name": "Zephyr_motif_7n_1",
+      "name": "Zephyr_minor_7n_1",
       "nodes": 7,
       "edges": 11,
       "spanning_trees": 128,
@@ -3022,7 +3022,7 @@
       }
     },
     "477a5452423f0a": {
-      "name": "Zephyr_motif_8n_1",
+      "name": "Zephyr_minor_8n_1",
       "nodes": 8,
       "edges": 13,
       "spanning_trees": 304,
@@ -3062,7 +3062,7 @@
       }
     },
     "447a670a": {
-      "name": "Zephyr_motif_5n_2",
+      "name": "Zephyr_minor_5n_2",
       "nodes": 5,
       "edges": 7,
       "spanning_trees": 21,
@@ -3084,7 +3084,7 @@
       }
     },
     "457a685f0a": {
-      "name": "Zephyr_motif_6n_2",
+      "name": "Zephyr_minor_6n_2",
       "nodes": 6,
       "edges": 9,
       "spanning_trees": 52,
@@ -3111,7 +3111,7 @@
       }
     },
     "467a69623f0a": {
-      "name": "Zephyr_motif_7n_2",
+      "name": "Zephyr_minor_7n_2",
       "nodes": 7,
       "edges": 11,
       "spanning_trees": 128,
@@ -3144,7 +3144,7 @@
       }
     },
     "477a6962423f0a": {
-      "name": "Zephyr_motif_8n_2",
+      "name": "Zephyr_minor_8n_2",
       "nodes": 8,
       "edges": 13,
       "spanning_trees": 304,
@@ -3184,7 +3184,7 @@
       }
     },
     "436e0a": {
-      "name": "Zephyr_motif_4n_2",
+      "name": "Zephyr_minor_4n_2",
       "nodes": 4,
       "edges": 5,
       "spanning_trees": 8,
@@ -3202,7 +3202,7 @@
       }
     },
     "446e430a": {
-      "name": "Zephyr_motif_5n_3",
+      "name": "Zephyr_minor_5n_3",
       "nodes": 5,
       "edges": 6,
       "spanning_trees": 8,
@@ -3220,7 +3220,7 @@
       }
     },
     "456e534f0a": {
-      "name": "Zephyr_motif_6n_3",
+      "name": "Zephyr_minor_6n_3",
       "nodes": 6,
       "edges": 8,
       "spanning_trees": 20,
@@ -3242,7 +3242,7 @@
       }
     },
     "466e534f5f0a": {
-      "name": "Zephyr_motif_7n_3",
+      "name": "Zephyr_minor_7n_3",
       "nodes": 7,
       "edges": 9,
       "spanning_trees": 20,
@@ -3264,7 +3264,7 @@
       }
     },
     "476e545f5f5f0a": {
-      "name": "Zephyr_motif_8n_3",
+      "name": "Zephyr_minor_8n_3",
       "nodes": 8,
       "edges": 11,
       "spanning_trees": 52,
@@ -3291,7 +3291,7 @@
       }
     },
     "445a6b0a": {
-      "name": "Zephyr_motif_5n_4",
+      "name": "Zephyr_minor_5n_4",
       "nodes": 5,
       "edges": 7,
       "spanning_trees": 21,
@@ -3313,7 +3313,7 @@
       }
     },
     "455a6b6f0a": {
-      "name": "Zephyr_motif_6n_4",
+      "name": "Zephyr_minor_6n_4",
       "nodes": 6,
       "edges": 9,
       "spanning_trees": 52,
@@ -3340,7 +3340,7 @@
       }
     },
     "465a6b685f0a": {
-      "name": "Zephyr_motif_7n_4",
+      "name": "Zephyr_minor_7n_4",
       "nodes": 7,
       "edges": 11,
       "spanning_trees": 128,
@@ -3373,7 +3373,7 @@
       }
     },
     "475a6b68605f0a": {
-      "name": "Zephyr_motif_8n_4",
+      "name": "Zephyr_minor_8n_4",
       "nodes": 8,
       "edges": 13,
       "spanning_trees": 304,
@@ -3413,7 +3413,7 @@
       }
     },
     "45587b470a": {
-      "name": "Zephyr_motif_6n_5",
+      "name": "Zephyr_minor_6n_5",
       "nodes": 6,
       "edges": 8,
       "spanning_trees": 20,
@@ -3435,7 +3435,7 @@
       }
     },
     "46587b474f0a": {
-      "name": "Zephyr_motif_7n_5",
+      "name": "Zephyr_minor_7n_5",
       "nodes": 7,
       "edges": 9,
       "spanning_trees": 20,
@@ -3457,7 +3457,7 @@
       }
     },
     "47587b485f4f0a": {
-      "name": "Zephyr_motif_8n_5",
+      "name": "Zephyr_minor_8n_5",
       "nodes": 8,
       "edges": 11,
       "spanning_trees": 52,
@@ -3484,7 +3484,7 @@
       }
     },
     "457b69670a": {
-      "name": "Zephyr_motif_6n_6",
+      "name": "Zephyr_minor_6n_6",
       "nodes": 6,
       "edges": 9,
       "spanning_trees": 40,
@@ -3508,7 +3508,7 @@
       }
     },
     "467b6564470a": {
-      "name": "Zephyr_motif_7n_6",
+      "name": "Zephyr_minor_7n_6",
       "nodes": 7,
       "edges": 11,
       "spanning_trees": 120,
@@ -3541,7 +3541,7 @@
       }
     },
     "477b65644c3f0a": {
-      "name": "Zephyr_motif_8n_6",
+      "name": "Zephyr_minor_8n_6",
       "nodes": 8,
       "edges": 13,
       "spanning_trees": 288,
@@ -3582,7 +3582,7 @@
       }
     },
     "46664e576f0a": {
-      "name": "Zephyr_motif_7n_7",
+      "name": "Zephyr_minor_7n_7",
       "nodes": 7,
       "edges": 12,
       "spanning_trees": 256,
@@ -3619,7 +3619,7 @@
       }
     },
     "47664e576f730a": {
-      "name": "Zephyr_motif_8n_7",
+      "name": "Zephyr_minor_8n_7",
       "nodes": 8,
       "edges": 15,
       "spanning_trees": 1216,
@@ -3666,7 +3666,7 @@
       }
     },
     "467a696a3f0a": {
-      "name": "Zephyr_motif_7n_8",
+      "name": "Zephyr_minor_7n_8",
       "nodes": 7,
       "edges": 12,
       "spanning_trees": 256,
@@ -3703,7 +3703,7 @@
       }
     },
     "477a696a42430a": {
-      "name": "Zephyr_motif_8n_8",
+      "name": "Zephyr_minor_8n_8",
       "nodes": 8,
       "edges": 15,
       "spanning_trees": 1216,
@@ -3750,7 +3750,7 @@
       }
     },
     "44507b0a": {
-      "name": "Zephyr_motif_5n_5",
+      "name": "Zephyr_minor_5n_5",
       "nodes": 5,
       "edges": 6,
       "spanning_trees": 8,
@@ -3768,7 +3768,7 @@
       }
     },
     "456546770a": {
-      "name": "Zephyr_motif_6n_7",
+      "name": "Zephyr_minor_6n_7",
       "nodes": 6,
       "edges": 9,
       "spanning_trees": 40,
@@ -3792,7 +3792,7 @@
       }
     },
     "46654678470a": {
-      "name": "Zephyr_motif_7n_9",
+      "name": "Zephyr_minor_7n_9",
       "nodes": 7,
       "edges": 11,
       "spanning_trees": 120,
@@ -3825,7 +3825,7 @@
       }
     },
     "475f774e77630a": {
-      "name": "Zephyr_motif_8n_9",
+      "name": "Zephyr_minor_8n_9",
       "nodes": 8,
       "edges": 13,
       "spanning_trees": 288,
@@ -3866,7 +3866,7 @@
       }
     },
     "446a530a": {
-      "name": "Zephyr_motif_5n_6",
+      "name": "Zephyr_minor_5n_6",
       "nodes": 5,
       "edges": 6,
       "spanning_trees": 8,
@@ -3884,7 +3884,7 @@
       }
     },
     "456a54570a": {
-      "name": "Zephyr_motif_6n_8",
+      "name": "Zephyr_minor_6n_8",
       "nodes": 6,
       "edges": 9,
       "spanning_trees": 40,
@@ -3908,7 +3908,7 @@
       }
     },
     "46784b68570a": {
-      "name": "Zephyr_motif_7n_10",
+      "name": "Zephyr_minor_7n_10",
       "nodes": 7,
       "edges": 11,
       "spanning_trees": 120,
@@ -3941,7 +3941,7 @@
       }
     },
     "47784b68584f0a": {
-      "name": "Zephyr_motif_8n_10",
+      "name": "Zephyr_minor_8n_10",
       "nodes": 8,
       "edges": 13,
       "spanning_trees": 288,
@@ -3982,7 +3982,7 @@
       }
     },
     "46606f4e770a": {
-      "name": "Zephyr_motif_7n_11",
+      "name": "Zephyr_minor_7n_11",
       "nodes": 7,
       "edges": 11,
       "spanning_trees": 120,
@@ -4015,7 +4015,7 @@
       }
     },
     "475f465f4e7b0a": {
-      "name": "Zephyr_motif_8n_11",
+      "name": "Zephyr_minor_8n_11",
       "nodes": 8,
       "edges": 13,
       "spanning_trees": 288,
@@ -4056,7 +4056,7 @@
       }
     },
     "456a544f0a": {
-      "name": "Zephyr_motif_6n_9",
+      "name": "Zephyr_minor_6n_9",
       "nodes": 6,
       "edges": 8,
       "spanning_trees": 20,
@@ -4078,7 +4078,7 @@
       }
     },
     "46584b684f0a": {
-      "name": "Zephyr_motif_7n_12",
+      "name": "Zephyr_minor_7n_12",
       "nodes": 7,
       "edges": 9,
       "spanning_trees": 20,
@@ -4100,7 +4100,7 @@
       }
     },
     "47584b68584f0a": {
-      "name": "Zephyr_motif_8n_12",
+      "name": "Zephyr_minor_8n_12",
       "nodes": 8,
       "edges": 12,
       "spanning_trees": 96,
@@ -4130,7 +4130,7 @@
       }
     },
     "46464e576f0a": {
-      "name": "Zephyr_motif_7n_13",
+      "name": "Zephyr_minor_7n_13",
       "nodes": 7,
       "edges": 11,
       "spanning_trees": 128,
@@ -4163,7 +4163,7 @@
       }
     },
     "47464e576f6f0a": {
-      "name": "Zephyr_motif_8n_13",
+      "name": "Zephyr_minor_8n_13",
       "nodes": 8,
       "edges": 13,
       "spanning_trees": 304,
@@ -4203,7 +4203,7 @@
       }
     },
     "454546770a": {
-      "name": "Zephyr_motif_6n_10",
+      "name": "Zephyr_minor_6n_10",
       "nodes": 6,
       "edges": 8,
       "spanning_trees": 20,
@@ -4225,7 +4225,7 @@
       }
     },
     "463f6f4e770a": {
-      "name": "Zephyr_motif_7n_14",
+      "name": "Zephyr_minor_7n_14",
       "nodes": 7,
       "edges": 9,
       "spanning_trees": 20,
@@ -4247,7 +4247,7 @@
       }
     },
     "475f425f4e7b0a": {
-      "name": "Zephyr_motif_8n_14",
+      "name": "Zephyr_minor_8n_14",
       "nodes": 8,
       "edges": 12,
       "spanning_trees": 96,
@@ -4277,7 +4277,7 @@
       }
     },
     "44585b0a": {
-      "name": "Zephyr_motif_5n_7",
+      "name": "Zephyr_minor_5n_7",
       "nodes": 5,
       "edges": 6,
       "spanning_trees": 8,
@@ -4295,7 +4295,7 @@
       }
     },
     "45585b670a": {
-      "name": "Zephyr_motif_6n_11",
+      "name": "Zephyr_minor_6n_11",
       "nodes": 6,
       "edges": 8,
       "spanning_trees": 20,
@@ -4317,7 +4317,7 @@
       }
     },
     "46464377670a": {
-      "name": "Zephyr_motif_7n_15",
+      "name": "Zephyr_minor_7n_15",
       "nodes": 7,
       "edges": 9,
       "spanning_trees": 20,
@@ -4339,7 +4339,7 @@
       }
     },
     "47407b4877530a": {
-      "name": "Zephyr_motif_8n_15",
+      "name": "Zephyr_minor_8n_15",
       "nodes": 8,
       "edges": 12,
       "spanning_trees": 96,
@@ -4369,7 +4369,7 @@
       }
     },
     "446e4b0a": {
-      "name": "Zephyr_motif_5n_8",
+      "name": "Zephyr_minor_5n_8",
       "nodes": 5,
       "edges": 7,
       "spanning_trees": 21,
@@ -4391,7 +4391,7 @@
       }
     },
     "456e4b6f0a": {
-      "name": "Zephyr_motif_6n_12",
+      "name": "Zephyr_minor_6n_12",
       "nodes": 6,
       "edges": 9,
       "spanning_trees": 52,
@@ -4418,7 +4418,7 @@
       }
     },
     "466e4c505f0a": {
-      "name": "Zephyr_motif_7n_16",
+      "name": "Zephyr_minor_7n_16",
       "nodes": 7,
       "edges": 11,
       "spanning_trees": 128,
@@ -4451,7 +4451,7 @@
       }
     },
     "476e4c50605f0a": {
-      "name": "Zephyr_motif_8n_16",
+      "name": "Zephyr_minor_8n_16",
       "nodes": 8,
       "edges": 13,
       "spanning_trees": 304,
@@ -4491,7 +4491,7 @@
       }
     },
     "454e44770a": {
-      "name": "Zephyr_motif_6n_13",
+      "name": "Zephyr_minor_6n_13",
       "nodes": 6,
       "edges": 9,
       "spanning_trees": 40,
@@ -4515,7 +4515,7 @@
       }
     },
     "46607b48770a": {
-      "name": "Zephyr_motif_7n_17",
+      "name": "Zephyr_minor_7n_17",
       "nodes": 7,
       "edges": 11,
       "spanning_trees": 120,
@@ -4548,7 +4548,7 @@
       }
     },
     "47604277487b0a": {
-      "name": "Zephyr_motif_8n_17",
+      "name": "Zephyr_minor_8n_17",
       "nodes": 8,
       "edges": 13,
       "spanning_trees": 288,
@@ -4589,7 +4589,7 @@
       }
     },
     "47777b77575b0a": {
-      "name": "Zephyr_motif_8n_18",
+      "name": "Zephyr_minor_8n_18",
       "nodes": 8,
       "edges": 15,
       "spanning_trees": 1216,
@@ -4636,7 +4636,7 @@
       }
     },
     "46787b576f0a": {
-      "name": "Zephyr_motif_7n_18",
+      "name": "Zephyr_minor_7n_18",
       "nodes": 7,
       "edges": 12,
       "spanning_trees": 256,
@@ -4673,7 +4673,7 @@
       }
     },
     "474a6677575b0a": {
-      "name": "Zephyr_motif_8n_19",
+      "name": "Zephyr_minor_8n_19",
       "nodes": 8,
       "edges": 15,
       "spanning_trees": 1216,
@@ -4720,7 +4720,7 @@
       }
     },
     "435e0a": {
-      "name": "Zephyr_motif_4n_3",
+      "name": "Zephyr_minor_4n_3",
       "nodes": 4,
       "edges": 5,
       "spanning_trees": 8,
@@ -4738,7 +4738,7 @@
       }
     },
     "45465d570a": {
-      "name": "Zephyr_motif_6n_14",
+      "name": "Zephyr_minor_6n_14",
       "nodes": 6,
       "edges": 9,
       "spanning_trees": 52,
@@ -4765,7 +4765,7 @@
       }
     },
     "465f7b7d570a": {
-      "name": "Zephyr_motif_7n_19",
+      "name": "Zephyr_minor_7n_19",
       "nodes": 7,
       "edges": 12,
       "spanning_trees": 256,
@@ -4802,7 +4802,7 @@
       }
     },
     "476042787d4b0a": {
-      "name": "Zephyr_motif_8n_20",
+      "name": "Zephyr_minor_8n_20",
       "nodes": 8,
       "edges": 15,
       "spanning_trees": 1216,
@@ -4929,7 +4929,7 @@
       }
     },
     "447e6f0a": {
-      "name": "Pegasus_motif_5n_0",
+      "name": "Pegasus_minor_5n_0",
       "nodes": 5,
       "edges": 8,
       "spanning_trees": 40,
@@ -4953,7 +4953,7 @@
       }
     },
     "457e72470a": {
-      "name": "Pegasus_motif_6n_0",
+      "name": "Pegasus_minor_6n_0",
       "nodes": 6,
       "edges": 11,
       "spanning_trees": 192,
@@ -4984,7 +4984,7 @@
       }
     },
     "46667e66470a": {
-      "name": "Pegasus_motif_7n_0",
+      "name": "Pegasus_minor_7n_0",
       "nodes": 7,
       "edges": 15,
       "spanning_trees": 1800,
@@ -5025,7 +5025,7 @@
       }
     },
     "47607e7e66630a": {
-      "name": "Pegasus_motif_8n_0",
+      "name": "Pegasus_minor_8n_0",
       "nodes": 8,
       "edges": 20,
       "spanning_trees": 20736,
@@ -5080,7 +5080,7 @@
       }
     },
     "485f465d7e72780a": {
-      "name": "Pegasus_motif_9n_0",
+      "name": "Pegasus_minor_9n_0",
       "nodes": 9,
       "edges": 22,
       "spanning_trees": 48384,
@@ -5150,7 +5150,7 @@
       }
     },
     "48607e7e66634b0a": {
-      "name": "Pegasus_motif_9n_1",
+      "name": "Pegasus_minor_9n_1",
       "nodes": 9,
       "edges": 22,
       "spanning_trees": 48384,
@@ -5220,7 +5220,7 @@
       }
     },
     "44667b0a": {
-      "name": "Pegasus_motif_5n_1",
+      "name": "Pegasus_minor_5n_1",
       "nodes": 5,
       "edges": 8,
       "spanning_trees": 40,
@@ -5244,7 +5244,7 @@
       }
     },
     "45667b770a": {
-      "name": "Pegasus_motif_6n_1",
+      "name": "Pegasus_minor_6n_1",
       "nodes": 6,
       "edges": 11,
       "spanning_trees": 192,
@@ -5275,7 +5275,7 @@
       }
     },
     "46667b776f0a": {
-      "name": "Pegasus_motif_7n_1",
+      "name": "Pegasus_minor_7n_1",
       "nodes": 7,
       "edges": 13,
       "spanning_trees": 448,
@@ -5314,7 +5314,7 @@
       }
     },
     "47667b776f730a": {
-      "name": "Pegasus_motif_8n_1",
+      "name": "Pegasus_minor_8n_1",
       "nodes": 8,
       "edges": 16,
       "spanning_trees": 2048,
@@ -5363,7 +5363,7 @@
       }
     },
     "48667b776f73570a": {
-      "name": "Pegasus_motif_9n_2",
+      "name": "Pegasus_minor_9n_2",
       "nodes": 9,
       "edges": 18,
       "spanning_trees": 4608,
@@ -5423,7 +5423,7 @@
       }
     },
     "45607e770a": {
-      "name": "Pegasus_motif_6n_2",
+      "name": "Pegasus_minor_6n_2",
       "nodes": 6,
       "edges": 11,
       "spanning_trees": 192,
@@ -5454,7 +5454,7 @@
       }
     },
     "46607e77570a": {
-      "name": "Pegasus_motif_7n_2",
+      "name": "Pegasus_minor_7n_2",
       "nodes": 7,
       "edges": 13,
       "spanning_trees": 448,
@@ -5493,7 +5493,7 @@
       }
     },
     "47607e77575b0a": {
-      "name": "Pegasus_motif_8n_2",
+      "name": "Pegasus_minor_8n_2",
       "nodes": 8,
       "edges": 16,
       "spanning_trees": 2048,
@@ -5542,7 +5542,7 @@
       }
     },
     "48607e77575b4b0a": {
-      "name": "Pegasus_motif_9n_3",
+      "name": "Pegasus_minor_9n_3",
       "nodes": 9,
       "edges": 18,
       "spanning_trees": 4608,
@@ -5602,7 +5602,7 @@
       }
     },
     "4660427e770a": {
-      "name": "Pegasus_motif_7n_3",
+      "name": "Pegasus_minor_7n_3",
       "nodes": 7,
       "edges": 13,
       "spanning_trees": 448,
@@ -5641,7 +5641,7 @@
       }
     },
     "47603f4e7e7b0a": {
-      "name": "Pegasus_motif_8n_3",
+      "name": "Pegasus_minor_8n_3",
       "nodes": 8,
       "edges": 16,
       "spanning_trees": 2048,
@@ -5690,7 +5690,7 @@
       }
     },
     "48603f4e7e7b420a": {
-      "name": "Pegasus_motif_9n_4",
+      "name": "Pegasus_minor_9n_4",
       "nodes": 9,
       "edges": 18,
       "spanning_trees": 4608,
@@ -5750,7 +5750,7 @@
       }
     },
     "447e4b0a": {
-      "name": "Pegasus_motif_5n_2",
+      "name": "Pegasus_minor_5n_2",
       "nodes": 5,
       "edges": 8,
       "spanning_trees": 40,
@@ -5774,7 +5774,7 @@
       }
     },
     "457e4b770a": {
-      "name": "Pegasus_motif_6n_3",
+      "name": "Pegasus_minor_6n_3",
       "nodes": 6,
       "edges": 11,
       "spanning_trees": 192,
@@ -5805,7 +5805,7 @@
       }
     },
     "467e4b785f0a": {
-      "name": "Pegasus_motif_7n_4",
+      "name": "Pegasus_minor_7n_4",
       "nodes": 7,
       "edges": 13,
       "spanning_trees": 448,
@@ -5844,7 +5844,7 @@
       }
     },
     "477e4b7860630a": {
-      "name": "Pegasus_motif_8n_4",
+      "name": "Pegasus_minor_8n_4",
       "nodes": 8,
       "edges": 16,
       "spanning_trees": 2048,
@@ -5893,7 +5893,7 @@
       }
     },
     "487e4b7860636f0a": {
-      "name": "Pegasus_motif_9n_5",
+      "name": "Pegasus_minor_9n_5",
       "nodes": 9,
       "edges": 18,
       "spanning_trees": 4608,
@@ -5953,7 +5953,7 @@
       }
     },
     "464e7b57770a": {
-      "name": "Pegasus_motif_7n_5",
+      "name": "Pegasus_minor_7n_5",
       "nodes": 7,
       "edges": 13,
       "spanning_trees": 448,
@@ -5992,7 +5992,7 @@
       }
     },
     "485f467e774b460a": {
-      "name": "Pegasus_motif_9n_6",
+      "name": "Pegasus_minor_9n_6",
       "nodes": 9,
       "edges": 18,
       "spanning_trees": 4608,
@@ -6052,7 +6052,7 @@
       }
     },
     "4847433f4e7e7e0a": {
-      "name": "Pegasus_motif_9n_7",
+      "name": "Pegasus_minor_9n_7",
       "nodes": 9,
       "edges": 18,
       "spanning_trees": 4608,
@@ -6112,7 +6112,7 @@
       }
     },
     "444e7b0a": {
-      "name": "Pegasus_motif_5n_3",
+      "name": "Pegasus_minor_5n_3",
       "nodes": 5,
       "edges": 8,
       "spanning_trees": 40,
@@ -6136,7 +6136,7 @@
       }
     },
     "46607e76670a": {
-      "name": "Pegasus_motif_7n_6",
+      "name": "Pegasus_minor_7n_6",
       "nodes": 7,
       "edges": 15,
       "spanning_trees": 1800,
@@ -6177,7 +6177,7 @@
       }
     },
     "4877465d7d72580a": {
-      "name": "Pegasus_motif_9n_8",
+      "name": "Pegasus_minor_9n_8",
       "nodes": 9,
       "edges": 22,
       "spanning_trees": 48384,
@@ -6247,7 +6247,7 @@
       }
     },
     "48607e7e6662700a": {
-      "name": "Pegasus_motif_9n_9",
+      "name": "Pegasus_minor_9n_9",
       "nodes": 9,
       "edges": 24,
       "spanning_trees": 141120,
@@ -6319,7 +6319,7 @@
       }
     },
     "467b647a770a": {
-      "name": "Pegasus_motif_7n_7",
+      "name": "Pegasus_minor_7n_7",
       "nodes": 7,
       "edges": 15,
       "spanning_trees": 1800,
@@ -6360,7 +6360,7 @@
       }
     },
     "477e7248787b0a": {
-      "name": "Pegasus_motif_8n_5",
+      "name": "Pegasus_minor_8n_5",
       "nodes": 8,
       "edges": 20,
       "spanning_trees": 20736,
@@ -6415,7 +6415,7 @@
       }
     },
     "487e7248787b6f0a": {
-      "name": "Pegasus_motif_9n_10",
+      "name": "Pegasus_minor_9n_10",
       "nodes": 9,
       "edges": 22,
       "spanning_trees": 48384,
@@ -6485,7 +6485,7 @@
       }
     },
     "46607e7e5f0a": {
-      "name": "Pegasus_motif_7n_8",
+      "name": "Pegasus_minor_7n_8",
       "nodes": 7,
       "edges": 15,
       "spanning_trees": 1800,
@@ -6526,7 +6526,7 @@
       }
     },
     "48604e5d7d72580a": {
-      "name": "Pegasus_motif_9n_11",
+      "name": "Pegasus_minor_9n_11",
       "nodes": 9,
       "edges": 22,
       "spanning_trees": 48384,
@@ -6596,7 +6596,7 @@
       }
     },
     "48603f47467e7e0a": {
-      "name": "Pegasus_motif_9n_12",
+      "name": "Pegasus_minor_9n_12",
       "nodes": 9,
       "edges": 18,
       "spanning_trees": 4608,
@@ -6656,7 +6656,7 @@
       }
     },
     "467e724d3f0a": {
-      "name": "Pegasus_motif_7n_9",
+      "name": "Pegasus_minor_7n_9",
       "nodes": 7,
       "edges": 13,
       "spanning_trees": 448,
@@ -6695,7 +6695,7 @@
       }
     },
     "477e724d45430a": {
-      "name": "Pegasus_motif_8n_6",
+      "name": "Pegasus_minor_8n_6",
       "nodes": 8,
       "edges": 16,
       "spanning_trees": 2048,
@@ -6744,7 +6744,7 @@
       }
     },
     "487e724d45463f0a": {
-      "name": "Pegasus_motif_9n_13",
+      "name": "Pegasus_minor_9n_13",
       "nodes": 9,
       "edges": 18,
       "spanning_trees": 4608,
@@ -6804,7 +6804,7 @@
       }
     },
     "447d730a": {
-      "name": "Pegasus_motif_5n_4",
+      "name": "Pegasus_minor_5n_4",
       "nodes": 5,
       "edges": 8,
       "spanning_trees": 40,
@@ -6828,7 +6828,7 @@
       }
     },
     "457d765f0a": {
-      "name": "Pegasus_motif_6n_4",
+      "name": "Pegasus_minor_6n_4",
       "nodes": 6,
       "edges": 11,
       "spanning_trees": 192,
@@ -6859,7 +6859,7 @@
       }
     },
     "467d76653f0a": {
-      "name": "Pegasus_motif_7n_10",
+      "name": "Pegasus_minor_7n_10",
       "nodes": 7,
       "edges": 13,
       "spanning_trees": 448,
@@ -6898,7 +6898,7 @@
       }
     },
     "477d766545430a": {
-      "name": "Pegasus_motif_8n_7",
+      "name": "Pegasus_minor_8n_7",
       "nodes": 8,
       "edges": 16,
       "spanning_trees": 2048,
@@ -6947,7 +6947,7 @@
       }
     },
     "487d766545463f0a": {
-      "name": "Pegasus_motif_9n_14",
+      "name": "Pegasus_minor_9n_14",
       "nodes": 9,
       "edges": 18,
       "spanning_trees": 4608,
@@ -7007,7 +7007,7 @@
       }
     },
     "48607e7e66636f0a": {
-      "name": "Pegasus_motif_9n_15",
+      "name": "Pegasus_minor_9n_15",
       "nodes": 9,
       "edges": 22,
       "spanning_trees": 48384,
@@ -7077,7 +7077,7 @@
       }
     },
     "464e7c62470a": {
-      "name": "Pegasus_motif_7n_11",
+      "name": "Pegasus_minor_7n_11",
       "nodes": 7,
       "edges": 13,
       "spanning_trees": 480,
@@ -7116,7 +7116,7 @@
       }
     },
     "47607e7860630a": {
-      "name": "Pegasus_motif_8n_8",
+      "name": "Pegasus_minor_8n_8",
       "nodes": 8,
       "edges": 16,
       "spanning_trees": 2304,
@@ -7165,7 +7165,7 @@
       }
     },
     "485f467e776f580a": {
-      "name": "Pegasus_motif_9n_16",
+      "name": "Pegasus_minor_9n_16",
       "nodes": 9,
       "edges": 18,
       "spanning_trees": 5376,

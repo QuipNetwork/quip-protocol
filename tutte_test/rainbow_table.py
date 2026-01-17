@@ -1,7 +1,7 @@
 """
 Tutte Polynomial Rainbow Table
 
-Pre-compute and store Tutte polynomials for graph motifs.
+Pre-compute and store Tutte polynomials for graph minors.
 Use for rapid lookup when analyzing larger graphs.
 
 Usage:
@@ -14,12 +14,12 @@ Usage:
     poly = table.lookup_by_name('K_4')
 """
 
-import sys
-import os
 import json
-from dataclasses import dataclass, field
-from typing import Dict, Optional, List, Tuple
+import os
+import sys
 from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import networkx as nx
 
@@ -27,15 +27,10 @@ import networkx as nx
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.setrecursionlimit(200000)
 
-from tutte_test.tutte_to_ising import (
-    TuttePolynomial,
-    GraphBuilder,
-    compute_tutte_polynomial,
-)
-from tutte_test.tutte_utils import (
-    networkx_to_graphbuilder,
-    graph_to_canonical_key,
-)
+from tutte_test.tutte_to_ising import (GraphBuilder, TuttePolynomial,
+                                       compute_tutte_polynomial)
+from tutte_test.tutte_utils import (graph_to_canonical_key,
+                                    networkx_to_graphbuilder)
 
 # Check D-Wave availability
 try:
@@ -310,22 +305,22 @@ def build_standard_graphs(table: RainbowTable, verbose: bool = True):
                 print(f"  Circ({n},[1,2]): {G.number_of_edges()} edges, T(1,1)={t.num_spanning_trees()}")
 
 
-def build_zephyr_motifs(table: RainbowTable, verbose: bool = True):
-    """Extract and catalog motifs from Zephyr topology."""
+def build_zephyr_minors(table: RainbowTable, verbose: bool = True):
+    """Extract and catalog minors from Zephyr topology."""
 
     if not DWAVE_AVAILABLE:
         if verbose:
-            print("\n--- Zephyr Motifs: SKIPPED (dwave_networkx not available) ---")
+            print("\n--- Zephyr minors: SKIPPED (dwave_networkx not available) ---")
         return
 
     if verbose:
-        print("\n--- Zephyr Motifs from Z(2,2) ---")
+        print("\n--- Zephyr minors from Z(2,2) ---")
 
     G_zephyr = dnx.zephyr_graph(2, 2)
     if verbose:
         print(f"Source: Z(2,2) with {G_zephyr.number_of_nodes()} nodes, {G_zephyr.number_of_edges()} edges")
 
-    motif_counts = defaultdict(int)
+    minor_counts = defaultdict(int)
     nodes_list = list(G_zephyr.nodes())
 
     # Sample starting points and grow subgraphs
@@ -352,16 +347,16 @@ def build_zephyr_motifs(table: RainbowTable, verbose: bool = True):
                     key = graph_to_canonical_key(subgraph)
                     if key not in table.entries:
                         try:
-                            name = f'Zephyr_motif_{len(visited)}n_{motif_counts[len(visited)]}'
+                            name = f'Zephyr_minor_{len(visited)}n_{minor_counts[len(visited)]}'
                             table.add(subgraph, name)
-                            motif_counts[len(visited)] += 1
+                            minor_counts[len(visited)] += 1
                         except Exception:
                             pass
 
     if verbose:
-        print("Zephyr motifs discovered:")
-        for size in sorted(motif_counts.keys()):
-            print(f"  {size} nodes: {motif_counts[size]} unique motifs")
+        print("Zephyr minors discovered:")
+        for size in sorted(minor_counts.keys()):
+            print(f"  {size} nodes: {minor_counts[size]} unique minors")
 
 
 def build_zephyr_z11(table: RainbowTable, verbose: bool = True):
@@ -382,31 +377,31 @@ def build_zephyr_z11(table: RainbowTable, verbose: bool = True):
         print(f"Z(1,1): {G.number_of_edges()} edges, T(1,1)={t.num_spanning_trees()}")
 
 
-def build_pegasus_motifs(table: RainbowTable, verbose: bool = True):
+def build_pegasus_minors(table: RainbowTable, verbose: bool = True):
     """
-    Extract and catalog motifs from Pegasus topology.
+    Extract and catalog minors from Pegasus topology.
 
     Pegasus graphs are too large to compute full Tutte polynomials:
     - P(2): 40 nodes, 164 edges
     - P(3): 128 nodes, 704 edges
 
-    Instead, we extract small connected subgraphs (motifs) that capture
+    Instead, we extract small connected subgraphs (minors) that capture
     the local structure of Pegasus topology.
     """
 
     if not DWAVE_AVAILABLE:
         if verbose:
-            print("\n--- Pegasus Motifs: SKIPPED (dwave_networkx not available) ---")
+            print("\n--- Pegasus minors: SKIPPED (dwave_networkx not available) ---")
         return
 
     if verbose:
-        print("\n--- Pegasus Motifs from P(2) ---")
+        print("\n--- Pegasus minors from P(2) ---")
 
     G_pegasus = dnx.pegasus_graph(2)
     if verbose:
         print(f"Source: P(2) with {G_pegasus.number_of_nodes()} nodes, {G_pegasus.number_of_edges()} edges")
 
-    motif_counts = defaultdict(int)
+    minor_counts = defaultdict(int)
     nodes_list = list(G_pegasus.nodes())
 
     # Sample starting points and grow subgraphs
@@ -433,16 +428,16 @@ def build_pegasus_motifs(table: RainbowTable, verbose: bool = True):
                     key = graph_to_canonical_key(subgraph)
                     if key not in table.entries:
                         try:
-                            name = f'Pegasus_motif_{len(visited)}n_{motif_counts[len(visited)]}'
+                            name = f'Pegasus_minor_{len(visited)}n_{minor_counts[len(visited)]}'
                             table.add(subgraph, name)
-                            motif_counts[len(visited)] += 1
+                            minor_counts[len(visited)] += 1
                         except Exception:
                             pass
 
     if verbose:
-        print("Pegasus motifs discovered:")
-        for size in sorted(motif_counts.keys()):
-            print(f"  {size} nodes: {motif_counts[size]} unique motifs")
+        print("Pegasus minors discovered:")
+        for size in sorted(minor_counts.keys()):
+            print(f"  {size} nodes: {minor_counts[size]} unique minors")
 
 
 def build_full_table(verbose: bool = True) -> RainbowTable:
@@ -450,14 +445,14 @@ def build_full_table(verbose: bool = True) -> RainbowTable:
     Build complete rainbow table with all graph families.
 
     Returns:
-        RainbowTable with standard graphs, Zephyr motifs, Z(1,1), and Pegasus motifs
+        RainbowTable with standard graphs, Zephyr minors, Z(1,1), and Pegasus minors
     """
     table = RainbowTable()
 
     build_standard_graphs(table, verbose=verbose)
-    build_zephyr_motifs(table, verbose=verbose)
+    build_zephyr_minors(table, verbose=verbose)
     build_zephyr_z11(table, verbose=verbose)
-    build_pegasus_motifs(table, verbose=verbose)
+    build_pegasus_minors(table, verbose=verbose)
 
     return table
 
