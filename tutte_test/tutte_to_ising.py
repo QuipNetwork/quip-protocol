@@ -434,9 +434,11 @@ def compute_tutte_polynomial(g: GraphBuilder) -> TuttePolynomial:
     u, v = g.edges[edge_id]
     
     # Check if edge is a bridge (removing it disconnects the graph)
-    is_bridge = _is_bridge(g, edge_id)
+    # Use lazy import to avoid circular dependency with tutte_utils
+    from tutte_test.tutte_utils import is_bridge as check_bridge
+    is_bridge_edge = check_bridge(g, edge_id)
     
-    if is_bridge:
+    if is_bridge_edge:
         # T(G) = x * T(G \ e)
         g_minus_e = g.copy()
         del g_minus_e.edges[edge_id]
@@ -455,34 +457,6 @@ def compute_tutte_polynomial(g: GraphBuilder) -> TuttePolynomial:
     t_contract = compute_tutte_polynomial(g_contract)
     
     return t_delete + t_contract
-
-
-def _is_bridge(g: GraphBuilder, edge_id: int) -> bool:
-    """Check if removing edge disconnects the graph."""
-    if edge_id not in g.edges:
-        return False
-    
-    u, v = g.edges[edge_id]
-    
-    # BFS/DFS from u without using edge_id
-    visited = {u}
-    stack = [u]
-    
-    while stack:
-        curr = stack.pop()
-        for eid, (a, b) in g.edges.items():
-            if eid == edge_id:
-                continue
-            neighbor = None
-            if a == curr and b not in visited:
-                neighbor = b
-            elif b == curr and a not in visited:
-                neighbor = a
-            if neighbor is not None:
-                visited.add(neighbor)
-                stack.append(neighbor)
-    
-    return v not in visited
 
 
 # =============================================================================
