@@ -78,8 +78,8 @@ done
 PORT="${QUIP_PORT:-20049}"
 echo "Port: $PORT"
 
-# Set listen address (default 0.0.0.0)
-LISTEN="${QUIP_LISTEN:-0.0.0.0}"
+# Set listen address (default :: for dual-stack IPv4+IPv6)
+LISTEN="${QUIP_LISTEN:-::}"
 echo "Listen: $LISTEN"
 
 # Build optional arguments

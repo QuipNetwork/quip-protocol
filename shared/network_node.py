@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import ipaddress
 import json
 import math
 import random
@@ -20,7 +21,7 @@ from shared.base_miner import MiningResult
 from shared.block import Block, BlockHeader, MinerInfo
 from shared.node import Node
 from shared.logging_config import init_component_logger
-from shared.version import get_version
+from shared.version import get_version, PROTOCOL_VERSION
 from shared.node_client import (
     NodeClient, QuicMessage, QuicMessageType,
     generate_self_signed_cert, QUIP_ALPN_PROTOCOL, MAX_DATAGRAM_FRAME_SIZE,
@@ -34,8 +35,8 @@ from aioquic.quic.events import QuicEvent, DatagramFrameReceived, StreamDataRece
 from shared.block_synchronizer import BlockSynchronizer
 from shared.block_store import BlockStore
 from shared.time_utils import (
-    utc_timestamp_float, utc_timestamp, get_network_time_offset,
-    is_clock_synchronized, sync_time_with_network, NETWORK_TIME_SYNC_INTERVAL
+    utc_timestamp_float, is_clock_synchronized, NETWORK_TIME_SYNC_INTERVAL,
+    get_network_clock, network_timestamp
 )
 
 
@@ -91,10 +92,15 @@ async def get_public_ip() -> Optional[str]:
                     return response.read().decode('utf-8').strip()
 
             ip = await loop.run_in_executor(None, fetch_ip)
-            # Basic validation - check if it looks like an IP
-            if ip and '.' in ip and len(ip.split('.')) == 4:
-                logger.info(f"Detected public IP: {ip}")
-                return ip
+            # Validate using ipaddress module (supports both IPv4 and IPv6)
+            if ip:
+                try:
+                    ipaddress.ip_address(ip)
+                    logger.info(f"Detected public IP: {ip}")
+                    return ip
+                except ValueError:
+                    logger.debug(f"Invalid IP format from {service}: {ip}")
+                    continue
         except Exception as e:
             logger.debug(f"Failed to get IP from {service}: {e}")
             continue
@@ -103,13 +109,22 @@ async def get_public_ip() -> Optional[str]:
     return None
 
 
-def get_local_ip() -> str:
+def get_local_ip(prefer_ipv6: bool = False) -> str:
     """
     Get the local IP address (best guess).
+
+    Args:
+        prefer_ipv6: If True, try IPv6 first, then fall back to IPv4
 
     Returns:
         Local IP address as string
     """
+    if prefer_ipv6:
+        # Try IPv6 first
+        ipv6 = get_local_ipv6()
+        if ipv6:
+            return ipv6
+
     try:
         # Connect to a remote address to determine which local interface would be used
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -120,6 +135,27 @@ def get_local_ip() -> str:
     except Exception:
         # Fallback to localhost
         return "127.0.0.1"
+
+
+def get_local_ipv6() -> Optional[str]:
+    """
+    Get the local IPv6 address (best guess).
+
+    Returns:
+        Local IPv6 address as string, or None if not available
+    """
+    try:
+        # Connect to Google's IPv6 DNS server to determine which local interface would be used
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
+            # Use Google's IPv6 DNS server - we don't actually send data
+            s.connect(("2001:4860:4860::8888", 80))
+            local_ip = s.getsockname()[0]
+            # Filter out link-local addresses (fe80::)
+            if local_ip and not local_ip.startswith('fe80'):
+                return local_ip
+    except Exception:
+        pass
+    return None
 
 
 
@@ -608,6 +644,11 @@ class NetworkNode(Node):
 
                 # If we are synchronized, check if we are mining. If not, start mining on the next block.
                 if not self._is_mining:
+                    # Guard: Don't start mining unless we're actually synchronized
+                    if not self.synchronized:
+                        self.logger.debug("Not starting mining - not synchronized with network")
+                        await asyncio.sleep(1)
+                        continue
                     latest_block = self.get_latest_block()
                     # Create task with exception handler to crash on ValueError
                     task = asyncio.create_task(self.mine_block(latest_block))
@@ -639,18 +680,23 @@ class NetworkNode(Node):
                     continue
 
                 # Process the block in background
-                block, response_future = block_data
+                # Unpack with optional force_reorg flag (default False for backward compat)
+                if len(block_data) == 3:
+                    block, response_future, force_reorg = block_data
+                else:
+                    block, response_future = block_data
+                    force_reorg = False
                 try:
                     latest = self.get_latest_block()
                     # Cache out of order blocks for later processing
                     # NOTE: older blocks need processing to determine chain fork
                     if latest.header.index+1 < block.header.index:
-                        self.sync_block_cache[block.header.index] = block
+                        self.sync_block_cache[block.header.index] = (block, force_reorg)
                         # WE return failure, but thats only to signal we didn't process it.
                         response_future.set_result(False)
                         continue
                     # Base case we can process the block
-                    result = await self.receive_block(block)
+                    result = await self.receive_block(block, force_reorg=force_reorg)
                     response_future.set_result(result)
                 except Exception as e:
                     self.logger.info(f"Error processing block: {e}")
@@ -727,20 +773,26 @@ class NetworkNode(Node):
 
     async def _exhaust_block_cache(self):
         """Exhaust the block cache by processing all blocks in order."""
-        # Pause gossip and process the current block cache. 
+        # Pause gossip and process the current block cache.
         async with self.gossip_lock:
             # Process cached blocks starting from end_index + 1
             next_block_index = self.get_latest_block().header.index + 1
             while next_block_index in self.sync_block_cache:
-                cached_block = self.sync_block_cache.pop(next_block_index)
+                cached_data = self.sync_block_cache.pop(next_block_index)
+                # Handle both old format (block only) and new format (block, force_reorg)
+                if isinstance(cached_data, tuple):
+                    cached_block, force_reorg = cached_data
+                else:
+                    cached_block = cached_data
+                    force_reorg = False
                 self.logger.info(f"Processing cached block {next_block_index} received during sync")
-                
+
                 # Process the cached block
-                success = await self.receive_block(cached_block)
+                success = await self.receive_block(cached_block, force_reorg=force_reorg)
                 if not success:
                     self.logger.error(f"Failed to process cached block {next_block_index}")
                     break
-                    
+
                 next_block_index += 1
 
 
@@ -888,6 +940,7 @@ class NetworkNode(Node):
             fresh_stats = self.get_stats()
             
             # Add network-specific information
+            clock = get_network_clock()
             fresh_stats.update({
                 "network": {
                     "host": self.public_host,
@@ -901,6 +954,10 @@ class NetworkNode(Node):
                         "block_processing": self.block_processing_queue.qsize(),
                         "gossip_processing": self.gossip_processing_queue.qsize(),
                     }
+                },
+                "network_clock": {
+                    "offset_seconds": round(clock.get_offset(), 1),
+                    "is_trusted": clock.is_trusted(),
                 }
             })
             
@@ -913,13 +970,19 @@ class NetworkNode(Node):
         except Exception as e:
             self.logger.exception(f"Error updating stats cache: {e}")
 
-    async def receive_block(self, block: Block) -> bool:
-        """Receive a block from the network with epoch validation and max block limit."""
+    async def receive_block(self, block: Block, force_reorg: bool = False) -> bool:
+        """Receive a block from the network with epoch validation and max block limit.
+
+        Args:
+            block: The block to receive.
+            force_reorg: If True, skip timestamp comparison to allow chain reorganization
+                        during sync (longest chain wins). Default False.
+        """
         # Reject blocks that are too far in the future (beyond max sync limit)
         if block.header.index > self.max_sync_block_index:
             self.logger.debug(f"Block {block.header.index} rejected: index > max_sync_block_index {self.max_sync_block_index}")
             return False
-        
+
         # Check against previous epoch to prevent accepting blocks from old chain epoch
         async with self.chain_lock:
             if self.previous_epoch:
@@ -927,19 +990,19 @@ class NetworkNode(Node):
                 if block.header.index == 1 and block.hash and block.hash == self.previous_epoch.first_hash:
                     self.logger.warning(f"Block 1 rejected: hash {block.hash.hex()[:8]}... matches previous epoch first_hash")
                     return False
-                
-                # Reject if this block hash matches the last block from the previous epoch  
+
+                # Reject if this block hash matches the last block from the previous epoch
                 if block.hash and block.hash == self.previous_epoch.last_hash:
                     self.logger.warning(f"Block {block.header.index} rejected: hash {block.hash.hex()[:8]}... matches previous epoch last_hash")
                     return False
-                
+
                 # Reject if timestamp is older than the last timestamp from the previous epoch
                 if block.header.timestamp <= self.previous_epoch.last_timestamp:
                     self.logger.warning(f"Block {block.header.index} rejected: timestamp {block.header.timestamp} <= previous epoch last_timestamp {self.previous_epoch.last_timestamp}")
                     return False
-        
+
         # If all validations pass, call parent receive_block
-        return await super().receive_block(block)
+        return await super().receive_block(block, force_reorg=force_reorg)
 
     async def mine_block(self, previous_block: Block, transactions=None) -> Optional[MiningResult]:
         """Mine a block and broadcast if successful."""
@@ -1021,9 +1084,10 @@ class NetworkNode(Node):
             if my_latest_block.header.previous_hash == net_latest.previous_hash and my_latest_block.header.timestamp <= net_latest.timestamp:
                 self.set_synchronized()
                 return 0
-            else:                    
-                self.logger.debug("Latest block prev_hash mismatch, may need to synchronize")
-                return 0
+            else:
+                self.logger.warning(f"Fork detected at block {my_latest_block.header.index} - our prev_hash differs from network, triggering reorg sync")
+                # Return non-zero to trigger synchronization - longest chain wins
+                return net_latest.index
 
         return net_latest.index
 
@@ -1079,6 +1143,9 @@ class NetworkNode(Node):
         """Track a peer timestamp for time synchronization."""
         current_time = utc_timestamp_float()
 
+        # Feed the global network clock for offset calculation
+        get_network_clock().record_peer_timestamp(timestamp)
+
         # Only track recent timestamps (within last 5 minutes)
         if abs(current_time - timestamp) < 300:
             self.peer_timestamps.append(int(timestamp))
@@ -1097,18 +1164,19 @@ class NetworkNode(Node):
         if len(self.peer_timestamps) < 3:
             return  # Not enough data
 
+        clock = get_network_clock()
         if not is_clock_synchronized(self.peer_timestamps):
-            offset = get_network_time_offset(self.peer_timestamps)
+            offset = clock.get_offset()
             self.time_sync_warnings += 1
 
             if self.time_sync_warnings <= 3:  # Limit warnings
                 self.logger.warning(
-                    f"⚠️  Clock synchronization issue detected! "
-                    f"Local time is {offset} seconds {'ahead' if offset > 0 else 'behind'} network time. "
-                    f"Consider synchronizing your system clock with NTP."
+                    f"⚠️  Clock drift detected: local time is {abs(offset):.0f}s "
+                    f"{'ahead' if offset > 0 else 'behind'} network time. "
+                    f"Network clock is compensating (timestamps adjusted by {-offset:.0f}s)."
                 )
             elif self.time_sync_warnings == 4:
-                self.logger.warning("⚠️  Clock sync warnings suppressed (fix your system clock)")
+                self.logger.info(f"Clock drift warnings suppressed (compensating by {-offset:.0f}s)")
         else:
             # Reset warning counter if synchronized
             if self.time_sync_warnings > 0:
@@ -1385,15 +1453,16 @@ class NetworkNode(Node):
             block = Block.from_network(message.data)
             # Don't rebroadcast if we are not synchronized yet
             if not self.synchronized:
-                self.sync_block_cache[block.header.index] = block
+                self.sync_block_cache[block.header.index] = (block, False)  # force_reorg=False for gossip
                 return "ok"
             # Don't rebroadcast if we likely already saw it and its a little old
             if self.get_latest_block().header.index-2 >= block.header.index:
                 return "ok"
             # Queue for background processing to avoid blocking
             # Create a dummy future for gossip blocks (we don't need the result)
+            # force_reorg=False because these are normal network propagation, not sync
             dummy_future = asyncio.Future()
-            self.block_processing_queue.put_nowait((block, dummy_future))
+            self.block_processing_queue.put_nowait((block, dummy_future, False))
 
         asyncio.create_task(self.gossip_broadcast(message, self.fanout))
         return "ok"
@@ -1412,6 +1481,11 @@ class NetworkNode(Node):
         This replaces all the HTTP route handlers with a single dispatch point.
         """
         try:
+            # Validate protocol version - reject incompatible nodes
+            if msg.protocol_version != PROTOCOL_VERSION:
+                self.logger.warning(f"Protocol version mismatch from {protocol._peer_address}: expected {PROTOCOL_VERSION}, got {msg.protocol_version} (msg_type={msg.msg_type.name})")
+                return msg.create_error_response(f"Protocol version mismatch: expected {PROTOCOL_VERSION}, got {msg.protocol_version}")
+
             if msg.msg_type == QuicMessageType.JOIN_REQUEST:
                 return await self._quic_handle_join(msg)
             elif msg.msg_type == QuicMessageType.HEARTBEAT:
@@ -1536,7 +1610,8 @@ class NetworkNode(Node):
 
         response_future: asyncio.Future[bool] = asyncio.Future()
         try:
-            self.block_processing_queue.put_nowait((block, response_future))
+            # force_reorg=False for submitted blocks (normal propagation rules)
+            self.block_processing_queue.put_nowait((block, response_future, False))
             result = await asyncio.wait_for(response_future, timeout=10.0)
             status = "ok" if result else "rejected"
             return msg.create_response(json.dumps({"status": status}).encode('utf-8'))
@@ -1678,7 +1753,7 @@ class NetworkNode(Node):
         from shared.block import Transaction
         transaction = Transaction(
             transaction_id=transaction_id,
-            timestamp=utc_timestamp(),
+            timestamp=network_timestamp(),
             request_h=h,
             request_J=J,
             num_samples=num_samples,

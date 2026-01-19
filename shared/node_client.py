@@ -28,8 +28,9 @@ from aioquic.quic.events import (
 )
 
 from shared.block import Block, BlockHeader, MinerInfo
-from shared.version import get_version
+from shared.version import get_version, PROTOCOL_VERSION
 from shared.time_utils import utc_timestamp_float
+from shared.address_utils import parse_host_port
 
 if TYPE_CHECKING:
     from shared.trust_store import TrustStore
@@ -86,39 +87,42 @@ class QuicMessageType(IntEnum):
 class QuicMessage:
     """QUIC datagram message with framing.
 
-    Wire format: [1B msg_type][4B request_id][4B payload_len][payload...]
+    Wire format: [1B msg_type][1B protocol_version][4B request_id][4B payload_len][payload...]
     """
     msg_type: QuicMessageType
     request_id: int
     payload: bytes
+    protocol_version: int = PROTOCOL_VERSION
 
-    HEADER_SIZE = 9
+    HEADER_SIZE = 10  # 1 + 1 + 4 + 4
 
     def to_bytes(self) -> bytes:
-        header = struct.pack('!BII', self.msg_type, self.request_id, len(self.payload))
+        header = struct.pack('!BBII', self.msg_type, self.protocol_version, self.request_id, len(self.payload))
         return header + self.payload
 
     @classmethod
     def from_bytes(cls, data: bytes) -> 'QuicMessage':
         if len(data) < cls.HEADER_SIZE:
             raise ValueError(f"Datagram too short: {len(data)}")
-        msg_type_raw, request_id, payload_len = struct.unpack('!BII', data[:cls.HEADER_SIZE])
+        msg_type_raw, protocol_version, request_id, payload_len = struct.unpack('!BBII', data[:cls.HEADER_SIZE])
         msg_type = QuicMessageType(msg_type_raw)
         payload = data[cls.HEADER_SIZE:cls.HEADER_SIZE + payload_len]
-        return cls(msg_type=msg_type, request_id=request_id, payload=payload)
+        return cls(msg_type=msg_type, request_id=request_id, payload=payload, protocol_version=protocol_version)
 
     def create_response(self, payload: bytes) -> 'QuicMessage':
         return QuicMessage(
             msg_type=QuicMessageType.response_for(self.msg_type),
             request_id=self.request_id,
-            payload=payload
+            payload=payload,
+            protocol_version=self.protocol_version
         )
 
     def create_error_response(self, error_message: str) -> 'QuicMessage':
         return QuicMessage(
             msg_type=QuicMessageType.ERROR_RESPONSE,
             request_id=self.request_id,
-            payload=error_message.encode('utf-8')
+            payload=error_message.encode('utf-8'),
+            protocol_version=self.protocol_version
         )
 
 
@@ -149,6 +153,7 @@ def generate_self_signed_cert(hostname: str = "localhost", cert_dir: Optional[st
                 x509.DNSName(hostname),
                 x509.DNSName("localhost"),
                 x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+                x509.IPAddress(ipaddress.IPv6Address("::1")),
             ]),
             critical=False,
         )
@@ -390,8 +395,7 @@ class NodeClient:
             # Clean up old connection if exists
             await self._close_connection(host)
 
-            addr, port = (host.rsplit(':', 1) if ':' in host else (host, DEFAULT_QUIC_PORT))
-            port = int(port) if isinstance(port, str) else port
+            addr, port = parse_host_port(host, DEFAULT_QUIC_PORT)
 
             configuration = QuicConfiguration(
                 is_client=True,

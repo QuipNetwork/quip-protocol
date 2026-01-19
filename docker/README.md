@@ -75,10 +75,12 @@ ls -la ~/quip-data/
 |----------|---------|-------------|
 | `QUIP_PEERS` | (see below) | Comma-separated peer list |
 | `QUIP_PORT` | `20049` | Port to bind |
-| `QUIP_LISTEN` | `0.0.0.0` | Address to bind |
-| `QUIP_PUBLIC_HOST` | "" | Public host:port for peer advertisement |
+| `QUIP_LISTEN` | `::` | Address to bind (dual-stack: accepts IPv4+IPv6) |
+| `QUIP_PUBLIC_HOST` | "" | Public host:port for peer advertisement (use `[IPv6]:port` for IPv6) |
 | `QUIP_NODE_NAME` | "" | Human-readable node name |
 | `QUIP_AUTO_MINE` | `false` | Enable auto-mining |
+
+**IPv6 Support:** The default `QUIP_LISTEN=::` enables dual-stack mode, accepting both IPv4 and IPv6 connections. For IPv6-only, use `QUIP_LISTEN=::1`. For IPv4-only, use `QUIP_LISTEN=0.0.0.0`.
 
 **Default peers:**
 ```

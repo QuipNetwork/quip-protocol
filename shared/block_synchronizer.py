@@ -275,8 +275,9 @@ class BlockSynchronizer:
                     self.logger.debug(f"📨 Received block {block_number} from producer, storing for sequential processing")
                             
                     # Put block in queue for consumer task to process
+                    # force_reorg=True because sync blocks should always be accepted (longest chain wins)
                     dummy_future = asyncio.Future()
-                    self.receive_block_queue.put_nowait((block, dummy_future))
+                    self.receive_block_queue.put_nowait((block, dummy_future, True))
                     next_expected += 1
 
                     # Give consumer task a chance to run

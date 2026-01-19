@@ -471,11 +471,11 @@ class RestApiServer:
 
             # Create and store transaction
             from shared.block import Transaction
-            from shared.time_utils import utc_timestamp
+            from shared.time_utils import network_timestamp
 
             transaction = Transaction(
                 transaction_id=transaction_id,
-                timestamp=utc_timestamp(),
+                timestamp=network_timestamp(),
                 request_h=h,
                 request_J=J,
                 num_samples=num_samples,
