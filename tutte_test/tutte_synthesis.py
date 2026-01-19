@@ -2722,135 +2722,6 @@ def estimate_zephyr_spanning_trees(m: int, t: int) -> Tuple[int, str]:
     return 0, "unknown"
 
 
-@dataclass
-class ZephyrTilingAnalysis:
-    """Analysis of how Z(1,1) tiles into larger Zephyr graphs."""
-    target_m: int
-    target_t: int
-    target_nodes: int
-    target_edges: int
-    z11_subgraph_count: int  # Number of Z(1,1)-isomorphic subgraphs found
-    shared_edges: int  # Edges shared between Z(1,1) tiles
-    unique_z11_edges: int  # Total edges if Z(1,1) tiles were disjoint
-    extra_edges: int  # Edges not in any Z(1,1) tile
-    tiling_structure: str  # Description of how tiles connect
-
-
-def analyze_zephyr_tiling(m: int, t: int) -> ZephyrTilingAnalysis:
-    """
-    Analyze how Z(1,1) unit cells tile into larger Zephyr topologies.
-
-    This helps understand the relationship between Z(1,1) and larger Zephyr
-    graphs, even when direct polynomial computation is infeasible.
-
-    Args:
-        m: Target Zephyr m parameter
-        t: Target Zephyr t parameter
-
-    Returns:
-        ZephyrTilingAnalysis with tiling information
-    """
-    try:
-        import dwave_networkx as dnx
-        import networkx as nx
-        from networkx.algorithms import isomorphism
-    except ImportError:
-        return ZephyrTilingAnalysis(
-            target_m=m, target_t=t,
-            target_nodes=0, target_edges=0,
-            z11_subgraph_count=0, shared_edges=0,
-            unique_z11_edges=0, extra_edges=0,
-            tiling_structure="D-Wave libraries not available"
-        )
-
-    # Get the target Zephyr graph
-    G_target = dnx.zephyr_graph(m, t)
-    G_z11 = dnx.zephyr_graph(1, 1)
-
-    target_nodes = G_target.number_of_nodes()
-    target_edges = G_target.number_of_edges()
-
-    # For Z(1,1), return trivial result
-    if m == 1 and t == 1:
-        return ZephyrTilingAnalysis(
-            target_m=1, target_t=1,
-            target_nodes=12, target_edges=22,
-            z11_subgraph_count=1, shared_edges=0,
-            unique_z11_edges=22, extra_edges=0,
-            tiling_structure="Single Z(1,1) unit cell"
-        )
-
-    # Find Z(1,1)-isomorphic subgraphs
-    # This uses subgraph isomorphism which can be slow for large graphs
-    GM = isomorphism.GraphMatcher(G_target, G_z11)
-
-    z11_matches = []
-    edges_in_z11 = set()
-
-    # Limit search to avoid exponential blowup
-    match_count = 0
-    max_matches = 100  # Cap to avoid very long searches
-
-    for subgraph_mapping in GM.subgraph_isomorphisms_iter():
-        if match_count >= max_matches:
-            break
-        # mapping is target_node -> z11_node
-        target_nodes_in_match = set(subgraph_mapping.keys())
-        z11_matches.append(target_nodes_in_match)
-
-        # Track edges in this Z(1,1) copy
-        for u in target_nodes_in_match:
-            for v in G_target.neighbors(u):
-                if v in target_nodes_in_match:
-                    edges_in_z11.add(tuple(sorted([u, v])))
-
-        match_count += 1
-
-    # Calculate tiling statistics
-    z11_subgraph_count = len(z11_matches)
-    unique_z11_edges = len(edges_in_z11)
-
-    # Expected edges if tiles were disjoint: count * 22
-    expected_disjoint_edges = z11_subgraph_count * 22
-
-    # Shared edges = expected - actual in tiles
-    if z11_subgraph_count > 0:
-        shared_edges = max(0, expected_disjoint_edges - unique_z11_edges)
-    else:
-        shared_edges = 0
-
-    # Extra edges = total edges - edges in Z(1,1) tiles
-    extra_edges = target_edges - unique_z11_edges
-
-    # Describe tiling structure
-    if z11_subgraph_count == 0:
-        tiling_structure = "No Z(1,1) subgraphs found (unexpected for Zephyr)"
-    elif z11_subgraph_count == 1:
-        if extra_edges == 0:
-            tiling_structure = "Single Z(1,1) with no extra edges"
-        else:
-            tiling_structure = f"Single Z(1,1) core with {extra_edges} additional connecting edges"
-    else:
-        overlap_ratio = shared_edges / expected_disjoint_edges if expected_disjoint_edges > 0 else 0
-        if overlap_ratio > 0.3:
-            tiling_structure = f"{z11_subgraph_count} highly overlapping Z(1,1) copies ({overlap_ratio:.1%} edge overlap)"
-        elif extra_edges > unique_z11_edges * 0.5:
-            tiling_structure = f"{z11_subgraph_count} Z(1,1) tiles with significant inter-tile connections"
-        else:
-            tiling_structure = f"{z11_subgraph_count} Z(1,1) tiles with sparse inter-tile connections"
-
-    return ZephyrTilingAnalysis(
-        target_m=m, target_t=t,
-        target_nodes=target_nodes,
-        target_edges=target_edges,
-        z11_subgraph_count=z11_subgraph_count,
-        shared_edges=shared_edges,
-        unique_z11_edges=unique_z11_edges,
-        extra_edges=extra_edges,
-        tiling_structure=tiling_structure
-    )
-
-
 def build_zephyr_approximation(
     m: int, t: int,
     method: str = "z11_union"
@@ -2963,225 +2834,203 @@ def build_zephyr_approximation(
 
 
 # =============================================================================
-# EXACT ZEPHYR DECOMPOSITION
+# GENERALIZED Z(1,t) DECOMPOSITION
 # =============================================================================
 
+# The "Zephyr connector component" - a (2,4)-biregular bipartite graph
+# with 12 nodes, 16 edges, and 768 spanning trees
+ZEPHYR_CONNECTOR_COMPONENT_TREES = 768
+
+
+def get_zephyr_connector_component_polynomial() -> TuttePolynomial:
+    """
+    Get the Tutte polynomial for the Zephyr connector component.
+
+    This is the universal (2,4)-biregular bipartite graph that connects
+    pairs of Z(1,1) copies in all Z(1,t) graphs:
+    - 12 nodes, 16 edges
+    - 768 spanning trees
+    - Degree sequence: [4,4,4,4,2,2,2,2,2,2,2,2]
+
+    Returns:
+        TuttePolynomial for a single connector component
+    """
+    # Use Z(1,2) decomposition to get the component polynomial
+    decomp = decompose_zephyr_z1t(2)
+    if decomp.component_polynomial:
+        return decomp.component_polynomial
+    raise ValueError("Could not compute Zephyr connector component polynomial")
+
+
 @dataclass
-class ZephyrDecomposition:
-    """Exact decomposition of a Zephyr graph into Z(1,1) copies and connectors."""
-    m: int
-    t: int
-    z11_copies: List[Set[int]]  # Node sets for each Z(1,1) copy
-    connector_components: List[Set[int]]  # Node sets for connector components
-    connector_edges: List[Tuple[int, int]]  # All connector edges
-    connector_polynomial: Optional[TuttePolynomial]  # Polynomial of connector
-    component_polynomial: Optional[TuttePolynomial]  # Polynomial of single component
-    summary: str
-
-
-def decompose_zephyr_z12() -> ZephyrDecomposition:
+class Z1tDecomposition:
     """
-    Exactly decompose Z(1,2) into components with computed polynomials.
+    Decomposition of Z(1,t) Zephyr graph.
 
-    Z(1,2) = Z(1,1)₁ ∪ Z(1,1)₂ ∪ Connector
-
-    Where Connector = Component₁ ∪ Component₂ (two isomorphic 12-node graphs)
-
-    Returns:
-        ZephyrDecomposition with full structural and polynomial information
-    """
-    try:
-        import dwave_networkx as dnx
-        import networkx as nx
-        from networkx.algorithms import isomorphism
-    except ImportError:
-        return ZephyrDecomposition(
-            m=1, t=2,
-            z11_copies=[], connector_components=[],
-            connector_edges=[], connector_polynomial=None,
-            component_polynomial=None,
-            summary="D-Wave libraries not available"
-        )
-
-    G_z12 = dnx.zephyr_graph(1, 2)
-    G_z11 = dnx.zephyr_graph(1, 1)
-
-    # Find disjoint Z(1,1) copies
-    GM = isomorphism.GraphMatcher(G_z12, G_z11)
-    all_matches = [frozenset(m.keys()) for m in GM.subgraph_isomorphisms_iter()]
-
-    used_nodes = set()
-    z11_copies = []
-    for nodes in sorted(all_matches, key=lambda x: min(x)):
-        if not (nodes & used_nodes):
-            z11_copies.append(set(nodes))
-            used_nodes.update(nodes)
-
-    # Find connector edges (not in any Z(1,1) copy)
-    all_edges = set(tuple(sorted(e)) for e in G_z12.edges())
-    z11_edges = set()
-    for copy in z11_copies:
-        subg = G_z12.subgraph(copy)
-        for e in subg.edges():
-            z11_edges.add(tuple(sorted(e)))
-
-    connector_edges = list(all_edges - z11_edges)
-
-    # Build connector graph and find components
-    conn_graph = nx.Graph()
-    conn_graph.add_edges_from(connector_edges)
-    components = [set(c) for c in nx.connected_components(conn_graph)]
-
-    # Compute polynomials
-    component_poly = None
-    connector_poly = None
-
-    if components:
-        # Compute polynomial of first component (others are isomorphic)
-        comp1 = conn_graph.subgraph(components[0]).copy()
-        gb_comp = networkx_to_graphbuilder(comp1)
-        component_poly = compute_tutte_polynomial(gb_comp)
-
-        # Connector polynomial is product of component polynomials
-        connector_poly = component_poly
-        for _ in range(len(components) - 1):
-            connector_poly = connector_poly * component_poly
-
-    summary = f"""Z(1,2) Exact Decomposition:
-
-  Total: 24 nodes, 76 edges
-
-  Z(1,1) copies: 2 (disjoint)
-    - Copy 1: {sorted(z11_copies[0]) if z11_copies else []}
-    - Copy 2: {sorted(z11_copies[1]) if len(z11_copies) > 1 else []}
-    - Each: 12 nodes, 22 edges, 69,360 spanning trees
-
-  Connector: 2 isomorphic components
-    - Each component: 12 nodes, 16 edges
-    - Component spanning trees: {component_poly.num_spanning_trees() if component_poly else 'N/A'}
-    - Total connector spanning trees: {connector_poly.num_spanning_trees() if connector_poly else 'N/A'}
-
-  Structure:
-    - Connector is (2,4)-biregular bipartite graph
-    - 4 nodes of degree 4, 8 nodes of degree 2 per component
-    - Unique to Zephyr topology (not a standard named graph)
-"""
-
-    return ZephyrDecomposition(
-        m=1, t=2,
-        z11_copies=z11_copies,
-        connector_components=components,
-        connector_edges=connector_edges,
-        connector_polynomial=connector_poly,
-        component_polynomial=component_poly,
-        summary=summary
-    )
-
-
-def decompose_zephyr_z21() -> ZephyrDecomposition:
-    """
-    Decompose Z(2,1) into Z(1,1) copies and connector.
-
-    Z(2,1) is more complex than Z(1,2):
-    - 40 nodes, 114 edges
-    - Only 2 disjoint Z(1,1) copies fit (24 nodes covered)
-    - 16 uncovered nodes with 70 connector edges
-
-    Returns:
-        ZephyrDecomposition with structural information
-    """
-    try:
-        import dwave_networkx as dnx
-        import networkx as nx
-        from networkx.algorithms import isomorphism
-    except ImportError:
-        return ZephyrDecomposition(
-            m=2, t=1,
-            z11_copies=[], connector_components=[],
-            connector_edges=[], connector_polynomial=None,
-            component_polynomial=None,
-            summary="D-Wave libraries not available"
-        )
-
-    G_z21 = dnx.zephyr_graph(2, 1)
-    G_z11 = dnx.zephyr_graph(1, 1)
-
-    # Find disjoint Z(1,1) copies
-    GM = isomorphism.GraphMatcher(G_z21, G_z11)
-    all_matches = [frozenset(m.keys()) for m in GM.subgraph_isomorphisms_iter()]
-
-    used_nodes = set()
-    z11_copies = []
-    for nodes in sorted(all_matches, key=lambda x: min(x)):
-        if not (nodes & used_nodes):
-            z11_copies.append(set(nodes))
-            used_nodes.update(nodes)
-
-    # Find connector structure
-    all_edges = set(tuple(sorted(e)) for e in G_z21.edges())
-    z11_edges = set()
-    for copy in z11_copies:
-        subg = G_z21.subgraph(copy)
-        for e in subg.edges():
-            z11_edges.add(tuple(sorted(e)))
-
-    connector_edges = list(all_edges - z11_edges)
-    uncovered_nodes = set(G_z21.nodes()) - used_nodes
-
-    # Build connector graph
-    conn_graph = nx.Graph()
-    conn_graph.add_edges_from(connector_edges)
-    conn_graph.add_nodes_from(uncovered_nodes)
-    components = [set(c) for c in nx.connected_components(conn_graph)]
-
-    # Z(2,1) connector is too large (70 edges) for polynomial computation
-    summary = f"""Z(2,1) Decomposition:
-
-  Total: 40 nodes, 114 edges
-
-  Z(1,1) copies: {len(z11_copies)} (maximal disjoint packing)
-    - Nodes covered: {len(used_nodes)} / 40
-    - Uncovered nodes: {len(uncovered_nodes)}
-
-  Connector: 70 edges (too large for Tutte polynomial)
-    - Connected components: {len(components)}
-    - Involves all 40 nodes (cross-connections)
-
-  Note: Z(2,1) has a more complex structure than Z(1,2).
-  The connector cannot be factored into simple components.
-"""
-
-    return ZephyrDecomposition(
-        m=2, t=1,
-        z11_copies=z11_copies,
-        connector_components=components,
-        connector_edges=connector_edges,
-        connector_polynomial=None,  # Too large
-        component_polynomial=None,
-        summary=summary
-    )
-
-
-def get_z12_connector_polynomial() -> TuttePolynomial:
-    """
-    Get the pre-computed Tutte polynomial for Z(1,2)'s connector structure.
-
-    The connector between two Z(1,1) copies in Z(1,2) consists of:
-    - 2 isomorphic components, each with 12 nodes, 16 edges
+    Z(1,t) has a regular structure:
+    - t disjoint Z(1,1) copies
+    - C(t,2) pair-wise connectors (one for each pair of Z(1,1) copies)
+    - Each pair-connector has 32 edges = 2 isomorphic components
     - Each component has 768 spanning trees
-    - Total: 768² = 589,824 spanning trees
+
+    Edge formula: E(Z(1,t)) = 16t² + 6t
+    """
+    t: int
+    nodes: int
+    edges: int
+    z11_copies: List[Set[int]]
+    pair_connectors: Dict[Tuple[int, int], Dict]  # (i,j) -> {edges, components, trees}
+    component_polynomial: Optional[TuttePolynomial]  # Single component (768 trees)
+    pattern_verified: bool
+
+
+def decompose_zephyr_z1t(t: int) -> Z1tDecomposition:
+    """
+    Decompose Z(1,t) into Z(1,1) copies and pair-wise connectors.
+
+    The discovered pattern for Z(1,t):
+    - Contains exactly t disjoint Z(1,1) subgraphs
+    - Each pair of Z(1,1) copies is connected by 32 edges
+    - Those 32 edges form 2 isomorphic components of 16 edges each
+    - Each component is a (2,4)-biregular bipartite graph with 768 spanning trees
+
+    This gives the edge formula:
+        E(Z(1,t)) = t × 22 + C(t,2) × 32 = 16t² + 6t
+
+    Args:
+        t: The Zephyr parameter (Z(1,t))
 
     Returns:
-        TuttePolynomial for the connector
+        Z1tDecomposition with full structural information
     """
-    decomp = decompose_zephyr_z12()
-    if decomp.connector_polynomial:
-        return decomp.connector_polynomial
+    try:
+        import dwave_networkx as dnx
+        import networkx as nx
+        from networkx.algorithms import isomorphism
+    except ImportError:
+        return Z1tDecomposition(
+            t=t, nodes=12*t, edges=16*t*t + 6*t,
+            z11_copies=[], pair_connectors={},
+            component_polynomial=None, pattern_verified=False
+        )
 
-    # Fallback: return the known polynomial
-    # (This was computed and verified)
-    # Component has 768 trees, connector has 768² = 589824 trees
-    raise ValueError("Could not compute Z(1,2) connector polynomial")
+    G = dnx.zephyr_graph(1, t)
+    G_z11 = dnx.zephyr_graph(1, 1)
+
+    # Find t disjoint Z(1,1) copies
+    GM = isomorphism.GraphMatcher(G, G_z11)
+    all_z11 = [frozenset(m.keys()) for m in GM.subgraph_isomorphisms_iter()]
+
+    used = set()
+    z11_copies = []
+    for nodes in sorted(all_z11, key=lambda x: min(x)):
+        if not (nodes & used):
+            z11_copies.append(set(nodes))
+            used.update(nodes)
+
+    # Get connector edges
+    all_edges = set(tuple(sorted(e)) for e in G.edges())
+    z11_edges = set()
+    for copy in z11_copies:
+        subg = G.subgraph(copy)
+        for e in subg.edges():
+            z11_edges.add(tuple(sorted(e)))
+
+    connector_edges = list(all_edges - z11_edges)
+
+    # Analyze pair-wise connectors
+    pair_connectors = {}
+    component_poly = None
+    pattern_verified = True
+
+    for i in range(len(z11_copies)):
+        for j in range(i + 1, len(z11_copies)):
+            pair_edges = [
+                (u, v) for (u, v) in connector_edges
+                if (u in z11_copies[i] and v in z11_copies[j]) or
+                   (v in z11_copies[i] and u in z11_copies[j])
+            ]
+
+            pair_graph = nx.Graph()
+            pair_graph.add_edges_from(pair_edges)
+            components = list(nx.connected_components(pair_graph))
+
+            comp_trees = []
+            for comp_nodes in components:
+                comp = pair_graph.subgraph(comp_nodes).copy()
+                if comp.number_of_edges() <= 20:
+                    gb = networkx_to_graphbuilder(comp)
+                    poly = compute_tutte_polynomial(gb)
+                    comp_trees.append(poly.num_spanning_trees())
+
+                    # Save first component polynomial
+                    if component_poly is None:
+                        component_poly = poly
+
+            pair_connectors[(i, j)] = {
+                'edges': len(pair_edges),
+                'components': len(components),
+                'trees': comp_trees,
+            }
+
+            # Verify pattern
+            if not (len(pair_edges) == 32 and
+                    len(components) == 2 and
+                    comp_trees == [768, 768]):
+                pattern_verified = False
+
+    return Z1tDecomposition(
+        t=t,
+        nodes=G.number_of_nodes(),
+        edges=G.number_of_edges(),
+        z11_copies=z11_copies,
+        pair_connectors=pair_connectors,
+        component_polynomial=component_poly,
+        pattern_verified=pattern_verified,
+    )
+
+
+def z1t_edge_formula(t: int) -> int:
+    """
+    Compute edge count for Z(1,t) using the discovered formula.
+
+    E(Z(1,t)) = 16t² + 6t
+
+    Derivation:
+    - t Z(1,1) copies contribute t × 22 = 22t edges
+    - C(t,2) = t(t-1)/2 pairs, each with 32 connector edges
+    - Total: 22t + 32 × t(t-1)/2 = 22t + 16t(t-1) = 16t² + 6t
+    """
+    return 16 * t * t + 6 * t
+
+
+def z1t_connector_structure(t: int) -> str:
+    """
+    Return a description of Z(1,t)'s connector structure.
+    """
+    num_pairs = t * (t - 1) // 2
+    num_components = 2 * num_pairs
+    connector_edges = 32 * num_pairs
+
+    return f"""Z(1,{t}) Connector Structure:
+
+  Z(1,1) copies: {t}
+  Pair-wise connectors: {num_pairs} (one per pair of Z(1,1) copies)
+
+  Per-pair connector:
+    - 32 edges
+    - 2 isomorphic components
+    - Each component: 12 nodes, 16 edges, 768 spanning trees
+    - Component is (2,4)-biregular bipartite graph
+
+  Total connector:
+    - {connector_edges} edges
+    - {num_components} components
+    - If independent: 768^{num_components} spanning trees
+
+  Edge formula verification:
+    E(Z(1,{t})) = 16({t})² + 6({t}) = {16*t*t} + {6*t} = {z1t_edge_formula(t)}
+"""
 
 
 if __name__ == "__main__":

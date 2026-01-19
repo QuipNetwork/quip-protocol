@@ -510,6 +510,131 @@ class TestSynthesisEngine(unittest.TestCase):
 
 
 # =============================================================================
+# Z(1,t) DECOMPOSITION TESTS
+# =============================================================================
+
+class TestZ1tDecomposition(unittest.TestCase):
+    """Test the Z(1,t) Zephyr graph decomposition pattern."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Check if D-Wave libraries are available."""
+        try:
+            import dwave_networkx
+            cls.dwave_available = True
+        except ImportError:
+            cls.dwave_available = False
+
+    def test_z1t_edge_formula(self):
+        """Test that edge formula E(Z(1,t)) = 16t² + 6t is correct."""
+        from tutte_test.tutte_synthesis import z1t_edge_formula
+
+        # Known values
+        self.assertEqual(z1t_edge_formula(1), 22)   # Z(1,1)
+        self.assertEqual(z1t_edge_formula(2), 76)   # Z(1,2)
+        self.assertEqual(z1t_edge_formula(3), 162)  # Z(1,3)
+        self.assertEqual(z1t_edge_formula(4), 280)  # Z(1,4)
+        self.assertEqual(z1t_edge_formula(5), 430)  # Z(1,5)
+
+    def test_z12_decomposition_pattern(self):
+        """Test Z(1,2) decomposes into 2 Z(1,1) copies + connector."""
+        if not self.dwave_available:
+            self.skipTest("D-Wave libraries not available")
+
+        from tutte_test.tutte_synthesis import decompose_zephyr_z1t
+
+        decomp = decompose_zephyr_z1t(2)
+
+        # Should have exactly 2 Z(1,1) copies
+        self.assertEqual(len(decomp.z11_copies), 2)
+
+        # Should have 1 pair with correct structure
+        self.assertEqual(len(decomp.pair_connectors), 1)
+
+        pair_info = list(decomp.pair_connectors.values())[0]
+        self.assertEqual(pair_info['edges'], 32)
+        self.assertEqual(pair_info['components'], 2)
+        self.assertEqual(pair_info['trees'], [768, 768])
+
+        # Pattern should be verified
+        self.assertTrue(decomp.pattern_verified)
+
+    def test_z13_decomposition_pattern(self):
+        """Test Z(1,3) decomposes into 3 Z(1,1) copies + 3 pair connectors."""
+        if not self.dwave_available:
+            self.skipTest("D-Wave libraries not available")
+
+        from tutte_test.tutte_synthesis import decompose_zephyr_z1t
+
+        decomp = decompose_zephyr_z1t(3)
+
+        # Should have exactly 3 Z(1,1) copies
+        self.assertEqual(len(decomp.z11_copies), 3)
+
+        # Should have 3 pairs (C(3,2) = 3)
+        self.assertEqual(len(decomp.pair_connectors), 3)
+
+        # Each pair should have same connector structure
+        for pair_info in decomp.pair_connectors.values():
+            self.assertEqual(pair_info['edges'], 32)
+            self.assertEqual(pair_info['components'], 2)
+            self.assertEqual(pair_info['trees'], [768, 768])
+
+        # Pattern should be verified
+        self.assertTrue(decomp.pattern_verified)
+
+    def test_z14_decomposition_pattern(self):
+        """Test Z(1,4) decomposes into 4 Z(1,1) copies + 6 pair connectors."""
+        if not self.dwave_available:
+            self.skipTest("D-Wave libraries not available")
+
+        from tutte_test.tutte_synthesis import decompose_zephyr_z1t
+
+        decomp = decompose_zephyr_z1t(4)
+
+        # Should have exactly 4 Z(1,1) copies
+        self.assertEqual(len(decomp.z11_copies), 4)
+
+        # Should have 6 pairs (C(4,2) = 6)
+        self.assertEqual(len(decomp.pair_connectors), 6)
+
+        # Pattern should be verified
+        self.assertTrue(decomp.pattern_verified)
+
+    def test_connector_component_trees(self):
+        """Test that connector component has exactly 768 spanning trees."""
+        if not self.dwave_available:
+            self.skipTest("D-Wave libraries not available")
+
+        from tutte_test.tutte_synthesis import (
+            decompose_zephyr_z1t,
+            ZEPHYR_CONNECTOR_COMPONENT_TREES,
+        )
+
+        decomp = decompose_zephyr_z1t(2)
+
+        self.assertIsNotNone(decomp.component_polynomial)
+        self.assertEqual(
+            decomp.component_polynomial.num_spanning_trees(),
+            ZEPHYR_CONNECTOR_COMPONENT_TREES
+        )
+        self.assertEqual(ZEPHYR_CONNECTOR_COMPONENT_TREES, 768)
+
+    def test_edge_count_matches_formula(self):
+        """Test that actual edge counts match the formula for t=2,3,4."""
+        if not self.dwave_available:
+            self.skipTest("D-Wave libraries not available")
+
+        from tutte_test.tutte_synthesis import decompose_zephyr_z1t, z1t_edge_formula
+
+        for t in [2, 3, 4]:
+            decomp = decompose_zephyr_z1t(t)
+            expected = z1t_edge_formula(t)
+            self.assertEqual(decomp.edges, expected,
+                           f"Z(1,{t}) edge count mismatch: {decomp.edges} != {expected}")
+
+
+# =============================================================================
 # BENCHMARK FUNCTIONS (not unittest)
 # =============================================================================
 
