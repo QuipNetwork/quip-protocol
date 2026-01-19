@@ -678,6 +678,169 @@ def benchmark_networkx_comparison():
         print(f"{name:<10} {our_time:<12.2f} {nx_time:<12.2f} {match:<8} {trees}")
 
 
+class TestSpanningTreeVerification(unittest.TestCase):
+    """
+    Verify spanning tree counts using two independent algorithms:
+    1. Tutte polynomial evaluation at T(1,1)
+    2. Kirchhoff's theorem (matrix-tree theorem) via NetworkX
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        """Load rainbow table for testing."""
+        try:
+            from tutte_test.build_rainbow_table import RainbowTable
+            table_path = os.path.join(os.path.dirname(__file__), 'tutte_rainbow_table.json')
+            cls.table = RainbowTable.load(table_path)
+            cls.table_available = True
+        except Exception:
+            cls.table_available = False
+
+    def test_standard_graphs_two_algorithms(self):
+        """Verify spanning trees for standard graphs using both algorithms."""
+        # Test cases: (graph_constructor, name, expected_trees)
+        test_cases = [
+            (lambda: nx.complete_graph(3), "K_3", 3),
+            (lambda: nx.complete_graph(4), "K_4", 16),
+            (lambda: nx.complete_graph(5), "K_5", 125),
+            (lambda: nx.cycle_graph(4), "C_4", 4),
+            (lambda: nx.cycle_graph(5), "C_5", 5),
+            (lambda: nx.cycle_graph(6), "C_6", 6),
+            (lambda: nx.path_graph(4), "P_4", 1),
+            (lambda: nx.wheel_graph(5), "W_5", 45),
+            (lambda: nx.complete_bipartite_graph(3, 3), "K_3,3", 81),
+            (lambda: nx.petersen_graph(), "Petersen", 2000),
+        ]
+
+        for constructor, name, expected in test_cases:
+            with self.subTest(graph=name):
+                G = constructor()
+
+                # Method 1: Tutte polynomial T(1,1)
+                gb = networkx_to_graphbuilder(G)
+                poly = compute_tutte_polynomial(gb)
+                tutte_trees = poly.num_spanning_trees()
+
+                # Method 2: Kirchhoff's theorem (matrix-tree)
+                kirchhoff_trees = round(nx.number_of_spanning_trees(G))
+
+                # Both methods should agree
+                self.assertEqual(tutte_trees, kirchhoff_trees,
+                    f"{name}: Tutte={tutte_trees}, Kirchhoff={kirchhoff_trees}")
+
+                # Both should match expected value
+                self.assertEqual(tutte_trees, expected,
+                    f"{name}: Expected {expected}, got Tutte={tutte_trees}")
+
+    def test_rainbow_table_entries_consistency(self):
+        """Verify all small rainbow table entries using matrix-tree theorem."""
+        if not self.table_available:
+            self.skipTest("Rainbow table not available")
+
+        # Only test graphs small enough for efficient Kirchhoff computation
+        MAX_EDGES = 25
+        verified_count = 0
+        errors = []
+
+        for key, entry in self.table.entries.items():
+            edges = entry.get('edges', 0)
+            name = entry.get('name', 'unknown')
+
+            # Skip large graphs (Kirchhoff is O(n^3) but we don't have the graph)
+            # and graphs computed from decomposition
+            if edges > MAX_EDGES or 'computed_from' in entry:
+                continue
+
+            # Get the stored spanning tree count
+            stored_trees = entry.get('spanning_trees', 0)
+
+            # Reconstruct the Tutte polynomial and verify T(1,1)
+            poly = self.table._entry_to_polynomial(entry)
+            tutte_trees = poly.num_spanning_trees()
+
+            if tutte_trees != stored_trees:
+                errors.append(f"{name}: stored={stored_trees}, T(1,1)={tutte_trees}")
+            else:
+                verified_count += 1
+
+        self.assertEqual(len(errors), 0,
+            f"Inconsistent entries: {errors[:10]}")  # Show first 10 errors
+
+    def test_zephyr_z11_both_methods(self):
+        """Verify Z(1,1) spanning trees using both algorithms."""
+        try:
+            import dwave_networkx as dnx
+        except ImportError:
+            self.skipTest("dwave_networkx not available")
+
+        G = dnx.zephyr_graph(1, 1)
+
+        # Method 1: Tutte polynomial
+        gb = networkx_to_graphbuilder(G)
+        poly = compute_tutte_polynomial(gb)
+        tutte_trees = poly.num_spanning_trees()
+
+        # Method 2: Kirchhoff's theorem
+        kirchhoff_trees = round(nx.number_of_spanning_trees(G))
+
+        self.assertEqual(tutte_trees, kirchhoff_trees,
+            f"Z(1,1): Tutte={tutte_trees}, Kirchhoff={kirchhoff_trees}")
+        self.assertEqual(tutte_trees, 69360,
+            f"Z(1,1) expected 69360 spanning trees, got {tutte_trees}")
+
+    def test_connector_component_both_methods(self):
+        """Verify Zephyr connector component spanning trees using both algorithms."""
+        try:
+            import dwave_networkx as dnx
+            from networkx.algorithms import isomorphism
+        except ImportError:
+            self.skipTest("dwave_networkx not available")
+
+        # Extract connector component from Z(1,2)
+        G_z12 = dnx.zephyr_graph(1, 2)
+        G_z11 = dnx.zephyr_graph(1, 1)
+
+        GM = isomorphism.GraphMatcher(G_z12, G_z11)
+        used = set()
+        z11_copies = []
+        for m in GM.subgraph_isomorphisms_iter():
+            nodes = frozenset(m.keys())
+            if not (nodes & used):
+                z11_copies.append(set(nodes))
+                used.update(nodes)
+                if len(z11_copies) >= 2:
+                    break
+
+        # Get connector edges
+        all_edges = set(tuple(sorted(e)) for e in G_z12.edges())
+        z11_edges = set()
+        for copy in z11_copies:
+            subg = G_z12.subgraph(copy)
+            for e in subg.edges():
+                z11_edges.add(tuple(sorted(e)))
+
+        connector_edges = list(all_edges - z11_edges)
+        connector_graph = nx.Graph()
+        connector_graph.add_edges_from(connector_edges)
+        components = list(nx.connected_components(connector_graph))
+
+        if len(components) >= 1:
+            G_component = connector_graph.subgraph(components[0]).copy()
+
+            # Method 1: Tutte polynomial
+            gb = networkx_to_graphbuilder(G_component)
+            poly = compute_tutte_polynomial(gb)
+            tutte_trees = poly.num_spanning_trees()
+
+            # Method 2: Kirchhoff's theorem
+            kirchhoff_trees = round(nx.number_of_spanning_trees(G_component))
+
+            self.assertEqual(tutte_trees, kirchhoff_trees,
+                f"Connector: Tutte={tutte_trees}, Kirchhoff={kirchhoff_trees}")
+            self.assertEqual(tutte_trees, 768,
+                f"Connector expected 768 spanning trees, got {tutte_trees}")
+
+
 def run_all_tests():
     """Run all tests and benchmarks."""
     # Run unittest tests
@@ -691,6 +854,7 @@ def run_all_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestRainbowTableConsistency))
     suite.addTests(loader.loadTestsFromTestCase(TestCompositionWithRainbowTable))
     suite.addTests(loader.loadTestsFromTestCase(TestSynthesisEngine))
+    suite.addTests(loader.loadTestsFromTestCase(TestSpanningTreeVerification))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

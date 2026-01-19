@@ -57,6 +57,12 @@ class RainbowTable:
     # Name index for lookup by name
     name_index: Dict[str, str] = field(default_factory=dict)
 
+    # Minor relationships: graph_name -> list of minor graph names
+    minor_relationships: Dict[str, List[str]] = field(default_factory=dict)
+
+    # Minor relationship summary
+    minor_summary: Dict[str, any] = field(default_factory=dict)
+
     # Statistics
     stats: Dict[str, int] = field(default_factory=lambda: {
         'hits': 0, 'misses': 0, 'computations': 0
@@ -168,6 +174,14 @@ class RainbowTable:
             'note': 'Coefficients stored as "i,j": coefficient for x^i * y^j',
             'graphs': self.entries,
         }
+
+        # Include minor relationships if computed
+        if self.minor_relationships:
+            output['minor_relationships'] = {
+                'summary': self.minor_summary,
+                'relationships': self.minor_relationships,
+            }
+
         with open(filepath, 'w') as f:
             json.dump(output, f, indent=2)
         return os.path.getsize(filepath)
@@ -193,6 +207,12 @@ class RainbowTable:
         for key, entry in table.entries.items():
             if 'name' in entry:
                 table.name_index[entry['name']] = key
+
+        # Load minor relationships if present
+        if 'minor_relationships' in data:
+            minor_data = data['minor_relationships']
+            table.minor_relationships = minor_data.get('relationships', {})
+            table.minor_summary = minor_data.get('summary', {})
 
         return table
 
@@ -380,6 +400,140 @@ def build_zephyr_z11(table: RainbowTable, verbose: bool = True):
         print(f"Z(1,1): {G.number_of_edges()} edges, T(1,1)={t.num_spanning_trees()}")
 
 
+def build_zephyr_z1t_connectors(table: RainbowTable, verbose: bool = True):
+    """
+    Add Zephyr Z(1,t) graphs and connector components to the rainbow table.
+
+    Discovers the Z(1,t) decomposition pattern by analyzing Z(1,2):
+    - t copies of Z(1,1)
+    - C(t,2) = t(t-1)/2 pair-wise connectors between Z(1,1) copies
+    - Each pair connector has multiple components
+
+    Computes Z(1,2), Z(1,3), Z(1,4) from assembled minors.
+    """
+
+    if not DWAVE_AVAILABLE:
+        if verbose:
+            print("\n--- Zephyr Z(1,t) graphs: SKIPPED (dwave_networkx not available) ---")
+        return
+
+    if verbose:
+        print("\n--- Zephyr Z(1,t) Graphs ---")
+
+    try:
+        from networkx.algorithms import isomorphism
+
+        # Build Z(1,2) and Z(1,1) for component extraction
+        if verbose:
+            print("  Building Z(1,2) and Z(1,1) graphs...")
+        G_z12 = dnx.zephyr_graph(1, 2)
+        G_z11 = dnx.zephyr_graph(1, 1)
+
+        # Find 2 disjoint Z(1,1) copies in Z(1,2)
+        if verbose:
+            print("  Finding Z(1,1) subgraph isomorphisms...")
+        GM = isomorphism.GraphMatcher(G_z12, G_z11)
+
+        used = set()
+        z11_copies = []
+        count = 0
+        for m in GM.subgraph_isomorphisms_iter():
+            count += 1
+            nodes = frozenset(m.keys())
+            if not (nodes & used):
+                z11_copies.append(set(nodes))
+                used.update(nodes)
+                if verbose:
+                    print(f"    Found Z(1,1) copy {len(z11_copies)} (after {count} isomorphisms)")
+                if len(z11_copies) >= 2:
+                    break
+
+        if len(z11_copies) < 2:
+            if verbose:
+                print("  Warning: Could not find 2 Z(1,1) copies in Z(1,2)")
+            return
+
+        # Extract connector edges (edges not in any Z(1,1) copy)
+        if verbose:
+            print("  Extracting connector structure...")
+        all_edges = set(tuple(sorted(e)) for e in G_z12.edges())
+        z11_edges = set()
+        for copy in z11_copies:
+            subg = G_z12.subgraph(copy)
+            for e in subg.edges():
+                z11_edges.add(tuple(sorted(e)))
+
+        connector_edges = list(all_edges - z11_edges)
+        connector_graph = nx.Graph()
+        connector_graph.add_edges_from(connector_edges)
+        components = list(nx.connected_components(connector_graph))
+
+        if verbose:
+            print(f"    Connector: {len(connector_edges)} edges, {len(components)} components")
+
+        # Add connector component to table (discover its properties, don't assume)
+        component_poly = None
+        num_components_per_pair = len(components)
+
+        if len(components) >= 1:
+            comp_nodes = components[0]
+            G_component = connector_graph.subgraph(comp_nodes).copy()
+            component_poly = table.add(G_component, 'Zephyr_connector_component')
+
+            if verbose:
+                print(f"  Zephyr_connector_component: {G_component.number_of_nodes()} nodes, "
+                      f"{G_component.number_of_edges()} edges, T(1,1)={component_poly.num_spanning_trees()}")
+
+        # Get Z(1,1) polynomial
+        z11_poly = table.lookup_by_name('Z(1,1)')
+        if not z11_poly or not component_poly:
+            if verbose:
+                print("  Warning: Missing Z(1,1) or connector polynomial")
+            return
+
+        # Compute Z(1,t) for t = 2, 3, 4 using the discovered pattern:
+        # Z(1,t) = (Z(1,1))^t × (connector_component)^(num_components_per_pair × C(t,2))
+        # where C(t,2) = t(t-1)/2 is the number of pairs
+        for t in range(2, 5):
+            if verbose:
+                print(f"  Computing Z(1,{t}) from assembled minors...")
+
+            G_z1t = dnx.zephyr_graph(1, t)
+            num_pairs = t * (t - 1) // 2
+            num_connector_components = num_components_per_pair * num_pairs
+
+            # Compute polynomial: Z(1,1)^t × connector^num_connector_components
+            z1t_poly = z11_poly
+            for _ in range(t - 1):
+                z1t_poly = z1t_poly * z11_poly
+            for _ in range(num_connector_components):
+                z1t_poly = z1t_poly * component_poly
+
+            # Store in table
+            key = graph_to_canonical_key(G_z1t)
+            table.entries[key] = {
+                'name': f'Z(1,{t})',
+                'nodes': G_z1t.number_of_nodes(),
+                'edges': G_z1t.number_of_edges(),
+                'spanning_trees': z1t_poly.num_spanning_trees(),
+                'coefficients': {f"{i},{j}": c for (i, j), c in z1t_poly.coefficients.items()},
+                'computed_from': f'Z(1,t) decomposition: {t}×Z(1,1) + {num_connector_components}×connector_component',
+            }
+            table.name_index[f'Z(1,{t})'] = key
+
+            if verbose:
+                print(f"  Z(1,{t}): {G_z1t.number_of_nodes()} nodes, "
+                      f"{G_z1t.number_of_edges()} edges, T(1,1)={z1t_poly.num_spanning_trees()}")
+                print(f"    Structure: {t}×Z(1,1) + {num_pairs} pairs × {num_components_per_pair} components = "
+                      f"{num_connector_components} connector components")
+
+    except Exception as e:
+        if verbose:
+            import traceback
+            print(f"  Error building Z(1,t) graphs: {e}")
+            traceback.print_exc()
+
+
 def build_pegasus_minors(table: RainbowTable, verbose: bool = True):
     """
     Extract and catalog minors from Pegasus topology.
@@ -443,19 +597,123 @@ def build_pegasus_minors(table: RainbowTable, verbose: bool = True):
             print(f"  {size} nodes: {minor_counts[size]} unique minors")
 
 
+def build_minor_relationships(table: RainbowTable, verbose: bool = True):
+    """
+    Compute and store minor relationships for all graphs in the table.
+
+    A polynomial P1 is a "minor" of P2 if P2 - P1 has all non-negative coefficients.
+    This suggests P2's graph could structurally contain P1's graph.
+    """
+    if verbose:
+        print("\n--- Computing Minor Relationships ---")
+
+    try:
+        # Load all polynomials with progress
+        polys = {}
+        names = list(table.name_index.keys())
+        n = len(names)
+
+        if verbose:
+            print(f"  Loading {n} polynomials...")
+
+        for name in names:
+            key = table.name_index[name]
+            entry = table.entries[key]
+            polys[name] = table._entry_to_polynomial(entry)
+
+        # Compute minor relationships with progress
+        minor_of = defaultdict(list)
+        total_comparisons = n * n
+        comparisons_done = 0
+        last_percent = -1
+
+        if verbose:
+            print(f"  Computing {total_comparisons:,} polynomial comparisons...")
+
+        for name1, poly1 in polys.items():
+            for name2, poly2 in polys.items():
+                comparisons_done += 1
+
+                # Progress update every 5%
+                percent = (comparisons_done * 100) // total_comparisons
+                if verbose and percent >= last_percent + 5:
+                    last_percent = percent
+                    print(f"    Progress: {percent}% ({comparisons_done:,}/{total_comparisons:,})")
+
+                if name1 == name2:
+                    continue
+
+                # Check if poly1 is a minor of poly2 (poly2 - poly1 >= 0)
+                all_non_negative = True
+                diff_coeffs = defaultdict(int, poly2.coefficients)
+                for k, v in poly1.coefficients.items():
+                    diff_coeffs[k] -= v
+
+                for c in diff_coeffs.values():
+                    if c < 0:
+                        all_non_negative = False
+                        break
+
+                if all_non_negative:
+                    minor_of[name2].append(name1)
+
+        table.minor_relationships = dict(minor_of)
+
+        # Compute summary statistics
+        total_rels = sum(len(v) for v in minor_of.values())
+
+        if minor_of:
+            max_graph = max(minor_of.items(), key=lambda x: len(x[1]))
+            max_name, max_minors = max_graph
+            max_count = len(max_minors)
+        else:
+            max_name, max_count = "None", 0
+
+        # Find Zephyr-specific relationships
+        zephyr_minors = {
+            name: minors for name, minors in minor_of.items()
+            if 'Z(' in name or 'Zephyr' in name
+        }
+
+        table.minor_summary = {
+            'total_relationships': total_rels,
+            'graphs_with_minors': len(minor_of),
+            'max_minors_graph': max_name,
+            'max_minors_count': max_count,
+            'zephyr_graphs_with_minors': len(zephyr_minors),
+        }
+
+        if verbose:
+            print(f"  Total relationships: {total_rels}")
+            print(f"  Graphs with minors: {len(minor_of)}")
+            print(f"  Graph with most minors: {max_name} ({max_count} minors)")
+            if zephyr_minors:
+                print(f"  Zephyr graphs with minors: {len(zephyr_minors)}")
+                for name, minors in sorted(zephyr_minors.items()):
+                    print(f"    {name}: {len(minors)} minors")
+
+    except Exception as e:
+        if verbose:
+            import traceback
+            print(f"  Error computing minor relationships: {e}")
+            traceback.print_exc()
+
+
 def build_full_table(verbose: bool = True) -> RainbowTable:
     """
     Build complete rainbow table with all graph families.
 
     Returns:
-        RainbowTable with standard graphs, Zephyr minors, Z(1,1), and Pegasus minors
+        RainbowTable with standard graphs, Zephyr graphs, Z(1,t) connectors, and Pegasus minors
     """
     table = RainbowTable()
 
     build_standard_graphs(table, verbose=verbose)
     build_zephyr_minors(table, verbose=verbose)
     build_zephyr_z11(table, verbose=verbose)
+    build_zephyr_z1t_connectors(table, verbose=verbose)
     build_pegasus_minors(table, verbose=verbose)
+    build_minor_relationships(table, verbose=verbose)
 
     return table
 

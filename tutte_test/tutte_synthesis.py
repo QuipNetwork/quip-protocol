@@ -962,13 +962,21 @@ def find_covering_set(
 
 
 def find_minor_relationships(
-    rainbow_table: Optional['RainbowTable'] = None
+    rainbow_table: Optional['RainbowTable'] = None,
+    force_recompute: bool = False
 ) -> Dict[str, List[str]]:
     """
     Find which polynomials in the rainbow table are "minors" of others.
 
     A polynomial P1 is a minor of P2 if P2 - P1 has all non-negative coefficients.
     This means P2's graph could potentially contain P1's graph as a minor.
+
+    First checks if minor_relationships are already stored in the rainbow table.
+    Only recomputes if not present or force_recompute is True.
+
+    Args:
+        rainbow_table: RainbowTable to analyze (loads from file if None)
+        force_recompute: If True, recompute even if relationships exist in table
 
     Returns:
         Dict mapping polynomial name to list of its minor names
@@ -981,7 +989,11 @@ def find_minor_relationships(
         except Exception:
             return {}
 
-    # Load all polynomials
+    # Check if minor_relationships are already in the rainbow table
+    if not force_recompute and hasattr(rainbow_table, 'minor_relationships') and rainbow_table.minor_relationships:
+        return rainbow_table.minor_relationships
+
+    # Load all polynomials and compute relationships
     polys = {}
     for key, entry in rainbow_table.entries.items():
         polys[entry['name']] = rainbow_table._entry_to_polynomial(entry)

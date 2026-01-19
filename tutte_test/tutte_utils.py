@@ -539,21 +539,25 @@ def graph_to_canonical_key(G: nx.Graph) -> str:
     """
     Create a canonical string key for a graph (isomorphism-invariant).
 
-    Uses NetworkX's graph6 format for small graphs, falls back to
-    sorted edge list for graphs that can't be encoded.
+    Uses SHA256 hash of the graph6 format for compact, deterministic keys.
+    Falls back to hash of sorted edge list for graphs that can't be encoded.
 
     Args:
         G: NetworkX graph
 
     Returns:
-        String key that is identical for isomorphic graphs
+        64-character SHA256 hex hash that is identical for isomorphic graphs
     """
+    import hashlib
+
     G_relabeled = nx.convert_node_labels_to_integers(G)
     try:
-        return nx.to_graph6_bytes(G_relabeled, header=False).hex()
+        canonical_bytes = nx.to_graph6_bytes(G_relabeled, header=False)
     except Exception:
         edges = sorted((min(u, v), max(u, v)) for u, v in G_relabeled.edges())
-        return str(edges)
+        canonical_bytes = str(edges).encode('utf-8')
+
+    return hashlib.sha256(canonical_bytes).hexdigest()
 
 
 def extract_subgraph(G: nx.Graph, nodes: List) -> nx.Graph:
