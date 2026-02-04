@@ -22,7 +22,7 @@ from dwave_topologies.topologies import (
     PEGASUS_P16_TOPOLOGY,
     ZEPHYR_Z12_TOPOLOGY,
     ZEPHYR_Z11_T4_TOPOLOGY,
-    ADVANTAGE2_SYSTEM1_10_TOPOLOGY
+    ADVANTAGE2_SYSTEM1_11_TOPOLOGY
 )
 
 
@@ -56,7 +56,7 @@ def report_topology(name: str, quiet: bool = False):
         'z12': ZEPHYR_Z12_TOPOLOGY,
         'z11t4': ZEPHYR_Z11_T4_TOPOLOGY,
         'zephyr': DEFAULT_TOPOLOGY,  # Use default topology (currently Z11T4)
-        'advantage2': ADVANTAGE2_SYSTEM1_10_TOPOLOGY,
+        'advantage2': ADVANTAGE2_SYSTEM1_11_TOPOLOGY,
     }
 
     topology_obj = topology_map.get(name.lower())

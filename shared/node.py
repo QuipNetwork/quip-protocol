@@ -197,8 +197,16 @@ class Node:
 
         # QPU Miners, 1 per qpu section
         if cfg.get("qpu") is not None:
-            spec = {"id": f"{self.node_id}-QPU-1", "kind": "qpu"}
-            # QPU requires no config at this time.
+            qpu_cfg = cfg.get("qpu", {})
+            spec = {
+                "id": f"{self.node_id}-QPU-1",
+                "kind": "qpu",
+                "cfg": {
+                    "qpu_daily_budget": qpu_cfg.get("qpu_daily_budget"),
+                    "qpu_min_blocks_for_estimation": qpu_cfg.get("qpu_min_blocks_for_estimation", 5),
+                    "qpu_ema_alpha": qpu_cfg.get("qpu_ema_alpha", 0.3),
+                }
+            }
             self.miner_handles.append(MinerHandle(spec, self._log_queue))
 
         # Back-compat summary list for logs (do not assign to typed self.miners)

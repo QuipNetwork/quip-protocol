@@ -424,6 +424,8 @@ def gpu(
 @click.option("--dwave-api-key", type=str, default=None, help="D-Wave API key")
 @click.option("--dwave-api-solver", type=str, default=None, help="D-Wave solver name")
 @click.option("--dwave-region-url", type=str, default=None, help="D-Wave SAPI region endpoint URL")
+# QPU time budget options
+@click.option("--qpu-daily-budget", type=str, default=None, help="Daily QPU time budget (e.g., 40s, 2m) - calculate from your Leap allocation")
 # Other
 @click.option("--genesis-config", type=str, default="genesis_block.json", show_default=True, help="Genesis block configuration file")
 @click.option("--debug-config", is_flag=True, help="Print final configuration as JSON")
@@ -447,6 +449,7 @@ def qpu(
     dwave_api_key: Optional[str],
     dwave_api_solver: Optional[str],
     dwave_region_url: Optional[str],
+    qpu_daily_budget: Optional[str],
     genesis_config: str,
     debug_config: bool,
 ):
@@ -487,6 +490,10 @@ def qpu(
         os.environ["DWAVE_API_SOLVER"] = qpu_cfg["dwave_api_solver"]
     if "dwave_region_url" in qpu_cfg and "DWAVE_REGION_URL" not in os.environ:
         os.environ["DWAVE_REGION_URL"] = qpu_cfg["dwave_region_url"]
+
+    # Handle QPU daily budget CLI option
+    if qpu_daily_budget is not None:
+        qpu_cfg["qpu_daily_budget"] = qpu_daily_budget
 
     if not qpu_cfg:
         qpu_cfg = {}

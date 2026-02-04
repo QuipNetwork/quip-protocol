@@ -403,7 +403,7 @@ def main():
         '--topology',
         type=str,
         help='Topology to use. Can be: file path (e.g., "dwave_topologies/topologies/advantage2_system1_7.json.gz"), '
-             'hardware name (e.g., "Advantage2_system1.10"), or Zephyr format (e.g., "Z(12,4)"). '
+             'hardware name (e.g., "Advantage2_system1.11"), or Zephyr format (e.g., "Z(12,4)"). '
              'Takes precedence over --embedding.'
     )
     args = parser.parse_args()

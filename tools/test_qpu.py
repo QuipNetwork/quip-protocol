@@ -257,7 +257,7 @@ def main():
         '--topology',
         type=str,
         default=None,
-        help='Topology name (default: DEFAULT_TOPOLOGY=Z(9,2)). Examples: "Z(9,2)", "Advantage2_system1.10"'
+        help='Topology name (default: DEFAULT_TOPOLOGY=Z(9,2)). Examples: "Z(9,2)", "Advantage2_system1.11"'
     )
     parser.add_argument(
         '--output', '-o',

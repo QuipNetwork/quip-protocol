@@ -60,3 +60,8 @@ http_log = "logs/quip-node-http.log"  # Path to HTTP/aiohttp log file (optional,
 dwave_api_key = "..."
 dwave_api_solver = "Advantage_system6.4"
 dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+
+# QPU Time Budget Management
+# Daily budget with proportional pacing - spreads usage across the day
+# Calculate from your monthly allocation (e.g., 30 min/month = 60s/day)
+qpu_daily_budget = "60s"

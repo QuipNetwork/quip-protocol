@@ -105,7 +105,18 @@ def build_miner_from_spec(spec: Dict[str, Any]):
     elif kind == "modal":
         return GPU.ModalMiner(miner_id, **cfg, **args)
     elif kind == "qpu":
-        return QPU.DWaveMiner(miner_id, **cfg)
+        # Build QPU time config if daily budget is specified
+        time_config = None
+        if cfg.get("qpu_daily_budget"):
+            from QPU.qpu_time_manager import QPUTimeConfig, parse_duration
+            time_config = QPUTimeConfig(
+                daily_budget_seconds=parse_duration(cfg["qpu_daily_budget"]),
+                min_blocks_for_estimation=cfg.get("qpu_min_blocks_for_estimation", 5),
+                ema_alpha=cfg.get("qpu_ema_alpha", 0.3),
+            )
+            # Remove time config keys from cfg to avoid passing them to miner
+            cfg = {k: v for k, v in cfg.items() if not k.startswith("qpu_")}
+        return QPU.DWaveMiner(miner_id, time_config=time_config, **cfg)
     else:
         raise ValueError(f"Unknown miner kind '{kind}'")
 

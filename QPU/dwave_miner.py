@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Optional, cast, Mapping, Tuple, Any, Dict, Union
 
 from QPU.dwave_sampler import DWaveSamplerWrapper, EmbeddedFuture
+from QPU.qpu_time_manager import QPUTimeManager, QPUTimeConfig
 from shared.base_miner import BaseMiner, MiningResult
 from shared.quantum_proof_of_work import (
     ising_nonce_from_block,
@@ -39,7 +40,7 @@ class DWaveMiner(BaseMiner):
         miner_id: str,
         topology: DWaveTopology = DEFAULT_TOPOLOGY,
         embedding_file: Optional[str] = None,
-        qpu_timeout: float = 360.0,
+        time_config: Optional[QPUTimeConfig] = None,
         queue_depth: int = 10,
         **cfg
     ):
@@ -52,9 +53,9 @@ class DWaveMiner(BaseMiner):
                      Can be any DWaveTopology (Zephyr, Advantage2, etc.)
             embedding_file: Optional path to embedding file. If None and topology requires
                           embedding, will auto-discover precomputed embedding.
-            qpu_timeout: Minimum seconds between QPU streaming attempts (default: 360.0).
-                        Set to 0.0 to disable rate limiting. Within an attempt, problems
-                        are streamed continuously until a valid result is found.
+            time_config: Optional QPUTimeConfig for time budget management. If provided,
+                        the miner will track QPU time usage and skip mining when the
+                        budget is exhausted (accounting for reserve time).
             queue_depth: Number of problems to keep in-flight in the QPU queue (default: 10).
                         Higher values increase throughput but may waste QPU time if
                         early results are valid.
@@ -70,9 +71,15 @@ class DWaveMiner(BaseMiner):
         self.miner_type = "QPU"
         self.topology = topology
 
-        # QPU rate limiting configuration
-        self.qpu_timeout = qpu_timeout  # Minimum seconds between QPU streaming attempts (0.0 = disabled)
-        self.last_qpu_attempt_time = 0.0  # Track last QPU streaming attempt start time
+        # QPU time budget management
+        self.time_manager: Optional[QPUTimeManager] = None
+        if time_config is not None:
+            self.time_manager = QPUTimeManager(time_config)
+            self.logger.info(
+                f"[QPU] Daily budget enabled: {time_config.daily_budget_seconds:.1f}s/day"
+            )
+        else:
+            self.logger.info("[QPU] Daily budget management disabled - no budget configured")
 
         # Streaming queue configuration
         self.queue_depth = queue_depth  # Number of problems to keep in-flight
@@ -249,29 +256,29 @@ class DWaveMiner(BaseMiner):
         )
         self.logger.info(f"{self.miner_id} - Adaptive params: {params}")
 
-        # QPU rate limiting: wait if we've run too recently
-        current_time = time.time()
-        time_since_last_attempt = current_time - self.last_qpu_attempt_time
-
-        if time_since_last_attempt < self.qpu_timeout:
-            wait_time = self.qpu_timeout - time_since_last_attempt
-            self.logger.info(f"[QPU] Rate limiting: waiting {wait_time:.1f}s before streaming attempt (timeout={self.qpu_timeout}s)")
-
-            # Check stop event during wait to allow early termination
-            while wait_time > 0 and not stop_event.is_set():
-                sleep_duration = min(1.0, wait_time)  # Sleep in 1-second chunks
-                time.sleep(sleep_duration)
-                wait_time -= sleep_duration
-
-            # If stop event was set during wait, exit
-            if stop_event.is_set():
-                self.logger.info("Stop event received during QPU rate limiting wait")
+        # Check QPU daily budget before starting
+        if self.time_manager is not None:
+            estimate = self.time_manager.should_mine_block()
+            if not estimate.should_mine:
+                # Pacing - wait for proportional limit to catch up
+                wait_str = f"{estimate.seconds_until_can_mine:.0f}s" if estimate.seconds_until_can_mine < 3600 else f"{estimate.seconds_until_can_mine/3600:.1f}h"
+                self.logger.info(
+                    f"[QPU] Pacing block {cur_index} - waiting {wait_str} for limit to catch up. "
+                    f"Used: {estimate.cumulative_used_us/1e6:.2f}s, "
+                    f"Limit: {estimate.proportional_limit_us/1e6:.2f}s "
+                    f"({estimate.elapsed_fraction*100:.1f}% of day)"
+                )
                 return None
 
+            self.logger.info(
+                f"[QPU] Budget check passed. Used: {estimate.cumulative_used_us/1e6:.2f}s / "
+                f"{estimate.proportional_limit_us/1e6:.2f}s limit ({estimate.elapsed_fraction*100:.1f}% of day), "
+                f"Estimated: {estimate.estimated_block_time_us/1e6:.2f}s ({estimate.confidence} confidence)"
+            )
+
         # Mark start of streaming attempt
-        self.last_qpu_attempt_time = time.time()
         self.current_stage = 'sampling'
-        self.current_stage_start = self.last_qpu_attempt_time
+        self.current_stage_start = time.time()
 
         # Clear any stale pending futures
         self.pending_futures.clear()
@@ -367,6 +374,9 @@ class DWaveMiner(BaseMiner):
                     qpu_total_access = qpu_programming + qpu_sampling
                     if qpu_total_access > 0:
                         self.timing_stats['qpu_access_time'].append(qpu_total_access)
+                        # Record time for budget tracking
+                        if self.time_manager is not None:
+                            self.time_manager.record_block_time(qpu_total_access)
 
                 # Update sample counts
                 all_energies = sampleset.record.energy
