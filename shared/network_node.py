@@ -1487,7 +1487,7 @@ class NetworkNode(Node):
                 return msg.create_error_response(f"Protocol version mismatch: expected {PROTOCOL_VERSION}, got {msg.protocol_version}")
 
             if msg.msg_type == QuicMessageType.JOIN_REQUEST:
-                return await self._quic_handle_join(msg)
+                return await self._quic_handle_join(msg, protocol)
             elif msg.msg_type == QuicMessageType.HEARTBEAT:
                 return await self._quic_handle_heartbeat(msg)
             elif msg.msg_type == QuicMessageType.PEERS_REQUEST:
@@ -1514,15 +1514,72 @@ class NetworkNode(Node):
             self.logger.exception(f"Error handling {msg.msg_type.name}: {e}")
             return msg.create_error_response(str(e))
 
-    async def _quic_handle_join(self, msg: QuicMessage) -> QuicMessage:
+    async def _can_reach_address(self, address: str, timeout: float) -> bool:
+        """Check if we can establish a TCP connection to the address."""
+        try:
+            host, port = address.rsplit(':', 1)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, int(port)),
+                timeout=timeout
+            )
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except Exception as e:
+            self.logger.debug(f"Cannot reach {address}: {e}")
+            return False
+
+    async def _validate_peer_address(
+        self, claimed: str, real_peer_addr: str, timeout: float = 2.0
+    ) -> str:
+        """Validate claimed address is reachable, fallback to real IP if not.
+
+        Args:
+            claimed: Address the peer claims (e.g., "your-public-ip:20049")
+            real_peer_addr: Actual source address from QUIC (e.g., "192.168.1.50:54321")
+            timeout: Connection timeout in seconds
+
+        Returns:
+            Validated address to use for this peer
+
+        Raises:
+            ValueError: If neither claimed nor fallback address is reachable
+        """
+        # Try claimed address first
+        if await self._can_reach_address(claimed, timeout):
+            return claimed
+
+        # Extract real IP (without ephemeral port) and use claimed port
+        real_ip = real_peer_addr.rsplit(':', 1)[0]
+        claimed_port = claimed.rsplit(':', 1)[1]
+        fallback = f"{real_ip}:{claimed_port}"
+
+        self.logger.warning(
+            f"Claimed address {claimed} unreachable, falling back to {fallback}"
+        )
+
+        if await self._can_reach_address(fallback, timeout):
+            return fallback
+
+        # Neither works - reject the join
+        raise ValueError(f"Cannot reach peer at claimed {claimed} or fallback {fallback}")
+
+    async def _quic_handle_join(self, msg: QuicMessage, protocol: Any) -> QuicMessage:
         """Handle join request from a new node."""
         data = json.loads(msg.payload.decode('utf-8'))
-        new_node_address = data.get("host")
+        claimed_address = data.get("host")
         info_field = data.get("info")
         new_node_info = MinerInfo.from_json(info_field) if info_field else None
 
-        if not new_node_address or not new_node_info:
+        if not claimed_address or not new_node_info:
             return msg.create_error_response("Missing host or info")
+
+        # Validate the claimed address, fallback to real source IP if unreachable
+        real_peer_address = protocol._peer_address
+        try:
+            new_node_address = await self._validate_peer_address(claimed_address, real_peer_address)
+        except ValueError as e:
+            return msg.create_error_response(str(e))
 
         # Add the new node
         await self.add_peer(new_node_address, new_node_info)
