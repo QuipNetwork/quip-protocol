@@ -320,6 +320,9 @@ class DWaveMiner(BaseMiner):
         # Clear any stale pending futures
         self.pending_futures.clear()
 
+        # Track if we've paused submissions due to budget
+        budget_paused = False
+
         # Initial queue fill
         self.logger.info(f"[QPU] Filling initial queue with {self.queue_depth} problems...")
         try:
@@ -329,6 +332,19 @@ class DWaveMiner(BaseMiner):
                     if self.time_manager and cancelled_time_us > 0:
                         self.time_manager.record_block_time(cancelled_time_us)
                     return None
+
+                # Check budget before each submission
+                if self.time_manager is not None:
+                    estimate = self.time_manager.should_mine_block()
+                    if not estimate.should_mine:
+                        budget_paused = True
+                        self.logger.info(
+                            f"[QPU] Budget limit reached during queue fill at job {i+1}/{self.queue_depth}. "
+                            f"Used: {estimate.cumulative_used_us/1e6:.2f}s / {estimate.proportional_limit_us/1e6:.2f}s limit. "
+                            f"Continuing with {len(self.pending_futures)} pending jobs."
+                        )
+                        break
+
                 job = self._generate_and_submit_job(prev_block, node_info, cur_index, params, nodes, edges)
                 self.pending_futures[job.future] = job
                 self.logger.debug(f"[QPU] Submitted job {i+1}/{self.queue_depth}")
@@ -467,15 +483,35 @@ class DWaveMiner(BaseMiner):
             except Exception as e:
                 self.logger.error(f"Error processing result: {e}")
 
-            # Refill queue: submit new job to maintain queue depth
-            if not stop_event.is_set():
-                try:
-                    new_job = self._generate_and_submit_job(
-                        prev_block, node_info, cur_index, params, nodes, edges
-                    )
-                    self.pending_futures[new_job.future] = new_job
-                except Exception as e:
-                    self.logger.error(f"Error submitting replacement job: {e}")
+            # Refill queue: submit new job to maintain queue depth (if budget allows)
+            if not stop_event.is_set() and not budget_paused:
+                # Check budget before submitting replacement job
+                if self.time_manager is not None:
+                    estimate = self.time_manager.should_mine_block()
+                    if not estimate.should_mine:
+                        budget_paused = True
+                        self.logger.info(
+                            f"[QPU] Budget limit reached. Pausing new submissions. "
+                            f"Used: {estimate.cumulative_used_us/1e6:.2f}s / {estimate.proportional_limit_us/1e6:.2f}s limit. "
+                            f"Waiting for {len(self.pending_futures)} pending jobs and difficulty decay."
+                        )
+                    else:
+                        try:
+                            new_job = self._generate_and_submit_job(
+                                prev_block, node_info, cur_index, params, nodes, edges
+                            )
+                            self.pending_futures[new_job.future] = new_job
+                        except Exception as e:
+                            self.logger.error(f"Error submitting replacement job: {e}")
+                else:
+                    # No time manager - always submit
+                    try:
+                        new_job = self._generate_and_submit_job(
+                            prev_block, node_info, cur_index, params, nodes, edges
+                        )
+                        self.pending_futures[new_job.future] = new_job
+                    except Exception as e:
+                        self.logger.error(f"Error submitting replacement job: {e}")
 
         # Cleanup on exit
         cancelled, cancelled_time_us = self._cancel_all_pending()
