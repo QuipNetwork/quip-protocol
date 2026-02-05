@@ -701,8 +701,10 @@ class NetworkNode(Node):
                         continue
                     # Base case we can process the block
                     result = await self.receive_block(block, force_reorg=force_reorg)
-                    if not result and peer_address:
-                        self.logger.warning(f"Block {block.header.index} from peer {peer_address} was rejected")
+                    if not result:
+                        miner_id = block.miner_info.miner_id if block.miner_info else "unknown"
+                        source = f" (via {peer_address})" if peer_address else ""
+                        self.logger.warning(f"Block {block.header.index} mined by {miner_id}{source} was rejected")
                     response_future.set_result(result)
                 except Exception as e:
                     self.logger.info(f"Error processing block: {e}")

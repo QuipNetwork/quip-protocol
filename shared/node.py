@@ -306,14 +306,23 @@ class Node:
         # 4. Validate the Quantum Proof and other block artifacts.
         block.quantum_proof.compute_derived_fields()
         if not validate_block(block, prev_block):
-            self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid quantum proof")
+            self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid quantum proof (miner: {block.miner_info.miner_id})")
             qpjson = block.quantum_proof.to_json()
             qpjson['proof_data'] = qpjson['proof_data'][:10] + "..."
             # Compute actual decayed requirements for accurate logging
-            actual_req = prev_block.next_block_requirements
+            original_req = prev_block.next_block_requirements
+            actual_req = original_req
+            elapsed = block.header.timestamp - prev_block.header.timestamp
             if prev_block.header.index > 0:
-                mining_start_time = block.header.timestamp - int(block.quantum_proof.mining_time)
-                actual_req = compute_current_requirements(actual_req, prev_block.header.timestamp, self.logger, mining_start_time)
+                actual_req = compute_current_requirements(original_req, prev_block.header.timestamp, self.logger, block.header.timestamp)
+            self.logger.error(
+                f"Timestamps: prev_block={prev_block.header.timestamp}, block={block.header.timestamp}, "
+                f"elapsed={elapsed}s, mining_time={block.quantum_proof.mining_time}s"
+            )
+            self.logger.error(
+                f"Requirements: original_energy={original_req.difficulty_energy:.2f}, "
+                f"decayed_energy={actual_req.difficulty_energy:.2f}"
+            )
             self.logger.error(f"Quantum Proof: {json.dumps(qpjson)}, rq: {actual_req.to_json()}")
             return False
 
