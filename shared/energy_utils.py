@@ -15,7 +15,7 @@ DEFAULT_C_RANGE = (0.7, 0.75)
 
 # Fixed difficulty requirement ranges (consensus-adjustable in future)
 # Currently set to (min, max) where min == max to effectively fix values
-DEFAULT_DIVERSITY_RANGE = (0.3, 0.3)  # (min, max) - currently fixed at 0.3
+DEFAULT_DIVERSITY_RANGE = (0.2, 0.2)  # (min, max) - currently fixed at 0.2
 DEFAULT_SOLUTIONS_RANGE = (5, 5)      # (min, max) - currently fixed at 5
 
 # Calibrated sweep ranges for different miner types

@@ -3,12 +3,12 @@ from shared.block_requirements import BlockRequirements, calculate_requirements_
 
 def test_decay_zero_steps_no_change():
     """Test that requirements are unchanged when no decay is applied."""
-    req = BlockRequirements(difficulty_energy=-100.0, min_diversity=0.30, min_solutions=20, timeout_to_difficulty_adjustment_decay=10)
+    req = BlockRequirements(difficulty_energy=-100.0, min_diversity=0.20, min_solutions=20, timeout_to_difficulty_adjustment_decay=10)
 
     # Verify requirements unchanged when no decay steps
     cur_req = req.to_json()
     assert cur_req['difficulty_energy'] == -100.0
-    assert cur_req['min_diversity'] == 0.30
+    assert cur_req['min_diversity'] == 0.20
     assert cur_req['min_solutions'] == 20
 
 
