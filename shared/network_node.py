@@ -1523,16 +1523,18 @@ class NetworkNode(Node):
             return msg.create_error_response(str(e))
 
     async def _can_reach_address(self, address: str, timeout: float) -> bool:
-        """Check if we can establish a TCP connection to the address."""
+        """Check if we can establish a QUIC connection to the address."""
+        if not self.node_client:
+            self.logger.warning("NodeClient not initialized, cannot verify peer address")
+            return False
         try:
-            host, port = address.rsplit(':', 1)
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, int(port)),
+            return await asyncio.wait_for(
+                self.node_client.connect_to_peer(address),
                 timeout=timeout
             )
-            writer.close()
-            await writer.wait_closed()
-            return True
+        except asyncio.TimeoutError:
+            self.logger.debug(f"Timeout reaching {address}")
+            return False
         except Exception as e:
             self.logger.debug(f"Cannot reach {address}: {e}")
             return False
