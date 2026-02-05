@@ -233,6 +233,14 @@ class Node:
         """Get the latest block from the blockchain."""
         return self.chain[-1]
 
+    def _find_block_by_hash(self, target_hash: bytes) -> Optional[Block]:
+        """Search chain backward for a block with matching hash (for reorg)."""
+        # Search last 6 blocks
+        for i in range(len(self.chain) - 1, max(0, len(self.chain) - 7), -1):
+            if self.chain[i].hash == target_hash:
+                return self.chain[i]
+        return None
+
     async def check_block(self, block: Block, force_reorg: bool = False) -> bool:
         """Check if a block is valid and can be accepted.
 
@@ -282,10 +290,29 @@ class Node:
         if prev_block is None or prev_block.hash is None:
             self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we do not have the previous block ({block.header.index - 1})")
             return False
-        
+
         if prev_block.hash != block.header.previous_hash:
-            self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: previous hash mismatch ({prev_block.hash.hex()[:8]} != {block.header.previous_hash.hex()[:8]})")
-            return False
+            if force_reorg:
+                # Search backward for common ancestor during reorg
+                ancestor = self._find_block_by_hash(block.header.previous_hash)
+                if ancestor is not None:
+                    self.logger.info(
+                        f"Reorg: common ancestor at block {ancestor.header.index}, "
+                        f"truncating from {self.get_latest_block().header.index}"
+                    )
+                    # Truncate chain to common ancestor (with lock for safety)
+                    async with self.chain_lock:
+                        self.chain = self.chain[:ancestor.header.index + 1]
+                    prev_block = ancestor
+                else:
+                    self.logger.error(
+                        f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: cannot find ancestor "
+                        f"with hash {block.header.previous_hash.hex()[:8]} in last 6 blocks"
+                    )
+                    return False
+            else:
+                self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: previous hash mismatch ({prev_block.hash.hex()[:8]} != {block.header.previous_hash.hex()[:8]})")
+                return False
 
         # 3. Check Signature
         # FIXME: We are not even bothering with checking against known miner info right now.

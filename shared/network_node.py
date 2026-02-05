@@ -1121,8 +1121,8 @@ class NetworkNode(Node):
             self.logger.warning(f"Refusing to synchronize beyond max_sync_block_index {self.max_sync_block_index}, requested: {current_head}")
             return
 
-        # Always go back at least 2 blocks.
-        start_index = max(1, my_latest_block.header.index-1)
+        # Go back 6 blocks for reorg depth
+        start_index = max(1, my_latest_block.header.index - 6)
         end_index = current_head
         if start_index > end_index:
             return

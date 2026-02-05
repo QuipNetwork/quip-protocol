@@ -12,11 +12,8 @@ echo "Setting ownership and permissions..."
 sudo chown -R quip:quip /opt/quip/src
 sudo chmod -R o+rX /opt/quip/src
 
-echo "Removing duplicate cupy installations..."
-sudo -u quip /opt/quip/bin/pip uninstall -y cupy cupy-cuda11x cupy-cuda12x cupy-cuda13x 2>/dev/null || true
-
-echo "Reinstalling package..."
-sudo -u quip /opt/quip/bin/pip install -e /opt/quip/src
+echo "Reinstalling package with CUDA support..."
+sudo -u quip /opt/quip/bin/pip install -e "/opt/quip/src[cuda]"
 
 echo "Restarting service..."
 sudo systemctl restart quip-network-node

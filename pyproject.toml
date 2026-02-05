@@ -26,9 +26,9 @@ dependencies = [
 # CPU mode - lightweight, no GPU dependencies
 cpu = []
 
-# CUDA mode - NVIDIA GPU support
+# CUDA mode - NVIDIA GPU support (matches PyTorch CUDA 12)
 cuda = [
-    "cupy-cuda11x>=12.0.0,<13.0.0",
+    "cupy-cuda12x>=13.0.0",
 ]
 
 # Metal mode - Apple Silicon GPU support
@@ -42,7 +42,7 @@ full = [
     "torch>=2.0.0",
     "torchvision>=0.15.0",
     "torchaudio>=2.0.0",
-    "cupy-cuda13x>=13.0.0; sys_platform == 'linux' or sys_platform == 'win32'",
+    "cupy-cuda12x>=13.0.0; sys_platform == 'linux' or sys_platform == 'win32'",
     "pyobjc-framework-Metal; sys_platform == 'darwin'",
     "pyobjc-framework-MetalPerformanceShaders; sys_platform == 'darwin'",
     "matplotlib>=3.6.0",
