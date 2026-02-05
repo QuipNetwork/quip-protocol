@@ -426,6 +426,11 @@ class NetworkNode(Node):
             trust_db_path = os.path.expanduser(
                 self.tofu_config.get("trust_db", "~/.quip/trust.db")
             )
+            # Clear trust DB on start if configured
+            if self.tofu_config.get("clear_on_start", False):
+                if os.path.exists(trust_db_path):
+                    os.remove(trust_db_path)
+                    self.logger.info(f"Cleared TOFU trust store at {trust_db_path}")
             self.trust_store = TrustStore(trust_db_path, logger=self.logger)
             await self.trust_store.initialize()
             self.logger.info(f"TOFU trust store initialized at {trust_db_path}")
@@ -1523,16 +1528,48 @@ class NetworkNode(Node):
             return msg.create_error_response(str(e))
 
     async def _can_reach_address(self, address: str, timeout: float) -> bool:
-        """Check if we can establish a TCP connection to the address."""
+        """Check if we can reach a UDP address (for QUIC connectivity).
+
+        Uses a lightweight UDP probe rather than full QUIC handshake.
+        Sends a small packet and checks for ICMP unreachable errors.
+        """
+        import socket
         try:
-            host, port = address.rsplit(':', 1)
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, int(port)),
-                timeout=timeout
-            )
-            writer.close()
-            await writer.wait_closed()
-            return True
+            host, port_str = address.rsplit(':', 1)
+            port = int(port_str)
+
+            # Resolve hostname to IP
+            loop = asyncio.get_event_loop()
+            try:
+                infos = await asyncio.wait_for(
+                    loop.getaddrinfo(host, port, type=socket.SOCK_DGRAM),
+                    timeout=timeout
+                )
+                if not infos:
+                    self.logger.debug(f"Cannot resolve {host}")
+                    return False
+                family, _, _, _, sockaddr = infos[0]
+            except Exception as e:
+                self.logger.debug(f"DNS resolution failed for {host}: {e}")
+                return False
+
+            # Create UDP socket and "connect" (sets default destination)
+            sock = socket.socket(family, socket.SOCK_DGRAM)
+            sock.setblocking(False)
+            try:
+                sock.connect(sockaddr)
+                # Send a small probe packet (will be ignored by QUIC server as invalid)
+                sock.send(b'\x00')
+                # Brief wait to allow ICMP unreachable to come back
+                await asyncio.sleep(0.1)
+                # Try to send again - if port is unreachable, this may raise
+                sock.send(b'\x00')
+                return True
+            except (ConnectionRefusedError, OSError) as e:
+                self.logger.debug(f"UDP probe failed for {address}: {e}")
+                return False
+            finally:
+                sock.close()
         except Exception as e:
             self.logger.debug(f"Cannot reach {address}: {e}")
             return False
