@@ -840,6 +840,80 @@ class TestSpanningTreeVerification(unittest.TestCase):
             self.assertEqual(tutte_trees, 768,
                 f"Connector expected 768 spanning trees, got {tutte_trees}")
 
+    def test_z21_decomposition(self):
+        """Test Z(2,1) decomposition structure."""
+        try:
+            from tutte_test.tutte_synthesis import decompose_zephyr_z21
+        except ImportError:
+            self.skipTest("tutte_synthesis not available")
+
+        decomp = decompose_zephyr_z21()
+
+        # Verify basic structure
+        self.assertEqual(decomp.nodes, 40)
+        self.assertEqual(decomp.edges, 114)
+        self.assertTrue(decomp.pattern_verified)
+
+        # Verify we found 2 Z(1,1) copies
+        self.assertEqual(len(decomp.z11_copies), 2)
+        for copy in decomp.z11_copies:
+            self.assertEqual(len(copy), 12)
+
+        # Verify we found 2 8-node connector components
+        self.assertEqual(len(decomp.connector_8node_components), 2)
+        for comp in decomp.connector_8node_components:
+            self.assertEqual(len(comp), 8)
+
+        # Verify edge matrix
+        self.assertEqual(decomp.edge_matrix['A_internal'], 22)
+        self.assertEqual(decomp.edge_matrix['B_internal'], 22)
+        self.assertEqual(decomp.edge_matrix['C_internal'], 13)
+        self.assertEqual(decomp.edge_matrix['D_internal'], 13)
+        self.assertEqual(decomp.edge_matrix['A_B'], 8)
+        self.assertEqual(decomp.edge_matrix['A_C'], 9)
+        self.assertEqual(decomp.edge_matrix['A_D'], 9)
+        self.assertEqual(decomp.edge_matrix['B_C'], 9)
+        self.assertEqual(decomp.edge_matrix['B_D'], 9)
+        self.assertEqual(decomp.edge_matrix['C_D'], 0)
+
+        # Verify 8-node connector polynomial
+        self.assertIsNotNone(decomp.connector_8node_polynomial)
+        self.assertEqual(decomp.connector_8node_polynomial.num_spanning_trees(), 408)
+
+    def test_z21_8node_connector_in_rainbow_table(self):
+        """Verify Z(2,1)_connector_8node is in rainbow table with correct values."""
+        entry = self.table.get_entry('Z(2,1)_connector_8node')
+        if entry is None:
+            self.skipTest("Z(2,1)_connector_8node not in rainbow table")
+
+        self.assertEqual(entry['nodes'], 8)
+        self.assertEqual(entry['edges'], 13)
+        self.assertEqual(entry['spanning_trees'], 408)
+        self.assertEqual(entry['num_terms'], 29)
+
+    def test_z21_spanning_trees_via_kirchhoff(self):
+        """Verify Z(2,1) spanning tree count via Kirchhoff's theorem."""
+        try:
+            import dwave_networkx as dnx
+            import numpy as np
+        except ImportError:
+            self.skipTest("dwave_networkx not available")
+
+        z21 = dnx.zephyr_graph(2, 1)
+
+        # Compute spanning trees via Kirchhoff
+        L = nx.laplacian_matrix(z21).toarray()
+        L_reduced = L[1:, 1:]
+        kirchhoff_trees = int(round(np.linalg.det(L_reduced)))
+
+        # This should be a very large number
+        self.assertGreater(kirchhoff_trees, 10**20)
+
+        # Verify against decomposition
+        from tutte_test.tutte_synthesis import decompose_zephyr_z21
+        decomp = decompose_zephyr_z21()
+        self.assertEqual(decomp.spanning_trees, kirchhoff_trees)
+
 
 def run_all_tests():
     """Run all tests and benchmarks."""

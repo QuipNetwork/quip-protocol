@@ -1,6 +1,6 @@
 {
   "description": "Tutte Polynomial Rainbow Table",
-  "total_entries": 213,
+  "total_entries": 214,
   "note": "Coefficients stored as \"i,j\": coefficient for x^i * y^j",
   "graphs": {
     "fae4bfc454bd04363dcd5222772f2973b1193e1ff6f676e822a427323a677ef9": {
@@ -22642,6 +22642,47 @@
         "1,9": 1,
         "0,10": 1
       }
+    },
+    "0458d24f1b1ac5b5a869bfcb38ed3446cf79c6332d04ab1191148fa9ea8dced2": {
+      "name": "Z(2,1)_connector_8node",
+      "nodes": 8,
+      "edges": 13,
+      "spanning_trees": 408,
+      "x_degree": 7,
+      "y_degree": 6,
+      "num_terms": 29,
+      "polynomial_str": "x^7 + 6x^6 + 6x^5y + 15x^5 + x^4y^3 + 3x^4y^2 + 25x^4y + 21x^4 + 3x^3y^3 + 22x^3y^2 + 43x^3y + 18x^3 + 3x^2y^4 + 17x^2y^3 + 44x^2y^2 + 37x^2y + 9x^2 + 2xy^5 + 12xy^4 + 30xy^3 + 33xy^2 + 15xy + 2x + y^6 + 5y^5 + 11y^4 + 13y^3 + 8y^2 + 2y",
+      "coefficients": {
+        "7,0": 1,
+        "6,0": 6,
+        "5,1": 6,
+        "5,0": 15,
+        "4,1": 25,
+        "3,2": 22,
+        "4,0": 21,
+        "3,1": 43,
+        "2,2": 44,
+        "3,0": 18,
+        "2,1": 37,
+        "1,2": 33,
+        "1,3": 30,
+        "2,0": 9,
+        "1,1": 15,
+        "0,2": 8,
+        "0,3": 13,
+        "2,3": 17,
+        "0,4": 11,
+        "4,2": 3,
+        "1,4": 12,
+        "1,0": 2,
+        "0,1": 2,
+        "0,5": 5,
+        "4,3": 1,
+        "3,3": 3,
+        "2,4": 3,
+        "1,5": 2,
+        "0,6": 1
+      }
     }
   },
   "minor_relationships": {
@@ -22650,7 +22691,15 @@
       "graphs_with_minors": 190,
       "max_minors_graph": "Z(1,1)",
       "max_minors_count": 166,
-      "zephyr_graphs_with_minors": 74
+      "zephyr_graphs_with_minors": 74,
+      "Z(2,1)": {
+        "description": "Z(2,1) = 2\u00d7Z(1,1) + 2\u00d7Z(2,1)_connector_8node + 44 cross-edges",
+        "z11_copies": 2,
+        "connector_8node_copies": 2,
+        "cross_edges": 44,
+        "direct_edges_between_z11": 8,
+        "edges_z11_to_connectors": 36
+      }
     },
     "relationships": {
       "K_3": [
@@ -34890,6 +34939,12 @@
         "P_22",
         "P_23",
         "P_24"
+      ],
+      "Z(2,1)": [
+        "Z(1,1)",
+        "Z(1,1)",
+        "Z(2,1)_connector_8node",
+        "Z(2,1)_connector_8node"
       ]
     }
   }
