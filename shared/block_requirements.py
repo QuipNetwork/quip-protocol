@@ -330,8 +330,10 @@ def validate_block(block: 'Block', previous_block: 'Block', logger: logging.Logg
         return False
     
     # Apply timeout-based difficulty decay based on elapsed time since previous block
+    # Use mining START time (not block creation time) to match what the miner used
     if previous_block.header.index > 0:
-        requirements = compute_current_requirements(requirements, previous_block.header.timestamp, logger, block.header.timestamp)
+        mining_start_time = block.header.timestamp - int(block.quantum_proof.mining_time)
+        requirements = compute_current_requirements(requirements, previous_block.header.timestamp, logger, mining_start_time)
 
     #Validate the timestamps in the block using UTC time
     if not validate_block_timestamp(block.header.timestamp, previous_block.header.timestamp):

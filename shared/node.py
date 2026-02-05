@@ -15,7 +15,7 @@ from multiprocessing.synchronize import Event as EventType
 from logging.handlers import QueueListener
 import aiohttp
 
-from shared.block_requirements import compute_next_block_requirements, validate_block
+from shared.block_requirements import compute_next_block_requirements, validate_block, compute_current_requirements
 
 if TYPE_CHECKING:
     pass
@@ -309,7 +309,12 @@ class Node:
             self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid quantum proof")
             qpjson = block.quantum_proof.to_json()
             qpjson['proof_data'] = qpjson['proof_data'][:10] + "..."
-            self.logger.error(f"Quantum Proof: {json.dumps(qpjson)}, rq: {prev_block.next_block_requirements.to_json()}")
+            # Compute actual decayed requirements for accurate logging
+            actual_req = prev_block.next_block_requirements
+            if prev_block.header.index > 0:
+                mining_start_time = block.header.timestamp - int(block.quantum_proof.mining_time)
+                actual_req = compute_current_requirements(actual_req, prev_block.header.timestamp, self.logger, mining_start_time)
+            self.logger.error(f"Quantum Proof: {json.dumps(qpjson)}, rq: {actual_req.to_json()}")
             return False
 
         return True
