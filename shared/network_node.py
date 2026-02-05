@@ -680,12 +680,16 @@ class NetworkNode(Node):
                     continue
 
                 # Process the block in background
-                # Unpack with optional force_reorg flag (default False for backward compat)
-                if len(block_data) == 3:
+                # Unpack with optional force_reorg flag and peer_address (default False/None for backward compat)
+                if len(block_data) >= 4:
+                    block, response_future, force_reorg, peer_address = block_data
+                elif len(block_data) == 3:
                     block, response_future, force_reorg = block_data
+                    peer_address = None
                 else:
                     block, response_future = block_data
                     force_reorg = False
+                    peer_address = None
                 try:
                     latest = self.get_latest_block()
                     # Cache out of order blocks for later processing
@@ -697,6 +701,8 @@ class NetworkNode(Node):
                         continue
                     # Base case we can process the block
                     result = await self.receive_block(block, force_reorg=force_reorg)
+                    if not result and peer_address:
+                        self.logger.warning(f"Block {block.header.index} from peer {peer_address} was rejected")
                     response_future.set_result(result)
                 except Exception as e:
                     self.logger.info(f"Error processing block: {e}")
@@ -1462,7 +1468,7 @@ class NetworkNode(Node):
             # Create a dummy future for gossip blocks (we don't need the result)
             # force_reorg=False because these are normal network propagation, not sync
             dummy_future = asyncio.Future()
-            self.block_processing_queue.put_nowait((block, dummy_future, False))
+            self.block_processing_queue.put_nowait((block, dummy_future, False, message.sender))
 
         asyncio.create_task(self.gossip_broadcast(message, self.fanout))
         return "ok"
@@ -1495,7 +1501,7 @@ class NetworkNode(Node):
             elif msg.msg_type == QuicMessageType.GOSSIP:
                 return await self._quic_handle_gossip(msg)
             elif msg.msg_type == QuicMessageType.BLOCK_SUBMIT:
-                return await self._quic_handle_block_submit(msg)
+                return await self._quic_handle_block_submit(msg, protocol)
             elif msg.msg_type == QuicMessageType.STATUS_REQUEST:
                 return await self._quic_handle_status(msg)
             elif msg.msg_type == QuicMessageType.STATS_REQUEST:
@@ -1656,7 +1662,7 @@ class NetworkNode(Node):
         except asyncio.TimeoutError:
             return msg.create_error_response("processing timeout")
 
-    async def _quic_handle_block_submit(self, msg: QuicMessage) -> QuicMessage:
+    async def _quic_handle_block_submit(self, msg: QuicMessage, protocol: Any) -> QuicMessage:
         """Handle new block submission (DEBUG purposes)."""
         data = json.loads(msg.payload.decode('utf-8'))
 
@@ -1665,10 +1671,13 @@ class NetworkNode(Node):
         net_data = block_bytes + signature
         block = Block.from_network(net_data)
 
+        # Get peer address for logging
+        peer_address = getattr(protocol, '_peer_address', None)
+
         response_future: asyncio.Future[bool] = asyncio.Future()
         try:
             # force_reorg=False for submitted blocks (normal propagation rules)
-            self.block_processing_queue.put_nowait((block, response_future, False))
+            self.block_processing_queue.put_nowait((block, response_future, False, peer_address))
             result = await asyncio.wait_for(response_future, timeout=10.0)
             status = "ok" if result else "rejected"
             return msg.create_response(json.dumps({"status": status}).encode('utf-8'))
