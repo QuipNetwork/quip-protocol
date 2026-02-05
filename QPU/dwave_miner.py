@@ -1,6 +1,7 @@
 """QPU miner using D-Wave sampler with streaming queue for high-throughput mining."""
 from __future__ import annotations
 
+import logging
 import multiprocessing
 import multiprocessing.synchronize
 import random
@@ -9,6 +10,8 @@ import sys
 import time
 from dataclasses import dataclass
 from typing import Optional, cast, Mapping, Tuple, Any, Dict, Union
+
+init_logger = logging.getLogger(__name__)
 
 from QPU.dwave_sampler import DWaveSamplerWrapper, EmbeddedFuture
 from QPU.qpu_time_manager import QPUTimeManager, QPUTimeConfig
@@ -63,10 +66,17 @@ class DWaveMiner(BaseMiner):
         """
         # Create sampler (encapsulates embedding internally)
         # job_label_prefix will be auto-generated as "Quip_Z{m}_T{t}" by DWaveSamplerWrapper
-        sampler = DWaveSamplerWrapper(
-            topology=topology,
-            embedding_file=embedding_file
-        )
+        # Note: We can't use self.logger yet since super().__init__ hasn't been called
+        init_logger.info(f"[QPU] Initializing DWaveMiner with topology: {topology.solver_name}")
+        try:
+            sampler = DWaveSamplerWrapper(
+                topology=topology,
+                embedding_file=embedding_file
+            )
+            init_logger.info(f"[QPU] Sampler ready: {len(sampler.nodes)} nodes, {len(sampler.edges)} edges")
+        except Exception as e:
+            init_logger.error(f"[QPU] Failed to initialize sampler: {e}")
+            raise
         super().__init__(miner_id, sampler, miner_type="QPU")
         self.miner_type = "QPU"
         self.topology = topology
