@@ -426,6 +426,11 @@ class NetworkNode(Node):
             trust_db_path = os.path.expanduser(
                 self.tofu_config.get("trust_db", "~/.quip/trust.db")
             )
+            # Clear trust DB on start if configured
+            if self.tofu_config.get("clear_on_start", False):
+                if os.path.exists(trust_db_path):
+                    os.remove(trust_db_path)
+                    self.logger.info(f"Cleared TOFU trust store at {trust_db_path}")
             self.trust_store = TrustStore(trust_db_path, logger=self.logger)
             await self.trust_store.initialize()
             self.logger.info(f"TOFU trust store initialized at {trust_db_path}")

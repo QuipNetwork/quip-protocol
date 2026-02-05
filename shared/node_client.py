@@ -431,7 +431,8 @@ class NodeClient:
                     self.logger.info(f"QUIC connection established to {host}")
                     return protocol
                 else:
-                    # Connection failed, clean up
+                    # Connection failed (handshake timeout), clean up
+                    self.logger.warning(f"QUIC handshake failed/timed out for {host}")
                     await ctx.__aexit__(None, None, None)
                     return None
             except TofuVerificationError as e:
@@ -536,6 +537,7 @@ class NodeClient:
     async def join_network_via_peer(self, peer_address: str, join_data: dict) -> Optional[dict]:
         protocol = await self._get_connection(peer_address)
         if not protocol:
+            self.logger.warning(f"Could not establish connection to {peer_address}")
             return None
         payload = json.dumps(join_data).encode('utf-8')
         response = await protocol.send_request(QuicMessageType.JOIN_REQUEST, payload, timeout=self.node_timeout)
@@ -544,6 +546,9 @@ class NodeClient:
                 return json.loads(response.payload.decode('utf-8'))
             except Exception:
                 return None
+        elif response and response.msg_type == QuicMessageType.ERROR_RESPONSE:
+            error_msg = response.payload.decode('utf-8', errors='replace')
+            self.logger.warning(f"Join rejected by {peer_address}: {error_msg}")
         return None
 
     async def connect_to_peer(self, peer_address: str) -> bool:
