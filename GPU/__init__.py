@@ -31,6 +31,14 @@ except ImportError:
     MetalSASampler = None
     MetalMiner = None
 
+# Try to import Metal Gibbs components (only available on macOS)
+try:
+    from .metal_gibbs_sa import MetalGibbsSampler
+    METAL_GIBBS_AVAILABLE = True
+except ImportError:
+    METAL_GIBBS_AVAILABLE = False
+    MetalGibbsSampler = None
+
 # Check if GPU functionality is available
 GPU_AVAILABLE = CUDA_AVAILABLE or MODAL_AVAILABLE
 
@@ -51,3 +59,7 @@ if MODAL_AVAILABLE:
 # Add Metal components if available
 if METAL_AVAILABLE:
     __all__.extend(['MetalSASampler', 'MetalMiner'])
+
+# Add Metal Gibbs components if available
+if METAL_GIBBS_AVAILABLE:
+    __all__.extend(['MetalGibbsSampler', 'METAL_GIBBS_AVAILABLE'])

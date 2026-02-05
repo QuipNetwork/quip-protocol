@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import dwave_networkx as dnx
-from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_10_TOPOLOGY
+from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_11_TOPOLOGY
 
 try:
     from minorminer.utils.feasibility import embedding_feasibility_filter
@@ -186,7 +186,7 @@ Examples:
 Notes:
   - Uses minorminer's feasibility_filter (more accurate than manual checking)
   - Tests embedding feasibility (with chains), not just 1:1 subgraph matching
-  - Uses predownloaded Advantage2_system1.10 topology (no QPU access needed)
+  - Uses predownloaded Advantage2_system1.11 topology (no QPU access needed)
         """
     )
     parser.add_argument('--max-m', type=int, default=12,
@@ -197,7 +197,7 @@ Notes:
     args = parser.parse_args()
 
     # Load Advantage2 topology (no QPU access needed)
-    topology = ADVANTAGE2_SYSTEM1_10_TOPOLOGY
+    topology = ADVANTAGE2_SYSTEM1_11_TOPOLOGY
     target_graph = topology.graph
 
     print(f"Target QPU: {topology.solver_name}")

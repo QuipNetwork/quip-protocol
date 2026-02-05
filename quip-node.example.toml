@@ -92,3 +92,30 @@ devices = ["0", "1"]
 # dwave_api_solver = "Advantage_system6.4"
 # dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
 
+# QPU Time Budget Management
+# Controls QPU usage to prevent exceeding your Leap allocation.
+# Check your Leap Dashboard for your monthly allocation.
+#
+# Daily QPU time budget - calculate from your monthly allocation
+# Example: With 20 minutes/month, set daily budget to ~40s (20m / 30 days)
+# Supports: 30s, 5m, 2h, etc.
+#
+# Budget is spread proportionally across the day using proportional pacing:
+# - At 6 AM UTC (25% of day): can use up to 25% of budget (10s)
+# - At noon UTC (50% of day): can use up to 50% of budget (20s)
+# - At 6 PM UTC (75% of day): can use up to 75% of budget (30s)
+# - Day resets at UTC midnight
+#
+# This prevents exhausting your entire budget early in the day.
+qpu_daily_budget = "60s"
+#
+# Minimum blocks to mine before EMA estimation kicks in
+# Until this threshold, uses conservative max(observed) * 1.5 estimate
+# Default: 5
+# qpu_min_blocks_for_estimation = 5
+#
+# EMA decay factor for time estimation (0.0-1.0)
+# Higher values give more weight to recent block times
+# Default: 0.3
+# qpu_ema_alpha = 0.3
+

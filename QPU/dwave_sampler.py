@@ -1,8 +1,12 @@
 """D-Wave QPU sampler wrapper and configuration for quantum blockchain mining."""
 
+import logging
+import os
 from typing import Dict, List, Tuple, Any, Union, Mapping, Sequence, cast, Optional, TYPE_CHECKING
 import collections.abc
 from dwave.system import DWaveSampler, FixedEmbeddingComposite
+
+logger = logging.getLogger(__name__)
 from dwave.system.testing import MockDWaveSampler
 from dwave.embedding import embed_bqm, unembed_sampleset
 import dimod
@@ -131,12 +135,26 @@ class DWaveSamplerWrapper:
 
         self.job_label_prefix = job_label_prefix
 
+        # Check for API key before attempting connection
+        api_key = os.environ.get('DWAVE_API_KEY')
+        if not api_key:
+            logger.warning("[QPU] DWAVE_API_KEY environment variable not set!")
+        else:
+            logger.debug(f"[QPU] DWAVE_API_KEY set (length: {len(api_key)})")
+
         # Initialize base QPU sampler
-        base_sampler = DWaveSampler()
+        logger.info("[QPU] Connecting to D-Wave API...")
+        try:
+            base_sampler = DWaveSampler()
+            logger.info(f"[QPU] Connected to solver: {base_sampler.properties.get('chip_id', 'unknown')}")
+            logger.info(f"[QPU] Qubits available: {len(base_sampler.nodelist)}")
+        except Exception as e:
+            logger.error(f"[QPU] Failed to connect to D-Wave: {e}")
+            raise
         self.qpu_solver = base_sampler
 
         # Get hardware info
-        solver_name = base_sampler.properties.get('chip_id', 'Advantage2_system1.10')
+        solver_name = base_sampler.properties.get('chip_id', 'Advantage2_system1.11')
         solver_dir = solver_name.replace('-', '_').replace('.', '_')
 
         # Determine if this topology needs embedding
@@ -173,6 +191,7 @@ class DWaveSamplerWrapper:
             # Create FixedEmbeddingComposite (encapsulated internally)
             self.sampler = FixedEmbeddingComposite(base_sampler, embedding)
             self.embedding = embedding
+            logger.info(f"[QPU] Embedding loaded: {len(embedding)} logical qubits mapped to hardware")
 
             # Use topology's graph directly
             self.nodelist: List[Variable] = topology.nodes
@@ -180,6 +199,7 @@ class DWaveSamplerWrapper:
 
         else:
             # Native hardware topology - no embedding needed
+            logger.info(f"[QPU] Using native hardware topology (no embedding needed)")
             self.sampler = base_sampler
             self.embedding = None
             self.nodelist: List[Variable] = topology.nodes
@@ -201,7 +221,7 @@ class DWaveSamplerWrapper:
         Determine if a topology needs embedding to run on the QPU.
 
         Args:
-            topology_name: Name of the topology (e.g., "Z(9,2)" or "Advantage2_system1.10")
+            topology_name: Name of the topology (e.g., "Z(9,2)" or "Advantage2_system1.11")
             solver_name: Name of the QPU solver
 
         Returns:

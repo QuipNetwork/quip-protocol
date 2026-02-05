@@ -426,6 +426,11 @@ def validate_quantum_proof(quantum_proof, miner_id: str, requirements, block_ind
     if len(energy_valid_solutions) < requirements.min_solutions:
         logger.error(f"Block {block_index} rejected: insufficient valid solutions ({len(energy_valid_solutions)} < {requirements.min_solutions})")
         logger.error(f"Solutions presented in result: {len(solutions)} - energies: {energies}")
+        logger.error(f"Energy threshold: {requirements.difficulty_energy:.2f} (solutions must be < this value)")
+        # Show which solutions failed and by how much
+        for i, e in enumerate(energies):
+            status = "PASS" if e < requirements.difficulty_energy else f"FAIL (gap: {e - requirements.difficulty_energy:.2f})"
+            logger.error(f"  Solution {i}: energy={e:.2f} - {status}")
         return False
 
     # Select most diverse subset of min_solutions and check diversity

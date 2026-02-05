@@ -15,7 +15,7 @@ from multiprocessing.synchronize import Event as EventType
 from logging.handlers import QueueListener
 import aiohttp
 
-from shared.block_requirements import compute_next_block_requirements, validate_block
+from shared.block_requirements import compute_next_block_requirements, validate_block, compute_current_requirements
 
 if TYPE_CHECKING:
     pass
@@ -197,8 +197,16 @@ class Node:
 
         # QPU Miners, 1 per qpu section
         if cfg.get("qpu") is not None:
-            spec = {"id": f"{self.node_id}-QPU-1", "kind": "qpu"}
-            # QPU requires no config at this time.
+            qpu_cfg = cfg.get("qpu", {})
+            spec = {
+                "id": f"{self.node_id}-QPU-1",
+                "kind": "qpu",
+                "cfg": {
+                    "qpu_daily_budget": qpu_cfg.get("qpu_daily_budget"),
+                    "qpu_min_blocks_for_estimation": qpu_cfg.get("qpu_min_blocks_for_estimation", 5),
+                    "qpu_ema_alpha": qpu_cfg.get("qpu_ema_alpha", 0.3),
+                }
+            }
             self.miner_handles.append(MinerHandle(spec, self._log_queue))
 
         # Back-compat summary list for logs (do not assign to typed self.miners)
@@ -298,10 +306,24 @@ class Node:
         # 4. Validate the Quantum Proof and other block artifacts.
         block.quantum_proof.compute_derived_fields()
         if not validate_block(block, prev_block):
-            self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid quantum proof")
+            self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid quantum proof (miner: {block.miner_info.miner_id})")
             qpjson = block.quantum_proof.to_json()
             qpjson['proof_data'] = qpjson['proof_data'][:10] + "..."
-            self.logger.error(f"Quantum Proof: {json.dumps(qpjson)}, rq: {prev_block.next_block_requirements.to_json()}")
+            # Compute actual decayed requirements for accurate logging
+            original_req = prev_block.next_block_requirements
+            actual_req = original_req
+            elapsed = block.header.timestamp - prev_block.header.timestamp
+            if prev_block.header.index > 0:
+                actual_req = compute_current_requirements(original_req, prev_block.header.timestamp, self.logger, block.header.timestamp)
+            self.logger.error(
+                f"Timestamps: prev_block={prev_block.header.timestamp}, block={block.header.timestamp}, "
+                f"elapsed={elapsed}s, mining_time={block.quantum_proof.mining_time}s"
+            )
+            self.logger.error(
+                f"Requirements: original_energy={original_req.difficulty_energy:.2f}, "
+                f"decayed_energy={actual_req.difficulty_energy:.2f}"
+            )
+            self.logger.error(f"Quantum Proof: {json.dumps(qpjson)}, rq: {actual_req.to_json()}")
             return False
 
         return True

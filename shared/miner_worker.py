@@ -68,10 +68,12 @@ def _signal_aware_mining_worker(spec: Dict[str, Any], block, node_info, requirem
     try:
         # Set up logging for child process
         _setup_child_process_logging()
-        
+
         # Build the miner
+        logger.info(f"Building miner in worker: kind={spec.get('kind')}, id={spec.get('id')}")
         miner = build_miner_from_spec(spec)
-        
+        logger.info(f"Miner built successfully in worker: {miner.miner_type} - {miner.miner_id}")
+
         # Create a stop event that will never be set (child process doesn't monitor signals)
         # The parent process will terminate this process via SIGTERM when needed
         child_stop_event = mp.Event()
@@ -85,8 +87,10 @@ def _signal_aware_mining_worker(spec: Dict[str, Any], block, node_info, requirem
             
     except Exception as e:
         # Log error and exit gracefully
+        import traceback
         logger.error(f"Mining worker error: {e}")
-    
+        logger.error(f"Traceback:\n{traceback.format_exc()}")
+
     # Process exits naturally
 
 
@@ -105,7 +109,18 @@ def build_miner_from_spec(spec: Dict[str, Any]):
     elif kind == "modal":
         return GPU.ModalMiner(miner_id, **cfg, **args)
     elif kind == "qpu":
-        return QPU.DWaveMiner(miner_id, **cfg)
+        # Build QPU time config if daily budget is specified
+        time_config = None
+        if cfg.get("qpu_daily_budget"):
+            from QPU.qpu_time_manager import QPUTimeConfig, parse_duration
+            time_config = QPUTimeConfig(
+                daily_budget_seconds=parse_duration(cfg["qpu_daily_budget"]),
+                min_blocks_for_estimation=cfg.get("qpu_min_blocks_for_estimation", 5),
+                ema_alpha=cfg.get("qpu_ema_alpha", 0.3),
+            )
+            # Remove time config keys from cfg to avoid passing them to miner
+            cfg = {k: v for k, v in cfg.items() if not k.startswith("qpu_")}
+        return QPU.DWaveMiner(miner_id, time_config=time_config, **cfg)
     else:
         raise ValueError(f"Unknown miner kind '{kind}'")
 
@@ -113,7 +128,13 @@ def build_miner_from_spec(spec: Dict[str, Any]):
 def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any], log_queue: Optional[mp.Queue] = None):
     # Set up logging for child process
     _setup_child_process_logging(log_queue)
-    miner = build_miner_from_spec(spec)
+    logger.info(f"Building miner: kind={spec.get('kind')}, id={spec.get('id')}")
+    try:
+        miner = build_miner_from_spec(spec)
+        logger.info(f"Miner built successfully: {miner.miner_type} - {miner.miner_id}")
+    except Exception as e:
+        logger.error(f"Failed to build miner {spec.get('id')}: {e}")
+        raise
     current_stop: mpsync.Event = mp.Event()
 
     while True:
@@ -234,7 +255,10 @@ class MinerHandle:
             try:
                 result = result_queue.get_nowait()
                 return result
-            except:
+            except Exception as e:
+                # Queue.Empty is expected when no result, other exceptions should be logged
+                if not str(type(e).__name__) == 'Empty':
+                    logger.debug(f"No result from mining worker: {type(e).__name__}: {e}")
                 return None
                 
         finally:
