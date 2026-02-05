@@ -197,21 +197,48 @@ class DWaveMiner(BaseMiner):
             submit_time=time.time()
         )
 
-    def _cancel_all_pending(self) -> int:
-        """Cancel all pending futures and clear the tracking dict.
+    def _cancel_all_pending(self) -> Tuple[int, float]:
+        """Cancel all pending futures and estimate their QPU time.
+
+        Jobs that were submitted to the QPU have already consumed QPU time even
+        if cancelled. This method attempts to get actual timing from completed
+        jobs, or uses EMA estimates for pending jobs.
 
         Returns:
-            Number of futures cancelled
+            Tuple of (cancelled_count, estimated_qpu_time_us)
         """
         cancelled = 0
-        for future in list(self.pending_futures.keys()):
+        total_estimated_us = 0.0
+
+        for future, job in list(self.pending_futures.items()):
             try:
+                # Try to get actual time if job already completed
+                if future.done():
+                    try:
+                        sampleset = future.sampleset
+                        if hasattr(sampleset, 'info') and 'timing' in sampleset.info:
+                            timing = sampleset.info['timing']
+                            qpu_time = timing.get('qpu_programming_time', 0) + timing.get('qpu_sampling_time', 0)
+                            total_estimated_us += qpu_time
+                        elif self.time_manager:
+                            # Use EMA estimate for completed job without timing
+                            total_estimated_us += self.time_manager.estimate_next_block_time()
+                    except Exception:
+                        # Fallback to estimate
+                        if self.time_manager:
+                            total_estimated_us += self.time_manager.estimate_next_block_time()
+                else:
+                    # Job still pending - use EMA estimate
+                    if self.time_manager:
+                        total_estimated_us += self.time_manager.estimate_next_block_time()
+
                 future.cancel()
                 cancelled += 1
             except Exception:
                 pass  # Best effort cancellation
+
         self.pending_futures.clear()
-        return cancelled
+        return cancelled, total_estimated_us
 
     def mine_block(
         self,
@@ -298,14 +325,18 @@ class DWaveMiner(BaseMiner):
         try:
             for i in range(self.queue_depth):
                 if stop_event.is_set():
-                    self._cancel_all_pending()
+                    cancelled, cancelled_time_us = self._cancel_all_pending()
+                    if self.time_manager and cancelled_time_us > 0:
+                        self.time_manager.record_block_time(cancelled_time_us)
                     return None
                 job = self._generate_and_submit_job(prev_block, node_info, cur_index, params, nodes, edges)
                 self.pending_futures[job.future] = job
                 self.logger.debug(f"[QPU] Submitted job {i+1}/{self.queue_depth}")
         except Exception as e:
             self.logger.error(f"Error filling initial queue: {e}")
-            self._cancel_all_pending()
+            cancelled, cancelled_time_us = self._cancel_all_pending()
+            if self.time_manager and cancelled_time_us > 0:
+                self.time_manager.record_block_time(cancelled_time_us)
             return None
 
         self.logger.info(f"[QPU] Queue filled, streaming results...")
@@ -334,8 +365,12 @@ class DWaveMiner(BaseMiner):
                         )
                         if result:
                             self.logger.info(f"[Block-{cur_index}] Previous result now meets decayed difficulty!")
-                            cancelled = self._cancel_all_pending()
-                            self.logger.info(f"Cancelled {cancelled} pending jobs")
+                            cancelled, cancelled_time_us = self._cancel_all_pending()
+                            if self.time_manager and cancelled_time_us > 0:
+                                self.time_manager.record_block_time(cancelled_time_us)
+                                self.logger.info(f"Cancelled {cancelled} pending jobs, recorded ~{cancelled_time_us/1e6:.2f}s estimated QPU time")
+                            else:
+                                self.logger.info(f"Cancelled {cancelled} pending jobs")
                             return result
 
             # Poll for completed futures (works with both Future and EmbeddedFuture)
@@ -410,8 +445,12 @@ class DWaveMiner(BaseMiner):
                         f"Solutions: {result.num_valid}, Diversity: {result.diversity:.3f}, "
                         f"Attempts: {progress}, Total Mining Time: {time.time() - start_time:.2f}s"
                     )
-                    cancelled = self._cancel_all_pending()
-                    self.logger.info(f"Cancelled {cancelled} pending jobs")
+                    cancelled, cancelled_time_us = self._cancel_all_pending()
+                    if self.time_manager and cancelled_time_us > 0:
+                        self.time_manager.record_block_time(cancelled_time_us)
+                        self.logger.info(f"Cancelled {cancelled} pending jobs, recorded ~{cancelled_time_us/1e6:.2f}s estimated QPU time")
+                    else:
+                        self.logger.info(f"Cancelled {cancelled} pending jobs")
                     return result
 
                 # Invalid result - track and refill queue (rolling window)
@@ -439,9 +478,13 @@ class DWaveMiner(BaseMiner):
                     self.logger.error(f"Error submitting replacement job: {e}")
 
         # Cleanup on exit
-        cancelled = self._cancel_all_pending()
+        cancelled, cancelled_time_us = self._cancel_all_pending()
         if cancelled > 0:
-            self.logger.info(f"Cancelled {cancelled} pending jobs on exit")
+            if self.time_manager and cancelled_time_us > 0:
+                self.time_manager.record_block_time(cancelled_time_us)
+                self.logger.info(f"Cancelled {cancelled} pending jobs on exit, recorded ~{cancelled_time_us/1e6:.2f}s estimated QPU time")
+            else:
+                self.logger.info(f"Cancelled {cancelled} pending jobs on exit")
 
         self.logger.info("Stopping mining, no valid results found")
         return None
