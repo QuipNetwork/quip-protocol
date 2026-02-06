@@ -18,7 +18,10 @@ from typing import Dict, Set, Tuple, List, Optional, Iterator
 import networkx as nx
 from networkx.algorithms import isomorphism
 
-from .graph import Graph
+from .graph import (
+    Graph, CellSignature, NodeSignature,
+    compute_signature, compute_node_signature, compute_all_node_signatures
+)
 from .rainbow_table import MinorEntry, RainbowTable
 
 
@@ -292,9 +295,13 @@ def find_disjoint_cover(
 def _minor_to_graph(minor: MinorEntry) -> Optional[Graph]:
     """Reconstruct a graph from a minor entry.
 
-    This is a simple reconstruction for common graph types.
-    For complex graphs, returns None (cannot reconstruct).
+    First checks if the entry has a stored graph. Otherwise falls back
+    to name-based reconstruction for common graph types.
     """
+    # Use stored graph if available
+    if minor.graph is not None:
+        return minor.graph
+
     from .graph import complete_graph, cycle_graph, path_graph, star_graph, wheel_graph
 
     name = minor.name

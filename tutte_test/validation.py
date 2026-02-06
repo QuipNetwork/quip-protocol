@@ -16,7 +16,7 @@ from typing import Optional, Tuple
 import networkx as nx
 
 from .polynomial import TuttePolynomial
-from .graph import Graph, MutableGraph
+from .graph import Graph
 
 
 # =============================================================================
@@ -244,28 +244,6 @@ def verify_polynomial_properties(poly: TuttePolynomial, graph: Graph) -> Tuple[b
             return False, f"x-degree {poly.x_degree()} exceeds expected max {max_x_deg}"
 
     return True, "All properties verified"
-
-
-def verify_against_deletion_contraction(
-    graph: MutableGraph,
-    poly: TuttePolynomial,
-    compute_dc_poly
-) -> bool:
-    """Verify polynomial matches deletion-contraction computation.
-
-    This is the ground truth verification - the deletion-contraction
-    algorithm is provably correct (if slow).
-
-    Args:
-        graph: The graph (MutableGraph for deletion-contraction)
-        poly: The polynomial to verify
-        compute_dc_poly: Function implementing deletion-contraction
-
-    Returns:
-        True if polynomials match
-    """
-    dc_poly = compute_dc_poly(graph)
-    return poly == dc_poly
 
 
 # =============================================================================

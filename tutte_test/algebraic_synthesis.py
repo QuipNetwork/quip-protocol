@@ -271,10 +271,6 @@ class AlgebraicSynthesisEngine:
         # Verify against Kirchhoff
         result.verified = verify_spanning_trees(graph, result.polynomial)
 
-        # Add to rainbow table for future lookups
-        name = f"synth_{graph.canonical_key()[:8]}"
-        self.table.add(graph, name, poly)
-
         return result
 
     def _decompose_algebraically(
@@ -495,116 +491,17 @@ class AlgebraicSynthesisEngine:
     # =========================================================================
 
     def _compute_via_fallback(self, graph: Graph) -> TuttePolynomial:
-        """Compute polynomial using deletion-contraction.
+        """Compute polynomial using HybridSynthesisEngine.
 
-        This is the fallback method when algebraic decomposition
-        needs a starting polynomial.
+        This delegates to the hybrid engine which uses spanning tree
+        expansion + pattern recognition instead of deletion-contraction.
         """
-        from .graph import MultiGraph
+        from .hybrid_synthesis import HybridSynthesisEngine
 
-        self._log(f"Computing via deletion-contraction: {graph.edge_count()} edges")
+        self._log(f"Computing via hybrid synthesis: {graph.edge_count()} edges")
 
-        # Convert to multigraph for D-C
-        mg = MultiGraph.from_graph(graph)
-        return self._dc_multigraph(mg)
-
-    def _dc_multigraph(self, mg) -> TuttePolynomial:
-        """Deletion-contraction for multigraphs."""
-        from .graph import MultiGraph
-
-        # Base case: no edges
-        if mg.edge_count() == 0:
-            return TuttePolynomial.one()
-
-        # Handle loops: T(G with loops) = y^k * T(G without loops)
-        if mg.total_loop_count() > 0:
-            loop_count = mg.total_loop_count()
-            return TuttePolynomial.y(loop_count) * self._dc_multigraph(mg.remove_loops())
-
-        # Handle disconnected graphs
-        if not mg.is_connected():
-            # Find one component via BFS
-            start = next(iter(mg.nodes))
-            visited = {start}
-            stack = [start]
-            while stack:
-                node = stack.pop()
-                for neighbor in mg.neighbors(node):
-                    if neighbor not in visited:
-                        visited.add(neighbor)
-                        stack.append(neighbor)
-
-            # Build component subgraph
-            comp1_edges = {e: c for e, c in mg.edge_counts.items() if e[0] in visited}
-            comp1_loops = {n: c for n, c in mg.loop_counts.items() if n in visited}
-            comp1 = MultiGraph(nodes=frozenset(visited), edge_counts=comp1_edges, loop_counts=comp1_loops)
-
-            # Rest of the graph
-            rest_nodes = mg.nodes - visited
-            rest_edges = {e: c for e, c in mg.edge_counts.items() if e[0] in rest_nodes}
-            rest_loops = {n: c for n, c in mg.loop_counts.items() if n in rest_nodes}
-            rest = MultiGraph(nodes=frozenset(rest_nodes), edge_counts=rest_edges, loop_counts=rest_loops)
-
-            return self._dc_multigraph(comp1) * self._dc_multigraph(rest)
-
-        # Handle parallel edges special case
-        if mg.is_just_parallel_edges():
-            k = mg.parallel_edge_count()
-            # T(k parallel) = x + y + y^2 + ... + y^{k-1}
-            if k <= 0:
-                return TuttePolynomial.one()
-            if k == 1:
-                return TuttePolynomial.x()
-            coeffs = {(1, 0): 1}
-            for i in range(1, k):
-                coeffs[(0, i)] = 1
-            return TuttePolynomial.from_coefficients(coeffs)
-
-        # Pick an edge for D-C
-        edge = next(iter(mg.edge_counts.keys()))
-        u, v = edge
-        multiplicity = mg.edge_counts[edge]
-
-        # Remove one copy of edge (deletion)
-        new_edge_counts = dict(mg.edge_counts)
-        new_edge_counts[edge] = multiplicity - 1
-        if new_edge_counts[edge] == 0:
-            del new_edge_counts[edge]
-
-        mg_delete = MultiGraph(
-            nodes=mg.nodes,
-            edge_counts=new_edge_counts,
-            loop_counts=mg.loop_counts
-        )
-
-        # Check if bridge
-        if not mg_delete.is_connected():
-            # Bridge: T(G) = x * T(G \ e)
-            return TuttePolynomial.x() * self._dc_multigraph(mg_delete)
-
-        # Regular edge: T(G) = T(G \ e) + T(G / e)
-        # Contract edge
-        mg_merged = mg.merge_nodes(u, v)
-        survivor = min(u, v)
-
-        # Remove one loop (from the contracted edge)
-        if survivor in mg_merged.loop_counts:
-            new_loops = dict(mg_merged.loop_counts)
-            new_loops[survivor] -= 1
-            if new_loops[survivor] == 0:
-                del new_loops[survivor]
-            mg_contract = MultiGraph(
-                nodes=mg_merged.nodes,
-                edge_counts=mg_merged.edge_counts,
-                loop_counts=new_loops
-            )
-        else:
-            mg_contract = mg_merged
-
-        t_delete = self._dc_multigraph(mg_delete)
-        t_contract = self._dc_multigraph(mg_contract)
-
-        return t_delete + t_contract
+        engine = HybridSynthesisEngine(table=self.table, verbose=self.verbose)
+        return engine.synthesize(graph).polynomial
 
 
 # =============================================================================

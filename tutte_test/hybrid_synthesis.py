@@ -183,10 +183,6 @@ class HybridSynthesisEngine:
         result.verified = verify_spanning_trees(graph, result.polynomial)
         self._cache[cache_key] = result
 
-        # Add to rainbow table
-        name = f"hybrid_{graph.canonical_key()[:8]}"
-        self.table.add(graph, name, result.polynomial)
-
         return result
 
     def _synthesize_disconnected(
@@ -562,59 +558,16 @@ class HybridSynthesisEngine:
         mg: MultiGraph,
         max_depth: int
     ) -> TuttePolynomial:
-        """Deletion-contraction fallback for multigraphs.
+        """Deletion-contraction fallback — should never be reached.
 
-        Only used when pattern recognition fails.
+        Pattern recognition (loops, cut vertices, parallel edges, disconnected
+        components, parallel edge reduction) should handle all multigraph cases.
+        If this is reached, it indicates a gap in the pattern recognition logic.
         """
-        self._stats['dc'] += 1
-
-        # Base cases already handled in caller
-
-        # Pick an edge
-        edge = next(iter(mg.edge_counts.keys()))
-        u, v = edge
-        multiplicity = mg.edge_counts[edge]
-
-        # Build deletion graph (remove one edge)
-        new_edge_counts = dict(mg.edge_counts)
-        new_edge_counts[edge] = multiplicity - 1
-        if new_edge_counts[edge] == 0:
-            del new_edge_counts[edge]
-
-        mg_delete = MultiGraph(
-            nodes=mg.nodes,
-            edge_counts=new_edge_counts,
-            loop_counts=mg.loop_counts
+        raise RuntimeError(
+            f"D-C fallback reached for multigraph with "
+            f"{mg.node_count()} nodes, {mg.edge_count()} edges"
         )
-
-        # Check if bridge
-        if not mg_delete.is_connected():
-            # Bridge: T(G) = x × T(G \ e)
-            return TuttePolynomial.x() * self._synthesize_multigraph(mg_delete, max_depth)
-
-        # Contraction
-        mg_merged = mg.merge_nodes(u, v)
-        survivor = min(u, v)
-
-        # Remove contracted edge loop
-        if survivor in mg_merged.loop_counts:
-            new_loops = dict(mg_merged.loop_counts)
-            new_loops[survivor] -= 1
-            if new_loops[survivor] == 0:
-                del new_loops[survivor]
-            mg_contract = MultiGraph(
-                nodes=mg_merged.nodes,
-                edge_counts=mg_merged.edge_counts,
-                loop_counts=new_loops
-            )
-        else:
-            mg_contract = mg_merged
-
-        # T(G) = T(G \ e) + T(G / e)
-        t_delete = self._synthesize_multigraph(mg_delete, max_depth)
-        t_contract = self._synthesize_multigraph(mg_contract, max_depth)
-
-        return t_delete + t_contract
 
 
 # =============================================================================

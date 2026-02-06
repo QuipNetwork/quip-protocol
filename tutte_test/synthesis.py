@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from .polynomial import TuttePolynomial
-from .graph import Graph, MutableGraph, MultiGraph
+from .graph import Graph, MultiGraph
 from .rainbow_table import RainbowTable, MinorEntry, load_default_table
 from .covering import (
     Cover, Tile, Fringe,
@@ -190,46 +190,49 @@ class SynthesisEngine:
         max_depth: int
     ) -> SynthesisResult:
         """Synthesize polynomial for connected graph using creation-expansion-join."""
-        # Find largest minor in rainbow table
-        minor = self.table.largest_minor_of(graph)
+        target_edges = graph.edge_count()
 
-        if minor is None or minor.edge_count <= 1:
-            # No useful minors (K_2 alone isn't useful for tiling), use spanning tree expansion
+        # For small graphs, spanning tree expansion is faster than VF2 search.
+        if target_edges <= 15:
             return self._synthesize_from_k2(graph, max_depth)
 
-        self._log(f"Largest minor: {minor.name} ({minor.edge_count} edges)")
+        # Only use tiles that cover a meaningful portion of the graph
+        min_tile_edges = max(target_edges // 3, 4)
 
-        # Find disjoint cover using this minor
-        cover = find_disjoint_cover(graph, minor, self.table)
+        # Only use explicitly-named entries as tile candidates
+        candidates = [
+            c for c in self.table.find_minors_of(graph)
+            if not c.name.startswith("synth_") and not c.name.startswith("hybrid_")
+               and c.edge_count >= min_tile_edges
+               and c.canonical_key != graph.canonical_key()
+        ]
 
-        if not cover.tiles:
-            # Couldn't place any tiles, fall back to spanning tree expansion
+        cover = None
+        minor = None
+
+        for candidate in candidates:
+            self._log(f"Trying minor: {candidate.name} ({candidate.edge_count} edges)")
+            trial_cover = find_disjoint_cover(graph, candidate, self.table)
+
+            if not trial_cover.tiles:
+                continue  # Not a real subgraph, try next
+
+            if trial_cover.covered_nodes != graph.nodes:
+                self._log(f"  Cover incomplete ({len(trial_cover.covered_nodes)}/{len(graph.nodes)} nodes)")
+                continue  # Doesn't cover all nodes, try next
+
+            # Found a usable cover
+            cover = trial_cover
+            minor = candidate
+            break
+
+        if cover is None:
+            # No minor produces a useful cover, use spanning tree expansion
             return self._synthesize_from_k2(graph, max_depth)
-
-        # Check if cover covers all nodes - if not, tiling approach won't work
-        # because uncovered edges to new nodes can't use edge addition properly
-        if cover.covered_nodes != graph.nodes:
-            self._log(f"Cover incomplete ({len(cover.covered_nodes)}/{len(graph.nodes)} nodes), using spanning tree expansion")
-            return self._synthesize_from_k2(graph, max_depth)
-
-        # Also check: if tiles are disconnected (no shared nodes), spanning tree is simpler
-        # because tiling creates a disconnected base which is complex to handle
-        if len(cover.tiles) > 1:
-            # Check if any tiles share nodes (they shouldn't for disjoint cover, but let's be safe)
-            all_nodes = set()
-            for tile in cover.tiles:
-                if tile.covered_nodes & all_nodes:
-                    break  # Found overlap, tiles are connected via shared nodes
-                all_nodes.update(tile.covered_nodes)
-            else:
-                # No overlap - tiles form disconnected components
-                # Spanning tree expansion is simpler for this case
-                self._log("Tiles are disconnected, using spanning tree expansion")
-                return self._synthesize_from_k2(graph, max_depth)
 
         self._log(f"Cover: {len(cover.tiles)} tiles, {len(cover.uncovered_edges)} uncovered edges")
 
-        # Compute base polynomial from disjoint tiles
+        # Compute base polynomial from disjoint tiles (product formula)
         poly = TuttePolynomial.one()
         recipe = [f"Tiling with {len(cover.tiles)} copies of {minor.name}"]
 
@@ -237,31 +240,47 @@ class SynthesisEngine:
             poly = poly * tile.minor.polynomial
             recipe.append(f"  Tile {tile.minor.name}: T = {tile.minor.polynomial}")
 
-        # Handle inter-tile edges (k-joins)
-        inter_edges = compute_inter_tile_edges(cover, graph)
-        if inter_edges:
-            poly, join_steps = self._apply_k_joins(poly, cover, graph, inter_edges)
-            recipe.extend(join_steps)
+        # Build the covered subgraph as a MultiGraph for edge addition
+        covered_edge_counts = {}
+        for tile in cover.tiles:
+            for edge in tile.covered_edges:
+                covered_edge_counts[edge] = covered_edge_counts.get(edge, 0) + 1
 
-        # Handle fringe (over-coverage)
-        fringe = compute_fringe(cover, graph)
-        if not fringe.is_empty():
-            poly, fringe_steps = self._adjust_for_fringe(poly, fringe, max_depth)
-            recipe.extend(fringe_steps)
-
-        # Handle uncovered edges using edge addition formula
+        # Handle uncovered edges using the correct formula:
+        # - Bridge (connects different components): T(G+e) = x · T(G)
+        # - Chord (within same component): T(G+e) = T(G) + T(G/{u,v})
         if cover.uncovered_edges:
-            poly, uncovered_steps = self._handle_uncovered(
-                poly, cover.uncovered_edges, graph, cover, max_depth
+            uncovered_list = sorted(cover.uncovered_edges)
+            self._log(f"Adding {len(uncovered_list)} uncovered edges via edge addition")
+            recipe.append(f"Edge addition for {len(uncovered_list)} uncovered edges")
+
+            current_mg = MultiGraph(
+                nodes=graph.nodes,
+                edge_counts=covered_edge_counts,
+                loop_counts={}
             )
-            recipe.extend(uncovered_steps)
+
+            for u, v in uncovered_list:
+                if current_mg.in_same_component(u, v):
+                    # Chord: T(G+e) = T(G) + T(G/{u,v})
+                    merged = current_mg.merge_nodes(u, v)
+                    merged_poly = self._synthesize_multigraph(merged)
+                    poly = poly + merged_poly
+                else:
+                    # Bridge: T(G+e) = x · T(G)
+                    poly = TuttePolynomial.x() * poly
+
+                edge = (min(u, v), max(u, v))
+                new_edge_counts = dict(current_mg.edge_counts)
+                new_edge_counts[edge] = new_edge_counts.get(edge, 0) + 1
+                current_mg = MultiGraph(
+                    nodes=current_mg.nodes,
+                    edge_counts=new_edge_counts,
+                    loop_counts=current_mg.loop_counts
+                )
 
         # Verify
         verified = verify_spanning_trees(graph, poly)
-
-        # Add to rainbow table for future lookups
-        name = f"synth_{graph.canonical_key()[:8]}"
-        self.table.add(graph, name, poly)
 
         return SynthesisResult(
             polynomial=poly,
@@ -269,7 +288,7 @@ class SynthesisEngine:
             verified=verified,
             method="creation_expansion_join",
             tiles_used=len(cover.tiles),
-            fringe_edges=fringe.edge_count()
+            fringe_edges=0
         )
 
     def _synthesize_from_k2(
@@ -365,88 +384,6 @@ class SynthesisEngine:
             method="spanning_tree_expansion"
         )
 
-    def _deletion_contraction(self, graph: Graph) -> SynthesisResult:
-        """Compute polynomial via deletion-contraction algorithm.
-
-        This is the fallback for small or complex graphs.
-        """
-        self._log(f"Deletion-contraction on {graph.edge_count()} edges")
-
-        # Convert to MutableGraph for deletion-contraction
-        mg = MutableGraph.from_graph(graph)
-        poly = self._dc_recursive(mg)
-
-        return SynthesisResult(
-            polynomial=poly,
-            recipe=["Deletion-contraction"],
-            verified=True,  # D-C is provably correct
-            method="deletion_contraction"
-        )
-
-    def _dc_recursive(self, g: MutableGraph) -> TuttePolynomial:
-        """Recursive deletion-contraction implementation."""
-        # Base case: no edges
-        if g.num_edges() == 0:
-            return TuttePolynomial.one()
-
-        # Handle loops first
-        if g.loops:
-            edge_id = next(iter(g.loops.keys()))
-            g_copy = g.copy()
-            del g_copy.loops[edge_id]
-            return TuttePolynomial.y() * self._dc_recursive(g_copy)
-
-        # Pick an edge
-        edge_id = next(iter(g.edges.keys()))
-        u, v = g.edges[edge_id]
-
-        # Check if bridge
-        if self._is_bridge(g, edge_id):
-            # T(G) = x * T(G \ e)
-            g_minus = g.copy()
-            del g_minus.edges[edge_id]
-            return TuttePolynomial.x() * self._dc_recursive(g_minus)
-
-        # Regular edge: T(G) = T(G \ e) + T(G / e)
-        # Deletion
-        g_delete = g.copy()
-        del g_delete.edges[edge_id]
-        t_delete = self._dc_recursive(g_delete)
-
-        # Contraction
-        g_contract = g.copy()
-        g_contract.contract_edge(edge_id)
-        t_contract = self._dc_recursive(g_contract)
-
-        return t_delete + t_contract
-
-    def _is_bridge(self, g: MutableGraph, edge_id: int) -> bool:
-        """Check if edge is a bridge (cut edge)."""
-        if edge_id not in g.edges:
-            return False
-
-        u, v = g.edges[edge_id]
-
-        # BFS from u without using edge_id
-        visited = {u}
-        stack = [u]
-
-        while stack:
-            curr = stack.pop()
-            for eid, (a, b) in g.edges.items():
-                if eid == edge_id:
-                    continue
-                neighbor = None
-                if a == curr and b not in visited:
-                    neighbor = b
-                elif b == curr and a not in visited:
-                    neighbor = a
-                if neighbor is not None:
-                    visited.add(neighbor)
-                    stack.append(neighbor)
-
-        return v not in visited
-
     # =========================================================================
     # MULTIGRAPH SYNTHESIS WITH PATTERN RECOGNITION
     # =========================================================================
@@ -509,7 +446,20 @@ class SynthesisEngine:
             self._multigraph_cache[cache_key] = poly
             return poly
 
-        # 6. Fall back to deletion-contraction for multigraphs
+        # 6. Disconnected multigraph: T(G1 ∪ G2) = T(G1) × T(G2)
+        if not mg.is_connected():
+            poly = self._handle_disconnected_multigraph(mg)
+            self._multigraph_cache[cache_key] = poly
+            return poly
+
+        # 7. Reduce parallel edges one at a time: T(G) = T(G\e) + T(G/e)
+        max_mult_edge = max(mg.edge_counts.keys(), key=lambda e: mg.edge_counts[e])
+        if mg.edge_counts[max_mult_edge] > 1:
+            poly = self._reduce_parallel_edge(mg, max_mult_edge)
+            self._multigraph_cache[cache_key] = poly
+            return poly
+
+        # 8. Fall back to deletion-contraction for multigraphs
         poly = self._dc_multigraph(mg)
         self._multigraph_cache[cache_key] = poly
         return poly
@@ -539,143 +489,57 @@ class SynthesisEngine:
             coeffs[(0, i)] = 1  # + y^i
         return TuttePolynomial.from_coefficients(coeffs)
 
-    def _dc_multigraph(self, mg: MultiGraph) -> TuttePolynomial:
-        """Deletion-contraction for multigraphs.
+    def _handle_disconnected_multigraph(self, mg: MultiGraph) -> TuttePolynomial:
+        """Handle disconnected multigraph: T(G1 ∪ G2) = T(G1) × T(G2)."""
+        start = next(iter(mg.nodes))
+        visited = {start}
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            for neighbor in mg.neighbors(node):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    stack.append(neighbor)
 
-        This is a pure D-C implementation. Pattern recognition can incorrectly
-        identify cut vertices in intermediate graphs during D-C recursion.
+        comp1_edges = {e: c for e, c in mg.edge_counts.items() if e[0] in visited}
+        comp1_loops = {n: c for n, c in mg.loop_counts.items() if n in visited}
+        comp1 = MultiGraph(nodes=frozenset(visited), edge_counts=comp1_edges, loop_counts=comp1_loops)
+
+        rest_nodes = mg.nodes - visited
+        rest_edges = {e: c for e, c in mg.edge_counts.items() if e[0] in rest_nodes}
+        rest_loops = {n: c for n, c in mg.loop_counts.items() if n in rest_nodes}
+        rest = MultiGraph(nodes=frozenset(rest_nodes), edge_counts=rest_edges, loop_counts=rest_loops)
+
+        return self._synthesize_multigraph(comp1) * self._synthesize_multigraph(rest)
+
+    def _reduce_parallel_edge(
+        self,
+        mg: MultiGraph,
+        edge: Tuple[int, int]
+    ) -> TuttePolynomial:
+        """Reduce a parallel edge using T(G) = T(G\\e) + T(G/e).
+
+        For parallel edges, deletion removes one copy, contraction
+        merges the endpoints (creating loops from other parallel copies).
         """
-        # Remove isolated nodes first (they contribute T=1)
-        nodes_with_edges = set()
-        for (u, v) in mg.edge_counts.keys():
-            nodes_with_edges.add(u)
-            nodes_with_edges.add(v)
-        for n in mg.loop_counts.keys():
-            nodes_with_edges.add(n)
-
-        if nodes_with_edges and len(nodes_with_edges) < len(mg.nodes):
-            mg = MultiGraph(
-                nodes=frozenset(nodes_with_edges),
-                edge_counts=mg.edge_counts,
-                loop_counts=mg.loop_counts
-            )
-
-        # Check cache after normalizing
-        cache_key = mg.canonical_key()
-        if cache_key in self._multigraph_cache:
-            return self._multigraph_cache[cache_key]
-
-        # Base case: no edges
-        if mg.edge_count() == 0:
-            return TuttePolynomial.one()
-
-        # Handle disconnected graphs: T(G1 ∪ G2) = T(G1) × T(G2)
-        if not mg.is_connected():
-            # BFS to find one component
-            start = next(iter(mg.nodes))
-            visited = {start}
-            stack = [start]
-            while stack:
-                node = stack.pop()
-                for neighbor in mg.neighbors(node):
-                    if neighbor not in visited:
-                        visited.add(neighbor)
-                        stack.append(neighbor)
-
-            # Build component subgraph
-            comp1_edges = {e: c for e, c in mg.edge_counts.items() if e[0] in visited}
-            comp1_loops = {n: c for n, c in mg.loop_counts.items() if n in visited}
-            comp1 = MultiGraph(nodes=frozenset(visited), edge_counts=comp1_edges, loop_counts=comp1_loops)
-
-            # Rest of the graph
-            rest_nodes = mg.nodes - visited
-            rest_edges = {e: c for e, c in mg.edge_counts.items() if e[0] in rest_nodes}
-            rest_loops = {n: c for n, c in mg.loop_counts.items() if n in rest_nodes}
-            rest = MultiGraph(nodes=frozenset(rest_nodes), edge_counts=rest_edges, loop_counts=rest_loops)
-
-            result = self._dc_multigraph(comp1) * self._dc_multigraph(rest)
-            self._multigraph_cache[cache_key] = result
-            return result
-
-        # Handle loops: T(G with loops) = y^k * T(G without loops)
-        if mg.total_loop_count() > 0:
-            loop_count = mg.total_loop_count()
-            result = TuttePolynomial.y(loop_count) * self._dc_multigraph(mg.remove_loops())
-            self._multigraph_cache[cache_key] = result
-            return result
-
-        # Check for parallel edges between 2 nodes only
-        if mg.is_just_parallel_edges():
-            result = self._parallel_edges_formula(mg.parallel_edge_count())
-            self._multigraph_cache[cache_key] = result
-            return result
-
-        # Pick an edge
-        edge = next(iter(mg.edge_counts.keys()))
         u, v = edge
         multiplicity = mg.edge_counts[edge]
 
-        if multiplicity > 1:
-            # Multiple parallel edges: remove one copy
-            new_edge_counts = dict(mg.edge_counts)
-            new_edge_counts[edge] = multiplicity - 1
-            if new_edge_counts[edge] == 0:
-                del new_edge_counts[edge]
-
-            mg_minus_one = MultiGraph(
-                nodes=mg.nodes,
-                edge_counts=new_edge_counts,
-                loop_counts=mg.loop_counts
-            )
-
-            # T(G) = T(G \ e) + T(G / e)
-            # Contracting creates loops from parallel edges; remove one for the contracted edge
-            mg_merged = mg.merge_nodes(u, v)
-            survivor = min(u, v)
-            if survivor in mg_merged.loop_counts:
-                new_loops = dict(mg_merged.loop_counts)
-                new_loops[survivor] -= 1
-                if new_loops[survivor] == 0:
-                    del new_loops[survivor]
-                mg_contract = MultiGraph(
-                    nodes=mg_merged.nodes,
-                    edge_counts=mg_merged.edge_counts,
-                    loop_counts=new_loops
-                )
-            else:
-                mg_contract = mg_merged
-
-            t_delete = self._dc_multigraph(mg_minus_one)
-            t_contract = self._dc_multigraph(mg_contract)
-
-            result = t_delete + t_contract
-            self._multigraph_cache[cache_key] = result
-            return result
-
-        # Single edge - deletion
+        # Delete one copy
         new_edge_counts = dict(mg.edge_counts)
-        del new_edge_counts[edge]
+        new_edge_counts[edge] = multiplicity - 1
+        if new_edge_counts[edge] == 0:
+            del new_edge_counts[edge]
         mg_delete = MultiGraph(
             nodes=mg.nodes,
             edge_counts=new_edge_counts,
             loop_counts=mg.loop_counts
         )
 
-        # Check if bridge (deletion disconnects the graph)
-        if not mg_delete.is_connected():
-            # It's a bridge: T(G) = x * T(G \ e)
-            result = TuttePolynomial.x() * self._dc_multigraph(mg_delete)
-            self._multigraph_cache[cache_key] = result
-            return result
-
-        # Regular edge: T(G) = T(G \ e) + T(G / e)
-        # Contracting edge (u,v) = merge nodes + remove the edge
-        # merge_nodes creates a loop from the contracted edge, so we need to remove it
+        # Contract (merge endpoints, creating loops from parallel copies)
         mg_merged = mg.merge_nodes(u, v)
-        # The contracted edge becomes a loop at the surviving node (min(u,v))
         survivor = min(u, v)
         if survivor in mg_merged.loop_counts:
-            # Remove one loop (the one from the contracted edge)
             new_loops = dict(mg_merged.loop_counts)
             new_loops[survivor] -= 1
             if new_loops[survivor] == 0:
@@ -688,12 +552,22 @@ class SynthesisEngine:
         else:
             mg_contract = mg_merged
 
-        t_delete = self._dc_multigraph(mg_delete)
-        t_contract = self._dc_multigraph(mg_contract)
+        t_delete = self._synthesize_multigraph(mg_delete)
+        t_contract = self._synthesize_multigraph(mg_contract)
 
-        result = t_delete + t_contract
-        self._multigraph_cache[cache_key] = result
-        return result
+        return t_delete + t_contract
+
+    def _dc_multigraph(self, mg: MultiGraph) -> TuttePolynomial:
+        """Deletion-contraction fallback — should never be reached.
+
+        Pattern recognition (loops, cut vertices, parallel edges, disconnected
+        components) should handle all multigraph cases. If this is reached,
+        it indicates a gap in the pattern recognition logic.
+        """
+        raise RuntimeError(
+            f"D-C fallback reached for multigraph with "
+            f"{mg.node_count()} nodes, {mg.edge_count()} edges"
+        )
 
     def _add_edges_to_graph(
         self,
@@ -1025,14 +899,3 @@ def compute_tutte_polynomial(graph: Graph, method: str = "auto") -> TuttePolynom
     return result.polynomial
 
 
-def compute_from_mutable(mg: MutableGraph) -> TuttePolynomial:
-    """Compute Tutte polynomial from MutableGraph.
-
-    Args:
-        mg: MutableGraph to compute polynomial for
-
-    Returns:
-        TuttePolynomial for the graph
-    """
-    graph = mg.freeze()
-    return compute_tutte_polynomial(graph)

@@ -1,16 +1,19 @@
-"""Test Suite for New Synthesis Engine.
+"""Consolidated Test Suite for Tutte Polynomial Synthesis.
 
 This module tests:
 1. Polynomial bitstring encoding/decoding
 2. Graph operations and conversions
-3. Rainbow table lookups
-4. Synthesis engine correctness
-5. Spanning tree invariant verification
+3. Rainbow table lookups and binary encoding
+4. Synthesis engine correctness (tiling, hybrid, algebraic)
+5. Spanning tree invariant verification (Tutte vs Kirchhoff)
 6. Composition formula verification
+7. Zephyr Z(m,t) synthesis with basic primitives
+8. Z(1,1) synthesis with empty rainbow table
 
 Run with: python -m pytest tutte_test/test_synthesis.py -v
 """
 
+import json
 import os
 import sys
 import unittest
@@ -20,19 +23,39 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import networkx as nx
 from tutte_test.covering import (compute_fringe, find_disjoint_cover,
                                  find_subgraph_isomorphisms)
-from tutte_test.graph import (Graph, MutableGraph, MultiGraph, complete_graph,
+from tutte_test.graph import (Graph, MultiGraph, complete_graph,
                               cut_vertex_join, cycle_graph, disjoint_union,
                               path_graph, star_graph, wheel_graph)
 from tutte_test.polynomial import (TuttePolynomial, cycle_polynomial,
                                    decode_varsint, decode_varuint,
                                    encode_varsint, encode_varuint,
                                    path_polynomial)
-from tutte_test.rainbow_table import RainbowTable, load_default_table
+from tutte_test.rainbow_table import (RainbowTable, load_default_table,
+                                      build_basic_table,
+                                      encode_rainbow_table_binary,
+                                      create_minimal_json,
+                                      analyze_binary_breakdown)
 from tutte_test.synthesis import (SynthesisEngine, SynthesisResult,
-                                  compute_from_mutable,
                                   compute_tutte_polynomial, synthesize)
 from tutte_test.validation import (count_spanning_trees_kirchhoff,
                                    verify_spanning_trees, verify_with_networkx)
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def get_zephyr_graph(m: int, t: int) -> nx.Graph:
+    """Get Zephyr graph Z(m,t) using dwave_networkx."""
+    try:
+        import dwave_networkx as dnx
+        return dnx.zephyr_graph(m, t)
+    except ImportError:
+        raise ImportError(
+            "dwave_networkx required for Zephyr graphs. "
+            "Install with: pip install dwave-networkx"
+        )
+
 
 # =============================================================================
 # POLYNOMIAL ENCODING TESTS
@@ -206,44 +229,6 @@ class TestGraph(unittest.TestCase):
         self.assertEqual(joined.edge_count(), 6)  # 3 + 3
 
 
-class TestMutableGraph(unittest.TestCase):
-    """Test MutableGraph class operations."""
-
-    def test_add_nodes_edges(self):
-        """Test adding nodes and edges."""
-        g = MutableGraph()
-        n1 = g.add_node()
-        n2 = g.add_node()
-        e = g.add_edge(n1, n2)
-
-        self.assertEqual(g.num_nodes(), 2)
-        self.assertEqual(g.num_edges(), 1)
-
-    def test_freeze(self):
-        """Test freezing to immutable Graph."""
-        g = MutableGraph()
-        nodes = g.add_nodes(3)
-        g.add_edge(nodes[0], nodes[1])
-        g.add_edge(nodes[1], nodes[2])
-
-        frozen = g.freeze()
-        self.assertEqual(frozen.node_count(), 3)
-        self.assertEqual(frozen.edge_count(), 2)
-
-    def test_contract_edge(self):
-        """Test edge contraction."""
-        g = MutableGraph()
-        nodes = g.add_nodes(3)
-        g.add_edge(nodes[0], nodes[1])
-        g.add_edge(nodes[1], nodes[2])
-
-        # Contract edge between nodes[0] and nodes[1]
-        edge_id = 0
-        g.contract_edge(edge_id)
-
-        self.assertEqual(g.num_nodes(), 2)
-
-
 # =============================================================================
 # RAINBOW TABLE TESTS
 # =============================================================================
@@ -291,6 +276,62 @@ class TestRainbowTable(unittest.TestCase):
         minor_names = {m.name for m in minors}
         self.assertIn('K_3', minor_names)
         self.assertIn('K_2', minor_names)
+
+    def test_k5_networkx_verification(self):
+        """K_5 polynomial matches NetworkX."""
+        k5 = complete_graph(5)
+        poly = compute_tutte_polynomial(k5)
+        self.assertTrue(verify_with_networkx(k5, poly))
+
+    def test_c5_networkx_verification(self):
+        """C_5 polynomial matches NetworkX."""
+        c5 = cycle_graph(5)
+        poly = compute_tutte_polynomial(c5)
+        self.assertTrue(verify_with_networkx(c5, poly))
+
+    def test_petersen_networkx_verification(self):
+        """Petersen graph polynomial matches NetworkX."""
+        g_pet = Graph.from_networkx(nx.petersen_graph())
+        poly = compute_tutte_polynomial(g_pet)
+        self.assertTrue(verify_with_networkx(g_pet, poly))
+
+    def test_k5_rainbow_table_consistency(self):
+        """K_5 rainbow table entry matches computed polynomial."""
+        entry = self.table.get_entry('K_5')
+        if entry is None:
+            self.skipTest("K_5 not in rainbow table")
+        k5 = complete_graph(5)
+        computed = compute_tutte_polynomial(k5)
+        self.assertEqual(computed.num_spanning_trees(), entry.spanning_trees)
+
+    def test_k6_rainbow_table_consistency(self):
+        """K_6 rainbow table entry matches Kirchhoff."""
+        entry = self.table.get_entry('K_6')
+        if entry is None:
+            self.skipTest("K_6 not in rainbow table")
+        k6 = complete_graph(6)
+        kirchhoff = count_spanning_trees_kirchhoff(k6)
+        self.assertEqual(entry.spanning_trees, kirchhoff)
+
+    def test_petersen_rainbow_table_consistency(self):
+        """Petersen rainbow table entry matches Kirchhoff."""
+        entry = self.table.get_entry('Petersen')
+        if entry is None:
+            self.skipTest("Petersen not in rainbow table")
+        g_pet = Graph.from_networkx(nx.petersen_graph())
+        kirchhoff = count_spanning_trees_kirchhoff(g_pet)
+        self.assertEqual(entry.spanning_trees, kirchhoff)
+
+    def test_wheel_rainbow_table_consistency(self):
+        """Wheel graph rainbow table entries match Kirchhoff."""
+        for n in [5, 6]:
+            with self.subTest(n=n):
+                entry = self.table.get_entry(f'W_{n}')
+                if entry is None:
+                    self.skipTest(f"W_{n} not in rainbow table")
+                g = Graph.from_networkx(nx.wheel_graph(n))
+                kirchhoff = count_spanning_trees_kirchhoff(g)
+                self.assertEqual(entry.spanning_trees, kirchhoff)
 
 
 # =============================================================================
@@ -403,6 +444,22 @@ class TestSpanningTreeVerification(unittest.TestCase):
                 self.assertEqual(tutte_trees, expected, f"{name}: Tutte mismatch")
                 self.assertEqual(tutte_trees, kirchhoff_trees, f"{name}: Tutte != Kirchhoff")
 
+    def test_k5_two_algorithm_check(self):
+        """K_5 spanning trees via Tutte and Kirchhoff agree."""
+        k5 = complete_graph(5)
+        poly = compute_tutte_polynomial(k5)
+        self.assertEqual(poly.num_spanning_trees(), 125)
+        self.assertTrue(verify_spanning_trees(k5, poly))
+
+    def test_k33_two_algorithm_check(self):
+        """K_3,3 spanning trees via Tutte and Kirchhoff agree."""
+        G_nx = nx.complete_bipartite_graph(3, 3)
+        g = Graph.from_networkx(G_nx)
+        poly = compute_tutte_polynomial(g)
+        kirchhoff = count_spanning_trees_kirchhoff(g)
+        self.assertEqual(poly.num_spanning_trees(), kirchhoff)
+        self.assertEqual(kirchhoff, 81)
+
 
 class TestCompositionFormulas(unittest.TestCase):
     """Test that composition formulas hold."""
@@ -435,6 +492,34 @@ class TestCompositionFormulas(unittest.TestCase):
         expected = t1 * t2
         self.assertEqual(t_joined, expected)
 
+    def test_disjoint_union_k3_k4(self):
+        """T(K_3 ∪ K_4) = T(K_3) × T(K_4)."""
+        g1 = complete_graph(3)
+        g2 = complete_graph(4)
+
+        t1 = compute_tutte_polynomial(g1)
+        t2 = compute_tutte_polynomial(g2)
+
+        union = disjoint_union(g1, g2)
+        t_union = compute_tutte_polynomial(union)
+
+        expected = t1 * t2
+        self.assertEqual(t_union, expected)
+
+    def test_cut_vertex_join_cycles(self):
+        """T(C_4 · C_5) = T(C_4) × T(C_5) for cut vertex join."""
+        g1 = cycle_graph(4)
+        g2 = cycle_graph(5)
+
+        t1 = compute_tutte_polynomial(g1)
+        t2 = compute_tutte_polynomial(g2)
+
+        joined = cut_vertex_join(g1, 0, g2, 0)
+        t_joined = compute_tutte_polynomial(joined)
+
+        expected = t1 * t2
+        self.assertEqual(t_joined, expected)
+
 
 # =============================================================================
 # COVERING TESTS
@@ -448,8 +533,6 @@ class TestCovering(unittest.TestCase):
         k4 = complete_graph(4)
         k3 = complete_graph(3)
 
-        # K_4 contains 4 induced K_3 subgraphs, each with 3! = 6 automorphisms
-        # VF2 returns all isomorphisms, so 4 * 6 = 24 total
         matches = find_subgraph_isomorphisms(k4, k3)
         self.assertEqual(len(matches), 24)
 
@@ -461,11 +544,9 @@ class TestCovering(unittest.TestCase):
         if minor is None:
             self.skipTest("K_3 not in table")
 
-        # K_6 should be coverable by 2 disjoint K_3
         k6 = complete_graph(6)
         cover = find_disjoint_cover(k6, minor, table)
 
-        # Should find at least 1 tile
         self.assertGreater(len(cover.tiles), 0)
 
 
@@ -481,7 +562,6 @@ class TestValidation(unittest.TestCase):
         k3 = complete_graph(3)
         poly = compute_tutte_polynomial(k3)
 
-        # Should verify successfully (or skip if sympy unavailable)
         result = verify_with_networkx(k3, poly)
         self.assertTrue(result)
 
@@ -491,41 +571,6 @@ class TestValidation(unittest.TestCase):
         poly = compute_tutte_polynomial(k4)
 
         self.assertTrue(verify_spanning_trees(k4, poly))
-
-
-# =============================================================================
-# INTEGRATION TESTS
-# =============================================================================
-
-class TestIntegration(unittest.TestCase):
-    """Integration tests with old codebase."""
-
-    def test_compatible_with_old_tutte_utils(self):
-        """Test that results match old tutte_utils implementation."""
-        try:
-            from tutte_test.tutte_utils import \
-                TuttePolynomial as OldTuttePolynomial
-            from tutte_test.tutte_utils import \
-                compute_tutte_polynomial as old_compute
-            from tutte_test.tutte_utils import \
-                create_complete_graph as old_complete_graph
-        except ImportError:
-            self.skipTest("Old tutte_utils not available")
-
-        # Compare K_4 polynomials
-        old_k4 = old_complete_graph(4)
-        old_poly = old_compute(old_k4)
-
-        new_k4 = complete_graph(4)
-        new_poly = compute_tutte_polynomial(new_k4)
-
-        # Compare spanning trees
-        self.assertEqual(old_poly.num_spanning_trees(), new_poly.num_spanning_trees())
-
-        # Compare coefficients
-        old_coeffs = old_poly.coefficients
-        new_coeffs = new_poly.to_coefficients()
-        self.assertEqual(old_coeffs, new_coeffs)
 
 
 # =============================================================================
@@ -547,9 +592,7 @@ class TestMultiGraph(unittest.TestCase):
         """Test that merging nodes creates parallel edges."""
         k3 = complete_graph(3)
         merged = k3.merge_nodes(0, 1)
-        # Should have 2 parallel edges (0-2 and 1-2 become both 0-2)
         self.assertEqual(merged.edge_multiplicity(0, 2), 2)
-        # Should have 1 loop (from edge 0-1)
         self.assertEqual(merged.loop_counts.get(0, 0), 1)
         self.assertFalse(merged.is_simple())
 
@@ -563,7 +606,6 @@ class TestMultiGraph(unittest.TestCase):
         self.assertTrue(mg_parallel.is_just_parallel_edges())
         self.assertEqual(mg_parallel.parallel_edge_count(), 3)
 
-        # With a loop, not just parallel edges
         mg_with_loop = MultiGraph(
             nodes=frozenset([0, 1]),
             edge_counts={(0, 1): 2},
@@ -573,38 +615,32 @@ class TestMultiGraph(unittest.TestCase):
 
     def test_multigraph_cut_vertex(self):
         """Test cut vertex detection in multigraph."""
-        # Create multigraph with cut vertex: triangle connected to another triangle
-        # First triangle: 0-1-2, second triangle: 2-3-4, connected at vertex 2
         mg = MultiGraph(
             nodes=frozenset([0, 1, 2, 3, 4]),
             edge_counts={
-                (0, 1): 1, (1, 2): 1, (0, 2): 1,  # First triangle
-                (2, 3): 1, (3, 4): 1, (2, 4): 1,  # Second triangle
+                (0, 1): 1, (1, 2): 1, (0, 2): 1,
+                (2, 3): 1, (3, 4): 1, (2, 4): 1,
             },
             loop_counts={}
         )
         cut = mg.has_cut_vertex()
-        # Vertex 2 is the cut vertex connecting the two triangles
         self.assertIsNotNone(cut)
         self.assertEqual(cut, 2)
 
     def test_multigraph_split(self):
         """Test splitting multigraph at cut vertex."""
-        # Two triangles joined at vertex 2
         mg = MultiGraph(
             nodes=frozenset([0, 1, 2, 3, 4]),
             edge_counts={
-                (0, 1): 1, (1, 2): 1, (0, 2): 1,  # First triangle
-                (2, 3): 1, (3, 4): 1, (2, 4): 1,  # Second triangle
+                (0, 1): 1, (1, 2): 1, (0, 2): 1,
+                (2, 3): 1, (3, 4): 1, (2, 4): 1,
             },
             loop_counts={}
         )
         parts = mg.split_at_cut_vertex(2)
         self.assertEqual(len(parts), 2)
-        # Each part should contain vertex 2
         for part in parts:
             self.assertIn(2, part.nodes)
-        # Each part should be a triangle (3 nodes, 3 edges)
         for part in parts:
             self.assertEqual(part.node_count(), 3)
             self.assertEqual(part.edge_count(), 3)
@@ -614,7 +650,7 @@ class TestGraphCutVertex(unittest.TestCase):
     """Test cut vertex operations on Graph."""
 
     def test_has_cut_vertex_bowtie(self):
-        """Test cut vertex detection on bowtie (two triangles sharing vertex)."""
+        """Test cut vertex detection on bowtie."""
         k3a = complete_graph(3)
         k3b = complete_graph(3)
         bowtie = cut_vertex_join(k3a, 0, k3b, 0)
@@ -648,7 +684,6 @@ class TestParallelEdges(unittest.TestCase):
     """Test parallel edge polynomial formulas."""
 
     def setUp(self):
-        """Set up synthesis engine."""
         self.engine = SynthesisEngine(verbose=False)
 
     def test_single_edge(self):
@@ -695,46 +730,31 @@ class TestEdgeAddition(unittest.TestCase):
     """Test edge addition formula: T(G + e) = T(G) + T(G/{u,v})"""
 
     def setUp(self):
-        """Set up synthesis engine."""
         self.engine = SynthesisEngine(verbose=False)
 
     def test_p3_to_c3(self):
         """P_3 + edge(0,2) = C_3"""
         p3 = path_graph(3)
         p3_poly = self.engine.synthesize(p3).polynomial
-
-        # Add edge using formula
         c3_via_addition = self.engine._add_edges_to_graph(p3, p3_poly, [(0, 2)])
-
-        # Compute C_3 directly
         c3 = cycle_graph(3)
         c3_direct = self.engine.synthesize(c3).polynomial
-
         self.assertEqual(c3_via_addition, c3_direct)
 
     def test_c4_to_k4_minus_edge(self):
         """C_4 + diagonal = K_4 minus one edge"""
         c4 = cycle_graph(4)
         c4_poly = self.engine.synthesize(c4).polynomial
-
-        # Add one diagonal
         result = self.engine._add_edges_to_graph(c4, c4_poly, [(0, 2)])
-
-        # K_4 minus edge has 8 spanning trees
         self.assertEqual(result.num_spanning_trees(), 8)
 
     def test_multiple_edge_addition(self):
         """Add multiple edges sequentially."""
-        p4 = path_graph(4)  # 0-1-2-3
+        p4 = path_graph(4)
         p4_poly = self.engine.synthesize(p4).polynomial
-
-        # Add edges to make it a cycle
         result = self.engine._add_edges_to_graph(p4, p4_poly, [(0, 3)])
-
-        # Should equal C_4
         c4 = cycle_graph(4)
         c4_poly = self.engine.synthesize(c4).polynomial
-
         self.assertEqual(result, c4_poly)
 
 
@@ -742,7 +762,6 @@ class TestLoopHandling(unittest.TestCase):
     """Test loop handling in multigraph synthesis."""
 
     def setUp(self):
-        """Set up synthesis engine."""
         self.engine = SynthesisEngine(verbose=False)
 
     def test_single_loop(self):
@@ -773,7 +792,7 @@ class TestLoopHandling(unittest.TestCase):
             loop_counts={0: 1}
         )
         poly = self.engine._synthesize_multigraph(mg)
-        expected = TuttePolynomial.from_coefficients({(1, 1): 1})  # xy
+        expected = TuttePolynomial.from_coefficients({(1, 1): 1})
         self.assertEqual(poly, expected)
 
 
@@ -781,7 +800,6 @@ class TestCutVertexFactorization(unittest.TestCase):
     """Test cut vertex factorization: T(G1 · G2) = T(G1) × T(G2)."""
 
     def setUp(self):
-        """Set up synthesis engine."""
         self.engine = SynthesisEngine(verbose=False)
 
     def test_bowtie_factorization(self):
@@ -789,44 +807,23 @@ class TestCutVertexFactorization(unittest.TestCase):
         k3a = complete_graph(3)
         k3b = complete_graph(3)
         bowtie = cut_vertex_join(k3a, 0, k3b, 0)
-
-        # Synthesize bowtie
         bowtie_poly = self.engine.synthesize(bowtie).polynomial
-
-        # Compute expected: T(K3)^2
         k3_poly = self.engine.synthesize(k3a).polynomial
         expected = k3_poly * k3_poly
-
         self.assertEqual(bowtie_poly, expected)
 
     def test_multigraph_cut_vertex_factorization(self):
         """Test factorization for multigraph with cut vertex."""
-        # Create a multigraph: two pairs of parallel edges connected at vertex 2
-        mg = MultiGraph(
-            nodes=frozenset([0, 1, 2, 3]),
-            edge_counts={
-                (0, 1): 2,  # 2 parallel edges
-                (0, 2): 1,  # Connect to cut vertex
-                (2, 3): 1,  # Connect from cut vertex
-            },
-            loop_counts={}
-        )
-        # This should factor because vertex 2 is a cut vertex... but actually
-        # it's not because 0 connects to both 1 and 2. Let me create a proper one.
-
-        # Proper cut vertex graph
         mg2 = MultiGraph(
             nodes=frozenset([0, 1, 2, 3, 4]),
             edge_counts={
-                (0, 2): 1, (1, 2): 1,  # First component: 0-2-1 with cut at 2
-                (2, 3): 1, (2, 4): 1,  # Second component: 3-2-4 with cut at 2
+                (0, 2): 1, (1, 2): 1,
+                (2, 3): 1, (2, 4): 1,
             },
             loop_counts={}
         )
         poly = self.engine._synthesize_multigraph(mg2)
-        # Both components are P3 with center removed, which are 2 K2s each = x^2 each
-        # So result should be x^4
-        self.assertEqual(poly.num_spanning_trees(), 1)  # Tree, so 1 spanning tree
+        self.assertEqual(poly.num_spanning_trees(), 1)
 
 
 # =============================================================================
@@ -841,11 +838,7 @@ class TestKnownPolynomials(unittest.TestCase):
         for n in [3, 4, 5, 6]:
             with self.subTest(n=n):
                 poly = cycle_polynomial(n)
-
-                # Should have n terms: x^{n-1}, x^{n-2}, ..., x, y
                 self.assertEqual(poly.num_terms(), n)
-
-                # Check spanning trees (C_n has n spanning trees)
                 self.assertEqual(poly.num_spanning_trees(), n)
 
     def test_path_polynomial_formula(self):
@@ -853,47 +846,287 @@ class TestKnownPolynomials(unittest.TestCase):
         for n in [2, 3, 4, 5]:
             with self.subTest(n=n):
                 poly = path_polynomial(n)
-
-                # Should be x^{n-1}
                 self.assertEqual(poly, TuttePolynomial.x(n - 1))
-
-                # Paths have 1 spanning tree
                 self.assertEqual(poly.num_spanning_trees(), 1)
+
+
+# =============================================================================
+# BINARY ENCODING TESTS (migrated from benchmark_synthesis)
+# =============================================================================
+
+class TestBinaryEncoding(unittest.TestCase):
+    """Test binary rainbow table encoding and roundtrip."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.table = load_default_table()
+
+    def test_binary_smaller_than_json(self):
+        """Binary table is smaller than JSON."""
+        table_path = os.path.join(os.path.dirname(__file__), 'tutte_rainbow_table.json')
+        if not os.path.exists(table_path):
+            self.skipTest("No JSON table to compare")
+        json_size = os.path.getsize(table_path)
+        binary_data = encode_rainbow_table_binary(self.table)
+        self.assertLess(len(binary_data), json_size)
+
+    def test_binary_roundtrip_header(self):
+        """Binary encoding has correct magic header."""
+        binary_data = encode_rainbow_table_binary(self.table)
+        self.assertTrue(binary_data.startswith(b"RTBL"))
+        self.assertEqual(binary_data[4], 1)  # version
+
+    def test_minimal_json_smaller_than_full(self):
+        """Minimal JSON is smaller than full JSON."""
+        table_path = os.path.join(os.path.dirname(__file__), 'tutte_rainbow_table.json')
+        if not os.path.exists(table_path):
+            self.skipTest("No JSON table to compare")
+        json_size = os.path.getsize(table_path)
+        minimal = create_minimal_json(self.table)
+        minimal_str = json.dumps(minimal, separators=(',', ':'))
+        self.assertLess(len(minimal_str), json_size)
+
+    def test_binary_breakdown_sums_correctly(self):
+        """Binary breakdown components sum to total."""
+        breakdown = analyze_binary_breakdown(self.table)
+        expected_total = (breakdown['header'] + breakdown['names'] +
+                         breakdown['metadata'] + breakdown['polynomials'])
+        self.assertEqual(breakdown['total'], expected_total)
+
+
+# =============================================================================
+# BENCHMARK-AS-TEST: SYNTHESIS CORRECTNESS
+# =============================================================================
+
+class TestBenchmarkSynthesis(unittest.TestCase):
+    """Run synthesis on graph families up to 22 edges, verify via Kirchhoff."""
+
+    def test_complete_graphs_kirchhoff(self):
+        """Complete graphs K_3 through K_6 match Kirchhoff."""
+        for n in [3, 4, 5, 6]:
+            with self.subTest(graph=f"K_{n}"):
+                g = complete_graph(n)
+                result = synthesize(g)
+                kirchhoff = count_spanning_trees_kirchhoff(g)
+                self.assertEqual(result.polynomial.num_spanning_trees(), kirchhoff)
+
+    def test_cycle_graphs_kirchhoff(self):
+        """Cycle graphs C_4 through C_10 match Kirchhoff."""
+        for n in [4, 5, 6, 8, 10]:
+            with self.subTest(graph=f"C_{n}"):
+                g = cycle_graph(n)
+                result = synthesize(g)
+                kirchhoff = count_spanning_trees_kirchhoff(g)
+                self.assertEqual(result.polynomial.num_spanning_trees(), kirchhoff)
+
+    def test_wheel_graphs_kirchhoff(self):
+        """Wheel graphs W_4 through W_6 match Kirchhoff."""
+        for n in [4, 5, 6]:
+            with self.subTest(graph=f"W_{n}"):
+                g = Graph.from_networkx(nx.wheel_graph(n))
+                result = synthesize(g)
+                kirchhoff = count_spanning_trees_kirchhoff(g)
+                self.assertEqual(result.polynomial.num_spanning_trees(), kirchhoff)
+
+    def test_petersen_kirchhoff(self):
+        """Petersen graph matches Kirchhoff (15 edges)."""
+        g = Graph.from_networkx(nx.petersen_graph())
+        result = synthesize(g)
+        kirchhoff = count_spanning_trees_kirchhoff(g)
+        self.assertEqual(result.polynomial.num_spanning_trees(), kirchhoff)
+
+    def test_grid_3x3_kirchhoff(self):
+        """Grid 3x3 matches Kirchhoff (12 edges)."""
+        G_nx = nx.convert_node_labels_to_integers(nx.grid_2d_graph(3, 3))
+        g = Graph.from_networkx(G_nx)
+        result = synthesize(g)
+        kirchhoff = count_spanning_trees_kirchhoff(g)
+        self.assertEqual(result.polynomial.num_spanning_trees(), kirchhoff)
+
+
+# =============================================================================
+# Z(1,1) EMPTY TABLE TEST
+# =============================================================================
+
+class TestZ11EmptyTable(unittest.TestCase):
+    """Test Z(1,1) synthesis with empty rainbow table (no pre-cached entries).
+
+    This verifies that the tiling and hybrid engines can compute Z(1,1)
+    without relying on Zephyr-specific decomposition, and that no D-C
+    fallback is needed (dc_stats == 0).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        """Build basic table and Z(1,1) graph."""
+        cls.basic_table = build_basic_table()
+
+        # Build Z(1,1) graph from NetworkX definition
+        G = nx.Graph()
+        for i in range(4):
+            for j in range(4, 8):
+                G.add_edge(i, j)
+        G.add_edge(0, 1)
+        G.add_edge(2, 3)
+        G.add_edge(4, 5)
+        G.add_edge(6, 7)
+        G.add_edge(0, 2)
+        G.add_edge(1, 3)
+        cls.z11_nx = G
+        cls.z11_graph = Graph.from_networkx(G)
+        cls.kirchhoff = int(round(nx.number_of_spanning_trees(G)))
+
+    def test_z11_via_tiling_engine(self):
+        """Z(1,1) via SynthesisEngine (tiling) matches Kirchhoff."""
+        engine = SynthesisEngine(table=self.basic_table, verbose=False)
+        result = engine.synthesize(self.z11_graph)
+        self.assertEqual(result.polynomial.num_spanning_trees(), self.kirchhoff)
+
+    def test_z11_via_hybrid_engine(self):
+        """Z(1,1) via HybridSynthesisEngine matches Kirchhoff, dc_stats == 0."""
+        from tutte_test.hybrid_synthesis import HybridSynthesisEngine
+
+        engine = HybridSynthesisEngine(table=self.basic_table, verbose=False)
+        engine.reset_stats()
+        result = engine.synthesize(self.z11_graph)
+
+        self.assertEqual(result.polynomial.num_spanning_trees(), self.kirchhoff)
+        self.assertTrue(result.verified)
+
+        stats = engine.get_stats()
+        self.assertEqual(stats['dc'], 0,
+                        f"D-C fallback was used {stats['dc']} times; expected 0")
+
+
+# =============================================================================
+# ZEPHYR Z(m,t) SYNTHESIS TESTS (migrated from test_zephyr_synthesis)
+# =============================================================================
+
+class TestZephyrSynthesis(unittest.TestCase):
+    """Test Zephyr graph synthesis with bootstrapped Z(1,1) tile.
+
+    Z(m,t) graphs are built from Z(1,1) unit cells. By synthesizing
+    Z(1,1) first and adding it to the table, larger graphs can tile
+    with it and only need edge addition for inter-cell connections.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        """Build table and bootstrap Z(1,1) as a reusable tile."""
+        cls.table = build_basic_table()
+        cls.engine = SynthesisEngine(table=cls.table, verbose=False)
+
+        # Bootstrap: synthesize Z(1,1) and add to table
+        try:
+            G_z11 = get_zephyr_graph(1, 1)
+            z11_graph = Graph.from_networkx(G_z11)
+            z11_result = cls.engine.synthesize(z11_graph)
+            cls.table.add(z11_graph, "Z_1_1", z11_result.polynomial)
+            cls.z11_available = True
+        except ImportError:
+            cls.z11_available = False
+
+    def _test_zephyr(self, m: int, t: int):
+        """Test synthesis of Z(m,t) and verify via Kirchhoff."""
+        if not self.z11_available:
+            self.skipTest("dwave_networkx required for Zephyr graphs")
+            return
+
+        G = get_zephyr_graph(m, t)
+        graph = Graph.from_networkx(G)
+        self.engine._cache.clear()
+
+        result = self.engine.synthesize(graph)
+        kirchhoff = int(round(nx.number_of_spanning_trees(G)))
+        tutte_trees = result.polynomial.num_spanning_trees()
+
+        self.assertEqual(tutte_trees, kirchhoff,
+                        f"Z({m},{t}) spanning tree mismatch: {tutte_trees} != {kirchhoff}")
+
+    def test_z11(self):
+        """Test Z(1,1) - smallest Zephyr unit cell (12 nodes, 22 edges)."""
+        self._test_zephyr(1, 1)
+
+    @unittest.skip("VF2 isomorphism too slow for 36+ node graphs; requires tiling optimization")
+    def test_z12(self):
+        """Test Z(1,2) - two Z(1,1) cells."""
+        self._test_zephyr(1, 2)
+
+    @unittest.skip("VF2 isomorphism too slow for 36+ node graphs; requires tiling optimization")
+    def test_z13(self):
+        """Test Z(1,3) - three Z(1,1) cells."""
+        self._test_zephyr(1, 3)
+
+    @unittest.skip("VF2 isomorphism too slow for 36+ node graphs; requires tiling optimization")
+    def test_z14(self):
+        """Test Z(1,4) - four Z(1,1) cells."""
+        self._test_zephyr(1, 4)
+
+    @unittest.skip("VF2 isomorphism too slow for 36+ node graphs; requires tiling optimization")
+    def test_z21(self):
+        """Test Z(2,1)."""
+        self._test_zephyr(2, 1)
+
+    @unittest.skip("VF2 isomorphism too slow for 36+ node graphs; requires tiling optimization")
+    def test_z22(self):
+        """Test Z(2,2)."""
+        self._test_zephyr(2, 2)
+
+
+class TestLargeZephyr(unittest.TestCase):
+    """Test larger Zephyr graphs - uses Z(1,1) tiling."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.table = build_basic_table()
+        cls.engine = SynthesisEngine(table=cls.table, verbose=False)
+
+        # Bootstrap Z(1,1)
+        try:
+            G_z11 = get_zephyr_graph(1, 1)
+            z11_graph = Graph.from_networkx(G_z11)
+            z11_result = cls.engine.synthesize(z11_graph)
+            cls.table.add(z11_graph, "Z_1_1", z11_result.polynomial)
+            cls.z11_available = True
+        except ImportError:
+            cls.z11_available = False
+
+    def _test_zephyr(self, m: int, t: int):
+        """Test synthesis of Z(m,t)."""
+        if not self.z11_available:
+            self.skipTest("dwave_networkx required for Zephyr graphs")
+            return
+
+        G = get_zephyr_graph(m, t)
+        graph = Graph.from_networkx(G)
+        self.engine._cache.clear()
+
+        result = self.engine.synthesize(graph)
+        kirchhoff = int(round(nx.number_of_spanning_trees(G)))
+        tutte_trees = result.polynomial.num_spanning_trees()
+
+        self.assertEqual(tutte_trees, kirchhoff,
+                        f"Z({m},{t}) spanning tree mismatch: {tutte_trees} != {kirchhoff}")
+
+    @unittest.skip("VF2 isomorphism too slow for large Zephyr graphs; requires tiling optimization")
+    def test_z31(self):
+        """Test Z(3,1)."""
+        self._test_zephyr(3, 1)
+
+    @unittest.skip("VF2 isomorphism too slow for large Zephyr graphs; requires tiling optimization")
+    def test_z23(self):
+        """Test Z(2,3)."""
+        self._test_zephyr(2, 3)
+
+    @unittest.skip("VF2 isomorphism too slow for large Zephyr graphs; requires tiling optimization")
+    def test_z41(self):
+        """Test Z(4,1)."""
+        self._test_zephyr(4, 1)
 
 
 # =============================================================================
 # RUN TESTS
 # =============================================================================
 
-def run_tests():
-    """Run all tests."""
-    loader = unittest.TestLoader()
-    suite = unittest.TestSuite()
-
-    # Add all test cases
-    suite.addTests(loader.loadTestsFromTestCase(TestVarintEncoding))
-    suite.addTests(loader.loadTestsFromTestCase(TestPolynomialEncoding))
-    suite.addTests(loader.loadTestsFromTestCase(TestPolynomialArithmetic))
-    suite.addTests(loader.loadTestsFromTestCase(TestGraph))
-    suite.addTests(loader.loadTestsFromTestCase(TestMutableGraph))
-    suite.addTests(loader.loadTestsFromTestCase(TestRainbowTable))
-    suite.addTests(loader.loadTestsFromTestCase(TestSynthesis))
-    suite.addTests(loader.loadTestsFromTestCase(TestSpanningTreeVerification))
-    suite.addTests(loader.loadTestsFromTestCase(TestCompositionFormulas))
-    suite.addTests(loader.loadTestsFromTestCase(TestCovering))
-    suite.addTests(loader.loadTestsFromTestCase(TestValidation))
-    suite.addTests(loader.loadTestsFromTestCase(TestIntegration))
-    suite.addTests(loader.loadTestsFromTestCase(TestMultiGraph))
-    suite.addTests(loader.loadTestsFromTestCase(TestGraphCutVertex))
-    suite.addTests(loader.loadTestsFromTestCase(TestParallelEdges))
-    suite.addTests(loader.loadTestsFromTestCase(TestEdgeAddition))
-    suite.addTests(loader.loadTestsFromTestCase(TestLoopHandling))
-    suite.addTests(loader.loadTestsFromTestCase(TestCutVertexFactorization))
-    suite.addTests(loader.loadTestsFromTestCase(TestKnownPolynomials))
-
-    runner = unittest.TextTestRunner(verbosity=2)
-    return runner.run(suite)
-
-
 if __name__ == "__main__":
-    run_tests()
+    unittest.main()

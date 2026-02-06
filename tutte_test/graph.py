@@ -17,6 +17,101 @@ import networkx as nx
 
 
 # =============================================================================
+# CELL SIGNATURE (for fast structural matching without VF2)
+# =============================================================================
+
+@dataclass(frozen=True)
+class CellSignature:
+    """Structural fingerprint for fast cell matching without VF2.
+
+    This signature captures key graph invariants that must match
+    for two graphs to be isomorphic. Checking signatures is O(n log n)
+    compared to VF2's exponential worst case.
+    """
+    node_count: int
+    edge_count: int
+    degree_sequence: Tuple[int, ...]  # sorted
+    triangle_count: int
+
+    def could_match(self, other: 'CellSignature') -> bool:
+        """Quick check if two signatures could represent isomorphic graphs."""
+        return (self.node_count == other.node_count and
+                self.edge_count == other.edge_count and
+                self.degree_sequence == other.degree_sequence and
+                self.triangle_count == other.triangle_count)
+
+
+@dataclass(frozen=True)
+class NodeSignature:
+    """Local structural fingerprint for a single node.
+
+    Used for partitioning nodes into cell groups by matching
+    their local structure.
+    """
+    degree: int
+    neighbor_degree_sum: int  # sum of degrees of neighbors
+    triangles: int  # number of triangles containing this node
+
+    def distance_to(self, other: 'NodeSignature') -> int:
+        """Compute similarity distance between node signatures."""
+        return (abs(self.degree - other.degree) +
+                abs(self.neighbor_degree_sum - other.neighbor_degree_sum) +
+                abs(self.triangles - other.triangles))
+
+
+def compute_signature(graph: 'Graph') -> CellSignature:
+    """Compute structural signature for a graph.
+
+    This is used for fast filtering before expensive VF2 checks.
+    """
+    degrees = sorted(graph.degree(n) for n in graph.nodes)
+
+    # Count triangles
+    triangle_count = 0
+    for u, v in graph.edges:
+        # Count common neighbors of u and v
+        u_neighbors = graph.neighbors(u)
+        v_neighbors = graph.neighbors(v)
+        triangle_count += len(u_neighbors & v_neighbors)
+    triangle_count //= 3  # Each triangle counted 3 times
+
+    return CellSignature(
+        node_count=graph.node_count(),
+        edge_count=graph.edge_count(),
+        degree_sequence=tuple(degrees),
+        triangle_count=triangle_count
+    )
+
+
+def compute_node_signature(graph: 'Graph', node: int) -> NodeSignature:
+    """Compute local structural signature for a node."""
+    degree = graph.degree(node)
+    neighbors = graph.neighbors(node)
+    neighbor_degree_sum = sum(graph.degree(n) for n in neighbors)
+
+    # Count triangles containing this node
+    triangles = 0
+    neighbor_list = list(neighbors)
+    for i, n1 in enumerate(neighbor_list):
+        for n2 in neighbor_list[i+1:]:
+            # Check if n1-n2 edge exists
+            edge = (min(n1, n2), max(n1, n2))
+            if edge in graph.edges:
+                triangles += 1
+
+    return NodeSignature(
+        degree=degree,
+        neighbor_degree_sum=neighbor_degree_sum,
+        triangles=triangles
+    )
+
+
+def compute_all_node_signatures(graph: 'Graph') -> Dict[int, NodeSignature]:
+    """Compute node signatures for all nodes in the graph."""
+    return {node: compute_node_signature(graph, node) for node in graph.nodes}
+
+
+# =============================================================================
 # IMMUTABLE GRAPH CLASS
 # =============================================================================
 
@@ -581,6 +676,22 @@ class MultiGraph:
 
         return len(visited) == len(self.nodes)
 
+    def in_same_component(self, u: int, v: int) -> bool:
+        """Check if nodes u and v are in the same connected component."""
+        if u == v:
+            return True
+        visited = {u}
+        stack = [u]
+        while stack:
+            node = stack.pop()
+            for neighbor in self.neighbors(node):
+                if neighbor == v:
+                    return True
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    stack.append(neighbor)
+        return False
+
     def merge_nodes(self, u: int, v: int) -> 'MultiGraph':
         """Merge nodes u and v."""
         if u not in self.nodes or v not in self.nodes:
@@ -642,197 +753,6 @@ class MultiGraph:
         ]
         key_str = "|".join(parts)
         return hashlib.sha256(key_str.encode()).hexdigest()
-
-
-# =============================================================================
-# MUTABLE GRAPH CLASS
-# =============================================================================
-
-@dataclass
-class MutableGraph:
-    """Mutable graph for incremental construction.
-
-    Supports adding nodes, edges, and loops. Can be frozen into
-    an immutable Graph for storage and hashing.
-    """
-    nodes: Set[int] = field(default_factory=set)
-    edges: Dict[int, Tuple[int, int]] = field(default_factory=dict)
-    loops: Dict[int, int] = field(default_factory=dict)  # edge_id -> node_id
-    _next_node_id: int = 0
-    _next_edge_id: int = 0
-
-    def add_node(self) -> int:
-        """Add a new isolated node. Returns node ID."""
-        node_id = self._next_node_id
-        self._next_node_id += 1
-        self.nodes.add(node_id)
-        return node_id
-
-    def add_nodes(self, count: int) -> List[int]:
-        """Add multiple nodes. Returns list of node IDs."""
-        return [self.add_node() for _ in range(count)]
-
-    def add_edge(self, u: int, v: int) -> int:
-        """Add an edge between two existing nodes. Returns edge ID."""
-        if u not in self.nodes or v not in self.nodes:
-            raise ValueError(f"Nodes {u} and {v} must exist")
-        if u == v:
-            return self.add_loop(u)
-
-        edge_id = self._next_edge_id
-        self._next_edge_id += 1
-        self.edges[edge_id] = (min(u, v), max(u, v))
-        return edge_id
-
-    def add_loop(self, node: int) -> int:
-        """Add a self-loop at a node. Returns edge ID."""
-        if node not in self.nodes:
-            raise ValueError(f"Node {node} must exist")
-        edge_id = self._next_edge_id
-        self._next_edge_id += 1
-        self.loops[edge_id] = node
-        return edge_id
-
-    def remove_edge(self, edge_id: int) -> None:
-        """Remove an edge by ID."""
-        if edge_id in self.edges:
-            del self.edges[edge_id]
-        elif edge_id in self.loops:
-            del self.loops[edge_id]
-        else:
-            raise ValueError(f"Edge {edge_id} not found")
-
-    def remove_node(self, node: int) -> None:
-        """Remove a node and all incident edges."""
-        if node not in self.nodes:
-            raise ValueError(f"Node {node} not found")
-
-        # Remove incident edges
-        edges_to_remove = [
-            eid for eid, (u, v) in self.edges.items()
-            if u == node or v == node
-        ]
-        for eid in edges_to_remove:
-            del self.edges[eid]
-
-        # Remove loops
-        loops_to_remove = [
-            eid for eid, n in self.loops.items()
-            if n == node
-        ]
-        for eid in loops_to_remove:
-            del self.loops[eid]
-
-        self.nodes.remove(node)
-
-    def contract_edge(self, edge_id: int) -> int:
-        """Contract an edge, merging its endpoints. Returns surviving node."""
-        if edge_id not in self.edges:
-            raise ValueError(f"Edge {edge_id} not found")
-
-        u, v = self.edges[edge_id]
-        del self.edges[edge_id]
-
-        # Redirect all edges from v to u
-        new_edges = {}
-        for eid, (a, b) in self.edges.items():
-            if a == v:
-                a = u
-            if b == v:
-                b = u
-            if a == b:
-                # Edge becomes a loop
-                self.loops[eid] = a
-            else:
-                new_edges[eid] = (min(a, b), max(a, b))
-        self.edges = new_edges
-
-        # Redirect loops
-        for eid in self.loops:
-            if self.loops[eid] == v:
-                self.loops[eid] = u
-
-        self.nodes.remove(v)
-        return u
-
-    def num_nodes(self) -> int:
-        """Number of nodes."""
-        return len(self.nodes)
-
-    def num_edges(self) -> int:
-        """Number of edges (including loops)."""
-        return len(self.edges) + len(self.loops)
-
-    def degree(self, node: int) -> int:
-        """Get degree of a node (loops count as 2)."""
-        deg = sum(1 for u, v in self.edges.values() if u == node or v == node)
-        deg += 2 * sum(1 for n in self.loops.values() if n == node)
-        return deg
-
-    def neighbors(self, node: int) -> Set[int]:
-        """Get neighbors of a node."""
-        result = set()
-        for u, v in self.edges.values():
-            if u == node:
-                result.add(v)
-            elif v == node:
-                result.add(u)
-        return result
-
-    def copy(self) -> 'MutableGraph':
-        """Create a deep copy."""
-        g = MutableGraph()
-        g.nodes = set(self.nodes)
-        g.edges = dict(self.edges)
-        g.loops = dict(self.loops)
-        g._next_node_id = self._next_node_id
-        g._next_edge_id = self._next_edge_id
-        return g
-
-    def freeze(self) -> Graph:
-        """Convert to immutable Graph.
-
-        Note: Loops are not included in the frozen representation
-        as the immutable Graph class does not support them.
-        """
-        return Graph(
-            nodes=frozenset(self.nodes),
-            edges=frozenset(self.edges.values())
-        )
-
-    def to_networkx(self) -> nx.Graph:
-        """Convert to NetworkX graph."""
-        G = nx.Graph()
-        G.add_nodes_from(self.nodes)
-        G.add_edges_from(self.edges.values())
-        for node in self.loops.values():
-            G.add_edge(node, node)
-        return G
-
-    @classmethod
-    def from_networkx(cls, G: nx.Graph) -> 'MutableGraph':
-        """Create from NetworkX graph."""
-        g = cls()
-        node_map = {}
-        for n in G.nodes():
-            node_map[n] = g.add_node()
-        for u, v in G.edges():
-            if u == v:
-                g.add_loop(node_map[u])
-            else:
-                g.add_edge(node_map[u], node_map[v])
-        return g
-
-    @classmethod
-    def from_graph(cls, graph: Graph) -> 'MutableGraph':
-        """Create from immutable Graph."""
-        g = cls()
-        node_map = {}
-        for n in graph.nodes:
-            node_map[n] = g.add_node()
-        for u, v in graph.edges:
-            g.add_edge(node_map[u], node_map[v])
-        return g
 
 
 # =============================================================================
