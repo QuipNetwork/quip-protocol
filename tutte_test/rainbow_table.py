@@ -21,7 +21,7 @@ from math import gcd as math_gcd
 from typing import Dict, List, Optional, Set, Tuple
 
 from .polynomial import TuttePolynomial, encode_varuint
-from .graph import Graph
+from .graph import Graph, CellSignature, compute_signature
 
 
 # =============================================================================
@@ -39,6 +39,15 @@ class MinorEntry:
     spanning_trees: int
     num_terms: int
     graph: Optional['Graph'] = None  # Stored graph for tiling reconstruction
+    signature: Optional['CellSignature'] = None  # Cached signature for fast matching
+
+    def get_signature(self) -> Optional['CellSignature']:
+        """Get or compute the cell signature for this entry."""
+        if self.signature is not None:
+            return self.signature
+        if self.graph is not None:
+            return compute_signature(self.graph)
+        return None
 
     @property
     def complexity(self) -> int:
@@ -311,6 +320,7 @@ class RainbowTable:
             spanning_trees=polynomial.num_spanning_trees(),
             num_terms=polynomial.num_terms(),
             graph=graph,
+            signature=compute_signature(graph),
         )
 
         self.entries[key] = entry

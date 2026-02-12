@@ -28,6 +28,7 @@ from .k_join import polynomial_divmod, polynomial_divide, tutte_k
 from .factorization import polynomial_gcd, has_common_factor
 from .validation import verify_spanning_trees
 from .covering import find_disjoint_cover, compute_fringe, compute_inter_tile_edges
+from .synthesis import BaseMultigraphSynthesizer
 
 
 # =============================================================================
@@ -58,7 +59,7 @@ class HybridSynthesisResult:
 # HYBRID SYNTHESIS ENGINE
 # =============================================================================
 
-class HybridSynthesisEngine:
+class HybridSynthesisEngine(BaseMultigraphSynthesizer):
     """Synthesis engine combining algebraic and tiling approaches.
 
     Strategy:
@@ -381,192 +382,6 @@ class HybridSynthesisEngine:
             decomposition=["spanning_tree", f"{len(chords)}_chords"],
             recipe=recipe,
             tiling_steps=1 + len(chords)
-        )
-
-    # =========================================================================
-    # MULTIGRAPH SYNTHESIS (with pattern recognition)
-    # =========================================================================
-
-    def _synthesize_multigraph(
-        self,
-        mg: MultiGraph,
-        max_depth: int
-    ) -> TuttePolynomial:
-        """Synthesize polynomial for multigraph with pattern recognition.
-
-        Uses patterns to avoid deletion-contraction:
-        1. Cache lookup
-        2. Simple graph → regular synthesis
-        3. Loops: T(G with loop) = y × T(G without loop)
-        4. Cut vertex: T(G1 · G2) = T(G1) × T(G2)
-        5. Parallel edges: closed-form formula
-        6. Only D-C for truly irreducible cases
-        """
-        cache_key = mg.canonical_key()
-        if cache_key in self._multigraph_cache:
-            return self._multigraph_cache[cache_key]
-
-        # Simple graph case
-        if mg.is_simple():
-            simple = mg.to_simple_graph()
-            if simple is not None:
-                result = self.synthesize(simple, max_depth)
-                self._multigraph_cache[cache_key] = result.polynomial
-                return result.polynomial
-
-        # Loops: T(G with loops) = y^k × T(G without loops)
-        if mg.total_loop_count() > 0:
-            loop_count = mg.total_loop_count()
-            mg_no_loops = mg.remove_loops()
-            poly = TuttePolynomial.y(loop_count) * self._synthesize_multigraph(mg_no_loops, max_depth)
-            self._multigraph_cache[cache_key] = poly
-            return poly
-
-        # Cut vertex factorization
-        cut = mg.has_cut_vertex()
-        if cut is not None:
-            components = mg.split_at_cut_vertex(cut)
-            if len(components) > 1:
-                poly = TuttePolynomial.one()
-                for comp in components:
-                    poly = poly * self._synthesize_multigraph(comp, max_depth)
-                self._multigraph_cache[cache_key] = poly
-                return poly
-
-        # Parallel edges between exactly 2 nodes
-        if mg.is_just_parallel_edges():
-            poly = self._parallel_edges_formula(mg.parallel_edge_count())
-            self._multigraph_cache[cache_key] = poly
-            return poly
-
-        # Disconnected
-        if not mg.is_connected():
-            poly = self._handle_disconnected_multigraph(mg, max_depth)
-            self._multigraph_cache[cache_key] = poly
-            return poly
-
-        # Try to reduce to a simpler multigraph using edge reduction
-        # If we have parallel edges, peel them off one at a time
-        # using: T(G) = T(G\e) + T(G/e)
-        # Choose the edge with highest multiplicity - contracting it
-        # reduces node count while deleting reduces edge count
-        max_mult_edge = max(mg.edge_counts.keys(), key=lambda e: mg.edge_counts[e])
-        if mg.edge_counts[max_mult_edge] > 1:
-            # Reduce multiplicity by 1 via deletion-contraction on one copy
-            poly = self._reduce_parallel_edge(mg, max_mult_edge, max_depth)
-            self._multigraph_cache[cache_key] = poly
-            return poly
-
-        # Fall back to deletion-contraction for remaining cases
-        poly = self._dc_multigraph(mg, max_depth)
-        self._multigraph_cache[cache_key] = poly
-        return poly
-
-    def _reduce_parallel_edge(
-        self,
-        mg: MultiGraph,
-        edge: Tuple[int, int],
-        max_depth: int
-    ) -> TuttePolynomial:
-        """Reduce a parallel edge using T(G) = T(G\\e) + T(G/e).
-
-        For parallel edges, deletion removes one copy, contraction
-        merges the endpoints (creating loops from other parallel copies).
-        This is cheaper than general D-C because the resulting graphs
-        are simpler.
-        """
-        u, v = edge
-        multiplicity = mg.edge_counts[edge]
-
-        # Delete one copy
-        new_edge_counts = dict(mg.edge_counts)
-        new_edge_counts[edge] = multiplicity - 1
-        if new_edge_counts[edge] == 0:
-            del new_edge_counts[edge]
-        mg_delete = MultiGraph(
-            nodes=mg.nodes,
-            edge_counts=new_edge_counts,
-            loop_counts=mg.loop_counts
-        )
-
-        # Contract (merge endpoints, creating loops from parallel copies)
-        mg_merged = mg.merge_nodes(u, v)
-        survivor = min(u, v)
-        if survivor in mg_merged.loop_counts:
-            new_loops = dict(mg_merged.loop_counts)
-            new_loops[survivor] -= 1
-            if new_loops[survivor] == 0:
-                del new_loops[survivor]
-            mg_contract = MultiGraph(
-                nodes=mg_merged.nodes,
-                edge_counts=mg_merged.edge_counts,
-                loop_counts=new_loops
-            )
-        else:
-            mg_contract = mg_merged
-
-        # Both sub-problems go through pattern recognition again
-        t_delete = self._synthesize_multigraph(mg_delete, max_depth)
-        t_contract = self._synthesize_multigraph(mg_contract, max_depth)
-
-        return t_delete + t_contract
-
-    def _parallel_edges_formula(self, k: int) -> TuttePolynomial:
-        """T(k parallel edges) = x + y + y² + ... + y^(k-1)."""
-        if k <= 0:
-            return TuttePolynomial.one()
-        if k == 1:
-            return TuttePolynomial.x()
-
-        coeffs = {(1, 0): 1}
-        for i in range(1, k):
-            coeffs[(0, i)] = 1
-        return TuttePolynomial.from_coefficients(coeffs)
-
-    def _handle_disconnected_multigraph(
-        self,
-        mg: MultiGraph,
-        max_depth: int
-    ) -> TuttePolynomial:
-        """Handle disconnected multigraph: T(G1 ∪ G2) = T(G1) × T(G2)."""
-        # Find one component via BFS
-        start = next(iter(mg.nodes))
-        visited = {start}
-        stack = [start]
-        while stack:
-            node = stack.pop()
-            for neighbor in mg.neighbors(node):
-                if neighbor not in visited:
-                    visited.add(neighbor)
-                    stack.append(neighbor)
-
-        # Build first component
-        comp1_edges = {e: c for e, c in mg.edge_counts.items() if e[0] in visited}
-        comp1_loops = {n: c for n, c in mg.loop_counts.items() if n in visited}
-        comp1 = MultiGraph(nodes=frozenset(visited), edge_counts=comp1_edges, loop_counts=comp1_loops)
-
-        # Build rest
-        rest_nodes = mg.nodes - visited
-        rest_edges = {e: c for e, c in mg.edge_counts.items() if e[0] in rest_nodes}
-        rest_loops = {n: c for n, c in mg.loop_counts.items() if n in rest_nodes}
-        rest = MultiGraph(nodes=frozenset(rest_nodes), edge_counts=rest_edges, loop_counts=rest_loops)
-
-        return self._synthesize_multigraph(comp1, max_depth) * self._synthesize_multigraph(rest, max_depth)
-
-    def _dc_multigraph(
-        self,
-        mg: MultiGraph,
-        max_depth: int
-    ) -> TuttePolynomial:
-        """Deletion-contraction fallback — should never be reached.
-
-        Pattern recognition (loops, cut vertices, parallel edges, disconnected
-        components, parallel edge reduction) should handle all multigraph cases.
-        If this is reached, it indicates a gap in the pattern recognition logic.
-        """
-        raise RuntimeError(
-            f"D-C fallback reached for multigraph with "
-            f"{mg.node_count()} nodes, {mg.edge_count()} edges"
         )
 
 

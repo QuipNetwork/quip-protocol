@@ -13,7 +13,7 @@ Key concepts:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Set, Tuple, List, Optional, Iterator
+from typing import Dict, Set, Tuple, List, Optional, Iterator, FrozenSet
 
 import networkx as nx
 from networkx.algorithms import isomorphism
@@ -346,6 +346,19 @@ def _minor_to_graph(minor: MinorEntry) -> Optional[Graph]:
         except ValueError:
             pass
 
+    # Zephyr graphs: Z(m,t)
+    if name.startswith('Z(') and ',' in name:
+        try:
+            import dwave_networkx as dnx
+            # Parse "Z(m,t)" format
+            inner = name[2:-1]  # Remove "Z(" and ")"
+            m, t = inner.split(',')
+            m, t = int(m.strip()), int(t.strip())
+            G = dnx.zephyr_graph(m, t)
+            return Graph.from_networkx(G)
+        except (ValueError, ImportError):
+            pass
+
     return None
 
 
@@ -495,3 +508,676 @@ def _determine_k_join_type(shared_vertices: int, connecting_edges: int) -> str:
         return "2_join"  # Edge identification
     else:
         return f"{shared_vertices}_join"  # k-clique join
+
+
+# =============================================================================
+# HIERARCHICAL TILING (for graphs with repeating cell structure)
+# =============================================================================
+
+@dataclass
+class InterCellInfo:
+    """Information about edges connecting different cells."""
+    edges: List[Tuple[int, int]]
+    is_regular: bool  # True if same # edges between each cell pair
+    edges_per_pair: int  # Number of edges between each adjacent cell pair
+    cell_adjacencies: List[Tuple[int, int]]  # Which cells are adjacent
+
+
+def find_cell_candidates(
+    graph: Graph,
+    table: RainbowTable,
+    min_cells: int = 2
+) -> List[MinorEntry]:
+    """Find rainbow table entries that could tile the graph.
+
+    Uses arithmetic filters to quickly eliminate candidates without
+    running expensive VF2 subgraph isomorphism.
+
+    Args:
+        graph: Target graph to tile
+        table: Rainbow table with potential tiles
+        min_cells: Minimum number of cells required
+
+    Returns:
+        List of candidate entries sorted by edge count (descending)
+    """
+    target_nodes = graph.node_count()
+    target_edges = graph.edge_count()
+    target_sig = compute_signature(graph)
+
+    candidates = []
+
+    for entry in table.entries.values():
+        # Skip entries without stored graphs (can't use as tiles)
+        if entry.graph is None:
+            # Try to reconstruct from name
+            pattern = _minor_to_graph(entry)
+            if pattern is None:
+                continue
+        else:
+            pattern = entry.graph
+
+        cell_nodes = entry.node_count
+        cell_edges = entry.edge_count
+
+        # Filter 1: node count must divide evenly
+        if cell_nodes <= 0 or target_nodes % cell_nodes != 0:
+            continue
+
+        k = target_nodes // cell_nodes
+        if k < min_cells:
+            continue
+
+        # Filter 2: edge count consistency
+        # k disjoint cells have k * cell_edges edges
+        # Inter-cell edges add to this
+        cell_total_edges = k * cell_edges
+        inter_cell_edges = target_edges - cell_total_edges
+
+        if inter_cell_edges < 0:
+            continue  # Would need negative inter-cell edges
+
+        # Filter 3: degree sequence compatibility
+        # Each cell contributes its degree sequence
+        # Inter-cell edges add 2 to the degree sum
+        cell_sig = compute_signature(pattern)
+        cell_degree_sum = sum(cell_sig.degree_sequence)
+        target_degree_sum = sum(target_sig.degree_sequence)
+
+        # With k cells and inter_cell_edges between them:
+        # target_degree_sum = k * cell_degree_sum + 2 * inter_cell_edges
+        expected_degree_sum = k * cell_degree_sum + 2 * inter_cell_edges
+        if target_degree_sum != expected_degree_sum:
+            continue
+
+        candidates.append(entry)
+
+    # Sort by edge count descending (prefer larger tiles)
+    return sorted(candidates, key=lambda e: e.edge_count, reverse=True)
+
+
+def partition_into_cells(
+    graph: Graph,
+    cell: MinorEntry,
+    k: int
+) -> Optional[List[Set[int]]]:
+    """Partition graph nodes into k groups that look like the cell.
+
+    This is the main entry point for partitioning. It tries multiple
+    strategies in order of sophistication:
+    1. Disconnected components (trivial case)
+    2. Node signature matching (works when cells are disjoint)
+    3. Structural clustering (works when cells share edges)
+
+    Args:
+        graph: Target graph to partition
+        cell: Cell pattern from rainbow table
+        k: Expected number of cells
+
+    Returns:
+        List of node sets (one per cell) or None if partitioning fails
+    """
+    cell_graph = cell.graph if cell.graph is not None else _minor_to_graph(cell)
+    if cell_graph is None:
+        return None
+
+    cell_size = cell.node_count
+
+    if graph.node_count() != k * cell_size:
+        return None
+
+    # Strategy 1: Disconnected components
+    if not graph.is_connected():
+        components = graph.connected_components()
+        if len(components) == k:
+            if all(comp.node_count() == cell_size for comp in components):
+                return [set(comp.nodes) for comp in components]
+
+    # Strategy 2: Node signature matching (for disjoint cells)
+    target_sigs = compute_all_node_signatures(graph)
+    cell_sigs = compute_all_node_signatures(cell_graph)
+
+    partitions = _greedy_partition(graph, cell_graph, k, target_sigs, cell_sigs)
+    if partitions is not None:
+        # Verify the partition is actually valid before returning
+        if _verify_partition_structure(graph, partitions, cell_graph):
+            return partitions
+
+    # Strategy 3: VF2-based structural matching for connected cells
+    # This handles cases where inter-cell edges change node signatures
+    partitions = _partition_by_structure(graph, cell_graph, k)
+
+    return partitions
+
+
+def _verify_partition_structure(
+    graph: Graph,
+    partition: List[Set[int]],
+    cell_graph: Graph
+) -> bool:
+    """Quick verification that partition cells are isomorphic to pattern."""
+    cell_edges = cell_graph.edge_count()
+
+    for cell_nodes in partition:
+        subgraph = graph.subgraph(cell_nodes)
+        # Check edge count first (fast)
+        if subgraph.edge_count() != cell_edges:
+            return False
+
+    # All cells have correct edge count - check one for isomorphism
+    if partition:
+        subgraph = graph.subgraph(partition[0])
+        G1 = subgraph.to_networkx()
+        G2 = cell_graph.to_networkx()
+        if not nx.is_isomorphic(G1, G2):
+            return False
+
+    return True
+
+
+def _partition_by_structure(
+    graph: Graph,
+    cell_graph: Graph,
+    k: int
+) -> Optional[List[Set[int]]]:
+    """Partition using VF2 to find disjoint isomorphic copies.
+
+    When cells share edges, node signatures change. We need to find
+    groups where the *induced subgraph* is isomorphic to the cell.
+
+    Strategy:
+    1. Find all subgraph isomorphisms using VF2 (on small cells, this is fast)
+    2. Find k disjoint copies that cover all nodes
+    3. Return the partition
+    """
+    cell_size = cell_graph.node_count()
+    total_nodes = graph.node_count()
+
+    if total_nodes != k * cell_size:
+        return None
+
+    # Use VF2 to find all isomorphic copies of cell in graph
+    G_target = graph.to_networkx()
+    G_pattern = cell_graph.to_networkx()
+
+    matcher = isomorphism.GraphMatcher(G_target, G_pattern)
+
+    # Collect all matches as sets of nodes
+    all_matches: List[Set[int]] = []
+    seen_node_sets: Set[FrozenSet[int]] = set()
+
+    for mapping in matcher.subgraph_isomorphisms_iter():
+        nodes = frozenset(mapping.keys())
+        if nodes not in seen_node_sets:
+            seen_node_sets.add(nodes)
+            all_matches.append(set(nodes))
+
+        # Limit search for large graphs
+        if len(all_matches) > 1000:
+            break
+
+    if len(all_matches) < k:
+        return None
+
+    # Find k disjoint matches that cover all nodes
+    partition = _find_disjoint_partition(all_matches, k, total_nodes)
+
+    return partition
+
+
+def _find_disjoint_partition(
+    matches: List[Set[int]],
+    k: int,
+    total_nodes: int
+) -> Optional[List[Set[int]]]:
+    """Find k disjoint matches that cover all nodes.
+
+    Uses backtracking search to find a valid partition.
+    """
+    if k == 0:
+        return []
+
+    if not matches:
+        return None
+
+    # Sort matches by node indices for deterministic behavior
+    matches = sorted(matches, key=lambda m: tuple(sorted(m)))
+
+    def backtrack(
+        index: int,
+        used: Set[int],
+        partition: List[Set[int]]
+    ) -> Optional[List[Set[int]]]:
+        if len(partition) == k:
+            if len(used) == total_nodes:
+                return partition.copy()
+            return None
+
+        for i in range(index, len(matches)):
+            match = matches[i]
+
+            # Check if this match is disjoint from already used nodes
+            if not (match & used):
+                partition.append(match)
+                new_used = used | match
+
+                result = backtrack(i + 1, new_used, partition)
+                if result is not None:
+                    return result
+
+                partition.pop()
+
+        return None
+
+    return backtrack(0, set(), [])
+
+
+def _grow_by_edge_density(
+    graph: Graph,
+    start: int,
+    cell_size: int,
+    cell_edges: int,
+    used_nodes: Set[int]
+) -> Optional[Set[int]]:
+    """Grow a cell by maximizing internal edge density.
+
+    Greedily add nodes that maximize edges within the growing cell.
+    """
+    cell_nodes = {start}
+    all_edges = graph.edges
+
+    while len(cell_nodes) < cell_size:
+        best_node = None
+        best_score = -1
+
+        # Consider all neighbors of current cell
+        frontier = set()
+        for node in cell_nodes:
+            for neighbor in graph.neighbors(node):
+                if neighbor not in cell_nodes and neighbor not in used_nodes:
+                    frontier.add(neighbor)
+
+        if not frontier:
+            return None
+
+        for candidate in frontier:
+            # Count edges from candidate to current cell
+            edges_to_cell = sum(1 for n in cell_nodes
+                               if (min(candidate, n), max(candidate, n)) in all_edges)
+
+            if edges_to_cell > best_score:
+                best_score = edges_to_cell
+                best_node = candidate
+
+        if best_node is None:
+            return None
+
+        cell_nodes.add(best_node)
+
+    return cell_nodes
+
+
+def _greedy_partition(
+    graph: Graph,
+    cell_graph: Graph,
+    k: int,
+    target_sigs: Dict[int, NodeSignature],
+    cell_sigs: Dict[int, NodeSignature]
+) -> Optional[List[Set[int]]]:
+    """Greedily partition graph into k cell-shaped groups.
+
+    Strategy:
+    1. Find anchor nodes (distinct signature in cell)
+    2. Grow cells from anchors by signature matching
+    3. Verify each cell is isomorphic to pattern
+
+    For disconnected graphs, use connected components as natural partitions.
+    """
+    cell_size = len(cell_sigs)
+
+    # Special case: disconnected graph
+    # Use connected components as natural cell boundaries
+    if not graph.is_connected():
+        components = graph.connected_components()
+        if len(components) == k:
+            # Check if each component has the right size
+            valid = all(comp.node_count() == cell_size for comp in components)
+            if valid:
+                return [set(comp.nodes) for comp in components]
+
+    # Find nodes with unique signatures in cell (good anchors)
+    sig_counts: Dict[Tuple[int, int, int], int] = {}
+    for sig in cell_sigs.values():
+        key = (sig.degree, sig.neighbor_degree_sum, sig.triangles)
+        sig_counts[key] = sig_counts.get(key, 0) + 1
+
+    unique_sig_keys = [k for k, v in sig_counts.items() if v == 1]
+
+    if not unique_sig_keys:
+        # No unique signatures - all nodes look the same
+        # For regular graphs, use connectivity-based partitioning
+        # Try to find k disjoint subgraphs of the right size
+        return _partition_by_connectivity(graph, cell_size, k)
+
+    anchor_sig_key = unique_sig_keys[0]
+
+    # Find all nodes in target with this signature
+    anchor_candidates = [
+        n for n, sig in target_sigs.items()
+        if (sig.degree, sig.neighbor_degree_sum, sig.triangles) == anchor_sig_key
+    ]
+
+    if len(anchor_candidates) != k:
+        return None  # Wrong number of anchors
+
+    partitions: List[Set[int]] = []
+    used_nodes: Set[int] = set()
+
+    for anchor in anchor_candidates:
+        if anchor in used_nodes:
+            continue
+
+        # Grow a cell from this anchor using BFS with signature matching
+        cell_nodes = _grow_cell(graph, anchor, cell_size, target_sigs, cell_sigs, used_nodes)
+
+        if cell_nodes is None or len(cell_nodes) != cell_size:
+            # Try alternative approach: just grow connected component of size cell_size
+            cell_nodes = _grow_connected_cell(graph, anchor, cell_size, used_nodes)
+
+        if cell_nodes is None or len(cell_nodes) != cell_size:
+            return None
+
+        partitions.append(cell_nodes)
+        used_nodes.update(cell_nodes)
+
+    if len(partitions) != k:
+        return None
+
+    return partitions
+
+
+def _partition_by_connectivity(
+    graph: Graph,
+    cell_size: int,
+    k: int
+) -> Optional[List[Set[int]]]:
+    """Partition graph into k groups of cell_size using connectivity.
+
+    For graphs where all nodes have identical signatures, use
+    connected components or greedy growth.
+    """
+    # First check if graph has natural connected components
+    if not graph.is_connected():
+        components = graph.connected_components()
+        if len(components) == k:
+            valid = all(comp.node_count() == cell_size for comp in components)
+            if valid:
+                return [set(comp.nodes) for comp in components]
+
+    # For connected graphs, use greedy growth from distributed starting points
+    # Pick k starting nodes that are maximally spread out
+    nodes_list = list(graph.nodes)
+    if len(nodes_list) != k * cell_size:
+        return None
+
+    partitions: List[Set[int]] = []
+    used_nodes: Set[int] = set()
+
+    # Start from first unused node and grow cells
+    for start_candidate in nodes_list:
+        if start_candidate in used_nodes:
+            continue
+
+        cell_nodes = _grow_connected_cell(graph, start_candidate, cell_size, used_nodes)
+        if cell_nodes is None or len(cell_nodes) != cell_size:
+            return None
+
+        partitions.append(cell_nodes)
+        used_nodes.update(cell_nodes)
+
+        if len(partitions) == k:
+            break
+
+    if len(partitions) != k or len(used_nodes) != k * cell_size:
+        return None
+
+    return partitions
+
+
+def _grow_cell(
+    graph: Graph,
+    anchor: int,
+    cell_size: int,
+    target_sigs: Dict[int, NodeSignature],
+    cell_sigs: Dict[int, NodeSignature],
+    used_nodes: Set[int]
+) -> Optional[Set[int]]:
+    """Grow a cell from anchor by matching node signatures."""
+    # Get required signature distribution
+    sig_needed: Dict[Tuple[int, int, int], int] = {}
+    for sig in cell_sigs.values():
+        key = (sig.degree, sig.neighbor_degree_sum, sig.triangles)
+        sig_needed[key] = sig_needed.get(key, 0) + 1
+
+    cell_nodes = {anchor}
+    anchor_sig = target_sigs[anchor]
+    anchor_key = (anchor_sig.degree, anchor_sig.neighbor_degree_sum, anchor_sig.triangles)
+    sig_needed[anchor_key] -= 1
+
+    # BFS from anchor
+    frontier = list(graph.neighbors(anchor) - used_nodes)
+
+    while len(cell_nodes) < cell_size and frontier:
+        best_node = None
+        best_score = float('inf')
+
+        for node in frontier:
+            if node in cell_nodes or node in used_nodes:
+                continue
+
+            sig = target_sigs[node]
+            sig_key = (sig.degree, sig.neighbor_degree_sum, sig.triangles)
+
+            if sig_needed.get(sig_key, 0) > 0:
+                # This signature is still needed
+                # Score by how many cell neighbors it has
+                cell_neighbors = len(graph.neighbors(node) & cell_nodes)
+                score = -cell_neighbors  # More neighbors = better
+                if score < best_score:
+                    best_score = score
+                    best_node = node
+
+        if best_node is None:
+            # No matching node in frontier, expand frontier
+            new_frontier = []
+            for node in cell_nodes:
+                for neighbor in graph.neighbors(node):
+                    if neighbor not in cell_nodes and neighbor not in used_nodes:
+                        new_frontier.append(neighbor)
+            if not new_frontier:
+                break
+            frontier = new_frontier
+        else:
+            cell_nodes.add(best_node)
+            sig = target_sigs[best_node]
+            sig_key = (sig.degree, sig.neighbor_degree_sum, sig.triangles)
+            sig_needed[sig_key] -= 1
+
+            # Expand frontier
+            for neighbor in graph.neighbors(best_node):
+                if neighbor not in cell_nodes and neighbor not in used_nodes:
+                    if neighbor not in frontier:
+                        frontier.append(neighbor)
+
+    if len(cell_nodes) == cell_size:
+        return cell_nodes
+    return None
+
+
+def _grow_connected_cell(
+    graph: Graph,
+    start: int,
+    cell_size: int,
+    used_nodes: Set[int]
+) -> Optional[Set[int]]:
+    """Grow a connected component of exactly cell_size nodes from start."""
+    cell_nodes = {start}
+    frontier = [n for n in graph.neighbors(start) if n not in used_nodes]
+
+    while len(cell_nodes) < cell_size and frontier:
+        # Pick node with most connections to current cell
+        best = max(frontier, key=lambda n: len(graph.neighbors(n) & cell_nodes))
+        cell_nodes.add(best)
+        frontier.remove(best)
+
+        for neighbor in graph.neighbors(best):
+            if neighbor not in cell_nodes and neighbor not in used_nodes and neighbor not in frontier:
+                frontier.append(neighbor)
+
+    if len(cell_nodes) == cell_size:
+        return cell_nodes
+    return None
+
+
+def verify_cell_partition(
+    graph: Graph,
+    partition: List[Set[int]],
+    cell: MinorEntry
+) -> bool:
+    """Verify each partition element is isomorphic to the cell.
+
+    Uses signature pre-checks before VF2 for speed.
+    VF2 on small cell-sized graphs is fast!
+
+    Args:
+        graph: The full graph
+        partition: List of node sets (one per cell)
+        cell: Cell pattern from rainbow table
+
+    Returns:
+        True if all partitions are isomorphic to cell
+    """
+    cell_graph = cell.graph if cell.graph is not None else _minor_to_graph(cell)
+    if cell_graph is None:
+        return False
+
+    cell_sig = compute_signature(cell_graph)
+
+    for cell_nodes in partition:
+        subgraph = graph.subgraph(cell_nodes)
+
+        # Quick signature check first
+        sub_sig = compute_signature(subgraph)
+        if not cell_sig.could_match(sub_sig):
+            return False
+
+        # Edge count check (faster than VF2)
+        if subgraph.edge_count() != cell.edge_count:
+            return False
+
+        # VF2 isomorphism check on small graph (fast!)
+        G1 = subgraph.to_networkx()
+        G2 = cell_graph.to_networkx()
+
+        if not nx.is_isomorphic(G1, G2):
+            return False
+
+    return True
+
+
+def analyze_inter_cell_edges(
+    graph: Graph,
+    partition: List[Set[int]]
+) -> InterCellInfo:
+    """Analyze edges between cells in a partition.
+
+    Determines:
+    - Which edges connect different cells
+    - Whether the connection pattern is regular
+    - How many edges exist between each cell pair
+
+    Args:
+        graph: The full graph
+        partition: List of node sets (one per cell)
+
+    Returns:
+        InterCellInfo with edge analysis
+    """
+    k = len(partition)
+
+    # Build node-to-cell mapping
+    node_to_cell: Dict[int, int] = {}
+    for i, cell_nodes in enumerate(partition):
+        for node in cell_nodes:
+            node_to_cell[node] = i
+
+    # Find all inter-cell edges
+    inter_edges: List[Tuple[int, int]] = []
+    cell_pair_edges: Dict[Tuple[int, int], int] = {}
+
+    for u, v in graph.edges:
+        cell_u = node_to_cell.get(u, -1)
+        cell_v = node_to_cell.get(v, -1)
+
+        if cell_u != cell_v and cell_u >= 0 and cell_v >= 0:
+            inter_edges.append((u, v))
+            pair = (min(cell_u, cell_v), max(cell_u, cell_v))
+            cell_pair_edges[pair] = cell_pair_edges.get(pair, 0) + 1
+
+    # Check if pattern is regular
+    edge_counts = list(cell_pair_edges.values())
+    is_regular = len(set(edge_counts)) <= 1 if edge_counts else True
+    edges_per_pair = edge_counts[0] if edge_counts else 0
+
+    # Find adjacent cell pairs
+    cell_adjacencies = list(cell_pair_edges.keys())
+
+    return InterCellInfo(
+        edges=inter_edges,
+        is_regular=is_regular,
+        edges_per_pair=edges_per_pair,
+        cell_adjacencies=cell_adjacencies
+    )
+
+
+def try_hierarchical_partition(
+    graph: Graph,
+    table: RainbowTable
+) -> Optional[Tuple[MinorEntry, List[Set[int]], InterCellInfo]]:
+    """Try to partition graph into cells from the rainbow table.
+
+    This is the main entry point for hierarchical tiling. It:
+    1. Finds candidate cells that could tile the graph
+    2. Tries to partition nodes into cell groups
+    3. Verifies each group is isomorphic to the cell
+    4. Analyzes inter-cell edges
+
+    Args:
+        graph: Graph to partition
+        table: Rainbow table with potential tiles
+
+    Returns:
+        (cell_entry, partition, inter_cell_info) or None if no tiling found
+    """
+    # Find candidate tiles
+    candidates = find_cell_candidates(graph, table)
+
+    for cell in candidates:
+        cell_size = cell.node_count
+        k = graph.node_count() // cell_size
+
+        # Try to partition
+        partition = partition_into_cells(graph, cell, k)
+        if partition is None:
+            continue
+
+        # Verify partition
+        if not verify_cell_partition(graph, partition, cell):
+            continue
+
+        # Analyze inter-cell edges
+        inter_info = analyze_inter_cell_edges(graph, partition)
+
+        return (cell, partition, inter_info)
+
+    return None

@@ -22,10 +22,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import networkx as nx
 from tutte_test.covering import (compute_fringe, find_disjoint_cover,
-                                 find_subgraph_isomorphisms)
+                                 find_subgraph_isomorphisms,
+                                 find_cell_candidates, partition_into_cells,
+                                 verify_cell_partition, try_hierarchical_partition,
+                                 analyze_inter_cell_edges)
 from tutte_test.graph import (Graph, MultiGraph, complete_graph,
                               cut_vertex_join, cycle_graph, disjoint_union,
-                              path_graph, star_graph, wheel_graph)
+                              path_graph, star_graph, wheel_graph,
+                              CellSignature, NodeSignature,
+                              compute_signature, compute_node_signature,
+                              compute_all_node_signatures)
 from tutte_test.polynomial import (TuttePolynomial, cycle_polynomial,
                                    decode_varsint, decode_varuint,
                                    encode_varsint, encode_varuint,
@@ -1122,6 +1128,253 @@ class TestLargeZephyr(unittest.TestCase):
     def test_z41(self):
         """Test Z(4,1)."""
         self._test_zephyr(4, 1)
+
+
+# =============================================================================
+# HIERARCHICAL TILING TESTS
+# =============================================================================
+
+class TestCellSignature(unittest.TestCase):
+    """Test cell signature computation."""
+
+    def test_k3_signature(self):
+        """K_3 has known signature."""
+        k3 = complete_graph(3)
+        sig = compute_signature(k3)
+        self.assertEqual(sig.node_count, 3)
+        self.assertEqual(sig.edge_count, 3)
+        self.assertEqual(sig.degree_sequence, (2, 2, 2))
+        self.assertEqual(sig.triangle_count, 1)
+
+    def test_k4_signature(self):
+        """K_4 has known signature."""
+        k4 = complete_graph(4)
+        sig = compute_signature(k4)
+        self.assertEqual(sig.node_count, 4)
+        self.assertEqual(sig.edge_count, 6)
+        self.assertEqual(sig.degree_sequence, (3, 3, 3, 3))
+        self.assertEqual(sig.triangle_count, 4)
+
+    def test_c5_signature(self):
+        """C_5 has no triangles."""
+        c5 = cycle_graph(5)
+        sig = compute_signature(c5)
+        self.assertEqual(sig.node_count, 5)
+        self.assertEqual(sig.edge_count, 5)
+        self.assertEqual(sig.degree_sequence, (2, 2, 2, 2, 2))
+        self.assertEqual(sig.triangle_count, 0)
+
+    def test_signature_could_match(self):
+        """Signature matching works correctly."""
+        k3_sig = compute_signature(complete_graph(3))
+        k3_sig2 = compute_signature(complete_graph(3))
+        c3_sig = compute_signature(cycle_graph(3))  # Same as K_3
+        k4_sig = compute_signature(complete_graph(4))
+
+        self.assertTrue(k3_sig.could_match(k3_sig2))
+        self.assertTrue(k3_sig.could_match(c3_sig))  # K_3 = C_3
+        self.assertFalse(k3_sig.could_match(k4_sig))
+
+
+class TestNodeSignature(unittest.TestCase):
+    """Test node signature computation."""
+
+    def test_k3_node_signatures(self):
+        """All nodes in K_3 have same signature."""
+        k3 = complete_graph(3)
+        sigs = compute_all_node_signatures(k3)
+        self.assertEqual(len(sigs), 3)
+
+        # All should be equal
+        sig_list = list(sigs.values())
+        self.assertEqual(sig_list[0], sig_list[1])
+        self.assertEqual(sig_list[1], sig_list[2])
+
+    def test_star_node_signatures(self):
+        """Star graph has distinct center and leaf signatures."""
+        s3 = star_graph(3)
+        sigs = compute_all_node_signatures(s3)
+
+        # Center (node 0) has degree 3
+        center_sig = sigs[0]
+        leaf_sig = sigs[1]
+
+        self.assertEqual(center_sig.degree, 3)
+        self.assertEqual(leaf_sig.degree, 1)
+        self.assertNotEqual(center_sig, leaf_sig)
+
+
+class TestHierarchicalPartition(unittest.TestCase):
+    """Test hierarchical partition functions."""
+
+    def test_disjoint_k3_finds_cells(self):
+        """Two disjoint K_3s can be partitioned into cells."""
+        k3_1 = complete_graph(3)
+        k3_2 = complete_graph(3)
+        union = disjoint_union(k3_1, k3_2)
+
+        table = build_basic_table()
+        candidates = find_cell_candidates(union, table)
+
+        # Should find C_3 (=K_3) as a candidate
+        # K_3 and C_3 are isomorphic, share same canonical key
+        c3_names = [c.name for c in candidates if c.name == 'C_3']
+        self.assertIn('C_3', c3_names)
+
+    def test_disjoint_k3_partition(self):
+        """Two disjoint K_3s can be partitioned."""
+        k3_1 = complete_graph(3)
+        k3_2 = complete_graph(3)
+        union = disjoint_union(k3_1, k3_2)
+
+        table = build_basic_table()
+        # Use C_3 which is isomorphic to K_3
+        c3_entry = table.get_entry('C_3')
+        if c3_entry is None:
+            self.skipTest("C_3 not in table")
+
+        partition = partition_into_cells(union, c3_entry, 2)
+        self.assertIsNotNone(partition)
+        self.assertEqual(len(partition), 2)
+        self.assertEqual(len(partition[0]), 3)
+        self.assertEqual(len(partition[1]), 3)
+        self.assertEqual(partition[0] & partition[1], set())
+
+    def test_verify_partition(self):
+        """Verify partition checks isomorphism correctly."""
+        k3_1 = complete_graph(3)
+        k3_2 = complete_graph(3)
+        union = disjoint_union(k3_1, k3_2)
+
+        table = build_basic_table()
+        c3_entry = table.get_entry('C_3')
+        if c3_entry is None:
+            self.skipTest("C_3 not in table")
+
+        partition = partition_into_cells(union, c3_entry, 2)
+        if partition is None:
+            self.skipTest("Partition not found")
+
+        self.assertTrue(verify_cell_partition(union, partition, c3_entry))
+
+    def test_inter_cell_edges_disjoint(self):
+        """Disjoint union has no inter-cell edges."""
+        k3_1 = complete_graph(3)
+        k3_2 = complete_graph(3)
+        union = disjoint_union(k3_1, k3_2)
+
+        partition = [{0, 1, 2}, {3, 4, 5}]
+        inter_info = analyze_inter_cell_edges(union, partition)
+
+        self.assertEqual(len(inter_info.edges), 0)
+        self.assertTrue(inter_info.is_regular)
+
+
+class TestHierarchicalZephyr(unittest.TestCase):
+    """Test hierarchical synthesis infrastructure on Zephyr graphs.
+
+    Note: Full synthesis tests are skipped due to inter-cell edge complexity.
+    These tests verify the partitioning and candidate detection work correctly.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        """Build table and bootstrap Z(1,1) as a reusable tile."""
+        cls.table = build_basic_table()
+        cls.engine = SynthesisEngine(table=cls.table, verbose=False)
+
+        try:
+            G_z11 = get_zephyr_graph(1, 1)
+            z11_graph = Graph.from_networkx(G_z11)
+            z11_result = cls.engine.synthesize(z11_graph)
+            cls.table.add(z11_graph, "Z_1_1", z11_result.polynomial)
+            cls.z11_available = True
+            cls.z11_graph = z11_graph
+        except ImportError:
+            cls.z11_available = False
+
+    def test_z11_signature(self):
+        """Z(1,1) has correct signature."""
+        if not self.z11_available:
+            self.skipTest("dwave_networkx required")
+
+        sig = compute_signature(self.z11_graph)
+        self.assertEqual(sig.node_count, 12)
+        self.assertEqual(sig.edge_count, 22)
+
+    def test_z12_finds_z11_cells(self):
+        """Z(1,2) should find Z(1,1) as candidate cell."""
+        if not self.z11_available:
+            self.skipTest("dwave_networkx required")
+
+        G_z12 = get_zephyr_graph(1, 2)
+        z12_graph = Graph.from_networkx(G_z12)
+
+        candidates = find_cell_candidates(z12_graph, self.table)
+        z11_candidates = [c for c in candidates if c.name == 'Z_1_1']
+
+        # Z(1,1) should be a candidate for Z(1,2) tiling
+        self.assertGreater(len(z11_candidates), 0)
+
+    def test_z12_partition(self):
+        """Z(1,2) can be partitioned into two Z(1,1) cells."""
+        if not self.z11_available:
+            self.skipTest("dwave_networkx required")
+
+        G_z12 = get_zephyr_graph(1, 2)
+        z12_graph = Graph.from_networkx(G_z12)
+
+        z11_entry = self.table.get_entry('Z_1_1')
+        partition = partition_into_cells(z12_graph, z11_entry, 2)
+
+        self.assertIsNotNone(partition)
+        self.assertEqual(len(partition), 2)
+
+        # Verify each partition is correct size and isomorphic to Z(1,1)
+        for cell_nodes in partition:
+            self.assertEqual(len(cell_nodes), 12)
+            subgraph = z12_graph.subgraph(cell_nodes)
+            self.assertEqual(subgraph.edge_count(), 22)
+
+        # Verify partition is verified
+        self.assertTrue(verify_cell_partition(z12_graph, partition, z11_entry))
+
+    def test_z12_inter_cell_edges(self):
+        """Z(1,2) has 32 inter-cell edges between the two Z(1,1) cells."""
+        if not self.z11_available:
+            self.skipTest("dwave_networkx required")
+
+        G_z12 = get_zephyr_graph(1, 2)
+        z12_graph = Graph.from_networkx(G_z12)
+
+        z11_entry = self.table.get_entry('Z_1_1')
+        partition = partition_into_cells(z12_graph, z11_entry, 2)
+
+        if partition is None:
+            self.skipTest("Partition not found")
+
+        inter_info = analyze_inter_cell_edges(z12_graph, partition)
+
+        # Total edges = 2 * 22 (cells) + 32 (inter) = 76
+        self.assertEqual(len(inter_info.edges), 32)
+
+    @unittest.skip("Full synthesis too slow; inter-cell edge addition needs optimization")
+    def test_z12_hierarchical(self):
+        """Z(1,2) can be synthesized hierarchically from Z(1,1) cells."""
+        if not self.z11_available:
+            self.skipTest("dwave_networkx required")
+
+        G_z12 = get_zephyr_graph(1, 2)
+        z12_graph = Graph.from_networkx(G_z12)
+
+        self.engine._cache.clear()
+
+        result = self.engine.synthesize(z12_graph)
+        kirchhoff = int(round(nx.number_of_spanning_trees(G_z12)))
+
+        self.assertEqual(result.polynomial.num_spanning_trees(), kirchhoff,
+                        f"Z(1,2) spanning tree mismatch")
+        self.assertTrue(result.verified)
 
 
 # =============================================================================
