@@ -1,6 +1,6 @@
 # Quip Network Experimental Node
 
-> **WARNING: This is experimental demonstration software provided without warranty of any kind. It is not intended for production use. Use at your own risk.**
+> **WARNING: This is experimental  demonstration software provided without warranty of any kind. It is not intended for production use. Use at your own risk.**
 
 This project implements a quantum blockchain using quantum annealing for proof-of-work consensus. It features competitive mining between quantum computers (QPU) and classical simulated annealing (SA) with a dynamic difficulty adjustment mechanism.
 
