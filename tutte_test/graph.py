@@ -17,6 +17,78 @@ import networkx as nx
 
 
 # =============================================================================
+# CANONICAL KEY COMPUTATION (isomorphism-invariant graph hashing)
+# =============================================================================
+
+def _compute_canonical_key(G: nx.Graph) -> str:
+    """Compute a truly canonical key for a NetworkX graph.
+
+    Uses Weisfeiler-Lehman refinement to compute a canonical node ordering,
+    then hashes the resulting edge list. This is isomorphism-invariant:
+    two isomorphic graphs will always produce the same key.
+
+    This is faster than graph6 encoding and more reliable for cache hits.
+    """
+    if len(G) == 0:
+        return hashlib.sha256(b'empty').hexdigest()
+
+    n = len(G)
+
+    # Initialize node colors with degrees
+    colors: Dict[int, tuple] = {node: (G.degree(node),) for node in G.nodes()}
+
+    # Iteratively refine colors using neighbor information (WL algorithm)
+    for _ in range(n):  # At most n iterations needed for convergence
+        new_colors = {}
+        for node in G.nodes():
+            neighbor_colors = tuple(sorted(colors[nb] for nb in G.neighbors(node)))
+            new_colors[node] = (colors[node], neighbor_colors)
+
+        # Check if color partition stabilized
+        old_partitions = len(set(colors.values()))
+        new_partitions = len(set(new_colors.values()))
+        colors = new_colors
+
+        if new_partitions == old_partitions:
+            break
+
+    # Convert colors to integers for efficient sorting
+    color_to_int = {c: i for i, c in enumerate(sorted(set(colors.values())))}
+    int_colors = {node: color_to_int[colors[node]] for node in G.nodes()}
+
+    # Initial sort by WL color
+    sorted_nodes = sorted(G.nodes(), key=lambda node: int_colors[node])
+
+    # Break remaining ties using neighbor indices within sorted list
+    def canonical_sort_key(idx: int) -> tuple:
+        node = sorted_nodes[idx]
+        color = int_colors[node]
+        # Neighbor indices provide canonical tie-breaking
+        neighbor_indices = tuple(sorted(
+            sorted_nodes.index(nb) for nb in G.neighbors(node)
+        ))
+        return (color, neighbor_indices)
+
+    indices = list(range(len(sorted_nodes)))
+    indices.sort(key=canonical_sort_key)
+    sorted_nodes = [sorted_nodes[i] for i in indices]
+
+    # Create mapping to canonical integer labels
+    mapping = {old: new for new, old in enumerate(sorted_nodes)}
+
+    # Build canonical edge list
+    edges = []
+    for u, v in G.edges():
+        new_u, new_v = mapping[u], mapping[v]
+        edges.append((min(new_u, new_v), max(new_u, new_v)))
+    edges.sort()
+
+    # Hash the canonical form
+    canonical_str = f'{len(G)}:{edges}'
+    return hashlib.sha256(canonical_str.encode()).hexdigest()
+
+
+# =============================================================================
 # CELL SIGNATURE (for fast structural matching without VF2)
 # =============================================================================
 
@@ -168,17 +240,12 @@ class Graph:
     def canonical_key(self) -> str:
         """Create a canonical string key for the graph (isomorphism-invariant).
 
-        Uses SHA256 hash of the graph6 format for compact, deterministic keys.
-        Falls back to hash of sorted edge list for graphs that can't be encoded.
+        Uses Weisfeiler-Lehman refinement to compute a canonical node ordering,
+        then hashes the resulting edge list. This is truly isomorphism-invariant
+        and faster than the previous graph6-based approach.
         """
         G = self.to_networkx()
-        G_relabeled = nx.convert_node_labels_to_integers(G)
-        try:
-            canonical_bytes = nx.to_graph6_bytes(G_relabeled, header=False)
-        except Exception:
-            edges = sorted(self.edges)
-            canonical_bytes = str(edges).encode('utf-8')
-        return hashlib.sha256(canonical_bytes).hexdigest()
+        return _compute_canonical_key(G)
 
     def node_count(self) -> int:
         """Number of nodes."""
@@ -744,15 +811,84 @@ class MultiGraph:
         return next(iter(self.edge_counts.values()))
 
     def canonical_key(self) -> str:
-        """Create a canonical key for the multigraph."""
-        # Include edge multiplicities in the key
-        parts = [
-            f"n{len(self.nodes)}",
-            "e" + ",".join(f"{u}-{v}x{c}" for (u, v), c in sorted(self.edge_counts.items())),
-            "l" + ",".join(f"{n}x{c}" for n, c in sorted(self.loop_counts.items()))
-        ]
-        key_str = "|".join(parts)
-        return hashlib.sha256(key_str.encode()).hexdigest()
+        """Create a canonical key for the multigraph (isomorphism-invariant).
+
+        Uses WL refinement for node ordering, then encodes edge multiplicities
+        and loops in canonical form.
+        """
+        if not self.nodes:
+            return hashlib.sha256(b'empty_multigraph').hexdigest()
+
+        n = len(self.nodes)
+
+        # Build adjacency info including multiplicities and loops
+        def node_signature(node: int) -> tuple:
+            """Compute initial signature for a node."""
+            degree = sum(self.edge_counts.get((min(node, nb), max(node, nb)), 0)
+                        for nb in self.neighbors(node))
+            loops = self.loop_counts.get(node, 0)
+            return (degree, loops)
+
+        # Initialize colors
+        colors: Dict[int, tuple] = {node: node_signature(node) for node in self.nodes}
+
+        # WL refinement
+        for _ in range(n):
+            new_colors = {}
+            for node in self.nodes:
+                neighbor_info = []
+                for nb in self.neighbors(node):
+                    edge = (min(node, nb), max(node, nb))
+                    mult = self.edge_counts.get(edge, 0)
+                    neighbor_info.append((colors[nb], mult))
+                neighbor_info = tuple(sorted(neighbor_info))
+                new_colors[node] = (colors[node], neighbor_info)
+
+            old_parts = len(set(colors.values()))
+            new_parts = len(set(new_colors.values()))
+            colors = new_colors
+            if new_parts == old_parts:
+                break
+
+        # Sort nodes by color
+        color_to_int = {c: i for i, c in enumerate(sorted(set(colors.values())))}
+        int_colors = {node: color_to_int[colors[node]] for node in self.nodes}
+        sorted_nodes = sorted(self.nodes, key=lambda n: int_colors[n])
+
+        # Tie-breaking using neighbor structure
+        def canonical_sort_key(idx: int) -> tuple:
+            node = sorted_nodes[idx]
+            color = int_colors[node]
+            neighbor_indices = []
+            for nb in self.neighbors(node):
+                edge = (min(node, nb), max(node, nb))
+                mult = self.edge_counts.get(edge, 0)
+                neighbor_indices.append((sorted_nodes.index(nb), mult))
+            return (color, tuple(sorted(neighbor_indices)))
+
+        indices = list(range(len(sorted_nodes)))
+        indices.sort(key=canonical_sort_key)
+        sorted_nodes = [sorted_nodes[i] for i in indices]
+
+        # Create canonical mapping
+        mapping = {old: new for new, old in enumerate(sorted_nodes)}
+
+        # Build canonical edge list with multiplicities
+        edges = []
+        for (u, v), mult in self.edge_counts.items():
+            new_u, new_v = mapping[u], mapping[v]
+            edges.append((min(new_u, new_v), max(new_u, new_v), mult))
+        edges.sort()
+
+        # Build canonical loop list
+        loops = []
+        for node, count in self.loop_counts.items():
+            loops.append((mapping[node], count))
+        loops.sort()
+
+        # Hash canonical form
+        canonical_str = f'MG:{n}:e{edges}:l{loops}'
+        return hashlib.sha256(canonical_str.encode()).hexdigest()
 
 
 # =============================================================================

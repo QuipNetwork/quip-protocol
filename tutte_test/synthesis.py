@@ -54,12 +54,17 @@ class BaseMultigraphSynthesizer:
     - _multigraph_cache -> dict for caching multigraph polynomials
     """
 
-    def _synthesize_multigraph(self, mg: MultiGraph, max_depth: int = 10) -> TuttePolynomial:
+    def _synthesize_multigraph(
+        self,
+        mg: MultiGraph,
+        max_depth: int = 10,
+        skip_minor_search: bool = False
+    ) -> TuttePolynomial:
         """Synthesize polynomial for a multigraph with pattern recognition.
 
         Pattern recognition order:
         1. Cache lookup
-        2. Simple graph -> use regular synthesis
+        2. Simple graph -> use regular synthesis (or fast path if skip_minor_search)
         3. Loop handling: T(G with loop) = y × T(G without loop)
         4. Cut vertex factorization: T(G1 · G2) = T(G1) × T(G2)
         5. Parallel edges formula (for simple multi-edge graphs)
@@ -69,6 +74,10 @@ class BaseMultigraphSynthesizer:
         Args:
             mg: MultiGraph to synthesize
             max_depth: Maximum recursion depth (for subclass methods)
+            skip_minor_search: If True, skip expensive minor search for simple graphs
+                              and go directly to spanning tree expansion. Use this
+                              for intermediate graphs that are unlikely to match
+                              known minors.
 
         Returns:
             TuttePolynomial for the multigraph
@@ -84,7 +93,13 @@ class BaseMultigraphSynthesizer:
         if mg.is_simple():
             simple = mg.to_simple_graph()
             if simple is not None:
-                result = self.synthesize(simple, max_depth)
+                if skip_minor_search:
+                    # Fast path: skip minor search, go directly to spanning tree expansion
+                    # This is used for intermediate merged graphs that are unlikely
+                    # to match any named minors in the rainbow table
+                    result = self._synthesize_fast(simple, max_depth)
+                else:
+                    result = self.synthesize(simple, max_depth)
                 self._multigraph_cache[cache_key] = result.polynomial
                 return result.polynomial
 
@@ -92,7 +107,7 @@ class BaseMultigraphSynthesizer:
         if mg.total_loop_count() > 0:
             loop_count = mg.total_loop_count()
             mg_no_loops = mg.remove_loops()
-            poly = TuttePolynomial.y(loop_count) * self._synthesize_multigraph(mg_no_loops, max_depth)
+            poly = TuttePolynomial.y(loop_count) * self._synthesize_multigraph(mg_no_loops, max_depth, skip_minor_search)
             self._multigraph_cache[cache_key] = poly
             return poly
 
@@ -104,7 +119,7 @@ class BaseMultigraphSynthesizer:
                 self._log(f"Cut vertex {cut} splits into {len(components)} components")
                 poly = TuttePolynomial.one()
                 for comp in components:
-                    poly = poly * self._synthesize_multigraph(comp, max_depth)
+                    poly = poly * self._synthesize_multigraph(comp, max_depth, skip_minor_search)
                 self._multigraph_cache[cache_key] = poly
                 return poly
 
@@ -116,14 +131,14 @@ class BaseMultigraphSynthesizer:
 
         # 6. Disconnected multigraph: T(G1 ∪ G2) = T(G1) × T(G2)
         if not mg.is_connected():
-            poly = self._handle_disconnected_multigraph(mg, max_depth)
+            poly = self._handle_disconnected_multigraph(mg, max_depth, skip_minor_search)
             self._multigraph_cache[cache_key] = poly
             return poly
 
         # 7. Reduce parallel edges one at a time: T(G) = T(G\\e) + T(G/e)
         max_mult_edge = max(mg.edge_counts.keys(), key=lambda e: mg.edge_counts[e])
         if mg.edge_counts[max_mult_edge] > 1:
-            poly = self._reduce_parallel_edge(mg, max_mult_edge, max_depth)
+            poly = self._reduce_parallel_edge(mg, max_mult_edge, max_depth, skip_minor_search)
             self._multigraph_cache[cache_key] = poly
             return poly
 
@@ -158,7 +173,12 @@ class BaseMultigraphSynthesizer:
             coeffs[(0, i)] = 1  # + y^i
         return TuttePolynomial.from_coefficients(coeffs)
 
-    def _handle_disconnected_multigraph(self, mg: MultiGraph, max_depth: int) -> TuttePolynomial:
+    def _handle_disconnected_multigraph(
+        self,
+        mg: MultiGraph,
+        max_depth: int,
+        skip_minor_search: bool = False
+    ) -> TuttePolynomial:
         """Handle disconnected multigraph: T(G1 ∪ G2) = T(G1) × T(G2)."""
         start = next(iter(mg.nodes))
         visited = {start}
@@ -179,13 +199,15 @@ class BaseMultigraphSynthesizer:
         rest_loops = {n: c for n, c in mg.loop_counts.items() if n in rest_nodes}
         rest = MultiGraph(nodes=frozenset(rest_nodes), edge_counts=rest_edges, loop_counts=rest_loops)
 
-        return self._synthesize_multigraph(comp1, max_depth) * self._synthesize_multigraph(rest, max_depth)
+        return (self._synthesize_multigraph(comp1, max_depth, skip_minor_search) *
+                self._synthesize_multigraph(rest, max_depth, skip_minor_search))
 
     def _reduce_parallel_edge(
         self,
         mg: MultiGraph,
         edge: Tuple[int, int],
-        max_depth: int
+        max_depth: int,
+        skip_minor_search: bool = False
     ) -> TuttePolynomial:
         """Reduce a parallel edge using T(G) = T(G\\e) + T(G/e).
 
@@ -222,8 +244,8 @@ class BaseMultigraphSynthesizer:
         else:
             mg_contract = mg_merged
 
-        t_delete = self._synthesize_multigraph(mg_delete, max_depth)
-        t_contract = self._synthesize_multigraph(mg_contract, max_depth)
+        t_delete = self._synthesize_multigraph(mg_delete, max_depth, skip_minor_search)
+        t_contract = self._synthesize_multigraph(mg_contract, max_depth, skip_minor_search)
 
         return t_delete + t_contract
 
@@ -504,17 +526,10 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
 
         Algorithm:
         1. Base: T(disjoint cells) = T(cell)^k
-        2. Add inter-cell edges using optimized chord processing:
-           - Separate bridges (connect different components) from chords
-           - Bridges: T(G+e) = x × T(G)
-           - Chords: T(G+e) = T(G) + T(G/{u,v}), with caching of merged-cell polynomials
-
-        The optimization caches polynomials for merged cells. When contracting
-        an inter-cell edge (u,v), the merged node becomes a cut vertex, so:
-        T(G/{u,v}) = T(cell1_with_merge) × T(cell2_with_merge)
-
-        By caching these cell-with-merge polynomials (keyed by which nodes
-        have been merged into the cell), we avoid redundant computation.
+        2. Try product formula: T(full) = T(cell)^k × product(T(inter_components))
+           - This only works for specific structures (like Zephyr graphs)
+           - Verify result; if wrong, fall back to edge-by-edge addition
+        3. Fallback: Add inter-cell edges one-by-one using chord/bridge formulas
 
         Args:
             graph: Full graph
@@ -530,22 +545,49 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         recipe = [f"Hierarchical: {k} × {cell.name} cells"]
 
         # Step 1: Base polynomial = T(cell)^k (disjoint cells)
-        poly = TuttePolynomial.one()
+        base_poly = TuttePolynomial.one()
         for _ in range(k):
-            poly = poly * cell.polynomial
+            base_poly = base_poly * cell.polynomial
 
         recipe.append(f"Base: T({cell.name})^{k}")
-        self._log(f"Base polynomial has {poly.num_terms()} terms")
+        self._log(f"Base polynomial has {base_poly.num_terms()} terms")
 
-        # Step 2: Add inter-cell edges using optimized processing
+        # Step 2: Try product formula for inter-cell edges
+        # This formula works for Zephyr-type graphs: T(full) = T(cell)^k × Π T(inter_components)
+        # But doesn't work for arbitrary partitions, so we verify and fall back if needed.
         if inter_info.edges:
-            self._log(f"Adding {len(inter_info.edges)} inter-cell edges")
-            recipe.append(f"Inter-cell edges: {len(inter_info.edges)}")
+            inter_graph = self._build_inter_cell_graph(graph, partition, inter_info)
+            inter_components = inter_graph.connected_components()
 
-            poly = self._add_inter_cell_edges_optimized(
-                poly, graph, partition, inter_info, cell
-            )
-            recipe.append("Optimized inter-cell processing")
+            self._log(f"Inter-cell: {len(inter_components)} components, {inter_graph.edge_count()} edges")
+
+            # Try product formula first (fast path for Zephyr-like structures)
+            poly = base_poly
+            for i, comp in enumerate(inter_components):
+                comp_result = self.synthesize(comp, max_depth)
+                poly = poly * comp_result.polynomial
+
+            # Verify - product formula only works for specific structures
+            if verify_spanning_trees(graph, poly):
+                self._log("Product formula verified")
+                recipe.append(f"Inter-cell: {len(inter_components)} components")
+                recipe.append("Product formula: T(cells)^k × Π T(inter_components)")
+
+                return SynthesisResult(
+                    polynomial=poly,
+                    recipe=recipe,
+                    verified=True,
+                    method="hierarchical_tiling",
+                    tiles_used=k,
+                    fringe_edges=0
+                )
+
+            # Product formula failed - fall back to component-optimized edge addition
+            self._log("Product formula failed, using optimized edge-by-edge addition")
+            recipe.append("Product formula invalid, using optimized edge-by-edge")
+            poly = self._add_inter_cell_edges_optimized(base_poly, graph, partition, inter_info, cell)
+        else:
+            poly = base_poly
 
         self._log(f"Final polynomial has {poly.num_terms()} terms")
 
@@ -820,16 +862,18 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                     if cache_key in self._multigraph_cache:
                         comp_poly = self._multigraph_cache[cache_key]
                     else:
-                        comp_poly = self._synthesize_multigraph(comp)
+                        # Use skip_minor_search for intermediate merged graphs
+                        comp_poly = self._synthesize_multigraph(comp, skip_minor_search=True)
                         self._multigraph_cache[cache_key] = comp_poly
                     merged_poly = merged_poly * comp_poly
             else:
-                # Full synthesis (with caching)
+                # Full synthesis (with caching) - skip minor search for efficiency
                 cache_key = merged.canonical_key()
                 if cache_key in self._multigraph_cache:
                     merged_poly = self._multigraph_cache[cache_key]
                 else:
-                    merged_poly = self._synthesize_multigraph(merged)
+                    # Use skip_minor_search for intermediate merged graphs
+                    merged_poly = self._synthesize_multigraph(merged, skip_minor_search=True)
                     self._multigraph_cache[cache_key] = merged_poly
                 self._log(f"      Chord {i+1}/{len(chord_edges)}: full synthesis")
 
@@ -1238,6 +1282,172 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             recipe=recipe,
             verified=True,
             method="spanning_tree_expansion"
+        )
+
+    def _synthesize_fast(
+        self,
+        graph: Graph,
+        max_depth: int
+    ) -> SynthesisResult:
+        """Fast synthesis path that skips minor search.
+
+        This method handles basic cases and optimizations but skips the
+        expensive minor search in _synthesize_connected. It's used for
+        intermediate merged graphs that are unlikely to match known minors.
+
+        The order of checks:
+        1. Rainbow table lookup (still fast)
+        2. Base cases (empty, single edge)
+        3. Disconnected graphs
+        4. Cut vertex factorization
+        5. Direct spanning tree expansion (skip minor search)
+
+        Args:
+            graph: Graph to compute polynomial for
+            max_depth: Maximum recursion depth
+
+        Returns:
+            SynthesisResult with computed polynomial
+        """
+        # Check cache first
+        cache_key = graph.canonical_key()
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        # 1. Rainbow table lookup (still worthwhile - it's fast)
+        cached = self.table.lookup(graph)
+        if cached is not None:
+            result = SynthesisResult(
+                polynomial=cached,
+                recipe=["Rainbow table lookup"],
+                verified=True,
+                method="lookup"
+            )
+            self._cache[cache_key] = result
+            return result
+
+        # 2. Base cases
+        if graph.edge_count() == 0:
+            result = SynthesisResult(
+                polynomial=TuttePolynomial.one(),
+                recipe=["Empty graph: T = 1"],
+                verified=True,
+                method="base_case"
+            )
+            self._cache[cache_key] = result
+            return result
+
+        if graph.edge_count() == 1:
+            result = SynthesisResult(
+                polynomial=TuttePolynomial.x(),
+                recipe=["Single edge: T = x"],
+                verified=True,
+                method="base_case"
+            )
+            self._cache[cache_key] = result
+            return result
+
+        # 3. Disconnected graphs
+        components = graph.connected_components()
+        if len(components) > 1:
+            result = self._synthesize_disconnected(components, max_depth)
+            self._cache[cache_key] = result
+            return result
+
+        # 4. Cut vertex factorization
+        cut = graph.has_cut_vertex()
+        if cut is not None:
+            result = self._synthesize_via_cut_vertex(graph, cut, max_depth)
+            self._cache[cache_key] = result
+            return result
+
+        # 5. Direct spanning tree expansion (skip minor search)
+        result = self._synthesize_from_k2_fast(graph, max_depth)
+        self._cache[cache_key] = result
+        return result
+
+    def _synthesize_from_k2_fast(
+        self,
+        graph: Graph,
+        max_depth: int
+    ) -> SynthesisResult:
+        """Spanning tree expansion with fast path for merged graphs.
+
+        Same as _synthesize_from_k2 but uses skip_minor_search=True for
+        recursive multigraph synthesis.
+        """
+        self._log("Building via spanning tree + edge addition (fast path)")
+
+        n = graph.node_count()
+
+        if n == 0:
+            return SynthesisResult(
+                polynomial=TuttePolynomial.one(),
+                recipe=["Empty graph"],
+                verified=True,
+                method="base_case"
+            )
+
+        recipe = ["Spanning tree + edge addition (fast)"]
+
+        # Find spanning tree using BFS
+        tree_edges = set()
+        visited = set()
+        start = next(iter(graph.nodes))
+        queue = [start]
+        visited.add(start)
+
+        while queue:
+            node = queue.pop(0)
+            for neighbor in graph.neighbors(node):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+                    edge = (min(node, neighbor), max(node, neighbor))
+                    tree_edges.add(edge)
+
+        # Chords
+        chords = [e for e in graph.edges if e not in tree_edges]
+
+        self._log(f"Spanning tree: {len(tree_edges)} edges, chords: {len(chords)}")
+        recipe.append(f"Spanning tree: {len(tree_edges)} edges")
+        recipe.append(f"Chords: {len(chords)}")
+
+        # Start with spanning tree polynomial
+        poly = TuttePolynomial.x(len(tree_edges))
+
+        # Build current multigraph
+        current_mg = MultiGraph(
+            nodes=graph.nodes,
+            edge_counts={e: 1 for e in tree_edges},
+            loop_counts={}
+        )
+
+        # Add chords with skip_minor_search=True
+        for i, (u, v) in enumerate(chords):
+            merged = current_mg.merge_nodes(u, v)
+            # Use skip_minor_search=True for recursive synthesis
+            merged_poly = self._synthesize_multigraph(merged, max_depth, skip_minor_search=True)
+
+            poly = poly + merged_poly
+
+            # Update current graph
+            edge = (min(u, v), max(u, v))
+            new_edge_counts = dict(current_mg.edge_counts)
+            new_edge_counts[edge] = new_edge_counts.get(edge, 0) + 1
+            current_mg = MultiGraph(
+                nodes=current_mg.nodes,
+                edge_counts=new_edge_counts,
+                loop_counts=current_mg.loop_counts
+            )
+
+        recipe.append(f"Final: {poly.num_terms()} terms")
+
+        return SynthesisResult(
+            polynomial=poly,
+            recipe=recipe,
+            verified=True,
+            method="spanning_tree_expansion_fast"
         )
 
     # =========================================================================
