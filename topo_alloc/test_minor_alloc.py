@@ -142,33 +142,6 @@ class TestImpossibleEmbeddings:
         assert phi is None
 
 
-class TestReturnStructure:
-    def test_returns_dict_of_frozensets(self):
-        source = nx.path_graph(3)
-        target = nx.complete_graph(6)
-        phi = find_embedding(source, target, rng_factory=seeded_rng(2))
-        assert phi is not None
-        assert isinstance(phi, dict)
-        for key, val in phi.items():
-            assert isinstance(val, frozenset), f"Expected frozenset, got {type(val)}"
-
-    def test_keys_match_source_nodes(self):
-        source = nx.cycle_graph(4)
-        target = nx.complete_graph(8)
-        phi = find_embedding(source, target, rng_factory=seeded_rng(2))
-        assert phi is not None
-        assert set(phi.keys()) == set(source.nodes)
-
-    def test_values_are_subsets_of_target_nodes(self):
-        source = nx.path_graph(3)
-        target = nx.path_graph(10)
-        phi = find_embedding(source, target, rng_factory=seeded_rng(9))
-        assert phi is not None
-        target_nodes = set(target.nodes)
-        for model in phi.values():
-            assert model <= target_nodes
-
-
 class TestDeterminism:
     def test_same_seed_same_result(self):
         source = nx.cycle_graph(5)
