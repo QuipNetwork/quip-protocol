@@ -8,6 +8,7 @@ venv/
 env/
 ENV/
 .venv/
+uv.lock
 
 # Environment variables
 .env
