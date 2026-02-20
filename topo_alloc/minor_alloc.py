@@ -6,9 +6,10 @@ The whole allocator uses minor-embedding approach to
 perform proper allocations.
 """
 
+import itertools
 import random as rng
 from collections import defaultdict
-from typing import Callable, Dict, FrozenSet, List, Optional
+from typing import Callable, Dict, FrozenSet, List, Optional, Set
 
 import networkx as nx
 
@@ -96,22 +97,8 @@ def find_embedding[G, H](
         # Stage 3 - validate the solution
         # --------------------------------
         phi_set = {x: frozenset(phi[x]) for x in src_nodes}
-        phi_image = sum((list(s) for s in phi_set.values()), [])
-        if len(phi_image) != len(set(phi_image)):  # Models should not overlap
-            continue
-        if any(not phi_set[x] for x in src_nodes):  # V-models should be non-empty
-            continue
-        if any(
-            len(phi_set[x]) > 1 and not nx.is_connected(target.subgraph(phi_set[x]))
-            for x in src_nodes
-        ):  # V-model should generate connected subgraph
-            continue
-        if any(
-            not any(target.has_edge(gu, gv) for gu in phi_set[u] for gv in phi_set[v])
-            for u, v in source.edges
-        ):  # Source graph edges should be covered
-            continue
-        return phi_set
+        if is_valid_embedding(source, target, phi_set):
+            return phi_set
     return None
 
 
@@ -119,29 +106,29 @@ def build_model[G, H](
     x: H,
     adjlist: Dict[H, List[H]],
     phi: Dict[H, List[G]],
-    target: nx.Graph[G],
+    graph: nx.Graph[G],
     overlap_penalty: float,
 ) -> Optional[List[G]]:
     # Get already placed neighbours to x
     placed_neighbours = [y for y in adjlist[x] if phi[y]]
 
     # Find any other nodes than x in y-models
-    occupied = set.union(set(), *(set(model) for y, model in phi.items() if y != x))
+    occupied = set().union(*(set(model) for y, model in phi.items() if y != x))
 
     # If there is no placed neighbour, just pick any free node.
     if not placed_neighbours:
-        free = [g for g in target.nodes if g not in occupied]
-        return [free[0]] if free else [next(iter(target.nodes))]
+        free = [g for g in graph.nodes if g not in occupied]
+        return [free[0]] if free else [next(iter(graph.nodes))]
 
     # Run Dijkstra's algorithm from multiple sources from v-models.
     def weight(_u, v, _data):
         return 1.0 + overlap_penalty * (1.0 if v in occupied else 0.0)
 
     dist_from = {}
-    pred_from = {}
+    path_from = {}
     for y in placed_neighbours:
-        dist_from[y], pred_from[y] = nx.multi_source_dijkstra(
-            target, sources=phi[y], weight=weight
+        dist_from[y], path_from[y] = nx.multi_source_dijkstra(
+            graph, sources=phi[y], weight=weight
         )
 
     # Choose the best root.
@@ -149,7 +136,7 @@ def build_model[G, H](
     # Take `free` node from the target graph by minimising sum of
     # distances to all neighbour models.
     best_root, best_cost = None, float("+inf")
-    for g in target.nodes:
+    for g in graph.nodes:
         if g in occupied:
             continue
         cost = sum(dist_from[y].get(g, float("+inf")) for y in placed_neighbours)
@@ -164,12 +151,12 @@ def build_model[G, H](
     model = {best_root}
     for y in placed_neighbours:
         phi_y_set = frozenset(phi[y])
-        path = path_stopping_at(pred_from[y], best_root, phi_y_set)
+        path = path_stopping_at(path_from[y], best_root, phi_y_set)
         model.update(path)
 
     # Keep only the component containing root (paths should be connected,
     # but guard against edge cases).
-    sub = target.subgraph(model)
+    sub = graph.subgraph(model)
     if len(model) > 1 and not nx.is_connected(sub):
         model = set(nx.node_connected_component(sub, best_root))
 
@@ -178,10 +165,10 @@ def build_model[G, H](
     model_set = set(model)
     for y in placed_neighbours:
         phi_y_set = frozenset(phi[y])
-        if not any(target.has_edge(m, g) for m in model_set for g in phi_y_set):
+        if not any(graph.has_edge(m, g) for m in model_set for g in phi_y_set):
             # Fallback: add the closest free node adjacent to phi[y]
             for gy in phi[y]:
-                for nb in target.neighbors(gy):
+                for nb in graph.neighbors(gy):
                     if nb not in occupied:
                         model_set.add(nb)
                         break
@@ -192,7 +179,9 @@ def build_model[G, H](
     return list(model_set)
 
 
-def path_stopping_at(paths, target, stop_set):
+def path_stopping_at[G](
+    paths: Dict[G, List[G]], target: G, stop_set: FrozenSet[G]
+) -> List[G]:
     """
     From `paths[target]`, extract the tail starting at `target`
     going backward toward the source,
@@ -203,16 +192,45 @@ def path_stopping_at(paths, target, stop_set):
     the phi[y] boundary — without including any phi[y] node.
     """
     full_path = paths.get(target, [target])
-    result = []
-    for node in reversed(full_path):
-        if node in stop_set:
-            break
-        result.append(node)
-    return result
+    return list(itertools.takewhile(lambda n: n not in stop_set, reversed(full_path)))
+
+
+def is_valid_embedding(source: nx.Graph, target: nx.Graph, phi) -> bool:
+    """
+    Check all three minor-embedding conditions:
+
+    1. Every source node has a non-empty, connected vertex-model in target.
+    2. Vertex-models are pairwise disjoint.
+    3. Every source edge (u, v) has at least one target edge between phi[u]
+       and phi[v].
+    """
+    if phi is None:
+        return False
+
+    # Condition 1 – non-empty and connected vertex models
+    for h in source.nodes:
+        model = phi[h]
+        if not model:
+            return False
+        if len(model) > 1 and not nx.is_connected(target.subgraph(model)):
+            return False
+
+    # Condition 2 – disjoint
+    all_nodes = [g for model in phi.values() for g in model]
+    if len(all_nodes) != len(set(all_nodes)):
+        return False
+
+    # Condition 3 – edge coverage
+    for u, v in source.edges:
+        if not any(target.has_edge(gu, gv) for gu in phi[u] for gv in phi[v]):
+            return False
+
+    return True
 
 
 __all__ = [
     "Model",
     "build_model",
     "find_embedding",
+    "is_valid_embedding",
 ]

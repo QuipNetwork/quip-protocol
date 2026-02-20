@@ -11,40 +11,7 @@ import random
 
 import networkx as nx
 
-from topo_alloc.minor_alloc import build_model, find_embedding
-
-
-def is_valid_embedding(source: nx.Graph, target: nx.Graph, phi) -> bool:
-    """
-    Check all three minor-embedding conditions:
-
-    1. Every source node has a non-empty, connected vertex-model in target.
-    2. Vertex-models are pairwise disjoint.
-    3. Every source edge (u, v) has at least one target edge between phi[u]
-       and phi[v].
-    """
-    if phi is None:
-        return False
-
-    # Condition 1 – non-empty and connected vertex models
-    for h in source.nodes:
-        model = phi[h]
-        if not model:
-            return False
-        if len(model) > 1 and not nx.is_connected(target.subgraph(model)):
-            return False
-
-    # Condition 2 – disjoint
-    all_nodes = [g for model in phi.values() for g in model]
-    if len(all_nodes) != len(set(all_nodes)):
-        return False
-
-    # Condition 3 – edge coverage
-    for u, v in source.edges:
-        if not any(target.has_edge(gu, gv) for gu in phi[u] for gv in phi[v]):
-            return False
-
-    return True
+from topo_alloc.minor_alloc import build_model, find_embedding, is_valid_embedding
 
 
 def seeded_rng(seed: int):
