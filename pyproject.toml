@@ -7,7 +7,7 @@ name = "quip-protocol"
 version = "0.0.1"
 description = "Quantum Proof-of-Work Blockchain Implementation"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 # Base dependencies required for all modes
 dependencies = [
     "dwave-ocean-sdk>=6.0.0",
