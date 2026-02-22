@@ -9,7 +9,7 @@ perform proper allocations.
 import itertools
 import random as rng
 from collections import defaultdict
-from typing import Callable, Dict, FrozenSet, List, Optional, Set
+from typing import Callable, Dict, FrozenSet, List, Optional
 
 import networkx as nx
 
@@ -121,7 +121,7 @@ def build_model[G, H](
         return [free[0]] if free else [next(iter(graph.nodes))]
 
     # Run Dijkstra's algorithm from multiple sources from v-models.
-    def weight(_u, v, _data):
+    def weight(_u: G, v: G, _data):
         return 1.0 + overlap_penalty * (1.0 if v in occupied else 0.0)
 
     dist_from = {}
@@ -143,7 +143,15 @@ def build_model[G, H](
         if cost < best_cost:
             best_root, best_cost = g, cost
 
-    if best_root is None or best_cost == float("+inf"):
+    if best_root is None or best_cost == float("inf"):
+        # Fallback: allow root from occupied nodes (should rarely happen)
+        for g in graph.nodes:
+            cost = sum(dist_from[y].get(g, float("inf")) for y in placed_neighbours)
+            if cost < best_cost:
+                best_cost, best_root = cost, g
+
+    # Worst case: we couldn't pick any root, so we fail.
+    if best_root is None or best_cost == float("inf"):
         return None
 
     # Grow Steiner tree: trace paths from root toward each neighbour,
