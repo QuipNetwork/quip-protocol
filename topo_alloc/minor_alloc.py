@@ -6,15 +6,15 @@ The whole allocator uses minor-embedding approach to
 perform proper allocations.
 """
 
+from __future__ import annotations
 import itertools
 import random as rng
 from collections import defaultdict
-from typing import Callable, Dict, FrozenSet, List, Optional
+from typing import Callable
 
 import networkx as nx
 
-type Model[G, H] = Dict[H, FrozenSet[G]]
-
+type Model[G, H] = dict[H, frozenset[G]]
 
 def find_embedding[G, H](
     source: nx.Graph[H],
@@ -25,14 +25,14 @@ def find_embedding[G, H](
     tries: int = 30,
     refinment_constant: int = 20,
     overlap_penalty: float = 2.0,
-) -> Optional[Model[G, H]]:
+) -> Model[G, H] | None:
     """
     Finds a graph embedding of `source` as a minor of `target`.
 
     # Parameters
-    `source: nx.Graph[H]`
+    `source: nx.Graph[G]`
         The graph to be embedded into `target`.
-    `target: nx.Graph[G]`
+    `target: nx.Graph[H]`
         The graph that reassembles the hardware topology.
     `rng_factory: Callable[[], rng.Random]`
         The pseudo-random number generator factory. By default
@@ -62,7 +62,7 @@ def find_embedding[G, H](
         # Stage 1 - initialize model with greedy placement in a random vertex order
         # --------------------------------
         order = list(src_nodes)
-        phi = {x: [] for x in order}
+        phi: dict[H, list[G]] = {x: [] for x in order}
         rng.shuffle(order)
         for x in order:
             model = build_model(x, src_adj, phi, target, overlap_penalty)
@@ -75,7 +75,7 @@ def find_embedding[G, H](
         # --------------------------------
         for _ in range(refine_rounds):
             # Sum up all overlaps
-            counters = defaultdict(int)
+            counters: defaultdict[G, int] = defaultdict(int)
             for model in phi.values():
                 for g in model:
                     counters[g] += 1
@@ -104,16 +104,16 @@ def find_embedding[G, H](
 
 def build_model[G, H](
     x: H,
-    adjlist: Dict[H, List[H]],
-    phi: Dict[H, List[G]],
+    adjlist: dict[H, list[H]],
+    phi: dict[H, list[G]],
     graph: nx.Graph[G],
     overlap_penalty: float,
-) -> Optional[List[G]]:
+) -> list[G] | None:
     # Get already placed neighbours to x
     placed_neighbours = [y for y in adjlist[x] if phi[y]]
 
     # Find any other nodes than x in y-models
-    occupied = set().union(*(set(model) for y, model in phi.items() if y != x))
+    occupied: set[G] = set().union(*(set(model) for y, model in phi.items() if y != x))
 
     # If there is no placed neighbour, just pick any free node.
     if not placed_neighbours:
@@ -121,7 +121,7 @@ def build_model[G, H](
         return [free[0]] if free else [next(iter(graph.nodes))]
 
     # Run Dijkstra's algorithm from multiple sources from v-models.
-    def weight(_u: G, v: G, _data):
+    def weight(_u: G, v: G, _data) -> float:
         return 1.0 + overlap_penalty * (1.0 if v in occupied else 0.0)
 
     dist_from = {}
@@ -188,8 +188,8 @@ def build_model[G, H](
 
 
 def path_stopping_at[G](
-    paths: Dict[G, List[G]], target: G, stop_set: FrozenSet[G]
-) -> List[G]:
+    paths: dict[G, list[G]], target: G, stop_set: frozenset[G]
+) -> list[G]:
     """
     From `paths[target]`, extract the tail starting at `target`
     going backward toward the source,
@@ -203,7 +203,7 @@ def path_stopping_at[G](
     return list(itertools.takewhile(lambda n: n not in stop_set, reversed(full_path)))
 
 
-def is_valid_embedding(source: nx.Graph, target: nx.Graph, phi) -> bool:
+def is_valid_embedding[G, H](source: nx.Graph[H], target: nx.Graph[G], phi: dict[H, frozenset[G]] | None) -> bool:
     """
     Check all three minor-embedding conditions:
 

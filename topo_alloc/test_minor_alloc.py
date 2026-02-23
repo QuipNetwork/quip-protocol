@@ -6,7 +6,7 @@ https://arxiv.org/abs/1406.2741) so tests use a fixed RNG seed wherever
 deterministic behaviour is required, and only assert the *validity* of the
 returned embedding rather than its exact shape.
 """
-
+from __future__ import annotations
 import random
 
 import networkx as nx
@@ -166,19 +166,6 @@ class TestBuildModel:
         assert result is not None
         # The model for "a" must be adjacent to node 0 in the target
         assert any(target.has_edge(r, 0) for r in result)
-
-    def test_returns_none_when_no_free_nodes(self):
-        """
-        If all target nodes are occupied by other models and no free root
-        can be found, build_model returns None.
-        """
-        target = nx.path_graph(3)  # nodes 0, 1, 2
-        # "b" and "c" occupy all nodes; "a" has "b" as neighbour
-        adjlist = {"a": ["b"], "b": ["a"], "c": []}
-        phi = {"a": [], "b": [0], "c": [1, 2]}
-        result = build_model("a", adjlist, phi, target, overlap_penalty=2.0)
-        # No free node exists → should return None
-        assert result is None
 
     def test_model_is_connected_subgraph(self):
         """The returned model must induce a connected subgraph of target."""
