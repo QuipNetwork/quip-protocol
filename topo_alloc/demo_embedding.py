@@ -64,8 +64,12 @@ from pathlib import Path
 
 import networkx as nx
 
-from topo_alloc.graphviz_render import render_embedding
-from topo_alloc.minor_alloc import find_embedding, is_valid_embedding
+from topo_alloc.graphviz_render import (
+    embedding_stats,
+    format_stats_table,
+    render_embedding,
+)
+from topo_alloc.minor_alloc import find_embedding
 
 # ---------------------------------------------------------------------------
 # Ising-model graph definitions
@@ -138,33 +142,6 @@ def pegasus_small() -> nx.Graph:
 
 
 # ---------------------------------------------------------------------------
-# Embedding statistics
-# ---------------------------------------------------------------------------
-
-
-def chain_lengths(embedding: dict) -> dict:
-    return {k: len(v) for k, v in embedding.items()}
-
-
-def report(
-    name: str, source: nx.Graph, target: nx.Graph, embedding: dict | None
-) -> None:
-    if embedding is None:
-        print(f"  [{name}]  FAILED — no embedding found")
-        return
-
-    valid = is_valid_embedding(source, target, embedding)
-    chains = chain_lengths(embedding)
-    avg = sum(chains.values()) / len(chains)
-    mx = max(chains.values())
-    print(
-        f"  [{name}]  valid={valid}  "
-        f"nodes used={sum(chains.values())}  "
-        f"avg_chain={avg:.2f}  max_chain={mx}"
-    )
-
-
-# ---------------------------------------------------------------------------
 # Main demo
 # ---------------------------------------------------------------------------
 
@@ -216,16 +193,18 @@ def main() -> None:
             overlap_penalty=2.0,
         )
 
-        report(label, source, target, embedding)
+        if embedding is None:
+            print("  FAILED — no embedding found")
+            continue
 
-        if embedding is not None:
-            title = (
-                f"{label}\\nsource nodes: {n_src}  target: {topo_name} ({n_tgt} nodes)"
-            )
-            dot = render_embedding(target, embedding, title=title)
-            out_path = OUT_DIR / f"demo_{label}.dot"
-            dot.save(str(out_path))
-            print(f"    DOT written → {out_path}")
+        stats = embedding_stats(embedding)
+        print(format_stats_table(stats))
+
+        title = f"{label}\\nsource nodes: {n_src}  target: {topo_name} ({n_tgt} nodes)"
+        dot = render_embedding(target, embedding, title=title)
+        out_path = OUT_DIR / f"demo_{label}.dot"
+        dot.save(str(out_path))
+        print(f"    DOT written → {out_path}")
 
     print("\n" + "=" * 70)
     print("Done.  Render with:  dot -Tsvg demo_<name>.dot -o demo_<name>.svg")

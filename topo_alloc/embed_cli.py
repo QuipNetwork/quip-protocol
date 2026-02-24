@@ -16,7 +16,7 @@ import click
 import networkx as nx
 from networkx.readwrite import json_graph
 
-from topo_alloc.graphviz_render import render_embedding
+from topo_alloc.graphviz_render import embedding_stats, format_stats_table, render_embedding
 from topo_alloc.minor_alloc import find_embedding
 
 
@@ -128,6 +128,8 @@ def main(
     if embedding is None:
         click.echo("No embedding found.", err=True)
         sys.exit(1)
+
+    click.echo(format_stats_table(embedding_stats(embedding)), err=True)
 
     result = {str(k): sorted(v) for k, v in embedding.items()}
     serialized = json.dumps(result, indent=2)

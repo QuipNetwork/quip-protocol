@@ -1,10 +1,12 @@
 """
-Graphviz visualisation for minor-embeddings.
+Graphviz visualisation and statistics for minor-embeddings.
 
 Shared between embed_cli and demo_embedding.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import graphviz as gv
 import networkx as nx
@@ -36,9 +38,11 @@ def render_embedding(
     Nodes are coloured by the source-node cluster they belong to and laid out
     according to the target graph's own edge structure — no ``cluster_``
     subgraphs are used, so Graphviz does not relocate or group nodes spatially.
-    Cross-model edges (witnessing source edges) are drawn bold in red;
-    intra-model and unassigned edges are thin grey.  Unassigned target nodes
-    are rendered in light grey.
+    Edge styles by category:
+    - intra-cluster (chain edges): black, bold
+    - cross-cluster (witness source edges): red, bold
+    - unassigned: thin grey
+    Unassigned target nodes are rendered in light grey.
 
     Parameters
     ----------
@@ -105,11 +109,97 @@ def render_embedding(
         src_u = node_to_src.get(u)
         src_v = node_to_src.get(v)
         if src_u is not None and src_v is not None and src_u != src_v:
+            # Cross-cluster edge: witnesses a source edge
             dot.edge(str(u), str(v), penwidth="2.5", style="bold", color="#cc0000")
+        elif src_u is not None and src_u == src_v:
+            # Intra-cluster edge: chain edge within a vertex-model
+            dot.edge(str(u), str(v), penwidth="2.5", color="#000000")
         else:
             dot.edge(str(u), str(v), color="#aaaaaa")
 
     return dot
 
 
-__all__ = ["COLOURS", "render_embedding"]
+@dataclass
+class EmbeddingStats:
+    """Summary statistics for a minor-embedding."""
+
+    num_source_nodes: int
+    nodes_used: int          # total physical nodes across all chains
+    chain_min: int
+    chain_max: int
+    chain_avg: float
+    cluster_min: int         # same values, named for source-node perspective
+    cluster_max: int
+    cluster_avg: float
+
+
+def embedding_stats(embedding: dict) -> EmbeddingStats:
+    """
+    Compute summary statistics for a minor-embedding.
+
+    Parameters
+    ----------
+    embedding:
+        Mapping from source node to the collection of target nodes that form
+        its vertex-model.
+
+    Returns
+    -------
+    An ``EmbeddingStats`` dataclass.
+    """
+    chains = [len(model) for model in embedding.values()]
+    n = len(chains)
+    total = sum(chains)
+    return EmbeddingStats(
+        num_source_nodes=n,
+        nodes_used=total,
+        chain_min=min(chains),
+        chain_max=max(chains),
+        chain_avg=total / n,
+        cluster_min=min(chains),
+        cluster_max=max(chains),
+        cluster_avg=total / n,
+    )
+
+
+def format_stats_table(stats: EmbeddingStats) -> str:
+    """
+    Format an ``EmbeddingStats`` as a compact plain-text table.
+
+    Example output::
+
+        ┌─────────────────────┬───────┐
+        │ source nodes        │     5 │
+        │ physical nodes used │     8 │
+        ├─────────────────────┼───────┤
+        │ chain length  min   │     1 │
+        │               max   │     2 │
+        │               avg   │  1.60 │
+        └─────────────────────┴───────┘
+    """
+    rows = [
+        ("source nodes",        f"{stats.num_source_nodes:>5}"),
+        ("physical nodes used", f"{stats.nodes_used:>5}"),
+        None,  # separator
+        ("chain length  min",   f"{stats.chain_min:>5}"),
+        ("              max",   f"{stats.chain_max:>5}"),
+        ("              avg",   f"{stats.chain_avg:>5.2f}"),
+    ]
+    col1 = max(len(r[0]) for r in rows if r is not None)
+    col2 = max(len(r[1]) for r in rows if r is not None)
+    h_top = f"┌{'─' * (col1 + 2)}┬{'─' * (col2 + 2)}┐"
+    h_sep = f"├{'─' * (col1 + 2)}┼{'─' * (col2 + 2)}┤"
+    h_bot = f"└{'─' * (col1 + 2)}┴{'─' * (col2 + 2)}┘"
+    lines = [h_top]
+    for row in rows:
+        if row is None:
+            lines.append(h_sep)
+        else:
+            label, value = row
+            lines.append(f"│ {label:<{col1}} │ {value:>{col2}} │")
+    lines.append(h_bot)
+    return "\n".join(lines)
+
+
+__all__ = ["COLOURS", "EmbeddingStats", "embedding_stats", "format_stats_table", "render_embedding"]
