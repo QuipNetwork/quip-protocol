@@ -21,6 +21,7 @@ dependencies = [
     "aioquic>=1.3.0",
     "cryptography>=42.0.0",
     "networkx>=3.6.1",
+    "graphviz>=0.21",
 ]
 
 [project.optional-dependencies]
