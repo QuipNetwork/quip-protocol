@@ -67,7 +67,6 @@ import networkx as nx
 from topo_alloc.graphviz_render import render_embedding
 from topo_alloc.minor_alloc import find_embedding, is_valid_embedding
 
-
 # ---------------------------------------------------------------------------
 # Ising-model graph definitions
 # ---------------------------------------------------------------------------
@@ -202,7 +201,6 @@ def main() -> None:
     print("=" * 70)
 
     for label, source, topo_name, target in CASES:
-        src_name = source.__class__.__name__
         n_src = source.number_of_nodes()
         n_tgt = target.number_of_nodes()
         print(
