@@ -7,6 +7,7 @@ perform proper allocations.
 """
 
 from __future__ import annotations
+
 import itertools
 import random as rng
 from collections import defaultdict
@@ -15,6 +16,7 @@ from typing import Callable
 import networkx as nx
 
 type Model[G, H] = dict[H, frozenset[G]]
+
 
 def find_embedding[G, H](
     source: nx.Graph[H],
@@ -30,20 +32,20 @@ def find_embedding[G, H](
     Finds a graph embedding of `source` as a minor of `target`.
 
     # Parameters
-    `source: nx.Graph[G]`
+    source: nx.Graph[H]
         The graph to be embedded into `target`.
-    `target: nx.Graph[H]`
+    target: nx.Graph[G]
         The graph that reassembles the hardware topology.
-    `rng_factory: Callable[[], rng.Random]`
+    rng_factory: Callable[[], rng.Random]
         The pseudo-random number generator factory. By default
         returns `rng.Random()`.
-    `tries: int`
+    tries: int
         The number of retries when the heuristic algorithm fails
         to find non-overlapping mapping.
-    `refinment_constant: int`
+    refinment_constant: int
         The constant `k` which sets the number of refinment iterations
         to `k * |V(H)|`.
-    `overlap_penalty: float`
+    overlap_penalty: float
         The weight given to an edge that leads towards a node belonging
         to different vertex model.
 
@@ -203,7 +205,9 @@ def path_stopping_at[G](
     return list(itertools.takewhile(lambda n: n not in stop_set, reversed(full_path)))
 
 
-def is_valid_embedding[G, H](source: nx.Graph[H], target: nx.Graph[G], phi: dict[H, frozenset[G]] | None) -> bool:
+def is_valid_embedding[G, H](
+    source: nx.Graph[H], target: nx.Graph[G], phi: dict[H, frozenset[G]] | None
+) -> bool:
     """
     Check all three minor-embedding conditions:
 
