@@ -67,7 +67,7 @@ quip-network-simulator = "quip_cli:network_simulator_main"
 py-modules = ["quip_cli"]
 
 [tool.setuptools.packages.find]
-include = ["shared*", "dwave_topologies*", "CPU*", "GPU*", "QPU*"]
+include = ["shared*", "dwave_topologies*", "topo_alloc*", "CPU*", "GPU*", "QPU*"]
 
 [tool.setuptools.package-data]
 dwave_topologies = ["topologies/*.json.gz", "embeddings/*.json.gz"]

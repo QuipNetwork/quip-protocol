@@ -33,11 +33,12 @@ def render_embedding(
     """
     Build a graphviz.Graph visualising a minor-embedding on the target graph.
 
-    Each target node is drawn inside a cluster subgraph corresponding to the
-    source node whose vertex-model it belongs to.  Cross-model edges (which
-    witness source edges) are drawn bold in red; intra-model and background
-    edges are thin grey.  Unassigned target nodes are placed in an invisible
-    background subgraph.
+    Nodes are coloured by the source-node cluster they belong to and laid out
+    according to the target graph's own edge structure — no ``cluster_``
+    subgraphs are used, so Graphviz does not relocate or group nodes spatially.
+    Cross-model edges (witnessing source edges) are drawn bold in red;
+    intra-model and unassigned edges are thin grey.  Unassigned target nodes
+    are rendered in light grey.
 
     Parameters
     ----------
@@ -80,27 +81,19 @@ def render_embedding(
         edge_attr={"penwidth": "1.0"},
     )
 
-    # One cluster subgraph per source node
-    for i, src_node in enumerate(src_nodes):
-        colour = colour_of[src_node]
-        with dot.subgraph(name=f"cluster_{i}") as sub:  # pyright: ignore[reportOptionalContextManager]
-            sub.attr(
-                label=str(src_node),
-                style="filled",
-                fillcolor=f"{colour}22",
-                color=colour,
-                penwidth="2",
+    # Emit every target node coloured by its cluster membership.
+    for g in target.nodes:
+        src = node_to_src.get(g)
+        if src is not None:
+            colour = colour_of[src]
+            dot.node(
+                str(g),
+                fillcolor=colour,
+                fontcolor="white",
+                tooltip=str(src),
             )
-            for g in sorted(embedding[src_node], key=str):
-                sub.node(str(g), fillcolor=colour, fontcolor="white")
-
-    # Unassigned target nodes
-    unassigned = [g for g in target.nodes if g not in node_to_src]
-    if unassigned:
-        with dot.subgraph(name="cluster_unassigned") as sub:  # pyright: ignore[reportOptionalContextManager]
-            sub.attr(label="", style="invis")
-            for g in sorted(unassigned, key=str):
-                sub.node(str(g), fillcolor="#dddddd", fontcolor="#888888")
+        else:
+            dot.node(str(g), fillcolor="#dddddd", fontcolor="#888888")
 
     # Edges
     seen: set[frozenset] = set()
