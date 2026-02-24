@@ -13,26 +13,11 @@ import json
 import sys
 
 import click
-import graphviz as gv
 import networkx as nx
 from networkx.readwrite import json_graph
 
+from topo_alloc.graphviz_render import render_embedding
 from topo_alloc.minor_alloc import find_embedding
-
-# Palette for vertex-model colouring in the graphviz render.
-# Cycles through these when there are more source nodes than colours.
-_COLOURS = [
-    "#4e79a7",
-    "#f28e2b",
-    "#e15759",
-    "#76b7b2",
-    "#59a14f",
-    "#edc948",
-    "#b07aa1",
-    "#ff9da7",
-    "#9c755f",
-    "#bab0ac",
-]
 
 
 def _load_graph(path: str) -> nx.Graph:
@@ -48,74 +33,6 @@ def _load_graph(path: str) -> nx.Graph:
         f"Unrecognised graph format in '{path}'. "
         "Expected node-link (keys: nodes, links) or adjacency (keys: nodes, adjacency) JSON."
     )
-
-
-def _render_graphviz(
-    target: nx.Graph,
-    embedding: dict,  # source_node -> frozenset[target_node]
-) -> gv.Graph:
-    """
-    Build a graphviz.Graph visualising the embedding on the target graph.
-
-    Each target node is drawn inside a cluster subgraph corresponding to the
-    source node whose vertex-model it belongs to.  Target edges that connect
-    two different vertex-models are drawn bold (they witness source edges);
-    intra-model and background edges are thin.  Unassigned target nodes are
-    placed in a grey background subgraph.
-    """
-    # Build reverse map: target_node -> source_node
-    node_to_src: dict = {}
-    for src_node, model in embedding.items():
-        for g in model:
-            node_to_src[g] = src_node
-
-    src_nodes = list(embedding.keys())
-    colour_of = {s: _COLOURS[i % len(_COLOURS)] for i, s in enumerate(src_nodes)}
-
-    dot = gv.Graph(
-        "embedding",
-        graph_attr={"bgcolor": "white"},
-        node_attr={"style": "filled", "fontname": "Helvetica"},
-        edge_attr={"penwidth": "1.0"},
-    )
-
-    # One cluster subgraph per source node
-    for i, src_node in enumerate(src_nodes):
-        colour = colour_of[src_node]
-        with dot.subgraph(name=f"cluster_{i}") as sub:  # pyright: ignore[reportOptionalContextManager]
-            sub.attr(
-                label=str(src_node),
-                style="filled",
-                fillcolor=f"{colour}22",
-                color=colour,
-                penwidth="2",
-            )
-            for g in sorted(embedding[src_node], key=str):
-                sub.node(str(g), fillcolor=colour, fontcolor="white")
-
-    # Unassigned target nodes
-    unassigned = [g for g in target.nodes if g not in node_to_src]
-    if unassigned:
-        with dot.subgraph(name="cluster_unassigned") as sub:  # pyright: ignore[reportOptionalContextManager]
-            sub.attr(label="", style="invis")
-            for g in sorted(unassigned, key=str):
-                sub.node(str(g), fillcolor="#dddddd")
-
-    # Edges
-    seen: set[frozenset] = set()
-    for u, v in target.edges:
-        key = frozenset([u, v])
-        if key in seen:
-            continue
-        seen.add(key)
-        src_u = node_to_src.get(u)
-        src_v = node_to_src.get(v)
-        if src_u is not None and src_v is not None and src_u != src_v:
-            dot.edge(str(u), str(v), penwidth="2.5", style="bold")
-        else:
-            dot.edge(str(u), str(v))
-
-    return dot
 
 
 @click.command()
@@ -223,7 +140,7 @@ def main(
         click.echo(f"Embedding written to {output}", err=True)
 
     if graphviz is not None:
-        dot = _render_graphviz(target_graph, embedding)
+        dot = render_embedding(target_graph, embedding)
         if graphviz == "-":
             click.echo(dot.source)
         else:
