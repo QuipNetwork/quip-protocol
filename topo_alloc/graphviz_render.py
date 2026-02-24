@@ -27,6 +27,33 @@ COLOURS = [
 ]
 
 
+def _stats_html_label(title: str, stats: EmbeddingStats) -> str:
+    """
+    Build a Graphviz HTML-like label combining an optional title with a stats
+    table.  The returned string starts with ``<`` and ends with ``>`` so the
+    graphviz library passes it through as an HTML label without escaping.
+    """
+    title_row = (
+        f'<TR><TD COLSPAN="2" ALIGN="CENTER"><B>{title}</B></TD></TR>'
+        if title
+        else ""
+    )
+    def row(label: str, value: str) -> str:
+        return f'<TR><TD ALIGN="LEFT">{label}</TD><TD ALIGN="RIGHT">{value}</TD></TR>'
+
+    sep = '<TR><TD COLSPAN="2" BORDER="0"> </TD></TR>'
+    inner = "".join([
+        title_row,
+        row("source nodes", str(stats.num_source_nodes)),
+        row("physical nodes used", str(stats.nodes_used)),
+        sep,
+        row("chain min", str(stats.chain_min)),
+        row("chain max", str(stats.chain_max)),
+        row("chain avg", f"{stats.chain_avg:.2f}"),
+    ])
+    return f'<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">{inner}</TABLE>>'
+
+
 def render_embedding(
     target: nx.Graph,
     embedding: dict,  # source_node -> frozenset | set | list of target nodes
@@ -67,13 +94,13 @@ def render_embedding(
     src_nodes = list(embedding.keys())
     colour_of = {s: COLOURS[i % len(COLOURS)] for i, s in enumerate(src_nodes)}
 
+    stats = embedding_stats(embedding)
     dot = gv.Graph(
         "embedding",
         graph_attr={
             "bgcolor": "white",
-            "label": title,
+            "label": _stats_html_label(title, stats),
             "labelloc": "t",
-            "fontsize": "14",
             "fontname": "Helvetica",
         },
         node_attr={
