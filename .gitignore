@@ -25,6 +25,7 @@ uv.lock
 results/
 quip_protocol.egg-info/
 .quip/
+*.dot
 
 # Test results and data files
 test_results/
