@@ -38,6 +38,7 @@ from .covering import (
     try_hierarchical_partition,
 )
 from .validation import verify_spanning_trees
+from .series_parallel import compute_sp_tutte_if_applicable
 
 
 # =============================================================================
@@ -603,80 +604,6 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             fringe_edges=0
         )
 
-    def _try_fast_inter_cell(
-        self,
-        graph: Graph,
-        partition: List[Set[int]],
-        inter_info: InterCellInfo
-    ) -> Optional[TuttePolynomial]:
-        """Try to compute inter-cell polynomial quickly.
-
-        Returns polynomial if pattern recognized, None otherwise.
-        Works for:
-        - Small inter-cell graphs (≤ 50 edges): use spanning tree expansion
-        - Disconnected inter-cell graphs: compute components separately
-        - Cached results: reuse for common structures
-
-        Args:
-            graph: Full graph
-            partition: List of node sets (one per cell)
-            inter_info: Information about inter-cell edges
-
-        Returns:
-            TuttePolynomial for inter-cell structure, or None if not feasible
-        """
-        if not inter_info.edges:
-            return TuttePolynomial.one()
-
-        # Build the inter-cell graph
-        inter_graph = self._build_inter_cell_graph(graph, partition, inter_info)
-
-        # Check cache by canonical key
-        cache_key = inter_graph.canonical_key()
-        if cache_key in self._inter_cell_cache:
-            self._log(f"Inter-cell cache hit: {cache_key[:16]}...")
-            return self._inter_cell_cache[cache_key]
-
-        # For small graphs, compute directly via spanning tree expansion
-        # The threshold is based on the number of chords, not total edges.
-        # Spanning tree has n-1 edges, so chords = edges - (n-1)
-        n_nodes = inter_graph.node_count()
-        n_edges = inter_graph.edge_count()
-        components = inter_graph.connected_components()
-        n_components = len(components)
-        n_spanning_tree_edges = n_nodes - n_components
-        n_chords = n_edges - n_spanning_tree_edges
-
-        # If inter-cell graph is disconnected, process components separately
-        # This is crucial for Z(1,2) which has 2 disconnected inter-cell components
-        if n_components > 1:
-            self._log(f"Inter-cell: {n_components} disconnected components")
-            poly = TuttePolynomial.one()
-            for i, comp in enumerate(components):
-                comp_chords = comp.edge_count() - (comp.node_count() - 1)
-                self._log(f"  Component {i}: {comp.node_count()} nodes, {comp.edge_count()} edges, {comp_chords} chords")
-                comp_result = self.synthesize(comp, max_depth=5)
-                poly = poly * comp_result.polynomial
-            self._inter_cell_cache[cache_key] = poly
-            return poly
-
-        # Fast path: ≤ 15 chord additions (each chord addition is one multigraph synthesis)
-        if n_chords <= 15:
-            self._log(f"Inter-cell: {n_edges} edges, {n_chords} chords - using fast synthesis")
-            result = self._synthesize_from_k2(inter_graph, max_depth=5)
-            self._inter_cell_cache[cache_key] = result.polynomial
-            return result.polynomial
-
-        # Also allow if total edges is small enough
-        if n_edges <= 25:
-            self._log(f"Inter-cell: {n_edges} edges - using direct synthesis")
-            result = self._synthesize_from_k2(inter_graph, max_depth=5)
-            self._inter_cell_cache[cache_key] = result.polynomial
-            return result.polynomial
-
-        self._log(f"Inter-cell: {n_edges} edges, {n_chords} chords - too complex for fast path")
-        return None
-
     def _build_inter_cell_graph(
         self,
         graph: Graph,
@@ -719,18 +646,12 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         inter_info: InterCellInfo,
         cell: MinorEntry
     ) -> TuttePolynomial:
-        """Add inter-cell edges by processing disconnected components separately.
+        """Add inter-cell edges using component-based bridge/chord processing.
 
-        Key insight: The inter-cell graph often has multiple disconnected
-        components (e.g., Z(1,2) has 2 components of 16 edges each). Each
-        component connects the same k cells but via different nodes.
-
-        By processing each component separately:
-        1. Each component contributes 1 bridge (first edge connecting cells)
-        2. Remaining edges in that component are chords
-        3. Chords within one component don't interact with other components
-
-        This reduces the problem size significantly.
+        Strategy:
+        1. Build the inter-cell graph and find connected components
+        2. For each component, identify bridge edge and chord edges
+        3. Apply bridge (multiply by x) then process chords edge-by-edge
 
         Args:
             base_poly: T(cell)^k polynomial
@@ -758,53 +679,83 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
 
         poly = base_poly
 
-        # Process each inter-cell component separately
+        # Process each inter-cell component
         for comp_idx, comp in enumerate(inter_components):
-            comp_edges = list(comp.edges)
             self._log(f"  Component {comp_idx}: {comp.node_count()} nodes, {comp.edge_count()} edges")
+            poly = self._process_inter_cell_component(
+                poly, comp, graph, partition, node_to_cell, k, comp_idx
+            )
 
-            # Within this component, identify the bridge (first edge connecting different cells)
-            # and chords (remaining edges)
-            bridge_edge = None
-            chord_edges = []
+        return poly
 
-            # Track which cells are connected within this component's processing
-            cell_connected = [False] * k
+    def _process_inter_cell_component(
+        self,
+        base_poly: TuttePolynomial,
+        comp: Graph,
+        graph: Graph,
+        partition: List[Set[int]],
+        node_to_cell: Dict[int, int],
+        k: int,
+        comp_idx: int
+    ) -> TuttePolynomial:
+        """Process one inter-cell component via bridge/chord separation.
 
-            for u, v in comp_edges:
-                cell_u = node_to_cell.get(u, -1)
-                cell_v = node_to_cell.get(v, -1)
+        The first edge connecting previously disconnected cells is a BRIDGE
+        (multiply by x). Remaining edges are CHORDS processed edge-by-edge
+        using T(G+e) = T(G) + T(G/{u,v}).
 
-                if cell_u < 0 or cell_v < 0 or cell_u == cell_v:
-                    # Edge within same cell or invalid - treat as chord
-                    chord_edges.append((u, v))
-                    continue
+        Args:
+            base_poly: Current polynomial (cells with prior components)
+            comp: Inter-cell component to process
+            graph: Full graph
+            partition: Cell partition
+            node_to_cell: Node-to-cell mapping
+            k: Number of cells
+            comp_idx: Component index (for logging)
 
-                # First edge between unconnected cells is a bridge
-                if not cell_connected[cell_u] and not cell_connected[cell_v]:
-                    cell_connected[cell_u] = True
-                    cell_connected[cell_v] = True
-                    bridge_edge = (u, v)
-                elif cell_connected[cell_u] != cell_connected[cell_v]:
-                    # One cell connected, one not - this is a bridge
-                    cell_connected[cell_u] = True
-                    cell_connected[cell_v] = True
-                    bridge_edge = (u, v)
-                else:
-                    # Both cells already connected - this is a chord
-                    chord_edges.append((u, v))
+        Returns:
+            Updated polynomial with this component's contribution
+        """
+        comp_edges = list(comp.edges)
 
-            # Apply bridge (if any)
-            if bridge_edge is not None:
-                poly = TuttePolynomial.x() * poly
-                self._log(f"    Bridge: {bridge_edge}")
+        # Identify bridge and chord edges
+        bridge_edge = None
+        chord_edges = []
+        cell_connected = [False] * k
 
-            # Process chords for this component
-            if chord_edges:
-                self._log(f"    Chords: {len(chord_edges)}")
-                poly = self._process_component_chords(
-                    poly, graph, partition, bridge_edge, chord_edges, node_to_cell
-                )
+        for u, v in comp_edges:
+            cell_u = node_to_cell.get(u, -1)
+            cell_v = node_to_cell.get(v, -1)
+
+            if cell_u < 0 or cell_v < 0 or cell_u == cell_v:
+                chord_edges.append((u, v))
+                continue
+
+            if not cell_connected[cell_u] and not cell_connected[cell_v]:
+                cell_connected[cell_u] = True
+                cell_connected[cell_v] = True
+                bridge_edge = (u, v)
+            elif cell_connected[cell_u] != cell_connected[cell_v]:
+                cell_connected[cell_u] = True
+                cell_connected[cell_v] = True
+                bridge_edge = (u, v)
+            else:
+                chord_edges.append((u, v))
+
+        # Apply bridge
+        poly = base_poly
+        if bridge_edge is not None:
+            poly = TuttePolynomial.x() * poly
+            self._log(f"    Bridge: {bridge_edge}")
+
+        if not chord_edges:
+            return poly
+
+        # Process chords edge-by-edge
+        self._log(f"    Processing {len(chord_edges)} chords")
+        poly = self._process_component_chords(
+            poly, graph, partition, bridge_edge, chord_edges, node_to_cell
+        )
 
         return poly
 
@@ -880,199 +831,6 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             poly = poly + merged_poly
 
             # Update current multigraph
-            edge = (min(u, v), max(u, v))
-            new_edge_counts = dict(current_mg.edge_counts)
-            new_edge_counts[edge] = new_edge_counts.get(edge, 0) + 1
-            current_mg = MultiGraph(
-                nodes=current_mg.nodes,
-                edge_counts=new_edge_counts,
-                loop_counts=current_mg.loop_counts
-            )
-
-        return poly
-
-    def _apply_inter_cell_polynomial(
-        self,
-        base_poly: TuttePolynomial,
-        inter_poly: TuttePolynomial,
-        graph: Graph,
-        partition: List[Set[int]],
-        inter_info: InterCellInfo
-    ) -> TuttePolynomial:
-        """Apply inter-cell polynomial to base cell polynomial using cut-vertex optimization.
-
-        Key insight: When we contract an inter-cell edge (u,v), the merged
-        node becomes a cut vertex between the two cells. This means:
-
-        T(G/{u,v}) = T(cell1_with_merge) × T(cell2_with_merge)
-
-        Each "cell_with_merge" is a modified cell where:
-        - The node from that cell (u or v) now has extra edges from the merge
-        - If the other cell had edges to multiple nodes in this cell,
-          those become edges to the merged node
-
-        This optimization processes inter-cell edges by exploiting this
-        cut-vertex factorization, avoiding full multigraph synthesis on the
-        combined graph.
-
-        Args:
-            base_poly: T(cell)^k polynomial
-            inter_poly: Polynomial for inter-cell graph alone (computed but unused for now)
-            graph: Full graph
-            partition: List of node sets (one per cell)
-            inter_info: Information about inter-cell edges
-
-        Returns:
-            Combined polynomial
-        """
-        k = len(partition)
-
-        # Build node-to-cell mapping
-        node_to_cell: Dict[int, int] = {}
-        for i, cell_nodes in enumerate(partition):
-            for node in cell_nodes:
-                node_to_cell[node] = i
-
-        inter_edges = list(inter_info.edges)
-
-        # Separate edges into: those that connect new cells (bridges) vs others (chords)
-        cell_connected = [False] * k
-        cell_connected[0] = True
-
-        bridge_edges = []
-        chord_edges = []
-
-        for u, v in inter_edges:
-            cell_u = node_to_cell.get(u, -1)
-            cell_v = node_to_cell.get(v, -1)
-
-            if cell_u < 0 or cell_v < 0 or cell_u == cell_v:
-                chord_edges.append((u, v))
-                continue
-
-            if cell_connected[cell_u] and not cell_connected[cell_v]:
-                cell_connected[cell_v] = True
-                bridge_edges.append((u, v))
-            elif cell_connected[cell_v] and not cell_connected[cell_u]:
-                cell_connected[cell_u] = True
-                bridge_edges.append((u, v))
-            elif not cell_connected[cell_u] and not cell_connected[cell_v]:
-                cell_connected[cell_u] = True
-                cell_connected[cell_v] = True
-                bridge_edges.append((u, v))
-            else:
-                chord_edges.append((u, v))
-
-        self._log(f"Inter-cell: {len(bridge_edges)} bridges, {len(chord_edges)} chords")
-
-        # Process bridges first (fast: just multiply by x for each)
-        poly = base_poly
-        for _ in range(len(bridge_edges)):
-            poly = TuttePolynomial.x() * poly
-
-        if not chord_edges:
-            return poly
-
-        # Build multigraph with cell edges + bridge edges
-        edge_counts: Dict[Tuple[int, int], int] = {}
-        for cell_nodes in partition:
-            for u, v in graph.edges:
-                if u in cell_nodes and v in cell_nodes:
-                    edge = (min(u, v), max(u, v))
-                    edge_counts[edge] = edge_counts.get(edge, 0) + 1
-
-        for u, v in bridge_edges:
-            edge = (min(u, v), max(u, v))
-            edge_counts[edge] = edge_counts.get(edge, 0) + 1
-
-        current_mg = MultiGraph(
-            nodes=graph.nodes,
-            edge_counts=edge_counts,
-            loop_counts={}
-        )
-
-        # Add chord edges using cut-vertex-aware synthesis
-        for u, v in chord_edges:
-            # Chord: T(G+e) = T(G) + T(G/{u,v})
-            merged = current_mg.merge_nodes(u, v)
-
-            # Check if merged node is a cut vertex (usually true for inter-cell edges)
-            survivor = min(u, v)
-            cut = merged.has_cut_vertex()
-
-            if cut is not None and cut == survivor:
-                # Exploit cut vertex factorization
-                components = merged.split_at_cut_vertex(cut)
-                self._log(f"Cut-vertex optimization: {len(components)} components at node {cut}")
-                merged_poly = TuttePolynomial.one()
-                for comp in components:
-                    comp_poly = self._synthesize_multigraph(comp)
-                    merged_poly = merged_poly * comp_poly
-            else:
-                # Fall back to regular synthesis
-                merged_poly = self._synthesize_multigraph(merged)
-
-            poly = poly + merged_poly
-
-            edge = (min(u, v), max(u, v))
-            new_edge_counts = dict(current_mg.edge_counts)
-            new_edge_counts[edge] = new_edge_counts.get(edge, 0) + 1
-            current_mg = MultiGraph(
-                nodes=current_mg.nodes,
-                edge_counts=new_edge_counts,
-                loop_counts=current_mg.loop_counts
-            )
-
-        return poly
-
-    def _add_inter_cell_edges_slow(
-        self,
-        base_poly: TuttePolynomial,
-        graph: Graph,
-        partition: List[Set[int]],
-        inter_info: InterCellInfo
-    ) -> TuttePolynomial:
-        """Add inter-cell edges one-by-one (fallback method).
-
-        This is the original slow approach that adds each inter-cell edge
-        individually using the edge addition formula.
-
-        Args:
-            base_poly: T(cell)^k polynomial
-            graph: Full graph
-            partition: List of node sets (one per cell)
-            inter_info: Information about inter-cell edges
-
-        Returns:
-            Combined polynomial
-        """
-        # Build the current graph state (disjoint cells)
-        cell_edge_counts: Dict[Tuple[int, int], int] = {}
-        for cell_nodes in partition:
-            for u, v in graph.edges:
-                if u in cell_nodes and v in cell_nodes:
-                    edge = (min(u, v), max(u, v))
-                    cell_edge_counts[edge] = cell_edge_counts.get(edge, 0) + 1
-
-        current_mg = MultiGraph(
-            nodes=graph.nodes,
-            edge_counts=cell_edge_counts,
-            loop_counts={}
-        )
-
-        poly = base_poly
-
-        # Add each inter-cell edge
-        for u, v in sorted(inter_info.edges):
-            if current_mg.in_same_component(u, v):
-                # Chord: T(G+e) = T(G) + T(G/{u,v})
-                merged = current_mg.merge_nodes(u, v)
-                merged_poly = self._synthesize_multigraph(merged)
-                poly = poly + merged_poly
-            else:
-                # Bridge: T(G+e) = x × T(G)
-                poly = TuttePolynomial.x() * poly
-
             edge = (min(u, v), max(u, v))
             new_edge_counts = dict(current_mg.edge_counts)
             new_edge_counts[edge] = new_edge_counts.get(edge, 0) + 1
