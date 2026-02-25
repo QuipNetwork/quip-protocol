@@ -128,7 +128,7 @@ def test_mining_time(
                 elapsed = time.time() - start_time
                 try:
                     result = result_queue.get_nowait()
-                except:
+                except Exception:
                     result = None
         else:
             # No timeout - run directly

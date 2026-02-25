@@ -99,7 +99,7 @@ class BlockSynchronizer:
             for _ in range(num_producers):
                 try:
                     download_queue.put(None)  # Sentinel value to stop producers
-                except:
+                except Exception:
                     pass  # Queue might be full or closed
                     
             for p in producer_processes:
