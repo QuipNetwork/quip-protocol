@@ -34,23 +34,24 @@ def _stats_html_label(title: str, stats: EmbeddingStats) -> str:
     graphviz library passes it through as an HTML label without escaping.
     """
     title_row = (
-        f'<TR><TD COLSPAN="2" ALIGN="CENTER"><B>{title}</B></TD></TR>'
-        if title
-        else ""
+        f'<TR><TD COLSPAN="2" ALIGN="CENTER"><B>{title}</B></TD></TR>' if title else ""
     )
+
     def row(label: str, value: str) -> str:
         return f'<TR><TD ALIGN="LEFT">{label}</TD><TD ALIGN="RIGHT">{value}</TD></TR>'
 
     sep = '<TR><TD COLSPAN="2" BORDER="0"> </TD></TR>'
-    inner = "".join([
-        title_row,
-        row("source nodes", str(stats.num_source_nodes)),
-        row("physical nodes used", str(stats.nodes_used)),
-        sep,
-        row("chain min", str(stats.chain_min)),
-        row("chain max", str(stats.chain_max)),
-        row("chain avg", f"{stats.chain_avg:.2f}"),
-    ])
+    inner = "".join(
+        [
+            title_row,
+            row("source nodes", str(stats.num_source_nodes)),
+            row("physical nodes used", str(stats.nodes_used)),
+            sep,
+            row("chain min", str(stats.chain_min)),
+            row("chain max", str(stats.chain_max)),
+            row("chain avg", f"{stats.chain_avg:.2f}"),
+        ]
+    )
     return f'<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">{inner}</TABLE>>'
 
 
@@ -102,6 +103,7 @@ def render_embedding(
             "label": _stats_html_label(title, stats),
             "labelloc": "t",
             "fontname": "Helvetica",
+            "layout": "fdp",
         },
         node_attr={
             "style": "filled",
@@ -152,11 +154,11 @@ class EmbeddingStats:
     """Summary statistics for a minor-embedding."""
 
     num_source_nodes: int
-    nodes_used: int          # total physical nodes across all chains
+    nodes_used: int  # total physical nodes across all chains
     chain_min: int
     chain_max: int
     chain_avg: float
-    cluster_min: int         # same values, named for source-node perspective
+    cluster_min: int  # same values, named for source-node perspective
     cluster_max: int
     cluster_avg: float
 
@@ -206,12 +208,12 @@ def format_stats_table(stats: EmbeddingStats) -> str:
         └─────────────────────┴───────┘
     """
     rows = [
-        ("source nodes",        f"{stats.num_source_nodes:>5}"),
+        ("source nodes", f"{stats.num_source_nodes:>5}"),
         ("physical nodes used", f"{stats.nodes_used:>5}"),
         None,  # separator
-        ("chain length  min",   f"{stats.chain_min:>5}"),
-        ("              max",   f"{stats.chain_max:>5}"),
-        ("              avg",   f"{stats.chain_avg:>5.2f}"),
+        ("chain length  min", f"{stats.chain_min:>5}"),
+        ("              max", f"{stats.chain_max:>5}"),
+        ("              avg", f"{stats.chain_avg:>5.2f}"),
     ]
     col1 = max(len(r[0]) for r in rows if r is not None)
     col2 = max(len(r[1]) for r in rows if r is not None)
@@ -229,4 +231,10 @@ def format_stats_table(stats: EmbeddingStats) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["COLOURS", "EmbeddingStats", "embedding_stats", "format_stats_table", "render_embedding"]
+__all__ = [
+    "COLOURS",
+    "EmbeddingStats",
+    "embedding_stats",
+    "format_stats_table",
+    "render_embedding",
+]
