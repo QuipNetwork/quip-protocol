@@ -15,6 +15,10 @@ Usage examples
     python -m topo_alloc.bench_random --graph-model ba --nodes 10 --ba-m 3 \\
         --topology zephyr --topology-size 3 --samples 15 --strategy degree
 
+# Compare all three strategies (random, degree, longest_chains):
+    python -m topo_alloc.bench_random --graph-model er --nodes 8 --er-p 0.5 \\
+        --topology chimera --topology-size 4 --samples 20 --strategy all
+
 # Random trees embedded into a Pegasus topology, CSV output:
     python -m topo_alloc.bench_random --graph-model tree --nodes 12 \\
         --topology pegasus --topology-size 4 --samples 30 --strategy both --csv
@@ -112,7 +116,8 @@ def _run_sample(
     def rng_factory():
         return random.Random(seed)
 
-    order_by_degree = strategy == "degree"
+    order_by_degree = strategy in ("degree", "longest_chains")
+    refine_longest_chains = strategy == "longest_chains"
     embedding = find_embedding(
         source,
         target,
@@ -121,6 +126,7 @@ def _run_sample(
         refinment_constant=refinement_constant,
         overlap_penalty=overlap_penalty,
         order_by_degree=order_by_degree,
+        refine_longest_chains=refine_longest_chains,
     )
 
     if embedding is None:
@@ -305,14 +311,16 @@ def _write_csv(results: list[SampleResult], path: str) -> None:
 )
 @click.option(
     "--strategy",
-    type=click.Choice(["random", "degree", "both"]),
+    type=click.Choice(["random", "degree", "longest_chains", "both", "all"]),
     default="both",
     show_default=True,
     help=(
         "Ordering strategy for find_embedding.  "
         "'random' = uniform shuffle,  "
         "'degree' = descending source-degree first,  "
-        "'both' = run each strategy and compare."
+        "'longest_chains' = degree-order placement + longest-chain refinement,  "
+        "'both' = random vs degree,  "
+        "'all' = all three strategies."
     ),
 )
 @click.option(
@@ -395,7 +403,12 @@ def main(
         target = _build_target(topology, topology_size)
         topo_label = f"{topology}({topology_size})"
 
-    strategies = ["random", "degree"] if strategy == "both" else [strategy]
+    if strategy == "both":
+        strategies = ["random", "degree"]
+    elif strategy == "all":
+        strategies = ["random", "degree", "longest_chains"]
+    else:
+        strategies = [strategy]
 
     click.echo(
         f"Graph model : {graph_model.upper()}"

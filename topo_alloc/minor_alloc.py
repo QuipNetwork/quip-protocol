@@ -28,6 +28,7 @@ def find_embedding[G, H](
     refinment_constant: int = 20,
     overlap_penalty: float = 2.0,
     order_by_degree: bool = False,
+    refine_longest_chains: bool = False,
 ) -> Model[G, H] | None:
     """
     Finds a graph embedding of `source` as a minor of `target`.
@@ -55,6 +56,14 @@ def find_embedding[G, H](
         rather than a uniform random shuffle.  High-degree nodes (more
         constrained) are placed first, which can reduce chain lengths and
         improve embedding quality on structured topologies.
+    refine_longest_chains: bool
+        When True, after the overlap-removal refinement converges a second
+        refinement pass is run: the source node whose vertex-model is
+        currently longest is re-embedded, repeating for
+        `refinment_constant * |V(H)|` iterations.  Each successful
+        re-embedding is accepted only when it does not increase the chain
+        length, so the pass is strictly non-worsening.  This directly
+        targets the `nodes_used` metric.
 
     # Returns
     A `Model[G, H]` which is a dictionary from `H` nodes into
@@ -114,12 +123,59 @@ def find_embedding[G, H](
                     phi[x] = model
 
         # --------------------------------
+        # Stage 2b - longest-chain refinement (optional)
+        # --------------------------------
+        if refine_longest_chains:
+            phi = _refine_longest_chains(
+                src_nodes, src_adj, phi, target, overlap_penalty, refine_rounds
+            )
+
+        # --------------------------------
         # Stage 3 - validate the solution
         # --------------------------------
         phi_set = {x: frozenset(phi[x]) for x in src_nodes}
         if is_valid_embedding(source, target, phi_set):
             return phi_set
     return None
+
+
+def _refine_longest_chains[G, H](
+    src_nodes: list[H],
+    src_adj: dict[H, list[H]],
+    phi: dict[H, list[G]],
+    graph: nx.Graph[G],
+    overlap_penalty: float,
+    rounds: int,
+) -> dict[H, list[G]]:
+    """
+    Refinement pass that repeatedly re-embeds the source node with the
+    longest chain, accepting the new placement only when it is strictly
+    shorter (non-worsening).
+
+    This pass runs after the overlap refinement has already converged, so it
+    only operates on overlap-free embeddings and always keeps the embedding
+    valid.
+    """
+    for _ in range(rounds):
+        # Pick the source node whose chain is currently longest.
+        x = max(src_nodes, key=lambda v: len(phi[v]))
+        current_len = len(phi[x])
+
+        # Temporarily remove x from phi so build_model treats those target
+        # nodes as free.
+        old_model = phi[x]
+        phi[x] = []
+
+        candidate = build_model(x, src_adj, phi, graph, overlap_penalty)
+
+        if candidate is not None and len(candidate) < current_len:
+            # Accept: strictly shorter chain found.
+            phi[x] = candidate
+        else:
+            # Reject: restore original model.
+            phi[x] = old_model
+
+    return phi
 
 
 def _shuffle_within_degree_tiers[H](

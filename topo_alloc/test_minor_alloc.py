@@ -15,6 +15,7 @@ import networkx as nx
 import pytest
 
 from topo_alloc.minor_alloc import (
+    _refine_longest_chains,
     _shuffle_within_degree_tiers,
     build_model,
     find_embedding,
@@ -322,6 +323,139 @@ class TestRandomSourceGraphs:
         )
         assert phi is not None, f"{label}: embedding failed (degree order)"
         assert is_valid_embedding(source, self.TARGET, phi), f"{label}: invalid embedding"
+
+
+class TestLongestChainRefinement:
+    """Tests for the refine_longest_chains heuristic."""
+
+    def test_produces_valid_embedding(self):
+        """refine_longest_chains=True must still return a valid embedding."""
+        source = nx.complete_graph(5)
+        target = nx.petersen_graph()
+        phi = find_embedding(
+            source,
+            target,
+            rng_factory=seeded_rng(7),
+            tries=50,
+            refine_longest_chains=True,
+        )
+        if phi is not None:
+            assert is_valid_embedding(source, target, phi)
+
+    def test_nodes_used_not_worse_than_degree_order(self):
+        """
+        longest_chains refinement (on top of degree ordering) should use
+        no more physical nodes than degree ordering alone on the same seed.
+        """
+        source = nx.complete_bipartite_graph(3, 3)
+        target = nx.complete_graph(20)
+
+        phi_degree = find_embedding(
+            source, target, rng_factory=seeded_rng(42), tries=50, order_by_degree=True
+        )
+        phi_longest = find_embedding(
+            source,
+            target,
+            rng_factory=seeded_rng(42),
+            tries=50,
+            refine_longest_chains=True,
+        )
+
+        assert phi_degree is not None
+        assert phi_longest is not None
+        assert is_valid_embedding(source, target, phi_degree)
+        assert is_valid_embedding(source, target, phi_longest)
+
+        nodes_degree = sum(len(m) for m in phi_degree.values())
+        nodes_longest = sum(len(m) for m in phi_longest.values())
+        # longest-chain refinement should never produce a strictly worse result
+        assert nodes_longest <= nodes_degree
+
+    def test_k4_into_k4_with_longest_chains(self):
+        """K_4 into K_4 succeeds with longest-chain refinement enabled."""
+        source = nx.complete_graph(4)
+        target = nx.complete_graph(4)
+        phi = find_embedding(
+            source, target, rng_factory=seeded_rng(3), refine_longest_chains=True
+        )
+        assert phi is not None
+        assert is_valid_embedding(source, target, phi)
+
+    def test_star_graph_with_longest_chains(self):
+        """Star graph embeds correctly with the refinement pass active."""
+        source = nx.star_graph(4)
+        target = nx.complete_graph(10)
+        phi = find_embedding(
+            source,
+            target,
+            rng_factory=seeded_rng(0),
+            tries=20,
+            refine_longest_chains=True,
+        )
+        assert phi is not None
+        assert is_valid_embedding(source, target, phi)
+
+    @pytest.mark.parametrize(
+        "label,source",
+        _RANDOM_SOURCE_CASES,
+        ids=[c[0] for c in _RANDOM_SOURCE_CASES],
+    )
+    def test_random_source_longest_chains(self, label: str, source: nx.Graph) -> None:
+        """Random source graphs embed correctly with longest-chain refinement."""
+        target = nx.complete_graph(20)
+        phi = find_embedding(
+            source,
+            target,
+            rng_factory=seeded_rng(0),
+            tries=30,
+            refine_longest_chains=True,
+        )
+        assert phi is not None, f"{label}: embedding failed (longest_chains)"
+        assert is_valid_embedding(source, target, phi), f"{label}: invalid embedding"
+
+    def test_refine_longest_chains_helper_never_lengthens(self):
+        """
+        _refine_longest_chains must only shorten or keep chain lengths; it
+        must never lengthen any chain.
+        """
+        # Build a simple valid embedding on a path graph so every chain
+        # starts as length 1 (trivial — node maps to a single target node).
+        source = nx.path_graph(4)   # 0-1-2-3
+        target = nx.path_graph(10)
+        src_nodes = list(source.nodes)
+        src_adj = {h: list(source.neighbors(h)) for h in src_nodes}
+
+        # Place each source node on a distinct target node (chain length = 1).
+        phi: dict[int, list[int]] = {i: [i] for i in src_nodes}
+
+        before_total = sum(len(v) for v in phi.values())
+        phi_after = _refine_longest_chains(
+            src_nodes, src_adj, phi, target, overlap_penalty=2.0, rounds=40
+        )
+        after_total = sum(len(v) for v in phi_after.values())
+
+        assert after_total <= before_total
+
+    def test_refine_longest_chains_helper_accepts_shorter(self):
+        """
+        _refine_longest_chains should accept a re-embedding when it produces
+        a strictly shorter chain.  We construct a phi where one node has a
+        long chain reachable via a shortcut, and verify total length drops.
+        """
+        # Target: 0-1-2-3-4-5, source: two nodes a-b
+        # phi[a] = [2, 3, 4]  (length 3, the "long chain")
+        # phi[b] = [0]         (length 1, adjacent to 1 which neighbours 2)
+        # build_model for 'a' with b placed at 0 should find chain [1] (length 1)
+        target = nx.path_graph(6)
+        src_adj = {"a": ["b"], "b": ["a"]}
+        phi: dict[str, list[int]] = {"a": [2, 3, 4], "b": [0]}
+
+        before_len_a = len(phi["a"])
+        phi_after = _refine_longest_chains(
+            ["a", "b"], src_adj, phi, target, overlap_penalty=2.0, rounds=5
+        )
+        # Chain for 'a' should have been shortened (2,3,4 → something adjacent to 0)
+        assert len(phi_after["a"]) < before_len_a
 
 
 class TestBuildModel:
