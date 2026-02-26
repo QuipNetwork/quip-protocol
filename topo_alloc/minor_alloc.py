@@ -27,6 +27,7 @@ def find_embedding[G, H](
     tries: int = 30,
     refinment_constant: int = 20,
     overlap_penalty: float = 2.0,
+    order_by_degree: bool = False,
 ) -> Model[G, H] | None:
     """
     Finds a graph embedding of `source` as a minor of `target`.
@@ -48,6 +49,12 @@ def find_embedding[G, H](
     overlap_penalty: float
         The weight given to an edge that leads towards a node belonging
         to different vertex model.
+    order_by_degree: bool
+        When True, the initial source node ordering is seeded by sorting
+        nodes in descending order of their degree in the source graph,
+        rather than a uniform random shuffle.  High-degree nodes (more
+        constrained) are placed first, which can reduce chain lengths and
+        improve embedding quality on structured topologies.
 
     # Returns
     A `Model[G, H]` which is a dictionary from `H` nodes into
@@ -58,14 +65,25 @@ def find_embedding[G, H](
     rng = rng_factory()
     src_nodes = list(source.nodes)
     src_adj = {h: list(source.neighbors(h)) for h in src_nodes}
+    degree_order = None
+
+    if order_by_degree:
+        # Seed the order by descending source-graph degree so that the most
+        # constrained nodes are placed first.  Ties are broken randomly.
+        degree_order = sorted(src_nodes, key=lambda h: source.degree(h), reverse=True)
 
     for _ in range(tries):
         # --------------------------------
         # Stage 1 - initialize model with greedy placement in a random vertex order
         # --------------------------------
-        order = list(src_nodes)
+        if order_by_degree:
+            # Shuffle within each degree tier to keep randomness across tries
+            # while preserving the coarse degree ordering.
+            order = _shuffle_within_degree_tiers(degree_order, source, rng)
+        else:
+            order = list(src_nodes)
+            rng.shuffle(order)
         phi: dict[H, list[G]] = {x: [] for x in order}
-        rng.shuffle(order)
         for x in order:
             model = build_model(x, src_adj, phi, target, overlap_penalty)
             if model is None:
@@ -102,6 +120,28 @@ def find_embedding[G, H](
         if is_valid_embedding(source, target, phi_set):
             return phi_set
     return None
+
+
+def _shuffle_within_degree_tiers[H](
+    degree_order: list[H] | None,
+    source: nx.Graph[H],
+    rng_inst: rng.Random,
+) -> list[H]:
+    """
+    Return a node ordering that respects descending degree tiers but shuffles
+    nodes within each tier so successive tries explore different orderings.
+    """
+    from itertools import groupby
+
+    if degree_order is None:
+        return []
+
+    result: list[H] = []
+    for _, group in groupby(degree_order, key=lambda h: source.degree(h)):
+        tier = list(group)
+        rng_inst.shuffle(tier)
+        result.extend(tier)
+    return result
 
 
 def build_model[G, H](
