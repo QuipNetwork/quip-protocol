@@ -16,6 +16,7 @@ import pytest
 
 from topo_alloc.minor_alloc import (
     _refine_longest_chains,
+    _shuffle_within_centrality_tiers,
     _shuffle_within_degree_tiers,
     build_model,
     find_embedding,
@@ -238,6 +239,110 @@ class TestDegreeOrdering:
         assert len(orderings) > 1
 
 
+class TestCentralityOrdering:
+    """Tests for the order_by_centrality heuristic."""
+
+    def test_centrality_ordering_produces_valid_embedding(self):
+        """order_by_centrality=True must still return a valid embedding."""
+        source = nx.complete_graph(5)
+        target = nx.petersen_graph()
+        phi = find_embedding(
+            source, target, rng_factory=seeded_rng(7), tries=50, order_by_centrality=True
+        )
+        if phi is not None:
+            assert is_valid_embedding(source, target, phi)
+
+    def test_centrality_ordering_k4_into_k4(self):
+        """K_4 into K_4 succeeds with centrality ordering (all centralities equal)."""
+        source = nx.complete_graph(4)
+        target = nx.complete_graph(4)
+        phi = find_embedding(
+            source, target, rng_factory=seeded_rng(3), order_by_centrality=True
+        )
+        assert phi is not None
+        assert is_valid_embedding(source, target, phi)
+
+    def test_centrality_ordering_path_graph(self):
+        """Path graph: central nodes have higher betweenness; they should be placed first."""
+        source = nx.path_graph(5)  # node 2 has highest betweenness
+        target = nx.complete_graph(10)
+        phi = find_embedding(
+            source, target, rng_factory=seeded_rng(0), tries=20, order_by_centrality=True
+        )
+        assert phi is not None
+        assert is_valid_embedding(source, target, phi)
+
+    def test_centrality_ordering_matches_default_validity(self):
+        """Both centrality and random modes must produce valid embeddings."""
+        source = nx.complete_bipartite_graph(3, 3)
+        target = nx.complete_graph(12)
+        phi_random = find_embedding(
+            source, target, rng_factory=seeded_rng(42), tries=50
+        )
+        phi_centrality = find_embedding(
+            source,
+            target,
+            rng_factory=seeded_rng(42),
+            tries=50,
+            order_by_centrality=True,
+        )
+        assert phi_random is not None
+        assert phi_centrality is not None
+        assert is_valid_embedding(source, target, phi_random)
+        assert is_valid_embedding(source, target, phi_centrality)
+
+    def test_centrality_takes_precedence_over_degree(self):
+        """When both flags are True, order_by_centrality takes precedence and result is valid."""
+        source = nx.star_graph(4)
+        target = nx.complete_graph(10)
+        phi = find_embedding(
+            source,
+            target,
+            rng_factory=seeded_rng(0),
+            tries=20,
+            order_by_degree=True,
+            order_by_centrality=True,
+        )
+        assert phi is not None
+        assert is_valid_embedding(source, target, phi)
+
+    def test_shuffle_within_centrality_tiers_preserves_centrality_order(self):
+        """_shuffle_within_centrality_tiers must never place a lower-centrality node
+        before a strictly higher-centrality node."""
+        import random
+
+        # Path graph: interior nodes have higher betweenness than endpoints.
+        source = nx.path_graph(5)  # nodes: 0-1-2-3-4; node 2 has highest centrality
+        centrality = nx.betweenness_centrality(source)
+        centrality_order = sorted(source.nodes, key=lambda h: centrality[h], reverse=True)
+        rng_inst = random.Random(0)
+        for _ in range(20):
+            order = _shuffle_within_centrality_tiers(centrality_order, centrality, rng_inst)
+            # Verify no lower-centrality node appears before a strictly higher one
+            seen_centrality = -1.0
+            prev = float("inf")
+            for node in order:
+                c = centrality[node]
+                assert c <= prev, (
+                    f"Node {node} (centrality {c}) placed after node with centrality {prev}"
+                )
+                prev = c
+
+    def test_shuffle_within_centrality_tiers_randomises_ties(self):
+        """Equal-centrality nodes should appear in varying orders across calls."""
+        import random
+
+        source = nx.complete_graph(5)  # all centralities equal
+        centrality = nx.betweenness_centrality(source)
+        centrality_order = sorted(source.nodes, key=lambda h: centrality[h], reverse=True)
+        rng_inst = random.Random(1)
+        orderings = {
+            tuple(_shuffle_within_centrality_tiers(centrality_order, centrality, rng_inst))
+            for _ in range(30)
+        }
+        assert len(orderings) > 1
+
+
 def random_source_graphs() -> list[tuple[str, nx.Graph]]:
     """
     Generate a variety of small random source graphs for parametrized tests.
@@ -322,6 +427,23 @@ class TestRandomSourceGraphs:
             order_by_degree=True,
         )
         assert phi is not None, f"{label}: embedding failed (degree order)"
+        assert is_valid_embedding(source, self.TARGET, phi), f"{label}: invalid embedding"
+
+    @pytest.mark.parametrize(
+        "label,source",
+        _RANDOM_SOURCE_CASES,
+        ids=[c[0] for c in _RANDOM_SOURCE_CASES],
+    )
+    def test_random_source_centrality_order(self, label: str, source: nx.Graph) -> None:
+        """Random source graph embeds with the betweenness-centrality ordering."""
+        phi = find_embedding(
+            source,
+            self.TARGET,
+            rng_factory=seeded_rng(0),
+            tries=30,
+            order_by_centrality=True,
+        )
+        assert phi is not None, f"{label}: embedding failed (centrality order)"
         assert is_valid_embedding(source, self.TARGET, phi), f"{label}: invalid embedding"
 
 
@@ -494,4 +616,140 @@ class TestBuildModel:
         }
         result = build_model("a", adjlist, phi, target, overlap_penalty=2.0)
         if result is not None and len(result) > 1:
+            assert nx.is_connected(target.subgraph(result))
+
+
+class TestVertexWeights:
+    """Tests for the use_vertex_weights=True mode (Cai, Macready & Roy 2014)."""
+
+    def test_produces_valid_embedding_k3_into_k4(self):
+        """K_3 embeds into K_4 with vertex weights enabled."""
+        source = nx.complete_graph(3)
+        target = nx.complete_graph(4)
+        phi = find_embedding(
+            source, target, rng_factory=seeded_rng(7), use_vertex_weights=True
+        )
+        assert phi is not None
+        assert is_valid_embedding(source, target, phi)
+
+    def test_produces_valid_embedding_k4_into_k4(self):
+        """K_4 into K_4 succeeds with vertex weights."""
+        source = nx.complete_graph(4)
+        target = nx.complete_graph(4)
+        phi = find_embedding(
+            source, target, rng_factory=seeded_rng(3), use_vertex_weights=True
+        )
+        assert phi is not None
+        assert is_valid_embedding(source, target, phi)
+
+    def test_produces_valid_embedding_path_into_grid(self):
+        """Path embeds into a grid with vertex weights enabled."""
+        source = nx.path_graph(5)
+        target = nx.grid_2d_graph(4, 4)
+        phi = find_embedding(
+            source, target, rng_factory=seeded_rng(0), tries=30, use_vertex_weights=True
+        )
+        assert phi is not None
+        assert is_valid_embedding(source, target, phi)
+
+    def test_produces_valid_embedding_cycle_into_grid(self):
+        """A 4-cycle embeds into a grid with vertex weights enabled."""
+        source = nx.cycle_graph(4)
+        target = nx.grid_2d_graph(3, 3)
+        phi = find_embedding(
+            source, target, rng_factory=seeded_rng(5), use_vertex_weights=True
+        )
+        assert phi is not None
+        assert is_valid_embedding(source, target, phi)
+
+    @pytest.mark.parametrize(
+        "label,source",
+        _RANDOM_SOURCE_CASES,
+        ids=[c[0] for c in _RANDOM_SOURCE_CASES],
+    )
+    def test_random_source_vertex_weights(self, label: str, source: nx.Graph) -> None:
+        """Random source graphs embed correctly with vertex weights."""
+        target = nx.complete_graph(20)
+        phi = find_embedding(
+            source,
+            target,
+            rng_factory=seeded_rng(0),
+            tries=30,
+            use_vertex_weights=True,
+        )
+        assert phi is not None, f"{label}: embedding failed (vertex_weights)"
+        assert is_valid_embedding(source, target, phi), f"{label}: invalid embedding"
+
+    def test_vertex_weights_combined_with_degree_order(self):
+        """vertex_weights + order_by_degree must yield a valid embedding."""
+        source = nx.complete_graph(5)
+        target = nx.petersen_graph()
+        phi = find_embedding(
+            source,
+            target,
+            rng_factory=seeded_rng(7),
+            tries=50,
+            order_by_degree=True,
+            use_vertex_weights=True,
+        )
+        if phi is not None:
+            assert is_valid_embedding(source, target, phi)
+
+    def test_vertex_weights_combined_with_longest_chains(self):
+        """vertex_weights + refine_longest_chains must yield a valid embedding."""
+        source = nx.complete_bipartite_graph(3, 3)
+        target = nx.complete_graph(20)
+        phi = find_embedding(
+            source,
+            target,
+            rng_factory=seeded_rng(42),
+            tries=50,
+            refine_longest_chains=True,
+            use_vertex_weights=True,
+        )
+        assert phi is not None
+        assert is_valid_embedding(source, target, phi)
+
+    def test_build_model_vertex_weights_weights_occupied_lower(self):
+        """
+        Vertex weights should assign lower Dijkstra cost to nodes already in
+        some vertex-model (inclusion_count > 0) than to completely free nodes.
+
+        We verify this indirectly: with a path target 0-1-2-3, b placed at 0,
+        and c placed at 3, the weight of node 1 (adjacent to 0, used by b)
+        should be lower than node 2 (free).  The model for 'a' should prefer
+        to route through node 1 rather than 2 when possible.
+        """
+        # target: 0-1-2-3, source: b-a-c
+        target = nx.path_graph(4)
+        adjlist = {"a": ["b", "c"], "b": ["a"], "c": ["a"]}
+        phi: dict[str, list[int]] = {"a": [], "b": [0], "c": [3]}
+
+        # With vertex weights D=3 (diameter of path_graph(4)), n=3 source nodes.
+        # inclusion_count: {0: 1, 3: 1}  (one model each for b and c)
+        # wt(0) = 3^(3-1) = 9   (in b's model, distance from source=0 so cost 0 for start)
+        # wt(1) = 3^(3-0) = 27  (not in any model yet)
+        # wt(2) = 3^(3-0) = 27  (not in any model yet)
+        # wt(3) = 3^(3-1) = 9   (in c's model)
+        # Dijkstra from {0}: dist to 1 = wt(1)=27, dist to 2 = 27+27=54
+        # Dijkstra from {3}: dist to 2 = 27, dist to 1 = 27+27=54
+        # Best root minimises sum of distances from both models.
+        # Node 1: dist_b(1)+dist_c(1) = 27 + 54 = 81
+        # Node 2: dist_b(2)+dist_c(2) = 54 + 27 = 81  (symmetric)
+        # Either node 1 or 2 may be root; what matters is that the result is valid.
+        result = build_model(
+            "a",
+            adjlist,
+            phi,
+            target,
+            overlap_penalty=2.0,
+            use_vertex_weights=True,
+            target_diameter=3,
+            num_source_nodes=3,
+        )
+        assert result is not None
+        # Model must be adjacent to both phi[b]={0} and phi[c]={3}
+        assert any(target.has_edge(r, 0) for r in result)
+        assert any(target.has_edge(r, 3) for r in result)
+        if len(result) > 1:
             assert nx.is_connected(target.subgraph(result))

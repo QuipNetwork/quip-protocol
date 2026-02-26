@@ -15,9 +15,13 @@ Usage examples
     python -m topo_alloc.bench_random --graph-model ba --nodes 10 --ba-m 3 \\
         --topology zephyr --topology-size 3 --samples 15 --strategy degree
 
-# Compare all three strategies (random, degree, longest_chains):
+# Compare all strategies (random, degree, centrality, longest_chains, vertex_weights):
     python -m topo_alloc.bench_random --graph-model er --nodes 8 --er-p 0.5 \\
         --topology chimera --topology-size 4 --samples 20 --strategy all
+
+# Vertex-weight strategy (Cai, Macready & Roy 2014):
+    python -m topo_alloc.bench_random --graph-model er --nodes 8 --er-p 0.5 \\
+        --topology chimera --topology-size 4 --samples 20 --strategy vertex_weights
 
 # Random trees embedded into a Pegasus topology, CSV output:
     python -m topo_alloc.bench_random --graph-model tree --nodes 12 \\
@@ -117,7 +121,9 @@ def _run_sample(
         return random.Random(seed)
 
     order_by_degree = strategy in ("degree", "longest_chains")
+    order_by_centrality = strategy == "centrality"
     refine_longest_chains = strategy == "longest_chains"
+    use_vertex_weights = strategy == "vertex_weights"
     embedding = find_embedding(
         source,
         target,
@@ -126,7 +132,9 @@ def _run_sample(
         refinment_constant=refinement_constant,
         overlap_penalty=overlap_penalty,
         order_by_degree=order_by_degree,
+        order_by_centrality=order_by_centrality,
         refine_longest_chains=refine_longest_chains,
+        use_vertex_weights=use_vertex_weights,
     )
 
     if embedding is None:
@@ -311,16 +319,20 @@ def _write_csv(results: list[SampleResult], path: str) -> None:
 )
 @click.option(
     "--strategy",
-    type=click.Choice(["random", "degree", "longest_chains", "both", "all"]),
+    type=click.Choice(
+        ["random", "degree", "centrality", "longest_chains", "vertex_weights", "both", "all"]
+    ),
     default="both",
     show_default=True,
     help=(
         "Ordering strategy for find_embedding.  "
         "'random' = uniform shuffle,  "
         "'degree' = descending source-degree first,  "
+        "'centrality' = descending betweenness centrality first,  "
         "'longest_chains' = degree-order placement + longest-chain refinement,  "
+        "'vertex_weights' = vertex-weight Dijkstra scheme (Cai et al. 2014),  "
         "'both' = random vs degree,  "
-        "'all' = all three strategies."
+        "'all' = all five strategies."
     ),
 )
 @click.option(
@@ -406,7 +418,7 @@ def main(
     if strategy == "both":
         strategies = ["random", "degree"]
     elif strategy == "all":
-        strategies = ["random", "degree", "longest_chains"]
+        strategies = ["random", "degree", "centrality", "longest_chains", "vertex_weights"]
     else:
         strategies = [strategy]
 

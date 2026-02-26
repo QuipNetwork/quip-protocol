@@ -28,7 +28,9 @@ def find_embedding[G, H](
     refinment_constant: int = 20,
     overlap_penalty: float = 2.0,
     order_by_degree: bool = False,
+    order_by_centrality: bool = False,
     refine_longest_chains: bool = False,
+    use_vertex_weights: bool = False,
 ) -> Model[G, H] | None:
     """
     Finds a graph embedding of `source` as a minor of `target`.
@@ -49,13 +51,22 @@ def find_embedding[G, H](
         to `k * |V(H)|`.
     overlap_penalty: float
         The weight given to an edge that leads towards a node belonging
-        to different vertex model.
+        to different vertex model.  Only used when `use_vertex_weights`
+        is False.
     order_by_degree: bool
         When True, the initial source node ordering is seeded by sorting
         nodes in descending order of their degree in the source graph,
         rather than a uniform random shuffle.  High-degree nodes (more
         constrained) are placed first, which can reduce chain lengths and
         improve embedding quality on structured topologies.
+    order_by_centrality: bool
+        When True, the initial source node ordering is seeded by sorting
+        nodes in descending order of their betweenness centrality in the
+        source graph.  Nodes that lie on many shortest paths (and are thus
+        more structurally central) are placed first.  Within ties the order
+        is shuffled randomly across tries.  Mutually exclusive with
+        `order_by_degree`; if both are True, `order_by_centrality` takes
+        precedence.
     refine_longest_chains: bool
         When True, after the overlap-removal refinement converges a second
         refinement pass is run: the source node whose vertex-model is
@@ -64,6 +75,14 @@ def find_embedding[G, H](
         re-embedding is accepted only when it does not increase the chain
         length, so the pass is strictly non-worsening.  This directly
         targets the `nodes_used` metric.
+    use_vertex_weights: bool
+        When True, use the vertex-weight scheme from Cai, Macready & Roy
+        (2014).  Each target node g receives weight
+        wt(g) = D^{|{i : g ∉ φ(x_i)}|}, where D is the diameter of the
+        target graph.  Nodes included in many existing vertex-models get
+        low weight (encouraging path re-use through shared nodes), while
+        free nodes get high weight (D^n).  This replaces the flat
+        `overlap_penalty` approach.
 
     # Returns
     A `Model[G, H]` which is a dictionary from `H` nodes into
@@ -75,8 +94,23 @@ def find_embedding[G, H](
     src_nodes = list(source.nodes)
     src_adj = {h: list(source.neighbors(h)) for h in src_nodes}
     degree_order = None
+    centrality_order = None
 
-    if order_by_degree:
+    # Pre-compute target diameter for vertex-weight mode (Cai et al. 2014).
+    # nx.diameter requires a connected graph; fall back to a safe lower-bound
+    # of 2 on disconnected targets so the weight formula remains well-defined.
+    # In the default overlap-penalty mode the diameter is unused (set to 1).
+    target_diameter = (
+        (nx.diameter(target) if nx.is_connected(target) else 2)
+        if use_vertex_weights
+        else 1
+    )
+
+    centrality = None
+    if order_by_centrality:
+        centrality = nx.betweenness_centrality(source)
+        centrality_order = sorted(src_nodes, key=lambda h: centrality[h], reverse=True)
+    elif order_by_degree:
         # Seed the order by descending source-graph degree so that the most
         # constrained nodes are placed first.  Ties are broken randomly.
         degree_order = sorted(src_nodes, key=lambda h: source.degree(h), reverse=True)
@@ -85,7 +119,9 @@ def find_embedding[G, H](
         # --------------------------------
         # Stage 1 - initialize model with greedy placement in a random vertex order
         # --------------------------------
-        if order_by_degree:
+        if order_by_centrality:
+            order = _shuffle_within_centrality_tiers(centrality_order, centrality, rng)  # pyright: ignore[reportArgumentType]
+        elif order_by_degree:
             # Shuffle within each degree tier to keep randomness across tries
             # while preserving the coarse degree ordering.
             order = _shuffle_within_degree_tiers(degree_order, source, rng)
@@ -94,7 +130,16 @@ def find_embedding[G, H](
             rng.shuffle(order)
         phi: dict[H, list[G]] = {x: [] for x in order}
         for x in order:
-            model = build_model(x, src_adj, phi, target, overlap_penalty)
+            model = build_model(
+                x,
+                src_adj,
+                phi,
+                target,
+                overlap_penalty,
+                use_vertex_weights=use_vertex_weights,
+                target_diameter=target_diameter,
+                num_source_nodes=len(src_nodes),
+            )
             if model is None:
                 break
             phi[x] = model
@@ -118,7 +163,16 @@ def find_embedding[G, H](
                 # Re-embed the H-node with the worst overlap
                 x = max(order, key=lambda v: overlap_per_node[v])
                 phi[x] = []
-                model = build_model(x, src_adj, phi, target, overlap_penalty)
+                model = build_model(
+                    x,
+                    src_adj,
+                    phi,
+                    target,
+                    overlap_penalty=overlap_penalty,
+                    use_vertex_weights=use_vertex_weights,
+                    target_diameter=target_diameter if use_vertex_weights else 1,
+                    num_source_nodes=len(src_nodes),
+                )
                 if model is not None:
                     phi[x] = model
 
@@ -127,7 +181,15 @@ def find_embedding[G, H](
         # --------------------------------
         if refine_longest_chains:
             phi = _refine_longest_chains(
-                src_nodes, src_adj, phi, target, overlap_penalty, refine_rounds
+                src_nodes,
+                src_adj,
+                phi,
+                target,
+                overlap_penalty=overlap_penalty,
+                rounds=refine_rounds,
+                use_vertex_weights=use_vertex_weights,
+                target_diameter=target_diameter,
+                num_source_nodes=len(src_nodes),
             )
 
         # --------------------------------
@@ -144,8 +206,12 @@ def _refine_longest_chains[G, H](
     src_adj: dict[H, list[H]],
     phi: dict[H, list[G]],
     graph: nx.Graph[G],
-    overlap_penalty: float,
+    *,
     rounds: int,
+    overlap_penalty: float,
+    use_vertex_weights: bool = False,
+    target_diameter: int = 1,
+    num_source_nodes: int = 0,
 ) -> dict[H, list[G]]:
     """
     Refinement pass that repeatedly re-embeds the source node with the
@@ -166,7 +232,16 @@ def _refine_longest_chains[G, H](
         old_model = phi[x]
         phi[x] = []
 
-        candidate = build_model(x, src_adj, phi, graph, overlap_penalty)
+        candidate = build_model(
+            x,
+            src_adj,
+            phi,
+            graph,
+            overlap_penalty,
+            use_vertex_weights=use_vertex_weights,
+            target_diameter=target_diameter,
+            num_source_nodes=num_source_nodes,
+        )
 
         if candidate is not None and len(candidate) < current_len:
             # Accept: strictly shorter chain found.
@@ -200,13 +275,62 @@ def _shuffle_within_degree_tiers[H](
     return result
 
 
+def _shuffle_within_centrality_tiers[H](
+    centrality_order: list[H],
+    centrality: dict[H, float],
+    rng_inst: rng.Random,
+) -> list[H]:
+    """
+    Return a node ordering that respects descending betweenness-centrality
+    tiers but shuffles nodes within each tier so successive tries explore
+    different orderings.
+
+    Two nodes are in the same tier when their centrality values are equal
+    (which is common for regular or symmetric graphs).
+    """
+    from itertools import groupby
+
+    result: list[H] = []
+    for _, group in groupby(centrality_order, key=lambda h: centrality[h]):
+        tier = list(group)
+        rng_inst.shuffle(tier)
+        result.extend(tier)
+    return result
+
+
 def build_model[G, H](
     x: H,
     adjlist: dict[H, list[H]],
     phi: dict[H, list[G]],
     graph: nx.Graph[G],
     overlap_penalty: float,
+    *,
+    use_vertex_weights: bool = False,
+    target_diameter: int = 1,
+    num_source_nodes: int = 0,
 ) -> list[G] | None:
+    """
+    Build a vertex-model (chain) for source node `x` in `graph`.
+
+    When `use_vertex_weights` is True the Dijkstra edge weights are derived
+    from the vertex-weight formula of Cai, Macready & Roy (2014):
+
+        ``wt(g) = D^{|{i : g ∉ φ(x_i)}|}``
+
+    where
+        - D = diameter of the target topology; and
+        - the exponent counts how many source nodes whose current model *does not*
+          contain target node g.
+
+    A node shared by many vertex-models has a small exponent → low weight,
+    making paths through shared nodes cheap.  A completely free node has
+    exponent n (number of source nodes) → weight D^n, making it expensive.
+    This naturally guides Dijkstra toward compact re-use of already-placed
+    nodes.
+
+    When `use_vertex_weights` is False the original flat `overlap_penalty`
+    scheme is used instead.
+    """
     # Get already placed neighbours to x
     placed_neighbours = [y for y in adjlist[x] if phi[y]]
 
@@ -219,8 +343,25 @@ def build_model[G, H](
         return [free[0]] if free else [next(iter(graph.nodes))]
 
     # Run Dijkstra's algorithm from multiple sources from v-models.
-    def weight(_u: G, v: G, _data) -> float:
-        return 1.0 + overlap_penalty * (1.0 if v in occupied else 0.0)
+    if use_vertex_weights:
+        # Count how many source-node models contain each target node.
+        # (Exclude x itself since its model is being rebuilt.)
+        inclusion_count: dict[G, int] = {}
+        for y, model in phi.items():
+            if y != x:
+                for g in model:
+                    inclusion_count[g] = inclusion_count.get(g, 0) + 1
+
+        n = num_source_nodes or len(phi)
+
+        def weight(_u: G, v: G, _data) -> float:
+            # exponent = #{i : v ∉ φ(x_i)} = n - #{i : v ∈ φ(x_i)}
+            exponent = n - inclusion_count.get(v, 0)
+            return float(target_diameter**exponent)
+    else:
+
+        def weight(_u: G, v: G, _data) -> float:
+            return 1.0 + overlap_penalty * (1.0 if v in occupied else 0.0)
 
     dist_from = {}
     path_from = {}
@@ -229,10 +370,11 @@ def build_model[G, H](
             graph, sources=phi[y], weight=weight
         )
 
-    # Choose the best root.
-    #
-    # Take `free` node from the target graph by minimising sum of
-    # distances to all neighbour models.
+    # Choose the best root: prefer free nodes in both modes, with a fallback
+    # to occupied nodes if no free root is reachable.
+    # In vertex-weight mode the Dijkstra distances already encode occupancy
+    # preference (shared nodes are cheaper to route through), so the best
+    # free root naturally tends to be adjacent to well-placed chains.
     best_root, best_cost = None, float("+inf")
     for g in graph.nodes:
         if g in occupied:
