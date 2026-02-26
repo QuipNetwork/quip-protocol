@@ -31,7 +31,6 @@ import dataclasses
 import random
 import statistics
 import sys
-from tkinter.constants import S
 from typing import Literal
 
 import click
