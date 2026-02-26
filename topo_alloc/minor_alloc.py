@@ -11,7 +11,7 @@ from __future__ import annotations
 import itertools
 import random as rng
 from collections import defaultdict
-from typing import Callable
+from typing import Any, Callable
 
 import networkx as nx
 
@@ -120,11 +120,17 @@ def find_embedding[G, H](
         # Stage 1 - initialize model with greedy placement in a random vertex order
         # --------------------------------
         if order_by_centrality:
-            order = _shuffle_within_centrality_tiers(centrality_order, centrality, rng)  # pyright: ignore[reportArgumentType]
+            order = _shuffle_within_tiers(
+                centrality_order,  # pyright: ignore[reportArgumentType]
+                lambda h: centrality[h],  # pyright: ignore[reportOptionalSubscript]
+                rng,
+            )
         elif order_by_degree:
             # Shuffle within each degree tier to keep randomness across tries
             # while preserving the coarse degree ordering.
-            order = _shuffle_within_degree_tiers(degree_order, source, rng)
+            order = _shuffle_within_tiers(
+                degree_order or [], lambda h: source.degree(h), rng
+            )
         else:
             order = list(src_nodes)
             rng.shuffle(order)
@@ -258,45 +264,19 @@ def _refine_longest_chains[G, H](
     return phi
 
 
-def _shuffle_within_degree_tiers[H](
-    degree_order: list[H] | None,
-    source: nx.Graph[H],
+def _shuffle_within_tiers[H](
+    order: list[H],
+    key: Callable[[H], Any],
     rng_inst: rng.Random,
 ) -> list[H]:
     """
-    Return a node ordering that respects descending degree tiers but shuffles
-    nodes within each tier so successive tries explore different orderings.
-    """
-    from itertools import groupby
-
-    if degree_order is None:
-        return []
-
-    result: list[H] = []
-    for _, group in groupby(degree_order, key=lambda h: source.degree(h)):
-        tier = list(group)
-        rng_inst.shuffle(tier)
-        result.extend(tier)
-    return result
-
-
-def _shuffle_within_centrality_tiers[H](
-    centrality_order: list[H],
-    centrality: dict[H, float],
-    rng_inst: rng.Random,
-) -> list[H]:
-    """
-    Return a node ordering that respects descending betweenness-centrality
-    tiers but shuffles nodes within each tier so successive tries explore
-    different orderings.
-
-    Two nodes are in the same tier when their centrality values are equal
-    (which is common for regular or symmetric graphs).
+    Return a node ordering that preserves tier boundaries defined by `key` but
+    shuffles nodes within each tier so successive tries explore different orderings.
     """
     from itertools import groupby
 
     result: list[H] = []
-    for _, group in groupby(centrality_order, key=lambda h: centrality[h]):
+    for _, group in groupby(order, key=key):
         tier = list(group)
         rng_inst.shuffle(tier)
         result.extend(tier)
