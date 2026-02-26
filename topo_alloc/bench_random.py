@@ -39,6 +39,7 @@ import dataclasses
 import random
 import statistics
 import sys
+import time
 from typing import Literal
 
 import click
@@ -105,6 +106,7 @@ class SampleResult:
     chain_min: int | None
     chain_max: int | None
     chain_avg: float | None
+    elapsed_s: float
 
 
 def _run_sample(
@@ -124,6 +126,7 @@ def _run_sample(
     order_by_centrality = strategy == "centrality"
     refine_longest_chains = strategy == "longest_chains"
     use_vertex_weights = strategy == "vertex_weights"
+    t0 = time.perf_counter()
     embedding = find_embedding(
         source,
         target,
@@ -136,6 +139,7 @@ def _run_sample(
         refine_longest_chains=refine_longest_chains,
         use_vertex_weights=use_vertex_weights,
     )
+    elapsed_s = time.perf_counter() - t0
 
     if embedding is None:
         return SampleResult(
@@ -149,6 +153,7 @@ def _run_sample(
             chain_min=None,
             chain_max=None,
             chain_avg=None,
+            elapsed_s=elapsed_s,
         )
 
     stats: EmbeddingStats = embedding_stats(embedding)
@@ -163,6 +168,7 @@ def _run_sample(
         chain_min=stats.chain_min,
         chain_max=stats.chain_max,
         chain_avg=stats.chain_avg,
+        elapsed_s=elapsed_s,
     )
 
 
@@ -179,6 +185,17 @@ def _fmt(val: object, width: int = _W) -> str:
     if isinstance(val, float):
         return f"{val:{width}.2f}"
     return f"{val!s:>{width}}"
+
+
+def _elapsed_unit(mean_s: float) -> tuple[float, str]:
+    """Return (scale, unit_label) so that mean_s * scale is in that unit."""
+    if mean_s >= 1.0:
+        return 1.0, "s"
+    if mean_s >= 1e-3:
+        return 1e3, "ms"
+    if mean_s >= 1e-6:
+        return 1e6, "µs"
+    return 1e9, "ns"
 
 
 def _agg_line(label: str, values: list[float | int], width: int = _W) -> str:
@@ -208,6 +225,9 @@ def _print_aggregate(results: list[SampleResult], strategy: str) -> None:
         click.echo("  No successful embeddings.")
         return
 
+    elapsed_vals = [r.elapsed_s for r in subset]
+    scale, unit = _elapsed_unit(statistics.mean(elapsed_vals))
+    click.echo(_agg_line(f"elapsed ({unit})", [v * scale for v in elapsed_vals]))
     click.echo(_agg_line("nodes used", [r.nodes_used for r in successes]))  # pyright: ignore[reportArgumentType]
     click.echo(_agg_line("chain avg", [r.chain_avg for r in successes]))  # pyright: ignore[reportArgumentType]
     click.echo(_agg_line("chain max", [r.chain_max for r in successes]))  # pyright: ignore[reportArgumentType]
@@ -218,9 +238,12 @@ def _print_aggregate(results: list[SampleResult], strategy: str) -> None:
 
 def _print_sample_table(results: list[SampleResult]) -> None:
     col = 10
+    mean_elapsed = statistics.mean(r.elapsed_s for r in results) if results else 0.0
+    scale, unit = _elapsed_unit(mean_elapsed)
+    elapsed_col = f"elapsed({unit})"
     header = (
         f"  {'id':>4}  {'seed':>8}  {'src_n':>5}  {'src_e':>5}  {'strat':>6}"
-        f"  {'ok':>2}  {'n_used':>{col}}  {'ch_avg':>{col}}"
+        f"  {'ok':>2}  {elapsed_col:>{col}}  {'n_used':>{col}}  {'ch_avg':>{col}}"
         f"  {'ch_min':>{col}}  {'ch_max':>{col}}"
     )
     click.echo(header)
@@ -229,7 +252,7 @@ def _print_sample_table(results: list[SampleResult]) -> None:
         click.echo(
             f"  {r.sample_id:>4}  {r.seed:>8}  {r.source_nodes:>5}  {r.source_edges:>5}"
             f"  {r.strategy:>6}  {'Y' if r.success else 'N':>2}"
-            f"  {_fmt(r.nodes_used, col)}  {_fmt(r.chain_avg, col)}"
+            f"  {_fmt(r.elapsed_s * scale, col)}  {_fmt(r.nodes_used, col)}  {_fmt(r.chain_avg, col)}"
             f"  {_fmt(r.chain_min, col)}  {_fmt(r.chain_max, col)}"
         )
 
