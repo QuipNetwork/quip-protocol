@@ -147,6 +147,11 @@ def find_embedding[G, H](
         # --------------------------------
         # Stage 2 - refinement: re-embed nodes with overlapping models
         # --------------------------------
+        # Overlap resolution always uses the flat overlap_penalty regardless
+        # of use_vertex_weights.  Vertex weights encourage path re-use and
+        # intentionally create overlapping models; the penalty-based scheme is
+        # better suited for untangling them because it actively steers away
+        # from occupied nodes.
         for _ in range(refine_rounds):
             # Sum up all overlaps
             counters: defaultdict[G, int] = defaultdict(int)
@@ -169,8 +174,8 @@ def find_embedding[G, H](
                     phi,
                     target,
                     overlap_penalty=overlap_penalty,
-                    use_vertex_weights=use_vertex_weights,
-                    target_diameter=target_diameter if use_vertex_weights else 1,
+                    use_vertex_weights=False,
+                    target_diameter=1,
                     num_source_nodes=len(src_nodes),
                 )
                 if model is not None:
@@ -357,7 +362,7 @@ def build_model[G, H](
         def weight(_u: G, v: G, _data) -> float:
             # exponent = #{i : v ∉ φ(x_i)} = n - #{i : v ∈ φ(x_i)}
             exponent = n - inclusion_count.get(v, 0)
-            return float(target_diameter**exponent)
+            return 1.0 + float(target_diameter**exponent)
     else:
 
         def weight(_u: G, v: G, _data) -> float:
