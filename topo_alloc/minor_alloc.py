@@ -1,9 +1,89 @@
 """
-A graph allocator that sends some arbitrary Ising model
-into a known architecture as a graph.
+Minor-embedding heuristic for mapping an arbitrary source graph H into a
+hardware topology graph G as a graph minor.
 
-The whole allocator uses minor-embedding approach to
-perform proper allocations.
+Background
+----------
+A graph H is a *minor* of G when H can be obtained from G by a sequence of
+edge contractions, edge deletions, and vertex deletions.  Equivalently, H is
+a minor of G iff there exists a *minor embedding*: an injective map
+
+    φ : V(H) → 2^{V(G)}
+
+such that for each source node x ∈ V(H):
+
+1. φ(x) is non-empty and induces a connected subgraph of G (*vertex model*,
+   also called a *chain* in the quantum-annealing literature).
+2. All vertex models are pairwise disjoint.
+3. For every edge (x, y) ∈ E(H) there is at least one edge in G between
+   φ(x) and φ(y).
+
+The problem is NP-hard in general.  This module implements a practical
+randomised heuristic following the approach of Cai, Macready & Roy (2014),
+"A practical heuristic for finding graph minors"
+(https://arxiv.org/abs/1406.2741).
+
+Algorithm outline
+-----------------
+The outer loop makes up to `tries` independent attempts.  Each attempt
+consists of three stages:
+
+**Stage 1 – Greedy initialisation.**
+Source nodes are placed one by one in some order (random, degree-first, or
+centrality-first depending on `options`).  For each source node x, a vertex
+model φ(x) is constructed by running multi-source Dijkstra from the already-
+placed models of x's neighbours in H, finding the cheapest way to connect
+them through a single new root target node.  The Dijkstra edge weights
+encode a penalty for passing through nodes that are already occupied by
+other models — either a flat `overlap_penalty` multiplier (default) or the
+vertex-weight formula from Cai et al. (see below).  The result is a
+connected Steiner-tree approximation anchored at the cheapest free root.
+Overlapping models are accepted at this stage.
+
+**Stage 2 – Overlap-removal refinement.**
+Repeated for `refinement_constant × |V(H)|` rounds.  In each round, the
+source node x* with the most overlapping target nodes is identified and
+re-embedded from scratch (using the flat `overlap_penalty` scheme regardless
+of `options`, because the penalty scheme is better at untangling overlaps).
+The loop terminates early when all vertex models become disjoint.
+
+**Stage 2b – Longest-chain refinement (optional, `REFINE_LONGEST_CHAINS`).**
+After overlap removal has converged, a further
+`refinement_constant × |V(H)|` rounds are run: in each round the source node
+whose vertex model is currently longest is re-embedded, and the new model is
+accepted only when it is *strictly shorter* (non-worsening).  This pass
+directly targets the `nodes_used` metric without risking the validity of the
+embedding.
+
+**Stage 3 – Validation.**
+The candidate embedding is checked against all three minor-embedding
+conditions.  If it passes, it is returned immediately.  Otherwise the next
+attempt begins.
+
+Vertex-weight scheme (`USE_VERTEX_WEIGHTS`)
+-------------------------------------------
+Instead of the flat `overlap_penalty`, the Cai et al. (2014) vertex-weight
+formula can be used during Stage 1:
+
+    wt(g) = D^{n − inclusion_count(g)}
+
+where D is the diameter of the target graph, n = |V(H)|, and
+inclusion_count(g) counts how many source-node models currently contain g.
+A target node shared by many models has a small exponent and therefore low
+weight, making paths through it cheap and encouraging the algorithm to route
+new chains through already-placed nodes (path re-use).  A completely free
+node gets weight D^n, making it expensive and discouraging premature
+commitment to unused resources.
+
+Ordering heuristics (`ORDER_BY_DEGREE`, `ORDER_BY_CENTRALITY`)
+---------------------------------------------------------------
+The greedy placement order in Stage 1 affects quality significantly.
+Placing the most *constrained* source nodes first (high degree or high
+betweenness centrality) tends to produce shorter chains and higher success
+rates, because the constrained nodes get first pick of the target topology.
+Within each tier of equal-valued nodes the order is shuffled randomly,
+preserving the coarse ranking while still exploring different placements
+across tries.
 """
 
 from __future__ import annotations
