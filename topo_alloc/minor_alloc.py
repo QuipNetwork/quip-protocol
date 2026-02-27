@@ -8,6 +8,7 @@ perform proper allocations.
 
 from __future__ import annotations
 
+import enum
 import itertools
 import random as rng
 from collections import defaultdict
@@ -16,6 +17,48 @@ from typing import Any, Callable
 import networkx as nx
 
 type Model[G, H] = dict[H, frozenset[G]]
+
+
+class EmbedOption(enum.Flag):
+    """
+    Options controlling the behaviour of `find_embedding`.
+
+    Multiple options may be combined with the ``|`` operator::
+
+        find_embedding(source, target, options=EmbedOption.ORDER_BY_DEGREE | EmbedOption.REFINE_LONGEST_CHAINS)
+
+    Options
+    -------
+    ORDER_BY_DEGREE
+        Sort source nodes in descending order of their degree in the source
+        graph before placement.  High-degree (more constrained) nodes are
+        placed first, which can reduce chain lengths and improve embedding
+        quality on structured topologies.  Within ties the order is shuffled
+        randomly across tries.
+
+    ORDER_BY_CENTRALITY
+        Sort source nodes in descending order of their betweenness centrality
+        in the source graph.  Nodes that lie on many shortest paths are placed
+        first.  Within ties the order is shuffled randomly across tries.
+        Takes precedence over ``ORDER_BY_DEGREE`` when both are set.
+
+    REFINE_LONGEST_CHAINS
+        After overlap-removal refinement converges, run a second pass that
+        re-embeds the source node with the longest chain for
+        ``refinement_constant * |V(H)|`` iterations.  Each accepted
+        re-embedding is strictly non-worsening.
+
+    USE_VERTEX_WEIGHTS
+        Use the vertex-weight scheme from Cai, Macready & Roy (2014).
+        Each target node g receives weight
+        ``wt(g) = D^{|{i : g ∉ φ(x_i)}|}``, replacing the flat
+        ``overlap_penalty`` approach.
+    """
+
+    ORDER_BY_DEGREE = enum.auto()
+    ORDER_BY_CENTRALITY = enum.auto()
+    REFINE_LONGEST_CHAINS = enum.auto()
+    USE_VERTEX_WEIGHTS = enum.auto()
 
 
 def find_embedding[G, H](
@@ -27,10 +70,7 @@ def find_embedding[G, H](
     tries: int = 30,
     refinment_constant: int = 20,
     overlap_penalty: float = 2.0,
-    order_by_degree: bool = False,
-    order_by_centrality: bool = False,
-    refine_longest_chains: bool = False,
-    use_vertex_weights: bool = False,
+    options: EmbedOption = EmbedOption(0),
 ) -> Model[G, H] | None:
     """
     Finds a graph embedding of `source` as a minor of `target`.
@@ -51,44 +91,23 @@ def find_embedding[G, H](
         to `k * |V(H)|`.
     overlap_penalty: float
         The weight given to an edge that leads towards a node belonging
-        to different vertex model.  Only used when `use_vertex_weights`
-        is False.
-    order_by_degree: bool
-        When True, the initial source node ordering is seeded by sorting
-        nodes in descending order of their degree in the source graph,
-        rather than a uniform random shuffle.  High-degree nodes (more
-        constrained) are placed first, which can reduce chain lengths and
-        improve embedding quality on structured topologies.
-    order_by_centrality: bool
-        When True, the initial source node ordering is seeded by sorting
-        nodes in descending order of their betweenness centrality in the
-        source graph.  Nodes that lie on many shortest paths (and are thus
-        more structurally central) are placed first.  Within ties the order
-        is shuffled randomly across tries.  Mutually exclusive with
-        `order_by_degree`; if both are True, `order_by_centrality` takes
-        precedence.
-    refine_longest_chains: bool
-        When True, after the overlap-removal refinement converges a second
-        refinement pass is run: the source node whose vertex-model is
-        currently longest is re-embedded, repeating for
-        `refinment_constant * |V(H)|` iterations.  Each successful
-        re-embedding is accepted only when it does not increase the chain
-        length, so the pass is strictly non-worsening.  This directly
-        targets the `nodes_used` metric.
-    use_vertex_weights: bool
-        When True, use the vertex-weight scheme from Cai, Macready & Roy
-        (2014).  Each target node g receives weight
-        wt(g) = D^{|{i : g ∉ φ(x_i)}|}, where D is the diameter of the
-        target graph.  Nodes included in many existing vertex-models get
-        low weight (encouraging path re-use through shared nodes), while
-        free nodes get high weight (D^n).  This replaces the flat
-        `overlap_penalty` approach.
+        to different vertex model.  Only used when `EmbedOption.USE_VERTEX_WEIGHTS`
+        is not set.
+    options: EmbedOption
+        A set of `EmbedOption` flags controlling the embedding strategy.
+        Multiple options may be combined with ``|``.  See `EmbedOption`
+        for the full list.
 
     # Returns
     A `Model[G, H]` which is a dictionary from `H` nodes into
     sets of `G` nodes mapped. Returns `None` if after the number of `tries`
     there is no non-overlapping map.
     """
+    order_by_degree = EmbedOption.ORDER_BY_DEGREE in options
+    order_by_centrality = EmbedOption.ORDER_BY_CENTRALITY in options
+    refine_longest_chains = EmbedOption.REFINE_LONGEST_CHAINS in options
+    use_vertex_weights = EmbedOption.USE_VERTEX_WEIGHTS in options
+
     refine_rounds = refinment_constant * len(source.nodes)
     rng = rng_factory()
     src_nodes = list(source.nodes)
@@ -464,6 +483,7 @@ def is_valid_embedding[G, H](
 
 
 __all__ = [
+    "EmbedOption",
     "Model",
     "build_model",
     "find_embedding",

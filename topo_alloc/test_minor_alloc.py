@@ -15,9 +15,9 @@ import networkx as nx
 import pytest
 
 from topo_alloc.minor_alloc import (
+    EmbedOption,
     _refine_longest_chains,
-    _shuffle_within_centrality_tiers,
-    _shuffle_within_degree_tiers,
+    _shuffle_within_tiers,
     build_model,
     find_embedding,
     is_valid_embedding,
@@ -160,7 +160,7 @@ class TestDegreeOrdering:
         source = nx.complete_graph(5)
         target = nx.petersen_graph()
         phi = find_embedding(
-            source, target, rng_factory=seeded_rng(7), tries=50, order_by_degree=True
+            source, target, rng_factory=seeded_rng(7), tries=50, options=EmbedOption.ORDER_BY_DEGREE
         )
         if phi is not None:
             assert is_valid_embedding(source, target, phi)
@@ -170,7 +170,7 @@ class TestDegreeOrdering:
         source = nx.complete_graph(4)
         target = nx.complete_graph(4)
         phi = find_embedding(
-            source, target, rng_factory=seeded_rng(3), order_by_degree=True
+            source, target, rng_factory=seeded_rng(3), options=EmbedOption.ORDER_BY_DEGREE
         )
         assert phi is not None
         assert is_valid_embedding(source, target, phi)
@@ -180,7 +180,7 @@ class TestDegreeOrdering:
         source = nx.star_graph(4)  # 1 hub + 4 leaves
         target = nx.complete_graph(10)  # fully connected, guarantees success
         phi = find_embedding(
-            source, target, rng_factory=seeded_rng(0), tries=20, order_by_degree=True
+            source, target, rng_factory=seeded_rng(0), tries=20, options=EmbedOption.ORDER_BY_DEGREE
         )
         assert phi is not None
         assert is_valid_embedding(source, target, phi)
@@ -197,7 +197,7 @@ class TestDegreeOrdering:
             target,
             rng_factory=seeded_rng(42),
             tries=50,
-            order_by_degree=True,
+            options=EmbedOption.ORDER_BY_DEGREE,
         )
         # Both should succeed and be valid
         assert phi_random is not None
@@ -206,7 +206,7 @@ class TestDegreeOrdering:
         assert is_valid_embedding(source, target, phi_degree)
 
     def test_shuffle_within_degree_tiers_preserves_degree_order(self):
-        """_shuffle_within_degree_tiers must never place a lower-degree node
+        """_shuffle_within_tiers must never place a lower-degree node
         before a strictly higher-degree node."""
         import random
 
@@ -216,7 +216,7 @@ class TestDegreeOrdering:
         )
         rng_inst = random.Random(0)
         for _ in range(20):
-            order = _shuffle_within_degree_tiers(degree_order, source, rng_inst)
+            order = _shuffle_within_tiers(degree_order, lambda h: source.degree(h), rng_inst)
             # The hub (node 0) must be first -- it has degree 5
             assert order[0] == 0
             # All leaves come after the hub
@@ -232,7 +232,7 @@ class TestDegreeOrdering:
         )
         rng_inst = random.Random(1)
         orderings = {
-            tuple(_shuffle_within_degree_tiers(degree_order, source, rng_inst))
+            tuple(_shuffle_within_tiers(degree_order, lambda h: source.degree(h), rng_inst))
             for _ in range(30)
         }
         # With 5! = 120 permutations and 30 tries, we expect more than 1 unique ordering
@@ -247,7 +247,7 @@ class TestCentralityOrdering:
         source = nx.complete_graph(5)
         target = nx.petersen_graph()
         phi = find_embedding(
-            source, target, rng_factory=seeded_rng(7), tries=50, order_by_centrality=True
+            source, target, rng_factory=seeded_rng(7), tries=50, options=EmbedOption.ORDER_BY_CENTRALITY
         )
         if phi is not None:
             assert is_valid_embedding(source, target, phi)
@@ -257,7 +257,7 @@ class TestCentralityOrdering:
         source = nx.complete_graph(4)
         target = nx.complete_graph(4)
         phi = find_embedding(
-            source, target, rng_factory=seeded_rng(3), order_by_centrality=True
+            source, target, rng_factory=seeded_rng(3), options=EmbedOption.ORDER_BY_CENTRALITY
         )
         assert phi is not None
         assert is_valid_embedding(source, target, phi)
@@ -267,7 +267,7 @@ class TestCentralityOrdering:
         source = nx.path_graph(5)  # node 2 has highest betweenness
         target = nx.complete_graph(10)
         phi = find_embedding(
-            source, target, rng_factory=seeded_rng(0), tries=20, order_by_centrality=True
+            source, target, rng_factory=seeded_rng(0), tries=20, options=EmbedOption.ORDER_BY_CENTRALITY
         )
         assert phi is not None
         assert is_valid_embedding(source, target, phi)
@@ -284,7 +284,7 @@ class TestCentralityOrdering:
             target,
             rng_factory=seeded_rng(42),
             tries=50,
-            order_by_centrality=True,
+            options=EmbedOption.ORDER_BY_CENTRALITY,
         )
         assert phi_random is not None
         assert phi_centrality is not None
@@ -300,14 +300,13 @@ class TestCentralityOrdering:
             target,
             rng_factory=seeded_rng(0),
             tries=20,
-            order_by_degree=True,
-            order_by_centrality=True,
+            options=EmbedOption.ORDER_BY_DEGREE | EmbedOption.ORDER_BY_CENTRALITY,
         )
         assert phi is not None
         assert is_valid_embedding(source, target, phi)
 
     def test_shuffle_within_centrality_tiers_preserves_centrality_order(self):
-        """_shuffle_within_centrality_tiers must never place a lower-centrality node
+        """_shuffle_within_tiers must never place a lower-centrality node
         before a strictly higher-centrality node."""
         import random
 
@@ -317,9 +316,8 @@ class TestCentralityOrdering:
         centrality_order = sorted(source.nodes, key=lambda h: centrality[h], reverse=True)
         rng_inst = random.Random(0)
         for _ in range(20):
-            order = _shuffle_within_centrality_tiers(centrality_order, centrality, rng_inst)
+            order = _shuffle_within_tiers(centrality_order, lambda h: centrality[h], rng_inst)
             # Verify no lower-centrality node appears before a strictly higher one
-            seen_centrality = -1.0
             prev = float("inf")
             for node in order:
                 c = centrality[node]
@@ -337,7 +335,7 @@ class TestCentralityOrdering:
         centrality_order = sorted(source.nodes, key=lambda h: centrality[h], reverse=True)
         rng_inst = random.Random(1)
         orderings = {
-            tuple(_shuffle_within_centrality_tiers(centrality_order, centrality, rng_inst))
+            tuple(_shuffle_within_tiers(centrality_order, lambda h: centrality[h], rng_inst))
             for _ in range(30)
         }
         assert len(orderings) > 1
@@ -424,7 +422,7 @@ class TestRandomSourceGraphs:
             self.TARGET,
             rng_factory=seeded_rng(0),
             tries=30,
-            order_by_degree=True,
+            options=EmbedOption.ORDER_BY_DEGREE,
         )
         assert phi is not None, f"{label}: embedding failed (degree order)"
         assert is_valid_embedding(source, self.TARGET, phi), f"{label}: invalid embedding"
@@ -441,7 +439,7 @@ class TestRandomSourceGraphs:
             self.TARGET,
             rng_factory=seeded_rng(0),
             tries=30,
-            order_by_centrality=True,
+            options=EmbedOption.ORDER_BY_CENTRALITY,
         )
         assert phi is not None, f"{label}: embedding failed (centrality order)"
         assert is_valid_embedding(source, self.TARGET, phi), f"{label}: invalid embedding"
@@ -459,7 +457,7 @@ class TestLongestChainRefinement:
             target,
             rng_factory=seeded_rng(7),
             tries=50,
-            refine_longest_chains=True,
+            options=EmbedOption.REFINE_LONGEST_CHAINS,
         )
         if phi is not None:
             assert is_valid_embedding(source, target, phi)
@@ -473,14 +471,14 @@ class TestLongestChainRefinement:
         target = nx.complete_graph(20)
 
         phi_degree = find_embedding(
-            source, target, rng_factory=seeded_rng(42), tries=50, order_by_degree=True
+            source, target, rng_factory=seeded_rng(42), tries=50, options=EmbedOption.ORDER_BY_DEGREE
         )
         phi_longest = find_embedding(
             source,
             target,
             rng_factory=seeded_rng(42),
             tries=50,
-            refine_longest_chains=True,
+            options=EmbedOption.REFINE_LONGEST_CHAINS,
         )
 
         assert phi_degree is not None
@@ -498,7 +496,7 @@ class TestLongestChainRefinement:
         source = nx.complete_graph(4)
         target = nx.complete_graph(4)
         phi = find_embedding(
-            source, target, rng_factory=seeded_rng(3), refine_longest_chains=True
+            source, target, rng_factory=seeded_rng(3), options=EmbedOption.REFINE_LONGEST_CHAINS
         )
         assert phi is not None
         assert is_valid_embedding(source, target, phi)
@@ -512,7 +510,7 @@ class TestLongestChainRefinement:
             target,
             rng_factory=seeded_rng(0),
             tries=20,
-            refine_longest_chains=True,
+            options=EmbedOption.REFINE_LONGEST_CHAINS,
         )
         assert phi is not None
         assert is_valid_embedding(source, target, phi)
@@ -530,7 +528,7 @@ class TestLongestChainRefinement:
             target,
             rng_factory=seeded_rng(0),
             tries=30,
-            refine_longest_chains=True,
+            options=EmbedOption.REFINE_LONGEST_CHAINS,
         )
         assert phi is not None, f"{label}: embedding failed (longest_chains)"
         assert is_valid_embedding(source, target, phi), f"{label}: invalid embedding"
@@ -627,7 +625,7 @@ class TestVertexWeights:
         source = nx.complete_graph(3)
         target = nx.complete_graph(4)
         phi = find_embedding(
-            source, target, rng_factory=seeded_rng(7), use_vertex_weights=True
+            source, target, rng_factory=seeded_rng(7), options=EmbedOption.USE_VERTEX_WEIGHTS
         )
         assert phi is not None
         assert is_valid_embedding(source, target, phi)
@@ -637,7 +635,7 @@ class TestVertexWeights:
         source = nx.complete_graph(4)
         target = nx.complete_graph(4)
         phi = find_embedding(
-            source, target, rng_factory=seeded_rng(3), use_vertex_weights=True
+            source, target, rng_factory=seeded_rng(3), options=EmbedOption.USE_VERTEX_WEIGHTS
         )
         assert phi is not None
         assert is_valid_embedding(source, target, phi)
@@ -647,7 +645,7 @@ class TestVertexWeights:
         source = nx.path_graph(5)
         target = nx.grid_2d_graph(4, 4)
         phi = find_embedding(
-            source, target, rng_factory=seeded_rng(0), tries=30, use_vertex_weights=True
+            source, target, rng_factory=seeded_rng(0), tries=30, options=EmbedOption.USE_VERTEX_WEIGHTS
         )
         assert phi is not None
         assert is_valid_embedding(source, target, phi)
@@ -657,7 +655,7 @@ class TestVertexWeights:
         source = nx.cycle_graph(4)
         target = nx.grid_2d_graph(3, 3)
         phi = find_embedding(
-            source, target, rng_factory=seeded_rng(5), use_vertex_weights=True
+            source, target, rng_factory=seeded_rng(5), options=EmbedOption.USE_VERTEX_WEIGHTS
         )
         assert phi is not None
         assert is_valid_embedding(source, target, phi)
@@ -675,7 +673,7 @@ class TestVertexWeights:
             target,
             rng_factory=seeded_rng(0),
             tries=30,
-            use_vertex_weights=True,
+            options=EmbedOption.USE_VERTEX_WEIGHTS,
         )
         assert phi is not None, f"{label}: embedding failed (vertex_weights)"
         assert is_valid_embedding(source, target, phi), f"{label}: invalid embedding"
@@ -689,8 +687,7 @@ class TestVertexWeights:
             target,
             rng_factory=seeded_rng(7),
             tries=50,
-            order_by_degree=True,
-            use_vertex_weights=True,
+            options=EmbedOption.ORDER_BY_DEGREE | EmbedOption.USE_VERTEX_WEIGHTS,
         )
         if phi is not None:
             assert is_valid_embedding(source, target, phi)
@@ -704,8 +701,7 @@ class TestVertexWeights:
             target,
             rng_factory=seeded_rng(42),
             tries=50,
-            refine_longest_chains=True,
-            use_vertex_weights=True,
+            options=EmbedOption.REFINE_LONGEST_CHAINS | EmbedOption.USE_VERTEX_WEIGHTS,
         )
         assert phi is not None
         assert is_valid_embedding(source, target, phi)

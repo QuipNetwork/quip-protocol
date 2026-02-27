@@ -70,7 +70,7 @@ from topo_alloc.graphviz_render import (
     format_stats_table,
     render_embedding,
 )
-from topo_alloc.minor_alloc import find_embedding
+from topo_alloc.minor_alloc import EmbedOption, find_embedding
 
 # ---------------------------------------------------------------------------
 # Ising-model graph definitions
@@ -192,7 +192,7 @@ def _run_case(
         tries=50,
         refinment_constant=20,
         overlap_penalty=2.0,
-        order_by_degree=order_by_degree,
+        options=EmbedOption.ORDER_BY_DEGREE if order_by_degree else EmbedOption(0),
     )
     if embedding is None:
         return suffix, None

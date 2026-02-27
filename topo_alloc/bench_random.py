@@ -46,7 +46,7 @@ import click
 import networkx as nx
 
 from topo_alloc.graphviz_render import EmbeddingStats, embedding_stats
-from topo_alloc.minor_alloc import find_embedding
+from topo_alloc.minor_alloc import EmbedOption, find_embedding
 
 # ---------------------------------------------------------------------------
 # Graph-model generators
@@ -122,10 +122,15 @@ def _run_sample(
     def rng_factory():
         return random.Random(seed)
 
-    order_by_degree = strategy in ("degree", "longest_chains")
-    order_by_centrality = strategy == "centrality"
-    refine_longest_chains = strategy == "longest_chains"
-    use_vertex_weights = strategy == "vertex_weights"
+    options = EmbedOption(0)
+    if strategy in ("degree", "longest_chains"):
+        options |= EmbedOption.ORDER_BY_DEGREE
+    if strategy == "centrality":
+        options |= EmbedOption.ORDER_BY_CENTRALITY
+    if strategy == "longest_chains":
+        options |= EmbedOption.REFINE_LONGEST_CHAINS
+    if strategy == "vertex_weights":
+        options |= EmbedOption.USE_VERTEX_WEIGHTS
     t0 = time.perf_counter()
     embedding = find_embedding(
         source,
@@ -134,10 +139,7 @@ def _run_sample(
         tries=tries,
         refinment_constant=refinement_constant,
         overlap_penalty=overlap_penalty,
-        order_by_degree=order_by_degree,
-        order_by_centrality=order_by_centrality,
-        refine_longest_chains=refine_longest_chains,
-        use_vertex_weights=use_vertex_weights,
+        options=options,
     )
     elapsed_s = time.perf_counter() - t0
 
