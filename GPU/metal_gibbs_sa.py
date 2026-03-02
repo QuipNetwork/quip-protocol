@@ -179,14 +179,20 @@ class MetalGibbsSampler:
        - For each color block:
          - Compute effective field for all nodes in block
          - Sample new spins (Gibbs) or accept/reject flips (Metropolis)
+
+    Two execution modes:
+    - Sequential (parallel=False): One thread per sample, nodes updated sequentially within colors
+    - Parallel (parallel=True): One threadgroup per sample, threads divide nodes within colors,
+      with barriers between colors for true parallel Gibbs updates
     """
 
-    def __init__(self, topology=None, update_mode: str = "gibbs"):
+    def __init__(self, topology=None, update_mode: str = "gibbs", parallel: bool = False):
         """Initialize Metal Gibbs sampler.
 
         Args:
             topology: Topology object (default: DEFAULT_TOPOLOGY)
             update_mode: "gibbs" or "metropolis" (default: "gibbs")
+            parallel: Use parallel kernel with threadgroup barriers (default: False)
         """
         self.logger = logging.getLogger(__name__)
         self.device = Metal.MTLCreateSystemDefaultDevice()
@@ -197,6 +203,7 @@ class MetalGibbsSampler:
             raise ValueError(f"update_mode must be 'gibbs' or 'metropolis', got {update_mode}")
         self.update_mode = 0 if update_mode.lower() == "gibbs" else 1
         self.update_mode_name = update_mode.lower()
+        self.parallel = parallel
 
         # Set up topology
         from dwave_topologies import DEFAULT_TOPOLOGY
@@ -219,8 +226,9 @@ class MetalGibbsSampler:
         self.num_colors = 4
 
         self.logger.debug(f"Color block sizes: {self.block_counts}")
+        self.logger.debug(f"Parallel mode: {self.parallel}")
 
-        # Load and compile Metal kernel
+        # Load and compile Metal kernels
         kernel_path = os.path.join(os.path.dirname(__file__), "metal_gibbs.metal")
         with open(kernel_path, 'r') as f:
             kernel_source = f.read()
@@ -231,6 +239,7 @@ class MetalGibbsSampler:
         if not lib:
             raise RuntimeError("Failed to create Metal library (no error reported)")
 
+        # Load sequential kernel
         self._kernel = lib.newFunctionWithName_("block_gibbs_sampler")
         if not self._kernel:
             function_names = [lib.functionNames()[i] for i in range(len(lib.functionNames()))]
@@ -238,7 +247,17 @@ class MetalGibbsSampler:
 
         self._pipeline, err = self.device.newComputePipelineStateWithFunction_error_(self._kernel, None)
         if err or not self._pipeline:
-            raise RuntimeError(f"Failed to create pipeline: {err}")
+            raise RuntimeError(f"Failed to create sequential pipeline: {err}")
+
+        # Load parallel kernel
+        self._kernel_parallel = lib.newFunctionWithName_("block_gibbs_parallel")
+        if not self._kernel_parallel:
+            function_names = [lib.functionNames()[i] for i in range(len(lib.functionNames()))]
+            raise RuntimeError(f"Failed to find block_gibbs_parallel kernel. Available: {function_names}")
+
+        self._pipeline_parallel, err = self.device.newComputePipelineStateWithFunction_error_(self._kernel_parallel, None)
+        if err or not self._pipeline_parallel:
+            raise RuntimeError(f"Failed to create parallel pipeline: {err}")
 
         self._command_queue = self.device.newCommandQueue()
 
@@ -412,9 +431,18 @@ class MetalGibbsSampler:
         beta_schedule_buf = self._create_buffer(beta_schedule, "beta_schedule")
 
         # Color block buffers
+        # Remap color_node_indices from topology node IDs to dense CSR indices.
+        # Topology node IDs can be non-contiguous (e.g., Advantage2 has 4582 nodes
+        # with IDs spanning 0-4799 due to dead qubits). The CSR structure uses dense
+        # indices 0..N-1, so we must translate.
+        node_to_idx = node_to_idx_list[0]  # All problems share same topology
+        csr_color_node_indices = np.array(
+            [node_to_idx[n] for n in self.color_node_indices],
+            dtype=np.int32
+        )
         color_block_starts_buf = self._create_buffer(self.block_starts, "color_block_starts")
         color_block_counts_buf = self._create_buffer(self.block_counts, "color_block_counts")
-        color_node_indices_buf = self._create_buffer(self.color_node_indices, "color_node_indices")
+        color_node_indices_buf = self._create_buffer(csr_color_node_indices, "color_node_indices")
 
         # Scalar parameters
         N_bytes = np.int32(N).tobytes()
@@ -444,7 +472,15 @@ class MetalGibbsSampler:
         cmd_buf = self._command_queue.commandBuffer()
         encoder = cmd_buf.computeCommandEncoder()
 
-        encoder.setComputePipelineState_(self._pipeline)
+        # Select kernel based on parallel mode
+        if self.parallel:
+            pipeline = self._pipeline_parallel
+            kernel_name = "block_gibbs_parallel"
+        else:
+            pipeline = self._pipeline
+            kernel_name = "block_gibbs_sampler"
+
+        encoder.setComputePipelineState_(pipeline)
 
         # Buffer bindings (must match kernel parameter order)
         encoder.setBuffer_offset_atIndex_(csr_row_ptr_buf, 0, 0)
@@ -476,21 +512,34 @@ class MetalGibbsSampler:
         encoder.setBytes_length_atIndex_(update_mode_bytes, len(update_mode_bytes), 19)
         encoder.setBytes_length_atIndex_(num_colors_bytes, len(num_colors_bytes), 20)
 
-        # Dispatch configuration
-        max_threadgroups = self._pipeline.maxTotalThreadsPerThreadgroup()
+        # Dispatch configuration depends on kernel mode
+        if self.parallel:
+            # Parallel kernel: one threadgroup per sample, multiple threads per group
+            # Each threadgroup collaboratively updates one sample
+            num_samples = num_problems * num_reads
 
-        if num_problems > max_threadgroups:
-            raise ValueError(f"Too many problems ({num_problems}) for device capacity ({max_threadgroups})")
+            # Use 256 threads per threadgroup (good balance for color block parallelism)
+            # For ~342 nodes/color, 256 threads means each thread handles ~1-2 nodes
+            threads_per_group = min(256, pipeline.maxTotalThreadsPerThreadgroup())
 
-        num_threadgroups_width = num_problems
-        threads_per_threadgroup_width = num_reads
+            threads_per_threadgroup = Metal.MTLSize(width=threads_per_group, height=1, depth=1)
+            num_threadgroups_size = Metal.MTLSize(width=num_samples, height=1, depth=1)
 
-        threads_per_threadgroup = Metal.MTLSize(width=threads_per_threadgroup_width, height=1, depth=1)
-        num_threadgroups = Metal.MTLSize(width=num_threadgroups_width, height=1, depth=1)
+            self.logger.debug(f"[MetalGibbs] Parallel dispatch ({kernel_name}): {num_samples} threadgroups x {threads_per_group} threads")
+        else:
+            # Sequential kernel: one thread per sample
+            max_threads_per_group = pipeline.maxTotalThreadsPerThreadgroup()
 
-        self.logger.debug(f"[MetalGibbs] Dispatch: {num_threadgroups.width} threadgroups x {threads_per_threadgroup.width} threads")
+            # Group samples by problem for locality
+            num_threadgroups_width = num_problems
+            threads_per_threadgroup_width = min(num_reads, max_threads_per_group)
 
-        encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_threadgroups, threads_per_threadgroup)
+            threads_per_threadgroup = Metal.MTLSize(width=threads_per_threadgroup_width, height=1, depth=1)
+            num_threadgroups_size = Metal.MTLSize(width=num_threadgroups_width, height=1, depth=1)
+
+            self.logger.debug(f"[MetalGibbs] Sequential dispatch ({kernel_name}): {num_threadgroups_width} threadgroups x {threads_per_threadgroup_width} threads")
+
+        encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_threadgroups_size, threads_per_threadgroup)
 
         encoder.endEncoding()
         cmd_buf.commit()

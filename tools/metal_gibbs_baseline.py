@@ -30,7 +30,8 @@ def metal_gibbs_baseline_test(
     h_values=None,
     num_models=1,
     topology=None,
-    update_mode="gibbs"
+    update_mode="gibbs",
+    parallel=False
 ):
     """Test Metal Block Gibbs performance with baseline format and evaluation logic.
 
@@ -47,21 +48,24 @@ def metal_gibbs_baseline_test(
                   - File path to embedding (e.g., "path/to/*.embed.json.gz") - auto-detected
                   Default: Advantage2_system1.11
         update_mode: "gibbs" or "metropolis" (default: "gibbs")
+        parallel: Use parallel kernel with threadgroup barriers (default: False)
     """
     if h_values is None:
         h_values = [-1.0, 0.0, 1.0]
 
     mode_name = "Gibbs" if update_mode == "gibbs" else "Metropolis"
-    print(f"Metal Block {mode_name} Baseline Parameter Test")
+    parallel_str = " (Parallel)" if parallel else ""
+    print(f"Metal Block {mode_name}{parallel_str} Baseline Parameter Test")
     print("=" * 50)
     print(f"Timeout: {timeout_minutes} minutes")
     print(f"h_values: {h_values}")
     print(f"Update mode: {update_mode}")
+    print(f"Parallel mode: {parallel}")
 
     # Initialize sampler
     try:
-        gibbs_sampler = MetalGibbsSampler(update_mode=update_mode)
-        print(f"Metal Block {mode_name} sampler ready")
+        gibbs_sampler = MetalGibbsSampler(update_mode=update_mode, parallel=parallel)
+        print(f"Metal Block {mode_name}{parallel_str} sampler ready")
         print(f"Color block sizes: {gibbs_sampler.block_counts}")
     except Exception as e:
         print(f"Metal Block {mode_name} sampler failed: {e}")
@@ -134,10 +138,11 @@ def metal_gibbs_baseline_test(
 
     results = {
         'timeout_minutes': timeout_minutes,
-        'sampler_type': f'metal-{update_mode}',
+        'sampler_type': f'metal-{update_mode}' + ('-parallel' if parallel else ''),
         'topology': topology_desc,
         'topology_arg': topology if topology else "default",
         'update_mode': update_mode,
+        'parallel': parallel,
         'problem_info': {
             'num_variables': len(h),
             'num_couplings': len(J),
@@ -370,6 +375,11 @@ def main():
         default='gibbs',
         help='Update mode: gibbs (default) or metropolis'
     )
+    parser.add_argument(
+        '--parallel',
+        action='store_true',
+        help='Use parallel kernel with threadgroup barriers for true parallel color block updates'
+    )
 
     args = parser.parse_args()
 
@@ -401,7 +411,8 @@ def main():
     output_file = args.output
     if not output_file:
         timestamp = int(time.time())
-        output_file = f"metal_{args.update_mode}_baseline_results_{timestamp}.json"
+        parallel_suffix = "_parallel" if args.parallel else ""
+        output_file = f"metal_{args.update_mode}{parallel_suffix}_baseline_results_{timestamp}.json"
 
     # Run test
     metal_gibbs_baseline_test(
@@ -411,10 +422,12 @@ def main():
         h_values=h_values,
         num_models=num_models,
         topology=args.topology,
-        update_mode=args.update_mode
+        update_mode=args.update_mode,
+        parallel=args.parallel
     )
 
-    print(f"\nMetal Block {mode_name} baseline test complete!")
+    parallel_str = " (Parallel)" if args.parallel else ""
+    print(f"\nMetal Block {mode_name}{parallel_str} baseline test complete!")
 
 
 if __name__ == "__main__":

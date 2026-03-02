@@ -705,12 +705,13 @@ class NetworkNode(Node):
                         response_future.set_result(False)
                         continue
                     # Base case we can process the block
-                    result = await self.receive_block(block, force_reorg=force_reorg)
-                    if not result:
+                    accepted, reason = await self.receive_block(block, force_reorg=force_reorg)
+                    if not accepted:
                         miner_id = block.miner_info.miner_id if block.miner_info else "unknown"
                         source = f" (via {peer_address})" if peer_address else ""
-                        self.logger.warning(f"Block {block.header.index} mined by {miner_id}{source} was rejected")
-                    response_future.set_result(result)
+                        reason_str = f": {reason}" if reason else ""
+                        self.logger.warning(f"Block {block.header.index} mined by {miner_id}{source} was rejected{reason_str}")
+                    response_future.set_result(accepted)
                 except Exception as e:
                     self.logger.info(f"Error processing block: {e}")
                     if not response_future.done():
@@ -801,9 +802,10 @@ class NetworkNode(Node):
                 self.logger.info(f"Processing cached block {next_block_index} received during sync")
 
                 # Process the cached block
-                success = await self.receive_block(cached_block, force_reorg=force_reorg)
+                success, reason = await self.receive_block(cached_block, force_reorg=force_reorg)
                 if not success:
-                    self.logger.error(f"Failed to process cached block {next_block_index}")
+                    reason_str = f": {reason}" if reason else ""
+                    self.logger.error(f"Failed to process cached block {next_block_index}{reason_str}")
                     break
 
                 next_block_index += 1
@@ -983,36 +985,43 @@ class NetworkNode(Node):
         except Exception as e:
             self.logger.exception(f"Error updating stats cache: {e}")
 
-    async def receive_block(self, block: Block, force_reorg: bool = False) -> bool:
+    async def receive_block(self, block: Block, force_reorg: bool = False) -> tuple[bool, str | None]:
         """Receive a block from the network with epoch validation and max block limit.
 
         Args:
             block: The block to receive.
             force_reorg: If True, skip timestamp comparison to allow chain reorganization
                         during sync (longest chain wins). Default False.
+
+        Returns:
+            Tuple of (accepted: bool, rejection_reason: str | None).
         """
         # Reject blocks that are too far in the future (beyond max sync limit)
         if block.header.index > self.max_sync_block_index:
-            self.logger.debug(f"Block {block.header.index} rejected: index > max_sync_block_index {self.max_sync_block_index}")
-            return False
+            reason = f"index > max_sync_block_index {self.max_sync_block_index}"
+            self.logger.debug(f"Block {block.header.index} rejected: {reason}")
+            return False, reason
 
         # Check against previous epoch to prevent accepting blocks from old chain epoch
         async with self.chain_lock:
             if self.previous_epoch:
                 # Reject if this is block 1 from the previous epoch
                 if block.header.index == 1 and block.hash and block.hash == self.previous_epoch.first_hash:
-                    self.logger.warning(f"Block 1 rejected: hash {block.hash.hex()[:8]}... matches previous epoch first_hash")
-                    return False
+                    reason = "matches previous epoch first_hash"
+                    self.logger.warning(f"Block 1 rejected: hash {block.hash.hex()[:8]}... {reason}")
+                    return False, reason
 
                 # Reject if this block hash matches the last block from the previous epoch
                 if block.hash and block.hash == self.previous_epoch.last_hash:
-                    self.logger.warning(f"Block {block.header.index} rejected: hash {block.hash.hex()[:8]}... matches previous epoch last_hash")
-                    return False
+                    reason = "matches previous epoch last_hash"
+                    self.logger.warning(f"Block {block.header.index} rejected: hash {block.hash.hex()[:8]}... {reason}")
+                    return False, reason
 
                 # Reject if timestamp is older than the last timestamp from the previous epoch
                 if block.header.timestamp <= self.previous_epoch.last_timestamp:
-                    self.logger.warning(f"Block {block.header.index} rejected: timestamp {block.header.timestamp} <= previous epoch last_timestamp {self.previous_epoch.last_timestamp}")
-                    return False
+                    reason = f"timestamp <= previous epoch ({block.header.timestamp} <= {self.previous_epoch.last_timestamp})"
+                    self.logger.warning(f"Block {block.header.index} rejected: {reason}")
+                    return False, reason
 
         # If all validations pass, call parent receive_block
         return await super().receive_block(block, force_reorg=force_reorg)
@@ -1041,9 +1050,12 @@ class NetworkNode(Node):
         self.logger.info(f"Candidate Block {wb.header.index}-{wb.hash.hex()[:8]} mined on this node!")
     
         if wb.header.index == self.get_latest_block().header.index + 1:
-            await self.receive_block(wb)
-            self.logger.info(f"Accepted block {wb.header.index}-{wb.hash.hex()[:8]} from {wb.miner_info.miner_id}")
-            asyncio.create_task(self.gossip_block(wb))
+            accepted, reason = await self.receive_block(wb)
+            if accepted:
+                self.logger.info(f"Accepted block {wb.header.index}-{wb.hash.hex()[:8]} from {wb.miner_info.miner_id}")
+                asyncio.create_task(self.gossip_block(wb))
+            else:
+                self.logger.warning(f"Own block {wb.header.index}-{wb.hash.hex()[:8]} was rejected: {reason}")
         else:
             self.logger.info(f"Candidate Block {wb.header.index}-{wb.hash.hex()[:8]} sniped by another miner!")
 
