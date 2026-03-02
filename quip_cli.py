@@ -654,39 +654,6 @@ def network_node_main():
 
     quip_network_node(standalone_mode=False)
 
-# -----------------------------
-# quip-node-stats (experimental)
-# -----------------------------
-
-@click.command()
-@click.option("--config", type=click.Path(exists=True, dir_okay=False), help="Path to TOML config file")
-@click.option("--interval", type=float, default=5.0, help="Seconds between stats prints")
-@click.pass_context
-def quip_node_stats(_: click.Context, config: Optional[str], interval: float):
-    """Run a single in-process node and periodically print stats to stdout.
-
-    This is an experimental helper that constructs Node directly from TOML config
-    and prints Node.get_stats() every --interval seconds. Ctrl-C to stop.
-    """
-    # Set multiprocessing start method to 'spawn' to avoid context mixing issues
-    multiprocessing.set_start_method('spawn', force=True)
-
-    cfg = _load_config(config)
-    miners_config = cfg or {}
-    genesis_block=load_genesis_block(cfg.get("genesis_config", "genesis_block.json"))
-    node = Node(node_id="stats-node", miners_config=miners_config, genesis_block=genesis_block)
-    click.echo("Starting stats loop (Ctrl-C to stop)...")
-    try:
-        while True:
-            stats = node.get_stats()
-            click.echo(json.dumps(stats, indent=2))
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        click.echo("Stopping...")
-    finally:
-        node.close()
-
-
 def network_simulator_main():
     # Set multiprocessing start method to 'spawn' to avoid context mixing issues
     multiprocessing.set_start_method('spawn', force=True)
