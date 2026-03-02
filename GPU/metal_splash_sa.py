@@ -25,7 +25,7 @@ import dimod
 import Metal
 import numpy as np
 
-from shared.beta_schedule import _default_ising_beta_range
+from GPU.metal_utils import _create_buffer, build_csr_from_ising, compute_beta_schedule, unpack_metal_results
 
 
 class MetalSplashSampler:
@@ -100,19 +100,6 @@ class MetalSplashSampler:
 
         self._command_queue = self.device.newCommandQueue()
 
-    def _create_buffer(self, data: np.ndarray, label: str = ""):
-        """Create a Metal buffer from numpy array."""
-        if not data.flags['C_CONTIGUOUS']:
-            data = np.ascontiguousarray(data)
-        byte_data = data.tobytes()
-        byte_length = len(byte_data)
-        buf = self.device.newBufferWithBytes_length_options_(
-            byte_data, byte_length, Metal.MTLResourceStorageModeShared
-        )
-        if not buf:
-            raise RuntimeError(f"Failed to create buffer: {label}")
-        return buf
-
     def sample_ising(
         self,
         h: List[Dict[int, float]],
@@ -149,83 +136,17 @@ class MetalSplashSampler:
 
         self.logger.debug(f"[MetalSplash] Processing {num_problems} problems, {num_reads} reads each, {num_sweeps} sweeps")
 
-        # Build CSR representation for the problem
-        # For Splash sampler, we need float J values for potential computation
-        all_nodes = set(h[0].keys()) | set(n for edge in J[0].keys() for n in edge)
-        N = len(all_nodes)
-        node_list = sorted(all_nodes)
-        node_to_idx = {node: idx for idx, node in enumerate(node_list)}
-
-        # Build CSR representation
-        csr_row_ptr = np.zeros(N + 1, dtype=np.int32)
-        csr_col_ind = []
-        csr_J_vals = []
-
-        # Extract h values in node order (float for Splash)
-        h_vals_array = np.zeros(N, dtype=np.float32)
-        for node, h_val in h[0].items():
-            if node in node_to_idx:
-                h_vals_array[node_to_idx[node]] = float(h_val)
-
-        # Count degrees
-        degree = np.zeros(N, dtype=np.int32)
-        for (i, j) in J[0].keys():
-            if i in node_to_idx and j in node_to_idx:
-                degree[node_to_idx[i]] += 1
-                degree[node_to_idx[j]] += 1
-
-        # Build CSR
-        csr_row_ptr[1:] = np.cumsum(degree)
-
-        adjacency = [[] for _ in range(N)]
-        for (i, j), Jij in J[0].items():
-            if i in node_to_idx and j in node_to_idx:
-                idx_i = node_to_idx[i]
-                idx_j = node_to_idx[j]
-                adjacency[idx_i].append((idx_j, Jij))
-                adjacency[idx_j].append((idx_i, Jij))
-
-        for i in range(N):
-            adjacency[i].sort()
-            for j, Jij in adjacency[i]:
-                csr_col_ind.append(j)
-                csr_J_vals.append(float(Jij))
-
-        csr_row_ptr = np.array(csr_row_ptr, dtype=np.int32)
-        csr_col_ind = np.array(csr_col_ind, dtype=np.int32)
-        csr_J_vals = np.array(csr_J_vals, dtype=np.float32)
+        # Build CSR representation for the problem (use float for Splash)
+        csr_row_ptr, csr_col_ind, csr_J_vals, h_vals_array, node_to_idx, N = build_csr_from_ising(
+            h[0], J[0], use_float=True
+        )
 
         num_edges = len(csr_col_ind) // 2
 
         # Compute beta schedule
-        if beta_schedule_type == "custom":
-            if beta_schedule is None:
-                raise ValueError("'beta_schedule' must be provided for beta_schedule_type = 'custom'")
-            beta_schedule = np.array(beta_schedule, dtype=np.float32)
-            num_betas = len(beta_schedule)
-            if num_sweeps != num_betas * num_sweeps_per_beta:
-                raise ValueError(f"num_sweeps ({num_sweeps}) must equal len(beta_schedule) * num_sweeps_per_beta")
-        else:
-            num_betas, rem = divmod(num_sweeps, num_sweeps_per_beta)
-            if rem > 0 or num_betas < 0:
-                raise ValueError("'num_sweeps' must be divisible by 'num_sweeps_per_beta'")
-
-            if beta_range is None:
-                beta_range = _default_ising_beta_range(h[0], J[0])
-            elif len(beta_range) != 2 or min(beta_range) < 0:
-                raise ValueError("'beta_range' should be a 2-tuple of positive numbers")
-
-            if num_betas == 1:
-                beta_schedule = np.array([beta_range[-1]], dtype=np.float32)
-            else:
-                if beta_schedule_type == "linear":
-                    beta_schedule = np.linspace(beta_range[0], beta_range[1], num=num_betas, dtype=np.float32)
-                elif beta_schedule_type == "geometric":
-                    if min(beta_range) <= 0:
-                        raise ValueError("'beta_range' must contain non-zero values for geometric schedule")
-                    beta_schedule = np.geomspace(beta_range[0], beta_range[1], num=num_betas, dtype=np.float32)
-                else:
-                    raise ValueError(f"Beta schedule type {beta_schedule_type} not implemented")
+        beta_schedule, beta_range = compute_beta_schedule(
+            h[0], J[0], num_sweeps, num_sweeps_per_beta, beta_range, beta_schedule_type, beta_schedule
+        )
 
         self.logger.debug(f"[MetalSplash] Beta schedule: {len(beta_schedule)} betas from {beta_schedule[0]:.4f} to {beta_schedule[-1]:.4f}")
 
@@ -234,11 +155,11 @@ class MetalSplashSampler:
             seed = np.random.randint(0, 2**31)
 
         # Create Metal buffers
-        csr_row_ptr_buf = self._create_buffer(csr_row_ptr, "csr_row_ptr")
-        csr_col_ind_buf = self._create_buffer(csr_col_ind, "csr_col_ind")
-        csr_J_vals_buf = self._create_buffer(csr_J_vals, "csr_J_vals")
-        h_vals_buf = self._create_buffer(h_vals_array, "h_vals")
-        beta_schedule_buf = self._create_buffer(beta_schedule, "beta_schedule")
+        csr_row_ptr_buf = _create_buffer(self.device, csr_row_ptr, "csr_row_ptr")
+        csr_col_ind_buf = _create_buffer(self.device, csr_col_ind, "csr_col_ind")
+        csr_J_vals_buf = _create_buffer(self.device, csr_J_vals, "csr_J_vals")
+        h_vals_buf = _create_buffer(self.device, h_vals_array, "h_vals")
+        beta_schedule_buf = _create_buffer(self.device, beta_schedule, "beta_schedule")
 
         # Scalar parameters
         N_bytes = np.int32(N).tobytes()
@@ -347,40 +268,19 @@ class MetalSplashSampler:
 
         # Unpack samples and build SampleSets
         samplesets = []
-        idx_to_node = {idx: node for node, idx in node_to_idx.items()}
-
         for prob_idx in range(num_problems):
             prob_start = prob_idx * num_reads
             prob_end = prob_start + num_reads
             prob_packed = samples_raw[prob_start:prob_end]
             prob_energies = energies_raw[prob_start:prob_end]
 
-            # Unpack bit-packed samples
-            samples_data = np.zeros((num_reads, N), dtype=np.int8)
-            for read_idx in range(num_reads):
-                for var in range(N):
-                    byte_idx = var >> 3
-                    bit_idx = var & 7
-                    bit = (prob_packed[read_idx, byte_idx] >> bit_idx) & 1
-                    samples_data[read_idx, var] = -1 if bit else 1
-
-            # Build dimod SampleSet with original node labels
-            samples_list = []
-            for read_idx in range(num_reads):
-                sample_dict = {idx_to_node[idx]: int(samples_data[read_idx, idx]) for idx in range(N)}
-                samples_list.append(sample_dict)
-
-            sampleset = dimod.SampleSet.from_samples(
-                samples_list,
-                vartype=dimod.SPIN,
-                energy=prob_energies.astype(float),
-                info={
-                    "beta_range": beta_range,
-                    "beta_schedule_type": beta_schedule_type,
-                    "sampler_type": "splash",
-                    "max_treewidth": self.max_treewidth,
-                    "max_splash_size": self.max_splash_size
-                }
+            # Unpack and build SampleSet
+            sampleset = unpack_metal_results(
+                prob_packed, prob_energies, N, num_reads, node_to_idx,
+                beta_range, beta_schedule_type,
+                sampler_type="splash",
+                max_treewidth=self.max_treewidth,
+                max_splash_size=self.max_splash_size
             )
             samplesets.append(sampleset)
 
