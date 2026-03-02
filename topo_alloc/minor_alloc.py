@@ -75,12 +75,13 @@ new chains through already-placed nodes (path re-use).  A completely free
 node gets weight D^n, making it expensive and discouraging premature
 commitment to unused resources.
 
-Ordering heuristics (`ORDER_BY_DEGREE`, `ORDER_BY_CENTRALITY`)
----------------------------------------------------------------
+Ordering heuristics (`ORDER_BY_DEGREE_ASC`, `ORDER_BY_CENTRALITY`)
+-------------------------------------------------------------------
 The greedy placement order in Stage 1 affects quality significantly.
-Placing the most *constrained* source nodes first (high degree or high
-betweenness centrality) tends to produce shorter chains and higher success
-rates, because the constrained nodes get first pick of the target topology.
+``ORDER_BY_DEGREE_ASC`` places low-degree nodes first and the hub last,
+so Dijkstra can bridge all already-placed neighbours when building the
+hub's chain.  ``ORDER_BY_CENTRALITY`` sorts by descending betweenness,
+which is particularly effective on tree-structured source graphs.
 Within each tier of equal-valued nodes the order is shuffled randomly,
 preserving the coarse ranking while still exploring different placements
 across tries.
@@ -105,68 +106,35 @@ class EmbedOption(enum.Flag):
 
     Multiple options may be combined with the ``|`` operator::
 
-        find_embedding(source, target, options=EmbedOption.ORDER_BY_DEGREE | EmbedOption.REFINE_LONGEST_CHAINS)
+        find_embedding(source, target, options=EmbedOption.ORDER_BY_DEGREE_ASC | EmbedOption.REFINE_LONGEST_CHAINS)
 
     Options
     -------
-    ORDER_BY_DEGREE
-        Sort source nodes in descending order of their degree in the source
-        graph before placement.  High-degree (more constrained) nodes are
-        placed first, which can reduce chain lengths and improve embedding
-        quality on structured topologies.  Within ties the order is shuffled
-        randomly across tries.
-
     ORDER_BY_DEGREE_ASC
         Sort source nodes in *ascending* order of their degree in the source
         graph before placement.  Low-degree nodes are placed first (cheaply,
         with few constraints) and the high-degree hub is placed last, by
         which point all of its neighbours are already positioned — Dijkstra
         then builds the hub's chain as a natural bridge through them.  This
-        avoids the failure mode of ``ORDER_BY_DEGREE`` on scale-free
-        (e.g. Barabási-Albert) graphs with a dominant hub: placing the hub
-        first with no context anchors it at an isolated target node that all
-        6–7 neighbours must then route back to, which is extremely hard to
-        satisfy.  Takes precedence over ``ORDER_BY_DEGREE`` when both are
-        set (ascending wins).
+        avoids the failure mode of descending-degree ordering on scale-free
+        (e.g. Barabási-Albert) graphs with a dominant hub.
 
     ORDER_BY_CENTRALITY
         Sort source nodes in descending order of their betweenness centrality
         in the source graph.  Nodes that lie on many shortest paths are placed
         first.  Within ties the order is shuffled randomly across tries.
-        Takes precedence over ``ORDER_BY_DEGREE`` when both are set.
+        Takes precedence over ``ORDER_BY_DEGREE_ASC`` when both are set.
 
     REFINE_LONGEST_CHAINS
         After overlap-removal refinement converges, run a second pass that
         re-embeds the source node with the longest chain for
         ``refinement_constant * |V(H)|`` iterations.  Each accepted
         re-embedding is strictly non-worsening.
-
-    USE_VERTEX_WEIGHTS
-        Use the vertex-weight scheme from Cai, Macready & Roy (2014).
-        Each target node g receives weight
-        ``wt(g) = D^{|{i : g ∉ φ(x_i)}|}``, replacing the flat
-        ``overlap_penalty`` approach.
-
-    PREFER_ARTICULATION_POINTS
-        When placing a source node that has no already-placed neighbours
-        (i.e. choosing the initial anchor for a new connected component),
-        and that source node is an *articulation point* of the source graph
-        (its removal would disconnect the source graph), anchor it on the
-        highest-degree free target node rather than an arbitrary free node.
-        Articulation points in the source are the most structurally
-        constrained nodes — they sit between otherwise-disconnected parts of
-        the source graph and must be reachable by neighbours on both sides.
-        Placing them on high-degree target nodes maximises the routing
-        options available for those neighbours.  For non-articulation source
-        nodes the fallback (first free target node) is used unchanged.
     """
 
-    ORDER_BY_DEGREE = enum.auto()
     ORDER_BY_DEGREE_ASC = enum.auto()
     ORDER_BY_CENTRALITY = enum.auto()
     REFINE_LONGEST_CHAINS = enum.auto()
-    USE_VERTEX_WEIGHTS = enum.auto()
-    PREFER_ARTICULATION_POINTS = enum.auto()
 
 
 def find_embedding[G, H](
@@ -199,8 +167,7 @@ def find_embedding[G, H](
         to `k * |V(H)|`.
     overlap_penalty: float
         The weight given to an edge that leads towards a node belonging
-        to different vertex model.  Only used when `EmbedOption.USE_VERTEX_WEIGHTS`
-        is not set.
+        to a different vertex model.
     options: EmbedOption
         A set of `EmbedOption` flags controlling the embedding strategy.
         Multiple options may be combined with ``|``.  See `EmbedOption`
@@ -211,38 +178,17 @@ def find_embedding[G, H](
     sets of `G` nodes mapped. Returns `None` if after the number of `tries`
     there is no non-overlapping map.
     """
-    order_by_degree = EmbedOption.ORDER_BY_DEGREE in options
     order_by_degree_asc = EmbedOption.ORDER_BY_DEGREE_ASC in options
     order_by_centrality = EmbedOption.ORDER_BY_CENTRALITY in options
     refine_longest_chains = EmbedOption.REFINE_LONGEST_CHAINS in options
-    use_vertex_weights = EmbedOption.USE_VERTEX_WEIGHTS in options
-    prefer_art_pts = EmbedOption.PREFER_ARTICULATION_POINTS in options
 
     refine_rounds = refinment_constant * len(source.nodes)
     rng = rng_factory()
     src_nodes = list(source.nodes)
     src_adj = {h: list(source.neighbors(h)) for h in src_nodes}
 
-    # Pre-compute source articulation points once per embedding call (O(V+E)).
-    # These are source nodes whose removal would disconnect the source graph;
-    # they are anchored on the highest-degree free target node to maximise
-    # routing options for their neighbours on both sides of the cut.
-    source_art_pts: frozenset[H] = (
-        frozenset(nx.articulation_points(source)) if prefer_art_pts else frozenset()
-    )
-    degree_order = None
     degree_asc_order = None
     centrality_order = None
-
-    # Pre-compute target diameter for vertex-weight mode (Cai et al. 2014).
-    # nx.diameter requires a connected graph; fall back to a safe lower-bound
-    # of 2 on disconnected targets so the weight formula remains well-defined.
-    # In the default overlap-penalty mode the diameter is unused (set to 1).
-    target_diameter = (
-        (nx.diameter(target) if nx.is_connected(target) else 2)
-        if use_vertex_weights
-        else 1
-    )
 
     centrality = None
     if order_by_centrality:
@@ -252,10 +198,6 @@ def find_embedding[G, H](
         # Ascending degree: low-degree nodes placed first (cheap, few constraints),
         # hub placed last so Dijkstra can bridge all already-placed neighbours.
         degree_asc_order = sorted(src_nodes, key=lambda h: source.degree(h))
-    elif order_by_degree:
-        # Seed the order by descending source-graph degree so that the most
-        # constrained nodes are placed first.  Ties are broken randomly.
-        degree_order = sorted(src_nodes, key=lambda h: source.degree(h), reverse=True)
 
     for _ in range(tries):
         # --------------------------------
@@ -271,12 +213,6 @@ def find_embedding[G, H](
             order = _shuffle_within_tiers(
                 degree_asc_order or [], lambda h: source.degree(h), rng
             )
-        elif order_by_degree:
-            # Shuffle within each degree tier to keep randomness across tries
-            # while preserving the coarse degree ordering.
-            order = _shuffle_within_tiers(
-                degree_order or [], lambda h: source.degree(h), rng
-            )
         else:
             order = list(src_nodes)
             rng.shuffle(order)
@@ -288,10 +224,6 @@ def find_embedding[G, H](
                 phi,
                 target,
                 overlap_penalty,
-                use_vertex_weights=use_vertex_weights,
-                target_diameter=target_diameter,
-                num_source_nodes=len(src_nodes),
-                source_art_pts=source_art_pts,
             )
             if model is None:
                 break
@@ -300,11 +232,6 @@ def find_embedding[G, H](
         # --------------------------------
         # Stage 2 - refinement: re-embed nodes with overlapping models
         # --------------------------------
-        # Overlap resolution always uses the flat overlap_penalty regardless
-        # of use_vertex_weights.  Vertex weights encourage path re-use and
-        # intentionally create overlapping models; the penalty-based scheme is
-        # better suited for untangling them because it actively steers away
-        # from occupied nodes.
         for _ in range(refine_rounds):
             # Sum up all overlaps
             counters: defaultdict[G, int] = defaultdict(int)
@@ -327,10 +254,6 @@ def find_embedding[G, H](
                     phi,
                     target,
                     overlap_penalty=overlap_penalty,
-                    use_vertex_weights=False,
-                    target_diameter=1,
-                    num_source_nodes=len(src_nodes),
-                    source_art_pts=source_art_pts,
                 )
                 if model is not None:
                     phi[x] = model
@@ -346,10 +269,6 @@ def find_embedding[G, H](
                 target,
                 overlap_penalty=overlap_penalty,
                 rounds=refine_rounds,
-                use_vertex_weights=use_vertex_weights,
-                target_diameter=target_diameter,
-                num_source_nodes=len(src_nodes),
-                source_art_pts=source_art_pts,
             )
 
         # --------------------------------
@@ -369,10 +288,6 @@ def _refine_longest_chains[G, H](
     *,
     rounds: int,
     overlap_penalty: float,
-    use_vertex_weights: bool = False,
-    target_diameter: int = 1,
-    num_source_nodes: int = 0,
-    source_art_pts: frozenset[H] = frozenset(),
 ) -> dict[H, list[G]]:
     """
     Refinement pass that repeatedly re-embeds the source node with the
@@ -399,10 +314,6 @@ def _refine_longest_chains[G, H](
             phi,
             graph,
             overlap_penalty,
-            use_vertex_weights=use_vertex_weights,
-            target_diameter=target_diameter,
-            num_source_nodes=num_source_nodes,
-            source_art_pts=source_art_pts,
         )
 
         if candidate is not None and len(candidate) < current_len:
@@ -440,33 +351,12 @@ def build_model[G, H](
     phi: dict[H, list[G]],
     graph: nx.Graph[G],
     overlap_penalty: float,
-    *,
-    use_vertex_weights: bool = False,
-    target_diameter: int = 1,
-    num_source_nodes: int = 0,
-    source_art_pts: frozenset[H] = frozenset(),
 ) -> list[G] | None:
     """
     Build a vertex-model (chain) for source node `x` in `graph`.
 
-    When `use_vertex_weights` is True the Dijkstra edge weights are derived
-    from the vertex-weight formula of Cai, Macready & Roy (2014):
-
-        ``wt(g) = D^{|{i : g ∉ φ(x_i)}|}``
-
-    where
-        - D = diameter of the target topology; and
-        - the exponent counts how many source nodes whose current model *does not*
-          contain target node g.
-
-    A node shared by many vertex-models has a small exponent → low weight,
-    making paths through shared nodes cheap.  A completely free node has
-    exponent n (number of source nodes) → weight D^n, making it expensive.
-    This naturally guides Dijkstra toward compact re-use of already-placed
-    nodes.
-
-    When `use_vertex_weights` is False the original flat `overlap_penalty`
-    scheme is used instead.
+    Dijkstra edge weights penalise passing through target nodes already
+    occupied by another chain via a flat `overlap_penalty` multiplier.
     """
     # Get already placed neighbours to x
     placed_neighbours = [y for y in adjlist[x] if phi[y]]
@@ -474,38 +364,16 @@ def build_model[G, H](
     # Find any other nodes than x in y-models
     occupied: set[G] = set().union(*(set(model) for y, model in phi.items() if y != x))
 
-    # If there is no placed neighbour, pick the anchor target node.
-    # For source articulation points (nodes whose removal disconnects the
-    # source graph) prefer the highest-degree free target node: they sit
-    # between disconnected source components and need maximum routing options.
+    # If there is no placed neighbour, pick the first free anchor target node.
     if not placed_neighbours:
         free = [g for g in graph.nodes if g not in occupied]
         if not free:
             return [next(iter(graph.nodes))]
-        if source_art_pts and x in source_art_pts:
-            free.sort(key=lambda g: graph.degree(g), reverse=True)
         return [free[0]]
 
     # Run Dijkstra's algorithm from multiple sources from v-models.
-    if use_vertex_weights:
-        # Count how many source-node models contain each target node.
-        # (Exclude x itself since its model is being rebuilt.)
-        inclusion_count: dict[G, int] = {}
-        for y, model in phi.items():
-            if y != x:
-                for g in model:
-                    inclusion_count[g] = inclusion_count.get(g, 0) + 1
-
-        n = num_source_nodes or len(phi)
-
-        def weight(_u: G, v: G, _data) -> float:
-            # exponent = #{i : v ∉ φ(x_i)} = n - #{i : v ∈ φ(x_i)}
-            exponent = n - inclusion_count.get(v, 0)
-            return 1.0 + float(target_diameter**exponent)
-    else:
-
-        def weight(_u: G, v: G, _data) -> float:
-            return 1.0 + overlap_penalty * (1.0 if v in occupied else 0.0)
+    def weight(_u: G, v: G, _data) -> float:
+        return 1.0 + overlap_penalty * (1.0 if v in occupied else 0.0)
 
     dist_from = {}
     path_from = {}

@@ -152,92 +152,6 @@ class TestImpossibleEmbeddings:
         assert phi is None
 
 
-class TestDegreeOrdering:
-    """Tests for the order_by_degree heuristic."""
-
-    def test_degree_ordering_produces_valid_embedding(self):
-        """order_by_degree=True must still return a valid embedding."""
-        source = nx.complete_graph(5)
-        target = nx.petersen_graph()
-        phi = find_embedding(
-            source, target, rng_factory=seeded_rng(7), tries=50, options=EmbedOption.ORDER_BY_DEGREE
-        )
-        if phi is not None:
-            assert is_valid_embedding(source, target, phi)
-
-    def test_degree_ordering_k4_into_k4(self):
-        """K_4 into K_4 succeeds with degree ordering (all degrees equal)."""
-        source = nx.complete_graph(4)
-        target = nx.complete_graph(4)
-        phi = find_embedding(
-            source, target, rng_factory=seeded_rng(3), options=EmbedOption.ORDER_BY_DEGREE
-        )
-        assert phi is not None
-        assert is_valid_embedding(source, target, phi)
-
-    def test_degree_ordering_star_graph(self):
-        """Star graph: hub has degree n-1, leaves degree 1 -- hub placed first."""
-        source = nx.star_graph(4)  # 1 hub + 4 leaves
-        target = nx.complete_graph(10)  # fully connected, guarantees success
-        phi = find_embedding(
-            source, target, rng_factory=seeded_rng(0), tries=20, options=EmbedOption.ORDER_BY_DEGREE
-        )
-        assert phi is not None
-        assert is_valid_embedding(source, target, phi)
-
-    def test_degree_ordering_matches_default_validity(self):
-        """Both modes must produce valid embeddings on the same problem."""
-        source = nx.complete_bipartite_graph(3, 3)
-        target = nx.complete_graph(12)  # large fully-connected target
-        phi_random = find_embedding(
-            source, target, rng_factory=seeded_rng(42), tries=50
-        )
-        phi_degree = find_embedding(
-            source,
-            target,
-            rng_factory=seeded_rng(42),
-            tries=50,
-            options=EmbedOption.ORDER_BY_DEGREE,
-        )
-        # Both should succeed and be valid
-        assert phi_random is not None
-        assert phi_degree is not None
-        assert is_valid_embedding(source, target, phi_random)
-        assert is_valid_embedding(source, target, phi_degree)
-
-    def test_shuffle_within_degree_tiers_preserves_degree_order(self):
-        """_shuffle_within_tiers must never place a lower-degree node
-        before a strictly higher-degree node."""
-        import random
-
-        source = nx.star_graph(5)  # hub degree=5, leaves degree=1
-        degree_order = sorted(
-            source.nodes, key=lambda h: source.degree(h), reverse=True
-        )
-        rng_inst = random.Random(0)
-        for _ in range(20):
-            order = _shuffle_within_tiers(degree_order, lambda h: source.degree(h), rng_inst)
-            # The hub (node 0) must be first -- it has degree 5
-            assert order[0] == 0
-            # All leaves come after the hub
-            assert set(order[1:]) == set(range(1, 6))
-
-    def test_shuffle_within_degree_tiers_randomises_ties(self):
-        """Equal-degree nodes should appear in varying orders across calls."""
-        import random
-
-        source = nx.complete_graph(5)  # all degrees equal (4)
-        degree_order = sorted(
-            source.nodes, key=lambda h: source.degree(h), reverse=True
-        )
-        rng_inst = random.Random(1)
-        orderings = {
-            tuple(_shuffle_within_tiers(degree_order, lambda h: source.degree(h), rng_inst))
-            for _ in range(30)
-        }
-        # With 5! = 120 permutations and 30 tries, we expect more than 1 unique ordering
-        assert len(orderings) > 1
-
 
 class TestCentralityOrdering:
     """Tests for the order_by_centrality heuristic."""
@@ -291,8 +205,8 @@ class TestCentralityOrdering:
         assert is_valid_embedding(source, target, phi_random)
         assert is_valid_embedding(source, target, phi_centrality)
 
-    def test_centrality_takes_precedence_over_degree(self):
-        """When both flags are True, order_by_centrality takes precedence and result is valid."""
+    def test_centrality_takes_precedence_over_degree_asc(self):
+        """When both flags are set, ORDER_BY_CENTRALITY takes precedence and result is valid."""
         source = nx.star_graph(4)
         target = nx.complete_graph(10)
         phi = find_embedding(
@@ -300,7 +214,7 @@ class TestCentralityOrdering:
             target,
             rng_factory=seeded_rng(0),
             tries=20,
-            options=EmbedOption.ORDER_BY_DEGREE | EmbedOption.ORDER_BY_CENTRALITY,
+            options=EmbedOption.ORDER_BY_DEGREE_ASC | EmbedOption.ORDER_BY_CENTRALITY,
         )
         assert phi is not None
         assert is_valid_embedding(source, target, phi)
@@ -415,16 +329,16 @@ class TestRandomSourceGraphs:
         _RANDOM_SOURCE_CASES,
         ids=[c[0] for c in _RANDOM_SOURCE_CASES],
     )
-    def test_random_source_degree_order(self, label: str, source: nx.Graph) -> None:
-        """Random source graph embeds with the degree-first ordering."""
+    def test_random_source_degree_asc_order(self, label: str, source: nx.Graph) -> None:
+        """Random source graph embeds with the ascending degree-first ordering."""
         phi = find_embedding(
             source,
             self.TARGET,
             rng_factory=seeded_rng(0),
             tries=30,
-            options=EmbedOption.ORDER_BY_DEGREE,
+            options=EmbedOption.ORDER_BY_DEGREE_ASC,
         )
-        assert phi is not None, f"{label}: embedding failed (degree order)"
+        assert phi is not None, f"{label}: embedding failed (degree_asc order)"
         assert is_valid_embedding(source, self.TARGET, phi), f"{label}: invalid embedding"
 
     @pytest.mark.parametrize(
@@ -462,34 +376,34 @@ class TestLongestChainRefinement:
         if phi is not None:
             assert is_valid_embedding(source, target, phi)
 
-    def test_nodes_used_not_worse_than_degree_order(self):
+    def test_nodes_used_not_worse_than_degree_asc_order(self):
         """
-        longest_chains refinement (on top of degree ordering) should use
-        no more physical nodes than degree ordering alone on the same seed.
+        longest_chains refinement (on top of degree_asc ordering) should use
+        no more physical nodes than degree_asc ordering alone on the same seed.
         """
         source = nx.complete_bipartite_graph(3, 3)
         target = nx.complete_graph(20)
 
-        phi_degree = find_embedding(
-            source, target, rng_factory=seeded_rng(42), tries=50, options=EmbedOption.ORDER_BY_DEGREE
+        phi_degree_asc = find_embedding(
+            source, target, rng_factory=seeded_rng(42), tries=50, options=EmbedOption.ORDER_BY_DEGREE_ASC
         )
         phi_longest = find_embedding(
             source,
             target,
             rng_factory=seeded_rng(42),
             tries=50,
-            options=EmbedOption.REFINE_LONGEST_CHAINS,
+            options=EmbedOption.ORDER_BY_DEGREE_ASC | EmbedOption.REFINE_LONGEST_CHAINS,
         )
 
-        assert phi_degree is not None
+        assert phi_degree_asc is not None
         assert phi_longest is not None
-        assert is_valid_embedding(source, target, phi_degree)
+        assert is_valid_embedding(source, target, phi_degree_asc)
         assert is_valid_embedding(source, target, phi_longest)
 
-        nodes_degree = sum(len(m) for m in phi_degree.values())
+        nodes_degree_asc = sum(len(m) for m in phi_degree_asc.values())
         nodes_longest = sum(len(m) for m in phi_longest.values())
         # longest-chain refinement should never produce a strictly worse result
-        assert nodes_longest <= nodes_degree
+        assert nodes_longest <= nodes_degree_asc
 
     def test_k4_into_k4_with_longest_chains(self):
         """K_4 into K_4 succeeds with longest-chain refinement enabled."""
@@ -617,301 +531,3 @@ class TestBuildModel:
             assert nx.is_connected(target.subgraph(result))
 
 
-class TestVertexWeights:
-    """Tests for the use_vertex_weights=True mode (Cai, Macready & Roy 2014)."""
-
-    def test_produces_valid_embedding_k3_into_k4(self):
-        """K_3 embeds into K_4 with vertex weights enabled."""
-        source = nx.complete_graph(3)
-        target = nx.complete_graph(4)
-        phi = find_embedding(
-            source, target, rng_factory=seeded_rng(7), options=EmbedOption.USE_VERTEX_WEIGHTS
-        )
-        assert phi is not None
-        assert is_valid_embedding(source, target, phi)
-
-    def test_produces_valid_embedding_k4_into_k4(self):
-        """K_4 into K_4 succeeds with vertex weights."""
-        source = nx.complete_graph(4)
-        target = nx.complete_graph(4)
-        phi = find_embedding(
-            source, target, rng_factory=seeded_rng(3), options=EmbedOption.USE_VERTEX_WEIGHTS
-        )
-        assert phi is not None
-        assert is_valid_embedding(source, target, phi)
-
-    def test_produces_valid_embedding_path_into_grid(self):
-        """Path embeds into a grid with vertex weights enabled."""
-        source = nx.path_graph(5)
-        target = nx.grid_2d_graph(4, 4)
-        phi = find_embedding(
-            source, target, rng_factory=seeded_rng(0), tries=30, options=EmbedOption.USE_VERTEX_WEIGHTS
-        )
-        assert phi is not None
-        assert is_valid_embedding(source, target, phi)
-
-    def test_produces_valid_embedding_cycle_into_grid(self):
-        """A 4-cycle embeds into a grid with vertex weights enabled."""
-        source = nx.cycle_graph(4)
-        target = nx.grid_2d_graph(3, 3)
-        phi = find_embedding(
-            source, target, rng_factory=seeded_rng(5), options=EmbedOption.USE_VERTEX_WEIGHTS
-        )
-        assert phi is not None
-        assert is_valid_embedding(source, target, phi)
-
-    @pytest.mark.parametrize(
-        "label,source",
-        _RANDOM_SOURCE_CASES,
-        ids=[c[0] for c in _RANDOM_SOURCE_CASES],
-    )
-    def test_random_source_vertex_weights(self, label: str, source: nx.Graph) -> None:
-        """Random source graphs embed correctly with vertex weights."""
-        target = nx.complete_graph(20)
-        phi = find_embedding(
-            source,
-            target,
-            rng_factory=seeded_rng(0),
-            tries=30,
-            options=EmbedOption.USE_VERTEX_WEIGHTS,
-        )
-        assert phi is not None, f"{label}: embedding failed (vertex_weights)"
-        assert is_valid_embedding(source, target, phi), f"{label}: invalid embedding"
-
-    def test_vertex_weights_combined_with_degree_order(self):
-        """vertex_weights + order_by_degree must yield a valid embedding."""
-        source = nx.complete_graph(5)
-        target = nx.petersen_graph()
-        phi = find_embedding(
-            source,
-            target,
-            rng_factory=seeded_rng(7),
-            tries=50,
-            options=EmbedOption.ORDER_BY_DEGREE | EmbedOption.USE_VERTEX_WEIGHTS,
-        )
-        if phi is not None:
-            assert is_valid_embedding(source, target, phi)
-
-    def test_vertex_weights_combined_with_longest_chains(self):
-        """vertex_weights + refine_longest_chains must yield a valid embedding."""
-        source = nx.complete_bipartite_graph(3, 3)
-        target = nx.complete_graph(20)
-        phi = find_embedding(
-            source,
-            target,
-            rng_factory=seeded_rng(42),
-            tries=50,
-            options=EmbedOption.REFINE_LONGEST_CHAINS | EmbedOption.USE_VERTEX_WEIGHTS,
-        )
-        assert phi is not None
-        assert is_valid_embedding(source, target, phi)
-
-    def test_build_model_vertex_weights_weights_occupied_lower(self):
-        """
-        Vertex weights should assign lower Dijkstra cost to nodes already in
-        some vertex-model (inclusion_count > 0) than to completely free nodes.
-
-        We verify this indirectly: with a path target 0-1-2-3, b placed at 0,
-        and c placed at 3, the weight of node 1 (adjacent to 0, used by b)
-        should be lower than node 2 (free).  The model for 'a' should prefer
-        to route through node 1 rather than 2 when possible.
-        """
-        # target: 0-1-2-3, source: b-a-c
-        target = nx.path_graph(4)
-        adjlist = {"a": ["b", "c"], "b": ["a"], "c": ["a"]}
-        phi: dict[str, list[int]] = {"a": [], "b": [0], "c": [3]}
-
-        # With vertex weights D=3 (diameter of path_graph(4)), n=3 source nodes.
-        # inclusion_count: {0: 1, 3: 1}  (one model each for b and c)
-        # wt(0) = 3^(3-1) = 9   (in b's model, distance from source=0 so cost 0 for start)
-        # wt(1) = 3^(3-0) = 27  (not in any model yet)
-        # wt(2) = 3^(3-0) = 27  (not in any model yet)
-        # wt(3) = 3^(3-1) = 9   (in c's model)
-        # Dijkstra from {0}: dist to 1 = wt(1)=27, dist to 2 = 27+27=54
-        # Dijkstra from {3}: dist to 2 = 27, dist to 1 = 27+27=54
-        # Best root minimises sum of distances from both models.
-        # Node 1: dist_b(1)+dist_c(1) = 27 + 54 = 81
-        # Node 2: dist_b(2)+dist_c(2) = 54 + 27 = 81  (symmetric)
-        # Either node 1 or 2 may be root; what matters is that the result is valid.
-        result = build_model(
-            "a",
-            adjlist,
-            phi,
-            target,
-            overlap_penalty=2.0,
-            use_vertex_weights=True,
-            target_diameter=3,
-            num_source_nodes=3,
-        )
-        assert result is not None
-        # Model must be adjacent to both phi[b]={0} and phi[c]={3}
-        assert any(target.has_edge(r, 0) for r in result)
-        assert any(target.has_edge(r, 3) for r in result)
-        if len(result) > 1:
-            assert nx.is_connected(target.subgraph(result))
-
-
-class TestPreferArticulationPoints:
-    """
-    Tests for EmbedOption.PREFER_ARTICULATION_POINTS.
-
-    The option anchors source articulation points (nodes whose removal
-    disconnects the source graph) on the highest-degree free target node,
-    maximising routing options for their neighbours on both sides of the cut.
-    Non-articulation source nodes are unaffected.
-    """
-
-    # -----------------------------------------------------------------------
-    # build_model unit tests
-    # -----------------------------------------------------------------------
-
-    def test_art_pt_anchor_prefers_highest_degree_target_node(self):
-        """
-        Source node that is an articulation point picks the highest-degree
-        free target node, not the first-in-iteration-order target node.
-
-        Source: path P3 (0-1-2).  Node 1 is the only articulation point.
-        Target: path P5 (0-1-2-3-4).  Nodes 1, 2, 3 have degree 2;
-                nodes 0 and 4 have degree 1.  Without the option, build_model
-                would return [0] (first in iteration order).  With the option,
-                it must return a node with the maximum degree (2).
-        """
-        source = nx.path_graph(3)
-        art_pts = frozenset(nx.articulation_points(source))
-        assert art_pts == {1}, "Expected node 1 to be the sole AP of P3"
-
-        target = nx.path_graph(5)
-        adjlist = {n: list(source.neighbors(n)) for n in source.nodes}
-        phi = {n: [] for n in source.nodes}
-
-        model = build_model(1, adjlist, phi, target, overlap_penalty=2.0,
-                            source_art_pts=art_pts)
-        assert model is not None and len(model) == 1
-        max_deg = max(d for _, d in target.degree())
-        assert target.degree(model[0]) == max_deg, (
-            f"AP anchor should have degree {max_deg}, got {target.degree(model[0])}"
-        )
-
-    def test_non_art_pt_uses_first_free_node(self):
-        """
-        A source node that is NOT an articulation point falls back to the
-        first free target node regardless of degree, as before.
-        """
-        source = nx.path_graph(3)
-        art_pts = frozenset(nx.articulation_points(source))
-        assert 0 not in art_pts
-
-        target = nx.path_graph(5)
-        adjlist = {n: list(source.neighbors(n)) for n in source.nodes}
-        phi = {n: [] for n in source.nodes}
-
-        model = build_model(0, adjlist, phi, target, overlap_penalty=2.0,
-                            source_art_pts=art_pts)
-        assert model is not None and len(model) == 1
-        assert model[0] == 0, "Non-AP source node should pick first free target node"
-
-    def test_no_source_art_pts_unchanged(self):
-        """
-        When the source graph has no articulation points (e.g. a complete
-        graph), passing an empty frozenset leaves the behaviour identical to
-        the default.
-        """
-        source = nx.complete_graph(4)
-        art_pts = frozenset(nx.articulation_points(source))
-        assert len(art_pts) == 0
-
-        target = nx.path_graph(8)
-        adjlist = {n: list(source.neighbors(n)) for n in source.nodes}
-        phi = {n: [] for n in source.nodes}
-
-        model_with = build_model(0, adjlist, phi, target, overlap_penalty=2.0,
-                                 source_art_pts=art_pts)
-        model_without = build_model(0, adjlist, phi, target, overlap_penalty=2.0)
-        assert model_with == model_without
-
-    def test_fallback_when_all_high_degree_nodes_occupied(self):
-        """
-        If the highest-degree target nodes are already occupied, the option
-        still returns a valid (lower-degree) free node.
-        """
-        source = nx.path_graph(3)
-        art_pts = frozenset(nx.articulation_points(source))
-
-        # Target: star with center 0 (degree 4), leaves 1-4 (degree 1)
-        target = nx.star_graph(4)
-        adjlist = {n: list(source.neighbors(n)) for n in source.nodes}
-        # Occupy the centre (highest-degree node)
-        phi = {0: [], 1: [0], 2: []}  # source node 1 already occupies target 0
-
-        model = build_model(0, adjlist, phi, target, overlap_penalty=2.0,
-                            source_art_pts=art_pts)
-        assert model is not None and len(model) == 1
-        assert model[0] != 0, "Centre is occupied; AP should pick a different node"
-
-    # -----------------------------------------------------------------------
-    # find_embedding integration tests
-    # -----------------------------------------------------------------------
-
-    def test_valid_embedding_path_into_grid(self):
-        """Path graph (many articulation points) embeds into a grid."""
-        source = nx.path_graph(6)
-        target = nx.grid_2d_graph(4, 4)
-        phi = find_embedding(
-            source, target,
-            rng_factory=seeded_rng(0), tries=30,
-            options=EmbedOption.PREFER_ARTICULATION_POINTS,
-        )
-        assert phi is not None
-        assert is_valid_embedding(source, target, phi)
-
-    def test_valid_embedding_k4_into_k4(self):
-        """K_4 (no articulation points) with the flag is identical to default."""
-        source = nx.complete_graph(4)
-        target = nx.complete_graph(4)
-        phi = find_embedding(
-            source, target,
-            rng_factory=seeded_rng(3),
-            options=EmbedOption.PREFER_ARTICULATION_POINTS,
-        )
-        assert phi is not None
-        assert is_valid_embedding(source, target, phi)
-
-    @pytest.mark.parametrize(
-        "label,source",
-        _RANDOM_SOURCE_CASES,
-        ids=[c[0] for c in _RANDOM_SOURCE_CASES],
-    )
-    def test_random_source_art_pts(self, label: str, source: nx.Graph) -> None:
-        """Random source graphs embed with PREFER_ARTICULATION_POINTS."""
-        target = nx.complete_graph(20)
-        phi = find_embedding(
-            source, target,
-            rng_factory=seeded_rng(0), tries=30,
-            options=EmbedOption.PREFER_ARTICULATION_POINTS,
-        )
-        assert phi is not None, f"{label}: embedding failed"
-        assert is_valid_embedding(source, target, phi), f"{label}: invalid embedding"
-
-    def test_combined_with_degree_order(self):
-        """ORDER_BY_DEGREE | PREFER_ARTICULATION_POINTS produces a valid embedding."""
-        source = nx.path_graph(6)
-        target = nx.grid_2d_graph(4, 4)
-        phi = find_embedding(
-            source, target,
-            rng_factory=seeded_rng(7), tries=30,
-            options=EmbedOption.ORDER_BY_DEGREE | EmbedOption.PREFER_ARTICULATION_POINTS,
-        )
-        assert phi is not None
-        assert is_valid_embedding(source, target, phi)
-
-    def test_combined_with_longest_chains(self):
-        """PREFER_ARTICULATION_POINTS + REFINE_LONGEST_CHAINS is valid."""
-        source = nx.path_graph(6)
-        target = nx.complete_graph(20)
-        phi = find_embedding(
-            source, target,
-            rng_factory=seeded_rng(42), tries=20,
-            options=EmbedOption.PREFER_ARTICULATION_POINTS | EmbedOption.REFINE_LONGEST_CHAINS,
-        )
-        assert phi is not None
-        assert is_valid_embedding(source, target, phi)

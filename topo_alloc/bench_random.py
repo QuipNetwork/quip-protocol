@@ -2,8 +2,7 @@
 Benchmark minor-embedding on randomly generated source graphs.
 
 Generates a configurable number of random source graphs, embeds each into a
-chosen target topology, and prints per-sample and aggregate statistics.  Two
-ordering strategies from find_embedding can be compared side-by-side.
+chosen target topology, and prints per-sample and aggregate statistics.
 
 Usage examples
 --------------
@@ -11,17 +10,13 @@ Usage examples
     python -m topo_alloc.bench_random --graph-model er --nodes 8 --er-p 0.5 \\
         --topology chimera --topology-size 4 --samples 20 --strategy both
 
-# Barabási-Albert graphs, degree-order strategy only:
+# Barabási-Albert graphs, degree-asc strategy only:
     python -m topo_alloc.bench_random --graph-model ba --nodes 10 --ba-m 3 \\
-        --topology zephyr --topology-size 3 --samples 15 --strategy degree
+        --topology zephyr --topology-size 3 --samples 15 --strategy degree_asc
 
-# Compare all strategies (random, degree, centrality, longest_chains, vertex_weights):
+# Compare all strategies:
     python -m topo_alloc.bench_random --graph-model er --nodes 8 --er-p 0.5 \\
         --topology chimera --topology-size 4 --samples 20 --strategy all
-
-# Vertex-weight strategy (Cai, Macready & Roy 2014):
-    python -m topo_alloc.bench_random --graph-model er --nodes 8 --er-p 0.5 \\
-        --topology chimera --topology-size 4 --samples 20 --strategy vertex_weights
 
 # Random trees embedded into a Pegasus topology, CSV output:
     python -m topo_alloc.bench_random --graph-model tree --nodes 12 \\
@@ -131,20 +126,12 @@ def _run_sample(
         options = select_embed_options(source, target, priority=priority)
     else:
         options = EmbedOption(0)
-        if strategy in ("degree", "longest_chains"):
-            options |= EmbedOption.ORDER_BY_DEGREE
         if strategy == "degree_asc":
             options |= EmbedOption.ORDER_BY_DEGREE_ASC
         if strategy == "centrality":
             options |= EmbedOption.ORDER_BY_CENTRALITY
         if strategy == "longest_chains":
-            options |= EmbedOption.REFINE_LONGEST_CHAINS
-        if strategy == "vertex_weights":
-            options |= EmbedOption.USE_VERTEX_WEIGHTS
-        if strategy in ("art_pts", "degree_art"):
-            options |= EmbedOption.PREFER_ARTICULATION_POINTS
-        if strategy == "degree_art":
-            options |= EmbedOption.ORDER_BY_DEGREE
+            options |= EmbedOption.ORDER_BY_DEGREE_ASC | EmbedOption.REFINE_LONGEST_CHAINS
     t0 = time.perf_counter()
     embedding = find_embedding(
         source,
@@ -360,8 +347,7 @@ def _write_csv(results: list[SampleResult], path: str) -> None:
     "--strategy",
     type=click.Choice(
         [
-            "random", "degree", "degree_asc", "centrality", "longest_chains",
-            "vertex_weights", "art_pts", "degree_art",
+            "random", "degree_asc", "centrality", "longest_chains",
             "auto", "auto_quality", "auto_speed",
             "both", "all",
         ]
@@ -371,17 +357,13 @@ def _write_csv(results: list[SampleResult], path: str) -> None:
     help=(
         "Ordering strategy for find_embedding.  "
         "'random' = uniform shuffle,  "
-        "'degree' = descending source-degree first,  "
         "'degree_asc' = ascending source-degree first (hub placed last),  "
         "'centrality' = descending betweenness centrality first,  "
-        "'longest_chains' = degree-order placement + longest-chain refinement,  "
-        "'vertex_weights' = vertex-weight Dijkstra scheme (Cai et al. 2014),  "
-        "'art_pts' = anchor source articulation-points on highest-degree target nodes,  "
-        "'degree_art' = degree ordering + articulation-point anchoring,  "
+        "'longest_chains' = degree-asc placement + longest-chain refinement,  "
         "'auto' = select_embed_options (balanced priority),  "
         "'auto_quality' = select_embed_options (quality priority),  "
         "'auto_speed' = select_embed_options (speed priority),  "
-        "'both' = random vs degree,  "
+        "'both' = random vs degree_asc,  "
         "'all' = all strategies including auto."
     ),
 )
@@ -478,11 +460,10 @@ def main(
         topo_label = f"{topology}({topology_size})"
 
     if strategy == "both":
-        strategies = ["random", "degree"]
+        strategies = ["random", "degree_asc"]
     elif strategy == "all":
         strategies = [
-            "random", "degree", "degree_asc", "centrality", "longest_chains",
-            "vertex_weights", "art_pts", "degree_art",
+            "random", "degree_asc", "centrality", "longest_chains",
             "auto", "auto_quality", "auto_speed",
         ]
     else:
