@@ -411,6 +411,17 @@ def _write_csv(results: list[SampleResult], path: str) -> None:
     help="Write per-sample results to this CSV file.",
 )
 @click.option(
+    "--warmup",
+    default=3,
+    show_default=True,
+    type=click.IntRange(min=0),
+    help=(
+        "Number of warmup rounds to run before recording results.  "
+        "Uses seeds just below the base seed so they never overlap with "
+        "the measured samples.  Set to 0 to disable."
+    ),
+)
+@click.option(
     "--no-detail",
     is_flag=True,
     default=False,
@@ -431,6 +442,7 @@ def main(
     refinement_constant: int,
     overlap_penalty: float,
     csv_path: str | None,
+    warmup: int,
     no_detail: bool,
 ) -> None:
     """Benchmark minor-embedding on randomly generated source graphs.
@@ -488,6 +500,34 @@ def main(
         err=True,
     )
     click.echo("", err=True)
+
+    # Warmup: run a few embedding rounds whose timings are discarded.
+    # Seeds are offset below the base seed so they never collide with
+    # the measured samples (which use seed, seed+1, …, seed+samples-1).
+    if warmup > 0:
+        click.echo(f"Warming up ({warmup} round(s)) …", err=True)
+        for w in range(warmup):
+            warmup_seed = seed - warmup + w  # always < seed
+            if graph_model == "er":
+                warmup_source = _gen_er(nodes, er_p, warmup_seed)
+            elif graph_model == "ba":
+                warmup_source = _gen_ba(nodes, ba_m, warmup_seed)
+            else:
+                warmup_source = _gen_tree(nodes, warmup_seed)
+            if warmup_source.number_of_nodes() >= 2:
+                for strat in strategies:
+                    _run_sample(
+                        sample_id=-1,
+                        source=warmup_source,
+                        target=target,
+                        strategy=strat,
+                        seed=warmup_seed,
+                        tries=tries,
+                        refinement_constant=refinement_constant,
+                        overlap_penalty=overlap_penalty,
+                    )
+        click.echo("Warmup done.  Starting timed benchmark …", err=True)
+        click.echo("", err=True)
 
     all_results: list[SampleResult] = []
 
