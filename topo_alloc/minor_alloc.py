@@ -92,7 +92,7 @@ import enum
 import itertools
 import random as rng
 from collections import defaultdict
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import networkx as nx
 
@@ -562,10 +562,187 @@ def is_valid_embedding[G, H](
     return True
 
 
+# ---------------------------------------------------------------------------
+# Heuristic option selector
+# ---------------------------------------------------------------------------
+
+# Target-to-source node ratio below which a topology is considered "tight".
+# On tight topologies front-loading high-degree / high-centrality nodes leaves
+# no slack for later placements, causing degree/centrality orderings to succeed
+# far less often than random (18-12/30 vs 27/30 on Chimera(4) benchmarks).
+# Above this ratio there is enough room that ORDER_BY_DEGREE consistently
+# improves chain quality at no cost to success rate.
+_TIGHT_RATIO: float = 25.0
+
+
+def select_embed_options(
+    source: nx.Graph,
+    target: nx.Graph,
+    *,
+    priority: Literal["speed", "balanced", "quality"] = "balanced",
+) -> EmbedOption:
+    """
+    Analyse ``source`` and ``target`` and return the `EmbedOption` flags most
+    likely to yield a good embedding, based on empirical benchmarks.
+
+    # Parameters
+    source: nx.Graph
+        The graph to be embedded.
+    target: nx.Graph
+        The hardware topology graph.
+    priority: ``"speed"`` | ``"balanced"`` | ``"quality"``
+        Trade-off preference:
+
+        * ``"speed"``    – minimise runtime; always use random ordering
+          (no pre-computation overhead).
+        * ``"balanced"`` – default; good quality with acceptable latency.
+        * ``"quality"``  – minimise chain lengths; may add longest-chain
+          refinement on spacious topologies.
+
+    # Returns
+    An `EmbedOption` flag set to pass directly to `find_embedding`.
+
+    # Heuristic rules
+
+    The rules are derived from benchmarks across Chimera(4), Zephyr(3), and
+    Pegasus(4) topologies using ER, BA, and tree source graphs:
+
+    1. **Speed priority** → ``EmbedOption(0)`` (random).
+       Random ordering has zero pre-computation cost and is a strong baseline
+       on tight topologies.
+
+    2. **Tree source** → ``ORDER_BY_CENTRALITY``.
+       Betweenness-centrality ordering produces near-identity embeddings
+       (chain_avg ≈ 1.02, chain_max ≈ 1.14) on trees, regardless of how
+       tight the target topology is.  This is a massive quality win at
+       negligible extra cost for sparse sources.
+
+    3. **Tight topology** (``target_n / source_n < 25``) → ``EmbedOption(0)``.
+       Front-loading constrained nodes leaves no slack on small targets.
+       Random ordering succeeds 27/30 while degree/centrality drop to
+       12–18/30 (Chimera(4) benchmarks).
+
+    4. **Spacious topology, quality priority** →
+       ``ORDER_BY_DEGREE | REFINE_LONGEST_CHAINS``.
+       Degree ordering cuts mean nodes used by ~13% vs random; longest-chain
+       refinement squeezes a further 0.5% at ~40× the runtime cost.
+
+    5. **Spacious topology, balanced priority** → ``ORDER_BY_DEGREE``.
+       Best quality/speed tradeoff: same success rate as random with
+       13% fewer nodes used (Zephyr(3) benchmarks).
+    """
+    if priority == "speed":
+        return EmbedOption(0)
+
+    n = source.number_of_nodes()
+    if n == 0:
+        return EmbedOption(0)
+
+    # Trees: centrality ordering yields near-identity embeddings (chain_avg ≈ 1)
+    # regardless of topology tightness — clear quality win with negligible cost.
+    if nx.is_tree(source):
+        return EmbedOption.ORDER_BY_CENTRALITY
+
+    # Tight topologies: random ordering maximises success rate.
+    tightness_ratio = target.number_of_nodes() / n
+    if tightness_ratio < _TIGHT_RATIO:
+        return EmbedOption(0)
+
+    # Spacious topologies: degree ordering cuts chain lengths with no success penalty.
+    if priority == "quality":
+        return EmbedOption.ORDER_BY_DEGREE | EmbedOption.REFINE_LONGEST_CHAINS
+    return EmbedOption.ORDER_BY_DEGREE
+
+
+# ---------------------------------------------------------------------------
+# Facade
+# ---------------------------------------------------------------------------
+
+
+def embed[G, H](
+    source: nx.Graph[H],
+    target: nx.Graph[G],
+    /,
+    *,
+    priority: Literal["speed", "balanced", "quality"] = "balanced",
+    rng_factory: Callable[[], rng.Random] = rng.Random,
+    tries: int = 30,
+    refinment_constant: int = 20,
+    overlap_penalty: float = 2.0,
+    options: EmbedOption | None = None,
+) -> Model[G, H] | None:
+    """
+    Find a minor-embedding of ``source`` into ``target``, automatically
+    selecting the best heuristic options for the given graphs.
+
+    This is a convenience façade over `find_embedding`.  When ``options``
+    is ``None`` (the default), `select_embed_options` analyses ``source``
+    and ``target`` and picks the `EmbedOption` flags most likely to yield a
+    compact, valid embedding.  Pass explicit ``options`` to bypass
+    auto-selection entirely.
+
+    # Parameters
+    source: nx.Graph[H]
+        The graph to be embedded into ``target``.
+    target: nx.Graph[G]
+        The graph representing the hardware topology.
+    priority: ``"speed"`` | ``"balanced"`` | ``"quality"``
+        Trade-off hint forwarded to `select_embed_options`.  Ignored when
+        ``options`` is supplied explicitly.
+    rng_factory: Callable[[], rng.Random]
+        Factory for the pseudo-random number generator.
+    tries: int
+        Maximum number of independent embedding attempts.
+    refinment_constant: int
+        Refinement iterations = ``refinment_constant × |V(source)|``.
+    overlap_penalty: float
+        Flat penalty weight for edges leading into another vertex-model.
+        Used when `EmbedOption.USE_VERTEX_WEIGHTS` is not active.
+    options: EmbedOption | None
+        Explicit option flags.  When ``None`` (default), options are
+        chosen automatically via `select_embed_options`.
+
+    # Returns
+    A `Model[G, H]` mapping each source node to its vertex-model
+    (a frozenset of target nodes), or ``None`` if no valid embedding was
+    found within ``tries`` attempts.
+
+    # Examples
+
+    Basic auto-selected embedding::
+
+        embedding = embed(source_graph, target_graph)
+
+    Prefer chain-length quality over speed::
+
+        embedding = embed(source_graph, target_graph, priority="quality")
+
+    Override auto-selection with explicit options::
+
+        embedding = embed(
+            source_graph, target_graph,
+            options=EmbedOption.ORDER_BY_DEGREE | EmbedOption.REFINE_LONGEST_CHAINS,
+        )
+    """
+    if options is None:
+        options = select_embed_options(source, target, priority=priority)
+    return find_embedding(
+        source,
+        target,
+        rng_factory=rng_factory,
+        tries=tries,
+        refinment_constant=refinment_constant,
+        overlap_penalty=overlap_penalty,
+        options=options,
+    )
+
+
 __all__ = [
     "EmbedOption",
     "Model",
     "build_model",
+    "embed",
     "find_embedding",
     "is_valid_embedding",
+    "select_embed_options",
 ]

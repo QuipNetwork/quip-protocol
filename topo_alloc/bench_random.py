@@ -46,7 +46,7 @@ import click
 import networkx as nx
 
 from topo_alloc.graphviz_render import EmbeddingStats, embedding_stats
-from topo_alloc.minor_alloc import EmbedOption, find_embedding
+from topo_alloc.minor_alloc import EmbedOption, find_embedding, select_embed_options
 
 # ---------------------------------------------------------------------------
 # Graph-model generators
@@ -122,15 +122,23 @@ def _run_sample(
     def rng_factory():
         return random.Random(seed)
 
-    options = EmbedOption(0)
-    if strategy in ("degree", "longest_chains"):
-        options |= EmbedOption.ORDER_BY_DEGREE
-    if strategy == "centrality":
-        options |= EmbedOption.ORDER_BY_CENTRALITY
-    if strategy == "longest_chains":
-        options |= EmbedOption.REFINE_LONGEST_CHAINS
-    if strategy == "vertex_weights":
-        options |= EmbedOption.USE_VERTEX_WEIGHTS
+    if strategy in ("auto", "auto_quality", "auto_speed"):
+        priority: Literal["speed", "balanced", "quality"] = (
+            "quality" if strategy == "auto_quality" else
+            "speed" if strategy == "auto_speed" else
+            "balanced"
+        )
+        options = select_embed_options(source, target, priority=priority)
+    else:
+        options = EmbedOption(0)
+        if strategy in ("degree", "longest_chains"):
+            options |= EmbedOption.ORDER_BY_DEGREE
+        if strategy == "centrality":
+            options |= EmbedOption.ORDER_BY_CENTRALITY
+        if strategy == "longest_chains":
+            options |= EmbedOption.REFINE_LONGEST_CHAINS
+        if strategy == "vertex_weights":
+            options |= EmbedOption.USE_VERTEX_WEIGHTS
     t0 = time.perf_counter()
     embedding = find_embedding(
         source,
@@ -345,7 +353,11 @@ def _write_csv(results: list[SampleResult], path: str) -> None:
 @click.option(
     "--strategy",
     type=click.Choice(
-        ["random", "degree", "centrality", "longest_chains", "vertex_weights", "both", "all"]
+        [
+            "random", "degree", "centrality", "longest_chains", "vertex_weights",
+            "auto", "auto_quality", "auto_speed",
+            "both", "all",
+        ]
     ),
     default="both",
     show_default=True,
@@ -356,8 +368,11 @@ def _write_csv(results: list[SampleResult], path: str) -> None:
         "'centrality' = descending betweenness centrality first,  "
         "'longest_chains' = degree-order placement + longest-chain refinement,  "
         "'vertex_weights' = vertex-weight Dijkstra scheme (Cai et al. 2014),  "
+        "'auto' = select_embed_options (balanced priority),  "
+        "'auto_quality' = select_embed_options (quality priority),  "
+        "'auto_speed' = select_embed_options (speed priority),  "
         "'both' = random vs degree,  "
-        "'all' = all five strategies."
+        "'all' = all strategies including auto."
     ),
 )
 @click.option(
@@ -443,7 +458,10 @@ def main(
     if strategy == "both":
         strategies = ["random", "degree"]
     elif strategy == "all":
-        strategies = ["random", "degree", "centrality", "longest_chains", "vertex_weights"]
+        strategies = [
+            "random", "degree", "centrality", "longest_chains", "vertex_weights",
+            "auto", "auto_quality", "auto_speed",
+        ]
     else:
         strategies = [strategy]
 
