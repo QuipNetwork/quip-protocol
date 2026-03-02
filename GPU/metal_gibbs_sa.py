@@ -19,13 +19,14 @@ Key algorithm (from BlockSampler):
 
 import logging
 import os
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import dimod
 import Metal
 import numpy as np
 
-from shared.beta_schedule import _default_ising_beta_range
+from GPU.metal_utils import _create_buffer, build_csr_from_ising, compute_beta_schedule, unpack_metal_results
 
 
 def zephyr_four_color_linear(linear_idx: int, m: int = 9, t: int = 2) -> int:
@@ -204,19 +205,6 @@ class MetalGibbsSampler:
 
         self._command_queue = self.device.newCommandQueue()
 
-    def _create_buffer(self, data: np.ndarray, label: str = ""):
-        """Create a Metal buffer from numpy array."""
-        if not data.flags['C_CONTIGUOUS']:
-            data = np.ascontiguousarray(data)
-        byte_data = data.tobytes()
-        byte_length = len(byte_data)
-        buf = self.device.newBufferWithBytes_length_options_(
-            byte_data, byte_length, Metal.MTLResourceStorageModeShared
-        )
-        if not buf:
-            raise RuntimeError(f"Failed to create buffer: {label}")
-        return buf
-
     def sample_ising(
         self,
         h: List[Dict[int, float]],
@@ -264,48 +252,12 @@ class MetalGibbsSampler:
         N_list = []
 
         for prob_idx, (h_prob, J_prob) in enumerate(zip(h, J)):
-            # Get all nodes for this problem
-            all_nodes = set(h_prob.keys()) | set(n for edge in J_prob.keys() for n in edge)
-            N = len(all_nodes)
-            N_list.append(N)
-            node_list = sorted(all_nodes)
-            node_to_idx = {node: idx for idx, node in enumerate(node_list)}
-            node_to_idx_list.append(node_to_idx)
-
             # Build CSR representation for this problem
-            csr_row_ptr = np.zeros(N + 1, dtype=np.int32)
-            csr_col_ind = []
-            csr_J_vals = []
-
-            # Extract h values in node order
-            h_vals_array = np.zeros(N, dtype=np.int8)
-            for node, h_val in h_prob.items():
-                if node in node_to_idx:
-                    h_vals_array[node_to_idx[node]] = int(h_val)
-
-            # Count degrees
-            degree = np.zeros(N, dtype=np.int32)
-            for (i, j) in J_prob.keys():
-                if i in node_to_idx and j in node_to_idx:
-                    degree[node_to_idx[i]] += 1
-                    degree[node_to_idx[j]] += 1
-
-            # Build CSR
-            csr_row_ptr[1:] = np.cumsum(degree)
-
-            adjacency = [[] for _ in range(N)]
-            for (i, j), Jij in J_prob.items():
-                if i in node_to_idx and j in node_to_idx:
-                    idx_i = node_to_idx[i]
-                    idx_j = node_to_idx[j]
-                    adjacency[idx_i].append((idx_j, Jij))
-                    adjacency[idx_j].append((idx_i, Jij))
-
-            for i in range(N):
-                adjacency[i].sort()
-                for j, Jij in adjacency[i]:
-                    csr_col_ind.append(j)
-                    csr_J_vals.append(int(Jij))
+            csr_row_ptr, csr_col_ind, csr_J_vals, h_vals_array, node_to_idx, N = build_csr_from_ising(
+                h_prob, J_prob, use_float=False
+            )
+            N_list.append(N)
+            node_to_idx_list.append(node_to_idx)
 
             # Append to concatenated arrays
             all_csr_row_ptr.extend(csr_row_ptr)
@@ -329,34 +281,9 @@ class MetalGibbsSampler:
             raise ValueError(f"All problems must have same N: {N_list}")
 
         # Compute beta schedule
-        if beta_schedule_type == "custom":
-            if beta_schedule is None:
-                raise ValueError("'beta_schedule' must be provided for beta_schedule_type = 'custom'")
-            beta_schedule = np.array(beta_schedule, dtype=np.float32)
-            num_betas = len(beta_schedule)
-            if num_sweeps != num_betas * num_sweeps_per_beta:
-                raise ValueError(f"num_sweeps ({num_sweeps}) must equal len(beta_schedule) * num_sweeps_per_beta")
-        else:
-            num_betas, rem = divmod(num_sweeps, num_sweeps_per_beta)
-            if rem > 0 or num_betas < 0:
-                raise ValueError("'num_sweeps' must be divisible by 'num_sweeps_per_beta'")
-
-            if beta_range is None:
-                beta_range = _default_ising_beta_range(h[0], J[0])
-            elif len(beta_range) != 2 or min(beta_range) < 0:
-                raise ValueError("'beta_range' should be a 2-tuple of positive numbers")
-
-            if num_betas == 1:
-                beta_schedule = np.array([beta_range[-1]], dtype=np.float32)
-            else:
-                if beta_schedule_type == "linear":
-                    beta_schedule = np.linspace(beta_range[0], beta_range[1], num=num_betas, dtype=np.float32)
-                elif beta_schedule_type == "geometric":
-                    if min(beta_range) <= 0:
-                        raise ValueError("'beta_range' must contain non-zero values for geometric schedule")
-                    beta_schedule = np.geomspace(beta_range[0], beta_range[1], num=num_betas, dtype=np.float32)
-                else:
-                    raise ValueError(f"Beta schedule type {beta_schedule_type} not implemented")
+        beta_schedule, beta_range = compute_beta_schedule(
+            h[0], J[0], num_sweeps, num_sweeps_per_beta, beta_range, beta_schedule_type, beta_schedule
+        )
 
         self.logger.debug(f"[MetalGibbs] Beta schedule: {len(beta_schedule)} betas from {beta_schedule[0]:.4f} to {beta_schedule[-1]:.4f}")
 
@@ -365,13 +292,13 @@ class MetalGibbsSampler:
             seed = np.random.randint(0, 2**31)
 
         # Create Metal buffers
-        csr_row_ptr_buf = self._create_buffer(all_csr_row_ptr, "csr_row_ptr")
-        csr_col_ind_buf = self._create_buffer(all_csr_col_ind, "csr_col_ind")
-        csr_J_vals_buf = self._create_buffer(all_csr_J_vals, "csr_J_vals")
-        row_ptr_offsets_buf = self._create_buffer(row_ptr_offsets, "row_ptr_offsets")
-        col_ind_offsets_buf = self._create_buffer(col_ind_offsets, "col_ind_offsets")
-        csr_h_vals_buf = self._create_buffer(all_h_vals, "csr_h_vals")
-        beta_schedule_buf = self._create_buffer(beta_schedule, "beta_schedule")
+        csr_row_ptr_buf = _create_buffer(self.device, all_csr_row_ptr, "csr_row_ptr")
+        csr_col_ind_buf = _create_buffer(self.device, all_csr_col_ind, "csr_col_ind")
+        csr_J_vals_buf = _create_buffer(self.device, all_csr_J_vals, "csr_J_vals")
+        row_ptr_offsets_buf = _create_buffer(self.device, row_ptr_offsets, "row_ptr_offsets")
+        col_ind_offsets_buf = _create_buffer(self.device, col_ind_offsets, "col_ind_offsets")
+        csr_h_vals_buf = _create_buffer(self.device, all_h_vals, "csr_h_vals")
+        beta_schedule_buf = _create_buffer(self.device, beta_schedule, "beta_schedule")
 
         # Color block buffers
         # Remap color_node_indices from topology node IDs to dense CSR indices.
@@ -383,9 +310,9 @@ class MetalGibbsSampler:
             [node_to_idx[n] for n in self.color_node_indices],
             dtype=np.int32
         )
-        color_block_starts_buf = self._create_buffer(self.block_starts, "color_block_starts")
-        color_block_counts_buf = self._create_buffer(self.block_counts, "color_block_counts")
-        color_node_indices_buf = self._create_buffer(csr_color_node_indices, "color_node_indices")
+        color_block_starts_buf = _create_buffer(self.device, self.block_starts, "color_block_starts")
+        color_block_counts_buf = _create_buffer(self.device, self.block_counts, "color_block_counts")
+        color_node_indices_buf = _create_buffer(self.device, csr_color_node_indices, "color_node_indices")
 
         # Scalar parameters
         N_bytes = np.int32(N).tobytes()
@@ -515,29 +442,11 @@ class MetalGibbsSampler:
             prob_packed = packed_data[start_idx:end_idx]
             prob_energies = energies_data[start_idx:end_idx]
 
-            # Unpack bit-packed samples
-            samples_data = np.zeros((num_reads, N), dtype=np.int8)
-            for read_idx in range(num_reads):
-                for var in range(N):
-                    byte_idx = var >> 3
-                    bit_idx = var & 7
-                    bit = (prob_packed[read_idx, byte_idx] >> bit_idx) & 1
-                    samples_data[read_idx, var] = -1 if bit else 1
-
-            # Build SampleSet
-            samples_dict = []
-            for sample in samples_data:
-                samples_dict.append({node: int(sample[idx]) for node, idx in node_to_idx_list[prob_idx].items()})
-
-            sampleset = dimod.SampleSet.from_samples(
-                samples_dict,
-                energy=prob_energies.astype(float),
-                vartype=dimod.SPIN,
-                info={
-                    "beta_range": beta_range,
-                    "beta_schedule_type": beta_schedule_type,
-                    "update_mode": self.update_mode_name
-                }
+            # Unpack and build SampleSet
+            sampleset = unpack_metal_results(
+                prob_packed, prob_energies, N, num_reads, node_to_idx_list[prob_idx],
+                beta_range, beta_schedule_type,
+                update_mode=self.update_mode_name
             )
             samplesets.append(sampleset)
 
