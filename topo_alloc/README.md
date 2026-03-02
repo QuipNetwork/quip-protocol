@@ -24,10 +24,11 @@ All three minor-embedding conditions are verified. If satisfied the embedding is
 |---|---|---|
 | *(none)* | `random` | Uniform shuffle each attempt |
 | `ORDER_BY_DEGREE` | `degree` | Descending source-degree first, ties shuffled randomly |
+| `ORDER_BY_DEGREE_ASC` | `degree_asc` | Ascending source-degree first — hub placed last so Dijkstra bridges all already-placed neighbours |
 | `ORDER_BY_CENTRALITY` | `centrality` | Descending betweenness centrality first |
 | `REFINE_LONGEST_CHAINS` | `longest_chains` | Degree ordering + Stage 2b chain refinement |
 | `USE_VERTEX_WEIGHTS` | `vertex_weights` | Cai et al. 2014 vertex-weight Dijkstra scheme |
-| `PREFER_ARTICULATION_POINTS` | `art_pts` | When a source node has no placed neighbours, and it is an articulation point of the source graph, anchor it on the highest-degree free target node rather than an arbitrary free node |
+| `PREFER_ARTICULATION_POINTS` | `art_pts` | Anchor source articulation points on the highest-degree free target node when they have no placed neighbours |
 
 ### Module Structure
 
@@ -61,17 +62,17 @@ dot -Tsvg topo_alloc/demo_k5_chimera4_degree.dot -o demo_k5_chimera4_degree.svg
 `bench_random.py` generates random source graphs, embeds them into a chosen topology, and reports per-strategy chain-length statistics.
 
 ```bash
-# ER graphs (n=8, p=0.5) → Chimera(4), all 5 strategies, 30 samples
+# ER graphs (n=8, p=0.5) → Chimera(4), all strategies, 30 samples, 10 warmup rounds
 python -m topo_alloc.bench_random \
     --graph-model er --nodes 8 --er-p 0.5 \
     --topology chimera --topology-size 4 \
-    --samples 30 --strategy all
+    --samples 30 --strategy all --warmup 10
 
-# Barabási-Albert → Zephyr(3), degree strategy only
+# Barabási-Albert → Zephyr(3), auto strategy only
 python -m topo_alloc.bench_random \
     --graph-model ba --nodes 8 --ba-m 2 \
     --topology zephyr --topology-size 3 \
-    --samples 30 --strategy degree
+    --samples 30 --strategy auto --warmup 10
 
 # Trees → Pegasus(4), aggregate statistics only, CSV output
 python -m topo_alloc.bench_random \
@@ -88,9 +89,10 @@ Key options:
 | `--nodes` / `-n` | `8` | Source graph node count |
 | `--topology` | `chimera` | Target topology: `chimera`, `zephyr`, `pegasus` |
 | `--topology-size` | `4` | Size parameter (e.g. `4` → Chimera(4), 128 qubits) |
-| `--strategy` | `both` | `random`, `degree`, `centrality`, `longest_chains`, `vertex_weights`, `art_pts`, `degree_art`, `auto`, `auto_quality`, `auto_speed`, `both`, `all` |
+| `--strategy` | `both` | `random`, `degree`, `degree_asc`, `centrality`, `longest_chains`, `vertex_weights`, `art_pts`, `degree_art`, `auto`, `auto_quality`, `auto_speed`, `both`, `all` |
 | `--samples` | `20` | Number of random source graphs to generate |
 | `--tries` | `30` | Embedding attempts per sample |
+| `--warmup` | `3` | Warmup rounds before recording (discards cold-start latency) |
 | `--no-detail` | off | Suppress per-sample table, show only aggregates |
 | `--csv PATH` | — | Write per-sample results to a CSV file |
 
@@ -104,84 +106,128 @@ The suite covers trivial inputs, small graphs, impossible embeddings, all orderi
 
 ### Benchmark Findings
 
-30 samples per configuration (ER n=8, p=0.5 unless noted). All five strategies benchmarked on the three D-Wave topologies.
+30 samples per configuration, `--tries 100 --refinement-constant 10 --warmup 10`. All strategies benchmarked on each topology.
 
-#### ER n=8, p=0.5 → Chimera(4) — 128 qubits (tight)
+#### ER n=8, p=0.5 → Chimera(4) — 128 qubits (tight, ratio 16)
 
-| Strategy | Success | nodes (mean) | chain\_avg | chain\_max | elapsed |
-|---|---|---|---|---|---|
-| random | **27/30** | 16.19 | 2.04 | 5.19 | 671 ms |
-| degree | 18/30 | 15.17 | 1.91 | 4.39 | 1.64 s |
-| centrality | 12/30 | 15.50 | 1.96 | 4.83 | 2.07 s |
-| longest\_chains | 18/30 | 15.17 | 1.91 | 4.39 | 3.37 s |
-| vertex\_weights | **27/30** | 16.26 | 2.04 | 4.78 | 1.09 s |
+| Strategy | Success | chain\_avg | chain\_max | elapsed |
+|---|---|---|---|---|
+| **random** | **28/30** | 2.06 | 5.25 | **691 ms** |
+| degree | 18/30 | 1.91 | 4.39 | 2.62 s |
+| degree\_asc | 22/30 | 2.02 | 5.32 | 1.38 s |
+| centrality | 12/30 | 1.96 | 4.83 | 3.48 s |
+| longest\_chains | 18/30 | 1.91 | 4.39 | 5.25 s |
+| **vertex\_weights** | **29/30** | 2.08 | 4.90 | 882 ms |
+| **auto** | **28/30** | 2.06 | 5.25 | 686 ms |
 
-#### ER n=8, p=0.5 → Zephyr(3) — 336 qubits
+#### ER n=8, p=0.5 → Zephyr(3) — 336 qubits (spacious, ratio 42)
 
-| Strategy | Success | nodes (mean) | chain\_avg | chain\_max | elapsed |
-|---|---|---|---|---|---|
-| random | 30/30 | 15.67 | 1.96 | 4.67 | **13.7 ms** |
-| degree | 30/30 | **13.60** | **1.71** | **3.37** | 12.6 ms |
-| centrality | 29/30 | 14.14 | 1.77 | 3.55 | 597 ms |
-| longest\_chains | 30/30 | **13.53** | **1.70** | **3.33** | 498 ms |
-| vertex\_weights | 30/30 | 15.77 | 1.98 | 4.77 | 340 ms |
+| Strategy | Success | chain\_avg | chain\_max | elapsed |
+|---|---|---|---|---|
+| random | 30/30 | 1.96 | 4.67 | 15 ms |
+| **degree** | **30/30** | **1.71** | **3.37** | **13 ms** |
+| degree\_asc | 30/30 | 2.06 | 4.97 | 29 ms |
+| centrality | 29/30 | 1.77 | 3.55 | 1.04 s |
+| **longest\_chains** | **30/30** | **1.70** | **3.33** | 267 ms |
+| vertex\_weights | 30/30 | 1.98 | 4.77 | 217 ms |
+| **auto** | **30/30** | 2.06 | 4.97 | 28 ms |
 
-#### ER n=8, p=0.5 → Pegasus(4) — 264 qubits
+#### ER n=8, p=0.5 → Pegasus(4) — 264 qubits (spacious, ratio 33)
 
-| Strategy | Success | nodes (mean) | chain\_avg | chain\_max | elapsed |
-|---|---|---|---|---|---|
-| random | **30/30** | 16.00 | 2.01 | 4.40 | **20 ms** |
-| degree | 29/30 | 15.55 | 1.95 | 3.79 | 517 ms |
-| centrality | 25/30 | **15.00** | **1.88** | 3.84 | 2.18 s |
-| longest\_chains | 29/30 | 15.38 | 1.93 | **3.72** | 1.18 s |
-| vertex\_weights | **30/30** | 17.63 | 2.21 | 4.53 | 341 ms |
+| Strategy | Success | chain\_avg | chain\_max | elapsed |
+|---|---|---|---|---|
+| **random** | **30/30** | 2.01 | 4.40 | **14 ms** |
+| degree | 29/30 | 1.95 | 3.79 | 700 ms |
+| degree\_asc | 30/30 | 2.13 | 5.10 | 17 ms |
+| centrality | 25/30 | 1.88 | 3.84 | 3.77 s |
+| **longest\_chains** | 29/30 | **1.93** | **3.72** | 1.38 s |
+| vertex\_weights | 30/30 | 2.21 | 4.53 | 200 ms |
+| **auto** | **30/30** | 2.13 | 5.10 | 17 ms |
 
-#### BA n=8, m=2 → Chimera(4)
+#### BA n=8, m=2 → Chimera(4) — 128 qubits (tight, ratio 16)
 
-| Strategy | Success | nodes (mean) | chain\_avg | chain\_max | elapsed |
-|---|---|---|---|---|---|
-| random | **30/30** | **14.17** | **1.77** | 4.20 | **87 ms** |
-| degree | 21/30 | 18.19 | 2.27 | 6.33 | 1.12 s |
-| centrality | 17/30 | 17.29 | 2.16 | 6.41 | 1.47 s |
-| longest\_chains | 21/30 | 18.19 | 2.27 | 6.33 | 2.44 s |
-| vertex\_weights | **30/30** | **14.20** | **1.77** | **4.17** | 398 ms |
+| Strategy | Success | chain\_avg | chain\_max | elapsed |
+|---|---|---|---|---|
+| **random** | **30/30** | **1.77** | 4.20 | **47 ms** |
+| degree | 21/30 | 2.27 | 6.33 | 1.76 s |
+| degree\_asc | 21/30 | 1.65 | 4.48 | 1.73 s |
+| centrality | 17/30 | 2.16 | 6.41 | 2.40 s |
+| longest\_chains | 21/30 | 2.27 | 6.33 | 3.77 s |
+| **vertex\_weights** | **30/30** | **1.77** | **4.17** | 215 ms |
+| **auto** | **30/30** | **1.77** | 4.20 | **47 ms** |
+
+#### BA n=8, m=2 → Zephyr(3) — 336 qubits (spacious, ratio 42)
+
+| Strategy | Success | chain\_avg | chain\_max | elapsed |
+|---|---|---|---|---|
+| **random** | **30/30** | 1.77 | 4.53 | **11 ms** |
+| degree | 29/30 | **1.64** | **3.24** | 983 ms |
+| **degree\_asc** | **30/30** | 2.08 | 5.90 | 11 ms |
+| centrality | 29/30 | 1.67 | 3.17 | 987 ms |
+| longest\_chains | 29/30 | 1.63 | 3.21 | 2.09 s |
+| vertex\_weights | 30/30 | 1.80 | 4.93 | 140 ms |
+| **auto** | **30/30** | 2.08 | 5.90 | **11 ms** |
+
+#### BA n=8, m=2 → Pegasus(4) — 264 qubits (spacious, ratio 33)
+
+| Strategy | Success | chain\_avg | chain\_max | elapsed |
+|---|---|---|---|---|
+| **random** | **30/30** | 1.80 | 4.47 | **10 ms** |
+| degree | 27/30 | 1.83 | 3.52 | 2.07 s |
+| **degree\_asc** | **30/30** | 1.98 | 5.10 | 7 ms |
+| centrality | 27/30 | 1.84 | 3.44 | 2.03 s |
+| longest\_chains | 27/30 | 1.82 | 3.48 | 4.18 s |
+| vertex\_weights | 30/30 | 1.87 | 4.90 | 77 ms |
+| **auto** | **30/30** | 1.98 | 5.10 | **7 ms** |
 
 #### Tree n=10 → Chimera(4)
 
-| Strategy | Success | nodes (mean) | chain\_avg | chain\_max | elapsed |
-|---|---|---|---|---|---|
-| random | 30/30 | 15.10 | 1.51 | 3.70 | 54 ms |
-| degree | 30/30 | 11.03 | 1.10 | 1.63 | **24 ms** |
-| centrality | 29/30 | **10.17** | **1.02** | **1.14** | 63 ms |
-| longest\_chains | 30/30 | 11.00 | 1.10 | 1.63 | 116 ms |
-| vertex\_weights | 30/30 | 14.37 | 1.44 | 3.23 | 55 ms |
+| Strategy | Success | chain\_avg | chain\_max | elapsed |
+|---|---|---|---|---|
+| random | 30/30 | 1.51 | 3.70 | 31 ms |
+| degree | 30/30 | 1.10 | 1.63 | **15 ms** |
+| degree\_asc | 30/30 | 1.51 | 3.93 | 13 ms |
+| **centrality** | 29/30 | **1.02** | **1.14** | 109 ms |
+| longest\_chains | 30/30 | 1.10 | 1.63 | 64 ms |
+| vertex\_weights | 30/30 | 1.44 | 3.23 | 34 ms |
+| **auto** | 29/30 | **1.02** | **1.14** | 109 ms |
 
 #### Key observations
 
-**Topology tightness flips the success-rate ranking.**
-On tight topologies (Chimera(4), 128 qubits), `degree` and `centrality` ordering hurt success rates (12–18/30 vs 27/30 for random): front-loading the hardest nodes leaves no slack for later placements. On larger targets (Zephyr, Pegasus) all strategies succeed near-perfectly.
+**Topology tightness determines the success-rate ranking.**
+On tight topologies (Chimera(4), ratio 16), any degree-based ordering hurts success rates because front-loading constrained nodes leaves no slack for later placements. `random` (28/30) and `vertex_weights` (29/30) are the only strategies that stay competitive. On spacious targets (Zephyr, Pegasus, ratio 33–42) all strategies succeed near-perfectly on ER graphs.
 
-**`degree` is the best quality/speed tradeoff on spacious topologies.**
-On Zephyr it cuts mean nodes used by ~13% (15.67 → 13.60) at virtually no extra cost (12.6 ms vs 13.7 ms for random).
+**`degree` gives the best chain quality on spacious ER topologies.**
+On Zephyr it cuts chain\_avg by ~13% (1.96 → 1.71) vs random at equal speed. `longest_chains` adds a further marginal improvement (1.71 → 1.70) at 20× the cost — worth it only for offline preprocessing.
 
-**`longest_chains` squeezes a marginal further gain over `degree` at 40× the cost.**
-Zephyr: 13.53 vs 13.60 nodes (+0.5% improvement), but 498 ms vs 13 ms. Worth it for offline preprocessing; not for interactive use.
+**`degree` has a hub-graph failure mode on spacious topologies.**
+On BA graphs (scale-free, m=2), `degree` places the dominant hub node first with no neighbours yet placed, anchoring it at an arbitrary target node that all 6–7 neighbours must then route back to. This causes 1–3 failures per 30 samples and mean latencies of 1–2 s on Zephyr and Pegasus. The same samples embed in ~10 ms with `random`.
 
-**`centrality` shines on trees but has unpredictable latency on dense graphs.**
-On trees it yields near-identity embeddings (chain\_max ≈ 1.14). On dense ER/BA graphs the betweenness centrality computation dominates (up to 17.5 s on one sample) with no consistent quality advantage.
+**`degree_asc` is the reliable default on spacious topologies.**
+Ascending-degree ordering places low-degree nodes first (cheap, minimal constraints) and the hub last, letting Dijkstra build the hub's chain as a natural bridge through all already-placed neighbours. This eliminates the hub failure mode (30/30 on BA Zephyr and Pegasus vs 27–29/30 for `degree`). The tradeoff: chain quality on ER graphs regresses slightly vs `degree` (chain\_avg 2.06 vs 1.71 on Zephyr) but remains close to `random`.
 
-**`vertex_weights` (Cai et al. 2014) maintains high success rates on tight topologies.**
-It matches `random` on Chimera and ties for best on BA graphs, but produces longer chains than `degree` on spacious topologies.
+**`degree_asc` does not help on tight topologies.**
+On Chimera (tight, ratio 16), ascending ordering still degrades success rate relative to random (22/30 ER, 21/30 BA vs 28–30/30 for random), for the same reason as descending: any deterministic ordering leaves the later-placed nodes with fewer free target resources. `random` and `vertex_weights` remain the only strong strategies on tight topologies.
+
+**`centrality` shines on trees, hurts on dense graphs.**
+On trees it produces near-identity embeddings (chain\_avg ≈ 1.02, chain\_max ≈ 1.14). On ER/BA graphs the betweenness computation is cheap (O(VE) for n=8) but success rates degrade similarly to `degree` on tight topologies and add no quality benefit on spacious ones.
+
+**`vertex_weights` (Cai et al. 2014) is the safety net on tight topologies.**
+It matches `random` on success rate (29/30 ER Chimera, 30/30 BA Chimera) while using a smarter path-reuse scheme, but produces longer chains than `degree` on spacious topologies and is 5–20× slower than random.
 
 #### Strategy selection guide
 
 | Situation | Recommended strategy |
 |---|---|
-| Large topology (Zephyr / Pegasus), ER-like source | `degree` |
-| Tight topology or unknown source structure | `random` |
+| Spacious topology (Zephyr / Pegasus), ER-like source, quality matters | `degree` |
+| Spacious topology, mixed or BA source, or when success rate is critical | `degree_asc` |
+| Tight topology (Chimera) or unknown source structure | `random` |
+| Tight topology, scale-free source | `random` or `vertex_weights` |
 | Sparse / tree-structured source graph | `centrality` |
-| Scale-free (BA) source on tight topology | `random` or `vertex_weights` |
 | Offline quality maximisation, time not critical | `longest_chains` |
+| Automatic selection (balanced) | `auto` — uses `select_embed_options` |
+
+`auto` implements these rules: `centrality` for tree sources, `random` on tight topologies (ratio < 25), `degree_asc` on spacious topologies (balanced priority), `degree_asc + longest_chains` (quality priority).
 
 ---
 

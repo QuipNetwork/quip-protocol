@@ -133,6 +133,8 @@ def _run_sample(
         options = EmbedOption(0)
         if strategy in ("degree", "longest_chains"):
             options |= EmbedOption.ORDER_BY_DEGREE
+        if strategy == "degree_asc":
+            options |= EmbedOption.ORDER_BY_DEGREE_ASC
         if strategy == "centrality":
             options |= EmbedOption.ORDER_BY_CENTRALITY
         if strategy == "longest_chains":
@@ -358,8 +360,8 @@ def _write_csv(results: list[SampleResult], path: str) -> None:
     "--strategy",
     type=click.Choice(
         [
-            "random", "degree", "centrality", "longest_chains", "vertex_weights",
-            "art_pts", "degree_art",
+            "random", "degree", "degree_asc", "centrality", "longest_chains",
+            "vertex_weights", "art_pts", "degree_art",
             "auto", "auto_quality", "auto_speed",
             "both", "all",
         ]
@@ -370,6 +372,7 @@ def _write_csv(results: list[SampleResult], path: str) -> None:
         "Ordering strategy for find_embedding.  "
         "'random' = uniform shuffle,  "
         "'degree' = descending source-degree first,  "
+        "'degree_asc' = ascending source-degree first (hub placed last),  "
         "'centrality' = descending betweenness centrality first,  "
         "'longest_chains' = degree-order placement + longest-chain refinement,  "
         "'vertex_weights' = vertex-weight Dijkstra scheme (Cai et al. 2014),  "
@@ -478,8 +481,8 @@ def main(
         strategies = ["random", "degree"]
     elif strategy == "all":
         strategies = [
-            "random", "degree", "centrality", "longest_chains", "vertex_weights",
-            "art_pts", "degree_art",
+            "random", "degree", "degree_asc", "centrality", "longest_chains",
+            "vertex_weights", "art_pts", "degree_art",
             "auto", "auto_quality", "auto_speed",
         ]
     else:
