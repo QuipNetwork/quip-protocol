@@ -133,12 +133,26 @@ class EmbedOption(enum.Flag):
         Each target node g receives weight
         ``wt(g) = D^{|{i : g ∉ φ(x_i)}|}``, replacing the flat
         ``overlap_penalty`` approach.
+
+    PREFER_ARTICULATION_POINTS
+        When placing a source node that has no already-placed neighbours
+        (i.e. choosing the initial anchor for a new connected component),
+        and that source node is an *articulation point* of the source graph
+        (its removal would disconnect the source graph), anchor it on the
+        highest-degree free target node rather than an arbitrary free node.
+        Articulation points in the source are the most structurally
+        constrained nodes — they sit between otherwise-disconnected parts of
+        the source graph and must be reachable by neighbours on both sides.
+        Placing them on high-degree target nodes maximises the routing
+        options available for those neighbours.  For non-articulation source
+        nodes the fallback (first free target node) is used unchanged.
     """
 
     ORDER_BY_DEGREE = enum.auto()
     ORDER_BY_CENTRALITY = enum.auto()
     REFINE_LONGEST_CHAINS = enum.auto()
     USE_VERTEX_WEIGHTS = enum.auto()
+    PREFER_ARTICULATION_POINTS = enum.auto()
 
 
 def find_embedding[G, H](
@@ -187,11 +201,20 @@ def find_embedding[G, H](
     order_by_centrality = EmbedOption.ORDER_BY_CENTRALITY in options
     refine_longest_chains = EmbedOption.REFINE_LONGEST_CHAINS in options
     use_vertex_weights = EmbedOption.USE_VERTEX_WEIGHTS in options
+    prefer_art_pts = EmbedOption.PREFER_ARTICULATION_POINTS in options
 
     refine_rounds = refinment_constant * len(source.nodes)
     rng = rng_factory()
     src_nodes = list(source.nodes)
     src_adj = {h: list(source.neighbors(h)) for h in src_nodes}
+
+    # Pre-compute source articulation points once per embedding call (O(V+E)).
+    # These are source nodes whose removal would disconnect the source graph;
+    # they are anchored on the highest-degree free target node to maximise
+    # routing options for their neighbours on both sides of the cut.
+    source_art_pts: frozenset[H] = (
+        frozenset(nx.articulation_points(source)) if prefer_art_pts else frozenset()
+    )
     degree_order = None
     centrality_order = None
 
@@ -244,6 +267,7 @@ def find_embedding[G, H](
                 use_vertex_weights=use_vertex_weights,
                 target_diameter=target_diameter,
                 num_source_nodes=len(src_nodes),
+                source_art_pts=source_art_pts,
             )
             if model is None:
                 break
@@ -282,6 +306,7 @@ def find_embedding[G, H](
                     use_vertex_weights=False,
                     target_diameter=1,
                     num_source_nodes=len(src_nodes),
+                    source_art_pts=source_art_pts,
                 )
                 if model is not None:
                     phi[x] = model
@@ -300,6 +325,7 @@ def find_embedding[G, H](
                 use_vertex_weights=use_vertex_weights,
                 target_diameter=target_diameter,
                 num_source_nodes=len(src_nodes),
+                source_art_pts=source_art_pts,
             )
 
         # --------------------------------
@@ -322,6 +348,7 @@ def _refine_longest_chains[G, H](
     use_vertex_weights: bool = False,
     target_diameter: int = 1,
     num_source_nodes: int = 0,
+    source_art_pts: frozenset[H] = frozenset(),
 ) -> dict[H, list[G]]:
     """
     Refinement pass that repeatedly re-embeds the source node with the
@@ -351,6 +378,7 @@ def _refine_longest_chains[G, H](
             use_vertex_weights=use_vertex_weights,
             target_diameter=target_diameter,
             num_source_nodes=num_source_nodes,
+            source_art_pts=source_art_pts,
         )
 
         if candidate is not None and len(candidate) < current_len:
@@ -392,6 +420,7 @@ def build_model[G, H](
     use_vertex_weights: bool = False,
     target_diameter: int = 1,
     num_source_nodes: int = 0,
+    source_art_pts: frozenset[H] = frozenset(),
 ) -> list[G] | None:
     """
     Build a vertex-model (chain) for source node `x` in `graph`.
@@ -421,10 +450,17 @@ def build_model[G, H](
     # Find any other nodes than x in y-models
     occupied: set[G] = set().union(*(set(model) for y, model in phi.items() if y != x))
 
-    # If there is no placed neighbour, just pick any free node.
+    # If there is no placed neighbour, pick the anchor target node.
+    # For source articulation points (nodes whose removal disconnects the
+    # source graph) prefer the highest-degree free target node: they sit
+    # between disconnected source components and need maximum routing options.
     if not placed_neighbours:
         free = [g for g in graph.nodes if g not in occupied]
-        return [free[0]] if free else [next(iter(graph.nodes))]
+        if not free:
+            return [next(iter(graph.nodes))]
+        if source_art_pts and x in source_art_pts:
+            free.sort(key=lambda g: graph.degree(g), reverse=True)
+        return [free[0]]
 
     # Run Dijkstra's algorithm from multiple sources from v-models.
     if use_vertex_weights:

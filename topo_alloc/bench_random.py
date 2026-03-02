@@ -139,6 +139,10 @@ def _run_sample(
             options |= EmbedOption.REFINE_LONGEST_CHAINS
         if strategy == "vertex_weights":
             options |= EmbedOption.USE_VERTEX_WEIGHTS
+        if strategy in ("art_pts", "degree_art"):
+            options |= EmbedOption.PREFER_ARTICULATION_POINTS
+        if strategy == "degree_art":
+            options |= EmbedOption.ORDER_BY_DEGREE
     t0 = time.perf_counter()
     embedding = find_embedding(
         source,
@@ -355,6 +359,7 @@ def _write_csv(results: list[SampleResult], path: str) -> None:
     type=click.Choice(
         [
             "random", "degree", "centrality", "longest_chains", "vertex_weights",
+            "art_pts", "degree_art",
             "auto", "auto_quality", "auto_speed",
             "both", "all",
         ]
@@ -368,6 +373,8 @@ def _write_csv(results: list[SampleResult], path: str) -> None:
         "'centrality' = descending betweenness centrality first,  "
         "'longest_chains' = degree-order placement + longest-chain refinement,  "
         "'vertex_weights' = vertex-weight Dijkstra scheme (Cai et al. 2014),  "
+        "'art_pts' = anchor source articulation-points on highest-degree target nodes,  "
+        "'degree_art' = degree ordering + articulation-point anchoring,  "
         "'auto' = select_embed_options (balanced priority),  "
         "'auto_quality' = select_embed_options (quality priority),  "
         "'auto_speed' = select_embed_options (speed priority),  "
@@ -460,6 +467,7 @@ def main(
     elif strategy == "all":
         strategies = [
             "random", "degree", "centrality", "longest_chains", "vertex_weights",
+            "art_pts", "degree_art",
             "auto", "auto_quality", "auto_speed",
         ]
     else:

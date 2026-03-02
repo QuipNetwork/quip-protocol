@@ -27,6 +27,7 @@ All three minor-embedding conditions are verified. If satisfied the embedding is
 | `ORDER_BY_CENTRALITY` | `centrality` | Descending betweenness centrality first |
 | `REFINE_LONGEST_CHAINS` | `longest_chains` | Degree ordering + Stage 2b chain refinement |
 | `USE_VERTEX_WEIGHTS` | `vertex_weights` | Cai et al. 2014 vertex-weight Dijkstra scheme |
+| `PREFER_ARTICULATION_POINTS` | `art_pts` | When a source node has no placed neighbours, and it is an articulation point of the source graph, anchor it on the highest-degree free target node rather than an arbitrary free node |
 
 ### Module Structure
 
@@ -87,7 +88,7 @@ Key options:
 | `--nodes` / `-n` | `8` | Source graph node count |
 | `--topology` | `chimera` | Target topology: `chimera`, `zephyr`, `pegasus` |
 | `--topology-size` | `4` | Size parameter (e.g. `4` → Chimera(4), 128 qubits) |
-| `--strategy` | `both` | `random`, `degree`, `centrality`, `longest_chains`, `vertex_weights`, `both`, `all` |
+| `--strategy` | `both` | `random`, `degree`, `centrality`, `longest_chains`, `vertex_weights`, `art_pts`, `degree_art`, `auto`, `auto_quality`, `auto_speed`, `both`, `all` |
 | `--samples` | `20` | Number of random source graphs to generate |
 | `--tries` | `30` | Embedding attempts per sample |
 | `--no-detail` | off | Suppress per-sample table, show only aggregates |
@@ -181,3 +182,69 @@ It matches `random` on Chimera and ties for best on BA graphs, but produces long
 | Sparse / tree-structured source graph | `centrality` |
 | Scale-free (BA) source on tight topology | `random` or `vertex_weights` |
 | Offline quality maximisation, time not critical | `longest_chains` |
+
+---
+
+### `PREFER_ARTICULATION_POINTS` benchmark
+
+`PREFER_ARTICULATION_POINTS` anchors source articulation points (nodes whose removal disconnects the source graph) on the highest-degree free target node when they have no already-placed neighbours. The intuition is that structurally critical source nodes benefit from the most-connected target anchors.
+
+> **Note:** All D-Wave topologies (Chimera, Zephyr, Pegasus) are biconnected (zero articulation points of their own), so this flag operates on the **source** graph only.
+
+The flag was benchmarked standalone (`art_pts`) and combined with degree ordering (`degree_art`), against the `random` and `degree` baselines. 30 samples, ER n=8 p=0.4 unless noted.
+
+#### ER n=8, p=0.4 → Chimera(4) — 128 qubits (tight, ratio 16)
+
+| Strategy | Success | chain\_avg | elapsed |
+|---|---|---|---|
+| random | **28/30** | 1.66 | 285 ms |
+| degree | 24/30 | 1.58 | 712 ms |
+| art\_pts | **28/30** | 1.68 | 286 ms |
+| degree\_art | 23/30 | 1.76 | 809 ms |
+
+#### BA n=8, m=2 → Chimera(4) — tight
+
+| Strategy | Success | chain\_avg | elapsed |
+|---|---|---|---|
+| random | **30/30** | **1.77** | 82 ms |
+| degree | 21/30 | 2.27 | 1.07 s |
+| art\_pts | **30/30** | **1.77** | **68 ms** |
+| degree\_art | 23/30 | 2.27 | 631 ms |
+
+#### ER n=8, p=0.4 → Zephyr(3) — 336 qubits (spacious, ratio 42)
+
+| Strategy | Success | chain\_avg | elapsed |
+|---|---|---|---|
+| random | 30/30 | 1.79 | 10.5 ms |
+| degree | 30/30 | 1.54 | **10.1 ms** |
+| art\_pts | 30/30 | 1.73 | 10.7 ms |
+| degree\_art | 30/30 | **1.52** | 10.1 ms |
+
+#### ER n=8, p=0.4 → Pegasus(4) — 264 qubits (spacious, ratio 33)
+
+| Strategy | Success | chain\_avg | elapsed |
+|---|---|---|---|
+| random | **30/30** | 1.81 | **6.4 ms** |
+| degree | 29/30 | 1.70 | 496 ms |
+| art\_pts | **30/30** | 1.80 | 6.5 ms |
+| degree\_art | 29/30 | **1.67** | 421 ms |
+
+#### Tree n=8 → Chimera(4)
+
+| Strategy | Success | chain\_avg | elapsed |
+|---|---|---|---|
+| random | 30/30 | 1.32 | 8.0 ms |
+| degree | 30/30 | **1.04** | **1.2 ms** |
+| art\_pts | 30/30 | 1.28 | 4.6 ms |
+| degree\_art | 30/30 | **1.05** | 1.3 ms |
+
+#### Observations
+
+**`art_pts` alone behaves like `random`.**
+The flag only fires when placing isolated source nodes (no placed neighbours) that happen to be articulation points — a rare event in dense source graphs. Success rates and chain quality track `random` within noise across all configurations.
+
+**`degree_art` mirrors `degree`.**
+On tight topologies it inherits `degree`'s success-rate penalty (24→23 on Chimera ER, 21→23 on BA). On spacious topologies it matches or barely improves on `degree` (chain\_avg 1.54→1.52 on Zephyr, 1.70→1.67 on Pegasus), well within sample variance. On trees, `degree_art` (1.05) is indistinguishable from `degree` alone (1.04).
+
+**`PREFER_ARTICULATION_POINTS` is not included in `select_embed_options`.**
+No configuration showed a consistent, statistically meaningful improvement over the existing strategy rules. The flag is exposed for manual experimentation but is not recommended automatically.

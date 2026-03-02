@@ -749,3 +749,169 @@ class TestVertexWeights:
         assert any(target.has_edge(r, 3) for r in result)
         if len(result) > 1:
             assert nx.is_connected(target.subgraph(result))
+
+
+class TestPreferArticulationPoints:
+    """
+    Tests for EmbedOption.PREFER_ARTICULATION_POINTS.
+
+    The option anchors source articulation points (nodes whose removal
+    disconnects the source graph) on the highest-degree free target node,
+    maximising routing options for their neighbours on both sides of the cut.
+    Non-articulation source nodes are unaffected.
+    """
+
+    # -----------------------------------------------------------------------
+    # build_model unit tests
+    # -----------------------------------------------------------------------
+
+    def test_art_pt_anchor_prefers_highest_degree_target_node(self):
+        """
+        Source node that is an articulation point picks the highest-degree
+        free target node, not the first-in-iteration-order target node.
+
+        Source: path P3 (0-1-2).  Node 1 is the only articulation point.
+        Target: path P5 (0-1-2-3-4).  Nodes 1, 2, 3 have degree 2;
+                nodes 0 and 4 have degree 1.  Without the option, build_model
+                would return [0] (first in iteration order).  With the option,
+                it must return a node with the maximum degree (2).
+        """
+        source = nx.path_graph(3)
+        art_pts = frozenset(nx.articulation_points(source))
+        assert art_pts == {1}, "Expected node 1 to be the sole AP of P3"
+
+        target = nx.path_graph(5)
+        adjlist = {n: list(source.neighbors(n)) for n in source.nodes}
+        phi = {n: [] for n in source.nodes}
+
+        model = build_model(1, adjlist, phi, target, overlap_penalty=2.0,
+                            source_art_pts=art_pts)
+        assert model is not None and len(model) == 1
+        max_deg = max(d for _, d in target.degree())
+        assert target.degree(model[0]) == max_deg, (
+            f"AP anchor should have degree {max_deg}, got {target.degree(model[0])}"
+        )
+
+    def test_non_art_pt_uses_first_free_node(self):
+        """
+        A source node that is NOT an articulation point falls back to the
+        first free target node regardless of degree, as before.
+        """
+        source = nx.path_graph(3)
+        art_pts = frozenset(nx.articulation_points(source))
+        assert 0 not in art_pts
+
+        target = nx.path_graph(5)
+        adjlist = {n: list(source.neighbors(n)) for n in source.nodes}
+        phi = {n: [] for n in source.nodes}
+
+        model = build_model(0, adjlist, phi, target, overlap_penalty=2.0,
+                            source_art_pts=art_pts)
+        assert model is not None and len(model) == 1
+        assert model[0] == 0, "Non-AP source node should pick first free target node"
+
+    def test_no_source_art_pts_unchanged(self):
+        """
+        When the source graph has no articulation points (e.g. a complete
+        graph), passing an empty frozenset leaves the behaviour identical to
+        the default.
+        """
+        source = nx.complete_graph(4)
+        art_pts = frozenset(nx.articulation_points(source))
+        assert len(art_pts) == 0
+
+        target = nx.path_graph(8)
+        adjlist = {n: list(source.neighbors(n)) for n in source.nodes}
+        phi = {n: [] for n in source.nodes}
+
+        model_with = build_model(0, adjlist, phi, target, overlap_penalty=2.0,
+                                 source_art_pts=art_pts)
+        model_without = build_model(0, adjlist, phi, target, overlap_penalty=2.0)
+        assert model_with == model_without
+
+    def test_fallback_when_all_high_degree_nodes_occupied(self):
+        """
+        If the highest-degree target nodes are already occupied, the option
+        still returns a valid (lower-degree) free node.
+        """
+        source = nx.path_graph(3)
+        art_pts = frozenset(nx.articulation_points(source))
+
+        # Target: star with center 0 (degree 4), leaves 1-4 (degree 1)
+        target = nx.star_graph(4)
+        adjlist = {n: list(source.neighbors(n)) for n in source.nodes}
+        # Occupy the centre (highest-degree node)
+        phi = {0: [], 1: [0], 2: []}  # source node 1 already occupies target 0
+
+        model = build_model(0, adjlist, phi, target, overlap_penalty=2.0,
+                            source_art_pts=art_pts)
+        assert model is not None and len(model) == 1
+        assert model[0] != 0, "Centre is occupied; AP should pick a different node"
+
+    # -----------------------------------------------------------------------
+    # find_embedding integration tests
+    # -----------------------------------------------------------------------
+
+    def test_valid_embedding_path_into_grid(self):
+        """Path graph (many articulation points) embeds into a grid."""
+        source = nx.path_graph(6)
+        target = nx.grid_2d_graph(4, 4)
+        phi = find_embedding(
+            source, target,
+            rng_factory=seeded_rng(0), tries=30,
+            options=EmbedOption.PREFER_ARTICULATION_POINTS,
+        )
+        assert phi is not None
+        assert is_valid_embedding(source, target, phi)
+
+    def test_valid_embedding_k4_into_k4(self):
+        """K_4 (no articulation points) with the flag is identical to default."""
+        source = nx.complete_graph(4)
+        target = nx.complete_graph(4)
+        phi = find_embedding(
+            source, target,
+            rng_factory=seeded_rng(3),
+            options=EmbedOption.PREFER_ARTICULATION_POINTS,
+        )
+        assert phi is not None
+        assert is_valid_embedding(source, target, phi)
+
+    @pytest.mark.parametrize(
+        "label,source",
+        _RANDOM_SOURCE_CASES,
+        ids=[c[0] for c in _RANDOM_SOURCE_CASES],
+    )
+    def test_random_source_art_pts(self, label: str, source: nx.Graph) -> None:
+        """Random source graphs embed with PREFER_ARTICULATION_POINTS."""
+        target = nx.complete_graph(20)
+        phi = find_embedding(
+            source, target,
+            rng_factory=seeded_rng(0), tries=30,
+            options=EmbedOption.PREFER_ARTICULATION_POINTS,
+        )
+        assert phi is not None, f"{label}: embedding failed"
+        assert is_valid_embedding(source, target, phi), f"{label}: invalid embedding"
+
+    def test_combined_with_degree_order(self):
+        """ORDER_BY_DEGREE | PREFER_ARTICULATION_POINTS produces a valid embedding."""
+        source = nx.path_graph(6)
+        target = nx.grid_2d_graph(4, 4)
+        phi = find_embedding(
+            source, target,
+            rng_factory=seeded_rng(7), tries=30,
+            options=EmbedOption.ORDER_BY_DEGREE | EmbedOption.PREFER_ARTICULATION_POINTS,
+        )
+        assert phi is not None
+        assert is_valid_embedding(source, target, phi)
+
+    def test_combined_with_longest_chains(self):
+        """PREFER_ARTICULATION_POINTS + REFINE_LONGEST_CHAINS is valid."""
+        source = nx.path_graph(6)
+        target = nx.complete_graph(20)
+        phi = find_embedding(
+            source, target,
+            rng_factory=seeded_rng(42), tries=20,
+            options=EmbedOption.PREFER_ARTICULATION_POINTS | EmbedOption.REFINE_LONGEST_CHAINS,
+        )
+        assert phi is not None
+        assert is_valid_embedding(source, target, phi)
