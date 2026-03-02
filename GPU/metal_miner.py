@@ -12,7 +12,6 @@ import dimod
 
 from shared.base_miner import BaseMiner
 from shared.block_requirements import BlockRequirements
-from shared.energy_utils import energy_to_difficulty, DEFAULT_NUM_NODES, DEFAULT_NUM_EDGES
 from GPU.metal_sa import MetalSASampler
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
 
@@ -42,6 +41,12 @@ def get_gpu_core_count() -> int:
 
 
 class MetalMiner(BaseMiner):
+    # Metal MPS strategy: fewer sweeps, more reads
+    ADAPT_MIN_SWEEPS = 64
+    ADAPT_MAX_SWEEPS = 512
+    ADAPT_MIN_READS = 32
+    ADAPT_MAX_READS = 1024
+
     def __init__(self, miner_id: str, topology=None, **cfg):
         try:
             # Initialize base miner first to get the logger
@@ -96,7 +101,7 @@ class MetalMiner(BaseMiner):
         nodes: List[int],
         edges: List[Tuple[int, int]],
     ) -> dict:
-        return adapt_parameters(
+        return self.adapt_parameters(
             current_requirements.difficulty_energy,
             current_requirements.min_diversity,
             current_requirements.min_solutions,
@@ -119,50 +124,3 @@ class MetalMiner(BaseMiner):
         )
         return results[0]
 
-
-def adapt_parameters(
-    difficulty_energy: float,
-    min_diversity: float,
-    min_solutions: int,
-    num_nodes: int = DEFAULT_NUM_NODES,
-    num_edges: int = DEFAULT_NUM_EDGES
-):
-    """Calculate adaptive mining parameters based on difficulty requirements.
-
-    Metal MPS strategy: Fast convergence with MORE READS, FEWER SWEEPS.
-    Based on calibration showing Metal benefits from multiple quick attempts
-    rather than deep convergence per attempt.
-
-    Args:
-        difficulty_energy: Target energy threshold
-        min_diversity: Minimum solution diversity required (reserved)
-        min_solutions: Minimum number of valid solutions required
-        num_nodes: Number of nodes in topology (default: DEFAULT_TOPOLOGY)
-        num_edges: Number of edges in topology (default: DEFAULT_TOPOLOGY)
-
-    Returns:
-        Dictionary with num_sweeps and num_reads parameters
-    """
-    # Get normalized difficulty [0, 1]
-    difficulty = energy_to_difficulty(
-        difficulty_energy,
-        num_nodes=num_nodes,
-        num_edges=num_edges
-    )
-
-    # Metal calibration: Prefers fewer sweeps, more reads per calibration
-    min_sweeps = 64      # Easiest difficulty (very fast convergence)
-    max_sweeps = 512     # Hardest difficulty (still relatively fast)
-
-    # Direct linear scaling: difficulty × max_sweeps
-    num_sweeps = max(min_sweeps, int(difficulty * max_sweeps))
-
-    # Metal benefits from MORE READS (multiple nonce strategy)
-    min_reads = 32
-    max_reads = 1024
-    num_reads = max(min_reads, int(difficulty * max_reads))
-
-    return {
-        'num_sweeps': num_sweeps,
-        'num_reads': max(num_reads, min_solutions),
-    }

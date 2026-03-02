@@ -17,6 +17,11 @@ import dimod
 import numpy as np
 
 from shared.block_requirements import BlockRequirements, compute_current_requirements
+from shared.energy_utils import (
+    energy_to_difficulty,
+    DEFAULT_NUM_NODES,
+    DEFAULT_NUM_EDGES,
+)
 from shared.miner_types import IsingSample, MiningResult, Sampler
 from shared.quantum_proof_of_work import (
     evaluate_sampleset,
@@ -183,43 +188,110 @@ class BaseMiner(ABC):
 
         return "\n".join(summary_lines)
 
-    def adapt_parameters(self, network_stats: dict):
-        """Adapt miner parameters based on performance relative to network.
+    # --- Adaptive parameter bounds (override in subclasses) ---
+    # SA/GPU miners use sweeps + reads; QPU miners use annealing_time + reads.
+    ADAPT_MIN_SWEEPS: int = 64
+    ADAPT_MAX_SWEEPS: int = 4096
+    ADAPT_MIN_READS: int = 64
+    ADAPT_MAX_READS: int = 512
+    # When > 0, reads range is derived from min_solutions instead of fixed
+    # bounds: min = max(min_solutions * factor, ADAPT_MIN_READS),
+    #         max = max(min_solutions * factor, ADAPT_MAX_READS).
+    ADAPT_READS_SOLUTION_MIN_FACTOR: int = 0
+    ADAPT_READS_SOLUTION_MAX_FACTOR: int = 0
+    # Floor applied to final num_reads as max(num_reads, min_solutions * N).
+    # Most miners use 1; Modal uses 3; SA uses 0 (no floor).
+    ADAPT_READS_SOLUTION_FLOOR_FACTOR: int = 1
+    # QPU miners set these instead of sweeps bounds
+    ADAPT_MIN_ANNEALING_TIME: float = 0.0
+    ADAPT_MAX_ANNEALING_TIME: float = 0.0
+    ADAPT_MIN_BONUS_READS: int = 0
+    ADAPT_MAX_BONUS_READS: int = 0
+    # Extra keys merged into the returned dict (e.g. num_sweeps_per_beta)
+    ADAPT_EXTRA_PARAMS: Dict[str, Any] = {}
+
+    @classmethod
+    def adapt_parameters(
+        cls,
+        difficulty_energy: float,
+        min_diversity: float,
+        min_solutions: int,
+        num_nodes: int = DEFAULT_NUM_NODES,
+        num_edges: int = DEFAULT_NUM_EDGES,
+    ) -> dict:
+        """Calculate adaptive mining parameters based on difficulty.
+
+        Uses GSE-based difficulty with linear interpolation. Each miner
+        subclass declares its own parameter bounds as class attributes.
+
+        Can be called on an instance (``self.adapt_parameters(...)``) or on
+        the class directly (``SimulatedAnnealingMiner.adapt_parameters(...)``).
 
         Args:
-            network_stats: Dict containing total_blocks, total_miners, avg_win_rate
+            difficulty_energy: Target energy threshold.
+            min_diversity: Minimum solution diversity (reserved).
+            min_solutions: Minimum number of valid solutions required.
+            num_nodes: Number of nodes in topology.
+            num_edges: Number of edges in topology.
+
+        Returns:
+            Dictionary with miner-specific parameter keys.
         """
-        if self.timing_stats['blocks_attempted'] < 5:
-            return  # Need enough data before adapting
+        difficulty = energy_to_difficulty(
+            difficulty_energy,
+            num_nodes=num_nodes,
+            num_edges=num_edges,
+        )
 
-        # Calculate expected win rate (fair share)
-        expected_win_rate = 1.0 / network_stats['total_miners']
-        actual_win_rate = self.blocks_won / self.timing_stats['blocks_attempted']
+        # QPU path: annealing_time + bonus reads
+        if cls.ADAPT_MAX_ANNEALING_TIME > 0:
+            annealing_time = (
+                cls.ADAPT_MIN_ANNEALING_TIME
+                + difficulty
+                * (cls.ADAPT_MAX_ANNEALING_TIME - cls.ADAPT_MIN_ANNEALING_TIME)
+            )
+            bonus_reads = int(
+                cls.ADAPT_MIN_BONUS_READS
+                + difficulty
+                * (cls.ADAPT_MAX_BONUS_READS - cls.ADAPT_MIN_BONUS_READS)
+            )
+            result: dict = {
+                'num_reads': min_solutions + bonus_reads,
+                'annealing_time': annealing_time,
+            }
+        else:
+            # SA / GPU path: sweeps + reads
+            num_sweeps = max(
+                cls.ADAPT_MIN_SWEEPS,
+                int(difficulty * cls.ADAPT_MAX_SWEEPS),
+            )
 
-        # If winning less than expected, improve parameters
-        if actual_win_rate < expected_win_rate * 0.8:  # 20% below expected
-            if self.miner_type == "QPU":
-                # Increase annealing time for better solutions
-                self.adaptive_params['quantum_annealing_time'] *= 1.2
-                self.logger.info(f"{self.miner_id} increasing annealing time to {self.adaptive_params['quantum_annealing_time']:.2f} μs")
+            # Reads range: solution-factor or fixed bounds
+            if cls.ADAPT_READS_SOLUTION_MIN_FACTOR > 0:
+                min_reads = max(
+                    int(min_solutions) * cls.ADAPT_READS_SOLUTION_MIN_FACTOR,
+                    cls.ADAPT_MIN_READS,
+                )
+                max_reads = max(
+                    int(min_solutions) * cls.ADAPT_READS_SOLUTION_MAX_FACTOR,
+                    cls.ADAPT_MAX_READS,
+                )
             else:
-                # For SA, increase sweeps or adjust beta range
-                self.adaptive_params['num_sweeps'] = int(self.adaptive_params['num_sweeps'] * 1.1)
-                # Widen beta range for better exploration
-                self.adaptive_params['beta_range'][0] *= 0.9
-                self.adaptive_params['beta_range'][1] *= 1.1
-                self.logger.info(f"{self.miner_id} adapting: sweeps={self.adaptive_params['num_sweeps']}, beta_range={self.adaptive_params['beta_range']}")
+                min_reads = cls.ADAPT_MIN_READS
+                max_reads = cls.ADAPT_MAX_READS
 
-        # If winning too much, can reduce parameters to save resources
-        elif actual_win_rate > expected_win_rate * 1.5:  # 50% above expected
-            if self.miner_type == "QPU":
-                # Reduce annealing time to save QPU resources
-                self.adaptive_params['quantum_annealing_time'] *= 0.9
-                self.logger.info(f"{self.miner_id} reducing annealing time to {self.adaptive_params['quantum_annealing_time']:.2f} μs")
-            else:
-                # For SA, reduce sweeps for faster mining
-                self.adaptive_params['num_sweeps'] = int(self.adaptive_params['num_sweeps'] * 0.95)
-                self.logger.info(f"{self.miner_id} reducing sweeps to {self.adaptive_params['num_sweeps']}")
+            num_reads = max(min_reads, int(difficulty * max_reads))
+
+            floor = min_solutions * cls.ADAPT_READS_SOLUTION_FLOOR_FACTOR
+            result = {
+                'num_sweeps': num_sweeps,
+                'num_reads': max(num_reads, floor),
+            }
+
+        if cls.ADAPT_EXTRA_PARAMS:
+            result.update(cls.ADAPT_EXTRA_PARAMS)
+
+        return result
 
     # ------------------------------------------------------------------
     # Template Method: mine_block

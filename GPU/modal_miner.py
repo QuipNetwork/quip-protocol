@@ -11,11 +11,17 @@ import dimod
 
 from shared.base_miner import BaseMiner
 from shared.block_requirements import BlockRequirements
-from shared.energy_utils import energy_to_difficulty, DEFAULT_NUM_NODES, DEFAULT_NUM_EDGES
 from GPU.modal_sampler import ModalSampler
 
 
 class ModalMiner(BaseMiner):
+    # Modal cloud GPU calibration ranges
+    ADAPT_MIN_SWEEPS = 128
+    ADAPT_MAX_SWEEPS = 4096
+    ADAPT_MIN_READS = 64
+    ADAPT_MAX_READS = 256
+    ADAPT_READS_SOLUTION_FLOOR_FACTOR = 3
+
     def __init__(self, miner_id: str, gpu_type: str = "t4", **cfg):
         sampler = ModalSampler(gpu_type)
         super().__init__(miner_id, sampler)
@@ -61,8 +67,9 @@ class ModalMiner(BaseMiner):
         nodes: List[int],
         edges: List[Tuple[int, int]],
     ) -> dict:
-        return adapt_parameters(
+        return self.adapt_parameters(
             current_requirements.difficulty_energy,
+            current_requirements.min_diversity,
             current_requirements.min_solutions,
             num_nodes=len(nodes),
             num_edges=len(edges),
@@ -80,47 +87,3 @@ class ModalMiner(BaseMiner):
         return self.sampler.sample_ising(
             h=h, J=J, num_reads=num_reads, num_sweeps=num_sweeps,
         )
-
-
-def adapt_parameters(
-    difficulty_energy: float,
-    min_solutions: int,
-    num_nodes: int = DEFAULT_NUM_NODES,
-    num_edges: int = DEFAULT_NUM_EDGES
-):
-    """Calculate adaptive mining parameters based on difficulty requirements.
-
-    Cloud GPU strategy: Balanced approach optimized for Modal Labs GPUs.
-
-    Args:
-        difficulty_energy: Target energy threshold
-        min_solutions: Minimum number of valid solutions required
-        num_nodes: Number of nodes in topology (default: DEFAULT_TOPOLOGY)
-        num_edges: Number of edges in topology (default: DEFAULT_TOPOLOGY)
-
-    Returns:
-        Dictionary with num_sweeps and num_reads parameters
-    """
-    # Get normalized difficulty [0, 1]
-    difficulty = energy_to_difficulty(
-        difficulty_energy,
-        num_nodes=num_nodes,
-        num_edges=num_edges
-    )
-
-    # Modal GPU calibration ranges (cloud GPU optimized)
-    min_sweeps = 128
-    max_sweeps = 4096
-
-    # Direct linear scaling: difficulty × max_sweeps
-    num_sweeps = max(min_sweeps, int(difficulty * max_sweeps))
-
-    # Reads scale linearly with difficulty
-    min_reads = 64
-    max_reads = 256
-    num_reads = max(min_reads, int(difficulty * max_reads))
-
-    return {
-        'num_sweeps': num_sweeps,
-        'num_reads': max(num_reads, min_solutions * 3),
-    }
