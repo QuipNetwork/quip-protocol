@@ -11,7 +11,9 @@ import math
 # Add the project root to the path so we can import the function
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from CPU.sa_miner import adapt_parameters
+from CPU.sa_miner import SimulatedAnnealingMiner
+
+adapt_parameters = SimulatedAnnealingMiner.adapt_parameters
 
 
 def test_adapt_parameters_range():

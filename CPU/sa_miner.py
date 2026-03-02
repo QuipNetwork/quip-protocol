@@ -12,11 +12,19 @@ import dimod
 
 from shared.base_miner import BaseMiner
 from shared.block_requirements import BlockRequirements
-from shared.energy_utils import energy_to_difficulty, DEFAULT_NUM_NODES, DEFAULT_NUM_EDGES
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
 
 
 class SimulatedAnnealingMiner(BaseMiner):
+    # CPU SA calibration: sweeps 64–4096, reads from min_solutions factors
+    ADAPT_MIN_SWEEPS = 64
+    ADAPT_MAX_SWEEPS = 4096
+    ADAPT_MIN_READS = 64
+    ADAPT_MAX_READS = 512
+    ADAPT_READS_SOLUTION_MIN_FACTOR = 4
+    ADAPT_READS_SOLUTION_MAX_FACTOR = 8
+    ADAPT_READS_SOLUTION_FLOOR_FACTOR = 0
+
     def __init__(self, miner_id: str, sampler=None, topology=None, **cfg):
         if sampler is None:
             sampler = SimulatedAnnealingStructuredSampler(topology=topology)
@@ -56,7 +64,7 @@ class SimulatedAnnealingMiner(BaseMiner):
         nodes: List[int],
         edges: List[Tuple[int, int]],
     ) -> dict:
-        return adapt_parameters(
+        return self.adapt_parameters(
             current_requirements.difficulty_energy,
             current_requirements.min_diversity,
             current_requirements.min_solutions,
@@ -93,49 +101,3 @@ class SimulatedAnnealingMiner(BaseMiner):
         return False
 
 
-def adapt_parameters(
-    difficulty_energy: float,
-    min_diversity: float,
-    min_solutions: int,
-    num_nodes: int = DEFAULT_NUM_NODES,
-    num_edges: int = DEFAULT_NUM_EDGES
-):
-    """Calculate adaptive mining parameters based on difficulty requirements.
-
-    Uses GSE-based difficulty calculation with log-linear interpolation
-    in sweep space, calibrated from experimental data.
-
-    Args:
-        difficulty_energy: Target energy threshold
-        min_diversity: Minimum solution diversity required (reserved)
-        min_solutions: Minimum number of valid solutions required
-        num_nodes: Number of nodes in topology (default: DEFAULT_TOPOLOGY)
-        num_edges: Number of edges in topology (default: DEFAULT_TOPOLOGY)
-
-    Returns:
-        Dictionary with num_sweeps and num_reads parameters
-    """
-    # Get normalized difficulty [0, 1]
-    difficulty = energy_to_difficulty(
-        difficulty_energy,
-        num_nodes=num_nodes,
-        num_edges=num_edges
-    )
-
-    # CPU SA calibration ranges (from experimental data)
-    min_sweeps = 64      # Easiest difficulty
-    max_sweeps = 4096    # Hardest difficulty (avoid overfitting beyond this)
-
-    # Direct linear scaling: difficulty × max_sweeps
-    # Example: difficulty=0.5 → 0.5 × 4096 = 2048 sweeps
-    num_sweeps = max(min_sweeps, int(difficulty * max_sweeps))
-
-    # Reads scale with both difficulty and min_solutions requirement
-    base_reads = max(int(min_solutions) * 4, 64)
-    max_reads = max(int(min_solutions) * 8, 512)
-    num_reads = max(base_reads, int(difficulty * max_reads))
-
-    return {
-        'num_sweeps': num_sweeps,
-        'num_reads': num_reads,
-    }

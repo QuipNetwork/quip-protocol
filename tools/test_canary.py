@@ -354,20 +354,12 @@ def run_canary_test(
     nodes = list(topology.nodes)
     edges = list(topology.edges)
 
-    # Import correct adapt_parameters based on miner type
-    if hasattr(miner, 'miner_type') and miner.miner_type == 'QPU':
-        from QPU.dwave_miner import adapt_parameters
-    elif hasattr(miner, 'miner_type') and any(t in miner.miner_type for t in ['CUDA', 'Metal', 'GPU']):
-        from CPU.sa_miner import adapt_parameters  # Use CPU params for GPU
-    else:
-        from CPU.sa_miner import adapt_parameters
-
-    full_params = adapt_parameters(
+    full_params = miner.adapt_parameters(
         difficulty_energy=difficulty_energy,
         min_diversity=min_diversity,
         min_solutions=min_solutions,
         num_nodes=len(nodes),
-        num_edges=len(edges)
+        num_edges=len(edges),
     )
 
     # Cap num_reads at 256 for CUDA (hardware limit)

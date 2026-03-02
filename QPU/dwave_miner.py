@@ -17,12 +17,17 @@ from QPU.dwave_sampler import DWaveSamplerWrapper
 from QPU.qpu_time_manager import QPUTimeManager, QPUTimeConfig
 from shared.base_miner import BaseMiner
 from shared.block_requirements import BlockRequirements
-from shared.energy_utils import energy_to_difficulty, DEFAULT_NUM_NODES, DEFAULT_NUM_EDGES
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.dwave_topology import DWaveTopology
 
 
 class DWaveMiner(BaseMiner):
+    # QPU annealing time + bonus reads (no sweeps)
+    ADAPT_MIN_ANNEALING_TIME = 5.0    # μs, easiest difficulty
+    ADAPT_MAX_ANNEALING_TIME = 20.0   # μs, hardest difficulty
+    ADAPT_MIN_BONUS_READS = 32
+    ADAPT_MAX_BONUS_READS = 64
+
     def __init__(
         self,
         miner_id: str,
@@ -154,7 +159,7 @@ class DWaveMiner(BaseMiner):
         nodes: List[int],
         edges: List[Tuple[int, int]],
     ) -> dict:
-        return adapt_parameters(
+        return self.adapt_parameters(
             current_requirements.difficulty_energy,
             current_requirements.min_diversity,
             current_requirements.min_solutions,
@@ -205,59 +210,3 @@ class DWaveMiner(BaseMiner):
                     self.time_manager.record_block_time(qpu_total_access)
 
         return sampleset
-
-
-def adapt_parameters(
-    difficulty_energy: float,
-    min_diversity: float,
-    min_solutions: int,
-    num_nodes: int = DEFAULT_NUM_NODES,
-    num_edges: int = DEFAULT_NUM_EDGES
-):
-    """Calculate adaptive mining parameters based on difficulty requirements.
-
-    QPU strategy: Scales annealing time and read bonus (not sweeps).
-    Linear interpolation for both parameters.
-
-    Note: num_reads = min_solutions + bonus, where bonus in [16, 64]
-
-    Args:
-        difficulty_energy: Target energy threshold
-        min_diversity: Minimum solution diversity required (reserved)
-        min_solutions: Minimum number of valid solutions required
-        num_nodes: Number of nodes in topology (default: DEFAULT_TOPOLOGY)
-        num_edges: Number of edges in topology (default: DEFAULT_TOPOLOGY)
-
-    Returns:
-        Dictionary with num_reads, num_sweeps, and annealing_time parameters
-    """
-    # Get normalized difficulty [0, 1]
-    difficulty = energy_to_difficulty(
-        difficulty_energy,
-        num_nodes=num_nodes,
-        num_edges=num_edges
-    )
-
-    # QPU annealing time range (microseconds)
-    min_annealing_time = 5.0    # Easiest difficulty
-    max_annealing_time = 20.0   # Hardest difficulty
-
-    # Linear interpolation for annealing time
-    annealing_time = min_annealing_time + difficulty * (max_annealing_time - min_annealing_time)
-
-    # QPU read bonus range (added to min_solutions)
-    min_bonus = 32    # Easiest difficulty
-    max_bonus = 64    # Hardest difficulty
-
-    # Linear interpolation for bonus reads
-    bonus_reads = int(min_bonus + difficulty * (max_bonus - min_bonus))
-    num_reads = min_solutions + bonus_reads
-
-    # QPU doesn't use sweeps but the template requires it
-    num_sweeps = 1
-
-    return {
-        'num_reads': num_reads,
-        'num_sweeps': num_sweeps,
-        'annealing_time': annealing_time,
-    }

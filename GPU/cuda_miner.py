@@ -13,7 +13,6 @@ import dimod
 
 from shared.base_miner import BaseMiner
 from shared.block_requirements import BlockRequirements
-from shared.energy_utils import energy_to_difficulty, DEFAULT_NUM_NODES, DEFAULT_NUM_EDGES
 from GPU.cuda_kernel import CudaKernelRealSA
 from GPU.cuda_sa import CudaKernelAdapter, CudaSASamplerAsync
 from dwave_topologies import DEFAULT_TOPOLOGY
@@ -24,54 +23,6 @@ except ImportError:
     cp = None
 
 
-def adapt_parameters(
-    difficulty_energy: float,
-    min_diversity: float,
-    min_solutions: int,
-    num_nodes: int = DEFAULT_NUM_NODES,
-    num_edges: int = DEFAULT_NUM_EDGES
-) -> dict:
-    """Adapt mining parameters based on difficulty.
-
-    Uses GSE-based difficulty calculation with log-linear interpolation
-    in sweep space, optimized for CUDA GPU performance.
-
-    Args:
-        difficulty_energy: Target energy threshold
-        min_diversity: Minimum solution diversity required (reserved)
-        min_solutions: Minimum number of valid solutions required
-        num_nodes: Number of nodes in topology (default: DEFAULT_TOPOLOGY)
-        num_edges: Number of edges in topology (default: DEFAULT_TOPOLOGY)
-
-    Returns:
-        Dictionary with num_sweeps, num_reads, and num_sweeps_per_beta
-    """
-    # Get normalized difficulty [0, 1]
-    difficulty = energy_to_difficulty(
-        difficulty_energy,
-        num_nodes=num_nodes,
-        num_edges=num_edges
-    )
-
-    # CUDA GPU calibration ranges
-    min_sweeps = 256     # Easiest difficulty (fast GPU convergence)
-    max_sweeps = 2048    # Hardest difficulty
-
-    # Direct linear scaling: difficulty × max_sweeps
-    num_sweeps = max(min_sweeps, int(difficulty * max_sweeps))
-
-    # Reads scale linearly with difficulty (capped at 256 for CUDA hardware limit)
-    min_reads = 64
-    max_reads = 256  # CUDA max_threads_per_job limit
-    num_reads = max(min_reads, int(difficulty * max_reads))
-
-    return {
-        'num_sweeps': num_sweeps,
-        'num_reads': max(num_reads, min_solutions),
-        'num_sweeps_per_beta': 1
-    }
-
-
 class CudaMiner(BaseMiner):
     """CUDA GPU miner using persistent kernel for high-throughput mining.
 
@@ -79,6 +30,13 @@ class CudaMiner(BaseMiner):
     The kernel runs continuously on the GPU, processing jobs from a ring buffer.
     This eliminates kernel launch overhead and enables high job throughput.
     """
+
+    # CUDA GPU calibration ranges
+    ADAPT_MIN_SWEEPS = 256
+    ADAPT_MAX_SWEEPS = 2048
+    ADAPT_MIN_READS = 64
+    ADAPT_MAX_READS = 256  # CUDA max_threads_per_job limit
+    ADAPT_EXTRA_PARAMS = {'num_sweeps_per_beta': 1}
 
     def __init__(self, miner_id: str, device: str = "0", topology=None, **cfg):
         """Initialize CUDA miner.
@@ -227,7 +185,7 @@ class CudaMiner(BaseMiner):
         nodes: List[int],
         edges: List[Tuple[int, int]],
     ) -> dict:
-        return adapt_parameters(
+        return self.adapt_parameters(
             current_requirements.difficulty_energy,
             current_requirements.min_diversity,
             current_requirements.min_solutions,
