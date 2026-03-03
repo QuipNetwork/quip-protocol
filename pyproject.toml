@@ -79,5 +79,6 @@ asyncio_default_fixture_loop_scope = "function"
 
 [dependency-groups]
 dev = [
+    "minorminer>=0.2.21",
     "pytest>=8.4.2",
 ]

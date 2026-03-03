@@ -70,7 +70,7 @@ from topo_alloc.graphviz_render import (
     format_stats_table,
     render_embedding,
 )
-from topo_alloc.minor_alloc import EmbedOption, find_embedding
+from topo_alloc.minor_alloc import embed
 
 # ---------------------------------------------------------------------------
 # Ising-model graph definitions
@@ -172,59 +172,44 @@ CASES: list[tuple[str, nx.Graph, str, nx.Graph]] = [
 
 OUT_DIR = Path(__file__).parent
 
-_COL_W = 28  # column width for comparison table
-
 
 def _run_case(
     label: str,
     source: nx.Graph,
     topo_name: str,
     target: nx.Graph,
-    order_by_degree: bool,
     seed: int = 42,
-) -> tuple[str, tuple[EmbeddingStats, str] | None]:
-    """Run one embedding attempt; return (suffix, stats_line | None)."""
-    suffix = "degree" if order_by_degree else "random"
-    embedding = find_embedding(
+) -> tuple[EmbeddingStats, str] | None:
+    """Run one embedding attempt with balanced strategy; return (stats, out_path) or None."""
+    embedding = embed(
         source,
         target,
+        priority="balanced",
         rng_factory=seeded_rng(seed),
         tries=50,
         refinment_constant=20,
-        overlap_penalty=2.0,
-        options=EmbedOption.ORDER_BY_DEGREE if order_by_degree else EmbedOption(0),
+        overlap_penalty=2,
     )
     if embedding is None:
-        return suffix, None
+        return None
 
     stats = embedding_stats(embedding)
 
     n_src = source.number_of_nodes()
     title = (
-        f"{label} [{suffix}]\\nsource nodes: {n_src}"
+        f"{label}\\nsource nodes: {n_src}"
         f"  target: {topo_name} ({target.number_of_nodes()} nodes)"
     )
     dot = render_embedding(target, embedding, title=title)
-    out_path = OUT_DIR / f"demo_{label}_{suffix}.dot"
+    out_path = OUT_DIR / f"demo_{label}.dot"
     dot.save(str(out_path))
-    return suffix, (stats, str(out_path))
-
-
-def _fmt(val) -> str:
-    if val is None:
-        return "FAILED"
-    if isinstance(val, float):
-        return f"{val:.2f}"
-    return str(val)
+    return stats, str(out_path)
 
 
 def main() -> None:
     print("=" * 70)
-    print("Ising-model minor-embedding demo  (random  vs  degree-ordered)")
+    print("Ising-model minor-embedding demo  (balanced strategy)")
     print("=" * 70)
-
-    hdr = f"{'metric':<20}  {'random':>{_COL_W}}  {'degree-order':>{_COL_W}}"
-    sep = "-" * len(hdr)
 
     for label, source, topo_name, target in CASES:
         n_src = source.number_of_nodes()
@@ -233,59 +218,17 @@ def main() -> None:
             f"\n-- {label}  (source: {n_src} nodes  →  target: {topo_name} {n_tgt} nodes)"
         )
 
-        results: dict[str, object] = {}
-        for use_degree in (False, True):
-            suffix, payload = _run_case(label, source, topo_name, target, use_degree)
-            results[suffix] = payload
+        payload = _run_case(label, source, topo_name, target)
 
-        r_payload = results["random"]
-        d_payload = results["degree"]
-
-        # Pretty-print comparison table
-        print(hdr)
-        print(sep)
-
-        def row(name: str, r_val, d_val) -> None:
-            print(f"  {name:<18}  {_fmt(r_val):>{_COL_W}}  {_fmt(d_val):>{_COL_W}}")
-
-        if r_payload is None and d_payload is None:
-            print("  Both strategies FAILED to find an embedding.")
+        if payload is None:
+            print("  FAILED to find an embedding.")
         else:
-            r_stats = r_payload[0] if r_payload else None  # pyright: ignore[reportIndexIssue]
-            d_stats = d_payload[0] if d_payload else None  # pyright: ignore[reportIndexIssue]
-            row(
-                "nodes used",
-                r_stats.nodes_used if r_stats else None,
-                d_stats.nodes_used if d_stats else None,
-            )
-            row(
-                "chain avg",
-                r_stats.chain_avg if r_stats else None,
-                d_stats.chain_avg if d_stats else None,
-            )
-            row(
-                "chain max",
-                r_stats.chain_max if r_stats else None,
-                d_stats.chain_max if d_stats else None,
-            )
-            row(
-                "chain min",
-                r_stats.chain_min if r_stats else None,
-                d_stats.chain_min if d_stats else None,
-            )
-
-            for suffix, payload in [("random", r_payload), ("degree", d_payload)]:
-                if payload:
-                    print(f"    DOT [{suffix}] → {payload[1]}")
-
-        # Also print per-strategy formatted stats for detail
-        for suffix, payload in [("random", r_payload), ("degree", d_payload)]:
-            if payload:
-                print(f"\n  [{suffix}] full stats:")
-                print(format_stats_table(payload[0]))  # pyright: ignore[reportIndexIssue]
+            stats, out_path = payload
+            print(format_stats_table(stats))
+            print(f"    DOT → {out_path}")
 
     print("\n" + "=" * 70)
-    print("Done.  Render with:  dot -Tsvg demo_<name>_<strategy>.dot -o out.svg")
+    print("Done.  Render with:  dot -Tsvg demo_<name>.dot -o out.svg")
     print("=" * 70)
 
 

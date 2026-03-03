@@ -31,18 +31,19 @@ All three minor-embedding conditions are verified. If satisfied the embedding is
 
 ```
 topo_alloc/
-├── minor_alloc.py      # Core embedding algorithm (find_embedding, build_model, EmbedOption)
-├── topology.py         # Topology dataclasses (Cell, Coupling, Topology) - WORK IN PROGRESS
-├── graphviz_render.py  # DOT rendering and chain statistics helpers
-├── embed_cli.py        # CLI wrapper around find_embedding
-├── demo_embedding.py   # Ising-model embedding demos (K₅, rings, K₃₃, K₄₄)
-├── bench_random.py     # Benchmark CLI for random source graphs
-└── test_minor_alloc.py # pytest test suite
+├── minor_alloc.py        # Core embedding algorithm (find_embedding, build_model, EmbedOption)
+├── topology.py           # Topology dataclasses (Cell, Coupling, Topology) - WORK IN PROGRESS
+├── graphviz_render.py    # DOT rendering and chain statistics helpers
+├── embed_cli.py          # CLI wrapper around find_embedding
+├── demo_embedding.py     # Ising-model embedding demos (K₅, rings, K₃₃, K₄₄)
+├── bench_random.py       # Benchmark CLI for random source graphs (strategy comparison)
+├── bench_minorminer.py   # Benchmark CLI comparing quip vs D-Wave minorminer
+└── test_minor_alloc.py   # pytest test suite
 ```
 
 ### Running the Demo
 
-Embeds five canonical Ising-model graphs (K₅, frustrated triangle, 8-spin antiferromagnetic ring, K₃₃, K₄₄) into Chimera, Zephyr, and Pegasus topologies and compares random vs degree-ordered placement:
+Embeds five canonical Ising-model graphs (K₅, frustrated triangle, 8-spin antiferromagnetic ring, K₃₃, K₄₄) into Chimera, Zephyr, and Pegasus topologies using the `balanced` strategy:
 
 ```bash
 python -m topo_alloc.demo_embedding
@@ -51,10 +52,12 @@ python -m topo_alloc.demo_embedding
 This writes `.dot` files into the `topo_alloc/` directory. Render any of them with Graphviz (run from the project root):
 
 ```bash
-dot -Tsvg topo_alloc/demo_k5_chimera4_degree.dot -o demo_k5_chimera4_degree.svg
+dot -Tsvg topo_alloc/demo_k5_chimera4.dot -o demo_k5_chimera4.svg
 ```
 
 ### Running the Benchmarks
+
+#### `bench_random.py` — strategy comparison
 
 `bench_random.py` generates random source graphs, embeds them into a chosen topology, and reports per-strategy chain-length statistics.
 
@@ -90,6 +93,38 @@ Key options:
 | `--samples` | `20` | Number of random source graphs to generate |
 | `--tries` | `30` | Embedding attempts per sample |
 | `--warmup` | `3` | Warmup rounds before recording (discards cold-start latency) |
+| `--no-detail` | off | Suppress per-sample table, show only aggregates |
+| `--csv PATH` | — | Write per-sample results to a CSV file |
+
+#### `bench_minorminer.py` — quip vs minorminer
+
+`bench_minorminer.py` runs the same random source graphs through both quip (`embed`, `balanced` priority) and D-Wave's `minorminer` side-by-side. Requires `pip install minorminer`.
+
+```bash
+# ER graphs (n=8, p=0.5) → Chimera(4), 30 samples
+python -m topo_alloc.bench_minorminer \
+    --graph-model er --nodes 8 --er-p 0.5 \
+    --topology chimera --topology-size 4 \
+    --samples 30 --warmup 5
+
+# Barabási-Albert → Zephyr(3), aggregates only, CSV output
+python -m topo_alloc.bench_minorminer \
+    --graph-model ba --nodes 8 --ba-m 2 \
+    --topology zephyr --topology-size 3 \
+    --samples 30 --no-detail --csv results.csv
+```
+
+Key options:
+
+| Option | Default | Description |
+|---|---|---|
+| `--graph-model` | `er` | Source graph family: `er`, `ba`, `tree` |
+| `--nodes` / `-n` | `8` | Source graph node count |
+| `--topology` | `chimera` | Target topology: `chimera`, `zephyr`, `pegasus` |
+| `--topology-size` | `4` | Size parameter (e.g. `4` → Chimera(4), 128 qubits) |
+| `--quip-tries` | `50` | Independent embedding attempts for quip |
+| `--mm-tries` | `10` | Restart attempts for minorminer (its default) |
+| `--warmup` | `3` | Warmup rounds before recording |
 | `--no-detail` | off | Suppress per-sample table, show only aggregates |
 | `--csv PATH` | — | Write per-sample results to a CSV file |
 
@@ -212,3 +247,58 @@ Zero failures vs the per-strategy optimum: `auto` never falls behind the best fi
 | Automatic selection (balanced) | `auto` — uses `select_embed_options` |
 
 `auto` implements these rules: `centrality` for tree sources, `random` on tight topologies (ratio < 25), `degree_asc` on spacious topologies (balanced priority), `degree_asc + longest_chains` (quality priority).
+
+---
+
+### quip vs minorminer
+
+30 samples per configuration, 5 warmup rounds. quip: `--quip-tries 50 --refinement-constant 20`. minorminer: `--mm-tries 10` (its default).
+
+#### ER n=8, p=0.5 → Chimera(4) — 128 qubits
+
+| Solver | Success | chain\_avg | chain\_max | elapsed |
+|---|---|---|---|---|
+| quip (balanced) | 27/30 | 2.04 | 5.19 | 844 ms |
+| **minorminer** | **30/30** | **1.55** | **2.47** | **1.0 ms** |
+
+#### ER n=8, p=0.5 → Zephyr(3) — 336 qubits
+
+| Solver | Success | chain\_avg | chain\_max | elapsed |
+|---|---|---|---|---|
+| quip (balanced) | 30/30 | 2.06 | 4.97 | 34 ms |
+| **minorminer** | **30/30** | **1.11** | **1.73** | **1.9 ms** |
+
+#### BA n=8, m=2 → Chimera(4) — 128 qubits
+
+| Solver | Success | chain\_avg | chain\_max | elapsed |
+|---|---|---|---|---|
+| quip (balanced) | 30/30 | 1.77 | 4.20 | 77 ms |
+| **minorminer** | **30/30** | **1.39** | **2.20** | **0.73 ms** |
+
+#### BA n=8, m=2 → Zephyr(3) — 336 qubits
+
+| Solver | Success | chain\_avg | chain\_max | elapsed |
+|---|---|---|---|---|
+| quip (balanced) | 30/30 | 2.08 | 5.90 | 9.7 ms |
+| **minorminer** | **30/30** | **1.06** | **1.47** | **1.6 ms** |
+
+#### Tree n=10 → Chimera(4) — 128 qubits
+
+| Solver | Success | chain\_avg | chain\_max | elapsed |
+|---|---|---|---|---|
+| quip (balanced) | 29/30 | 1.02 | 1.14 | 93 ms |
+| **minorminer** | **30/30** | **1.00** | **1.00** | **0.32 ms** |
+
+#### Key observations
+
+**minorminer is 15–300× faster.**
+minorminer is a mature C extension; quip is a pure-Python research implementation. Even with 5× more restart attempts (50 vs 10), quip is consistently slower by one to two orders of magnitude.
+
+**minorminer produces significantly shorter chains.**
+Across all configurations minorminer's `chain_avg` is 25–50% lower and `chain_max` roughly half of quip's. On Zephyr and BA graphs the gap is especially pronounced (quip `chain_max` 5.9 vs minorminer 1.47).
+
+**Trees expose the ceiling of both solvers.**
+Both achieve near-unit chains on tree sources (`chain_avg` ≈ 1.00–1.02), but minorminer reaches a perfect 1.00 average on every sample while quip's `centrality` heuristic still averages 1.02 with an occasional chain of length 3.
+
+**quip's advantage is transparency and extensibility.**
+The Python implementation exposes every algorithmic stage as readable, hackable code. It is suited for experimenting with new placement heuristics and topology-aware strategies that have not yet been incorporated into minorminer.
