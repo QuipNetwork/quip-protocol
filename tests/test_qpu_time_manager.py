@@ -206,17 +206,21 @@ class TestQPUTimeManager:
         manager = QPUTimeManager(config)
 
         # Simulate being at end of day so proportional limit equals daily budget
-        manager.day_start_timestamp = time_module.time() - 86400 + 60
+        # Freeze time at 23h 59m into the day (86400 - 60 seconds elapsed)
+        now = time_module.time()
+        day_start = manager._calculate_day_start(now)
+        manager.day_start_timestamp = day_start
+        now = day_start + 86400 - 60  # 60 seconds before midnight
 
         # First check should pass (0 + 10000 <= 20000)
-        result = manager.should_mine_block()
+        result = manager.should_mine_block(now=now)
         assert result.should_mine is True
 
         # Record 15ms of usage
         manager.record_block_time(15000.0)
 
         # Second check should fail (15000 + 10000 > 20000)
-        result = manager.should_mine_block()
+        result = manager.should_mine_block(now=now)
         assert result.should_mine is False
 
     def test_confidence_levels(self):
@@ -338,9 +342,12 @@ class TestProportionalPacing:
         manager = QPUTimeManager(config)
 
         # Manually set day_start to simulate being 6 hours (25%) into the day
-        manager.day_start_timestamp = time_module.time() - (6 * 3600)
+        base_now = time_module.time()
+        day_start = manager._calculate_day_start(base_now)
+        manager.day_start_timestamp = day_start
+        now = day_start + (6 * 3600)  # 6 hours after midnight
 
-        result = manager.should_mine_block()
+        result = manager.should_mine_block(now=now)
 
         # At 25% of day, limit should be ~10s (25% of 40s)
         # Allow some tolerance for time passing during test
@@ -355,9 +362,12 @@ class TestProportionalPacing:
         manager = QPUTimeManager(config)
 
         # Manually set day_start to simulate being 12 hours (50%) into the day
-        manager.day_start_timestamp = time_module.time() - (12 * 3600)
+        base_now = time_module.time()
+        day_start = manager._calculate_day_start(base_now)
+        manager.day_start_timestamp = day_start
+        now = day_start + (12 * 3600)  # 12 hours after midnight
 
-        result = manager.should_mine_block()
+        result = manager.should_mine_block(now=now)
 
         # At 50% of day, limit should be ~20s (50% of 40s)
         assert 19_000_000 <= result.proportional_limit_us <= 21_000_000
@@ -371,12 +381,15 @@ class TestProportionalPacing:
         manager = QPUTimeManager(config)
 
         # Simulate being 25% into the day (proportional limit = 10s)
-        manager.day_start_timestamp = time_module.time() - (6 * 3600)
+        base_now = time_module.time()
+        day_start = manager._calculate_day_start(base_now)
+        manager.day_start_timestamp = day_start
+        now = day_start + (6 * 3600)  # 6 hours after midnight
 
         # Record 12s of usage (exceeds 10s proportional limit)
         manager.cumulative_used_us = 12_000_000
 
-        result = manager.should_mine_block()
+        result = manager.should_mine_block(now=now)
 
         # Should not mine because 12s > 10s proportional limit
         assert result.should_mine is False
@@ -503,8 +516,10 @@ class TestProportionalPacing:
         manager = QPUTimeManager(config)
 
         # Simulate being 50% into the day (12 hours, proportional limit = 20s)
-        now = time_module.time()
-        manager.day_start_timestamp = now - (12 * 3600)
+        base_now = time_module.time()
+        day_start = manager._calculate_day_start(base_now)
+        manager.day_start_timestamp = day_start
+        now = day_start + (12 * 3600)  # 12 hours after midnight
 
         # Directly set cumulative to simulate already having mined
         # and record a last block of 8s
@@ -516,7 +531,7 @@ class TestProportionalPacing:
         # 23/40 = 57.5% of day = 13.8 hours from midnight
         # Currently at 12 hours, so wait = 1.8h = 6480s
 
-        result = manager.should_mine_block()
+        result = manager.should_mine_block(now=now)
         assert result.should_mine is False
         assert result.is_pacing_limited is True
         # Wait time should be ~1.8 hours = ~6480 seconds
