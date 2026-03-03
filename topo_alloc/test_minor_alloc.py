@@ -152,7 +152,6 @@ class TestImpossibleEmbeddings:
         assert phi is None
 
 
-
 class TestCentralityOrdering:
     """Tests for the order_by_centrality heuristic."""
 
@@ -161,7 +160,11 @@ class TestCentralityOrdering:
         source = nx.complete_graph(5)
         target = nx.petersen_graph()
         phi = find_embedding(
-            source, target, rng_factory=seeded_rng(7), tries=50, options=EmbedOption.ORDER_BY_CENTRALITY
+            source,
+            target,
+            rng_factory=seeded_rng(7),
+            tries=50,
+            options=EmbedOption.ORDER_BY_CENTRALITY,
         )
         if phi is not None:
             assert is_valid_embedding(source, target, phi)
@@ -171,7 +174,10 @@ class TestCentralityOrdering:
         source = nx.complete_graph(4)
         target = nx.complete_graph(4)
         phi = find_embedding(
-            source, target, rng_factory=seeded_rng(3), options=EmbedOption.ORDER_BY_CENTRALITY
+            source,
+            target,
+            rng_factory=seeded_rng(3),
+            options=EmbedOption.ORDER_BY_CENTRALITY,
         )
         assert phi is not None
         assert is_valid_embedding(source, target, phi)
@@ -181,7 +187,11 @@ class TestCentralityOrdering:
         source = nx.path_graph(5)  # node 2 has highest betweenness
         target = nx.complete_graph(10)
         phi = find_embedding(
-            source, target, rng_factory=seeded_rng(0), tries=20, options=EmbedOption.ORDER_BY_CENTRALITY
+            source,
+            target,
+            rng_factory=seeded_rng(0),
+            tries=20,
+            options=EmbedOption.ORDER_BY_CENTRALITY,
         )
         assert phi is not None
         assert is_valid_embedding(source, target, phi)
@@ -227,10 +237,14 @@ class TestCentralityOrdering:
         # Path graph: interior nodes have higher betweenness than endpoints.
         source = nx.path_graph(5)  # nodes: 0-1-2-3-4; node 2 has highest centrality
         centrality = nx.betweenness_centrality(source)
-        centrality_order = sorted(source.nodes, key=lambda h: centrality[h], reverse=True)
+        centrality_order = sorted(
+            source.nodes, key=lambda h: centrality[h], reverse=True
+        )
         rng_inst = random.Random(0)
         for _ in range(20):
-            order = _shuffle_within_tiers(centrality_order, lambda h: centrality[h], rng_inst)
+            order = _shuffle_within_tiers(
+                centrality_order, lambda h: centrality[h], rng_inst
+            )
             # Verify no lower-centrality node appears before a strictly higher one
             prev = float("inf")
             for node in order:
@@ -246,10 +260,16 @@ class TestCentralityOrdering:
 
         source = nx.complete_graph(5)  # all centralities equal
         centrality = nx.betweenness_centrality(source)
-        centrality_order = sorted(source.nodes, key=lambda h: centrality[h], reverse=True)
+        centrality_order = sorted(
+            source.nodes, key=lambda h: centrality[h], reverse=True
+        )
         rng_inst = random.Random(1)
         orderings = {
-            tuple(_shuffle_within_tiers(centrality_order, lambda h: centrality[h], rng_inst))
+            tuple(
+                _shuffle_within_tiers(
+                    centrality_order, lambda h: centrality[h], rng_inst
+                )
+            )
             for _ in range(30)
         }
         assert len(orderings) > 1
@@ -280,7 +300,7 @@ def random_source_graphs() -> list[tuple[str, nx.Graph]]:
         # Drop isolates so every node has at least one edge to embed
         g.remove_nodes_from(list(nx.isolates(g)))
         if g.number_of_nodes() >= 2:
-            cases.append((f"ER_n{n}_p{int(p*100)}_s{seed}", g))
+            cases.append((f"ER_n{n}_p{int(p * 100)}_s{seed}", g))
 
     ba_params = [(6, 2, 10), (8, 2, 11), (8, 3, 12)]
     for n, m, seed in ba_params:
@@ -322,7 +342,9 @@ class TestRandomSourceGraphs:
             tries=30,
         )
         assert phi is not None, f"{label}: embedding failed (random order)"
-        assert is_valid_embedding(source, self.TARGET, phi), f"{label}: invalid embedding"
+        assert is_valid_embedding(source, self.TARGET, phi), (
+            f"{label}: invalid embedding"
+        )
 
     @pytest.mark.parametrize(
         "label,source",
@@ -339,7 +361,9 @@ class TestRandomSourceGraphs:
             options=EmbedOption.ORDER_BY_DEGREE_ASC,
         )
         assert phi is not None, f"{label}: embedding failed (degree_asc order)"
-        assert is_valid_embedding(source, self.TARGET, phi), f"{label}: invalid embedding"
+        assert is_valid_embedding(source, self.TARGET, phi), (
+            f"{label}: invalid embedding"
+        )
 
     @pytest.mark.parametrize(
         "label,source",
@@ -356,7 +380,9 @@ class TestRandomSourceGraphs:
             options=EmbedOption.ORDER_BY_CENTRALITY,
         )
         assert phi is not None, f"{label}: embedding failed (centrality order)"
-        assert is_valid_embedding(source, self.TARGET, phi), f"{label}: invalid embedding"
+        assert is_valid_embedding(source, self.TARGET, phi), (
+            f"{label}: invalid embedding"
+        )
 
 
 class TestLongestChainRefinement:
@@ -385,7 +411,11 @@ class TestLongestChainRefinement:
         target = nx.complete_graph(20)
 
         phi_degree_asc = find_embedding(
-            source, target, rng_factory=seeded_rng(42), tries=50, options=EmbedOption.ORDER_BY_DEGREE_ASC
+            source,
+            target,
+            rng_factory=seeded_rng(42),
+            tries=50,
+            options=EmbedOption.ORDER_BY_DEGREE_ASC,
         )
         phi_longest = find_embedding(
             source,
@@ -410,7 +440,10 @@ class TestLongestChainRefinement:
         source = nx.complete_graph(4)
         target = nx.complete_graph(4)
         phi = find_embedding(
-            source, target, rng_factory=seeded_rng(3), options=EmbedOption.REFINE_LONGEST_CHAINS
+            source,
+            target,
+            rng_factory=seeded_rng(3),
+            options=EmbedOption.REFINE_LONGEST_CHAINS,
         )
         assert phi is not None
         assert is_valid_embedding(source, target, phi)
@@ -454,7 +487,7 @@ class TestLongestChainRefinement:
         """
         # Build a simple valid embedding on a path graph so every chain
         # starts as length 1 (trivial — node maps to a single target node).
-        source = nx.path_graph(4)   # 0-1-2-3
+        source = nx.path_graph(4)  # 0-1-2-3
         target = nx.path_graph(10)
         src_nodes = list(source.nodes)
         src_adj = {h: list(source.neighbors(h)) for h in src_nodes}
@@ -464,7 +497,7 @@ class TestLongestChainRefinement:
 
         before_total = sum(len(v) for v in phi.values())
         phi_after = _refine_longest_chains(
-            src_nodes, src_adj, phi, target, overlap_penalty=2.0, rounds=40
+            src_nodes, src_adj, phi, target, overlap_penalty=2, rounds=40
         )
         after_total = sum(len(v) for v in phi_after.values())
 
@@ -486,7 +519,7 @@ class TestLongestChainRefinement:
 
         before_len_a = len(phi["a"])
         phi_after = _refine_longest_chains(
-            ["a", "b"], src_adj, phi, target, overlap_penalty=2.0, rounds=5
+            ["a", "b"], src_adj, phi, target, overlap_penalty=2, rounds=5
         )
         # Chain for 'a' should have been shortened (2,3,4 → something adjacent to 0)
         assert len(phi_after["a"]) < before_len_a
@@ -502,7 +535,7 @@ class TestBuildModel:
         target = nx.path_graph(5)
         adjlist = {"a": [], "b": []}
         phi = {"a": [], "b": []}
-        result = build_model("a", adjlist, phi, target, overlap_penalty=2.0)
+        result = build_model("a", adjlist, phi, target, overlap_penalty=2)
         assert result is not None
         assert len(result) == 1
         assert result[0] in target.nodes
@@ -512,7 +545,7 @@ class TestBuildModel:
         target = nx.path_graph(6)  # 0-1-2-3-4-5
         adjlist = {"a": ["b"], "b": ["a"]}
         phi = {"a": [], "b": [0]}  # b is placed at node 0
-        result = build_model("a", adjlist, phi, target, overlap_penalty=2.0)
+        result = build_model("a", adjlist, phi, target, overlap_penalty=2)
         assert result is not None
         # The model for "a" must be adjacent to node 0 in the target
         assert any(target.has_edge(r, 0) for r in result)
@@ -526,8 +559,6 @@ class TestBuildModel:
             "b": [(0, 0)],
             "c": [(3, 3)],
         }
-        result = build_model("a", adjlist, phi, target, overlap_penalty=2.0)
+        result = build_model("a", adjlist, phi, target, overlap_penalty=2)
         if result is not None and len(result) > 1:
             assert nx.is_connected(target.subgraph(result))
-
-

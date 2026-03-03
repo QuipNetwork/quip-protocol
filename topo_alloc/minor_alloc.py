@@ -145,7 +145,7 @@ def find_embedding[G, H](
     rng_factory: Callable[[], rng.Random] = rng.Random,
     tries: int = 30,
     refinment_constant: int = 10,
-    overlap_penalty: float = 2.0,
+    overlap_penalty: int = 2,
     options: EmbedOption = EmbedOption(0),
 ) -> Model[G, H] | None:
     """
@@ -287,7 +287,7 @@ def _refine_longest_chains[G, H](
     graph: nx.Graph[G],
     *,
     rounds: int,
-    overlap_penalty: float,
+    overlap_penalty: int,
 ) -> dict[H, list[G]]:
     """
     Refinement pass that repeatedly re-embeds the source node with the
@@ -350,7 +350,7 @@ def build_model[G, H](
     adjlist: dict[H, list[H]],
     phi: dict[H, list[G]],
     graph: nx.Graph[G],
-    overlap_penalty: float,
+    overlap_penalty: int,
 ) -> list[G] | None:
     """
     Build a vertex-model (chain) for source node `x` in `graph`.
@@ -372,8 +372,8 @@ def build_model[G, H](
         return [free[0]]
 
     # Run Dijkstra's algorithm from multiple sources from v-models.
-    def weight(_u: G, v: G, _data) -> float:
-        return 1.0 + overlap_penalty * (1.0 if v in occupied else 0.0)
+    def weight(_u: G, v: G, _data) -> int:
+        return 1 + overlap_penalty * (1 if v in occupied else 0)
 
     dist_from = {}
     path_from = {}
@@ -602,7 +602,7 @@ def embed[G, H](
     rng_factory: Callable[[], rng.Random] = rng.Random,
     tries: int = 30,
     refinment_constant: int = 20,
-    overlap_penalty: float = 2.0,
+    overlap_penalty: int = 2,
     options: EmbedOption | None = None,
 ) -> Model[G, H] | None:
     """

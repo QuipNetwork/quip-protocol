@@ -112,16 +112,18 @@ def _run_sample(
     seed: int,
     tries: int,
     refinement_constant: int,
-    overlap_penalty: float,
+    overlap_penalty: int,
 ) -> SampleResult:
     def rng_factory():
         return random.Random(seed)
 
     if strategy in ("auto", "auto_quality", "auto_speed"):
         priority: Literal["speed", "balanced", "quality"] = (
-            "quality" if strategy == "auto_quality" else
-            "speed" if strategy == "auto_speed" else
-            "balanced"
+            "quality"
+            if strategy == "auto_quality"
+            else "speed"
+            if strategy == "auto_speed"
+            else "balanced"
         )
         options = select_embed_options(source, target, priority=priority)
     else:
@@ -131,7 +133,9 @@ def _run_sample(
         if strategy == "centrality":
             options |= EmbedOption.ORDER_BY_CENTRALITY
         if strategy == "longest_chains":
-            options |= EmbedOption.ORDER_BY_DEGREE_ASC | EmbedOption.REFINE_LONGEST_CHAINS
+            options |= (
+                EmbedOption.ORDER_BY_DEGREE_ASC | EmbedOption.REFINE_LONGEST_CHAINS
+            )
     t0 = time.perf_counter()
     embedding = find_embedding(
         source,
@@ -347,9 +351,15 @@ def _write_csv(results: list[SampleResult], path: str) -> None:
     "--strategy",
     type=click.Choice(
         [
-            "random", "degree_asc", "centrality", "longest_chains",
-            "auto", "auto_quality", "auto_speed",
-            "both", "all",
+            "random",
+            "degree_asc",
+            "centrality",
+            "longest_chains",
+            "auto",
+            "auto_quality",
+            "auto_speed",
+            "both",
+            "all",
         ]
     ),
     default="both",
@@ -383,9 +393,9 @@ def _write_csv(results: list[SampleResult], path: str) -> None:
 )
 @click.option(
     "--overlap-penalty",
-    default=2.0,
+    default=2,
     show_default=True,
-    type=float,
+    type=int,
     help="Penalty weight for edges leading into another vertex-model.",
 )
 @click.option(
@@ -425,7 +435,7 @@ def main(
     strategy: str,
     tries: int,
     refinement_constant: int,
-    overlap_penalty: float,
+    overlap_penalty: int,
     csv_path: str | None,
     warmup: int,
     no_detail: bool,
@@ -463,8 +473,13 @@ def main(
         strategies = ["random", "degree_asc"]
     elif strategy == "all":
         strategies = [
-            "random", "degree_asc", "centrality", "longest_chains",
-            "auto", "auto_quality", "auto_speed",
+            "random",
+            "degree_asc",
+            "centrality",
+            "longest_chains",
+            "auto",
+            "auto_quality",
+            "auto_speed",
         ]
     else:
         strategies = [strategy]

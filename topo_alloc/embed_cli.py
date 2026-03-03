@@ -16,7 +16,11 @@ import click
 import networkx as nx
 from networkx.readwrite import json_graph
 
-from topo_alloc.graphviz_render import embedding_stats, format_stats_table, render_embedding
+from topo_alloc.graphviz_render import (
+    embedding_stats,
+    format_stats_table,
+    render_embedding,
+)
 from topo_alloc.minor_alloc import find_embedding
 
 
@@ -66,7 +70,7 @@ def _load_graph(path: str) -> nx.Graph:
 )
 @click.option(
     "--overlap-penalty",
-    default=2.0,
+    default=2,
     show_default=True,
     type=float,
     help="Penalty weight for edges leading into another vertex-model.",
@@ -96,7 +100,7 @@ def main(
     target: str,
     tries: int,
     refinement_constant: int,
-    overlap_penalty: float,
+    overlap_penalty: int,
     seed: int | None,
     output: str,
     graphviz: str | None,
