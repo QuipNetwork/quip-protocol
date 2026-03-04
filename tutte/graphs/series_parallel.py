@@ -15,8 +15,8 @@ This module also provides:
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Tuple, Set
-from .graph import Graph
-from .polynomial import TuttePolynomial
+from ..graph import Graph
+from ..polynomial import TuttePolynomial
 
 
 # =============================================================================

@@ -10,8 +10,8 @@ Engines benchmarked:
     - NetworkX (nx.tutte_polynomial): reference implementation via deletion-contraction
 
 Standalone usage:
-    python -m tutte_test.benchmark_tutte
-    python -m tutte_test.benchmark_tutte --compare file1.json file2.json
+    python -m tutte.benchmarks.benchmark
+    python -m tutte.benchmarks.benchmark --compare file1.json file2.json
 
 Pytest integration: run with --benchmark flag to collect timings automatically.
 """
@@ -25,13 +25,13 @@ import sys
 import time
 
 import networkx as nx
-from tutte_test.graph import (Graph, complete_graph, cycle_graph, grid_graph,
+from tutte.graph import (Graph, complete_graph, cycle_graph, grid_graph,
                               path_graph, petersen_graph, wheel_graph)
-from tutte_test.hybrid_synthesis import HybridSynthesisEngine
-from tutte_test.polynomial import TuttePolynomial
-from tutte_test.rainbow_table import RainbowTable, save_binary_rainbow_table
-from tutte_test.synthesis import SynthesisEngine
-from tutte_test.validation import count_spanning_trees_kirchhoff
+from tutte.synthesis import HybridSynthesisEngine
+from tutte.polynomial import TuttePolynomial
+from tutte.lookup import RainbowTable, save_binary_rainbow_table
+from tutte.synthesis import SynthesisEngine
+from tutte.validation import count_spanning_trees_kirchhoff
 
 # ---------------------------------------------------------------------------
 # Named graph set (merged with atlas below)
@@ -439,7 +439,7 @@ def save_results(results, cej_table=None):
         "results": results,
     }
 
-    base_dir = os.path.dirname(__file__)
+    base_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data')
     out_path = os.path.join(base_dir, "benchmark_results.json")
     with open(out_path, "w") as f:
         json.dump(output, f, indent=2)
@@ -456,8 +456,8 @@ def save_results(results, cej_table=None):
         print(f"Found {total_minors} minor relationships across "
               f"{len(relationships)} entries ({elapsed:.1f}s)", flush=True)
 
-        json_path = os.path.join(base_dir, "tutte_rainbow_table.json")
-        bin_path = os.path.join(base_dir, "tutte_rainbow_table.bin")
+        json_path = os.path.join(base_dir, "lookup_table.json")
+        bin_path = os.path.join(base_dir, "lookup_table.bin")
         cej_table.save(json_path)
         save_binary_rainbow_table(cej_table, bin_path)
         print(f"Rainbow table saved: {len(cej_table)} entries ({json_path}, {bin_path})",

@@ -21,15 +21,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
-from .polynomial import TuttePolynomial
-from .graph import Graph
-from .rainbow_table import RainbowTable, MinorEntry, GCDMinorIndex, load_default_table
-from .k_join import polynomial_divmod, polynomial_divide, tutte_k
-from .factorization import (
+from ..polynomial import TuttePolynomial
+from ..graph import Graph
+from ..lookup.core import RainbowTable, MinorEntry, GCDMinorIndex, load_default_table
+from ..graphs.k_join import polynomial_divmod, polynomial_divide, tutte_k
+from ..factorization import (
     polynomial_gcd, has_common_factor, monomial_content,
     primitive_part, find_divisibility_chain, try_factorize
 )
-from .validation import verify_spanning_trees
+from ..validation import verify_spanning_trees
 
 
 # =============================================================================
@@ -496,7 +496,7 @@ class AlgebraicSynthesisEngine:
         This delegates to the hybrid engine which uses spanning tree
         expansion + pattern recognition instead of deletion-contraction.
         """
-        from .hybrid_synthesis import HybridSynthesisEngine
+        from .hybrid import HybridSynthesisEngine
 
         self._log(f"Computing via hybrid synthesis: {graph.edge_count()} edges")
 

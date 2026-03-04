@@ -1,1 +1,0 @@
-"""Tutte polynomial synthesis library."""

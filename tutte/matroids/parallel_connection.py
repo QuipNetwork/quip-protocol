@@ -16,16 +16,16 @@ from collections import defaultdict
 from math import comb
 from typing import Dict, FrozenSet, List, Optional, Tuple, TYPE_CHECKING
 
-from .polynomial import TuttePolynomial
-from .graph import Graph
-from .matroid import (
+from ..polynomial import TuttePolynomial
+from ..graph import Graph
+from .core import (
     GraphicMatroid, FlatLattice, Edge,
     enumerate_flats_with_hasse,
 )
-from .series_parallel import compute_contraction_chi
+from ..graphs.series_parallel import compute_contraction_chi
 
 if TYPE_CHECKING:
-    from .synthesis import SynthesisEngine
+    from ..synthesis.engine import SynthesisEngine
 
 
 # =============================================================================

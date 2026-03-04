@@ -270,7 +270,7 @@ def _primitive_gcd(p: TuttePolynomial, q: TuttePolynomial) -> TuttePolynomial:
     2. Try common low-degree factors
     3. Use evaluation-based heuristics
     """
-    from .k_join import polynomial_divmod
+    from .graphs.k_join import polynomial_divmod
 
     # Check if one divides the other
     if _divides(p, q):
@@ -304,7 +304,7 @@ def _primitive_gcd(p: TuttePolynomial, q: TuttePolynomial) -> TuttePolynomial:
 
 def _divides(divisor: TuttePolynomial, dividend: TuttePolynomial) -> bool:
     """Check if divisor divides dividend exactly."""
-    from .k_join import polynomial_divmod
+    from .graphs.k_join import polynomial_divmod
 
     if divisor.is_zero():
         return dividend.is_zero()
@@ -450,7 +450,7 @@ def try_factorize(p: TuttePolynomial,
     Returns:
         FactorizationResult with found factors
     """
-    from .k_join import polynomial_divmod
+    from .graphs.k_join import polynomial_divmod
 
     if known_factors is None:
         # Use default known factors (common Tutte polynomials)
@@ -511,7 +511,7 @@ def find_divisibility_chain(
     Returns:
         List of (divisor, quotient) pairs where divisor * quotient = target
     """
-    from .k_join import polynomial_divmod
+    from .graphs.k_join import polynomial_divmod
 
     results = []
 

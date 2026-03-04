@@ -74,3 +74,4 @@ dwave_topologies = ["topologies/*.json.gz", "embeddings/*.json.gz"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tutte/tests"]

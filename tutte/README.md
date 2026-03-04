@@ -1,30 +1,45 @@
 # Tutte Polynomial Synthesis Library
 
-Tools for computing Tutte polynomials of graphs.
+Tools for computing Tutte polynomials of graphs via structural decomposition and approximate graph covers. These polynomials are used to canonically determine the difficulty of a collection of Ising Models in the Quip Protocol's initial quantum proof of work. Future applications may include efficient construction of embeddings for arbitrary input graphs onto specified processor graphs.
 
-## Modules
+## Package Structure
 
-| File                     | Description                                                            |
-| ------------------------ | ---------------------------------------------------------------------- |
-| `graph.py`               | `Graph` and `MultiGraph` classes, graph builders, WL canonical hashing |
-| `polynomial.py`          | `TuttePolynomial` class with bitstring encoding                        |
-| `synthesis.py`           | Main Create-Expand-Join synthesis engine (`SynthesisEngine`)           |
-| `rainbow_table.py`       | `RainbowTable` for pre-computed polynomials                            |
-| `covering.py`            | Subgraph isomorphism (VF2), disjoint covers, hierarchical tiling       |
-| `series_parallel.py`     | O(n+m) SP recognition, O(n) Tutte synthesis                            |
-| `validation.py`          | Kirchhoff verification, NetworkX cross-checks                          |
-| `matroid.py`             | Graphic matroid, flat lattice, Mobius function                         |
-| `parallel_connection.py` | Bonin-de Mier Theorem 6, bivariate Laurent polynomials                 |
-| `k_join.py`              | K-join operations and polynomial division                              |
-| `factorization.py`       | Polynomial GCD and factorization                                       |
-| `algebraic_synthesis.py` | Algebraic synthesis (GCD/factorization approach)                       |
-| `hybrid_synthesis.py`    | Hybrid engine combining algebraic + tiling                             |
+```mermaid
+graph TD
+    P["polynomial.py<br/>TuttePolynomial"] --> G["graph.py<br/>Graph, MultiGraph"]
+    G --> GR["graphs/<br/>SP, covering, minor, k-join"]
+    G --> F["factorization.py<br/>GCD, factorization"]
+    GR --> L["lookup/<br/>RainbowTable, binary I/O"]
+    F --> L
+    L --> S["synthesis/<br/>CEJ, algebraic, hybrid engines"]
+    GR --> S
+    M["matroids/<br/>Theorem 6, flat lattice"] --> S
+```
+
+| Subpackage                            | Description                                                             |
+| ------------------------------------- | ----------------------------------------------------------------------- |
+| [`graphs/`](graphs/README.md)         | Series-parallel recognition, subgraph covering, minor detection, k-join |
+| [`matroids/`](matroids/README.md)     | Graphic matroid, flat lattice, Bonin-de Mier Theorem 6                  |
+| [`lookup/`](lookup/README.md)         | Rainbow table: O(1) polynomial lookup, binary serialization             |
+| [`synthesis/`](synthesis/README.md)   | CEJ, algebraic, and hybrid synthesis engines                            |
+| [`data/`](data/README.md)             | Pre-computed lookup tables and benchmark results                        |
+| [`tests/`](tests/README.md)           | Parametrized test suite (Kirchhoff + NetworkX cross-validation)         |
+| [`benchmarks/`](benchmarks/README.md) | Standalone benchmark suite                                              |
+
+### Core Modules
+
+| Module             | Description                                                            |
+| ------------------ | ---------------------------------------------------------------------- |
+| `graph.py`         | `Graph` and `MultiGraph` classes, graph builders, WL canonical hashing |
+| `polynomial.py`    | `TuttePolynomial` class with bitstring encoding                        |
+| `factorization.py` | Polynomial GCD and factorization                                       |
+| `validation.py`    | Kirchhoff verification, NetworkX cross-checks                          |
 
 ## Synthesis Workflows
 
 ### CEJ Engine (Creation-Expansion-Join)
 
-The primary synthesis engine in `synthesis.py`. Computes Tutte polynomials by decomposing graphs into known components.
+The primary synthesis engine. Computes Tutte polynomials by decomposing graphs into known components.
 
 ```mermaid
 graph TD
@@ -50,7 +65,7 @@ graph TD
 
 ### Matroid / Parallel Connection (Theorem 6)
 
-An alternative approach for graphs decomposable into two cells sharing edges. Uses the Bonin-de Mier formula for parallel connections of graphic matroids.
+An alternative approach for graphs decomposable into two cells sharing edges. Uses the Bonin-de Mier formula for parallel connections and k-sums of graphic matroids.
 
 ```mermaid
 graph TD
@@ -94,12 +109,12 @@ graph TD
 - **Exponential worst case**: Deletion-contraction is O(2^m). Practical for ≤25 edges without structural shortcuts.
 - **Matroid approach**: Currently implemented for 2-cell decompositions only. Useful for dense graphs where CEJ chord addition is too slow.
 
-## Rainbow Table
+## Lookup Table
 
-Pre-computed Tutte polynomials for graph minors in `tutte_rainbow_table.json` (also binary format in `.bin`).
+Pre-computed Tutte polynomials for graph minors in `data/lookup_table.json` (also binary format in `.bin`).
 
 ```python
-from tutte_test.rainbow_table import load_default_table
+from tutte.lookup import load_default_table
 
 table = load_default_table()
 entry = table.get_entry("Petersen")
@@ -110,26 +125,26 @@ print(f"Spanning trees: {entry.polynomial.num_spanning_trees()}")  # 2000
 
 ```bash
 # Full test suite
-python -m pytest tutte_test/test_tutte.py -v
+python -m pytest tutte/tests/ -v
 
 # Skip slow tests (graph atlas exhaustive)
-python -m pytest tutte_test/test_tutte.py -v -m "not slow"
+python -m pytest tutte/tests/ -v -m "not slow"
 
 # Update rainbow table with newly computed polynomials
-python -m pytest tutte_test/test_tutte.py -v --update-rainbow-table
+python -m pytest tutte/tests/ -v --update-rainbow-table
 
 # Run with benchmarks
-python -m pytest tutte_test/test_tutte.py -v --benchmark
+python -m pytest tutte/tests/ -v --benchmark
 ```
 
 ## Running Benchmarks
 
 ```bash
 # Standalone benchmark
-python -m tutte_test.benchmark_tutte --timeout 300 --nx-timeout 300
+python -m tutte.benchmarks.benchmark --timeout 300 --nx-timeout 300
 
 # Compare two benchmark runs (e.g., across branches)
-python -m tutte_test.benchmark_tutte --compare benchmark_results_0.json benchmark_results_1.json
+python -m tutte.benchmarks.benchmark --compare benchmark_results_0.json benchmark_results_1.json
 ```
 
 ## Performance vs NetworkX
@@ -162,9 +177,9 @@ Key graph timings (Hybrid engine, empty table):
 ## Usage
 
 ```python
-from tutte_test.graph import complete_graph, petersen_graph
-from tutte_test.synthesis import SynthesisEngine
-from tutte_test.rainbow_table import load_default_table
+from tutte.graph import complete_graph, petersen_graph
+from tutte.synthesis import SynthesisEngine
+from tutte.lookup import load_default_table
 
 table = load_default_table()
 engine = SynthesisEngine(table)

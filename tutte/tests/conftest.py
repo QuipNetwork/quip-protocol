@@ -29,13 +29,13 @@ def pytest_addoption(parser):
 
 @pytest.fixture(scope="session")
 def default_table():
-    from tutte_test.rainbow_table import load_default_table
+    from tutte.lookup import load_default_table
     return load_default_table()
 
 
 @pytest.fixture(scope="session")
 def engine(default_table):
-    from tutte_test.synthesis import SynthesisEngine
+    from tutte.synthesis import SynthesisEngine
     return SynthesisEngine(default_table)
 
 
@@ -52,15 +52,15 @@ def rainbow_updater(request, default_table):
     yield updater
 
     if request.config.getoption("--update-rainbow-table") and collected:
-        from tutte_test.rainbow_table import save_binary_rainbow_table
+        from tutte.lookup import save_binary_rainbow_table
 
         for name, (graph, poly) in collected.items():
             if default_table.get_entry(name) is None:
                 default_table.add(graph, name, poly)
-        base = os.path.dirname(__file__)
-        default_table.save(os.path.join(base, "tutte_rainbow_table.json"))
+        base = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data')
+        default_table.save(os.path.join(base, "lookup_table.json"))
         save_binary_rainbow_table(
-            default_table, os.path.join(base, "tutte_rainbow_table.bin")
+            default_table, os.path.join(base, "lookup_table.bin")
         )
 
 
@@ -108,7 +108,7 @@ def benchmark_collector(request):
             },
             "results": results,
         }
-        out_path = os.path.join(os.path.dirname(__file__), "benchmark_results.json")
+        out_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "benchmark_results.json")
         with open(out_path, "w") as f:
             json.dump(output, f, indent=2)
         print(f"\nBenchmark results written to {out_path}")

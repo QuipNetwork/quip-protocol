@@ -20,8 +20,9 @@ from dataclasses import dataclass, field
 from math import gcd as math_gcd
 from typing import Dict, List, Optional, Set, Tuple
 
-from .graph import CellSignature, Graph, compute_signature
-from .polynomial import TuttePolynomial, encode_varuint, decode_varuint
+from ..graph import CellSignature, Graph, compute_signature
+from ..polynomial import TuttePolynomial, encode_varuint, decode_varuint
+
 
 # =============================================================================
 # MINOR ENTRY DATA CLASS
@@ -387,7 +388,7 @@ class RainbowTable:
         """Compute minor relationships between all entries using coefficient domination.
 
         Uses the Tutte polynomial monotonicity property: if H is a graph minor
-        of G, then every coefficient of T(H) is ≤ the corresponding coefficient
+        of G, then every coefficient of T(H) is <= the corresponding coefficient
         of T(G). This is a known theorem (no false negatives).
 
         The converse is not always true (~12% false positive rate on small graphs),
@@ -403,6 +404,8 @@ class RainbowTable:
 
         Keys and values are canonical keys for O(1) lookup.
         """
+        from ..graphs.minor import is_graph_minor
+
         entries_list = list(self.entries.values())
 
         # Phase 1: coefficient domination (no false negatives)
@@ -559,13 +562,13 @@ class RainbowTable:
         """Compute GCD-based relationships between all polynomial entries.
 
         Two polynomials are related if they share a non-trivial common factor
-        (GCD ≠ 1). This is a symmetric relationship that captures structural
+        (GCD != 1). This is a symmetric relationship that captures structural
         similarities between graphs.
 
         Returns:
             GCDMinorIndex containing all relationships
         """
-        from .factorization import has_common_factor, polynomial_gcd
+        from ..factorization import has_common_factor, polynomial_gcd
 
         index = GCDMinorIndex()
 
@@ -631,7 +634,7 @@ class RainbowTable:
         if entry is None:
             return []
 
-        from .factorization import has_common_factor, polynomial_gcd
+        from ..factorization import has_common_factor, polynomial_gcd
 
         results = []
         target_poly = entry.polynomial
@@ -668,7 +671,7 @@ class RainbowTable:
         Returns:
             List of (entry, quotient) tuples where entry.polynomial * quotient = target
         """
-        from .k_join import polynomial_divmod
+        from ..graphs.k_join import polynomial_divmod
 
         results = []
         target_trees = target.num_spanning_trees()
@@ -709,251 +712,6 @@ class RainbowTable:
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
-
-def _find_tree_model(G, T):
-    """Check if tree T is a minor of connected graph G via branch-set search.
-
-    Finds vertex-disjoint connected subgraphs of G (branch sets), one per
-    node of T, with edges between branch sets of adjacent tree nodes.
-
-    Works by rooting T and assigning branch sets top-down. For each tree node,
-    we grow a connected component in G that reaches all children's branch sets.
-
-    Args:
-        G: NetworkX graph (the major, must be connected).
-        T: NetworkX graph (the minor, must be a tree).
-
-    Returns:
-        True/False, or None if search exceeds budget.
-    """
-    import networkx as nx
-    from collections import deque
-
-    t_nodes = list(T.nodes())
-    if len(t_nodes) <= 1:
-        return True
-    if len(t_nodes) > G.number_of_nodes():
-        return False
-
-    # Root tree at highest-degree node for best pruning
-    root = max(t_nodes, key=lambda v: T.degree(v))
-
-    # Build parent/children structure via BFS from root
-    parent = {}
-    children = {v: [] for v in t_nodes}
-    bfs_order = [root]
-    visited_t = {root}
-    queue = deque([root])
-    while queue:
-        v = queue.popleft()
-        for w in T.neighbors(v):
-            if w not in visited_t:
-                visited_t.add(w)
-                parent[w] = v
-                children[v].append(w)
-                bfs_order.append(w)
-                queue.append(w)
-
-    # Leaf-to-root order for bottom-up processing
-    leaves = [v for v in t_nodes if not children[v]]
-
-    # Use backtracking: assign each tree node a single G-vertex first
-    # (checks topological minor), then try expanding branch sets.
-    g_nodes = list(G.nodes())
-    assignment = {}  # tree_node -> g_vertex
-    used = set()
-    call_count = [0]
-    max_calls = 50000  # budget to avoid combinatorial explosion
-
-    def _backtrack(idx):
-        call_count[0] += 1
-        if call_count[0] > max_calls:
-            return None  # budget exceeded
-
-        if idx == len(bfs_order):
-            return True
-
-        t_node = bfs_order[idx]
-
-        if idx == 0:
-            # Root: try each G-vertex
-            for gv in g_nodes:
-                assignment[t_node] = gv
-                used.add(gv)
-                result = _backtrack(idx + 1)
-                if result is True:
-                    return True
-                if result is None:
-                    return None
-                used.remove(gv)
-                del assignment[t_node]
-        else:
-            # Non-root: must be adjacent in G to parent's assigned vertex
-            p_vertex = assignment[parent[t_node]]
-            for gv in G.neighbors(p_vertex):
-                if gv not in used:
-                    assignment[t_node] = gv
-                    used.add(gv)
-                    result = _backtrack(idx + 1)
-                    if result is True:
-                        return True
-                    if result is None:
-                        return None
-                    used.remove(gv)
-                    del assignment[t_node]
-
-        return False
-
-    result = _backtrack(0)
-    if result is True:
-        return True
-    if result is None:
-        return None  # budget exceeded, inconclusive
-
-    # Single-vertex assignment failed. For trees with max_degree <= 3,
-    # topological minor == minor (Mader's theorem), so False is definitive.
-    t_max_deg = max(T.degree(v) for v in T.nodes())
-    if t_max_deg <= 3:
-        return False
-
-    # For higher-degree trees, single-vertex search may miss valid models
-    # where branch sets contain multiple vertices. Try shallow contraction:
-    # contract each edge of G, then retry topological search on the result.
-    # This catches cases like K_{1,4} in Petersen (one contraction creates
-    # a degree-4 vertex, making K_{1,4} a subgraph).
-    from networkx.algorithms.isomorphism import GraphMatcher as _GM
-
-    max_depth = min(3, G.number_of_nodes() - len(t_nodes))
-    if max_depth <= 0:
-        return False
-
-    def _graph_key(g):
-        return tuple(sorted(tuple(sorted(e)) for e in g.edges()))
-
-    current_level = {_graph_key(G): G}
-    for _depth in range(max_depth):
-        next_level = {}
-        for gkey, g in current_level.items():
-            for u, v in list(g.edges()):
-                contracted = g.copy()
-                for w in list(contracted.neighbors(v)):
-                    if w != u:
-                        contracted.add_edge(u, w)
-                contracted.remove_node(v)
-                ckey = _graph_key(contracted)
-                if ckey in next_level:
-                    continue
-                if _GM(contracted, T).subgraph_is_monomorphic():
-                    return True
-                next_level[ckey] = contracted
-        current_level = next_level
-        if not current_level:
-            break
-
-    return False
-
-
-def is_graph_minor(major: Graph, minor: Graph, max_contractions: int = 5) -> Optional[bool]:
-    """Check if `minor` is a graph minor of `major` via BFS edge contraction.
-
-    Uses subgraph monomorphism (nx.algorithms.isomorphism.GraphMatcher) to
-    check whether `minor` can be found as a subgraph of some contraction of
-    `major`.
-
-    Args:
-        major: The larger graph (potential major).
-        minor: The smaller graph (potential minor).
-        max_contractions: Maximum number of edge contractions to try.
-            If more contractions are needed, returns None (inconclusive).
-
-    Returns:
-        True if minor IS a graph minor of major.
-        False if minor is NOT a graph minor (exhaustive search within budget).
-        None if inconclusive (exceeded max_contractions budget).
-    """
-    from networkx.algorithms.isomorphism import GraphMatcher
-
-    # Quick reject on node/edge counts
-    if minor.node_count() > major.node_count():
-        return False
-    if minor.edge_count() > major.edge_count():
-        return False
-
-    # Structural rules for tree minors
-    minor_is_tree = (
-        minor.edge_count() == minor.node_count() - 1
-        and minor.node_count() >= 1
-    )
-    if minor_is_tree:
-        import networkx as nx
-        G_nx = major.to_networkx()
-        if nx.is_connected(G_nx):
-            minor_max_deg = max(
-                (len(minor.neighbors(v)) for v in range(minor.node_count())),
-                default=0,
-            )
-            if minor_max_deg <= 2:
-                # Path minor: any connected graph with enough nodes contains it
-                return True
-            major_max_deg = max(dict(G_nx.degree()).values())
-            if major_max_deg <= 2:
-                # 2-regular major (cycle/path): contractions never exceed
-                # degree 2, so trees with higher max degree can't be minors
-                return False
-            # Connected major with high enough max degree — use tree model search
-            H_nx = minor.to_networkx()
-            result = _find_tree_model(G_nx, H_nx)
-            if result is not None:
-                return result
-
-    G = major.to_networkx() if not minor_is_tree else G_nx
-    H = minor.to_networkx() if not minor_is_tree else H_nx
-
-    # Check zero contractions: is H a subgraph of G?
-    if GraphMatcher(G, H).subgraph_is_monomorphic():
-        return True
-
-    # How many contractions might we need?
-    needed = major.node_count() - minor.node_count()
-    if needed > max_contractions:
-        return None  # Inconclusive — too many contractions to explore
-
-    # BFS contraction: try contracting each edge, deduplicate, check monomorphism
-    # Each level = one contraction step
-    def _graph_key(g):
-        """Canonical key for deduplication: sorted edge tuple."""
-        return tuple(sorted(tuple(sorted(e)) for e in g.edges()))
-
-    current_level = {_graph_key(G): G}
-
-    for _depth in range(needed):
-        next_level = {}
-        for gkey, g in current_level.items():
-            for u, v in list(g.edges()):
-                # Contract edge (u, v): merge v into u
-                contracted = g.copy()
-                # Transfer v's neighbors to u
-                for w in list(contracted.neighbors(v)):
-                    if w != u:
-                        contracted.add_edge(u, w)
-                contracted.remove_node(v)
-
-                ckey = _graph_key(contracted)
-                if ckey in next_level:
-                    continue
-
-                # Check monomorphism
-                if GraphMatcher(contracted, H).subgraph_is_monomorphic():
-                    return True
-
-                next_level[ckey] = contracted
-
-        current_level = next_level
-        if not current_level:
-            break
-
-    return False
-
 
 def _try_divide(dividend: TuttePolynomial, divisor: TuttePolynomial) -> Optional[TuttePolynomial]:
     """Try polynomial division. Returns quotient if exact, None otherwise.
@@ -998,12 +756,13 @@ def load_default_table() -> RainbowTable:
     Tries binary format first (faster, includes minor relationships),
     falls back to JSON.
     """
-    base_dir = os.path.dirname(__file__)
-    bin_path = os.path.join(base_dir, 'tutte_rainbow_table.bin')
-    json_path = os.path.join(base_dir, 'tutte_rainbow_table.json')
+    base_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data')
+    bin_path = os.path.join(base_dir, 'lookup_table.bin')
+    json_path = os.path.join(base_dir, 'lookup_table.json')
 
     if os.path.exists(bin_path):
         try:
+            from .binary import load_binary_rainbow_table
             return load_binary_rainbow_table(bin_path)
         except Exception:
             pass  # Fall through to JSON
@@ -1012,437 +771,3 @@ def load_default_table() -> RainbowTable:
         return RainbowTable.load(json_path)
 
     return RainbowTable()
-
-
-# =============================================================================
-# BINARY ENCODING
-# =============================================================================
-
-def encode_rainbow_table_binary(table: RainbowTable) -> bytes:
-    """Encode rainbow table to compact binary v2 format.
-
-    v2 Format:
-        Header:
-            [magic: 4 bytes]    = "RTBL"
-            [version: 1 byte]   = 2
-            [flags: 1 byte]     bit 0: has_minor_rels, bit 1: structural_minors_computed
-            [num_entries: varuint]
-
-        Entry Section (per entry):
-            [canonical_key: 32 bytes]       ← raw SHA256
-            [name_len: varuint] [name: bytes]
-            [node_count: varuint]
-            [edge_count: varuint]
-            [spanning_trees: varuint]
-            [poly_len: varuint] [poly_bytes: bytes]
-
-        Minor Relationships Section (if flag bit 0):
-            [num_majors: varuint]
-            Per major:
-                [major_index: varuint]
-                [num_minors: varuint]
-                [minor_index: varuint] × num_minors
-    """
-    import hashlib
-
-    result = bytearray()
-
-    # Magic header
-    result.extend(b"RTBL")
-    result.append(2)  # version
-
-    # Flags
-    has_minors = bool(table.minor_relationships)
-    flags = 0
-    if has_minors:
-        flags |= 0x01
-    if table._structural_minors_computed:
-        flags |= 0x02
-    result.append(flags)
-
-    # Number of entries
-    entries_ordered = list(table.entries.items())
-    result.extend(encode_varuint(len(entries_ordered)))
-
-    # Build key -> index map for minor relationships
-    key_to_index: Dict[str, int] = {}
-    for idx, (key, _entry) in enumerate(entries_ordered):
-        key_to_index[key] = idx
-
-    # Entry section
-    for key, entry in entries_ordered:
-        # Canonical key as raw 32-byte SHA256
-        result.extend(bytes.fromhex(key))
-
-        # Name
-        name_bytes = entry.name.encode('utf-8')
-        result.extend(encode_varuint(len(name_bytes)))
-        result.extend(name_bytes)
-
-        # Metadata
-        result.extend(encode_varuint(entry.node_count))
-        result.extend(encode_varuint(entry.edge_count))
-        result.extend(encode_varuint(entry.spanning_trees))
-
-        # Polynomial as bitstring
-        poly_bytes = entry.polynomial.to_bytes()
-        result.extend(encode_varuint(len(poly_bytes)))
-        result.extend(poly_bytes)
-
-    # Minor relationships section
-    if has_minors:
-        # Filter to only majors with valid indices
-        valid_majors = []
-        for major_key, minor_keys in table.minor_relationships.items():
-            if major_key not in key_to_index:
-                continue
-            valid_minor_indices = []
-            for mk in minor_keys:
-                if mk in key_to_index:
-                    valid_minor_indices.append(key_to_index[mk])
-            if valid_minor_indices:
-                valid_majors.append((key_to_index[major_key], valid_minor_indices))
-
-        result.extend(encode_varuint(len(valid_majors)))
-        for major_idx, minor_indices in valid_majors:
-            result.extend(encode_varuint(major_idx))
-            result.extend(encode_varuint(len(minor_indices)))
-            for mi in minor_indices:
-                result.extend(encode_varuint(mi))
-
-    return bytes(result)
-
-
-def decode_rainbow_table_binary(data: bytes) -> RainbowTable:
-    """Decode binary rainbow table (supports v1 and v2 formats).
-
-    Returns a fully populated RainbowTable with entries and minor_relationships.
-    """
-    offset = 0
-
-    # Magic header
-    if data[offset:offset + 4] != b"RTBL":
-        raise ValueError("Invalid magic header — not a rainbow table binary")
-    offset += 4
-
-    version = data[offset]
-    offset += 1
-
-    if version == 1:
-        return _decode_binary_v1(data, offset)
-    elif version == 2:
-        return _decode_binary_v2(data, offset)
-    else:
-        raise ValueError(f"Unsupported binary version: {version}")
-
-
-def _decode_binary_v1(data: bytes, offset: int) -> RainbowTable:
-    """Decode v1 binary format (no canonical keys, no minor relationships)."""
-    table = RainbowTable()
-
-    num_entries, offset = decode_varuint(data, offset)
-
-    for _ in range(num_entries):
-        # Name
-        name_len, offset = decode_varuint(data, offset)
-        name = data[offset:offset + name_len].decode('utf-8')
-        offset += name_len
-
-        # Metadata
-        node_count, offset = decode_varuint(data, offset)
-        edge_count, offset = decode_varuint(data, offset)
-        spanning_trees, offset = decode_varuint(data, offset)
-
-        # Polynomial
-        poly_len, offset = decode_varuint(data, offset)
-        poly_bytes = data[offset:offset + poly_len]
-        offset += poly_len
-        polynomial = TuttePolynomial.from_bytes(poly_bytes)
-
-        # v1 has no canonical key stored — we can't reconstruct it without
-        # the graph, so use a placeholder based on name
-        import hashlib
-        canonical_key = hashlib.sha256(f"v1:{name}".encode()).hexdigest()
-
-        entry = MinorEntry(
-            name=name,
-            polynomial=polynomial,
-            node_count=node_count,
-            edge_count=edge_count,
-            canonical_key=canonical_key,
-            spanning_trees=spanning_trees,
-            num_terms=polynomial.num_terms(),
-        )
-
-        table.entries[canonical_key] = entry
-        table.name_index[name] = canonical_key
-
-    table._sort_by_complexity()
-    return table
-
-
-def _decode_binary_v2(data: bytes, offset: int) -> RainbowTable:
-    """Decode v2 binary format (with canonical keys and minor relationships)."""
-    table = RainbowTable()
-
-    # Flags
-    flags = data[offset]
-    offset += 1
-    has_minors = bool(flags & 0x01)
-    table._structural_minors_computed = bool(flags & 0x02)
-
-    # Number of entries
-    num_entries, offset = decode_varuint(data, offset)
-
-    # Read entries, build index -> key mapping
-    index_to_key: List[str] = []
-
-    for _ in range(num_entries):
-        # Canonical key: 32 raw bytes → hex string
-        canonical_key = data[offset:offset + 32].hex()
-        offset += 32
-
-        # Name
-        name_len, offset = decode_varuint(data, offset)
-        name = data[offset:offset + name_len].decode('utf-8')
-        offset += name_len
-
-        # Metadata
-        node_count, offset = decode_varuint(data, offset)
-        edge_count, offset = decode_varuint(data, offset)
-        spanning_trees, offset = decode_varuint(data, offset)
-
-        # Polynomial
-        poly_len, offset = decode_varuint(data, offset)
-        poly_bytes = data[offset:offset + poly_len]
-        offset += poly_len
-        polynomial = TuttePolynomial.from_bytes(poly_bytes)
-
-        entry = MinorEntry(
-            name=name,
-            polynomial=polynomial,
-            node_count=node_count,
-            edge_count=edge_count,
-            canonical_key=canonical_key,
-            spanning_trees=spanning_trees,
-            num_terms=polynomial.num_terms(),
-        )
-
-        table.entries[canonical_key] = entry
-        table.name_index[name] = canonical_key
-        index_to_key.append(canonical_key)
-
-    # Minor relationships section
-    if has_minors:
-        num_majors, offset = decode_varuint(data, offset)
-        for _ in range(num_majors):
-            major_idx, offset = decode_varuint(data, offset)
-            num_minors, offset = decode_varuint(data, offset)
-            minor_keys = []
-            for _ in range(num_minors):
-                minor_idx, offset = decode_varuint(data, offset)
-                if minor_idx < len(index_to_key):
-                    minor_keys.append(index_to_key[minor_idx])
-            if major_idx < len(index_to_key) and minor_keys:
-                table.minor_relationships[index_to_key[major_idx]] = minor_keys
-
-    table._sort_by_complexity()
-    return table
-
-
-def load_binary_rainbow_table(path: str) -> RainbowTable:
-    """Load rainbow table from binary file."""
-    with open(path, 'rb') as f:
-        data = f.read()
-    return decode_rainbow_table_binary(data)
-
-
-def save_binary_rainbow_table(table: RainbowTable, path: str) -> int:
-    """Save rainbow table to binary format, return size in bytes."""
-    data = encode_rainbow_table_binary(table)
-    with open(path, 'wb') as f:
-        f.write(data)
-    return len(data)
-
-
-def create_minimal_json(table: RainbowTable) -> dict:
-    """Create minimal JSON representation (no redundant fields)."""
-    graphs = {}
-    for key, entry in table.entries.items():
-        # Only store what's needed to reconstruct
-        coeffs = {}
-        for (i, j), c in entry.polynomial.to_coefficients().items():
-            coeffs[f"{i},{j}"] = c
-
-        graphs[key] = {
-            'n': entry.name,
-            'v': entry.node_count,
-            'e': entry.edge_count,
-            'c': coeffs
-        }
-
-    return {'g': graphs}
-
-
-def analyze_binary_breakdown(table: RainbowTable) -> Dict[str, int]:
-    """Analyze where bytes go in binary format. Returns size breakdown dict."""
-    header_size = 5  # magic + version
-    entry_count_size = len(encode_varuint(len(table.entries)))
-
-    name_bytes = 0
-    metadata_bytes = 0
-    polynomial_bytes = 0
-
-    for entry in table.entries.values():
-        name_b = entry.name.encode('utf-8')
-        name_bytes += len(encode_varuint(len(name_b))) + len(name_b)
-
-        metadata_bytes += len(encode_varuint(entry.node_count))
-        metadata_bytes += len(encode_varuint(entry.edge_count))
-        metadata_bytes += len(encode_varuint(entry.spanning_trees))
-
-        poly_b = entry.polynomial.to_bytes()
-        polynomial_bytes += len(encode_varuint(len(poly_b))) + len(poly_b)
-
-    total = header_size + entry_count_size + name_bytes + metadata_bytes + polynomial_bytes
-
-    return {
-        'header': header_size + entry_count_size,
-        'names': name_bytes,
-        'metadata': metadata_bytes,
-        'polynomials': polynomial_bytes,
-        'total': total,
-    }
-
-
-# =============================================================================
-# SYMPY CONVERSION
-# =============================================================================
-
-def sympy_to_tutte(nx_poly) -> TuttePolynomial:
-    """Convert networkx/sympy polynomial to TuttePolynomial."""
-    coeffs = {}
-
-    # Handle different sympy types
-    if hasattr(nx_poly, 'as_dict'):
-        poly_dict = nx_poly.as_dict()
-    elif hasattr(nx_poly, 'as_poly'):
-        poly_dict = nx_poly.as_poly().as_dict()
-    else:
-        # Try to convert to Poly first
-        from sympy import Poly, symbols
-        x, y = symbols('x y')
-        try:
-            poly = Poly(nx_poly, x, y)
-            poly_dict = poly.as_dict()
-        except Exception:
-            # Single term or constant
-            poly_dict = {(0, 0): int(nx_poly)}
-
-    for monom, coeff in poly_dict.items():
-        if len(monom) >= 2:
-            coeffs[(monom[0], monom[1])] = int(coeff)
-        elif len(monom) == 1:
-            coeffs[(monom[0], 0)] = int(coeff)
-        else:
-            coeffs[(0, 0)] = int(coeff)
-
-    return TuttePolynomial.from_coefficients(coeffs)
-
-
-# =============================================================================
-# BASIC TABLE BUILDER
-# =============================================================================
-
-def build_basic_table() -> RainbowTable:
-    """Build rainbow table using closed-form formulas and self-synthesis.
-
-    Phase 1: Seed with closed-form polynomials (no computation needed)
-      - Complete graphs K_2 through K_5
-      - Cycle graphs C_3 through C_12
-      - Path graphs P_2 through P_10
-      - Star graphs S_3 through S_8
-
-    Phase 2: Use the synthesis engine with the seeded table to compute
-      - Complete graphs K_6 through K_8
-      - Wheel graphs W_4 through W_8
-      - Petersen graph
-      - Small grid graphs
-    """
-    import networkx as nx
-
-    from .graph import (complete_graph, cycle_graph, path_graph, star_graph,
-                        wheel_graph)
-
-    table = RainbowTable()
-
-    # === Phase 1: Closed-form polynomials ===
-
-    # Complete graphs K_n: well-known polynomials
-    k_polys = {
-        2: {(1, 0): 1},  # x
-        3: {(2, 0): 1, (1, 0): 1, (0, 1): 1},  # x^2 + x + y
-        4: {(3, 0): 1, (2, 0): 3, (1, 1): 4, (1, 0): 2, (0, 1): 2, (0, 2): 3, (0, 3): 1},
-        5: {(4, 0): 1, (3, 0): 6, (2, 1): 10, (2, 0): 11, (1, 1): 20, (1, 2): 15,
-            (1, 3): 5, (1, 0): 6, (0, 1): 6, (0, 2): 15, (0, 3): 15, (0, 4): 10,
-            (0, 5): 4, (0, 6): 1},
-    }
-
-    for n in range(2, 6):
-        g = complete_graph(n)
-        poly = TuttePolynomial.from_coefficients(k_polys[n])
-        table.add(g, f"K_{n}", poly)
-
-    # Cycle graphs C_n: T(C_n) = x^{n-1} + x^{n-2} + ... + x + y
-    for n in range(3, 13):
-        g = cycle_graph(n)
-        coeffs = {(i, 0): 1 for i in range(1, n)}
-        coeffs[(0, 1)] = 1
-        poly = TuttePolynomial.from_coefficients(coeffs)
-        table.add(g, f"C_{n}", poly)
-
-    # Path graphs P_n: T(P_n) = x^{n-1}
-    for n in range(2, 11):
-        g = path_graph(n)
-        poly = TuttePolynomial.x(n - 1)
-        table.add(g, f"P_{n}", poly)
-
-    # Star graphs S_n: T(S_n) = x^n (n bridges)
-    for n in range(3, 9):
-        g = star_graph(n)
-        poly = TuttePolynomial.x(n)
-        table.add(g, f"S_{n}", poly)
-
-    # === Phase 2: Synthesize remaining graphs using the seeded table ===
-
-    from .synthesis import SynthesisEngine
-    engine = SynthesisEngine(table=table, verbose=False)
-
-    # Complete graphs K_6, K_7, K_8
-    for n in range(6, 9):
-        g = complete_graph(n)
-        result = engine.synthesize(g)
-        table.add(g, f"K_{n}", result.polynomial)
-
-    # Wheel graphs W_n (n spokes + hub)
-    for n in range(4, 9):
-        G_nx = nx.wheel_graph(n)
-        g = Graph.from_networkx(G_nx)
-        result = engine.synthesize(g)
-        table.add(g, f"W_{n}", result.polynomial)
-
-    # Petersen graph
-    g_pet = Graph.from_networkx(nx.petersen_graph())
-    result = engine.synthesize(g_pet)
-    table.add(g_pet, "Petersen", result.polynomial)
-
-    # Small grid graphs
-    for rows in range(2, 4):
-        for cols in range(2, 5):
-            G_grid = nx.convert_node_labels_to_integers(nx.grid_2d_graph(rows, cols))
-            g_grid = Graph.from_networkx(G_grid)
-            if G_grid.number_of_edges() <= 12:
-                result = engine.synthesize(g_grid)
-                table.add(g_grid, f"Grid_{rows}x{cols}", result.polynomial)
-
-    return table

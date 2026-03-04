@@ -193,21 +193,21 @@ class TuttePolynomial:
         """Divide with remainder: returns (quotient, remainder)."""
         if not isinstance(other, TuttePolynomial):
             return NotImplemented
-        from .k_join import polynomial_divmod
+        from .graphs.k_join import polynomial_divmod
         return polynomial_divmod(self, other)
 
     def __floordiv__(self, other: 'TuttePolynomial') -> 'TuttePolynomial':
         """Integer division (exact division, raises if remainder)."""
         if not isinstance(other, TuttePolynomial):
             return NotImplemented
-        from .k_join import polynomial_divide
+        from .graphs.k_join import polynomial_divide
         return polynomial_divide(self, other)
 
     def __mod__(self, other: 'TuttePolynomial') -> 'TuttePolynomial':
         """Remainder after division."""
         if not isinstance(other, TuttePolynomial):
             return NotImplemented
-        from .k_join import polynomial_divmod
+        from .graphs.k_join import polynomial_divmod
         _, remainder = polynomial_divmod(self, other)
         return remainder
 

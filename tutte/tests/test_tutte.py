@@ -1,7 +1,7 @@
 """Tutte polynomial test suite.
 
 Parametrized correctness tests validating synthesis against Kirchhoff's theorem
-and NetworkX. Run with: python -m pytest tutte_test/test_tutte.py -v
+and NetworkX. Run with: python -m pytest tutte/tests/ -v
 
 Sections:
     A. Spanning tree verification (Kirchhoff)
@@ -19,12 +19,12 @@ import time
 
 import networkx as nx
 import pytest
-from tutte_test.graph import (Graph, complete_graph, cut_vertex_join,
+from tutte.graph import (Graph, complete_graph, cut_vertex_join,
                               cycle_graph, disjoint_union, grid_graph,
                               path_graph, petersen_graph, wheel_graph)
-from tutte_test.polynomial import TuttePolynomial
-from tutte_test.synthesis import SynthesisEngine
-from tutte_test.validation import (compute_tutte_networkx,
+from tutte.polynomial import TuttePolynomial
+from tutte.synthesis import SynthesisEngine
+from tutte.validation import (compute_tutte_networkx,
                                    count_spanning_trees_kirchhoff,
                                    verify_spanning_trees)
 
@@ -433,8 +433,8 @@ def test_star_not_minor_of_cycle():
     degree-2 nodes or (at most) degree-2 after merging — never degree-3+
     without adding edges.
     """
-    from tutte_test.graph import star_graph
-    from tutte_test.rainbow_table import is_graph_minor
+    from tutte.graph import star_graph
+    from tutte.lookup import is_graph_minor
 
     s3 = star_graph(3)   # 4 nodes, 3 edges; center has degree 3
     c5 = cycle_graph(5)  # 5 nodes, 5 edges; all degree 2
@@ -445,7 +445,7 @@ def test_star_not_minor_of_cycle():
 
 def test_path_is_minor_of_cycle():
     """P_4 IS a graph minor of C_5 (delete one edge from cycle)."""
-    from tutte_test.rainbow_table import is_graph_minor
+    from tutte.lookup import is_graph_minor
 
     p4 = path_graph(4)   # 4 nodes, 3 edges
     c5 = cycle_graph(5)  # 5 nodes, 5 edges
@@ -456,7 +456,7 @@ def test_path_is_minor_of_cycle():
 
 def test_k3_is_minor_of_k4():
     """K_3 IS a graph minor of K_4 (delete one vertex)."""
-    from tutte_test.rainbow_table import is_graph_minor
+    from tutte.lookup import is_graph_minor
 
     k3 = complete_graph(3)
     k4 = complete_graph(4)
@@ -471,8 +471,8 @@ def test_high_degree_tree_minor():
     Requires contraction: Petersen is 3-regular, but contracting one edge
     creates a degree-4 vertex that hosts the star center.
     """
-    from tutte_test.graph import star_graph
-    from tutte_test.rainbow_table import is_graph_minor
+    from tutte.graph import star_graph
+    from tutte.lookup import is_graph_minor
 
     s4 = star_graph(4)          # 5 nodes, 4 edges; center has degree 4
     petersen = petersen_graph()  # 10 nodes, 15 edges; 3-regular
@@ -488,7 +488,7 @@ def test_high_degree_tree_minor():
 
 def test_binary_roundtrip():
     """Encode→decode preserves all entries and polynomials."""
-    from tutte_test.rainbow_table import (RainbowTable,
+    from tutte.lookup import (RainbowTable,
                                           encode_rainbow_table_binary,
                                           decode_rainbow_table_binary)
 
@@ -520,7 +520,7 @@ def test_binary_roundtrip():
 
 def test_binary_roundtrip_with_minors():
     """Minor relationships survive binary encode→decode roundtrip."""
-    from tutte_test.rainbow_table import (RainbowTable,
+    from tutte.lookup import (RainbowTable,
                                           encode_rainbow_table_binary,
                                           decode_rainbow_table_binary)
 

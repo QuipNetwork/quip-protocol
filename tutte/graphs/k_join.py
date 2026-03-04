@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import Dict, Tuple, List, Optional, Set
 from dataclasses import dataclass
 
-from .polynomial import TuttePolynomial
+from ..polynomial import TuttePolynomial
 
 
 # =============================================================================

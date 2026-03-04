@@ -18,11 +18,11 @@ from typing import Dict, Set, Tuple, List, Optional, Iterator, FrozenSet
 import networkx as nx
 from networkx.algorithms import isomorphism
 
-from .graph import (
+from ..graph import (
     Graph, CellSignature, NodeSignature,
     compute_signature, compute_node_signature, compute_all_node_signatures
 )
-from .rainbow_table import MinorEntry, RainbowTable
+from ..lookup.core import MinorEntry, RainbowTable
 
 
 # =============================================================================
@@ -302,7 +302,7 @@ def _minor_to_graph(minor: MinorEntry) -> Optional[Graph]:
     if minor.graph is not None:
         return minor.graph
 
-    from .graph import complete_graph, cycle_graph, path_graph, star_graph, wheel_graph
+    from ..graph import complete_graph, cycle_graph, path_graph, star_graph, wheel_graph
 
     name = minor.name
 

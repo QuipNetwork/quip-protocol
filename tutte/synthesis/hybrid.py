@@ -21,14 +21,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
-from .polynomial import TuttePolynomial
-from .graph import Graph, MultiGraph
-from .rainbow_table import RainbowTable, MinorEntry, load_default_table
-from .k_join import polynomial_divmod, polynomial_divide, tutte_k
-from .factorization import polynomial_gcd, has_common_factor
-from .validation import verify_spanning_trees
-from .covering import find_disjoint_cover, compute_fringe, compute_inter_tile_edges
-from .synthesis import BaseMultigraphSynthesizer
+from ..polynomial import TuttePolynomial
+from ..graph import Graph, MultiGraph
+from ..lookup.core import RainbowTable, MinorEntry, load_default_table
+from ..graphs.k_join import polynomial_divmod, polynomial_divide, tutte_k
+from ..factorization import polynomial_gcd, has_common_factor
+from ..validation import verify_spanning_trees
+from ..graphs.covering import find_disjoint_cover, compute_fringe, compute_inter_tile_edges
+from .base import BaseMultigraphSynthesizer
 
 
 # =============================================================================

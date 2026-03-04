@@ -19,8 +19,8 @@ from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 from collections import defaultdict
 
-from .graph import Graph
-from .polynomial import TuttePolynomial
+from ..graph import Graph
+from ..polynomial import TuttePolynomial
 
 
 # Type alias for edges
