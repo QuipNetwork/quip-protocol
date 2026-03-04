@@ -465,6 +465,22 @@ def test_k3_is_minor_of_k4():
     assert result is True, "K_3 should be a minor of K_4"
 
 
+def test_high_degree_tree_minor():
+    """K_{1,4} (star with 4 leaves) IS a minor of Petersen graph.
+
+    Requires contraction: Petersen is 3-regular, but contracting one edge
+    creates a degree-4 vertex that hosts the star center.
+    """
+    from tutte_test.graph import star_graph
+    from tutte_test.rainbow_table import is_graph_minor
+
+    s4 = star_graph(4)          # 5 nodes, 4 edges; center has degree 4
+    petersen = petersen_graph()  # 10 nodes, 15 edges; 3-regular
+
+    result = is_graph_minor(petersen, s4)
+    assert result is True, "K_{1,4} should be a minor of Petersen"
+
+
 # =============================================================================
 # I. BINARY ROUNDTRIP
 # =============================================================================
