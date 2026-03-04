@@ -364,6 +364,7 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
         print(f"{m:>5} {b['count']:>5}  "
               f"{_fmt(avg(b['cej'])):>10} {_fmt(avg(b['hybrid'])):>10} {_fmt(avg(b['nx'])):>10}")
 
+    sys.stdout.flush()
     return results, cej_table
 
 
@@ -442,23 +443,25 @@ def save_results(results, cej_table=None):
     out_path = os.path.join(base_dir, "benchmark_results.json")
     with open(out_path, "w") as f:
         json.dump(output, f, indent=2)
-    print(f"\nResults saved to {out_path}")
+    print(f"\nResults saved to {out_path}", flush=True)
 
     if cej_table and len(cej_table) > 0:
         # Compute comprehensive structural minor relationships
-        print(f"\nComputing structural minor relationships for {len(cej_table)} entries...")
+        print(f"\nComputing structural minor relationships for {len(cej_table)} entries...",
+              flush=True)
         t0 = time.perf_counter()
         relationships = cej_table.compute_minor_relationships()
         elapsed = time.perf_counter() - t0
         total_minors = sum(len(v) for v in relationships.values())
         print(f"Found {total_minors} minor relationships across "
-              f"{len(relationships)} entries ({elapsed:.1f}s)")
+              f"{len(relationships)} entries ({elapsed:.1f}s)", flush=True)
 
         json_path = os.path.join(base_dir, "tutte_rainbow_table.json")
         bin_path = os.path.join(base_dir, "tutte_rainbow_table.bin")
         cej_table.save(json_path)
         save_binary_rainbow_table(cej_table, bin_path)
-        print(f"Rainbow table saved: {len(cej_table)} entries ({json_path}, {bin_path})")
+        print(f"Rainbow table saved: {len(cej_table)} entries ({json_path}, {bin_path})",
+              flush=True)
 
     return out_path
 

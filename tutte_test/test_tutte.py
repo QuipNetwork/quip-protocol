@@ -419,3 +419,123 @@ def test_performance_regression(name, builder, engine):
         f"{name}: {elapsed_ms:.1f}ms > {threshold_ms:.1f}ms "
         f"(baseline {baseline_ms:.1f}ms + 10%)"
     )
+
+
+# =============================================================================
+# H. MINOR VERIFICATION
+# =============================================================================
+
+
+def test_star_not_minor_of_cycle():
+    """S_3 (star with 3 leaves) is NOT a graph minor of C_5.
+
+    Stars need a degree-3+ node, but contracting a cycle can only produce
+    degree-2 nodes or (at most) degree-2 after merging — never degree-3+
+    without adding edges.
+    """
+    from tutte_test.graph import star_graph
+    from tutte_test.rainbow_table import is_graph_minor
+
+    s3 = star_graph(3)   # 4 nodes, 3 edges; center has degree 3
+    c5 = cycle_graph(5)  # 5 nodes, 5 edges; all degree 2
+
+    result = is_graph_minor(c5, s3)
+    assert result is False, "S_3 should NOT be a minor of C_5"
+
+
+def test_path_is_minor_of_cycle():
+    """P_4 IS a graph minor of C_5 (delete one edge from cycle)."""
+    from tutte_test.rainbow_table import is_graph_minor
+
+    p4 = path_graph(4)   # 4 nodes, 3 edges
+    c5 = cycle_graph(5)  # 5 nodes, 5 edges
+
+    result = is_graph_minor(c5, p4)
+    assert result is True, "P_4 should be a minor of C_5"
+
+
+def test_k3_is_minor_of_k4():
+    """K_3 IS a graph minor of K_4 (delete one vertex)."""
+    from tutte_test.rainbow_table import is_graph_minor
+
+    k3 = complete_graph(3)
+    k4 = complete_graph(4)
+
+    result = is_graph_minor(k4, k3)
+    assert result is True, "K_3 should be a minor of K_4"
+
+
+# =============================================================================
+# I. BINARY ROUNDTRIP
+# =============================================================================
+
+
+def test_binary_roundtrip():
+    """Encode→decode preserves all entries and polynomials."""
+    from tutte_test.rainbow_table import (RainbowTable,
+                                          encode_rainbow_table_binary,
+                                          decode_rainbow_table_binary)
+
+    table = RainbowTable()
+    k3 = complete_graph(3)
+    c5 = cycle_graph(5)
+
+    k3_poly = TuttePolynomial.from_coefficients({(2, 0): 1, (1, 0): 1, (0, 1): 1})
+    c5_coeffs = {(i, 0): 1 for i in range(1, 5)}
+    c5_coeffs[(0, 1)] = 1
+    c5_poly = TuttePolynomial.from_coefficients(c5_coeffs)
+
+    table.add(k3, "K_3", k3_poly)
+    table.add(c5, "C_5", c5_poly)
+
+    data = encode_rainbow_table_binary(table)
+    decoded = decode_rainbow_table_binary(data)
+
+    assert len(decoded) == 2
+    assert decoded.lookup_by_name("K_3") == k3_poly
+    assert decoded.lookup_by_name("C_5") == c5_poly
+
+    # Verify metadata
+    k3_entry = decoded.get_entry("K_3")
+    assert k3_entry.node_count == 3
+    assert k3_entry.edge_count == 3
+    assert k3_entry.spanning_trees == 3
+
+
+def test_binary_roundtrip_with_minors():
+    """Minor relationships survive binary encode→decode roundtrip."""
+    from tutte_test.rainbow_table import (RainbowTable,
+                                          encode_rainbow_table_binary,
+                                          decode_rainbow_table_binary)
+
+    table = RainbowTable()
+    k3 = complete_graph(3)
+    k4 = complete_graph(4)
+    p2 = path_graph(2)
+
+    k3_poly = TuttePolynomial.from_coefficients({(2, 0): 1, (1, 0): 1, (0, 1): 1})
+    k4_poly = TuttePolynomial.from_coefficients(
+        {(3, 0): 1, (2, 0): 3, (1, 1): 4, (1, 0): 2, (0, 1): 2, (0, 2): 3, (0, 3): 1}
+    )
+    p2_poly = TuttePolynomial.x(1)
+
+    table.add(p2, "P_2", p2_poly)
+    table.add(k3, "K_3", k3_poly)
+    table.add(k4, "K_4", k4_poly)
+
+    # Manually set minor relationships
+    k3_key = k3.canonical_key()
+    k4_key = k4.canonical_key()
+    p2_key = p2.canonical_key()
+    table.minor_relationships[k4_key] = [k3_key, p2_key]
+    table.minor_relationships[k3_key] = [p2_key]
+    table._structural_minors_computed = True
+
+    data = encode_rainbow_table_binary(table)
+    decoded = decode_rainbow_table_binary(data)
+
+    assert decoded._structural_minors_computed is True
+    assert k4_key in decoded.minor_relationships
+    assert set(decoded.minor_relationships[k4_key]) == {k3_key, p2_key}
+    assert k3_key in decoded.minor_relationships
+    assert decoded.minor_relationships[k3_key] == [p2_key]

@@ -21,7 +21,7 @@ from math import gcd as math_gcd
 from typing import Dict, List, Optional, Set, Tuple
 
 from .graph import CellSignature, Graph, compute_signature
-from .polynomial import TuttePolynomial, encode_varuint
+from .polynomial import TuttePolynomial, encode_varuint, decode_varuint
 
 # =============================================================================
 # MINOR ENTRY DATA CLASS
@@ -382,7 +382,8 @@ class RainbowTable:
 
         return results
 
-    def compute_minor_relationships(self) -> Dict[str, List[str]]:
+    def compute_minor_relationships(self, verify: bool = True,
+                                     max_contractions: int = 5) -> Dict[str, List[str]]:
         """Compute minor relationships between all entries using coefficient domination.
 
         Uses the Tutte polynomial monotonicity property: if H is a graph minor
@@ -393,6 +394,9 @@ class RainbowTable:
         but the false positives are well-characterized (mainly Tutte-equivalent
         trees like P_n vs S_{n-1}) and harmless for synthesis purposes.
 
+        When ``verify=True``, suspicious candidate pairs are checked with
+        ``is_graph_minor()`` to filter false positives (requires stored graphs).
+
         Additional filter: Tutte-equivalent non-isomorphic graphs (same polynomial,
         different canonical key) are excluded since neither can be a minor of the
         other when they have the same edge count.
@@ -401,11 +405,14 @@ class RainbowTable:
         """
         entries_list = list(self.entries.values())
 
+        # Phase 1: coefficient domination (no false negatives)
         # Merge new minors into existing synthesis-tracked relationships
-        relationships = dict(self.minor_relationships)
+        relationships: Dict[str, set] = {}
+        for key, minor_list in self.minor_relationships.items():
+            relationships[key] = set(minor_list)
 
         for entry in entries_list:
-            existing = set(relationships.get(entry.canonical_key, []))
+            existing = relationships.get(entry.canonical_key, set())
 
             for other in entries_list:
                 if entry.canonical_key == other.canonical_key:
@@ -432,11 +439,123 @@ class RainbowTable:
                 existing.add(other.canonical_key)
 
             if existing:
-                relationships[entry.canonical_key] = sorted(existing)
+                relationships[entry.canonical_key] = existing
 
-        self.minor_relationships = relationships
+        # Phase 2: verify suspicious pairs with actual graph minor check
+        if verify:
+            import sys as _sys
+            import time as _time
+            from networkx.algorithms.isomorphism import GraphMatcher as _GM
+
+            def _progress(msg):
+                print(msg, flush=True)
+
+            verified = 0
+            removed = 0
+            skipped = 0
+
+            # Pre-build NetworkX graph cache (avoids repeated conversion)
+            nx_cache: Dict[str, object] = {}
+            for key, entry in self.entries.items():
+                if entry.graph is not None:
+                    nx_cache[key] = entry.graph.to_networkx()
+
+            # Count total suspicious pairs for progress reporting
+            total_suspicious = 0
+            for major_key, minor_keys in relationships.items():
+                major_entry = self.entries.get(major_key)
+                if major_entry is None or major_key not in nx_cache:
+                    continue
+                for minor_key in minor_keys:
+                    minor_entry = self.entries.get(minor_key)
+                    if minor_entry is None or minor_key not in nx_cache:
+                        continue
+                    is_minor_tree = (minor_entry.spanning_trees == 1
+                                     and minor_entry.edge_count == minor_entry.node_count - 1)
+                    major_is_tree = (major_entry.spanning_trees == 1
+                                     and major_entry.edge_count == major_entry.node_count - 1)
+                    same_nodes = (major_entry.node_count == minor_entry.node_count
+                                  and major_entry.edge_count != minor_entry.edge_count)
+                    if (is_minor_tree and not major_is_tree) or same_nodes:
+                        total_suspicious += 1
+
+            _progress(f"  Verifying {total_suspicious} suspicious pairs "
+                      f"({len(nx_cache)} graphs cached)...")
+
+            checked = 0
+            t_start = _time.perf_counter()
+
+            for major_key, minor_keys in list(relationships.items()):
+                major_entry = self.entries.get(major_key)
+                G_major = nx_cache.get(major_key)
+                if major_entry is None or G_major is None:
+                    continue
+
+                to_remove = set()
+                for minor_key in list(minor_keys):
+                    minor_entry = self.entries.get(minor_key)
+                    G_minor = nx_cache.get(minor_key)
+                    if minor_entry is None or G_minor is None:
+                        continue
+
+                    # Determine if this pair is "suspicious" (likely false positive)
+                    is_minor_tree = (minor_entry.spanning_trees == 1
+                                     and minor_entry.edge_count == minor_entry.node_count - 1)
+                    major_is_tree = (major_entry.spanning_trees == 1
+                                     and major_entry.edge_count == major_entry.node_count - 1)
+                    same_nodes = (major_entry.node_count == minor_entry.node_count
+                                  and major_entry.edge_count != minor_entry.edge_count)
+
+                    suspicious = (is_minor_tree and not major_is_tree) or same_nodes
+                    if not suspicious:
+                        continue
+
+                    checked += 1
+                    if total_suspicious > 1000 and checked % 25000 == 0:
+                        elapsed = _time.perf_counter() - t_start
+                        rate = checked / elapsed if elapsed > 0 else 0
+                        remaining = (total_suspicious - checked) / rate if rate > 0 else 0
+                        _progress(f"    {checked}/{total_suspicious} verified "
+                                  f"({elapsed:.0f}s elapsed, ~{remaining:.0f}s remaining)")
+
+                    needed = major_entry.node_count - minor_entry.node_count
+                    if needed == 0:
+                        # Same node count: subgraph monomorphism IS the full test
+                        # (no contractions needed — edge deletion only)
+                        if _GM(G_major, G_minor).subgraph_is_monomorphic():
+                            verified += 1
+                        else:
+                            to_remove.add(minor_key)
+                            removed += 1
+                    elif needed <= max_contractions:
+                        # Different node counts: need BFS contraction
+                        result = is_graph_minor(major_entry.graph, minor_entry.graph,
+                                               max_contractions=max_contractions)
+                        if result is False:
+                            to_remove.add(minor_key)
+                            removed += 1
+                        elif result is True:
+                            verified += 1
+                        else:
+                            skipped += 1
+                    else:
+                        skipped += 1
+
+                minor_keys -= to_remove
+
+            elapsed = _time.perf_counter() - t_start
+            _progress(f"  Minor verification: {verified} confirmed, {removed} false positives removed, "
+                      f"{skipped} inconclusive ({elapsed:.1f}s)")
+
+        # Convert sets to sorted lists
+        final: Dict[str, List[str]] = {}
+        for key, minor_set in relationships.items():
+            if minor_set:
+                final[key] = sorted(minor_set)
+
+        self.minor_relationships = final
         self._structural_minors_computed = True
-        return relationships
+        return final
 
     def compute_gcd_relationships(self) -> 'GCDMinorIndex':
         """Compute GCD-based relationships between all polynomial entries.
@@ -593,6 +712,81 @@ class RainbowTable:
 # UTILITY FUNCTIONS
 # =============================================================================
 
+def is_graph_minor(major: Graph, minor: Graph, max_contractions: int = 5) -> Optional[bool]:
+    """Check if `minor` is a graph minor of `major` via BFS edge contraction.
+
+    Uses subgraph monomorphism (nx.algorithms.isomorphism.GraphMatcher) to
+    check whether `minor` can be found as a subgraph of some contraction of
+    `major`.
+
+    Args:
+        major: The larger graph (potential major).
+        minor: The smaller graph (potential minor).
+        max_contractions: Maximum number of edge contractions to try.
+            If more contractions are needed, returns None (inconclusive).
+
+    Returns:
+        True if minor IS a graph minor of major.
+        False if minor is NOT a graph minor (exhaustive search within budget).
+        None if inconclusive (exceeded max_contractions budget).
+    """
+    from networkx.algorithms.isomorphism import GraphMatcher
+
+    # Quick reject on node/edge counts
+    if minor.node_count() > major.node_count():
+        return False
+    if minor.edge_count() > major.edge_count():
+        return False
+
+    G = major.to_networkx()
+    H = minor.to_networkx()
+
+    # Check zero contractions: is H a subgraph of G?
+    if GraphMatcher(G, H).subgraph_is_monomorphic():
+        return True
+
+    # How many contractions might we need?
+    needed = major.node_count() - minor.node_count()
+    if needed > max_contractions:
+        return None  # Inconclusive — too many contractions to explore
+
+    # BFS contraction: try contracting each edge, deduplicate, check monomorphism
+    # Each level = one contraction step
+    def _graph_key(g):
+        """Canonical key for deduplication: sorted edge tuple."""
+        return tuple(sorted(tuple(sorted(e)) for e in g.edges()))
+
+    current_level = {_graph_key(G): G}
+
+    for _depth in range(needed):
+        next_level = {}
+        for gkey, g in current_level.items():
+            for u, v in list(g.edges()):
+                # Contract edge (u, v): merge v into u
+                contracted = g.copy()
+                # Transfer v's neighbors to u
+                for w in list(contracted.neighbors(v)):
+                    if w != u:
+                        contracted.add_edge(u, w)
+                contracted.remove_node(v)
+
+                ckey = _graph_key(contracted)
+                if ckey in next_level:
+                    continue
+
+                # Check monomorphism
+                if GraphMatcher(contracted, H).subgraph_is_monomorphic():
+                    return True
+
+                next_level[ckey] = contracted
+
+        current_level = next_level
+        if not current_level:
+            break
+
+    return False
+
+
 def _try_divide(dividend: TuttePolynomial, divisor: TuttePolynomial) -> Optional[TuttePolynomial]:
     """Try polynomial division. Returns quotient if exact, None otherwise.
 
@@ -631,10 +825,24 @@ def _try_divide(dividend: TuttePolynomial, divisor: TuttePolynomial) -> Optional
 
 
 def load_default_table() -> RainbowTable:
-    """Load the default rainbow table from the package directory."""
-    table_path = os.path.join(os.path.dirname(__file__), 'tutte_rainbow_table.json')
-    if os.path.exists(table_path):
-        return RainbowTable.load(table_path)
+    """Load the default rainbow table from the package directory.
+
+    Tries binary format first (faster, includes minor relationships),
+    falls back to JSON.
+    """
+    base_dir = os.path.dirname(__file__)
+    bin_path = os.path.join(base_dir, 'tutte_rainbow_table.bin')
+    json_path = os.path.join(base_dir, 'tutte_rainbow_table.json')
+
+    if os.path.exists(bin_path):
+        try:
+            return load_binary_rainbow_table(bin_path)
+        except Exception:
+            pass  # Fall through to JSON
+
+    if os.path.exists(json_path):
+        return RainbowTable.load(json_path)
+
     return RainbowTable()
 
 
@@ -643,34 +851,61 @@ def load_default_table() -> RainbowTable:
 # =============================================================================
 
 def encode_rainbow_table_binary(table: RainbowTable) -> bytes:
-    """Encode rainbow table to compact binary format.
+    """Encode rainbow table to compact binary v2 format.
 
-    Format:
+    v2 Format:
         Header:
-            [magic: 4 bytes] = "RTBL"
-            [version: 1 byte] = 1
+            [magic: 4 bytes]    = "RTBL"
+            [version: 1 byte]   = 2
+            [flags: 1 byte]     bit 0: has_minor_rels, bit 1: structural_minors_computed
             [num_entries: varuint]
 
-        For each entry:
-            [name_len: varuint]
-            [name: bytes]
+        Entry Section (per entry):
+            [canonical_key: 32 bytes]       ← raw SHA256
+            [name_len: varuint] [name: bytes]
             [node_count: varuint]
             [edge_count: varuint]
             [spanning_trees: varuint]
-            [polynomial_bytes_len: varuint]
-            [polynomial_bytes: bytes]
+            [poly_len: varuint] [poly_bytes: bytes]
+
+        Minor Relationships Section (if flag bit 0):
+            [num_majors: varuint]
+            Per major:
+                [major_index: varuint]
+                [num_minors: varuint]
+                [minor_index: varuint] × num_minors
     """
+    import hashlib
+
     result = bytearray()
 
     # Magic header
     result.extend(b"RTBL")
-    result.append(1)  # version
+    result.append(2)  # version
+
+    # Flags
+    has_minors = bool(table.minor_relationships)
+    flags = 0
+    if has_minors:
+        flags |= 0x01
+    if table._structural_minors_computed:
+        flags |= 0x02
+    result.append(flags)
 
     # Number of entries
-    result.extend(encode_varuint(len(table.entries)))
+    entries_ordered = list(table.entries.items())
+    result.extend(encode_varuint(len(entries_ordered)))
 
-    # Each entry
-    for key, entry in table.entries.items():
+    # Build key -> index map for minor relationships
+    key_to_index: Dict[str, int] = {}
+    for idx, (key, _entry) in enumerate(entries_ordered):
+        key_to_index[key] = idx
+
+    # Entry section
+    for key, entry in entries_ordered:
+        # Canonical key as raw 32-byte SHA256
+        result.extend(bytes.fromhex(key))
+
         # Name
         name_bytes = entry.name.encode('utf-8')
         result.extend(encode_varuint(len(name_bytes)))
@@ -686,7 +921,172 @@ def encode_rainbow_table_binary(table: RainbowTable) -> bytes:
         result.extend(encode_varuint(len(poly_bytes)))
         result.extend(poly_bytes)
 
+    # Minor relationships section
+    if has_minors:
+        # Filter to only majors with valid indices
+        valid_majors = []
+        for major_key, minor_keys in table.minor_relationships.items():
+            if major_key not in key_to_index:
+                continue
+            valid_minor_indices = []
+            for mk in minor_keys:
+                if mk in key_to_index:
+                    valid_minor_indices.append(key_to_index[mk])
+            if valid_minor_indices:
+                valid_majors.append((key_to_index[major_key], valid_minor_indices))
+
+        result.extend(encode_varuint(len(valid_majors)))
+        for major_idx, minor_indices in valid_majors:
+            result.extend(encode_varuint(major_idx))
+            result.extend(encode_varuint(len(minor_indices)))
+            for mi in minor_indices:
+                result.extend(encode_varuint(mi))
+
     return bytes(result)
+
+
+def decode_rainbow_table_binary(data: bytes) -> RainbowTable:
+    """Decode binary rainbow table (supports v1 and v2 formats).
+
+    Returns a fully populated RainbowTable with entries and minor_relationships.
+    """
+    offset = 0
+
+    # Magic header
+    if data[offset:offset + 4] != b"RTBL":
+        raise ValueError("Invalid magic header — not a rainbow table binary")
+    offset += 4
+
+    version = data[offset]
+    offset += 1
+
+    if version == 1:
+        return _decode_binary_v1(data, offset)
+    elif version == 2:
+        return _decode_binary_v2(data, offset)
+    else:
+        raise ValueError(f"Unsupported binary version: {version}")
+
+
+def _decode_binary_v1(data: bytes, offset: int) -> RainbowTable:
+    """Decode v1 binary format (no canonical keys, no minor relationships)."""
+    table = RainbowTable()
+
+    num_entries, offset = decode_varuint(data, offset)
+
+    for _ in range(num_entries):
+        # Name
+        name_len, offset = decode_varuint(data, offset)
+        name = data[offset:offset + name_len].decode('utf-8')
+        offset += name_len
+
+        # Metadata
+        node_count, offset = decode_varuint(data, offset)
+        edge_count, offset = decode_varuint(data, offset)
+        spanning_trees, offset = decode_varuint(data, offset)
+
+        # Polynomial
+        poly_len, offset = decode_varuint(data, offset)
+        poly_bytes = data[offset:offset + poly_len]
+        offset += poly_len
+        polynomial = TuttePolynomial.from_bytes(poly_bytes)
+
+        # v1 has no canonical key stored — we can't reconstruct it without
+        # the graph, so use a placeholder based on name
+        import hashlib
+        canonical_key = hashlib.sha256(f"v1:{name}".encode()).hexdigest()
+
+        entry = MinorEntry(
+            name=name,
+            polynomial=polynomial,
+            node_count=node_count,
+            edge_count=edge_count,
+            canonical_key=canonical_key,
+            spanning_trees=spanning_trees,
+            num_terms=polynomial.num_terms(),
+        )
+
+        table.entries[canonical_key] = entry
+        table.name_index[name] = canonical_key
+
+    table._sort_by_complexity()
+    return table
+
+
+def _decode_binary_v2(data: bytes, offset: int) -> RainbowTable:
+    """Decode v2 binary format (with canonical keys and minor relationships)."""
+    table = RainbowTable()
+
+    # Flags
+    flags = data[offset]
+    offset += 1
+    has_minors = bool(flags & 0x01)
+    table._structural_minors_computed = bool(flags & 0x02)
+
+    # Number of entries
+    num_entries, offset = decode_varuint(data, offset)
+
+    # Read entries, build index -> key mapping
+    index_to_key: List[str] = []
+
+    for _ in range(num_entries):
+        # Canonical key: 32 raw bytes → hex string
+        canonical_key = data[offset:offset + 32].hex()
+        offset += 32
+
+        # Name
+        name_len, offset = decode_varuint(data, offset)
+        name = data[offset:offset + name_len].decode('utf-8')
+        offset += name_len
+
+        # Metadata
+        node_count, offset = decode_varuint(data, offset)
+        edge_count, offset = decode_varuint(data, offset)
+        spanning_trees, offset = decode_varuint(data, offset)
+
+        # Polynomial
+        poly_len, offset = decode_varuint(data, offset)
+        poly_bytes = data[offset:offset + poly_len]
+        offset += poly_len
+        polynomial = TuttePolynomial.from_bytes(poly_bytes)
+
+        entry = MinorEntry(
+            name=name,
+            polynomial=polynomial,
+            node_count=node_count,
+            edge_count=edge_count,
+            canonical_key=canonical_key,
+            spanning_trees=spanning_trees,
+            num_terms=polynomial.num_terms(),
+        )
+
+        table.entries[canonical_key] = entry
+        table.name_index[name] = canonical_key
+        index_to_key.append(canonical_key)
+
+    # Minor relationships section
+    if has_minors:
+        num_majors, offset = decode_varuint(data, offset)
+        for _ in range(num_majors):
+            major_idx, offset = decode_varuint(data, offset)
+            num_minors, offset = decode_varuint(data, offset)
+            minor_keys = []
+            for _ in range(num_minors):
+                minor_idx, offset = decode_varuint(data, offset)
+                if minor_idx < len(index_to_key):
+                    minor_keys.append(index_to_key[minor_idx])
+            if major_idx < len(index_to_key) and minor_keys:
+                table.minor_relationships[index_to_key[major_idx]] = minor_keys
+
+    table._sort_by_complexity()
+    return table
+
+
+def load_binary_rainbow_table(path: str) -> RainbowTable:
+    """Load rainbow table from binary file."""
+    with open(path, 'rb') as f:
+        data = f.read()
+    return decode_rainbow_table_binary(data)
 
 
 def save_binary_rainbow_table(table: RainbowTable, path: str) -> int:
