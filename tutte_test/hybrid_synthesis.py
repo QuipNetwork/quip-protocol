@@ -47,6 +47,7 @@ class HybridSynthesisResult:
     algebraic_steps: int = 0
     tiling_steps: int = 0
     dc_steps: int = 0  # Should be 0 in ideal case
+    minors_used: Set[str] = field(default_factory=set)  # Names of table entries used
 
     def __repr__(self) -> str:
         status = "✓" if self.verified else "✗"
@@ -139,12 +140,15 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         if cached is not None:
             self._log("Direct lookup hit")
             self._stats['lookup'] += 1
+            entry = self.table.entries.get(cache_key)
+            entry_name = entry.name if entry else None
             result = HybridSynthesisResult(
                 polynomial=cached,
                 method="lookup",
                 decomposition=["table"],
                 recipe=["Rainbow table lookup"],
-                verified=True
+                verified=True,
+                minors_used={entry_name} if entry_name else set(),
             )
             self._cache[cache_key] = result
             return result
@@ -201,6 +205,7 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         decomposition = []
         recipe = [f"Disconnected: {len(components)} components"]
         total_alg = total_tile = total_dc = 0
+        all_minors = set()
 
         for i, comp in enumerate(components):
             comp_result = self.synthesize(comp, max_depth)
@@ -210,6 +215,7 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
             total_alg += comp_result.algebraic_steps
             total_tile += comp_result.tiling_steps
             total_dc += comp_result.dc_steps
+            all_minors |= comp_result.minors_used
 
         return HybridSynthesisResult(
             polynomial=poly,
@@ -219,7 +225,8 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
             verified=True,
             algebraic_steps=total_alg,
             tiling_steps=total_tile,
-            dc_steps=total_dc
+            dc_steps=total_dc,
+            minors_used=all_minors,
         )
 
     def _synthesize_hybrid(
@@ -244,6 +251,7 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                 decomposition = []
                 recipe = [f"Cut vertex factorization at node {cut}"]
                 total_alg = total_tile = total_dc = 0
+                all_minors = set()
 
                 for i, comp in enumerate(components):
                     comp_result = self.synthesize(comp, max_depth)
@@ -253,6 +261,7 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                     total_alg += comp_result.algebraic_steps
                     total_tile += comp_result.tiling_steps
                     total_dc += comp_result.dc_steps
+                    all_minors |= comp_result.minors_used
 
                 return HybridSynthesisResult(
                     polynomial=poly,
@@ -261,7 +270,8 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                     recipe=recipe,
                     algebraic_steps=total_alg + 1,
                     tiling_steps=total_tile,
-                    dc_steps=total_dc
+                    dc_steps=total_dc,
+                    minors_used=all_minors,
                 )
 
         # Use tiling-based approach (spanning tree + edge addition)

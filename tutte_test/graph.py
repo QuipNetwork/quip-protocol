@@ -60,12 +60,14 @@ def _compute_canonical_key(G: nx.Graph) -> str:
     sorted_nodes = sorted(G.nodes(), key=lambda node: int_colors[node])
 
     # Break remaining ties using neighbor indices within sorted list
+    node_to_index = {node: i for i, node in enumerate(sorted_nodes)}
+
     def canonical_sort_key(idx: int) -> tuple:
         node = sorted_nodes[idx]
         color = int_colors[node]
         # Neighbor indices provide canonical tie-breaking
         neighbor_indices = tuple(sorted(
-            sorted_nodes.index(nb) for nb in G.neighbors(node)
+            node_to_index[nb] for nb in G.neighbors(node)
         ))
         return (color, neighbor_indices)
 
@@ -203,6 +205,13 @@ class Graph:
             if u not in self.nodes or v not in self.nodes:
                 raise ValueError(f"Edge ({u}, {v}) references invalid node")
 
+        # Build adjacency cache (avoids O(m) scan on every neighbors()/degree() call)
+        adj: Dict[int, Set[int]] = {n: set() for n in self.nodes}
+        for u, v in self.edges:
+            adj[u].add(v)
+            adj[v].add(u)
+        object.__setattr__(self, '_adj', adj)
+
     @classmethod
     def from_networkx(cls, G: nx.Graph) -> 'Graph':
         """Convert NetworkX graph to immutable Graph.
@@ -257,17 +266,11 @@ class Graph:
 
     def degree(self, node: int) -> int:
         """Get degree of a node."""
-        return sum(1 for u, v in self.edges if u == node or v == node)
+        return len(self._adj.get(node, set()))
 
     def neighbors(self, node: int) -> Set[int]:
         """Get neighbors of a node."""
-        result = set()
-        for u, v in self.edges:
-            if u == node:
-                result.add(v)
-            elif v == node:
-                result.add(u)
-        return result
+        return self._adj.get(node, set())
 
     def subgraph(self, nodes: Set[int]) -> 'Graph':
         """Return induced subgraph on given nodes."""
@@ -569,6 +572,13 @@ class MultiGraph:
             if count <= 0:
                 raise ValueError(f"Loop count must be positive")
 
+        # Build adjacency cache (avoids O(m) scan on every neighbors() call)
+        adj: Dict[int, Set[int]] = {n: set() for n in self.nodes}
+        for u, v in self.edge_counts:
+            adj[u].add(v)
+            adj[v].add(u)
+        object.__setattr__(self, '_adj', adj)
+
     @classmethod
     def from_graph(cls, g: Graph) -> 'MultiGraph':
         """Convert simple Graph to MultiGraph."""
@@ -606,21 +616,15 @@ class MultiGraph:
     def degree(self, node: int) -> int:
         """Get degree of a node (loops count as 2 each)."""
         deg = 0
-        for (u, v), count in self.edge_counts.items():
-            if u == node or v == node:
-                deg += count
+        for nb in self._adj.get(node, set()):
+            edge = (min(node, nb), max(node, nb))
+            deg += self.edge_counts.get(edge, 0)
         deg += 2 * self.loop_counts.get(node, 0)
         return deg
 
     def neighbors(self, node: int) -> Set[int]:
         """Get neighbors of a node (not counting multiplicities)."""
-        result = set()
-        for (u, v) in self.edge_counts.keys():
-            if u == node:
-                result.add(v)
-            elif v == node:
-                result.add(u)
-        return result
+        return self._adj.get(node, set())
 
     def edge_multiplicity(self, u: int, v: int) -> int:
         """Get number of edges between u and v."""
@@ -856,6 +860,8 @@ class MultiGraph:
         sorted_nodes = sorted(self.nodes, key=lambda n: int_colors[n])
 
         # Tie-breaking using neighbor structure
+        node_to_index = {node: i for i, node in enumerate(sorted_nodes)}
+
         def canonical_sort_key(idx: int) -> tuple:
             node = sorted_nodes[idx]
             color = int_colors[node]
@@ -863,7 +869,7 @@ class MultiGraph:
             for nb in self.neighbors(node):
                 edge = (min(node, nb), max(node, nb))
                 mult = self.edge_counts.get(edge, 0)
-                neighbor_indices.append((sorted_nodes.index(nb), mult))
+                neighbor_indices.append((node_to_index[nb], mult))
             return (color, tuple(sorted(neighbor_indices)))
 
         indices = list(range(len(sorted_nodes)))

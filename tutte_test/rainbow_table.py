@@ -307,8 +307,17 @@ class RainbowTable:
 
         return None
 
-    def add(self, graph: Graph, name: str, polynomial: TuttePolynomial) -> None:
-        """Add a new entry to the table."""
+    def add(self, graph: Graph, name: str, polynomial: TuttePolynomial,
+            minors_used: Optional[Set[str]] = None) -> None:
+        """Add a new entry to the table.
+
+        Args:
+            graph: The graph to add
+            name: Human-readable name for the entry
+            polynomial: Computed Tutte polynomial
+            minors_used: Set of table entry names used during synthesis.
+                         Transitive minors are inherited automatically.
+        """
         key = graph.canonical_key()
 
         entry = MinorEntry(
@@ -325,6 +334,19 @@ class RainbowTable:
 
         self.entries[key] = entry
         self.name_index[name] = key
+
+        # Build transitive minor closure (Merkle-tree style)
+        if minors_used:
+            all_minors = set()
+            for minor_name in minors_used:
+                if minor_name == name:
+                    continue  # Don't list self
+                all_minors.add(minor_name)
+                # Inherit transitive minors from each direct minor
+                if minor_name in self.minor_relationships:
+                    all_minors |= set(self.minor_relationships[minor_name])
+            if all_minors:
+                self.minor_relationships[name] = sorted(all_minors)
 
         # Re-sort
         self._sort_by_complexity()

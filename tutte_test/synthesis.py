@@ -39,6 +39,43 @@ from .covering import (
 )
 from .validation import verify_spanning_trees
 from .series_parallel import compute_sp_tutte_if_applicable
+from .matroid import GraphicMatroid, FlatLattice, enumerate_flats_with_hasse
+from .parallel_connection import (
+    BivariateLaurentPoly,
+    theorem6_parallel_connection,
+    precompute_contractions,
+    build_extended_cell_graph,
+)
+
+
+# =============================================================================
+# UNION-FIND (for bridge/chord classification)
+# =============================================================================
+
+class UnionFind:
+    """O(alpha(n)) union-find for bridge/chord classification."""
+
+    def __init__(self, elements):
+        self.parent = {x: x for x in elements}
+        self.rank = {x: 0 for x in elements}
+
+    def find(self, x):
+        """Find with path compression."""
+        if self.parent[x] != x:
+            self.parent[x] = self.find(self.parent[x])
+        return self.parent[x]
+
+    def union(self, x, y):
+        """Union by rank. Returns True if x,y were in different sets."""
+        rx, ry = self.find(x), self.find(y)
+        if rx == ry:
+            return False
+        if self.rank[rx] < self.rank[ry]:
+            rx, ry = ry, rx
+        self.parent[ry] = rx
+        if self.rank[rx] == self.rank[ry]:
+            self.rank[rx] += 1
+        return True
 
 
 # =============================================================================
@@ -63,56 +100,42 @@ class BaseMultigraphSynthesizer:
     ) -> TuttePolynomial:
         """Synthesize polynomial for a multigraph with pattern recognition.
 
+        Cheap structural checks (O(n+m)) are done BEFORE canonical_key (O(n²))
+        to avoid expensive hashing on graphs that can be factored directly.
+
         Pattern recognition order:
-        1. Cache lookup
-        2. Simple graph -> use regular synthesis (or fast path if skip_minor_search)
-        3. Loop handling: T(G with loop) = y × T(G without loop)
+        1. Handle loops: T(G with loop) = y × T(G without loop)
+        2. Parallel edges formula (for simple 2-node multi-edge graphs)
+        3. Disconnected: T(G1 ∪ G2) = T(G1) × T(G2)
         4. Cut vertex factorization: T(G1 · G2) = T(G1) × T(G2)
-        5. Parallel edges formula (for simple multi-edge graphs)
-        6. Disconnected multigraph: T(G1 ∪ G2) = T(G1) × T(G2)
-        7. Reduce parallel edges one at a time: T(G) = T(G\\e) + T(G/e)
+        5. Cache lookup (requires canonical_key)
+        6. Simple graph -> use regular synthesis
+        7. Reduce parallel edges: T(G) = T(G\\e) + T(G/e)
 
         Args:
             mg: MultiGraph to synthesize
             max_depth: Maximum recursion depth (for subclass methods)
             skip_minor_search: If True, skip expensive minor search for simple graphs
-                              and go directly to spanning tree expansion. Use this
-                              for intermediate graphs that are unlikely to match
-                              known minors.
 
         Returns:
             TuttePolynomial for the multigraph
         """
-        # 1. Check cache
-        cache_key = mg.canonical_key()
-        if cache_key in self._multigraph_cache:
-            return self._multigraph_cache[cache_key]
-
-        self._log(f"Synthesizing multigraph: {mg.node_count()} nodes, {mg.edge_count()} edges")
-
-        # 2. If simple graph, convert and use regular synthesis
-        if mg.is_simple():
-            simple = mg.to_simple_graph()
-            if simple is not None:
-                if skip_minor_search:
-                    # Fast path: skip minor search, go directly to spanning tree expansion
-                    # This is used for intermediate merged graphs that are unlikely
-                    # to match any named minors in the rainbow table
-                    result = self._synthesize_fast(simple, max_depth)
-                else:
-                    result = self.synthesize(simple, max_depth)
-                self._multigraph_cache[cache_key] = result.polynomial
-                return result.polynomial
-
-        # 3. Handle loops first: T(G with loop) = y × T(G without loop)
+        # 1. Handle loops first: T(G with loop) = y × T(G without loop)
         if mg.total_loop_count() > 0:
             loop_count = mg.total_loop_count()
             mg_no_loops = mg.remove_loops()
-            poly = TuttePolynomial.y(loop_count) * self._synthesize_multigraph(mg_no_loops, max_depth, skip_minor_search)
-            self._multigraph_cache[cache_key] = poly
-            return poly
+            return TuttePolynomial.y(loop_count) * self._synthesize_multigraph(mg_no_loops, max_depth, skip_minor_search)
+
+        # 2. Parallel edges formula (very cheap check)
+        if mg.is_just_parallel_edges():
+            return self._parallel_edges_formula(mg.parallel_edge_count())
+
+        # 3. Disconnected: T(G1 ∪ G2) = T(G1) × T(G2)
+        if not mg.is_connected():
+            return self._handle_disconnected_multigraph(mg, max_depth, skip_minor_search)
 
         # 4. Cut vertex factorization: T(G1 · G2) = T(G1) × T(G2)
+        #    O(n+m) check, avoids expensive canonical_key for factorable graphs
         cut = mg.has_cut_vertex()
         if cut is not None:
             components = mg.split_at_cut_vertex(cut)
@@ -121,20 +144,25 @@ class BaseMultigraphSynthesizer:
                 poly = TuttePolynomial.one()
                 for comp in components:
                     poly = poly * self._synthesize_multigraph(comp, max_depth, skip_minor_search)
-                self._multigraph_cache[cache_key] = poly
                 return poly
 
-        # 5. Parallel edges formula
-        if mg.is_just_parallel_edges():
-            poly = self._parallel_edges_formula(mg.parallel_edge_count())
-            self._multigraph_cache[cache_key] = poly
-            return poly
+        # 5. Cache lookup (requires canonical_key - expensive but needed for non-factorable graphs)
+        cache_key = mg.canonical_key()
+        if cache_key in self._multigraph_cache:
+            return self._multigraph_cache[cache_key]
 
-        # 6. Disconnected multigraph: T(G1 ∪ G2) = T(G1) × T(G2)
-        if not mg.is_connected():
-            poly = self._handle_disconnected_multigraph(mg, max_depth, skip_minor_search)
-            self._multigraph_cache[cache_key] = poly
-            return poly
+        self._log(f"Synthesizing multigraph: {mg.node_count()} nodes, {mg.edge_count()} edges")
+
+        # 6. Simple graph -> use regular synthesis (or fast path)
+        if mg.is_simple():
+            simple = mg.to_simple_graph()
+            if simple is not None:
+                if skip_minor_search:
+                    result = self._synthesize_fast(simple, max_depth)
+                else:
+                    result = self.synthesize(simple, max_depth)
+                self._multigraph_cache[cache_key] = result.polynomial
+                return result.polynomial
 
         # 7. Reduce parallel edges one at a time: T(G) = T(G\\e) + T(G/e)
         max_mult_edge = max(mg.edge_counts.keys(), key=lambda e: mg.edge_counts[e])
@@ -143,7 +171,7 @@ class BaseMultigraphSynthesizer:
             self._multigraph_cache[cache_key] = poly
             return poly
 
-        # 8. Fall back to deletion-contraction for multigraphs (should not be reached)
+        # 8. Fall back (should not be reached)
         raise RuntimeError(
             f"D-C fallback reached for multigraph with "
             f"{mg.node_count()} nodes, {mg.edge_count()} edges"
@@ -291,6 +319,7 @@ class SynthesisResult:
     method: str = "unknown"
     tiles_used: int = 0
     fringe_edges: int = 0
+    minors_used: Set[str] = field(default_factory=set)  # Names of table entries used
 
     def __repr__(self) -> str:
         status = "verified" if self.verified else "unverified"
@@ -352,11 +381,14 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         cached = self.table.lookup(graph)
         if cached is not None:
             self._log("Direct rainbow table lookup")
+            entry = self.table.entries.get(cache_key)
+            entry_name = entry.name if entry else None
             result = SynthesisResult(
                 polynomial=cached,
                 recipe=["Rainbow table lookup"],
                 verified=True,
-                method="lookup"
+                method="lookup",
+                minors_used={entry_name} if entry_name else set(),
             )
             self._cache[cache_key] = result
             return result
@@ -405,7 +437,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 self._cache[cache_key] = result
                 return result
 
-        # 6. Try creation-expansion-join
+        # 7. Try creation-expansion-join
         result = self._synthesize_connected(graph, max_depth)
         self._cache[cache_key] = result
         return result
@@ -423,11 +455,13 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
 
         poly = TuttePolynomial.one()
         recipe = [f"Disconnected: {len(components)} components"]
+        all_minors = set()
 
         for i, comp in enumerate(components):
             comp_result = self.synthesize(comp, max_depth)
             poly = poly * comp_result.polynomial
             recipe.append(f"  Component {i+1}: {comp_result.polynomial}")
+            all_minors |= comp_result.minors_used
 
         recipe.append(f"Product: {poly}")
 
@@ -435,7 +469,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             polynomial=poly,
             recipe=recipe,
             verified=True,  # Product formula is exact
-            method="disjoint_union"
+            method="disjoint_union",
+            minors_used=all_minors,
         )
 
     def _synthesize_via_cut_vertex(
@@ -458,16 +493,19 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         recipe = [f"Cut vertex factorization at node {cut}: {len(components)} components"]
 
         poly = TuttePolynomial.one()
+        all_minors = set()
         for i, comp in enumerate(components):
             comp_result = self.synthesize(comp, max_depth)
             poly = poly * comp_result.polynomial
             recipe.append(f"  Component {i+1}: {comp_result.polynomial}")
+            all_minors |= comp_result.minors_used
 
         return SynthesisResult(
             polynomial=poly,
             recipe=recipe,
             verified=True,  # Cut vertex formula is exact
-            method="cut_vertex"
+            method="cut_vertex",
+            minors_used=all_minors,
         )
 
     def _try_hierarchical(
@@ -544,6 +582,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         """
         k = len(partition)
         recipe = [f"Hierarchical: {k} × {cell.name} cells"]
+        all_minors = {cell.name}
 
         # Step 1: Base polynomial = T(cell)^k (disjoint cells)
         base_poly = TuttePolynomial.one()
@@ -564,9 +603,11 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
 
             # Try product formula first (fast path for Zephyr-like structures)
             poly = base_poly
+            inter_minors = set()
             for i, comp in enumerate(inter_components):
                 comp_result = self.synthesize(comp, max_depth)
                 poly = poly * comp_result.polynomial
+                inter_minors |= comp_result.minors_used
 
             # Verify - product formula only works for specific structures
             if verify_spanning_trees(graph, poly):
@@ -580,12 +621,34 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                     verified=True,
                     method="hierarchical_tiling",
                     tiles_used=k,
-                    fringe_edges=0
+                    fringe_edges=0,
+                    minors_used=all_minors | inter_minors,
                 )
 
-            # Product formula failed - fall back to component-optimized edge addition
-            self._log("Product formula failed, using optimized edge-by-edge addition")
-            recipe.append("Product formula invalid, using optimized edge-by-edge")
+            # Product formula failed - try Theorem 6 parallel connection for 2-cell case
+            if len(partition) == 2:
+                self._log("Product formula failed, trying Theorem 6 parallel connection")
+                recipe.append("Product formula invalid, trying Theorem 6")
+                pc_poly = self._try_parallel_connection(graph, partition, inter_info, cell, base_poly)
+                if pc_poly is not None:
+                    poly = pc_poly
+                    recipe.append("Theorem 6 parallel connection succeeded")
+                    self._log(f"Final polynomial has {poly.num_terms()} terms")
+                    verified = verify_spanning_trees(graph, poly)
+                    return SynthesisResult(
+                        polynomial=poly,
+                        recipe=recipe,
+                        verified=verified,
+                        method="parallel_connection",
+                        tiles_used=k,
+                        fringe_edges=0,
+                        minors_used=all_minors,
+                    )
+                self._log("Theorem 6 failed, falling back to edge-by-edge")
+                recipe.append("Theorem 6 failed, using optimized edge-by-edge")
+
+            # Fall back to component-optimized edge addition
+            self._log("Using optimized edge-by-edge addition")
             poly = self._add_inter_cell_edges_optimized(base_poly, graph, partition, inter_info, cell)
         else:
             poly = base_poly
@@ -601,7 +664,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             verified=verified,
             method="hierarchical_tiling",
             tiles_used=k,
-            fringe_edges=0
+            fringe_edges=0,
+            minors_used=all_minors,
         )
 
     def _build_inter_cell_graph(
@@ -638,6 +702,93 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             edges=frozenset(inter_edges)
         )
 
+    def _try_parallel_connection(
+        self,
+        graph: Graph,
+        partition: List[Set[int]],
+        inter_info: InterCellInfo,
+        cell: MinorEntry,
+        base_poly: TuttePolynomial,
+    ) -> Optional[TuttePolynomial]:
+        """Try Theorem 6 (Bonin-de Mier) for 2-cell decomposition.
+
+        Steps:
+        1. Build inter-cell graph -> GraphicMatroid N
+        2. Enumerate flats with Hasse diagram
+        3. Build FlatLattice with pre-built Hasse
+        4. Build extended cell graphs (cell + inter-cell edges)
+        5. Precompute T(M_i/Z) for all flats Z
+        6. Apply Theorem 6
+        7. Verify via Kirchhoff
+
+        Args:
+            graph: Full graph
+            partition: List of 2 node sets
+            inter_info: Information about inter-cell edges
+            cell: Cell pattern from rainbow table
+            base_poly: T(cell)^k polynomial
+
+        Returns:
+            TuttePolynomial if successful, None otherwise
+        """
+        if len(partition) != 2:
+            return None
+
+        try:
+            # Step 1: Build inter-cell graph and matroid
+            inter_graph = self._build_inter_cell_graph(graph, partition, inter_info)
+            if inter_graph.edge_count() == 0:
+                return None
+
+            matroid_N = GraphicMatroid(inter_graph)
+            r_N = matroid_N.rank()
+
+            self._log(f"Inter-cell matroid: rank {r_N}, {inter_graph.edge_count()} edges")
+
+            # Step 2: Enumerate flats with Hasse diagram
+            flats, ranks, upper_covers = enumerate_flats_with_hasse(matroid_N)
+            self._log(f"Enumerated {len(flats)} flats")
+
+            # Step 3: Build FlatLattice
+            lattice = FlatLattice(
+                matroid_N,
+                flats=flats,
+                ranks=ranks,
+                upper_covers=upper_covers,
+            )
+
+            # Step 4: Build extended cell graphs
+            inter_edge_list = list(inter_info.edges)
+
+            ext1, shared1 = build_extended_cell_graph(
+                graph, partition[0], inter_edge_list,
+            )
+            ext2, shared2 = build_extended_cell_graph(
+                graph, partition[1], inter_edge_list,
+            )
+
+            self._log(f"Extended cell 1: {ext1.node_count()} nodes, {ext1.edge_count()} edges")
+            self._log(f"Extended cell 2: {ext2.node_count()} nodes, {ext2.edge_count()} edges")
+
+            # Step 5: Precompute T(M_i/Z) for all flats Z
+            t_m1 = precompute_contractions(ext1, shared1, lattice, self)
+            t_m2 = precompute_contractions(ext2, shared2, lattice, self)
+
+            # Step 6: Apply Theorem 6
+            poly = theorem6_parallel_connection(lattice, t_m1, t_m2, r_N)
+
+            # Step 7: Verify
+            if verify_spanning_trees(graph, poly):
+                self._log("Theorem 6 verified!")
+                return poly
+            else:
+                self._log("Theorem 6 result failed Kirchhoff verification")
+                return None
+
+        except Exception as e:
+            self._log(f"Theorem 6 failed with exception: {e}")
+            return None
+
     def _add_inter_cell_edges_optimized(
         self,
         base_poly: TuttePolynomial,
@@ -646,12 +797,18 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         inter_info: InterCellInfo,
         cell: MinorEntry
     ) -> TuttePolynomial:
-        """Add inter-cell edges using component-based bridge/chord processing.
+        """Add inter-cell edges using single-pass with running multigraph.
+
+        Uses UnionFind for O(alpha(n)) bridge/chord classification.
+        Maintains a running multigraph across ALL inter-cell edges so that
+        T(G/{u,v}) is computed on the correct graph state.
 
         Strategy:
-        1. Build the inter-cell graph and find connected components
-        2. For each component, identify bridge edge and chord edges
-        3. Apply bridge (multiply by x) then process chords edge-by-edge
+        1. Build initial multigraph from ALL intra-cell edges
+        2. Initialize union-find with cells pre-unioned
+        3. Classify each inter-cell edge: bridge if uf.find(u) != uf.find(v)
+        4. Process bridges first (cheap: poly *= x), then chords
+        5. Running multigraph updated after each edge
 
         Args:
             base_poly: T(cell)^k polynomial
@@ -663,174 +820,64 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         Returns:
             Combined polynomial
         """
-        k = len(partition)
-
-        # Build node-to-cell mapping
-        node_to_cell: Dict[int, int] = {}
-        for i, cell_nodes in enumerate(partition):
-            for node in cell_nodes:
-                node_to_cell[node] = i
-
-        # Build the inter-cell graph and find its connected components
-        inter_graph = self._build_inter_cell_graph(graph, partition, inter_info)
-        inter_components = inter_graph.connected_components()
-
-        self._log(f"Inter-cell graph: {len(inter_components)} components, {inter_graph.edge_count()} total edges")
-
-        poly = base_poly
-
-        # Process each inter-cell component
-        for comp_idx, comp in enumerate(inter_components):
-            self._log(f"  Component {comp_idx}: {comp.node_count()} nodes, {comp.edge_count()} edges")
-            poly = self._process_inter_cell_component(
-                poly, comp, graph, partition, node_to_cell, k, comp_idx
-            )
-
-        return poly
-
-    def _process_inter_cell_component(
-        self,
-        base_poly: TuttePolynomial,
-        comp: Graph,
-        graph: Graph,
-        partition: List[Set[int]],
-        node_to_cell: Dict[int, int],
-        k: int,
-        comp_idx: int
-    ) -> TuttePolynomial:
-        """Process one inter-cell component via bridge/chord separation.
-
-        The first edge connecting previously disconnected cells is a BRIDGE
-        (multiply by x). Remaining edges are CHORDS processed edge-by-edge
-        using T(G+e) = T(G) + T(G/{u,v}).
-
-        Args:
-            base_poly: Current polynomial (cells with prior components)
-            comp: Inter-cell component to process
-            graph: Full graph
-            partition: Cell partition
-            node_to_cell: Node-to-cell mapping
-            k: Number of cells
-            comp_idx: Component index (for logging)
-
-        Returns:
-            Updated polynomial with this component's contribution
-        """
-        comp_edges = list(comp.edges)
-
-        # Identify bridge and chord edges
-        bridge_edge = None
-        chord_edges = []
-        cell_connected = [False] * k
-
-        for u, v in comp_edges:
-            cell_u = node_to_cell.get(u, -1)
-            cell_v = node_to_cell.get(v, -1)
-
-            if cell_u < 0 or cell_v < 0 or cell_u == cell_v:
-                chord_edges.append((u, v))
-                continue
-
-            if not cell_connected[cell_u] and not cell_connected[cell_v]:
-                cell_connected[cell_u] = True
-                cell_connected[cell_v] = True
-                bridge_edge = (u, v)
-            elif cell_connected[cell_u] != cell_connected[cell_v]:
-                cell_connected[cell_u] = True
-                cell_connected[cell_v] = True
-                bridge_edge = (u, v)
-            else:
-                chord_edges.append((u, v))
-
-        # Apply bridge
-        poly = base_poly
-        if bridge_edge is not None:
-            poly = TuttePolynomial.x() * poly
-            self._log(f"    Bridge: {bridge_edge}")
-
-        if not chord_edges:
-            return poly
-
-        # Process chords edge-by-edge
-        self._log(f"    Processing {len(chord_edges)} chords")
-        poly = self._process_component_chords(
-            poly, graph, partition, bridge_edge, chord_edges, node_to_cell
-        )
-
-        return poly
-
-    def _process_component_chords(
-        self,
-        base_poly: TuttePolynomial,
-        graph: Graph,
-        partition: List[Set[int]],
-        bridge_edge: Optional[Tuple[int, int]],
-        chord_edges: List[Tuple[int, int]],
-        node_to_cell: Dict[int, int]
-    ) -> TuttePolynomial:
-        """Process chord edges for one inter-cell component.
-
-        This method handles the chord additions for a single connected
-        component of inter-cell edges.
-        """
-        # Build initial multigraph: cells + bridge (if any)
+        # Build initial multigraph from ALL intra-cell edges
+        all_nodes: Set[int] = set()
         edge_counts: Dict[Tuple[int, int], int] = {}
         for cell_nodes in partition:
+            all_nodes.update(cell_nodes)
             for u, v in graph.edges:
                 if u in cell_nodes and v in cell_nodes:
                     edge = (min(u, v), max(u, v))
                     edge_counts[edge] = edge_counts.get(edge, 0) + 1
 
-        if bridge_edge is not None:
-            edge = (min(bridge_edge[0], bridge_edge[1]), max(bridge_edge[0], bridge_edge[1]))
-            edge_counts[edge] = edge_counts.get(edge, 0) + 1
-
         current_mg = MultiGraph(
-            nodes=graph.nodes,
+            nodes=frozenset(all_nodes),
             edge_counts=edge_counts,
             loop_counts={}
         )
 
+        # Initialize union-find: union all nodes within each cell
+        uf = UnionFind(all_nodes)
+        for cell_nodes in partition:
+            nodes_list = list(cell_nodes)
+            for i in range(1, len(nodes_list)):
+                uf.union(nodes_list[0], nodes_list[i])
+
+        # Classify inter-cell edges into bridges and chords
+        bridges = []
+        chords = []
+        for u, v in inter_info.edges:
+            if uf.find(u) != uf.find(v):
+                bridges.append((u, v))
+                uf.union(u, v)  # Now connected
+            else:
+                chords.append((u, v))
+
+        self._log(f"Inter-cell edges: {len(bridges)} bridges, {len(chords)} chords")
+
         poly = base_poly
 
-        # Process chords
-        for i, (u, v) in enumerate(chord_edges):
-            # Chord: T(G+e) = T(G) + T(G/{u,v})
+        # Process bridges first (cheap: T(G+e) = x * T(G))
+        for u, v in bridges:
+            poly = TuttePolynomial.x() * poly
+            edge = (min(u, v), max(u, v))
+            new_edge_counts = dict(current_mg.edge_counts)
+            new_edge_counts[edge] = new_edge_counts.get(edge, 0) + 1
+            current_mg = MultiGraph(
+                nodes=current_mg.nodes,
+                edge_counts=new_edge_counts,
+                loop_counts=current_mg.loop_counts
+            )
+
+        # Process chords (T(G+e) = T(G) + T(G/{u,v}))
+        for i, (u, v) in enumerate(chords):
             merged = current_mg.merge_nodes(u, v)
-            survivor = min(u, v)
-
-            # Check if merged node is a cut vertex
-            cut = merged.has_cut_vertex()
-
-            if cut is not None and cut == survivor:
-                # Cut vertex factorization: T(G/{u,v}) = product of components
-                components = merged.split_at_cut_vertex(cut)
-                self._log(f"      Chord {i+1}/{len(chord_edges)}: cut-vertex at {cut}")
-
-                merged_poly = TuttePolynomial.one()
-                for comp in components:
-                    cache_key = comp.canonical_key()
-                    if cache_key in self._multigraph_cache:
-                        comp_poly = self._multigraph_cache[cache_key]
-                    else:
-                        # Use skip_minor_search for intermediate merged graphs
-                        comp_poly = self._synthesize_multigraph(comp, skip_minor_search=True)
-                        self._multigraph_cache[cache_key] = comp_poly
-                    merged_poly = merged_poly * comp_poly
-            else:
-                # Full synthesis (with caching) - skip minor search for efficiency
-                cache_key = merged.canonical_key()
-                if cache_key in self._multigraph_cache:
-                    merged_poly = self._multigraph_cache[cache_key]
-                else:
-                    # Use skip_minor_search for intermediate merged graphs
-                    merged_poly = self._synthesize_multigraph(merged, skip_minor_search=True)
-                    self._multigraph_cache[cache_key] = merged_poly
-                self._log(f"      Chord {i+1}/{len(chord_edges)}: full synthesis")
+            merged_poly = self._synthesize_multigraph(merged, skip_minor_search=True)
+            self._log(f"  Chord {i+1}/{len(chords)}")
 
             poly = poly + merged_poly
 
-            # Update current multigraph
+            # Update running multigraph
             edge = (min(u, v), max(u, v))
             new_edge_counts = dict(current_mg.edge_counts)
             new_edge_counts[edge] = new_edge_counts.get(edge, 0) + 1
@@ -893,6 +940,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         # Compute base polynomial from disjoint tiles (product formula)
         poly = TuttePolynomial.one()
         recipe = [f"Tiling with {len(cover.tiles)} copies of {minor.name}"]
+        all_minors = {minor.name}
 
         for tile in cover.tiles:
             poly = poly * tile.minor.polynomial
@@ -946,7 +994,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             verified=verified,
             method="creation_expansion_join",
             tiles_used=len(cover.tiles),
-            fringe_edges=0
+            fringe_edges=0,
+            minors_used=all_minors,
         )
 
     def _synthesize_from_k2(
@@ -1075,11 +1124,14 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         # 1. Rainbow table lookup (still worthwhile - it's fast)
         cached = self.table.lookup(graph)
         if cached is not None:
+            entry = self.table.entries.get(cache_key)
+            entry_name = entry.name if entry else None
             result = SynthesisResult(
                 polynomial=cached,
                 recipe=["Rainbow table lookup"],
                 verified=True,
-                method="lookup"
+                method="lookup",
+                minors_used={entry_name} if entry_name else set(),
             )
             self._cache[cache_key] = result
             return result
@@ -1105,17 +1157,42 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             self._cache[cache_key] = result
             return result
 
-        # 3. Disconnected graphs
+        # 3. Disconnected graphs (recurse through _synthesize_fast, not full synthesize)
         components = graph.connected_components()
         if len(components) > 1:
-            result = self._synthesize_disconnected(components, max_depth)
+            poly = TuttePolynomial.one()
+            all_minors = set()
+            for comp in components:
+                comp_result = self._synthesize_fast(comp, max_depth)
+                poly = poly * comp_result.polynomial
+                all_minors |= comp_result.minors_used
+            result = SynthesisResult(
+                polynomial=poly,
+                recipe=[f"Disconnected: {len(components)} components (fast)"],
+                verified=True,
+                method="disjoint_union",
+                minors_used=all_minors,
+            )
             self._cache[cache_key] = result
             return result
 
-        # 4. Cut vertex factorization
+        # 4. Cut vertex factorization (recurse through _synthesize_fast, not full synthesize)
         cut = graph.has_cut_vertex()
         if cut is not None:
-            result = self._synthesize_via_cut_vertex(graph, cut, max_depth)
+            sub_components = graph.split_at_cut_vertex(cut)
+            poly = TuttePolynomial.one()
+            all_minors = set()
+            for comp in sub_components:
+                comp_result = self._synthesize_fast(comp, max_depth)
+                poly = poly * comp_result.polynomial
+                all_minors |= comp_result.minors_used
+            result = SynthesisResult(
+                polynomial=poly,
+                recipe=[f"Cut vertex at {cut}: {len(sub_components)} components (fast)"],
+                verified=True,
+                method="cut_vertex",
+                minors_used=all_minors,
+            )
             self._cache[cache_key] = result
             return result
 

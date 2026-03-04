@@ -14,7 +14,7 @@ This module also provides:
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, FrozenSet, List, Optional, Tuple, Set
 from .graph import Graph
 from .polynomial import TuttePolynomial
 
@@ -405,3 +405,130 @@ def compute_sp_tutte_if_applicable(graph: Graph) -> Optional[TuttePolynomial]:
         return None
 
     return compute_sp_tutte(tree)
+
+
+# =============================================================================
+# CHARACTERISTIC POLYNOMIAL VIA SP DECOMPOSITION
+# =============================================================================
+
+def compute_sp_chi_coeffs(graph: Graph) -> Optional[Dict[int, int]]:
+    """Compute chi(M(G); q) = (-1)^r * T(1-q, 0) for SP graphs.
+
+    Returns {power: coefficient} or None if graph is not SP.
+    Uses compute_sp_tutte() for T, then evaluates at (1-q, 0).
+    O(n) time via SP decomposition.
+    """
+    tutte = compute_sp_tutte_if_applicable(graph)
+    if tutte is None:
+        return None
+
+    return _chi_from_tutte(tutte, graph)
+
+
+def _chi_from_tutte(tutte: TuttePolynomial, graph: Graph) -> Dict[int, int]:
+    """Compute chi(M; q) from T(M; x, y) via chi(q) = (-1)^r * T(1-q, 0).
+
+    T(1-q, 0) means substitute x = 1-q, y = 0 in T(x, y).
+    Only terms with y_power == 0 survive.
+
+    For a term c * x^i * y^j:
+      If j > 0: contributes 0 (since y=0)
+      If j == 0: contributes c * (1-q)^i
+
+    Then multiply by (-1)^r.
+    """
+    # Compute rank
+    n = graph.node_count()
+    # For connected graph, rank = n - 1
+    # For general graph, rank = n - components
+    # We compute via edge count and y-degree: rank = x_degree of T
+    # Actually, for Tutte polynomial T(x,y), the x-degree = n - k where k = components
+    # Simpler: rank = number of edges in spanning forest
+    # For connected: rank = n-1, for disconnected: rank = n - num_components
+    # We can read it from T: rank = max x-power in T
+    rank = tutte.x_degree()
+
+    # Collect terms with y^0 (only x terms survive y=0)
+    # T(1-q, 0) = sum_{i} c_i * (1-q)^i  where c_i = coefficient(x^i, y^0)
+    x_coeffs: Dict[int, int] = {}
+    for (i, j), c in tutte.to_coefficients().items():
+        if j == 0:
+            x_coeffs[i] = c
+
+    if not x_coeffs:
+        return {0: 0}
+
+    # Expand sum c_i * (1-q)^i using binomial theorem
+    # (1-q)^i = sum_{k=0}^{i} C(i,k) * (-q)^k = sum_{k} C(i,k) * (-1)^k * q^k
+    from math import comb
+
+    chi_coeffs: Dict[int, int] = {}
+    for i, c_i in x_coeffs.items():
+        for k in range(i + 1):
+            binom = comb(i, k)
+            sign = (-1) ** k
+            contribution = c_i * binom * sign
+            chi_coeffs[k] = chi_coeffs.get(k, 0) + contribution
+
+    # Multiply by (-1)^r
+    sign_r = (-1) ** rank
+    result = {k: sign_r * v for k, v in chi_coeffs.items() if v != 0}
+
+    return result
+
+
+def compute_contraction_chi(
+    graph: Graph, flat: FrozenSet[Tuple[int, int]]
+) -> Optional[Dict[int, int]]:
+    """Compute chi(M(G)/W; q) by contracting flat W in graph G.
+
+    1. Contract flat edges (merge endpoints)
+    2. Try SP decomposition on contracted graph -> O(n) chi
+    3. If not SP, return None (caller should fall back to lattice chi)
+    """
+    if not flat:
+        return compute_sp_chi_coeffs(graph)
+
+    # Contract flat edges: merge endpoints
+    # Build union-find for contraction
+    all_nodes = set(graph.nodes)
+    parent = {v: v for v in all_nodes}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            if rx < ry:
+                parent[ry] = rx
+            else:
+                parent[rx] = ry
+
+    for u, v in flat:
+        union(u, v)
+
+    # Build contracted graph
+    node_map = {n: find(n) for n in all_nodes}
+    new_nodes = frozenset(node_map.values())
+
+    new_edges = set()
+    for u, v in graph.edges:
+        if (u, v) not in flat:
+            nu, nv = node_map[u], node_map[v]
+            if nu != nv:
+                edge = (min(nu, nv), max(nu, nv))
+                new_edges.add(edge)
+
+    if not new_edges:
+        # Contracted to a single vertex or no remaining edges
+        # chi(point; q) = 1
+        return {0: 1}
+
+    contracted_graph = Graph(nodes=new_nodes, edges=frozenset(new_edges))
+
+    # Try SP decomposition first (O(n))
+    return compute_sp_chi_coeffs(contracted_graph)
