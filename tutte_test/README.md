@@ -126,10 +126,10 @@ python -m pytest tutte_test/test_tutte.py -v --benchmark
 
 ```bash
 # Standalone benchmark
-python -m tutte_test.benchmark_tutte
+python -m tutte_test.benchmark_tutte --timeout 300 --nx-timeout 300
 
 # Compare two benchmark runs (e.g., across branches)
-python -m tutte_test.benchmark_tutte --compare results_tutte.json results_tutte2.json
+python -m tutte_test.benchmark_tutte --compare benchmark_results_0.json benchmark_results_1.json
 ```
 
 ## Performance vs NetworkX
@@ -137,13 +137,13 @@ python -m tutte_test.benchmark_tutte --compare results_tutte.json results_tutte2
 Speedup of Hybrid engine over NetworkX `nx.tutte_polynomial()` (deletion-contraction),
 measured from empty rainbow tables across 1000+ graphs:
 
-| Edges | Graphs | Hybrid avg | NX avg    | Speedup     |
-|-------|--------|------------|-----------|-------------|
-| 1-5   | ~200   | 0.1-0.5ms  | 0.5-5ms   | ~5-10x      |
-| 6-10  | ~500   | 0.3-2ms    | 5-100ms   | ~20-50x     |
-| 11-15 | ~250   | 1-5ms      | 100ms-5s  | ~100-500x   |
-| 16-19 | ~50    | 2-5ms      | 1-30s     | ~500-5000x  |
-| 20+   | ~10    | 3-10ms     | TIMEOUT   | -           |
+| Edges | Graphs | Hybrid avg | NX avg   | Speedup    |
+| ----- | ------ | ---------- | -------- | ---------- |
+| 1-5   | ~200   | 0.1-0.5ms  | 0.5-5ms  | ~5-10x     |
+| 6-10  | ~500   | 0.3-2ms    | 5-100ms  | ~20-50x    |
+| 11-15 | ~250   | 1-5ms      | 100ms-5s | ~100-500x  |
+| 16-19 | ~50    | 2-5ms      | 1-30s    | ~500-5000x |
+| 20+   | ~10    | 3-10ms     | TIMEOUT  | -          |
 
 Key graph timings (Hybrid engine, empty table):
 

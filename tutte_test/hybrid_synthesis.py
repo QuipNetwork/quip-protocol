@@ -47,7 +47,7 @@ class HybridSynthesisResult:
     algebraic_steps: int = 0
     tiling_steps: int = 0
     dc_steps: int = 0  # Should be 0 in ideal case
-    minors_used: Set[str] = field(default_factory=set)  # Names of table entries used
+    minors_used: Set[str] = field(default_factory=set)  # Canonical keys of table entries used
 
     def __repr__(self) -> str:
         status = "✓" if self.verified else "✗"
@@ -93,6 +93,7 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         # Caches
         self._cache: Dict[str, HybridSynthesisResult] = {}
         self._multigraph_cache: Dict[str, TuttePolynomial] = {}
+        self._mg_minors_accum: Set[str] = set()  # Accumulates minors found during multigraph synthesis
 
         # Statistics
         self._stats = {'algebraic': 0, 'tiling': 0, 'dc': 0, 'lookup': 0}
@@ -140,15 +141,13 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         if cached is not None:
             self._log("Direct lookup hit")
             self._stats['lookup'] += 1
-            entry = self.table.entries.get(cache_key)
-            entry_name = entry.name if entry else None
             result = HybridSynthesisResult(
                 polynomial=cached,
                 method="lookup",
                 decomposition=["table"],
                 recipe=["Rainbow table lookup"],
                 verified=True,
-                minors_used={entry_name} if entry_name else set(),
+                minors_used={cache_key} if cache_key in self.table.entries else set(),
             )
             self._cache[cache_key] = result
             return result
@@ -333,6 +332,9 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                 tiling_steps=1
             )
 
+        # Snapshot accumulator to diff later
+        pre_minors = set(self._mg_minors_accum)
+
         # Find spanning tree via BFS
         tree_edges = set()
         visited = set()
@@ -386,12 +388,16 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
 
         recipe.append(f"Final: {poly.num_terms()} terms")
 
+        # Harvest minors discovered during chord addition
+        new_minors = self._mg_minors_accum - pre_minors
+
         return HybridSynthesisResult(
             polynomial=poly,
             method="tiling",
             decomposition=["spanning_tree", f"{len(chords)}_chords"],
             recipe=recipe,
-            tiling_steps=1 + len(chords)
+            tiling_steps=1 + len(chords),
+            minors_used=new_minors,
         )
 
 

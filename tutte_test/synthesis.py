@@ -161,6 +161,13 @@ class BaseMultigraphSynthesizer:
                     result = self._synthesize_fast(simple, max_depth)
                 else:
                     result = self.synthesize(simple, max_depth)
+                # Track minors: both from sub-synthesis AND table entry identity
+                if hasattr(self, '_mg_minors_accum'):
+                    self._mg_minors_accum |= result.minors_used
+                    # If this graph is a known table entry, track it as a used minor
+                    simple_key = simple.canonical_key()
+                    if simple_key in self.table.entries:
+                        self._mg_minors_accum.add(simple_key)
                 self._multigraph_cache[cache_key] = result.polynomial
                 return result.polynomial
 
@@ -319,7 +326,7 @@ class SynthesisResult:
     method: str = "unknown"
     tiles_used: int = 0
     fringe_edges: int = 0
-    minors_used: Set[str] = field(default_factory=set)  # Names of table entries used
+    minors_used: Set[str] = field(default_factory=set)  # Canonical keys of table entries used
 
     def __repr__(self) -> str:
         status = "verified" if self.verified else "unverified"
@@ -349,6 +356,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         self._cache: Dict[str, SynthesisResult] = {}
         self._multigraph_cache: Dict[str, TuttePolynomial] = {}  # For multigraph polynomials
         self._inter_cell_cache: Dict[str, TuttePolynomial] = {}  # For inter-cell graph polynomials
+        self._mg_minors_accum: Set[str] = set()  # Accumulates minors found during multigraph synthesis
 
     def _log(self, msg: str) -> None:
         """Print message if verbose."""
@@ -381,14 +389,12 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         cached = self.table.lookup(graph)
         if cached is not None:
             self._log("Direct rainbow table lookup")
-            entry = self.table.entries.get(cache_key)
-            entry_name = entry.name if entry else None
             result = SynthesisResult(
                 polynomial=cached,
                 recipe=["Rainbow table lookup"],
                 verified=True,
                 method="lookup",
-                minors_used={entry_name} if entry_name else set(),
+                minors_used={cache_key} if cache_key in self.table.entries else set(),
             )
             self._cache[cache_key] = result
             return result
@@ -582,7 +588,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         """
         k = len(partition)
         recipe = [f"Hierarchical: {k} × {cell.name} cells"]
-        all_minors = {cell.name}
+        all_minors = {cell.canonical_key}
 
         # Step 1: Base polynomial = T(cell)^k (disjoint cells)
         base_poly = TuttePolynomial.one()
@@ -940,7 +946,10 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         # Compute base polynomial from disjoint tiles (product formula)
         poly = TuttePolynomial.one()
         recipe = [f"Tiling with {len(cover.tiles)} copies of {minor.name}"]
-        all_minors = {minor.name}
+        all_minors = {minor.canonical_key}
+
+        # Snapshot accumulator before edge addition
+        pre_minors = set(self._mg_minors_accum)
 
         for tile in cover.tiles:
             poly = poly * tile.minor.polynomial
@@ -985,6 +994,9 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                     loop_counts=current_mg.loop_counts
                 )
 
+        # Harvest minors from edge addition
+        all_minors |= (self._mg_minors_accum - pre_minors)
+
         # Verify
         verified = verify_spanning_trees(graph, poly)
 
@@ -1025,6 +1037,9 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 verified=True,
                 method="base_case"
             )
+
+        # Snapshot accumulator to diff later
+        pre_minors = set(self._mg_minors_accum)
 
         recipe = ["Spanning tree + edge addition"]
 
@@ -1084,11 +1099,15 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
 
         recipe.append(f"Final polynomial has {poly.num_terms()} terms")
 
+        # Harvest minors discovered during chord addition
+        new_minors = self._mg_minors_accum - pre_minors
+
         return SynthesisResult(
             polynomial=poly,
             recipe=recipe,
             verified=True,
-            method="spanning_tree_expansion"
+            method="spanning_tree_expansion",
+            minors_used=new_minors,
         )
 
     def _synthesize_fast(
@@ -1124,14 +1143,12 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         # 1. Rainbow table lookup (still worthwhile - it's fast)
         cached = self.table.lookup(graph)
         if cached is not None:
-            entry = self.table.entries.get(cache_key)
-            entry_name = entry.name if entry else None
             result = SynthesisResult(
                 polynomial=cached,
                 recipe=["Rainbow table lookup"],
                 verified=True,
                 method="lookup",
-                minors_used={entry_name} if entry_name else set(),
+                minors_used={cache_key} if cache_key in self.table.entries else set(),
             )
             self._cache[cache_key] = result
             return result
@@ -1223,6 +1240,9 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 method="base_case"
             )
 
+        # Snapshot accumulator to diff later
+        pre_minors = set(self._mg_minors_accum)
+
         recipe = ["Spanning tree + edge addition (fast)"]
 
         # Find spanning tree using BFS
@@ -1278,11 +1298,15 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
 
         recipe.append(f"Final: {poly.num_terms()} terms")
 
+        # Harvest minors discovered during chord addition
+        new_minors = self._mg_minors_accum - pre_minors
+
         return SynthesisResult(
             polynomial=poly,
             recipe=recipe,
             verified=True,
-            method="spanning_tree_expansion_fast"
+            method="spanning_tree_expansion_fast",
+            minors_used=new_minors,
         )
 
     # =========================================================================

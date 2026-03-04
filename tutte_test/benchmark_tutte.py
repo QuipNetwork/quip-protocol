@@ -445,6 +445,15 @@ def save_results(results, cej_table=None):
     print(f"\nResults saved to {out_path}")
 
     if cej_table and len(cej_table) > 0:
+        # Compute comprehensive structural minor relationships
+        print(f"\nComputing structural minor relationships for {len(cej_table)} entries...")
+        t0 = time.perf_counter()
+        relationships = cej_table.compute_minor_relationships()
+        elapsed = time.perf_counter() - t0
+        total_minors = sum(len(v) for v in relationships.values())
+        print(f"Found {total_minors} minor relationships across "
+              f"{len(relationships)} entries ({elapsed:.1f}s)")
+
         json_path = os.path.join(base_dir, "tutte_rainbow_table.json")
         bin_path = os.path.join(base_dir, "tutte_rainbow_table.bin")
         cej_table.save(json_path)
