@@ -23,7 +23,7 @@ import dimod
 import cupy as cp
 import numpy as np
 
-from GPU.sampler_utils import _default_ising_beta_range
+from shared.beta_schedule import _default_ising_beta_range
 from shared.quantum_proof_of_work import DEFAULT_TOPOLOGY
 
 
@@ -35,9 +35,9 @@ class IsingJob:
     num_reads: int
     num_sweeps: int
     num_sweeps_per_beta: int
-    beta_schedule: Optional[np.ndarray] = None
+    beta_schedule: Optional[np.ndarray] = None  # Temperature schedule for this job
     seed: Optional[int] = None
-    job_id: Optional[int] = None
+    job_id: Optional[int] = None  # Assigned by sampler
 
 
 class CudaKernelMock:

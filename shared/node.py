@@ -241,19 +241,25 @@ class Node:
                 return self.chain[i]
         return None
 
-    async def check_block(self, block: Block, force_reorg: bool = False) -> bool:
+    async def check_block(self, block: Block, force_reorg: bool = False) -> tuple[bool, str | None]:
         """Check if a block is valid and can be accepted.
 
         Args:
             block: The block to check.
             force_reorg: If True, skip timestamp comparison to allow chain reorganization
                         during sync (longest chain wins). Default False.
+
+        Returns:
+            Tuple of (accepted: bool, rejection_reason: str | None).
+            If accepted is True, rejection_reason is None.
+            If accepted is False, rejection_reason contains the reason for rejection.
         """
         # 1. Check if we already have this block or a newer one at this index
         cur_block = self.get_block(block.header.index)
         if not block.hash or not block.raw or not block.signature:
-            self.logger.error(f"Block {block.header.index} rejected: missing hash, raw, or signature - it's not been finalized/signed.")
-            return False
+            reason = "missing hash, raw, or signature - it's not been finalized/signed"
+            self.logger.error(f"Block {block.header.index} rejected: {reason}")
+            return False, reason
 
         if cur_block is not None:
             if not cur_block.hash:
@@ -261,19 +267,22 @@ class Node:
 
             # We should not process duplicates...
             if cur_block.hash == block.hash:
+                reason = "duplicate block"
                 self.logger.warning(f"Block {block.header.index}-{block.hash.hex()[:8]} is a duplicate, ignoring...")
-                return False
+                return False, reason
 
             # Skip timestamp comparison during forced reorg (sync mode - longest chain wins)
             if not force_reorg:
                 # Compare timestamps first - prefer older blocks
                 if cur_block.header.timestamp < block.header.timestamp:
+                    reason = f"older block exists (ours: {cur_block.header.timestamp} < incoming: {block.header.timestamp})"
                     self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have an older block at this index (ours: {cur_block.header.timestamp} < incoming: {block.header.timestamp}), keeping {cur_block.hash.hex()[:8]}")
-                    return False
+                    return False, reason
                 elif cur_block.header.timestamp == block.header.timestamp:
                     if cur_block.hash > block.hash:
+                        reason = "same timestamp, larger hash exists"
                         self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have a block with same timestamp and larger hash at this index, {cur_block.hash.hex()[:8]}")
-                        return False
+                        return False, reason
             else:
                 self.logger.info(f"Block {block.header.index}-{block.hash.hex()[:8]} accepting via force_reorg (replacing {cur_block.hash.hex()[:8]})")
             
@@ -283,13 +292,15 @@ class Node:
             raise RuntimeError("Head block is not finalized!")
     
         if head.header.index > block.header.index + 6:
+            reason = f"too old (chain is at {head.header.index}, block is {block.header.index})"
             self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have more than 6 blocks after it ({head.header.index} > {block.header.index + 6})")
-            return False
+            return False, reason
 
         prev_block = self.get_block(block.header.index - 1)
         if prev_block is None or prev_block.hash is None:
+            reason = f"missing previous block ({block.header.index - 1})"
             self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we do not have the previous block ({block.header.index - 1})")
-            return False
+            return False, reason
 
         if prev_block.hash != block.header.previous_hash:
             if force_reorg:
@@ -305,34 +316,39 @@ class Node:
                         self.chain = self.chain[:ancestor.header.index + 1]
                     prev_block = ancestor
                 else:
+                    reason = f"cannot find ancestor with hash {block.header.previous_hash.hex()[:8]}"
                     self.logger.error(
                         f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: cannot find ancestor "
                         f"with hash {block.header.previous_hash.hex()[:8]} in last 6 blocks"
                     )
-                    return False
+                    return False, reason
             else:
+                reason = f"previous hash mismatch ({prev_block.hash.hex()[:8]} != {block.header.previous_hash.hex()[:8]})"
                 self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: previous hash mismatch ({prev_block.hash.hex()[:8]} != {block.header.previous_hash.hex()[:8]})")
-                return False
+                return False, reason
 
         # 3. Check Signature
         # FIXME: We are not even bothering with checking against known miner info right now.
         block_bytes = block.raw
         signature = block.signature
         if not block_bytes or not signature:
-            self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: missing block bytes or signature")
-            return False
+            reason = "missing block bytes or signature"
+            self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: {reason}")
+            return False, reason
         if not self.crypto.verify_combined_signature(
             block.miner_info.ecdsa_public_key,
             block.miner_info.wots_public_key,
             block_bytes,
             signature
         ):
-            self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid signature")
-            return False
+            reason = "invalid signature"
+            self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: {reason}")
+            return False, reason
 
         # 4. Validate the Quantum Proof and other block artifacts.
         block.quantum_proof.compute_derived_fields()
         if not validate_block(block, prev_block):
+            reason = "invalid quantum proof"
             self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid quantum proof (miner: {block.miner_info.miner_id})")
             qpjson = block.quantum_proof.to_json()
             qpjson['proof_data'] = qpjson['proof_data'][:10] + "..."
@@ -351,20 +367,26 @@ class Node:
                 f"decayed_energy={actual_req.difficulty_energy:.2f}"
             )
             self.logger.error(f"Quantum Proof: {json.dumps(qpjson)}, rq: {actual_req.to_json()}")
-            return False
+            return False, reason
 
-        return True
+        return True, None
 
-    async def receive_block(self, block: Block, force_reorg: bool = False) -> bool:
+    async def receive_block(self, block: Block, force_reorg: bool = False) -> tuple[bool, str | None]:
         """Receive a block from the network.
 
         Args:
             block: The block to receive.
             force_reorg: If True, skip timestamp comparison to allow chain reorganization
                         during sync (longest chain wins). Default False.
+
+        Returns:
+            Tuple of (accepted: bool, rejection_reason: str | None).
+            If accepted is True, rejection_reason is None.
+            If accepted is False, rejection_reason contains the reason for rejection.
         """
-        if not await self.check_block(block, force_reorg=force_reorg):
-            return False
+        accepted, reason = await self.check_block(block, force_reorg=force_reorg)
+        if not accepted:
+            return False, reason
 
         head = self.get_latest_block()
         async with self.chain_lock:
@@ -382,7 +404,7 @@ class Node:
         # Emit an event so we can stop mining and potentially broadcast to other nodes
         asyncio.create_task(self._emit_block_mined(block))
 
-        return True
+        return True, None
 
     async def _emit_mining_started(self, block: Block) -> None:
         """Emit mining started event with sync callback."""

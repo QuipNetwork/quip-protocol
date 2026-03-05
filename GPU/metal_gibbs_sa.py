@@ -19,18 +19,98 @@ Key algorithm (from BlockSampler):
 
 import logging
 import os
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import dimod
 import Metal
 import numpy as np
 
-from GPU.sampler_utils import (
-    build_csr_from_ising,
-    compute_beta_schedule,
-    compute_color_blocks,
-    unpack_packed_results,
-)
+from GPU.metal_utils import _create_buffer, build_csr_from_ising, compute_beta_schedule, unpack_metal_results
+
+
+def zephyr_four_color_linear(linear_idx: int, m: int = 9, t: int = 2) -> int:
+    """Compute 4-color for Zephyr node given linear index.
+
+    Converts linear index to Zephyr coordinates, then applies coloring.
+    Based on dwave_networkx.zephyr_four_color scheme 0.
+
+    The Zephyr linear index encoding is:
+        r = u * M * t * 2 * m + w * t * 2 * m + k * 2 * m + j * m + z
+    where M = 2*m + 1
+
+    We reverse this to get (u, w, k, j, z), then apply:
+        color = j + ((w + 2*(z+u) + j) & 2)
+
+    Args:
+        linear_idx: Linear node index
+        m: Zephyr m parameter (default 9 for Z(9,2))
+        t: Zephyr t parameter (default 2)
+
+    Returns:
+        Color index (0-3)
+    """
+    M = 2 * m + 1  # = 19 for m=9
+
+    # Decode linear index to Zephyr coordinates
+    r = linear_idx
+    r, z = divmod(r, m)
+    r, j = divmod(r, 2)
+    r, k = divmod(r, t)
+    u, w = divmod(r, M)
+
+    # Apply zephyr_four_color scheme 0
+    return j + ((w + 2 * (z + u) + j) & 2)
+
+
+def compute_color_blocks(nodes: List[int], m: int = 9, t: int = 2) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute color block partitions for Zephyr topology.
+
+    Partitions nodes by their graph coloring. For Zephyr topologies,
+    this produces 4 independent sets where no two adjacent nodes
+    share the same color.
+
+    Args:
+        nodes: List of node indices
+        m: Zephyr m parameter
+        t: Zephyr t parameter
+
+    Returns:
+        Tuple of (block_starts, block_counts, color_node_indices)
+        - block_starts: [4] start indices into color_node_indices
+        - block_counts: [4] number of nodes per color
+        - color_node_indices: [N] nodes sorted by color
+    """
+    # Compute color for each node
+    node_colors = {node: zephyr_four_color_linear(node, m, t) for node in nodes}
+
+    # Group nodes by color
+    color_groups = defaultdict(list)
+    for node in nodes:
+        color_groups[node_colors[node]].append(node)
+
+    # Sort each color group for determinism
+    for color in color_groups:
+        color_groups[color].sort()
+
+    # Build output arrays
+    num_colors = 4
+    block_starts = np.zeros(num_colors, dtype=np.int32)
+    block_counts = np.zeros(num_colors, dtype=np.int32)
+
+    # Concatenate all color groups
+    color_node_indices = []
+    current_start = 0
+    for color in range(num_colors):
+        nodes_in_color = color_groups.get(color, [])
+        block_starts[color] = current_start
+        block_counts[color] = len(nodes_in_color)
+        color_node_indices.extend(nodes_in_color)
+        current_start += len(nodes_in_color)
+
+    color_node_indices = np.array(color_node_indices, dtype=np.int32)
+
+    return block_starts, block_counts, color_node_indices
 
 
 class MetalGibbsSampler:
@@ -43,14 +123,20 @@ class MetalGibbsSampler:
        - For each color block:
          - Compute effective field for all nodes in block
          - Sample new spins (Gibbs) or accept/reject flips (Metropolis)
+
+    Two execution modes:
+    - Sequential (parallel=False): One thread per sample, nodes updated sequentially within colors
+    - Parallel (parallel=True): One threadgroup per sample, threads divide nodes within colors,
+      with barriers between colors for true parallel Gibbs updates
     """
 
-    def __init__(self, topology=None, update_mode: str = "gibbs"):
+    def __init__(self, topology=None, update_mode: str = "gibbs", parallel: bool = False):
         """Initialize Metal Gibbs sampler.
 
         Args:
             topology: Topology object (default: DEFAULT_TOPOLOGY)
             update_mode: "gibbs" or "metropolis" (default: "gibbs")
+            parallel: Use parallel kernel with threadgroup barriers (default: False)
         """
         self.logger = logging.getLogger(__name__)
         self.device = Metal.MTLCreateSystemDefaultDevice()
@@ -61,6 +147,7 @@ class MetalGibbsSampler:
             raise ValueError(f"update_mode must be 'gibbs' or 'metropolis', got {update_mode}")
         self.update_mode = 0 if update_mode.lower() == "gibbs" else 1
         self.update_mode_name = update_mode.lower()
+        self.parallel = parallel
 
         # Set up topology
         from dwave_topologies import DEFAULT_TOPOLOGY
@@ -83,8 +170,9 @@ class MetalGibbsSampler:
         self.num_colors = 4
 
         self.logger.debug(f"Color block sizes: {self.block_counts}")
+        self.logger.debug(f"Parallel mode: {self.parallel}")
 
-        # Load and compile Metal kernel
+        # Load and compile Metal kernels
         kernel_path = os.path.join(os.path.dirname(__file__), "metal_gibbs.metal")
         with open(kernel_path, 'r') as f:
             kernel_source = f.read()
@@ -95,6 +183,7 @@ class MetalGibbsSampler:
         if not lib:
             raise RuntimeError("Failed to create Metal library (no error reported)")
 
+        # Load sequential kernel
         self._kernel = lib.newFunctionWithName_("block_gibbs_sampler")
         if not self._kernel:
             function_names = [lib.functionNames()[i] for i in range(len(lib.functionNames()))]
@@ -102,22 +191,19 @@ class MetalGibbsSampler:
 
         self._pipeline, err = self.device.newComputePipelineStateWithFunction_error_(self._kernel, None)
         if err or not self._pipeline:
-            raise RuntimeError(f"Failed to create pipeline: {err}")
+            raise RuntimeError(f"Failed to create sequential pipeline: {err}")
+
+        # Load parallel kernel
+        self._kernel_parallel = lib.newFunctionWithName_("block_gibbs_parallel")
+        if not self._kernel_parallel:
+            function_names = [lib.functionNames()[i] for i in range(len(lib.functionNames()))]
+            raise RuntimeError(f"Failed to find block_gibbs_parallel kernel. Available: {function_names}")
+
+        self._pipeline_parallel, err = self.device.newComputePipelineStateWithFunction_error_(self._kernel_parallel, None)
+        if err or not self._pipeline_parallel:
+            raise RuntimeError(f"Failed to create parallel pipeline: {err}")
 
         self._command_queue = self.device.newCommandQueue()
-
-    def _create_buffer(self, data: np.ndarray, label: str = ""):
-        """Create a Metal buffer from numpy array."""
-        if not data.flags['C_CONTIGUOUS']:
-            data = np.ascontiguousarray(data)
-        byte_data = data.tobytes()
-        byte_length = len(byte_data)
-        buf = self.device.newBufferWithBytes_length_options_(
-            byte_data, byte_length, Metal.MTLResourceStorageModeShared
-        )
-        if not buf:
-            raise RuntimeError(f"Failed to create buffer: {label}")
-        return buf
 
     def sample_ising(
         self,
@@ -156,9 +242,39 @@ class MetalGibbsSampler:
         self.logger.debug(f"[MetalGibbs] Processing {num_problems} problems, {num_reads} reads each, {num_sweeps} sweeps")
 
         # Build concatenated CSR arrays for all problems
-        (all_csr_row_ptr, all_csr_col_ind, all_csr_J_vals, all_h_vals,
-         row_ptr_offsets, col_ind_offsets, node_to_idx_list, N_list) = \
-            build_csr_from_ising(h, J)
+        all_csr_row_ptr = []
+        all_csr_col_ind = []
+        all_csr_J_vals = []
+        all_h_vals = []
+        row_ptr_offsets = [0]
+        col_ind_offsets = [0]
+        node_to_idx_list = []
+        N_list = []
+
+        for prob_idx, (h_prob, J_prob) in enumerate(zip(h, J)):
+            # Build CSR representation for this problem
+            csr_row_ptr, csr_col_ind, csr_J_vals, h_vals_array, node_to_idx, N = build_csr_from_ising(
+                h_prob, J_prob, use_float=False
+            )
+            N_list.append(N)
+            node_to_idx_list.append(node_to_idx)
+
+            # Append to concatenated arrays
+            all_csr_row_ptr.extend(csr_row_ptr)
+            all_csr_col_ind.extend(csr_col_ind)
+            all_csr_J_vals.extend(csr_J_vals)
+            all_h_vals.extend(h_vals_array)
+
+            row_ptr_offsets.append(len(all_csr_row_ptr))
+            col_ind_offsets.append(len(all_csr_col_ind))
+
+        # Convert to numpy arrays
+        all_csr_row_ptr = np.array(all_csr_row_ptr, dtype=np.int32)
+        all_csr_col_ind = np.array(all_csr_col_ind, dtype=np.int32)
+        all_csr_J_vals = np.array(all_csr_J_vals, dtype=np.int8)
+        all_h_vals = np.array(all_h_vals, dtype=np.int8)
+        row_ptr_offsets = np.array(row_ptr_offsets, dtype=np.int32)
+        col_ind_offsets = np.array(col_ind_offsets, dtype=np.int32)
 
         N = N_list[0]
         if not all(n == N for n in N_list):
@@ -166,8 +282,7 @@ class MetalGibbsSampler:
 
         # Compute beta schedule
         beta_schedule, beta_range = compute_beta_schedule(
-            h[0], J[0], num_sweeps, num_sweeps_per_beta,
-            beta_range, beta_schedule_type, beta_schedule,
+            h[0], J[0], num_sweeps, num_sweeps_per_beta, beta_range, beta_schedule_type, beta_schedule
         )
 
         self.logger.debug(f"[MetalGibbs] Beta schedule: {len(beta_schedule)} betas from {beta_schedule[0]:.4f} to {beta_schedule[-1]:.4f}")
@@ -177,18 +292,27 @@ class MetalGibbsSampler:
             seed = np.random.randint(0, 2**31)
 
         # Create Metal buffers
-        csr_row_ptr_buf = self._create_buffer(all_csr_row_ptr, "csr_row_ptr")
-        csr_col_ind_buf = self._create_buffer(all_csr_col_ind, "csr_col_ind")
-        csr_J_vals_buf = self._create_buffer(all_csr_J_vals, "csr_J_vals")
-        row_ptr_offsets_buf = self._create_buffer(row_ptr_offsets, "row_ptr_offsets")
-        col_ind_offsets_buf = self._create_buffer(col_ind_offsets, "col_ind_offsets")
-        csr_h_vals_buf = self._create_buffer(all_h_vals, "csr_h_vals")
-        beta_schedule_buf = self._create_buffer(beta_schedule, "beta_schedule")
+        csr_row_ptr_buf = _create_buffer(self.device, all_csr_row_ptr, "csr_row_ptr")
+        csr_col_ind_buf = _create_buffer(self.device, all_csr_col_ind, "csr_col_ind")
+        csr_J_vals_buf = _create_buffer(self.device, all_csr_J_vals, "csr_J_vals")
+        row_ptr_offsets_buf = _create_buffer(self.device, row_ptr_offsets, "row_ptr_offsets")
+        col_ind_offsets_buf = _create_buffer(self.device, col_ind_offsets, "col_ind_offsets")
+        csr_h_vals_buf = _create_buffer(self.device, all_h_vals, "csr_h_vals")
+        beta_schedule_buf = _create_buffer(self.device, beta_schedule, "beta_schedule")
 
         # Color block buffers
-        color_block_starts_buf = self._create_buffer(self.block_starts, "color_block_starts")
-        color_block_counts_buf = self._create_buffer(self.block_counts, "color_block_counts")
-        color_node_indices_buf = self._create_buffer(self.color_node_indices, "color_node_indices")
+        # Remap color_node_indices from topology node IDs to dense CSR indices.
+        # Topology node IDs can be non-contiguous (e.g., Advantage2 has 4582 nodes
+        # with IDs spanning 0-4799 due to dead qubits). The CSR structure uses dense
+        # indices 0..N-1, so we must translate.
+        node_to_idx = node_to_idx_list[0]  # All problems share same topology
+        csr_color_node_indices = np.array(
+            [node_to_idx[n] for n in self.color_node_indices],
+            dtype=np.int32
+        )
+        color_block_starts_buf = _create_buffer(self.device, self.block_starts, "color_block_starts")
+        color_block_counts_buf = _create_buffer(self.device, self.block_counts, "color_block_counts")
+        color_node_indices_buf = _create_buffer(self.device, csr_color_node_indices, "color_node_indices")
 
         # Scalar parameters
         N_bytes = np.int32(N).tobytes()
@@ -218,7 +342,15 @@ class MetalGibbsSampler:
         cmd_buf = self._command_queue.commandBuffer()
         encoder = cmd_buf.computeCommandEncoder()
 
-        encoder.setComputePipelineState_(self._pipeline)
+        # Select kernel based on parallel mode
+        if self.parallel:
+            pipeline = self._pipeline_parallel
+            kernel_name = "block_gibbs_parallel"
+        else:
+            pipeline = self._pipeline
+            kernel_name = "block_gibbs_sampler"
+
+        encoder.setComputePipelineState_(pipeline)
 
         # Buffer bindings (must match kernel parameter order)
         encoder.setBuffer_offset_atIndex_(csr_row_ptr_buf, 0, 0)
@@ -250,21 +382,34 @@ class MetalGibbsSampler:
         encoder.setBytes_length_atIndex_(update_mode_bytes, len(update_mode_bytes), 19)
         encoder.setBytes_length_atIndex_(num_colors_bytes, len(num_colors_bytes), 20)
 
-        # Dispatch configuration
-        max_threadgroups = self._pipeline.maxTotalThreadsPerThreadgroup()
+        # Dispatch configuration depends on kernel mode
+        if self.parallel:
+            # Parallel kernel: one threadgroup per sample, multiple threads per group
+            # Each threadgroup collaboratively updates one sample
+            num_samples = num_problems * num_reads
 
-        if num_problems > max_threadgroups:
-            raise ValueError(f"Too many problems ({num_problems}) for device capacity ({max_threadgroups})")
+            # Use 256 threads per threadgroup (good balance for color block parallelism)
+            # For ~342 nodes/color, 256 threads means each thread handles ~1-2 nodes
+            threads_per_group = min(256, pipeline.maxTotalThreadsPerThreadgroup())
 
-        num_threadgroups_width = num_problems
-        threads_per_threadgroup_width = num_reads
+            threads_per_threadgroup = Metal.MTLSize(width=threads_per_group, height=1, depth=1)
+            num_threadgroups_size = Metal.MTLSize(width=num_samples, height=1, depth=1)
 
-        threads_per_threadgroup = Metal.MTLSize(width=threads_per_threadgroup_width, height=1, depth=1)
-        num_threadgroups = Metal.MTLSize(width=num_threadgroups_width, height=1, depth=1)
+            self.logger.debug(f"[MetalGibbs] Parallel dispatch ({kernel_name}): {num_samples} threadgroups x {threads_per_group} threads")
+        else:
+            # Sequential kernel: one thread per sample
+            max_threads_per_group = pipeline.maxTotalThreadsPerThreadgroup()
 
-        self.logger.debug(f"[MetalGibbs] Dispatch: {num_threadgroups.width} threadgroups x {threads_per_threadgroup.width} threads")
+            # Group samples by problem for locality
+            num_threadgroups_width = num_problems
+            threads_per_threadgroup_width = min(num_reads, max_threads_per_group)
 
-        encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_threadgroups, threads_per_threadgroup)
+            threads_per_threadgroup = Metal.MTLSize(width=threads_per_threadgroup_width, height=1, depth=1)
+            num_threadgroups_size = Metal.MTLSize(width=num_threadgroups_width, height=1, depth=1)
+
+            self.logger.debug(f"[MetalGibbs] Sequential dispatch ({kernel_name}): {num_threadgroups_width} threadgroups x {threads_per_threadgroup_width} threads")
+
+        encoder.dispatchThreadgroups_threadsPerThreadgroup_(num_threadgroups_size, threads_per_threadgroup)
 
         encoder.endEncoding()
         cmd_buf.commit()
@@ -288,12 +433,21 @@ class MetalGibbsSampler:
 
         self.logger.debug(f"[MetalGibbs] Energy range: [{energies_data.min()}, {energies_data.max()}]")
 
-        return unpack_packed_results(
-            packed_data, energies_data, num_problems, num_reads, N,
-            node_to_idx_list,
-            info={
-                "beta_range": beta_range,
-                "beta_schedule_type": beta_schedule_type,
-                "update_mode": self.update_mode_name,
-            },
-        )
+        # Parse into separate SampleSets
+        samplesets = []
+        for prob_idx in range(num_problems):
+            start_idx = prob_idx * num_reads
+            end_idx = (prob_idx + 1) * num_reads
+
+            prob_packed = packed_data[start_idx:end_idx]
+            prob_energies = energies_data[start_idx:end_idx]
+
+            # Unpack and build SampleSet
+            sampleset = unpack_metal_results(
+                prob_packed, prob_energies, N, num_reads, node_to_idx_list[prob_idx],
+                beta_range, beta_schedule_type,
+                update_mode=self.update_mode_name
+            )
+            samplesets.append(sampleset)
+
+        return samplesets

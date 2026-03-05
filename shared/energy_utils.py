@@ -62,9 +62,9 @@ def expected_solution_energy(
 
     Example Calibration (Advantage2 topology):
     --------------------------------------------
-    - N = 4,593 nodes
-    - M = 41,796 edges
-    - avg_degree = 2 × 41,796 / 4,593 ≈ 18.2
+    - N = 4,580 nodes
+    - M = 41,567 edges
+    - avg_degree = 2 × 41,567 / 4,580 ≈ 18.2
     - √(avg_degree) ≈ 4.27
     - Observed GSE ≈ -15,700
     - Implied c ≈ 15,700 / (4.27 × 4,593) ≈ 0.80

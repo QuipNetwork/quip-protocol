@@ -20,7 +20,7 @@ from typing import Optional, Dict, Tuple
 import cupy as cp
 import numpy as np
 
-from GPU.sampler_utils import _default_ising_beta_range  # noqa: F401
+from shared.beta_schedule import _default_ising_beta_range
 
 
 def _load_cudart():

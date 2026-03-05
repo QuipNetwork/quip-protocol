@@ -19,12 +19,7 @@ import dimod
 import Metal
 import numpy as np
 
-from GPU.sampler_utils import (
-    _default_ising_beta_range,
-    build_csr_from_ising,
-    compute_beta_schedule,
-    unpack_packed_results,
-)
+from GPU.metal_utils import _create_buffer, build_csr_from_ising, compute_beta_schedule, unpack_metal_results
 
 
 class MetalSASampler:
@@ -76,19 +71,6 @@ class MetalSASampler:
 
         self._command_queue = self.device.newCommandQueue()
 
-    def _create_buffer(self, data: np.ndarray, label: str = ""):
-        """Create a Metal buffer from numpy array."""
-        if not data.flags['C_CONTIGUOUS']:
-            data = np.ascontiguousarray(data)
-        byte_data = data.tobytes()
-        byte_length = len(byte_data)
-        buf = self.device.newBufferWithBytes_length_options_(
-            byte_data, byte_length, Metal.MTLResourceStorageModeShared
-        )
-        if not buf:
-            raise RuntimeError(f"Failed to create buffer: {label}")
-        return buf
-
     def sample_ising(
         self,
         h: List[Dict[int, float]],
@@ -126,18 +108,51 @@ class MetalSASampler:
         self.logger.debug(f"[MetalSA] Processing {num_problems} problems, {num_reads} reads each, {num_sweeps} sweeps")
 
         # Build concatenated CSR arrays for all problems
-        (all_csr_row_ptr, all_csr_col_ind, all_csr_J_vals, all_h_vals,
-         row_ptr_offsets, col_ind_offsets, node_to_idx_list, N_list) = \
-            build_csr_from_ising(h, J)
+        all_csr_row_ptr = []
+        all_csr_col_ind = []
+        all_csr_J_vals = []
+        all_h_vals = []  # Concatenated h values for all problems
+        row_ptr_offsets = [0]  # Offsets into csr_row_ptr array
+        col_ind_offsets = [0]  # Offsets into csr_col_ind array
+        node_to_idx_list = []
+        N_list = []
 
+        for prob_idx, (h_prob, J_prob) in enumerate(zip(h, J)):
+            # Build CSR representation for this problem
+            csr_row_ptr, csr_col_ind, csr_J_vals, h_vals_array, node_to_idx, N = build_csr_from_ising(
+                h_prob, J_prob, use_float=False
+            )
+            N_list.append(N)
+            node_to_idx_list.append(node_to_idx)
+
+            # Append to concatenated arrays
+            all_csr_row_ptr.extend(csr_row_ptr)
+            all_csr_col_ind.extend(csr_col_ind)
+            all_csr_J_vals.extend(csr_J_vals)
+            all_h_vals.extend(h_vals_array)
+
+            # Track offsets for next problem
+            row_ptr_offsets.append(len(all_csr_row_ptr))
+            col_ind_offsets.append(len(all_csr_col_ind))
+
+            self.logger.debug(f"[MetalSA] Problem {prob_idx}: N={N}, edges={len(csr_col_ind)}, row_ptr_offset={row_ptr_offsets[-2]}, col_ind_offset={col_ind_offsets[-2]}")
+
+        # Convert to numpy arrays
+        all_csr_row_ptr = np.array(all_csr_row_ptr, dtype=np.int32)
+        all_csr_col_ind = np.array(all_csr_col_ind, dtype=np.int32)
+        all_csr_J_vals = np.array(all_csr_J_vals, dtype=np.int8)
+        all_h_vals = np.array(all_h_vals, dtype=np.int8)
+        row_ptr_offsets = np.array(row_ptr_offsets, dtype=np.int32)
+        col_ind_offsets = np.array(col_ind_offsets, dtype=np.int32)
+
+        # Use first problem's N for uniform sizing (all problems should have same N)
         N = N_list[0]
         if not all(n == N for n in N_list):
             raise ValueError(f"All problems must have same N: {N_list}")
 
-        # Compute beta schedule
+        # Compute beta schedule (use first problem for auto range)
         beta_schedule, beta_range = compute_beta_schedule(
-            h[0], J[0], num_sweeps, num_sweeps_per_beta,
-            beta_range, beta_schedule_type, beta_schedule,
+            h[0], J[0], num_sweeps, num_sweeps_per_beta, beta_range, beta_schedule_type, beta_schedule
         )
 
         self.logger.debug(f"[MetalSA] Beta schedule: {len(beta_schedule)} betas from {beta_schedule[0]:.4f} to {beta_schedule[-1]:.4f}")
@@ -147,14 +162,14 @@ class MetalSASampler:
             seed = np.random.randint(0, 2**31)
 
         # Create Metal buffers for concatenated CSR arrays
-        csr_row_ptr_buf = self._create_buffer(all_csr_row_ptr, "csr_row_ptr")
-        csr_col_ind_buf = self._create_buffer(all_csr_col_ind, "csr_col_ind")
-        csr_J_vals_buf = self._create_buffer(all_csr_J_vals, "csr_J_vals")
-        csr_h_vals_buf = self._create_buffer(all_h_vals, "csr_h_vals")
-        row_ptr_offsets_buf = self._create_buffer(row_ptr_offsets, "row_ptr_offsets")
-        col_ind_offsets_buf = self._create_buffer(col_ind_offsets, "col_ind_offsets")
+        csr_row_ptr_buf = _create_buffer(self.device, all_csr_row_ptr, "csr_row_ptr")
+        csr_col_ind_buf = _create_buffer(self.device, all_csr_col_ind, "csr_col_ind")
+        csr_J_vals_buf = _create_buffer(self.device, all_csr_J_vals, "csr_J_vals")
+        csr_h_vals_buf = _create_buffer(self.device, all_h_vals, "csr_h_vals")
+        row_ptr_offsets_buf = _create_buffer(self.device, row_ptr_offsets, "row_ptr_offsets")
+        col_ind_offsets_buf = _create_buffer(self.device, col_ind_offsets, "col_ind_offsets")
 
-        beta_schedule_buf = self._create_buffer(beta_schedule, "beta_schedule")
+        beta_schedule_buf = _create_buffer(self.device, beta_schedule, "beta_schedule")
 
         # Scalar parameters for batched problems
         N_bytes = np.int32(N).tobytes()
@@ -253,9 +268,24 @@ class MetalSASampler:
 
         self.logger.debug(f"[MetalSA] Energy range: [{energies_data.min()}, {energies_data.max()}]")
 
-        return unpack_packed_results(
-            packed_data, energies_data, num_problems, num_reads, N,
-            node_to_idx_list,
-            info={"beta_range": beta_range, "beta_schedule_type": beta_schedule_type},
-        )
+        # Parse into separate SampleSets
+        samplesets = []
+        for prob_idx in range(num_problems):
+            start_idx = prob_idx * num_reads
+            end_idx = (prob_idx + 1) * num_reads
+
+            # Extract this problem's results
+            prob_packed = packed_data[start_idx:end_idx]
+            prob_energies = energies_data[start_idx:end_idx]
+
+            # Unpack and build SampleSet
+            sampleset = unpack_metal_results(
+                prob_packed, prob_energies, N, num_reads, node_to_idx_list[prob_idx],
+                beta_range, beta_schedule_type
+            )
+            samplesets.append(sampleset)
+
+            self.logger.debug(f"[MetalSA] Problem {prob_idx}: energy range [{prob_energies.min()}, {prob_energies.max()}]")
+
+        return samplesets
 

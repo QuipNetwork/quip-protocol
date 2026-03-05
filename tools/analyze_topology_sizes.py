@@ -177,11 +177,11 @@ def test_embedding_feasibility(config: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         import minorminer
-        from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_11_TOPOLOGY
+        from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_12_TOPOLOGY
 
         # Get target QPU topology from saved JSON (no live connection needed!)
         try:
-            target_topology = ADVANTAGE2_SYSTEM1_11_TOPOLOGY
+            target_topology = ADVANTAGE2_SYSTEM1_12_TOPOLOGY
             target_graph = target_topology.graph
 
             qpu_chip_id = target_topology.solver_name
@@ -359,7 +359,7 @@ def _find_native_subgraph_seed(source_graph: nx.Graph, target_graph: nx.Graph, m
     return None
 
 
-def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Advantage2_system1_11", timeout: int = 3600, try_timeout: int = 600, num_processes: Optional[int] = None) -> Dict[str, Any]:
+def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Advantage2_system1_12", timeout: int = 3600, try_timeout: int = 600, num_processes: Optional[int] = None) -> Dict[str, Any]:
     """
     Precompute and save embedding for a topology using parallel multiprocessing.
 
@@ -368,7 +368,7 @@ def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Adva
 
     Args:
         config: Topology configuration dict
-        target_solver_name: Target solver name (default: Advantage2_system1_11)
+        target_solver_name: Target solver name (default: Advantage2_system1_12)
         timeout: Total timeout in seconds for all workers
         try_timeout: Timeout per individual embedding attempt (default: 600s = 10min)
         num_processes: Number of parallel processes (default: CPU count)
@@ -380,10 +380,10 @@ def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Adva
     import gzip
     import minorminer
     import multiprocessing as mp
-    from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_11_TOPOLOGY
+    from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_12_TOPOLOGY
 
     # Get target topology
-    target_topology = ADVANTAGE2_SYSTEM1_11_TOPOLOGY
+    target_topology = ADVANTAGE2_SYSTEM1_12_TOPOLOGY
     target_graph = target_topology.graph
 
     source_graph = config['graph']
@@ -829,7 +829,7 @@ def main():
             try_timeout_seconds = parse_timeout(args.try_timeout)
             precompute_embedding(
                 config_info,
-                target_solver_name="Advantage2_system1_11",
+                target_solver_name="Advantage2_system1_12",
                 timeout=timeout_seconds,
                 try_timeout=try_timeout_seconds
             )
