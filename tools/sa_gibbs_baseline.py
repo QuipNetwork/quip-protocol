@@ -9,7 +9,7 @@ to achieve block Gibbs sampling on CPU. Variables are reordered so that same-col
 nodes (which share no edges) are consecutive, making sequential Gibbs updates
 equivalent to block-parallel updates.
 
-Requires a Zephyr topology (default: Advantage2_system1.11).
+Requires a Zephyr topology (default: Advantage2_system1.12).
 
 Usage:
     python tools/sa_gibbs_baseline.py --quick
@@ -113,9 +113,9 @@ def sa_gibbs_baseline_test(
         only_label: Run only specific config (e.g., "Light Gibbs")
         topology: Topology to use (must be Zephyr). Can be:
                   - Z(m,t) format (e.g., "Z(9,2)")
-                  - Hardware name (e.g., "Advantage2_system1.11")
+                  - Hardware name (e.g., "Advantage2_system1.12")
                   - File path to topology JSON
-                  Default: Advantage2_system1.11
+                  Default: Advantage2_system1.12
         update_mode: "gibbs" or "metropolis" (default: "gibbs")
     """
     if h_values is None:
@@ -138,7 +138,7 @@ def sa_gibbs_baseline_test(
         edges = list(topo_obj.graph.edges) if hasattr(topo_obj, 'graph') else topo_obj.edges
         topology_desc = f"{getattr(topo_obj, 'solver_name', 'unknown')} ({len(nodes)} nodes, {len(edges)} edges)"
     else:
-        print("Using default topology (Advantage2_system1.11)")
+        print("Using default topology (Advantage2_system1.12)")
         topo_obj = DEFAULT_TOPOLOGY
         nodes = list(topo_obj.graph.nodes) if hasattr(topo_obj, 'graph') else topo_obj.nodes
         edges = list(topo_obj.graph.edges) if hasattr(topo_obj, 'graph') else topo_obj.edges
@@ -392,8 +392,8 @@ def main():
     parser.add_argument(
         '--topology',
         type=str,
-        help='Zephyr topology: Z(9,2), Advantage2_system1.11, or file path. '
-             'Default: Advantage2_system1.11',
+        help='Zephyr topology: Z(9,2), Advantage2_system1.12, or file path. '
+             'Default: Advantage2_system1.12',
     )
     parser.add_argument(
         '--update-mode',

@@ -108,12 +108,12 @@ def generate_generic_topology_json(topology_type: str, params: dict, output_dir:
 
 
 def generate_advantage2_system_json(output_dir: str):
-    """Generate JSON for real Advantage2-System1.11 topology."""
+    """Generate JSON for real Advantage2-System1.12 topology."""
 
     # Import the existing topology data
-    from dwave_topologies.topologies.advantage2_system1_11 import ADVANTAGE2_SYSTEM1_11_TOPOLOGY
+    from dwave_topologies.topologies.advantage2_system1_12 import ADVANTAGE2_SYSTEM1_12_TOPOLOGY
 
-    topo = ADVANTAGE2_SYSTEM1_11_TOPOLOGY
+    topo = ADVANTAGE2_SYSTEM1_12_TOPOLOGY
 
     # Calculate expected GSE
     from shared.energy_utils import expected_solution_energy

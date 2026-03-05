@@ -26,13 +26,13 @@ from dwave_topologies.topologies.json_loader import load_json_topology
 class EmbeddedTopology:
     """Topology representing the physical hardware subgraph used in an embedding."""
 
-    def __init__(self, topology_name: str, solver_name: str = "Advantage2_system1.11"):
+    def __init__(self, topology_name: str, solver_name: str = "Advantage2_system1.12"):
         """
         Create an embedded topology from a precomputed embedding.
 
         Args:
             topology_name: Source topology name like "Z(9,2)"
-            solver_name: Target solver name (default: "Advantage2_system1.11")
+            solver_name: Target solver name (default: "Advantage2_system1.12")
         """
         self.topology_name = topology_name
         self.solver_name = solver_name
@@ -128,13 +128,13 @@ class EmbeddedTopology:
         }
 
 
-def create_embedded_topology(topology_name: str, solver_name: str = "Advantage2_system1.11") -> EmbeddedTopology:
+def create_embedded_topology(topology_name: str, solver_name: str = "Advantage2_system1.12") -> EmbeddedTopology:
     """
     Create an embedded topology from a precomputed embedding.
 
     Args:
         topology_name: Source topology like "Z(9,2)"
-        solver_name: Target solver (default: "Advantage2_system1.11")
+        solver_name: Target solver (default: "Advantage2_system1.12")
 
     Returns:
         EmbeddedTopology instance representing the physical hardware subgraph
