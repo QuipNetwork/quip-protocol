@@ -6,15 +6,14 @@
 // ==============================================================================
 // Two kernel variants:
 //
-// 1. cuda_block_gibbs_parallel (Jacobi-style):
-//    - 4 CUDA blocks per sample (one per color)
-//    - All colors update simultaneously from previous sweep's state
-//    - Double-buffered global state with sense-reversing barrier
-//    - 4x parallelism vs sequential, trades per-sweep info flow
+// 1. cuda_block_gibbs_parallel (chromatic parallel):
+//    - 1 CUDA block per sample, 256 threads
+//    - Colors processed sequentially (Gauss-Seidel across colors)
+//    - Nodes within each color updated in parallel (independent set)
+//    - __syncthreads() between colors for visibility
 //
 // 2. cuda_block_gibbs_sequential (validation baseline):
-//    - 1 thread per sample, processes colors sequentially
-//    - Gauss-Seidel style: each color sees previous colors' updates
+//    - 1 thread per sample, fully sequential
 //    - For correctness verification against parallel variant
 
 // ==============================================================================
@@ -167,42 +166,10 @@ __device__ __forceinline__ int metropolis_update(
 }
 
 // ==============================================================================
-// Sense-reversing barrier for inter-block synchronization
-// 4 blocks per sample must synchronize after each sweep
-// ==============================================================================
-
-__device__ void sample_barrier(
-    int sample_id,
-    volatile int* sync_counters,
-    volatile int* sync_sense
-) {
-    __threadfence();
-    if (threadIdx.x == 0) {
-        int local_sense = sync_sense[sample_id];
-        int arrived = atomicAdd(
-            (int*)&sync_counters[sample_id], 1
-        );
-        if (arrived == 3) {
-            // Last of 4 blocks: reset counter and flip sense
-            sync_counters[sample_id] = 0;
-            __threadfence();
-            sync_sense[sample_id] = 1 - local_sense;
-        } else {
-            // Spin-wait for sense to flip
-            while (sync_sense[sample_id] == local_sense) {
-#if __CUDA_ARCH__ >= 700
-                __nanosleep(100);
-#endif
-            }
-        }
-    }
-    __syncthreads();
-}
-
-// ==============================================================================
-// KERNEL 1: Jacobi-style parallel block Gibbs
-// Grid: num_samples * 4 blocks, 256 threads per block
-// Each block handles one color of one sample
+// KERNEL 1: Chromatic parallel block Gibbs
+// Grid: num_samples blocks, 256 threads per block
+// Colors processed sequentially (Gauss-Seidel across colors)
+// Nodes within each color updated in parallel (independent set)
 // ==============================================================================
 
 extern "C" __global__ void cuda_block_gibbs_parallel(
@@ -224,13 +191,8 @@ extern "C" __global__ void cuda_block_gibbs_parallel(
     int num_betas,
     int sweeps_per_beta,
 
-    // Double-buffered state
-    signed char* state_A,
-    signed char* state_B,
-
-    // Inter-block sync
-    int* sync_counters,
-    int* sync_sense,
+    // State (single buffer, one per sample)
+    signed char* state,
 
     // Output
     signed char* final_samples,
@@ -241,91 +203,82 @@ extern "C" __global__ void cuda_block_gibbs_parallel(
     unsigned int base_seed,
     int update_mode  // 0=Gibbs, 1=Metropolis
 ) {
-    int sample_id = blockIdx.x / num_colors;
-    int color = blockIdx.x % num_colors;
-
+    int sample_id = blockIdx.x;
     if (sample_id >= num_samples) return;
-
-    int my_block_start = __ldg(&color_block_starts[color]);
-    int my_block_count = __ldg(&color_block_counts[color]);
 
     // Init RNG per thread
     Xoshiro128 rng;
     xoshiro128_init(rng, base_seed, blockIdx.x, threadIdx.x);
 
     // Phase 1: Cooperative initialization
-    // Each block initializes its color's nodes in state_A
-    for (int i = threadIdx.x; i < my_block_count; i += blockDim.x) {
-        int var = __ldg(&color_node_indices[my_block_start + i]);
+    for (int var = threadIdx.x; var < N; var += blockDim.x) {
         unsigned int r = xoshiro128ss(rng);
         int spin = (r & 1) ? -1 : 1;
-        write_spin(state_A, sample_id, var, N, spin);
+        write_spin(state, sample_id, var, N, spin);
     }
+    __syncthreads();
 
-    // Barrier: wait for all 4 blocks to finish init
-    sample_barrier(sample_id, sync_counters, sync_sense);
-
-    // Phase 2: Jacobi annealing sweeps
-    int sweep_parity = 0;  // 0: read A write B, 1: read B write A
-
+    // Phase 2: Chromatic Gibbs annealing
+    // Colors processed sequentially, nodes parallel within color
     for (int beta_idx = 0; beta_idx < num_betas; beta_idx++) {
         float beta = __ldg(&beta_schedule[beta_idx]);
 
         for (int sweep = 0; sweep < sweeps_per_beta; sweep++) {
-            signed char* read_buf = (sweep_parity == 0)
-                                    ? state_A : state_B;
-            signed char* write_buf = (sweep_parity == 0)
-                                     ? state_B : state_A;
-
-            // Update this color's nodes
-            for (int i = threadIdx.x; i < my_block_count;
-                 i += blockDim.x) {
-                int var = __ldg(
-                    &color_node_indices[my_block_start + i]
+            for (int color = 0; color < num_colors; color++) {
+                int block_start = __ldg(
+                    &color_block_starts[color]
+                );
+                int block_count = __ldg(
+                    &color_block_counts[color]
                 );
 
-                float h_eff = compute_effective_field(
-                    var, sample_id, N, read_buf,
-                    csr_row_ptr, csr_col_ind, csr_J_vals, h_vals
-                );
-
-                int new_spin;
-                if (update_mode == 0) {
-                    new_spin = gibbs_sample(h_eff, beta, rng);
-                } else {
-                    int cur = read_spin(
-                        read_buf, sample_id, var, N
+                // Parallel update within this color
+                for (int i = threadIdx.x; i < block_count;
+                     i += blockDim.x) {
+                    int var = __ldg(
+                        &color_node_indices[block_start + i]
                     );
-                    new_spin = metropolis_update(
-                        cur, h_eff, beta, rng
+
+                    float h_eff = compute_effective_field(
+                        var, sample_id, N, state,
+                        csr_row_ptr, csr_col_ind,
+                        csr_J_vals, h_vals
+                    );
+
+                    int new_spin;
+                    if (update_mode == 0) {
+                        new_spin = gibbs_sample(
+                            h_eff, beta, rng
+                        );
+                    } else {
+                        int cur = read_spin(
+                            state, sample_id, var, N
+                        );
+                        new_spin = metropolis_update(
+                            cur, h_eff, beta, rng
+                        );
+                    }
+
+                    write_spin(
+                        state, sample_id, var, N, new_spin
                     );
                 }
 
-                write_spin(write_buf, sample_id, var, N, new_spin);
+                // Sync between colors: make updates visible
+                __syncthreads();
             }
-
-            // Barrier: wait for all 4 blocks before next sweep
-            sample_barrier(sample_id, sync_counters, sync_sense);
-
-            sweep_parity = 1 - sweep_parity;
         }
     }
 
-    // Phase 3: Energy computation (partial per block)
-    // Determine which buffer holds the final state
-    signed char* final_state = (sweep_parity == 0)
-                               ? state_A : state_B;
-
-    // Each block computes partial energy for its color's nodes
-    // Use warp-level reduction, then atomicAdd to global
+    // Phase 3: Energy computation (all threads cooperate)
     float thread_energy = 0.0f;
 
-    for (int i = threadIdx.x; i < my_block_count; i += blockDim.x) {
-        int var = __ldg(&color_node_indices[my_block_start + i]);
-        int spin_i = read_spin(final_state, sample_id, var, N);
+    for (int var = threadIdx.x; var < N; var += blockDim.x) {
+        int spin_i = read_spin(state, sample_id, var, N);
 
         // h contribution
-        thread_energy += (float)__ldg(&h_vals[var]) * (float)spin_i;
+        thread_energy += (float)__ldg(&h_vals[var])
+                         * (float)spin_i;
 
         // J contribution (j > var to count each edge once)
         int start = __ldg(&csr_row_ptr[var]);
@@ -335,9 +288,11 @@ extern "C" __global__ void cuda_block_gibbs_parallel(
             if (j > var) {
                 int Jij = (int)__ldg(&csr_J_vals[p]);
                 int spin_j = read_spin(
-                    final_state, sample_id, j, N
+                    state, sample_id, j, N
                 );
-                thread_energy += (float)(Jij * spin_i * spin_j);
+                thread_energy += (float)(
+                    Jij * spin_i * spin_j
+                );
             }
         }
     }
@@ -345,29 +300,35 @@ extern "C" __global__ void cuda_block_gibbs_parallel(
     // Warp-level reduction
     unsigned mask = __activemask();
     for (int offset = 16; offset > 0; offset >>= 1) {
-        thread_energy += __shfl_down_sync(mask, thread_energy, offset);
+        thread_energy += __shfl_down_sync(
+            mask, thread_energy, offset
+        );
     }
 
     // Lane 0 of each warp does atomicAdd
     if ((threadIdx.x & 31) == 0) {
-        atomicAdd(&final_energies[sample_id], (int)thread_energy);
+        atomicAdd(
+            &final_energies[sample_id], (int)thread_energy
+        );
     }
 
-    // Phase 4: Bit-pack final state (only color 0, thread 0)
-    // Barrier to ensure energy computation is done
-    sample_barrier(sample_id, sync_counters, sync_sense);
+    __syncthreads();
 
-    if (color == 0 && threadIdx.x == 0) {
+    // Phase 4: Bit-pack final state (thread 0 only)
+    if (threadIdx.x == 0) {
         int packed_size = (N + 7) / 8;
-        signed char* output = &final_samples[sample_id * packed_size];
+        signed char* output = &final_samples[
+            sample_id * packed_size
+        ];
 
-        // Zero output first
         for (int b = 0; b < packed_size; b++) {
             output[b] = 0;
         }
 
         for (int var = 0; var < N; var++) {
-            int spin = read_spin(final_state, sample_id, var, N);
+            int spin = read_spin(
+                state, sample_id, var, N
+            );
             set_spin_packed(var, spin, output);
         }
     }

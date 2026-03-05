@@ -44,13 +44,13 @@ def cuda_gibbs_baseline_test(
         h_values: List of allowed h field values.
         topology: Topology specification.
         update_mode: "gibbs" or "metropolis".
-        parallel: Use Jacobi-parallel kernel (True) or sequential.
+        parallel: Use Chromatic-parallel kernel (True) or sequential.
     """
     if h_values is None:
         h_values = [-1.0, 0.0, 1.0]
 
     mode_name = "Gibbs" if update_mode == "gibbs" else "Metropolis"
-    kernel_type = "Jacobi" if parallel else "Sequential"
+    kernel_type = "Chromatic" if parallel else "Sequential"
     print(f"CUDA Block {mode_name} ({kernel_type}) Baseline Test")
     print("=" * 50)
     print(f"Timeout: {timeout_minutes} minutes")
@@ -379,7 +379,7 @@ def main():
     parser.add_argument(
         '--sequential', action='store_true',
         help='Use sequential (Gauss-Seidel) kernel instead of '
-             'Jacobi parallel',
+             'Chromatic parallel',
     )
 
     args = parser.parse_args()
@@ -417,7 +417,7 @@ def main():
         parallel=not args.sequential,
     )
 
-    kernel_type = "Sequential" if args.sequential else "Jacobi"
+    kernel_type = "Sequential" if args.sequential else "Chromatic"
     print(
         f"\nCUDA Block {mode_name} ({kernel_type}) "
         f"baseline test complete!"

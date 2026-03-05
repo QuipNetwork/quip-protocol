@@ -3,9 +3,10 @@
 
 """CUDA Block Gibbs Sampler.
 
-Jacobi-style parallel block Gibbs sampling on GPU via CuPy.
-Uses 4 CUDA blocks per sample (one per color) with double-buffered
-state and sense-reversing barrier for inter-block synchronization.
+Chromatic parallel block Gibbs sampling on GPU via CuPy.
+Colors processed sequentially (Gauss-Seidel), nodes within each
+color updated in parallel (independent set). One CUDA block per
+sample with 256 threads.
 """
 
 import logging
@@ -27,11 +28,10 @@ from GPU.sampler_utils import (
 class CudaGibbsSampler:
     """Block Gibbs sampler using CUDA GPU.
 
-    Implements Jacobi-style parallel block Gibbs sampling where
-    all 4 color blocks update simultaneously from the previous
-    sweep's state, synchronized via sense-reversing barrier.
-
-    Also supports a sequential (Gauss-Seidel) mode for validation.
+    Chromatic parallel: colors processed sequentially
+    (Gauss-Seidel), nodes within each color updated in
+    parallel by 256 threads. Also supports a fully sequential
+    mode for validation.
     """
 
     def __init__(
@@ -45,8 +45,8 @@ class CudaGibbsSampler:
         Args:
             topology: Topology object (default: DEFAULT_TOPOLOGY).
             update_mode: "gibbs" or "metropolis".
-            parallel: Use Jacobi-style parallel kernel (True) or
-                sequential Gauss-Seidel kernel (False).
+            parallel: Use chromatic parallel kernel (True) or
+                fully sequential kernel (False).
         """
         self.logger = logging.getLogger(__name__)
 
@@ -290,20 +290,10 @@ class CudaGibbsSampler:
         d_final_samples, d_final_energies,
         num_reads, seed,
     ):
-        """Launch the Jacobi-style parallel kernel."""
-        # Double-buffered state
-        d_state_A = cp.zeros(
-            num_reads * N, dtype=cp.int8
-        )
-        d_state_B = cp.zeros(
-            num_reads * N, dtype=cp.int8
-        )
+        """Launch chromatic parallel kernel."""
+        d_state = cp.zeros(num_reads * N, dtype=cp.int8)
 
-        # Sync arrays
-        d_sync_counters = cp.zeros(num_reads, dtype=cp.int32)
-        d_sync_sense = cp.zeros(num_reads, dtype=cp.int32)
-
-        grid = (num_reads * self.num_colors,)
+        grid = (num_reads,)
         block = (256,)
 
         self._parallel_kernel(
@@ -316,8 +306,7 @@ class CudaGibbsSampler:
                 d_beta_sched,
                 np.int32(num_betas),
                 np.int32(sweeps_per_beta),
-                d_state_A, d_state_B,
-                d_sync_counters, d_sync_sense,
+                d_state,
                 d_final_samples, d_final_energies,
                 np.int32(num_reads),
                 np.uint32(seed),

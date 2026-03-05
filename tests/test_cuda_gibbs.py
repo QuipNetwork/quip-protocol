@@ -122,7 +122,7 @@ class TestSequentialKernel:
 
 
 class TestParallelKernel:
-    """Tests for the Jacobi-style parallel kernel."""
+    """Tests for the chromatic parallel kernel."""
 
     def test_small_problem_runs(self):
         from GPU.cuda_gibbs_sa import CudaGibbsSampler
@@ -308,7 +308,7 @@ class TestFullTopology:
         assert results[0].record.energy.min() < 0
 
 
-class TestJacobiVsSequentialQuality:
+class TestParallelVsSequentialQuality:
     """Verify both kernel variants produce comparable quality."""
 
     def test_similar_energy_distributions(self):
@@ -329,10 +329,10 @@ class TestJacobiVsSequentialQuality:
         seq_min = seq_results[0].record.energy.min()
         par_min = par_results[0].record.energy.min()
 
-        # Both should find reasonably low energies
-        # Allow tolerance since Jacobi and Gauss-Seidel converge
-        # differently
-        assert par_min < seq_min * 0.5 or par_min < -100, (
+        # Chromatic parallel should match sequential closely
+        # (same Gauss-Seidel across colors, just parallel within)
+        # Allow 5% tolerance: par_min within 5% of seq_min
+        assert par_min <= seq_min * 0.95, (
             f"Parallel min={par_min} much worse than "
             f"sequential min={seq_min}"
         )
