@@ -135,13 +135,16 @@ class QPUTimeManager:
         day_start_dt = utc_dt.replace(hour=0, minute=0, second=0, microsecond=0)
         return day_start_dt.timestamp()
 
-    def _check_day_rollover(self) -> bool:
+    def _check_day_rollover(self, now: Optional[float] = None) -> bool:
         """Reset counters if day has changed (UTC midnight rollover).
+
+        Args:
+            now: Optional Unix timestamp; uses current time if not provided
 
         Returns:
             True if reset occurred, False otherwise
         """
-        now = time.time()
+        now = now or time.time()
         current_day_start = self._calculate_day_start(now)
         if current_day_start > self.day_start_timestamp:
             self.day_start_timestamp = current_day_start
@@ -198,7 +201,7 @@ class QPUTimeManager:
             # Fallback if EMA wasn't computed (shouldn't happen)
             return (sum(self.block_times_us) / len(self.block_times_us)) * 1.2
 
-    def should_mine_block(self) -> QPUTimeEstimate:
+    def should_mine_block(self, now: Optional[float] = None) -> QPUTimeEstimate:
         """Determine if there's enough budget to mine the next block.
 
         Uses proportional pacing: at any point in the day, usage cannot exceed
@@ -208,13 +211,16 @@ class QPUTimeManager:
         If usage exceeds the current proportional limit, mining is paused until
         the limit catches up (continuous pacing).
 
+        Args:
+            now: Optional Unix timestamp; uses current time if not provided
+
         Returns:
             QPUTimeEstimate with decision and supporting metrics
         """
         # Check for day rollover (resets counters at UTC midnight)
-        self._check_day_rollover()
+        self._check_day_rollover(now)
 
-        now = time.time()
+        now = now or time.time()
         estimated_time = self.estimate_next_block_time()
         daily_budget_us = self.config.daily_budget_seconds * 1_000_000
 

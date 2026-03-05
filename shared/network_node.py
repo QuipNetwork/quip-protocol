@@ -34,6 +34,7 @@ from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import QuicEvent, DatagramFrameReceived, StreamDataReceived, ConnectionTerminated, HandshakeCompleted
 from shared.block_synchronizer import BlockSynchronizer
 from shared.block_store import BlockStore
+from shared.telemetry import TelemetryManager
 from shared.time_utils import (
     utc_timestamp_float, is_clock_synchronized, NETWORK_TIME_SYNC_INTERVAL,
     get_network_clock, network_timestamp
@@ -318,6 +319,14 @@ class NetworkNode(Node):
         else:
             self.epoch_block_store = None
         
+        # Telemetry
+        self.telemetry = TelemetryManager(
+            telemetry_dir=config.get("telemetry_dir", "telemetry"),
+            enabled=config.get("telemetry_enabled", True),
+            logger=self.logger,
+        )
+        self.telemetry.record_initial_peers(self.initial_peers)
+
         # Maximum block index to synchronize with (prevents syncing with peers too far ahead)
         self.max_sync_block_index = 1024
 
@@ -500,6 +509,12 @@ class NetworkNode(Node):
         # Initialize stats cache
         asyncio.create_task(self._update_stats_cache())
 
+        # Telemetry: periodic node table log and epoch sync for mid-epoch joins
+        self.telemetry._periodic_task = asyncio.create_task(
+            self.telemetry.start_periodic_log(interval=600.0)
+        )
+        self.telemetry.sync_epoch_from_chain(self.chain)
+
     @property
     def synchronized(self) -> bool:
         """Check if node is synchronized with the network."""
@@ -528,6 +543,7 @@ class NetworkNode(Node):
             self.gossip_processor_task.cancel()
         if self.server_task:
             self.server_task.cancel()
+        self.telemetry.stop()
         if self.reset_timer_task:
             self.reset_timer_task.cancel()
 
@@ -705,12 +721,13 @@ class NetworkNode(Node):
                         response_future.set_result(False)
                         continue
                     # Base case we can process the block
-                    result = await self.receive_block(block, force_reorg=force_reorg)
-                    if not result:
+                    accepted, reason = await self.receive_block(block, force_reorg=force_reorg)
+                    if not accepted:
                         miner_id = block.miner_info.miner_id if block.miner_info else "unknown"
                         source = f" (via {peer_address})" if peer_address else ""
-                        self.logger.warning(f"Block {block.header.index} mined by {miner_id}{source} was rejected")
-                    response_future.set_result(result)
+                        reason_str = f": {reason}" if reason else ""
+                        self.logger.warning(f"Block {block.header.index} mined by {miner_id}{source} was rejected{reason_str}")
+                    response_future.set_result(accepted)
                 except Exception as e:
                     self.logger.info(f"Error processing block: {e}")
                     if not response_future.done():
@@ -801,9 +818,10 @@ class NetworkNode(Node):
                 self.logger.info(f"Processing cached block {next_block_index} received during sync")
 
                 # Process the cached block
-                success = await self.receive_block(cached_block, force_reorg=force_reorg)
+                success, reason = await self.receive_block(cached_block, force_reorg=force_reorg)
                 if not success:
-                    self.logger.error(f"Failed to process cached block {next_block_index}")
+                    reason_str = f": {reason}" if reason else ""
+                    self.logger.error(f"Failed to process cached block {next_block_index}{reason_str}")
                     break
 
                 next_block_index += 1
@@ -845,6 +863,9 @@ class NetworkNode(Node):
                 # No event loop running, skip reset timer
                 self.logger.warning("No event loop running, cannot schedule reset timer")
         
+        # Record block telemetry
+        self.telemetry.record_block(block)
+
         # Trigger stats cache update in background
         try:
             loop = asyncio.get_event_loop()
@@ -922,6 +943,9 @@ class NetworkNode(Node):
                         self.logger.info(f"Recorded previous epoch: block 1 hash {block_1.hash.hex()[:8]}..., "
                                        f"last block {head_block.header.index} hash {head_block.hash.hex()[:8]}...")
                 
+                # Reset telemetry epoch for next cycle
+                self.telemetry.set_epoch_timestamp(None)
+
                 # Reset to original genesis block (no more new genesis creation)
                 self.chain = [self.genesis_block]
                 self.logger.info("Chain reset to genesis block completed")
@@ -983,36 +1007,43 @@ class NetworkNode(Node):
         except Exception as e:
             self.logger.exception(f"Error updating stats cache: {e}")
 
-    async def receive_block(self, block: Block, force_reorg: bool = False) -> bool:
+    async def receive_block(self, block: Block, force_reorg: bool = False) -> tuple[bool, str | None]:
         """Receive a block from the network with epoch validation and max block limit.
 
         Args:
             block: The block to receive.
             force_reorg: If True, skip timestamp comparison to allow chain reorganization
                         during sync (longest chain wins). Default False.
+
+        Returns:
+            Tuple of (accepted: bool, rejection_reason: str | None).
         """
         # Reject blocks that are too far in the future (beyond max sync limit)
         if block.header.index > self.max_sync_block_index:
-            self.logger.debug(f"Block {block.header.index} rejected: index > max_sync_block_index {self.max_sync_block_index}")
-            return False
+            reason = f"index > max_sync_block_index {self.max_sync_block_index}"
+            self.logger.debug(f"Block {block.header.index} rejected: {reason}")
+            return False, reason
 
         # Check against previous epoch to prevent accepting blocks from old chain epoch
         async with self.chain_lock:
             if self.previous_epoch:
                 # Reject if this is block 1 from the previous epoch
                 if block.header.index == 1 and block.hash and block.hash == self.previous_epoch.first_hash:
-                    self.logger.warning(f"Block 1 rejected: hash {block.hash.hex()[:8]}... matches previous epoch first_hash")
-                    return False
+                    reason = "matches previous epoch first_hash"
+                    self.logger.warning(f"Block 1 rejected: hash {block.hash.hex()[:8]}... {reason}")
+                    return False, reason
 
                 # Reject if this block hash matches the last block from the previous epoch
                 if block.hash and block.hash == self.previous_epoch.last_hash:
-                    self.logger.warning(f"Block {block.header.index} rejected: hash {block.hash.hex()[:8]}... matches previous epoch last_hash")
-                    return False
+                    reason = "matches previous epoch last_hash"
+                    self.logger.warning(f"Block {block.header.index} rejected: hash {block.hash.hex()[:8]}... {reason}")
+                    return False, reason
 
                 # Reject if timestamp is older than the last timestamp from the previous epoch
                 if block.header.timestamp <= self.previous_epoch.last_timestamp:
-                    self.logger.warning(f"Block {block.header.index} rejected: timestamp {block.header.timestamp} <= previous epoch last_timestamp {self.previous_epoch.last_timestamp}")
-                    return False
+                    reason = f"timestamp <= previous epoch ({block.header.timestamp} <= {self.previous_epoch.last_timestamp})"
+                    self.logger.warning(f"Block {block.header.index} rejected: {reason}")
+                    return False, reason
 
         # If all validations pass, call parent receive_block
         return await super().receive_block(block, force_reorg=force_reorg)
@@ -1041,9 +1072,12 @@ class NetworkNode(Node):
         self.logger.info(f"Candidate Block {wb.header.index}-{wb.hash.hex()[:8]} mined on this node!")
     
         if wb.header.index == self.get_latest_block().header.index + 1:
-            await self.receive_block(wb)
-            self.logger.info(f"Accepted block {wb.header.index}-{wb.hash.hex()[:8]} from {wb.miner_info.miner_id}")
-            asyncio.create_task(self.gossip_block(wb))
+            accepted, reason = await self.receive_block(wb)
+            if accepted:
+                self.logger.info(f"Accepted block {wb.header.index}-{wb.hash.hex()[:8]} from {wb.miner_info.miner_id}")
+                asyncio.create_task(self.gossip_block(wb))
+            else:
+                self.logger.warning(f"Own block {wb.header.index}-{wb.hash.hex()[:8]} was rejected: {reason}")
         else:
             self.logger.info(f"Candidate Block {wb.header.index}-{wb.hash.hex()[:8]} sniped by another miner!")
 
@@ -1251,6 +1285,7 @@ class NetworkNode(Node):
 
         except Exception as e:
             self.logger.warning(f"Failed to connect to peer {peer_address}: {e}")
+            self.telemetry.update_node(peer_address, "failed")
             return False
 
     async def add_peer(self, host: str, info: MinerInfo) -> bool:
@@ -1264,6 +1299,9 @@ class NetworkNode(Node):
             # Always update node client with peer info (new or updated)
             if self.node_client:
                 self.node_client.add_peer(host, info)
+
+            # Track in telemetry (both new and existing peers)
+            self.telemetry.update_node(host, "active", info)
 
             if is_new:
                 self.logger.info(f"New peer discovered: {host}: {info.miner_id} ({info.ecdsa_public_key.hex()[:8]})")
@@ -1280,6 +1318,7 @@ class NetworkNode(Node):
             if host in self.peers:
                 del self.peers[host]
                 self.logger.info(f"Node removed: {host}")
+                self.telemetry.remove_node(host)
                 self._on_node_lost(host)
 
                 # Update node client to remove peer
@@ -1670,6 +1709,7 @@ class NetworkNode(Node):
                 if sender in self.peers:
                     self.heartbeats[sender] = utc_timestamp_float()
                     self._track_peer_timestamp(timestamp)
+                    self.telemetry.update_node(sender, "active", last_heartbeat=timestamp)
                 else:
                     self.logger.info(f"New node discovered via heartbeat: {sender}")
                     asyncio.create_task(self.refresh_peer_info(sender))

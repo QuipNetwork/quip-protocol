@@ -8,27 +8,42 @@ from abc import ABC, abstractmethod
 import logging
 import multiprocessing
 import multiprocessing.synchronize
-
-import dimod
-from shared.block_requirements import BlockRequirements
-from shared.miner_types import IsingSample, MiningResult, Sampler
-
-# Global logger for this module (set during initialization)
-log = None
+import random
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
+
+import dimod
 import numpy as np
-from shared.quantum_proof_of_work import evaluate_sampleset
+
+from shared.block_requirements import BlockRequirements, compute_current_requirements
+from shared.energy_utils import (
+    energy_to_difficulty,
+    DEFAULT_NUM_NODES,
+    DEFAULT_NUM_EDGES,
+)
+from shared.miner_types import IsingSample, MiningResult, Sampler
+from shared.quantum_proof_of_work import (
+    evaluate_sampleset,
+    ising_nonce_from_block,
+    generate_ising_model_from_nonce,
+)
+
 # Global logger for this module
 log = logging.getLogger(__name__)
 
 class BaseMiner(ABC):
-    """Abstract base class for concrete miners.
+    """Abstract base class for concrete miners (Template Method pattern).
 
     Subclasses must implement:
-      - mine_block(): miner-specific mining logic
-      - set self.miner_type and self.sampler in __init__
+      - _sample(h, J, **kwargs): backend-specific Ising sampling
+      - _adapt_mining_params(requirements, nodes, edges): return parameter dict
+
+    Subclasses may optionally override:
+      - _pre_mine_setup(...): one-time setup before the mining loop
+      - _post_sample(sampleset): post-process a SampleSet (e.g. sparse filtering)
+      - _post_mine_cleanup(): cleanup after the mining loop exits
+      - _on_sampling_error(error, stop_event): handle sampling exceptions
     """
 
     def __init__(
@@ -173,45 +188,115 @@ class BaseMiner(ABC):
 
         return "\n".join(summary_lines)
 
-    def adapt_parameters(self, network_stats: dict):
-        """Adapt miner parameters based on performance relative to network.
+    # --- Adaptive parameter bounds (override in subclasses) ---
+    # SA/GPU miners use sweeps + reads; QPU miners use annealing_time + reads.
+    ADAPT_MIN_SWEEPS: int = 64
+    ADAPT_MAX_SWEEPS: int = 4096
+    ADAPT_MIN_READS: int = 64
+    ADAPT_MAX_READS: int = 512
+    # When > 0, reads range is derived from min_solutions instead of fixed
+    # bounds: min = max(min_solutions * factor, ADAPT_MIN_READS),
+    #         max = max(min_solutions * factor, ADAPT_MAX_READS).
+    ADAPT_READS_SOLUTION_MIN_FACTOR: int = 0
+    ADAPT_READS_SOLUTION_MAX_FACTOR: int = 0
+    # Floor applied to final num_reads as max(num_reads, min_solutions * N).
+    # Most miners use 1; Modal uses 3; SA uses 0 (no floor).
+    ADAPT_READS_SOLUTION_FLOOR_FACTOR: int = 1
+    # QPU miners set these instead of sweeps bounds
+    ADAPT_MIN_ANNEALING_TIME: float = 0.0
+    ADAPT_MAX_ANNEALING_TIME: float = 0.0
+    ADAPT_MIN_BONUS_READS: int = 0
+    ADAPT_MAX_BONUS_READS: int = 0
+    # Extra keys merged into the returned dict (e.g. num_sweeps_per_beta)
+    ADAPT_EXTRA_PARAMS: Dict[str, Any] = {}
+
+    @classmethod
+    def adapt_parameters(
+        cls,
+        difficulty_energy: float,
+        min_diversity: float,
+        min_solutions: int,
+        num_nodes: int = DEFAULT_NUM_NODES,
+        num_edges: int = DEFAULT_NUM_EDGES,
+    ) -> dict:
+        """Calculate adaptive mining parameters based on difficulty.
+
+        Uses GSE-based difficulty with linear interpolation. Each miner
+        subclass declares its own parameter bounds as class attributes.
+
+        Can be called on an instance (``self.adapt_parameters(...)``) or on
+        the class directly (``SimulatedAnnealingMiner.adapt_parameters(...)``).
 
         Args:
-            network_stats: Dict containing total_blocks, total_miners, avg_win_rate
+            difficulty_energy: Target energy threshold.
+            min_diversity: Minimum solution diversity (reserved).
+            min_solutions: Minimum number of valid solutions required.
+            num_nodes: Number of nodes in topology.
+            num_edges: Number of edges in topology.
+
+        Returns:
+            Dictionary with miner-specific parameter keys.
         """
-        if self.timing_stats['blocks_attempted'] < 5:
-            return  # Need enough data before adapting
+        difficulty = energy_to_difficulty(
+            difficulty_energy,
+            num_nodes=num_nodes,
+            num_edges=num_edges,
+        )
 
-        # Calculate expected win rate (fair share)
-        expected_win_rate = 1.0 / network_stats['total_miners']
-        actual_win_rate = self.blocks_won / self.timing_stats['blocks_attempted']
+        # QPU path: annealing_time + bonus reads
+        if cls.ADAPT_MAX_ANNEALING_TIME > 0:
+            annealing_time = (
+                cls.ADAPT_MIN_ANNEALING_TIME
+                + difficulty
+                * (cls.ADAPT_MAX_ANNEALING_TIME - cls.ADAPT_MIN_ANNEALING_TIME)
+            )
+            bonus_reads = int(
+                cls.ADAPT_MIN_BONUS_READS
+                + difficulty
+                * (cls.ADAPT_MAX_BONUS_READS - cls.ADAPT_MIN_BONUS_READS)
+            )
+            result: dict = {
+                'num_reads': min_solutions + bonus_reads,
+                'annealing_time': annealing_time,
+            }
+        else:
+            # SA / GPU path: sweeps + reads
+            num_sweeps = max(
+                cls.ADAPT_MIN_SWEEPS,
+                int(difficulty * cls.ADAPT_MAX_SWEEPS),
+            )
 
-        # If winning less than expected, improve parameters
-        if actual_win_rate < expected_win_rate * 0.8:  # 20% below expected
-            if self.miner_type == "QPU":
-                # Increase annealing time for better solutions
-                self.adaptive_params['quantum_annealing_time'] *= 1.2
-                self.logger.info(f"{self.miner_id} increasing annealing time to {self.adaptive_params['quantum_annealing_time']:.2f} μs")
+            # Reads range: solution-factor or fixed bounds
+            if cls.ADAPT_READS_SOLUTION_MIN_FACTOR > 0:
+                min_reads = max(
+                    int(min_solutions) * cls.ADAPT_READS_SOLUTION_MIN_FACTOR,
+                    cls.ADAPT_MIN_READS,
+                )
+                max_reads = max(
+                    int(min_solutions) * cls.ADAPT_READS_SOLUTION_MAX_FACTOR,
+                    cls.ADAPT_MAX_READS,
+                )
             else:
-                # For SA, increase sweeps or adjust beta range
-                self.adaptive_params['num_sweeps'] = int(self.adaptive_params['num_sweeps'] * 1.1)
-                # Widen beta range for better exploration
-                self.adaptive_params['beta_range'][0] *= 0.9
-                self.adaptive_params['beta_range'][1] *= 1.1
-                self.logger.info(f"{self.miner_id} adapting: sweeps={self.adaptive_params['num_sweeps']}, beta_range={self.adaptive_params['beta_range']}")
+                min_reads = cls.ADAPT_MIN_READS
+                max_reads = cls.ADAPT_MAX_READS
 
-        # If winning too much, can reduce parameters to save resources
-        elif actual_win_rate > expected_win_rate * 1.5:  # 50% above expected
-            if self.miner_type == "QPU":
-                # Reduce annealing time to save QPU resources
-                self.adaptive_params['quantum_annealing_time'] *= 0.9
-                self.logger.info(f"{self.miner_id} reducing annealing time to {self.adaptive_params['quantum_annealing_time']:.2f} μs")
-            else:
-                # For SA, reduce sweeps for faster mining
-                self.adaptive_params['num_sweeps'] = int(self.adaptive_params['num_sweeps'] * 0.95)
-                self.logger.info(f"{self.miner_id} reducing sweeps to {self.adaptive_params['num_sweeps']}")
+            num_reads = max(min_reads, int(difficulty * max_reads))
 
-    @abstractmethod
+            floor = min_solutions * cls.ADAPT_READS_SOLUTION_FLOOR_FACTOR
+            result = {
+                'num_sweeps': num_sweeps,
+                'num_reads': max(num_reads, floor),
+            }
+
+        if cls.ADAPT_EXTRA_PARAMS:
+            result.update(cls.ADAPT_EXTRA_PARAMS)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Template Method: mine_block
+    # ------------------------------------------------------------------
+
     def mine_block(
         self,
         prev_block,
@@ -219,20 +304,288 @@ class BaseMiner(ABC):
         requirements,
         prev_timestamp: int,
         stop_event: multiprocessing.synchronize.Event,
+        **kwargs,
     ) -> Optional[MiningResult]:
-        """Abstract method for miner-specific mining implementation.
+        """Mine a block using the common mining loop skeleton.
+
+        The loop generates (salt, nonce, h, J) each iteration, delegates
+        sampling to ``_sample()``, evaluates the result, and tracks
+        progress.  Subclasses customise behaviour via the hook methods
+        listed in the class docstring.
 
         Args:
-            prev_block: Previous block object containing header, data, and other block information
-            node_info: Node information containing miner_id and other details
-            requirements: BlockRequirements object with difficulty settings
+            prev_block: Previous block object
+            node_info: Node information containing miner_id
+            requirements: BlockRequirements with difficulty settings
             prev_timestamp: Timestamp from the previous block header
             stop_event: Multiprocessing event to signal stop
+            **kwargs: Passed through to ``_pre_mine_setup``
 
         Returns:
-            MiningResult if successful, None if stopped or failed
+            MiningResult if a valid solution is found, else None.
         """
-        pass
+        # -- setup --------------------------------------------------------
+        self.mining = True
+        progress = 0
+        self.top_attempts = []
+        start_time = time.time()
+
+        cur_index = prev_block.header.index + 1
+
+        self.current_round_attempted = True
+        self.logger.info(f"Mining block {cur_index}...")
+
+        # One-time miner-specific initialisation
+        if not self._pre_mine_setup(
+            prev_block, node_info, requirements,
+            prev_timestamp, stop_event, **kwargs,
+        ):
+            return None
+
+        # Compute initial requirements (with difficulty decay)
+        current_requirements = compute_current_requirements(
+            requirements, prev_timestamp, self.logger,
+        )
+
+        # Topology
+        nodes = self.sampler.nodes
+        edges = self.sampler.edges
+
+        # Adaptive parameters (per-miner)
+        params = self._adapt_mining_params(
+            current_requirements, nodes, edges,
+        )
+        self.logger.info(f"{self.miner_id} - Adaptive params: {params}")
+
+        # Sweep-increment tracking
+        current_num_sweeps = params.get('num_sweeps', 64)
+        num_reads = params.get('num_reads', 100)
+        max_num_sweeps = current_num_sweeps
+        increment_interval = 30.0
+        last_increment_time = start_time
+
+        # -- main mining loop ---------------------------------------------
+        while self.mining and not stop_event.is_set():
+            # Gradually increase sweeps over time
+            current_time = time.time()
+            if current_time - last_increment_time >= increment_interval:
+                current_num_sweeps = min(
+                    max_num_sweeps, int(current_num_sweeps * 1.05),
+                )
+                last_increment_time = current_time
+
+            # Generate salt, nonce, Ising model
+            salt = random.randbytes(32)
+            nonce = ising_nonce_from_block(
+                prev_block.hash, node_info.miner_id, cur_index, salt,
+            )
+            h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+
+            # Re-check requirements (difficulty decay)
+            updated_requirements = compute_current_requirements(
+                requirements, prev_timestamp, self.logger,
+            )
+            if current_requirements != updated_requirements:
+                current_requirements = updated_requirements
+                params = self._adapt_mining_params(
+                    current_requirements, nodes, edges,
+                )
+                self.logger.info(
+                    f"{self.miner_id} - updated adaptive params: {params}",
+                )
+
+                # Check if any cached top attempts now satisfy requirements
+                for sample in self.top_attempts:
+                    best_e = min(sample.sampleset.record.energy)
+                    if best_e <= current_requirements.difficulty_energy:
+                        result = self.evaluate_sampleset(
+                            sample.sampleset, current_requirements,
+                            nodes, edges, sample.nonce, sample.salt,
+                            prev_timestamp, start_time,
+                        )
+                        if result:
+                            self.logger.info(
+                                f"[Block-{cur_index}] Already Mined at "
+                                f"this difficulty! Nonce: {sample.nonce}, "
+                                f"Salt: {sample.salt.hex()[:4]}..., "
+                                f"Min Energy: {result.energy:.2f}, "
+                                f"Solutions: {result.num_valid}, "
+                                f"Diversity: {result.diversity:.3f}, "
+                                f"Attempt Time: {result.mining_time:.2f}s, "
+                                f"Total Mining Time: "
+                                f"{time.time() - start_time:.2f}s",
+                            )
+                            self._post_mine_cleanup()
+                            return result
+
+            # Track preprocessing
+            preprocess_start = time.time()
+            self.current_stage = 'preprocessing'
+            self.current_stage_start = preprocess_start
+
+            # ---------- SAMPLING (delegated to subclass) ----------
+            try:
+                sample_start = time.time()
+                self.current_stage = 'sampling'
+                self.current_stage_start = sample_start
+
+                sampleset = self._sample(
+                    h, J,
+                    num_reads=num_reads,
+                    num_sweeps=current_num_sweeps,
+                    **{k: v for k, v in params.items()
+                       if k not in ('num_reads', 'num_sweeps')},
+                )
+
+                sample_time = time.time() - sample_start
+                self.timing_stats['sampling'].append(sample_time * 1e6)
+                self.timing_stats['preprocessing'].append(
+                    (sample_start - preprocess_start) * 1e6,
+                )
+            except Exception as e:
+                if self._on_sampling_error(e, stop_event):
+                    return None
+                continue
+
+            # Post-sample hook (e.g. sparse-topology filter)
+            sampleset = self._post_sample(sampleset)
+
+            if stop_event.is_set():
+                self._post_mine_cleanup()
+                return None
+
+            # ---------- EVALUATE ----------
+            postprocess_start = time.time()
+            self.current_stage = 'postprocessing'
+            self.current_stage_start = postprocess_start
+
+            self.timing_stats['total_samples'] += len(
+                sampleset.record.energy,
+            )
+            self.timing_stats['blocks_attempted'] += 1
+
+            result = self.evaluate_sampleset(
+                sampleset, current_requirements, nodes, edges,
+                nonce, salt, prev_timestamp, start_time,
+            )
+
+            self.timing_stats['postprocessing'].append(
+                (time.time() - postprocess_start) * 1e6,
+            )
+
+            if result:
+                self.logger.info(
+                    f"[Block-{cur_index}] Mined! "
+                    f"Nonce: {nonce}, Salt: {salt.hex()[:4]}..., "
+                    f"Min Energy: {result.energy:.2f}, "
+                    f"Solutions: {result.num_valid}, "
+                    f"Diversity: {result.diversity:.3f}, "
+                    f"Attempt Time: {result.mining_time:.2f}s, "
+                    f"Total Mining Time: {time.time() - start_time:.2f}s",
+                )
+                self._post_mine_cleanup()
+                return result
+
+            # Track best attempts
+            self.update_top_samples(
+                sampleset, nonce, salt, current_requirements,
+            )
+
+            progress += 1
+            if progress % 10 == 0:
+                best_energy = (
+                    min(self.top_attempts[0].sampleset.record.energy)
+                    if self.top_attempts
+                    else float('inf')
+                )
+                self.logger.info(
+                    f"Progress: {progress} attempts, "
+                    f"best energy: {best_energy:.2f} | "
+                    f"Sweeps: {current_num_sweeps}/{max_num_sweeps}, "
+                    f"Reads: {num_reads}",
+                )
+
+        # -- teardown -----------------------------------------------------
+        self._post_mine_cleanup()
+        self.logger.info("Stopping mining, no results found")
+        return None
+
+    # ------------------------------------------------------------------
+    # Hook methods (override in subclasses as needed)
+    # ------------------------------------------------------------------
+
+    def _pre_mine_setup(
+        self,
+        prev_block,
+        node_info,
+        requirements,
+        prev_timestamp: int,
+        stop_event: multiprocessing.synchronize.Event,
+        **kwargs,
+    ) -> bool:
+        """Called once before the mining loop starts.
+
+        Return False to abort mining (e.g. QPU budget exhausted).
+        """
+        return True
+
+    @abstractmethod
+    def _sample(
+        self,
+        h: Dict[int, float],
+        J: Dict[Tuple[int, int], float],
+        *,
+        num_reads: int,
+        num_sweeps: int,
+        **kwargs,
+    ) -> dimod.SampleSet:
+        """Perform backend-specific Ising sampling.
+
+        Must return a dimod.SampleSet.
+        """
+
+    @abstractmethod
+    def _adapt_mining_params(
+        self,
+        current_requirements: BlockRequirements,
+        nodes: List[int],
+        edges: List[Tuple[int, int]],
+    ) -> dict:
+        """Return adaptive mining parameters for the current difficulty.
+
+        The returned dict must include at least 'num_sweeps' and
+        'num_reads'.  Extra keys are forwarded to ``_sample()`` as
+        keyword arguments.
+        """
+
+    def _post_sample(
+        self, sampleset: dimod.SampleSet,
+    ) -> dimod.SampleSet:
+        """Post-process a SampleSet before evaluation.
+
+        Default implementation is the identity function.
+        Override in subclasses that need filtering (e.g. sparse topology).
+        """
+        return sampleset
+
+    def _post_mine_cleanup(self) -> None:
+        """Called after the mining loop exits (success or stop)."""
+
+    def _on_sampling_error(
+        self,
+        error: Exception,
+        stop_event: multiprocessing.synchronize.Event,
+    ) -> bool:
+        """Handle a sampling exception.
+
+        Return True to abort mining, False to skip this iteration and
+        continue.
+        """
+        if stop_event.is_set():
+            self.logger.info("Interrupted during sampling")
+            return True
+        self.logger.error(f"Sampling error: {error}")
+        return False
 
     def get_stats(self) -> Dict[str, Any]:
         """Return machine-readable stats for this miner."""

@@ -2,101 +2,143 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""Metal Block Gibbs baseline parameter testing tool."""
+"""CPU Block Gibbs baseline parameter testing tool.
+
+Uses dwave's SimulatedAnnealingSampler with Zephyr four-color variable reordering
+to achieve block Gibbs sampling on CPU. Variables are reordered so that same-color
+nodes (which share no edges) are consecutive, making sequential Gibbs updates
+equivalent to block-parallel updates.
+
+Requires a Zephyr topology (default: Advantage2_system1.12).
+
+Usage:
+    python tools/sa_gibbs_baseline.py --quick
+    python tools/sa_gibbs_baseline.py --quick --update-mode metropolis
+    python tools/sa_gibbs_baseline.py --timeout 10
+"""
 
 import argparse
+import json
+import random
 import sys
 import time
-import json
 from pathlib import Path
 
-# Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evaluate_sampleset, calculate_diversity
+import numpy as np
+from dwave.samplers import SimulatedAnnealingSampler
+from dwave_networkx import zephyr_four_color, zephyr_coordinates
+
+from shared.quantum_proof_of_work import (
+    generate_ising_model_from_nonce,
+    evaluate_sampleset,
+    calculate_diversity,
+)
 from shared.block_requirements import BlockRequirements
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.json_loader import load_topology
-from dwave_topologies.embedded_topology import create_embedded_topology
-
-from GPU.metal_gibbs_sa import MetalGibbsSampler
-from GPU.metal_miner import get_gpu_core_count
 
 
-def metal_gibbs_baseline_test(
+def _extract_zephyr_params(topo_obj):
+    """Extract Zephyr (m, t) from a topology object.
+
+    Returns (m, t) or raises ValueError if not a Zephyr topology.
+    """
+    # ZephyrTopology instances have .m and .t directly
+    if hasattr(topo_obj, 'm') and hasattr(topo_obj, 't'):
+        return topo_obj.m, topo_obj.t
+
+    # Loaded topologies: check properties
+    props = getattr(topo_obj, 'properties', {})
+    topo_info = props.get('topology', {})
+    if topo_info.get('type') == 'zephyr':
+        shape = topo_info['shape']
+        return int(shape[0]), int(shape[1])
+
+    raise ValueError(
+        f"Topology is not Zephyr (type={topo_info.get('type', 'unknown')}). "
+        "Block Gibbs color reordering requires a Zephyr topology."
+    )
+
+
+def _build_color_ordering(nodes, m, t):
+    """Build Zephyr four-color variable ordering map.
+
+    Returns:
+        standard_to_bg: dict mapping original node index -> color-ordered index
+        bg_to_standard: dict mapping color-ordered index -> original node index
+        block_counts: dict mapping color -> count of nodes in that color block
+    """
+    to_tuple = zephyr_coordinates(m, t).linear_to_zephyr
+    ordered_nodes = sorted(nodes, key=lambda n: zephyr_four_color(to_tuple(n)))
+    standard_to_bg = {n: idx for idx, n in enumerate(ordered_nodes)}
+    bg_to_standard = {idx: n for idx, n in enumerate(ordered_nodes)}
+
+    # Count nodes per color block
+    block_counts = {}
+    for n in nodes:
+        color = zephyr_four_color(to_tuple(n))
+        block_counts[color] = block_counts.get(color, 0) + 1
+
+    return standard_to_bg, bg_to_standard, block_counts
+
+
+def _reorder_ising(h, J, standard_to_bg):
+    """Remap h and J dicts from standard to color-block ordering."""
+    h_bg = {standard_to_bg[n]: v for n, v in h.items()}
+    J_bg = {(standard_to_bg[n1], standard_to_bg[n2]): v for (n1, n2), v in J.items()}
+    return h_bg, J_bg
+
+
+def _remap_sampleset(sampleset, bg_to_standard):
+    """Remap sampleset variables from color-block ordering back to standard."""
+    return sampleset.relabel_variables(bg_to_standard)
+
+
+def sa_gibbs_baseline_test(
     timeout_minutes=10.0,
     output_file=None,
-    only_label=None,
     h_values=None,
-    num_models=1,
+    only_label=None,
     topology=None,
     update_mode="gibbs",
-    parallel=False
 ):
-    """Test Metal Block Gibbs performance with baseline format and evaluation logic.
+    """Test CPU Block Gibbs performance with baseline format and evaluation logic.
 
     Args:
         timeout_minutes: Test timeout in minutes
         output_file: Path to save JSON results
-        only_label: Run only specific config (e.g., "Light Gibbs")
         h_values: List of allowed h field values
-        num_models: Number of parallel models to run
-        topology: Topology to use. Can be:
-                  - Z(m,t) format for perfect Zephyr topology (e.g., "Z(9,2)")
+        only_label: Run only specific config (e.g., "Light Gibbs")
+        topology: Topology to use (must be Zephyr). Can be:
+                  - Z(m,t) format (e.g., "Z(9,2)")
                   - Hardware name (e.g., "Advantage2_system1.12")
-                  - File path to topology JSON (e.g., "path/to/topology.json.gz")
-                  - File path to embedding (e.g., "path/to/*.embed.json.gz") - auto-detected
+                  - File path to topology JSON
                   Default: Advantage2_system1.12
         update_mode: "gibbs" or "metropolis" (default: "gibbs")
-        parallel: Use parallel kernel with threadgroup barriers (default: False)
     """
     if h_values is None:
         h_values = [-1.0, 0.0, 1.0]
 
     mode_name = "Gibbs" if update_mode == "gibbs" else "Metropolis"
-    parallel_str = " (Parallel)" if parallel else ""
-    print(f"Metal Block {mode_name}{parallel_str} Baseline Parameter Test")
+    acceptance = "Gibbs" if update_mode == "gibbs" else "Metropolis"
+
+    print(f"CPU Block {mode_name} Baseline Parameter Test")
     print("=" * 50)
     print(f"Timeout: {timeout_minutes} minutes")
     print(f"h_values: {h_values}")
     print(f"Update mode: {update_mode}")
-    print(f"Parallel mode: {parallel}")
 
-    # Initialize sampler
-    try:
-        gibbs_sampler = MetalGibbsSampler(update_mode=update_mode, parallel=parallel)
-        print(f"Metal Block {mode_name}{parallel_str} sampler ready")
-        print(f"Color block sizes: {gibbs_sampler.block_counts}")
-    except Exception as e:
-        print(f"Metal Block {mode_name} sampler failed: {e}")
-        return None
-
-    # Get topology
+    # Load topology
     if topology:
-        # Auto-detect embedding files by .embed.json.gz extension
-        if topology.endswith('.embed.json.gz'):
-            print(f"Loading embedded topology: {topology}")
-            # Parse Z(m,t) from filename like "zephyr_z9_t2.embed.json.gz"
-            import os
-            filename = os.path.basename(topology)
-            if filename.startswith("zephyr_z"):
-                parts = filename.replace("zephyr_z", "").replace(".embed.json.gz", "").split("_t")
-                topology_name = f"Z({parts[0]},{parts[1]})"
-                embedded_topo = create_embedded_topology(topology_name)
-                nodes = embedded_topo.nodes
-                edges = embedded_topo.edges
-                topology_desc = f"{topology_name} embedded ({len(nodes)} qubits, {len(edges)} couplers)"
-            else:
-                raise ValueError(f"Cannot parse embedding filename: {filename}")
-        else:
-            print(f"Loading topology: {topology}")
-            topo_obj = load_topology(topology)
-            nodes = list(topo_obj.graph.nodes) if hasattr(topo_obj, 'graph') else topo_obj.nodes
-            edges = list(topo_obj.graph.edges) if hasattr(topo_obj, 'graph') else topo_obj.edges
-            topology_name = getattr(topo_obj, 'solver_name', 'unknown')
-            topology_desc = f"{topology_name} ({len(nodes)} nodes, {len(edges)} edges)"
+        print(f"Loading topology: {topology}")
+        topo_obj = load_topology(topology)
+        nodes = list(topo_obj.graph.nodes) if hasattr(topo_obj, 'graph') else topo_obj.nodes
+        edges = list(topo_obj.graph.edges) if hasattr(topo_obj, 'graph') else topo_obj.edges
+        topology_desc = f"{getattr(topo_obj, 'solver_name', 'unknown')} ({len(nodes)} nodes, {len(edges)} edges)"
     else:
-        print(f"Using default topology (Advantage2_system1.12)")
+        print("Using default topology (Advantage2_system1.12)")
         topo_obj = DEFAULT_TOPOLOGY
         nodes = list(topo_obj.graph.nodes) if hasattr(topo_obj, 'graph') else topo_obj.nodes
         edges = list(topo_obj.graph.edges) if hasattr(topo_obj, 'graph') else topo_obj.edges
@@ -104,7 +146,15 @@ def metal_gibbs_baseline_test(
 
     print(f"Topology: {topology_desc}")
 
-    # Generate test problem with h_values
+    # Extract Zephyr parameters and build color ordering
+    m, t = _extract_zephyr_params(topo_obj)
+    standard_to_bg, bg_to_standard, block_counts = _build_color_ordering(nodes, m, t)
+    print(f"Zephyr({m},{t}) four-color block sizes: {block_counts}")
+
+    # Initialize sampler
+    sampler = SimulatedAnnealingSampler()
+
+    # Generate test problem
     seed = 12345
     h, J = generate_ising_model_from_nonce(seed, nodes, edges, h_values=h_values)
 
@@ -115,14 +165,14 @@ def metal_gibbs_baseline_test(
     print(f"Problem: {len(h)} variables, {len(J)} couplings")
     print(f"   h distribution: {h_dist_str}")
 
-    # Test configurations - matching other baselines
+    # Test configurations
     test_configs = [
         (256, 64, f"Light {mode_name}"),
         (512, 100, f"Low {mode_name}"),
         (1024, 100, f"Medium {mode_name}"),
         (2048, 150, f"High {mode_name}"),
         (4096, 200, f"Very High {mode_name}"),
-        (8192, 200, f"Max {mode_name}")
+        (8192, 200, f"Max {mode_name}"),
     ]
 
     # Optional filter
@@ -134,28 +184,28 @@ def metal_gibbs_baseline_test(
             return None
         test_configs = filtered
 
-    print(f"\nTesting Metal Block {mode_name} configurations:")
+    print(f"\nTesting CPU Block {mode_name} configurations:")
 
     results = {
         'timeout_minutes': timeout_minutes,
-        'sampler_type': f'metal-{update_mode}' + ('-parallel' if parallel else ''),
+        'sampler_type': f'cpu-sa-{update_mode}',
         'topology': topology_desc,
         'topology_arg': topology if topology else "default",
         'update_mode': update_mode,
-        'parallel': parallel,
+        'zephyr_params': {'m': m, 't': t},
+        'color_block_sizes': {str(k): v for k, v in block_counts.items()},
         'problem_info': {
             'num_variables': len(h),
             'num_couplings': len(J),
-            'seed': 12345
+            'seed': seed,
         },
-        'tests': []
+        'tests': [],
     }
 
     timeout_seconds = timeout_minutes * 60
     total_start_time = time.time()
 
-    # Use deterministic seed sequence for reproducible comparisons
-    import random
+    # Deterministic seed sequence for reproducible comparisons
     random.seed(42)
     test_nonces = [random.randint(0, 2**32 - 1) for _ in range(len(test_configs))]
 
@@ -165,79 +215,63 @@ def metal_gibbs_baseline_test(
             print(f"\nTotal timeout ({timeout_minutes} min) reached, stopping")
             break
 
-        print(f"\n{desc}: {sweeps} sweeps, {reads} reads, {num_models} models")
+        print(f"\n{desc}: {sweeps} sweeps, {reads} reads")
 
         try:
-            # Generate problems with deterministic nonces
-            h_list = []
-            J_list = []
-            nonces = []
+            # Generate problem with deterministic nonce
+            nonce = test_nonces[idx]
+            h_test, J_test = generate_ising_model_from_nonce(nonce, nodes, edges, h_values=h_values)
 
-            for _ in range(num_models):
-                nonce = test_nonces[idx]
-                nonces.append(nonce)
-                h, J = generate_ising_model_from_nonce(nonce, nodes, edges, h_values=h_values)
-                h_list.append(h)
-                J_list.append(J)
+            # Reorder to color-block ordering
+            h_bg, J_bg = _reorder_ising(h_test, J_test, standard_to_bg)
 
             start_time = time.time()
-            # Process models in batch
-            samplesets = gibbs_sampler.sample_ising(
-                h=h_list, J=J_list,
+            sampleset_bg = sampler.sample_ising(
+                h=h_bg,
+                J=J_bg,
                 num_reads=reads,
-                num_sweeps=sweeps
+                num_sweeps=sweeps,
+                proposal_acceptance_criteria=acceptance,
             )
             runtime = time.time() - start_time
-            throughput = num_models / runtime
 
-            # Collect stats from all models
-            all_min_energies = []
-            all_avg_energies = []
-            for sampleset in samplesets:
-                energies = list(sampleset.record.energy)
-                all_min_energies.append(float(min(energies)))
-                all_avg_energies.append(float(sum(energies) / len(energies)))
+            # Remap back to standard ordering for evaluation
+            sampleset = _remap_sampleset(sampleset_bg, bg_to_standard)
 
-            # Use first sampleset for detailed analysis
-            sampleset = samplesets[0]
             energies = list(sampleset.record.energy)
             min_energy = float(min(energies))
             avg_energy = float(sum(energies) / len(energies))
-            std_energy = float((sum((e - avg_energy)**2 for e in energies) / len(energies)) ** 0.5)
+            std_energy = float(np.std(energies))
 
-            print(f"  Runtime: {runtime:.2f}s ({num_models} models)")
-            if num_models > 1:
-                print(f"  Throughput: {throughput:.2f} models/second")
-                print(f"  Best energy: {min(all_min_energies):.1f} (across {num_models} models)")
-            else:
-                print(f"  min_energy = {min_energy:.1f}")
-            print(f"  Avg energy (first model): {avg_energy:.1f} (+/-{std_energy:.1f})")
+            print(f"  Runtime: {runtime:.2f}s ({runtime/60:.1f} min)")
+            print(f"  min_energy = {min_energy:.1f}")
+            print(f"  avg_energy = {avg_energy:.1f} (+/-{std_energy:.1f})")
 
-            # Use evaluate_sampleset to get diversity and num_solutions
+            # Evaluate with mining requirements
             requirements = BlockRequirements(
                 difficulty_energy=0.0,
                 min_diversity=0.1,
                 min_solutions=1,
-                timeout_to_difficulty_adjustment_decay=600
+                timeout_to_difficulty_adjustment_decay=600,
             )
 
-            salt = b"test_salt_metal_gibbs_baseline"
+            salt = b"test_salt_sa_gibbs_baseline"
             prev_timestamp = int(time.time()) - 600
 
             mining_result = evaluate_sampleset(
-                sampleset, requirements, nodes, edges, nonces[0], salt,
-                prev_timestamp, start_time, f"metal-{update_mode}-{sweeps}-{reads}", "Metal"
+                sampleset, requirements, nodes, edges, nonce, salt,
+                prev_timestamp, start_time, f"cpu-sa-{update_mode}-{sweeps}-{reads}", "CPU"
             )
 
             diversity = 0.0
             num_solutions = 0
             meets_requirements = False
 
-            # Calculate diversity of top 10 solutions by energy
+            # Diversity of top 10 solutions by energy
             solutions = list(sampleset.record.sample)
-            energies = list(sampleset.record.energy)
+            energies_arr = list(sampleset.record.energy)
 
-            solution_energy_pairs = list(zip(solutions, energies))
+            solution_energy_pairs = list(zip(solutions, energies_arr))
             solution_energy_pairs.sort(key=lambda x: x[1])
             top_10_solutions = [sol for sol, _ in solution_energy_pairs[:10]]
 
@@ -280,7 +314,7 @@ def metal_gibbs_baseline_test(
                 'diversity': float(diversity),
                 'diversity_top_10': float(top_10_diversity),
                 'num_solutions': int(num_solutions),
-                'meets_requirements': bool(meets_requirements)
+                'meets_requirements': bool(meets_requirements),
             }
             results['tests'].append(test_result)
 
@@ -297,22 +331,19 @@ def metal_gibbs_baseline_test(
 
     # Summary
     total_runtime = time.time() - total_start_time
-    print(f"\nMetal Block {mode_name} Baseline Summary (total time: {total_runtime/60:.1f} min):")
+    print(f"\nCPU Block {mode_name} Baseline Summary (total time: {total_runtime/60:.1f} min):")
     print("=" * 50)
 
     if results['tests']:
-        # Best energy achieved
         best_result = min(results['tests'], key=lambda r: r['min_energy'])
         print(f"Best energy: {best_result['min_energy']:.1f}")
         print(f"   Required: {best_result['num_sweeps']} sweeps, {best_result['runtime_minutes']:.1f} min")
 
-        # Time vs energy analysis
         print(f"\nTime vs Energy Performance:")
         for result in results['tests']:
             quality = f"({result['target_reached']})" if result['target_reached'] != 'none' else ""
             print(f"  {result['runtime_minutes']:5.1f} min: {result['min_energy']:7.1f} energy {quality}")
 
-    # Save results if requested
     if output_file:
         with open(output_file, 'w') as f:
             json.dump(results, f, indent=2)
@@ -323,75 +354,56 @@ def metal_gibbs_baseline_test(
 
 def main():
     """Main function with command line argument parsing."""
-    parser = argparse.ArgumentParser(description='Metal Block Gibbs baseline parameter testing tool')
+    parser = argparse.ArgumentParser(
+        description='CPU Block Gibbs baseline parameter testing tool'
+    )
     parser.add_argument(
         '--timeout', '-t',
         type=float,
         default=10.0,
-        help='Timeout in minutes (default: 10.0)'
+        help='Timeout in minutes (default: 10.0)',
     )
     parser.add_argument(
         '--output', '-o',
         type=str,
-        help='Output JSON file for results'
+        help='Output JSON file for results',
     )
     parser.add_argument(
         '--quick',
         action='store_true',
-        help='Quick test mode (only Light test)'
+        help='Quick test mode (only Light test)',
     )
     parser.add_argument(
         '--extended',
         action='store_true',
-        help='Extended test mode (30 minute timeout)'
+        help='Extended test mode (30 minute timeout)',
     )
     parser.add_argument(
         '--only',
         type=str,
-        help='Run only the config with this description (e.g., "Light Gibbs")'
+        help='Run only the config with this description (e.g., "Light Gibbs")',
     )
     parser.add_argument(
         '--h-values',
         type=str,
         default='-1,0,1',
-        help='Comma-separated h field values (default: -1,0,1). Use "0" for h=0 baseline.'
-    )
-    parser.add_argument(
-        '--num-models',
-        type=int,
-        default=None,
-        help='Number of models to process in parallel (default: auto-detect GPU cores)'
+        help='Comma-separated h field values (default: -1,0,1). Use "0" for h=0 baseline.',
     )
     parser.add_argument(
         '--topology',
         type=str,
-        help='Topology: Z(9,2), Advantage2_system1.12, file path, or *.embed.json.gz for embedded. '
-             'Default: Advantage2_system1.12'
+        help='Zephyr topology: Z(9,2), Advantage2_system1.12, or file path. '
+             'Default: Advantage2_system1.12',
     )
     parser.add_argument(
         '--update-mode',
         type=str,
         choices=['gibbs', 'metropolis'],
         default='gibbs',
-        help='Update mode: gibbs (default) or metropolis'
-    )
-    parser.add_argument(
-        '--parallel',
-        action='store_true',
-        help='Use parallel kernel with threadgroup barriers for true parallel color block updates'
+        help='Acceptance criteria: gibbs (default) or metropolis',
     )
 
     args = parser.parse_args()
-
-    # Auto-detect GPU core count if not specified
-    if args.num_models is None:
-        try:
-            num_models = get_gpu_core_count()
-        except Exception as e:
-            print(f"Could not detect GPU cores ({e}), defaulting to 40 models")
-            num_models = 40
-    else:
-        num_models = args.num_models
 
     # Parse h_values
     h_values = [float(v.strip()) for v in args.h_values.split(',')]
@@ -411,23 +423,18 @@ def main():
     output_file = args.output
     if not output_file:
         timestamp = int(time.time())
-        parallel_suffix = "_parallel" if args.parallel else ""
-        output_file = f"metal_{args.update_mode}{parallel_suffix}_baseline_results_{timestamp}.json"
+        output_file = f"sa_{args.update_mode}_baseline_results_{timestamp}.json"
 
-    # Run test
-    metal_gibbs_baseline_test(
+    sa_gibbs_baseline_test(
         timeout_minutes=timeout,
         output_file=output_file,
-        only_label=only_label,
         h_values=h_values,
-        num_models=num_models,
+        only_label=only_label,
         topology=args.topology,
         update_mode=args.update_mode,
-        parallel=args.parallel
     )
 
-    parallel_str = " (Parallel)" if args.parallel else ""
-    print(f"\nMetal Block {mode_name}{parallel_str} baseline test complete!")
+    print(f"\nCPU Block {mode_name} baseline test complete!")
 
 
 if __name__ == "__main__":

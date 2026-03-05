@@ -30,10 +30,12 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # Copy source code
 COPY pyproject.toml README.md LICENSE ./
-COPY blockchain_base.py ./
 COPY quip_cli.py ./
 COPY shared/ ./shared/
 COPY CPU/ ./CPU/
+COPY GPU/ ./GPU/
+COPY QPU/ ./QPU/
+COPY dwave_topologies/ ./dwave_topologies/
 
 # Install the project in editable mode (registers entry points)
 RUN pip install --no-cache-dir -e . --no-deps
@@ -64,7 +66,7 @@ COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy only necessary application code from builder
-COPY --from=builder /build/blockchain_base.py /build/quip_cli.py ./
+COPY --from=builder /build/quip_cli.py ./
 COPY --from=builder /build/shared/ ./shared/
 COPY --from=builder /build/CPU/ ./CPU/
 
@@ -80,7 +82,7 @@ ENV MINING_DURATION=90m
 ENV DIFFICULTY_ENERGY=-14900
 ENV MIN_DIVERSITY=0.1
 ENV MIN_SOLUTIONS=5
-ENV TOPOLOGY_FILE=dwave_topologies/topologies/advantage2_system1_11.json.gz
+ENV TOPOLOGY_FILE=dwave_topologies/topologies/advantage2_system1_12.json.gz
 
 # Create output directory
 RUN mkdir -p /output
