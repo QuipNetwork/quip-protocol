@@ -65,6 +65,10 @@ log_level = "INFO"  # DEBUG, INFO, WARNING, ERROR
 node_log = "logs/quip-node.log"  # Path to main node log file (optional, defaults to stderr)
 http_log = "logs/quip-node-http.log"  # Path to HTTP/aiohttp log file (optional, suppresses aiohttp logs if not set)
 
+# Telemetry - local JSON output for monitoring
+telemetry_enabled = true   # Write telemetry files (nodes.json, per-block stats)
+telemetry_dir = "telemetry"  # Directory for telemetry output
+
 # if any of the following are defined then they will be spun up as miner processes to mine blocks.
 # By default a single CPU miner is created.
 
