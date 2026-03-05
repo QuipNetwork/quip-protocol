@@ -751,3 +751,30 @@ class FlatLattice:
             coeffs[power] += mu_val
 
         return dict(coeffs)
+
+    def to_flat_lattice_data(self) -> 'FlatLatticeData':
+        """Export flat lattice to a serializable FlatLatticeData object.
+
+        This can be stored in a rainbow table entry for fast reconstruction.
+        """
+        from ..lookup.core import FlatLatticeData
+        return FlatLatticeData(
+            flats=list(self._flats),
+            ranks=list(self._ranks),
+            upper_covers=dict(self._upper_covers),
+        )
+
+    @classmethod
+    def from_flat_lattice_data(
+        cls, matroid: GraphicMatroid, data: 'FlatLatticeData'
+    ) -> 'FlatLattice':
+        """Reconstruct FlatLattice from cached FlatLatticeData.
+
+        O(n) construction vs O(|flats|^2 * |E|) enumeration.
+        """
+        return cls(
+            matroid=matroid,
+            flats=data.flats,
+            ranks=data.ranks,
+            upper_covers=data.upper_covers,
+        )

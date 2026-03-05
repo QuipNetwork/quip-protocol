@@ -13,16 +13,16 @@ Key components:
 from __future__ import annotations
 
 from collections import defaultdict
+from itertools import combinations
 from math import comb
 from typing import Dict, FrozenSet, List, Optional, Tuple, TYPE_CHECKING
 
 from ..polynomial import TuttePolynomial
-from ..graph import Graph
+from ..graph import Graph, MultiGraph
 from .core import (
     GraphicMatroid, FlatLattice, Edge,
     enumerate_flats_with_hasse,
 )
-from ..graphs.series_parallel import compute_contraction_chi
 
 if TYPE_CHECKING:
     from ..synthesis.engine import SynthesisEngine
@@ -157,6 +157,64 @@ class BivariateLaurentPoly:
         coeffs = {k: v for k, v in result.items() if v != 0}
         return TuttePolynomial.from_coefficients(coeffs)
 
+    def divmod(self, other: 'BivariateLaurentPoly') -> Tuple['BivariateLaurentPoly', 'BivariateLaurentPoly']:
+        """Polynomial long division in Z[u, v, v^{-1}].
+
+        Uses graded lexicographic order: (u_pow + v_pow, u_pow) as the
+        monomial ordering. Returns (quotient, remainder).
+        """
+        if not other.coeffs:
+            raise ZeroDivisionError("Division by zero polynomial")
+        if not self.coeffs:
+            return BivariateLaurentPoly.zero(), BivariateLaurentPoly.zero()
+
+        def mono_key(uv: Tuple[int, int]) -> Tuple[int, int]:
+            return (uv[0] + uv[1], uv[0])
+
+        # Leading term of divisor
+        den_leading = max(other.coeffs.keys(), key=mono_key)
+        den_lc = other.coeffs[den_leading]
+
+        quotient: Dict[Tuple[int, int], int] = {}
+        remainder = dict(self.coeffs)
+
+        while remainder:
+            # Leading term of remainder
+            rem_leading = max(remainder.keys(), key=mono_key)
+            rem_lc = remainder[rem_leading]
+
+            # Quotient monomial exponent
+            q_exp = (rem_leading[0] - den_leading[0], rem_leading[1] - den_leading[1])
+
+            # For u-powers, we need non-negative exponents
+            if q_exp[0] < 0:
+                break
+
+            # Check integer divisibility
+            if rem_lc % den_lc != 0:
+                break
+
+            q_coeff = rem_lc // den_lc
+            quotient[q_exp] = quotient.get(q_exp, 0) + q_coeff
+
+            # Subtract q_coeff * u^q_exp * other from remainder
+            for (du, dv), dc in other.coeffs.items():
+                key = (du + q_exp[0], dv + q_exp[1])
+                remainder[key] = remainder.get(key, 0) - q_coeff * dc
+                if remainder[key] == 0:
+                    del remainder[key]
+
+        return BivariateLaurentPoly(quotient), BivariateLaurentPoly(remainder)
+
+    def __floordiv__(self, other: 'BivariateLaurentPoly') -> 'BivariateLaurentPoly':
+        """Exact division (asserts remainder is zero)."""
+        quotient, remainder = self.divmod(other)
+        if not remainder.is_zero():
+            raise ValueError(
+                f"Non-exact division: remainder = {remainder}"
+            )
+        return quotient
+
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, BivariateLaurentPoly):
             return NotImplemented
@@ -201,123 +259,6 @@ def _chi_in_uv(chi_coeffs: Dict[int, int]) -> BivariateLaurentPoly:
     return BivariateLaurentPoly(coeffs)
 
 
-def compute_f_W(
-    lattice: FlatLattice,
-    w_idx: int,
-    t_contracted: Dict[int, BivariateLaurentPoly],
-) -> BivariateLaurentPoly:
-    """Compute f_i(W) = sum_{Z >= W} mu(W, Z) * y^|Z| / (y-1)^{r(Z)} * T(M_i/Z).
-
-    In (u,v) basis:
-    - y^|Z| = (v+1)^|Z|
-    - (y-1)^{r(Z)} = v^{r(Z)}
-    - Division by v^{r(Z)} is a shift
-    - T(M_i/Z) is already in (u,v) form
-
-    Args:
-        lattice: FlatLattice of the shared matroid N
-        w_idx: Index of flat W in the lattice
-        t_contracted: Dict mapping flat index -> T(M_i/Z) in (u,v) form
-    """
-    result = BivariateLaurentPoly.zero()
-
-    # Get all flats Z >= W
-    flats_above = lattice.flats_above_idx(w_idx)
-
-    for z_idx in flats_above:
-        # mu(W, Z)
-        mu_val = lattice._compute_mobius(w_idx, z_idx)
-        if mu_val == 0:
-            continue
-
-        z_flat = lattice.flat_by_idx(z_idx)
-        z_size = len(z_flat)
-        z_rank = lattice.flat_rank_by_idx(z_idx)
-
-        # y^|Z| / (y-1)^{r(Z)} in (u,v) form = (v+1)^|Z| / v^{r(Z)}
-        y_pow = _y_power_in_uv(z_size)
-        y_div_v = y_pow.shift_v(-z_rank)
-
-        # T(M_i/Z) in (u,v) form
-        t_z = t_contracted.get(z_idx)
-        if t_z is None:
-            continue
-
-        # mu(W,Z) * y^|Z| / v^{r(Z)} * T(M_i/Z)
-        term = y_div_v * t_z
-        if mu_val != 1:
-            term = mu_val * term
-
-        result = result + term
-
-    return result
-
-
-def compute_weight(
-    r_N: int,
-    w_idx: int,
-    lattice: FlatLattice,
-    chi_coeffs: Dict[int, int],
-) -> BivariateLaurentPoly:
-    """Compute weight(W) = v^{r(N)} / ((v+1)^|W| * chi(N/W; uv)).
-
-    In (u,v) form:
-    - v^{r(N)} is just a monomial
-    - (v+1)^|W| = y^|W| in (u,v) form
-    - chi(N/W; uv) substitutes q = uv in the characteristic polynomial
-
-    The division is handled via the exact formula:
-    weight(W) = v^{r(N)} * [(v+1)^|W| * chi(N/W; uv)]^{-1}
-
-    But actually, the denominator is a polynomial, so we need a different approach.
-    In practice, the Bonin-de Mier formula uses this in a product:
-    result = sum_W weight(W) * f_1(W) * f_2(W)
-
-    Let's restructure: instead of computing weight(W) as a Laurent poly
-    and multiplying, we fold the (v+1)^|W| and chi terms into the summation.
-
-    Actually, the correct Bonin-de Mier Theorem 6 formula is:
-
-    T(P_N(M1,M2)) = sum_W  [(-1)^{r(W)} * chi(N/W; uv) * v^{r(N)-r(W)}]^{-1}
-                     * ... this isn't right either.
-
-    Let me re-derive from the paper. Theorem 6 in Bonin-de Mier states:
-
-    R(P_N(M1,M2); u,v) = sum_{W flat of N}
-        mu(0,W) * v^{r(N)} / [(v+1)^|W| * chi_W]
-        * f_1(W) * f_2(W)
-
-    where chi_W = chi(N/W; (1+u)(1+v)) = chi(N/W; xy)
-
-    Actually, the exact formulation uses the characteristic polynomial
-    evaluated at xy (not uv). Let me reconsider.
-
-    For simplicity, since the structure is complex, we use the weight as:
-    weight(W) is computed and multiplied with f_1(W) * f_2(W).
-    """
-    W = lattice.flat_by_idx(w_idx)
-    w_size = len(W)
-    w_rank = lattice.flat_rank_by_idx(w_idx)
-
-    # v^{r(N)} as monomial
-    v_rN = BivariateLaurentPoly({(0, r_N): 1})
-
-    # (v+1)^|W| = y^|W|
-    v_plus_1_W = _y_power_in_uv(w_size)
-
-    # chi(N/W; uv)
-    chi_uv = _chi_in_uv(chi_coeffs)
-
-    # Denominator = (v+1)^|W| * chi(N/W; uv)
-    denominator = v_plus_1_W * chi_uv
-
-    # We need v^{r(N)} / denominator, but denominator is a polynomial,
-    # not a monomial. This exact division must work for the formula to hold.
-    # In practice, we'll compute it differently - see theorem6_parallel_connection.
-
-    return v_rN  # Placeholder - actual computation happens in the main formula
-
-
 # =============================================================================
 # THEOREM 6: PARALLEL CONNECTION
 # =============================================================================
@@ -330,23 +271,18 @@ def theorem6_parallel_connection(
 ) -> TuttePolynomial:
     """Compute T(P_N(M1, M2)) via Bonin-de Mier Theorem 6.
 
-    The formula in the rank-generating polynomial basis R(u,v) where u=x-1, v=y-1:
+    The corrected formula in rank-generating basis R(u,v) where u=x-1, v=y-1:
 
-    R(P_N(M1,M2)) = (1/v^{r(N)}) * sum_{W flat of N}
-        mu(0_N, W) * f_1(W) * f_2(W) * (v+1)^|W|
-        * sum_{Z >= W} mu(W,Z) * ...
+    R(P_N(M1,M2); u,v) = v^{r(N)} * sum_{W flat of N}
+        [1 / ((v+1)^{|W|} * chi(N/W; uv))]
+        * g_1(W) * g_2(W)
 
-    Actually, the cleaned-up version from the paper:
+    where:
+        g_i(W) = sum_{Z >= W} mu(W,Z) * (v+1)^{|Z|} * v^{-r(Z)} * R(M_i/Z; u,v)
 
-    T(P_N(M1,M2); x,y) = sum_{A flat of N} mu(0,A)
-        * (y-1)^{-r(N)} * y^{|A|}
-        * prod_{i=1,2} [ sum_{B >= A} mu(A,B) * T(M_i/B; x,y) / (y-1)^{r(B)-r(A)} ]
-
-    Or equivalently in (u,v) form:
-    R = v^{-r(N)} * sum_{A flat} mu(0,A) * (v+1)^{|A|}
-        * prod_i [ sum_{B >= A} mu(A,B) * R(M_i/B) * v^{r(A)-r(B)} ]
-
-    The v^{-r(N)} at the front will cancel with v-powers from the inner sums.
+    Uses common-denominator accumulation to handle the 1/chi denominator:
+    numerator and denominator are accumulated separately, then exact
+    division is performed at the end (guaranteed by theory).
 
     Args:
         lattice_N: FlatLattice of the shared matroid N
@@ -360,81 +296,555 @@ def theorem6_parallel_connection(
     # Precompute Mobius from bottom for all flats
     lattice_N.precompute_all_mobius_from_bottom()
 
-    result = BivariateLaurentPoly.zero()
+    # Common-denominator accumulation: result = result_n / result_d
+    result_n = BivariateLaurentPoly.zero()
+    result_d = BivariateLaurentPoly.one()
 
-    for a_idx in range(lattice_N.num_flats):
-        # mu(0, A)
-        mu_0A = lattice_N._mobius_from_bottom.get(a_idx, 0)
-        if mu_0A == 0:
+    for w_idx in range(lattice_N.num_flats):
+        w_flat = lattice_N.flat_by_idx(w_idx)
+        w_size = len(w_flat)
+
+        # Compute g_1(W) and g_2(W)
+        g1 = _compute_g_for_flat(lattice_N, w_idx, T_M1_contracted)
+        g2 = _compute_g_for_flat(lattice_N, w_idx, T_M2_contracted)
+
+        if g1.is_zero() or g2.is_zero():
             continue
 
-        a_flat = lattice_N.flat_by_idx(a_idx)
-        a_size = len(a_flat)
-        a_rank = lattice_N.flat_rank_by_idx(a_idx)
+        # Denominator for this flat: (v+1)^{|W|} * chi(N/W; uv)
+        chi_coeffs = lattice_N.characteristic_poly_coeffs(contraction_flat=w_flat)
+        chi_uv = _chi_in_uv(chi_coeffs)
+        y_pow_w = _y_power_in_uv(w_size)
+        denom_W = y_pow_w * chi_uv
 
-        # (v+1)^|A|
-        v_plus_1_A = _y_power_in_uv(a_size)
+        # Numerator for this flat: g_1(W) * g_2(W)
+        numer_W = g1 * g2
 
-        # Compute f_1(A) and f_2(A)
-        # f_i(A) = sum_{B >= A} mu(A,B) * R(M_i/B) * v^{r(A)-r(B)}
-        f1 = _compute_f_for_flat(lattice_N, a_idx, a_rank, T_M1_contracted)
-        f2 = _compute_f_for_flat(lattice_N, a_idx, a_rank, T_M2_contracted)
+        # Accumulate: result_n/result_d += numer_W/denom_W
+        # = (result_n * denom_W + numer_W * result_d) / (result_d * denom_W)
+        result_n = result_n * denom_W + numer_W * result_d
+        result_d = result_d * denom_W
 
-        if f1.is_zero() or f2.is_zero():
-            continue
+    # Final: v^{r(N)} * result_n / result_d
+    v_rN = BivariateLaurentPoly({(0, r_N): 1})
+    final_n = v_rN * result_n
 
-        # Combine: mu(0,A) * (v+1)^|A| * f_1(A) * f_2(A)
-        term = v_plus_1_A * f1 * f2
-        if mu_0A != 1:
-            term = mu_0A * term
-
-        result = result + term
-
-    # Multiply by v^{-r(N)} (shift all v-powers down by r_N)
-    result = result.shift_v(-r_N)
+    # Exact division (guaranteed by theory)
+    result = final_n // result_d
 
     # Convert back to T(x,y)
     return result.to_tutte_poly()
 
 
-def _compute_f_for_flat(
+def _compute_g_for_flat(
     lattice: FlatLattice,
-    a_idx: int,
-    a_rank: int,
+    w_idx: int,
     t_contracted: Dict[int, BivariateLaurentPoly],
 ) -> BivariateLaurentPoly:
-    """Compute f_i(A) = sum_{B >= A} mu(A,B) * R(M_i/B) * v^{r(A)-r(B)}.
+    """Compute g_i(W) = sum_{Z >= W} mu(W,Z) * (v+1)^{|Z|} * v^{-r(Z)} * R(M_i/Z).
 
     Args:
         lattice: FlatLattice of shared matroid
-        a_idx: Index of flat A
-        a_rank: Rank of flat A
-        t_contracted: Pre-computed T(M_i/B) in BivariateLaurentPoly form
+        w_idx: Index of flat W
+        t_contracted: Pre-computed T(M_i/Z) in BivariateLaurentPoly form
     """
     result = BivariateLaurentPoly.zero()
 
-    flats_above = lattice.flats_above_idx(a_idx)
+    flats_above = lattice.flats_above_idx(w_idx)
 
-    # Precompute Mobius from A for efficiency
-    lattice.precompute_mobius_from(lattice.flat_by_idx(a_idx))
+    # Precompute Mobius from W for efficiency
+    lattice.precompute_mobius_from(lattice.flat_by_idx(w_idx))
 
-    for b_idx in flats_above:
-        mu_AB = lattice._compute_mobius(a_idx, b_idx)
-        if mu_AB == 0:
+    for z_idx in flats_above:
+        mu_WZ = lattice._compute_mobius(w_idx, z_idx)
+        if mu_WZ == 0:
             continue
 
-        t_b = t_contracted.get(b_idx)
-        if t_b is None:
+        t_z = t_contracted.get(z_idx)
+        if t_z is None:
             continue
 
-        b_rank = lattice.flat_rank_by_idx(b_idx)
+        z_flat = lattice.flat_by_idx(z_idx)
+        z_size = len(z_flat)
+        z_rank = lattice.flat_rank_by_idx(z_idx)
 
-        # v^{r(A) - r(B)} — note this is negative since r(B) >= r(A)
-        v_shift = a_rank - b_rank
+        # (v+1)^{|Z|} * v^{-r(Z)} * R(M_i/Z)
+        y_pow_z = _y_power_in_uv(z_size)
+        term = y_pow_z * t_z.shift_v(-z_rank)
 
-        term = t_b.shift_v(v_shift)
-        if mu_AB != 1:
-            term = mu_AB * term
+        if mu_WZ != 1:
+            term = mu_WZ * term
+
+        result = result + term
+
+    return result
+
+
+# =============================================================================
+# THEOREM 10: K-SUM VIA DELETION OF SHARED EDGES
+# =============================================================================
+
+def theorem10_k_sum(
+    pc_graph: Graph,
+    shared_edges: List[Edge],
+    engine: 'SynthesisEngine',
+) -> TuttePolynomial:
+    r"""Compute T(G1 ⊕_k G2) = T(P_N(M1,M2) \ T) via corrected inclusion-exclusion.
+
+    The k-sum is the parallel connection with all shared edges deleted.
+    Uses the identity:
+
+        T(M\T) = sum_{S⊆T} (-1)^|S| (y-1)^{n(S)} T(M/S)
+
+    where n(S) = |S| - r(S) is the nullity (number of dependent edges) of S
+    in the graphic matroid. The (y-1)^{n(S)} correction accounts for edges
+    that become loops after partial contraction — the naive formula without
+    this factor is only correct when all subsets S are independent.
+
+    Complexity: O(2^|T|) synthesis calls. Efficient for |T| <= ~10.
+
+    Args:
+        pc_graph: The parallel connection graph P_N(G1, G2)
+        shared_edges: List of shared edges to delete (= E(N))
+        engine: SynthesisEngine for computing Tutte polynomials
+
+    Returns:
+        TuttePolynomial for the k-sum
+    """
+    from itertools import combinations
+
+    result = TuttePolynomial.zero()
+
+    for k in range(len(shared_edges) + 1):
+        sign = (-1) ** k
+        for S in combinations(shared_edges, k):
+            # Compute nullity of S in the graphic matroid
+            nullity = _edge_set_nullity(S)
+
+            # Contract subset S in the PC graph
+            mg = _contract_edges_in_graph(pc_graph, frozenset(S))
+            poly = engine._synthesize_multigraph(mg)
+
+            # Apply nullity correction: multiply by (y-1)^{n(S)}
+            if nullity > 0:
+                poly = _y_minus_1_power(nullity) * poly
+
+            if sign == -1:
+                poly = -poly
+            result = result + poly
+
+    return result
+
+
+def _edge_set_nullity(edges: tuple) -> int:
+    """Compute nullity n(S) = |S| - r(S) of an edge set in its graphic matroid.
+
+    r(S) = number of edges in a spanning forest of the subgraph formed by S,
+    computed via union-find.
+    """
+    if not edges:
+        return 0
+
+    parent = {}
+
+    def find(x):
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent[x], parent[x])
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx == ry:
+            return False
+        parent[rx] = ry
+        return True
+
+    rank = 0
+    for u, v in edges:
+        parent.setdefault(u, u)
+        parent.setdefault(v, v)
+        if union(u, v):
+            rank += 1
+
+    return len(edges) - rank
+
+
+def _y_minus_1_power(k: int) -> TuttePolynomial:
+    """Compute (y-1)^k as a TuttePolynomial."""
+    coeffs: Dict[Tuple[int, int], int] = {}
+    for j in range(k + 1):
+        coeff = comb(k, j) * ((-1) ** (k - j))
+        if coeff != 0:
+            coeffs[(0, j)] = coeff
+    return TuttePolynomial.from_coefficients(coeffs)
+
+
+# =============================================================================
+# THEOREM 10 OPTIMIZED: K-SUM VIA FLAT-GROUPED THEOREM 6
+# =============================================================================
+
+def theorem10_k_sum_via_theorem6(
+    ksum_graph: Graph,
+    separator: Tuple[int, ...],
+    k: int,
+    engine: 'SynthesisEngine',
+) -> TuttePolynomial:
+    r"""Compute T(G1 ⊕_k G2) using flat-grouped Theorem 6, avoiding brute-force 2^|T|.
+
+    Instead of iterating over all 2^|T| subsets of shared edges T (where |T| = C(k,2)),
+    this groups subsets by their closure (flat) in the shared matroid N = M(K_k).
+    Subsets with the same closure produce the same contracted matroid, collapsing
+    2^|T| terms into |flats(N)| terms.
+
+    For K_k on k vertices:
+    - k=4: 15 flats vs 64 subsets
+    - k=5: 52 flats vs 1024 subsets
+
+    Each flat term uses polynomial arithmetic (BivariateLaurentPoly multiplication)
+    instead of graph synthesis.
+
+    Algorithm:
+    1. Decompose ksum_graph into two cells by splitting at separator vertices
+    2. Build shared matroid N = M(K_k) on separator vertices
+    3. Build flat lattice of N
+    4. For each cell, build extended graph (cell + separator clique edges)
+    5. Precompute T(M_i/Z) for all flats Z
+    6. For each flat F, compute:
+       - coefficient(F) = Σ_{S: cl(S)=F} (-1)^|S| · (y-1)^{nullity(S)}
+       - T(PC/F) via Theorem 6 restricted to flats >= F
+    7. Sum: T(ksum) = Σ_F coefficient(F) · T(PC/F)
+
+    Args:
+        ksum_graph: The k-sum graph (with clique edges already deleted)
+        separator: Tuple of k separator vertices
+        k: Number of shared vertices
+        engine: SynthesisEngine for computing Tutte polynomials
+
+    Returns:
+        TuttePolynomial for the k-sum
+    """
+    sv = sorted(separator)
+
+    # Build the shared clique edges (K_k on separator vertices)
+    clique_edges = [(sv[i], sv[j]) for i in range(k) for j in range(i + 1, k)]
+    clique_edges_set = frozenset(clique_edges)
+
+    # Reconstruct the parallel connection graph
+    pc_edges = ksum_graph.edges | clique_edges_set
+    pc_graph = Graph(nodes=ksum_graph.nodes, edges=pc_edges)
+
+    # Split into two cells at separator vertices
+    sep_set = set(sv)
+    remaining_nodes = ksum_graph.nodes - sep_set
+
+    # Find connected components of remaining nodes in ksum_graph
+    visited = set()
+    components = []
+    for start in sorted(remaining_nodes):
+        if start in visited:
+            continue
+        comp = set()
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            if node in comp:
+                continue
+            comp.add(node)
+            for nb in ksum_graph.neighbors(node):
+                if nb not in comp and nb not in sep_set:
+                    stack.append(nb)
+        visited |= comp
+        components.append(comp)
+
+    if len(components) != 2:
+        raise ValueError(f"Expected 2 components after removing separator, got {len(components)}")
+
+    cell1_nodes = components[0] | sep_set
+    cell2_nodes = components[1] | sep_set
+
+    # Build the shared matroid N = graphic matroid of K_k
+    inter_graph = Graph(
+        nodes=frozenset(sv),
+        edges=clique_edges_set,
+    )
+    matroid_N = GraphicMatroid(inter_graph)
+    r_N = matroid_N.rank()
+
+    # Build flat lattice of N
+    flats, ranks, upper_covers = enumerate_flats_with_hasse(matroid_N)
+    lattice_N = FlatLattice(matroid_N, flats=flats, ranks=ranks, upper_covers=upper_covers)
+
+    # Build extended cell graphs (cell + clique edges touching it)
+    # Since all separator vertices are in both cells, all clique edges touch both cells
+    ext1, shared1 = build_extended_cell_graph(pc_graph, cell1_nodes, clique_edges)
+    ext2, shared2 = build_extended_cell_graph(pc_graph, cell2_nodes, clique_edges)
+
+    # Precompute T(M_i/Z) for all flats Z of N
+    t_m1 = precompute_contractions(ext1, shared1, lattice_N, engine)
+    t_m2 = precompute_contractions(ext2, shared2, lattice_N, engine)
+
+    # Precompute all Mobius values
+    lattice_N.precompute_all_mobius_from_bottom()
+
+    # For each flat F, compute coefficient and T(PC/F)
+    result_uv = BivariateLaurentPoly.zero()
+
+    for f_idx in range(lattice_N.num_flats):
+        f_flat = lattice_N.flat_by_idx(f_idx)
+        f_rank = lattice_N.flat_rank_by_idx(f_idx)
+
+        # Compute flat coefficient
+        coeff = _compute_flat_coefficient(matroid_N, lattice_N, f_idx)
+        if coeff.is_zero():
+            continue
+
+        # Compute T(PC/F) via Theorem 6 on the interval [F, top]
+        t_pc_f = _theorem6_for_contraction(lattice_N, f_idx, t_m1, t_m2, r_N)
+
+        # Convert T(PC/F) to uv-basis and multiply by coefficient
+        t_pc_f_uv = BivariateLaurentPoly.from_tutte(t_pc_f)
+        result_uv = result_uv + coeff * t_pc_f_uv
+
+    # Convert back to Tutte polynomial
+    return result_uv.to_tutte_poly()
+
+
+def _compute_flat_coefficient(
+    matroid_N: GraphicMatroid,
+    lattice_N: FlatLattice,
+    f_idx: int,
+) -> BivariateLaurentPoly:
+    r"""Compute the flat coefficient for flat F in the deletion formula.
+
+    coeff(F) = Σ_{S ⊆ T : cl(S) = F} (-1)^|S| · (y-1)^{nullity(S)}
+
+    Since cl(S) = F implies r(S) = r(F) for all such S (S spans the flat F),
+    the nullity is |S| - r(F). So:
+
+    coeff(F) = Σ_{S ⊆ F : cl(S) = F} (-1)^|S| · (y-1)^{|S| - r(F)}
+
+    In the uv-basis (v = y-1):
+
+    coeff(F) = Σ_{S ⊆ F : cl(S) = F} (-1)^|S| · v^{|S| - r(F)}
+
+    The count of subsets S ⊆ F with cl(S) = F and |S| = j is computed via
+    Mobius inversion over the lattice interval [bottom, F]:
+
+    #{S ⊆ F : cl(S) = F, |S| = j} = C(|F|, j) - Σ_{G < F} #{S ⊆ G : cl(S) = G, |S| = j}
+
+    But we can compute this more directly: the number of subsets of F with
+    closure exactly F is obtained by inclusion-exclusion over proper subflats.
+
+    #{S ⊆ F : cl(S) = F} = Σ_{G ≤ F} μ(G, F) · 2^{|G|}
+
+    So coeff(F) = Σ_{G ≤ F} μ(G, F) · Σ_{j=0}^{|G|} C(|G|,j) · (-1)^j · v^{j - r(F)}
+
+    = v^{-r(F)} · Σ_{G ≤ F} μ(G, F) · Σ_{j=0}^{|G|} C(|G|,j) · (-v)^j · (-1)^0
+
+    Wait, let's be more careful. We need subsets S of F with cl(S) = F.
+
+    Using Mobius inversion on the lattice:
+    #{S ⊆ F : cl(S) = F} = Σ_{G ≤ F} μ(G, F) · 2^{|G|}
+
+    For the weighted version with (-1)^|S| · v^{|S| - r(F)}:
+    coeff(F) = v^{-r(F)} · Σ_{G ≤ F} μ(G, F) · Σ_{j} C(|G|,j)(-1)^j v^j
+             = v^{-r(F)} · Σ_{G ≤ F} μ(G, F) · (1-v)^{|G|}
+             = v^{-r(F)} · Σ_{G ≤ F} μ(G, F) · (2-y)^{|G|}
+
+    In u,v basis: (1-v) is just the constant 2-y = 2-(v+1) = 1-v.
+    So (1-v)^n = Σ_j C(n,j)(-v)^j = Σ_j C(n,j)(-1)^j v^j.
+
+    Args:
+        matroid_N: The shared matroid
+        lattice_N: Flat lattice of N
+        f_idx: Index of flat F
+
+    Returns:
+        BivariateLaurentPoly representing the coefficient
+    """
+    f_flat = lattice_N.flat_by_idx(f_idx)
+    f_rank = lattice_N.flat_rank_by_idx(f_idx)
+
+    # coeff(F) = v^{-r(F)} · Σ_{G ≤ F} μ(G, F) · (1-v)^{|G|}
+    # We iterate over all flats G ≤ F
+
+    # Precompute Mobius from all flats below F to F
+    # We need mu(G, F) for G <= F
+    # Use the interval: iterate over flats with rank <= r(F) that are subsets of F
+    flats_below_f = []
+    for g_idx in range(lattice_N.num_flats):
+        g_flat = lattice_N.flat_by_idx(g_idx)
+        if g_flat.issubset(f_flat):
+            flats_below_f.append(g_idx)
+
+    # Precompute Mobius values mu(G, F) for all G <= F
+    # We need to compute these via the lattice
+    accumulator = BivariateLaurentPoly.zero()
+
+    for g_idx in flats_below_f:
+        mu_gf = lattice_N._compute_mobius(g_idx, f_idx)
+        if mu_gf == 0:
+            continue
+
+        g_flat = lattice_N.flat_by_idx(g_idx)
+        g_size = len(g_flat)
+
+        # (1-v)^{|G|} = Σ_{j=0}^{|G|} C(|G|,j) (-1)^j v^j
+        one_minus_v_pow: Dict[Tuple[int, int], int] = {}
+        for j in range(g_size + 1):
+            coeff_val = comb(g_size, j) * ((-1) ** j)
+            if coeff_val != 0:
+                one_minus_v_pow[(0, j)] = coeff_val
+
+        term = BivariateLaurentPoly(one_minus_v_pow)
+        if mu_gf != 1:
+            term = mu_gf * term
+
+        accumulator = accumulator + term
+
+    # Multiply by v^{-r(F)}
+    return accumulator.shift_v(-f_rank)
+
+
+def _theorem6_for_contraction(
+    lattice_N: FlatLattice,
+    f_idx: int,
+    t_m1: Dict[int, BivariateLaurentPoly],
+    t_m2: Dict[int, BivariateLaurentPoly],
+    r_N: int,
+) -> TuttePolynomial:
+    """Compute T(PC/F) for a flat F using Theorem 6 on the interval [F, top].
+
+    When we contract flat F in the parallel connection, the result is a
+    parallel connection of contracted cells over the contracted shared matroid N/F.
+
+    T(PC/F) is computed via Theorem 6 with:
+    - Lattice restricted to flats >= F (the interval [F, top] in the lattice of N)
+    - Cell contractions T(M_i/Z) for flats Z >= F (already precomputed)
+    - Rank of contracted matroid = r(N) - r(F)
+
+    The formula becomes:
+    R(PC/F; u,v) = v^{r(N/F)} · Σ_{W >= F}
+        [1 / ((v+1)^{|W|-|F|} · chi(N/W; uv))]
+        · g_1^F(W) · g_2^F(W)
+
+    where g_i^F(W) uses Mobius values mu(W, Z) in the interval [F, top]
+    and T(M_i/Z) for Z >= F, with rank adjustments.
+
+    Note: The characteristic polynomial chi(N/W) is the same regardless of F,
+    since it only depends on the interval [W, top].
+
+    Args:
+        lattice_N: Full flat lattice of N
+        f_idx: Index of flat F to contract
+        t_m1: Precomputed T(M1/Z) for all flats Z
+        t_m2: Precomputed T(M2/Z) for all flats Z
+        r_N: Rank of full matroid N
+
+    Returns:
+        TuttePolynomial for T(PC/F)
+    """
+    f_flat = lattice_N.flat_by_idx(f_idx)
+    f_rank = lattice_N.flat_rank_by_idx(f_idx)
+    f_size = len(f_flat)
+    contracted_rank = r_N - f_rank
+
+    # Get flats above F (the interval [F, top])
+    flats_above_f = lattice_N.flats_above_idx(f_idx)
+
+    # Precompute Mobius from each W >= F within the interval
+    for w_idx in flats_above_f:
+        lattice_N.precompute_mobius_from(lattice_N.flat_by_idx(w_idx))
+
+    # Common-denominator accumulation
+    result_n = BivariateLaurentPoly.zero()
+    result_d = BivariateLaurentPoly.one()
+
+    for w_idx in flats_above_f:
+        w_flat = lattice_N.flat_by_idx(w_idx)
+        w_rank = lattice_N.flat_rank_by_idx(w_idx)
+
+        # In the contracted matroid N/F:
+        # - Size of flat W/F = |W| - |F|
+        # - Rank of W/F = r(W) - r(F)
+        w_contracted_size = len(w_flat) - f_size
+        w_contracted_rank = w_rank - f_rank
+
+        # Compute g_1^F(W) and g_2^F(W) in the interval [F, top]
+        # g_i^F(W) = Σ_{Z >= W, Z in [F,top]} mu(W,Z) · (v+1)^{|Z|-|F|} · v^{-(r(Z)-r(F))} · R(M_i/Z)
+        g1 = _compute_g_for_contracted_flat(lattice_N, w_idx, f_idx, t_m1, flats_above_f)
+        g2 = _compute_g_for_contracted_flat(lattice_N, w_idx, f_idx, t_m2, flats_above_f)
+
+        if g1.is_zero() or g2.is_zero():
+            continue
+
+        # Denominator: (v+1)^{|W|-|F|} · chi(N/W; uv)
+        chi_coeffs = lattice_N.characteristic_poly_coeffs(contraction_flat=w_flat)
+        chi_uv = _chi_in_uv(chi_coeffs)
+        y_pow_w = _y_power_in_uv(w_contracted_size)
+        denom_W = y_pow_w * chi_uv
+
+        # Numerator: g1(W) · g2(W)
+        numer_W = g1 * g2
+
+        # Accumulate fractions
+        result_n = result_n * denom_W + numer_W * result_d
+        result_d = result_d * denom_W
+
+    # Final: v^{contracted_rank} · result_n / result_d
+    v_r = BivariateLaurentPoly({(0, contracted_rank): 1})
+    final_n = v_r * result_n
+
+    if result_d.is_zero() or final_n.is_zero():
+        return TuttePolynomial.one()
+
+    result = final_n // result_d
+    return result.to_tutte_poly()
+
+
+def _compute_g_for_contracted_flat(
+    lattice: FlatLattice,
+    w_idx: int,
+    f_idx: int,
+    t_contracted: Dict[int, BivariateLaurentPoly],
+    interval_flats: List[int],
+) -> BivariateLaurentPoly:
+    """Compute g_i^F(W) for the contracted lattice interval [F, top].
+
+    g_i^F(W) = Σ_{Z >= W, Z in interval} mu(W,Z) · (v+1)^{|Z|-|F|} · v^{-(r(Z)-r(F))} · R(M_i/Z)
+
+    This is analogous to _compute_g_for_flat but with rank/size offsets for contraction.
+    """
+    f_size = len(lattice.flat_by_idx(f_idx))
+    f_rank = lattice.flat_rank_by_idx(f_idx)
+
+    result = BivariateLaurentPoly.zero()
+    w_flat = lattice.flat_by_idx(w_idx)
+
+    for z_idx in interval_flats:
+        z_flat = lattice.flat_by_idx(z_idx)
+        if not w_flat.issubset(z_flat):
+            continue
+
+        mu_WZ = lattice._compute_mobius(w_idx, z_idx)
+        if mu_WZ == 0:
+            continue
+
+        t_z = t_contracted.get(z_idx)
+        if t_z is None:
+            continue
+
+        # Contracted sizes/ranks relative to F
+        z_contracted_size = len(z_flat) - f_size
+        z_contracted_rank = lattice.flat_rank_by_idx(z_idx) - f_rank
+
+        # (v+1)^{|Z|-|F|} · v^{-(r(Z)-r(F))} · R(M_i/Z)
+        y_pow_z = _y_power_in_uv(z_contracted_size)
+        term = y_pow_z * t_z.shift_v(-z_contracted_rank)
+
+        if mu_WZ != 1:
+            term = mu_WZ * term
 
         result = result + term
 
@@ -479,66 +889,91 @@ def precompute_contractions(
             continue
 
         # Contract edges in z_flat within graph_i
-        # These edges are in the inter-cell portion of graph_i
-        contracted_graph = _contract_edges_in_graph(graph_i, z_flat)
+        # Returns a MultiGraph (contraction can create parallel edges)
+        contracted_mg = _contract_edges_in_graph(graph_i, z_flat)
 
-        if contracted_graph.edge_count() == 0:
+        if contracted_mg.edge_count() == 0:
             result[z_idx] = BivariateLaurentPoly.from_tutte(TuttePolynomial.one())
             continue
 
-        synth_result = engine.synthesize(contracted_graph)
-        result[z_idx] = BivariateLaurentPoly.from_tutte(synth_result.polynomial)
+        # Use multigraph synthesis to handle parallel edges correctly
+        poly = engine._synthesize_multigraph(contracted_mg)
+        result[z_idx] = BivariateLaurentPoly.from_tutte(poly)
 
     return result
 
 
 def _contract_edges_in_graph(
     graph: Graph, edges_to_contract: FrozenSet[Edge]
-) -> Graph:
+) -> MultiGraph:
     """Contract specified edges in a graph by merging endpoints.
 
     For each edge in edges_to_contract that exists in graph,
-    merge the endpoints. Edges not in graph are ignored.
-    Resulting loops are removed (simple graph output).
+    merge the endpoints. Returns a MultiGraph because contraction
+    can create parallel edges (e.g., contracting one edge of a triangle
+    produces two parallel edges between the remaining nodes).
+    Loops (from contracting edges within a cycle) are tracked.
+
+    Uses union-find to track node remapping across sequential contractions,
+    so that later edges correctly reference nodes that were merged earlier.
     """
-    all_nodes = set(graph.nodes)
-    parent = {v: v for v in all_nodes}
-    rank = {v: 0 for v in all_nodes}
+    # Start from a MultiGraph representation
+    mg = MultiGraph.from_graph(graph)
+
+    # Track node remapping: when merge_nodes(u, v) is called,
+    # the removed node (max(u,v)) maps to the survivor (min(u,v)).
+    node_map = {n: n for n in mg.nodes}
 
     def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
+        """Find current representative of node x."""
+        while node_map.get(x, x) != x:
+            # Path compression
+            node_map[x] = node_map.get(node_map[x], node_map[x])
+            x = node_map[x]
         return x
 
-    def union(x, y):
-        rx, ry = find(x), find(y)
-        if rx != ry:
-            if rank[rx] < rank[ry]:
-                rx, ry = ry, rx
-            parent[ry] = rx
-            if rank[rx] == rank[ry]:
-                rank[rx] += 1
-
-    # Contract specified edges
+    # Contract each edge by merging its endpoints
     for u, v in edges_to_contract:
-        if u in all_nodes and v in all_nodes:
-            union(u, v)
-
-    # Build contracted graph
-    node_map = {n: find(n) for n in all_nodes}
-    new_nodes = frozenset(node_map.values())
-
-    new_edges = set()
-    for u, v in graph.edges:
-        if (u, v) in edges_to_contract:
+        # Map to current representatives
+        ru, rv = find(u), find(v)
+        if ru == rv:
+            # Edge has become a loop due to prior merges.
+            # Contracting a loop in a matroid removes it.
+            if ru in mg.loop_counts and mg.loop_counts[ru] > 0:
+                new_loops = dict(mg.loop_counts)
+                new_loops[ru] -= 1
+                if new_loops[ru] <= 0:
+                    del new_loops[ru]
+                mg = MultiGraph(
+                    nodes=mg.nodes,
+                    edge_counts=dict(mg.edge_counts),
+                    loop_counts=new_loops,
+                )
             continue
-        nu, nv = node_map[u], node_map[v]
-        if nu != nv:
-            edge = (min(nu, nv), max(nu, nv))
-            new_edges.add(edge)
+        if ru not in mg.nodes or rv not in mg.nodes:
+            continue
 
-    return Graph(nodes=new_nodes, edges=frozenset(new_edges))
+        # Remove the contracted edge itself first, then merge
+        edge = (min(ru, rv), max(ru, rv))
+        new_edge_counts = dict(mg.edge_counts)
+        if edge in new_edge_counts:
+            new_edge_counts[edge] -= 1
+            if new_edge_counts[edge] <= 0:
+                del new_edge_counts[edge]
+
+        mg = MultiGraph(
+            nodes=mg.nodes,
+            edge_counts=new_edge_counts,
+            loop_counts=dict(mg.loop_counts),
+        )
+        mg = mg.merge_nodes(ru, rv)
+
+        # Update node_map: the removed node maps to the survivor
+        survivor = min(ru, rv)
+        removed = max(ru, rv)
+        node_map[removed] = survivor
+
+    return mg
 
 
 # =============================================================================

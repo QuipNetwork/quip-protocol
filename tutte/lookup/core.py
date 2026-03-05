@@ -29,6 +29,18 @@ from ..polynomial import TuttePolynomial, encode_varuint, decode_varuint
 # =============================================================================
 
 @dataclass
+class FlatLatticeData:
+    """Serializable flat lattice data for a graphic matroid.
+
+    Stores the flat lattice structure so it can be reconstructed
+    without re-enumerating flats (O(n) vs O(|flats|^2 * |E|)).
+    """
+    flats: List[frozenset]  # List of flats (each a frozenset of (int,int) edges), sorted by rank
+    ranks: List[int]  # Rank of each flat
+    upper_covers: Dict[int, List[int]]  # Hasse diagram: flat_idx -> list of immediate successors
+
+
+@dataclass
 class MinorEntry:
     """An entry in the rainbow table."""
     name: str
@@ -40,6 +52,7 @@ class MinorEntry:
     num_terms: int
     graph: Optional['Graph'] = None  # Stored graph for tiling reconstruction
     signature: Optional['CellSignature'] = None  # Cached signature for fast matching
+    flat_data: Optional[FlatLatticeData] = None  # Cached flat lattice for matroid ops
 
     def get_signature(self) -> Optional['CellSignature']:
         """Get or compute the cell signature for this entry."""
@@ -165,6 +178,21 @@ class RainbowTable:
 
             polynomial = TuttePolynomial.from_coefficients(coeffs)
 
+            # Parse flat lattice data if present
+            flat_data = None
+            if 'flat_data' in entry_data:
+                fd = entry_data['flat_data']
+                flats = [
+                    frozenset(tuple(e) for e in flat_list)
+                    for flat_list in fd['flats']
+                ]
+                upper_covers = {int(k): v for k, v in fd['upper_covers'].items()}
+                flat_data = FlatLatticeData(
+                    flats=flats,
+                    ranks=fd['ranks'],
+                    upper_covers=upper_covers,
+                )
+
             entry = MinorEntry(
                 name=entry_data.get('name', 'unknown'),
                 polynomial=polynomial,
@@ -173,6 +201,7 @@ class RainbowTable:
                 canonical_key=key,
                 spanning_trees=entry_data.get('spanning_trees', 0),
                 num_terms=entry_data.get('num_terms', len(coeffs)),
+                flat_data=flat_data,
             )
 
             table.entries[key] = entry
@@ -196,7 +225,7 @@ class RainbowTable:
             for (i, j), c in entry.polynomial.to_coefficients().items():
                 coeffs[f"{i},{j}"] = c
 
-            graphs[key] = {
+            entry_dict = {
                 'name': entry.name,
                 'nodes': entry.node_count,
                 'edges': entry.edge_count,
@@ -207,6 +236,17 @@ class RainbowTable:
                 'polynomial_str': str(entry.polynomial),
                 'coefficients': coeffs,
             }
+
+            # Serialize flat lattice data if present
+            if entry.flat_data is not None:
+                fd = entry.flat_data
+                entry_dict['flat_data'] = {
+                    'flats': [sorted(list(f)) for f in fd.flats],
+                    'ranks': fd.ranks,
+                    'upper_covers': {str(k): v for k, v in fd.upper_covers.items()},
+                }
+
+            graphs[key] = entry_dict
 
         data = {
             'description': 'Tutte Polynomial Rainbow Table',

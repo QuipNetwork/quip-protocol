@@ -1010,6 +1010,101 @@ def disjoint_union(g1: Graph, g2: Graph) -> Graph:
     )
 
 
+def parallel_connection_graph(g1: Graph, g2: Graph, shared_edge: Tuple[int, int]) -> Graph:
+    """Build P_N(G1, G2) by identifying a shared edge.
+
+    Relabels g2 nodes to avoid collision with g1,
+    identifies the shared edge endpoints, keeps the shared edge.
+
+    Args:
+        g1: First graph
+        g2: Second graph
+        shared_edge: Edge (u, v) present in both graphs. The endpoints of
+            this edge in g2 are mapped to the corresponding endpoints in g1.
+
+    Returns:
+        The parallel connection graph P_N(G1, G2).
+    """
+    u, v = shared_edge
+    if u not in g1.nodes or v not in g1.nodes:
+        raise ValueError(f"Shared edge ({u}, {v}) not in g1")
+
+    # Find the shared edge in g2 (try both orientations)
+    e_g2 = (min(u, v), max(u, v))
+    if e_g2 not in g2.edges:
+        raise ValueError(f"Shared edge {e_g2} not in g2")
+
+    # Relabel g2 nodes, mapping shared endpoints to g1's
+    offset = max(g1.nodes) + 1 if g1.nodes else 0
+    g2_node_map = {u: u, v: v}  # Keep shared endpoints
+    for n in g2.nodes:
+        if n not in g2_node_map:
+            g2_node_map[n] = n + offset
+
+    g2_nodes = frozenset(g2_node_map[n] for n in g2.nodes)
+    g2_edges = set()
+    for a, b in g2.edges:
+        na, nb = g2_node_map[a], g2_node_map[b]
+        g2_edges.add((min(na, nb), max(na, nb)))
+
+    return Graph(
+        nodes=g1.nodes | g2_nodes,
+        edges=g1.edges | frozenset(g2_edges),
+    )
+
+
+def k_sum_graph(g1: Graph, g2: Graph, k: int, shared_vertices: List[int]) -> Graph:
+    """Build G1 ⊕_k G2 by identifying k vertices, deleting shared clique edges.
+
+    Args:
+        g1: First graph (must contain all shared_vertices)
+        g2: Second graph (must contain all shared_vertices)
+        k: Number of shared vertices
+        shared_vertices: List of k vertex labels present in both graphs.
+            These vertices are identified, and all edges of the K_k clique
+            among them are deleted from the result.
+
+    Returns:
+        The k-sum graph G1 ⊕_k G2.
+    """
+    if len(shared_vertices) != k:
+        raise ValueError(f"Expected {k} shared vertices, got {len(shared_vertices)}")
+
+    shared_set = set(shared_vertices)
+    for sv in shared_vertices:
+        if sv not in g1.nodes:
+            raise ValueError(f"Shared vertex {sv} not in g1")
+        if sv not in g2.nodes:
+            raise ValueError(f"Shared vertex {sv} not in g2")
+
+    # Relabel g2 nodes, keeping shared vertices
+    offset = max(g1.nodes) + 1 if g1.nodes else 0
+    g2_node_map = {sv: sv for sv in shared_vertices}
+    for n in g2.nodes:
+        if n not in g2_node_map:
+            g2_node_map[n] = n + offset
+
+    g2_nodes = frozenset(g2_node_map[n] for n in g2.nodes)
+    g2_edges = set()
+    for a, b in g2.edges:
+        na, nb = g2_node_map[a], g2_node_map[b]
+        g2_edges.add((min(na, nb), max(na, nb)))
+
+    all_nodes = g1.nodes | g2_nodes
+    all_edges = g1.edges | frozenset(g2_edges)
+
+    # Delete shared clique edges (K_k among shared vertices)
+    clique_edges = set()
+    sv_list = sorted(shared_vertices)
+    for i in range(len(sv_list)):
+        for j in range(i + 1, len(sv_list)):
+            clique_edges.add((sv_list[i], sv_list[j]))
+
+    all_edges = all_edges - frozenset(clique_edges)
+
+    return Graph(nodes=all_nodes, edges=all_edges)
+
+
 def cut_vertex_join(g1: Graph, v1: int, g2: Graph, v2: int) -> Graph:
     """Join two graphs at a cut vertex (1-sum).
 

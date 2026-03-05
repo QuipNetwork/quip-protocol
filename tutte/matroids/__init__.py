@@ -13,6 +13,7 @@ from .core import (
 from .parallel_connection import (
     BivariateLaurentPoly,
     theorem6_parallel_connection,
+    theorem10_k_sum,
     precompute_contractions,
     build_extended_cell_graph,
 )

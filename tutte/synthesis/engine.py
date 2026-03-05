@@ -43,6 +43,8 @@ from ..matroids.core import GraphicMatroid, FlatLattice, enumerate_flats_with_ha
 from ..matroids.parallel_connection import (
     BivariateLaurentPoly,
     theorem6_parallel_connection,
+    theorem10_k_sum,
+    theorem10_k_sum_via_theorem6,
     precompute_contractions,
     build_extended_cell_graph,
 )
@@ -153,7 +155,14 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             self._cache[cache_key] = result
             return result
 
-        # 5. Try hierarchical tiling for graphs with repeating structure
+        # 5. Try k-sum decomposition (k=2..5, detect independent vertex separators)
+        if graph.edge_count() >= 6:  # Need at least some edges for useful k-sum
+            result = self._try_ksum_decomposition(graph)
+            if result is not None:
+                self._cache[cache_key] = result
+                return result
+
+        # 6. Try hierarchical tiling for graphs with repeating structure
         if graph.edge_count() >= 20:  # Only try for larger graphs
             result = self._try_hierarchical(graph, max_depth)
             if result is not None:
@@ -195,6 +204,150 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             method="disjoint_union",
             minors_used=all_minors,
         )
+
+    def _try_ksum_decomposition(
+        self,
+        graph: Graph,
+    ) -> Optional[SynthesisResult]:
+        """Try to decompose graph as a k-sum (k=2..5) via independent vertex separators.
+
+        For each k, looks for a set S of k pairwise non-adjacent vertices such that
+        removing S disconnects the graph into exactly 2 components.
+
+        Cost guard: k=4 requires >= 15 edges, k=5 requires >= 25 edges
+        (inclusion-exclusion over C(k,2) shared clique edges grows as 2^C(k,2)).
+
+        Returns SynthesisResult if successful, None otherwise.
+        """
+        for k in range(2, 6):
+            # Cost guard: skip k-sum detection on very small graphs
+            # For k>=4, the optimized flat-grouped Theorem 6 path makes
+            # larger k feasible, so thresholds are lower than brute-force.
+            if k == 4 and graph.edge_count() < 12:
+                continue
+            if k == 5 and graph.edge_count() < 15:
+                continue
+
+            separator = self._find_independent_vertex_separator(graph, k)
+            if separator is not None:
+                result = self._apply_ksum(graph, separator, k)
+                if result is not None:
+                    return result
+        return None
+
+    def _find_independent_vertex_separator(
+        self,
+        graph: Graph,
+        k: int,
+    ) -> Optional[Tuple[int, ...]]:
+        """Find k pairwise non-adjacent vertices whose removal disconnects the graph.
+
+        Returns tuple of k vertices if found, None otherwise. Only checks a bounded
+        number of candidates to avoid combinatorial explosion on large graphs.
+        """
+        from itertools import combinations
+
+        nodes = sorted(graph.nodes, key=lambda n: graph.degree(n), reverse=True)
+
+        # Limit candidates for performance
+        candidates = nodes[:min(len(nodes), 20)]
+
+        if len(candidates) < k:
+            return None
+
+        for combo in combinations(candidates, k):
+            # Check pairwise non-adjacency (all K_k edges must be absent)
+            all_independent = True
+            for i in range(k):
+                for j in range(i + 1, k):
+                    edge = (min(combo[i], combo[j]), max(combo[i], combo[j]))
+                    if edge in graph.edges:
+                        all_independent = False
+                        break
+                if not all_independent:
+                    break
+            if not all_independent:
+                continue
+
+            # Check if removing these k vertices disconnects the graph
+            sep_set = set(combo)
+            remaining = graph.nodes - sep_set
+            if not remaining:
+                continue
+
+            start = next(iter(remaining))
+            reached = set()
+            stack = [start]
+            while stack:
+                node = stack.pop()
+                if node in reached:
+                    continue
+                reached.add(node)
+                for nb in graph.neighbors(node):
+                    if nb not in reached and nb not in sep_set:
+                        stack.append(nb)
+
+            if len(reached) < len(remaining):
+                return combo
+
+        return None
+
+    def _apply_ksum(
+        self,
+        graph: Graph,
+        separator: Tuple[int, ...],
+        k: int,
+    ) -> Optional[SynthesisResult]:
+        """Apply Theorem 10 to compute Tutte polynomial of a k-sum decomposition.
+
+        Reconstructs the parallel connection by adding back the K_k clique edges
+        among separator vertices, then uses inclusion-exclusion.
+
+        Args:
+            graph: The k-sum graph
+            separator: Tuple of k separator vertices
+            k: Number of shared vertices
+
+        Returns:
+            SynthesisResult if successful, None otherwise
+        """
+        self._log(f"Found {k}-sum separator: {separator}")
+
+        try:
+            # Build clique edges among separator vertices
+            sv = sorted(separator)
+            clique_edges = [(sv[i], sv[j]) for i in range(k) for j in range(i + 1, k)]
+
+            # Use flat-grouped Theorem 6 for dense PC graphs (avoids exponential
+            # brute-force on large parallel connections like K6⊕K6)
+            num_shared = len(clique_edges)
+            pc_edge_count = graph.edge_count() + num_shared
+            if pc_edge_count > 20:
+                poly = theorem10_k_sum_via_theorem6(graph, separator, k, self)
+            else:
+                # Reconstruct parallel connection by adding clique edges
+                pc_edges = graph.edges | frozenset(clique_edges)
+                pc_graph = Graph(nodes=graph.nodes, edges=pc_edges)
+
+                # Apply Theorem 10: T(k-sum) = T(P_N \ T)
+                poly = theorem10_k_sum(pc_graph, clique_edges, self)
+
+            # Verify
+            if verify_spanning_trees(graph, poly):
+                self._log(f"{k}-sum decomposition via Theorem 10 verified!")
+                return SynthesisResult(
+                    polynomial=poly,
+                    recipe=[f"{k}-sum at {separator}", f"T = {poly}"],
+                    verified=True,
+                    method=f"{k}sum_theorem10",
+                )
+            else:
+                self._log(f"{k}-sum Theorem 10 failed Kirchhoff")
+                return None
+
+        except Exception as e:
+            self._log(f"{k}-sum decomposition failed: {e}")
+            return None
 
     def _synthesize_via_cut_vertex(
         self,
@@ -468,17 +621,21 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
 
             self._log(f"Inter-cell matroid: rank {r_N}, {inter_graph.edge_count()} edges")
 
-            # Step 2: Enumerate flats with Hasse diagram
-            flats, ranks, upper_covers = enumerate_flats_with_hasse(matroid_N)
-            self._log(f"Enumerated {len(flats)} flats")
-
-            # Step 3: Build FlatLattice
-            lattice = FlatLattice(
-                matroid_N,
-                flats=flats,
-                ranks=ranks,
-                upper_covers=upper_covers,
-            )
+            # Step 2-3: Build FlatLattice (check cache first)
+            inter_key = inter_graph.canonical_key()
+            entry = self.table.entries.get(inter_key)
+            if entry is not None and entry.flat_data is not None:
+                self._log("Using cached flat lattice data")
+                lattice = FlatLattice.from_flat_lattice_data(matroid_N, entry.flat_data)
+            else:
+                flats, ranks, upper_covers = enumerate_flats_with_hasse(matroid_N)
+                self._log(f"Enumerated {len(flats)} flats")
+                lattice = FlatLattice(
+                    matroid_N,
+                    flats=flats,
+                    ranks=ranks,
+                    upper_covers=upper_covers,
+                )
 
             # Step 4: Build extended cell graphs
             inter_edge_list = list(inter_info.edges)
@@ -503,6 +660,9 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             # Step 7: Verify
             if verify_spanning_trees(graph, poly):
                 self._log("Theorem 6 verified!")
+                # Cache flat lattice data for future use
+                if entry is not None and entry.flat_data is None:
+                    entry.flat_data = lattice.to_flat_lattice_data()
                 return poly
             else:
                 self._log("Theorem 6 result failed Kirchhoff verification")
@@ -929,6 +1089,13 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             )
             self._cache[cache_key] = result
             return result
+
+        # 4.5 Try k-sum decomposition (useful for intermediate merged graphs)
+        if graph.edge_count() >= 6:
+            result = self._try_ksum_decomposition(graph)
+            if result is not None:
+                self._cache[cache_key] = result
+                return result
 
         # 5. Direct spanning tree expansion (skip minor search)
         result = self._synthesize_from_k2_fast(graph, max_depth)
