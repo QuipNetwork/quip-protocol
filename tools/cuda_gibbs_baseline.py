@@ -63,7 +63,6 @@ def cuda_gibbs_baseline_test(
             update_mode=update_mode, parallel=parallel
         )
         print(f"CUDA Block {mode_name} sampler ready")
-        print(f"Color block sizes: {sampler.block_counts}")
     except Exception as e:
         print(f"CUDA Block {mode_name} sampler failed: {e}")
         return None

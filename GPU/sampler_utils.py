@@ -296,11 +296,12 @@ def unpack_packed_results(
     """Unpack bit-packed GPU results into dimod SampleSets.
 
     Args:
-        packed_data: Bit-packed samples, shape (num_threads, packed_size).
-        energies_data: Energy values, shape (num_threads,).
+        packed_data: Bit-packed samples, shape (total, packed_size).
+            packed_size may be based on max_N across problems.
+        energies_data: Energy values, shape (total,).
         num_problems: Number of problems in the batch.
         num_reads: Number of reads per problem.
-        N: Number of variables per problem.
+        N: Max number of variables (stride for packed_data).
         node_to_idx_list: Per-problem node-to-index mappings.
         info: Extra metadata to include in each SampleSet.
 
@@ -315,19 +316,29 @@ def unpack_packed_results(
         prob_packed = packed_data[start_idx:end_idx]
         prob_energies = energies_data[start_idx:end_idx]
 
-        samples_data = np.zeros((num_reads, N), dtype=np.int8)
+        # Use per-problem N from node_to_idx mapping
+        node_to_idx = node_to_idx_list[prob_idx]
+        prob_N = len(node_to_idx)
+
+        samples_data = np.zeros(
+            (num_reads, prob_N), dtype=np.int8
+        )
         for read_idx in range(num_reads):
-            for var in range(N):
+            for var in range(prob_N):
                 byte_idx = var >> 3
                 bit_idx = var & 7
-                bit = (prob_packed[read_idx, byte_idx] >> bit_idx) & 1
+                bit = (
+                    prob_packed[read_idx, byte_idx] >> bit_idx
+                ) & 1
                 samples_data[read_idx, var] = -1 if bit else 1
 
         samples_dict = []
-        node_to_idx = node_to_idx_list[prob_idx]
         for sample in samples_data:
             samples_dict.append(
-                {node: int(sample[idx]) for node, idx in node_to_idx.items()}
+                {
+                    node: int(sample[idx])
+                    for node, idx in node_to_idx.items()
+                }
             )
 
         sampleset = dimod.SampleSet.from_samples(

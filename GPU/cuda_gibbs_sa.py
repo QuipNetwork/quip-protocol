@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""CUDA Block Gibbs Sampler.
+"""CUDA Block Gibbs Sampler - persistent kernel with work queue.
 
 Chromatic parallel block Gibbs sampling on GPU via CuPy.
 Colors processed sequentially (Gauss-Seidel), nodes within each
-color updated in parallel (independent set). One CUDA block per
-sample with 256 threads.
+color updated in parallel (independent set).
+
+Single persistent kernel: blocks grab work units (model + read
+chunk) from atomic queue, process all sweeps/colors using shared
+memory, then grab the next unit. Work-stealing balances load
+across models.
 """
 
 import logging
@@ -28,10 +32,12 @@ from GPU.sampler_utils import (
 class CudaGibbsSampler:
     """Block Gibbs sampler using CUDA GPU.
 
-    Chromatic parallel: colors processed sequentially
-    (Gauss-Seidel), nodes within each color updated in
-    parallel by 256 threads. Also supports a fully sequential
-    mode for validation.
+    Persistent kernel with work queue: blocks grab work units
+    from an atomic queue, process all sweeps/colors using
+    shared memory state, then grab the next unit. 256 threads
+    per block parallelize nodes within each color.
+
+    Also supports a fully sequential mode for validation.
     """
 
     def __init__(
@@ -77,15 +83,7 @@ class CudaGibbsSampler:
         ).get('shape', [9, 2])
         self.m = topo_shape[0]
         self.t = topo_shape[1]
-
-        # Precompute color blocks
-        self.block_starts, self.block_counts, self.color_node_indices = \
-            compute_color_blocks(self.nodes, self.m, self.t)
         self.num_colors = 4
-
-        self.logger.debug(
-            f"Color block sizes: {self.block_counts}"
-        )
 
         # Compile CUDA kernels
         kernel_path = os.path.join(
@@ -98,8 +96,8 @@ class CudaGibbsSampler:
             code=kernel_code,
             options=('--use_fast_math',),
         )
-        self._parallel_kernel = self._module.get_function(
-            'cuda_block_gibbs_parallel'
+        self._persistent_kernel = self._module.get_function(
+            'cuda_gibbs_persistent'
         )
         self._sequential_kernel = self._module.get_function(
             'cuda_block_gibbs_sequential'
@@ -119,6 +117,8 @@ class CudaGibbsSampler:
         **kwargs,
     ) -> List[dimod.SampleSet]:
         """Sample from Ising model using block Gibbs sampling.
+
+        All problems are dispatched in a single kernel launch.
 
         Args:
             h: List of linear biases per problem.
@@ -154,194 +154,227 @@ class CudaGibbsSampler:
         if seed is None:
             seed = np.random.randint(0, 2**31)
 
+        num_betas = len(sched)
+        max_N = max(N_list)
+        max_packed_size = (max_N + 7) // 8
+
+        # Build per-problem color blocks
+        color_data = self._build_batched_color_blocks(
+            node_to_idx_list, N_list, num_problems
+        )
+
         self.logger.debug(
-            f"[CudaGibbs] {num_problems} problems, "
+            f"[CudaGibbs] {num_problems} problems batched, "
             f"{num_reads} reads, {num_sweeps} sweeps, "
             f"mode={self.update_mode_name}, "
             f"parallel={self.parallel}"
         )
 
-        # Process each problem separately (kernel is single-problem)
-        all_samplesets = []
-        for prob_idx in range(num_problems):
-            sampleset = self._sample_single_problem(
-                prob_idx, all_row_ptr, all_col_ind, all_J_vals,
-                all_h_vals, row_ptr_offsets, col_ind_offsets,
-                node_to_idx_list, N_list,
-                num_reads, sched, num_sweeps_per_beta,
-                seed + prob_idx, beta_range, beta_schedule_type,
-            )
-            all_samplesets.append(sampleset)
-
-        return all_samplesets
-
-    def _sample_single_problem(
-        self,
-        prob_idx: int,
-        all_row_ptr: np.ndarray,
-        all_col_ind: np.ndarray,
-        all_J_vals: np.ndarray,
-        all_h_vals: np.ndarray,
-        row_ptr_offsets: np.ndarray,
-        col_ind_offsets: np.ndarray,
-        node_to_idx_list: list,
-        N_list: list,
-        num_reads: int,
-        beta_sched: np.ndarray,
-        sweeps_per_beta: int,
-        seed: int,
-        beta_range: Optional[Tuple[float, float]],
-        beta_schedule_type: str,
-    ) -> dimod.SampleSet:
-        """Run kernel for a single Ising problem."""
-        N = N_list[prob_idx]
-        num_betas = len(beta_sched)
-        packed_size = (N + 7) // 8
-
-        # Extract this problem's CSR slice
-        rp_start = int(row_ptr_offsets[prob_idx])
-        rp_end = int(row_ptr_offsets[prob_idx + 1])
-        ci_start = int(col_ind_offsets[prob_idx])
-        ci_end = int(col_ind_offsets[prob_idx + 1])
-
-        prob_row_ptr = all_row_ptr[rp_start:rp_end]
-        prob_col_ind = all_col_ind[ci_start:ci_end]
-        prob_J_vals = all_J_vals[ci_start:ci_end]
-        prob_h_vals = all_h_vals[prob_idx * N:(prob_idx + 1) * N]
-
-        # Compute color blocks for this problem's nodes and remap
-        # to dense CSR indices
-        node_to_idx = node_to_idx_list[prob_idx]
-        prob_nodes = sorted(node_to_idx.keys())
-        block_starts, block_counts, color_indices = \
-            compute_color_blocks(prob_nodes, self.m, self.t)
-
-        # Remap original node IDs to dense CSR indices
-        remapped_colors = np.array(
-            [node_to_idx[n] for n in color_indices],
+        # Build per-problem offset arrays
+        problem_rp_offsets = np.array(
+            [int(row_ptr_offsets[i]) for i in range(num_problems)],
             dtype=np.int32,
         )
+        problem_ci_offsets = np.array(
+            [int(col_ind_offsets[i]) for i in range(num_problems)],
+            dtype=np.int32,
+        )
+        # h_vals offset: sum of N values for problems before this one
+        h_offsets = np.zeros(num_problems, dtype=np.int32)
+        running = 0
+        for i in range(num_problems):
+            h_offsets[i] = running
+            running += N_list[i]
+        problem_N = np.array(N_list, dtype=np.int32)
 
         # Transfer to GPU
-        d_row_ptr = cp.asarray(prob_row_ptr)
-        d_col_ind = cp.asarray(prob_col_ind)
-        d_J_vals = cp.asarray(prob_J_vals)
-        d_h_vals = cp.asarray(prob_h_vals)
+        d_row_ptr = cp.asarray(all_row_ptr)
+        d_col_ind = cp.asarray(all_col_ind)
+        d_J_vals = cp.asarray(all_J_vals)
+        d_h_vals = cp.asarray(all_h_vals)
 
-        d_block_starts = cp.asarray(block_starts)
-        d_block_counts = cp.asarray(block_counts)
-        d_color_indices = cp.asarray(remapped_colors)
+        d_problem_N = cp.asarray(problem_N)
+        d_problem_rp = cp.asarray(problem_rp_offsets)
+        d_problem_ci = cp.asarray(problem_ci_offsets)
+        d_problem_h = cp.asarray(h_offsets)
 
-        d_beta_sched = cp.asarray(beta_sched)
+        d_block_starts = cp.asarray(color_data[0])
+        d_block_counts = cp.asarray(color_data[1])
+        d_color_nodes = cp.asarray(color_data[2])
+
+        d_beta_sched = cp.asarray(sched)
 
         # Output buffers
+        total_samples = num_problems * num_reads
         d_final_samples = cp.zeros(
-            num_reads * packed_size, dtype=cp.int8
+            total_samples * max_packed_size, dtype=cp.int8
         )
-        d_final_energies = cp.zeros(num_reads, dtype=cp.int32)
+        d_final_energies = cp.zeros(
+            total_samples, dtype=cp.int32
+        )
 
         if self.parallel:
-            self._launch_parallel(
-                d_row_ptr, d_col_ind, d_J_vals, d_h_vals, N,
-                d_block_starts, d_block_counts, d_color_indices,
-                d_beta_sched, num_betas, sweeps_per_beta,
-                d_final_samples, d_final_energies,
-                num_reads, seed,
+            # Persistent kernel with work queue.
+            # Blocks grab (model, read_chunk) from atomic queue.
+            dev = cp.cuda.Device()
+            num_sms = dev.attributes['MultiProcessorCount']
+            num_blocks = num_sms  # 1 persistent block per SM
+
+            chunks_per_model = max(
+                1, num_blocks // num_problems
+            )
+            reads_per_chunk = (
+                (num_reads + chunks_per_model - 1)
+                // chunks_per_model
+            )
+            total_work_units = (
+                num_problems * chunks_per_model
+            )
+
+            # Atomic work queue counter
+            d_queue_counter = cp.zeros(1, dtype=cp.int32)
+
+            self.logger.debug(
+                f"[CudaGibbs] persistent: "
+                f"{num_blocks} blocks, "
+                f"{chunks_per_model} chunks/model, "
+                f"{reads_per_chunk} reads/chunk, "
+                f"{total_work_units} total units"
+            )
+
+            grid = (num_blocks,)
+            block = (256,)
+            self._persistent_kernel(
+                grid, block, (
+                    d_row_ptr, d_col_ind,
+                    d_J_vals, d_h_vals,
+                    d_problem_N, d_problem_rp,
+                    d_problem_ci, d_problem_h,
+                    d_block_starts, d_block_counts,
+                    d_color_nodes,
+                    np.int32(self.num_colors),
+                    d_beta_sched,
+                    np.int32(num_betas),
+                    np.int32(num_sweeps // num_betas),
+                    d_final_samples, d_final_energies,
+                    np.int32(num_reads),
+                    np.int32(max_N),
+                    np.int32(max_packed_size),
+                    np.int32(num_problems),
+                    d_queue_counter,
+                    np.int32(chunks_per_model),
+                    np.int32(reads_per_chunk),
+                    np.int32(total_work_units),
+                    np.uint32(seed),
+                    np.int32(self.update_mode),
+                ),
             )
         else:
-            self._launch_sequential(
-                d_row_ptr, d_col_ind, d_J_vals, d_h_vals, N,
-                d_block_starts, d_block_counts, d_color_indices,
-                d_beta_sched, num_betas, sweeps_per_beta,
-                d_final_samples, d_final_energies,
-                num_reads, seed,
+            # Sequential: 1 thread/block, reads_per_block=1
+            d_state = cp.zeros(
+                total_samples * max_N, dtype=cp.int8
             )
+            seq_args = (
+                d_row_ptr, d_col_ind, d_J_vals, d_h_vals,
+                d_problem_N, d_problem_rp,
+                d_problem_ci, d_problem_h,
+                d_block_starts, d_block_counts,
+                d_color_nodes,
+                np.int32(self.num_colors),
+                d_beta_sched,
+                np.int32(num_betas),
+                np.int32(num_sweeps // num_betas),
+                d_state,
+                d_final_samples, d_final_energies,
+                np.int32(num_reads),
+                np.int32(max_N),
+                np.int32(max_packed_size),
+                np.int32(num_problems),
+                np.int32(1),  # reads_per_block=1
+                np.uint32(seed),
+                np.int32(self.update_mode),
+            )
+            grid = (num_reads, num_problems)
+            block = (1,)
+            self._sequential_kernel(grid, block, seq_args)
 
         cp.cuda.Stream.null.synchronize()
 
         # Read results
-        packed_data = cp.asnumpy(d_final_samples).reshape(
-            num_reads, packed_size
-        )
-        energies = cp.asnumpy(d_final_energies)
+        packed_raw = cp.asnumpy(d_final_samples)
+        energies_raw = cp.asnumpy(d_final_energies)
 
-        self.logger.debug(
-            f"[CudaGibbs] Problem {prob_idx}: "
-            f"energy range [{energies.min()}, {energies.max()}]"
+        packed_data = packed_raw.reshape(
+            total_samples, max_packed_size
         )
+        energies_data = energies_raw
 
-        # Unpack single problem
-        samplesets = unpack_packed_results(
-            packed_data, energies, 1, num_reads, N,
-            [node_to_idx_list[prob_idx]],
+        for prob_idx in range(num_problems):
+            start = prob_idx * num_reads
+            end = (prob_idx + 1) * num_reads
+            e = energies_data[start:end]
+            self.logger.debug(
+                f"[CudaGibbs] Problem {prob_idx}: "
+                f"energy range [{e.min()}, {e.max()}]"
+            )
+
+        return unpack_packed_results(
+            packed_data, energies_data,
+            num_problems, num_reads, max_N,
+            node_to_idx_list,
             info={
                 "beta_range": beta_range,
                 "beta_schedule_type": beta_schedule_type,
                 "update_mode": self.update_mode_name,
             },
         )
-        return samplesets[0]
 
-    def _launch_parallel(
+    def _build_batched_color_blocks(
         self,
-        d_row_ptr, d_col_ind, d_J_vals, d_h_vals, N,
-        d_block_starts, d_block_counts, d_color_indices,
-        d_beta_sched, num_betas, sweeps_per_beta,
-        d_final_samples, d_final_energies,
-        num_reads, seed,
-    ):
-        """Launch chromatic parallel kernel."""
-        d_state = cp.zeros(num_reads * N, dtype=cp.int8)
+        node_to_idx_list: list,
+        N_list: list,
+        num_problems: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Build flattened color block arrays for all problems.
 
-        grid = (num_reads,)
-        block = (256,)
-
-        self._parallel_kernel(
-            grid, block,
-            (
-                d_row_ptr, d_col_ind, d_J_vals, d_h_vals,
-                np.int32(N),
-                d_block_starts, d_block_counts, d_color_indices,
-                np.int32(self.num_colors),
-                d_beta_sched,
-                np.int32(num_betas),
-                np.int32(sweeps_per_beta),
-                d_state,
-                d_final_samples, d_final_energies,
-                np.int32(num_reads),
-                np.uint32(seed),
-                np.int32(self.update_mode),
-            ),
+        Returns:
+            Tuple of:
+            - all_block_starts: [num_problems * 4] global starts
+            - all_block_counts: [num_problems * 4] counts
+            - all_color_nodes: concatenated remapped node indices
+        """
+        all_block_starts = np.zeros(
+            num_problems * self.num_colors, dtype=np.int32
         )
-
-    def _launch_sequential(
-        self,
-        d_row_ptr, d_col_ind, d_J_vals, d_h_vals, N,
-        d_block_starts, d_block_counts, d_color_indices,
-        d_beta_sched, num_betas, sweeps_per_beta,
-        d_final_samples, d_final_energies,
-        num_reads, seed,
-    ):
-        """Launch the sequential (Gauss-Seidel) kernel."""
-        d_state = cp.zeros(num_reads * N, dtype=cp.int8)
-
-        grid = (num_reads,)
-        block = (1,)
-
-        self._sequential_kernel(
-            grid, block,
-            (
-                d_row_ptr, d_col_ind, d_J_vals, d_h_vals,
-                np.int32(N),
-                d_block_starts, d_block_counts, d_color_indices,
-                np.int32(self.num_colors),
-                d_beta_sched,
-                np.int32(num_betas),
-                np.int32(sweeps_per_beta),
-                d_state,
-                d_final_samples, d_final_energies,
-                np.int32(num_reads),
-                np.uint32(seed),
-                np.int32(self.update_mode),
-            ),
+        all_block_counts = np.zeros(
+            num_problems * self.num_colors, dtype=np.int32
         )
+        all_color_nodes = []
+        global_offset = 0
+
+        for prob_idx in range(num_problems):
+            node_to_idx = node_to_idx_list[prob_idx]
+            prob_nodes = sorted(node_to_idx.keys())
+
+            starts, counts, color_indices = compute_color_blocks(
+                prob_nodes, self.m, self.t
+            )
+
+            # Remap to dense CSR indices
+            remapped = np.array(
+                [node_to_idx[n] for n in color_indices],
+                dtype=np.int32,
+            )
+
+            base = prob_idx * self.num_colors
+            for c in range(self.num_colors):
+                all_block_starts[base + c] = (
+                    global_offset + int(starts[c])
+                )
+                all_block_counts[base + c] = int(counts[c])
+
+            all_color_nodes.append(remapped)
+            global_offset += len(remapped)
+
+        all_color_nodes = np.concatenate(all_color_nodes)
+        return all_block_starts, all_block_counts, all_color_nodes
