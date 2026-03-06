@@ -505,6 +505,11 @@ class NetworkNode(Node):
         # have we fully synchronized with the network at least one time?
         self._synchronized = threading.Event()
         self.sync_block_cache = {}  # Regular dict is thread-safe for simple assignments in CPython
+
+        # Sync failure tracking for consensus fallback
+        self._sync_failure_count: int = 0
+        self._last_sync_target: int = 0
+        self._max_sync_failures: int = 3
         
         # Initialize stats cache
         asyncio.create_task(self._update_stats_cache())
@@ -658,9 +663,44 @@ class NetworkNode(Node):
                     if self._is_mining:
                         await self.stop_mining()
                         self.logger.info("Stopped mining to synchronize with network...")
-                    await self.synchronize_blockchain(latest_block)
-                    # NOTE: It's possible we can get triggered again if the sync takes too long, but that's OK
-                    # as we will be closer to the goal.
+
+                    # Track repeated failures for the same sync target
+                    if latest_block == self._last_sync_target:
+                        self._sync_failure_count += 1
+                    else:
+                        self._sync_failure_count = 0
+                        self._last_sync_target = latest_block
+
+                    # After repeated failures, check if peers agree on our height
+                    if self._sync_failure_count >= self._max_sync_failures:
+                        consensus = await self._query_peer_consensus()
+                        my_height = self.get_latest_block().header.index
+                        if consensus is not None and my_height >= consensus:
+                            self.logger.info(
+                                f"Peer consensus height={consensus}, "
+                                f"local height={my_height}. "
+                                f"Declaring synchronized after "
+                                f"{self._sync_failure_count} sync failures."
+                            )
+                            self.set_synchronized()
+                            self._sync_failure_count = 0
+                            self._last_sync_target = 0
+                            continue
+
+                        # Exponential backoff before retrying
+                        backoff = min(30, 2 ** self._sync_failure_count)
+                        self.logger.warning(
+                            f"Sync failed {self._sync_failure_count} times "
+                            f"for target {latest_block}, backing off {backoff}s"
+                        )
+                        await asyncio.sleep(backoff)
+
+                    success = await self.synchronize_blockchain(latest_block)
+                    if not success:
+                        self._sync_failure_count += 1
+                    else:
+                        self._sync_failure_count = 0
+                        self._last_sync_target = 0
                     continue
 
                 # If we are synchronized, check if we are mining. If not, start mining on the next block.
@@ -1084,6 +1124,43 @@ class NetworkNode(Node):
         return result
 
 
+    async def _query_peer_consensus(self) -> Optional[int]:
+        """Query multiple peers for their latest block height.
+
+        Returns the consensus height if a majority of sampled peers
+        agree (within 1 block tolerance), or None if no consensus.
+        """
+        if not self.peers:
+            return None
+
+        from collections import Counter
+
+        peer_list = list(self.peers.keys())
+        sample_size = min(5, len(peer_list))
+        sampled = random.sample(peer_list, sample_size)
+
+        heights: list[int] = []
+        for peer in sampled:
+            header = await self.get_peer_block_header(peer)
+            if header:
+                heights.append(header.index)
+
+        if not heights:
+            return None
+
+        counts = Counter(heights)
+        most_common_height, _ = counts.most_common(1)[0]
+
+        # Count heights within +/-1 of most common
+        cluster_count = sum(
+            c for h, c in counts.items()
+            if abs(h - most_common_height) <= 1
+        )
+
+        if cluster_count > len(heights) / 2:
+            return most_common_height
+        return None
+
     async def check_synchronized(self) -> int:
         """Check if we are synchronized with the network using header-only fetch.
 
@@ -1097,29 +1174,25 @@ class NetworkNode(Node):
             else:
                 raise RuntimeError("No peers to synchronize with")
 
+        # Query up to 3 peers and take the highest valid response
         net_latest: Optional[BlockHeader] = None
-        tries = 0
-        peers = list(self.peers.keys())
-        while net_latest is None:
-            if not peers:
-                self.logger.warning("No valid peers to synchronize with (all peers may have >max_sync_block_index blocks)")
-                return 0
-                
-            random_peer = random.choice(peers)
-            peers.remove(random_peer)
-            header = await self.get_peer_block_header(random_peer)
-            if header:
-                # Ignore peers with blocks beyond our max sync limit
-                if header.index > self.max_sync_block_index:
-                    self.logger.debug(f"Ignoring peer {random_peer} with block index {header.index} > max_sync_block_index {self.max_sync_block_index}")
-                    continue
+        peer_list = list(self.peers.keys())
+        sample_size = min(3, len(peer_list))
+        sampled = random.sample(peer_list, sample_size)
+
+        for peer in sampled:
+            header = await self.get_peer_block_header(peer)
+            if not header:
+                continue
+            if header.index > self.max_sync_block_index:
+                self.logger.debug(f"Ignoring peer {peer} with block index {header.index} > max_sync_block_index {self.max_sync_block_index}")
+                continue
+            if net_latest is None or header.index > net_latest.index:
                 net_latest = header
-                break
-            tries += 1
-            if tries > 3:
-                self.logger.warning("Unable to get latest block header from peers, assuming we are synchronized")
-                return 0
-            await asyncio.sleep(1)
+
+        if net_latest is None:
+            self.logger.warning("Unable to get block headers from peers, assuming synchronized")
+            return 0
 
         if my_latest_block.header.index > net_latest.index:
             self.set_synchronized()
@@ -1138,52 +1211,58 @@ class NetworkNode(Node):
 
         return net_latest.index
 
-    async def  synchronize_blockchain(self, current_head: int = 0):
-        """Synchronize the blockchain with the network using BlockSynchronizer."""
+    async def synchronize_blockchain(self, current_head: int = 0) -> bool:
+        """Synchronize the blockchain with the network using BlockSynchronizer.
+
+        Args:
+            current_head: Target block index. If 0, queries peers.
+
+        Returns:
+            True if sync succeeded, False if it failed.
+        """
         if self._is_mining:
-            raise RuntimeError("Cannot synchronize while mining")
+            self.logger.error("Cannot synchronize while mining")
+            return False
 
         if current_head == 0:
             current_head = await self.check_synchronized()
         if current_head == 0:
-            return
+            return True
 
         my_latest_block = self.get_latest_block()
-        
+
         # Enforce maximum sync block limit
         if current_head > self.max_sync_block_index:
-            self.logger.warning(f"Refusing to synchronize beyond max_sync_block_index {self.max_sync_block_index}, requested: {current_head}")
-            return
+            self.logger.warning(f"Refusing to sync beyond max_sync_block_index {self.max_sync_block_index}, requested: {current_head}")
+            return False
 
         # Go back 6 blocks for reorg depth
         start_index = max(1, my_latest_block.header.index - 6)
         end_index = current_head
         if start_index > end_index:
-            return
+            return True
 
         self.logger.info(f"Syncing with network from block {start_index} to {end_index}...")
 
-        # Use BlockSynchronizer for concurrent block downloads and sequential processing
         if not self.node_client:
             self.logger.error("NodeClient not initialized")
-            return
-            
+            return False
+
         # Update node client with current peers
         self.node_client.update_peers(self.peers)
-        
-        # Create block synchronizer
+
         synchronizer = BlockSynchronizer(
             node_client=self.node_client,
             receive_block_queue=self.block_processing_queue,
             logger=self.logger
         )
-        
-        # Synchronize blocks using multiprocessing
+
         success = await synchronizer.sync_blocks(start_index, end_index)
-        if not success:
-            raise RuntimeError(f"Failed to synchronize blocks {start_index} to {end_index}")
+        if success:
+            self.logger.info(f"Synced blocks {start_index} to {end_index}")
         else:
-            self.logger.info(f"Successfully synchronized blocks {start_index} to {end_index}")
+            self.logger.error(f"Failed to sync blocks {start_index} to {end_index}")
+        return success
             
 
     def _track_peer_timestamp(self, timestamp: float):
@@ -1536,6 +1615,8 @@ class NetworkNode(Node):
             # Validate protocol version - reject incompatible nodes
             if msg.protocol_version != PROTOCOL_VERSION:
                 self.logger.warning(f"Protocol version mismatch from {protocol._peer_address}: expected {PROTOCOL_VERSION}, got {msg.protocol_version} (msg_type={msg.msg_type.name})")
+                # Schedule connection close after response is sent
+                asyncio.get_event_loop().call_later(0.1, protocol.close)
                 return msg.create_error_response(f"Protocol version mismatch: expected {PROTOCOL_VERSION}, got {msg.protocol_version}")
 
             if msg.msg_type == QuicMessageType.JOIN_REQUEST:

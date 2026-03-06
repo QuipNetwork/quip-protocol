@@ -26,6 +26,7 @@ from shared.block import Block, MinerInfo
 from shared.miner import Miner, MiningResult
 from shared.logging_config import init_component_logger
 from shared.time_utils import utc_timestamp_float, utc_timestamp, network_timestamp
+from shared.version import PROTOCOL_VERSION
 # Global logger for this module (set during Node initialization)
 log = None
 
@@ -254,6 +255,15 @@ class Node:
             If accepted is True, rejection_reason is None.
             If accepted is False, rejection_reason contains the reason for rejection.
         """
+        # 0. Check block protocol version
+        if block.header.version != PROTOCOL_VERSION:
+            reason = (
+                f"incompatible protocol version "
+                f"(block: {block.header.version}, local: {PROTOCOL_VERSION})"
+            )
+            self.logger.error(f"Block {block.header.index} rejected: {reason}")
+            return False, reason
+
         # 1. Check if we already have this block or a newer one at this index
         cur_block = self.get_block(block.header.index)
         if not block.hash or not block.raw or not block.signature:
