@@ -7,10 +7,8 @@ import collections.abc
 from dwave.system import DWaveSampler, FixedEmbeddingComposite
 
 logger = logging.getLogger(__name__)
-from dwave.system.testing import MockDWaveSampler
 from dwave.embedding import embed_bqm, unembed_sampleset
 import dimod
-import dwave_networkx as dnx
 
 if TYPE_CHECKING:
     from dwave.cloud.computation import Future
@@ -145,7 +143,9 @@ class DWaveSamplerWrapper:
         # Initialize base QPU sampler
         logger.info("[QPU] Connecting to D-Wave API...")
         try:
-            base_sampler = DWaveSampler()
+            base_sampler = DWaveSampler(
+                request_timeout=(60, 300),
+            )
             logger.info(f"[QPU] Connected to solver: {base_sampler.properties.get('chip_id', 'unknown')}")
             logger.info(f"[QPU] Qubits available: {len(base_sampler.nodelist)}")
         except Exception as e:
@@ -215,6 +215,18 @@ class DWaveSamplerWrapper:
         # For quantum_proof_of_work functions, nodes and edges should be int lists
         self.nodes: List[int] = cast(List[int], self.nodelist)
         self.edges: List[Tuple[int, int]] = cast(List[Tuple[int, int]], self.edgelist)
+
+    def close(self):
+        """Release QPU connection resources (Ocean SDK 9.x resource management)."""
+        if hasattr(self, 'qpu_solver'):
+            self.qpu_solver.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
     def _needs_embedding(self, topology_name: str, solver_name: str) -> bool:
         """
