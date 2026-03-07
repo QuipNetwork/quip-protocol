@@ -368,7 +368,7 @@ class NetworkNode(Node):
                 elif isinstance(event, StreamDataReceived):
                     self._handle_stream_data(event)
                 elif isinstance(event, ConnectionTerminated):
-                    node.logger.info(
+                    node.logger.debug(
                         f"Connection terminated with {self._peer_address}: "
                         f"error_code={event.error_code}, reason={event.reason_phrase}"
                     )
@@ -843,6 +843,9 @@ class NetworkNode(Node):
 
     async def _exhaust_block_cache(self):
         """Exhaust the block cache by processing all blocks in order."""
+        # Don't exhaust cache during sync - blocks will be processed after sync completes
+        if not self.synchronized:
+            return
         # Pause gossip and process the current block cache.
         async with self.gossip_lock:
             # Process cached blocks starting from end_index + 1
@@ -1260,6 +1263,8 @@ class NetworkNode(Node):
         success = await synchronizer.sync_blocks(start_index, end_index)
         if success:
             self.logger.info(f"Synced blocks {start_index} to {end_index}")
+            self.set_synchronized()
+            await self._exhaust_block_cache()
         else:
             self.logger.error(f"Failed to sync blocks {start_index} to {end_index}")
         return success
