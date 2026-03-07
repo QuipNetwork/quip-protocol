@@ -1944,10 +1944,12 @@ class NetworkNode(Node):
         sampler = None
         miner_kind = miner_handle.spec.get("kind", "").lower()
 
+        qpu_sampler = None
         if miner_kind == "qpu":
             from dwave.system import DWaveSampler
             try:
-                sampler = DWaveSampler()
+                qpu_sampler = DWaveSampler()
+                sampler = qpu_sampler
                 self.logger.info(f"Using QPU sampler: {sampler.properties.get('chip_id', 'unknown')}")
             except Exception as e:
                 self.logger.error(f"Failed to create QPU sampler: {e}")
@@ -1959,8 +1961,12 @@ class NetworkNode(Node):
         else:
             return msg.create_error_response(f"Unknown miner type: {miner_kind}")
 
-        # Sample the Ising problem
-        sampleset = sampler.sample_ising(h_dict, J_dict, num_reads=num_samples)
+        try:
+            # Sample the Ising problem
+            sampleset = sampler.sample_ising(h_dict, J_dict, num_reads=num_samples)
+        finally:
+            if qpu_sampler is not None:
+                qpu_sampler.close()
 
         # Extract samples and energies
         samples = []
