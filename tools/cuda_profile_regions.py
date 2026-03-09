@@ -112,58 +112,52 @@ def profile_gibbs(num_reads, num_sweeps):
 def profile_sa(num_reads, num_sweeps):
     """Run SA kernel with profiling and return data.
 
-    Uses the persistent SA kernel (CudaKernelRealSA) via the
-    async sampler wrapper. Submits one job, collects results,
-    then reads profiling counters.
+    Uses CudaKernelRealSA persistent kernel: enqueue one job,
+    poll for result, then read profiling counters.
     """
+    import time
     from GPU.cuda_kernel import CudaKernelRealSA
-    from GPU.cuda_sa import CudaSASamplerAsync
-    from GPU.sampler_utils import build_csr_from_ising
+    from shared.beta_schedule import _default_ising_beta_range
 
     h_dict, J_dict = build_ising_problem()
 
-    # Build arrays for the async sampler
-    nodes = sorted(h_dict.keys())
-    N = max(nodes) + 1
-    h_arr = np.zeros(N, dtype=np.float32)
-    for node, val in h_dict.items():
-        h_arr[node] = float(val)
-
-    edges = sorted(J_dict.keys())
-    J_arr = np.array(
-        [float(J_dict[e]) for e in edges],
-        dtype=np.float32,
-    )
-
-    # Compute beta schedule
-    from shared.beta_schedule import _default_ising_beta_range
-    beta_range = _default_ising_beta_range(h_dict, J_dict)
     num_betas = num_sweeps
     num_sweeps_per_beta = 1
-    beta_sched = np.geomspace(
-        beta_range[0], beta_range[1],
-        num=num_betas, dtype=np.float32,
-    )
+    beta_range = _default_ising_beta_range(h_dict, J_dict)
 
-    # Launch persistent kernel with profiling
     kernel = CudaKernelRealSA(
         profile=True, verbose=False,
     )
-    sampler = CudaSASamplerAsync(kernel)
 
-    # Submit and collect
-    sampler.sample_ising(
-        h_list=[h_arr],
-        J_list=[J_arr],
-        num_reads=num_reads,
+    kernel.enqueue_job(
+        job_id=0,
+        h=h_dict,
+        J=J_dict,
+        num_reads=min(num_reads, 256),
         num_betas=num_betas,
         num_sweeps_per_beta=num_sweeps_per_beta,
-        beta_schedule=beta_sched,
-        edges=edges,
+        beta_range=beta_range,
     )
+    kernel.signal_batch_ready()
+
+    # Poll for result
+    deadline = time.time() + 30.0
+    result = None
+    while time.time() < deadline:
+        result = kernel.try_dequeue_result()
+        if result is not None:
+            break
+        time.sleep(0.01)
 
     data = kernel.get_profile_data()
     kernel.stop_immediate()
+
+    if result is None:
+        print(
+            "WARNING: SA persistent kernel did not produce "
+            "a result within 30s. Profile data may be empty."
+        )
+
     return data
 
 
