@@ -7,7 +7,7 @@ import importlib.util
 # Load qpu_time_manager module directly without triggering QPU/__init__.py
 # This avoids the D-Wave dependency which may not be installed in test environments
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_module_path = os.path.join(_project_root, "QPU", "qpu_time_manager.py")
+_module_path = os.path.join(_project_root, "QPU", "DWave", "qpu_time_manager.py")
 _spec = importlib.util.spec_from_file_location("qpu_time_manager", _module_path)
 _module = importlib.util.module_from_spec(_spec)
 # Register the module in sys.modules before execution (required for dataclass decorator)
