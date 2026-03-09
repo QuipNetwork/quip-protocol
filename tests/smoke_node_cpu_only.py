@@ -1,28 +1,33 @@
 """Smoke test for Node with CPU-only persistent miner worker.
 
 Run:
-  python -m tests.smoke_node_cpu_only
+  python tests/smoke_node_cpu_only.py
 """
 from __future__ import annotations
 
+import asyncio
 import multiprocessing
-import time
 
 from shared.node import Node
+from shared.block import create_genesis_block
 
 
-def main():
+async def run():
     miners_config = {
         "global": {"host": "0.0.0.0", "port": 8080},
         "cpu": {"num_cpus": 1},
     }
-    node = Node(node_id="node-1", miners_config=miners_config)
-
-    stop_event = multiprocessing.Event()
-    header = f"prevhash0|index1|{int(time.time())}|data"
+    genesis_block = create_genesis_block()
+    node = Node(node_id="node-1", miners_config=miners_config, genesis_block=genesis_block)
 
     print("Starting mining round...")
-    result = node.mine_block(header, stop_event)
+    try:
+        result = await node.mine_block(genesis_block)
+    except Exception as e:
+        print(f"CPU smoke test failed: {e}")
+        node.close()
+        return
+
     if result:
         print(f"Winner: {result.miner_id}, energy={result.energy:.2f}, num_valid={result.num_valid}")
     else:
@@ -35,5 +40,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-
+    multiprocessing.set_start_method("spawn", force=True)
+    asyncio.run(run())

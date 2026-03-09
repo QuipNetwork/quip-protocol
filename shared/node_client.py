@@ -474,6 +474,28 @@ class NodeClient:
             )
             return False
 
+    async def _handle_version_mismatch(self, host: str) -> None:
+        """Close connection and remove peer after protocol version mismatch."""
+        self.logger.error(
+            f"Protocol version mismatch with {host}, removing peer. "
+            f"Please ensure both nodes are running compatible versions. "
+            f"Run 'pip install -U quip-network' to upgrade."
+        )
+        await self.remove_peer(host)
+
+    async def _is_version_error(self, response: Optional[QuicMessage], host: str) -> bool:
+        """Check if response indicates protocol version mismatch.
+
+        Returns:
+            True if version mismatch detected and peer was removed.
+        """
+        if (response
+                and response.msg_type == QuicMessageType.ERROR_RESPONSE
+                and b"Protocol version mismatch" in response.payload):
+            await self._handle_version_mismatch(host)
+            return True
+        return False
+
     async def send_heartbeat(self, node_host: str, public_host: str, miner_info: MinerInfo) -> bool:
         protocol = await self._get_connection(node_host)
         if not protocol:
@@ -482,6 +504,8 @@ class NodeClient:
             "sender": public_host, "version": get_version(), "timestamp": utc_timestamp_float()
         }).encode('utf-8')
         response = await protocol.send_request(QuicMessageType.HEARTBEAT, payload, timeout=5.0)
+        if await self._is_version_error(response, node_host):
+            return False
         return response is not None and response.msg_type == QuicMessageType.HEARTBEAT_RESPONSE
 
     async def get_peer_status(self, host: str) -> Optional[dict]:
@@ -489,6 +513,8 @@ class NodeClient:
         if not protocol:
             return None
         response = await protocol.send_request(QuicMessageType.STATUS_REQUEST, b'', timeout=self.node_timeout)
+        if await self._is_version_error(response, host):
+            return None
         if response and response.msg_type == QuicMessageType.STATUS_RESPONSE:
             try:
                 return json.loads(response.payload.decode('utf-8'))
@@ -503,6 +529,8 @@ class NodeClient:
         t0 = time.perf_counter()
         payload = struct.pack('!I', block_number)
         response = await protocol.send_request(QuicMessageType.BLOCK_REQUEST, payload, timeout=self.node_timeout)
+        if await self._is_version_error(response, host):
+            return None
         if response and response.msg_type == QuicMessageType.BLOCK_RESPONSE:
             try:
                 block = Block.from_network(response.payload)
@@ -518,6 +546,8 @@ class NodeClient:
             return None
         payload = struct.pack('!I', block_number)
         response = await protocol.send_request(QuicMessageType.BLOCK_HEADER_REQUEST, payload, timeout=self.node_timeout)
+        if await self._is_version_error(response, host):
+            return None
         if response and response.msg_type == QuicMessageType.BLOCK_HEADER_RESPONSE:
             try:
                 return BlockHeader.from_network(response.payload)
@@ -532,6 +562,8 @@ class NodeClient:
             return False
         payload = message.to_network()
         response = await protocol.send_request(QuicMessageType.GOSSIP, payload, timeout=5.0)
+        if await self._is_version_error(response, host):
+            return False
         return response is not None and response.msg_type == QuicMessageType.GOSSIP_RESPONSE
 
     async def join_network_via_peer(self, peer_address: str, join_data: dict) -> Optional[dict]:
@@ -547,6 +579,8 @@ class NodeClient:
             except Exception:
                 return None
         elif response and response.msg_type == QuicMessageType.ERROR_RESPONSE:
+            if await self._is_version_error(response, peer_address):
+                return None
             error_msg = response.payload.decode('utf-8', errors='replace')
             self.logger.warning(f"Join rejected by {peer_address}: {error_msg}")
         return None

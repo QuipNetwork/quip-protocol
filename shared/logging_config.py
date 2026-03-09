@@ -144,6 +144,12 @@ def setup_logging(
 
     root_logger.addHandler(console_handler)
 
+    # Suppress verbose aioquic connection logs
+    # (version negotiation, ALPN, duplicate CRYPTO)
+    quic_logger = logging.getLogger("quic")
+    quic_logger.setLevel(logging.WARNING)
+    quic_logger.propagate = True
+
     # Configure aiohttp logging
     if http_log_file:
         # Create aiohttp logger

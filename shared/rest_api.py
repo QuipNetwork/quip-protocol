@@ -443,9 +443,11 @@ class RestApiServer:
             # Create appropriate sampler based on miner type
             if miner_kind == "qpu":
                 from dwave.system import DWaveSampler
-                sampler = DWaveSampler()
+                qpu_sampler = DWaveSampler()
+                sampler = qpu_sampler
             elif miner_kind in ["cpu", "metal", "cuda", "modal"]:
                 from dwave.samplers import SimulatedAnnealingSampler
+                qpu_sampler = None
                 sampler = SimulatedAnnealingSampler()
             else:
                 return self._error_response(
@@ -453,8 +455,12 @@ class RestApiServer:
                     "UNKNOWN_MINER_TYPE"
                 )
 
-            # Sample the Ising problem
-            sampleset = sampler.sample_ising(h_dict, J_dict, num_reads=num_samples)
+            try:
+                # Sample the Ising problem
+                sampleset = sampler.sample_ising(h_dict, J_dict, num_reads=num_samples)
+            finally:
+                if qpu_sampler is not None:
+                    qpu_sampler.close()
 
             # Extract samples and energies
             samples = []

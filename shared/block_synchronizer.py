@@ -256,8 +256,15 @@ class BlockSynchronizer:
                             None, lambda: completed_queue.get(timeout=30.0)
                         )
                     except Exception:
-                        # Handle queue timeout or other errors
-                        self.logger.error("Timeout waiting for block download completion")
+                        # Check if we made any progress before giving up
+                        blocks_synced = next_expected - start_index
+                        if blocks_synced > 0:
+                            self.logger.warning(
+                                f"Timeout after syncing {blocks_synced} blocks, "
+                                f"returning partial success"
+                            )
+                            return True
+                        self.logger.error("Timeout with no progress on block downloads")
                         return False
                     
                     if block is None:
