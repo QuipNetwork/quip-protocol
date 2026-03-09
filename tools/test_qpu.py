@@ -19,7 +19,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -49,6 +49,22 @@ from shared.quantum_proof_of_work import (
 )
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies import load_topology
+
+
+def ensure_solver_topology(solver_name: str, region: Optional[str] = None):
+    """Load or dump topology for a solver. Returns DWaveTopology.
+
+    If the topology JSON doesn't exist locally, dumps it from the D-Wave API.
+    """
+    try:
+        return load_topology(solver_name)
+    except (ValueError, FileNotFoundError):
+        pass
+    # Not found locally — dump from D-Wave API
+    from tools.dump_solver_topology import dump_solver_topology as dump_topo
+    print(f"Topology for {solver_name} not found locally, dumping from API...")
+    dump_topo(solver_name, use_gzip=True, region=region)
+    return load_topology(solver_name)
 
 
 def parse_duration(duration_str: str) -> float:
@@ -87,18 +103,39 @@ def parse_duration_list(s: str) -> List[float]:
     return [parse_duration(x.strip()) for x in s.split(',')]
 
 
-# Conservative constants for Advantage2 QPU time estimation.
+# Conservative defaults for QPU time estimation (Advantage2 baseline).
 # Derived from actual D-Wave timing: 2048 reads x 320us -> 1,014,436us.
 QPU_MAX_ACCESS_TIME_US = 1_000_000
 QPU_PROGRAMMING_TIME_US = 15_000
 QPU_PER_SAMPLE_OVERHEAD_US = 180  # readout + thermalization (conservative)
 
 
-def exceeds_qpu_time_limit(num_reads: int, annealing_time: float) -> bool:
-    """Check if a parameter combination would exceed QPU time limit."""
-    estimated = (QPU_PROGRAMMING_TIME_US
-                 + num_reads * (annealing_time + QPU_PER_SAMPLE_OVERHEAD_US))
-    return estimated > QPU_MAX_ACCESS_TIME_US
+def exceeds_qpu_time_limit(
+    num_reads: int,
+    annealing_time: float,
+    solver_props: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Check if a parameter combination would exceed QPU time limit.
+
+    When solver_props is provided, uses the solver's actual limits instead
+    of conservative defaults.
+    """
+    if solver_props:
+        max_time = solver_props.get(
+            'problem_run_duration_range', [0, QPU_MAX_ACCESS_TIME_US]
+        )[1]
+        prog_time = solver_props.get(
+            'default_programming_thermalization', QPU_PROGRAMMING_TIME_US
+        )
+        overhead = solver_props.get(
+            'readout_thermalization_range', [0, QPU_PER_SAMPLE_OVERHEAD_US]
+        )[1]
+    else:
+        max_time = QPU_MAX_ACCESS_TIME_US
+        prog_time = QPU_PROGRAMMING_TIME_US
+        overhead = QPU_PER_SAMPLE_OVERHEAD_US
+    estimated = prog_time + num_reads * (annealing_time + overhead)
+    return estimated > max_time
 
 
 def generate_nonce(seed: int, topology) -> Tuple[str, Dict]:
@@ -216,7 +253,8 @@ def save_results_incremental(output_file: str, output_data: Dict):
 
 def build_output_data(seeds, topology, num_reads_list, annealing_time_list,
                       interval_list, cpu_baseline_sweeps, cpu_baseline_reads,
-                      cpu_baselines, qpu_results, queue_depth):
+                      cpu_baselines, qpu_results, queue_depth,
+                      solver_name=None, solver_props=None):
     """Build the full output data dict for JSON serialization."""
     qpu_results_serializable = {}
     for (seed, interval_seconds), results in qpu_results.items():
@@ -227,7 +265,7 @@ def build_output_data(seeds, topology, num_reads_list, annealing_time_list,
             'results': results
         }
 
-    return {
+    data = {
         'seeds': seeds,
         'topology': topology.solver_name,
         'num_reads_tested': num_reads_list,
@@ -243,11 +281,21 @@ def build_output_data(seeds, topology, num_reads_list, annealing_time_list,
         'timestamp': time.time()
     }
 
+    if solver_name or solver_props:
+        data['solver'] = {
+            'name': solver_name,
+            'chip_id': solver_props.get('chip_id') if solver_props else None,
+            'num_qubits': len(topology.nodes),
+            'num_couplers': len(topology.edges),
+        }
+
+    return data
+
 
 def run_streaming(qpu_miner, nonces_and_models, num_reads_list,
                   annealing_time_list, interval_seconds, qpu_results,
                   queue_depth, total_tests, test_counter, output_file,
-                  output_data_builder):
+                  output_data_builder, solver_props=None):
     """Run QPU tests with async streaming for maximum throughput.
 
     Maintains up to queue_depth jobs in-flight simultaneously.
@@ -258,7 +306,7 @@ def run_streaming(qpu_miner, nonces_and_models, num_reads_list,
     skipped_combos = 0
     for num_reads in num_reads_list:
         for annealing_time in annealing_time_list:
-            if exceeds_qpu_time_limit(num_reads, annealing_time):
+            if exceeds_qpu_time_limit(num_reads, annealing_time, solver_props):
                 skipped_combos += 1
                 continue
             for seed, nonce, model in nonces_and_models:
@@ -267,8 +315,7 @@ def run_streaming(qpu_miner, nonces_and_models, num_reads_list,
     if skipped_combos:
         skipped_jobs = skipped_combos * len(nonces_and_models)
         print(f"  Skipped {skipped_combos} param combo(s) exceeding "
-              f"{QPU_MAX_ACCESS_TIME_US / 1e6:.0f}s QPU limit "
-              f"({skipped_jobs} jobs)")
+              f"QPU time limit ({skipped_jobs} jobs)")
 
     topology_label = qpu_miner.sampler.job_label
     pending: Dict[Any, PendingJob] = {}
@@ -369,13 +416,14 @@ def run_streaming(qpu_miner, nonces_and_models, num_reads_list,
 
 def run_sync(qpu_miner, nonces_and_models, num_reads_list,
              annealing_time_list, interval_seconds, qpu_results,
-             total_tests, test_counter, output_file, output_data_builder):
+             total_tests, test_counter, output_file, output_data_builder,
+             solver_props=None):
     """Run QPU tests synchronously with sleep intervals between queries."""
     work_items = []
     skipped_combos = 0
     for num_reads in num_reads_list:
         for annealing_time in annealing_time_list:
-            if exceeds_qpu_time_limit(num_reads, annealing_time):
+            if exceeds_qpu_time_limit(num_reads, annealing_time, solver_props):
                 skipped_combos += 1
                 continue
             for seed, nonce, model in nonces_and_models:
@@ -384,8 +432,7 @@ def run_sync(qpu_miner, nonces_and_models, num_reads_list,
     if skipped_combos:
         skipped_jobs = skipped_combos * len(nonces_and_models)
         print(f"  Skipped {skipped_combos} param combo(s) exceeding "
-              f"{QPU_MAX_ACCESS_TIME_US / 1e6:.0f}s QPU limit "
-              f"({skipped_jobs} jobs)")
+              f"QPU time limit ({skipped_jobs} jobs)")
 
     for i, (seed, nonce, model, num_reads, annealing_time) in enumerate(work_items):
         test_counter[0] += 1
@@ -480,6 +527,19 @@ def main():
         help='Number of QPU jobs to keep in-flight for async streaming (default: 30). '
              'Only used when interval=0.'
     )
+    parser.add_argument(
+        '--solver',
+        type=str,
+        default=None,
+        help='Target a specific D-Wave solver by name (e.g. "Advantage2_system1.12"). '
+             'Auto-detects topology from hardware. Use with --topology to override.'
+    )
+    parser.add_argument(
+        '--region',
+        type=str,
+        default=None,
+        help='D-Wave region (e.g. "na-east-1"). If not specified, uses default from config.'
+    )
 
     args = parser.parse_args()
 
@@ -504,13 +564,26 @@ def main():
         except (ValueError, FileNotFoundError) as e:
             print(f"❌ Failed to load topology '{args.topology}': {e}")
             return 1
+    elif args.solver:
+        try:
+            topology = ensure_solver_topology(args.solver, region=args.region)
+            print(f"✅ Auto-loaded topology for solver {args.solver}: "
+                  f"{topology.solver_name}")
+        except (ValueError, FileNotFoundError) as e:
+            print(f"❌ Failed to load topology for solver '{args.solver}': {e}")
+            return 1
     else:
         topology = DEFAULT_TOPOLOGY
 
     queue_depth = args.queue_depth
 
+    # Extract solver properties for dynamic time limits
+    solver_props = None
+
     print("🔬 QPU Parameter Testing Tool")
     print("=" * 60)
+    if args.solver:
+        print(f"Solver: {args.solver}")
     print(f"Topology: {topology.solver_name} ({len(topology.nodes)} nodes, {len(topology.edges)} edges)")
     print(f"Seeds: {seeds}")
     print(f"num_reads values: {num_reads_list}")
@@ -523,8 +596,12 @@ def main():
     # Determine output file early for incremental saves
     output_file = args.output
     if not output_file:
-        timestamp = int(time.time())
-        output_file = f"qpu_test_{timestamp}.json"
+        if args.solver:
+            normalized = args.solver.replace('-', '_').replace('.', '_').lower()
+            output_file = f"qpu_grid_{normalized}.json"
+        else:
+            timestamp = int(time.time())
+            output_file = f"qpu_test_{timestamp}.json"
 
     # Initialize miners
     print("Initializing miners...")
@@ -534,10 +611,26 @@ def main():
 
     cpu_sampler = SimulatedAnnealingStructuredSampler(topology=topology)
     cpu_miner = SimulatedAnnealingMiner(miner_id="qpu-test-cpu", sampler=cpu_sampler)
-    qpu_miner = DWaveMiner(miner_id="qpu-test-qpu", topology=topology, qpu_timeout=0.0)
+    qpu_miner = DWaveMiner(
+        miner_id="qpu-test-qpu",
+        topology=topology,
+        solver_name=args.solver,
+        region=args.region,
+        qpu_timeout=0.0,
+    )
 
     print("✅ CPU miner initialized")
     print("✅ QPU miner initialized")
+
+    # Extract solver properties for dynamic time limits
+    solver_props = qpu_miner.sampler.properties
+    chip_id = solver_props.get('chip_id', 'unknown')
+    if args.solver:
+        print(f"   chip_id: {chip_id}")
+        dur_range = solver_props.get('problem_run_duration_range')
+        if dur_range:
+            print(f"   problem_run_duration_range: "
+                  f"[{dur_range[0]}, {dur_range[1]}] μs")
     print()
 
     # Generate nonces for all seeds
@@ -569,7 +662,7 @@ def main():
     # Build list of all QPU tests, accounting for skipped combos
     skipped_combos = sum(
         1 for nr in num_reads_list for at in annealing_time_list
-        if exceeds_qpu_time_limit(nr, at)
+        if exceeds_qpu_time_limit(nr, at, solver_props)
     )
     valid_combos = len(num_reads_list) * len(annealing_time_list) - skipped_combos
     total_tests = valid_combos * len(nonces_and_models) * len(interval_list)
@@ -577,7 +670,7 @@ def main():
     print(f"  {len(num_reads_list)} num_reads × {len(annealing_time_list)} annealing_time × {len(interval_list)} interval × {len(seeds)} seed(s)")
     if skipped_combos:
         skipped_jobs = skipped_combos * len(nonces_and_models) * len(interval_list)
-        print(f"  {skipped_combos} param combo(s) exceed {QPU_MAX_ACCESS_TIME_US / 1e6:.0f}s QPU limit ({skipped_jobs} jobs skipped)")
+        print(f"  {skipped_combos} param combo(s) exceed QPU time limit ({skipped_jobs} jobs skipped)")
 
     # Show mode per interval
     for interval in interval_list:
@@ -593,7 +686,8 @@ def main():
         return build_output_data(
             seeds, topology, num_reads_list, annealing_time_list,
             interval_list, args.cpu_baseline_sweeps, args.cpu_baseline_reads,
-            cpu_baselines, qpu_results, queue_depth
+            cpu_baselines, qpu_results, queue_depth,
+            solver_name=args.solver, solver_props=solver_props,
         )
 
     # Run tests per interval
@@ -606,7 +700,7 @@ def main():
                 qpu_miner, nonces_and_models, num_reads_list,
                 annealing_time_list, interval_seconds, qpu_results,
                 queue_depth, total_tests, test_counter, output_file,
-                make_output_data
+                make_output_data, solver_props=solver_props
             )
         else:
             print(f"\n{'=' * 60}")
@@ -615,7 +709,8 @@ def main():
             run_sync(
                 qpu_miner, nonces_and_models, num_reads_list,
                 annealing_time_list, interval_seconds, qpu_results,
-                total_tests, test_counter, output_file, make_output_data
+                total_tests, test_counter, output_file, make_output_data,
+                solver_props=solver_props
             )
 
     print()
