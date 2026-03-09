@@ -37,20 +37,7 @@ class EmbeddedFuture:
         self._cached_sampleset: Optional[dimod.SampleSet] = None
 
     @property
-    def sampleset(self) -> dimod.SampleSet:
-        """Get the unembedded sampleset (blocks if not ready)."""
-        if self._cached_sampleset is None:
-            # Get raw embedded sampleset from QPU
-            embedded_sampleset = self._future.sampleset
 
-            # Unembed to get logical variable samples
-            self._cached_sampleset = unembed_sampleset(
-                embedded_sampleset,
-                self._embedding,
-                self._source_bqm,
-                chain_break_method='majority_vote'
-            )
-        return self._cached_sampleset
 
     def done(self) -> bool:
         """Check if the future is complete."""

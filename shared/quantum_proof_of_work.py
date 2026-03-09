@@ -213,7 +213,7 @@ def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
     # Only look at upper triangle to avoid duplicates
     upper_tri = np.triu(dist_matrix, k=1)
     max_idx = np.unravel_index(np.argmax(upper_tri), upper_tri.shape)
-    selected_indices = list(max_idx)
+    selected_indices = [int(x) for x in max_idx]
 
     # Convert to set for O(1) lookup
     selected_set = set(selected_indices)
@@ -228,7 +228,7 @@ def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
         min_dists[selected_arr] = -1
 
         # Find point with maximum minimum distance
-        best_idx = np.argmax(min_dists)
+        best_idx = int(np.argmax(min_dists))
         selected_indices.append(best_idx)
         selected_set.add(best_idx)
 
@@ -255,6 +255,7 @@ def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
                 candidates = range(n_solutions)
 
             for cand_idx in candidates:
+                cand_idx = int(cand_idx)
                 if cand_idx in selected_set:
                     continue
 
