@@ -346,7 +346,7 @@ def _minor_to_graph(minor: MinorEntry) -> Optional[Graph]:
         except ValueError:
             pass
 
-    # Zephyr graphs: Z(m,t)
+    # Zephyr graphs: Z(m,t) or Zm_t format
     if name.startswith('Z(') and ',' in name:
         try:
             import dwave_networkx as dnx
@@ -355,6 +355,27 @@ def _minor_to_graph(minor: MinorEntry) -> Optional[Graph]:
             m, t = inner.split(',')
             m, t = int(m.strip()), int(t.strip())
             G = dnx.zephyr_graph(m, t)
+            return Graph.from_networkx(G)
+        except (ValueError, ImportError):
+            pass
+
+    if name.startswith('Z') and '_' in name and not name.startswith('Z('):
+        try:
+            import dwave_networkx as dnx
+            parts = name[1:].split('_')
+            if len(parts) == 2:
+                m, t = int(parts[0]), int(parts[1])
+                G = dnx.zephyr_graph(m, t)
+                return Graph.from_networkx(G)
+        except (ValueError, ImportError):
+            pass
+
+    # Chimera graphs: Cmm format
+    if name.startswith('Cm') and name[2:].isdigit():
+        try:
+            import dwave_networkx as dnx
+            m = int(name[2:])
+            G = dnx.chimera_graph(m)
             return Graph.from_networkx(G)
         except (ValueError, ImportError):
             pass

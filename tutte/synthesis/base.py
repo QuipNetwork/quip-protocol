@@ -13,6 +13,8 @@ from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 from ..polynomial import TuttePolynomial
 from ..graph import Graph, MultiGraph
+from ..graphs.series_parallel import compute_sp_tutte_multigraph_if_applicable
+from ..graphs.treewidth import compute_treewidth_tutte_if_applicable
 
 
 # =============================================================================
@@ -113,10 +115,51 @@ class BaseMultigraphSynthesizer:
                     poly = poly * self._synthesize_multigraph(comp, max_depth, skip_minor_search)
                 return poly
 
-        # 5. Cache lookup (requires canonical_key - expensive but needed for non-factorable graphs)
-        cache_key = mg.canonical_key()
-        if cache_key in self._multigraph_cache:
-            return self._multigraph_cache[cache_key]
+        # 4.5 Series-parallel multigraph O(n) computation
+        sp_poly = compute_sp_tutte_multigraph_if_applicable(mg)
+        if sp_poly is not None:
+            self._log(f"SP multigraph: {mg.node_count()} nodes, {mg.edge_count()} edges")
+            # Lazily compute cache_key only for caching
+            cache_key = mg.canonical_key()
+            self._multigraph_cache[cache_key] = sp_poly
+            if not hasattr(self, '_fast_hash_set'):
+                self._fast_hash_set = set()
+            self._fast_hash_set.add(mg.fast_hash())
+            return sp_poly
+
+        # 4.6 Treewidth-based O(n · B(w+1)²) computation
+        tw_poly = compute_treewidth_tutte_if_applicable(mg, max_width=6)
+        if tw_poly is not None:
+            self._log(f"Treewidth-based: {mg.node_count()} nodes, {mg.edge_count()} edges")
+            cache_key = mg.canonical_key()
+            self._multigraph_cache[cache_key] = tw_poly
+            if not hasattr(self, '_fast_hash_set'):
+                self._fast_hash_set = set()
+            self._fast_hash_set.add(mg.fast_hash())
+            return tw_poly
+
+        # 5. Two-level cache lookup: fast_hash filter before expensive canonical_key
+        #    _fast_hash_set contains hashes of all entries cached this session.
+        #    If fast_hash not in set AND _fast_hash_set_complete is True, skip
+        #    canonical_key entirely (guaranteed miss). Otherwise, fall through.
+        fh = mg.fast_hash()
+        if not hasattr(self, '_fast_hash_set'):
+            self._fast_hash_set = set()
+        if not hasattr(self, '_fast_hash_set_complete'):
+            self._fast_hash_set_complete = not bool(self._multigraph_cache)
+
+        if fh in self._fast_hash_set:
+            cache_key = mg.canonical_key()
+            if cache_key in self._multigraph_cache:
+                return self._multigraph_cache[cache_key]
+        elif not self._fast_hash_set_complete:
+            # Loaded entries may not be indexed yet — must check
+            cache_key = mg.canonical_key()
+            if cache_key in self._multigraph_cache:
+                self._fast_hash_set.add(fh)
+                return self._multigraph_cache[cache_key]
+        else:
+            cache_key = None  # Guaranteed miss — skip canonical_key
 
         self._log(f"Synthesizing multigraph: {mg.node_count()} nodes, {mg.edge_count()} edges")
 
@@ -135,14 +178,24 @@ class BaseMultigraphSynthesizer:
                     simple_key = simple.canonical_key()
                     if simple_key in self.table.entries:
                         self._mg_minors_accum.add(simple_key)
+                if cache_key is None:
+                    cache_key = mg.canonical_key()
                 self._multigraph_cache[cache_key] = result.polynomial
+                self._fast_hash_set.add(fh)
                 return result.polynomial
 
-        # 7. Reduce parallel edges one at a time: T(G) = T(G\\e) + T(G/e)
+        # 7. Batch reduce parallel edges using closed-form formula
+        # For k parallel edges between u,v:
+        #   Connected case: T(G) = T(G_0) + T(G_c) * (1 + y + ... + y^{k-1})
+        #   Disconnected case: T(G) = T(G_c) * (x + y + ... + y^{k-1})
+        # where G_0 = G without u-v edges, G_c = G_0 with u,v merged
         max_mult_edge = max(mg.edge_counts.keys(), key=lambda e: mg.edge_counts[e])
         if mg.edge_counts[max_mult_edge] > 1:
-            poly = self._reduce_parallel_edge(mg, max_mult_edge, max_depth, skip_minor_search)
+            poly = self._batch_reduce_parallel(mg, max_mult_edge, max_depth, skip_minor_search)
+            if cache_key is None:
+                cache_key = mg.canonical_key()
             self._multigraph_cache[cache_key] = poly
+            self._fast_hash_set.add(fh)
             return poly
 
         # 8. Fall back (should not be reached)
@@ -205,79 +258,61 @@ class BaseMultigraphSynthesizer:
         return (self._synthesize_multigraph(comp1, max_depth, skip_minor_search) *
                 self._synthesize_multigraph(rest, max_depth, skip_minor_search))
 
-    def _reduce_parallel_edge(
+    def _batch_reduce_parallel(
         self,
         mg: MultiGraph,
         edge: Tuple[int, int],
         max_depth: int,
         skip_minor_search: bool = False
     ) -> TuttePolynomial:
-        """Reduce a parallel edge using T(G) = T(G\\e) + T(G/e).
+        """Batch reduce all k parallel edges between u,v using closed-form formula.
 
-        For parallel edges, deletion removes one copy, contraction
-        merges the endpoints (creating loops from other parallel copies).
+        For k parallel edges between u,v:
+          If u,v connected in G_0 (G without u-v edges):
+            T(G) = T(G_0) + T(G_c) * (1 + y + y^2 + ... + y^{k-1})
+          If u,v disconnected in G_0:
+            T(G) = T(G_c) * (x + y + y^2 + ... + y^{k-1})
+
+        where G_c = G_0 with u,v merged (no u-v edges, no loops from them).
+        This replaces k sequential delete-contract steps with 2 recursive calls.
         """
         u, v = edge
-        multiplicity = mg.edge_counts[edge]
+        k = mg.edge_counts[edge]
 
-        # Delete one copy
+        # Build G_0: remove ALL edges between u,v
         new_edge_counts = dict(mg.edge_counts)
-        new_edge_counts[edge] = multiplicity - 1
-        if new_edge_counts[edge] == 0:
-            del new_edge_counts[edge]
-        mg_delete = MultiGraph(
+        del new_edge_counts[edge]
+        mg_0 = MultiGraph(
             nodes=mg.nodes,
             edge_counts=new_edge_counts,
             loop_counts=mg.loop_counts
         )
 
-        # Contract (merge endpoints, creating loops from parallel copies)
-        mg_merged = mg.merge_nodes(u, v)
-        survivor = min(u, v)
-        if survivor in mg_merged.loop_counts:
-            new_loops = dict(mg_merged.loop_counts)
-            new_loops[survivor] -= 1
-            if new_loops[survivor] == 0:
-                del new_loops[survivor]
-            mg_contract = MultiGraph(
-                nodes=mg_merged.nodes,
-                edge_counts=mg_merged.edge_counts,
-                loop_counts=new_loops
-            )
+        # Build G_c: merge u,v in G_0 (no u-v edges to create loops)
+        mg_c = mg_0.merge_nodes(u, v)
+
+        # Compute y-geometric sum: 1 + y + y^2 + ... + y^{k-1}
+        y_sum_coeffs = {}
+        for i in range(k):
+            y_sum_coeffs[(0, i)] = 1
+        y_sum = TuttePolynomial.from_coefficients(y_sum_coeffs)
+
+        # Check connectivity of u,v in G_0
+        if mg_0.in_same_component(u, v):
+            # Connected case: T(G) = T(G_0) + T(G_c) * y_sum
+            t_g0 = self._synthesize_multigraph(mg_0, max_depth, skip_minor_search)
+            t_gc = self._synthesize_multigraph(mg_c, max_depth, skip_minor_search)
+            return t_g0 + t_gc * y_sum
         else:
-            mg_contract = mg_merged
+            # Disconnected case: T(G) = T(G_c) * (x - 1 + y_sum)
+            # = T(G_c) * (x + y + y^2 + ... + y^{k-1})
+            t_gc = self._synthesize_multigraph(mg_c, max_depth, skip_minor_search)
+            x_plus_y_sum_coeffs = {(1, 0): 1}  # x
+            for i in range(1, k):
+                x_plus_y_sum_coeffs[(0, i)] = 1  # + y^i
+            x_plus_y_sum = TuttePolynomial.from_coefficients(x_plus_y_sum_coeffs)
+            return t_gc * x_plus_y_sum
 
-        t_delete = self._synthesize_multigraph(mg_delete, max_depth, skip_minor_search)
-        t_contract = self._synthesize_multigraph(mg_contract, max_depth, skip_minor_search)
-
-        return t_delete + t_contract
-
-    def _build_spanning_tree_bfs(self, graph: Graph) -> Tuple[Set[Tuple[int, int]], List[Tuple[int, int]]]:
-        """Build a spanning tree via BFS and return (tree_edges, chords).
-
-        Args:
-            graph: Connected graph to build spanning tree from
-
-        Returns:
-            Tuple of (tree_edges set, chords list)
-        """
-        tree_edges = set()
-        visited = set()
-        start = next(iter(graph.nodes))
-        queue = [start]
-        visited.add(start)
-
-        while queue:
-            node = queue.pop(0)
-            for neighbor in graph.neighbors(node):
-                if neighbor not in visited:
-                    visited.add(neighbor)
-                    queue.append(neighbor)
-                    edge = (min(node, neighbor), max(node, neighbor))
-                    tree_edges.add(edge)
-
-        chords = [e for e in graph.edges if e not in tree_edges]
-        return tree_edges, chords
 
 
 # =============================================================================

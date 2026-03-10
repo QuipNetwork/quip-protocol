@@ -15,7 +15,7 @@ This module also provides:
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Tuple, Set
-from ..graph import Graph
+from ..graph import Graph, MultiGraph
 from ..polynomial import TuttePolynomial
 
 
@@ -240,11 +240,9 @@ def decompose_series_parallel(graph: Graph) -> Optional[SPNode]:
 def compute_sp_tutte(tree: SPNode) -> TuttePolynomial:
     """Compute Tutte polynomial from SP decomposition tree in O(n) time.
 
-    Formulas:
-    - EDGE: T = x (single edge is a bridge)
-    - SERIES (cut vertex): T(G1 · G2) = T(G1) × T(G2)
-    - PARALLEL (k simple edges): T = x + y + y² + ... + y^(k-1)
-    - PARALLEL (complex children): Process children edge-by-edge
+    Uses (T, D) pair recursion where:
+    - T = Tutte polynomial of the 2-terminal graph
+    - D = Tutte polynomial after merging the two terminals
 
     Args:
         tree: SPNode decomposition tree
@@ -252,133 +250,157 @@ def compute_sp_tutte(tree: SPNode) -> TuttePolynomial:
     Returns:
         TuttePolynomial for the graph represented by this tree
     """
-    if tree.type == "EDGE":
-        return TuttePolynomial.x()
+    T, _ = _sp_TD(tree)
+    return T
 
-    elif tree.type == "SERIES":
-        # Cut vertex factorization: T(G1 · G2) = T(G1) × T(G2)
-        result = TuttePolynomial.one()
-        for child in tree.children:
-            result = result * compute_sp_tutte(child)
-        return result
 
-    elif tree.type == "PARALLEL":
-        # All-edge children: T(k parallel) = x + y + y² + ... + y^(k-1)
-        if all(c.type == "EDGE" for c in tree.children):
-            k = len(tree.children)
-            if k == 1:
-                return TuttePolynomial.x()
-            coeffs = {(1, 0): 1}  # x
-            for i in range(1, k):
-                coeffs[(0, i)] = 1  # + y^i
-            return TuttePolynomial.from_coefficients(coeffs)
+def _sp_TD(node: SPNode) -> Tuple[TuttePolynomial, TuttePolynomial]:
+    """Compute (T, D) for an SP node.
 
-        # Complex children: process edge by edge using chord formula
-        children_by_edges = sorted(tree.children, key=lambda c: -c.edge_count())
+    T = Tutte polynomial of the 2-terminal graph
+    D = Tutte polynomial after merging the two terminals
 
-        # Start with largest child as base
-        base_child = children_by_edges[0]
-        result = compute_sp_tutte(base_child)
-        accumulated_contracted = _compute_contracted_poly(base_child)
+    EDGE: T = x, D = y
+    SERIES(A₁,...,Aₖ): T = ∏T(Aᵢ), D = T(ring formed by merging outer terminals)
+    PARALLEL(A₁,...,Aₖ): D = ∏D(Aᵢ), T computed by sequential parallel addition
+    """
+    if node.type == "EDGE":
+        return (TuttePolynomial.x(), TuttePolynomial.y())
 
-        # Add remaining children in parallel
-        for child in children_by_edges[1:]:
-            result, accumulated_contracted = _add_child_edges_to_base(
-                child, result, accumulated_contracted
-            )
+    elif node.type == "SERIES":
+        children = node.children
+        # T = product of T(child) via cut vertex factorization
+        T = TuttePolynomial.one()
+        child_TDs = [_sp_TD(c) for c in children]
+        for T_c, _ in child_TDs:
+            T = T * T_c
 
-        return result
+        # D = T(ring) where ring = merging outer terminals of the series
+        # Ring = PARALLEL(Aₖ, SERIES(A₁,...,Aₖ₋₁)) at the merged vertex
+        # Computed as: start with S(A₁,...,Aₖ₋₁), add Aₖ in parallel
+        D = _series_D(children, child_TDs)
+
+        return (T, D)
+
+    elif node.type == "PARALLEL":
+        children = node.children
+        child_TDs = [_sp_TD(c) for c in children]
+
+        # D = product of D(child) — after merging terminals, each child has
+        # its terminals merged independently, sharing only the merged vertex
+        D = TuttePolynomial.one()
+        for _, D_c in child_TDs:
+            D = D * D_c
+
+        # T = add children in parallel sequentially
+        T, D_running = child_TDs[0]
+        for i, child in enumerate(children[1:], 1):
+            T, D_running = _add_parallel(child, T, D_running, child_TDs[i])
+
+        return (T, D)
 
     else:
-        raise ValueError(f"Unknown node type: {tree.type}")
+        raise ValueError(f"Unknown node type: {node.type}")
 
 
-def _add_child_edges_to_base(
-    child: SPNode,
-    base_poly: TuttePolynomial,
-    base_contracted: TuttePolynomial
-) -> Tuple[TuttePolynomial, TuttePolynomial]:
-    """Add a child structure in parallel to the base.
+def _series_D(
+    children: List[SPNode],
+    child_TDs: List[Tuple[TuttePolynomial, TuttePolynomial]],
+) -> TuttePolynomial:
+    """Compute D for a SERIES node = T(ring formed by merging outer terminals).
 
-    Handles complex children by processing them edge by edge.
+    Ring = SERIES(A₁,...,Aₖ) with outer terminals merged
+         = PARALLEL(Aₖ, SERIES(A₁,...,Aₖ₋₁)) at the merged terminals
 
-    - EDGE: direct chord, T(G + e) = T(G) + T(G/{s,t})
-    - SERIES: recursively process each sub-child
-    - PARALLEL: recursively process each grandchild
-
-    Args:
-        child: Child SP node to add in parallel
-        base_poly: Current polynomial T(base)
-        base_contracted: T(base/{s,t})
-
-    Returns:
-        (new_poly, new_contracted) tuple
+    Recursion: D(S(A₁,...,Aₖ)) = add_parallel(Aₖ, T(S(A₁,...,Aₖ₋₁)), D(S(A₁,...,Aₖ₋₁)))[0]
+    Base: D(S(A₁)) = D(A₁)
     """
-    if child.type == "EDGE":
-        # T(G + e) = T(G) + T(G/{s,t})
-        new_poly = base_poly + base_contracted
-        # (G + e)/{s,t} = G/{s,t} + loop -> multiply by y
-        new_contracted = base_contracted * TuttePolynomial.y()
-        return (new_poly, new_contracted)
+    k = len(children)
+    if k == 1:
+        return child_TDs[0][1]  # D of the single child
 
-    elif child.type == "SERIES":
-        # Recursively process each sub-child in sequence
-        poly = base_poly
-        contracted = base_contracted
-        for subchild in child.children:
-            poly, contracted = _add_child_edges_to_base(subchild, poly, contracted)
-        return (poly, contracted)
+    # T_base = T(S(A₁,...,Aₖ₋₁)) = product of T(Aᵢ) for i < k
+    T_base = TuttePolynomial.one()
+    for i in range(k - 1):
+        T_base = T_base * child_TDs[i][0]
+
+    # D_base = D(S(A₁,...,Aₖ₋₁)) — recursive
+    D_base = _series_D(children[:k-1], child_TDs[:k-1])
+
+    # Add Aₖ in parallel to get the ring
+    T_ring, _ = _add_parallel(children[k-1], T_base, D_base, child_TDs[k-1])
+    return T_ring
+
+
+def _add_parallel(
+    child: SPNode,
+    T: TuttePolynomial,
+    D: TuttePolynomial,
+    child_TD: Tuple[TuttePolynomial, TuttePolynomial],
+) -> Tuple[TuttePolynomial, TuttePolynomial]:
+    """Add a 2-terminal SP subgraph in parallel to current graph.
+
+    Current graph has (T, D) where D = T(G/{s,t}).
+    Child shares terminals s, t with current graph.
+
+    Returns (T_new, D_new) for the combined graph.
+
+    Key formulas:
+    - D_new = D × D(child) always (terminals merge independently, cut vertex)
+    - EDGE: T_new = T + D (chord formula)
+    - SERIES(C₁,...,Cₖ): bridge phase (multiply by T(Cᵢ) for i<k),
+      then chord phase (add Cₖ between internal vertex and terminal)
+    - PARALLEL(C₁,...,Cⱼ): add each sub-child sequentially
+    """
+    D_child = child_TD[1]
+    D_new = D * D_child
+
+    if child.type == "EDGE":
+        T_new = T + D
+        return (T_new, D_new)
 
     elif child.type == "PARALLEL":
-        # Recursively process each grandchild
-        poly = base_poly
-        contracted = base_contracted
-        for grandchild in child.children:
-            poly, contracted = _add_child_edges_to_base(grandchild, poly, contracted)
-        return (poly, contracted)
+        sub_TDs = [_sp_TD(c) for c in child.children]
+        T_running = T
+        D_running = D
+        for i, subchild in enumerate(child.children):
+            T_running, D_running = _add_parallel(subchild, T_running, D_running, sub_TDs[i])
+        return (T_running, D_new)
+
+    elif child.type == "SERIES":
+        children = child.children
+        k = len(children)
+        sub_TDs = [_sp_TD(c) for c in children]
+
+        # Bridge phase: C₁ through Cₖ₋₁ introduce new internal vertices
+        # Each attaches at a cut vertex, so T and D both multiply by T(Cᵢ)
+        T_partial = T
+        for i in range(k - 1):
+            T_partial = T_partial * sub_TDs[i][0]
+
+        # Chord phase: add Cₖ between wₖ₋₁ (internal) and t (terminal)
+        # Need D' = T(G_partial/{wₖ₋₁,t})
+        # = T(PARALLEL(base, S(C₁,...,Cₖ₋₁)) at merged terminals)
+        if k == 1:
+            D_prime = D  # No bridge phase, just use current D
+        else:
+            # Recursively add S(C₁,...,Cₖ₋₁) in parallel to base
+            sub_series = SPNode(type="SERIES", children=list(children[:k-1]))
+            sub_series_T = TuttePolynomial.one()
+            for i in range(k - 1):
+                sub_series_T = sub_series_T * sub_TDs[i][0]
+            sub_series_D = _series_D(children[:k-1], sub_TDs[:k-1])
+            sub_series_TD = (sub_series_T, sub_series_D)
+
+            D_prime, _ = _add_parallel(sub_series, T, D, sub_series_TD)
+
+        # Add Cₖ in parallel using (T_partial, D_prime)
+        T_new, _ = _add_parallel(children[k-1], T_partial, D_prime, sub_TDs[k-1])
+
+        return (T_new, D_new)
 
     else:
         raise ValueError(f"Unknown child type: {child.type}")
-
-
-def _compute_contracted_poly(tree: SPNode) -> TuttePolynomial:
-    """Compute T(tree with terminals merged).
-
-    When terminals s,t of a 2-terminal SP graph are merged:
-    - EDGE (s,t) -> loop: T = y
-    - SERIES (path with n edges) -> cycle C_n: T = x^(n-1) + ... + x + y
-    - PARALLEL -> product of contracted children (bouquet at merged vertex)
-    """
-    if tree.type == "EDGE":
-        return TuttePolynomial.y()
-
-    elif tree.type == "SERIES":
-        # Path with n edges, merging endpoints creates cycle C_n
-        # T(C_n) = x^(n-1) + x^(n-2) + ... + x + y
-        n_edges = tree.edge_count()
-        if n_edges == 1:
-            return TuttePolynomial.y()
-
-        coeffs: Dict[Tuple[int, int], int] = {}
-        for i in range(1, n_edges):
-            coeffs[(i, 0)] = 1  # x^i terms
-        coeffs[(0, 1)] = 1  # y term
-        return TuttePolynomial.from_coefficients(coeffs)
-
-    elif tree.type == "PARALLEL":
-        # Each child becomes structure at merged vertex (bouquet/cut vertex)
-        # T(bouquet) = product of T(each contracted structure)
-        if all(c.type == "EDGE" for c in tree.children):
-            # k parallel edges -> k loops -> y^k
-            return TuttePolynomial.y(len(tree.children))
-
-        result = TuttePolynomial.one()
-        for child in tree.children:
-            result = result * _compute_contracted_poly(child)
-        return result
-
-    else:
-        raise ValueError(f"Unknown node type: {tree.type}")
 
 
 # =============================================================================
@@ -405,6 +427,266 @@ def compute_sp_tutte_if_applicable(graph: Graph) -> Optional[TuttePolynomial]:
         return None
 
     return compute_sp_tutte(tree)
+
+
+# =============================================================================
+# MULTIGRAPH SERIES-PARALLEL RECOGNITION AND TUTTE POLYNOMIAL
+# =============================================================================
+
+@dataclass
+class SPMGNode:
+    """Node in series-parallel decomposition tree for multigraphs.
+
+    Like SPNode but EDGE nodes carry a multiplicity.
+    """
+    type: str  # "EDGE", "SERIES", or "PARALLEL"
+    children: List['SPMGNode'] = field(default_factory=list)
+    edge: Optional[Tuple[int, int]] = None
+    multiplicity: int = 1  # For EDGE nodes: number of parallel copies
+
+
+def decompose_sp_multigraph(mg: MultiGraph) -> Optional[SPMGNode]:
+    """Build SP decomposition tree for a multigraph, or None if not SP.
+
+    Works on the underlying topology (with multiplicities tracked).
+    Loops are NOT handled here — they must be stripped before calling.
+    """
+    if mg.total_loop_count() > 0:
+        return None  # Caller should handle loops first
+
+    if not mg.edge_counts:
+        return None
+
+    if len(mg.edge_counts) == 1:
+        edge, mult = next(iter(mg.edge_counts.items()))
+        if mult == 1:
+            return SPMGNode(type="EDGE", edge=edge, multiplicity=1)
+        # Multiple parallel edges between 2 nodes
+        children = [SPMGNode(type="EDGE", edge=edge, multiplicity=1) for _ in range(mult)]
+        return SPMGNode(type="PARALLEL", children=children)
+
+    # Build adjacency with multiplicities
+    adj: Dict[int, Dict[int, int]] = {n: {} for n in mg.nodes}
+    for (u, v), count in mg.edge_counts.items():
+        adj[u][v] = count
+        adj[v][u] = count
+
+    # Track decomposition trees for each edge pair
+    edge_trees: Dict[Tuple[int, int], List[SPMGNode]] = {}
+    for (u, v), mult in mg.edge_counts.items():
+        key = (min(u, v), max(u, v))
+        # Each multiplicity-k edge becomes k EDGE leaves
+        edge_trees[key] = [SPMGNode(type="EDGE", edge=(u, v), multiplicity=1) for _ in range(mult)]
+
+    n_edges = sum(mg.edge_counts.values())
+
+    while n_edges > 1:
+        reduced = False
+
+        # Parallel reduction: multiple edges/trees between same pair
+        for u in list(adj.keys()):
+            if u not in adj:
+                continue
+            for v, count in list(adj[u].items()):
+                key = (min(u, v), max(u, v))
+                trees = edge_trees.get(key, [])
+                if len(trees) > 1:
+                    parallel_node = SPMGNode(type="PARALLEL", children=trees)
+                    edge_trees[key] = [parallel_node]
+                    adj[u][v] = adj[v][u] = 1
+                    n_edges -= count - 1
+                    reduced = True
+                    break
+            if reduced:
+                break
+
+        if not reduced:
+            # Series reduction: degree-2 vertex
+            for u in list(adj.keys()):
+                if u not in adj:
+                    continue
+                neighbors = list(adj[u].keys())
+                if len(neighbors) == 2:
+                    v, w = neighbors
+
+                    key_uv = (min(u, v), max(u, v))
+                    key_uw = (min(u, w), max(u, w))
+
+                    trees_uv = edge_trees.pop(key_uv)
+                    trees_uw = edge_trees.pop(key_uw)
+
+                    series_children = trees_uv + trees_uw
+                    series_node = SPMGNode(type="SERIES", children=series_children)
+
+                    del adj[u]
+                    del adj[v][u]
+                    del adj[w][u]
+
+                    adj[v][w] = adj[v].get(w, 0) + 1
+                    adj[w][v] = adj[w].get(v, 0) + 1
+
+                    key_vw = (min(v, w), max(v, w))
+                    if key_vw not in edge_trees:
+                        edge_trees[key_vw] = []
+                    edge_trees[key_vw].append(series_node)
+
+                    n_edges -= 1
+                    reduced = True
+                    break
+
+        if not reduced:
+            return None  # Not series-parallel
+
+    if len(edge_trees) != 1:
+        return None
+
+    final_trees = list(edge_trees.values())[0]
+
+    if len(final_trees) == 1:
+        return final_trees[0]
+    else:
+        return SPMGNode(type="PARALLEL", children=final_trees)
+
+
+def compute_sp_tutte_multigraph(tree: SPMGNode) -> TuttePolynomial:
+    """Compute Tutte polynomial from SP multigraph decomposition tree."""
+    T, _ = _sp_mg_TD(tree)
+    return T
+
+
+def _sp_mg_TD(node: SPMGNode) -> Tuple[TuttePolynomial, TuttePolynomial]:
+    """Compute (T, D) for an SP multigraph node.
+
+    Same recursion as simple SP, but EDGE base case is always (x, y)
+    since multiplicities are handled structurally via PARALLEL nodes.
+    """
+    if node.type == "EDGE":
+        return (TuttePolynomial.x(), TuttePolynomial.y())
+
+    elif node.type == "SERIES":
+        children = node.children
+        child_TDs = [_sp_mg_TD(c) for c in children]
+
+        T = TuttePolynomial.one()
+        for T_c, _ in child_TDs:
+            T = T * T_c
+
+        D = _series_mg_D(children, child_TDs)
+        return (T, D)
+
+    elif node.type == "PARALLEL":
+        children = node.children
+        child_TDs = [_sp_mg_TD(c) for c in children]
+
+        D = TuttePolynomial.one()
+        for _, D_c in child_TDs:
+            D = D * D_c
+
+        T, D_running = child_TDs[0]
+        for i in range(1, len(children)):
+            T, D_running = _add_parallel_mg(children[i], T, D_running, child_TDs[i])
+
+        return (T, D)
+
+    else:
+        raise ValueError(f"Unknown node type: {node.type}")
+
+
+def _series_mg_D(
+    children: List[SPMGNode],
+    child_TDs: List[Tuple[TuttePolynomial, TuttePolynomial]],
+) -> TuttePolynomial:
+    """Compute D for a SERIES multigraph node."""
+    k = len(children)
+    if k == 1:
+        return child_TDs[0][1]
+
+    T_base = TuttePolynomial.one()
+    for i in range(k - 1):
+        T_base = T_base * child_TDs[i][0]
+
+    D_base = _series_mg_D(children[:k-1], child_TDs[:k-1])
+
+    T_ring, _ = _add_parallel_mg(children[k-1], T_base, D_base, child_TDs[k-1])
+    return T_ring
+
+
+def _add_parallel_mg(
+    child: SPMGNode,
+    T: TuttePolynomial,
+    D: TuttePolynomial,
+    child_TD: Tuple[TuttePolynomial, TuttePolynomial],
+) -> Tuple[TuttePolynomial, TuttePolynomial]:
+    """Add an SP multigraph subgraph in parallel to current graph."""
+    D_child = child_TD[1]
+    D_new = D * D_child
+
+    if child.type == "EDGE":
+        T_new = T + D
+        return (T_new, D_new)
+
+    elif child.type == "PARALLEL":
+        sub_TDs = [_sp_mg_TD(c) for c in child.children]
+        T_running = T
+        D_running = D
+        for i, subchild in enumerate(child.children):
+            T_running, D_running = _add_parallel_mg(subchild, T_running, D_running, sub_TDs[i])
+        return (T_running, D_new)
+
+    elif child.type == "SERIES":
+        children = child.children
+        k = len(children)
+        sub_TDs = [_sp_mg_TD(c) for c in children]
+
+        T_partial = T
+        for i in range(k - 1):
+            T_partial = T_partial * sub_TDs[i][0]
+
+        if k == 1:
+            D_prime = D
+        else:
+            sub_series = SPMGNode(type="SERIES", children=list(children[:k-1]))
+            sub_series_T = TuttePolynomial.one()
+            for i in range(k - 1):
+                sub_series_T = sub_series_T * sub_TDs[i][0]
+            sub_series_D = _series_mg_D(children[:k-1], sub_TDs[:k-1])
+            sub_series_TD = (sub_series_T, sub_series_D)
+
+            D_prime, _ = _add_parallel_mg(sub_series, T, D, sub_series_TD)
+
+        T_new, _ = _add_parallel_mg(children[k-1], T_partial, D_prime, sub_TDs[k-1])
+        return (T_new, D_new)
+
+    else:
+        raise ValueError(f"Unknown child type: {child.type}")
+
+
+def compute_sp_tutte_multigraph_if_applicable(mg: MultiGraph) -> Optional[TuttePolynomial]:
+    """Try to compute Tutte polynomial for a multigraph using SP decomposition.
+
+    Handles loops separately, then tries SP decomposition on the loop-free part.
+    Returns None if the underlying graph is not series-parallel.
+    """
+    if not mg.edge_counts and not mg.loop_counts:
+        return TuttePolynomial.one()
+
+    # Handle loops: T(G with k loops) = y^k × T(G without loops)
+    loop_count = mg.total_loop_count()
+    if loop_count > 0:
+        mg_no_loops = mg.remove_loops()
+        base = compute_sp_tutte_multigraph_if_applicable(mg_no_loops)
+        if base is None:
+            return None
+        return TuttePolynomial.y(loop_count) * base
+
+    if not mg.edge_counts:
+        return TuttePolynomial.one()
+
+    tree = decompose_sp_multigraph(mg)
+    if tree is None:
+        return None
+
+    return compute_sp_tutte_multigraph(tree)
 
 
 # =============================================================================

@@ -38,15 +38,19 @@ from ..graphs.covering import (
     try_hierarchical_partition,
 )
 from ..validation import verify_spanning_trees
+from ..graph import compute_signature
 from ..graphs.series_parallel import compute_sp_tutte_if_applicable
 from ..matroids.core import GraphicMatroid, FlatLattice, enumerate_flats_with_hasse
 from ..matroids.parallel_connection import (
     BivariateLaurentPoly,
     theorem6_parallel_connection,
+    theorem6_product_lattice,
     theorem10_k_sum,
     theorem10_k_sum_via_theorem6,
     precompute_contractions,
+    precompute_contractions_product,
     build_extended_cell_graph,
+    MAX_PRODUCT_FLATS,
 )
 
 from .base import UnionFind, BaseMultigraphSynthesizer, SynthesisResult
@@ -62,18 +66,27 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
     def __init__(
         self,
         table: Optional[RainbowTable] = None,
-        verbose: bool = False
+        verbose: bool = False,
+        auto_promote: bool = False,
     ):
         """Initialize synthesis engine.
 
         Args:
             table: Rainbow table for lookups (loads default if None)
             verbose: Print progress information
+            auto_promote: If True, auto-promote synthesized simple graphs to the rainbow table
         """
         self.table = table if table is not None else load_default_table()
         self.verbose = verbose
+        self.auto_promote = auto_promote
         self._cache: Dict[str, SynthesisResult] = {}
         self._multigraph_cache: Dict[str, TuttePolynomial] = {}  # For multigraph polynomials
+        self._fast_hash_set: Set[str] = set()  # Fast hashes of all cached multigraphs
+        self._fast_hash_set_complete: bool = True  # True when _fast_hash_set covers all cache entries
+        self._fast_simple_hash_set: Set[str] = set()  # Fast hashes of all cached simple graphs
+        self._table_nm_set: Set[Tuple[int, int]] = {
+            (e.node_count, e.edge_count) for e in self.table.entries.values()
+        }
         self._inter_cell_cache: Dict[str, TuttePolynomial] = {}  # For inter-cell graph polynomials
         self._mg_minors_accum: Set[str] = set()  # Accumulates minors found during multigraph synthesis
 
@@ -81,6 +94,236 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         """Print message if verbose."""
         if self.verbose:
             print(f"[Synth] {msg}")
+
+    def _promote_to_table(self, graph: Graph, cache_key: str, result: 'SynthesisResult') -> None:
+        """Auto-promote a synthesized simple graph to the rainbow table.
+
+        Only promotes if auto_promote is enabled and the key is not already in the table.
+        """
+        if not self.auto_promote or cache_key in self.table.entries:
+            return
+        entry = MinorEntry(
+            name=f"auto_{graph.node_count()}n{graph.edge_count()}e_{cache_key[:8]}",
+            polynomial=result.polynomial,
+            node_count=graph.node_count(),
+            edge_count=graph.edge_count(),
+            canonical_key=cache_key,
+            spanning_trees=result.polynomial.num_spanning_trees(),
+            num_terms=result.polynomial.num_terms(),
+            graph=graph,
+            signature=compute_signature(graph),
+        )
+        self.table.add_entry(entry)
+
+    def save_rainbow_table(self, json_path: str = None, bin_path: str = None) -> None:
+        """Save the rainbow table (with any auto-promoted entries) to disk.
+
+        Args:
+            json_path: Path for JSON format (default: tutte/data/lookup_table.json)
+            bin_path: Path for binary format (default: tutte/data/lookup_table.bin)
+        """
+        import os
+        from ..lookup.binary import save_binary_rainbow_table
+
+        base_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data')
+        if json_path is None:
+            json_path = os.path.join(base_dir, 'lookup_table.json')
+        if bin_path is None:
+            bin_path = os.path.join(base_dir, 'lookup_table.bin')
+
+        self.table.resort()
+        self.table.save(json_path)
+        save_binary_rainbow_table(self.table, bin_path)
+
+    @staticmethod
+    def _default_multigraph_table_path() -> str:
+        """Return default path for multigraph lookup table binary."""
+        import os
+        return os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), 'data', 'multigraph_lookup_table.bin'
+        )
+
+    def save_multigraph_cache(self, path: str = None) -> None:
+        """Save the multigraph polynomial cache to binary format.
+
+        Args:
+            path: File path. Defaults to tutte/data/multigraph_lookup_table.bin.
+        """
+        from ..lookup.binary import save_multigraph_lookup_table
+        if path is None:
+            path = self._default_multigraph_table_path()
+        save_multigraph_lookup_table(self._multigraph_cache, path)
+
+    def load_multigraph_cache(self, path: str = None) -> int:
+        """Load multigraph polynomial cache from binary file.
+
+        Args:
+            path: File path. Defaults to tutte/data/multigraph_lookup_table.bin.
+                  Also supports legacy JSON format for migration.
+
+        Returns the number of entries loaded.
+        """
+        import os
+        from ..lookup.binary import load_multigraph_lookup_table
+        if path is None:
+            path = self._default_multigraph_table_path()
+        if not os.path.exists(path):
+            return 0
+        # Detect format by magic bytes
+        with open(path, 'rb') as f:
+            magic = f.read(4)
+        if magic == b"MGLT":
+            loaded = load_multigraph_lookup_table(path)
+            count = 0
+            for key, poly in loaded.items():
+                if key not in self._multigraph_cache:
+                    self._multigraph_cache[key] = poly
+                    count += 1
+            self._fast_hash_set_complete = False
+            return count
+        else:
+            # Legacy JSON format
+            import json
+            with open(path) as f:
+                saved = json.load(f)
+            count = 0
+            for key, coeffs_str in saved.items():
+                if key not in self._multigraph_cache:
+                    coeffs = {tuple(map(int, k.split(','))): v for k, v in coeffs_str.items()}
+                    self._multigraph_cache[key] = TuttePolynomial.from_coefficients(coeffs)
+                    count += 1
+            self._fast_hash_set_complete = False
+            return count
+
+    def _collect_simple_intermediates(
+        self,
+        mg: MultiGraph,
+        out: Dict[str, Graph],
+    ) -> None:
+        """Recursively trace batch reduction to collect simple graph intermediates.
+
+        Follows the same reduction path as _synthesize_multigraph but only
+        collects the Graph objects that will eventually need synthesis,
+        without actually computing polynomials.
+        """
+        # Skip loops
+        if mg.total_loop_count() > 0:
+            mg = mg.remove_loops()
+
+        # Skip parallel-only
+        if mg.is_just_parallel_edges():
+            return
+
+        # Skip disconnected — recurse into components
+        if not mg.is_connected():
+            start = next(iter(mg.nodes))
+            visited = {start}
+            stack = [start]
+            while stack:
+                node = stack.pop()
+                for neighbor in mg.neighbors(node):
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        stack.append(neighbor)
+            comp1_edges = {e: c for e, c in mg.edge_counts.items() if e[0] in visited}
+            comp1_loops = {n: c for n, c in mg.loop_counts.items() if n in visited}
+            comp1 = MultiGraph(nodes=frozenset(visited), edge_counts=comp1_edges, loop_counts=comp1_loops)
+            rest_nodes = mg.nodes - visited
+            rest_edges = {e: c for e, c in mg.edge_counts.items() if e[0] in rest_nodes}
+            rest_loops = {n: c for n, c in mg.loop_counts.items() if n in rest_nodes}
+            rest = MultiGraph(nodes=frozenset(rest_nodes), edge_counts=rest_edges, loop_counts=rest_loops)
+            self._collect_simple_intermediates(comp1, out)
+            self._collect_simple_intermediates(rest, out)
+            return
+
+        # Cut vertex
+        cut = mg.has_cut_vertex()
+        if cut is not None:
+            components = mg.split_at_cut_vertex(cut)
+            if len(components) > 1:
+                for comp in components:
+                    self._collect_simple_intermediates(comp, out)
+                return
+
+        # Cache check
+        cache_key = mg.canonical_key()
+        if cache_key in self._multigraph_cache:
+            return
+
+        # Simple graph — this is what we want to collect
+        if mg.is_simple():
+            simple = mg.to_simple_graph()
+            if simple is not None:
+                sk = simple.canonical_key()
+                if sk not in self._cache and sk not in self.table.entries:
+                    out[sk] = simple
+                return
+
+        # Batch reduce parallel — recurse into G_0 and G_c
+        max_mult_edge = max(mg.edge_counts.keys(), key=lambda e: mg.edge_counts[e])
+        if mg.edge_counts[max_mult_edge] > 1:
+            u, v = max_mult_edge
+            new_edge_counts = dict(mg.edge_counts)
+            del new_edge_counts[max_mult_edge]
+            mg_0 = MultiGraph(nodes=mg.nodes, edge_counts=new_edge_counts, loop_counts=mg.loop_counts)
+            mg_c = mg_0.merge_nodes(u, v)
+            if mg_0.in_same_component(u, v):
+                self._collect_simple_intermediates(mg_0, out)
+            self._collect_simple_intermediates(mg_c, out)
+
+    def precompute_intermediate_simple_graphs(
+        self,
+        extended_cell: Graph,
+        lattice: 'FlatLattice',
+        shared_edges: list,
+    ) -> int:
+        """Pre-compute simple graph intermediates from flat contractions.
+
+        For each flat in the lattice, contracts the extended cell graph,
+        traces the batch reduction to find simple graph intermediates,
+        deduplicates, sorts by size, and synthesizes smallest-first.
+        Auto-promotes each result to the rainbow table.
+
+        Returns the number of new entries added.
+        """
+        from ..matroids.parallel_connection import _contract_edges_in_graph
+
+        # Collect all simple graph intermediates
+        all_intermediates: Dict[str, Graph] = {}
+        for z_idx in range(lattice.num_flats):
+            z_flat = lattice.flat_by_idx(z_idx)
+            if not z_flat:
+                mg = MultiGraph.from_graph(extended_cell)
+            else:
+                mg = _contract_edges_in_graph(extended_cell, z_flat)
+            self._collect_simple_intermediates(mg, all_intermediates)
+
+        if not all_intermediates:
+            return 0
+
+        # Sort by edge count (smallest first for bottom-up synthesis)
+        sorted_graphs = sorted(
+            all_intermediates.items(),
+            key=lambda kv: (kv[1].edge_count(), kv[1].node_count()),
+        )
+
+        self._log(f"Pre-computing {len(sorted_graphs)} intermediate simple graphs")
+
+        count = 0
+        for sk, simple in sorted_graphs:
+            if sk in self.table.entries:
+                continue
+            result = self.synthesize(simple)
+            count += 1
+            if count % 50 == 0:
+                self._log(f"  Pre-computed {count}/{len(sorted_graphs)}")
+
+        # Resort the table once after all promotions
+        if count > 0:
+            self.table.resort()
+
+        self._log(f"Pre-computed {count} new intermediate graphs")
+        return count
 
     def synthesize(
         self,
@@ -146,6 +389,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         if len(components) > 1:
             result = self._synthesize_disconnected(components, max_depth)
             self._cache[cache_key] = result
+            self._promote_to_table(graph, cache_key, result)
             return result
 
         # 4. Check for cut vertices (fast factorization before expensive operations)
@@ -153,25 +397,43 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         if cut is not None:
             result = self._synthesize_via_cut_vertex(graph, cut, max_depth)
             self._cache[cache_key] = result
+            self._promote_to_table(graph, cache_key, result)
             return result
 
-        # 5. Try k-sum decomposition (k=2..5, detect independent vertex separators)
+        # 5. Try series-parallel O(n) computation
+        sp_poly = compute_sp_tutte_if_applicable(graph)
+        if sp_poly is not None:
+            self._log("Series-parallel: O(n) computation")
+            result = SynthesisResult(
+                polynomial=sp_poly,
+                recipe=["Series-parallel decomposition"],
+                verified=True,
+                method="series_parallel",
+            )
+            self._cache[cache_key] = result
+            self._promote_to_table(graph, cache_key, result)
+            return result
+
+        # 6. Try k-sum decomposition (k=2..5, detect independent vertex separators)
         if graph.edge_count() >= 6:  # Need at least some edges for useful k-sum
             result = self._try_ksum_decomposition(graph)
             if result is not None:
                 self._cache[cache_key] = result
+                self._promote_to_table(graph, cache_key, result)
                 return result
 
-        # 6. Try hierarchical tiling for graphs with repeating structure
+        # 7. Try hierarchical tiling for graphs with repeating structure
         if graph.edge_count() >= 20:  # Only try for larger graphs
             result = self._try_hierarchical(graph, max_depth)
             if result is not None:
                 self._cache[cache_key] = result
+                self._promote_to_table(graph, cache_key, result)
                 return result
 
-        # 7. Try creation-expansion-join
+        # 8. Try creation-expansion-join
         result = self._synthesize_connected(graph, max_depth)
         self._cache[cache_key] = result
+        self._promote_to_table(graph, cache_key, result)
         return result
 
     def _synthesize_disconnected(
@@ -505,6 +767,49 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             if len(partition) == 2:
                 self._log("Product formula failed, trying Theorem 6 parallel connection")
                 recipe.append("Product formula invalid, trying Theorem 6")
+
+                # Try product-lattice Theorem 6 if inter-cell graph is disconnected
+                if len(inter_components) > 1:
+                    pc_poly = self._try_product_lattice_theorem6(
+                        graph, partition, inter_info, cell, inter_components,
+                    )
+                    if pc_poly is not None:
+                        poly = pc_poly
+                        recipe.append("Product-lattice Theorem 6 succeeded")
+                        self._log(f"Final polynomial has {poly.num_terms()} terms")
+                        verified = verify_spanning_trees(graph, poly)
+                        return SynthesisResult(
+                            polynomial=poly,
+                            recipe=recipe,
+                            verified=verified,
+                            method="product_lattice_theorem6",
+                            tiles_used=k,
+                            fringe_edges=0,
+                            minors_used=all_minors,
+                        )
+                    self._log("Product-lattice Theorem 6 failed")
+
+                    # Try staged per-component Theorem 6
+                    pc_poly = self._try_staged_theorem6(
+                        graph, partition, inter_info, cell, inter_components,
+                    )
+                    if pc_poly is not None:
+                        poly = pc_poly
+                        recipe.append("Staged per-component Theorem 6 succeeded")
+                        self._log(f"Final polynomial has {poly.num_terms()} terms")
+                        verified = verify_spanning_trees(graph, poly)
+                        return SynthesisResult(
+                            polynomial=poly,
+                            recipe=recipe,
+                            verified=verified,
+                            method="staged_theorem6",
+                            tiles_used=k,
+                            fringe_edges=0,
+                            minors_used=all_minors,
+                        )
+                    self._log("Staged Theorem 6 failed")
+
+                # Fall back to standard Theorem 6 (single matroid)
                 pc_poly = self._try_parallel_connection(graph, partition, inter_info, cell, base_poly)
                 if pc_poly is not None:
                     poly = pc_poly
@@ -670,6 +975,241 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
 
         except Exception as e:
             self._log(f"Theorem 6 failed with exception: {e}")
+            return None
+
+    def _try_product_lattice_theorem6(
+        self,
+        graph: Graph,
+        partition: List[Set[int]],
+        inter_info: InterCellInfo,
+        cell: MinorEntry,
+        components: List[Graph],
+    ) -> Optional[TuttePolynomial]:
+        """Try Theorem 6 with product-lattice optimization for disconnected inter-cell matroid.
+
+        When the inter-cell graph has multiple disconnected components, the shared
+        matroid N = N1 + N2 + ... is a direct sum. The flat lattice decomposes as
+        L(N) = L(N1) x L(N2) x ..., avoiding enumeration of the full (huge) lattice.
+
+        Feasibility gate: product of component flat counts must be < MAX_PRODUCT_FLATS.
+
+        Args:
+            graph: Full graph
+            partition: List of 2 node sets
+            inter_info: Information about inter-cell edges
+            cell: Cell pattern from rainbow table
+            components: List of inter-cell graph connected components
+
+        Returns:
+            TuttePolynomial if successful, None otherwise
+        """
+        if len(partition) != 2 or len(components) < 2:
+            return None
+
+        try:
+            # Build matroid and flat lattice for each component
+            component_data = []  # (matroid, lattice, rank)
+            total_product = 1
+
+            for i, comp in enumerate(components):
+                matroid = GraphicMatroid(comp)
+                r = matroid.rank()
+
+                # Check cache for flat data
+                comp_key = comp.canonical_key()
+                entry = self.table.entries.get(comp_key)
+
+                if entry is not None and entry.flat_data is not None:
+                    self._log(f"Component {i}: using cached flat lattice")
+                    lattice = FlatLattice.from_flat_lattice_data(matroid, entry.flat_data)
+                else:
+                    flats, ranks, uc = enumerate_flats_with_hasse(matroid)
+                    self._log(f"Component {i}: {len(flats)} flats (rank {r})")
+                    lattice = FlatLattice(matroid, flats=flats, ranks=ranks, upper_covers=uc)
+
+                    # Cache for future use
+                    if entry is not None and entry.flat_data is None:
+                        entry.flat_data = lattice.to_flat_lattice_data()
+
+                component_data.append((matroid, lattice, r))
+                total_product *= lattice.num_flats
+
+            self._log(f"Product flat count: {total_product}")
+
+            if total_product > MAX_PRODUCT_FLATS:
+                self._log(f"Product flat count {total_product} exceeds limit {MAX_PRODUCT_FLATS}")
+                return None
+
+            # Currently only support 2 components
+            if len(components) != 2:
+                self._log(f"Product-lattice only supports 2 components, got {len(components)}")
+                return None
+
+            mat1, lat1, r1 = component_data[0]
+            mat2, lat2, r2 = component_data[1]
+
+            # Build extended cell graphs (cell + ALL inter-cell edges)
+            inter_edge_list = list(inter_info.edges)
+            ext1, shared1 = build_extended_cell_graph(graph, partition[0], inter_edge_list)
+            ext2, shared2 = build_extended_cell_graph(graph, partition[1], inter_edge_list)
+
+            self._log(f"Extended cell 1: {ext1.node_count()}n, {ext1.edge_count()}e")
+            self._log(f"Extended cell 2: {ext2.node_count()}n, {ext2.edge_count()}e")
+
+            # Precompute T(M_i/(Z1∪Z2)) for all flat pairs
+            self._log("Precomputing contractions for cell 1...")
+            t_m1 = precompute_contractions_product(ext1, shared1, lat1, lat2, self)
+            self._log(f"Cell 1: {len(t_m1)} contraction results")
+
+            self._log("Precomputing contractions for cell 2...")
+            t_m2 = precompute_contractions_product(ext2, shared2, lat1, lat2, self)
+            self._log(f"Cell 2: {len(t_m2)} contraction results")
+
+            # Apply product-lattice Theorem 6
+            self._log("Applying product-lattice Theorem 6...")
+            poly = theorem6_product_lattice(lat1, lat2, t_m1, t_m2, r1, r2)
+
+            # Verify
+            if verify_spanning_trees(graph, poly):
+                self._log("Product-lattice Theorem 6 verified!")
+                return poly
+            else:
+                self._log("Product-lattice Theorem 6 failed Kirchhoff verification")
+                return None
+
+        except Exception as e:
+            self._log(f"Product-lattice Theorem 6 failed with exception: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _try_staged_theorem6(
+        self,
+        graph: Graph,
+        partition: List[Set[int]],
+        inter_info: InterCellInfo,
+        cell: MinorEntry,
+        components: List[Graph],
+    ) -> Optional[TuttePolynomial]:
+        """Apply Theorem 6 per-component, then add remaining edges via edge-by-edge.
+
+        For disconnected inter-cell graphs with components too large for the full
+        product-lattice approach, process one component at a time:
+
+        1. Pick the component with fewest flats
+        2. Apply Theorem 6 with that component as the shared matroid
+           - Extended cells include only that component's inter-cell edges
+        3. This gives T(G_partial) where G_partial = cells + component's edges
+        4. Add remaining components' edges via edge-by-edge chord addition
+
+        Args:
+            graph: Full graph
+            partition: List of 2 node sets
+            inter_info: Information about inter-cell edges
+            cell: Cell pattern from rainbow table
+            components: Disconnected inter-cell graph components
+
+        Returns:
+            TuttePolynomial if successful, None otherwise
+        """
+        if len(partition) != 2:
+            return None
+
+        MAX_STAGED_FLATS = 50_000  # Max flats for per-component Theorem 6
+
+        try:
+            # Enumerate flats for each component and pick the smallest
+            component_info = []
+            for i, comp in enumerate(components):
+                matroid = GraphicMatroid(comp)
+                r = matroid.rank()
+                flats, ranks, uc = enumerate_flats_with_hasse(matroid)
+                lattice = FlatLattice(matroid, flats=flats, ranks=ranks, upper_covers=uc)
+                component_info.append((i, comp, matroid, lattice, r, list(comp.edges)))
+                self._log(f"Staged component {i}: {lattice.num_flats} flats")
+
+            # Sort by flat count to pick the smallest
+            component_info.sort(key=lambda x: x[3].num_flats)
+
+            # Check if any component is feasible for Theorem 6
+            best_idx, best_comp, best_matroid, best_lattice, best_rank, best_edges = component_info[0]
+            if best_lattice.num_flats > MAX_STAGED_FLATS:
+                self._log(f"Smallest component has {best_lattice.num_flats} flats, exceeds staged limit")
+                return None
+
+            self._log(f"Using component {best_idx} ({best_lattice.num_flats} flats) for staged Theorem 6")
+
+            # Build partial extended cell graphs (cell + ONLY this component's edges)
+            partial_inter_edges = best_edges
+            ext1, shared1 = build_extended_cell_graph(graph, partition[0], partial_inter_edges)
+            ext2, shared2 = build_extended_cell_graph(graph, partition[1], partial_inter_edges)
+
+            self._log(f"Partial extended cell 1: {ext1.node_count()}n, {ext1.edge_count()}e")
+            self._log(f"Partial extended cell 2: {ext2.node_count()}n, {ext2.edge_count()}e")
+
+            # Precompute T(M_i/Z) for all flats Z of this component's matroid
+            t_m1 = precompute_contractions(ext1, shared1, best_lattice, self)
+            t_m2 = precompute_contractions(ext2, shared2, best_lattice, self)
+
+            # Apply Theorem 6 to get T(G_partial) = T(cells + this component's edges)
+            self._log("Applying Theorem 6 for staged component...")
+            partial_poly = theorem6_parallel_connection(best_lattice, t_m1, t_m2, best_rank)
+
+            # Build G_partial = graph minus remaining components' edges
+            remaining_edges = set()
+            for idx, comp, _, _, _, edges in component_info[1:]:
+                remaining_edges.update(edges)
+
+            # Verify partial result: G_partial = graph - remaining_edges
+            partial_graph_edges = graph.edges - frozenset(
+                (min(u, v), max(u, v)) for u, v in remaining_edges
+            )
+            partial_graph = Graph(nodes=graph.nodes, edges=partial_graph_edges)
+            if not verify_spanning_trees(partial_graph, partial_poly):
+                self._log("Staged Theorem 6 partial result failed verification")
+                return None
+
+            self._log(f"Staged Theorem 6 partial verified! Adding {len(remaining_edges)} remaining edges")
+
+            # Now add remaining edges via edge-by-edge
+            # Build multigraph from G_partial
+            all_nodes = set(graph.nodes)
+            edge_counts: Dict[Tuple[int, int], int] = {}
+            for u, v in partial_graph_edges:
+                edge = (min(u, v), max(u, v))
+                edge_counts[edge] = 1
+
+            current_mg = MultiGraph(
+                nodes=frozenset(all_nodes),
+                edge_counts=edge_counts,
+                loop_counts={},
+            )
+
+            # All remaining edges are chords (G_partial is connected)
+            poly = partial_poly
+            remaining_sorted = sorted(remaining_edges)
+            for i, (u, v) in enumerate(remaining_sorted):
+                merged = current_mg.merge_nodes(u, v)
+                merged_poly = self._synthesize_multigraph(merged, skip_minor_search=True)
+                poly = poly + merged_poly
+
+                edge = (min(u, v), max(u, v))
+                new_edge_counts = dict(current_mg.edge_counts)
+                new_edge_counts[edge] = new_edge_counts.get(edge, 0) + 1
+                current_mg = MultiGraph(
+                    nodes=current_mg.nodes,
+                    edge_counts=new_edge_counts,
+                    loop_counts=current_mg.loop_counts,
+                )
+                if (i + 1) % 5 == 0:
+                    self._log(f"  Staged edge-by-edge: {i+1}/{len(remaining_sorted)}")
+
+            return poly
+
+        except Exception as e:
+            self._log(f"Staged Theorem 6 failed with exception: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _add_inter_cell_edges_optimized(
@@ -856,7 +1396,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 if current_mg.in_same_component(u, v):
                     # Chord: T(G+e) = T(G) + T(G/{u,v})
                     merged = current_mg.merge_nodes(u, v)
-                    merged_poly = self._synthesize_multigraph(merged)
+                    merged_poly = self._synthesize_multigraph(merged, skip_minor_search=True)
                     poly = poly + merged_poly
                 else:
                     # Bridge: T(G+e) = x · T(G)
@@ -958,7 +1498,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         for i, (u, v) in enumerate(chords):
             # T(G + e) = T(G) + T(G/{u,v})
             merged = current_mg.merge_nodes(u, v)
-            merged_poly = self._synthesize_multigraph(merged)
+            merged_poly = self._synthesize_multigraph(merged, skip_minor_search=True)
 
             poly = poly + merged_poly
 
@@ -1012,44 +1552,68 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         Returns:
             SynthesisResult with computed polynomial
         """
-        # Check cache first
-        cache_key = graph.canonical_key()
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-
-        # 1. Rainbow table lookup (still worthwhile - it's fast)
-        cached = self.table.lookup(graph)
-        if cached is not None:
-            result = SynthesisResult(
-                polynomial=cached,
-                recipe=["Rainbow table lookup"],
-                verified=True,
-                method="lookup",
-                minors_used={cache_key} if cache_key in self.table.entries else set(),
-            )
-            self._cache[cache_key] = result
-            return result
-
-        # 2. Base cases
-        if graph.edge_count() == 0:
-            result = SynthesisResult(
-                polynomial=TuttePolynomial.one(),
-                recipe=["Empty graph: T = 1"],
-                verified=True,
-                method="base_case"
-            )
-            self._cache[cache_key] = result
-            return result
-
-        if graph.edge_count() == 1:
-            result = SynthesisResult(
+        # Base cases (0-1 edges) — checked first to avoid hashing trivial graphs
+        if graph.edge_count() <= 1:
+            if graph.edge_count() == 0:
+                return SynthesisResult(
+                    polynomial=TuttePolynomial.one(),
+                    recipe=["Empty graph: T = 1"],
+                    verified=True,
+                    method="base_case"
+                )
+            return SynthesisResult(
                 polynomial=TuttePolynomial.x(),
                 recipe=["Single edge: T = x"],
                 verified=True,
                 method="base_case"
             )
+
+        # Two-level cache: fast_hash filter before expensive canonical_key
+        fh = graph.fast_hash()
+        if not hasattr(self, '_fast_simple_hash_set'):
+            self._fast_simple_hash_set = set()
+        if not hasattr(self, '_table_nm_set'):
+            self._table_nm_set = {
+                (e.node_count, e.edge_count) for e in self.table.entries.values()
+            }
+
+        if fh in self._fast_simple_hash_set:
+            # Potential cache/table hit — compute canonical_key
+            cache_key = graph.canonical_key()
+        elif (graph.node_count(), graph.edge_count()) in self._table_nm_set:
+            # Could match a rainbow table entry — compute canonical_key
+            cache_key = graph.canonical_key()
+        else:
+            # No cache entry and no table entry with this n,m — skip canonical_key
+            cache_key = None
+
+        if cache_key is not None and cache_key in self._cache:
+            return self._cache[cache_key]
+
+        # 1. Rainbow table lookup by key (avoids recomputing canonical_key)
+        if cache_key is not None:
+            entry = self.table.get_entry_by_key(cache_key)
+        else:
+            entry = None
+        if entry is not None:
+            result = SynthesisResult(
+                polynomial=entry.polynomial,
+                recipe=["Rainbow table lookup"],
+                verified=True,
+                method="lookup",
+                minors_used={cache_key},
+            )
             self._cache[cache_key] = result
             return result
+
+        # (Base cases already handled above — edge_count <= 1 returns early)
+
+        # Helper to ensure cache_key is computed before caching
+        def _ensure_cache_key():
+            nonlocal cache_key
+            if cache_key is None:
+                cache_key = graph.canonical_key()
+            return cache_key
 
         # 3. Disconnected graphs (recurse through _synthesize_fast, not full synthesize)
         components = graph.connected_components()
@@ -1067,7 +1631,10 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 method="disjoint_union",
                 minors_used=all_minors,
             )
-            self._cache[cache_key] = result
+            ck = _ensure_cache_key()
+            self._cache[ck] = result
+            self._fast_simple_hash_set.add(fh)
+            self._promote_to_table(graph, ck, result)
             return result
 
         # 4. Cut vertex factorization (recurse through _synthesize_fast, not full synthesize)
@@ -1087,19 +1654,43 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 method="cut_vertex",
                 minors_used=all_minors,
             )
-            self._cache[cache_key] = result
+            ck = _ensure_cache_key()
+            self._cache[ck] = result
+            self._fast_simple_hash_set.add(fh)
+            self._promote_to_table(graph, ck, result)
             return result
 
-        # 4.5 Try k-sum decomposition (useful for intermediate merged graphs)
+        # 4.5 Try series-parallel O(n) computation
+        sp_poly = compute_sp_tutte_if_applicable(graph)
+        if sp_poly is not None:
+            result = SynthesisResult(
+                polynomial=sp_poly,
+                recipe=["Series-parallel decomposition (fast)"],
+                verified=True,
+                method="series_parallel",
+            )
+            ck = _ensure_cache_key()
+            self._cache[ck] = result
+            self._fast_simple_hash_set.add(fh)
+            self._promote_to_table(graph, ck, result)
+            return result
+
+        # 4.6 Try k-sum decomposition (useful for intermediate merged graphs)
         if graph.edge_count() >= 6:
             result = self._try_ksum_decomposition(graph)
             if result is not None:
-                self._cache[cache_key] = result
+                ck = _ensure_cache_key()
+                self._cache[ck] = result
+                self._fast_simple_hash_set.add(fh)
+                self._promote_to_table(graph, ck, result)
                 return result
 
         # 5. Direct spanning tree expansion (skip minor search)
         result = self._synthesize_from_k2_fast(graph, max_depth)
-        self._cache[cache_key] = result
+        ck = _ensure_cache_key()
+        self._cache[ck] = result
+        self._fast_simple_hash_set.add(fh)
+        self._promote_to_table(graph, ck, result)
         return result
 
     def _synthesize_from_k2_fast(
@@ -1145,8 +1736,19 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                     edge = (min(node, neighbor), max(node, neighbor))
                     tree_edges.add(edge)
 
-        # Chords
+        # Chords — sorted by priority: prefer edges whose contraction is more
+        # likely to create cut vertices (fewer shared neighbors between endpoints)
         chords = [e for e in graph.edges if e not in tree_edges]
+
+        def chord_priority(e):
+            u, v = e
+            nu = graph.neighbors(u)
+            nv = graph.neighbors(v)
+            shared = len(nu & nv)
+            min_deg = min(len(nu), len(nv))
+            return (shared, min_deg)
+
+        chords.sort(key=chord_priority)
 
         self._log(f"Spanning tree: {len(tree_edges)} edges, chords: {len(chords)}")
         recipe.append(f"Spanning tree: {len(tree_edges)} edges")
@@ -1229,7 +1831,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         for u, v in edges_to_add:
             # Compute T(G/{u,v}) - the polynomial for merged graph
             merged = current_mg.merge_nodes(u, v)
-            merged_poly = self._synthesize_multigraph(merged)
+            merged_poly = self._synthesize_multigraph(merged, skip_minor_search=True)
 
             # T(G + e) = T(G) + T(G/{u,v})
             current_poly = current_poly + merged_poly

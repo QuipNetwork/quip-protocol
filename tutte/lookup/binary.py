@@ -264,51 +264,96 @@ def save_binary_rainbow_table(table: RainbowTable, path: str) -> int:
     return len(data)
 
 
-def create_minimal_json(table: RainbowTable) -> dict:
-    """Create minimal JSON representation (no redundant fields)."""
-    graphs = {}
-    for key, entry in table.entries.items():
-        # Only store what's needed to reconstruct
-        coeffs = {}
-        for (i, j), c in entry.polynomial.to_coefficients().items():
-            coeffs[f"{i},{j}"] = c
+# =============================================================================
+# MULTIGRAPH LOOKUP TABLE BINARY ENCODING
+# =============================================================================
 
-        graphs[key] = {
-            'n': entry.name,
-            'v': entry.node_count,
-            'e': entry.edge_count,
-            'c': coeffs
-        }
+def encode_multigraph_lookup_table(cache: Dict[str, 'TuttePolynomial']) -> bytes:
+    """Encode multigraph lookup table to compact binary format.
 
-    return {'g': graphs}
+    Format:
+        Header:
+            [magic: 4 bytes]    = "MGLT"
+            [version: 1 byte]   = 1
+            [num_entries: varuint]
+
+        Entry Section (per entry):
+            [canonical_key: 32 bytes]       <- raw SHA256
+            [poly_len: varuint] [poly_bytes: bytes]
+    """
+    result = bytearray()
+
+    # Magic header
+    result.extend(b"MGLT")
+    result.append(1)  # version
+
+    # Number of entries
+    result.extend(encode_varuint(len(cache)))
+
+    # Entry section
+    for key, poly in cache.items():
+        # Canonical key as raw 32-byte SHA256
+        result.extend(bytes.fromhex(key))
+
+        # Polynomial as binary
+        poly_bytes = poly.to_bytes()
+        result.extend(encode_varuint(len(poly_bytes)))
+        result.extend(poly_bytes)
+
+    return bytes(result)
 
 
-def analyze_binary_breakdown(table: RainbowTable) -> Dict[str, int]:
-    """Analyze where bytes go in binary format. Returns size breakdown dict."""
-    header_size = 5  # magic + version
-    entry_count_size = len(encode_varuint(len(table.entries)))
+def decode_multigraph_lookup_table(data: bytes) -> Dict[str, 'TuttePolynomial']:
+    """Decode multigraph lookup table from binary format.
 
-    name_bytes = 0
-    metadata_bytes = 0
-    polynomial_bytes = 0
+    Returns dict of canonical_key -> TuttePolynomial.
+    """
+    from ..polynomial import TuttePolynomial
 
-    for entry in table.entries.values():
-        name_b = entry.name.encode('utf-8')
-        name_bytes += len(encode_varuint(len(name_b))) + len(name_b)
+    offset = 0
 
-        metadata_bytes += len(encode_varuint(entry.node_count))
-        metadata_bytes += len(encode_varuint(entry.edge_count))
-        metadata_bytes += len(encode_varuint(entry.spanning_trees))
+    # Magic header
+    if data[offset:offset + 4] != b"MGLT":
+        raise ValueError("Invalid magic header -- not a multigraph lookup table binary")
+    offset += 4
 
-        poly_b = entry.polynomial.to_bytes()
-        polynomial_bytes += len(encode_varuint(len(poly_b))) + len(poly_b)
+    version = data[offset]
+    offset += 1
+    if version != 1:
+        raise ValueError(f"Unsupported multigraph lookup table version: {version}")
 
-    total = header_size + entry_count_size + name_bytes + metadata_bytes + polynomial_bytes
+    # Number of entries
+    num_entries, offset = decode_varuint(data, offset)
 
-    return {
-        'header': header_size + entry_count_size,
-        'names': name_bytes,
-        'metadata': metadata_bytes,
-        'polynomials': polynomial_bytes,
-        'total': total,
-    }
+    cache: Dict[str, 'TuttePolynomial'] = {}
+    for _ in range(num_entries):
+        # Canonical key: 32 raw bytes -> hex string
+        canonical_key = data[offset:offset + 32].hex()
+        offset += 32
+
+        # Polynomial
+        poly_len, offset = decode_varuint(data, offset)
+        poly_bytes = data[offset:offset + poly_len]
+        offset += poly_len
+        polynomial = TuttePolynomial.from_bytes(poly_bytes)
+
+        cache[canonical_key] = polynomial
+
+    return cache
+
+
+def save_multigraph_lookup_table(cache: Dict[str, 'TuttePolynomial'], path: str) -> int:
+    """Save multigraph lookup table to binary format, return size in bytes."""
+    data = encode_multigraph_lookup_table(cache)
+    with open(path, 'wb') as f:
+        f.write(data)
+    return len(data)
+
+
+def load_multigraph_lookup_table(path: str) -> Dict[str, 'TuttePolynomial']:
+    """Load multigraph lookup table from binary file."""
+    with open(path, 'rb') as f:
+        data = f.read()
+    return decode_multigraph_lookup_table(data)
+
+

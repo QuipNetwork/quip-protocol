@@ -85,10 +85,6 @@ class MinorEntry:
 class GCDMinorIndex:
     """Index of GCD-based relationships between polynomial entries.
 
-    This structure enables efficient lookup of polynomials that share
-    common factors, which indicates structural relationships between
-    the corresponding graphs.
-
     Attributes:
         shared_factor_graph: Maps graph name -> set of names sharing a factor
         factor_to_graphs: Maps factor polynomial key -> set of graph names
@@ -113,10 +109,7 @@ class GCDMinorIndex:
         return self.factor_to_graphs.get(factor_key, set())
 
     def largest_shared_factor(self, name: str) -> Optional[Tuple[str, TuttePolynomial]]:
-        """Find the entry sharing the largest factor with the given entry.
-
-        Returns (related_name, gcd) or None if no shared factors.
-        """
+        """Find the entry sharing the largest factor with the given entry."""
         related = self.shared_factor_graph.get(name, set())
         if not related:
             return None
@@ -346,6 +339,19 @@ class RainbowTable:
 
         return None
 
+    def add_entry(self, entry: MinorEntry) -> None:
+        """Insert a pre-built MinorEntry without re-sorting.
+
+        Use this for batch inserts (e.g. auto-promotion during synthesis).
+        Call resort() once after all inserts are done.
+        """
+        self.entries[entry.canonical_key] = entry
+        self.name_index[entry.name] = entry.canonical_key
+
+    def resort(self) -> None:
+        """Re-sort entries by complexity after batch inserts."""
+        self._sort_by_complexity()
+
     def add(self, graph: Graph, name: str, polynomial: TuttePolynomial,
             minors_used: Optional[Set[str]] = None) -> None:
         """Add a new entry to the table.
@@ -395,33 +401,6 @@ class RainbowTable:
         """Add entry from NetworkX graph."""
         graph = Graph.from_networkx(G)
         self.add(graph, name, polynomial)
-
-    def find_by_polynomial(self, polynomial: TuttePolynomial) -> Optional[MinorEntry]:
-        """Find entry with matching polynomial."""
-        for entry in self.entries.values():
-            if entry.polynomial == polynomial:
-                return entry
-        return None
-
-    def find_factors(self, target: TuttePolynomial) -> List[Tuple[MinorEntry, TuttePolynomial]]:
-        """Find table entries whose polynomial divides the target.
-
-        Returns list of (entry, quotient) tuples where entry.polynomial * quotient = target.
-        """
-        results = []
-        target_trees = target.num_spanning_trees()
-
-        for entry in self.entries.values():
-            # Quick filter by spanning trees
-            if target_trees % entry.spanning_trees != 0:
-                continue
-
-            # Try to divide
-            quotient = _try_divide(target, entry.polynomial)
-            if quotient is not None:
-                results.append((entry, quotient))
-
-        return results
 
     def compute_minor_relationships(self, verify: bool = True,
                                      max_contractions: int = 5) -> Dict[str, List[str]]:
@@ -599,15 +578,7 @@ class RainbowTable:
         return final
 
     def compute_gcd_relationships(self) -> 'GCDMinorIndex':
-        """Compute GCD-based relationships between all polynomial entries.
-
-        Two polynomials are related if they share a non-trivial common factor
-        (GCD != 1). This is a symmetric relationship that captures structural
-        similarities between graphs.
-
-        Returns:
-            GCDMinorIndex containing all relationships
-        """
+        """Compute GCD-based relationships between all polynomial entries."""
         from ..factorization import has_common_factor, polynomial_gcd
 
         index = GCDMinorIndex()
@@ -615,7 +586,6 @@ class RainbowTable:
         entries_list = list(self.entries.values())
         n = len(entries_list)
 
-        # Compare all pairs
         for i in range(n):
             entry_i = entries_list[i]
             name_i = entry_i.name
@@ -628,18 +598,13 @@ class RainbowTable:
                 poly_j = entry_j.polynomial
                 trees_j = entry_j.spanning_trees
 
-                # Quick pre-filter: if spanning tree counts are coprime,
-                # polynomials cannot share a factor
                 if trees_i > 0 and trees_j > 0:
                     if math_gcd(trees_i, trees_j) == 1:
                         continue
 
-                # Check if they share a factor
                 if has_common_factor(poly_i, poly_j):
-                    # Compute and cache the GCD
                     gcd = polynomial_gcd(poly_i, poly_j)
 
-                    # Add to shared factor graph
                     if name_i not in index.shared_factor_graph:
                         index.shared_factor_graph[name_i] = set()
                     if name_j not in index.shared_factor_graph:
@@ -648,11 +613,9 @@ class RainbowTable:
                     index.shared_factor_graph[name_i].add(name_j)
                     index.shared_factor_graph[name_j].add(name_i)
 
-                    # Cache the GCD
                     pair_key = (name_i, name_j) if name_i < name_j else (name_j, name_i)
                     index.gcd_cache[pair_key] = gcd
 
-                    # Index by factor polynomial (use string repr as key)
                     factor_key = str(gcd)
                     if factor_key not in index.factor_to_graphs:
                         index.factor_to_graphs[factor_key] = set()
@@ -660,45 +623,6 @@ class RainbowTable:
                     index.factor_to_graphs[factor_key].add(name_j)
 
         return index
-
-    def find_gcd_related(self, name: str) -> List[Tuple[str, TuttePolynomial]]:
-        """Find all entries sharing a polynomial factor with the given entry.
-
-        Args:
-            name: Name of entry to find relations for
-
-        Returns:
-            List of (related_name, gcd) tuples
-        """
-        entry = self.get_entry(name)
-        if entry is None:
-            return []
-
-        from ..factorization import has_common_factor, polynomial_gcd
-
-        results = []
-        target_poly = entry.polynomial
-        target_trees = entry.spanning_trees
-
-        for other_entry in self.entries.values():
-            if other_entry.name == name:
-                continue
-
-            other_trees = other_entry.spanning_trees
-
-            # Quick pre-filter
-            if target_trees > 0 and other_trees > 0:
-                if math_gcd(target_trees, other_trees) == 1:
-                    continue
-
-            if has_common_factor(target_poly, other_entry.polynomial):
-                gcd = polynomial_gcd(target_poly, other_entry.polynomial)
-                results.append((other_entry.name, gcd))
-
-        # Sort by GCD complexity (prefer larger shared factors)
-        results.sort(key=lambda x: x[1].total_degree(), reverse=True)
-
-        return results
 
     def find_factors_of(self, target: TuttePolynomial) -> List[Tuple[MinorEntry, TuttePolynomial]]:
         """Find table entries whose polynomial divides the target (with quotient).
@@ -752,43 +676,6 @@ class RainbowTable:
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
-
-def _try_divide(dividend: TuttePolynomial, divisor: TuttePolynomial) -> Optional[TuttePolynomial]:
-    """Try polynomial division. Returns quotient if exact, None otherwise.
-
-    Currently only handles monomial divisors for simplicity.
-    """
-    divisor_coeffs = divisor.to_coefficients()
-
-    # Simple case: divisor is monomial
-    if len(divisor_coeffs) == 1:
-        (a, b), c = next(iter(divisor_coeffs.items()))
-        if c != 1:
-            return None  # Only handle coefficient 1
-
-        quotient_coeffs = {}
-        for (i, j), coeff in dividend.to_coefficients().items():
-            if i >= a and j >= b:
-                quotient_coeffs[(i - a, j - b)] = coeff
-            else:
-                return None  # Division not exact
-
-        if not quotient_coeffs:
-            return None
-
-        return TuttePolynomial.from_coefficients(quotient_coeffs)
-
-    # Check if divisor * something could equal dividend
-    # by verifying degrees are compatible
-    if divisor.x_degree() > dividend.x_degree():
-        return None
-    if divisor.y_degree() > dividend.y_degree():
-        return None
-
-    # For non-monomial divisors, we'd need actual polynomial division
-    # which is more complex. Return None for now.
-    return None
-
 
 def load_default_table() -> RainbowTable:
     """Load the default rainbow table from the package directory.

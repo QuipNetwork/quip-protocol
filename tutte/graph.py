@@ -246,15 +246,31 @@ class Graph:
         G.add_edges_from(self.edges)
         return G
 
+    def fast_hash(self) -> str:
+        """Fast structural hash (isomorphism-invariant but not collision-free).
+
+        Uses sorted degree sequence — O(n log n), under 1ms.
+        Use as a cheap pre-filter before expensive canonical_key().
+        """
+        degrees = sorted(self.degree(n) for n in self.nodes)
+        return f"{len(self.nodes)}:{self.edge_count()}:{degrees}"
+
     def canonical_key(self) -> str:
         """Create a canonical string key for the graph (isomorphism-invariant).
 
         Uses Weisfeiler-Lehman refinement to compute a canonical node ordering,
         then hashes the resulting edge list. This is truly isomorphism-invariant
         and faster than the previous graph6-based approach.
+
+        Result is memoized on the object (frozen dataclass, key never changes).
         """
+        cached = getattr(self, '_canonical_key_cache', None)
+        if cached is not None:
+            return cached
         G = self.to_networkx()
-        return _compute_canonical_key(G)
+        key = _compute_canonical_key(G)
+        object.__setattr__(self, '_canonical_key_cache', key)
+        return key
 
     def node_count(self) -> int:
         """Number of nodes."""
@@ -814,14 +830,33 @@ class MultiGraph:
             return 0
         return next(iter(self.edge_counts.values()))
 
+    def fast_hash(self) -> str:
+        """Fast structural hash (isomorphism-invariant but not collision-free).
+
+        Uses sorted degree sequence with edge multiplicities and loops.
+        O(n log n), under 1ms. Use as a cheap pre-filter before canonical_key().
+        """
+        degrees = sorted(self.degree(n) for n in self.nodes)
+        mults = sorted(self.edge_counts.values())
+        loops = self.total_loop_count()
+        return f"MG:{len(self.nodes)}:{self.edge_count()}:{degrees}:{mults}:{loops}"
+
     def canonical_key(self) -> str:
         """Create a canonical key for the multigraph (isomorphism-invariant).
 
         Uses WL refinement for node ordering, then encodes edge multiplicities
         and loops in canonical form.
+
+        Result is memoized on the object (frozen dataclass, key never changes).
         """
+        cached = getattr(self, '_canonical_key_cache', None)
+        if cached is not None:
+            return cached
+
         if not self.nodes:
-            return hashlib.sha256(b'empty_multigraph').hexdigest()
+            key = hashlib.sha256(b'empty_multigraph').hexdigest()
+            object.__setattr__(self, '_canonical_key_cache', key)
+            return key
 
         n = len(self.nodes)
 
@@ -894,7 +929,9 @@ class MultiGraph:
 
         # Hash canonical form
         canonical_str = f'MG:{n}:e{edges}:l{loops}'
-        return hashlib.sha256(canonical_str.encode()).hexdigest()
+        key = hashlib.sha256(canonical_str.encode()).hexdigest()
+        object.__setattr__(self, '_canonical_key_cache', key)
+        return key
 
 
 # =============================================================================
