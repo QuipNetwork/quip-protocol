@@ -9,6 +9,7 @@ import argparse
 import json
 import logging
 import multiprocessing
+import random
 import sys
 import threading
 import time
@@ -135,6 +136,27 @@ def aggregate_results(
     }
 
 
+def _install_salt_pool(salt_pool: List[bytes]):
+    """Replace random.randbytes with a deterministic salt sequence.
+
+    Called inside each worker process so the miner's internal
+    random.randbytes(32) calls draw from the shared pool instead of
+    the OS CSPRNG. Falls back to real randomness once the pool is
+    exhausted.
+    """
+    idx = [0]
+    _real_randbytes = random.randbytes
+
+    def _next(n: int) -> bytes:
+        if n == 32 and idx[0] < len(salt_pool):
+            s = salt_pool[idx[0]]
+            idx[0] += 1
+            return s
+        return _real_randbytes(n)
+
+    random.randbytes = _next
+
+
 def mine_worker(
     miner_spec: Dict,
     difficulty_energy: float,
@@ -142,20 +164,28 @@ def mine_worker(
     min_solutions: int,
     result_queue: multiprocessing.Queue,
     stop_event: multiprocessing.Event,
+    salt_pool: Optional[List[bytes]] = None,
 ):
     """Worker function for parallel mining.
 
     Args:
-        miner_spec: Dict with 'kind' and 'id' for miner creation.
+        miner_spec: Dict with 'kind', 'id', and optional 'nonce_id'.
         difficulty_energy: Fixed difficulty threshold.
         min_diversity: Minimum solution diversity.
         min_solutions: Minimum solutions required.
         result_queue: Queue to send results back.
         stop_event: Shared event to signal stop.
+        salt_pool: Pre-generated salts for deterministic nonce
+            generation. When provided, both miner types see the
+            same Ising problems (requires matching nonce_id).
     """
     kind = miner_spec['kind']
     miner_id = miner_spec['id']
+    nonce_id = miner_spec.get('nonce_id', miner_id)
     topology = DEFAULT_TOPOLOGY
+
+    if salt_pool is not None:
+        _install_salt_pool(salt_pool)
 
     try:
         if kind == 'cpu':
@@ -187,7 +217,7 @@ def mine_worker(
         timeout_to_difficulty_adjustment_decay=0,
     )
 
-    node_info = NodeInfo(miner_id=miner_id)
+    node_info = NodeInfo(miner_id=nonce_id)
     blocks_found = []
     attempts = 0
     start_time = time.time()
@@ -210,6 +240,17 @@ def mine_worker(
             'solution_counts': [b.num_valid for b in blocks_found],
             'mining_times': [
                 b.mining_time for b in blocks_found if b.mining_time
+            ],
+            'block_details': [
+                {
+                    'nonce': b.nonce,
+                    'salt': b.salt.hex(),
+                    'energy': b.energy,
+                    'diversity': b.diversity,
+                    'num_valid': b.num_valid,
+                    'mining_time': b.mining_time,
+                }
+                for b in blocks_found
             ],
         })
 
@@ -259,24 +300,39 @@ def build_specs(
 ) -> List[Dict]:
     """Build miner spec dicts for the requested type(s).
 
+    When miner_type is 'both', num_cpus is the TOTAL budget split
+    evenly between types (e.g. 8 total -> 4 cpu + 4 cpu-filtered).
+    Paired workers share a nonce_id so they solve identical Ising
+    problems when given the same salt pool.
+
     Args:
         miner_type: 'cpu', 'cpu-filtered', or 'both'.
-        num_cpus: Number of workers per miner type.
+        num_cpus: Total worker count (split when 'both').
 
     Returns:
-        List of spec dicts with 'kind' and 'id'.
+        List of spec dicts with 'kind', 'id', and 'nonce_id'.
     """
     specs = []
-    types = (
-        ['cpu', 'cpu-filtered']
-        if miner_type == 'both'
-        else [miner_type]
-    )
-    for kind in types:
+    if miner_type == 'both':
+        per_type = max(1, num_cpus // 2)
+        for i in range(per_type):
+            nonce_id = f'bench-{i}'
+            specs.append({
+                'kind': 'cpu',
+                'id': f'cpu-{i}',
+                'nonce_id': nonce_id,
+            })
+            specs.append({
+                'kind': 'cpu-filtered',
+                'id': f'cpu-filtered-{i}',
+                'nonce_id': nonce_id,
+            })
+    else:
         for i in range(num_cpus):
             specs.append({
-                'kind': kind,
-                'id': f'{kind}-{i}',
+                'kind': miner_type,
+                'id': f'{miner_type}-{i}',
+                'nonce_id': f'bench-{i}',
             })
     return specs
 
@@ -309,7 +365,13 @@ def run_benchmark(args) -> int:
     print(f"Miner type: {args.miner_type}")
     print(f"Difficulty: {args.difficulty_energy:.1f}")
     print(f"Duration: {args.duration} ({duration_minutes:.1f} min)")
-    print(f"Workers per type: {args.num_cpus}")
+    type_counts = {}
+    for s in specs:
+        type_counts[s['kind']] = type_counts.get(s['kind'], 0) + 1
+    worker_desc = ' + '.join(
+        f"{c} {t}" for t, c in sorted(type_counts.items())
+    )
+    print(f"Workers: {worker_desc} ({len(specs)} total)")
     print(
         f"SA params: sweeps={sa_params['num_sweeps']}, "
         f"reads={sa_params['num_reads']}",
@@ -317,9 +379,18 @@ def run_benchmark(args) -> int:
     print(f"Difficulty factor: {difficulty_factor:.3f}")
     if args.min_blocks > 0:
         print(f"Min blocks target: {args.min_blocks}")
+
+    # Generate deterministic salt pool for controlled experiments.
+    # All workers get the same pool so paired workers (same nonce_id)
+    # solve identical Ising problems.
+    seed = args.seed if args.seed is not None else int(time.time())
+    rng = random.Random(seed)
+    salt_pool = [rng.randbytes(32) for _ in range(args.salt_pool_size)]
+    print(f"Salt pool: {args.salt_pool_size} salts (seed={seed})")
+
     print(f"\nSpawning {len(specs)} worker(s):")
     for s in specs:
-        print(f"   - {s['id']}")
+        print(f"   - {s['id']} (nonce_id={s['nonce_id']})")
 
     result_queue = multiprocessing.Queue()
     stop_event = multiprocessing.Event()
@@ -335,6 +406,7 @@ def run_benchmark(args) -> int:
                 args.min_solutions,
                 result_queue,
                 stop_event,
+                salt_pool,
             ),
         )
         p.start()
@@ -483,6 +555,7 @@ def run_benchmark(args) -> int:
         'min_solutions': args.min_solutions,
         'sa_params': sa_params,
         'difficulty_factor': float(difficulty_factor),
+        'seed': seed,
         'per_type_stats': type_stats,
         'errors': [e.get('error') for e in errors],
         'timestamp': utc_timestamp(),
@@ -495,6 +568,7 @@ def run_benchmark(args) -> int:
             f"prefilter_mining_{args.miner_type}_{ts}.json"
         )
 
+    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
     with open(output_file, 'w') as f:
         json.dump(output_data, f, indent=2, cls=NumpyEncoder)
 
@@ -545,11 +619,19 @@ def main():
         '--num-cpus',
         type=int,
         default=2,
-        help='Number of workers per miner type (default: 2)',
+        help='Total workers (split evenly for "both" mode, default: 2)',
     )
     parser.add_argument(
         '--min-blocks', type=int, default=0,
         help='Stop after this many total blocks (0=use duration only)',
+    )
+    parser.add_argument(
+        '--seed', type=int, default=None,
+        help='RNG seed for reproducible salt generation (default: time)',
+    )
+    parser.add_argument(
+        '--salt-pool-size', type=int, default=10000,
+        help='Number of pre-generated salts (default: 10000)',
     )
     parser.add_argument(
         '--output', '-o',
