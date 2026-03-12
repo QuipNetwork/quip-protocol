@@ -27,7 +27,9 @@ sys.path.append(str(Path(__file__).parent.parent))
 import numpy as np
 
 from dwave_topologies import DEFAULT_TOPOLOGY
+from CPU.sa_miner import SimulatedAnnealingMiner
 from shared.block import BlockRequirements, create_genesis_block
+from shared.energy_utils import energy_to_difficulty
 from shared.time_utils import utc_timestamp
 
 logging.basicConfig(
@@ -281,11 +283,21 @@ def build_specs(
 
 def run_benchmark(args) -> int:
     """Run the mining rate benchmark."""
+    if args.min_blocks > 0 and args.duration == '10m':
+        args.duration = '4h'
+
     try:
         duration_minutes = parse_duration(args.duration)
     except (ValueError, IndexError):
         print(f"Invalid duration: '{args.duration}'")
         return 1
+
+    sa_params = SimulatedAnnealingMiner.adapt_parameters(
+        difficulty_energy=args.difficulty_energy,
+        min_diversity=args.min_diversity,
+        min_solutions=args.min_solutions,
+    )
+    difficulty_factor = energy_to_difficulty(args.difficulty_energy)
 
     specs = build_specs(args.miner_type, args.num_cpus)
     if not specs:
@@ -298,6 +310,13 @@ def run_benchmark(args) -> int:
     print(f"Difficulty: {args.difficulty_energy:.1f}")
     print(f"Duration: {args.duration} ({duration_minutes:.1f} min)")
     print(f"Workers per type: {args.num_cpus}")
+    print(
+        f"SA params: sweeps={sa_params['num_sweeps']}, "
+        f"reads={sa_params['num_reads']}",
+    )
+    print(f"Difficulty factor: {difficulty_factor:.3f}")
+    if args.min_blocks > 0:
+        print(f"Min blocks target: {args.min_blocks}")
     print(f"\nSpawning {len(specs)} worker(s):")
     for s in specs:
         print(f"   - {s['id']}")
@@ -349,6 +368,20 @@ def run_benchmark(args) -> int:
         while any(p.is_alive() for p in processes):
             time.sleep(0.1)
             drain_queue()
+            total_blocks = sum(
+                r.get('blocks_found', 0)
+                for r in results_by_id.values()
+                if 'error' not in r
+            )
+            if (
+                args.min_blocks > 0
+                and total_blocks >= args.min_blocks
+            ):
+                print(
+                    f"\nReached {total_blocks}"
+                    f"/{args.min_blocks} blocks",
+                )
+                stop_event.set()
             if stop_event.is_set():
                 shutdown_start = time.time()
                 while any(p.is_alive() for p in processes):
@@ -448,6 +481,8 @@ def run_benchmark(args) -> int:
         'duration_minutes': duration_minutes,
         'min_diversity': args.min_diversity,
         'min_solutions': args.min_solutions,
+        'sa_params': sa_params,
+        'difficulty_factor': float(difficulty_factor),
         'per_type_stats': type_stats,
         'errors': [e.get('error') for e in errors],
         'timestamp': utc_timestamp(),
@@ -511,6 +546,10 @@ def main():
         type=int,
         default=2,
         help='Number of workers per miner type (default: 2)',
+    )
+    parser.add_argument(
+        '--min-blocks', type=int, default=0,
+        help='Stop after this many total blocks (0=use duration only)',
     )
     parser.add_argument(
         '--output', '-o',
