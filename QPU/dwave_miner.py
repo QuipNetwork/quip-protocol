@@ -35,6 +35,8 @@ class DWaveMiner(BaseMiner):
         embedding_file: Optional[str] = None,
         time_config: Optional[QPUTimeConfig] = None,
         queue_depth: int = 10,
+        solver_name: Optional[str] = None,
+        region: Optional[str] = None,
         **cfg
     ):
         """
@@ -52,6 +54,10 @@ class DWaveMiner(BaseMiner):
             queue_depth: Number of problems to keep in-flight in the QPU queue (default: 10).
                         Higher values increase throughput but may waste QPU time if
                         early results are valid.
+            solver_name: Optional explicit solver name to connect to (e.g.
+                        "Advantage2_system1.12"). If None, uses DWAVE_API_SOLVER env var.
+            region: Optional D-Wave region (e.g. "na-east-1").
+                   If None, uses default from config.
             **cfg: Additional configuration options (reserved for future use)
         """
         # Create sampler (encapsulates embedding internally)
@@ -59,7 +65,9 @@ class DWaveMiner(BaseMiner):
         try:
             sampler = DWaveSamplerWrapper(
                 topology=topology,
-                embedding_file=embedding_file
+                embedding_file=embedding_file,
+                solver_name=solver_name,
+                region=region,
             )
             init_logger.info(f"[QPU] Sampler ready: {len(sampler.nodes)} nodes, {len(sampler.edges)} edges")
         except Exception as e:
