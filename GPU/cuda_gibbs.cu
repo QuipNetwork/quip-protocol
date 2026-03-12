@@ -119,7 +119,7 @@ __device__ float compute_effective_field_shared(
     volatile signed char* shared_state,
     const int* csr_row_ptr, int rp_off,
     const int* csr_col_ind, int ci_off,
-    const signed char* csr_J_vals,
+    const signed char* csr_J_vals, int j_off,
     const signed char* h_vals, int h_off
 ) {
     int start = __ldg(&csr_row_ptr[rp_off + var]);
@@ -130,7 +130,7 @@ __device__ float compute_effective_field_shared(
     #pragma unroll 20
     for (int p = start; p < end; ++p) {
         int neighbor = __ldg(&csr_col_ind[ci_off + p]);
-        int Jij = (int)__ldg(&csr_J_vals[ci_off + p]);
+        int Jij = (int)__ldg(&csr_J_vals[j_off + p]);
         int neighbor_spin = (int)shared_state[neighbor];
         h_eff += (float)(Jij * neighbor_spin);
     }
@@ -147,7 +147,7 @@ __device__ float compute_effective_field(
     const signed char* my_state,
     const int* csr_row_ptr, int rp_off,
     const int* csr_col_ind, int ci_off,
-    const signed char* csr_J_vals,
+    const signed char* csr_J_vals, int j_off,
     const signed char* h_vals, int h_off
 ) {
     int start = __ldg(&csr_row_ptr[rp_off + var]);
@@ -158,7 +158,7 @@ __device__ float compute_effective_field(
     #pragma unroll 20
     for (int p = start; p < end; ++p) {
         int neighbor = __ldg(&csr_col_ind[ci_off + p]);
-        int Jij = (int)__ldg(&csr_J_vals[ci_off + p]);
+        int Jij = (int)__ldg(&csr_J_vals[j_off + p]);
         int neighbor_spin = (int)__ldg(&my_state[neighbor]);
         h_eff += (float)(Jij * neighbor_spin);
     }
@@ -218,6 +218,7 @@ extern "C" __global__ void cuda_gibbs_persistent(
     const int* __restrict__ problem_N,
     const int* __restrict__ problem_rp_offsets,
     const int* __restrict__ problem_ci_offsets,
+    const int* __restrict__ problem_j_offsets,
     const int* __restrict__ problem_h_offsets,
 
     // Color blocks (flattened, global indices)
@@ -279,6 +280,7 @@ extern "C" __global__ void cuda_gibbs_persistent(
         int N = __ldg(&problem_N[model_id]);
         int rp_off = __ldg(&problem_rp_offsets[model_id]);
         int ci_off = __ldg(&problem_ci_offsets[model_id]);
+        int j_off = __ldg(&problem_j_offsets[model_id]);
         int h_off = __ldg(&problem_h_offsets[model_id]);
         int color_base = model_id * num_colors;
 
@@ -363,7 +365,7 @@ extern "C" __global__ void cuda_gibbs_persistent(
                                     var, shared_state,
                                     csr_row_ptr, rp_off,
                                     csr_col_ind, ci_off,
-                                    csr_J_vals,
+                                    csr_J_vals, j_off,
                                     h_vals, h_off
                                 );
                             PROF_ACCUM0(_is_p, prof, 6, ft);
@@ -452,7 +454,7 @@ extern "C" __global__ void cuda_gibbs_persistent(
                         &csr_col_ind[ci_off + p]);
                     if (j > var) {
                         int Jij = (int)__ldg(
-                            &csr_J_vals[ci_off + p]);
+                            &csr_J_vals[j_off + p]);
                         int spin_j =
                             (int)shared_state[j];
                         thread_energy += (float)(
@@ -513,6 +515,7 @@ extern "C" __global__ void cuda_block_gibbs_sequential(
     const int* __restrict__ problem_N,
     const int* __restrict__ problem_rp_offsets,
     const int* __restrict__ problem_ci_offsets,
+    const int* __restrict__ problem_j_offsets,
     const int* __restrict__ problem_h_offsets,
 
     const int* __restrict__ all_block_starts,
@@ -544,6 +547,7 @@ extern "C" __global__ void cuda_block_gibbs_sequential(
     int N = problem_N[prob_id];
     int rp_off = problem_rp_offsets[prob_id];
     int ci_off = problem_ci_offsets[prob_id];
+    int j_off = problem_j_offsets[prob_id];
     int h_off = problem_h_offsets[prob_id];
     int color_base = prob_id * num_colors;
 
@@ -594,7 +598,8 @@ extern "C" __global__ void cuda_block_gibbs_sequential(
                                 var, my_state,
                                 csr_row_ptr, rp_off,
                                 csr_col_ind, ci_off,
-                                csr_J_vals, h_vals, h_off
+                                csr_J_vals, j_off,
+                                h_vals, h_off
                             );
 
                         int new_spin;
@@ -628,7 +633,7 @@ extern "C" __global__ void cuda_block_gibbs_sequential(
                 int j = csr_col_ind[ci_off + p];
                 if (j > i) {
                     int Jij =
-                        (int)csr_J_vals[ci_off + p];
+                        (int)csr_J_vals[j_off + p];
                     int spin_j = (int)my_state[j];
                     energy += Jij * spin_i * spin_j;
                 }

@@ -25,3 +25,16 @@ cert_dir = "/data/certs"
 backend = "local"
 # GPU devices to use (auto-detected by entrypoint if not specified)
 # devices = ["0", "1"]
+
+# Defaults for all GPUs (override per-device below)
+# gpu_utilization = 100  # 1-100, percentage of SMs to use
+# yielding = false       # true = yield to other GPU users (NVML)
+
+# Per-device overrides (optional):
+# [gpu.device.0]
+# gpu_utilization = 100
+# yielding = false
+#
+# [gpu.device.1]
+# gpu_utilization = 50
+# yielding = true

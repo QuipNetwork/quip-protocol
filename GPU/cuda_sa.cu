@@ -735,4 +735,130 @@ __global__ void cuda_sa_oneshot(
     out_energies[global_tid] = (float)current_energy;
 }
 
+// Multi-nonce SA kernel: one block per nonce, threads = reads.
+// CSR topology (row_ptr, col_ind) is shared across nonces.
+// J/h are per-nonce at offsets j_offsets[nonce_id], h_offsets[nonce_id].
+// Grid=(num_nonces,) Block=(num_reads,).
+__global__ void cuda_sa_multi(
+    const int* __restrict__ csr_row_ptr,
+    const int* __restrict__ csr_col_ind,
+    const int8_t* __restrict__ all_J_vals,
+    const float*  __restrict__ all_h,
+    const int*    __restrict__ j_offsets,
+    const int*    __restrict__ h_offsets,
+    const float*  __restrict__ beta_schedule,
+    int N,
+    int num_reads,
+    int num_betas,
+    int num_sweeps_per_beta,
+    unsigned int base_seed,
+    int8_t* __restrict__ delta_energy_workspace,
+    float*  __restrict__ out_samples,
+    float*  __restrict__ out_energies
+) {
+    int nonce_id = blockIdx.x;
+    int tid = threadIdx.x;
+    if (tid >= num_reads) return;
+
+    // Per-nonce J and h pointers
+    const int8_t* my_J = &all_J_vals[__ldg(&j_offsets[nonce_id])];
+    const float*  my_h = &all_h[__ldg(&h_offsets[nonce_id])];
+
+    // Global thread ID for workspace and output indexing
+    int global_tid = nonce_id * num_reads + tid;
+
+    // Thread-local unpacked state
+    int8_t unpacked_state[5000];
+
+    // Delta energy workspace for this thread
+    int8_t* delta_energy = &delta_energy_workspace[global_tid * N];
+
+    // Initialize RNG (combine seed, nonce_id, tid for uniqueness)
+    unsigned int rng_state =
+        (base_seed ^ ((nonce_id + 1) * 65537u + (tid + 1))) * 12345u;
+    if (rng_state == 0) rng_state = 0xdeadbeef;
+
+    // Random initial state
+    for (int var = 0; var < N; var++) {
+        unsigned int rv = xorshift32(rng_state);
+        unpacked_state[var] = (rv & 1) ? -1 : 1;
+    }
+
+    // Build initial delta_energy array
+    for (int var = 0; var < N; var++) {
+        delta_energy[var] = get_flip_energy_unpacked(
+            var, unpacked_state, csr_row_ptr, csr_col_ind,
+            my_J, N, my_h
+        );
+    }
+
+    // Compute initial energy
+    int current_energy = 0;
+    for (int i = 0; i < N; i++) {
+        int8_t spin_i = unpacked_state[i];
+        current_energy += (int)(__ldg(&my_h[i]) * spin_i);
+        const int start = __ldg(&csr_row_ptr[i]);
+        const int end = __ldg(&csr_row_ptr[i + 1]);
+        for (int p = start; p < end; ++p) {
+            const int j = __ldg(&csr_col_ind[p]);
+            if (j > i) {
+                const int8_t Jij = __ldg(&my_J[p]);
+                current_energy += Jij * spin_i * unpacked_state[j];
+            }
+        }
+    }
+
+    // SA sweeps
+    for (int beta_idx = 0; beta_idx < num_betas; beta_idx++) {
+        float beta = beta_schedule[beta_idx];
+        float threshold = 22.18f / beta;
+
+        for (int sweep = 0; sweep < num_sweeps_per_beta; sweep++) {
+            for (int var = 0; var < N; var++) {
+                int8_t de = delta_energy[var];
+                if (de >= threshold) continue;
+
+                bool flip_spin = false;
+                if (de <= 0) {
+                    flip_spin = true;
+                } else {
+                    const float accept_prob = __expf(
+                        -__int2float_rn(de) * beta
+                    );
+                    const float rand_uniform = (
+                        __uint2float_rn(xorshift32(rng_state))
+                        * RNG_SCALE
+                    );
+                    flip_spin = (accept_prob > rand_uniform);
+                }
+
+                if (flip_spin) {
+                    current_energy += de;
+                    const int8_t var_spin = unpacked_state[var];
+                    const int8_t multiplier = 4 * var_spin;
+                    const int start = __ldg(&csr_row_ptr[var]);
+                    const int end = __ldg(&csr_row_ptr[var + 1]);
+
+                    for (int p = start; p < end; ++p) {
+                        const int neighbor = __ldg(&csr_col_ind[p]);
+                        const int8_t Jij = __ldg(&my_J[p]);
+                        const int8_t ns = unpacked_state[neighbor];
+                        delta_energy[neighbor] += multiplier * Jij * ns;
+                    }
+
+                    unpacked_state[var] = -var_spin;
+                    delta_energy[var] = -de;
+                }
+            }
+        }
+    }
+
+    // Write results
+    int sample_offset = global_tid * N;
+    for (int i = 0; i < N; i++) {
+        out_samples[sample_offset + i] = (float)unpacked_state[i];
+    }
+    out_energies[global_tid] = (float)current_energy;
+}
+
 }  // extern "C"

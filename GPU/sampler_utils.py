@@ -386,6 +386,102 @@ def zephyr_four_color_linear(
     return j + ((w + 2 * (z + u) + j) & 2)
 
 
+def build_csr_structure_from_edges(
+    edges: List[Tuple[int, int]],
+    nodes: List[int],
+) -> Tuple[
+    np.ndarray, np.ndarray, Dict[int, int],
+    List[List[int]], int, int
+]:
+    """Build CSR structure from topology edges (no J values).
+
+    Uses dense indexing: nodes are mapped to contiguous 0..N-1
+    indices via node_to_idx.
+
+    Args:
+        edges: Topology edges [(i, j), ...].
+        nodes: Topology nodes.
+
+    Returns:
+        Tuple of:
+        - csr_row_ptr: Row pointers (int32), length N+1.
+        - csr_col_ind: Column indices (int32), length nnz.
+        - node_to_idx: Node ID -> dense index mapping.
+        - sorted_neighbors: Per-node sorted neighbor lists.
+        - N: Number of nodes.
+        - nnz: Number of non-zeros (2 * len(edges)).
+    """
+    node_list = sorted(nodes)
+    N = len(node_list)
+    node_to_idx = {
+        node: idx for idx, node in enumerate(node_list)
+    }
+
+    adjacency: List[List[int]] = [[] for _ in range(N)]
+    for i, j in edges:
+        idx_i = node_to_idx[i]
+        idx_j = node_to_idx[j]
+        adjacency[idx_i].append(idx_j)
+        adjacency[idx_j].append(idx_i)
+
+    sorted_neighbors: List[List[int]] = [
+        sorted(adj) for adj in adjacency
+    ]
+
+    csr_row_ptr = np.zeros(N + 1, dtype=np.int32)
+    nnz = 0
+    for node_idx in range(N):
+        csr_row_ptr[node_idx] = nnz
+        nnz += len(sorted_neighbors[node_idx])
+    csr_row_ptr[N] = nnz
+
+    csr_col_ind = np.array(
+        [c for row in sorted_neighbors for c in row],
+        dtype=np.int32,
+    )
+
+    return (
+        csr_row_ptr, csr_col_ind, node_to_idx,
+        sorted_neighbors, N, nnz,
+    )
+
+
+def build_edge_position_index(
+    edges: List[Tuple[int, int]],
+    node_to_idx: Dict[int, int],
+    csr_row_ptr: np.ndarray,
+    sorted_neighbors: List[List[int]],
+) -> List[Tuple[int, int]]:
+    """Map each topology edge to its two CSR positions.
+
+    For edge (i, j), returns the CSR offset of j within row i
+    and of i within row j. Enables O(1) J-value updates.
+
+    Args:
+        edges: Topology edges [(i, j), ...].
+        node_to_idx: Node ID -> dense index mapping.
+        csr_row_ptr: CSR row pointers.
+        sorted_neighbors: Per-node sorted neighbor lists.
+
+    Returns:
+        List of (pos_ij, pos_ji) per edge, same order as edges.
+    """
+    positions: List[Tuple[int, int]] = []
+    for i, j in edges:
+        idx_i = node_to_idx[i]
+        idx_j = node_to_idx[j]
+        pos_ij = (
+            int(csr_row_ptr[idx_i])
+            + sorted_neighbors[idx_i].index(idx_j)
+        )
+        pos_ji = (
+            int(csr_row_ptr[idx_j])
+            + sorted_neighbors[idx_j].index(idx_i)
+        )
+        positions.append((pos_ij, pos_ji))
+    return positions
+
+
 def compute_color_blocks(
     nodes: List[int], m: int = 9, t: int = 2
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
