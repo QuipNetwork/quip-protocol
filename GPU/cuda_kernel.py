@@ -429,10 +429,12 @@ class CudaKernel:
 class CudaKernelRealSA:
     """Persistent CUDA kernel with real simulated annealing algorithm."""
 
+    SA_NUM_REGIONS = 10
+
     def __init__(self, ring_size: int = 16, max_threads_per_job: int = 256,
-                 max_h_size: int = 10000, max_J_size: int = 100000, max_N: int = 4600,
+                 max_h_size: int = 10000, max_J_size: int = 100000, max_N: int = 5000,
                  debug_verbose: int = 0, debug_kernel: int = 0, debug_workers: int = 0,
-                 verbose: bool = True):
+                 verbose: bool = True, profile: bool = False):
         """
         Initialize persistent CUDA kernel with real SA.
 
@@ -446,10 +448,12 @@ class CudaKernelRealSA:
             debug_kernel: Enable DEBUG_KERNEL (0 or 1)
             debug_workers: Enable DEBUG_WORKERS (0 or 1)
             verbose: Enable Python print statements (default True)
+            profile: Enable PROFILE_REGIONS instrumentation
         """
         self.ring_size = ring_size
         self.max_threads_per_job = max_threads_per_job
         self.verbose = verbose
+        self.profile = profile
         self.max_h_size = max_h_size
         self.max_J_size = max_J_size
         self.max_N = max_N
@@ -468,6 +472,8 @@ class CudaKernelRealSA:
             options.append('-DDEBUG_KERNEL=1')
         if debug_workers:
             options.append('-DDEBUG_WORKERS=1')
+        if self.profile:
+            options.append('-DPROFILE_REGIONS=1')
 
         # Compile kernel with fast math optimizations
         # Note: NVRTC doesn't support -O3, uses --use_fast_math instead
@@ -587,28 +593,39 @@ class CudaKernelRealSA:
         workspace_capacity = max_N
         self.d_delta_energy_workspace = cp.zeros(self.num_blocks * max_threads_per_job * workspace_capacity, dtype=cp.int8)
 
+        # Profile output buffer (one row of SA_NUM_REGIONS per global thread)
+        total_threads = self.num_blocks * max_threads_per_job
+        if self.profile:
+            self.d_profile_output = cp.zeros(
+                total_threads * self.SA_NUM_REGIONS, dtype=cp.int64,
+            )
+            self._profile_total_threads = total_threads
+
         # Launch kernel (no global CSR arrays - each job has its own)
         self.stream = cp.cuda.Stream(non_blocking=True)
         if self.verbose:
             print(f"[PYTHON] Launching kernel with {self.num_blocks} blocks, {max_threads_per_job} threads/block", flush=True)
+        kernel_args = (
+            self.d_input_ring_ptrs,  # Array of pointers to JobDesc
+            self.ring_size,
+            self.d_input_head_arr,  # Device-only atomic counter
+            self.d_input_tail_arr,  # Mapped memory (host writes, kernel reads)
+            self.d_host_writing_mutex_arr,  # Mutex: 1=host writing, 0=idle
+            self.d_output_slots_bytes,
+            self.d_control_flag_arr,
+            self.d_kernel_state_arr,
+            self.d_samples_pool,
+            self.d_energies_pool,
+            max_samples_per_job,
+            max_energies_per_job,
+            self.d_delta_energy_workspace,
+            max_N,
+        )
+        if self.profile:
+            kernel_args = kernel_args + (self.d_profile_output,)
         self.kernel(
             (self.num_blocks,), (max_threads_per_job,),
-            (
-                self.d_input_ring_ptrs,  # Array of pointers to JobDesc
-                self.ring_size,
-                self.d_input_head_arr,  # Device-only atomic counter
-                self.d_input_tail_arr,  # Mapped memory (host writes, kernel reads)
-                self.d_host_writing_mutex_arr,  # Mutex: 1=host writing, 0=idle
-                self.d_output_slots_bytes,
-                self.d_control_flag_arr,
-                self.d_kernel_state_arr,
-                self.d_samples_pool,
-                self.d_energies_pool,
-                max_samples_per_job,
-                max_energies_per_job,
-                self.d_delta_energy_workspace,
-                max_N,
-            ),
+            kernel_args,
             stream=self.stream
         )
         if self.verbose:
@@ -1026,6 +1043,23 @@ class CudaKernelRealSA:
         offset = result['energies_offset']
         count = result['num_reads']
         return self.h_energies_pool[offset:offset + count]
+
+    def get_profile_data(self) -> np.ndarray:
+        """Read profiling counters from device after kernel stop.
+
+        Must be called after stop_immediate() or stop_drain()
+        so the kernel stream is synchronized.
+
+        Returns:
+            Array of shape (total_threads, SA_NUM_REGIONS).
+        """
+        if not self.profile:
+            raise RuntimeError("Profiling not enabled.")
+        self.stream.synchronize()
+        raw = cp.asnumpy(self.d_profile_output)
+        return raw.reshape(
+            self._profile_total_threads, self.SA_NUM_REGIONS,
+        )
 
     def stop_immediate(self) -> None:
         """
