@@ -28,6 +28,7 @@ quip_protocol.egg-info/
 test_results/
 *_results*.json
 mining_rate_*.json
+*lookup_table*.bin
 *lookup_table*.json
 *.zip
 
