@@ -321,7 +321,8 @@ def run_gibbs_benchmark(args, avail_sms):
     }
 
 
-def main():
+def main():  # noqa: C901
+    global TARGET_ENERGY  # noqa: PLW0604
     parser = argparse.ArgumentParser(
         description="SA and Gibbs multi-nonce benchmark",
     )
@@ -357,7 +358,6 @@ def main():
     )
     args = parser.parse_args()
 
-    global TARGET_ENERGY
     TARGET_ENERGY = args.target_energy
 
     dev = cp.cuda.Device()

@@ -118,8 +118,12 @@ class CudaGibbsSampler:
         self._sequential_kernel = self._module.get_function(
             'cuda_block_gibbs_sequential'
         )
+        self._self_feeding_kernel = self._module.get_function(
+            'cuda_gibbs_self_feeding'
+        )
 
         self._prepared = False
+        self._sf_prepared = False
 
     def prepare(
         self,
@@ -885,29 +889,45 @@ class CudaGibbsSampler:
             'total_samples': total_samples,
         }
 
-    def harvest_multi_nonce(self) -> List[dimod.SampleSet]:
-        """Synchronize GPU and return results from last launch.
+    def harvest_sync(self) -> dict:
+        """Synchronize GPU and return pending metadata.
+
+        Waits for the compute stream to finish but does NOT
+        download results from VRAM. Call download_results()
+        with the returned dict to get SampleSets.
 
         Returns:
-            List of dimod.SampleSet, one per nonce.
+            Pending metadata dict for download_results().
         """
         assert self._mn_pending is not None, (
             "No pending launch — call launch_multi_nonce() first"
         )
+        pending = self._mn_pending
+        self._mn_pending = None
+        self._stream_compute.synchronize()
+        return pending
+
+    def download_results(
+        self, pending: dict,
+    ) -> List[dimod.SampleSet]:
+        """Download and unpack results from a completed kernel.
+
+        Args:
+            pending: Metadata dict from harvest_sync().
+
+        Returns:
+            List of dimod.SampleSet, one per nonce.
+        """
         N = self._prep_N
         node_to_idx = self._prep_node_to_idx
         max_packed_size = self._prep_max_packed_size
 
-        p = self._mn_pending
-        idx = p['idx']
-        num_nonces = p['num_nonces']
-        reads_per_nonce = p['reads_per_nonce']
-        beta_range = p['beta_range']
-        beta_schedule_type = p['beta_schedule_type']
-        total_samples = p['total_samples']
-        self._mn_pending = None
-
-        self._stream_compute.synchronize()
+        idx = pending['idx']
+        num_nonces = pending['num_nonces']
+        reads_per_nonce = pending['reads_per_nonce']
+        beta_range = pending['beta_range']
+        beta_schedule_type = pending['beta_schedule_type']
+        total_samples = pending['total_samples']
 
         packed_raw = cp.asnumpy(
             self._d_mn_samples[idx][
@@ -932,6 +952,17 @@ class CudaGibbsSampler:
                 "update_mode": self.update_mode_name,
             },
         )
+
+    def harvest_multi_nonce(self) -> List[dimod.SampleSet]:
+        """Synchronize GPU and return results from last launch.
+
+        Convenience wrapper: harvest_sync() + download_results().
+
+        Returns:
+            List of dimod.SampleSet, one per nonce.
+        """
+        pending = self.harvest_sync()
+        return self.download_results(pending)
 
     def sample_multi_nonce(
         self,
@@ -1217,6 +1248,439 @@ class CudaGibbsSampler:
 
         all_color_nodes = np.concatenate(all_color_nodes)
         return all_block_starts, all_block_counts, all_color_nodes
+
+    # ==============================================================
+    # Self-feeding kernel: 3-slot rotating buffers per nonce
+    # ==============================================================
+    # Control layout per nonce (CTRL_STRIDE=8 ints):
+    #   [0..2] slot_state  [3] active_slot  [4] blocks_done
+    #   [5] work_queue  [6] exit_now  [7] generation
+    CTRL_STRIDE = 8
+    SLOT_EMPTY = 0
+    SLOT_READY = 1
+    SLOT_ACTIVE = 2
+    SLOT_COMPLETE = 3
+
+    def prepare_self_feeding(
+        self,
+        num_nonces: int,
+        reads_per_nonce: int = 32,
+        num_sweeps: int = 1000,
+        num_sweeps_per_beta: int = 1,
+        sms_per_nonce: int = 4,
+    ) -> None:
+        """Allocate 3-slot rotating buffers for self-feeding kernel.
+
+        Args:
+            num_nonces: Number of concurrent nonce groups.
+            reads_per_nonce: Reads per nonce per model.
+            num_sweeps: Max sweeps (for beta schedule size).
+            num_sweeps_per_beta: Sweeps per beta value.
+            sms_per_nonce: CUDA blocks per nonce group.
+        """
+        assert self._prepared, "Must call prepare() first"
+
+        N = self._prep_N
+        nnz = self._prep_nnz
+        max_packed_size = self._prep_max_packed_size
+        total_slots = num_nonces * 3
+
+        self._sf_num_nonces = num_nonces
+        self._sf_reads_per_nonce = reads_per_nonce
+        self._sf_sms_per_nonce = sms_per_nonce
+        self._sf_num_sweeps_per_beta = num_sweeps_per_beta
+        self._sf_max_num_betas = num_sweeps // num_sweeps_per_beta
+
+        # Flat buffer allocations (Option A: stride math)
+        self._d_sf_J = cp.zeros(
+            total_slots * nnz, dtype=cp.int8,
+        )
+        self._d_sf_h = cp.zeros(
+            total_slots * N, dtype=cp.int8,
+        )
+        self._d_sf_samples = cp.zeros(
+            total_slots * reads_per_nonce * max_packed_size,
+            dtype=cp.int8,
+        )
+        self._d_sf_energies = cp.zeros(
+            total_slots * reads_per_nonce, dtype=cp.int32,
+        )
+
+        # Per-nonce control array (device memory)
+        self._d_sf_ctrl = cp.zeros(
+            num_nonces * self.CTRL_STRIDE, dtype=cp.int32,
+        )
+
+        # Host staging buffers (one per slot for async fill)
+        self._h_sf_J = np.zeros(nnz, dtype=np.int8)
+        self._h_sf_h = np.zeros(N, dtype=np.int8)
+
+        # Shared beta schedule buffer
+        self._d_sf_beta = cp.zeros(
+            self._sf_max_num_betas, dtype=cp.float32,
+        )
+
+        # Color blocks tiled for num_nonces
+        starts = cp.asnumpy(self._d_block_starts)
+        counts = cp.asnumpy(self._d_block_counts)
+        self._d_sf_block_starts = cp.asarray(
+            np.tile(starts, num_nonces),
+        )
+        self._d_sf_block_counts = cp.asarray(
+            np.tile(counts, num_nonces),
+        )
+
+        # Dedicated streams
+        self._sf_stream_compute = cp.cuda.Stream(
+            non_blocking=True,
+        )
+        self._sf_stream_transfer = cp.cuda.Stream(
+            non_blocking=True,
+        )
+
+        # Chunks per model (work distribution)
+        self._sf_chunks_per_model = sms_per_nonce
+        self._sf_reads_per_chunk = (
+            (reads_per_nonce + sms_per_nonce - 1)
+            // sms_per_nonce
+        )
+
+        self._sf_kernel_running = False
+        self._sf_prepared = True
+
+        self.logger.info(
+            "Self-feeding prepared: %d nonces × 3 slots, "
+            "%d reads/nonce, %d SMs/nonce",
+            num_nonces, reads_per_nonce, sms_per_nonce,
+        )
+
+    def upload_slot(
+        self,
+        nonce_id: int,
+        slot_id: int,
+        h: Dict[int, float],
+        J: Dict[Tuple[int, int], float],
+    ) -> None:
+        """Upload model data to a specific slot, mark READY.
+
+        Performs async H2D copy on the transfer stream, then
+        writes SLOT_READY to the control array.
+
+        Args:
+            nonce_id: Nonce group index.
+            slot_id: Slot within nonce (0, 1, or 2).
+            h: Linear biases.
+            J: Quadratic biases.
+        """
+        assert self._sf_prepared, (
+            "Must call prepare_self_feeding() first"
+        )
+        N = self._prep_N
+        nnz = self._prep_nnz
+        max_packed_size = self._prep_max_packed_size
+        reads = self._sf_reads_per_nonce
+        slot_idx = nonce_id * 3 + slot_id
+
+        # Fill host staging
+        j_vals = np.fromiter(
+            J.values(), dtype=np.int8, count=len(J),
+        )
+        self._h_sf_J[:] = 0
+        self._h_sf_J[self._pos_ij] = j_vals
+        self._h_sf_J[self._pos_ji] = j_vals
+
+        h_vals = np.fromiter(
+            h.values(), dtype=np.int8, count=len(h),
+        )
+        self._h_sf_h[:] = 0
+        self._h_sf_h[self._h_idx] = h_vals
+
+        # Async H2D on transfer stream
+        j_start = slot_idx * nnz
+        h_start = slot_idx * N
+        sample_start = slot_idx * reads * max_packed_size
+        energy_start = slot_idx * reads
+
+        with self._sf_stream_transfer:
+            self._d_sf_J[j_start:j_start + nnz].set(
+                self._h_sf_J,
+            )
+            self._d_sf_h[h_start:h_start + N].set(
+                self._h_sf_h,
+            )
+            # Zero output buffers for this slot
+            self._d_sf_samples[
+                sample_start:sample_start
+                + reads * max_packed_size
+            ] = 0
+            self._d_sf_energies[
+                energy_start:energy_start + reads
+            ] = 0
+
+        # Mark slot READY via DMA on transfer stream
+        ctrl_offset = nonce_id * self.CTRL_STRIDE + slot_id
+        ready_val = np.array(
+            [self.SLOT_READY], dtype=np.int32,
+        )
+        with self._sf_stream_transfer:
+            self._d_sf_ctrl[ctrl_offset:ctrl_offset + 1].set(
+                ready_val,
+            )
+        self._sf_stream_transfer.synchronize()
+
+    def launch_self_feeding(
+        self,
+        num_betas: int,
+        seed: Optional[int] = None,
+        active_nonce_count: Optional[int] = None,
+    ) -> None:
+        """Launch self-feeding kernel (once, stays resident).
+
+        Slots must already have READY state from upload_slot().
+        The kernel runs until no READY slots remain or
+        signal_exit() is called.
+
+        Args:
+            num_betas: Number of beta schedule entries.
+            seed: RNG base seed.
+            active_nonce_count: Launch blocks for this many
+                nonces (default: all prepared nonces).
+        """
+        assert self._sf_prepared
+        assert not self._sf_kernel_running
+
+        if seed is None:
+            seed = np.random.randint(0, 2**31)
+
+        N = self._prep_N
+        nnz = self._prep_nnz
+        max_packed_size = self._prep_max_packed_size
+        num_nonces = self._sf_num_nonces
+        blocks_per_nonce = self._sf_sms_per_nonce
+        active = (
+            active_nonce_count
+            if active_nonce_count is not None
+            else num_nonces
+        )
+        num_blocks = active * blocks_per_nonce
+
+        grid = (num_blocks,)
+        block = (256,)
+        kernel_args = (
+            self._d_row_ptr,
+            self._d_col_ind,
+            self._d_sf_block_starts,
+            self._d_sf_block_counts,
+            self._d_color_nodes,
+            np.int32(self.num_colors),
+            self._d_sf_beta,
+            np.int32(num_betas),
+            np.int32(self._sf_num_sweeps_per_beta),
+            self._d_sf_J,
+            self._d_sf_h,
+            self._d_sf_samples,
+            self._d_sf_energies,
+            self._d_sf_ctrl,
+            np.int32(num_nonces),
+            np.int32(blocks_per_nonce),
+            np.int32(self._sf_reads_per_nonce),
+            np.int32(N),
+            np.int32(nnz),
+            np.int32(max_packed_size),
+            np.int32(self._sf_chunks_per_model),
+            np.int32(self._sf_reads_per_chunk),
+            np.uint32(seed),
+            np.int32(self.update_mode),
+        )
+
+        with self._sf_stream_compute:
+            self._self_feeding_kernel(
+                grid, block, kernel_args,
+            )
+
+        self._sf_kernel_running = True
+
+    def upload_beta_schedule(
+        self,
+        h_first: Dict[int, float],
+        J_first: Dict[Tuple[int, int], float],
+        num_sweeps: int,
+        num_sweeps_per_beta: int = 1,
+        beta_range: Optional[Tuple[float, float]] = None,
+        beta_schedule_type: str = "geometric",
+    ) -> Tuple[int, Tuple[float, float]]:
+        """Upload beta schedule to the shared device buffer.
+
+        Returns:
+            (num_betas, beta_range) tuple.
+        """
+        sched, beta_range = self._get_cached_beta_schedule(
+            h_first, J_first, num_sweeps,
+            num_sweeps_per_beta, beta_range,
+            beta_schedule_type, None,
+        )
+        num_betas = len(sched)
+        self._d_sf_beta[:num_betas].set(sched)
+        self._sf_beta_range = beta_range
+        return num_betas, beta_range
+
+    def poll_completions(
+        self,
+    ) -> List[Tuple[int, int]]:
+        """Check for COMPLETE slots (non-blocking).
+
+        Reads the control array from device and checks each
+        slot's state.
+
+        Returns:
+            List of (nonce_id, slot_id) for completed slots.
+        """
+        assert self._sf_prepared
+        ctrl_host = cp.asnumpy(self._d_sf_ctrl)
+        completed = []
+        for n in range(self._sf_num_nonces):
+            base = n * self.CTRL_STRIDE
+            for s in range(3):
+                if ctrl_host[base + s] == self.SLOT_COMPLETE:
+                    completed.append((n, s))
+        return completed
+
+    def download_slot(
+        self,
+        nonce_id: int,
+        slot_id: int,
+    ) -> dimod.SampleSet:
+        """Download results from a COMPLETE slot.
+
+        Does NOT change slot state — caller should upload_slot()
+        with new data (which resets to READY) or leave as-is.
+
+        Args:
+            nonce_id: Nonce group index.
+            slot_id: Slot within nonce.
+
+        Returns:
+            dimod.SampleSet with the slot's results.
+        """
+        N = self._prep_N
+        node_to_idx = self._prep_node_to_idx
+        max_packed_size = self._prep_max_packed_size
+        reads = self._sf_reads_per_nonce
+        slot_idx = nonce_id * 3 + slot_id
+
+        sample_start = slot_idx * reads * max_packed_size
+        energy_start = slot_idx * reads
+
+        packed_raw = cp.asnumpy(
+            self._d_sf_samples[
+                sample_start:sample_start
+                + reads * max_packed_size
+            ],
+        )
+        energies_raw = cp.asnumpy(
+            self._d_sf_energies[
+                energy_start:energy_start + reads
+            ],
+        )
+
+        packed_data = packed_raw.reshape(reads, max_packed_size)
+
+        results = unpack_packed_results(
+            packed_data, energies_raw,
+            1, reads, N,
+            [node_to_idx],
+            info={
+                "beta_range": getattr(
+                    self, '_sf_beta_range', None,
+                ),
+                "update_mode": self.update_mode_name,
+            },
+        )
+        return results[0]
+
+    def mark_slot_empty(
+        self, nonce_id: int, slot_id: int,
+    ) -> None:
+        """Mark a slot as EMPTY (host done with it)."""
+        ctrl_offset = (
+            nonce_id * self.CTRL_STRIDE + slot_id
+        )
+        empty_val = np.array(
+            [self.SLOT_EMPTY], dtype=np.int32,
+        )
+        self._d_sf_ctrl[ctrl_offset:ctrl_offset + 1].set(
+            empty_val,
+        )
+
+    def signal_nonce_exit(self, nonce_id: int) -> None:
+        """Signal one nonce group to exit (not all).
+
+        Sets exit_now for just this nonce_id. The kernel blocks
+        for this nonce will exit at their next barrier check.
+        Does NOT synchronize — caller should wait if needed.
+
+        Args:
+            nonce_id: Nonce group index to signal.
+        """
+        assert self._sf_prepared
+        ctrl_offset = (
+            nonce_id * self.CTRL_STRIDE + 6  # CTRL_EXIT_NOW
+        )
+        exit_val = np.array([1], dtype=np.int32)
+        self._d_sf_ctrl[
+            ctrl_offset:ctrl_offset + 1
+        ].set(exit_val)
+
+    def signal_exit(self) -> None:
+        """Set exit_now for all nonces, wait for kernel exit."""
+        assert self._sf_prepared
+        for n in range(self._sf_num_nonces):
+            self.signal_nonce_exit(n)
+
+        self._sf_stream_compute.synchronize()
+        self._sf_kernel_running = False
+
+    def relaunch_self_feeding(
+        self,
+        active_nonce_count: int,
+        num_betas: int,
+        seed: Optional[int] = None,
+    ) -> None:
+        """Stop kernel, reset ctrl, relaunch with N nonces.
+
+        Precondition: caller has uploaded slots for nonces
+        0..active_nonce_count-1 already.
+
+        Args:
+            active_nonce_count: Number of active nonce groups.
+            num_betas: Beta schedule length.
+            seed: RNG base seed (random if None).
+        """
+        assert self._sf_prepared
+
+        # Wait for kernel exit
+        self._sf_stream_compute.synchronize()
+        self._sf_kernel_running = False
+
+        # Zero the entire ctrl array
+        self._d_sf_ctrl[:] = 0
+
+        # Relaunch with reduced grid
+        self.launch_self_feeding(
+            num_betas=num_betas,
+            seed=seed,
+            active_nonce_count=active_nonce_count,
+        )
+
+    def is_kernel_running(self) -> bool:
+        """Check if the self-feeding kernel is still running."""
+        if not self._sf_kernel_running:
+            return False
+        # Non-blocking query: check if compute stream is done
+        done = self._sf_stream_compute.done
+        if done:
+            self._sf_kernel_running = False
+        return self._sf_kernel_running
 
     def get_profile_data(self) -> np.ndarray:
         """Copy profile counters from GPU and reshape."""

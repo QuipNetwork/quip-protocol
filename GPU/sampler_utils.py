@@ -316,33 +316,25 @@ def unpack_packed_results(
         prob_packed = packed_data[start_idx:end_idx]
         prob_energies = energies_data[start_idx:end_idx]
 
-        # Use per-problem N from node_to_idx mapping
         node_to_idx = node_to_idx_list[prob_idx]
         prob_N = len(node_to_idx)
 
-        samples_data = np.zeros(
-            (num_reads, prob_N), dtype=np.int8
-        )
-        for read_idx in range(num_reads):
-            for var in range(prob_N):
-                byte_idx = var >> 3
-                bit_idx = var & 7
-                bit = (
-                    prob_packed[read_idx, byte_idx] >> bit_idx
-                ) & 1
-                samples_data[read_idx, var] = -1 if bit else 1
+        # Vectorized bit unpack: kernel stores LSB-first
+        bits = np.unpackbits(
+            prob_packed.view(np.uint8),
+            axis=1, bitorder='little',
+        )[:, :prob_N]
 
-        samples_dict = []
-        for sample in samples_data:
-            samples_dict.append(
-                {
-                    node: int(sample[idx])
-                    for node, idx in node_to_idx.items()
-                }
-            )
+        # Map 0/1 bits → +1/-1 spins (0 → +1, 1 → −1)
+        spins = np.where(bits, np.int8(-1), np.int8(1))
+
+        # Variable labels in index order
+        labels = sorted(
+            node_to_idx, key=node_to_idx.__getitem__,
+        )
 
         sampleset = dimod.SampleSet.from_samples(
-            samples_dict,
+            (spins, labels),
             energy=prob_energies.astype(float),
             vartype=dimod.SPIN,
             info=info or {},

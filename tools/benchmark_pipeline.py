@@ -44,7 +44,7 @@ class NodeInfo:
     miner_id: str
 
 
-ENERGY_TARGET = -14600.0
+ENERGY_TARGET = -14750.0
 REQUIREMENTS = BlockRequirements(
     difficulty_energy=ENERGY_TARGET,
     min_diversity=0.2,
@@ -63,8 +63,16 @@ SINGLE_TIMEOUT = 120  # seconds per single-miner trial
 COEXIST_TIMEOUT = 180  # seconds for co-existence test
 
 
+def _get_nonces_per_attempt(miner):
+    """Read how many nonces the scheduler dispatches per attempt."""
+    scheduler = getattr(miner, '_scheduler', None)
+    if scheduler is None:
+        return 1
+    return scheduler.get_sm_budget()
+
+
 def run_trial(label, miner_cls, device, utilization, yielding):
-    """Run a single mining trial. Returns (elapsed, result)."""
+    """Run a single mining trial. Returns trial metrics dict."""
     print(f"\n{'=' * 60}")
     print(f"  {label}  (util={utilization}%, yielding={yielding})")
     print(f"{'=' * 60}")
@@ -78,6 +86,8 @@ def run_trial(label, miner_cls, device, utilization, yielding):
 
     # Override adaptive params for fast kernel launches
     miner._adapt_mining_params = lambda *a, **kw: dict(OVERRIDE_PARAMS)
+
+    nonces_per = _get_nonces_per_attempt(miner)
 
     prev_block = create_genesis_block()
     prev_block.next_block_requirements = REQUIREMENTS
@@ -94,15 +104,17 @@ def run_trial(label, miner_cls, device, utilization, yielding):
     )
     elapsed = time.time() - start
 
-    blocks = miner.timing_stats['blocks_attempted']
-    models_s = blocks / elapsed if elapsed > 0 else 0.0
+    attempts = miner.timing_stats['blocks_attempted']
+    total_nonces = attempts * nonces_per
+    nonces_s = total_nonces / elapsed if elapsed > 0 else 0.0
 
     if result:
         print(
             f"  MINED in {elapsed:.1f}s | "
             f"energy={result.energy:.1f} | "
-            f"attempts={blocks} | "
-            f"models/s={models_s:.2f}"
+            f"attempts={attempts} | "
+            f"nonces/attempt={nonces_per} | "
+            f"nonces/s={nonces_s:.1f}"
         )
     else:
         print(f"  FAILED after {elapsed:.1f}s")
@@ -119,8 +131,9 @@ def run_trial(label, miner_cls, device, utilization, yielding):
         'label': label,
         'elapsed': elapsed,
         'result': result,
-        'blocks_attempted': blocks,
-        'models_s': models_s,
+        'blocks_attempted': attempts,
+        'nonces_per_attempt': nonces_per,
+        'nonces_s': nonces_s,
         'success': result is not None,
     }
 
@@ -147,10 +160,12 @@ def _coexist_worker(miner_cls_name, label, device, result_file):
             'label': trial['label'],
             'elapsed': trial['elapsed'],
             'blocks_attempted': trial['blocks_attempted'],
-            'models_s': trial['models_s'],
+            'nonces_per_attempt': trial['nonces_per_attempt'],
+            'nonces_s': float(trial['nonces_s']),
             'success': trial['success'],
             'energy': (
-                trial['result'].energy if trial['result'] else None
+                float(trial['result'].energy)
+                if trial['result'] else None
             ),
         }
     except Exception as exc:
@@ -160,7 +175,11 @@ def _coexist_worker(miner_cls_name, label, device, result_file):
 
 
 def run_coexistence_test(device):
-    """Run SA + Gibbs concurrently on the same GPU."""
+    """Run SA + Gibbs concurrently on the same GPU.
+
+    Uses 'spawn' context so each child gets a fresh CUDA runtime
+    instead of inheriting the parent's (already-initialized) context.
+    """
     import json
     import tempfile
 
@@ -168,16 +187,18 @@ def run_coexistence_test(device):
     print("  CO-EXISTENCE: SA + Gibbs @ 50% yielding=True")
     print(f"{'#' * 60}")
 
+    ctx = multiprocessing.get_context('spawn')
+
     tmpdir = Path(tempfile.mkdtemp())
     sa_file = str(tmpdir / "sa_result.json")
     gibbs_file = str(tmpdir / "gibbs_result.json")
 
     procs = [
-        multiprocessing.Process(
+        ctx.Process(
             target=_coexist_worker,
             args=("CudaMiner", "coexist-SA", device, sa_file),
         ),
-        multiprocessing.Process(
+        ctx.Process(
             target=_coexist_worker,
             args=(
                 "CudaGibbsMiner", "coexist-Gibbs",
@@ -240,40 +261,43 @@ def main():
     coexist_results = run_coexistence_test(device)
 
     # --- Summary ---
-    print(f"\n{'=' * 70}")
+    print(f"\n{'=' * 76}")
     print(f"  PIPELINE BENCHMARK SUMMARY  (target={ENERGY_TARGET})")
-    print(f"{'=' * 70}")
+    print(f"{'=' * 76}")
     print(
-        f"  {'Trial':<25s} {'Time(s)':>8s} "
-        f"{'Attempts':>8s} {'Models/s':>9s} {'Status':>8s}"
+        f"  {'Trial':<20s} {'Time':>6s} {'Att':>4s} "
+        f"{'N/att':>5s} {'Nonces/s':>9s} {'Status':>7s}"
     )
-    print(f"  {'-' * 62}")
+    print(f"  {'-' * 55}")
 
     for r in all_results:
         status = "OK" if r['success'] else "FAIL"
         print(
-            f"  {r['label']:<25s} {r['elapsed']:>8.1f} "
-            f"{r['blocks_attempted']:>8d} "
-            f"{r['models_s']:>9.2f} {status:>8s}"
+            f"  {r['label']:<20s} {r['elapsed']:>5.1f}s "
+            f"{r['blocks_attempted']:>4d} "
+            f"{r['nonces_per_attempt']:>5d} "
+            f"{r['nonces_s']:>9.1f} {status:>7s}"
         )
 
-    print(f"  {'-' * 62}")
+    print(f"  {'-' * 55}")
     for r in coexist_results:
         if 'error' in r:
-            print(f"  {r['label']:<25s} {'ERROR':>8s}  {r['error']}")
+            print(f"  {r['label']:<20s} {'ERROR':>7s}  {r['error']}")
         else:
             status = "OK" if r['success'] else "FAIL"
+            nonces_s = r.get('nonces_s', 0.0)
             print(
-                f"  {r['label']:<25s} {r['elapsed']:>8.1f} "
-                f"{r['blocks_attempted']:>8d} "
-                f"{r['models_s']:>9.2f} {status:>8s}"
+                f"  {r['label']:<20s} {r['elapsed']:>5.1f}s "
+                f"{r['blocks_attempted']:>4d} "
+                f"{r.get('nonces_per_attempt', '?'):>5} "
+                f"{nonces_s:>9.1f} {status:>7s}"
             )
 
     # --- Scaling check ---
-    print(f"\n  Scaling check (models/s should increase with util%):")
+    print(f"\n  Scaling (nonces/s should increase with util%):")
     for name in ["SA", "Gibbs"]:
         rates = [
-            r['models_s'] for r in all_results
+            r['nonces_s'] for r in all_results
             if r['label'].startswith(name) and r['success']
         ]
         if len(rates) >= 2:
@@ -283,7 +307,8 @@ def main():
             )
             tag = "PASS" if monotonic else "WARN"
             print(
-                f"    {name}: {' < '.join(f'{r:.2f}' for r in rates)}"
+                f"    {name}: "
+                f"{' < '.join(f'{r:.1f}' for r in rates)}"
                 f"  [{tag}]"
             )
 
