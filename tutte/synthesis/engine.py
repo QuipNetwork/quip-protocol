@@ -135,65 +135,28 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         self.table.save(json_path)
         save_binary_rainbow_table(self.table, bin_path)
 
-    @staticmethod
-    def _default_multigraph_table_path() -> str:
-        """Return default path for multigraph lookup table binary."""
-        import os
-        return os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), 'data', 'multigraph_lookup_table.bin'
-        )
+    def save_multigraph_cache(self) -> None:
+        """Save the multigraph polynomial cache to default location (binary + JSON)."""
+        from ..lookup.core import save_default_multigraph_table
+        save_default_multigraph_table(self._multigraph_cache)
 
-    def save_multigraph_cache(self, path: str = None) -> None:
-        """Save the multigraph polynomial cache to binary format.
+    def load_multigraph_cache(self) -> int:
+        """Load multigraph polynomial cache from default location.
 
-        Args:
-            path: File path. Defaults to tutte/data/multigraph_lookup_table.bin.
-        """
-        from ..lookup.binary import save_multigraph_lookup_table
-        if path is None:
-            path = self._default_multigraph_table_path()
-        save_multigraph_lookup_table(self._multigraph_cache, path)
-
-    def load_multigraph_cache(self, path: str = None) -> int:
-        """Load multigraph polynomial cache from binary file.
-
-        Args:
-            path: File path. Defaults to tutte/data/multigraph_lookup_table.bin.
-                  Also supports legacy JSON format for migration.
+        Tries binary format first, falls back to JSON.
 
         Returns the number of entries loaded.
         """
-        import os
-        from ..lookup.binary import load_multigraph_lookup_table
-        if path is None:
-            path = self._default_multigraph_table_path()
-        if not os.path.exists(path):
-            return 0
-        # Detect format by magic bytes
-        with open(path, 'rb') as f:
-            magic = f.read(4)
-        if magic == b"MGLT":
-            loaded = load_multigraph_lookup_table(path)
-            count = 0
-            for key, poly in loaded.items():
-                if key not in self._multigraph_cache:
-                    self._multigraph_cache[key] = poly
-                    count += 1
+        from ..lookup.core import load_default_multigraph_table
+        loaded = load_default_multigraph_table()
+        count = 0
+        for key, poly in loaded.items():
+            if key not in self._multigraph_cache:
+                self._multigraph_cache[key] = poly
+                count += 1
+        if count > 0:
             self._fast_hash_set_complete = False
-            return count
-        else:
-            # Legacy JSON format
-            import json
-            with open(path) as f:
-                saved = json.load(f)
-            count = 0
-            for key, coeffs_str in saved.items():
-                if key not in self._multigraph_cache:
-                    coeffs = {tuple(map(int, k.split(','))): v for k, v in coeffs_str.items()}
-                    self._multigraph_cache[key] = TuttePolynomial.from_coefficients(coeffs)
-                    count += 1
-            self._fast_hash_set_complete = False
-            return count
+        return count
 
     def _collect_simple_intermediates(
         self,

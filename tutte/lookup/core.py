@@ -677,13 +677,18 @@ class RainbowTable:
 # UTILITY FUNCTIONS
 # =============================================================================
 
+def _default_data_dir() -> str:
+    """Return the default data directory (tutte/data/)."""
+    return os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data')
+
+
 def load_default_table() -> RainbowTable:
     """Load the default rainbow table from the package directory.
 
     Tries binary format first (faster, includes minor relationships),
     falls back to JSON.
     """
-    base_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data')
+    base_dir = _default_data_dir()
     bin_path = os.path.join(base_dir, 'lookup_table.bin')
     json_path = os.path.join(base_dir, 'lookup_table.json')
 
@@ -698,3 +703,59 @@ def load_default_table() -> RainbowTable:
         return RainbowTable.load(json_path)
 
     return RainbowTable()
+
+
+def load_default_multigraph_table() -> Dict[str, 'TuttePolynomial']:
+    """Load the default multigraph lookup table from the package directory.
+
+    Tries binary format first (faster), falls back to JSON.
+
+    Returns:
+        Dict mapping canonical key -> TuttePolynomial.
+    """
+    from ..polynomial import TuttePolynomial
+
+    base_dir = _default_data_dir()
+    bin_path = os.path.join(base_dir, 'multigraph_lookup_table.bin')
+    json_path = os.path.join(base_dir, 'multigraph_lookup_table.json')
+
+    if os.path.exists(bin_path):
+        try:
+            from .binary import load_multigraph_lookup_table
+            return load_multigraph_lookup_table(bin_path)
+        except Exception:
+            pass  # Fall through to JSON
+
+    if os.path.exists(json_path):
+        import json as _json
+        with open(json_path) as f:
+            saved = _json.load(f)
+        cache: Dict[str, TuttePolynomial] = {}
+        for key, coeffs_str in saved.items():
+            coeffs = {tuple(map(int, k.split(','))): v for k, v in coeffs_str.items()}
+            cache[key] = TuttePolynomial.from_coefficients(coeffs)
+        return cache
+
+    return {}
+
+
+def save_default_multigraph_table(cache: Dict[str, 'TuttePolynomial']) -> None:
+    """Save the multigraph lookup table to the default location (binary + JSON).
+
+    Args:
+        cache: Dict mapping canonical key -> TuttePolynomial.
+    """
+    import json as _json
+    from .binary import save_multigraph_lookup_table
+
+    base_dir = _default_data_dir()
+    bin_path = os.path.join(base_dir, 'multigraph_lookup_table.bin')
+    json_path = os.path.join(base_dir, 'multigraph_lookup_table.json')
+
+    save_multigraph_lookup_table(cache, bin_path)
+
+    json_cache = {}
+    for key, poly in cache.items():
+        json_cache[key] = {f'{i},{j}': c for i, j, c in poly.terms()}
+    with open(json_path, 'w') as f:
+        _json.dump(json_cache, f, indent=2)

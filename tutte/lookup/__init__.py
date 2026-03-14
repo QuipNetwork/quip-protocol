@@ -6,6 +6,8 @@ from .core import (
     GCDMinorIndex,
     RainbowTable,
     load_default_table,
+    load_default_multigraph_table,
+    save_default_multigraph_table,
 )
 from .binary import (
     encode_rainbow_table_binary,
