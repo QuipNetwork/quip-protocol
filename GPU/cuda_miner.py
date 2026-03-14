@@ -4,11 +4,9 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import multiprocessing.synchronize
-import random
 import signal
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -16,10 +14,8 @@ import dimod
 
 from shared.base_miner import BaseMiner
 from shared.block_requirements import BlockRequirements
-from shared.quantum_proof_of_work import (
-    generate_ising_model_from_nonce,
-    ising_nonce_from_block,
-)
+from shared.ising_feeder import IsingFeeder
+from shared.ising_model import IsingModel
 from GPU.cuda_sa_kernel import CudaSAKernel
 from GPU.gpu_scheduler import (
     KernelScheduler,
@@ -37,35 +33,6 @@ logger = logging.getLogger(__name__)
 _PIPELINE_STALL_TIMEOUT = 30.0
 _POLL_INTERVAL = 0.001  # 1ms between completion polls
 _YIELD_CHECK_INTERVAL = 2.0  # seconds between yield checks
-
-
-def _generate_batch_worker(
-    prev_hash, miner_id, cur_index,
-    nodes, edges, num_nonces,
-):
-    """Generate Ising models in a worker process.
-
-    Runs in ProcessPoolExecutor to avoid GIL contention
-    with the main thread's GPU operations.
-
-    Returns:
-        (h_list, J_list, nonces, salts) tuple.
-    """
-    h_list, J_list = [], []
-    nonces, salts = [], []
-    for _ in range(num_nonces):
-        salt = random.randbytes(32)
-        nonce = ising_nonce_from_block(
-            prev_hash, miner_id, cur_index, salt,
-        )
-        h, J = generate_ising_model_from_nonce(
-            nonce, nodes, edges,
-        )
-        h_list.append(h)
-        J_list.append(J)
-        nonces.append(nonce)
-        salts.append(salt)
-    return h_list, J_list, nonces, salts
 
 
 class SaSelfFeedingPipeline:
@@ -86,30 +53,20 @@ class SaSelfFeedingPipeline:
     def __init__(
         self,
         kernel,
-        prev_hash,
-        miner_id,
-        cur_index,
-        nodes,
-        edges,
-        num_nonces,
-        mn_params,
+        feeder: IsingFeeder,
+        num_nonces: int,
+        mn_params: dict,
         scheduler=None,
     ):
         self._kernel = kernel
-        self._gen_args = (
-            prev_hash, miner_id, cur_index,
-            nodes, edges, num_nonces,
-        )
+        self._feeder = feeder
         self._mn_params = mn_params
         self._num_nonces = num_nonces
-
-        self._pool = ProcessPoolExecutor(max_workers=1)
-        self._future = None
         self._started = False
 
-        # Track (nonce_id, slot_id) -> (nonce_value, salt)
+        # Track (nonce_id, slot_id) -> IsingModel
         self._slot_meta: Dict[
-            Tuple[int, int], Tuple[int, bytes]
+            Tuple[int, int], IsingModel
         ] = {}
 
         # Dynamic yielding state
@@ -134,42 +91,37 @@ class SaSelfFeedingPipeline:
         )
 
         # Generate first batch (blocking)
-        h1, J1, nonces1, salts1 = _generate_batch_worker(
-            *self._gen_args,
-        )
+        batch1 = [
+            self._feeder.pop()
+            for _ in range(num_nonces)
+        ]
 
         # Upload beta schedule (shared, once)
         self._num_betas, _ = kernel.upload_beta_schedule(
-            h1[0], J1[0], num_betas,
+            batch1[0].h, batch1[0].J, num_betas,
         )
 
         # Upload batch 1 to slot 0
         for k in range(num_nonces):
-            kernel.upload_slot(k, 0, h1[k], J1[k])
-            self._slot_meta[(k, 0)] = (
-                nonces1[k], salts1[k],
-            )
+            m = batch1[k]
+            kernel.upload_slot(k, 0, m.h, m.J)
+            self._slot_meta[(k, 0)] = m
 
         # Generate second batch (blocking for cold start)
-        h2, J2, nonces2, salts2 = _generate_batch_worker(
-            *self._gen_args,
-        )
+        batch2 = [
+            self._feeder.pop()
+            for _ in range(num_nonces)
+        ]
 
         # Upload batch 2 to slot 1
         for k in range(num_nonces):
-            kernel.upload_slot(k, 1, h2[k], J2[k])
-            self._slot_meta[(k, 1)] = (
-                nonces2[k], salts2[k],
-            )
+            m = batch2[k]
+            kernel.upload_slot(k, 1, m.h, m.J)
+            self._slot_meta[(k, 1)] = m
 
         # Launch kernel (stays resident)
         kernel.launch_self_feeding(
             num_betas=self._num_betas,
-        )
-
-        # Start async CPU generation for next batch
-        self._future = self._pool.submit(
-            _generate_batch_worker, *self._gen_args,
         )
 
         self._started = True
@@ -224,12 +176,12 @@ class SaSelfFeedingPipeline:
         kernel.signal_exit()
 
         # Generate fresh models for all nonce slots
-        h_list, J_list, nonces, salts = (
-            _generate_batch_worker(*self._gen_args)
-        )
-        h2, J2, nonces2, salts2 = (
-            _generate_batch_worker(*self._gen_args)
-        )
+        batch1 = [
+            self._feeder.pop() for _ in range(target)
+        ]
+        batch2 = [
+            self._feeder.pop() for _ in range(target)
+        ]
 
         # Zero ctrl array for clean state
         kernel._d_sf_ctrl[:] = 0
@@ -237,16 +189,12 @@ class SaSelfFeedingPipeline:
         # Upload fresh slots for all nonces
         self._slot_meta.clear()
         for k in range(target):
-            kernel.upload_slot(
-                k, 0, h_list[k], J_list[k],
-            )
-            self._slot_meta[(k, 0)] = (
-                nonces[k], salts[k],
-            )
-            kernel.upload_slot(k, 1, h2[k], J2[k])
-            self._slot_meta[(k, 1)] = (
-                nonces2[k], salts2[k],
-            )
+            m1 = batch1[k]
+            kernel.upload_slot(k, 0, m1.h, m1.J)
+            self._slot_meta[(k, 0)] = m1
+            m2 = batch2[k]
+            kernel.upload_slot(k, 1, m2.h, m2.J)
+            self._slot_meta[(k, 1)] = m2
 
         # Relaunch with full nonce count
         kernel.launch_self_feeding(
@@ -307,10 +255,13 @@ class SaSelfFeedingPipeline:
             if nonce_id >= self._active_count:
                 continue
             ss = kernel.download_slot(nonce_id, slot_id)
-            meta = self._slot_meta.pop(
-                (nonce_id, slot_id), (None, None),
+            model = self._slot_meta.pop(
+                (nonce_id, slot_id), None,
             )
-            results.append((meta[0], meta[1], ss))
+            if model is not None:
+                results.append(
+                    (model.nonce, model.salt, ss),
+                )
 
             # Refill this slot with new work
             self._refill_slot(nonce_id, slot_id)
@@ -319,30 +270,13 @@ class SaSelfFeedingPipeline:
 
     def _refill_slot(self, nonce_id, slot_id):
         """Upload new model to a completed slot."""
-        if self._future is None:
-            self._future = self._pool.submit(
-                _generate_batch_worker,
-                *self._gen_args,
-            )
-
-        if not self._future.done():
+        model = self._feeder.try_pop()
+        if model is None:
             return  # Leave slot empty; kernel handles it
-
-        h_list, J_list, nonces, salts = (
-            self._future.result()
+        self._kernel.upload_slot(
+            nonce_id, slot_id, model.h, model.J,
         )
-        self._future = self._pool.submit(
-            _generate_batch_worker, *self._gen_args,
-        )
-
-        if nonce_id < len(h_list):
-            self._kernel.upload_slot(
-                nonce_id, slot_id,
-                h_list[nonce_id], J_list[nonce_id],
-            )
-            self._slot_meta[(nonce_id, slot_id)] = (
-                nonces[nonce_id], salts[nonce_id],
-            )
+        self._slot_meta[(nonce_id, slot_id)] = model
 
     def stop(self):
         """Signal kernel exit and clean up."""
@@ -354,9 +288,6 @@ class SaSelfFeedingPipeline:
                     "Error signaling exit: %s", e,
                 )
             self._started = False
-        self._pool.shutdown(
-            wait=False, cancel_futures=True,
-        )
 
 
 class CudaMiner(BaseMiner):
@@ -483,6 +414,8 @@ class CudaMiner(BaseMiner):
 
         self.miner_type = "GPU-CUDA"
         self._pipeline = None
+        self._feeder = None
+        self._preload_models = None
 
         signal.signal(signal.SIGTERM, self._cleanup_handler)
 
@@ -508,6 +441,9 @@ class CudaMiner(BaseMiner):
             if self._pipeline:
                 self._pipeline.stop()
                 self._pipeline = None
+            if self._feeder:
+                self._feeder.stop()
+                self._feeder = None
             self.kernel.close()
             self._scheduler.stop()
             if cp is not None:
@@ -527,6 +463,9 @@ class CudaMiner(BaseMiner):
         if self._pipeline:
             self._pipeline.stop()
             self._pipeline = None
+        if self._feeder:
+            self._feeder.stop()
+            self._feeder = None
         self.kernel.close()
         self._scheduler.stop()
 
@@ -621,10 +560,16 @@ class CudaMiner(BaseMiner):
         if self._scheduler.should_throttle():
             time.sleep(0.5)
 
-        if self._pipeline is None:
+        if self._feeder is None:
             sm_budget = self._scheduler.get_sm_budget()
             # SA uses 1 SM per nonce
             num_nonces = max(1, sm_budget)
+
+            self._feeder = IsingFeeder(
+                prev_hash, miner_id, cur_index,
+                nodes, edges,
+                buffer_size=num_nonces * 2,
+            )
 
             if self._pipeline_mode == 'self-feeding':
                 mn_params = dict(
@@ -638,27 +583,28 @@ class CudaMiner(BaseMiner):
                 )
                 self._pipeline = SaSelfFeedingPipeline(
                     self.kernel,
-                    prev_hash, miner_id, cur_index,
-                    nodes, edges, num_nonces,
+                    self._feeder,
+                    num_nonces,
                     mn_params,
                     scheduler=sched,
                 )
+                self._pipeline.start()
             else:
-                return self._launch_harvest_batch(
-                    prev_hash, miner_id, cur_index,
-                    nodes, edges, num_nonces,
-                    num_reads, num_sweeps,
-                    num_sweeps_per_beta,
-                )
-            self._pipeline.start()
+                self._lh_num_nonces = num_nonces
 
-        return self._pipeline.next_batch()
+        if self._pipeline is not None:
+            return self._pipeline.next_batch()
+
+        return self._launch_harvest_batch(
+            self._lh_num_nonces,
+            num_reads, num_sweeps,
+            num_sweeps_per_beta,
+        )
 
     def _launch_harvest_batch(
         self,
-        prev_hash, miner_id, cur_index,
-        nodes, edges, num_nonces,
-        num_reads, num_sweeps, num_sweeps_per_beta,
+        num_nonces, num_reads,
+        num_sweeps, num_sweeps_per_beta,
     ) -> List[Tuple[int, bytes, dimod.SampleSet]]:
         """Fallback: launch/harvest pipeline (synchronous)."""
         kernel = self.kernel
@@ -669,37 +615,35 @@ class CudaMiner(BaseMiner):
         )
 
         if kernel._preloaded:
-            nonces = self._preload_nonces
-            salts = self._preload_salts
+            models = self._preload_models
             kernel.launch_multi_nonce([], [], **mn_params)
         else:
-            h_list, J_list, nonces, salts = (
-                _generate_batch_worker(
-                    prev_hash, miner_id, cur_index,
-                    nodes, edges, num_nonces,
-                )
-            )
+            models = [
+                self._feeder.pop()
+                for _ in range(num_nonces)
+            ]
             kernel.launch_multi_nonce(
-                h_list, J_list, **mn_params,
+                [m.h for m in models],
+                [m.J for m in models],
+                **mn_params,
             )
 
-        # CPU gen overlaps GPU
-        next_h, next_J, next_nonces, next_salts = (
-            _generate_batch_worker(
-                prev_hash, miner_id, cur_index,
-                nodes, edges, num_nonces,
-            )
-        )
+        # Feeder generates in background during GPU work
+        next_models = [
+            self._feeder.pop()
+            for _ in range(num_nonces)
+        ]
 
         kernel.preload_multi_nonce(
-            next_h, next_J, **mn_params,
+            [m.h for m in next_models],
+            [m.J for m in next_models],
+            **mn_params,
         )
-        self._preload_nonces = next_nonces
-        self._preload_salts = next_salts
+        self._preload_models = next_models
 
         results = kernel.harvest_multi_nonce()
         return [
-            (nonces[i], salts[i], results[i])
+            (models[i].nonce, models[i].salt, results[i])
             for i in range(num_nonces)
         ]
 
