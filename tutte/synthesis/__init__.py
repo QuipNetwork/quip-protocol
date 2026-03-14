@@ -23,3 +23,12 @@ from .hybrid import (
     hybrid_synthesize,
     compute_tutte_hybrid,
 )
+from .parallel import (
+    parallel_synthesize_pair,
+    shutdown_pool,
+)
+from .symmetric import (
+    find_cell_automorphism,
+    pair_chords_by_symmetry,
+    build_symmetric_chord_order,
+)

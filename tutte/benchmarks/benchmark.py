@@ -55,10 +55,18 @@ NAMED_GRAPHS = [
 
 
 def _try_dwave_graphs():
-    """Add D-Wave graphs if available: Chimera C1-C16, Pegasus P1-P16, Zephyr Z(1,1)."""
+    """Add D-Wave graphs if available: Chimera C1-C16, Pegasus P1-P16, Zephyr Z(1,1).
+
+    Also includes Z(1,2) inter-cell component graphs (12n/16e series-parallel,
+    treewidth 2) which appear during hierarchical tiling of Zephyr topologies.
+    """
     extras = []
     try:
         import dwave_networkx as dnx
+        import networkx as nx
+        from tutte.lookup import load_default_table
+        from tutte.graphs.covering import try_hierarchical_partition
+
         for m in range(1, 17):
             _m = m  # capture for lambda
             extras.append((f"Cm{m}", lambda _m=_m: Graph.from_networkx(dnx.chimera_graph(_m))))
@@ -68,6 +76,26 @@ def _try_dwave_graphs():
             if G.number_of_nodes() > 0:
                 extras.append((f"Pm{m}", lambda _m=_m: Graph.from_networkx(dnx.pegasus_graph(_m))))
         extras.append(("Z1_1", lambda: Graph.from_networkx(dnx.zephyr_graph(1, 1))))
+
+        # Z(1,2) inter-cell components: 2 isomorphic series-parallel graphs
+        # that arise from hierarchical tiling of Zephyr Z(1,2).
+        def _z12_inter_cell_component():
+            z12 = Graph.from_networkx(dnx.zephyr_graph(1, 2))
+            table = load_default_table()
+            result = try_hierarchical_partition(z12, table)
+            if result is None:
+                return None
+            _, _, inter_info = result
+            inter_nx = nx.Graph()
+            for u, v in inter_info.edges:
+                inter_nx.add_edge(min(u, v), max(u, v))
+            # Both components are isomorphic; take the first
+            comp = next(iter(nx.connected_components(inter_nx)))
+            sub = inter_nx.subgraph(comp)
+            comp_edges = frozenset((min(u, v), max(u, v)) for u, v in sub.edges())
+            return Graph(nodes=frozenset(comp), edges=comp_edges)
+
+        extras.append(("Z1_2_inter_component", _z12_inter_cell_component))
     except ImportError:
         pass
     return extras
@@ -365,7 +393,7 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
               f"{_fmt(avg(b['cej'])):>10} {_fmt(avg(b['hybrid'])):>10} {_fmt(avg(b['nx'])):>10}")
 
     sys.stdout.flush()
-    return results, cej_table
+    return results, cej_table, hybrid_engine
 
 
 # ---------------------------------------------------------------------------
@@ -420,8 +448,8 @@ def compare_results(file1, file2):
 # Save / CLI
 # ---------------------------------------------------------------------------
 
-def save_results(results, cej_table=None):
-    """Save benchmark results to JSON and optionally save rainbow table."""
+def save_results(results, cej_table=None, hybrid_engine=None):
+    """Save benchmark results to JSON and optionally save rainbow/multigraph tables."""
     try:
         branch = subprocess.check_output(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -463,6 +491,13 @@ def save_results(results, cej_table=None):
         print(f"Rainbow table saved: {len(cej_table)} entries ({json_path}, {bin_path})",
               flush=True)
 
+    # Save multigraph cache from hybrid engine
+    if hybrid_engine is not None:
+        mg_cache = hybrid_engine._structural_engine._multigraph_cache
+        if len(mg_cache) > 0:
+            hybrid_engine._structural_engine.save_multigraph_cache()
+            print(f"Multigraph cache saved: {len(mg_cache)} entries", flush=True)
+
     return out_path
 
 
@@ -487,8 +522,8 @@ def main():
     if args.compare:
         compare_results(args.compare[0], args.compare[1])
     else:
-        results, cej_table = run_benchmarks(timeout_s=args.timeout, nx_timeout_s=args.nx_timeout)
-        save_results(results, cej_table)
+        results, cej_table, hybrid_engine = run_benchmarks(timeout_s=args.timeout, nx_timeout_s=args.nx_timeout)
+        save_results(results, cej_table, hybrid_engine)
 
 
 if __name__ == "__main__":

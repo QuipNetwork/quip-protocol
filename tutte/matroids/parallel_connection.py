@@ -380,6 +380,149 @@ def _compute_g_for_flat(
     return result
 
 
+def _theorem6_for_contraction(
+    lattice_N: FlatLattice,
+    f_idx: int,
+    t_m1: Dict[int, BivariateLaurentPoly],
+    t_m2: Dict[int, BivariateLaurentPoly],
+    r_N: int,
+) -> TuttePolynomial:
+    """Compute T(PC/F) for a flat F using Theorem 6 on the interval [F, top].
+
+    When we contract flat F in the parallel connection, the result is a
+    parallel connection of contracted cells over the contracted shared matroid N/F.
+
+    T(PC/F) is computed via Theorem 6 with:
+    - Lattice restricted to flats >= F (the interval [F, top] in the lattice of N)
+    - Cell contractions T(M_i/Z) for flats Z >= F (already precomputed)
+    - Rank of contracted matroid = r(N) - r(F)
+
+    The formula becomes:
+    R(PC/F; u,v) = v^{r(N/F)} · Σ_{W >= F}
+        [1 / ((v+1)^{|W|-|F|} · chi(N/W; uv))]
+        · g_1^F(W) · g_2^F(W)
+
+    where g_i^F(W) uses Mobius values mu(W, Z) in the interval [F, top]
+    and T(M_i/Z) for Z >= F, with rank adjustments.
+
+    Note: The characteristic polynomial chi(N/W) is the same regardless of F,
+    since it only depends on the interval [W, top].
+
+    Args:
+        lattice_N: Full flat lattice of N
+        f_idx: Index of flat F to contract
+        t_m1: Precomputed T(M1/Z) for all flats Z
+        t_m2: Precomputed T(M2/Z) for all flats Z
+        r_N: Rank of full matroid N
+
+    Returns:
+        TuttePolynomial for T(PC/F)
+    """
+    f_flat = lattice_N.flat_by_idx(f_idx)
+    f_rank = lattice_N.flat_rank_by_idx(f_idx)
+    f_size = len(f_flat)
+    contracted_rank = r_N - f_rank
+
+    # Get flats above F (the interval [F, top])
+    flats_above_f = lattice_N.flats_above_idx(f_idx)
+
+    # Precompute Mobius from each W >= F within the interval
+    for w_idx in flats_above_f:
+        lattice_N.precompute_mobius_from(lattice_N.flat_by_idx(w_idx))
+
+    # Common-denominator accumulation
+    result_n = BivariateLaurentPoly.zero()
+    result_d = BivariateLaurentPoly.one()
+
+    for w_idx in flats_above_f:
+        w_flat = lattice_N.flat_by_idx(w_idx)
+        w_rank = lattice_N.flat_rank_by_idx(w_idx)
+
+        # In the contracted matroid N/F:
+        # - Size of flat W/F = |W| - |F|
+        # - Rank of W/F = r(W) - r(F)
+        w_contracted_size = len(w_flat) - f_size
+        w_contracted_rank = w_rank - f_rank
+
+        # Compute g_1^F(W) and g_2^F(W) in the interval [F, top]
+        g1 = _compute_g_for_contracted_flat(lattice_N, w_idx, f_idx, t_m1, flats_above_f)
+        g2 = _compute_g_for_contracted_flat(lattice_N, w_idx, f_idx, t_m2, flats_above_f)
+
+        if g1.is_zero() or g2.is_zero():
+            continue
+
+        # Denominator: (v+1)^{|W|-|F|} · chi(N/W; uv)
+        chi_coeffs = lattice_N.characteristic_poly_coeffs(contraction_flat=w_flat)
+        chi_uv = _chi_in_uv(chi_coeffs)
+        y_pow_w = _y_power_in_uv(w_contracted_size)
+        denom_W = y_pow_w * chi_uv
+
+        # Numerator: g1(W) · g2(W)
+        numer_W = g1 * g2
+
+        # Accumulate fractions
+        result_n = result_n * denom_W + numer_W * result_d
+        result_d = result_d * denom_W
+
+    # Final: v^{contracted_rank} · result_n / result_d
+    v_r = BivariateLaurentPoly({(0, contracted_rank): 1})
+    final_n = v_r * result_n
+
+    if result_d.is_zero() or final_n.is_zero():
+        return TuttePolynomial.one()
+
+    result = final_n // result_d
+    return result.to_tutte_poly()
+
+
+def _compute_g_for_contracted_flat(
+    lattice: FlatLattice,
+    w_idx: int,
+    f_idx: int,
+    t_contracted: Dict[int, BivariateLaurentPoly],
+    interval_flats: List[int],
+) -> BivariateLaurentPoly:
+    """Compute g_i^F(W) for the contracted lattice interval [F, top].
+
+    g_i^F(W) = Σ_{Z >= W, Z in interval} mu(W,Z) · (v+1)^{|Z|-|F|} · v^{-(r(Z)-r(F))} · R(M_i/Z)
+
+    This is analogous to _compute_g_for_flat but with rank/size offsets for contraction.
+    """
+    f_size = len(lattice.flat_by_idx(f_idx))
+    f_rank = lattice.flat_rank_by_idx(f_idx)
+
+    result = BivariateLaurentPoly.zero()
+    w_flat = lattice.flat_by_idx(w_idx)
+
+    for z_idx in interval_flats:
+        z_flat = lattice.flat_by_idx(z_idx)
+        if not w_flat.issubset(z_flat):
+            continue
+
+        mu_WZ = lattice._compute_mobius(w_idx, z_idx)
+        if mu_WZ == 0:
+            continue
+
+        t_z = t_contracted.get(z_idx)
+        if t_z is None:
+            continue
+
+        # Contracted sizes/ranks relative to F
+        z_contracted_size = len(z_flat) - f_size
+        z_contracted_rank = lattice.flat_rank_by_idx(z_idx) - f_rank
+
+        # (v+1)^{|Z|-|F|} · v^{-(r(Z)-r(F))} · R(M_i/Z)
+        y_pow_z = _y_power_in_uv(z_contracted_size)
+        term = y_pow_z * t_z.shift_v(-z_contracted_rank)
+
+        if mu_WZ != 1:
+            term = mu_WZ * term
+
+        result = result + term
+
+    return result
+
+
 # =============================================================================
 # THEOREM 10: K-SUM VIA DELETION OF SHARED EDGES
 # =============================================================================

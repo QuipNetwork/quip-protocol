@@ -75,3 +75,7 @@ dwave_topologies = ["topologies/*.json.gz", "embeddings/*.json.gz"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tutte/tests"]
+markers = [
+    "slow: marks tests as slow (deselect with -m 'not slow')",
+    "perf: marks performance regression tests",
+]

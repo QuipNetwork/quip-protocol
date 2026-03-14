@@ -110,7 +110,7 @@ class AlgebraicSynthesisEngine:
     def _log(self, msg: str) -> None:
         """Print message if verbose."""
         if self.verbose:
-            print(f"[AlgSynth] {msg}")
+            print(f"[AlgSynth] {msg}", flush=True)
 
     def _get_gcd_index(self) -> GCDMinorIndex:
         """Get or compute GCD index."""

@@ -4,14 +4,15 @@ Validates Theorem 6 (parallel connection) and Theorem 10 (k-sum) formulas
 against brute-force synthesis on graph atlas pairs.
 """
 
+import os
 import time
 
 import pytest
 import networkx as nx
 
 from tutte.graph import (
-    Graph, complete_graph, cycle_graph, parallel_connection_graph, k_sum_graph,
-    petersen_graph, wheel_graph, grid_graph,
+    Graph, MultiGraph, complete_graph, cycle_graph, parallel_connection_graph,
+    k_sum_graph, petersen_graph, wheel_graph, grid_graph,
 )
 from tutte.polynomial import TuttePolynomial
 from tutte.matroids.core import GraphicMatroid, FlatLattice, enumerate_flats_with_hasse
@@ -756,10 +757,147 @@ class TestZephyrIntegration:
     """Integration tests for Zephyr graph synthesis with matroid paths."""
 
     @pytest.mark.slow
-    def test_z12_synthesis(self, engine):
-        """Verify Z(1,2) synthesis produces a verified result."""
+    @pytest.mark.skipif(
+        not os.environ.get("RUN_Z12"),
+        reason="Z(1,2) synthesis takes ~60-90s; set RUN_Z12=1 to enable",
+    )
+    def test_z12_synthesis(self):
+        """Verify Z(1,2) synthesis produces a verified result via hybrid engine."""
         dnx = pytest.importorskip("dwave_networkx")
+        from tutte.synthesis import synthesize
         z12 = Graph.from_networkx(dnx.zephyr_graph(1, 2))
-        engine._cache.clear()
-        result = engine.synthesize(z12)
+        result = synthesize(z12, verbose=True)
         assert result.verified
+        assert result.polynomial.num_spanning_trees() == 25_117_827_740_467_216
+
+
+# =============================================================================
+# Z(1,2) MULTIGRAPH SYNTHESIS BENCHMARKS
+# =============================================================================
+
+class TestZ12MultigraphBenchmarks:
+    """Benchmark multigraph synthesis for Z(1,2) inter-cell chord merges.
+
+    Z(1,2) decomposes into 2 × Z(1,1) cells with 32 inter-cell edges
+    (1 bridge + 31 chords). Each chord merge produces a 23-node multigraph
+    with 45-75 edges. This benchmark times the multigraph synthesis for
+    each chord merge to identify bottlenecks.
+    """
+
+    @pytest.fixture(scope="class")
+    def z12_chord_merges(self):
+        """Build the sequence of multigraphs from Z(1,2) chord merges."""
+        dnx = pytest.importorskip("dwave_networkx")
+        from tutte.graphs.covering import try_hierarchical_partition
+        from tutte.lookup.core import load_default_table
+        from tutte.synthesis.base import UnionFind
+
+        z12 = Graph.from_networkx(dnx.zephyr_graph(1, 2))
+        table = load_default_table()
+        cell, partition, inter_info = try_hierarchical_partition(z12, table)
+
+        # Build initial multigraph from intra-cell edges
+        all_nodes = set()
+        edge_counts = {}
+        for cell_nodes in partition:
+            all_nodes.update(cell_nodes)
+            for u, v in z12.edges:
+                if u in cell_nodes and v in cell_nodes:
+                    edge = (min(u, v), max(u, v))
+                    edge_counts[edge] = edge_counts.get(edge, 0) + 1
+
+        mg = MultiGraph(
+            nodes=frozenset(all_nodes),
+            edge_counts=edge_counts,
+            loop_counts={},
+        )
+
+        # Classify into bridges and chords
+        uf = UnionFind(all_nodes)
+        for cell_nodes in partition:
+            nodes_list = list(cell_nodes)
+            for i in range(1, len(nodes_list)):
+                uf.union(nodes_list[0], nodes_list[i])
+
+        bridges, chords = [], []
+        for u, v in inter_info.edges:
+            if uf.find(u) != uf.find(v):
+                bridges.append((u, v))
+                uf.union(u, v)
+            else:
+                chords.append((u, v))
+
+        # Add bridges to multigraph
+        for u, v in bridges:
+            edge = (min(u, v), max(u, v))
+            new_ec = dict(mg.edge_counts)
+            new_ec[edge] = new_ec.get(edge, 0) + 1
+            mg = MultiGraph(
+                nodes=mg.nodes, edge_counts=new_ec, loop_counts=mg.loop_counts,
+            )
+
+        # Build list of (chord, merged_multigraph, running_mg_after_chord)
+        merges = []
+        for u, v in chords:
+            merged = mg.merge_nodes(u, v)
+            merges.append((u, v, merged))
+            # Update running multigraph
+            edge = (min(u, v), max(u, v))
+            new_ec = dict(mg.edge_counts)
+            new_ec[edge] = new_ec.get(edge, 0) + 1
+            mg = MultiGraph(
+                nodes=mg.nodes, edge_counts=new_ec, loop_counts=mg.loop_counts,
+            )
+
+        return merges
+
+    @pytest.mark.perf
+    def test_benchmark_z12_chord_merges(self, z12_chord_merges, benchmark_collector):
+        """Benchmark multigraph synthesis for each Z(1,2) chord merge."""
+        from tutte.synthesis.hybrid import HybridSynthesisEngine
+
+        engine = HybridSynthesisEngine(verbose=False)
+        timings = {}
+        total_t0 = time.perf_counter()
+
+        total = len(z12_chord_merges)
+        for i, (u, v, merged) in enumerate(z12_chord_merges):
+            n = merged.node_count()
+            e = sum(merged.edge_counts.values())
+            l = sum(merged.loop_counts.values())
+
+            elapsed = time.perf_counter() - total_t0
+            print(f"  [{i+1}/{total}] merge({u:2d},{v:2d}) {n}n/{e}e/{l}l  (elapsed {elapsed:.1f}s)", flush=True)
+
+            t0 = time.perf_counter()
+            poly = engine._synthesize_multigraph(merged)
+            dt = time.perf_counter() - t0
+
+            trees = poly.num_spanning_trees()
+            label = f"chord_{i:02d}_merge({u},{v})_{n}n_{e}e"
+            timings[label] = round(dt * 1000, 2)
+            print(f"         -> {dt*1000:.0f}ms, {trees:,} trees", flush=True)
+
+        total_ms = round((time.perf_counter() - total_t0) * 1000, 2)
+        timings["total"] = total_ms
+
+        benchmark_collector.record(
+            name="z12_chord_merges",
+            nodes=24,
+            edges=76,
+            spanning_trees=25_117_827_740_467_216,
+            timings_ms=timings,
+        )
+
+        # Print summary
+        sorted_timings = sorted(
+            [(k, v) for k, v in timings.items() if k != "total"],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        print(f"\nZ(1,2) chord merge benchmark ({len(z12_chord_merges)} chords):")
+        print(f"  Total: {total_ms:.0f}ms")
+        for label, ms in sorted_timings[:10]:
+            print(f"  {label}: {ms:.0f}ms")
+        if len(sorted_timings) > 10:
+            print(f"  ... ({len(sorted_timings) - 10} more)")

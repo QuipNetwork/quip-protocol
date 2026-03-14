@@ -93,7 +93,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
     def _log(self, msg: str) -> None:
         """Print message if verbose."""
         if self.verbose:
-            print(f"[Synth] {msg}")
+            print(f"[Synth] {msg}", flush=True)
 
     def _promote_to_table(self, graph: Graph, cache_key: str, result: 'SynthesisResult') -> None:
         """Auto-promote a synthesized simple graph to the rainbow table.
@@ -926,8 +926,19 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
 
             self._log(f"Inter-cell matroid: rank {r_N}, {inter_graph.edge_count()} edges")
 
-            # Step 2-3: Build FlatLattice (check cache first)
+            # Guard: skip if flat lattice would be too large
+            MAX_PARALLEL_CONNECTION_FLATS = 5_000
+
+            # Early bail: high-rank matroids with many edges have enormous flat counts.
+            # Per-component flat counts of 17K each (rank 11) already make the combined
+            # case hopeless. Skip flat enumeration entirely for large matroids.
+            if r_N > 12 or inter_graph.edge_count() > 20:
+                self._log(f"Inter-cell matroid too large (rank {r_N}, {inter_graph.edge_count()} edges), skipping Theorem 6")
+                return None
+
             inter_key = inter_graph.canonical_key()
+
+            # Step 2-3: Build FlatLattice (check cache first)
             entry = self.table.entries.get(inter_key)
             if entry is not None and entry.flat_data is not None:
                 self._log("Using cached flat lattice data")
@@ -941,6 +952,10 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                     ranks=ranks,
                     upper_covers=upper_covers,
                 )
+
+            if lattice.num_flats > MAX_PARALLEL_CONNECTION_FLATS:
+                self._log(f"Flat count {lattice.num_flats} exceeds limit {MAX_PARALLEL_CONNECTION_FLATS}, skipping Theorem 6")
+                return None
 
             # Step 4: Build extended cell graphs
             inter_edge_list = list(inter_info.edges)
@@ -1115,7 +1130,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         if len(partition) != 2:
             return None
 
-        MAX_STAGED_FLATS = 50_000  # Max flats for per-component Theorem 6
+        MAX_STAGED_FLATS = 2_000  # Max flats for per-component Theorem 6
+        # theorem6_parallel_connection is O(n_flats²), so 17K flats = 297M ops — too slow
 
         try:
             # Enumerate flats for each component and pick the smallest
@@ -1231,7 +1247,11 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         2. Initialize union-find with cells pre-unioned
         3. Classify each inter-cell edge: bridge if uf.find(u) != uf.find(v)
         4. Process bridges first (cheap: poly *= x), then chords
-        5. Running multigraph updated after each edge
+        5. For 2-cell graphs with automorphism: use symmetric chord ordering
+           - Pair chords by symmetry, process pairs consecutively
+           - For each pair at symmetric state G: T(G/{e₁}) and T((G+e₁)/{e₂})
+             are computed in parallel (independent subproblems)
+        6. Running multigraph updated after each edge
 
         Args:
             base_poly: T(cell)^k polynomial
@@ -1292,11 +1312,99 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 loop_counts=current_mg.loop_counts
             )
 
-        # Process chords (T(G+e) = T(G) + T(G/{u,v}))
+        # Compare symmetric vs treewidth-minimizing chord orderings
+        symmetric_order = None
+        automorphism = None
+        tw_order = None
+
+        if len(partition) == 2 and len(chords) > 2:
+            from .symmetric import build_symmetric_chord_order
+            symmetric_order, automorphism = build_symmetric_chord_order(
+                chords, graph, partition
+            )
+            if automorphism is None:
+                symmetric_order = None
+
+        # Try treewidth-minimizing order for non-trivial chord counts
+        if len(chords) > 2:
+            from .symmetric import build_treewidth_minimizing_chord_order
+            self._log(f"Computing treewidth-minimizing chord order for {len(chords)} chords...")
+            tw_order = build_treewidth_minimizing_chord_order(
+                chords, current_mg, max_width=9
+            )
+
+        # Estimate costs and pick the best ordering
+        if tw_order is not None and symmetric_order is not None:
+            tw_cost = self._estimate_chord_order_cost(current_mg, tw_order)
+            sym_cost = self._estimate_chord_order_cost(current_mg, symmetric_order)
+            self._log(f"Chord order costs: treewidth-min={tw_cost:.0f}, symmetric={sym_cost:.0f}")
+            if tw_cost < sym_cost:
+                self._log(f"Using treewidth-minimizing chord order")
+                return self._process_chords_sequential(poly, current_mg, tw_order)
+            else:
+                self._log(f"Using symmetric chord ordering")
+                return self._process_chords_symmetric(
+                    poly, current_mg, symmetric_order, automorphism, partition
+                )
+        elif tw_order is not None:
+            self._log(f"Using treewidth-minimizing chord order")
+            return self._process_chords_sequential(poly, current_mg, tw_order)
+        elif symmetric_order is not None:
+            self._log(f"Using symmetric chord ordering")
+            return self._process_chords_symmetric(
+                poly, current_mg, symmetric_order, automorphism, partition
+            )
+
+        # Standard chord processing (T(G+e) = T(G) + T(G/{u,v}))
+        return self._process_chords_sequential(poly, current_mg, chords)
+
+    def _estimate_chord_order_cost(
+        self,
+        current_mg: MultiGraph,
+        chords: List[Tuple[int, int]],
+    ) -> float:
+        """Estimate total DP cost for a chord ordering.
+
+        Simulates the chord-by-chord process, computing tree decomposition
+        cost for each merged graph G/{u,v}.
+        """
+        from ..graphs.treewidth import compute_best_tree_decomposition, estimate_dp_cost
+
+        total_cost = 0.0
+        mg = current_mg
+
+        for u, v in chords:
+            merged = mg.merge_nodes(u, v)
+            if merged.total_loop_count() > 0:
+                merged = merged.remove_loops()
+            td = compute_best_tree_decomposition(merged, max_width=9)
+            if td is None:
+                total_cost += 1e15  # Penalty for infeasible treewidth
+            else:
+                total_cost += estimate_dp_cost(td)
+
+            # Update running multigraph
+            edge = (min(u, v), max(u, v))
+            ec = dict(mg.edge_counts)
+            ec[edge] = ec.get(edge, 0) + 1
+            mg = MultiGraph(nodes=mg.nodes, edge_counts=ec, loop_counts=mg.loop_counts)
+
+        return total_cost
+
+    def _process_chords_sequential(
+        self,
+        poly: TuttePolynomial,
+        current_mg: MultiGraph,
+        chords: List[Tuple[int, int]],
+    ) -> TuttePolynomial:
+        """Process chords sequentially (standard path)."""
+        import time as _time
         for i, (u, v) in enumerate(chords):
+            t0 = _time.perf_counter()
             merged = current_mg.merge_nodes(u, v)
             merged_poly = self._synthesize_multigraph(merged, skip_minor_search=True)
-            self._log(f"  Chord {i+1}/{len(chords)}")
+            dt = _time.perf_counter() - t0
+            self._log(f"  Chord {i+1}/{len(chords)}: ({u},{v}) -> {merged.node_count()}n/{merged.edge_count()}e  [{dt:.1f}s]")
 
             poly = poly + merged_poly
 
@@ -1311,6 +1419,122 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             )
 
         return poly
+
+    def _process_chords_symmetric(
+        self,
+        poly: TuttePolynomial,
+        current_mg: MultiGraph,
+        ordered_chords: List[Tuple[int, int]],
+        automorphism: Dict[int, int],
+        partition: List[Set[int]],
+    ) -> TuttePolynomial:
+        """Process chords using symmetric pair ordering with parallel merge computation.
+
+        For each symmetric pair (e₁, e₂) at symmetric state G:
+          T(G + e₁ + e₂) = T(G) + T(G/{e₁}) + T((G+e₁)/{e₂})
+
+        T(G/{e₁}) and T((G+e₁)/{e₂}) are independent and can be parallelized.
+        After adding both chords, the graph is symmetric again for the next pair.
+        """
+        total = len(ordered_chords)
+        i = 0
+
+        while i < total:
+            u1, v1 = ordered_chords[i]
+
+            # Check if next chord is the symmetric partner
+            if i + 1 < total:
+                u2, v2 = ordered_chords[i + 1]
+                if self._is_symmetric_partner(u1, v1, u2, v2, automorphism, partition):
+                    # Process as symmetric pair
+                    self._log(f"  Symmetric pair {i+1}-{i+2}/{total}: "
+                              f"({u1},{v1}) ↔ ({u2},{v2})")
+
+                    # Build both merged graphs (independent of each other)
+                    merge1 = current_mg.merge_nodes(u1, v1)
+
+                    # G + e₁ for the second merge
+                    edge1 = (min(u1, v1), max(u1, v1))
+                    ec_with_e1 = dict(current_mg.edge_counts)
+                    ec_with_e1[edge1] = ec_with_e1.get(edge1, 0) + 1
+                    mg_plus_e1 = MultiGraph(
+                        nodes=current_mg.nodes,
+                        edge_counts=ec_with_e1,
+                        loop_counts=current_mg.loop_counts,
+                    )
+                    merge2 = mg_plus_e1.merge_nodes(u2, v2)
+
+                    # Synthesize both merges — in parallel if large enough
+                    if self._should_parallelize(merge1, merge2):
+                        from .parallel import parallel_synthesize_pair
+                        poly1, poly2 = parallel_synthesize_pair(
+                            self, merge1, merge2, 10, True
+                        )
+                    else:
+                        poly1 = self._synthesize_multigraph(merge1, skip_minor_search=True)
+                        poly2 = self._synthesize_multigraph(merge2, skip_minor_search=True)
+
+                    # T(G + e₁ + e₂) = T(G) + T(G/{e₁}) + T((G+e₁)/{e₂})
+                    poly = poly + poly1 + poly2
+
+                    # Update running multigraph with both edges
+                    edge2 = (min(u2, v2), max(u2, v2))
+                    ec_with_both = dict(ec_with_e1)
+                    ec_with_both[edge2] = ec_with_both.get(edge2, 0) + 1
+                    current_mg = MultiGraph(
+                        nodes=current_mg.nodes,
+                        edge_counts=ec_with_both,
+                        loop_counts=current_mg.loop_counts,
+                    )
+
+                    i += 2
+                    continue
+
+            # Single chord (unpaired or not a partner)
+            merged = current_mg.merge_nodes(u1, v1)
+            merged_poly = self._synthesize_multigraph(merged, skip_minor_search=True)
+            self._log(f"  Chord {i+1}/{total}")
+
+            poly = poly + merged_poly
+
+            edge = (min(u1, v1), max(u1, v1))
+            new_edge_counts = dict(current_mg.edge_counts)
+            new_edge_counts[edge] = new_edge_counts.get(edge, 0) + 1
+            current_mg = MultiGraph(
+                nodes=current_mg.nodes,
+                edge_counts=new_edge_counts,
+                loop_counts=current_mg.loop_counts,
+            )
+
+            i += 1
+
+        return poly
+
+    def _is_symmetric_partner(
+        self,
+        u1: int, v1: int,
+        u2: int, v2: int,
+        automorphism: Dict[int, int],
+        partition: List[Set[int]],
+    ) -> bool:
+        """Check if (u2, v2) is the symmetric partner of (u1, v1) under σ."""
+        cell0 = partition[0]
+        inv = {v: k for k, v in automorphism.items()}
+
+        # Normalize: cell0 node first
+        if u1 not in cell0:
+            u1, v1 = v1, u1
+        if u2 not in cell0:
+            u2, v2 = v2, u2
+
+        # Partner of (u1∈cell0, v1∈cell1) = (σ⁻¹(v1), σ(u1))
+        partner_u = inv.get(v1)
+        partner_v = automorphism.get(u1)
+
+        if partner_u is None or partner_v is None:
+            return False
+
+        return ({u2, v2} == {partner_u, partner_v})
 
     def _synthesize_connected(
         self,

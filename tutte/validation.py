@@ -86,6 +86,9 @@ def verify_spanning_trees(graph: Graph, poly: TuttePolynomial) -> bool:
     1. Tutte polynomial: T(1,1)
     2. Kirchhoff: determinant of reduced Laplacian matrix
 
+    Uses exact integer arithmetic (sympy) for graphs with >=20 nodes to avoid
+    float64 precision loss. For smaller graphs, float is sufficient.
+
     Args:
         graph: The graph
         poly: The computed Tutte polynomial
@@ -95,14 +98,41 @@ def verify_spanning_trees(graph: Graph, poly: TuttePolynomial) -> bool:
     """
     tutte_count = poly.num_spanning_trees()
 
-    G = graph.to_networkx()
-    try:
-        kirchhoff_count = round(nx.number_of_spanning_trees(G))
-    except Exception:
-        # NetworkX can fail for certain graphs
-        return True
+    n = graph.node_count()
+    if n >= 20:
+        # Use exact integer arithmetic to avoid float precision issues
+        try:
+            kirchhoff_count = _exact_spanning_tree_count(graph)
+        except Exception:
+            return True
+    else:
+        G = graph.to_networkx()
+        try:
+            kirchhoff_count = round(nx.number_of_spanning_trees(G))
+        except Exception:
+            return True
 
     return tutte_count == kirchhoff_count
+
+
+def _exact_spanning_tree_count(graph: Graph) -> int:
+    """Compute exact spanning tree count using sympy integer determinant."""
+    from sympy import Matrix, zeros
+
+    nodes = sorted(graph.nodes)
+    n = len(nodes)
+    idx = {v: i for i, v in enumerate(nodes)}
+
+    L = zeros(n, n)
+    for u, v in graph.edges:
+        i, j = idx[u], idx[v]
+        L[i, i] += 1
+        L[j, j] += 1
+        L[i, j] -= 1
+        L[j, i] -= 1
+
+    cofactor = L[1:, 1:]
+    return int(cofactor.det())
 
 
 def count_spanning_trees_kirchhoff(graph: Graph) -> int:

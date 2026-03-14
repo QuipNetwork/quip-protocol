@@ -77,9 +77,11 @@ class BaseMultigraphSynthesizer:
         2. Parallel edges formula (for simple 2-node multi-edge graphs)
         3. Disconnected: T(G1 ∪ G2) = T(G1) × T(G2)
         4. Cut vertex factorization: T(G1 · G2) = T(G1) × T(G2)
-        5. Cache lookup (requires canonical_key)
-        6. Simple graph -> use regular synthesis
-        7. Reduce parallel edges: T(G) = T(G\\e) + T(G/e)
+        4.5 Cache lookup (requires canonical_key, but cheaper than SP/treewidth)
+        4.6 Series-parallel O(n) computation
+        4.7 Treewidth-based O(n · B(w+1)²) computation
+        5. Simple graph -> use regular synthesis
+        6. Reduce parallel edges: T(G) = T(G\\e) + T(G/e)
 
         Args:
             mg: MultiGraph to synthesize
@@ -115,33 +117,11 @@ class BaseMultigraphSynthesizer:
                     poly = poly * self._synthesize_multigraph(comp, max_depth, skip_minor_search)
                 return poly
 
-        # 4.5 Series-parallel multigraph O(n) computation
-        sp_poly = compute_sp_tutte_multigraph_if_applicable(mg)
-        if sp_poly is not None:
-            self._log(f"SP multigraph: {mg.node_count()} nodes, {mg.edge_count()} edges")
-            # Lazily compute cache_key only for caching
-            cache_key = mg.canonical_key()
-            self._multigraph_cache[cache_key] = sp_poly
-            if not hasattr(self, '_fast_hash_set'):
-                self._fast_hash_set = set()
-            self._fast_hash_set.add(mg.fast_hash())
-            return sp_poly
-
-        # 4.6 Treewidth-based O(n · B(w+1)²) computation
-        tw_poly = compute_treewidth_tutte_if_applicable(mg, max_width=6)
-        if tw_poly is not None:
-            self._log(f"Treewidth-based: {mg.node_count()} nodes, {mg.edge_count()} edges")
-            cache_key = mg.canonical_key()
-            self._multigraph_cache[cache_key] = tw_poly
-            if not hasattr(self, '_fast_hash_set'):
-                self._fast_hash_set = set()
-            self._fast_hash_set.add(mg.fast_hash())
-            return tw_poly
-
-        # 5. Two-level cache lookup: fast_hash filter before expensive canonical_key
+        # 4.5 Two-level cache lookup: fast_hash filter before expensive canonical_key
         #    _fast_hash_set contains hashes of all entries cached this session.
         #    If fast_hash not in set AND _fast_hash_set_complete is True, skip
         #    canonical_key entirely (guaranteed miss). Otherwise, fall through.
+        #    This runs BEFORE SP/treewidth DP since cache hits are O(n²) vs O(n·B(w+1)²).
         fh = mg.fast_hash()
         if not hasattr(self, '_fast_hash_set'):
             self._fast_hash_set = set()
@@ -160,6 +140,29 @@ class BaseMultigraphSynthesizer:
                 return self._multigraph_cache[cache_key]
         else:
             cache_key = None  # Guaranteed miss — skip canonical_key
+
+        # 4.6 Series-parallel multigraph O(n) computation
+        sp_poly = compute_sp_tutte_multigraph_if_applicable(mg)
+        if sp_poly is not None:
+            self._log(f"SP multigraph: {mg.node_count()} nodes, {mg.edge_count()} edges")
+            if cache_key is None:
+                cache_key = mg.canonical_key()
+            self._multigraph_cache[cache_key] = sp_poly
+            self._fast_hash_set.add(fh)
+            return sp_poly
+
+        # 4.7 Treewidth-based O(n · B(w+1)²) computation
+        # max_width=9: parent grouping optimization reduces _poly_mul calls from
+        # B(w+1)² to B(w)² per merge. TW=9 is tractable with good decomposition
+        # selection (exponential edge cost model steers toward even edge distribution).
+        tw_poly = compute_treewidth_tutte_if_applicable(mg, max_width=9)
+        if tw_poly is not None:
+            self._log(f"Treewidth-based: {mg.node_count()} nodes, {mg.edge_count()} edges")
+            if cache_key is None:
+                cache_key = mg.canonical_key()
+            self._multigraph_cache[cache_key] = tw_poly
+            self._fast_hash_set.add(fh)
+            return tw_poly
 
         self._log(f"Synthesizing multigraph: {mg.node_count()} nodes, {mg.edge_count()} edges")
 
@@ -228,6 +231,21 @@ class BaseMultigraphSynthesizer:
         for i in range(1, k):
             coeffs[(0, i)] = 1  # + y^i
         return TuttePolynomial.from_coefficients(coeffs)
+
+    def _should_parallelize(self, mg1: MultiGraph, mg2: MultiGraph) -> bool:
+        """Check if two multigraphs are large enough to benefit from parallel synthesis."""
+        if getattr(self, '_in_worker', False):
+            return False
+        MIN_NODES, MIN_EDGES = 12, 40
+        return (mg1.node_count() >= MIN_NODES and sum(mg1.edge_counts.values()) >= MIN_EDGES and
+                mg2.node_count() >= MIN_NODES and sum(mg2.edge_counts.values()) >= MIN_EDGES)
+
+    def _merge_worker_cache(self, worker_cache: Dict[str, TuttePolynomial]) -> None:
+        """Merge cache entries discovered by a worker process."""
+        for key, poly in worker_cache.items():
+            if key not in self._multigraph_cache:
+                self._multigraph_cache[key] = poly
+        self._fast_hash_set_complete = False
 
     def _handle_disconnected_multigraph(
         self,
@@ -300,8 +318,13 @@ class BaseMultigraphSynthesizer:
         # Check connectivity of u,v in G_0
         if mg_0.in_same_component(u, v):
             # Connected case: T(G) = T(G_0) + T(G_c) * y_sum
-            t_g0 = self._synthesize_multigraph(mg_0, max_depth, skip_minor_search)
-            t_gc = self._synthesize_multigraph(mg_c, max_depth, skip_minor_search)
+            if self._should_parallelize(mg_0, mg_c):
+                from .parallel import parallel_synthesize_pair
+                t_g0, t_gc = parallel_synthesize_pair(
+                    self, mg_0, mg_c, max_depth, skip_minor_search)
+            else:
+                t_g0 = self._synthesize_multigraph(mg_0, max_depth, skip_minor_search)
+                t_gc = self._synthesize_multigraph(mg_c, max_depth, skip_minor_search)
             return t_g0 + t_gc * y_sum
         else:
             # Disconnected case: T(G) = T(G_c) * (x - 1 + y_sum)

@@ -16,12 +16,12 @@ expand to standard (x, y) basis at the end.
 
 from __future__ import annotations
 
+from collections import defaultdict as _defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 from ..graph import MultiGraph
 from ..polynomial import TuttePolynomial
-
 
 # =============================================================================
 # SET PARTITION UTILITIES
@@ -41,6 +41,85 @@ def canonicalize(labels: Tuple[int, ...]) -> Tuple[int, ...]:
             next_id += 1
         result.append(mapping[lbl])
     return tuple(result)
+
+
+# =============================================================================
+# INTEGER-ENCODED PARTITIONS (fast hashing/equality for bags up to 16 elements)
+# =============================================================================
+# Encode partition as single int: 4 bits per element, supports up to 16 elements
+# with labels 0-15. This makes dict operations ~2x faster than tuple keys.
+
+def encode_partition(labels: Tuple[int, ...]) -> int:
+    """Encode canonical partition as single integer. Max 16 elements."""
+    result = len(labels)  # Store length in bits 0-3 (low nibble of "header")
+    for i, lbl in enumerate(labels):
+        result |= (lbl << (4 + i * 4))
+    return result
+
+
+def decode_partition(encoded: int) -> Tuple[int, ...]:
+    """Decode integer back to partition tuple."""
+    n = encoded & 0xF
+    return tuple((encoded >> (4 + i * 4)) & 0xF for i in range(n))
+
+
+def encode_canonicalize(labels: Tuple[int, ...]) -> int:
+    """Canonicalize and encode in one step."""
+    return encode_partition(canonicalize(labels))
+
+
+def encoded_connect(enc: int, i: int, j: int) -> int:
+    """Merge blocks containing positions i and j in encoded partition."""
+    n = enc & 0xF
+    li = (enc >> (4 + i * 4)) & 0xF
+    lj = (enc >> (4 + j * 4)) & 0xF
+    if li == lj:
+        return enc
+    target = min(li, lj)
+    replace = max(li, lj)
+    # Replace labels directly in the integer, then canonicalize
+    labels = []
+    for k in range(n):
+        lbl = (enc >> (4 + k * 4)) & 0xF
+        labels.append(target if lbl == replace else lbl)
+    return encode_canonicalize(tuple(labels))
+
+
+# Cache for encoded_connect to avoid recomputation on repeated partition+edge pairs
+_connect_cache: Dict[Tuple[int, int, int], int] = {}
+_CONNECT_CACHE_MAX = 500_000
+
+
+def encoded_connect_cached(enc: int, i: int, j: int) -> int:
+    """Cached version of encoded_connect for hot inner loops."""
+    key = (enc, i, j)
+    result = _connect_cache.get(key)
+    if result is not None:
+        return result
+    result = encoded_connect(enc, i, j)
+    if len(_connect_cache) < _CONNECT_CACHE_MAX:
+        _connect_cache[key] = result
+    return result
+
+
+def encoded_forget(enc: int, i: int) -> Tuple[bool, int]:
+    """Remove element at position i from encoded partition.
+
+    Returns (was_singleton, new_encoded).
+    """
+    n = enc & 0xF
+    lbl_i = (enc >> (4 + i * 4)) & 0xF
+    # Check if singleton
+    count = 0
+    labels = []
+    for k in range(n):
+        lbl = (enc >> (4 + k * 4)) & 0xF
+        if lbl == lbl_i:
+            count += 1
+        if k != i:
+            labels.append(lbl)
+    was_singleton = count == 1
+    return was_singleton, encode_canonicalize(tuple(labels))
 
 
 def connect(labels: Tuple[int, ...], i: int, j: int) -> Tuple[int, ...]:
@@ -97,6 +176,27 @@ def poly_mul_monomial(p: Poly, a_pow: int, b_pow: int) -> Poly:
     return {(k[0] + a_pow, k[1] + b_pow): v for k, v in p.items()}
 
 
+def _poly_scale(p: Poly, c: int) -> Poly:
+    """Multiply polynomial by integer constant."""
+    if c == 0:
+        return {}
+    return {k: v * c for k, v in p.items()}
+
+
+def _poly_content_key(p: Poly) -> frozenset:
+    """Content-based identity key for polynomial deduplication."""
+    return frozenset(p.items())
+
+
+def _power_1_plus_b(k: int) -> Poly:
+    """Compute (1 + b)^k = sum C(k,j) b^j via binomial theorem.
+
+    Used for batch introduction of k parallel edges.
+    """
+    from math import comb
+    return {(0, j): comb(k, j) for j in range(k + 1)}
+
+
 # =============================================================================
 # TREE DECOMPOSITION
 # =============================================================================
@@ -118,130 +218,186 @@ class TreeDecomposition:
     width: int
 
 
-def compute_tree_decomposition(mg: MultiGraph, max_width: int = 6) -> Optional[TreeDecomposition]:
-    """Compute tree decomposition via greedy min-fill-in elimination.
+BELL = [1, 1, 2, 5, 15, 52, 203, 877, 4140, 21147, 115975, 678570, 4213597]
 
-    Returns None if treewidth exceeds max_width.
+
+def _elimination_ordering(
+    adj: Dict[int, Set[int]],
+    nodes: List[int],
+    heuristic: str = "minfill",
+    seed: Optional[int] = None,
+    max_width: int = 20,
+) -> Optional[List[int]]:
+    """Compute elimination ordering using the given heuristic.
+
+    Heuristics:
+    - "minfill": Min fill-in, first-found tie-break (original behavior)
+    - "minfill_random": Min fill-in, random tie-break using seed
+    - "mindegree": Min degree (fewest neighbors)
+    - "minfill_degree": Min fill-in, then min degree tie-break
+
+    Returns None if any bag would exceed max_width + 1.
     """
-    if not mg.nodes:
-        return None
+    import random as _random
 
-    nodes = sorted(mg.nodes)
     n = len(nodes)
-
-    if n == 1:
-        # Single node - trivial decomposition
-        bag = frozenset(nodes)
-        node = nodes[0]
-        loop_edges = []
-        if node in mg.loop_counts:
-            loop_edges.append((node, node, mg.loop_counts[node]))
-        return TreeDecomposition(
-            bags=[bag],
-            tree_adj={0: set()},
-            root=0,
-            bag_edges={0: loop_edges},
-            width=0,
-        )
-
-    # Build simple adjacency (ignore multiplicities for decomposition)
-    adj: Dict[int, Set[int]] = {v: set() for v in nodes}
-    for (u, v) in mg.edge_counts:
-        adj[u].add(v)
-        adj[v].add(u)
-
-    # Greedy elimination ordering by min-fill-in
     remaining = set(nodes)
     elim_order = []
-    elim_bags: List[frozenset] = []  # bag for each eliminated vertex
-    elim_adj = {v: set(adj[v]) for v in nodes}  # mutable copy
+    elim_adj = {v: set(adj[v]) for v in nodes}
+
+    rng = _random.Random(seed) if seed is not None else None
 
     for _ in range(n):
-        # Pick vertex with minimum fill-in edges
-        best_v = None
-        best_fill = float('inf')
-        for v in remaining:
-            neighbors_in = elim_adj[v] & remaining
-            # Count fill-in edges needed
-            fill = 0
-            nb_list = sorted(neighbors_in)
-            for i in range(len(nb_list)):
-                for j in range(i + 1, len(nb_list)):
-                    if nb_list[j] not in elim_adj[nb_list[i]]:
-                        fill += 1
-            if fill < best_fill:
-                best_fill = fill
-                best_v = v
+        if heuristic == "mindegree":
+            # Pick vertex with fewest remaining neighbors
+            best_v = None
+            best_deg = float('inf')
+            for v in remaining:
+                deg = len(elim_adj[v] & remaining)
+                if deg < best_deg:
+                    best_deg = deg
+                    best_v = v
+        elif heuristic == "minfill_random":
+            # Min fill-in with random tie-breaking
+            best_fill = float('inf')
+            tied = []
+            for v in remaining:
+                neighbors_in = elim_adj[v] & remaining
+                fill = 0
+                nb_list = list(neighbors_in)
+                for i in range(len(nb_list)):
+                    for j in range(i + 1, len(nb_list)):
+                        if nb_list[j] not in elim_adj[nb_list[i]]:
+                            fill += 1
+                if fill < best_fill:
+                    best_fill = fill
+                    tied = [v]
+                elif fill == best_fill:
+                    tied.append(v)
+            best_v = rng.choice(tied) if rng else tied[0]
+        elif heuristic == "minfill_degree":
+            # Min fill-in, then min degree tie-break
+            best_v = None
+            best_fill = float('inf')
+            best_deg = float('inf')
+            for v in remaining:
+                neighbors_in = elim_adj[v] & remaining
+                fill = 0
+                nb_list = list(neighbors_in)
+                for i in range(len(nb_list)):
+                    for j in range(i + 1, len(nb_list)):
+                        if nb_list[j] not in elim_adj[nb_list[i]]:
+                            fill += 1
+                deg = len(neighbors_in)
+                if fill < best_fill or (fill == best_fill and deg < best_deg):
+                    best_fill = fill
+                    best_deg = deg
+                    best_v = v
+        else:
+            # Default: minfill with first-found tie-break
+            best_v = None
+            best_fill = float('inf')
+            for v in remaining:
+                neighbors_in = elim_adj[v] & remaining
+                fill = 0
+                nb_list = list(neighbors_in)
+                for i in range(len(nb_list)):
+                    for j in range(i + 1, len(nb_list)):
+                        if nb_list[j] not in elim_adj[nb_list[i]]:
+                            fill += 1
+                if fill < best_fill:
+                    best_fill = fill
+                    best_v = v
 
-        # Create bag = {v} union neighbors still remaining
+        # Check bag size
         neighbors_in = elim_adj[best_v] & remaining
-        bag = frozenset({best_v} | neighbors_in)
-
-        if len(bag) > max_width + 1:
-            return None  # Treewidth too high
+        bag_size = 1 + len(neighbors_in)
+        if bag_size > max_width + 1:
+            return None
 
         elim_order.append(best_v)
-        elim_bags.append(bag)
 
-        # Make neighbors of v a clique (fill-in)
-        nb_list = sorted(neighbors_in)
+        # Make neighbors a clique (fill-in)
+        nb_list = list(neighbors_in)
         for i in range(len(nb_list)):
             for j in range(i + 1, len(nb_list)):
                 u, w = nb_list[i], nb_list[j]
                 elim_adj[u].add(w)
                 elim_adj[w].add(u)
 
-        # Remove v from remaining
+        # Remove v
         remaining.remove(best_v)
         for nb in list(elim_adj[best_v]):
             elim_adj[nb].discard(best_v)
 
-    # Build tree: parent of bag(i) = first bag after i that shares a vertex
-    elim_index = {v: i for i, v in enumerate(elim_order)}
+    return elim_order
 
-    # Remove duplicate/subset bags
-    # Keep track of bag indices and build tree
+
+def _build_decomposition(
+    mg: MultiGraph,
+    elim_order: List[int],
+    adj: Dict[int, Set[int]],
+) -> TreeDecomposition:
+    """Build a TreeDecomposition from a multigraph and elimination ordering."""
+    nodes = sorted(mg.nodes)
+    n = len(nodes)
+
+    # Replay elimination to get bags
+    remaining = set(nodes)
+    elim_bags: List[frozenset] = []
+    elim_adj = {v: set(adj[v]) for v in nodes}
+
+    for v in elim_order:
+        neighbors_in = elim_adj[v] & remaining
+        bag = frozenset({v} | neighbors_in)
+        elim_bags.append(bag)
+
+        # Fill-in
+        nb_list = list(neighbors_in)
+        for i in range(len(nb_list)):
+            for j in range(i + 1, len(nb_list)):
+                u, w = nb_list[i], nb_list[j]
+                elim_adj[u].add(w)
+                elim_adj[w].add(u)
+
+        remaining.remove(v)
+        for nb in list(elim_adj[v]):
+            elim_adj[nb].discard(v)
+
+    # Build tree structure
+    elim_index = {v: i for i, v in enumerate(elim_order)}
     bag_list = list(elim_bags)
     tree_adj: Dict[int, Set[int]] = {i: set() for i in range(n)}
 
-    # Parent of bag i = the bag of the neighbor of elim_order[i] that was
-    # eliminated earliest after i
     for i in range(n - 1):
         v = elim_order[i]
         bag = bag_list[i]
-        # Find parent: bag with smallest index > i that overlaps with bag - {v}
         remaining_vertices = bag - {v}
         if not remaining_vertices:
-            # Isolated vertex, connect to next bag
             tree_adj[i].add(i + 1)
             tree_adj[i + 1].add(i)
             continue
-
-        # The parent bag is the bag where the first remaining vertex gets eliminated
         parent_idx = min(elim_index[u] for u in remaining_vertices)
         tree_adj[i].add(parent_idx)
         tree_adj[parent_idx].add(i)
 
-    root = n - 1  # Last eliminated vertex's bag is root
+    root = n - 1
 
     # Assign edges to bags
     bag_edges: Dict[int, List[Tuple[int, int, int]]] = {i: [] for i in range(n)}
 
     for (u, v), mult in mg.edge_counts.items():
-        # Assign to the bag where the later-eliminated of u,v is eliminated
         idx_u, idx_v = elim_index[u], elim_index[v]
         bag_idx = max(idx_u, idx_v)
-        # Verify both endpoints are in the bag
         if u in bag_list[bag_idx] and v in bag_list[bag_idx]:
             bag_edges[bag_idx].append((u, v, mult))
         else:
-            # Shouldn't happen with correct tree decomposition, but find a valid bag
             for i in range(n):
                 if u in bag_list[i] and v in bag_list[i]:
                     bag_edges[i].append((u, v, mult))
                     break
 
-    # Assign loops to bags
+    # Assign loops
     for node, count in mg.loop_counts.items():
         bag_idx = elim_index[node]
         bag_edges[bag_idx].append((node, node, count))
@@ -257,13 +413,218 @@ def compute_tree_decomposition(mg: MultiGraph, max_width: int = 6) -> Optional[T
     )
 
 
+def estimate_dp_cost(td: TreeDecomposition) -> float:
+    """Estimate the DP cost of a tree decomposition without running the full DP.
+
+    Cost model: for each bag, Bell(bag_size) * 1.6^n_edges for edge introduction
+    (exponential because each edge can roughly double partition count),
+    plus Bell(bag_size) * Bell(child_bag_size) for each child merge.
+    """
+    n_bags = len(td.bags)
+
+    # Build children from rooted tree
+    children: Dict[int, List[int]] = {i: [] for i in range(n_bags)}
+    visited: Set[int] = set()
+
+    def build_children(bag_idx: int):
+        visited.add(bag_idx)
+        for nb in td.tree_adj[bag_idx]:
+            if nb not in visited:
+                children[bag_idx].append(nb)
+                build_children(nb)
+
+    build_children(td.root)
+
+    cost = 0.0
+    for i in range(n_bags):
+        bag_size = len(td.bags[i])
+        b = BELL[min(bag_size, len(BELL) - 1)]
+        n_edges = len(td.bag_edges[i])
+        # Edge introduction cost: exponential in edges (each edge can
+        # roughly double active partition count; 1.6 accounts for edges
+        # between already-connected vertices not creating new partitions)
+        cost += b * (1.6 ** n_edges)
+        # Child merge cost: Cartesian product of parent and child tables
+        for child in children[i]:
+            child_size = len(td.bags[child])
+            child_b = BELL[min(child_size, len(BELL) - 1)]
+            cost += b * child_b
+
+    return cost
+
+
+def _redistribute_edges(td: TreeDecomposition, mg: MultiGraph) -> TreeDecomposition:
+    """Redistribute edges between bags to minimize DP cost.
+
+    For each edge, find all bags containing both endpoints and assign to the
+    bag that minimizes the total estimated cost (fewest edges in the bag).
+    """
+    n_bags = len(td.bags)
+
+    # Find all valid bags for each edge
+    edge_candidates: Dict[Tuple[int, int, int], List[int]] = {}
+    all_edges = []
+    for bag_idx, edges in td.bag_edges.items():
+        for e in edges:
+            if e not in edge_candidates:
+                edge_candidates[e] = []
+                all_edges.append(e)
+
+    # For each edge, find ALL bags that contain both endpoints
+    for e in all_edges:
+        u, v, mult = e
+        edge_candidates[e] = []
+        for i in range(n_bags):
+            if u in td.bags[i] and v in td.bags[i]:
+                edge_candidates[e].append(i)
+
+    # If every edge has only one candidate bag, nothing to redistribute
+    if all(len(cands) == 1 for cands in edge_candidates.values()):
+        return td
+
+    # Greedy assignment: assign each edge to the candidate bag with fewest
+    # already-assigned edges, weighted by Bell number of bag size
+    new_bag_edges: Dict[int, List[Tuple[int, int, int]]] = {i: [] for i in range(n_bags)}
+    bag_edge_count = {i: 0 for i in range(n_bags)}
+
+    # Sort edges so edges with fewer candidate bags are assigned first
+    sorted_edges = sorted(all_edges, key=lambda e: len(edge_candidates[e]))
+
+    for e in sorted_edges:
+        candidates = edge_candidates[e]
+        if len(candidates) == 1:
+            best = candidates[0]
+        else:
+            # Pick candidate that minimizes Bell(bag_size) * 1.6^(current_edges + 1)
+            best = min(
+                candidates,
+                key=lambda i: BELL[min(len(td.bags[i]), len(BELL) - 1)] * (1.6 ** (bag_edge_count[i] + 1)),
+            )
+        new_bag_edges[best].append(e)
+        bag_edge_count[best] += 1
+
+    return TreeDecomposition(
+        bags=td.bags,
+        tree_adj=td.tree_adj,
+        root=td.root,
+        bag_edges=new_bag_edges,
+        width=td.width,
+    )
+
+
+def compute_tree_decomposition(mg: MultiGraph, max_width: int = 20) -> Optional[TreeDecomposition]:
+    """Compute tree decomposition via greedy min-fill-in elimination.
+
+    Returns None if treewidth exceeds max_width.
+    """
+    if not mg.nodes:
+        return None
+
+    nodes = sorted(mg.nodes)
+    n = len(nodes)
+
+    if n == 1:
+        bag = frozenset(nodes)
+        node = nodes[0]
+        loop_edges = []
+        if node in mg.loop_counts:
+            loop_edges.append((node, node, mg.loop_counts[node]))
+        return TreeDecomposition(
+            bags=[bag],
+            tree_adj={0: set()},
+            root=0,
+            bag_edges={0: loop_edges},
+            width=0,
+        )
+
+    # Build simple adjacency
+    adj: Dict[int, Set[int]] = {v: set() for v in nodes}
+    for (u, v) in mg.edge_counts:
+        adj[u].add(v)
+        adj[v].add(u)
+
+    ordering = _elimination_ordering(adj, nodes, heuristic="minfill", max_width=max_width)
+    if ordering is None:
+        return None
+
+    return _build_decomposition(mg, ordering, adj)
+
+
+def compute_best_tree_decomposition(
+    mg: MultiGraph, max_width: int = 20
+) -> Optional[TreeDecomposition]:
+    """Try multiple elimination orderings and return the best decomposition.
+
+    Strategy: minfill + minfill_degree + 20 random seeds, select by minimum
+    treewidth then minimum estimated DP cost. Apply edge redistribution to
+    the winner to further reduce cost.
+
+    Overhead: ~20ms for 23-node graphs (vs seconds-minutes for the DP).
+    """
+    if not mg.nodes:
+        return None
+
+    nodes = sorted(mg.nodes)
+    n = len(nodes)
+
+    if n == 1:
+        return compute_tree_decomposition(mg, max_width)
+
+    # Build simple adjacency
+    adj: Dict[int, Set[int]] = {v: set() for v in nodes}
+    for (u, v) in mg.edge_counts:
+        adj[u].add(v)
+        adj[v].add(u)
+
+    best_td: Optional[TreeDecomposition] = None
+    best_cost: float = float('inf')
+
+    def _consider(td: TreeDecomposition):
+        nonlocal best_td, best_cost
+        if td.width > max_width:
+            return
+        if best_td is not None and td.width > best_td.width:
+            return
+        cost = estimate_dp_cost(td)
+        if best_td is None or td.width < best_td.width or cost < best_cost:
+            best_td = td
+            best_cost = cost
+
+    # minfill deterministic (good baseline)
+    ordering = _elimination_ordering(adj, nodes, heuristic="minfill", max_width=max_width)
+    if ordering is not None:
+        _consider(_build_decomposition(mg, ordering, adj))
+
+    # minfill_degree deterministic (min fill-in with min degree tie-break)
+    ordering = _elimination_ordering(adj, nodes, heuristic="minfill_degree", max_width=max_width)
+    if ordering is not None:
+        _consider(_build_decomposition(mg, ordering, adj))
+
+    # minfill with random tie-breaking
+    # Use more seeds for higher treewidth graphs where decomposition quality matters more
+    n_seeds = 50 if (best_td is not None and best_td.width >= 8) else 20
+    for seed in range(n_seeds):
+        ordering = _elimination_ordering(
+            adj, nodes, heuristic="minfill_random", seed=seed, max_width=max_width
+        )
+        if ordering is not None:
+            _consider(_build_decomposition(mg, ordering, adj))
+
+    # Apply edge redistribution to minimize DP cost
+    if best_td is not None:
+        best_td = _redistribute_edges(best_td, mg)
+
+    return best_td
+
+
 # =============================================================================
 # DP ON TREE DECOMPOSITION
 # =============================================================================
 
-# DP table: maps partition (tuple of ints) to polynomial in (a, b) basis
+# DP table: maps encoded partition (int) to polynomial in (a, b) basis
 # where a = (x-1), b = (y-1).
-DPTable = Dict[Tuple[int, ...], Poly]
+# Encoded partitions use 4 bits per element for fast hashing/equality.
+DPTable = Dict[int, Poly]
 
 
 def compute_treewidth_tutte(td: TreeDecomposition, mg: MultiGraph) -> TuttePolynomial:
@@ -314,10 +675,10 @@ def compute_treewidth_tutte(td: TreeDecomposition, mg: MultiGraph) -> TuttePolyn
         """
         bag = td.bags[bag_idx]
         bag_verts = sorted(bag)
+        vert_to_idx = {v: i for i, v in enumerate(bag_verts)}
 
         # Start with trivial table: all singletons, coefficient 1
-        # Each vertex starts in its own block
-        init_partition = canonicalize(tuple(range(len(bag_verts))))
+        init_partition = encode_partition(canonicalize(tuple(range(len(bag_verts)))))
         table: DPTable = {init_partition: poly_one()}
 
         # Introduce edges assigned to this bag
@@ -325,92 +686,125 @@ def compute_treewidth_tutte(td: TreeDecomposition, mg: MultiGraph) -> TuttePolyn
             if u not in bag or v not in bag:
                 continue
 
-            idx_u = bag_verts.index(u)
-            idx_v = bag_verts.index(v) if u != v else idx_u
+            idx_u = vert_to_idx[u]
+            idx_v = vert_to_idx[v] if u != v else idx_u
 
-            for _ in range(mult):
+            if u == v:
+                # Loop: all copies just multiply by (1+b)^mult
+                # Each loop copy: absent (weight 1) or present (weight b)
+                # k copies: (1+b)^k
+                loop_factor = _power_1_plus_b(mult)
                 new_table: DPTable = {}
                 for partition, poly in table.items():
-                    # Edge absent: partition unchanged, poly unchanged
-                    new_table[partition] = poly_add(
-                        new_table.get(partition, poly_zero()), poly
-                    )
-
-                    # Edge present: connect u,v in partition, multiply by b=(y-1)
-                    if u == v:
-                        # Loop: connect(u,u) is no-op, just multiply by b
-                        new_poly = poly_mul_monomial(poly, 0, 1)
+                    new_poly = _poly_mul(poly, loop_factor)
+                    if new_poly:
                         new_table[partition] = poly_add(
                             new_table.get(partition, poly_zero()), new_poly
                         )
+                table = new_table
+            elif mult == 1:
+                # Single edge: original logic (most common case)
+                new_table: DPTable = {}
+                for partition, poly in table.items():
+                    # Edge absent
+                    if partition in new_table:
+                        new_table[partition] = poly_add(new_table[partition], poly)
                     else:
-                        new_part = connect(partition, idx_u, idx_v)
-                        new_poly = poly_mul_monomial(poly, 0, 1)
-                        new_table[new_part] = poly_add(
-                            new_table.get(new_part, poly_zero()), new_poly
+                        new_table[partition] = poly
+                    # Edge present: connect u,v, multiply by b
+                    new_part = encoded_connect_cached(partition, idx_u, idx_v)
+                    new_poly = poly_mul_monomial(poly, 0, 1)
+                    if new_part in new_table:
+                        new_table[new_part] = poly_add(new_table[new_part], new_poly)
+                    else:
+                        new_table[new_part] = new_poly
+                table = new_table
+            else:
+                # Batch introduction of k parallel edges (Optimization B)
+                # For k parallel edges between u,v:
+                # - u,v already connected: weight = (1+b)^k
+                # - u,v disconnected: unchanged with weight 1, or
+                #   connected with weight (1+b)^k - 1
+                factor_full = _power_1_plus_b(mult)
+                factor_minus_1 = poly_add(factor_full, {(0, 0): -1})
+                new_table: DPTable = {}
+                for partition, poly in table.items():
+                    connected_part = encoded_connect_cached(partition, idx_u, idx_v)
+                    if connected_part == partition:
+                        # u,v already connected: weight = (1+b)^k
+                        new_poly = _poly_mul(poly, factor_full)
+                        if new_poly:
+                            new_table[partition] = poly_add(
+                                new_table.get(partition, poly_zero()), new_poly
+                            )
+                    else:
+                        # All k absent: partition unchanged, weight 1
+                        new_table[partition] = poly_add(
+                            new_table.get(partition, poly_zero()), poly
                         )
+                        # >=1 present: connect u,v, weight (1+b)^k - 1
+                        new_poly = _poly_mul(poly, factor_minus_1)
+                        if new_poly:
+                            new_table[connected_part] = poly_add(
+                                new_table.get(connected_part, poly_zero()), new_poly
+                            )
                 table = new_table
 
         # Process children: merge child tables, then forget child-only vertices
         for child_idx in children[bag_idx]:
             child_table, child_verts = process_bag(child_idx)
-            child_bag = td.bags[child_idx]
 
-            # Forget vertices in child but not in current bag
-            verts_to_forget = [v for v in child_verts if v not in bag]
+            # Precompute forget indices (positions in child_verts to remove,
+            # adjusted for earlier removals)
+            forget_indices = []
+            offset = 0
+            for pos, v in enumerate(child_verts):
+                if v not in bag:
+                    forget_indices.append(pos - offset)
+                    offset += 1
 
             # Forget vertices from child table
             forgotten_table: DPTable = {}
             for partition, poly in child_table.items():
-                current_verts = list(child_verts)
-                current_part = partition
+                current_enc = partition
                 current_poly = poly
 
-                for v in verts_to_forget:
-                    if v not in current_verts:
-                        continue
-                    idx = current_verts.index(v)
-                    was_singleton, new_part = forget(current_part, idx)
+                for idx in forget_indices:
+                    was_singleton, new_enc = encoded_forget(current_enc, idx)
                     if was_singleton:
-                        # Completed component: multiply by a*b = (x-1)*(y-1)
                         current_poly = poly_mul_monomial(current_poly, 1, 1)
-                    current_part = new_part
-                    current_verts = current_verts[:idx] + current_verts[idx+1:]
+                    current_enc = new_enc
 
-                forgotten_table[current_part] = poly_add(
-                    forgotten_table.get(current_part, poly_zero()),
-                    current_poly,
-                )
+                if current_enc in forgotten_table:
+                    forgotten_table[current_enc] = poly_add(
+                        forgotten_table[current_enc], current_poly)
+                else:
+                    forgotten_table[current_enc] = current_poly
 
             # Now child table has same vertex set as shared vertices
-            # Merge with current table via join
-            # The shared vertices must be in the same order
             shared_verts = [v for v in child_verts if v in bag]
 
-            # Remap child partition to match parent's vertex ordering
+            # Merge with current table
             table = _merge_tables(table, forgotten_table, bag_verts, shared_verts)
 
         return table, bag_verts
 
     root_table, root_verts = process_bag(td.root)
 
-    # Forget all remaining vertices in root
+    # Forget all remaining vertices in root (indices 0,0,0,... since we
+    # always forget position 0 after each removal shifts everything down)
+    n_root = len(root_verts)
     final_poly = poly_zero()
     for partition, poly in root_table.items():
-        current_verts = list(root_verts)
-        current_part = partition
+        current_enc = partition
         current_poly = poly
 
-        for v in list(current_verts):
-            idx = current_verts.index(v)
-            was_singleton, new_part = forget(current_part, idx)
+        for _ in range(n_root):
+            was_singleton, new_enc = encoded_forget(current_enc, 0)
             if was_singleton:
-                # Completed component: multiply by a*b = (x-1)*(y-1)
                 current_poly = poly_mul_monomial(current_poly, 1, 1)
-            current_part = new_part
-            current_verts = current_verts[:idx] + current_verts[idx+1:]
+            current_enc = new_enc
 
-        # current_part should now be empty
         final_poly = poly_add(final_poly, current_poly)
 
     # We computed sum_A a^{k(A)} * b^{|A|+k(A)} where a=(x-1), b=(y-1).
@@ -447,6 +841,22 @@ def compute_treewidth_tutte(td: TreeDecomposition, mg: MultiGraph) -> TuttePolyn
     return _convert_ab_to_xy(tutte_poly)
 
 
+def _child_connectivity_key(child_enc: int, n_shared: int) -> Tuple[Tuple[int, int], ...]:
+    """Extract which shared vertices are in the same block (connectivity pattern).
+
+    Returns tuple of (i,j) pairs where child_part[i] == child_part[j].
+    For n_shared vertices, there are at most Bell(n_shared) unique patterns.
+    """
+    pairs = []
+    for i in range(n_shared):
+        li = (child_enc >> (4 + i * 4)) & 0xF
+        for j in range(i + 1, n_shared):
+            lj = (child_enc >> (4 + j * 4)) & 0xF
+            if li == lj:
+                pairs.append((i, j))
+    return tuple(pairs)
+
+
 def _merge_tables(
     parent_table: DPTable,
     child_table: DPTable,
@@ -460,8 +870,9 @@ def _merge_tables(
     subtree. This connectivity is applied to the parent partition by merging
     blocks of shared vertices that the child says are connected.
 
-    Every (parent_part, child_part) pair is combined: start with parent_part,
-    then force-merge blocks as dictated by child_part.
+    Optimization: group child partitions by connectivity pattern on shared
+    vertices and sum their polynomials first. This reduces the Cartesian
+    product from |parent| * |child| to |parent| * Bell(|shared|).
     """
     if not shared_verts:
         # No shared vertices: just multiply polynomials
@@ -476,49 +887,130 @@ def _merge_tables(
                 result[partition] = poly_add(result.get(partition, poly_zero()), new_poly)
         return result
 
-    shared_positions_in_parent = [parent_verts.index(v) for v in shared_verts]
+    parent_vert_idx = {v: i for i, v in enumerate(parent_verts)}
+    shared_positions_in_parent = [parent_vert_idx[v] for v in shared_verts]
+    n_shared = len(shared_verts)
+
+    # Group child entries by connectivity pattern on shared vertices
+    child_groups: Dict[Tuple[Tuple[int, int], ...], Poly] = _defaultdict(poly_zero)
+    for child_enc, child_poly in child_table.items():
+        conn_key = _child_connectivity_key(child_enc, n_shared)
+        child_groups[conn_key] = poly_add(child_groups[conn_key], child_poly)
 
     result: DPTable = {}
 
-    for parent_part, parent_poly in parent_table.items():
-        for child_part, child_poly in child_table.items():
-            # Start with parent partition, apply child's connectivity
-            merged = list(parent_part)
-            for ci in range(len(shared_verts)):
-                for cj in range(ci + 1, len(shared_verts)):
-                    if child_part[ci] == child_part[cj]:
-                        # Child says these shared verts are connected
-                        pi = shared_positions_in_parent[ci]
-                        pj = shared_positions_in_parent[cj]
-                        old_label = merged[pj]
-                        new_label = merged[pi]
-                        if old_label != new_label:
-                            target = min(old_label, new_label)
-                            replace = max(old_label, new_label)
-                            merged = [target if l == replace else l for l in merged]
+    # Fast path: if only one connectivity group with empty key (all disconnected),
+    # no merging needed — just multiply each parent entry by the summed child poly.
+    # Dedup: group parents by polynomial identity to avoid redundant _poly_mul calls.
+    if len(child_groups) == 1 and () in child_groups:
+        child_poly = child_groups[()]
+        poly_groups: Dict[frozenset, List[int]] = {}
+        poly_by_key: Dict[frozenset, Poly] = {}
+        for parent_enc, parent_poly in parent_table.items():
+            pk = _poly_content_key(parent_poly)
+            if pk in poly_groups:
+                poly_groups[pk].append(parent_enc)
+            else:
+                poly_groups[pk] = [parent_enc]
+                poly_by_key[pk] = parent_poly
 
-            merged_part = canonicalize(tuple(merged))
-            new_poly = _poly_mul(parent_poly, child_poly)
+        for pk, encs in poly_groups.items():
+            new_poly = _poly_mul(poly_by_key[pk], child_poly)
             if new_poly:
-                result[merged_part] = poly_add(
-                    result.get(merged_part, poly_zero()), new_poly
-                )
+                for enc in encs:
+                    result[enc] = new_poly  # Safe: new_poly is never mutated in-place
+        return result
+
+    # Parent grouping optimization: for each conn_key, many parent partitions
+    # map to the same merged_enc. By distributive law, sum parent polys first
+    # (cheap O(N) poly_add), then multiply once (expensive O(N²) _poly_mul).
+    # Reduces _poly_mul calls from |parent| * |child_groups| to
+    # |unique_outputs| * |child_groups| (e.g. 4,140 -> 877 for TW=7).
+    for conn_key, child_poly in child_groups.items():
+        # Group parent partitions by their output merged_enc
+        if not conn_key:
+            # Poly dedup: group parents by polynomial value.
+            # Parent grouping has no benefit here (output == input),
+            # but many parents share the same polynomial.
+            poly_groups_inner: Dict[frozenset, List[int]] = {}
+            poly_by_key_inner: Dict[frozenset, Poly] = {}
+            for parent_enc, parent_poly in parent_table.items():
+                pk = _poly_content_key(parent_poly)
+                if pk in poly_groups_inner:
+                    poly_groups_inner[pk].append(parent_enc)
+                else:
+                    poly_groups_inner[pk] = [parent_enc]
+                    poly_by_key_inner[pk] = parent_poly
+
+            for pk, encs in poly_groups_inner.items():
+                new_poly = _poly_mul(poly_by_key_inner[pk], child_poly)
+                if new_poly:
+                    for enc in encs:
+                        if enc in result:
+                            result[enc] = poly_add(result[enc], new_poly)
+                        else:
+                            result[enc] = new_poly
+            continue  # Skip the generic multiply loop below
+
+        parents_by_output: Dict[int, Poly] = {}
+        for parent_enc, parent_poly in parent_table.items():
+            parent_labels = list(decode_partition(parent_enc))
+            merged = list(parent_labels)
+            for ci, cj in conn_key:
+                pi = shared_positions_in_parent[ci]
+                pj = shared_positions_in_parent[cj]
+                old_label = merged[pj]
+                new_label = merged[pi]
+                if old_label != new_label:
+                    target = min(old_label, new_label)
+                    replace = max(old_label, new_label)
+                    merged = [target if l == replace else l for l in merged]
+            merged_enc = encode_canonicalize(tuple(merged))
+
+            if merged_enc in parents_by_output:
+                parents_by_output[merged_enc] = poly_add(
+                    parents_by_output[merged_enc], parent_poly)
+            else:
+                parents_by_output[merged_enc] = parent_poly
+
+        # Now multiply once per unique output (expensive _poly_mul)
+        for merged_enc, summed_parent in parents_by_output.items():
+            new_poly = _poly_mul(summed_parent, child_poly)
+            if new_poly:
+                if merged_enc in result:
+                    result[merged_enc] = poly_add(result[merged_enc], new_poly)
+                else:
+                    result[merged_enc] = new_poly
 
     return result
 
 
 def _poly_mul(p: Poly, q: Poly) -> Poly:
-    """Multiply two polynomials."""
+    """Multiply two polynomials.
+
+    Fast paths for common cases: monomial * poly, scalar * poly.
+    """
     if not p or not q:
         return {}
-    result: Poly = {}
+    # Fast path: one side is a monomial (very common in DP)
+    lp, lq = len(p), len(q)
+    if lp == 1:
+        (a1, b1), c1 = next(iter(p.items()))
+        if a1 == 0 and b1 == 0:
+            # Scalar multiply
+            return {k: v * c1 for k, v in q.items()}
+        return {(a1 + a2, b1 + b2): c1 * c2 for (a2, b2), c2 in q.items()}
+    if lq == 1:
+        (a2, b2), c2 = next(iter(q.items()))
+        if a2 == 0 and b2 == 0:
+            return {k: v * c2 for k, v in p.items()}
+        return {(a1 + a2, b1 + b2): c1 * c2 for (a1, b1), c1 in p.items()}
+    # General case: use defaultdict to avoid per-iteration get/del overhead
+    result: Dict[Tuple[int, int], int] = _defaultdict(int)
     for (a1, b1), c1 in p.items():
         for (a2, b2), c2 in q.items():
-            key = (a1 + a2, b1 + b2)
-            result[key] = result.get(key, 0) + c1 * c2
-            if result[key] == 0:
-                del result[key]
-    return result
+            result[(a1 + a2, b1 + b2)] += c1 * c2
+    return {k: v for k, v in result.items() if v != 0}
 
 
 def _convert_ab_to_xy(poly_ab: Poly) -> TuttePolynomial:
@@ -552,11 +1044,12 @@ def _convert_ab_to_xy(poly_ab: Poly) -> TuttePolynomial:
 # =============================================================================
 
 def compute_treewidth_tutte_if_applicable(
-    mg: MultiGraph, max_width: int = 6
+    mg: MultiGraph, max_width: int = 8
 ) -> Optional[TuttePolynomial]:
     """Compute Tutte polynomial via tree decomposition if treewidth <= max_width.
 
     Returns None if treewidth exceeds max_width or graph is trivial.
+    Uses multi-ordering optimization to find the best decomposition.
     """
     if not mg.nodes:
         return TuttePolynomial.one()
@@ -564,8 +1057,13 @@ def compute_treewidth_tutte_if_applicable(
     if not mg.edge_counts and not mg.loop_counts:
         return TuttePolynomial.one()
 
-    td = compute_tree_decomposition(mg, max_width)
+    td = compute_best_tree_decomposition(mg, max_width)
     if td is None:
         return None
 
-    return compute_treewidth_tutte(td, mg)
+    result = compute_treewidth_tutte(td, mg)
+
+    # Clear connect cache between graphs to bound memory
+    _connect_cache.clear()
+
+    return result

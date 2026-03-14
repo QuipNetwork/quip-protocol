@@ -4,12 +4,18 @@ import networkx as nx
 
 from tutte.graph import Graph, MultiGraph, complete_graph, cycle_graph, petersen_graph
 from tutte.graphs.treewidth import (
+    BELL,
     canonicalize,
     connect,
     forget,
     compute_tree_decomposition,
+    compute_best_tree_decomposition,
     compute_treewidth_tutte,
     compute_treewidth_tutte_if_applicable,
+    estimate_dp_cost,
+    _elimination_ordering,
+    _build_decomposition,
+    _redistribute_edges,
 )
 from tutte.graphs.series_parallel import (
     compute_sp_tutte_if_applicable,
@@ -335,6 +341,159 @@ class TestCrossValidation:
 # =============================================================================
 # SPANNING TREE COUNT VALIDATION
 # =============================================================================
+
+# =============================================================================
+# MULTI-ORDERING AND COST ESTIMATOR TESTS
+# =============================================================================
+
+class TestEliminationOrdering:
+    def _build_adj(self, mg):
+        adj = {v: set() for v in mg.nodes}
+        for (u, v) in mg.edge_counts:
+            adj[u].add(v)
+            adj[v].add(u)
+        return adj
+
+    def test_minfill_ordering(self):
+        g = complete_graph(4)
+        mg = MultiGraph.from_graph(g)
+        adj = self._build_adj(mg)
+        ordering = _elimination_ordering(adj, sorted(mg.nodes), heuristic="minfill")
+        assert ordering is not None
+        assert set(ordering) == mg.nodes
+        assert len(ordering) == len(mg.nodes)
+
+    def test_mindegree_ordering(self):
+        g = cycle_graph(6)
+        mg = MultiGraph.from_graph(g)
+        adj = self._build_adj(mg)
+        ordering = _elimination_ordering(adj, sorted(mg.nodes), heuristic="mindegree")
+        assert ordering is not None
+        assert set(ordering) == mg.nodes
+
+    def test_minfill_degree_ordering(self):
+        g = petersen_graph()
+        mg = MultiGraph.from_graph(g)
+        adj = self._build_adj(mg)
+        ordering = _elimination_ordering(adj, sorted(mg.nodes), heuristic="minfill_degree")
+        assert ordering is not None
+        assert set(ordering) == mg.nodes
+
+    def test_minfill_random_different_seeds(self):
+        """Different seeds can produce different orderings."""
+        g = petersen_graph()
+        mg = MultiGraph.from_graph(g)
+        adj = self._build_adj(mg)
+        orderings = set()
+        for seed in range(10):
+            ordering = _elimination_ordering(
+                adj, sorted(mg.nodes), heuristic="minfill_random", seed=seed
+            )
+            assert ordering is not None
+            orderings.add(tuple(ordering))
+        # With 10 seeds on Petersen, we should get at least 2 distinct orderings
+        assert len(orderings) >= 2
+
+    def test_max_width_respected(self):
+        g = complete_graph(5)
+        mg = MultiGraph.from_graph(g)
+        adj = self._build_adj(mg)
+        ordering = _elimination_ordering(adj, sorted(mg.nodes), max_width=2)
+        assert ordering is None  # K5 has treewidth 4
+
+
+class TestCostEstimator:
+    def test_single_edge_cost(self):
+        mg = MultiGraph(nodes=frozenset({0, 1}), edge_counts={(0, 1): 1})
+        td = compute_tree_decomposition(mg)
+        assert td is not None
+        cost = estimate_dp_cost(td)
+        assert cost > 0
+
+    def test_denser_graph_higher_cost(self):
+        """K5 should have higher DP cost than C5."""
+        k5 = MultiGraph.from_graph(complete_graph(5))
+        c5 = MultiGraph.from_graph(cycle_graph(5))
+        td_k5 = compute_tree_decomposition(k5)
+        td_c5 = compute_tree_decomposition(c5)
+        assert td_k5 is not None and td_c5 is not None
+        assert estimate_dp_cost(td_k5) > estimate_dp_cost(td_c5)
+
+
+class TestBestTreeDecomposition:
+    def test_finds_valid_decomposition(self):
+        g = petersen_graph()
+        mg = MultiGraph.from_graph(g)
+        td = compute_best_tree_decomposition(mg)
+        assert td is not None
+        assert td.width <= 5
+
+    def test_best_is_no_worse_than_default(self):
+        """Best decomposition should have cost <= default single ordering."""
+        g = petersen_graph()
+        mg = MultiGraph.from_graph(g)
+        td_default = compute_tree_decomposition(mg)
+        td_best = compute_best_tree_decomposition(mg)
+        assert td_default is not None and td_best is not None
+        assert estimate_dp_cost(td_best) <= estimate_dp_cost(td_default)
+
+    def test_correctness_preserved(self):
+        """Multi-ordering must produce same polynomial as single ordering."""
+        g = petersen_graph()
+        mg = MultiGraph.from_graph(g)
+        td_default = compute_tree_decomposition(mg)
+        td_best = compute_best_tree_decomposition(mg)
+        assert td_default is not None and td_best is not None
+        result_default = compute_treewidth_tutte(td_default, mg)
+        result_best = compute_treewidth_tutte(td_best, mg)
+        assert result_default == result_best
+
+    def test_max_width_exceeded(self):
+        g = complete_graph(5)
+        mg = MultiGraph.from_graph(g)
+        td = compute_best_tree_decomposition(mg, max_width=2)
+        assert td is None
+
+
+class TestEdgeRedistribution:
+    def test_redistribution_preserves_edges(self):
+        """All edges must still be assigned after redistribution."""
+        g = complete_graph(5)
+        mg = MultiGraph.from_graph(g)
+        td = compute_tree_decomposition(mg)
+        assert td is not None
+        td_redist = _redistribute_edges(td, mg)
+
+        original_edges = sum(len(e) for e in td.bag_edges.values())
+        redist_edges = sum(len(e) for e in td_redist.bag_edges.values())
+        assert original_edges == redist_edges
+
+    def test_redistribution_preserves_correctness(self):
+        """Polynomial must be the same after redistribution."""
+        g = complete_graph(5)
+        mg = MultiGraph.from_graph(g)
+        td = compute_tree_decomposition(mg)
+        assert td is not None
+        td_redist = _redistribute_edges(td, mg)
+
+        result_orig = compute_treewidth_tutte(td, mg)
+        result_redist = compute_treewidth_tutte(td_redist, mg)
+        assert result_orig == result_redist
+
+    def test_endpoints_in_bag(self):
+        """After redistribution, both endpoints of each edge must be in its bag."""
+        g = complete_graph(5)
+        mg = MultiGraph.from_graph(g)
+        td = compute_tree_decomposition(mg)
+        assert td is not None
+        td_redist = _redistribute_edges(td, mg)
+
+        for bag_idx, edges in td_redist.bag_edges.items():
+            bag = td_redist.bags[bag_idx]
+            for u, v, _ in edges:
+                assert u in bag
+                assert v in bag
+
 
 class TestSpanningTreeCount:
     """Validate T(1,1) matches Kirchhoff matrix-tree theorem."""

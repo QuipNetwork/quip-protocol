@@ -28,6 +28,7 @@ from ..graphs.k_join import polynomial_divmod, polynomial_divide, tutte_k
 from ..factorization import polynomial_gcd, has_common_factor
 from ..validation import verify_spanning_trees
 from ..graphs.covering import find_disjoint_cover, compute_fringe, compute_inter_tile_edges
+from ..graphs.series_parallel import compute_sp_tutte_if_applicable
 from .base import BaseMultigraphSynthesizer
 
 
@@ -95,13 +96,24 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         self._multigraph_cache: Dict[str, TuttePolynomial] = {}
         self._mg_minors_accum: Set[str] = set()  # Accumulates minors found during multigraph synthesis
 
+        # Structural engine for series-parallel, k-sum, and hierarchical decomposition
+        from .engine import SynthesisEngine
+        self._structural_engine = SynthesisEngine(table=self.table, verbose=verbose)
+        # Share multigraph cache between engines
+        self._structural_engine._multigraph_cache = self._multigraph_cache
+
+        # Load precomputed multigraph lookup table if available
+        loaded = self._structural_engine.load_multigraph_cache()
+        if loaded > 0 and verbose:
+            print(f"[Hybrid] Loaded {loaded} multigraph cache entries")
+
         # Statistics
         self._stats = {'algebraic': 0, 'tiling': 0, 'dc': 0, 'lookup': 0}
 
     def _log(self, msg: str) -> None:
         """Print message if verbose."""
         if self.verbose:
-            print(f"[Hybrid] {msg}")
+            print(f"[Hybrid] {msg}", flush=True)
 
     def reset_stats(self) -> None:
         """Reset statistics counters."""
@@ -110,6 +122,14 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
     def get_stats(self) -> Dict[str, int]:
         """Get statistics about methods used."""
         return dict(self._stats)
+
+    def _synthesize_fast(self, graph: Graph, max_depth: int = 10) -> HybridSynthesisResult:
+        """Fast synthesis path that skips minor search.
+
+        HybridSynthesisEngine doesn't distinguish fast/slow paths since it
+        uses treewidth/SP before falling back to tiling. Delegates to synthesize().
+        """
+        return self.synthesize(graph, max_depth)
 
     # =========================================================================
     # MAIN SYNTHESIS METHODS
@@ -180,7 +200,14 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
             self._cache[cache_key] = result
             return result
 
-        # 4. Connected graph - use hybrid approach
+        # 4. Try structural decompositions (series-parallel, k-sum, hierarchical)
+        if graph.edge_count() >= 6:
+            structural_result = self._try_structural(graph, max_depth)
+            if structural_result is not None:
+                self._cache[cache_key] = structural_result
+                return structural_result
+
+        # 5. Connected graph - use hybrid approach
         result = self._synthesize_hybrid(graph, max_depth)
 
         # Verify and cache
@@ -275,6 +302,56 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
 
         # Use tiling-based approach (spanning tree + edge addition)
         return self._synthesize_via_tiling(graph, max_depth)
+
+    def _try_structural(
+        self,
+        graph: Graph,
+        max_depth: int
+    ) -> Optional[HybridSynthesisResult]:
+        """Try SynthesisEngine's structural decompositions.
+
+        Delegates to the structural engine for series-parallel, k-sum,
+        and hierarchical tiling decompositions.
+        """
+        from .engine import SynthesisResult
+
+        # Series-parallel O(n)
+        sp_poly = compute_sp_tutte_if_applicable(graph)
+        if sp_poly is not None:
+            self._log("Series-parallel: O(n) computation")
+            return HybridSynthesisResult(
+                polynomial=sp_poly,
+                method="series_parallel",
+                recipe=["Series-parallel decomposition"],
+                verified=True,
+            )
+
+        engine = self._structural_engine
+
+        # K-sum decomposition
+        ksum_result = engine._try_ksum_decomposition(graph)
+        if ksum_result is not None:
+            self._log(f"K-sum decomposition: {ksum_result.method}")
+            return HybridSynthesisResult(
+                polynomial=ksum_result.polynomial,
+                method=ksum_result.method,
+                recipe=ksum_result.recipe,
+                verified=ksum_result.verified,
+            )
+
+        # Hierarchical tiling
+        if graph.edge_count() >= 20:
+            hier_result = engine._try_hierarchical(graph, max_depth)
+            if hier_result is not None:
+                self._log(f"Hierarchical tiling: {hier_result.method}")
+                return HybridSynthesisResult(
+                    polynomial=hier_result.polynomial,
+                    method=hier_result.method,
+                    recipe=hier_result.recipe,
+                    verified=hier_result.verified,
+                )
+
+        return None
 
     def _find_all_cut_vertices_and_split(
         self,
