@@ -2,12 +2,12 @@
 
 # Try to import CUDA components (only available with cupy)
 try:
-    from .cuda_sa import CudaSASamplerAsync
+    from .cuda_sa_kernel import CudaSAKernel
     from .cuda_miner import CudaMiner
     CUDA_AVAILABLE = True
 except ImportError:
     CUDA_AVAILABLE = False
-    CudaSASamplerAsync = None
+    CudaSAKernel = None
     CudaMiner = None
 
 # Try to import Modal components
@@ -34,10 +34,12 @@ except ImportError:
 # Try to import CUDA Gibbs components (only available with cupy)
 try:
     from .cuda_gibbs_sa import CudaGibbsSampler
+    from .cuda_gibbs_miner import CudaGibbsMiner
     CUDA_GIBBS_AVAILABLE = True
 except ImportError:
     CUDA_GIBBS_AVAILABLE = False
     CudaGibbsSampler = None
+    CudaGibbsMiner = None
 
 # Try to import Metal Gibbs components (only available on macOS)
 try:
@@ -58,7 +60,7 @@ __all__ = [
 
 # Add CUDA components if available
 if CUDA_AVAILABLE:
-    __all__.extend(['CudaSASamplerAsync', 'CudaMiner'])
+    __all__.extend(['CudaSAKernel', 'CudaMiner'])
 
 # Add Modal components if available
 if MODAL_AVAILABLE:
@@ -70,7 +72,10 @@ if METAL_AVAILABLE:
 
 # Add CUDA Gibbs components if available
 if CUDA_GIBBS_AVAILABLE:
-    __all__.extend(['CudaGibbsSampler', 'CUDA_GIBBS_AVAILABLE'])
+    __all__.extend([
+        'CudaGibbsSampler', 'CudaGibbsMiner',
+        'CUDA_GIBBS_AVAILABLE',
+    ])
 
 # Add Metal Gibbs components if available
 if METAL_GIBBS_AVAILABLE:

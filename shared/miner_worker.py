@@ -114,6 +114,13 @@ def build_miner_from_spec(spec: Dict[str, Any]):
         if not GPU.MODAL_AVAILABLE:
             raise RuntimeError("Modal miner requested but Modal is not available (requires modal SDK: pip install modal)")
         return GPU.ModalMiner(miner_id, **cfg, **args)
+    elif kind == "cuda-gibbs":
+        if not GPU.CUDA_GIBBS_AVAILABLE:
+            raise RuntimeError(
+                "CUDA Gibbs miner requested but not available "
+                "(requires CuPy and CUDA toolkit)")
+        from GPU.cuda_gibbs_miner import CudaGibbsMiner
+        return CudaGibbsMiner(miner_id, **cfg, **args)
     elif kind == "qpu":
         # Build QPU time config if daily budget is specified
         time_config = None
@@ -207,6 +214,8 @@ class MinerHandle:
             return f"GPU-LOCAL:{d}"
         if k == "metal":
             return "GPU-MPS"
+        if k == "cuda-gibbs":
+            return "GPU-CUDA-Gibbs"
         return k.upper()
 
     def mine(self, block, node_info, requirements, prev_timestamp: int = 0):

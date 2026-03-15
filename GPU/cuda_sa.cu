@@ -439,32 +439,34 @@ __global__ void cuda_sa_persistent_real(
             PROF_T(_t0);  // Region 0: SA_TOTAL start
 #endif
 
+#ifdef PROFILE_REGIONS
+            long long prof[SA_NUM_REGIONS] = {0};
+            long long _t0, _t1, _t2, _t3, _t4;
+#endif
+
+            PROF_T(_t0);  // SA_TOTAL start
             for (int beta_idx = 0; beta_idx < num_betas; beta_idx++) {
+                PROF_T(_t1);  // BETA_OVERHEAD start
                 float beta = shared_job.beta_schedule[beta_idx];
 #ifdef PROFILE_REGIONS
                 PROF_T(_t1);  // Region 1: BETA_OVERHEAD start
 #endif
                 float threshold = 22.18f / beta;
-#ifdef PROFILE_REGIONS
-                PROF_ACCUM(prof, 1, _t1);  // Region 1: BETA_OVERHEAD end
-#endif
+                PROF_ACCUM(prof, 1, _t1);  // BETA_OVERHEAD end
 
                 for (int sweep = 0; sweep < sweeps_per_beta; sweep++) {
-#ifdef PROFILE_REGIONS
-                    PROF_T(_t1);  // Region 2: SWEEP_TOTAL start
-#endif
+                    PROF_T(_t2);  // SWEEP_TOTAL start
                     for (int var = 0; var < n; var++) {
+                        PROF_T(_t3);  // Per-var start
                         int8_t de = delta_energy[var];
 
                         if (de >= threshold) {
-#ifdef PROFILE_REGIONS
-                            PROF_T(_t2);
-                            PROF_ACCUM(prof, 4, _t2);  // Region 4: THRESHOLD_SKIP
-                            PROF_INC(prof, 9);         // Region 9: SKIP_COUNT
-#endif
+                            PROF_ACCUM(prof, 4, _t3);  // THRESHOLD_SKIP
+                            PROF_INC(prof, 9);          // SKIP_COUNT
                             continue;
                         }
 
+                        PROF_T(_t4);  // ACCEPT_DECIDE start
                         bool flip_spin = false;
 
 #ifdef PROFILE_REGIONS
@@ -478,14 +480,10 @@ __global__ void cuda_sa_persistent_real(
                             const float rand_uniform = __uint2float_rn(xorshift32(rng_state)) * RNG_SCALE;
                             flip_spin = (accept_prob > rand_uniform);
                         }
-#ifdef PROFILE_REGIONS
-                        PROF_ACCUM(prof, 5, _t2);  // Region 5: ACCEPT_DECIDE end
-#endif
+                        PROF_ACCUM(prof, 5, _t4);  // ACCEPT_DECIDE end
 
                         if (flip_spin) {
-#ifdef PROFILE_REGIONS
-                            PROF_T(_t2);  // Region 6: FLIP_TOTAL start
-#endif
+                            PROF_T(_t4);  // FLIP_TOTAL start
                             current_energy += de;
 
                             // OPTIMIZATION: Use unpacked state (matching Metal logic)
@@ -494,34 +492,33 @@ __global__ void cuda_sa_persistent_real(
                             const int start = __ldg(&csr_row_ptr[var]);
                             const int end = __ldg(&csr_row_ptr[var + 1]);
 
-#ifdef PROFILE_REGIONS
-                            long long _t3;
-                            PROF_T(_t3);  // Region 7: NEIGHBOR_LOOP start
-#endif
+                            PROF_T(_t3);  // NEIGHBOR_LOOP start (reuse _t3)
                             for (int p = start; p < end; ++p) {
                                 const int neighbor = __ldg(&csr_col_ind[p]);
                                 const int8_t Jij = __ldg(&csr_J_vals[p]);
                                 const int8_t neighbor_spin = unpacked_state[neighbor];
                                 delta_energy[neighbor] += multiplier * Jij * neighbor_spin;
                             }
-#ifdef PROFILE_REGIONS
-                            PROF_ACCUM(prof, 7, _t3);  // Region 7: NEIGHBOR_LOOP end
-#endif
+                            PROF_ACCUM(prof, 7, _t3);  // NEIGHBOR_LOOP end
 
                             // Flip spin (just negate, no bit packing)
                             unpacked_state[var] = -var_spin;
                             delta_energy[var] = -de;
-#ifdef PROFILE_REGIONS
-                            PROF_ACCUM(prof, 6, _t2);  // Region 6: FLIP_TOTAL end
-                            PROF_INC(prof, 8);          // Region 8: FLIP_COUNT
-#endif
+                            PROF_ACCUM(prof, 6, _t4);  // FLIP_TOTAL end
+                            PROF_INC(prof, 8);          // FLIP_COUNT
                         }
                     }
-#ifdef PROFILE_REGIONS
-                    PROF_ACCUM(prof, 2, _t1);  // Region 2: SWEEP_TOTAL end
-#endif
+                    PROF_ACCUM(prof, 2, _t2);  // SWEEP_TOTAL end
                 }
             }
+            PROF_ACCUM(prof, 0, _t0);  // SA_TOTAL end
+
+#ifdef PROFILE_REGIONS
+            // Write profiling data to global buffer
+            int gid = bid * blockDim.x + tid;
+            for (int r = 0; r < SA_NUM_REGIONS; r++)
+                profile_output[gid * SA_NUM_REGIONS + r] = prof[r];
+#endif
 
 #ifdef PROFILE_REGIONS
             PROF_ACCUM(prof, 0, _t0);  // Region 0: SA_TOTAL end
@@ -755,6 +752,413 @@ __global__ void cuda_sa_oneshot(
         out_samples[sample_offset + i] = (float)unpacked_state[i];
     }
     out_energies[global_tid] = (float)current_energy;
+}
+
+// Multi-nonce SA kernel: one block per nonce, threads = reads.
+// CSR topology (row_ptr, col_ind) is shared across nonces.
+// J/h are per-nonce at offsets j_offsets[nonce_id], h_offsets[nonce_id].
+// Grid=(num_nonces,) Block=(num_reads,).
+__global__ void cuda_sa_multi(
+    const int* __restrict__ csr_row_ptr,
+    const int* __restrict__ csr_col_ind,
+    const int8_t* __restrict__ all_J_vals,
+    const float*  __restrict__ all_h,
+    const int*    __restrict__ j_offsets,
+    const int*    __restrict__ h_offsets,
+    const float*  __restrict__ beta_schedule,
+    int N,
+    int num_reads,
+    int num_betas,
+    int num_sweeps_per_beta,
+    unsigned int base_seed,
+    int8_t* __restrict__ delta_energy_workspace,
+    float*  __restrict__ out_samples,
+    float*  __restrict__ out_energies
+) {
+    int nonce_id = blockIdx.x;
+    int tid = threadIdx.x;
+    if (tid >= num_reads) return;
+
+    // Per-nonce J and h pointers
+    const int8_t* my_J = &all_J_vals[__ldg(&j_offsets[nonce_id])];
+    const float*  my_h = &all_h[__ldg(&h_offsets[nonce_id])];
+
+    // Global thread ID for workspace and output indexing
+    int global_tid = nonce_id * num_reads + tid;
+
+    // Thread-local unpacked state
+    int8_t unpacked_state[5000];
+
+    // Delta energy workspace for this thread
+    int8_t* delta_energy = &delta_energy_workspace[global_tid * N];
+
+    // Initialize RNG (combine seed, nonce_id, tid for uniqueness)
+    unsigned int rng_state =
+        (base_seed ^ ((nonce_id + 1) * 65537u + (tid + 1))) * 12345u;
+    if (rng_state == 0) rng_state = 0xdeadbeef;
+
+    // Random initial state
+    for (int var = 0; var < N; var++) {
+        unsigned int rv = xorshift32(rng_state);
+        unpacked_state[var] = (rv & 1) ? -1 : 1;
+    }
+
+    // Build initial delta_energy array
+    for (int var = 0; var < N; var++) {
+        delta_energy[var] = get_flip_energy_unpacked(
+            var, unpacked_state, csr_row_ptr, csr_col_ind,
+            my_J, N, my_h
+        );
+    }
+
+    // Compute initial energy
+    int current_energy = 0;
+    for (int i = 0; i < N; i++) {
+        int8_t spin_i = unpacked_state[i];
+        current_energy += (int)(__ldg(&my_h[i]) * spin_i);
+        const int start = __ldg(&csr_row_ptr[i]);
+        const int end = __ldg(&csr_row_ptr[i + 1]);
+        for (int p = start; p < end; ++p) {
+            const int j = __ldg(&csr_col_ind[p]);
+            if (j > i) {
+                const int8_t Jij = __ldg(&my_J[p]);
+                current_energy += Jij * spin_i * unpacked_state[j];
+            }
+        }
+    }
+
+    // SA sweeps
+    for (int beta_idx = 0; beta_idx < num_betas; beta_idx++) {
+        float beta = beta_schedule[beta_idx];
+        float threshold = 22.18f / beta;
+
+        for (int sweep = 0; sweep < num_sweeps_per_beta; sweep++) {
+            for (int var = 0; var < N; var++) {
+                int8_t de = delta_energy[var];
+                if (de >= threshold) continue;
+
+                bool flip_spin = false;
+                if (de <= 0) {
+                    flip_spin = true;
+                } else {
+                    const float accept_prob = __expf(
+                        -__int2float_rn(de) * beta
+                    );
+                    const float rand_uniform = (
+                        __uint2float_rn(xorshift32(rng_state))
+                        * RNG_SCALE
+                    );
+                    flip_spin = (accept_prob > rand_uniform);
+                }
+
+                if (flip_spin) {
+                    current_energy += de;
+                    const int8_t var_spin = unpacked_state[var];
+                    const int8_t multiplier = 4 * var_spin;
+                    const int start = __ldg(&csr_row_ptr[var]);
+                    const int end = __ldg(&csr_row_ptr[var + 1]);
+
+                    for (int p = start; p < end; ++p) {
+                        const int neighbor = __ldg(&csr_col_ind[p]);
+                        const int8_t Jij = __ldg(&my_J[p]);
+                        const int8_t ns = unpacked_state[neighbor];
+                        delta_energy[neighbor] += multiplier * Jij * ns;
+                    }
+
+                    unpacked_state[var] = -var_spin;
+                    delta_energy[var] = -de;
+                }
+            }
+        }
+    }
+
+    // Write results
+    int sample_offset = global_tid * N;
+    for (int i = 0; i < N; i++) {
+        out_samples[sample_offset + i] = (float)unpacked_state[i];
+    }
+    out_energies[global_tid] = (float)current_energy;
+}
+
+// ==============================================================
+// Self-feeding SA kernel with 3-slot rotating buffers
+// ==============================================================
+// Persistent kernel: 1 block per nonce, threads = num_reads.
+// Each block loops: find READY slot -> run SA -> mark COMPLETE
+// -> find next READY slot.  Host refills slots asynchronously.
+//
+// NonceControl layout (CTRL_STRIDE=8 ints per nonce):
+//   [0..2] = slot states (EMPTY=0, READY=1, ACTIVE=2, COMPLETE=3)
+//   [3]    = active_slot
+//   [4]    = (unused — no inter-block barrier for SA)
+//   [5]    = (unused — no work queue with 1 block)
+//   [6]    = exit_now flag
+//   [7]    = (unused — no generation counter with 1 block)
+
+#define SF_SLOT_EMPTY    0
+#define SF_SLOT_READY    1
+#define SF_SLOT_ACTIVE   2
+#define SF_SLOT_COMPLETE 3
+#define SF_CTRL_STRIDE   8
+#define SF_CTRL_EXIT_NOW 6
+
+__global__ void cuda_sa_self_feeding(
+    const int* __restrict__ csr_row_ptr,
+    const int* __restrict__ csr_col_ind,
+    const int8_t* __restrict__ all_J_vals,
+    const float*  __restrict__ all_h,
+    const float*  __restrict__ beta_schedule,
+    int N,
+    int num_reads,
+    int num_betas,
+    int num_sweeps_per_beta,
+    unsigned int base_seed,
+    int8_t* __restrict__ delta_energy_workspace,
+    float*  __restrict__ out_samples,
+    float*  __restrict__ out_energies,
+    volatile int* nonce_ctrl,
+    int num_nonces,
+    int nnz
+) {
+    int nonce_id = blockIdx.x;
+    int tid = threadIdx.x;
+    if (nonce_id >= num_nonces) return;
+    if (tid >= num_reads) return;
+
+    int ctrl_base = nonce_id * SF_CTRL_STRIDE;
+
+    // ---- Claim initial READY slot ----
+    __shared__ int s_active_slot;
+
+    if (tid == 0) {
+        s_active_slot = -1;
+        for (int s = 0; s < 3; s++) {
+            int old = atomicCAS(
+                (int*)&nonce_ctrl[ctrl_base + s],
+                SF_SLOT_READY, SF_SLOT_ACTIVE
+            );
+            if (old == SF_SLOT_READY) {
+                s_active_slot = s;
+                break;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (s_active_slot < 0) return;  // No initial slot
+
+    int active_slot = s_active_slot;
+
+    // Global thread index for workspace
+    int global_tid = nonce_id * num_reads + tid;
+
+    // ---- Model loop ----
+    while (true) {
+        int slot_idx = nonce_id * 3 + active_slot;
+        int j_off = slot_idx * nnz;
+        int h_off = slot_idx * N;
+
+        // Per-slot J and h
+        const int8_t* my_J = &all_J_vals[j_off];
+        const float*  my_h = &all_h[h_off];
+
+        // Thread-local state
+        int8_t unpacked_state[5000];
+        int8_t* delta_energy = (
+            &delta_energy_workspace[global_tid * N]
+        );
+
+        // RNG seeded per (nonce, slot, tid)
+        unsigned int rng_state = (
+            (base_seed
+             ^ ((nonce_id + 1) * 65537u
+                + (active_slot + 1) * 97u
+                + (tid + 1)))
+            * 12345u
+        );
+        if (rng_state == 0) rng_state = 0xdeadbeef;
+
+        // Init random spins
+        for (int var = 0; var < N; var++) {
+            unsigned int rv = xorshift32(rng_state);
+            unpacked_state[var] = (rv & 1) ? -1 : 1;
+        }
+
+        // Build initial delta_energy
+        for (int var = 0; var < N; var++) {
+            delta_energy[var] = get_flip_energy_unpacked(
+                var, unpacked_state,
+                csr_row_ptr, csr_col_ind,
+                my_J, N, my_h
+            );
+        }
+
+        // Compute initial energy
+        int current_energy = 0;
+        for (int i = 0; i < N; i++) {
+            int8_t spin_i = unpacked_state[i];
+            current_energy += (int)(
+                __ldg(&my_h[i]) * spin_i
+            );
+            const int start = __ldg(&csr_row_ptr[i]);
+            const int end = __ldg(&csr_row_ptr[i + 1]);
+            for (int p = start; p < end; ++p) {
+                const int j = __ldg(&csr_col_ind[p]);
+                if (j > i) {
+                    const int8_t Jij = __ldg(&my_J[p]);
+                    current_energy += (
+                        Jij * spin_i * unpacked_state[j]
+                    );
+                }
+            }
+        }
+
+        // SA sweeps (same algorithm as cuda_sa_multi)
+        for (int beta_idx = 0; beta_idx < num_betas;
+             beta_idx++) {
+            float beta = beta_schedule[beta_idx];
+            float threshold = 22.18f / beta;
+
+            for (int sweep = 0;
+                 sweep < num_sweeps_per_beta; sweep++) {
+                for (int var = 0; var < N; var++) {
+                    int8_t de = delta_energy[var];
+                    if (de >= threshold) continue;
+
+                    bool flip_spin = false;
+                    if (de <= 0) {
+                        flip_spin = true;
+                    } else {
+                        const float accept_prob = __expf(
+                            -__int2float_rn(de) * beta
+                        );
+                        const float rand_uniform = (
+                            __uint2float_rn(
+                                xorshift32(rng_state))
+                            * RNG_SCALE
+                        );
+                        flip_spin = (
+                            accept_prob > rand_uniform
+                        );
+                    }
+
+                    if (flip_spin) {
+                        current_energy += de;
+                        const int8_t var_spin = (
+                            unpacked_state[var]
+                        );
+                        const int8_t multiplier = (
+                            4 * var_spin
+                        );
+                        const int start = __ldg(
+                            &csr_row_ptr[var]
+                        );
+                        const int end = __ldg(
+                            &csr_row_ptr[var + 1]
+                        );
+
+                        for (int p = start; p < end; ++p) {
+                            const int neighbor = __ldg(
+                                &csr_col_ind[p]
+                            );
+                            const int8_t Jij = __ldg(
+                                &my_J[p]
+                            );
+                            const int8_t ns = (
+                                unpacked_state[neighbor]
+                            );
+                            delta_energy[neighbor] += (
+                                multiplier * Jij * ns
+                            );
+                        }
+
+                        unpacked_state[var] = -var_spin;
+                        delta_energy[var] = -de;
+                    }
+                }
+            }
+        }
+
+        // Write results to slot output buffers
+        int sample_base = slot_idx * num_reads * N;
+        int energy_base = slot_idx * num_reads;
+
+        int sample_offset = sample_base + tid * N;
+        for (int i = 0; i < N; i++) {
+            out_samples[sample_offset + i] = (
+                (float)unpacked_state[i]
+            );
+        }
+        out_energies[energy_base + tid] = (
+            (float)current_energy
+        );
+
+        // Sync all threads before marking COMPLETE
+        __syncthreads();
+
+        // Thread 0: mark COMPLETE, find next READY slot
+        if (tid == 0) {
+            nonce_ctrl[ctrl_base + active_slot] = (
+                SF_SLOT_COMPLETE
+            );
+            __threadfence();
+
+            // Check exit flag
+            if (nonce_ctrl[
+                    ctrl_base + SF_CTRL_EXIT_NOW]) {
+                s_active_slot = -1;
+            } else {
+                // Find next READY slot
+                s_active_slot = -1;
+                for (int s = 0; s < 3; s++) {
+                    int old = atomicCAS(
+                        (int*)&nonce_ctrl[ctrl_base + s],
+                        SF_SLOT_READY, SF_SLOT_ACTIVE
+                    );
+                    if (old == SF_SLOT_READY) {
+                        s_active_slot = s;
+                        break;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        if (s_active_slot < 0) {
+            // No more READY slots or exit requested —
+            // spin briefly then retry once before exiting
+            if (tid == 0) {
+                for (int retry = 0; retry < 10000;
+                     retry++) {
+                    // Check exit
+                    if (nonce_ctrl[
+                            ctrl_base + SF_CTRL_EXIT_NOW]) {
+                        break;
+                    }
+                    // Try to find a READY slot
+                    for (int s = 0; s < 3; s++) {
+                        int old = atomicCAS(
+                            (int*)&nonce_ctrl[
+                                ctrl_base + s],
+                            SF_SLOT_READY,
+                            SF_SLOT_ACTIVE
+                        );
+                        if (old == SF_SLOT_READY) {
+                            s_active_slot = s;
+                            break;
+                        }
+                    }
+                    if (s_active_slot >= 0) break;
+                    __nanosleep(10000);  // 10us
+                }
+            }
+            __syncthreads();
+
+            if (s_active_slot < 0) return;  // Exit kernel
+        }
+
+        active_slot = s_active_slot;
+    }
 }
 
 }  // extern "C"

@@ -448,7 +448,8 @@ class CudaKernelRealSA:
             debug_kernel: Enable DEBUG_KERNEL (0 or 1)
             debug_workers: Enable DEBUG_WORKERS (0 or 1)
             verbose: Enable Python print statements (default True)
-            profile: Enable PROFILE_REGIONS instrumentation
+            profile: Compile with PROFILE_REGIONS for clock64()
+                instrumentation.
         """
         self.ring_size = ring_size
         self.max_threads_per_job = max_threads_per_job
@@ -472,7 +473,7 @@ class CudaKernelRealSA:
             options.append('-DDEBUG_KERNEL=1')
         if debug_workers:
             options.append('-DDEBUG_WORKERS=1')
-        if self.profile:
+        if profile:
             options.append('-DPROFILE_REGIONS=1')
 
         # Compile kernel with fast math optimizations
@@ -593,11 +594,12 @@ class CudaKernelRealSA:
         workspace_capacity = max_N
         self.d_delta_energy_workspace = cp.zeros(self.num_blocks * max_threads_per_job * workspace_capacity, dtype=cp.int8)
 
-        # Profile output buffer (one row of SA_NUM_REGIONS per global thread)
+        # Profile buffer (only allocated when profiling)
         total_threads = self.num_blocks * max_threads_per_job
         if self.profile:
             self.d_profile_output = cp.zeros(
-                total_threads * self.SA_NUM_REGIONS, dtype=cp.int64,
+                total_threads * self.SA_NUM_REGIONS,
+                dtype=cp.int64,
             )
             self._profile_total_threads = total_threads
 
@@ -630,6 +632,28 @@ class CudaKernelRealSA:
         )
         if self.verbose:
             print(f"[PYTHON] Kernel launched successfully", flush=True)
+
+    def get_profile_data(self) -> np.ndarray:
+        """Copy profile counters from GPU and reshape.
+
+        Returns:
+            Array of shape (total_threads, SA_NUM_REGIONS) with
+            int64 cycle counts per region.
+
+        Raises:
+            RuntimeError: If profiling not enabled or no data yet.
+        """
+        if not self.profile:
+            raise RuntimeError(
+                "Profiling not enabled. "
+                "Pass profile=True to __init__()."
+            )
+        self.stream.synchronize()
+        raw = cp.asnumpy(self.d_profile_output)
+        return raw.reshape(
+            self._profile_total_threads,
+            self.SA_NUM_REGIONS,
+        )
 
     @staticmethod
     def _get_sm_count() -> int:

@@ -33,6 +33,27 @@ log = None
 # Persistent miner handle and worker integration
 from shared.miner_worker import MinerHandle, miner_worker_main
 
+# Keys forwarded from [gpu] or [gpu.device.<id>] to miners
+_GPU_CFG_KEYS = (
+    "gpu_utilization", "yielding", "sms_per_nonce",
+)
+
+
+def _build_gpu_miner_cfg(
+    section: Dict[str, Any],
+    defaults: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build miner cfg dict from a TOML section.
+
+    Extracts known GPU config keys from *section*, falling
+    back to *defaults* for any missing keys.
+    """
+    base = dict(defaults) if defaults else {}
+    for key in _GPU_CFG_KEYS:
+        if key in section:
+            base[key] = section[key]
+    return base
+
 
 class Node:
     """Node that manages multiple miners and handles blockchain network participation."""
@@ -157,44 +178,66 @@ class Node:
         # GPU Miners, 1 per device or type
         if cfg.get("gpu") is not None:
             gpu_cfg = cfg["gpu"]
-            gpu_backend = (gpu_cfg.get("backend") or "local").lower()
-            gpu_devices = list(gpu_cfg.get("devices") or [])
+            gpu_backend = (
+                gpu_cfg.get("backend") or "local"
+            ).lower()
+            gpu_devices = list(
+                gpu_cfg.get("devices") or [],
+            )
 
-            # Extract common GPU config (gpu_utilization, etc.)
-            miner_cfg = {}
-            if "gpu_utilization" in gpu_cfg:
-                miner_cfg["gpu_utilization"] = gpu_cfg["gpu_utilization"]
+            # Per-device overrides: [gpu.device.<id>]
+            per_device = gpu_cfg.get("device") or {}
+
+            # Common defaults (gpu_utilization, yielding)
+            common_cfg = _build_gpu_miner_cfg(gpu_cfg)
 
             if gpu_backend == "local":
                 for d in gpu_devices:
+                    dev_cfg = _build_gpu_miner_cfg(
+                        per_device.get(str(d), {}),
+                        defaults=common_cfg,
+                    )
                     spec = {
-                        "id": f"{self.node_id}-GPU-CUDA-{d}",
+                        "id": (
+                            f"{self.node_id}-GPU-CUDA-{d}"
+                        ),
                         "kind": "cuda",
-                        "cfg": miner_cfg,
-                        "args": {"device": str(d)}
+                        "cfg": dev_cfg,
+                        "args": {"device": str(d)},
                     }
-                    self.miner_handles.append(MinerHandle(spec, self._log_queue))
+                    self.miner_handles.append(
+                        MinerHandle(spec, self._log_queue),
+                    )
             elif gpu_backend == "modal":
-                gpu_types = list(gpu_cfg.get("types") or [])
+                gpu_types = list(
+                    gpu_cfg.get("types") or [],
+                )
                 for t in gpu_types:
                     spec = {
-                        "id": f"{self.node_id}-GPU-MODAL-{t}",
+                        "id": (
+                            f"{self.node_id}-GPU-MODAL-{t}"
+                        ),
                         "kind": "modal",
-                        "cfg": miner_cfg,
-                        "args": {"gpu_type": str(t)}
+                        "cfg": common_cfg,
+                        "args": {"gpu_type": str(t)},
                     }
-                    self.miner_handles.append(MinerHandle(spec, self._log_queue))
+                    self.miner_handles.append(
+                        MinerHandle(spec, self._log_queue),
+                    )
             elif gpu_backend == "mps":
-                # can only have one metal miner
                 spec = {
                     "id": f"{self.node_id}-GPU-MPS",
                     "kind": "metal",
-                    "cfg": miner_cfg,
-                    "args": {"device": "mps"}
+                    "cfg": common_cfg,
+                    "args": {"device": "mps"},
                 }
-                self.miner_handles.append(MinerHandle(spec, self._log_queue))
+                self.miner_handles.append(
+                    MinerHandle(spec, self._log_queue),
+                )
             else:
-                raise ValueError(f"Unknown GPU backend: {gpu_backend}")
+                raise ValueError(
+                    f"Unknown GPU backend: {gpu_backend}",
+                )
 
         # QPU Miners, 1 per qpu section
         if cfg.get("qpu") is not None:
