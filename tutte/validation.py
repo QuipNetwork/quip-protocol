@@ -17,6 +17,7 @@ import networkx as nx
 
 from .polynomial import TuttePolynomial
 from .graph import Graph
+from .logs import get_log, EventType, LogLevel
 
 
 # =============================================================================
@@ -35,6 +36,7 @@ def verify_with_networkx(graph: Graph, computed: TuttePolynomial) -> bool:
     Returns:
         True if polynomials match or graph is too large to verify
     """
+    _log = get_log()
     if graph.edge_count() > 15:
         return True  # Skip expensive verification for large graphs
 
@@ -44,7 +46,12 @@ def verify_with_networkx(graph: Graph, computed: TuttePolynomial) -> bool:
     if nx_poly is None:
         return True  # Can't verify without networkx/sympy
 
-    return computed == nx_poly
+    match = computed == nx_poly
+    if not match:
+        _log.record(EventType.VERIFY, "validation",
+                    f"NetworkX mismatch: {graph.node_count()}n {graph.edge_count()}e",
+                    LogLevel.WARN)
+    return match
 
 
 def compute_tutte_networkx(G: nx.Graph) -> Optional[TuttePolynomial]:
@@ -96,6 +103,7 @@ def verify_spanning_trees(graph: Graph, poly: TuttePolynomial) -> bool:
     Returns:
         True if both methods agree
     """
+    _log = get_log()
     tutte_count = poly.num_spanning_trees()
 
     n = graph.node_count()
@@ -112,7 +120,13 @@ def verify_spanning_trees(graph: Graph, poly: TuttePolynomial) -> bool:
         except Exception:
             return True
 
-    return tutte_count == kirchhoff_count
+    match = tutte_count == kirchhoff_count
+    if not match:
+        _log.record(EventType.VERIFY, "validation",
+                    f"Kirchhoff mismatch: T(1,1)={tutte_count} vs Kirchhoff={kirchhoff_count} "
+                    f"for {graph.node_count()}n {graph.edge_count()}e",
+                    LogLevel.WARN)
+    return match
 
 
 def _exact_spanning_tree_count(graph: Graph) -> int:

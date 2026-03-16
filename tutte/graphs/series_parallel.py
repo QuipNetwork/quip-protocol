@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Tuple, Set
 from ..graph import Graph, MultiGraph
 from ..polynomial import TuttePolynomial
+from ..logs import get_log, EventType, LogLevel
 
 
 # =============================================================================
@@ -426,6 +427,11 @@ def compute_sp_tutte_if_applicable(graph: Graph) -> Optional[TuttePolynomial]:
     if tree is None:
         return None
 
+    _log = get_log()
+    _log.record(EventType.SERIES_PARALLEL, "series_parallel",
+                f"SP graph: {graph.node_count()}n {graph.edge_count()}e, "
+                f"tree depth {tree.depth()}",
+                LogLevel.DEBUG)
     return compute_sp_tutte(tree)
 
 
@@ -686,6 +692,10 @@ def compute_sp_tutte_multigraph_if_applicable(mg: MultiGraph) -> Optional[TutteP
     if tree is None:
         return None
 
+    _log = get_log()
+    _log.record(EventType.SERIES_PARALLEL, "series_parallel",
+                f"SP multigraph: {mg.node_count()}n {mg.edge_count()}e",
+                LogLevel.DEBUG)
     return compute_sp_tutte_multigraph(tree)
 
 

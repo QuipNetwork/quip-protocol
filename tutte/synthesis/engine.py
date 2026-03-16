@@ -54,6 +54,7 @@ from ..matroids.parallel_connection import (
 )
 
 from .base import UnionFind, BaseMultigraphSynthesizer, SynthesisResult
+from ..logs import get_log, EventType, LogLevel
 
 
 # =============================================================================
@@ -302,17 +303,26 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         Returns:
             SynthesisResult with computed polynomial
         """
+        _log = get_log()
+        n, m = graph.node_count(), graph.edge_count()
+        _log.record(EventType.SYNTHESIS_START, "engine",
+                     f"{n}n {m}e", LogLevel.INFO)
+
         # Check cache
         cache_key = graph.canonical_key()
         if cache_key in self._cache:
+            _log.record(EventType.CACHE_HIT, "engine",
+                        f"Cache hit: {cache_key[:12]}", LogLevel.DEBUG)
             self._log(f"Cache hit: {cache_key[:16]}...")
             return self._cache[cache_key]
 
-        self._log(f"Synthesizing graph with {graph.node_count()} nodes, {graph.edge_count()} edges")
+        self._log(f"Synthesizing graph with {n} nodes, {m} edges")
 
         # 1. Check rainbow table first
         cached = self.table.lookup(graph)
         if cached is not None:
+            _log.record(EventType.LOOKUP_HIT, "engine",
+                        f"Rainbow table hit: {n}n {m}e")
             self._log("Direct rainbow table lookup")
             result = SynthesisResult(
                 polynomial=cached,
@@ -326,7 +336,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
 
         # 2. Handle base cases
         if graph.edge_count() == 0:
-            # Empty graph (just vertices) -> T = 1
+            _log.record(EventType.BASE_CASE, "engine", "Empty graph: T = 1")
             result = SynthesisResult(
                 polynomial=TuttePolynomial.one(),
                 recipe=["Empty graph: T = 1"],
@@ -337,7 +347,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             return result
 
         if graph.edge_count() == 1:
-            # Single edge -> T = x
+            _log.record(EventType.BASE_CASE, "engine", "Single edge: T = x")
             result = SynthesisResult(
                 polynomial=TuttePolynomial.x(),
                 recipe=["Single edge: T = x"],
@@ -350,6 +360,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         # 3. Check if graph is disconnected
         components = graph.connected_components()
         if len(components) > 1:
+            _log.record(EventType.FACTORIZE, "engine",
+                        f"Disconnected: {len(components)} components")
             result = self._synthesize_disconnected(components, max_depth)
             self._cache[cache_key] = result
             self._promote_to_table(graph, cache_key, result)
@@ -358,6 +370,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         # 4. Check for cut vertices (fast factorization before expensive operations)
         cut = graph.has_cut_vertex()
         if cut is not None:
+            _log.record(EventType.FACTORIZE, "engine",
+                        f"Cut vertex at {cut}")
             result = self._synthesize_via_cut_vertex(graph, cut, max_depth)
             self._cache[cache_key] = result
             self._promote_to_table(graph, cache_key, result)
@@ -366,6 +380,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         # 5. Try series-parallel O(n) computation
         sp_poly = compute_sp_tutte_if_applicable(graph)
         if sp_poly is not None:
+            _log.record(EventType.SERIES_PARALLEL, "engine",
+                        f"SP decomposition: {n}n {m}e")
             self._log("Series-parallel: O(n) computation")
             result = SynthesisResult(
                 polynomial=sp_poly,
@@ -378,17 +394,21 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             return result
 
         # 6. Try k-sum decomposition (k=2..5, detect independent vertex separators)
-        if graph.edge_count() >= 6:  # Need at least some edges for useful k-sum
+        if graph.edge_count() >= 6:
             result = self._try_ksum_decomposition(graph)
             if result is not None:
+                _log.record(EventType.KSUM, "engine",
+                            f"k-sum: {result.method}")
                 self._cache[cache_key] = result
                 self._promote_to_table(graph, cache_key, result)
                 return result
 
         # 7. Try hierarchical tiling for graphs with repeating structure
-        if graph.edge_count() >= 20:  # Only try for larger graphs
+        if graph.edge_count() >= 20:
             result = self._try_hierarchical(graph, max_depth)
             if result is not None:
+                _log.record(EventType.HIERARCHICAL, "engine",
+                            f"Hierarchical: {result.tiles_used} tiles")
                 self._cache[cache_key] = result
                 self._promote_to_table(graph, cache_key, result)
                 return result
@@ -1505,10 +1525,13 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         max_depth: int
     ) -> SynthesisResult:
         """Synthesize polynomial for connected graph using creation-expansion-join."""
+        _log = get_log()
         target_edges = graph.edge_count()
 
         # For small graphs, spanning tree expansion is faster than VF2 search.
         if target_edges <= 15:
+            _log.record(EventType.EDGE_ADD, "engine",
+                        f"Small graph ({target_edges}e), spanning tree expansion")
             return self._synthesize_from_k2(graph, max_depth)
 
         # Only use tiles that cover a meaningful portion of the graph
@@ -1542,9 +1565,13 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             break
 
         if cover is None:
-            # No minor produces a useful cover, use spanning tree expansion
+            _log.record(EventType.COVER_RESULT, "engine",
+                        f"No cover found, falling back to spanning tree expansion")
             return self._synthesize_from_k2(graph, max_depth)
 
+        _log.record(EventType.COVER_RESULT, "engine",
+                    f"{len(cover.tiles)} tiles of {minor.name}, "
+                    f"{len(cover.uncovered_edges)} uncovered edges")
         self._log(f"Cover: {len(cover.tiles)} tiles, {len(cover.uncovered_edges)} uncovered edges")
 
         # Compute base polynomial from disjoint tiles (product formula)
@@ -1570,6 +1597,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         # - Chord (within same component): T(G+e) = T(G) + T(G/{u,v})
         if cover.uncovered_edges:
             uncovered_list = sorted(cover.uncovered_edges)
+            _log.record(EventType.EDGE_ADD, "engine",
+                        f"Adding {len(uncovered_list)} uncovered edges")
             self._log(f"Adding {len(uncovered_list)} uncovered edges via edge addition")
             recipe.append(f"Edge addition for {len(uncovered_list)} uncovered edges")
 
@@ -1603,6 +1632,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
 
         # Verify
         verified = verify_spanning_trees(graph, poly)
+        _log.record(EventType.VERIFY, "engine",
+                    f"CEJ {'passed' if verified else 'FAILED'} Kirchhoff check")
 
         return SynthesisResult(
             polynomial=poly,

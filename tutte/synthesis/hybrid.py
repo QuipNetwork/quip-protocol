@@ -30,6 +30,7 @@ from ..validation import verify_spanning_trees
 from ..graphs.covering import find_disjoint_cover, compute_fringe, compute_inter_tile_edges
 from ..graphs.series_parallel import compute_sp_tutte_if_applicable
 from .base import BaseMultigraphSynthesizer
+from ..logs import get_log, EventType, LogLevel
 
 
 # =============================================================================
@@ -149,16 +150,26 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         Returns:
             HybridSynthesisResult with computed polynomial
         """
+        _log = get_log()
         # Check cache
         cache_key = graph.canonical_key()
         if cache_key in self._cache:
+            _log.record(EventType.CACHE_HIT, "hybrid",
+                        f"Cache hit: {graph.node_count()}n {graph.edge_count()}e",
+                        LogLevel.DEBUG)
             return self._cache[cache_key]
 
-        self._log(f"Synthesizing: {graph.node_count()} nodes, {graph.edge_count()} edges")
+        n = graph.node_count()
+        m = graph.edge_count()
+        _log.record(EventType.SYNTHESIS_START, "hybrid",
+                    f"{n}n {m}e")
+        self._log(f"Synthesizing: {n} nodes, {m} edges")
 
         # 1. Direct rainbow table lookup
         cached = self.table.lookup(graph)
         if cached is not None:
+            _log.record(EventType.LOOKUP_HIT, "hybrid",
+                        f"Table hit: {n}n {m}e")
             self._log("Direct lookup hit")
             self._stats['lookup'] += 1
             result = HybridSynthesisResult(
@@ -196,6 +207,8 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         # 3. Handle disconnected graphs
         components = graph.connected_components()
         if len(components) > 1:
+            _log.record(EventType.FACTORIZE, "hybrid",
+                        f"Disconnected: {len(components)} components")
             result = self._synthesize_disconnected(components, max_depth)
             self._cache[cache_key] = result
             return result
@@ -268,10 +281,13 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         3. Use tiling-based spanning tree expansion on 2-connected blocks
         """
         # Check for cut vertices first (factorization is always a win)
+        _log = get_log()
         cut = graph.has_cut_vertex()
         if cut is not None:
             components = graph.split_at_cut_vertex(cut)
             if len(components) > 1:
+                _log.record(EventType.FACTORIZE, "hybrid",
+                            f"Cut vertex: {len(components)} components")
                 self._log(f"Cut vertex {cut} splits into {len(components)} components")
                 poly = TuttePolynomial.one()
                 decomposition = []
@@ -315,9 +331,12 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         """
         from .engine import SynthesisResult
 
+        _log = get_log()
         # Series-parallel O(n)
         sp_poly = compute_sp_tutte_if_applicable(graph)
         if sp_poly is not None:
+            _log.record(EventType.SERIES_PARALLEL, "hybrid",
+                        f"SP: {graph.node_count()}n {graph.edge_count()}e")
             self._log("Series-parallel: O(n) computation")
             return HybridSynthesisResult(
                 polynomial=sp_poly,
@@ -331,6 +350,8 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         # K-sum decomposition
         ksum_result = engine._try_ksum_decomposition(graph)
         if ksum_result is not None:
+            _log.record(EventType.KSUM, "hybrid",
+                        f"K-sum: {graph.node_count()}n {graph.edge_count()}e")
             self._log(f"K-sum decomposition: {ksum_result.method}")
             return HybridSynthesisResult(
                 polynomial=ksum_result.polynomial,
@@ -343,6 +364,8 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         if graph.edge_count() >= 20:
             hier_result = engine._try_hierarchical(graph, max_depth)
             if hier_result is not None:
+                _log.record(EventType.HIERARCHICAL, "hybrid",
+                            f"Hierarchical: {graph.node_count()}n {graph.edge_count()}e")
                 self._log(f"Hierarchical tiling: {hier_result.method}")
                 return HybridSynthesisResult(
                     polynomial=hier_result.polynomial,
@@ -393,11 +416,13 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         2. Adding chords one at a time using edge addition formula
         3. Using pattern recognition for merged graphs
         """
-        self._log("Using tiling (spanning tree + edge addition)")
-        self._stats['tiling'] += 1
-
+        _log = get_log()
         n = graph.node_count()
         m = graph.edge_count()
+        _log.record(EventType.EDGE_ADD, "hybrid",
+                    f"Tiling path: {n}n {m}e")
+        self._log("Using tiling (spanning tree + edge addition)")
+        self._stats['tiling'] += 1
         recipe = ["Spanning tree + edge addition"]
 
         if n == 0:

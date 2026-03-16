@@ -30,6 +30,7 @@ from ..factorization import (
     primitive_part, find_divisibility_chain, try_factorize
 )
 from ..validation import verify_spanning_trees
+from ..logs import get_log, EventType, LogLevel
 
 
 # =============================================================================
@@ -138,17 +139,26 @@ class AlgebraicSynthesisEngine:
         Returns:
             AlgebraicSynthesisResult with computed polynomial
         """
+        _log = get_log()
         # Check cache
         cache_key = graph.canonical_key()
         if cache_key in self._cache:
-            self._log(f"Cache hit: {cache_key[:16]}...")
+            _log.record(EventType.CACHE_HIT, "algebraic",
+                        f"Cache hit: {graph.node_count()}n {graph.edge_count()}e",
+                        LogLevel.DEBUG)
             return self._cache[cache_key]
 
-        self._log(f"Synthesizing graph: {graph.node_count()} nodes, {graph.edge_count()} edges")
+        n = graph.node_count()
+        m = graph.edge_count()
+        _log.record(EventType.SYNTHESIS_START, "algebraic",
+                    f"{n}n {m}e")
+        self._log(f"Synthesizing graph: {n} nodes, {m} edges")
 
         # 1. Check rainbow table first
         cached = self.table.lookup(graph)
         if cached is not None:
+            _log.record(EventType.LOOKUP_HIT, "algebraic",
+                        f"Table hit: {n}n {m}e")
             self._log("Direct rainbow table lookup")
             result = AlgebraicSynthesisResult(
                 polynomial=cached,
@@ -186,6 +196,8 @@ class AlgebraicSynthesisEngine:
         # 3. Check if graph is disconnected
         components = graph.connected_components()
         if len(components) > 1:
+            _log.record(EventType.FACTORIZE, "algebraic",
+                        f"Disconnected: {len(components)} components")
             result = self._synthesize_disconnected(components, max_depth)
             self._cache[cache_key] = result
             return result
@@ -311,10 +323,14 @@ class AlgebraicSynthesisEngine:
             )
 
         # Find the largest factor
+        _log = get_log()
         factor_result = self._find_largest_factor(target)
 
         if factor_result is None:
             # No factors found - target is the remainder
+            _log.record(EventType.FACTORIZE, "algebraic",
+                        f"No known factors for {target.num_terms()}-term poly",
+                        LogLevel.DEBUG)
             recipe.append("  No known factors found")
             return AlgebraicSynthesisResult(
                 polynomial=target,
@@ -324,6 +340,9 @@ class AlgebraicSynthesisEngine:
             )
 
         entry, quotient = factor_result
+        _log.record(EventType.FACTORIZE, "algebraic",
+                    f"Factor: {entry.name} ({entry.node_count}n {entry.edge_count}e)",
+                    LogLevel.DEBUG)
         recipe.append(f"  Factor: {entry.name} ({entry.polynomial})")
 
         # Compute remainder

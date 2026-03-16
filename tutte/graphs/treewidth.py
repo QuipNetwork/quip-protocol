@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from ..graph import MultiGraph
 from ..polynomial import TuttePolynomial
+from ..logs import get_log, EventType, LogLevel
 
 # =============================================================================
 # SET PARTITION UTILITIES
@@ -1060,6 +1061,13 @@ def compute_treewidth_tutte_if_applicable(
     td = compute_best_tree_decomposition(mg, max_width)
     if td is None:
         return None
+
+    _log = get_log()
+    cost = estimate_dp_cost(td)
+    _log.record(EventType.TREEWIDTH_DP, "treewidth",
+                f"TW={td.width}, {len(td.bags)} bags, "
+                f"{mg.node_count()}n {mg.edge_count()}e, cost={cost:.0f}",
+                LogLevel.DEBUG)
 
     result = compute_treewidth_tutte(td, mg)
 

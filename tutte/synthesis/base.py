@@ -15,6 +15,7 @@ from ..polynomial import TuttePolynomial
 from ..graph import Graph, MultiGraph
 from ..graphs.series_parallel import compute_sp_tutte_multigraph_if_applicable
 from ..graphs.treewidth import compute_treewidth_tutte_if_applicable
+from ..logs import get_log, EventType, LogLevel
 
 
 # =============================================================================
@@ -91,6 +92,8 @@ class BaseMultigraphSynthesizer:
         Returns:
             TuttePolynomial for the multigraph
         """
+        _log = get_log()
+
         # 1. Handle loops first: T(G with loop) = y × T(G without loop)
         if mg.total_loop_count() > 0:
             loop_count = mg.total_loop_count()
@@ -103,6 +106,9 @@ class BaseMultigraphSynthesizer:
 
         # 3. Disconnected: T(G1 ∪ G2) = T(G1) × T(G2)
         if not mg.is_connected():
+            _log.record(EventType.FACTORIZE, "base",
+                        f"Disconnected MG: {mg.node_count()}n {mg.edge_count()}e",
+                        LogLevel.DEBUG)
             return self._handle_disconnected_multigraph(mg, max_depth, skip_minor_search)
 
         # 4. Cut vertex factorization: T(G1 · G2) = T(G1) × T(G2)
@@ -111,6 +117,9 @@ class BaseMultigraphSynthesizer:
         if cut is not None:
             components = mg.split_at_cut_vertex(cut)
             if len(components) > 1:
+                _log.record(EventType.FACTORIZE, "base",
+                            f"Cut vertex in MG: {len(components)} components",
+                            LogLevel.DEBUG)
                 self._log(f"Cut vertex {cut} splits into {len(components)} components")
                 poly = TuttePolynomial.one()
                 for comp in components:
@@ -131,11 +140,16 @@ class BaseMultigraphSynthesizer:
         if fh in self._fast_hash_set:
             cache_key = mg.canonical_key()
             if cache_key in self._multigraph_cache:
+                _log.record(EventType.CACHE_HIT, "base",
+                            f"MG cache hit: {mg.node_count()}n {mg.edge_count()}e",
+                            LogLevel.DEBUG)
                 return self._multigraph_cache[cache_key]
         elif not self._fast_hash_set_complete:
-            # Loaded entries may not be indexed yet — must check
             cache_key = mg.canonical_key()
             if cache_key in self._multigraph_cache:
+                _log.record(EventType.CACHE_HIT, "base",
+                            f"MG cache hit (unindexed): {mg.node_count()}n {mg.edge_count()}e",
+                            LogLevel.DEBUG)
                 self._fast_hash_set.add(fh)
                 return self._multigraph_cache[cache_key]
         else:
@@ -194,6 +208,10 @@ class BaseMultigraphSynthesizer:
         # where G_0 = G without u-v edges, G_c = G_0 with u,v merged
         max_mult_edge = max(mg.edge_counts.keys(), key=lambda e: mg.edge_counts[e])
         if mg.edge_counts[max_mult_edge] > 1:
+            k = mg.edge_counts[max_mult_edge]
+            _log.record(EventType.MULTIGRAPH_OP, "base",
+                        f"Batch reduce {k} parallel edges: {mg.node_count()}n {mg.edge_count()}e",
+                        LogLevel.DEBUG)
             poly = self._batch_reduce_parallel(mg, max_mult_edge, max_depth, skip_minor_search)
             if cache_key is None:
                 cache_key = mg.canonical_key()

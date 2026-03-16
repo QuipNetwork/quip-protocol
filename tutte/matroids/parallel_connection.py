@@ -24,6 +24,8 @@ from .core import (
     enumerate_flats_with_hasse,
 )
 
+from ..logs import get_log, EventType, LogLevel
+
 if TYPE_CHECKING:
     from ..synthesis.engine import SynthesisEngine
 
@@ -293,6 +295,10 @@ def theorem6_parallel_connection(
     Returns:
         TuttePolynomial for the parallel connection
     """
+    _log = get_log()
+    _log.record(EventType.THEOREM6, "parallel_conn",
+                f"Theorem 6: {lattice_N.num_flats} flats, rank {r_N}")
+
     # Precompute Mobius from bottom for all flats
     lattice_N.precompute_all_mobius_from_bottom()
 
@@ -555,6 +561,12 @@ def theorem10_k_sum(
         TuttePolynomial for the k-sum
     """
     from itertools import combinations
+
+    _log = get_log()
+    n_subsets = 2 ** len(shared_edges)
+    _log.record(EventType.KSUM, "parallel_conn",
+                f"K-sum IE: {len(shared_edges)} shared edges, {n_subsets} subsets",
+                LogLevel.DEBUG)
 
     result = TuttePolynomial.zero()
 
@@ -876,6 +888,12 @@ def precompute_contractions(
     Returns:
         Dict mapping flat index -> T(graph_i/Z) as BivariateLaurentPoly
     """
+    _log = get_log()
+    _log.record(EventType.THEOREM6, "parallel_conn",
+                f"Precomputing {lattice_N.num_flats} contractions for "
+                f"{graph_i.node_count()}n {graph_i.edge_count()}e",
+                LogLevel.DEBUG)
+
     result: Dict[int, BivariateLaurentPoly] = {}
     # Cache by canonical key to avoid redundant synthesis
     canon_cache: Dict[str, BivariateLaurentPoly] = {}
@@ -1066,6 +1084,13 @@ def precompute_contractions_product(
     Returns:
         Dict mapping (flat1_idx, flat2_idx) -> T(graph_i/(Z1∪Z2)) as BivariateLaurentPoly
     """
+    _log = get_log()
+    n_pairs = lattice_1.num_flats * lattice_2.num_flats
+    _log.record(EventType.THEOREM6, "parallel_conn",
+                f"Precomputing {n_pairs} product contractions for "
+                f"{graph_i.node_count()}n {graph_i.edge_count()}e",
+                LogLevel.DEBUG)
+
     result: Dict[Tuple[int, int], BivariateLaurentPoly] = {}
 
     # Stage 1: Contract each Z1 in graph_i, cache intermediate multigraphs
@@ -1204,6 +1229,12 @@ def theorem6_product_lattice(
         TuttePolynomial for the parallel connection
     """
     r_N = r_N1 + r_N2
+
+    _log = get_log()
+    n_product_flats = lattice_1.num_flats * lattice_2.num_flats
+    _log.record(EventType.THEOREM6, "parallel_conn",
+                f"Theorem 6 product: {lattice_1.num_flats}x{lattice_2.num_flats}="
+                f"{n_product_flats} flat pairs, rank {r_N}")
 
     # Precompute Mobius values for both lattices
     lattice_1.precompute_all_mobius_from_bottom()

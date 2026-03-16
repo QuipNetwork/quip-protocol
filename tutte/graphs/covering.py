@@ -23,6 +23,7 @@ from ..graph import (
     compute_signature, compute_node_signature, compute_all_node_signatures
 )
 from ..lookup.core import MinorEntry, RainbowTable
+from ..logs import get_log, EventType, LogLevel
 
 
 # =============================================================================
@@ -218,6 +219,7 @@ def find_disjoint_cover(
     Returns:
         Cover with all tiles and any uncovered edges
     """
+    _log = get_log()
     cover = Cover()
     cover.uncovered_edges = set(graph.edges)
 
@@ -236,6 +238,9 @@ def find_disjoint_cover(
 
     # Find all occurrences
     matches = find_subgraph_isomorphisms(graph, pattern, max_matches=50)
+    _log.record(EventType.VF2_MATCH, "covering",
+                f"Disjoint cover: {len(matches)} placements of {minor.name}",
+                LogLevel.DEBUG)
 
     # Sort by coverage (prefer matches that cover more uncovered edges)
     def coverage_score(mapping):
@@ -289,6 +294,10 @@ def find_disjoint_cover(
                 if cover.is_complete():
                     break
 
+    _log.record(EventType.COVER_RESULT, "covering",
+                f"Cover: {cover.total_tiles()} tiles, "
+                f"{len(cover.uncovered_edges)} uncovered edges",
+                LogLevel.DEBUG)
     return cover
 
 
@@ -1180,8 +1189,12 @@ def try_hierarchical_partition(
     Returns:
         (cell_entry, partition, inter_cell_info) or None if no tiling found
     """
+    _log = get_log()
     # Find candidate tiles
     candidates = find_cell_candidates(graph, table)
+    _log.record(EventType.CANDIDATE_FILTER, "covering",
+                f"Hierarchical: {len(candidates)} cell candidates for {graph.node_count()}n {graph.edge_count()}e",
+                LogLevel.DEBUG)
 
     for cell in candidates:
         cell_size = cell.node_count
@@ -1198,6 +1211,9 @@ def try_hierarchical_partition(
 
         # Analyze inter-cell edges
         inter_info = analyze_inter_cell_edges(graph, partition)
+        _log.record(EventType.HIERARCHICAL, "covering",
+                    f"Tiled with {cell.name}: {len(partition)} cells, "
+                    f"{len(inter_info.edges)} inter-cell edges")
 
         return (cell, partition, inter_info)
 
