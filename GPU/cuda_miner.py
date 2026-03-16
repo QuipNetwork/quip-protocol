@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""CUDA SA miner — self-feeding kernel adapter over GPUMiner.
+"""Unified CUDA miner — SA and Gibbs kernel adapter over GPUMiner.
 
-Uses CudaSASampler self-feeding kernel with 1 SM per model.
-Each kernel (nonce) has 3 rotating slots:
+Supports both simulated annealing (SA) and chromatic block Gibbs
+sampling via the ``update_mode`` parameter. Each kernel (nonce)
+has 3 rotating slots:
 
     completed | active | next
 
@@ -23,7 +24,6 @@ import numpy as np
 
 from shared.ising_model import IsingModel
 from GPU.gpu_miner import GPUMiner
-from GPU.cuda_sa_sampler import CudaSASampler
 from dwave_topologies import DEFAULT_TOPOLOGY
 
 try:
@@ -31,7 +31,7 @@ try:
 except ImportError:
     cp = None
 
-# Slot states matching CudaSASampler constants
+# Slot states matching sampler constants
 _SLOT_COMPLETE = 3
 
 
@@ -58,15 +58,20 @@ class KernelState:
 
 
 class CudaMiner(GPUMiner):
-    """CUDA GPU miner using self-feeding SA kernel.
+    """Unified CUDA GPU miner for SA and Gibbs kernels.
 
-    1 SM per model. Inherits pipeline, feeder, scheduler,
-    and SIGTERM cleanup from GPUMiner.
+    Inherits pipeline, feeder, scheduler, and SIGTERM cleanup
+    from GPUMiner.
 
     Per-kernel slot lifecycle:
         Host uploads to free_slot -> becomes next_slot.
         Kernel finishes active_slot -> switches to next_slot.
         Host downloads completed active_slot -> becomes free.
+
+    Args:
+        update_mode: "sa" for simulated annealing (1 SM/model),
+            "gibbs" or "metropolis" for chromatic block Gibbs
+            (sms_per_nonce SMs/model, default 4).
     """
 
     ADAPT_MIN_SWEEPS = 256
@@ -80,13 +85,20 @@ class CudaMiner(GPUMiner):
         miner_id: str,
         device: str = "0",
         topology=None,
+        update_mode: str = "sa",
         **cfg,
     ):
         if cp is None:
             raise ImportError("cupy not available")
 
+        self._is_gibbs = update_mode.lower() in (
+            "gibbs", "metropolis",
+        )
+        self._update_mode = update_mode.lower()
+
         gpu_util = cfg.pop('gpu_utilization', 100)
         yielding = cfg.pop('yielding', False)
+        self.sms_per_nonce = cfg.pop('sms_per_nonce', 4)
 
         dev_id = int(device)
         GPUMiner._init_cuda_device(
@@ -106,18 +118,29 @@ class CudaMiner(GPUMiner):
             1, int(device_sms * gpu_util / 100),
         )
 
-        self._sa = CudaSASampler(
-            topology=topology_obj,
-            max_sms=sm_ceiling,
-        )
+        if self._is_gibbs:
+            from GPU.cuda_gibbs_sa import CudaGibbsSampler
+            self._sampler = CudaGibbsSampler(
+                topology=topology_obj,
+                update_mode=self._update_mode,
+                max_sms=sm_ceiling,
+            )
+            miner_type = "GPU-CUDA-Gibbs"
+        else:
+            from GPU.cuda_sa_sampler import CudaSASampler
+            self._sampler = CudaSASampler(
+                topology=topology_obj,
+                max_sms=sm_ceiling,
+            )
+            miner_type = "GPU-CUDA"
 
         super().__init__(
             miner_id,
-            self._sa,
+            self._sampler,
             device=device,
             gpu_utilization=gpu_util,
             yielding=yielding,
-            miner_type="GPU-CUDA",
+            miner_type=miner_type,
         )
 
         # Per-kernel slot tracking (indexed by nonce_id)
@@ -127,15 +150,26 @@ class CudaMiner(GPUMiner):
         self._beta_uploaded = False
         self._enqueue_count = 0
 
-        self.logger.info(
-            "CUDA SA miner on device %s "
-            "(self-feeding, utilization=%d%%)",
-            device, gpu_util,
-        )
+        if self._is_gibbs:
+            self.logger.info(
+                "CUDA Gibbs miner on device %s "
+                "(mode=%s, utilization=%d%%, "
+                "sms_per_nonce=%d)",
+                device, self._update_mode, gpu_util,
+                self.sms_per_nonce,
+            )
+        else:
+            self.logger.info(
+                "CUDA SA miner on device %s "
+                "(self-feeding, utilization=%d%%)",
+                device, gpu_util,
+            )
 
     # -- Kernel adapter protocol --
 
     def _kernel_sms_per_model(self) -> int:
+        if self._is_gibbs:
+            return self.sms_per_nonce
         return 1
 
     def _kernel_enqueue(
@@ -157,18 +191,33 @@ class CudaMiner(GPUMiner):
         spb = params.get('num_sweeps_per_beta', 1)
 
         # Lazy init: prepare buffers on first enqueue
-        if not self._sa._sf_prepared:
-            self._sa.prepare(
-                num_reads=self.ADAPT_MAX_READS,
-                num_sweeps=self.ADAPT_MAX_SWEEPS,
-                num_sweeps_per_beta=1,
-            )
-            self._sa.prepare_self_feeding(
-                num_nonces=num_k,
-                reads_per_nonce=num_reads,
-                num_sweeps=num_sweeps,
-                num_sweeps_per_beta=spb,
-            )
+        if not self._sampler._sf_prepared:
+            if self._is_gibbs:
+                self._sampler.prepare(
+                    num_reads=self.ADAPT_MAX_READS,
+                    num_sweeps=self.ADAPT_MAX_SWEEPS,
+                    num_sweeps_per_beta=1,
+                    max_nonces=num_k,
+                )
+                self._sampler.prepare_self_feeding(
+                    num_nonces=num_k,
+                    reads_per_nonce=num_reads,
+                    num_sweeps=num_sweeps,
+                    num_sweeps_per_beta=spb,
+                    sms_per_nonce=self.sms_per_nonce,
+                )
+            else:
+                self._sampler.prepare(
+                    num_reads=self.ADAPT_MAX_READS,
+                    num_sweeps=self.ADAPT_MAX_SWEEPS,
+                    num_sweeps_per_beta=1,
+                )
+                self._sampler.prepare_self_feeding(
+                    num_nonces=num_k,
+                    reads_per_nonce=num_reads,
+                    num_sweeps=num_sweeps,
+                    num_sweeps_per_beta=spb,
+                )
             # Initialize per-kernel state:
             # slots 0=active, 1=next, 2=free
             self._kernels = [
@@ -182,7 +231,7 @@ class CudaMiner(GPUMiner):
 
         if not self._beta_uploaded:
             self._num_betas, _ = (
-                self._sa.upload_beta_schedule(
+                self._sampler.upload_beta_schedule(
                     model.h, model.J, num_sweeps, spb,
                 )
             )
@@ -193,7 +242,7 @@ class CudaMiner(GPUMiner):
         if idx < num_k:
             nonce_id = idx
             ks = self._kernels[nonce_id]
-            self._sa.upload_slot(
+            self._sampler.upload_slot(
                 nonce_id, ks.active_slot,
                 model.h, model.J,
             )
@@ -201,7 +250,7 @@ class CudaMiner(GPUMiner):
         elif idx < 2 * num_k:
             nonce_id = idx - num_k
             ks = self._kernels[nonce_id]
-            self._sa.upload_slot(
+            self._sampler.upload_slot(
                 nonce_id, ks.next_slot,
                 model.h, model.J,
             )
@@ -210,7 +259,7 @@ class CudaMiner(GPUMiner):
             placed = False
             for nonce_id, ks in enumerate(self._kernels):
                 if ks.free_slot >= 0:
-                    self._sa.upload_slot(
+                    self._sampler.upload_slot(
                         nonce_id, ks.free_slot,
                         model.h, model.J,
                     )
@@ -228,7 +277,7 @@ class CudaMiner(GPUMiner):
     def _kernel_signal_ready(self) -> None:
         """Launch self-feeding kernel if not running."""
         if not self._kernel_launched:
-            self._sa.launch_self_feeding(
+            self._sampler.launch_self_feeding(
                 num_betas=self._num_betas,
             )
             self._kernel_launched = True
@@ -245,8 +294,8 @@ class CudaMiner(GPUMiner):
         if not self._kernel_launched:
             return None
 
-        ctrl = cp.asnumpy(self._sa._d_sf_ctrl)
-        stride = self._sa.CTRL_STRIDE
+        ctrl = cp.asnumpy(self._sampler._d_sf_ctrl)
+        stride = self._sampler.CTRL_STRIDE
 
         for nonce_id, ks in enumerate(self._kernels):
             if ks.active_job < 0:
@@ -258,14 +307,13 @@ class CudaMiner(GPUMiner):
                 continue
 
             # Download completed results
-            ss = self._sa.download_slot(
+            ss = self._sampler.download_slot(
                 nonce_id, ks.active_slot,
             )
             job_id = ks.active_job
 
             # Rotate: active->free, next->active
-            old_active = ks.active_slot
-            ks.free_slot = old_active
+            ks.free_slot = ks.active_slot
             ks.active_slot = ks.next_slot
             ks.active_job = ks.next_job
             ks.next_slot = -1
@@ -285,7 +333,7 @@ class CudaMiner(GPUMiner):
         """Signal kernel exit, clean up resources."""
         if self._kernel_launched:
             try:
-                self._sa.signal_exit()
+                self._sampler.signal_exit()
             except Exception:
                 pass
             self._kernel_launched = False
@@ -296,5 +344,5 @@ class CudaMiner(GPUMiner):
     def _post_mine_cleanup(self) -> None:
         """Release kernel, feeder, and scheduler."""
         super()._post_mine_cleanup()
-        self._sa.close()
+        self._sampler.close()
         self._scheduler.stop()

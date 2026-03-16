@@ -146,10 +146,13 @@ def _coexist_worker(miner_cls_name, label, device, result_file):
     import json
 
     # Import miner class by name to avoid pickling issues
-    if miner_cls_name == "CudaMiner":
-        from GPU.cuda_miner import CudaMiner as cls
+    from GPU.cuda_miner import CudaMiner
+
+    if miner_cls_name == "CudaGibbsMiner":
+        def cls(*a, **kw):
+            return CudaMiner(*a, update_mode="gibbs", **kw)
     else:
-        from GPU.cuda_gibbs_miner import CudaGibbsMiner as cls
+        cls = CudaMiner
 
     try:
         trial = run_trial(
@@ -237,15 +240,18 @@ def run_coexistence_test(device):
 def main():
     device = "0"
 
+    from functools import partial
     from GPU.cuda_miner import CudaMiner
-    from GPU.cuda_gibbs_miner import CudaGibbsMiner
+
+    def GibbsMiner(*a, **kw):
+        return CudaMiner(*a, update_mode="gibbs", **kw)
 
     all_results = []
 
     # --- Single-miner trials ---
     for miner_cls, name in [
         (CudaMiner, "SA"),
-        (CudaGibbsMiner, "Gibbs"),
+        (GibbsMiner, "Gibbs"),
     ]:
         for util in [25, 50, 75, 100]:
             label = f"{name}-{util}pct"

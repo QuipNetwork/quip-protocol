@@ -118,7 +118,9 @@ def main():
     device = "0"  # CUDA_VISIBLE_DEVICES remaps
 
     from GPU.cuda_miner import CudaMiner
-    from GPU.cuda_gibbs_miner import CudaGibbsMiner
+
+    def GibbsMiner(*a, **kw):
+        return CudaMiner(*a, update_mode="gibbs", **kw)
 
     results = {}
 
@@ -134,7 +136,7 @@ def main():
     for yielding in [False, True]:
         tag = f"Gibbs-yield={yielding}"
         elapsed, res = run_trial(
-            tag, CudaGibbsMiner, device, yielding,
+            tag, GibbsMiner, device, yielding,
         )
         results[tag] = elapsed
 

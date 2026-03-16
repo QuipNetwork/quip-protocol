@@ -10,6 +10,12 @@ except ImportError:
     GPUMiner = None
     CudaMiner = None
 
+# Try to import CUDA Gibbs sampler (separate class, same CudaMiner)
+try:
+    from .cuda_gibbs_sa import CudaGibbsSampler
+except ImportError:
+    CudaGibbsSampler = None
+
 # Try to import Modal components
 try:
     from .modal_sampler import ModalSampler, gpu_app
@@ -31,16 +37,6 @@ except ImportError:
     MetalSASampler = None
     MetalMiner = None
 
-# Try to import CUDA Gibbs components (only available with cupy)
-try:
-    from .cuda_gibbs_sa import CudaGibbsSampler
-    from .cuda_gibbs_miner import CudaGibbsMiner
-    CUDA_GIBBS_AVAILABLE = True
-except ImportError:
-    CUDA_GIBBS_AVAILABLE = False
-    CudaGibbsSampler = None
-    CudaGibbsMiner = None
-
 # Try to import Metal Gibbs components (only available on macOS)
 try:
     from .metal_gibbs_sa import MetalGibbsSampler
@@ -55,7 +51,8 @@ GPU_AVAILABLE = CUDA_AVAILABLE or MODAL_AVAILABLE
 __all__ = [
     'ModalSampler',
     'ModalMiner',
-    'gpu_app', 'GPU_AVAILABLE', 'METAL_AVAILABLE', 'MODAL_AVAILABLE'
+    'gpu_app', 'GPU_AVAILABLE', 'METAL_AVAILABLE',
+    'MODAL_AVAILABLE',
 ]
 
 # Add CUDA components if available
@@ -70,13 +67,8 @@ if MODAL_AVAILABLE:
 if METAL_AVAILABLE:
     __all__.extend(['MetalSASampler', 'MetalMiner'])
 
-# Add CUDA Gibbs components if available
-if CUDA_GIBBS_AVAILABLE:
-    __all__.extend([
-        'CudaGibbsSampler', 'CudaGibbsMiner',
-        'CUDA_GIBBS_AVAILABLE',
-    ])
-
 # Add Metal Gibbs components if available
 if METAL_GIBBS_AVAILABLE:
-    __all__.extend(['MetalGibbsSampler', 'METAL_GIBBS_AVAILABLE'])
+    __all__.extend([
+        'MetalGibbsSampler', 'METAL_GIBBS_AVAILABLE',
+    ])

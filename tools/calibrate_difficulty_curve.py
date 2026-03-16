@@ -33,7 +33,7 @@ except ImportError:
     METAL_AVAILABLE = False
 
 try:
-    from GPU.cuda_sa import CudaSASampler
+    from GPU.cuda_sa_sampler import CudaSASampler
     CUDA_AVAILABLE = False  # Disabled for now (requires CUDA machine)
 except ImportError:
     CUDA_AVAILABLE = False

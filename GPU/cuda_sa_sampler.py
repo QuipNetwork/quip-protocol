@@ -19,7 +19,7 @@ import cupy as cp
 import dimod
 import numpy as np
 
-from GPU.sampler_utils import (
+from GPU.gpu_miner import (
     build_csr_structure_from_edges,
     build_edge_position_index,
     compute_beta_schedule,
