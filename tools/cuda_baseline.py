@@ -110,11 +110,11 @@ def cuda_baseline_test(
             f"({len(nodes)} qubits, {len(edges)} couplers)"
         )
     else:
-        print("✨ Using perfect topology (default)")
+        print(f"✨ Using default topology ({DEFAULT_TOPOLOGY.solver_name})")
         nodes = list(DEFAULT_TOPOLOGY.graph.nodes)
         edges = list(DEFAULT_TOPOLOGY.graph.edges)
         topology_desc = (
-            f"perfect Z(9,2) "
+            f"{DEFAULT_TOPOLOGY.solver_name} "
             f"({len(nodes)} nodes, {len(edges)} edges)"
         )
 

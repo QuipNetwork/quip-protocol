@@ -134,12 +134,12 @@ def cuda_gibbs_baseline_test(
                 f"{len(edges)} edges)"
             )
     else:
-        print("✨ Using perfect topology (default)")
+        print(f"✨ Using default topology ({DEFAULT_TOPOLOGY.solver_name})")
         topo_obj = DEFAULT_TOPOLOGY
         nodes = list(topo_obj.graph.nodes)
         edges = list(topo_obj.graph.edges)
         topology_desc = (
-            f"perfect Z(9,2) "
+            f"{topo_obj.solver_name} "
             f"({len(nodes)} nodes, {len(edges)} edges)"
         )
 
