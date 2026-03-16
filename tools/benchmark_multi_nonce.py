@@ -59,38 +59,37 @@ def generate_nonce_batch(
 
 
 def calibrate_sa(sampler, num_nonces, num_reads):
-    """Find num_betas for SA to hit target avg energy."""
+    """Find num_sweeps for SA to hit target avg energy."""
     nodes, edges = get_topology_info()
     cal_n = min(4, num_nonces)
     h_list, J_list = generate_nonce_batch(
         nodes, edges, cal_n,
     )
 
-    best_betas = 50
+    best_sweeps = 50
     best_energy = 0.0
 
-    for num_betas in [25, 50, 100, 200, 400]:
+    for num_sweeps in [25, 50, 100, 200, 400]:
         results = sampler.sample_ising(
             h_list, J_list,
             num_reads=num_reads,
-            num_betas=num_betas,
-            num_sweeps_per_beta=1,
+            num_sweeps=num_sweeps,
         )
         avg_e = np.mean([
             ss.record.energy.mean() for ss in results
         ])
         print(
-            f"  SA calibrate: betas={num_betas:4d}, "
+            f"  SA calibrate: sweeps={num_sweeps:4d}, "
             f"avg_energy={avg_e:.1f}"
         )
         if avg_e <= TARGET_ENERGY:
-            best_betas = num_betas
+            best_sweeps = num_sweeps
             best_energy = avg_e
             break
-        best_betas = num_betas
+        best_sweeps = num_sweeps
         best_energy = avg_e
 
-    return best_betas, best_energy
+    return best_sweeps, best_energy
 
 
 def calibrate_gibbs(
@@ -131,7 +130,7 @@ def calibrate_gibbs(
 
 
 def benchmark_sa(
-    sampler, sa_nonces, num_reads, num_betas,
+    sampler, sa_nonces, num_reads, num_sweeps,
 ):
     """Run SA multi-nonce benchmark and return metrics."""
     nodes, edges = get_topology_info()
@@ -148,8 +147,7 @@ def benchmark_sa(
         results = sampler.sample_ising(
             h_b, J_b,
             num_reads=num_reads,
-            num_betas=num_betas,
-            num_sweeps_per_beta=1,
+            num_sweeps=num_sweeps,
         )
         cp.cuda.Stream.null.synchronize()
         t1 = time.perf_counter()
@@ -207,27 +205,23 @@ def benchmark_gibbs(
 
 def run_sa_benchmark(args, avail_sms):
     """Run SA benchmark and return metrics dict."""
-    from GPU.cuda_kernel import CudaKernelRealSA
-    from GPU.cuda_sa import CudaKernelAdapter, CudaSASamplerAsync
+    from GPU.cuda_sa_sampler import CudaSASampler
 
     # SA: 1 SM per nonce
     sa_nonces = args.sa_nonces or avail_sms
 
     print(
-        f"=== SA Kernel (persistent, "
+        f"=== SA Kernel (self-feeding, "
         f"{sa_nonces} nonces) ===",
     )
-    sa_kernel = CudaKernelRealSA(max_N=5000, verbose=False)
-    sa_sampler = CudaSASamplerAsync(
-        CudaKernelAdapter(sa_kernel),
-    )
+    sa_sampler = CudaSASampler()
 
     print("Calibrating SA...")
-    sa_betas, sa_cal_e = calibrate_sa(
+    sa_sweeps, sa_cal_e = calibrate_sa(
         sa_sampler, sa_nonces, args.sa_reads,
     )
     print(
-        f"  -> betas={sa_betas}, "
+        f"  -> sweeps={sa_sweeps}, "
         f"calibration energy={sa_cal_e:.1f}",
     )
     print()
@@ -235,7 +229,7 @@ def run_sa_benchmark(args, avail_sms):
     print("Benchmarking SA...")
     sa_avg_e, sa_mps, sa_time = benchmark_sa(
         sa_sampler, sa_nonces,
-        args.sa_reads, sa_betas,
+        args.sa_reads, sa_sweeps,
     )
     print(
         f"  SA: avg_energy={sa_avg_e:.1f}, "
@@ -245,14 +239,14 @@ def run_sa_benchmark(args, avail_sms):
     print()
 
     # Tear down SA to free GPU memory
-    sa_sampler.stop_immediate()
-    del sa_kernel
+    sa_sampler.close()
+    del sa_sampler
     cp.get_default_memory_pool().free_all_blocks()
 
     return {
         'nonces': sa_nonces,
         'reads': args.sa_reads,
-        'betas': sa_betas,
+        'sweeps': sa_sweeps,
         'avg_energy': sa_avg_e,
         'models_per_sec': sa_mps,
         'batch_time': sa_time,
@@ -404,8 +398,8 @@ def main():  # noqa: C901
             f"{gibbs_result['reads']:>15}",
         )
         print(
-            f"{'Sweeps/betas':<25} "
-            f"{sa_result['betas']:>15} "
+            f"{'Sweeps':<25} "
+            f"{sa_result['sweeps']:>15} "
             f"{gibbs_result['sweeps']:>15}",
         )
         print(

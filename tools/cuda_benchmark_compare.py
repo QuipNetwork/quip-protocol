@@ -43,7 +43,7 @@ import numpy as np
 # Project imports
 from dwave_topologies import DEFAULT_TOPOLOGY
 from GPU.cuda_gibbs_sa import CudaGibbsSampler
-from GPU.cuda_kernel import CudaKernelRealSA
+from GPU.cuda_sa_sampler import CudaSASampler
 from shared.beta_schedule import _default_ising_beta_range
 from shared.energy_utils import energy_to_difficulty
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce
@@ -157,9 +157,7 @@ def resolve_sa_batch_size(sa_batch: int) -> int:
 
 def run_sa_batch(models, num_reads, num_betas,
                  sweeps_per_beta, profile):
-    """Pipeline a batch of models through SA ring buffer.
-
-    Enqueues all jobs, signals batch ready, dequeues all results.
+    """Run a batch of models through SA self-feeding kernel.
 
     Args:
         models: List of (seed, h_dict, J_dict) tuples.
@@ -172,54 +170,29 @@ def run_sa_batch(models, num_reads, num_betas,
         (energies, wall_time, profile_data_or_None)
     """
     batch_size = len(models)
-    ring_size = max(batch_size, 16)
-
-    # Sync GPU before creating kernel to clear stale state
     cp.cuda.Device().synchronize()
 
-    kernel = CudaKernelRealSA(
-        profile=profile, verbose=False,
-        ring_size=ring_size,
-    )
+    sampler = CudaSASampler(profile=profile)
     capped_reads = min(num_reads, 256)
+    num_sweeps = num_betas * sweeps_per_beta
+
+    h_list = [m[1] for m in models]
+    J_list = [m[2] for m in models]
 
     t0 = time.perf_counter()
-    for i, (seed, h, J) in enumerate(models):
-        beta_range = _default_ising_beta_range(h, J)
-        kernel.enqueue_job(
-            job_id=i, h=h, J=J,
-            num_reads=capped_reads,
-            num_betas=num_betas,
-            num_sweeps_per_beta=sweeps_per_beta,
-            beta_range=beta_range,
-        )
-    kernel.signal_batch_ready()
-
-    # Dequeue all results with adaptive timeout
-    results = {}
-    deadline = time.time() + max(600, batch_size * 120)
-    while len(results) < batch_size and time.time() < deadline:
-        try:
-            r = kernel.try_dequeue_result()
-        except cp.cuda.runtime.CUDARuntimeError as e:
-            print(
-                f"    CUDA error in dequeue "
-                f"({len(results)}/{batch_size} done): {e}"
-            )
-            break
-        if r is not None:
-            results[r["job_id"]] = r
-        else:
-            time.sleep(0.01)
-
+    results = sampler.sample_ising(
+        h_list, J_list,
+        num_reads=capped_reads,
+        num_sweeps=num_sweeps,
+        num_sweeps_per_beta=sweeps_per_beta,
+    )
     wall = time.perf_counter() - t0
-    kernel.stop_immediate()
-    data = kernel.get_profile_data() if profile else None
+
+    data = sampler.get_profile_data() if profile else None
 
     energies = [
-        float(results[i]["min_energy"]) if i in results
-        else float("nan")
-        for i in range(batch_size)
+        float(ss.record.energy.min())
+        for ss in results
     ]
     return energies, wall, data
 
@@ -242,7 +215,7 @@ def build_aggregate_profile(all_profiles, kernel_name):
     """
     num_regions = (
         12 if kernel_name == "gibbs"
-        else CudaKernelRealSA.SA_NUM_REGIONS
+        else CudaSASampler.SA_NUM_REGIONS
     )
     active_rows = []
     for data in all_profiles:

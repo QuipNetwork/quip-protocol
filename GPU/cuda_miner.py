@@ -1,23 +1,29 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""CUDA SA miner — thin kernel adapter over GPUMiner.
+"""CUDA SA miner — self-feeding kernel adapter over GPUMiner.
 
-Uses CudaKernelRealSA persistent kernel with 1 SM per model.
-Each SM has a ring-buffer slot: the host enqueues models,
-the kernel grabs them, processes SA sweeps, writes output.
+Uses CudaSASampler self-feeding kernel with 1 SM per model.
+Each kernel (nonce) has 3 rotating slots:
+
+    completed | active | next
+
+The kernel works on the active slot, then switches to next.
+If no next is available, the kernel exits. The host tracks
+per-kernel slot assignments and polls only active slots for
+completion, then downloads + re-enqueues immediately.
 """
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+import dataclasses
+from typing import Any, List, Optional, Tuple
 
 import dimod
 import numpy as np
 
-from shared.beta_schedule import _default_ising_beta_range
 from shared.ising_model import IsingModel
 from GPU.gpu_miner import GPUMiner
-from GPU.cuda_kernel import CudaKernelRealSA
+from GPU.cuda_sa_sampler import CudaSASampler
 from dwave_topologies import DEFAULT_TOPOLOGY
 
 try:
@@ -25,27 +31,42 @@ try:
 except ImportError:
     cp = None
 
+# Slot states matching CudaSASampler constants
+_SLOT_COMPLETE = 3
 
-class _SASampler:
-    """Minimal sampler stub for BaseMiner topology access."""
 
-    def __init__(self, nodes, edges, properties):
-        self.nodes = nodes
-        self.edges = edges
-        self.nodelist = nodes
-        self.edgelist = edges
-        self.properties = properties
-        self.sampler_type = "cuda-persistent"
+@dataclasses.dataclass(slots=True)
+class KernelState:
+    """Per-kernel (nonce) slot assignment.
 
-    def sample_ising(self, h, J, **kw):
-        raise NotImplementedError
+    Tracks which slot holds the active job, which holds
+    the next job, and which is free for upload.
+
+    Attributes:
+        active_slot: Slot the kernel is computing on.
+        active_job: Job ID in the active slot.
+        next_slot: Preloaded slot, kernel picks up next.
+        next_job: Job ID in the next slot, or -1 if empty.
+        free_slot: Slot available for new model upload.
+    """
+
+    active_slot: int
+    active_job: int
+    next_slot: int
+    next_job: int
+    free_slot: int
 
 
 class CudaMiner(GPUMiner):
-    """CUDA GPU miner using persistent SA kernel.
+    """CUDA GPU miner using self-feeding SA kernel.
 
     1 SM per model. Inherits pipeline, feeder, scheduler,
     and SIGTERM cleanup from GPUMiner.
+
+    Per-kernel slot lifecycle:
+        Host uploads to free_slot -> becomes next_slot.
+        Kernel finishes active_slot -> switches to next_slot.
+        Host downloads completed active_slot -> becomes free.
     """
 
     ADAPT_MIN_SWEEPS = 256
@@ -67,36 +88,48 @@ class CudaMiner(GPUMiner):
         gpu_util = cfg.pop('gpu_utilization', 100)
         yielding = cfg.pop('yielding', False)
 
+        dev_id = int(device)
+        GPUMiner._init_cuda_device(
+            self, dev_id, gpu_util, yielding,
+        )
+
         topology_obj = (
             topology
             if topology is not None
             else DEFAULT_TOPOLOGY
         )
-        nodes = list(topology_obj.graph.nodes)
-        edges = list(topology_obj.graph.edges)
 
-        sampler = _SASampler(
-            nodes, edges, topology_obj.properties,
+        device_sms = cp.cuda.Device(
+            dev_id,
+        ).attributes['MultiProcessorCount']
+        sm_ceiling = max(
+            1, int(device_sms * gpu_util / 100),
         )
 
-        # GPUMiner.__init__ sets MPS + CUDA device context
+        self._sa = CudaSASampler(
+            topology=topology_obj,
+            max_sms=sm_ceiling,
+        )
+
         super().__init__(
             miner_id,
-            sampler,
+            self._sa,
             device=device,
             gpu_utilization=gpu_util,
             yielding=yielding,
             miner_type="GPU-CUDA",
         )
 
-        # Kernel must be created after CUDA context
-        self._kernel = CudaKernelRealSA(
-            max_N=5000, verbose=False,
-        )
+        # Per-kernel slot tracking (indexed by nonce_id)
+        self._kernels: List[KernelState] = []
+        self._kernel_launched = False
+        self._num_betas = 0
+        self._beta_uploaded = False
+        self._enqueue_count = 0
 
         self.logger.info(
             "CUDA SA miner on device %s "
-            "(persistent, utilization=%d%%)",
+            "(self-feeding, utilization=%d%%)",
             device, gpu_util,
         )
 
@@ -113,42 +146,155 @@ class CudaMiner(GPUMiner):
         num_sweeps: int,
         **params,
     ) -> None:
-        beta_range = _default_ising_beta_range(
-            model.h, model.J,
-        )
-        self._kernel.enqueue_job(
-            job_id=job_id,
-            h=model.h,
-            J=model.J,
-            num_reads=num_reads,
-            num_betas=num_sweeps,
-            num_sweeps_per_beta=params.get(
-                'num_sweeps_per_beta', 1,
-            ),
-            beta_range=beta_range,
-        )
+        """Upload model to a kernel's free slot.
+
+        First N calls (cold start) fill slot 0 of each
+        kernel as the initial active slot. Next N calls
+        fill slot 1 as the next slot. Subsequent calls
+        rotate into whatever slot is free.
+        """
+        num_k = self._num_kernels
+        spb = params.get('num_sweeps_per_beta', 1)
+
+        # Lazy init: prepare buffers on first enqueue
+        if not self._sa._sf_prepared:
+            self._sa.prepare(
+                num_reads=self.ADAPT_MAX_READS,
+                num_sweeps=self.ADAPT_MAX_SWEEPS,
+                num_sweeps_per_beta=1,
+            )
+            self._sa.prepare_self_feeding(
+                num_nonces=num_k,
+                reads_per_nonce=num_reads,
+                num_sweeps=num_sweeps,
+                num_sweeps_per_beta=spb,
+            )
+            # Initialize per-kernel state:
+            # slots 0=active, 1=next, 2=free
+            self._kernels = [
+                KernelState(
+                    active_slot=0, active_job=-1,
+                    next_slot=1, next_job=-1,
+                    free_slot=2,
+                )
+                for _ in range(num_k)
+            ]
+
+        if not self._beta_uploaded:
+            self._num_betas, _ = (
+                self._sa.upload_beta_schedule(
+                    model.h, model.J, num_sweeps, spb,
+                )
+            )
+            self._beta_uploaded = True
+
+        # Cold start: fill active (slot 0), then next (slot 1)
+        idx = self._enqueue_count
+        if idx < num_k:
+            nonce_id = idx
+            ks = self._kernels[nonce_id]
+            self._sa.upload_slot(
+                nonce_id, ks.active_slot,
+                model.h, model.J,
+            )
+            ks.active_job = job_id
+        elif idx < 2 * num_k:
+            nonce_id = idx - num_k
+            ks = self._kernels[nonce_id]
+            self._sa.upload_slot(
+                nonce_id, ks.next_slot,
+                model.h, model.J,
+            )
+            ks.next_job = job_id
+        else:
+            placed = False
+            for nonce_id, ks in enumerate(self._kernels):
+                if ks.free_slot >= 0:
+                    self._sa.upload_slot(
+                        nonce_id, ks.free_slot,
+                        model.h, model.J,
+                    )
+                    ks.next_slot = ks.free_slot
+                    ks.next_job = job_id
+                    ks.free_slot = -1
+                    placed = True
+                    break
+            assert placed, (
+                f"No free slot for job {job_id}"
+            )
+
+        self._enqueue_count += 1
 
     def _kernel_signal_ready(self) -> None:
-        self._kernel.signal_batch_ready()
+        """Launch self-feeding kernel if not running."""
+        if not self._kernel_launched:
+            self._sa.launch_self_feeding(
+                num_betas=self._num_betas,
+            )
+            self._kernel_launched = True
 
     def _kernel_try_dequeue(
         self,
     ) -> Optional[Tuple[int, Any]]:
-        result = self._kernel.try_dequeue_result()
-        if result is None:
+        """Poll only active slots for completion.
+
+        Reads the ctrl array and checks slot_state for
+        each kernel's active_slot. On COMPLETE: downloads
+        results, rotates slots, returns (job_id, sampleset).
+        """
+        if not self._kernel_launched:
             return None
-        return (result.get('job_id', 0), result)
+
+        ctrl = cp.asnumpy(self._sa._d_sf_ctrl)
+        stride = self._sa.CTRL_STRIDE
+
+        for nonce_id, ks in enumerate(self._kernels):
+            if ks.active_job < 0:
+                continue
+            base = nonce_id * stride
+            state = ctrl[base + ks.active_slot]
+
+            if state != _SLOT_COMPLETE:
+                continue
+
+            # Download completed results
+            ss = self._sa.download_slot(
+                nonce_id, ks.active_slot,
+            )
+            job_id = ks.active_job
+
+            # Rotate: active->free, next->active
+            old_active = ks.active_slot
+            ks.free_slot = old_active
+            ks.active_slot = ks.next_slot
+            ks.active_job = ks.next_job
+            ks.next_slot = -1
+            ks.next_job = -1
+
+            return (job_id, ss)
+
+        return None
 
     def _kernel_harvest(
         self, raw_result: Any,
     ) -> dimod.SampleSet:
-        samples = self._kernel.get_samples(raw_result)
-        energies = self._kernel.get_energies(raw_result)
-        return dimod.SampleSet.from_samples(
-            samples.astype(np.int8),
-            vartype='SPIN',
-            energy=energies,
-        )
+        """Result is already a SampleSet from download_slot."""
+        return raw_result
 
     def _kernel_stop(self) -> None:
-        self._kernel.stop_immediate()
+        """Signal kernel exit, clean up resources."""
+        if self._kernel_launched:
+            try:
+                self._sa.signal_exit()
+            except Exception:
+                pass
+            self._kernel_launched = False
+        self._kernels.clear()
+        self._beta_uploaded = False
+        self._enqueue_count = 0
+
+    def _post_mine_cleanup(self) -> None:
+        """Release kernel, feeder, and scheduler."""
+        super()._post_mine_cleanup()
+        self._sa.close()
+        self._scheduler.stop()

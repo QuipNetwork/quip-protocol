@@ -70,13 +70,13 @@ GIBBS_SOURCE_MAP = {
 
 # These map to cuda_sa_self_feeding in cuda_sa.cu
 SA_SOURCE_MAP = {
-    0: (447, 514),  # SA_TOTAL
-    1: (449, 455),  # BETA_OVERHEAD
-    2: (458, 511),  # SWEEP_TOTAL
-    4: (460, 466),  # THRESHOLD_SKIP
-    5: (469, 483),  # ACCEPT_DECIDE
-    6: (486, 508),  # FLIP_TOTAL
-    7: (495, 502),  # NEIGHBOR_LOOP
+    0: (269, 369),  # SA_TOTAL
+    1: (273, 277),  # BETA_OVERHEAD
+    2: (282, 366),  # SWEEP_TOTAL
+    4: (284, 291),  # THRESHOLD_SKIP
+    5: (295, 314),  # ACCEPT_DECIDE
+    6: (317, 363),  # FLIP_TOTAL
+    7: (336, 355),  # NEIGHBOR_LOOP
 }
 
 # Project root for resolving .cu file paths
@@ -148,56 +148,20 @@ def profile_gibbs(num_reads, num_sweeps):
 def profile_sa(num_reads, num_sweeps):
     """Run SA kernel with profiling and return data.
 
-    Uses CudaKernelRealSA persistent kernel: enqueue one job,
-    poll for result, then read profiling counters.
+    Uses CudaSASampler self-feeding kernel: upload one model,
+    launch, poll for completion, then read profiling counters.
     """
-    import time
-    from GPU.cuda_kernel import CudaKernelRealSA
-    from shared.beta_schedule import _default_ising_beta_range
+    from GPU.cuda_sa_sampler import CudaSASampler
 
     h_dict, J_dict = build_ising_problem()
 
-    num_betas = num_sweeps
-    num_sweeps_per_beta = 1
-    beta_range = _default_ising_beta_range(h_dict, J_dict)
-
-    kernel = CudaKernelRealSA(
-        profile=True, verbose=False,
-    )
-
-    kernel.enqueue_job(
-        job_id=0,
-        h=h_dict,
-        J=J_dict,
+    sampler = CudaSASampler(profile=True)
+    sampler.sample_ising(
+        [h_dict], [J_dict],
         num_reads=min(num_reads, 256),
-        num_betas=num_betas,
-        num_sweeps_per_beta=num_sweeps_per_beta,
-        beta_range=beta_range,
+        num_sweeps=num_sweeps,
     )
-    kernel.signal_batch_ready()
-
-    # Poll for result — profiled kernels are slower due
-    # to clock64() overhead, so allow generous timeout.
-    deadline = time.time() + 300.0
-    result = None
-    while time.time() < deadline:
-        result = kernel.try_dequeue_result()
-        if result is not None:
-            break
-        time.sleep(0.05)
-
-    if result is None:
-        print(
-            "WARNING: SA persistent kernel did not produce "
-            "a result within 300s."
-        )
-
-    # Drain lets the kernel finish its current job so
-    # profile counters are fully written.
-    kernel.stop_drain()
-    data = kernel.get_profile_data()
-
-    return data
+    return sampler.get_profile_data()
 
 
 def print_sa_profile(data, clock_khz, num_reads, num_sweeps):

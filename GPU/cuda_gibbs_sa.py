@@ -493,6 +493,10 @@ class CudaGibbsSampler:
                 sms_per_nonce=sms_per_nonce,
             )
 
+        # Reset ctrl array (clears stale EXIT_NOW from
+        # previous sample_ising call)
+        self._d_sf_ctrl[:] = 0
+
         # Upload beta schedule
         num_betas, beta_range = self.upload_beta_schedule(
             h[0], J[0], num_sweeps,
@@ -505,6 +509,7 @@ class CudaGibbsSampler:
             self.upload_slot(i, 0, h[i], J[i])
 
         # Launch kernel
+        self._sf_kernel_running = False  # allow re-launch
         self.launch_self_feeding(
             num_betas=num_betas,
             seed=seed,
@@ -819,6 +824,11 @@ class CudaGibbsSampler:
             beta_schedule_type, None,
         )
         num_betas = len(sched)
+        # Grow beta buffer if schedule exceeds allocation
+        if num_betas > len(self._d_sf_beta):
+            self._d_sf_beta = cp.zeros(
+                num_betas, dtype=cp.float32,
+            )
         self._d_sf_beta[:num_betas].set(sched)
         self._sf_beta_range = beta_range
         return num_betas, beta_range
