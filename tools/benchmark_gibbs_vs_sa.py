@@ -50,7 +50,7 @@ def bench_cuda_gibbs(h, J, num_reads, num_sweeps, n_models):
 
 def bench_cuda_sa(h, J, num_reads, num_sweeps, n_models):
     """Benchmark CUDA SA sampler (self-feeding)."""
-    from GPU.cuda_sa_sampler import CudaSASampler
+    from GPU.cuda_sa import CudaSASampler
 
     sampler = CudaSASampler()
     # warmup

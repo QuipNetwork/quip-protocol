@@ -127,7 +127,7 @@ class CudaMiner(GPUMiner):
             )
             miner_type = "GPU-CUDA-Gibbs"
         else:
-            from GPU.cuda_sa_sampler import CudaSASampler
+            from GPU.cuda_sa import CudaSASampler
             self._sampler = CudaSASampler(
                 topology=topology_obj,
                 max_sms=sm_ceiling,

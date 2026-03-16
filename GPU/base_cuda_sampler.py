@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""CUDA Simulated Annealing Sampler - self-feeding persistent kernel.
+"""Abstract base class for CUDA self-feeding kernel samplers.
 
-3-slot rotating buffer architecture: the kernel autonomously grabs
-READY slots via atomicCAS, processes SA sweeps with thread-local
-unpacked state, marks COMPLETE, and grabs the next slot. No host
-signaling needed.
+Captures the shared 3-slot rotating buffer protocol used by
+both CudaSASampler and CudaGibbsSampler. Subclasses provide
+kernel-specific compilation, buffer allocation, and launch
+arguments.
 
-1 block per nonce, 1 SM per block. 48 SMs → 48 concurrent nonces.
+Control layout per nonce (CTRL_STRIDE=8 ints):
+    [0..2] slot_state  [3] active_slot  [4] blocks_done
+    [5] work_queue  [6] exit_now  [7] generation
 """
+from __future__ import annotations
 
+import abc
 import logging
 import os
 from typing import Dict, List, Optional, Tuple
@@ -19,24 +23,32 @@ import cupy as cp
 import dimod
 import numpy as np
 
-from GPU.gpu_miner import (
+from GPU.sampler_utils import (
     build_csr_structure_from_edges,
     build_edge_position_index,
     compute_beta_schedule,
-    default_ising_beta_range,
     unpack_packed_results,
 )
 
 
-class CudaSASampler:
-    """Self-feeding SA sampler using CUDA GPU.
+class BaseCudaSampler(abc.ABC):
+    """Abstract base for CUDA self-feeding kernel samplers.
 
-    Each nonce gets 1 block (1 SM) with 3 rotating slots.
-    Threads within the block process reads independently
-    using thread-local state + delta_energy workspace.
+    Provides the shared 3-slot rotating buffer protocol:
+    prepare topology, allocate self-feeding buffers, upload
+    models, launch/poll/download/signal the kernel.
+
+    Subclasses implement kernel-specific hooks:
+        _kernel_filename()
+        _kernel_function_name()
+        _num_profile_regions()
+        _extra_compile_options()
+        _sms_per_nonce (property)
+        _allocate_kernel_buffers()
+        _kernel_launch_args()
+        _extra_download_info()
     """
 
-    SA_NUM_REGIONS = 10
     CTRL_STRIDE = 8
     SLOT_EMPTY = 0
     SLOT_READY = 1
@@ -48,23 +60,28 @@ class CudaSASampler:
         topology=None,
         max_sms: int = 0,
         profile: bool = False,
+        sampler_type: str = "cuda",
     ):
-        """Initialize CUDA SA sampler.
+        """Initialize base CUDA sampler.
 
         Args:
             topology: Topology object (default: DEFAULT_TOPOLOGY).
             max_sms: Maximum SMs to use (0 = all available).
             profile: Compile with PROFILE_REGIONS for clock64()
                 instrumentation.
+            sampler_type: Identifier string for this sampler.
         """
         self.profile = profile
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger(
+            type(self).__module__,
+        )
         self.max_sms = max_sms
-        self.sampler_type = "cuda-sa"
+        self.sampler_type = sampler_type
 
         from dwave_topologies import DEFAULT_TOPOLOGY
         topology_obj = (
-            topology if topology is not None else DEFAULT_TOPOLOGY
+            topology if topology is not None
+            else DEFAULT_TOPOLOGY
         )
         topology_graph = topology_obj.graph
         self.nodes = list(topology_graph.nodes())
@@ -75,7 +92,10 @@ class CudaSASampler:
 
         # Compile CUDA kernel
         kernel_path = os.path.join(
-            os.path.dirname(__file__), 'cuda_sa.cu',
+            os.path.dirname(
+                os.path.abspath(__file__),
+            ),
+            self._kernel_filename(),
         )
         with open(kernel_path, 'r') as f:
             kernel_code = f.read()
@@ -83,16 +103,88 @@ class CudaSASampler:
         compile_options = ['--use_fast_math']
         if self.profile:
             compile_options.append('-DPROFILE_REGIONS=1')
+        compile_options.extend(
+            self._extra_compile_options(),
+        )
         self._module = cp.RawModule(
             code=kernel_code,
             options=tuple(compile_options),
         )
         self._self_feeding_kernel = self._module.get_function(
-            'cuda_sa_self_feeding',
+            self._kernel_function_name(),
         )
 
         self._prepared = False
         self._sf_prepared = False
+
+    # ----------------------------------------------------------
+    # Abstract hooks for subclasses
+    # ----------------------------------------------------------
+
+    @abc.abstractmethod
+    def _kernel_filename(self) -> str:
+        """CUDA source file name (e.g., 'cuda_sa.cu')."""
+
+    @abc.abstractmethod
+    def _kernel_function_name(self) -> str:
+        """Kernel entry point name."""
+
+    @abc.abstractmethod
+    def _num_profile_regions(self) -> int:
+        """Number of profiling regions in the kernel."""
+
+    def _extra_compile_options(self) -> List[str]:
+        """Extra nvcc compile options (default: none)."""
+        return []
+
+    @property
+    @abc.abstractmethod
+    def _sms_per_nonce(self) -> int:
+        """CUDA blocks launched per nonce group."""
+
+    @abc.abstractmethod
+    def _allocate_kernel_buffers(
+        self,
+        num_nonces: int,
+        reads_per_nonce: int,
+        num_sweeps: int,
+        num_sweeps_per_beta: int,
+    ) -> None:
+        """Allocate kernel-specific GPU buffers.
+
+        Called during prepare_self_feeding() after common
+        buffers are allocated. Subclass stores its own
+        device arrays as instance attributes.
+        """
+
+    @abc.abstractmethod
+    def _kernel_launch_args(
+        self,
+        active: int,
+        num_betas: int,
+        seed: int,
+    ) -> tuple:
+        """Build kernel launch args tuple.
+
+        Args:
+            active: Number of active nonces.
+            num_betas: Beta schedule length.
+            seed: RNG seed.
+
+        Returns:
+            Tuple of kernel arguments.
+        """
+
+    def _extra_download_info(self) -> dict:
+        """Extra metadata for download_slot SampleSet info.
+
+        Override to add sampler-specific info fields.
+        """
+        return {}
+
+    # ----------------------------------------------------------
+    # Shared prepare (topology CSR)
+    # ----------------------------------------------------------
 
     def prepare(
         self,
@@ -109,7 +201,9 @@ class CudaSASampler:
         """
         (csr_row_ptr, csr_col_ind, node_to_idx,
          sorted_neighbors, N, nnz) = (
-            build_csr_structure_from_edges(self.edges, self.nodes)
+            build_csr_structure_from_edges(
+                self.edges, self.nodes,
+            )
         )
 
         edge_positions = build_edge_position_index(
@@ -156,8 +250,13 @@ class CudaSASampler:
 
         self._prepared = True
         self.logger.info(
-            "SA topology prepared: N=%d, nnz=%d", N, nnz,
+            "%s topology prepared: N=%d, nnz=%d",
+            self.sampler_type, N, nnz,
         )
+
+    # ----------------------------------------------------------
+    # Self-feeding buffer allocation
+    # ----------------------------------------------------------
 
     def prepare_self_feeding(
         self,
@@ -165,6 +264,7 @@ class CudaSASampler:
         reads_per_nonce: int = 32,
         num_sweeps: int = 1000,
         num_sweeps_per_beta: int = 1,
+        **kwargs,
     ) -> None:
         """Allocate 3-slot rotating buffers for self-feeding.
 
@@ -173,6 +273,7 @@ class CudaSASampler:
             reads_per_nonce: Reads per nonce per model.
             num_sweeps: Max sweeps (for beta schedule size).
             num_sweeps_per_beta: Sweeps per beta value.
+            **kwargs: Passed to _allocate_kernel_buffers().
         """
         assert self._prepared, "Must call prepare() first"
 
@@ -213,13 +314,6 @@ class CudaSASampler:
             self._sf_max_num_betas, dtype=cp.float32,
         )
 
-        # Delta energy workspace: one per global thread
-        # Grid = num_nonces blocks × 256 threads
-        total_threads = num_nonces * 256
-        self._d_sf_delta_energy = cp.zeros(
-            total_threads * N, dtype=cp.int8,
-        )
-
         # Dedicated streams
         self._sf_stream_compute = cp.cuda.Stream(
             non_blocking=True,
@@ -228,11 +322,19 @@ class CudaSASampler:
             non_blocking=True,
         )
 
+        # Subclass-specific buffers
+        self._allocate_kernel_buffers(
+            num_nonces, reads_per_nonce,
+            num_sweeps, num_sweeps_per_beta,
+            **kwargs,
+        )
+
         # Profile buffer
         if self.profile:
-            max_work_units = total_threads
+            num_regions = self._num_profile_regions()
+            max_work_units = num_nonces * 10
             self._d_sf_profile = cp.zeros(
-                max_work_units * self.SA_NUM_REGIONS,
+                max_work_units * num_regions,
                 dtype=cp.int64,
             )
             self._sf_profile_work_units = max_work_units
@@ -241,10 +343,15 @@ class CudaSASampler:
         self._sf_prepared = True
 
         self.logger.info(
-            "SA self-feeding prepared: %d nonces × 3 slots, "
+            "%s self-feeding prepared: %d nonces × 3 slots, "
             "%d reads/nonce",
+            self.sampler_type,
             num_nonces, reads_per_nonce,
         )
+
+    # ----------------------------------------------------------
+    # Slot upload / download
+    # ----------------------------------------------------------
 
     def upload_slot(
         self,
@@ -362,88 +469,6 @@ class CudaSASampler:
         self._sf_beta_range = beta_range
         return num_betas, beta_range
 
-    def launch_self_feeding(
-        self,
-        num_betas: int,
-        seed: Optional[int] = None,
-        active_nonce_count: Optional[int] = None,
-    ) -> None:
-        """Launch self-feeding kernel (once, stays resident).
-
-        Args:
-            num_betas: Number of beta schedule entries.
-            seed: RNG base seed.
-            active_nonce_count: Launch blocks for this many
-                nonces (default: all prepared nonces).
-        """
-        assert self._sf_prepared
-        assert not self._sf_kernel_running
-
-        if seed is None:
-            seed = np.random.randint(0, 2**31)
-
-        N = self._prep_N
-        nnz = self._prep_nnz
-        max_packed_size = self._prep_max_packed_size
-        num_nonces = self._sf_num_nonces
-        active = (
-            active_nonce_count
-            if active_nonce_count is not None
-            else num_nonces
-        )
-
-        grid = (active,)
-        block = (256,)
-        kernel_args = (
-            self._d_row_ptr,
-            self._d_col_ind,
-            self._d_sf_J,
-            self._d_sf_h,
-            self._d_sf_samples,
-            self._d_sf_energies,
-            self._d_sf_beta,
-            np.int32(num_betas),
-            np.int32(self._sf_num_sweeps_per_beta),
-            self._d_sf_ctrl,
-            np.int32(num_nonces),
-            np.int32(self._sf_reads_per_nonce),
-            np.int32(N),
-            np.int32(nnz),
-            np.int32(max_packed_size),
-            np.uint32(seed),
-            self._d_sf_delta_energy,
-            np.int32(N),
-        )
-        if self.profile:
-            kernel_args = kernel_args + (
-                self._d_sf_profile,
-            )
-
-        with self._sf_stream_compute:
-            self._self_feeding_kernel(
-                grid, block, kernel_args,
-            )
-
-        self._sf_kernel_running = True
-
-    def poll_completions(
-        self,
-    ) -> List[Tuple[int, int]]:
-        """Check for COMPLETE slots (non-blocking).
-
-        Returns:
-            List of (nonce_id, slot_id) for completed slots.
-        """
-        assert self._sf_prepared
-        ctrl_host = cp.asnumpy(self._d_sf_ctrl)
-        completed = []
-        for n in range(self._sf_num_nonces):
-            base = n * self.CTRL_STRIDE
-            for s in range(3):
-                if ctrl_host[base + s] == self.SLOT_COMPLETE:
-                    completed.append((n, s))
-        return completed
-
     def download_slot(
         self,
         nonce_id: int,
@@ -485,15 +510,18 @@ class CudaSASampler:
             reads, max_packed_size,
         )
 
+        info = {
+            "beta_range": getattr(
+                self, '_sf_beta_range', None,
+            ),
+        }
+        info.update(self._extra_download_info())
+
         results = unpack_packed_results(
             packed_data, energies_raw,
             1, reads, N,
             [node_to_idx],
-            info={
-                "beta_range": getattr(
-                    self, '_sf_beta_range', None,
-                ),
-            },
+            info=info,
         )
         return results[0]
 
@@ -510,6 +538,73 @@ class CudaSASampler:
         self._d_sf_ctrl[
             ctrl_offset:ctrl_offset + 1
         ].set(empty_val)
+
+    # ----------------------------------------------------------
+    # Kernel launch / control
+    # ----------------------------------------------------------
+
+    def launch_self_feeding(
+        self,
+        num_betas: int,
+        seed: Optional[int] = None,
+        active_nonce_count: Optional[int] = None,
+    ) -> None:
+        """Launch self-feeding kernel (once, stays resident).
+
+        Args:
+            num_betas: Number of beta schedule entries.
+            seed: RNG base seed.
+            active_nonce_count: Launch blocks for this many
+                nonces (default: all prepared nonces).
+        """
+        assert self._sf_prepared
+        assert not self._sf_kernel_running
+
+        if seed is None:
+            seed = np.random.randint(0, 2**31)
+
+        num_nonces = self._sf_num_nonces
+        active = (
+            active_nonce_count
+            if active_nonce_count is not None
+            else num_nonces
+        )
+
+        num_blocks = active * self._sms_per_nonce
+        grid = (num_blocks,)
+        block = (256,)
+        kernel_args = self._kernel_launch_args(
+            active, num_betas, seed,
+        )
+        if self.profile:
+            kernel_args = kernel_args + (
+                self._d_sf_profile,
+            )
+
+        with self._sf_stream_compute:
+            self._self_feeding_kernel(
+                grid, block, kernel_args,
+            )
+
+        self._sf_kernel_running = True
+
+    def poll_completions(
+        self,
+    ) -> List[Tuple[int, int]]:
+        """Check for COMPLETE slots (non-blocking).
+
+        Returns:
+            List of (nonce_id, slot_id) for completed slots.
+        """
+        assert self._sf_prepared
+        ctrl_host = cp.asnumpy(self._d_sf_ctrl)
+        completed = []
+        for n in range(self._sf_num_nonces):
+            base = n * self.CTRL_STRIDE
+            for s in range(3):
+                if ctrl_host[base + s] == self.SLOT_COMPLETE:
+                    completed.append((n, s))
+        return completed
 
     def signal_nonce_exit(self, nonce_id: int) -> None:
         """Signal one nonce to exit."""
@@ -571,7 +666,7 @@ class CudaSASampler:
         """Copy profile counters from GPU and reshape.
 
         Returns:
-            Array of shape (work_units, SA_NUM_REGIONS).
+            Array of shape (work_units, num_regions).
         """
         if not self.profile:
             raise RuntimeError(
@@ -585,7 +680,7 @@ class CudaSASampler:
         raw = cp.asnumpy(self._d_sf_profile)
         return raw.reshape(
             self._sf_profile_work_units,
-            self.SA_NUM_REGIONS,
+            self._num_profile_regions(),
         )
 
     def close(self) -> None:
@@ -596,100 +691,3 @@ class CudaSASampler:
         self._sf_stream_transfer.synchronize()
         self._sf_kernel_running = False
         self._sf_prepared = False
-
-    def sample_ising(
-        self,
-        h: List[Dict[int, float]],
-        J: List[Dict[Tuple[int, int], float]],
-        num_reads: int = 200,
-        num_sweeps: int = 1000,
-        num_sweeps_per_beta: int = 1,
-        beta_range: Optional[Tuple[float, float]] = None,
-        beta_schedule_type: str = "geometric",
-        seed: Optional[int] = None,
-        **kwargs,
-    ) -> List[dimod.SampleSet]:
-        """Sample from Ising model using self-feeding kernel.
-
-        Args:
-            h: List of linear biases per problem.
-            J: List of quadratic biases per problem.
-            num_reads: Number of independent samples per problem.
-            num_sweeps: Total number of sweeps.
-            num_sweeps_per_beta: Sweeps per beta value.
-            beta_range: (hot_beta, cold_beta) or None for auto.
-            beta_schedule_type: Schedule type.
-            seed: RNG seed.
-
-        Returns:
-            List of dimod.SampleSet, one per problem.
-        """
-        import time
-
-        num_problems = len(h)
-        assert len(J) == num_problems, (
-            f"h and J must have same length: "
-            f"{num_problems} vs {len(J)}"
-        )
-
-        if not self._prepared:
-            self.prepare(
-                num_reads=num_reads,
-                num_sweeps=num_sweeps,
-                num_sweeps_per_beta=num_sweeps_per_beta,
-            )
-
-        if not self._sf_prepared:
-            self.prepare_self_feeding(
-                num_nonces=num_problems,
-                reads_per_nonce=num_reads,
-                num_sweeps=num_sweeps,
-                num_sweeps_per_beta=num_sweeps_per_beta,
-            )
-
-        # Reset ctrl array (clears stale EXIT_NOW from
-        # previous sample_ising call)
-        self._d_sf_ctrl[:] = 0
-
-        # Upload beta schedule
-        num_betas, beta_range = self.upload_beta_schedule(
-            h[0], J[0], num_sweeps,
-            num_sweeps_per_beta, beta_range,
-            beta_schedule_type,
-        )
-
-        # Upload one model per nonce to slot 0
-        for i in range(num_problems):
-            self.upload_slot(i, 0, h[i], J[i])
-
-        # Launch kernel
-        self._sf_kernel_running = False  # allow re-launch
-        self.launch_self_feeding(
-            num_betas=num_betas,
-            seed=seed,
-            active_nonce_count=num_problems,
-        )
-
-        # Poll until all nonces complete
-        completed = set()
-        deadline = time.time() + 300.0
-        while len(completed) < num_problems:
-            assert time.time() < deadline, (
-                "sample_ising timed out waiting for kernel"
-            )
-            for nonce_id, slot_id in self.poll_completions():
-                if nonce_id not in completed:
-                    completed.add(nonce_id)
-            if len(completed) < num_problems:
-                time.sleep(0.001)
-
-        # Download results
-        results = []
-        for i in range(num_problems):
-            ss = self.download_slot(i, 0)
-            results.append(ss)
-
-        # Signal exit and wait
-        self.signal_exit()
-
-        return results

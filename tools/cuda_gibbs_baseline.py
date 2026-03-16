@@ -26,12 +26,9 @@ from shared.quantum_proof_of_work import (
     calculate_diversity,
 )
 from shared.block_requirements import BlockRequirements
-from dwave_topologies import DEFAULT_TOPOLOGY
-from dwave_topologies.topologies.json_loader import (
-    load_topology,
-)
-from dwave_topologies.embedded_topology import (
-    create_embedded_topology,
+from tools.baseline_utils import (
+    classify_energy,
+    load_baseline_topology,
 )
 
 from GPU.cuda_gibbs_sa import CudaGibbsSampler
@@ -91,57 +88,9 @@ def cuda_gibbs_baseline_test(
         return None
 
     # Get topology
-    if topology:
-        if topology.endswith('.embed.json.gz'):
-            print(
-                f"🔗 Loading embedded topology: {topology}"
-            )
-            import os
-            filename = os.path.basename(topology)
-            parts = filename.replace(
-                "zephyr_z", "",
-            ).replace(".embed.json.gz", "").split("_t")
-            topology_name = f"Z({parts[0]},{parts[1]})"
-            embedded_topo = create_embedded_topology(
-                topology_name,
-            )
-            nodes = embedded_topo.nodes
-            edges = embedded_topo.edges
-            topology_desc = (
-                f"{topology_name} embedded "
-                f"({len(nodes)} qubits, "
-                f"{len(edges)} couplers)"
-            )
-        else:
-            print(f"📂 Loading topology: {topology}")
-            topo_obj = load_topology(topology)
-            nodes = (
-                list(topo_obj.graph.nodes)
-                if hasattr(topo_obj, 'graph')
-                else topo_obj.nodes
-            )
-            edges = (
-                list(topo_obj.graph.edges)
-                if hasattr(topo_obj, 'graph')
-                else topo_obj.edges
-            )
-            topology_name = getattr(
-                topo_obj, 'solver_name', 'unknown',
-            )
-            topology_desc = (
-                f"{topology_name} "
-                f"({len(nodes)} nodes, "
-                f"{len(edges)} edges)"
-            )
-    else:
-        print(f"✨ Using default topology ({DEFAULT_TOPOLOGY.solver_name})")
-        topo_obj = DEFAULT_TOPOLOGY
-        nodes = list(topo_obj.graph.nodes)
-        edges = list(topo_obj.graph.edges)
-        topology_desc = (
-            f"{topo_obj.solver_name} "
-            f"({len(nodes)} nodes, {len(edges)} edges)"
-        )
+    nodes, edges, topology_desc = load_baseline_topology(
+        topology_arg=topology,
+    )
 
     print(f"📐 Topology: {topology_desc}")
 
@@ -332,15 +281,7 @@ def cuda_gibbs_baseline_test(
 
             # Quality tier
             best_across = min(all_min_energies)
-            target_reached = "none"
-            if best_across <= -15650:
-                target_reached = "excellent"
-            elif best_across <= -15500:
-                target_reached = "very_good"
-            elif best_across <= -15400:
-                target_reached = "good"
-            elif best_across <= -15300:
-                target_reached = "fair"
+            target_reached = classify_energy(best_across)
 
             if target_reached != "none":
                 print(f"  🎖️  Quality: {target_reached}")

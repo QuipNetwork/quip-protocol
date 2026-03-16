@@ -17,14 +17,13 @@ from shared.quantum_proof_of_work import (
     calculate_diversity,
 )
 from shared.block_requirements import BlockRequirements
-from dwave_topologies import DEFAULT_TOPOLOGY
-from dwave_topologies.embedded_topology import (
-    create_embedded_topology,
+from tools.baseline_utils import (
+    classify_energy,
+    load_baseline_topology,
 )
-from dwave_topologies.topologies.json_loader import load_topology
 
 try:
-    from GPU.cuda_sa_sampler import CudaSASampler
+    from GPU.cuda_sa import CudaSASampler
     CUDA_AVAILABLE = True
 except ImportError:
     CUDA_AVAILABLE = False
@@ -73,50 +72,10 @@ def cuda_baseline_test(
         return None
 
     # Get topology
-    if topology_path:
-        print(f"📂 Loading topology from file: {topology_path}")
-        topology = load_topology(topology_path)
-        nodes = (
-            list(topology.graph.nodes)
-            if hasattr(topology, 'graph')
-            else topology.nodes
-        )
-        edges = (
-            list(topology.graph.edges)
-            if hasattr(topology, 'graph')
-            else topology.edges
-        )
-        topology_name = (
-            getattr(topology, 'solver_name', None)
-            or getattr(
-                topology, 'topology_shape',
-                Path(topology_path).stem,
-            )
-        )
-        topology_desc = (
-            f"{topology_name} from file "
-            f"({len(nodes)} nodes, {len(edges)} edges)"
-        )
-    elif use_embedding:
-        print(
-            f"🔗 Using embedded hardware topology: "
-            f"{use_embedding}"
-        )
-        embedded_topo = create_embedded_topology(use_embedding)
-        nodes = embedded_topo.nodes
-        edges = embedded_topo.edges
-        topology_desc = (
-            f"{use_embedding} embedded "
-            f"({len(nodes)} qubits, {len(edges)} couplers)"
-        )
-    else:
-        print(f"✨ Using default topology ({DEFAULT_TOPOLOGY.solver_name})")
-        nodes = list(DEFAULT_TOPOLOGY.graph.nodes)
-        edges = list(DEFAULT_TOPOLOGY.graph.edges)
-        topology_desc = (
-            f"{DEFAULT_TOPOLOGY.solver_name} "
-            f"({len(nodes)} nodes, {len(edges)} edges)"
-        )
+    nodes, edges, topology_desc = load_baseline_topology(
+        topology_arg=topology_path,
+        embedding_arg=use_embedding,
+    )
 
     sampler_type = "self-feeding-sa"
     print(f"📐 Topology: {topology_desc}")
@@ -340,15 +299,7 @@ def cuda_baseline_test(
                 print("  ❌ Does not meet mining requirements")
 
             # Energy target analysis (same as CPU)
-            target_reached = "none"
-            if min_energy <= -15650:
-                target_reached = "excellent"
-            elif min_energy <= -15500:
-                target_reached = "very_good"
-            elif min_energy <= -15400:
-                target_reached = "good"
-            elif min_energy <= -15300:
-                target_reached = "fair"
+            target_reached = classify_energy(min_energy)
 
             if target_reached != "none":
                 print(f"  🎖️  Quality: {target_reached}")

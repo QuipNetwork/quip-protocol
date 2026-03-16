@@ -115,19 +115,21 @@ def fmt_cycles(cycles):
 
 
 def build_ising_problem():
-    """Build a standard Advantage topology Ising problem."""
+    """Build a standard Advantage topology Ising problem.
+
+    Uses generate_ising_model_from_nonce for representative
+    problems matching actual mining workloads.
+    """
     from dwave_topologies import DEFAULT_TOPOLOGY
+    from shared.quantum_proof_of_work import (
+        generate_ising_model_from_nonce,
+    )
 
-    graph = DEFAULT_TOPOLOGY.graph
-    nodes = sorted(graph.nodes())
-    edges = list(graph.edges())
-
-    rng = np.random.default_rng(42)
-    h = {n: float(rng.choice([-1, 0, 1])) for n in nodes}
-    J = {}
-    for u, v in edges:
-        J[(u, v)] = float(rng.choice([-1, 1]))
-
+    nodes = sorted(DEFAULT_TOPOLOGY.graph.nodes())
+    edges = list(DEFAULT_TOPOLOGY.graph.edges())
+    h, J = generate_ising_model_from_nonce(
+        42, nodes, edges, h_values=[-1, 0, 1],
+    )
     return h, J
 
 
@@ -151,7 +153,7 @@ def profile_sa(num_reads, num_sweeps):
     Uses CudaSASampler self-feeding kernel: upload one model,
     launch, poll for completion, then read profiling counters.
     """
-    from GPU.cuda_sa_sampler import CudaSASampler
+    from GPU.cuda_sa import CudaSASampler
 
     h_dict, J_dict = build_ising_problem()
 
