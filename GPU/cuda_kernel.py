@@ -482,7 +482,7 @@ class CudaKernelRealSA:
             code=self._load_kernel_code(),
             options=tuple(options)
         )
-        self.kernel = self.module.get_function('cuda_sa_persistent_real')
+        self.kernel = self.module.get_function('cuda_sa_self_feeding')
 
         # Struct sizes
         # JobDesc: job_id, num_reads, num_betas, num_sweeps_per_beta (4 ints)
@@ -1067,23 +1067,6 @@ class CudaKernelRealSA:
         offset = result['energies_offset']
         count = result['num_reads']
         return self.h_energies_pool[offset:offset + count]
-
-    def get_profile_data(self) -> np.ndarray:
-        """Read profiling counters from device after kernel stop.
-
-        Must be called after stop_immediate() or stop_drain()
-        so the kernel stream is synchronized.
-
-        Returns:
-            Array of shape (total_threads, SA_NUM_REGIONS).
-        """
-        if not self.profile:
-            raise RuntimeError("Profiling not enabled.")
-        self.stream.synchronize()
-        raw = cp.asnumpy(self.d_profile_output)
-        return raw.reshape(
-            self._profile_total_threads, self.SA_NUM_REGIONS,
-        )
 
     def stop_immediate(self) -> None:
         """

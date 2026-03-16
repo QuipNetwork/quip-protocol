@@ -20,6 +20,8 @@ Options:
     --max-attempts INT      Max mining attempts for test2 (default: 500)
     --output-dir PATH       Output directory (default: benchmarks/compare)
     --gpu INT               GPU device (default: 1)
+    --sa-batch INT          SA batch size (default: all SMs)
+    --gibbs-batch INT       Gibbs batch size (default: 12)
     --json                  Also dump raw JSON data
 """
 
@@ -57,9 +59,9 @@ from tools.cuda_profile_regions import (
 )
 
 
-# Pipeline batch sizes matching hardware capacity
-GIBBS_BATCH_SIZE = 12
-SA_BATCH_SIZE = 48  # One job per SM on A4000
+# Default pipeline batch sizes matching hardware capacity
+DEFAULT_GIBBS_BATCH_SIZE = 12
+DEFAULT_SA_BATCH_SIZE = 0  # 0 = auto-detect (all SMs)
 
 # Adaptive parameter bounds for CUDA miners
 ADAPT_MIN_SWEEPS = 256
@@ -125,6 +127,9 @@ def run_gibbs_batch(models, num_reads, num_sweeps, profile):
     Returns:
         (energies, wall_time, profile_data_or_None)
     """
+    # Sync GPU before creating sampler to clear stale state
+    cp.cuda.Device().synchronize()
+
     sampler = CudaGibbsSampler(profile=profile)
     h_list = [h for _, h, _ in models]
     J_list = [J for _, _, J in models]
@@ -138,6 +143,16 @@ def run_gibbs_batch(models, num_reads, num_sweeps, profile):
     energies = [float(r.first.energy) for r in results]
     data = sampler.get_profile_data() if profile else None
     return energies, wall, data
+
+
+def resolve_sa_batch_size(sa_batch: int) -> int:
+    """Resolve SA batch size (0 = all SMs on the current GPU)."""
+    if sa_batch > 0:
+        return sa_batch
+    props = cp.cuda.runtime.getDeviceProperties(
+        cp.cuda.runtime.getDevice()
+    )
+    return props['multiProcessorCount']
 
 
 def run_sa_batch(models, num_reads, num_betas,
@@ -158,6 +173,10 @@ def run_sa_batch(models, num_reads, num_betas,
     """
     batch_size = len(models)
     ring_size = max(batch_size, 16)
+
+    # Sync GPU before creating kernel to clear stale state
+    cp.cuda.Device().synchronize()
+
     kernel = CudaKernelRealSA(
         profile=profile, verbose=False,
         ring_size=ring_size,
@@ -176,11 +195,18 @@ def run_sa_batch(models, num_reads, num_betas,
         )
     kernel.signal_batch_ready()
 
-    # Dequeue all results
+    # Dequeue all results with adaptive timeout
     results = {}
-    deadline = time.time() + 1200.0
+    deadline = time.time() + max(600, batch_size * 120)
     while len(results) < batch_size and time.time() < deadline:
-        r = kernel.try_dequeue_result()
+        try:
+            r = kernel.try_dequeue_result()
+        except cp.cuda.runtime.CUDARuntimeError as e:
+            print(
+                f"    CUDA error in dequeue "
+                f"({len(results)}/{batch_size} done): {e}"
+            )
+            break
         if r is not None:
             results[r["job_id"]] = r
         else:
@@ -426,7 +452,10 @@ def plot_mining_summary(gibbs_summary, sa_summary, output_path):
 # ── Test orchestration ───────────────────────────────────────
 
 
-def run_test1(num_models, target_energy, output_dir, dump_json):
+def run_test1(
+    num_models, target_energy, output_dir, dump_json,
+    gibbs_batch, sa_batch,
+):
     """Test 1: CLT comparison across N models with pipelined dispatch."""
     params = compute_adaptive_params(target_energy)
     print(f"\n{'=' * 60}")
@@ -436,8 +465,8 @@ def run_test1(num_models, target_energy, output_dir, dump_json):
     print(f"  Difficulty:    {params['difficulty']:.3f}")
     print(f"  Sweeps:        {params['num_sweeps']}")
     print(f"  Reads:         {params['num_reads']}")
-    print(f"  Gibbs batch:   {GIBBS_BATCH_SIZE}")
-    print(f"  SA batch:      {SA_BATCH_SIZE}")
+    print(f"  Gibbs batch:   {gibbs_batch}")
+    print(f"  SA batch:      {sa_batch}")
     print()
 
     gpu_name, clock_khz, _ = get_gpu_info()
@@ -449,8 +478,8 @@ def run_test1(num_models, target_energy, output_dir, dump_json):
     gibbs_profiles = []
     gibbs_total_wall = 0.0
 
-    for start in range(0, num_models, GIBBS_BATCH_SIZE):
-        batch = models[start:start + GIBBS_BATCH_SIZE]
+    for start in range(0, num_models, gibbs_batch):
+        batch = models[start:start + gibbs_batch]
         label = f"{start}-{start + len(batch) - 1}"
         print(f"    Batch [{label}]...", end=" ", flush=True)
         energies, wall, data = run_gibbs_batch(
@@ -473,8 +502,8 @@ def run_test1(num_models, target_energy, output_dir, dump_json):
     sa_profiles = []
     sa_total_wall = 0.0
 
-    for start in range(0, num_models, SA_BATCH_SIZE):
-        batch = models[start:start + SA_BATCH_SIZE]
+    for start in range(0, num_models, sa_batch):
+        batch = models[start:start + sa_batch]
         label = f"{start}-{start + len(batch) - 1}"
         print(f"    Batch [{label}]...", end=" ", flush=True)
         energies, wall, data = run_sa_batch(
@@ -553,7 +582,10 @@ def run_test1(num_models, target_energy, output_dir, dump_json):
     print(f"\nTest 1 complete. Outputs in {output_dir}/")
 
 
-def run_test2(target_energy, max_attempts, output_dir, dump_json):
+def run_test2(
+    target_energy, max_attempts, output_dir, dump_json,
+    gibbs_batch, sa_batch,
+):
     """Test 2: Mining simulation with pipelined batch dispatch."""
     params = compute_adaptive_params(target_energy)
     print(f"\n{'=' * 60}")
@@ -563,8 +595,8 @@ def run_test2(target_energy, max_attempts, output_dir, dump_json):
     print(f"  Difficulty:    {params['difficulty']:.3f}")
     print(f"  Sweeps:        {params['num_sweeps']}")
     print(f"  Reads:         {params['num_reads']}")
-    print(f"  Gibbs batch:   {GIBBS_BATCH_SIZE}")
-    print(f"  SA batch:      {SA_BATCH_SIZE}")
+    print(f"  Gibbs batch:   {gibbs_batch}")
+    print(f"  SA batch:      {sa_batch}")
     print()
 
     gpu_name, clock_khz, _ = get_gpu_info()
@@ -641,12 +673,12 @@ def run_test2(target_energy, max_attempts, output_dir, dump_json):
     # Instrumented runs
     print("  Running GIBBS with profiling...")
     gibbs_attempts, gibbs_profiles, gibbs_inst_time = (
-        _mine_batched("gibbs", GIBBS_BATCH_SIZE, profile=True)
+        _mine_batched("gibbs", gibbs_batch, profile=True)
     )
 
     print("\n  Running SA with profiling...")
     sa_attempts, sa_profiles, sa_inst_time = (
-        _mine_batched("sa", SA_BATCH_SIZE, profile=True)
+        _mine_batched("sa", sa_batch, profile=True)
     )
 
     # Uninstrumented runs for overhead comparison
@@ -661,8 +693,8 @@ def run_test2(target_energy, max_attempts, output_dir, dump_json):
         gibbs_uninst_models.append((nonce, h, J))
 
     gibbs_uninst_time = 0.0
-    for start in range(0, num_gibbs, GIBBS_BATCH_SIZE):
-        batch = gibbs_uninst_models[start:start + GIBBS_BATCH_SIZE]
+    for start in range(0, num_gibbs, gibbs_batch):
+        batch = gibbs_uninst_models[start:start + gibbs_batch]
         _, wall, _ = run_gibbs_batch(
             batch, params["num_reads"], params["num_sweeps"],
             profile=False,
@@ -676,8 +708,8 @@ def run_test2(target_energy, max_attempts, output_dir, dump_json):
         sa_uninst_models.append((nonce, h, J))
 
     sa_uninst_time = 0.0
-    for start in range(0, num_sa, SA_BATCH_SIZE):
-        batch = sa_uninst_models[start:start + SA_BATCH_SIZE]
+    for start in range(0, num_sa, sa_batch):
+        batch = sa_uninst_models[start:start + sa_batch]
         _, wall, _ = run_sa_batch(
             batch, params["num_reads"],
             params["num_betas"], params["sweeps_per_beta"],
@@ -806,6 +838,18 @@ def main():
         help="GPU device (default: 1)",
     )
     parser.add_argument(
+        "--sa-batch", type=int, default=DEFAULT_SA_BATCH_SIZE,
+        help="SA batch size, 0=all SMs (default: 0)",
+    )
+    parser.add_argument(
+        "--gibbs-batch", type=int,
+        default=DEFAULT_GIBBS_BATCH_SIZE,
+        help=(
+            f"Gibbs batch size "
+            f"(default: {DEFAULT_GIBBS_BATCH_SIZE})"
+        ),
+    )
+    parser.add_argument(
         "--json", action="store_true",
         help="Also dump raw JSON data",
     )
@@ -817,15 +861,23 @@ def main():
     gpu_name, clock_khz, clock_mhz = get_gpu_info()
     print(f"GPU: {gpu_name}, SM clock: {clock_mhz:.0f} MHz")
 
+    sa_batch = resolve_sa_batch_size(args.sa_batch)
+    gibbs_batch = args.gibbs_batch
+    print(
+        f"Batch sizes: Gibbs={gibbs_batch}, SA={sa_batch}"
+    )
+
     if args.test in ("test1", "both"):
         run_test1(
             args.num_models, args.target_energy,
             args.output_dir, args.json,
+            gibbs_batch, sa_batch,
         )
     if args.test in ("test2", "both"):
         run_test2(
             args.target_energy, args.max_attempts,
             args.output_dir, args.json,
+            gibbs_batch, sa_batch,
         )
 
 

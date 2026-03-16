@@ -58,7 +58,7 @@ def generate_nonce_batch(
     return h_list, J_list
 
 
-def calibrate_sa(kernel, num_nonces, num_reads):
+def calibrate_sa(sampler, num_nonces, num_reads):
     """Find num_betas for SA to hit target avg energy."""
     nodes, edges = get_topology_info()
     cal_n = min(4, num_nonces)
@@ -70,7 +70,7 @@ def calibrate_sa(kernel, num_nonces, num_reads):
     best_energy = 0.0
 
     for num_betas in [25, 50, 100, 200, 400]:
-        results = kernel.sample_multi_nonce(
+        results = sampler.sample_ising(
             h_list, J_list,
             num_reads=num_reads,
             num_betas=num_betas,
@@ -131,7 +131,7 @@ def calibrate_gibbs(
 
 
 def benchmark_sa(
-    kernel, sa_nonces, num_reads, num_betas,
+    sampler, sa_nonces, num_reads, num_betas,
 ):
     """Run SA multi-nonce benchmark and return metrics."""
     nodes, edges = get_topology_info()
@@ -145,7 +145,7 @@ def benchmark_sa(
         )
 
         t0 = time.perf_counter()
-        results = kernel.sample_multi_nonce(
+        results = sampler.sample_ising(
             h_b, J_b,
             num_reads=num_reads,
             num_betas=num_betas,
@@ -207,25 +207,24 @@ def benchmark_gibbs(
 
 def run_sa_benchmark(args, avail_sms):
     """Run SA benchmark and return metrics dict."""
-    from GPU.cuda_sa_kernel import CudaSAKernel
+    from GPU.cuda_kernel import CudaKernelRealSA
+    from GPU.cuda_sa import CudaKernelAdapter, CudaSASamplerAsync
 
-    nodes, edges = get_topology_info()
     # SA: 1 SM per nonce
     sa_nonces = args.sa_nonces or avail_sms
 
-    print(f"=== SA Kernel (multi-nonce, {sa_nonces} nonces) ===")
-    sa_kernel = CudaSAKernel(max_N=5000)
-    sa_kernel.prepare(
-        nodes=nodes,
-        edges=edges,
-        num_reads=args.sa_reads,
-        max_num_betas=400,
-        max_nonces=sa_nonces,
+    print(
+        f"=== SA Kernel (persistent, "
+        f"{sa_nonces} nonces) ===",
+    )
+    sa_kernel = CudaKernelRealSA(max_N=5000, verbose=False)
+    sa_sampler = CudaSASamplerAsync(
+        CudaKernelAdapter(sa_kernel),
     )
 
     print("Calibrating SA...")
     sa_betas, sa_cal_e = calibrate_sa(
-        sa_kernel, sa_nonces, args.sa_reads,
+        sa_sampler, sa_nonces, args.sa_reads,
     )
     print(
         f"  -> betas={sa_betas}, "
@@ -235,7 +234,7 @@ def run_sa_benchmark(args, avail_sms):
 
     print("Benchmarking SA...")
     sa_avg_e, sa_mps, sa_time = benchmark_sa(
-        sa_kernel, sa_nonces,
+        sa_sampler, sa_nonces,
         args.sa_reads, sa_betas,
     )
     print(
@@ -246,6 +245,7 @@ def run_sa_benchmark(args, avail_sms):
     print()
 
     # Tear down SA to free GPU memory
+    sa_sampler.stop_immediate()
     del sa_kernel
     cp.get_default_memory_pool().free_all_blocks()
 

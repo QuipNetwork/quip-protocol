@@ -2,12 +2,12 @@
 
 # Try to import CUDA components (only available with cupy)
 try:
-    from .cuda_sa_kernel import CudaSAKernel
+    from .gpu_miner import GPUMiner
     from .cuda_miner import CudaMiner
     CUDA_AVAILABLE = True
 except ImportError:
     CUDA_AVAILABLE = False
-    CudaSAKernel = None
+    GPUMiner = None
     CudaMiner = None
 
 # Try to import Modal components
@@ -54,13 +54,13 @@ GPU_AVAILABLE = CUDA_AVAILABLE or MODAL_AVAILABLE
 
 __all__ = [
     'ModalSampler',
-    'CudaMiner', 'ModalMiner',
+    'ModalMiner',
     'gpu_app', 'GPU_AVAILABLE', 'METAL_AVAILABLE', 'MODAL_AVAILABLE'
 ]
 
 # Add CUDA components if available
 if CUDA_AVAILABLE:
-    __all__.extend(['CudaSAKernel', 'CudaMiner'])
+    __all__.extend(['GPUMiner', 'CudaMiner'])
 
 # Add Modal components if available
 if MODAL_AVAILABLE:
