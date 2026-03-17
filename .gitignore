@@ -61,3 +61,8 @@ localhost.pem
 
 # Logs
 *.log
+
+# Profiling flamegraph outputs
+flamegraphs/
+# Benchmark outputs
+benchmarks/

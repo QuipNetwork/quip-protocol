@@ -16,34 +16,23 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from shared.quantum_proof_of_work import generate_ising_model_from_nonce
+from shared.quantum_proof_of_work import (
+    generate_ising_model_from_nonce,
+)
 from dwave_topologies import DEFAULT_TOPOLOGY
-
-
-def _convert_dict_to_arrays(h_dict, J_dict, nodes, edges):
-    """Convert dict-form h/J to array-form for production SA."""
-    N = max(max(nodes), max(max(i, j) for i, j in edges)) + 1
-    h_arr = np.zeros(N, dtype=np.float32)
-    for node, val in h_dict.items():
-        h_arr[node] = val
-    edge_to_idx = {edge: idx for idx, edge in enumerate(edges)}
-    J_arr = np.zeros(len(edges), dtype=np.float32)
-    for (i, j), val in J_dict.items():
-        if (i, j) in edge_to_idx:
-            J_arr[edge_to_idx[(i, j)]] = val
-        elif (j, i) in edge_to_idx:
-            J_arr[edge_to_idx[(j, i)]] = val
-    return h_arr, J_arr
 
 
 def bench_cuda_gibbs(h, J, num_reads, num_sweeps, n_models):
     """Benchmark CUDA Gibbs sampler."""
     from GPU.cuda_gibbs_sa import CudaGibbsSampler
+
     sampler = CudaGibbsSampler(
         update_mode="gibbs", parallel=True,
     )
     # warmup
-    sampler.sample_ising(h=[h], J=[J], num_reads=2, num_sweeps=100)
+    sampler.sample_ising(
+        h=[h], J=[J], num_reads=2, num_sweeps=100,
+    )
 
     h_batch = [h] * n_models
     J_batch = [J] * n_models
@@ -59,27 +48,35 @@ def bench_cuda_gibbs(h, J, num_reads, num_sweeps, n_models):
     return elapsed, min(energies), sum(energies) / len(energies)
 
 
-def bench_cuda_sa(sampler, h_arr, J_arr, edges,
-                  num_reads, num_sweeps, n_models):
-    """Benchmark production CUDA SA pipeline."""
-    h_batch = [h_arr] * n_models
-    J_batch = [J_arr] * n_models
+def bench_cuda_sa(h, J, num_reads, num_sweeps, n_models):
+    """Benchmark CUDA SA sampler (self-feeding)."""
+    from GPU.cuda_sa import CudaSASampler
+
+    sampler = CudaSASampler()
+    # warmup
+    sampler.sample_ising(
+        [h], [J], num_reads=2, num_sweeps=100,
+    )
+
+    h_batch = [h] * n_models
+    J_batch = [J] * n_models
     start = time.time()
     results = sampler.sample_ising(
-        h_list=h_batch, J_list=J_batch,
-        num_reads=num_reads, num_betas=num_sweeps,
-        num_sweeps_per_beta=1, edges=edges,
+        h=h_batch, J=J_batch,
+        num_reads=num_reads, num_sweeps=num_sweeps,
     )
     elapsed = time.time() - start
     energies = []
     for ss in results:
         energies.extend(list(ss.record.energy))
+    sampler.close()
     return elapsed, min(energies), sum(energies) / len(energies)
 
 
 def bench_cpu_sa(h, J, num_reads, num_sweeps, n_models):
     """Benchmark CPU SA sampler."""
     from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
+
     sampler = SimulatedAnnealingStructuredSampler()
     start = time.time()
     all_e = []
@@ -121,27 +118,6 @@ def main():
     )
     print("-" * 93)
 
-    # Initialize production SA kernel once (persistent)
-    from GPU.cuda_kernel import CudaKernelRealSA
-    from GPU.cuda_sa import CudaSASamplerAsync, CudaKernelAdapter
-
-    kernel = CudaKernelRealSA(
-        ring_size=256, max_threads_per_job=256, max_N=5000,
-        debug_verbose=0, debug_kernel=0, debug_workers=0,
-        verbose=False,
-    )
-    adapter = CudaKernelAdapter(kernel)
-    sa_sampler = CudaSASamplerAsync(adapter)
-
-    h_arr, J_arr = _convert_dict_to_arrays(h, J, nodes, edges)
-
-    # Warmup SA kernel
-    sa_sampler.sample_ising(
-        h_list=[h_arr], J_list=[J_arr],
-        num_reads=2, num_betas=100,
-        num_sweeps_per_beta=1, edges=edges,
-    )
-
     # --- Single model, 1024 sweeps ---
     label = "1 model, 1024sw, 100rd"
     sweeps, reads, nm = 1024, 100, 1
@@ -150,8 +126,7 @@ def main():
     t, mi, av = bench_cuda_gibbs(h, J, reads, sweeps, nm)
     fmt_row(label, "CUDA Gibbs", t, mi, av, ts)
 
-    t, mi, av = bench_cuda_sa(
-        sa_sampler, h_arr, J_arr, edges, reads, sweeps, nm)
+    t, mi, av = bench_cuda_sa(h, J, reads, sweeps, nm)
     fmt_row(label, "CUDA SA", t, mi, av, ts)
 
     t, mi, av = bench_cpu_sa(h, J, reads, sweeps, nm)
@@ -166,8 +141,7 @@ def main():
     t, mi, av = bench_cuda_gibbs(h, J, reads, sweeps, nm)
     fmt_row(label, "CUDA Gibbs", t, mi, av, ts)
 
-    t, mi, av = bench_cuda_sa(
-        sa_sampler, h_arr, J_arr, edges, reads, sweeps, nm)
+    t, mi, av = bench_cuda_sa(h, J, reads, sweeps, nm)
     fmt_row(label, "CUDA SA", t, mi, av, ts)
 
     t, mi, av = bench_cpu_sa(h, J, reads, sweeps, nm)
@@ -182,8 +156,7 @@ def main():
     t, mi, av = bench_cuda_gibbs(h, J, reads, sweeps, nm)
     fmt_row(label, "CUDA Gibbs", t, mi, av, ts)
 
-    t, mi, av = bench_cuda_sa(
-        sa_sampler, h_arr, J_arr, edges, reads, sweeps, nm)
+    t, mi, av = bench_cuda_sa(h, J, reads, sweeps, nm)
     fmt_row(label, "CUDA SA", t, mi, av, ts)
     print()
 
@@ -195,13 +168,9 @@ def main():
     t, mi, av = bench_cuda_gibbs(h, J, reads, sweeps, nm)
     fmt_row(label, "CUDA Gibbs", t, mi, av, ts)
 
-    t, mi, av = bench_cuda_sa(
-        sa_sampler, h_arr, J_arr, edges, reads, sweeps, nm)
+    t, mi, av = bench_cuda_sa(h, J, reads, sweeps, nm)
     fmt_row(label, "CUDA SA", t, mi, av, ts)
     print()
-
-    # Shutdown persistent kernel
-    kernel.stop_immediate()
 
 
 if __name__ == "__main__":

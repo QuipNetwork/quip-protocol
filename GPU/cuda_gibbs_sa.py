@@ -12,24 +12,26 @@ chunk) from atomic queue, process all sweeps/colors using shared
 memory, then grab the next unit. Work-stealing balances load
 across models.
 """
-
-import logging
-import os
-from typing import Dict, List, Optional, Tuple
+import time
+from itertools import chain
+from typing import (
+    Dict, Iterable, Iterator, List, Optional, Tuple,
+)
 
 import cupy as cp
 import dimod
 import numpy as np
 
+from GPU.base_cuda_sampler import BaseCudaSampler
 from GPU.sampler_utils import (
-    build_csr_from_ising,
     compute_beta_schedule,
     compute_color_blocks,
     unpack_packed_results,
 )
+from shared.ising_model import IsingModel
 
 
-class CudaGibbsSampler:
+class CudaGibbsSampler(BaseCudaSampler):
     """Block Gibbs sampler using CUDA GPU.
 
     Persistent kernel with work queue: blocks grab work units
@@ -39,8 +41,6 @@ class CudaGibbsSampler:
 
     Also supports a fully sequential mode for validation.
     """
-
-    GIBBS_NUM_REGIONS = 12
 
     def __init__(
         self,
@@ -58,34 +58,26 @@ class CudaGibbsSampler:
             parallel: Use chromatic parallel kernel (True) or
                 fully sequential kernel (False).
             max_sms: Maximum SMs to use (0 = all available).
-            profile: Compile with PROFILE_REGIONS for clock64()
+            profile: Enable auto-profiling with clock64()
                 instrumentation.
         """
-        self.profile = profile
-        self.logger = logging.getLogger(__name__)
-
         if update_mode.lower() not in ("gibbs", "metropolis"):
             raise ValueError(
-                f"update_mode must be 'gibbs' or 'metropolis', "
-                f"got {update_mode}"
+                f"update_mode must be 'gibbs' or "
+                f"'metropolis', got {update_mode}"
             )
-        self.update_mode = 0 if update_mode.lower() == "gibbs" else 1
+        self.update_mode = (
+            0 if update_mode.lower() == "gibbs" else 1
+        )
         self.update_mode_name = update_mode.lower()
         self.parallel = parallel
-        self.max_sms = max_sms
-        self.sampler_type = "cuda-gibbs"
 
-        # Set up topology
-        from dwave_topologies import DEFAULT_TOPOLOGY
-        topology_obj = (
-            topology if topology is not None else DEFAULT_TOPOLOGY
+        super().__init__(
+            topology=topology,
+            max_sms=max_sms,
+            profile=profile,
+            sampler_type="cuda-gibbs",
         )
-        topology_graph = topology_obj.graph
-        self.nodes = list(topology_graph.nodes())
-        self.edges = list(topology_graph.edges())
-        self.nodelist = self.nodes
-        self.edgelist = self.edges
-        self.properties = topology_obj.properties
 
         # Extract Zephyr parameters
         topo_shape = self.properties.get(
@@ -95,26 +87,499 @@ class CudaGibbsSampler:
         self.t = topo_shape[1]
         self.num_colors = 4
 
-        # Compile CUDA kernels
-        kernel_path = os.path.join(
-            os.path.dirname(__file__), 'cuda_gibbs.cu'
-        )
-        with open(kernel_path, 'r') as f:
-            kernel_code = f.read()
+        # Default SMs per nonce (overridable via
+        # prepare_self_feeding kwargs)
+        self._sf_sms_per_nonce_val = 4
 
-        compile_options = ['--use_fast_math']
-        if self.profile:
-            compile_options.append('-DPROFILE_REGIONS=1')
-        self._module = cp.RawModule(
-            code=kernel_code,
-            options=tuple(compile_options),
+    # -- BaseCudaSampler hooks --
+
+    def _kernel_filename(self) -> str:
+        return 'cuda_gibbs.cu'
+
+    def _kernel_function_name(self) -> str:
+        return 'cuda_gibbs_self_feeding'
+
+    def _profiling_mode(self) -> str:
+        return "thread_zero"
+
+    @property
+    def _sms_per_nonce(self) -> int:
+        return self._sf_sms_per_nonce_val
+
+    def _extra_download_info(self) -> dict:
+        return {"update_mode": self.update_mode_name}
+
+    # -- Gibbs-specific prepare (adds color blocks) --
+
+    def prepare(
+        self,
+        num_reads: int = 256,
+        num_sweeps: int = 1000,
+        num_sweeps_per_beta: int = 1,
+        max_nonces: int = 1,
+    ) -> None:
+        """Pre-allocate GPU buffers for a fixed topology.
+
+        Extends base prepare() with color block computation
+        and double-buffered GPU arrays for the non-self-feeding
+        pipeline path.
+
+        Args:
+            num_reads: Max reads per job.
+            num_sweeps: Max sweeps (determines beta schedule
+                size).
+            num_sweeps_per_beta: Sweeps per beta value.
+            max_nonces: Max nonces for multi-nonce dispatch.
+        """
+        super().prepare(
+            num_reads=num_reads,
+            num_sweeps=num_sweeps,
+            num_sweeps_per_beta=num_sweeps_per_beta,
         )
-        self._persistent_kernel = self._module.get_function(
-            'cuda_gibbs_persistent'
+
+        N = self._prep_N
+        nnz = self._prep_nnz
+        max_packed_size = self._prep_max_packed_size
+        node_to_idx = self._prep_node_to_idx
+
+        # Build color blocks (topology-constant, computed once)
+        prob_nodes = sorted(node_to_idx.keys())
+        starts, counts, color_indices = compute_color_blocks(
+            prob_nodes, self.m, self.t
         )
-        self._sequential_kernel = self._module.get_function(
-            'cuda_block_gibbs_sequential'
+        # Remap to dense CSR indices
+        remapped = np.array(
+            [node_to_idx[n] for n in color_indices],
+            dtype=np.int32,
         )
+
+        # Single-problem metadata arrays
+        problem_N = np.array([N], dtype=np.int32)
+        problem_rp = np.array([0], dtype=np.int32)
+        problem_ci = np.array([0], dtype=np.int32)
+        problem_j = np.array([0], dtype=np.int32)
+        problem_h = np.array([0], dtype=np.int32)
+
+        # Upload Gibbs-specific constant GPU buffers
+        self._d_block_starts = cp.asarray(starts)
+        self._d_block_counts = cp.asarray(counts)
+        self._d_color_nodes = cp.asarray(remapped)
+        self._d_problem_N = cp.asarray(problem_N)
+        self._d_problem_rp = cp.asarray(problem_rp)
+        self._d_problem_ci = cp.asarray(problem_ci)
+        self._d_problem_j = cp.asarray(problem_j)
+        self._d_problem_h = cp.asarray(problem_h)
+
+        # Double-buffered mutable GPU arrays (A/B sets)
+        max_betas = self._prep_max_num_betas
+        total_samples = num_reads
+        self._d_J_vals = [
+            cp.zeros(nnz, dtype=cp.int8),
+            cp.zeros(nnz, dtype=cp.int8),
+        ]
+        self._d_h_vals = [
+            cp.zeros(N, dtype=cp.int8),
+            cp.zeros(N, dtype=cp.int8),
+        ]
+        self._d_beta_sched = [
+            cp.zeros(max_betas, dtype=cp.float32),
+            cp.zeros(max_betas, dtype=cp.float32),
+        ]
+        self._d_final_samples = [
+            cp.zeros(
+                total_samples * max_packed_size,
+                dtype=cp.int8,
+            ),
+            cp.zeros(
+                total_samples * max_packed_size,
+                dtype=cp.int8,
+            ),
+        ]
+        self._d_final_energies = [
+            cp.zeros(total_samples, dtype=cp.int32),
+            cp.zeros(total_samples, dtype=cp.int32),
+        ]
+        self._d_queue_counter = [
+            cp.zeros(1, dtype=cp.int32),
+            cp.zeros(1, dtype=cp.int32),
+        ]
+
+        # Multi-nonce double-buffered GPU arrays (A/B)
+        self._max_nonces = max_nonces
+        if max_nonces > 1:
+            mn_total_reads = max_nonces * num_reads
+            self._d_mn_J = [
+                cp.zeros(
+                    max_nonces * nnz, dtype=cp.int8,
+                ),
+                cp.zeros(
+                    max_nonces * nnz, dtype=cp.int8,
+                ),
+            ]
+            self._d_mn_h = [
+                cp.zeros(
+                    max_nonces * N, dtype=cp.int8,
+                ),
+                cp.zeros(
+                    max_nonces * N, dtype=cp.int8,
+                ),
+            ]
+            self._d_mn_samples = [
+                cp.zeros(
+                    mn_total_reads * max_packed_size,
+                    dtype=cp.int8,
+                ),
+                cp.zeros(
+                    mn_total_reads * max_packed_size,
+                    dtype=cp.int8,
+                ),
+            ]
+            self._d_mn_energies = [
+                cp.zeros(
+                    mn_total_reads, dtype=cp.int32,
+                ),
+                cp.zeros(
+                    mn_total_reads, dtype=cp.int32,
+                ),
+            ]
+            self._d_mn_queue = [
+                cp.zeros(1, dtype=cp.int32),
+                cp.zeros(1, dtype=cp.int32),
+            ]
+            self._d_mn_beta = [
+                cp.zeros(
+                    self._prep_max_num_betas,
+                    dtype=cp.float32,
+                ),
+                cp.zeros(
+                    self._prep_max_num_betas,
+                    dtype=cp.float32,
+                ),
+            ]
+            # Per-nonce metadata
+            self._d_mn_problem_N = cp.full(
+                max_nonces, N, dtype=cp.int32,
+            )
+            self._d_mn_problem_rp = cp.zeros(
+                max_nonces, dtype=cp.int32,
+            )
+            self._d_mn_problem_ci = cp.zeros(
+                max_nonces, dtype=cp.int32,
+            )
+            self._d_mn_problem_j = cp.asarray(
+                np.arange(
+                    max_nonces, dtype=np.int32,
+                ) * nnz,
+            )
+            self._d_mn_problem_h = cp.asarray(
+                np.arange(
+                    max_nonces, dtype=np.int32,
+                ) * N,
+            )
+            self._d_mn_block_starts = cp.asarray(
+                np.tile(starts, max_nonces),
+            )
+            self._d_mn_block_counts = cp.asarray(
+                np.tile(counts, max_nonces),
+            )
+
+            # Double host staging buffers (A/B)
+            self._h_mn_J = [
+                np.zeros(
+                    max_nonces * nnz, dtype=np.int8,
+                ),
+                np.zeros(
+                    max_nonces * nnz, dtype=np.int8,
+                ),
+            ]
+            self._h_mn_h = [
+                np.zeros(
+                    max_nonces * N, dtype=np.int8,
+                ),
+                np.zeros(
+                    max_nonces * N, dtype=np.int8,
+                ),
+            ]
+
+        # CUDA streams for pipeline overlap
+        self._stream_compute = cp.cuda.Stream(
+            non_blocking=True,
+        )
+        self._stream_transfer = cp.cuda.Stream(
+            non_blocking=True,
+        )
+        self._event_transfer_done = cp.cuda.Event()
+
+        # Pipeline state — single-nonce double buffer
+        self._buf_idx = 0
+        self._preloaded = False
+        self._preload_meta = None
+
+        # Pipeline state — multi-nonce double buffer
+        self._mn_buf_idx = 0
+        self._mn_preloaded = False
+        self._mn_preload_meta = None
+        self._mn_pending = None
+
+        self.logger.info(
+            "Prepared Gibbs buffers: N=%d, nnz=%d, "
+            "num_reads=%d, max_betas=%d, max_nonces=%d",
+            N, nnz, num_reads,
+            self._prep_max_num_betas, max_nonces,
+        )
+
+    def _allocate_kernel_buffers(
+        self,
+        num_nonces: int,
+        reads_per_nonce: int,
+        num_sweeps: int,
+        num_sweeps_per_beta: int,
+        sms_per_nonce: int = 4,
+    ) -> None:
+        """Allocate Gibbs-specific GPU buffers.
+
+        Color blocks tiled for num_nonces, and work
+        distribution metadata.
+        """
+        self._sf_sms_per_nonce_val = sms_per_nonce
+
+        # Color blocks tiled for num_nonces
+        starts = cp.asnumpy(self._d_block_starts)
+        counts = cp.asnumpy(self._d_block_counts)
+        self._d_sf_block_starts = cp.asarray(
+            np.tile(starts, num_nonces),
+        )
+        self._d_sf_block_counts = cp.asarray(
+            np.tile(counts, num_nonces),
+        )
+
+        # Chunks per model (work distribution)
+        self._sf_chunks_per_model = sms_per_nonce
+        self._sf_reads_per_chunk = (
+            (reads_per_nonce + sms_per_nonce - 1)
+            // sms_per_nonce
+        )
+
+    def _kernel_launch_args(
+        self,
+        active: int,
+        num_betas: int,
+        seed: int,
+    ) -> tuple:
+        N = self._prep_N
+        nnz = self._prep_nnz
+        max_packed_size = self._prep_max_packed_size
+        num_nonces = self._sf_num_nonces
+        blocks_per_nonce = self._sf_sms_per_nonce_val
+
+        return (
+            self._d_row_ptr,
+            self._d_col_ind,
+            self._d_sf_block_starts,
+            self._d_sf_block_counts,
+            self._d_color_nodes,
+            np.int32(self.num_colors),
+            self._d_sf_beta,
+            np.int32(num_betas),
+            np.int32(self._sf_num_sweeps_per_beta),
+            self._d_sf_J,
+            self._d_sf_h,
+            self._d_sf_samples,
+            self._d_sf_energies,
+            self._d_sf_ctrl,
+            np.int32(num_nonces),
+            np.int32(blocks_per_nonce),
+            np.int32(self._sf_reads_per_nonce),
+            np.int32(N),
+            np.int32(nnz),
+            np.int32(max_packed_size),
+            np.int32(self._sf_chunks_per_model),
+            np.int32(self._sf_reads_per_chunk),
+            np.uint32(seed),
+            np.int32(self.update_mode),
+        )
+
+    # -- Gibbs-specific close (also handles double-buffer
+    #    streams) --
+
+    def close(self) -> None:
+        """Synchronize and release all CUDA streams."""
+        super().close()
+        if hasattr(self, '_stream_compute'):
+            self._stream_compute.synchronize()
+            self._stream_transfer.synchronize()
+        self._mn_preloaded = False
+        self._preloaded = False
+
+    # -- Gibbs-specific methods --
+
+    def _get_cached_beta_schedule(
+        self,
+        h: Dict[int, float],
+        J: Dict[Tuple[int, int], float],
+        num_sweeps: int,
+        num_sweeps_per_beta: int,
+        beta_range: Optional[Tuple[float, float]],
+        beta_schedule_type: str,
+        beta_schedule: Optional[np.ndarray],
+    ) -> Tuple[np.ndarray, Tuple[float, float]]:
+        """Return cached beta schedule if params match."""
+        key = (
+            num_sweeps, num_sweeps_per_beta,
+            beta_schedule_type, beta_range,
+        )
+        if (self._cached_beta_key == key
+                and beta_schedule is None):
+            return (
+                self._cached_beta_sched,
+                self._cached_beta_range,
+            )
+
+        sched, br = compute_beta_schedule(
+            h, J, num_sweeps, num_sweeps_per_beta,
+            beta_range, beta_schedule_type, beta_schedule,
+        )
+        if beta_schedule is None:
+            self._cached_beta_key = key
+            self._cached_beta_sched = sched
+            self._cached_beta_range = br
+        return sched, br
+
+    def preload(
+        self,
+        h: Dict[int, float],
+        J: Dict[Tuple[int, int], float],
+        num_reads: int,
+        num_sweeps: int,
+        num_sweeps_per_beta: int = 1,
+        beta_range: Optional[Tuple[float, float]] = None,
+        beta_schedule_type: str = "geometric",
+        beta_schedule: Optional[np.ndarray] = None,
+        seed: Optional[int] = None,
+    ) -> None:
+        """Preload next job's data asynchronously."""
+        assert self._prepared, "Must call prepare() first"
+        next_idx = 1 - self._buf_idx
+        num_reads = min(num_reads, self._prep_num_reads)
+
+        # Vectorized staging fill
+        j_vals = np.fromiter(
+            J.values(), dtype=np.int8, count=len(J),
+        )
+        self._h_J_vals[:] = 0
+        self._h_J_vals[self._pos_ij] = j_vals
+        self._h_J_vals[self._pos_ji] = j_vals
+
+        h_vals = np.fromiter(
+            h.values(), dtype=np.int8, count=len(h),
+        )
+        self._h_h_vals[:] = 0
+        self._h_h_vals[self._h_idx] = h_vals
+
+        sched, beta_range = self._get_cached_beta_schedule(
+            h, J, num_sweeps, num_sweeps_per_beta,
+            beta_range, beta_schedule_type, beta_schedule,
+        )
+        num_betas = len(sched)
+
+        if seed is None:
+            seed = np.random.randint(0, 2**31)
+
+        # Async H2D on transfer stream
+        with self._stream_transfer:
+            self._d_J_vals[next_idx].set(self._h_J_vals)
+            self._d_h_vals[next_idx].set(self._h_h_vals)
+            self._d_beta_sched[next_idx][
+                :num_betas
+            ].set(sched)
+        self._event_transfer_done.record(
+            self._stream_transfer,
+        )
+
+        self._preloaded = True
+        self._preload_meta = (
+            num_reads, num_betas, num_sweeps_per_beta,
+            seed, beta_range, beta_schedule_type,
+        )
+
+    # -- Gibbs-specific streaming API --
+
+    def sample_ising_streaming(
+        self,
+        models: Iterable[IsingModel],
+        *,
+        num_reads: int = 200,
+        num_sweeps: int = 1000,
+        num_sweeps_per_beta: int = 1,
+        beta_range: Optional[Tuple[float, float]] = None,
+        beta_schedule_type: str = "geometric",
+        seed: Optional[int] = None,
+        num_kernels: Optional[int] = None,
+        poll_timeout: Optional[float] = None,
+    ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
+        """Stream Ising model solutions via Gibbs kernel.
+
+        Gibbs-specific prepare logic (max_nonces,
+        sms_per_nonce) + base rotation loop.
+
+        Args:
+            models: Iterable of IsingModel.
+            num_reads: Samples per model.
+            num_sweeps: Total sweeps per model.
+            num_sweeps_per_beta: Sweeps per beta value.
+            beta_range: (hot, cold) or None for auto.
+            beta_schedule_type: Schedule type.
+            seed: RNG seed.
+            num_kernels: Concurrent nonces (default: auto).
+            poll_timeout: Seconds before TimeoutError.
+
+        Yields:
+            (model, SampleSet) in completion order.
+        """
+        num_k = num_kernels or max(
+            1,
+            self.max_sms // self._sms_per_nonce,
+        )
+
+        if not self._prepared:
+            self.prepare(
+                num_reads=num_reads,
+                num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+                max_nonces=num_k,
+            )
+
+        if not self._sf_prepared:
+            self.prepare_self_feeding(
+                num_nonces=num_k,
+                reads_per_nonce=num_reads,
+                num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+                sms_per_nonce=self._sf_sms_per_nonce_val,
+            )
+
+        # Peek first model for beta schedule
+        model_iter = iter(models)
+        try:
+            first = next(model_iter)
+        except StopIteration:
+            return
+
+        num_betas, _ = self.upload_beta_schedule(
+            first.h, first.J, num_sweeps,
+            num_sweeps_per_beta, beta_range,
+            beta_schedule_type,
+        )
+
+        yield from self._run_streaming_loop(
+            chain([first], model_iter),
+            num_k=num_k,
+            num_betas=num_betas,
+            seed=seed,
+            poll_timeout=poll_timeout,
+        )
+
+    # -- sample_ising --
 
     def sample_ising(
         self,
@@ -129,19 +594,19 @@ class CudaGibbsSampler:
         seed: Optional[int] = None,
         **kwargs,
     ) -> List[dimod.SampleSet]:
-        """Sample from Ising model using block Gibbs sampling.
-
-        All problems are dispatched in a single kernel launch.
+        """Sample from Ising model using self-feeding kernel.
 
         Args:
             h: List of linear biases per problem.
             J: List of quadratic biases per problem.
-            num_reads: Number of independent samples per problem.
+            num_reads: Number of independent samples per
+                problem.
             num_sweeps: Total number of sweeps.
             num_sweeps_per_beta: Sweeps per beta value.
-            beta_range: (hot_beta, cold_beta) or None for auto.
-            beta_schedule_type: "linear", "geometric", or "custom".
-            beta_schedule: Custom schedule (requires type="custom").
+            beta_range: (hot_beta, cold_beta) or None for
+                auto.
+            beta_schedule_type: Schedule type.
+            beta_schedule: Custom schedule.
             seed: RNG seed.
 
         Returns:
@@ -153,281 +618,65 @@ class CudaGibbsSampler:
             f"{num_problems} vs {len(J)}"
         )
 
-        # Build CSR for all problems
-        (all_row_ptr, all_col_ind, all_J_vals, all_h_vals,
-         row_ptr_offsets, col_ind_offsets,
-         node_to_idx_list, N_list) = build_csr_from_ising(h, J)
+        # Prepare topology structures if needed
+        if not self._prepared:
+            self.prepare(
+                num_reads=num_reads,
+                num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+                max_nonces=num_problems,
+            )
 
-        # Compute beta schedule (using first problem for auto range)
-        sched, beta_range = compute_beta_schedule(
-            h[0], J[0], num_sweeps, num_sweeps_per_beta,
-            beta_range, beta_schedule_type, beta_schedule,
+        # Prepare self-feeding buffers if needed
+        if not self._sf_prepared:
+            sms_per_nonce = max(1, 4)
+            self.prepare_self_feeding(
+                num_nonces=num_problems,
+                reads_per_nonce=num_reads,
+                num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+                sms_per_nonce=sms_per_nonce,
+            )
+
+        # Reset ctrl array (clears stale EXIT_NOW from
+        # previous sample_ising call)
+        self._d_sf_ctrl[:] = 0
+
+        # Upload beta schedule
+        num_betas, beta_range = self.upload_beta_schedule(
+            h[0], J[0], num_sweeps,
+            num_sweeps_per_beta, beta_range,
+            beta_schedule_type,
         )
 
-        if seed is None:
-            seed = np.random.randint(0, 2**31)
-
-        num_betas = len(sched)
-        max_N = max(N_list)
-        max_packed_size = (max_N + 7) // 8
-
-        # Build per-problem color blocks
-        color_data = self._build_batched_color_blocks(
-            node_to_idx_list, N_list, num_problems
-        )
-
-        self.logger.debug(
-            f"[CudaGibbs] {num_problems} problems batched, "
-            f"{num_reads} reads, {num_sweeps} sweeps, "
-            f"mode={self.update_mode_name}, "
-            f"parallel={self.parallel}"
-        )
-
-        # Build per-problem offset arrays
-        problem_rp_offsets = np.array(
-            [int(row_ptr_offsets[i]) for i in range(num_problems)],
-            dtype=np.int32,
-        )
-        problem_ci_offsets = np.array(
-            [int(col_ind_offsets[i]) for i in range(num_problems)],
-            dtype=np.int32,
-        )
-        # h_vals offset: sum of N values for problems before this one
-        h_offsets = np.zeros(num_problems, dtype=np.int32)
-        running = 0
+        # Upload one model per nonce to slot 0
         for i in range(num_problems):
-            h_offsets[i] = running
-            running += N_list[i]
-        problem_N = np.array(N_list, dtype=np.int32)
+            self.upload_slot(i, 0, h[i], J[i])
 
-        # Transfer to GPU
-        d_row_ptr = cp.asarray(all_row_ptr)
-        d_col_ind = cp.asarray(all_col_ind)
-        d_J_vals = cp.asarray(all_J_vals)
-        d_h_vals = cp.asarray(all_h_vals)
-
-        d_problem_N = cp.asarray(problem_N)
-        d_problem_rp = cp.asarray(problem_rp_offsets)
-        d_problem_ci = cp.asarray(problem_ci_offsets)
-        d_problem_h = cp.asarray(h_offsets)
-
-        d_block_starts = cp.asarray(color_data[0])
-        d_block_counts = cp.asarray(color_data[1])
-        d_color_nodes = cp.asarray(color_data[2])
-
-        d_beta_sched = cp.asarray(sched)
-
-        # Output buffers
-        total_samples = num_problems * num_reads
-        d_final_samples = cp.zeros(
-            total_samples * max_packed_size, dtype=cp.int8
-        )
-        d_final_energies = cp.zeros(
-            total_samples, dtype=cp.int32
+        # Launch kernel
+        self._sf_kernel_running = False  # allow re-launch
+        self.launch_self_feeding(
+            num_betas=num_betas,
+            seed=seed,
+            active_nonce_count=num_problems,
         )
 
-        if self.parallel:
-            # Persistent kernel with work queue.
-            # Blocks grab (model, read_chunk) from atomic queue.
-            dev = cp.cuda.Device()
-            num_sms = dev.attributes['MultiProcessorCount']
-            num_blocks = num_sms  # 1 persistent block per SM
-            if self.max_sms > 0:
-                num_blocks = min(num_blocks, self.max_sms)
+        # Poll until all nonces complete
+        completed = set()
+        while len(completed) < num_problems:
+            for nonce_id, slot_id in self.poll_completions():
+                if nonce_id not in completed:
+                    completed.add(nonce_id)
+            if len(completed) < num_problems:
+                time.sleep(0.001)
 
-            chunks_per_model = max(
-                1, num_blocks // num_problems
-            )
-            reads_per_chunk = (
-                (num_reads + chunks_per_model - 1)
-                // chunks_per_model
-            )
-            total_work_units = (
-                num_problems * chunks_per_model
-            )
+        # Download results
+        results = []
+        for i in range(num_problems):
+            ss = self.download_slot(i, 0)
+            results.append(ss)
 
-            # Atomic work queue counter
-            d_queue_counter = cp.zeros(1, dtype=cp.int32)
+        # Signal exit and wait
+        self.signal_exit()
 
-            self.logger.debug(
-                f"[CudaGibbs] persistent: "
-                f"{num_blocks} blocks, "
-                f"{chunks_per_model} chunks/model, "
-                f"{reads_per_chunk} reads/chunk, "
-                f"{total_work_units} total units"
-            )
-
-            # Profile buffer (only allocated when profiling)
-            if self.profile:
-                d_profile = cp.zeros(
-                    total_work_units * self.GIBBS_NUM_REGIONS,
-                    dtype=cp.int64,
-                )
-                self._profile_work_units = total_work_units
-
-            grid = (num_blocks,)
-            block = (256,)
-            kernel_args = (
-                d_row_ptr, d_col_ind,
-                d_J_vals, d_h_vals,
-                d_problem_N, d_problem_rp,
-                d_problem_ci, d_problem_h,
-                d_block_starts, d_block_counts,
-                d_color_nodes,
-                np.int32(self.num_colors),
-                d_beta_sched,
-                np.int32(num_betas),
-                np.int32(num_sweeps // num_betas),
-                d_final_samples, d_final_energies,
-                np.int32(num_reads),
-                np.int32(max_N),
-                np.int32(max_packed_size),
-                np.int32(num_problems),
-                d_queue_counter,
-                np.int32(chunks_per_model),
-                np.int32(reads_per_chunk),
-                np.int32(total_work_units),
-                np.uint32(seed),
-                np.int32(self.update_mode),
-            )
-            if self.profile:
-                kernel_args = kernel_args + (d_profile,)
-                self._d_profile = d_profile
-            self._persistent_kernel(
-                grid, block, kernel_args,
-            )
-        else:
-            # Sequential: 1 thread/block, reads_per_block=1
-            d_state = cp.zeros(
-                total_samples * max_N, dtype=cp.int8
-            )
-            seq_args = (
-                d_row_ptr, d_col_ind, d_J_vals, d_h_vals,
-                d_problem_N, d_problem_rp,
-                d_problem_ci, d_problem_h,
-                d_block_starts, d_block_counts,
-                d_color_nodes,
-                np.int32(self.num_colors),
-                d_beta_sched,
-                np.int32(num_betas),
-                np.int32(num_sweeps // num_betas),
-                d_state,
-                d_final_samples, d_final_energies,
-                np.int32(num_reads),
-                np.int32(max_N),
-                np.int32(max_packed_size),
-                np.int32(num_problems),
-                np.int32(1),  # reads_per_block=1
-                np.uint32(seed),
-                np.int32(self.update_mode),
-            )
-            grid = (num_reads, num_problems)
-            block = (1,)
-            self._sequential_kernel(grid, block, seq_args)
-
-        cp.cuda.Stream.null.synchronize()
-
-        # Read results
-        packed_raw = cp.asnumpy(d_final_samples)
-        energies_raw = cp.asnumpy(d_final_energies)
-
-        packed_data = packed_raw.reshape(
-            total_samples, max_packed_size
-        )
-        energies_data = energies_raw
-
-        for prob_idx in range(num_problems):
-            start = prob_idx * num_reads
-            end = (prob_idx + 1) * num_reads
-            e = energies_data[start:end]
-            self.logger.debug(
-                f"[CudaGibbs] Problem {prob_idx}: "
-                f"energy range [{e.min()}, {e.max()}]"
-            )
-
-        return unpack_packed_results(
-            packed_data, energies_data,
-            num_problems, num_reads, max_N,
-            node_to_idx_list,
-            info={
-                "beta_range": beta_range,
-                "beta_schedule_type": beta_schedule_type,
-                "update_mode": self.update_mode_name,
-            },
-        )
-
-    def _build_batched_color_blocks(
-        self,
-        node_to_idx_list: list,
-        N_list: list,
-        num_problems: int,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Build flattened color block arrays for all problems.
-
-        Returns:
-            Tuple of:
-            - all_block_starts: [num_problems * 4] global starts
-            - all_block_counts: [num_problems * 4] counts
-            - all_color_nodes: concatenated remapped node indices
-        """
-        all_block_starts = np.zeros(
-            num_problems * self.num_colors, dtype=np.int32
-        )
-        all_block_counts = np.zeros(
-            num_problems * self.num_colors, dtype=np.int32
-        )
-        all_color_nodes = []
-        global_offset = 0
-
-        for prob_idx in range(num_problems):
-            node_to_idx = node_to_idx_list[prob_idx]
-            prob_nodes = sorted(node_to_idx.keys())
-
-            starts, counts, color_indices = compute_color_blocks(
-                prob_nodes, self.m, self.t
-            )
-
-            # Remap to dense CSR indices
-            remapped = np.array(
-                [node_to_idx[n] for n in color_indices],
-                dtype=np.int32,
-            )
-
-            base = prob_idx * self.num_colors
-            for c in range(self.num_colors):
-                all_block_starts[base + c] = (
-                    global_offset + int(starts[c])
-                )
-                all_block_counts[base + c] = int(counts[c])
-
-            all_color_nodes.append(remapped)
-            global_offset += len(remapped)
-
-        all_color_nodes = np.concatenate(all_color_nodes)
-        return all_block_starts, all_block_counts, all_color_nodes
-
-    def get_profile_data(self) -> np.ndarray:
-        """Copy profile counters from GPU and reshape.
-
-        Returns:
-            Array of shape (work_units, GIBBS_NUM_REGIONS) with
-            int64 cycle counts per region.
-
-        Raises:
-            RuntimeError: If profiling is not enabled or no data
-                has been collected yet.
-        """
-        if not self.profile:
-            raise RuntimeError(
-                "Profiling not enabled. "
-                "Pass profile=True to __init__()."
-            )
-        if not hasattr(self, '_d_profile'):
-            raise RuntimeError(
-                "No profile data. Call sample_ising() first."
-            )
-        raw = cp.asnumpy(self._d_profile)
-        return raw.reshape(
-            self._profile_work_units,
-            self.GIBBS_NUM_REGIONS,
-        )
+        return results
