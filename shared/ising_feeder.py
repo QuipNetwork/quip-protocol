@@ -129,27 +129,53 @@ class IsingFeeder:
         return self
 
     def __next__(self) -> IsingModel:
-        return self.pop()
+        return self.pop_blocking()
 
     def pop(self) -> IsingModel:
-        """Pop one model, blocking if necessary."""
+        """Pop one model. Never blocks.
+
+        The buffer should always have ready models. If not,
+        that's a programming error — the buffer_size is too
+        small or _fill() isn't being called frequently enough.
+        """
         self._fill()
         try:
             return self._queue.get_nowait()
         except queue.Empty:
             pass
-        if self._futures:
-            logger.debug(
-                "IsingFeeder queue empty, waiting",
-            )
-            model = self._futures.pop(0).result(
-                timeout=5.0,
-            )
-            self._fill()
-            return model
-        raise RuntimeError(
-            "IsingFeeder: no pending work and empty queue",
+        # Check if any future is already done
+        for i, f in enumerate(self._futures):
+            if f.done():
+                model = self._futures.pop(i).result()
+                self._fill()
+                return model
+        assert self._futures, (
+            "IsingFeeder: no pending work and empty queue"
         )
+        assert False, (
+            f"IsingFeeder buffer underrun: "
+            f"{len(self._futures)} futures pending, "
+            f"none ready. Increase buffer_size."
+        )
+
+    def pop_blocking(self) -> IsingModel:
+        """Pop one model, waiting for a worker if needed.
+
+        Used only during cold start when the buffer hasn't
+        filled yet. Once the pipeline is running, use pop()
+        (non-blocking) or try_pop() instead.
+        """
+        self._fill()
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        assert self._futures, (
+            "IsingFeeder: no pending work and empty queue"
+        )
+        model = self._futures.pop(0).result(timeout=10.0)
+        self._fill()
+        return model
 
     def try_pop(self) -> Optional[IsingModel]:
         """Non-blocking pop, returns None if empty."""
@@ -162,7 +188,7 @@ class IsingFeeder:
     def pop_n(self, n: int) -> list[IsingModel]:
         """Pop up to n models, blocking only for the first."""
         assert n > 0, "n must be positive"
-        models = [self.pop()]
+        models = [self.pop_blocking()]
         for _ in range(n - 1):
             m = self.try_pop()
             if m is None:

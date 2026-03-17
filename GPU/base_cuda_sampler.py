@@ -681,13 +681,21 @@ class BaseCudaSampler(abc.ABC):
             ctrl_offset:ctrl_offset + 1
         ].set(exit_val)
 
-    def signal_exit(self) -> None:
-        """Set exit_now for all nonces, wait for kernel."""
+    def signal_exit(self, wait: bool = True) -> None:
+        """Set exit_now for all nonces.
+
+        Args:
+            wait: If True, synchronize the compute stream
+                (blocks until kernel exits). If False, signal
+                only — caller is responsible for cleanup
+                (e.g., process is about to exit).
+        """
         assert self._sf_prepared
         for n in range(self._sf_num_nonces):
             self.signal_nonce_exit(n)
 
-        self._sf_stream_compute.synchronize()
+        if wait:
+            self._sf_stream_compute.synchronize()
         self._sf_kernel_running = False
 
     def relaunch_self_feeding(
@@ -790,12 +798,41 @@ class BaseCudaSampler(abc.ABC):
         self._d_sf_ctrl[:] = 0
 
         model_iter = iter(models)
+        _has_try_pop = hasattr(models, 'try_pop')
+        _exhausted = False
 
-        def _pull() -> Optional[IsingModel]:
+        def _pull_blocking() -> Optional[IsingModel]:
+            """Wait for a model (cold start only).
+
+            Uses IsingFeeder.pop_blocking() when available,
+            otherwise falls back to next(model_iter).
+            """
+            nonlocal _exhausted
+            if _exhausted:
+                return None
+            if hasattr(models, 'pop_blocking'):
+                try:
+                    return models.pop_blocking()
+                except (StopIteration, RuntimeError):
+                    _exhausted = True
+                    return None
             try:
                 return next(model_iter)
             except StopIteration:
+                _exhausted = True
                 return None
+
+        def _pull_nonblocking() -> Optional[IsingModel]:
+            """Return a model if one is ready, else None."""
+            nonlocal _exhausted
+            if _exhausted:
+                return None
+            if _has_try_pop:
+                m = models.try_pop()
+                if m is None:
+                    return None
+                return m
+            return _pull_blocking()
 
         # Build per-kernel slot state
         # Slots: 0=active, 1=next, 2=free
@@ -807,10 +844,10 @@ class BaseCudaSampler(abc.ABC):
                 free_slot=2,
             ))
 
-        # Cold start: fill active slots (slot 0)
+        # Cold start: fill active slots (slot 0) — blocking
         pending_models: list[IsingModel] = []
         for _ in range(num_k):
-            m = _pull()
+            m = _pull_blocking()
             if m is None:
                 break
             pending_models.append(m)
@@ -824,9 +861,10 @@ class BaseCudaSampler(abc.ABC):
             )
             slots[i].active_model = m
 
-        # Fill next slots (slot 1)
+        # Fill next slots (slot 1) — blocking to ensure
+        # the kernel has work queued when it finishes slot 0
         for i in range(len(pending_models)):
-            m = _pull()
+            m = _pull_blocking()
             if m is None:
                 break
             self.upload_slot(
@@ -852,6 +890,24 @@ class BaseCudaSampler(abc.ABC):
                 )
                 if not any_active:
                     break
+
+                # Try to fill any empty next-slots before
+                # polling, so the GPU doesn't stall waiting
+                for nonce_id, ss in enumerate(slots):
+                    if (
+                        ss.active_model is not None
+                        and ss.next_model is None
+                        and ss.free_slot >= 0
+                    ):
+                        m = _pull_nonblocking()
+                        if m is not None:
+                            self.upload_slot(
+                                nonce_id, ss.free_slot,
+                                m.h, m.J,
+                            )
+                            ss.next_slot = ss.free_slot
+                            ss.next_model = m
+                            ss.free_slot = -1
 
                 # Single DMA read of ctrl array
                 ctrl = cp.asnumpy(self._d_sf_ctrl)
@@ -882,8 +938,8 @@ class BaseCudaSampler(abc.ABC):
                     ss.next_slot = -1
                     ss.next_model = None
 
-                    # Try to fill the free slot as next
-                    m = _pull()
+                    # Non-blocking fill of freed slot
+                    m = _pull_nonblocking()
                     if m is not None:
                         self.upload_slot(
                             nonce_id, ss.free_slot,
@@ -909,7 +965,7 @@ class BaseCudaSampler(abc.ABC):
                     time.sleep(0.001)
 
         finally:
-            self.signal_exit()
+            self.signal_exit(wait=False)
 
     def close(self) -> None:
         """Synchronize and release CUDA streams."""

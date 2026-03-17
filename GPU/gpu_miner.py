@@ -12,6 +12,7 @@ Subclasses create the appropriate sampler and pass it here.
 """
 from __future__ import annotations
 
+import os
 import signal
 import sys
 import time
@@ -20,8 +21,6 @@ from typing import (
 )
 
 import dimod
-import numpy as np
-
 from shared.base_miner import BaseMiner
 from shared.block_requirements import BlockRequirements
 from shared.ising_feeder import IsingFeeder
@@ -40,7 +39,12 @@ except ImportError:
 # Pipeline constants
 # ----------------------------------------------------------
 
-_PIPELINE_STALL_TIMEOUT = 30.0
+_PIPELINE_STALL_FLOOR = 60.0
+# Empirical: on the Advantage topology (4580 nodes, 32k edges),
+# SA takes ~30ms per sweep×read at num_reads=64.  Use a 5×
+# safety margin to cover cold start, high reads, and contention.
+_SEC_PER_SWEEP = 0.03
+_STALL_SAFETY_FACTOR = 5.0
 
 
 class GPUMiner(BaseMiner):
@@ -99,11 +103,6 @@ class GPUMiner(BaseMiner):
             device_sms=device_sms,
             gpu_utilization_pct=gpu_utilization,
             yielding=yielding,
-        )
-
-        # Sparse topology node indices for filtering
-        self._node_indices = np.array(
-            sampler.nodes, dtype=np.int32,
         )
 
         # Pipeline state (reset per mine_block call)
@@ -225,29 +224,30 @@ class GPUMiner(BaseMiner):
                 self._scheduler.get_sm_budget()
                 // self.sampler._sms_per_nonce,
             )
+            stall_timeout = max(
+                _PIPELINE_STALL_FLOOR,
+                num_sweeps * _SEC_PER_SWEEP
+                * _STALL_SAFETY_FACTOR,
+            )
             self._stream = (
                 self.sampler.sample_ising_streaming(
                     self._feeder,
                     num_reads=num_reads,
                     num_sweeps=num_sweeps,
                     num_kernels=num_k,
-                    poll_timeout=_PIPELINE_STALL_TIMEOUT,
+                    poll_timeout=stall_timeout,
                     **extra,
                 )
             )
 
         try:
             model, ss = next(self._stream)
-        except TimeoutError:
-            self.logger.warning(
-                "Pipeline stall: no completions after "
-                f"{_PIPELINE_STALL_TIMEOUT}s",
-            )
+        except TimeoutError as e:
+            self.logger.warning(f"Pipeline stall: {e}")
             return None
         except StopIteration:
             return None
 
-        ss = self._filter_sparse_topology(ss)
         return [(model.nonce, model.salt, ss)]
 
     def _sample(
@@ -275,59 +275,42 @@ class GPUMiner(BaseMiner):
     def _post_sample(
         self, sampleset: dimod.SampleSet,
     ) -> dimod.SampleSet:
-        """Filter samples for sparse topology."""
-        return self._filter_sparse_topology(sampleset)
-
-    def _filter_sparse_topology(
-        self, sampleset: dimod.SampleSet,
-    ) -> dimod.SampleSet:
-        """Extract only active topology nodes from kernel output.
-
-        Kernel returns N=max_node+1 but validation expects
-        only active node count.
-        """
-        samples = sampleset.record.sample
-        filtered = samples[:, self._node_indices].astype(
-            np.int8,
-        )
-        return dimod.SampleSet.from_samples(
-            filtered,
-            vartype='SPIN',
-            energy=sampleset.record.energy,
-            info=sampleset.info,
-        )
+        """No-op: unpack_packed_results already returns dense-indexed samples."""
+        return sampleset
 
     def _post_mine_cleanup(self) -> None:
-        """Stop stream, feeder, and sync sampler."""
+        """Stop stream and feeder. Non-blocking.
+
+        Signals the GPU kernel to exit but does not wait for
+        it — the worker process is about to exit or start
+        a new block, so blocking on kernel sync is wasteful.
+        """
         if self._stream is not None:
             self._stream.close()
             self._stream = None
         if self._feeder is not None:
             self._feeder.stop()
             self._feeder = None
-        self.sampler.close()
 
     def _cleanup_handler(self, signum, frame):
-        """Handle SIGTERM for graceful CUDA cleanup."""
+        """Handle SIGTERM: stop feeder, signal kernel, exit."""
+        # Stop the IsingFeeder first — its ProcessPoolExecutor
+        # workers will block atexit if not shut down.
+        if self._feeder is not None:
+            self._feeder.stop()
+            self._feeder = None
+
         if hasattr(self, '_scheduler'):
             self._scheduler.stop()
 
-        if self._stream is not None:
-            self._stream.close()
-            self._stream = None
+        if hasattr(self, 'sampler') and self.sampler._sf_prepared:
+            self.sampler.signal_exit(wait=False)
 
         self.logger.info(
             f"{self.miner_type} miner {self.miner_id} "
             f"received SIGTERM, cleaning up...",
         )
-        try:
-            if cp is not None:
-                cp.cuda.Device(int(self.device)).use()
-                cp.cuda.Stream.null.synchronize()
-                mem = cp.get_default_memory_pool()
-                mem.free_all_blocks()
-                pin = cp.get_default_pinned_memory_pool()
-                pin.free_all_blocks()
-        except Exception as e:
-            self.logger.error(f"CUDA cleanup error: {e}")
-        sys.exit(0)
+
+        # Hard exit — skip atexit handlers that might block
+        # on GPU sync or orphaned thread pools.
+        os._exit(0)
