@@ -15,13 +15,19 @@ Control layout per nonce (CTRL_STRIDE=8 ints):
 from __future__ import annotations
 
 import abc
+import dataclasses
 import logging
 import os
-from typing import Dict, List, Optional, Tuple
+import time
+from typing import (
+    Dict, Iterable, Iterator, List, Optional, Tuple,
+)
 
 import cupy as cp
 import dimod
 import numpy as np
+
+from shared.ising_model import IsingModel
 
 from GPU.sampler_utils import (
     build_csr_structure_from_edges,
@@ -29,6 +35,22 @@ from GPU.sampler_utils import (
     compute_beta_schedule,
     unpack_packed_results,
 )
+
+
+@dataclasses.dataclass(slots=True)
+class _SlotState:
+    """Per-kernel slot assignment for streaming API.
+
+    Tracks which slot holds the active model (being computed),
+    which holds the next model (preloaded), and which is free
+    for upload.
+    """
+
+    active_slot: int
+    active_model: Optional[IsingModel]
+    next_slot: int
+    next_model: Optional[IsingModel]
+    free_slot: int
 
 
 class BaseCudaSampler(abc.ABC):
@@ -724,6 +746,170 @@ class BaseCudaSampler(abc.ABC):
             self._sf_profile_work_units,
             self._num_profile_regions(),
         )
+
+    # ----------------------------------------------------------
+    # Streaming rotation loop (mechanical slot management)
+    # ----------------------------------------------------------
+
+    def _run_streaming_loop(
+        self,
+        models: Iterable[IsingModel],
+        *,
+        num_k: int,
+        num_betas: int,
+        seed: Optional[int] = None,
+        poll_timeout: Optional[float] = None,
+    ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
+        """Run the 3-slot rotation loop over models.
+
+        Preconditions (caller must ensure):
+        - prepare() already called
+        - prepare_self_feeding() already called
+        - Beta schedule already uploaded (num_betas)
+
+        Args:
+            models: Iterable of IsingModel.
+            num_k: Number of concurrent nonces.
+            num_betas: Beta schedule length.
+            seed: RNG seed.
+            poll_timeout: Seconds before raising
+                TimeoutError. None = block forever.
+
+        Yields:
+            (model, SampleSet) in completion order.
+        """
+        assert self._prepared, (
+            "Must call prepare() before _run_streaming_loop"
+        )
+        assert self._sf_prepared, (
+            "Must call prepare_self_feeding() before "
+            "_run_streaming_loop"
+        )
+
+        # Reset ctrl array
+        self._d_sf_ctrl[:] = 0
+
+        model_iter = iter(models)
+
+        def _pull() -> Optional[IsingModel]:
+            try:
+                return next(model_iter)
+            except StopIteration:
+                return None
+
+        # Build per-kernel slot state
+        # Slots: 0=active, 1=next, 2=free
+        slots: list[_SlotState] = []
+        for _ in range(num_k):
+            slots.append(_SlotState(
+                active_slot=0, active_model=None,
+                next_slot=1, next_model=None,
+                free_slot=2,
+            ))
+
+        # Cold start: fill active slots (slot 0)
+        pending_models: list[IsingModel] = []
+        for _ in range(num_k):
+            m = _pull()
+            if m is None:
+                break
+            pending_models.append(m)
+
+        if not pending_models:
+            return
+
+        for i, m in enumerate(pending_models):
+            self.upload_slot(
+                i, slots[i].active_slot, m.h, m.J,
+            )
+            slots[i].active_model = m
+
+        # Fill next slots (slot 1)
+        for i in range(len(pending_models)):
+            m = _pull()
+            if m is None:
+                break
+            self.upload_slot(
+                i, slots[i].next_slot, m.h, m.J,
+            )
+            slots[i].next_model = m
+
+        # Launch kernel
+        self._sf_kernel_running = False
+        self.launch_self_feeding(
+            num_betas=num_betas,
+            seed=seed,
+            active_nonce_count=len(pending_models),
+        )
+
+        try:
+            last_completion = time.monotonic()
+            while True:
+                # Check if any kernels still have work
+                any_active = any(
+                    s.active_model is not None
+                    for s in slots
+                )
+                if not any_active:
+                    break
+
+                # Single DMA read of ctrl array
+                ctrl = cp.asnumpy(self._d_sf_ctrl)
+                found = False
+
+                for nonce_id, ss in enumerate(slots):
+                    if ss.active_model is None:
+                        continue
+                    base = nonce_id * self.CTRL_STRIDE
+                    state = ctrl[base + ss.active_slot]
+                    if state != self.SLOT_COMPLETE:
+                        continue
+
+                    found = True
+                    last_completion = time.monotonic()
+
+                    # Download completed results
+                    result_ss = self.download_slot(
+                        nonce_id, ss.active_slot,
+                    )
+                    completed_model = ss.active_model
+
+                    # Rotate: active -> free,
+                    # next -> active
+                    ss.free_slot = ss.active_slot
+                    ss.active_slot = ss.next_slot
+                    ss.active_model = ss.next_model
+                    ss.next_slot = -1
+                    ss.next_model = None
+
+                    # Try to fill the free slot as next
+                    m = _pull()
+                    if m is not None:
+                        self.upload_slot(
+                            nonce_id, ss.free_slot,
+                            m.h, m.J,
+                        )
+                        ss.next_slot = ss.free_slot
+                        ss.next_model = m
+                        ss.free_slot = -1
+
+                    yield (completed_model, result_ss)
+
+                if not found:
+                    if (
+                        poll_timeout is not None
+                        and time.monotonic()
+                        - last_completion
+                        > poll_timeout
+                    ):
+                        raise TimeoutError(
+                            f"No completion after "
+                            f"{poll_timeout}s"
+                        )
+                    time.sleep(0.001)
+
+        finally:
+            self.signal_exit()
 
     def close(self) -> None:
         """Synchronize and release CUDA streams."""

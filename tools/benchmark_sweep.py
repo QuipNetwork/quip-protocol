@@ -85,12 +85,16 @@ def bench_sampler(sampler, h_list, J_list, sweeps):
     Returns:
         (elapsed_seconds, per_model_avg_energies).
     """
+    timeout = max(300, len(h_list) * sweeps * 0.01)
     start = time.perf_counter()
     results = sampler.sample_ising(
         h=h_list, J=J_list,
         num_reads=NUM_READS, num_sweeps=sweeps,
     )
     elapsed = time.perf_counter() - start
+    assert elapsed < timeout, (
+        f"Benchmark timed out: {elapsed:.1f}s > {timeout:.1f}s"
+    )
     energies = collect_energies(results)
     return elapsed, energies
 

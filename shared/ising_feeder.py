@@ -125,6 +125,12 @@ class IsingFeeder:
             )
             self._futures.append(f)
 
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> IsingModel:
+        return self.pop()
+
     def pop(self) -> IsingModel:
         """Pop one model, blocking if necessary."""
         self._fill()

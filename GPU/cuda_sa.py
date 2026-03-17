@@ -11,13 +11,17 @@ signaling needed.
 1 block per nonce, 1 SM per block. 48 SMs → 48 concurrent nonces.
 """
 import time
-from typing import Dict, List, Optional, Tuple
+from itertools import chain
+from typing import (
+    Dict, Iterable, Iterator, List, Optional, Tuple,
+)
 
 import cupy as cp
 import dimod
 import numpy as np
 
 from GPU.base_cuda_sampler import BaseCudaSampler
+from shared.ising_model import IsingModel
 
 
 class CudaSASampler(BaseCudaSampler):
@@ -103,6 +107,79 @@ class CudaSASampler(BaseCudaSampler):
             np.int32(N),
         )
 
+    # -- SA-specific streaming API --
+
+    def sample_ising_streaming(
+        self,
+        models: Iterable[IsingModel],
+        *,
+        num_reads: int = 200,
+        num_sweeps: int = 1000,
+        num_sweeps_per_beta: int = 1,
+        beta_range: Optional[Tuple[float, float]] = None,
+        beta_schedule_type: str = "geometric",
+        seed: Optional[int] = None,
+        num_kernels: Optional[int] = None,
+        poll_timeout: Optional[float] = None,
+    ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
+        """Stream Ising model solutions via SA kernel.
+
+        SA-specific prepare logic + base rotation loop.
+
+        Args:
+            models: Iterable of IsingModel.
+            num_reads: Samples per model.
+            num_sweeps: Total sweeps per model.
+            num_sweeps_per_beta: Sweeps per beta value.
+            beta_range: (hot, cold) or None for auto.
+            beta_schedule_type: Schedule type.
+            seed: RNG seed.
+            num_kernels: Concurrent nonces (default: auto).
+            poll_timeout: Seconds before TimeoutError.
+
+        Yields:
+            (model, SampleSet) in completion order.
+        """
+        num_k = num_kernels or max(
+            1, self.max_sms // 1,
+        )
+
+        if not self._prepared:
+            self.prepare(
+                num_reads=num_reads,
+                num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+            )
+
+        if not self._sf_prepared:
+            self.prepare_self_feeding(
+                num_nonces=num_k,
+                reads_per_nonce=num_reads,
+                num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+            )
+
+        # Peek first model for beta schedule
+        model_iter = iter(models)
+        try:
+            first = next(model_iter)
+        except StopIteration:
+            return
+
+        num_betas, _ = self.upload_beta_schedule(
+            first.h, first.J, num_sweeps,
+            num_sweeps_per_beta, beta_range,
+            beta_schedule_type,
+        )
+
+        yield from self._run_streaming_loop(
+            chain([first], model_iter),
+            num_k=num_k,
+            num_betas=num_betas,
+            seed=seed,
+            poll_timeout=poll_timeout,
+        )
+
     # -- SA-specific sample_ising --
 
     def sample_ising(
@@ -180,11 +257,7 @@ class CudaSASampler(BaseCudaSampler):
 
         # Poll until all nonces complete
         completed = set()
-        deadline = time.time() + 300.0
         while len(completed) < num_problems:
-            assert time.time() < deadline, (
-                "sample_ising timed out waiting for kernel"
-            )
             for nonce_id, slot_id in self.poll_completions():
                 if nonce_id not in completed:
                     completed.add(nonce_id)

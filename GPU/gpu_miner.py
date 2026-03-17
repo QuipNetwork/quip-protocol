@@ -5,26 +5,19 @@
 
 Owns the shared pipeline infrastructure: IsingFeeder for
 background model generation, KernelScheduler for SM budget,
-SIGTERM cleanup, sparse topology filtering, and the
-enqueue/poll/dequeue/re-enqueue mining loop.
+SIGTERM cleanup, sparse topology filtering, and the streaming
+mining loop via sample_ising_streaming().
 
-Pipeline model (per kernel):
-    3 slots: completed | active | next
-    Kernel persists until no "next" slot, then exits.
-    Host: dequeue completed → enqueue replacement.
-    Feeder keeps num_kernels models buffered for burst.
-
-Subclasses implement 6 abstract methods (kernel adapter
-protocol) to plug in their specific kernel backend.
+Subclasses create the appropriate sampler and pass it here.
 """
 from __future__ import annotations
 
-import dataclasses
 import signal
 import sys
 import time
-from abc import abstractmethod
-from typing import Any, Dict, List, Optional, Tuple
+from typing import (
+    Dict, Iterator, List, Optional, Tuple,
+)
 
 import dimod
 import numpy as np
@@ -32,7 +25,6 @@ import numpy as np
 from shared.base_miner import BaseMiner
 from shared.block_requirements import BlockRequirements
 from shared.ising_feeder import IsingFeeder
-from shared.ising_model import IsingModel
 from GPU.gpu_scheduler import (
     KernelScheduler,
     configure_mps_thread_limit,
@@ -44,46 +36,22 @@ except ImportError:
     cp = None
 
 
-
 # ----------------------------------------------------------
 # Pipeline constants
 # ----------------------------------------------------------
 
-_POLL_INTERVAL = 0.001  # 1ms between completion polls
 _PIPELINE_STALL_TIMEOUT = 30.0
-
-
-@dataclasses.dataclass(slots=True)
-class InFlightModel:
-    """Tracks a model currently in the GPU pipeline.
-
-    Attributes:
-        job_id: Unique kernel job identifier.
-        nonce: Blockchain nonce for proof-of-work.
-        salt: Random salt used to derive the nonce.
-        enqueue_time: Monotonic timestamp when enqueued.
-    """
-
-    job_id: int
-    nonce: int
-    salt: bytes
-    enqueue_time: float
 
 
 class GPUMiner(BaseMiner):
     """Shared pipeline base for CUDA GPU miners.
 
     Provides IsingFeeder, KernelScheduler, SIGTERM cleanup,
-    the pipeline loop, sparse topology filtering, and
+    the streaming mining loop, sparse topology filtering, and
     adaptive parameter calculation.
 
-    Subclasses must implement the kernel adapter protocol:
-        _kernel_sms_per_model()
-        _kernel_enqueue(model, job_id, num_reads, num_sweeps, **p)
-        _kernel_signal_ready()
-        _kernel_try_dequeue() -> Optional[Tuple[int, Any]]
-        _kernel_harvest(raw_result) -> dimod.SampleSet
-        _kernel_stop()
+    Subclasses create a sampler (CudaSASampler or
+    CudaGibbsSampler) and pass it to __init__.
     """
 
     def __init__(
@@ -140,9 +108,7 @@ class GPUMiner(BaseMiner):
 
         # Pipeline state (reset per mine_block call)
         self._feeder: Optional[IsingFeeder] = None
-        self._in_flight: Dict[int, InFlightModel] = {}
-        self._next_job_id = 0
-        self._cold_start = True
+        self._stream: Optional[Iterator] = None
 
         signal.signal(signal.SIGTERM, self._cleanup_handler)
 
@@ -171,55 +137,6 @@ class GPUMiner(BaseMiner):
         self._cuda_initialized = True
 
     # ----------------------------------------------------------
-    # Kernel adapter protocol (abstract)
-    # ----------------------------------------------------------
-
-    @abstractmethod
-    def _kernel_sms_per_model(self) -> int:
-        """SMs consumed per in-flight model."""
-
-    @abstractmethod
-    def _kernel_enqueue(
-        self,
-        model: IsingModel,
-        job_id: int,
-        num_reads: int,
-        num_sweeps: int,
-        **params,
-    ) -> None:
-        """Upload one model to a kernel slot."""
-
-    @abstractmethod
-    def _kernel_signal_ready(self) -> None:
-        """Tell kernel it can start (or that new work exists)."""
-
-    @abstractmethod
-    def _kernel_try_dequeue(
-        self,
-    ) -> Optional[Tuple[int, Any]]:
-        """Non-blocking poll. Returns (job_id, raw) or None."""
-
-    @abstractmethod
-    def _kernel_harvest(
-        self, raw_result: Any,
-    ) -> dimod.SampleSet:
-        """Convert raw kernel result to dimod.SampleSet."""
-
-    @abstractmethod
-    def _kernel_stop(self) -> None:
-        """Stop kernel and release GPU resources."""
-
-    # ----------------------------------------------------------
-    # Pipeline properties
-    # ----------------------------------------------------------
-
-    @property
-    def _num_kernels(self) -> int:
-        """Number of concurrent kernel instances."""
-        budget = self._scheduler.get_sm_budget()
-        return max(1, budget // self._kernel_sms_per_model())
-
-    # ----------------------------------------------------------
     # BaseMiner hooks
     # ----------------------------------------------------------
 
@@ -243,7 +160,10 @@ class GPUMiner(BaseMiner):
             return False
 
         cur_index = prev_block.header.index + 1
-        num_k = self._num_kernels
+        budget = self._scheduler.get_sm_budget()
+        num_k = max(
+            1, budget // self.sampler._sms_per_nonce,
+        )
 
         self._feeder = IsingFeeder(
             prev_hash=prev_block.hash,
@@ -254,9 +174,7 @@ class GPUMiner(BaseMiner):
             buffer_size=num_k * 2,
         )
 
-        self._in_flight.clear()
-        self._next_job_id = 0
-        self._cold_start = True
+        self._stream = None
 
         return True
 
@@ -289,64 +207,48 @@ class GPUMiner(BaseMiner):
     ) -> Optional[
         List[Tuple[int, bytes, dimod.SampleSet]]
     ]:
-        """Pipeline: enqueue→poll→dequeue→re-enqueue.
+        """Stream one result from the GPU pipeline.
 
-        Cold start: enqueue num_kernels models, signal kernel.
-        Steady state: poll for completions, dequeue + re-enqueue
-        each, return harvested results.
+        Lazily creates the streaming iterator on first call.
+        Returns one (nonce, salt, sampleset) per call.
         """
         if self._scheduler.should_throttle():
             time.sleep(0.5)
 
-        extra = {
-            k: v for k, v in kwargs.items()
-            if k not in ('num_reads', 'num_sweeps')
-        }
-
-        # Cold start: fill active + next slots per kernel
-        if self._cold_start:
-            self._cold_start = False
-            fill = self._num_kernels * 2
-            for _ in range(fill):
-                self._enqueue_one(
-                    num_reads, num_sweeps, **extra,
+        if self._stream is None:
+            extra = {
+                k: v for k, v in kwargs.items()
+                if k not in ('num_reads', 'num_sweeps')
+            }
+            num_k = max(
+                1,
+                self._scheduler.get_sm_budget()
+                // self.sampler._sms_per_nonce,
+            )
+            self._stream = (
+                self.sampler.sample_ising_streaming(
+                    self._feeder,
+                    num_reads=num_reads,
+                    num_sweeps=num_sweeps,
+                    num_kernels=num_k,
+                    poll_timeout=_PIPELINE_STALL_TIMEOUT,
+                    **extra,
                 )
-            self._kernel_signal_ready()
+            )
 
-        # Poll for completions
-        deadline = time.monotonic() + _PIPELINE_STALL_TIMEOUT
-        while time.monotonic() < deadline:
-            pair = self._kernel_try_dequeue()
-            if pair is not None:
-                job_id, raw_result = pair
-                tracked = self._in_flight.pop(
-                    job_id, None,
-                )
+        try:
+            model, ss = next(self._stream)
+        except TimeoutError:
+            self.logger.warning(
+                "Pipeline stall: no completions after "
+                f"{_PIPELINE_STALL_TIMEOUT}s",
+            )
+            return None
+        except StopIteration:
+            return None
 
-                # Immediately enqueue replacement
-                self._enqueue_one(
-                    num_reads, num_sweeps, **extra,
-                )
-                self._kernel_signal_ready()
-
-                sampleset = self._kernel_harvest(
-                    raw_result,
-                )
-
-                if tracked is not None:
-                    return [
-                        (tracked.nonce, tracked.salt,
-                         sampleset),
-                    ]
-                return []
-
-            time.sleep(_POLL_INTERVAL)
-
-        self.logger.warning(
-            "Pipeline stall: no completions after "
-            f"{_PIPELINE_STALL_TIMEOUT}s",
-        )
-        return None
+        ss = self._filter_sparse_topology(ss)
+        return [(model.nonce, model.salt, ss)]
 
     def _sample(
         self,
@@ -362,54 +264,13 @@ class GPUMiner(BaseMiner):
             k: v for k, v in kwargs.items()
             if k not in ('num_reads', 'num_sweeps')
         }
-        model = IsingModel(h=h, J=J, nonce=0, salt=b'')
-        job_id = self._alloc_job_id()
-        self._kernel_enqueue(
-            model, job_id, num_reads, num_sweeps,
+        results = self.sampler.sample_ising(
+            [h], [J],
+            num_reads=num_reads,
+            num_sweeps=num_sweeps,
             **extra,
         )
-        self._kernel_signal_ready()
-
-        deadline = time.monotonic() + 300.0
-        while time.monotonic() < deadline:
-            pair = self._kernel_try_dequeue()
-            if pair is not None:
-                _, raw_result = pair
-                return self._kernel_harvest(raw_result)
-            time.sleep(0.05)
-
-        raise TimeoutError(
-            "Kernel did not produce result within 300s",
-        )
-
-    def _enqueue_one(
-        self,
-        num_reads: int,
-        num_sweeps: int,
-        **extra,
-    ) -> None:
-        """Pop a model from feeder and enqueue it."""
-        assert self._feeder is not None, (
-            "_enqueue_one called before _pre_mine_setup"
-        )
-        model = self._feeder.pop()
-        job_id = self._alloc_job_id()
-        self._in_flight[job_id] = InFlightModel(
-            job_id=job_id,
-            nonce=model.nonce,
-            salt=model.salt,
-            enqueue_time=time.monotonic(),
-        )
-        self._kernel_enqueue(
-            model, job_id, num_reads, num_sweeps,
-            **extra,
-        )
-
-    def _alloc_job_id(self) -> int:
-        """Allocate a monotonically increasing job ID."""
-        jid = self._next_job_id
-        self._next_job_id += 1
-        return jid
+        return results[0]
 
     def _post_sample(
         self, sampleset: dimod.SampleSet,
@@ -437,25 +298,23 @@ class GPUMiner(BaseMiner):
         )
 
     def _post_mine_cleanup(self) -> None:
-        """Stop feeder, kernel, and scheduler."""
+        """Stop stream, feeder, and sync sampler."""
+        if self._stream is not None:
+            self._stream.close()
+            self._stream = None
         if self._feeder is not None:
             self._feeder.stop()
             self._feeder = None
-        self._in_flight.clear()
-        try:
-            self._kernel_stop()
-        except Exception:
-            pass
+        self.sampler.close()
 
     def _cleanup_handler(self, signum, frame):
         """Handle SIGTERM for graceful CUDA cleanup."""
         if hasattr(self, '_scheduler'):
             self._scheduler.stop()
 
-        try:
-            self._kernel_stop()
-        except Exception:
-            pass
+        if self._stream is not None:
+            self._stream.close()
+            self._stream = None
 
         self.logger.info(
             f"{self.miner_type} miner {self.miner_id} "
