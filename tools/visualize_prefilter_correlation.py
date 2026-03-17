@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Visualize greedy descent vs SA energy correlation.
 
-Generates a multi-panel figure with:
-1. Scatter plot: greedy vs SA energy with regression line
-2. Progressive correlation: Pearson/Spearman r vs greedy pass count
-3. Filtering ROC: false negative rate vs rejection threshold
-4. Energy distribution: overlapping histograms
-5. 2D density heatmap: greedy vs SA with marginal histograms
+Generates individual PNG files:
+1. scatter.png: greedy vs SA energy with regression line
+2. progressive_correlation.png: Pearson/Spearman r vs pass count
+3. roc.png: false negative rate vs rejection threshold
+4. energy_distributions.png: overlapping histograms
+5. density_heatmap.png: greedy vs SA with marginal histograms
 """
 from __future__ import annotations
 
@@ -22,16 +22,18 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 )
 
+from CPU.sa_miner import SimulatedAnnealingMiner
+from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
 from dwave_topologies import DEFAULT_TOPOLOGY
-from shared.quantum_proof_of_work import (
-    generate_ising_model_from_nonce,
-    ising_nonce_from_block,
-)
+from shared.energy_utils import energy_to_difficulty
 from shared.nonce_prefilter import (
     IsingTopologyCache,
     greedy_descent_energy,
 )
-from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
+from shared.quantum_proof_of_work import (
+    generate_ising_model_from_nonce,
+    ising_nonce_from_block,
+)
 
 
 def collect_data(
@@ -49,8 +51,8 @@ def collect_data(
         max_passes: Maximum greedy passes to test (1..max_passes).
 
     Returns:
-        Tuple of (greedy_by_pass, sa_energies) where
-        greedy_by_pass is dict {pass_count: np.array}.
+        Tuple of (greedy_by_pass, sa_min_energies, sa_mean_energies)
+        where greedy_by_pass is dict {pass_count: np.array}.
     """
     sampler = SimulatedAnnealingStructuredSampler()
     nodes = sampler.nodes
@@ -62,7 +64,8 @@ def collect_data(
     cur_index = 1
 
     greedy_by_pass = {p: [] for p in range(1, max_passes + 1)}
-    sa_energies = []
+    sa_min_energies = []
+    sa_mean_energies = []
 
     print(
         f"Collecting data: {num_nonces} nonces, "
@@ -86,7 +89,10 @@ def collect_data(
         ss = sampler.sample_ising(
             h=h, J=J, num_reads=sa_reads, num_sweeps=sa_sweeps,
         )
-        sa_energies.append(float(np.min(ss.record.energy)))
+        sa_min_energies.append(float(np.min(ss.record.energy)))
+        sa_mean_energies.append(
+            float(np.mean(ss.record.energy))
+        )
 
         if (i + 1) % 50 == 0:
             elapsed = time.perf_counter() - t0
@@ -103,15 +109,27 @@ def collect_data(
     greedy_arrays = {
         p: np.array(v) for p, v in greedy_by_pass.items()
     }
-    return greedy_arrays, np.array(sa_energies)
+    return (
+        greedy_arrays,
+        np.array(sa_min_energies),
+        np.array(sa_mean_energies),
+    )
 
 
-def plot_scatter(ax, greedy, sa, target_energy):
-    """Plot 1: Scatter with regression line."""
+def plot_scatter(
+    greedy, sa, target_energy, config_str, output_path,
+):
+    """Scatter with regression line, saved to output_path."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
     from scipy.stats import pearsonr
 
+    fig, ax = plt.subplots(figsize=(8, 6))
+
     ax.scatter(
-        greedy, sa, alpha=0.4, s=12, c='steelblue', edgecolors='none',
+        greedy, sa, alpha=0.4, s=12,
+        c='steelblue', edgecolors='none',
     )
 
     # Regression line
@@ -119,24 +137,35 @@ def plot_scatter(ax, greedy, sa, target_energy):
     x_line = np.linspace(greedy.min(), greedy.max(), 100)
     ax.plot(x_line, np.polyval(coeffs, x_line), 'r-', lw=1.5)
 
-    r, p = pearsonr(greedy, sa)
+    r, _ = pearsonr(greedy, sa)
     ax.set_xlabel('Greedy Energy (3 passes)')
     ax.set_ylabel('SA Best Energy')
-    ax.set_title(f'Greedy vs SA Energy (r={r:.3f})')
+    ax.set_title(
+        f'Greedy vs SA Energy (r={r:.3f})\n{config_str}'
+    )
 
-    # Target energy line
     ax.axhline(
         y=target_energy, color='orange', linestyle='--',
         lw=1, alpha=0.7, label=f'Target {target_energy}',
     )
     ax.legend(fontsize=8)
 
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Saved {output_path}")
+
 
 def plot_progressive_correlation(
-    ax, greedy_by_pass, sa,
+    greedy_by_pass, sa, config_str, output_path,
 ):
-    """Plot 2: Correlation vs greedy pass count."""
+    """Correlation vs greedy pass count, saved to output_path."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
     from scipy.stats import pearsonr, spearmanr
+
+    fig, ax = plt.subplots(figsize=(8, 6))
 
     passes = sorted(greedy_by_pass.keys())
     pearson_vals = []
@@ -161,14 +190,17 @@ def plot_progressive_correlation(
 
     ax.set_xlabel('Greedy Passes')
     ax.set_ylabel('Correlation with SA')
-    ax.set_title('Progressive Correlation Signal')
+    ax.set_title(
+        f'Progressive Correlation Signal\n{config_str}'
+    )
     ax.set_xticks(x)
     ax.set_xticklabels(passes)
     ax.legend(fontsize=8)
     ax.set_ylim(0, 1.0)
 
-    # Annotate values
-    for i, (pv, sv) in enumerate(zip(pearson_vals, spearman_vals)):
+    for i, (pv, sv) in enumerate(
+        zip(pearson_vals, spearman_vals),
+    ):
         ax.text(
             i - width / 2, pv + 0.02, f'{pv:.2f}',
             ha='center', va='bottom', fontsize=7,
@@ -178,19 +210,21 @@ def plot_progressive_correlation(
             ha='center', va='bottom', fontsize=7,
         )
 
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Saved {output_path}")
 
-def plot_roc(ax, greedy, sa, target_energy):
-    """Plot 3: Filtering ROC curve."""
+
+def _compute_roc_curves(greedy, sa, target_energy):
+    """Compute ROC false-negative rates and speedups.
+
+    Returns:
+        Tuple of (thresholds, false_neg_rates, speedups,
+        num_valid).
+    """
     sa_valid = sa < target_energy
-    num_valid = np.sum(sa_valid)
-
-    if num_valid == 0:
-        ax.text(
-            0.5, 0.5, f'No SA nonces below {target_energy}',
-            transform=ax.transAxes, ha='center',
-        )
-        ax.set_title('Filtering ROC (no valid nonces)')
-        return
+    num_valid = int(np.sum(sa_valid))
 
     thresholds = np.linspace(0, 95, 50)
     false_neg_rates = []
@@ -204,13 +238,63 @@ def plot_roc(ax, greedy, sa, target_energy):
 
         greedy_pass = greedy <= threshold
         false_neg = np.sum(sa_valid & ~greedy_pass)
-        fn_rate = false_neg / num_valid
+        fn_rate = false_neg / num_valid if num_valid > 0 else 0
         false_neg_rates.append(fn_rate)
 
         kept = np.sum(greedy_pass)
-        speedup = len(greedy) / kept if kept > 0 else len(greedy)
+        speedup = (
+            len(greedy) / kept if kept > 0 else len(greedy)
+        )
         speedups.append(speedup)
 
+    return thresholds, false_neg_rates, speedups, num_valid
+
+
+def plot_roc(
+    greedy, sa, target_energy, config_str, output_path,
+):
+    """Filtering ROC curve, saved to output_path."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    thresholds, false_neg_rates, speedups, num_valid = (
+        _compute_roc_curves(greedy, sa, target_energy)
+    )
+
+    if num_valid == 0:
+        ax.text(
+            0.5, 0.5,
+            f'No SA nonces below {target_energy}',
+            transform=ax.transAxes, ha='center',
+        )
+        ax.set_title(
+            f'Filtering ROC (no valid nonces)\n{config_str}'
+        )
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"  Saved {output_path}")
+        return
+
+    _draw_roc_axes(
+        ax, thresholds, false_neg_rates, speedups,
+        target_energy, config_str,
+    )
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Saved {output_path}")
+
+
+def _draw_roc_axes(
+    ax, thresholds, false_neg_rates, speedups,
+    target_energy, config_str,
+):
+    """Draw ROC curves and sweet-spot annotation on ax."""
     color_fn = 'steelblue'
     color_sp = 'coral'
 
@@ -221,7 +305,9 @@ def plot_roc(ax, greedy, sa, target_energy):
     ax.set_xlabel('Rejection %')
     ax.set_ylabel('False Negative Rate', color=color_fn)
     ax.tick_params(axis='y', labelcolor=color_fn)
-    ax.set_title(f'Filter ROC (target={target_energy})')
+    ax.set_title(
+        f'Filter ROC (target={target_energy})\n{config_str}'
+    )
 
     ax2 = ax.twinx()
     ax2.plot(
@@ -231,11 +317,11 @@ def plot_roc(ax, greedy, sa, target_energy):
     ax2.set_ylabel('Speedup Factor', color=color_sp)
     ax2.tick_params(axis='y', labelcolor=color_sp)
 
-    # Find sweet spot: maximum curvature in FN rate curve
+    # Sweet spot: maximum curvature in FN rate curve
     fn_arr = np.array(false_neg_rates)
     if len(fn_arr) >= 3:
         d2 = np.diff(fn_arr, n=2)
-        knee_idx = np.argmax(d2) + 1  # offset for second derivative
+        knee_idx = np.argmax(d2) + 1
         sweet_pct = thresholds[knee_idx]
         sweet_fn = fn_arr[knee_idx]
         sweet_sp = speedups[knee_idx]
@@ -255,51 +341,80 @@ def plot_roc(ax, greedy, sa, target_energy):
             ),
         )
 
-    # Combined legend
     lines1, labels1 = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=8)
+    ax.legend(
+        lines1 + lines2, labels1 + labels2, fontsize=8,
+    )
 
 
-def plot_energy_distributions(ax, greedy, sa):
-    """Plot 4: Overlapping energy histograms."""
-    bins_greedy = np.linspace(greedy.min(), greedy.max(), 40)
-    bins_sa = np.linspace(sa.min(), sa.max(), 40)
+def plot_energy_distributions(
+    greedy, sa_min, sa_mean, config_str, output_path,
+):
+    """Overlapping energy histograms, saved to output_path."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    bins_greedy = np.linspace(
+        greedy.min(), greedy.max(), 40,
+    )
+    bins_sa = np.linspace(sa_min.min(), sa_min.max(), 40)
 
     ax.hist(
         greedy, bins=bins_greedy, alpha=0.5,
-        label=f'Greedy (n={len(greedy)})', color='steelblue',
-        density=True,
+        label=f'Greedy (n={len(greedy)})',
+        color='steelblue', density=True,
     )
     ax.hist(
-        sa, bins=bins_sa, alpha=0.5,
-        label=f'SA (n={len(sa)})', color='coral',
-        density=True,
+        sa_min, bins=bins_sa, alpha=0.5,
+        label=f'SA min (n={len(sa_min)})',
+        color='coral', density=True,
+    )
+    ax.hist(
+        sa_mean, bins=40, alpha=0.4,
+        label=f'SA mean (n={len(sa_mean)})',
+        color='green', density=True,
     )
     ax.set_xlabel('Energy')
     ax.set_ylabel('Density')
-    ax.set_title('Energy Distributions')
+    ax.set_title(
+        f'Energy Distributions\n{config_str}'
+    )
     ax.legend(fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Saved {output_path}")
 
 
 def plot_density_heatmap(
-    fig, ax, greedy, sa, target_energy,
+    greedy, sa, target_energy, config_str, output_path,
 ):
-    """Plot 5: 2D density heatmap with marginal histograms."""
+    """2D density heatmap with marginals, saved to output_path."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
     from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-    divider = make_axes_locatable(ax)
-    ax_top = divider.append_axes("top", 0.6, pad=0.1, sharex=ax)
-    ax_right = divider.append_axes("right", 0.6, pad=0.1, sharey=ax)
+    fig, ax = plt.subplots(figsize=(8, 6))
 
-    # Hide tick labels on marginals
+    divider = make_axes_locatable(ax)
+    ax_top = divider.append_axes(
+        "top", 0.6, pad=0.1, sharex=ax,
+    )
+    ax_right = divider.append_axes(
+        "right", 0.6, pad=0.1, sharey=ax,
+    )
+
     ax_top.tick_params(labelbottom=False)
     ax_right.tick_params(labelleft=False)
 
-    # Main hexbin
     hb = ax.hexbin(
-        greedy, sa, gridsize=30, cmap='inferno',
-        mincnt=1,
+        greedy, sa, gridsize=30, cmap='inferno', mincnt=1,
     )
     fig.colorbar(hb, ax=ax_right, pad=0.15, label='Count')
 
@@ -309,28 +424,39 @@ def plot_density_heatmap(
     )
     ax.set_xlabel('Greedy Energy (3 passes)')
     ax.set_ylabel('SA Best Energy')
-    ax.set_title('2D Density: Greedy vs SA')
+    ax.set_title(
+        f'2D Density: Greedy vs SA\n{config_str}'
+    )
 
-    # Marginal histograms
     ax_top.hist(greedy, bins=40, color='steelblue', alpha=0.7)
     ax_right.hist(
         sa, bins=40, orientation='horizontal',
         color='coral', alpha=0.7,
     )
 
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Saved {output_path}")
 
-def print_summary(greedy_by_pass, sa, target_energy):
+
+def print_summary(
+    greedy_by_pass, sa_min, sweeps, reads, diff_factor,
+    target_energy,
+):
     """Print correlation statistics to console."""
     from scipy.stats import pearsonr, spearmanr
 
     print("\n" + "=" * 50)
     print("CORRELATION SUMMARY")
+    print(f"  sweeps={sweeps}, reads={reads}")
+    print(f"  difficulty_factor={diff_factor:.4f}")
     print("=" * 50)
 
     for p in sorted(greedy_by_pass.keys()):
         g = greedy_by_pass[p]
-        r_p, _ = pearsonr(g, sa)
-        r_s, _ = spearmanr(g, sa)
+        r_p, _ = pearsonr(g, sa_min)
+        r_s, _ = spearmanr(g, sa_min)
         print(
             f"  Pass {p}: Pearson r={r_p:.4f}, "
             f"Spearman rho={r_s:.4f}",
@@ -338,86 +464,134 @@ def print_summary(greedy_by_pass, sa, target_energy):
 
     g3 = greedy_by_pass[max(greedy_by_pass.keys())]
     print(f"\n  Greedy range: [{g3.min():.0f}, {g3.max():.0f}]")
-    print(f"  SA range:     [{sa.min():.0f}, {sa.max():.0f}]")
+    print(
+        f"  SA range:     "
+        f"[{sa_min.min():.0f}, {sa_min.max():.0f}]"
+    )
 
-    sa_valid = np.sum(sa < target_energy)
+    sa_valid = np.sum(sa_min < target_energy)
+    pct = sa_valid / len(sa_min) * 100
     print(
         f"  SA valid at {target_energy}: "
-        f"{sa_valid}/{len(sa)} ({sa_valid/len(sa)*100:.1f}%)",
+        f"{sa_valid}/{len(sa_min)} ({pct:.1f}%)",
     )
+
+
+def _resolve_params(args):
+    """Resolve sweeps/reads from args or adapt_parameters.
+
+    Returns:
+        Tuple of (sweeps, reads, difficulty_factor).
+    """
+    diff_factor = energy_to_difficulty(args.target_energy)
+
+    if args.sweeps is not None and args.reads is not None:
+        return args.sweeps, args.reads, diff_factor
+
+    params = SimulatedAnnealingMiner.adapt_parameters(
+        difficulty_energy=args.target_energy,
+        min_diversity=0.15,
+        min_solutions=5,
+    )
+    sweeps = (
+        args.sweeps if args.sweeps is not None
+        else params['num_sweeps']
+    )
+    reads = (
+        args.reads if args.reads is not None
+        else params['num_reads']
+    )
+    return sweeps, reads, diff_factor
 
 
 def main():
     """Entry point."""
     parser = argparse.ArgumentParser(
-        description='Visualize greedy descent vs SA correlation',
+        description=(
+            'Visualize greedy descent vs SA correlation'
+        ),
     )
     parser.add_argument(
-        '--nonces', type=int, default=200,
-        help='Number of nonces to evaluate (default: 200)',
+        '--nonces', type=int, default=500,
+        help='Number of nonces to evaluate (default: 500)',
     )
     parser.add_argument(
-        '--sweeps', type=int, default=1024,
-        help='SA num_sweeps (default: 1024)',
+        '--sweeps', type=int, default=None,
+        help='SA num_sweeps (default: auto from difficulty)',
     )
     parser.add_argument(
-        '--reads', type=int, default=20,
-        help='SA num_reads (default: 20)',
+        '--reads', type=int, default=None,
+        help='SA num_reads (default: auto from difficulty)',
     )
     parser.add_argument(
         '--target-energy', type=float, default=-14900.0,
         help='Target energy threshold (default: -14900)',
     )
     parser.add_argument(
-        '--output', '-o', type=str,
-        default='prefilter_correlation.png',
-        help='Output PNG file (default: prefilter_correlation.png)',
+        '--output', '-o', type=str, default='.',
+        help='Output directory for PNGs (default: .)',
     )
     args = parser.parse_args()
 
+    sweeps, reads, diff_factor = _resolve_params(args)
+    config_str = f"sweeps={sweeps}, reads={reads}"
+
+    print(f"SA parameters: {config_str}")
+    print(f"Difficulty factor: {diff_factor:.4f}")
+    print(f"Target energy: {args.target_energy}")
+
+    # Runtime estimate: ~30-60s per nonce at production params
+    est_low = args.nonces * 30
+    est_high = args.nonces * 60
+    print(
+        f"\nWARNING: {args.nonces} nonces at production SA "
+        f"params may take {est_low // 3600:.0f}-"
+        f"{est_high // 3600:.0f} hours "
+        f"({est_low}s-{est_high}s)\n"
+    )
+
+    outdir = args.output
+    os.makedirs(outdir, exist_ok=True)
+
     # Collect data
-    greedy_by_pass, sa = collect_data(
+    greedy_by_pass, sa_min, sa_mean = collect_data(
         num_nonces=args.nonces,
-        sa_sweeps=args.sweeps,
-        sa_reads=args.reads,
+        sa_sweeps=sweeps,
+        sa_reads=reads,
     )
 
     # Print stats
-    print_summary(greedy_by_pass, sa, args.target_energy)
-
-    # Import matplotlib (deferred to avoid import cost if data
-    # collection fails)
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    fig = plt.figure(figsize=(18, 10))
-
-    # Layout: 2 rows, 3 columns. Plot 5 (heatmap) is wider.
-    ax1 = fig.add_subplot(2, 3, 1)
-    ax2 = fig.add_subplot(2, 3, 2)
-    ax3 = fig.add_subplot(2, 3, 3)
-    ax4 = fig.add_subplot(2, 3, 4)
-    ax5 = fig.add_subplot(2, 3, 5)
+    print_summary(
+        greedy_by_pass, sa_min, sweeps, reads,
+        diff_factor, args.target_energy,
+    )
 
     max_pass = max(greedy_by_pass.keys())
     g3 = greedy_by_pass[max_pass]
 
-    plot_scatter(ax1, g3, sa, args.target_energy)
-    plot_progressive_correlation(ax2, greedy_by_pass, sa)
-    plot_roc(ax3, g3, sa, args.target_energy)
-    plot_energy_distributions(ax4, g3, sa)
-    plot_density_heatmap(fig, ax5, g3, sa, args.target_energy)
-
-    fig.suptitle(
-        f'Prefilter Correlation Analysis '
-        f'(n={args.nonces}, SA sweeps={args.sweeps})',
-        fontsize=14,
+    print("\nGenerating plots...")
+    plot_scatter(
+        g3, sa_min, args.target_energy, config_str,
+        os.path.join(outdir, 'scatter.png'),
     )
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    plot_progressive_correlation(
+        greedy_by_pass, sa_min, config_str,
+        os.path.join(outdir, 'progressive_correlation.png'),
+    )
+    plot_roc(
+        g3, sa_min, args.target_energy, config_str,
+        os.path.join(outdir, 'roc.png'),
+    )
+    plot_energy_distributions(
+        g3, sa_min, sa_mean, config_str,
+        os.path.join(outdir, 'energy_distributions.png'),
+    )
+    plot_density_heatmap(
+        g3, sa_min, args.target_energy, config_str,
+        os.path.join(outdir, 'density_heatmap.png'),
+    )
 
-    plt.savefig(args.output, dpi=150, bbox_inches='tight')
-    print(f"\nFigure saved to {args.output}")
+    print(f"\nAll plots saved to {outdir}/")
     return 0
 
 
