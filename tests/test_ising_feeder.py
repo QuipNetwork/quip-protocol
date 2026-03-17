@@ -60,7 +60,7 @@ class TestIsingFeeder:
     def test_pop_returns_ising_model(self):
         feeder = _make_feeder(seed=1)
         try:
-            model = feeder.pop()
+            model = feeder.pop_blocking()
             assert isinstance(model, IsingModel)
             assert isinstance(model.h, dict)
             assert isinstance(model.J, dict)
@@ -74,8 +74,8 @@ class TestIsingFeeder:
         feeder1 = _make_feeder(seed=42)
         feeder2 = _make_feeder(seed=42)
         try:
-            m1 = [feeder1.pop() for _ in range(3)]
-            m2 = [feeder2.pop() for _ in range(3)]
+            m1 = [feeder1.pop_blocking() for _ in range(3)]
+            m2 = [feeder2.pop_blocking() for _ in range(3)]
             for a, b in zip(m1, m2):
                 assert a.nonce == b.nonce
                 assert a.salt == b.salt
@@ -89,8 +89,8 @@ class TestIsingFeeder:
         feeder1 = _make_feeder(seed=1)
         feeder2 = _make_feeder(seed=2)
         try:
-            m1 = feeder1.pop()
-            m2 = feeder2.pop()
+            m1 = feeder1.pop_blocking()
+            m2 = feeder2.pop_blocking()
             assert m1.nonce != m2.nonce
         finally:
             feeder1.stop()
@@ -121,7 +121,7 @@ class TestIsingFeeder:
         feeder = _make_feeder(seed=7, buffer_size=6)
         try:
             for _ in range(4):
-                feeder.pop()
+                feeder.pop_blocking()
             time.sleep(0.5)
             model = feeder.try_pop()
             assert model is not None
@@ -137,7 +137,7 @@ class TestIsingFeeder:
     def test_nonce_roundtrip(self):
         feeder = _make_feeder(seed=99)
         try:
-            model = feeder.pop()
+            model = feeder.pop_blocking()
             h2, J2 = generate_ising_model_from_nonce(
                 model.nonce, _NODES, _EDGES,
             )
@@ -149,11 +149,11 @@ class TestIsingFeeder:
     def test_update_block(self):
         feeder = _make_feeder(seed=11)
         try:
-            m_before = feeder.pop()
+            m_before = feeder.pop_blocking()
             feeder.update_block(
                 b"newhash", "new-miner", 1,
             )
-            m_after = feeder.pop()
+            m_after = feeder.pop_blocking()
             assert m_before.nonce != m_after.nonce
         finally:
             feeder.stop()

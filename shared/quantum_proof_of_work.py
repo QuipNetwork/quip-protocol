@@ -545,6 +545,7 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
     min_diversity = requirements.min_diversity
     min_solutions = requirements.min_solutions
     best_energy = float('inf')
+    valid_count = 0
     valid_solutions = []
     diversity = 0.0
     result = None
@@ -658,5 +659,5 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         logger.debug(f"Failed to meet requirements: {e}")
     finally:
         # Log every mining attempt (successful or not) for analysis
-        logger.info(f"[{miner_id}] Mining attempt - Energy: {best_energy:.0f}, Valid: {len(valid_solutions)} (best {min_solutions} diversity: {diversity:.3f}) (requirements: energy<={difficulty_energy:.0f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
+        logger.info(f"[{miner_id}] Mining attempt - Energy: {best_energy:.0f}, Valid: {valid_count} (best {min_solutions} diversity: {diversity:.3f}) (requirements: energy<={difficulty_energy:.0f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
     return result
