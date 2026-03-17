@@ -10,6 +10,7 @@ import multiprocessing
 import multiprocessing.synchronize
 import random
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -423,7 +424,58 @@ class BaseMiner(ABC):
             self.current_stage = 'preprocessing'
             self.current_stage_start = preprocess_start
 
-            # ---------- SAMPLING (delegated to subclass) ----------
+            # ---------- BATCH SAMPLING (multi-nonce) ----------
+            extra_params = {
+                k: v for k, v in params.items()
+                if k not in ('num_reads', 'num_sweeps')
+            }
+            try:
+                batch = self._sample_batch(
+                    prev_block.hash, node_info.miner_id,
+                    cur_index, nodes, edges,
+                    num_reads=num_reads,
+                    num_sweeps=current_num_sweeps,
+                    **extra_params,
+                )
+            except Exception as e:
+                if self._on_sampling_error(e, stop_event):
+                    return None
+                batch = None
+
+            if batch is not None:
+                sample_time = time.time() - preprocess_start
+                self.timing_stats['sampling'].append(
+                    sample_time * 1e6,
+                )
+                for b_nonce, b_salt, b_ss in batch:
+                    b_ss = self._post_sample(b_ss)
+                    self.timing_stats['total_samples'] += len(
+                        b_ss.record.energy,
+                    )
+                    self.timing_stats['blocks_attempted'] += 1
+                    result = self.evaluate_sampleset(
+                        b_ss, current_requirements,
+                        nodes, edges, b_nonce, b_salt,
+                        prev_timestamp, start_time,
+                    )
+                    if result:
+                        self.logger.info(
+                            f"[Block-{cur_index}] Mined (batch)! "
+                            f"Nonce: {b_nonce}, "
+                            f"Min Energy: {result.energy:.2f}, "
+                            f"Solutions: {result.num_valid}, "
+                            f"Diversity: {result.diversity:.3f}",
+                        )
+                        self._post_mine_cleanup()
+                        return result
+                    self.update_top_samples(
+                        b_ss, b_nonce, b_salt,
+                        current_requirements,
+                    )
+                progress += 1
+                continue
+
+            # ---------- SAMPLING (single nonce) ----------
             try:
                 sample_start = time.time()
                 self.current_stage = 'sampling'
@@ -433,8 +485,7 @@ class BaseMiner(ABC):
                     h, J,
                     num_reads=num_reads,
                     num_sweeps=current_num_sweeps,
-                    **{k: v for k, v in params.items()
-                       if k not in ('num_reads', 'num_sweeps')},
+                    **extra_params,
                 )
 
                 sample_time = time.time() - sample_start
@@ -558,6 +609,26 @@ class BaseMiner(ABC):
         keyword arguments.
         """
 
+    def _sample_batch(
+        self,
+        prev_hash: bytes,
+        miner_id: str,
+        cur_index: int,
+        nodes: List[int],
+        edges: List[Tuple[int, int]],
+        *,
+        num_reads: int,
+        num_sweeps: int,
+        **kwargs,
+    ) -> Optional[List[Tuple[int, bytes, dimod.SampleSet]]]:
+        """Sample multiple nonces in a single kernel launch.
+
+        Returns list of (nonce, salt, sampleset) tuples, or None
+        to fall through to single-nonce _sample() path.
+        Override in miners that support multi-nonce dispatch.
+        """
+        return None
+
     def _post_sample(
         self, sampleset: dimod.SampleSet,
     ) -> dimod.SampleSet:
@@ -584,7 +655,9 @@ class BaseMiner(ABC):
         if stop_event.is_set():
             self.logger.info("Interrupted during sampling")
             return True
-        self.logger.error(f"Sampling error: {error}")
+        self.logger.error(
+            f"Sampling error: {error}\n{traceback.format_exc()}"
+        )
         return False
 
     def get_stats(self) -> Dict[str, Any]:

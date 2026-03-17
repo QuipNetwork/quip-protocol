@@ -64,3 +64,5 @@ localhost.pem
 
 # Profiling flamegraph outputs
 flamegraphs/
+# Benchmark outputs
+benchmarks/

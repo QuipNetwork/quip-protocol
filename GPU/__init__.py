@@ -2,13 +2,19 @@
 
 # Try to import CUDA components (only available with cupy)
 try:
-    from .cuda_sa import CudaSASamplerAsync
+    from .gpu_miner import GPUMiner
     from .cuda_miner import CudaMiner
     CUDA_AVAILABLE = True
 except ImportError:
     CUDA_AVAILABLE = False
-    CudaSASamplerAsync = None
+    GPUMiner = None
     CudaMiner = None
+
+# Try to import CUDA Gibbs sampler (separate class, same CudaMiner)
+try:
+    from .cuda_gibbs_sa import CudaGibbsSampler
+except ImportError:
+    CudaGibbsSampler = None
 
 # Try to import Modal components
 try:
@@ -44,13 +50,14 @@ GPU_AVAILABLE = CUDA_AVAILABLE or MODAL_AVAILABLE
 
 __all__ = [
     'ModalSampler',
-    'CudaMiner', 'ModalMiner',
-    'gpu_app', 'GPU_AVAILABLE', 'METAL_AVAILABLE', 'MODAL_AVAILABLE'
+    'ModalMiner',
+    'gpu_app', 'GPU_AVAILABLE', 'METAL_AVAILABLE',
+    'MODAL_AVAILABLE',
 ]
 
 # Add CUDA components if available
 if CUDA_AVAILABLE:
-    __all__.extend(['CudaSASamplerAsync', 'CudaMiner'])
+    __all__.extend(['GPUMiner', 'CudaMiner'])
 
 # Add Modal components if available
 if MODAL_AVAILABLE:
@@ -62,4 +69,6 @@ if METAL_AVAILABLE:
 
 # Add Metal Gibbs components if available
 if METAL_GIBBS_AVAILABLE:
-    __all__.extend(['MetalGibbsSampler', 'METAL_GIBBS_AVAILABLE'])
+    __all__.extend([
+        'MetalGibbsSampler', 'METAL_GIBBS_AVAILABLE',
+    ])
