@@ -134,6 +134,9 @@ def build_miner_from_spec(spec: Dict[str, Any]):
             # Remove time config keys from cfg to avoid passing them to miner
             cfg = {k: v for k, v in cfg.items() if not k.startswith("qpu_")}
         return QPU.DWaveMiner(miner_id, time_config=time_config, **cfg)
+    elif kind == "cpu-filtered":
+        from CPU.sa_filtered_miner import SAFilteredMiner
+        return SAFilteredMiner(miner_id, **cfg)
     else:
         raise ValueError(f"Unknown miner kind '{kind}'")
 
@@ -214,6 +217,8 @@ class MinerHandle:
             return f"GPU-LOCAL:{d}"
         if k == "metal":
             return "GPU-MPS"
+        if k == "cpu-filtered":
+            return "CPU-Filtered"
         if k == "cuda-gibbs":
             return "GPU-CUDA-Gibbs"
         return k.upper()
