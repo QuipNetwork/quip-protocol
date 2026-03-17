@@ -40,19 +40,6 @@
 #define DEBUG_VERBOSE 0
 #endif
 
-// Profiling macros (zero overhead when PROFILE_REGIONS is not defined)
-#ifdef PROFILE_REGIONS
-#define PROF_T(var) var = clock64()
-#define PROF_ACCUM(arr, idx, start_var) \
-    arr[idx] += clock64() - start_var
-#define PROF_INC(arr, idx) arr[idx]++
-#define SA_NUM_REGIONS 10
-#else
-#define PROF_T(var)
-#define PROF_ACCUM(arr, idx, start_var)
-#define PROF_INC(arr, idx)
-#endif
-
 // Fast math constants
 #define RNG_SCALE 2.32830643653869628906e-10f  // 1.0f / 2^32
 
@@ -150,9 +137,6 @@ __global__ void cuda_sa_self_feeding(
     // Workspace (per global thread)
     signed char* delta_energy_workspace,
     int max_N
-#ifdef PROFILE_REGIONS
-    , long long* profile_output
-#endif
 ) {
     int tid = threadIdx.x;
     int nonce_id = blockIdx.x;
@@ -259,40 +243,24 @@ __global__ void cuda_sa_self_feeding(
                     }
                 }
             }
-
             // === SA sweep loop ===
-#ifdef PROFILE_REGIONS
-            long long prof[SA_NUM_REGIONS] = {0};
-            long long _t0, _t1, _t2, _t3, _t4;
-#endif
-
-            PROF_T(_t0);  // SA_TOTAL start
             for (int beta_idx = 0;
                  beta_idx < num_betas;
                  beta_idx++) {
-                PROF_T(_t1);  // BETA_OVERHEAD
                 float beta = __ldg(
                     &beta_schedule[beta_idx]);
                 float threshold = 22.18f / beta;
-                PROF_ACCUM(prof, 1, _t1);
 
                 for (int sweep = 0;
                      sweep < sweeps_per_beta;
                      sweep++) {
-                    PROF_T(_t2);  // SWEEP_TOTAL
                     for (int var = 0; var < N; var++) {
-                        PROF_T(_t3);  // Per-var
                         signed char de =
                             delta_energy[var];
 
                         if (de >= threshold) {
-                            PROF_ACCUM(
-                                prof, 4, _t3);
-                            PROF_INC(prof, 9);
                             continue;
                         }
-
-                        PROF_T(_t4);  // ACCEPT_DECIDE
                         bool flip_spin = false;
 
                         if (de <= 0) {
@@ -311,10 +279,8 @@ __global__ void cuda_sa_self_feeding(
                                 (accept_prob
                                  > rand_uniform);
                         }
-                        PROF_ACCUM(prof, 5, _t4);
 
                         if (flip_spin) {
-                            PROF_T(_t4);  // FLIP_TOTAL
                             current_energy += de;
 
                             const signed char
@@ -332,8 +298,6 @@ __global__ void cuda_sa_self_feeding(
                                 __ldg(
                                     &csr_row_ptr[
                                         var + 1]);
-
-                            PROF_T(_t3);  // NEIGHBOR
                             for (int p = start;
                                  p < end; ++p) {
                                 const int neighbor =
@@ -352,30 +316,14 @@ __global__ void cuda_sa_self_feeding(
                                     multiplier
                                     * Jij * ns;
                             }
-                            PROF_ACCUM(
-                                prof, 7, _t3);
 
                             unpacked_state[var] =
                                 -var_spin;
                             delta_energy[var] = -de;
-                            PROF_ACCUM(
-                                prof, 6, _t4);
-                            PROF_INC(prof, 8);
                         }
                     }
-                    PROF_ACCUM(prof, 2, _t2);
                 }
             }
-            PROF_ACCUM(prof, 0, _t0);  // SA_TOTAL end
-
-#ifdef PROFILE_REGIONS
-            // Write profile for this thread
-            int gid = blockIdx.x * blockDim.x + tid;
-            for (int r = 0; r < SA_NUM_REGIONS; r++)
-                profile_output[
-                    gid * SA_NUM_REGIONS + r
-                ] = prof[r];
-#endif
 
             // Pack final state to bit format
             signed char packed_state[640];

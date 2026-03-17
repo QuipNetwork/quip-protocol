@@ -48,14 +48,11 @@ from shared.beta_schedule import _default_ising_beta_range
 from shared.energy_utils import energy_to_difficulty
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce
 from tools.cuda_profile_regions import (
-    SA_REGION_NAMES,
-    GIBBS_REGION_NAMES,
+    _load_manifest,
     generate_flamegraph_html,
     get_gpu_info,
     get_topology_stats,
-    print_gibbs_profile,
-    print_precise_ticks,
-    print_sa_profile,
+    print_profile,
 )
 
 
@@ -213,10 +210,8 @@ def build_aggregate_profile(all_profiles, kernel_name):
     Returns:
         Synthetic profile array suitable for generate_flamegraph_html.
     """
-    num_regions = (
-        12 if kernel_name == "gibbs"
-        else CudaSASampler.SA_NUM_REGIONS
-    )
+    manifest = _load_manifest(kernel_name)
+    num_regions = manifest["num_regions"]
     active_rows = []
     for data in all_profiles:
         active = data[data[:, 0] > 0]
@@ -516,13 +511,15 @@ def run_test1(
 
     os.makedirs(output_dir, exist_ok=True)
 
+    g_manifest = _load_manifest("gibbs")
+    s_manifest = _load_manifest("sa")
     generate_flamegraph_html(
-        g_agg, clock_khz, "gibbs",
+        g_agg, clock_khz, "gibbs", g_manifest,
         params["num_sweeps"], gpu_name,
         os.path.join(output_dir, "flamegraph_gibbs_aggregate.html"),
     )
     generate_flamegraph_html(
-        s_agg, clock_khz, "sa",
+        s_agg, clock_khz, "sa", s_manifest,
         params["num_sweeps"], gpu_name,
         os.path.join(output_dir, "flamegraph_sa_aggregate.html"),
     )
@@ -694,15 +691,17 @@ def run_test2(
     print("\nBuilding aggregate flamegraphs...")
     if gibbs_profiles:
         g_agg = build_aggregate_profile(gibbs_profiles, "gibbs")
+        g_manifest = _load_manifest("gibbs")
         generate_flamegraph_html(
-            g_agg, clock_khz, "gibbs",
+            g_agg, clock_khz, "gibbs", g_manifest,
             params["num_sweeps"], gpu_name,
             os.path.join(output_dir, "flamegraph_gibbs_mining.html"),
         )
     if sa_profiles:
         s_agg = build_aggregate_profile(sa_profiles, "sa")
+        s_manifest = _load_manifest("sa")
         generate_flamegraph_html(
-            s_agg, clock_khz, "sa",
+            s_agg, clock_khz, "sa", s_manifest,
             params["num_sweeps"], gpu_name,
             os.path.join(output_dir, "flamegraph_sa_mining.html"),
         )

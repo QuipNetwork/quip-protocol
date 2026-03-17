@@ -27,9 +27,6 @@ from GPU.sampler_utils import (
 )
 
 
-GIBBS_NUM_REGIONS = 12
-
-
 class CudaGibbsSampler(BaseCudaSampler):
     """Block Gibbs sampler using CUDA GPU.
 
@@ -57,7 +54,7 @@ class CudaGibbsSampler(BaseCudaSampler):
             parallel: Use chromatic parallel kernel (True) or
                 fully sequential kernel (False).
             max_sms: Maximum SMs to use (0 = all available).
-            profile: Compile with PROFILE_REGIONS for clock64()
+            profile: Enable auto-profiling with clock64()
                 instrumentation.
         """
         if update_mode.lower() not in ("gibbs", "metropolis"):
@@ -98,8 +95,8 @@ class CudaGibbsSampler(BaseCudaSampler):
     def _kernel_function_name(self) -> str:
         return 'cuda_gibbs_self_feeding'
 
-    def _num_profile_regions(self) -> int:
-        return GIBBS_NUM_REGIONS
+    def _profiling_mode(self) -> str:
+        return "thread_zero"
 
     @property
     def _sms_per_nonce(self) -> int:

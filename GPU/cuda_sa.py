@@ -20,9 +20,6 @@ import numpy as np
 from GPU.base_cuda_sampler import BaseCudaSampler
 
 
-SA_NUM_REGIONS = 10
-
-
 class CudaSASampler(BaseCudaSampler):
     """Self-feeding SA sampler using CUDA GPU.
 
@@ -52,8 +49,8 @@ class CudaSASampler(BaseCudaSampler):
     def _kernel_function_name(self) -> str:
         return 'cuda_sa_self_feeding'
 
-    def _num_profile_regions(self) -> int:
-        return SA_NUM_REGIONS
+    def _profiling_mode(self) -> str:
+        return "per_thread"
 
     @property
     def _sms_per_nonce(self) -> int:

@@ -67,7 +67,7 @@ class BaseCudaSampler(abc.ABC):
         Args:
             topology: Topology object (default: DEFAULT_TOPOLOGY).
             max_sms: Maximum SMs to use (0 = all available).
-            profile: Compile with PROFILE_REGIONS for clock64()
+            profile: Enable auto-profiling with clock64()
                 instrumentation.
             sampler_type: Identifier string for this sampler.
         """
@@ -97,15 +97,43 @@ class BaseCudaSampler(abc.ABC):
             ),
             self._kernel_filename(),
         )
-        with open(kernel_path, 'r') as f:
-            kernel_code = f.read()
+        self._profile_manifest = None
 
         compile_options = ['--use_fast_math']
-        if self.profile:
-            compile_options.append('-DPROFILE_REGIONS=1')
         compile_options.extend(
             self._extra_compile_options(),
         )
+
+        if self.profile:
+            # Auto-instrument: generates profiled temp file
+            # and manifest from clean source
+            import sys
+            _project_root = os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__)),
+            )
+            if _project_root not in sys.path:
+                sys.path.insert(0, _project_root)
+            from tools.cuda_auto_profiler import (
+                auto_instrument,
+            )
+            profiled_path, manifest = auto_instrument(
+                kernel_path,
+                self._kernel_function_name(),
+                self._profiling_mode(),
+            )
+            self._profile_manifest = manifest
+            with open(profiled_path, 'r') as f:
+                kernel_code = f.read()
+            self.logger.info(
+                "%s auto-profiler: %d regions from %s",
+                self.sampler_type,
+                manifest["num_regions"],
+                kernel_path,
+            )
+        else:
+            with open(kernel_path, 'r') as f:
+                kernel_code = f.read()
+
         self._module = cp.RawModule(
             code=kernel_code,
             options=tuple(compile_options),
@@ -129,9 +157,17 @@ class BaseCudaSampler(abc.ABC):
     def _kernel_function_name(self) -> str:
         """Kernel entry point name."""
 
-    @abc.abstractmethod
     def _num_profile_regions(self) -> int:
-        """Number of profiling regions in the kernel."""
+        """Number of profiling regions (from manifest)."""
+        assert self._profile_manifest is not None, (
+            "Profile manifest not loaded. "
+            "Pass profile=True to __init__()."
+        )
+        return self._profile_manifest["num_regions"]
+
+    @abc.abstractmethod
+    def _profiling_mode(self) -> str:
+        """Profiling mode: 'per_thread' or 'thread_zero'."""
 
     def _extra_compile_options(self) -> List[str]:
         """Extra nvcc compile options (default: none)."""
@@ -329,10 +365,16 @@ class BaseCudaSampler(abc.ABC):
             **kwargs,
         )
 
-        # Profile buffer
+        # Profile buffer (size depends on mode)
         if self.profile:
             num_regions = self._num_profile_regions()
-            max_work_units = num_nonces * 10
+            num_blocks = num_nonces * self._sms_per_nonce
+            if self._profiling_mode() == "per_thread":
+                # One entry per thread
+                max_work_units = num_blocks * 256
+            else:
+                # One entry per block (thread 0 only)
+                max_work_units = num_blocks
             self._d_sf_profile = cp.zeros(
                 max_work_units * num_regions,
                 dtype=cp.int64,
