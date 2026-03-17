@@ -15,6 +15,25 @@
 //   1. cuda_gibbs_persistent: work-queue persistent kernel (256 threads)
 //   2. cuda_block_gibbs_sequential: validation baseline (1 thread)
 
+// Profiling macros (zero overhead when PROFILE_REGIONS is not defined)
+#ifdef PROFILE_REGIONS
+#define PROF_T(var) var = clock64()
+#define PROF_ACCUM(arr, idx, start_var) arr[idx] += clock64() - start_var
+#define PROF_INC(arr, idx) arr[idx]++
+// Thread-0-only variants for Gibbs kernel (representative measurement)
+#define PROF_T0(cond, var) if (cond) var = clock64()
+#define PROF_ACCUM0(cond, arr, idx, sv) if (cond) arr[idx] += clock64() - sv
+#define PROF_INC0(cond, arr, idx) if (cond) arr[idx]++
+#define GIBBS_NUM_REGIONS 12
+#else
+#define PROF_T(var)
+#define PROF_ACCUM(arr, idx, start_var)
+#define PROF_INC(arr, idx)
+#define PROF_T0(cond, var)
+#define PROF_ACCUM0(cond, arr, idx, sv)
+#define PROF_INC0(cond, arr, idx)
+#endif
+
 // ==============================================================================
 // xoshiro128** RNG
 // ==============================================================================
@@ -230,6 +249,9 @@ extern "C" __global__ void cuda_gibbs_persistent(
 
     unsigned int base_seed,
     int update_mode
+#ifdef PROFILE_REGIONS
+    , long long* profile_output         // Per-work-unit profiling counters
+#endif
 ) {
     // Shared memory for spin state (unpacked, 1 byte per spin)
     __shared__ signed char shared_state[4800];
@@ -288,15 +310,29 @@ extern "C" __global__ void cuda_gibbs_persistent(
             __syncthreads();
 
             // Phase 2: Chromatic Gibbs annealing
+#ifdef PROFILE_REGIONS
+            long long prof[GIBBS_NUM_REGIONS] = {0};
+            long long _t0, _t1, _t2, _t3, _t4;
+            bool _is_p = (threadIdx.x == 0);
+#endif
+
+            PROF_T0(_is_p, _t0);  // ANNEALING_TOTAL
             for (int beta_idx = 0; beta_idx < num_betas;
                  beta_idx++) {
+                PROF_T0(_is_p, _t1);  // BETA_ITER
                 float beta =
                     __ldg(&beta_schedule[beta_idx]);
 
                 for (int sweep = 0;
                      sweep < sweeps_per_beta; sweep++) {
+                    PROF_T0(_is_p, _t2);  // SWEEP_ITER
+
                     for (int color = 0;
                          color < num_colors; color++) {
+                        PROF_T0(_is_p, _t3);  // COLOR_ITER
+
+                        // COLOR_SETUP measurement
+                        PROF_T0(_is_p, _t4);
                         int bstart = __ldg(
                             &all_block_starts[
                                 color_base + color]
@@ -305,7 +341,10 @@ extern "C" __global__ void cuda_gibbs_persistent(
                             &all_block_counts[
                                 color_base + color]
                         );
+                        PROF_ACCUM0(_is_p, prof, 4, _t4);
 
+                        // NODE_LOOP measurement
+                        PROF_T0(_is_p, _t4);
                         // 256 threads divide nodes
                         for (int i = threadIdx.x;
                              i < bcount;
@@ -315,6 +354,10 @@ extern "C" __global__ void cuda_gibbs_persistent(
                                     bstart + i]
                             );
 
+#ifdef PROFILE_REGIONS
+                            long long ft = 0;
+                            if (_is_p) ft = clock64();
+#endif
                             float h_eff =
                                 compute_effective_field_shared(
                                     var, shared_state,
@@ -323,7 +366,12 @@ extern "C" __global__ void cuda_gibbs_persistent(
                                     csr_J_vals,
                                     h_vals, h_off
                                 );
+                            PROF_ACCUM0(_is_p, prof, 6, ft);
 
+#ifdef PROFILE_REGIONS
+                            long long st = 0;
+                            if (_is_p) st = clock64();
+#endif
                             int new_spin;
                             if (update_mode == 0) {
                                 new_spin = gibbs_sample(
@@ -338,16 +386,52 @@ extern "C" __global__ void cuda_gibbs_persistent(
                                         beta, rng
                                     );
                             }
+                            PROF_ACCUM0(_is_p, prof, 7, st);
 
                             shared_state[var] =
                                 (signed char)new_spin;
                         }
+                        PROF_ACCUM0(_is_p, prof, 5, _t4);
 
+                        // SYNC_COLOR measurement
+                        PROF_T0(_is_p, _t4);
                         // Barrier between colors
                         __syncthreads();
+#ifdef PROFILE_REGIONS
+                        if (_is_p) {
+                            prof[8] += clock64() - _t4;
+                            prof[3] += clock64() - _t3;
+                            prof[11]++;
+                        }
+#endif
                     }
+#ifdef PROFILE_REGIONS
+                    if (_is_p) {
+                        prof[2] += clock64() - _t2;
+                        prof[10]++;
+                    }
+#endif
                 }
+#ifdef PROFILE_REGIONS
+                if (_is_p) {
+                    prof[1] += clock64() - _t1;
+                    prof[9]++;
+                }
+#endif
             }
+#ifdef PROFILE_REGIONS
+            if (_is_p) {
+                prof[0] += clock64() - _t0;
+            }
+
+            // Thread 0 writes profile data for this work unit
+            if (_is_p) {
+                int wu_id = s_work_unit;
+                for (int r = 0; r < GIBBS_NUM_REGIONS; r++)
+                    profile_output[wu_id * GIBBS_NUM_REGIONS + r]
+                        = prof[r];
+            }
+#endif
 
             // Phase 3: Energy (warp reduction)
             float thread_energy = 0.0f;

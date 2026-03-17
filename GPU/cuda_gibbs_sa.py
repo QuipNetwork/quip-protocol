@@ -40,11 +40,15 @@ class CudaGibbsSampler:
     Also supports a fully sequential mode for validation.
     """
 
+    GIBBS_NUM_REGIONS = 12
+
     def __init__(
         self,
         topology=None,
         update_mode: str = "gibbs",
         parallel: bool = True,
+        max_sms: int = 0,
+        profile: bool = False,
     ):
         """Initialize CUDA Gibbs sampler.
 
@@ -53,7 +57,11 @@ class CudaGibbsSampler:
             update_mode: "gibbs" or "metropolis".
             parallel: Use chromatic parallel kernel (True) or
                 fully sequential kernel (False).
+            max_sms: Maximum SMs to use (0 = all available).
+            profile: Compile with PROFILE_REGIONS for clock64()
+                instrumentation.
         """
+        self.profile = profile
         self.logger = logging.getLogger(__name__)
 
         if update_mode.lower() not in ("gibbs", "metropolis"):
@@ -64,6 +72,8 @@ class CudaGibbsSampler:
         self.update_mode = 0 if update_mode.lower() == "gibbs" else 1
         self.update_mode_name = update_mode.lower()
         self.parallel = parallel
+        self.max_sms = max_sms
+        self.sampler_type = "cuda-gibbs"
 
         # Set up topology
         from dwave_topologies import DEFAULT_TOPOLOGY
@@ -92,9 +102,12 @@ class CudaGibbsSampler:
         with open(kernel_path, 'r') as f:
             kernel_code = f.read()
 
+        compile_options = ['--use_fast_math']
+        if self.profile:
+            compile_options.append('-DPROFILE_REGIONS=1')
         self._module = cp.RawModule(
             code=kernel_code,
-            options=('--use_fast_math',),
+            options=tuple(compile_options),
         )
         self._persistent_kernel = self._module.get_function(
             'cuda_gibbs_persistent'
@@ -219,6 +232,8 @@ class CudaGibbsSampler:
             dev = cp.cuda.Device()
             num_sms = dev.attributes['MultiProcessorCount']
             num_blocks = num_sms  # 1 persistent block per SM
+            if self.max_sms > 0:
+                num_blocks = min(num_blocks, self.max_sms)
 
             chunks_per_model = max(
                 1, num_blocks // num_problems
@@ -242,32 +257,44 @@ class CudaGibbsSampler:
                 f"{total_work_units} total units"
             )
 
+            # Profile buffer (only allocated when profiling)
+            if self.profile:
+                d_profile = cp.zeros(
+                    total_work_units * self.GIBBS_NUM_REGIONS,
+                    dtype=cp.int64,
+                )
+                self._profile_work_units = total_work_units
+
             grid = (num_blocks,)
             block = (256,)
+            kernel_args = (
+                d_row_ptr, d_col_ind,
+                d_J_vals, d_h_vals,
+                d_problem_N, d_problem_rp,
+                d_problem_ci, d_problem_h,
+                d_block_starts, d_block_counts,
+                d_color_nodes,
+                np.int32(self.num_colors),
+                d_beta_sched,
+                np.int32(num_betas),
+                np.int32(num_sweeps // num_betas),
+                d_final_samples, d_final_energies,
+                np.int32(num_reads),
+                np.int32(max_N),
+                np.int32(max_packed_size),
+                np.int32(num_problems),
+                d_queue_counter,
+                np.int32(chunks_per_model),
+                np.int32(reads_per_chunk),
+                np.int32(total_work_units),
+                np.uint32(seed),
+                np.int32(self.update_mode),
+            )
+            if self.profile:
+                kernel_args = kernel_args + (d_profile,)
+                self._d_profile = d_profile
             self._persistent_kernel(
-                grid, block, (
-                    d_row_ptr, d_col_ind,
-                    d_J_vals, d_h_vals,
-                    d_problem_N, d_problem_rp,
-                    d_problem_ci, d_problem_h,
-                    d_block_starts, d_block_counts,
-                    d_color_nodes,
-                    np.int32(self.num_colors),
-                    d_beta_sched,
-                    np.int32(num_betas),
-                    np.int32(num_sweeps // num_betas),
-                    d_final_samples, d_final_energies,
-                    np.int32(num_reads),
-                    np.int32(max_N),
-                    np.int32(max_packed_size),
-                    np.int32(num_problems),
-                    d_queue_counter,
-                    np.int32(chunks_per_model),
-                    np.int32(reads_per_chunk),
-                    np.int32(total_work_units),
-                    np.uint32(seed),
-                    np.int32(self.update_mode),
-                ),
+                grid, block, kernel_args,
             )
         else:
             # Sequential: 1 thread/block, reads_per_block=1
@@ -378,3 +405,29 @@ class CudaGibbsSampler:
 
         all_color_nodes = np.concatenate(all_color_nodes)
         return all_block_starts, all_block_counts, all_color_nodes
+
+    def get_profile_data(self) -> np.ndarray:
+        """Copy profile counters from GPU and reshape.
+
+        Returns:
+            Array of shape (work_units, GIBBS_NUM_REGIONS) with
+            int64 cycle counts per region.
+
+        Raises:
+            RuntimeError: If profiling is not enabled or no data
+                has been collected yet.
+        """
+        if not self.profile:
+            raise RuntimeError(
+                "Profiling not enabled. "
+                "Pass profile=True to __init__()."
+            )
+        if not hasattr(self, '_d_profile'):
+            raise RuntimeError(
+                "No profile data. Call sample_ising() first."
+            )
+        raw = cp.asnumpy(self._d_profile)
+        return raw.reshape(
+            self._profile_work_units,
+            self.GIBBS_NUM_REGIONS,
+        )

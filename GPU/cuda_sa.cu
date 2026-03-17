@@ -24,6 +24,18 @@ typedef unsigned int uint;
 #define DEBUG_VERBOSE 0 // Disabled - very expensive printf in SA loop
 #endif
 
+// Profiling macros (zero overhead when PROFILE_REGIONS is not defined)
+#ifdef PROFILE_REGIONS
+#define PROF_T(var) var = clock64()
+#define PROF_ACCUM(arr, idx, start_var) arr[idx] += clock64() - start_var
+#define PROF_INC(arr, idx) arr[idx]++
+#define SA_NUM_REGIONS 10
+#else
+#define PROF_T(var)
+#define PROF_ACCUM(arr, idx, start_var)
+#define PROF_INC(arr, idx)
+#endif
+
 // Fast math constants
 #define RNG_SCALE 2.32830643653869628906e-10f  // 1.0f / 2^32
 
@@ -194,6 +206,9 @@ __global__ void cuda_sa_persistent_real(
     int max_energies_per_job,           // Max floats for energies per job
     int8_t* __restrict__ delta_energy_workspace,
     int max_N                           // Max problem size (workspace capacity per thread)
+#ifdef PROFILE_REGIONS
+    , long long* profile_output         // Per-thread profiling counters
+#endif
 ) {
     int tid = threadIdx.x;
     int bid = blockIdx.x;
@@ -419,16 +434,31 @@ __global__ void cuda_sa_persistent_real(
 
             // Perform SA sweeps
 
+#ifdef PROFILE_REGIONS
+            long long prof[SA_NUM_REGIONS] = {0};
+            long long _t0, _t1, _t2, _t3, _t4;
+#endif
+
+            PROF_T(_t0);  // SA_TOTAL start
             for (int beta_idx = 0; beta_idx < num_betas; beta_idx++) {
+                PROF_T(_t1);  // BETA_OVERHEAD start
                 float beta = shared_job.beta_schedule[beta_idx];
                 float threshold = 22.18f / beta;
+                PROF_ACCUM(prof, 1, _t1);  // BETA_OVERHEAD end
 
                 for (int sweep = 0; sweep < sweeps_per_beta; sweep++) {
+                    PROF_T(_t2);  // SWEEP_TOTAL start
                     for (int var = 0; var < n; var++) {
+                        PROF_T(_t3);  // Per-var start
                         int8_t de = delta_energy[var];
 
-                        if (de >= threshold) continue;
+                        if (de >= threshold) {
+                            PROF_ACCUM(prof, 4, _t3);  // THRESHOLD_SKIP
+                            PROF_INC(prof, 9);          // SKIP_COUNT
+                            continue;
+                        }
 
+                        PROF_T(_t4);  // ACCEPT_DECIDE start
                         bool flip_spin = false;
 
                         if (de <= 0) {
@@ -439,8 +469,10 @@ __global__ void cuda_sa_persistent_real(
                             const float rand_uniform = __uint2float_rn(xorshift32(rng_state)) * RNG_SCALE;
                             flip_spin = (accept_prob > rand_uniform);
                         }
+                        PROF_ACCUM(prof, 5, _t4);  // ACCEPT_DECIDE end
 
                         if (flip_spin) {
+                            PROF_T(_t4);  // FLIP_TOTAL start
                             current_energy += de;
 
                             // OPTIMIZATION: Use unpacked state (matching Metal logic)
@@ -449,20 +481,33 @@ __global__ void cuda_sa_persistent_real(
                             const int start = __ldg(&csr_row_ptr[var]);
                             const int end = __ldg(&csr_row_ptr[var + 1]);
 
+                            PROF_T(_t3);  // NEIGHBOR_LOOP start (reuse _t3)
                             for (int p = start; p < end; ++p) {
                                 const int neighbor = __ldg(&csr_col_ind[p]);
                                 const int8_t Jij = __ldg(&csr_J_vals[p]);
                                 const int8_t neighbor_spin = unpacked_state[neighbor];
                                 delta_energy[neighbor] += multiplier * Jij * neighbor_spin;
                             }
+                            PROF_ACCUM(prof, 7, _t3);  // NEIGHBOR_LOOP end
 
                             // Flip spin (just negate, no bit packing)
                             unpacked_state[var] = -var_spin;
                             delta_energy[var] = -de;
+                            PROF_ACCUM(prof, 6, _t4);  // FLIP_TOTAL end
+                            PROF_INC(prof, 8);          // FLIP_COUNT
                         }
                     }
+                    PROF_ACCUM(prof, 2, _t2);  // SWEEP_TOTAL end
                 }
             }
+            PROF_ACCUM(prof, 0, _t0);  // SA_TOTAL end
+
+#ifdef PROFILE_REGIONS
+            // Write profiling data to global buffer
+            int gid = bid * blockDim.x + tid;
+            for (int r = 0; r < SA_NUM_REGIONS; r++)
+                profile_output[gid * SA_NUM_REGIONS + r] = prof[r];
+#endif
 
             // Pack final state back to bit format (for compatibility with existing code)
             for (int i = 0; i < n; i++) {
@@ -573,6 +618,121 @@ __global__ void cuda_sa_persistent_real(
             __nanosleep(10000000);  // 10ms - was 500ms
         }
     }
+}
+
+// Per-job oneshot SA kernel: no ring buffer, no polling, no control flags.
+// Each thread runs one SA read independently.
+// Grid=(num_blocks,) block=(threads_per_block,).
+// Threads beyond num_reads are idle.
+__global__ void cuda_sa_oneshot(
+    const int* __restrict__ csr_row_ptr,
+    const int* __restrict__ csr_col_ind,
+    const int8_t* __restrict__ csr_J_vals,
+    const float* __restrict__ h,
+    const float* __restrict__ beta_schedule,
+    int N,
+    int num_reads,
+    int num_betas,
+    int num_sweeps_per_beta,
+    unsigned int base_seed,
+    int8_t* __restrict__ delta_energy_workspace,
+    float* __restrict__ out_samples,
+    float* __restrict__ out_energies
+) {
+    int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (global_tid >= num_reads) return;
+
+    // Thread-local unpacked state
+    int8_t unpacked_state[5000];
+
+    // Delta energy workspace for this thread
+    int8_t* delta_energy = &delta_energy_workspace[global_tid * N];
+
+    // Initialize RNG
+    unsigned int rng_state = (base_seed ^ (global_tid + 1)) * 12345u;
+    if (rng_state == 0) rng_state = 0xdeadbeef;
+
+    // Random initial state
+    for (int var = 0; var < N; var++) {
+        unsigned int rv = xorshift32(rng_state);
+        unpacked_state[var] = (rv & 1) ? -1 : 1;
+    }
+
+    // Build initial delta_energy array
+    for (int var = 0; var < N; var++) {
+        delta_energy[var] = get_flip_energy_unpacked(
+            var, unpacked_state, csr_row_ptr, csr_col_ind,
+            csr_J_vals, N, h
+        );
+    }
+
+    // Compute initial energy
+    int current_energy = 0;
+    for (int i = 0; i < N; i++) {
+        int8_t spin_i = unpacked_state[i];
+        current_energy += (int)(__ldg(&h[i]) * spin_i);
+        const int start = __ldg(&csr_row_ptr[i]);
+        const int end = __ldg(&csr_row_ptr[i + 1]);
+        for (int p = start; p < end; ++p) {
+            const int j = __ldg(&csr_col_ind[p]);
+            if (j > i) {
+                const int8_t Jij = __ldg(&csr_J_vals[p]);
+                current_energy += Jij * spin_i * unpacked_state[j];
+            }
+        }
+    }
+
+    // SA sweeps
+    for (int beta_idx = 0; beta_idx < num_betas; beta_idx++) {
+        float beta = beta_schedule[beta_idx];
+        float threshold = 22.18f / beta;
+
+        for (int sweep = 0; sweep < num_sweeps_per_beta; sweep++) {
+            for (int var = 0; var < N; var++) {
+                int8_t de = delta_energy[var];
+                if (de >= threshold) continue;
+
+                bool flip_spin = false;
+                if (de <= 0) {
+                    flip_spin = true;
+                } else {
+                    const float accept_prob = __expf(
+                        -__int2float_rn(de) * beta
+                    );
+                    const float rand_uniform = (
+                        __uint2float_rn(xorshift32(rng_state))
+                        * RNG_SCALE
+                    );
+                    flip_spin = (accept_prob > rand_uniform);
+                }
+
+                if (flip_spin) {
+                    current_energy += de;
+                    const int8_t var_spin = unpacked_state[var];
+                    const int8_t multiplier = 4 * var_spin;
+                    const int start = __ldg(&csr_row_ptr[var]);
+                    const int end = __ldg(&csr_row_ptr[var + 1]);
+
+                    for (int p = start; p < end; ++p) {
+                        const int neighbor = __ldg(&csr_col_ind[p]);
+                        const int8_t Jij = __ldg(&csr_J_vals[p]);
+                        const int8_t ns = unpacked_state[neighbor];
+                        delta_energy[neighbor] += multiplier * Jij * ns;
+                    }
+
+                    unpacked_state[var] = -var_spin;
+                    delta_energy[var] = -de;
+                }
+            }
+        }
+    }
+
+    // Write results: unpacked spins as float and energy
+    int sample_offset = global_tid * N;
+    for (int i = 0; i < N; i++) {
+        out_samples[sample_offset + i] = (float)unpacked_state[i];
+    }
+    out_energies[global_tid] = (float)current_energy;
 }
 
 }  // extern "C"

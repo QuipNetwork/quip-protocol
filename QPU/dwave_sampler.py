@@ -7,10 +7,8 @@ import collections.abc
 from dwave.system import DWaveSampler, FixedEmbeddingComposite
 
 logger = logging.getLogger(__name__)
-from dwave.system.testing import MockDWaveSampler
 from dwave.embedding import embed_bqm, unembed_sampleset
 import dimod
-import dwave_networkx as dnx
 
 if TYPE_CHECKING:
     from dwave.cloud.computation import Future
@@ -100,7 +98,9 @@ class DWaveSamplerWrapper:
         self,
         topology: DWaveTopology = DEFAULT_TOPOLOGY,
         embedding_file: Optional[str] = None,
-        job_label_prefix: Optional[str] = None
+        job_label_prefix: Optional[str] = None,
+        solver_name: Optional[str] = None,
+        region: Optional[str] = None,
     ):
         """
         Initialize D-Wave sampler wrapper.
@@ -113,6 +113,10 @@ class DWaveSamplerWrapper:
             job_label_prefix: Optional prefix for job labels on D-Wave dashboard.
                              If None, generates format like "Quip_Z9_T2" for Zephyr,
                              "Quip_C16" for Chimera, "Quip_P16" for Pegasus.
+            solver_name: Optional explicit solver name to connect to.
+                        If None, uses DWAVE_API_SOLVER env var.
+            region: Optional D-Wave region (e.g. "na-east-1").
+                   If None, uses default from config.
         """
         self.topology = topology
         self.topology_name = topology.solver_name
@@ -145,7 +149,12 @@ class DWaveSamplerWrapper:
         # Initialize base QPU sampler
         logger.info("[QPU] Connecting to D-Wave API...")
         try:
-            base_sampler = DWaveSampler()
+            sampler_kwargs: Dict[str, Any] = {'request_timeout': (60, 300)}
+            if solver_name is not None:
+                sampler_kwargs['solver'] = solver_name
+            if region is not None:
+                sampler_kwargs['region'] = region
+            base_sampler = DWaveSampler(**sampler_kwargs)
             logger.info(f"[QPU] Connected to solver: {base_sampler.properties.get('chip_id', 'unknown')}")
             logger.info(f"[QPU] Qubits available: {len(base_sampler.nodelist)}")
         except Exception as e:
@@ -154,11 +163,22 @@ class DWaveSamplerWrapper:
         self.qpu_solver = base_sampler
 
         # Get hardware info
-        solver_name = base_sampler.properties.get('chip_id', 'Advantage2_system1.12')
-        solver_dir = solver_name.replace('-', '_').replace('.', '_')
+        hw_solver_name = base_sampler.properties.get('chip_id', 'Advantage2_system1.12')
+        solver_dir = hw_solver_name.replace('-', '_').replace('.', '_')
 
         # Determine if this topology needs embedding
-        needs_embedding = self._needs_embedding(topology.solver_name, solver_name)
+        try:
+            needs_embedding = self._needs_embedding(topology.solver_name, hw_solver_name)
+        except ValueError:
+            # Topology doesn't match solver and isn't a known embeddable type.
+            # Use the solver's native hardware graph directly (no embedding).
+            logger.info(
+                f"[QPU] Topology '{topology.solver_name}' doesn't match solver "
+                f"'{hw_solver_name}' — using solver's native hardware graph"
+            )
+            needs_embedding = False
+            # Override topology with hardware graph
+            topology = None  # signal to use hardware graph below
 
         if needs_embedding:
             # Load embedding (either specified or auto-discover)
@@ -202,8 +222,19 @@ class DWaveSamplerWrapper:
             logger.info(f"[QPU] Using native hardware topology (no embedding needed)")
             self.sampler = base_sampler
             self.embedding = None
-            self.nodelist: List[Variable] = topology.nodes
-            self.edgelist: List[Tuple[Variable, Variable]] = topology.edges
+            if topology is not None:
+                self.nodelist: List[Variable] = topology.nodes
+                self.edgelist: List[Tuple[Variable, Variable]] = topology.edges
+            else:
+                # Use solver's own hardware graph
+                self.nodelist: List[Variable] = sorted(base_sampler.nodelist)
+                self.edgelist: List[Tuple[Variable, Variable]] = list(base_sampler.edgelist)
+
+        # Update topology metadata if we switched to hardware graph
+        if topology is None:
+            self.topology_name = hw_solver_name
+            safe_name = hw_solver_name.replace('.', '_').replace('-', '_')
+            self.job_label_prefix = f"Quip_{safe_name}"
 
         # Job label is just the prefix (which already contains topology info)
         self.job_label = self.job_label_prefix
@@ -215,6 +246,18 @@ class DWaveSamplerWrapper:
         # For quantum_proof_of_work functions, nodes and edges should be int lists
         self.nodes: List[int] = cast(List[int], self.nodelist)
         self.edges: List[Tuple[int, int]] = cast(List[Tuple[int, int]], self.edgelist)
+
+    def close(self):
+        """Release QPU connection resources (Ocean SDK 9.x resource management)."""
+        if hasattr(self, 'qpu_solver'):
+            self.qpu_solver.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
     def _needs_embedding(self, topology_name: str, solver_name: str) -> bool:
         """
@@ -265,6 +308,9 @@ class DWaveSamplerWrapper:
         if 'label' not in kwargs:
             kwargs['label'] = self.job_label
 
+        # Pop custom kwargs before passing to D-Wave
+        chain_strength_multiplier = kwargs.pop('chain_strength_multiplier', 1.5)
+
         # For FixedEmbeddingComposite, we need to be explicit about variable labels
         # to ensure proper unembedding. Create a BQM from h, J with explicit labels.
         if self.embedding is not None:
@@ -281,8 +327,14 @@ class DWaveSamplerWrapper:
                 print(f"   BQM vars: {len(bqm_vars)}, range: {min(bqm_vars)}-{max(bqm_vars)}", file=sys.stderr)
                 print(f"   Embedding vars: {len(embedding_vars)}, range: {min(embedding_vars)}-{max(embedding_vars)}", file=sys.stderr)
 
+            # Calculate chain strength explicitly so we control the multiplier
+            if bqm.num_interactions > 0:
+                chain_strength = max(abs(b) for b in bqm.quadratic.values()) * chain_strength_multiplier
+            else:
+                chain_strength = max(abs(b) for b in bqm.linear.values()) * chain_strength_multiplier if bqm.linear else 1.0
+
             # Sample using BQM (not sample_ising)
-            sampleset = self.sampler.sample(bqm, **kwargs)
+            sampleset = self.sampler.sample(bqm, chain_strength=chain_strength, **kwargs)
         else:
             # No embedding, use sample_ising directly
             sampleset = self.sampler.sample_ising(h, J, **kwargs)
@@ -329,6 +381,9 @@ class DWaveSamplerWrapper:
         if 'label' not in kwargs:
             kwargs['label'] = self.job_label
 
+        # Pop custom kwargs before passing to D-Wave
+        chain_strength_multiplier = kwargs.pop('chain_strength_multiplier', 1.5)
+
         if self.embedding is not None:
             # Create BQM from Ising problem
             source_bqm = dimod.BinaryQuadraticModel.from_ising(h, J)
@@ -336,9 +391,9 @@ class DWaveSamplerWrapper:
             # Calculate chain strength (using same logic as FixedEmbeddingComposite)
             # Default to magnitude of strongest interaction
             if source_bqm.num_interactions > 0:
-                chain_strength = max(abs(bias) for bias in source_bqm.quadratic.values()) * 1.5
+                chain_strength = max(abs(bias) for bias in source_bqm.quadratic.values()) * chain_strength_multiplier
             else:
-                chain_strength = max(abs(bias) for bias in source_bqm.linear.values()) * 1.5 if source_bqm.linear else 1.0
+                chain_strength = max(abs(bias) for bias in source_bqm.linear.values()) * chain_strength_multiplier if source_bqm.linear else 1.0
 
             # Manually embed the BQM
             target_bqm = embed_bqm(

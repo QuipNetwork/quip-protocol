@@ -110,32 +110,31 @@ def extract_solver_info(solver_name: str, region: Optional[str] = None) -> Optio
         kwargs = {'solver': solver_name}
         if region:
             kwargs['region'] = region
-        sampler = DWaveSampler(**kwargs)
-        
-        # Extract basic topology info
-        nodes = list(sampler.nodelist)
-        edges = list(sampler.edgelist)
-        properties = dict(sampler.properties)
-        
-        # Get topology metadata
-        topology_type = get_topology_type(properties)
-        topology_shape = get_topology_shape(properties)
-        
-        print(f"✅ Connected to {solver_name}")
-        print(f"   Topology: {topology_type} ({topology_shape})")
-        print(f"   Nodes: {len(nodes)}")
-        print(f"   Edges: {len(edges)}")
-        
-        return {
-            'solver_name': solver_name,
-            'nodes': nodes,
-            'edges': edges,
-            'properties': properties,
-            'topology_type': topology_type,
-            'topology_shape': topology_shape,
-            'num_nodes': len(nodes),
-            'num_edges': len(edges)
-        }
+        with DWaveSampler(**kwargs) as sampler:
+            # Extract basic topology info
+            nodes = list(sampler.nodelist)
+            edges = list(sampler.edgelist)
+            properties = dict(sampler.properties)
+
+            # Get topology metadata
+            topology_type = get_topology_type(properties)
+            topology_shape = get_topology_shape(properties)
+
+            print(f"✅ Connected to {solver_name}")
+            print(f"   Topology: {topology_type} ({topology_shape})")
+            print(f"   Nodes: {len(nodes)}")
+            print(f"   Edges: {len(edges)}")
+
+            return {
+                'solver_name': solver_name,
+                'nodes': nodes,
+                'edges': edges,
+                'properties': properties,
+                'topology_type': topology_type,
+                'topology_shape': topology_shape,
+                'num_nodes': len(nodes),
+                'num_edges': len(edges)
+            }
         
     except Exception as e:
         print(f"❌ Failed to connect to solver {solver_name}: {e}")
@@ -183,38 +182,36 @@ def list_available_solvers(region: Optional[str] = None) -> List[str]:
         kwargs = {}
         if region:
             kwargs['region'] = region
-        client = Client.from_config(**kwargs)
-        solvers = client.get_solvers()
-        
-        solver_names = []
-        print("\n📋 Available solvers:")
-        for solver in solvers:
-            solver_names.append(solver.name)
-            properties = solver.properties
-            topology_type = get_topology_type(properties)
-            topology_shape = get_topology_shape(properties)
-            num_qubits = properties.get('num_qubits', 'unknown')
+        with Client.from_config(**kwargs) as client:
+            solvers = client.get_solvers()
 
-            # Handle status safely - different solver types have different status formats
-            status = 'unknown'
-            try:
-                if hasattr(solver, 'status'):
-                    if isinstance(solver.status, dict):
-                        status = solver.status.get('state', 'unknown')
-                    else:
-                        status = str(solver.status)
-                elif hasattr(solver, 'is_online'):
-                    status = 'online' if solver.is_online else 'offline'
-            except Exception:
+            solver_names = []
+            print("\n📋 Available solvers:")
+            for solver in solvers:
+                solver_names.append(solver.name)
+                properties = solver.properties
+                topology_type = get_topology_type(properties)
+                topology_shape = get_topology_shape(properties)
+                num_qubits = properties.get('num_qubits', 'unknown')
+
+                # Handle status safely - different solver types have different status formats
                 status = 'unknown'
+                try:
+                    if hasattr(solver, 'status'):
+                        if isinstance(solver.status, dict):
+                            status = solver.status.get('state', 'unknown')
+                        else:
+                            status = str(solver.status)
+                except Exception:
+                    status = 'unknown'
 
-            print(f"   {solver.name}")
-            print(f"      Type: {topology_type} ({topology_shape})")
-            print(f"      Qubits: {num_qubits}")
-            print(f"      Status: {status}")
-            print()
-        
-        return solver_names
+                print(f"   {solver.name}")
+                print(f"      Type: {topology_type} ({topology_shape})")
+                print(f"      Qubits: {num_qubits}")
+                print(f"      Status: {status}")
+                print()
+
+            return solver_names
         
     except Exception as e:
         print(f"❌ Failed to list solvers: {e}")
