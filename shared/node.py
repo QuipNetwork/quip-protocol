@@ -197,14 +197,24 @@ class Node:
                         per_device.get(str(d), {}),
                         defaults=common_cfg,
                     )
-                    spec = {
-                        "id": (
-                            f"{self.node_id}-GPU-CUDA-{d}"
-                        ),
-                        "kind": "cuda",
-                        "cfg": dev_cfg,
-                        "args": {"device": str(d)},
-                    }
+                    if str(d).lower() == "mps":
+                        spec = {
+                            "id": (
+                                f"{self.node_id}-GPU-MPS"
+                            ),
+                            "kind": "metal",
+                            "cfg": dev_cfg,
+                            "args": {"device": "mps"},
+                        }
+                    else:
+                        spec = {
+                            "id": (
+                                f"{self.node_id}-GPU-CUDA-{d}"
+                            ),
+                            "kind": "cuda",
+                            "cfg": dev_cfg,
+                            "args": {"device": str(d)},
+                        }
                     self.miner_handles.append(
                         MinerHandle(spec, self._log_queue),
                     )

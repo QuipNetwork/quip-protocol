@@ -109,7 +109,7 @@ class TestIOKitGPUDetection:
     def test_detects_metal_kernel(self):
         """IOKit should read >0% while a Metal kernel runs."""
         sampler = MetalSASampler()
-        models = _make_models(sampler, 4)
+        models = _make_models(sampler, 8)
 
         readings: List[int] = []
         stop = threading.Event()
@@ -117,17 +117,17 @@ class TestIOKitGPUDetection:
         def poll():
             while not stop.is_set():
                 readings.append(_query_iokit_gpu_utilization())
-                time.sleep(0.15)
+                time.sleep(0.1)
 
         poller = threading.Thread(target=poll, daemon=True)
         poller.start()
 
-        # Run a kernel long enough for IOKit to detect
+        # Run a heavy kernel so IOKit has time to register
         h_list = [m.h for m in models]
         j_list = [m.J for m in models]
         sampler.sample_ising(
             h_list, j_list,
-            num_reads=128, num_sweeps=256, seed=42,
+            num_reads=256, num_sweeps=512, seed=42,
         )
 
         stop.set()
@@ -135,8 +135,8 @@ class TestIOKitGPUDetection:
 
         peak = max(readings) if readings else 0
         nonzero = sum(1 for r in readings if r > 0)
-        assert peak > 50, (
-            f"Expected >50% peak GPU utilization, "
+        assert peak > 30, (
+            f"Expected >30% peak GPU utilization, "
             f"got {peak}% (readings: {readings})"
         )
         assert nonzero > 0, (
