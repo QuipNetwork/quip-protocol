@@ -33,6 +33,20 @@ from shared.version import get_version
 from shared.logging_config import setup_logging
 
 
+def _set_dwave_env(section: Dict[str, Any]) -> None:
+    """Set D-Wave env vars from a config section."""
+    token = section.get("token")
+    if token and "DWAVE_API_KEY" not in os.environ:
+        os.environ["DWAVE_API_KEY"] = token
+        os.environ["DWAVE_API_TOKEN"] = token
+    solver = section.get("solver")
+    if solver and "DWAVE_API_SOLVER" not in os.environ:
+        os.environ["DWAVE_API_SOLVER"] = solver
+    region = section.get("dwave_region_url")
+    if region and "DWAVE_REGION_URL" not in os.environ:
+        os.environ["DWAVE_REGION_URL"] = region
+
+
 def _load_config(path: Optional[str]) -> Dict[str, Any]:
     if not path:
         return {}
@@ -40,25 +54,26 @@ def _load_config(path: Optional[str]) -> Dict[str, Any]:
     with open(path, "rb") as f:
         config = _toml.load(f)
 
-    # Set DWave environment variables from TOML config if present
-    qpu_config = config.get("qpu", {})
-    if "dwave_api_key" in qpu_config:
-        os.environ["DWAVE_API_KEY"] = qpu_config["dwave_api_key"]
-        os.environ["DWAVE_API_TOKEN"] = qpu_config["dwave_api_key"]
-
-    if "dwave_api_solver" in qpu_config:
-        os.environ["DWAVE_API_SOLVER"] = qpu_config["dwave_api_solver"]
-
-    if "dwave_region_url" in qpu_config:
-        os.environ["DWAVE_REGION_URL"] = qpu_config["dwave_region_url"]
+    # Set D-Wave environment variables from [dwave] section if present
+    dwave_config = config.get("dwave", {})
+    if isinstance(dwave_config, dict):
+        _set_dwave_env(dwave_config)
 
     cfg = _merge_globals_from_toml(config)
-    if qpu_config:
-        cfg["qpu"] = qpu_config
-    if "gpu" in config:
-        cfg["gpu"] = config["gpu"]
-    if "cpu" in config:
-        cfg["cpu"] = config["cpu"]
+
+    # Forward miner sections
+    for section in ("cpu", "gpu", "qpu"):
+        if section in config:
+            cfg[section] = config[section]
+
+    # Forward device-type sections (top-level [cuda.N], [metal], [dwave], etc.)
+    _device_sections = (
+        "cuda", "nvidia", "metal", "modal",
+        "dwave", "ibm", "braket", "pasqal", "ionq", "origin",
+    )
+    for section in _device_sections:
+        if section in config:
+            cfg[section] = config[section]
 
     _print_final_config(cfg, "load_config")
 
@@ -374,27 +389,31 @@ def gpu(
     # Apply CLI overrides
     conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
 
-    # Handle GPU-specific configuration
+    # Build GPU config from CLI args as top-level device sections.
+    # [gpu] holds global defaults; [cuda.N]/[metal]/[modal] hold devices.
     gpu_cfg = dict((conf.get("gpu") or {}))
-    if gpu_backend is not None:
-        gpu_cfg["backend"] = str(gpu_backend).lower()
-    if devices:
-        gpu_cfg["devices"] = [str(d) for d in devices]
-    if gpu_types:
-        gpu_cfg["types"] = [str(t) for t in gpu_types]
     if gpu_utilization != 100:
-        gpu_cfg["gpu_utilization"] = gpu_utilization
+        gpu_cfg["utilization"] = gpu_utilization
     if yielding:
         gpu_cfg["yielding"] = True
-    if not gpu_cfg:
-        gpu_cfg = {"backend": "local"}
-
-    # Default to device 0 if backend is local and no devices specified
-    backend = gpu_cfg.get("backend", "local")
-    if backend == "local" and "devices" not in gpu_cfg:
-        gpu_cfg["devices"] = ["0"]
-
     conf["gpu"] = gpu_cfg
+
+    backend = str(gpu_backend or "cuda").lower()
+    if backend in ("local", "cuda", "nvidia"):
+        dev_list = [str(d) for d in devices] if devices else ["0"]
+        cuda_section = conf.get("cuda") or {}
+        for d in dev_list:
+            if d not in cuda_section:
+                cuda_section[d] = {}
+        conf["cuda"] = cuda_section
+    elif backend == "mps":
+        if "metal" not in conf:
+            conf["metal"] = {}
+    elif backend == "modal":
+        modal_cfg = conf.get("modal") or {}
+        if gpu_types:
+            modal_cfg["gpu_type"] = str(gpu_types[0])
+        conf["modal"] = modal_cfg
 
     # Use genesis config from TOML if CLI option is default and TOML has it
     if genesis_config == "genesis_block.json" and "genesis_config" in conf:
@@ -468,40 +487,29 @@ def qpu(
     # Apply CLI overrides
     conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
 
-    # Handle QPU-specific configuration
-    qpu_cfg = dict((conf.get("qpu") or {}))
+    # Build QPU config — CLI args populate a [dwave] section.
+    dwave_cfg = dict(conf.get("dwave") or {})
 
-    # Set environment variables from CLI arguments
     if dwave_api_key is not None:
-        qpu_cfg["dwave_api_key"] = dwave_api_key
-        # Set environment variable for child processes
+        dwave_cfg["token"] = dwave_api_key
         os.environ["DWAVE_API_KEY"] = dwave_api_key
         os.environ["DWAVE_API_TOKEN"] = dwave_api_key
     if dwave_api_solver is not None:
-        qpu_cfg["dwave_api_solver"] = dwave_api_solver
-        # Set environment variable for child processes
+        dwave_cfg["solver"] = dwave_api_solver
         os.environ["DWAVE_API_SOLVER"] = dwave_api_solver
     if dwave_region_url is not None:
-        qpu_cfg["dwave_region_url"] = dwave_region_url
-        # Set environment variable for child processes
+        dwave_cfg["dwave_region_url"] = dwave_region_url
         os.environ["DWAVE_REGION_URL"] = dwave_region_url
-
-    # Ensure environment variables are set from TOML config values (if not already set by CLI)
-    if "dwave_api_key" in qpu_cfg and "DWAVE_API_KEY" not in os.environ:
-        os.environ["DWAVE_API_KEY"] = qpu_cfg["dwave_api_key"]
-        os.environ["DWAVE_API_TOKEN"] = qpu_cfg["dwave_api_key"]
-    if "dwave_api_solver" in qpu_cfg and "DWAVE_API_SOLVER" not in os.environ:
-        os.environ["DWAVE_API_SOLVER"] = qpu_cfg["dwave_api_solver"]
-    if "dwave_region_url" in qpu_cfg and "DWAVE_REGION_URL" not in os.environ:
-        os.environ["DWAVE_REGION_URL"] = qpu_cfg["dwave_region_url"]
-
-    # Handle QPU daily budget CLI option
     if qpu_daily_budget is not None:
-        qpu_cfg["qpu_daily_budget"] = qpu_daily_budget
+        dwave_cfg["daily_budget"] = qpu_daily_budget
 
-    if not qpu_cfg:
-        qpu_cfg = {}
-    conf["qpu"] = qpu_cfg
+    # Ensure env vars are set from TOML
+    _set_dwave_env(dwave_cfg)
+
+    conf["dwave"] = dwave_cfg
+    # Ensure [qpu] exists so _initialize_miners detects QPU mode
+    if "qpu" not in conf:
+        conf["qpu"] = {}
 
     # Use genesis config from TOML if CLI option is default and TOML has it
     if genesis_config == "genesis_block.json" and "genesis_config" in conf:

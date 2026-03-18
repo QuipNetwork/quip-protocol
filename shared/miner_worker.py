@@ -125,15 +125,17 @@ def build_miner_from_spec(spec: Dict[str, Any]):
     elif kind == "qpu":
         # Build QPU time config if daily budget is specified
         time_config = None
-        if cfg.get("qpu_daily_budget"):
+        if cfg.get("daily_budget"):
             from QPU.qpu_time_manager import QPUTimeConfig, parse_duration
             time_config = QPUTimeConfig(
-                daily_budget_seconds=parse_duration(cfg["qpu_daily_budget"]),
+                daily_budget_seconds=parse_duration(cfg["daily_budget"]),
                 min_blocks_for_estimation=cfg.get("qpu_min_blocks_for_estimation", 5),
                 ema_alpha=cfg.get("qpu_ema_alpha", 0.3),
             )
             # Remove time config keys from cfg to avoid passing them to miner
-            cfg = {k: v for k, v in cfg.items() if not k.startswith("qpu_")}
+            cfg = {k: v for k, v in cfg.items()
+                   if k not in ("daily_budget", "qpu_min_blocks_for_estimation",
+                                "qpu_ema_alpha", "qpu_type")}
         return QPU.DWaveMiner(miner_id, time_config=time_config, **cfg)
     elif kind == "cpu-filtered":
         from CPU.sa_filtered_miner import SAFilteredMiner

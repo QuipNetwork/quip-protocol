@@ -77,64 +77,69 @@ telemetry_dir = "telemetry"  # Directory for telemetry output
 num_cpus = 4
 
 [gpu]
-# Backend selection: "local" (default) uses local GPUs (CUDA/ROCm/MPS). "modal" uses Modal cloud GPUs.
-backend = "local"
-# For local backend: list devices to use (e.g., CUDA ordinals like "0", "1"). If omitted, runtime may auto-detect.
-devices = ["0", "1"]
-# For modal backend: list GPU types to use (e.g., ["t4", "a10g"]).
-# types = ["t4", "a10g"]
+# Global GPU defaults — inherited by all GPU device sections below.
+# utilization = 100  # 1-100, percentage of SMs to use
+# yielding = false   # true = yield to other GPU users
+# enabled = true     # false = skip this device
 
-# GPU utilization ceiling (1-100). Limits SM budget via kernel
-# count, and sets CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for hardware
-# enforcement when MPS is active.
-# gpu_utilization = 100
+# Discovery commands:
+#   CUDA:  nvidia-smi --query-gpu=index,name --format=csv,noheader
+#   Metal: system_profiler SPDisplaysDataType | grep 'Chipset Model'
 
-# Yield GPU to other processes. Enables NVML-adaptive nonce
-# scaling that reduces kernel count when external GPU load is
-# detected. Requires pynvml.
-# yielding = false
+# ── CUDA / NVIDIA GPUs ──
+# [cuda.N] or [nvidia.N] — one section per device ordinal.
+# [nvidia.N] is an alias for [cuda.N].
 
-# SMs per nonce for Gibbs sampler (default 4). Higher values
-# give each nonce more parallelism at the cost of fewer
-# concurrent nonces.
-# sms_per_nonce = 4
+[cuda.0]
+# inherits [gpu] defaults
+
+[cuda.1]
+# utilization = 50
+# yielding = true
+
+# ── Apple Silicon (Metal) ──
+# [metal]
+
+# ── Modal cloud GPU ──
+# [modal]
+# gpu_type = "a10g"
+
+# ── QPU Configuration ──
 
 [qpu]
-# Credentials and region for D-Wave
-# If omitted here, can be supplied on CLI
-# Endpoint defaults to na-west-1 SAPI
-# DWAVE_API_TOKEN
-# DWAVE_API_SOLVER
-# DWAVE_API_ENDPOINT
-# Fill as desired:
-# dwave_api_key = "..."
-# dwave_api_solver = "Advantage_system6.4"
-# dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
-
+# Global QPU defaults — inherited by all QPU device sections below.
+#
 # QPU Time Budget Management
 # Controls QPU usage to prevent exceeding your Leap allocation.
-# Check your Leap Dashboard for your monthly allocation.
-#
-# Daily QPU time budget - calculate from your monthly allocation
+# Daily budget with proportional pacing — spreads usage across the day.
 # Example: With 20 minutes/month, set daily budget to ~40s (20m / 30 days)
 # Supports: 30s, 5m, 2h, etc.
-#
-# Budget is spread proportionally across the day using proportional pacing:
-# - At 6 AM UTC (25% of day): can use up to 25% of budget (10s)
-# - At noon UTC (50% of day): can use up to 50% of budget (20s)
-# - At 6 PM UTC (75% of day): can use up to 75% of budget (30s)
-# - Day resets at UTC midnight
-#
-# This prevents exhausting your entire budget early in the day.
-qpu_daily_budget = "60s"
-#
-# Minimum blocks to mine before EMA estimation kicks in
-# Until this threshold, uses conservative max(observed) * 1.5 estimate
-# Default: 5
+
+# ── D-Wave ──
+[dwave]
+daily_budget = "60s"
+# token = "..."
+# solver = "Advantage_system6.4"
+# dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
 # qpu_min_blocks_for_estimation = 5
-#
-# EMA decay factor for time estimation (0.0-1.0)
-# Higher values give more weight to recent block times
-# Default: 0.3
 # qpu_ema_alpha = 0.3
 
+# ── IBM Quantum ──
+# [ibm]
+# token = "..."
+
+# ── Amazon Braket ──
+# [braket]
+# token = "..."
+
+# ── Pasqal ──
+# [pasqal]
+# token = "..."
+
+# ── IonQ ──
+# [ionq]
+# token = "..."
+
+# ── Origin Quantum ──
+# [origin]
+# token = "..."

@@ -22,19 +22,14 @@ cert_dir = "/data/certs"
 
 [gpu]
 # CUDA GPU mining configuration
-backend = "local"
-# GPU devices to use (auto-detected by entrypoint if not specified)
-# devices = ["0", "1"]
+# Global defaults for all GPUs
+# utilization = 100  # 1-100, percentage of SMs to use
+# yielding = false   # true = yield to other GPU users (NVML)
 
-# Defaults for all GPUs (override per-device below)
-# gpu_utilization = 100  # 1-100, percentage of SMs to use
-# yielding = false       # true = yield to other GPU users (NVML)
-
-# Per-device overrides (optional):
-# [gpu.device.0]
-# gpu_utilization = 100
-# yielding = false
+# GPU devices (auto-detected by entrypoint via CLI args if not specified here)
+# One [cuda.N] section per device:
+# [cuda.0]
 #
-# [gpu.device.1]
-# gpu_utilization = 50
+# [cuda.1]
+# utilization = 50
 # yielding = true
