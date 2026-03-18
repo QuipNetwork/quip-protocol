@@ -37,6 +37,7 @@ class EventType(Enum):
 
     # --- Structural decomposition ---
     BASE_CASE = "base_case"
+    FAMILY_RECOGNITION = "family_recognition"
     FACTORIZE = "factorize"           # Cut vertex / disconnected split
     SERIES_PARALLEL = "series_parallel"
     TREEWIDTH_DP = "treewidth_dp"

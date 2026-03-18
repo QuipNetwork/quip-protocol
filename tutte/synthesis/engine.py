@@ -40,6 +40,7 @@ from ..graphs.covering import (
 from ..validation import verify_spanning_trees
 from ..graph import compute_signature
 from ..graphs.series_parallel import compute_sp_tutte_if_applicable
+from ..family_recognition import recognize_family
 from ..matroids.core import GraphicMatroid, FlatLattice, enumerate_flats_with_hasse
 from ..matroids.parallel_connection import (
     BivariateLaurentPoly,
@@ -308,7 +309,23 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         _log.record(EventType.SYNTHESIS_START, "engine",
                      f"{n}n {m}e", LogLevel.INFO)
 
-        # Check cache
+        # 1. Family recognition fast path — O(n+m)
+        # Runs before canonical_key() to avoid the O(n² log n) cost for
+        # known families. canonical_key is only needed for cache/table ops.
+        family_poly = recognize_family(graph)
+        if family_poly is not None:
+            _log.record(EventType.FAMILY_RECOGNITION, "engine",
+                        f"Family recognized: {n}n {m}e", LogLevel.INFO)
+            self._log(f"Family recognition: O(n+m) fast path")
+            result = SynthesisResult(
+                polynomial=family_poly,
+                recipe=["Family recognition"],
+                verified=True,
+                method="family_recognition",
+            )
+            return result
+
+        # 2. Compute canonical key (expensive — O(n² log n))
         cache_key = graph.canonical_key()
         if cache_key in self._cache:
             _log.record(EventType.CACHE_HIT, "engine",
@@ -318,7 +335,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
 
         self._log(f"Synthesizing graph with {n} nodes, {m} edges")
 
-        # 1. Check rainbow table first
+        # 3. Check rainbow table
         cached = self.table.lookup(graph)
         if cached is not None:
             _log.record(EventType.LOOKUP_HIT, "engine",
@@ -334,7 +351,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             self._cache[cache_key] = result
             return result
 
-        # 2. Handle base cases
+        # 4. Handle base cases
         if graph.edge_count() == 0:
             _log.record(EventType.BASE_CASE, "engine", "Empty graph: T = 1")
             result = SynthesisResult(
@@ -357,7 +374,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             self._cache[cache_key] = result
             return result
 
-        # 3. Check if graph is disconnected
+        # 5. Check if graph is disconnected
         components = graph.connected_components()
         if len(components) > 1:
             _log.record(EventType.FACTORIZE, "engine",
@@ -367,7 +384,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             self._promote_to_table(graph, cache_key, result)
             return result
 
-        # 4. Check for cut vertices (fast factorization before expensive operations)
+        # 6. Check for cut vertices (fast factorization before expensive operations)
         cut = graph.has_cut_vertex()
         if cut is not None:
             _log.record(EventType.FACTORIZE, "engine",
@@ -377,7 +394,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             self._promote_to_table(graph, cache_key, result)
             return result
 
-        # 5. Try series-parallel O(n) computation
+        # 7. Try series-parallel O(n) computation
         sp_poly = compute_sp_tutte_if_applicable(graph)
         if sp_poly is not None:
             _log.record(EventType.SERIES_PARALLEL, "engine",
@@ -393,7 +410,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             self._promote_to_table(graph, cache_key, result)
             return result
 
-        # 6. Try k-sum decomposition (k=2..5, detect independent vertex separators)
+        # 8. Try k-sum decomposition (k=2..5, detect independent vertex separators)
         if graph.edge_count() >= 6:
             result = self._try_ksum_decomposition(graph)
             if result is not None:
@@ -403,7 +420,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 self._promote_to_table(graph, cache_key, result)
                 return result
 
-        # 7. Try hierarchical tiling for graphs with repeating structure
+        # 9. Try hierarchical tiling for graphs with repeating structure
         if graph.edge_count() >= 20:
             result = self._try_hierarchical(graph, max_depth)
             if result is not None:
@@ -413,7 +430,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 self._promote_to_table(graph, cache_key, result)
                 return result
 
-        # 8. Try creation-expansion-join
+        # 10. Try creation-expansion-join
         result = self._synthesize_connected(graph, max_depth)
         self._cache[cache_key] = result
         self._promote_to_table(graph, cache_key, result)

@@ -1,6 +1,6 @@
 REPO_ROOT := $(shell dirname $(CURDIR))
 
-.PHONY: setup test test-tutte benchmark benchmark-paths visualize clean
+.PHONY: setup test test-tutte benchmark-family-pipeline benchmark-family visualize clean
 
 # ===== Setup =====
 
@@ -20,11 +20,11 @@ test-tutte:
 
 # ===== Benchmark =====
 
-benchmark:
-	uv run python -m pytest tests/tutte/test_benchmark.py::test_known_families -v -s 2>&1 | tee benchmark_output.log
+benchmark-family-pipeline:
+	PYTHONPATH=$(REPO_ROOT) PYTHONUNBUFFERED=1 uv run python -m pytest tests/test_benchmark_family_recognition.py::test_benchmark_family_pipeline -v -s 2>&1 | tee benchmark_family_pipeline_output.log
 
-benchmark-paths:
-	uv run python -m pytest tests/tutte/test_benchmark.py::test_path_graphs -v -s 2>&1 | tee benchmark_paths_output.log
+benchmark-family:
+	PYTHONPATH=$(REPO_ROOT) PYTHONUNBUFFERED=1 FAMILY=$(FAMILY) MIN_E=$(MIN_E) MAX_E=$(MAX_E) uv run python -m pytest tests/test_benchmark_family_recognition.py::test_benchmark_family -v -s 2>&1 | tee benchmark_family_output.log
 
 # ===== Visualizer =====
 
