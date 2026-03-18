@@ -49,6 +49,7 @@ class CudaGibbsSampler(BaseCudaSampler):
         parallel: bool = True,
         max_sms: int = 0,
         profile: bool = False,
+        sms_per_nonce: int = 4,
     ):
         """Initialize CUDA Gibbs sampler.
 
@@ -60,6 +61,7 @@ class CudaGibbsSampler(BaseCudaSampler):
             max_sms: Maximum SMs to use (0 = all available).
             profile: Enable auto-profiling with clock64()
                 instrumentation.
+            sms_per_nonce: SMs allocated per nonce (default 4).
         """
         if update_mode.lower() not in ("gibbs", "metropolis"):
             raise ValueError(
@@ -87,9 +89,9 @@ class CudaGibbsSampler(BaseCudaSampler):
         self.t = topo_shape[1]
         self.num_colors = 4
 
-        # Default SMs per nonce (overridable via
+        # SMs per nonce (overridable via
         # prepare_self_feeding kwargs)
-        self._sf_sms_per_nonce_val = 4
+        self._sf_sms_per_nonce_val = sms_per_nonce
 
     # -- BaseCudaSampler hooks --
 

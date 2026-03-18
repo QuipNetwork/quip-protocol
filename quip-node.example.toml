@@ -84,6 +84,21 @@ devices = ["0", "1"]
 # For modal backend: list GPU types to use (e.g., ["t4", "a10g"]).
 # types = ["t4", "a10g"]
 
+# GPU utilization ceiling (1-100). Limits SM budget via kernel
+# count, and sets CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for hardware
+# enforcement when MPS is active.
+# gpu_utilization = 100
+
+# Yield GPU to other processes. Enables NVML-adaptive nonce
+# scaling that reduces kernel count when external GPU load is
+# detected. Requires pynvml.
+# yielding = false
+
+# SMs per nonce for Gibbs sampler (default 4). Higher values
+# give each nonce more parallelism at the cost of fewer
+# concurrent nonces.
+# sms_per_nonce = 4
+
 [qpu]
 # Credentials and region for D-Wave
 # If omitted here, can be supplied on CLI

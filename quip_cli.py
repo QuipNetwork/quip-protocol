@@ -333,6 +333,7 @@ def cpu(
 @click.option("--device", "devices", multiple=True, help="GPU device(s) for local backend (e.g., 0 1)")
 @click.option("--gpu-type", "gpu_types", multiple=True, help="GPU type(s) for modal backend (e.g., t4 a10g)")
 @click.option("--gpu-utilization", type=int, default=100, help="GPU utilization percentage (1-100, default: 100)")
+@click.option("--yielding", is_flag=True, default=False, help="Yield GPU to other processes (NVML-adaptive nonce scaling)")
 # Other
 @click.option("--genesis-config", type=str, default="genesis_block.json", show_default=True, help="Genesis block configuration file")
 @click.option("--debug-config", is_flag=True, help="Print final configuration as JSON")
@@ -357,6 +358,7 @@ def gpu(
     devices: List[str],
     gpu_types: List[str],
     gpu_utilization: int,
+    yielding: bool,
     genesis_config: str,
     debug_config: bool,
 ):
@@ -382,6 +384,8 @@ def gpu(
         gpu_cfg["types"] = [str(t) for t in gpu_types]
     if gpu_utilization != 100:
         gpu_cfg["gpu_utilization"] = gpu_utilization
+    if yielding:
+        gpu_cfg["yielding"] = True
     if not gpu_cfg:
         gpu_cfg = {"backend": "local"}
 
