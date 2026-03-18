@@ -22,26 +22,8 @@ import networkx as nx
 from tutte.graph import Graph
 from tutte.lookup.core import load_default_table
 from tutte.synthesis.engine import SynthesisEngine
-from tutte.validation import _exact_spanning_tree_count
+from tutte.validation import _exact_spanning_tree_count, _exact_num_spanning_trees
 from tutte.logs import get_log, reset_log, LogLevel
-
-
-# ===========================================================================
-# Helpers
-# ===========================================================================
-
-def _exact_num_spanning_trees(poly) -> int:
-    """Exact T(1,1) via integer coefficient sum.
-
-    TuttePolynomial.num_spanning_trees() uses evaluate(1.0, 1.0) which
-    converts large int coefficients to 64-bit floats, losing precision
-    beyond ~2^53. Since T(1,1) = sum of all coefficients, we can compute
-    it exactly by summing the int coefficients directly.
-
-    TODO: Move this fix into TuttePolynomial.num_spanning_trees() in
-    polynomial.py so all callers benefit from exact arithmetic.
-    """
-    return sum(poly.to_coefficients().values())
 
 
 class _Timeout(BaseException):

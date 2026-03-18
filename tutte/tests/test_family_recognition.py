@@ -18,66 +18,10 @@ import pytest
 
 from tutte.graph import Graph
 from tutte.family_recognition import recognize_family
-from tutte.validation import count_spanning_trees_kirchhoff
-
-
-# ===========================================================================
-# Graph builders
-# ===========================================================================
-
-def _build_gear(k: int) -> nx.Graph:
-    """Build gear graph: hub + k rim vertices + k subdivision vertices."""
-    G = nx.Graph()
-    hub = 0
-    rim = list(range(1, k + 1))
-    sub = list(range(k + 1, 2 * k + 1))
-    for i in range(k):
-        G.add_edge(hub, rim[i])
-        G.add_edge(rim[i], sub[i])
-        G.add_edge(sub[i], rim[(i + 1) % k])
-    return G
-
-
-def _build_helm(k: int) -> nx.Graph:
-    """Build helm: wheel W_k + pendant at each rim vertex."""
-    G = nx.wheel_graph(k + 1)
-    for i in range(1, k + 1):
-        G.add_edge(i, k + i)
-    return G
-
-
-def _build_book(k: int) -> nx.Graph:
-    """Build book: k triangles sharing edge (0, 1)."""
-    G = nx.Graph()
-    G.add_edge(0, 1)
-    for i in range(k):
-        v = i + 2
-        G.add_edge(0, v)
-        G.add_edge(1, v)
-    return G
-
-
-def _build_pan(cycle_size: int) -> nx.Graph:
-    """Build pan: cycle of size cycle_size + one pendant edge."""
-    G = nx.cycle_graph(cycle_size)
-    G.add_edge(0, cycle_size)
-    return G
-
-
-def _build_sunlet(k: int) -> nx.Graph:
-    """Build sunlet: C_k with pendant at each vertex."""
-    G = nx.cycle_graph(k)
-    for i in range(k):
-        G.add_edge(i, k + i)
-    return G
-
-
-def _build_mobius(k: int) -> nx.Graph:
-    """Build Möbius ladder: 2k-cycle with k rungs connecting v_i to v_{i+k}."""
-    G = nx.cycle_graph(2 * k)
-    for i in range(k):
-        G.add_edge(i, i + k)
-    return G
+from tutte.validation import _exact_spanning_tree_count, _exact_num_spanning_trees
+from tutte.tests.test_benchmark_family_recognition import (
+    _build_gear, _build_helm, _build_book, _build_pan, _build_sunlet, _build_mobius,
+)
 
 
 # ===========================================================================
@@ -95,9 +39,9 @@ def _verify_recognition(G_nx: nx.Graph, family_name: str, expected_recognized: b
 
     assert poly is not None, f"{family_name}: not recognized (returned None)"
 
-    # Kirchhoff: T(1,1) = spanning tree count
-    trees = poly.num_spanning_trees()
-    kirchhoff = count_spanning_trees_kirchhoff(graph)
+    # Kirchhoff: T(1,1) = spanning tree count (exact integer arithmetic)
+    trees = _exact_num_spanning_trees(poly)
+    kirchhoff = _exact_spanning_tree_count(graph)
     assert trees == kirchhoff, (
         f"{family_name}: T(1,1)={trees} != Kirchhoff={kirchhoff}"
     )

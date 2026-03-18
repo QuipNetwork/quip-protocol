@@ -129,6 +129,18 @@ def verify_spanning_trees(graph: Graph, poly: TuttePolynomial) -> bool:
     return match
 
 
+def _exact_num_spanning_trees(poly: TuttePolynomial) -> int:
+    """Exact T(1,1) via integer coefficient sum.
+
+    TuttePolynomial.num_spanning_trees() uses evaluate(1.0, 1.0) which
+    converts large int coefficients to 64-bit floats, losing precision
+    beyond ~2^53. Since T(1,1) = sum of all coefficients, we can compute
+    it exactly by summing the int coefficients directly.
+    """
+    
+    return sum(poly.to_coefficients().values())
+
+
 def _exact_spanning_tree_count(graph: Graph) -> int:
     """Compute exact spanning tree count using sympy integer determinant."""
     from sympy import Matrix, zeros
