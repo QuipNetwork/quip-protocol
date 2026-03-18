@@ -73,31 +73,47 @@ def configure_mps_thread_limit(
         device_id: CUDA device index (for log messages).
         yielding: Whether yielding mode is enabled.
     """
-    if not yielding:
+    # Full GPU + no yielding — nothing to configure
+    if gpu_utilization_pct >= 100 and not yielding:
         return False
 
-    os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
-        gpu_utilization_pct,
-    )
+    # Static utilization ceiling: set env var for MPS
+    # hardware enforcement (harmless without MPS daemon)
+    if gpu_utilization_pct < 100:
+        os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = (
+            str(gpu_utilization_pct)
+        )
 
     mps_active = _is_mps_active()
-    if mps_active:
+
+    if gpu_utilization_pct < 100 and mps_active:
         logger.info(
             "GPU %d: MPS active — SM ceiling enforced "
             "at %d%%",
             device_id,
             gpu_utilization_pct,
         )
+    elif yielding and gpu_utilization_pct >= 100:
+        # Yielding without a static ceiling — MPS can't
+        # enforce dynamic limits, only software scaling
+        logger.info(
+            "GPU %d: yielding enabled at 100%% — "
+            "NVML adaptive scaling is software-only "
+            "(MPS requires a static ceiling to enforce "
+            "hardware SM limits)",
+            device_id,
+        )
     elif _is_docker():
         logger.warning(
             "GPU %d: MPS not active in container — "
-            "yielding uses software nonce reduction only",
+            "using software nonce reduction only",
             device_id,
         )
         logger.info(
             "GPU %d: For hardware SM sharing, start MPS "
             "on host and run:\n"
-            "    docker run --gpus device=%d --ipc=host \\\n"
+            "    docker run --gpus device=%d --ipc=host"
+            " \\\n"
             "      -v /var/run/nvidia-mps:"
             "/var/run/nvidia-mps \\\n"
             "      -e CUDA_MPS_PIPE_DIRECTORY="
@@ -107,19 +123,21 @@ def configure_mps_thread_limit(
             "      <image>",
             device_id, device_id, gpu_utilization_pct,
         )
-        logger.info(
-            "GPU %d: For process-based yielding without "
-            "MPS, add --pid=host so NVML can detect "
-            "sibling containers:\n"
-            "    docker run --gpus device=%d "
-            "--pid=host \\\n"
-            "      <image>",
-            device_id, device_id,
-        )
-    else:
+        if yielding:
+            logger.info(
+                "GPU %d: For process-based yielding "
+                "without MPS, add --pid=host so NVML "
+                "can detect sibling containers:\n"
+                "    docker run --gpus device=%d "
+                "--pid=host \\\n"
+                "      <image>",
+                device_id, device_id,
+            )
+    elif gpu_utilization_pct < 100:
         logger.warning(
-            "GPU %d: MPS not active — GPU is time-sliced."
-            " Start MPS for hardware SM sharing:\n"
+            "GPU %d: MPS not active — GPU is "
+            "time-sliced. Start MPS for hardware SM "
+            "sharing:\n"
             "    export CUDA_MPS_PIPE_DIRECTORY="
             "/var/run/nvidia-mps\n"
             "    nvidia-cuda-mps-control -d",

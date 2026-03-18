@@ -81,6 +81,7 @@ class CudaMiner(GPUMiner):
                 topology=topology_obj,
                 update_mode=self._update_mode,
                 max_sms=sm_ceiling,
+                sms_per_nonce=self.sms_per_nonce,
             )
             miner_type = "GPU-CUDA-Gibbs"
         else:

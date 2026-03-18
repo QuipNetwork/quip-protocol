@@ -7,6 +7,8 @@ Verifies GpuBufferSlot lifecycle transitions and
 KernelScheduler polling behavior.
 """
 
+import os
+
 import pytest
 
 cp = pytest.importorskip(
@@ -374,3 +376,189 @@ class TestBuildGpuMinerCfg:
             defaults=common,
         )
         assert dev_cfg == {"gpu_utilization": 100}
+
+
+class TestMpsConfiguration:
+    """Verify MPS env var is set based on gpu_utilization."""
+
+    def test_mps_env_set_without_yielding(self, monkeypatch):
+        """CUDA_MPS_ACTIVE_THREAD_PERCENTAGE set when
+        gpu_utilization < 100, yielding=False.
+        """
+        from GPU.gpu_scheduler import configure_mps_thread_limit
+
+        monkeypatch.delenv(
+            "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE",
+            raising=False,
+        )
+        configure_mps_thread_limit(
+            gpu_utilization_pct=50,
+            device_id=0,
+            yielding=False,
+        )
+        assert (
+            os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"]
+            == "50"
+        )
+
+    def test_mps_env_not_set_at_100_pct(self, monkeypatch):
+        """Env var NOT set when gpu_utilization=100,
+        yielding=False.
+        """
+        from GPU.gpu_scheduler import configure_mps_thread_limit
+
+        monkeypatch.delenv(
+            "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE",
+            raising=False,
+        )
+        configure_mps_thread_limit(
+            gpu_utilization_pct=100,
+            device_id=0,
+            yielding=False,
+        )
+        assert (
+            "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"
+            not in os.environ
+        )
+
+
+class TestAdaptiveNonces:
+    """Verify compute_target_nonces and hysteresis."""
+
+    def test_compute_target_nonces_no_external(self):
+        """Returns max_nonces when 0 external processes."""
+        from GPU.gpu_scheduler import KernelScheduler
+
+        sched = KernelScheduler(
+            device_sms=80,
+            gpu_utilization_pct=100,
+            yielding=True,
+        )
+        sched._nvml_handle = "fake"
+        result = sched.compute_target_nonces(
+            max_nonces=20, active_nonces=20,
+        )
+        assert result == 20
+        sched.stop()
+
+    def test_compute_target_nonces_with_external(self):
+        """Returns < max_nonces with external processes."""
+        from GPU.gpu_scheduler import KernelScheduler
+
+        sched = KernelScheduler(
+            device_sms=80,
+            gpu_utilization_pct=100,
+            yielding=True,
+        )
+        sched._nvml_handle = "fake"
+        sched._external_util_pct = 50
+
+        # Mock count_external_gpu_processes to return 1
+        sched.count_external_gpu_processes = lambda: 1
+
+        result = sched.compute_target_nonces(
+            max_nonces=20, active_nonces=20,
+        )
+        assert 1 <= result < 20
+        sched.stop()
+
+    def test_compute_target_nonces_fair_share(self):
+        """With N competing, target ~ max_nonces/(N+1)."""
+        from GPU.gpu_scheduler import KernelScheduler
+
+        sched = KernelScheduler(
+            device_sms=80,
+            gpu_utilization_pct=100,
+            yielding=True,
+        )
+        sched._nvml_handle = "fake"
+        sched._external_util_pct = 90
+
+        # 3 external processes — fair share is ~1/4
+        sched.count_external_gpu_processes = lambda: 3
+
+        # Force our_est >= total_util to trigger
+        # fair share fallback
+        result = sched.compute_target_nonces(
+            max_nonces=20, active_nonces=20,
+        )
+        # Fair share: 100% / 4 = 25%, 25/100 * 20 = 5
+        assert 1 <= result <= 6
+        sched.stop()
+
+    def test_check_stable_target_hysteresis(self):
+        """Returns None on 1st call, value on 2nd."""
+        from GPU.gpu_scheduler import KernelScheduler
+
+        sched = KernelScheduler(
+            device_sms=80,
+            gpu_utilization_pct=100,
+            yielding=True,
+        )
+        sched._nvml_handle = "fake"
+        # No external processes → always returns max
+        first = sched.check_stable_target(
+            max_nonces=10, active_nonces=10,
+        )
+        assert first is None
+
+        second = sched.check_stable_target(
+            max_nonces=10, active_nonces=10,
+        )
+        assert second == 10
+        sched.stop()
+
+    def test_check_stable_target_reset_on_change(self):
+        """Returns None when target changes between calls."""
+        from GPU.gpu_scheduler import KernelScheduler
+
+        sched = KernelScheduler(
+            device_sms=80,
+            gpu_utilization_pct=100,
+            yielding=True,
+        )
+        sched._nvml_handle = "fake"
+
+        # First call: no external → target=10
+        sched.check_stable_target(
+            max_nonces=10, active_nonces=10,
+        )
+
+        # Simulate external process appearing
+        sched.count_external_gpu_processes = lambda: 2
+        sched._external_util_pct = 80
+
+        # Target changed → counter resets
+        result = sched.check_stable_target(
+            max_nonces=10, active_nonces=10,
+        )
+        assert result is None
+        sched.stop()
+
+
+class TestSmsPerNonceReachesGibbs:
+    """Verify sms_per_nonce config reaches the sampler."""
+
+    def test_sms_per_nonce_reaches_gibbs(self):
+        from GPU.cuda_gibbs_sa import CudaGibbsSampler
+
+        sampler = CudaGibbsSampler(
+            sms_per_nonce=8,
+        )
+        assert sampler._sf_sms_per_nonce_val == 8
+
+    def test_gpu_util_scales_sm_ceiling(self):
+        """CudaMiner with 50% util gets half the SMs."""
+        dev_id = 0
+        device_sms = cp.cuda.Device(
+            dev_id,
+        ).attributes['MultiProcessorCount']
+
+        from GPU.cuda_gibbs_sa import CudaGibbsSampler
+
+        sm_ceiling = max(1, int(device_sms * 50 / 100))
+        sampler = CudaGibbsSampler(
+            max_sms=sm_ceiling,
+        )
+        assert sampler.max_sms == sm_ceiling
+        assert sm_ceiling <= device_sms // 2 + 1

@@ -164,6 +164,10 @@ class GPUMiner(BaseMiner):
             1, budget // self.sampler._sms_per_nonce,
         )
 
+        # Adaptive nonce tracking for yielding mode
+        self._max_nonces = num_k
+        self._active_nonces = num_k
+
         self._feeder = IsingFeeder(
             prev_hash=prev_block.hash,
             miner_id=node_info.miner_id,
@@ -214,16 +218,32 @@ class GPUMiner(BaseMiner):
         if self._scheduler.should_throttle():
             time.sleep(0.5)
 
+        # Adaptive nonce scaling (yielding mode only)
+        if (
+            self._scheduler.yielding
+            and self._stream is not None
+        ):
+            new_target = self._scheduler.check_stable_target(
+                self._max_nonces, self._active_nonces,
+            )
+            if (
+                new_target is not None
+                and new_target != self._active_nonces
+            ):
+                self.logger.info(
+                    "Adaptive nonce scaling: %d → %d",
+                    self._active_nonces, new_target,
+                )
+                self._stream.close()
+                self._stream = None
+                self._active_nonces = new_target
+
         if self._stream is None:
             extra = {
                 k: v for k, v in kwargs.items()
                 if k not in ('num_reads', 'num_sweeps')
             }
-            num_k = max(
-                1,
-                self._scheduler.get_sm_budget()
-                // self.sampler._sms_per_nonce,
-            )
+            num_k = self._active_nonces
             stall_timeout = max(
                 _PIPELINE_STALL_FLOOR,
                 num_sweeps * _SEC_PER_SWEEP
