@@ -1,5 +1,5 @@
 # GitLab CI/CD for Quip Network Node Docker Images
-# Builds and pushes to GitLab Container Registry
+# Builds multi-arch (amd64 + arm64) and pushes to GitLab Container Registry
 
 stages:
   - build
@@ -9,36 +9,40 @@ variables:
   CPU_IMAGE: quip-network-node-cpu
   CUDA_IMAGE: quip-network-node-cuda
 
-# Template for Docker builds
+# Template for Docker buildx builds
 .docker_build:
   image: docker:24
   services:
     - docker:24-dind
   before_script:
     - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - docker buildx create --use --name multiarch-builder || docker buildx use multiarch-builder
+    - docker buildx inspect --bootstrap
 
-# Build and push CPU network node image
+# Build and push CPU network node image (amd64 + arm64)
 build-cpu:
   extends: .docker_build
   stage: build
   script:
-    - docker build -f docker/Dockerfile.cpu -t $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA .
-    - docker tag $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE/$CPU_IMAGE:latest
-    - docker push $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
-    - docker push $CI_REGISTRY_IMAGE/$CPU_IMAGE:latest
+    - docker buildx build --platform linux/amd64,linux/arm64
+        -f docker/Dockerfile.cpu
+        -t $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
+        -t $CI_REGISTRY_IMAGE/$CPU_IMAGE:latest
+        --push .
   only:
     - main
     - tags
 
-# Build and push CUDA network node image
+# Build and push CUDA network node image (amd64 + arm64)
 build-cuda:
   extends: .docker_build
   stage: build
   script:
-    - docker build -f docker/Dockerfile.cuda -t $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA .
-    - docker tag $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
-    - docker push $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA
-    - docker push $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
+    - docker buildx build --platform linux/amd64,linux/arm64
+        -f docker/Dockerfile.cuda
+        -t $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA
+        -t $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
+        --push .
   only:
     - main
     - tags
