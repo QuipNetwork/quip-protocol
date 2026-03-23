@@ -24,8 +24,15 @@ docker run -d --name quip-cpu \
   -e CERT_EMAIL=admin@example.com \
   -p 20049:20049/udp -p 20049:20049/tcp \
   -p 80:80/tcp \
-  carback1/quip-network-node-cpu:latest
+  registry.gitlab.com/piqued/quip-protocol/quip-network-node-cpu:latest
 ```
+
+**How it works:** The certbot script auto-detects whether port 80 is available:
+
+- **First boot (port 80 free):** Uses `--standalone` — certbot runs its own temporary HTTP server on port 80 for the ACME challenge, then releases it before the node starts.
+- **Renewal (port 80 in use):** Uses `--webroot` — certbot writes challenge files to `/data/webroot/.well-known/acme-challenge/` and the node's HTTP server on port 80 serves them. No restart needed.
+
+Override the webroot path with `CERT_WEBROOT` (default: `/data/webroot`).
 
 ## DNS-01 Challenge
 
@@ -41,7 +48,7 @@ docker run -d --name quip-cpu \
   -e CERT_DNS_PLUGIN=cloudflare \
   -e CERT_DNS_CREDENTIALS=/data/certs/cf.ini \
   -p 20049:20049/udp -p 20049:20049/tcp \
-  carback1/quip-network-node-cpu:latest
+  registry.gitlab.com/piqued/quip-protocol/quip-network-node-cpu:latest
 ```
 
 ## DNS Plugin Reference
@@ -78,7 +85,7 @@ docker run -d --name quip-cpu \
   -e CERT_EAB_KID=your-eab-key-id \
   -e CERT_EAB_HMAC_KEY=your-eab-hmac-key \
   -p 20049:20049/udp -p 20049:20049/tcp -p 80:80/tcp \
-  carback1/quip-network-node-cpu:latest
+  registry.gitlab.com/piqued/quip-protocol/quip-network-node-cpu:latest
 ```
 
 This also works with Buypass (`https://api.buypass.com/acme/directory`) and other ACME-compliant CAs.
@@ -135,9 +142,12 @@ This uses Let's Encrypt's staging server, which issues untrusted certificates bu
 ```bash
 # Verify port mapping
 docker port <container> 80
-# Test from outside
+# Test from outside (should return 404, not connection refused)
 curl -v http://mynode.example.com/.well-known/acme-challenge/test
 ```
+
+**Webroot not served during renewal:**
+If the node's HTTP server doesn't serve `/.well-known/acme-challenge/`, ensure `rest_insecure_port = 80` in config.toml and the webroot path matches (`CERT_WEBROOT`, default `/data/webroot`).
 
 **DNS propagation delay:**
 DNS-01 challenges may take a few minutes for TXT records to propagate. The DNS plugins handle waiting automatically.

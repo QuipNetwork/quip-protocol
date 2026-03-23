@@ -67,8 +67,7 @@ COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # Environment variables — override TOML config when set (non-empty).
-# TOML template has defaults: listen=0.0.0.0, port=20049, auto_mine=false.
-# Set QUIP_LISTEN=:: in docker run to enable dual-stack (IPv4+IPv6).
+# TOML template has defaults: listen=::, port=20049, auto_mine=false.
 ENV QUIP_MODE=cpu
 ENV QUIP_PEERS=""
 ENV QUIP_PORT=""
