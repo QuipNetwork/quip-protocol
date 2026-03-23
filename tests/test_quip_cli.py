@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 import quip_cli
 from click.testing import CliRunner
+from shared.node import _normalize_gpu_config, _normalize_qpu_config
 
 
 def write_toml(tmp_path, content: str):
@@ -14,7 +15,6 @@ def write_toml(tmp_path, content: str):
 
 
 def test_global_config_and_cpu_num_cpus(tmp_path, monkeypatch):
-    # Arrange: config with [global] and [cpu].num_cpus
     cfg = """
 [global]
 listen = "127.0.0.1"
@@ -35,28 +35,22 @@ num_cpus = 2
 
     monkeypatch.setattr(quip_cli, "_run_network_node_sync", fake_run)
 
-    # Act
     runner = CliRunner()
     result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path), "cpu"])
 
-    # Assert
     assert result.exit_code == 0, result.output
     config = captured["config"]
     assert "cpu" in config
-    # Config flattens global section into top-level
     assert config.get("listen") == "127.0.0.1"
     assert config.get("port") == 8123
     assert config["cpu"]["num_cpus"] == 2
 
 
-def test_gpu_device_cli_overrides_toml(tmp_path, monkeypatch):
-    # Arrange: config with devices array but CLI provides --device
+def test_gpu_device_cli_creates_cuda_section(tmp_path, monkeypatch):
+    """CLI --device produces top-level [cuda.N] sections."""
     cfg = """
 [global]
 port = 9001
-
-[gpu]
-devices = ["1", "2"]
 """
     cfg_path = write_toml(tmp_path, cfg)
 
@@ -68,25 +62,28 @@ devices = ["1", "2"]
 
     monkeypatch.setattr(quip_cli, "_run_network_node_sync", fake_run)
 
-    # Act: explicitly pass device 0
     runner = CliRunner()
-    result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path), "gpu", "--device", "0"])
+    result = runner.invoke(quip_cli.quip_network_node, [
+        "--config", str(cfg_path), "gpu", "--device", "0", "--device", "1",
+    ])
 
-    # Assert
     assert result.exit_code == 0, result.output
     config = captured["config"]
-    assert "gpu" in config
-    # Config flattens global section into top-level
     assert config.get("port") == 9001
-    # Device is stored in devices list
-    assert config["gpu"].get("devices") == ["0"]
+    assert "cuda" in config
+    assert "0" in config["cuda"]
+    assert "1" in config["cuda"]
 
 
-def test_gpu_device_from_toml_when_none(tmp_path, monkeypatch):
-    # Arrange: devices list in TOML; no CLI device
+def test_gpu_device_from_toml_new_format(tmp_path, monkeypatch):
+    """[cuda.N] sections from TOML are forwarded."""
     cfg = """
 [gpu]
-devices = ["3", "4"]
+
+[cuda.3]
+
+[cuda.4]
+utilization = 50
 """
     cfg_path = write_toml(tmp_path, cfg)
 
@@ -98,25 +95,56 @@ devices = ["3", "4"]
 
     monkeypatch.setattr(quip_cli, "_run_network_node_sync", fake_run)
 
-    # Act
     runner = CliRunner()
     result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path), "gpu"])
 
-    # Assert
     assert result.exit_code == 0, result.output
     config = captured["config"]
-    assert "gpu" in config
-    # Devices should be preserved from TOML
-    assert config["gpu"].get("devices") == ["3", "4"]
+    assert "cuda" in config
+    assert "3" in config["cuda"]
+    assert config["cuda"]["4"]["utilization"] == 50
 
 
-def test_qpu_env_from_toml_and_defaults(tmp_path, monkeypatch):
-    # Arrange: explicit key and solver; omit region to use default
+def test_qpu_cli_creates_dwave_section(tmp_path, monkeypatch):
+    """CLI --dwave-api-key/--dwave-api-solver produce [dwave] section."""
+    cfg_path = write_toml(tmp_path, """
+[global]
+port = 9002
+""")
+
+    captured: Dict[str, Any] = {}
+
+    def fake_run(config: Dict[str, Any], genesis_config_file: str = "genesis_block.json"):
+        captured.update({"config": config, "genesis_config_file": genesis_config_file})
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_network_node_sync", fake_run)
+
+    runner = CliRunner()
+    result = runner.invoke(quip_cli.quip_network_node, [
+        "--config", str(cfg_path), "qpu",
+        "--dwave-api-key", "TOKEN123",
+        "--dwave-api-solver", "Advantage_system6.4",
+        "--qpu-daily-budget", "60s",
+    ])
+
+    assert result.exit_code == 0, result.output
+    config = captured["config"]
+    assert "dwave" in config
+    assert config["dwave"]["token"] == "TOKEN123"
+    assert config["dwave"]["solver"] == "Advantage_system6.4"
+    assert config["dwave"]["daily_budget"] == "60s"
+
+
+def test_qpu_from_toml_new_format(tmp_path, monkeypatch):
+    """[dwave] section from TOML is forwarded."""
     cfg = """
 [qpu]
-dwave_api_key = "TOKEN123"
-dwave_api_solver = "Advantage_system6.4"
-# dwave_region_url omitted to trigger default
+
+[dwave]
+token = "DW_TOKEN"
+solver = "Advantage_system6.4"
+daily_budget = "60s"
 """
     cfg_path = write_toml(tmp_path, cfg)
 
@@ -128,21 +156,18 @@ dwave_api_solver = "Advantage_system6.4"
 
     monkeypatch.setattr(quip_cli, "_run_network_node_sync", fake_run)
 
-    # Act
     runner = CliRunner()
     result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path), "qpu"])
 
-    # Assert
     assert result.exit_code == 0, result.output
     config = captured["config"]
-    assert "qpu" in config
-    assert config["qpu"].get("dwave_api_key") == "TOKEN123"
-    assert config["qpu"].get("dwave_api_solver") == "Advantage_system6.4"
+    assert "dwave" in config
+    assert config["dwave"]["token"] == "DW_TOKEN"
+    assert config["dwave"]["solver"] == "Advantage_system6.4"
 
 
 def test_simulator_print_only_commands(tmp_path):
     runner = CliRunner()
-    # CPU-only 2 nodes starting at 9000
     result = runner.invoke(
         quip_cli.quip_network_simulator,
         ["--scenario", "cpu", "--num-cpu", "2", "--base-port", "9000", "--print-only"],
@@ -153,15 +178,9 @@ def test_simulator_print_only_commands(tmp_path):
     assert "Running: quip-network-node cpu --port 9001 --peer localhost:9000" in out
 
 
-
-def test_gpu_modal_types_env(tmp_path, monkeypatch):
-    # Arrange: backend=modal with types
-    cfg = """
-[gpu]
-backend = "modal"
-types = ["t4", "a10g"]
-"""
-    cfg_path = write_toml(tmp_path, cfg)
+def test_gpu_mps_backend_creates_metal_section(tmp_path, monkeypatch):
+    """CLI --gpu-backend mps produces [metal] section."""
+    cfg_path = write_toml(tmp_path, "")
 
     captured: Dict[str, Any] = {}
 
@@ -171,27 +190,19 @@ types = ["t4", "a10g"]
 
     monkeypatch.setattr(quip_cli, "_run_network_node_sync", fake_run)
 
-    # Act
     runner = CliRunner()
-    result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path), "gpu"])
+    result = runner.invoke(quip_cli.quip_network_node, [
+        "--config", str(cfg_path), "gpu", "--gpu-backend", "mps",
+    ])
 
-    # Assert
     assert result.exit_code == 0, result.output
     config = captured["config"]
-    assert "gpu" in config
-    assert config["gpu"].get("backend") == "modal"
-    assert config["gpu"].get("types") == ["t4", "a10g"]
+    assert "metal" in config
 
 
-
-def test_gpu_backend_cli_override(tmp_path, monkeypatch):
-    # Arrange: TOML says local, CLI overrides to modal
-    cfg = """
-[gpu]
-backend = "local"
-types = ["t4"]
-"""
-    cfg_path = write_toml(tmp_path, cfg)
+def test_gpu_modal_backend_creates_modal_section(tmp_path, monkeypatch):
+    """CLI --gpu-backend modal --gpu-type t4 produces [modal] section."""
+    cfg_path = write_toml(tmp_path, "")
 
     captured: Dict[str, Any] = {}
 
@@ -201,12 +212,178 @@ types = ["t4"]
 
     monkeypatch.setattr(quip_cli, "_run_network_node_sync", fake_run)
 
-    # Act: override via CLI
     runner = CliRunner()
-    result = runner.invoke(quip_cli.quip_network_node, ["--config", str(cfg_path), "gpu", "--gpu-backend", "modal"])
+    result = runner.invoke(quip_cli.quip_network_node, [
+        "--config", str(cfg_path), "gpu", "--gpu-backend", "modal", "--gpu-type", "t4",
+    ])
 
-    # Assert
     assert result.exit_code == 0, result.output
     config = captured["config"]
-    assert config["gpu"].get("backend") == "modal"
+    assert "modal" in config
+    assert config["modal"]["gpu_type"] == "t4"
 
+
+# ── GPU normalizer tests ──────────────────────────────────────────────
+
+
+def test_normalize_gpu_cuda_sections():
+    """[cuda.0] and [cuda.1] top-level sections → 2 cuda entries."""
+    cfg = {
+        "gpu": {"utilization": 100},
+        "cuda": {
+            "0": {},
+            "1": {"utilization": 50, "yielding": True},
+        },
+    }
+    result = _normalize_gpu_config(cfg)
+    devs = result["devices"]
+    assert len(devs) == 2
+    assert devs[0] == {"type": "cuda", "device": "0"}
+    assert devs[1]["type"] == "cuda"
+    assert devs[1]["device"] == "1"
+    assert devs[1]["utilization"] == 50
+
+
+def test_normalize_gpu_nvidia_alias():
+    """[nvidia.0] is interchangeable with [cuda.0]."""
+    cfg = {
+        "gpu": {},
+        "nvidia": {"0": {"yielding": True}},
+    }
+    result = _normalize_gpu_config(cfg)
+    devs = result["devices"]
+    assert len(devs) == 1
+    assert devs[0]["type"] == "cuda"
+    assert devs[0]["device"] == "0"
+    assert devs[0]["yielding"] is True
+
+
+def test_normalize_gpu_metal_section():
+    """[metal] top-level section → 1 metal entry."""
+    cfg = {
+        "gpu": {"utilization": 80},
+        "metal": {"yielding": True},
+    }
+    result = _normalize_gpu_config(cfg)
+    devs = result["devices"]
+    assert len(devs) == 1
+    assert devs[0]["type"] == "metal"
+    assert devs[0]["yielding"] is True
+
+
+def test_normalize_gpu_metal_array_of_tables():
+    """[[metal]] (array of tables) → 1 metal entry."""
+    cfg = {
+        "gpu": {},
+        "metal": [{"utilization": 90}],
+    }
+    result = _normalize_gpu_config(cfg)
+    devs = result["devices"]
+    assert len(devs) == 1
+    assert devs[0]["type"] == "metal"
+    assert devs[0]["utilization"] == 90
+
+
+def test_normalize_gpu_mixed_cuda_and_metal():
+    """[cuda.0] + [metal] → cuda + metal entries."""
+    cfg = {
+        "gpu": {"utilization": 100},
+        "cuda": {"0": {}},
+        "metal": {},
+    }
+    result = _normalize_gpu_config(cfg)
+    devs = result["devices"]
+    types = [d["type"] for d in devs]
+    assert "cuda" in types
+    assert "metal" in types
+
+
+def test_normalize_gpu_enabled_false():
+    """Device with enabled=false is present in normalized list."""
+    cfg = {
+        "cuda": {"0": {"enabled": False}},
+    }
+    result = _normalize_gpu_config(cfg)
+    devs = result["devices"]
+    assert len(devs) == 1
+    assert devs[0]["enabled"] is False
+
+
+def test_normalize_gpu_no_devices():
+    """[gpu] with no device sections → empty devices list."""
+    cfg = {"gpu": {"utilization": 100}}
+    result = _normalize_gpu_config(cfg)
+    assert "devices" not in result
+
+
+# ── QPU normalizer tests ──────────────────────────────────────────────
+
+
+def test_normalize_qpu_dwave_section():
+    """[dwave] top-level section → 1 dwave entry."""
+    cfg = {
+        "qpu": {},
+        "dwave": {
+            "token": "DW_KEY",
+            "solver": "Advantage_system6.4",
+            "daily_budget": "60s",
+        },
+    }
+    result = _normalize_qpu_config(cfg)
+    devs = result["devices"]
+    assert len(devs) == 1
+    assert devs[0]["type"] == "dwave"
+    assert devs[0]["token"] == "DW_KEY"
+    assert devs[0]["daily_budget"] == "60s"
+
+
+def test_normalize_qpu_token_backend():
+    """[ibm] with token → 1 ibm entry."""
+    cfg = {
+        "qpu": {},
+        "ibm": {"token": "IBM_TOK"},
+    }
+    result = _normalize_qpu_config(cfg)
+    devs = result["devices"]
+    assert len(devs) == 1
+    assert devs[0]["type"] == "ibm"
+    assert devs[0]["token"] == "IBM_TOK"
+
+
+def test_normalize_qpu_multiple_backends():
+    """[dwave] + [ibm] + [ionq] → 3 entries."""
+    cfg = {
+        "qpu": {},
+        "dwave": {"token": "DW"},
+        "ibm": {"token": "IBM"},
+        "ionq": {"token": "IONQ"},
+    }
+    result = _normalize_qpu_config(cfg)
+    devs = result["devices"]
+    assert len(devs) == 3
+    types = [d["type"] for d in devs]
+    assert "dwave" in types
+    assert "ibm" in types
+    assert "ionq" in types
+
+
+def test_normalize_qpu_array_of_tables():
+    """[[dwave]] (array of tables) → entries from list."""
+    cfg = {
+        "dwave": [
+            {"token": "KEY1", "solver": "solver_a"},
+            {"token": "KEY2", "solver": "solver_b"},
+        ],
+    }
+    result = _normalize_qpu_config(cfg)
+    devs = result["devices"]
+    assert len(devs) == 2
+    assert devs[0]["token"] == "KEY1"
+    assert devs[1]["token"] == "KEY2"
+
+
+def test_normalize_qpu_no_devices():
+    """[qpu] with no device sections → empty devices list."""
+    cfg = {"qpu": {}}
+    result = _normalize_qpu_config(cfg)
+    assert "devices" not in result

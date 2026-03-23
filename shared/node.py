@@ -33,6 +33,138 @@ log = None
 # Persistent miner handle and worker integration
 from shared.miner_worker import MinerHandle, miner_worker_main
 
+# Per-device GPU config keys (inherited from [gpu] defaults)
+_GPU_CFG_KEYS = (
+    "utilization", "yielding", "enabled", "sms_per_nonce",
+)
+
+# Top-level TOML keys that map to GPU device types
+_GPU_DEVICE_SECTIONS = {
+    "cuda": "cuda",
+    "nvidia": "cuda",   # alias
+    "metal": "metal",
+    "modal": "modal",
+}
+
+# Top-level TOML keys that map to QPU device types
+_QPU_DEVICE_SECTIONS = (
+    "dwave", "ibm", "braket", "pasqal", "ionq", "origin",
+)
+
+
+def _build_gpu_miner_cfg(
+    section: Dict[str, Any],
+    defaults: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build miner cfg dict from a TOML section.
+
+    Extracts known GPU config keys from *section*, falling
+    back to *defaults* for any missing keys.
+    """
+    base = dict(defaults) if defaults else {}
+    for key in _GPU_CFG_KEYS:
+        if key in section:
+            base[key] = section[key]
+    return base
+
+
+
+def _normalize_gpu_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a normalized GPU config from the full TOML config.
+
+    Scans for top-level device-type sections (``[cuda.N]``,
+    ``[nvidia.N]``, ``[metal]``, ``[modal]``) and merges them
+    with ``[gpu]`` global defaults.
+
+    Returns a dict with a ``devices`` list-of-dicts ready for
+    ``_initialize_miners``.
+    """
+    gpu_cfg = dict(cfg.get("gpu") or {})
+    devices: List[Dict[str, Any]] = []
+
+    for section_key, dev_type in _GPU_DEVICE_SECTIONS.items():
+        section = cfg.get(section_key)
+        if section is None:
+            continue
+
+        if dev_type in ("cuda", "modal") and isinstance(section, dict):
+            # [cuda.0], [cuda.1] — subtables keyed by device id
+            if any(isinstance(v, dict) for v in section.values()):
+                for dev_id in sorted(section.keys()):
+                    sub = section[dev_id]
+                    if not isinstance(sub, dict):
+                        continue
+                    entry: Dict[str, Any] = {"type": dev_type}
+                    if dev_type == "cuda":
+                        entry["device"] = str(dev_id)
+                    entry.update(sub)
+                    devices.append(entry)
+            else:
+                # [cuda] with direct keys (no numbered subtables)
+                entry = {"type": dev_type}
+                entry.update(section)
+                devices.append(entry)
+        elif isinstance(section, list):
+            # [[cuda]] or [[metal]] — array of tables
+            for item in section:
+                entry = {"type": dev_type}
+                entry.update(item)
+                devices.append(entry)
+        elif isinstance(section, dict):
+            # [metal] or [modal] — single table
+            entry = {"type": dev_type}
+            entry.update(section)
+            devices.append(entry)
+
+    if devices:
+        gpu_cfg["devices"] = devices
+    return gpu_cfg
+
+
+def _normalize_qpu_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a normalized QPU config from the full TOML config.
+
+    Scans for top-level device-type sections (``[dwave]``, ``[ibm]``,
+    ``[braket]``, ``[pasqal]``, ``[ionq]``, ``[origin]``) and merges
+    them with ``[qpu]`` global defaults.
+
+    Returns a dict with a ``devices`` list-of-dicts ready for
+    ``_initialize_miners``.
+    """
+    qpu_cfg = dict(cfg.get("qpu") or {})
+    devices: List[Dict[str, Any]] = []
+
+    for section_key in _QPU_DEVICE_SECTIONS:
+        section = cfg.get(section_key)
+        if section is None:
+            continue
+
+        if isinstance(section, list):
+            # [[dwave]] — array of tables
+            for item in section:
+                entry: Dict[str, Any] = {"type": section_key}
+                entry.update(item)
+                devices.append(entry)
+        elif isinstance(section, dict):
+            # Check for numbered subtables: [dwave.1], [dwave.2]
+            if any(isinstance(v, dict) for v in section.values()):
+                for sub_id in sorted(section.keys()):
+                    sub = section[sub_id]
+                    if not isinstance(sub, dict):
+                        continue
+                    entry = {"type": section_key}
+                    entry.update(sub)
+                    devices.append(entry)
+            else:
+                # [dwave] with direct keys
+                entry = {"type": section_key}
+                entry.update(section)
+                devices.append(entry)
+
+    if devices:
+        qpu_cfg["devices"] = devices
+    return qpu_cfg
+
 
 class Node:
     """Node that manages multiple miners and handles blockchain network participation."""
@@ -154,61 +286,92 @@ class Node:
                 # CPU requires no config at this time.
                 self.miner_handles.append(MinerHandle(spec, self._log_queue))
 
-        # GPU Miners, 1 per device or type
-        if cfg.get("gpu") is not None:
-            gpu_cfg = cfg["gpu"]
-            gpu_backend = (gpu_cfg.get("backend") or "local").lower()
-            gpu_devices = list(gpu_cfg.get("devices") or [])
+        # GPU Miners — one per device section ([cuda.N], [metal], etc.)
+        has_gpu = (
+            cfg.get("gpu") is not None
+            or any(cfg.get(k) is not None for k in _GPU_DEVICE_SECTIONS)
+        )
+        if has_gpu:
+            gpu_cfg = _normalize_gpu_config(cfg)
+            common_cfg = _build_gpu_miner_cfg(gpu_cfg)
 
-            # Extract common GPU config (gpu_utilization, etc.)
-            miner_cfg = {}
-            if "gpu_utilization" in gpu_cfg:
-                miner_cfg["gpu_utilization"] = gpu_cfg["gpu_utilization"]
+            for dev in gpu_cfg.get("devices", []):
+                dev_type = dev["type"].lower()
+                if dev.get("enabled") is False:
+                    continue
+                dev_cfg = _build_gpu_miner_cfg(dev, defaults=common_cfg)
 
-            if gpu_backend == "local":
-                for d in gpu_devices:
+                if dev_type == "cuda":
+                    device_id = dev.get("device", "0")
                     spec = {
-                        "id": f"{self.node_id}-GPU-CUDA-{d}",
+                        "id": f"{self.node_id}-GPU-CUDA-{device_id}",
                         "kind": "cuda",
-                        "cfg": miner_cfg,
-                        "args": {"device": str(d)}
+                        "cfg": dev_cfg,
+                        "args": {"device": str(device_id)},
                     }
-                    self.miner_handles.append(MinerHandle(spec, self._log_queue))
-            elif gpu_backend == "modal":
-                gpu_types = list(gpu_cfg.get("types") or [])
-                for t in gpu_types:
+                elif dev_type == "metal":
                     spec = {
-                        "id": f"{self.node_id}-GPU-MODAL-{t}",
-                        "kind": "modal",
-                        "cfg": miner_cfg,
-                        "args": {"gpu_type": str(t)}
+                        "id": f"{self.node_id}-GPU-MPS",
+                        "kind": "metal",
+                        "cfg": dev_cfg,
+                        "args": {"device": "mps"},
                     }
-                    self.miner_handles.append(MinerHandle(spec, self._log_queue))
-            elif gpu_backend == "mps":
-                # can only have one metal miner
-                spec = {
-                    "id": f"{self.node_id}-GPU-MPS",
-                    "kind": "metal",
-                    "cfg": miner_cfg,
-                    "args": {"device": "mps"}
-                }
-                self.miner_handles.append(MinerHandle(spec, self._log_queue))
-            else:
-                raise ValueError(f"Unknown GPU backend: {gpu_backend}")
+                elif dev_type == "modal":
+                    gpu_type = dev.get("gpu_type", "t4")
+                    spec = {
+                        "id": f"{self.node_id}-GPU-MODAL-{gpu_type}",
+                        "kind": "modal",
+                        "cfg": dev_cfg,
+                        "args": {"gpu_type": str(gpu_type)},
+                    }
+                else:
+                    raise ValueError(f"Unknown GPU device type: {dev_type}")
 
-        # QPU Miners, 1 per qpu section
-        if cfg.get("qpu") is not None:
-            qpu_cfg = cfg.get("qpu", {})
-            spec = {
-                "id": f"{self.node_id}-QPU-1",
-                "kind": "qpu",
-                "cfg": {
-                    "qpu_daily_budget": qpu_cfg.get("qpu_daily_budget"),
-                    "qpu_min_blocks_for_estimation": qpu_cfg.get("qpu_min_blocks_for_estimation", 5),
-                    "qpu_ema_alpha": qpu_cfg.get("qpu_ema_alpha", 0.3),
-                }
-            }
-            self.miner_handles.append(MinerHandle(spec, self._log_queue))
+                self.miner_handles.append(
+                    MinerHandle(spec, self._log_queue),
+                )
+
+        # QPU Miners — one per device section ([dwave], [ibm], etc.)
+        has_qpu = (
+            cfg.get("qpu") is not None
+            or any(cfg.get(k) is not None for k in _QPU_DEVICE_SECTIONS)
+        )
+        if has_qpu:
+            qpu_cfg = _normalize_qpu_config(cfg)
+
+            for i, dev in enumerate(qpu_cfg.get("devices", []), start=1):
+                dev_type = dev.get("type", "dwave").lower()
+                tag = dev_type.upper()
+
+                if dev_type == "dwave":
+                    spec = {
+                        "id": f"{self.node_id}-QPU-{tag}-{i}",
+                        "kind": "qpu",
+                        "cfg": {
+                            "qpu_type": "dwave",
+                            "daily_budget": dev.get("daily_budget"),
+                            "qpu_min_blocks_for_estimation": dev.get(
+                                "qpu_min_blocks_for_estimation", 5,
+                            ),
+                            "qpu_ema_alpha": dev.get("qpu_ema_alpha", 0.3),
+                        },
+                    }
+                elif dev_type in (
+                    "ibm", "braket", "pasqal", "ionq", "origin",
+                ):
+                    spec = {
+                        "id": f"{self.node_id}-QPU-{tag}-{i}",
+                        "kind": "qpu",
+                        "cfg": {
+                            "qpu_type": dev_type,
+                            "token": dev.get("token"),
+                            "daily_budget": dev.get("daily_budget"),
+                        },
+                    }
+                else:
+                    raise ValueError(f"Unknown QPU device type: {dev_type}")
+
+                self.miner_handles.append(MinerHandle(spec, self._log_queue))
 
         # Back-compat summary list for logs (do not assign to typed self.miners)
         self._summary_miners = [(h.miner_id, h.miner_type) for h in self.miner_handles]

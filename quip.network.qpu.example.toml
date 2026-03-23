@@ -50,18 +50,22 @@ http_log = "logs/quip-node-http.log"  # Path to HTTP/aiohttp log file (optional,
 # types = ["t4", "a10g"]
 
 [qpu]
-# Credentials and region for D-Wave
-# If omitted here, can be supplied on CLI
-# Endpoint defaults to na-west-1 SAPI
-# DWAVE_API_TOKEN
-# DWAVE_API_SOLVER
-# DWAVE_API_ENDPOINT
-# Fill as desired:
-dwave_api_key = "..."
-dwave_api_solver = "Advantage_system6.4"
-dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+# Global QPU defaults
 
-# QPU Time Budget Management
-# Daily budget with proportional pacing - spreads usage across the day
-# Calculate from your monthly allocation (e.g., 30 min/month = 60s/day)
-qpu_daily_budget = "60s"
+# Supported QPU types: dwave, ibm, braket, pasqal, ionq, origin
+# D-Wave requires: dwave_api_key, dwave_api_solver, dwave_region_url
+# All others require: token
+
+[dwave]
+token = "..."
+solver = "Advantage_system6.4"
+dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+daily_budget = "60s"
+
+# IBM Quantum example:
+# [ibm]
+# token = "..."
+
+# Amazon Braket example:
+# [braket]
+# token = "..."

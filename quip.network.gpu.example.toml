@@ -42,21 +42,18 @@ http_log = "logs/quip-node-http.log"  # Path to HTTP/aiohttp log file (optional,
 # num_cpus = 4
 
 [gpu]
-# Backend selection: "local" (default) uses local GPUs (CUDA/ROCm/MPS). "modal" uses Modal cloud GPUs.
-backend = "local"
-# For local backend: list devices to use (e.g., CUDA ordinals like "0", "1"). If omitted, runtime may auto-detect.
-devices = ["0", "1"]
-# For modal backend: list GPU types to use (e.g., ["t4", "a10g"]).
-# types = ["t4", "a10g"]
+# Global GPU defaults
+# utilization = 100
+# yielding = false
+# sms_per_nonce = 4
 
-# [qpu]  # Commented out for GPU-only node
-# Credentials and region for D-Wave
-# If omitted here, can be supplied on CLI
-# Endpoint defaults to na-west-1 SAPI
-# DWAVE_API_TOKEN
-# DWAVE_API_SOLVER
-# DWAVE_API_ENDPOINT
-# Fill as desired:
-# dwave_api_key = "..."
-# dwave_api_solver = "Advantage_system6.4"
-# dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+# Discovery commands:
+#   CUDA:  nvidia-smi --query-gpu=index,name --format=csv,noheader
+#   Metal: system_profiler SPDisplaysDataType | grep 'Chipset Model'
+
+[cuda.0]
+
+[cuda.1]
+
+# Apple Silicon example:
+# [metal]
