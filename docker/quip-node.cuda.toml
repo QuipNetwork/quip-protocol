@@ -33,6 +33,10 @@ webroot = "/data/webroot"
 # Logging
 log_level = "INFO"
 
+# Telemetry
+telemetry_enabled = true
+telemetry_dir = "/data/telemetry"
+
 [gpu]
 # CUDA GPU mining configuration
 # Global defaults for all GPUs

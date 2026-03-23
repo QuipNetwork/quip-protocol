@@ -202,7 +202,8 @@ if [ -n "$PUBLIC_HOST" ]; then
 
                     # Inject cert paths into [global] section of config.toml
                     # Shared by both QUIC and REST API
-                    if ! grep -q 'tls_cert_file' "$CONFIG_FILE"; then
+                    # Use exact key match (^tls_) to avoid matching rest_tls_cert_file from old configs
+                    if ! grep -q '^tls_cert_file' "$CONFIG_FILE"; then
                         toml_set tls_cert_file "$CERT_FILE" string
                         toml_set tls_key_file "$KEY_FILE" string
                     fi

@@ -33,5 +33,9 @@ webroot = "/data/webroot"
 # Logging
 log_level = "INFO"
 
+# Telemetry
+telemetry_enabled = true
+telemetry_dir = "/data/telemetry"
+
 [cpu]
 # num_cpus is auto-set by entrypoint.sh if not already configured

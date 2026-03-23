@@ -487,18 +487,20 @@ class NetworkNode(Node):
             from shared.rest_api import RestApiServer
             from shared.certificate_manager import CertificateManager
 
-            # Build cert config with fallback to shared QUIC TLS certs
-            cert_config = {
-                "rest_tls_cert_file": (
-                    self.config.get("rest_tls_cert_file")
-                    or self.config.get("tls_cert_file")
-                ),
-                "rest_tls_key_file": (
-                    self.config.get("rest_tls_key_file")
-                    or self.config.get("tls_key_file")
-                ),
-            }
-            cert_manager = CertificateManager(cert_config, logger=self.logger)
+            # Only set up cert manager when HTTPS port is enabled
+            cert_manager = None
+            if self.rest_port > 0:
+                cert_config = {
+                    "rest_tls_cert_file": (
+                        self.config.get("rest_tls_cert_file")
+                        or self.config.get("tls_cert_file")
+                    ),
+                    "rest_tls_key_file": (
+                        self.config.get("rest_tls_key_file")
+                        or self.config.get("tls_key_file")
+                    ),
+                }
+                cert_manager = CertificateManager(cert_config, logger=self.logger)
             self.rest_api_server = RestApiServer(
                 network_node=self,
                 host=self.rest_host,
