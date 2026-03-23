@@ -21,6 +21,4 @@ http_port = 8080
 cert_dir = "/data/certs"
 
 [cpu]
-# Number of CPU threads for mining
-# Auto-detected by entrypoint if not specified
-# num_cpus = 4
+# num_cpus is auto-set by entrypoint.sh if not already configured

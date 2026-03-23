@@ -30,7 +30,7 @@ else
     echo "Using existing config at $CONFIG_FILE"
 fi
 
-# Auto-detect resources based on mode
+# Auto-detect hardware and write into TOML config (no subcommand forcing)
 if [ "$QUIP_MODE" = "gpu" ]; then
     echo "----------------------------------------"
     echo "GPU Mode - Detecting NVIDIA GPUs..."
@@ -45,19 +45,29 @@ if [ "$QUIP_MODE" = "gpu" ]; then
         exit 1
     fi
 
-    # Build device arguments for all detected GPUs
-    DEVICE_ARGS=""
-    for ((i=0; i<NUM_GPUS; i++)); do
-        DEVICE_ARGS="$DEVICE_ARGS --device $i"
-    done
-    echo "GPU devices: 0-$((NUM_GPUS-1))"
-    MODE_ARGS="gpu --gpu-backend local $DEVICE_ARGS"
+    # Write [cuda.N] device sections into config if not already present
+    if ! grep -q '^\[cuda\.' "$CONFIG_FILE"; then
+        echo "" >> "$CONFIG_FILE"
+        for ((i=0; i<NUM_GPUS; i++)); do
+            echo "[cuda.$i]" >> "$CONFIG_FILE"
+            echo "" >> "$CONFIG_FILE"
+        done
+        echo "Wrote $NUM_GPUS GPU device section(s) into $CONFIG_FILE"
+    else
+        echo "GPU device sections already present in $CONFIG_FILE"
+    fi
 
 else
-    # CPU mode (default)
+    # CPU mode (default) — write num_cpus into [cpu] section if not set
     NUM_CPUS=$(nproc)
     echo "CPU Mode - Detected CPUs: $NUM_CPUS"
-    MODE_ARGS="cpu --num-cpus $NUM_CPUS"
+
+    if ! grep -q '^num_cpus' "$CONFIG_FILE"; then
+        sed -i '/^\[cpu\]/a num_cpus = '"$NUM_CPUS" "$CONFIG_FILE"
+        echo "Set num_cpus = $NUM_CPUS in $CONFIG_FILE"
+    else
+        echo "num_cpus already configured in $CONFIG_FILE"
+    fi
 fi
 
 # Parse peer arguments from comma-separated list (with defaults)
@@ -111,7 +121,7 @@ echo "Starting Quip Network Node..."
 echo "========================================"
 
 # Construct and execute the command
-CMD="quip-network-node --config $CONFIG_FILE $MODE_ARGS \
+CMD="quip-network-node --config $CONFIG_FILE \
     --listen $LISTEN \
     --port $PORT \
     --genesis-config genesis_block_public.json \
