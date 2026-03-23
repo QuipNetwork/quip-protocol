@@ -340,11 +340,7 @@ class NetworkNode(Node):
         # Maximum block index to synchronize with (prevents syncing with peers too far ahead)
         self.max_sync_block_index = 1024
 
-        self.miners_config = {
-            "cpu": config.get("cpu", None),
-            "gpu": config.get("gpu", None),
-            "qpu": config.get("qpu", None)
-        }
+        self.miners_config = config
         super().__init__(self.node_name, self.miners_config, genesis_block, secret=self.secret,
                          on_block_mined=self._on_block_received,
                          on_mining_started=self._network_on_mining_started,
