@@ -93,7 +93,7 @@ class CertificateManager:
                 cert_data = f.read()
 
             cert = x509.load_pem_x509_certificate(cert_data)
-            now = datetime.datetime.now(datetime.UTC)
+            now = datetime.datetime.now(datetime.timezone.utc)
 
             if cert.not_valid_after_utc < now:
                 self.logger.error(f"Certificate has expired: {cert_path}")
@@ -134,7 +134,7 @@ class CertificateManager:
             x509.IPAddress(ipaddress.IPv6Address("::1")),
         ]
 
-        now = datetime.datetime.now(datetime.UTC)
+        now = datetime.datetime.now(datetime.timezone.utc)
         cert = (
             x509.CertificateBuilder()
             .subject_name(subject)

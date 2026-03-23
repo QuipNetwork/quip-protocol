@@ -139,7 +139,7 @@ def generate_self_signed_cert(hostname: str = "localhost", cert_dir: Optional[st
         x509.NameAttribute(NameOID.COMMON_NAME, hostname),
     ])
 
-    now = datetime.datetime.now(datetime.UTC)
+    now = datetime.datetime.now(datetime.timezone.utc)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
