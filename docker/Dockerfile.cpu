@@ -37,9 +37,9 @@ LABEL maintainer="Quip Protocol"
 LABEL description="Quip Network Node - CPU Mining"
 LABEL org.opencontainers.image.source="https://gitlab.com/piqued/quip-protocol"
 
-# Install runtime dependencies
+# Install runtime dependencies (tini for PID 1, busybox for crond)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    openssl \
+    openssl tini busybox-static \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -50,29 +50,45 @@ RUN WHEEL=$(ls /tmp/*.whl) && \
     pip install --no-cache-dir "${WHEEL}[cpu]" && \
     rm /tmp/*.whl
 
+# Install certbot + DNS plugins for automated TLS certificate management
+RUN pip install --no-cache-dir \
+    certbot certbot-dns-cloudflare certbot-dns-route53 \
+    certbot-dns-google certbot-dns-digitalocean \
+    certbot-dns-ovh certbot-dns-rfc2136
+
 # Copy genesis block (needed at runtime)
 COPY genesis_block_public.json ./
 
-# Copy config template and entrypoint
+# Copy config template, certbot wrapper, and entrypoint
 COPY docker/quip-node.cpu.toml /app/quip-node.docker.toml
+COPY docker/certbot-default.sh /app/certbot-default.sh
+RUN chmod +x /app/certbot-default.sh
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Environment variables with defaults
-# QUIP_LISTEN=:: enables dual-stack (both IPv4 and IPv6)
+# Environment variables — override TOML config when set (non-empty).
+# TOML template has defaults: listen=0.0.0.0, port=20049, auto_mine=false.
+# Set QUIP_LISTEN=:: in docker run to enable dual-stack (IPv4+IPv6).
 ENV QUIP_MODE=cpu
-ENV QUIP_PEERS=nodes.quip.network:20049
-ENV QUIP_PORT=20049
-ENV QUIP_LISTEN=::
+ENV QUIP_PEERS=""
+ENV QUIP_PORT=""
+ENV QUIP_LISTEN=""
 ENV QUIP_PUBLIC_HOST=""
+ENV QUIP_PUBLIC_PORT=""
 ENV QUIP_NODE_NAME=""
-ENV QUIP_AUTO_MINE=false
+ENV QUIP_AUTO_MINE=""
+
+# TLS certificate management (certbot activates when CERT_EMAIL is set
+# and QUIP_PUBLIC_HOST is a DNS name). All other CERT_* vars are unset
+# by default — the certbot script defaults to Let's Encrypt HTTP-01.
+ENV CERT_EMAIL=""
 
 # Data volume for persistent config and secret
 VOLUME ["/data"]
 
-# Expose QUIC port
+# Expose QUIC port and HTTP-01 challenge port
 EXPOSE 20049/udp
 EXPOSE 20049/tcp
+EXPOSE 80/tcp
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["tini", "--", "/entrypoint.sh"]

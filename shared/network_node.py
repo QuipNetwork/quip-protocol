@@ -216,10 +216,14 @@ class NetworkNode(Node):
         self.port = config.get("port", 20049)
 
         self.node_name = config.get("node_name", socket.getfqdn())
-        self.public_host = config.get("public_host", f"{get_local_ip()}:{self.port}")
-        # Default to local_ip only when we are listening on a local host.
-        # Note: We can't call asyncio.run() here since we're inside an async context.
-        # Public IP will be determined asynchronously during node startup if needed.
+        raw_public_host = config.get("public_host", get_local_ip())
+        if ":" in str(raw_public_host):
+            raise ValueError(
+                f"public_host must be a hostname or IP without a port, got: '{raw_public_host}'. "
+                "Use separate public_host and public_port settings."
+            )
+        public_port = config.get("public_port", self.port)
+        self.public_host = f"{raw_public_host}:{public_port}"
 
         self.secret = config.get("secret", f"quip network node secret {random.randint(0, 1000000)}")
         self.auto_mine = config.get("auto_mine", False)

@@ -5,7 +5,8 @@ node_name = "Quantum Node Name"  # Optional human-readable name for your node.
 listen = "0.0.0.0"
 port = 20049 # ("QN" -> little endian unsigned int is 0x514E -> 0x4E51 = 20049)
 
-#public_host = "my.dns.or.ip:public_port"
+# public_host = "my.dns.or.ip"
+# public_port = 20049  # Defaults to port if not set
 
 # Optional deterministic key generation
 # Defaults to generate a brand new key on boot.
