@@ -32,9 +32,6 @@ CERTBOT_ARGS=(
     --non-interactive
     --agree-tos
     --domain "$DOMAIN"
-    --cert-path "$CERT_FILE"
-    --key-path "$KEY_FILE"
-    --fullchain-path "$CERT_FILE"
     --config-dir /data/certs/certbot-config
     --work-dir /data/certs/certbot-work
     --logs-dir /data/certs/certbot-logs
@@ -84,8 +81,16 @@ esac
 echo "certbot: obtaining certificate for $DOMAIN ..."
 certbot "${CERTBOT_ARGS[@]}"
 
-# Lock down private key
-chmod 600 "$KEY_FILE" 2>/dev/null || true
-chmod 644 "$CERT_FILE" 2>/dev/null || true
-
-echo "certbot: certificate for $DOMAIN saved to $CERT_DIR"
+# certbot certonly ignores --cert-path/--key-path/--fullchain-path and
+# writes to its own live directory. Copy to our expected location.
+LIVE_DIR="/data/certs/certbot-config/live/$DOMAIN"
+if [ -d "$LIVE_DIR" ]; then
+    cp -L "$LIVE_DIR/fullchain.pem" "$CERT_FILE"
+    cp -L "$LIVE_DIR/privkey.pem" "$KEY_FILE"
+    chmod 600 "$KEY_FILE"
+    chmod 644 "$CERT_FILE"
+    echo "certbot: certificate for $DOMAIN saved to $CERT_DIR"
+else
+    echo "certbot: ERROR — live directory $LIVE_DIR not found" >&2
+    exit 1
+fi

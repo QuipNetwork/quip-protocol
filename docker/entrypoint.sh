@@ -213,6 +213,7 @@ if [ -n "$PUBLIC_HOST" ]; then
             done
 
             CRON_LINE="0 3 * * * $CRON_ENV $CERTBOT_SCRIPT $PUBLIC_HOST >> /data/certs/renewal.log 2>&1"
+            mkdir -p /var/spool/cron/crontabs
             echo "$CRON_LINE" | busybox crontab -
 
             # Start crond in background (tini reaps if it dies)
