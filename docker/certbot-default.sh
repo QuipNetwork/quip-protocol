@@ -61,9 +61,18 @@ fi
 
 # Challenge type
 CHALLENGE="${CERT_CHALLENGE:-http}"
+WEBROOT="${CERT_WEBROOT:-/data/webroot}"
 case "$CHALLENGE" in
     http)
-        CERTBOT_ARGS+=(--standalone --http-01-port 80)
+        if python3 -c "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1',80)); s.close()" 2>/dev/null; then
+            # Port 80 is in use (REST API or another server) — use webroot
+            mkdir -p "$WEBROOT/.well-known/acme-challenge"
+            CERTBOT_ARGS+=(--webroot --webroot-path "$WEBROOT")
+            echo "certbot: port 80 in use, using --webroot ($WEBROOT)"
+        else
+            # Port 80 is free — let certbot run its own server
+            CERTBOT_ARGS+=(--standalone --http-01-port 80)
+        fi
         ;;
     dns)
         PLUGIN="${CERT_DNS_PLUGIN:?CERT_DNS_PLUGIN required when CERT_CHALLENGE=dns}"

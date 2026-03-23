@@ -27,6 +27,7 @@ trust_db = "/data/trust.db"
 rest_host = "0.0.0.0"
 rest_port = -1
 rest_insecure_port = -1
+webroot = "/data/webroot"
 
 # Logging
 log_level = "INFO"

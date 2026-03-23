@@ -250,6 +250,7 @@ class NetworkNode(Node):
         self.rest_host = config.get("rest_host", "127.0.0.1")
         self.rest_port = int(config.get("rest_port", -1))
         self.rest_insecure_port = int(config.get("rest_insecure_port", 20050))
+        self.webroot = config.get("webroot")
         self.rest_api_enabled = self.rest_port > 0 or self.rest_insecure_port > 0
         self.rest_api_server = None  # Initialized in start()
 
@@ -504,6 +505,7 @@ class NetworkNode(Node):
                 port=self.rest_insecure_port,
                 tls_port=self.rest_port,
                 cert_manager=cert_manager,
+                webroot=self.webroot,
                 logger=self.logger
             )
             await self.rest_api_server.start()
