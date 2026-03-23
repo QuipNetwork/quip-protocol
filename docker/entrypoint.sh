@@ -188,16 +188,11 @@ if [ -n "$PUBLIC_HOST" ]; then
                     chmod 600 "$KEY_FILE"
                     echo "TLS: certificate obtained, injecting paths into config"
 
-                    # Inject cert paths into [rest_api] section of config.toml
-                    if grep -q '^\[rest_api\]' "$CONFIG_FILE"; then
-                        # Section exists — append cert paths if not already present
-                        if ! grep -q 'rest_tls_cert_file' "$CONFIG_FILE"; then
-                            sed -i '/^\[rest_api\]/a rest_tls_cert_file = "'"$CERT_FILE"'"\nrest_tls_key_file = "'"$KEY_FILE"'"' "$CONFIG_FILE"
-                        fi
-                    else
-                        # Create [rest_api] section
-                        printf '\n[rest_api]\nrest_tls_cert_file = "%s"\nrest_tls_key_file = "%s"\n' \
-                            "$CERT_FILE" "$KEY_FILE" >> "$CONFIG_FILE"
+                    # Inject cert paths into [global] section of config.toml
+                    # Shared by both QUIC and REST API
+                    if ! grep -q 'tls_cert_file' "$CONFIG_FILE"; then
+                        toml_set tls_cert_file "$CERT_FILE" string
+                        toml_set tls_key_file "$KEY_FILE" string
                     fi
                 else
                     echo "TLS: WARNING — certbot succeeded but cert files not found, falling back to self-signed"

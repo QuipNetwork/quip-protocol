@@ -332,10 +332,10 @@ class NodeClient:
     """QUIC client for QuIP P2P networking with connection pooling and TOFU verification."""
 
     def __init__(self, node_timeout: float = 10.0, logger: Optional[logging.Logger] = None,
-                 verify_ssl: bool = False, trust_store: Optional['TrustStore'] = None):
+                 verify_tls: bool = False, trust_store: Optional['TrustStore'] = None):
         self.node_timeout = node_timeout
         self.logger = logger or logging.getLogger(__name__)
-        self.verify_ssl = verify_ssl
+        self.verify_tls = verify_tls
         self.trust_store = trust_store
         self._connections: Dict[str, _QuicClientProtocol] = {}
         self._connection_contexts: Dict[str, Any] = {}  # Store context managers to keep connections alive
@@ -403,7 +403,7 @@ class NodeClient:
                 alpn_protocols=[QUIP_ALPN_PROTOCOL],
                 idle_timeout=300.0,
             )
-            if not self.verify_ssl:
+            if not self.verify_tls:
                 configuration.verify_mode = ssl.CERT_NONE
 
             try:

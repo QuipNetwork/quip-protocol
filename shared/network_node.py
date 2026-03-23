@@ -212,6 +212,7 @@ class NetworkNode(Node):
     """Peer-to-peer node for quantum blockchain network."""
 
     def __init__(self, config: dict, genesis_block: Block):
+        self.config = config
         self.bind_address = config.get("listen", "127.0.0.1")
         self.port = config.get("port", 20049)
 
@@ -238,15 +239,18 @@ class NetworkNode(Node):
         self.tls_cert_file = config.get("tls_cert_file")
         self.tls_key_file = config.get("tls_key_file")
         self.tls_enabled = bool(self.tls_cert_file and self.tls_key_file)
+        self.verify_tls = config.get("verify_tls", False)
 
         # TOFU (Trust On First Use) configuration
-        self.tofu_config = config.get("tofu", {})
-        self.tofu_enabled = self.tofu_config.get("enabled", True)
+        self.tofu_enabled = config.get("tofu", True)
+        self.trust_db = config.get("trust_db", "~/.quip/trust.db")
         self.trust_store = None  # Initialized in start()
 
-        # REST API configuration
-        self.rest_api_config = config.get("rest_api", {})
-        self.rest_api_enabled = self.rest_api_config.get("enabled", False)
+        # REST API configuration (enabled when rest_port > 0 or rest_insecure_port > 0)
+        self.rest_host = config.get("rest_host", "127.0.0.1")
+        self.rest_port = int(config.get("rest_port", -1))
+        self.rest_insecure_port = int(config.get("rest_insecure_port", 20050))
+        self.rest_api_enabled = self.rest_port > 0 or self.rest_insecure_port > 0
         self.rest_api_server = None  # Initialized in start()
 
         # Initialize logger with helper function
@@ -436,14 +440,7 @@ class NetworkNode(Node):
         if self.tofu_enabled:
             import os
             from shared.trust_store import TrustStore
-            trust_db_path = os.path.expanduser(
-                self.tofu_config.get("trust_db", "~/.quip/trust.db")
-            )
-            # Clear trust DB on start if configured
-            if self.tofu_config.get("clear_on_start", False):
-                if os.path.exists(trust_db_path):
-                    os.remove(trust_db_path)
-                    self.logger.info(f"Cleared TOFU trust store at {trust_db_path}")
+            trust_db_path = os.path.expanduser(self.trust_db)
             self.trust_store = TrustStore(trust_db_path, logger=self.logger)
             await self.trust_store.initialize()
             self.logger.info(f"TOFU trust store initialized at {trust_db_path}")
@@ -452,6 +449,7 @@ class NetworkNode(Node):
         self.node_client = NodeClient(
             node_timeout=self.node_timeout,
             logger=self.logger,
+            verify_tls=self.verify_tls,
             trust_store=self.trust_store
         )
         await self.node_client.start()
@@ -488,12 +486,23 @@ class NetworkNode(Node):
             from shared.rest_api import RestApiServer
             from shared.certificate_manager import CertificateManager
 
-            cert_manager = CertificateManager(self.rest_api_config, logger=self.logger)
+            # Build cert config with fallback to shared QUIC TLS certs
+            cert_config = {
+                "rest_tls_cert_file": (
+                    self.config.get("rest_tls_cert_file")
+                    or self.config.get("tls_cert_file")
+                ),
+                "rest_tls_key_file": (
+                    self.config.get("rest_tls_key_file")
+                    or self.config.get("tls_key_file")
+                ),
+            }
+            cert_manager = CertificateManager(cert_config, logger=self.logger)
             self.rest_api_server = RestApiServer(
                 network_node=self,
-                host=self.rest_api_config.get("host", "0.0.0.0"),
-                port=self.rest_api_config.get("http_port", 8080),
-                tls_port=self.rest_api_config.get("https_port", 443),
+                host=self.rest_host,
+                port=self.rest_insecure_port,
+                tls_port=self.rest_port,
                 cert_manager=cert_manager,
                 logger=self.logger
             )

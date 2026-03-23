@@ -26,7 +26,7 @@ heartbeat_timeout = 300  # Timeout for waiting for heartbeats from peers in seco
 # fanout = 3
 
 # TLS/SSL Configuration
-verify_ssl = true  # Verify SSL/TLS certificates when connecting to peers
+verify_tls = false  # Verify TLS certificates when connecting to peers
 # ca_bundle = "/path/to/ca-certificates.crt"  # Custom CA certificate bundle (optional)
 
 # Logging configuration

@@ -13,17 +13,23 @@ port = 20049
 timeout = 3
 heartbeat_interval = 15
 heartbeat_timeout = 300
-verify_ssl = true
+verify_tls = false
 
-[tofu]
-enabled = true
+# TLS certificates (injected by certbot in entrypoint.sh)
+# tls_cert_file = "/data/certs/private/fullchain.pem"
+# tls_key_file = "/data/certs/private/privkey.pem"
+
+# TOFU
+tofu = true
 trust_db = "/data/trust.db"
 
-[rest_api]
-enabled = false
-host = "0.0.0.0"
-http_port = 8080
-cert_dir = "/data/certs"
+# REST API
+rest_host = "0.0.0.0"
+rest_port = -1
+rest_insecure_port = -1
+
+# Logging
+log_level = "INFO"
 
 [gpu]
 # CUDA GPU mining configuration
