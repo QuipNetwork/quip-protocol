@@ -115,6 +115,7 @@ def _apply_global_overrides(conf: Dict[str, Any],
                              listen: Optional[str],
                              port: Optional[int],
                              public_host: Optional[str],
+                             public_port: Optional[int],
                              node_name: Optional[str],
                              secret: Optional[str],
                              auto_mine: Optional[bool],
@@ -133,6 +134,8 @@ def _apply_global_overrides(conf: Dict[str, Any],
         c["port"] = int(port)
     if public_host is not None:
         c["public_host"] = public_host
+    if public_port is not None:
+        c["public_port"] = int(public_port)
     if node_name is not None:
         c["node_name"] = node_name
     if secret is not None:
@@ -257,7 +260,8 @@ def quip_network_node(ctx: click.Context, config: Optional[str], version: bool, 
 # Global network options
 @click.option("--listen", type=str, default=None, help="Address to bind; IPv6 supported (e.g., ::1 or ::). Defaults from [global].listen or 127.0.0.1")
 @click.option("--port", type=int, default=None, help="Port to bind (defaults from [global].port or 20049)")
-@click.option("--public-host", type=str, default=None, help="Public host:port advertised to peers; use [IPv6]:port for IPv6")
+@click.option("--public-host", type=str, default=None, help="Public hostname or IP advertised to peers")
+@click.option("--public-port", type=int, default=None, help="Public port advertised to peers (defaults to --port)")
 @click.option("--node-name", type=str, default=None, help="Human-readable node name")
 @click.option("--secret", type=str, default=None, help="Deterministic secret for keypair")
 @click.option("--auto-mine/--no-auto-mine", default=None, help="Enable/disable auto-mining when no peers found")
@@ -281,6 +285,7 @@ def cpu(
     listen: Optional[str],
     port: Optional[int],
     public_host: Optional[str],
+    public_port: Optional[int],
     node_name: Optional[str],
     secret: Optional[str],
     auto_mine: Optional[bool],
@@ -304,7 +309,7 @@ def cpu(
     conf.pop("gpu", None)
     conf.pop("qpu", None)
 
-    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
+    conf = _apply_global_overrides(conf, listen, port, public_host, public_port, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
 
     # Handle CPU-specific configuration
     cpu_cfg = dict((conf.get("cpu") or {}))
@@ -330,7 +335,8 @@ def cpu(
 # Global network options
 @click.option("--listen", type=str, default=None, help="Address to bind; IPv6 supported (e.g., ::1 or ::). Defaults from [global].listen or 127.0.0.1")
 @click.option("--port", type=int, default=None, help="Port to bind (defaults from [global].port or 20049)")
-@click.option("--public-host", type=str, default=None, help="Public host:port advertised to peers; use [IPv6]:port for IPv6")
+@click.option("--public-host", type=str, default=None, help="Public hostname or IP advertised to peers")
+@click.option("--public-port", type=int, default=None, help="Public port advertised to peers (defaults to --port)")
 @click.option("--node-name", type=str, default=None, help="Human-readable node name")
 @click.option("--secret", type=str, default=None, help="Deterministic secret for keypair")
 @click.option("--auto-mine/--no-auto-mine", default=None, help="Enable/disable auto-mining when no peers found")
@@ -358,6 +364,7 @@ def gpu(
     listen: Optional[str],
     port: Optional[int],
     public_host: Optional[str],
+    public_port: Optional[int],
     node_name: Optional[str],
     secret: Optional[str],
     auto_mine: Optional[bool],
@@ -387,7 +394,7 @@ def gpu(
     conf.pop("qpu", None)
 
     # Apply CLI overrides
-    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
+    conf = _apply_global_overrides(conf, listen, port, public_host, public_port, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
 
     # Build GPU config from CLI args as top-level device sections.
     # [gpu] holds global defaults; [cuda.N]/[metal]/[modal] hold devices.
@@ -430,7 +437,8 @@ def gpu(
 # Global network options
 @click.option("--listen", type=str, default=None, help="Address to bind; IPv6 supported (e.g., ::1 or ::). Defaults from [global].listen or 127.0.0.1")
 @click.option("--port", type=int, default=None, help="Port to bind (defaults from [global].port or 20049)")
-@click.option("--public-host", type=str, default=None, help="Public host:port advertised to peers; use [IPv6]:port for IPv6")
+@click.option("--public-host", type=str, default=None, help="Public hostname or IP advertised to peers")
+@click.option("--public-port", type=int, default=None, help="Public port advertised to peers (defaults to --port)")
 @click.option("--node-name", type=str, default=None, help="Human-readable node name")
 @click.option("--secret", type=str, default=None, help="Deterministic secret for keypair")
 @click.option("--auto-mine/--no-auto-mine", default=None, help="Enable/disable auto-mining when no peers found")
@@ -458,6 +466,7 @@ def qpu(
     listen: Optional[str],
     port: Optional[int],
     public_host: Optional[str],
+    public_port: Optional[int],
     node_name: Optional[str],
     secret: Optional[str],
     auto_mine: Optional[bool],
@@ -485,7 +494,7 @@ def qpu(
     conf.pop("cpu", None)
 
     # Apply CLI overrides
-    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
+    conf = _apply_global_overrides(conf, listen, port, public_host, public_port, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
 
     # Build QPU config — CLI args populate a [dwave] section.
     dwave_cfg = dict(conf.get("dwave") or {})

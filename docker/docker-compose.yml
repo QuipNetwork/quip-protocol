@@ -2,6 +2,10 @@ version: '3.8'
 
 # Docker Compose for Quip Network Node testing
 # Run: docker-compose up cpu-bootstrap cpu-node-2
+#
+# Config philosophy: TOML is the source of truth.
+# ENV vars here override TOML only when non-empty.
+# Port/listen/auto_mine defaults are in the TOML template.
 
 services:
   # Bootstrap CPU node (first node, no external peers needed)
@@ -12,17 +16,17 @@ services:
     image: carback1/quip-network-node-cpu:latest
     container_name: quip-cpu-bootstrap
     environment:
-      - QUIP_PORT=20049
-      - QUIP_LISTEN=::
-      - QUIP_PUBLIC_HOST=cpu-bootstrap:20049
+      - QUIP_PUBLIC_HOST=cpu-bootstrap
       - QUIP_NODE_NAME=cpu-bootstrap
       - QUIP_AUTO_MINE=true
       - QUIP_PEERS=
+      - CERT_EMAIL=
     volumes:
       - cpu-bootstrap-data:/data
     ports:
       - "20049:20049/udp"
       - "20049:20049/tcp"
+      - "80:80/tcp"
     networks:
       - quip-net
 
@@ -34,9 +38,7 @@ services:
     image: carback1/quip-network-node-cpu:latest
     container_name: quip-cpu-2
     environment:
-      - QUIP_PORT=20049
-      - QUIP_LISTEN=::
-      - QUIP_PUBLIC_HOST=cpu-node-2:20049
+      - QUIP_PUBLIC_HOST=cpu-node-2
       - QUIP_NODE_NAME=cpu-node-2
       - QUIP_PEERS=cpu-bootstrap:20049
       - QUIP_AUTO_MINE=true
@@ -55,9 +57,7 @@ services:
     image: carback1/quip-network-node-cuda:latest
     container_name: quip-gpu-1
     environment:
-      - QUIP_PORT=20049
-      - QUIP_LISTEN=::
-      - QUIP_PUBLIC_HOST=gpu-node:20049
+      - QUIP_PUBLIC_HOST=gpu-node
       - QUIP_NODE_NAME=gpu-node-1
       - QUIP_PEERS=cpu-bootstrap:20049
       - QUIP_AUTO_MINE=true

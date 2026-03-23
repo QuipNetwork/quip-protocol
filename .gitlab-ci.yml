@@ -16,7 +16,10 @@ variables:
     - docker:24-dind
   before_script:
     - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
-    - docker buildx create --use --name multiarch-builder || docker buildx use multiarch-builder
+    - |
+      docker context create ci-ctx \
+        --docker "host=${DOCKER_HOST:-tcp://docker:2376},ca=${DOCKER_TLS_CERTDIR}/client/ca.pem,cert=${DOCKER_TLS_CERTDIR}/client/cert.pem,key=${DOCKER_TLS_CERTDIR}/client/key.pem"
+    - docker buildx create --use --name multiarch-builder ci-ctx
     - docker buildx inspect --bootstrap
 
 # Build and push CPU network node image (amd64 + arm64)

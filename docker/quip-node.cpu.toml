@@ -3,8 +3,13 @@
 
 [global]
 secret = "GENERATE_ON_FIRST_RUN"
-listen = "0.0.0.0"
+listen = "::"
 port = 20049
+# public_host = ""
+# public_port = 20049
+# node_name = ""
+# auto_mine = false
+# peer = []
 timeout = 3
 heartbeat_interval = 15
 heartbeat_timeout = 300

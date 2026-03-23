@@ -66,3 +66,6 @@ localhost.pem
 flamegraphs/
 # Benchmark outputs
 benchmarks/
+
+# TLS private keys (certbot output in Docker data volume)
+data/certs/private/

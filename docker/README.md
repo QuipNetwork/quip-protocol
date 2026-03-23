@@ -37,7 +37,7 @@ mkdir -p ~/quip-data
 ```bash
 docker run -d --pull always --name quip-cpu \
   -v ~/quip-data:/data \
-  -e QUIP_PUBLIC_HOST=myhost.example.com:20049 \
+  -e QUIP_PUBLIC_HOST=myhost.example.com \
   -p 20049:20049/udp -p 20049:20049/tcp \
   carback1/quip-network-node-cpu:latest
 ```
@@ -46,7 +46,7 @@ docker run -d --pull always --name quip-cpu \
 ```bash
 docker run -d --pull always --gpus all --name quip-cuda \
   -v ~/quip-data:/data \
-  -e QUIP_PUBLIC_HOST=myhost.example.com:20049 \
+  -e QUIP_PUBLIC_HOST=myhost.example.com \
   -p 20049:20049/udp -p 20049:20049/tcp \
   carback1/quip-network-node-cuda:latest
 ```
@@ -71,14 +71,25 @@ ls -la ~/quip-data/
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `QUIP_PEERS` | (see below) | Comma-separated peer list |
-| `QUIP_PORT` | `20049` | Port to bind |
-| `QUIP_LISTEN` | `::` | Address to bind (dual-stack: accepts IPv4+IPv6) |
-| `QUIP_PUBLIC_HOST` | "" | Public host:port for peer advertisement (use `[IPv6]:port` for IPv6) |
-| `QUIP_NODE_NAME` | "" | Human-readable node name |
-| `QUIP_AUTO_MINE` | `false` | Enable auto-mining |
+All settings live in `/data/config.toml` (source of truth). ENV vars override the TOML only when set (non-empty). Edit the TOML directly for persistent changes.
+
+| Variable | TOML key | TOML default | Description |
+|----------|----------|--------------|-------------|
+| `QUIP_LISTEN` | `listen` | `::` | Address to bind (dual-stack: accepts IPv4+IPv6) |
+| `QUIP_PORT` | `port` | `20049` | Port to bind |
+| `QUIP_PUBLIC_HOST` | `public_host` | (auto-detect) | Public hostname or IP for peer advertisement |
+| `QUIP_PUBLIC_PORT` | `public_port` | same as `port` | Public port (if different, e.g. behind NAT) |
+| `QUIP_NODE_NAME` | `node_name` | (hostname) | Human-readable node name |
+| `QUIP_AUTO_MINE` | `auto_mine` | `false` | Enable auto-mining |
+| `QUIP_PEERS` | `peer` | `["nodes.quip.network:20049"]` | Comma-separated peer list (TOML uses array) |
+| `CERT_EMAIL` | (unset) | ACME email — enables certbot when set with a DNS domain |
+| `CERT_CHALLENGE` | (unset→http) | `http` (port 80) or `dns` |
+| `CERT_DNS_PLUGIN` | (unset) | cloudflare, route53, google, digitalocean, ovh, rfc2136 |
+| `CERT_DNS_CREDENTIALS` | (unset) | Path to DNS credentials file (e.g. `/data/certs/cf.ini`) |
+| `CERT_ACME_SERVER` | (unset→LE) | Custom ACME URL (ZeroSSL, Buypass). Default: Let's Encrypt |
+| `CERT_EAB_KID` | (unset) | EAB Key ID (ZeroSSL, Buypass) |
+| `CERT_EAB_HMAC_KEY` | (unset) | EAB HMAC Key (base64url) |
+| `CERT_STAGING` | (unset→false) | Use Let's Encrypt staging server |
 
 **IPv6 Support:** The default `QUIP_LISTEN=::` enables dual-stack mode, accepting both IPv4 and IPv6 connections. For IPv6-only, use `QUIP_LISTEN=::1`. For IPv4-only, use `QUIP_LISTEN=0.0.0.0`.
 
@@ -87,11 +98,29 @@ ls -la ~/quip-data/
 qpu-1.nodes.quip.network, cpu-1.quip.carback.us, gpu-1.quip.carback.us, gpu-2.quip.carback.us
 ```
 
+## TLS Certificates (Let's Encrypt)
+
+Certbot activates automatically when `QUIP_PUBLIC_HOST` is a DNS name and `CERT_EMAIL` is set:
+
+```bash
+docker run -d --name quip-cpu \
+  -v ~/quip-data:/data \
+  -e QUIP_PUBLIC_HOST=mynode.example.com \
+  -e CERT_EMAIL=admin@example.com \
+  -p 20049:20049/udp -p 20049:20049/tcp -p 80:80/tcp \
+  carback1/quip-network-node-cpu:latest
+```
+
+For DNS-01 challenges (no port 80 needed), custom ACME providers, or advanced configuration, see [TLS.md](TLS.md).
+
 ## Persistent Data
 
 Mount a volume at `/data` to persist:
-- `config.toml` - Node configuration (secret auto-generated on first run)
+- `config.toml` - Node configuration (source of truth, seeded on first run)
 - `trust.db` - TOFU peer certificate database
+- `certs/` - TLS certificates and certbot state
+
+Edit `config.toml` directly for persistent changes — ENV vars only override when non-empty.
 
 ## Building Images
 
