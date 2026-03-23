@@ -2,6 +2,12 @@
 
 Detailed documentation for each technique used by the tutte synthesis engine to compute Tutte polynomials.
 
+## Motivation
+
+| # | Document | Description |
+|---|----------|-------------|
+| 0 | [Tutte Polynomials as a Difficulty Mechanism](00_motivation.md) | Why Tutte polynomials are used in Quip Protocol's proof of work |
+
 ## Technique Index
 
 | # | Technique | When Used | Complexity |
