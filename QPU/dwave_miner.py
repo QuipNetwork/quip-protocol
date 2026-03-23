@@ -55,7 +55,7 @@ class DWaveMiner(BaseMiner):
                         Higher values increase throughput but may waste QPU time if
                         early results are valid.
             solver_name: Optional explicit solver name to connect to (e.g.
-                        "Advantage2_system1.12"). If None, uses DWAVE_API_SOLVER env var.
+                        "Advantage2_system1.13"). If None, uses DWAVE_API_SOLVER env var.
             region: Optional D-Wave region (e.g. "na-east-1").
                    If None, uses default from config.
             **cfg: Additional configuration options (reserved for future use)

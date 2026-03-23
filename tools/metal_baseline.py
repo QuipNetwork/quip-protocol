@@ -30,10 +30,10 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None,
         num_models: Number of parallel models to run
         topology: Topology to use. Can be:
                   - Z(m,t) format for perfect Zephyr topology (e.g., "Z(9,2)")
-                  - Hardware name (e.g., "Advantage2_system1.12")
+                  - Hardware name (e.g., "Advantage2_system1.13")
                   - File path to topology JSON (e.g., "path/to/topology.json.gz")
                   - File path to embedding (e.g., "path/to/*.embed.json.gz") - auto-detected
-                  Default: Advantage2_system1.12
+                  Default: Advantage2_system1.13
     """
     if h_values is None:
         h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
@@ -76,7 +76,7 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None,
             topology_name = getattr(topo_obj, 'solver_name', 'unknown')
             topology_desc = f"{topology_name} ({len(nodes)} nodes, {len(edges)} edges)"
     else:
-        print(f"✨ Using default topology (Advantage2_system1.12)")
+        print(f"✨ Using default topology (Advantage2_system1.13)")
         topo_obj = DEFAULT_TOPOLOGY
         nodes = list(topo_obj.graph.nodes) if hasattr(topo_obj, 'graph') else topo_obj.nodes
         edges = list(topo_obj.graph.edges) if hasattr(topo_obj, 'graph') else topo_obj.edges
@@ -343,8 +343,8 @@ def main():
     parser.add_argument(
         '--topology',
         type=str,
-        help='Topology: Z(9,2), Advantage2_system1.12, file path, or *.embed.json.gz for embedded. '
-             'Default: Advantage2_system1.12'
+        help='Topology: Z(9,2), Advantage2_system1.13, file path, or *.embed.json.gz for embedded. '
+             'Default: Advantage2_system1.13'
     )
 
     args = parser.parse_args()

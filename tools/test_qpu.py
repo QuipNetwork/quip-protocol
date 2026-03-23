@@ -501,7 +501,7 @@ def main():
         '--topology',
         type=str,
         default=None,
-        help='Topology name (default: DEFAULT_TOPOLOGY=Z(9,2)). Examples: "Z(9,2)", "Advantage2_system1.12"'
+        help='Topology name (default: DEFAULT_TOPOLOGY=Z(9,2)). Examples: "Z(9,2)", "Advantage2_system1.13"'
     )
     parser.add_argument(
         '--output', '-o',
@@ -531,7 +531,7 @@ def main():
         '--solver',
         type=str,
         default=None,
-        help='Target a specific D-Wave solver by name (e.g. "Advantage2_system1.12"). '
+        help='Target a specific D-Wave solver by name (e.g. "Advantage2_system1.13"). '
              'Auto-detects topology from hardware. Use with --topology to override.'
     )
     parser.add_argument(
