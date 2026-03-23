@@ -22,7 +22,7 @@ COPY GPU/ ./GPU/
 COPY QPU/ ./QPU/
 COPY dwave_topologies/ ./dwave_topologies/
 COPY quip_cli.py ./
-COPY genesis_block_public.json ./
+COPY genesis_block*.json ./
 
 # Build wheel
 RUN pip install --no-cache-dir build && \
@@ -57,7 +57,7 @@ RUN pip install --no-cache-dir \
     certbot-dns-ovh certbot-dns-rfc2136
 
 # Copy genesis block (needed at runtime)
-COPY genesis_block_public.json ./
+COPY genesis_block*.json ./
 
 # Copy config template, certbot wrapper, and entrypoint
 COPY docker/quip-node.cpu.toml /app/quip-node.docker.toml

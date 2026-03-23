@@ -18,7 +18,7 @@ secret = "your-secret-here" # Used to generate a deterministic key pair for this
 
 # Genesis block configuration file path
 # Defaults to "genesis_block.json" if not specified
-# genesis_config = "genesis_block_testnet.json"
+genesis_config = "genesis_block.json"
 
 # Peers to try and connect to, defaults to "nodes.quip.network:20049"
 # peer = ["nodes.quip.network:20049", "peer2.quip.network:20049"]

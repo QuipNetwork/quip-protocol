@@ -2,6 +2,7 @@
 # Copied to /data/config.toml on first run
 
 [global]
+genesis_config = "genesis_block.json"
 secret = "GENERATE_ON_FIRST_RUN"
 listen = "::"
 port = 20049

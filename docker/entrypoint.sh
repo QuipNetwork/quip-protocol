@@ -84,6 +84,18 @@ else
     echo "Using existing config at $CONFIG_FILE"
 fi
 
+# ── Copy genesis block to data dir if not present ─────────────────
+GENESIS_CONFIG=$(toml_get genesis_config)
+GENESIS_CONFIG="${GENESIS_CONFIG:-genesis_block.json}"
+if [ ! -f "/data/$GENESIS_CONFIG" ]; then
+    if [ -f "/app/$GENESIS_CONFIG" ]; then
+        cp "/app/$GENESIS_CONFIG" "/data/$GENESIS_CONFIG"
+        echo "Copied default genesis block to /data/$GENESIS_CONFIG"
+    else
+        echo "WARNING: genesis block $GENESIS_CONFIG not found in /app/"
+    fi
+fi
+
 # ── Resolve all settings (ENV overrides TOML) ─────────────────────
 resolve QUIP_LISTEN        listen        string
 resolve QUIP_PORT          port          int
@@ -234,7 +246,7 @@ echo "========================================"
 echo "Starting Quip Network Node..."
 echo "========================================"
 
-CMD="quip-network-node --config $CONFIG_FILE --genesis-config genesis_block_public.json"
+CMD="quip-network-node --config $CONFIG_FILE"
 echo "Command: $CMD"
 echo "----------------------------------------"
 
