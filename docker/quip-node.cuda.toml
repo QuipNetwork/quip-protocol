@@ -26,8 +26,9 @@ cert_dir = "/data/certs"
 # utilization = 100  # 1-100, percentage of SMs to use
 # yielding = false   # true = yield to other GPU users (NVML)
 
-# GPU devices (auto-detected by entrypoint via CLI args if not specified here)
-# One [cuda.N] section per device:
+# Device sections ([cuda.0], [cuda.1], ...) are auto-generated
+# by entrypoint.sh if not already present in /data/config.toml
+# Override by adding sections here or in /data/config.toml:
 # [cuda.0]
 #
 # [cuda.1]
