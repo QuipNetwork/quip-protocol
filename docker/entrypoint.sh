@@ -11,7 +11,6 @@ echo "========================================"
 echo "Quip Protocol Network Node"
 echo "========================================"
 echo "Start time: $(date)"
-echo "Mode: $QUIP_MODE"
 
 CONFIG_FILE="/data/config.toml"
 TEMPLATE_FILE="/app/quip-node.docker.toml"
@@ -123,37 +122,44 @@ echo "Config: listen=$(toml_get listen) port=$(toml_get port)"
 echo "Config: public_host=$(toml_get public_host) public_port=$(toml_get public_port)"
 echo "Config: node_name=$(toml_get node_name) auto_mine=$(toml_get auto_mine)"
 
-# ── Auto-detect hardware and write into TOML config ───────────────
-if [ "$QUIP_MODE" = "gpu" ]; then
+# ── Auto-detect hardware from config ──────────────────────────────
+# Detect GPU/CPU sections from TOML instead of relying on QUIP_MODE env var.
+
+# GPU: if [gpu] or [cuda.*] sections exist, detect NVIDIA GPUs
+if grep -q '^\[gpu\]\|^\[cuda\.' "$CONFIG_FILE"; then
     echo "----------------------------------------"
-    echo "GPU Mode - Detecting NVIDIA GPUs..."
-    nvidia-smi 2>&1 || { echo "ERROR: nvidia-smi not available - no GPUs detected. Run with --gpus all"; exit 1; }
-    echo "----------------------------------------"
+    echo "GPU config detected - checking for NVIDIA GPUs..."
+    if nvidia-smi 2>&1; then
+        echo "----------------------------------------"
 
-    NUM_GPUS=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader | wc -l)
-    echo "Detected GPUs: $NUM_GPUS"
+        NUM_GPUS=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader | wc -l)
+        echo "Detected GPUs: $NUM_GPUS"
 
-    if [ "$NUM_GPUS" -eq 0 ]; then
-        echo "ERROR: No GPUs detected. Make sure to run with --gpus all"
-        exit 1
-    fi
+        if [ "$NUM_GPUS" -eq 0 ]; then
+            echo "WARNING: [gpu] section in config but no GPUs detected. Run with --gpus all"
+        fi
 
-    # Write [cuda.N] device sections into config if not already present
-    if ! grep -q '^\[cuda\.' "$CONFIG_FILE"; then
-        echo "" >> "$CONFIG_FILE"
-        for ((i=0; i<NUM_GPUS; i++)); do
-            echo "[cuda.$i]" >> "$CONFIG_FILE"
+        # Write [cuda.N] device sections into config if not already present
+        if ! grep -q '^\[cuda\.' "$CONFIG_FILE"; then
             echo "" >> "$CONFIG_FILE"
-        done
-        echo "Wrote $NUM_GPUS GPU device section(s) into $CONFIG_FILE"
+            for ((i=0; i<NUM_GPUS; i++)); do
+                echo "[cuda.$i]" >> "$CONFIG_FILE"
+                echo "" >> "$CONFIG_FILE"
+            done
+            echo "Wrote $NUM_GPUS GPU device section(s) into $CONFIG_FILE"
+        else
+            echo "GPU device sections already present in $CONFIG_FILE"
+        fi
     else
-        echo "GPU device sections already present in $CONFIG_FILE"
+        echo "----------------------------------------"
+        echo "WARNING: [gpu] section in config but nvidia-smi not available"
     fi
+fi
 
-else
-    # CPU mode (default) — write num_cpus into [cpu] section if not set
+# CPU: if [cpu] section exists, auto-set num_cpus
+if grep -q '^\[cpu\]' "$CONFIG_FILE"; then
     NUM_CPUS=$(nproc)
-    echo "CPU Mode - Detected CPUs: $NUM_CPUS"
+    echo "CPU config detected - $NUM_CPUS CPUs available"
 
     if ! grep -q '^num_cpus' "$CONFIG_FILE"; then
         sed -i '/^\[cpu\]/a num_cpus = '"$NUM_CPUS" "$CONFIG_FILE"

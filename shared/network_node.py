@@ -268,6 +268,7 @@ class NetworkNode(Node):
         self.net_lock = asyncio.Lock()
         self.running = False
         self.heartbeats = {}
+        self.peer_versions: dict[str, str] = {}  # peer_host -> version string
 
         self.gossip_lock = asyncio.Lock()
         self.recent_messages = set()
@@ -1194,11 +1195,28 @@ class NetworkNode(Node):
             else:
                 raise RuntimeError("No peers to synchronize with")
 
+        # Filter to peers running a compatible version (same major.minor)
+        local_version = get_version()
+        local_major_minor = ".".join(local_version.split(".")[:2])
+        compatible_peers = []
+        for peer in self.peers:
+            peer_ver = self.peer_versions.get(peer)
+            if peer_ver is None:
+                # No version info yet (no heartbeat received) — include tentatively
+                compatible_peers.append(peer)
+            elif ".".join(peer_ver.split(".")[:2]) == local_major_minor:
+                compatible_peers.append(peer)
+            else:
+                self.logger.debug(f"Skipping peer {peer} for sync: version {peer_ver} != {local_version}")
+
+        if not compatible_peers:
+            self.logger.warning("No compatible-version peers available for sync")
+            return 0
+
         # Query up to 3 peers and take the highest valid response
         net_latest: Optional[BlockHeader] = None
-        peer_list = list(self.peers.keys())
-        sample_size = min(3, len(peer_list))
-        sampled = random.sample(peer_list, sample_size)
+        sample_size = min(3, len(compatible_peers))
+        sampled = random.sample(compatible_peers, sample_size)
 
         for peer in sampled:
             header = await self.get_peer_block_header(peer)
@@ -1268,8 +1286,15 @@ class NetworkNode(Node):
             self.logger.error("NodeClient not initialized")
             return False
 
-        # Update node client with current peers
-        self.node_client.update_peers(self.peers)
+        # Update node client with only compatible-version peers
+        local_version = get_version()
+        local_major_minor = ".".join(local_version.split(".")[:2])
+        compatible_peers = {
+            peer: info for peer, info in self.peers.items()
+            if self.peer_versions.get(peer) is None
+            or ".".join(self.peer_versions[peer].split(".")[:2]) == local_major_minor
+        }
+        self.node_client.update_peers(compatible_peers)
 
         synchronizer = BlockSynchronizer(
             node_client=self.node_client,
@@ -1806,6 +1831,9 @@ class NetworkNode(Node):
                 self.logger.warning(
                     f"Peer {sender} is running older version {net_version} (local: {local_version})"
                 )
+
+        if sender and net_version:
+            self.peer_versions[sender] = net_version
 
         if sender:
             async with self.net_lock:
