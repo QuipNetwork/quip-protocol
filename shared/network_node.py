@@ -269,6 +269,7 @@ class NetworkNode(Node):
         self.running = False
         self.heartbeats = {}
         self.peer_versions: dict[str, str] = {}  # peer_host -> version string
+        self.connection_backoff: dict[str, float] = {}  # peer_host -> backoff_expires_at
 
         self.gossip_lock = asyncio.Lock()
         self.recent_messages = set()
@@ -1374,6 +1375,9 @@ class NetworkNode(Node):
         if not self.node_client:
             return False
 
+        if self._is_backed_off(peer_address):
+            return False
+
         try:
             join_data = {
                 "host": self.public_host,
@@ -1410,9 +1414,34 @@ class NetworkNode(Node):
             self.telemetry.update_node(peer_address, "failed")
             return False
 
+    def _is_backed_off(self, peer_address: str) -> bool:
+        """Check if peer is on the connection backoff table."""
+        expires_at = self.connection_backoff.get(peer_address)
+        if expires_at is None:
+            return False
+        if utc_timestamp_float() >= expires_at:
+            del self.connection_backoff[peer_address]
+            return False
+        return True
+
+    async def _backoff_peer(self, peer_address: str, reason: str):
+        """Add peer to backoff table for 5-15 minutes and disconnect."""
+        duration = random.uniform(300.0, 900.0)
+        self.connection_backoff[peer_address] = (
+            utc_timestamp_float() + duration
+        )
+        self.logger.warning(
+            f"Backing off peer {peer_address} for "
+            f"{int(duration)}s - {reason}"
+        )
+        await self.remove_node(peer_address)
+
     async def add_peer(self, host: str, info: MinerInfo) -> bool:
         """Add a node to our registry."""
         if host == self.public_host:
+            return False
+
+        if self._is_backed_off(host):
             return False
 
         async with self.net_lock:
@@ -1789,6 +1818,25 @@ class NetworkNode(Node):
         except ValueError as e:
             return msg.create_error_response(str(e))
 
+        if self._is_backed_off(new_node_address):
+            return msg.create_error_response("backed off")
+
+        join_version = data.get("version")
+        if join_version:
+            local_version = get_version()
+            local_ver = version.parse(local_version)
+            peer_ver = version.parse(join_version)
+            if local_ver > peer_ver:
+                await self._backoff_peer(
+                    new_node_address,
+                    f"older version {join_version} "
+                    f"(local: {local_version})",
+                )
+                return msg.create_error_response(
+                    f"Version {join_version} too old"
+                )
+            self.peer_versions[new_node_address] = join_version
+
         # Add the new node
         await self.add_peer(new_node_address, new_node_info)
 
@@ -1811,6 +1859,11 @@ class NetworkNode(Node):
         net_version = data.get("version")
         timestamp = data.get("timestamp", utc_timestamp_float())
 
+        if sender and self._is_backed_off(sender):
+            return msg.create_response(
+                json.dumps({"status": "backed_off"}).encode('utf-8')
+            )
+
         if net_version:
             local_version = get_version()
             local_ver = version.parse(local_version)
@@ -1824,8 +1877,15 @@ class NetworkNode(Node):
                 self.logger.error("Please run 'pip install quip-network' to get the latest version")
                 await self.stop()
             elif local_ver > peer_ver:
-                self.logger.warning(
-                    f"Peer {sender} is running older version {net_version} (local: {local_version})"
+                await self._backoff_peer(
+                    sender,
+                    f"older version {net_version} "
+                    f"(local: {local_version})",
+                )
+                return msg.create_response(
+                    json.dumps(
+                        {"status": "incompatible_version"}
+                    ).encode('utf-8')
                 )
 
         if sender and net_version:
