@@ -156,6 +156,24 @@ if grep -q '^\[gpu\]\|^\[cuda\.' "$CONFIG_FILE"; then
     fi
 fi
 
+# MPS: start NVIDIA Multi-Process Service for hardware SM partitioning
+if [ "${NUM_GPUS:-0}" -gt 0 ] && command -v nvidia-cuda-mps-control &>/dev/null; then
+    export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+    export CUDA_MPS_LOG_DIRECTORY=/data/mps-logs
+    mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+
+    echo "MPS: starting nvidia-cuda-mps-control daemon"
+    nvidia-cuda-mps-control -d
+    echo "MPS: daemon started (pipes=$CUDA_MPS_PIPE_DIRECTORY, logs=$CUDA_MPS_LOG_DIRECTORY)"
+
+    # Shut down MPS cleanly on container stop
+    trap 'echo quit | nvidia-cuda-mps-control 2>/dev/null; exit' SIGTERM SIGINT
+else
+    if [ "${NUM_GPUS:-0}" -gt 0 ]; then
+        echo "MPS: nvidia-cuda-mps-control not found — falling back to NVML-only scheduling"
+    fi
+fi
+
 # CPU: if [cpu] section exists, auto-set num_cpus
 if grep -q '^\[cpu\]' "$CONFIG_FILE"; then
     NUM_CPUS=$(nproc)

@@ -32,6 +32,8 @@ webroot = "/data/webroot"
 
 # Logging
 log_level = "INFO"
+node_log = "/data/logs/quip-node.log"
+http_log = "/data/logs/quip-http.log"
 
 # Telemetry
 telemetry_enabled = true

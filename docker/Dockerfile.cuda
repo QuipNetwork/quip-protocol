@@ -41,10 +41,12 @@ LABEL org.opencontainers.image.source="https://gitlab.com/piqued/quip-protocol"
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install Python and runtime dependencies (tini for PID 1, busybox for crond)
+# cuda-mps is installed separately since the package name varies by arch
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     openssl tini busybox-static \
+    && apt-get install -y --no-install-recommends cuda-mps-11-8 2>/dev/null || true \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/python3 /usr/bin/python
 
