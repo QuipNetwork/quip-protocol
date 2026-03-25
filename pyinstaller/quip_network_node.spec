@@ -119,19 +119,24 @@ for pkg in ("dimod", "minorminer", "dwave.samplers", "dwave.preprocessing"):
 # Python wheels on Windows vendor C++ deps in <package>.libs/ next to the package dir.
 # e.g. site-packages/dwave_samplers.libs/ contains DLLs that dwave/samplers/*.pyd needs.
 if platform.system() == "Windows":
-    _seen_sp = set()
-    for pkg in ("dimod", "minorminer", "dwave", "numpy", "scipy"):
+    # Find site-packages by walking sys.path
+    import sys as _sys
+    _sp_dirs = set()
+    for p in _sys.path:
+        if "site-packages" in p and os.path.isdir(p):
+            _sp_dirs.add(p)
+    # Also check relative to known packages
+    for pkg in ("dimod", "dwave", "numpy"):
         try:
             _pkg = importlib.import_module(pkg)
+            for _pp in getattr(_pkg, "__path__", []):
+                _sp_dirs.add(os.path.dirname(_pp))
+            if getattr(_pkg, "__file__", None):
+                _sp_dirs.add(os.path.dirname(os.path.dirname(_pkg.__file__)))
         except ImportError:
-            continue
-        _pkg_paths = getattr(_pkg, "__path__", [])
-        if not _pkg_paths:
-            continue
-        _sp_dir = os.path.dirname(_pkg_paths[0])
-        if _sp_dir in _seen_sp:
-            continue
-        _seen_sp.add(_sp_dir)
+            pass
+    print(f"  Searching for .libs in: {_sp_dirs}")
+    for _sp_dir in _sp_dirs:
         for libs_dir in glob.glob(os.path.join(_sp_dir, "*.libs")):
             pkg_prefix = os.path.basename(libs_dir)
             for dll in os.listdir(libs_dir):
