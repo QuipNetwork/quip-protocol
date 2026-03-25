@@ -29,12 +29,12 @@ datas = [
         os.path.join(proj_root, "dwave_topologies", "topologies", "*.json.gz"),
         os.path.join("dwave_topologies", "topologies"),
     ),
-    # Pre-computed minor embeddings (directory may be empty)
-    (
-        os.path.join(proj_root, "dwave_topologies", "embeddings"),
-        os.path.join("dwave_topologies", "embeddings"),
-    ),
 ]
+
+# Pre-computed minor embeddings (directory may not exist in fresh checkouts)
+_embeddings_dir = os.path.join(proj_root, "dwave_topologies", "embeddings")
+if os.path.isdir(_embeddings_dir):
+    datas.append((_embeddings_dir, os.path.join("dwave_topologies", "embeddings")))
 
 # ---------------------------------------------------------------------------
 # Hidden imports: collect all submodules for packages with dynamic/Cython imports
