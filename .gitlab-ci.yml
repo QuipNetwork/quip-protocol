@@ -4,6 +4,7 @@
 stages:
   - build
   - package
+  - release
 
 variables:
   DOCKER_TLS_CERTDIR: "/certs"
@@ -59,7 +60,7 @@ build-cuda:
 
 # Template for PyInstaller builds
 .pyinstaller_build:
-  stage: package
+  stage: build
   variables:
     PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
   script:
@@ -116,7 +117,7 @@ package-windows-x86_64:
     expire_in: 30 days
 
 release-binaries:
-  stage: package
+  stage: release
   needs:
     - package-macos-arm64
     - package-macos-x86_64
