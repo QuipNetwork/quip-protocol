@@ -96,7 +96,11 @@ def _collect_extension_binaries(pkg_name):
 # Collect compiled extensions from packages with namespace sub-packages
 extra_binaries = []
 for pkg in ("dimod", "minorminer", "dwave.samplers", "dwave.preprocessing"):
-    extra_binaries += _collect_extension_binaries(pkg)
+    found = _collect_extension_binaries(pkg)
+    print(f"  {pkg}: {len(found)} extensions")
+    for src, dest in found:
+        print(f"    {os.path.basename(src)} -> {dest}")
+    extra_binaries += found
 
 # Package metadata so importlib.metadata.version("quip-protocol") works
 datas += copy_metadata("quip-protocol")
