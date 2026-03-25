@@ -108,9 +108,9 @@ package-windows-x86_64:
     - $env:Path = "D:\GitLab-Runner\venv\Scripts;C:\Program Files\Git\cmd;" + $env:Path
     - python -m venv .venv
     - .\.venv\Scripts\Activate.ps1
-    - pip install -U pip setuptools wheel
-    - pip install pyinstaller
-    - pip install -e ".[cuda]"
+    - python -m pip install -U pip setuptools wheel
+    - python -m pip install pyinstaller
+    - python -m pip install -e ".[cuda]"
   artifacts:
     paths:
       - dist/quip-network-node-*.exe
