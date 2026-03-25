@@ -3,7 +3,6 @@
 
 stages:
   - build
-  - package
   - release
 
 variables:
@@ -45,28 +44,19 @@ build-cuda:
         --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
 
 # ---------------------------------------------------------------------------
-# PyInstaller native binaries (package stage, tags only)
+# PyInstaller native binaries
 # ---------------------------------------------------------------------------
 
-# Template for PyInstaller builds
-# Binaries uploaded to GitLab Package Registry (no artifact size limit)
 .pyinstaller_build:
   stage: build
   variables:
     PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
-    PACKAGE_NAME: quip-network-node
-    PACKAGE_VERSION: "${CI_COMMIT_TAG:-${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}}"
   script:
     - bash pyinstaller/build.sh
-  after_script:
-    - |
-      for f in dist/quip-network-node-*; do
-        filename=$(basename "$f")
-        echo "Uploading $filename to Package Registry..."
-        curl --header "JOB-TOKEN: $CI_JOB_TOKEN" \
-             --upload-file "$f" \
-             "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${PACKAGE_VERSION}/${filename}"
-      done
+  artifacts:
+    paths:
+      - dist/quip-network-node-*
+    expire_in: 30 days
   only:
     - tags
     - /^v\d+/
@@ -93,10 +83,10 @@ package-macos-x86_64:
 
 package-linux-x86_64:
   extends: .pyinstaller_build
-  image: nvidia/cuda:12.8.1-runtime-ubuntu24.04
+  image: nvidia/cuda:12.6.3-base-ubuntu22.04
   tags: [linux, x86_64]
   before_script:
-    - apt-get update && apt-get install -y python3 python3-pip python3-venv
+    - apt-get update && apt-get install -y --no-install-recommends python3 python3-pip python3-venv cuda-cudart-12-6 cuda-nvrtc-12-6
     - python3 -m venv .venv
     - source .venv/bin/activate
     - pip install -U pip setuptools wheel
@@ -117,26 +107,19 @@ package-windows-x86_64:
     - pyinstaller pyinstaller/quip_network_node.spec --distpath dist --workpath build/pyinstaller --clean
     - $binary = Get-ChildItem dist/quip-network-node-* | Select-Object -First 1
     - "& $($binary.FullName) --version"
-  after_script:
-    - |
-      Get-ChildItem dist/quip-network-node-* | ForEach-Object {
-        $filename = $_.Name
-        Write-Host "Uploading $filename to Package Registry..."
-        $url = "$env:CI_API_V4_URL/projects/$env:CI_PROJECT_ID/packages/generic/$env:PACKAGE_NAME/$env:PACKAGE_VERSION/$filename"
-        Invoke-RestMethod -Uri $url -Method Put -InFile $_.FullName -Headers @{"JOB-TOKEN"=$env:CI_JOB_TOKEN}
-      }
+    - Get-ChildItem dist/quip-network-node-* | ForEach-Object { Write-Host "$($_.Name): $([math]::Round($_.Length/1MB, 1)) MB" }
+  artifacts:
+    paths:
+      - dist/quip-network-node-*.exe
+    expire_in: 30 days
 
 release-binaries:
   stage: release
-  image: alpine:latest
   needs:
     - package-macos-arm64
     - package-macos-x86_64
     - package-linux-x86_64
     - package-windows-x86_64
-  variables:
-    PACKAGE_NAME: quip-network-node
-    PACKAGE_REGISTRY_URL: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}"
   rules:
     - if: $CI_COMMIT_TAG
   script:
@@ -147,14 +130,14 @@ release-binaries:
     assets:
       links:
         - name: quip-network-node-macos-arm64
-          url: "${PACKAGE_REGISTRY_URL}/${CI_COMMIT_TAG}/quip-network-node-macos-arm64"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-macos-arm64?job=package-macos-arm64"
           filepath: /quip-network-node-macos-arm64
         - name: quip-network-node-macos-x86_64
-          url: "${PACKAGE_REGISTRY_URL}/${CI_COMMIT_TAG}/quip-network-node-macos-x86_64"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-macos-x86_64?job=package-macos-x86_64"
           filepath: /quip-network-node-macos-x86_64
         - name: quip-network-node-linux-x86_64
-          url: "${PACKAGE_REGISTRY_URL}/${CI_COMMIT_TAG}/quip-network-node-linux-x86_64"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-linux-x86_64?job=package-linux-x86_64"
           filepath: /quip-network-node-linux-x86_64
         - name: quip-network-node-windows-x86_64.exe
-          url: "${PACKAGE_REGISTRY_URL}/${CI_COMMIT_TAG}/quip-network-node-windows-x86_64.exe"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-windows-x86_64.exe?job=package-windows-x86_64"
           filepath: /quip-network-node-windows-x86_64.exe
