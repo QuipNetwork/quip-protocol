@@ -69,17 +69,30 @@ def _collect_extension_binaries(pkg_name):
     except ImportError:
         return []
     if not hasattr(pkg, "__file__") or pkg.__file__ is None:
-        # Namespace package — try __path__ instead
         if hasattr(pkg, "__path__"):
             search_dirs = list(pkg.__path__)
         else:
             return []
     else:
         search_dirs = [os.path.dirname(pkg.__file__)]
+    # Find the site-packages root to compute correct relative paths
+    # e.g. for dwave.samplers, __path__ = ['.../site-packages/dwave/samplers']
+    # We need dest_dir = 'dwave/samplers/greedy', not 'samplers/greedy'
+    site_root = None
+    top_pkg = pkg_name.split(".")[0]
+    for base in search_dirs:
+        idx = base.replace(os.sep, "/").rfind("/" + top_pkg + "/")
+        if idx >= 0:
+            site_root = base[:idx]
+            break
+        idx = base.replace(os.sep, "/").rfind("/" + top_pkg)
+        if idx >= 0:
+            site_root = base[:idx]
+            break
     exts = (".pyd", ".so")
     result = []
     for base in search_dirs:
-        parent = os.path.dirname(base)
+        parent = site_root if site_root else os.path.dirname(base)
         for root, _dirs, files in os.walk(base):
             for f in files:
                 if any(f.endswith(e) or (e in f) for e in exts):
