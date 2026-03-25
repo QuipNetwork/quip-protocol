@@ -1,5 +1,5 @@
-# GitLab CI/CD for Quip Network Node Docker Images
-# Builds multi-arch (amd64 + arm64) Docker images and PyInstaller binaries
+# GitLab CI/CD for Quip Network Node
+# Docker images (Kaniko) + PyInstaller native binaries
 
 stages:
   - build
@@ -9,8 +9,10 @@ variables:
   CPU_IMAGE: quip-network-node-cpu
   CUDA_IMAGE: quip-network-node-cuda
 
-# Template for Docker image builds using Kaniko
-# No Docker daemon required — builds and pushes from within a container
+# ---------------------------------------------------------------------------
+# Docker image builds (Kaniko — no daemon required)
+# ---------------------------------------------------------------------------
+
 .docker_build:
   stage: build
   image:
@@ -106,12 +108,15 @@ package-windows-x86_64:
   script:
     - pyinstaller pyinstaller/quip_network_node.spec --distpath dist --workpath build/pyinstaller --clean
     - $binary = Get-ChildItem dist/quip-network-node-* | Select-Object -First 1
-    - "& $($binary.FullName) --version"
-    - Get-ChildItem dist/quip-network-node-* | ForEach-Object { Write-Host "$($_.Name): $([math]::Round($_.Length/1MB, 1)) MB" }
+    - '& $($binary.FullName) --version'
   artifacts:
     paths:
       - dist/quip-network-node-*.exe
     expire_in: 30 days
+
+# ---------------------------------------------------------------------------
+# Release (tags only)
+# ---------------------------------------------------------------------------
 
 release-binaries:
   stage: release
