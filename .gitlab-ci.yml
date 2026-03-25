@@ -77,7 +77,7 @@ package-macos-arm64:
   extends: .pyinstaller_build
   tags: [macos, arm64]
   before_script:
-    - python3 -m venv .venv
+    - /opt/homebrew/bin/python3 -m venv .venv
     - source .venv/bin/activate
     - pip install -U pip setuptools wheel
     - pip install pyinstaller
@@ -87,7 +87,7 @@ package-macos-x86_64:
   extends: .pyinstaller_build
   tags: [macos, x86_64]
   before_script:
-    - python3 -m venv .venv
+    - /opt/homebrew/bin/python3 -m venv .venv
     - source .venv/bin/activate
     - pip install -U pip setuptools wheel
     - pip install pyinstaller
