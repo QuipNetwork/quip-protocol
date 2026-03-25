@@ -131,6 +131,23 @@ if _sp:
                 extra_binaries.append((dll, pkg_prefix))
                 print(f"  vendored lib: {os.path.basename(dll)} -> {pkg_prefix}")
 
+# On Windows, bundle MSVCP140.dll — required by dwave C++ extensions and CuPy.
+# PyInstaller excludes it by default but the frozen binary needs it.
+if platform.system() == "Windows":
+    import ctypes.util
+    for dll_name in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
+        dll_path = ctypes.util.find_library(dll_name)
+        if dll_path is None:
+            # Try common locations
+            for search_dir in (os.environ.get("SYSTEMROOT", r"C:\Windows"), r"C:\Windows\System32"):
+                candidate = os.path.join(search_dir, dll_name)
+                if os.path.isfile(candidate):
+                    dll_path = candidate
+                    break
+        if dll_path and os.path.isfile(dll_path):
+            extra_binaries.append((dll_path, "."))
+            print(f"  VC++ runtime: {dll_path}")
+
 # Package metadata so importlib.metadata.version("quip-protocol") works
 datas += copy_metadata("quip-protocol")
 
