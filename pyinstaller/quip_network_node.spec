@@ -185,6 +185,25 @@ a = Analysis(
 )
 
 # ---------------------------------------------------------------------------
+# Strip unused CUDA libraries from the bundle to reduce size.
+# The GPU code only uses cp.RawModule (needs cudart + nvrtc).
+# CuPy bundles cublas, cufft, cusparse, cusolver, nccl, cutensor — all unused.
+# ---------------------------------------------------------------------------
+_cuda_keep = {"cudart", "nvrtc"}
+_cuda_strip = {"cublas", "cufft", "cusparse", "cusolver", "curand", "nccl",
+               "cutensor", "cutensormg", "cublaslt", "nvjitlink", "nvfatbin"}
+
+def _is_unwanted_cuda(name):
+    n = name.lower()
+    return any(lib in n for lib in _cuda_strip) and not any(lib in n for lib in _cuda_keep)
+
+_before = len(a.binaries)
+a.binaries = [b for b in a.binaries if not _is_unwanted_cuda(b[0])]
+_removed = _before - len(a.binaries)
+if _removed:
+    print(f"  Stripped {_removed} unused CUDA libraries from bundle")
+
+# ---------------------------------------------------------------------------
 # Platform-aware binary name: quip-network-node-{os}-{arch}
 # ---------------------------------------------------------------------------
 _os_map = {"darwin": "macos", "linux": "linux", "windows": "windows"}
