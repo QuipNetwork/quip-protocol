@@ -48,7 +48,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     openssl tini busybox-static \
     cuda-cudart-12-6 \
-    libnvrtc-12-6 \
+    cuda-nvrtc-12-6 \
     && apt-get install -y --no-install-recommends cuda-mps-12-6 2>/dev/null || true \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/python3 /usr/bin/python
