@@ -115,21 +115,30 @@ for pkg in ("dimod", "minorminer", "dwave.samplers", "dwave.preprocessing"):
         print(f"    {os.path.basename(src)} -> {dest}")
     extra_binaries += found
 
-# Collect vendored .libs directories (e.g. dwave_samplers.libs/*.dll on Windows)
-# These contain C++ runtime DLLs that .pyd extensions depend on
-import site
-_sp = site.getsitepackages()[0] if hasattr(site, "getsitepackages") else None
-if _sp is None:
-    # venv: site-packages is in sys.path
-    import sysconfig
-    _sp = sysconfig.get_path("purelib")
-if _sp:
-    for libs_dir in glob.glob(os.path.join(_sp, "*.libs")):
-        pkg_prefix = os.path.basename(libs_dir)  # e.g. "dwave_samplers.libs"
-        for dll in glob.glob(os.path.join(libs_dir, "*")):
-            if os.path.isfile(dll):
-                extra_binaries.append((dll, pkg_prefix))
-                print(f"  vendored lib: {os.path.basename(dll)} -> {pkg_prefix}")
+# Collect vendored .libs directories (Windows only)
+# Python wheels on Windows vendor C++ deps in <package>.libs/ next to the package dir.
+# e.g. site-packages/dwave_samplers.libs/ contains DLLs that dwave/samplers/*.pyd needs.
+if platform.system() == "Windows":
+    _seen_sp = set()
+    for pkg in ("dimod", "minorminer", "dwave", "numpy", "scipy"):
+        try:
+            _pkg = importlib.import_module(pkg)
+        except ImportError:
+            continue
+        _pkg_paths = getattr(_pkg, "__path__", [])
+        if not _pkg_paths:
+            continue
+        _sp_dir = os.path.dirname(_pkg_paths[0])
+        if _sp_dir in _seen_sp:
+            continue
+        _seen_sp.add(_sp_dir)
+        for libs_dir in glob.glob(os.path.join(_sp_dir, "*.libs")):
+            pkg_prefix = os.path.basename(libs_dir)
+            for dll in os.listdir(libs_dir):
+                full = os.path.join(libs_dir, dll)
+                if os.path.isfile(full):
+                    extra_binaries.append((full, "."))
+                    print(f"  vendored lib: {dll} -> . (from {pkg_prefix})")
 
 # On Windows, bundle MSVCP140.dll — required by dwave C++ extensions and CuPy.
 # PyInstaller excludes it by default but the frozen binary needs it.
