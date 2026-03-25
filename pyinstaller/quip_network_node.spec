@@ -115,6 +115,22 @@ for pkg in ("dimod", "minorminer", "dwave.samplers", "dwave.preprocessing"):
         print(f"    {os.path.basename(src)} -> {dest}")
     extra_binaries += found
 
+# Collect vendored .libs directories (e.g. dwave_samplers.libs/*.dll on Windows)
+# These contain C++ runtime DLLs that .pyd extensions depend on
+import site
+_sp = site.getsitepackages()[0] if hasattr(site, "getsitepackages") else None
+if _sp is None:
+    # venv: site-packages is in sys.path
+    import sysconfig
+    _sp = sysconfig.get_path("purelib")
+if _sp:
+    for libs_dir in glob.glob(os.path.join(_sp, "*.libs")):
+        pkg_prefix = os.path.basename(libs_dir)  # e.g. "dwave_samplers.libs"
+        for dll in glob.glob(os.path.join(libs_dir, "*")):
+            if os.path.isfile(dll):
+                extra_binaries.append((dll, pkg_prefix))
+                print(f"  vendored lib: {os.path.basename(dll)} -> {pkg_prefix}")
+
 # Package metadata so importlib.metadata.version("quip-protocol") works
 datas += copy_metadata("quip-protocol")
 
