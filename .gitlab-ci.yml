@@ -76,9 +76,7 @@ package-macos-arm64:
   extends: .pyinstaller_build
   tags: [macos, arm64]
   before_script:
-    - python3.12 -m venv .venv
-    - source .venv/bin/activate
-    - pip install -U pip setuptools wheel
+    - source ~/gitlab-runner-venv/bin/activate
     - pip install pyinstaller
     - pip install -e ".[metal]"
 
@@ -86,9 +84,7 @@ package-macos-x86_64:
   extends: .pyinstaller_build
   tags: [macos, x86_64]
   before_script:
-    - arch -x86_64 python3.12 -m venv .venv
-    - source .venv/bin/activate
-    - pip install -U pip setuptools wheel
+    - source ~/gitlab-runner-venv-x86/bin/activate
     - pip install pyinstaller
     - pip install -e .
 
