@@ -119,31 +119,23 @@ for pkg in ("dimod", "minorminer", "dwave.samplers", "dwave.preprocessing"):
 # Python wheels on Windows vendor C++ deps in <package>.libs/ next to the package dir.
 # e.g. site-packages/dwave_samplers.libs/ contains DLLs that dwave/samplers/*.pyd needs.
 if platform.system() == "Windows":
-    # Find site-packages by walking sys.path
+    # Collect all vendored DLLs from .libs directories in site-packages.
+    # PyInstaller lists these in "Extra DLL search directories (AddDllDirectory)"
+    # but doesn't bundle them. We need them at runtime for .pyd extensions.
     import sys as _sys
-    _sp_dirs = set()
     for p in _sys.path:
-        if "site-packages" in p and os.path.isdir(p):
-            _sp_dirs.add(p)
-    # Also check relative to known packages
-    for pkg in ("dimod", "dwave", "numpy"):
-        try:
-            _pkg = importlib.import_module(pkg)
-            for _pp in getattr(_pkg, "__path__", []):
-                _sp_dirs.add(os.path.dirname(_pp))
-            if getattr(_pkg, "__file__", None):
-                _sp_dirs.add(os.path.dirname(os.path.dirname(_pkg.__file__)))
-        except ImportError:
-            pass
-    print(f"  Searching for .libs in: {_sp_dirs}")
-    for _sp_dir in _sp_dirs:
-        for libs_dir in glob.glob(os.path.join(_sp_dir, "*.libs")):
-            pkg_prefix = os.path.basename(libs_dir)
-            for dll in os.listdir(libs_dir):
-                full = os.path.join(libs_dir, dll)
-                if os.path.isfile(full):
-                    extra_binaries.append((full, "."))
-                    print(f"  vendored lib: {dll} -> . (from {pkg_prefix})")
+        if not os.path.isdir(p):
+            continue
+        for entry in os.listdir(p):
+            if entry.endswith(".libs"):
+                libs_dir = os.path.join(p, entry)
+                if not os.path.isdir(libs_dir):
+                    continue
+                for dll in os.listdir(libs_dir):
+                    full = os.path.join(libs_dir, dll)
+                    if os.path.isfile(full):
+                        extra_binaries.append((full, "."))
+                        print(f"  vendored: {dll} (from {entry})")
 
 # On Windows, bundle MSVCP140.dll — required by dwave C++ extensions and CuPy.
 # PyInstaller excludes it by default but the frozen binary needs it.
