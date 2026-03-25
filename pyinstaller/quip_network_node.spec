@@ -106,6 +106,16 @@ def _collect_extension_binaries(pkg_name):
     return result
 
 
+# CUDA library filter — keep only cudart + nvrtc, strip everything else.
+# The GPU code only uses cp.RawModule for custom CUDA kernels.
+_cuda_keep = {"cudart", "nvrtc"}
+_cuda_strip = {"cublas", "cufft", "cusparse", "cusolver", "curand", "nccl",
+               "cutensor", "cutensormg", "cublaslt", "nvjitlink", "nvfatbin"}
+
+def _is_unwanted_cuda(name):
+    n = name.lower()
+    return any(lib in n for lib in _cuda_strip) and not any(lib in n for lib in _cuda_keep)
+
 # Collect compiled extensions from packages with namespace sub-packages
 extra_binaries = []
 for pkg in ("dimod", "minorminer", "dwave.samplers", "dwave.preprocessing"):
@@ -171,19 +181,7 @@ a = Analysis(
     noarchive=False,
 )
 
-# ---------------------------------------------------------------------------
-# Strip unused CUDA libraries from the bundle to reduce size.
-# The GPU code only uses cp.RawModule (needs cudart + nvrtc).
-# CuPy bundles cublas, cufft, cusparse, cusolver, nccl, cutensor — all unused.
-# ---------------------------------------------------------------------------
-_cuda_keep = {"cudart", "nvrtc"}
-_cuda_strip = {"cublas", "cufft", "cusparse", "cusolver", "curand", "nccl",
-               "cutensor", "cutensormg", "cublaslt", "nvjitlink", "nvfatbin"}
-
-def _is_unwanted_cuda(name):
-    n = name.lower()
-    return any(lib in n for lib in _cuda_strip) and not any(lib in n for lib in _cuda_keep)
-
+# Strip unused CUDA libraries that PyInstaller collected during Analysis
 _before = len(a.binaries)
 a.binaries = [b for b in a.binaries if not _is_unwanted_cuda(b[0])]
 _removed = _before - len(a.binaries)
