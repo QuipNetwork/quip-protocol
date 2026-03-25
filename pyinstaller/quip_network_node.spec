@@ -1,0 +1,158 @@
+# -*- mode: python ; coding: utf-8 -*-
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2025 QUIP Protocol Contributors
+
+"""PyInstaller spec for quip-network-node frozen binary."""
+
+import glob
+import importlib
+import os
+import platform
+
+from PyInstaller.utils.hooks import collect_submodules, copy_metadata
+
+block_cipher = None
+proj_root = os.path.abspath(os.path.join(SPECPATH, ".."))
+
+# ---------------------------------------------------------------------------
+# Data files
+# ---------------------------------------------------------------------------
+datas = [
+    # Genesis block configurations
+    (os.path.join(proj_root, "genesis_block.json"), "."),
+    (os.path.join(proj_root, "genesis_block_public.json"), "."),
+    # GPU kernel source files
+    (os.path.join(proj_root, "GPU", "*.cu"), "GPU"),
+    (os.path.join(proj_root, "GPU", "*.metal"), "GPU"),
+    # D-Wave hardware topology graphs
+    (
+        os.path.join(proj_root, "dwave_topologies", "topologies", "*.json.gz"),
+        os.path.join("dwave_topologies", "topologies"),
+    ),
+    # Pre-computed minor embeddings (directory may be empty)
+    (
+        os.path.join(proj_root, "dwave_topologies", "embeddings"),
+        os.path.join("dwave_topologies", "embeddings"),
+    ),
+]
+
+# ---------------------------------------------------------------------------
+# Hidden imports: collect all submodules for packages with dynamic/Cython imports
+# ---------------------------------------------------------------------------
+hiddenimports = []
+# Project packages (conditional imports in GPU/__init__.py, dynamic in miner_worker.py)
+for pkg in ("shared", "CPU", "GPU", "QPU", "dwave_topologies"):
+    hiddenimports += collect_submodules(pkg)
+# D-Wave packages with Cython extensions that static analysis misses
+for pkg in ("dimod", "minorminer", "dwave"):
+    hiddenimports += collect_submodules(pkg)
+# Explicitly dynamic imports (inside function bodies)
+hiddenimports += [
+    "CPU.sa_filtered_miner",
+    "QPU.qpu_time_manager",
+    "tomli",
+]
+# D-Wave ecosystem runtime deps missed by static analysis
+hiddenimports += [
+    "fasteners",
+    "homebase",
+    "plucky",
+    "diskcache",
+    "orjson",
+]
+
+
+def _collect_extension_binaries(pkg_name):
+    """Find all .so/.pyd in a package, including namespace packages without __init__.py."""
+    pkg = importlib.import_module(pkg_name)
+    if not hasattr(pkg, "__file__") or pkg.__file__ is None:
+        return []
+    base = os.path.dirname(pkg.__file__)
+    parent = os.path.dirname(base)
+    ext = ".pyd" if platform.system() == "Windows" else ".so"
+    result = []
+    for so in glob.glob(os.path.join(base, "**/*" + ext), recursive=True):
+        dest_dir = os.path.relpath(os.path.dirname(so), parent)
+        mod_stem = os.path.basename(so).split(".")[0]
+        mod_path = dest_dir.replace(os.sep, ".") + "." + mod_stem
+        result.append((so, dest_dir))
+        if mod_path not in hiddenimports:
+            hiddenimports.append(mod_path)
+    return result
+
+
+# Collect compiled extensions from packages with namespace sub-packages
+extra_binaries = []
+for pkg in ("dimod", "minorminer"):
+    extra_binaries += _collect_extension_binaries(pkg)
+
+# Package metadata so importlib.metadata.version("quip-protocol") works
+datas += copy_metadata("quip-protocol")
+
+# ---------------------------------------------------------------------------
+# Analysis
+# ---------------------------------------------------------------------------
+a = Analysis(
+    [os.path.join(SPECPATH, "boot_network_node.py")],
+    pathex=[proj_root],
+    binaries=extra_binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        "matplotlib",
+        "pandas",
+        "seaborn",
+        "tkinter",
+        "torch",
+        "torchvision",
+        "torchaudio",
+    ],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+# ---------------------------------------------------------------------------
+# Platform-aware binary name: quip-network-node-{os}-{arch}
+# ---------------------------------------------------------------------------
+_os_map = {"darwin": "macos", "linux": "linux", "windows": "windows"}
+_arch_map = {
+    "arm64": "arm64",
+    "aarch64": "arm64",
+    "x86_64": "x86_64",
+    "amd64": "x86_64",
+}
+_os = _os_map.get(platform.system().lower(), platform.system().lower())
+_arch = _arch_map.get(platform.machine().lower(), platform.machine().lower())
+binary_name = f"quip-network-node-{_os}-{_arch}"
+
+# ---------------------------------------------------------------------------
+# Bundle
+# ---------------------------------------------------------------------------
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    [],
+    name=binary_name,
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=True,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)

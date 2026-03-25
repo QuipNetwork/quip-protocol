@@ -60,6 +60,8 @@ build-cuda:
 # Template for PyInstaller builds
 .pyinstaller_build:
   stage: package
+  variables:
+    PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
   script:
     - bash pyinstaller/build.sh
   artifacts:
@@ -74,6 +76,8 @@ package-macos-arm64:
   extends: .pyinstaller_build
   tags: [macos, arm64]
   before_script:
+    - python3 -m venv .venv
+    - source .venv/bin/activate
     - pip install pyinstaller
     - pip install -e ".[metal]"
 
@@ -81,6 +85,8 @@ package-macos-x86_64:
   extends: .pyinstaller_build
   tags: [macos, x86_64]
   before_script:
+    - python3 -m venv .venv
+    - source .venv/bin/activate
     - pip install pyinstaller
     - pip install -e .
 
@@ -96,6 +102,8 @@ package-windows-x86_64:
   extends: .pyinstaller_build
   tags: [windows, x86_64]
   before_script:
+    - python -m venv .venv
+    - .venv\Scripts\activate
     - pip install pyinstaller
     - pip install -e ".[cuda]"
   artifacts:
