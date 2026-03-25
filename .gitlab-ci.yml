@@ -118,14 +118,12 @@ package-windows-x86_64:
     - $binary = Get-ChildItem dist/quip-network-node-* | Select-Object -First 1
     - "& $($binary.FullName) --version"
   after_script:
-    - $env:Path = "D:\GitLab-Runner\venv\Scripts;C:\Program Files\Git\cmd;" + $env:Path
     - |
       Get-ChildItem dist/quip-network-node-* | ForEach-Object {
         $filename = $_.Name
         Write-Host "Uploading $filename to Package Registry..."
-        curl.exe --header "JOB-TOKEN: $env:CI_JOB_TOKEN" `
-             --upload-file $_.FullName `
-             "$env:CI_API_V4_URL/projects/$env:CI_PROJECT_ID/packages/generic/$env:PACKAGE_NAME/$env:PACKAGE_VERSION/$filename"
+        $url = "$env:CI_API_V4_URL/projects/$env:CI_PROJECT_ID/packages/generic/$env:PACKAGE_NAME/$env:PACKAGE_VERSION/$filename"
+        Invoke-RestMethod -Uri $url -Method Put -InFile $_.FullName -Headers @{"JOB-TOKEN"=$env:CI_JOB_TOKEN}
       }
 
 release-binaries:

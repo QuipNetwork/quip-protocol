@@ -64,20 +64,32 @@ hiddenimports += [
 
 def _collect_extension_binaries(pkg_name):
     """Find all .so/.pyd in a package, including namespace packages without __init__.py."""
-    pkg = importlib.import_module(pkg_name)
-    if not hasattr(pkg, "__file__") or pkg.__file__ is None:
+    try:
+        pkg = importlib.import_module(pkg_name)
+    except ImportError:
         return []
-    base = os.path.dirname(pkg.__file__)
-    parent = os.path.dirname(base)
-    ext = ".pyd" if platform.system() == "Windows" else ".so"
+    if not hasattr(pkg, "__file__") or pkg.__file__ is None:
+        # Namespace package — try __path__ instead
+        if hasattr(pkg, "__path__"):
+            search_dirs = list(pkg.__path__)
+        else:
+            return []
+    else:
+        search_dirs = [os.path.dirname(pkg.__file__)]
+    exts = (".pyd", ".so")
     result = []
-    for so in glob.glob(os.path.join(base, "**/*" + ext), recursive=True):
-        dest_dir = os.path.relpath(os.path.dirname(so), parent)
-        mod_stem = os.path.basename(so).split(".")[0]
-        mod_path = dest_dir.replace(os.sep, ".") + "." + mod_stem
-        result.append((so, dest_dir))
-        if mod_path not in hiddenimports:
-            hiddenimports.append(mod_path)
+    for base in search_dirs:
+        parent = os.path.dirname(base)
+        for root, _dirs, files in os.walk(base):
+            for f in files:
+                if any(f.endswith(e) or (e in f) for e in exts):
+                    full = os.path.join(root, f)
+                    dest_dir = os.path.relpath(root, parent)
+                    mod_stem = f.split(".")[0]
+                    mod_path = dest_dir.replace(os.sep, ".") + "." + mod_stem
+                    result.append((full, dest_dir))
+                    if mod_path not in hiddenimports:
+                        hiddenimports.append(mod_path)
     return result
 
 
