@@ -76,8 +76,9 @@ package-macos-arm64:
   extends: .pyinstaller_build
   tags: [macos, arm64]
   before_script:
-    - python3 -m venv .venv
+    - python3.12 -m venv .venv
     - source .venv/bin/activate
+    - pip install -U pip setuptools wheel
     - pip install pyinstaller
     - pip install -e ".[metal]"
 
@@ -85,8 +86,9 @@ package-macos-x86_64:
   extends: .pyinstaller_build
   tags: [macos, x86_64]
   before_script:
-    - python3 -m venv .venv
+    - arch -x86_64 python3.12 -m venv .venv
     - source .venv/bin/activate
+    - pip install -U pip setuptools wheel
     - pip install pyinstaller
     - pip install -e .
 
@@ -102,8 +104,10 @@ package-windows-x86_64:
   extends: .pyinstaller_build
   tags: [windows, x86_64]
   before_script:
+    - $env:Path = "C:\Program Files\Git\cmd;C:\Python312\Scripts;C:\Python312;$env:Path"
     - python -m venv .venv
-    - .venv\Scripts\activate
+    - .\.venv\Scripts\Activate.ps1
+    - pip install -U pip setuptools wheel
     - pip install pyinstaller
     - pip install -e ".[cuda]"
   artifacts:
