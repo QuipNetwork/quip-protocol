@@ -118,41 +118,28 @@ for pkg in ("dimod", "minorminer", "dwave.samplers", "dwave.preprocessing"):
 # Collect vendored .libs directories (Windows only)
 # Python wheels on Windows vendor C++ deps in <package>.libs/ next to the package dir.
 # e.g. site-packages/dwave_samplers.libs/ contains DLLs that dwave/samplers/*.pyd needs.
+# On Windows, bundle only the vendored DLLs that dwave/minorminer .pyd files need.
+# Skip numpy.libs/scipy.libs (huge OpenBLAS) — numpy/scipy work without them in
+# the frozen binary because PyInstaller bundles the .pyd files directly.
+# Also skip VC++ runtime (msvcp140.dll etc.) — present on every Windows machine
+# with the VC++ Redistributable installed (required prerequisite).
 if platform.system() == "Windows":
-    # Collect all vendored DLLs from .libs directories in site-packages.
-    # PyInstaller lists these in "Extra DLL search directories (AddDllDirectory)"
-    # but doesn't bundle them. We need them at runtime for .pyd extensions.
+    _needed_libs = {"dwave_samplers.libs", "dwave_preprocessing.libs",
+                    "dimod.libs", "minorminer.libs"}
     import sys as _sys
     for p in _sys.path:
         if not os.path.isdir(p):
             continue
         for entry in os.listdir(p):
-            if entry.endswith(".libs"):
+            if entry in _needed_libs:
                 libs_dir = os.path.join(p, entry)
                 if not os.path.isdir(libs_dir):
                     continue
                 for dll in os.listdir(libs_dir):
                     full = os.path.join(libs_dir, dll)
-                    if os.path.isfile(full):
+                    if os.path.isfile(full) and not _is_unwanted_cuda(dll):
                         extra_binaries.append((full, "."))
                         print(f"  vendored: {dll} (from {entry})")
-
-# On Windows, bundle MSVCP140.dll — required by dwave C++ extensions and CuPy.
-# PyInstaller excludes it by default but the frozen binary needs it.
-if platform.system() == "Windows":
-    import ctypes.util
-    for dll_name in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
-        dll_path = ctypes.util.find_library(dll_name)
-        if dll_path is None:
-            # Try common locations
-            for search_dir in (os.environ.get("SYSTEMROOT", r"C:\Windows"), r"C:\Windows\System32"):
-                candidate = os.path.join(search_dir, dll_name)
-                if os.path.isfile(candidate):
-                    dll_path = candidate
-                    break
-        if dll_path and os.path.isfile(dll_path):
-            extra_binaries.append((dll_path, "."))
-            print(f"  VC++ runtime: {dll_path}")
 
 # Package metadata so importlib.metadata.version("quip-protocol") works
 datas += copy_metadata("quip-protocol")
