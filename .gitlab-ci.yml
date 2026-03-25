@@ -111,6 +111,10 @@ package-windows-x86_64:
     - python -m pip install -U pip setuptools wheel
     - python -m pip install pyinstaller
     - python -m pip install -e ".[cuda]"
+  script:
+    - pyinstaller pyinstaller/quip_network_node.spec --distpath dist --workpath build/pyinstaller --clean
+    - $binary = Get-ChildItem dist/quip-network-node-* | Select-Object -First 1
+    - "& $($binary.FullName) --version"
   artifacts:
     paths:
       - dist/quip-network-node-*.exe
