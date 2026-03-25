@@ -90,9 +90,13 @@ package-macos-x86_64:
 
 package-linux-x86_64:
   extends: .pyinstaller_build
-  image: python:3.12-bookworm
+  image: nvidia/cuda:12.8.1-devel-ubuntu24.04
   tags: [linux, x86_64]
   before_script:
+    - apt-get update && apt-get install -y python3 python3-pip python3-venv
+    - python3 -m venv .venv
+    - source .venv/bin/activate
+    - pip install -U pip setuptools wheel
     - pip install pyinstaller
     - pip install -e ".[cuda]"
 
