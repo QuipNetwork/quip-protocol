@@ -7,24 +7,20 @@ stages:
   - release
 
 variables:
-  DOCKER_TLS_CERTDIR: "/certs"
   CPU_IMAGE: quip-network-node-cpu
   CUDA_IMAGE: quip-network-node-cuda
 
-# Template for Docker buildx builds
+# Template for Docker buildx builds (no DinD required)
+# Uses QEMU for cross-platform arm64 builds on amd64 runner
 .docker_build:
   image: docker:24
-  services:
-    - docker:24-dind
+  tags: [linux, amd64]
   before_script:
     - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
-    - |
-      docker context create ci-ctx \
-        --docker "host=${DOCKER_HOST:-tcp://docker:2376},ca=${DOCKER_TLS_CERTDIR}/client/ca.pem,cert=${DOCKER_TLS_CERTDIR}/client/cert.pem,key=${DOCKER_TLS_CERTDIR}/client/key.pem"
-    - docker buildx create --use --name multiarch-builder ci-ctx
+    - docker run --rm --privileged tonistiigi/binfmt --install arm64
+    - docker buildx create --use --name builder --driver docker-container
     - docker buildx inspect --bootstrap
 
-# Build and push CPU network node image (amd64 + arm64)
 build-cpu:
   extends: .docker_build
   stage: build
@@ -39,7 +35,6 @@ build-cpu:
     - tags
     - /^v\d+/
 
-# Build and push CUDA network node image (amd64 + arm64)
 build-cuda:
   extends: .docker_build
   stage: build

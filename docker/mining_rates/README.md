@@ -47,7 +47,7 @@ sudo apt-get install -y nvidia-docker2
 sudo systemctl restart docker
 
 # Test
-docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.6.3-base-ubuntu22.04 nvidia-smi
 ```
 
 **Amazon Linux 2:**
@@ -246,7 +246,7 @@ docker run --rm \
 **Error: "could not select device driver"**
 ```bash
 # Verify NVIDIA runtime is installed
-docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.6.3-base-ubuntu22.04 nvidia-smi
 
 # Check Docker daemon.json
 cat /etc/docker/daemon.json

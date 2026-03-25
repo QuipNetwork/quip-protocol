@@ -1,17 +1,12 @@
 # Akash-optimized Dockerfile for CUDA mining
-# Uses CUDA 11.8 with Ubuntu 22.04 for good driver compatibility (520+)
+# Uses CUDA 12.6 with Ubuntu 22.04 (driver 525+)
 # Ubuntu 22.04 has Python 3.10 built in (no PPA needed)
 # Optimized for minimal size (~2GB vs 5GB+)
-#
-# Driver compatibility:
-#   CUDA 11.2 = driver 450+
-#   CUDA 11.8 = driver 520+  (GOOD - works on most modern providers)
-#   CUDA 12.x = driver 525+
 
 # =============================================================================
 # Stage 1: Builder - Install Python packages with build dependencies
 # =============================================================================
-FROM nvidia/cuda:11.8.0-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:12.6.3-devel-ubuntu22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -58,7 +53,7 @@ RUN rm -rf /root/.cache/pip && \
 # =============================================================================
 # Use 'runtime' image - includes cuBLAS, cuFFT, cuSPARSE, cuSOLVER, cuRAND
 # (base only has libcudart, which is insufficient for CuPy)
-FROM nvidia/cuda:11.8.0-runtime-ubuntu22.04 AS runtime
+FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04 AS runtime
 
 LABEL maintainer="Quip Protocol"
 LABEL description="CUDA GPU miner for Akash (optimized, ~2GB)"

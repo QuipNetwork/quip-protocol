@@ -176,7 +176,7 @@ On first run, the entrypoint copies the template to `/data/config.toml` and gene
 **GPU not detected:**
 ```bash
 # Verify NVIDIA runtime
-docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.6.3-base-ubuntu22.04 nvidia-smi
 ```
 
 ---
