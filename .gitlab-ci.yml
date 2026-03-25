@@ -10,16 +10,13 @@ variables:
   CPU_IMAGE: quip-network-node-cpu
   CUDA_IMAGE: quip-network-node-cuda
 
-# Template for Docker buildx builds (DinD for daemon access)
-# Uses QEMU for cross-platform arm64 builds on amd64 runner
+# Template for Docker buildx builds
+# Requires runner config: volumes = ["/var/run/docker.sock:/var/run/docker.sock"]
 .docker_build:
   image: docker:24
-  services:
-    - docker:24-dind
   tags: [linux, amd64]
   variables:
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
+    DOCKER_HOST: unix:///var/run/docker.sock
   before_script:
     - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
     - docker run --rm --privileged tonistiigi/binfmt --install arm64
