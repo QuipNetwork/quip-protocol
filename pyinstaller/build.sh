@@ -28,4 +28,5 @@ if [ -z "$BINARY" ]; then
 fi
 
 "$BINARY" --version
+ls -lh "$BINARY"
 echo "OK: $BINARY"
