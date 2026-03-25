@@ -105,6 +105,7 @@ package-windows-x86_64:
   extends: .pyinstaller_build
   tags: [windows, x86_64]
   before_script:
+    - $env:Path = "D:\GitLab-Runner\venv\Scripts;C:\Program Files\Git\cmd;" + $env:Path
     - python -m venv .venv
     - .\.venv\Scripts\Activate.ps1
     - pip install -U pip setuptools wheel
