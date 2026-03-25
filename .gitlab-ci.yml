@@ -10,46 +10,39 @@ variables:
   CPU_IMAGE: quip-network-node-cpu
   CUDA_IMAGE: quip-network-node-cuda
 
-# Template for Docker buildx builds
-# Requires runner config: volumes = ["/var/run/docker.sock:/var/run/docker.sock"]
+# Template for Docker image builds using Kaniko
+# No Docker daemon required — builds and pushes from within a container
 .docker_build:
-  image: docker:24
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
   tags: [linux, amd64]
-  variables:
-    DOCKER_HOST: unix:///var/run/docker.sock
   before_script:
-    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
-    - docker run --rm --privileged tonistiigi/binfmt --install arm64
-    - docker buildx create --use --name builder --driver docker-container
-    - docker buildx inspect --bootstrap
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(echo -n ${CI_REGISTRY_USER}:${CI_REGISTRY_PASSWORD} | base64)\"}}}" > /kaniko/.docker/config.json
+  only:
+    - main
+    - tags
+    - /^v\d+/
 
 build-cpu:
   extends: .docker_build
-  stage: build
   script:
-    - docker buildx build --platform linux/amd64,linux/arm64
-        -f docker/Dockerfile.cpu
-        -t $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
-        -t $CI_REGISTRY_IMAGE/$CPU_IMAGE:latest
-        --push .
-  only:
-    - main
-    - tags
-    - /^v\d+/
+    - /kaniko/executor
+        --context $CI_PROJECT_DIR
+        --dockerfile docker/Dockerfile.cpu
+        --destination $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
+        --destination $CI_REGISTRY_IMAGE/$CPU_IMAGE:latest
 
 build-cuda:
   extends: .docker_build
-  stage: build
   script:
-    - docker buildx build --platform linux/amd64,linux/arm64
-        -f docker/Dockerfile.cuda
-        -t $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA
-        -t $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
-        --push .
-  only:
-    - main
-    - tags
-    - /^v\d+/
+    - /kaniko/executor
+        --context $CI_PROJECT_DIR
+        --dockerfile docker/Dockerfile.cuda
+        --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA
+        --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
 
 # ---------------------------------------------------------------------------
 # PyInstaller native binaries (package stage, tags only)
