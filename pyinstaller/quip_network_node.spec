@@ -83,7 +83,7 @@ def _collect_extension_binaries(pkg_name):
 
 # Collect compiled extensions from packages with namespace sub-packages
 extra_binaries = []
-for pkg in ("dimod", "minorminer"):
+for pkg in ("dimod", "minorminer", "dwave.samplers", "dwave.preprocessing"):
     extra_binaries += _collect_extension_binaries(pkg)
 
 # Package metadata so importlib.metadata.version("quip-protocol") works
