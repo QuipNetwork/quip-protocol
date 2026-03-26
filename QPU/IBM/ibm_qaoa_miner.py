@@ -17,13 +17,12 @@ import multiprocessing.synchronize
 import random
 import signal
 import sys
-import threading
 import time
 from typing import Optional, Dict, Tuple, Any, List
 
 init_logger = logging.getLogger(__name__)
 
-from .ibm_qaoa_solver import QAOASolverWrapper, QAOAFuture
+from QPU.IBM.ibm_qaoa_solver import QAOASolverWrapper, QAOAFuture
 from shared.base_miner import BaseMiner, MiningResult
 from shared.quantum_proof_of_work import (
     ising_nonce_from_block,
@@ -103,12 +102,6 @@ class IBMQAOAMiner(BaseMiner):
         # Current async job (at most one in-flight at a time)
         self._current_future: Optional[QAOAFuture] = None
 
-        # Threading event passed into QAOA optimizer for mid-solve cancellation
-        # We bridge multiprocessing.Event → threading.Event because the QAOA
-        # solver runs in-process and scipy.optimize uses threading, not
-        # multiprocessing.
-        self._thread_stop: Optional[threading.Event] = None
-
         # Register SIGTERM handler for graceful cleanup
         signal.signal(signal.SIGTERM, self._cleanup_handler)
 
@@ -120,18 +113,10 @@ class IBMQAOAMiner(BaseMiner):
             )
 
         try:
-            # Signal the optimizer loop to stop
-            if self._thread_stop is not None:
-                self._thread_stop.set()
-
             # Cancel in-flight future
             if self._current_future is not None:
                 self._current_future.cancel()
                 self._current_future = None
-
-            # Shut down solver thread pool
-            if hasattr(self, 'sampler') and hasattr(self.sampler, 'close'):
-                self.sampler.close()
 
             # Clear cached attempts
             if hasattr(self, 'top_attempts'):
@@ -142,27 +127,6 @@ class IBMQAOAMiner(BaseMiner):
                 self.logger.error(f"Error during QAOA miner cleanup: {e}")
 
         sys.exit(0)
-
-    def _bridge_stop_event(
-        self, mp_event: multiprocessing.synchronize.Event
-    ):
-        """Create a threading.Event that mirrors the multiprocessing.Event.
-
-        The QAOA optimizer runs in-process (not in a subprocess), so it needs
-        a threading.Event for cooperative cancellation.  We poll the
-        multiprocessing.Event in the mining loop and propagate it.
-        """
-        self._thread_stop = threading.Event()
-        thread_stop = self._thread_stop  # local ref for closure (avoids Optional check)
-
-        def _monitor():
-            while not mp_event.is_set() and not thread_stop.is_set():
-                time.sleep(0.1)
-            # Propagate stop signal
-            thread_stop.set()
-
-        monitor = threading.Thread(target=_monitor, daemon=True)
-        monitor.start()
 
     def mine_block(
         self,
@@ -202,9 +166,6 @@ class IBMQAOAMiner(BaseMiner):
 
         cur_index = prev_block.header.index + 1
         self.current_round_attempted = True
-
-        # Bridge multiprocessing stop → threading stop for QAOA optimizer
-        self._bridge_stop_event(stop_event)
 
         # Apply difficulty decay
         current_requirements = compute_current_requirements(
@@ -246,14 +207,8 @@ class IBMQAOAMiner(BaseMiner):
                 f"nonce={nonce}, salt={salt.hex()[:8]}..."
             )
 
-            # Reset thread stop for this solve
-            if self._thread_stop is not None:
-                # Don't clear if mp stop_event already set
-                if not stop_event.is_set():
-                    self._thread_stop.clear()
-
             self._current_future = self.sampler.solve_ising_async(
-                h, J, stop_event=self._thread_stop, params=params
+                h, J, stop_event=stop_event, params=params
             )
             future = self._current_future  # local ref avoids Optional checks
 
@@ -307,8 +262,6 @@ class IBMQAOAMiner(BaseMiner):
                                     f"in-progress solve."
                                 )
                                 future.cancel()
-                                if self._thread_stop is not None:
-                                    self._thread_stop.set()
                                 return result
 
                 time.sleep(0.2)  # 200ms polling interval

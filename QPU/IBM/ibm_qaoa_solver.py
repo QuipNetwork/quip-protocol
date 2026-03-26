@@ -7,9 +7,8 @@ result conversion) behind a simple (h, J) → dimod.SampleSet interface.
 from __future__ import annotations
 
 import logging
-import threading
+import multiprocessing
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any, cast
 
@@ -123,46 +122,100 @@ class _OptResult:
 # ---------------------------------------------------------------------------
 
 class QAOAFuture:
-    """Future-like object for asynchronous QAOA execution.
+    """Future-like object for asynchronous QAOA execution via multiprocessing.
 
-    Mirrors the interface of dwave_sampler.EmbeddedFuture so that the miner
-    can use a consistent polling pattern.
+    Wraps a multiprocessing.Process and Queue to provide the same polling
+    interface as dwave_sampler.EmbeddedFuture, so the miner can use a
+    consistent pattern.
     """
 
-    def __init__(self, future: Future, solve_start: float):
-        self._future = future
+    def __init__(
+        self,
+        process: multiprocessing.Process,
+        result_queue: multiprocessing.Queue,
+        solve_start: float,
+    ):
+        self._process = process
+        self._result_queue = result_queue
         self._solve_start = solve_start
-        self._cancelled = False
+        self._result: Optional[dimod.SampleSet] = None
+        self._done = False
 
     @property
     def sampleset(self) -> Optional[dimod.SampleSet]:
         """Block until the QAOA solve completes and return the SampleSet.
 
-        Returns None if the solve was interrupted.
+        Returns None if the solve was interrupted or terminated.
         """
-        return self._future.result()
+        if not self._done:
+            self._result = self._result_queue.get()
+            self._process.join()
+            self._done = True
+        return self._result
 
     def done(self) -> bool:
-        return self._future.done()
+        if self._done:
+            return True
+        if not self._result_queue.empty():
+            return True
+        return not self._process.is_alive()
 
     def cancel(self) -> bool:
-        self._cancelled = True
-        return self._future.cancel()
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=2)
+        self._done = True
+        return True
 
     def wait(self, timeout: Optional[float] = None):
-        self._future.result(timeout=timeout)
+        self._process.join(timeout=timeout)
 
     @property
     def elapsed(self) -> float:
         return time.time() - self._solve_start
 
     def __hash__(self):
-        return id(self._future)
+        return id(self._process)
 
     def __eq__(self, other):
         if isinstance(other, QAOAFuture):
-            return self._future is other._future
+            return self._process is other._process
         return False
+
+
+# ---------------------------------------------------------------------------
+# Module-level solve function for multiprocessing
+# ---------------------------------------------------------------------------
+
+def _qaoa_solve_in_process(
+    solver_config: Dict[str, Any],
+    h: Dict[int, float],
+    J: Dict[Tuple[int, int], float],
+    stop_event,
+    params: Optional[Dict[str, Any]],
+    result_queue: multiprocessing.Queue,
+):
+    """Run a QAOA solve in a child process.
+
+    This is a module-level function (not a method) so that
+    multiprocessing.Process can pickle it.  A fresh QAOASolverWrapper is
+    constructed from ``solver_config`` inside the child process.
+
+    Args:
+        solver_config: Serializable kwargs for QAOASolverWrapper.__init__.
+        h: Linear biases.
+        J: Quadratic biases.
+        stop_event: multiprocessing.Event for cooperative cancellation.
+        params: Per-solve parameter overrides (p, shots, etc.).
+        result_queue: Queue to send the resulting SampleSet (or None) back.
+    """
+    try:
+        solver = QAOASolverWrapper(**solver_config)
+        sampleset = solver.solve_ising(h, J, stop_event=stop_event, params=params)
+        result_queue.put(sampleset)
+    except Exception as e:
+        logger.error(f"[QAOA] Process solve failed: {e}")
+        result_queue.put(None)
 
 
 # ---------------------------------------------------------------------------
@@ -245,11 +298,6 @@ class QAOASolverWrapper:
         if optimizer_options:
             default_opts.update(optimizer_options)
         self.optimizer_options = default_opts
-
-        # Thread pool for async solves (1 worker — sequential mining loop
-        # submits at most one solve at a time; using >1 would require
-        # removing per-solve instance state like _current_h, _solve_shots)
-        self._executor = ThreadPoolExecutor(max_workers=1)
 
         # Expose sampler-like properties for BaseMiner compatibility
         self.sampler_type = "qaoa"
@@ -353,14 +401,14 @@ class QAOASolverWrapper:
     def _optimize(
         self,
         circuit: Any,
-        stop_event: Optional[threading.Event] = None,
+        stop_event: Optional[Any] = None,
         optimizer_options: Optional[Dict[str, Any]] = None,
     ) -> Optional[np.ndarray]:
         """Run the classical optimizer to find optimal QAOA angles.
 
         Args:
             circuit: Transpiled QAOA circuit.
-            stop_event: Threading event for cooperative cancellation.
+            stop_event: Event for cooperative cancellation.
             optimizer_options: Per-solve optimizer options (may override __init__ defaults).
 
         Returns the best parameter vector, or None if interrupted.
@@ -489,7 +537,7 @@ class QAOASolverWrapper:
         self,
         h: Dict[int, float],
         J: Dict[Tuple[int, int], float],
-        stop_event: Optional[threading.Event] = None,
+        stop_event: Optional[Any] = None,
         params: Optional[Dict[str, Any]] = None,
     ) -> Optional[dimod.SampleSet]:
         """Synchronous QAOA solve:  (h, J) → dimod.SampleSet.
@@ -500,7 +548,7 @@ class QAOASolverWrapper:
         Args:
             h: Linear biases (field parameters).
             J: Quadratic biases (coupling parameters).
-            stop_event: Threading event for cooperative cancellation.
+            stop_event: multiprocessing.Event for cooperative cancellation.
             params: Optional per-solve parameter overrides from adapt_parameters().
                    Keys: 'p', 'shots', 'final_shots', 'max_iter'.
                    If None, uses the values set during __init__.
@@ -527,21 +575,30 @@ class QAOASolverWrapper:
         self._solve_final_shots = final_shots
 
         # 1. Build cost Hamiltonian
+        logger.info("[QAOA] Step 1/5: Building cost Hamiltonian (h,J → SparsePauliOp)")
         cost_op = self._build_cost_operator(h, J)
 
         # 2. Build & transpile QAOA circuit (p may differ per solve)
+        logger.info(f"[QAOA] Step 2/5: Building QAOA circuit (p={p})")
         circuit = self._build_circuit(cost_op, p=p)
+        logger.info(f"[QAOA] Step 3/5: Transpiling circuit for backend")
         circuit = self._transpile(circuit)
 
-        # 3. Variational optimization
+        # 4. Variational optimization
+        logger.info(
+            f"[QAOA] Step 4/5: Variational optimization "
+            f"({self.optimizer_name}, max_iter={optimizer_options.get('maxiter', '?')}, "
+            f"{shots} shots/eval)"
+        )
         best_params = self._optimize(circuit, stop_event, optimizer_options=optimizer_options)
         if best_params is None:
             return None  # interrupted
 
-        # 4. Final sampling with optimized angles
+        # 5. Final sampling with optimized angles
+        logger.info(f"[QAOA] Step 5/5: Final sampling ({final_shots} shots)")
         counts = self._final_sample(circuit, best_params)
 
-        # 5. Convert to dimod.SampleSet
+        # Convert to dimod.SampleSet
         sampleset = self._counts_to_sampleset(counts, h, J)
 
         solve_time = time.time() - solve_start
@@ -552,32 +609,56 @@ class QAOASolverWrapper:
         )
         return sampleset
 
+    def _get_solver_config(self) -> Dict[str, Any]:
+        """Return a serializable config dict to reconstruct this solver.
+
+        Used by solve_ising_async to create a fresh solver instance inside
+        a child process.  The backend is passed as None so the child
+        constructs its own AerSimulator (the backend object itself is not
+        reliably picklable).
+        """
+        return {
+            'nodes': self.nodes,
+            'edges': self.edges,
+            'backend': None,  # child process creates its own AerSimulator
+            'p': self.p,
+            'optimizer': self.optimizer_name,
+            'shots': self.shots,
+            'final_shots': self.final_shots,
+            'optimizer_options': self.optimizer_options.copy(),
+            'optimization_level': self.optimization_level,
+        }
+
     def solve_ising_async(
         self,
         h: Dict[int, float],
         J: Dict[Tuple[int, int], float],
-        stop_event: Optional[threading.Event] = None,
+        stop_event: Optional[Any] = None,
         params: Optional[Dict[str, Any]] = None,
     ) -> QAOAFuture:
         """Asynchronous QAOA solve — returns a QAOAFuture immediately.
 
-        The solve runs in a background thread.  Access future.sampleset
-        to block until the result is ready.
+        The solve runs in a child process via multiprocessing.Process,
+        giving it its own GIL for true parallelism.  The stop_event
+        (a multiprocessing.Event) passes natively to the child.
 
         Args:
             h: Linear biases (field parameters).
             J: Quadratic biases (coupling parameters).
-            stop_event: Threading event for cooperative cancellation.
+            stop_event: multiprocessing.Event for cooperative cancellation.
             params: Optional per-solve parameter overrides from adapt_parameters().
         """
         solve_start = time.time()
 
-        future = self._executor.submit(
-            self.solve_ising, h, J, stop_event, params
+        result_queue: multiprocessing.Queue = multiprocessing.Queue()
+        process = multiprocessing.Process(
+            target=_qaoa_solve_in_process,
+            args=(self._get_solver_config(), h, J, stop_event, params, result_queue),
         )
+        process.start()
 
-        return QAOAFuture(future=future, solve_start=solve_start)
-
-    def close(self):
-        """Shut down the thread pool."""
-        self._executor.shutdown(wait=False)
+        return QAOAFuture(
+            process=process,
+            result_queue=result_queue,
+            solve_start=solve_start,
+        )
