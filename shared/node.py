@@ -397,10 +397,19 @@ class Node:
         """Get the latest block from the blockchain."""
         return self.chain[-1]
 
-    def _find_block_by_hash(self, target_hash: bytes) -> Optional[Block]:
-        """Search chain backward for a block with matching hash (for reorg)."""
-        # Search last 6 blocks
-        for i in range(len(self.chain) - 1, max(0, len(self.chain) - 7), -1):
+    def _find_block_by_hash(
+        self, target_hash: bytes, full_search: bool = False
+    ) -> Optional[Block]:
+        """Search chain backward for a block with matching hash.
+
+        Args:
+            target_hash: Hash to search for.
+            full_search: If True, search the entire chain (used during
+                sync to resolve deep forks). If False, search only the
+                last 6 blocks (used for normal gossip reorgs).
+        """
+        stop = 0 if full_search else max(0, len(self.chain) - 7)
+        for i in range(len(self.chain) - 1, stop, -1):
             if self.chain[i].hash == target_hash:
                 return self.chain[i]
         return None
@@ -464,7 +473,7 @@ class Node:
         if not head.hash and head.header.index > 0:
             raise RuntimeError("Head block is not finalized!")
     
-        if head.header.index > block.header.index + 6:
+        if not force_reorg and head.header.index > block.header.index + 6:
             reason = f"too old (chain is at {head.header.index}, block is {block.header.index})"
             self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: we have more than 6 blocks after it ({head.header.index} > {block.header.index + 6})")
             return False, reason
@@ -477,8 +486,11 @@ class Node:
 
         if prev_block.hash != block.header.previous_hash:
             if force_reorg:
-                # Search backward for common ancestor during reorg
-                ancestor = self._find_block_by_hash(block.header.previous_hash)
+                # During sync, search the entire chain for the ancestor
+                # to resolve deep forks (e.g., node mined while disconnected)
+                ancestor = self._find_block_by_hash(
+                    block.header.previous_hash, full_search=True
+                )
                 if ancestor is not None:
                     self.logger.info(
                         f"Reorg: common ancestor at block {ancestor.header.index}, "
@@ -492,7 +504,7 @@ class Node:
                     reason = f"cannot find ancestor with hash {block.header.previous_hash.hex()[:8]}"
                     self.logger.error(
                         f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: cannot find ancestor "
-                        f"with hash {block.header.previous_hash.hex()[:8]} in last 6 blocks"
+                        f"with hash {block.header.previous_hash.hex()[:8]} in chain"
                     )
                     return False, reason
             else:

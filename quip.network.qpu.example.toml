@@ -16,8 +16,8 @@ secret = "your-secret-here" # Used to generate a deterministic key pair for this
 # auto_mine = true
 
 
-# Peers to try and connect to, defaults to "nodes.quip.network:20049"
-# peer = ["nodes.quip.network:20049", "peer2.quip.network:20049"]
+# Peers to try and connect to (defaults shown below)
+# peer = ["qpu-1.nodes.quip.network:20049", "cpu-1.quip.carback.us:20049", "gpu-1.quip.carback.us:20049", "gpu-2.quip.carback.us:20050", "nodes.quip.network:20049"]
 
 timeout = 3  # Timeout for peer connections and communications in seconds
 heartbeat_interval = 15  # Interval for sending heartbeats to peers in seconds

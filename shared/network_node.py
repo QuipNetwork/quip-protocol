@@ -262,14 +262,24 @@ class NetworkNode(Node):
         self.heartbeat_timeout = float(config.get("heartbeat_timeout", 300))
         self.node_timeout = float(config.get("node_timeout", 10))
 
-        self.initial_peers = config.get("peer", ["nodes.quip.network:20049"])
+        self.initial_peers = config.get("peer", [
+            "qpu-1.nodes.quip.network:20049",
+            "cpu-1.quip.carback.us:20049",
+            "gpu-1.quip.carback.us:20049",
+            "gpu-2.quip.carback.us:20050",
+            "nodes.quip.network:20049",
+        ])
         self.fanout = int(config.get("fanout", 3))
 
         self.net_lock = asyncio.Lock()
         self.running = False
         self.heartbeats = {}
         self.peer_versions: dict[str, str] = {}  # peer_host -> version string
-        self.connection_backoff: dict[str, float] = {}  # peer_host -> backoff_expires_at
+        # Peer ban list is created here for pre-start checks (e.g. connect_to_peer);
+        # once NodeClient is initialised in start(), we share its ban_list instead.
+        from shared.peer_ban_list import PeerBanList
+        self._own_ban_list = PeerBanList(logger=self.logger)
+        self._ban_list: PeerBanList = self._own_ban_list
 
         self.gossip_lock = asyncio.Lock()
         self.recent_messages = set()
@@ -451,6 +461,10 @@ class NetworkNode(Node):
             verify_tls=self.verify_tls,
             trust_store=self.trust_store
         )
+        # Share a single ban list between NetworkNode and NodeClient so that
+        # protocol-level bans (version mismatch) also block QUIC connections.
+        self.node_client.ban_list = self._own_ban_list
+        self._ban_list = self._own_ban_list
         await self.node_client.start()
 
         # Start QUIC server
@@ -519,6 +533,7 @@ class NetworkNode(Node):
 
         # have we fully synchronized with the network at least one time?
         self._synchronized = threading.Event()
+        self._has_ever_had_peers = False  # distinguishes bootstrap (solo) from desync (lost peers)
         self.sync_block_cache = {}  # Regular dict is thread-safe for simple assignments in CPython
 
         # Sync failure tracking for consensus fallback
@@ -1011,6 +1026,8 @@ class NetworkNode(Node):
             # Reset synchronization state if it exists (only after start() is called)
             if hasattr(self, '_synchronized'):
                 self._synchronized.clear()
+            if hasattr(self, '_has_ever_had_peers'):
+                self._has_ever_had_peers = False
             if hasattr(self, 'sync_block_cache'):
                 self.sync_block_cache.clear()
             
@@ -1186,8 +1203,16 @@ class NetworkNode(Node):
         """
         my_latest_block = self.get_latest_block()
         if not self.peers:
-            if self.auto_mine:
-                self.logger.debug("No connected peers, but auto-mine is enabled so we are synchronized by default")
+            if self.auto_mine and not self._has_ever_had_peers:
+                # True bootstrap: never had peers, solo mining OK
+                self.logger.debug("Bootstrap mode: no peers ever seen, auto-mine enabled")
+                self.set_synchronized()
+                return 0
+            elif self.auto_mine:
+                # Had peers before but lost them all — do not auto-sync.
+                # _synchronized was already cleared by remove_node(),
+                # so the mining guard in server_loop will block mining.
+                self.logger.debug("All peers lost, waiting for reconnection before mining")
                 return 0
             else:
                 raise RuntimeError("No peers to synchronize with")
@@ -1415,25 +1440,12 @@ class NetworkNode(Node):
             return False
 
     def _is_backed_off(self, peer_address: str) -> bool:
-        """Check if peer is on the connection backoff table."""
-        expires_at = self.connection_backoff.get(peer_address)
-        if expires_at is None:
-            return False
-        if utc_timestamp_float() >= expires_at:
-            del self.connection_backoff[peer_address]
-            return False
-        return True
+        """Check if peer is currently banned."""
+        return self._ban_list.is_banned(peer_address)
 
     async def _backoff_peer(self, peer_address: str, reason: str):
-        """Add peer to backoff table for 5-15 minutes and disconnect."""
-        duration = random.uniform(300.0, 900.0)
-        self.connection_backoff[peer_address] = (
-            utc_timestamp_float() + duration
-        )
-        self.logger.warning(
-            f"Backing off peer {peer_address} for "
-            f"{int(duration)}s - {reason}"
-        )
+        """Ban peer with exponential backoff and disconnect."""
+        self._ban_list.record_failure(peer_address, reason)
         await self.remove_node(peer_address)
 
     async def add_peer(self, host: str, info: MinerInfo) -> bool:
@@ -1455,6 +1467,7 @@ class NetworkNode(Node):
             self.telemetry.update_node(host, "active", info)
 
             if is_new:
+                self._has_ever_had_peers = True
                 self.logger.info(f"New peer discovered: {host}: {info.miner_id} ({info.ecdsa_public_key.hex()[:8]})")
                 self._on_new_node(host, info)
 
@@ -1472,13 +1485,25 @@ class NetworkNode(Node):
                 self.telemetry.remove_node(host)
                 self._on_node_lost(host)
 
+                # Clear synchronized state when all peers are lost
+                if not self.peers and self._has_ever_had_peers:
+                    self._synchronized.clear()
+                    self.logger.warning(
+                        "All peers lost — cleared synchronized state, "
+                        "mining paused until re-sync"
+                    )
+
                 # Update node client to remove peer
                 if self.node_client:
                     await self.node_client.remove_peer(host)
 
     async def send_heartbeat(self, node_host: str) -> bool:
-        """Send heartbeat to a specific node."""
-        if not self.node_client or not self.synchronized:
+        """Send heartbeat to a specific node.
+
+        Heartbeats are sent regardless of sync state so that desynced
+        nodes can maintain peer connections for re-synchronization.
+        """
+        if not self.node_client:
             return False
         return await self.node_client.send_heartbeat(node_host, self.public_host, self.info())
 

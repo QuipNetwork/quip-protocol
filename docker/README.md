@@ -81,7 +81,7 @@ All settings live in `/data/config.toml` (source of truth). ENV vars override th
 | `QUIP_PUBLIC_PORT` | `public_port` | same as `port` | Public port (if different, e.g. behind NAT) |
 | `QUIP_NODE_NAME` | `node_name` | (hostname) | Human-readable node name |
 | `QUIP_AUTO_MINE` | `auto_mine` | `false` | Enable auto-mining |
-| `QUIP_PEERS` | `peer` | `["nodes.quip.network:20049"]` | Comma-separated peer list (TOML uses array) |
+| `QUIP_PEERS` | `peer` | (see default peers below) | Comma-separated peer list (TOML uses array) |
 | `CERT_EMAIL` | (unset) | ACME email — enables certbot when set with a DNS domain |
 | `CERT_CHALLENGE` | (unset→http) | `http` (port 80) or `dns` |
 | `CERT_DNS_PLUGIN` | (unset) | cloudflare, route53, google, digitalocean, ovh, rfc2136 |
@@ -95,7 +95,7 @@ All settings live in `/data/config.toml` (source of truth). ENV vars override th
 
 **Default peers:**
 ```
-qpu-1.nodes.quip.network, cpu-1.quip.carback.us, gpu-1.quip.carback.us, gpu-2.quip.carback.us
+qpu-1.nodes.quip.network:20049, cpu-1.quip.carback.us:20049, gpu-1.quip.carback.us:20049, gpu-2.quip.carback.us:20050, nodes.quip.network:20049
 ```
 
 ## TLS Certificates (Let's Encrypt)

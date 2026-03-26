@@ -28,6 +28,7 @@ from aioquic.quic.events import (
 )
 
 from shared.block import Block, BlockHeader, MinerInfo
+from shared.peer_ban_list import PeerBanList
 from shared.version import get_version, PROTOCOL_VERSION
 from shared.time_utils import utc_timestamp_float
 from shared.address_utils import parse_host_port
@@ -341,6 +342,7 @@ class NodeClient:
         self._connection_contexts: Dict[str, Any] = {}  # Store context managers to keep connections alive
         self._connection_locks: Dict[str, asyncio.Lock] = {}
         self.peers: Dict[str, MinerInfo] = {}
+        self.ban_list = PeerBanList(logger=self.logger)
 
     async def start(self) -> None:
         pass
@@ -379,6 +381,9 @@ class NodeClient:
         await self._close_connection(host)
 
     async def _get_connection(self, host: str) -> Optional[_QuicClientProtocol]:
+        if self.ban_list.is_banned(host):
+            return None
+
         if host not in self._connection_locks:
             self._connection_locks[host] = asyncio.Lock()
 
@@ -429,17 +434,19 @@ class NodeClient:
                     self._connections[host] = protocol
                     self._connection_contexts[host] = ctx
                     self.logger.info(f"QUIC connection established to {host}")
+                    self.ban_list.record_success(host)
                     return protocol
                 else:
                     # Connection failed (handshake timeout), clean up
-                    self.logger.warning(f"QUIC handshake failed/timed out for {host}")
+                    self.ban_list.record_failure(host, "QUIC handshake timeout")
                     await ctx.__aexit__(None, None, None)
                     return None
             except TofuVerificationError as e:
                 self.logger.error(f"TOFU verification failed for {host}: {e}")
+                self.ban_list.record_failure(host, f"TOFU verification: {e}")
                 return None
             except Exception as e:
-                self.logger.warning(f"Failed to connect to {host}: {e}")
+                self.ban_list.record_failure(host, str(e))
                 return None
 
     async def _verify_tofu(self, host: str, protocol: _QuicClientProtocol) -> bool:
