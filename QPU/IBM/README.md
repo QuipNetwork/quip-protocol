@@ -19,6 +19,11 @@ shared/
 QPU/IBM/
 ├── ibm_qaoa_solver.py        ← QAOA engine: (h, J) → dimod.SampleSet
 └── ibm_qaoa_miner.py         ← Mining loop: generates problems, submits solves, evaluates results
+
+tools/
+├── ibm_qaoa_baseline.py      ← Baseline benchmarking tool (AerSimulator, no API keys)
+├── basic_ising_problems.py   ← Easy test problems with known optimal energies
+└── hard_ising_problems.py    ← Hard test problems (spin glasses, 16-20 qubits)
 ```
 
 `quantum_proof_of_work.py` defines the protocol — how problems are generated from block data, how solutions are scored, and how mining results are validated. Both the D-Wave miner and the IBM QAOA miner depend on it.
@@ -76,7 +81,7 @@ The miner wraps this in a sequential loop:
 while not stopped:
     1. Generate random salt → nonce → Ising problem (h, J)
     2. Compute adaptive parameters (circuit depth, shots, iterations)
-    3. Submit QAOA solve asynchronously
+    3. Submit QAOA solve asynchronously (spawns a child process)
     4. Poll every 200ms:
        - Check if blockchain says stop (another miner won)
        - Check for difficulty decay (threshold relaxes over time)
@@ -95,6 +100,41 @@ A mining result must satisfy three requirements simultaneously (checked by `eval
 3. **Solution count** — Must have at least `min_solutions` valid, unique solutions
 
 If all three are met, a `MiningResult` is created and returned to the blockchain.
+
+
+## Multiprocessing Architecture
+
+The solver uses **multiprocessing** (not threading) for async solves, following the same 2-process architecture as the existing mining system in `shared/miner_worker.py`.
+
+### Why multiprocessing over threading
+
+- **True parallelism** — Python's GIL prevents threads from executing CPU-bound code in parallel. QAOA solving is heavily CPU-bound (matrix math, circuit simulation, optimization loops). A child process gets its own GIL.
+- **Native stop_event passing** — The mining worker sends a `multiprocessing.Event` for cancellation. With threading, this required a bridge: a monitor thread polling the multiprocessing event and mirroring it onto a `threading.Event`. With multiprocessing, the event passes directly to the child process via shared memory — no bridge needed.
+
+### How it works
+
+`solve_ising_async()` spawns a `multiprocessing.Process` running a module-level `_qaoa_solve_in_process()` function. This function reconstructs a `QAOASolverWrapper` in the child process (using a serializable config dict from `_get_solver_config()`) and runs `solve_ising()`. The result (`dimod.SampleSet`) is sent back via a `multiprocessing.Queue`.
+
+```
+Parent (miner)                    Child (solver process)
+     │                                    │
+     ├── create Queue, Process            │
+     ├── process.start() ─────────────────┤
+     │                                    ├── reconstruct QAOASolverWrapper
+     │   poll loop:                       ├── solve_ising(h, J, stop_event)
+     │   ├── stop_event?                  │   ├── Step 1: build cost operator
+     │   ├── future.done()?               │   ├── Step 2: build QAOA circuit
+     │   ├── difficulty decay?            │   ├── Step 3: transpile
+     │   └── sleep(200ms)                 │   ├── Step 4: optimize (100 iterations)
+     │                                    │   └── Step 5: final sampling
+     │                                    ├── result_queue.put(sampleset)
+     │◄── result_queue.get() ─────────────┤
+     │                                    └── exit
+     ├── evaluate_sampleset()
+     └── MiningResult or retry
+```
+
+`QAOAFuture` wraps the `Process` + `Queue` pair, exposing the same polling interface (`done()`, `sampleset`, `cancel()`, `elapsed`) that the miner uses. Cancellation calls `process.terminate()` directly.
 
 
 ## Code Walkthrough: quantum_proof_of_work.py
@@ -179,13 +219,17 @@ Algorithm per iteration:
 
 ### QAOAFuture
 
-Lightweight wrapper around Python's `concurrent.futures.Future` that matches the interface of D-Wave's `EmbeddedFuture`. This lets the miner use the same polling pattern for both backends.
+Wrapper around `multiprocessing.Process` + `multiprocessing.Queue` that provides the same polling interface as D-Wave's `EmbeddedFuture`. This lets the miner use a consistent polling pattern for both backends.
 
-Key interface: `future.sampleset` (blocks until done), `future.done()` (non-blocking check), `future.cancel()`, `future.elapsed` (wall-clock time since submission).
+Key interface: `future.sampleset` (blocks until done), `future.done()` (non-blocking check), `future.cancel()` (terminates child process), `future.elapsed` (wall-clock time since submission).
+
+### `_qaoa_solve_in_process(solver_config, h, J, stop_event, params, result_queue)`
+
+Module-level function (not a method) that runs in the child process. It's module-level because `multiprocessing.Process` needs to pickle its target — instance methods aren't reliably picklable. Reconstructs a `QAOASolverWrapper` from the serializable config dict, runs `solve_ising()`, and puts the result on the queue.
 
 ### QAOASolverWrapper
 
-The main solver class. Stores the topology (nodes, edges), configures the backend (AerSimulator for local simulation or a real IBM QPU), sets QAOA defaults, and creates a single-threaded executor for async solves.
+The main solver class. Stores the topology (nodes, edges), configures the backend (AerSimulator for local simulation or a real IBM QPU), and sets QAOA defaults.
 
 #### `_build_cost_operator(h, J) → SparsePauliOp`
 
@@ -226,9 +270,13 @@ Converts Qiskit measurement results into the `dimod.SampleSet` format used throu
 
 Public interface. Runs the full five-step pipeline. Accepts optional per-solve parameter overrides (`p`, `shots`, `final_shots`, `max_iter`) from `adapt_parameters()`, falling back to constructor defaults for any not provided.
 
+#### `_get_solver_config() → dict`
+
+Returns a serializable dict of constructor arguments so that `_qaoa_solve_in_process` can reconstruct the solver in a child process. The backend is set to `None` (child creates its own `AerSimulator`) since backend objects aren't reliably picklable.
+
 #### `solve_ising_async(h, J, stop_event, params) → QAOAFuture`
 
-Submits `solve_ising` to a background thread and returns a `QAOAFuture` immediately. This is what the miner calls — it needs the solve to run in the background so it can poll for `stop_event` and difficulty decay.
+Spawns a `multiprocessing.Process` targeting `_qaoa_solve_in_process` and returns a `QAOAFuture` immediately. The `stop_event` (`multiprocessing.Event`) passes directly to the child process via shared memory — no bridging needed.
 
 
 ## Code Walkthrough: ibm_qaoa_miner.py
@@ -237,10 +285,6 @@ Submits `solve_ising` to a background thread and returns a `QAOAFuture` immediat
 
 Subclass of `BaseMiner`. Creates a `QAOASolverWrapper` with the configured parameters, registers SIGTERM handler for cleanup, and stores topology references.
 
-#### `_bridge_stop_event(mp_event)`
-
-The blockchain uses `multiprocessing.Event` for inter-process signaling, but QAOA runs in-process using threads. This method creates a `threading.Event` and spawns a daemon thread that polls the multiprocessing event every 100ms, propagating the stop signal when detected.
-
 #### `mine_block(...) → MiningResult or None`
 
 The main mining loop. Setup phase computes current difficulty (with decay), extracts topology from the solver, and calls `adapt_parameters()` to configure QAOA parameters based on difficulty.
@@ -248,6 +292,8 @@ The main mining loop. Setup phase computes current difficulty (with decay), extr
 The sequential solve loop generates a random salt and nonce via `ising_nonce_from_block`, creates the Ising problem via `generate_ising_model_from_nonce`, submits an async QAOA solve, then enters the poll loop. The poll loop checks every 200ms for: completion, external stop signal, and difficulty decay. On difficulty decay, it recomputes adaptive parameters and re-checks cached near-miss attempts — if one now qualifies under relaxed difficulty, it cancels the in-progress solve and returns immediately.
 
 When a solve completes, the result is evaluated via `evaluate_sampleset` from quantum_proof_of_work. If it meets all three requirements (energy, diversity, solution count), a `MiningResult` is returned. Otherwise the result is cached via `update_top_samples` for potential re-evaluation on difficulty decay.
+
+The `stop_event` (`multiprocessing.Event` from the mining worker) is passed directly to `solve_ising_async` — no bridging or conversion needed.
 
 ### adapt_parameters(difficulty_energy, ...) → dict
 
@@ -272,9 +318,56 @@ Module-level function that maps blockchain difficulty to QAOA-specific parameter
 COBYLA is the default. Switch to SPSA for real IBM hardware.
 
 
-## Usage
+## Baseline Benchmarking Tool
 
-### Local Simulation
+`tools/ibm_qaoa_baseline.py` benchmarks the QAOA solver on AerSimulator — no IBM account or API keys needed.
+
+### Modes
+
+**Pipeline mode** (`--quick` / standard / `--extended` / `--stress`) — proves the mining pipeline works end-to-end using protocol-style problems:
+
+```
+nonce → generate_ising_model_from_nonce → solve_ising → evaluate_sampleset → MiningResult
+```
+
+Uses a connected subgraph of the protocol topology (AerSimulator can't handle the full ~4,580-qubit graph):
+
+| Flag | Subgraph | p | Optimizers | Shots | Solves/config |
+|------|----------|---|------------|-------|---------------|
+| `--quick` | 8 nodes | 1 | COBYLA | 512 | 1 |
+| (standard) | 10 nodes | 1, 2 | COBYLA | 512, 1024 | 3 |
+| `--extended` | 14 nodes | 1, 2, 3 | COBYLA, SPSA | 512, 1024, 2048 | 5 |
+| `--stress` | 28 nodes | 1 | COBYLA | 1024 | 1 |
+
+**Known-problems mode** (`--known-problems`) — tests solution quality against problems with known optimal energies:
+- Easy problems from `tools/basic_ising_problems.py` (2-16 qubits) — should hit ratio 1.0
+- Hard problems from `tools/hard_ising_problems.py` (16-20 qubit spin glasses) — QAOA may fall below 90%
+
+Reports approximation ratios: `found_energy / optimal_energy`.
+
+### Commands
+
+```bash
+python tools/ibm_qaoa_baseline.py --quick            # fast smoke test (seconds)
+python tools/ibm_qaoa_baseline.py                    # standard run
+python tools/ibm_qaoa_baseline.py --known-problems   # solution quality check
+python tools/ibm_qaoa_baseline.py --extended         # thorough sweep
+python tools/ibm_qaoa_baseline.py --stress           # memory stress test (28 qubits)
+python tools/ibm_qaoa_baseline.py --quick -v         # show QAOA solver steps
+```
+
+### Metrics
+
+Both modes measure:
+- **Energy levels** — min and avg energy per solve
+- **Execution time** — wall-clock seconds per solve
+- **Memory usage** — peak memory in MB
+- **Diversity** — solution diversity (pipeline mode)
+- **Approximation ratios** — found / optimal (known-problems mode)
+- **Pipeline pass rate** — how often `evaluate_sampleset` returns a `MiningResult` (pipeline mode)
+
+
+## Developer Reference
 
 ```python
 from QPU.IBM import IBMQAOAMiner
@@ -290,24 +383,6 @@ miner = IBMQAOAMiner(
 )
 
 result = miner.mine_block(prev_block, node_info, requirements, prev_timestamp, stop_event)
-```
-
-### Real IBM Hardware
-
-```python
-from qiskit_ibm_runtime import QiskitRuntimeService
-
-service = QiskitRuntimeService()
-backend = service.backend("ibm_brisbane")
-
-miner = IBMQAOAMiner(
-    miner_id="ibm-qaoa-1",
-    nodes=protocol_nodes,
-    edges=protocol_edges,
-    backend=backend,
-    optimizer='SPSA',           # noise-robust optimizer for real hardware
-    shots=512,                  # fewer shots (hardware is expensive)
-)
 ```
 
 
@@ -332,6 +407,7 @@ IBMQAOAMiner.mine_block()
   │   │                                                                   │
   │   │ ibm_qaoa_solver:                                                  │
   │   ▼ QAOASolverWrapper.solve_ising_async(h, J, stop, params)           │
+  │   │   └── spawns child process via multiprocessing.Process            │
   │   │                                                                   │
   │   ├── _build_cost_operator(h, J)             → SparsePauliOp          │
   │   ├── _build_circuit(cost_op, p)             → QAOAAnsatz             │
@@ -358,3 +434,12 @@ IBMQAOAMiner.mine_block()
   ▼
 MiningResult → Blockchain
 ```
+
+
+## Hardware Realism
+
+IBM's current production hardware — headlined by the 156-qubit Heron R3 and the 120-qubit Nighthawk — cannot run the full 4,582-node protocol graph. While legacy systems like the 433-qubit Osprey demonstrated large-scale fabrication, they remain limited by high error rates and constrained qubit connectivity. Even Nighthawk, with its improved square lattice topology and over 20% more couplers than Heron, is currently optimized for circuits of up to 5,000 two-qubit gates (with future iterations targeting 7,500 by end of 2026), far below the requirements of the full protocol topology.
+
+Consequently, only AerSimulator can simulate the protocol, and even then only on subgraphs. Because a statevector simulation requires 2^n complex amplitudes — where each amplitude consumes 16 bytes of memory — a 30-qubit simulation hits a 16 GB RAM "memory wall," doubling with every additional qubit. This places the practical limit for high-end consumer hardware at roughly 28–31 qubits. IonQ's 100-qubit Tempo system (#AQ 64) is similarly infeasible for the full protocol at this time.
+
+The baseline tool uses subgraphs of 8–28 nodes to prove the code works. Real mining on the full topology would require future quantum hardware with thousands of qubits, or a protocol change to use smaller graphs.
