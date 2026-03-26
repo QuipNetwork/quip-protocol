@@ -4,8 +4,8 @@ Dependencies:
     pip install qiskit qiskit-aer dimod
 """
 
-from .ibm_qaoa_solver import QAOASolverWrapper, QAOAFuture
-from .ibm_qaoa_miner import IBMQAOAMiner
+from QPU.IBM.ibm_qaoa_solver import QAOASolverWrapper, QAOAFuture
+from QPU.IBM.ibm_qaoa_miner import IBMQAOAMiner
 
 __all__ = [
     'QAOASolverWrapper',

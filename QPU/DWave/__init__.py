@@ -1,8 +1,8 @@
 """D-Wave QPU mining components for quantum blockchain."""
 
-from .dwave_sampler import DWaveSamplerWrapper
-from .dwave_miner import DWaveMiner
-from .qpu_time_manager import QPUTimeManager, QPUTimeConfig, QPUTimeEstimate, parse_duration
+from QPU.DWave.dwave_sampler import DWaveSamplerWrapper
+from QPU.DWave.dwave_miner import DWaveMiner
+from QPU.DWave.qpu_time_manager import QPUTimeManager, QPUTimeConfig, QPUTimeEstimate, parse_duration
 
 __all__ = [
     'DWaveSamplerWrapper',
@@ -12,13 +12,5 @@ __all__ = [
     'QPUTimeEstimate',
     'parse_duration',
 ]
-
-
-
-
-
-
-
-
 
 
