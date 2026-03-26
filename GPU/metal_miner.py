@@ -74,7 +74,7 @@ class MetalMiner(BaseMiner):
 
     def __init__(self, miner_id: str, topology=None, **cfg):
         gpu_util = cfg.pop('gpu_utilization', 100)
-        yielding = cfg.pop('yielding', False)
+        yielding = cfg.pop('yielding', True)
         # Remove CUDA-only keys that flow through common_cfg
         cfg.pop('sms_per_nonce', None)
 
@@ -127,6 +127,8 @@ class MetalMiner(BaseMiner):
         # Pipeline state (reset per mine_block call)
         self._feeder: Optional[IsingFeeder] = None
         self._stream: Optional[Iterator] = None
+        self._active_tg = self._scheduler.get_core_budget()
+        self._max_tg = self._active_tg
 
         signal.signal(signal.SIGTERM, self._cleanup_handler)
 
@@ -198,8 +200,23 @@ class MetalMiner(BaseMiner):
         if self._scheduler.should_throttle():
             time.sleep(0.5)
 
+        # Dynamic batch sizing: check if IOKit suggests resizing
+        if self._stream is not None and self._scheduler.yielding:
+            new_tg = self._scheduler.check_stable_target_threadgroups(
+                self._max_tg, self._active_tg,
+            )
+            if new_tg is not None and new_tg != self._active_tg:
+                self.logger.info(
+                    "Resizing Metal batch: %d → %d threadgroups",
+                    self._active_tg, new_tg,
+                )
+                if hasattr(self._stream, 'close'):
+                    self._stream.close()
+                self._stream = None
+                self._active_tg = new_tg
+
         if self._stream is None:
-            budget = self._scheduler.get_core_budget()
+            budget = self._active_tg
             self._stream = self.sampler.sample_ising_streaming(
                 self._feeder,
                 num_reads=num_reads,

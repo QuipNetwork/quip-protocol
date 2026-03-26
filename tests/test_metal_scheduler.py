@@ -134,6 +134,65 @@ class TestMetalSchedulerTargetThreadgroups:
         sched.stop()
 
 
+class TestStableTargetHysteresis:
+    """Hysteresis for stable target threadgroups."""
+
+    def test_returns_none_on_first_call(self):
+        from GPU.metal_scheduler import MetalScheduler
+        sched = MetalScheduler(
+            gpu_core_count=40,
+            gpu_utilization_pct=100,
+            yielding=True,
+        )
+        sched._external_util_pct = 80
+        result = sched.check_stable_target_threadgroups(
+            max_tg=10, active_tg=0,
+        )
+        assert result is None
+        sched.stop()
+
+    def test_returns_value_after_two_stable_calls(self):
+        from GPU.metal_scheduler import MetalScheduler
+        sched = MetalScheduler(
+            gpu_core_count=40,
+            gpu_utilization_pct=100,
+            yielding=True,
+        )
+        sched._external_util_pct = 80
+        sched.check_stable_target_threadgroups(10, 0)
+        result = sched.check_stable_target_threadgroups(10, 0)
+        assert result is not None
+        assert 1 <= result <= 10
+        sched.stop()
+
+    def test_resets_on_target_change(self):
+        from GPU.metal_scheduler import MetalScheduler
+        sched = MetalScheduler(
+            gpu_core_count=40,
+            gpu_utilization_pct=100,
+            yielding=True,
+        )
+        sched._external_util_pct = 80
+        sched.check_stable_target_threadgroups(10, 0)
+        # Change external load → different target
+        sched._external_util_pct = 20
+        result = sched.check_stable_target_threadgroups(10, 0)
+        assert result is None  # Reset, need 2 stable again
+        sched.stop()
+
+    def test_returns_max_when_not_yielding(self):
+        from GPU.metal_scheduler import MetalScheduler
+        sched = MetalScheduler(
+            gpu_core_count=40,
+            gpu_utilization_pct=100,
+            yielding=False,
+        )
+        # Even without yielding, should return max after 2 calls
+        sched.check_stable_target_threadgroups(10, 5)
+        result = sched.check_stable_target_threadgroups(10, 5)
+        assert result == 10
+
+
 class TestIOKitQuery:
     """Test IOKit query function with graceful fallback."""
 

@@ -13,6 +13,7 @@ SimulatedAnnealingSampler from cpu_sa.cpp, including:
 
 import logging
 import os
+import time
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 import dimod
@@ -644,6 +645,12 @@ class MetalSASampler:
                 num_sweeps_per_beta=num_sweeps_per_beta,
                 seed=batch_seed,
             )
+
+            # Yield to WindowServer compositor between GPU batches.
+            # Apple Silicon's unified GPU is shared with the OS; a 2ms
+            # gap gives the compositor one frame opportunity per batch
+            # (~2% overhead on a typical 100ms dispatch).
+            time.sleep(0.002)
 
             batch_seed = (batch_seed + 1) & 0x7FFFFFFF
 

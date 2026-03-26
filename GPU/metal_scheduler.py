@@ -182,7 +182,7 @@ class MetalScheduler:
         gpu_core_count: int,
         gpu_utilization_pct: int = 100,
         yielding: bool = False,
-        poll_interval: float = 5.0,
+        poll_interval: float = 1.0,
     ):
         self._gpu_core_count = gpu_core_count
         self._gpu_utilization_pct = gpu_utilization_pct
@@ -202,6 +202,10 @@ class MetalScheduler:
         self._util_cache: Optional[int] = None
         self._util_cache_time = 0.0
         self._CACHE_TTL = 1.0
+
+        # Hysteresis for stable target threadgroups
+        self._prev_target = 0
+        self._stable_ticks = 0
 
         if yielding:
             self._start_iokit_monitor()
@@ -307,6 +311,27 @@ class MetalScheduler:
             target_pct / self._gpu_utilization_pct * max_tg,
         )
         return max(1, min(target, max_tg))
+
+    def check_stable_target_threadgroups(
+        self,
+        max_tg: int,
+        active_tg: int,
+    ) -> Optional[int]:
+        """Return target threadgroups only if stable for 2 checks.
+
+        Calls compute_target_threadgroups internally. Returns None
+        if the target is still changing between polls (hysteresis
+        to prevent stream recreation oscillation).
+        """
+        current = self.compute_target_threadgroups(max_tg, active_tg)
+        if current == self._prev_target:
+            self._stable_ticks += 1
+        else:
+            self._prev_target = current
+            self._stable_ticks = 1
+        if self._stable_ticks >= 2:
+            return current
+        return None
 
     @property
     def yielding(self) -> bool:
