@@ -14,6 +14,7 @@ The goal is to understand the relationship between QPU parameters and solution q
 import argparse
 import json
 import logging
+import os
 import random
 import sys
 import time
@@ -127,9 +128,10 @@ def exceeds_qpu_time_limit(
         prog_time = solver_props.get(
             'default_programming_thermalization', QPU_PROGRAMMING_TIME_US
         )
-        overhead = solver_props.get(
-            'readout_thermalization_range', [0, QPU_PER_SAMPLE_OVERHEAD_US]
-        )[1]
+        # Per-sample overhead = hardware readout time + thermalization delay
+        readout = solver_props.get('readout_time_per_sample', 123.0)
+        therm = solver_props.get('default_readout_thermalization', 0.0)
+        overhead = readout + therm
     else:
         max_time = QPU_MAX_ACCESS_TIME_US
         prog_time = QPU_PROGRAMMING_TIME_US
@@ -245,6 +247,44 @@ class PendingJob:
     test_index: int
 
 
+def load_completed_results(
+    output_file: str,
+) -> Tuple[set, Dict[Tuple[int, float], List[Dict]], Dict]:
+    """Load completed results from an existing JSON file for resume.
+
+    Returns:
+        (completed_keys, qpu_results, cpu_baselines) where completed_keys
+        is a set of (seed, interval, num_reads, annealing_time) tuples.
+    """
+    completed: set = set()
+    qpu_results: Dict[Tuple[int, float], List[Dict]] = {}
+    cpu_baselines: Dict = {}
+
+    if not os.path.exists(output_file):
+        return completed, qpu_results, cpu_baselines
+
+    with open(output_file, 'r') as f:
+        data = json.load(f)
+
+    cpu_baselines = data.get('cpu_baseline', {}).get('results', {})
+    # Convert string keys back to int
+    cpu_baselines = {int(k): v for k, v in cpu_baselines.items()}
+
+    for key_str, group in data.get('qpu_results', {}).items():
+        seed = group['seed']
+        interval = group['interval']
+        results_list = group.get('results', [])
+        dict_key = (seed, interval)
+        qpu_results[dict_key] = results_list
+        for r in results_list:
+            completed.add((
+                seed, interval,
+                r['num_reads'], r['annealing_time'],
+            ))
+
+    return completed, qpu_results, cpu_baselines
+
+
 def save_results_incremental(output_file: str, output_data: Dict):
     """Save current results to JSON (overwrites on each call)."""
     with open(output_file, 'w') as f:
@@ -295,27 +335,34 @@ def build_output_data(seeds, topology, num_reads_list, annealing_time_list,
 def run_streaming(qpu_miner, nonces_and_models, num_reads_list,
                   annealing_time_list, interval_seconds, qpu_results,
                   queue_depth, total_tests, test_counter, output_file,
-                  output_data_builder, solver_props=None):
+                  output_data_builder, solver_props=None,
+                  completed_keys=None):
     """Run QPU tests with async streaming for maximum throughput.
 
     Maintains up to queue_depth jobs in-flight simultaneously.
     Saves results incrementally after each completed job.
     """
-    # Build work queue, skipping combos that exceed QPU time limit
+    # Build work queue, skipping combos that exceed QPU time limit or are resumed
     work_items = []
     skipped_combos = 0
+    skipped_resume = 0
     for num_reads in num_reads_list:
         for annealing_time in annealing_time_list:
             if exceeds_qpu_time_limit(num_reads, annealing_time, solver_props):
                 skipped_combos += 1
                 continue
             for seed, nonce, model in nonces_and_models:
+                if completed_keys and (seed, interval_seconds, num_reads, annealing_time) in completed_keys:
+                    skipped_resume += 1
+                    continue
                 work_items.append((seed, nonce, model, num_reads, annealing_time))
 
     if skipped_combos:
         skipped_jobs = skipped_combos * len(nonces_and_models)
         print(f"  Skipped {skipped_combos} param combo(s) exceeding "
               f"QPU time limit ({skipped_jobs} jobs)")
+    if skipped_resume:
+        print(f"  Skipped {skipped_resume} already-completed job(s) (resume)")
 
     topology_label = qpu_miner.sampler.job_label
     pending: Dict[Any, PendingJob] = {}
@@ -417,22 +464,28 @@ def run_streaming(qpu_miner, nonces_and_models, num_reads_list,
 def run_sync(qpu_miner, nonces_and_models, num_reads_list,
              annealing_time_list, interval_seconds, qpu_results,
              total_tests, test_counter, output_file, output_data_builder,
-             solver_props=None):
+             solver_props=None, completed_keys=None):
     """Run QPU tests synchronously with sleep intervals between queries."""
     work_items = []
     skipped_combos = 0
+    skipped_resume = 0
     for num_reads in num_reads_list:
         for annealing_time in annealing_time_list:
             if exceeds_qpu_time_limit(num_reads, annealing_time, solver_props):
                 skipped_combos += 1
                 continue
             for seed, nonce, model in nonces_and_models:
+                if completed_keys and (seed, interval_seconds, num_reads, annealing_time) in completed_keys:
+                    skipped_resume += 1
+                    continue
                 work_items.append((seed, nonce, model, num_reads, annealing_time))
 
     if skipped_combos:
         skipped_jobs = skipped_combos * len(nonces_and_models)
         print(f"  Skipped {skipped_combos} param combo(s) exceeding "
               f"QPU time limit ({skipped_jobs} jobs)")
+    if skipped_resume:
+        print(f"  Skipped {skipped_resume} already-completed job(s) (resume)")
 
     for i, (seed, nonce, model, num_reads, annealing_time) in enumerate(work_items):
         test_counter[0] += 1
@@ -507,6 +560,11 @@ def main():
         '--output', '-o',
         type=str,
         help='Output JSON file for results'
+    )
+    parser.add_argument(
+        '--resume',
+        action='store_true',
+        help='Resume from existing output JSON, skipping completed tests.'
     )
     parser.add_argument(
         '--cpu-baseline-sweeps',
@@ -643,10 +701,23 @@ def main():
         print(f"  Seed {seed}: nonce={nonce_hex[:16]}...")
     print()
 
-    # Run CPU baseline for each nonce
+    # Resume: load existing results if --resume and output file exists
+    completed_keys: set = set()
+    qpu_results: Dict = {}
+    cpu_baselines: Dict = {}
+    if args.resume and os.path.exists(output_file):
+        completed_keys, qpu_results, cpu_baselines = load_completed_results(output_file)
+        print(f"Resuming: loaded {len(completed_keys)} completed QPU tests from {output_file}")
+        if cpu_baselines:
+            print(f"  CPU baselines recovered for {len(cpu_baselines)} seed(s)")
+        print()
+
+    # Run CPU baseline for each nonce (skip if already recovered)
     print(f"Running CPU baseline ({args.cpu_baseline_sweeps} sweeps, {args.cpu_baseline_reads} reads)...")
-    cpu_baselines = {}
     for seed, nonce, model in nonces_and_models:
+        if seed in cpu_baselines:
+            print(f"  Seed {seed}: recovered (energy_min={cpu_baselines[seed]['energy_min']:.1f})")
+            continue
         print(f"  Seed {seed}...", end='', flush=True)
         result = run_cpu_baseline(
             cpu_miner,
@@ -659,18 +730,22 @@ def main():
         print(f" energy_min={result['energy_min']:.1f}, time={result['time']:.3f}s")
     print()
 
-    # Build list of all QPU tests, accounting for skipped combos
+    # Build list of all QPU tests, accounting for skipped combos and resume
     skipped_combos = sum(
         1 for nr in num_reads_list for at in annealing_time_list
         if exceeds_qpu_time_limit(nr, at, solver_props)
     )
     valid_combos = len(num_reads_list) * len(annealing_time_list) - skipped_combos
-    total_tests = valid_combos * len(nonces_and_models) * len(interval_list)
-    print(f"Running {total_tests} QPU tests...")
-    print(f"  {len(num_reads_list)} num_reads × {len(annealing_time_list)} annealing_time × {len(interval_list)} interval × {len(seeds)} seed(s)")
+    total_tests_full = valid_combos * len(nonces_and_models) * len(interval_list)
+    remaining_tests = total_tests_full - len(completed_keys)
+    total_tests = total_tests_full
+    print(f"Running {total_tests_full} QPU tests...")
+    print(f"  {len(num_reads_list)} num_reads x {len(annealing_time_list)} annealing_time x {len(interval_list)} interval x {len(seeds)} seed(s)")
     if skipped_combos:
         skipped_jobs = skipped_combos * len(nonces_and_models) * len(interval_list)
         print(f"  {skipped_combos} param combo(s) exceed QPU time limit ({skipped_jobs} jobs skipped)")
+    if completed_keys:
+        print(f"  {len(completed_keys)} already completed (resume), {remaining_tests} remaining")
 
     # Show mode per interval
     for interval in interval_list:
@@ -678,7 +753,6 @@ def main():
         print(f"  interval={interval}s: {mode}")
     print()
 
-    qpu_results = {}
     # Mutable counter so nested functions can update it
     test_counter = [0]
 
@@ -700,7 +774,8 @@ def main():
                 qpu_miner, nonces_and_models, num_reads_list,
                 annealing_time_list, interval_seconds, qpu_results,
                 queue_depth, total_tests, test_counter, output_file,
-                make_output_data, solver_props=solver_props
+                make_output_data, solver_props=solver_props,
+                completed_keys=completed_keys,
             )
         else:
             print(f"\n{'=' * 60}")
@@ -710,7 +785,7 @@ def main():
                 qpu_miner, nonces_and_models, num_reads_list,
                 annealing_time_list, interval_seconds, qpu_results,
                 total_tests, test_counter, output_file, make_output_data,
-                solver_props=solver_props
+                solver_props=solver_props, completed_keys=completed_keys,
             )
 
     print()
