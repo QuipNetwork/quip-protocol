@@ -323,13 +323,13 @@ class TestBuildGpuMinerCfg:
         from shared.node import _build_gpu_miner_cfg
 
         section = {
-            "gpu_utilization": 80,
+            "utilization": 80,
             "yielding": True,
             "backend": "local",  # not a miner key
         }
         result = _build_gpu_miner_cfg(section)
         assert result == {
-            "gpu_utilization": 80,
+            "utilization": 80,
             "yielding": True,
         }
 
@@ -337,15 +337,15 @@ class TestBuildGpuMinerCfg:
         from shared.node import _build_gpu_miner_cfg
 
         common = _build_gpu_miner_cfg({
-            "gpu_utilization": 80,
+            "utilization": 80,
             "yielding": False,
         })
         dev_cfg = _build_gpu_miner_cfg(
-            {"gpu_utilization": 50, "yielding": True},
+            {"utilization": 50, "yielding": True},
             defaults=common,
         )
         assert dev_cfg == {
-            "gpu_utilization": 50,
+            "utilization": 50,
             "yielding": True,
         }
 
@@ -353,15 +353,15 @@ class TestBuildGpuMinerCfg:
         from shared.node import _build_gpu_miner_cfg
 
         common = _build_gpu_miner_cfg({
-            "gpu_utilization": 80,
+            "utilization": 80,
             "yielding": True,
         })
         dev_cfg = _build_gpu_miner_cfg(
-            {"gpu_utilization": 50},
+            {"utilization": 50},
             defaults=common,
         )
         assert dev_cfg == {
-            "gpu_utilization": 50,
+            "utilization": 50,
             "yielding": True,
         }
 
@@ -369,13 +369,13 @@ class TestBuildGpuMinerCfg:
         from shared.node import _build_gpu_miner_cfg
 
         common = _build_gpu_miner_cfg({
-            "gpu_utilization": 100,
+            "utilization": 100,
         })
         dev_cfg = _build_gpu_miner_cfg(
             {},
             defaults=common,
         )
-        assert dev_cfg == {"gpu_utilization": 100}
+        assert dev_cfg == {"utilization": 100}
 
 
 class TestMpsConfiguration:

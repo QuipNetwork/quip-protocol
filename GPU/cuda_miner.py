@@ -81,7 +81,9 @@ class CudaMiner(GPUMiner):
         )
         self._update_mode = update_mode.lower()
 
-        gpu_util = cfg.pop('gpu_utilization', 100)
+        gpu_util = cfg.pop(
+            'utilization', cfg.pop('gpu_utilization', 100),
+        )
         yielding = cfg.pop('yielding', False)
         self.sms_per_nonce = cfg.pop('sms_per_nonce', 4)
 

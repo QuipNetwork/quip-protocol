@@ -13,6 +13,15 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _mock_iokit_monitor():
+    """Prevent IOKit polling on non-macOS platforms."""
+    with patch(
+        "GPU.metal_scheduler.MetalScheduler._start_iokit_monitor",
+    ):
+        yield
+
+
 class TestMetalSchedulerBudget:
     """Core budget computation from utilization config."""
 
