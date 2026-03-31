@@ -212,14 +212,19 @@ class NetworkNode(Node):
     """Peer-to-peer node for quantum blockchain network."""
 
     def __init__(self, config: dict, genesis_block: Block):
+        self.config = config
         self.bind_address = config.get("listen", "127.0.0.1")
         self.port = config.get("port", 20049)
 
         self.node_name = config.get("node_name", socket.getfqdn())
-        self.public_host = config.get("public_host", f"{get_local_ip()}:{self.port}")
-        # Default to local_ip only when we are listening on a local host.
-        # Note: We can't call asyncio.run() here since we're inside an async context.
-        # Public IP will be determined asynchronously during node startup if needed.
+        raw_public_host = config.get("public_host", get_local_ip())
+        if ":" in str(raw_public_host):
+            raise ValueError(
+                f"public_host must be a hostname or IP without a port, got: '{raw_public_host}'. "
+                "Use separate public_host and public_port settings."
+            )
+        public_port = config.get("public_port", self.port)
+        self.public_host = f"{raw_public_host}:{public_port}"
 
         self.secret = config.get("secret", f"quip network node secret {random.randint(0, 1000000)}")
         self.auto_mine = config.get("auto_mine", False)
@@ -234,15 +239,19 @@ class NetworkNode(Node):
         self.tls_cert_file = config.get("tls_cert_file")
         self.tls_key_file = config.get("tls_key_file")
         self.tls_enabled = bool(self.tls_cert_file and self.tls_key_file)
+        self.verify_tls = config.get("verify_tls", False)
 
         # TOFU (Trust On First Use) configuration
-        self.tofu_config = config.get("tofu", {})
-        self.tofu_enabled = self.tofu_config.get("enabled", True)
+        self.tofu_enabled = config.get("tofu", True)
+        self.trust_db = config.get("trust_db", "~/.quip/trust.db")
         self.trust_store = None  # Initialized in start()
 
-        # REST API configuration
-        self.rest_api_config = config.get("rest_api", {})
-        self.rest_api_enabled = self.rest_api_config.get("enabled", False)
+        # REST API configuration (enabled when rest_port > 0 or rest_insecure_port > 0)
+        self.rest_host = config.get("rest_host", "127.0.0.1")
+        self.rest_port = int(config.get("rest_port", -1))
+        self.rest_insecure_port = int(config.get("rest_insecure_port", 20050))
+        self.webroot = config.get("webroot")
+        self.rest_api_enabled = self.rest_port > 0 or self.rest_insecure_port > 0
         self.rest_api_server = None  # Initialized in start()
 
         # Initialize logger with helper function
@@ -253,12 +262,24 @@ class NetworkNode(Node):
         self.heartbeat_timeout = float(config.get("heartbeat_timeout", 300))
         self.node_timeout = float(config.get("node_timeout", 10))
 
-        self.initial_peers = config.get("peer", ["nodes.quip.network:20049"])
+        self.initial_peers = config.get("peer", [
+            "qpu-1.nodes.quip.network:20049",
+            "cpu-1.quip.carback.us:20049",
+            "gpu-1.quip.carback.us:20049",
+            "gpu-2.quip.carback.us:20050",
+            "nodes.quip.network:20049",
+        ])
         self.fanout = int(config.get("fanout", 3))
 
         self.net_lock = asyncio.Lock()
         self.running = False
         self.heartbeats = {}
+        self.peer_versions: dict[str, str] = {}  # peer_host -> version string
+        # Peer ban list is created here for pre-start checks (e.g. connect_to_peer);
+        # once NodeClient is initialised in start(), we share its ban_list instead.
+        from shared.peer_ban_list import PeerBanList
+        self._own_ban_list = PeerBanList(logger=self.logger)
+        self._ban_list: PeerBanList = self._own_ban_list
 
         self.gossip_lock = asyncio.Lock()
         self.recent_messages = set()
@@ -330,11 +351,7 @@ class NetworkNode(Node):
         # Maximum block index to synchronize with (prevents syncing with peers too far ahead)
         self.max_sync_block_index = 1024
 
-        self.miners_config = {
-            "cpu": config.get("cpu", None),
-            "gpu": config.get("gpu", None),
-            "qpu": config.get("qpu", None)
-        }
+        self.miners_config = config
         super().__init__(self.node_name, self.miners_config, genesis_block, secret=self.secret,
                          on_block_mined=self._on_block_received,
                          on_mining_started=self._network_on_mining_started,
@@ -432,14 +449,7 @@ class NetworkNode(Node):
         if self.tofu_enabled:
             import os
             from shared.trust_store import TrustStore
-            trust_db_path = os.path.expanduser(
-                self.tofu_config.get("trust_db", "~/.quip/trust.db")
-            )
-            # Clear trust DB on start if configured
-            if self.tofu_config.get("clear_on_start", False):
-                if os.path.exists(trust_db_path):
-                    os.remove(trust_db_path)
-                    self.logger.info(f"Cleared TOFU trust store at {trust_db_path}")
+            trust_db_path = os.path.expanduser(self.trust_db)
             self.trust_store = TrustStore(trust_db_path, logger=self.logger)
             await self.trust_store.initialize()
             self.logger.info(f"TOFU trust store initialized at {trust_db_path}")
@@ -448,8 +458,13 @@ class NetworkNode(Node):
         self.node_client = NodeClient(
             node_timeout=self.node_timeout,
             logger=self.logger,
+            verify_tls=self.verify_tls,
             trust_store=self.trust_store
         )
+        # Share a single ban list between NetworkNode and NodeClient so that
+        # protocol-level bans (version mismatch) also block QUIC connections.
+        self.node_client.ban_list = self._own_ban_list
+        self._ban_list = self._own_ban_list
         await self.node_client.start()
 
         # Start QUIC server
@@ -484,13 +499,27 @@ class NetworkNode(Node):
             from shared.rest_api import RestApiServer
             from shared.certificate_manager import CertificateManager
 
-            cert_manager = CertificateManager(self.rest_api_config, logger=self.logger)
+            # Only set up cert manager when HTTPS port is enabled
+            cert_manager = None
+            if self.rest_port > 0:
+                cert_config = {
+                    "rest_tls_cert_file": (
+                        self.config.get("rest_tls_cert_file")
+                        or self.config.get("tls_cert_file")
+                    ),
+                    "rest_tls_key_file": (
+                        self.config.get("rest_tls_key_file")
+                        or self.config.get("tls_key_file")
+                    ),
+                }
+                cert_manager = CertificateManager(cert_config, logger=self.logger)
             self.rest_api_server = RestApiServer(
                 network_node=self,
-                host=self.rest_api_config.get("host", "0.0.0.0"),
-                port=self.rest_api_config.get("http_port", 8080),
-                tls_port=self.rest_api_config.get("https_port", 443),
+                host=self.rest_host,
+                port=self.rest_insecure_port,
+                tls_port=self.rest_port,
                 cert_manager=cert_manager,
+                webroot=self.webroot,
                 logger=self.logger
             )
             await self.rest_api_server.start()
@@ -504,6 +533,7 @@ class NetworkNode(Node):
 
         # have we fully synchronized with the network at least one time?
         self._synchronized = threading.Event()
+        self._has_ever_had_peers = False  # distinguishes bootstrap (solo) from desync (lost peers)
         self.sync_block_cache = {}  # Regular dict is thread-safe for simple assignments in CPython
 
         # Sync failure tracking for consensus fallback
@@ -996,6 +1026,8 @@ class NetworkNode(Node):
             # Reset synchronization state if it exists (only after start() is called)
             if hasattr(self, '_synchronized'):
                 self._synchronized.clear()
+            if hasattr(self, '_has_ever_had_peers'):
+                self._has_ever_had_peers = False
             if hasattr(self, 'sync_block_cache'):
                 self.sync_block_cache.clear()
             
@@ -1171,17 +1203,42 @@ class NetworkNode(Node):
         """
         my_latest_block = self.get_latest_block()
         if not self.peers:
-            if self.auto_mine:
-                self.logger.debug("No connected peers, but auto-mine is enabled so we are synchronized by default")
+            if self.auto_mine and not self._has_ever_had_peers:
+                # True bootstrap: never had peers, solo mining OK
+                self.logger.debug("Bootstrap mode: no peers ever seen, auto-mine enabled")
+                self.set_synchronized()
+                return 0
+            elif self.auto_mine:
+                # Had peers before but lost them all — do not auto-sync.
+                # _synchronized was already cleared by remove_node(),
+                # so the mining guard in server_loop will block mining.
+                self.logger.debug("All peers lost, waiting for reconnection before mining")
                 return 0
             else:
                 raise RuntimeError("No peers to synchronize with")
 
+        # Filter to peers running a compatible version (same major.minor)
+        local_version = get_version()
+        local_major_minor = ".".join(local_version.split(".")[:2])
+        compatible_peers = []
+        for peer in self.peers:
+            peer_ver = self.peer_versions.get(peer)
+            if peer_ver is None:
+                # No version info yet (no heartbeat received) — include tentatively
+                compatible_peers.append(peer)
+            elif ".".join(peer_ver.split(".")[:2]) == local_major_minor:
+                compatible_peers.append(peer)
+            else:
+                self.logger.debug(f"Skipping peer {peer} for sync: version {peer_ver} != {local_version}")
+
+        if not compatible_peers:
+            self.logger.warning("No compatible-version peers available for sync")
+            return 0
+
         # Query up to 3 peers and take the highest valid response
         net_latest: Optional[BlockHeader] = None
-        peer_list = list(self.peers.keys())
-        sample_size = min(3, len(peer_list))
-        sampled = random.sample(peer_list, sample_size)
+        sample_size = min(3, len(compatible_peers))
+        sampled = random.sample(compatible_peers, sample_size)
 
         for peer in sampled:
             header = await self.get_peer_block_header(peer)
@@ -1251,8 +1308,15 @@ class NetworkNode(Node):
             self.logger.error("NodeClient not initialized")
             return False
 
-        # Update node client with current peers
-        self.node_client.update_peers(self.peers)
+        # Update node client with only compatible-version peers
+        local_version = get_version()
+        local_major_minor = ".".join(local_version.split(".")[:2])
+        compatible_peers = {
+            peer: info for peer, info in self.peers.items()
+            if self.peer_versions.get(peer) is None
+            or ".".join(self.peer_versions[peer].split(".")[:2]) == local_major_minor
+        }
+        self.node_client.update_peers(compatible_peers)
 
         synchronizer = BlockSynchronizer(
             node_client=self.node_client,
@@ -1336,6 +1400,9 @@ class NetworkNode(Node):
         if not self.node_client:
             return False
 
+        if self._is_backed_off(peer_address):
+            return False
+
         try:
             join_data = {
                 "host": self.public_host,
@@ -1372,9 +1439,21 @@ class NetworkNode(Node):
             self.telemetry.update_node(peer_address, "failed")
             return False
 
+    def _is_backed_off(self, peer_address: str) -> bool:
+        """Check if peer is currently banned."""
+        return self._ban_list.is_banned(peer_address)
+
+    async def _backoff_peer(self, peer_address: str, reason: str):
+        """Ban peer with exponential backoff and disconnect."""
+        self._ban_list.record_failure(peer_address, reason)
+        await self.remove_node(peer_address)
+
     async def add_peer(self, host: str, info: MinerInfo) -> bool:
         """Add a node to our registry."""
         if host == self.public_host:
+            return False
+
+        if self._is_backed_off(host):
             return False
 
         async with self.net_lock:
@@ -1388,6 +1467,7 @@ class NetworkNode(Node):
             self.telemetry.update_node(host, "active", info)
 
             if is_new:
+                self._has_ever_had_peers = True
                 self.logger.info(f"New peer discovered: {host}: {info.miner_id} ({info.ecdsa_public_key.hex()[:8]})")
                 self._on_new_node(host, info)
 
@@ -1405,13 +1485,25 @@ class NetworkNode(Node):
                 self.telemetry.remove_node(host)
                 self._on_node_lost(host)
 
+                # Clear synchronized state when all peers are lost
+                if not self.peers and self._has_ever_had_peers:
+                    self._synchronized.clear()
+                    self.logger.warning(
+                        "All peers lost — cleared synchronized state, "
+                        "mining paused until re-sync"
+                    )
+
                 # Update node client to remove peer
                 if self.node_client:
                     await self.node_client.remove_peer(host)
 
     async def send_heartbeat(self, node_host: str) -> bool:
-        """Send heartbeat to a specific node."""
-        if not self.node_client or not self.synchronized:
+        """Send heartbeat to a specific node.
+
+        Heartbeats are sent regardless of sync state so that desynced
+        nodes can maintain peer connections for re-synchronization.
+        """
+        if not self.node_client:
             return False
         return await self.node_client.send_heartbeat(node_host, self.public_host, self.info())
 
@@ -1751,6 +1843,25 @@ class NetworkNode(Node):
         except ValueError as e:
             return msg.create_error_response(str(e))
 
+        if self._is_backed_off(new_node_address):
+            return msg.create_error_response("backed off")
+
+        join_version = data.get("version")
+        if join_version:
+            local_version = get_version()
+            local_ver = version.parse(local_version)
+            peer_ver = version.parse(join_version)
+            if local_ver > peer_ver:
+                await self._backoff_peer(
+                    new_node_address,
+                    f"older version {join_version} "
+                    f"(local: {local_version})",
+                )
+                return msg.create_error_response(
+                    f"Version {join_version} too old"
+                )
+            self.peer_versions[new_node_address] = join_version
+
         # Add the new node
         await self.add_peer(new_node_address, new_node_info)
 
@@ -1773,6 +1884,11 @@ class NetworkNode(Node):
         net_version = data.get("version")
         timestamp = data.get("timestamp", utc_timestamp_float())
 
+        if sender and self._is_backed_off(sender):
+            return msg.create_response(
+                json.dumps({"status": "backed_off"}).encode('utf-8')
+            )
+
         if net_version:
             local_version = get_version()
             local_ver = version.parse(local_version)
@@ -1786,9 +1902,19 @@ class NetworkNode(Node):
                 self.logger.error("Please run 'pip install quip-network' to get the latest version")
                 await self.stop()
             elif local_ver > peer_ver:
-                self.logger.warning(
-                    f"Peer {sender} is running older version {net_version} (local: {local_version})"
+                await self._backoff_peer(
+                    sender,
+                    f"older version {net_version} "
+                    f"(local: {local_version})",
                 )
+                return msg.create_response(
+                    json.dumps(
+                        {"status": "incompatible_version"}
+                    ).encode('utf-8')
+                )
+
+        if sender and net_version:
+            self.peer_versions[sender] = net_version
 
         if sender:
             async with self.net_lock:

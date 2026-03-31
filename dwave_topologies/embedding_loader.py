@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 
 def load_embedding(
     topology_name: str,
-    solver_name: str = "Advantage2_system1_12",
+    solver_name: str = "Advantage2_system1_13",
     embeddings_dir: Optional[str] = None
 ) -> Optional[Dict]:
     """
@@ -21,7 +21,7 @@ def load_embedding(
 
     Args:
         topology_name: Name like "zephyr_z10_t2" or "Z(10,2)"
-        solver_name: Target solver name (default: "Advantage2_system1_12")
+        solver_name: Target solver name (default: "Advantage2_system1_13")
         embeddings_dir: Optional custom embeddings directory
 
     Returns:
@@ -76,7 +76,7 @@ def load_embedding(
 
 def get_embedding_dict(
     topology_name: str,
-    solver_name: str = "Advantage2_system1_12",
+    solver_name: str = "Advantage2_system1_13",
     convert_keys_to_int: bool = True
 ) -> Optional[Dict]:
     """
@@ -109,7 +109,7 @@ def get_embedding_dict(
     return embedding
 
 
-def list_available_embeddings(solver_name: str = "Advantage2_system1_12") -> List[Tuple[str, Dict]]:
+def list_available_embeddings(solver_name: str = "Advantage2_system1_13") -> List[Tuple[str, Dict]]:
     """
     List all available precomputed embeddings for a solver.
 
@@ -144,7 +144,7 @@ def list_available_embeddings(solver_name: str = "Advantage2_system1_12") -> Lis
     return results
 
 
-def embedding_exists(topology_name: str, solver_name: str = "Advantage2_system1_12") -> bool:
+def embedding_exists(topology_name: str, solver_name: str = "Advantage2_system1_13") -> bool:
     """
     Check if a precomputed embedding exists.
 

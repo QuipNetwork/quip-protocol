@@ -137,8 +137,8 @@ def setup_logging(
         file_handler.setLevel(numeric_level)
         file_handler.setFormatter(formatter)
 
-        # If file logging is enabled, also log to console at WARNING level or higher
-        console_handler.setLevel(max(numeric_level, logging.WARNING))
+        # Log to both file and console at the same level
+        console_handler.setLevel(numeric_level)
 
         root_logger.addHandler(file_handler)
 

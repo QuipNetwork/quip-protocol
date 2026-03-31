@@ -1,44 +1,170 @@
-# GitLab CI/CD for Quip Network Node Docker Images
-# Builds and pushes to GitLab Container Registry
+# GitLab CI/CD for Quip Network Node
+# Tests on branches, builds + releases on main/tags
 
 stages:
+  - test
   - build
+  - release
 
 variables:
-  DOCKER_TLS_CERTDIR: "/certs"
   CPU_IMAGE: quip-network-node-cpu
   CUDA_IMAGE: quip-network-node-cuda
 
-# Template for Docker builds
-.docker_build:
-  image: docker:24
-  services:
-    - docker:24-dind
-  before_script:
-    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+# ---------------------------------------------------------------------------
+# Tests (branches only — main/tags skip straight to build)
+# ---------------------------------------------------------------------------
 
-# Build and push CPU network node image
+test:
+  stage: test
+  image: python:3.12-slim
+  tags: [linux, amd64]
+  before_script:
+    - pip install -U pip setuptools wheel
+    - pip install -e ".[dev]"
+  script:
+    - python -m pytest tests/ -v --ignore=tests/test_certificate_manager.py
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+# ---------------------------------------------------------------------------
+# Docker image builds (Kaniko — no daemon required)
+# ---------------------------------------------------------------------------
+
+.docker_build:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  tags: [linux, amd64]
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(echo -n ${CI_REGISTRY_USER}:${CI_REGISTRY_PASSWORD} | base64)\"}}}" > /kaniko/.docker/config.json
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+
 build-cpu:
   extends: .docker_build
-  stage: build
   script:
-    - docker build -f docker/Dockerfile.cpu -t $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA .
-    - docker tag $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE/$CPU_IMAGE:latest
-    - docker push $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
-    - docker push $CI_REGISTRY_IMAGE/$CPU_IMAGE:latest
-  only:
-    - main
-    - tags
+    - /kaniko/executor
+        --context $CI_PROJECT_DIR
+        --dockerfile docker/Dockerfile.cpu
+        --destination $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
+        --destination $CI_REGISTRY_IMAGE/$CPU_IMAGE:latest
 
-# Build and push CUDA network node image
 build-cuda:
   extends: .docker_build
-  stage: build
   script:
-    - docker build -f docker/Dockerfile.cuda -t $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA .
-    - docker tag $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
-    - docker push $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA
-    - docker push $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
-  only:
-    - main
-    - tags
+    - /kaniko/executor
+        --context $CI_PROJECT_DIR
+        --dockerfile docker/Dockerfile.cuda
+        --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA
+        --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
+
+# ---------------------------------------------------------------------------
+# PyInstaller native binaries
+# ---------------------------------------------------------------------------
+
+.pyinstaller_build:
+  stage: build
+  variables:
+    PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+  script:
+    - bash pyinstaller/build.sh
+  artifacts:
+    paths:
+      - dist/quip-network-node-*
+    expire_in: 30 days
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+
+package-macos-arm64:
+  extends: .pyinstaller_build
+  tags: [macos, arm64]
+  before_script:
+    - /opt/homebrew/bin/python3 -m venv .venv
+    - source .venv/bin/activate
+    - pip install -U pip setuptools wheel
+    - pip install pyinstaller
+    - pip install -e ".[metal]"
+
+package-macos-x86_64:
+  extends: .pyinstaller_build
+  tags: [macos, x86_64]
+  before_script:
+    - /opt/homebrew/bin/python3 -m venv .venv
+    - source .venv/bin/activate
+    - pip install -U pip setuptools wheel
+    - pip install pyinstaller
+    - pip install -e .
+
+package-linux-x86_64:
+  extends: .pyinstaller_build
+  image: nvidia/cuda:12.6.3-base-ubuntu22.04
+  tags: [linux, x86_64]
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends python3 python3-dev python3-pip python3-venv libpython3.10 binutils cuda-cudart-12-6 cuda-nvrtc-12-6
+    - python3 -m venv .venv
+    - source .venv/bin/activate
+    - pip install -U pip setuptools wheel
+    - pip install pyinstaller
+    - pip install -e ".[cuda]"
+
+package-windows-x86_64:
+  extends: .pyinstaller_build
+  tags: [windows, x86_64]
+  before_script:
+    - $env:Path = "D:\GitLab-Runner\venv\Scripts;C:\Program Files\Git\cmd;" + $env:Path
+    - python -m venv .venv
+    - .\.venv\Scripts\Activate.ps1
+    - python -m pip install -U pip setuptools wheel
+    - python -m pip install pyinstaller
+    - python -m pip install -e ".[cuda]"
+  script:
+    - pyinstaller pyinstaller/quip_network_node.spec --distpath dist --workpath build/pyinstaller --clean
+    - $binary = Get-ChildItem dist/quip-network-node-* | Select-Object -First 1
+    - '& $($binary.FullName) --version'
+  artifacts:
+    paths:
+      - dist/quip-network-node-*.exe
+    expire_in: 30 days
+
+# ---------------------------------------------------------------------------
+# Release (tags only)
+# ---------------------------------------------------------------------------
+
+release-binaries:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  tags: [linux, amd64]
+  needs:
+    - package-macos-arm64
+    - package-macos-x86_64
+    - package-linux-x86_64
+    - package-windows-x86_64
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - echo "Creating release $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    description: "Release $CI_COMMIT_TAG"
+    assets:
+      links:
+        - name: quip-network-node-macos-arm64
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-macos-arm64?job=package-macos-arm64"
+          filepath: /quip-network-node-macos-arm64
+        - name: quip-network-node-macos-x86_64
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-macos-x86_64?job=package-macos-x86_64"
+          filepath: /quip-network-node-macos-x86_64
+        - name: quip-network-node-linux-x86_64
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-linux-x86_64?job=package-linux-x86_64"
+          filepath: /quip-network-node-linux-x86_64
+        - name: quip-network-node-windows-x86_64.exe
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-windows-x86_64.exe?job=package-windows-x86_64"
+          filepath: /quip-network-node-windows-x86_64.exe

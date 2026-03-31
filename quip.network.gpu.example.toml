@@ -16,8 +16,8 @@ secret = "your-secret-here" # Used to generate a deterministic key pair for this
 # auto_mine = true
 
 
-# Peers to try and connect to, defaults to "nodes.quip.network:20049"
-# peer = ["nodes.quip.network:20049", "peer2.quip.network:20049"]
+# Peers to try and connect to (defaults shown below)
+# peer = ["qpu-1.nodes.quip.network:20049", "cpu-1.quip.carback.us:20049", "gpu-1.quip.carback.us:20049", "gpu-2.quip.carback.us:20050", "nodes.quip.network:20049"]
 
 timeout = 3  # Timeout for peer connections and communications in seconds
 heartbeat_interval = 15  # Interval for sending heartbeats to peers in seconds
@@ -26,7 +26,7 @@ heartbeat_timeout = 300  # Timeout for waiting for heartbeats from peers in seco
 # fanout = 3
 
 # TLS/SSL Configuration
-verify_ssl = true  # Verify SSL/TLS certificates when connecting to peers
+verify_tls = false  # Verify TLS certificates when connecting to peers
 # ca_bundle = "/path/to/ca-certificates.crt"  # Custom CA certificate bundle (optional)
 
 # Logging configuration
@@ -42,36 +42,18 @@ http_log = "logs/quip-node-http.log"  # Path to HTTP/aiohttp log file (optional,
 # num_cpus = 4
 
 [gpu]
-# Backend selection: "local" (default) uses local GPUs (CUDA/ROCm/MPS). "modal" uses Modal cloud GPUs.
-backend = "local"
-# For local backend: list devices to use (e.g., CUDA ordinals like "0", "1"). If omitted, runtime may auto-detect.
-devices = ["0", "1"]
-# For modal backend: list GPU types to use (e.g., ["t4", "a10g"]).
-# types = ["t4", "a10g"]
-
-# GPU utilization ceiling (1-100). Limits SM budget via kernel
-# count, and sets CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for hardware
-# enforcement when MPS is active.
-# gpu_utilization = 100
-
-# Yield GPU to other processes. Enables NVML-adaptive nonce
-# scaling that reduces kernel count when external GPU load is
-# detected. Requires pynvml.
+# Global GPU defaults
+# utilization = 100
 # yielding = false
-
-# SMs per nonce for Gibbs sampler (default 4). Higher values
-# give each nonce more parallelism at the cost of fewer
-# concurrent nonces.
 # sms_per_nonce = 4
 
-# [qpu]  # Commented out for GPU-only node
-# Credentials and region for D-Wave
-# If omitted here, can be supplied on CLI
-# Endpoint defaults to na-west-1 SAPI
-# DWAVE_API_TOKEN
-# DWAVE_API_SOLVER
-# DWAVE_API_ENDPOINT
-# Fill as desired:
-# dwave_api_key = "..."
-# dwave_api_solver = "Advantage_system6.4"
-# dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+# Discovery commands:
+#   CUDA:  nvidia-smi --query-gpu=index,name --format=csv,noheader
+#   Metal: system_profiler SPDisplaysDataType | grep 'Chipset Model'
+
+[cuda.0]
+
+[cuda.1]
+
+# Apple Silicon example:
+# [metal]

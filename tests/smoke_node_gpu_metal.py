@@ -17,8 +17,8 @@ from shared.block import create_genesis_block
 async def run():
     miners_config = {
         "global": {"host": "0.0.0.0", "port": 8086},
-        # Use 'mps' device to trigger Metal/MPS path in GPUSampler
-        "gpu": {"backend": "local", "devices": ["mps"]},
+        # backend=mps routes to Metal miner in Node (local=CUDA only)
+        "gpu": {"backend": "mps"},
     }
     genesis_block = create_genesis_block()
     node = Node(node_id="node-gpu-metal", miners_config=miners_config, genesis_block=genesis_block)

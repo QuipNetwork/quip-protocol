@@ -1027,8 +1027,8 @@ Examples:
     parser.add_argument(
         '--topology',
         type=str,
-        default='Advantage2_system1.12',
-        help='Topology name for chart titles (default: Advantage2_system1.12)'
+        default='Advantage2_system1.13',
+        help='Topology name for chart titles (default: Advantage2_system1.13)'
     )
     parser.add_argument(
         '--mc-sims',

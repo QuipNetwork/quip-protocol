@@ -3,6 +3,7 @@
 from blake3 import blake3
 import json
 import struct
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
@@ -950,6 +951,13 @@ def load_genesis_block(genesis_block_filepath: str) -> 'Block':
         json.JSONDecodeError: If JSON is malformed
     """
     config_path = Path(genesis_block_filepath)
+    # Resolve bundled genesis file in frozen binaries (PyInstaller)
+    if not config_path.is_absolute() and not config_path.exists():
+        _meipass = getattr(sys, "_MEIPASS", None)
+        if _meipass:
+            _bundled = Path(_meipass) / genesis_block_filepath
+            if _bundled.exists():
+                config_path = _bundled
     logger.info(f"Loading genesis block from: {config_path.name}")
     with open(config_path, 'r') as f:
         genesis_data = json.load(f)

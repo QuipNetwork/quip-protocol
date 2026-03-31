@@ -5,7 +5,7 @@ This tool tests CPU simulated annealing performance with various sweep/read conf
 
 TOPOLOGY OPTIONS:
 -----------------
-1. Default (Advantage2_system1.12):
+1. Default (Advantage2_system1.13):
    python tools/cpu_baseline.py
    - Uses full Advantage2 hardware topology (4,582 qubits)
 
@@ -52,10 +52,10 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
         only_label: Run only specific config (e.g., "Light CPU")
         topology: Topology to use. Can be:
                   - Z(m,t) format for perfect Zephyr topology (e.g., "Z(9,2)")
-                  - Hardware name (e.g., "Advantage2_system1.12")
+                  - Hardware name (e.g., "Advantage2_system1.13")
                   - File path to topology JSON (e.g., "path/to/topology.json.gz")
                   - File path to embedding (e.g., "path/to/*.embed.json.gz") - auto-detected
-                  Default: Advantage2_system1.12
+                  Default: Advantage2_system1.13
     """
     if h_values is None:
         h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
@@ -85,7 +85,7 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
 
             # Load embedding data
             print(f"🔗 Loading embedded topology: {topology}")
-            embedding_data = load_embedding(topology_name, "Advantage2_system1.12")
+            embedding_data = load_embedding(topology_name, "Advantage2_system1.13")
             if not embedding_data:
                 print(f"❌ Failed to load embedding file")
                 return None
@@ -99,8 +99,8 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
             source_topology = zephyr(m, t)
 
             # Get hardware topology
-            from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_12_TOPOLOGY
-            hardware_topology = ADVANTAGE2_SYSTEM1_12_TOPOLOGY
+            from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_13_TOPOLOGY
+            hardware_topology = ADVANTAGE2_SYSTEM1_13_TOPOLOGY
         else:
             raise ValueError(f"Cannot parse embedding filename: {filename}")
 
@@ -143,7 +143,7 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
         cpu_sampler = SimulatedAnnealingStructuredSampler()
 
     else:
-        print(f"✨ Using default topology (Advantage2_system1.12)")
+        print(f"✨ Using default topology (Advantage2_system1.13)")
         topo_obj = DEFAULT_TOPOLOGY
         cpu_sampler = SimulatedAnnealingStructuredSampler()
         nodes = list(topo_obj.graph.nodes) if hasattr(topo_obj, 'graph') else topo_obj.nodes
@@ -424,8 +424,8 @@ def main():
     parser.add_argument(
         '--topology',
         type=str,
-        help='Topology: Z(9,2), Advantage2_system1.12, file path, or *.embed.json.gz for embedded. '
-             'Default: Advantage2_system1.12'
+        help='Topology: Z(9,2), Advantage2_system1.13, file path, or *.embed.json.gz for embedded. '
+             'Default: Advantage2_system1.13'
     )
 
     args = parser.parse_args()

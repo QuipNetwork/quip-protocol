@@ -16,8 +16,8 @@ secret = "your-secret-here" # Used to generate a deterministic key pair for this
 # auto_mine = true
 
 
-# Peers to try and connect to, defaults to "nodes.quip.network:20049"
-# peer = ["nodes.quip.network:20049", "peer2.quip.network:20049"]
+# Peers to try and connect to (defaults shown below)
+# peer = ["qpu-1.nodes.quip.network:20049", "cpu-1.quip.carback.us:20049", "gpu-1.quip.carback.us:20049", "gpu-2.quip.carback.us:20050", "nodes.quip.network:20049"]
 
 timeout = 3  # Timeout for peer connections and communications in seconds
 heartbeat_interval = 15  # Interval for sending heartbeats to peers in seconds
@@ -26,7 +26,7 @@ heartbeat_timeout = 300  # Timeout for waiting for heartbeats from peers in seco
 # fanout = 3
 
 # TLS/SSL Configuration
-verify_ssl = true  # Verify SSL/TLS certificates when connecting to peers
+verify_tls = false  # Verify TLS certificates when connecting to peers
 # ca_bundle = "/path/to/ca-certificates.crt"  # Custom CA certificate bundle (optional)
 
 # Logging configuration
@@ -50,18 +50,22 @@ http_log = "logs/quip-node-http.log"  # Path to HTTP/aiohttp log file (optional,
 # types = ["t4", "a10g"]
 
 [qpu]
-# Credentials and region for D-Wave
-# If omitted here, can be supplied on CLI
-# Endpoint defaults to na-west-1 SAPI
-# DWAVE_API_TOKEN
-# DWAVE_API_SOLVER
-# DWAVE_API_ENDPOINT
-# Fill as desired:
-dwave_api_key = "..."
-dwave_api_solver = "Advantage_system6.4"
-dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+# Global QPU defaults
 
-# QPU Time Budget Management
-# Daily budget with proportional pacing - spreads usage across the day
-# Calculate from your monthly allocation (e.g., 30 min/month = 60s/day)
-qpu_daily_budget = "60s"
+# Supported QPU types: dwave, ibm, braket, pasqal, ionq, origin
+# D-Wave requires: dwave_api_key, dwave_api_solver, dwave_region_url
+# All others require: token
+
+[dwave]
+token = "..."
+solver = "Advantage_system6.4"
+dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+daily_budget = "60s"
+
+# IBM Quantum example:
+# [ibm]
+# token = "..."
+
+# Amazon Braket example:
+# [braket]
+# token = "..."

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quip-protocol"
-version = "0.0.2"
+version = "0.0.4"
 description = "Quantum Proof-of-Work Blockchain Implementation"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -71,6 +71,7 @@ include = ["shared*", "dwave_topologies*", "CPU*", "GPU*", "QPU*"]
 
 [tool.setuptools.package-data]
 dwave_topologies = ["topologies/*.json.gz", "embeddings/*.json.gz"]
+GPU = ["*.cu", "*.metal"]
 "*" = ["genesis_block_public.json"]
 
 [tool.pytest.ini_options]

@@ -8,6 +8,7 @@ Runs alongside the QUIC server on a separate port.
 import asyncio
 import json
 import logging
+import os
 import ssl
 import struct
 import time
@@ -76,6 +77,7 @@ class RestApiServer:
         port: int = 8080,
         tls_port: int = 443,
         cert_manager: Optional['CertificateManager'] = None,
+        webroot: Optional[str] = None,
         logger: Optional[logging.Logger] = None
     ):
         """
@@ -87,6 +89,7 @@ class RestApiServer:
             port: HTTP port (non-TLS)
             tls_port: HTTPS port (TLS)
             cert_manager: Certificate manager for TLS
+            webroot: Directory to serve static files from (for ACME challenges)
             logger: Logger instance
         """
         self.node = network_node
@@ -94,6 +97,7 @@ class RestApiServer:
         self.http_port = port
         self.https_port = tls_port
         self.cert_manager = cert_manager
+        self.webroot = webroot
         self.logger = logger or logging.getLogger(__name__)
 
         self._http_runner: Optional[web.AppRunner] = None
@@ -119,6 +123,13 @@ class RestApiServer:
         app.router.add_post("/api/v1/gossip", self.handle_gossip)
         app.router.add_post("/api/v1/solve", self.handle_solve)
         app.router.add_post("/api/v1/heartbeat", self.handle_heartbeat)
+
+        # Static file hosting (ACME HTTP-01 challenges, etc.)
+        if self.webroot and os.path.isdir(self.webroot):
+            well_known = os.path.join(self.webroot, ".well-known")
+            os.makedirs(well_known, exist_ok=True)
+            app.router.add_static("/.well-known", well_known, show_index=False)
+            self.logger.info(f"Serving static files from {well_known} at /.well-known/")
 
         # OPTIONS handler for CORS preflight
         app.router.add_route("OPTIONS", "/{path:.*}", self.handle_options)

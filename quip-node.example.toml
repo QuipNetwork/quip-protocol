@@ -1,11 +1,12 @@
 [global]
-node_name = "Quantum Node Name"  # Optional human-readable name for your node. 
+node_name = "Quantum Node Name"  # Optional human-readable name for your node.
 
 # Local binding address (ip address) and port to listen to.
 listen = "0.0.0.0"
 port = 20049 # ("QN" -> little endian unsigned int is 0x514E -> 0x4E51 = 20049)
 
-#public_host = "my.dns.or.ip:public_port"
+# public_host = "my.dns.or.ip"
+# public_port = 20049  # Defaults to port if not set
 
 # Optional deterministic key generation
 # Defaults to generate a brand new key on boot.
@@ -17,10 +18,10 @@ secret = "your-secret-here" # Used to generate a deterministic key pair for this
 
 # Genesis block configuration file path
 # Defaults to "genesis_block.json" if not specified
-# genesis_config = "genesis_block_testnet.json"
+genesis_config = "genesis_block.json"
 
-# Peers to try and connect to, defaults to "nodes.quip.network:20049"
-# peer = ["nodes.quip.network:20049", "peer2.quip.network:20049"]
+# Peers to try and connect to (defaults shown below)
+# peer = ["qpu-1.nodes.quip.network:20049", "cpu-1.quip.carback.us:20049", "gpu-1.quip.carback.us:20049", "gpu-2.quip.carback.us:20050", "nodes.quip.network:20049"]
 
 timeout = 3  # Timeout for peer connections and communications in seconds
 heartbeat_interval = 15  # Interval for sending heartbeats to peers in seconds
@@ -28,37 +29,25 @@ heartbeat_timeout = 300  # Timeout for waiting for heartbeats from peers in seco
 # Number of peers to gossip to at a time. Defaults to 3, you should never need to change this.
 # fanout = 3
 
-# TLS/SSL Configuration for QUIC peer-to-peer
-verify_ssl = true  # Verify SSL/TLS certificates when connecting to peers
+# TLS Configuration
+verify_tls = false  # Verify TLS certificates when connecting to peers
 # ca_bundle = "/path/to/ca-certificates.crt"  # Custom CA certificate bundle (optional)
 
+# TLS certificates — shared by QUIC and REST (certbot manages these in Docker)
+# tls_cert_file = "/data/certs/private/fullchain.pem"
+# tls_key_file = "/data/certs/private/privkey.pem"
+# rest_tls_cert_file = "..."  # Optional REST-only override
+# rest_tls_key_file = "..."   # Optional REST-only override
+
 # TOFU (Trust On First Use) - Certificate pinning for peer-to-peer security
-[tofu]
-enabled = true  # Enable TOFU certificate fingerprint verification
-trust_db = "~/.quip/trust.db"  # SQLite database for storing peer fingerprints
+tofu = true
+trust_db = "~/.quip/trust.db"
 
-# REST API - HTTP/HTTPS server for browser and external access
-[rest_api]
-enabled = false  # Set to true to enable REST API
-host = "0.0.0.0"  # Bind address for REST API
-http_port = 8080  # HTTP port (non-TLS, for development/local access)
-https_port = 443  # HTTPS port (TLS, for production browser access)
-
-# Certificate acquisition priority:
-# 1. Use these files if provided and valid
-# rest_tls_cert_file = "/etc/letsencrypt/live/your-domain.com/fullchain.pem"
-# rest_tls_key_file = "/etc/letsencrypt/live/your-domain.com/privkey.pem"
-
-# 2. Attempt ACME/Let's Encrypt if domain and email are configured (requires port 80)
-# rest_domain = "api.your-node.example.com"
-# acme_email = "admin@example.com"
-# acme_staging = false  # Use Let's Encrypt staging server for testing
-
-# 3. If neither above works, a self-signed certificate is generated automatically
-# Browser users will see certificate warnings, but node-to-node QUIC is unaffected
-
-# Directory to store generated certificates
-cert_dir = "~/.quip/certs"
+# REST API (enabled when rest_port > 0 or rest_insecure_port > 0)
+rest_host = "127.0.0.1"
+rest_port = -1              # HTTPS port, -1 = disabled
+rest_insecure_port = 20050  # HTTP port
+# webroot = "/data/webroot"  # Static file dir (serves /.well-known/ for ACME challenges)
 
 # Logging configuration
 log_level = "INFO"  # DEBUG, INFO, WARNING, ERROR
@@ -77,64 +66,69 @@ telemetry_dir = "telemetry"  # Directory for telemetry output
 num_cpus = 4
 
 [gpu]
-# Backend selection: "local" (default) uses local GPUs (CUDA/ROCm/MPS). "modal" uses Modal cloud GPUs.
-backend = "local"
-# For local backend: list devices to use (e.g., CUDA ordinals like "0", "1"). If omitted, runtime may auto-detect.
-devices = ["0", "1"]
-# For modal backend: list GPU types to use (e.g., ["t4", "a10g"]).
-# types = ["t4", "a10g"]
+# Global GPU defaults — inherited by all GPU device sections below.
+# utilization = 100  # 1-100, percentage of SMs to use
+# yielding = false   # true = yield to other GPU users
+# enabled = true     # false = skip this device
 
-# GPU utilization ceiling (1-100). Limits SM budget via kernel
-# count, and sets CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for hardware
-# enforcement when MPS is active.
-# gpu_utilization = 100
+# Discovery commands:
+#   CUDA:  nvidia-smi --query-gpu=index,name --format=csv,noheader
+#   Metal: system_profiler SPDisplaysDataType | grep 'Chipset Model'
 
-# Yield GPU to other processes. Enables NVML-adaptive nonce
-# scaling that reduces kernel count when external GPU load is
-# detected. Requires pynvml.
-# yielding = false
+# ── CUDA / NVIDIA GPUs ──
+# [cuda.N] or [nvidia.N] — one section per device ordinal.
+# [nvidia.N] is an alias for [cuda.N].
 
-# SMs per nonce for Gibbs sampler (default 4). Higher values
-# give each nonce more parallelism at the cost of fewer
-# concurrent nonces.
-# sms_per_nonce = 4
+[cuda.0]
+# inherits [gpu] defaults
+
+[cuda.1]
+# utilization = 50
+# yielding = true
+
+# ── Apple Silicon (Metal) ──
+# [metal]
+
+# ── Modal cloud GPU ──
+# [modal]
+# gpu_type = "a10g"
+
+# ── QPU Configuration ──
 
 [qpu]
-# Credentials and region for D-Wave
-# If omitted here, can be supplied on CLI
-# Endpoint defaults to na-west-1 SAPI
-# DWAVE_API_TOKEN
-# DWAVE_API_SOLVER
-# DWAVE_API_ENDPOINT
-# Fill as desired:
-# dwave_api_key = "..."
-# dwave_api_solver = "Advantage_system6.4"
-# dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
-
+# Global QPU defaults — inherited by all QPU device sections below.
+#
 # QPU Time Budget Management
 # Controls QPU usage to prevent exceeding your Leap allocation.
-# Check your Leap Dashboard for your monthly allocation.
-#
-# Daily QPU time budget - calculate from your monthly allocation
+# Daily budget with proportional pacing — spreads usage across the day.
 # Example: With 20 minutes/month, set daily budget to ~40s (20m / 30 days)
 # Supports: 30s, 5m, 2h, etc.
-#
-# Budget is spread proportionally across the day using proportional pacing:
-# - At 6 AM UTC (25% of day): can use up to 25% of budget (10s)
-# - At noon UTC (50% of day): can use up to 50% of budget (20s)
-# - At 6 PM UTC (75% of day): can use up to 75% of budget (30s)
-# - Day resets at UTC midnight
-#
-# This prevents exhausting your entire budget early in the day.
-qpu_daily_budget = "60s"
-#
-# Minimum blocks to mine before EMA estimation kicks in
-# Until this threshold, uses conservative max(observed) * 1.5 estimate
-# Default: 5
+
+# ── D-Wave ──
+[dwave]
+daily_budget = "60s"
+# token = "..."
+# solver = "Advantage_system6.4"
+# dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
 # qpu_min_blocks_for_estimation = 5
-#
-# EMA decay factor for time estimation (0.0-1.0)
-# Higher values give more weight to recent block times
-# Default: 0.3
 # qpu_ema_alpha = 0.3
 
+# ── IBM Quantum ──
+# [ibm]
+# token = "..."
+
+# ── Amazon Braket ──
+# [braket]
+# token = "..."
+
+# ── Pasqal ──
+# [pasqal]
+# token = "..."
+
+# ── IonQ ──
+# [ionq]
+# token = "..."
+
+# ── Origin Quantum ──
+# [origin]
+# token = "..."

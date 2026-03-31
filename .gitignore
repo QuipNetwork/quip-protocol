@@ -35,6 +35,7 @@ mining_rate_*.json
 
 # Build outputs
 **/dist/
+build/pyinstaller/
 akash/web/localhost.pem
 node_modules
 # Dependencies (installed by bun/npm - developer only)
@@ -66,3 +67,6 @@ localhost.pem
 flamegraphs/
 # Benchmark outputs
 benchmarks/
+
+# TLS private keys (certbot output in Docker data volume)
+data/certs/private/

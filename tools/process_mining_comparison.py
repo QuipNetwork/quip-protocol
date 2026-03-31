@@ -75,7 +75,7 @@ def detect_model(log_content: str, miner_type: str) -> str:
         return match.group(1).strip() if match else 'h100'
     elif miner_type == 'qpu':
         match = PATTERNS['qpu_topology'].search(log_content)
-        return match.group(1) if match else 'Advantage2_system1.12'
+        return match.group(1) if match else 'Advantage2_system1.13'
     return 'unknown'
 
 
