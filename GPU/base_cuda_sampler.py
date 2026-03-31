@@ -97,6 +97,10 @@ class BaseCudaSampler(abc.ABC):
         self.logger = logging.getLogger(
             type(self).__module__,
         )
+        if max_sms == 0:
+            max_sms = cp.cuda.Device().attributes[
+                'MultiProcessorCount'
+            ]
         self.max_sms = max_sms
         self.sampler_type = sampler_type
 
@@ -968,10 +972,26 @@ class BaseCudaSampler(abc.ABC):
             self.signal_exit(wait=False)
 
     def close(self) -> None:
-        """Synchronize and release CUDA streams."""
+        """Synchronize streams and free GPU buffers.
+
+        Explicitly deletes device arrays so CuPy's memory
+        pool can reclaim them immediately, rather than
+        waiting for GC. Includes both SA-specific and
+        Gibbs-specific attrs — hasattr guards handle
+        whichever sampler type is active.
+        """
         if not self._sf_prepared:
             return
         self._sf_stream_compute.synchronize()
         self._sf_stream_transfer.synchronize()
         self._sf_kernel_running = False
         self._sf_prepared = False
+
+        for attr in (
+            '_d_sf_J', '_d_sf_h', '_d_sf_samples',
+            '_d_sf_energies', '_d_sf_ctrl', '_d_sf_beta',
+            '_d_sf_profile', '_d_sf_delta_energy',
+            '_d_sf_block_starts', '_d_sf_block_counts',
+        ):
+            if hasattr(self, attr):
+                delattr(self, attr)

@@ -19,7 +19,7 @@ import numpy as np
 
 from shared.block_requirements import BlockRequirements, compute_current_requirements
 from shared.energy_utils import (
-    energy_to_difficulty,
+    energy_to_difficulty as _energy_to_difficulty,
     DEFAULT_NUM_NODES,
     DEFAULT_NUM_EDGES,
 )
@@ -210,6 +210,33 @@ class BaseMiner(ABC):
     ADAPT_MAX_BONUS_READS: int = 0
     # Extra keys merged into the returned dict (e.g. num_sweeps_per_beta)
     ADAPT_EXTRA_PARAMS: Dict[str, Any] = {}
+    # Calibrated c_range for this miner's energy curve.
+    # Override in subclasses with empirically measured values.
+    # None = use DEFAULT_C_RANGE from energy_utils (SA baseline).
+    ADAPT_C_RANGE: Optional[Tuple[float, float]] = None
+
+    @classmethod
+    def energy_to_difficulty(
+        cls,
+        target_energy: float,
+        num_nodes: int = DEFAULT_NUM_NODES,
+        num_edges: int = DEFAULT_NUM_EDGES,
+    ) -> float:
+        """Convert energy target to [0, 1] difficulty for this miner.
+
+        Uses the miner's ADAPT_C_RANGE if set, otherwise falls
+        back to the SA baseline. Override in subclasses for
+        fundamentally different difficulty mappings.
+        """
+        kwargs = {}
+        if cls.ADAPT_C_RANGE is not None:
+            kwargs['c_range'] = cls.ADAPT_C_RANGE
+        return _energy_to_difficulty(
+            target_energy,
+            num_nodes=num_nodes,
+            num_edges=num_edges,
+            **kwargs,
+        )
 
     @classmethod
     def adapt_parameters(
@@ -238,7 +265,7 @@ class BaseMiner(ABC):
         Returns:
             Dictionary with miner-specific parameter keys.
         """
-        difficulty = energy_to_difficulty(
+        difficulty = cls.energy_to_difficulty(
             difficulty_energy,
             num_nodes=num_nodes,
             num_edges=num_edges,
