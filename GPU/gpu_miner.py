@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import signal
 import sys
+import threading
 import time
 from typing import (
     Dict, Iterator, List, Optional, Tuple,
@@ -39,7 +40,6 @@ except ImportError:
 # Pipeline constants
 # ----------------------------------------------------------
 
-_PIPELINE_STALL_FLOOR = 60.0
 # Empirical: on the Advantage topology (4580 nodes, 32k edges),
 # SA takes ~30ms per sweep×read at num_reads=64.  Use a 5×
 # safety margin to cover cold start, high reads, and contention.
@@ -109,7 +109,10 @@ class GPUMiner(BaseMiner):
         self._feeder: Optional[IsingFeeder] = None
         self._stream: Optional[Iterator] = None
 
-        signal.signal(signal.SIGTERM, self._cleanup_handler)
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(
+                signal.SIGTERM, self._cleanup_handler,
+            )
 
     def _init_cuda_device(
         self,
@@ -140,16 +143,15 @@ class GPUMiner(BaseMiner):
     # ----------------------------------------------------------
 
     def _pre_mine_setup(self, *args, **kwargs) -> bool:
-        """Set CUDA device and create IsingFeeder."""
-        try:
-            cp.cuda.Device(int(self.device)).use()
-        except Exception as e:
-            self.logger.error(
-                f"Failed to set device context: {e}",
-            )
-            return False
+        """Create IsingFeeder, then activate CUDA device.
 
-        # Extract block context from BaseMiner's positional args
+        Order matters: IsingFeeder spawns worker processes
+        via 'spawn' context. Creating it BEFORE CUDA
+        activation ensures workers start from a clean
+        state with no inherited GPU driver handles.
+        """
+        # Extract block context from BaseMiner's positional
+        # args — no CUDA needed for this.
         prev_block = args[0] if len(args) > 0 else None
         node_info = args[1] if len(args) > 1 else None
         if prev_block is None or node_info is None:
@@ -159,6 +161,9 @@ class GPUMiner(BaseMiner):
             return False
 
         cur_index = prev_block.header.index + 1
+
+        # get_sm_budget() uses cached _device_sms — no
+        # CUDA call needed.
         budget = self._scheduler.get_sm_budget()
         num_k = max(
             1, budget // self.sampler._sms_per_nonce,
@@ -168,6 +173,9 @@ class GPUMiner(BaseMiner):
         self._max_nonces = num_k
         self._active_nonces = num_k
 
+        # Create feeder BEFORE CUDA activation so spawn
+        # workers don't inherit GPU context.
+        feeder_seed = kwargs.pop('feeder_seed', None)
         self._feeder = IsingFeeder(
             prev_hash=prev_block.hash,
             miner_id=node_info.miner_id,
@@ -175,7 +183,20 @@ class GPUMiner(BaseMiner):
             nodes=self.sampler.nodes,
             edges=self.sampler.edges,
             buffer_size=num_k * 2,
+            seed=feeder_seed,
         )
+
+        # Now activate CUDA — safe because feeder workers
+        # are already forked from clean state.
+        try:
+            cp.cuda.Device(int(self.device)).use()
+        except Exception as e:
+            self.logger.error(
+                f"Failed to set device context: {e}",
+            )
+            self._feeder.stop()
+            self._feeder = None
+            return False
 
         self._stream = None
 
@@ -244,10 +265,13 @@ class GPUMiner(BaseMiner):
                 if k not in ('num_reads', 'num_sweeps')
             }
             num_k = self._active_nonces
+            # Timeout = expected time for one nonce to
+            # complete, with safety margin. Capped at 30min
+            # to account for slow cards.
             stall_timeout = max(
-                _PIPELINE_STALL_FLOOR,
                 num_sweeps * _SEC_PER_SWEEP
                 * _STALL_SAFETY_FACTOR,
+                1800.0,
             )
             self._stream = (
                 self.sampler.sample_ising_streaming(
@@ -299,18 +323,34 @@ class GPUMiner(BaseMiner):
         return sampleset
 
     def _post_mine_cleanup(self) -> None:
-        """Stop stream and feeder. Non-blocking.
+        """Stop stream, sync GPU, kill feeder, free buffers.
 
-        Signals the GPU kernel to exit but does not wait for
-        it — the worker process is about to exit or start
-        a new block, so blocking on kernel sync is wasteful.
+        Ordering:
+        1. Close stream — signals kernel to exit
+        2. Sync GPU compute stream — kernel must stop
+           before feeder data it reads is freed
+        3. Stop feeder — kills worker processes
+        4. Close sampler — frees GPU buffers
         """
         if self._stream is not None:
             self._stream.close()
             self._stream = None
+
+        # Sync GPU before killing feeder — kernel must be
+        # stopped before feeder data is freed.
+        if (
+            hasattr(self, 'sampler')
+            and self.sampler is not None
+            and getattr(self.sampler, '_sf_prepared', False)
+        ):
+            self.sampler._sf_stream_compute.synchronize()
+
         if self._feeder is not None:
             self._feeder.stop()
             self._feeder = None
+
+        if hasattr(self, 'sampler') and self.sampler is not None:
+            self.sampler.close()
 
     def _cleanup_handler(self, signum, frame):
         """Handle SIGTERM: stop feeder, signal kernel, exit."""

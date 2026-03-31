@@ -1,10 +1,19 @@
-"""Background Ising model generator with ProcessPoolExecutor."""
+"""Background Ising model generator with ProcessPoolExecutor.
+
+Uses processes with 'spawn' context to avoid inheriting CUDA
+state from the parent. Ising model generation involves
+Python-level dict comprehension that holds the GIL, so threads
+would serialize the work.
+"""
 from __future__ import annotations
 
 import logging
+import multiprocessing as _mp
 import os
 import queue
 import random
+import signal as _signal
+import time
 from concurrent.futures import ProcessPoolExecutor
 from typing import Optional
 
@@ -16,6 +25,8 @@ from shared.quantum_proof_of_work import (
 
 logger = logging.getLogger(__name__)
 
+_SPAWN_CTX = _mp.get_context('spawn')
+
 
 def _generate_one_model(
     prev_hash: bytes,
@@ -25,10 +36,7 @@ def _generate_one_model(
     edges: list,
     salt: bytes,
 ) -> IsingModel:
-    """Generate one IsingModel in a worker process.
-
-    Module-level function for ProcessPoolExecutor pickling.
-    """
+    """Generate one IsingModel in a worker process."""
     nonce = ising_nonce_from_block(
         prev_hash, miner_id, cur_index, salt,
     )
@@ -38,12 +46,56 @@ def _generate_one_model(
     return IsingModel(h=h, J=J, nonce=nonce, salt=salt)
 
 
+def _kill_workers(pids: list[int], timeout: float = 3.0):
+    """SIGTERM workers, wait, then SIGKILL survivors.
+
+    Logs a warning if SIGKILL is needed — that indicates a
+    bug in the worker shutdown path.
+    """
+    alive = []
+    for pid in pids:
+        try:
+            os.kill(pid, _signal.SIGTERM)
+            alive.append(pid)
+        except OSError:
+            pass
+
+    if not alive:
+        return
+
+    deadline = time.monotonic() + timeout
+    while alive and time.monotonic() < deadline:
+        time.sleep(0.1)
+        alive = [
+            p for p in alive if _pid_alive(p)
+        ]
+
+    for pid in alive:
+        logger.warning(
+            "IsingFeeder: worker %d did not exit after "
+            "SIGTERM, sending SIGKILL", pid,
+        )
+        try:
+            os.kill(pid, _signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """Check if a process is still alive."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 class IsingFeeder:
     """Keeps a buffer of pre-generated IsingModels full.
 
-    Uses a ProcessPoolExecutor to generate models in
-    background worker processes, avoiding GIL contention
-    with GPU work on the main thread.
+    Uses a ProcessPoolExecutor (spawn context) to generate
+    models in background processes. Spawn avoids inheriting
+    CUDA driver state from the parent process.
 
     Args:
         prev_hash: Current block's previous hash.
@@ -79,6 +131,7 @@ class IsingFeeder:
         )
         self._pool = ProcessPoolExecutor(
             max_workers=max_workers,
+            mp_context=_SPAWN_CTX,
         )
         self._futures: list = []
         self._queue: queue.Queue[IsingModel] = queue.Queue()
@@ -197,14 +250,24 @@ class IsingFeeder:
         return models
 
     def stop(self) -> None:
-        """Shutdown pool and cancel pending futures."""
+        """Shutdown pool and force-kill any surviving workers."""
         self._stopped = True
         for f in self._futures:
             f.cancel()
         self._futures.clear()
+
+        # Collect worker PIDs before shutdown — after
+        # shutdown() the process objects may be gone.
+        pids = [
+            p.pid for p in self._pool._processes.values()
+            if p.pid is not None
+        ]
+
         self._pool.shutdown(
             wait=False, cancel_futures=True,
         )
+
+        _kill_workers(pids)
 
     def update_block(
         self,
