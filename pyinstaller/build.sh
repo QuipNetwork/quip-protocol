@@ -22,8 +22,7 @@ fi
 echo "=== Building quip-network-node ==="
 pyinstaller "$SCRIPT_DIR/quip_network_node.spec" \
     --distpath "$PROJECT_ROOT/dist" \
-    --workpath "$PROJECT_ROOT/build/pyinstaller" \
-    --clean
+    --workpath "$PROJECT_ROOT/build/pyinstaller"
 
 # Smoke test: binary must print version and exit 0
 echo ""
