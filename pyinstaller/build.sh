@@ -12,17 +12,17 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_ROOT"
 
-# Clear PyInstaller cache before build to avoid shutil.rmtree race
-# condition on Python 3.14 / macOS (OSError ENOTEMPTY during --clean).
-PYINSTALLER_CACHE="${HOME}/Library/Application Support/pyinstaller"
-if [ -d "$PYINSTALLER_CACHE" ]; then
-    rm -rf "$PYINSTALLER_CACHE"
-fi
+# Isolate PyInstaller cache per architecture to prevent corruption when
+# arm64 and x86_64 jobs run concurrently on the same machine.
+ARCH="$(uname -m)"
+export PYINSTALLER_CONFIG_DIR="$PROJECT_ROOT/build/.pyinstaller-cache-${ARCH}"
+rm -rf "$PYINSTALLER_CONFIG_DIR"
+mkdir -p "$PYINSTALLER_CONFIG_DIR"
 
-echo "=== Building quip-network-node ==="
+echo "=== Building quip-network-node (${ARCH}) ==="
 pyinstaller "$SCRIPT_DIR/quip_network_node.spec" \
     --distpath "$PROJECT_ROOT/dist" \
-    --workpath "$PROJECT_ROOT/build/pyinstaller"
+    --workpath "$PROJECT_ROOT/build/pyinstaller-${ARCH}"
 
 # Smoke test: binary must print version and exit 0
 echo ""
