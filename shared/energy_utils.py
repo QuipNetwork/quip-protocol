@@ -18,20 +18,6 @@ DEFAULT_C_RANGE = (0.7, 0.75)
 DEFAULT_DIVERSITY_RANGE = (0.2, 0.2)  # (min, max) - currently fixed at 0.2
 DEFAULT_SOLUTIONS_RANGE = (5, 5)      # (min, max) - currently fixed at 5
 
-# Calibrated sweep ranges for different miner types
-CALIBRATION_RANGES = {
-    'cpu': {'min_sweeps': 64, 'max_sweeps': 8192},
-    'cuda': {'min_sweeps': 256, 'max_sweeps': 2048},
-    'metal': {'min_sweeps': 64, 'max_sweeps': 256},
-    'modal': {'min_sweeps': 128, 'max_sweeps': 4096},
-    'qpu': {
-        'min_annealing_time': 5.0,   # microseconds
-        'max_annealing_time': 10.0,
-        'min_bonus_reads': 16,
-        'max_bonus_reads': 64
-    }
-}
-
 
 def expected_solution_energy(
     num_nodes: int = DEFAULT_NUM_NODES,
@@ -344,9 +330,15 @@ def energy_to_difficulty(
     parameters based on difficulty. Each miner implementation can then
     map this normalized difficulty to their preferred computational ranges.
 
-    The difficulty mapping is LINEAR in energy space:
-    - More negative energy → Higher difficulty → More computation needed
-    - Less negative energy → Lower difficulty → Less computation needed
+    Uses a piecewise curve centered on the knee point:
+    - Below knee (easy side): concave sqrt — ramps up quickly then
+      flattens approaching the knee.
+    - Above knee (hard side): convex square — starts flat at the
+      knee then accelerates toward maximum difficulty.
+
+    This allocates meaningful compute even for easy targets (fast
+    ramp), avoids wasting budget near the knee (flat), and pushes
+    hard at the ceiling (fast ramp again).
 
     Args:
         target_energy: Target energy threshold from BlockRequirements
@@ -362,25 +354,9 @@ def energy_to_difficulty(
         - 1.0 = Hardest (min_energy, maximum computational effort)
 
     Example:
-        >>> # Easy difficulty
-        >>> diff = energy_to_difficulty(-14700)  # Close to max_energy
-        >>> print(f"Difficulty: {diff:.2f}")
-        Difficulty: 0.01  # Very easy
-
-        >>> # Hard difficulty
-        >>> diff = energy_to_difficulty(-15600)  # Close to min_energy
-        >>> print(f"Difficulty: {diff:.2f}")
-        Difficulty: 0.95  # Very hard
-
-        >>> # Knee point
-        >>> diff = energy_to_difficulty(-15150)  # At knee
-        >>> print(f"Difficulty: {diff:.2f}")
-        Difficulty: 0.50  # Diminishing returns
-
-        >>> # Custom topology
-        >>> diff = energy_to_difficulty(-3500, num_nodes=1000, num_edges=2000)
-        >>> print(f"Difficulty: {diff:.2f}")
-        Difficulty: 0.73  # Hard for small topology
+        >>> diff = energy_to_difficulty(-14700)  # Easy
+        >>> diff = energy_to_difficulty(-15150)  # Knee → ~0.50
+        >>> diff = energy_to_difficulty(-15600)  # Hard → ~0.95
     """
     # Get energy range for this topology
     min_energy, knee_energy, max_energy = calc_energy_range(
@@ -392,13 +368,28 @@ def energy_to_difficulty(
 
     # Handle out-of-range (clamp to [0, 1])
     if target_energy <= min_energy:
-        return 1.0  # Hardest difficulty
+        return 1.0
     if target_energy >= max_energy:
-        return 0.0  # Easiest difficulty
+        return 0.0
 
-    # Linear interpolation: map energy range to [0, 1]
-    # More negative energy → higher difficulty
-    difficulty = (max_energy - target_energy) / (max_energy - min_energy)
+    # Normalized position [0, 1]: 0 = max_energy (easy), 1 = min_energy (hard)
+    total_range = max_energy - min_energy
+    normalized_pos = (max_energy - target_energy) / total_range
+
+    # Knee position in normalized space
+    knee_pos = (max_energy - knee_energy) / total_range
+
+    # Piecewise curve: fast ramp → flat at knee → fast ramp
+    if normalized_pos <= knee_pos:
+        # Below knee: concave (sqrt) — quick ramp, then flattens
+        progress = normalized_pos / knee_pos
+        difficulty = 0.5 * math.sqrt(progress)
+    else:
+        # Above knee: convex (square) — flat at knee, then ramps
+        progress = (
+            (normalized_pos - knee_pos) / (1.0 - knee_pos)
+        )
+        difficulty = 0.5 + 0.5 * (progress ** 2)
 
     return difficulty
 

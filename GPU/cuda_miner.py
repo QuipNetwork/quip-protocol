@@ -10,7 +10,10 @@ through the GPUMiner base class.
 """
 from __future__ import annotations
 
+from typing import List, Tuple
+
 from GPU.gpu_miner import GPUMiner
+from shared.block_requirements import BlockRequirements
 from dwave_topologies import DEFAULT_TOPOLOGY
 
 try:
@@ -37,6 +40,31 @@ class CudaMiner(GPUMiner):
     ADAPT_MAX_READS = 256
     ADAPT_EXTRA_PARAMS = {'num_sweeps_per_beta': 1}
 
+    # Gibbs needs ~2x sweeps to match SA at the same reads.
+    # Measured via sweep_reads_grid on Advantage2 topology.
+    GIBBS_SWEEP_MULTIPLIER = 2
+
+    def _adapt_mining_params(
+        self,
+        current_requirements: BlockRequirements,
+        nodes: List[int],
+        edges: List[Tuple[int, int]],
+    ) -> dict:
+        """Compute adaptive params, doubling sweeps for Gibbs."""
+        params = self.adapt_parameters(
+            current_requirements.difficulty_energy,
+            current_requirements.min_diversity,
+            current_requirements.min_solutions,
+            num_nodes=len(nodes),
+            num_edges=len(edges),
+        )
+        if self._is_gibbs:
+            params['num_sweeps'] = min(
+                params['num_sweeps'] * self.GIBBS_SWEEP_MULTIPLIER,
+                self.ADAPT_MAX_SWEEPS * self.GIBBS_SWEEP_MULTIPLIER,
+            )
+        return params
+
     def __init__(
         self,
         miner_id: str,
@@ -53,7 +81,9 @@ class CudaMiner(GPUMiner):
         )
         self._update_mode = update_mode.lower()
 
-        gpu_util = cfg.pop('gpu_utilization', 100)
+        gpu_util = cfg.pop(
+            'utilization', cfg.pop('gpu_utilization', 100),
+        )
         yielding = cfg.pop('yielding', False)
         self.sms_per_nonce = cfg.pop('sms_per_nonce', 4)
 

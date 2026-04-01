@@ -37,12 +37,12 @@ def _query_iokit_gpu_utilization() -> int:
         GPU utilization 0-100, or 0 on any error.
     """
     try:
-        iokit = ctypes.cdll.LoadLibrary(
-            ctypes.util.find_library("IOKit"),
-        )
-        cf = ctypes.cdll.LoadLibrary(
-            ctypes.util.find_library("CoreFoundation"),
-        )
+        iokit_path = ctypes.util.find_library("IOKit")
+        cf_path = ctypes.util.find_library("CoreFoundation")
+        if iokit_path is None or cf_path is None:
+            return 0
+        iokit = ctypes.cdll.LoadLibrary(iokit_path)
+        cf = ctypes.cdll.LoadLibrary(cf_path)
     except (OSError, TypeError):
         return 0
 
