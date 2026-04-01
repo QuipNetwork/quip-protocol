@@ -99,7 +99,7 @@ package-macos-x86_64:
   tags: [macos, x86_64]
   before_script:
     - rm -rf .venv
-    - /opt/homebrew/bin/python3.13 -m venv .venv
+    - arch -x86_64 /usr/local/bin/python3.13 -m venv .venv
     - source .venv/bin/activate
     - pip install -U pip setuptools wheel
     - pip install pyinstaller
