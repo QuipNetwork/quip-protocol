@@ -24,6 +24,10 @@ results/
 quip_protocol.egg-info/
 .quip/
 
+# AI assistant config (project instructions live in AGENTS.md)
+.claude/
+CLAUDE.md
+
 # Test results and data files
 test_results/
 *_results*.json
