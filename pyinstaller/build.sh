@@ -19,7 +19,19 @@ export PYINSTALLER_CONFIG_DIR="$PROJECT_ROOT/build/.pyinstaller-cache-${ARCH}"
 rm -rf "$PYINSTALLER_CONFIG_DIR"
 mkdir -p "$PYINSTALLER_CONFIG_DIR"
 
-echo "=== Building quip-network-node (${ARCH}) ==="
+# Stamp version into boot script so --version needs zero imports
+VERSION=$(python -c "
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+with open('pyproject.toml', 'rb') as f:
+    print(tomllib.load(f)['project']['version'])
+")
+sed "s/@VERSION@/${VERSION}/" "$SCRIPT_DIR/boot_network_node.py" \
+    > "$SCRIPT_DIR/boot_network_node_stamped.py"
+
+echo "=== Building quip-network-node ${VERSION} (${ARCH}) ==="
 pyinstaller "$SCRIPT_DIR/quip_network_node.spec" \
     --distpath "$PROJECT_ROOT/dist" \
     --workpath "$PROJECT_ROOT/build/pyinstaller-${ARCH}"

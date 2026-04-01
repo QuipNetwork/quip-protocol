@@ -40,6 +40,7 @@ mining_rate_*.json
 # Build outputs
 **/dist/
 build/pyinstaller/
+pyinstaller/boot_network_node_stamped.py
 akash/web/localhost.pem
 node_modules
 # Dependencies (installed by bun/npm - developer only)

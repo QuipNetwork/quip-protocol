@@ -157,8 +157,13 @@ datas += copy_metadata("quip-protocol")
 # ---------------------------------------------------------------------------
 # Analysis
 # ---------------------------------------------------------------------------
+# Use version-stamped boot script if available (built by build.sh)
+_boot = os.path.join(SPECPATH, "boot_network_node_stamped.py")
+if not os.path.exists(_boot):
+    _boot = os.path.join(SPECPATH, "boot_network_node.py")
+
 a = Analysis(
-    [os.path.join(SPECPATH, "boot_network_node.py")],
+    [_boot],
     pathex=[proj_root],
     binaries=extra_binaries,
     datas=datas,
