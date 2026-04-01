@@ -12,6 +12,13 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_ROOT"
 
+# Clear PyInstaller cache before build to avoid shutil.rmtree race
+# condition on Python 3.14 / macOS (OSError ENOTEMPTY during --clean).
+PYINSTALLER_CACHE="${HOME}/Library/Application Support/pyinstaller"
+if [ -d "$PYINSTALLER_CACHE" ]; then
+    rm -rf "$PYINSTALLER_CACHE"
+fi
+
 echo "=== Building quip-network-node ==="
 pyinstaller "$SCRIPT_DIR/quip_network_node.spec" \
     --distpath "$PROJECT_ROOT/dist" \
