@@ -107,10 +107,10 @@ class IBMQAOAMiner(BaseMiner):
 
     def _cleanup_handler(self, signum, frame):
         """Handle SIGTERM for graceful shutdown."""
-        if hasattr(self, 'logger'):
-            self.logger.info(
-                f"QAOA miner {self.miner_id} received SIGTERM, cleaning up..."
-            )
+        log = getattr(self, 'logger', init_logger)
+        log.info(
+            f"QAOA miner {getattr(self, 'miner_id', '?')} received SIGTERM, cleaning up..."
+        )
 
         try:
             # Cancel in-flight future
@@ -123,8 +123,7 @@ class IBMQAOAMiner(BaseMiner):
                 self.top_attempts.clear()
 
         except Exception as e:
-            if hasattr(self, 'logger'):
-                self.logger.error(f"Error during QAOA miner cleanup: {e}")
+            log.error(f"Error during QAOA miner cleanup: {e}")
 
         sys.exit(0)
 

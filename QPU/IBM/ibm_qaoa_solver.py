@@ -27,6 +27,11 @@ from shared.miner_types import Variable
 logger = logging.getLogger(__name__)
 
 
+class SolveCancelled(Exception):
+    """Raised inside the optimizer objective when stop_event fires."""
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Optimizer configurations
 # ---------------------------------------------------------------------------
@@ -145,10 +150,20 @@ class QAOAFuture:
     def sampleset(self) -> Optional[dimod.SampleSet]:
         """Block until the QAOA solve completes and return the SampleSet.
 
-        Returns None if the solve was interrupted or terminated.
+        Returns None if the solve was interrupted, terminated, or the
+        child process died without returning a result.
         """
         if not self._done:
-            self._result = self._result_queue.get()
+            try:
+                self._result = self._result_queue.get(timeout=5)
+            except Exception:
+                # Child process died without putting a result
+                if not self._process.is_alive():
+                    logger.error("[QAOA] Child process died without returning a result")
+                    self._result = None
+                else:
+                    # Still running, keep waiting
+                    self._result = self._result_queue.get()
             self._process.join()
             self._done = True
         return self._result
@@ -207,7 +222,7 @@ def _qaoa_solve_in_process(
         J: Quadratic biases.
         stop_event: multiprocessing.Event for cooperative cancellation.
         params: Per-solve parameter overrides (p, shots, etc.).
-        result_queue: Queue to send the resulting SampleSet (or None) back.
+        result_queue: Queue to send the resulting SampleSet back.
     """
     try:
         solver = QAOASolverWrapper(**solver_config)
@@ -215,7 +230,6 @@ def _qaoa_solve_in_process(
         result_queue.put(sampleset)
     except Exception as e:
         logger.error(f"[QAOA] Process solve failed: {e}")
-        result_queue.put(None)
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +437,7 @@ class QAOASolverWrapper:
             iteration_count += 1
 
             if stop_event and stop_event.is_set():
-                raise StopIteration("Mining cancelled")
+                raise SolveCancelled("Mining cancelled")
 
             value = self._evaluate_circuit(circuit, params)
 
@@ -454,7 +468,7 @@ class QAOASolverWrapper:
                     method=config['method'],
                     options=optimizer_options,
                 )
-        except StopIteration:
+        except SolveCancelled:
             logger.info("[QAOA] Optimization interrupted by stop_event")
             return None
 
