@@ -87,9 +87,9 @@ package-macos-arm64:
   extends: .pyinstaller_build
   tags: [macos, arm64]
   before_script:
-    - rm -rf .venv
-    - /opt/homebrew/bin/python3.13 -m venv .venv
-    - source .venv/bin/activate
+    - rm -rf .venv-arm64
+    - /opt/homebrew/bin/python3.13 -m venv .venv-arm64
+    - source .venv-arm64/bin/activate
     - pip install -U pip setuptools wheel
     - pip install pyinstaller
     - pip install -e ".[metal]"
@@ -98,9 +98,9 @@ package-macos-x86_64:
   extends: .pyinstaller_build
   tags: [macos, x86_64]
   before_script:
-    - rm -rf .venv
-    - arch -x86_64 /usr/local/bin/python3.13 -m venv .venv
-    - source .venv/bin/activate
+    - rm -rf .venv-x86_64
+    - arch -x86_64 /usr/local/bin/python3.13 -m venv .venv-x86_64
+    - source .venv-x86_64/bin/activate
     - pip install -U pip setuptools wheel
     - pip install pyinstaller
     - pip install -e .
