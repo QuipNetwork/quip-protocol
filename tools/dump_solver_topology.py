@@ -44,6 +44,8 @@ except ImportError:
     DWaveSampler = None
     Client = None
 
+DWAVE_REGIONS = ['na-west-1', 'na-east-1', 'eu-central-1']
+
 
 def normalize_solver_name(solver_name: str) -> str:
     """
@@ -168,54 +170,62 @@ def generate_topology_json(solver_info: Dict[str, Any]) -> Dict[str, Any]:
     return topology_json
 
 
-def list_available_solvers(region: Optional[str] = None) -> List[str]:
-    """List all available D-Wave solvers."""
+def list_available_solvers(region: Optional[str] = None) -> List[Dict[str, Any]]:
+    """List all available D-Wave solvers across regions.
+
+    Queries all known D-Wave regions (unless a specific region is given)
+    and deduplicates by solver name.
+
+    Returns list of dicts with keys: name, region, category, num_qubits,
+    topology_type, topology_shape.
+    """
     if not DWAVE_AVAILABLE or Client is None:
         print("❌ D-Wave Ocean SDK not available")
         return []
 
-    try:
-        region_str = f" in region {region}" if region else ""
-        print(f"🔍 Querying available D-Wave solvers{region_str}...")
+    regions = [region] if region else DWAVE_REGIONS
+    seen_names: set = set()
+    all_solvers: List[Dict[str, Any]] = []
 
-        # Pass region if specified
-        kwargs = {}
-        if region:
-            kwargs['region'] = region
-        with Client.from_config(**kwargs) as client:
-            solvers = client.get_solvers()
+    for r in regions:
+        try:
+            with Client.from_config(region=r) as client:
+                solvers = client.get_solvers()
+        except Exception as e:
+            print(f"  Warning: Could not query region {r}: {e}")
+            continue
 
-            solver_names = []
-            print("\n📋 Available solvers:")
-            for solver in solvers:
-                solver_names.append(solver.name)
-                properties = solver.properties
-                topology_type = get_topology_type(properties)
-                topology_shape = get_topology_shape(properties)
-                num_qubits = properties.get('num_qubits', 'unknown')
+        for solver in solvers:
+            if solver.name in seen_names:
+                continue
+            seen_names.add(solver.name)
 
-                # Handle status safely - different solver types have different status formats
-                status = 'unknown'
-                try:
-                    if hasattr(solver, 'status'):
-                        if isinstance(solver.status, dict):
-                            status = solver.status.get('state', 'unknown')
-                        else:
-                            status = str(solver.status)
-                except Exception:
-                    status = 'unknown'
+            props = solver.properties
+            category = props.get('category', 'unknown')
+            topology_type = get_topology_type(props)
+            topology_shape = get_topology_shape(props)
+            num_qubits = props.get('num_qubits', 'unknown')
 
-                print(f"   {solver.name}")
-                print(f"      Type: {topology_type} ({topology_shape})")
-                print(f"      Qubits: {num_qubits}")
-                print(f"      Status: {status}")
-                print()
+            all_solvers.append({
+                'name': solver.name,
+                'region': r,
+                'category': category,
+                'num_qubits': num_qubits,
+                'topology_type': topology_type,
+                'topology_shape': topology_shape,
+            })
 
-            return solver_names
-        
-    except Exception as e:
-        print(f"❌ Failed to list solvers: {e}")
-        return []
+    region_label = f"region {regions[0]}" if len(regions) == 1 else f"{len(regions)} region(s)"
+    print(f"\n📋 Available solvers ({len(all_solvers)} across {region_label}):\n")
+    for s in all_solvers:
+        print(f"   {s['name']}")
+        print(f"      Region:   {s['region']}")
+        print(f"      Category: {s['category']}")
+        print(f"      Type:     {s['topology_type']} ({s['topology_shape']})")
+        print(f"      Qubits:   {s['num_qubits']}")
+        print()
+
+    return all_solvers
 
 
 def generate_python_module(solver_info: Dict[str, Any], json_filename: str) -> str:
@@ -381,10 +391,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --solver Advantage2-System1.6 --gzip
-  %(prog)s --solver Advantage_system6.4 --output-dir custom/path
-  %(prog)s --list-solvers
-  %(prog)s --all-available --gzip
+  %(prog)s --list-solvers                          # List all solvers across all regions
+  %(prog)s --list-solvers --region na-east-1       # List solvers in a specific region
+  %(prog)s --dump-all                              # Dump all QPU topologies (gzipped)
+  %(prog)s --solver Advantage2-System1.6 --gzip    # Dump a specific solver
+  %(prog)s --all-available --gzip                  # Dump all solvers (including hybrid)
         """
     )
     
@@ -416,13 +427,20 @@ Examples:
     parser.add_argument(
         '--all-available', '-a',
         action='store_true',
-        help='Dump topologies for all available solvers'
+        help='Dump topologies for all available solvers (including hybrid)'
+    )
+
+    parser.add_argument(
+        '--dump-all',
+        action='store_true',
+        help='Dump topologies for all QPU solvers (gzipped, all regions, excludes hybrid)'
     )
 
     parser.add_argument(
         '--region', '-r',
         type=str,
-        help='D-Wave region (e.g., "na-east-1", "na-west-1"). If not specified, uses default from config.'
+        help='D-Wave region (e.g., "na-east-1", "na-west-1"). '
+             'If not specified, queries all known regions.'
     )
 
     args = parser.parse_args()
@@ -436,26 +454,51 @@ Examples:
     if args.list_solvers:
         list_available_solvers(region=args.region)
         return
-    
-    # All available solvers mode
+
+    # Dump all QPU solvers mode (excludes hybrid, always gzipped)
+    if args.dump_all:
+        all_solvers = list_available_solvers(region=args.region)
+        qpu_solvers = [s for s in all_solvers if s['category'] == 'qpu']
+        if not qpu_solvers:
+            print("❌ No QPU solvers available")
+            sys.exit(1)
+
+        print(f"\n🚀 Dumping topologies for {len(qpu_solvers)} QPU solver(s)...")
+        print(f"   Output format: JSON (gzip compressed)")
+        successful = []
+
+        for solver_info in qpu_solvers:
+            print(f"\n--- Processing {solver_info['name']} (region: {solver_info['region']}) ---")
+            if dump_solver_topology(solver_info['name'], args.output_dir, True, region=solver_info['region']):
+                successful.append(solver_info['name'])
+
+        if successful:
+            create_readme_file(args.output_dir, successful, True)
+            print(f"\n✅ Successfully dumped {len(successful)}/{len(qpu_solvers)} QPU solver topologies")
+        else:
+            print(f"\n❌ Failed to dump any solver topologies")
+
+        return
+
+    # All available solvers mode (includes hybrid)
     if args.all_available:
-        solver_names = list_available_solvers(region=args.region)
-        if not solver_names:
+        all_solvers = list_available_solvers(region=args.region)
+        if not all_solvers:
             print("❌ No solvers available")
             sys.exit(1)
 
-        print(f"\n🚀 Dumping topologies for {len(solver_names)} solvers...")
+        print(f"\n🚀 Dumping topologies for {len(all_solvers)} solvers...")
         print(f"   Output format: {'JSON (gzip compressed)' if args.gzip else 'JSON (uncompressed)'}")
         successful = []
 
-        for solver_name in solver_names:
-            print(f"\n--- Processing {solver_name} ---")
-            if dump_solver_topology(solver_name, args.output_dir, args.gzip, region=args.region):
-                successful.append(solver_name)
+        for solver_info in all_solvers:
+            print(f"\n--- Processing {solver_info['name']} (region: {solver_info['region']}) ---")
+            if dump_solver_topology(solver_info['name'], args.output_dir, args.gzip, region=solver_info['region']):
+                successful.append(solver_info['name'])
 
         if successful:
             create_readme_file(args.output_dir, successful, args.gzip)
-            print(f"\n✅ Successfully dumped {len(successful)}/{len(solver_names)} solver topologies")
+            print(f"\n✅ Successfully dumped {len(successful)}/{len(all_solvers)} solver topologies")
         else:
             print(f"\n❌ Failed to dump any solver topologies")
 
@@ -475,7 +518,7 @@ Examples:
     
     # No action specified
     parser.print_help()
-    print("\n❌ Please specify --solver, --list-solvers, or --all-available")
+    print("\n❌ Please specify --solver, --list-solvers, --dump-all, or --all-available")
     sys.exit(1)
 
 
