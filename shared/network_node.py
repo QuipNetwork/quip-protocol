@@ -72,11 +72,12 @@ async def get_public_ip() -> Optional[str]:
 
     # List of reliable IP detection services
     services = [
+        "https://check.quip.network",
         "https://api.ipify.org",
         "https://icanhazip.com",
         "https://ipecho.net/plain",
         "https://checkip.amazonaws.com",
-        "https://ident.me"
+        "https://ident.me",
     ]
 
     # Create SSL context that doesn't verify (for simplicity)
@@ -217,14 +218,17 @@ class NetworkNode(Node):
         self.port = config.get("port", 20049)
 
         self.node_name = config.get("node_name", socket.getfqdn())
-        raw_public_host = config.get("public_host", get_local_ip())
+        raw_public_host = config.get("public_host")
+        self._public_host_explicit = raw_public_host is not None
+        if raw_public_host is None:
+            raw_public_host = get_local_ip()
         if ":" in str(raw_public_host):
             raise ValueError(
                 f"public_host must be a hostname or IP without a port, got: '{raw_public_host}'. "
                 "Use separate public_host and public_port settings."
             )
-        public_port = config.get("public_port", self.port)
-        self.public_host = f"{raw_public_host}:{public_port}"
+        self._public_port = config.get("public_port", self.port)
+        self.public_host = f"{raw_public_host}:{self._public_port}"
 
         self.secret = config.get("secret", f"quip network node secret {random.randint(0, 1000000)}")
         self.auto_mine = config.get("auto_mine", False)
@@ -448,6 +452,22 @@ class NetworkNode(Node):
     async def start(self):
         """Start the P2P node."""
         self.running = True
+
+        # If public_host was not explicitly configured, detect the public IP.
+        # get_local_ip() returns the LAN address which is unreachable from
+        # remote peers behind NAT, causing JOIN rejections and ban escalation.
+        if not self._public_host_explicit:
+            public_ip = await get_public_ip()
+            if public_ip:
+                old = self.public_host
+                self.public_host = f"{public_ip}:{self._public_port}"
+                self.logger.info(
+                    f"Auto-detected public IP: {old} -> {self.public_host}"
+                )
+            else:
+                self.logger.warning(
+                    f"Could not detect public IP, using {self.public_host}"
+                )
 
         # Initialize TOFU trust store if enabled
         if self.tofu_enabled:
