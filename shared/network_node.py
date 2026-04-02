@@ -653,7 +653,6 @@ class NetworkNode(Node):
         self.close()
 
         self.logger.info("Network node stopped")
-        sys.exit(0)
 
     ##########################
     ## Server logic threads ##
