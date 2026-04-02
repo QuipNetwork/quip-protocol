@@ -183,9 +183,10 @@ class _QuicClientProtocol(QuicConnectionProtocol):
     """QUIC connection protocol handler for client."""
 
     def __init__(self, quic: QuicConnection, stream_handler: Optional[Any] = None,
-                 logger: Optional[logging.Logger] = None):
+                 logger: Optional[logging.Logger] = None, peer_host: str = ""):
         super().__init__(quic, stream_handler)
         self._logger = logger or logging.getLogger(__name__)
+        self._peer_host = peer_host
         self._pending_requests: Dict[int, asyncio.Future] = {}
         self._request_counter = 0
         self._connected = asyncio.Event()
@@ -205,7 +206,7 @@ class _QuicClientProtocol(QuicConnectionProtocol):
         elif isinstance(event, StreamDataReceived):
             self._handle_stream_data(event)
         elif isinstance(event, ConnectionTerminated):
-            self._logger.info(f"ConnectionTerminated: code={event.error_code}, reason={event.reason_phrase}")
+            self._logger.info(f"ConnectionTerminated ({self._peer_host}): code={event.error_code}, reason={event.reason_phrase}")
             self._connection_closed = True
             self._connected.clear()
             for future in self._pending_requests.values():
@@ -260,7 +261,7 @@ class _QuicClientProtocol(QuicConnectionProtocol):
                     future.set_result(msg)
             else:
                 self._logger.warning(
-                    f"Received response for unknown request_id={msg.request_id}"
+                    f"Received response for unknown request_id={msg.request_id} ({self._peer_host})"
                 )
         except Exception as e:
             self._logger.warning(f"Invalid response: {e}")
@@ -308,11 +309,11 @@ class _QuicClientProtocol(QuicConnectionProtocol):
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
-            self._logger.warning(f"Timeout waiting for response to {msg_type.name} (id={request_id})")
+            self._logger.warning(f"Timeout waiting for response to {msg_type.name} (id={request_id}) from {self._peer_host}")
             self._pending_requests.pop(request_id, None)
             return None
         except (ConnectionError, OSError) as e:
-            self._logger.warning(f"Connection lost during {msg_type.name} (id={request_id}): {e}")
+            self._logger.warning(f"Connection lost during {msg_type.name} (id={request_id}) to {self._peer_host}: {e}")
             self._pending_requests.pop(request_id, None)
             return None
 
@@ -420,7 +421,7 @@ class NodeClient:
                 # since that would close connection when block exits
                 ctx = connect(
                     host=addr, port=port, configuration=configuration,
-                    create_protocol=lambda *a, **k: _QuicClientProtocol(*a, logger=self.logger, **k),
+                    create_protocol=lambda *a, _h=host, **k: _QuicClientProtocol(*a, logger=self.logger, peer_host=_h, **k),
                 )
                 # Manually enter the context to start the connection
                 protocol = await ctx.__aenter__()
