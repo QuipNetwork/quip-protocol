@@ -260,7 +260,7 @@ class NetworkNode(Node):
         # Durations as float seconds
         self.heartbeat_interval = float(config.get("heartbeat_interval", 15))
         self.heartbeat_timeout = float(config.get("heartbeat_timeout", 300))
-        self.node_timeout = float(config.get("node_timeout", 10))
+        self.node_timeout = float(config.get("node_timeout", 60))
 
         self.initial_peers = config.get("peer", [
             "qpu-1.nodes.quip.network:20049",
@@ -280,6 +280,10 @@ class NetworkNode(Node):
         from shared.peer_ban_list import PeerBanList
         self._own_ban_list = PeerBanList(logger=self.logger)
         self._ban_list: PeerBanList = self._own_ban_list
+
+        # Connection worker (initialized in start())
+        self._connection_worker: Optional['ConnectionWorkerHandle'] = None
+        self._connection_request_pending = False
 
         self.gossip_lock = asyncio.Lock()
         self.recent_messages = set()
@@ -467,6 +471,13 @@ class NetworkNode(Node):
         self._ban_list = self._own_ban_list
         await self.node_client.start()
 
+        # Start connection worker process for non-blocking peer discovery
+        from shared.connection_worker import ConnectionWorkerHandle
+        self._connection_worker = ConnectionWorkerHandle(
+            node_timeout=self.node_timeout,
+        )
+        self._connection_worker.start()
+
         # Start QUIC server
         cert_file = self.tls_cert_file if self.tls_enabled else None
         key_file = self.tls_key_file if self.tls_enabled else None
@@ -587,6 +598,12 @@ class NetworkNode(Node):
             self.logger.info("Stopping REST API server...")
             await self.rest_api_server.stop()
 
+        # Stop connection worker before closing the QUIC client
+        if self._connection_worker:
+            self.logger.info("Stopping connection worker...")
+            self._connection_worker.close()
+            self._connection_worker = None
+
         self.logger.info("Cancelling QUIC client tasks...")
         # Close node client
         if self.node_client:
@@ -666,11 +683,13 @@ class NetworkNode(Node):
         """Main server loop."""
         while self.running:
             try:
-                # Check if we are connected to any active peers, if not, try to reconnect to known peers in our
-                # heartbeats list or, if empty, the initial peers list.
+                # Check if we are connected to any active peers, if not,
+                # submit connection requests to the worker process (non-blocking)
+                # and poll for results.
                 connected = await self.is_connected()
                 if not connected:
-                    connected = await self.connect_to_network()
+                    self._request_peer_connections()
+                    connected = await self._drain_connection_results()
 
                 # If we are not connected and not in auto-mine mode, sleep and retry
                 if not connected and not self.auto_mine:
@@ -1441,6 +1460,84 @@ class NetworkNode(Node):
             self.logger.warning(f"Failed to connect to peer {peer_address}: {e}")
             self.telemetry.update_node(peer_address, "failed")
             return False
+
+    def _request_peer_connections(self) -> None:
+        """Submit peer connection requests to the worker process.
+
+        Non-blocking: puts work on the queue and returns immediately.
+        Guards against duplicate submissions while a batch is in flight.
+        """
+        if self._connection_request_pending:
+            return
+
+        if not self._connection_worker or not self._connection_worker.is_alive():
+            self.logger.warning("Connection worker not alive, restarting")
+            from shared.connection_worker import ConnectionWorkerHandle
+            self._connection_worker = ConnectionWorkerHandle(
+                node_timeout=self.node_timeout,
+            )
+            self._connection_worker.start()
+
+        initial_set = set(self.initial_peers)
+        peers: list[str] = []
+
+        # Always include initial/seed peers (bypass bans)
+        peers.extend(self.initial_peers)
+
+        # Add known heartbeat peers that aren't banned
+        for host in self.heartbeats:
+            if host not in initial_set and not self._is_backed_off(host):
+                peers.append(host)
+
+        if not peers:
+            return
+
+        join_data = {
+            "host": self.public_host,
+            "version": get_version(),
+            "capabilities": ["mining", "relay"],
+            "info": self.info().to_json(),
+        }
+        self._connection_worker.request_connections(
+            peers, join_data, initial_peers=initial_set,
+        )
+        self._connection_request_pending = True
+
+    async def _drain_connection_results(self) -> bool:
+        """Poll for connection results from the worker process.
+
+        Returns True if at least one peer was successfully joined.
+        """
+        if not self._connection_worker:
+            return False
+
+        results = self._connection_worker.poll_results()
+        if not results:
+            return False
+
+        any_success = False
+        for result in results:
+            peer = result.get("peer", "?")
+            if result.get("success") and result.get("peers_map"):
+                peers_map = result["peers_map"]
+                peers_found = 0
+                for peer_host, peer_info_json in peers_map.items():
+                    if peer_host == self.public_host:
+                        continue
+                    info = MinerInfo.from_json(peer_info_json)
+                    if await self.add_peer(peer_host, info):
+                        peers_found += 1
+                if peers_found > 0:
+                    self.logger.info(
+                        f"Joined network via {peer}, discovered {peers_found} peers"
+                    )
+                any_success = True
+            else:
+                self.logger.debug(f"Connection worker: failed to join {peer}")
+
+        # Allow new requests once we've drained the batch
+        self._connection_request_pending = False
+        return any_success
 
     def _is_backed_off(self, peer_address: str) -> bool:
         """Check if peer is currently banned."""
