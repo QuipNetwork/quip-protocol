@@ -1584,6 +1584,16 @@ class NetworkNode(Node):
 
     async def add_peer(self, host: str, info: MinerInfo) -> bool:
         """Add a node to our registry."""
+        # Normalize IPv6-mapped IPv4 addresses (::ffff:x.x.x.x:port) that
+        # arrive in peer lists from nodes running on dual-stack sockets.
+        from shared.address_utils import parse_host_port, format_host_port
+        try:
+            h, p = parse_host_port(host)
+            host = format_host_port(h, p)
+        except ValueError:
+            self.logger.warning(f"Invalid peer address, skipping: {host}")
+            return False
+
         if host == self.public_host:
             return False
 
