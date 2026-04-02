@@ -766,6 +766,119 @@ class Node:
         # Reset state
         self._mining_stop_event = None
     
+    def _write_validation_debug_report(
+        self,
+        mining_result: MiningResult,
+        quantum_proof,
+        previous_block: Block,
+        mismatches: List[str],
+    ) -> Optional[str]:
+        """Write a debug report for block validation mismatches.
+
+        Dumps all data needed to reproduce the energy mismatch:
+        nonce, salt, topology dimensions, node ordering, per-solution
+        energies (reported vs recomputed), and the full traceback.
+
+        Returns the debug file path, or None on write failure.
+        """
+        import traceback
+        from pathlib import Path
+        from shared.quantum_proof_of_work import (
+            generate_ising_model_from_nonce,
+            energy_of_solution,
+        )
+
+        timestamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+        block_index = previous_block.header.index + 1
+
+        # Find log directory from root logger's file handlers
+        debug_dir = Path("debug")
+        for handler in logging.getLogger().handlers:
+            if isinstance(handler, logging.FileHandler):
+                debug_dir = Path(handler.baseFilename).parent / "debug"
+                break
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        filename = f"energy_mismatch_block{block_index}_{timestamp}.txt"
+        filepath = debug_dir / filename
+
+        proof_nodes = mining_result.variable_order or mining_result.node_list
+        proof_edges = mining_result.edge_list
+
+        # Recompute per-solution energies for the report
+        try:
+            h, J = generate_ising_model_from_nonce(
+                mining_result.nonce, proof_nodes, proof_edges,
+            )
+            per_solution_energies = [
+                energy_of_solution(sol, h, J, proof_nodes)
+                for sol in mining_result.solutions
+            ]
+        except Exception as e:
+            per_solution_energies = [f"recompute failed: {e}"]
+
+        nodes_sorted = list(sorted(proof_nodes))
+        nodes_match_sorted = (proof_nodes == nodes_sorted)
+
+        lines = [
+            f"=== Energy Mismatch Debug Report ===",
+            f"Timestamp:       {timestamp}",
+            f"Block index:     {block_index}",
+            f"Miner ID:        {mining_result.miner_id}",
+            f"Miner type:      {mining_result.miner_type}",
+            f"",
+            f"--- Mismatches ---",
+            *[f"  {m}" for m in mismatches],
+            f"",
+            f"--- Reported (from miner) ---",
+            f"Energy:          {mining_result.energy}",
+            f"Diversity:       {mining_result.diversity}",
+            f"Num valid:       {mining_result.num_valid}",
+            f"",
+            f"--- Recomputed (compute_derived_fields) ---",
+            f"Energy:          {quantum_proof.energy}",
+            f"Diversity:       {quantum_proof.diversity}",
+            f"Num valid:       {quantum_proof.num_valid_solutions}",
+            f"",
+            f"--- Ising Model Params ---",
+            f"Nonce:           {mining_result.nonce}",
+            f"Salt:            {mining_result.salt.hex()}",
+            f"Num nodes:       {len(proof_nodes)}",
+            f"Num edges:       {len(proof_edges)}",
+            f"Nodes sorted?    {nodes_match_sorted}",
+            f"First 10 nodes:  {proof_nodes[:10]}",
+            f"Last 10 nodes:   {proof_nodes[-10:]}",
+            f"",
+            f"--- Solutions ---",
+            f"Num solutions:   {len(mining_result.solutions)}",
+        ]
+        for i, sol in enumerate(mining_result.solutions):
+            recomp = per_solution_energies[i] if i < len(per_solution_energies) else "N/A"
+            lines.append(f"  Solution {i}: len={len(sol)}, recomputed_energy={recomp}")
+            # Show first/last few spin values for ordering analysis
+            if len(sol) > 20:
+                lines.append(f"    first 10 spins: {sol[:10]}")
+                lines.append(f"    last 10 spins:  {sol[-10:]}")
+            else:
+                lines.append(f"    spins: {sol}")
+
+        lines.extend([
+            f"",
+            f"--- Previous Block ---",
+            f"Index:           {previous_block.header.index}",
+            f"Hash:            {previous_block.hash.hex() if previous_block.hash else 'None'}",
+            f"",
+            f"--- Traceback ---",
+            traceback.format_stack()[-3] if len(traceback.format_stack()) >= 3 else "(unavailable)",
+        ])
+
+        try:
+            filepath.write_text("\n".join(lines), encoding="utf-8")
+            return str(filepath)
+        except OSError as e:
+            self.logger.warning(f"Failed to write debug report: {e}")
+            return None
+
     def build_block(self, previous_block: Block, mining_result: MiningResult, block_data: bytes, transactions: List = None):
         """Build a block from a mining result.
 
@@ -774,6 +887,10 @@ class Node:
             mining_result: The result from the mining process
             block_data: Arbitrary block data
             transactions: Optional list of Transaction objects to include in the block
+
+        Returns:
+            Block if validation passes, None if validation fails
+            (debug report written to disk on failure).
         """
         if transactions is None:
             transactions = []
@@ -801,12 +918,36 @@ class Node:
         )
         quantum_proof.compute_derived_fields()
 
-        if (quantum_proof.energy is None or quantum_proof.energy != mining_result.energy):
-            raise ValueError(f"Miner reported bad energy {mining_result.energy} but we computed {quantum_proof.energy}")
-        if (quantum_proof.diversity is None or quantum_proof.diversity != mining_result.diversity):
-            raise ValueError(f"Miner reported bad diversity {mining_result.diversity} but we computed {quantum_proof.diversity}")
-        if (quantum_proof.num_valid_solutions is None or quantum_proof.num_valid_solutions > mining_result.num_valid):
-            raise ValueError(f"Miner reported bad num_valid_solutions {mining_result.num_valid} but we computed {quantum_proof.num_valid_solutions}")
+        mismatches = []
+        if quantum_proof.energy is None or quantum_proof.energy != mining_result.energy:
+            mismatches.append(
+                f"energy: miner={mining_result.energy}, "
+                f"recomputed={quantum_proof.energy}"
+            )
+        if quantum_proof.diversity is None or quantum_proof.diversity != mining_result.diversity:
+            mismatches.append(
+                f"diversity: miner={mining_result.diversity}, "
+                f"recomputed={quantum_proof.diversity}"
+            )
+        if quantum_proof.num_valid_solutions is None or quantum_proof.num_valid_solutions > mining_result.num_valid:
+            mismatches.append(
+                f"num_valid: miner={mining_result.num_valid}, "
+                f"recomputed={quantum_proof.num_valid_solutions}"
+            )
+
+        if mismatches:
+            debug_path = self._write_validation_debug_report(
+                mining_result, quantum_proof, previous_block, mismatches,
+            )
+            self.logger.error(
+                "Block validation failed for %s block %d: %s "
+                "(debug report: %s)",
+                mining_result.miner_id,
+                previous_block.header.index + 1,
+                "; ".join(mismatches),
+                debug_path or "write failed",
+            )
+            return None
 
         next_block_requirements = compute_next_block_requirements(previous_block, mining_result, self.logger)
         next_block = block.Block(

@@ -856,19 +856,13 @@ class NetworkNode(Node):
                 break
 
     def _handle_mining_task_exception(self, task: asyncio.Task):
-        """Handle exceptions from mining tasks - crash on ValueError."""
+        """Handle exceptions from mining tasks."""
         if task.done() and not task.cancelled():
             try:
-                task.result()  # This will raise the exception if one occurred
+                task.result()
             except ValueError as e:
-                # Shutdown miner workers and stop the event loop to crash the program
-                self.logger.error(f"ValueError in mining task - shutting down: {e}")
-                self.close()  # Shutdown miner workers first
-                loop = asyncio.get_event_loop()
-                loop.stop()
-                sys.exit(-1)
+                self.logger.error(f"ValueError in mining task: {e}")
             except Exception as e:
-                # Log other exceptions but don't crash
                 self.logger.error(f"Exception in mining task: {e}")
 
     async def _exhaust_block_cache(self):
@@ -1139,6 +1133,9 @@ class NetworkNode(Node):
 
         data = f"{self.node_id} was here"
         wb = self.build_block(previous_block, result, data.encode(), transactions)
+        if wb is None:
+            self.logger.warning("Block validation failed, discarding mining result (see debug report)")
+            return None
         wb = self.sign_block(wb)
 
         if not wb.hash:
