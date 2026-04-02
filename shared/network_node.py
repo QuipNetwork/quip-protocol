@@ -70,14 +70,16 @@ async def get_public_ip() -> Optional[str]:
     # Use module-level logger
     logger = logging.getLogger(__name__)
 
-    # List of reliable IP detection services
+    # List of reliable IP detection services (shuffled to spread load)
     services = [
+        "https://check.quip.network",
         "https://api.ipify.org",
         "https://icanhazip.com",
         "https://ipecho.net/plain",
         "https://checkip.amazonaws.com",
-        "https://ident.me"
+        "https://ident.me",
     ]
+    random.shuffle(services)
 
     # Create SSL context that doesn't verify (for simplicity)
     ssl_context = ssl.create_default_context()
@@ -96,7 +98,11 @@ async def get_public_ip() -> Optional[str]:
             # Validate using ipaddress module (supports both IPv4 and IPv6)
             if ip:
                 try:
-                    ipaddress.ip_address(ip)
+                    addr = ipaddress.ip_address(ip)
+                    # Normalize IPv6-mapped IPv4 (::ffff:1.2.3.4) to plain IPv4
+                    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+                        addr = addr.ipv4_mapped
+                    ip = str(addr)
                     logger.info(f"Detected public IP: {ip}")
                     return ip
                 except ValueError:
@@ -217,14 +223,17 @@ class NetworkNode(Node):
         self.port = config.get("port", 20049)
 
         self.node_name = config.get("node_name", socket.getfqdn())
-        raw_public_host = config.get("public_host", get_local_ip())
+        raw_public_host = config.get("public_host")
+        self._public_host_explicit = raw_public_host is not None
+        if raw_public_host is None:
+            raw_public_host = get_local_ip()
         if ":" in str(raw_public_host):
             raise ValueError(
                 f"public_host must be a hostname or IP without a port, got: '{raw_public_host}'. "
                 "Use separate public_host and public_port settings."
             )
-        public_port = config.get("public_port", self.port)
-        self.public_host = f"{raw_public_host}:{public_port}"
+        self._public_port = config.get("public_port", self.port)
+        self.public_host = f"{raw_public_host}:{self._public_port}"
 
         self.secret = config.get("secret", f"quip network node secret {random.randint(0, 1000000)}")
         self.auto_mine = config.get("auto_mine", False)
@@ -260,7 +269,7 @@ class NetworkNode(Node):
         # Durations as float seconds
         self.heartbeat_interval = float(config.get("heartbeat_interval", 15))
         self.heartbeat_timeout = float(config.get("heartbeat_timeout", 300))
-        self.node_timeout = float(config.get("node_timeout", 10))
+        self.node_timeout = float(config.get("node_timeout", 60))
 
         self.initial_peers = config.get("peer", [
             "qpu-1.nodes.quip.network:20049",
@@ -280,6 +289,10 @@ class NetworkNode(Node):
         from shared.peer_ban_list import PeerBanList
         self._own_ban_list = PeerBanList(logger=self.logger)
         self._ban_list: PeerBanList = self._own_ban_list
+
+        # Connection worker (initialized in start())
+        self._connection_worker: Optional['ConnectionWorkerHandle'] = None
+        self._connection_request_pending = False
 
         self.gossip_lock = asyncio.Lock()
         self.recent_messages = set()
@@ -445,6 +458,22 @@ class NetworkNode(Node):
         """Start the P2P node."""
         self.running = True
 
+        # If public_host was not explicitly configured, detect the public IP.
+        # get_local_ip() returns the LAN address which is unreachable from
+        # remote peers behind NAT, causing JOIN rejections and ban escalation.
+        if not self._public_host_explicit:
+            public_ip = await get_public_ip()
+            if public_ip:
+                old = self.public_host
+                self.public_host = f"{public_ip}:{self._public_port}"
+                self.logger.info(
+                    f"Auto-detected public IP: {old} -> {self.public_host}"
+                )
+            else:
+                self.logger.warning(
+                    f"Could not detect public IP, using {self.public_host}"
+                )
+
         # Initialize TOFU trust store if enabled
         if self.tofu_enabled:
             import os
@@ -466,6 +495,13 @@ class NetworkNode(Node):
         self.node_client.ban_list = self._own_ban_list
         self._ban_list = self._own_ban_list
         await self.node_client.start()
+
+        # Start connection worker process for non-blocking peer discovery
+        from shared.connection_worker import ConnectionWorkerHandle
+        self._connection_worker = ConnectionWorkerHandle(
+            node_timeout=self.node_timeout,
+        )
+        self._connection_worker.start()
 
         # Start QUIC server
         cert_file = self.tls_cert_file if self.tls_enabled else None
@@ -587,6 +623,12 @@ class NetworkNode(Node):
             self.logger.info("Stopping REST API server...")
             await self.rest_api_server.stop()
 
+        # Stop connection worker before closing the QUIC client
+        if self._connection_worker:
+            self.logger.info("Stopping connection worker...")
+            self._connection_worker.close()
+            self._connection_worker = None
+
         self.logger.info("Cancelling QUIC client tasks...")
         # Close node client
         if self.node_client:
@@ -666,11 +708,13 @@ class NetworkNode(Node):
         """Main server loop."""
         while self.running:
             try:
-                # Check if we are connected to any active peers, if not, try to reconnect to known peers in our
-                # heartbeats list or, if empty, the initial peers list.
+                # Check if we are connected to any active peers, if not,
+                # submit connection requests to the worker process (non-blocking)
+                # and poll for results.
                 connected = await self.is_connected()
                 if not connected:
-                    connected = await self.connect_to_network()
+                    self._request_peer_connections()
+                    connected = await self._drain_connection_results()
 
                 # If we are not connected and not in auto-mine mode, sleep and retry
                 if not connected and not self.auto_mine:
@@ -856,19 +900,13 @@ class NetworkNode(Node):
                 break
 
     def _handle_mining_task_exception(self, task: asyncio.Task):
-        """Handle exceptions from mining tasks - crash on ValueError."""
+        """Handle exceptions from mining tasks."""
         if task.done() and not task.cancelled():
             try:
-                task.result()  # This will raise the exception if one occurred
+                task.result()
             except ValueError as e:
-                # Shutdown miner workers and stop the event loop to crash the program
-                self.logger.error(f"ValueError in mining task - shutting down: {e}")
-                self.close()  # Shutdown miner workers first
-                loop = asyncio.get_event_loop()
-                loop.stop()
-                sys.exit(-1)
+                self.logger.error(f"ValueError in mining task: {e}")
             except Exception as e:
-                # Log other exceptions but don't crash
                 self.logger.error(f"Exception in mining task: {e}")
 
     async def _exhaust_block_cache(self):
@@ -1139,6 +1177,9 @@ class NetworkNode(Node):
 
         data = f"{self.node_id} was here"
         wb = self.build_block(previous_block, result, data.encode(), transactions)
+        if wb is None:
+            self.logger.warning("Block validation failed, discarding mining result (see debug report)")
+            return None
         wb = self.sign_block(wb)
 
         if not wb.hash:
@@ -1400,7 +1441,10 @@ class NetworkNode(Node):
         if not self.node_client:
             return False
 
-        if self._is_backed_off(peer_address):
+        # Only enforce bans for non-initial peers. Initial/seed peers
+        # must always be retryable so the node can recover from
+        # transient network partitions.
+        if peer_address not in self.initial_peers and self._is_backed_off(peer_address):
             return False
 
         try:
@@ -1413,7 +1457,10 @@ class NetworkNode(Node):
             }
 
             # Use NodeClient's SSL-aware connection method
-            result = await self.node_client.join_network_via_peer(peer_address, join_data)
+            is_initial = peer_address in self.initial_peers
+            result = await self.node_client.join_network_via_peer(
+                peer_address, join_data, bypass_ban=is_initial,
+            )
             if not result:
                 self.logger.warning(f"Failed to join via {peer_address}")
                 return False
@@ -1439,9 +1486,96 @@ class NetworkNode(Node):
             self.telemetry.update_node(peer_address, "failed")
             return False
 
+    def _request_peer_connections(self) -> None:
+        """Submit peer connection requests to the worker process.
+
+        Non-blocking: puts work on the queue and returns immediately.
+        Guards against duplicate submissions while a batch is in flight.
+        """
+        if self._connection_request_pending:
+            return
+
+        if not self._connection_worker or not self._connection_worker.is_alive():
+            self.logger.warning("Connection worker not alive, restarting")
+            from shared.connection_worker import ConnectionWorkerHandle
+            self._connection_worker = ConnectionWorkerHandle(
+                node_timeout=self.node_timeout,
+            )
+            self._connection_worker.start()
+
+        initial_set = set(self.initial_peers)
+        peers: list[str] = []
+
+        # Always include initial/seed peers (bypass bans)
+        peers.extend(self.initial_peers)
+
+        # Add known heartbeat peers that aren't banned
+        for host in self.heartbeats:
+            if host not in initial_set and not self._is_backed_off(host):
+                peers.append(host)
+
+        if not peers:
+            return
+
+        join_data = {
+            "host": self.public_host,
+            "version": get_version(),
+            "capabilities": ["mining", "relay"],
+            "info": self.info().to_json(),
+        }
+        self._connection_worker.request_connections(
+            peers, join_data, initial_peers=initial_set,
+        )
+        self._connection_request_pending = True
+
+    async def _drain_connection_results(self) -> bool:
+        """Poll for connection results from the worker process.
+
+        Returns True if at least one peer was successfully joined.
+        """
+        if not self._connection_worker:
+            return False
+
+        results = self._connection_worker.poll_results()
+        if not results:
+            return False
+
+        any_success = False
+        for result in results:
+            peer = result.get("peer", "?")
+            if result.get("success") and result.get("peers_map"):
+                peers_map = result["peers_map"]
+                peers_found = 0
+                for peer_host, peer_info_json in peers_map.items():
+                    if peer_host == self.public_host:
+                        continue
+                    info = MinerInfo.from_json(peer_info_json)
+                    if await self.add_peer(peer_host, info):
+                        peers_found += 1
+                if peers_found > 0:
+                    self.logger.info(
+                        f"Joined network via {peer}, discovered {peers_found} peers"
+                    )
+                any_success = True
+            else:
+                self.logger.debug(f"Connection worker: failed to join {peer}")
+
+        # Allow new requests once we've drained the batch
+        self._connection_request_pending = False
+        return any_success
+
     def _is_backed_off(self, peer_address: str) -> bool:
         """Check if peer is currently banned."""
         return self._ban_list.is_banned(peer_address)
+
+    @staticmethod
+    def _format_ban_remaining(seconds: float) -> str:
+        """Format remaining ban time for error messages."""
+        if seconds < 60:
+            return f"{int(seconds)}s"
+        if seconds < 3600:
+            return f"{int(seconds / 60)}m"
+        return f"{seconds / 3600:.1f}h"
 
     async def _backoff_peer(self, peer_address: str, reason: str):
         """Ban peer with exponential backoff and disconnect."""
@@ -1450,6 +1584,16 @@ class NetworkNode(Node):
 
     async def add_peer(self, host: str, info: MinerInfo) -> bool:
         """Add a node to our registry."""
+        # Normalize IPv6-mapped IPv4 addresses (::ffff:x.x.x.x:port) that
+        # arrive in peer lists from nodes running on dual-stack sockets.
+        from shared.address_utils import parse_host_port, format_host_port
+        try:
+            h, p = parse_host_port(host)
+            host = format_host_port(h, p)
+        except ValueError:
+            self.logger.warning(f"Invalid peer address, skipping: {host}")
+            return False
+
         if host == self.public_host:
             return False
 
@@ -1791,14 +1935,49 @@ class NetworkNode(Node):
             self.logger.debug(f"Cannot reach {address}: {e}")
             return False
 
+    @staticmethod
+    def _normalize_ip(raw_ip: str) -> str:
+        """Normalize an IP: strip brackets, map IPv6-mapped IPv4 to plain IPv4."""
+        host = raw_ip.strip('[]')
+        try:
+            addr = ipaddress.ip_address(host)
+            if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+                return str(addr.ipv4_mapped)
+            return str(addr)
+        except ValueError:
+            return host
+
+    @staticmethod
+    def _is_private_ip(host: str) -> bool:
+        """Check if an IP string (no port) is private/loopback/link-local."""
+        try:
+            addr = ipaddress.ip_address(host)
+            if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+                addr = addr.ipv4_mapped
+            return addr.is_private or addr.is_loopback or addr.is_link_local
+        except ValueError:
+            return False
+
+    def _extract_peer_ip_port(self, address: str) -> tuple[str, int]:
+        """Parse host:port using address_utils, normalize IPv6-mapped IPs."""
+        from shared.address_utils import parse_host_port, DEFAULT_PORT
+        host, port = parse_host_port(address, DEFAULT_PORT)
+        host = self._normalize_ip(host)
+        return host, port
+
     async def _validate_peer_address(
         self, claimed: str, real_peer_addr: str, timeout: float = 2.0
     ) -> str:
         """Validate claimed address is reachable, fallback to real IP if not.
 
+        If the claimed address uses a private/loopback IP, it is immediately
+        replaced with the real connecting IP since private addresses are not
+        routable from remote peers.  IPv6-mapped IPv4 addresses are normalized
+        to plain IPv4.
+
         Args:
             claimed: Address the peer claims (e.g., "your-public-ip:20049")
-            real_peer_addr: Actual source address from QUIC (e.g., "192.168.1.50:54321")
+            real_peer_addr: Actual source address from QUIC (e.g., "1.2.3.4:54321")
             timeout: Connection timeout in seconds
 
         Returns:
@@ -1807,24 +1986,45 @@ class NetworkNode(Node):
         Raises:
             ValueError: If neither claimed nor fallback address is reachable
         """
+        from shared.address_utils import format_host_port
+
+        claimed_host, claimed_port = self._extract_peer_ip_port(claimed)
+        real_host, _ = self._extract_peer_ip_port(real_peer_addr)
+        claimed_addr = format_host_port(claimed_host, claimed_port)
+
+        # Private/loopback IPs are never reachable from remote peers —
+        # replace immediately with the connecting IP.
+        if self._is_private_ip(claimed_host):
+            fallback = format_host_port(real_host, claimed_port)
+            self.logger.info(
+                f"Peer claimed private address {claimed_addr}, "
+                f"using connecting IP: {fallback}"
+            )
+            if await self._can_reach_address(fallback, timeout):
+                return fallback
+            raise ValueError(
+                f"Peer claimed private address {claimed_addr} and "
+                f"connecting IP {fallback} is unreachable"
+            )
+
         # Try claimed address first
-        if await self._can_reach_address(claimed, timeout):
-            return claimed
+        if await self._can_reach_address(claimed_addr, timeout):
+            return claimed_addr
 
-        # Extract real IP (without ephemeral port) and use claimed port
-        real_ip = real_peer_addr.rsplit(':', 1)[0]
-        claimed_port = claimed.rsplit(':', 1)[1]
-        fallback = f"{real_ip}:{claimed_port}"
-
+        # Fallback to real connecting IP with claimed port
+        fallback = format_host_port(real_host, claimed_port)
         self.logger.warning(
-            f"Claimed address {claimed} unreachable, falling back to {fallback}"
+            f"Claimed address {claimed_addr} unreachable, "
+            f"falling back to {fallback}"
         )
 
         if await self._can_reach_address(fallback, timeout):
             return fallback
 
-        # Neither works - reject the join
-        raise ValueError(f"Cannot reach peer at claimed {claimed} or fallback {fallback}")
+        raise ValueError(
+            f"Cannot reach peer at claimed {claimed_addr} "
+            f"or fallback {fallback}"
+        )
 
     async def _quic_handle_join(self, msg: QuicMessage, protocol: Any) -> QuicMessage:
         """Handle join request from a new node."""
@@ -1844,7 +2044,10 @@ class NetworkNode(Node):
             return msg.create_error_response(str(e))
 
         if self._is_backed_off(new_node_address):
-            return msg.create_error_response("backed off")
+            remaining = self._ban_list.time_remaining(new_node_address)
+            return msg.create_error_response(
+                f"backed off ({self._format_ban_remaining(remaining)} remaining)"
+            )
 
         join_version = data.get("version")
         if join_version:
