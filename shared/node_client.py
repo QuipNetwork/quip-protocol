@@ -590,6 +590,9 @@ class NodeClient:
                 return None
             error_msg = response.payload.decode('utf-8', errors='replace')
             self.logger.warning(f"Join rejected by {peer_address}: {error_msg}")
+            self.ban_list.record_failure(
+                peer_address, f"join rejected: {error_msg}"
+            )
         return None
 
     async def connect_to_peer(self, peer_address: str) -> bool:

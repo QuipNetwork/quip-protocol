@@ -1416,6 +1416,9 @@ class NetworkNode(Node):
             result = await self.node_client.join_network_via_peer(peer_address, join_data)
             if not result:
                 self.logger.warning(f"Failed to join via {peer_address}")
+                self._ban_list.record_failure(
+                    peer_address, "join failed"
+                )
                 return False
 
             # Add all nodes from the peer's node list
