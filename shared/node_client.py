@@ -311,6 +311,10 @@ class _QuicClientProtocol(QuicConnectionProtocol):
             self._logger.warning(f"Timeout waiting for response to {msg_type.name} (id={request_id})")
             self._pending_requests.pop(request_id, None)
             return None
+        except (ConnectionError, OSError) as e:
+            self._logger.warning(f"Connection lost during {msg_type.name} (id={request_id}): {e}")
+            self._pending_requests.pop(request_id, None)
+            return None
 
     @property
     def is_connected(self) -> bool:
