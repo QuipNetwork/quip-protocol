@@ -182,7 +182,7 @@ class MetalScheduler:
         gpu_core_count: int,
         gpu_utilization_pct: int = 100,
         yielding: bool = False,
-        poll_interval: float = 1.0,
+        poll_interval: float = 0.3,
     ):
         self._gpu_core_count = gpu_core_count
         self._gpu_utilization_pct = gpu_utilization_pct
@@ -201,7 +201,7 @@ class MetalScheduler:
         self._util_lock = threading.Lock()
         self._util_cache: Optional[int] = None
         self._util_cache_time = 0.0
-        self._CACHE_TTL = 1.0
+        self._CACHE_TTL = 0.3
 
         # Hysteresis for stable target threadgroups
         self._prev_target = 0
@@ -338,8 +338,135 @@ class MetalScheduler:
         """Whether yielding mode is active."""
         return self._yielding
 
+    def get_cached_utilization(self) -> int:
+        """Return latest IOKit GPU utilization without querying.
+
+        Returns:
+            Cached utilization 0-100, or 0 if unavailable.
+        """
+        with self._util_lock:
+            return self._external_util_pct
+
     def stop(self) -> None:
         """Stop IOKit polling thread."""
         self._iokit_stop.set()
         if self._iokit_thread is not None:
             self._iokit_thread.join(timeout=2.0)
+
+
+class DutyCycleController:
+    """Time-based GPU duty cycling for Metal dispatches.
+
+    Measures compute wall-clock time per dispatch and inserts
+    proportional sleep to hit a target GPU utilization percentage.
+    Uses an exponential moving average to smooth timing and an
+    optional IOKit feedback loop to correct drift.
+
+    At 30% target with a 100ms dispatch: sleep = 100 * (1/0.3 - 1)
+    = 233ms, creating a real 30/70 compute/idle duty cycle.
+
+    Args:
+        target_pct: Target GPU utilization (1-100).
+        enabled: Override enable flag. Defaults to target_pct < 100.
+    """
+
+    _MIN_SLEEP_S = 0.001   # 1ms floor — always yield at least one frame
+    _MAX_SLEEP_S = 2.0     # 2s ceiling — keep mining loop responsive
+    _EMA_ALPHA = 0.3       # Smoothing factor for compute duration EMA
+
+    def __init__(
+        self,
+        target_pct: int = 100,
+        enabled: Optional[bool] = None,
+    ):
+        self._target_pct = max(1, min(100, target_pct))
+        self._duty_ratio = self._target_pct / 100.0
+        self._enabled = (
+            enabled if enabled is not None
+            else self._target_pct < 100
+        )
+
+        # EMA of compute duration (seconds)
+        self._ema_compute_s = 0.0
+        self._ema_initialized = False
+
+        # PI controller state (Phase 3 feedback)
+        self._duty_multiplier = 1.0
+        self._kp = 0.01    # Proportional gain
+        self._ki = 0.002   # Integral gain
+        self._integral = 0.0
+        self._integral_clamp = 50.0  # Windup limit
+
+    @property
+    def enabled(self) -> bool:
+        """Whether duty cycling is active."""
+        return self._enabled
+
+    @property
+    def target_pct(self) -> int:
+        """Target utilization percentage."""
+        return self._target_pct
+
+    def compute_sleep(self, compute_duration_s: float) -> float:
+        """Compute sleep duration to achieve target duty cycle.
+
+        Args:
+            compute_duration_s: Wall-clock time of the GPU dispatch.
+
+        Returns:
+            Seconds to sleep before the next dispatch.
+        """
+        if not self._enabled or compute_duration_s <= 0:
+            return self._MIN_SLEEP_S
+
+        # Update EMA
+        if not self._ema_initialized:
+            self._ema_compute_s = compute_duration_s
+            self._ema_initialized = True
+        else:
+            alpha = self._EMA_ALPHA
+            self._ema_compute_s = (
+                alpha * compute_duration_s
+                + (1.0 - alpha) * self._ema_compute_s
+            )
+
+        # Duty cycle formula: sleep = compute * (1/ratio - 1)
+        raw_sleep = self._ema_compute_s * (1.0 / self._duty_ratio - 1.0)
+
+        # Apply PI controller multiplier (Phase 3)
+        adjusted = raw_sleep * self._duty_multiplier
+
+        return max(self._MIN_SLEEP_S, min(self._MAX_SLEEP_S, adjusted))
+
+    def feedback(self, measured_util_pct: int) -> None:
+        """Adjust duty multiplier from IOKit utilization reading.
+
+        PI controller: if measured > target, increase sleep;
+        if measured < target, decrease sleep. Call after each
+        duty-cycle sleep with the latest IOKit reading.
+
+        Args:
+            measured_util_pct: IOKit "Device Utilization %" (0-100).
+        """
+        if not self._enabled:
+            return
+
+        error = measured_util_pct - self._target_pct
+
+        # Accumulate integral with windup clamp
+        self._integral = max(
+            -self._integral_clamp,
+            min(self._integral_clamp, self._integral + error),
+        )
+
+        adjustment = self._kp * error + self._ki * self._integral
+        self._duty_multiplier = max(
+            0.1, min(10.0, self._duty_multiplier + adjustment),
+        )
+
+    def reset(self) -> None:
+        """Reset EMA and PI state (e.g. after batch size change)."""
+        self._ema_compute_s = 0.0
+        self._ema_initialized = False
+        self._duty_multiplier = 1.0
+        self._integral = 0.0
