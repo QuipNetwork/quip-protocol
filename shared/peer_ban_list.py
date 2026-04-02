@@ -1,9 +1,10 @@
 """
-Peer ban list with exponential backoff.
+Peer ban list with graduated backoff.
 
-Tracks peers that repeatedly fail to connect and bans them for
-increasing durations, from 1 hour up to 1 week, with randomized
-jitter to prevent thundering herd reconnection storms.
+Tracks peers that repeatedly fail to connect. Early failures get
+short cooldowns (30s); actual bans start after BAN_THRESHOLD
+consecutive failures and escalate from 1 hour to 1 week with
+randomized jitter.
 """
 
 import logging
@@ -13,7 +14,13 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
-# Ban duration bounds (seconds)
+# Failures below this threshold get a short cooldown, not a ban.
+BAN_THRESHOLD = 5
+
+# Cooldown for early failures (below threshold)
+COOLDOWN_DURATION = 30.0        # 30 seconds
+
+# Ban duration bounds (seconds) — applied at threshold and above
 MIN_BAN_DURATION = 3600.0       # 1 hour
 MAX_BAN_DURATION = 604800.0     # 1 week
 JITTER_RANGE = (0.75, 1.25)    # ±25% randomization
@@ -29,26 +36,30 @@ class _BanRecord:
 
 class PeerBanList:
     """
-    Track peer connection failures and apply exponential backoff bans.
+    Track peer connection failures with graduated backoff.
 
-    Each failure doubles the ban duration (with jitter), starting at
-    1 hour and capping at 1 week. Successful connections reset the
-    failure count.
+    Failures 1 through BAN_THRESHOLD-1 apply a short cooldown (30s).
+    At BAN_THRESHOLD and above, real bans kick in starting at 1 hour
+    and doubling up to 1 week. Successful connections reset everything.
     """
 
     def __init__(
         self,
         min_duration: float = MIN_BAN_DURATION,
         max_duration: float = MAX_BAN_DURATION,
+        ban_threshold: int = BAN_THRESHOLD,
+        cooldown: float = COOLDOWN_DURATION,
         logger: Optional[logging.Logger] = None,
     ):
         self._min_duration = min_duration
         self._max_duration = max_duration
+        self._ban_threshold = ban_threshold
+        self._cooldown = cooldown
         self._records: dict[str, _BanRecord] = {}
         self.logger = logger or logging.getLogger(__name__)
 
     def is_banned(self, peer: str) -> bool:
-        """Check if a peer is currently banned."""
+        """Check if a peer is currently banned (or in cooldown)."""
         record = self._records.get(peer)
         if record is None:
             return False
@@ -70,14 +81,17 @@ class PeerBanList:
         return record.failure_count if record else 0
 
     def record_failure(self, peer: str, reason: str = "") -> float:
-        """Record a connection failure and ban the peer.
+        """Record a connection failure.
+
+        Below the ban threshold, applies a short cooldown.
+        At the threshold and above, applies escalating bans.
 
         Args:
             peer: Peer address (host:port).
             reason: Human-readable failure reason for logging.
 
         Returns:
-            Ban duration in seconds.
+            Cooldown/ban duration in seconds.
         """
         now = time.monotonic()
         record = self._records.get(peer)
@@ -88,21 +102,30 @@ class PeerBanList:
         record.failure_count += 1
         record.last_failure = now
 
-        # Exponential backoff: min_dur * 2^(n-1), capped at max_dur
-        raw_duration = self._min_duration * (2 ** (record.failure_count - 1))
-        capped_duration = min(raw_duration, self._max_duration)
+        if record.failure_count < self._ban_threshold:
+            # Short cooldown — not a real ban
+            duration = self._cooldown
+            record.banned_until = now + duration
+            reason_str = f" — {reason}" if reason else ""
+            self.logger.debug(
+                "Cooldown peer %s for %ds (failure #%d%s)",
+                peer, int(duration), record.failure_count, reason_str,
+            )
+        else:
+            # Real ban with exponential backoff
+            exponent = record.failure_count - self._ban_threshold
+            raw_duration = self._min_duration * (2 ** exponent)
+            capped_duration = min(raw_duration, self._max_duration)
+            jitter = random.uniform(*JITTER_RANGE)
+            duration = capped_duration * jitter
+            record.banned_until = now + duration
+            reason_str = f" — {reason}" if reason else ""
+            self.logger.warning(
+                "Banned peer %s for %s (failure #%d%s)",
+                peer, self._format_duration(duration),
+                record.failure_count, reason_str,
+            )
 
-        # Apply jitter
-        jitter = random.uniform(*JITTER_RANGE)
-        duration = capped_duration * jitter
-
-        record.banned_until = now + duration
-
-        reason_str = f" — {reason}" if reason else ""
-        self.logger.warning(
-            f"Banned peer {peer} for {self._format_duration(duration)} "
-            f"(failure #{record.failure_count}{reason_str})"
-        )
         return duration
 
     def record_success(self, peer: str) -> None:
