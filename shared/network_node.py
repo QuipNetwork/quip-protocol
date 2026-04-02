@@ -1921,14 +1921,32 @@ class NetworkNode(Node):
             self.logger.debug(f"Cannot reach {address}: {e}")
             return False
 
+    @staticmethod
+    def _is_private_ip(address: str) -> bool:
+        """Check if the IP portion of a host:port address is private/loopback."""
+        host = address.rsplit(':', 1)[0]
+        # Strip IPv6 brackets
+        if host.startswith('[') and host.endswith(']'):
+            host = host[1:-1]
+        try:
+            addr = ipaddress.ip_address(host)
+            return addr.is_private or addr.is_loopback or addr.is_link_local
+        except ValueError:
+            # Hostname, not an IP literal — not private
+            return False
+
     async def _validate_peer_address(
         self, claimed: str, real_peer_addr: str, timeout: float = 2.0
     ) -> str:
         """Validate claimed address is reachable, fallback to real IP if not.
 
+        If the claimed address uses a private/loopback IP, it is immediately
+        replaced with the real connecting IP since private addresses are not
+        routable from remote peers.
+
         Args:
             claimed: Address the peer claims (e.g., "your-public-ip:20049")
-            real_peer_addr: Actual source address from QUIC (e.g., "192.168.1.50:54321")
+            real_peer_addr: Actual source address from QUIC (e.g., "1.2.3.4:54321")
             timeout: Connection timeout in seconds
 
         Returns:
@@ -1937,15 +1955,30 @@ class NetworkNode(Node):
         Raises:
             ValueError: If neither claimed nor fallback address is reachable
         """
+        claimed_port = claimed.rsplit(':', 1)[1]
+        real_ip = real_peer_addr.rsplit(':', 1)[0]
+
+        # Private/loopback IPs are never reachable from remote peers —
+        # replace immediately with the connecting IP.
+        if self._is_private_ip(claimed):
+            fallback = f"{real_ip}:{claimed_port}"
+            self.logger.info(
+                f"Peer claimed private address {claimed}, "
+                f"using connecting IP: {fallback}"
+            )
+            if await self._can_reach_address(fallback, timeout):
+                return fallback
+            raise ValueError(
+                f"Peer claimed private address {claimed} and "
+                f"connecting IP {fallback} is unreachable"
+            )
+
         # Try claimed address first
         if await self._can_reach_address(claimed, timeout):
             return claimed
 
-        # Extract real IP (without ephemeral port) and use claimed port
-        real_ip = real_peer_addr.rsplit(':', 1)[0]
-        claimed_port = claimed.rsplit(':', 1)[1]
+        # Fallback to real connecting IP with claimed port
         fallback = f"{real_ip}:{claimed_port}"
-
         self.logger.warning(
             f"Claimed address {claimed} unreachable, falling back to {fallback}"
         )
