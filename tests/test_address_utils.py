@@ -116,6 +116,36 @@ class TestParseHostPort:
         with pytest.raises(ValueError, match="Port out of range"):
             parse_host_port("127.0.0.1:99999")
 
+    def test_ipv6_mapped_ipv4_with_port(self):
+        """Unbracketed ::ffff:x.x.x.x:port normalizes to plain IPv4."""
+        host, port = parse_host_port("::ffff:103.188.95.31:20049")
+        assert host == "103.188.95.31"
+        assert port == 20049
+
+    def test_ipv6_mapped_ipv4_second_addr(self):
+        """Another mapped address seen in production logs."""
+        host, port = parse_host_port("::ffff:27.59.125.162:20049")
+        assert host == "27.59.125.162"
+        assert port == 20049
+
+    def test_ipv6_mapped_ipv4_without_port(self):
+        """Bare ::ffff:x.x.x.x normalizes to plain IPv4."""
+        host, port = parse_host_port("::ffff:103.188.95.31")
+        assert host == "103.188.95.31"
+        assert port == DEFAULT_PORT
+
+    def test_ipv6_mapped_ipv4_bracketed_with_port(self):
+        """Bracketed [::ffff:x.x.x.x]:port normalizes to plain IPv4."""
+        host, port = parse_host_port("[::ffff:103.188.95.31]:20049")
+        assert host == "103.188.95.31"
+        assert port == 20049
+
+    def test_pure_ipv6_with_port_bracketed(self):
+        """Pure IPv6 with port must use brackets and is preserved."""
+        host, port = parse_host_port("[2001:db8::1]:20049")
+        assert host == "2001:db8::1"
+        assert port == 20049
+
 
 class TestFormatHostPort:
     """Test suite for format_host_port function."""

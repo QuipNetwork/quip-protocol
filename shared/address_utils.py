@@ -44,9 +44,13 @@ def parse_host_port(address: str, default_port: int = DEFAULT_PORT) -> Tuple[str
         host = address[1:bracket_end]
         remainder = address[bracket_end + 1:]
 
-        # Validate the IPv6 address
+        # Validate the IPv6 address and normalize mapped IPv4
         try:
-            ipaddress.IPv6Address(host)
+            addr = ipaddress.IPv6Address(host)
+            if addr.ipv4_mapped:
+                host = str(addr.ipv4_mapped)
+            else:
+                host = str(addr)
         except ipaddress.AddressValueError as e:
             raise ValueError(f"Invalid IPv6 address in brackets: {host}") from e
 
@@ -68,12 +72,35 @@ def parse_host_port(address: str, default_port: int = DEFAULT_PORT) -> Tuple[str
     colon_count = address.count(':')
 
     if colon_count > 1:
-        # This is an IPv6 address without brackets (no port)
+        # Try as a bare IPv6 address (no port) first
         try:
-            ipaddress.IPv6Address(address)
+            addr = ipaddress.IPv6Address(address)
+            # Normalize IPv6-mapped IPv4 (::ffff:x.x.x.x) to plain IPv4
+            if addr.ipv4_mapped:
+                return (str(addr.ipv4_mapped), default_port)
             return (address, default_port)
-        except ipaddress.AddressValueError as e:
-            raise ValueError(f"Invalid IPv6 address: {address}") from e
+        except ipaddress.AddressValueError:
+            pass
+
+        # Could be an unbracketed IPv6 with a port suffix (e.g.
+        # ::ffff:103.188.95.31:20049).  Split on the last colon and
+        # check whether the left side is a valid IP and the right side
+        # is a valid port number.
+        last_colon = address.rfind(':')
+        host_part = address[:last_colon]
+        port_str = address[last_colon + 1:]
+        try:
+            port = int(port_str)
+            if 0 < port <= 65535:
+                addr = ipaddress.ip_address(host_part)
+                # Normalize IPv6-mapped IPv4
+                if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+                    return (str(addr.ipv4_mapped), port)
+                return (str(addr), port)
+        except (ValueError, TypeError):
+            pass
+
+        raise ValueError(f"Invalid IPv6 address: {address}")
 
     elif colon_count == 1:
         # Could be IPv4:port or an incomplete IPv6 (rare but valid like "::1" is handled above)
