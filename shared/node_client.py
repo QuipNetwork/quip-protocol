@@ -360,20 +360,19 @@ class NodeClient:
 
     async def _close_connection(self, host: str) -> None:
         """Close a connection and clean up its context manager."""
-        if host in self._connections:
+        conn = self._connections.pop(host, None)
+        if conn is not None:
             self.logger.debug(f"Closing QUIC connection to {host}")
             try:
-                self._connections[host].close()
+                conn.close()
             except Exception:
                 pass
-            del self._connections[host]
-        if host in self._connection_contexts:
+        ctx = self._connection_contexts.pop(host, None)
+        if ctx is not None:
             try:
-                ctx = self._connection_contexts[host]
                 await ctx.__aexit__(None, None, None)
             except Exception:
                 pass
-            del self._connection_contexts[host]
 
     def update_peers(self, peers: Dict[str, MinerInfo]) -> None:
         self.peers = peers.copy()
