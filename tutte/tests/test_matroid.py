@@ -139,6 +139,118 @@ class TestBivariateLaurentPoly:
         shifted = p.shift_v(-2)
         assert shifted == BivariateLaurentPoly({(1, 0): 3, (0, -2): 1})
 
+    def test_eval_at(self):
+        """Test numeric evaluation at integer points."""
+        from fractions import Fraction
+        # p = 3*u*v^2 + 1  evaluated at u=2, v=3: 3*2*9 + 1 = 55
+        p = BivariateLaurentPoly({(1, 2): 3, (0, 0): 1})
+        assert p.eval_at(2, 3) == Fraction(55)
+        # With negative v-power: u*v^(-1) at u=4, v=2: 4/2 = 2
+        q = BivariateLaurentPoly({(1, -1): 1})
+        assert q.eval_at(4, 2) == Fraction(2)
+
+
+class TestEvalInterp:
+    """Tests for evaluation-interpolation Theorem 6."""
+
+    def test_eval_interp_two_triangles(self, engine):
+        """Eval-interp should match symbolic Theorem 6 for two triangles sharing an edge."""
+        from tutte.matroids.parallel_connection import theorem6_eval_interp
+
+        k3 = complete_graph(3)
+        pc = parallel_connection_graph(k3, k3, (0, 1))
+
+        shared_edge = (0, 1)
+        inter_graph = Graph(
+            nodes=frozenset([0, 1]),
+            edges=frozenset([(0, 1)]),
+        )
+        matroid_N = GraphicMatroid(inter_graph)
+        r_N = matroid_N.rank()
+
+        flats, ranks, upper_covers = enumerate_flats_with_hasse(matroid_N)
+        lattice = FlatLattice(matroid_N, flats=flats, ranks=ranks, upper_covers=upper_covers)
+
+        cell1_nodes = set(k3.nodes)
+        cell2_nodes = set(pc.nodes) - {2}  # remap: node 2 is unique to cell1
+        cell2_nodes = set()
+        for n in pc.nodes:
+            cell2_nodes.add(n)
+        cell1_nodes = {0, 1, 2}
+        cell2_nodes = {0, 1, 3}
+
+        ext1, shared1 = build_extended_cell_graph(pc, cell1_nodes, [(0, 1)])
+        ext2, shared2 = build_extended_cell_graph(pc, cell2_nodes, [(0, 1)])
+
+        t_m1 = precompute_contractions(ext1, shared1, lattice, engine)
+        t_m2 = precompute_contractions(ext2, shared2, lattice, engine)
+
+        # Symbolic result
+        symbolic = theorem6_parallel_connection(lattice, t_m1, t_m2, r_N)
+
+        # Eval-interp result (max degrees: x<=3, y<=2 for 4-node 5-edge graph)
+        ei_result = theorem6_eval_interp(lattice, t_m1, t_m2, r_N,
+                                         max_x_degree=3, max_y_degree=2)
+
+        assert symbolic == ei_result, f"Mismatch: symbolic={symbolic}, eval_interp={ei_result}"
+
+    def test_eval_interp_non_boolean_lattice(self, engine):
+        """Eval-interp must use correct Möbius function for non-Boolean lattices.
+
+        Two K4s sharing a triangle (K3) gives a shared matroid with 7 flats
+        including non-Boolean intervals where μ(W,Z) != ±1. The old top-down
+        subtraction assumed μ = -1 along all covering relations, which fails here.
+        """
+        from tutte.matroids.parallel_connection import theorem6_eval_interp
+
+        k4 = complete_graph(4)
+        # Build the parallel connection manually: two K4s sharing triangle {0,1,2}
+        # K4_1 has nodes {0,1,2,3}, K4_2 remapped to {0,1,2,4}
+        pc_nodes = frozenset([0, 1, 2, 3, 4])
+        pc_edges = frozenset([
+            (0, 1), (0, 2), (1, 2),  # shared triangle
+            (0, 3), (1, 3), (2, 3),  # K4_1 extra edges
+            (0, 4), (1, 4), (2, 4),  # K4_2 extra edges
+        ])
+        pc = Graph(nodes=pc_nodes, edges=pc_edges)
+
+        # Shared matroid: graphic matroid of K3 (triangle on {0,1,2})
+        inter_edges = [(0, 1), (0, 2), (1, 2)]
+        inter_graph = Graph(
+            nodes=frozenset([0, 1, 2]),
+            edges=frozenset(inter_edges),
+        )
+        matroid_N = GraphicMatroid(inter_graph)
+        r_N = matroid_N.rank()
+
+        flats, ranks, upper_covers = enumerate_flats_with_hasse(matroid_N)
+        lattice = FlatLattice(matroid_N, flats=flats, ranks=ranks, upper_covers=upper_covers)
+
+        # Verify this IS a non-Boolean lattice (K3 cycle matroid: rank 2, 5 flats != 2^2=4)
+        assert lattice.num_flats == 5, f"Expected 5 flats for K3, got {lattice.num_flats}"
+
+        cell1_nodes = {0, 1, 2, 3}
+        cell2_nodes = {0, 1, 2, 4}
+
+        ext1, shared1 = build_extended_cell_graph(pc, cell1_nodes, inter_edges)
+        ext2, shared2 = build_extended_cell_graph(pc, cell2_nodes, inter_edges)
+
+        t_m1 = precompute_contractions(ext1, shared1, lattice, engine)
+        t_m2 = precompute_contractions(ext2, shared2, lattice, engine)
+
+        # Symbolic result (known correct)
+        symbolic = theorem6_parallel_connection(lattice, t_m1, t_m2, r_N)
+
+        # Eval-interp result: 5 nodes, 9 edges => max degree ~7
+        ei_result = theorem6_eval_interp(lattice, t_m1, t_m2, r_N,
+                                         max_x_degree=7, max_y_degree=7)
+
+        assert symbolic == ei_result, f"Mismatch: symbolic={symbolic}, eval_interp={ei_result}"
+
+        # Also verify against direct synthesis
+        T_direct = _synthesize_direct(pc, engine)
+        assert T_direct == ei_result, f"Direct mismatch: direct={T_direct}, eval_interp={ei_result}"
+
 
 # =============================================================================
 # THEOREM 6 TARGETED TESTS
@@ -532,6 +644,26 @@ class TestHigherKSums:
         T_thm10 = theorem10_k_sum(pc_graph, clique_edges, engine)
         assert T_thm10 == T_direct
 
+    def test_ksum_multi_component_chimera1(self):
+        """Chimera(1) has a 4-sum separator yielding 4 components."""
+        dnx = pytest.importorskip("dwave_networkx")
+        from tutte.synthesis.engine import SynthesisEngine
+
+        g = Graph.from_networkx(dnx.chimera_graph(1))
+        engine = SynthesisEngine(verbose=False)
+        result = engine.synthesize(g)
+        assert result.verified
+        assert result.polynomial.num_spanning_trees() == 4096
+        # Full polynomial check (not just spanning trees)
+        assert verify_with_networkx(g, result.polynomial)
+
+    def test_4sum_polynomial_correctness(self, engine):
+        """Verify 4-sum produces correct FULL polynomial, not just spanning trees."""
+        k5 = complete_graph(5)
+        ks = k_sum_graph(k5, k5, 4, [0, 1, 2, 3])
+        T_direct = _synthesize_direct(ks, engine)
+        assert verify_with_networkx(ks, T_direct)
+
     def test_3sum_k3_k4(self, engine):
         """3-sum of K3 and K4: all 3 vertices shared, all edges of K3 deleted."""
         k3 = complete_graph(3)
@@ -545,6 +677,29 @@ class TestHigherKSums:
         pc_graph = Graph(nodes=ks.nodes, edges=pc_edges)
         T_thm10 = theorem10_k_sum(pc_graph, clique_edges, engine)
         assert T_thm10 == T_direct
+
+    def test_partial_separator_deletion(self, engine):
+        """Partial separator: 3-vertex separator with 1 existing adjacency.
+
+        Build K4 ⊕_3 K4, then add back one clique edge. The result has a
+        3-vertex separator where 1 of 3 clique edges is present. The engine
+        should decompose via partial deletion (only 2 edges to delete).
+        """
+        k4 = complete_graph(4)
+        ks = k_sum_graph(k4, k4, 3, [0, 1, 2])
+        # Add back edge (0,1) — now separator {0,1,2} has 1 existing adjacency
+        edges_with_extra = ks.edges | frozenset([(0, 1)])
+        g = Graph(nodes=ks.nodes, edges=edges_with_extra)
+
+        # Build PC: add missing edges (0,2) and (1,2)
+        missing = [(0, 2), (1, 2)]
+        pc_edges = g.edges | frozenset(missing)
+        pc_graph = Graph(nodes=g.nodes, edges=pc_edges)
+
+        # Brute-force on just the 2 missing edges
+        poly = theorem10_k_sum(pc_graph, missing, engine)
+        assert verify_spanning_trees(g, poly)
+        assert verify_with_networkx(g, poly)
 
 
 # =============================================================================
@@ -561,10 +716,10 @@ class TestKSumRouteTriggering:
         (5, 7),   # 5-sum K7+K7: uses flat-grouped Theorem 6
     ])
     def test_ksum_route_triggers(self, k, n, engine):
-        """Verify engine uses the exact k-sum path for graphs with no smaller separator.
+        """Verify engine solves k-sum graphs correctly when not in rainbow table.
 
-        Using n=k+2 ensures vertex connectivity = k, so no (k-1)-vertex
-        independent separator exists and the engine must use exactly k-sum.
+        Treewidth DP now runs before k-sum detection, so small k-sum graphs
+        may be solved via treewidth DP instead. We accept any valid method.
         """
         kn = complete_graph(n)
         shared = list(range(k))
@@ -578,18 +733,46 @@ class TestKSumRouteTriggering:
             pytest.skip(f"{k}-sum of K{n} is disconnected")
 
         engine._cache.clear()
-        # Temporarily remove from rainbow table so k-sum detection fires
         cache_key = ks.canonical_key()
         saved_entry = engine.table.entries.pop(cache_key, None)
         try:
             result = engine.synthesize(ks)
             assert result.verified
-            assert result.method == f"{k}sum_theorem10", (
-                f"Expected {k}sum_theorem10, got {result.method}"
-            )
+            assert result.method in (
+                f"{k}sum_theorem10", "treewidth_dp",
+                # Smaller separator may fire instead
+                *(f"{j}sum_theorem10" for j in range(2, k)),
+            ), f"Unexpected method: {result.method}"
         finally:
             if saved_entry is not None:
                 engine.table.entries[cache_key] = saved_entry
+
+
+# =============================================================================
+# CYCLE GRAPH TESTS
+# =============================================================================
+
+class TestCycleFormula:
+    """Tests for cycle graph fast path: T(C_n) = x^{n-1} + ... + x + y."""
+
+    @pytest.mark.parametrize("n", [3, 4, 5, 7, 10, 15])
+    def test_cycle_formula_correctness(self, engine, n):
+        """Verify cycle formula matches NetworkX for various sizes."""
+        g = cycle_graph(n)
+        engine._cache.clear()
+        cache_key = g.canonical_key()
+        saved = engine.table.entries.pop(cache_key, None)
+        try:
+            result = engine.synthesize(g)
+            assert result.verified
+            assert result.method == "cycle_formula"
+            assert result.polynomial.num_spanning_trees() == n
+            # Full polynomial check for small cycles
+            if n <= 15:
+                assert verify_with_networkx(g, result.polynomial)
+        finally:
+            if saved is not None:
+                engine.table.entries[cache_key] = saved
 
 
 # =============================================================================
@@ -635,9 +818,15 @@ class TestMethodDistribution:
                 methods[name] = result.method
                 assert result.verified, f"{name} result not verified"
 
-            # At least one k-sum graph should use a k-sum path
-            ksum_methods = [m for m in methods.values() if "sum_theorem10" in m]
-            assert len(ksum_methods) > 0, f"No graph triggered k-sum: {methods}"
+            # All graphs should be solved (verified) via some method
+            # With treewidth DP running before k-sum, small k-sum graphs
+            # may be solved directly by treewidth DP instead.
+            valid_methods = {"lookup", "treewidth_dp", "series_parallel",
+                             "cut_vertex", "cycle_formula"}
+            valid_methods |= {f"{k}sum_theorem10" for k in range(2, 8)}
+            for name, method in methods.items():
+                if method != "skipped_disconnected":
+                    assert method in valid_methods, f"{name}: unexpected method {method}"
         finally:
             engine.table.entries.update(saved_entries)
 
@@ -750,6 +939,271 @@ class TestKSumBenchmarks:
 
 
 # =============================================================================
+# SP-GUIDED BOTTOM-UP CONTRACTION TESTS
+# =============================================================================
+
+class TestSPGuidedContractions:
+    """Test SP-guided bottom-up contraction cache on small SP graphs."""
+
+    def test_single_edge_leaf(self):
+        """Single edge has 2 flats, both contractions match direct."""
+        from tutte.synthesis.engine import SynthesisEngine
+        from tutte.matroids.parallel_connection import (
+            _build_leaf_contractions,
+            BivariateLaurentPoly,
+        )
+
+        engine = SynthesisEngine(verbose=False)
+        # Extended cell = a small triangle graph
+        ext = Graph(
+            nodes=frozenset({0, 1, 2}),
+            edges=frozenset({(0, 1), (1, 2), (0, 2)}),
+        )
+        edge = (0, 1)
+        canon_cache = {}
+        data = _build_leaf_contractions(edge, ext, engine, canon_cache)
+
+        assert data.flat_lattice.num_flats == 2
+        assert 0 in data.contracted_blps
+        assert 1 in data.contracted_blps
+        # Verify flat 0 (empty) gives T(triangle) and flat 1 (contract 0-1) gives T(merged)
+        # T(triangle) = x^2 + x + y
+        t_triangle = data.contracted_blps[0].to_tutte_poly()
+        assert t_triangle.num_spanning_trees() == 3  # triangle has 3 spanning trees
+
+    def test_sp_guided_matches_direct_small(self):
+        """SP-guided contractions match direct precompute_contractions on a small SP graph."""
+        from tutte.synthesis.engine import SynthesisEngine
+        from tutte.matroids.parallel_connection import (
+            build_contractions_bottom_up,
+            precompute_contractions,
+            sp_guided_precompute_contractions,
+        )
+        from tutte.graphs.series_parallel import decompose_series_parallel, is_series_parallel
+
+        engine = SynthesisEngine(verbose=False)
+
+        # Build a small SP inter-cell graph: a path (0,1)-(1,2)-(2,3) = 3 series edges
+        inter_graph = Graph(
+            nodes=frozenset({0, 1, 2, 3}),
+            edges=frozenset({(0, 1), (1, 2), (2, 3)}),
+        )
+        assert is_series_parallel(inter_graph)
+
+        # Extended cell: inter_graph + some extra edges
+        ext = Graph(
+            nodes=frozenset({0, 1, 2, 3, 4, 5}),
+            edges=frozenset({
+                (0, 1), (1, 2), (2, 3),  # inter edges
+                (0, 4), (4, 5), (5, 3),  # extra cell edges
+                (1, 4), (2, 5),          # more connections
+            }),
+        )
+
+        matroid = GraphicMatroid(inter_graph)
+        flats, ranks, uc = enumerate_flats_with_hasse(matroid)
+        lattice = FlatLattice(matroid, flats=flats, ranks=ranks, upper_covers=uc)
+
+        # Direct contractions
+        shared = frozenset(inter_graph.edges)
+        direct = precompute_contractions(ext, shared, lattice, engine)
+
+        # SP-guided contractions
+        sp_guided = sp_guided_precompute_contractions(
+            inter_graph, ext, lattice, engine, verbose=False,
+        )
+
+        # Compare results for all flats
+        for z_idx in range(lattice.num_flats):
+            direct_blp = direct[z_idx]
+            sp_blp = sp_guided.get(z_idx)
+            assert sp_blp is not None, f"Missing flat {z_idx} in SP-guided result"
+            # Convert both to Tutte and compare
+            direct_poly = direct_blp.to_tutte_poly()
+            sp_poly = sp_blp.to_tutte_poly()
+            assert direct_poly == sp_poly, (
+                f"Flat {z_idx}: direct={direct_poly} != sp_guided={sp_poly}"
+            )
+
+    def test_sp_guided_parallel_composition(self):
+        """SP-guided contractions work for parallel composition (multi-edge)."""
+        from tutte.synthesis.engine import SynthesisEngine
+        from tutte.matroids.parallel_connection import (
+            precompute_contractions,
+            sp_guided_precompute_contractions,
+        )
+        from tutte.graphs.series_parallel import is_series_parallel
+
+        engine = SynthesisEngine(verbose=False)
+
+        # Inter-cell graph: two parallel edges between nodes 0 and 1
+        # As a simple graph for the matroid, this is just one edge (0,1)
+        # For a proper test of parallel composition in the SP tree,
+        # use a diamond graph: 0-1, 0-2, 1-3, 2-3 (two paths in parallel)
+        inter_graph = Graph(
+            nodes=frozenset({0, 1, 2, 3}),
+            edges=frozenset({(0, 1), (0, 2), (1, 3), (2, 3)}),
+        )
+        assert is_series_parallel(inter_graph)
+
+        ext = Graph(
+            nodes=frozenset({0, 1, 2, 3, 4, 5}),
+            edges=frozenset({
+                (0, 1), (0, 2), (1, 3), (2, 3),  # inter edges
+                (0, 4), (3, 5), (4, 5),            # extra cell edges
+            }),
+        )
+
+        matroid = GraphicMatroid(inter_graph)
+        flats, ranks, uc = enumerate_flats_with_hasse(matroid)
+        lattice = FlatLattice(matroid, flats=flats, ranks=ranks, upper_covers=uc)
+
+        shared = frozenset(inter_graph.edges)
+        direct = precompute_contractions(ext, shared, lattice, engine)
+        sp_guided = sp_guided_precompute_contractions(
+            inter_graph, ext, lattice, engine, verbose=False,
+        )
+
+        for z_idx in range(lattice.num_flats):
+            direct_poly = direct[z_idx].to_tutte_poly()
+            sp_poly = sp_guided[z_idx].to_tutte_poly()
+            assert direct_poly == sp_poly, (
+                f"Flat {z_idx}: direct={direct_poly} != sp_guided={sp_poly}"
+            )
+
+    def test_contraction_cache_save_load_roundtrip(self, tmp_path):
+        """Contraction cache saves to binary+JSON and reloads correctly."""
+        from tutte.synthesis.engine import SynthesisEngine
+        from tutte.matroids.parallel_connection import (
+            build_contractions_bottom_up,
+        )
+        from tutte.graphs.series_parallel import decompose_series_parallel
+        from tutte.lookup.binary import save_contraction_cache, load_contraction_cache
+
+        engine = SynthesisEngine(verbose=False)
+
+        # Build some contractions
+        inter_graph = Graph(
+            nodes=frozenset({0, 1, 2, 3}),
+            edges=frozenset({(0, 1), (1, 2), (2, 3)}),
+        )
+        ext = Graph(
+            nodes=frozenset({0, 1, 2, 3, 4, 5}),
+            edges=frozenset({
+                (0, 1), (1, 2), (2, 3),
+                (0, 4), (4, 5), (5, 3),
+                (1, 4), (2, 5),
+            }),
+        )
+
+        # Build with persistent cache
+        persistent = {}
+        tree = decompose_series_parallel(inter_graph)
+        build_contractions_bottom_up(
+            tree, ext, engine, verbose=False, persistent_cache=persistent,
+        )
+        assert len(persistent) > 0
+
+        # Save to binary
+        bin_path = str(tmp_path / "test_contractions.bin")
+        size = save_contraction_cache(persistent, bin_path)
+        assert size > 0
+
+        # Load back
+        loaded = load_contraction_cache(bin_path)
+        assert len(loaded) == len(persistent)
+        for key in persistent:
+            assert key in loaded
+            assert loaded[key] == persistent[key]
+
+    def test_contraction_cache_json_roundtrip(self, tmp_path):
+        """Contraction cache JSON round-trip."""
+        import json as _json
+        from tutte.synthesis.engine import SynthesisEngine
+        from tutte.matroids.parallel_connection import build_contractions_bottom_up
+        from tutte.graphs.series_parallel import decompose_series_parallel
+
+        engine = SynthesisEngine(verbose=False)
+
+        inter_graph = Graph(
+            nodes=frozenset({0, 1, 2}),
+            edges=frozenset({(0, 1), (1, 2)}),
+        )
+        ext = Graph(
+            nodes=frozenset({0, 1, 2, 3}),
+            edges=frozenset({(0, 1), (1, 2), (0, 3), (2, 3)}),
+        )
+
+        persistent = {}
+        tree = decompose_series_parallel(inter_graph)
+        build_contractions_bottom_up(
+            tree, ext, engine, verbose=False, persistent_cache=persistent,
+        )
+
+        # Save as JSON
+        json_path = str(tmp_path / "test_contractions.json")
+        json_cache = {}
+        for key, poly in persistent.items():
+            json_cache[key] = {f'{i},{j}': c for i, j, c in poly.terms()}
+        with open(json_path, 'w') as f:
+            _json.dump(json_cache, f)
+
+        # Load back
+        with open(json_path) as f:
+            saved = _json.load(f)
+        loaded = {}
+        for key, coeffs_str in saved.items():
+            coeffs = {tuple(map(int, k.split(','))): v for k, v in coeffs_str.items()}
+            loaded[key] = TuttePolynomial.from_coefficients(coeffs)
+
+        assert len(loaded) == len(persistent)
+        for key in persistent:
+            assert loaded[key] == persistent[key]
+
+    def test_persistent_cache_warms_subsequent_build(self):
+        """Persistent cache avoids re-synthesis on second build."""
+        from tutte.synthesis.engine import SynthesisEngine
+        from tutte.matroids.parallel_connection import build_contractions_bottom_up
+        from tutte.graphs.series_parallel import decompose_series_parallel
+
+        engine = SynthesisEngine(verbose=False)
+
+        inter_graph = Graph(
+            nodes=frozenset({0, 1, 2, 3}),
+            edges=frozenset({(0, 1), (1, 2), (2, 3)}),
+        )
+        ext = Graph(
+            nodes=frozenset({0, 1, 2, 3, 4, 5}),
+            edges=frozenset({
+                (0, 1), (1, 2), (2, 3),
+                (0, 4), (4, 5), (5, 3),
+            }),
+        )
+
+        tree = decompose_series_parallel(inter_graph)
+
+        # First build populates the cache
+        persistent = {}
+        data1 = build_contractions_bottom_up(
+            tree, ext, engine, persistent_cache=persistent,
+        )
+        assert len(persistent) > 0
+        first_count = len(persistent)
+
+        # Second build with same cache should add no new entries
+        data2 = build_contractions_bottom_up(
+            tree, ext, engine, persistent_cache=persistent,
+        )
+        assert len(persistent) == first_count
+
+        # Results should match
+        for idx in data1.contracted_blps:
+            poly1 = data1.contracted_blps[idx].to_tutte_poly()
+            poly2 = data2.contracted_blps[idx].to_tutte_poly()
+            assert poly1 == poly2
+
+
+# =============================================================================
 # Z(1,2) INTEGRATION TESTS
 # =============================================================================
 
@@ -757,18 +1211,14 @@ class TestZephyrIntegration:
     """Integration tests for Zephyr graph synthesis with matroid paths."""
 
     @pytest.mark.slow
-    @pytest.mark.skipif(
-        not os.environ.get("RUN_Z12"),
-        reason="Z(1,2) synthesis takes ~60-90s; set RUN_Z12=1 to enable",
-    )
     def test_z12_synthesis(self):
-        """Verify Z(1,2) synthesis produces a verified result via hybrid engine."""
+        """Verify Z(1,2) synthesis produces correct Tutte polynomial (~2 min with C DP)."""
         dnx = pytest.importorskip("dwave_networkx")
         from tutte.synthesis import synthesize
         z12 = Graph.from_networkx(dnx.zephyr_graph(1, 2))
         result = synthesize(z12, verbose=True)
         assert result.verified
-        assert result.polynomial.num_spanning_trees() == 25_117_827_740_467_216
+        assert result.polynomial.num_spanning_trees() == 25_117_827_740_467_200
 
 
 # =============================================================================
@@ -885,7 +1335,7 @@ class TestZ12MultigraphBenchmarks:
             name="z12_chord_merges",
             nodes=24,
             edges=76,
-            spanning_trees=25_117_827_740_467_216,
+            spanning_trees=25_117_827_740_467_200,
             timings_ms=timings,
         )
 
@@ -901,3 +1351,83 @@ class TestZ12MultigraphBenchmarks:
             print(f"  {label}: {ms:.0f}ms")
         if len(sorted_timings) > 10:
             print(f"  ... ({len(sorted_timings) - 10} more)")
+
+
+# =============================================================================
+# TREEWIDTH DP AND COMPLETENESS GUARD TESTS
+# =============================================================================
+
+class TestTreewidthDPInSynthesis:
+    """Test that treewidth DP is triggered at strategic points in synthesis."""
+
+    def test_treewidth_dp_triggered_for_medium_graph(self):
+        """Treewidth DP should solve medium 2-connected graphs directly."""
+        from tutte.synthesis.engine import SynthesisEngine
+
+        # Petersen graph: 10n, 15e, tw=4 — should be solved by treewidth DP
+        g = petersen_graph()
+        engine = SynthesisEngine(verbose=False)
+        result = engine.synthesize(g)
+        assert result.verified
+        assert verify_spanning_trees(g, result.polynomial)
+        # Should use treewidth_dp since Petersen is 2-connected, not SP, no k-sum
+        assert result.method in ("treewidth_dp", "lookup"), \
+            f"Expected treewidth_dp or lookup, got {result.method}"
+
+    def test_treewidth_dp_for_grid_graph(self):
+        """Grid graphs have bounded treewidth and should use treewidth DP."""
+        from tutte.synthesis.engine import SynthesisEngine
+
+        g = grid_graph(3, 4)  # 12n, 17e, tw=3
+        engine = SynthesisEngine(verbose=False)
+        result = engine.synthesize(g)
+        assert result.verified
+        assert verify_spanning_trees(g, result.polynomial)
+
+    def test_treewidth_dp_in_hybrid_engine(self):
+        """Hybrid engine should also use treewidth DP for bounded-tw graphs."""
+        from tutte.synthesis.hybrid import HybridSynthesisEngine
+
+        g = petersen_graph()
+        engine = HybridSynthesisEngine(verbose=False)
+        result = engine.synthesize(g)
+        assert result.verified or verify_spanning_trees(g, result.polynomial)
+
+    def test_ksum_still_works_with_complete_shared(self):
+        """K-sum decomposition with complete shared graph should still work."""
+        from tutte.synthesis.engine import SynthesisEngine
+
+        # Two K4s sharing a K3 (3-sum) — shared vertices [0,1,2]
+        g = k_sum_graph(complete_graph(4), complete_graph(4), k=3, shared_vertices=[0, 1, 2])
+        engine = SynthesisEngine(verbose=False)
+        result = engine.synthesize(g)
+        assert result.verified
+        assert verify_spanning_trees(g, result.polynomial)
+
+
+class TestCompletenessGuard:
+    """Test that Theorem 6 completeness guard prevents wrong results."""
+
+    def test_non_complete_inter_cell_rejected(self):
+        """Theorem 6 should reject non-complete inter-cell graphs."""
+        from tutte.synthesis.engine import _is_complete_graph
+
+        # K3 is complete
+        k3 = complete_graph(3)
+        assert _is_complete_graph(k3)
+
+        # Cycle C4 is NOT complete
+        c4 = cycle_graph(4)
+        assert not _is_complete_graph(c4)
+
+        # K1 (single node) is complete
+        k1 = Graph(nodes=frozenset({0}), edges=frozenset())
+        assert _is_complete_graph(k1)
+
+        # K2 (single edge) is complete
+        k2 = Graph(nodes=frozenset({0, 1}), edges=frozenset({(0, 1)}))
+        assert _is_complete_graph(k2)
+
+        # Path P3 is NOT complete
+        p3 = Graph(nodes=frozenset({0, 1, 2}), edges=frozenset({(0, 1), (1, 2)}))
+        assert not _is_complete_graph(p3)

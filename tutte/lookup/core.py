@@ -705,6 +705,30 @@ def load_default_table() -> RainbowTable:
     return RainbowTable()
 
 
+def _validate_poly_cache(
+    cache: Dict[str, 'TuttePolynomial'],
+    label: str,
+) -> Dict[str, 'TuttePolynomial']:
+    """Validate cached polynomials, dropping entries with negative coefficients.
+
+    Connected graph Tutte polynomials have all non-negative coefficients.
+    Negative coefficients indicate a corrupt cache entry from a prior buggy run.
+    """
+    bad_keys = []
+    for key, poly in cache.items():
+        coeffs = poly.to_coefficients()
+        if any(v < 0 for v in coeffs.values()):
+            bad_keys.append(key)
+    if bad_keys:
+        import warnings
+        warnings.warn(
+            f"{label} cache: dropped {len(bad_keys)} entries with negative coefficients"
+        )
+        for key in bad_keys:
+            del cache[key]
+    return cache
+
+
 def load_default_multigraph_table() -> Dict[str, 'TuttePolynomial']:
     """Load the default multigraph lookup table from the package directory.
 
@@ -722,7 +746,8 @@ def load_default_multigraph_table() -> Dict[str, 'TuttePolynomial']:
     if os.path.exists(bin_path):
         try:
             from .binary import load_multigraph_lookup_table
-            return load_multigraph_lookup_table(bin_path)
+            cache = load_multigraph_lookup_table(bin_path)
+            return _validate_poly_cache(cache, "multigraph")
         except Exception:
             pass  # Fall through to JSON
 
@@ -734,7 +759,7 @@ def load_default_multigraph_table() -> Dict[str, 'TuttePolynomial']:
         for key, coeffs_str in saved.items():
             coeffs = {tuple(map(int, k.split(','))): v for k, v in coeffs_str.items()}
             cache[key] = TuttePolynomial.from_coefficients(coeffs)
-        return cache
+        return _validate_poly_cache(cache, "multigraph")
 
     return {}
 
@@ -753,6 +778,67 @@ def save_default_multigraph_table(cache: Dict[str, 'TuttePolynomial']) -> None:
     json_path = os.path.join(base_dir, 'multigraph_lookup_table.json')
 
     save_multigraph_lookup_table(cache, bin_path)
+
+    json_cache = {}
+    for key, poly in cache.items():
+        json_cache[key] = {f'{i},{j}': c for i, j, c in poly.terms()}
+    with open(json_path, 'w') as f:
+        _json.dump(json_cache, f, indent=2)
+
+
+def load_default_contraction_cache() -> Dict[str, 'TuttePolynomial']:
+    """Load the default contraction cache from the package directory.
+
+    The contraction cache stores pre-computed T(M_i/Z) contractions from
+    the SP-guided bottom-up approach. Keyed by canonical_key of the contracted
+    multigraph, valued by TuttePolynomial.
+
+    Tries binary format first (faster), falls back to JSON.
+
+    Returns:
+        Dict mapping canonical key -> TuttePolynomial.
+    """
+    from ..polynomial import TuttePolynomial
+
+    base_dir = _default_data_dir()
+    bin_path = os.path.join(base_dir, 'contraction_lookup_table.bin')
+    json_path = os.path.join(base_dir, 'contraction_lookup_table.json')
+
+    if os.path.exists(bin_path):
+        try:
+            from .binary import load_contraction_cache
+            cache = load_contraction_cache(bin_path)
+            return _validate_poly_cache(cache, "contraction")
+        except Exception:
+            pass  # Fall through to JSON
+
+    if os.path.exists(json_path):
+        import json as _json
+        with open(json_path) as f:
+            saved = _json.load(f)
+        cache: Dict[str, TuttePolynomial] = {}
+        for key, coeffs_str in saved.items():
+            coeffs = {tuple(map(int, k.split(','))): v for k, v in coeffs_str.items()}
+            cache[key] = TuttePolynomial.from_coefficients(coeffs)
+        return _validate_poly_cache(cache, "contraction")
+
+    return {}
+
+
+def save_default_contraction_cache(cache: Dict[str, 'TuttePolynomial']) -> None:
+    """Save the contraction cache to the default location (binary + JSON).
+
+    Args:
+        cache: Dict mapping canonical key -> TuttePolynomial.
+    """
+    import json as _json
+    from .binary import save_contraction_cache
+
+    base_dir = _default_data_dir()
+    bin_path = os.path.join(base_dir, 'contraction_lookup_table.bin')
+    json_path = os.path.join(base_dir, 'contraction_lookup_table.json')
+
+    save_contraction_cache(cache, bin_path)
 
     json_cache = {}
     for key, poly in cache.items():

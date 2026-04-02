@@ -107,6 +107,11 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         if loaded > 0 and verbose:
             print(f"[Hybrid] Loaded {loaded} multigraph cache entries")
 
+        # Load precomputed contraction cache if available
+        cc_loaded = self._structural_engine.load_contraction_cache()
+        if cc_loaded > 0 and verbose:
+            print(f"[Hybrid] Loaded {cc_loaded} contraction cache entries")
+
         # Statistics
         self._stats = {'algebraic': 0, 'tiling': 0, 'dc': 0, 'lookup': 0}
 
@@ -314,6 +319,21 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         and hierarchical tiling decompositions.
         """
         from .engine import SynthesisResult
+        from ..polynomial import TuttePolynomial
+
+        # Cycle graph: T(C_n) = x^{n-1} + ... + x + y
+        if graph.node_count() >= 3 and graph.edge_count() == graph.node_count():
+            if all(graph.degree(n) == 2 for n in graph.nodes):
+                n = graph.node_count()
+                coeffs = {(i, 0): 1 for i in range(1, n)}
+                coeffs[(0, 1)] = 1
+                self._log(f"Cycle C_{n}: direct formula")
+                return HybridSynthesisResult(
+                    polynomial=TuttePolynomial.from_coefficients(coeffs),
+                    method="cycle_formula",
+                    recipe=[f"Cycle C_{n}"],
+                    verified=True,
+                )
 
         # Series-parallel O(n)
         sp_poly = compute_sp_tutte_if_applicable(graph)
@@ -327,6 +347,20 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
             )
 
         engine = self._structural_engine
+
+        # Treewidth DP (fast for tw <= 10, before expensive k-sum/hierarchical)
+        if graph.edge_count() >= 10:
+            from ..graphs.treewidth import compute_treewidth_tutte_if_applicable
+            full_mg = MultiGraph.from_graph(graph)
+            tw_poly = compute_treewidth_tutte_if_applicable(full_mg, max_width=10)
+            if tw_poly is not None:
+                self._log(f"Treewidth DP: {graph.node_count()}n, {graph.edge_count()}e")
+                return HybridSynthesisResult(
+                    polynomial=tw_poly,
+                    method="treewidth_dp",
+                    recipe=["Treewidth-based DP (full graph)"],
+                    verified=True,
+                )
 
         # K-sum decomposition
         ksum_result = engine._try_ksum_decomposition(graph)
