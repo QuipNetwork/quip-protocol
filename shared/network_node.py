@@ -70,7 +70,7 @@ async def get_public_ip() -> Optional[str]:
     # Use module-level logger
     logger = logging.getLogger(__name__)
 
-    # List of reliable IP detection services
+    # List of reliable IP detection services (shuffled to spread load)
     services = [
         "https://check.quip.network",
         "https://api.ipify.org",
@@ -79,6 +79,7 @@ async def get_public_ip() -> Optional[str]:
         "https://checkip.amazonaws.com",
         "https://ident.me",
     ]
+    random.shuffle(services)
 
     # Create SSL context that doesn't verify (for simplicity)
     ssl_context = ssl.create_default_context()
