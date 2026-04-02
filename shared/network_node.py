@@ -1926,18 +1926,34 @@ class NetworkNode(Node):
             return False
 
     @staticmethod
-    def _is_private_ip(address: str) -> bool:
-        """Check if the IP portion of a host:port address is private/loopback."""
-        host = address.rsplit(':', 1)[0]
-        # Strip IPv6 brackets
-        if host.startswith('[') and host.endswith(']'):
-            host = host[1:-1]
+    def _normalize_ip(raw_ip: str) -> str:
+        """Normalize an IP: strip brackets, map IPv6-mapped IPv4 to plain IPv4."""
+        host = raw_ip.strip('[]')
         try:
             addr = ipaddress.ip_address(host)
+            if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+                return str(addr.ipv4_mapped)
+            return str(addr)
+        except ValueError:
+            return host
+
+    @staticmethod
+    def _is_private_ip(host: str) -> bool:
+        """Check if an IP string (no port) is private/loopback/link-local."""
+        try:
+            addr = ipaddress.ip_address(host)
+            if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+                addr = addr.ipv4_mapped
             return addr.is_private or addr.is_loopback or addr.is_link_local
         except ValueError:
-            # Hostname, not an IP literal — not private
             return False
+
+    def _extract_peer_ip_port(self, address: str) -> tuple[str, int]:
+        """Parse host:port using address_utils, normalize IPv6-mapped IPs."""
+        from shared.address_utils import parse_host_port, DEFAULT_PORT
+        host, port = parse_host_port(address, DEFAULT_PORT)
+        host = self._normalize_ip(host)
+        return host, port
 
     async def _validate_peer_address(
         self, claimed: str, real_peer_addr: str, timeout: float = 2.0
@@ -1946,7 +1962,8 @@ class NetworkNode(Node):
 
         If the claimed address uses a private/loopback IP, it is immediately
         replaced with the real connecting IP since private addresses are not
-        routable from remote peers.
+        routable from remote peers.  IPv6-mapped IPv4 addresses are normalized
+        to plain IPv4.
 
         Args:
             claimed: Address the peer claims (e.g., "your-public-ip:20049")
@@ -1959,39 +1976,45 @@ class NetworkNode(Node):
         Raises:
             ValueError: If neither claimed nor fallback address is reachable
         """
-        claimed_port = claimed.rsplit(':', 1)[1]
-        real_ip = real_peer_addr.rsplit(':', 1)[0]
+        from shared.address_utils import format_host_port
+
+        claimed_host, claimed_port = self._extract_peer_ip_port(claimed)
+        real_host, _ = self._extract_peer_ip_port(real_peer_addr)
+        claimed_addr = format_host_port(claimed_host, claimed_port)
 
         # Private/loopback IPs are never reachable from remote peers —
         # replace immediately with the connecting IP.
-        if self._is_private_ip(claimed):
-            fallback = f"{real_ip}:{claimed_port}"
+        if self._is_private_ip(claimed_host):
+            fallback = format_host_port(real_host, claimed_port)
             self.logger.info(
-                f"Peer claimed private address {claimed}, "
+                f"Peer claimed private address {claimed_addr}, "
                 f"using connecting IP: {fallback}"
             )
             if await self._can_reach_address(fallback, timeout):
                 return fallback
             raise ValueError(
-                f"Peer claimed private address {claimed} and "
+                f"Peer claimed private address {claimed_addr} and "
                 f"connecting IP {fallback} is unreachable"
             )
 
         # Try claimed address first
-        if await self._can_reach_address(claimed, timeout):
-            return claimed
+        if await self._can_reach_address(claimed_addr, timeout):
+            return claimed_addr
 
         # Fallback to real connecting IP with claimed port
-        fallback = f"{real_ip}:{claimed_port}"
+        fallback = format_host_port(real_host, claimed_port)
         self.logger.warning(
-            f"Claimed address {claimed} unreachable, falling back to {fallback}"
+            f"Claimed address {claimed_addr} unreachable, "
+            f"falling back to {fallback}"
         )
 
         if await self._can_reach_address(fallback, timeout):
             return fallback
 
-        # Neither works - reject the join
-        raise ValueError(f"Cannot reach peer at claimed {claimed} or fallback {fallback}")
+        raise ValueError(
+            f"Cannot reach peer at claimed {claimed_addr} "
+            f"or fallback {fallback}"
+        )
 
     async def _quic_handle_join(self, msg: QuicMessage, protocol: Any) -> QuicMessage:
         """Handle join request from a new node."""
