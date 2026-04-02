@@ -1413,7 +1413,10 @@ class NetworkNode(Node):
             }
 
             # Use NodeClient's SSL-aware connection method
-            result = await self.node_client.join_network_via_peer(peer_address, join_data)
+            is_initial = peer_address in self.initial_peers
+            result = await self.node_client.join_network_via_peer(
+                peer_address, join_data, bypass_ban=is_initial,
+            )
             if not result:
                 self.logger.warning(f"Failed to join via {peer_address}")
                 return False
@@ -1442,6 +1445,15 @@ class NetworkNode(Node):
     def _is_backed_off(self, peer_address: str) -> bool:
         """Check if peer is currently banned."""
         return self._ban_list.is_banned(peer_address)
+
+    @staticmethod
+    def _format_ban_remaining(seconds: float) -> str:
+        """Format remaining ban time for error messages."""
+        if seconds < 60:
+            return f"{int(seconds)}s"
+        if seconds < 3600:
+            return f"{int(seconds / 60)}m"
+        return f"{seconds / 3600:.1f}h"
 
     async def _backoff_peer(self, peer_address: str, reason: str):
         """Ban peer with exponential backoff and disconnect."""
@@ -1843,11 +1855,11 @@ class NetworkNode(Node):
         except ValueError as e:
             return msg.create_error_response(str(e))
 
-        # A JOIN is an explicit reconnection attempt — clear any prior
-        # ban so the peer gets a fresh chance.  Version checks below
-        # will re-ban if the version is actually too old.
         if self._is_backed_off(new_node_address):
-            self._ban_list.clear_ban(new_node_address)
+            remaining = self._ban_list.time_remaining(new_node_address)
+            return msg.create_error_response(
+                f"backed off ({self._format_ban_remaining(remaining)} remaining)"
+            )
 
         join_version = data.get("version")
         if join_version:

@@ -384,8 +384,8 @@ class NodeClient:
         self.peers.pop(host, None)
         await self._close_connection(host)
 
-    async def _get_connection(self, host: str) -> Optional[_QuicClientProtocol]:
-        if self.ban_list.is_banned(host):
+    async def _get_connection(self, host: str, bypass_ban: bool = False) -> Optional[_QuicClientProtocol]:
+        if not bypass_ban and self.ban_list.is_banned(host):
             return None
 
         if host not in self._connection_locks:
@@ -577,8 +577,8 @@ class NodeClient:
             return False
         return response is not None and response.msg_type == QuicMessageType.GOSSIP_RESPONSE
 
-    async def join_network_via_peer(self, peer_address: str, join_data: dict) -> Optional[dict]:
-        protocol = await self._get_connection(peer_address)
+    async def join_network_via_peer(self, peer_address: str, join_data: dict, bypass_ban: bool = False) -> Optional[dict]:
+        protocol = await self._get_connection(peer_address, bypass_ban=bypass_ban)
         if not protocol:
             self.logger.warning(f"Could not establish connection to {peer_address}")
             return None
