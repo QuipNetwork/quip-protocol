@@ -153,6 +153,9 @@ release-binaries:
     - if: $CI_COMMIT_TAG
   script:
     - echo "Creating release $CI_COMMIT_TAG"
+    # Delete any existing release so retagged versions don't fail
+    - |
+      release-cli delete --tag-name "$CI_COMMIT_TAG" 2>/dev/null || true
   release:
     tag_name: $CI_COMMIT_TAG
     description: "Release $CI_COMMIT_TAG"
