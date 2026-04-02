@@ -166,10 +166,9 @@ class BaseMultigraphSynthesizer:
             return sp_poly
 
         # 4.7 Treewidth-based O(n · B(w+1)²) computation
-        # max_width=9: parent grouping optimization reduces _poly_mul calls from
-        # B(w+1)² to B(w)² per merge. TW=9 is tractable with good decomposition
-        # selection (exponential edge cost model steers toward even edge distribution).
-        tw_poly = compute_treewidth_tutte_if_applicable(mg, max_width=9)
+        # max_width=10: supports up to Z(1,2) Zephyr graphs (tw=10).
+        # Parent grouping reduces _poly_mul calls from B(w+1)² to B(w)² per merge.
+        tw_poly = compute_treewidth_tutte_if_applicable(mg, max_width=10)
         if tw_poly is not None:
             self._log(f"Treewidth-based: {mg.node_count()} nodes, {mg.edge_count()} edges")
             if cache_key is None:

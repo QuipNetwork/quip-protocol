@@ -24,6 +24,13 @@ from ..graph import MultiGraph
 from ..polynomial import TuttePolynomial
 from ..logs import get_log, EventType, LogLevel
 
+# Try to import C-accelerated partition merge (5x faster for tw >= 8)
+try:
+    from ._treewidth_c import c_batch_merge as _c_batch_merge
+except Exception:
+    _c_batch_merge = None
+
+
 # =============================================================================
 # SET PARTITION UTILITIES
 # =============================================================================
@@ -69,6 +76,47 @@ def encode_canonicalize(labels: Tuple[int, ...]) -> int:
     return encode_partition(canonicalize(labels))
 
 
+def encoded_merge_for_conn(enc: int, conn_key: Tuple[Tuple[int, int], ...],
+                            shared_positions: List[int]) -> int:
+    """Merge partition labels at shared positions according to conn_key, directly on encoded int.
+
+    conn_key is a list of (ci, cj) pairs meaning shared_positions[ci] and
+    shared_positions[cj] should be in the same block. Avoids
+    decode_partition + list manipulation + encode_canonicalize.
+    """
+    n = enc & 0xF
+
+    # Apply merges directly on the encoded int using bit manipulation
+    for ci, cj in conn_key:
+        pi = shared_positions[ci]
+        pj = shared_positions[cj]
+        lbl_pi = (enc >> (4 + pi * 4)) & 0xF
+        lbl_pj = (enc >> (4 + pj * 4)) & 0xF
+        if lbl_pi != lbl_pj:
+            target = min(lbl_pi, lbl_pj)
+            replace = max(lbl_pi, lbl_pj)
+            # Replace all occurrences of 'replace' with 'target' in the encoded int
+            for k in range(n):
+                shift = 4 + k * 4
+                if (enc >> shift) & 0xF == replace:
+                    enc = (enc & ~(0xF << shift)) | (target << shift)
+
+    # Canonicalize: renumber labels in first-appearance order
+    # Build mapping from current labels to canonical labels
+    mapping = [0] * 16  # max 16 labels
+    seen = [False] * 16
+    next_id = 0
+    result = n
+    for i in range(n):
+        lbl = (enc >> (4 + i * 4)) & 0xF
+        if not seen[lbl]:
+            seen[lbl] = True
+            mapping[lbl] = next_id
+            next_id += 1
+        result |= (mapping[lbl] << (4 + i * 4))
+    return result
+
+
 def encoded_connect(enc: int, i: int, j: int) -> int:
     """Merge blocks containing positions i and j in encoded partition."""
     n = enc & 0xF
@@ -88,7 +136,7 @@ def encoded_connect(enc: int, i: int, j: int) -> int:
 
 # Cache for encoded_connect to avoid recomputation on repeated partition+edge pairs
 _connect_cache: Dict[Tuple[int, int, int], int] = {}
-_CONNECT_CACHE_MAX = 500_000
+_CONNECT_CACHE_MAX = 2_000_000
 
 
 def encoded_connect_cached(enc: int, i: int, j: int) -> int:
@@ -166,10 +214,22 @@ def poly_one() -> Poly:
 def poly_add(p: Poly, q: Poly) -> Poly:
     result = dict(p)
     for k, v in q.items():
-        result[k] = result.get(k, 0) + v
-        if result[k] == 0:
+        s = result.get(k, 0) + v
+        if s:
+            result[k] = s
+        elif k in result:
             del result[k]
     return result
+
+
+def poly_add_inplace(dst: Poly, src: Poly) -> None:
+    """Add src into dst in-place. Avoids dict copy for accumulation patterns."""
+    for k, v in src.items():
+        s = dst.get(k, 0) + v
+        if s:
+            dst[k] = s
+        elif k in dst:
+            del dst[k]
 
 
 def poly_mul_monomial(p: Poly, a_pow: int, b_pow: int) -> Poly:
@@ -602,8 +662,14 @@ def compute_best_tree_decomposition(
         _consider(_build_decomposition(mg, ordering, adj))
 
     # minfill with random tie-breaking
-    # Use more seeds for higher treewidth graphs where decomposition quality matters more
-    n_seeds = 50 if (best_td is not None and best_td.width >= 8) else 20
+    # Use more seeds for higher treewidth graphs where decomposition quality matters more.
+    # For tw>=9 (e.g. Z(1,2)), DP cost varies up to 3x between orderings.
+    if best_td is not None and best_td.width >= 9:
+        n_seeds = 200
+    elif best_td is not None and best_td.width >= 8:
+        n_seeds = 50
+    else:
+        n_seeds = 20
     for seed in range(n_seeds):
         ordering = _elimination_ordering(
             adj, nodes, heuristic="minfill_random", seed=seed, max_width=max_width
@@ -683,72 +749,106 @@ def compute_treewidth_tutte(td: TreeDecomposition, mg: MultiGraph) -> TuttePolyn
         table: DPTable = {init_partition: poly_one()}
 
         # Introduce edges assigned to this bag
+        # Separate edges by type for batch processing
+        loop_edges = []
+        simple_edges = []  # mult == 1, non-loop
+        parallel_edges = []  # mult > 1, non-loop
         for (u, v, mult) in td.bag_edges[bag_idx]:
             if u not in bag or v not in bag:
                 continue
-
-            idx_u = vert_to_idx[u]
-            idx_v = vert_to_idx[v] if u != v else idx_u
-
             if u == v:
-                # Loop: all copies just multiply by (1+b)^mult
-                # Each loop copy: absent (weight 1) or present (weight b)
-                # k copies: (1+b)^k
-                loop_factor = _power_1_plus_b(mult)
-                new_table: DPTable = {}
-                for partition, poly in table.items():
-                    new_poly = _poly_mul(poly, loop_factor)
+                loop_edges.append((u, v, mult))
+            elif mult == 1:
+                simple_edges.append((u, v, mult))
+            else:
+                parallel_edges.append((u, v, mult))
+
+        # Process loops
+        for (u, v, mult) in loop_edges:
+            loop_factor = _power_1_plus_b(mult)
+            new_table: DPTable = {}
+            for partition, poly in table.items():
+                new_poly = _poly_mul(poly, loop_factor)
+                if new_poly:
+                    new_table[partition] = poly_add(
+                        new_table.get(partition, poly_zero()), new_poly
+                    )
+            table = new_table
+
+        # Process parallel edges (mult > 1)
+        for (u, v, mult) in parallel_edges:
+            idx_u = vert_to_idx[u]
+            idx_v = vert_to_idx[v]
+            factor_full = _power_1_plus_b(mult)
+            factor_minus_1 = poly_add(factor_full, {(0, 0): -1})
+            new_table: DPTable = {}
+            for partition, poly in table.items():
+                connected_part = encoded_connect_cached(partition, idx_u, idx_v)
+                if connected_part == partition:
+                    # u,v already connected: weight = (1+b)^k
+                    new_poly = _poly_mul(poly, factor_full)
                     if new_poly:
                         new_table[partition] = poly_add(
                             new_table.get(partition, poly_zero()), new_poly
                         )
-                table = new_table
-            elif mult == 1:
-                # Single edge: original logic (most common case)
+                else:
+                    # All k absent: partition unchanged, weight 1
+                    new_table[partition] = poly_add(
+                        new_table.get(partition, poly_zero()), poly
+                    )
+                    # >=1 present: connect u,v, weight (1+b)^k - 1
+                    new_poly = _poly_mul(poly, factor_minus_1)
+                    if new_poly:
+                        new_table[connected_part] = poly_add(
+                            new_table.get(connected_part, poly_zero()), new_poly
+                        )
+            table = new_table
+
+        # Batch introduction of simple edges (mult == 1)
+        # Instead of introducing one at a time (each doubling table size),
+        # iterate over all 2^k subsets of edges simultaneously.
+        # This avoids large intermediate tables and collapses partitions early.
+        if simple_edges and len(simple_edges) <= 12:
+            edge_indices = [(vert_to_idx[u], vert_to_idx[v])
+                           for (u, v, _) in simple_edges]
+            k = len(edge_indices)
+            new_table: DPTable = {}
+            for partition, poly in table.items():
+                for mask in range(1 << k):
+                    # Compute partition from connecting all edges in subset
+                    p = partition
+                    for bit in range(k):
+                        if mask & (1 << bit):
+                            p = encoded_connect_cached(
+                                p, edge_indices[bit][0], edge_indices[bit][1]
+                            )
+                    # Weight: b^popcount(mask)
+                    bc = bin(mask).count('1')
+                    shifted = poly_mul_monomial(poly, 0, bc) if bc > 0 else poly
+                    if p in new_table:
+                        poly_add_inplace(new_table[p], shifted)
+                    else:
+                        new_table[p] = dict(shifted)
+            table = new_table
+        elif simple_edges:
+            # Sequential introduction for k > 12
+            for (u, v, _) in simple_edges:
+                idx_u = vert_to_idx[u]
+                idx_v = vert_to_idx[v]
                 new_table: DPTable = {}
                 for partition, poly in table.items():
                     # Edge absent
                     if partition in new_table:
-                        new_table[partition] = poly_add(new_table[partition], poly)
+                        poly_add_inplace(new_table[partition], poly)
                     else:
-                        new_table[partition] = poly
+                        new_table[partition] = dict(poly)
                     # Edge present: connect u,v, multiply by b
                     new_part = encoded_connect_cached(partition, idx_u, idx_v)
                     new_poly = poly_mul_monomial(poly, 0, 1)
                     if new_part in new_table:
-                        new_table[new_part] = poly_add(new_table[new_part], new_poly)
+                        poly_add_inplace(new_table[new_part], new_poly)
                     else:
-                        new_table[new_part] = new_poly
-                table = new_table
-            else:
-                # Batch introduction of k parallel edges (Optimization B)
-                # For k parallel edges between u,v:
-                # - u,v already connected: weight = (1+b)^k
-                # - u,v disconnected: unchanged with weight 1, or
-                #   connected with weight (1+b)^k - 1
-                factor_full = _power_1_plus_b(mult)
-                factor_minus_1 = poly_add(factor_full, {(0, 0): -1})
-                new_table: DPTable = {}
-                for partition, poly in table.items():
-                    connected_part = encoded_connect_cached(partition, idx_u, idx_v)
-                    if connected_part == partition:
-                        # u,v already connected: weight = (1+b)^k
-                        new_poly = _poly_mul(poly, factor_full)
-                        if new_poly:
-                            new_table[partition] = poly_add(
-                                new_table.get(partition, poly_zero()), new_poly
-                            )
-                    else:
-                        # All k absent: partition unchanged, weight 1
-                        new_table[partition] = poly_add(
-                            new_table.get(partition, poly_zero()), poly
-                        )
-                        # >=1 present: connect u,v, weight (1+b)^k - 1
-                        new_poly = _poly_mul(poly, factor_minus_1)
-                        if new_poly:
-                            new_table[connected_part] = poly_add(
-                                new_table.get(connected_part, poly_zero()), new_poly
-                            )
+                        new_table[new_part] = dict(new_poly)
                 table = new_table
 
         # Process children: merge child tables, then forget child-only vertices
@@ -777,10 +877,9 @@ def compute_treewidth_tutte(td: TreeDecomposition, mg: MultiGraph) -> TuttePolyn
                     current_enc = new_enc
 
                 if current_enc in forgotten_table:
-                    forgotten_table[current_enc] = poly_add(
-                        forgotten_table[current_enc], current_poly)
+                    poly_add_inplace(forgotten_table[current_enc], current_poly)
                 else:
-                    forgotten_table[current_enc] = current_poly
+                    forgotten_table[current_enc] = dict(current_poly)
 
             # Now child table has same vertex set as shared vertices
             shared_verts = [v for v in child_verts if v in bag]
@@ -885,7 +984,10 @@ def _merge_tables(
         for partition, poly in parent_table.items():
             new_poly = _poly_mul(poly, child_poly)
             if new_poly:
-                result[partition] = poly_add(result.get(partition, poly_zero()), new_poly)
+                if partition in result:
+                    poly_add_inplace(result[partition], new_poly)
+                else:
+                    result[partition] = dict(new_poly)
         return result
 
     parent_vert_idx = {v: i for i, v in enumerate(parent_verts)}
@@ -893,10 +995,13 @@ def _merge_tables(
     n_shared = len(shared_verts)
 
     # Group child entries by connectivity pattern on shared vertices
-    child_groups: Dict[Tuple[Tuple[int, int], ...], Poly] = _defaultdict(poly_zero)
+    child_groups: Dict[Tuple[Tuple[int, int], ...], Poly] = {}
     for child_enc, child_poly in child_table.items():
         conn_key = _child_connectivity_key(child_enc, n_shared)
-        child_groups[conn_key] = poly_add(child_groups[conn_key], child_poly)
+        if conn_key in child_groups:
+            poly_add_inplace(child_groups[conn_key], child_poly)
+        else:
+            child_groups[conn_key] = dict(child_poly)
 
     result: DPTable = {}
 
@@ -948,40 +1053,60 @@ def _merge_tables(
                 if new_poly:
                     for enc in encs:
                         if enc in result:
-                            result[enc] = poly_add(result[enc], new_poly)
+                            poly_add_inplace(result[enc], new_poly)
                         else:
-                            result[enc] = new_poly
+                            result[enc] = dict(new_poly)
             continue  # Skip the generic multiply loop below
 
         parents_by_output: Dict[int, Poly] = {}
-        for parent_enc, parent_poly in parent_table.items():
-            parent_labels = list(decode_partition(parent_enc))
-            merged = list(parent_labels)
-            for ci, cj in conn_key:
-                pi = shared_positions_in_parent[ci]
-                pj = shared_positions_in_parent[cj]
-                old_label = merged[pj]
-                new_label = merged[pi]
-                if old_label != new_label:
-                    target = min(old_label, new_label)
-                    replace = max(old_label, new_label)
-                    merged = [target if l == replace else l for l in merged]
-            merged_enc = encode_canonicalize(tuple(merged))
 
-            if merged_enc in parents_by_output:
-                parents_by_output[merged_enc] = poly_add(
-                    parents_by_output[merged_enc], parent_poly)
-            else:
-                parents_by_output[merged_enc] = parent_poly
+        # Use C batch merge if available (5x faster for partition encoding)
+        if _c_batch_merge is not None:
+            enc_list, out_buf, n = _c_batch_merge(
+                parent_table.keys(), conn_key, shared_positions_in_parent)
+            for i in range(n):
+                merged_enc = out_buf[i]
+                parent_poly = parent_table[enc_list[i]]
+                dst = parents_by_output.get(merged_enc)
+                if dst is not None:
+                    # Inlined poly_add_inplace — avoids function call overhead
+                    for k, v in parent_poly.items():
+                        s = dst.get(k, 0) + v
+                        if s:
+                            dst[k] = s
+                        elif k in dst:
+                            del dst[k]
+                else:
+                    parents_by_output[merged_enc] = dict(parent_poly)
+        else:
+            for parent_enc, parent_poly in parent_table.items():
+                merged_enc = encoded_merge_for_conn(
+                    parent_enc, conn_key, shared_positions_in_parent)
+                dst = parents_by_output.get(merged_enc)
+                if dst is not None:
+                    for k, v in parent_poly.items():
+                        s = dst.get(k, 0) + v
+                        if s:
+                            dst[k] = s
+                        elif k in dst:
+                            del dst[k]
+                else:
+                    parents_by_output[merged_enc] = dict(parent_poly)
 
         # Now multiply once per unique output (expensive _poly_mul)
         for merged_enc, summed_parent in parents_by_output.items():
             new_poly = _poly_mul(summed_parent, child_poly)
             if new_poly:
-                if merged_enc in result:
-                    result[merged_enc] = poly_add(result[merged_enc], new_poly)
+                dst = result.get(merged_enc)
+                if dst is not None:
+                    for k, v in new_poly.items():
+                        s = dst.get(k, 0) + v
+                        if s:
+                            dst[k] = s
+                        elif k in dst:
+                            del dst[k]
                 else:
-                    result[merged_enc] = new_poly
+                    result[merged_enc] = dict(new_poly)
 
     return result
 
@@ -1047,11 +1172,7 @@ def _convert_ab_to_xy(poly_ab: Poly) -> TuttePolynomial:
 def compute_treewidth_tutte_if_applicable(
     mg: MultiGraph, max_width: int = 8
 ) -> Optional[TuttePolynomial]:
-    """Compute Tutte polynomial via tree decomposition if treewidth <= max_width.
-
-    Returns None if treewidth exceeds max_width or graph is trivial.
-    Uses multi-ordering optimization to find the best decomposition.
-    """
+    """Compute Tutte polynomial via tree decomposition if treewidth <= max_width."""
     if not mg.nodes:
         return TuttePolynomial.one()
 
@@ -1069,9 +1190,18 @@ def compute_treewidth_tutte_if_applicable(
                 f"{mg.node_count()}n {mg.edge_count()}e, cost={cost:.0f}",
                 LogLevel.DEBUG)
 
+    # Use bulk C DP for tw >= 5 when available (5-15x faster)
+    if td.width >= 5:
+        try:
+            from ._treewidth_c import compute_treewidth_tutte_c
+            c_result = compute_treewidth_tutte_c(td, mg)
+            if c_result is not None:
+                _connect_cache.clear()
+                return c_result
+        except Exception:
+            pass  # fall back to Python
+
     result = compute_treewidth_tutte(td, mg)
 
-    # Clear connect cache between graphs to bound memory
     _connect_cache.clear()
-
     return result

@@ -706,6 +706,109 @@ class FlatLattice:
                             total += self._mobius_cache.get((w_idx, k), 0)
                 self._mobius_cache[(w_idx, j)] = -total
 
+    def precompute_all_mobius_and_chi(
+        self,
+    ) -> Tuple[Dict[int, List[int]], Dict[int, Dict[int, int]]]:
+        """Batch precompute flats_above, Möbius values, and chi coefficients for ALL flats.
+
+        Returns:
+            (flats_above_map, chi_coeffs_map) where:
+            - flats_above_map[w_idx] = list of z_idx with Z >= W
+            - chi_coeffs_map[w_idx] = {power: coeff} for chi(N/W; q)
+            Also populates self._mobius_cache with all μ(W,Z) values.
+        """
+        import time as _time
+        t0 = _time.time()
+
+        nf = len(self._flats)
+        max_rank = max(self._flats_by_rank.keys()) if self._flats_by_rank else 0
+        r_top = self._ranks[-1]
+
+        # Step 1: Precompute flats_above for all W using top-down BFS from Hasse
+        # For each flat j at rank r, it is above all flats at rank < r that are subsets.
+        # Build bottom-up: flats_above[w] starts with {w}, then propagate down covers.
+        flats_above_map: Dict[int, List[int]] = {i: [i] for i in range(nf)}
+
+        # For each flat j (from high rank to low), add j to flats_above of all its ancestors
+        # Use DFS through lower_covers
+        for r in range(max_rank, 0, -1):
+            for j in self._flats_by_rank.get(r, []):
+                # j is above all its lower covers' ancestors
+                stack = list(self._lower_covers.get(j, []))
+                visited = set()
+                while stack:
+                    w = stack.pop()
+                    if w in visited:
+                        continue
+                    visited.add(w)
+                    flats_above_map[w].append(j)
+                    stack.extend(self._lower_covers.get(w, []))
+
+        t1 = _time.time()
+        print(f"[Mobius] flats_above computed: {_time.time() - t0:.1f}s", flush=True)
+
+        # Step 1b: Precompute flats_below for all Z (dual of flats_above)
+        flats_below_sets: Dict[int, Set[int]] = {i: {i} for i in range(nf)}
+        for r in range(0, max_rank):
+            for w in self._flats_by_rank.get(r, []):
+                for j in self._upper_covers.get(w, []):
+                    # w < j, so w is below j, and all things below w are below j
+                    flats_below_sets[j].update(flats_below_sets[w])
+
+        t1b = _time.time()
+        print(f"[Mobius] flats_below computed: {t1b - t1:.1f}s", flush=True)
+
+        # Step 2: Batch Möbius for all (W, Z) pairs
+        # For each W, compute μ(W, Z) for all Z >= W using recursion:
+        #   μ(W, W) = 1
+        #   μ(W, Z) = -Σ_{W≤K<Z} μ(W, K)
+        # Interval [W, Z] = flats_above(W) ∩ flats_below(Z)
+        for w_idx in range(nf):
+            w_rank = self._ranks[w_idx]
+            above = flats_above_map[w_idx]
+            above_set = set(above)
+
+            self._mobius_cache[(w_idx, w_idx)] = 1
+
+            # Group flats above W by rank for ordered processing
+            above_by_rank: Dict[int, List[int]] = defaultdict(list)
+            for z in above:
+                above_by_rank[self._ranks[z]].append(z)
+
+            for r in range(w_rank + 1, max_rank + 1):
+                for j in above_by_rank.get(r, []):
+                    # interval [W, j) = flats above W ∩ flats below j, excluding j
+                    interval_below_j = flats_below_sets[j]
+                    total = 0
+                    for k in interval_below_j:
+                        if k != j and k in above_set:
+                            total += self._mobius_cache.get((w_idx, k), 0)
+                    self._mobius_cache[(w_idx, j)] = -total
+
+        t2 = _time.time()
+        print(f"[Mobius] all μ(W,Z) computed: {t2 - t1:.1f}s", flush=True)
+
+        # Step 3: Compute chi coefficients for all W
+        chi_coeffs_map: Dict[int, Dict[int, int]] = {}
+        for w_idx in range(nf):
+            w_rank = self._ranks[w_idx]
+            contracted_rank = r_top - w_rank
+            coeffs: Dict[int, int] = defaultdict(int)
+            for z_idx in flats_above_map[w_idx]:
+                mu_val = self._mobius_cache.get((w_idx, z_idx), 0)
+                if mu_val == 0:
+                    continue
+                r_z = self._ranks[z_idx]
+                power = contracted_rank - (r_z - w_rank)
+                coeffs[power] += mu_val
+            chi_coeffs_map[w_idx] = dict(coeffs)
+
+        t3 = _time.time()
+        print(f"[Mobius] chi coefficients computed: {t3 - t2:.1f}s", flush=True)
+        print(f"[Mobius] Total precomputation: {t3 - t0:.1f}s", flush=True)
+
+        return flats_above_map, chi_coeffs_map
+
     def characteristic_poly_coeffs(
         self, contraction_flat: FrozenSet[Edge] = None
     ) -> Dict[int, int]:

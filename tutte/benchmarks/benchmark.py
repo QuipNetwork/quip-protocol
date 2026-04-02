@@ -26,11 +26,10 @@ import time
 
 import networkx as nx
 from tutte.graph import (Graph, complete_graph, cycle_graph, grid_graph,
-                              path_graph, petersen_graph, wheel_graph)
-from tutte.synthesis import HybridSynthesisEngine
-from tutte.polynomial import TuttePolynomial
+                         path_graph, petersen_graph, wheel_graph)
 from tutte.lookup import RainbowTable, save_binary_rainbow_table
-from tutte.synthesis import SynthesisEngine
+from tutte.polynomial import TuttePolynomial
+from tutte.synthesis import HybridSynthesisEngine, SynthesisEngine
 from tutte.validation import count_spanning_trees_kirchhoff
 
 # ---------------------------------------------------------------------------
@@ -64,8 +63,8 @@ def _try_dwave_graphs():
     try:
         import dwave_networkx as dnx
         import networkx as nx
-        from tutte.lookup import load_default_table
         from tutte.graphs.covering import try_hierarchical_partition
+        from tutte.lookup import load_default_table
 
         for m in range(1, 17):
             _m = m  # capture for lambda
@@ -76,6 +75,7 @@ def _try_dwave_graphs():
             if G.number_of_nodes() > 0:
                 extras.append((f"Pm{m}", lambda _m=_m: Graph.from_networkx(dnx.pegasus_graph(_m))))
         extras.append(("Z1_1", lambda: Graph.from_networkx(dnx.zephyr_graph(1, 1))))
+        extras.append(("Z1_2", lambda: Graph.from_networkx(dnx.zephyr_graph(1, 2))))
 
         # Z(1,2) inter-cell components: 2 isomorphic series-parallel graphs
         # that arise from hierarchical tiling of Zephyr Z(1,2).
@@ -256,11 +256,13 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
         n, m = graph.node_count(), graph.edge_count()
         G_nx = graph.to_networkx()
 
-        # Ground truth via Kirchhoff
-        kirchhoff = count_spanning_trees_kirchhoff(graph)
+        # Ground truth via Kirchhoff — only compute if we'll attempt synthesis
+        # (avoids expensive exact determinant on huge unsolvable graphs)
+        will_attempt = (m <= cej_max_solved + 60 or m <= hybrid_max_solved + 60)
+        kirchhoff = count_spanning_trees_kirchhoff(graph) if will_attempt else -1
 
         # --- CEJ engine ---
-        if m > cej_max_solved + 30:
+        if m > cej_max_solved + 60:
             # Way beyond frontier — skip without wasting timeout
             cej_ms, cej_result, cej_err = None, None, "UNSOLVED"
         else:
@@ -279,7 +281,7 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
             cej_status = cej_err or "WRONG"
 
         # --- Hybrid engine ---
-        if m > hybrid_max_solved + 30:
+        if m > hybrid_max_solved + 60:
             hybrid_ms, hybrid_result, hybrid_err = None, None, "UNSOLVED"
         else:
             hybrid_ms, hybrid_result, hybrid_err = _time_fn(
@@ -393,7 +395,7 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
               f"{_fmt(avg(b['cej'])):>10} {_fmt(avg(b['hybrid'])):>10} {_fmt(avg(b['nx'])):>10}")
 
     sys.stdout.flush()
-    return results, cej_table, hybrid_engine
+    return results, cej_table, hybrid_engine, cej_engine
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +450,7 @@ def compare_results(file1, file2):
 # Save / CLI
 # ---------------------------------------------------------------------------
 
-def save_results(results, cej_table=None, hybrid_engine=None):
+def save_results(results, cej_table=None, hybrid_engine=None, cej_engine=None):
     """Save benchmark results to JSON and optionally save rainbow/multigraph tables."""
     try:
         branch = subprocess.check_output(
@@ -491,12 +493,26 @@ def save_results(results, cej_table=None, hybrid_engine=None):
         print(f"Rainbow table saved: {len(cej_table)} entries ({json_path}, {bin_path})",
               flush=True)
 
-    # Save multigraph cache from hybrid engine
+    # Merge and save multigraph caches from both engines
+    merged_mg_cache = {}
+    if cej_engine is not None:
+        merged_mg_cache.update(cej_engine._multigraph_cache)
     if hybrid_engine is not None:
-        mg_cache = hybrid_engine._structural_engine._multigraph_cache
-        if len(mg_cache) > 0:
-            hybrid_engine._structural_engine.save_multigraph_cache()
-            print(f"Multigraph cache saved: {len(mg_cache)} entries", flush=True)
+        merged_mg_cache.update(hybrid_engine._structural_engine._multigraph_cache)
+    if len(merged_mg_cache) > 0:
+        from ..lookup.core import save_default_multigraph_table
+        save_default_multigraph_table(merged_mg_cache)
+        print(f"Multigraph cache saved: {len(merged_mg_cache)} entries "
+              f"({os.path.join(base_dir, 'multigraph_lookup_table.json')}, "
+              f"{os.path.join(base_dir, 'multigraph_lookup_table.bin')})",
+              flush=True)
+
+    # Save contraction cache from hybrid engine
+    if hybrid_engine is not None:
+        cc = hybrid_engine._structural_engine._contraction_cache
+        if len(cc) > 0:
+            hybrid_engine._structural_engine.save_contraction_cache()
+            print(f"Contraction cache saved: {len(cc)} entries", flush=True)
 
     return out_path
 
@@ -522,8 +538,8 @@ def main():
     if args.compare:
         compare_results(args.compare[0], args.compare[1])
     else:
-        results, cej_table, hybrid_engine = run_benchmarks(timeout_s=args.timeout, nx_timeout_s=args.nx_timeout)
-        save_results(results, cej_table, hybrid_engine)
+        results, cej_table, hybrid_engine, cej_engine = run_benchmarks(timeout_s=args.timeout, nx_timeout_s=args.nx_timeout)
+        save_results(results, cej_table, hybrid_engine, cej_engine)
 
 
 if __name__ == "__main__":

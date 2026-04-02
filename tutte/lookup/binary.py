@@ -1,8 +1,8 @@
-"""Binary Encoding/Decoding for Rainbow Table.
+"""Binary Encoding/Decoding for Rainbow Table and Contraction Cache.
 
 This module provides efficient binary serialization of the rainbow table,
 supporting both v1 (legacy) and v2 (with canonical keys and minor relationships)
-formats.
+formats, as well as multigraph and contraction cache tables.
 """
 
 from __future__ import annotations
@@ -357,3 +357,97 @@ def load_multigraph_lookup_table(path: str) -> Dict[str, 'TuttePolynomial']:
     return decode_multigraph_lookup_table(data)
 
 
+# =============================================================================
+# CONTRACTION CACHE BINARY ENCODING
+# =============================================================================
+
+def encode_contraction_cache(cache: Dict[str, 'TuttePolynomial']) -> bytes:
+    """Encode contraction cache to compact binary format.
+
+    The contraction cache maps canonical_key -> TuttePolynomial, storing
+    pre-computed T(M_i/Z) contractions from the SP-guided bottom-up approach.
+
+    Format:
+        Header:
+            [magic: 4 bytes]    = "CCLT"
+            [version: 1 byte]   = 1
+            [num_entries: varuint]
+
+        Entry Section (per entry):
+            [canonical_key: 32 bytes]       <- raw SHA256
+            [poly_len: varuint] [poly_bytes: bytes]
+    """
+    result = bytearray()
+
+    # Magic header
+    result.extend(b"CCLT")
+    result.append(1)  # version
+
+    # Number of entries
+    result.extend(encode_varuint(len(cache)))
+
+    # Entry section
+    for key, poly in cache.items():
+        # Canonical key as raw 32-byte SHA256
+        result.extend(bytes.fromhex(key))
+
+        # Polynomial as binary
+        poly_bytes = poly.to_bytes()
+        result.extend(encode_varuint(len(poly_bytes)))
+        result.extend(poly_bytes)
+
+    return bytes(result)
+
+
+def decode_contraction_cache(data: bytes) -> Dict[str, 'TuttePolynomial']:
+    """Decode contraction cache from binary format.
+
+    Returns dict of canonical_key -> TuttePolynomial.
+    """
+    from ..polynomial import TuttePolynomial
+
+    offset = 0
+
+    # Magic header
+    if data[offset:offset + 4] != b"CCLT":
+        raise ValueError("Invalid magic header -- not a contraction cache binary")
+    offset += 4
+
+    version = data[offset]
+    offset += 1
+    if version != 1:
+        raise ValueError(f"Unsupported contraction cache version: {version}")
+
+    # Number of entries
+    num_entries, offset = decode_varuint(data, offset)
+
+    cache: Dict[str, 'TuttePolynomial'] = {}
+    for _ in range(num_entries):
+        # Canonical key: 32 raw bytes -> hex string
+        canonical_key = data[offset:offset + 32].hex()
+        offset += 32
+
+        # Polynomial
+        poly_len, offset = decode_varuint(data, offset)
+        poly_bytes = data[offset:offset + poly_len]
+        offset += poly_len
+        polynomial = TuttePolynomial.from_bytes(poly_bytes)
+
+        cache[canonical_key] = polynomial
+
+    return cache
+
+
+def save_contraction_cache(cache: Dict[str, 'TuttePolynomial'], path: str) -> int:
+    """Save contraction cache to binary format, return size in bytes."""
+    data = encode_contraction_cache(cache)
+    with open(path, 'wb') as f:
+        f.write(data)
+    return len(data)
+
+
+def load_contraction_cache(path: str) -> Dict[str, 'TuttePolynomial']:
+    """Load contraction cache from binary file."""
+    with open(path, 'rb') as f:
+        data = f.read()
+    return decode_contraction_cache(data)

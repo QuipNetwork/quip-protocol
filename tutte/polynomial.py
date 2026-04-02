@@ -259,8 +259,8 @@ class TuttePolynomial:
                    for (i, j), c in self._coeffs.items())
 
     def num_spanning_trees(self) -> int:
-        """T(1,1) = number of spanning trees."""
-        return int(round(self.evaluate(1.0, 1.0)))
+        """T(1,1) = number of spanning trees (exact integer sum of coefficients)."""
+        return sum(c for c in self._coeffs.values())
 
     def x_degree(self) -> int:
         """Maximum power of x."""

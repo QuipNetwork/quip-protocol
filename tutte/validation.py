@@ -164,14 +164,211 @@ def _exact_spanning_tree_count(graph: Graph) -> int:
 def count_spanning_trees_kirchhoff(graph: Graph) -> int:
     """Count spanning trees using Kirchhoff's matrix-tree theorem.
 
-    Uses NetworkX's implementation which computes the determinant
-    of the reduced Laplacian matrix.
+    For small graphs (< 20 nodes), uses NetworkX's numpy-based determinant.
+    For medium graphs (20-200 nodes), uses C-accelerated modular Gaussian
+    elimination with CRT for exact integer determinant.
+    For large graphs (> 200 nodes), uses Python Bareiss on the integer
+    Laplacian (slower but always exact).
     """
     G = graph.to_networkx()
     try:
-        return round(nx.number_of_spanning_trees(G))
+        if graph.node_count() < 20:
+            return round(nx.number_of_spanning_trees(G))
+        # Build integer Laplacian
+        L = nx.laplacian_matrix(G).toarray()
+        n = len(L)
+        # Reduced Laplacian: delete first row and column
+        M = [[int(L[i][j]) for j in range(1, n)] for i in range(1, n)]
+        if n <= 100:
+            # Python Bareiss is faster for small matrices (no cffi overhead)
+            return _bareiss_det(M)
+        # C modular determinant for large matrices
+        c_det = _c_modular_det(M)
+        if c_det is not None:
+            return c_det
+        return _bareiss_det(M)
     except Exception:
         return -1
+
+
+def _c_modular_det(M):
+    """Compute exact integer determinant via C modular Gaussian elimination.
+
+    Uses enough primes (dynamically chosen) to cover the Hadamard bound.
+    Each modular determinant is O(n^3) in int64 C — very fast.
+    Returns None if C extension is unavailable.
+    """
+    try:
+        from .graphs._treewidth_c import _get_lib, _ffi
+    except Exception:
+        return None
+
+    lib = _get_lib()
+    n = len(M)
+    if n == 0:
+        return 1
+
+    # Hadamard bound: |det| <= prod of row norms
+    # For integer matrices, use Euclidean row norms
+    import math
+    log2_bound = 0
+    for i in range(n):
+        row_norm_sq = sum(M[i][j] * M[i][j] for j in range(n))
+        if row_norm_sq > 0:
+            log2_bound += math.log2(row_norm_sq) / 2
+
+    # Need enough primes so product > 2 * bound (factor 2 for sign).
+    # Generate primes near 2^50 (large enough for fast modular GE,
+    # small enough that 2^50 * 2^50 < 2^63 avoids overflow in multiply).
+    # Use primes of the form 2^k - c for various k and small c.
+    n_primes_needed = int(log2_bound / 49) + 2  # ~49 bits per prime
+
+    primes = _get_modular_primes(n_primes_needed)
+
+    # Flatten matrix once using numpy for speed
+    import numpy as np
+    M_np = np.array(M, dtype=np.int64).ravel()
+    flat = _ffi.cast("long long*", M_np.ctypes.data)
+
+    # Pass all primes and compute all residues in one C call
+    c_primes = _ffi.new("long long[]", len(primes))
+    for i, p in enumerate(primes):
+        c_primes[i] = p
+    c_residues = _ffi.new("long long[]", len(primes))
+
+    lib.modular_det_multi(flat, n, c_primes, len(primes), c_residues)
+
+    residues = [int(c_residues[i]) for i in range(len(primes))]
+    return _crt_multi(residues, primes)
+
+
+_MODULAR_PRIMES_CACHE = None
+
+
+def _get_modular_primes(n_needed):
+    """Get at least n_needed distinct primes for modular determinant.
+
+    Uses Miller-Rabin primality test (deterministic for < 2^64).
+    Primes are ~50 bits each. Cached across calls.
+    """
+    global _MODULAR_PRIMES_CACHE
+    if _MODULAR_PRIMES_CACHE is not None and len(_MODULAR_PRIMES_CACHE) >= n_needed:
+        return _MODULAR_PRIMES_CACHE[:n_needed]
+
+    def _is_prime(n):
+        if n < 2:
+            return False
+        if n < 4:
+            return True
+        if n % 2 == 0:
+            return False
+        # Deterministic Miller-Rabin for n < 2^64
+        d, r = n - 1, 0
+        while d % 2 == 0:
+            d //= 2
+            r += 1
+        for a in [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]:
+            if a >= n:
+                continue
+            x = pow(a, d, n)
+            if x == 1 or x == n - 1:
+                continue
+            for _ in range(r - 1):
+                x = pow(x, 2, n)
+                if x == n - 1:
+                    break
+            else:
+                return False
+        return True
+
+    primes = []
+    p = (1 << 50) - 27  # Start at a known prime near 2^50
+    target = max(n_needed, 200)
+    while len(primes) < target:
+        if _is_prime(p):
+            primes.append(p)
+        p += 2  # Next odd candidate
+        if p % 2 == 0:
+            p += 1
+
+    _MODULAR_PRIMES_CACHE = primes
+    return primes[:n_needed]
+
+
+def _crt_multi(residues, primes):
+    """Chinese Remainder Theorem via Garner's algorithm.
+
+    More efficient than the direct CRT formula for many primes:
+    builds the result incrementally without computing the full product.
+    """
+    k = len(residues)
+    if k == 0:
+        return 0
+    if k == 1:
+        r = residues[0]
+        p = primes[0]
+        return r if r <= p // 2 else r - p
+
+    # Garner's algorithm: express x = a0 + a1*p0 + a2*p0*p1 + ...
+    # Precompute modular inverses
+    # inv[i][j] = inverse of primes[j] mod primes[i]
+    coeffs = [0] * k
+    coeffs[0] = residues[0] % primes[0]
+
+    product = primes[0]
+    for i in range(1, k):
+        # Find coeffs[i] such that
+        # coeffs[0] + coeffs[1]*p0 + ... + coeffs[i]*p0*...*p_{i-1} ≡ residues[i] (mod primes[i])
+        temp = coeffs[0]
+        pp = 1
+        for j in range(1, i):
+            pp = pp * primes[j - 1] % primes[i]
+            temp = (temp + coeffs[j] * pp) % primes[i]
+        pp = pp * primes[i - 1] % primes[i]
+        # coeffs[i] = (residues[i] - temp) / pp mod primes[i]
+        diff = (residues[i] - temp) % primes[i]
+        coeffs[i] = diff * pow(pp, primes[i] - 2, primes[i]) % primes[i]
+        product *= primes[i]
+
+    # Reconstruct: x = coeffs[0] + coeffs[1]*p0 + coeffs[2]*p0*p1 + ...
+    x = coeffs[k - 1]
+    for i in range(k - 2, -1, -1):
+        x = x * primes[i] + coeffs[i]
+
+    # Convert to signed
+    half_product = product >> 1
+    return x if x <= half_product else x - product
+
+
+def _bareiss_det(M):
+    """Compute exact integer determinant via Bareiss algorithm (Python fallback).
+
+    Fraction-free Gaussian elimination: O(n^3) with only integer division
+    (guaranteed exact at each step). Slow for large n due to big-integer growth.
+    """
+    n = len(M)
+    if n == 0:
+        return 1
+    A = [row[:] for row in M]
+    sign = 1
+    for k in range(n - 1):
+        if A[k][k] == 0:
+            found = False
+            for i in range(k + 1, n):
+                if A[i][k] != 0:
+                    A[k], A[i] = A[i], A[k]
+                    sign = -sign
+                    found = True
+                    break
+            if not found:
+                return 0
+        for i in range(k + 1, n):
+            for j in range(k + 1, n):
+                A[i][j] = A[k][k] * A[i][j] - A[i][k] * A[k][j]
+                if k > 0:
+                    A[i][j] //= A[k - 1][k - 1]
+            A[i][k] = 0
+    return sign * A[n - 1][n - 1]
 
 
 # =============================================================================
