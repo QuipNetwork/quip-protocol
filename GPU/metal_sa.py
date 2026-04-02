@@ -635,13 +635,30 @@ class MetalSASampler:
             # Duty-cycle sleep between chunks
             if duty_cycle and duty_cycle.enabled:
                 compute_s = time.perf_counter() - t0
-                time.sleep(duty_cycle.compute_sleep(compute_s))
+                sleep_s = duty_cycle.compute_sleep(compute_s)
+                self.logger.info(
+                    "[duty-cycle] chunk %d/%d "
+                    "compute=%.1fms sleep=%.1fms "
+                    "ema=%.1fms mult=%.2f",
+                    chunk_start // betas_per_chunk,
+                    (total_betas + betas_per_chunk - 1)
+                    // betas_per_chunk,
+                    compute_s * 1000,
+                    sleep_s * 1000,
+                    duty_cycle._ema_compute_s * 1000,
+                    duty_cycle._duty_multiplier,
+                )
+                time.sleep(sleep_s)
 
                 # IOKit feedback: adjust duty multiplier to
                 # converge on target utilization
                 if scheduler is not None:
-                    duty_cycle.feedback(
-                        scheduler.get_cached_utilization(),
+                    iokit_val = (
+                        scheduler.get_cached_utilization()
+                    )
+                    duty_cycle.feedback(iokit_val)
+                    self.logger.debug(
+                        "[duty-cycle] iokit=%d%%", iokit_val,
                     )
 
         # Unpack results from final chunk
@@ -750,6 +767,11 @@ class MetalSASampler:
                 # Chunked dispatch: break beta schedule into
                 # small chunks with duty-cycle sleeps between
                 # them for smooth GPU sharing.
+                self.logger.info(
+                    "[streaming] Using CHUNKED dispatch "
+                    "(target=%d%%, betas=%d)",
+                    duty_cycle.target_pct, len(beta_arr),
+                )
                 samplesets = self._dispatch_batch_chunked(
                     batch_models,
                     num_reads=num_reads,

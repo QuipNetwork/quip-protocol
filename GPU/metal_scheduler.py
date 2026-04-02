@@ -370,7 +370,7 @@ class DutyCycleController:
         enabled: Override enable flag. Defaults to target_pct < 100.
     """
 
-    _MIN_SLEEP_S = 0.001   # 1ms floor — always yield at least one frame
+    _MIN_SLEEP_S = 0.005   # 5ms floor — ensure GPU scheduler can yield
     _MAX_SLEEP_S = 2.0     # 2s ceiling — keep mining loop responsive
     _EMA_ALPHA = 0.3       # Smoothing factor for compute duration EMA
 
