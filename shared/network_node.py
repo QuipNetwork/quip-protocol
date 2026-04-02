@@ -98,7 +98,11 @@ async def get_public_ip() -> Optional[str]:
             # Validate using ipaddress module (supports both IPv4 and IPv6)
             if ip:
                 try:
-                    ipaddress.ip_address(ip)
+                    addr = ipaddress.ip_address(ip)
+                    # Normalize IPv6-mapped IPv4 (::ffff:1.2.3.4) to plain IPv4
+                    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+                        addr = addr.ipv4_mapped
+                    ip = str(addr)
                     logger.info(f"Detected public IP: {ip}")
                     return ip
                 except ValueError:
