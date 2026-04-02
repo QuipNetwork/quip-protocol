@@ -191,5 +191,5 @@ def test_escalation_steps_to_max():
             if duration == MAX_BAN_DURATION:
                 break
             assert ban_steps < 20, "should reach max within 20 steps"
-    # 1h * 2^(n-1) >= 604800 → n >= 9
-    assert ban_steps == 9
+    # 120 * 2^(n-1) >= 14400 → n=8 (120*64=7680 < 14400; 120*128=15360 > 14400)
+    assert ban_steps == 8

@@ -1397,7 +1397,10 @@ class NetworkNode(Node):
         if not self.node_client:
             return False
 
-        if self._is_backed_off(peer_address):
+        # Only enforce bans for non-initial peers. Initial/seed peers
+        # must always be retryable so the node can recover from
+        # transient network partitions.
+        if peer_address not in self.initial_peers and self._is_backed_off(peer_address):
             return False
 
         try:
@@ -1413,9 +1416,6 @@ class NetworkNode(Node):
             result = await self.node_client.join_network_via_peer(peer_address, join_data)
             if not result:
                 self.logger.warning(f"Failed to join via {peer_address}")
-                self._ban_list.record_failure(
-                    peer_address, "join failed"
-                )
                 return False
 
             # Add all nodes from the peer's node list
@@ -1843,8 +1843,11 @@ class NetworkNode(Node):
         except ValueError as e:
             return msg.create_error_response(str(e))
 
+        # A JOIN is an explicit reconnection attempt — clear any prior
+        # ban so the peer gets a fresh chance.  Version checks below
+        # will re-ban if the version is actually too old.
         if self._is_backed_off(new_node_address):
-            return msg.create_error_response("backed off")
+            self._ban_list.clear_ban(new_node_address)
 
         join_version = data.get("version")
         if join_version:

@@ -21,8 +21,8 @@ BAN_THRESHOLD = 5
 COOLDOWN_DURATION = 30.0        # 30 seconds
 
 # Ban duration bounds (seconds) — applied at threshold and above
-MIN_BAN_DURATION = 3600.0       # 1 hour
-MAX_BAN_DURATION = 604800.0     # 1 week
+MIN_BAN_DURATION = 120.0        # 2 minutes
+MAX_BAN_DURATION = 14400.0      # 4 hours
 JITTER_RANGE = (0.75, 1.25)    # ±25% randomization
 
 
