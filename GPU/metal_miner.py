@@ -23,7 +23,7 @@ from shared.base_miner import BaseMiner
 from shared.block_requirements import BlockRequirements
 from shared.ising_feeder import IsingFeeder
 from GPU.metal_sa import MetalSASampler
-from GPU.metal_scheduler import MetalScheduler
+from GPU.metal_scheduler import DutyCycleController, MetalScheduler
 
 
 def get_gpu_core_count() -> int:
@@ -73,7 +73,7 @@ class MetalMiner(BaseMiner):
     ADAPT_MAX_READS = 1024
 
     def __init__(self, miner_id: str, topology=None, **cfg):
-        gpu_util = cfg.pop('gpu_utilization', 100)
+        gpu_util = cfg.pop('utilization', cfg.pop('gpu_utilization', 100))
         yielding = cfg.pop('yielding', True)
         # Remove CUDA-only keys that flow through common_cfg
         cfg.pop('sms_per_nonce', None)
@@ -122,6 +122,12 @@ class MetalMiner(BaseMiner):
             self._scheduler.get_core_budget(),
             self.gpu_core_count,
             yielding,
+        )
+
+        # Duty-cycle controller: sleep proportionally to compute
+        # time so actual GPU utilization matches the target.
+        self._duty_cycle = DutyCycleController(
+            target_pct=gpu_util,
         )
 
         # Pipeline state (reset per mine_block call)
@@ -214,6 +220,7 @@ class MetalMiner(BaseMiner):
                     self._stream.close()
                 self._stream = None
                 self._active_tg = new_tg
+                self._duty_cycle.reset()
 
         if self._stream is None:
             budget = self._active_tg
@@ -222,6 +229,8 @@ class MetalMiner(BaseMiner):
                 num_reads=num_reads,
                 num_sweeps=num_sweeps,
                 max_threadgroups=budget,
+                duty_cycle=self._duty_cycle,
+                scheduler=self._scheduler,
             )
 
         try:
