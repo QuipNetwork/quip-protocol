@@ -228,14 +228,13 @@ class BaseCudaSampler(abc.ABC):
         the highest supported arch (driver JIT-compiles it).
         """
         dev = cp.cuda.Device()
-        cc = (
-            dev.attributes['ComputeCapabilityMajor'] * 10
-            + dev.attributes['ComputeCapabilityMinor']
-        )
+        cc = int(dev.compute_capability)
         cuda_ver = cp.cuda.runtime.runtimeGetVersion()
+        props = cp.cuda.runtime.getDeviceProperties(dev.id)
+        gpu_name = props.get('name', 'unknown').decode()
         self.logger.info(
             "%s GPU: %s (sm_%d, CUDA runtime %d)",
-            self.sampler_type, dev.name, cc, cuda_ver,
+            self.sampler_type, gpu_name, cc, cuda_ver,
         )
 
         min_cuda = _CUDA_ARCH_MIN_VERSION.get(cc, 0)
