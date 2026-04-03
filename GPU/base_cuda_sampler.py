@@ -36,6 +36,24 @@ from GPU.sampler_utils import (
     unpack_packed_results,
 )
 
+# Minimum CUDA runtime version (runtimeGetVersion()) for each
+# GPU architecture. Used for PTX fallback when NVRTC is older
+# than the GPU (e.g., CUDA 12.6 with Blackwell sm_120).
+_CUDA_ARCH_MIN_VERSION = {
+    121: 12090, 120: 12080,
+    103: 12090, 101: 12080, 100: 12080,
+    90: 12000, 89: 11080, 86: 11010, 80: 11000,
+}
+
+
+def _best_fallback_arch(cuda_ver: int) -> int:
+    """Highest GPU arch the given CUDA version supports."""
+    return max(
+        (a for a, v in _CUDA_ARCH_MIN_VERSION.items()
+         if v <= cuda_ver),
+        default=80,
+    )
+
 
 @dataclasses.dataclass(slots=True)
 class _SlotState:
@@ -160,9 +178,8 @@ class BaseCudaSampler(abc.ABC):
             with open(kernel_path, 'r') as f:
                 kernel_code = f.read()
 
-        self._module = cp.RawModule(
-            code=kernel_code,
-            options=tuple(compile_options),
+        self._module = self._compile_module(
+            kernel_code, compile_options,
         )
         self._self_feeding_kernel = self._module.get_function(
             self._kernel_function_name(),
@@ -198,6 +215,63 @@ class BaseCudaSampler(abc.ABC):
     def _extra_compile_options(self) -> List[str]:
         """Extra nvcc compile options (default: none)."""
         return []
+
+    def _compile_module(
+        self,
+        kernel_code: str,
+        compile_options: List[str],
+    ) -> cp.RawModule:
+        """Compile CUDA kernel with PTX fallback.
+
+        Normal path: NVRTC auto-detects GPU arch. If the GPU
+        is newer than NVRTC supports, falls back to PTX from
+        the highest supported arch (driver JIT-compiles it).
+        """
+        dev = cp.cuda.Device()
+        cc = int(dev.compute_capability)
+        cuda_ver = cp.cuda.runtime.runtimeGetVersion()
+        props = cp.cuda.runtime.getDeviceProperties(dev.id)
+        gpu_name = props.get('name', 'unknown').decode()
+        self.logger.info(
+            "%s GPU: %s (sm_%d, CUDA runtime %d)",
+            self.sampler_type, gpu_name, cc, cuda_ver,
+        )
+
+        min_cuda = _CUDA_ARCH_MIN_VERSION.get(cc, 0)
+        using_fallback = min_cuda > cuda_ver
+        if using_fallback:
+            fb = _best_fallback_arch(cuda_ver)
+            self.logger.warning(
+                "NVRTC (CUDA %d) cannot target sm_%d; "
+                "using compute_%d PTX. Upgrade Docker "
+                "image for native support.",
+                cuda_ver, cc, fb,
+            )
+            compile_options = list(compile_options) + [
+                '--gpu-architecture=compute_%d' % fb,
+            ]
+
+        try:
+            return cp.RawModule(
+                code=kernel_code,
+                options=tuple(compile_options),
+            )
+        except Exception:
+            if using_fallback:
+                raise
+            fb = _best_fallback_arch(cuda_ver)
+            self.logger.warning(
+                "NVRTC failed for sm_%d; retrying "
+                "with compute_%d PTX.",
+                cc, fb,
+            )
+            compile_options = list(compile_options) + [
+                '--gpu-architecture=compute_%d' % fb,
+            ]
+            return cp.RawModule(
+                code=kernel_code,
+                options=tuple(compile_options),
+            )
 
     @property
     @abc.abstractmethod
