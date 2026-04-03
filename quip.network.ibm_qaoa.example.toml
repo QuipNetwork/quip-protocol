@@ -1,0 +1,53 @@
+[global]
+node_name = "IBM QAOA Node"  # Optional human-readable name for your node.
+
+# Local binding address (ip address) and port to listen to.
+listen = "0.0.0.0"
+port = 20049
+
+#public_host = "my.dns.or.ip:public_port"
+
+# Optional deterministic key generation
+secret = "your-secret-here"
+
+# Enable mining on startup when no peers can be found.
+# auto_mine = true
+
+# Peers to try and connect to
+# peer = ["nodes.quip.network:20049"]
+
+timeout = 3
+heartbeat_interval = 15
+heartbeat_timeout = 300
+
+# TLS/SSL Configuration
+verify_ssl = true
+
+# Logging configuration
+log_level = "INFO"
+node_log = "logs/quip-node.log"
+http_log = "logs/quip-node-http.log"
+
+# IBM QAOA Miner Configuration
+[ibm_qaoa]
+# Backend selection: "aer" (default) uses local AerSimulator, "ibm" uses real IBM hardware.
+backend = "aer"
+
+# Subgraph size: number of nodes to extract from the protocol topology.
+# AerSimulator practical limits: 28 qubits (~4 GB RAM), 31 qubits (~33 GB RAM).
+# Memory formula: 2^n x 16 bytes (double precision).
+subgraph_size = 14
+
+# QAOA circuit depth (number of layers). Higher p = better solutions but slower.
+p = 1
+
+# Classical optimizer for variational parameter tuning.
+# Options: COBYLA, NELDER_MEAD, POWELL, L_BFGS_B, SPSA
+optimizer = "COBYLA"
+
+# Shots per evaluation during QAOA optimization loop.
+shots = 1024
+
+# --- IBM Hardware Settings (only used when backend = "ibm") ---
+# ibm_api_token = "your-ibm-quantum-api-token"
+# ibm_backend_name = "ibm_brisbane"

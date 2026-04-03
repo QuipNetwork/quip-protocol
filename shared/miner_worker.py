@@ -56,10 +56,6 @@ import multiprocessing as mp
 import multiprocessing.synchronize as mpsync
 from typing import Any, Dict, Optional
 
-import CPU
-import GPU
-import QPU
-
 def _signal_aware_mining_worker(spec: Dict[str, Any], block, node_info, requirements, prev_timestamp: int, mining_queue: mp.Queue, result_queue: mp.Queue):
     """Dedicated mining worker process that handles mining with signal awareness."""
     # mining_queue is reserved for future use
@@ -94,6 +90,40 @@ def _signal_aware_mining_worker(spec: Dict[str, Any], block, node_info, requirem
     # Process exits naturally
 
 
+def _extract_subgraph(all_nodes, all_edges, size):
+    """Extract a connected subgraph of ``size`` nodes via BFS.
+
+    Starts from a random node and grows outward.  Returns
+    (sub_nodes, sub_edges) where sub_edges only includes edges
+    between nodes in the subgraph.
+    """
+    import random
+
+    adj = {n: [] for n in all_nodes}
+    for u, v in all_edges:
+        adj[u].append(v)
+        adj[v].append(u)
+
+    start = random.choice(all_nodes)
+    visited = set()
+    queue = [start]
+
+    while queue and len(visited) < size:
+        node = queue.pop(0)
+        if node in visited:
+            continue
+        visited.add(node)
+        for neighbor in adj[node]:
+            if neighbor not in visited:
+                queue.append(neighbor)
+
+    sub_nodes = sorted(visited)
+    sub_node_set = set(sub_nodes)
+    sub_edges = [(u, v) for u, v in all_edges
+                 if u in sub_node_set and v in sub_node_set]
+    return sub_nodes, sub_edges
+
+
 def build_miner_from_spec(spec: Dict[str, Any]):
     kind = spec["kind"].lower()
     miner_id = spec["id"]
@@ -101,20 +131,25 @@ def build_miner_from_spec(spec: Dict[str, Any]):
     args = dict(spec.get("args", {}))
 
     if kind == "cpu":
+        import CPU
         return CPU.SimulatedAnnealingMiner(miner_id, **cfg)
     elif kind == "metal":
+        import GPU
         if not GPU.METAL_AVAILABLE:
             raise RuntimeError("Metal miner requested but Metal is not available (requires macOS with Metal support)")
         return GPU.MetalMiner(miner_id, **cfg)
     elif kind == "cuda":
+        import GPU
         if not GPU.CUDA_AVAILABLE:
             raise RuntimeError("CUDA miner requested but CUDA is not available (requires CuPy and CUDA toolkit)")
         return GPU.CudaMiner(miner_id, **cfg, **args)
     elif kind == "modal":
+        import GPU
         if not GPU.MODAL_AVAILABLE:
             raise RuntimeError("Modal miner requested but Modal is not available (requires modal SDK: pip install modal)")
         return GPU.ModalMiner(miner_id, **cfg, **args)
     elif kind == "cuda-gibbs":
+        import GPU
         if not GPU.CUDA_AVAILABLE:
             raise RuntimeError(
                 "CUDA Gibbs miner requested but not available "
@@ -123,6 +158,7 @@ def build_miner_from_spec(spec: Dict[str, Any]):
             miner_id, update_mode="gibbs", **cfg, **args,
         )
     elif kind == "qpu":
+        import QPU
         # Build QPU time config if daily budget is specified
         time_config = None
         if cfg.get("daily_budget"):
@@ -137,6 +173,40 @@ def build_miner_from_spec(spec: Dict[str, Any]):
                    if k not in ("daily_budget", "qpu_min_blocks_for_estimation",
                                 "qpu_ema_alpha", "qpu_type")}
         return QPU.DWaveMiner(miner_id, time_config=time_config, **cfg)
+    elif kind == "ibm_qaoa":
+        import QPU
+        from dwave_topologies import DEFAULT_TOPOLOGY
+        subgraph_size = cfg.pop("subgraph_size", 28)
+        backend_type = cfg.pop("backend", "aer")
+        ibm_api_token = cfg.pop("ibm_api_token", None)
+        ibm_backend_name = cfg.pop("ibm_backend_name", None)
+
+        # Build backend
+        backend = None  # None → AerSimulator (default)
+        if backend_type == "ibm":
+            try:
+                from qiskit_ibm_runtime import QiskitRuntimeService
+                if ibm_api_token:
+                    service = QiskitRuntimeService(channel="ibm_quantum", token=ibm_api_token)
+                else:
+                    service = QiskitRuntimeService()
+                backend_name = ibm_backend_name or "ibm_brisbane"
+                backend = service.backend(backend_name)
+                logger.info(f"Using IBM backend: {backend_name}")
+            except ImportError:
+                raise RuntimeError("IBM backend requested but qiskit-ibm-runtime is not installed")
+            except Exception as e:
+                raise RuntimeError(f"Failed to connect to IBM backend: {e}")
+        else:
+            logger.info("Using AerSimulator backend (local simulation)")
+
+        # Extract subgraph
+        nodes = list(DEFAULT_TOPOLOGY.nodes)
+        edges = list(DEFAULT_TOPOLOGY.edges)
+        if subgraph_size < len(nodes):
+            nodes, edges = _extract_subgraph(nodes, edges, subgraph_size)
+            logger.info(f"Extracted {len(nodes)}-node subgraph ({len(edges)} edges) from {len(DEFAULT_TOPOLOGY.nodes)}-node topology")
+        return QPU.IBMQAOAMiner(miner_id, nodes=nodes, edges=edges, backend=backend, **cfg)
     elif kind == "cpu-filtered":
         from CPU.sa_filtered_miner import SAFilteredMiner
         return SAFilteredMiner(miner_id, **cfg)
@@ -212,6 +282,8 @@ class MinerHandle:
             return "CPU"
         if k == "qpu":
             return "QPU"
+        if k == "ibm_qaoa":
+            return "IBM_QAOA"
         if k == "modal":
             t = (self.spec.get("args", {}) or {}).get("gpu_type", "t4")
             return f"GPU-{t.upper()}"

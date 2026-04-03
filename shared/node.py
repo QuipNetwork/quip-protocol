@@ -373,6 +373,24 @@ class Node:
 
                 self.miner_handles.append(MinerHandle(spec, self._log_queue))
 
+        # IBM QAOA Miners
+        if cfg.get("ibm_qaoa") is not None:
+            ibm_cfg = cfg.get("ibm_qaoa", {})
+            spec = {
+                "id": f"{self.node_id}-IBM-1",
+                "kind": "ibm_qaoa",
+                "cfg": {
+                    "subgraph_size": ibm_cfg.get("subgraph_size", 28),
+                    "p": ibm_cfg.get("p", 1),
+                    "optimizer": ibm_cfg.get("optimizer", "COBYLA"),
+                    "shots": ibm_cfg.get("shots", 1024),
+                    "backend": ibm_cfg.get("backend", "aer"),
+                    "ibm_api_token": ibm_cfg.get("ibm_api_token"),
+                    "ibm_backend_name": ibm_cfg.get("ibm_backend_name"),
+                }
+            }
+            self.miner_handles.append(MinerHandle(spec, self._log_queue))
+
         # Back-compat summary list for logs (do not assign to typed self.miners)
         self._summary_miners = [(h.miner_id, h.miner_type) for h in self.miner_handles]
 
