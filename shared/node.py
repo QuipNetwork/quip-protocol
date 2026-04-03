@@ -905,6 +905,11 @@ class Node:
             data_hash=blake3(block_data).digest()
         )
         miner_info = self.info()
+        # Use h_values from the previous block's requirements so the
+        # recomputed Ising model matches what the miner was given.
+        h_values = getattr(
+            previous_block.next_block_requirements, 'h_values', None,
+        )
         quantum_proof = block.QuantumProof(
             nonce=mining_result.nonce,
             salt=mining_result.salt,
@@ -912,6 +917,7 @@ class Node:
             edges=mining_result.edge_list,
             solutions=mining_result.solutions,
             mining_time=mining_result.mining_time,
+            h_values=h_values,
             energy=mining_result.energy,
             diversity=mining_result.diversity,
             num_valid_solutions=mining_result.num_valid

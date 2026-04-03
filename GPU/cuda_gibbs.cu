@@ -506,6 +506,10 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
         __syncthreads();
 
         if (s_arrival + 1 == blocks_per_nonce) {
+            // Last block: fence all prior writes so the host
+            // sees energy/sample data before SLOT_COMPLETE.
+            __threadfence();
+
             // Last block: transition state
             if (threadIdx.x == 0) {
                 // Mark current slot COMPLETE

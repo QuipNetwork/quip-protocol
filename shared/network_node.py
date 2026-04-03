@@ -653,7 +653,6 @@ class NetworkNode(Node):
         self.close()
 
         self.logger.info("Network node stopped")
-        sys.exit(0)
 
     ##########################
     ## Server logic threads ##
@@ -716,10 +715,16 @@ class NetworkNode(Node):
                     self._request_peer_connections()
                     connected = await self._drain_connection_results()
 
-                # If we are not connected and not in auto-mine mode, sleep and retry
+                # If we are not connected and not in auto-mine mode,
+                # poll for connection results while waiting.
                 if not connected and not self.auto_mine:
                     self.logger.error(f"Not connected to network, retrying in {self.node_timeout} seconds...")
-                    await asyncio.sleep(self.node_timeout)
+                    deadline = time.time() + self.node_timeout
+                    while time.time() < deadline and self.running:
+                        await asyncio.sleep(1)
+                        connected = await self._drain_connection_results()
+                        if connected:
+                            break
                     continue
                 elif not connected and self.auto_mine:
                     self.logger.info("No peers connected, automining...")

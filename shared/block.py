@@ -322,6 +322,9 @@ class QuantumProof:
     solutions: List[List[int]]  # List of quantum solutions found
     mining_time: float
 
+    # Ising model parameters (needed for deterministic recomputation)
+    h_values: Optional[List[float]] = None
+
     # Computed fields (derived from validation, not stored in network format)
     energy: Optional[float] = None
     diversity: Optional[float] = None
@@ -412,16 +415,19 @@ class QuantumProof:
         return quantum_proof
 
     def compute_derived_fields(self):
-        """Calculate derived fields from solutions and requirements using Ising model.
-        Requires the Block for deterministic model generation.
+        """Calculate derived fields from solutions using the Ising model.
+
+        Uses self.h_values (if set) for model generation so the
+        recomputed energy matches what the miner used. Falls back to
+        the default [-1, 0, +1] when h_values is None.
         """
         if not self.solutions:
             return
 
-        # Generate model sized to the maximum solution length
         h, J = generate_ising_model_from_nonce(self.nonce,
                                               self.nodes,
-                                              self.edges)
+                                              self.edges,
+                                              h_values=self.h_values)
 
         energies = energies_for_solutions(self.solutions, h, J, self.nodes)
 
