@@ -20,6 +20,8 @@ import sys
 import time
 from typing import Optional, Dict, Tuple, Any, List
 
+import dimod
+
 init_logger = logging.getLogger(__name__)
 
 from QPU.IBM.ibm_qaoa_solver import QAOASolverWrapper, QAOAFuture
@@ -126,6 +128,46 @@ class IBMQAOAMiner(BaseMiner):
             log.error(f"Error during QAOA miner cleanup: {e}")
 
         sys.exit(0)
+
+    def _sample(
+        self,
+        h: Dict[int, float],
+        J: Dict[Tuple[int, int], float],
+        *,
+        num_reads: int = 1024,
+        num_sweeps: int = 100,
+        **kwargs,
+    ) -> dimod.SampleSet:
+        """Perform QAOA sampling on the given Ising problem.
+
+        Called by BaseMiner's template mine_block if used directly.
+        IBMQAOAMiner overrides mine_block with its own async loop,
+        but this method is still required by the abstract interface.
+        """
+        sampleset = self.sampler.solve_ising(h, J)
+        if sampleset is None:
+            # Return an empty SampleSet if solve was cancelled or failed
+            return dimod.SampleSet.from_samples(
+                [], vartype=dimod.SPIN, energy=[],
+            )
+        return sampleset
+
+    def _adapt_mining_params(
+        self,
+        current_requirements,
+        nodes: List[int],
+        edges: List[Tuple[int, int]],
+    ) -> dict:
+        """Return adaptive mining parameters for QAOA.
+
+        QAOA doesn't use sweeps in the traditional sense — the optimizer
+        iterations serve a similar role. Returns num_reads (shots) and
+        num_sweeps (mapped to optimizer max_iter) for BaseMiner compatibility.
+        """
+        return {
+            'num_reads': self.sampler.shots,
+            'num_sweeps': self.sampler.optimizer_options.get('maxiter', 100),
+        }
 
     def mine_block(
         self,
