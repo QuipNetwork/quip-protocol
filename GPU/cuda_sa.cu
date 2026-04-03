@@ -348,7 +348,19 @@ __global__ void cuda_sa_self_feeding(
                 current_energy;
         }
 
-        // All threads done with this slot
+        // All threads done writing energy + samples
+        __syncthreads();
+
+        // Fence every thread's global writes so the host
+        // sees energy/sample data before SLOT_COMPLETE.
+        // __syncthreads is a thread barrier, NOT a memory
+        // fence: without __threadfence the volatile COMPLETE
+        // write can reach L2 before the non-volatile
+        // energy/sample writes, causing the host to read
+        // stale data.
+        if (tid < num_reads) {
+            __threadfence();
+        }
         __syncthreads();
 
         // Thread 0: mark COMPLETE, find next READY
