@@ -31,7 +31,7 @@ RUN pip install --no-cache-dir build && \
 #############################################
 # Stage 2: Runtime image with CUDA
 #############################################
-FROM nvidia/cuda:12.6.3-base-ubuntu22.04
+FROM nvidia/cuda:12.9.1-base-ubuntu22.04
 
 LABEL maintainer="Quip Protocol"
 LABEL description="Quip Network Node - CUDA GPU Mining"
@@ -47,9 +47,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     openssl tini busybox-static \
-    cuda-cudart-12-6 \
-    cuda-nvrtc-12-6 \
-    && apt-get install -y --no-install-recommends cuda-mps-12-6 2>/dev/null || true \
+    cuda-cudart-12-9 \
+    cuda-nvrtc-12-9 \
+    && apt-get install -y --no-install-recommends cuda-mps-12-9 2>/dev/null || true \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/python3 /usr/bin/python
 

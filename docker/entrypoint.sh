@@ -134,6 +134,7 @@ if grep -q '^\[gpu\]\|^\[cuda\.' "$CONFIG_FILE"; then
 
         NUM_GPUS=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader | wc -l)
         echo "Detected GPUs: $NUM_GPUS"
+        nvidia-smi --query-gpu=gpu_name,compute_cap --format=csv,noheader
 
         if [ "$NUM_GPUS" -eq 0 ]; then
             echo "WARNING: [gpu] section in config but no GPUs detected. Run with --gpus all"
