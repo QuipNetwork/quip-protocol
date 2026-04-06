@@ -26,51 +26,8 @@ from tutte.graph import (
     Graph, complete_graph, cycle_graph, path_graph,
     petersen_graph, wheel_graph, grid_graph,
 )
-from tutte.cotree_dp import is_cograph, compute_tutte_cotree_dp
-
-
-# =============================================================================
-# VALIDATION
-# =============================================================================
-
-def _spanning_tree_count(graph: Graph) -> int:
-    """Exact spanning tree count (connected or disconnected)."""
-    components = graph.connected_components()
-    if len(components) > 1:
-        result = 1
-        for comp in components:
-            result *= _spanning_tree_count_connected(comp)
-        return result
-    return _spanning_tree_count_connected(graph)
-
-
-def _spanning_tree_count_connected(graph: Graph) -> int:
-    """Exact spanning tree count for a connected graph via sympy."""
-    if graph.node_count() <= 1:
-        return 1
-
-    try:
-        from sympy import zeros  # type: ignore[import-unresolved]
-    except ImportError:
-        G = graph.to_networkx()
-        return round(nx.number_of_spanning_trees(G))
-
-    nodes = sorted(graph.nodes)
-    n = len(nodes)
-    idx = {v: i for i, v in enumerate(nodes)}
-    L = zeros(n, n)
-    for u, v in graph.edges:
-        i, j = idx[u], idx[v]
-        L[i, i] += 1
-        L[j, j] += 1
-        L[i, j] -= 1
-        L[j, i] -= 1
-    return int(L[1:, 1:].det())
-
-
-def _exact_t11(poly) -> int:
-    """Exact T(1,1) via integer coefficient sum."""
-    return sum(poly.to_coefficients().values())
+from tutte.cotree_dp import compute_tutte_cotree_dp
+from tutte.validation import _exact_num_spanning_trees, _exact_spanning_tree_count
 
 
 # =============================================================================
@@ -250,36 +207,16 @@ def main():
     print(f"  Total graphs: {len(graphs)}")
     print()
 
-    # Separate into cographs and non-cographs
-    cograph_list = []
-    non_cograph_list = []
-
-    for name, g in graphs:
-        try:
-            is_cog = is_cograph(g)
-        except TypeError:
-            is_cog = False
-        if is_cog:
-            cograph_list.append((name, g))
-        else:
-            non_cograph_list.append((name, g.node_count(), g.edge_count()))
-
-    print(f"  Cographs: {len(cograph_list)}")
-    print(f"  Non-cographs: {len(non_cograph_list)}")
-    print()
-
-    # ===== COGRAPH RESULTS =====
-
-    print("=== Cographs (cotree DP computed) ===")
-    print(f"{'Graph':<20} {'n':>4} {'m':>5} {'Time':>10} {'Match':>6}")
-    print("-" * 49)
+    print(f"{'Graph':<20} {'n':>4} {'m':>5} {'Time':>10} {'Result':>12}")
+    print("-" * 55)
 
     passed = 0
     failed = 0
     errors = 0
+    non_cographs = 0
     total_time = 0.0
 
-    for name, g in cograph_list:
+    for name, g in graphs:
         n = g.node_count()
         m = g.edge_count()
 
@@ -287,36 +224,38 @@ def main():
         try:
             poly = compute_tutte_cotree_dp(g)
             elapsed = time.perf_counter() - t0
+        except (TypeError, ValueError):
+            # Not a cograph (or MultiGraph) — report and move on
+            non_cographs += 1
+            print(f"{name:<20} {n:>4} {m:>5} {'—':>10} {'not cograph':>12}")
+            continue
         except Exception as e:
             elapsed = time.perf_counter() - t0
-            print(f"{name:<20} {n:>4} {m:>5} {elapsed:>9.2f}s ERROR: {e}")
             errors += 1
+            print(f"{name:<20} {n:>4} {m:>5} {elapsed:>9.2f}s {'ERROR':>12}")
+            print(f"  {e}")
             continue
 
         total_time += elapsed
-        t11 = _exact_t11(poly)
-        kirchhoff = _spanning_tree_count(g)
-        match = t11 == kirchhoff
 
-        if match:
+        # Validate: exact T(1,1) vs exact Kirchhoff
+        t11 = _exact_num_spanning_trees(poly)
+        components = g.connected_components()
+        if len(components) == 1:
+            kirchhoff = _exact_spanning_tree_count(g)
+        else:
+            kirchhoff = 1
+            for comp in components:
+                kirchhoff *= _exact_spanning_tree_count(comp)
+
+        if t11 == kirchhoff:
             passed += 1
+            print(f"{name:<20} {n:>4} {m:>5} {elapsed:>9.2f}s {'OK':>12}")
         else:
             failed += 1
-
-        print(f"{name:<20} {n:>4} {m:>5} {elapsed:>9.2f}s {'OK' if match else 'FAIL':>6}")
-        if not match:
+            print(f"{name:<20} {n:>4} {m:>5} {elapsed:>9.2f}s {'FAIL':>12}")
             print(f"  T(1,1)     = {t11}")
             print(f"  Kirchhoff  = {kirchhoff}")
-
-    # ===== NON-COGRAPH LIST =====
-
-    print()
-    print("=== Non-cographs (skipped — not P₄-free) ===")
-    print(f"{'Graph':<20} {'n':>4} {'m':>5}")
-    print("-" * 33)
-    for name, n, m in non_cograph_list:
-        print(f"{name:<20} {n:>4} {m:>5}")
-
     # ===== SUMMARY =====
 
     print()
@@ -327,7 +266,7 @@ def main():
         print(f"    Failed:  {failed}")
     if errors:
         print(f"    Errors:  {errors}")
-    print(f"  Non-cographs skipped: {len(non_cograph_list)}")
+    print(f"  Non-cographs skipped: {non_cographs}")
     print(f"  Total cotree DP time: {total_time:.2f}s")
 
 

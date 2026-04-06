@@ -18,17 +18,17 @@ Target graph families:
   - Any P₄-free graph
 
 Public API:
-    is_cograph(graph) -> bool
-    build_cotree(graph) -> CotreeNode
     compute_tutte_cotree_dp(graph) -> TuttePolynomial
+        Computes the Tutte polynomial if the graph is a cograph.
+        Raises ValueError if not a cograph (contains induced P₄).
+        Raises TypeError if graph is a MultiGraph.
 """
 
-from .recognition import is_cograph, build_cotree, CotreeNode
+from .recognition import CotreeNode, CotreeNodeType
 from .dp import compute_tutte_cotree_dp
 
 __all__ = [
-    'is_cograph',
-    'build_cotree',
     'CotreeNode',
+    'CotreeNodeType',
     'compute_tutte_cotree_dp',
 ]

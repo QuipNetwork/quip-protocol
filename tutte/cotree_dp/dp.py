@@ -1,11 +1,11 @@
 """Compute Tutte polynomial of a cograph via cotree DP.
 
-Orchestrates the two-stage algorithm from Gimenez et al. (2006):
-  Stage 1 (forest.py): Count spanning forests by component-size signature
-  Stage 2 (subgraph.py): Count spanning subgraphs by signature + edge count
-
-The Tutte polynomial is extracted from the Stage 2 table via the
-rank-nullity formulation in the (x-1, y-1) basis.
+Orchestrates the algorithm from Gimenez et al. (2006):
+  1. Build the cotree via modular decomposition (recognition.py)
+  2. Compute subgraph signature tables bottom-up on the cotree (subgraph.py),
+     using CellSel (combinatorics.py) for edge counting at ⊗ nodes
+  3. Extract the Tutte polynomial from the final table via the
+     rank-nullity formulation in the (x-1, y-1) basis
 
 Complexity: exp(O(vertices^{2/3})) — determined by the number of integer
 partitions of vertices, which is exp(Theta(pi * sqrt(2 * vertices / 3)))
@@ -18,17 +18,22 @@ from collections import defaultdict
 from math import comb
 from typing import Dict, Tuple
 
-from ..graph import Graph
+from ..graph import Graph, MultiGraph
 from ..polynomial import TuttePolynomial
-from .recognition import CotreeNode, build_cotree
-from .signatures import SubgraphTable
+from .recognition import CotreeNode, CotreeNodeType, _build_cotree
 from .subgraph import (
+    SubgraphTable,
     leaf_subgraph_table,
-    union_subgraph_combine,
-    join_subgraph_combine,
+    disjoint_union_subgraph_combine,
+    complete_union_subgraph_combine,
 )
 from .combinatorics import clear_cellsel_cache
 
+# Maximum vertex count for cotree DP. The signature table grows as
+# exp(pi * sqrt(2n/3)) by the Hardy-Ramanujan asymptotic formula for
+# integer partitions. At n=35 this is ~16K entries — tractable.
+# At n=50 this is ~200K entries — borderline.
+_MAX_COTREE_DP_VERTICES = 35
 
 # =============================================================================
 # COTREE TRAVERSAL
@@ -36,26 +41,23 @@ from .combinatorics import clear_cellsel_cache
 
 def _compute_subgraph_table(node: CotreeNode) -> SubgraphTable:
     """Compute subgraph signature table bottom-up on the cotree."""
-    if node.node_type == 'leaf':
+    if node.node_type == CotreeNodeType.LEAF:
         assert node.vertex is not None, "Leaf node must have a vertex"
         return leaf_subgraph_table(node.vertex)
 
+    assert node.children is not None, "Internal node must have children"
     child_tables = [_compute_subgraph_table(child) for child in node.children]
 
-    if node.node_type == 'union':
+    if node.node_type == CotreeNodeType.DISJOINT_UNION_OP:
         table = child_tables[0]
         for child_idx in range(1, len(child_tables)):
-            table = union_subgraph_combine(table, child_tables[child_idx])
+            table = disjoint_union_subgraph_combine(table, child_tables[child_idx])
         return table
 
-    elif node.node_type == 'join':
+    elif node.node_type == CotreeNodeType.COMPLETE_UNION_OP:
         table = child_tables[0]
-        vertices_so_far = node.children[0].size()
         for child_idx in range(1, len(child_tables)):
-            table = join_subgraph_combine(
-                table, child_tables[child_idx], vertices_so_far,
-            )
-            vertices_so_far += node.children[child_idx].size()
+            table = complete_union_subgraph_combine(table, child_tables[child_idx])
         return table
 
     raise ValueError(f"Unknown node type: {node.node_type}")
@@ -137,7 +139,6 @@ def compute_tutte_cotree_dp(graph: Graph) -> TuttePolynomial:
 
     Complexity: exp(O(vertices^{2/3})) where vertices = |V|.
     """
-    from ..graph import MultiGraph
     if isinstance(graph, MultiGraph):
         raise TypeError(
             "Cotree DP requires a simple Graph, not MultiGraph. "
@@ -155,13 +156,15 @@ def compute_tutte_cotree_dp(graph: Graph) -> TuttePolynomial:
 
     # Guard: signature table size grows as exp(pi * sqrt(2 * vertices / 3))
     # by Hardy-Ramanujan.
-    if graph.node_count() > 35:
+    if graph.node_count() > _MAX_COTREE_DP_VERTICES:
         raise ValueError(
             f"Graph has {graph.node_count()} vertices; cotree DP signature "
-            f"tables grow as exp(O(vertices^{{2/3}})). vertices > 35 is likely too slow."
+            f"tables grow as exp(O(vertices^{{2/3}})). "
+            f"vertices > {_MAX_COTREE_DP_VERTICES} is likely too slow."
         )
 
-    cotree = build_cotree(graph)
+    # Build cotree — returns None if the graph contains an induced P4
+    cotree = _build_cotree(graph)
     if cotree is None:
         raise ValueError(
             "Graph is not a cograph (contains induced P4). "

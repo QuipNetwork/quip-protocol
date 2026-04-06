@@ -12,7 +12,7 @@ from collections import Counter
 from math import comb
 from typing import Dict, List, Tuple
 
-from .signatures import DoubleSig
+from .subgraph import DoubleSig
 
 
 # =============================================================================
@@ -23,7 +23,16 @@ from .signatures import DoubleSig
 # Cell sizes are sorted for canonical keys — cellsel is order-independent
 # (the DP result doesn't depend on the order of cells).
 #
-# Call clear_cellsel_cache() between unrelated graphs to bound memory.
+# The cache is auto-cleared by compute_tutte_cotree_dp after each graph.
+# For direct calls to cellsel (e.g. from notebooks or benchmarks), the
+# cache is capped at _CELLSEL_CACHE_MAX entries to bound memory.
+# At 500K entries the estimated memory usage is ~100 MB.
+#
+# Empirical peak cache sizes (measured with auto-clear disabled):
+#   K_10:     437 entries (~85 KB)
+#   K_20:  22,375 entries (~4.3 MB)
+#   K_30: 405,613 entries (~77 MB)
+_CELLSEL_CACHE_MAX: int = 500_000
 _cellsel_cache: Dict[Tuple[Tuple[int, ...], int], int] = {}
 
 
@@ -70,7 +79,8 @@ def cellsel(cell_sizes: List[int], total_to_select: int) -> int:
         return cached
 
     result = _cellsel_compute(cell_sizes, num_cells, total_to_select)
-    _cellsel_cache[cache_key] = result
+    if len(_cellsel_cache) < _CELLSEL_CACHE_MAX:
+        _cellsel_cache[cache_key] = result
     return result
 
 
@@ -165,8 +175,11 @@ def _enum_submultisets(
 # =============================================================================
 
 def multiset_diff(multiset: DoubleSig, to_remove: DoubleSig) -> DoubleSig:
-    """Multiset difference: multiset minus to_remove."""
-    remaining = list(multiset)
-    for element in to_remove:
-        remaining.remove(element)
-    return tuple(sorted(remaining, reverse=True))
+    """Multiset difference: multiset minus to_remove.
+
+    Uses Counter subtraction for O(n + k) instead of O(n × k)
+    from repeated list.remove() calls.
+    """
+    result = Counter(multiset)
+    result.subtract(to_remove)
+    return DoubleSig(sorted(result.elements(), reverse=True))

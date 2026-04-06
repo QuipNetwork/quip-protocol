@@ -21,16 +21,28 @@ Complexity: O(vertices² + vertices × edges) for this recursive implementation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from enum import Enum
 from typing import FrozenSet, List, Optional, Set
 
-from ..graph import Graph, MultiGraph
+from ..graph import Graph
 
 
 # Maximum vertex count for cograph recognition. The recursive decomposition
 # has O(vertices) depth in the worst case (threshold graphs). Python's default
 # recursion limit is 1000, so we cap at 500 to leave room for the caller.
 _MAX_RECOGNITION_VERTICES = 500
+
+
+# =============================================================================
+# NODE TYPE ENUM
+# =============================================================================
+
+class CotreeNodeType(Enum):
+    """Type of a node in the cotree decomposition."""
+    LEAF = "leaf"
+    DISJOINT_UNION_OP = "disjoint_union_op"
+    COMPLETE_UNION_OP = "complete_union_op"
 
 
 # =============================================================================
@@ -42,28 +54,30 @@ class CotreeNode:
     """Node in the cotree decomposition of a cograph.
 
     Attributes:
-        node_type: 'leaf', 'union' (∪), or 'join' (⊗)
-        vertex: The vertex label (only for leaf nodes)
-        children: Child cotree nodes (only for internal nodes)
+        node_type: LEAF, DISJOINT_UNION_OP (∪), or COMPLETE_UNION_OP (⊗)
+        vertex: The vertex label (only for leaf nodes, None for internal nodes)
+        children: Child cotree nodes (only for internal nodes, None for leaves)
         vertices: All vertices in the subtree rooted at this node
     """
-    node_type: str  # 'leaf', 'union', or 'join'
+    node_type: CotreeNodeType
     vertex: Optional[int] = None
-    children: List['CotreeNode'] = field(default_factory=list)
+    children: Optional[List['CotreeNode']] = None
     vertices: FrozenSet[int] = frozenset()
 
     def __post_init__(self):
-        if self.node_type not in ('leaf', 'union', 'join'):
+        if not isinstance(self.node_type, CotreeNodeType):
             raise ValueError(
-                f"Invalid node_type '{self.node_type}': "
-                f"must be 'leaf', 'union', or 'join'"
+                f"Invalid node_type: {self.node_type!r}. "
+                f"Must be a CotreeNodeType enum value "
+                f"(LEAF, DISJOINT_UNION_OP, or COMPLETE_UNION_OP)."
             )
 
     def __repr__(self) -> str:
-        if self.node_type == 'leaf':
+        if self.node_type == CotreeNodeType.LEAF:
             return f'Leaf({self.vertex})'
-        symbol = '∪' if self.node_type == 'union' else '⊗'
-        return f'{symbol}({", ".join(repr(child) for child in self.children)})'
+        symbol = '∪' if self.node_type == CotreeNodeType.DISJOINT_UNION_OP else '⊗'
+        children = self.children or []
+        return f'{symbol}({", ".join(repr(child) for child in children)})'
 
     def size(self) -> int:
         """Number of vertices in this subtree."""
@@ -71,50 +85,16 @@ class CotreeNode:
 
     def depth(self) -> int:
         """Maximum depth of the cotree."""
-        if self.node_type == 'leaf':
+        if self.node_type == CotreeNodeType.LEAF or not self.children:
             return 0
         return 1 + max(child.depth() for child in self.children)
-
-
-# =============================================================================
-# COGRAPH RECOGNITION
-# =============================================================================
-
-def is_cograph(graph: Graph) -> bool:
-    """Check if a graph is a cograph (P₄-free).
-
-    Uses recursive modular decomposition as an early-reject filter:
-    attempts to build the cotree, returns True if successful. For
-    non-cographs, exits early at the first non-decomposable subgraph.
-
-    Args:
-        graph: A simple undirected graph.
-
-    Returns:
-        True if the graph is a cograph.
-
-    Raises:
-        TypeError: if graph is a MultiGraph.
-        ValueError: if graph has more than _MAX_RECOGNITION_VERTICES vertices.
-
-    Complexity: O(vertices² + vertices × edges).
-    """
-    if isinstance(graph, MultiGraph):
-        raise TypeError(
-            "Cograph recognition requires a simple Graph, not MultiGraph. "
-            "Cographs are defined for simple graphs only."
-        )
-    # P₄ requires 4 vertices; all graphs on ≤ 3 vertices are cographs
-    if graph.node_count() <= 3:
-        return True
-    return build_cotree(graph) is not None
 
 
 # =============================================================================
 # COTREE CONSTRUCTION
 # =============================================================================
 
-def build_cotree(graph: Graph) -> Optional[CotreeNode]:
+def _build_cotree(graph: Graph) -> Optional[CotreeNode]:
     """Build the cotree decomposition of a cograph.
 
     Returns None if the graph is NOT a cograph (contains induced P₄).
@@ -143,11 +123,11 @@ def build_cotree(graph: Graph) -> Optional[CotreeNode]:
         )
 
     if num_vertices == 0:
-        return CotreeNode(node_type='union', vertices=frozenset())
+        return CotreeNode(node_type=CotreeNodeType.DISJOINT_UNION_OP, vertices=frozenset())
 
     if num_vertices == 1:
         vertex = all_vertices[0]
-        return CotreeNode(node_type='leaf', vertex=vertex, vertices=frozenset({vertex}))
+        return CotreeNode(node_type=CotreeNodeType.LEAF, vertex=vertex, vertices=frozenset({vertex}))
 
     # Build adjacency dict from the Graph's neighbors() API.
     # This references the same sets already cached in Graph._adj,
@@ -165,26 +145,26 @@ def build_cotree(graph: Graph) -> Optional[CotreeNode]:
         count = len(vertices)
 
         if count == 0:
-            return CotreeNode(node_type='union', vertices=frozenset())
+            return CotreeNode(node_type=CotreeNodeType.DISJOINT_UNION_OP, vertices=frozenset())
 
         if count == 1:
             vertex = vertices[0]
             return CotreeNode(
-                node_type='leaf', vertex=vertex, vertices=frozenset({vertex}),
+                node_type=CotreeNodeType.LEAF, vertex=vertex, vertices=frozenset({vertex}),
             )
 
         if count == 2:
             first, second = vertices[0], vertices[1]
-            node_type = 'join' if second in adjacency[first] else 'union'
+            nt = CotreeNodeType.COMPLETE_UNION_OP if second in adjacency[first] else CotreeNodeType.DISJOINT_UNION_OP
             return CotreeNode(
-                node_type=node_type,
+                node_type=nt,
                 children=[
                     CotreeNode(
-                        node_type='leaf', vertex=first,
+                        node_type=CotreeNodeType.LEAF, vertex=first,
                         vertices=frozenset({first}),
                     ),
                     CotreeNode(
-                        node_type='leaf', vertex=second,
+                        node_type=CotreeNodeType.LEAF, vertex=second,
                         vertices=frozenset({second}),
                     ),
                 ],
@@ -205,7 +185,7 @@ def build_cotree(graph: Graph) -> Optional[CotreeNode]:
                 children.append(child)
                 collected_vertices.update(component)
             return CotreeNode(
-                node_type='union',
+                node_type=CotreeNodeType.DISJOINT_UNION_OP,
                 children=children,
                 vertices=frozenset(collected_vertices),
             )
@@ -222,7 +202,7 @@ def build_cotree(graph: Graph) -> Optional[CotreeNode]:
                 children.append(child)
                 collected_vertices.update(component)
             return CotreeNode(
-                node_type='join',
+                node_type=CotreeNodeType.COMPLETE_UNION_OP,
                 children=children,
                 vertices=frozenset(collected_vertices),
             )
@@ -231,7 +211,7 @@ def build_cotree(graph: Graph) -> Optional[CotreeNode]:
         return None
 
     # ------------------------------------------------------------------
-    # Component-finding helpers (close over adjacency from build_cotree)
+    # Component-finding helpers (close over adjacency from _build_cotree)
     # ------------------------------------------------------------------
 
     def _find_components(

@@ -20,8 +20,13 @@ import pytest
 
 from tutte.graph import Graph, MultiGraph, complete_graph, cycle_graph, path_graph, disjoint_union
 from tutte.polynomial import TuttePolynomial
-from tutte.validation import count_spanning_trees_kirchhoff
-from tutte.cotree_dp import is_cograph, build_cotree, CotreeNode, compute_tutte_cotree_dp
+from tutte.validation import (
+    count_spanning_trees_kirchhoff,
+    _exact_num_spanning_trees,
+    _exact_spanning_tree_count,
+)
+from tutte.cotree_dp import CotreeNode, compute_tutte_cotree_dp
+from tutte.cotree_dp.recognition import CotreeNodeType, _build_cotree
 
 
 # =============================================================================
@@ -51,16 +56,6 @@ def _make_threshold(sequence: str) -> Graph:
 class TestInputValidation:
     """Type checks, size guards, and invalid inputs."""
 
-    def test_is_cograph_rejects_multigraph(self):
-        """is_cograph must raise TypeError on MultiGraph."""
-        multigraph = MultiGraph(
-            nodes=frozenset({0, 1}),
-            edge_counts={(0, 1): 2},
-            loop_counts={},
-        )
-        with pytest.raises(TypeError, match="simple Graph"):
-            is_cograph(multigraph)
-
     def test_compute_rejects_multigraph(self):
         """compute_tutte_cotree_dp must raise TypeError on MultiGraph."""
         multigraph = MultiGraph(
@@ -81,16 +76,32 @@ class TestInputValidation:
         with pytest.raises(ValueError, match="vertices > 35"):
             compute_tutte_cotree_dp(graph)
 
-    def test_build_cotree_rejects_more_than_500_vertices(self):
-        """build_cotree must reject n > 500 (recursion depth guard)."""
+    def test__build_cotree_rejects_more_than_500_vertices(self):
+        """_build_cotree must reject n > 500 (recursion depth guard)."""
         graph = Graph(nodes=frozenset(range(501)), edges=frozenset())
         with pytest.raises(ValueError, match="500"):
-            build_cotree(graph)
+            _build_cotree(graph)
 
     def test_invalid_cotree_node_type_raises(self):
         """CotreeNode with invalid node_type must raise ValueError."""
         with pytest.raises(ValueError, match="Invalid node_type"):
             CotreeNode(node_type='invalid')
+
+    def test_invalid_cotree_node_type_int(self):
+        """CotreeNode rejects non-enum types (int)."""
+        with pytest.raises(ValueError, match="Invalid node_type"):
+            CotreeNode(node_type=42)
+
+    def test_invalid_cotree_node_type_none(self):
+        """CotreeNode rejects None as node_type."""
+        with pytest.raises(ValueError, match="Invalid node_type"):
+            CotreeNode(node_type=None)
+
+    def test_valid_cotree_node_types_accepted(self):
+        """All three CotreeNodeType enum values must be accepted."""
+        CotreeNode(node_type=CotreeNodeType.LEAF, vertex=0, vertices=frozenset({0}))
+        CotreeNode(node_type=CotreeNodeType.DISJOINT_UNION_OP)
+        CotreeNode(node_type=CotreeNodeType.COMPLETE_UNION_OP)
 
     def test_non_cograph_raises_value_error(self):
         """compute_tutte_cotree_dp must raise ValueError on non-cographs."""
@@ -134,29 +145,32 @@ class TestCographRecognition:
 
     @pytest.mark.parametrize("name,builder", COGRAPHS, ids=[g[0] for g in COGRAPHS])
     def test_recognizes_known_cographs(self, name, builder):
-        """Known cographs must be recognized."""
-        assert is_cograph(builder()), f"{name} should be a cograph"
+        """Known cographs must be accepted by compute_tutte_cotree_dp."""
+        compute_tutte_cotree_dp(builder())  # should not raise
 
     @pytest.mark.parametrize("name,builder", NON_COGRAPHS, ids=[g[0] for g in NON_COGRAPHS])
     def test_rejects_known_non_cographs(self, name, builder):
-        """Known non-cographs must be rejected."""
-        assert not is_cograph(builder()), f"{name} should NOT be a cograph"
+        """Known non-cographs must be rejected by compute_tutte_cotree_dp."""
+        with pytest.raises(ValueError, match="not a cograph"):
+            compute_tutte_cotree_dp(builder())
 
     def test_early_p4_rejection(self):
         """P₄ is the simplest non-cograph — detected at first recursion level."""
-        assert not is_cograph(path_graph(4))
-        assert build_cotree(path_graph(4)) is None
+        with pytest.raises(ValueError, match="not a cograph"):
+            compute_tutte_cotree_dp(path_graph(4))
+        assert _build_cotree(path_graph(4)) is None
 
     def test_p4_embedded_in_larger_graph(self):
         """W₄ (wheel on 4 rim vertices) contains induced P₄ among rim vertices."""
         edges = {(0, 1), (1, 2), (2, 3), (0, 4), (1, 4), (2, 4), (3, 4)}
         graph = Graph(nodes=frozenset(range(5)), edges=frozenset(edges))
-        assert not is_cograph(graph)
+        with pytest.raises(ValueError, match="not a cograph"):
+            compute_tutte_cotree_dp(graph)
 
     def test_complement_of_cograph_is_cograph(self):
         """complement(K_{3,3}) = K_3 ∪ K_3 — also a cograph."""
         graph = Graph.from_networkx(nx.complement(nx.complete_bipartite_graph(3, 3)))
-        assert is_cograph(graph)
+        compute_tutte_cotree_dp(graph)  # should not raise
 
 
 # =============================================================================
@@ -168,24 +182,122 @@ class TestCotreeStructure:
 
     def test_k3_is_join_of_three_leaves(self):
         """K_3 cotree: ⊗(v0, v1, v2)."""
-        cotree = build_cotree(complete_graph(3))
+        cotree = _build_cotree(complete_graph(3))
         assert cotree is not None
-        assert cotree.node_type == 'join'
+        assert cotree.node_type == CotreeNodeType.COMPLETE_UNION_OP
         assert cotree.size() == 3
-        assert all(child.node_type == 'leaf' for child in cotree.children)
+        assert all(child.node_type == CotreeNodeType.LEAF for child in cotree.children)
 
     def test_k33_is_join_of_two_unions(self):
         """K_{3,3} cotree: ⊗(∪(a,b,c), ∪(d,e,f))."""
-        cotree = build_cotree(Graph.from_networkx(nx.complete_bipartite_graph(3, 3)))
+        cotree = _build_cotree(Graph.from_networkx(nx.complete_bipartite_graph(3, 3)))
         assert cotree is not None
-        assert cotree.node_type == 'join'
+        assert cotree.node_type == CotreeNodeType.COMPLETE_UNION_OP
         assert len(cotree.children) == 2
-        assert all(child.node_type == 'union' for child in cotree.children)
+        assert all(child.node_type == CotreeNodeType.DISJOINT_UNION_OP for child in cotree.children)
 
     def test_non_cograph_returns_none(self):
-        """Non-cographs must return None from build_cotree."""
-        assert build_cotree(cycle_graph(5)) is None
-        assert build_cotree(path_graph(4)) is None
+        """Non-cographs must return None from _build_cotree."""
+        assert _build_cotree(cycle_graph(5)) is None
+        assert _build_cotree(path_graph(4)) is None
+
+    def test_3way_complete_union_matches_k4(self):
+        """Manually construct ⊗(v0, v1, ⊗(v2, v3)) and verify it equals K_4.
+
+        K_4 has cotree ⊗(v0, v1, v2, v3) — a single ⊗ with 4 leaves.
+        An alternative valid cotree is ⊗(v0, v1, ⊗(v2, v3)) — a ⊗ with
+        2 leaves and 1 child ⊗. Both must produce the same polynomial.
+
+        This tests that iterative left-fold ⊗ combine (used by
+        _compute_subgraph_table for 3+ children) is associative —
+        i.e., ⊗(A, B, C) via fold gives the same result as ⊗(A, ⊗(B, C)).
+        """
+        from tutte.cotree_dp.dp import _compute_subgraph_table, _extract_tutte_polynomial
+
+        # Build flat cotree: ⊗(v0, v1, v2, v3) — 4 leaves under one ⊗
+        flat_tree = CotreeNode(
+            node_type=CotreeNodeType.COMPLETE_UNION_OP,
+            children=[
+                CotreeNode(node_type=CotreeNodeType.LEAF, vertex=i, vertices=frozenset({i}))
+                for i in range(4)
+            ],
+            vertices=frozenset(range(4)),
+        )
+
+        # Build nested cotree: ⊗(v0, v1, ⊗(v2, v3))
+        nested_tree = CotreeNode(
+            node_type=CotreeNodeType.COMPLETE_UNION_OP,
+            children=[
+                CotreeNode(node_type=CotreeNodeType.LEAF, vertex=0, vertices=frozenset({0})),
+                CotreeNode(node_type=CotreeNodeType.LEAF, vertex=1, vertices=frozenset({1})),
+                CotreeNode(
+                    node_type=CotreeNodeType.COMPLETE_UNION_OP,
+                    children=[
+                        CotreeNode(node_type=CotreeNodeType.LEAF, vertex=2, vertices=frozenset({2})),
+                        CotreeNode(node_type=CotreeNodeType.LEAF, vertex=3, vertices=frozenset({3})),
+                    ],
+                    vertices=frozenset({2, 3}),
+                ),
+            ],
+            vertices=frozenset(range(4)),
+        )
+
+        flat_table = _compute_subgraph_table(flat_tree)
+        nested_table = _compute_subgraph_table(nested_tree)
+
+        flat_poly = _extract_tutte_polynomial(flat_table, 4, 1)
+        nested_poly = _extract_tutte_polynomial(nested_table, 4, 1)
+
+        # Both must equal T(K_4)
+        expected = compute_tutte_cotree_dp(complete_graph(4))
+        assert flat_poly == expected, f"Flat ⊗(4 leaves): {flat_poly} != {expected}"
+        assert nested_poly == expected, f"Nested ⊗(2 leaves + ⊗(2)): {nested_poly} != {expected}"
+        assert flat_poly == nested_poly, f"Flat != Nested: {flat_poly} != {nested_poly}"
+
+    def test_3way_disjoint_union_associativity(self):
+        """∪(v0, v1, ∪(v2, v3)) must equal ∪(v0, v1, v2, v3).
+
+        Same associativity test for ∪ combine.
+        """
+        from tutte.cotree_dp.dp import _compute_subgraph_table, _extract_tutte_polynomial
+
+        # Flat: ∪(v0, v1, v2)
+        flat_tree = CotreeNode(
+            node_type=CotreeNodeType.DISJOINT_UNION_OP,
+            children=[
+                CotreeNode(node_type=CotreeNodeType.LEAF, vertex=i, vertices=frozenset({i}))
+                for i in range(3)
+            ],
+            vertices=frozenset(range(3)),
+        )
+
+        # Nested: ∪(v0, ∪(v1, v2))
+        nested_tree = CotreeNode(
+            node_type=CotreeNodeType.DISJOINT_UNION_OP,
+            children=[
+                CotreeNode(node_type=CotreeNodeType.LEAF, vertex=0, vertices=frozenset({0})),
+                CotreeNode(
+                    node_type=CotreeNodeType.DISJOINT_UNION_OP,
+                    children=[
+                        CotreeNode(node_type=CotreeNodeType.LEAF, vertex=1, vertices=frozenset({1})),
+                        CotreeNode(node_type=CotreeNodeType.LEAF, vertex=2, vertices=frozenset({2})),
+                    ],
+                    vertices=frozenset({1, 2}),
+                ),
+            ],
+            vertices=frozenset(range(3)),
+        )
+
+        flat_table = _compute_subgraph_table(flat_tree)
+        nested_table = _compute_subgraph_table(nested_tree)
+
+        # 3 isolated vertices, 3 components → T = 1
+        flat_poly = _extract_tutte_polynomial(flat_table, 3, 3)
+        nested_poly = _extract_tutte_polynomial(nested_table, 3, 3)
+
+        assert flat_poly == TuttePolynomial.one()
+        assert nested_poly == TuttePolynomial.one()
+        assert flat_poly == nested_poly
 
 
 # =============================================================================
@@ -203,7 +315,6 @@ class TestKnownPolynomials:
     def test_single_vertex(self):
         """Single vertex: T = 1."""
         graph = Graph(nodes=frozenset({0}), edges=frozenset())
-        assert is_cograph(graph)
         assert compute_tutte_cotree_dp(graph) == TuttePolynomial.one()
 
     def test_two_isolated_vertices(self):
@@ -234,22 +345,30 @@ class TestKnownPolynomials:
 # =============================================================================
 
 class TestKirchhoffValidation:
-    """T(1,1) must equal spanning tree count for all cographs."""
+    """T(1,1) must equal spanning tree count for all cographs.
+
+    Uses exact integer arithmetic for both T(1,1) and Kirchhoff to avoid
+    float64 precision loss on large graphs (n >= 18 where spanning tree
+    counts exceed 2^53).
+    """
 
     @pytest.mark.parametrize("name,builder", COGRAPHS, ids=[g[0] for g in COGRAPHS])
     def test_spanning_tree_count_matches(self, name, builder):
-        """T(1,1) = Kirchhoff spanning tree count."""
+        """T(1,1) = Kirchhoff spanning tree count (exact integer arithmetic)."""
         graph = builder()
         poly = compute_tutte_cotree_dp(graph)
-        t11 = int(poly.evaluate(1, 1))
 
+        # Exact T(1,1) via integer coefficient sum — no float conversion
+        t11 = _exact_num_spanning_trees(poly)
+
+        # Exact Kirchhoff via sympy integer determinant — no float conversion
         components = graph.connected_components()
         if len(components) == 1:
-            expected = count_spanning_trees_kirchhoff(graph)
+            expected = _exact_spanning_tree_count(graph)
         else:
             expected = 1
             for component in components:
-                expected *= count_spanning_trees_kirchhoff(component)
+                expected *= _exact_spanning_tree_count(component)
 
         assert t11 == expected, f"{name}: T(1,1)={t11} != Kirchhoff={expected}"
 
@@ -267,7 +386,6 @@ class TestGraphFamilies:
         Exercises ∪ combine with substantial components on both sides.
         """
         graph = disjoint_union(complete_graph(4), complete_graph(5))
-        assert is_cograph(graph)
         poly = compute_tutte_cotree_dp(graph)
 
         poly_k4 = compute_tutte_cotree_dp(complete_graph(4))
@@ -285,7 +403,6 @@ class TestGraphFamilies:
     def test_asymmetric_complete_bipartite(self):
         """K_{2,8}: very unbalanced cotree (2 leaves vs 8 leaves under ⊗)."""
         graph = Graph.from_networkx(nx.complete_bipartite_graph(2, 8))
-        assert is_cograph(graph)
         poly = compute_tutte_cotree_dp(graph)
         kirchhoff = count_spanning_trees_kirchhoff(graph)
         assert int(poly.evaluate(1, 1)) == kirchhoff
@@ -297,7 +414,6 @@ class TestGraphFamilies:
         Kirchhoff on the whole graph returns 0. Compute per-component.
         """
         graph = _make_threshold("didididi")
-        assert is_cograph(graph)
         poly = compute_tutte_cotree_dp(graph)
         t11 = int(poly.evaluate(1, 1))
 
@@ -387,14 +503,18 @@ CROSS_VALIDATION_GRAPHS = [
 # =============================================================================
 
 class TestKnScaling:
-    """Run cotree DP on K_8 through K_100 to find where it becomes too slow.
+    """Run cotree DP on K_30 through K_100 to find where it becomes too slow.
+
+    K_8 through K_29 are covered by Section G (engine cross-validation).
+    This section tests larger graphs where the engine times out but
+    cotree DP still succeeds.
 
     Each K_n result is printed immediately. Stops on first timeout (15 min).
     Run with: pytest tests/test_cotree_dp.py::TestKnScaling -v -s
     """
 
     def test_kn_scaling(self):
-        """Cotree DP on K_8..K_100: print time for each, stop on timeout."""
+        """Cotree DP on K_30..K_100: print time for each, stop on timeout."""
         import sys
         import time
         from tutte.validation import _exact_num_spanning_trees, _exact_spanning_tree_count
@@ -505,3 +625,79 @@ class TestEngineCrossValidation:
                 f"  Kirchhoff     = {kirchhoff}\n"
                 f"  components    = {len(components)}"
             )
+
+
+# =============================================================================
+# I. CELLSEL CACHE GROWTH (Issue #4)
+# =============================================================================
+
+class TestCellSelCacheGrowth:
+    """Measure CellSel cache peak size to determine the cache limit for issue #4.
+
+    The _cellsel_cache dict grows during compute_tutte_cotree_dp and is
+    auto-cleared after each call. This test disables auto-clear to measure
+    peak entries, then uses the result to validate a proposed cache limit.
+
+    Run with: pytest tests/test_cotree_dp.py::TestCellSelCacheGrowth -v -s
+    """
+
+    def test_cache_peak_k30(self):
+        """Measure peak CellSel cache entries on K_30.
+
+        K_30 is the largest graph we routinely benchmark with cotree DP.
+        The peak cache size determines the safe limit for issue #4.
+        """
+        import time
+        import tutte.cotree_dp.dp as dp_mod
+        from tutte.cotree_dp.combinatorics import _cellsel_cache
+
+        n = 30
+        g = complete_graph(n)
+
+        # Disable auto-clear to observe peak
+        original_clear = dp_mod.clear_cellsel_cache
+        dp_mod.clear_cellsel_cache = lambda: None
+        _cellsel_cache.clear()
+
+        try:
+            t0 = time.perf_counter()
+            poly = compute_tutte_cotree_dp(g)
+            elapsed = time.perf_counter() - t0
+
+            peak_entries = len(_cellsel_cache)
+
+            # Estimate memory per entry:
+            #   key: tuple of sorted ints (~5 elements avg) + int
+            #     tuple overhead: 56 bytes + 5 × 28 bytes = 196 bytes
+            #     int key: 28 bytes
+            #   value: int = 28 bytes
+            #   dict overhead per entry: ~50 bytes
+            est_bytes_per_entry = 196 + 28 + 28 + 50
+            est_memory_mb = peak_entries * est_bytes_per_entry / (1024 * 1024)
+
+            print(f"\n{'='*60}")
+            print(f"CellSel cache growth on K_{n}")
+            print(f"  Peak cache entries: {peak_entries:,}")
+            print(f"  Estimated memory:   {est_memory_mb:.1f} MB")
+            print(f"  Computation time:   {elapsed:.1f}s")
+            print(f"{'='*60}")
+
+            # Verify correctness
+            kirchhoff = _exact_spanning_tree_count(g)
+            t11 = _exact_num_spanning_trees(poly)
+            assert t11 == kirchhoff, (
+                f"K_{n}: T(1,1)={t11} != Kirchhoff={kirchhoff}"
+            )
+
+            # The cache must have entries (sanity check)
+            assert peak_entries > 0, "Cache should have entries after K_30"
+
+            # Record the peak for use in setting the limit.
+            # A safe limit is 2× the K_30 peak (headroom for K_35).
+            suggested_limit = peak_entries * 2
+            print(f"  Suggested cache limit: {suggested_limit:,} "
+                  f"(2× K_{n} peak)")
+
+        finally:
+            dp_mod.clear_cellsel_cache = original_clear
+            _cellsel_cache.clear()
