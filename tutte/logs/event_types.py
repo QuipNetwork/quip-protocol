@@ -41,6 +41,7 @@ class EventType(Enum):
     FACTORIZE = "factorize"           # Cut vertex / disconnected split
     SERIES_PARALLEL = "series_parallel"
     TREEWIDTH_DP = "treewidth_dp"
+    COTREE_DP = "cotree_dp"
     KSUM = "ksum"
 
     # --- Hierarchical tiling ---

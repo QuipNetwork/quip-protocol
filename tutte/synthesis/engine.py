@@ -483,7 +483,27 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 self._promote_to_table(graph, cache_key, result)
                 return result
 
-        # 10. Try k-sum decomposition (k=2..7, vertex separators)
+        # 10. Cotree DP for cographs -- exp(O(n^{2/3})) subexponential
+        if graph.node_count() <= 35:
+            try:
+                from ..cotree_dp import compute_tutte_cotree_dp
+                cotree_poly = compute_tutte_cotree_dp(graph)
+                _log.record(EventType.COTREE_DP, "engine",
+                            f"Cotree DP: {n}n {m}e", LogLevel.INFO)
+                self._log(f"Cotree DP: {graph.node_count()}n {graph.edge_count()}e")
+                result = SynthesisResult(
+                    polynomial=cotree_poly,
+                    recipe=["Cotree DP (cograph)"],
+                    verified=True,
+                    method="cotree_dp",
+                )
+                self._cache[cache_key] = result
+                self._promote_to_table(graph, cache_key, result)
+                return result
+            except (ValueError, TypeError):
+                pass  # Not a cograph -- fall through to k-sum
+
+        # 11. Try k-sum decomposition (k=2..7, vertex separators)
         if graph.edge_count() >= 6:
             result = self._try_ksum_decomposition(graph)
             if result is not None:
@@ -493,7 +513,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 self._promote_to_table(graph, cache_key, result)
                 return result
 
-        # 11. Try hierarchical tiling for graphs with repeating structure
+        # 12. Try hierarchical tiling for graphs with repeating structure
         if graph.edge_count() >= 20:
             result = self._try_hierarchical(graph, max_depth)
             if result is not None:
@@ -503,7 +523,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 self._promote_to_table(graph, cache_key, result)
                 return result
 
-        # 12. Try creation-expansion-join
+        # 13. Try creation-expansion-join
         result = self._synthesize_connected(graph, max_depth)
         self._cache[cache_key] = result
         self._promote_to_table(graph, cache_key, result)

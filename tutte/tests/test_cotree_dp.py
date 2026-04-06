@@ -64,7 +64,7 @@ class TestInputValidation:
             loop_counts={},
         )
         with pytest.raises(TypeError, match="simple Graph"):
-            compute_tutte_cotree_dp(multigraph)
+            compute_tutte_cotree_dp(multigraph)  # type: ignore[arg-type]
 
     def test_compute_rejects_more_than_35_vertices(self):
         """compute_tutte_cotree_dp must reject n > 35.
@@ -85,17 +85,17 @@ class TestInputValidation:
     def test_invalid_cotree_node_type_raises(self):
         """CotreeNode with invalid node_type must raise ValueError."""
         with pytest.raises(ValueError, match="Invalid node_type"):
-            CotreeNode(node_type='invalid')
+            CotreeNode(node_type='invalid')  # type: ignore[arg-type]
 
     def test_invalid_cotree_node_type_int(self):
         """CotreeNode rejects non-enum types (int)."""
         with pytest.raises(ValueError, match="Invalid node_type"):
-            CotreeNode(node_type=42)
+            CotreeNode(node_type=42)  # type: ignore[arg-type]
 
     def test_invalid_cotree_node_type_none(self):
         """CotreeNode rejects None as node_type."""
         with pytest.raises(ValueError, match="Invalid node_type"):
-            CotreeNode(node_type=None)
+            CotreeNode(node_type=None)  # type: ignore[arg-type]
 
     def test_valid_cotree_node_types_accepted(self):
         """All three CotreeNodeType enum values must be accepted."""
@@ -186,6 +186,7 @@ class TestCotreeStructure:
         assert cotree is not None
         assert cotree.node_type == CotreeNodeType.COMPLETE_UNION_OP
         assert cotree.size() == 3
+        assert cotree.children is not None
         assert all(child.node_type == CotreeNodeType.LEAF for child in cotree.children)
 
     def test_k33_is_join_of_two_unions(self):
@@ -193,6 +194,7 @@ class TestCotreeStructure:
         cotree = _build_cotree(Graph.from_networkx(nx.complete_bipartite_graph(3, 3)))
         assert cotree is not None
         assert cotree.node_type == CotreeNodeType.COMPLETE_UNION_OP
+        assert cotree.children is not None
         assert len(cotree.children) == 2
         assert all(child.node_type == CotreeNodeType.DISJOINT_UNION_OP for child in cotree.children)
 

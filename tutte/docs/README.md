@@ -18,6 +18,7 @@ Detailed documentation for each technique used by the tutte synthesis engine to 
 | 4 | [Cut Vertex Factorization](04_cut_vertex_factorization.md) | Graph has an articulation point | O(n + m) + recursive synthesis per block |
 | 5 | [Hierarchical Tiling](05_hierarchical_tiling.md) | Graphs >= 20 edges with repeating cell structure | O(inter_edges × synthesis_cost) — see sub-techniques |
 | 6 | [Creation-Expansion-Join (CEJ)](06_creation_expansion_join.md) | Final fallback — spanning tree + chord addition | O(chords × synthesis_cost) |
+| 7 | [Cotree DP](07_cotree_dp.md) | Cographs (P₄-free graphs) — standalone module for K_11+ | exp(O(n^{2/3})) — subexponential |
 
 ## Pipeline Overview
 
