@@ -21,7 +21,10 @@ from shared.base_miner import MiningResult
 from shared.block import Block, BlockHeader, MinerInfo
 from shared.node import Node
 from shared.logging_config import init_component_logger
-from shared.version import get_version, PROTOCOL_VERSION
+from shared.version import (
+    get_version, PROTOCOL_VERSION,
+    is_version_compatible, MIN_COMPATIBLE_VERSION,
+)
 from shared.node_client import (
     NodeClient, QuicMessage, QuicMessageType,
     generate_self_signed_cert, QUIP_ALPN_PROTOCOL, MAX_DATAGRAM_FRAME_SIZE,
@@ -1263,19 +1266,17 @@ class NetworkNode(Node):
             else:
                 raise RuntimeError("No peers to synchronize with")
 
-        # Filter to peers running a compatible version (same major.minor)
-        local_version = get_version()
-        local_major_minor = ".".join(local_version.split(".")[:2])
+        # Filter to peers running a compatible version
         compatible_peers = []
         for peer in self.peers:
             peer_ver = self.peer_versions.get(peer)
             if peer_ver is None:
                 # No version info yet (no heartbeat received) — include tentatively
                 compatible_peers.append(peer)
-            elif ".".join(peer_ver.split(".")[:2]) == local_major_minor:
+            elif is_version_compatible(peer_ver):
                 compatible_peers.append(peer)
             else:
-                self.logger.debug(f"Skipping peer {peer} for sync: version {peer_ver} != {local_version}")
+                self.logger.debug(f"Skipping peer {peer} for sync: version {peer_ver} incompatible")
 
         if not compatible_peers:
             self.logger.warning("No compatible-version peers available for sync")
@@ -1355,12 +1356,10 @@ class NetworkNode(Node):
             return False
 
         # Update node client with only compatible-version peers
-        local_version = get_version()
-        local_major_minor = ".".join(local_version.split(".")[:2])
         compatible_peers = {
             peer: info for peer, info in self.peers.items()
             if self.peer_versions.get(peer) is None
-            or ".".join(self.peer_versions[peer].split(".")[:2]) == local_major_minor
+            or is_version_compatible(self.peer_versions[peer])
         }
         self.node_client.update_peers(compatible_peers)
 
@@ -2056,19 +2055,25 @@ class NetworkNode(Node):
 
         join_version = data.get("version")
         if join_version:
-            local_version = get_version()
-            local_ver = version.parse(local_version)
-            peer_ver = version.parse(join_version)
-            if local_ver > peer_ver:
+            self.peer_versions[new_node_address] = join_version
+            if not is_version_compatible(join_version):
                 await self._backoff_peer(
                     new_node_address,
-                    f"older version {join_version} "
-                    f"(local: {local_version})",
+                    f"incompatible version {join_version} "
+                    f"(min: {MIN_COMPATIBLE_VERSION}, "
+                    f"local: {get_version()})",
                 )
                 return msg.create_error_response(
-                    f"Version {join_version} too old"
+                    f"Version {join_version} incompatible "
+                    f"(minimum: {MIN_COMPATIBLE_VERSION})"
                 )
-            self.peer_versions[new_node_address] = join_version
+            peer_ver = version.parse(join_version)
+            local_ver = version.parse(get_version())
+            if peer_ver > local_ver:
+                self.logger.info(
+                    f"Peer {new_node_address} runs newer version "
+                    f"{join_version} (local: {get_version()})"
+                )
 
         # Add the new node
         await self.add_peer(new_node_address, new_node_info)
@@ -2098,27 +2103,25 @@ class NetworkNode(Node):
             )
 
         if net_version:
-            local_version = get_version()
-            local_ver = version.parse(local_version)
-            peer_ver = version.parse(net_version)
-
-            if local_ver < peer_ver:
-                self.logger.error(
-                    f"Local version {local_version} is outdated compared to "
-                    f"peer {sender} running version {net_version}"
-                )
-                self.logger.error("Please run 'pip install quip-network' to get the latest version")
-                await self.stop()
-            elif local_ver > peer_ver:
+            if not is_version_compatible(net_version):
                 await self._backoff_peer(
                     sender,
-                    f"older version {net_version} "
-                    f"(local: {local_version})",
+                    f"incompatible version {net_version} "
+                    f"(min: {MIN_COMPATIBLE_VERSION}, "
+                    f"local: {get_version()})",
                 )
                 return msg.create_response(
                     json.dumps(
                         {"status": "incompatible_version"}
                     ).encode('utf-8')
+                )
+            peer_ver = version.parse(net_version)
+            local_ver = version.parse(get_version())
+            if peer_ver > local_ver:
+                self.logger.info(
+                    f"Peer {sender} runs newer version "
+                    f"{net_version} (local: {get_version()}). "
+                    f"Consider updating."
                 )
 
         if sender and net_version:
