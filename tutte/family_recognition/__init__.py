@@ -68,12 +68,15 @@ def recognize_family(graph: Graph) -> Optional[TuttePolynomial]:
     n = graph.node_count()
     m = graph.edge_count()
 
-    # --- O(1) checks based on (n, m) ---
+    # --- O(1) + O(n+m) checks based on (n, m) ---
 
     # Tree (covers paths, stars, all trees)
-    # Precondition: graph is connected (checked by engine before calling)
+    # Must verify connectivity: a disconnected graph with m = n-1 is a forest,
+    # not a tree. T(forest) ≠ x^{n-1}; the engine handles forests via the
+    # disconnected-component split at step 5.
     if m == n - 1:
-        return tree_formula(n)
+        if graph.is_connected():
+            return tree_formula(n)
 
     # Compute fingerprint once — O(n+m)
     fp = compute_structural_fingerprint(graph)

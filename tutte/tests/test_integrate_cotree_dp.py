@@ -3,15 +3,6 @@
 Validates that the cotree DP module is correctly wired into
 SynthesisEngine.synthesize() as step 9b (after treewidth DP, before k-sum).
 
-The inner loop (base.py) is NOT modified -- chord addition produces
-multigraphs that are caught by treewidth DP or series-parallel after
-batch-parallel reduction. Cographs are caught at the outer loop before
-CEJ ever starts.
-
-The hybrid engine (hybrid.py) is NOT modified -- it is a secondary engine
-used only in a few matroid tests. Cographs entering it still compute
-correctly via the tiling fallback.
-
 Sections:
     A. Engine produces correct polynomials for cographs
     B. Engine falls through correctly for non-cographs
@@ -27,7 +18,7 @@ from __future__ import annotations
 import networkx as nx
 import pytest
 
-from tutte.graph import Graph, complete_graph, cycle_graph, path_graph
+from tutte.graph import Graph, complete_graph, cycle_graph, path_graph, wheel_graph, grid_graph
 from tutte.polynomial import TuttePolynomial
 from tutte.synthesis.engine import SynthesisEngine
 from tutte.cotree_dp import compute_tutte_cotree_dp
@@ -405,3 +396,194 @@ class TestNoRegressions:
         engine = _empty_table_engine()
         result = engine.synthesize(graph)
         assert result.polynomial == TuttePolynomial.one()
+
+
+# =============================================================================
+# H. FAMILY RECOGNITION — ENGINE PRODUCES CORRECT POLYNOMIALS
+# =============================================================================
+
+FAMILY_RECOGNITION_GRAPHS = [
+    # Trees (recognized as m = n-1)
+    ("P_5",   lambda: path_graph(5)),
+    ("P_10",  lambda: path_graph(10)),
+    ("P_20",  lambda: path_graph(20)),
+
+    # Cycles
+    ("C_5",   lambda: cycle_graph(5)),
+    ("C_10",  lambda: cycle_graph(10)),
+    ("C_20",  lambda: cycle_graph(20)),
+
+    # Wheels
+    ("W_5",   lambda: wheel_graph(5)),
+    ("W_8",   lambda: wheel_graph(8)),
+    ("W_12",  lambda: wheel_graph(12)),
+
+    # Grids (2×k ladder and larger)
+    ("Grid_2x4", lambda: grid_graph(2, 4)),
+    ("Grid_2x8", lambda: grid_graph(2, 8)),
+    ("Grid_3x3", lambda: grid_graph(3, 3)),
+
+    # Complete graphs (not family-recognized but engine handles via other paths)
+    ("K_5",   lambda: complete_graph(5)),
+    ("K_6",   lambda: complete_graph(6)),
+]
+
+
+class TestFamilyRecognitionIntegration:
+    """Engine must produce correct polynomials for family-recognized graphs.
+
+    Family recognition runs at step 1 of SynthesisEngine.synthesize().
+    These tests verify that recognized families produce correct results
+    end-to-end through the engine, not just from the recognition module.
+    """
+
+    @pytest.mark.parametrize(
+        "name,builder",
+        FAMILY_RECOGNITION_GRAPHS,
+        ids=[g[0] for g in FAMILY_RECOGNITION_GRAPHS],
+    )
+    def test_kirchhoff_family(self, name, builder):
+        """T(1,1) must equal Kirchhoff spanning tree count."""
+        graph = builder()
+        engine = _empty_table_engine()
+        result = engine.synthesize(graph)
+
+        t11 = _exact_num_spanning_trees(result.polynomial)
+
+        components = graph.connected_components()
+        if len(components) == 1:
+            kirchhoff = _exact_spanning_tree_count(graph)
+        else:
+            kirchhoff = 1
+            for component in components:
+                kirchhoff *= _exact_spanning_tree_count(component)
+
+        assert t11 == kirchhoff, (
+            f"{name}: T(1,1)={t11} != Kirchhoff={kirchhoff}, method={result.method}"
+        )
+
+    @pytest.mark.parametrize(
+        "name,builder",
+        FAMILY_RECOGNITION_GRAPHS,
+        ids=[g[0] for g in FAMILY_RECOGNITION_GRAPHS],
+    )
+    def test_t22_family(self, name, builder):
+        """T(2,2) must equal 2^|E| for all graphs."""
+        graph = builder()
+        engine = _empty_table_engine()
+        result = engine.synthesize(graph)
+
+        m = graph.edge_count()
+        t22 = result.polynomial.evaluate(2, 2)
+        assert t22 == 2 ** m, (
+            f"{name}: T(2,2)={t22} != 2^{m}={2**m}, method={result.method}"
+        )
+
+    def test_path_exact(self):
+        """P_5: T = x^4."""
+        engine = _empty_table_engine()
+        result = engine.synthesize(path_graph(5))
+        assert result.polynomial == TuttePolynomial.x(4)
+
+    def test_cycle_exact(self):
+        """C_5: T = x^4 + x^3 + x^2 + x + y."""
+        expected = TuttePolynomial.from_coefficients(
+            {(4, 0): 1, (3, 0): 1, (2, 0): 1, (1, 0): 1, (0, 1): 1}
+        )
+        engine = _empty_table_engine()
+        result = engine.synthesize(cycle_graph(5))
+        assert result.polynomial == expected
+
+    def test_wheel_method(self):
+        """W_8 should be resolved by family recognition (method check)."""
+        engine = _empty_table_engine()
+        result = engine.synthesize(wheel_graph(8))
+        assert result.method == "family_recognition", (
+            f"W_8: expected method='family_recognition', got '{result.method}'"
+        )
+
+
+# =============================================================================
+# I. RANDOM GRAPH REGRESSION (n < 20)
+# =============================================================================
+
+def _random_graph(n: int, p: float, seed: int) -> Graph:
+    """Build a random Erdos-Renyi graph."""
+    return Graph.from_networkx(nx.erdos_renyi_graph(n, p, seed=seed))
+
+
+RANDOM_REGRESSION_GRAPHS = [
+    # Sparse (low treewidth, engine should handle via TW-DP or SP)
+    ("G(8,0.3,s1)",   lambda: _random_graph(8, 0.3, seed=1)),
+    ("G(10,0.2,s2)",  lambda: _random_graph(10, 0.2, seed=2)),
+    ("G(12,0.2,s3)",  lambda: _random_graph(12, 0.2, seed=3)),
+    ("G(15,0.15,s4)", lambda: _random_graph(15, 0.15, seed=4)),
+    ("G(18,0.1,s5)",  lambda: _random_graph(18, 0.1, seed=5)),
+
+    # Medium density
+    ("G(8,0.5,s6)",   lambda: _random_graph(8, 0.5, seed=6)),
+    ("G(10,0.4,s7)",  lambda: _random_graph(10, 0.4, seed=7)),
+    ("G(12,0.35,s8)", lambda: _random_graph(12, 0.35, seed=8)),
+    ("G(14,0.3,s9)",  lambda: _random_graph(14, 0.3, seed=9)),
+
+    # Dense (higher treewidth, exercises chord addition path)
+    ("G(8,0.7,s10)",  lambda: _random_graph(8, 0.7, seed=10)),
+    ("G(10,0.6,s11)", lambda: _random_graph(10, 0.6, seed=11)),
+    ("G(12,0.5,s12)", lambda: _random_graph(12, 0.5, seed=12)),
+
+    # Irregular structures
+    ("BA(10,3,s13)",  lambda: Graph.from_networkx(nx.barabasi_albert_graph(10, 3, seed=13))),
+    ("BA(15,2,s14)",  lambda: Graph.from_networkx(nx.barabasi_albert_graph(15, 2, seed=14))),
+    ("WS(12,4,0.3)",  lambda: Graph.from_networkx(nx.watts_strogatz_graph(12, 4, 0.3, seed=15))),
+    ("WS(16,4,0.5)",  lambda: Graph.from_networkx(nx.watts_strogatz_graph(16, 4, 0.5, seed=16))),
+]
+
+
+class TestRandomGraphRegression:
+    """Engine must produce correct polynomials for random graphs (n < 20).
+
+    These tests catch regressions from pipeline changes (cotree DP,
+    Björklund integration, etc.) on graphs with no guaranteed structure.
+    """
+
+    @pytest.mark.parametrize(
+        "name,builder",
+        RANDOM_REGRESSION_GRAPHS,
+        ids=[g[0] for g in RANDOM_REGRESSION_GRAPHS],
+    )
+    def test_kirchhoff_random(self, name, builder):
+        """T(1,1) must equal Kirchhoff spanning tree count."""
+        graph = builder()
+        engine = _empty_table_engine()
+        result = engine.synthesize(graph)
+
+        t11 = _exact_num_spanning_trees(result.polynomial)
+
+        components = graph.connected_components()
+        if len(components) == 1:
+            kirchhoff = _exact_spanning_tree_count(graph)
+        else:
+            kirchhoff = 1
+            for component in components:
+                kirchhoff *= _exact_spanning_tree_count(component)
+
+        assert t11 == kirchhoff, (
+            f"{name}: T(1,1)={t11} != Kirchhoff={kirchhoff}, method={result.method}"
+        )
+
+    @pytest.mark.parametrize(
+        "name,builder",
+        RANDOM_REGRESSION_GRAPHS,
+        ids=[g[0] for g in RANDOM_REGRESSION_GRAPHS],
+    )
+    def test_t22_random(self, name, builder):
+        """T(2,2) must equal 2^|E| for all graphs."""
+        graph = builder()
+        engine = _empty_table_engine()
+        result = engine.synthesize(graph)
+
+        m = graph.edge_count()
+        t22 = result.polynomial.evaluate(2, 2)
+        assert t22 == 2 ** m, (
+            f"{name}: T(2,2)={t22} != 2^{m}={2**m}, method={result.method}"
+        )
