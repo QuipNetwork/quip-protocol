@@ -68,6 +68,14 @@ def recognize_family(graph: Graph) -> Optional[TuttePolynomial]:
     n = graph.node_count()
     m = graph.edge_count()
 
+    # Precompute derived values used by multiple checks below.
+    # Avoids redundant division/modulus on large vertex counts.
+    n_is_even = n % 2 == 0
+    n_is_odd = not n_is_even
+    n_half = n // 2           # valid when n_is_even
+    n_half_odd = (n - 1) // 2 # valid when n_is_odd (k for helm/gear)
+    twice_n_minus_1 = 2 * (n - 1)
+
     # --- O(1) + O(n+m) checks based on (n, m) ---
 
     # Tree (covers paths, stars, all trees)
@@ -80,81 +88,81 @@ def recognize_family(graph: Graph) -> Optional[TuttePolynomial]:
 
     # Compute fingerprint once — O(n+m)
     fp = compute_structural_fingerprint(graph)
+    dc = fp.degree_counts  # shorthand for degree count dict
 
     # --- O(1) checks against fingerprint ---
 
     # Cycle: connected, |E| = |V|, all degree 2
-    if m == n and fp.degree_counts == {2: n}:
+    if m == n and dc == {2: n}:
         return cycle_formula(n)
 
     # Wheel: one hub with degree n-1, all others degree 3, 2(n-1) edges
     # W_k has k+1 vertices. For n=4 (W_3=K_4), hub degree = 3 = rim degree.
-    if n >= 4 and m == 2 * (n - 1):
+    if n >= 4 and m == twice_n_minus_1:
         if n == 4:
-            # W_3 = K_4: all vertices degree 3
-            if fp.degree_counts == {3: 4}:
+            if dc == {3: 4}:
                 return wheel_recurrence(3)
-        elif (fp.degree_counts.get(n - 1, 0) == 1
-                and fp.degree_counts.get(3, 0) == n - 1
-                and len(fp.degree_counts) == 2):
+        elif (dc.get(n - 1, 0) == 1
+                and dc.get(3, 0) == n - 1
+                and len(dc) == 2):
             return wheel_recurrence(n - 1)
 
     # Fan: one apex with degree n-1, two degree-2 endpoints, rest degree 3
     # F_k has k+1 vertices, 2k-1 edges. k = n-1.
-    if (n >= 4 and m == 2 * (n - 1) - 1
-            and fp.degree_counts.get(n - 1, 0) == 1
-            and fp.degree_counts.get(2, 0) == 2
-            and fp.degree_counts.get(3, 0) == n - 3
-            and len(fp.degree_counts) == 3):
+    if (n >= 4 and m == twice_n_minus_1 - 1
+            and dc.get(n - 1, 0) == 1
+            and dc.get(2, 0) == 2
+            and dc.get(3, 0) == n - 3
+            and len(dc) == 3):
         return fan_recurrence(n - 1)
 
     # Pan: one pendant (deg 1), one deg-3 vertex, rest deg-2, |E|=|V|
     if (n >= 4 and m == n
-            and fp.degree_counts.get(1, 0) == 1
-            and fp.degree_counts.get(3, 0) == 1
-            and fp.degree_counts.get(2, 0) == n - 2):
+            and dc.get(1, 0) == 1
+            and dc.get(3, 0) == 1
+            and dc.get(2, 0) == n - 2):
         return pan_formula(n - 1)
 
     # --- O(1) + O(n+m) verification checks ---
 
     # Ladder: P_k × P_2 — 2k vertices, 3k-2 edges, 4 degree-2 corners
-    if n >= 4 and n % 2 == 0:
-        k = n // 2
+    if n >= 4 and n_is_even:
+        k = n_half
         if (m == 3 * k - 2
-                and fp.degree_counts.get(2, 0) == 4
-                and fp.degree_counts.get(3, 0) == n - 4
+                and dc.get(2, 0) == 4
+                and dc.get(3, 0) == n - 4
                 and fp.is_bipartite
-                and len(fp.degree_counts) == 2):
+                and len(dc) == 2):
             if verify_ladder(graph, k):
                 return ladder_recurrence(k)
 
     # Helm: hub degree k, rim degree 4, pendants degree 1
     # 2k+1 vertices, 3k edges
     # Special case k=4: hub and rim both degree 4 → degree_counts = {4: k+1, 1: k}
-    if n >= 7 and n % 2 == 1:
-        k = (n - 1) // 2
-        if m == 3 * k and fp.degree_counts.get(1, 0) == k:
+    if n >= 7 and n_is_odd:
+        k = n_half_odd
+        if m == 3 * k and dc.get(1, 0) == k:
             if k == 4:
-                if fp.degree_counts.get(4, 0) == k + 1:
+                if dc.get(4, 0) == k + 1:
                     if verify_helm(graph, k):
                         return helm_formula(k)
-            elif (fp.degree_counts.get(k, 0) == 1
-                    and fp.degree_counts.get(4, 0) == k):
+            elif (dc.get(k, 0) == 1
+                    and dc.get(4, 0) == k):
                 if verify_helm(graph, k):
                     return helm_formula(k)
 
     # Gear: hub degree k, k rim vertices degree 3, k subdivision vertices degree 2
     # 2k+1 vertices, 3k edges (same as helm but different degree pattern)
     # Special case k=3: hub and rim both degree 3 → degree_counts = {3: k+1, 2: k}
-    if n >= 7 and n % 2 == 1:
-        k = (n - 1) // 2
-        if m == 3 * k and fp.degree_counts.get(2, 0) == k:
+    if n >= 7 and n_is_odd:
+        k = n_half_odd
+        if m == 3 * k and dc.get(2, 0) == k:
             if k == 3:
-                if fp.degree_counts.get(3, 0) == k + 1:
+                if dc.get(3, 0) == k + 1:
                     if verify_gear(graph, k):
                         return gear_recurrence(k)
-            elif (fp.degree_counts.get(k, 0) == 1
-                    and fp.degree_counts.get(3, 0) == k):
+            elif (dc.get(k, 0) == 1
+                    and dc.get(3, 0) == k):
                 if verify_gear(graph, k):
                     return gear_recurrence(k)
 
@@ -164,33 +172,33 @@ def recognize_family(graph: Graph) -> Optional[TuttePolynomial]:
         if k >= 1:
             hub_deg = k + 1
             if (m == 2 * k + 1
-                    and fp.degree_counts.get(hub_deg, 0) == 2
-                    and fp.degree_counts.get(2, 0) == k):
+                    and dc.get(hub_deg, 0) == 2
+                    and dc.get(2, 0) == k):
                 if verify_book(graph, k):
                     return book_recurrence(k)
 
     # Sunlet: half degree 1, half degree 3, |E| = |V|
-    if n >= 6 and n % 2 == 0 and m == n:
-        k = n // 2
-        if (fp.degree_counts.get(1, 0) == k
-                and fp.degree_counts.get(3, 0) == k):
+    if n >= 6 and n_is_even and m == n:
+        k = n_half
+        if (dc.get(1, 0) == k
+                and dc.get(3, 0) == k):
             if verify_sunlet(graph, k):
                 return sunlet_formula(k)
 
     # Prism / Möbius: 3-regular, 2k vertices, 3k edges
     # Prism C_k×K_2 is bipartite iff k is even; Möbius M_k is bipartite iff k is odd.
     # Try both verifiers — bipartiteness alone cannot distinguish them.
-    if (n >= 6 and n % 2 == 0
+    if (n >= 6 and n_is_even
             and fp.is_regular and fp.regularity == 3
-            and m == 3 * (n // 2)):
-        k = n // 2
+            and m == 3 * n_half):
+        k = n_half
         if verify_prism(graph, k):
             return prism_recurrence(k)
         if verify_mobius(graph, k):
             return mobius_recurrence(k)
 
     # Grid: bipartite, specific degree pattern, m <= 5 rows
-    if fp.is_bipartite and fp.degree_counts.get(2, 0) == 4:
+    if fp.is_bipartite and dc.get(2, 0) == 4:
         dims = detect_grid_dims(graph, fp)
         if dims is not None:
             m_dim, n_dim = dims
