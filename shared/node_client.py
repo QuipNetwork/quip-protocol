@@ -65,6 +65,9 @@ class QuicMessageType(IntEnum):
     MIGRATE = 0x0C            # Ask peer to disconnect and reconnect elsewhere
     PROBE_REQUEST = 0x0D      # SWIM indirect probe: check if target is alive
     LOAD_INFO = 0x0E          # Node load metrics (piggybacked on heartbeat)
+    # Phase 3: IHAVE/IWANT block propagation
+    IHAVE = 0x10              # Announce block availability (hash only)
+    IWANT = 0x11              # Request specific blocks by hash
 
     # Response types (0x80-0xFF)
     JOIN_RESPONSE = 0x81
@@ -82,6 +85,9 @@ class QuicMessageType(IntEnum):
     MIGRATE_ACK = 0x8C
     PROBE_RESPONSE = 0x8D
     LOAD_INFO_RESPONSE = 0x8E
+    # Phase 3 responses
+    IHAVE_RESPONSE = 0x90
+    IWANT_RESPONSE = 0x91
 
     ERROR_RESPONSE = 0xFF
 
