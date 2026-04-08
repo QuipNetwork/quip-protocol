@@ -60,6 +60,11 @@ class QuicMessageType(IntEnum):
     BLOCK_REQUEST = 0x08
     BLOCK_HEADER_REQUEST = 0x09
     SOLVE_REQUEST = 0x0A
+    # Phase 2: rebalancing + SWIM
+    REDIRECT = 0x0B           # JOIN response when overloaded
+    MIGRATE = 0x0C            # Ask peer to disconnect and reconnect elsewhere
+    PROBE_REQUEST = 0x0D      # SWIM indirect probe: check if target is alive
+    LOAD_INFO = 0x0E          # Node load metrics (piggybacked on heartbeat)
 
     # Response types (0x80-0xFF)
     JOIN_RESPONSE = 0x81
@@ -72,6 +77,11 @@ class QuicMessageType(IntEnum):
     BLOCK_RESPONSE = 0x88
     BLOCK_HEADER_RESPONSE = 0x89
     SOLVE_RESPONSE = 0x8A
+    # Phase 2 responses
+    REDIRECT_RESPONSE = 0x8B
+    MIGRATE_ACK = 0x8C
+    PROBE_RESPONSE = 0x8D
+    LOAD_INFO_RESPONSE = 0x8E
 
     ERROR_RESPONSE = 0xFF
 
@@ -586,7 +596,16 @@ class NodeClient:
         response = await protocol.send_request(QuicMessageType.JOIN_REQUEST, payload, timeout=self.node_timeout)
         if response and response.msg_type == QuicMessageType.JOIN_RESPONSE:
             try:
-                return json.loads(response.payload.decode('utf-8'))
+                data = json.loads(response.payload.decode('utf-8'))
+                # Handle at_capacity redirect: peer is overloaded, try
+                # the suggested alternatives instead
+                if data.get("status") == "at_capacity":
+                    self.logger.info(
+                        f"Peer {peer_address} at capacity, "
+                        f"received {len(data.get('peers', {}))} alternatives"
+                    )
+                    return data
+                return data
             except Exception:
                 return None
         elif response and response.msg_type == QuicMessageType.ERROR_RESPONSE:
@@ -595,6 +614,66 @@ class NodeClient:
             error_msg = response.payload.decode('utf-8', errors='replace')
             self.logger.warning(f"Join rejected by {peer_address}: {error_msg}")
         return None
+
+    async def send_migrate(
+        self, host: str, alternatives: list[str], reason: str = "overloaded"
+    ) -> bool:
+        """Send MIGRATE request telling peer to reconnect elsewhere."""
+        protocol = await self._get_connection(host)
+        if not protocol:
+            return False
+        payload = json.dumps({
+            "reason": reason,
+            "alternatives": alternatives,
+        }).encode('utf-8')
+        response = await protocol.send_request(
+            QuicMessageType.MIGRATE, payload, timeout=5.0
+        )
+        return (
+            response is not None
+            and response.msg_type == QuicMessageType.MIGRATE_ACK
+        )
+
+    async def send_probe_request(
+        self, prober_host: str, target_host: str, probe_id: str
+    ) -> Optional[bool]:
+        """Ask prober_host to check if target_host is alive.
+
+        Returns True if target is alive, False if unreachable, None on error.
+        """
+        protocol = await self._get_connection(prober_host)
+        if not protocol:
+            return None
+        payload = json.dumps({
+            "target": target_host,
+            "probe_id": probe_id,
+        }).encode('utf-8')
+        response = await protocol.send_request(
+            QuicMessageType.PROBE_REQUEST, payload, timeout=10.0
+        )
+        if response and response.msg_type == QuicMessageType.PROBE_RESPONSE:
+            try:
+                data = json.loads(response.payload.decode('utf-8'))
+                return data.get("alive", False)
+            except Exception:
+                return None
+        return None
+
+    async def send_load_info(
+        self, host: str, load_data: dict
+    ) -> bool:
+        """Send load metrics to a peer (piggybacked on heartbeat cycle)."""
+        protocol = await self._get_connection(host)
+        if not protocol:
+            return False
+        payload = json.dumps(load_data).encode('utf-8')
+        response = await protocol.send_request(
+            QuicMessageType.LOAD_INFO, payload, timeout=5.0
+        )
+        return (
+            response is not None
+            and response.msg_type == QuicMessageType.LOAD_INFO_RESPONSE
+        )
 
     async def connect_to_peer(self, peer_address: str) -> bool:
         protocol = await self._get_connection(peer_address)
