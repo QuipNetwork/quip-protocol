@@ -31,6 +31,26 @@ test:
     - if: $CI_COMMIT_BRANCH
 
 # ---------------------------------------------------------------------------
+# Version-tag gate (tags only — fail fast if tag ≠ pyproject.toml version)
+# ---------------------------------------------------------------------------
+
+check-version:
+  stage: test
+  image: python:3.12-slim
+  tags: [linux, amd64]
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - |
+      PKG_VERSION=$(python3 -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+      TAG_VERSION="${CI_COMMIT_TAG#v}"
+      if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+        echo "ERROR: tag $CI_COMMIT_TAG has version v${PKG_VERSION} in pyproject.toml (expected v${TAG_VERSION})"
+        exit 1
+      fi
+      echo "OK: tag $CI_COMMIT_TAG matches pyproject.toml version $PKG_VERSION"
+
+# ---------------------------------------------------------------------------
 # Docker image builds (Kaniko — no daemon required)
 # ---------------------------------------------------------------------------
 
@@ -105,37 +125,6 @@ package-macos-x86_64:
     - pip install pyinstaller
     - pip install -e .
 
-package-linux-x86_64:
-  extends: .pyinstaller_build
-  image: nvidia/cuda:12.9.1-base-ubuntu22.04
-  tags: [linux, x86_64]
-  before_script:
-    - apt-get update && apt-get install -y --no-install-recommends python3 python3-dev python3-pip python3-venv libpython3.10 binutils cuda-cudart-12-9 cuda-nvrtc-12-9
-    - python3 -m venv .venv
-    - source .venv/bin/activate
-    - pip install -U pip setuptools wheel
-    - pip install pyinstaller
-    - pip install -e ".[cuda]"
-
-package-windows-x86_64:
-  extends: .pyinstaller_build
-  tags: [windows, x86_64]
-  before_script:
-    - $env:Path = "D:\GitLab-Runner\venv\Scripts;C:\Program Files\Git\cmd;" + $env:Path
-    - python -m venv .venv
-    - .\.venv\Scripts\Activate.ps1
-    - python -m pip install -U pip setuptools wheel
-    - python -m pip install pyinstaller
-    - python -m pip install -e ".[cuda]"
-  script:
-    - pyinstaller pyinstaller/quip_network_node.spec --distpath dist --workpath build/pyinstaller
-    - $binary = Get-ChildItem dist/quip-network-node-* | Select-Object -First 1
-    - '& $($binary.FullName) --version'
-  artifacts:
-    paths:
-      - dist/quip-network-node-*.exe
-    expire_in: 30 days
-
 # ---------------------------------------------------------------------------
 # Release (tags only)
 # ---------------------------------------------------------------------------
@@ -147,8 +136,6 @@ release-binaries:
   needs:
     - package-macos-arm64
     - package-macos-x86_64
-    - package-linux-x86_64
-    - package-windows-x86_64
   rules:
     - if: $CI_COMMIT_TAG
   script:
@@ -167,9 +154,3 @@ release-binaries:
         - name: quip-network-node-macos-x86_64
           url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-macos-x86_64?job=package-macos-x86_64"
           filepath: /quip-network-node-macos-x86_64
-        - name: quip-network-node-linux-x86_64
-          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-linux-x86_64?job=package-linux-x86_64"
-          filepath: /quip-network-node-linux-x86_64
-        - name: quip-network-node-windows-x86_64.exe
-          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-windows-x86_64.exe?job=package-windows-x86_64"
-          filepath: /quip-network-node-windows-x86_64.exe
