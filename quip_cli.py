@@ -199,6 +199,10 @@ async def _async_run_network_node(config: Dict[str, Any], genesis_config_file: s
 
 
 def _run_network_node_sync(config: Dict[str, Any], genesis_config_file: str) -> int:
+    # Install uvloop for 2-4x async throughput if available
+    from shared.event_loop import install_uvloop_policy
+    install_uvloop_policy()
+
     try:
         return asyncio.run(_async_run_network_node(config, genesis_config_file))
     except KeyboardInterrupt:
