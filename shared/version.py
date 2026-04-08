@@ -15,11 +15,11 @@ __version__: Optional[str] = None
 # - Block serialization format
 # - Network message format
 # - Consensus rules
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 # Minimum application version we will accept from peers.
 # Bump this when a release introduces changes that older nodes cannot handle.
-MIN_COMPATIBLE_VERSION = "0.0.1"
+MIN_COMPATIBLE_VERSION = "0.1.0"
 
 
 def get_version() -> str:
@@ -37,7 +37,7 @@ def get_version() -> str:
             __version__ = importlib.metadata.version("quip-protocol")
         except importlib.metadata.PackageNotFoundError:
             # Fallback to development version
-            __version__ = "0.1.0-dev"
+            __version__ = "0.1.0"
 
     return __version__
 
