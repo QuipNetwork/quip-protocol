@@ -37,6 +37,8 @@ from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import QuicEvent, DatagramFrameReceived, StreamDataReceived, ConnectionTerminated, HandshakeCompleted
 from shared.block_synchronizer import BlockSynchronizer
 from shared.block_store import BlockStore
+from shared.process_pool import ProcessPool, ProcessPoolConfig
+from shared.rate_limiter import PeerRateLimiter
 from shared.telemetry import TelemetryManager
 from shared.time_utils import (
     utc_timestamp_float, is_clock_synchronized, NETWORK_TIME_SYNC_INTERVAL,
@@ -282,6 +284,7 @@ class NetworkNode(Node):
             "nodes.quip.network:20049",
         ])
         self.fanout = int(config.get("fanout", 3))
+        self.max_connections = int(config.get("max_connections", 50))
 
         self.net_lock = asyncio.Lock()
         self.running = False
@@ -297,8 +300,20 @@ class NetworkNode(Node):
         self._connection_worker: Optional['ConnectionWorkerHandle'] = None
         self._connection_request_pending = False
 
+        # Process pool for per-connection peer isolation (initialized in start())
+        self._process_pool: Optional[ProcessPool] = None
+
+        # Per-peer rate limiter for incoming QUIC messages
+        self._rate_limiter = PeerRateLimiter(
+            tokens_per_second=float(config.get("rate_limit_tps", 10.0)),
+            max_burst=int(config.get("rate_limit_burst", 20)),
+        )
+
         self.gossip_lock = asyncio.Lock()
-        self.recent_messages = set()
+        # Bounded dedup: maps message_id -> timestamp, max 10k entries
+        self.recent_messages: dict[str, float] = {}
+        self._recent_messages_max = 10_000
+        self._recent_messages_ttl = 300.0  # 5 minutes
 
         # Time synchronization tracking
         self.peer_timestamps = []  # Recent timestamps from peers
@@ -506,6 +521,14 @@ class NetworkNode(Node):
         )
         self._connection_worker.start()
 
+        # Initialize process pool for per-connection peer isolation
+        pool_cfg = ProcessPoolConfig(
+            max_connections=self.max_connections,
+            node_timeout=self.node_timeout,
+            verify_tls=self.verify_tls,
+        )
+        self._process_pool = ProcessPool(config=pool_cfg, logger=self.logger)
+
         # Start QUIC server
         cert_file = self.tls_cert_file if self.tls_enabled else None
         key_file = self.tls_key_file if self.tls_enabled else None
@@ -632,6 +655,12 @@ class NetworkNode(Node):
             self._connection_worker.close()
             self._connection_worker = None
 
+        # Shut down process pool (per-connection processes)
+        if self._process_pool:
+            self.logger.info("Stopping process pool...")
+            self._process_pool.shutdown_all(timeout=5.0)
+            self._process_pool = None
+
         self.logger.info("Cancelling QUIC client tasks...")
         # Close node client
         if self.node_client:
@@ -683,7 +712,7 @@ class NetworkNode(Node):
                 self.logger.exception("Error in heartbeat loop")
 
     async def node_cleanup_loop(self):
-        """Remove dead nodes from registry."""
+        """Remove dead nodes from registry and prune stale state."""
         while self.running:
             try:
                 await asyncio.sleep(self.heartbeat_timeout / 2)
@@ -696,6 +725,25 @@ class NetworkNode(Node):
                     for host, node_info in list(self.peers.items()):
                         if host not in self.heartbeats or current_time - self.heartbeats[host] > self.heartbeat_timeout:
                             dead_nodes.append(host)
+
+                # Prune stale gossip dedup entries and rate limiter buckets
+                async with self.gossip_lock:
+                    pruned = self._prune_recent_messages()
+                    if pruned:
+                        self.logger.debug(
+                            f"Pruned {pruned} stale gossip dedup entries "
+                            f"({len(self.recent_messages)} remaining)"
+                        )
+                self._rate_limiter.prune()
+
+                # Reap dead connection processes
+                if self._process_pool:
+                    dead_procs = self._process_pool.reap_dead()
+                    for peer in dead_procs:
+                        self.logger.info(
+                            f"Connection process for {peer} died, "
+                            f"will reconnect on next cycle"
+                        )
 
                 # Remove dead nodes
                 for host in dead_nodes:
@@ -1742,7 +1790,7 @@ class NetworkNode(Node):
             if message.id in self.recent_messages:
                 return  # Already processed
 
-            self.recent_messages.add(message.id)
+            self._record_recent_message(message.id)
 
         # Select random peers
         peers = list(self.peers.keys())
@@ -1800,7 +1848,7 @@ class NetworkNode(Node):
         async with self.gossip_lock:
             if message.id in self.recent_messages:
                 return "ok"  # Already processed
-            # NOTE: We only check and do not add to the processing list,
+            # NOTE: We only check and do not add to the dedup dict,
             #       as that happens during gossip_broadcast.
 
         if message.type == "new_node":
@@ -1847,6 +1895,42 @@ class NetworkNode(Node):
     ## QUIC Message Handlers ##
     ############################
 
+    def _record_recent_message(self, message_id: str) -> None:
+        """Record a message ID in the bounded dedup dict.
+
+        Evicts oldest entries when the dict exceeds max size, and
+        periodically prunes entries older than TTL.
+        """
+        now = time.time()
+        self.recent_messages[message_id] = now
+
+        # Evict if over capacity
+        if len(self.recent_messages) > self._recent_messages_max:
+            self._prune_recent_messages(now)
+
+    def _prune_recent_messages(self, now: Optional[float] = None) -> int:
+        """Remove messages older than TTL. Returns count removed."""
+        if now is None:
+            now = time.time()
+        cutoff = now - self._recent_messages_ttl
+        stale = [
+            mid for mid, ts in self.recent_messages.items()
+            if ts < cutoff
+        ]
+        for mid in stale:
+            del self.recent_messages[mid]
+
+        # If still over capacity after TTL pruning, drop oldest
+        if len(self.recent_messages) > self._recent_messages_max:
+            excess = len(self.recent_messages) - self._recent_messages_max
+            oldest = sorted(
+                self.recent_messages.items(), key=lambda x: x[1]
+            )[:excess]
+            for mid, _ in oldest:
+                del self.recent_messages[mid]
+            return len(stale) + excess
+        return len(stale)
+
     async def _handle_quic_message(
         self,
         msg: QuicMessage,
@@ -1857,6 +1941,12 @@ class NetworkNode(Node):
         This replaces all the HTTP route handlers with a single dispatch point.
         """
         try:
+            # Per-peer rate limiting
+            peer_addr = getattr(protocol, '_peer_address', None) or 'unknown'
+            if not self._rate_limiter.allow(peer_addr):
+                self.logger.debug(f"Rate limited {peer_addr}")
+                return msg.create_error_response("Rate limited")
+
             # Validate protocol version - reject incompatible nodes
             if msg.protocol_version != PROTOCOL_VERSION:
                 self.logger.warning(f"Protocol version mismatch from {protocol._peer_address}: expected {PROTOCOL_VERSION}, got {msg.protocol_version} (msg_type={msg.msg_type.name})")
@@ -2032,6 +2122,21 @@ class NetworkNode(Node):
 
     async def _quic_handle_join(self, msg: QuicMessage, protocol: Any) -> QuicMessage:
         """Handle join request from a new node."""
+        # Check connection capacity before processing
+        if self._process_pool is not None and self._process_pool.is_at_capacity:
+            # Suggest alternative peers when at capacity
+            async with self.net_lock:
+                alt_peers = list(self.peers.keys())[:10]
+            self.logger.info(
+                f"At connection capacity ({self.max_connections}), "
+                f"suggesting {len(alt_peers)} alternative peers"
+            )
+            response_data = json.dumps({
+                "status": "at_capacity",
+                "peers": {h: self.peers[h].to_json() for h in alt_peers},
+            })
+            return msg.create_response(response_data.encode('utf-8'))
+
         data = json.loads(msg.payload.decode('utf-8'))
         claimed_address = data.get("host")
         info_field = data.get("info")
