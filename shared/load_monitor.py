@@ -183,20 +183,19 @@ def _get_memory_percent() -> float:
     """Get memory usage as a percentage. Best-effort, returns 0.0 on failure."""
     try:
         import resource
-        # rusage gives maxrss in bytes (macOS) or KB (Linux)
-        usage = resource.getrusage(resource.RUSAGE_SELF)
+    except ImportError:
+        return 0.0  # Expected on Windows
+    try:
         import sys
-        if sys.platform == 'darwin':
-            rss_bytes = usage.ru_maxrss
-        else:
-            rss_bytes = usage.ru_maxrss * 1024
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        # rusage gives maxrss in bytes (macOS) or KB (Linux)
+        rss_bytes = usage.ru_maxrss if sys.platform == 'darwin' else usage.ru_maxrss * 1024
 
-        # Estimate total memory from sysconf
         pages = os.sysconf('SC_PHYS_PAGES')
         page_size = os.sysconf('SC_PAGE_SIZE')
         total = pages * page_size
         if total > 0:
             return (rss_bytes / total) * 100.0
-    except Exception:
-        pass
-    return 0.0
+        return 0.0
+    except (OSError, ValueError):
+        return 0.0

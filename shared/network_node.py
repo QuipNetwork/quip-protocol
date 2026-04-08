@@ -869,8 +869,12 @@ class NetworkNode(Node):
                         await self.node_client.send_load_info(
                             peer, load_dict
                         )
-                    except Exception:
-                        pass
+                    except (ConnectionError, asyncio.TimeoutError, OSError):
+                        pass  # Expected network errors
+                    except Exception as exc:
+                        self.logger.debug(
+                            f"Failed to send load info to {peer}: {exc}"
+                        )
 
                 # Check if we need to shed connections
                 if self._load_monitor.is_overloaded():
@@ -924,8 +928,10 @@ class NetworkNode(Node):
             return
 
         # Find least-loaded peers to suggest as alternatives
+        async with self.net_lock:
+            snapshot = list(self.peers.keys())
         alternatives = self._get_least_loaded_peers(
-            exclude=set(targets), count=5
+            exclude=set(targets), count=5, peer_list=snapshot
         )
 
         self.logger.info(
@@ -939,21 +945,26 @@ class NetworkNode(Node):
                     peer, alternatives, reason="overloaded"
                 )
             except Exception as exc:
-                self.logger.debug(f"MIGRATE to {peer} failed: {exc}")
+                self.logger.warning(f"MIGRATE to {peer} failed: {exc}")
             # Kill the connection process regardless of MIGRATE success
             self._process_pool.kill(peer)
 
     def _get_least_loaded_peers(
-        self, exclude: set, count: int
+        self, exclude: set, count: int,
+        peer_list: Optional[list[str]] = None,
     ) -> list[str]:
         """Select the least-loaded known peers as alternatives.
 
         Uses peer load info if available, otherwise falls back to
         random selection from the peer list.
+
+        Args:
+            peer_list: Pre-copied peer list (caller should copy under
+                net_lock). Falls back to self.peers if not provided.
         """
         # Sort peers by load (connection utilization)
         candidates = []
-        async_peers = list(self.peers.keys())
+        async_peers = peer_list if peer_list is not None else list(self.peers.keys())
         for peer in async_peers:
             if peer in exclude:
                 continue
@@ -2084,24 +2095,16 @@ class NetworkNode(Node):
                     QuicMessageType.IHAVE, payload, timeout=3.0
                 )
                 ihave_sent += 1
-            except Exception:
-                pass
+            except (ConnectionError, asyncio.TimeoutError, OSError):
+                pass  # Expected network errors
+            except Exception as exc:
+                self.logger.debug(f"IHAVE to {peer} failed: {exc}")
 
         self.logger.debug(
             f"Sent IHAVE for block {block_data.header.index} "
             f"to {ihave_sent}/{len(targets)} peers "
             f"(hash={block_hash.hex()[:16]}...)"
         )
-
-        # Also propagate via the existing gossip path for backward
-        # compatibility with nodes that don't support IHAVE/IWANT
-        message = Message(
-            type="block",
-            sender=self.public_host,
-            timestamp=utc_timestamp_float(),
-            data=binary_data,
-        )
-        await self.gossip(message)
 
     def _adaptive_fanout(self, peer_count: int) -> int:
         """Calculate adaptive fanout based on network size.
@@ -2597,8 +2600,10 @@ class NetworkNode(Node):
         # Check connection capacity before processing
         if not self._load_monitor.should_accept_join():
             # Suggest least-loaded alternative peers when at capacity
+            async with self.net_lock:
+                peer_keys = list(self.peers.keys())
             alt_peers = self._get_least_loaded_peers(
-                exclude=set(), count=10
+                exclude=set(), count=10, peer_list=peer_keys
             )
             self.logger.info(
                 f"Rejecting JOIN (overloaded or at capacity), "

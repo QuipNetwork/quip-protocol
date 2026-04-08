@@ -13,13 +13,6 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture
-def event_loop():
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture
 async def router_dealer():
     """Create a connected ROUTER/DEALER pair, clean up after test."""
     from shared.ipc_transport import IPCRouter, IPCDealer, get_default_ipc_address

@@ -83,14 +83,19 @@ class ConnectionProcessHandle:
             return False
 
     def recv(self) -> Optional[dict]:
-        """Non-blocking receive. Returns None if nothing available or pipe broken."""
+        """Non-blocking receive. Returns None if nothing available.
+
+        Returns a synthetic ``{"event": "disconnected", ...}`` dict
+        if the pipe is broken, so callers can distinguish "no data"
+        from "child process is gone."
+        """
         try:
             if self.pipe.poll(0):
                 msg = self.pipe.recv()
                 self.last_activity = time.monotonic()
                 return msg
         except (BrokenPipeError, OSError, EOFError):
-            pass
+            return {"event": "disconnected", "reason": "pipe broken"}
         return None
 
     def shutdown(self) -> None:
@@ -248,7 +253,12 @@ async def _connect_with_cancel(
         await asyncio.sleep(0.5)
     try:
         return connect_task.result()
-    except (asyncio.CancelledError, Exception):
+    except asyncio.CancelledError:
+        return False
+    except Exception as exc:
+        logging.getLogger(__name__).debug(
+            f"Connection to {peer_address} failed: {exc}"
+        )
         return False
 
 

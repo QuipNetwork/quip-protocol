@@ -160,11 +160,11 @@ class PeerScorer:
         Returns:
             List of selected peer addresses.
         """
-        if len(all_peers) <= fanout:
-            return list(all_peers)
+        if fanout <= 0 or len(all_peers) <= fanout:
+            return list(all_peers) if fanout != 0 else []
 
         n_scored = max(1, int(fanout * scored_fraction))
-        n_random = fanout - n_scored
+        n_random = max(0, fanout - n_scored)
 
         # Get scored peers sorted by score
         scored = [
