@@ -50,7 +50,7 @@ def gpu_simulated_annealing(
     # Get GPU info
     try:
         gpu_info = subprocess.check_output(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], text=True).strip()
-    except:
+    except Exception:
         gpu_info = "T4"
     
     start_time = time.time()
