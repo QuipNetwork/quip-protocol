@@ -37,6 +37,8 @@ from typing import Any, Dict, Optional
 
 from shared.logging_config import QuipFormatter
 
+logger = logging.getLogger(__name__)
+
 
 def _setup_service_logging(miner_id: str) -> logging.Logger:
     """Configure logging for the miner service process."""
@@ -93,8 +95,7 @@ def miner_service_main(
         })
         return
 
-    mining_stop = mp.Event()
-    is_mining = False
+    ctx = _MinerContext(miner, miner_id, spec, result_queue, log)
 
     while not stop_event.is_set():
         try:
@@ -105,77 +106,100 @@ def miner_service_main(
         if not isinstance(msg, dict):
             continue
 
-        op = msg.get("cmd")
-
-        if op == "shutdown":
+        if msg.get("cmd") == "shutdown":
             log.info("Shutdown requested")
-            mining_stop.set()
+            ctx.mining_stop.set()
             break
 
-        elif op == "stop":
-            mining_stop.set()
-            is_mining = False
-            result_queue.put({"event": "stopped"})
-
-        elif op == "status":
-            result_queue.put({
-                "event": "status",
-                "mining": is_mining,
-                "miner_id": miner_id,
-                "miner_type": getattr(miner, 'miner_type', 'unknown'),
-                "kind": spec.get("kind", "unknown"),
-            })
-
-        elif op == "mine":
-            prev_block = msg.get("block")
-            node_info = msg.get("node_info")
-            requirements = msg.get("requirements")
-            prev_timestamp = msg.get("prev_timestamp", 0)
-
-            if prev_block is None or requirements is None or node_info is None:
-                result_queue.put({
-                    "event": "error",
-                    "message": "Missing block, node_info, or requirements",
-                })
-                continue
-
-            mining_stop = mp.Event()
-            is_mining = True
-
-            try:
-                result = miner.mine_block(
-                    prev_block, node_info, requirements,
-                    prev_timestamp, mining_stop,
-                )
-                is_mining = False
-                if result is not None:
-                    result_queue.put(result)
-            except Exception as exc:
-                is_mining = False
-                log.error(f"Mining error: {exc}")
-                result_queue.put({
-                    "event": "error",
-                    "message": str(exc),
-                })
-
-        elif op == "get_stats":
-            try:
-                stats = miner.get_stats()
-                result_queue.put({
-                    "op": "stats",
-                    "data": stats,
-                    "id": miner_id,
-                })
-            except Exception as exc:
-                result_queue.put({
-                    "event": "error",
-                    "message": f"get_stats failed: {exc}",
-                })
-
-        else:
-            log.warning(f"Unknown command: {op}")
+        ctx.dispatch(msg)
 
     log.info(f"Miner service {miner_id} stopped")
+
+
+class _MinerContext:
+    """Command dispatch state for the miner service loop."""
+
+    def __init__(self, miner, miner_id, spec, result_queue, log):
+        self.miner = miner
+        self.miner_id = miner_id
+        self.spec = spec
+        self.result_queue = result_queue
+        self.log = log
+        self.mining_stop = mp.Event()
+        self.is_mining = False
+
+    def dispatch(self, msg: dict) -> None:
+        op = msg.get("cmd")
+        if op == "stop":
+            self._handle_stop()
+        elif op == "status":
+            self._handle_status()
+        elif op == "mine":
+            self._handle_mine(msg)
+        elif op == "get_stats":
+            self._handle_get_stats()
+        else:
+            self.log.warning(f"Unknown command: {op}")
+
+    def _handle_stop(self) -> None:
+        self.mining_stop.set()
+        self.is_mining = False
+        self.result_queue.put({"event": "stopped"})
+
+    def _handle_status(self) -> None:
+        self.result_queue.put({
+            "event": "status",
+            "mining": self.is_mining,
+            "miner_id": self.miner_id,
+            "miner_type": getattr(self.miner, 'miner_type', 'unknown'),
+            "kind": self.spec.get("kind", "unknown"),
+        })
+
+    def _handle_mine(self, msg: dict) -> None:
+        prev_block = msg.get("block")
+        node_info = msg.get("node_info")
+        requirements = msg.get("requirements")
+        prev_timestamp = msg.get("prev_timestamp", 0)
+
+        if prev_block is None or requirements is None or node_info is None:
+            self.result_queue.put({
+                "event": "error",
+                "message": "Missing block, node_info, or requirements",
+            })
+            return
+
+        self.mining_stop = mp.Event()
+        self.is_mining = True
+
+        try:
+            result = self.miner.mine_block(
+                prev_block, node_info, requirements,
+                prev_timestamp, self.mining_stop,
+            )
+            self.is_mining = False
+            if result is not None:
+                self.result_queue.put(result)
+        except Exception as exc:
+            self.is_mining = False
+            self.log.error(f"Mining error: {exc}")
+            self.result_queue.put({
+                "event": "error",
+                "message": str(exc),
+            })
+
+    def _handle_get_stats(self) -> None:
+        try:
+            stats = self.miner.get_stats()
+            self.result_queue.put({
+                "op": "stats",
+                "data": stats,
+                "id": self.miner_id,
+            })
+        except Exception as exc:
+            self.result_queue.put({
+                "event": "error",
+                "message": f"get_stats failed: {exc}",
+            })
 
 
 class MinerServiceHandle:
@@ -246,8 +270,10 @@ class MinerServiceHandle:
             msg = self.result_queue.get(timeout=5.0)
             if isinstance(msg, dict) and msg.get("op") == "stats":
                 return msg.get("data", {})
+            logger.debug(f"Unexpected stats response from {self.miner_id}: {msg}")
             return {}
         except queue.Empty:
+            logger.debug(f"Stats request timed out for miner {self.miner_id}")
             return {}
 
     def get_status(self) -> Optional[dict]:
@@ -257,8 +283,10 @@ class MinerServiceHandle:
             msg = self.result_queue.get(timeout=2.0)
             if isinstance(msg, dict) and msg.get("event") == "status":
                 return msg
+            logger.debug(f"Unexpected status response from {self.miner_id}: {msg}")
             return None
         except queue.Empty:
+            logger.debug(f"Status request timed out for miner {self.miner_id}")
             return None
 
     def is_alive(self) -> bool:

@@ -25,18 +25,21 @@ class TestNodeLoad:
 
 
 class TestLoadMonitor:
+    # Use high cpu_threshold to avoid flakiness from real system load
+    _HIGH_CPU = 99999.0
+
     def test_not_overloaded_initially(self):
-        m = LoadMonitor(max_connections=50)
+        m = LoadMonitor(max_connections=50, cpu_threshold=self._HIGH_CPU)
         m.update(connection_count=10)
         assert not m.is_overloaded()
 
     def test_overloaded_at_high_watermark(self):
-        m = LoadMonitor(max_connections=50, high_watermark=0.8)
+        m = LoadMonitor(max_connections=50, high_watermark=0.8, cpu_threshold=self._HIGH_CPU)
         m.update(connection_count=40)
         assert m.is_overloaded()
 
     def test_hysteresis_stays_overloaded(self):
-        m = LoadMonitor(max_connections=50, high_watermark=0.8, low_watermark=0.5)
+        m = LoadMonitor(max_connections=50, high_watermark=0.8, low_watermark=0.5, cpu_threshold=self._HIGH_CPU)
         m.update(connection_count=42)
         assert m.is_overloaded()
 
@@ -45,7 +48,7 @@ class TestLoadMonitor:
         assert m.is_overloaded(), "Should stay overloaded until below low_watermark"
 
     def test_hysteresis_clears_at_low_watermark(self):
-        m = LoadMonitor(max_connections=50, high_watermark=0.8, low_watermark=0.5)
+        m = LoadMonitor(max_connections=50, high_watermark=0.8, low_watermark=0.5, cpu_threshold=self._HIGH_CPU)
         m.update(connection_count=42)
         assert m.is_overloaded()
 
@@ -53,7 +56,7 @@ class TestLoadMonitor:
         assert not m.is_overloaded()
 
     def test_connections_to_shed(self):
-        m = LoadMonitor(max_connections=50, high_watermark=0.8, low_watermark=0.5)
+        m = LoadMonitor(max_connections=50, high_watermark=0.8, low_watermark=0.5, cpu_threshold=self._HIGH_CPU)
         m.update(connection_count=45)
         assert m.is_overloaded()
         shed = m.connections_to_shed()
@@ -61,22 +64,22 @@ class TestLoadMonitor:
         assert shed == 20
 
     def test_connections_to_shed_zero_when_not_overloaded(self):
-        m = LoadMonitor(max_connections=50)
+        m = LoadMonitor(max_connections=50, cpu_threshold=self._HIGH_CPU)
         m.update(connection_count=10)
         assert m.connections_to_shed() == 0
 
     def test_should_accept_join_under_capacity(self):
-        m = LoadMonitor(max_connections=50)
+        m = LoadMonitor(max_connections=50, cpu_threshold=self._HIGH_CPU)
         m.update(connection_count=30)
         assert m.should_accept_join()
 
     def test_should_not_accept_join_at_max(self):
-        m = LoadMonitor(max_connections=50)
+        m = LoadMonitor(max_connections=50, cpu_threshold=self._HIGH_CPU)
         m.update(connection_count=50)
         assert not m.should_accept_join()
 
     def test_should_not_accept_join_while_shedding(self):
-        m = LoadMonitor(max_connections=50, high_watermark=0.8, low_watermark=0.5)
+        m = LoadMonitor(max_connections=50, high_watermark=0.8, low_watermark=0.5, cpu_threshold=self._HIGH_CPU)
         m.update(connection_count=42)
         m.is_overloaded()  # trigger shedding
         m.update(connection_count=35)  # still above low watermark
@@ -96,6 +99,6 @@ class TestLoadMonitor:
         assert snap.block_queue_depth == 5
 
     def test_queue_overload(self):
-        m = LoadMonitor(max_connections=50, queue_threshold=100)
+        m = LoadMonitor(max_connections=50, queue_threshold=100, cpu_threshold=self._HIGH_CPU)
         m.update(connection_count=10, block_queue=150)
         assert m.is_overloaded()

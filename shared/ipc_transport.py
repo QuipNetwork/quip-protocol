@@ -118,8 +118,7 @@ class IPCRouter:
         if self._socket is None:
             return None
         try:
-            parts = self._socket.recv_multipart(flags=zmq.NOBLOCK)
-            # For non-async recv with NOBLOCK, we get the result directly
+            parts = await self._socket.recv_multipart(flags=zmq.NOBLOCK)
             identity = parts[0]
             data = parts[-1]
             return identity, data
