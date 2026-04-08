@@ -135,7 +135,8 @@ def connection_process_main(
     log = _setup_child_logging(peer_address)
     log.info(f"Connection process started for {peer_address}")
 
-    loop = asyncio.new_event_loop()
+    from shared.event_loop import create_event_loop
+    loop = create_event_loop()
     asyncio.set_event_loop(loop)
 
     try:
