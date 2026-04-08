@@ -37,8 +37,10 @@ from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import QuicEvent, DatagramFrameReceived, StreamDataReceived, ConnectionTerminated, HandshakeCompleted
 from shared.block_synchronizer import BlockSynchronizer
 from shared.block_store import BlockStore
+from shared.load_monitor import LoadMonitor, NodeLoad
 from shared.process_pool import ProcessPool, ProcessPoolConfig
 from shared.rate_limiter import PeerRateLimiter
+from shared.swim_detector import SwimDetector, PeerState
 from shared.telemetry import TelemetryManager
 from shared.time_utils import (
     utc_timestamp_float, is_clock_synchronized, NETWORK_TIME_SYNC_INTERVAL,
@@ -308,6 +310,20 @@ class NetworkNode(Node):
             tokens_per_second=float(config.get("rate_limit_tps", 10.0)),
             max_burst=int(config.get("rate_limit_burst", 20)),
         )
+
+        # Load monitoring and SWIM failure detection
+        self._load_monitor = LoadMonitor(
+            max_connections=self.max_connections,
+            high_watermark=float(config.get("load_high_watermark", 0.8)),
+            low_watermark=float(config.get("load_low_watermark", 0.5)),
+        )
+        self._swim_detector = SwimDetector(
+            k_probes=int(config.get("swim_k_probes", 3)),
+            suspect_rounds=int(config.get("swim_suspect_rounds", 2)),
+            probe_timeout=float(config.get("swim_probe_timeout", 10.0)),
+        )
+        # Load info received from peers: {peer_address: NodeLoad}
+        self._peer_loads: Dict[str, NodeLoad] = {}
 
         self.gossip_lock = asyncio.Lock()
         # Bounded dedup: maps message_id -> timestamp, max 10k entries
@@ -592,6 +608,7 @@ class NetworkNode(Node):
         self.block_processor_task = asyncio.create_task(self.block_processor_loop())
         self.gossip_processor_task = asyncio.create_task(self.gossip_processor_loop())
         self.server_task = asyncio.create_task(self.server_loop())
+        self.rebalance_task = asyncio.create_task(self.rebalance_loop())
 
         # have we fully synchronized with the network at least one time?
         self._synchronized = threading.Event()
@@ -640,6 +657,8 @@ class NetworkNode(Node):
             self.gossip_processor_task.cancel()
         if self.server_task:
             self.server_task.cancel()
+        if hasattr(self, 'rebalance_task') and self.rebalance_task:
+            self.rebalance_task.cancel()
         self.telemetry.stop()
         if self.reset_timer_task:
             self.reset_timer_task.cancel()
@@ -691,7 +710,7 @@ class NetworkNode(Node):
     ##########################
 
     async def heartbeat_loop(self):
-        """Send heartbeats to all known nodes."""
+        """Send heartbeats to all known nodes with SWIM probing."""
         while self.running:
             try:
                 await asyncio.sleep(self.heartbeat_interval)
@@ -699,17 +718,65 @@ class NetworkNode(Node):
                 # Send heartbeat to all nodes
                 tasks = []
                 async with self.net_lock:
-                    for node_host in list(self.peers.keys()):
-                        task = asyncio.create_task(self.send_heartbeat(node_host))
+                    peer_list = list(self.peers.keys())
+                    for node_host in peer_list:
+                        task = asyncio.create_task(
+                            self._heartbeat_with_swim(node_host)
+                        )
                         tasks.append(task)
 
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
 
+                # SWIM: create and send indirect probes for suspects
+                await self._run_swim_probes(peer_list)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 self.logger.exception("Error in heartbeat loop")
+
+    async def _heartbeat_with_swim(self, node_host: str) -> None:
+        """Send heartbeat and update SWIM detector based on result."""
+        ok = await self.send_heartbeat(node_host)
+        if ok:
+            self._swim_detector.record_heartbeat_success(node_host)
+        else:
+            self._swim_detector.record_heartbeat_failure(node_host)
+            state = self._swim_detector.get_state(node_host)
+            if state == PeerState.SUSPECT:
+                self.logger.debug(
+                    f"SWIM: {node_host} now SUSPECT "
+                    f"(direct heartbeat failed)"
+                )
+
+    async def _run_swim_probes(self, peer_list: list[str]) -> None:
+        """Send SWIM indirect probe requests for all suspect peers."""
+        probe_requests = self._swim_detector.create_probe_requests(
+            peer_list
+        )
+        if not probe_requests:
+            return
+
+        self.logger.debug(
+            f"SWIM: sending {len(probe_requests)} indirect probes"
+        )
+        tasks = []
+        for req in probe_requests:
+            tasks.append(asyncio.create_task(
+                self._send_swim_probe(req)
+            ))
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _send_swim_probe(self, req) -> None:
+        """Send a single SWIM probe request and record the result."""
+        result = await self.node_client.send_probe_request(
+            req.prober, req.target, req.probe_id
+        )
+        if result is not None:
+            self._swim_detector.record_probe_result(
+                req.target, req.prober, result
+            )
 
     async def node_cleanup_loop(self):
         """Remove dead nodes from registry and prune stale state."""
@@ -753,6 +820,124 @@ class NetworkNode(Node):
                 break
             except Exception as e:
                 self.logger.exception("Error in cleanup loop")
+
+    async def rebalance_loop(self):
+        """Periodic load-based connection rebalancing.
+
+        Runs every 60s. If the node is overloaded, sheds excess
+        connections by sending MIGRATE to the least-active peers.
+        Also broadcasts load info to peers and runs SWIM probing.
+        """
+        while self.running:
+            try:
+                await asyncio.sleep(60)
+
+                # Update load monitor with current metrics
+                pool_count = (
+                    self._process_pool.connection_count
+                    if self._process_pool else 0
+                )
+                self._load_monitor.update(
+                    connection_count=pool_count,
+                    block_queue=self.block_processing_queue.qsize()
+                    if hasattr(self, 'block_processing_queue') else 0,
+                    gossip_queue=self.gossip_processing_queue.qsize()
+                    if hasattr(self, 'gossip_processing_queue') else 0,
+                )
+
+                # Broadcast load info to peers
+                load_snapshot = self._load_monitor.snapshot()
+                load_dict = load_snapshot.to_dict()
+                load_dict["sender"] = self.public_host
+                async with self.net_lock:
+                    peer_list = list(self.peers.keys())
+                for peer in peer_list:
+                    try:
+                        await self.node_client.send_load_info(
+                            peer, load_dict
+                        )
+                    except Exception:
+                        pass
+
+                # Check if we need to shed connections
+                if self._load_monitor.is_overloaded():
+                    to_shed = self._load_monitor.connections_to_shed()
+                    if to_shed > 0 and self._process_pool:
+                        await self._shed_connections(to_shed)
+
+                # SWIM: expire stale probes
+                self._swim_detector.expire_probes()
+
+                # SWIM: handle dead peers
+                dead_peers = self._swim_detector.get_dead_peers()
+                for peer in dead_peers:
+                    self.logger.warning(
+                        f"SWIM declared {peer} dead, removing"
+                    )
+                    self._swim_detector.remove_peer(peer)
+                    await self.remove_node(peer)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                self.logger.exception("Error in rebalance loop")
+
+    async def _shed_connections(self, count: int) -> None:
+        """Shed excess connections by sending MIGRATE to least-active peers."""
+        if not self._process_pool:
+            return
+
+        targets = self._process_pool.get_least_active_peers(count)
+        if not targets:
+            return
+
+        # Find least-loaded peers to suggest as alternatives
+        alternatives = self._get_least_loaded_peers(
+            exclude=set(targets), count=5
+        )
+
+        self.logger.info(
+            f"Shedding {len(targets)} connections "
+            f"(suggesting {len(alternatives)} alternatives)"
+        )
+
+        for peer in targets:
+            try:
+                await self.node_client.send_migrate(
+                    peer, alternatives, reason="overloaded"
+                )
+            except Exception as exc:
+                self.logger.debug(f"MIGRATE to {peer} failed: {exc}")
+            # Kill the connection process regardless of MIGRATE success
+            self._process_pool.kill(peer)
+
+    def _get_least_loaded_peers(
+        self, exclude: set, count: int
+    ) -> list[str]:
+        """Select the least-loaded known peers as alternatives.
+
+        Uses peer load info if available, otherwise falls back to
+        random selection from the peer list.
+        """
+        # Sort peers by load (connection utilization)
+        candidates = []
+        async_peers = list(self.peers.keys())
+        for peer in async_peers:
+            if peer in exclude:
+                continue
+            load = self._peer_loads.get(peer)
+            if load:
+                util = (
+                    load.connection_count / load.max_connections
+                    if load.max_connections > 0 else 0.0
+                )
+                candidates.append((peer, util))
+            else:
+                # Unknown load — assume moderate utilization
+                candidates.append((peer, 0.5))
+
+        candidates.sort(key=lambda x: x[1])
+        return [p for p, _ in candidates[:count]]
 
     async def server_loop(self):
         """Main server loop."""
@@ -1666,6 +1851,8 @@ class NetworkNode(Node):
                 self._has_ever_had_peers = True
                 self.logger.info(f"New peer discovered: {host}: {info.miner_id} ({info.ecdsa_public_key.hex()[:8]})")
                 self._on_new_node(host, info)
+                if hasattr(self, '_swim_detector'):
+                    self._swim_detector.add_peer(host)
 
                 # Broadcast new node to all other nodes
                 asyncio.create_task(self.gossip_new_node(host, info))
@@ -1692,6 +1879,10 @@ class NetworkNode(Node):
                 # Update node client to remove peer
                 if self.node_client:
                     await self.node_client.remove_peer(host)
+                if hasattr(self, '_swim_detector'):
+                    self._swim_detector.remove_peer(host)
+                if hasattr(self, '_peer_loads'):
+                    self._peer_loads.pop(host, None)
 
     async def send_heartbeat(self, node_host: str) -> bool:
         """Send heartbeat to a specific node.
@@ -1974,6 +2165,13 @@ class NetworkNode(Node):
                 return await self._quic_handle_block_header_request(msg)
             elif msg.msg_type == QuicMessageType.SOLVE_REQUEST:
                 return await self._quic_handle_solve(msg)
+            # Phase 2: rebalancing + SWIM message handlers
+            elif msg.msg_type == QuicMessageType.MIGRATE:
+                return await self._quic_handle_migrate(msg)
+            elif msg.msg_type == QuicMessageType.PROBE_REQUEST:
+                return await self._quic_handle_probe_request(msg)
+            elif msg.msg_type == QuicMessageType.LOAD_INFO:
+                return await self._quic_handle_load_info(msg)
             else:
                 self.logger.warning(f"Unknown message type: {msg.msg_type}")
                 return msg.create_error_response(f"Unknown message type: {msg.msg_type}")
@@ -1981,6 +2179,80 @@ class NetworkNode(Node):
         except Exception as e:
             self.logger.exception(f"Error handling {msg.msg_type.name}: {e}")
             return msg.create_error_response(str(e))
+
+    async def _quic_handle_migrate(self, msg: QuicMessage) -> QuicMessage:
+        """Handle MIGRATE: remote node is asking us to disconnect and reconnect elsewhere."""
+        try:
+            data = json.loads(msg.payload.decode('utf-8'))
+            reason = data.get("reason", "unknown")
+            alternatives = data.get("alternatives", [])
+            self.logger.info(
+                f"Received MIGRATE (reason={reason}), "
+                f"{len(alternatives)} alternatives suggested"
+            )
+            # TODO(Phase 2 follow-up): actually reconnect to alternatives.
+            # For now, acknowledge the MIGRATE so the sender can clean up.
+            return QuicMessage(
+                msg_type=QuicMessageType.MIGRATE_ACK,
+                request_id=msg.request_id,
+                payload=json.dumps({"status": "ok"}).encode('utf-8'),
+                protocol_version=msg.protocol_version,
+            )
+        except Exception as exc:
+            return msg.create_error_response(str(exc))
+
+    async def _quic_handle_probe_request(self, msg: QuicMessage) -> QuicMessage:
+        """Handle SWIM PROBE_REQUEST: check if a target peer is alive on behalf of requester."""
+        try:
+            data = json.loads(msg.payload.decode('utf-8'))
+            target = data.get("target", "")
+            probe_id = data.get("probe_id", "")
+
+            if not target:
+                return msg.create_error_response("Missing target in probe request")
+
+            # Try to reach the target via heartbeat
+            alive = await self.node_client.send_heartbeat(
+                target, self.public_host, self.info()
+            )
+            self.logger.debug(
+                f"SWIM probe {probe_id}: {target} "
+                f"{'alive' if alive else 'unreachable'}"
+            )
+            return QuicMessage(
+                msg_type=QuicMessageType.PROBE_RESPONSE,
+                request_id=msg.request_id,
+                payload=json.dumps({
+                    "target": target,
+                    "probe_id": probe_id,
+                    "alive": alive,
+                }).encode('utf-8'),
+                protocol_version=msg.protocol_version,
+            )
+        except Exception as exc:
+            return msg.create_error_response(str(exc))
+
+    async def _quic_handle_load_info(self, msg: QuicMessage) -> QuicMessage:
+        """Handle LOAD_INFO: store peer's load metrics."""
+        try:
+            data = json.loads(msg.payload.decode('utf-8'))
+            peer_load = NodeLoad.from_dict(data)
+            # Identify sender from the load data or protocol
+            # We store by any identifying info available
+            # The load info doesn't contain the sender address, so
+            # we use a placeholder — the real caller should include it
+            # For now, just store it if there's a sender field
+            sender = data.get("sender", "")
+            if sender:
+                self._peer_loads[sender] = peer_load
+            return QuicMessage(
+                msg_type=QuicMessageType.LOAD_INFO_RESPONSE,
+                request_id=msg.request_id,
+                payload=b'ok',
+                protocol_version=msg.protocol_version,
+            )
+        except Exception as exc:
+            return msg.create_error_response(str(exc))
 
     async def _can_reach_address(self, address: str, timeout: float) -> bool:
         """Check if we can reach a UDP address (for QUIC connectivity).
@@ -2123,17 +2395,23 @@ class NetworkNode(Node):
     async def _quic_handle_join(self, msg: QuicMessage, protocol: Any) -> QuicMessage:
         """Handle join request from a new node."""
         # Check connection capacity before processing
-        if self._process_pool is not None and self._process_pool.is_at_capacity:
-            # Suggest alternative peers when at capacity
-            async with self.net_lock:
-                alt_peers = list(self.peers.keys())[:10]
+        if not self._load_monitor.should_accept_join():
+            # Suggest least-loaded alternative peers when at capacity
+            alt_peers = self._get_least_loaded_peers(
+                exclude=set(), count=10
+            )
             self.logger.info(
-                f"At connection capacity ({self.max_connections}), "
+                f"Rejecting JOIN (overloaded or at capacity), "
                 f"suggesting {len(alt_peers)} alternative peers"
             )
+            async with self.net_lock:
+                peers_snapshot = {
+                    h: self.peers[h].to_json()
+                    for h in alt_peers if h in self.peers
+                }
             response_data = json.dumps({
                 "status": "at_capacity",
-                "peers": {h: self.peers[h].to_json() for h in alt_peers},
+                "peers": peers_snapshot,
             })
             return msg.create_response(response_data.encode('utf-8'))
 
