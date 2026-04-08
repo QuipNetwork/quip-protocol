@@ -85,43 +85,34 @@ def sunlet_formula(k: int) -> TuttePolynomial:
     return TuttePolynomial.x(k) * cycle_formula(k)
 
 
-def helm_formula(k: int) -> TuttePolynomial:
-    """T(Helm_k) = x^k · T(W_k).
-
-    Helm = wheel W_k with pendant at each rim vertex. Each pendant
-    contributes a bridge factor of x.
-
-    Complexity: O(k) polynomial multiplications (for wheel recurrence).
-
-    Source: Wheel formula from [3] + bridge factorization [1].
-    """
-    return TuttePolynomial.x(k) * wheel_recurrence(k)
+def helm_formula(k: int) -> Optional[TuttePolynomial]:
+    """T(Helm_k) = x^k · T(W_k). Returns None if wheel bases unavailable."""
+    w = wheel_recurrence(k)
+    if w is None:
+        return None
+    return TuttePolynomial.x(k) * w
 
 
 # =============================================================================
 # TIER 1 — RECURRENCE-BASED (still O(k) after detection)
 # =============================================================================
 
-def wheel_recurrence(k: int) -> TuttePolynomial:
+def wheel_recurrence(k: int) -> Optional[TuttePolynomial]:
     """T(W_k) for wheel with k rim vertices (k+1 total vertices, 2k edges).
 
-    Uses order-3 recurrence:
-        T(W_n) = (x+y+2)·T(W_{n-1}) - (x+1)(y+1)·T(W_{n-2}) + xy·T(W_{n-3})
-
-    Base cases verified against SynthesisEngine + Kirchhoff T(1,1).
-
-    Complexity: O(k) polynomial multiplications.
-
-    Source: Brennan, Mansour, Mphako-Banda [3].
+    Returns None if base cases are not available in the rainbow table.
     """
     if k < 3:
         raise ValueError(f"Wheel requires k >= 3 rim vertices, got {k}")
 
-    # Base cases: W_3 (k=3), W_4 (k=4), W_5 (k=5)
-    if k <= 5:
-        return WHEEL_BASES[k - 3]
+    bases = WHEEL_BASES()
+    if bases is None:
+        return None
 
-    prev3, prev2, prev1 = WHEEL_BASES
+    if k <= 5:
+        return bases[k - 3]
+
+    prev3, prev2, prev1 = bases
     for _ in range(6, k + 1):
         curr = WHEEL_A * prev1 - WHEEL_B * prev2 + WHEEL_C * prev3
         prev3, prev2, prev1 = prev2, prev1, curr
@@ -129,26 +120,19 @@ def wheel_recurrence(k: int) -> TuttePolynomial:
     return prev1
 
 
-def fan_recurrence(k: int) -> TuttePolynomial:
-    """T(F_k) for fan with k path vertices (k+1 total, 2k-1 edges).
-
-    Uses order-2 recurrence:
-        T(F_n) = (x+y+1)·T(F_{n-1}) - xy·T(F_{n-2})
-
-    Base cases verified against SynthesisEngine + Kirchhoff T(1,1).
-
-    Complexity: O(k) polynomial multiplications.
-
-    Source: Brennan, Mansour, Mphako-Banda [3].
-    """
+def fan_recurrence(k: int) -> Optional[TuttePolynomial]:
+    """T(F_k) for fan. Returns None if base cases unavailable."""
     if k < 1:
         raise ValueError(f"Fan requires k >= 1, got {k}")
 
-    # Base cases: F_1 (k=1), F_2 (k=2)
-    if k <= 2:
-        return FAN_BASES[k - 1]
+    bases = FAN_BASES()
+    if bases is None:
+        return None
 
-    prev2, prev1 = FAN_BASES
+    if k <= 2:
+        return bases[k - 1]
+
+    prev2, prev1 = bases
     for _ in range(3, k + 1):
         curr = FAN_A * prev1 - FAN_B * prev2
         prev2, prev1 = prev1, curr
@@ -156,26 +140,19 @@ def fan_recurrence(k: int) -> TuttePolynomial:
     return prev1
 
 
-def ladder_recurrence(k: int) -> TuttePolynomial:
-    """T(L_k) for ladder P_k × P_2 (2k vertices, 3k-2 edges).
-
-    Uses order-2 recurrence:
-        T(L_n) = (x² + x + y + 1)·T(L_{n-1}) - x²y·T(L_{n-2})
-
-    Base cases verified against SynthesisEngine + Kirchhoff T(1,1).
-
-    Complexity: O(k) polynomial multiplications.
-
-    Source: Biggs, Damerell, Sands [4]; Chang and Shrock [5].
-    """
+def ladder_recurrence(k: int) -> Optional[TuttePolynomial]:
+    """T(L_k) for ladder P_k × P_2. Returns None if base cases unavailable."""
     if k < 2:
         raise ValueError(f"Ladder requires k >= 2, got {k}")
 
-    # Base cases: L_2 (k=2), L_3 (k=3)
-    if k <= 3:
-        return LADDER_BASES[k - 2]
+    bases = LADDER_BASES()
+    if bases is None:
+        return None
 
-    prev2, prev1 = LADDER_BASES
+    if k <= 3:
+        return bases[k - 2]
+
+    prev2, prev1 = bases
     for _ in range(4, k + 1):
         curr = LADDER_A * prev1 - LADDER_B * prev2
         prev2, prev1 = prev1, curr
@@ -183,26 +160,19 @@ def ladder_recurrence(k: int) -> TuttePolynomial:
     return prev1
 
 
-def book_recurrence(k: int) -> TuttePolynomial:
-    """T(Book_k) for k triangles sharing a common edge (k+2 vertices, 2k+1 edges).
-
-    Uses order-2 recurrence:
-        T(B_k) = (2x + y + 1)·T(B_{k-1}) - (x+1)(x+y)·T(B_{k-2})
-
-    Base cases verified against SynthesisEngine + Kirchhoff T(1,1).
-
-    Complexity: O(k) polynomial multiplications.
-
-    Source: Folklore, recurrence derived via deletion-contraction.
-    """
+def book_recurrence(k: int) -> Optional[TuttePolynomial]:
+    """T(Book_k) for k triangles sharing an edge. Returns None if base cases unavailable."""
     if k < 1:
         raise ValueError(f"Book requires k >= 1, got {k}")
 
-    # Base cases: B_1 (k=1), B_2 (k=2)
-    if k <= 2:
-        return BOOK_BASES[k - 1]
+    bases = BOOK_BASES()
+    if bases is None:
+        return None
 
-    prev2, prev1 = BOOK_BASES
+    if k <= 2:
+        return bases[k - 1]
+
+    prev2, prev1 = bases
     for _ in range(3, k + 1):
         curr = BOOK_A * prev1 - BOOK_B * prev2
         prev2, prev1 = prev1, curr
@@ -210,29 +180,19 @@ def book_recurrence(k: int) -> TuttePolynomial:
     return prev1
 
 
-def gear_recurrence(k: int) -> TuttePolynomial:
-    """T(Gear_k) for gear graph: wheel W_k with each rim edge subdivided.
-
-    2k+1 vertices, 3k edges. Hub has degree k, k rim vertices have degree 3,
-    k subdivision vertices have degree 2.
-
-    Uses order-3 recurrence:
-        T(G_n) = (x²+x+y+2)·T(G_{n-1}) - (x²y+x²+x+y+1)·T(G_{n-2}) + x²y·T(G_{n-3})
-
-    Base cases derived from MathWorld closed-form eigenvalue formula [15].
-
-    Complexity: O(k) polynomial multiplications.
-
-    Source: Weisstein, MathWorld [15].
-    """
+def gear_recurrence(k: int) -> Optional[TuttePolynomial]:
+    """T(Gear_k) for gear graph. Returns None if base cases unavailable."""
     if k < 3:
         raise ValueError(f"Gear requires k >= 3 rim vertices, got {k}")
 
-    # Base cases: G_3 (k=3), G_4 (k=4), G_5 (k=5)
-    if k <= 5:
-        return GEAR_BASES[k - 3]
+    bases = GEAR_BASES()
+    if bases is None:
+        return None
 
-    prev3, prev2, prev1 = GEAR_BASES
+    if k <= 5:
+        return bases[k - 3]
+
+    prev3, prev2, prev1 = bases
     for _ in range(6, k + 1):
         curr = GEAR_A * prev1 - GEAR_B * prev2 + GEAR_C * prev3
         prev3, prev2, prev1 = prev2, prev1, curr
@@ -240,57 +200,35 @@ def gear_recurrence(k: int) -> TuttePolynomial:
     return prev1
 
 
-def prism_recurrence(k: int) -> TuttePolynomial:
-    """T(CL_k) for prism (circular ladder) C_k × K_2 (2k vertices, 3k edges).
-
-    3-regular bipartite graph. Two parallel k-cycles connected by k rungs.
-
-    Uses order-6 recurrence derived from transfer matrix eigenvalues:
-        Characteristic polynomial (in Tutte variables):
-        (z-1)(z-x)(z²-(x+y+2)z+xy)(z²-(x²+x+y+1)z+x²y)
-
-    Base cases derived from Shrock [8] eigenvalue decomposition.
-
-    Complexity: O(k) polynomial multiplications.
-
-    Source: Shrock [8]; Chang and Shrock [5].
-    """
+def prism_recurrence(k: int) -> Optional[TuttePolynomial]:
+    """T(CL_k) for prism (circular ladder). Returns None if base cases unavailable."""
     if k < 3:
         raise ValueError(f"Prism requires k >= 3, got {k}")
 
-    # Base cases: CL_3 (k=3) through CL_8 (k=8)
-    if k <= 8:
-        return PRISM_BASES[k - 3]
+    bases = PRISM_BASES()
+    if bases is None:
+        return None
 
-    cl3, cl4, cl5, cl6, cl7, cl8 = PRISM_BASES
+    if k <= 8:
+        return bases[k - 3]
+
+    cl3, cl4, cl5, cl6, cl7, cl8 = bases
     return apply_order6_recurrence(cl3, cl4, cl5, cl6, cl7, cl8, 9, k)
 
 
-def mobius_recurrence(k: int) -> TuttePolynomial:
-    """T(M_k) for Möbius ladder (Möbius-Kantor graph generalization).
-
-    2k vertices, 3k edges. 3-regular, non-bipartite.
-    Same as prism but with one twisted rung (cross-connection).
-
-    Uses the same order-6 characteristic polynomial as prism:
-        (z-1)(z-x)(z²-(x+y+2)z+xy)(z²-(x²+x+y+1)z+x²y)
-
-    Different base cases due to different boundary conditions.
-
-    Base cases derived from Shrock [8] eigenvalue decomposition.
-
-    Complexity: O(k) polynomial multiplications.
-
-    Source: Shrock [8]; Chang and Shrock [5].
-    """
+def mobius_recurrence(k: int) -> Optional[TuttePolynomial]:
+    """T(M_k) for Möbius ladder. Returns None if base cases unavailable."""
     if k < 3:
         raise ValueError(f"Möbius ladder requires k >= 3, got {k}")
 
-    # Base cases: M_3 (k=3) through M_8 (k=8)
-    if k <= 8:
-        return MOBIUS_BASES[k - 3]
+    bases = MOBIUS_BASES()
+    if bases is None:
+        return None
 
-    m3, m4, m5, m6, m7, m8 = MOBIUS_BASES
+    if k <= 8:
+        return bases[k - 3]
+
+    m3, m4, m5, m6, m7, m8 = bases
     return apply_order6_recurrence(m3, m4, m5, m6, m7, m8, 9, k)
 
 

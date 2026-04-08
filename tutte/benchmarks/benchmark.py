@@ -36,6 +36,40 @@ from tutte.validation import count_spanning_trees_kirchhoff
 # Named graph set (merged with atlas below)
 # ---------------------------------------------------------------------------
 
+def _build_book(k):
+    """Book graph: k triangles sharing edge (0, 1)."""
+    G = nx.Graph()
+    G.add_edge(0, 1)
+    for i in range(k):
+        v = i + 2
+        G.add_edge(0, v)
+        G.add_edge(1, v)
+    return G
+
+
+def _gear(k):
+    """Gear graph: hub + k rim vertices + k subdivision vertices."""
+    G = nx.Graph()
+    for i in range(k):
+        G.add_edge(0, i + 1)
+        G.add_edge(i + 1, k + 1 + i)
+        G.add_edge(k + 1 + i, (i + 1) % k + 1)
+    return Graph.from_networkx(G)
+
+
+def _prism(k):
+    """Prism graph C_k × K_2 (circular ladder)."""
+    return Graph.from_networkx(nx.circular_ladder_graph(k))
+
+
+def _mobius(k):
+    """Möbius ladder: 2k-cycle with k rungs connecting v_i to v_{i+k}."""
+    G = nx.cycle_graph(2 * k)
+    for i in range(k):
+        G.add_edge(i, i + k)
+    return Graph.from_networkx(G)
+
+
 NAMED_GRAPHS = [
     ("K_3", lambda: complete_graph(3)),
     ("K_4", lambda: complete_graph(4)),
@@ -50,6 +84,34 @@ NAMED_GRAPHS = [
     ("Petersen", lambda: petersen_graph()),
     ("Grid_3x3", lambda: grid_graph(3, 3)),
     ("Grid_4x4", lambda: grid_graph(4, 4)),
+
+    # Family recognition recurrence seeds
+    # Small seeds that atlas stores under atlas_* names — add with explicit names
+    ("K_2", lambda: path_graph(2)),               # F_1 = single edge
+    ("C_4", lambda: Graph.from_networkx(nx.cycle_graph(4))),   # L_2
+    ("W_4", lambda: wheel_graph(4)),
+    ("B_2", lambda: Graph.from_networkx(_build_book(2))),      # Book k=2
+    ("Gear_3", lambda: _gear(3)),
+    ("Grid_2x3", lambda: grid_graph(2, 3)),       # L_3
+    # Larger seeds (n > 7, not in atlas)
+    ("Gear_4", lambda: _gear(4)),
+    ("Gear_5", lambda: _gear(5)),
+    # Prism seeds: CL_3..CL_8
+    ("Prism_3", lambda: _prism(3)),
+    ("Prism_4", lambda: _prism(4)),
+    ("Prism_5", lambda: _prism(5)),
+    ("Prism_6", lambda: _prism(6)),
+    ("Prism_7", lambda: _prism(7)),
+    ("Prism_8", lambda: _prism(8)),
+    # Möbius seeds: M_3..M_8
+    ("Mobius_3", lambda: _mobius(3)),
+    ("Mobius_4", lambda: _mobius(4)),
+    ("Mobius_5", lambda: _mobius(5)),
+    ("Mobius_6", lambda: _mobius(6)),
+    ("Mobius_7", lambda: _mobius(7)),
+    ("Mobius_8", lambda: _mobius(8)),
+    # K_{3,3} (= M_3, already in atlas as 6n/9e, but named for clarity)
+    ("K_{3,3}", lambda: Graph.from_networkx(nx.complete_bipartite_graph(3, 3))),
 ]
 
 
@@ -144,7 +206,8 @@ def _build_graph_list():
     # Large D-Wave graphs: no deduplication needed (unique topologies)
     for name, builder in _try_dwave_graphs():
         g = builder()
-        deduped.append((name, g))
+        if g is not None:
+            deduped.append((name, g))
 
     deduped.sort(key=lambda x: (x[1].edge_count(), x[1].node_count(), x[0]))
     return deduped

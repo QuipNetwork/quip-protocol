@@ -1,7 +1,18 @@
-"""Recurrence coefficients and base cases for graph family Tutte polynomial formulas.
+"""Recurrence coefficients and base-case loaders for graph family Tutte polynomial formulas.
 
-All values are TuttePolynomial constants computed once at import time.
-Base cases are verified against SynthesisEngine + Kirchhoff T(1,1).
+Recurrence coefficients are mathematical constants from published papers — they
+are hardcoded here because they do not correspond to any graph's polynomial.
+
+Base cases (seed polynomials for each recurrence) are loaded from the rainbow
+table at first use. If the rainbow table is empty (fresh clone, no benchmarks
+run yet), the base cases are computed on demand via the synthesis engine and
+cached for subsequent calls.
+
+To populate the rainbow table with all seed graphs, run:
+    make benchmark
+
+The benchmark includes all seed graphs (Gear_4/5, Prism_4-8, Mobius_4-8, etc.)
+in NAMED_GRAPHS, so they are computed and stored automatically.
 
 References:
     [1] Tutte (1947) — foundational deletion-contraction, bridge/cut-vertex factorization
@@ -14,103 +25,44 @@ References:
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 from ..polynomial import TuttePolynomial
 
+
 # =============================================================================
+# RECURRENCE COEFFICIENTS (mathematical constants, NOT graph polynomials)
+# =============================================================================
+
 # WHEEL — order-3 recurrence [3]
 # T(W_n) = (x+y+2)·T(W_{n-1}) - (x+1)(y+1)·T(W_{n-2}) + xy·T(W_{n-3})
-# =============================================================================
 WHEEL_A = TuttePolynomial.from_coefficients({(1, 0): 1, (0, 1): 1, (0, 0): 2})
 WHEEL_B = TuttePolynomial.from_coefficients({
     (1, 1): 1, (1, 0): 1, (0, 1): 1, (0, 0): 1,
 })
 WHEEL_C = TuttePolynomial.from_coefficients({(1, 1): 1})
 
-# W_3 = K_4: T(1,1) = 16
-WHEEL_W3 = TuttePolynomial.from_coefficients({
-    (0, 1): 2, (0, 2): 3, (0, 3): 1,
-    (1, 0): 2, (1, 1): 4,
-    (2, 0): 3, (3, 0): 1,
-})
-# W_4: 5 vertices, 8 edges. T(1,1) = 45
-WHEEL_W4 = TuttePolynomial.from_coefficients({
-    (0, 1): 3, (0, 2): 6, (0, 3): 4, (0, 4): 1,
-    (1, 0): 3, (1, 1): 9, (1, 2): 4,
-    (2, 0): 6, (2, 1): 4,
-    (3, 0): 4, (4, 0): 1,
-})
-# W_5: 6 vertices, 10 edges. T(1,1) = 121
-WHEEL_W5 = TuttePolynomial.from_coefficients({
-    (0, 1): 4, (0, 2): 10, (0, 3): 10, (0, 4): 5, (0, 5): 1,
-    (1, 0): 4, (1, 1): 16, (1, 2): 15, (1, 3): 5,
-    (2, 0): 10, (2, 1): 15, (2, 2): 5,
-    (3, 0): 10, (3, 1): 5,
-    (4, 0): 5, (5, 0): 1,
-})
-WHEEL_BASES: Tuple[TuttePolynomial, ...] = (WHEEL_W3, WHEEL_W4, WHEEL_W5)
-
-# =============================================================================
 # FAN — order-2 recurrence [3]
 # T(F_n) = (x+y+1)·T(F_{n-1}) - xy·T(F_{n-2})
-# =============================================================================
 FAN_A = TuttePolynomial.from_coefficients({(1, 0): 1, (0, 1): 1, (0, 0): 1})
 FAN_B = TuttePolynomial.from_coefficients({(1, 1): 1})
 
-# F_1 = K_2: T(1,1) = 1
-FAN_F1 = TuttePolynomial.from_coefficients({(1, 0): 1})
-# F_2 = K_3: T(1,1) = 3
-FAN_F2 = TuttePolynomial.from_coefficients({(2, 0): 1, (1, 0): 1, (0, 1): 1})
-FAN_BASES: Tuple[TuttePolynomial, ...] = (FAN_F1, FAN_F2)
-
-# =============================================================================
 # LADDER — order-2 recurrence [4], [5]
 # T(L_n) = (x²+x+y+1)·T(L_{n-1}) - x²y·T(L_{n-2})
-# =============================================================================
 LADDER_A = TuttePolynomial.from_coefficients({
     (2, 0): 1, (1, 0): 1, (0, 1): 1, (0, 0): 1,
 })
 LADDER_B = TuttePolynomial.from_coefficients({(2, 1): 1})
 
-# L_2 = C_4: T(1,1) = 4
-LADDER_L2 = TuttePolynomial.from_coefficients({
-    (3, 0): 1, (2, 0): 1, (1, 0): 1, (0, 1): 1,
-})
-# L_3: 6 vertices, 7 edges. T(1,1) = 15
-LADDER_L3 = TuttePolynomial.from_coefficients({
-    (0, 1): 1, (0, 2): 1,
-    (1, 0): 1, (1, 1): 2,
-    (2, 0): 2, (2, 1): 2,
-    (3, 0): 3,
-    (4, 0): 2, (5, 0): 1,
-})
-LADDER_BASES: Tuple[TuttePolynomial, ...] = (LADDER_L2, LADDER_L3)
-
-# =============================================================================
 # BOOK — order-2 recurrence (folklore)
 # T(B_k) = (2x+y+1)·T(B_{k-1}) - (x+1)(x+y)·T(B_{k-2})
-# (x+1)(x+y) = x²+xy+x+y
-# =============================================================================
 BOOK_A = TuttePolynomial.from_coefficients({(1, 0): 2, (0, 1): 1, (0, 0): 1})
 BOOK_B = TuttePolynomial.from_coefficients({
     (2, 0): 1, (1, 1): 1, (1, 0): 1, (0, 1): 1,
 })
 
-# B_1 = K_3: T(1,1) = 3
-BOOK_B1 = TuttePolynomial.from_coefficients({(0, 1): 1, (1, 0): 1, (2, 0): 1})
-# B_2: 4 vertices, 5 edges. T(1,1) = 8
-BOOK_B2 = TuttePolynomial.from_coefficients({
-    (0, 1): 1, (0, 2): 1,
-    (1, 0): 1, (1, 1): 2,
-    (2, 0): 2, (3, 0): 1,
-})
-BOOK_BASES: Tuple[TuttePolynomial, ...] = (BOOK_B1, BOOK_B2)
-
-# =============================================================================
 # GEAR — order-3 recurrence [15]
 # T(G_n) = (x²+x+y+2)·T(G_{n-1}) - (x²y+x²+x+y+1)·T(G_{n-2}) + x²y·T(G_{n-3})
-# =============================================================================
 GEAR_A = TuttePolynomial.from_coefficients({
     (2, 0): 1, (1, 0): 1, (0, 1): 1, (0, 0): 2,
 })
@@ -119,242 +71,189 @@ GEAR_B = TuttePolynomial.from_coefficients({
 })
 GEAR_C = TuttePolynomial.from_coefficients({(2, 1): 1})
 
-# G_3: 7 vertices, 9 edges. T(1,1) = 50
-GEAR_G3 = TuttePolynomial.from_coefficients({
-    (0, 1): 2, (0, 2): 3, (0, 3): 1,
-    (1, 0): 2, (1, 1): 7, (1, 2): 3,
-    (2, 0): 6, (2, 1): 6,
-    (3, 0): 7, (3, 1): 3,
-    (4, 0): 6, (5, 0): 3, (6, 0): 1,
-})
-# G_4: 9 vertices, 12 edges. T(1,1) = 192
-GEAR_G4 = TuttePolynomial.from_coefficients({
-    (0, 1): 3, (0, 2): 6, (0, 3): 4, (0, 4): 1,
-    (1, 0): 3, (1, 1): 13, (1, 2): 12, (1, 3): 4,
-    (2, 0): 10, (2, 1): 20, (2, 2): 10,
-    (3, 0): 16, (3, 1): 20, (3, 2): 4,
-    (4, 0): 19, (4, 1): 12,
-    (5, 0): 16, (5, 1): 4,
-    (6, 0): 10, (7, 0): 4, (8, 0): 1,
-})
-# G_5: 11 vertices, 15 edges. T(1,1) = 722
-GEAR_G5 = TuttePolynomial.from_coefficients({
-    (0, 1): 4, (0, 2): 10, (0, 3): 10, (0, 4): 5, (0, 5): 1,
-    (1, 0): 4, (1, 1): 21, (1, 2): 30, (1, 3): 20, (1, 4): 5,
-    (2, 0): 15, (2, 1): 45, (2, 2): 45, (2, 3): 15,
-    (3, 0): 30, (3, 1): 65, (3, 2): 40, (3, 3): 5,
-    (4, 0): 45, (4, 1): 65, (4, 2): 20,
-    (5, 0): 51, (5, 1): 45, (5, 2): 5,
-    (6, 0): 45, (6, 1): 20,
-    (7, 0): 30, (7, 1): 5,
-    (8, 0): 15, (9, 0): 5, (10, 0): 1,
-})
-GEAR_BASES: Tuple[TuttePolynomial, ...] = (GEAR_G3, GEAR_G4, GEAR_G5)
-
-# =============================================================================
 # PRISM / MÖBIUS — order-6 recurrence [5], [8]
 # Characteristic polynomial:
 #   (z-1)(z-x)(z²-(x+y+2)z+xy)(z²-(x²+x+y+1)z+x²y)
-# =============================================================================
-
-# α₁ = x²+3x+2y+4
 ORDER6_A1 = TuttePolynomial.from_coefficients({
     (2, 0): 1, (1, 0): 3, (0, 1): 2, (0, 0): 4,
 })
-# α₂ = -(2x³+2x²y+6x²+5xy+9x+y²+5y+5)
 ORDER6_A2 = TuttePolynomial.from_coefficients({
     (3, 0): -2, (2, 1): -2, (2, 0): -6, (1, 1): -5, (1, 0): -9,
     (0, 2): -1, (0, 1): -5, (0, 0): -5,
 })
-# α₃ = x⁴+4x³y+5x³+x²y²+8x²y+8x²+2xy²+9xy+8x+y²+3y+2
 ORDER6_A3 = TuttePolynomial.from_coefficients({
     (4, 0): 1, (3, 1): 4, (3, 0): 5, (2, 2): 1, (2, 1): 8, (2, 0): 8,
     (1, 2): 2, (1, 1): 9, (1, 0): 8, (0, 2): 1, (0, 1): 3, (0, 0): 2,
 })
-# α₄ = -(2x⁴y+x⁴+2x³y²+7x³y+3x³+2x²y²+7x²y+3x²+2xy²+4xy+2x)
 ORDER6_A4 = TuttePolynomial.from_coefficients({
     (4, 1): -2, (4, 0): -1, (3, 2): -2, (3, 1): -7, (3, 0): -3,
     (2, 2): -2, (2, 1): -7, (2, 0): -3, (1, 2): -2, (1, 1): -4, (1, 0): -2,
 })
-# α₅ = x⁴y²+2x⁴y+2x³y²+3x³y+x²y²+x²y
 ORDER6_A5 = TuttePolynomial.from_coefficients({
     (4, 2): 1, (4, 1): 2, (3, 2): 2, (3, 1): 3, (2, 2): 1, (2, 1): 1,
 })
-# α₆ = -x⁴y²
 ORDER6_A6 = TuttePolynomial.from_coefficients({(4, 2): -1})
 
-# --- Prism base cases ---
-# CL_3: 6 vertices, 9 edges. T(1,1) = 75
-PRISM_CL3 = TuttePolynomial.from_coefficients({
-    (0, 1): 4, (0, 2): 8, (0, 3): 5, (0, 4): 1,
-    (1, 0): 4, (1, 1): 13, (1, 2): 7,
-    (2, 0): 9, (2, 1): 9,
-    (3, 0): 8, (3, 1): 2,
-    (4, 0): 4, (5, 0): 1,
-})
-# CL_4: 8 vertices, 12 edges. T(1,1) = 384
-PRISM_CL4 = TuttePolynomial.from_coefficients({
-    (0, 1): 11, (0, 2): 25, (0, 3): 20, (0, 4): 7, (0, 5): 1,
-    (1, 0): 11, (1, 1): 46, (1, 2): 39, (1, 3): 8,
-    (2, 0): 32, (2, 1): 52, (2, 2): 12,
-    (3, 0): 40, (3, 1): 24,
-    (4, 0): 29, (4, 1): 6,
-    (5, 0): 15, (6, 0): 5, (7, 0): 1,
-})
-# CL_5: 10 vertices, 15 edges. T(1,1) = 1805
-PRISM_CL5 = TuttePolynomial.from_coefficients({
-    (0, 1): 26, (0, 2): 69, (0, 3): 70, (0, 4): 35, (0, 5): 9, (0, 6): 1,
-    (1, 0): 26, (1, 1): 133, (1, 2): 161, (1, 3): 70, (1, 4): 10,
-    (2, 0): 90, (2, 1): 210, (2, 2): 115, (2, 3): 15,
-    (3, 0): 140, (3, 1): 165, (3, 2): 35,
-    (4, 0): 135, (4, 1): 80, (4, 2): 5,
-    (5, 0): 94, (5, 1): 27,
-    (6, 0): 51, (6, 1): 5,
-    (7, 0): 21, (8, 0): 6, (9, 0): 1,
-})
-# CL_6: 12 vertices, 18 edges. T(1,1) = 8100
-PRISM_CL6 = TuttePolynomial.from_coefficients({
-    (0, 1): 57, (0, 2): 176, (0, 3): 220, (0, 4): 145, (0, 5): 54,
-    (0, 6): 11, (0, 7): 1,
-    (1, 0): 57, (1, 1): 346, (1, 2): 550, (1, 3): 368, (1, 4): 111, (1, 5): 12,
-    (2, 0): 227, (2, 1): 696, (2, 2): 615, (2, 3): 200, (2, 4): 18,
-    (3, 0): 417, (3, 1): 748, (3, 2): 363, (3, 3): 48,
-    (4, 0): 487, (4, 1): 534, (4, 2): 141, (4, 3): 6,
-    (5, 0): 421, (5, 1): 288, (5, 2): 39,
-    (6, 0): 292, (6, 1): 122, (6, 2): 6,
-    (7, 0): 168, (7, 1): 36,
-    (8, 0): 78, (8, 1): 6,
-    (9, 0): 28, (10, 0): 7, (11, 0): 1,
-})
-# CL_7: 14 vertices, 21 edges. T(1,1) = 35287
-PRISM_CL7 = TuttePolynomial.from_coefficients({
-    (0, 1): 120, (0, 2): 426, (0, 3): 637, (0, 4): 525, (0, 5): 259,
-    (0, 6): 77, (0, 7): 13, (0, 8): 1,
-    (1, 0): 120, (1, 1): 845, (1, 2): 1667, (1, 3): 1505, (1, 4): 700,
-    (1, 5): 161, (1, 6): 14,
-    (2, 0): 539, (2, 1): 2051, (2, 2): 2506, (2, 3): 1337, (2, 4): 308,
-    (2, 5): 21,
-    (3, 0): 1134, (3, 1): 2744, (3, 2): 2128, (3, 3): 651, (3, 4): 63,
-    (4, 0): 1533, (4, 1): 2499, (4, 2): 1267, (4, 3): 224, (4, 4): 7,
-    (5, 0): 1547, (5, 1): 1771, (5, 2): 602, (5, 3): 56,
-    (6, 0): 1274, (6, 1): 1043, (6, 2): 224, (6, 3): 7,
-    (7, 0): 895, (7, 1): 506, (7, 2): 56,
-    (8, 0): 540, (8, 1): 189, (8, 2): 7,
-    (9, 0): 274, (9, 1): 49,
-    (10, 0): 113, (10, 1): 7,
-    (11, 0): 36, (12, 0): 8, (13, 0): 1,
-})
-# CL_8: 16 vertices, 24 edges. T(1,1) = 150528
-PRISM_CL8 = TuttePolynomial.from_coefficients({
-    (0, 1): 247, (0, 2): 995, (0, 3): 1736, (0, 4): 1722, (0, 5): 1064,
-    (0, 6): 420, (0, 7): 104, (0, 8): 15, (0, 9): 1,
-    (1, 0): 247, (1, 1): 1982, (1, 2): 4669, (1, 3): 5296, (1, 4): 3330,
-    (1, 5): 1184, (1, 6): 220, (1, 7): 16,
-    (2, 0): 1234, (2, 1): 5608, (2, 2): 8736, (2, 3): 6496, (2, 4): 2470,
-    (2, 5): 440, (2, 6): 24,
-    (3, 0): 2914, (3, 1): 8880, (3, 2): 9496, (3, 3): 4656, (3, 4): 1046,
-    (3, 5): 80,
-    (4, 0): 4440, (4, 1): 9648, (4, 2): 7356, (4, 3): 2472, (4, 4): 332,
-    (4, 5): 8,
-    (5, 0): 5056, (5, 1): 8208, (5, 2): 4660, (5, 3): 1088, (5, 4): 76,
-    (6, 0): 4720, (6, 1): 5928, (6, 2): 2512, (6, 3): 368, (6, 4): 8,
-    (7, 0): 3816, (7, 1): 3712, (7, 2): 1096, (7, 3): 80,
-    (8, 0): 2725, (8, 1): 1970, (8, 2): 356, (8, 3): 8,
-    (9, 0): 1711, (9, 1): 848, (9, 2): 76,
-    (10, 0): 927, (10, 1): 280, (10, 2): 8,
-    (11, 0): 423, (11, 1): 64,
-    (12, 0): 157, (12, 1): 8,
-    (13, 0): 45, (14, 0): 9, (15, 0): 1,
-})
-PRISM_BASES: Tuple[TuttePolynomial, ...] = (
-    PRISM_CL3, PRISM_CL4, PRISM_CL5, PRISM_CL6, PRISM_CL7, PRISM_CL8,
-)
 
-# --- Möbius base cases ---
-# M_3 = K_{3,3}: 6 vertices, 9 edges. T(1,1) = 81
-MOBIUS_M3 = TuttePolynomial.from_coefficients({
-    (0, 1): 5, (0, 2): 9, (0, 3): 5, (0, 4): 1,
-    (1, 0): 5, (1, 1): 15, (1, 2): 6,
-    (2, 0): 11, (2, 1): 9,
-    (3, 0): 10, (4, 0): 4, (5, 0): 1,
-})
-# M_4: 8 vertices, 12 edges. T(1,1) = 392
-MOBIUS_M4 = TuttePolynomial.from_coefficients({
-    (0, 1): 12, (0, 2): 26, (0, 3): 20, (0, 4): 7, (0, 5): 1,
-    (1, 0): 12, (1, 1): 48, (1, 2): 38, (1, 3): 8,
-    (2, 0): 34, (2, 1): 52, (2, 2): 12,
-    (3, 0): 42, (3, 1): 24,
-    (4, 0): 31, (4, 1): 4,
-    (5, 0): 15, (6, 0): 5, (7, 0): 1,
-})
-# M_5: 10 vertices, 15 edges. T(1,1) = 1815
-MOBIUS_M5 = TuttePolynomial.from_coefficients({
-    (0, 1): 27, (0, 2): 70, (0, 3): 70, (0, 4): 35, (0, 5): 9, (0, 6): 1,
-    (1, 0): 27, (1, 1): 135, (1, 2): 160, (1, 3): 70, (1, 4): 10,
-    (2, 0): 92, (2, 1): 210, (2, 2): 115, (2, 3): 15,
-    (3, 0): 142, (3, 1): 165, (3, 2): 35,
-    (4, 0): 137, (4, 1): 80, (4, 2): 5,
-    (5, 0): 96, (5, 1): 25,
-    (6, 0): 51, (6, 1): 5,
-    (7, 0): 21, (8, 0): 6, (9, 0): 1,
-})
-# M_6: 12 vertices, 18 edges. T(1,1) = 8112
-MOBIUS_M6 = TuttePolynomial.from_coefficients({
-    (0, 1): 58, (0, 2): 177, (0, 3): 220, (0, 4): 145, (0, 5): 54,
-    (0, 6): 11, (0, 7): 1,
-    (1, 0): 58, (1, 1): 348, (1, 2): 549, (1, 3): 368, (1, 4): 111, (1, 5): 12,
-    (2, 0): 229, (2, 1): 696, (2, 2): 615, (2, 3): 200, (2, 4): 18,
-    (3, 0): 419, (3, 1): 748, (3, 2): 363, (3, 3): 48,
-    (4, 0): 489, (4, 1): 534, (4, 2): 141, (4, 3): 6,
-    (5, 0): 423, (5, 1): 288, (5, 2): 39,
-    (6, 0): 294, (6, 1): 120, (6, 2): 6,
-    (7, 0): 168, (7, 1): 36,
-    (8, 0): 78, (8, 1): 6,
-    (9, 0): 28, (10, 0): 7, (11, 0): 1,
-})
-# M_7: 14 vertices, 21 edges. T(1,1) = 35301
-MOBIUS_M7 = TuttePolynomial.from_coefficients({
-    (0, 1): 121, (0, 2): 427, (0, 3): 637, (0, 4): 525, (0, 5): 259,
-    (0, 6): 77, (0, 7): 13, (0, 8): 1,
-    (1, 0): 121, (1, 1): 847, (1, 2): 1666, (1, 3): 1505, (1, 4): 700,
-    (1, 5): 161, (1, 6): 14,
-    (2, 0): 541, (2, 1): 2051, (2, 2): 2506, (2, 3): 1337, (2, 4): 308,
-    (2, 5): 21,
-    (3, 0): 1136, (3, 1): 2744, (3, 2): 2128, (3, 3): 651, (3, 4): 63,
-    (4, 0): 1535, (4, 1): 2499, (4, 2): 1267, (4, 3): 224, (4, 4): 7,
-    (5, 0): 1549, (5, 1): 1771, (5, 2): 602, (5, 3): 56,
-    (6, 0): 1276, (6, 1): 1043, (6, 2): 224, (6, 3): 7,
-    (7, 0): 897, (7, 1): 504, (7, 2): 56,
-    (8, 0): 540, (8, 1): 189, (8, 2): 7,
-    (9, 0): 274, (9, 1): 49,
-    (10, 0): 113, (10, 1): 7,
-    (11, 0): 36, (12, 0): 8, (13, 0): 1,
-})
-# M_8: 16 vertices, 24 edges. T(1,1) = 150544
-MOBIUS_M8 = TuttePolynomial.from_coefficients({
-    (0, 1): 248, (0, 2): 996, (0, 3): 1736, (0, 4): 1722, (0, 5): 1064,
-    (0, 6): 420, (0, 7): 104, (0, 8): 15, (0, 9): 1,
-    (1, 0): 248, (1, 1): 1984, (1, 2): 4668, (1, 3): 5296, (1, 4): 3330,
-    (1, 5): 1184, (1, 6): 220, (1, 7): 16,
-    (2, 0): 1236, (2, 1): 5608, (2, 2): 8736, (2, 3): 6496, (2, 4): 2470,
-    (2, 5): 440, (2, 6): 24,
-    (3, 0): 2916, (3, 1): 8880, (3, 2): 9496, (3, 3): 4656, (3, 4): 1046,
-    (3, 5): 80,
-    (4, 0): 4442, (4, 1): 9648, (4, 2): 7356, (4, 3): 2472, (4, 4): 332,
-    (4, 5): 8,
-    (5, 0): 5058, (5, 1): 8208, (5, 2): 4660, (5, 3): 1088, (5, 4): 76,
-    (6, 0): 4722, (6, 1): 5928, (6, 2): 2512, (6, 3): 368, (6, 4): 8,
-    (7, 0): 3818, (7, 1): 3712, (7, 2): 1096, (7, 3): 80,
-    (8, 0): 2727, (8, 1): 1968, (8, 2): 356, (8, 3): 8,
-    (9, 0): 1711, (9, 1): 848, (9, 2): 76,
-    (10, 0): 927, (10, 1): 280, (10, 2): 8,
-    (11, 0): 423, (11, 1): 64,
-    (12, 0): 157, (12, 1): 8,
-    (13, 0): 45, (14, 0): 9, (15, 0): 1,
-})
-MOBIUS_BASES: Tuple[TuttePolynomial, ...] = (
-    MOBIUS_M3, MOBIUS_M4, MOBIUS_M5, MOBIUS_M6, MOBIUS_M7, MOBIUS_M8,
-)
+# =============================================================================
+# BASE CASE LOADING (from rainbow table, with compute-on-demand fallback)
+# =============================================================================
+
+# Cache: populated on first access per family
+_base_cache: dict = {}
+
+
+def _load_by_name(name: str) -> Optional[TuttePolynomial]:
+    """Load base case from the rainbow table by name. Returns None if not found.
+
+    Uses name-based lookup (not canonical key) because WL hashing is not
+    a complete graph invariant — the same graph built two different ways
+    can produce different canonical keys. Name-based lookup is reliable
+    as long as the benchmark stores seeds under consistent names.
+
+    The rainbow table must be populated first by running the benchmark:
+        make benchmark
+
+    Returns None (not raises) so that recognize_family() can gracefully
+    fall through when the table is empty.
+    """
+    from ..lookup.core import load_default_table
+    table = load_default_table()
+    return table.lookup_by_name(name)
+
+
+
+def _get_wheel_bases() -> Optional[Tuple[TuttePolynomial, ...]]:
+    """Load T(W_3), T(W_4), T(W_5) — seeds for the wheel recurrence.
+    Returns None if any base case is missing from the rainbow table."""
+    if 'wheel' not in _base_cache:
+        polys = (
+            _load_by_name("K_4"),       # W_3 = K_4
+            _load_by_name("W_4"),
+            _load_by_name("W_5"),
+        )
+        if any(p is None for p in polys):
+            return None
+        _base_cache['wheel'] = polys
+    return _base_cache['wheel']
+
+
+def _get_fan_bases() -> Optional[Tuple[TuttePolynomial, ...]]:
+    """Load T(F_1), T(F_2) — seeds for the fan recurrence.
+    Returns None if any base case is missing from the rainbow table."""
+    if 'fan' not in _base_cache:
+        polys = (
+            _load_by_name("K_2"),       # F_1 = single edge
+            _load_by_name("K_3"),       # F_2 = triangle
+        )
+        if any(p is None for p in polys):
+            return None
+        _base_cache['fan'] = polys
+    return _base_cache['fan']
+
+
+def _get_ladder_bases() -> Optional[Tuple[TuttePolynomial, ...]]:
+    """Load T(L_2), T(L_3) — seeds for the ladder recurrence.
+    Returns None if any base case is missing from the rainbow table."""
+    if 'ladder' not in _base_cache:
+        polys = (
+            _load_by_name("C_4"),         # L_2 = C_4
+            _load_by_name("Grid_2x3"),    # L_3
+        )
+        if any(p is None for p in polys):
+            return None
+        _base_cache['ladder'] = polys
+    return _base_cache['ladder']
+
+
+def _get_book_bases() -> Optional[Tuple[TuttePolynomial, ...]]:
+    """Load T(B_1), T(B_2) — seeds for the book recurrence.
+    Returns None if any base case is missing from the rainbow table."""
+    if 'book' not in _base_cache:
+        polys = (
+            _load_by_name("K_3"),       # B_1 = K_3
+            _load_by_name("B_2"),
+        )
+        if any(p is None for p in polys):
+            return None
+        _base_cache['book'] = polys
+    return _base_cache['book']
+
+
+def _get_gear_bases() -> Optional[Tuple[TuttePolynomial, ...]]:
+    """Load T(G_3), T(G_4), T(G_5) — seeds for the gear recurrence.
+    Returns None if any base case is missing from the rainbow table."""
+    if 'gear' not in _base_cache:
+        polys = (
+            _load_by_name("Gear_3"),
+            _load_by_name("Gear_4"),
+            _load_by_name("Gear_5"),
+        )
+        if any(p is None for p in polys):
+            return None
+        _base_cache['gear'] = polys
+    return _base_cache['gear']
+
+
+def _get_prism_bases() -> Optional[Tuple[TuttePolynomial, ...]]:
+    """Load T(CL_3)..T(CL_8) — seeds for the prism recurrence.
+    Returns None if any base case is missing from the rainbow table."""
+    if 'prism' not in _base_cache:
+        polys = tuple(
+            _load_by_name(f"Prism_{k}")
+            for k in range(3, 9)
+        )
+        if any(p is None for p in polys):
+            return None
+        _base_cache['prism'] = polys
+    return _base_cache['prism']
+
+
+def _get_mobius_bases() -> Optional[Tuple[TuttePolynomial, ...]]:
+    """Load T(M_3)..T(M_8) — seeds for the Möbius recurrence.
+    Returns None if any base case is missing from the rainbow table."""
+    if 'mobius' not in _base_cache:
+        polys = tuple(
+            _load_by_name(f"Mobius_{k}")
+            for k in range(3, 9)
+        )
+        if any(p is None for p in polys):
+            return None
+        _base_cache['mobius'] = polys
+    return _base_cache['mobius']
+
+
+# =============================================================================
+# PUBLIC API — lazy properties that formulas.py imports
+# =============================================================================
+
+class _LazyBases:
+    """Loader that fetches base cases from the rainbow table on first access.
+
+    Returns None if the rainbow table doesn't have the required seed graphs.
+    This allows recognize_family() to gracefully fall through to the engine's
+    other synthesis paths (SP, treewidth DP, chord addition).
+    """
+    _NOT_LOADED = object()
+
+    def __init__(self, loader):
+        self._loader = loader
+        self._value = self._NOT_LOADED
+
+    def __call__(self) -> Optional[Tuple[TuttePolynomial, ...]]:
+        if self._value is self._NOT_LOADED:
+            self._value = self._loader()  # Returns None if table missing seeds
+        return self._value
+
+
+# These are called as functions in formulas.py: WHEEL_BASES(), not WHEEL_BASES
+WHEEL_BASES = _LazyBases(_get_wheel_bases)
+FAN_BASES = _LazyBases(_get_fan_bases)
+LADDER_BASES = _LazyBases(_get_ladder_bases)
+BOOK_BASES = _LazyBases(_get_book_bases)
+GEAR_BASES = _LazyBases(_get_gear_bases)
+PRISM_BASES = _LazyBases(_get_prism_bases)
+MOBIUS_BASES = _LazyBases(_get_mobius_bases)
 
 
 def apply_order6_recurrence(
