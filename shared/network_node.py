@@ -35,9 +35,11 @@ from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import QuicEvent, DatagramFrameReceived, StreamDataReceived, ConnectionTerminated, HandshakeCompleted
+from shared.block_inventory import BlockInventory
 from shared.block_synchronizer import BlockSynchronizer
 from shared.block_store import BlockStore
 from shared.load_monitor import LoadMonitor, NodeLoad
+from shared.peer_scorer import PeerScorer
 from shared.process_pool import ProcessPool, ProcessPoolConfig
 from shared.rate_limiter import PeerRateLimiter
 from shared.swim_detector import SwimDetector, PeerState
@@ -324,6 +326,15 @@ class NetworkNode(Node):
         )
         # Load info received from peers: {peer_address: NodeLoad}
         self._peer_loads: Dict[str, NodeLoad] = {}
+
+        # Block inventory for IHAVE/IWANT protocol
+        self._block_inventory = BlockInventory()
+        # Peer scoring for gossip target selection
+        self._peer_scorer = PeerScorer(
+            disconnect_threshold=float(
+                config.get("peer_disconnect_threshold", -100.0)
+            ),
+        )
 
         self.gossip_lock = asyncio.Lock()
         # Bounded dedup: maps message_id -> timestamp, max 10k entries
@@ -737,12 +748,14 @@ class NetworkNode(Node):
                 self.logger.exception("Error in heartbeat loop")
 
     async def _heartbeat_with_swim(self, node_host: str) -> None:
-        """Send heartbeat and update SWIM detector based on result."""
+        """Send heartbeat and update SWIM/scoring based on result."""
         ok = await self.send_heartbeat(node_host)
         if ok:
             self._swim_detector.record_heartbeat_success(node_host)
+            self._peer_scorer.record_heartbeat_ok(node_host)
         else:
             self._swim_detector.record_heartbeat_failure(node_host)
+            self._peer_scorer.record_heartbeat_fail(node_host)
             state = self._swim_detector.get_state(node_host)
             if state == PeerState.SUSPECT:
                 self.logger.debug(
@@ -864,6 +877,25 @@ class NetworkNode(Node):
                     to_shed = self._load_monitor.connections_to_shed()
                     if to_shed > 0 and self._process_pool:
                         await self._shed_connections(to_shed)
+
+                # Peer scoring: decay and disconnect low scorers
+                self._peer_scorer.decay_scores()
+                low_scorers = self._peer_scorer.get_low_scoring_peers()
+                for peer in low_scorers:
+                    self.logger.info(
+                        f"Disconnecting low-scoring peer {peer} "
+                        f"(score={self._peer_scorer.get_score(peer):.1f})"
+                    )
+                    self._peer_scorer.remove_peer(peer)
+                    await self.remove_node(peer)
+
+                # Block inventory: expire stale IWANT requests
+                expired_wants = self._block_inventory.expire_wants()
+                for block_hash, peer in expired_wants:
+                    self.logger.debug(
+                        f"IWANT timeout for {block_hash.hex()[:16]}... "
+                        f"from {peer}"
+                    )
 
                 # SWIM: expire stale probes
                 self._swim_detector.expire_probes()
@@ -1883,6 +1915,10 @@ class NetworkNode(Node):
                     self._swim_detector.remove_peer(host)
                 if hasattr(self, '_peer_loads'):
                     self._peer_loads.pop(host, None)
+                if hasattr(self, '_peer_scorer'):
+                    self._peer_scorer.remove_peer(host)
+                if hasattr(self, '_block_inventory'):
+                    self._block_inventory.remove_peer(host)
 
     async def send_heartbeat(self, node_host: str) -> bool:
         """Send heartbeat to a specific node.
@@ -2012,22 +2048,70 @@ class NetworkNode(Node):
 
     async def gossip_block(self, block_data: Block):
         """Broadcast a new block to the network.
-        Data encoding: raw block network bytes.
-        """
-        binary_data = block_data.to_network()
-        bytes_sent = len(binary_data)
 
+        Uses IHAVE/IWANT protocol: sends block hash via IHAVE to peers,
+        peers that need the block respond with IWANT. Falls back to
+        full-block gossip for the initial propagation to ensure the
+        block reaches the network quickly.
+        """
+        block_hash = block_data.header.block_hash
+        binary_data = block_data.to_network()
+
+        # Record in our inventory
+        self._block_inventory.record_have(block_hash)
+
+        # Send IHAVE to peers via scored selection
+        async with self.net_lock:
+            peer_list = list(self.peers.keys())
+
+        effective_fanout = self._adaptive_fanout(len(peer_list))
+        targets = self._peer_scorer.select_gossip_targets(
+            peer_list, effective_fanout
+        )
+
+        ihave_sent = 0
+        for peer in targets:
+            try:
+                protocol = await self.node_client._get_connection(peer)
+                if protocol is None:
+                    continue
+                payload = json.dumps({
+                    "block_hash": block_hash.hex(),
+                    "block_index": block_data.header.index,
+                    "sender": self.public_host,
+                }).encode('utf-8')
+                await protocol.send_request(
+                    QuicMessageType.IHAVE, payload, timeout=3.0
+                )
+                ihave_sent += 1
+            except Exception:
+                pass
+
+        self.logger.debug(
+            f"Sent IHAVE for block {block_data.header.index} "
+            f"to {ihave_sent}/{len(targets)} peers "
+            f"(hash={block_hash.hex()[:16]}...)"
+        )
+
+        # Also propagate via the existing gossip path for backward
+        # compatibility with nodes that don't support IHAVE/IWANT
         message = Message(
             type="block",
             sender=self.public_host,
             timestamp=utc_timestamp_float(),
-            data=binary_data
+            data=binary_data,
         )
-
-        # Log byte count for gossiped block
-        self.logger.debug(f"📤 Gossiped block {block_data.header.index}: {bytes_sent} bytes")
-
         await self.gossip(message)
+
+    def _adaptive_fanout(self, peer_count: int) -> int:
+        """Calculate adaptive fanout based on network size.
+
+        Scales as max(3, min(configured_fanout, sqrt(peer_count))).
+        """
+        if peer_count <= 0:
+            return self.fanout
+        sqrt_peers = int(math.sqrt(peer_count))
+        return max(3, min(self.fanout, sqrt_peers))
 
     async def handle_gossip(self, message: Message) -> str:
         """Main gossip logic to handle a gossip message from another node and rebroadcast."""
@@ -2172,6 +2256,11 @@ class NetworkNode(Node):
                 return await self._quic_handle_probe_request(msg)
             elif msg.msg_type == QuicMessageType.LOAD_INFO:
                 return await self._quic_handle_load_info(msg)
+            # Phase 3: IHAVE/IWANT block propagation
+            elif msg.msg_type == QuicMessageType.IHAVE:
+                return await self._quic_handle_ihave(msg)
+            elif msg.msg_type == QuicMessageType.IWANT:
+                return await self._quic_handle_iwant(msg)
             else:
                 self.logger.warning(f"Unknown message type: {msg.msg_type}")
                 return msg.create_error_response(f"Unknown message type: {msg.msg_type}")
@@ -2249,6 +2338,117 @@ class NetworkNode(Node):
                 msg_type=QuicMessageType.LOAD_INFO_RESPONSE,
                 request_id=msg.request_id,
                 payload=b'ok',
+                protocol_version=msg.protocol_version,
+            )
+        except Exception as exc:
+            return msg.create_error_response(str(exc))
+
+    async def _quic_handle_ihave(self, msg: QuicMessage) -> QuicMessage:
+        """Handle IHAVE: peer announces they have a block.
+
+        If we don't have it, we respond with IWANT to request it.
+        """
+        try:
+            data = json.loads(msg.payload.decode('utf-8'))
+            block_hash_hex = data.get("block_hash", "")
+            block_index = data.get("block_index", 0)
+            sender = data.get("sender", "")
+
+            if not block_hash_hex:
+                return msg.create_error_response("Missing block_hash")
+
+            block_hash = bytes.fromhex(block_hash_hex)
+
+            # Check if we need this block
+            should_request = self._block_inventory.record_ihave(
+                sender, block_hash
+            )
+
+            if should_request:
+                self.logger.debug(
+                    f"IHAVE: need block {block_index} from {sender}, "
+                    f"sending IWANT"
+                )
+                self._block_inventory.record_want(block_hash, sender)
+
+                # Send IWANT back to the sender
+                asyncio.create_task(
+                    self._send_iwant(sender, block_hash, block_index)
+                )
+
+            return QuicMessage(
+                msg_type=QuicMessageType.IHAVE_RESPONSE,
+                request_id=msg.request_id,
+                payload=json.dumps({
+                    "need": should_request,
+                }).encode('utf-8'),
+                protocol_version=msg.protocol_version,
+            )
+        except Exception as exc:
+            return msg.create_error_response(str(exc))
+
+    async def _send_iwant(
+        self, peer: str, block_hash: bytes, block_index: int
+    ) -> None:
+        """Send IWANT request to a peer for a specific block."""
+        try:
+            protocol = await self.node_client._get_connection(peer)
+            if protocol is None:
+                return
+            payload = json.dumps({
+                "block_hash": block_hash.hex(),
+                "block_index": block_index,
+            }).encode('utf-8')
+            response = await protocol.send_request(
+                QuicMessageType.IWANT, payload, timeout=10.0
+            )
+            if response and response.msg_type == QuicMessageType.IWANT_RESPONSE:
+                # Response payload is the full block
+                try:
+                    block = Block.from_network(response.payload)
+                    self._block_inventory.record_block_received(block_hash)
+                    self._peer_scorer.record_valid_block(peer)
+                    self.logger.debug(
+                        f"IWANT: received block {block.header.index} "
+                        f"from {peer}"
+                    )
+                    # Queue for processing
+                    dummy_future = asyncio.Future()
+                    self.block_processing_queue.put_nowait(
+                        (block, dummy_future, False, peer)
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        f"IWANT: invalid block from {peer}: {exc}"
+                    )
+                    self._peer_scorer.record_invalid_block(peer)
+        except Exception as exc:
+            self.logger.debug(f"IWANT to {peer} failed: {exc}")
+
+    async def _quic_handle_iwant(self, msg: QuicMessage) -> QuicMessage:
+        """Handle IWANT: peer is requesting a block we announced via IHAVE."""
+        try:
+            data = json.loads(msg.payload.decode('utf-8'))
+            block_hash_hex = data.get("block_hash", "")
+            block_index = data.get("block_index", 0)
+
+            if not block_hash_hex:
+                return msg.create_error_response("Missing block_hash")
+
+            block_hash = bytes.fromhex(block_hash_hex)
+
+            # Look up the block in our chain
+            block = self.get_block(block_index)
+            if block is None or block.header.block_hash != block_hash:
+                return msg.create_error_response(
+                    f"Block {block_index} not found or hash mismatch"
+                )
+
+            # Return the full block
+            return QuicMessage(
+                msg_type=QuicMessageType.IWANT_RESPONSE,
+                request_id=msg.request_id,
+                payload=block.to_network(),
                 protocol_version=msg.protocol_version,
             )
         except Exception as exc:
