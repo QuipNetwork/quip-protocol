@@ -155,7 +155,8 @@ def build_miner_specs(
     miner_type: str,
     hardware: Dict[str, Any],
     num_cpus: Optional[int] = None,
-    devices: Optional[str] = None
+    devices: Optional[str] = None,
+    update_mode: str = 'sa'
 ) -> List[Dict]:
     """Build list of miner specs based on hardware and CLI args.
 
@@ -164,6 +165,7 @@ def build_miner_specs(
         hardware: Dict from detect_hardware()
         num_cpus: Optional limit on CPU miners
         devices: Optional comma-separated CUDA device IDs
+        update_mode: CUDA update mode ('sa' or 'gibbs')
 
     Returns:
         List of spec dicts with 'kind', 'id', and optional 'args'
@@ -185,10 +187,12 @@ def build_miner_specs(
             # Fallback to device 0 if no CUDA detected but user requested cuda
             device_ids = ['0']
 
+        kind = 'cuda-gibbs' if update_mode == 'gibbs' else 'cuda'
+        mode_label = update_mode
         for device in device_ids:
             specs.append({
-                'kind': 'cuda',
-                'id': f'rate-test-cuda-{device}',
+                'kind': kind,
+                'id': f'rate-test-cuda-{mode_label}-{device}',
                 'args': {'device': device}
             })
 
@@ -358,10 +362,14 @@ def mine_worker(
         if kind == 'cpu':
             from CPU.sa_miner import SimulatedAnnealingMiner
             miner = SimulatedAnnealingMiner(miner_id=miner_id, topology=topology)
-        elif kind == 'cuda':
+        elif kind in ('cuda', 'cuda-gibbs'):
             from GPU.cuda_miner import CudaMiner
             device = miner_spec.get('args', {}).get('device', '0')
-            miner = CudaMiner(miner_id=miner_id, device=device, topology=topology)
+            update_mode = 'gibbs' if kind == 'cuda-gibbs' else 'sa'
+            miner = CudaMiner(
+                miner_id=miner_id, device=device,
+                topology=topology, update_mode=update_mode,
+            )
         elif kind == 'metal':
             from GPU.metal_miner import MetalMiner
             miner = MetalMiner(miner_id=miner_id, topology=topology)
@@ -599,6 +607,13 @@ def main():
         default=10,
         help='QPU streaming queue depth (default: 10). Higher values increase throughput but may waste QPU time.'
     )
+    parser.add_argument(
+        '--update-mode',
+        type=str,
+        choices=['sa', 'gibbs'],
+        default='sa',
+        help='CUDA sampling algorithm: "sa" for simulated annealing, "gibbs" for chromatic block Gibbs (default: sa)'
+    )
 
     args = parser.parse_args()
 
@@ -626,6 +641,8 @@ def main():
     print("🔬 Mining Rate Comparison Tool")
     print("=" * 50)
     print(f"Miner type: {args.miner_type.upper()}")
+    if args.miner_type == 'cuda':
+        print(f"Update mode: {args.update_mode.upper()}")
     print(f"Topology: {topology.solver_name} ({len(topology.nodes)} nodes, {len(topology.edges)} edges)")
     print(f"Difficulty: {args.difficulty_energy:.1f}")
     print(f"Duration: {args.duration} ({duration_minutes:.1f} minutes)")
@@ -654,7 +671,8 @@ def main():
         miner_type=args.miner_type,
         hardware=hardware,
         num_cpus=args.num_cpus,
-        devices=devices_arg
+        devices=devices_arg,
+        update_mode=args.update_mode,
     )
 
     if not miner_specs:
@@ -852,6 +870,7 @@ def main():
     # Always save results (even if empty)
     output_data = {
         'miner_type': args.miner_type,
+        'update_mode': args.update_mode,
         'num_miners': stats['num_miners'],
         'difficulty_energy': args.difficulty_energy,
         'duration_spec': args.duration,
@@ -866,7 +885,8 @@ def main():
     output_file = args.output
     if not output_file:
         timestamp = int(time.time())
-        output_file = f"mining_rate_{args.miner_type}_{args.duration}min_{timestamp}.json"
+        mode_suffix = f"_{args.update_mode}" if args.miner_type == 'cuda' else ""
+        output_file = f"mining_rate_{args.miner_type}{mode_suffix}_{args.duration}min_{timestamp}.json"
 
     with open(output_file, 'w') as f:
         json.dump(output_data, f, indent=2, cls=NumpyEncoder)

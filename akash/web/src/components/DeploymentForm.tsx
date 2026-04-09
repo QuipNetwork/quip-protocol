@@ -47,6 +47,7 @@ export function DeploymentForm() {
 
   const [minerType, setMinerType] = useState<'cpu' | 'cuda'>(DEFAULTS.minerType)
   const [gpuModel, setGpuModel] = useState<GpuModelKey>('any')
+  const [updateMode, setUpdateMode] = useState<'sa' | 'gibbs'>('sa')
   const [minCpuPerformance, setMinCpuPerformance] = useState<string>('any')
   const [fleetSize, setFleetSize] = useState(DEFAULTS.fleetSize)
   const [miningDuration, setMiningDuration] = useState(DEFAULTS.duration)
@@ -239,6 +240,8 @@ export function DeploymentForm() {
         minSolutions,
         // Include GPU model for CUDA deployments
         gpuModel: minerType === 'cuda' ? gpuModel : undefined,
+        // CUDA algorithm selection
+        updateMode: minerType === 'cuda' ? updateMode : undefined,
         // Include IPFS config if enabled
         ipfsNode: ipfsEnabled ? ipfsNode : undefined,
         ipfsApiKey: ipfsEnabled ? ipfsApiKey : undefined,
@@ -590,6 +593,8 @@ export function DeploymentForm() {
     minSolutions,
     // Include GPU model for CUDA deployments
     gpuModel: minerType === 'cuda' ? gpuModel : undefined,
+    // CUDA algorithm selection
+    updateMode: minerType === 'cuda' ? updateMode : undefined,
     // Include CPU performance requirement for CPU deployments
     minCpuScore: minerType === 'cpu' ? minCpuScoreValue : undefined,
     // Include IPFS config if enabled
@@ -929,19 +934,33 @@ export function DeploymentForm() {
         </div>
 
         {minerType === 'cuda' && (
-          <div className="form-group">
-            <label htmlFor="gpuModel">GPU Model</label>
-            <select
-              id="gpuModel"
-              value={gpuModel}
-              onChange={(e) => setGpuModel(e.target.value as GpuModelKey)}
-            >
-              {Object.entries(GPU_MODELS).map(([key, { label }]) => (
-                <option key={key} value={key}>{label}</option>
-              ))}
-            </select>
-            <small>Select a specific GPU model or "Any" to accept any NVIDIA GPU. Specific models may have fewer available providers.</small>
-          </div>
+          <>
+            <div className="form-group">
+              <label htmlFor="gpuModel">GPU Model</label>
+              <select
+                id="gpuModel"
+                value={gpuModel}
+                onChange={(e) => setGpuModel(e.target.value as GpuModelKey)}
+              >
+                {Object.entries(GPU_MODELS).map(([key, { label }]) => (
+                  <option key={key} value={key}>{label}</option>
+                ))}
+              </select>
+              <small>Select a specific GPU model or "Any" to accept any NVIDIA GPU. Specific models may have fewer available providers.</small>
+            </div>
+            <div className="form-group">
+              <label htmlFor="updateMode">Sampling Algorithm</label>
+              <select
+                id="updateMode"
+                value={updateMode}
+                onChange={(e) => setUpdateMode(e.target.value as 'sa' | 'gibbs')}
+              >
+                <option value="sa">Simulated Annealing (SA)</option>
+                <option value="gibbs">Chromatic Block Gibbs</option>
+              </select>
+              <small>SA uses 1 SM per model (proven). Gibbs uses parallel chromatic updates across multiple SMs per model (experimental, potentially faster).</small>
+            </div>
+          </>
         )}
 
         {minerType === 'cpu' && (
@@ -1132,6 +1151,13 @@ export function DeploymentForm() {
         <div className="alert alert-info cost-estimate">
           <strong>Estimated Cost:</strong> {estimatedCost} AKT for {miningDuration}
           {fleetSize > 1 && ` (${fleetSize} ${minerType === 'cuda' ? 'GPUs' : 'CPUs'})`}
+          <br />
+          <small>
+            Deployments require ACT (Akash Compute Token). Mint ACT by burning AKT at{' '}
+            <a href="https://console.akash.network" target="_blank" rel="noopener noreferrer">
+              console.akash.network
+            </a>.
+          </small>
         </div>
 
         <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>

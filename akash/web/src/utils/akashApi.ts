@@ -31,23 +31,45 @@ export async function fetchBlockHeight(): Promise<number> {
 }
 
 /**
- * Fetch balance for an Akash address
+ * Fetch AKT and ACT balances for an Akash address.
+ *
+ * After the BME upgrade (Mainnet 17, March 2026), tenants need ACT
+ * (Akash Compute Token, denom 'uact') to pay for deployments.
+ * ACT is minted by burning AKT via MsgMintACT.
  */
-export async function fetchBalance(address: string): Promise<string> {
+export interface AkashBalances {
+  akt: string   // uakt balance
+  act: string   // uact balance (compute credits)
+}
+
+export async function fetchBalances(address: string): Promise<AkashBalances> {
   try {
     const response = await fetch(
       `${AKASH_REST}/cosmos/bank/v1beta1/balances/${address}`
     )
     const data = await response.json()
 
-    const aktBalance = data.balances?.find(
-      (b: { denom: string; amount: string }) => b.denom === AKASH_DENOM
-    )
-    return aktBalance?.amount || '0'
+    const findBalance = (denom: string) =>
+      data.balances?.find(
+        (b: { denom: string; amount: string }) => b.denom === denom
+      )?.amount || '0'
+
+    return {
+      akt: findBalance(AKASH_DENOM),
+      act: findBalance('uact'),
+    }
   } catch (error) {
-    console.error('Failed to fetch balance:', error)
-    return '0'
+    console.error('Failed to fetch balances:', error)
+    return { akt: '0', act: '0' }
   }
+}
+
+/**
+ * Fetch AKT balance for an Akash address (legacy convenience wrapper).
+ */
+export async function fetchBalance(address: string): Promise<string> {
+  const balances = await fetchBalances(address)
+  return balances.akt
 }
 
 /**

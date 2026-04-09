@@ -102,13 +102,18 @@ for MANIFEST_CID in "${MANIFEST_CIDS[@]}"; do
 
     DEPLOYMENT_ID=$(jq -r '.deployment_id // "unknown"' "$MANIFEST_FILE")
     MINER_TYPE=$(jq -r '.miner_type // "unknown"' "$MANIFEST_FILE")
+    UPDATE_MODE=$(jq -r '.update_mode // "sa"' "$MANIFEST_FILE")
     JSON_CID=$(jq -r '.results.json_cid // ""' "$MANIFEST_FILE")
     LOG_CID=$(jq -r '.results.log_cid // ""' "$MANIFEST_FILE")
 
-    echo -e "${GREEN}Deployment: $DEPLOYMENT_ID ($MINER_TYPE)${NC}"
+    echo -e "${GREEN}Deployment: $DEPLOYMENT_ID ($MINER_TYPE, $UPDATE_MODE)${NC}"
 
-    # Create deployment directory
-    DEPLOYMENT_DIR="${OUTPUT_DIR}/${MINER_TYPE}/${DEPLOYMENT_ID}"
+    # Create deployment directory (include update_mode for CUDA)
+    if [ "$MINER_TYPE" = "cuda" ]; then
+        DEPLOYMENT_DIR="${OUTPUT_DIR}/${MINER_TYPE}_${UPDATE_MODE}/${DEPLOYMENT_ID}"
+    else
+        DEPLOYMENT_DIR="${OUTPUT_DIR}/${MINER_TYPE}/${DEPLOYMENT_ID}"
+    fi
     mkdir -p "$DEPLOYMENT_DIR"
 
     # Download JSON results
@@ -162,7 +167,7 @@ Deployments:
 EOF
 
     # Add details for each deployment
-    for MINER_TYPE in cpu cuda metal; do
+    for MINER_TYPE in cpu cuda_sa cuda_gibbs cuda metal; do
         if [ -d "$OUTPUT_DIR/$MINER_TYPE" ]; then
             echo "" >> "$SUMMARY_FILE"
             echo "$MINER_TYPE Miners:" >> "$SUMMARY_FILE"

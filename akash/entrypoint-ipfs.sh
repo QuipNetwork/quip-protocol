@@ -10,6 +10,7 @@ MIN_SOLUTIONS="${MIN_SOLUTIONS:-5}"
 TOPOLOGY_FILE="${TOPOLOGY_FILE:-dwave_topologies/topologies/advantage2_system1_7.json.gz}"
 GPU_DEVICE="${GPU_DEVICE:-0}"
 NUM_CPUS="${NUM_CPUS:-}"  # Override auto-detected CPU count
+UPDATE_MODE="${UPDATE_MODE:-sa}"  # CUDA algorithm: sa or gibbs
 
 # Suppress SyntaxWarnings from third-party packages (dwave-samplers, homebase on Python 3.13)
 export PYTHONWARNINGS="ignore::SyntaxWarning"
@@ -19,8 +20,8 @@ DEPLOYMENT_ID="${AKASH_DEPLOYMENT_ID:-$(hostname)}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_DIR="/output"
 mkdir -p "$OUTPUT_DIR"
-OUTPUT_JSON="${OUTPUT_DIR}/${MINER_TYPE}_${DEPLOYMENT_ID}_${TIMESTAMP}.json"
-OUTPUT_LOG="${OUTPUT_DIR}/${MINER_TYPE}_${DEPLOYMENT_ID}_${TIMESTAMP}.log"
+OUTPUT_JSON="${OUTPUT_DIR}/${MINER_TYPE}_${UPDATE_MODE}_${DEPLOYMENT_ID}_${TIMESTAMP}.json"
+OUTPUT_LOG="${OUTPUT_DIR}/${MINER_TYPE}_${UPDATE_MODE}_${DEPLOYMENT_ID}_${TIMESTAMP}.log"
 
 # Create symlinks for easy HTTP access
 ln -sf "$OUTPUT_JSON" "${OUTPUT_DIR}/latest.json"
@@ -277,6 +278,7 @@ echo "========================================" | tee -a "$OUTPUT_LOG"
 echo "Quip Protocol - Akash Mining with IPFS" | tee -a "$OUTPUT_LOG"
 echo "========================================" | tee -a "$OUTPUT_LOG"
 echo "Miner Type: $MINER_TYPE" | tee -a "$OUTPUT_LOG"
+echo "Update Mode: $UPDATE_MODE" | tee -a "$OUTPUT_LOG"
 echo "Deployment ID: $DEPLOYMENT_ID" | tee -a "$OUTPUT_LOG"
 echo "Start Time: $(date)" | tee -a "$OUTPUT_LOG"
 echo "Duration: $MINING_DURATION" | tee -a "$OUTPUT_LOG"
@@ -413,7 +415,7 @@ CMD="python tools/compare_mining_rates.py \
   --topology $TOPOLOGY_FILE"
 
 if [ "$MINER_TYPE" = "cuda" ]; then
-  CMD="$CMD --device $GPU_DEVICE"
+  CMD="$CMD --device $GPU_DEVICE --update-mode $UPDATE_MODE"
 fi
 
 CMD="$CMD -o $OUTPUT_JSON"
@@ -452,6 +454,7 @@ if [ -n "$IPFS_NODE" ]; then
 {
   "deployment_id": "$DEPLOYMENT_ID",
   "miner_type": "$MINER_TYPE",
+  "update_mode": "$UPDATE_MODE",
   "timestamp": "$TIMESTAMP",
   "duration": "$MINING_DURATION",
   "difficulty": $DIFFICULTY_ENERGY,

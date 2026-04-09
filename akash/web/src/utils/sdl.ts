@@ -45,6 +45,8 @@ export interface SDLConfig {
   instanceCount?: number  // Number of container instances to run (default: 1)
   // Optional: GPU model selection for CUDA deployments
   gpuModel?: GpuModelKey  // Specific GPU model to request
+  // Optional: CUDA sampling algorithm
+  updateMode?: 'sa' | 'gibbs'  // 'sa' for simulated annealing, 'gibbs' for chromatic block Gibbs
   // Optional: CPU performance requirement for CPU deployments
   minCpuScore?: number  // Minimum CPU score (0=any, 2000=entry, 3000=good, 4000=high)
   // Optional: IPFS configuration for result uploads
@@ -71,7 +73,10 @@ export function generateSDL(config: SDLConfig): object {
   // For CUDA: CPU units match GPU units (minimal CPU needed for GPU coordination)
   const gpuUnits = config.gpuUnits ?? (isCuda ? 1 : 0)
   const cpuUnits = config.cpuUnits ?? (isCuda ? gpuUnits : 1)
-  const memoryGi = config.memoryGi ?? (isCuda ? 4 : 2)
+  // H100 has 80GB VRAM; allocate more system memory for large models
+  const isH100 = config.gpuModel === 'h100'
+  const defaultMemoryGi = isCuda ? (isH100 ? 32 : 4) : 2
+  const memoryGi = config.memoryGi ?? defaultMemoryGi
   const storageGi = isCuda ? 10 : 5
 
   // Build resources object
@@ -143,6 +148,8 @@ export function generateSDL(config: SDLConfig): object {
           `DIFFICULTY_ENERGY=${config.difficultyEnergy}`,
           `MIN_DIVERSITY=${config.minDiversity}`,
           `MIN_SOLUTIONS=${config.minSolutions}`,
+          // CUDA algorithm selection (sa or gibbs)
+          ...(isCuda ? [`UPDATE_MODE=${config.updateMode ?? 'sa'}`] : []),
           // Pass resource info so container can auto-detect
           `REQUESTED_CPUS=${cpuUnits}`,
           `REQUESTED_GPUS=${gpuUnits}`,

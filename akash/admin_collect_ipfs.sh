@@ -11,8 +11,7 @@ NC='\033[0m'
 
 # Configuration
 IPFS_NODE="${IPFS_NODE:-https://carback-ipfs.ngrok.io}"
-IPFS_ADMIN_USER="${IPFS_ADMIN_USER:-}"
-IPFS_ADMIN_PASS="${IPFS_ADMIN_PASS:-}"
+IPFS_API_KEY="${IPFS_API_KEY:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-./ipfs_results}"
 IPFS_GATEWAY="${IPFS_GATEWAY:-https://ipfs.io}"
 
@@ -21,22 +20,20 @@ echo -e "${BLUE}Admin IPFS Results Collection${NC}"
 echo -e "${BLUE}========================================${NC}"
 
 # Check credentials
-if [ -z "$IPFS_ADMIN_USER" ] || [ -z "$IPFS_ADMIN_PASS" ]; then
-    echo -e "${YELLOW}Usage: IPFS_ADMIN_USER=admin IPFS_ADMIN_PASS=password $0${NC}"
+if [ -z "$IPFS_API_KEY" ]; then
+    echo -e "${YELLOW}Usage: IPFS_API_KEY=your-key $0${NC}"
     echo ""
     echo "Environment variables:"
-    echo "  IPFS_ADMIN_USER - Admin username for IPFS node"
-    echo "  IPFS_ADMIN_PASS - Admin password for IPFS node"
+    echo "  IPFS_API_KEY    - API key for IPFS node (X-API-Key header)"
     echo "  IPFS_NODE       - IPFS node URL (default: https://carback-ipfs.ngrok.io)"
     echo "  OUTPUT_DIR      - Output directory (default: ./ipfs_results)"
     echo ""
     echo "Example:"
-    echo "  IPFS_ADMIN_USER=admin IPFS_ADMIN_PASS=mypassword $0"
+    echo "  IPFS_API_KEY=abc123 $0"
     exit 1
 fi
 
 echo "IPFS Node: $IPFS_NODE"
-echo "Admin User: $IPFS_ADMIN_USER"
 echo "Output Dir: $OUTPUT_DIR"
 echo ""
 
@@ -49,7 +46,7 @@ ipfs_api_call() {
     shift
     local url="${IPFS_NODE}${endpoint}"
 
-    curl -s -u "${IPFS_ADMIN_USER}:${IPFS_ADMIN_PASS}" "$@" "$url"
+    curl -s -H "X-API-Key: ${IPFS_API_KEY}" "$@" "$url"
 }
 
 # Function to fetch from IPFS
@@ -99,7 +96,7 @@ if [ -z "$MANIFEST_CIDS" ]; then
     echo "This could mean:"
     echo "  1. No mining results have been uploaded yet"
     echo "  2. Files were uploaded without pinning (IPFS_PIN=false)"
-    echo "  3. Admin user doesn't have permission to list pins"
+    echo "  3. API key doesn't have permission to list pins"
     exit 0
 fi
 
@@ -237,7 +234,7 @@ Deployments:
 EOF
 
     # Add details for each deployment
-    for MINER_TYPE in cpu cuda metal; do
+    for MINER_TYPE in cpu cuda cuda_sa cuda_gibbs metal; do
         if [ -d "$OUTPUT_DIR/$MINER_TYPE" ]; then
             echo "" >> "$SUMMARY_FILE"
             echo "$MINER_TYPE Miners:" >> "$SUMMARY_FILE"

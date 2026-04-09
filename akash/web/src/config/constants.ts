@@ -17,8 +17,8 @@ export const AKASH_DECIMALS = 6
 
 // Docker images (must match Docker Hub repository names)
 export const DOCKER_IMAGES = {
-  cpu: 'carback1/quip-protocol-cpu-miner:v0.0.9',
-  cuda: 'carback1/quip-protocol-cuda-miner:v0.0.9',
+  cpu: 'carback1/quip-protocol-cpu-miner:v0.1.0',
+  cuda: 'carback1/quip-protocol-cuda-miner:v0.1.0',
 }
 
 // Resource limits per deployment
