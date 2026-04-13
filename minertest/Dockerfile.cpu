@@ -1,4 +1,4 @@
-# Akash-optimized Dockerfile for CPU mining
+# Dockerfile for CPU mining
 # Multi-stage build for minimal image size (~500MB vs 2.5GB+)
 # NO PyTorch - uses D-Wave SDK's built-in SimulatedAnnealingSampler
 # Includes HTTP server for log/result retrieval
@@ -24,7 +24,7 @@ RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Install Python dependencies first (better layer caching)
-COPY akash/requirements-mining-cpu.txt ./requirements.txt
+COPY minertest/requirements-cpu.txt ./requirements.txt
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
@@ -51,7 +51,7 @@ RUN rm -rf /root/.cache/pip && \
 FROM python:3.13-slim-bookworm AS runtime
 
 LABEL maintainer="Quip Protocol"
-LABEL description="CPU miner for Akash (optimized, ~500MB)"
+LABEL description="CPU miner (optimized, ~500MB)"
 
 # Install only runtime dependencies (curl for healthcheck)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -87,8 +87,8 @@ ENV TOPOLOGY_FILE=dwave_topologies/topologies/advantage2_system1_13.json.gz
 # Create output directory
 RUN mkdir -p /output
 
-# Copy Akash-specific entrypoint with IPFS support
-COPY akash/entrypoint-ipfs.sh /entrypoint.sh
+# Copy entrypoint with IPFS support
+COPY minertest/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # Expose HTTP port for result retrieval
