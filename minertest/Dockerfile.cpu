@@ -55,7 +55,7 @@ LABEL description="CPU miner (optimized, ~500MB)"
 
 # Install only runtime dependencies (curl for healthcheck)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
+    curl dnsutils \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -97,5 +97,8 @@ EXPOSE 8080
 # Health check via HTTP server
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
   CMD curl -f http://localhost:8080/ || exit 1
+
+ARG BUILD_TAG=dev
+ENV BUILD_TAG=${BUILD_TAG}
 
 ENTRYPOINT ["/entrypoint.sh"]

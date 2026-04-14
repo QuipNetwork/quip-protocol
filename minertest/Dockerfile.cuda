@@ -64,7 +64,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     libgomp1 \
-    curl \
+    curl dnsutils \
     cuda-cudart-12-6 \
     cuda-cudart-dev-12-6 \
     cuda-nvrtc-12-6 \
@@ -113,5 +113,8 @@ EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
   CMD curl -f http://localhost:8080/ || exit 1
+
+ARG BUILD_TAG=dev
+ENV BUILD_TAG=${BUILD_TAG}
 
 ENTRYPOINT ["/entrypoint.sh"]

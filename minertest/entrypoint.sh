@@ -319,14 +319,64 @@ upload_to_ipfs() {
     local upload_filename="${filename}.gz"
     echo "  Compressed size: $(ls -lh "$compressed_file" | awk '{print $5}')" | tee -a "$OUTPUT_LOG"
 
-    # Upload via IPFS HTTP API (capture both stdout and stderr)
+    # Strip trailing slash from IPFS_NODE to avoid double-slash in URL
+    local node_url="${IPFS_NODE%/}"
+
+    # Resolve IPFS hostname bypassing broken provider DNS search domains.
+    # Some Akash/K8s providers append cluster search domains (e.g. .alphionsee.in)
+    # which hijack external hostname resolution.
+    # Strategy: try FQDN (trailing dot) first, then public resolvers as fallback.
+    local ipfs_host=$(echo "$node_url" | sed 's|https\?://||' | cut -d/ -f1 | cut -d: -f1)
+    local resolved_ip=""
+    local resolve_opt=""
+    local resolve_source=""
+
+    # Method 1: FQDN with trailing dot (prevents search domain append)
+    if [ -z "$resolved_ip" ] && command -v getent &> /dev/null; then
+        resolved_ip=$(getent hosts "${ipfs_host}." 2>/dev/null | awk '{print $1; exit}')
+        resolve_source="FQDN"
+    fi
+
+    # Method 2: Public DNS resolvers (try multiple for geo-resilience)
+    if [ -z "$resolved_ip" ] && command -v nslookup &> /dev/null; then
+        for dns in 1.1.1.1 8.8.8.8 9.9.9.9; do
+            resolved_ip=$(nslookup "$ipfs_host" "$dns" 2>/dev/null | awk '/^Address: / { print $2; exit }')
+            if [ -n "$resolved_ip" ]; then
+                resolve_source="$dns"
+                break
+            fi
+        done
+    fi
+
+    if [ -n "$resolved_ip" ]; then
+        resolve_opt="--resolve ${ipfs_host}:443:${resolved_ip}"
+        echo "  DNS override: $ipfs_host -> $resolved_ip (via $resolve_source)" | tee -a "$OUTPUT_LOG"
+    else
+        echo "  DNS override: failed, using system resolver" | tee -a "$OUTPUT_LOG"
+    fi
+
+    # Upload via IPFS HTTP API with retry
     local CURL_OUTPUT=$(mktemp)
-    local HTTP_CODE=$(curl -s -w "%{http_code}" -X POST \
-        -H "X-API-Key: $IPFS_API_KEY" \
-        -F "file=@$upload_file" \
-        "${IPFS_NODE}/api/v0/add?pin=${IPFS_PIN}&wrap-with-directory=false" \
-        -o "$CURL_OUTPUT" 2>&1)
-    local CURL_EXIT=$?
+    local HTTP_CODE=""
+    local CURL_EXIT=1
+    local max_retries=3
+
+    for attempt in $(seq 1 $max_retries); do
+        HTTP_CODE=$(curl -s -w "%{http_code}" -X POST \
+            --connect-timeout 10 --max-time 60 \
+            $resolve_opt \
+            -H "X-API-Key: $IPFS_API_KEY" \
+            -F "file=@$upload_file" \
+            "${node_url}/api/v0/add?pin=${IPFS_PIN}&wrap-with-directory=false" \
+            -o "$CURL_OUTPUT" 2>/dev/null)
+        CURL_EXIT=$?
+        if [ $CURL_EXIT -eq 0 ] && [ "$HTTP_CODE" = "200" ]; then
+            break
+        fi
+        echo "  Attempt $attempt/$max_retries failed (curl=$CURL_EXIT, http=$HTTP_CODE), retrying..." | tee -a "$OUTPUT_LOG"
+        sleep 2
+    done
+
     local IPFS_RESPONSE=$(cat "$CURL_OUTPUT")
     rm -f "$CURL_OUTPUT"
 
@@ -362,15 +412,17 @@ upload_to_ipfs() {
         echo "  Adding to MFS: $MFS_PATH" | tee -a "$OUTPUT_LOG"
 
         # Create directory if needed
-        curl -s -X POST \
+        curl -s -X POST --connect-timeout 10 --max-time 30 \
+            $resolve_opt \
             -H "X-API-Key: $IPFS_API_KEY" \
-            "${IPFS_NODE}/api/v0/files/mkdir?arg=/${DEPLOYMENT_ID}&parents=true" \
-            > /dev/null 2>&1
+            "${node_url}/api/v0/files/mkdir?arg=/${DEPLOYMENT_ID}&parents=true" \
+            > /dev/null 2>/dev/null
 
         # Copy file to MFS
-        local MFS_RESPONSE=$(curl -s -X POST \
+        local MFS_RESPONSE=$(curl -s -X POST --connect-timeout 10 --max-time 30 \
+            $resolve_opt \
             -H "X-API-Key: $IPFS_API_KEY" \
-            "${IPFS_NODE}/api/v0/files/cp?arg=/ipfs/${CID}&arg=${MFS_PATH}" 2>&1)
+            "${node_url}/api/v0/files/cp?arg=/ipfs/${CID}&arg=${MFS_PATH}" 2>/dev/null)
 
         if [ $? -eq 0 ]; then
             echo "  ✓ Added to MFS: $MFS_PATH" | tee -a "$OUTPUT_LOG"
@@ -436,6 +488,32 @@ echo "" | tee -a "$OUTPUT_LOG"
 echo "========================================" | tee -a "$OUTPUT_LOG"
 echo "Uploading Results" | tee -a "$OUTPUT_LOG"
 echo "========================================" | tee -a "$OUTPUT_LOG"
+echo "Build: ${BUILD_TAG:-unknown}" | tee -a "$OUTPUT_LOG"
+
+# Connectivity diagnostics
+if [ -n "$IPFS_NODE" ]; then
+    local_node="${IPFS_NODE%/}"
+    echo "IPFS connectivity test:" | tee -a "$OUTPUT_LOG"
+    echo "  Target: ${local_node}/api/v0/id" | tee -a "$OUTPUT_LOG"
+
+    # DNS test
+    ipfs_host=$(echo "$local_node" | sed 's|https\?://||' | cut -d/ -f1 | cut -d: -f1)
+    echo "  DNS lookup ($ipfs_host):" | tee -a "$OUTPUT_LOG"
+    if command -v nslookup &> /dev/null; then
+        nslookup "$ipfs_host" 2>&1 | head -5 | tee -a "$OUTPUT_LOG"
+    elif command -v getent &> /dev/null; then
+        getent hosts "$ipfs_host" 2>&1 | tee -a "$OUTPUT_LOG"
+    else
+        echo "    (no DNS tools available)" | tee -a "$OUTPUT_LOG"
+    fi
+
+    # HTTP test with verbose output
+    echo "  curl -v test:" | tee -a "$OUTPUT_LOG"
+    curl -v -s --connect-timeout 10 --max-time 15 -X POST \
+        -H "X-API-Key: $IPFS_API_KEY" \
+        "${local_node}/api/v0/id" 2>&1 | tee -a "$OUTPUT_LOG"
+    echo "" | tee -a "$OUTPUT_LOG"
+fi
 
 # Try IPFS first (if configured)
 IPFS_UPLOAD_SUCCESS=false
