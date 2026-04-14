@@ -6,7 +6,7 @@
 # =============================================================================
 # Stage 1: Builder - Install Python packages with build dependencies
 # =============================================================================
-FROM nvidia/cuda:12.6.3-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:12.9.1-devel-ubuntu22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -53,7 +53,7 @@ RUN rm -rf /root/.cache/pip && \
 # =============================================================================
 # The GPU code uses custom CUDA kernels via cp.RawModule, not cuBLAS/cuFFT/etc.
 # Only cuda-cudart (runtime) and libnvrtc (kernel compilation) are needed.
-FROM nvidia/cuda:12.6.3-base-ubuntu22.04 AS runtime
+FROM nvidia/cuda:12.9.1-base-ubuntu22.04 AS runtime
 
 LABEL maintainer="Quip Protocol"
 LABEL description="CUDA GPU miner (optimized, ~1.5GB)"
@@ -65,9 +65,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     libgomp1 \
     curl dnsutils \
-    cuda-cudart-12-6 \
-    cuda-cudart-dev-12-6 \
-    cuda-nvrtc-12-6 \
+    cuda-cudart-12-9 \
+    cuda-cudart-dev-12-9 \
+    cuda-nvrtc-12-9 \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean \
     && rm -rf /var/cache/apt/archives/*

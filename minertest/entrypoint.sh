@@ -331,16 +331,16 @@ upload_to_ipfs() {
     local resolve_opt=""
     local resolve_source=""
 
-    # Method 1: FQDN with trailing dot (prevents search domain append)
+    # Method 1: FQDN with trailing dot (prevents search domain append), IPv4 only
     if [ -z "$resolved_ip" ] && command -v getent &> /dev/null; then
-        resolved_ip=$(getent hosts "${ipfs_host}." 2>/dev/null | awk '{print $1; exit}')
+        resolved_ip=$(getent ahostsv4 "${ipfs_host}." 2>/dev/null | awk '{print $1; exit}')
         resolve_source="FQDN"
     fi
 
-    # Method 2: Public DNS resolvers (try multiple for geo-resilience)
+    # Method 2: Public DNS resolvers (try multiple for geo-resilience), IPv4 only
     if [ -z "$resolved_ip" ] && command -v nslookup &> /dev/null; then
         for dns in 1.1.1.1 8.8.8.8 9.9.9.9; do
-            resolved_ip=$(nslookup "$ipfs_host" "$dns" 2>/dev/null | awk '/^Address: / { print $2; exit }')
+            resolved_ip=$(nslookup -type=A "$ipfs_host" "$dns" 2>/dev/null | awk '/^Address: / { ip=$2 } END { if (ip) print ip }')
             if [ -n "$resolved_ip" ]; then
                 resolve_source="$dns"
                 break
