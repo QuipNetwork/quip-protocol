@@ -436,6 +436,29 @@ def mine_worker(
             }
         result_queue.put(result)
 
+    # Callback for drain mode: mine_block stays in its loop and
+    # calls this on each block found instead of returning.
+    def on_block_found(result):
+        nonlocal total_qpu_time_us
+        blocks_found.append(result)
+        # Track QPU time
+        if hasattr(miner, 'timing_stats') and 'qpu_access_time' in miner.timing_stats:
+            if miner.timing_stats['qpu_access_time']:
+                total_qpu_time_us += miner.timing_stats['qpu_access_time'][-1]
+        qpu_msg = f", QPU: {total_qpu_time_us / 1e6:.2f}s total" if total_qpu_time_us > 0 else ""
+        elapsed_min = (time.time() - start_time) / 60
+        blocks_per_min = len(blocks_found) / elapsed_min if elapsed_min > 0 else 0
+        print(f"   [{miner_id}] Block {len(blocks_found)} found! "
+              f"Energy: {result.energy:.1f}, "
+              f"Diversity: {result.diversity:.3f}, "
+              f"Solutions: {result.num_valid}{qpu_msg}")
+        print(f"   [{miner_id}] Progress: {elapsed_min:.1f} min, "
+              f"Blocks: {len(blocks_found)}, "
+              f"Rate: {blocks_per_min:.2f}/min")
+        submit_results()
+
+    use_drain = kind == 'cuda'
+
     while not stop_event.is_set():
         # Progress update
         current_time = time.time()
@@ -452,7 +475,6 @@ def mine_worker(
 
         attempts += 1
 
-        # Build mine_block kwargs (drain only applies to CUDA)
         mine_kwargs = {
             'prev_block': prev_block,
             'node_info': node_info,
@@ -460,8 +482,9 @@ def mine_worker(
             'prev_timestamp': prev_block.header.timestamp,
             'stop_event': stop_event,
         }
-        if kind == 'cuda':
+        if use_drain:
             mine_kwargs['drain'] = True
+            mine_kwargs['on_block'] = on_block_found
 
         result = miner.mine_block(**mine_kwargs)
 

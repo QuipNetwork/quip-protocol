@@ -66,6 +66,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     curl \
     cuda-cudart-12-6 \
+    cuda-cudart-dev-12-6 \
     cuda-nvrtc-12-6 \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean \
