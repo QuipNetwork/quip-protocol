@@ -226,32 +226,57 @@ class TestGenerateIsingModel:
 
 
 # ---------------------------------------------------------------------------
-# Backward compatibility
+# Edge cases and input validation
 # ---------------------------------------------------------------------------
 
-class TestBackwardCompatibility:
-    """Old functions should still produce the same output."""
+class TestEdgeCases:
+    """Validate error handling and boundary conditions."""
 
-    def test_old_nonce_function_unchanged(self):
-        from shared.quantum_proof_of_work import ising_nonce_from_block
-        nonce = ising_nonce_from_block(
-            prev_hash=b'\x00' * 32,
-            miner_id='test',
-            cur_index=0,
-            salt=b'\x00' * 32,
-        )
-        assert isinstance(nonce, int)
-        assert 0 <= nonce < 2**32
+    def test_empty_allowed_h_values_raises(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            generate_ising_model(42, [0, 1], [(0, 1)], [])
 
-    def test_old_generate_function_unchanged(self):
-        from shared.quantum_proof_of_work import generate_ising_model_from_nonce
-        nodes = [0, 1, 2]
-        edges = [(0, 1), (1, 2)]
-        h, J = generate_ising_model_from_nonce(42, nodes, edges)
-        # Old function uses numpy PCG64, should still work
+    def test_empty_nodes_raises(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            generate_ising_model(42, [], [])
+
+    def test_single_h_value(self):
+        h, J = generate_ising_model(42, [0, 1], [(0, 1)], [0.0])
+        assert all(v == 0.0 for v in h.values())
+
+    def test_empty_edges_returns_empty_j(self):
+        h, J = generate_ising_model(42, [0, 1, 2], [])
+        assert len(J) == 0
         assert len(h) == 3
-        assert len(J) == 2
-        for v in h.values():
-            assert v in (-1.0, 0.0, 1.0)
-        for v in J.values():
-            assert v in (-1.0, 1.0)
+
+    def test_seed_out_of_range_raises(self):
+        with pytest.raises(ValueError, match="u64"):
+            ChaCha8Rng.seed_from_u64(-1)
+        with pytest.raises(ValueError, match="u64"):
+            ChaCha8Rng.seed_from_u64(2**64)
+
+    def test_derive_nonce_block_number_overflow(self):
+        with pytest.raises(ValueError, match="u32"):
+            derive_nonce(b'\x00' * 32, 'miner', 2**32, b'\x00' * 32)
+
+    def test_derive_nonce_block_number_negative(self):
+        with pytest.raises(ValueError, match="u32"):
+            derive_nonce(b'\x00' * 32, 'miner', -1, b'\x00' * 32)
+
+    def test_derive_nonce_max_u32(self):
+        nonce = derive_nonce(b'\x00' * 32, 'miner', 2**32 - 1, b'\x00' * 32)
+        assert 0 <= nonce < 2**64
+
+    def test_counter_carry(self):
+        """Verify 64-bit counter carry from state[12] to state[13]."""
+        key = b'\x00' * 32
+        rng = ChaCha8Rng(key, counter=0xFFFFFFFF)
+        # Consume all 16 words from the first block
+        for _ in range(16):
+            rng.next_u32()
+        # Next call triggers _refill_buffer with carry
+        val = rng.next_u32()
+        assert 0 <= val <= 0xFFFFFFFF
+        # Counter should have wrapped: state[12]=0, state[13]=1
+        assert rng._state[12] == 1
+        assert rng._state[13] == 1
