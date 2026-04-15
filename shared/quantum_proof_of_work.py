@@ -11,6 +11,7 @@ from typing import Any, Tuple, Dict, Optional, List
 from blake3 import blake3
 import numpy as np
 
+from shared.chacha8 import ChaCha8Rng
 from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
 from dwave_topologies import DEFAULT_TOPOLOGY
@@ -82,6 +83,65 @@ def generate_ising_model_from_nonce(
         # General case: sample from h_values distribution
         h_vals = rng.choice(h_values, size=len(nodes))
         h = {int(node_id): float(h_vals[idx]) for idx, node_id in enumerate(nodes)}
+
+    return h, J
+
+
+def derive_nonce(
+    parent_hash: bytes,
+    miner_id: str,
+    block_number: int,
+    salt: bytes,
+) -> int:
+    """Derive a u64 nonce from block parameters using BLAKE3.
+
+    Matches Rust's derive_nonce() in quip-protocol-rs. Key differences
+    from ising_nonce_from_block:
+      - Hashes raw bytes (not hex-encoded strings)
+      - Uses u32 big-endian for block_number
+      - Returns u64 (8 bytes) not u32 (4 bytes)
+    """
+    hasher = blake3()
+    hasher.update(parent_hash)
+    hasher.update(miner_id.encode())
+    hasher.update(block_number.to_bytes(4, 'big'))
+    hasher.update(salt)
+    digest = hasher.digest()
+    return int.from_bytes(digest[:8], 'big')
+
+
+def generate_ising_model(
+    nonce: int,
+    nodes: List[int],
+    edges: List[Tuple[int, int]],
+    allowed_h_values: Optional[List[float]] = None,
+) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float]]:
+    """Generate (h, J) Ising parameters using ChaCha8Rng.
+
+    Matches Rust's generate_ising_model() in quip-protocol-rs. Key
+    differences from generate_ising_model_from_nonce:
+      - Uses ChaCha8Rng (not numpy PCG64)
+      - Generates h FIRST, then J (reversed order)
+      - Uses next_u32() % len for h (modulo selection, matches Rust)
+      - Uses next_u32() & 1 for J sign
+    """
+    if allowed_h_values is None:
+        allowed_h_values = [-1.0, 0.0, 1.0]
+
+    rng = ChaCha8Rng.seed_from_u64(nonce)
+    n_h = len(allowed_h_values)
+
+    # h FIRST: one next_u32() per node
+    h: Dict[int, float] = {}
+    for node_id in nodes:
+        index = rng.next_u32() % n_h
+        h[int(node_id)] = allowed_h_values[index]
+
+    # J SECOND: one next_u32() per edge
+    J: Dict[Tuple[int, int], float] = {}
+    for (u, v) in edges:
+        sign = -1.0 if (rng.next_u32() & 1) == 0 else 1.0
+        J[(int(u), int(v))] = sign
 
     return h, J
 
