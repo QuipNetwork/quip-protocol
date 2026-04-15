@@ -2,6 +2,68 @@
 
 QAOA-based quantum miner for the QUIP proof-of-work protocol. Currently runs on Qiskit's AerSimulator (local simulation) — no IBM account or API keys needed.
 
+## Setup
+
+```bash
+# Install project (registers quip-network-node on PATH)
+pip install -e .
+
+# Install IBM QAOA dependencies
+pip install qiskit qiskit-aer qiskit-ibm-runtime dimod numpy scipy psutil
+
+# If quip-network-node is not recognized after install, add Scripts to PATH:
+# PowerShell:
+$env:PATH += ";C:\Users\<you>\AppData\Local\Python\<version>\Scripts"
+```
+
+## Usage
+
+### Baseline Testing (no node infrastructure needed)
+
+```bash
+# Quick smoke test — 8-node subgraph, ~1 min
+python tools/ibm_qaoa_baseline.py --quick -v
+
+# Standard test — 10-node subgraph, parameter sweep
+python tools/ibm_qaoa_baseline.py -v
+
+# Solution quality check against known optimal energies
+python tools/ibm_qaoa_baseline.py --known-problems -v
+
+# Memory stress test — 28-node subgraph, ~4 GB RAM
+python tools/ibm_qaoa_baseline.py --stress -v
+```
+
+### Running a Node
+
+```bash
+# AerSimulator (default, no API key needed)
+quip-network-node --config quip.network.ibm_qaoa.example.toml ibm_qaoa --auto-mine
+
+# IBM hardware
+quip-network-node --config quip.network.ibm_qaoa.example.toml ibm_qaoa --backend ibm --ibm-api-token TOKEN
+
+# With custom QAOA parameters
+quip-network-node --config quip.network.ibm_qaoa.example.toml ibm_qaoa --auto-mine --subgraph-size 10 --p 2 --optimizer SPSA --shots 512
+```
+
+### TOML Configuration
+
+See `quip.network.ibm_qaoa.example.toml` for all options. Key settings:
+
+```toml
+[ibm_qaoa]
+backend = "aer"           # "aer" (local) or "ibm" (real hardware)
+subgraph_size = 14        # nodes extracted from protocol topology
+p = 1                     # QAOA circuit depth
+optimizer = "COBYLA"      # COBYLA, NELDER_MEAD, POWELL, L_BFGS_B, SPSA
+shots = 1024              # shots per optimizer evaluation
+
+# IBM hardware (only when backend = "ibm")
+# ibm_api_token = "your-token"
+# ibm_backend_name = "ibm_brisbane"
+```
+
 ## Why QAOA
 
 The protocol's proof-of-work is an Ising optimization problem defined on a fixed graph (4,579 nodes, 41,549 edges, from the D-Wave Advantage2 topology). D-Wave solves this natively via quantum annealing. QAOA is the gate-based alternative — it runs on IBM-style quantum hardware (or simulators) and uses a variational approach: build a parameterized quantum circuit, optimize its parameters classically, then sample solutions.
@@ -95,17 +157,3 @@ The practical limit for consumer hardware (64 GB) is around 28–31 qubits with 
 - **Matrix Product State (MPS)** — `AerSimulator(method='matrix_product_state')` avoids storing the full 2^n statevector. Memory scales with entanglement, not qubit count. Can handle 50+ qubits for low-entanglement circuits, but QAOA circuits may have high entanglement, limiting the benefit.
 
 The baseline tool uses subgraphs of 8–28 nodes to prove the code works. Real mining on the full topology would require future quantum hardware with thousands of qubits, or a protocol change to use smaller graphs.
-
-## Baseline Tool
-
-`tools/ibm_qaoa_baseline.py` — benchmarks the solver on AerSimulator.
-
-```bash
-pip install qiskit qiskit-aer dimod numpy scipy psutil
-
-python tools/ibm_qaoa_baseline.py --quick            # fast smoke test
-python tools/ibm_qaoa_baseline.py --known-problems   # solution quality check
-python tools/ibm_qaoa_baseline.py --stress           # memory stress test (28 qubits)
-```
-
-**Pipeline mode** (`--quick`/standard/`--extended`/`--stress`) proves the mining pipeline works end-to-end on topology subgraphs. **Known-problems mode** (`--known-problems`) tests solution quality against problems with known optimal energies and reports approximation ratios.
