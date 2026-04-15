@@ -520,6 +520,7 @@ class BaseMiner(ABC):
                     h, J,
                     num_reads=num_reads,
                     num_sweeps=current_num_sweeps,
+                    nonce_seed=nonce,
                     **extra_params,
                 )
 
