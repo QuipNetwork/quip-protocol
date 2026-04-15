@@ -127,6 +127,10 @@ def generate_ising_model(
     """
     if allowed_h_values is None:
         allowed_h_values = [-1.0, 0.0, 1.0]
+    if not allowed_h_values:
+        raise ValueError("allowed_h_values must be non-empty")
+    if not nodes:
+        raise ValueError("nodes must be non-empty for Ising model generation")
 
     rng = ChaCha8Rng.seed_from_u64(nonce)
     n_h = len(allowed_h_values)
