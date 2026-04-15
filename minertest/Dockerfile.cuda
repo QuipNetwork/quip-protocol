@@ -1,4 +1,4 @@
-# Akash-optimized Dockerfile for CUDA mining
+# Dockerfile for CUDA mining
 # Uses CUDA 12.6 with Ubuntu 22.04 (driver 525+)
 # Ubuntu 22.04 has Python 3.10 built in (no PPA needed)
 # Optimized for minimal size (~2GB vs 5GB+)
@@ -6,7 +6,7 @@
 # =============================================================================
 # Stage 1: Builder - Install Python packages with build dependencies
 # =============================================================================
-FROM nvidia/cuda:12.6.3-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:12.9.1-devel-ubuntu22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -27,7 +27,7 @@ RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Install Python dependencies (minimal - no PyTorch!)
-COPY akash/requirements-mining-cuda.txt ./requirements.txt
+COPY minertest/requirements-cuda.txt ./requirements.txt
 RUN pip install --no-cache-dir --upgrade pip wheel && \
     pip install --no-cache-dir -r requirements.txt
 
@@ -49,22 +49,25 @@ RUN rm -rf /root/.cache/pip && \
     find /opt/venv -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 
 # =============================================================================
-# Stage 2: Runtime - Includes cuBLAS and other CUDA libraries needed by CuPy
+# Stage 2: Runtime - Minimal CUDA base + only the libs CuPy RawModule needs
 # =============================================================================
-# Use 'runtime' image - includes cuBLAS, cuFFT, cuSPARSE, cuSOLVER, cuRAND
-# (base only has libcudart, which is insufficient for CuPy)
-FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04 AS runtime
+# The GPU code uses custom CUDA kernels via cp.RawModule, not cuBLAS/cuFFT/etc.
+# Only cuda-cudart (runtime) and libnvrtc (kernel compilation) are needed.
+FROM nvidia/cuda:12.9.1-base-ubuntu22.04 AS runtime
 
 LABEL maintainer="Quip Protocol"
-LABEL description="CUDA GPU miner for Akash (optimized, ~2GB)"
+LABEL description="CUDA GPU miner (optimized, ~1.5GB)"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install minimal Python 3.10 runtime (Ubuntu 22.04 default)
+# Install Python 3.10, minimal CUDA libs for CuPy RawKernel, and runtime deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     libgomp1 \
-    curl \
+    curl dnsutils \
+    cuda-cudart-12-9 \
+    cuda-cudart-dev-12-9 \
+    cuda-nvrtc-12-9 \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean \
     && rm -rf /var/cache/apt/archives/*
@@ -103,12 +106,15 @@ ENV CUPY_CACHE_DIR=/tmp/cupy_cache
 RUN mkdir -p /output /tmp/cupy_cache
 
 # Copy entrypoint
-COPY akash/entrypoint-ipfs.sh /entrypoint.sh
+COPY minertest/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
   CMD curl -f http://localhost:8080/ || exit 1
+
+ARG BUILD_TAG=dev
+ENV BUILD_TAG=${BUILD_TAG}
 
 ENTRYPOINT ["/entrypoint.sh"]

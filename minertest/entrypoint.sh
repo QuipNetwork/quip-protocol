@@ -1,5 +1,5 @@
 #!/bin/bash
-# Akash entrypoint with IPFS upload support
+# Mining entrypoint with IPFS upload support
 set -e
 
 MINER_TYPE="${MINER_TYPE:-cpu}"
@@ -10,17 +10,18 @@ MIN_SOLUTIONS="${MIN_SOLUTIONS:-5}"
 TOPOLOGY_FILE="${TOPOLOGY_FILE:-dwave_topologies/topologies/advantage2_system1_7.json.gz}"
 GPU_DEVICE="${GPU_DEVICE:-0}"
 NUM_CPUS="${NUM_CPUS:-}"  # Override auto-detected CPU count
+UPDATE_MODE="${UPDATE_MODE:-sa}"  # CUDA algorithm: sa or gibbs
 
 # Suppress SyntaxWarnings from third-party packages (dwave-samplers, homebase on Python 3.13)
 export PYTHONWARNINGS="ignore::SyntaxWarning"
 
 # Set up output files early so diagnostics can be logged
-DEPLOYMENT_ID="${AKASH_DEPLOYMENT_ID:-$(hostname)}"
+DEPLOYMENT_ID="${DEPLOYMENT_ID:-${AKASH_DEPLOYMENT_ID:-$(hostname)}}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_DIR="/output"
 mkdir -p "$OUTPUT_DIR"
-OUTPUT_JSON="${OUTPUT_DIR}/${MINER_TYPE}_${DEPLOYMENT_ID}_${TIMESTAMP}.json"
-OUTPUT_LOG="${OUTPUT_DIR}/${MINER_TYPE}_${DEPLOYMENT_ID}_${TIMESTAMP}.log"
+OUTPUT_JSON="${OUTPUT_DIR}/${MINER_TYPE}_${UPDATE_MODE}_${DEPLOYMENT_ID}_${TIMESTAMP}.json"
+OUTPUT_LOG="${OUTPUT_DIR}/${MINER_TYPE}_${UPDATE_MODE}_${DEPLOYMENT_ID}_${TIMESTAMP}.log"
 
 # Create symlinks for easy HTTP access
 ln -sf "$OUTPUT_JSON" "${OUTPUT_DIR}/latest.json"
@@ -274,9 +275,10 @@ IPFS_PIN="${IPFS_PIN:-false}"  # Pin to IPFS (keep permanently)
 S3_BUCKET="${S3_BUCKET:-}"
 
 echo "========================================" | tee -a "$OUTPUT_LOG"
-echo "Quip Protocol - Akash Mining with IPFS" | tee -a "$OUTPUT_LOG"
+echo "Quip Protocol - Mining with IPFS" | tee -a "$OUTPUT_LOG"
 echo "========================================" | tee -a "$OUTPUT_LOG"
 echo "Miner Type: $MINER_TYPE" | tee -a "$OUTPUT_LOG"
+echo "Update Mode: $UPDATE_MODE" | tee -a "$OUTPUT_LOG"
 echo "Deployment ID: $DEPLOYMENT_ID" | tee -a "$OUTPUT_LOG"
 echo "Start Time: $(date)" | tee -a "$OUTPUT_LOG"
 echo "Duration: $MINING_DURATION" | tee -a "$OUTPUT_LOG"
@@ -317,14 +319,64 @@ upload_to_ipfs() {
     local upload_filename="${filename}.gz"
     echo "  Compressed size: $(ls -lh "$compressed_file" | awk '{print $5}')" | tee -a "$OUTPUT_LOG"
 
-    # Upload via IPFS HTTP API (capture both stdout and stderr)
+    # Strip trailing slash from IPFS_NODE to avoid double-slash in URL
+    local node_url="${IPFS_NODE%/}"
+
+    # Resolve IPFS hostname bypassing broken provider DNS search domains.
+    # Some Akash/K8s providers append cluster search domains (e.g. .alphionsee.in)
+    # which hijack external hostname resolution.
+    # Strategy: try FQDN (trailing dot) first, then public resolvers as fallback.
+    local ipfs_host=$(echo "$node_url" | sed 's|https\?://||' | cut -d/ -f1 | cut -d: -f1)
+    local resolved_ip=""
+    local resolve_opt=""
+    local resolve_source=""
+
+    # Method 1: FQDN with trailing dot (prevents search domain append), IPv4 only
+    if [ -z "$resolved_ip" ] && command -v getent &> /dev/null; then
+        resolved_ip=$(getent ahostsv4 "${ipfs_host}." 2>/dev/null | awk '{print $1; exit}')
+        resolve_source="FQDN"
+    fi
+
+    # Method 2: Public DNS resolvers (try multiple for geo-resilience), IPv4 only
+    if [ -z "$resolved_ip" ] && command -v nslookup &> /dev/null; then
+        for dns in 1.1.1.1 8.8.8.8 9.9.9.9; do
+            resolved_ip=$(nslookup -type=A "$ipfs_host" "$dns" 2>/dev/null | awk '/^Address: / { ip=$2 } END { if (ip) print ip }')
+            if [ -n "$resolved_ip" ]; then
+                resolve_source="$dns"
+                break
+            fi
+        done
+    fi
+
+    if [ -n "$resolved_ip" ]; then
+        resolve_opt="--resolve ${ipfs_host}:443:${resolved_ip}"
+        echo "  DNS override: $ipfs_host -> $resolved_ip (via $resolve_source)" | tee -a "$OUTPUT_LOG"
+    else
+        echo "  DNS override: failed, using system resolver" | tee -a "$OUTPUT_LOG"
+    fi
+
+    # Upload via IPFS HTTP API with retry
     local CURL_OUTPUT=$(mktemp)
-    local HTTP_CODE=$(curl -s -w "%{http_code}" -X POST \
-        -H "X-API-Key: $IPFS_API_KEY" \
-        -F "file=@$upload_file" \
-        "${IPFS_NODE}/api/v0/add?pin=${IPFS_PIN}&wrap-with-directory=false" \
-        -o "$CURL_OUTPUT" 2>&1)
-    local CURL_EXIT=$?
+    local HTTP_CODE=""
+    local CURL_EXIT=1
+    local max_retries=3
+
+    for attempt in $(seq 1 $max_retries); do
+        HTTP_CODE=$(curl -s -w "%{http_code}" -X POST \
+            --connect-timeout 10 --max-time 60 \
+            $resolve_opt \
+            -H "X-API-Key: $IPFS_API_KEY" \
+            -F "file=@$upload_file" \
+            "${node_url}/api/v0/add?pin=${IPFS_PIN}&wrap-with-directory=false" \
+            -o "$CURL_OUTPUT" 2>/dev/null)
+        CURL_EXIT=$?
+        if [ $CURL_EXIT -eq 0 ] && [ "$HTTP_CODE" = "200" ]; then
+            break
+        fi
+        echo "  Attempt $attempt/$max_retries failed (curl=$CURL_EXIT, http=$HTTP_CODE), retrying..." | tee -a "$OUTPUT_LOG"
+        sleep 2
+    done
+
     local IPFS_RESPONSE=$(cat "$CURL_OUTPUT")
     rm -f "$CURL_OUTPUT"
 
@@ -360,15 +412,17 @@ upload_to_ipfs() {
         echo "  Adding to MFS: $MFS_PATH" | tee -a "$OUTPUT_LOG"
 
         # Create directory if needed
-        curl -s -X POST \
+        curl -s -X POST --connect-timeout 10 --max-time 30 \
+            $resolve_opt \
             -H "X-API-Key: $IPFS_API_KEY" \
-            "${IPFS_NODE}/api/v0/files/mkdir?arg=/${DEPLOYMENT_ID}&parents=true" \
-            > /dev/null 2>&1
+            "${node_url}/api/v0/files/mkdir?arg=/${DEPLOYMENT_ID}&parents=true" \
+            > /dev/null 2>/dev/null
 
         # Copy file to MFS
-        local MFS_RESPONSE=$(curl -s -X POST \
+        local MFS_RESPONSE=$(curl -s -X POST --connect-timeout 10 --max-time 30 \
+            $resolve_opt \
             -H "X-API-Key: $IPFS_API_KEY" \
-            "${IPFS_NODE}/api/v0/files/cp?arg=/ipfs/${CID}&arg=${MFS_PATH}" 2>&1)
+            "${node_url}/api/v0/files/cp?arg=/ipfs/${CID}&arg=${MFS_PATH}" 2>/dev/null)
 
         if [ $? -eq 0 ]; then
             echo "  ✓ Added to MFS: $MFS_PATH" | tee -a "$OUTPUT_LOG"
@@ -413,7 +467,7 @@ CMD="python tools/compare_mining_rates.py \
   --topology $TOPOLOGY_FILE"
 
 if [ "$MINER_TYPE" = "cuda" ]; then
-  CMD="$CMD --device $GPU_DEVICE"
+  CMD="$CMD --device $GPU_DEVICE --update-mode $UPDATE_MODE"
 fi
 
 CMD="$CMD -o $OUTPUT_JSON"
@@ -434,6 +488,32 @@ echo "" | tee -a "$OUTPUT_LOG"
 echo "========================================" | tee -a "$OUTPUT_LOG"
 echo "Uploading Results" | tee -a "$OUTPUT_LOG"
 echo "========================================" | tee -a "$OUTPUT_LOG"
+echo "Build: ${BUILD_TAG:-unknown}" | tee -a "$OUTPUT_LOG"
+
+# Connectivity diagnostics
+if [ -n "$IPFS_NODE" ]; then
+    local_node="${IPFS_NODE%/}"
+    echo "IPFS connectivity test:" | tee -a "$OUTPUT_LOG"
+    echo "  Target: ${local_node}/api/v0/id" | tee -a "$OUTPUT_LOG"
+
+    # DNS test
+    ipfs_host=$(echo "$local_node" | sed 's|https\?://||' | cut -d/ -f1 | cut -d: -f1)
+    echo "  DNS lookup ($ipfs_host):" | tee -a "$OUTPUT_LOG"
+    if command -v nslookup &> /dev/null; then
+        nslookup "$ipfs_host" 2>&1 | head -5 | tee -a "$OUTPUT_LOG"
+    elif command -v getent &> /dev/null; then
+        getent hosts "$ipfs_host" 2>&1 | tee -a "$OUTPUT_LOG"
+    else
+        echo "    (no DNS tools available)" | tee -a "$OUTPUT_LOG"
+    fi
+
+    # HTTP test with verbose output
+    echo "  curl -v test:" | tee -a "$OUTPUT_LOG"
+    curl -v -s --connect-timeout 10 --max-time 15 -X POST \
+        -H "X-API-Key: $IPFS_API_KEY" \
+        "${local_node}/api/v0/id" 2>&1 | tee -a "$OUTPUT_LOG"
+    echo "" | tee -a "$OUTPUT_LOG"
+fi
 
 # Try IPFS first (if configured)
 IPFS_UPLOAD_SUCCESS=false
@@ -452,6 +532,7 @@ if [ -n "$IPFS_NODE" ]; then
 {
   "deployment_id": "$DEPLOYMENT_ID",
   "miner_type": "$MINER_TYPE",
+  "update_mode": "$UPDATE_MODE",
   "timestamp": "$TIMESTAMP",
   "duration": "$MINING_DURATION",
   "difficulty": $DIFFICULTY_ENERGY,
@@ -483,6 +564,33 @@ EOF
             # Check if all uploads succeeded
             if [ $IPFS_JSON_SUCCESS -eq 0 ] && [ $IPFS_LOG_SUCCESS -eq 0 ] && [ $IPFS_MANIFEST_SUCCESS -eq 0 ]; then
                 IPFS_UPLOAD_SUCCESS=true
+
+                # Pin the MFS deployment directory so it shows as pinned in Web UI
+                local pin_node_url="${IPFS_NODE%/}"
+                local pin_host=$(echo "$pin_node_url" | sed 's|https\?://||' | cut -d/ -f1 | cut -d: -f1)
+                local pin_resolve=""
+                local pin_ip=$(getent ahostsv4 "${pin_host}." 2>/dev/null | head -1 | awk '{print $1}')
+                if [ -n "$pin_ip" ]; then
+                    pin_resolve="--resolve ${pin_host}:443:${pin_ip}"
+                fi
+
+                # Get the MFS directory CID
+                local dir_stat=$(curl -s -X POST --connect-timeout 10 --max-time 30 \
+                    $pin_resolve \
+                    -H "X-API-Key: $IPFS_API_KEY" \
+                    "${pin_node_url}/api/v0/files/stat?arg=/${DEPLOYMENT_ID}" 2>/dev/null)
+                local dir_cid=$(echo "$dir_stat" | grep -o '"Hash":"[^"]*' | cut -d'"' -f4)
+
+                if [ -n "$dir_cid" ]; then
+                    echo "  Pinning deployment directory /${DEPLOYMENT_ID} ($dir_cid)..." | tee -a "$OUTPUT_LOG"
+                    curl -s -X POST --connect-timeout 10 --max-time 60 \
+                        $pin_resolve \
+                        -H "X-API-Key: $IPFS_API_KEY" \
+                        "${pin_node_url}/api/v0/pin/add?arg=${dir_cid}" > /dev/null 2>/dev/null
+                    if [ $? -eq 0 ]; then
+                        echo "  Pinned deployment directory: $dir_cid" | tee -a "$OUTPUT_LOG"
+                    fi
+                fi
             fi
         fi
     fi
@@ -517,7 +625,7 @@ if [ "$IPFS_UPLOAD_SUCCESS" = true ]; then
     echo "🔗 Access at: https://ipfs.io/ipfs/$MANIFEST_CID" | tee -a "$OUTPUT_LOG"
     echo "" | tee -a "$OUTPUT_LOG"
     echo "Retrieve your results with:" | tee -a "$OUTPUT_LOG"
-    echo "  ./akash/collect_ipfs_results.sh \"$MANIFEST_CID\"" | tee -a "$OUTPUT_LOG"
+    echo "  ipfs get $MANIFEST_CID" | tee -a "$OUTPUT_LOG"
     echo "" | tee -a "$OUTPUT_LOG"
     echo "✅ Mining and upload complete!" | tee -a "$OUTPUT_LOG"
     echo "   Results saved to IPFS - deployment can be closed" | tee -a "$OUTPUT_LOG"
