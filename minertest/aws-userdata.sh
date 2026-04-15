@@ -13,7 +13,7 @@ DOCKER_IMAGE="${DOCKER_IMAGE:-carback1/quip-protocol-cuda-miner:latest}"
 AUTO_TERMINATE="${AUTO_TERMINATE:-true}"
 
 # IPFS configuration (required for result upload)
-IPFS_API_URL="${IPFS_API_URL:-}"
+IPFS_NODE="${IPFS_NODE:-}"
 IPFS_API_KEY="${IPFS_API_KEY:-}"
 
 echo "========================================="
@@ -67,7 +67,7 @@ for GPU_ID in $(seq 0 $((NUM_GPUS - 1))); do
         -e MIN_SOLUTIONS="$MIN_SOLUTIONS" \
         -e TOPOLOGY_FILE="$TOPOLOGY_FILE" \
         -e DEPLOYMENT_ID="${INSTANCE_ID}-gpu${GPU_ID}" \
-        -e IPFS_API_URL="$IPFS_API_URL" \
+        -e IPFS_NODE="$IPFS_NODE" \
         -e IPFS_API_KEY="$IPFS_API_KEY" \
         "$DOCKER_IMAGE"
 done

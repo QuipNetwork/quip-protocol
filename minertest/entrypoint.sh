@@ -564,6 +564,33 @@ EOF
             # Check if all uploads succeeded
             if [ $IPFS_JSON_SUCCESS -eq 0 ] && [ $IPFS_LOG_SUCCESS -eq 0 ] && [ $IPFS_MANIFEST_SUCCESS -eq 0 ]; then
                 IPFS_UPLOAD_SUCCESS=true
+
+                # Pin the MFS deployment directory so it shows as pinned in Web UI
+                local pin_node_url="${IPFS_NODE%/}"
+                local pin_host=$(echo "$pin_node_url" | sed 's|https\?://||' | cut -d/ -f1 | cut -d: -f1)
+                local pin_resolve=""
+                local pin_ip=$(getent ahostsv4 "${pin_host}." 2>/dev/null | head -1 | awk '{print $1}')
+                if [ -n "$pin_ip" ]; then
+                    pin_resolve="--resolve ${pin_host}:443:${pin_ip}"
+                fi
+
+                # Get the MFS directory CID
+                local dir_stat=$(curl -s -X POST --connect-timeout 10 --max-time 30 \
+                    $pin_resolve \
+                    -H "X-API-Key: $IPFS_API_KEY" \
+                    "${pin_node_url}/api/v0/files/stat?arg=/${DEPLOYMENT_ID}" 2>/dev/null)
+                local dir_cid=$(echo "$dir_stat" | grep -o '"Hash":"[^"]*' | cut -d'"' -f4)
+
+                if [ -n "$dir_cid" ]; then
+                    echo "  Pinning deployment directory /${DEPLOYMENT_ID} ($dir_cid)..." | tee -a "$OUTPUT_LOG"
+                    curl -s -X POST --connect-timeout 10 --max-time 60 \
+                        $pin_resolve \
+                        -H "X-API-Key: $IPFS_API_KEY" \
+                        "${pin_node_url}/api/v0/pin/add?arg=${dir_cid}" > /dev/null 2>/dev/null
+                    if [ $? -eq 0 ]; then
+                        echo "  Pinned deployment directory: $dir_cid" | tee -a "$OUTPUT_LOG"
+                    fi
+                fi
             fi
         fi
     fi
@@ -598,7 +625,7 @@ if [ "$IPFS_UPLOAD_SUCCESS" = true ]; then
     echo "🔗 Access at: https://ipfs.io/ipfs/$MANIFEST_CID" | tee -a "$OUTPUT_LOG"
     echo "" | tee -a "$OUTPUT_LOG"
     echo "Retrieve your results with:" | tee -a "$OUTPUT_LOG"
-    echo "  ./akash/collect_ipfs_results.sh \"$MANIFEST_CID\"" | tee -a "$OUTPUT_LOG"
+    echo "  ipfs get $MANIFEST_CID" | tee -a "$OUTPUT_LOG"
     echo "" | tee -a "$OUTPUT_LOG"
     echo "✅ Mining and upload complete!" | tee -a "$OUTPUT_LOG"
     echo "   Results saved to IPFS - deployment can be closed" | tee -a "$OUTPUT_LOG"

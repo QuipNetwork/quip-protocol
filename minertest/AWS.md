@@ -86,7 +86,7 @@ Or inject env vars at launch time by prepending them to the script:
 ```bash
 cat > /tmp/userdata.sh << 'OUTER'
 #!/bin/bash
-export IPFS_API_URL="https://your-ipfs-node.example.com"
+export IPFS_NODE="https://your-ipfs-node.example.com"
 export IPFS_API_KEY="your-api-key"
 export MINING_DURATION="90m"
 export DIFFICULTY_ENERGY="-14900"
