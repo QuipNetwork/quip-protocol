@@ -101,6 +101,10 @@ def derive_nonce(
       - Uses u32 big-endian for block_number
       - Returns u64 (8 bytes) not u32 (4 bytes)
     """
+    if not (0 <= block_number < 2**32):
+        raise ValueError(
+            f"block_number must be a u32 (0..2^32-1), got {block_number}"
+        )
     hasher = blake3()
     hasher.update(parent_hash)
     hasher.update(miner_id.encode())
