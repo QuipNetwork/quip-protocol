@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build and push Docker images for Akash deployment
+# Build and push Docker images for mining deployment
 # Supports multi-platform builds for amd64 and arm64
 set -e
 
@@ -15,7 +15,7 @@ VERSION="${VERSION:-latest}"
 PLATFORM="${PLATFORM:-linux/amd64,linux/arm64}"  # Multi-arch by default
 
 echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}Building Akash-Optimized Docker Images${NC}"
+echo -e "${BLUE}Building Docker Mining Images${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo "Registry: $REGISTRY"
 echo "Version: $VERSION"
@@ -60,7 +60,7 @@ if [ "$IS_MULTI_PLATFORM" = true ]; then
 
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         echo -e "${YELLOW}Aborted. To build single platform locally:${NC}"
-        echo "  PLATFORM=linux/amd64 ./akash/build_akash_images.sh"
+        echo "  PLATFORM=linux/amd64 ./minertest/build_images.sh"
         exit 0
     fi
 
@@ -68,7 +68,7 @@ if [ "$IS_MULTI_PLATFORM" = true ]; then
     echo -e "${GREEN}[1/2] Building & pushing CPU miner (${PLATFORM})...${NC}"
     docker buildx build \
       --platform ${PLATFORM} \
-      -f akash/Dockerfile.akash-cpu \
+      -f minertest/Dockerfile.cpu \
       -t ${REGISTRY}/quip-protocol-cpu-miner:${VERSION} \
       -t ${REGISTRY}/quip-protocol-cpu-miner:latest \
       --push \
@@ -86,7 +86,7 @@ if [ "$IS_MULTI_PLATFORM" = true ]; then
     echo -e "${GREEN}[2/2] Building & pushing CUDA miner (${PLATFORM})...${NC}"
     docker buildx build \
       --platform ${PLATFORM} \
-      -f akash/Dockerfile.akash-cuda \
+      -f minertest/Dockerfile.cuda \
       -t ${REGISTRY}/quip-protocol-cuda-miner:${VERSION} \
       -t ${REGISTRY}/quip-protocol-cuda-miner:latest \
       --push \
@@ -103,10 +103,10 @@ else
     # Single platform: can use --load for local testing
 
     # Build CPU image
-    echo -e "${GREEN}[1/2] Building CPU miner for Akash (${PLATFORM})...${NC}"
+    echo -e "${GREEN}[1/2] Building CPU miner (${PLATFORM})...${NC}"
     docker buildx build \
       --platform ${PLATFORM} \
-      -f akash/Dockerfile.akash-cpu \
+      -f minertest/Dockerfile.cpu \
       -t ${REGISTRY}/quip-protocol-cpu-miner:${VERSION} \
       -t ${REGISTRY}/quip-protocol-cpu-miner:latest \
       --load \
@@ -121,10 +121,10 @@ else
     echo ""
 
     # Build CUDA image
-    echo -e "${GREEN}[2/2] Building CUDA miner for Akash (${PLATFORM})...${NC}"
+    echo -e "${GREEN}[2/2] Building CUDA miner (${PLATFORM})...${NC}"
     docker buildx build \
       --platform ${PLATFORM} \
-      -f akash/Dockerfile.akash-cuda \
+      -f minertest/Dockerfile.cuda \
       -t ${REGISTRY}/quip-protocol-cuda-miner:${VERSION} \
       -t ${REGISTRY}/quip-protocol-cuda-miner:latest \
       --load \
@@ -169,14 +169,13 @@ echo -e "${GREEN}Build Complete!${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
 echo -e "${YELLOW}Next Steps:${NC}"
-echo "1. Update akash/web/src/config/constants.ts if using different registry"
-echo "2. Deploy to Akash via the web interface"
-echo "3. Monitor deployment status in Akash Console"
+echo "1. Deploy to Akash: see minertest/AKASH.md"
+echo "2. Deploy to AWS: see minertest/AWS.md"
 echo ""
 echo -e "${YELLOW}Platform Options:${NC}"
 echo "- Default: linux/amd64,linux/arm64 (multi-arch, requires push)"
-echo "- Single platform: PLATFORM=linux/amd64 ./akash/build_akash_images.sh"
-echo "- ARM only: PLATFORM=linux/arm64 ./akash/build_akash_images.sh"
+echo "- Single platform: PLATFORM=linux/amd64 ./minertest/build_images.sh"
+echo "- ARM only: PLATFORM=linux/arm64 ./minertest/build_images.sh"
 echo ""
 
 # Show image sizes (only works for single-platform local builds)
