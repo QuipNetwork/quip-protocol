@@ -22,11 +22,6 @@ from dwave_topologies.topologies.dwave_topology import DWaveTopology
 
 
 class DWaveMiner(BaseMiner):
-    # QPU annealing time + bonus reads (no sweeps)
-    ADAPT_MIN_ANNEALING_TIME = 5.0    # μs, easiest difficulty
-    ADAPT_MAX_ANNEALING_TIME = 20.0   # μs, hardest difficulty
-    ADAPT_MIN_BONUS_READS = 32
-    ADAPT_MAX_BONUS_READS = 64
 
     def __init__(
         self,
@@ -167,13 +162,17 @@ class DWaveMiner(BaseMiner):
         nodes: List[int],
         edges: List[Tuple[int, int]],
     ) -> dict:
-        return self.adapt_parameters(
-            current_requirements.difficulty_energy,
-            current_requirements.min_diversity,
-            current_requirements.min_solutions,
-            num_nodes=len(nodes),
-            num_edges=len(edges),
-        )
+        """Return fixed optimal QPU parameters.
+
+        Based on "Multi-Solver QPU Parameter Grid Test" (2026-03-30):
+        512 reads × 120μs is the universal optimum across all D-Wave
+        solvers and architectures, within 0.1% of absolute best while
+        using ~4x less QPU time than higher settings.
+        """
+        return {
+            'num_reads': 512,
+            'annealing_time': 120.0,
+        }
 
     def _sample(
         self,
@@ -182,7 +181,7 @@ class DWaveMiner(BaseMiner):
         *,
         num_reads: int,
         num_sweeps: int,
-        annealing_time: float = 20.0,
+        annealing_time: float = 120.0,
         **kwargs,
     ) -> dimod.SampleSet:
         """Submit a synchronous QPU sampling call."""
