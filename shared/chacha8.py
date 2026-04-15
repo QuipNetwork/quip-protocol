@@ -121,6 +121,10 @@ class ChaCha8Rng:
         Matches rand_chacha::ChaCha8Rng::seed_from_u64, which uses
         PCG32 to expand the u64 into a 32-byte key.
         """
+        if not (0 <= seed <= _U64_MASK):
+            raise ValueError(
+                f"seed must be a u64 (0..2^64-1), got {seed}"
+            )
         key = _seed_from_u64(seed)
         return cls(key)
 
