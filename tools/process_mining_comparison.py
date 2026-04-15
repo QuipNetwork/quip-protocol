@@ -21,24 +21,27 @@ from typing import Dict, List, Optional, Tuple
 # Regex patterns for log parsing
 PATTERNS = {
     # Mining start: "2025-11-29 18:35:46,502 - miner.rate-test-cpu-24 - INFO - Mining block 1..."
+    # Also matches Gibbs format: "miner.rate-test-cuda-gibbs-0"
     'mining_start': re.compile(
         r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) - '
-        r'miner\.rate-test-(\w+)-(\d+) - INFO - Mining block (\d+)'
+        r'miner\.rate-test-([\w-]+?)-(\d+) - INFO - Mining block (\d+)'
     ),
 
-    # Mining attempt: "[rate-test-cpu-15] Mining attempt - Energy: -14928, Valid: 94 (best 5 diversity: 0.308) (requirements: energy<=-14900..."
+    # Mining attempt: "[rate-test-cpu-15] Mining attempt - Energy: -14928, Valid: 94 ..."
+    # Also matches: "[rate-test-cuda-gibbs-0] Mining attempt ..."
     'mining_attempt': re.compile(
         r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) - '
         r'shared\.quantum_proof_of_work - INFO - '
-        r'\[rate-test-(\w+)-(\d+)\] Mining attempt - '
+        r'\[rate-test-([\w-]+?)-(\d+)\] Mining attempt - '
         r'Energy: (-?\d+(?:\.\d+)?), Valid: (\d+) '
         r'\(best 5 diversity: ([\d.]+)\) '
         r'\(requirements: energy<=(-?\d+(?:\.\d+)?)'
     ),
 
-    # Block found: "[rate-test-cuda-1] Block 1 found! Energy: -14979.0, Diversity: 0.317, Solutions: 189"
+    # Block found: "[rate-test-cuda-1] Block 1 found! ..."
+    # Also matches: "[rate-test-cuda-gibbs-0] Block 1 found!"
     'block_found': re.compile(
-        r'\[rate-test-(\w+)-(\d+)\] Block (\d+) found!'
+        r'\[rate-test-([\w-]+?)-(\d+)\] Block (\d+) found!'
     ),
 
     # Model detection patterns
