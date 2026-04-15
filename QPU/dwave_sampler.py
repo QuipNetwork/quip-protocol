@@ -236,14 +236,15 @@ class DWaveSamplerWrapper:
             needs_embedding = self._needs_embedding(topology.solver_name, hw_solver_name)
         except ValueError:
             # Topology doesn't match solver and isn't a known embeddable type.
-            # Use the solver's native hardware graph directly (no embedding).
+            # This is normal when the stored topology is from a different
+            # revision of the same hardware (e.g., System1.10 vs System1).
+            # Keep the stored topology as the protocol reference and let
+            # defect detection handle the qubit differences.
             logger.info(
                 f"[QPU] Topology '{topology.solver_name}' doesn't match solver "
-                f"'{hw_solver_name}' — using solver's native hardware graph"
+                f"'{hw_solver_name}' — using stored topology with defect detection"
             )
             needs_embedding = False
-            # Override topology with hardware graph
-            topology = None  # signal to use hardware graph below
 
         if needs_embedding:
             # Load embedding (either specified or auto-discover)
@@ -326,12 +327,6 @@ class DWaveSamplerWrapper:
                 self._defective_qubits: List[int] = []
                 self.nodelist: List[Variable] = sorted(base_sampler.nodelist)
                 self.edgelist: List[Tuple[Variable, Variable]] = list(base_sampler.edgelist)
-
-        # Update topology metadata if we switched to hardware graph
-        if topology is None:
-            self.topology_name = hw_solver_name
-            safe_name = hw_solver_name.replace('.', '_').replace('-', '_')
-            self.job_label_prefix = f"Quip_{safe_name}"
 
         # Job label is just the prefix (which already contains topology info)
         self.job_label = self.job_label_prefix
