@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import multiprocessing.synchronize
+import random
 import signal
 import sys
 import time
@@ -13,7 +14,8 @@ import dimod
 
 init_logger = logging.getLogger(__name__)
 
-from QPU.dwave_sampler import DWaveSamplerWrapper
+from QPU.dwave_sampler import DWaveSamplerWrapper, ClampedFuture
+from shared.quantum_proof_of_work import ising_nonce_from_block, generate_ising_model_from_nonce
 from QPU.qpu_time_manager import QPUTimeManager, QPUTimeConfig
 from shared.base_miner import BaseMiner
 from shared.block_requirements import BlockRequirements
@@ -174,6 +176,71 @@ class DWaveMiner(BaseMiner):
             'annealing_time': 120.0,
         }
 
+    def _sample_batch(
+        self,
+        prev_hash: bytes,
+        miner_id: str,
+        cur_index: int,
+        nodes: List[int],
+        edges: List[Tuple[int, int]],
+        *,
+        num_reads: int,
+        num_sweeps: int,
+        **kwargs,
+    ) -> Optional[List[Tuple[int, bytes, dimod.SampleSet]]]:
+        """Submit queue_depth problems async, collect results as they complete.
+
+        Overlaps network round-trip latency (~2-3s per call) by keeping
+        multiple problems in-flight on the QPU simultaneously.
+        """
+        annealing_time = kwargs.pop('annealing_time', 120.0)
+        topology_label = self.sampler.job_label
+
+        # Submit queue_depth problems asynchronously
+        in_flight: List[Tuple[int, bytes, Any]] = []
+        for i in range(self.queue_depth):
+            salt = random.randbytes(32)
+            nonce = ising_nonce_from_block(
+                prev_hash, miner_id, cur_index, salt,
+            )
+            h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+
+            future = self.sampler.sample_ising_async(
+                h, J,
+                num_reads=num_reads,
+                answer_mode='raw',
+                annealing_time=annealing_time,
+                label=f"{topology_label}_async_{i}",
+                nonce_seed=nonce,
+            )
+            in_flight.append((nonce, salt, future))
+
+        # Collect results (blocks on each future in submission order)
+        results: List[Tuple[int, bytes, dimod.SampleSet]] = []
+        for nonce, salt, future in in_flight:
+            sampleset = future.sampleset
+            self._record_qpu_timing(sampleset)
+            results.append((nonce, salt, sampleset))
+
+        return results
+
+    def _record_qpu_timing(self, sampleset: dimod.SampleSet):
+        """Extract and record QPU timing from a sampleset."""
+        if not hasattr(sampleset, 'info') or 'timing' not in sampleset.info:
+            return
+        timing = sampleset.info['timing']
+        if 'qpu_anneal_time_per_sample' in timing:
+            self.timing_stats['quantum_annealing_time'].append(
+                timing['qpu_anneal_time_per_sample']
+            )
+        qpu_programming = timing.get('qpu_programming_time', 0)
+        qpu_sampling = timing.get('qpu_sampling_time', 0)
+        qpu_total_access = qpu_programming + qpu_sampling
+        if qpu_total_access > 0:
+            self.timing_stats['qpu_access_time'].append(qpu_total_access)
+            if self.time_manager is not None:
+                self.time_manager.record_block_time(qpu_total_access)
+
     def _sample(
         self,
         h: Dict[int, float],
@@ -184,7 +251,7 @@ class DWaveMiner(BaseMiner):
         annealing_time: float = 120.0,
         **kwargs,
     ) -> dimod.SampleSet:
-        """Submit a synchronous QPU sampling call."""
+        """Submit a synchronous QPU sampling call (fallback)."""
         h_cast = cast(Mapping[Any, float], h)
         J_cast = cast(Mapping[Tuple[Any, Any], float], J)
 
