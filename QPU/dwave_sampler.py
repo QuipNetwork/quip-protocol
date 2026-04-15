@@ -278,6 +278,7 @@ class DWaveSamplerWrapper:
             self.sampler = FixedEmbeddingComposite(base_sampler, embedding)
             self.embedding = embedding
             self._defective_qubits: List[int] = []  # Embedding handles defects
+            self._defective_edges: set = set()
             logger.info(f"[QPU] Embedding loaded: {len(embedding)} logical qubits mapped to hardware")
 
             # Use topology's graph directly
@@ -290,7 +291,8 @@ class DWaveSamplerWrapper:
             self.sampler = base_sampler
             self.embedding = None
             if topology is not None:
-                # Detect defective qubits by comparing stored vs live topology
+                # Detect defective qubits and couplers by comparing
+                # stored topology against live QPU hardware.
                 live_node_set = set(base_sampler.nodelist)
                 stored_node_set = set(topology.nodes)
 
@@ -299,14 +301,35 @@ class DWaveSamplerWrapper:
                 )
                 extra_qubits = sorted(live_node_set - stored_node_set)
 
+                # Detect defective edges (couplers offline between two
+                # live nodes). Normalize direction for comparison.
+                live_edge_set = {
+                    (min(u, v), max(u, v))
+                    for u, v in base_sampler.edgelist
+                }
+                defective_node_set = set(self._defective_qubits)
+                self._defective_edges: set = set()
+                for u, v in topology.edges:
+                    if u in defective_node_set or v in defective_node_set:
+                        continue  # handled by node clamping
+                    key = (min(u, v), max(u, v))
+                    if key not in live_edge_set:
+                        self._defective_edges.add((u, v))
+
                 if self._defective_qubits:
                     logger.warning(
-                        f"[QPU] {len(self._defective_qubits)} defective qubits "
-                        f"(offline on live QPU): "
+                        f"[QPU] {len(self._defective_qubits)} defective "
+                        f"qubits (offline on live QPU): "
                         f"{self._defective_qubits[:20]}"
                         f"{'...' if len(self._defective_qubits) > 20 else ''}"
-                        f" — will use variable clamping"
                     )
+                if self._defective_edges:
+                    logger.warning(
+                        f"[QPU] {len(self._defective_edges)} defective "
+                        f"couplers (offline between live qubits)"
+                    )
+                if self._defective_qubits or self._defective_edges:
+                    logger.warning("[QPU] Will use variable clamping")
                 else:
                     logger.info(
                         "[QPU] Live topology matches stored topology "
@@ -325,6 +348,7 @@ class DWaveSamplerWrapper:
             else:
                 # Use solver's own hardware graph (no stored topology)
                 self._defective_qubits: List[int] = []
+                self._defective_edges: set = set()
                 self.nodelist: List[Variable] = sorted(base_sampler.nodelist)
                 self.edgelist: List[Tuple[Variable, Variable]] = list(base_sampler.edgelist)
 
@@ -427,10 +451,16 @@ class DWaveSamplerWrapper:
                 h_reduced[u] = h_reduced.get(u, 0.0) + j_val * fixed_spins[v]
             # If both are defective, energy is constant — skip
 
-        # Remove all edges involving defective qubits
+        # Remove edges involving defective qubits AND defective couplers.
+        # Defective couplers are edges between two live qubits whose
+        # coupler is offline on the hardware — the QPU would reject them.
+        # Their energy contribution is still captured in reconstruction
+        # (full_J is used to recompute energy on the complete topology).
         J_reduced = {
             (u, v): val for (u, v), val in J.items()
-            if u not in defective_set and v not in defective_set
+            if u not in defective_set
+            and v not in defective_set
+            and (u, v) not in self._defective_edges
         }
 
         return h_reduced, J_reduced, fixed_spins
@@ -496,8 +526,9 @@ class DWaveSamplerWrapper:
         # Pop clamping seed before passing to D-Wave
         nonce_seed = kwargs.pop('nonce_seed', None)
 
-        # Handle defective qubits via variable clamping
-        if self._defective_qubits and nonce_seed is not None:
+        # Handle defective qubits/couplers via variable clamping
+        has_defects = self._defective_qubits or self._defective_edges
+        if has_defects and nonce_seed is not None:
             h_dict = dict(h) if not isinstance(h, dict) else h
             J_dict = dict(J) if not isinstance(J, dict) else J
             h_reduced, J_reduced, fixed_spins = self._clamp_defective_qubits(
@@ -594,8 +625,9 @@ class DWaveSamplerWrapper:
         # Pop clamping seed before passing to D-Wave
         nonce_seed = kwargs.pop('nonce_seed', None)
 
-        # Handle defective qubits via variable clamping
-        if self._defective_qubits and nonce_seed is not None:
+        # Handle defective qubits/couplers via variable clamping
+        has_defects = self._defective_qubits or self._defective_edges
+        if has_defects and nonce_seed is not None:
             h_dict = dict(h) if not isinstance(h, dict) else h
             J_dict = dict(J) if not isinstance(J, dict) else J
             h_reduced, J_reduced, fixed_spins = self._clamp_defective_qubits(

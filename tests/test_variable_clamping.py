@@ -50,8 +50,9 @@ def _ising_energy(sample, h, J):
 class MockSamplerWrapper:
     """Minimal mock that has the clamping methods from DWaveSamplerWrapper."""
 
-    def __init__(self, defective_qubits):
+    def __init__(self, defective_qubits, defective_edges=None):
         self._defective_qubits = defective_qubits
+        self._defective_edges = defective_edges or set()
 
     def _clamp_defective_qubits(self, h, J, nonce_seed):
         """Copied interface — import the real implementation."""
