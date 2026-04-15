@@ -5,7 +5,7 @@ for a given nonce, enabling batch scoring and filtering before
 expensive SA runs.
 
 Uses scipy sparse matrix-vector multiply for vectorized local field
-computation. Generates h/J values directly as numpy arrays (same RNG
+computation. Generates h/J values directly as numpy arrays (same ChaCha8Rng
 logic as generate_ising_model_from_nonce) to avoid Python dict overhead.
 """
 from __future__ import annotations
@@ -16,6 +16,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 from scipy.sparse import csr_matrix
 
+from shared.chacha8 import ChaCha8Rng
 from shared.quantum_proof_of_work import (
     generate_ising_model_from_nonce,
     ising_nonce_from_block,
@@ -39,7 +40,7 @@ class IsingTopologyCache:
         self.n_edges = len(edges)
         self.node_to_pos = {nid: i for i, nid in enumerate(nodes)}
 
-        # Store edge list for generate_ising_model_from_nonce compat
+        # Store edge list for generate_ising_model_from_nonce compatibility
         self._edges = edges
 
         # Build COO indices (symmetric: each edge -> 2 entries)
@@ -90,28 +91,25 @@ class IsingTopologyCache:
         """Run greedy descent using array-based Ising generation.
 
         Reproduces the same RNG logic as generate_ising_model_from_nonce
-        but outputs numpy arrays directly, avoiding Python dicts.
+        (ChaCha8Rng, h first then J) but outputs numpy arrays directly,
+        avoiding Python dicts.
         """
         if h_values is None:
             h_values = [-1.0, 0.0, 1.0]
 
         n = self.n
-        rng = np.random.default_rng(nonce)
+        rng = ChaCha8Rng.seed_from_u64(nonce)
+        n_h = len(h_values)
 
-        # Generate J values as array: same as rng.integers(2) per edge
-        j_vals = (2 * rng.integers(2, size=self.n_edges) - 1).astype(
-            np.float64,
-        )
+        # Generate h values FIRST (matches generate_ising_model_from_nonce)
+        h_arr = np.empty(n, dtype=np.float64)
+        for i in range(n):
+            h_arr[i] = h_values[rng.next_u32() % n_h]
 
-        # Generate h values: same as rng.choice(h_values, size=n)
-        if len(h_values) == 1 and h_values[0] == 0.0:
-            h_arr = np.zeros(n, dtype=np.float64)
-        else:
-            h_arr_raw = rng.choice(h_values, size=n)
-            # Map from node_id order to position order
-            h_arr = np.empty(n, dtype=np.float64)
-            for i, nid in enumerate(self.nodes):
-                h_arr[i] = h_arr_raw[i]
+        # Generate J values SECOND: ±1 per edge
+        j_vals = np.empty(self.n_edges, dtype=np.float64)
+        for i in range(self.n_edges):
+            j_vals[i] = -1.0 if (rng.next_u32() & 1) == 0 else 1.0
 
         # Fill CSR data using vectorized indexing
         csr_data = np.empty(self._nnz, dtype=np.float64)
