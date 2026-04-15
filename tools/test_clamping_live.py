@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import logging
 import multiprocessing
 import os
 import sys
@@ -32,6 +33,10 @@ try:
     load_dotenv(Path(__file__).parent.parent / '.env')
 except ImportError:
     pass
+
+# Enable mining logs (matching the [quip] format the user expects)
+from shared.logging_config import setup_logging
+setup_logging(log_level="INFO")
 
 from dwave_topologies.topologies.json_loader import load_json_topology
 from shared.block import create_genesis_block, BlockRequirements
