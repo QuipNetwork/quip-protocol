@@ -55,7 +55,7 @@ class DWaveMiner(BaseMiner):
                         Higher values increase throughput but may waste QPU time if
                         early results are valid.
             solver_name: Optional explicit solver name to connect to (e.g.
-                        "Advantage2_system1.13"). If None, uses DWAVE_API_SOLVER env var.
+                        "Advantage2_system1"). If None, uses DWAVE_API_SOLVER env var.
             region: Optional D-Wave region (e.g. "na-east-1").
                    If None, uses default from config.
             **cfg: Additional configuration options (reserved for future use)
@@ -193,12 +193,15 @@ class DWaveMiner(BaseMiner):
         topology_label = self.sampler.job_label
         job_label = f"{topology_label}_sync"
 
+        # Pass nonce_seed for deterministic variable clamping on defective QPUs
+        nonce_seed = kwargs.pop('nonce_seed', None)
         sampleset = self.sampler.sample_ising(
             h_cast, J_cast,
             num_reads=num_reads,
             answer_mode='raw',
             annealing_time=annealing_time,
             label=job_label,
+            nonce_seed=nonce_seed,
         )
 
         # Extract QPU timing information if available

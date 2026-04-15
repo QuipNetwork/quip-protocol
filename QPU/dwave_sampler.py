@@ -4,6 +4,7 @@ import logging
 import os
 from typing import Dict, List, Tuple, Any, Union, Mapping, Sequence, cast, Optional, TYPE_CHECKING
 import collections.abc
+import numpy as np
 from dwave.system import DWaveSampler, FixedEmbeddingComposite
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,70 @@ class EmbeddedFuture:
         if isinstance(other, EmbeddedFuture):
             return self._future is other._future
         return False
+
+class ClampedFuture:
+    """Wrapper that reconstructs full-topology solutions from a reduced QPU future.
+
+    When defective qubits are clamped, the QPU solves a reduced problem.
+    This future inserts fixed spins and recomputes energies on sampleset access.
+    """
+
+    def __init__(
+        self,
+        inner_future,
+        fixed_spins: Dict[int, int],
+        full_h: Dict[int, float],
+        full_J: Dict[Tuple[int, int], float],
+    ):
+        self._inner = inner_future
+        self._fixed_spins = fixed_spins
+        self._full_h = full_h
+        self._full_J = full_J
+        self._cached_sampleset: Optional[dimod.SampleSet] = None
+
+    @property
+    def sampleset(self) -> dimod.SampleSet:
+        """Get full-topology sampleset (blocks if not ready)."""
+        if self._cached_sampleset is None:
+            reduced = self._inner.sampleset
+            full_bqm = dimod.BinaryQuadraticModel.from_ising(
+                self._full_h, self._full_J
+            )
+            samples = []
+            energies = []
+            for sample in reduced.samples():
+                full_sample = dict(sample)
+                full_sample.update(self._fixed_spins)
+                samples.append(full_sample)
+                energies.append(full_bqm.energy(full_sample))
+
+            info = dict(reduced.info) if hasattr(reduced, 'info') else {}
+            self._cached_sampleset = dimod.SampleSet.from_samples(
+                samples, vartype=dimod.SPIN, energy=energies, info=info,
+            )
+        return self._cached_sampleset
+
+    def done(self) -> bool:
+        return self._inner.done()
+
+    def cancel(self) -> bool:
+        return self._inner.cancel()
+
+    def wait(self, timeout: Optional[float] = None):
+        return self._inner.wait(timeout)
+
+    @property
+    def id(self):
+        return self._inner.id
+
+    def __hash__(self):
+        return hash(id(self._inner))
+
+    def __eq__(self, other):
+        if isinstance(other, ClampedFuture):
+            return self._inner is other._inner
+        return False
+
 
 from dwave_topologies.embedding_loader import get_embedding_dict, embedding_exists
 from dwave_topologies import DEFAULT_TOPOLOGY
@@ -163,7 +228,7 @@ class DWaveSamplerWrapper:
         self.qpu_solver = base_sampler
 
         # Get hardware info
-        hw_solver_name = base_sampler.properties.get('chip_id', 'Advantage2_system1.13')
+        hw_solver_name = base_sampler.properties.get('chip_id', 'Advantage2_system1')
         solver_dir = hw_solver_name.replace('-', '_').replace('.', '_')
 
         # Determine if this topology needs embedding
@@ -211,6 +276,7 @@ class DWaveSamplerWrapper:
             # Create FixedEmbeddingComposite (encapsulated internally)
             self.sampler = FixedEmbeddingComposite(base_sampler, embedding)
             self.embedding = embedding
+            self._defective_qubits: List[int] = []  # Embedding handles defects
             logger.info(f"[QPU] Embedding loaded: {len(embedding)} logical qubits mapped to hardware")
 
             # Use topology's graph directly
@@ -223,10 +289,41 @@ class DWaveSamplerWrapper:
             self.sampler = base_sampler
             self.embedding = None
             if topology is not None:
+                # Detect defective qubits by comparing stored vs live topology
+                live_node_set = set(base_sampler.nodelist)
+                stored_node_set = set(topology.nodes)
+
+                self._defective_qubits: List[int] = sorted(
+                    stored_node_set - live_node_set
+                )
+                extra_qubits = sorted(live_node_set - stored_node_set)
+
+                if self._defective_qubits:
+                    logger.warning(
+                        f"[QPU] {len(self._defective_qubits)} defective qubits "
+                        f"(offline on live QPU): "
+                        f"{self._defective_qubits[:20]}"
+                        f"{'...' if len(self._defective_qubits) > 20 else ''}"
+                        f" — will use variable clamping"
+                    )
+                else:
+                    logger.info(
+                        "[QPU] Live topology matches stored topology "
+                        f"({len(stored_node_set)} qubits)"
+                    )
+                if extra_qubits:
+                    logger.info(
+                        f"[QPU] Live QPU has {len(extra_qubits)} extra "
+                        f"qubits not in stored topology (ignored)"
+                    )
+
+                # ALWAYS use the full stored topology for nodes/edges
+                # (consensus requires all miners solve the same problem)
                 self.nodelist: List[Variable] = topology.nodes
                 self.edgelist: List[Tuple[Variable, Variable]] = topology.edges
             else:
-                # Use solver's own hardware graph
+                # Use solver's own hardware graph (no stored topology)
+                self._defective_qubits: List[int] = []
                 self.nodelist: List[Variable] = sorted(base_sampler.nodelist)
                 self.edgelist: List[Tuple[Variable, Variable]] = list(base_sampler.edgelist)
 
@@ -264,7 +361,7 @@ class DWaveSamplerWrapper:
         Determine if a topology needs embedding to run on the QPU.
 
         Args:
-            topology_name: Name of the topology (e.g., "Z(9,2)" or "Advantage2_system1.13")
+            topology_name: Name of the topology (e.g., "Z(9,2)" or "Advantage2_system1")
             solver_name: Name of the QPU solver
 
         Returns:
@@ -289,21 +386,142 @@ class DWaveSamplerWrapper:
             f"Expected Zephyr format 'Z(m,t)' or native hardware name matching solver '{solver_name}'"
         )
 
+    def _clamp_defective_qubits(
+        self,
+        h: Dict[int, float],
+        J: Dict[Tuple[int, int], float],
+        nonce_seed: int,
+    ) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float], Dict[int, int]]:
+        """Clamp defective qubits to deterministic spins and adjust neighbors.
+
+        For each offline qubit k, assigns a fixed spin s_k (deterministic from
+        nonce_seed) and absorbs its coupling energy into neighbors' h-fields:
+            h'[j] += J[k,j] * s_k  for all neighbors j of k
+
+        This preserves the energy contribution of the clamped qubit in the
+        reduced problem, so the QPU optimizes the remaining variables correctly.
+
+        Args:
+            h: Linear biases for all nodes (full topology).
+            J: Quadratic biases for all edges (full topology).
+            nonce_seed: Seed for deterministic spin assignment (from block nonce).
+
+        Returns:
+            (h_reduced, J_reduced, fixed_spins) where:
+            - h_reduced: biases without defective qubits (neighbors adjusted)
+            - J_reduced: couplings without edges involving defective qubits
+            - fixed_spins: {qubit_id: spin_value} for solution reconstruction
+        """
+        defective_set = set(self._defective_qubits)
+        rng = np.random.default_rng(nonce_seed)
+
+        # Assign deterministic ±1 spins to defective qubits
+        fixed_spins: Dict[int, int] = {}
+        for qubit in self._defective_qubits:
+            fixed_spins[qubit] = int(2 * rng.integers(2) - 1)
+
+        # Copy h, remove defective qubits, adjust neighbors
+        h_reduced = {k: v for k, v in h.items() if k not in defective_set}
+
+        for (u, v), j_val in J.items():
+            if u in defective_set and v not in defective_set:
+                # u is clamped, absorb into v's h-field
+                h_reduced[v] = h_reduced.get(v, 0.0) + j_val * fixed_spins[u]
+            elif v in defective_set and u not in defective_set:
+                # v is clamped, absorb into u's h-field
+                h_reduced[u] = h_reduced.get(u, 0.0) + j_val * fixed_spins[v]
+            # If both are defective, energy is constant — skip
+
+        # Remove all edges involving defective qubits
+        J_reduced = {
+            (u, v): val for (u, v), val in J.items()
+            if u not in defective_set and v not in defective_set
+        }
+
+        return h_reduced, J_reduced, fixed_spins
+
+    def _reconstruct_full_sampleset(
+        self,
+        reduced_sampleset: dimod.SampleSet,
+        fixed_spins: Dict[int, int],
+        full_h: Dict[int, float],
+        full_J: Dict[Tuple[int, int], float],
+    ) -> dimod.SampleSet:
+        """Reconstruct full-topology sampleset from reduced QPU results.
+
+        Inserts fixed spins back into each sample and recomputes energies
+        on the full Ising model so validators see correct values.
+
+        Args:
+            reduced_sampleset: QPU results with defective qubits missing.
+            fixed_spins: {qubit_id: spin_value} from clamping.
+            full_h: Full topology linear biases.
+            full_J: Full topology quadratic biases.
+
+        Returns:
+            SampleSet with all topology variables and recomputed energies.
+        """
+        full_bqm = dimod.BinaryQuadraticModel.from_ising(full_h, full_J)
+        all_vars = sorted(full_bqm.variables)
+
+        samples = []
+        energies = []
+        for sample in reduced_sampleset.samples():
+            # Start with QPU results, add fixed spins
+            full_sample = dict(sample)
+            full_sample.update(fixed_spins)
+            samples.append(full_sample)
+            energies.append(full_bqm.energy(full_sample))
+
+        # Preserve timing info from original sampleset
+        info = dict(reduced_sampleset.info) if hasattr(reduced_sampleset, 'info') else {}
+
+        return dimod.SampleSet.from_samples(
+            samples,
+            vartype=dimod.SPIN,
+            energy=energies,
+            info=info,
+        )
+
     def sample_ising(
         self,
         h: Union[Mapping[Variable, float], Sequence[float]],
         J: Mapping[Tuple[Variable, Variable], float],
         **kwargs
     ) -> dimod.SampleSet:
-        """
-        Sample from the D-Wave QPU with automatic job labeling.
+        """Sample from the D-Wave QPU with automatic job labeling.
 
-        Automatically adds 'label' parameter for D-Wave dashboard visibility.
-        Caller can override by passing 'label' in kwargs.
+        If defective qubits were detected at init, transparently clamps them
+        to deterministic spins, submits the reduced problem, and reconstructs
+        the full-topology sampleset before returning.
 
-        For embedded samplers, converts Ising to BQM explicitly to ensure
-        correct variable labeling during unembedding.
+        Pass nonce_seed=<int> in kwargs for deterministic clamping (required
+        when defective qubits are present).
         """
+        # Pop clamping seed before passing to D-Wave
+        nonce_seed = kwargs.pop('nonce_seed', None)
+
+        # Handle defective qubits via variable clamping
+        if self._defective_qubits and nonce_seed is not None:
+            h_dict = dict(h) if not isinstance(h, dict) else h
+            J_dict = dict(J) if not isinstance(J, dict) else J
+            h_reduced, J_reduced, fixed_spins = self._clamp_defective_qubits(
+                h_dict, J_dict, nonce_seed
+            )
+            sampleset = self._sample_ising_inner(h_reduced, J_reduced, **kwargs)
+            return self._reconstruct_full_sampleset(
+                sampleset, fixed_spins, h_dict, J_dict
+            )
+
+        return self._sample_ising_inner(h, J, **kwargs)
+
+    def _sample_ising_inner(
+        self,
+        h: Union[Mapping[Variable, float], Sequence[float]],
+        J: Mapping[Tuple[Variable, Variable], float],
+        **kwargs
+    ) -> dimod.SampleSet:
+        """Submit Ising problem to QPU (handles embedding transparently)."""
         # Add default job label if not already specified
         if 'label' not in kwargs:
             kwargs['label'] = self.job_label
@@ -359,24 +577,54 @@ class DWaveSamplerWrapper:
         h: Union[Mapping[Variable, float], Sequence[float]],
         J: Mapping[Tuple[Variable, Variable], float],
         **kwargs
-    ) -> Union['Future', EmbeddedFuture]:
-        """
-        Submit Ising problem to QPU and return Future without blocking.
+    ) -> Union['Future', EmbeddedFuture, ClampedFuture]:
+        """Submit Ising problem to QPU and return Future without blocking.
 
-        Same as sample_ising() but returns a Future-like object for async processing.
-        Caller must access future.sampleset to get results (which blocks on first access).
+        Same as sample_ising() but returns a Future-like object for async
+        processing. Caller must access future.sampleset to get results
+        (which blocks on first access).
 
-        For embedded problems, returns an EmbeddedFuture that handles unembedding
-        automatically when the sampleset is accessed.
+        For defective qubits, wraps in ClampedFuture that reconstructs
+        the full-topology solution on sampleset access.
 
         Args:
-            h: Linear biases (dict mapping variable to bias, or sequence)
-            J: Quadratic biases (dict mapping variable pairs to bias)
-            **kwargs: Additional parameters passed to the sampler (num_reads, annealing_time, etc.)
+            h: Linear biases (dict mapping variable to bias, or sequence).
+            J: Quadratic biases (dict mapping variable pairs to bias).
+            **kwargs: Additional parameters (num_reads, annealing_time, etc.)
+                Pass nonce_seed=<int> for deterministic clamping.
 
         Returns:
-            Future-like object (Future or EmbeddedFuture) that resolves to SampleSet
+            Future-like object that resolves to full-topology SampleSet.
         """
+        # Pop clamping seed before passing to D-Wave
+        nonce_seed = kwargs.pop('nonce_seed', None)
+
+        # Handle defective qubits via variable clamping
+        if self._defective_qubits and nonce_seed is not None:
+            h_dict = dict(h) if not isinstance(h, dict) else h
+            J_dict = dict(J) if not isinstance(J, dict) else J
+            h_reduced, J_reduced, fixed_spins = self._clamp_defective_qubits(
+                h_dict, J_dict, nonce_seed
+            )
+            inner_future = self._sample_ising_async_inner(
+                h_reduced, J_reduced, **kwargs
+            )
+            return ClampedFuture(
+                inner_future=inner_future,
+                fixed_spins=fixed_spins,
+                full_h=h_dict,
+                full_J=J_dict,
+            )
+
+        return self._sample_ising_async_inner(h, J, **kwargs)
+
+    def _sample_ising_async_inner(
+        self,
+        h: Union[Mapping[Variable, float], Sequence[float]],
+        J: Mapping[Tuple[Variable, Variable], float],
+        **kwargs
+    ) -> Union['Future', EmbeddedFuture]:
+        """Submit Ising problem to QPU async (handles embedding transparently)."""
         # Add default job label if not already specified
         if 'label' not in kwargs:
             kwargs['label'] = self.job_label

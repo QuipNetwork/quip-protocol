@@ -82,7 +82,7 @@ ENV MINING_DURATION=90m
 ENV DIFFICULTY_ENERGY=-14900
 ENV MIN_DIVERSITY=0.1
 ENV MIN_SOLUTIONS=5
-ENV TOPOLOGY_FILE=dwave_topologies/topologies/advantage2_system1_13.json.gz
+ENV TOPOLOGY_FILE=dwave_topologies/topologies/advantage2_system1.json.gz
 
 # Create output directory
 RUN mkdir -p /output
