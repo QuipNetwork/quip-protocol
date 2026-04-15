@@ -18,132 +18,57 @@ from dwave_topologies import DEFAULT_TOPOLOGY
 
 logger = get_logger('quantum_proof_of_work')
 
-def ising_nonce_from_block(prev_hash: bytes, miner_id: str, cur_index: int, salt: bytes) -> int:
-    """Generate deterministic seed for Ising model from block parameters.
 
-    Uses miner_id instead of timestamp to ensure reproducible seeds between
-    mining and validation phases.
+def ising_nonce_from_block(prev_hash: bytes, miner_id: str, cur_index: int, salt: bytes) -> int:
+    """Generate deterministic nonce from block parameters using BLAKE3.
+
+    Matches Rust's derive_nonce() in quip-protocol-rs:
+      - Hashes raw bytes (not hex-encoded strings)
+      - Uses u32 big-endian for block index
+      - Returns u64 (8 bytes)
     """
-    seed = f"{prev_hash.hex()}{miner_id}{cur_index}".encode() + salt
-    nonce_bytes = blake3(seed).digest()
-    nonce = int.from_bytes(nonce_bytes[:4], 'big')
-    logger.debug(f"ising_nonce_from_block: prev_hash={prev_hash.hex()[:8]}, miner_id={miner_id}, cur_index={cur_index}, salt={salt.hex()[:8]}, nonce={nonce}")
-    return nonce
+    if not (0 <= cur_index < 2**32):
+        raise ValueError(
+            f"cur_index must be a u32 (0..2^32-1), got {cur_index}"
+        )
+    hasher = blake3()
+    hasher.update(prev_hash)
+    hasher.update(miner_id.encode())
+    hasher.update(cur_index.to_bytes(4, 'big'))
+    hasher.update(salt)
+    digest = hasher.digest()
+    return int.from_bytes(digest[:8], 'big')
 
 
 def generate_ising_model_from_nonce(
     nonce: int,
     nodes: List[int],
     edges: List[Tuple[int, int]],
-    h_values: Optional[List[float]] = None
-) -> Tuple[Dict[int, float], Dict[tuple, float]]:
-    """Generate (h, J) Ising parameters deterministically from a nonce.
-
-    Args:
-        nonce: Random seed for deterministic generation
-        nodes: List of node IDs in the topology
-        edges: List of edge tuples in the topology
-        h_values: List of allowed h field values (default: [-1, 0, +1])
-                 Use [0] for backward compatibility (h=0 everywhere)
-
-    Returns:
-        (h, J) where:
-          - h: Dict mapping node_id → field value from h_values
-          - J: Dict mapping (u,v) → coupling value in {-1, +1}
-
-    Note on h_values choice:
-        The default [-1, 0, +1] distribution is chosen because:
-        1. Very large |h| values make problems easier (h dominates, graph structure
-           becomes irrelevant, greedy solutions work)
-        2. Very small |h| values add little quantum advantage (h contributes nothing)
-        3. Continuous vs discrete h makes no computational difference for SA hardness
-           (both have same energy landscape topology, same local minima structure)
-        4. Discrete values are simpler (int8 efficient, easy validation, no float precision issues)
-        5. Including 0 keeps h contribution (~27%) balanced with J (~73%), preserving
-           graph-structured problem (favoring quantum hardware)
-    """
-    if h_values is None:
-        h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
-
-    # Use numpy's new Generator API instead of global np.random.seed()
-    # This is thread-safe and doesn't affect global state
-    rng = np.random.default_rng(nonce)
-
-    # Generate J: random ±1 for each edge
-    J = {
-        (int(u), int(v)): float(2 * rng.integers(2) - 1)
-        for (u, v) in edges
-    }
-
-    # Generate h: random selection from h_values for each node
-    if len(h_values) == 1 and h_values[0] == 0.0:
-        # Optimization: if h_values = [0], skip random generation
-        h = {int(i): 0.0 for i in nodes}
-    else:
-        # General case: sample from h_values distribution
-        h_vals = rng.choice(h_values, size=len(nodes))
-        h = {int(node_id): float(h_vals[idx]) for idx, node_id in enumerate(nodes)}
-
-    return h, J
-
-
-def derive_nonce(
-    parent_hash: bytes,
-    miner_id: str,
-    block_number: int,
-    salt: bytes,
-) -> int:
-    """Derive a u64 nonce from block parameters using BLAKE3.
-
-    Matches Rust's derive_nonce() in quip-protocol-rs. Key differences
-    from ising_nonce_from_block:
-      - Hashes raw bytes (not hex-encoded strings)
-      - Uses u32 big-endian for block_number
-      - Returns u64 (8 bytes) not u32 (4 bytes)
-    """
-    if not (0 <= block_number < 2**32):
-        raise ValueError(
-            f"block_number must be a u32 (0..2^32-1), got {block_number}"
-        )
-    hasher = blake3()
-    hasher.update(parent_hash)
-    hasher.update(miner_id.encode())
-    hasher.update(block_number.to_bytes(4, 'big'))
-    hasher.update(salt)
-    digest = hasher.digest()
-    return int.from_bytes(digest[:8], 'big')
-
-
-def generate_ising_model(
-    nonce: int,
-    nodes: List[int],
-    edges: List[Tuple[int, int]],
-    allowed_h_values: Optional[List[float]] = None,
+    h_values: Optional[List[float]] = None,
 ) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float]]:
     """Generate (h, J) Ising parameters using ChaCha8Rng.
 
-    Matches Rust's generate_ising_model() in quip-protocol-rs. Key
-    differences from generate_ising_model_from_nonce:
+    Matches Rust's generate_ising_model() in quip-protocol-rs:
       - Uses ChaCha8Rng (not numpy PCG64)
-      - Generates h FIRST, then J (reversed order)
+      - Generates h FIRST, then J
       - Uses next_u32() % len for h (modulo selection, matches Rust)
       - Uses next_u32() & 1 for J sign
     """
-    if allowed_h_values is None:
-        allowed_h_values = [-1.0, 0.0, 1.0]
-    if not allowed_h_values:
-        raise ValueError("allowed_h_values must be non-empty")
+    if h_values is None:
+        h_values = [-1.0, 0.0, 1.0]
+    if not h_values:
+        raise ValueError("h_values must be non-empty")
     if not nodes:
         raise ValueError("nodes must be non-empty for Ising model generation")
 
     rng = ChaCha8Rng.seed_from_u64(nonce)
-    n_h = len(allowed_h_values)
+    n_h = len(h_values)
 
     # h FIRST: one next_u32() per node
     h: Dict[int, float] = {}
     for node_id in nodes:
         index = rng.next_u32() % n_h
-        h[int(node_id)] = allowed_h_values[index]
+        h[int(node_id)] = h_values[index]
 
     # J SECOND: one next_u32() per edge
     J: Dict[Tuple[int, int], float] = {}
@@ -465,7 +390,7 @@ def validate_quantum_proof(quantum_proof, miner_id: str, requirements, block_ind
         nonce,
         quantum_proof.nodes,
         quantum_proof.edges,
-        h_values=h_values
+        h_values=h_values,
     )
 
     # Validate each solution for correctness
