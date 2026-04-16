@@ -57,13 +57,12 @@ class MockSamplerWrapper:
     def _clamp_defective_qubits(self, h, J, nonce_seed):
         """Copied interface — import the real implementation."""
         from QPU.dwave_sampler import DWaveSamplerWrapper
-        # Call the unbound method with self substituted
         return DWaveSamplerWrapper._clamp_defective_qubits(self, h, J, nonce_seed)
 
-    def _reconstruct_full_sampleset(self, reduced_ss, fixed_spins, full_h, full_J):
+    def reconstruct_full_sampleset(self, reduced_ss, defect_info):
         from QPU.dwave_sampler import DWaveSamplerWrapper
-        return DWaveSamplerWrapper._reconstruct_full_sampleset(
-            self, reduced_ss, fixed_spins, full_h, full_J
+        return DWaveSamplerWrapper.reconstruct_full_sampleset(
+            self, reduced_ss, defect_info
         )
 
 
@@ -81,7 +80,7 @@ class TestClampDefectiveQubits:
         J = {e: -1.0 for e in edges}
 
         wrapper = MockSamplerWrapper(defective_qubits=[])
-        h_r, J_r, fixed = wrapper._clamp_defective_qubits(h, J, nonce_seed=42)
+        h_r, J_r, fixed, offset, removed = wrapper._clamp_defective_qubits(h, J, nonce_seed=42)
 
         assert h_r == h
         assert J_r == J
@@ -94,7 +93,7 @@ class TestClampDefectiveQubits:
         J = {e: -1.0 for e in edges}
 
         wrapper = MockSamplerWrapper(defective_qubits=[4])
-        h_r, J_r, fixed = wrapper._clamp_defective_qubits(h, J, nonce_seed=42)
+        h_r, J_r, fixed, offset, removed = wrapper._clamp_defective_qubits(h, J, nonce_seed=42)
 
         # Qubit 4 should not be in reduced h
         assert 4 not in h_r
@@ -118,7 +117,7 @@ class TestClampDefectiveQubits:
 
         # Clamp node 1 (the middle one)
         wrapper = MockSamplerWrapper(defective_qubits=[1])
-        h_r, J_r, fixed = wrapper._clamp_defective_qubits(h, J, nonce_seed=123)
+        h_r, J_r, fixed, offset, removed = wrapper._clamp_defective_qubits(h, J, nonce_seed=123)
 
         s1 = fixed[1]  # deterministic spin for node 1
 
@@ -138,8 +137,8 @@ class TestClampDefectiveQubits:
 
         wrapper = MockSamplerWrapper(defective_qubits=[2, 4])
 
-        _, _, fixed1 = wrapper._clamp_defective_qubits(h, J, nonce_seed=999)
-        _, _, fixed2 = wrapper._clamp_defective_qubits(h, J, nonce_seed=999)
+        _, _, fixed1, _, _ = wrapper._clamp_defective_qubits(h, J, nonce_seed=999)
+        _, _, fixed2, _, _ = wrapper._clamp_defective_qubits(h, J, nonce_seed=999)
 
         assert fixed1 == fixed2
 
@@ -153,7 +152,7 @@ class TestClampDefectiveQubits:
 
         results = set()
         for seed in range(100):
-            _, _, fixed = wrapper._clamp_defective_qubits(h, J, seed)
+            _, _, fixed, _, _ = wrapper._clamp_defective_qubits(h, J, seed)
             results.add(tuple(fixed[i] for i in sorted(fixed)))
 
         # With 6 qubits, 2^6 = 64 possible spin configs. 100 seeds should
@@ -168,7 +167,7 @@ class TestClampDefectiveQubits:
 
         # Remove nodes 0 and 5 (corners)
         wrapper = MockSamplerWrapper(defective_qubits=[0, 5])
-        h_r, J_r, fixed = wrapper._clamp_defective_qubits(h, J, nonce_seed=7)
+        h_r, J_r, fixed, _, _ = wrapper._clamp_defective_qubits(h, J, nonce_seed=7)
 
         assert 0 not in h_r
         assert 5 not in h_r
@@ -184,60 +183,48 @@ class TestClampDefectiveQubits:
 
 
 class TestReconstructFullSampleset:
-    """Tests for _reconstruct_full_sampleset()."""
+    """Tests for reconstruct_full_sampleset()."""
 
     def test_reconstruction_inserts_fixed_spins(self):
         """Fixed spins appear in reconstructed samples."""
-        h = {0: 0.0, 1: 0.5, 2: -0.5}
-        J = {(0, 1): -1.0, (1, 2): 1.0, (0, 2): -1.0}
+        from QPU.dwave_sampler import DefectInfo
 
-        # Simulate QPU returned samples for nodes 0, 2 (node 1 was clamped)
+        fixed_spins = {1: 1}
+        defect_info = DefectInfo(fixed_spins=fixed_spins, energy_offset=0.0, removed_edges={})
+
         reduced_samples = [{0: 1, 2: -1}, {0: -1, 2: 1}]
         reduced_ss = dimod.SampleSet.from_samples(
-            reduced_samples, vartype=dimod.SPIN, energy=[0, 0]
+            reduced_samples, vartype=dimod.SPIN, energy=[-1.0, -0.5]
         )
-
-        fixed_spins = {1: 1}
 
         wrapper = MockSamplerWrapper(defective_qubits=[1])
-        full_ss = wrapper._reconstruct_full_sampleset(
-            reduced_ss, fixed_spins, h, J
-        )
+        full_ss = wrapper.reconstruct_full_sampleset(reduced_ss, defect_info)
 
-        # All samples should have all 3 variables
         for sample in full_ss.samples():
             assert set(sample.keys()) == {0, 1, 2}
-            assert sample[1] == 1  # Fixed spin
+            assert sample[1] == 1
 
-    def test_energy_recomputed_correctly(self):
-        """Reconstructed energies match manual Ising energy calculation."""
-        h = {0: 1.0, 1: -1.0, 2: 0.5}
-        J = {(0, 1): -1.0, (1, 2): 1.0}
+    def test_energy_offset_applied(self):
+        """Reconstructed energy = QPU energy + offset."""
+        from QPU.dwave_sampler import DefectInfo
 
-        # Node 1 clamped to +1
-        fixed_spins = {1: 1}
+        defect_info = DefectInfo(fixed_spins={1: 1}, energy_offset=-3.5, removed_edges={})
 
-        # QPU solved for nodes 0, 2
-        reduced_samples = [{0: 1, 2: -1}]
         reduced_ss = dimod.SampleSet.from_samples(
-            reduced_samples, vartype=dimod.SPIN, energy=[0]
+            [{0: 1, 2: -1}], vartype=dimod.SPIN, energy=[-10.0]
         )
 
         wrapper = MockSamplerWrapper(defective_qubits=[1])
-        full_ss = wrapper._reconstruct_full_sampleset(
-            reduced_ss, fixed_spins, h, J
-        )
+        full_ss = wrapper.reconstruct_full_sampleset(reduced_ss, defect_info)
 
-        # Manual energy: h[0]*1 + h[1]*1 + h[2]*(-1) + J[0,1]*1*1 + J[1,2]*1*(-1)
-        # = 1.0 + (-1.0) + (-0.5) + (-1.0) + (-1.0) = -2.5
-        expected_energy = _ising_energy({0: 1, 1: 1, 2: -1}, h, J)
-        assert full_ss.first.energy == pytest.approx(expected_energy)
+        # -10.0 + (-3.5) = -13.5
+        assert full_ss.first.energy == pytest.approx(-13.5)
 
     def test_timing_info_preserved(self):
         """QPU timing info survives reconstruction."""
-        h = {0: 0.0, 1: 0.0}
-        J = {(0, 1): -1.0}
-        fixed_spins = {1: 1}
+        from QPU.dwave_sampler import DefectInfo
+
+        defect_info = DefectInfo(fixed_spins={1: 1}, energy_offset=0.0, removed_edges={})
 
         reduced_ss = dimod.SampleSet.from_samples(
             [{0: 1}], vartype=dimod.SPIN, energy=[0],
@@ -245,9 +232,7 @@ class TestReconstructFullSampleset:
         )
 
         wrapper = MockSamplerWrapper(defective_qubits=[1])
-        full_ss = wrapper._reconstruct_full_sampleset(
-            reduced_ss, fixed_spins, h, J
-        )
+        full_ss = wrapper.reconstruct_full_sampleset(reduced_ss, defect_info)
 
         assert 'timing' in full_ss.info
         assert full_ss.info['timing']['qpu_access_time'] == 12345
@@ -257,68 +242,68 @@ class TestClampingEnergyConsistency:
     """End-to-end tests verifying energy consistency with clamping."""
 
     def test_clamped_energy_matches_full_topology(self):
-        """Energy of clamped solution equals energy on full Ising model.
+        """Reconstructed energy (offset + reduced edges) matches full Ising energy.
 
         This is the critical consensus test: validators compute energy on
-        the full topology, so the reconstructed sampleset must match.
+        the full topology, so the reconstructed energy must match.
         """
         nodes, edges = _make_small_topology()
         nonce = 42
         h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
 
-        # Clamp node 4
         wrapper = MockSamplerWrapper(defective_qubits=[4])
-        h_r, J_r, fixed = wrapper._clamp_defective_qubits(
+        h_r, J_r, fixed, offset, removed = wrapper._clamp_defective_qubits(
             dict(h), dict(J), nonce_seed=nonce
         )
 
         # Simulate QPU returning a solution for the reduced problem
         reduced_sample = {i: 1 if i % 2 == 0 else -1 for i in h_r}
+
+        # Compute reduced-problem energy (what QPU would report)
+        reduced_energy = _ising_energy(reduced_sample, h_r, J_r)
+
+        from QPU.dwave_sampler import DefectInfo
+        defect_info = DefectInfo(fixed, offset, removed)
+
         reduced_ss = dimod.SampleSet.from_samples(
-            [reduced_sample], vartype=dimod.SPIN, energy=[0]
+            [reduced_sample], vartype=dimod.SPIN, energy=[reduced_energy]
         )
+        full_ss = wrapper.reconstruct_full_sampleset(reduced_ss, defect_info)
 
-        full_ss = wrapper._reconstruct_full_sampleset(
-            reduced_ss, fixed, dict(h), dict(J)
-        )
-
-        # Verify energy matches manual calculation
-        full_sample = dict(full_ss.first.sample)
+        # Build the actual full sample for manual verification
+        full_sample = dict(reduced_sample)
+        full_sample.update(fixed)
         expected = _ising_energy(full_sample, h, J)
+
         assert full_ss.first.energy == pytest.approx(expected)
 
     def test_clamped_energy_vs_direct_energy(self):
-        """Clamped+reconstructed energy equals direct evaluation.
-
-        Use the same spin configuration for both direct and clamped paths
-        to verify mathematical equivalence.
-        """
+        """Clamped+reconstructed energy equals direct evaluation."""
         nodes, edges = _make_small_topology()
         nonce = 77
         h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
 
-        defective = [2]
-        wrapper = MockSamplerWrapper(defective_qubits=defective)
-        h_r, J_r, fixed = wrapper._clamp_defective_qubits(
+        wrapper = MockSamplerWrapper(defective_qubits=[2])
+        h_r, J_r, fixed, offset, removed = wrapper._clamp_defective_qubits(
             dict(h), dict(J), nonce_seed=nonce
         )
 
-        # Choose a spin config for the reduced problem
         reduced_sample = {i: 1 for i in h_r}
 
-        # Build full sample by inserting fixed spins
+        # Full sample with fixed spins inserted
         full_sample = dict(reduced_sample)
         full_sample.update(fixed)
-
-        # Energy computed directly on full model
         direct_energy = _ising_energy(full_sample, h, J)
 
-        # Energy via reconstruction
+        # Reduced-problem energy (what QPU reports)
+        reduced_energy = _ising_energy(reduced_sample, h_r, J_r)
+
+        from QPU.dwave_sampler import DefectInfo
+        defect_info = DefectInfo(fixed, offset, removed)
+
         reduced_ss = dimod.SampleSet.from_samples(
-            [reduced_sample], vartype=dimod.SPIN, energy=[0]
+            [reduced_sample], vartype=dimod.SPIN, energy=[reduced_energy]
         )
-        full_ss = wrapper._reconstruct_full_sampleset(
-            reduced_ss, fixed, dict(h), dict(J)
-        )
+        full_ss = wrapper.reconstruct_full_sampleset(reduced_ss, defect_info)
 
         assert full_ss.first.energy == pytest.approx(direct_energy)
