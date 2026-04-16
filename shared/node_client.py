@@ -297,8 +297,9 @@ class _QuicClientProtocol(QuicConnectionProtocol):
                 if not future.done():
                     future.set_result(msg)
             else:
-                self._logger.warning(
-                    f"Received response for unknown request_id={msg.request_id} ({self._peer_host})"
+                self._logger.debug(
+                    "Late response for timed-out request_id=%d (%s)",
+                    msg.request_id, self._peer_host,
                 )
         except Exception as e:
             self._logger.warning(f"Invalid response: {e}")
