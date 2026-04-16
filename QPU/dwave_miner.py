@@ -4,7 +4,6 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import multiprocessing.synchronize
-import random
 import signal
 import sys
 import time
@@ -15,107 +14,13 @@ import dimod
 init_logger = logging.getLogger(__name__)
 
 from QPU.dwave_sampler import DWaveSamplerWrapper
-from shared.quantum_proof_of_work import (
-    ising_nonce_from_block,
-    generate_ising_model_from_nonce,
-)
 from QPU.qpu_time_manager import QPUTimeManager, QPUTimeConfig
 from shared.base_miner import BaseMiner
 from shared.block_requirements import BlockRequirements
+from shared.ising_feeder import IsingFeeder
+from shared.ising_model import IsingModel
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.dwave_topology import DWaveTopology
-
-
-class QPUStream:
-    """Streaming iterator that keeps queue_depth QPU jobs in-flight.
-
-    Modeled on the GPU streaming pattern: each next() call polls for
-    a completed future, yields its result, and submits a replacement
-    to keep the pipeline full. This overlaps network round-trip latency
-    (~2-3s per call) so the QPU stays saturated.
-    """
-
-    def __init__(
-        self,
-        sampler: DWaveSamplerWrapper,
-        prev_hash: bytes,
-        miner_id: str,
-        cur_index: int,
-        nodes: List[int],
-        edges: List[Tuple[int, int]],
-        num_reads: int,
-        annealing_time: float,
-        queue_depth: int,
-    ):
-        self._sampler = sampler
-        self._prev_hash = prev_hash
-        self._miner_id = miner_id
-        self._cur_index = cur_index
-        self._nodes = nodes
-        self._edges = edges
-        self._num_reads = num_reads
-        self._annealing_time = annealing_time
-        self._queue_depth = queue_depth
-        self._job_index = 0
-        self._topology_label = sampler.job_label
-
-        # pending: {future_id: (nonce, salt, future)}
-        self._pending: Dict[int, Tuple[int, bytes, Any]] = {}
-
-        # Fill initial queue
-        for _ in range(queue_depth):
-            self._submit_one()
-
-    def _submit_one(self):
-        """Generate and submit a single async QPU problem."""
-        salt = random.randbytes(32)
-        nonce = ising_nonce_from_block(
-            self._prev_hash, self._miner_id,
-            self._cur_index, salt,
-        )
-        h, J = generate_ising_model_from_nonce(
-            nonce, self._nodes, self._edges,
-        )
-        future = self._sampler.sample_ising_async(
-            h, J,
-            num_reads=self._num_reads,
-            answer_mode='raw',
-            annealing_time=self._annealing_time,
-            label=f"{self._topology_label}_s{self._job_index}",
-            nonce_seed=nonce,
-        )
-        self._pending[id(future)] = (nonce, salt, future)
-        self._job_index += 1
-
-    def __iter__(self):
-        return self
-
-    def __next__(self) -> Tuple[int, bytes, dimod.SampleSet]:
-        """Poll for a completed future, return it, submit a replacement."""
-        if not self._pending:
-            raise StopIteration
-
-        # Poll until one completes
-        while True:
-            for fid, (nonce, salt, fut) in self._pending.items():
-                if fut.done():
-                    self._pending.pop(fid)
-                    sampleset = fut.sampleset
-
-                    # Refill the slot
-                    self._submit_one()
-
-                    return nonce, salt, sampleset
-            time.sleep(0.02)
-
-    def close(self):
-        """Cancel all pending futures."""
-        for _, _, fut in self._pending.values():
-            try:
-                fut.cancel()
-            except Exception:
-                pass
-        self._pending.clear()
 
 
 class DWaveMiner(BaseMiner):
@@ -177,7 +82,8 @@ class DWaveMiner(BaseMiner):
             )
 
         self.queue_depth = queue_depth
-        self._stream: Optional[QPUStream] = None
+        self._feeder: Optional[IsingFeeder] = None
+        self._stream: Optional[Iterator] = None
 
         # Register SIGTERM handler for graceful cleanup
         signal.signal(signal.SIGTERM, self._cleanup_handler)
@@ -190,9 +96,12 @@ class DWaveMiner(BaseMiner):
                 f"cleaning up D-Wave resources..."
             )
         try:
-            if self._stream is not None:
+            if self._stream is not None and hasattr(self._stream, 'close'):
                 self._stream.close()
                 self._stream = None
+            if self._feeder is not None:
+                self._feeder.stop()
+                self._feeder = None
             if hasattr(self, 'sampler') and hasattr(self.sampler, 'close'):
                 self.sampler.close()
             if hasattr(self, 'top_attempts'):
@@ -211,7 +120,7 @@ class DWaveMiner(BaseMiner):
         stop_event: multiprocessing.synchronize.Event,
         **kwargs,
     ) -> bool:
-        """Check QPU daily budget before starting."""
+        """Check QPU daily budget and create IsingFeeder."""
         if self.time_manager is not None:
             estimate = self.time_manager.should_mine_block()
             if not estimate.should_mine:
@@ -238,6 +147,19 @@ class DWaveMiner(BaseMiner):
                 f"Estimated: {estimate.estimated_block_time_us / 1e6:.2f}s "
                 f"({estimate.confidence} confidence)"
             )
+
+        # Create IsingFeeder (same pattern as GPU miners)
+        cur_index = prev_block.header.index + 1
+        feeder_seed = kwargs.pop('feeder_seed', None)
+        self._feeder = IsingFeeder(
+            prev_hash=prev_block.hash,
+            miner_id=node_info.miner_id,
+            cur_index=cur_index,
+            nodes=self.sampler.nodes,
+            edges=self.sampler.edges,
+            buffer_size=self.queue_depth * 2,
+            seed=feeder_seed,
+        )
         return True
 
     def _adapt_mining_params(
@@ -258,6 +180,76 @@ class DWaveMiner(BaseMiner):
             'annealing_time': 120.0,
         }
 
+    def sample_ising_streaming(
+        self,
+        feeder: IsingFeeder,
+        *,
+        num_reads: int,
+        annealing_time: float,
+        queue_depth: int,
+    ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
+        """Stream Ising model solutions via async QPU submission.
+
+        Maintains queue_depth jobs in-flight on the D-Wave cloud.
+        As each completes, yields its result and submits a replacement
+        from the feeder. This overlaps network round-trip latency
+        (~2-3s per call) so the QPU stays saturated.
+
+        Matches the GPU sample_ising_streaming() contract: consumes
+        an IsingFeeder and yields (model, sampleset) pairs.
+
+        Args:
+            feeder: IsingFeeder providing pre-generated IsingModels.
+            num_reads: QPU reads per problem.
+            annealing_time: Annealing time in microseconds.
+            queue_depth: Number of concurrent in-flight QPU jobs.
+
+        Yields:
+            (IsingModel, SampleSet) in completion order.
+        """
+        topology_label = self.sampler.job_label
+
+        # pending: {future_id: (model, future, job_index)}
+        pending: Dict[int, Tuple[IsingModel, Any, int]] = {}
+        job_index = 0
+
+        def submit_one():
+            nonlocal job_index
+            model = feeder.pop_blocking()
+            future = self.sampler.sample_ising_async(
+                model.h, model.J,
+                num_reads=num_reads,
+                answer_mode='raw',
+                annealing_time=annealing_time,
+                label=f"{topology_label}_s{job_index}",
+                nonce_seed=model.nonce,
+            )
+            pending[id(future)] = (model, future, job_index)
+            job_index += 1
+
+        # Fill initial queue
+        for _ in range(queue_depth):
+            submit_one()
+
+        # Stream: poll for completions, yield, refill
+        while pending:
+            completed_id = None
+            while completed_id is None:
+                for fid, (_, fut, _) in pending.items():
+                    if fut.done():
+                        completed_id = fid
+                        break
+                if completed_id is None:
+                    time.sleep(0.02)
+
+            model, future, _ = pending.pop(completed_id)
+            sampleset = future.sampleset
+
+            # Refill the slot
+            submit_one()
+
+            yield model, sampleset
+
     def _sample_batch(
         self,
         prev_hash: bytes,
@@ -273,19 +265,15 @@ class DWaveMiner(BaseMiner):
         """Stream one result from the QPU pipeline.
 
         Lazily creates the streaming iterator on first call. Returns one
-        (nonce, salt, sampleset) per call — matching the GPU streaming
-        pattern. The iterator maintains queue_depth in-flight futures.
+        (nonce, salt, sampleset) per call — matching the GPU miner pattern.
         """
         annealing_time = kwargs.pop('annealing_time', 120.0)
 
         if self._stream is None:
-            self._stream = QPUStream(
-                sampler=self.sampler,
-                prev_hash=prev_hash,
-                miner_id=miner_id,
-                cur_index=cur_index,
-                nodes=nodes,
-                edges=edges,
+            if self._feeder is None:
+                return None  # _pre_mine_setup not called
+            self._stream = self.sample_ising_streaming(
+                feeder=self._feeder,
                 num_reads=num_reads,
                 annealing_time=annealing_time,
                 queue_depth=self.queue_depth,
@@ -296,12 +284,12 @@ class DWaveMiner(BaseMiner):
             )
 
         try:
-            nonce, salt, sampleset = next(self._stream)
+            model, sampleset = next(self._stream)
         except StopIteration:
             return None
 
         self._record_qpu_timing(sampleset)
-        return [(nonce, salt, sampleset)]
+        return [(model.nonce, model.salt, sampleset)]
 
     def _record_qpu_timing(self, sampleset: dimod.SampleSet):
         """Extract and record QPU timing from a sampleset."""
@@ -348,7 +336,11 @@ class DWaveMiner(BaseMiner):
         return sampleset
 
     def _post_mine_cleanup(self) -> None:
-        """Stop the streaming pipeline."""
+        """Stop the streaming pipeline and feeder."""
         if self._stream is not None:
-            self._stream.close()
+            if hasattr(self._stream, 'close'):
+                self._stream.close()
             self._stream = None
+        if self._feeder is not None:
+            self._feeder.stop()
+            self._feeder = None
