@@ -1701,7 +1701,10 @@ class NetworkNode(Node):
         synchronizer = BlockSynchronizer(
             node_client=self.node_client,
             receive_block_queue=self.block_processing_queue,
-            logger=self.logger
+            local_tip=self.get_latest_block,
+            local_locator=self.build_locator,
+            local_get_block_by_hash=self.get_block_by_hash,
+            logger=self.logger,
         )
 
         result = await synchronizer.sync_blocks(start_index, end_index)
