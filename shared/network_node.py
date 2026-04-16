@@ -1392,7 +1392,8 @@ class NetworkNode(Node):
                 self.telemetry.set_epoch_timestamp(None)
 
                 # Reset to original genesis block (no more new genesis creation)
-                self.chain = [self.genesis_block]
+                self._index_truncate(0)
+                self._index_append(self.genesis_block)
                 self.logger.info("Chain reset to genesis block completed")
             
             # Reset synchronization state if it exists (only after start() is called)
