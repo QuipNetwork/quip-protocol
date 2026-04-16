@@ -282,6 +282,8 @@ def main():
         for r in failed:
             print(f"  Trial {r['trial']} FAILED: {r['reason']}")
 
+    # Clean shutdown: stop feeder, streaming pipeline, and D-Wave connection
+    miner._post_mine_cleanup()
     miner.sampler.close()
 
     if failed:
