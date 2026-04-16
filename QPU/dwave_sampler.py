@@ -326,9 +326,20 @@ class DWaveSamplerWrapper:
         self.edges: List[Tuple[int, int]] = cast(List[Tuple[int, int]], self.edgelist)
 
     def close(self):
-        """Release QPU connection resources (Ocean SDK 9.x resource management)."""
+        """Release QPU connection resources.
+
+        Closes the D-Wave cloud client without waiting for in-flight jobs.
+        Any pending futures from sample_ising_async() are abandoned.
+        """
         if hasattr(self, 'qpu_solver'):
-            self.qpu_solver.close()
+            # close(wait=False) tells the D-Wave client to shut down
+            # immediately without waiting for in-flight jobs to complete.
+            # Without this, the client's background submission thread
+            # blocks indefinitely on atexit in multiprocessing workers.
+            try:
+                self.qpu_solver.client.close(wait=False)
+            except Exception:
+                pass
 
     def __enter__(self):
         return self

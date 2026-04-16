@@ -293,9 +293,7 @@ def main():
         print("  All trials timed out")
         exit_code = 1
 
-    # Force exit — the D-Wave cloud client's background threads and
-    # ProcessPoolExecutor atexit handlers block indefinitely otherwise.
-    os._exit(exit_code)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
