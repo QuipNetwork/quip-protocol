@@ -29,6 +29,12 @@ from aioquic.quic.events import (
 
 from shared.block import Block, BlockHeader, MinerInfo
 from shared.peer_ban_list import PeerBanList
+from shared.sync_messages import (
+    decode_block_by_hash_response,
+    decode_manifest_response,
+    encode_block_by_hash_request,
+    encode_manifest_request,
+)
 from shared.version import get_version, PROTOCOL_VERSION
 from shared.time_utils import utc_timestamp_float
 from shared.address_utils import parse_host_port
@@ -68,6 +74,9 @@ class QuicMessageType(IntEnum):
     # Phase 3: IHAVE/IWANT block propagation
     IHAVE = 0x10              # Announce block availability (hash only)
     IWANT = 0x11              # Request specific blocks by hash
+    # Fork-aware sync: manifest + content-addressed block fetch
+    CHAIN_MANIFEST_REQUEST = 0x12  # Bitcoin-style locator in, (idx, hash) slice out
+    BLOCK_BY_HASH_REQUEST = 0x13   # Fetch a specific block by its hash
     # Telemetry stream API
     TELEMETRY_STATUS_REQUEST = 0x20
     TELEMETRY_NODES_REQUEST = 0x21
@@ -94,6 +103,9 @@ class QuicMessageType(IntEnum):
     # Phase 3 responses
     IHAVE_RESPONSE = 0x90
     IWANT_RESPONSE = 0x91
+    # Fork-aware sync responses
+    CHAIN_MANIFEST_RESPONSE = 0x92
+    BLOCK_BY_HASH_RESPONSE = 0x93
     # Telemetry responses
     TELEMETRY_STATUS_RESPONSE = 0xA0
     TELEMETRY_NODES_RESPONSE = 0xA1
@@ -601,6 +613,72 @@ class NodeClient:
             except Exception:
                 return None
         return None
+
+    async def get_chain_manifest(
+        self,
+        host: str,
+        locator: list,
+        limit: int,
+    ) -> Optional[list]:
+        """Fetch a slice of a peer's canonical chain as (index, hash) tuples.
+
+        The peer uses the Bitcoin-style ``locator`` to find the latest
+        common ancestor and returns up to ``limit`` entries on its
+        canonical chain starting from the next index.
+
+        Args:
+            host: ``host:port`` of the peer to query.
+            locator: Locator hashes tip-first (see
+                ``shared.node.Node.build_locator``).
+            limit: Maximum entries to request; capped at
+                ``MAX_MANIFEST_ENTRIES`` on the wire.
+
+        Returns:
+            List of ``(index, hash)`` tuples in ascending index order,
+            or ``None`` on connection, protocol, or decode failure.
+        """
+        protocol = await self._get_connection(host)
+        if not protocol:
+            return None
+        payload = encode_manifest_request(locator, limit)
+        response = await protocol.send_request(
+            QuicMessageType.CHAIN_MANIFEST_REQUEST, payload, timeout=self.node_timeout
+        )
+        if await self._is_version_error(response, host):
+            return None
+        if response is None or response.msg_type != QuicMessageType.CHAIN_MANIFEST_RESPONSE:
+            return None
+        try:
+            return decode_manifest_response(response.payload)
+        except ValueError as e:
+            self.logger.warning(f"Malformed manifest response from {host}: {e}")
+            return None
+
+    async def get_peer_block_by_hash(
+        self, host: str, block_hash: bytes
+    ) -> Optional[Block]:
+        """Fetch a block from a peer by its hash.
+
+        Returns ``None`` when the peer doesn't have the block on its
+        canonical chain (empty payload), when the connection fails, or
+        when the response payload fails to deserialize.
+        """
+        protocol = await self._get_connection(host)
+        if not protocol:
+            return None
+        payload = encode_block_by_hash_request(block_hash)
+        response = await protocol.send_request(
+            QuicMessageType.BLOCK_BY_HASH_REQUEST, payload, timeout=self.node_timeout
+        )
+        if await self._is_version_error(response, host):
+            return None
+        if response is None or response.msg_type != QuicMessageType.BLOCK_BY_HASH_RESPONSE:
+            return None
+        try:
+            return decode_block_by_hash_response(response.payload)
+        except Exception as e:
+            self.logger.warning(f"Malformed block-by-hash response from {host}: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Telemetry stream API

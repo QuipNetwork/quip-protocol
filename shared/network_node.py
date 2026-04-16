@@ -31,6 +31,13 @@ from shared.node_client import (
     generate_self_signed_cert, QUIP_ALPN_PROTOCOL, MAX_DATAGRAM_FRAME_SIZE,
     MAX_DATAGRAM_MESSAGE_SIZE,
 )
+from shared.sync_messages import (
+    MAX_MANIFEST_ENTRIES,
+    decode_block_by_hash_request,
+    decode_manifest_request,
+    encode_block_by_hash_response,
+    encode_manifest_response,
+)
 from aioquic.asyncio import serve
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.quic.configuration import QuicConfiguration
@@ -2371,6 +2378,11 @@ class NetworkNode(Node):
                 return await self._quic_handle_ihave(msg)
             elif msg.msg_type == QuicMessageType.IWANT:
                 return await self._quic_handle_iwant(msg)
+            # Fork-aware sync: manifest + content-addressed block fetch
+            elif msg.msg_type == QuicMessageType.CHAIN_MANIFEST_REQUEST:
+                return await self._quic_handle_chain_manifest_request(msg)
+            elif msg.msg_type == QuicMessageType.BLOCK_BY_HASH_REQUEST:
+                return await self._quic_handle_block_by_hash_request(msg)
             # Telemetry stream API
             elif msg.msg_type == QuicMessageType.TELEMETRY_STATUS_REQUEST:
                 return self._quic_handle_telemetry_status(msg)
@@ -3033,6 +3045,60 @@ class NetworkNode(Node):
 
         # Return header in network binary format
         return msg.create_response(block.header.to_network())
+
+    async def _quic_handle_chain_manifest_request(self, msg: QuicMessage) -> QuicMessage:
+        """Return a slice of our canonical chain as ``(index, hash)`` tuples.
+
+        The client sends a Bitcoin-style locator. We find the latest
+        hash in that locator that is still on our canonical chain
+        (O(1) per entry via ``chain_by_hash``), then return canonical
+        entries starting from the next index, up to ``limit`` or our
+        current tip — whichever is smaller.
+
+        Returns an empty manifest when no locator hash matches our
+        canonical chain (divergent genesis, or the client is a
+        reorg'd-away fork we don't share). The client treats that as
+        "no useful data here" and demotes the peer for the session.
+        """
+        try:
+            locator, limit = decode_manifest_request(msg.payload)
+        except ValueError as e:
+            return msg.create_error_response(f"malformed manifest request: {e}")
+
+        start_after = -1
+        for h in locator:
+            block = self.chain_by_hash.get(h)
+            if block is not None:
+                start_after = block.header.index
+                break
+
+        entries: list = []
+        if start_after >= 0:
+            first_idx = start_after + 1
+            tip_idx = self.get_latest_block().header.index
+            capped_limit = min(limit, MAX_MANIFEST_ENTRIES)
+            last_idx = min(tip_idx, first_idx + capped_limit - 1)
+            for i in range(first_idx, last_idx + 1):
+                blk = self.chain[i]
+                if blk.hash is None:
+                    # Canonical-chain blocks are expected to be finalized;
+                    # bail out rather than sending a partial manifest.
+                    break
+                entries.append((i, blk.hash))
+
+        return msg.create_response(encode_manifest_response(entries))
+
+    async def _quic_handle_block_by_hash_request(self, msg: QuicMessage) -> QuicMessage:
+        """Return a canonical-chain block by hash, or empty for NOT_FOUND."""
+        try:
+            block_hash = decode_block_by_hash_request(msg.payload)
+        except ValueError as e:
+            return msg.create_error_response(
+                f"malformed block-by-hash request: {e}"
+            )
+
+        block = self.get_block_by_hash(block_hash)
+        return msg.create_response(encode_block_by_hash_response(block))
 
     async def _quic_handle_solve(self, msg: QuicMessage) -> QuicMessage:
         """Handle quantum annealing solve request."""
