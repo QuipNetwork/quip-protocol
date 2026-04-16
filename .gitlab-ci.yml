@@ -138,17 +138,16 @@ release-binaries:
     - package-macos-x86_64
   rules:
     - if: $CI_COMMIT_TAG
-  variables:
-    GITLAB_TOKEN: $CI_JOB_TOKEN
   script:
     - echo "Creating release $CI_COMMIT_TAG"
-    # Delete any existing release so retagged versions don't fail
-    - glab release delete "$CI_COMMIT_TAG" --yes 2>/dev/null || true
-    - |
-      glab release create "$CI_COMMIT_TAG" \
-        --notes "Release $CI_COMMIT_TAG" \
-        --ref "$CI_COMMIT_SHA" \
-        --assets-links "[
-          {\"name\": \"quip-network-node-macos-arm64\", \"url\": \"${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-macos-arm64?job=package-macos-arm64\", \"filepath\": \"/quip-network-node-macos-arm64\"},
-          {\"name\": \"quip-network-node-macos-x86_64\", \"url\": \"${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-macos-x86_64?job=package-macos-x86_64\", \"filepath\": \"/quip-network-node-macos-x86_64\"}
-        ]"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    description: "Release $CI_COMMIT_TAG"
+    assets:
+      links:
+        - name: quip-network-node-macos-arm64
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-macos-arm64?job=package-macos-arm64"
+          filepath: /quip-network-node-macos-arm64
+        - name: quip-network-node-macos-x86_64
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-macos-x86_64?job=package-macos-x86_64"
+          filepath: /quip-network-node-macos-x86_64
