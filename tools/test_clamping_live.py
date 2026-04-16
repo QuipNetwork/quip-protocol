@@ -233,13 +233,15 @@ def main():
 
     # Override adaptive params if specified
     if args.num_reads is not None or args.annealing_time is not None:
-        base_params = miner._adapt_mining_params(None, [], [])
-        if args.num_reads is not None:
-            base_params['num_reads'] = args.num_reads
-        if args.annealing_time is not None:
-            base_params['annealing_time'] = args.annealing_time
-        override = dict(base_params)
-        miner._adapt_mining_params = lambda *a, **kw: override
+        override = {
+            'num_reads': args.num_reads or 512,
+            'annealing_time': args.annealing_time or 120.0,
+        }
+        # energy_threshold is filled dynamically from requirements
+        miner._adapt_mining_params = lambda reqs, *a, **kw: {
+            **override,
+            'energy_threshold': reqs.difficulty_energy if reqs else 0.0,
+        }
         print(f"  Override params: {override}")
     n_defects = len(miner.sampler._defective_qubits)
     print(f"  Defective qubits: {n_defects}")
