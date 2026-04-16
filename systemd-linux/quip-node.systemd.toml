@@ -1,0 +1,49 @@
+# Quip Network Node - Systemd (Bare-Metal Linux) Configuration
+# Installed to /etc/quip.network/config.toml by install.sh
+
+[global]
+genesis_config = "/var/lib/quip.network/genesis_block.json"
+secret = "GENERATE_ON_FIRST_RUN"
+listen = "::"
+port = 20049
+# public_host = ""
+# public_port = 20049
+# node_name = ""
+# auto_mine = false
+# peer = []
+timeout = 3
+heartbeat_interval = 15
+heartbeat_timeout = 300
+verify_tls = false
+
+# TLS certificates (manual — no certbot automation in systemd setup)
+# Obtain certificates via certbot, acme.sh, or your preferred method,
+# then uncomment and set the paths below.
+# tls_cert_file = "/etc/quip.network/certs/fullchain.pem"
+# tls_key_file = "/etc/quip.network/certs/privkey.pem"
+
+# TOFU (Trust On First Use)
+tofu = true
+trust_db = "/var/lib/quip.network/trust.db"
+
+# REST API (disabled by default)
+rest_host = "127.0.0.1"
+rest_port = -1
+rest_insecure_port = -1
+# webroot = "/var/lib/quip.network/webroot"
+
+# Logging
+log_level = "INFO"
+node_log = "/var/log/quip.network/quip-node.log"
+http_log = "/var/log/quip.network/quip-http.log"
+
+# Telemetry
+telemetry_enabled = true
+telemetry_dir = "/var/lib/quip.network/telemetry"
+
+[cpu]
+# num_cpus is auto-set by install.sh if not already configured
+
+# Uncomment for GPU mining (requires NVIDIA drivers + CUDA toolkit)
+# [gpu]
+# [cuda.0]

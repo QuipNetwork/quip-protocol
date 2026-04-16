@@ -24,7 +24,7 @@ docker run -d --name quip-cpu \
   -e CERT_EMAIL=admin@example.com \
   -p 20049:20049/udp -p 20049:20049/tcp \
   -p 80:80/tcp \
-  registry.gitlab.com/piqued/quip-protocol/quip-network-node-cpu:latest
+  registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest
 ```
 
 **How it works:** The certbot script auto-detects whether port 80 is available:
@@ -48,7 +48,7 @@ docker run -d --name quip-cpu \
   -e CERT_DNS_PLUGIN=cloudflare \
   -e CERT_DNS_CREDENTIALS=/data/certs/cf.ini \
   -p 20049:20049/udp -p 20049:20049/tcp \
-  registry.gitlab.com/piqued/quip-protocol/quip-network-node-cpu:latest
+  registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest
 ```
 
 ## DNS Plugin Reference
@@ -85,7 +85,7 @@ docker run -d --name quip-cpu \
   -e CERT_EAB_KID=your-eab-key-id \
   -e CERT_EAB_HMAC_KEY=your-eab-hmac-key \
   -p 20049:20049/udp -p 20049:20049/tcp -p 80:80/tcp \
-  registry.gitlab.com/piqued/quip-protocol/quip-network-node-cpu:latest
+  registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest
 ```
 
 This also works with Buypass (`https://api.buypass.com/acme/directory`) and other ACME-compliant CAs.

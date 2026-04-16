@@ -35,7 +35,7 @@ FROM python:3.13-slim-bookworm
 
 LABEL maintainer="Quip Protocol"
 LABEL description="Quip Network Node - CPU Mining"
-LABEL org.opencontainers.image.source="https://gitlab.com/piqued/quip-protocol"
+LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-protocol"
 
 # Install runtime dependencies (tini for PID 1, busybox for crond)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -76,6 +76,8 @@ ENV QUIP_PUBLIC_HOST=""
 ENV QUIP_PUBLIC_PORT=""
 ENV QUIP_NODE_NAME=""
 ENV QUIP_AUTO_MINE=""
+ENV QUIP_REST_INSECURE_PORT=""
+ENV QUIP_REST_HOST=""
 
 # TLS certificate management (certbot activates when CERT_EMAIL is set
 # and QUIP_PUBLIC_HOST is a DNS name). All other CERT_* vars are unset
@@ -88,6 +90,7 @@ VOLUME ["/data"]
 # Expose QUIC port and HTTP-01 challenge port
 EXPOSE 20049/udp
 EXPOSE 20049/tcp
+EXPOSE 20050/tcp
 EXPOSE 80/tcp
 
 ENTRYPOINT ["tini", "--", "/entrypoint.sh"]

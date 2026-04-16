@@ -353,6 +353,8 @@ class BaseMiner(ABC):
             MiningResult if a valid solution is found, else None.
         """
         # -- setup --------------------------------------------------------
+        drain = kwargs.pop('drain', False)
+        on_block = kwargs.pop('on_block', None)
         self.mining = True
         progress = 0
         self.top_attempts = []
@@ -443,8 +445,11 @@ class BaseMiner(ABC):
                                 f"Total Mining Time: "
                                 f"{time.time() - start_time:.2f}s",
                             )
-                            self._post_mine_cleanup()
-                            return result
+                            if drain and on_block:
+                                on_block(result)
+                            else:
+                                self._post_mine_cleanup()
+                                return result
 
             # Track preprocessing
             preprocess_start = time.time()
@@ -493,8 +498,11 @@ class BaseMiner(ABC):
                             f"Solutions: {result.num_valid}, "
                             f"Diversity: {result.diversity:.3f}",
                         )
-                        self._post_mine_cleanup()
-                        return result
+                        if drain and on_block:
+                            on_block(result)
+                        else:
+                            self._post_mine_cleanup()
+                            return result
                     self.update_top_samples(
                         b_ss, b_nonce, b_salt,
                         current_requirements,
@@ -512,6 +520,7 @@ class BaseMiner(ABC):
                     h, J,
                     num_reads=num_reads,
                     num_sweeps=current_num_sweeps,
+                    nonce_seed=nonce,
                     **extra_params,
                 )
 
@@ -561,8 +570,11 @@ class BaseMiner(ABC):
                     f"Attempt Time: {result.mining_time:.2f}s, "
                     f"Total Mining Time: {time.time() - start_time:.2f}s",
                 )
-                self._post_mine_cleanup()
-                return result
+                if drain and on_block:
+                    on_block(result)
+                else:
+                    self._post_mine_cleanup()
+                    return result
 
             # Track best attempts
             self.update_top_samples(
@@ -576,12 +588,21 @@ class BaseMiner(ABC):
                     if self.top_attempts
                     else float('inf')
                 )
-                self.logger.info(
-                    f"Progress: {progress} attempts, "
-                    f"best energy: {best_energy:.2f} | "
-                    f"Sweeps: {current_num_sweeps}/{max_num_sweeps}, "
-                    f"Reads: {num_reads}",
-                )
+                if self.miner_type == "QPU":
+                    anneal_us = extra_params.get('annealing_time', 0)
+                    self.logger.info(
+                        f"Progress: {progress} attempts, "
+                        f"best energy: {best_energy:.2f} | "
+                        f"Annealing: {anneal_us:.0f}μs, "
+                        f"Reads: {num_reads}",
+                    )
+                else:
+                    self.logger.info(
+                        f"Progress: {progress} attempts, "
+                        f"best energy: {best_energy:.2f} | "
+                        f"Sweeps: {current_num_sweeps}/{max_num_sweeps}, "
+                        f"Reads: {num_reads}",
+                    )
 
         # -- teardown -----------------------------------------------------
         self._post_mine_cleanup()

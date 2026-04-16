@@ -71,7 +71,7 @@ def load_json_topology(filename: str, topologies_dir: str = None, from_embedding
     Args:
         filename: Name of the JSON topology file (e.g., 'zephyr_z11_t4.json' or 'zephyr_z11_t4.json.gz')
         topologies_dir: Directory containing topology files. If None, uses default based on from_embeddings.
-        from_embeddings: If True, load from embeddings/Advantage2_system1_13/. Otherwise load from topologies/.
+        from_embeddings: If True, load from embeddings/Advantage2_system1/. Otherwise load from topologies/.
 
     Returns:
         DWaveTopologyFromJSON instance
@@ -84,9 +84,9 @@ def load_json_topology(filename: str, topologies_dir: str = None, from_embedding
     if topologies_dir is None:
         current_dir = os.path.dirname(os.path.abspath(__file__))
         if from_embeddings:
-            # Mined topologies are in embeddings/Advantage2_system1_13/
+            # Mined topologies are in embeddings/Advantage2_system1/
             parent_dir = os.path.dirname(current_dir)
-            topologies_dir = os.path.join(parent_dir, 'embeddings', 'Advantage2_system1_13')
+            topologies_dir = os.path.join(parent_dir, 'embeddings', 'Advantage2_system1')
         else:
             # Pregenerated topologies are in topologies/
             topologies_dir = current_dir
@@ -119,14 +119,14 @@ def load_topology(topology_name: str) -> Any:
 
     This function handles:
     - Zephyr topology names: "Z(9,2)" → generates ZephyrTopology on-the-fly
-    - Hardware topology names: "Advantage2_system1.13" → loads from JSON
+    - Hardware topology names: "Advantage2_system1" → loads from JSON
     - File paths: "path/to/topology.json" → loads from file
     - Named topologies: "ZEPHYR_Z9_T2_TOPOLOGY" → returns from dwave_topologies module
 
     Args:
         topology_name: String identifying the topology. Can be:
                       - Zephyr format: "Z(9,2)", "Z(10,2)", etc.
-                      - Hardware name: "Advantage2_system1.13", "Advantage2_system4_1"
+                      - Hardware name: "Advantage2_system1", "Advantage2_system4_1"
                       - File path: "path/to/custom_topology.json" or ".json.gz"
                       - Named constant: "ZEPHYR_Z9_T2_TOPOLOGY"
 
@@ -143,8 +143,8 @@ def load_topology(topology_name: str) -> Any:
         >>> topology = load_topology("Z(10,2)")
 
         >>> # Hardware topologies (loaded from JSON)
-        >>> topology = load_topology("Advantage2_system1.13")
-        >>> topology = load_topology("Advantage2-system1.13")  # Also works
+        >>> topology = load_topology("Advantage2_system1")
+        >>> topology = load_topology("Advantage2-system1")  # Also works
 
         >>> # Custom file
         >>> topology = load_topology("path/to/my_topology.json.gz")
@@ -183,7 +183,7 @@ def load_topology(topology_name: str) -> Any:
             t = int(match.group(2))
             return ZephyrTopology(m, t)
 
-    # Case 3: Hardware topology name (e.g., "Advantage2_system1.13" or "Advantage2-system1.13")
+    # Case 3: Hardware topology name (e.g., "Advantage2_system1" or "Advantage2-system1")
     # Normalize name to match JSON filename
     normalized_name = topology_name.replace('-', '_').replace('.', '_').lower()
 
@@ -214,7 +214,7 @@ def load_topology(topology_name: str) -> Any:
         f"Could not parse topology name '{topology_name}'. "
         f"Expected formats:\n"
         f"  - Zephyr: Z(m,t) (e.g., 'Z(9,2)')\n"
-        f"  - Hardware: Advantage2_system1.13 or Advantage2-system1.13\n"
+        f"  - Hardware: Advantage2_system1 or Advantage2-system1\n"
         f"  - File path: path/to/topology.json or .json.gz\n"
         f"  - Named constant: ZEPHYR_Z9_T2_TOPOLOGY"
     )

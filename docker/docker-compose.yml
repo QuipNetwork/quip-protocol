@@ -13,7 +13,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.cpu
-    image: registry.gitlab.com/piqued/quip-protocol/quip-network-node-cpu:latest
+    image: registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest
     container_name: quip-cpu-bootstrap
     environment:
       - QUIP_PUBLIC_HOST=cpu-bootstrap
@@ -35,7 +35,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.cpu
-    image: registry.gitlab.com/piqued/quip-protocol/quip-network-node-cpu:latest
+    image: registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest
     container_name: quip-cpu-2
     environment:
       - QUIP_PUBLIC_HOST=cpu-node-2
@@ -54,7 +54,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.cuda
-    image: registry.gitlab.com/piqued/quip-protocol/quip-network-node-cuda:latest
+    image: registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cuda:latest
     container_name: quip-gpu-1
     environment:
       - QUIP_PUBLIC_HOST=gpu-node

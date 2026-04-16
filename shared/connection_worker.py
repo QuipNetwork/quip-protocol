@@ -87,7 +87,8 @@ def connection_worker_main(
     log = _setup_child_logging()
     log.info("Connection worker started")
 
-    loop = asyncio.new_event_loop()
+    from shared.event_loop import create_event_loop
+    loop = create_event_loop()
     asyncio.set_event_loop(loop)
 
     from shared.node_client import NodeClient

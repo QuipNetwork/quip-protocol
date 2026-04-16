@@ -75,6 +75,10 @@ def _load_config(path: Optional[str]) -> Dict[str, Any]:
         if section in config:
             cfg[section] = config[section]
 
+    # Forward telemetry API configuration
+    if "telemetry_api" in config:
+        cfg["telemetry_api"] = config["telemetry_api"]
+
     _print_final_config(cfg, "load_config")
 
     return cfg
@@ -199,6 +203,10 @@ async def _async_run_network_node(config: Dict[str, Any], genesis_config_file: s
 
 
 def _run_network_node_sync(config: Dict[str, Any], genesis_config_file: str) -> int:
+    # Install uvloop for 2-4x async throughput if available
+    from shared.event_loop import install_uvloop_policy
+    install_uvloop_policy()
+
     try:
         return asyncio.run(_async_run_network_node(config, genesis_config_file))
     except KeyboardInterrupt:

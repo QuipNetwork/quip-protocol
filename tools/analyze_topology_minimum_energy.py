@@ -29,7 +29,7 @@ from dwave_topologies.topologies import (
     PEGASUS_P16_TOPOLOGY,
     ZEPHYR_Z12_TOPOLOGY,
     ZEPHYR_Z11_T4_TOPOLOGY,
-    ADVANTAGE2_SYSTEM1_13_TOPOLOGY
+    ADVANTAGE2_SYSTEM1_TOPOLOGY
 )
 
 # Available topologies for analysis
@@ -39,7 +39,7 @@ AVAILABLE_TOPOLOGIES = {
     'p16': PEGASUS_P16_TOPOLOGY,
     'z12': ZEPHYR_Z12_TOPOLOGY,  # Generic Z(12, 4) topology
     'z11t4': ZEPHYR_Z11_T4_TOPOLOGY,  # Generic Z(11, 4) topology
-    'advantage2': ADVANTAGE2_SYSTEM1_13_TOPOLOGY,  # Real Advantage2-System1.10 topology
+    'advantage2': ADVANTAGE2_SYSTEM1_TOPOLOGY,  # Real Advantage2-System1.10 topology
 }
 
 def analyze_topology(topology_name: str, topology_obj) -> Dict:

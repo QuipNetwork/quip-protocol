@@ -50,20 +50,35 @@ class MockNetworkNode:
         return None
 
     def _create_mock_block(self, index):
-        """Create a mock block."""
+        """Create a mock block matching real Block/BlockHeader schema."""
         mock_block = MagicMock()
         mock_block.header = MagicMock()
         mock_block.header.index = index
         mock_block.header.timestamp = 1700000000 + index
-        mock_block.header.prev_hash = b'\x00' * 32
-        mock_block.header.pow_hash = b'\x01' * 32
-        mock_block.header.merkle_root = b'\x02' * 32
-        mock_block.header.miner_info = self.info()
-        mock_block.header.pow_difficulty = -4100.0
-        mock_block.header.pow_energy = -4200.0
-        mock_block.header.diversity = 0.15
-        mock_block.header.num_solutions = 5
+        mock_block.header.previous_hash = b'\x00' * 32
+        mock_block.header.data_hash = b'\x02' * 32
+        mock_block.header.version = 2
+        mock_block.miner_info = MagicMock()
+        mock_block.miner_info.to_json.return_value = json.dumps({
+            "miner_id": "test_miner",
+            "miner_type": "CPU",
+            "reward_address": "aa" * 32,
+            "ecdsa_public_key": "bb" * 32,
+            "wots_public_key": "cc" * 32,
+            "next_wots_public_key": "dd" * 32,
+        })
+        mock_block.quantum_proof = MagicMock()
+        mock_block.quantum_proof.energy = -4200.0
+        mock_block.quantum_proof.diversity = 0.15
+        mock_block.quantum_proof.num_valid_solutions = 5
+        mock_block.quantum_proof.mining_time = 1.5
+        mock_block.quantum_proof.nonce = 12345
+        mock_block.next_block_requirements = MagicMock()
+        mock_block.next_block_requirements.difficulty_energy = -4100.0
+        mock_block.next_block_requirements.min_diversity = 0.2
+        mock_block.next_block_requirements.min_solutions = 5
         mock_block.transactions = []
+        mock_block.hash = b'\x04' * 32
         mock_block.signature = b'\x03' * 64
         return mock_block
 
@@ -259,21 +274,17 @@ class TestRestApiBlockConversion:
         mock_header = MagicMock()
         mock_header.index = 5
         mock_header.timestamp = 1700000005
-        mock_header.prev_hash = b'\x00' * 32
-        mock_header.pow_hash = b'\x01' * 32
-        mock_header.merkle_root = b'\x02' * 32
-        mock_header.miner_info = mock_node.info()
-        mock_header.pow_difficulty = -4100.0
-        mock_header.pow_energy = -4200.0
-        mock_header.diversity = 0.15
-        mock_header.num_solutions = 5
+        mock_header.previous_hash = b'\x00' * 32
+        mock_header.data_hash = b'\x02' * 32
+        mock_header.version = 2
 
         result = server._header_to_dict(mock_header)
 
         assert result["index"] == 5
         assert result["timestamp"] == 1700000005
-        assert result["pow_difficulty"] == -4100.0
-        assert result["diversity"] == 0.15
+        assert result["previous_hash"] == "00" * 32
+        assert result["data_hash"] == "02" * 32
+        assert result["version"] == 2
 
     def test_block_to_dict(self):
         """Test block conversion to dict."""
@@ -286,4 +297,9 @@ class TestRestApiBlockConversion:
 
         assert result["header"]["index"] == 7
         assert "transactions" in result
-        assert "signature_hex" in result
+        assert "signature" in result
+        assert "hash" in result
+        assert result["quantum_proof"]["energy"] == -4200.0
+        assert result["quantum_proof"]["num_valid_solutions"] == 5
+        assert result["miner_info"]["miner_id"] == "test_miner"
+        assert result["next_block_requirements"]["difficulty_energy"] == -4100.0

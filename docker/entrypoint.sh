@@ -103,6 +103,10 @@ resolve QUIP_PUBLIC_PORT   public_port   int
 resolve QUIP_NODE_NAME     node_name     string
 resolve QUIP_AUTO_MINE     auto_mine     bool
 
+# REST API
+resolve QUIP_REST_INSECURE_PORT  rest_insecure_port  int
+resolve QUIP_REST_HOST           rest_host            string
+
 # Peers: ENV is comma-separated, TOML is array
 if [ -n "${QUIP_PEERS:-}" ]; then
     # Convert "a,b,c" → ["a", "b", "c"]
@@ -121,6 +125,7 @@ fi
 echo "Config: listen=$(toml_get listen) port=$(toml_get port)"
 echo "Config: public_host=$(toml_get public_host) public_port=$(toml_get public_port)"
 echo "Config: node_name=$(toml_get node_name) auto_mine=$(toml_get auto_mine)"
+echo "Config: rest_host=$(toml_get rest_host) rest_insecure_port=$(toml_get rest_insecure_port)"
 
 # ── Auto-detect hardware from config ──────────────────────────────
 # Detect GPU/CPU sections from TOML instead of relying on QUIP_MODE env var.
