@@ -75,6 +75,10 @@ def _load_config(path: Optional[str]) -> Dict[str, Any]:
         if section in config:
             cfg[section] = config[section]
 
+    # Forward telemetry API configuration
+    if "telemetry_api" in config:
+        cfg["telemetry_api"] = config["telemetry_api"]
+
     _print_final_config(cfg, "load_config")
 
     return cfg

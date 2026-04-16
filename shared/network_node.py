@@ -44,6 +44,7 @@ from shared.process_pool import ProcessPool, ProcessPoolConfig
 from shared.rate_limiter import PeerRateLimiter
 from shared.swim_detector import SwimDetector, PeerState
 from shared.telemetry import TelemetryManager
+from shared.telemetry_cache import TelemetryCache
 from shared.time_utils import (
     utc_timestamp_float, is_clock_synchronized, NETWORK_TIME_SYNC_INTERVAL,
     get_network_clock, network_timestamp
@@ -406,6 +407,21 @@ class NetworkNode(Node):
         )
         self.telemetry.record_initial_peers(self.initial_peers)
 
+        # Telemetry cache (read-only, for REST + QUIC telemetry endpoints)
+        telem_api = config.get("telemetry_api", {})
+        telem_api_enabled = telem_api.get(
+            "enabled", config.get("telemetry_enabled", True),
+        )
+        if telem_api_enabled:
+            self.telemetry_cache: Optional[TelemetryCache] = TelemetryCache(
+                telemetry_dir=config.get("telemetry_dir", "telemetry"),
+                refresh_interval=telem_api.get("cache_refresh_interval", 5.0),
+                logger=self.logger,
+            )
+        else:
+            self.telemetry_cache = None
+        self._telemetry_api_config = telem_api
+
         # Maximum block index to synchronize with (prevents syncing with peers too far ahead)
         self.max_sync_block_index = 1024
 
@@ -602,6 +618,7 @@ class NetworkNode(Node):
                     ),
                 }
                 cert_manager = CertificateManager(cert_config, logger=self.logger)
+            tapi = self._telemetry_api_config
             self.rest_api_server = RestApiServer(
                 network_node=self,
                 host=self.rest_host,
@@ -609,9 +626,17 @@ class NetworkNode(Node):
                 tls_port=self.rest_port,
                 cert_manager=cert_manager,
                 webroot=self.webroot,
-                logger=self.logger
+                logger=self.logger,
+                telemetry_cache=self.telemetry_cache,
+                telemetry_access_token=tapi.get("access_token", ""),
+                telemetry_rate_limit_rpm=tapi.get("rate_limit_rpm", 30),
+                telemetry_max_sse=tapi.get("max_sse_connections", 20),
             )
             await self.rest_api_server.start()
+
+        # Start telemetry cache
+        if self.telemetry_cache is not None:
+            await self.telemetry_cache.start()
 
         # Start background tasks
         self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
@@ -673,6 +698,10 @@ class NetworkNode(Node):
         self.telemetry.stop()
         if self.reset_timer_task:
             self.reset_timer_task.cancel()
+
+        # Stop telemetry cache
+        if self.telemetry_cache is not None:
+            await self.telemetry_cache.stop()
 
         # Stop REST API server if running
         if self.rest_api_server:
@@ -2264,6 +2293,17 @@ class NetworkNode(Node):
                 return await self._quic_handle_ihave(msg)
             elif msg.msg_type == QuicMessageType.IWANT:
                 return await self._quic_handle_iwant(msg)
+            # Telemetry stream API
+            elif msg.msg_type == QuicMessageType.TELEMETRY_STATUS_REQUEST:
+                return self._quic_handle_telemetry_status(msg)
+            elif msg.msg_type == QuicMessageType.TELEMETRY_NODES_REQUEST:
+                return self._quic_handle_telemetry_nodes(msg)
+            elif msg.msg_type == QuicMessageType.TELEMETRY_EPOCHS_REQUEST:
+                return self._quic_handle_telemetry_epochs(msg)
+            elif msg.msg_type == QuicMessageType.TELEMETRY_BLOCK_REQUEST:
+                return self._quic_handle_telemetry_block(msg)
+            elif msg.msg_type == QuicMessageType.TELEMETRY_LATEST_REQUEST:
+                return self._quic_handle_telemetry_latest(msg)
             else:
                 self.logger.warning(f"Unknown message type: {msg.msg_type}")
                 return msg.create_error_response(f"Unknown message type: {msg.msg_type}")
@@ -2456,6 +2496,78 @@ class NetworkNode(Node):
             )
         except Exception as exc:
             return msg.create_error_response(str(exc))
+
+    # ------------------------------------------------------------------
+    # Telemetry QUIC handlers
+    # ------------------------------------------------------------------
+
+    def _quic_telemetry_json_response(
+        self, msg: 'QuicMessage', data: Any,
+    ) -> 'QuicMessage':
+        """Build a JSON telemetry response from cached data."""
+        payload = json.dumps(data).encode("utf-8")
+        return msg.create_response(payload)
+
+    def _quic_handle_telemetry_status(
+        self, msg: 'QuicMessage',
+    ) -> 'QuicMessage':
+        """Handle TELEMETRY_STATUS_REQUEST."""
+        if self.telemetry_cache is None:
+            return msg.create_error_response("Telemetry not enabled")
+        return self._quic_telemetry_json_response(
+            msg, self.telemetry_cache.get_status(),
+        )
+
+    def _quic_handle_telemetry_nodes(
+        self, msg: 'QuicMessage',
+    ) -> 'QuicMessage':
+        """Handle TELEMETRY_NODES_REQUEST."""
+        if self.telemetry_cache is None:
+            return msg.create_error_response("Telemetry not enabled")
+        data = self.telemetry_cache.get_nodes()
+        if data is None:
+            return msg.create_error_response("No node data available")
+        return self._quic_telemetry_json_response(msg, data)
+
+    def _quic_handle_telemetry_epochs(
+        self, msg: 'QuicMessage',
+    ) -> 'QuicMessage':
+        """Handle TELEMETRY_EPOCHS_REQUEST."""
+        if self.telemetry_cache is None:
+            return msg.create_error_response("Telemetry not enabled")
+        return self._quic_telemetry_json_response(
+            msg, {"epochs": self.telemetry_cache.get_epochs()},
+        )
+
+    def _quic_handle_telemetry_block(
+        self, msg: 'QuicMessage',
+    ) -> 'QuicMessage':
+        """Handle TELEMETRY_BLOCK_REQUEST."""
+        if self.telemetry_cache is None:
+            return msg.create_error_response("Telemetry not enabled")
+        try:
+            params = json.loads(msg.payload.decode("utf-8"))
+            epoch = params["epoch"]
+            block_index = int(params["block_index"])
+        except (json.JSONDecodeError, KeyError, ValueError):
+            return msg.create_error_response("Invalid request payload")
+        data = self.telemetry_cache.get_block(epoch, block_index)
+        if data is None:
+            return msg.create_error_response(
+                f"Block {epoch}/{block_index} not found",
+            )
+        return self._quic_telemetry_json_response(msg, data)
+
+    def _quic_handle_telemetry_latest(
+        self, msg: 'QuicMessage',
+    ) -> 'QuicMessage':
+        """Handle TELEMETRY_LATEST_REQUEST."""
+        if self.telemetry_cache is None:
+            return msg.create_error_response("Telemetry not enabled")
+        data = self.telemetry_cache.get_latest()
+        if data is None:
+            return msg.create_error_response("No blocks available")
+        return self._quic_telemetry_json_response(msg, data)
 
     async def _can_reach_address(self, address: str, timeout: float) -> bool:
         """Check if we can reach a UDP address (for QUIC connectivity).
