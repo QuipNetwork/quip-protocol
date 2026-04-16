@@ -193,6 +193,18 @@ def main():
         "--difficulty-energy", type=float, default=-14850.0,
         help="Target energy threshold (default: -14850.0)",
     )
+    parser.add_argument(
+        "--num-reads", type=int, default=None,
+        help="Override num_reads (default: use miner's adaptive params)",
+    )
+    parser.add_argument(
+        "--annealing-time", type=float, default=None,
+        help="Override annealing_time in μs (default: use miner's adaptive params)",
+    )
+    parser.add_argument(
+        "--queue-depth", type=int, default=30,
+        help="QPU queue depth (default: 30)",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.topology):
@@ -213,7 +225,22 @@ def main():
     from QPU.dwave_miner import DWaveMiner
 
     print("\nConnecting to live QPU...")
-    miner = DWaveMiner(miner_id="clamping-test", topology=topology)
+    miner = DWaveMiner(
+        miner_id="clamping-test",
+        topology=topology,
+        queue_depth=args.queue_depth,
+    )
+
+    # Override adaptive params if specified
+    if args.num_reads is not None or args.annealing_time is not None:
+        base_params = miner._adapt_mining_params(None, [], [])
+        if args.num_reads is not None:
+            base_params['num_reads'] = args.num_reads
+        if args.annealing_time is not None:
+            base_params['annealing_time'] = args.annealing_time
+        override = dict(base_params)
+        miner._adapt_mining_params = lambda *a, **kw: override
+        print(f"  Override params: {override}")
     n_defects = len(miner.sampler._defective_qubits)
     print(f"  Defective qubits: {n_defects}")
     if n_defects:
