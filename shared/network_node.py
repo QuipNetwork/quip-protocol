@@ -1674,14 +1674,20 @@ class NetworkNode(Node):
             logger=self.logger
         )
 
-        success = await synchronizer.sync_blocks(start_index, end_index)
-        if success:
-            self.logger.info(f"Synced blocks {start_index} to {end_index}")
+        result = await synchronizer.sync_blocks(start_index, end_index)
+        if result.success:
+            self.logger.info(
+                "Synced blocks %d–%d: %s", start_index, end_index,
+                result.summary(),
+            )
             self.set_synchronized()
             await self._exhaust_block_cache()
         else:
-            self.logger.error(f"Failed to sync blocks {start_index} to {end_index}")
-        return success
+            self.logger.error(
+                "Failed to sync blocks %d–%d: %s", start_index, end_index,
+                result.summary(),
+            )
+        return result.success
             
 
     def _track_peer_timestamp(self, timestamp: float):

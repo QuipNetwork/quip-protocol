@@ -5,13 +5,36 @@ import random
 import signal
 import time
 import logging
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 from shared.block import Block
 from shared.node_client import NodeClient
 import os
-import logging
-import time
+
+
+@dataclass
+class SyncResult:
+    """Result of a block synchronization attempt."""
+
+    success: bool
+    requested: int = 0
+    downloaded: int = 0
+    failed_block: Optional[int] = None
+    elapsed: float = 0.0
+    per_peer_downloads: Dict[str, int] = field(default_factory=dict)
+
+    def summary(self) -> str:
+        if self.success:
+            return (
+                f"Synced {self.downloaded}/{self.requested} blocks "
+                f"in {self.elapsed:.1f}s"
+            )
+        return (
+            f"Sync failed at block {self.failed_block}: "
+            f"{self.downloaded}/{self.requested} downloaded "
+            f"in {self.elapsed:.1f}s"
+        )
 
 
 class BlockSynchronizer:
@@ -36,18 +59,19 @@ class BlockSynchronizer:
         self.logger = logger or logging.getLogger(__name__)
         self.max_workers = max_workers or min(30, mp.cpu_count())
         
-    async def sync_blocks(self, start_index: int, end_index: int) -> bool:
+    async def sync_blocks(self, start_index: int, end_index: int) -> SyncResult:
         """
         Synchronize blocks from start_index to end_index using multiprocessing.
-        
+
         Returns:
-            bool: True if all blocks were successfully synced
+            SyncResult with download counts and timing.
         """
         if start_index > end_index:
-            return True
-            
+            return SyncResult(success=True)
+
         total_blocks = end_index - start_index + 1
         self.logger.debug(f"Syncing chain from {start_index} to {end_index} ({total_blocks} blocks)...")
+        t0 = time.monotonic()
         
         # Use multiprocessing queues for communication between processes
         download_queue = mp.Queue()
@@ -78,21 +102,38 @@ class BlockSynchronizer:
                 self.logger.debug(f"🔧 Started producer process {p.pid} ({i+1}/{num_producers})")
                 
             # Run consumer in main process to handle block validation
-            success = await self._consumer_async(completed_queue, start_index, end_index, download_queue)
-                    
-            if success:
-                self.logger.debug(f"🎉 Successfully synced {total_blocks} blocks from {start_index} to {end_index}")
+            result = await self._consumer_async(
+                completed_queue, start_index, end_index, download_queue,
+            )
+            result.requested = total_blocks
+            result.elapsed = time.monotonic() - t0
+
+            if result.success:
+                self.logger.debug(
+                    "Synced %d/%d blocks in %.1fs",
+                    result.downloaded, total_blocks, result.elapsed,
+                )
             else:
-                self.logger.error(f"❌ Failed to sync blocks from {start_index} to {end_index}")
-                    
-            return success
-            
+                self.logger.error(
+                    "Sync failed at block %s: %d/%d downloaded in %.1fs",
+                    result.failed_block, result.downloaded,
+                    total_blocks, result.elapsed,
+                )
+
+            return result
+
         except KeyboardInterrupt:
-            self.logger.warning("🛑 Block synchronization interrupted by user")
-            return False
+            self.logger.warning("Block synchronization interrupted by user")
+            return SyncResult(
+                success=False, requested=total_blocks,
+                elapsed=time.monotonic() - t0,
+            )
         except Exception as e:
             self.logger.error(f"Block sync failed: {e}")
-            return False
+            return SyncResult(
+                success=False, requested=total_blocks,
+                elapsed=time.monotonic() - t0,
+            )
         finally:
             # Always cleanup producer processes
             self.logger.debug("🛑 Signaling producer processes to stop")
@@ -227,80 +268,94 @@ class BlockSynchronizer:
         finally:
             loop.close()
             
-    async def _consumer_async(self, completed_queue: mp.Queue, 
-                             start_index: int, end_index: int, 
-                             download_queue: mp.Queue) -> bool:
+    async def _consumer_async(
+        self,
+        completed_queue: mp.Queue,
+        start_index: int,
+        end_index: int,
+        download_queue: mp.Queue,
+    ) -> SyncResult:
         """
         Consumer running in main process that validates blocks sequentially.
-        
-        Args:
-            completed_queue: Queue of completed block downloads
-            start_index: Starting block index
-            end_index: Ending block index  
-            download_queue: Queue to put retry requests
-            
+
         Returns:
-            bool: True if all blocks processed successfully
+            SyncResult with download counts (requested/elapsed filled by caller).
         """
-        retry_count = {}
+        retry_count: Dict[int, int] = {}
         max_retries = 3
         next_expected = start_index
-        
+        downloaded = 0
+
         try:
             while next_expected <= end_index:
                 try:
-                    # Get completed download (with timeout) - run in executor to avoid blocking
                     loop = asyncio.get_event_loop()
                     try:
                         block_number, block = await loop.run_in_executor(
                             None, lambda: completed_queue.get(timeout=30.0)
                         )
                     except Exception:
-                        # Check if we made any progress before giving up
                         blocks_synced = next_expected - start_index
                         if blocks_synced > 0:
                             self.logger.warning(
-                                f"Timeout after syncing {blocks_synced} blocks, "
-                                f"returning partial success"
+                                "Timeout after syncing %d blocks, "
+                                "returning partial success",
+                                blocks_synced,
                             )
-                            return True
+                            return SyncResult(success=True, downloaded=downloaded)
                         self.logger.error("Timeout with no progress on block downloads")
-                        return False
-                    
+                        return SyncResult(
+                            success=False, downloaded=downloaded,
+                            failed_block=next_expected,
+                        )
+
                     if block is None:
-                        # Download failed
                         retry_count[block_number] = retry_count.get(block_number, 0) + 1
                         if retry_count[block_number] <= max_retries:
-                            self.logger.warning(f"🔄 Retrying download for block {block_number} ({retry_count[block_number]}/{max_retries})")
-                            download_queue.put(block_number)  # Retry download
+                            self.logger.warning(
+                                "Retrying download for block %d (%d/%d)",
+                                block_number, retry_count[block_number], max_retries,
+                            )
+                            download_queue.put(block_number)
                             continue
                         else:
-                            self.logger.error(f"❌ Failed to download block {block_number} after {max_retries} retries")
-                            return False
-                            
-                    # Log block received from producer
-                    self.logger.debug(f"📨 Received block {block_number} from producer, storing for sequential processing")
-                            
-                    # Put block in queue for consumer task to process
-                    # force_reorg=True because sync blocks should always be accepted (longest chain wins)
+                            self.logger.error(
+                                "Failed to download block %d after %d retries",
+                                block_number, max_retries,
+                            )
+                            return SyncResult(
+                                success=False, downloaded=downloaded,
+                                failed_block=block_number,
+                            )
+
+                    self.logger.debug(
+                        "Received block %d from producer", block_number,
+                    )
+
                     dummy_future = asyncio.Future()
                     self.receive_block_queue.put_nowait((block, dummy_future, True, "sync"))
                     next_expected += 1
+                    downloaded += 1
 
-                    # Give consumer task a chance to run
                     await asyncio.sleep(0.01)
-                                                                        
+
                 except queue.Empty:
                     self.logger.error("Timeout waiting for block download completion")
-                    return False
+                    return SyncResult(
+                        success=False, downloaded=downloaded,
+                        failed_block=next_expected,
+                    )
                 except Exception as e:
                     self.logger.error(f"Consumer error: {e}")
-                    return False
+                    return SyncResult(
+                        success=False, downloaded=downloaded,
+                        failed_block=next_expected,
+                    )
         except KeyboardInterrupt:
-            self.logger.warning("🛑 Block processing interrupted by user")
-            return False
-                    
-        return True
+            self.logger.warning("Block processing interrupted by user")
+            return SyncResult(success=False, downloaded=downloaded)
+
+        return SyncResult(success=True, downloaded=downloaded)
 
 
 async def _download_single_block(client: NodeClient,
