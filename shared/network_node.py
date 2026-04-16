@@ -2094,7 +2094,7 @@ class NetworkNode(Node):
         full-block gossip for the initial propagation to ensure the
         block reaches the network quickly.
         """
-        block_hash = block_data.header.block_hash
+        block_hash = block_data.hash
         binary_data = block_data.to_network()
 
         # Record in our inventory

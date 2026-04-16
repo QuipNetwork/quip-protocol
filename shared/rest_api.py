@@ -19,6 +19,7 @@ from aiohttp.web import middleware
 
 from shared.rate_limiter import PeerRateLimiter
 from shared.time_utils import utc_timestamp_float
+from shared.version import get_version
 
 if TYPE_CHECKING:
     from shared.certificate_manager import CertificateManager
@@ -287,7 +288,7 @@ class RestApiServer:
         return self._success_response({
             "status": "healthy",
             "node_running": self.node.running,
-            "version": self.node.info().version if self.node.running else "unknown"
+            "version": get_version()
         })
 
     async def handle_status(self, request: web.Request) -> web.Response:
@@ -605,34 +606,44 @@ class RestApiServer:
 
     def _block_to_dict(self, block) -> dict:
         """Convert a Block to a JSON-serializable dict."""
-        return {
+        result = {
             "header": self._header_to_dict(block.header),
+            "miner_info": json.loads(block.miner_info.to_json()) if block.miner_info else None,
+            "quantum_proof": {
+                "energy": block.quantum_proof.energy,
+                "diversity": block.quantum_proof.diversity,
+                "num_valid_solutions": block.quantum_proof.num_valid_solutions,
+                "mining_time": block.quantum_proof.mining_time,
+                "nonce": block.quantum_proof.nonce,
+            } if block.quantum_proof else None,
+            "next_block_requirements": {
+                "difficulty_energy": block.next_block_requirements.difficulty_energy,
+                "min_diversity": block.next_block_requirements.min_diversity,
+                "min_solutions": block.next_block_requirements.min_solutions,
+            } if block.next_block_requirements else None,
             "transactions": [
                 {
                     "transaction_id": tx.transaction_id,
                     "timestamp": tx.timestamp,
                     "num_samples": tx.num_samples,
                     "samples_count": len(tx.samples) if tx.samples else 0,
-                    "energy_range": [min(tx.energies), max(tx.energies)] if tx.energies else None
+                    "energy_range": [min(tx.energies), max(tx.energies)] if tx.energies else None,
                 }
                 for tx in (block.transactions or [])
             ],
-            "signature_hex": block.signature.hex() if block.signature else None
+            "hash": block.hash.hex() if block.hash else None,
+            "signature": block.signature.hex() if block.signature else None,
         }
+        return result
 
     def _header_to_dict(self, header) -> dict:
         """Convert a BlockHeader to a JSON-serializable dict."""
         return {
             "index": header.index,
             "timestamp": header.timestamp,
-            "prev_hash_hex": header.prev_hash.hex() if header.prev_hash else None,
-            "pow_hash_hex": header.pow_hash.hex() if header.pow_hash else None,
-            "merkle_root_hex": header.merkle_root.hex() if header.merkle_root else None,
-            "miner_info": json.loads(header.miner_info.to_json()) if header.miner_info else None,
-            "pow_difficulty": header.pow_difficulty,
-            "pow_energy": header.pow_energy,
-            "diversity": header.diversity,
-            "num_solutions": header.num_solutions
+            "previous_hash": header.previous_hash.hex() if header.previous_hash else None,
+            "data_hash": header.data_hash.hex() if header.data_hash else None,
+            "version": header.version,
         }
 
     # ------------------------------------------------------------------

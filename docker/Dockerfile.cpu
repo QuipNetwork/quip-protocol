@@ -76,6 +76,8 @@ ENV QUIP_PUBLIC_HOST=""
 ENV QUIP_PUBLIC_PORT=""
 ENV QUIP_NODE_NAME=""
 ENV QUIP_AUTO_MINE=""
+ENV QUIP_REST_INSECURE_PORT=""
+ENV QUIP_REST_HOST=""
 
 # TLS certificate management (certbot activates when CERT_EMAIL is set
 # and QUIP_PUBLIC_HOST is a DNS name). All other CERT_* vars are unset
@@ -88,6 +90,7 @@ VOLUME ["/data"]
 # Expose QUIC port and HTTP-01 challenge port
 EXPOSE 20049/udp
 EXPOSE 20049/tcp
+EXPOSE 20050/tcp
 EXPOSE 80/tcp
 
 ENTRYPOINT ["tini", "--", "/entrypoint.sh"]
