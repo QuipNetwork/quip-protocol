@@ -569,6 +569,77 @@ def validate_solution(spins: List[int], h: Dict[int, float], J: Dict[Tuple[int, 
     return result
 
 
+def _energy_stratified_selection(
+    solutions: List[List[int]],
+    energies: List[float],
+    target_count: int,
+) -> Optional[List[int]]:
+    """Select solutions from different energy strata for diversity.
+
+    When all valid solutions cluster in one energy basin (low diversity),
+    picking from different energy levels pulls in solutions from different
+    spin basins. Solutions at slightly worse energies are structurally
+    different from the best — they represent alternative local minima.
+
+    Divides the energy range into target_count equal bands and picks
+    one solution per band (the most central in each band). Falls back
+    to evenly-spaced indices if any stratum is empty.
+
+    Args:
+        solutions: Valid solutions (all below energy threshold).
+        energies: Corresponding energies (same order).
+        target_count: Number of solutions to select.
+
+    Returns:
+        List of selected indices, or None if fewer than target_count
+        solutions are available.
+    """
+    if len(solutions) < target_count:
+        return None
+
+    # Sort by energy (best = most negative first)
+    order = sorted(range(len(energies)), key=lambda i: energies[i])
+    sorted_energies = [energies[i] for i in order]
+
+    # Try stratified: divide energy range into equal bands
+    e_best = sorted_energies[0]
+    e_worst = sorted_energies[-1]
+    e_range = e_worst - e_best
+
+    if e_range > 0:
+        band_size = e_range / target_count
+        selected = []
+        for band in range(target_count):
+            band_lo = e_best + band * band_size
+            band_hi = band_lo + band_size
+            # Find solutions in this band
+            candidates = [
+                order[i] for i, e in enumerate(sorted_energies)
+                if (band_lo <= e < band_hi or (band == target_count - 1 and e <= band_hi))
+                and order[i] not in selected
+            ]
+            if candidates:
+                # Pick the one closest to the band center
+                band_mid = (band_lo + band_hi) / 2
+                best_cand = min(candidates, key=lambda i: abs(energies[i] - band_mid))
+                selected.append(best_cand)
+
+        if len(selected) >= target_count:
+            return selected[:target_count]
+
+    # Fallback: evenly-spaced indices through the energy-sorted list
+    n = len(order)
+    step = max(1, n // target_count)
+    selected = [order[i * step] for i in range(min(target_count, n))]
+
+    # Fill remaining if step didn't give enough
+    if len(selected) < target_count:
+        remaining = [idx for idx in order if idx not in set(selected)]
+        selected.extend(remaining[:target_count - len(selected)])
+
+    return selected[:target_count] if len(selected) >= target_count else None
+
+
 def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tuple[int, int]],
                       nonce: int, salt: bytes, prev_timestamp: int, start_time: float,
                       miner_id: str, miner_type: str,
@@ -675,14 +746,37 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         if len(valid_solutions) < min_solutions:
             raise ValueError(f"Insufficient valid solutions: {len(valid_solutions)} < {min_solutions}")
 
-        # Filter solutions if we have too many
+        # Select diverse solutions — try farthest-point first, then
+        # fall back to energy-stratified selection if diversity is too low.
         filtered_solutions = valid_solutions
         if len(valid_solutions) >= min_solutions:
-            selected_solutions_indices = select_diverse_solutions(valid_solutions, min_solutions)
-            filtered_solutions = [valid_solutions[i] for i in selected_solutions_indices]
+            selected_indices = select_diverse_solutions(
+                valid_solutions, min_solutions,
+            )
+            filtered_solutions = [valid_solutions[i] for i in selected_indices]
             diversity = calculate_diversity(filtered_solutions)
-            # Use tracked energy for best of filtered solutions
-            best_energy = min(valid_energies[i] for i in selected_solutions_indices)
+            best_energy = min(valid_energies[i] for i in selected_indices)
+
+            # Fallback: if farthest-point selection doesn't meet diversity,
+            # try energy-stratified selection. Solutions at different energy
+            # levels are more likely to be in different spin basins.
+            if diversity < min_diversity and len(valid_solutions) > min_solutions:
+                stratified = _energy_stratified_selection(
+                    valid_solutions, valid_energies, min_solutions,
+                )
+                if stratified is not None:
+                    strat_div = calculate_diversity(
+                        [valid_solutions[i] for i in stratified]
+                    )
+                    if strat_div >= min_diversity:
+                        selected_indices = stratified
+                        filtered_solutions = [
+                            valid_solutions[i] for i in selected_indices
+                        ]
+                        diversity = strat_div
+                        best_energy = min(
+                            valid_energies[i] for i in selected_indices
+                        )
         elif valid_energies:
             best_energy = min(valid_energies)
 
