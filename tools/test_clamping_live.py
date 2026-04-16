@@ -282,15 +282,20 @@ def main():
         for r in failed:
             print(f"  Trial {r['trial']} FAILED: {r['reason']}")
 
-    # Clean shutdown: stop feeder, streaming pipeline, and D-Wave connection
+    # Clean shutdown
     miner._post_mine_cleanup()
     miner.sampler.close()
 
+    exit_code = 0
     if failed:
-        sys.exit(1)
-    if len(timed_out) == args.trials:
+        exit_code = 1
+    elif len(timed_out) == args.trials:
         print("  All trials timed out")
-        sys.exit(1)
+        exit_code = 1
+
+    # Force exit — the D-Wave cloud client's background threads and
+    # ProcessPoolExecutor atexit handlers block indefinitely otherwise.
+    os._exit(exit_code)
 
 
 if __name__ == "__main__":
