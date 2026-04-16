@@ -35,7 +35,7 @@ FROM python:3.13-slim-bookworm
 
 LABEL maintainer="Quip Protocol"
 LABEL description="Quip Network Node - CPU Mining"
-LABEL org.opencontainers.image.source="https://gitlab.com/piqued/quip-protocol"
+LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-protocol"
 
 # Install runtime dependencies (tini for PID 1, busybox for crond)
 RUN apt-get update && apt-get install -y --no-install-recommends \

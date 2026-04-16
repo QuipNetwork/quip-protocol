@@ -495,7 +495,7 @@ Before deploying to AWS, verify:
 
 ## Support
 
-- **Issues:** [GitLab Issues](https://gitlab.com/piqued/quip-protocol/-/issues)
+- **Issues:** [GitLab Issues](https://gitlab.com/quip.network/quip-protocol/-/issues)
 - **Documentation:** See root `README.md` and `CLAUDE.md`
 - **AWS Deployment:** See `aws/README_AWS_DEPLOYMENT.md`
 - **Akash Deployment:** See `akash/README_AKASH.md`

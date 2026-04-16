@@ -15,8 +15,8 @@ The primary Docker images for running Quip P2P network nodes:
 
 Available from GitLab Container Registry:
 ```
-registry.gitlab.com/piqued/quip-protocol/quip-network-node-cpu
-registry.gitlab.com/piqued/quip-protocol/quip-network-node-cuda
+registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu
+registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cuda
 ```
 
 **Note:** For Apple Silicon (Metal) GPU mining, run directly on macOS without Docker. See [../CLAUDE.md](../CLAUDE.md) for native macOS setup.
@@ -39,7 +39,7 @@ docker run -d --pull always --name quip-cpu \
   -v ~/quip-data:/data \
   -e QUIP_PUBLIC_HOST=myhost.example.com \
   -p 20049:20049/udp -p 20049:20049/tcp \
-  registry.gitlab.com/piqued/quip-protocol/quip-network-node-cpu:latest
+  registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest
 ```
 
 **CUDA node (NVIDIA):**
@@ -48,7 +48,7 @@ docker run -d --pull always --gpus all --name quip-cuda \
   -v ~/quip-data:/data \
   -e QUIP_PUBLIC_HOST=myhost.example.com \
   -p 20049:20049/udp -p 20049:20049/tcp \
-  registry.gitlab.com/piqued/quip-protocol/quip-network-node-cuda:latest
+  registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cuda:latest
 ```
 
 The `--pull always` flag ensures you get the latest image from Docker Hub.
@@ -110,7 +110,7 @@ docker run -d --name quip-cpu \
   -e QUIP_PUBLIC_HOST=mynode.example.com \
   -e CERT_EMAIL=admin@example.com \
   -p 20049:20049/udp -p 20049:20049/tcp -p 80:80/tcp \
-  registry.gitlab.com/piqued/quip-protocol/quip-network-node-cpu:latest
+  registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest
 ```
 
 For DNS-01 challenges (no port 80 needed), custom ACME providers, or advanced configuration, see [TLS.md](TLS.md).
@@ -144,13 +144,13 @@ Build and push to Docker Hub:
 # CPU (amd64 + arm64)
 docker buildx build --platform linux/amd64,linux/arm64 \
   -f Dockerfile.cpu \
-  -t registry.gitlab.com/piqued/quip-protocol/quip-network-node-cpu:latest \
+  -t registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest \
   --push ..
 
 # CUDA (amd64 + arm64)
 docker buildx build --platform linux/amd64,linux/arm64 \
   -f Dockerfile.cuda \
-  -t registry.gitlab.com/piqued/quip-protocol/quip-network-node-cuda:latest \
+  -t registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cuda:latest \
   --push ..
 ```
 
