@@ -2256,10 +2256,20 @@ class NetworkNode(Node):
 
             # Validate protocol version - reject incompatible nodes
             if msg.protocol_version != PROTOCOL_VERSION:
-                self.logger.warning(f"Protocol version mismatch from {protocol._peer_address}: expected {PROTOCOL_VERSION}, got {msg.protocol_version} (msg_type={msg.msg_type.name})")
+                peer_addr = str(protocol._peer_address)
+                self.logger.debug(
+                    "Protocol version mismatch from %s: expected %d, got %d (%s)",
+                    peer_addr, PROTOCOL_VERSION, msg.protocol_version,
+                    msg.msg_type.name,
+                )
+                self.telemetry.update_node(
+                    peer_addr, "version_mismatch",
+                )
                 # Schedule connection close after response is sent
                 asyncio.get_event_loop().call_later(0.1, protocol.close)
-                return msg.create_error_response(f"Protocol version mismatch: expected {PROTOCOL_VERSION}, got {msg.protocol_version}")
+                return msg.create_error_response(
+                    f"Protocol version mismatch: expected {PROTOCOL_VERSION}, got {msg.protocol_version}",
+                )
 
             if msg.msg_type == QuicMessageType.JOIN_REQUEST:
                 return await self._quic_handle_join(msg, protocol)

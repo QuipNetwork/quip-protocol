@@ -234,7 +234,16 @@ class _QuicClientProtocol(QuicConnectionProtocol):
         elif isinstance(event, StreamDataReceived):
             self._handle_stream_data(event)
         elif isinstance(event, ConnectionTerminated):
-            self._logger.info(f"ConnectionTerminated ({self._peer_host}): code={event.error_code}, reason={event.reason_phrase}")
+            if event.error_code:
+                self._logger.info(
+                    "ConnectionTerminated (%s): code=%s, reason=%s",
+                    self._peer_host, event.error_code, event.reason_phrase,
+                )
+            else:
+                self._logger.debug(
+                    "ConnectionTerminated (%s): clean close",
+                    self._peer_host,
+                )
             self._connection_closed = True
             self._connected.clear()
             for future in self._pending_requests.values():
