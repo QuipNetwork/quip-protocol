@@ -594,6 +594,26 @@ class NetworkNode(Node):
             create_protocol=self._create_server_protocol,
         )
 
+        # Suppress aioquic assertion errors from malformed packets
+        # (e.g. v1 nodes sending non-INITIAL first packets)
+        _default_handler = asyncio.get_event_loop().get_exception_handler()
+
+        def _quic_exception_handler(loop, context):
+            exc = context.get("exception")
+            if isinstance(exc, AssertionError) and "first packet must be INITIAL" in str(exc):
+                self.logger.debug("Dropped malformed QUIC packet (non-INITIAL first packet)")
+                return
+            if _default_handler:
+                _default_handler(loop, context)
+            else:
+                loop.default_exception_handler(context)
+
+        asyncio.get_event_loop().set_exception_handler(_quic_exception_handler)
+
+        # Suppress noisy aioquic internal warnings (CRYPTO frame errors
+        # from incompatible peers)
+        logging.getLogger("quic").setLevel(logging.ERROR)
+
         self.logger.info(
             f"Network node {self.node_name} ({self.crypto.ecdsa_public_key_hex[:8]}) "
             f"started at quic://{self.bind_address}:{self.port} with public address {self.public_host}"
