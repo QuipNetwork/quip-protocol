@@ -131,17 +131,13 @@ package-macos-x86_64:
 
 release-binaries:
   stage: release
-  image: alpine:3.21
+  image: registry.gitlab.com/gitlab-org/cli:v1.92.1
   tags: [linux, amd64]
   needs:
     - package-macos-arm64
     - package-macos-x86_64
   rules:
     - if: $CI_COMMIT_TAG
-  before_script:
-    - apk add --no-cache curl
-    - curl -sL "https://gitlab.com/gitlab-org/cli/-/releases/v1.92.1/downloads/glab_1.92.1_linux_amd64.tar.gz" | tar xz -C /usr/local/bin --strip-components=1 bin/glab
-    - glab version
   script:
     - echo "Creating release $CI_COMMIT_TAG"
     # Delete any existing release so retagged versions don't fail
