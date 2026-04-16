@@ -13,7 +13,7 @@ import dimod
 
 init_logger = logging.getLogger(__name__)
 
-from QPU.dwave_sampler import DWaveSamplerWrapper
+from QPU.dwave_sampler import DWaveSamplerWrapper, DefectInfo
 from QPU.qpu_time_manager import QPUTimeManager, QPUTimeConfig
 from shared.base_miner import BaseMiner
 from shared.block_requirements import BlockRequirements
@@ -21,6 +21,29 @@ from shared.ising_feeder import IsingFeeder
 from shared.ising_model import IsingModel
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.dwave_topology import DWaveTopology
+
+
+def _shift_energies(sampleset: dimod.SampleSet, offset: float) -> dimod.SampleSet:
+    """Shift all energies in a sampleset by a constant offset.
+
+    Cheap O(n) operation — no sample dict copying. Used when we don't
+    need full reconstruction but want approximate full-topology energies.
+    """
+    new_energies = sampleset.record.energy + offset
+    # Build new record with shifted energies
+    import numpy as np
+    new_record = np.recarray(
+        sampleset.record.shape,
+        dtype=sampleset.record.dtype,
+    )
+    for name in sampleset.record.dtype.names:
+        if name == 'energy':
+            new_record.energy = new_energies
+        else:
+            new_record[name] = sampleset.record[name]
+    return dimod.SampleSet(
+        new_record, sampleset.variables, sampleset.info, sampleset.vartype,
+    )
 
 
 class DWaveMiner(BaseMiner):
@@ -178,6 +201,7 @@ class DWaveMiner(BaseMiner):
         return {
             'num_reads': 512,
             'annealing_time': 120.0,
+            'energy_threshold': current_requirements.difficulty_energy,
         }
 
     def sample_ising_streaming(
@@ -187,36 +211,41 @@ class DWaveMiner(BaseMiner):
         num_reads: int,
         annealing_time: float,
         queue_depth: int,
+        energy_threshold: float = 0.0,
     ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
         """Stream Ising model solutions via async QPU submission.
 
         Maintains queue_depth jobs in-flight on the D-Wave cloud.
-        As each completes, yields its result and submits a replacement
-        from the feeder. This overlaps network round-trip latency
-        (~2-3s per call) so the QPU stays saturated.
+        As each completes, checks whether the best QPU energy (plus
+        the defect offset) could meet the threshold. Only reconstructs
+        the full-topology sampleset for promising candidates.
 
-        Matches the GPU sample_ising_streaming() contract: consumes
-        an IsingFeeder and yields (model, sampleset) pairs.
+        Non-candidates get a minimal sampleset with just the best
+        energy — enough for the mining loop's progress tracking but
+        without the ~1s cost of copying 4,500+ spin dicts.
 
         Args:
             feeder: IsingFeeder providing pre-generated IsingModels.
             num_reads: QPU reads per problem.
             annealing_time: Annealing time in microseconds.
             queue_depth: Number of concurrent in-flight QPU jobs.
+            energy_threshold: Current difficulty energy. Only samplesets
+                whose best QPU energy + defect offset < threshold are
+                fully reconstructed.
 
         Yields:
             (IsingModel, SampleSet) in completion order.
         """
         topology_label = self.sampler.job_label
 
-        # pending: {future_id: (model, future, job_index)}
-        pending: Dict[int, Tuple[IsingModel, Any, int]] = {}
+        # pending: {future_id: (model, future, defect_info, job_index)}
+        pending: Dict[int, Tuple[IsingModel, Any, Optional[DefectInfo], int]] = {}
         job_index = 0
 
         def submit_one():
             nonlocal job_index
             model = feeder.pop_blocking()
-            future = self.sampler.sample_ising_async(
+            future, defect_info = self.sampler.sample_ising_async(
                 model.h, model.J,
                 num_reads=num_reads,
                 answer_mode='raw',
@@ -224,7 +253,7 @@ class DWaveMiner(BaseMiner):
                 label=f"{topology_label}_s{job_index}",
                 nonce_seed=model.nonce,
             )
-            pending[id(future)] = (model, future, job_index)
+            pending[id(future)] = (model, future, defect_info, job_index)
             job_index += 1
 
         # Fill initial queue
@@ -235,18 +264,36 @@ class DWaveMiner(BaseMiner):
         while pending:
             completed_id = None
             while completed_id is None:
-                for fid, (_, fut, _) in pending.items():
+                for fid, (_, fut, _, _) in pending.items():
                     if fut.done():
                         completed_id = fid
                         break
                 if completed_id is None:
                     time.sleep(0.02)
 
-            model, future, _ = pending.pop(completed_id)
-            sampleset = future.sampleset
+            model, future, defect_info, _ = pending.pop(completed_id)
+            raw_ss = future.sampleset
 
-            # Refill the slot
+            # Refill the slot immediately (before any reconstruction)
             submit_one()
+
+            if defect_info is not None:
+                # Check if best QPU energy + offset could meet threshold
+                best_qpu_energy = min(raw_ss.record.energy)
+                approx_energy = best_qpu_energy + defect_info.energy_offset
+
+                if approx_energy < energy_threshold:
+                    # Promising — full reconstruction
+                    sampleset = self.sampler.reconstruct_full_sampleset(
+                        raw_ss, defect_info,
+                    )
+                else:
+                    # Not promising — yield raw QPU energies shifted by
+                    # offset so the mining loop sees approximate values
+                    # without paying reconstruction cost.
+                    sampleset = _shift_energies(raw_ss, defect_info.energy_offset)
+            else:
+                sampleset = raw_ss
 
             yield model, sampleset
 
@@ -268,6 +315,7 @@ class DWaveMiner(BaseMiner):
         (nonce, salt, sampleset) per call — matching the GPU miner pattern.
         """
         annealing_time = kwargs.pop('annealing_time', 120.0)
+        energy_threshold = kwargs.pop('energy_threshold', 0.0)
 
         if self._stream is None:
             if self._feeder is None:
@@ -277,6 +325,7 @@ class DWaveMiner(BaseMiner):
                 num_reads=num_reads,
                 annealing_time=annealing_time,
                 queue_depth=self.queue_depth,
+                energy_threshold=energy_threshold,
             )
             self.logger.info(
                 f"[QPU] Streaming started: queue_depth={self.queue_depth}, "
