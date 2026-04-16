@@ -61,7 +61,7 @@ python tests/smoke_node_qpu.py         # D-Wave QPU
 ```bash
 python tools/cpu_baseline.py --quick
 python tools/cpu_baseline.py --quick \
-  --topology dwave_topologies/topologies/advantage2_system1_13.json.gz
+  --topology dwave_topologies/topologies/advantage2_system1.json.gz
 python tools/analyze_topology_sizes.py --configs "8,2" --samples 10
 python tools/validate_mined_topology.py --all
 python reference/test_quantum_pow.py

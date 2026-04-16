@@ -520,6 +520,7 @@ class BaseMiner(ABC):
                     h, J,
                     num_reads=num_reads,
                     num_sweeps=current_num_sweeps,
+                    nonce_seed=nonce,
                     **extra_params,
                 )
 
@@ -587,12 +588,21 @@ class BaseMiner(ABC):
                     if self.top_attempts
                     else float('inf')
                 )
-                self.logger.info(
-                    f"Progress: {progress} attempts, "
-                    f"best energy: {best_energy:.2f} | "
-                    f"Sweeps: {current_num_sweeps}/{max_num_sweeps}, "
-                    f"Reads: {num_reads}",
-                )
+                if self.miner_type == "QPU":
+                    anneal_us = extra_params.get('annealing_time', 0)
+                    self.logger.info(
+                        f"Progress: {progress} attempts, "
+                        f"best energy: {best_energy:.2f} | "
+                        f"Annealing: {anneal_us:.0f}μs, "
+                        f"Reads: {num_reads}",
+                    )
+                else:
+                    self.logger.info(
+                        f"Progress: {progress} attempts, "
+                        f"best energy: {best_energy:.2f} | "
+                        f"Sweeps: {current_num_sweeps}/{max_num_sweeps}, "
+                        f"Reads: {num_reads}",
+                    )
 
         # -- teardown -----------------------------------------------------
         self._post_mine_cleanup()

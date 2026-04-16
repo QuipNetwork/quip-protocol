@@ -8,7 +8,7 @@ MINING_DURATION="${MINING_DURATION:-90m}"
 DIFFICULTY_ENERGY="${DIFFICULTY_ENERGY:--14900}"
 MIN_DIVERSITY="${MIN_DIVERSITY:-0.1}"
 MIN_SOLUTIONS="${MIN_SOLUTIONS:-5}"
-TOPOLOGY_FILE="${TOPOLOGY_FILE:-dwave_topologies/topologies/advantage2_system1_13.json.gz}"
+TOPOLOGY_FILE="${TOPOLOGY_FILE:-dwave_topologies/topologies/advantage2_system1.json.gz}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-carback1/quip-protocol-cuda-miner:latest}"
 AUTO_TERMINATE="${AUTO_TERMINATE:-true}"
 

@@ -53,7 +53,7 @@ akash provider lease-status --from $WALLET --provider $PROVIDER --dseq $DSEQ
 | `DIFFICULTY_ENERGY` | `-14900` | Energy threshold for mining |
 | `MIN_DIVERSITY` | `0.1` | Minimum solution diversity |
 | `MIN_SOLUTIONS` | `5` | Minimum solutions per block |
-| `TOPOLOGY_FILE` | `...advantage2_system1_13.json.gz` | Ising topology file |
+| `TOPOLOGY_FILE` | `...advantage2_system1.json.gz` | Ising topology file |
 | `GPU_DEVICE` | `0` | GPU device index (CUDA only) |
 | `IPFS_API_URL` | | IPFS node URL for result upload |
 | `IPFS_API_KEY` | | IPFS API authentication key |
