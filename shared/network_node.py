@@ -1660,11 +1660,11 @@ class NetworkNode(Node):
             self.logger.error("NodeClient not initialized")
             return False
 
-        # Update node client with only compatible-version peers
+        # Update node client with only version-confirmed compatible peers
         compatible_peers = {
             peer: info for peer, info in self.peers.items()
-            if self.peer_versions.get(peer) is None
-            or is_version_compatible(self.peer_versions[peer])
+            if self.peer_versions.get(peer) is not None
+            and is_version_compatible(self.peer_versions[peer])
         }
         self.node_client.update_peers(compatible_peers)
 

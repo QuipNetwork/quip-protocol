@@ -524,10 +524,8 @@ class NodeClient:
 
     async def _handle_version_mismatch(self, host: str) -> None:
         """Close connection and remove peer after protocol version mismatch."""
-        self.logger.error(
-            f"Protocol version mismatch with {host}, removing peer. "
-            f"Please ensure both nodes are running compatible versions. "
-            f"Run 'pip install -U quip-network' to upgrade."
+        self.logger.debug(
+            "Protocol version mismatch with %s, removing peer", host,
         )
         await self.remove_peer(host)
 
