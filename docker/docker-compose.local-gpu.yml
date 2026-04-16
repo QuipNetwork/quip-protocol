@@ -1,0 +1,103 @@
+# Local 3-node mixed network (2 CPU + 1 CUDA GPU) with REST API for telemetry testing.
+#
+# Requires: nvidia-container-toolkit + a CUDA-capable GPU on the host.
+#
+# Build & run:
+#   docker compose -f docker/docker-compose.local-gpu.yml up --build -d
+#
+# REST API endpoints (HTTP):
+#   Node 1 (bootstrap, CPU): http://localhost:20050
+#   Node 2 (CPU):            http://localhost:20051
+#   Node 3 (GPU/CUDA):       http://localhost:20052
+#
+# Test telemetry:
+#   bash docker/test-rest-telemetry.sh
+
+services:
+  cpu-bootstrap:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cpu
+    image: quip-network-node-cpu:local
+    container_name: quip-local-bootstrap
+    environment:
+      - QUIP_PUBLIC_HOST=cpu-bootstrap
+      - QUIP_NODE_NAME=local-bootstrap
+      - QUIP_AUTO_MINE=true
+      - QUIP_PEERS=
+      - QUIP_REST_INSECURE_PORT=20050
+      - QUIP_REST_HOST=0.0.0.0
+      - CERT_EMAIL=
+    volumes:
+      - local-gpu-bootstrap-data:/data
+    ports:
+      - "20049:20049/udp"
+      - "20049:20049/tcp"
+      - "20050:20050/tcp"
+    networks:
+      - quip-local-gpu-net
+
+  cpu-node-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cpu
+    image: quip-network-node-cpu:local
+    container_name: quip-local-node-2
+    environment:
+      - QUIP_PUBLIC_HOST=cpu-node-2
+      - QUIP_NODE_NAME=local-node-2
+      - QUIP_PEERS=cpu-bootstrap:20049
+      - QUIP_AUTO_MINE=true
+      - QUIP_REST_INSECURE_PORT=20050
+      - QUIP_REST_HOST=0.0.0.0
+    volumes:
+      - local-gpu-node-2-data:/data
+    depends_on:
+      - cpu-bootstrap
+    ports:
+      - "20051:20050/tcp"
+    networks:
+      - quip-local-gpu-net
+
+  gpu-node-3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cuda
+    image: quip-network-node-cuda:local
+    container_name: quip-local-gpu-node-3
+    environment:
+      - QUIP_PUBLIC_HOST=gpu-node-3
+      - QUIP_NODE_NAME=local-gpu-node-3
+      - QUIP_PEERS=cpu-bootstrap:20049
+      - QUIP_AUTO_MINE=true
+      - QUIP_REST_INSECURE_PORT=20050
+      - QUIP_REST_HOST=0.0.0.0
+    volumes:
+      - local-gpu-node-3-data:/data
+    depends_on:
+      - cpu-bootstrap
+    ports:
+      - "20052:20050/tcp"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - quip-local-gpu-net
+
+networks:
+  quip-local-gpu-net:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+        - subnet: fd00:dead:f00d::/64
+
+volumes:
+  local-gpu-bootstrap-data:
+  local-gpu-node-2-data:
+  local-gpu-node-3-data:
