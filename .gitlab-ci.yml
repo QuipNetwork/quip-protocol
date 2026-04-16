@@ -131,7 +131,7 @@ package-macos-x86_64:
 
 release-binaries:
   stage: release
-  image: registry.gitlab.com/gitlab-org/cli:v1.92.1
+  image: registry.gitlab.com/gitlab-org/cli:latest
   tags: [linux, amd64]
   needs:
     - package-macos-arm64
