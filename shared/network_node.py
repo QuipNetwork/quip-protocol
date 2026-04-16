@@ -21,6 +21,7 @@ from shared.base_miner import MiningResult
 from shared.block import Block, BlockHeader, MinerInfo
 from shared.node import Node
 from shared.logging_config import init_component_logger
+from shared.system_info import override_public_address
 from shared.version import (
     get_version, PROTOCOL_VERSION,
     is_version_compatible, MIN_COMPATIBLE_VERSION,
@@ -1421,7 +1422,10 @@ class NetworkNode(Node):
         try:
             # Get fresh stats (potentially expensive operation)
             fresh_stats = self.get_stats()
-            
+
+            # Include the whitelisted node descriptor for remote consumers.
+            fresh_stats["descriptor"] = self.descriptor()
+
             # Add network-specific information
             clock = get_network_clock()
             fresh_stats.update({
@@ -1431,8 +1435,6 @@ class NetworkNode(Node):
                     "total_peers": len(self.peers),
                     "synchronized": self.synchronized,
                     "auto_mine": self.auto_mine,
-                    "heartbeat_interval": self.heartbeat_interval,
-                    "heartbeat_timeout": self.heartbeat_timeout,
                     "queue_sizes": {
                         "block_processing": self.block_processing_queue.qsize(),
                         "gossip_processing": self.gossip_processing_queue.qsize(),
@@ -1788,7 +1790,8 @@ class NetworkNode(Node):
                 "version": get_version(),
                 "capabilities": ["mining", "relay"],
                 # Serialize MinerInfo as JSON string for transport
-                "info": self.info().to_json()
+                "info": self.info().to_json(),
+                "descriptor": self.descriptor(),
             }
 
             # Use NodeClient's SSL-aware connection method
@@ -1800,15 +1803,31 @@ class NetworkNode(Node):
                 self.logger.warning(f"Failed to join via {peer_address}")
                 return False
 
+            # Update responder's descriptor in telemetry if present.
+            # Override self-reported public_host/public_port with the
+            # address we actually reached them on.
+            responder_descriptor = result.get("descriptor") if isinstance(result, dict) else None
+            if responder_descriptor and peer_address != self.public_host:
+                self.telemetry.update_node(
+                    peer_address, "active",
+                    descriptor=override_public_address(
+                        responder_descriptor, peer_address,
+                    ),
+                )
+
             # Add all nodes from the peer's node list
             peers_found = 0
             peers_map = result.get("peers", {}) or {}
+            descriptors_map = result.get("descriptors", {}) or {}
             for peer_host, peer_info_json in peers_map.items():
                 # except ourselves
                 if peer_host == self.public_host:
                     continue
                 info = MinerInfo.from_json(peer_info_json)
-                if await self.add_peer(peer_host, info):
+                peer_desc = override_public_address(
+                    descriptors_map.get(peer_host), peer_host,
+                )
+                if await self.add_peer(peer_host, info, descriptor=peer_desc):
                     peers_found += 1
 
             if peers_found > 0:
@@ -1857,6 +1876,7 @@ class NetworkNode(Node):
             "version": get_version(),
             "capabilities": ["mining", "relay"],
             "info": self.info().to_json(),
+            "descriptor": self.descriptor(),
         }
         self._connection_worker.request_connections(
             peers, join_data, initial_peers=initial_set,
@@ -1880,12 +1900,22 @@ class NetworkNode(Node):
             peer = result.get("peer", "?")
             if result.get("success") and result.get("peers_map"):
                 peers_map = result["peers_map"]
+                descriptors_map = result.get("descriptors_map") or {}
+                responder_desc = result.get("responder_descriptor")
+                if responder_desc and peer != self.public_host:
+                    self.telemetry.update_node(
+                        peer, "active",
+                        descriptor=override_public_address(responder_desc, peer),
+                    )
                 peers_found = 0
                 for peer_host, peer_info_json in peers_map.items():
                     if peer_host == self.public_host:
                         continue
                     info = MinerInfo.from_json(peer_info_json)
-                    if await self.add_peer(peer_host, info):
+                    peer_desc = override_public_address(
+                        descriptors_map.get(peer_host), peer_host,
+                    )
+                    if await self.add_peer(peer_host, info, descriptor=peer_desc):
                         peers_found += 1
                 if peers_found > 0:
                     self.logger.info(
@@ -1917,7 +1947,12 @@ class NetworkNode(Node):
         self._ban_list.record_failure(peer_address, reason)
         await self.remove_node(peer_address)
 
-    async def add_peer(self, host: str, info: MinerInfo) -> bool:
+    async def add_peer(
+        self,
+        host: str,
+        info: MinerInfo,
+        descriptor: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Add a node to our registry."""
         # Normalize IPv6-mapped IPv4 addresses (::ffff:x.x.x.x:port) that
         # arrive in peer lists from nodes running on dual-stack sockets.
@@ -1943,7 +1978,7 @@ class NetworkNode(Node):
                 self.node_client.add_peer(host, info)
 
             # Track in telemetry (both new and existing peers)
-            self.telemetry.update_node(host, "active", info)
+            self.telemetry.update_node(host, "active", info, descriptor=descriptor)
 
             if is_new:
                 self._has_ever_had_peers = True
@@ -2022,6 +2057,12 @@ class NetworkNode(Node):
                 info = MinerInfo.from_json(peer_status['info'])
                 async with self.net_lock:
                     self.peers[host] = info
+                descriptor = override_public_address(
+                    peer_status.get('descriptor'), host,
+                )
+                self.telemetry.update_node(
+                    host, "active", info, descriptor=descriptor,
+                )
 
                 self.logger.debug(f"Refreshed info for peer {host}")
                 return True
@@ -2772,6 +2813,7 @@ class NetworkNode(Node):
         claimed_address = data.get("host")
         info_field = data.get("info")
         new_node_info = MinerInfo.from_json(info_field) if info_field else None
+        new_node_descriptor = data.get("descriptor")
 
         if not claimed_address or not new_node_info:
             return msg.create_error_response("Missing host or info")
@@ -2811,8 +2853,14 @@ class NetworkNode(Node):
                     f"{join_version} (local: {get_version()})"
                 )
 
-        # Add the new node
-        await self.add_peer(new_node_address, new_node_info)
+        # Add the new node. Override the sender's self-reported
+        # public_host/public_port with the address we actually validated.
+        await self.add_peer(
+            new_node_address, new_node_info,
+            descriptor=override_public_address(
+                new_node_descriptor, new_node_address,
+            ),
+        )
 
         # Return our node list
         async with self.net_lock:
@@ -2823,7 +2871,11 @@ class NetworkNode(Node):
             peers_payload[host] = info.to_json()
         peers_payload[self.public_host] = self.info().to_json()
 
-        response_data = json.dumps({"status": "ok", "peers": peers_payload})
+        response_data = json.dumps({
+            "status": "ok",
+            "peers": peers_payload,
+            "descriptor": self.descriptor(),
+        })
         return msg.create_response(response_data.encode('utf-8'))
 
     async def _quic_handle_heartbeat(self, msg: QuicMessage) -> QuicMessage:
@@ -2929,6 +2981,7 @@ class NetworkNode(Node):
         status_data = {
             "host": self.public_host,
             "info": self.info().to_json(),
+            "descriptor": self.descriptor(),
             "running": self.running,
             "total_peers": len(self.peers),
             "uptime": utc_timestamp_float() if self.running else 0

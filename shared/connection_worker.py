@@ -54,10 +54,14 @@ async def _try_join_peer(
             peer, join_data, bypass_ban=bypass_ban,
         )
         peers_map = result.get("peers", {}) if result else None
+        descriptors_map = result.get("descriptors", {}) if result else None
+        responder_descriptor = result.get("descriptor") if result else None
         result_queue.put({
             "peer": peer,
             "success": result is not None,
             "peers_map": peers_map,
+            "descriptors_map": descriptors_map,
+            "responder_descriptor": responder_descriptor,
         })
         if result is not None:
             log.info(f"JOIN succeeded with {peer}")
@@ -65,7 +69,13 @@ async def _try_join_peer(
             log.debug(f"JOIN failed with {peer}")
     except Exception as exc:
         log.debug(f"JOIN error with {peer}: {exc}")
-        result_queue.put({"peer": peer, "success": False, "peers_map": None})
+        result_queue.put({
+            "peer": peer,
+            "success": False,
+            "peers_map": None,
+            "descriptors_map": None,
+            "responder_descriptor": None,
+        })
 
 
 def connection_worker_main(

@@ -19,6 +19,7 @@ ENDPOINTS=(
     "/api/v1/stats"
     "/api/v1/peers"
     "/api/v1/block/latest"
+    "/api/v1/system"
 )
 
 GREEN='\033[0;32m'
@@ -120,6 +121,55 @@ else
     echo -e "  ${YELLOW}WARN${NC}  bootstrap sees $PEER_COUNT peers (expected >= 2, may need more time)"
     WARN=$((WARN + 1))
 fi
+
+# Phase 5: System descriptor + scrubbing check
+echo ""
+echo -e "${BLUE}Phase 5: System descriptor...${NC}"
+for i in "${!NODES[@]}"; do
+    SYS_RESP=$(curl -sf "http://${NODES[$i]}/api/v1/system" 2>/dev/null || echo "{}")
+    # Extract a few required fields
+    DESC_VERSION=$(echo "$SYS_RESP" | python3 -c \
+        "import sys,json; d=json.load(sys.stdin); print(d.get('data',{}).get('descriptor_version',''))" \
+        2>/dev/null || echo "")
+    CPU_BRAND=$(echo "$SYS_RESP" | python3 -c \
+        "import sys,json; d=json.load(sys.stdin); print(d.get('data',{}).get('system_info',{}).get('cpu',{}).get('brand',''))" \
+        2>/dev/null || echo "")
+    MINER_TYPE=$(curl -sf "http://${NODES[$i]}/api/v1/status" 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); info=d.get('data',{}).get('info',{}); print(info.get('miner_type','') if isinstance(info, dict) else json.loads(info).get('miner_type',''))" \
+        2>/dev/null || echo "")
+
+    if [ "$DESC_VERSION" = "1" ] && [ -n "$CPU_BRAND" ]; then
+        echo -e "  ${GREEN}PASS${NC}  ${NODE_NAMES[$i]} descriptor v$DESC_VERSION, cpu='$CPU_BRAND', miner_type='$MINER_TYPE'"
+        PASS=$((PASS + 1))
+    else
+        echo -e "  ${RED}FAIL${NC}  ${NODE_NAMES[$i]} descriptor_version='$DESC_VERSION', cpu_brand='$CPU_BRAND'"
+        FAIL=$((FAIL + 1))
+    fi
+
+    # Scrubbing: the JSON dump of system/status/peers/stats must never
+    # contain listen IPs, peer lists, or heartbeat internals.
+    ALL_BLOBS=$(
+        curl -sf "http://${NODES[$i]}/api/v1/system" 2>/dev/null;
+        curl -sf "http://${NODES[$i]}/api/v1/status" 2>/dev/null;
+        curl -sf "http://${NODES[$i]}/api/v1/stats"  2>/dev/null;
+        curl -sf "http://${NODES[$i]}/api/v1/peers"  2>/dev/null
+    )
+    LEAK=""
+    # We look for TOML-config keys that must never appear in outward JSON.
+    # "listen" and "heartbeat_interval" are the canonical smoking guns.
+    for needle in '"listen"' '"heartbeat_interval"' '"secret"' '"tls_cert_file"'; do
+        if echo "$ALL_BLOBS" | grep -q "$needle"; then
+            LEAK="$LEAK $needle"
+        fi
+    done
+    if [ -z "$LEAK" ]; then
+        echo -e "  ${GREEN}PASS${NC}  ${NODE_NAMES[$i]} no sensitive config keys in REST output"
+        PASS=$((PASS + 1))
+    else
+        echo -e "  ${RED}FAIL${NC}  ${NODE_NAMES[$i]} leaked:$LEAK"
+        FAIL=$((FAIL + 1))
+    fi
+done
 
 # Check that mining has started (at least genesis block)
 BLOCK_RESP=$(curl -sf "http://${NODES[0]}/api/v1/block/latest" 2>/dev/null || echo "{}")

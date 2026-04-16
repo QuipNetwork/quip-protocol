@@ -37,6 +37,11 @@ LABEL maintainer="Quip Protocol"
 LABEL description="Quip Network Node - CPU Mining"
 LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-protocol"
 
+# Image identity surfaced to telemetry — set by CI via
+# `--build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA`.
+ARG QUIP_DOCKER_IMAGE=""
+ENV QUIP_DOCKER_IMAGE=${QUIP_DOCKER_IMAGE}
+
 # Install runtime dependencies (tini for PID 1, busybox for crond)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openssl tini busybox-static \

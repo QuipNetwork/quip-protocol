@@ -25,6 +25,7 @@ from shared.block_signer import BlockSigner
 from shared.block import Block, MinerInfo
 from shared.miner import Miner, MiningResult
 from shared.logging_config import init_component_logger
+from shared.system_info import build_descriptor
 from shared.time_utils import utc_timestamp_float, utc_timestamp, network_timestamp
 from shared.version import PROTOCOL_VERSION
 # Global logger for this module (set during Node initialization)
@@ -187,6 +188,7 @@ class Node:
         """
         self.node_id = node_id
         self.miners_config = miners_config
+        self._descriptor_cache: Optional[Dict[str, Any]] = None
 
         self.peers: Dict[str, MinerInfo] = {}
 
@@ -615,16 +617,44 @@ class Node:
             except Exception as e:
                 self.logger.error(f"Error in block_mined callback: {e}")
 
+    def _derive_miner_type_label(self) -> str:
+        """Short label for this node's active miners (e.g. 'CPU', 'CPU+GPU').
+
+        Historically this field leaked the full TOML config. The
+        documented contract (shared/block.py:MinerInfo.miner_type) is
+        a short string consumed by `calculate_adaptive_parameters`.
+        """
+        kinds = sorted({
+            h.miner_type for h in getattr(self, "miner_handles", [])
+            if getattr(h, "miner_type", None)
+        })
+        return "+".join(kinds) if kinds else "UNKNOWN"
+
     def info(self) -> MinerInfo:
         """Get information about this node."""
         return MinerInfo(
             miner_id=self.node_id,
-            miner_type=f"{json.dumps(self.miners_config)}",
+            miner_type=self._derive_miner_type_label(),
             reward_address=self.crypto.ecdsa_public_key_bytes,
             ecdsa_public_key=self.crypto.ecdsa_public_key_bytes,
             wots_public_key=self.crypto.wots_plus_public_key,
             next_wots_public_key=self.crypto.wots_plus_public_key
         )
+
+    def descriptor(self) -> Dict[str, Any]:
+        """Lazily build and cache the NodeDescriptor for this node.
+
+        Returns a JSON-friendly dict. Cached after first call; call
+        ``invalidate_descriptor()`` if miners_config changes.
+        """
+        if self._descriptor_cache is None:
+            desc = build_descriptor(self.node_id, self.miners_config)
+            self._descriptor_cache = desc.to_dict()
+        return self._descriptor_cache
+
+    def invalidate_descriptor(self) -> None:
+        """Drop the cached descriptor so it will be rebuilt on next read."""
+        self._descriptor_cache = None
 
     async def mine_block(self, previous_block: Block, transactions: List = None) -> Optional[MiningResult]:
         """

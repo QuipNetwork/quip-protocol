@@ -141,6 +141,7 @@ class RestApiServer:
 
         # API v1 routes
         app.router.add_get("/api/v1/status", self.handle_status)
+        app.router.add_get("/api/v1/system", self.handle_system)
         app.router.add_get("/api/v1/stats", self.handle_stats)
         app.router.add_get("/api/v1/peers", self.handle_peers)
         app.router.add_get("/api/v1/block/latest", self.handle_get_latest_block)
@@ -296,12 +297,17 @@ class RestApiServer:
         status_data = {
             "host": self.node.public_host,
             "info": json.loads(self.node.info().to_json()),
+            "descriptor": self.node.descriptor(),
             "running": self.node.running,
             "total_peers": len(self.node.peers),
             "uptime": utc_timestamp_float() if self.node.running else 0,
             "latest_block": self.node.get_latest_block().header.index if self.node.get_latest_block() else 0
         }
         return self._success_response(status_data)
+
+    async def handle_system(self, request: web.Request) -> web.Response:
+        """GET /api/v1/system - Node hardware survey + whitelisted config."""
+        return self._success_response(self.node.descriptor())
 
     async def handle_stats(self, request: web.Request) -> web.Response:
         """GET /api/v1/stats - Mining and network statistics."""
@@ -389,8 +395,15 @@ class RestApiServer:
             except Exception as e:
                 return self._error_response(f"Invalid 'info' field: {e}", "INVALID_INFO")
 
+        descriptor_field = data.get("descriptor")
         if new_node_info:
-            await self.node.add_peer(new_node_address, new_node_info)
+            from shared.system_info import override_public_address
+            await self.node.add_peer(
+                new_node_address, new_node_info,
+                descriptor=override_public_address(
+                    descriptor_field, new_node_address,
+                ),
+            )
 
         # Return our peer list
         async with self.node.net_lock:
@@ -402,7 +415,11 @@ class RestApiServer:
         }
         peers_payload[self.node.public_host] = json.loads(self.node.info().to_json())
 
-        return self._success_response({"status": "ok", "peers": peers_payload})
+        return self._success_response({
+            "status": "ok",
+            "peers": peers_payload,
+            "descriptor": self.node.descriptor(),
+        })
 
     async def handle_submit_block(self, request: web.Request) -> web.Response:
         """POST /api/v1/block - Submit a new block (DEBUG)."""

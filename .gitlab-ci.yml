@@ -73,6 +73,7 @@ build-cpu:
     - /kaniko/executor
         --context $CI_PROJECT_DIR
         --dockerfile docker/Dockerfile.cpu
+        --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
         --destination $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
         --destination $CI_REGISTRY_IMAGE/$CPU_IMAGE:latest
 
@@ -82,6 +83,7 @@ build-cuda:
     - /kaniko/executor
         --context $CI_PROJECT_DIR
         --dockerfile docker/Dockerfile.cuda
+        --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA
         --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA
         --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
 

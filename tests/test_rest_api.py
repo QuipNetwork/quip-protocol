@@ -39,6 +39,34 @@ class MockNetworkNode:
         mock_info.version = "0.0.1"
         return mock_info
 
+    def descriptor(self):
+        """Return a minimal NodeDescriptor-shaped dict."""
+        return {
+            "descriptor_version": 1,
+            "node_name": "test-node",
+            "public_host": "127.0.0.1",
+            "public_port": 20049,
+            "auto_mine": False,
+            "log_level": "INFO",
+            "runtime": {
+                "python": "3.14.0",
+                "quip_version": "0.0.1",
+                "protocol_version": 2,
+                "in_docker": False,
+                "docker_image": None,
+            },
+            "miners": {},
+            "system_info": {
+                "os": {"system": "Linux", "release": "test", "machine": "x86_64"},
+                "cpu": {
+                    "logical_cores": 1, "physical_cores": 1,
+                    "brand": "Test CPU", "arch": "x86_64",
+                },
+                "memory_mb": 1024,
+                "gpus": [],
+            },
+        }
+
     def get_latest_block(self):
         """Return mock latest block."""
         return self._create_mock_block(10)

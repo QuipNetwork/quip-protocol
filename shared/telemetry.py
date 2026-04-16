@@ -33,6 +33,7 @@ class NodeRecord:
     last_heartbeat: Optional[float] = None
     first_seen: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
+    descriptor: Optional[Dict] = None
 
 
 class TelemetryManager:
@@ -74,6 +75,7 @@ class TelemetryManager:
         status: str,
         miner_info: Optional[MinerInfo] = None,
         last_heartbeat: Optional[float] = None,
+        descriptor: Optional[Dict] = None,
     ) -> None:
         """Insert or update a node record and rewrite nodes.json."""
         if not self._enabled:
@@ -93,6 +95,8 @@ class TelemetryManager:
             rec.miner_type = miner_info.miner_type
             if miner_info.ecdsa_public_key:
                 rec.ecdsa_public_key_hex = miner_info.ecdsa_public_key.hex()
+        if descriptor is not None:
+            rec.descriptor = descriptor
 
         self._write_nodes_json()
 
@@ -127,15 +131,16 @@ class TelemetryManager:
         active = sum(1 for n in self._nodes.values() if n.status == "active")
         lines = [f"=== Known Nodes ({len(self._nodes)} total, {active} active) ==="]
         lines.append(
-            f"{'Address':<30} {'Miner ID':<20} {'Type':<6} "
-            f"{'Status':<12} {'Last Heartbeat'}"
+            f"{'Address':<30} {'Miner ID':<20} {'Type':<10} "
+            f"{'Status':<12} {'Last Heartbeat':<16} {'System'}"
         )
         now = time.time()
         for rec in sorted(self._nodes.values(), key=lambda r: r.last_seen, reverse=True):
             hb = _format_ago(now, rec.last_heartbeat) if rec.last_heartbeat else "never"
             lines.append(
                 f"{rec.address:<30} {(rec.miner_id or '-'):<20} "
-                f"{(rec.miner_type or '-'):<6} {rec.status:<12} {hb}"
+                f"{(rec.miner_type or '-'):<10} {rec.status:<12} "
+                f"{hb:<16} {_describe_system(rec.descriptor)}"
             )
         self._logger.info("\n".join(lines))
 
@@ -268,3 +273,27 @@ def _format_ago(now: float, ts: float) -> str:
     if delta < 3600:
         return f"{delta // 60}m ago"
     return f"{delta // 3600}h ago"
+
+
+def _describe_system(descriptor: Optional[Dict]) -> str:
+    """Compact single-line system summary extracted from a descriptor dict."""
+    if not descriptor:
+        return "-"
+    sysinfo = descriptor.get("system_info") or {}
+    os_info = sysinfo.get("os") or {}
+    cpu = sysinfo.get("cpu") or {}
+    gpus = sysinfo.get("gpus") or []
+    parts = [f"{os_info.get('system', '?')}/{os_info.get('machine', '?')}"]
+    cores = cpu.get("logical_cores")
+    if cores:
+        parts.append(f"{cores}C")
+    if gpus:
+        counts: Dict[str, int] = {}
+        for gpu in gpus:
+            name = gpu.get("name") or gpu.get("vendor") or "GPU"
+            counts[name] = counts.get(name, 0) + 1
+        parts.append(" ".join(
+            f"{n}×{name}" if n > 1 else name
+            for name, n in counts.items()
+        ))
+    return " ".join(parts)
