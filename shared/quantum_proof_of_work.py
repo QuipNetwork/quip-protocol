@@ -11,77 +11,70 @@ from typing import Any, Tuple, Dict, Optional, List
 from blake3 import blake3
 import numpy as np
 
+from shared.chacha8 import ChaCha8Rng
 from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
 from dwave_topologies import DEFAULT_TOPOLOGY
 
 logger = get_logger('quantum_proof_of_work')
 
-def ising_nonce_from_block(prev_hash: bytes, miner_id: str, cur_index: int, salt: bytes) -> int:
-    """Generate deterministic seed for Ising model from block parameters.
 
-    Uses miner_id instead of timestamp to ensure reproducible seeds between
-    mining and validation phases.
+def ising_nonce_from_block(prev_hash: bytes, miner_id: str, cur_index: int, salt: bytes) -> int:
+    """Generate deterministic nonce from block parameters using BLAKE3.
+
+    Matches Rust's derive_nonce() in quip-protocol-rs:
+      - Hashes raw bytes (not hex-encoded strings)
+      - Uses u32 big-endian for block index
+      - Returns u64 (8 bytes)
     """
-    seed = f"{prev_hash.hex()}{miner_id}{cur_index}".encode() + salt
-    nonce_bytes = blake3(seed).digest()
-    nonce = int.from_bytes(nonce_bytes[:4], 'big')
-    logger.debug(f"ising_nonce_from_block: prev_hash={prev_hash.hex()[:8]}, miner_id={miner_id}, cur_index={cur_index}, salt={salt.hex()[:8]}, nonce={nonce}")
-    return nonce
+    if not (0 <= cur_index < 2**32):
+        raise ValueError(
+            f"cur_index must be a u32 (0..2^32-1), got {cur_index}"
+        )
+    hasher = blake3()
+    hasher.update(prev_hash)
+    hasher.update(miner_id.encode())
+    hasher.update(cur_index.to_bytes(4, 'big'))
+    hasher.update(salt)
+    digest = hasher.digest()
+    return int.from_bytes(digest[:8], 'big')
 
 
 def generate_ising_model_from_nonce(
     nonce: int,
     nodes: List[int],
     edges: List[Tuple[int, int]],
-    h_values: Optional[List[float]] = None
-) -> Tuple[Dict[int, float], Dict[tuple, float]]:
-    """Generate (h, J) Ising parameters deterministically from a nonce.
+    h_values: Optional[List[float]] = None,
+) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float]]:
+    """Generate (h, J) Ising parameters using ChaCha8Rng.
 
-    Args:
-        nonce: Random seed for deterministic generation
-        nodes: List of node IDs in the topology
-        edges: List of edge tuples in the topology
-        h_values: List of allowed h field values (default: [-1, 0, +1])
-                 Use [0] for backward compatibility (h=0 everywhere)
-
-    Returns:
-        (h, J) where:
-          - h: Dict mapping node_id → field value from h_values
-          - J: Dict mapping (u,v) → coupling value in {-1, +1}
-
-    Note on h_values choice:
-        The default [-1, 0, +1] distribution is chosen because:
-        1. Very large |h| values make problems easier (h dominates, graph structure
-           becomes irrelevant, greedy solutions work)
-        2. Very small |h| values add little quantum advantage (h contributes nothing)
-        3. Continuous vs discrete h makes no computational difference for SA hardness
-           (both have same energy landscape topology, same local minima structure)
-        4. Discrete values are simpler (int8 efficient, easy validation, no float precision issues)
-        5. Including 0 keeps h contribution (~27%) balanced with J (~73%), preserving
-           graph-structured problem (favoring quantum hardware)
+    Matches Rust's generate_ising_model() in quip-protocol-rs:
+      - Uses ChaCha8Rng (not numpy PCG64)
+      - Generates h FIRST, then J
+      - Uses next_u32() % len for h (modulo selection, matches Rust)
+      - Uses next_u32() & 1 for J sign
     """
     if h_values is None:
-        h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
+        h_values = [-1.0, 0.0, 1.0]
+    if not h_values:
+        raise ValueError("h_values must be non-empty")
+    if not nodes:
+        raise ValueError("nodes must be non-empty for Ising model generation")
 
-    # Use numpy's new Generator API instead of global np.random.seed()
-    # This is thread-safe and doesn't affect global state
-    rng = np.random.default_rng(nonce)
+    rng = ChaCha8Rng.seed_from_u64(nonce)
+    n_h = len(h_values)
 
-    # Generate J: random ±1 for each edge
-    J = {
-        (int(u), int(v)): float(2 * rng.integers(2) - 1)
-        for (u, v) in edges
-    }
+    # h FIRST: one next_u32() per node
+    h: Dict[int, float] = {}
+    for node_id in nodes:
+        index = rng.next_u32() % n_h
+        h[int(node_id)] = h_values[index]
 
-    # Generate h: random selection from h_values for each node
-    if len(h_values) == 1 and h_values[0] == 0.0:
-        # Optimization: if h_values = [0], skip random generation
-        h = {int(i): 0.0 for i in nodes}
-    else:
-        # General case: sample from h_values distribution
-        h_vals = rng.choice(h_values, size=len(nodes))
-        h = {int(node_id): float(h_vals[idx]) for idx, node_id in enumerate(nodes)}
+    # J SECOND: one next_u32() per edge
+    J: Dict[Tuple[int, int], float] = {}
+    for (u, v) in edges:
+        sign = -1.0 if (rng.next_u32() & 1) == 0 else 1.0
+        J[(int(u), int(v))] = sign
 
     return h, J
 
@@ -111,8 +104,59 @@ def energy_of_solution(solution: List[int], h: Dict[int, float], J: Dict[Tuple[i
 
 
 def energies_for_solutions(solutions: List[List[int]], h: Dict[int, float], J: Dict[Tuple[int, int], float], nodes: List[int]) -> List[float]:
-    """Compute energies for a list of solutions using energy_of_solution."""
-    return [energy_of_solution(sol, h, J, nodes) for sol in solutions]
+    """Compute Ising energies for multiple solutions using vectorized numpy.
+
+    Converts h and J to arrays and computes all energies in one pass.
+    ~10x faster than calling energy_of_solution() in a loop for large
+    solution counts.
+    """
+    if not solutions:
+        return []
+
+    n = len(nodes)
+    node_pos = {int(nid): pos for pos, nid in enumerate(nodes)}
+
+    # Build h_arr: shape (n,)
+    h_arr = np.zeros(n, dtype=np.float64)
+    for nid, val in h.items():
+        pos = node_pos.get(int(nid))
+        if pos is not None:
+            h_arr[pos] = val
+
+    # Build J arrays: edge endpoints + values
+    edge_u = []
+    edge_v = []
+    j_vals = []
+    for (u, v), val in J.items():
+        pu = node_pos.get(int(u))
+        pv = node_pos.get(int(v))
+        if pu is not None and pv is not None:
+            edge_u.append(pu)
+            edge_v.append(pv)
+            j_vals.append(val)
+    edge_u = np.array(edge_u, dtype=np.intp)
+    edge_v = np.array(edge_v, dtype=np.intp)
+    j_arr = np.array(j_vals, dtype=np.float64)
+
+    # Build spin matrix: shape (n_solutions, n)
+    # Fall back to per-solution if lengths are inconsistent
+    try:
+        spin_matrix = np.array(solutions, dtype=np.float64)
+    except ValueError:
+        return [energy_of_solution(sol, h, J, nodes) for sol in solutions]
+    # Map to {-1, +1}
+    spin_matrix = np.where(spin_matrix > 0, 1.0, -1.0)
+
+    # h contribution: sum(h_i * s_i) for each solution
+    h_energies = spin_matrix @ h_arr  # (n_solutions,)
+
+    # J contribution: sum(J_ij * s_i * s_j) for each solution
+    # Vectorized: s_u * s_v for all edges, then dot with J values
+    s_u = spin_matrix[:, edge_u]  # (n_solutions, n_edges)
+    s_v = spin_matrix[:, edge_v]  # (n_solutions, n_edges)
+    j_energies = (s_u * s_v) @ j_arr  # (n_solutions,)
+
+    return (h_energies + j_energies).tolist()
 
 def calculate_hamming_distance(s1: List[int], s2: List[int]) -> int:
     """Calculate symmetric Hamming distance between two spin arrays.
@@ -166,32 +210,43 @@ def _calculate_set_diversity(indices: List[int], dist_matrix: np.ndarray) -> flo
 
 
 def _compute_distance_matrix_vectorized(solutions: List[List[int]]) -> np.ndarray:
-    """Compute symmetric Hamming distance matrix using vectorized numpy operations.
+    """Compute symmetric Hamming distance matrix using vectorized operations.
 
-    Much faster than pairwise function calls for large solution sets.
+    Uses PyTorch MPS/CUDA when available for large matrices (5x speedup on
+    GPU at 500+ solutions). Falls back to numpy for small matrices or when
+    no GPU is available.
     """
-    # Convert to numpy array: shape (n_solutions, n_nodes)
     arr = np.array(solutions, dtype=np.int8)
     n_solutions = arr.shape[0]
 
-    # Compute all pairwise distances using broadcasting
-    # arr[i] != arr[j] gives boolean array of mismatches
-    # We need to compute this for all i,j pairs efficiently
+    # GPU acceleration for large matrices (amortizes transfer overhead)
+    if n_solutions >= 200:
+        try:
+            import torch
+            device = None
+            if torch.backends.mps.is_available():
+                device = 'mps'
+            elif torch.cuda.is_available():
+                device = 'cuda'
 
-    # Expand dims for broadcasting: (n, 1, nodes) vs (1, n, nodes)
-    a1 = arr[:, np.newaxis, :]  # Shape: (n, 1, nodes)
-    a2 = arr[np.newaxis, :, :]  # Shape: (1, n, nodes)
+            if device is not None:
+                t = torch.from_numpy(arr).to(torch.int8).to(device)
+                a1 = t.unsqueeze(1)
+                a2 = t.unsqueeze(0)
+                dist_normal = (a1 != a2).sum(dim=2)
+                dist_inverted = (a1 != -a2).sum(dim=2)
+                return torch.minimum(
+                    dist_normal, dist_inverted
+                ).cpu().numpy().astype(np.float64)
+        except Exception:
+            pass  # Fall through to numpy
 
-    # Normal distance: count where spins differ
+    # Numpy path (fast for small matrices, no GPU needed)
+    a1 = arr[:, np.newaxis, :]
+    a2 = arr[np.newaxis, :, :]
     dist_normal = np.count_nonzero(a1 != a2, axis=2)
-
-    # Inverted distance: count where a1 != -a2
     dist_inverted = np.count_nonzero(a1 != -a2, axis=2)
-
-    # Take minimum (symmetric Hamming distance)
-    dist_matrix = np.minimum(dist_normal, dist_inverted).astype(np.float64)
-
-    return dist_matrix
+    return np.minimum(dist_normal, dist_inverted).astype(np.float64)
 
 
 def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> List[int]:
@@ -397,7 +452,7 @@ def validate_quantum_proof(quantum_proof, miner_id: str, requirements, block_ind
         nonce,
         quantum_proof.nodes,
         quantum_proof.edges,
-        h_values=h_values
+        h_values=h_values,
     )
 
     # Validate each solution for correctness
@@ -514,6 +569,77 @@ def validate_solution(spins: List[int], h: Dict[int, float], J: Dict[Tuple[int, 
     return result
 
 
+def _energy_stratified_selection(
+    solutions: List[List[int]],
+    energies: List[float],
+    target_count: int,
+) -> Optional[List[int]]:
+    """Select solutions from different energy strata for diversity.
+
+    When all valid solutions cluster in one energy basin (low diversity),
+    picking from different energy levels pulls in solutions from different
+    spin basins. Solutions at slightly worse energies are structurally
+    different from the best — they represent alternative local minima.
+
+    Divides the energy range into target_count equal bands and picks
+    one solution per band (the most central in each band). Falls back
+    to evenly-spaced indices if any stratum is empty.
+
+    Args:
+        solutions: Valid solutions (all below energy threshold).
+        energies: Corresponding energies (same order).
+        target_count: Number of solutions to select.
+
+    Returns:
+        List of selected indices, or None if fewer than target_count
+        solutions are available.
+    """
+    if len(solutions) < target_count:
+        return None
+
+    # Sort by energy (best = most negative first)
+    order = sorted(range(len(energies)), key=lambda i: energies[i])
+    sorted_energies = [energies[i] for i in order]
+
+    # Try stratified: divide energy range into equal bands
+    e_best = sorted_energies[0]
+    e_worst = sorted_energies[-1]
+    e_range = e_worst - e_best
+
+    if e_range > 0:
+        band_size = e_range / target_count
+        selected = []
+        for band in range(target_count):
+            band_lo = e_best + band * band_size
+            band_hi = band_lo + band_size
+            # Find solutions in this band
+            candidates = [
+                order[i] for i, e in enumerate(sorted_energies)
+                if (band_lo <= e < band_hi or (band == target_count - 1 and e <= band_hi))
+                and order[i] not in selected
+            ]
+            if candidates:
+                # Pick the one closest to the band center
+                band_mid = (band_lo + band_hi) / 2
+                best_cand = min(candidates, key=lambda i: abs(energies[i] - band_mid))
+                selected.append(best_cand)
+
+        if len(selected) >= target_count:
+            return selected[:target_count]
+
+    # Fallback: evenly-spaced indices through the energy-sorted list
+    n = len(order)
+    step = max(1, n // target_count)
+    selected = [order[i * step] for i in range(min(target_count, n))]
+
+    # Fill remaining if step didn't give enough
+    if len(selected) < target_count:
+        remaining = [idx for idx in order if idx not in set(selected)]
+        selected.extend(remaining[:target_count - len(selected)])
+
+    return selected[:target_count] if len(selected) >= target_count else None
+
+
 def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tuple[int, int]],
                       nonce: int, salt: bytes, prev_timestamp: int, start_time: float,
                       miner_id: str, miner_type: str,
@@ -620,14 +746,37 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         if len(valid_solutions) < min_solutions:
             raise ValueError(f"Insufficient valid solutions: {len(valid_solutions)} < {min_solutions}")
 
-        # Filter solutions if we have too many
+        # Select diverse solutions — try farthest-point first, then
+        # fall back to energy-stratified selection if diversity is too low.
         filtered_solutions = valid_solutions
         if len(valid_solutions) >= min_solutions:
-            selected_solutions_indices = select_diverse_solutions(valid_solutions, min_solutions)
-            filtered_solutions = [valid_solutions[i] for i in selected_solutions_indices]
+            selected_indices = select_diverse_solutions(
+                valid_solutions, min_solutions,
+            )
+            filtered_solutions = [valid_solutions[i] for i in selected_indices]
             diversity = calculate_diversity(filtered_solutions)
-            # Use tracked energy for best of filtered solutions
-            best_energy = min(valid_energies[i] for i in selected_solutions_indices)
+            best_energy = min(valid_energies[i] for i in selected_indices)
+
+            # Fallback: if farthest-point selection doesn't meet diversity,
+            # try energy-stratified selection. Solutions at different energy
+            # levels are more likely to be in different spin basins.
+            if diversity < min_diversity and len(valid_solutions) > min_solutions:
+                stratified = _energy_stratified_selection(
+                    valid_solutions, valid_energies, min_solutions,
+                )
+                if stratified is not None:
+                    strat_div = calculate_diversity(
+                        [valid_solutions[i] for i in stratified]
+                    )
+                    if strat_div >= min_diversity:
+                        selected_indices = stratified
+                        filtered_solutions = [
+                            valid_solutions[i] for i in selected_indices
+                        ]
+                        diversity = strat_div
+                        best_energy = min(
+                            valid_energies[i] for i in selected_indices
+                        )
         elif valid_energies:
             best_energy = min(valid_energies)
 

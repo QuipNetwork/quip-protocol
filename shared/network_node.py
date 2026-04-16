@@ -35,9 +35,16 @@ from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import QuicEvent, DatagramFrameReceived, StreamDataReceived, ConnectionTerminated, HandshakeCompleted
+from shared.block_inventory import BlockInventory
 from shared.block_synchronizer import BlockSynchronizer
 from shared.block_store import BlockStore
+from shared.load_monitor import LoadMonitor, NodeLoad
+from shared.peer_scorer import PeerScorer
+from shared.process_pool import ProcessPool, ProcessPoolConfig
+from shared.rate_limiter import PeerRateLimiter
+from shared.swim_detector import SwimDetector, PeerState
 from shared.telemetry import TelemetryManager
+from shared.telemetry_cache import TelemetryCache
 from shared.time_utils import (
     utc_timestamp_float, is_clock_synchronized, NETWORK_TIME_SYNC_INTERVAL,
     get_network_clock, network_timestamp
@@ -282,6 +289,7 @@ class NetworkNode(Node):
             "nodes.quip.network:20049",
         ])
         self.fanout = int(config.get("fanout", 3))
+        self.max_connections = int(config.get("max_connections", 50))
 
         self.net_lock = asyncio.Lock()
         self.running = False
@@ -297,8 +305,43 @@ class NetworkNode(Node):
         self._connection_worker: Optional['ConnectionWorkerHandle'] = None
         self._connection_request_pending = False
 
+        # Process pool for per-connection peer isolation (initialized in start())
+        self._process_pool: Optional[ProcessPool] = None
+
+        # Per-peer rate limiter for incoming QUIC messages
+        self._rate_limiter = PeerRateLimiter(
+            tokens_per_second=float(config.get("rate_limit_tps", 10.0)),
+            max_burst=int(config.get("rate_limit_burst", 20)),
+        )
+
+        # Load monitoring and SWIM failure detection
+        self._load_monitor = LoadMonitor(
+            max_connections=self.max_connections,
+            high_watermark=float(config.get("load_high_watermark", 0.8)),
+            low_watermark=float(config.get("load_low_watermark", 0.5)),
+        )
+        self._swim_detector = SwimDetector(
+            k_probes=int(config.get("swim_k_probes", 3)),
+            suspect_rounds=int(config.get("swim_suspect_rounds", 2)),
+            probe_timeout=float(config.get("swim_probe_timeout", 10.0)),
+        )
+        # Load info received from peers: {peer_address: NodeLoad}
+        self._peer_loads: Dict[str, NodeLoad] = {}
+
+        # Block inventory for IHAVE/IWANT protocol
+        self._block_inventory = BlockInventory()
+        # Peer scoring for gossip target selection
+        self._peer_scorer = PeerScorer(
+            disconnect_threshold=float(
+                config.get("peer_disconnect_threshold", -100.0)
+            ),
+        )
+
         self.gossip_lock = asyncio.Lock()
-        self.recent_messages = set()
+        # Bounded dedup: maps message_id -> timestamp, max 10k entries
+        self.recent_messages: dict[str, float] = {}
+        self._recent_messages_max = 10_000
+        self._recent_messages_ttl = 300.0  # 5 minutes
 
         # Time synchronization tracking
         self.peer_timestamps = []  # Recent timestamps from peers
@@ -363,6 +406,21 @@ class NetworkNode(Node):
             logger=self.logger,
         )
         self.telemetry.record_initial_peers(self.initial_peers)
+
+        # Telemetry cache (read-only, for REST + QUIC telemetry endpoints)
+        telem_api = config.get("telemetry_api", {})
+        telem_api_enabled = telem_api.get(
+            "enabled", config.get("telemetry_enabled", True),
+        )
+        if telem_api_enabled:
+            self.telemetry_cache: Optional[TelemetryCache] = TelemetryCache(
+                telemetry_dir=config.get("telemetry_dir", "telemetry"),
+                refresh_interval=telem_api.get("cache_refresh_interval", 5.0),
+                logger=self.logger,
+            )
+        else:
+            self.telemetry_cache = None
+        self._telemetry_api_config = telem_api
 
         # Maximum block index to synchronize with (prevents syncing with peers too far ahead)
         self.max_sync_block_index = 1024
@@ -506,6 +564,14 @@ class NetworkNode(Node):
         )
         self._connection_worker.start()
 
+        # Initialize process pool for per-connection peer isolation
+        pool_cfg = ProcessPoolConfig(
+            max_connections=self.max_connections,
+            node_timeout=self.node_timeout,
+            verify_tls=self.verify_tls,
+        )
+        self._process_pool = ProcessPool(config=pool_cfg, logger=self.logger)
+
         # Start QUIC server
         cert_file = self.tls_cert_file if self.tls_enabled else None
         key_file = self.tls_key_file if self.tls_enabled else None
@@ -552,6 +618,7 @@ class NetworkNode(Node):
                     ),
                 }
                 cert_manager = CertificateManager(cert_config, logger=self.logger)
+            tapi = self._telemetry_api_config
             self.rest_api_server = RestApiServer(
                 network_node=self,
                 host=self.rest_host,
@@ -559,9 +626,17 @@ class NetworkNode(Node):
                 tls_port=self.rest_port,
                 cert_manager=cert_manager,
                 webroot=self.webroot,
-                logger=self.logger
+                logger=self.logger,
+                telemetry_cache=self.telemetry_cache,
+                telemetry_access_token=tapi.get("access_token", ""),
+                telemetry_rate_limit_rpm=tapi.get("rate_limit_rpm", 30),
+                telemetry_max_sse=tapi.get("max_sse_connections", 20),
             )
             await self.rest_api_server.start()
+
+        # Start telemetry cache
+        if self.telemetry_cache is not None:
+            await self.telemetry_cache.start()
 
         # Start background tasks
         self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
@@ -569,6 +644,7 @@ class NetworkNode(Node):
         self.block_processor_task = asyncio.create_task(self.block_processor_loop())
         self.gossip_processor_task = asyncio.create_task(self.gossip_processor_loop())
         self.server_task = asyncio.create_task(self.server_loop())
+        self.rebalance_task = asyncio.create_task(self.rebalance_loop())
 
         # have we fully synchronized with the network at least one time?
         self._synchronized = threading.Event()
@@ -617,9 +693,15 @@ class NetworkNode(Node):
             self.gossip_processor_task.cancel()
         if self.server_task:
             self.server_task.cancel()
+        if hasattr(self, 'rebalance_task') and self.rebalance_task:
+            self.rebalance_task.cancel()
         self.telemetry.stop()
         if self.reset_timer_task:
             self.reset_timer_task.cancel()
+
+        # Stop telemetry cache
+        if self.telemetry_cache is not None:
+            await self.telemetry_cache.stop()
 
         # Stop REST API server if running
         if self.rest_api_server:
@@ -631,6 +713,12 @@ class NetworkNode(Node):
             self.logger.info("Stopping connection worker...")
             self._connection_worker.close()
             self._connection_worker = None
+
+        # Shut down process pool (per-connection processes)
+        if self._process_pool:
+            self.logger.info("Stopping process pool...")
+            self._process_pool.shutdown_all(timeout=5.0)
+            self._process_pool = None
 
         self.logger.info("Cancelling QUIC client tasks...")
         # Close node client
@@ -662,7 +750,7 @@ class NetworkNode(Node):
     ##########################
 
     async def heartbeat_loop(self):
-        """Send heartbeats to all known nodes."""
+        """Send heartbeats to all known nodes with SWIM probing."""
         while self.running:
             try:
                 await asyncio.sleep(self.heartbeat_interval)
@@ -670,20 +758,70 @@ class NetworkNode(Node):
                 # Send heartbeat to all nodes
                 tasks = []
                 async with self.net_lock:
-                    for node_host in list(self.peers.keys()):
-                        task = asyncio.create_task(self.send_heartbeat(node_host))
+                    peer_list = list(self.peers.keys())
+                    for node_host in peer_list:
+                        task = asyncio.create_task(
+                            self._heartbeat_with_swim(node_host)
+                        )
                         tasks.append(task)
 
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
+
+                # SWIM: create and send indirect probes for suspects
+                await self._run_swim_probes(peer_list)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 self.logger.exception("Error in heartbeat loop")
 
+    async def _heartbeat_with_swim(self, node_host: str) -> None:
+        """Send heartbeat and update SWIM/scoring based on result."""
+        ok = await self.send_heartbeat(node_host)
+        if ok:
+            self._swim_detector.record_heartbeat_success(node_host)
+            self._peer_scorer.record_heartbeat_ok(node_host)
+        else:
+            self._swim_detector.record_heartbeat_failure(node_host)
+            self._peer_scorer.record_heartbeat_fail(node_host)
+            state = self._swim_detector.get_state(node_host)
+            if state == PeerState.SUSPECT:
+                self.logger.debug(
+                    f"SWIM: {node_host} now SUSPECT "
+                    f"(direct heartbeat failed)"
+                )
+
+    async def _run_swim_probes(self, peer_list: list[str]) -> None:
+        """Send SWIM indirect probe requests for all suspect peers."""
+        probe_requests = self._swim_detector.create_probe_requests(
+            peer_list
+        )
+        if not probe_requests:
+            return
+
+        self.logger.debug(
+            f"SWIM: sending {len(probe_requests)} indirect probes"
+        )
+        tasks = []
+        for req in probe_requests:
+            tasks.append(asyncio.create_task(
+                self._send_swim_probe(req)
+            ))
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _send_swim_probe(self, req) -> None:
+        """Send a single SWIM probe request and record the result."""
+        result = await self.node_client.send_probe_request(
+            req.prober, req.target, req.probe_id
+        )
+        if result is not None:
+            self._swim_detector.record_probe_result(
+                req.target, req.prober, result
+            )
+
     async def node_cleanup_loop(self):
-        """Remove dead nodes from registry."""
+        """Remove dead nodes from registry and prune stale state."""
         while self.running:
             try:
                 await asyncio.sleep(self.heartbeat_timeout / 2)
@@ -697,6 +835,25 @@ class NetworkNode(Node):
                         if host not in self.heartbeats or current_time - self.heartbeats[host] > self.heartbeat_timeout:
                             dead_nodes.append(host)
 
+                # Prune stale gossip dedup entries and rate limiter buckets
+                async with self.gossip_lock:
+                    pruned = self._prune_recent_messages()
+                    if pruned:
+                        self.logger.debug(
+                            f"Pruned {pruned} stale gossip dedup entries "
+                            f"({len(self.recent_messages)} remaining)"
+                        )
+                self._rate_limiter.prune()
+
+                # Reap dead connection processes
+                if self._process_pool:
+                    dead_procs = self._process_pool.reap_dead()
+                    for peer in dead_procs:
+                        self.logger.info(
+                            f"Connection process for {peer} died, "
+                            f"will reconnect on next cycle"
+                        )
+
                 # Remove dead nodes
                 for host in dead_nodes:
                     await self.remove_node(host)
@@ -705,6 +862,154 @@ class NetworkNode(Node):
                 break
             except Exception as e:
                 self.logger.exception("Error in cleanup loop")
+
+    async def rebalance_loop(self):
+        """Periodic load-based connection rebalancing.
+
+        Runs every 60s. If the node is overloaded, sheds excess
+        connections by sending MIGRATE to the least-active peers.
+        Also broadcasts load info to peers and runs SWIM probing.
+        """
+        while self.running:
+            try:
+                await asyncio.sleep(60)
+
+                # Update load monitor with current metrics
+                pool_count = (
+                    self._process_pool.connection_count
+                    if self._process_pool else 0
+                )
+                self._load_monitor.update(
+                    connection_count=pool_count,
+                    block_queue=self.block_processing_queue.qsize()
+                    if hasattr(self, 'block_processing_queue') else 0,
+                    gossip_queue=self.gossip_processing_queue.qsize()
+                    if hasattr(self, 'gossip_processing_queue') else 0,
+                )
+
+                # Broadcast load info to peers
+                load_snapshot = self._load_monitor.snapshot()
+                load_dict = load_snapshot.to_dict()
+                load_dict["sender"] = self.public_host
+                async with self.net_lock:
+                    peer_list = list(self.peers.keys())
+                for peer in peer_list:
+                    try:
+                        await self.node_client.send_load_info(
+                            peer, load_dict
+                        )
+                    except (ConnectionError, asyncio.TimeoutError, OSError):
+                        pass  # Expected network errors
+                    except Exception as exc:
+                        self.logger.debug(
+                            f"Failed to send load info to {peer}: {exc}"
+                        )
+
+                # Check if we need to shed connections
+                if self._load_monitor.is_overloaded():
+                    to_shed = self._load_monitor.connections_to_shed()
+                    if to_shed > 0 and self._process_pool:
+                        await self._shed_connections(to_shed)
+
+                # Peer scoring: decay and disconnect low scorers
+                self._peer_scorer.decay_scores()
+                low_scorers = self._peer_scorer.get_low_scoring_peers()
+                for peer in low_scorers:
+                    self.logger.info(
+                        f"Disconnecting low-scoring peer {peer} "
+                        f"(score={self._peer_scorer.get_score(peer):.1f})"
+                    )
+                    self._peer_scorer.remove_peer(peer)
+                    await self.remove_node(peer)
+
+                # Block inventory: expire stale IWANT requests
+                expired_wants = self._block_inventory.expire_wants()
+                for block_hash, peer in expired_wants:
+                    self.logger.debug(
+                        f"IWANT timeout for {block_hash.hex()[:16]}... "
+                        f"from {peer}"
+                    )
+
+                # SWIM: expire stale probes
+                self._swim_detector.expire_probes()
+
+                # SWIM: handle dead peers
+                dead_peers = self._swim_detector.get_dead_peers()
+                for peer in dead_peers:
+                    self.logger.warning(
+                        f"SWIM declared {peer} dead, removing"
+                    )
+                    self._swim_detector.remove_peer(peer)
+                    await self.remove_node(peer)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                self.logger.exception("Error in rebalance loop")
+
+    async def _shed_connections(self, count: int) -> None:
+        """Shed excess connections by sending MIGRATE to least-active peers."""
+        if not self._process_pool:
+            return
+
+        targets = self._process_pool.get_least_active_peers(count)
+        if not targets:
+            return
+
+        # Find least-loaded peers to suggest as alternatives
+        async with self.net_lock:
+            snapshot = list(self.peers.keys())
+        alternatives = self._get_least_loaded_peers(
+            exclude=set(targets), count=5, peer_list=snapshot
+        )
+
+        self.logger.info(
+            f"Shedding {len(targets)} connections "
+            f"(suggesting {len(alternatives)} alternatives)"
+        )
+
+        for peer in targets:
+            try:
+                await self.node_client.send_migrate(
+                    peer, alternatives, reason="overloaded"
+                )
+            except Exception as exc:
+                self.logger.warning(f"MIGRATE to {peer} failed: {exc}")
+            # Kill the connection process regardless of MIGRATE success
+            self._process_pool.kill(peer)
+
+    def _get_least_loaded_peers(
+        self, exclude: set, count: int,
+        peer_list: Optional[list[str]] = None,
+    ) -> list[str]:
+        """Select the least-loaded known peers as alternatives.
+
+        Uses peer load info if available, otherwise falls back to
+        random selection from the peer list.
+
+        Args:
+            peer_list: Pre-copied peer list (caller should copy under
+                net_lock). Falls back to self.peers if not provided.
+        """
+        # Sort peers by load (connection utilization)
+        candidates = []
+        async_peers = peer_list if peer_list is not None else list(self.peers.keys())
+        for peer in async_peers:
+            if peer in exclude:
+                continue
+            load = self._peer_loads.get(peer)
+            if load:
+                util = (
+                    load.connection_count / load.max_connections
+                    if load.max_connections > 0 else 0.0
+                )
+                candidates.append((peer, util))
+            else:
+                # Unknown load — assume moderate utilization
+                candidates.append((peer, 0.5))
+
+        candidates.sort(key=lambda x: x[1])
+        return [p for p, _ in candidates[:count]]
 
     async def server_loop(self):
         """Main server loop."""
@@ -1618,6 +1923,8 @@ class NetworkNode(Node):
                 self._has_ever_had_peers = True
                 self.logger.info(f"New peer discovered: {host}: {info.miner_id} ({info.ecdsa_public_key.hex()[:8]})")
                 self._on_new_node(host, info)
+                if hasattr(self, '_swim_detector'):
+                    self._swim_detector.add_peer(host)
 
                 # Broadcast new node to all other nodes
                 asyncio.create_task(self.gossip_new_node(host, info))
@@ -1644,6 +1951,14 @@ class NetworkNode(Node):
                 # Update node client to remove peer
                 if self.node_client:
                     await self.node_client.remove_peer(host)
+                if hasattr(self, '_swim_detector'):
+                    self._swim_detector.remove_peer(host)
+                if hasattr(self, '_peer_loads'):
+                    self._peer_loads.pop(host, None)
+                if hasattr(self, '_peer_scorer'):
+                    self._peer_scorer.remove_peer(host)
+                if hasattr(self, '_block_inventory'):
+                    self._block_inventory.remove_peer(host)
 
     async def send_heartbeat(self, node_host: str) -> bool:
         """Send heartbeat to a specific node.
@@ -1742,7 +2057,7 @@ class NetworkNode(Node):
             if message.id in self.recent_messages:
                 return  # Already processed
 
-            self.recent_messages.add(message.id)
+            self._record_recent_message(message.id)
 
         # Select random peers
         peers = list(self.peers.keys())
@@ -1773,22 +2088,62 @@ class NetworkNode(Node):
 
     async def gossip_block(self, block_data: Block):
         """Broadcast a new block to the network.
-        Data encoding: raw block network bytes.
-        """
-        binary_data = block_data.to_network()
-        bytes_sent = len(binary_data)
 
-        message = Message(
-            type="block",
-            sender=self.public_host,
-            timestamp=utc_timestamp_float(),
-            data=binary_data
+        Uses IHAVE/IWANT protocol: sends block hash via IHAVE to peers,
+        peers that need the block respond with IWANT. Falls back to
+        full-block gossip for the initial propagation to ensure the
+        block reaches the network quickly.
+        """
+        block_hash = block_data.hash
+        binary_data = block_data.to_network()
+
+        # Record in our inventory
+        self._block_inventory.record_have(block_hash)
+
+        # Send IHAVE to peers via scored selection
+        async with self.net_lock:
+            peer_list = list(self.peers.keys())
+
+        effective_fanout = self._adaptive_fanout(len(peer_list))
+        targets = self._peer_scorer.select_gossip_targets(
+            peer_list, effective_fanout
         )
 
-        # Log byte count for gossiped block
-        self.logger.debug(f"📤 Gossiped block {block_data.header.index}: {bytes_sent} bytes")
+        ihave_sent = 0
+        for peer in targets:
+            try:
+                protocol = await self.node_client._get_connection(peer)
+                if protocol is None:
+                    continue
+                payload = json.dumps({
+                    "block_hash": block_hash.hex(),
+                    "block_index": block_data.header.index,
+                    "sender": self.public_host,
+                }).encode('utf-8')
+                await protocol.send_request(
+                    QuicMessageType.IHAVE, payload, timeout=3.0
+                )
+                ihave_sent += 1
+            except (ConnectionError, asyncio.TimeoutError, OSError):
+                pass  # Expected network errors
+            except Exception as exc:
+                self.logger.debug(f"IHAVE to {peer} failed: {exc}")
 
-        await self.gossip(message)
+        self.logger.debug(
+            f"Sent IHAVE for block {block_data.header.index} "
+            f"to {ihave_sent}/{len(targets)} peers "
+            f"(hash={block_hash.hex()[:16]}...)"
+        )
+
+    def _adaptive_fanout(self, peer_count: int) -> int:
+        """Calculate adaptive fanout based on network size.
+
+        Scales as max(3, min(configured_fanout, sqrt(peer_count))).
+        """
+        if peer_count <= 0:
+            return self.fanout
+        sqrt_peers = int(math.sqrt(peer_count))
+        return max(3, min(self.fanout, sqrt_peers))
 
     async def handle_gossip(self, message: Message) -> str:
         """Main gossip logic to handle a gossip message from another node and rebroadcast."""
@@ -1800,7 +2155,7 @@ class NetworkNode(Node):
         async with self.gossip_lock:
             if message.id in self.recent_messages:
                 return "ok"  # Already processed
-            # NOTE: We only check and do not add to the processing list,
+            # NOTE: We only check and do not add to the dedup dict,
             #       as that happens during gossip_broadcast.
 
         if message.type == "new_node":
@@ -1847,6 +2202,42 @@ class NetworkNode(Node):
     ## QUIC Message Handlers ##
     ############################
 
+    def _record_recent_message(self, message_id: str) -> None:
+        """Record a message ID in the bounded dedup dict.
+
+        Evicts oldest entries when the dict exceeds max size, and
+        periodically prunes entries older than TTL.
+        """
+        now = time.time()
+        self.recent_messages[message_id] = now
+
+        # Evict if over capacity
+        if len(self.recent_messages) > self._recent_messages_max:
+            self._prune_recent_messages(now)
+
+    def _prune_recent_messages(self, now: Optional[float] = None) -> int:
+        """Remove messages older than TTL. Returns count removed."""
+        if now is None:
+            now = time.time()
+        cutoff = now - self._recent_messages_ttl
+        stale = [
+            mid for mid, ts in self.recent_messages.items()
+            if ts < cutoff
+        ]
+        for mid in stale:
+            del self.recent_messages[mid]
+
+        # If still over capacity after TTL pruning, drop oldest
+        if len(self.recent_messages) > self._recent_messages_max:
+            excess = len(self.recent_messages) - self._recent_messages_max
+            oldest = sorted(
+                self.recent_messages.items(), key=lambda x: x[1]
+            )[:excess]
+            for mid, _ in oldest:
+                del self.recent_messages[mid]
+            return len(stale) + excess
+        return len(stale)
+
     async def _handle_quic_message(
         self,
         msg: QuicMessage,
@@ -1857,6 +2248,12 @@ class NetworkNode(Node):
         This replaces all the HTTP route handlers with a single dispatch point.
         """
         try:
+            # Per-peer rate limiting
+            peer_addr = getattr(protocol, '_peer_address', None) or 'unknown'
+            if not self._rate_limiter.allow(peer_addr):
+                self.logger.debug(f"Rate limited {peer_addr}")
+                return msg.create_error_response("Rate limited")
+
             # Validate protocol version - reject incompatible nodes
             if msg.protocol_version != PROTOCOL_VERSION:
                 self.logger.warning(f"Protocol version mismatch from {protocol._peer_address}: expected {PROTOCOL_VERSION}, got {msg.protocol_version} (msg_type={msg.msg_type.name})")
@@ -1884,6 +2281,29 @@ class NetworkNode(Node):
                 return await self._quic_handle_block_header_request(msg)
             elif msg.msg_type == QuicMessageType.SOLVE_REQUEST:
                 return await self._quic_handle_solve(msg)
+            # Phase 2: rebalancing + SWIM message handlers
+            elif msg.msg_type == QuicMessageType.MIGRATE:
+                return await self._quic_handle_migrate(msg)
+            elif msg.msg_type == QuicMessageType.PROBE_REQUEST:
+                return await self._quic_handle_probe_request(msg)
+            elif msg.msg_type == QuicMessageType.LOAD_INFO:
+                return await self._quic_handle_load_info(msg)
+            # Phase 3: IHAVE/IWANT block propagation
+            elif msg.msg_type == QuicMessageType.IHAVE:
+                return await self._quic_handle_ihave(msg)
+            elif msg.msg_type == QuicMessageType.IWANT:
+                return await self._quic_handle_iwant(msg)
+            # Telemetry stream API
+            elif msg.msg_type == QuicMessageType.TELEMETRY_STATUS_REQUEST:
+                return self._quic_handle_telemetry_status(msg)
+            elif msg.msg_type == QuicMessageType.TELEMETRY_NODES_REQUEST:
+                return self._quic_handle_telemetry_nodes(msg)
+            elif msg.msg_type == QuicMessageType.TELEMETRY_EPOCHS_REQUEST:
+                return self._quic_handle_telemetry_epochs(msg)
+            elif msg.msg_type == QuicMessageType.TELEMETRY_BLOCK_REQUEST:
+                return self._quic_handle_telemetry_block(msg)
+            elif msg.msg_type == QuicMessageType.TELEMETRY_LATEST_REQUEST:
+                return self._quic_handle_telemetry_latest(msg)
             else:
                 self.logger.warning(f"Unknown message type: {msg.msg_type}")
                 return msg.create_error_response(f"Unknown message type: {msg.msg_type}")
@@ -1891,6 +2311,263 @@ class NetworkNode(Node):
         except Exception as e:
             self.logger.exception(f"Error handling {msg.msg_type.name}: {e}")
             return msg.create_error_response(str(e))
+
+    async def _quic_handle_migrate(self, msg: QuicMessage) -> QuicMessage:
+        """Handle MIGRATE: remote node is asking us to disconnect and reconnect elsewhere."""
+        try:
+            data = json.loads(msg.payload.decode('utf-8'))
+            reason = data.get("reason", "unknown")
+            alternatives = data.get("alternatives", [])
+            self.logger.info(
+                f"Received MIGRATE (reason={reason}), "
+                f"{len(alternatives)} alternatives suggested"
+            )
+            # TODO(Phase 2 follow-up): actually reconnect to alternatives.
+            # For now, acknowledge the MIGRATE so the sender can clean up.
+            return QuicMessage(
+                msg_type=QuicMessageType.MIGRATE_ACK,
+                request_id=msg.request_id,
+                payload=json.dumps({"status": "ok"}).encode('utf-8'),
+                protocol_version=msg.protocol_version,
+            )
+        except Exception as exc:
+            return msg.create_error_response(str(exc))
+
+    async def _quic_handle_probe_request(self, msg: QuicMessage) -> QuicMessage:
+        """Handle SWIM PROBE_REQUEST: check if a target peer is alive on behalf of requester."""
+        try:
+            data = json.loads(msg.payload.decode('utf-8'))
+            target = data.get("target", "")
+            probe_id = data.get("probe_id", "")
+
+            if not target:
+                return msg.create_error_response("Missing target in probe request")
+
+            # Try to reach the target via heartbeat
+            alive = await self.node_client.send_heartbeat(
+                target, self.public_host, self.info()
+            )
+            self.logger.debug(
+                f"SWIM probe {probe_id}: {target} "
+                f"{'alive' if alive else 'unreachable'}"
+            )
+            return QuicMessage(
+                msg_type=QuicMessageType.PROBE_RESPONSE,
+                request_id=msg.request_id,
+                payload=json.dumps({
+                    "target": target,
+                    "probe_id": probe_id,
+                    "alive": alive,
+                }).encode('utf-8'),
+                protocol_version=msg.protocol_version,
+            )
+        except Exception as exc:
+            return msg.create_error_response(str(exc))
+
+    async def _quic_handle_load_info(self, msg: QuicMessage) -> QuicMessage:
+        """Handle LOAD_INFO: store peer's load metrics."""
+        try:
+            data = json.loads(msg.payload.decode('utf-8'))
+            peer_load = NodeLoad.from_dict(data)
+            # Identify sender from the load data or protocol
+            # We store by any identifying info available
+            # The load info doesn't contain the sender address, so
+            # we use a placeholder — the real caller should include it
+            # For now, just store it if there's a sender field
+            sender = data.get("sender", "")
+            if sender:
+                self._peer_loads[sender] = peer_load
+            return QuicMessage(
+                msg_type=QuicMessageType.LOAD_INFO_RESPONSE,
+                request_id=msg.request_id,
+                payload=b'ok',
+                protocol_version=msg.protocol_version,
+            )
+        except Exception as exc:
+            return msg.create_error_response(str(exc))
+
+    async def _quic_handle_ihave(self, msg: QuicMessage) -> QuicMessage:
+        """Handle IHAVE: peer announces they have a block.
+
+        If we don't have it, we respond with IWANT to request it.
+        """
+        try:
+            data = json.loads(msg.payload.decode('utf-8'))
+            block_hash_hex = data.get("block_hash", "")
+            block_index = data.get("block_index", 0)
+            sender = data.get("sender", "")
+
+            if not block_hash_hex:
+                return msg.create_error_response("Missing block_hash")
+
+            block_hash = bytes.fromhex(block_hash_hex)
+
+            # Check if we need this block
+            should_request = self._block_inventory.record_ihave(
+                sender, block_hash
+            )
+
+            if should_request:
+                self.logger.debug(
+                    f"IHAVE: need block {block_index} from {sender}, "
+                    f"sending IWANT"
+                )
+                self._block_inventory.record_want(block_hash, sender)
+
+                # Send IWANT back to the sender
+                asyncio.create_task(
+                    self._send_iwant(sender, block_hash, block_index)
+                )
+
+            return QuicMessage(
+                msg_type=QuicMessageType.IHAVE_RESPONSE,
+                request_id=msg.request_id,
+                payload=json.dumps({
+                    "need": should_request,
+                }).encode('utf-8'),
+                protocol_version=msg.protocol_version,
+            )
+        except Exception as exc:
+            return msg.create_error_response(str(exc))
+
+    async def _send_iwant(
+        self, peer: str, block_hash: bytes, block_index: int
+    ) -> None:
+        """Send IWANT request to a peer for a specific block."""
+        try:
+            protocol = await self.node_client._get_connection(peer)
+            if protocol is None:
+                return
+            payload = json.dumps({
+                "block_hash": block_hash.hex(),
+                "block_index": block_index,
+            }).encode('utf-8')
+            response = await protocol.send_request(
+                QuicMessageType.IWANT, payload, timeout=10.0
+            )
+            if response and response.msg_type == QuicMessageType.IWANT_RESPONSE:
+                # Response payload is the full block
+                try:
+                    block = Block.from_network(response.payload)
+                    self._block_inventory.record_block_received(block_hash)
+                    self._peer_scorer.record_valid_block(peer)
+                    self.logger.debug(
+                        f"IWANT: received block {block.header.index} "
+                        f"from {peer}"
+                    )
+                    # Queue for processing
+                    dummy_future = asyncio.Future()
+                    self.block_processing_queue.put_nowait(
+                        (block, dummy_future, False, peer)
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        f"IWANT: invalid block from {peer}: {exc}"
+                    )
+                    self._peer_scorer.record_invalid_block(peer)
+        except Exception as exc:
+            self.logger.debug(f"IWANT to {peer} failed: {exc}")
+
+    async def _quic_handle_iwant(self, msg: QuicMessage) -> QuicMessage:
+        """Handle IWANT: peer is requesting a block we announced via IHAVE."""
+        try:
+            data = json.loads(msg.payload.decode('utf-8'))
+            block_hash_hex = data.get("block_hash", "")
+            block_index = data.get("block_index", 0)
+
+            if not block_hash_hex:
+                return msg.create_error_response("Missing block_hash")
+
+            block_hash = bytes.fromhex(block_hash_hex)
+
+            # Look up the block in our chain
+            block = self.get_block(block_index)
+            if block is None or block.header.block_hash != block_hash:
+                return msg.create_error_response(
+                    f"Block {block_index} not found or hash mismatch"
+                )
+
+            # Return the full block
+            return QuicMessage(
+                msg_type=QuicMessageType.IWANT_RESPONSE,
+                request_id=msg.request_id,
+                payload=block.to_network(),
+                protocol_version=msg.protocol_version,
+            )
+        except Exception as exc:
+            return msg.create_error_response(str(exc))
+
+    # ------------------------------------------------------------------
+    # Telemetry QUIC handlers
+    # ------------------------------------------------------------------
+
+    def _quic_telemetry_json_response(
+        self, msg: 'QuicMessage', data: Any,
+    ) -> 'QuicMessage':
+        """Build a JSON telemetry response from cached data."""
+        payload = json.dumps(data).encode("utf-8")
+        return msg.create_response(payload)
+
+    def _quic_handle_telemetry_status(
+        self, msg: 'QuicMessage',
+    ) -> 'QuicMessage':
+        """Handle TELEMETRY_STATUS_REQUEST."""
+        if self.telemetry_cache is None:
+            return msg.create_error_response("Telemetry not enabled")
+        return self._quic_telemetry_json_response(
+            msg, self.telemetry_cache.get_status(),
+        )
+
+    def _quic_handle_telemetry_nodes(
+        self, msg: 'QuicMessage',
+    ) -> 'QuicMessage':
+        """Handle TELEMETRY_NODES_REQUEST."""
+        if self.telemetry_cache is None:
+            return msg.create_error_response("Telemetry not enabled")
+        data = self.telemetry_cache.get_nodes()
+        if data is None:
+            return msg.create_error_response("No node data available")
+        return self._quic_telemetry_json_response(msg, data)
+
+    def _quic_handle_telemetry_epochs(
+        self, msg: 'QuicMessage',
+    ) -> 'QuicMessage':
+        """Handle TELEMETRY_EPOCHS_REQUEST."""
+        if self.telemetry_cache is None:
+            return msg.create_error_response("Telemetry not enabled")
+        return self._quic_telemetry_json_response(
+            msg, {"epochs": self.telemetry_cache.get_epochs()},
+        )
+
+    def _quic_handle_telemetry_block(
+        self, msg: 'QuicMessage',
+    ) -> 'QuicMessage':
+        """Handle TELEMETRY_BLOCK_REQUEST."""
+        if self.telemetry_cache is None:
+            return msg.create_error_response("Telemetry not enabled")
+        try:
+            params = json.loads(msg.payload.decode("utf-8"))
+            epoch = params["epoch"]
+            block_index = int(params["block_index"])
+        except (json.JSONDecodeError, KeyError, ValueError):
+            return msg.create_error_response("Invalid request payload")
+        data = self.telemetry_cache.get_block(epoch, block_index)
+        if data is None:
+            return msg.create_error_response(
+                f"Block {epoch}/{block_index} not found",
+            )
+        return self._quic_telemetry_json_response(msg, data)
+
+    def _quic_handle_telemetry_latest(
+        self, msg: 'QuicMessage',
+    ) -> 'QuicMessage':
+        """Handle TELEMETRY_LATEST_REQUEST."""
+        if self.telemetry_cache is None:
+            return msg.create_error_response("Telemetry not enabled")
+        data = self.telemetry_cache.get_latest()
+        if data is None:
+            return msg.create_error_response("No blocks available")
+        return self._quic_telemetry_json_response(msg, data)
 
     async def _can_reach_address(self, address: str, timeout: float) -> bool:
         """Check if we can reach a UDP address (for QUIC connectivity).
@@ -2032,6 +2709,29 @@ class NetworkNode(Node):
 
     async def _quic_handle_join(self, msg: QuicMessage, protocol: Any) -> QuicMessage:
         """Handle join request from a new node."""
+        # Check connection capacity before processing
+        if not self._load_monitor.should_accept_join():
+            # Suggest least-loaded alternative peers when at capacity
+            async with self.net_lock:
+                peer_keys = list(self.peers.keys())
+            alt_peers = self._get_least_loaded_peers(
+                exclude=set(), count=10, peer_list=peer_keys
+            )
+            self.logger.info(
+                f"Rejecting JOIN (overloaded or at capacity), "
+                f"suggesting {len(alt_peers)} alternative peers"
+            )
+            async with self.net_lock:
+                peers_snapshot = {
+                    h: self.peers[h].to_json()
+                    for h in alt_peers if h in self.peers
+                }
+            response_data = json.dumps({
+                "status": "at_capacity",
+                "peers": peers_snapshot,
+            })
+            return msg.create_response(response_data.encode('utf-8'))
+
         data = json.loads(msg.payload.decode('utf-8'))
         claimed_address = data.get("host")
         info_field = data.get("info")

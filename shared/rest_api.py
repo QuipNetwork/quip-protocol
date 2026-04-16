@@ -12,16 +12,19 @@ import os
 import ssl
 import struct
 import time
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 from aiohttp import web
 from aiohttp.web import middleware
 
+from shared.rate_limiter import PeerRateLimiter
 from shared.time_utils import utc_timestamp_float
+from shared.version import get_version
 
 if TYPE_CHECKING:
-    from shared.network_node import NetworkNode
     from shared.certificate_manager import CertificateManager
+    from shared.network_node import NetworkNode
+    from shared.telemetry_cache import TelemetryCache
 
 
 @middleware
@@ -78,19 +81,27 @@ class RestApiServer:
         tls_port: int = 443,
         cert_manager: Optional['CertificateManager'] = None,
         webroot: Optional[str] = None,
-        logger: Optional[logging.Logger] = None
+        logger: Optional[logging.Logger] = None,
+        telemetry_cache: Optional['TelemetryCache'] = None,
+        telemetry_access_token: str = "",
+        telemetry_rate_limit_rpm: int = 30,
+        telemetry_max_sse: int = 20,
     ):
         """
         Initialize the REST API server.
 
         Args:
-            network_node: The NetworkNode instance to expose
-            host: Host address to bind to
-            port: HTTP port (non-TLS)
-            tls_port: HTTPS port (TLS)
-            cert_manager: Certificate manager for TLS
-            webroot: Directory to serve static files from (for ACME challenges)
-            logger: Logger instance
+            network_node: The NetworkNode instance to expose.
+            host: Host address to bind to.
+            port: HTTP port (non-TLS).
+            tls_port: HTTPS port (TLS).
+            cert_manager: Certificate manager for TLS.
+            webroot: Directory for static files (ACME challenges).
+            logger: Logger instance.
+            telemetry_cache: TelemetryCache for telemetry endpoints.
+            telemetry_access_token: Bearer token for telemetry (empty=open).
+            telemetry_rate_limit_rpm: Requests/minute per IP for telemetry.
+            telemetry_max_sse: Max concurrent SSE connections.
         """
         self.node = network_node
         self.host = host
@@ -100,13 +111,30 @@ class RestApiServer:
         self.webroot = webroot
         self.logger = logger or logging.getLogger(__name__)
 
+        # Telemetry API
+        self._telemetry_cache = telemetry_cache
+        self._telemetry_token = telemetry_access_token
+        tokens_per_sec = telemetry_rate_limit_rpm / 60.0
+        self._telemetry_rate_limiter = PeerRateLimiter(
+            tokens_per_second=tokens_per_sec,
+            max_burst=max(int(tokens_per_sec * 5), 3),
+        )
+        self._telemetry_max_sse = telemetry_max_sse
+        self._sse_clients: List[web.StreamResponse] = []
+        self._rate_limit_prune_task: Optional[asyncio.Task] = None
+
         self._http_runner: Optional[web.AppRunner] = None
         self._https_runner: Optional[web.AppRunner] = None
         self._app: Optional[web.Application] = None
 
     def _create_app(self) -> web.Application:
         """Create and configure the aiohttp application."""
-        app = web.Application(middlewares=[cors_middleware, error_middleware])
+        middlewares = [cors_middleware, error_middleware]
+        if self._telemetry_cache is not None:
+            middlewares.append(self._telemetry_auth_middleware)
+            middlewares.append(self._telemetry_rate_limit_middleware)
+
+        app = web.Application(middlewares=middlewares)
 
         # Health check
         app.router.add_get("/health", self.handle_health)
@@ -124,6 +152,28 @@ class RestApiServer:
         app.router.add_post("/api/v1/solve", self.handle_solve)
         app.router.add_post("/api/v1/heartbeat", self.handle_heartbeat)
 
+        # Telemetry API v1 routes
+        if self._telemetry_cache is not None:
+            app.router.add_get(
+                "/api/v1/telemetry/status", self.handle_telemetry_status,
+            )
+            app.router.add_get(
+                "/api/v1/telemetry/nodes", self.handle_telemetry_nodes,
+            )
+            app.router.add_get(
+                "/api/v1/telemetry/epochs", self.handle_telemetry_epochs,
+            )
+            app.router.add_get(
+                "/api/v1/telemetry/epochs/{epoch}/blocks/{block_index}",
+                self.handle_telemetry_block,
+            )
+            app.router.add_get(
+                "/api/v1/telemetry/latest", self.handle_telemetry_latest,
+            )
+            app.router.add_get(
+                "/api/v1/telemetry/stream", self.handle_telemetry_stream,
+            )
+
         # Static file hosting (ACME HTTP-01 challenges, etc.)
         if self.webroot and os.path.isdir(self.webroot):
             well_known = os.path.join(self.webroot, ".well-known")
@@ -139,6 +189,14 @@ class RestApiServer:
     async def start(self) -> None:
         """Start the REST API server."""
         self._app = self._create_app()
+
+        # Wire SSE push from telemetry cache
+        if self._telemetry_cache is not None:
+            self._telemetry_cache.on_new_block = self._sse_push_block
+            self._telemetry_cache.on_nodes_changed = self._sse_push_nodes
+            self._rate_limit_prune_task = asyncio.create_task(
+                self._prune_rate_limiter_loop(),
+            )
 
         # Start HTTP server (always)
         self._http_runner = web.AppRunner(self._app)
@@ -173,6 +231,17 @@ class RestApiServer:
 
     async def stop(self) -> None:
         """Stop the REST API server."""
+        if self._rate_limit_prune_task and not self._rate_limit_prune_task.done():
+            self._rate_limit_prune_task.cancel()
+
+        # Close SSE connections
+        for client in list(self._sse_clients):
+            try:
+                await client.write_eof()
+            except Exception:
+                pass
+        self._sse_clients.clear()
+
         if self._http_runner:
             await self._http_runner.cleanup()
             self._http_runner = None
@@ -219,7 +288,7 @@ class RestApiServer:
         return self._success_response({
             "status": "healthy",
             "node_running": self.node.running,
-            "version": self.node.info().version if self.node.running else "unknown"
+            "version": get_version()
         })
 
     async def handle_status(self, request: web.Request) -> web.Response:
@@ -537,32 +606,277 @@ class RestApiServer:
 
     def _block_to_dict(self, block) -> dict:
         """Convert a Block to a JSON-serializable dict."""
-        return {
+        result = {
             "header": self._header_to_dict(block.header),
+            "miner_info": json.loads(block.miner_info.to_json()) if block.miner_info else None,
+            "quantum_proof": {
+                "energy": block.quantum_proof.energy,
+                "diversity": block.quantum_proof.diversity,
+                "num_valid_solutions": block.quantum_proof.num_valid_solutions,
+                "mining_time": block.quantum_proof.mining_time,
+                "nonce": block.quantum_proof.nonce,
+            } if block.quantum_proof else None,
+            "next_block_requirements": {
+                "difficulty_energy": block.next_block_requirements.difficulty_energy,
+                "min_diversity": block.next_block_requirements.min_diversity,
+                "min_solutions": block.next_block_requirements.min_solutions,
+            } if block.next_block_requirements else None,
             "transactions": [
                 {
                     "transaction_id": tx.transaction_id,
                     "timestamp": tx.timestamp,
                     "num_samples": tx.num_samples,
                     "samples_count": len(tx.samples) if tx.samples else 0,
-                    "energy_range": [min(tx.energies), max(tx.energies)] if tx.energies else None
+                    "energy_range": [min(tx.energies), max(tx.energies)] if tx.energies else None,
                 }
                 for tx in (block.transactions or [])
             ],
-            "signature_hex": block.signature.hex() if block.signature else None
+            "hash": block.hash.hex() if block.hash else None,
+            "signature": block.signature.hex() if block.signature else None,
         }
+        return result
 
     def _header_to_dict(self, header) -> dict:
         """Convert a BlockHeader to a JSON-serializable dict."""
         return {
             "index": header.index,
             "timestamp": header.timestamp,
-            "prev_hash_hex": header.prev_hash.hex() if header.prev_hash else None,
-            "pow_hash_hex": header.pow_hash.hex() if header.pow_hash else None,
-            "merkle_root_hex": header.merkle_root.hex() if header.merkle_root else None,
-            "miner_info": json.loads(header.miner_info.to_json()) if header.miner_info else None,
-            "pow_difficulty": header.pow_difficulty,
-            "pow_energy": header.pow_energy,
-            "diversity": header.diversity,
-            "num_solutions": header.num_solutions
+            "previous_hash": header.previous_hash.hex() if header.previous_hash else None,
+            "data_hash": header.data_hash.hex() if header.data_hash else None,
+            "version": header.version,
         }
+
+    # ------------------------------------------------------------------
+    # Telemetry middleware (scoped to /api/v1/telemetry/ routes)
+    # ------------------------------------------------------------------
+
+    @middleware
+    async def _telemetry_auth_middleware(
+        self, request: web.Request, handler,
+    ) -> web.Response:
+        """Check bearer token for telemetry endpoints."""
+        if not request.path.startswith("/api/v1/telemetry/"):
+            return await handler(request)
+        if not self._telemetry_token:
+            return await handler(request)
+        auth = request.headers.get("Authorization", "")
+        if auth == f"Bearer {self._telemetry_token}":
+            return await handler(request)
+        return self._error_response("Unauthorized", "UNAUTHORIZED", 401)
+
+    @middleware
+    async def _telemetry_rate_limit_middleware(
+        self, request: web.Request, handler,
+    ) -> web.Response:
+        """Per-IP token-bucket rate limit for telemetry endpoints."""
+        if not request.path.startswith("/api/v1/telemetry/"):
+            return await handler(request)
+        key = request.remote or "unknown"
+        if not self._telemetry_rate_limiter.allow(key):
+            return web.json_response(
+                {
+                    "success": False,
+                    "error": "Rate limit exceeded",
+                    "code": "RATE_LIMITED",
+                    "timestamp": int(time.time()),
+                },
+                status=429,
+            )
+        return await handler(request)
+
+    async def _prune_rate_limiter_loop(self) -> None:
+        """Periodically prune stale rate-limiter buckets."""
+        try:
+            while True:
+                await asyncio.sleep(300)
+                self._telemetry_rate_limiter.prune()
+        except asyncio.CancelledError:
+            pass
+
+    # ------------------------------------------------------------------
+    # Telemetry ETag helpers
+    # ------------------------------------------------------------------
+
+    def _check_etag(
+        self, request: web.Request, etag: str,
+    ) -> Optional[web.Response]:
+        """Return 304 response if client ETag matches, else None."""
+        if not etag:
+            return None
+        if_none_match = request.headers.get("If-None-Match", "")
+        if if_none_match == f'"{etag}"':
+            return web.Response(status=304)
+        return None
+
+    def _etag_response(self, data: Any, etag: str) -> web.Response:
+        """Success response with ETag header."""
+        resp = web.json_response({
+            "success": True,
+            "data": data,
+            "timestamp": int(time.time()),
+        })
+        if etag:
+            resp.headers["ETag"] = f'"{etag}"'
+        return resp
+
+    # ------------------------------------------------------------------
+    # Telemetry REST handlers
+    # ------------------------------------------------------------------
+
+    async def handle_telemetry_status(
+        self, request: web.Request,
+    ) -> web.Response:
+        """GET /api/v1/telemetry/status"""
+        cache = self._telemetry_cache
+        if cache is None:
+            return self._error_response(
+                "Telemetry not enabled", "TELEMETRY_DISABLED", 503,
+            )
+        etag = cache.status_etag()
+        not_modified = self._check_etag(request, etag)
+        if not_modified:
+            return not_modified
+        return self._etag_response(cache.get_status(), etag)
+
+    async def handle_telemetry_nodes(
+        self, request: web.Request,
+    ) -> web.Response:
+        """GET /api/v1/telemetry/nodes"""
+        cache = self._telemetry_cache
+        if cache is None:
+            return self._error_response(
+                "Telemetry not enabled", "TELEMETRY_DISABLED", 503,
+            )
+        data = cache.get_nodes()
+        if data is None:
+            return self._error_response(
+                "No node data available", "NO_DATA", 404,
+            )
+        etag = cache.nodes_etag()
+        not_modified = self._check_etag(request, etag)
+        if not_modified:
+            return not_modified
+        return self._etag_response(data, etag)
+
+    async def handle_telemetry_epochs(
+        self, request: web.Request,
+    ) -> web.Response:
+        """GET /api/v1/telemetry/epochs"""
+        cache = self._telemetry_cache
+        if cache is None:
+            return self._error_response(
+                "Telemetry not enabled", "TELEMETRY_DISABLED", 503,
+            )
+        return self._success_response({"epochs": cache.get_epochs()})
+
+    async def handle_telemetry_block(
+        self, request: web.Request,
+    ) -> web.Response:
+        """GET /api/v1/telemetry/epochs/{epoch}/blocks/{block_index}"""
+        cache = self._telemetry_cache
+        if cache is None:
+            return self._error_response(
+                "Telemetry not enabled", "TELEMETRY_DISABLED", 503,
+            )
+        epoch = request.match_info["epoch"]
+        try:
+            block_index = int(request.match_info["block_index"])
+        except ValueError:
+            return self._error_response(
+                "Invalid block index", "INVALID_BLOCK_INDEX",
+            )
+        data = cache.get_block(epoch, block_index)
+        if data is None:
+            return self._error_response(
+                f"Block {epoch}/{block_index} not found",
+                "BLOCK_NOT_FOUND",
+                404,
+            )
+        etag = cache.block_etag(data)
+        not_modified = self._check_etag(request, etag)
+        if not_modified:
+            return not_modified
+        return self._etag_response(data, etag)
+
+    async def handle_telemetry_latest(
+        self, request: web.Request,
+    ) -> web.Response:
+        """GET /api/v1/telemetry/latest"""
+        cache = self._telemetry_cache
+        if cache is None:
+            return self._error_response(
+                "Telemetry not enabled", "TELEMETRY_DISABLED", 503,
+            )
+        data = cache.get_latest()
+        if data is None:
+            return self._error_response(
+                "No blocks available", "NO_BLOCKS", 404,
+            )
+        etag = cache.block_etag(data.get("block", {}))
+        not_modified = self._check_etag(request, etag)
+        if not_modified:
+            return not_modified
+        return self._etag_response(data, etag)
+
+    # ------------------------------------------------------------------
+    # SSE (Server-Sent Events)
+    # ------------------------------------------------------------------
+
+    async def handle_telemetry_stream(
+        self, request: web.Request,
+    ) -> web.StreamResponse:
+        """GET /api/v1/telemetry/stream — SSE endpoint."""
+        if len(self._sse_clients) >= self._telemetry_max_sse:
+            return self._error_response(
+                "Too many SSE connections", "SSE_LIMIT", 429,
+            )
+
+        resp = web.StreamResponse()
+        resp.content_type = "text/event-stream"
+        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["X-Accel-Buffering"] = "no"
+        await resp.prepare(request)
+
+        self._sse_clients.append(resp)
+        try:
+            # Keep connection alive until client disconnects
+            while True:
+                await asyncio.sleep(15)
+                # Send keepalive comment
+                try:
+                    await resp.write(b":keepalive\n\n")
+                except (ConnectionResetError, ConnectionAbortedError):
+                    break
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if resp in self._sse_clients:
+                self._sse_clients.remove(resp)
+        return resp
+
+    def _sse_push_block(
+        self, epoch: str, block_index: int, data: dict,
+    ) -> None:
+        """Push a new-block event to all SSE clients."""
+        payload = json.dumps({
+            "epoch": epoch, "block_index": block_index, "block": data,
+        })
+        msg = f"event: block\ndata: {payload}\n\n".encode("utf-8")
+        self._sse_broadcast(msg)
+
+    def _sse_push_nodes(self, data: dict) -> None:
+        """Push a nodes-changed event to all SSE clients."""
+        payload = json.dumps(data)
+        msg = f"event: nodes\ndata: {payload}\n\n".encode("utf-8")
+        self._sse_broadcast(msg)
+
+    def _sse_broadcast(self, msg: bytes) -> None:
+        """Write an SSE message to all connected clients."""
+        dead: List[web.StreamResponse] = []
+        for client in self._sse_clients:
+            try:
+                asyncio.ensure_future(client.write(msg))
+            except Exception:
+                dead.append(client)
+        for client in dead:
+            self._sse_clients.remove(client)

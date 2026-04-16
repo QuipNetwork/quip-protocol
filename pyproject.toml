@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quip-protocol"
-version = "0.0.8"
+version = "0.1.0"
 description = "Quantum Proof-of-Work Blockchain Implementation"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,6 +25,12 @@ dependencies = [
 [project.optional-dependencies]
 # CPU mode - lightweight, no GPU dependencies
 cpu = []
+
+# Performance optimizations for networking (optional)
+fast = [
+    "pyzmq>=25.0.0",
+    "uvloop>=0.19.0; sys_platform != 'win32'",
+]
 
 # CUDA mode - NVIDIA GPU support (matches PyTorch CUDA 12)
 cuda = [

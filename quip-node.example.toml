@@ -58,6 +58,14 @@ http_log = "logs/quip-node-http.log"  # Path to HTTP/aiohttp log file (optional,
 telemetry_enabled = true   # Write telemetry files (nodes.json, per-block stats)
 telemetry_dir = "telemetry"  # Directory for telemetry output
 
+# Telemetry stream API - exposes telemetry data via REST + QUIC for indexers
+[telemetry_api]
+# enabled = true                  # Defaults to telemetry_enabled value
+# access_token = ""               # Bearer token for REST auth (empty = open access)
+# rate_limit_rpm = 30             # Requests per minute per IP
+# max_sse_connections = 20        # Max concurrent SSE connections
+# cache_refresh_interval = 5.0    # Seconds between telemetry dir scans
+
 # if any of the following are defined then they will be spun up as miner processes to mine blocks.
 # By default a single CPU miner is created.
 

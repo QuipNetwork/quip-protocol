@@ -82,6 +82,8 @@ All settings live in `/data/config.toml` (source of truth). ENV vars override th
 | `QUIP_NODE_NAME` | `node_name` | (hostname) | Human-readable node name |
 | `QUIP_AUTO_MINE` | `auto_mine` | `false` | Enable auto-mining |
 | `QUIP_PEERS` | `peer` | (see default peers below) | Comma-separated peer list (TOML uses array) |
+| `QUIP_REST_INSECURE_PORT` | `rest_insecure_port` | `-1` (disabled) | HTTP REST API port (set > 0 to enable) |
+| `QUIP_REST_HOST` | `rest_host` | `0.0.0.0` | REST API bind address |
 | `CERT_EMAIL` | (unset) | ACME email — enables certbot when set with a DNS domain |
 | `CERT_CHALLENGE` | (unset→http) | `http` (port 80) or `dns` |
 | `CERT_DNS_PLUGIN` | (unset) | cloudflare, route53, google, digitalocean, ovh, rfc2136 |
@@ -156,6 +158,41 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 
 ```bash
 docker-compose up cpu-bootstrap cpu-node-2
+```
+
+## Local 3-Node Testing with REST API
+
+A dedicated compose file runs 3 CPU nodes with REST API enabled for telemetry testing:
+
+```bash
+# Build and start
+docker compose -f docker/docker-compose.local.yml up --build -d
+
+# Run telemetry tests
+bash docker/test-rest-telemetry.sh
+
+# View logs
+docker compose -f docker/docker-compose.local.yml logs -f
+
+# Tear down (removes volumes)
+docker compose -f docker/docker-compose.local.yml down -v
+```
+
+**REST API endpoints (HTTP):**
+
+| Node | REST URL | QUIC Port |
+|------|----------|-----------|
+| bootstrap | http://localhost:20050 | 20049 |
+| node-2 | http://localhost:20051 | internal |
+| node-3 | http://localhost:20052 | internal |
+
+**Manual testing:**
+```bash
+curl http://localhost:20050/health
+curl http://localhost:20050/api/v1/status
+curl http://localhost:20050/api/v1/stats
+curl http://localhost:20050/api/v1/peers
+curl http://localhost:20050/api/v1/block/latest
 ```
 
 ## Configuration Files
