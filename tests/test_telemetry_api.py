@@ -16,10 +16,7 @@ from shared.telemetry_cache import TelemetryCache
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _write_json(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f)
+from _utils import write_json as _write_json  # noqa: E402
 
 
 def _make_block_json(block_index, epoch_ts):
