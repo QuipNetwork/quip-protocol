@@ -69,7 +69,12 @@ def node_with_secrets(sensitive_miners_config):
         genesis_block=genesis,
         secret="dev-seed",
     )
-    yield node
+    try:
+        yield node
+    finally:
+        # Without this, the QueueListener thread and MinerHandle child
+        # processes leak and block pytest from exiting at session end.
+        node.close()
 
 
 def _assert_no_secrets(blob: str):
