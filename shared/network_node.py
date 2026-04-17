@@ -32,6 +32,13 @@ from shared.node_client import (
     generate_self_signed_cert, QUIP_ALPN_PROTOCOL, MAX_DATAGRAM_FRAME_SIZE,
     MAX_DATAGRAM_MESSAGE_SIZE,
 )
+from shared.sync_messages import (
+    MAX_MANIFEST_ENTRIES,
+    decode_block_by_hash_request,
+    decode_manifest_request,
+    encode_block_by_hash_response,
+    encode_manifest_response,
+)
 from aioquic.asyncio import serve
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.quic.configuration import QuicConfiguration
@@ -290,6 +297,11 @@ class NetworkNode(Node):
             "gpu-2.quip.carback.us:20050",
             "nodes.quip.network:20049",
         ])
+        # A node listing its own public address as a peer makes it
+        # try to JOIN itself, fail validation, and backlist its own
+        # loopback address. Strip at config load — and again after
+        # public IP auto-detection below — so the ban list stays clean.
+        self.initial_peers = self._filter_self_from_peers(self.initial_peers)
         self.fanout = int(config.get("fanout", 3))
         self.max_connections = int(config.get("max_connections", 50))
 
@@ -532,6 +544,9 @@ class NetworkNode(Node):
                 self.logger.info(
                     f"Auto-detected public IP: {old} -> {self.public_host}"
                 )
+                # Re-filter in case the auto-detected public address is
+                # sitting in the initial peer list.
+                self.initial_peers = self._filter_self_from_peers(self.initial_peers)
             else:
                 self.logger.warning(
                     f"Could not detect public IP, using {self.public_host}"
@@ -1403,7 +1418,8 @@ class NetworkNode(Node):
                 self.telemetry.set_epoch_timestamp(None)
 
                 # Reset to original genesis block (no more new genesis creation)
-                self.chain = [self.genesis_block]
+                self._index_truncate(0)
+                self._index_append(self.genesis_block)
                 self.logger.info("Chain reset to genesis block completed")
             
             # Reset synchronization state if it exists (only after start() is called)
@@ -1702,7 +1718,10 @@ class NetworkNode(Node):
         synchronizer = BlockSynchronizer(
             node_client=self.node_client,
             receive_block_queue=self.block_processing_queue,
-            logger=self.logger
+            local_tip=self.get_latest_block,
+            local_locator=self.build_locator,
+            local_get_block_by_hash=self.get_block_by_hash,
+            logger=self.logger,
         )
 
         result = await synchronizer.sync_blocks(start_index, end_index)
@@ -2388,6 +2407,11 @@ class NetworkNode(Node):
                 return await self._quic_handle_ihave(msg)
             elif msg.msg_type == QuicMessageType.IWANT:
                 return await self._quic_handle_iwant(msg)
+            # Fork-aware sync: manifest + content-addressed block fetch
+            elif msg.msg_type == QuicMessageType.CHAIN_MANIFEST_REQUEST:
+                return await self._quic_handle_chain_manifest_request(msg)
+            elif msg.msg_type == QuicMessageType.BLOCK_BY_HASH_REQUEST:
+                return await self._quic_handle_block_by_hash_request(msg)
             # Telemetry stream API
             elif msg.msg_type == QuicMessageType.TELEMETRY_STATUS_REQUEST:
                 return self._quic_handle_telemetry_status(msg)
@@ -2741,6 +2765,40 @@ class NetworkNode(Node):
         host = self._normalize_ip(host)
         return host, port
 
+    def _is_self_address(self, address: str) -> bool:
+        """True when ``address`` refers to this node's own public host:port.
+
+        Compares by parsed ``(host, port)`` tuples so that
+        ``127.0.0.1:20049`` matches whether it's written with or
+        without IPv6 brackets, and hostnames match case-insensitively.
+        Returns False for malformed inputs rather than raising — the
+        filter is a best-effort tidy-up, not a validation step.
+        """
+        try:
+            addr_host, addr_port = self._extract_peer_ip_port(address)
+            self_host, self_port = self._extract_peer_ip_port(self.public_host)
+        except (ValueError, TypeError):
+            return False
+        if addr_port != self_port:
+            return False
+        return addr_host.lower() == self_host.lower()
+
+    def _filter_self_from_peers(self, peers: list[str]) -> list[str]:
+        """Drop entries from ``peers`` that refer to this node itself.
+
+        Leaving ``public_host`` in the peer list drives a node to
+        attempt JOINing itself, which fails validation and pollutes
+        the local ban list with its own loopback address.
+        """
+        filtered = [p for p in peers if not self._is_self_address(p)]
+        dropped = len(peers) - len(filtered)
+        if dropped > 0:
+            self.logger.info(
+                f"Filtered {dropped} self-reference(s) from peer list "
+                f"(local public address: {self.public_host})"
+            )
+        return filtered
+
     async def _validate_peer_address(
         self, claimed: str, real_peer_addr: str, timeout: float = 2.0
     ) -> str:
@@ -3059,6 +3117,60 @@ class NetworkNode(Node):
 
         # Return header in network binary format
         return msg.create_response(block.header.to_network())
+
+    async def _quic_handle_chain_manifest_request(self, msg: QuicMessage) -> QuicMessage:
+        """Return a slice of our canonical chain as ``(index, hash)`` tuples.
+
+        The client sends a Bitcoin-style locator. We find the latest
+        hash in that locator that is still on our canonical chain
+        (O(1) per entry via ``chain_by_hash``), then return canonical
+        entries starting from the next index, up to ``limit`` or our
+        current tip — whichever is smaller.
+
+        Returns an empty manifest when no locator hash matches our
+        canonical chain (divergent genesis, or the client is a
+        reorg'd-away fork we don't share). The client treats that as
+        "no useful data here" and demotes the peer for the session.
+        """
+        try:
+            locator, limit = decode_manifest_request(msg.payload)
+        except ValueError as e:
+            return msg.create_error_response(f"malformed manifest request: {e}")
+
+        start_after = -1
+        for h in locator:
+            block = self.chain_by_hash.get(h)
+            if block is not None:
+                start_after = block.header.index
+                break
+
+        entries: list = []
+        if start_after >= 0:
+            first_idx = start_after + 1
+            tip_idx = self.get_latest_block().header.index
+            capped_limit = min(limit, MAX_MANIFEST_ENTRIES)
+            last_idx = min(tip_idx, first_idx + capped_limit - 1)
+            for i in range(first_idx, last_idx + 1):
+                blk = self.chain[i]
+                if blk.hash is None:
+                    # Canonical-chain blocks are expected to be finalized;
+                    # bail out rather than sending a partial manifest.
+                    break
+                entries.append((i, blk.hash))
+
+        return msg.create_response(encode_manifest_response(entries))
+
+    async def _quic_handle_block_by_hash_request(self, msg: QuicMessage) -> QuicMessage:
+        """Return a canonical-chain block by hash, or empty for NOT_FOUND."""
+        try:
+            block_hash = decode_block_by_hash_request(msg.payload)
+        except ValueError as e:
+            return msg.create_error_response(
+                f"malformed block-by-hash request: {e}"
+            )
+
+        block = self.get_block_by_hash(block_hash)
+        return msg.create_response(encode_block_by_hash_response(block))
 
     async def _quic_handle_solve(self, msg: QuicMessage) -> QuicMessage:
         """Handle quantum annealing solve request."""

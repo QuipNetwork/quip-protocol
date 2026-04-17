@@ -1,419 +1,561 @@
+"""Fork-aware block synchronizer.
+
+Each call to :py:meth:`BlockSynchronizer.sync_blocks` runs four phases
+against one peer-advertised tip at a time:
+
+1. **Tip discovery** — survey every reachable peer for its latest
+   block, group peers by head hash, rank groups by
+   ``(height desc, peer_count desc, head_hash asc)``.
+2. **Manifest fetch** — pick the best group, pull a Bitcoin-style
+   ``(index, hash)`` manifest from up to two peers in it, cross-check
+   overlapping entries, and paginate forward until the pinned head is
+   covered.
+3. **Block download** — fetch every manifest block via
+   ``GET_BLOCK_BY_HASH`` in shuffled order and verify each response's
+   index, own hash, and ``previous_hash`` linkage against the manifest
+   (with the first entry's parent checked against the local chain).
+4. **Commit** — hand blocks to the node's block processing queue in
+   ascending index order, awaiting each future so the final gate is
+   the existing ``Node.check_block`` validation path.
+
+If any phase fails against the pinned group — manifest disagreement,
+all peers exhausted into the session backoff set, linkage error — the
+group is dropped and the next candidate is tried. The backoff set is
+local to one sync session; a peer demoted for group A stays demoted
+for group B within the same session.
+
+The synchronizer runs entirely inside a single asyncio event loop;
+concurrency is bounded by ``max_in_flight``.
+"""
+
 import asyncio
-import multiprocessing as mp
-import queue
-import random
-import signal
-import time
 import logging
+import random
+import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from shared.block import Block
 from shared.node_client import NodeClient
-import os
+from shared.sync_messages import MAX_MANIFEST_ENTRIES
+
+# Timeout for a single peer's tip-survey request. Kept short so slow
+# peers don't stall the whole ranking phase.
+TIP_SURVEY_TIMEOUT_SECONDS = 5.0
+
+# Timeout for awaiting a single block's acceptance through the node's
+# block processing queue.
+COMMIT_TIMEOUT_SECONDS = 30.0
+
+
+@dataclass
+class TipGroup:
+    """Set of peers advertising the same canonical chain head."""
+
+    height: int
+    head_hash: bytes
+    peers: List[str]
+
+    def __repr__(self) -> str:  # pragma: no cover - debug-only formatting
+        return (
+            f"TipGroup(height={self.height}, peers={len(self.peers)}, "
+            f"head={self.head_hash.hex()[:8]})"
+        )
 
 
 @dataclass
 class SyncResult:
-    """Result of a block synchronization attempt.
-
-    ``success`` is True only when every requested block was downloaded
-    and handed off for validation. Partial progress on a timed-out sync
-    is reported via ``downloaded``/``requested`` but must not set
-    ``success=True`` — callers rely on that flag to decide whether to
-    mark the node synchronized and resume mining.
-    """
+    """Outcome of one sync attempt."""
 
     success: bool
+    target_height: Optional[int] = None
+    target_hash: Optional[bytes] = None
+    committed: int = 0
     requested: int = 0
     downloaded: int = 0
     failed_block: Optional[int] = None
     elapsed: float = 0.0
-    per_peer_downloads: Dict[str, int] = field(default_factory=dict)
+    reason: Optional[str] = None
+    groups_tried: int = 0
+    peers_backed_off: int = 0
 
     def summary(self) -> str:
         if self.success:
             return (
-                f"Synced {self.downloaded}/{self.requested} blocks "
-                f"in {self.elapsed:.1f}s"
-            )
-        if self.failed_block is None:
-            return (
-                f"Sync incomplete: {self.downloaded}/{self.requested} "
-                f"downloaded in {self.elapsed:.1f}s"
+                f"Synced {self.committed} blocks to height "
+                f"{self.target_height} in {self.elapsed:.1f}s"
             )
         return (
-            f"Sync failed at block {self.failed_block}: "
-            f"{self.downloaded}/{self.requested} downloaded "
-            f"in {self.elapsed:.1f}s"
+            f"Sync failed after {self.groups_tried} tip group(s): "
+            f"{self.reason or 'unknown'}"
         )
 
 
 class BlockSynchronizer:
-    """Multiprocessing block synchronizer with producer/consumer pattern."""
+    """Fork-aware block synchronizer that commits to one peer tip per run."""
 
-    def __init__(self,
-                 node_client: NodeClient,
-                 receive_block_queue: asyncio.Queue,
-                 logger: Optional[logging.Logger] = None,
-                 max_workers: Optional[int] = None):
+    # Upper bound on pagination rounds during manifest fetch. Each round
+    # returns up to ``MAX_MANIFEST_ENTRIES`` entries, so this caps a
+    # single sync at roughly 2048 * MAX_MANIFEST_PAGES blocks — plenty
+    # of headroom for foreseeable chain lengths.
+    MAX_MANIFEST_PAGES = 512
+
+    # Max per-block retries before aborting phase 3 for the current group.
+    MAX_BLOCK_RETRIES = 3
+
+    def __init__(
+        self,
+        node_client: NodeClient,
+        receive_block_queue: asyncio.Queue,
+        local_tip: Callable[[], Block],
+        local_locator: Callable[[], List[bytes]],
+        local_get_block_by_hash: Callable[[bytes], Optional[Block]],
+        logger: Optional[logging.Logger] = None,
+        max_in_flight: int = 32,
+    ):
         """
-        Initialize BlockSynchronizer.
-
         Args:
-            node_client: NodeClient for peer communication
-            receive_block_queue: Callback to process/validate blocks
-            logger: Logger instance
-            max_workers: Max number of worker processes (default: min(30, cpu_count))
+            node_client: QUIC client carrying the current peer set.
+            receive_block_queue: ``asyncio.Queue`` the node's block
+                processor consumes; items are
+                ``(block, future, force_reorg, source)`` tuples.
+            local_tip: Returns the local chain's latest ``Block``.
+            local_locator: Returns a tip-first locator of local block
+                hashes (see ``shared.node.Node.build_locator``).
+            local_get_block_by_hash: Lookup function over the local
+                canonical chain; used to verify the first manifest
+                entry's parent hash is a block we actually hold.
+            logger: Logger instance (defaults to module logger).
+            max_in_flight: Upper bound on concurrent block-by-hash
+                requests during phase 3.
         """
         self.node_client = node_client
         self.receive_block_queue = receive_block_queue
+        self.local_tip = local_tip
+        self.local_locator = local_locator
+        self.local_get_block_by_hash = local_get_block_by_hash
         self.logger = logger or logging.getLogger(__name__)
-        self.max_workers = max_workers or min(30, mp.cpu_count())
-        
-    async def sync_blocks(self, start_index: int, end_index: int) -> SyncResult:
-        """
-        Synchronize blocks from start_index to end_index using multiprocessing.
+        self.max_in_flight = max_in_flight
 
-        Returns:
-            SyncResult with download counts and timing.
-        """
-        if start_index > end_index:
-            return SyncResult(success=True)
+    async def sync_blocks(
+        self,
+        start_index: int = 1,
+        end_index: int = 0,
+    ) -> SyncResult:
+        """Run one fork-aware sync attempt.
 
-        total_blocks = end_index - start_index + 1
-        self.logger.debug(f"Syncing chain from {start_index} to {end_index} ({total_blocks} blocks)...")
+        ``start_index`` is ignored — the common ancestor is derived from
+        the local locator. ``end_index``, if non-zero, is treated as an
+        upper-bound hint: tips reporting a height strictly greater than
+        this are skipped to avoid runaway downloads against a buggy or
+        hostile peer.
+        """
         t0 = time.monotonic()
-        
-        # Use multiprocessing queues for communication between processes
-        download_queue = mp.Queue()
-        completed_queue = mp.Queue()
-        
-        # Initialize download queue with block numbers
-        for block_number in range(start_index, end_index + 1):
-            download_queue.put(block_number)
-            
-        # Calculate optimal number of producer processes
-        num_producers = min(self.max_workers, len(self.node_client.peers), end_index - start_index + 1)
-        num_producers = max(1, num_producers)  # At least 1 producer
-        
-        producer_processes = []
-        try:
-            # Create shared data for worker processes
-            peers_list = list(self.node_client.peers.keys())
-            
-            # Start producer processes
-            self.logger.debug(f"🚀 Starting {num_producers} producer processes for concurrent downloads")
-            for i in range(num_producers):
-                p = mp.Process(
-                    target=self._producer_worker,
-                    args=(download_queue, completed_queue, peers_list, self.node_client.node_timeout)
-                )
-                p.start()
-                producer_processes.append(p)
-                self.logger.debug(f"🔧 Started producer process {p.pid} ({i+1}/{num_producers})")
-                
-            # Run consumer in main process to handle block validation
-            result = await self._consumer_async(
-                completed_queue, start_index, end_index, download_queue,
-            )
-            result.requested = total_blocks
-            result.elapsed = time.monotonic() - t0
+        local_tip = self.local_tip()
+        local_height = local_tip.header.index
 
-            if result.success:
-                self.logger.debug(
-                    "Synced %d/%d blocks in %.1fs",
-                    result.downloaded, total_blocks, result.elapsed,
-                )
-            else:
-                self.logger.error(
-                    "Sync failed at block %s: %d/%d downloaded in %.1fs",
-                    result.failed_block, result.downloaded,
-                    total_blocks, result.elapsed,
-                )
-
-            return result
-
-        except KeyboardInterrupt:
-            self.logger.warning("Block synchronization interrupted by user")
+        candidates = await self._discover_tips(
+            local_height=local_height,
+            max_height_hint=end_index if end_index > 0 else None,
+        )
+        if not candidates:
             return SyncResult(
-                success=False, requested=total_blocks,
+                success=True,
                 elapsed=time.monotonic() - t0,
+                reason="no peer advertises a longer chain",
+            )
+
+        peer_backoff: Set[str] = set()
+        groups_tried = 0
+
+        for original in candidates:
+            groups_tried += 1
+            live_peers = [p for p in original.peers if p not in peer_backoff]
+            if not live_peers:
+                self.logger.info(
+                    f"Skipping {original}: all peers already backed off"
+                )
+                continue
+            group = TipGroup(original.height, original.head_hash, live_peers)
+            self.logger.info(
+                f"Pinning {group} (candidate {groups_tried}/{len(candidates)})"
+            )
+
+            manifest = await self._fetch_manifest(group, peer_backoff)
+            if manifest is None or not manifest:
+                self.logger.warning(
+                    f"Manifest fetch failed for {group}; trying next group"
+                )
+                continue
+
+            downloaded = await self._download_blocks(group, manifest, peer_backoff)
+            if downloaded is None:
+                self.logger.warning(
+                    f"Block download failed for {group}; trying next group"
+                )
+                continue
+
+            committed, failed_idx = await self._commit(manifest, downloaded)
+            if failed_idx is not None:
+                return SyncResult(
+                    success=False,
+                    target_height=group.height,
+                    target_hash=group.head_hash,
+                    requested=len(manifest),
+                    downloaded=len(downloaded),
+                    committed=committed,
+                    failed_block=failed_idx,
+                    elapsed=time.monotonic() - t0,
+                    reason=f"commit rejected block {failed_idx}",
+                    groups_tried=groups_tried,
+                    peers_backed_off=len(peer_backoff),
+                )
+
+            return SyncResult(
+                success=True,
+                target_height=group.height,
+                target_hash=group.head_hash,
+                requested=len(manifest),
+                downloaded=len(downloaded),
+                committed=committed,
+                elapsed=time.monotonic() - t0,
+                groups_tried=groups_tried,
+                peers_backed_off=len(peer_backoff),
+            )
+
+        return SyncResult(
+            success=False,
+            elapsed=time.monotonic() - t0,
+            reason=f"all {groups_tried} tip groups exhausted",
+            groups_tried=groups_tried,
+            peers_backed_off=len(peer_backoff),
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 1 — tip discovery
+    # ------------------------------------------------------------------
+
+    async def _discover_tips(
+        self,
+        local_height: int,
+        max_height_hint: Optional[int],
+    ) -> List[TipGroup]:
+        """Query every peer for its tip and group peers by head hash."""
+        peers = list(self.node_client.peers.keys())
+        if not peers:
+            return []
+
+        tasks = [self._fetch_peer_tip(peer) for peer in peers]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        groups: Dict[bytes, TipGroup] = {}
+        for peer, result in zip(peers, results):
+            if isinstance(result, Exception) or result is None:
+                continue
+            height, head_hash = result
+            if height <= local_height:
+                continue
+            if max_height_hint is not None and height > max_height_hint:
+                self.logger.info(
+                    f"Skipping {peer} tip height {height}: exceeds hint "
+                    f"{max_height_hint}"
+                )
+                continue
+            g = groups.get(head_hash)
+            if g is None:
+                groups[head_hash] = TipGroup(height, head_hash, [peer])
+            else:
+                g.peers.append(peer)
+
+        return sorted(
+            groups.values(),
+            key=lambda g: (-g.height, -len(g.peers), g.head_hash),
+        )
+
+    async def _fetch_peer_tip(self, peer: str) -> Optional[Tuple[int, bytes]]:
+        """Return ``(height, head_hash)`` for a peer, or ``None`` on failure."""
+        try:
+            block = await asyncio.wait_for(
+                self.node_client.get_peer_block(peer, 0),
+                timeout=TIP_SURVEY_TIMEOUT_SECONDS,
+            )
+        except (asyncio.TimeoutError, Exception):
+            return None
+        if block is None or block.hash is None:
+            return None
+        return (block.header.index, block.hash)
+
+    # ------------------------------------------------------------------
+    # Phase 2 — manifest fetch
+    # ------------------------------------------------------------------
+
+    async def _fetch_manifest(
+        self,
+        group: TipGroup,
+        peer_backoff: Set[str],
+    ) -> Optional[List[Tuple[int, bytes]]]:
+        """Fetch entries from common ancestor to pinned head, paginated.
+
+        Cross-checks against a second peer when available. Demotes both
+        peers on disagreement.
+        """
+        manifest: List[Tuple[int, bytes]] = []
+        locator = self.local_locator()
+        seen_indices: Set[int] = set()
+
+        for _ in range(self.MAX_MANIFEST_PAGES):
+            live = [p for p in group.peers if p not in peer_backoff]
+            if not live:
+                self.logger.warning(
+                    f"No live peers remain in {group} during manifest fetch"
+                )
+                return None
+
+            primary = random.choice(live)
+            primary_entries = await self._fetch_manifest_page(
+                primary, locator, peer_backoff
+            )
+            if primary_entries is None:
+                continue  # primary demoted; retry with another peer
+            if not primary_entries:
+                break  # server has nothing else to give us
+
+            secondaries = [p for p in live if p != primary]
+            if secondaries:
+                secondary = random.choice(secondaries)
+                secondary_entries = await self._fetch_manifest_page(
+                    secondary, locator, peer_backoff
+                )
+                if (
+                    secondary_entries is not None
+                    and secondary_entries
+                    and not self._manifests_agree(primary_entries, secondary_entries)
+                ):
+                    self.logger.warning(
+                        f"Manifest disagreement in {group}: demoting "
+                        f"{primary} and {secondary}"
+                    )
+                    peer_backoff.add(primary)
+                    peer_backoff.add(secondary)
+                    return None
+
+            # Append only entries we haven't already accepted (pagination
+            # overlap is possible if peers return overlapping ranges).
+            new_entries = [
+                (idx, h) for (idx, h) in primary_entries if idx not in seen_indices
+            ]
+            if not new_entries:
+                # No forward progress; avoid infinite loop.
+                break
+            for idx, h in new_entries:
+                seen_indices.add(idx)
+            manifest.extend(new_entries)
+
+            last_idx, last_hash = manifest[-1]
+            if last_idx >= group.height and last_hash == group.head_hash:
+                break
+
+            # Advance locator: push the latest confirmed hash to the front
+            # so the next page starts there.
+            locator = [last_hash] + locator
+
+        if not manifest or manifest[-1][1] != group.head_hash:
+            self.logger.warning(
+                f"Manifest for {group} did not reach advertised head"
+            )
+            return None
+        return manifest
+
+    async def _fetch_manifest_page(
+        self,
+        peer: str,
+        locator: List[bytes],
+        peer_backoff: Set[str],
+    ) -> Optional[List[Tuple[int, bytes]]]:
+        """Fetch one manifest page. Demotes the peer on transport errors."""
+        try:
+            entries = await self.node_client.get_chain_manifest(
+                peer, locator, MAX_MANIFEST_ENTRIES
             )
         except Exception as e:
-            self.logger.error(f"Block sync failed: {e}")
-            return SyncResult(
-                success=False, requested=total_blocks,
-                elapsed=time.monotonic() - t0,
-            )
-        finally:
-            # Always cleanup producer processes
-            self.logger.debug("🛑 Signaling producer processes to stop")
-            for _ in range(num_producers):
-                try:
-                    download_queue.put(None)  # Sentinel value to stop producers
-                except (ValueError, OSError, queue.Full):
-                    pass  # Queue may be closed (ValueError) or full
-                    
-            for p in producer_processes:
-                if p.is_alive():
-                    p.join(timeout=2)  # Short timeout for graceful shutdown
-                    if p.is_alive():
-                        self.logger.warning(f"⚠️ Force terminating producer process {p.pid}")
-                        p.terminate()
-                        p.join(timeout=1)
-                        if p.is_alive():
-                            self.logger.warning(f"🔥 Sending SIGKILL to producer process {p.pid}")
-                            try:
-                                import os
-                                os.kill(p.pid, 9)  # SIGKILL
-                                p.join(timeout=1)
-                                if p.is_alive():
-                                    self.logger.error(f"❌ Failed to kill producer process {p.pid}")
-                                else:
-                                    self.logger.debug(f"✅ Producer process {p.pid} killed")
-                            except (OSError, ProcessLookupError):
-                                # Process already dead
-                                self.logger.debug(f"✅ Producer process {p.pid} already terminated")
-                        else:
-                            self.logger.debug(f"✅ Producer process {p.pid} terminated gracefully")
-                    else:
-                        self.logger.debug(f"✅ Producer process {p.pid} stopped gracefully")
-            
-    @staticmethod
-    def _producer_worker(download_queue: mp.Queue, 
-                        completed_queue: mp.Queue, 
-                        peers: List[str], 
-                        node_timeout: float):
-        """
-        Producer worker process that downloads blocks from peers.
-        
-        Args:
-            download_queue: Queue of block numbers to download
-            completed_queue: Queue to put completed downloads
-            peers: List of peer host addresses
-            node_timeout: Timeout for HTTP requests
-        """
-        # Set up signal handling for graceful shutdown
-        shutdown_flag = False
-        def signal_handler(_signum, _frame):
-            nonlocal shutdown_flag
-            shutdown_flag = True
-        
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        
-        # Create new event loop for this process
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # Initialize NodeClient in this process
-        client = NodeClient(node_timeout=node_timeout)
-        
-        async def download_worker():
-            await client.start()
-            
-            try:
-                while True:
-                    # Check shutdown flag first
-                    if shutdown_flag:
-                        break
-                        
-                    block_number = None  # Initialize to handle potential exceptions
-                    try:
-                        # Get next block number to download (timeout to prevent hanging)
-                        block_number = download_queue.get(timeout=1.0)
-                        if block_number is None:  # Sentinel value to stop
-                            break
-
-                        # Log download start with timing
-                        logger = logging.getLogger(f"BlockSync.Producer.{os.getpid()}")
-                        download_start = time.perf_counter()
-                        logger.debug(f"🔽 Starting download of block {block_number}")
-                        
-                        # Check shutdown flag before starting download
-                        if shutdown_flag:
-                            break
-                            
-                        block = await _download_single_block(client, block_number, peers, lambda: shutdown_flag)
-                        
-                        # Log download completion with timing
-                        download_time = time.perf_counter() - download_start
-                        if block:
-                            logger.debug(f"✅ Completed download of block {block_number} in {download_time:.3f}s")
-                        else:
-                            logger.warning(f"❌ Failed download of block {block_number} after {download_time:.3f}s")
-                        
-                        try:
-                            # Use timeout to avoid hanging on queue put
-                            completed_queue.put((block_number, block), timeout=1.0)
-                        except Exception:
-                            # Queue might be full or closed, exit gracefully
-                            break
-
-                    except queue.Empty:
-                        continue
-                    except Exception:
-                        if shutdown_flag:
-                            break
-                        if block_number is None:
-                            block_number = -1
-                        # Put error result in completed queue with timeout
-                        try:
-                            completed_queue.put((block_number, None), timeout=1.0)
-                        except Exception:
-                            # Queue might be closed, exit gracefully
-                            break
-                        
-            finally:
-                try:
-                    await asyncio.wait_for(client.stop(), timeout=2.0)
-                except asyncio.TimeoutError:
-                    # Force close if client.stop() hangs
-                    pass
-                except Exception:
-                    # Ignore any other errors during cleanup
-                    pass
-                
-        try:
-            loop.run_until_complete(download_worker())
-        finally:
-            loop.close()
-            
-    async def _consumer_async(
-        self,
-        completed_queue: mp.Queue,
-        start_index: int,
-        end_index: int,
-        download_queue: mp.Queue,
-    ) -> SyncResult:
-        """
-        Consumer running in main process that validates blocks sequentially.
-
-        Returns:
-            SyncResult with download counts (requested/elapsed filled by caller).
-        """
-        retry_count: Dict[int, int] = {}
-        max_retries = 3
-        next_expected = start_index
-        downloaded = 0
-
-        try:
-            while next_expected <= end_index:
-                try:
-                    loop = asyncio.get_event_loop()
-                    try:
-                        block_number, block = await loop.run_in_executor(
-                            None, lambda: completed_queue.get(timeout=30.0)
-                        )
-                    except Exception:
-                        blocks_synced = next_expected - start_index
-                        if blocks_synced > 0:
-                            self.logger.warning(
-                                "Timeout after syncing %d blocks, "
-                                "returning incomplete sync",
-                                blocks_synced,
-                            )
-                        else:
-                            self.logger.error(
-                                "Timeout with no progress on block downloads"
-                            )
-                        return SyncResult(
-                            success=False, downloaded=downloaded,
-                            failed_block=next_expected,
-                        )
-
-                    if block is None:
-                        retry_count[block_number] = retry_count.get(block_number, 0) + 1
-                        if retry_count[block_number] <= max_retries:
-                            self.logger.warning(
-                                "Retrying download for block %d (%d/%d)",
-                                block_number, retry_count[block_number], max_retries,
-                            )
-                            download_queue.put(block_number)
-                            continue
-                        else:
-                            self.logger.error(
-                                "Failed to download block %d after %d retries",
-                                block_number, max_retries,
-                            )
-                            return SyncResult(
-                                success=False, downloaded=downloaded,
-                                failed_block=block_number,
-                            )
-
-                    self.logger.debug(
-                        "Received block %d from producer", block_number,
-                    )
-
-                    dummy_future = asyncio.Future()
-                    self.receive_block_queue.put_nowait((block, dummy_future, True, "sync"))
-                    next_expected += 1
-                    downloaded += 1
-
-                    await asyncio.sleep(0.01)
-
-                except queue.Empty:
-                    self.logger.error("Timeout waiting for block download completion")
-                    return SyncResult(
-                        success=False, downloaded=downloaded,
-                        failed_block=next_expected,
-                    )
-                except Exception as e:
-                    self.logger.error(f"Consumer error: {e}")
-                    return SyncResult(
-                        success=False, downloaded=downloaded,
-                        failed_block=next_expected,
-                    )
-        except KeyboardInterrupt:
-            self.logger.warning("Block processing interrupted by user")
-            return SyncResult(success=False, downloaded=downloaded)
-
-        return SyncResult(success=True, downloaded=downloaded)
-
-
-async def _download_single_block(client: NodeClient,
-                                block_number: int, 
-                                peers: List[str],
-                                is_shutdown_requested = None) -> Optional[Block]:
-    """
-    Download a single block from peers with retry logic.
-    
-    Args:
-        client: NodeClient instance
-        block_number: Block number to download
-        peers: List of peer addresses
-        
-    Returns:
-        Block if successful, None if failed
-    """
-    tries = 0
-    max_tries = 3
-    backoff_sleep = 0.5
-    available_peers = peers.copy()
-    
-    while tries <= max_tries and available_peers:
-        # Check for shutdown request
-        if is_shutdown_requested and is_shutdown_requested():
+            self.logger.warning(f"Manifest request to {peer} raised: {e}")
+            peer_backoff.add(peer)
             return None
-            
-        # Download from random peer
-        random_peer = random.choice(available_peers)
+        if entries is None:
+            peer_backoff.add(peer)
+            return None
+        return entries
+
+    @staticmethod
+    def _manifests_agree(
+        a: List[Tuple[int, bytes]],
+        b: List[Tuple[int, bytes]],
+    ) -> bool:
+        """Return True iff two manifest pages agree on overlapping indices."""
+        a_by_idx = dict(a)
+        for idx, h in b:
+            if a_by_idx.get(idx, h) != h:
+                return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Phase 3 — block download with linkage audit
+    # ------------------------------------------------------------------
+
+    async def _download_blocks(
+        self,
+        group: TipGroup,
+        manifest: List[Tuple[int, bytes]],
+        peer_backoff: Set[str],
+    ) -> Optional[Dict[int, Block]]:
+        """Fetch every manifest block via ``GET_BLOCK_BY_HASH`` in shuffled order.
+
+        Returns ``None`` if the group can't fully serve the manifest —
+        all peers demoted or a single block exhausts its retry budget.
+        """
+        manifest_by_idx: Dict[int, bytes] = dict(manifest)
+        first_idx = manifest[0][0]
+        work: List[Tuple[int, bytes]] = list(manifest)
+        random.shuffle(work)
+        downloaded: Dict[int, Block] = {}
+        retries: Dict[int, int] = {}
+        failure = {"aborted": False}
+
+        async def worker() -> None:
+            while not failure["aborted"]:
+                if not work:
+                    return
+                idx, block_hash = work.pop()
+                block = await self._try_fetch_block(
+                    group=group,
+                    idx=idx,
+                    block_hash=block_hash,
+                    manifest_by_idx=manifest_by_idx,
+                    first_idx=first_idx,
+                    peer_backoff=peer_backoff,
+                )
+                if block is not None:
+                    downloaded[idx] = block
+                    continue
+                retries[idx] = retries.get(idx, 0) + 1
+                if retries[idx] >= self.MAX_BLOCK_RETRIES:
+                    self.logger.error(
+                        f"Block {idx} exhausted {self.MAX_BLOCK_RETRIES} "
+                        "retries; aborting group"
+                    )
+                    failure["aborted"] = True
+                    return
+                if not [p for p in group.peers if p not in peer_backoff]:
+                    failure["aborted"] = True
+                    return
+                work.append((idx, block_hash))
+                await asyncio.sleep(0.05)
+
+        workers = [asyncio.create_task(worker()) for _ in range(self.max_in_flight)]
+        await asyncio.gather(*workers)
+
+        if failure["aborted"] or len(downloaded) < len(manifest):
+            return None
+        return downloaded
+
+    async def _try_fetch_block(
+        self,
+        group: TipGroup,
+        idx: int,
+        block_hash: bytes,
+        manifest_by_idx: Dict[int, bytes],
+        first_idx: int,
+        peer_backoff: Set[str],
+    ) -> Optional[Block]:
+        """Single attempt to fetch block ``(idx, block_hash)`` with full linkage check."""
+        live = [p for p in group.peers if p not in peer_backoff]
+        if not live:
+            return None
+        peer = random.choice(live)
+
         try:
-            # Use a shorter timeout for HTTP operations during shutdown
-            block = await client.get_peer_block(random_peer, block_number)
-            
-            if block:
-                return block
-        except Exception:
-            # Continue to next peer on any exception
-            pass
-            
-        # Remove failed peer and retry
-        tries += 1
-        available_peers.remove(random_peer)
-        if available_peers and (not is_shutdown_requested or not is_shutdown_requested()):
-            # Only sleep if we have more peers to try and not shutting down
-            await asyncio.sleep(backoff_sleep * tries)
-            
-    return None
+            block = await self.node_client.get_peer_block_by_hash(peer, block_hash)
+        except Exception as e:
+            self.logger.warning(
+                f"Block-by-hash from {peer} (idx {idx}) raised: {e}; demoting"
+            )
+            peer_backoff.add(peer)
+            return None
+
+        if block is None:
+            self.logger.warning(
+                f"Peer {peer} returned NOT_FOUND for idx {idx}; demoting"
+            )
+            peer_backoff.add(peer)
+            return None
+
+        if block.header.index != idx:
+            self.logger.warning(
+                f"Peer {peer} returned index {block.header.index} "
+                f"for expected {idx}; demoting"
+            )
+            peer_backoff.add(peer)
+            return None
+
+        if block.hash != block_hash:
+            self.logger.warning(
+                f"Peer {peer} returned wrong-hash block at idx {idx}; demoting"
+            )
+            peer_backoff.add(peer)
+            return None
+
+        if idx == first_idx:
+            parent = self.local_get_block_by_hash(block.header.previous_hash)
+            if parent is None:
+                self.logger.warning(
+                    f"Peer {peer}: first manifest block's parent "
+                    f"{block.header.previous_hash.hex()[:8]} is not on our "
+                    "local chain; demoting"
+                )
+                peer_backoff.add(peer)
+                return None
+        else:
+            expected_parent_hash = manifest_by_idx[idx - 1]
+            if block.header.previous_hash != expected_parent_hash:
+                self.logger.warning(
+                    f"Peer {peer}: block {idx} previous_hash mismatches "
+                    "manifest; demoting"
+                )
+                peer_backoff.add(peer)
+                return None
+
+        return block
+
+    # ------------------------------------------------------------------
+    # Phase 4 — commit
+    # ------------------------------------------------------------------
+
+    async def _commit(
+        self,
+        manifest: List[Tuple[int, bytes]],
+        downloaded: Dict[int, Block],
+    ) -> Tuple[int, Optional[int]]:
+        """Push downloaded blocks through the node's processing queue.
+
+        Returns ``(committed_count, first_failed_index)``. On success,
+        ``first_failed_index`` is ``None``.
+        """
+        committed = 0
+        for idx, _ in manifest:
+            block = downloaded[idx]
+            future: asyncio.Future = asyncio.Future()
+            self.receive_block_queue.put_nowait(
+                (block, future, True, "sync")
+            )
+            try:
+                accepted = await asyncio.wait_for(
+                    future, timeout=COMMIT_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                self.logger.error(f"Block {idx} commit timed out")
+                return committed, idx
+            if not accepted:
+                self.logger.error(f"Block {idx} rejected during commit")
+                return committed, idx
+            committed += 1
+        return committed, None
