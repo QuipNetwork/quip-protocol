@@ -3,7 +3,9 @@
 import asyncio
 import json
 import os
+import time
 
+import aiohttp
 import pytest
 from aiohttp.test_utils import AioHTTPTestCase
 from unittest.mock import MagicMock
@@ -296,3 +298,56 @@ class TestTelemetryRateLimit(AioHTTPTestCase):
         # Health should still work
         resp = await self.client.request("GET", "/health")
         assert resp.status == 200
+
+
+# ---------------------------------------------------------------------------
+# SSE shutdown tests
+# ---------------------------------------------------------------------------
+
+async def test_stop_cancels_sse_streams(tmp_path):
+    """stop() must unblock in-flight SSE handlers without waiting 15s.
+
+    The SSE keepalive loop sleeps 15s between pings. Without explicit
+    task cancellation, stop() would return but handler tasks would
+    linger in the sleep, delaying full shutdown and leaking tasks.
+    """
+    tdir = _populate_telemetry(str(tmp_path))
+    cache = TelemetryCache(telemetry_dir=tdir, refresh_interval=60)
+    await cache._refresh()
+
+    server = RestApiServer(
+        network_node=MockNetworkNode(),
+        host="127.0.0.1",
+        port=0,  # random free port
+        tls_port=-1,
+        telemetry_cache=cache,
+        telemetry_access_token="",
+        telemetry_rate_limit_rpm=600,
+    )
+    await server.start()
+    try:
+        # Resolve the ephemeral port the runner bound to.
+        sockets = server._http_runner.addresses
+        assert sockets, "HTTP runner has no bound sockets"
+        host, port = sockets[0][0], sockets[0][1]
+        url = f"http://{host}:{port}/api/v1/telemetry/stream"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                assert resp.status == 200
+                # Give the handler a moment to register and enter sleep.
+                await asyncio.sleep(0.1)
+                assert len(server._sse_clients) == 1
+
+                t0 = time.monotonic()
+                await server.stop()
+                elapsed = time.monotonic() - t0
+    finally:
+        # stop() is idempotent; ensure cleanup even on test failure.
+        if server._http_runner is not None:
+            await server.stop()
+
+    assert elapsed < 2.0, (
+        f"stop() took {elapsed:.2f}s; SSE handler was not cancelled"
+    )
+    assert server._sse_clients == []
