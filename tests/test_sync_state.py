@@ -72,8 +72,28 @@ def _make_network_node(auto_mine: bool = True):
     node.on_new_node = None
     node.on_node_lost = None
 
+    # Two-tier peer management fields
+    node._max_active_peers = 20
+    node._max_candidate_peers = 100
+    node._candidate_peers = {}
+
+    # SWIM / scorer / gossip stubs for add_peer
+    from shared.swim_detector import SwimDetector
+    node._swim_detector = SwimDetector()
+    node._peer_scorer = MagicMock()
+    node._peer_scorer.remove_peer = MagicMock()
+    node._peer_loads = {}
+    node._block_inventory = MagicMock()
+    node._block_inventory.remove_peer = MagicMock()
+    node.gossip_new_node = AsyncMock()
+    node.fanout = 3
+    node.recent_messages = {}
+    node.gossip_lock = asyncio.Lock()
+    node.heartbeat_interval = 15
+    node.heartbeat_timeout = 300
+    node.node_timeout = 60
+
     # Stubs for methods called by add_peer / remove_node
-    node.add_or_update_peer = MagicMock(return_value=True)
     node.get_latest_block = MagicMock()
     node.peer_versions = {}
 

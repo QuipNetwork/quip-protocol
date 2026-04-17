@@ -385,16 +385,51 @@ class BlockSynchronizer:
             if last_idx >= group.height and last_hash == group.head_hash:
                 break
 
+            # The peer's chain may have grown since the tip survey.
+            # If the manifest already covers the pinned height (even
+            # with a different head because the peer mined further),
+            # stop paginating — we have enough.
+            if last_idx >= group.height:
+                break
+
             # Advance locator: push the latest confirmed hash to the front
             # so the next page starts there.
             locator = [last_hash] + locator
 
-        if not manifest or manifest[-1][1] != group.head_hash:
+        if not manifest:
             self.logger.warning(
-                f"Manifest for {group} did not reach advertised head"
+                f"Manifest for {group} is empty"
             )
             return None
-        return manifest
+
+        # Check if the pinned head appears at the expected height.
+        manifest_by_idx = {idx: h for idx, h in manifest}
+        pinned_hash = manifest_by_idx.get(group.height)
+
+        if pinned_hash == group.head_hash:
+            # Exact match — truncate any entries beyond the pinned head
+            # that arrived because the peer's chain grew during fetch.
+            manifest = [(idx, h) for idx, h in manifest if idx <= group.height]
+            return manifest
+
+        if pinned_hash is not None:
+            # The manifest covers the pinned height but with a different
+            # hash — the peer's chain extended and potentially reorged.
+            # Accept what we have up to the manifest's actual end;
+            # update the group so downstream phases use the real tip.
+            self.logger.info(
+                f"Manifest for {group} extended to height "
+                f"{manifest[-1][0]} (peer chain grew during fetch)"
+            )
+            group.height = manifest[-1][0]
+            group.head_hash = manifest[-1][1]
+            return manifest
+
+        self.logger.warning(
+            f"Manifest for {group} did not reach advertised height "
+            f"{group.height}"
+        )
+        return None
 
     async def _fetch_manifest_page(
         self,

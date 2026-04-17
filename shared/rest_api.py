@@ -129,6 +129,10 @@ class RestApiServer:
         # Tracks pending background writes per client so we can drop
         # slow consumers instead of accumulating unbounded write tasks.
         self._sse_pending: "dict[web.StreamResponse, int]" = {}
+        # Handler tasks for active SSE streams. stop() cancels these so
+        # clients sleeping in the keepalive loop exit immediately
+        # instead of lingering up to 15s past shutdown.
+        self._sse_tasks: "set[asyncio.Task]" = set()
         self._rate_limit_prune_task: Optional[asyncio.Task] = None
 
         # /api/v1/solve rate limiter and cached DWaveSampler. Solve is
@@ -261,6 +265,13 @@ class RestApiServer:
         if self._rate_limit_prune_task and not self._rate_limit_prune_task.done():
             self._rate_limit_prune_task.cancel()
 
+        # Cancel in-flight SSE handler tasks. Without this, any client
+        # suspended in the 15s keepalive sleep would linger past
+        # shutdown.  write_eof alone can't interrupt a sleeping task.
+        sse_tasks = list(self._sse_tasks)
+        for task in sse_tasks:
+            task.cancel()
+
         # Close SSE connections
         for client in list(self._sse_clients):
             try:
@@ -268,6 +279,12 @@ class RestApiServer:
             except Exception:
                 pass
         self._sse_clients.clear()
+
+        # Wait for cancelled handlers to unwind so their finally
+        # blocks finish cleanup before the app runner tears sockets
+        # down underneath them.
+        if sse_tasks:
+            await asyncio.gather(*sse_tasks, return_exceptions=True)
 
         if self._http_runner:
             await self._http_runner.cleanup()
@@ -929,6 +946,10 @@ class RestApiServer:
             self._sse_clients.append(resp)
             self._sse_pending[resp] = 0
 
+        # Register this handler so stop() can cancel it mid-sleep.
+        task = asyncio.current_task()
+        if task is not None:
+            self._sse_tasks.add(task)
         try:
             # Keep connection alive until client disconnects
             while True:
@@ -945,6 +966,8 @@ class RestApiServer:
                 if resp in self._sse_clients:
                     self._sse_clients.remove(resp)
                 self._sse_pending.pop(resp, None)
+            if task is not None:
+                self._sse_tasks.discard(task)
         return resp
 
     def _sse_push_block(
