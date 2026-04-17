@@ -4,6 +4,7 @@ import struct
 
 import pytest
 
+from _utils import hash_for as _hash
 from shared.sync_messages import (
     BLOCK_HASH_SIZE,
     MANIFEST_ENTRY_SIZE,
@@ -17,10 +18,6 @@ from shared.sync_messages import (
     encode_manifest_request,
     encode_manifest_response,
 )
-
-
-def _hash(i: int) -> bytes:
-    return i.to_bytes(BLOCK_HASH_SIZE, "big")
 
 
 def test_manifest_request_roundtrip_including_empty():

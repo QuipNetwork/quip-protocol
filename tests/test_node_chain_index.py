@@ -2,11 +2,8 @@
 
 from types import SimpleNamespace
 
+from _utils import hash_for as _hash, index_of
 from shared.node import Node
-
-
-def _hash(i: int) -> bytes:
-    return i.to_bytes(32, "big")
 
 
 def _block(index: int, block_hash: bytes | None):
@@ -63,7 +60,7 @@ def test_build_locator_linear_then_doubling_ends_at_genesis():
         node._index_append(_block(i, _hash(i)))
 
     locator = node.build_locator()
-    indices = [int.from_bytes(h, "big") for h in locator]
+    indices = [index_of(h) for h in locator]
 
     # Contiguous prefix from the tip and genesis at the end.
     assert indices[:11] == list(range(100, 89, -1))

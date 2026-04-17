@@ -122,7 +122,8 @@ class TestIsingFeeder:
         try:
             for _ in range(4):
                 feeder.pop_blocking()
-            time.sleep(0.5)
+            # Give the background worker a moment to refill.
+            time.sleep(0.1)
             model = feeder.try_pop()
             assert model is not None
         finally:

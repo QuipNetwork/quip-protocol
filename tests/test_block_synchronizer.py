@@ -9,11 +9,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from _utils import hash_for as _hash
 from shared.block_synchronizer import BlockSynchronizer, TipGroup
-
-
-def _hash(i: int) -> bytes:
-    return i.to_bytes(32, "big")
 
 
 def _fake_block(index: int, block_hash: bytes, previous_hash: bytes = b""):
