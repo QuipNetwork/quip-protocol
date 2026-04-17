@@ -289,6 +289,11 @@ class NetworkNode(Node):
             "gpu-2.quip.carback.us:20050",
             "nodes.quip.network:20049",
         ])
+        # A node listing its own public address as a peer makes it
+        # try to JOIN itself, fail validation, and backlist its own
+        # loopback address. Strip at config load — and again after
+        # public IP auto-detection below — so the ban list stays clean.
+        self.initial_peers = self._filter_self_from_peers(self.initial_peers)
         self.fanout = int(config.get("fanout", 3))
         self.max_connections = int(config.get("max_connections", 50))
 
@@ -531,6 +536,9 @@ class NetworkNode(Node):
                 self.logger.info(
                     f"Auto-detected public IP: {old} -> {self.public_host}"
                 )
+                # Re-filter in case the auto-detected public address is
+                # sitting in the initial peer list.
+                self.initial_peers = self._filter_self_from_peers(self.initial_peers)
             else:
                 self.logger.warning(
                     f"Could not detect public IP, using {self.public_host}"
@@ -2722,6 +2730,40 @@ class NetworkNode(Node):
         host, port = parse_host_port(address, DEFAULT_PORT)
         host = self._normalize_ip(host)
         return host, port
+
+    def _is_self_address(self, address: str) -> bool:
+        """True when ``address`` refers to this node's own public host:port.
+
+        Compares by parsed ``(host, port)`` tuples so that
+        ``127.0.0.1:20049`` matches whether it's written with or
+        without IPv6 brackets, and hostnames match case-insensitively.
+        Returns False for malformed inputs rather than raising — the
+        filter is a best-effort tidy-up, not a validation step.
+        """
+        try:
+            addr_host, addr_port = self._extract_peer_ip_port(address)
+            self_host, self_port = self._extract_peer_ip_port(self.public_host)
+        except (ValueError, TypeError):
+            return False
+        if addr_port != self_port:
+            return False
+        return addr_host.lower() == self_host.lower()
+
+    def _filter_self_from_peers(self, peers: list[str]) -> list[str]:
+        """Drop entries from ``peers`` that refer to this node itself.
+
+        Leaving ``public_host`` in the peer list drives a node to
+        attempt JOINing itself, which fails validation and pollutes
+        the local ban list with its own loopback address.
+        """
+        filtered = [p for p in peers if not self._is_self_address(p)]
+        dropped = len(peers) - len(filtered)
+        if dropped > 0:
+            self.logger.info(
+                f"Filtered {dropped} self-reference(s) from peer list "
+                f"(local public address: {self.public_host})"
+            )
+        return filtered
 
     async def _validate_peer_address(
         self, claimed: str, real_peer_addr: str, timeout: float = 2.0
