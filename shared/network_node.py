@@ -2028,11 +2028,25 @@ class NetworkNode(Node):
 
             return is_new
 
+    def remove_peer(self, peer_address: str) -> bool:
+        """Remove a peer, pruning NetworkNode-specific per-peer state.
+
+        Overrides Node.remove_peer so every deletion path — whether the
+        async remove_node flow or a direct base-class call — also clears
+        the parallel per-host maps (peer_versions, heartbeats). Pops
+        those entries regardless of whether the peer was in self.peers,
+        so stale state can't accumulate when peers churn in and out of
+        the ban list.
+        """
+        was_present = super().remove_peer(peer_address)
+        self.peer_versions.pop(peer_address, None)
+        self.heartbeats.pop(peer_address, None)
+        return was_present
+
     async def remove_node(self, host: str):
         """Remove a node from our registry."""
         async with self.net_lock:
-            if host in self.peers:
-                del self.peers[host]
+            if self.remove_peer(host):
                 self.logger.info(f"Node removed: {host}")
                 self.telemetry.remove_node(host)
                 self._on_node_lost(host)
@@ -2056,10 +2070,6 @@ class NetworkNode(Node):
                     self._peer_scorer.remove_peer(host)
                 if hasattr(self, '_block_inventory'):
                     self._block_inventory.remove_peer(host)
-            # Drop the version entry regardless of whether the peer was
-            # in self.peers — prevents stale versions accumulating when
-            # peers churn in and out of the ban list.
-            self.peer_versions.pop(host, None)
 
     async def send_heartbeat(self, node_host: str) -> bool:
         """Send heartbeat to a specific node.
