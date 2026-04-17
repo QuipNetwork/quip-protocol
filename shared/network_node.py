@@ -921,12 +921,19 @@ class NetworkNode(Node):
                                 dead_nodes.append(host)
                         else:
                             # Never got a heartbeat — use fast timeout.
-                            health = self._swim_detector._peers.get(host)
-                            age = (
-                                now_mono - health.joined_at
-                                if health else self.node_timeout + 1
-                            )
-                            if age > self.node_timeout:
+                            joined_at = self._swim_detector.get_joined_at(host)
+                            if joined_at is None:
+                                # Peer isn't tracked by SWIM (race with
+                                # remove_peer, or never registered). Assume
+                                # it's past the fast-timeout window and log
+                                # so an add_peer/register mismatch is
+                                # discoverable.
+                                self.logger.debug(
+                                    f"Unproven peer {host} missing from "
+                                    "SWIM detector; evicting via fast timeout"
+                                )
+                                dead_nodes.append(host)
+                            elif now_mono - joined_at > self.node_timeout:
                                 dead_nodes.append(host)
 
                 # Prune stale gossip dedup entries and rate limiter buckets
@@ -1118,12 +1125,21 @@ class NetworkNode(Node):
         """
         now = utc_timestamp_float()
         cutoff = self.heartbeat_timeout / 2
-        return {
+        healthy = {
             host: info
             for host, info in self.peers.items()
             if host in self.heartbeats
             and (now - self.heartbeats[host]) < cutoff
         }
+        # Surface the bootstrap case where the active set isn't empty
+        # but nothing is fresh enough to share — otherwise new joiners
+        # silently see an empty peer list and operators have no signal.
+        if not healthy and self.peers:
+            self.logger.info(
+                f"Filtered JOIN/PEERS response empty: {len(self.peers)} "
+                "active peers but none have a recent heartbeat"
+            )
+        return healthy
 
     async def server_loop(self):
         """Main server loop."""
@@ -2149,16 +2165,29 @@ class NetworkNode(Node):
         """Promote a candidate to the active peer set.
 
         Must be called while NOT holding net_lock (acquires it
-        internally via add_peer).  Returns True on success.
+        internally via add_peer).  Returns True on success. On
+        failure (active set filled between probe and promotion,
+        ban list hit, address parse error) the candidate is
+        re-inserted so the next probe cycle can retry.
         """
         candidate = self._candidate_peers.pop(host, None)
         if candidate is None:
             return False
-        return await self.add_peer(
+        promoted = await self.add_peer(
             host, candidate.info,
             descriptor=candidate.descriptor,
             connected=False,
         )
+        if not promoted and host not in self.peers:
+            # add_peer rejected the promotion; keep the candidate
+            # around rather than losing it silently.
+            async with self.net_lock:
+                if host not in self._candidate_peers:
+                    self._candidate_peers[host] = candidate
+            self.logger.debug(
+                f"Promotion of {host} rejected; returning to candidate pool"
+            )
+        return promoted
 
     async def _try_promote_candidates(self) -> None:
         """Probe top candidates and promote reachable ones.
@@ -2183,6 +2212,12 @@ class NetworkNode(Node):
                 if len(probe_list) >= min(slots, 5):
                     break
 
+        if self.node_client is None:
+            # Probing a candidate requires the QUIC client; without it
+            # (early startup / test paths) the rebalance cycle is a
+            # no-op rather than an AttributeError.
+            return
+
         for host in probe_list:
             cand = self._candidate_peers.get(host)
             if cand is None:
@@ -2196,12 +2231,17 @@ class NetworkNode(Node):
             if ok:
                 self.logger.info(f"Candidate {host} reachable, promoting")
                 await self._promote_candidate(host)
-            elif cand.probe_attempts >= 3:
+            else:
                 self.logger.debug(
-                    f"Candidate {host} unreachable after "
-                    f"{cand.probe_attempts} probes, removing"
+                    f"Candidate probe to {host} failed "
+                    f"(attempt {cand.probe_attempts}/3)"
                 )
-                self._candidate_peers.pop(host, None)
+                if cand.probe_attempts >= 3:
+                    self.logger.info(
+                        f"Candidate {host} unreachable after "
+                        f"{cand.probe_attempts} probes, removing"
+                    )
+                    self._candidate_peers.pop(host, None)
 
     def remove_peer(self, peer_address: str) -> bool:
         """Remove a peer, pruning NetworkNode-specific per-peer state.
@@ -2649,11 +2689,19 @@ class NetworkNode(Node):
     async def _migrate_to_alternatives(
         self, alternatives: list[str]
     ) -> None:
-        """Try to connect to MIGRATE-suggested peers (background)."""
+        """Try to connect to MIGRATE-suggested peers (background).
+
+        A MIGRATE is a recovery hint from a peer that's shedding us;
+        failures here matter for operators trying to diagnose why the
+        recovery attempt didn't work, so every branch logs its reason.
+        """
         for alt_host in alternatives[:5]:
             if alt_host == self.public_host:
                 continue
             if self._is_backed_off(alt_host):
+                self.logger.debug(
+                    f"MIGRATE alternative {alt_host} skipped: backed off"
+                )
                 continue
             async with self.net_lock:
                 if alt_host in self.peers:
@@ -2665,9 +2713,21 @@ class NetworkNode(Node):
                         f"MIGRATE: reconnected to {alt_host}"
                     )
                     return
-            except Exception as exc:
-                self.logger.debug(
-                    f"MIGRATE alternative {alt_host} failed: {exc}"
+                self.logger.warning(
+                    f"MIGRATE alternative {alt_host}: connect_to_peer "
+                    "returned False"
+                )
+            except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
+                self.logger.warning(
+                    f"MIGRATE alternative {alt_host} unreachable: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            except Exception:
+                # Unexpected exception types are programming bugs we
+                # want to surface loudly rather than mask as "peer
+                # unreachable".
+                self.logger.exception(
+                    f"MIGRATE alternative {alt_host}: unexpected error"
                 )
         self.logger.warning(
             "MIGRATE: none of the suggested alternatives were reachable"
