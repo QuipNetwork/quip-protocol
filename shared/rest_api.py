@@ -87,6 +87,7 @@ class RestApiServer:
         telemetry_access_token: str = "",
         telemetry_rate_limit_rpm: int = 30,
         telemetry_max_sse: int = 20,
+        solve_rate_limit_rpm: int = 10,
     ):
         """
         Initialize the REST API server.
@@ -103,6 +104,7 @@ class RestApiServer:
             telemetry_access_token: Bearer token for telemetry (empty=open).
             telemetry_rate_limit_rpm: Requests/minute per IP for telemetry.
             telemetry_max_sse: Max concurrent SSE connections.
+            solve_rate_limit_rpm: Requests/minute per IP for /api/v1/solve.
         """
         self.node = network_node
         self.host = host
@@ -128,6 +130,21 @@ class RestApiServer:
         # slow consumers instead of accumulating unbounded write tasks.
         self._sse_pending: "dict[web.StreamResponse, int]" = {}
         self._rate_limit_prune_task: Optional[asyncio.Task] = None
+
+        # /api/v1/solve rate limiter and cached DWaveSampler. Solve is
+        # expensive (Leap RTT + anneal time), so we serve one request
+        # at a time via a shared sampler instead of spinning one up
+        # per request on the event loop thread.
+        solve_tokens_per_sec = solve_rate_limit_rpm / 60.0
+        self._solve_rate_limiter = PeerRateLimiter(
+            tokens_per_second=solve_tokens_per_sec,
+            max_burst=max(int(solve_tokens_per_sec * 5), 3),
+        )
+        self._dwave_sampler: Optional[Any] = None
+        self._dwave_sampler_init_lock = asyncio.Lock()
+        # QPU is a single hardware resource; serialize sample_ising
+        # calls on the cached sampler.
+        self._dwave_sampler_sample_lock = asyncio.Lock()
 
         self._http_runner: Optional[web.AppRunner] = None
         self._https_runner: Optional[web.AppRunner] = None
@@ -201,9 +218,12 @@ class RestApiServer:
         if self._telemetry_cache is not None:
             self._telemetry_cache.on_new_block = self._sse_push_block
             self._telemetry_cache.on_nodes_changed = self._sse_push_nodes
-            self._rate_limit_prune_task = asyncio.create_task(
-                self._prune_rate_limiter_loop(),
-            )
+
+        # Rate-limiter pruning runs unconditionally: the solve limiter
+        # always exists even when telemetry is disabled.
+        self._rate_limit_prune_task = asyncio.create_task(
+            self._prune_rate_limiter_loop(),
+        )
 
         # Start HTTP server (always)
         self._http_runner = web.AppRunner(self._app)
@@ -256,6 +276,13 @@ class RestApiServer:
         if self._https_runner:
             await self._https_runner.cleanup()
             self._https_runner = None
+
+        if self._dwave_sampler is not None:
+            try:
+                await asyncio.to_thread(self._dwave_sampler.close)
+            except Exception as e:
+                self.logger.warning(f"Failed to close DWaveSampler: {e}")
+            self._dwave_sampler = None
 
         self.logger.info("REST API server stopped")
 
@@ -490,6 +517,20 @@ class RestApiServer:
 
     async def handle_solve(self, request: web.Request) -> web.Response:
         """POST /api/v1/solve - Submit quantum annealing solve request."""
+        # Per-IP rate limit: solve is expensive and one abusive peer
+        # could otherwise pin the QPU queue indefinitely.
+        peer_key = request.remote or "unknown"
+        if not self._solve_rate_limiter.allow(peer_key):
+            return web.json_response(
+                {
+                    "success": False,
+                    "error": "Rate limit exceeded",
+                    "code": "RATE_LIMITED",
+                    "timestamp": int(time.time()),
+                },
+                status=429,
+            )
+
         try:
             data = await request.json()
         except json.JSONDecodeError:
@@ -543,27 +584,27 @@ class RestApiServer:
         )
 
         try:
-            # Create appropriate sampler based on miner type
             if miner_kind == "qpu":
-                from dwave.system import DWaveSampler
-                qpu_sampler = DWaveSampler()
-                sampler = qpu_sampler
+                sampler = await self._get_or_create_dwave_sampler()
+                # Serialize concurrent solve requests on the shared
+                # QPU sampler; run the blocking Leap call off-loop.
+                async with self._dwave_sampler_sample_lock:
+                    sampleset = await asyncio.to_thread(
+                        sampler.sample_ising, h_dict, J_dict,
+                        num_reads=num_samples,
+                    )
             elif miner_kind in ["cpu", "metal", "cuda", "modal"]:
                 from dwave.samplers import SimulatedAnnealingSampler
-                qpu_sampler = None
                 sampler = SimulatedAnnealingSampler()
+                sampleset = await asyncio.to_thread(
+                    sampler.sample_ising, h_dict, J_dict,
+                    num_reads=num_samples,
+                )
             else:
                 return self._error_response(
                     f"Unknown miner type: {miner_kind}",
                     "UNKNOWN_MINER_TYPE"
                 )
-
-            try:
-                # Sample the Ising problem
-                sampleset = sampler.sample_ising(h_dict, J_dict, num_reads=num_samples)
-            finally:
-                if qpu_sampler is not None:
-                    qpu_sampler.close()
 
             # Extract samples and energies
             samples = []
@@ -605,6 +646,21 @@ class RestApiServer:
         except Exception as e:
             self.logger.error(f"REST API solve failed: {e}")
             return self._error_response(str(e), "SOLVE_FAILED")
+
+    async def _get_or_create_dwave_sampler(self) -> Any:
+        """Return the cached DWaveSampler, constructing it on first use.
+
+        The D-Wave client performs blocking network I/O on construction
+        (Leap auth + solver handshake), so we do the setup once in a
+        thread and share the instance across requests.
+        """
+        if self._dwave_sampler is not None:
+            return self._dwave_sampler
+        async with self._dwave_sampler_init_lock:
+            if self._dwave_sampler is None:
+                from dwave.system import DWaveSampler
+                self._dwave_sampler = await asyncio.to_thread(DWaveSampler)
+        return self._dwave_sampler
 
     async def handle_heartbeat(self, request: web.Request) -> web.Response:
         """POST /api/v1/heartbeat - Send heartbeat."""
@@ -715,7 +771,9 @@ class RestApiServer:
         try:
             while True:
                 await asyncio.sleep(300)
-                self._telemetry_rate_limiter.prune()
+                if self._telemetry_cache is not None:
+                    self._telemetry_rate_limiter.prune()
+                self._solve_rate_limiter.prune()
         except asyncio.CancelledError:
             pass
 
