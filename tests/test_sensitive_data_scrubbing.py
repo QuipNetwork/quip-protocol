@@ -33,7 +33,7 @@ _SECRETS = [
 ]
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def sensitive_miners_config():
     return {
         # Top-level "[global]" flattened keys (as the CLI produces)
@@ -61,8 +61,12 @@ def sensitive_miners_config():
     }
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def node_with_secrets(sensitive_miners_config):
+    """Node is shared across every test in the module because all six tests
+    only *read* from it (info / descriptor / telemetry snapshots). Creating
+    a Node spawns miner workers and takes ~3 s; doing that once instead
+    of per-test saves ~15 s of suite runtime."""
     from quip_cli import load_genesis_block
     genesis = load_genesis_block("genesis_block_public.json")
     node = Node(
