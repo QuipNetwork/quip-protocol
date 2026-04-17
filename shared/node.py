@@ -249,8 +249,11 @@ class Node:
 
         # Initialize blockchain
         self.chain: List[Block] = []
+        # Secondary index for content-addressed block lookup; kept in
+        # lockstep with ``chain`` via ``_index_append`` / ``_index_truncate``.
+        self.chain_by_hash: Dict[bytes, Block] = {}
         self.chain_lock = asyncio.Lock()
-        self.chain.append(genesis_block)
+        self._index_append(genesis_block)
 
     def _setup_multiprocess_logging(self):
         """Set up logging queue and listener for multiprocessing."""
@@ -394,10 +397,53 @@ class Node:
         if len(self.chain) <= index:
             return None
         return self.chain[index]
-    
+
     def get_latest_block(self) -> Block:
         """Get the latest block from the blockchain."""
         return self.chain[-1]
+
+    def get_block_by_hash(self, block_hash: bytes) -> Optional[Block]:
+        """Get a block from the canonical chain by its hash.
+
+        Returns None if the hash is not currently on the canonical chain
+        (including hashes from blocks that were truncated away during a
+        reorg).
+        """
+        return self.chain_by_hash.get(block_hash)
+
+    def build_locator(self) -> List[bytes]:
+        """Build a Bitcoin-style locator of block hashes from tip to genesis.
+
+        The locator is used by the GET_CHAIN_MANIFEST RPC so a peer can
+        find the latest common ancestor with our chain in a single round
+        trip. Layout: the tip plus the next 10 blocks contiguously, then
+        the step size doubles until genesis. Length grows like
+        ``~11 + log2(tip)``.
+
+        Returns:
+            List of 32-byte block hashes ordered newest-first. Empty when
+            the chain itself is empty. Always terminates with the genesis
+            block's hash when genesis is finalized.
+        """
+        locator: List[bytes] = []
+        if not self.chain:
+            return locator
+
+        index = len(self.chain) - 1
+        step = 1
+        while index > 0:
+            block = self.chain[index]
+            if block.hash is not None:
+                locator.append(block.hash)
+            index = max(0, index - step)
+            if len(locator) > 10:
+                step *= 2
+
+        genesis = self.chain[0]
+        if genesis.hash is not None:
+            locator.append(genesis.hash)
+
+        return locator
 
     def _find_block_by_hash(
         self, target_hash: bytes, full_search: bool = False
@@ -415,6 +461,33 @@ class Node:
             if self.chain[i].hash == target_hash:
                 return self.chain[i]
         return None
+
+    def _index_append(self, block: Block) -> None:
+        """Append a block to ``chain`` and mirror into ``chain_by_hash``.
+
+        Caller is responsible for holding ``chain_lock`` when the append
+        happens outside ``__init__``. Blocks without a finalized ``hash``
+        still land in ``chain`` but are omitted from ``chain_by_hash`` —
+        hash lookups for unfinalized blocks would be meaningless.
+        """
+        self.chain.append(block)
+        if block.hash is not None:
+            self.chain_by_hash[block.hash] = block
+
+    def _index_truncate(self, new_length: int) -> None:
+        """Shrink ``chain`` to ``new_length`` blocks and evict dropped hashes.
+
+        Caller is responsible for holding ``chain_lock`` when the
+        truncate happens outside ``__init__``. No-op when the chain is
+        already that short.
+        """
+        if new_length >= len(self.chain):
+            return
+        dropped = self.chain[new_length:]
+        self.chain = self.chain[:new_length]
+        for block in dropped:
+            if block.hash is not None:
+                self.chain_by_hash.pop(block.hash, None)
 
     async def check_block(self, block: Block, force_reorg: bool = False) -> tuple[bool, str | None]:
         """Check if a block is valid and can be accepted.
@@ -500,7 +573,7 @@ class Node:
                     )
                     # Truncate chain to common ancestor (with lock for safety)
                     async with self.chain_lock:
-                        self.chain = self.chain[:ancestor.header.index + 1]
+                        self._index_truncate(ancestor.header.index + 1)
                     prev_block = ancestor
                 else:
                     reason = f"cannot find ancestor with hash {block.header.previous_hash.hex()[:8]}"
@@ -580,9 +653,9 @@ class Node:
             # Reset chain if needed
             if head.header.index >= block.header.index:
                 self.logger.warning(f"Resetting chain to accept block {block.header.index} from previous head {head.header.index})")
-                self.chain = self.chain[:block.header.index]
+                self._index_truncate(block.header.index)
             # Accept the block
-            self.chain.append(block)
+            self._index_append(block)
 
         assert block.hash is not None
 
@@ -671,7 +744,7 @@ class Node:
             transactions = []
         if not self.chain:
             self.logger.info("No existing chain, previous block is genesis")
-            self.chain.append(previous_block)
+            self._index_append(previous_block)
 
         if (previous_block.header.index) != self.get_latest_block().header.index:
             self.logger.info(f"Node {self.node_id}: Previous block index {previous_block.header.index} does not match latest block index {self.get_latest_block().header.index}, exiting mining task...")

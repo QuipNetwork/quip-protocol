@@ -194,6 +194,7 @@ async def test_chain_reset_clears_has_ever_had_peers():
     node._has_ever_had_peers = True
     node._synchronized.set()
     node.chain = [MagicMock()]  # single genesis block
+    node.chain_by_hash = {node.chain[0].hash: node.chain[0]}
     node.chain_lock = asyncio.Lock()
     node.genesis_block = node.chain[0]
     node.previous_epoch = None
