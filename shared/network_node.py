@@ -640,6 +640,11 @@ class NetworkNode(Node):
         # calls — otherwise _default_handler would chain previous
         # installs and leak memory.
         loop = asyncio.get_running_loop()
+        # Log any callback that blocks the event loop for >250ms. Bursts here
+        # cluster around new-block arrivals when synchronous CPU work (SPHINCS+
+        # verify, PoW validation) runs on the main loop and stalls gossip
+        # handlers. Once that work is offloaded, these should become rare.
+        loop.slow_callback_duration = 0.25
         if not getattr(loop, "_quip_quic_handler_installed", False):
             _default_handler = loop.get_exception_handler()
 
@@ -1323,7 +1328,9 @@ class NetworkNode(Node):
                     proc_ms = (t1 - t0) * 1000.0
                     qsize = self.gossip_processing_queue.qsize()
                     wait_str = f"{wait_ms:.1f} ms" if wait_ms is not None else "n/a"
-                    self.logger.debug(
+                    slow = (wait_ms is not None and wait_ms > 500.0) or proc_ms > 500.0
+                    log_fn = self.logger.info if slow else self.logger.debug
+                    log_fn(
                         f"🧩 Gossip handled id={(message.id or '')[:8]} type={message.type}: wait={wait_str}, process={proc_ms:.1f} ms, qsize={qsize}"
                     )
                     if response_future and not response_future.done():
@@ -3307,22 +3314,24 @@ class NetworkNode(Node):
         )
 
     async def _quic_handle_gossip(self, msg: QuicMessage) -> QuicMessage:
-        """Handle a gossip message from another node."""
-        # Parse the gossip Message from payload
-        gossip_message = Message.from_network(msg.payload)
+        """Handle a gossip message from another node.
 
-        # Queue for background processing
-        response_future: asyncio.Future[str] = asyncio.Future()
+        ACK-on-receipt semantics: respond as soon as the message is queued
+        for background processing. The client (``gossip_to``) only checks
+        that it got a GOSSIP_RESPONSE, so returning before ``handle_gossip``
+        completes is safe. Backpressure is still visible via the
+        ``server overloaded`` error when the queue is full.
+        """
+        gossip_message = Message.from_network(msg.payload)
         t_enq = time.perf_counter()
 
         try:
-            self.gossip_processing_queue.put_nowait((gossip_message, response_future, t_enq))
-            status = await asyncio.wait_for(response_future, timeout=5.0)
-            return msg.create_response(json.dumps({"status": status}).encode('utf-8'))
+            self.gossip_processing_queue.put_nowait(
+                (gossip_message, None, t_enq)
+            )
         except asyncio.QueueFull:
             return msg.create_error_response("server overloaded")
-        except asyncio.TimeoutError:
-            return msg.create_error_response("processing timeout")
+        return msg.create_response(b'{"status":"accepted"}')
 
     async def _quic_handle_block_submit(self, msg: QuicMessage, protocol: Any) -> QuicMessage:
         """Handle new block submission (DEBUG purposes)."""

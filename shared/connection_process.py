@@ -162,6 +162,47 @@ def connection_process_main(
         log.info(f"Connection process stopped for {peer_address}")
 
 
+@dataclass
+class GossipStats:
+    """Rolling counters for outbound GOSSIP success/failure per peer.
+
+    Populated by ``_handle_gossip`` and reported every
+    ``_GOSSIP_STATS_INTERVAL`` seconds so operators can see which peers
+    reply reliably vs. which drop our datagrams. A failure here means
+    either a 5 s client-side timeout (``node_client.py:362``) or an
+    error response — both count equally for health-tracking purposes.
+    """
+    sent: int = 0
+    responded: int = 0
+    failed: int = 0
+
+
+_GOSSIP_STATS_INTERVAL = 60.0
+
+
+def _report_gossip_stats(
+    stats: 'GossipStats',
+    pipe: mp.connection.Connection,
+    peer_address: str,
+    log: logging.Logger,
+) -> None:
+    """Log a one-line summary and forward stats to the parent process."""
+    if stats.sent == 0:
+        return
+    rate = (stats.responded / stats.sent) * 100.0
+    log.info(
+        f"gossip_stats {peer_address}: sent={stats.sent} "
+        f"responded={stats.responded} failed={stats.failed} "
+        f"({rate:.0f}% success)"
+    )
+    _send_safe(pipe, {
+        "event": "gossip_stats",
+        "sent": stats.sent,
+        "responded": stats.responded,
+        "failed": stats.failed,
+    })
+
+
 async def _connection_loop(
     pipe: mp.connection.Connection,
     peer_address: str,
@@ -182,6 +223,8 @@ async def _connection_loop(
     await client.start()
 
     loop = asyncio.get_event_loop()
+    stats = GossipStats()
+    last_stats_report = time.monotonic()
 
     try:
         # Race connection establishment against shutdown
@@ -199,6 +242,11 @@ async def _connection_loop(
 
         # Main command loop
         while not stop_event.is_set():
+            now = time.monotonic()
+            if now - last_stats_report >= _GOSSIP_STATS_INTERVAL:
+                _report_gossip_stats(stats, pipe, peer_address, log)
+                last_stats_report = now
+
             # Poll pipe for commands (non-blocking via executor)
             try:
                 has_data = await loop.run_in_executor(
@@ -226,7 +274,9 @@ async def _connection_loop(
             elif op == "heartbeat":
                 await _handle_heartbeat(client, pipe, peer_address, cmd, log)
             elif op == "gossip":
-                await _handle_gossip(client, pipe, peer_address, cmd, log)
+                await _handle_gossip(
+                    client, pipe, peer_address, cmd, log, stats
+                )
             elif op == "request_block":
                 await _handle_request_block(
                     client, pipe, peer_address, cmd, log
@@ -239,6 +289,7 @@ async def _connection_loop(
                 log.warning(f"Unknown command: {op}")
 
     finally:
+        _report_gossip_stats(stats, pipe, peer_address, log)
         try:
             await asyncio.wait_for(client.stop(), timeout=2.0)
         except (asyncio.TimeoutError, Exception):
@@ -304,16 +355,23 @@ async def _handle_gossip(
     peer_address: str,
     cmd: dict,
     log: logging.Logger,
+    stats: 'GossipStats',
 ) -> None:
     """Forward a gossip message to the peer."""
+    stats.sent += 1
     try:
         from shared.network_node import Message
         payload_b64 = cmd.get("payload", "")
         payload_bytes = base64.b64decode(payload_b64)
         message = Message.from_network(payload_bytes)
         ok = await client.gossip_to(peer_address, message)
+        if ok:
+            stats.responded += 1
+        else:
+            stats.failed += 1
         _send_safe(pipe, {"event": "gossip_result", "success": ok})
     except Exception as exc:
+        stats.failed += 1
         log.debug(f"Gossip error: {exc}")
         _send_safe(pipe, {"event": "gossip_result", "success": False})
 

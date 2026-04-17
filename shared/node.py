@@ -7,6 +7,7 @@ import logging
 import multiprocessing
 import os
 import socket
+from concurrent.futures import BrokenExecutor, ProcessPoolExecutor
 from queue import Empty
 import time
 from blake3 import blake3
@@ -16,6 +17,45 @@ from logging.handlers import QueueListener
 import aiohttp
 
 from shared.block_requirements import compute_next_block_requirements, validate_block, compute_current_requirements
+
+_SPAWN_CTX = multiprocessing.get_context('spawn')
+
+# Per-worker singleton: ProcessPoolExecutor reuses worker processes across
+# calls, so we instantiate one BlockSigner per worker rather than paying
+# its init cost on every verify.
+_worker_signer: Optional['BlockSigner'] = None
+
+
+def _verify_worker_init() -> None:
+    """ProcessPoolExecutor initializer — one BlockSigner per worker."""
+    global _worker_signer
+    from shared.block_signer import BlockSigner as _BS
+    _worker_signer = _BS(seed=os.urandom(32))
+
+
+def _verify_signature_worker(
+    ecdsa_pk: bytes,
+    wots_pk: bytes,
+    message: bytes,
+    signature: bytes,
+) -> bool:
+    """Worker-side signature check. Uses the per-worker BlockSigner."""
+    global _worker_signer
+    if _worker_signer is None:
+        _verify_worker_init()
+    assert _worker_signer is not None
+    return _worker_signer.verify_combined_signature(
+        ecdsa_pk, wots_pk, message, signature
+    )
+
+
+def _validate_quantum_proof_worker(
+    block: 'Block',
+    prev_block: 'Block',
+) -> bool:
+    """Worker-side PoW check. Blocks cross the process boundary as dataclasses."""
+    block.quantum_proof.compute_derived_fields()
+    return validate_block(block, prev_block)
 
 if TYPE_CHECKING:
     pass
@@ -255,6 +295,12 @@ class Node:
         self.chain_lock = asyncio.Lock()
         self._index_append(genesis_block)
 
+        # CPU-bound verification (SPHINCS+ signature, PoW) is offloaded to
+        # this pool so the event loop stays responsive for gossip and other
+        # I/O. Lazy-initialized on first check_block to avoid spawn cost
+        # during tests that construct a Node but never verify a block.
+        self._verify_pool: Optional[ProcessPoolExecutor] = None
+
     def _setup_multiprocess_logging(self):
         """Set up logging queue and listener for multiprocessing."""
         # Use default multiprocessing context (should be spawn after CLI sets it)
@@ -489,6 +535,40 @@ class Node:
             if block.hash is not None:
                 self.chain_by_hash.pop(block.hash, None)
 
+    def _ensure_verify_pool(self) -> ProcessPoolExecutor:
+        if self._verify_pool is None:
+            self._verify_pool = ProcessPoolExecutor(
+                max_workers=max(2, (os.cpu_count() or 2) // 2),
+                mp_context=_SPAWN_CTX,
+                initializer=_verify_worker_init,
+            )
+        return self._verify_pool
+
+    async def _run_verify(
+        self,
+        fn: Callable[..., bool],
+        args: tuple,
+        inline_fn: Callable[[], bool],
+    ) -> bool:
+        """Run a CPU-bound verifier off the event loop; inline fallback on failure."""
+        pool = self._ensure_verify_pool()
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(pool, fn, *args)
+        except BrokenExecutor as exc:
+            self.logger.warning(
+                f"executor-fallback: verify pool broken ({exc}), "
+                f"running {fn.__name__} inline — next block will respawn pool"
+            )
+            self._verify_pool = None
+            return inline_fn()
+        except (OSError, EOFError) as exc:
+            self.logger.warning(
+                f"executor-fallback: IPC error ({exc}) in {fn.__name__}, "
+                f"running inline"
+            )
+            return inline_fn()
+
     async def check_block(self, block: Block, force_reorg: bool = False) -> tuple[bool, str | None]:
         """Check if a block is valid and can be accepted.
 
@@ -595,19 +675,32 @@ class Node:
             reason = "missing block bytes or signature"
             self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: {reason}")
             return False, reason
-        if not self.crypto.verify_combined_signature(
-            block.miner_info.ecdsa_public_key,
-            block.miner_info.wots_public_key,
-            block_bytes,
-            signature
-        ):
+        sig_valid = await self._run_verify(
+            _verify_signature_worker,
+            (block.miner_info.ecdsa_public_key,
+             block.miner_info.wots_public_key,
+             block_bytes,
+             signature),
+            inline_fn=lambda: self.crypto.verify_combined_signature(
+                block.miner_info.ecdsa_public_key,
+                block.miner_info.wots_public_key,
+                block_bytes,
+                signature,
+            ),
+        )
+        if not sig_valid:
             reason = "invalid signature"
             self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: {reason}")
             return False, reason
 
         # 4. Validate the Quantum Proof and other block artifacts.
         block.quantum_proof.compute_derived_fields()
-        if not validate_block(block, prev_block):
+        qp_valid = await self._run_verify(
+            _validate_quantum_proof_worker,
+            (block, prev_block),
+            inline_fn=lambda: validate_block(block, prev_block),
+        )
+        if not qp_valid:
             reason = "invalid quantum proof"
             self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid quantum proof (miner: {block.miner_info.miner_id})")
             qpjson = block.quantum_proof.to_json()
@@ -1094,6 +1187,13 @@ class Node:
                 h.close()
             except Exception:
                 pass
+
+        if self._verify_pool is not None:
+            try:
+                self._verify_pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            self._verify_pool = None
 
         # Stop the logging listener
         if self._log_listener:
