@@ -13,21 +13,25 @@ import logging
 import os
 import tempfile
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from shared.block import Block, MinerInfo
 
 
 @dataclass
 class NodeRecord:
-    """Telemetry record for a known network node."""
+    """Telemetry record for a known network node.
+
+    ``miner_id`` / ``miner_type`` are intentionally absent: they are
+    derivable from ``descriptor.node_name`` and ``descriptor.miners``
+    respectively, and the ``MinerInfo``-sourced versions carried stale
+    pre-upgrade values that were never refreshed by heartbeat.
+    """
 
     address: str
-    miner_id: Optional[str] = None
-    miner_type: Optional[str] = None
     ecdsa_public_key_hex: Optional[str] = None
     status: str = "active"
     last_heartbeat: Optional[float] = None
@@ -90,11 +94,8 @@ class TelemetryManager:
         rec.last_seen = now
         if last_heartbeat is not None:
             rec.last_heartbeat = last_heartbeat
-        if miner_info is not None:
-            rec.miner_id = miner_info.miner_id
-            rec.miner_type = miner_info.miner_type
-            if miner_info.ecdsa_public_key:
-                rec.ecdsa_public_key_hex = miner_info.ecdsa_public_key.hex()
+        if miner_info is not None and miner_info.ecdsa_public_key:
+            rec.ecdsa_public_key_hex = miner_info.ecdsa_public_key.hex()
         if descriptor is not None:
             rec.descriptor = descriptor
 
@@ -119,7 +120,10 @@ class TelemetryManager:
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "node_count": len(self._nodes),
             "active_count": active,
-            "nodes": {addr: asdict(rec) for addr, rec in self._nodes.items()},
+            "nodes": {
+                addr: _node_record_to_dict(rec)
+                for addr, rec in self._nodes.items()
+            },
         }
         self._atomic_write_json(target, payload)
 
@@ -131,15 +135,15 @@ class TelemetryManager:
         active = sum(1 for n in self._nodes.values() if n.status == "active")
         lines = [f"=== Known Nodes ({len(self._nodes)} total, {active} active) ==="]
         lines.append(
-            f"{'Address':<30} {'Miner ID':<20} {'Type':<10} "
+            f"{'Address':<30} {'Node':<20} {'Type':<10} "
             f"{'Status':<12} {'Last Heartbeat':<16} {'System'}"
         )
         now = time.time()
         for rec in sorted(self._nodes.values(), key=lambda r: r.last_seen, reverse=True):
             hb = _format_ago(now, rec.last_heartbeat) if rec.last_heartbeat else "never"
             lines.append(
-                f"{rec.address:<30} {(rec.miner_id or '-'):<20} "
-                f"{(rec.miner_type or '-'):<10} {rec.status:<12} "
+                f"{rec.address:<30} {_descriptor_node_label(rec.descriptor):<20} "
+                f"{_descriptor_miner_type(rec.descriptor):<10} {rec.status:<12} "
                 f"{hb:<16} {_describe_system(rec.descriptor)}"
             )
         self._logger.info("\n".join(lines))
@@ -263,6 +267,52 @@ class TelemetryManager:
                 raise
         except Exception as exc:
             self._logger.warning(f"Failed to write telemetry {target}: {exc}")
+
+
+def _node_record_to_dict(rec: NodeRecord) -> Dict[str, Any]:
+    """Flatten a NodeRecord into a JSON-friendly dict.
+
+    Connection metadata (address, status, heartbeat timestamps, ecdsa
+    pubkey) is merged with the descriptor so each node entry is a single
+    flat object. The descriptor — built through the
+    ``system_info.build_descriptor`` whitelist + ``_scrub()`` — is the
+    canonical source of node identity (``node_name``), hardware profile,
+    and per-miner detail (``miners``).
+    """
+    out: Dict[str, Any] = {
+        "address": rec.address,
+        "status": rec.status,
+        "first_seen": rec.first_seen,
+        "last_seen": rec.last_seen,
+        "last_heartbeat": rec.last_heartbeat,
+        "ecdsa_public_key_hex": rec.ecdsa_public_key_hex,
+    }
+    if rec.descriptor:
+        for key, value in rec.descriptor.items():
+            # Never let descriptor overwrite connection/status keys.
+            if key not in out:
+                out[key] = value
+    return out
+
+
+def _descriptor_node_label(descriptor: Optional[Dict]) -> str:
+    """Return a short node identifier for log-table display."""
+    if not descriptor:
+        return "-"
+    name = descriptor.get("node_name")
+    return name if name else "-"
+
+
+def _descriptor_miner_type(descriptor: Optional[Dict]) -> str:
+    """Derive a miner-type label (e.g. 'CPU', 'CPU+QPU') from a descriptor."""
+    if not descriptor:
+        return "-"
+    miners = descriptor.get("miners") or {}
+    kinds = sorted({
+        m.get("kind") for m in miners.values()
+        if isinstance(m, dict) and m.get("kind")
+    })
+    return "+".join(kinds) if kinds else "-"
 
 
 def _format_ago(now: float, ts: float) -> str:

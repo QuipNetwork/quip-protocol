@@ -136,6 +136,14 @@ def test_telemetry_nodes_json_has_no_secrets(tmp_path, node_with_secrets):
     _assert_no_secrets(nodes_json)
     parsed = json.loads(nodes_json)
     rec = parsed["nodes"]["peer.example.com:8085"]
-    # Descriptor propagated
-    assert rec["descriptor"]["descriptor_version"] >= 1
-    assert rec["miner_type"] in {"CPU+QPU", "CPU", "QPU"}
+    # Descriptor content is flattened into the entry. Confirm both the
+    # descriptor metadata and a derivable miner-type are present.
+    assert rec["descriptor_version"] >= 1
+    miner_kinds = sorted({
+        m.get("kind") for m in rec.get("miners", {}).values()
+        if isinstance(m, dict) and m.get("kind")
+    })
+    assert "+".join(miner_kinds) in {"CPU+QPU", "CPU", "QPU"}
+    # Legacy leak-prone fields must no longer be emitted.
+    assert "miner_type" not in rec
+    assert "miner_id" not in rec

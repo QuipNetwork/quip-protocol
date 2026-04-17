@@ -45,6 +45,12 @@ def _make_block_json(block_index, epoch_ts, energy=-3950.0):
 
 
 def _make_nodes_json(count=2, active=1):
+    """Build a nodes.json payload matching the current TelemetryManager shape.
+
+    Each entry is a flat merge of connection metadata and descriptor
+    fields; ``miner_id`` / ``miner_type`` are no longer at the top level
+    (derive them from ``node_name`` / ``miners`` when needed).
+    """
     return {
         "updated_at": "2026-04-02T23:31:53.610902+00:00",
         "node_count": count,
@@ -52,8 +58,9 @@ def _make_nodes_json(count=2, active=1):
         "nodes": {
             f"127.0.0.{i}:8085": {
                 "address": f"127.0.0.{i}:8085",
-                "miner_id": f"node-{i}",
                 "status": "active" if i < active else "initial_peer",
+                "node_name": f"node-{i}",
+                "miners": {"cpu": {"kind": "CPU", "num_cpus": 1}},
             }
             for i in range(count)
         },

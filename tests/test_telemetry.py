@@ -86,9 +86,59 @@ class TestNodeTelemetry:
         assert data["node_count"] == 1
         assert data["active_count"] == 1
         node = data["nodes"]["1.2.3.4:20049"]
-        assert node["miner_id"] == "node1-CPU-0"
+        assert node["address"] == "1.2.3.4:20049"
         assert node["status"] == "active"
         assert node["ecdsa_public_key_hex"] == (b"\x02" * 32).hex()
+        # miner_id / miner_type are no longer at top level — they are
+        # derived from the descriptor when one has been attached.
+        assert "miner_id" not in node
+        assert "miner_type" not in node
+
+    def test_update_node_flattens_descriptor(self, tmp_path):
+        tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
+        descriptor = {
+            "descriptor_version": 1,
+            "node_name": "test-node",
+            "public_host": "1.2.3.4",
+            "public_port": 20049,
+            "miners": {"cpu": {"kind": "CPU", "num_cpus": 4}},
+            "system_info": {"os": {"system": "Linux"}},
+        }
+        tm.update_node(
+            "1.2.3.4:20049", "active", _make_miner_info(),
+            descriptor=descriptor,
+        )
+
+        data = json.loads((tmp_path / "tel" / "nodes.json").read_text())
+        node = data["nodes"]["1.2.3.4:20049"]
+        # Descriptor keys are flattened onto the entry.
+        assert node["node_name"] == "test-node"
+        assert node["public_host"] == "1.2.3.4"
+        assert node["miners"]["cpu"]["kind"] == "CPU"
+        assert node["system_info"]["os"]["system"] == "Linux"
+        # Connection metadata sits alongside.
+        assert node["address"] == "1.2.3.4:20049"
+        assert node["status"] == "active"
+        # No nested "descriptor" wrapper and no legacy top-level fields.
+        assert "descriptor" not in node
+        assert "miner_id" not in node
+        assert "miner_type" not in node
+
+    def test_connection_metadata_survives_hostile_descriptor(self, tmp_path):
+        """A peer-supplied descriptor cannot overwrite our connection fields."""
+        tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
+        hostile = {
+            "node_name": "peer",
+            "address": "0.0.0.0:0",           # attempt to hijack
+            "status": "lost",                 # attempt to flip status
+            "last_heartbeat": 0,
+        }
+        tm.update_node("1.2.3.4:20049", "active", descriptor=hostile)
+
+        data = json.loads((tmp_path / "tel" / "nodes.json").read_text())
+        node = data["nodes"]["1.2.3.4:20049"]
+        assert node["address"] == "1.2.3.4:20049"
+        assert node["status"] == "active"
 
     def test_update_node_preserves_first_seen(self, tmp_path):
         tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
