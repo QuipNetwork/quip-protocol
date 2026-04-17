@@ -150,17 +150,22 @@ def _scrub(value: Any) -> Any:
 # ── Hardware probes (stdlib + pynvml) ─────────────────────────
 
 def _run_text(cmd: List[str], timeout: float = 2.0) -> Optional[str]:
-    """Run *cmd*, return stripped stdout, or None on any failure."""
+    """Run *cmd*, return stripped stdout, or None on any failure.
+
+    Output is decoded with ``errors='replace'`` so commands that emit
+    non-UTF-8 bytes (e.g. macOS ``ioreg -l``) don't crash the probe.
+    """
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True,
+            cmd, capture_output=True,
             timeout=timeout, check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
     if result.returncode != 0:
         return None
-    return result.stdout.strip() or None
+    decoded = result.stdout.decode("utf-8", errors="replace").strip()
+    return decoded or None
 
 
 def _cpu_brand() -> str:
@@ -328,39 +333,51 @@ def _nvidia_gpus() -> List[GPUInfo]:
         import pynvml
     except ImportError:
         return []
+    nvml_error = getattr(pynvml, "NVMLError", Exception)
     try:
         pynvml.nvmlInit()
-    except Exception:
+    except nvml_error as exc:
+        logger.debug("NVML init failed: %s", exc)
         return []
     gpus: List[GPUInfo] = []
+    count = 0
     try:
         count = pynvml.nvmlDeviceGetCount()
         for i in range(count):
-            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-            name = _nvml_decode(pynvml.nvmlDeviceGetName(handle))
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                name = _nvml_decode(pynvml.nvmlDeviceGetName(handle))
+            except nvml_error as exc:
+                logger.debug("NVML probe failed for GPU %d: %s", i, exc)
+                continue
             mem_mb: Optional[int] = None
             util: Optional[int] = None
             try:
                 mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
                 mem_mb = int(mem.total) // (1024 * 1024)
-            except Exception:
-                pass
+            except nvml_error as exc:
+                logger.debug("NVML memory probe failed for GPU %d: %s", i, exc)
             try:
                 rates = pynvml.nvmlDeviceGetUtilizationRates(handle)
                 util = int(rates.gpu)
-            except Exception:
-                pass
+            except nvml_error as exc:
+                logger.debug("NVML util probe failed for GPU %d: %s", i, exc)
             gpus.append(GPUInfo(
                 index=i, vendor="NVIDIA", name=name,
                 memory_mb=mem_mb, observed_utilization_pct=util,
             ))
-    except Exception as exc:
-        logger.debug("NVML probe failed: %s", exc)
+    except nvml_error as exc:
+        logger.debug("NVML enumeration failed: %s", exc)
     finally:
         try:
             pynvml.nvmlShutdown()
-        except Exception:
-            pass
+        except nvml_error as exc:
+            logger.debug("NVML shutdown failed: %s", exc)
+    if count and len(gpus) < count:
+        logger.warning(
+            "NVML reported %d GPUs but only %d were probed successfully",
+            count, len(gpus),
+        )
     return gpus
 
 
@@ -407,17 +424,11 @@ def _apple_gpu_name() -> Optional[str]:
 
 
 def _apple_gpu_core_count() -> Optional[int]:
-    """Parse GPU core count from 'ioreg -l | grep gpu-core-count'."""
-    try:
-        result = subprocess.run(
-            "ioreg -l | grep gpu-core-count",
-            shell=True, capture_output=True, text=True, timeout=2,
-        )
-    except (subprocess.TimeoutExpired, OSError):
+    """Parse GPU core count from ``ioreg -l`` output."""
+    out = _run_text(["ioreg", "-l"], timeout=2.0)
+    if not out:
         return None
-    if result.returncode != 0 or not result.stdout:
-        return None
-    for line in result.stdout.splitlines():
+    for line in out.splitlines():
         if "gpu-core-count" in line and "=" in line:
             _, _, rhs = line.partition("=")
             try:
@@ -667,11 +678,16 @@ def override_public_address(
     """
     if not descriptor or not validated_address:
         return descriptor
+    from shared.address_utils import parse_host_port
     try:
-        from shared.address_utils import parse_host_port
         host, port = parse_host_port(validated_address)
-    except (ImportError, ValueError):
-        return descriptor
+    except ValueError as exc:
+        logger.warning(
+            "override_public_address: rejecting descriptor, could not parse "
+            "validated address %r: %s",
+            validated_address, exc,
+        )
+        return None
     patched = dict(descriptor)
     patched["public_host"] = host
     patched["public_port"] = port

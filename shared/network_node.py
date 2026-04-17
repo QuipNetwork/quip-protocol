@@ -25,6 +25,7 @@ from shared.system_info import override_public_address
 from shared.version import (
     get_version, PROTOCOL_VERSION,
     is_version_compatible, MIN_COMPATIBLE_VERSION,
+    select_compatible_peers,
 )
 from shared.node_client import (
     NodeClient, QuicMessage, QuicMessageType,
@@ -596,20 +597,30 @@ class NetworkNode(Node):
         )
 
         # Suppress aioquic assertion errors from malformed packets
-        # (e.g. v1 nodes sending non-INITIAL first packets)
-        _default_handler = asyncio.get_event_loop().get_exception_handler()
+        # (e.g. v1 nodes sending non-INITIAL first packets).
+        # Guard against re-installing the handler on repeated start()
+        # calls — otherwise _default_handler would chain previous
+        # installs and leak memory.
+        loop = asyncio.get_running_loop()
+        if not getattr(loop, "_quip_quic_handler_installed", False):
+            _default_handler = loop.get_exception_handler()
 
-        def _quic_exception_handler(loop, context):
-            exc = context.get("exception")
-            if isinstance(exc, AssertionError) and "first packet must be INITIAL" in str(exc):
-                self.logger.debug("Dropped malformed QUIC packet (non-INITIAL first packet)")
-                return
-            if _default_handler:
-                _default_handler(loop, context)
-            else:
-                loop.default_exception_handler(context)
+            def _quic_exception_handler(loop_arg, context):
+                exc = context.get("exception")
+                if (isinstance(exc, AssertionError)
+                        and "first packet must be INITIAL" in str(exc)):
+                    self.logger.debug(
+                        "Dropped malformed QUIC packet "
+                        "(non-INITIAL first packet)"
+                    )
+                    return
+                if _default_handler:
+                    _default_handler(loop_arg, context)
+                else:
+                    loop_arg.default_exception_handler(context)
 
-        asyncio.get_event_loop().set_exception_handler(_quic_exception_handler)
+            loop.set_exception_handler(_quic_exception_handler)
+            loop._quip_quic_handler_installed = True
 
         # Suppress noisy aioquic internal warnings (CRYPTO frame errors
         # from incompatible peers)
@@ -1683,11 +1694,9 @@ class NetworkNode(Node):
             return False
 
         # Update node client with only version-confirmed compatible peers
-        compatible_peers = {
-            peer: info for peer, info in self.peers.items()
-            if self.peer_versions.get(peer) is not None
-            and is_version_compatible(self.peer_versions[peer])
-        }
+        compatible_peers = select_compatible_peers(
+            self.peers, self.peer_versions,
+        )
         self.node_client.update_peers(compatible_peers)
 
         synchronizer = BlockSynchronizer(
@@ -1814,20 +1823,24 @@ class NetworkNode(Node):
                         responder_descriptor, peer_address,
                     ),
                 )
+                # Record the responder's version so sync filters can
+                # see this peer before the first heartbeat arrives.
+                runtime = responder_descriptor.get("runtime") or {}
+                responder_version = runtime.get("quip_version")
+                if responder_version:
+                    self.peer_versions[peer_address] = responder_version
 
-            # Add all nodes from the peer's node list
+            # Add all nodes from the peer's node list. Transitive peers
+            # arrive without a descriptor — we will learn it via their
+            # own heartbeat/join later.
             peers_found = 0
             peers_map = result.get("peers", {}) or {}
-            descriptors_map = result.get("descriptors", {}) or {}
             for peer_host, peer_info_json in peers_map.items():
                 # except ourselves
                 if peer_host == self.public_host:
                     continue
                 info = MinerInfo.from_json(peer_info_json)
-                peer_desc = override_public_address(
-                    descriptors_map.get(peer_host), peer_host,
-                )
-                if await self.add_peer(peer_host, info, descriptor=peer_desc):
+                if await self.add_peer(peer_host, info, descriptor=None):
                     peers_found += 1
 
             if peers_found > 0:
@@ -1900,22 +1913,26 @@ class NetworkNode(Node):
             peer = result.get("peer", "?")
             if result.get("success") and result.get("peers_map"):
                 peers_map = result["peers_map"]
-                descriptors_map = result.get("descriptors_map") or {}
                 responder_desc = result.get("responder_descriptor")
                 if responder_desc and peer != self.public_host:
                     self.telemetry.update_node(
                         peer, "active",
                         descriptor=override_public_address(responder_desc, peer),
                     )
+                    # Record responder's version so sync filters can
+                    # see this peer before the first heartbeat arrives.
+                    runtime = responder_desc.get("runtime") or {}
+                    responder_version = runtime.get("quip_version")
+                    if responder_version:
+                        self.peer_versions[peer] = responder_version
                 peers_found = 0
                 for peer_host, peer_info_json in peers_map.items():
                     if peer_host == self.public_host:
                         continue
                     info = MinerInfo.from_json(peer_info_json)
-                    peer_desc = override_public_address(
-                        descriptors_map.get(peer_host), peer_host,
-                    )
-                    if await self.add_peer(peer_host, info, descriptor=peer_desc):
+                    # Transitive peers have no descriptor; we'll learn
+                    # it from their own heartbeat/join later.
+                    if await self.add_peer(peer_host, info, descriptor=None):
                         peers_found += 1
                 if peers_found > 0:
                     self.logger.info(
@@ -2321,7 +2338,11 @@ class NetworkNode(Node):
                 self.logger.debug(f"Rate limited {peer_addr}")
                 return msg.create_error_response("Rate limited")
 
-            # Validate protocol version - reject incompatible nodes
+            # Validate protocol version - reject incompatible nodes.
+            # We only log here; we don't add a telemetry entry because
+            # the transport-level peer address (ip:ephemeral-port) is
+            # not the peer's public identity and would pollute
+            # nodes.json with ghost rows that never reconcile.
             if msg.protocol_version != PROTOCOL_VERSION:
                 peer_addr = str(protocol._peer_address)
                 self.logger.debug(
@@ -2329,11 +2350,8 @@ class NetworkNode(Node):
                     peer_addr, PROTOCOL_VERSION, msg.protocol_version,
                     msg.msg_type.name,
                 )
-                self.telemetry.update_node(
-                    peer_addr, "version_mismatch",
-                )
                 # Schedule connection close after response is sent
-                asyncio.get_event_loop().call_later(0.1, protocol.close)
+                asyncio.get_running_loop().call_later(0.1, protocol.close)
                 return msg.create_error_response(
                     f"Protocol version mismatch: expected {PROTOCOL_VERSION}, got {msg.protocol_version}",
                 )
@@ -2832,26 +2850,30 @@ class NetworkNode(Node):
             )
 
         join_version = data.get("version")
-        if join_version:
-            self.peer_versions[new_node_address] = join_version
-            if not is_version_compatible(join_version):
-                await self._backoff_peer(
-                    new_node_address,
-                    f"incompatible version {join_version} "
-                    f"(min: {MIN_COMPATIBLE_VERSION}, "
-                    f"local: {get_version()})",
-                )
-                return msg.create_error_response(
-                    f"Version {join_version} incompatible "
-                    f"(minimum: {MIN_COMPATIBLE_VERSION})"
-                )
+        # A missing version field is treated as incompatible — peers
+        # cannot bypass the MIN_COMPATIBLE_VERSION gate by omitting it.
+        if not is_version_compatible(join_version):
+            await self._backoff_peer(
+                new_node_address,
+                f"incompatible version {join_version!r} "
+                f"(min: {MIN_COMPATIBLE_VERSION}, "
+                f"local: {get_version()})",
+            )
+            return msg.create_error_response(
+                f"Version {join_version!r} incompatible "
+                f"(minimum: {MIN_COMPATIBLE_VERSION})"
+            )
+        self.peer_versions[new_node_address] = join_version
+        try:
             peer_ver = version.parse(join_version)
             local_ver = version.parse(get_version())
-            if peer_ver > local_ver:
-                self.logger.info(
-                    f"Peer {new_node_address} runs newer version "
-                    f"{join_version} (local: {get_version()})"
-                )
+        except version.InvalidVersion:
+            peer_ver = local_ver = None
+        if peer_ver is not None and local_ver is not None and peer_ver > local_ver:
+            self.logger.info(
+                f"Peer {new_node_address} runs newer version "
+                f"{join_version} (local: {get_version()})"
+            )
 
         # Add the new node. Override the sender's self-reported
         # public_host/public_port with the address we actually validated.
@@ -2890,27 +2912,32 @@ class NetworkNode(Node):
                 json.dumps({"status": "backed_off"}).encode('utf-8')
             )
 
-        if net_version:
-            if not is_version_compatible(net_version):
+        # Heartbeats without a parseable version are rejected so a peer
+        # can't bypass the version gate by omitting the field.
+        if not is_version_compatible(net_version):
+            if sender:
                 await self._backoff_peer(
                     sender,
-                    f"incompatible version {net_version} "
+                    f"incompatible version {net_version!r} "
                     f"(min: {MIN_COMPATIBLE_VERSION}, "
                     f"local: {get_version()})",
                 )
-                return msg.create_response(
-                    json.dumps(
-                        {"status": "incompatible_version"}
-                    ).encode('utf-8')
-                )
+            return msg.create_response(
+                json.dumps(
+                    {"status": "incompatible_version"}
+                ).encode('utf-8')
+            )
+        try:
             peer_ver = version.parse(net_version)
             local_ver = version.parse(get_version())
-            if peer_ver > local_ver:
-                self.logger.info(
-                    f"Peer {sender} runs newer version "
-                    f"{net_version} (local: {get_version()}). "
-                    f"Consider updating."
-                )
+        except version.InvalidVersion:
+            peer_ver = local_ver = None
+        if peer_ver is not None and local_ver is not None and peer_ver > local_ver:
+            self.logger.info(
+                f"Peer {sender} runs newer version "
+                f"{net_version} (local: {get_version()}). "
+                f"Consider updating."
+            )
 
         if sender and net_version:
             self.peer_versions[sender] = net_version

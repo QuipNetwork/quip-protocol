@@ -27,8 +27,9 @@ _SECRETS = [
     "TOPSECRET-SEED",
     "dwave-ABCDEF-NEVER-SHIP",
     "ibm-ZZZ-PRIVATE",
-    "10.9.8.7:65000",      # planted peer address
-    "192.168.77.33",       # planted internal listen IP
+    "10.9.8.7:65000",            # planted peer address
+    "192.168.77.33",             # planted internal listen IP
+    "/etc/quip/private-key.pem", # planted TLS private-key path
 ]
 
 
@@ -47,6 +48,7 @@ def sensitive_miners_config():
         "auto_mine": True,
         "log_level": "INFO",
         "tls_cert_file": "/etc/quip/cert.pem",
+        "tls_key_file": "/etc/quip/private-key.pem",
         # Miner sections
         "cpu": {"num_cpus": 1},
         "dwave": {

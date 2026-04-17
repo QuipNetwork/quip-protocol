@@ -15,7 +15,14 @@ import os
 
 @dataclass
 class SyncResult:
-    """Result of a block synchronization attempt."""
+    """Result of a block synchronization attempt.
+
+    ``success`` is True only when every requested block was downloaded
+    and handed off for validation. Partial progress on a timed-out sync
+    is reported via ``downloaded``/``requested`` but must not set
+    ``success=True`` — callers rely on that flag to decide whether to
+    mark the node synchronized and resume mining.
+    """
 
     success: bool
     requested: int = 0
@@ -29,6 +36,11 @@ class SyncResult:
             return (
                 f"Synced {self.downloaded}/{self.requested} blocks "
                 f"in {self.elapsed:.1f}s"
+            )
+        if self.failed_block is None:
+            return (
+                f"Sync incomplete: {self.downloaded}/{self.requested} "
+                f"downloaded in {self.elapsed:.1f}s"
             )
         return (
             f"Sync failed at block {self.failed_block}: "
@@ -140,8 +152,8 @@ class BlockSynchronizer:
             for _ in range(num_producers):
                 try:
                     download_queue.put(None)  # Sentinel value to stop producers
-                except:
-                    pass  # Queue might be full or closed
+                except (ValueError, OSError, queue.Full):
+                    pass  # Queue may be closed (ValueError) or full
                     
             for p in producer_processes:
                 if p.is_alive():
@@ -299,11 +311,13 @@ class BlockSynchronizer:
                         if blocks_synced > 0:
                             self.logger.warning(
                                 "Timeout after syncing %d blocks, "
-                                "returning partial success",
+                                "returning incomplete sync",
                                 blocks_synced,
                             )
-                            return SyncResult(success=True, downloaded=downloaded)
-                        self.logger.error("Timeout with no progress on block downloads")
+                        else:
+                            self.logger.error(
+                                "Timeout with no progress on block downloads"
+                            )
                         return SyncResult(
                             success=False, downloaded=downloaded,
                             failed_block=next_expected,

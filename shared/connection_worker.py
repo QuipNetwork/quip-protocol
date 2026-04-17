@@ -10,8 +10,10 @@ Request queue (parent -> worker):
     {"op": "shutdown"}
 
 Result queue (worker -> parent):
-    {"peer": "host:port", "success": True,  "peers_map": {...}}
-    {"peer": "host:port", "success": False, "peers_map": None}
+    {"peer": "host:port", "success": True,  "peers_map": {...},
+     "responder_descriptor": {...} | None}
+    {"peer": "host:port", "success": False, "peers_map": None,
+     "responder_descriptor": None}
 """
 from __future__ import annotations
 
@@ -54,13 +56,11 @@ async def _try_join_peer(
             peer, join_data, bypass_ban=bypass_ban,
         )
         peers_map = result.get("peers", {}) if result else None
-        descriptors_map = result.get("descriptors", {}) if result else None
         responder_descriptor = result.get("descriptor") if result else None
         result_queue.put({
             "peer": peer,
             "success": result is not None,
             "peers_map": peers_map,
-            "descriptors_map": descriptors_map,
             "responder_descriptor": responder_descriptor,
         })
         if result is not None:
@@ -73,7 +73,6 @@ async def _try_join_peer(
             "peer": peer,
             "success": False,
             "peers_map": None,
-            "descriptors_map": None,
             "responder_descriptor": None,
         })
 
