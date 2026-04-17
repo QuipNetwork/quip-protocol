@@ -185,19 +185,19 @@ def test_clear_all(ban_list):
 # --- Expiry ---
 
 def test_cooldown_expires():
-    bl = PeerBanList(cooldown=0.1)
+    bl = PeerBanList(cooldown=0.02)
     bl.record_failure("peer:1", "timeout")
     assert bl.is_banned("peer:1")
-    time.sleep(0.15)
+    time.sleep(0.05)
     assert not bl.is_banned("peer:1")
 
 
 def test_ban_expires():
-    bl = PeerBanList(min_duration=0.1, max_duration=1.0, ban_threshold=1)
+    bl = PeerBanList(min_duration=0.02, max_duration=1.0, ban_threshold=1)
     with patch("shared.peer_ban_list.random.uniform", return_value=1.0):
         bl.record_failure("peer:1", "timeout")
     assert bl.is_banned("peer:1")
-    time.sleep(0.15)
+    time.sleep(0.05)
     assert not bl.is_banned("peer:1")
 
 
