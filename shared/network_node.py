@@ -1620,17 +1620,13 @@ class NetworkNode(Node):
             else:
                 raise RuntimeError("No peers to synchronize with")
 
-        # Filter to peers running a compatible version
-        compatible_peers = []
-        for peer in self.peers:
-            peer_ver = self.peer_versions.get(peer)
-            if peer_ver is None:
-                # No version info yet (no heartbeat received) — include tentatively
-                compatible_peers.append(peer)
-            elif is_version_compatible(peer_ver):
-                compatible_peers.append(peer)
-            else:
-                self.logger.debug(f"Skipping peer {peer} for sync: version {peer_ver} incompatible")
+        # Unified version filter with synchronize_blockchain. Peers whose
+        # version is not yet observed (transitive peers awaiting their
+        # first heartbeat) are excluded — we defer syncing from them until
+        # they are positively version-gated.
+        compatible_peers = list(
+            select_compatible_peers(self.peers, self.peer_versions)
+        )
 
         if not compatible_peers:
             self.logger.warning("No compatible-version peers available for sync")
