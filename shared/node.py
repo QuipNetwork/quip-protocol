@@ -390,7 +390,23 @@ class Node:
                 }
             }
             self.miner_handles.append(MinerHandle(spec, self._log_queue))
-
+        # IonQ QAOA Miners
+        if cfg.get("ionq_qaoa") is not None:
+            ionq_cfg = cfg.get("ionq_qaoa", {})
+            spec = {
+                "id": f"{self.node_id}-IONQ-1",
+                "kind": "ionq_qaoa",
+                "cfg": {
+                    "subgraph_size": ionq_cfg.get("subgraph_size", 28),
+                    "p": ionq_cfg.get("p", 1),
+                    "optimizer": ionq_cfg.get("optimizer", "COBYLA"),
+                    "shots": ionq_cfg.get("shots", 1024),
+                    "backend": ionq_cfg.get("backend", "aer"),
+                    "ionq_api_token": ionq_cfg.get("ionq_api_token"),
+                    "ionq_backend_name": ionq_cfg.get("ionq_backend_name", "aer_simulator"),
+                }
+            }
+            self.miner_handles.append(MinerHandle(spec, self._log_queue))
         # Back-compat summary list for logs (do not assign to typed self.miners)
         self._summary_miners = [(h.miner_id, h.miner_type) for h in self.miner_handles]
 

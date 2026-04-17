@@ -62,7 +62,7 @@ def _load_config(path: Optional[str]) -> Dict[str, Any]:
     cfg = _merge_globals_from_toml(config)
 
     # Forward miner sections
-    for section in ("cpu", "gpu", "qpu", "ibm_qaoa"):
+    for section in ("cpu", "gpu", "qpu", "ibm_qaoa","ionq_qaoa"):
         if section in config:
             cfg[section] = config[section]
 
@@ -240,7 +240,7 @@ def quip_network_node(ctx: click.Context, config: Optional[str], version: bool, 
         cfg = ctx.obj.get("config", {})
 
         # Check if any miner sections are present
-        has_miners = any(k in cfg for k in ("cpu", "gpu", "qpu", "ibm_qaoa"))
+        has_miners = any(k in cfg for k in ("cpu", "gpu", "qpu", "ibm_qaoa","ionq_qaoa"))
         if not has_miners:
             raise click.UsageError("No subcommand given and no miner sections ([cpu], [gpu], [qpu], [ibm_qaoa]) found in config")
         
@@ -634,7 +634,114 @@ def ibm_qaoa(
 
     sys.exit(_run_network_node_sync(conf, genesis_config))
 
-
+@quip_network_node.command(name="ionq_qaoa")
+# Global network options
+@click.option("--listen", type=str, default=None, help="Address to bind; IPv6 supported (e.g., ::1 or ::). Defaults from [global].listen or 127.0.0.1")
+@click.option("--port", type=int, default=None, help="Port to bind (defaults from [global].port or 20049)")
+@click.option("--public-host", type=str, default=None, help="Public hostname or IP advertised to peers")
+@click.option("--public-port", type=int, default=None, help="Public port advertised to peers (defaults to --port)")
+@click.option("--node-name", type=str, default=None, help="Human-readable node name")
+@click.option("--secret", type=str, default=None, help="Deterministic secret for keypair")
+@click.option("--auto-mine/--no-auto-mine", default=None, help="Enable/disable auto-mining when no peers found")
+@click.option("--peer", "peers", multiple=True, help="Peer host:port; use [IPv6]:port for IPv6 (repeat for multiple)")
+@click.option("--timeout", type=int, default=None, help="Node/network timeout seconds")
+@click.option("--heartbeat-interval", type=int, default=None, help="Seconds between heartbeats")
+@click.option("--heartbeat-timeout", type=int, default=None, help="Peer heartbeat timeout seconds")
+@click.option("--fanout", type=int, default=None, help="Gossip fanout")
+# Logging options
+@click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default=None, help="Logging level")
+@click.option("--node-log", type=str, default=None, help="Path to main node log file (defaults to stderr)")
+@click.option("--http-log", type=str, default=None, help="Path to HTTP log file or 'stderr'/'stdout' for console (suppresses aiohttp logs if not set)")
+# IonQ QAOA options
+@click.option("--subgraph-size", type=int, default=None, help="Number of nodes to extract from protocol topology (default: 28)")
+@click.option("--p", "qaoa_p", type=int, default=None, help="QAOA circuit depth / number of layers (default: 1)")
+@click.option("--optimizer", type=click.Choice(["COBYLA", "NELDER_MEAD", "POWELL", "L_BFGS_B", "SPSA"], case_sensitive=False), default=None, help="Classical optimizer (default: COBYLA)")
+@click.option("--shots", type=int, default=None, help="Shots per evaluation during optimization (default: 1024)")
+@click.option("--backend", type=click.Choice(["aer", "ionq"], case_sensitive=False), default=None, help="Backend: 'aer' for local AerSimulator (default), 'ionq' for IonQ cloud")
+@click.option("--ionq-api-token", type=str, default=None, help="IonQ API token (required when backend=ionq). Can also set IONQ_API_KEY env var.")
+@click.option("--ionq-backend-name", type=str, default=None, help="IonQ backend: 'ionq_simulator' (cloud sim, default when backend=ionq), 'ionq_qpu' (real hardware)")
+# Other
+@click.option("--genesis-config", type=str, default="genesis_block.json", show_default=True, help="Genesis block configuration file")
+@click.option("--debug-config", is_flag=True, help="Print final configuration as JSON")
+@click.pass_context
+def ionq_qaoa(
+    ctx: click.Context,
+    listen: Optional[str],
+    port: Optional[int],
+    public_host: Optional[str],
+    public_port: Optional[int],
+    node_name: Optional[str],
+    secret: Optional[str],
+    auto_mine: Optional[bool],
+    peers: List[str],
+    timeout: Optional[int],
+    heartbeat_interval: Optional[int],
+    heartbeat_timeout: Optional[int],
+    fanout: Optional[int],
+    log_level: Optional[str],
+    node_log: Optional[str],
+    http_log: Optional[str],
+    subgraph_size: Optional[int],
+    qaoa_p: Optional[int],
+    optimizer: Optional[str],
+    shots: Optional[int],
+    backend: Optional[str],
+    ionq_api_token: Optional[str],
+    ionq_backend_name: Optional[str],
+    genesis_config: str,
+    debug_config: bool,
+):
+    """Run an IonQ QAOA miner network node (AerSimulator or IonQ cloud)."""
+    # Load full TOML config
+    toml_cfg = (ctx.obj or {}).get("config", {})
+ 
+    conf = dict(toml_cfg)
+    conf.pop("gpu", None)
+    conf.pop("cpu", None)
+    conf.pop("qpu", None)
+    conf.pop("ibm_qaoa", None)
+ 
+    # Apply CLI overrides
+    conf = _apply_global_overrides(conf, listen, port, public_host, public_port, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
+ 
+    # Handle IonQ QAOA-specific configuration
+    ionq_cfg = dict((conf.get("ionq_qaoa") or {}))
+ 
+    # Apply CLI overrides to IonQ config
+    if subgraph_size is not None:
+        ionq_cfg["subgraph_size"] = subgraph_size
+    if qaoa_p is not None:
+        ionq_cfg["p"] = qaoa_p
+    if optimizer is not None:
+        ionq_cfg["optimizer"] = optimizer
+    if shots is not None:
+        ionq_cfg["shots"] = shots
+    if backend is not None:
+        ionq_cfg["backend"] = backend
+    if ionq_api_token is not None:
+        ionq_cfg["ionq_api_token"] = ionq_api_token
+    if ionq_backend_name is not None:
+        ionq_cfg["ionq_backend_name"] = ionq_backend_name
+ 
+    # Read IonQ token from env var if not provided
+    if not ionq_cfg.get("ionq_api_token"):
+        env_token = os.environ.get("IONQ_API_KEY")
+        if env_token:
+            ionq_cfg["ionq_api_token"] = env_token
+ 
+    if not ionq_cfg:
+        ionq_cfg = {}
+    conf["ionq_qaoa"] = ionq_cfg
+ 
+    # Use genesis config from TOML if CLI option is default and TOML has it
+    if genesis_config == "genesis_block.json" and "genesis_config" in conf:
+        genesis_config = conf["genesis_config"]
+ 
+    # Print final configuration if requested
+    if debug_config or (ctx.obj or {}).get("debug_config", False):
+        _print_final_config(conf, "ionq_qaoa")
+ 
+    sys.exit(_run_network_node_sync(conf, genesis_config))
 # -----------------------------
 # quip-network-simulator
 # -----------------------------
@@ -785,3 +892,5 @@ def network_simulator_main():
 
     quip_network_simulator(standalone_mode=False)
 
+if __name__ == "__main__":
+    network_node_main()

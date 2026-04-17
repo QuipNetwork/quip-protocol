@@ -207,6 +207,39 @@ def build_miner_from_spec(spec: Dict[str, Any]):
             nodes, edges = _extract_subgraph(nodes, edges, subgraph_size)
             logger.info(f"Extracted {len(nodes)}-node subgraph ({len(edges)} edges) from {len(DEFAULT_TOPOLOGY.nodes)}-node topology")
         return QPU.IBMQAOAMiner(miner_id, nodes=nodes, edges=edges, backend=backend, **cfg)
+    elif kind == "ionq_qaoa":
+        import QPU
+        from dwave_topologies import DEFAULT_TOPOLOGY
+        subgraph_size = cfg.pop("subgraph_size", 28)
+        backend_type = cfg.pop("backend", "aer")
+        ionq_api_token = cfg.pop("ionq_api_token", None)
+        ionq_backend_name = cfg.pop("ionq_backend_name", "aer_simulator")
+ 
+        # Build backend
+        backend = None  # None → AerSimulator (default)
+        if backend_type == "ionq":
+            # IonQ cloud backends — solver handles provider setup internally
+            backend = None  # solver will use _create_ionq_backend()
+            logger.info(f"Using IonQ backend: {ionq_backend_name}")
+        else:
+            logger.info("Using AerSimulator backend (local simulation)")
+ 
+        # Extract subgraph
+        nodes = list(DEFAULT_TOPOLOGY.nodes)
+        edges = list(DEFAULT_TOPOLOGY.edges)
+        if subgraph_size < len(nodes):
+            nodes, edges = _extract_subgraph(nodes, edges, subgraph_size)
+            logger.info(f"Extracted {len(nodes)}-node subgraph ({len(edges)} edges) from {len(DEFAULT_TOPOLOGY.nodes)}-node topology")
+ 
+        # Pass IonQ credentials for cloud backend setup
+        ionq_token = ionq_api_token if backend_type == "ionq" else None
+        ionq_backend = ionq_backend_name if backend_type == "ionq" else "aer_simulator"
+ 
+        return QPU.IonQQAOAMiner(
+            miner_id, nodes=nodes, edges=edges, backend=backend,
+            ionq_token=ionq_token, ionq_backend=ionq_backend, **cfg,
+        )
+    
     elif kind == "cpu-filtered":
         from CPU.sa_filtered_miner import SAFilteredMiner
         return SAFilteredMiner(miner_id, **cfg)
@@ -284,6 +317,8 @@ class MinerHandle:
             return "QPU"
         if k == "ibm_qaoa":
             return "IBM_QAOA"
+        if k == "ionq_qaoa":
+            return "IONQ_QAOA"
         if k == "modal":
             t = (self.spec.get("args", {}) or {}).get("gpu_type", "t4")
             return f"GPU-{t.upper()}"
