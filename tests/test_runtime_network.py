@@ -26,9 +26,23 @@ def test_network_cpu_only_smoke():
     )
     assert result.exit_code == 0, result.output
     out = result.output
-    assert f"Running: quip-network-node cpu --port {base_port}" in out
-    assert f"Running: quip-network-node cpu --port {base_port+1} --peer localhost:{base_port}" in out
-    assert f"Running: quip-network-node cpu --port {base_port+2} --peer localhost:{base_port}" in out
+    # Simulator pins listen/public-host to 127.0.0.1 and assigns each
+    # child a unique REST port so they don't collide on 20050.
+    assert (
+        f"Running: quip-network-node cpu --listen 127.0.0.1 "
+        f"--port {base_port} --public-host 127.0.0.1 "
+        f"--rest-insecure-port 20050"
+    ) in out
+    assert (
+        f"Running: quip-network-node cpu --listen 127.0.0.1 "
+        f"--port {base_port+1} --public-host 127.0.0.1 "
+        f"--rest-insecure-port 20051 --peer 127.0.0.1:{base_port}"
+    ) in out
+    assert (
+        f"Running: quip-network-node cpu --listen 127.0.0.1 "
+        f"--port {base_port+2} --public-host 127.0.0.1 "
+        f"--rest-insecure-port 20052 --peer 127.0.0.1:{base_port}"
+    ) in out
 
 
 def test_network_cpu_plus_gpu_env_only(monkeypatch):
