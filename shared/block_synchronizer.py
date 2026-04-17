@@ -154,11 +154,20 @@ class BlockSynchronizer:
         local_tip = self.local_tip()
         local_height = local_tip.header.index
 
-        candidates = await self._discover_tips(
+        candidates, surveyed, failed = await self._discover_tips(
             local_height=local_height,
             max_height_hint=end_index if end_index > 0 else None,
         )
         if not candidates:
+            # Distinguish "peers responded, none has a longer chain"
+            # (genuinely in sync) from "every surveyed peer errored out"
+            # (unknown state; do not mark ourselves synchronized).
+            if surveyed > 0 and failed == surveyed:
+                return SyncResult(
+                    success=False,
+                    elapsed=time.monotonic() - t0,
+                    reason=f"tip survey failed for all {surveyed} peers",
+                )
             return SyncResult(
                 success=True,
                 elapsed=time.monotonic() - t0,
@@ -239,18 +248,26 @@ class BlockSynchronizer:
         self,
         local_height: int,
         max_height_hint: Optional[int],
-    ) -> List[TipGroup]:
-        """Query every peer for its tip and group peers by head hash."""
+    ) -> Tuple[List[TipGroup], int, int]:
+        """Query every peer for its tip and group peers by head hash.
+
+        Returns ``(groups, surveyed, failed)``. ``failed`` counts peers
+        whose tip query raised or returned ``None``; callers use it to
+        distinguish "we surveyed peers and nobody has a longer chain"
+        from "every peer errored so we don't know if we're behind".
+        """
         peers = list(self.node_client.peers.keys())
         if not peers:
-            return []
+            return [], 0, 0
 
         tasks = [self._fetch_peer_tip(peer) for peer in peers]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         groups: Dict[bytes, TipGroup] = {}
+        failed = 0
         for peer, result in zip(peers, results):
             if isinstance(result, Exception) or result is None:
+                failed += 1
                 continue
             height, head_hash = result
             if height <= local_height:
@@ -267,19 +284,32 @@ class BlockSynchronizer:
             else:
                 g.peers.append(peer)
 
-        return sorted(
+        sorted_groups = sorted(
             groups.values(),
             key=lambda g: (-g.height, -len(g.peers), g.head_hash),
         )
+        return sorted_groups, len(peers), failed
 
     async def _fetch_peer_tip(self, peer: str) -> Optional[Tuple[int, bytes]]:
-        """Return ``(height, head_hash)`` for a peer, or ``None`` on failure."""
+        """Return ``(height, head_hash)`` for a peer, or ``None`` on failure.
+
+        Timeouts are expected under partial network reachability and are
+        logged at DEBUG. Any other exception is logged at WARNING so a
+        programming/codec bug in the tip-survey path is discoverable
+        rather than silently masquerading as a non-advancing peer.
+        """
         try:
             block = await asyncio.wait_for(
                 self.node_client.get_peer_block(peer, 0),
                 timeout=TIP_SURVEY_TIMEOUT_SECONDS,
             )
-        except (asyncio.TimeoutError, Exception):
+        except asyncio.TimeoutError:
+            self.logger.debug(f"Tip survey for {peer} timed out")
+            return None
+        except Exception:
+            self.logger.warning(
+                f"Tip survey for {peer} failed", exc_info=True
+            )
             return None
         if block is None or block.hash is None:
             return None

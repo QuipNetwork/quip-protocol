@@ -384,13 +384,21 @@ class TofuVerificationError(Exception):
     pass
 
 
+_MODULE_LOGGER = logging.getLogger(__name__)
+
+
 async def _safe_aexit(ctx: Any) -> None:
     """Invoke ``ctx.__aexit__`` swallowing any exception, used when we
-    schedule aioquic cleanup as a background task."""
+    schedule aioquic cleanup as a background task.
+
+    Exceptions here are not actionable — the caller has already moved
+    on — but we log at DEBUG so a spike of cleanup failures is still
+    discoverable via logs.
+    """
     try:
         await ctx.__aexit__(None, None, None)
     except Exception:
-        pass
+        _MODULE_LOGGER.debug("aioquic cleanup raised", exc_info=True)
 
 
 class NodeClient:
@@ -571,7 +579,10 @@ class NodeClient:
             try:
                 await ctx.__aexit__(None, None, None)
             except Exception:
-                pass
+                self.logger.debug(
+                    "aioquic cleanup raised in production path",
+                    exc_info=True,
+                )
             return
         asyncio.create_task(_safe_aexit(ctx))
 

@@ -989,7 +989,16 @@ class RestApiServer:
     ) -> None:
         try:
             await client.write(msg)
-        except (ConnectionResetError, ConnectionAbortedError, RuntimeError):
+        except (ConnectionResetError, ConnectionAbortedError):
+            self._sse_drop_client(client)
+        except RuntimeError:
+            # aiohttp raises RuntimeError for a range of states: transport
+            # already closed, response not prepared, etc. Log before
+            # dropping so a programming bug doesn't hide as "slow consumer".
+            self.logger.debug(
+                "SSE write raised RuntimeError; dropping client",
+                exc_info=True,
+            )
             self._sse_drop_client(client)
 
     def _sse_after_write(self, client: web.StreamResponse) -> None:

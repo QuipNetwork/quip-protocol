@@ -74,12 +74,15 @@ async def test_discover_tips_groups_ranks_and_filters():
         _fake_block(15, h_mid_a),  # C — tied with D on hash
         _fake_block(15, h_mid_a),  # D
     ]
-    groups = await sync._discover_tips(local_height=0, max_height_hint=None)
+    groups, surveyed, failed = await sync._discover_tips(
+        local_height=0, max_height_hint=None
+    )
     assert [(g.height, sorted(g.peers)) for g in groups] == [
         (20, ["A"]),
         (15, ["C", "D"]),  # more peers wins the tiebreak
         (15, ["B"]),
     ]
+    assert (surveyed, failed) == (4, 0)
 
 
 @pytest.mark.asyncio
@@ -90,8 +93,11 @@ async def test_discover_tips_honors_hints_and_handles_failures():
         _fake_block(500, _hash(2)),  # B — exceeds hint, skip
         None,                         # C — fetch failure, skip
     ]
-    groups = await sync._discover_tips(local_height=0, max_height_hint=200)
+    groups, surveyed, failed = await sync._discover_tips(
+        local_height=0, max_height_hint=200
+    )
     assert [(g.height, g.peers) for g in groups] == [(100, ["A"])]
+    assert (surveyed, failed) == (3, 1)
 
 
 # ---------------------------------------------------------------------------
