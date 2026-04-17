@@ -6,6 +6,7 @@ Runs alongside the QUIC server on a separate port.
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -121,6 +122,11 @@ class RestApiServer:
         )
         self._telemetry_max_sse = telemetry_max_sse
         self._sse_clients: List[web.StreamResponse] = []
+        # Guards check-then-append / iterate-and-remove on _sse_clients.
+        self._sse_lock = asyncio.Lock()
+        # Tracks pending background writes per client so we can drop
+        # slow consumers instead of accumulating unbounded write tasks.
+        self._sse_pending: "dict[web.StreamResponse, int]" = {}
         self._rate_limit_prune_task: Optional[asyncio.Task] = None
 
         self._http_runner: Optional[web.AppRunner] = None
@@ -677,7 +683,10 @@ class RestApiServer:
         if not self._telemetry_token:
             return await handler(request)
         auth = request.headers.get("Authorization", "")
-        if auth == f"Bearer {self._telemetry_token}":
+        expected = f"Bearer {self._telemetry_token}"
+        # Constant-time comparison — a plain `==` leaks token length and
+        # prefix bytes via response timing.
+        if hmac.compare_digest(auth, expected):
             return await handler(request)
         return self._error_response("Unauthorized", "UNAUTHORIZED", 401)
 
@@ -843,18 +852,25 @@ class RestApiServer:
         self, request: web.Request,
     ) -> web.StreamResponse:
         """GET /api/v1/telemetry/stream — SSE endpoint."""
-        if len(self._sse_clients) >= self._telemetry_max_sse:
-            return self._error_response(
-                "Too many SSE connections", "SSE_LIMIT", 429,
-            )
-
         resp = web.StreamResponse()
         resp.content_type = "text/event-stream"
         resp.headers["Cache-Control"] = "no-cache"
         resp.headers["X-Accel-Buffering"] = "no"
-        await resp.prepare(request)
 
-        self._sse_clients.append(resp)
+        # Hold the lock through the limit check AND prepare+append so
+        # (a) concurrent connects can't all pass the check before any
+        # append, and (b) broadcasts never see an unprepared response.
+        # prepare() only sends headers, so the critical section is
+        # short. _sse_broadcast does not acquire this lock.
+        async with self._sse_lock:
+            if len(self._sse_clients) >= self._telemetry_max_sse:
+                return self._error_response(
+                    "Too many SSE connections", "SSE_LIMIT", 429,
+                )
+            await resp.prepare(request)
+            self._sse_clients.append(resp)
+            self._sse_pending[resp] = 0
+
         try:
             # Keep connection alive until client disconnects
             while True:
@@ -867,8 +883,10 @@ class RestApiServer:
         except asyncio.CancelledError:
             pass
         finally:
-            if resp in self._sse_clients:
-                self._sse_clients.remove(resp)
+            async with self._sse_lock:
+                if resp in self._sse_clients:
+                    self._sse_clients.remove(resp)
+                self._sse_pending.pop(resp, None)
         return resp
 
     def _sse_push_block(
@@ -887,13 +905,41 @@ class RestApiServer:
         msg = f"event: nodes\ndata: {payload}\n\n".encode("utf-8")
         self._sse_broadcast(msg)
 
+    # Max outstanding writes allowed per SSE client before we drop it.
+    # A slow client that builds up a backlog is ejected rather than
+    # allowing the queue of pending write tasks to grow unboundedly.
+    _SSE_MAX_PENDING_WRITES = 32
+
     def _sse_broadcast(self, msg: bytes) -> None:
         """Write an SSE message to all connected clients."""
-        dead: List[web.StreamResponse] = []
-        for client in self._sse_clients:
-            try:
-                asyncio.ensure_future(client.write(msg))
-            except Exception:
-                dead.append(client)
-        for client in dead:
+        for client in list(self._sse_clients):
+            pending = self._sse_pending.get(client, 0)
+            if pending >= self._SSE_MAX_PENDING_WRITES:
+                self.logger.warning(
+                    "Dropping slow SSE client: %d pending writes",
+                    pending,
+                )
+                self._sse_drop_client(client)
+                continue
+            self._sse_pending[client] = pending + 1
+            task = asyncio.create_task(self._sse_write_one(client, msg))
+            # Hold a strong reference so the task isn't GC'd mid-write.
+            task.add_done_callback(lambda _t, c=client: self._sse_after_write(c))
+
+    async def _sse_write_one(
+        self, client: web.StreamResponse, msg: bytes,
+    ) -> None:
+        try:
+            await client.write(msg)
+        except (ConnectionResetError, ConnectionAbortedError, RuntimeError):
+            self._sse_drop_client(client)
+
+    def _sse_after_write(self, client: web.StreamResponse) -> None:
+        pending = self._sse_pending.get(client)
+        if pending is not None and pending > 0:
+            self._sse_pending[client] = pending - 1
+
+    def _sse_drop_client(self, client: web.StreamResponse) -> None:
+        if client in self._sse_clients:
             self._sse_clients.remove(client)
+        self._sse_pending.pop(client, None)

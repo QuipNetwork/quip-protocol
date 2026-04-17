@@ -2056,6 +2056,10 @@ class NetworkNode(Node):
                     self._peer_scorer.remove_peer(host)
                 if hasattr(self, '_block_inventory'):
                     self._block_inventory.remove_peer(host)
+            # Drop the version entry regardless of whether the peer was
+            # in self.peers — prevents stale versions accumulating when
+            # peers churn in and out of the ban list.
+            self.peer_versions.pop(host, None)
 
     async def send_heartbeat(self, node_host: str) -> bool:
         """Send heartbeat to a specific node.
