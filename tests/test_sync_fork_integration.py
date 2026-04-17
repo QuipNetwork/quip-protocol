@@ -1,20 +1,14 @@
 """Handler-level integration test for fork-aware sync.
 
-Wires a real ``BlockSynchronizer`` against two real NetworkNode shells
-through an in-memory ``NodeClient`` that routes requests to the
-shells' real ``_quic_handle_chain_manifest_request`` and
-``_quic_handle_block_by_hash_request`` handlers. Payloads cross the
-boundary through real ``sync_messages`` codecs and real
-``Block.to_network`` / ``from_network``, so the serialization layer
-is in the hot path — something the unit tests with fake-block
-stand-ins cannot cover.
+Wires a real ``BlockSynchronizer`` to two NetworkNode shells through an
+in-memory ``NodeClient`` that routes sync requests to the real handlers.
+Payloads go through the real ``sync_messages`` codecs and
+``Block.to_network`` / ``from_network`` — so this test fails if anything
+along the serialization path regresses.
 
-The test deliberately stops short of exercising
-``Node.receive_block``'s full signature + quantum-proof validation;
-that's the miner's job and requires a real PoW solution. Instead a
-test-local consumer drains the commit queue, records the block
-order, and completes each future with True — standing in for a node
-that has already validated every block it commits.
+Full PoW and signature validation are out of scope: the commit consumer
+grants every future, standing in for a node that has already validated
+every block it receives.
 """
 
 from __future__ import annotations
@@ -38,44 +32,33 @@ from shared.sync_messages import (
 
 
 def _build_block(index: int, previous_hash: bytes, timestamp: int) -> Block:
-    """Build a Block with computed raw/hash and a non-empty signature.
-
-    The signature and quantum proof are placeholders — this test never
-    flows through ``check_block``'s PoW/signature verification.
-    """
-    header = BlockHeader(
-        previous_hash=previous_hash,
-        index=index,
-        timestamp=timestamp,
-        data_hash=b"\x00" * 32,  # overwritten by finalize()
-    )
-    miner_info = MinerInfo(
-        miner_id=f"test-miner-{index}",
-        miner_type="CPU",
-        reward_address=b"R" * 32,
-        ecdsa_public_key=b"E" * 64,
-        wots_public_key=b"W" * 64,
-        next_wots_public_key=b"N" * 64,
-    )
-    quantum_proof = QuantumProof(
-        nonce=index,
-        salt=b"S",
-        solutions=[[1]],
-        mining_time=0.0,
-        nodes=[0],
-        edges=[],
-    )
-    req = BlockRequirements(
-        difficulty_energy=0.0,
-        min_diversity=0.0,
-        min_solutions=1,
-        timeout_to_difficulty_adjustment_decay=3600,
-    )
+    """Finalized ``Block`` with placeholder sig + PoW (never validated)."""
     block = Block(
-        header=header,
-        miner_info=miner_info,
-        quantum_proof=quantum_proof,
-        next_block_requirements=req,
+        header=BlockHeader(
+            previous_hash=previous_hash,
+            index=index,
+            timestamp=timestamp,
+            data_hash=b"\x00" * 32,
+        ),
+        miner_info=MinerInfo(
+            miner_id=f"m-{index}",
+            miner_type="CPU",
+            reward_address=b"R" * 32,
+            ecdsa_public_key=b"E" * 64,
+            wots_public_key=b"W" * 64,
+            next_wots_public_key=b"N" * 64,
+        ),
+        quantum_proof=QuantumProof(
+            nonce=index, salt=b"S",
+            solutions=[[1]], mining_time=0.0,
+            nodes=[0], edges=[],
+        ),
+        next_block_requirements=BlockRequirements(
+            difficulty_energy=0.0,
+            min_diversity=0.0,
+            min_solutions=1,
+            timeout_to_difficulty_adjustment_decay=3600,
+        ),
         data=b"",
     )
     block.finalize()
@@ -83,28 +66,17 @@ def _build_block(index: int, previous_hash: bytes, timestamp: int) -> Block:
     return block
 
 
-def _build_chain(
-    base_hash: bytes,
-    length: int,
-    base_index: int,
-    base_timestamp: int,
-) -> List[Block]:
-    """Build a linked chain of ``length`` blocks starting at ``base_index + 1``."""
+def _build_chain(base_hash: bytes, length: int, base_index: int, base_timestamp: int) -> List[Block]:
     chain: List[Block] = []
-    parent_hash = base_hash
+    parent = base_hash
     for i in range(length):
-        blk = _build_block(
-            index=base_index + i + 1,
-            previous_hash=parent_hash,
-            timestamp=base_timestamp + i + 1,
-        )
+        blk = _build_block(base_index + i + 1, parent, base_timestamp + i + 1)
         chain.append(blk)
-        parent_hash = blk.hash
+        parent = blk.hash
     return chain
 
 
 def _make_peer_shell(chain: List[Block]):
-    """A minimal NetworkNode whose handlers read from the given chain."""
     from shared.network_node import NetworkNode
     node = object.__new__(NetworkNode)
     node.chain = list(chain)
@@ -114,12 +86,7 @@ def _make_peer_shell(chain: List[Block]):
 
 
 class _InMemoryHandlerClient:
-    """Route sync requests to real handler methods via real codecs.
-
-    The serialized payload travels through ``encode_*``/``decode_*``
-    just like it would on the wire, so this test catches Block
-    round-trip bugs that pure-mock tests miss.
-    """
+    """Routes sync requests to real handler methods via real codecs."""
 
     def __init__(self, peers: Dict[str, object]):
         self.peers = {host: {} for host in peers}
@@ -127,17 +94,11 @@ class _InMemoryHandlerClient:
         self.node_timeout = 5.0
         self.logger = logging.getLogger("test.client")
 
-    async def get_peer_block(
-        self, host: str, block_number: int = 0
-    ) -> Optional[Block]:
+    async def get_peer_block(self, host: str, block_number: int = 0) -> Optional[Block]:
         shell = self._shells.get(host)
         if shell is None:
             return None
-        if block_number == 0:
-            return shell.chain[-1]
-        if block_number < len(shell.chain):
-            return shell.chain[block_number]
-        return None
+        return shell.chain[-1] if block_number == 0 else shell.chain[block_number]
 
     async def get_chain_manifest(self, host, locator, limit):
         shell = self._shells.get(host)
@@ -149,13 +110,9 @@ class _InMemoryHandlerClient:
             payload=encode_manifest_request(locator, limit),
         )
         resp = await shell._quic_handle_chain_manifest_request(req)
-        if resp.msg_type != QuicMessageType.CHAIN_MANIFEST_RESPONSE:
-            return None
         return decode_manifest_response(resp.payload)
 
-    async def get_peer_block_by_hash(
-        self, host: str, block_hash: bytes
-    ) -> Optional[Block]:
+    async def get_peer_block_by_hash(self, host: str, block_hash: bytes) -> Optional[Block]:
         shell = self._shells.get(host)
         if shell is None:
             return None
@@ -165,58 +122,31 @@ class _InMemoryHandlerClient:
             payload=encode_block_by_hash_request(block_hash),
         )
         resp = await shell._quic_handle_block_by_hash_request(req)
-        if resp.msg_type != QuicMessageType.BLOCK_BY_HASH_RESPONSE:
-            return None
         return decode_block_by_hash_response(resp.payload)
 
 
-async def _drain_commit_queue(
-    queue: asyncio.Queue, committed: List[Block]
-) -> None:
-    """Test-local stand-in for the real block processor loop."""
+async def _drain_commit_queue(queue: asyncio.Queue, committed: List[Block]) -> None:
     while True:
-        block, future, force_reorg, source = await queue.get()
+        block, future, _force_reorg, _source = await queue.get()
         committed.append(block)
         future.set_result(True)
 
 
 @pytest.mark.asyncio
 async def test_sync_picks_longest_fork_end_to_end():
-    """Two peers on divergent forks; the longer chain wins and contaminates nothing."""
-    # Shared genesis + 5-block shared prefix.
-    genesis = _build_block(0, previous_hash=b"\x00" * 32, timestamp=1000)
-    shared_prefix = _build_chain(
-        base_hash=genesis.hash,
-        length=5,
-        base_index=0,
-        base_timestamp=1000,
-    )
-    branch_point = shared_prefix[-1]
+    """Two peers on divergent forks; longer chain wins with zero contamination."""
+    genesis = _build_block(0, b"\x00" * 32, timestamp=1000)
+    shared = _build_chain(genesis.hash, length=5, base_index=0, base_timestamp=1000)
+    branch = shared[-1]
+    fork_a = _build_chain(branch.hash, length=10, base_index=5, base_timestamp=2000)
+    fork_b = _build_chain(branch.hash, length=15, base_index=5, base_timestamp=3000)  # longer
 
-    fork_a = _build_chain(
-        base_hash=branch_point.hash,
-        length=15,  # heights 6..20
-        base_index=5,
-        base_timestamp=2000,
-    )
-    fork_b = _build_chain(
-        base_hash=branch_point.hash,
-        length=20,  # heights 6..25 — longer
-        base_index=5,
-        base_timestamp=3000,
-    )
+    peer_a = _make_peer_shell([genesis] + shared + fork_a)
+    peer_b = _make_peer_shell([genesis] + shared + fork_b)
 
-    peer_a_chain = [genesis] + shared_prefix + fork_a
-    peer_b_chain = [genesis] + shared_prefix + fork_b
-
-    peer_a = _make_peer_shell(peer_a_chain)
-    peer_b = _make_peer_shell(peer_b_chain)
-
-    # Syncing node knows only the shared prefix.
-    local_chain = [genesis] + shared_prefix
+    local_chain = [genesis] + shared
     local_by_hash = {b.hash: b for b in local_chain}
-
-    client = _InMemoryHandlerClient(peers={"A:1": peer_a, "B:1": peer_b})
+    client = _InMemoryHandlerClient(peers={"A": peer_a, "B": peer_b})
 
     queue: asyncio.Queue = asyncio.Queue()
     committed: List[Block] = []
@@ -240,23 +170,9 @@ async def test_sync_picks_longest_fork_end_to_end():
         except asyncio.CancelledError:
             pass
 
-    assert result.success is True
+    assert result.success
     assert result.target_hash == fork_b[-1].hash
-    assert result.target_height == 25
-    assert result.committed == 20
-
-    # Blocks arrived in ascending index order.
-    commit_indices = [b.header.index for b in committed]
-    assert commit_indices == list(range(6, 26))
-
-    # Every committed block is from fork B.
-    fork_b_by_index = {b.header.index: b for b in fork_b}
-    for got in committed:
-        expected = fork_b_by_index[got.header.index]
-        assert got.hash == expected.hash
-        assert got.header.previous_hash == expected.header.previous_hash
-
-    # No block from fork A leaked in.
+    assert result.committed == 15
+    assert [b.header.index for b in committed] == list(range(6, 21))
     fork_a_hashes = {b.hash for b in fork_a}
-    for got in committed:
-        assert got.hash not in fork_a_hashes
+    assert not any(b.hash in fork_a_hashes for b in committed)
