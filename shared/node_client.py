@@ -521,6 +521,11 @@ class NodeClient:
                     wait_connected=False,
                 )
                 protocol = await ctx.__aenter__()
+                # aioquic passes transmit=wait_connected to
+                # protocol.connect(), so with wait_connected=False
+                # the Initial packet is buffered but never sent.
+                # Flush it now to start the handshake.
+                protocol.transmit()
 
                 if await protocol.wait_connected(timeout=handshake_timeout):
                     # TOFU verification if trust store is configured
