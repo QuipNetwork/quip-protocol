@@ -33,6 +33,12 @@ $env:IONQ_API_KEY = "your-key-here"
 export IONQ_API_KEY="your-key-here"
 ```
 
+The IonQ API token can be provided three ways (checked in this order):
+
+1. CLI flag: `--ionq-api-token TOKEN`
+2. TOML config: `ionq_api_token = "your-token"` in `[ionq_qaoa]`
+3. Environment variable: `IONQ_API_KEY` (fallback if neither above is set)
+
 The free account includes unlimited access to IonQ's cloud simulator (up to 29 qubits). QPU access requires credits.
 
 ## Usage
@@ -157,6 +163,41 @@ Real trapped-ion hardware (Aria #AQ 25, Forte #AQ 36). Requires IonQ credits. Sa
 
 IonQ's current hardware — Aria (#AQ 25) and Forte (#AQ 36) — cannot run the full 4,579-node protocol graph. The IonQ cloud simulator supports up to 29 qubits. AerSimulator caps out at ~31 qubits due to exponential memory scaling.
 
+### AerSimulator Memory Scaling
 
+AerSimulator stores 2^n complex amplitudes (16 bytes each at double precision):
 
+| Qubits | Memory | Solve time |
+|--------|--------|------------|
+| 8      | ~185 MB (mostly overhead) | ~0.7s |
+| 14     | ~185 MB | ~7s |
+| 23     | ~288 MB | ~27s |
+| 28     | ~4.3 GB | ~7 min |
+| 31     | ~33 GB  | ~43 min |
 
+### IonQ Cloud Simulator Timing
+
+Each optimizer iteration requires a network round-trip to IonQ's API. With COBYLA doing ~25-100 iterations, cloud solves are significantly slower than local AerSimulator. Actual timing depends on subgraph size, QAOA depth (p), shot count, and IonQ API latency.
+
+### Difficulty Mismatch
+
+The genesis block difficulty is -1200, but a 14-node subgraph can only produce energies around -16 to -30. This is a known issue shared with the IBM QAOA miner — pending design decisions on difficulty scaling for subgraph mining.
+
+## Architecture
+
+```
+QPU/IonQ/
+├── ionq_qaoa_solver.py     # (h, J) → dimod.SampleSet via QAOA
+├── ionq_qaoa_miner.py      # Mining loop, polling, caching
+├── __init__.py              # Package exports
+└── README.md                # This file
+
+tools/
+└── ionq_qaoa_baseline.py   # Standalone benchmark tool
+
+quip.network.ionq_qaoa.example.toml  # Example node configuration
+```
+
+The IonQ solver shares the same QAOA pipeline as the IBM solver — cost operator construction, circuit building, variational optimization, result conversion. The only differences are backend setup (IonQProvider vs QiskitRuntimeService) and transpilation (IonQ handles transpilation server-side for cloud backends).
+
+A future cleanup MR will refactor the shared QAOA logic into a common base class.
