@@ -8,16 +8,22 @@ from shared.connection_process import ConnectionProcessHandle, spawn_connection_
 from shared.process_pool import ProcessPool, ProcessPoolConfig
 
 
-# Unreachable peer for testing — connection will fail quickly
+# Unreachable peer for testing. Both the pool and direct spawns pass a
+# 1 s connect_timeout into NodeClient, which caps the handshake wait
+# AND clamps QUIC's idle_timeout so aioquic's close-handshake retries
+# give up promptly — otherwise each attempt burns ~15 s.
 _UNREACHABLE = "127.0.0.1:1"
-# QUIC connection to unreachable peer can take up to 15s
-_CONN_TIMEOUT = 20.0
+_FAST_CONNECT_TIMEOUT = 1.0
+_CONN_TIMEOUT = 5.0
 
 
 @pytest.fixture
 def pool():
     """Create a process pool with small limits for testing."""
-    cfg = ProcessPoolConfig(max_connections=3, node_timeout=3.0)
+    cfg = ProcessPoolConfig(
+        max_connections=3, node_timeout=3.0,
+        connect_timeout=_FAST_CONNECT_TIMEOUT,
+    )
     p = ProcessPool(config=cfg)
     yield p
     p.shutdown_all(timeout=5.0)
@@ -29,7 +35,8 @@ class TestConnectionProcessHandle:
     def test_spawn_creates_alive_process(self):
         """Spawning creates a live child process."""
         handle = spawn_connection_process(
-            _UNREACHABLE, node_timeout=2.0
+            _UNREACHABLE, node_timeout=2.0,
+            connect_timeout=_FAST_CONNECT_TIMEOUT,
         )
         try:
             assert handle.is_alive()
@@ -40,7 +47,8 @@ class TestConnectionProcessHandle:
     def test_shutdown_stops_process(self):
         """Shutdown command causes the child to exit."""
         handle = spawn_connection_process(
-            _UNREACHABLE, node_timeout=2.0
+            _UNREACHABLE, node_timeout=2.0,
+            connect_timeout=_FAST_CONNECT_TIMEOUT,
         )
         handle.shutdown()
         handle.process.join(timeout=10.0)
@@ -50,7 +58,8 @@ class TestConnectionProcessHandle:
     def test_disconnected_event_on_unreachable(self):
         """Child sends disconnected event when peer is unreachable."""
         handle = spawn_connection_process(
-            _UNREACHABLE, node_timeout=2.0
+            _UNREACHABLE, node_timeout=2.0,
+            connect_timeout=_FAST_CONNECT_TIMEOUT,
         )
         try:
             # Wait for the disconnected event
@@ -73,7 +82,8 @@ class TestConnectionProcessHandle:
     def test_force_stop_kills_process(self):
         """force_stop terminates even a stuck process."""
         handle = spawn_connection_process(
-            _UNREACHABLE, node_timeout=2.0
+            _UNREACHABLE, node_timeout=2.0,
+            connect_timeout=_FAST_CONNECT_TIMEOUT,
         )
         assert handle.is_alive()
         handle.force_stop(timeout=3.0)

@@ -29,6 +29,12 @@ class ProcessPoolConfig:
     verify_tls: bool = False
     # How long to wait before considering a process dead (no activity)
     process_idle_timeout: float = 600.0
+    # Upper bound on a single connect attempt (handshake + cleanup).
+    # ``None`` preserves the default ~5 s handshake + up to ~10 s
+    # cleanup behavior. Tests probing unreachable addresses should set
+    # a small value (e.g. 1.0) to avoid burning time on QUIC's PTO-
+    # backoff close retries.
+    connect_timeout: Optional[float] = None
 
 
 class ProcessPool:
@@ -93,6 +99,7 @@ class ProcessPool:
             peer_address=peer_address,
             node_timeout=self.config.node_timeout,
             verify_tls=self.config.verify_tls,
+            connect_timeout=self.config.connect_timeout,
         )
         self._handles[peer_address] = handle
         self.logger.info(

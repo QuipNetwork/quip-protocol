@@ -384,12 +384,37 @@ class TofuVerificationError(Exception):
     pass
 
 
+async def _safe_aexit(ctx: Any) -> None:
+    """Invoke ``ctx.__aexit__`` swallowing any exception, used when we
+    schedule aioquic cleanup as a background task."""
+    try:
+        await ctx.__aexit__(None, None, None)
+    except Exception:
+        pass
+
+
 class NodeClient:
     """QUIC client for QuIP P2P networking with connection pooling and TOFU verification."""
 
     def __init__(self, node_timeout: float = 10.0, logger: Optional[logging.Logger] = None,
-                 verify_tls: bool = False, trust_store: Optional['TrustStore'] = None):
+                 verify_tls: bool = False, trust_store: Optional['TrustStore'] = None,
+                 connect_timeout: Optional[float] = None):
+        """
+        Args:
+            connect_timeout: Upper bound, in seconds, on one connect
+                attempt including aioquic's close handshake on failure.
+                When ``None`` (default, production), the QUIC handshake
+                wait is capped at 5 s and ``idle_timeout`` defaults to
+                300 s — so cleanup to a dead peer can take up to ~10 s
+                while aioquic retries the CONNECTION_CLOSE frame under
+                PTO backoff. Tests that deliberately probe unreachable
+                addresses should set a small value (e.g. 1.0) to get a
+                fast deterministic failure; this also clamps QUIC's
+                idle_timeout so aioquic's PTO-driven close retries
+                give up promptly instead of holding the event loop.
+        """
         self.node_timeout = node_timeout
+        self.connect_timeout = connect_timeout
         self.logger = logger or logging.getLogger(__name__)
         self.verify_tls = verify_tls
         self.trust_store = trust_store
@@ -456,32 +481,54 @@ class NodeClient:
 
             addr, port = parse_host_port(host, DEFAULT_QUIC_PORT)
 
+            # When a test sets a small connect_timeout, also clamp QUIC's
+            # idle_timeout to a small multiple of it. Otherwise aioquic
+            # keeps the connection's PTO backoff running for up to
+            # idle_timeout (300 s default) — visible as the close
+            # handshake taking ~5 s to send a CONNECTION_CLOSE even
+            # after our wait_connected timed out.
+            idle_timeout = (
+                300.0 if self.connect_timeout is None
+                else max(2.0, self.connect_timeout * 2)
+            )
             configuration = QuicConfiguration(
                 is_client=True,
                 max_datagram_frame_size=MAX_DATAGRAM_FRAME_SIZE,
                 alpn_protocols=[QUIP_ALPN_PROTOCOL],
-                idle_timeout=300.0,
+                idle_timeout=idle_timeout,
             )
             if not self.verify_tls:
                 configuration.verify_mode = ssl.CERT_NONE
 
+            handshake_timeout = (
+                5.0 if self.connect_timeout is None else self.connect_timeout
+            )
+            cleanup_timeout = (
+                10.0 if self.connect_timeout is None else self.connect_timeout
+            )
+
             try:
-                # Create connection context manager but don't use 'async with'
-                # since that would close connection when block exits
+                # aioquic's ``connect()`` context awaits ``wait_connected``
+                # inside ``__aenter__`` when ``wait_connected=True``
+                # (the default), which doesn't honor our handshake cap —
+                # it waits until the connection either completes or
+                # times out on ``idle_timeout``. Pass False so
+                # ``__aenter__`` returns immediately after transport
+                # setup, then we bound the wait ourselves below.
                 ctx = connect(
                     host=addr, port=port, configuration=configuration,
                     create_protocol=lambda *a, _h=host, **k: _QuicClientProtocol(*a, logger=self.logger, peer_host=_h, **k),
+                    wait_connected=False,
                 )
-                # Manually enter the context to start the connection
                 protocol = await ctx.__aenter__()
 
-                if await protocol.wait_connected(timeout=5.0):
+                if await protocol.wait_connected(timeout=handshake_timeout):
                     # TOFU verification if trust store is configured
                     if self.trust_store:
                         tofu_ok = await self._verify_tofu(host, protocol)
                         if not tofu_ok:
                             protocol.close()
-                            await ctx.__aexit__(None, None, None)
+                            await self._bounded_aexit(ctx, cleanup_timeout)
                             return None
 
                     # Store both connection and context manager to keep connection alive
@@ -493,7 +540,7 @@ class NodeClient:
                 else:
                     # Connection failed (handshake timeout), clean up
                     self.ban_list.record_failure(host, "QUIC handshake timeout")
-                    await ctx.__aexit__(None, None, None)
+                    await self._bounded_aexit(ctx, cleanup_timeout)
                     return None
             except TofuVerificationError as e:
                 self.logger.error(f"TOFU verification failed for {host}: {e}")
@@ -502,6 +549,31 @@ class NodeClient:
             except Exception as e:
                 self.ban_list.record_failure(host, str(e))
                 return None
+
+    async def _bounded_aexit(self, ctx: Any, timeout: float) -> None:
+        """Bound aioquic's close handshake wait.
+
+        When ``connect_timeout`` is set (tests), we can't trust
+        ``asyncio.wait_for`` to return inside ``timeout`` — aioquic's
+        ``connect()`` ``__aexit__`` performs multi-step cleanup that
+        doesn't always yield back on cancellation, so ``wait_for``
+        ends up waiting for the cancelled task to settle. Instead,
+        schedule the cleanup as a background task and move on; the
+        UDP socket gets closed whenever the event loop next runs it,
+        which for a failed connect to a dead peer is good-enough
+        hygiene (we hold no state to leak).
+
+        When ``connect_timeout`` is None (production), keep the
+        original blocking-awaited cleanup so we don't accumulate
+        orphan tasks under heavy peer churn.
+        """
+        if self.connect_timeout is None:
+            try:
+                await ctx.__aexit__(None, None, None)
+            except Exception:
+                pass
+            return
+        asyncio.create_task(_safe_aexit(ctx))
 
     async def _verify_tofu(self, host: str, protocol: _QuicClientProtocol) -> bool:
         """

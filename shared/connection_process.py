@@ -121,6 +121,7 @@ def connection_process_main(
     node_timeout: float,
     verify_tls: bool,
     stop_event: mp.synchronize.Event,
+    connect_timeout: Optional[float] = None,
 ) -> None:
     """Child process entry point: own event loop, single QUIC connection.
 
@@ -130,6 +131,10 @@ def connection_process_main(
         node_timeout: Default timeout for QUIC requests.
         verify_tls: Whether to verify TLS certificates.
         stop_event: Multiprocessing event set by parent to request shutdown.
+        connect_timeout: Upper bound on a single connect attempt
+            (including the close handshake on unreachable peers).
+            ``None`` preserves the default ~5 s handshake + up to
+            ~10 s cleanup behavior.
     """
     def _signal_handler(_signum, _frame):
         stop_event.set()
@@ -147,7 +152,7 @@ def connection_process_main(
     try:
         loop.run_until_complete(
             _connection_loop(pipe, peer_address, node_timeout,
-                             verify_tls, stop_event, log)
+                             verify_tls, stop_event, log, connect_timeout)
         )
     except Exception as exc:
         log.error(f"Connection process crashed: {exc}")
@@ -164,11 +169,16 @@ async def _connection_loop(
     verify_tls: bool,
     stop_event: mp.synchronize.Event,
     log: logging.Logger,
+    connect_timeout: Optional[float] = None,
 ) -> None:
     """Async main loop: establish connection, then process commands."""
     from shared.node_client import NodeClient
 
-    client = NodeClient(node_timeout=node_timeout, verify_tls=verify_tls)
+    client = NodeClient(
+        node_timeout=node_timeout,
+        verify_tls=verify_tls,
+        connect_timeout=connect_timeout,
+    )
     await client.start()
 
     loop = asyncio.get_event_loop()
@@ -403,6 +413,7 @@ def spawn_connection_process(
     peer_address: str,
     node_timeout: float = 10.0,
     verify_tls: bool = False,
+    connect_timeout: Optional[float] = None,
 ) -> ConnectionProcessHandle:
     """Spawn a new connection process for the given peer.
 
@@ -413,7 +424,8 @@ def spawn_connection_process(
     stop_event = mp.Event()
     process = mp.Process(
         target=connection_process_main,
-        args=(child_pipe, peer_address, node_timeout, verify_tls, stop_event),
+        args=(child_pipe, peer_address, node_timeout, verify_tls,
+              stop_event, connect_timeout),
         daemon=True,
     )
     process.start()

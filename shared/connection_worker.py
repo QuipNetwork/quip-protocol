@@ -82,6 +82,7 @@ def connection_worker_main(
     result_queue: mp.Queue,
     stop_event: mp.synchronize.Event,
     node_timeout: float,
+    connect_timeout: Optional[float] = None,
 ) -> None:
     """Child process entry point: own event loop, own NodeClient."""
     shutdown_flag = False
@@ -101,7 +102,7 @@ def connection_worker_main(
     asyncio.set_event_loop(loop)
 
     from shared.node_client import NodeClient
-    client = NodeClient(node_timeout=node_timeout)
+    client = NodeClient(node_timeout=node_timeout, connect_timeout=connect_timeout)
 
     async def _run() -> None:
         await client.start()
@@ -148,8 +149,9 @@ def connection_worker_main(
 class ConnectionWorkerHandle:
     """Parent-side wrapper around a persistent connection worker process."""
 
-    def __init__(self, node_timeout: float = 10.0):
+    def __init__(self, node_timeout: float = 10.0, connect_timeout: Optional[float] = None):
         self._node_timeout = node_timeout
+        self._connect_timeout = connect_timeout
         self._request_queue: mp.Queue = mp.Queue()
         self._result_queue: mp.Queue = mp.Queue()
         self._stop_event: mp.synchronize.Event = mp.Event()
@@ -164,6 +166,7 @@ class ConnectionWorkerHandle:
                 self._result_queue,
                 self._stop_event,
                 self._node_timeout,
+                self._connect_timeout,
             ),
             daemon=True,
         )
