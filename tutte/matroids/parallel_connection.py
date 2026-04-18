@@ -1212,7 +1212,7 @@ def theorem10_k_sum(
     n_subsets = 2 ** len(shared_edges)
     _log.record(EventType.KSUM, "parallel_conn",
                 f"K-sum IE: {len(shared_edges)} shared edges, {n_subsets} subsets",
-                LogLevel.DEBUG)
+                LogLevel.DEBUG, graph=pc_graph)
 
     result = TuttePolynomial.zero()
 
@@ -1517,7 +1517,7 @@ def precompute_contractions(
     _log.record(EventType.THEOREM6, "parallel_conn",
                 f"Precomputing {lattice_N.num_flats} contractions for "
                 f"{graph_i.node_count()}n {graph_i.edge_count()}e",
-                LogLevel.DEBUG)
+                LogLevel.DEBUG, graph=graph_i)
 
     result: Dict[int, BivariateLaurentPoly] = {}
     # Cache by canonical key to avoid redundant synthesis
@@ -1716,7 +1716,7 @@ def precompute_contractions_product(
     _log.record(EventType.THEOREM6, "parallel_conn",
                 f"Precomputing {n_pairs} product contractions for "
                 f"{graph_i.node_count()}n {graph_i.edge_count()}e",
-                LogLevel.DEBUG)
+                LogLevel.DEBUG, graph=graph_i)
 
     result: Dict[Tuple[int, int], BivariateLaurentPoly] = {}
 

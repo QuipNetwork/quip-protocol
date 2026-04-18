@@ -19,20 +19,20 @@ leveraging polynomial algebra when beneficial.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from ..polynomial import TuttePolynomial
-from ..graph import Graph, MultiGraph
-from ..lookup.core import RainbowTable, MinorEntry, load_default_table
-from ..graphs.k_join import polynomial_divmod, polynomial_divide, tutte_k
-from ..factorization import polynomial_gcd, has_common_factor
-from ..validation import verify_spanning_trees
-from ..graphs.covering import find_disjoint_cover, compute_fringe, compute_inter_tile_edges
-from ..graphs.series_parallel import compute_sp_tutte_if_applicable
+from ..factorization import has_common_factor, polynomial_gcd
 from ..family_recognition import recognize_family
+from ..graph import Graph, MultiGraph
+from ..graphs.covering import (compute_fringe, compute_inter_tile_edges,
+                               find_disjoint_cover)
+from ..graphs.k_join import polynomial_divide, polynomial_divmod, tutte_k
+from ..graphs.series_parallel import compute_sp_tutte_if_applicable
+from ..logs import EventType, LogLevel, get_log
+from ..lookup.core import MinorEntry, RainbowTable, load_default_table
+from ..polynomial import TuttePolynomial
+from ..validation import verify_spanning_trees
 from .base import BaseMultigraphSynthesizer
-from ..logs import get_log, EventType, LogLevel
-
 
 # =============================================================================
 # HYBRID SYNTHESIS RESULT
@@ -51,6 +51,10 @@ class HybridSynthesisResult:
     tiling_steps: int = 0
     dc_steps: int = 0  # Should be 0 in ideal case
     minors_used: Set[str] = field(default_factory=set)  # Canonical keys of table entries used
+    # Canonical keys of sub-problems the engine synthesized (not table hits).
+    synthesized_minors: Set[str] = field(default_factory=set)
+    # Snapshot of Graph|MultiGraph objects keyed by canonical_key.
+    synthesized_graphs: Dict[str, Any] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         status = "✓" if self.verified else "✗"
@@ -97,6 +101,14 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         self._cache: Dict[str, HybridSynthesisResult] = {}
         self._multigraph_cache: Dict[str, TuttePolynomial] = {}
         self._mg_minors_accum: Set[str] = set()  # Accumulates minors found during multigraph synthesis
+        # (canonical_key -> Graph|MultiGraph) for every sub-problem actually
+        # synthesized this run; attached to the top-level result for the
+        # visualizer's "synthesized" panel.
+        self._synth_accum_graphs: Dict[str, Any] = {}
+        self._synth_depth: int = 0
+        # When True, the top-level synthesize() skips the rainbow-table
+        # lookup for the input graph (sub-problems may still look up).
+        self.skip_target_lookup: bool = False
 
         # Structural engine for series-parallel, k-sum, and hierarchical decomposition
         from .engine import SynthesisEngine
@@ -149,33 +161,48 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
     ) -> HybridSynthesisResult:
         """Main entry point: compute Tutte polynomial using hybrid approach.
 
-        Args:
-            graph: Graph to compute polynomial for
-            max_depth: Maximum recursion depth
-
-        Returns:
-            HybridSynthesisResult with computed polynomial
+        Thin wrapper that tracks recursion depth and stamps the top-level
+        result with `synthesized_minors` and `synthesized_graphs` for the
+        visualizer.
         """
+        is_top = self._synth_depth == 0
+        self._synth_depth += 1
+        try:
+            result = self._synthesize_inner(graph, max_depth)
+        finally:
+            self._synth_depth -= 1
+        if is_top:
+            result.synthesized_graphs = dict(self._synth_accum_graphs)
+            result.synthesized_minors = set(self._synth_accum_graphs.keys())
+        return result
+
+    def _synthesize_inner(
+        self,
+        graph: Graph,
+        max_depth: int = 10
+    ) -> HybridSynthesisResult:
+        """Core hybrid synthesis logic — see `synthesize()` for the public entrypoint."""
         _log = get_log()
         # Check cache
         cache_key = graph.canonical_key()
         if cache_key in self._cache:
             _log.record(EventType.CACHE_HIT, "hybrid",
                         f"Cache hit: {graph.node_count()}n {graph.edge_count()}e",
-                        LogLevel.DEBUG)
+                        LogLevel.DEBUG, graph=graph)
             return self._cache[cache_key]
 
         n = graph.node_count()
         m = graph.edge_count()
         _log.record(EventType.SYNTHESIS_START, "hybrid",
-                    f"{n}n {m}e")
+                    f"{n}n {m}e", graph=graph)
         self._log(f"Synthesizing: {n} nodes, {m} edges")
 
         # 1. Family recognition fast path — O(n+m)
         family_poly = recognize_family(graph)
         if family_poly is not None:
             _log.record(EventType.FAMILY_RECOGNITION, "hybrid",
-                        f"Family recognized: {n}n {m}e", LogLevel.INFO)
+                        f"Family recognized: {n}n {m}e", LogLevel.INFO,
+                        graph=graph)
             self._log(f"Family recognition: O(n+m) fast path")
             result = HybridSynthesisResult(
                 polynomial=family_poly,
@@ -184,25 +211,31 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                 verified=True,
             )
             self._cache[cache_key] = result
+            self._record_synth(graph, cache_key)
             return result
 
-        # 2. Direct rainbow table lookup
-        cached = self.table.lookup(graph)
-        if cached is not None:
-            _log.record(EventType.LOOKUP_HIT, "hybrid",
-                        f"Table hit: {n}n {m}e")
-            self._log("Direct lookup hit")
-            self._stats['lookup'] += 1
-            result = HybridSynthesisResult(
-                polynomial=cached,
-                method="lookup",
-                decomposition=["table"],
-                recipe=["Rainbow table lookup"],
-                verified=True,
-                minors_used={cache_key} if cache_key in self.table.entries else set(),
-            )
-            self._cache[cache_key] = result
-            return result
+        # 2. Direct rainbow table lookup (optionally skipped at top-level).
+        is_top_call = self._synth_depth == 1
+        if not (is_top_call and self.skip_target_lookup):
+            cached = self.table.lookup(graph)
+            if cached is not None:
+                _log.record(EventType.LOOKUP_HIT, "hybrid",
+                            f"Table hit: {n}n {m}e", graph=graph)
+                self._log("Direct lookup hit")
+                self._stats['lookup'] += 1
+                result = HybridSynthesisResult(
+                    polynomial=cached,
+                    method="lookup",
+                    decomposition=["table"],
+                    recipe=["Rainbow table lookup"],
+                    verified=True,
+                    minors_used={cache_key} if cache_key in self.table.entries else set(),
+                )
+                self._cache[cache_key] = result
+                return result
+
+        # Past the lookup gate: real synthesis work. Record the input graph.
+        self._record_synth(graph, cache_key)
 
         # 2. Handle base cases
         if graph.edge_count() == 0:
@@ -229,7 +262,8 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         components = graph.connected_components()
         if len(components) > 1:
             _log.record(EventType.FACTORIZE, "hybrid",
-                        f"Disconnected: {len(components)} components")
+                        f"Disconnected: {len(components)} components",
+                        graph=graph)
             result = self._synthesize_disconnected(components, max_depth)
             self._cache[cache_key] = result
             return result
@@ -308,7 +342,8 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
             components = graph.split_at_cut_vertex(cut)
             if len(components) > 1:
                 _log.record(EventType.FACTORIZE, "hybrid",
-                            f"Cut vertex: {len(components)} components")
+                            f"Cut vertex: {len(components)} components",
+                            graph=graph)
                 self._log(f"Cut vertex {cut} splits into {len(components)} components")
                 poly = TuttePolynomial.one()
                 decomposition = []
@@ -357,7 +392,8 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         sp_poly = compute_sp_tutte_if_applicable(graph)
         if sp_poly is not None:
             _log.record(EventType.SERIES_PARALLEL, "hybrid",
-                        f"SP: {graph.node_count()}n {graph.edge_count()}e")
+                        f"SP: {graph.node_count()}n {graph.edge_count()}e",
+                        graph=graph)
             self._log("Series-parallel: O(n) computation")
             return HybridSynthesisResult(
                 polynomial=sp_poly,
@@ -370,10 +406,14 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
 
         # Treewidth DP (fast for tw <= 10, before expensive k-sum/hierarchical)
         if graph.edge_count() >= 10:
-            from ..graphs.treewidth import compute_treewidth_tutte_if_applicable
+            from ..graphs.treewidth import \
+                compute_treewidth_tutte_if_applicable
             full_mg = MultiGraph.from_graph(graph)
             tw_poly = compute_treewidth_tutte_if_applicable(full_mg, max_width=11)
             if tw_poly is not None:
+                _log.record(EventType.TREEWIDTH_DP, "hybrid",
+                            f"Treewidth DP: {graph.node_count()}n {graph.edge_count()}e",
+                            graph=graph)
                 self._log(f"Treewidth DP: {graph.node_count()}n, {graph.edge_count()}e")
                 return HybridSynthesisResult(
                     polynomial=tw_poly,
@@ -386,7 +426,8 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         ksum_result = engine._try_ksum_decomposition(graph)
         if ksum_result is not None:
             _log.record(EventType.KSUM, "hybrid",
-                        f"K-sum: {graph.node_count()}n {graph.edge_count()}e")
+                        f"K-sum: {graph.node_count()}n {graph.edge_count()}e",
+                        graph=graph)
             self._log(f"K-sum decomposition: {ksum_result.method}")
             return HybridSynthesisResult(
                 polynomial=ksum_result.polynomial,
@@ -400,7 +441,8 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
             hier_result = engine._try_hierarchical(graph, max_depth)
             if hier_result is not None:
                 _log.record(EventType.HIERARCHICAL, "hybrid",
-                            f"Hierarchical: {graph.node_count()}n {graph.edge_count()}e")
+                            f"Hierarchical: {graph.node_count()}n {graph.edge_count()}e",
+                            graph=graph)
                 self._log(f"Hierarchical tiling: {hier_result.method}")
                 return HybridSynthesisResult(
                     polynomial=hier_result.polynomial,

@@ -145,20 +145,20 @@ class AlgebraicSynthesisEngine:
         if cache_key in self._cache:
             _log.record(EventType.CACHE_HIT, "algebraic",
                         f"Cache hit: {graph.node_count()}n {graph.edge_count()}e",
-                        LogLevel.DEBUG)
+                        LogLevel.DEBUG, graph=graph)
             return self._cache[cache_key]
 
         n = graph.node_count()
         m = graph.edge_count()
         _log.record(EventType.SYNTHESIS_START, "algebraic",
-                    f"{n}n {m}e")
+                    f"{n}n {m}e", graph=graph)
         self._log(f"Synthesizing graph: {n} nodes, {m} edges")
 
         # 1. Check rainbow table first
         cached = self.table.lookup(graph)
         if cached is not None:
             _log.record(EventType.LOOKUP_HIT, "algebraic",
-                        f"Table hit: {n}n {m}e")
+                        f"Table hit: {n}n {m}e", graph=graph)
             self._log("Direct rainbow table lookup")
             result = AlgebraicSynthesisResult(
                 polynomial=cached,
@@ -197,7 +197,8 @@ class AlgebraicSynthesisEngine:
         components = graph.connected_components()
         if len(components) > 1:
             _log.record(EventType.FACTORIZE, "algebraic",
-                        f"Disconnected: {len(components)} components")
+                        f"Disconnected: {len(components)} components",
+                        graph=graph)
             result = self._synthesize_disconnected(components, max_depth)
             self._cache[cache_key] = result
             return result

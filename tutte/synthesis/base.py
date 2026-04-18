@@ -9,7 +9,7 @@ Provides shared infrastructure used by all synthesis engines:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
 from ..polynomial import TuttePolynomial
 from ..graph import Graph, MultiGraph
@@ -62,6 +62,25 @@ class BaseMultigraphSynthesizer:
     - _multigraph_cache -> dict for caching multigraph polynomials
     """
 
+    def _record_synth(self, graph_or_mg: Any, key: Optional[str] = None) -> None:
+        """Record a graph that's being genuinely synthesized (not a lookup hit).
+
+        Populates `self._synth_accum_graphs` — a Dict[canonical_key, Graph/MultiGraph]
+        that the public `synthesize()` wrapper attaches to the top-level result
+        so the visualizer can separate lookup-hits from real decomposition work.
+
+        Always safe to call; ignores duplicates and handles missing attrs lazily.
+        """
+        accum = getattr(self, '_synth_accum_graphs', None)
+        if accum is None:
+            accum = {}
+            self._synth_accum_graphs = accum
+        try:
+            k = key if key is not None else graph_or_mg.canonical_key()
+        except Exception:
+            return
+        accum.setdefault(k, graph_or_mg)
+
     def _synthesize_multigraph(
         self,
         mg: MultiGraph,
@@ -108,7 +127,7 @@ class BaseMultigraphSynthesizer:
         if not mg.is_connected():
             _log.record(EventType.FACTORIZE, "base",
                         f"Disconnected MG: {mg.node_count()}n {mg.edge_count()}e",
-                        LogLevel.DEBUG)
+                        LogLevel.DEBUG, graph=mg)
             return self._handle_disconnected_multigraph(mg, max_depth, skip_minor_search)
 
         # 4. Cut vertex factorization: T(G1 · G2) = T(G1) × T(G2)
@@ -119,7 +138,7 @@ class BaseMultigraphSynthesizer:
             if len(components) > 1:
                 _log.record(EventType.FACTORIZE, "base",
                             f"Cut vertex in MG: {len(components)} components",
-                            LogLevel.DEBUG)
+                            LogLevel.DEBUG, graph=mg)
                 self._log(f"Cut vertex {cut} splits into {len(components)} components")
                 poly = TuttePolynomial.one()
                 for comp in components:
@@ -142,18 +161,22 @@ class BaseMultigraphSynthesizer:
             if cache_key in self._multigraph_cache:
                 _log.record(EventType.CACHE_HIT, "base",
                             f"MG cache hit: {mg.node_count()}n {mg.edge_count()}e",
-                            LogLevel.DEBUG)
+                            LogLevel.DEBUG, graph=mg)
                 return self._multigraph_cache[cache_key]
         elif not self._fast_hash_set_complete:
             cache_key = mg.canonical_key()
             if cache_key in self._multigraph_cache:
                 _log.record(EventType.CACHE_HIT, "base",
                             f"MG cache hit (unindexed): {mg.node_count()}n {mg.edge_count()}e",
-                            LogLevel.DEBUG)
+                            LogLevel.DEBUG, graph=mg)
                 self._fast_hash_set.add(fh)
                 return self._multigraph_cache[cache_key]
         else:
             cache_key = None  # Guaranteed miss — skip canonical_key
+
+        # Past all cache gates: record this MG as synthesized from scratch.
+        if cache_key is not None:
+            self._record_synth(mg, cache_key)
 
         # 4.6 Series-parallel multigraph O(n) computation
         sp_poly = compute_sp_tutte_multigraph_if_applicable(mg)
@@ -188,12 +211,14 @@ class BaseMultigraphSynthesizer:
                 else:
                     result = self.synthesize(simple, max_depth)
                 # Track minors: both from sub-synthesis AND table entry identity
+                simple_key = simple.canonical_key()
                 if hasattr(self, '_mg_minors_accum'):
                     self._mg_minors_accum |= result.minors_used
                     # If this graph is a known table entry, track it as a used minor
-                    simple_key = simple.canonical_key()
                     if simple_key in self.table.entries:
                         self._mg_minors_accum.add(simple_key)
+                # Record the simple graph as synthesized-from-scratch for the visualizer.
+                self._record_synth(simple, simple_key)
                 if cache_key is None:
                     cache_key = mg.canonical_key()
                 self._multigraph_cache[cache_key] = result.polynomial
@@ -210,7 +235,7 @@ class BaseMultigraphSynthesizer:
             k = mg.edge_counts[max_mult_edge]
             _log.record(EventType.MULTIGRAPH_OP, "base",
                         f"Batch reduce {k} parallel edges: {mg.node_count()}n {mg.edge_count()}e",
-                        LogLevel.DEBUG)
+                        LogLevel.DEBUG, graph=mg)
             poly = self._batch_reduce_parallel(mg, max_mult_edge, max_depth, skip_minor_search)
             if cache_key is None:
                 cache_key = mg.canonical_key()
@@ -369,6 +394,12 @@ class SynthesisResult:
     tiles_used: int = 0
     fringe_edges: int = 0
     minors_used: Set[str] = field(default_factory=set)  # Canonical keys of table entries used
+    # Canonical keys of simple graphs the engine synthesized from scratch
+    # (successful sub-problems, regardless of whether they appear in the table).
+    synthesized_minors: Set[str] = field(default_factory=set)
+    # Snapshot of the Graph object keyed by canonical_key, for visualizer
+    # reconstruction of synthesized (non-table) graphs.
+    synthesized_graphs: Dict[str, Any] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         status = "verified" if self.verified else "unverified"

@@ -139,7 +139,7 @@ static uint64_t encoded_connect(uint64_t enc, int i, int j) {
    key1 = enc (full partition encoding)
    key2 = (i << 4) | j (packed indices, max 16 each)
    Both must match for a cache hit. */
-static struct {
+static __thread struct {
     uint64_t enc;
     uint8_t  ij;   /* (i << 4) | j */
     uint64_t val;
@@ -334,8 +334,9 @@ void modular_det_multi(
    MODULAR COEFFICIENT ARITHMETIC
    ========================================================================= */
 
-/* Global prime for modular arithmetic. 0 = exact int64. */
-static long long g_prime = 0;
+/* Global prime for modular arithmetic. 0 = exact int64.
+   Thread-local so parallel CRT prime workers don't race. */
+static __thread long long g_prime = 0;
 
 static inline long long coeff_add(long long a, long long b) {
     if (g_prime == 0) return a + b;
@@ -1971,25 +1972,34 @@ int basis_convert_ab_to_xy(
 # Build/load
 _lib = None
 _ffi = ffi
+import threading as _threading
+
+_lib_lock = _threading.Lock()
 
 
 def _get_lib():
     global _lib
     if _lib is not None:
         return _lib
-    try:
-        from _treewidth_cffi import ffi as _cffi, lib
+    with _lib_lock:
+        if _lib is not None:
+            return _lib
+        try:
+            from _treewidth_cffi import ffi as _cffi
+            from _treewidth_cffi import lib
+            _lib = lib
+            return _lib
+        except ImportError:
+            pass
+        import sys
+        import tempfile
+        tmpdir = tempfile.mkdtemp(prefix="treewidth_c_")
+        ffi.compile(tmpdir=tmpdir)
+        sys.path.insert(0, tmpdir)
+        from _treewidth_cffi import ffi as _cffi
+        from _treewidth_cffi import lib
         _lib = lib
         return _lib
-    except ImportError:
-        pass
-    import tempfile, sys
-    tmpdir = tempfile.mkdtemp(prefix="treewidth_c_")
-    ffi.compile(tmpdir=tmpdir)
-    sys.path.insert(0, tmpdir)
-    from _treewidth_cffi import ffi as _cffi, lib
-    _lib = lib
-    return _lib
 
 
 # =============================================================================
@@ -2173,7 +2183,7 @@ def compute_treewidth_tutte_c(td, mg):
 
         return TuttePolynomial.from_coefficients(coeffs)
 
-    from ..validation import _get_modular_primes, _crt_multi
+    from ..validation import _crt_multi, _get_modular_primes
 
     if needs_dp_int128 and not needs_dp_modular:
         # __int128 DP (exact, single pass) + Python basis conversion.
@@ -2213,14 +2223,10 @@ def compute_treewidth_tutte_c(td, mg):
         return _convert_ab_to_xy(poly_ab)
 
     if not needs_dp_modular:
-        # DP in int64, modular basis conversion with CRT.
-        # Run DP once, then convert with multiple primes.
-        # Output (x,y) coefficients can reach 2^{2*n_edges + n_verts}.
-        log2_bound = 2 * n_total_edges + n_verts + 20
-        primes_needed = max(int(log2_bound / 50) + 1, 2)
-        primes = _get_modular_primes(primes_needed)
-
-        # Run DP once to get (a,b) basis polynomial
+        # Exact int64 DP in (a,b) basis, then Python basis conversion with
+        # arbitrary-precision ints. The (a,b) coefficients fit int64 for
+        # n_edges <= 76; the (x,y) coefficients may overflow int64 but Python
+        # math.comb handles them natively.
         max_ab = max_out * 2
         ab_keys = _ffi.new("int[]", max_ab * 2)
         ab_coeffs = _ffi.new("long long[]", max_ab)
@@ -2235,46 +2241,29 @@ def compute_treewidth_tutte_c(td, mg):
         if rc != 0:
             return None
 
-        # Convert with each prime, collect residues
-        all_results = []
-        for p_val in primes:
-            out_xy = _ffi.new("int[]", max_out * 2)
-            out_coeffs = _ffi.new("long long[]", max_out)
-            out_n = _ffi.new("int*")
-            rc = lib.basis_convert_ab_to_xy(
-                ab_keys, ab_coeffs, ab_n[0],
-                out_xy, out_coeffs, out_n, max_out, p_val)
-            if rc != 0:
-                return None
-            result_mod = {}
-            for i in range(out_n[0]):
-                key = (out_xy[i * 2], out_xy[i * 2 + 1])
-                result_mod[key] = int(out_coeffs[i])
-            all_results.append(result_mod)
+        poly_ab = {}
+        for i in range(ab_n[0]):
+            a_pow = ab_keys[i * 2]
+            b_pow = ab_keys[i * 2 + 1]
+            coeff = int(ab_coeffs[i])
+            if coeff != 0:
+                poly_ab[(a_pow, b_pow)] = coeff
 
-        all_keys = set()
-        for rm in all_results:
-            all_keys |= rm.keys()
-        coeffs = {}
-        for key in all_keys:
-            residues = [rm.get(key, 0) for rm in all_results]
-            val = _crt_multi(residues, primes)
-            if val != 0:
-                coeffs[key] = val
-
-        return TuttePolynomial.from_coefficients(coeffs)
+        from .treewidth import _convert_ab_to_xy
+        return _convert_ab_to_xy(poly_ab)
 
     # (a,b)-only CRT: run DP mod prime k times, reconstruct (a,b) as Python
     # bignums, then convert basis once in Python. The (a,b) coefficient bound
     # is ~2^{n_edges}, much tighter than the (x,y) bound ~2^{2·n_edges + n_verts},
     # so we need roughly half as many primes as the full-modular path.
+    # 62-bit primes (safe for coeff_add/coeff_mul) further reduce the count.
     log2_ab_bound = n_total_edges + 20
-    primes_needed = max(int(log2_ab_bound / 45) + 1, 2)
-    primes = _get_modular_primes(primes_needed)
+    primes_needed = max(int(log2_ab_bound / 60) + 1, 2)
+    primes = _get_modular_primes(primes_needed, bits=62)
 
     max_ab = max_out * 2
-    all_residues: list[dict] = []
-    for p_val in primes:
+
+    def _run_one_prime(p_val):
         ab_keys = _ffi.new("int[]", max_ab * 2)
         ab_coeffs = _ffi.new("long long[]", max_ab)
         ab_n = _ffi.new("int*")
@@ -2286,11 +2275,18 @@ def compute_treewidth_tutte_c(td, mg):
             ab_keys, ab_coeffs, ab_n, max_ab, p_val)
         if rc != 0:
             return None
-        residues = {}
-        for i in range(ab_n[0]):
-            key = (ab_keys[i * 2], ab_keys[i * 2 + 1])
-            residues[key] = int(ab_coeffs[i])
-        all_residues.append(residues)
+        return {(ab_keys[i * 2], ab_keys[i * 2 + 1]): int(ab_coeffs[i])
+                for i in range(ab_n[0])}
+
+    # Parallelize prime DPs. cffi releases the GIL during C calls, and both
+    # g_prime and ccache are __thread so workers don't race.
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+    max_workers = min(len(primes), max(1, (os.cpu_count() or 2) - 1))
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        all_residues = list(ex.map(_run_one_prime, primes))
+    if any(r is None for r in all_residues):
+        return None
 
     all_keys = set()
     for rm in all_residues:

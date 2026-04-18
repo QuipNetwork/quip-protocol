@@ -240,7 +240,7 @@ def find_disjoint_cover(
     matches = find_subgraph_isomorphisms(graph, pattern, max_matches=50)
     _log.record(EventType.VF2_MATCH, "covering",
                 f"Disjoint cover: {len(matches)} placements of {minor.name}",
-                LogLevel.DEBUG)
+                LogLevel.DEBUG, graph=graph)
 
     # Sort by coverage (prefer matches that cover more uncovered edges)
     def coverage_score(mapping):
@@ -297,7 +297,7 @@ def find_disjoint_cover(
     _log.record(EventType.COVER_RESULT, "covering",
                 f"Cover: {cover.total_tiles()} tiles, "
                 f"{len(cover.uncovered_edges)} uncovered edges",
-                LogLevel.DEBUG)
+                LogLevel.DEBUG, graph=graph)
     return cover
 
 
@@ -1194,7 +1194,7 @@ def try_hierarchical_partition(
     candidates = find_cell_candidates(graph, table)
     _log.record(EventType.CANDIDATE_FILTER, "covering",
                 f"Hierarchical: {len(candidates)} cell candidates for {graph.node_count()}n {graph.edge_count()}e",
-                LogLevel.DEBUG)
+                LogLevel.DEBUG, graph=graph)
 
     for cell in candidates:
         cell_size = cell.node_count

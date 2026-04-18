@@ -431,7 +431,7 @@ def compute_sp_tutte_if_applicable(graph: Graph) -> Optional[TuttePolynomial]:
     _log.record(EventType.SERIES_PARALLEL, "series_parallel",
                 f"SP graph: {graph.node_count()}n {graph.edge_count()}e, "
                 f"tree depth {tree.depth()}",
-                LogLevel.DEBUG)
+                LogLevel.DEBUG, graph=graph)
     return compute_sp_tutte(tree)
 
 
@@ -695,7 +695,7 @@ def compute_sp_tutte_multigraph_if_applicable(mg: MultiGraph) -> Optional[TutteP
     _log = get_log()
     _log.record(EventType.SERIES_PARALLEL, "series_parallel",
                 f"SP multigraph: {mg.node_count()}n {mg.edge_count()}e",
-                LogLevel.DEBUG)
+                LogLevel.DEBUG, graph=mg)
     return compute_sp_tutte_multigraph(tree)
 
 

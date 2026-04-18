@@ -104,6 +104,17 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         self._inter_cell_cache: Dict[str, TuttePolynomial] = {}  # For inter-cell graph polynomials
         self._contraction_cache: Dict[str, TuttePolynomial] = {}  # For SP-guided contraction polynomials
         self._mg_minors_accum: Set[str] = set()  # Accumulates minors found during multigraph synthesis
+        # Accumulates (canonical_key -> Graph|MultiGraph) for every sub-problem
+        # the engine actually synthesized (not a cache/lookup hit). Attached to
+        # the top-level SynthesisResult so the visualizer can split "contributing
+        # graphs from the lookup table" vs "graphs synthesized along the way".
+        self._synth_accum_graphs: Dict[str, object] = {}
+        self._synth_depth: int = 0
+        # When True, the top-level synthesize() call skips the rainbow-table
+        # lookup for the input graph (but sub-problems may still be looked up).
+        # Useful for visualizer runs where we want to see what the engine
+        # would do without a direct hit on the target.
+        self.skip_target_lookup: bool = False
 
     def _log(self, msg: str) -> None:
         """Print message if verbose."""
@@ -336,17 +347,33 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
     ) -> SynthesisResult:
         """Main entry point: compute Tutte polynomial via creation-expansion-join.
 
-        Args:
-            graph: Graph to compute polynomial for
-            max_depth: Maximum recursion depth
-
-        Returns:
-            SynthesisResult with computed polynomial
+        Thin wrapper around `_synthesize_inner` that tracks recursion depth
+        so the top-level call can stamp the final SynthesisResult with
+        `synthesized_minors` and `synthesized_graphs` — the per-run snapshot
+        of every sub-graph the engine actually synthesized (as opposed to
+        retrieved from the rainbow table).
         """
+        is_top = self._synth_depth == 0
+        self._synth_depth += 1
+        try:
+            result = self._synthesize_inner(graph, max_depth)
+        finally:
+            self._synth_depth -= 1
+        if is_top:
+            result.synthesized_graphs = dict(self._synth_accum_graphs)
+            result.synthesized_minors = set(self._synth_accum_graphs.keys())
+        return result
+
+    def _synthesize_inner(
+        self,
+        graph: Graph,
+        max_depth: int = 10
+    ) -> SynthesisResult:
+        """Core synthesis logic — see `synthesize()` for the public entrypoint."""
         _log = get_log()
         n, m = graph.node_count(), graph.edge_count()
         _log.record(EventType.SYNTHESIS_START, "engine",
-                     f"{n}n {m}e", LogLevel.INFO)
+                     f"{n}n {m}e", LogLevel.INFO, graph=graph)
 
         # 1. Family recognition fast path — O(n+m)
         # Runs before canonical_key() to avoid the O(n² log n) cost for
@@ -354,7 +381,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         family_poly = recognize_family(graph)
         if family_poly is not None:
             _log.record(EventType.FAMILY_RECOGNITION, "engine",
-                        f"Family recognized: {n}n {m}e", LogLevel.INFO)
+                        f"Family recognized: {n}n {m}e", LogLevel.INFO,
+                        graph=graph)
             self._log(f"Family recognition: O(n+m) fast path")
             result = SynthesisResult(
                 polynomial=family_poly,
@@ -362,37 +390,50 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 verified=True,
                 method="family_recognition",
             )
+            # Family recognition is synthesis-from-formula; count the input.
+            self._record_synth(graph)
             return result
 
         # 2. Compute canonical key (expensive — O(n² log n))
         cache_key = graph.canonical_key()
         if cache_key in self._cache:
             _log.record(EventType.CACHE_HIT, "engine",
-                        f"Cache hit: {cache_key[:12]}", LogLevel.DEBUG)
+                        f"Cache hit: {cache_key[:12]}", LogLevel.DEBUG,
+                        graph=graph)
             self._log(f"Cache hit: {cache_key[:16]}...")
             return self._cache[cache_key]
 
         self._log(f"Synthesizing graph with {n} nodes, {m} edges")
 
-        # 3. Check rainbow table
-        cached = self.table.lookup(graph)
-        if cached is not None:
-            _log.record(EventType.LOOKUP_HIT, "engine",
-                        f"Rainbow table hit: {n}n {m}e")
-            self._log("Direct rainbow table lookup")
-            result = SynthesisResult(
-                polynomial=cached,
-                recipe=["Rainbow table lookup"],
-                verified=True,
-                method="lookup",
-                minors_used={cache_key} if cache_key in self.table.entries else set(),
-            )
-            self._cache[cache_key] = result
-            return result
+        # 3. Check rainbow table (optionally skipped for the top-level call
+        # when skip_target_lookup is enabled — lets the visualizer show the
+        # engine's decomposition path for a graph that happens to be in the table).
+        is_top_call = self._synth_depth == 1
+        if not (is_top_call and self.skip_target_lookup):
+            cached = self.table.lookup(graph)
+            if cached is not None:
+                _log.record(EventType.LOOKUP_HIT, "engine",
+                            f"Rainbow table hit: {n}n {m}e", graph=graph)
+                self._log("Direct rainbow table lookup")
+                result = SynthesisResult(
+                    polynomial=cached,
+                    recipe=["Rainbow table lookup"],
+                    verified=True,
+                    method="lookup",
+                    minors_used={cache_key} if cache_key in self.table.entries else set(),
+                )
+                self._cache[cache_key] = result
+                return result
+
+        # Past the lookup gate: every remaining path is real synthesis work.
+        # Record the input graph so the visualizer can show it in the
+        # "synthesized" panel.
+        self._record_synth(graph, cache_key)
 
         # 4. Handle base cases
         if graph.edge_count() == 0:
-            _log.record(EventType.BASE_CASE, "engine", "Empty graph: T = 1")
+            _log.record(EventType.BASE_CASE, "engine", "Empty graph: T = 1",
+                        graph=graph)
             result = SynthesisResult(
                 polynomial=TuttePolynomial.one(),
                 recipe=["Empty graph: T = 1"],
@@ -403,7 +444,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             return result
 
         if graph.edge_count() == 1:
-            _log.record(EventType.BASE_CASE, "engine", "Single edge: T = x")
+            _log.record(EventType.BASE_CASE, "engine", "Single edge: T = x",
+                        graph=graph)
             result = SynthesisResult(
                 polynomial=TuttePolynomial.x(),
                 recipe=["Single edge: T = x"],
@@ -417,7 +459,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         components = graph.connected_components()
         if len(components) > 1:
             _log.record(EventType.FACTORIZE, "engine",
-                        f"Disconnected: {len(components)} components")
+                        f"Disconnected: {len(components)} components",
+                        graph=graph)
             result = self._synthesize_disconnected(components, max_depth)
             self._cache[cache_key] = result
             self._promote_to_table(graph, cache_key, result)
@@ -427,7 +470,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         cut = graph.has_cut_vertex()
         if cut is not None:
             _log.record(EventType.FACTORIZE, "engine",
-                        f"Cut vertex at {cut}")
+                        f"Cut vertex at {cut}", graph=graph)
             result = self._synthesize_via_cut_vertex(graph, cut, max_depth)
             self._cache[cache_key] = result
             self._promote_to_table(graph, cache_key, result)
@@ -437,7 +480,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         sp_poly = compute_sp_tutte_if_applicable(graph)
         if sp_poly is not None:
             _log.record(EventType.SERIES_PARALLEL, "engine",
-                        f"SP decomposition: {n}n {m}e")
+                        f"SP decomposition: {n}n {m}e", graph=graph)
             self._log("Series-parallel: O(n) computation")
             result = SynthesisResult(
                 polynomial=sp_poly,
@@ -455,6 +498,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             full_mg = MultiGraph.from_graph(graph)
             tw_poly = compute_treewidth_tutte_if_applicable(full_mg, max_width=11)
             if tw_poly is not None:
+                _log.record(EventType.TREEWIDTH_DP, "engine",
+                            f"Treewidth DP: {n}n {m}e", graph=graph)
                 self._log(f"Treewidth DP: {graph.node_count()}n, {graph.edge_count()}e")
                 result = SynthesisResult(
                     polynomial=tw_poly,
@@ -471,7 +516,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             result = self._try_ksum_decomposition(graph)
             if result is not None:
                 _log.record(EventType.KSUM, "engine",
-                            f"k-sum: {result.method}")
+                            f"k-sum: {result.method}", graph=graph)
                 self._cache[cache_key] = result
                 self._promote_to_table(graph, cache_key, result)
                 return result
@@ -481,7 +526,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             result = self._try_hierarchical(graph, max_depth)
             if result is not None:
                 _log.record(EventType.HIERARCHICAL, "engine",
-                            f"Hierarchical: {result.tiles_used} tiles")
+                            f"Hierarchical: {result.tiles_used} tiles",
+                            graph=graph)
                 self._cache[cache_key] = result
                 self._promote_to_table(graph, cache_key, result)
                 return result
