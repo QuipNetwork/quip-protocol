@@ -40,13 +40,56 @@ ffi.cdef("""
 
     /* Bulk treewidth DP — entire computation in C.
        Returns 0 on success, nonzero on error.
-       Output: (x_power, y_power, coefficient) triples in out arrays. */
+       Output: (x_power, y_power, coefficient) triples in out arrays.
+       dp_prime: modulus for DP arithmetic (0 = exact int64).
+       conv_prime: modulus for (a,b)→(x,y) basis conversion (0 = exact int64). */
     int treewidth_tutte_dp(
         int n_bags, const int* bag_sizes, const int* bag_verts_flat,
         int root, const int* children_counts, const int* children_flat,
         const int* bag_edge_counts, const int* edges_flat,
         int n_verts, int n_components,
-        int* out_xy, long long* out_coeffs, int* out_n_terms, int max_out);
+        int* out_xy, long long* out_coeffs, int* out_n_terms, int max_out,
+        long long dp_prime, long long conv_prime);
+
+    /* Treewidth DP — returns only the (a,b)-basis polynomial (no conversion).
+       Used when we want to run the DP once and convert with multiple primes. */
+    int treewidth_tutte_dp_ab(
+        int n_bags, const int* bag_sizes, const int* bag_verts_flat,
+        int root, const int* children_counts, const int* children_flat,
+        const int* bag_edge_counts, const int* edges_flat,
+        int n_verts, int n_components,
+        int* out_ab, long long* out_coeffs, int* out_n_terms, int max_out);
+
+    /* Modular variant of treewidth_tutte_dp_ab — runs DP mod dp_prime, emits
+       (a,b) residues. Used for (a,b)-only CRT reconstruction when coefficients
+       exceed int128 (>120 edges). */
+    int treewidth_tutte_dp_ab_mod(
+        int n_bags, const int* bag_sizes, const int* bag_verts_flat,
+        int root, const int* children_counts, const int* children_flat,
+        const int* bag_edge_counts, const int* edges_flat,
+        int n_verts, int n_components,
+        int* out_ab, long long* out_coeffs, int* out_n_terms, int max_out,
+        long long dp_prime);
+
+    /* __int128 variant — exact arithmetic, coefficients up to ~2^127.
+       Outputs each coefficient as (hi64, lo64) pair for Python reconstruction. */
+    int treewidth_tutte_dp_ab128(
+        int n_bags, const int* bag_sizes, const int* bag_verts_flat,
+        int root, const int* children_counts, const int* children_flat,
+        const int* bag_edge_counts, const int* edges_flat,
+        int n_verts, int n_components,
+        int* out_ab, long long* out_coeffs_hi, long long* out_coeffs_lo,
+        int* out_n_terms, int max_out);
+
+    /* Convert (a,b)-basis polynomial to (x,y)-basis via binomial expansion.
+       If conv_prime > 0, uses modular arithmetic for binomials (handles overflow).
+       ab_keys[i] = a_pow * 256 + b_pow, ab_coeffs[i] = coefficient in (a,b) basis.
+       Outputs (x,y) coefficients in out_xy/out_coeffs. */
+    int basis_convert_ab_to_xy(
+        const int* ab_keys, const long long* ab_coeffs, int n_ab_terms,
+        int* out_xy, long long* out_coeffs, int* out_n_terms, int max_out,
+        long long conv_prime);
+
 """)
 
 ffi.set_source("_treewidth_cffi", r"""
@@ -92,23 +135,33 @@ static uint64_t encoded_connect(uint64_t enc, int i, int j) {
 /* Connect cache: open-addressing hash map */
 #define CCACHE_CAP (1 << 21)  /* 2M entries */
 #define CCACHE_MASK (CCACHE_CAP - 1)
-static struct { uint64_t key; uint64_t val; uint8_t used; } ccache[CCACHE_CAP];
+/* Cache uses separate enc + ij fields to avoid key collisions:
+   key1 = enc (full partition encoding)
+   key2 = (i << 4) | j (packed indices, max 16 each)
+   Both must match for a cache hit. */
+static __thread struct {
+    uint64_t enc;
+    uint8_t  ij;   /* (i << 4) | j */
+    uint64_t val;
+    uint8_t  used;
+} ccache[CCACHE_CAP];
 
 static uint64_t cached_connect(uint64_t enc, int i, int j) {
-    uint64_t k = enc ^ ((uint64_t)i << 48) ^ ((uint64_t)j << 56);
-    uint32_t h = (uint32_t)(k * 0x9E3779B97F4A7C15ULL >> 43) & CCACHE_MASK;
-    /* Linear probing with 4 slots to handle collisions */
+    uint64_t h64 = enc * 0x9E3779B97F4A7C15ULL + (uint64_t)i * 31 + j;
+    uint32_t h = (uint32_t)(h64 >> 43) & CCACHE_MASK;
+    uint8_t ij = (uint8_t)((i << 4) | j);
     int probe;
-    for (probe = 0; probe < 4; probe++) {
+    for (probe = 0; probe < 8; probe++) {
         uint32_t slot = (h + probe) & CCACHE_MASK;
-        if (ccache[slot].used && ccache[slot].key == k) return ccache[slot].val;
+        if (ccache[slot].used && ccache[slot].enc == enc && ccache[slot].ij == ij)
+            return ccache[slot].val;
         if (!ccache[slot].used) {
             uint64_t result = encoded_connect(enc, i, j);
-            ccache[slot].key = k; ccache[slot].val = result; ccache[slot].used = 1;
+            ccache[slot].enc = enc; ccache[slot].ij = ij;
+            ccache[slot].val = result; ccache[slot].used = 1;
             return result;
         }
     }
-    /* All 4 probe slots occupied — compute without caching */
     return encoded_connect(enc, i, j);
 }
 
@@ -278,6 +331,39 @@ void modular_det_multi(
 }
 
 /* =========================================================================
+   MODULAR COEFFICIENT ARITHMETIC
+   ========================================================================= */
+
+/* Global prime for modular arithmetic. 0 = exact int64.
+   Thread-local so parallel CRT prime workers don't race. */
+static __thread long long g_prime = 0;
+
+static inline long long coeff_add(long long a, long long b) {
+    if (g_prime == 0) return a + b;
+    long long s = a + b;
+    if (s >= g_prime) s -= g_prime;
+    else if (s <= -g_prime) s += g_prime;
+    return s;
+}
+
+static inline long long coeff_mul(long long a, long long b) {
+    if (g_prime == 0) return a * b;
+    __int128 prod = (__int128)a * (__int128)b;
+    return (long long)(prod % (__int128)g_prime);
+}
+
+static inline long long coeff_neg(long long a) {
+    if (g_prime == 0) return -a;
+    return a == 0 ? 0 : g_prime - a;
+}
+
+static inline long long coeff_from_int(long long a) {
+    if (g_prime == 0) return a;
+    long long r = a % g_prime;
+    return r < 0 ? r + g_prime : r;
+}
+
+/* =========================================================================
    SPARSE POLYNOMIAL (sorted key-value arrays)
    ========================================================================= */
 
@@ -316,7 +402,7 @@ static Poly* poly_zero(void) { return poly_alloc(64); }
 
 static Poly* poly_one(void) {
     Poly* p = poly_alloc(64);
-    p->keys[0] = 0; p->vals[0] = 1; p->n = 1;
+    p->keys[0] = 0; p->vals[0] = coeff_from_int(1); p->n = 1;
     return p;
 }
 
@@ -350,7 +436,7 @@ static void poly_add_inplace(Poly* dst, const Poly* src) {
         } else if (dst->keys[di] > src->keys[si]) {
             tmp_k[wi] = src->keys[si]; tmp_v[wi] = src->vals[si]; si++; wi++;
         } else {
-            int64_t s = dst->vals[di] + src->vals[si];
+            int64_t s = coeff_add(dst->vals[di], src->vals[si]);
             if (s != 0) { tmp_k[wi] = dst->keys[di]; tmp_v[wi] = s; wi++; }
             di++; si++;
         }
@@ -386,7 +472,7 @@ static Poly* poly_mul(const Poly* p, const Poly* q) {
         int i;
         for (i = 0; i < q->n; i++) {
             r->keys[i] = pk + q->keys[i];
-            r->vals[i] = pv * q->vals[i];
+            r->vals[i] = coeff_mul(pv, q->vals[i]);
         }
         r->n = q->n;
         return r;
@@ -397,7 +483,7 @@ static Poly* poly_mul(const Poly* p, const Poly* q) {
         int i;
         for (i = 0; i < p->n; i++) {
             r->keys[i] = p->keys[i] + qk;
-            r->vals[i] = p->vals[i] * qv;
+            r->vals[i] = coeff_mul(p->vals[i], qv);
         }
         r->n = p->n;
         return r;
@@ -417,10 +503,10 @@ static Poly* poly_mul(const Poly* p, const Poly* q) {
         uint16_t pk = p->keys[i]; int64_t pv = p->vals[i];
         for (j = 0; j < q->n; j++) {
             uint16_t key = pk + q->keys[j];
-            int64_t prod = pv * q->vals[j];
+            int64_t prod = coeff_mul(pv, q->vals[j]);
             uint32_t h = ((uint32_t)key * 2654435761u) & mask;
             while (ht_used[h]) {
-                if (ht_keys[h] == key) { ht_vals[h] += prod; goto next_mul; }
+                if (ht_keys[h] == key) { ht_vals[h] = coeff_add(ht_vals[h], prod); goto next_mul; }
                 h = (h + 1) & mask;
             }
             ht_used[h] = 1; ht_keys[h] = key; ht_vals[h] = prod; result_n++;
@@ -755,7 +841,7 @@ static DPTable* process_bag(TDInfo* td, int bag_idx, int** out_verts, int* out_n
         int64_t c = 1;
         for (int j = 0; j <= mult; j++) {
             factor->keys[j] = (uint16_t)j; /* b^j: a=0, b=j, key=j */
-            factor->vals[j] = c;
+            factor->vals[j] = coeff_from_int(c);
             c = c * (mult - j) / (j + 1);
         }
         factor->n = mult + 1;
@@ -778,11 +864,12 @@ static DPTable* process_bag(TDInfo* td, int bag_idx, int** out_verts, int* out_n
         Poly* ff = poly_alloc(mult+1);
         int64_t c = 1;
         for (int j = 0; j <= mult; j++) {
-            ff->keys[j] = (uint16_t)j; ff->vals[j] = c;
+            ff->keys[j] = (uint16_t)j; ff->vals[j] = coeff_from_int(c);
             c = c * (mult - j) / (j + 1);
         }
         ff->n = mult + 1;
-        Poly* fm1 = poly_copy(ff); fm1->vals[0] -= 1;
+        Poly* fm1 = poly_copy(ff);
+        fm1->vals[0] = coeff_add(fm1->vals[0], coeff_neg(coeff_from_int(1)));
         if (fm1->vals[0] == 0) {
             /* Remove zero entry by shifting */
             memmove(fm1->keys, fm1->keys+1, (fm1->n-1)*sizeof(uint16_t));
@@ -929,8 +1016,11 @@ int treewidth_tutte_dp(
     int root, const int* children_counts, const int* children_flat,
     const int* bag_edge_counts, const int* edges_flat,
     int n_verts, int n_components,
-    int* out_xy, long long* out_coeffs, int* out_n_terms, int max_out)
+    int* out_xy, long long* out_coeffs, int* out_n_terms, int max_out,
+    long long dp_prime, long long conv_prime)
 {
+    g_prime = dp_prime;
+
     /* Clear connect cache */
     memset(ccache, 0, sizeof(ccache));
 
@@ -994,28 +1084,27 @@ int treewidth_tutte_dp(
         ab_poly->n++;
     }
 
+    /* Switch to conversion prime for the basis conversion phase.
+       This allows the DP to run in exact int64 while handling binomial overflow. */
+    g_prime = conv_prime;
+
     /* Convert (a,b) = (x-1, y-1) to (x,y) via binomial expansion.
-       Precompute signed binomial coefficients to avoid integer division issues. */
-    /* Precompute binom_signed[n][k] = C(n,k) * (-1)^(n-k) for n up to 128 */
-    #define MAX_BINOM 128
-    int64_t binom_signed[MAX_BINOM+1][MAX_BINOM+1];
-    memset(binom_signed, 0, sizeof(binom_signed));
-    for (int nn = 0; nn <= MAX_BINOM; nn++) {
-        binom_signed[nn][0] = (nn % 2 == 0) ? 1 : -1; /* (-1)^n */
-        binom_signed[nn][nn] = 1;
-        for (int kk = 1; kk < nn; kk++) {
-            /* C(n,k)*(-1)^(n-k) = C(n-1,k-1)*(-1)^(n-k) + C(n-1,k)*(-1)^(n-k) */
-            /* = -C(n-1,k-1)*(-1)^(n-1-k+1) + ... hmm, use Pascal's triangle on unsigned first */
-            /* Actually: just build unsigned C(n,k) then apply sign */
-        }
+       Binomial coefficients use modular arithmetic (coeff_add) to avoid
+       int64 overflow for large n (C(164,82) >> 2^63). */
+    int max_ab = 0;
+    for (int ti = 0; ti < ab_poly->n; ti++) {
+        int a = ab_poly->keys[ti] / KEY_STRIDE;
+        int b = ab_poly->keys[ti] % KEY_STRIDE;
+        if (a > max_ab) max_ab = a;
+        if (b > max_ab) max_ab = b;
     }
-    /* Simpler: build unsigned Pascal's triangle, apply sign after */
-    int64_t binom[MAX_BINOM+1][MAX_BINOM+1];
-    memset(binom, 0, sizeof(binom));
-    for (int nn = 0; nn <= MAX_BINOM; nn++) {
-        binom[nn][0] = 1;
+    int binom_size = max_ab + 1;
+    int64_t* binom_flat = (int64_t*)calloc((size_t)binom_size * binom_size, sizeof(int64_t));
+    #define BINOM(n,k) binom_flat[(n) * binom_size + (k)]
+    for (int nn = 0; nn < binom_size; nn++) {
+        BINOM(nn, 0) = coeff_from_int(1);
         for (int kk = 1; kk <= nn; kk++)
-            binom[nn][kk] = binom[nn-1][kk-1] + binom[nn-1][kk];
+            BINOM(nn, kk) = coeff_add(BINOM(nn-1, kk-1), BINOM(nn-1, kk));
     }
 
     int ht_cap = 65536;
@@ -1031,19 +1120,19 @@ int treewidth_tutte_dp(
 
         for (int p = 0; p <= a_pow; p++) {
             /* C(a_pow, p) * (-1)^(a_pow - p) */
-            int64_t cx = binom[a_pow][p];
-            if ((a_pow - p) % 2 != 0) cx = -cx;
+            int64_t cx = BINOM(a_pow, p);
+            if ((a_pow - p) % 2 != 0) cx = coeff_neg(cx);
 
             for (int q = 0; q <= b_pow; q++) {
-                int64_t cy = binom[b_pow][q];
-                if ((b_pow - q) % 2 != 0) cy = -cy;
+                int64_t cy = BINOM(b_pow, q);
+                if ((b_pow - q) % 2 != 0) cy = coeff_neg(cy);
 
-                int64_t contribution = coeff * cx * cy;
+                int64_t contribution = coeff_mul(coeff, coeff_mul(cx, cy));
                 if (contribution != 0) {
                     uint32_t key = (uint32_t)(p * 256 + q);
                     uint32_t h = (key * 2654435761u) & xy_mask;
                     while (ht_used_xy[h]) {
-                        if (ht_keys_xy[h] == key) { ht_vals_xy[h] += contribution; goto next_xy; }
+                        if (ht_keys_xy[h] == key) { ht_vals_xy[h] = coeff_add(ht_vals_xy[h], contribution); goto next_xy; }
                         h = (h + 1) & xy_mask;
                     }
                     ht_used_xy[h] = 1; ht_keys_xy[h] = key; ht_vals_xy[h] = contribution;
@@ -1068,6 +1157,8 @@ int treewidth_tutte_dp(
     /* Cleanup */
     free(ht_keys_xy); free(ht_vals_xy); free(ht_used_xy);
     poly_free(ab_poly);
+    free(binom_flat);
+    #undef BINOM
     poly_free(final_poly);
     dpt_free(root_table);
     free(root_verts);
@@ -1077,30 +1168,834 @@ int treewidth_tutte_dp(
 
     return 0;
 }
+
+/* Run DP only — return (a,b)-basis polynomial without basis conversion.
+   Used when we want to run the DP once (in int64) and convert with
+   multiple primes via basis_convert_ab_to_xy. */
+int treewidth_tutte_dp_ab(
+    int n_bags, const int* bag_sizes, const int* bag_verts_flat,
+    int root, const int* children_counts, const int* children_flat,
+    const int* bag_edge_counts, const int* edges_flat,
+    int n_verts, int n_components,
+    int* out_ab, long long* out_coeffs, int* out_n_terms, int max_out)
+{
+    g_prime = 0;  /* DP in exact int64 */
+    memset(ccache, 0, sizeof(ccache));
+
+    TDInfo td;
+    td.n_bags = n_bags;
+    td.bag_sizes = bag_sizes;
+    td.bag_verts_flat = bag_verts_flat;
+    td.children_counts = children_counts;
+    td.children_flat = children_flat;
+    td.bag_edge_counts = bag_edge_counts;
+    td.edges_flat = edges_flat;
+    td.bag_verts_offsets = (int*)malloc(n_bags * sizeof(int));
+    td.children_offsets = (int*)malloc(n_bags * sizeof(int));
+    td.edges_offsets = (int*)malloc(n_bags * sizeof(int));
+    int off = 0;
+    for (int i = 0; i < n_bags; i++) { td.bag_verts_offsets[i] = off; off += bag_sizes[i]; }
+    off = 0;
+    for (int i = 0; i < n_bags; i++) { td.children_offsets[i] = off; off += children_counts[i]; }
+    off = 0;
+    for (int i = 0; i < n_bags; i++) { td.edges_offsets[i] = off; off += bag_edge_counts[i] * 3; }
+
+    int* root_verts; int root_n;
+    DPTable* root_table = process_bag(&td, root, &root_verts, &root_n);
+
+    /* Forget all root vertices */
+    Poly* final_poly = poly_zero();
+    for (int i = 0; i < root_table->cap; i++) {
+        if (!root_table->used[i]) continue;
+        uint64_t cur_enc = root_table->keys[i];
+        Poly* cur_poly = poly_copy(root_table->vals[i]);
+        for (int j = 0; j < root_n; j++) {
+            ForgetResult fr = encoded_forget(cur_enc, 0);
+            if (fr.is_singleton) {
+                Poly* shifted = poly_shift(cur_poly, KEY_STRIDE + 1);
+                poly_free(cur_poly);
+                cur_poly = shifted;
+            }
+            cur_enc = fr.new_enc;
+        }
+        poly_add_inplace(final_poly, cur_poly);
+        poly_free(cur_poly);
+    }
+
+    /* Shift exponents: divide by a^{n_components} * b^{n_verts} */
+    int a_shift = n_components;
+    int b_shift = n_verts;
+    int n_out = 0;
+    for (int i = 0; i < final_poly->n && n_out < max_out; i++) {
+        int a_pow = final_poly->keys[i] / KEY_STRIDE;
+        int b_pow = final_poly->keys[i] % KEY_STRIDE;
+        int new_a = a_pow - a_shift;
+        int new_b = b_pow - b_shift;
+        if (new_a < 0 || new_b < 0) continue;
+        out_ab[n_out * 2] = new_a;
+        out_ab[n_out * 2 + 1] = new_b;
+        out_coeffs[n_out] = final_poly->vals[i];
+        n_out++;
+    }
+    *out_n_terms = n_out;
+
+    poly_free(final_poly);
+    dpt_free(root_table);
+    free(root_verts);
+    free(td.bag_verts_offsets);
+    free(td.children_offsets);
+    free(td.edges_offsets);
+    return 0;
+}
+
+/* Modular variant of treewidth_tutte_dp_ab. Runs DP mod dp_prime; coefficients
+   emitted are residues in [0, dp_prime). For graphs too large for int128 DP;
+   Python CRT-reconstructs (a,b) across primes then converts basis. */
+int treewidth_tutte_dp_ab_mod(
+    int n_bags, const int* bag_sizes, const int* bag_verts_flat,
+    int root, const int* children_counts, const int* children_flat,
+    const int* bag_edge_counts, const int* edges_flat,
+    int n_verts, int n_components,
+    int* out_ab, long long* out_coeffs, int* out_n_terms, int max_out,
+    long long dp_prime)
+{
+    g_prime = dp_prime;
+    memset(ccache, 0, sizeof(ccache));
+
+    TDInfo td;
+    td.n_bags = n_bags;
+    td.bag_sizes = bag_sizes;
+    td.bag_verts_flat = bag_verts_flat;
+    td.children_counts = children_counts;
+    td.children_flat = children_flat;
+    td.bag_edge_counts = bag_edge_counts;
+    td.edges_flat = edges_flat;
+    td.bag_verts_offsets = (int*)malloc(n_bags * sizeof(int));
+    td.children_offsets = (int*)malloc(n_bags * sizeof(int));
+    td.edges_offsets = (int*)malloc(n_bags * sizeof(int));
+    int off = 0;
+    for (int i = 0; i < n_bags; i++) { td.bag_verts_offsets[i] = off; off += bag_sizes[i]; }
+    off = 0;
+    for (int i = 0; i < n_bags; i++) { td.children_offsets[i] = off; off += children_counts[i]; }
+    off = 0;
+    for (int i = 0; i < n_bags; i++) { td.edges_offsets[i] = off; off += bag_edge_counts[i] * 3; }
+
+    int* root_verts; int root_n;
+    DPTable* root_table = process_bag(&td, root, &root_verts, &root_n);
+
+    Poly* final_poly = poly_zero();
+    for (int i = 0; i < root_table->cap; i++) {
+        if (!root_table->used[i]) continue;
+        uint64_t cur_enc = root_table->keys[i];
+        Poly* cur_poly = poly_copy(root_table->vals[i]);
+        for (int j = 0; j < root_n; j++) {
+            ForgetResult fr = encoded_forget(cur_enc, 0);
+            if (fr.is_singleton) {
+                Poly* shifted = poly_shift(cur_poly, KEY_STRIDE + 1);
+                poly_free(cur_poly);
+                cur_poly = shifted;
+            }
+            cur_enc = fr.new_enc;
+        }
+        poly_add_inplace(final_poly, cur_poly);
+        poly_free(cur_poly);
+    }
+
+    int a_shift = n_components;
+    int b_shift = n_verts;
+    int n_out = 0;
+    for (int i = 0; i < final_poly->n && n_out < max_out; i++) {
+        int a_pow = final_poly->keys[i] / KEY_STRIDE;
+        int b_pow = final_poly->keys[i] % KEY_STRIDE;
+        int new_a = a_pow - a_shift;
+        int new_b = b_pow - b_shift;
+        if (new_a < 0 || new_b < 0) continue;
+        out_ab[n_out * 2] = new_a;
+        out_ab[n_out * 2 + 1] = new_b;
+        out_coeffs[n_out] = final_poly->vals[i];
+        n_out++;
+    }
+    *out_n_terms = n_out;
+
+    poly_free(final_poly);
+    dpt_free(root_table);
+    free(root_verts);
+    free(td.bag_verts_offsets);
+    free(td.children_offsets);
+    free(td.edges_offsets);
+    return 0;
+}
+
+/* =========================================================================
+   __int128 DP VARIANTS (for medium-density graphs: 63-120 edges)
+   Exact arithmetic with __int128 — no modular reduction, no overflow
+   for coefficients up to ~2^127.
+   ========================================================================= */
+
+typedef struct {
+    uint16_t* keys;
+    __int128* vals;
+    int n, cap;
+} Poly128;
+
+static Poly128* poly_alloc128(int cap) {
+    Poly128* p = (Poly128*)malloc(sizeof(Poly128));
+    p->keys = (uint16_t*)calloc(cap, sizeof(uint16_t));
+    p->vals = (__int128*)calloc(cap, sizeof(__int128));
+    p->n = 0; p->cap = cap; return p;
+}
+static void poly_free128(Poly128* p) {
+    if (p) { free(p->keys); free(p->vals); free(p); }
+}
+static void poly_grow128(Poly128* p, int needed) {
+    if (needed <= p->cap) return;
+    int new_cap = p->cap * 2;
+    if (new_cap < needed) new_cap = needed;
+    p->keys = (uint16_t*)realloc(p->keys, new_cap * sizeof(uint16_t));
+    p->vals = (__int128*)realloc(p->vals, new_cap * sizeof(__int128));
+    p->cap = new_cap;
+}
+static Poly128* poly_zero128(void) { return poly_alloc128(64); }
+static Poly128* poly_one128(void) {
+    Poly128* p = poly_alloc128(64);
+    p->keys[0] = 0; p->vals[0] = (__int128)1; p->n = 1; return p;
+}
+static Poly128* poly_copy128(const Poly128* src) {
+    Poly128* dst = poly_alloc128(src->n > 0 ? src->n : 64);
+    memcpy(dst->keys, src->keys, src->n * sizeof(uint16_t));
+    memcpy(dst->vals, src->vals, src->n * sizeof(__int128));
+    dst->n = src->n; return dst;
+}
+static void poly_add_inplace128(Poly128* dst, const Poly128* src) {
+    if (src->n == 0) return;
+    int needed = dst->n + src->n;
+    uint16_t* tmp_k = (uint16_t*)malloc(needed * sizeof(uint16_t));
+    __int128* tmp_v = (__int128*)malloc(needed * sizeof(__int128));
+    int di = 0, si = 0, wi = 0, dn = dst->n, sn = src->n;
+    while (di < dn && si < sn) {
+        if (dst->keys[di] < src->keys[si]) {
+            tmp_k[wi] = dst->keys[di]; tmp_v[wi] = dst->vals[di]; di++; wi++;
+        } else if (dst->keys[di] > src->keys[si]) {
+            tmp_k[wi] = src->keys[si]; tmp_v[wi] = src->vals[si]; si++; wi++;
+        } else {
+            __int128 s = dst->vals[di] + src->vals[si];
+            if (s != 0) { tmp_k[wi] = dst->keys[di]; tmp_v[wi] = s; wi++; }
+            di++; si++;
+        }
+    }
+    while (di < dn) { tmp_k[wi] = dst->keys[di]; tmp_v[wi] = dst->vals[di]; di++; wi++; }
+    while (si < sn) { tmp_k[wi] = src->keys[si]; tmp_v[wi] = src->vals[si]; si++; wi++; }
+    poly_grow128(dst, wi);
+    memcpy(dst->keys, tmp_k, wi * sizeof(uint16_t));
+    memcpy(dst->vals, tmp_v, wi * sizeof(__int128));
+    dst->n = wi; free(tmp_k); free(tmp_v);
+}
+static Poly128* poly_shift128(const Poly128* p, int delta) {
+    Poly128* r = poly_alloc128(p->n > 0 ? p->n : 64);
+    int i;
+    for (i = 0; i < p->n; i++) {
+        r->keys[i] = p->keys[i] + delta; r->vals[i] = p->vals[i];
+    }
+    r->n = p->n; return r;
+}
+static Poly128* poly_mul128(const Poly128* p, const Poly128* q) {
+    if (p->n == 0 || q->n == 0) return poly_zero128();
+    if (p->n == 1) {
+        Poly128* r = poly_alloc128(q->n);
+        uint16_t pk = p->keys[0]; __int128 pv = p->vals[0];
+        int i;
+        for (i = 0; i < q->n; i++) {
+            r->keys[i] = pk + q->keys[i]; r->vals[i] = pv * q->vals[i];
+        }
+        r->n = q->n; return r;
+    }
+    if (q->n == 1) {
+        Poly128* r = poly_alloc128(p->n);
+        uint16_t qk = q->keys[0]; __int128 qv = q->vals[0];
+        int i;
+        for (i = 0; i < p->n; i++) {
+            r->keys[i] = p->keys[i] + qk; r->vals[i] = p->vals[i] * qv;
+        }
+        r->n = p->n; return r;
+    }
+    int total = p->n * q->n;
+    int ht_cap = 1; while (ht_cap < total * 4) ht_cap <<= 1;
+    if (ht_cap < 256) ht_cap = 256;
+    uint16_t* ht_keys = (uint16_t*)calloc(ht_cap, sizeof(uint16_t));
+    __int128* ht_vals = (__int128*)calloc(ht_cap, sizeof(__int128));
+    uint8_t*  ht_used = (uint8_t*)calloc(ht_cap, sizeof(uint8_t));
+    int mask = ht_cap - 1, result_n = 0, i, j;
+    for (i = 0; i < p->n; i++) {
+        uint16_t pk = p->keys[i]; __int128 pv = p->vals[i];
+        for (j = 0; j < q->n; j++) {
+            uint16_t key = pk + q->keys[j];
+            __int128 prod = pv * q->vals[j];
+            uint32_t h = ((uint32_t)key * 2654435761u) & mask;
+            while (ht_used[h]) {
+                if (ht_keys[h] == key) { ht_vals[h] += prod; goto next_mul128; }
+                h = (h + 1) & mask;
+            }
+            ht_used[h] = 1; ht_keys[h] = key; ht_vals[h] = prod; result_n++;
+            next_mul128:;
+        }
+    }
+    Poly128* r = poly_alloc128(result_n > 0 ? result_n : 64);
+    int wi = 0;
+    for (i = 0; i < ht_cap; i++) {
+        if (ht_used[i] && ht_vals[i] != 0) {
+            r->keys[wi] = ht_keys[i]; r->vals[wi] = ht_vals[i]; wi++;
+        }
+    }
+    r->n = wi;
+    for (i = 1; i < wi; i++) {
+        uint16_t key = r->keys[i]; __int128 val = r->vals[i];
+        j = i - 1;
+        while (j >= 0 && r->keys[j] > key) {
+            r->keys[j+1] = r->keys[j]; r->vals[j+1] = r->vals[j]; j--;
+        }
+        r->keys[j+1] = key; r->vals[j+1] = val;
+    }
+    free(ht_keys); free(ht_vals); free(ht_used);
+    return r;
+}
+
+/* DPTable128 — mirrors DPTable but with Poly128 values */
+typedef struct {
+    uint64_t* keys;
+    Poly128** vals;
+    uint8_t*  used;
+    int n, cap, mask;
+} DPTable128;
+
+static DPTable128* dpt_alloc128(int cap) {
+    int c = 256; while (c < cap) c <<= 1;
+    DPTable128* t = (DPTable128*)malloc(sizeof(DPTable128));
+    t->keys = (uint64_t*)calloc(c, sizeof(uint64_t));
+    t->vals = (Poly128**)calloc(c, sizeof(Poly128*));
+    t->used = (uint8_t*)calloc(c, sizeof(uint8_t));
+    t->n = 0; t->cap = c; t->mask = c - 1; return t;
+}
+static void dpt_free128(DPTable128* t) {
+    if (!t) return;
+    int i;
+    for (i = 0; i < t->cap; i++) if (t->used[i]) poly_free128(t->vals[i]);
+    free(t->keys); free(t->vals); free(t->used); free(t);
+}
+static Poly128* dpt_get128(DPTable128* t, uint64_t key) {
+    uint32_t h = (uint32_t)(key * 0x9E3779B97F4A7C15ULL >> 43) & t->mask;
+    while (t->used[h]) {
+        if (t->keys[h] == key) return t->vals[h];
+        h = (h + 1) & t->mask;
+    }
+    return NULL;
+}
+static void dpt_set128(DPTable128* t, uint64_t key, Poly128* val) {
+    if (t->n * 2 >= t->cap) {
+        int old_cap = t->cap;
+        uint64_t* old_keys = t->keys;
+        Poly128** old_vals = t->vals;
+        uint8_t* old_used = t->used;
+        int new_cap = old_cap * 2;
+        t->keys = (uint64_t*)calloc(new_cap, sizeof(uint64_t));
+        t->vals = (Poly128**)calloc(new_cap, sizeof(Poly128*));
+        t->used = (uint8_t*)calloc(new_cap, sizeof(uint8_t));
+        t->cap = new_cap; t->mask = new_cap - 1; t->n = 0;
+        int i;
+        for (i = 0; i < old_cap; i++) {
+            if (old_used[i]) dpt_set128(t, old_keys[i], old_vals[i]);
+        }
+        free(old_keys); free(old_vals); free(old_used);
+    }
+    uint32_t h = (uint32_t)(key * 0x9E3779B97F4A7C15ULL >> 43) & t->mask;
+    while (t->used[h]) {
+        if (t->keys[h] == key) { poly_free128(t->vals[h]); t->vals[h] = val; return; }
+        h = (h + 1) & t->mask;
+    }
+    t->used[h] = 1; t->keys[h] = key; t->vals[h] = val; t->n++;
+}
+static void dpt_add128(DPTable128* t, uint64_t key, const Poly128* val) {
+    Poly128* existing = dpt_get128(t, key);
+    if (existing) poly_add_inplace128(existing, val);
+    else dpt_set128(t, key, poly_copy128(val));
+}
+
+/* merge_tables128 — mirrors merge_tables but uses Poly128 / DPTable128.
+   ConnKey helpers are value-type independent so we reuse them. */
+static DPTable128* merge_tables128(DPTable128* parent, DPTable128* child,
+                                    const int* parent_verts, int n_parent,
+                                    const int* shared_verts, int n_shared) {
+    if (n_shared == 0) {
+        Poly128* child_sum = poly_zero128();
+        int i;
+        for (i = 0; i < child->cap; i++)
+            if (child->used[i]) poly_add_inplace128(child_sum, child->vals[i]);
+        DPTable128* result = dpt_alloc128(parent->n * 2);
+        for (i = 0; i < parent->cap; i++) {
+            if (!parent->used[i]) continue;
+            Poly128* prod = poly_mul128(parent->vals[i], child_sum);
+            if (prod->n > 0) dpt_set128(result, parent->keys[i], prod);
+            else poly_free128(prod);
+        }
+        poly_free128(child_sum);
+        return result;
+    }
+
+    int shared_pos[16];
+    int si, pi;
+    for (si = 0; si < n_shared; si++) {
+        for (pi = 0; pi < n_parent; pi++) {
+            if (parent_verts[pi] == shared_verts[si]) {
+                shared_pos[si] = pi; break;
+            }
+        }
+    }
+
+    int max_conn_groups = child->n + 1;
+    if (max_conn_groups < 256) max_conn_groups = 256;
+    ConnKey*  cg_keys  = (ConnKey*)malloc(max_conn_groups * sizeof(ConnKey));
+    Poly128** cg_polys = (Poly128**)malloc(max_conn_groups * sizeof(Poly128*));
+    int       n_groups = 0;
+    int i;
+
+    for (i = 0; i < child->cap; i++) {
+        if (!child->used[i]) continue;
+        ConnKey ck = child_conn_key(child->keys[i], n_shared);
+        int found = -1, g;
+        for (g = 0; g < n_groups; g++) {
+            if (conn_key_eq(&cg_keys[g], &ck)) { found = g; break; }
+        }
+        if (found >= 0) {
+            poly_add_inplace128(cg_polys[found], child->vals[i]);
+        } else {
+            if (n_groups >= max_conn_groups) {
+                max_conn_groups *= 2;
+                cg_keys  = (ConnKey*)realloc(cg_keys, max_conn_groups * sizeof(ConnKey));
+                cg_polys = (Poly128**)realloc(cg_polys, max_conn_groups * sizeof(Poly128*));
+            }
+            cg_keys[n_groups] = ck;
+            cg_polys[n_groups] = poly_copy128(child->vals[i]);
+            n_groups++;
+        }
+    }
+
+    DPTable128* result = dpt_alloc128(parent->n * 2);
+
+    for (int gi = 0; gi < n_groups; gi++) {
+        DPTable128* pbo = dpt_alloc128(parent->n);
+        for (i = 0; i < parent->cap; i++) {
+            if (!parent->used[i]) continue;
+            uint64_t merged = apply_conn_merge(parent->keys[i], &cg_keys[gi], shared_pos);
+            dpt_add128(pbo, merged, parent->vals[i]);
+        }
+        for (i = 0; i < pbo->cap; i++) {
+            if (!pbo->used[i]) continue;
+            Poly128* prod = poly_mul128(pbo->vals[i], cg_polys[gi]);
+            if (prod->n > 0) dpt_add128(result, pbo->keys[i], prod);
+            poly_free128(prod);
+        }
+        dpt_free128(pbo);
+    }
+
+    for (i = 0; i < n_groups; i++) poly_free128(cg_polys[i]);
+    free(cg_keys); free(cg_polys);
+    return result;
+}
+
+/* process_bag128 — mirrors process_bag but with __int128 arithmetic */
+static DPTable128* process_bag128(TDInfo* td, int bag_idx, int** out_verts, int* out_n);
+
+static DPTable128* process_bag128(TDInfo* td, int bag_idx, int** out_verts, int* out_n) {
+    int bag_size = td->bag_sizes[bag_idx];
+    const int* bag_v = td->bag_verts_flat + td->bag_verts_offsets[bag_idx];
+
+    int bag_verts[16]; int bv;
+    memcpy(bag_verts, bag_v, bag_size * sizeof(int));
+    for (int a = 0; a < bag_size - 1; a++)
+        for (int b = a+1; b < bag_size; b++)
+            if (bag_verts[a] > bag_verts[b]) {
+                int tmp = bag_verts[a]; bag_verts[a] = bag_verts[b]; bag_verts[b] = tmp;
+            }
+
+    int vert_to_idx[10000];
+    memset(vert_to_idx, -1, sizeof(vert_to_idx));
+    for (bv = 0; bv < bag_size; bv++) vert_to_idx[bag_verts[bv]] = bv;
+
+    uint64_t init_part = bag_size;
+    for (bv = 0; bv < bag_size; bv++) init_part |= ((uint64_t)bv) << (4 + bv*4);
+    DPTable128* table = dpt_alloc128(256);
+    dpt_set128(table, init_part, poly_one128());
+
+    int n_edges = td->bag_edge_counts[bag_idx];
+    const int* edges = td->edges_flat + td->edges_offsets[bag_idx];
+
+    int loop_u[64], loop_m[64]; int n_loops = 0;
+    int par_u[64], par_v[64], par_m[64]; int n_par = 0;
+    int sim_u[64], sim_v[64]; int n_sim = 0;
+
+    for (int e = 0; e < n_edges; e++) {
+        int u = edges[e*3], v = edges[e*3+1], m = edges[e*3+2];
+        if (vert_to_idx[u] < 0 || vert_to_idx[v] < 0) continue;
+        if (u == v) { loop_u[n_loops] = u; loop_m[n_loops] = m; n_loops++; }
+        else if (m > 1) { par_u[n_par] = u; par_v[n_par] = v; par_m[n_par] = m; n_par++; }
+        else { sim_u[n_sim] = u; sim_v[n_sim] = v; n_sim++; }
+    }
+
+    /* Process loops */
+    for (int li = 0; li < n_loops; li++) {
+        int mult = loop_m[li];
+        Poly128* factor = poly_alloc128(mult + 1);
+        __int128 c = (__int128)1;
+        for (int j = 0; j <= mult; j++) {
+            factor->keys[j] = (uint16_t)j;
+            factor->vals[j] = c;
+            c = c * (mult - j) / (j + 1);
+        }
+        factor->n = mult + 1;
+
+        DPTable128* nt = dpt_alloc128(table->n * 2);
+        for (int i = 0; i < table->cap; i++) {
+            if (!table->used[i]) continue;
+            Poly128* prod = poly_mul128(table->vals[i], factor);
+            if (prod->n > 0) dpt_add128(nt, table->keys[i], prod);
+            poly_free128(prod);
+        }
+        dpt_free128(table); table = nt;
+        poly_free128(factor);
+    }
+
+    /* Process parallel edges */
+    for (int pi = 0; pi < n_par; pi++) {
+        int iu = vert_to_idx[par_u[pi]], iv = vert_to_idx[par_v[pi]];
+        int mult = par_m[pi];
+        Poly128* ff = poly_alloc128(mult+1);
+        __int128 c = (__int128)1;
+        for (int j = 0; j <= mult; j++) {
+            ff->keys[j] = (uint16_t)j; ff->vals[j] = c;
+            c = c * (mult - j) / (j + 1);
+        }
+        ff->n = mult + 1;
+        Poly128* fm1 = poly_copy128(ff);
+        fm1->vals[0] = fm1->vals[0] - (__int128)1;
+        if (fm1->vals[0] == 0) {
+            memmove(fm1->keys, fm1->keys+1, (fm1->n-1)*sizeof(uint16_t));
+            memmove(fm1->vals, fm1->vals+1, (fm1->n-1)*sizeof(__int128));
+            fm1->n--;
+        }
+
+        DPTable128* nt = dpt_alloc128(table->n * 4);
+        for (int i = 0; i < table->cap; i++) {
+            if (!table->used[i]) continue;
+            uint64_t cp = cached_connect(table->keys[i], iu, iv);
+            if (cp == table->keys[i]) {
+                Poly128* prod = poly_mul128(table->vals[i], ff);
+                if (prod->n > 0) dpt_add128(nt, table->keys[i], prod);
+                poly_free128(prod);
+            } else {
+                dpt_add128(nt, table->keys[i], table->vals[i]);
+                Poly128* prod = poly_mul128(table->vals[i], fm1);
+                if (prod->n > 0) dpt_add128(nt, cp, prod);
+                poly_free128(prod);
+            }
+        }
+        dpt_free128(table); table = nt;
+        poly_free128(ff); poly_free128(fm1);
+    }
+
+    /* Batch simple edges (k <= 12) */
+    if (n_sim > 0 && n_sim <= 12) {
+        int eidx[12][2];
+        for (int e = 0; e < n_sim; e++) {
+            eidx[e][0] = vert_to_idx[sim_u[e]];
+            eidx[e][1] = vert_to_idx[sim_v[e]];
+        }
+        int k = n_sim;
+        DPTable128* nt = dpt_alloc128(table->n * (1 << (k > 4 ? 4 : k)));
+        for (int i = 0; i < table->cap; i++) {
+            if (!table->used[i]) continue;
+            uint64_t base_part = table->keys[i];
+            Poly128* base_poly = table->vals[i];
+            for (int mask = 0; mask < (1 << k); mask++) {
+                uint64_t p = base_part;
+                for (int bit = 0; bit < k; bit++) {
+                    if (mask & (1 << bit))
+                        p = cached_connect(p, eidx[bit][0], eidx[bit][1]);
+                }
+                int bc = __builtin_popcount(mask);
+                Poly128* shifted;
+                if (bc > 0) {
+                    shifted = poly_shift128(base_poly, (uint16_t)bc);
+                } else {
+                    shifted = poly_copy128(base_poly);
+                }
+                dpt_add128(nt, p, shifted);
+                poly_free128(shifted);
+            }
+        }
+        dpt_free128(table); table = nt;
+    } else if (n_sim > 12) {
+        for (int e = 0; e < n_sim; e++) {
+            int iu = vert_to_idx[sim_u[e]], iv = vert_to_idx[sim_v[e]];
+            DPTable128* nt = dpt_alloc128(table->n * 4);
+            for (int i = 0; i < table->cap; i++) {
+                if (!table->used[i]) continue;
+                dpt_add128(nt, table->keys[i], table->vals[i]);
+                uint64_t np = cached_connect(table->keys[i], iu, iv);
+                Poly128* shifted = poly_shift128(table->vals[i], 1);
+                dpt_add128(nt, np, shifted);
+                poly_free128(shifted);
+            }
+            dpt_free128(table); table = nt;
+        }
+    }
+
+    /* Process children */
+    int n_children = td->children_counts[bag_idx];
+    const int* child_ids = td->children_flat + td->children_offsets[bag_idx];
+
+    for (int ci = 0; ci < n_children; ci++) {
+        int child_idx = child_ids[ci];
+        int* child_verts; int child_n;
+        DPTable128* child_table = process_bag128(td, child_idx, &child_verts, &child_n);
+
+        int forget_pos[16]; int n_forget = 0;
+        int offset = 0;
+        for (int cv = 0; cv < child_n; cv++) {
+            int in_bag = 0;
+            for (bv = 0; bv < bag_size; bv++)
+                if (bag_verts[bv] == child_verts[cv]) { in_bag = 1; break; }
+            if (!in_bag) { forget_pos[n_forget++] = cv - offset; offset++; }
+        }
+
+        DPTable128* forgotten = dpt_alloc128(child_table->n * 2);
+        for (int i = 0; i < child_table->cap; i++) {
+            if (!child_table->used[i]) continue;
+            uint64_t cur_enc = child_table->keys[i];
+            Poly128* cur_poly = poly_copy128(child_table->vals[i]);
+            for (int fi = 0; fi < n_forget; fi++) {
+                ForgetResult fr = encoded_forget(cur_enc, forget_pos[fi]);
+                if (fr.is_singleton) {
+                    Poly128* shifted = poly_shift128(cur_poly, KEY_STRIDE + 1);
+                    poly_free128(cur_poly);
+                    cur_poly = shifted;
+                }
+                cur_enc = fr.new_enc;
+            }
+            dpt_add128(forgotten, cur_enc, cur_poly);
+            poly_free128(cur_poly);
+        }
+
+        int shared[16]; int n_shared = 0;
+        for (int cv = 0; cv < child_n; cv++) {
+            for (bv = 0; bv < bag_size; bv++) {
+                if (bag_verts[bv] == child_verts[cv]) {
+                    shared[n_shared++] = child_verts[cv]; break;
+                }
+            }
+        }
+
+        DPTable128* merged = merge_tables128(table, forgotten, bag_verts, bag_size,
+                                              shared, n_shared);
+        dpt_free128(table); table = merged;
+        dpt_free128(forgotten);
+        dpt_free128(child_table);
+        free(child_verts);
+    }
+
+    *out_verts = (int*)malloc(bag_size * sizeof(int));
+    memcpy(*out_verts, bag_verts, bag_size * sizeof(int));
+    *out_n = bag_size;
+    return table;
+}
+
+/* Entry point: run __int128 DP and output (a,b) polynomial.
+   Each coefficient emitted as (hi64, lo64) pair (two's complement). */
+int treewidth_tutte_dp_ab128(
+    int n_bags, const int* bag_sizes, const int* bag_verts_flat,
+    int root, const int* children_counts, const int* children_flat,
+    const int* bag_edge_counts, const int* edges_flat,
+    int n_verts, int n_components,
+    int* out_ab, long long* out_coeffs_hi, long long* out_coeffs_lo,
+    int* out_n_terms, int max_out)
+{
+    memset(ccache, 0, sizeof(ccache));
+
+    TDInfo td;
+    td.n_bags = n_bags;
+    td.bag_sizes = bag_sizes;
+    td.bag_verts_flat = bag_verts_flat;
+    td.children_counts = children_counts;
+    td.children_flat = children_flat;
+    td.bag_edge_counts = bag_edge_counts;
+    td.edges_flat = edges_flat;
+    td.bag_verts_offsets = (int*)malloc(n_bags * sizeof(int));
+    td.children_offsets = (int*)malloc(n_bags * sizeof(int));
+    td.edges_offsets = (int*)malloc(n_bags * sizeof(int));
+    int off = 0;
+    for (int i = 0; i < n_bags; i++) { td.bag_verts_offsets[i] = off; off += bag_sizes[i]; }
+    off = 0;
+    for (int i = 0; i < n_bags; i++) { td.children_offsets[i] = off; off += children_counts[i]; }
+    off = 0;
+    for (int i = 0; i < n_bags; i++) { td.edges_offsets[i] = off; off += bag_edge_counts[i] * 3; }
+
+    int* root_verts; int root_n;
+    DPTable128* root_table = process_bag128(&td, root, &root_verts, &root_n);
+
+    Poly128* final_poly = poly_zero128();
+    for (int i = 0; i < root_table->cap; i++) {
+        if (!root_table->used[i]) continue;
+        uint64_t cur_enc = root_table->keys[i];
+        Poly128* cur_poly = poly_copy128(root_table->vals[i]);
+        for (int j = 0; j < root_n; j++) {
+            ForgetResult fr = encoded_forget(cur_enc, 0);
+            if (fr.is_singleton) {
+                Poly128* shifted = poly_shift128(cur_poly, KEY_STRIDE + 1);
+                poly_free128(cur_poly);
+                cur_poly = shifted;
+            }
+            cur_enc = fr.new_enc;
+        }
+        poly_add_inplace128(final_poly, cur_poly);
+        poly_free128(cur_poly);
+    }
+
+    int a_shift = n_components;
+    int b_shift = n_verts;
+    int n_out = 0;
+    for (int i = 0; i < final_poly->n && n_out < max_out; i++) {
+        int a_pow = final_poly->keys[i] / KEY_STRIDE;
+        int b_pow = final_poly->keys[i] % KEY_STRIDE;
+        int new_a = a_pow - a_shift;
+        int new_b = b_pow - b_shift;
+        if (new_a < 0 || new_b < 0) continue;
+        out_ab[n_out * 2] = new_a;
+        out_ab[n_out * 2 + 1] = new_b;
+        __int128 v = final_poly->vals[i];
+        out_coeffs_hi[n_out] = (long long)(v >> 64);
+        out_coeffs_lo[n_out] = (long long)((uint64_t)v);
+        n_out++;
+    }
+    *out_n_terms = n_out;
+
+    poly_free128(final_poly);
+    dpt_free128(root_table);
+    free(root_verts);
+    free(td.bag_verts_offsets);
+    free(td.children_offsets);
+    free(td.edges_offsets);
+    return 0;
+}
+
+/* Convert (a,b)-basis polynomial to (x,y)-basis via binomial expansion.
+   conv_prime > 0: modular arithmetic for binomials (avoids overflow).
+   conv_prime == 0: exact int64 arithmetic. */
+int basis_convert_ab_to_xy(
+    const int* ab_keys, const long long* ab_coeffs, int n_ab_terms,
+    int* out_xy, long long* out_coeffs, int* out_n_terms, int max_out,
+    long long conv_prime)
+{
+    g_prime = conv_prime;
+
+    /* Find max degree for binomial table size */
+    int max_ab = 0;
+    for (int ti = 0; ti < n_ab_terms; ti++) {
+        int a = ab_keys[ti * 2];
+        int b = ab_keys[ti * 2 + 1];
+        if (a > max_ab) max_ab = a;
+        if (b > max_ab) max_ab = b;
+    }
+    int binom_size = max_ab + 1;
+    if (binom_size < 1) binom_size = 1;
+
+    int64_t* binom_flat = (int64_t*)calloc((size_t)binom_size * binom_size, sizeof(int64_t));
+    #define BINOM2(n,k) binom_flat[(n) * binom_size + (k)]
+    for (int nn = 0; nn < binom_size; nn++) {
+        BINOM2(nn, 0) = coeff_from_int(1);
+        for (int kk = 1; kk <= nn; kk++)
+            BINOM2(nn, kk) = coeff_add(BINOM2(nn-1, kk-1), BINOM2(nn-1, kk));
+    }
+
+    int ht_cap = 65536;
+    uint32_t* ht_keys_xy = (uint32_t*)calloc(ht_cap, sizeof(uint32_t));
+    int64_t*  ht_vals_xy = (int64_t*)calloc(ht_cap, sizeof(int64_t));
+    uint8_t*  ht_used_xy = (uint8_t*)calloc(ht_cap, sizeof(uint8_t));
+    int xy_mask = ht_cap - 1;
+
+    for (int ti = 0; ti < n_ab_terms; ti++) {
+        int a_pow = ab_keys[ti * 2];
+        int b_pow = ab_keys[ti * 2 + 1];
+        int64_t coeff = coeff_from_int(ab_coeffs[ti]);
+
+        for (int p = 0; p <= a_pow; p++) {
+            int64_t cx = BINOM2(a_pow, p);
+            if ((a_pow - p) % 2 != 0) cx = coeff_neg(cx);
+
+            for (int q = 0; q <= b_pow; q++) {
+                int64_t cy = BINOM2(b_pow, q);
+                if ((b_pow - q) % 2 != 0) cy = coeff_neg(cy);
+
+                int64_t contribution = coeff_mul(coeff, coeff_mul(cx, cy));
+                if (contribution != 0) {
+                    uint32_t key = (uint32_t)(p * 256 + q);
+                    uint32_t h = (key * 2654435761u) & xy_mask;
+                    while (ht_used_xy[h]) {
+                        if (ht_keys_xy[h] == key) {
+                            ht_vals_xy[h] = coeff_add(ht_vals_xy[h], contribution);
+                            goto next_conv;
+                        }
+                        h = (h + 1) & xy_mask;
+                    }
+                    ht_used_xy[h] = 1; ht_keys_xy[h] = key; ht_vals_xy[h] = contribution;
+                    next_conv:;
+                }
+            }
+        }
+    }
+
+    int n_out = 0;
+    for (int i = 0; i < ht_cap; i++) {
+        if (ht_used_xy[i] && ht_vals_xy[i] != 0 && n_out < max_out) {
+            out_xy[n_out * 2] = ht_keys_xy[i] / 256;
+            out_xy[n_out * 2 + 1] = ht_keys_xy[i] % 256;
+            out_coeffs[n_out] = ht_vals_xy[i];
+            n_out++;
+        }
+    }
+    *out_n_terms = n_out;
+
+    free(ht_keys_xy); free(ht_vals_xy); free(ht_used_xy);
+    free(binom_flat);
+    #undef BINOM2
+    return 0;
+}
 """)
 
 # Build/load
 _lib = None
 _ffi = ffi
+import threading as _threading
+_lib_lock = _threading.Lock()
 
 
 def _get_lib():
     global _lib
     if _lib is not None:
         return _lib
-    try:
+    with _lib_lock:
+        if _lib is not None:
+            return _lib
+        try:
+            from _treewidth_cffi import ffi as _cffi, lib
+            _lib = lib
+            return _lib
+        except ImportError:
+            pass
+        import tempfile, sys
+        tmpdir = tempfile.mkdtemp(prefix="treewidth_c_")
+        ffi.compile(tmpdir=tmpdir)
+        sys.path.insert(0, tmpdir)
         from _treewidth_cffi import ffi as _cffi, lib
         _lib = lib
         return _lib
-    except ImportError:
-        pass
-    import tempfile, sys
-    tmpdir = tempfile.mkdtemp(prefix="treewidth_c_")
-    ffi.compile(tmpdir=tmpdir)
-    sys.path.insert(0, tmpdir)
-    from _treewidth_cffi import ffi as _cffi, lib
-    _lib = lib
-    return _lib
 
 
 # =============================================================================
@@ -1245,29 +2140,159 @@ def compute_treewidth_tutte_c(td, mg):
                 if nb not in visited_nodes:
                     stack.append(nb)
 
-    # Output buffers
+    # Tiered DP strategy based on coefficient bounds:
+    # (a,b)-basis coefficient bound ≈ 2^{n_edges}; (x,y) bound larger (needs Python ints).
+    # 1. ≤62 edges: exact int64 DP + int64 conversion (fastest).
+    # 2. 63-76 edges: int64 DP + modular conversion with CRT.
+    # 3. 77-120 edges: __int128 DP + Python basis conversion (single DP pass).
+    # 4. >120 edges: full modular DP + CRT (multiple passes).
+    n_total_edges = sum(mg.edge_counts.values()) + sum(mg.loop_counts.values())
+    needs_dp_modular = n_total_edges > 120
+    needs_dp_int128 = n_total_edges > 76
+    needs_conv_modular = n_total_edges > 62
+
     max_out = 10000
-    out_xy = _ffi.new("int[]", max_out * 2)
-    out_coeffs = _ffi.new("long long[]", max_out)
-    out_n = _ffi.new("int*")
 
-    rc = lib.treewidth_tutte_dp(
-        n_bags, bag_sizes, bag_verts, td.root,
-        children_counts, children_flat,
-        bag_edge_counts, edges_flat,
-        n_verts, n_components,
-        out_xy, out_coeffs, out_n, max_out)
+    if not needs_conv_modular:
+        # Fully exact int64 (fastest path)
+        out_xy = _ffi.new("int[]", max_out * 2)
+        out_coeffs = _ffi.new("long long[]", max_out)
+        out_n = _ffi.new("int*")
 
-    if rc != 0:
+        rc = lib.treewidth_tutte_dp(
+            n_bags, bag_sizes, bag_verts, td.root,
+            children_counts, children_flat,
+            bag_edge_counts, edges_flat,
+            n_verts, n_components,
+            out_xy, out_coeffs, out_n, max_out, 0, 0)
+
+        if rc != 0:
+            return None
+
+        coeffs = {}
+        for i in range(out_n[0]):
+            x_pow = out_xy[i * 2]
+            y_pow = out_xy[i * 2 + 1]
+            coeff = int(out_coeffs[i])
+            if coeff != 0:
+                coeffs[(x_pow, y_pow)] = coeff
+
+        return TuttePolynomial.from_coefficients(coeffs)
+
+    from ..validation import _get_modular_primes, _crt_multi
+
+    if needs_dp_int128 and not needs_dp_modular:
+        # __int128 DP (exact, single pass) + Python basis conversion.
+        # Handles coefficients up to ~2^127 (covers up to ~120-edge graphs).
+        max_ab = max_out * 2
+        ab_keys = _ffi.new("int[]", max_ab * 2)
+        ab_hi = _ffi.new("long long[]", max_ab)
+        ab_lo = _ffi.new("long long[]", max_ab)
+        ab_n = _ffi.new("int*")
+
+        rc = lib.treewidth_tutte_dp_ab128(
+            n_bags, bag_sizes, bag_verts, td.root,
+            children_counts, children_flat,
+            bag_edge_counts, edges_flat,
+            n_verts, n_components,
+            ab_keys, ab_hi, ab_lo, ab_n, max_ab)
+        if rc != 0:
+            return None
+
+        # Reconstruct __int128 values from (hi64, lo64) pairs as Python ints.
+        # Treat both halves as unsigned, then sign-correct via two's complement.
+        MASK64 = (1 << 64) - 1
+        poly_ab = {}
+        for i in range(ab_n[0]):
+            a_pow = ab_keys[i * 2]
+            b_pow = ab_keys[i * 2 + 1]
+            hi_u = int(ab_hi[i]) & MASK64
+            lo_u = int(ab_lo[i]) & MASK64
+            val = (hi_u << 64) | lo_u
+            if val >= (1 << 127):
+                val -= (1 << 128)
+            if val != 0:
+                poly_ab[(a_pow, b_pow)] = val
+
+        # Basis conversion in Python with arbitrary-precision ints.
+        from .treewidth import _convert_ab_to_xy
+        return _convert_ab_to_xy(poly_ab)
+
+    if not needs_dp_modular:
+        # Exact int64 DP in (a,b) basis, then Python basis conversion with
+        # arbitrary-precision ints. The (a,b) coefficients fit int64 for
+        # n_edges <= 76; the (x,y) coefficients may overflow int64 but Python
+        # math.comb handles them natively.
+        max_ab = max_out * 2
+        ab_keys = _ffi.new("int[]", max_ab * 2)
+        ab_coeffs = _ffi.new("long long[]", max_ab)
+        ab_n = _ffi.new("int*")
+
+        rc = lib.treewidth_tutte_dp_ab(
+            n_bags, bag_sizes, bag_verts, td.root,
+            children_counts, children_flat,
+            bag_edge_counts, edges_flat,
+            n_verts, n_components,
+            ab_keys, ab_coeffs, ab_n, max_ab)
+        if rc != 0:
+            return None
+
+        poly_ab = {}
+        for i in range(ab_n[0]):
+            a_pow = ab_keys[i * 2]
+            b_pow = ab_keys[i * 2 + 1]
+            coeff = int(ab_coeffs[i])
+            if coeff != 0:
+                poly_ab[(a_pow, b_pow)] = coeff
+
+        from .treewidth import _convert_ab_to_xy
+        return _convert_ab_to_xy(poly_ab)
+
+    # (a,b)-only CRT: run DP mod prime k times, reconstruct (a,b) as Python
+    # bignums, then convert basis once in Python. The (a,b) coefficient bound
+    # is ~2^{n_edges}, much tighter than the (x,y) bound ~2^{2·n_edges + n_verts},
+    # so we need roughly half as many primes as the full-modular path.
+    # 62-bit primes (safe for coeff_add/coeff_mul) further reduce the count.
+    log2_ab_bound = n_total_edges + 20
+    primes_needed = max(int(log2_ab_bound / 60) + 1, 2)
+    primes = _get_modular_primes(primes_needed, bits=62)
+
+    max_ab = max_out * 2
+
+    def _run_one_prime(p_val):
+        ab_keys = _ffi.new("int[]", max_ab * 2)
+        ab_coeffs = _ffi.new("long long[]", max_ab)
+        ab_n = _ffi.new("int*")
+        rc = lib.treewidth_tutte_dp_ab_mod(
+            n_bags, bag_sizes, bag_verts, td.root,
+            children_counts, children_flat,
+            bag_edge_counts, edges_flat,
+            n_verts, n_components,
+            ab_keys, ab_coeffs, ab_n, max_ab, p_val)
+        if rc != 0:
+            return None
+        return {(ab_keys[i * 2], ab_keys[i * 2 + 1]): int(ab_coeffs[i])
+                for i in range(ab_n[0])}
+
+    # Parallelize prime DPs. cffi releases the GIL during C calls, and both
+    # g_prime and ccache are __thread so workers don't race.
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+    max_workers = min(len(primes), max(1, (os.cpu_count() or 2) - 1))
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        all_residues = list(ex.map(_run_one_prime, primes))
+    if any(r is None for r in all_residues):
         return None
 
-    # Unmarshal result
-    coeffs = {}
-    for i in range(out_n[0]):
-        x_pow = out_xy[i * 2]
-        y_pow = out_xy[i * 2 + 1]
-        coeff = int(out_coeffs[i])
-        if coeff != 0:
-            coeffs[(x_pow, y_pow)] = coeff
+    all_keys = set()
+    for rm in all_residues:
+        all_keys |= rm.keys()
+    poly_ab = {}
+    for key in all_keys:
+        res = [rm.get(key, 0) for rm in all_residues]
+        val = _crt_multi(res, primes)
+        if val != 0:
+            poly_ab[key] = val
 
-    return TuttePolynomial.from_coefficients(coeffs)
+    from .treewidth import _convert_ab_to_xy
+    return _convert_ab_to_xy(poly_ab)

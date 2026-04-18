@@ -242,18 +242,19 @@ def _c_modular_det(M):
     return _crt_multi(residues, primes)
 
 
-_MODULAR_PRIMES_CACHE = None
+_MODULAR_PRIMES_CACHE: dict = {}
 
 
-def _get_modular_primes(n_needed):
-    """Get at least n_needed distinct primes for modular determinant.
+def _get_modular_primes(n_needed, bits=50):
+    """Get at least n_needed distinct primes of the given bit-width.
 
     Uses Miller-Rabin primality test (deterministic for < 2^64).
-    Primes are ~50 bits each. Cached across calls.
+    Cached per bit-width. Defaults to 50-bit for backwards compatibility.
+    62-bit is the max safe size for coeff_add/coeff_mul (int64 sum + __int128 prod).
     """
-    global _MODULAR_PRIMES_CACHE
-    if _MODULAR_PRIMES_CACHE is not None and len(_MODULAR_PRIMES_CACHE) >= n_needed:
-        return _MODULAR_PRIMES_CACHE[:n_needed]
+    cached = _MODULAR_PRIMES_CACHE.get(bits)
+    if cached is not None and len(cached) >= n_needed:
+        return cached[:n_needed]
 
     def _is_prime(n):
         if n < 2:
@@ -281,8 +282,10 @@ def _get_modular_primes(n_needed):
                 return False
         return True
 
+    starts = {50: (1 << 50) - 27, 62: (1 << 62) - 57}
+    p = starts.get(bits, (1 << bits) | 1)
+
     primes = []
-    p = (1 << 50) - 27  # Start at a known prime near 2^50
     target = max(n_needed, 200)
     while len(primes) < target:
         if _is_prime(p):
@@ -291,7 +294,7 @@ def _get_modular_primes(n_needed):
         if p % 2 == 0:
             p += 1
 
-    _MODULAR_PRIMES_CACHE = primes
+    _MODULAR_PRIMES_CACHE[bits] = primes
     return primes[:n_needed]
 
 

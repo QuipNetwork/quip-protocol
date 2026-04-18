@@ -22,23 +22,22 @@ URL Parameters:
     engine=synthesis — Engine: "synthesis", "algebraic", or "hybrid"
 """
 
-import sys
-import os
 import json
-import time
+import os
 import re
+import sys
 import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import networkx as nx
-from flask import Flask, request, Response
-
+from flask import Flask, Response, request
 from tutte.graph import Graph
+from tutte.logs import EventType, LogLevel, get_log, reset_log
 from tutte.lookup.core import load_default_table
-from tutte.synthesis.engine import SynthesisEngine
 from tutte.synthesis.base import SynthesisResult
-from tutte.logs import get_log, reset_log, EventType, LogLevel
+from tutte.synthesis.engine import SynthesisEngine
 
 app = Flask(__name__)
 
@@ -59,7 +58,7 @@ def factored_poly_html(tutte_poly) -> str:
 
     Shows factored form if non-trivial, otherwise falls back to expanded form.
     """
-    from sympy import symbols, factor
+    from sympy import factor, symbols
 
     x, y = symbols('x y')
     expr = sum(coeff * x**i * y**j for (i, j), coeff in tutte_poly._coeffs.items())
@@ -73,8 +72,33 @@ def factored_poly_html(tutte_poly) -> str:
     return poly_to_html(display)
 
 
+def _normalize_nx_graph(G):
+    """Return G with nodes relabeled to consecutive ints starting at 0.
+
+    Several networkx generators (grid_2d_graph, kneser_graph, balanced_tree
+    with certain inputs) use tuple or frozenset node labels that vis.js
+    can't render and that break spring_layout keying in the visualizer.
+    Relabeling to ints keeps every family path uniform.
+    """
+    if G is None:
+        return G
+    return nx.convert_node_labels_to_integers(G)
+
+
 def parse_graph(args) -> tuple:
-    """Parse URL parameters into a (nx.Graph, description) tuple."""
+    """Parse URL parameters into a (nx.Graph, description) tuple.
+
+    The returned graph always has integer node labels (0..n-1) so
+    downstream rendering and engine conversion paths don't need to
+    special-case tuple/frozenset labels from networkx generators.
+    """
+    G, desc = _parse_graph_raw(args)
+    return _normalize_nx_graph(G), desc
+
+
+def _parse_graph_raw(args) -> tuple:
+    """Inner: returns the raw nx.Graph from the appropriate generator
+    without normalizing node labels."""
     atlas = args.get("atlas", type=int)
     if atlas is not None:
         try:
@@ -99,9 +123,10 @@ def parse_graph(args) -> tuple:
                 G = dnx.pegasus_graph(dwave_m)
                 return G, f"Pegasus P({dwave_m})"
             elif dwave_topo == "chimera":
-                t = dwave_t if dwave_t is not None else dwave_m
-                G = dnx.chimera_graph(dwave_m, t)
-                return G, f"Chimera C({dwave_m},{t})"
+                # D-Wave Chimera is specified by a single parameter m (tile grid
+                # is m×m, shore size is fixed at 4 on every D-Wave processor).
+                G = dnx.chimera_graph(dwave_m)
+                return G, f"Chimera C({dwave_m})"
             else:
                 return None, f"Unknown D-Wave topology: {dwave_topo}"
         except ImportError:
@@ -299,6 +324,31 @@ def small_graph_vis(G, div_id) -> str:
     )
 
 
+def _synth_graph_to_nx(g_obj):
+    """Convert a tutte Graph or MultiGraph synthesized during a run to an nx.Graph.
+
+    Used by the visualizer to render engine-synthesized sub-problems that
+    are not in the rainbow table. MultiGraphs are flattened to simple
+    networkx graphs; parallel edges and loops are dropped in this view
+    (node positions and connectivity are the visually useful parts).
+    """
+    if g_obj is None:
+        return None
+    if hasattr(g_obj, 'to_networkx'):
+        try:
+            return g_obj.to_networkx()
+        except Exception:
+            pass
+    edge_counts = getattr(g_obj, 'edge_counts', None)
+    nodes = getattr(g_obj, 'nodes', None)
+    if edge_counts is not None and nodes is not None:
+        G = nx.Graph()
+        G.add_nodes_from(nodes)
+        G.add_edges_from(edge_counts.keys())
+        return G
+    return None
+
+
 def graph_from_entry(entry):
     """Reconstruct nx.Graph from a rainbow table MinorEntry."""
     if entry.graph is not None:
@@ -330,6 +380,10 @@ EVENT_COLORS = {
     "lookup_miss": "#9e9e9e",
     "base_case": "#2e7d32",
     "factorize": "#1565c0",
+    "series_parallel": "#6a1b9a",
+    "treewidth_dp": "#00838f",
+    "ksum": "#1565c0",
+    "family_recognition": "#2e7d32",
     "vf2_match": "#e65100",
     "tile_accept": "#1565c0",
     "cover_result": "#1565c0",
@@ -410,6 +464,7 @@ HTML = """<!DOCTYPE html>
   <div class="panel section" style="padding:16px;">
     <h2 style="margin-bottom:12px;">Control Panel</h2>
     <form method="get" action="/" id="ctrl-form">
+      <input type="hidden" name="form_submitted" value="1">
       <div class="ctrl-grid">
         <!-- Input source selection -->
         <div class="ctrl-group">
@@ -420,7 +475,7 @@ HTML = """<!DOCTYPE html>
           <div class="ctrl-indent">
             <select name="dwave_topo" id="dwave-topo-select" {dwave_disabled}>{dwave_topo_options}</select>
             <span id="dwave-m-wrap"><span id="dwave-m-label">{dwave_m_label}</span>=<input type="number" name="dwave_m" value="{dwave_m_val}" placeholder="1" min="1" style="width:50px" {dwave_disabled}></span>
-            <span id="dwave-t-wrap"><span id="dwave-t-label">{dwave_t_label}</span>=<input type="number" name="dwave_t" value="{dwave_t_val}" placeholder="1" min="1" style="width:50px" {dwave_disabled}></span>
+            <span id="dwave-t-wrap" style="{dwave_t_display}"><span id="dwave-t-label">{dwave_t_label}</span>=<input type="number" name="dwave_t" value="{dwave_t_val}" placeholder="1" min="1" style="width:50px" {dwave_disabled}></span>
           </div>
           <label class="ctrl-radio"><input type="radio" name="source" value="family" {family_checked}> Graph family</label>
           <div class="ctrl-indent">
@@ -446,10 +501,13 @@ HTML = """<!DOCTYPE html>
           </div>
           <div class="ctrl-row">
             <span>Timeout:</span>
-            <input type="number" name="timeout" value="{timeout_val}" min="1" max="600" style="width:60px">s
+            <input type="number" name="timeout" value="{timeout_val}" min="1" max="3600" style="width:60px">s
           </div>
           <div class="ctrl-row">
             <label><input type="checkbox" name="debug" value="1" {debug_checked}> Debug logging</label>
+          </div>
+          <div class="ctrl-row">
+            <label title="Unchecking skips the direct rainbow-table lookup for the target graph only. Sub-problems still consult the table."><input type="checkbox" name="use_lookup" value="1" {use_lookup_checked}> Lookup target in rainbow table</label>
           </div>
           <div class="ctrl-row" style="margin-top:12px;">
             <button type="submit" class="run-btn" style="background:#555;">Load Graph</button>
@@ -524,12 +582,12 @@ HTML = """<!DOCTYPE html>
       var dwaveLabels = {{
         'zephyr':  ['grid parameter', 'tile parameter'],
         'pegasus': ['size parameter', ''],
-        'chimera': ['rows of tiles', 'shore size'],
+        'chimera': ['grid parameter', ''],
       }};
       function updateDwave() {{
         var topo = dsel.value;
-        // Zephyr: m, t; Pegasus: m only (min 2); Chimera: m, t
-        var showT = (topo === 'zephyr' || topo === 'chimera');
+        // Zephyr needs (m, t). Pegasus and Chimera both take just m.
+        var showT = (topo === 'zephyr');
         document.getElementById('dwave-t-wrap').style.display = showT ? '' : 'none';
         var labels = dwaveLabels[topo] || ['m', 't'];
         document.getElementById('dwave-m-label').textContent = labels[0];
@@ -592,18 +650,66 @@ HTML = """<!DOCTYPE html>
 
   <!-- Row 4: Timeline -->
   <div class="panel section">
-    <h2>Timeline <span id="event-count"></span></h2>
+    <h2>Timeline <span id="event-count"></span>
+      <span id="engine-elapsed" style="font-weight:normal;color:#888;font-size:12px;margin-left:12px;"></span>
+    </h2>
     <div class="timeline-scroll" id="timeline-scroll">
       <table class="timeline" id="timeline-table">
-        <tr><th>Time</th><th>Duration</th><th>D</th><th>Type</th><th>Module</th><th>Message</th></tr>
+        <tr><th>Time</th><th>Duration</th><th>D</th><th>Type</th><th>Module</th><th>Message</th><th>Graph</th></tr>
       </table>
     </div>
+  </div>
+
+  <!-- Row 5: Step-graph viewer -->
+  <div class="panel section">
+    <h2>Step Graph <span id="step-label" style="font-weight:normal;color:#888;font-size:12px;"></span></h2>
+    <div class="controls" id="step-controls">
+      <button type="button" id="step-first">&#x21E4; First</button>
+      <button type="button" id="step-prev">Prev</button>
+      <button type="button" id="step-play">Play</button>
+      <button type="button" id="step-next">Next</button>
+      <button type="button" id="step-last">Last &#x21E5;</button>
+      <span style="color:#666;margin-left:8px">interval</span>
+      <input type="number" id="step-interval" value="500" min="50" max="10000" step="50" style="width:70px">ms
+      <span id="step-graph-count" style="color:#888;margin-left:12px;"></span>
+    </div>
+    <div id="step-graph" class="graph-box"></div>
   </div>
 
   <script>
     var EVENT_COLORS = {event_colors_json};
     var opts = {{ edges: {{ smooth: false }}, physics: {{ enabled: false }} }};
     var _es = null;  // current EventSource
+    var _engineTimerId = null;
+    var _engineStartedAt = 0;
+
+    function _fmtElapsed(ms) {{
+      var s = ms / 1000;
+      if (s < 60) return s.toFixed(1) + 's';
+      var m = Math.floor(s / 60);
+      var r = (s - m * 60).toFixed(1);
+      return m + 'm ' + r + 's';
+    }}
+
+    function _paintElapsed() {{
+      var el = _fmtElapsed(performance.now() - _engineStartedAt);
+      var h = document.getElementById('engine-elapsed');
+      if (h) h.textContent = 'elapsed ' + el;
+      var r = document.getElementById('running-elapsed');
+      if (r) r.textContent = el;
+    }}
+
+    function _startEngineClock() {{
+      _engineStartedAt = performance.now();
+      _paintElapsed();
+      if (_engineTimerId) clearInterval(_engineTimerId);
+      _engineTimerId = setInterval(_paintElapsed, 250);
+    }}
+
+    function _stopEngineClock() {{
+      if (_engineTimerId) {{ clearInterval(_engineTimerId); _engineTimerId = null; }}
+      _paintElapsed();
+    }}
 
     window.addEventListener('DOMContentLoaded', function() {{
       // Render input graph
@@ -612,6 +718,7 @@ HTML = """<!DOCTYPE html>
 
     function stopEngine() {{
       if (_es) {{ _es.close(); _es = null; }}
+      _stopEngineClock();
       document.getElementById('run-engine-btn').style.display = '';
       document.getElementById('stop-engine-btn').style.display = 'none';
     }}
@@ -628,10 +735,16 @@ HTML = """<!DOCTYPE html>
       var tbody = document.getElementById('timeline-table');
       while (tbody.rows.length > 1) tbody.deleteRow(1);
       document.getElementById('event-count').textContent = '';
-      document.getElementById('result-container').innerHTML = '<div class="meta"><span class="spinner"></span>Running engine...</div>';
+      document.getElementById('result-container').innerHTML =
+        '<div class="meta"><span class="spinner"></span>Running engine... (<span id="running-elapsed">0.0s</span>)</div>';
       document.getElementById('minors-container').innerHTML = '<div class="meta"><span class="spinner"></span>Waiting for engine...</div>';
       document.getElementById('summary-container').innerHTML = '';
+      // Reset step-graph viewer
+      document.getElementById('step-graph').innerHTML = '';
+      document.getElementById('step-label').textContent = '';
+      document.getElementById('step-graph-count').textContent = '';
 
+      _startEngineClock();
       {sse_script}
     }}
   </script>
@@ -655,8 +768,13 @@ _engine_state = {
 }
 
 
-def _run_engine_thread(graph, table, timeout_sec, engine_type):
-    """Run the engine in a thread, storing result in _engine_state."""
+def _run_engine_thread(graph, table, timeout_sec, engine_type, skip_target_lookup=False):
+    """Run the engine in a thread, storing result in _engine_state.
+
+    If skip_target_lookup is True, the top-level synthesize() call skips the
+    rainbow-table lookup for the input graph — but the engine still uses the
+    full table for sub-problems encountered during decomposition.
+    """
     global _engine_state
     result_holder = [None]
     error_holder = [None]
@@ -666,12 +784,16 @@ def _run_engine_thread(graph, table, timeout_sec, engine_type):
             if engine_type == "hybrid":
                 from tutte.synthesis.hybrid import HybridSynthesisEngine
                 engine = HybridSynthesisEngine(table=table)
+                engine.skip_target_lookup = skip_target_lookup
                 hybrid_result = engine.synthesize(graph)
                 result_holder[0] = SynthesisResult(
                     polynomial=hybrid_result.polynomial,
                     recipe=hybrid_result.recipe,
                     verified=hybrid_result.verified,
                     method=hybrid_result.method,
+                    minors_used=getattr(hybrid_result, 'minors_used', set()),
+                    synthesized_minors=getattr(hybrid_result, 'synthesized_minors', set()),
+                    synthesized_graphs=getattr(hybrid_result, 'synthesized_graphs', {}),
                 )
             elif engine_type == "algebraic":
                 from tutte.synthesis.algebraic import AlgebraicSynthesisEngine
@@ -685,6 +807,7 @@ def _run_engine_thread(graph, table, timeout_sec, engine_type):
                 )
             else:
                 engine = SynthesisEngine(table=table)
+                engine.skip_target_lookup = skip_target_lookup
                 result_holder[0] = engine.synthesize(graph)
         except Exception as e:
             error_holder[0] = str(e)
@@ -713,6 +836,12 @@ def stream():
     engine_type = request.args.get("engine", "synthesis")
     threshold_ms = request.args.get("threshold", 100, type=float)
     debug = request.args.get("debug", "0") == "1"
+    # form_submitted sentinel distinguishes "no form submit" from "unchecked"
+    form_submitted = request.args.get("form_submitted", "0") == "1"
+    if form_submitted:
+        use_lookup = request.args.get("use_lookup", "0") == "1"
+    else:
+        use_lookup = True
 
     G_nx, graph_desc = parse_graph(request.args)
     if G_nx is None:
@@ -721,11 +850,16 @@ def stream():
         return Response(error_stream(), mimetype="text/event-stream")
 
     graph = Graph.from_networkx(G_nx)
+    # Always load the full table; `skip_target_lookup` only gates the
+    # top-level lookup for the input graph, leaving sub-problem lookups on.
     table = load_default_table()
+    skip_target_lookup = not use_lookup
 
-    # Reset log and set min_level based on debug toggle
+    # Reset log, set min_level, enable graph snapshot capture for the viewer.
     reset_log()
-    get_log().min_level = LogLevel.DEBUG if debug else LogLevel.INFO
+    log_ref = get_log()
+    log_ref.min_level = LogLevel.DEBUG if debug else LogLevel.INFO
+    log_ref.capture_graphs = True
     global _engine_state
     with _engine_lock:
         _engine_state = {
@@ -736,7 +870,7 @@ def stream():
     # Start engine in background thread
     engine_thread = threading.Thread(
         target=_run_engine_thread,
-        args=(graph, table, timeout_sec, engine_type),
+        args=(graph, table, timeout_sec, engine_type, skip_target_lookup),
         daemon=True,
     )
     engine_thread.start()
@@ -744,7 +878,8 @@ def stream():
     def _serialize_batch(new_events, start_idx, prev_timestamp):
         """Serialize a list of new events into a single SSE batch message.
 
-        Returns (json_str, last_timestamp).
+        Returns (batch, last_timestamp). Each event dict may include a
+        `graph_key` field referencing a snapshot sent in the same batch.
         """
         batch = []
         for i, ev in enumerate(new_events):
@@ -761,6 +896,7 @@ def stream():
                 "message": ev.message,
                 "color": color,
                 "gap": gap,
+                "graph_key": ev.graph_key,
             })
             prev_timestamp = ev.timestamp
         return batch, prev_timestamp
@@ -770,16 +906,27 @@ def stream():
         sent_count = 0
         prev_timestamp = None
         poll_interval = 0.05  # 50ms
+        sent_snapshot_keys: set = set()
+
+        def _batch_payload(events, start_idx, prev_ts):
+            batch, new_prev_ts = _serialize_batch(events, start_idx, prev_ts)
+            new_snapshots = log.new_graph_snapshots(sent_snapshot_keys)
+            if new_snapshots:
+                sent_snapshot_keys.update(new_snapshots.keys())
+            payload = {'type': 'batch', 'events': batch}
+            if new_snapshots:
+                payload['snapshots'] = new_snapshots
+            return payload, new_prev_ts
 
         while True:
             new_events = log.events_since(sent_count)
 
             if new_events:
-                batch, prev_timestamp = _serialize_batch(
+                payload, prev_timestamp = _batch_payload(
                     new_events, sent_count, prev_timestamp
                 )
                 sent_count += len(new_events)
-                yield f"data: {json.dumps({'type': 'batch', 'events': batch})}\n\n"
+                yield f"data: {json.dumps(payload)}\n\n"
 
             # Check if engine is done
             with _engine_lock:
@@ -789,11 +936,11 @@ def stream():
                 # Send any remaining events
                 remaining = log.events_since(sent_count)
                 if remaining:
-                    batch, prev_timestamp = _serialize_batch(
+                    payload, prev_timestamp = _batch_payload(
                         remaining, sent_count, prev_timestamp
                     )
                     sent_count += len(remaining)
-                    yield f"data: {json.dumps({'type': 'batch', 'events': batch})}\n\n"
+                    yield f"data: {json.dumps(payload)}\n\n"
 
                 # Build final result payload
                 with _engine_lock:
@@ -818,11 +965,15 @@ def stream():
                         f'</div>'
                     )
                     final["minors"] = []
+                    final["minors_lookup"] = []
+                    final["minors_synthesized"] = []
                 elif error:
                     final["result_html"] = (
                         f'<div class="error-banner">Engine error: {error}</div>'
                     )
                     final["minors"] = []
+                    final["minors_lookup"] = []
+                    final["minors_synthesized"] = []
                 elif result is not None:
                     poly_html = factored_poly_html(result.polynomial)
                     t11 = result.polynomial.num_spanning_trees()
@@ -840,28 +991,59 @@ def stream():
                         f'<dt>Polynomial</dt><dd class="poly">{poly_html}</dd>'
                         f'</dl>'
                     )
-                    # Build contributing graphs (minors)
-                    minors_list = []
-                    if result.minors_used:
-                        for key in sorted(result.minors_used):
-                            entry = table.get_entry_by_key(key)
-                            if entry is None:
-                                continue
-                            minor_info = {"name": entry.name, "edges": entry.edge_count}
-                            minor_nx = graph_from_entry(entry)
-                            if minor_nx is not None:
-                                nodes_json, edges_json = vis_data_json(minor_nx)
-                                minor_info["nodes"] = nodes_json
-                                minor_info["edges_data"] = edges_json
-                            minors_list.append(minor_info)
-                            if len(minors_list) >= 6:
-                                break
-                    final["minors"] = minors_list
+                    # Build contributing graphs split by provenance:
+                    #  - minors_lookup: entries the engine actually pulled from the rainbow table.
+                    #  - minors_synthesized: sub-graphs the engine synthesized from scratch
+                    #    during this run (may or may not also exist in the table).
+                    lookup_list = []
+                    for key in sorted(result.minors_used or []):
+                        entry = table.get_entry_by_key(key)
+                        if entry is None:
+                            continue
+                        card = {"name": entry.name, "edges": entry.edge_count}
+                        minor_nx = graph_from_entry(entry)
+                        if minor_nx is not None:
+                            nodes_json, edges_json = vis_data_json(minor_nx)
+                            card["nodes"] = nodes_json
+                            card["edges_data"] = edges_json
+                        lookup_list.append(card)
+                        if len(lookup_list) >= 12:
+                            break
+
+                    synth_list = []
+                    synthesized_graphs = getattr(result, 'synthesized_graphs', {}) or {}
+                    synthesized_minors = getattr(result, 'synthesized_minors', set()) or set()
+                    # Skip ones that came from the lookup table — those appear in lookup_list.
+                    for key in sorted(synthesized_minors - (result.minors_used or set())):
+                        g_obj = synthesized_graphs.get(key)
+                        if g_obj is None:
+                            continue
+                        minor_nx = _synth_graph_to_nx(g_obj)
+                        nc = getattr(g_obj, 'node_count', lambda: '?')()
+                        ec = getattr(g_obj, 'edge_count', lambda: '?')()
+                        name = (
+                            f"{type(g_obj).__name__} {nc}n {ec}e "
+                            f"[{key[:8]}]"
+                        )
+                        card = {"name": name, "edges": ec}
+                        if minor_nx is not None:
+                            nodes_json, edges_json = vis_data_json(minor_nx)
+                            card["nodes"] = nodes_json
+                            card["edges_data"] = edges_json
+                        synth_list.append(card)
+                        if len(synth_list) >= 24:
+                            break
+
+                    final["minors"] = lookup_list  # back-compat: legacy key
+                    final["minors_lookup"] = lookup_list
+                    final["minors_synthesized"] = synth_list
                 else:
                     final["result_html"] = (
                         '<div class="error-banner">Engine returned no result.</div>'
                     )
                     final["minors"] = []
+                    final["minors_lookup"] = []
+                    final["minors_synthesized"] = []
 
                 # Build summary from log aggregation
                 summary_data = log.summary()
@@ -903,6 +1085,13 @@ def index():
     threshold_ms = request.args.get("threshold", 100, type=float)
     engine_type = request.args.get("engine", "synthesis")
     debug = request.args.get("debug", "0") == "1"
+    # use_lookup defaults to ON. Unchecking the form checkbox submits without
+    # the param, so we detect form submission via a hidden sentinel.
+    form_submitted = request.args.get("form_submitted", "0") == "1"
+    if form_submitted:
+        use_lookup = request.args.get("use_lookup", "0") == "1"
+    else:
+        use_lookup = True
 
     atlas_val = request.args.get("atlas", "")
     dwave_topo_val = request.args.get("dwave_topo", "zephyr")
@@ -956,21 +1145,24 @@ def index():
 
     # Build D-Wave topology dropdown
     dwave_topo_options = ""
-    for topo, label in [("zephyr", "Zephyr Z(m, t)"), ("pegasus", "Pegasus P(m)"), ("chimera", "Chimera C(m, t)")]:
+    for topo, label in [("zephyr", "Zephyr Z(m, t)"), ("pegasus", "Pegasus P(m)"), ("chimera", "Chimera C(m)")]:
         sel = " selected" if topo == dwave_topo_val else ""
         dwave_topo_options += f'<option value="{topo}"{sel}>{label}</option>'
 
     G_nx, graph_desc = parse_graph(request.args)
 
     debug_checked = "checked" if debug else ""
+    use_lookup_checked = "checked" if use_lookup else ""
 
     # Compute server-side labels for D-Wave params
     _dwave_labels = {
         "zephyr": ("grid parameter", "tile parameter"),
         "pegasus": ("size parameter", ""),
-        "chimera": ("rows of tiles", "shore size"),
+        "chimera": ("grid parameter", ""),
     }
     dwave_m_label, dwave_t_label = _dwave_labels.get(dwave_topo_val, ("m", "t"))
+    # Only Zephyr exposes a tile parameter; Pegasus and Chimera hide the t input.
+    dwave_t_display = "" if dwave_topo_val == "zephyr" else "display:none"
     if not dwave_t_label:
         dwave_t_label = "t"
 
@@ -1009,6 +1201,7 @@ def index():
         atlas_val=atlas_val, dwave_m_val=dwave_m_val, dwave_t_val=dwave_t_val,
         dwave_topo_options=dwave_topo_options,
         dwave_m_label=dwave_m_label, dwave_t_label=dwave_t_label,
+        dwave_t_display=dwave_t_display,
         n_label=n_label, m_label=m_label,
         timeout_val=timeout_sec, engine_options=engine_options,
         atlas_checked=atlas_checked, dwave_checked=dwave_checked,
@@ -1019,6 +1212,7 @@ def index():
         random_disabled=random_disabled,
         family_options=family_options, n_val=n_val, m_val=m_val,
         edges_val=edges_val, debug_checked=debug_checked,
+        use_lookup_checked=use_lookup_checked,
         rand_n_val=rand_n_val, rand_m_val=rand_m_val,
         rand_max_hint=rand_max_hint,
     )
@@ -1068,6 +1262,111 @@ def index():
       var pendingBatch = [];
       var rafScheduled = false;
 
+      // Step-graph viewer state
+      var allEvents = [];                  // every event the timeline saw
+      var graphEventIdx = [];              // indices (into allEvents) of events with graph_key
+      var stepSnapshots = {};              // canonical_key -> {nodes, edges, loops}
+      var stepCursor = -1;                 // position within graphEventIdx
+      var stepNetwork = null;
+      var playTimer = null;
+
+      function renderStep(idx) {
+        if (graphEventIdx.length === 0) {
+          document.getElementById('step-label').textContent = '(no graph events yet)';
+          return;
+        }
+        if (idx < 0) idx = 0;
+        if (idx >= graphEventIdx.length) idx = graphEventIdx.length - 1;
+        stepCursor = idx;
+        var evIdx = graphEventIdx[idx];
+        var ev = allEvents[evIdx];
+        var snap = stepSnapshots[ev.graph_key];
+        document.getElementById('step-label').textContent =
+          'event #' + ev.index + ' · ' + ev.event_type + ' · ' + ev.module +
+          ' · ' + (idx + 1) + '/' + graphEventIdx.length;
+        if (!snap) {
+          document.getElementById('step-graph').innerHTML =
+            '<div class="meta" style="padding:12px">snapshot not yet received</div>';
+          return;
+        }
+        var nodes = snap.nodes.map(function(id) {
+          return {id: id, label: String(id)};
+        });
+        var edges = [];
+        var eid = 0;
+        snap.edges.forEach(function(e) {
+          var mult = e[2] || 1;
+          for (var k = 0; k < mult; k++) {
+            edges.push({id: 'e' + (eid++), from: e[0], to: e[1],
+                        smooth: mult > 1 ? {type: 'curvedCW', roundness: 0.2 * k} : false});
+          }
+        });
+        if (snap.loops) {
+          snap.loops.forEach(function(l) {
+            var mult = l[1] || 1;
+            for (var k = 0; k < mult; k++) {
+              edges.push({id: 'l' + (eid++), from: l[0], to: l[0],
+                          smooth: {type: 'curvedCW', roundness: 0.3 + 0.1 * k}});
+            }
+          });
+        }
+        var container = document.getElementById('step-graph');
+        container.innerHTML = '';
+        stepNetwork = new vis.Network(
+          container,
+          {nodes: new vis.DataSet(nodes), edges: new vis.DataSet(edges)},
+          {edges: {smooth: false}, physics: {enabled: true, stabilization: {iterations: 150}}}
+        );
+        stepNetwork.once('stabilizationIterationsDone', function() {
+          stepNetwork.setOptions({physics: {enabled: false}});
+        });
+      }
+
+      function stepPrev() { renderStep(stepCursor - 1); }
+      function stepNext() { renderStep(stepCursor + 1); }
+      function stepFirst() { renderStep(0); }
+      function stepLast() { renderStep(graphEventIdx.length - 1); }
+      function togglePlay() {
+        var btn = document.getElementById('step-play');
+        if (playTimer) {
+          clearInterval(playTimer);
+          playTimer = null;
+          btn.textContent = 'Play';
+          return;
+        }
+        var intervalMs = parseInt(document.getElementById('step-interval').value) || 500;
+        btn.textContent = 'Pause';
+        playTimer = setInterval(function() {
+          if (stepCursor + 1 >= graphEventIdx.length) {
+            clearInterval(playTimer);
+            playTimer = null;
+            btn.textContent = 'Play';
+            return;
+          }
+          renderStep(stepCursor + 1);
+        }, intervalMs);
+      }
+
+      function selectTimelineRow(evIndex) {
+        var ev = allEvents[evIndex];
+        if (!ev) return;
+        var targetEvIdx = evIndex;
+        if (!ev.graph_key) {
+          // Snap to nearest previous event with a graph.
+          for (var i = evIndex - 1; i >= 0; i--) {
+            if (allEvents[i] && allEvents[i].graph_key) { targetEvIdx = i; break; }
+          }
+        }
+        var pos = graphEventIdx.indexOf(targetEvIdx);
+        if (pos >= 0) renderStep(pos);
+      }
+
+      document.getElementById('step-first').addEventListener('click', stepFirst);
+      document.getElementById('step-prev').addEventListener('click', stepPrev);
+      document.getElementById('step-next').addEventListener('click', stepNext);
+      document.getElementById('step-last').addEventListener('click', stepLast);
+      document.getElementById('step-play').addEventListener('click', togglePlay);
+
       function flushBatch() {
         rafScheduled = false;
         if (pendingBatch.length === 0) return;
@@ -1078,8 +1377,14 @@ def index():
 
         for (var b = 0; b < batch.length; b++) {
           var ev = batch[b];
+          allEvents[ev.index] = ev;
+          if (ev.graph_key) {
+            graphEventIdx.push(ev.index);
+          }
           var row = document.createElement('tr');
           row.id = 'ev-' + ev.index;
+          row.style.cursor = 'pointer';
+          row.setAttribute('data-ev-index', ev.index);
 
           var durText = '';
           var highlight = false;
@@ -1097,13 +1402,17 @@ def index():
           if (highlight) row.style.background = '#fff3e0';
           var indent = '';
           for (var d = 0; d < ev.depth; d++) indent += '&nbsp;&nbsp;';
+          var graphDot = ev.graph_key
+            ? '<span title="' + ev.graph_key.substring(0, 16) + '" style="color:#1565c0">&#x25CF;</span>'
+            : '';
           row.innerHTML =
             '<td>' + ev.timestamp + '</td>' +
             '<td>' + durText + '</td>' +
             '<td>' + ev.depth + '</td>' +
             '<td><span class="badge" style="background:' + ev.color + '">' + ev.event_type + '</span></td>' +
             '<td>' + ev.module + '</td>' +
-            '<td>' + indent + ev.message + arrow + '</td>';
+            '<td>' + indent + ev.message + arrow + '</td>' +
+            '<td style="text-align:center">' + graphDot + '</td>';
           frag.appendChild(row);
         }
 
@@ -1115,15 +1424,62 @@ def index():
         tbody.appendChild(frag);
         evCount += batch.length;
         document.getElementById('event-count').textContent = '(' + evCount + ' events)';
+        document.getElementById('step-graph-count').textContent =
+          graphEventIdx.length + ' graph step' + (graphEventIdx.length === 1 ? '' : 's');
+        if (stepCursor < 0 && graphEventIdx.length > 0) {
+          renderStep(0);
+        }
 
         var scroll = document.getElementById('timeline-scroll');
         scroll.scrollTop = scroll.scrollHeight;
+      }
+
+      // Delegate clicks on timeline rows to the step viewer.
+      document.getElementById('timeline-table').addEventListener('click', function(e) {
+        var row = e.target.closest('tr[data-ev-index]');
+        if (!row) return;
+        selectTimelineRow(parseInt(row.getAttribute('data-ev-index')));
+      });
+
+      function renderMinorsSection(list, containerId, emptyText) {
+        var container = document.getElementById(containerId);
+        if (!list || list.length === 0) {
+          container.innerHTML = '<div class="meta">' + emptyText + '</div>';
+          return;
+        }
+        container.innerHTML = '';
+        list.forEach(function(m, i) {
+          var card = document.createElement('div');
+          card.className = 'minor-card';
+          var divId = containerId + '-card-' + i;
+          card.innerHTML = '<div class="minor-label">' + m.name + ' (' + m.edges + ' edges)</div>'
+            + '<div id="' + divId + '" class="small-graph"></div>';
+          container.appendChild(card);
+          if (m.nodes) {
+            (function(id, nodesJson, edgesJson) {
+              setTimeout(function() {
+                var net = new vis.Network(
+                  document.getElementById(id),
+                  {nodes: new vis.DataSet(JSON.parse(nodesJson)),
+                   edges: new vis.DataSet(JSON.parse(edgesJson))},
+                  opts
+                );
+                net.fit({padding: 20});
+              }, 50);
+            })(divId, m.nodes, m.edges_data);
+          }
+        });
       }
 
       _es.onmessage = function(msg) {
         var d = JSON.parse(msg.data);
 
         if (d.type === 'batch') {
+          if (d.snapshots) {
+            for (var k in d.snapshots) {
+              if (d.snapshots.hasOwnProperty(k)) stepSnapshots[k] = d.snapshots[k];
+            }
+          }
           for (var i = 0; i < d.events.length; i++) {
             pendingBatch.push(d.events[i]);
           }
@@ -1155,31 +1511,27 @@ def index():
             document.getElementById('summary-container').innerHTML = sh;
           }
 
-          // Contributing graphs
+          // Contributing graphs — split by provenance
           var mc = document.getElementById('minors-container');
-          if (d.minors && d.minors.length > 0) {
-            mc.innerHTML = '';
-            d.minors.forEach(function(m, i) {
-              var card = document.createElement('div');
-              card.className = 'minor-card';
-              card.innerHTML = '<div class="minor-label">' + m.name + ' (' + m.edges + ' edges)</div>'
-                + '<div id="minor-' + i + '" class="small-graph"></div>';
-              mc.appendChild(card);
-              // Render graph if data available
-              if (m.nodes) {
-                setTimeout(function() {
-                  var net = new vis.Network(
-                    document.getElementById('minor-' + i),
-                    {nodes: new vis.DataSet(JSON.parse(m.nodes)), edges: new vis.DataSet(JSON.parse(m.edges_data))},
-                    opts
-                  );
-                  net.fit({padding: 20});
-                }, 50);
-              }
-            });
-          } else {
-            mc.innerHTML = '<div class="meta">No rainbow table entries used.</div>';
-          }
+          var lookupList = d.minors_lookup || d.minors || [];
+          var synthList = d.minors_synthesized || [];
+          mc.innerHTML =
+            '<div class="minor-subsection">' +
+              '<h3 style="font-size:12px;margin:0 0 6px 0;color:#2e7d32;">' +
+                'From Lookup Table (' + lookupList.length + ')' +
+              '</h3>' +
+              '<div id="minors-lookup" class="minors-grid"></div>' +
+            '</div>' +
+            '<div class="minor-subsection" style="margin-top:12px">' +
+              '<h3 style="font-size:12px;margin:0 0 6px 0;color:#1565c0;">' +
+                'Synthesized During Run (' + synthList.length + ')' +
+              '</h3>' +
+              '<div id="minors-synthesized" class="minors-grid"></div>' +
+            '</div>';
+          renderMinorsSection(lookupList, 'minors-lookup',
+            'No rainbow table entries used.');
+          renderMinorsSection(synthList, 'minors-synthesized',
+            'No graphs synthesized from scratch (all hits were in the table).');
         }
 
         else if (d.type === 'error') {

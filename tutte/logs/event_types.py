@@ -8,6 +8,7 @@ See log_design.md for full design documentation.
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Optional
 
 
 class LogLevel(Enum):
@@ -80,6 +81,9 @@ class Event:
                 full list of standardized identifiers.
         message: Human-readable description of what happened.
         level: Severity level (DEBUG, INFO, WARN).
+        graph_key: Canonical key of the graph associated with this event,
+                   or None. The snapshot is stored in EventLog._graph_snapshots
+                   keyed by this string.
     """
 
     timestamp: float
@@ -88,3 +92,4 @@ class Event:
     module: str
     message: str
     level: LogLevel = LogLevel.INFO
+    graph_key: Optional[str] = None

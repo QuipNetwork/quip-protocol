@@ -1188,9 +1188,11 @@ def compute_treewidth_tutte_if_applicable(
     _log.record(EventType.TREEWIDTH_DP, "treewidth",
                 f"TW={td.width}, {len(td.bags)} bags, "
                 f"{mg.node_count()}n {mg.edge_count()}e, cost={cost:.0f}",
-                LogLevel.DEBUG)
+                LogLevel.DEBUG, graph=mg)
 
-    # Use bulk C DP for tw >= 5 when available (5-15x faster)
+    # Use bulk C DP for tw >= 5 when available (5-15x faster).
+    # The C DP uses modular arithmetic with CRT for graphs with > 62 edges
+    # (where int64 coefficients or binomial coefficients would overflow).
     if td.width >= 5:
         try:
             from ._treewidth_c import compute_treewidth_tutte_c

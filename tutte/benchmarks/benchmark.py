@@ -258,11 +258,11 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
 
         # Ground truth via Kirchhoff — only compute if we'll attempt synthesis
         # (avoids expensive exact determinant on huge unsolvable graphs)
-        will_attempt = (m <= cej_max_solved + 60 or m <= hybrid_max_solved + 60)
+        will_attempt = (m <= cej_max_solved + 100 or m <= hybrid_max_solved + 100)
         kirchhoff = count_spanning_trees_kirchhoff(graph) if will_attempt else -1
 
         # --- CEJ engine ---
-        if m > cej_max_solved + 60:
+        if m > cej_max_solved + 100:
             # Way beyond frontier — skip without wasting timeout
             cej_ms, cej_result, cej_err = None, None, "UNSOLVED"
         else:
@@ -281,7 +281,7 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
             cej_status = cej_err or "WRONG"
 
         # --- Hybrid engine ---
-        if m > hybrid_max_solved + 60:
+        if m > hybrid_max_solved + 100:
             hybrid_ms, hybrid_result, hybrid_err = None, None, "UNSOLVED"
         else:
             hybrid_ms, hybrid_result, hybrid_err = _time_fn(

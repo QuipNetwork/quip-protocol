@@ -7,25 +7,21 @@ against brute-force synthesis on graph atlas pairs.
 import os
 import time
 
-import pytest
 import networkx as nx
-
-from tutte.graph import (
-    Graph, MultiGraph, complete_graph, cycle_graph, parallel_connection_graph,
-    k_sum_graph, petersen_graph, wheel_graph, grid_graph,
-)
+import pytest
+from tutte.graph import (Graph, MultiGraph, complete_graph, cycle_graph,
+                         grid_graph, k_sum_graph, parallel_connection_graph,
+                         petersen_graph, wheel_graph)
+from tutte.matroids.core import (FlatLattice, GraphicMatroid,
+                                 enumerate_flats_with_hasse)
+from tutte.matroids.parallel_connection import (BivariateLaurentPoly,
+                                                build_extended_cell_graph,
+                                                precompute_contractions,
+                                                theorem6_parallel_connection,
+                                                theorem10_k_sum,
+                                                theorem10_k_sum_via_theorem6)
 from tutte.polynomial import TuttePolynomial
-from tutte.matroids.core import GraphicMatroid, FlatLattice, enumerate_flats_with_hasse
-from tutte.matroids.parallel_connection import (
-    BivariateLaurentPoly,
-    theorem6_parallel_connection,
-    theorem10_k_sum,
-    theorem10_k_sum_via_theorem6,
-    precompute_contractions,
-    build_extended_cell_graph,
-)
 from tutte.validation import verify_spanning_trees, verify_with_networkx
-
 
 # =============================================================================
 # HELPERS
@@ -142,6 +138,7 @@ class TestBivariateLaurentPoly:
     def test_eval_at(self):
         """Test numeric evaluation at integer points."""
         from fractions import Fraction
+
         # p = 3*u*v^2 + 1  evaluated at u=2, v=3: 3*2*9 + 1 = 55
         p = BivariateLaurentPoly({(1, 2): 3, (0, 0): 1})
         assert p.eval_at(2, 3) == Fraction(55)
@@ -765,7 +762,8 @@ class TestCycleFormula:
         try:
             result = engine.synthesize(g)
             assert result.verified
-            assert result.method == "cycle_formula"
+            assert result.method in ("family_recognition"), \
+                f"Expected cycle formula or family recognition, got {result.method}"
             assert result.polynomial.num_spanning_trees() == n
             # Full polynomial check for small cycles
             if n <= 15:
@@ -822,7 +820,7 @@ class TestMethodDistribution:
             # With treewidth DP running before k-sum, small k-sum graphs
             # may be solved directly by treewidth DP instead.
             valid_methods = {"lookup", "treewidth_dp", "series_parallel",
-                             "cut_vertex", "cycle_formula"}
+                             "cut_vertex", "family_recognition"}
             valid_methods |= {f"{k}sum_theorem10" for k in range(2, 8)}
             for name, method in methods.items():
                 if method != "skipped_disconnected":
@@ -947,11 +945,9 @@ class TestSPGuidedContractions:
 
     def test_single_edge_leaf(self):
         """Single edge has 2 flats, both contractions match direct."""
-        from tutte.synthesis.engine import SynthesisEngine
         from tutte.matroids.parallel_connection import (
-            _build_leaf_contractions,
-            BivariateLaurentPoly,
-        )
+            BivariateLaurentPoly, _build_leaf_contractions)
+        from tutte.synthesis.engine import SynthesisEngine
 
         engine = SynthesisEngine(verbose=False)
         # Extended cell = a small triangle graph
@@ -973,13 +969,12 @@ class TestSPGuidedContractions:
 
     def test_sp_guided_matches_direct_small(self):
         """SP-guided contractions match direct precompute_contractions on a small SP graph."""
-        from tutte.synthesis.engine import SynthesisEngine
+        from tutte.graphs.series_parallel import (decompose_series_parallel,
+                                                  is_series_parallel)
         from tutte.matroids.parallel_connection import (
-            build_contractions_bottom_up,
-            precompute_contractions,
-            sp_guided_precompute_contractions,
-        )
-        from tutte.graphs.series_parallel import decompose_series_parallel, is_series_parallel
+            build_contractions_bottom_up, precompute_contractions,
+            sp_guided_precompute_contractions)
+        from tutte.synthesis.engine import SynthesisEngine
 
         engine = SynthesisEngine(verbose=False)
 
@@ -1027,12 +1022,10 @@ class TestSPGuidedContractions:
 
     def test_sp_guided_parallel_composition(self):
         """SP-guided contractions work for parallel composition (multi-edge)."""
-        from tutte.synthesis.engine import SynthesisEngine
-        from tutte.matroids.parallel_connection import (
-            precompute_contractions,
-            sp_guided_precompute_contractions,
-        )
         from tutte.graphs.series_parallel import is_series_parallel
+        from tutte.matroids.parallel_connection import (
+            precompute_contractions, sp_guided_precompute_contractions)
+        from tutte.synthesis.engine import SynthesisEngine
 
         engine = SynthesisEngine(verbose=False)
 
@@ -1073,12 +1066,12 @@ class TestSPGuidedContractions:
 
     def test_contraction_cache_save_load_roundtrip(self, tmp_path):
         """Contraction cache saves to binary+JSON and reloads correctly."""
-        from tutte.synthesis.engine import SynthesisEngine
-        from tutte.matroids.parallel_connection import (
-            build_contractions_bottom_up,
-        )
         from tutte.graphs.series_parallel import decompose_series_parallel
-        from tutte.lookup.binary import save_contraction_cache, load_contraction_cache
+        from tutte.lookup.binary import (load_contraction_cache,
+                                         save_contraction_cache)
+        from tutte.matroids.parallel_connection import \
+            build_contractions_bottom_up
+        from tutte.synthesis.engine import SynthesisEngine
 
         engine = SynthesisEngine(verbose=False)
 
@@ -1119,9 +1112,11 @@ class TestSPGuidedContractions:
     def test_contraction_cache_json_roundtrip(self, tmp_path):
         """Contraction cache JSON round-trip."""
         import json as _json
-        from tutte.synthesis.engine import SynthesisEngine
-        from tutte.matroids.parallel_connection import build_contractions_bottom_up
+
         from tutte.graphs.series_parallel import decompose_series_parallel
+        from tutte.matroids.parallel_connection import \
+            build_contractions_bottom_up
+        from tutte.synthesis.engine import SynthesisEngine
 
         engine = SynthesisEngine(verbose=False)
 
@@ -1162,9 +1157,10 @@ class TestSPGuidedContractions:
 
     def test_persistent_cache_warms_subsequent_build(self):
         """Persistent cache avoids re-synthesis on second build."""
-        from tutte.synthesis.engine import SynthesisEngine
-        from tutte.matroids.parallel_connection import build_contractions_bottom_up
         from tutte.graphs.series_parallel import decompose_series_parallel
+        from tutte.matroids.parallel_connection import \
+            build_contractions_bottom_up
+        from tutte.synthesis.engine import SynthesisEngine
 
         engine = SynthesisEngine(verbose=False)
 

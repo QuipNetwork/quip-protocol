@@ -15,9 +15,11 @@ import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from tutte.logs.event_types import Event, EventType, LogLevel
+
+_SNAPSHOT_CAP = 500
 
 # Box-drawing characters with ASCII fallback for terminals that lack UTF-8
 # (e.g. older Windows cmd.exe).
@@ -55,6 +57,10 @@ class EventLog:
         self._start_time: Optional[float] = None
         self.min_level: LogLevel = LogLevel.INFO
         self._scope_stack: List[ScopeFrame] = []
+        # Opt-in graph snapshot capture for the visualizer. Zero cost when off.
+        self.capture_graphs: bool = False
+        self._graph_snapshots: Dict[str, Dict[str, Any]] = {}
+        self._snapshot_cap_warned: bool = False
 
     def record(
         self,
@@ -62,11 +68,19 @@ class EventLog:
         module: str,
         message: str,
         level: LogLevel = LogLevel.INFO,
+        *,
+        graph: Optional[Any] = None,
     ) -> None:
         """Append a timestamped event at the current recursion depth.
 
         If level is below min_level, the event is not stored. Instead, the
         count is incremented on the current scope frame (if any).
+
+        If `graph` is given and `capture_graphs` is enabled, a serialized
+        snapshot of the graph is stored in `_graph_snapshots` (deduped by
+        canonical key) and the resulting key is set on the event. The
+        snapshot dict is capped at _SNAPSHOT_CAP; overflow is ignored after
+        one WARN.
         """
         if level.value < self.min_level.value:
             if self._scope_stack:
@@ -77,6 +91,11 @@ class EventLog:
         if self._start_time is None:
             self._start_time = now
         timestamp = now - self._start_time
+
+        graph_key: Optional[str] = None
+        if graph is not None and self.capture_graphs:
+            graph_key = self._capture_snapshot(graph, timestamp)
+
         self._events.append(
             Event(
                 timestamp=timestamp,
@@ -85,8 +104,37 @@ class EventLog:
                 module=module,
                 message=message,
                 level=level,
+                graph_key=graph_key,
             )
         )
+
+    def _capture_snapshot(self, graph: Any, timestamp: float) -> Optional[str]:
+        """Serialize `graph` into the snapshot dict, keyed by canonical key."""
+        try:
+            key = graph.canonical_key()
+        except Exception:
+            return None
+        if key in self._graph_snapshots:
+            return key
+        if len(self._graph_snapshots) >= _SNAPSHOT_CAP:
+            if not self._snapshot_cap_warned:
+                self._snapshot_cap_warned = True
+                self._events.append(
+                    Event(
+                        timestamp=timestamp,
+                        depth=self._depth,
+                        event_type=EventType.SCOPE_SUMMARY,
+                        module="log",
+                        message=f"graph snapshot cap reached ({_SNAPSHOT_CAP}); further events will have no graph",
+                        level=LogLevel.WARN,
+                    )
+                )
+            return None
+        snapshot = _graph_to_snapshot(graph)
+        if snapshot is None:
+            return None
+        self._graph_snapshots[key] = snapshot
+        return key
 
     def push(self, scope: str = "") -> None:
         """Increment recursion depth and open a named scope.
@@ -118,6 +166,23 @@ class EventLog:
         self._depth = 0
         self._start_time = None
         self._scope_stack.clear()
+        self._graph_snapshots.clear()
+        self._snapshot_cap_warned = False
+
+    def graph_snapshot(self, key: str) -> Optional[Dict[str, Any]]:
+        """Return the serialized graph snapshot for `key`, or None."""
+        return self._graph_snapshots.get(key)
+
+    def new_graph_snapshots(self, known_keys: set) -> Dict[str, Dict[str, Any]]:
+        """Return snapshots keyed by canonical key that aren't in `known_keys`.
+
+        Used by the visualizer SSE stream to send only new snapshots per batch.
+        """
+        return {
+            key: snap
+            for key, snap in self._graph_snapshots.items()
+            if key not in known_keys
+        }
 
     def replay(self, events: List[Event]) -> None:
         """Load a captured event list for replay (e.g. print_timeline).
@@ -244,6 +309,49 @@ class EventLog:
                     f"{total_duration:>10.3f}s"
                     f"  ({pct:5.1f}%)"
                 )
+
+
+def _graph_to_snapshot(graph: Any) -> Optional[Dict[str, Any]]:
+    """Serialize a Graph or MultiGraph to a small dict for the visualizer.
+
+    Returns {"nodes": [id, ...], "edges": [[u, v, mult], ...], "loops": [[n, mult], ...]}
+    or None if the object is not a recognized graph. Node positions are
+    computed client-side.
+    """
+    nodes_attr = getattr(graph, "nodes", None)
+    if nodes_attr is None:
+        return None
+    try:
+        nodes = sorted(list(nodes_attr))
+    except Exception:
+        return None
+
+    edges: List[List[Any]] = []
+    loops: List[List[Any]] = []
+
+    edge_counts = getattr(graph, "edge_counts", None)
+    loop_counts = getattr(graph, "loop_counts", None)
+    if edge_counts is not None:
+        for (u, v), count in edge_counts.items():
+            edges.append([u, v, count])
+        if loop_counts:
+            for n, count in loop_counts.items():
+                loops.append([n, count])
+    else:
+        simple_edges = getattr(graph, "edges", None)
+        if simple_edges is None:
+            return None
+        try:
+            for e in simple_edges:
+                if not e:
+                    continue
+                u = e[0]
+                v = e[1] if len(e) > 1 else e[0]
+                edges.append([u, v, 1])
+        except Exception:
+            return None
+
+    return {"nodes": nodes, "edges": edges, "loops": loops}
 
 
 # ---------------------------------------------------------------------------
