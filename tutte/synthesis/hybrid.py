@@ -29,6 +29,7 @@ from ..factorization import polynomial_gcd, has_common_factor
 from ..validation import verify_spanning_trees
 from ..graphs.covering import find_disjoint_cover, compute_fringe, compute_inter_tile_edges
 from ..graphs.series_parallel import compute_sp_tutte_if_applicable
+from ..family_recognition import recognize_family
 from .base import BaseMultigraphSynthesizer
 from ..logs import get_log, EventType, LogLevel
 
@@ -170,7 +171,22 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                     f"{n}n {m}e")
         self._log(f"Synthesizing: {n} nodes, {m} edges")
 
-        # 1. Direct rainbow table lookup
+        # 1. Family recognition fast path — O(n+m)
+        family_poly = recognize_family(graph)
+        if family_poly is not None:
+            _log.record(EventType.FAMILY_RECOGNITION, "hybrid",
+                        f"Family recognized: {n}n {m}e", LogLevel.INFO)
+            self._log(f"Family recognition: O(n+m) fast path")
+            result = HybridSynthesisResult(
+                polynomial=family_poly,
+                method="family_recognition",
+                recipe=["Family recognition"],
+                verified=True,
+            )
+            self._cache[cache_key] = result
+            return result
+
+        # 2. Direct rainbow table lookup
         cached = self.table.lookup(graph)
         if cached is not None:
             _log.record(EventType.LOOKUP_HIT, "hybrid",
@@ -335,21 +351,6 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         and hierarchical tiling decompositions.
         """
         from .engine import SynthesisResult
-        from ..polynomial import TuttePolynomial
-
-        # Cycle graph: T(C_n) = x^{n-1} + ... + x + y
-        if graph.node_count() >= 3 and graph.edge_count() == graph.node_count():
-            if all(graph.degree(n) == 2 for n in graph.nodes):
-                n = graph.node_count()
-                coeffs = {(i, 0): 1 for i in range(1, n)}
-                coeffs[(0, 1)] = 1
-                self._log(f"Cycle C_{n}: direct formula")
-                return HybridSynthesisResult(
-                    polynomial=TuttePolynomial.from_coefficients(coeffs),
-                    method="cycle_formula",
-                    recipe=[f"Cycle C_{n}"],
-                    verified=True,
-                )
 
         _log = get_log()
         # Series-parallel O(n)
@@ -371,7 +372,7 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         if graph.edge_count() >= 10:
             from ..graphs.treewidth import compute_treewidth_tutte_if_applicable
             full_mg = MultiGraph.from_graph(graph)
-            tw_poly = compute_treewidth_tutte_if_applicable(full_mg, max_width=10)
+            tw_poly = compute_treewidth_tutte_if_applicable(full_mg, max_width=11)
             if tw_poly is not None:
                 self._log(f"Treewidth DP: {graph.node_count()}n, {graph.edge_count()}e")
                 return HybridSynthesisResult(

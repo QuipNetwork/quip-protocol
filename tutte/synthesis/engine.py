@@ -433,24 +433,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             self._promote_to_table(graph, cache_key, result)
             return result
 
-        # 7. Check for cycle graphs: T(C_n) = x^{n-1} + x^{n-2} + ... + x + y
-        if graph.node_count() >= 3 and graph.edge_count() == graph.node_count():
-            if all(graph.degree(n) == 2 for n in graph.nodes):
-                n = graph.node_count()
-                coeffs = {(i, 0): 1 for i in range(1, n)}
-                coeffs[(0, 1)] = 1
-                self._log(f"Cycle C_{n}: direct formula")
-                result = SynthesisResult(
-                    polynomial=TuttePolynomial.from_coefficients(coeffs),
-                    recipe=[f"Cycle C_{n}"],
-                    verified=True,
-                    method="cycle_formula",
-                )
-                self._cache[cache_key] = result
-                self._promote_to_table(graph, cache_key, result)
-                return result
-
-        # 8. Try series-parallel O(n) computation
+        # 7. Try series-parallel O(n) computation
         sp_poly = compute_sp_tutte_if_applicable(graph)
         if sp_poly is not None:
             _log.record(EventType.SERIES_PARALLEL, "engine",
@@ -466,11 +449,11 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             self._promote_to_table(graph, cache_key, result)
             return result
 
-        # 9. Try treewidth DP on full graph
+        # 8. Try treewidth DP on full graph
         if graph.edge_count() >= 10:
             from ..graphs.treewidth import compute_treewidth_tutte_if_applicable
             full_mg = MultiGraph.from_graph(graph)
-            tw_poly = compute_treewidth_tutte_if_applicable(full_mg, max_width=10)
+            tw_poly = compute_treewidth_tutte_if_applicable(full_mg, max_width=11)
             if tw_poly is not None:
                 self._log(f"Treewidth DP: {graph.node_count()}n, {graph.edge_count()}e")
                 result = SynthesisResult(
@@ -483,7 +466,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 self._promote_to_table(graph, cache_key, result)
                 return result
 
-        # 10. Try k-sum decomposition (k=2..7, vertex separators)
+        # 9. Try k-sum decomposition (k=2..7, vertex separators)
         if graph.edge_count() >= 6:
             result = self._try_ksum_decomposition(graph)
             if result is not None:
@@ -493,7 +476,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 self._promote_to_table(graph, cache_key, result)
                 return result
 
-        # 11. Try hierarchical tiling for graphs with repeating structure
+        # 10. Try hierarchical tiling for graphs with repeating structure
         if graph.edge_count() >= 20:
             result = self._try_hierarchical(graph, max_depth)
             if result is not None:
@@ -1005,7 +988,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             self._log("Product formula failed, trying treewidth DP on full graph")
             from ..graphs.treewidth import compute_treewidth_tutte_if_applicable as _tw_compute
             full_mg = MultiGraph.from_graph(graph)
-            tw_poly = _tw_compute(full_mg, max_width=10)
+            tw_poly = _tw_compute(full_mg, max_width=11)
             if tw_poly is not None:
                 self._log(f"Treewidth DP solved full graph: {graph.node_count()}n, {graph.edge_count()}e")
                 recipe.append("Treewidth-based DP (full graph, after product formula)")
@@ -1578,7 +1561,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             partial_graph_tw = Graph(nodes=graph.nodes, edges=partial_graph_edges_tw)
             from ..graphs.treewidth import compute_treewidth_tutte_if_applicable
             partial_mg_tw = MultiGraph.from_graph(partial_graph_tw)
-            partial_poly_tw = compute_treewidth_tutte_if_applicable(partial_mg_tw, max_width=10)
+            partial_poly_tw = compute_treewidth_tutte_if_applicable(partial_mg_tw, max_width=11)
             if partial_poly_tw is not None:
                 if verify_spanning_trees(partial_graph_tw, partial_poly_tw):
                     self._log(f"Treewidth DP on partial graph succeeded ({len(partial_graph_edges_tw)}e)")
@@ -1827,7 +1810,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             from .symmetric import build_treewidth_minimizing_chord_order
             self._log(f"Computing treewidth-minimizing chord order for {len(chords)} chords...")
             tw_order = build_treewidth_minimizing_chord_order(
-                chords, current_mg, max_width=10
+                chords, current_mg, max_width=11
             )
 
         # Estimate costs and pick the best ordering
@@ -1874,7 +1857,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             merged = mg.merge_nodes(u, v)
             if merged.total_loop_count() > 0:
                 merged = merged.remove_loops()
-            td = compute_best_tree_decomposition(merged, max_width=10)
+            td = compute_best_tree_decomposition(merged, max_width=11)
             if td is None:
                 total_cost += 1e15  # Penalty for infeasible treewidth
             else:

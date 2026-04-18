@@ -68,10 +68,26 @@ def recognize_family(graph: Graph) -> Optional[TuttePolynomial]:
     n = graph.node_count()
     m = graph.edge_count()
 
+    # Quick connectivity check — required for all family formulas.
+    # Uses DFS from first node; O(n+m) but exits early if disconnected.
+    if n > 1:
+        start = next(iter(graph.nodes))
+        reached = set()
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            if node in reached:
+                continue
+            reached.add(node)
+            for nb in graph.neighbors(node):
+                if nb not in reached:
+                    stack.append(nb)
+        if len(reached) != n:
+            return None  # Disconnected — no single family formula applies
+
     # --- O(1) checks based on (n, m) ---
 
     # Tree (covers paths, stars, all trees)
-    # Precondition: graph is connected (checked by engine before calling)
     if m == n - 1:
         return tree_formula(n)
 
@@ -86,6 +102,7 @@ def recognize_family(graph: Graph) -> Optional[TuttePolynomial]:
 
     # Wheel: one hub with degree n-1, all others degree 3, 2(n-1) edges
     # W_k has k+1 vertices. For n=4 (W_3=K_4), hub degree = 3 = rim degree.
+    # Verify: hub connected to all rim vertices, rim forms a cycle.
     if n >= 4 and m == 2 * (n - 1):
         if n == 4:
             # W_3 = K_4: all vertices degree 3
@@ -94,23 +111,104 @@ def recognize_family(graph: Graph) -> Optional[TuttePolynomial]:
         elif (fp.degree_counts.get(n - 1, 0) == 1
                 and fp.degree_counts.get(3, 0) == n - 1
                 and len(fp.degree_counts) == 2):
-            return wheel_recurrence(n - 1)
+            # Find hub and verify rim is a cycle
+            hub = None
+            for v in graph.nodes:
+                if graph.degree(v) == n - 1:
+                    hub = v
+                    break
+            if hub is not None:
+                hub_nbs = set(graph.neighbors(hub))
+                rim = [v for v in graph.nodes if v != hub]
+                # Hub must be connected to all rim vertices
+                if hub_nbs == set(rim):
+                    # Rim vertices must form a single cycle: each has exactly
+                    # 2 rim neighbors AND the rim is connected (one component).
+                    rim_set = set(rim)
+                    all_deg2 = all(
+                        sum(1 for nb in graph.neighbors(v) if nb in rim_set) == 2
+                        for v in rim
+                    )
+                    if all_deg2:
+                        # Check rim connectivity via DFS
+                        rim_visited = set()
+                        rim_stack = [rim[0]]
+                        while rim_stack:
+                            rv = rim_stack.pop()
+                            if rv in rim_visited:
+                                continue
+                            rim_visited.add(rv)
+                            for nb in graph.neighbors(rv):
+                                if nb in rim_set and nb not in rim_visited:
+                                    rim_stack.append(nb)
+                        if len(rim_visited) == len(rim):
+                            return wheel_recurrence(n - 1)
 
     # Fan: one apex with degree n-1, two degree-2 endpoints, rest degree 3
     # F_k has k+1 vertices, 2k-1 edges. k = n-1.
+    # Verify: apex connected to all others, non-apex vertices form a path.
     if (n >= 4 and m == 2 * (n - 1) - 1
             and fp.degree_counts.get(n - 1, 0) == 1
             and fp.degree_counts.get(2, 0) == 2
             and fp.degree_counts.get(3, 0) == n - 3
             and len(fp.degree_counts) == 3):
-        return fan_recurrence(n - 1)
+        # Find apex (degree n-1) and verify rim is a path
+        apex = None
+        for v in graph.nodes:
+            if graph.degree(v) == n - 1:
+                apex = v
+                break
+        if apex is not None:
+            rim = [v for v in graph.nodes if v != apex]
+            # rim should form a path: 2 endpoints (degree 2 in full graph = degree 1 in rim)
+            rim_set = set(rim)
+            rim_adj = {v: [] for v in rim}
+            for v in rim:
+                for nb in graph.neighbors(v):
+                    if nb in rim_set:
+                        rim_adj[v].append(nb)
+            endpoints = [v for v in rim if len(rim_adj[v]) == 1]
+            if len(endpoints) == 2:
+                # Trace path from endpoint to endpoint
+                path = [endpoints[0]]
+                visited = {endpoints[0]}
+                while len(path) < len(rim):
+                    cur = path[-1]
+                    found_next = False
+                    for nb in rim_adj[cur]:
+                        if nb not in visited:
+                            path.append(nb)
+                            visited.add(nb)
+                            found_next = True
+                            break
+                    if not found_next:
+                        break
+                if len(path) == len(rim):
+                    return fan_recurrence(n - 1)
 
-    # Pan: one pendant (deg 1), one deg-3 vertex, rest deg-2, |E|=|V|
+    # Pan: cycle C_{n-1} with one pendant vertex
+    # One pendant (deg 1), one deg-3 vertex, rest deg-2, |E|=|V|
+    # Verify: removing pendant + its neighbor's extra edge leaves a cycle.
     if (n >= 4 and m == n
             and fp.degree_counts.get(1, 0) == 1
             and fp.degree_counts.get(3, 0) == 1
             and fp.degree_counts.get(2, 0) == n - 2):
-        return pan_formula(n - 1)
+        # Find pendant and its neighbor (the deg-3 vertex)
+        pendant = None
+        for v in graph.nodes:
+            if graph.degree(v) == 1:
+                pendant = v
+                break
+        if pendant is not None:
+            hub = next(iter(graph.neighbors(pendant)))
+            # Remaining graph (without pendant) should be a cycle C_{n-1}
+            rim = [v for v in graph.nodes if v != pendant]
+            if all(graph.degree(v) == 2 for v in rim if v != hub):
+                # hub has degree 3 in full graph, degree 2 in rim → cycle check
+                rim_set = set(rim)
+                hub_rim_deg = sum(1 for nb in graph.neighbors(hub) if nb in rim_set)
+                if hub_rim_deg == 2:
+                    return pan_formula(n - 1)
 
     # --- O(1) + O(n+m) verification checks ---
 
