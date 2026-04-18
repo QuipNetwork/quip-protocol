@@ -380,6 +380,14 @@ class NetworkNode(Node):
         self._recent_messages_max = 10_000
         self._recent_messages_ttl = 300.0  # 5 minutes
 
+        # Per-host announcement dedup: maps peer host -> last-seen announce
+        # timestamp. Populated both when we originate a new_node gossip and
+        # when we observe one from another sender (including JOIN-response
+        # peer maps), so the gossip chain does not re-originate about peers
+        # the network already knows.
+        self._announced_nodes: dict[str, float] = {}
+        self._announced_nodes_ttl = 300.0  # 5 minutes, matches recent_messages
+
         # Time synchronization tracking
         self.peer_timestamps = []  # Recent timestamps from peers
         self.last_time_sync_check = 0.0
@@ -944,10 +952,16 @@ class NetworkNode(Node):
                 # Prune stale gossip dedup entries and rate limiter buckets
                 async with self.gossip_lock:
                     pruned = self._prune_recent_messages()
+                    announced_pruned = self._prune_announced_nodes()
                     if pruned:
                         self.logger.debug(
                             f"Pruned {pruned} stale gossip dedup entries "
                             f"({len(self.recent_messages)} remaining)"
+                        )
+                    if announced_pruned:
+                        self.logger.debug(
+                            f"Pruned {announced_pruned} stale announced-node "
+                            f"entries ({len(self._announced_nodes)} remaining)"
                         )
                 self._rate_limiter.prune()
 
@@ -1304,9 +1318,44 @@ class NetworkNode(Node):
                 self.logger.exception("Error in block processor loop")
 
     async def gossip_processor_loop(self):
-        """Background loop to process gossip messages without blocking HTTP handlers."""
+        """Background loop to process gossip messages without blocking HTTP handlers.
+
+        Emits two diagnostic signals:
+          - INFO per message only when ``proc_ms > 500`` (a genuinely
+            slow handler). Queue-wait time is excluded from the
+            per-message trigger because a single backlog fans out to
+            hundreds of entries with identical wait values.
+          - INFO summary every ``_GOSSIP_SUMMARY_INTERVAL`` seconds
+            capturing drained count, avg/max wait, and current qsize.
+            This is the right place to observe backlog conditions.
+        """
+        _SLOW_PROC_MS = 500.0
+        _SUMMARY_INTERVAL = 10.0
+
+        window_count = 0
+        window_wait_sum = 0.0
+        window_wait_max = 0.0
+        window_started = time.monotonic()
+
         while self.running:
             try:
+                now = time.monotonic()
+                if now - window_started >= _SUMMARY_INTERVAL:
+                    if window_count > 0:
+                        avg_wait = window_wait_sum / window_count
+                        qsize_now = self.gossip_processing_queue.qsize()
+                        self.logger.info(
+                            f"🧩 Gossip summary: drained {window_count} msgs "
+                            f"in last {_SUMMARY_INTERVAL:.0f}s, "
+                            f"avg_wait={avg_wait:.1f} ms, "
+                            f"max_wait={window_wait_max:.1f} ms, "
+                            f"qsize_now={qsize_now}"
+                        )
+                    window_count = 0
+                    window_wait_sum = 0.0
+                    window_wait_max = 0.0
+                    window_started = now
+
                 # Wait for gossip messages to process with timeout
                 try:
                     gossip_data = await asyncio.wait_for(
@@ -1327,12 +1376,27 @@ class NetworkNode(Node):
                     wait_ms = ((t_deq - t_enq) * 1000.0) if t_enq is not None else None
                     proc_ms = (t1 - t0) * 1000.0
                     qsize = self.gossip_processing_queue.qsize()
+
+                    window_count += 1
+                    if wait_ms is not None:
+                        window_wait_sum += wait_ms
+                        if wait_ms > window_wait_max:
+                            window_wait_max = wait_ms
+
                     wait_str = f"{wait_ms:.1f} ms" if wait_ms is not None else "n/a"
-                    slow = (wait_ms is not None and wait_ms > 500.0) or proc_ms > 500.0
-                    log_fn = self.logger.info if slow else self.logger.debug
-                    log_fn(
-                        f"🧩 Gossip handled id={(message.id or '')[:8]} type={message.type}: wait={wait_str}, process={proc_ms:.1f} ms, qsize={qsize}"
-                    )
+                    if proc_ms > _SLOW_PROC_MS:
+                        self.logger.info(
+                            f"🧩 Slow gossip handler id={(message.id or '')[:8]} "
+                            f"type={message.type}: wait={wait_str}, "
+                            f"process={proc_ms:.1f} ms, qsize={qsize}"
+                        )
+                    else:
+                        self.logger.debug(
+                            f"🧩 Gossip handled id={(message.id or '')[:8]} "
+                            f"type={message.type}: wait={wait_str}, "
+                            f"process={proc_ms:.1f} ms, qsize={qsize}"
+                        )
+
                     if response_future and not response_future.done():
                         try:
                             response_future.set_result(result)
@@ -1940,6 +2004,15 @@ class NetworkNode(Node):
             # own heartbeat/join later.
             peers_found = 0
             peers_map = result.get("peers", {}) or {}
+            # Snapshot the whole peer map as "already announced" so our
+            # own gossip_new_node origination guard suppresses a
+            # startup burst covering peers the network already knows.
+            now = time.time()
+            async with self.gossip_lock:
+                for peer_host in peers_map:
+                    if peer_host == self.public_host:
+                        continue
+                    self._announced_nodes[peer_host] = now
             for peer_host, peer_info_json in peers_map.items():
                 # except ourselves
                 if peer_host == self.public_host:
@@ -2031,6 +2104,15 @@ class NetworkNode(Node):
                     if responder_version:
                         self.peer_versions[peer] = responder_version
                 peers_found = 0
+                # Snapshot the whole peer map as "already announced" so
+                # our gossip_new_node origination guard suppresses a
+                # startup burst covering peers the network already knows.
+                now = time.time()
+                async with self.gossip_lock:
+                    for peer_host in peers_map:
+                        if peer_host == self.public_host:
+                            continue
+                        self._announced_nodes[peer_host] = now
                 for peer_host, peer_info_json in peers_map.items():
                     if peer_host == self.public_host:
                         continue
@@ -2264,6 +2346,10 @@ class NetworkNode(Node):
         self.peer_versions.pop(peer_address, None)
         self.heartbeats.pop(peer_address, None)
         self._candidate_peers.pop(peer_address, None)
+        # Clear the announcement dedup entry so a legitimate rejoin can
+        # re-announce immediately rather than waiting out the TTL. Dict
+        # .pop is atomic under the GIL, so we don't acquire gossip_lock.
+        self._announced_nodes.pop(peer_address, None)
         return was_present
 
     async def remove_node(self, host: str):
@@ -2413,7 +2499,22 @@ class NetworkNode(Node):
     async def gossip_new_node(self, new_node_address: str, new_node_info: MinerInfo):
         """Broadcast a new node to all known nodes.
         Data encoding: [u16 host_len][host utf-8][u32 info_len][info json utf-8]
+
+        Skips origination if an announcement for this host has been
+        observed within ``_announced_nodes_ttl``. Without this guard,
+        every node that learns about a peer re-originates a fresh
+        new_node gossip, producing O(N²) traffic per join because each
+        re-origination has a distinct (sender, timestamp) and therefore
+        a distinct message ID that the recent_messages dedup cannot
+        suppress.
         """
+        now = time.time()
+        async with self.gossip_lock:
+            last = self._announced_nodes.get(new_node_address)
+            if last is not None and now - last < self._announced_nodes_ttl:
+                return
+            self._announced_nodes[new_node_address] = now
+
         _st = struct
         host_b = new_node_address.encode('utf-8')
         info_json = new_node_info.to_json().encode('utf-8')
@@ -2516,6 +2617,11 @@ class NetworkNode(Node):
             info_json = message.data[o:o+info_len].decode('utf-8')
             new_info = MinerInfo.from_json(info_json)
             if host:
+                # Record the announcement before add_peer so the
+                # gossip_new_node origination guard sees it and does
+                # not re-originate with us as sender.
+                async with self.gossip_lock:
+                    self._announced_nodes[host] = time.time()
                 await self.add_peer(host, new_info)
 
         elif message.type == "block":
@@ -2576,6 +2682,24 @@ class NetworkNode(Node):
             for mid, _ in oldest:
                 del self.recent_messages[mid]
             return len(stale) + excess
+        return len(stale)
+
+    def _prune_announced_nodes(self, now: Optional[float] = None) -> int:
+        """Drop announcement dedup entries older than TTL.
+
+        No size cap — the dict is bounded by the number of distinct
+        peers that have been announced in the last TTL window, which
+        grows with the network, not with message volume.
+        """
+        if now is None:
+            now = time.time()
+        cutoff = now - self._announced_nodes_ttl
+        stale = [
+            host for host, ts in self._announced_nodes.items()
+            if ts < cutoff
+        ]
+        for host in stale:
+            del self._announced_nodes[host]
         return len(stale)
 
     async def _handle_quic_message(

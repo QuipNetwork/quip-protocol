@@ -70,6 +70,8 @@ def _make_node(
     node.fanout = 3
     node.recent_messages = {}
     node.gossip_lock = asyncio.Lock()
+    node._announced_nodes = {}
+    node._announced_nodes_ttl = 300.0
     # Stub gossip_new_node and info() to avoid QUIC / crypto calls.
     node.gossip_new_node = AsyncMock()
     node.info = MagicMock(return_value=_make_info("test-node"))
@@ -352,3 +354,79 @@ class TestFastEviction:
 
         assert "10.0.10.1:20001" in dead_nodes
         assert "10.0.10.2:20001" not in dead_nodes
+
+
+# ---------------------------------------------------------------------------
+# gossip_new_node: per-host announcement dedup
+# ---------------------------------------------------------------------------
+
+class TestGossipNewNodeDedup:
+    """Verifies that gossip_new_node skips origination when the host
+    has been announced within _announced_nodes_ttl, preventing the
+    N² new_node amplification observed in production."""
+
+    @pytest.fixture
+    def node(self):
+        node = _make_node()
+        # Use the real gossip_new_node (with its dedup gate), and stub
+        # only the downstream broadcast.
+        node.gossip_new_node = NetworkNode.gossip_new_node.__get__(node)
+        node.gossip = AsyncMock()
+        return node
+
+    @pytest.mark.asyncio
+    async def test_first_call_originates(self, node):
+        await node.gossip_new_node("10.0.11.1:20001", _make_info("a"))
+        assert node.gossip.await_count == 1
+        assert "10.0.11.1:20001" in node._announced_nodes
+
+    @pytest.mark.asyncio
+    async def test_second_call_within_ttl_skips(self, node):
+        await node.gossip_new_node("10.0.11.1:20001", _make_info("a"))
+        await node.gossip_new_node("10.0.11.1:20001", _make_info("a"))
+        assert node.gossip.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_call_after_ttl_expiry_re_announces(self, node):
+        await node.gossip_new_node("10.0.11.1:20001", _make_info("a"))
+        # Backdate the entry past the TTL window.
+        node._announced_nodes["10.0.11.1:20001"] = (
+            time.time() - node._announced_nodes_ttl - 1
+        )
+        await node.gossip_new_node("10.0.11.1:20001", _make_info("a"))
+        assert node.gossip.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_distinct_hosts_both_announce(self, node):
+        await node.gossip_new_node("10.0.11.1:20001", _make_info("a"))
+        await node.gossip_new_node("10.0.11.2:20001", _make_info("b"))
+        assert node.gossip.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_remove_peer_clears_announcement(self, node):
+        await node.gossip_new_node("10.0.11.1:20001", _make_info("a"))
+        node.remove_peer("10.0.11.1:20001")
+        assert "10.0.11.1:20001" not in node._announced_nodes
+        # Now a fresh announcement should proceed.
+        await node.gossip_new_node("10.0.11.1:20001", _make_info("a"))
+        assert node.gossip.await_count == 2
+
+
+# ---------------------------------------------------------------------------
+# _prune_announced_nodes: TTL expiry
+# ---------------------------------------------------------------------------
+
+class TestPruneAnnouncedNodes:
+    def test_prunes_only_entries_older_than_ttl(self):
+        node = _make_node()
+        now = time.time()
+        node._announced_nodes["fresh:1"] = now - 10
+        node._announced_nodes["stale:1"] = now - node._announced_nodes_ttl - 5
+        node._announced_nodes["stale:2"] = now - node._announced_nodes_ttl - 60
+
+        removed = node._prune_announced_nodes(now=now)
+
+        assert removed == 2
+        assert "fresh:1" in node._announced_nodes
+        assert "stale:1" not in node._announced_nodes
+        assert "stale:2" not in node._announced_nodes
