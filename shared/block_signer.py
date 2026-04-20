@@ -67,7 +67,7 @@ class BlockSigner:
         self.next_wots_plus_public_key = next_public_key_obj.to_bytes()
     
     # FIXME: Because we need to sign lots of candidate messages before iterating our key we need to switch
-    #.       either to an XMSS system, SPHINCS, etc for this to be secure.
+    #        either to an XMSS system, SPHINCS, etc for this to be secure.
     def iterate_wots_key(self):
         """Iterate to the next WOTS+ key pair."""
         self.wots_seed = self.next_wots_seed
