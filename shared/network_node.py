@@ -712,7 +712,7 @@ class NetworkNode(Node):
                 logger=self.logger,
                 telemetry_cache=self.telemetry_cache,
                 telemetry_access_token=tapi.get("access_token", ""),
-                telemetry_rate_limit_rpm=tapi.get("rate_limit_rpm", 30),
+                telemetry_rate_limit_rpm=tapi.get("rate_limit_rpm", 60),
                 telemetry_max_sse=tapi.get("max_sse_connections", 20),
             )
             await self.rest_api_server.start()
