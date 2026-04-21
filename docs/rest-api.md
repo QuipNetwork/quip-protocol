@@ -198,12 +198,64 @@ token is configured (`telemetry_access_token`), requests must include
 | `GET /api/v1/telemetry/status`                                 | Telemetry status snapshot + ETag           |
 | `GET /api/v1/telemetry/nodes`                                  | Node roster + ETag                         |
 | `GET /api/v1/telemetry/epochs`                                 | Available epochs                           |
+| `GET /api/v1/telemetry/epochs/{epoch}/blocks`                  | Bulk block range for cold sync             |
 | `GET /api/v1/telemetry/epochs/{epoch}/blocks/{block_index}`   | Block detail within an epoch               |
 | `GET /api/v1/telemetry/latest`                                 | Latest telemetry block                     |
 | `GET /api/v1/telemetry/stream`                                 | Server-sent events stream                  |
 
 Telemetry `GET` endpoints honor `If-None-Match` and return `304 Not Modified`
-when the ETag matches.
+when the ETag matches. The bulk range endpoint does not emit an ETag because
+its response varies with the `start`/`limit` pair; validate individual blocks
+via the block-detail endpoint if needed.
+
+### Bulk block range (cold sync)
+
+```
+GET /api/v1/telemetry/epochs/{epoch}/blocks?start=<int>&limit=<int>
+```
+
+Returns up to `limit` blocks starting at `start`. Designed so a fresh client
+can sync an entire epoch in `⌈N / limit⌉` requests instead of one per block.
+
+Query parameters:
+
+- `start` — first `block_index` to return. Defaults to the epoch's
+  `first_block`. Values below `first_block` are clamped up.
+- `limit` — max blocks per response. Default `100`, cap `1000`.
+  Non-numeric or non-positive inputs return `400 INVALID_RANGE`.
+
+Response `data`:
+
+```json
+{
+  "epoch":      "1775167182",
+  "start":      1,
+  "count":      1000,
+  "next_start": 1001,
+  "limit_cap":  1000,
+  "blocks":     [ { "block_index": 1, ... }, ... ]
+}
+```
+
+`next_start` is `null` once the range reaches the epoch's `last_block`.
+Clients should loop until `next_start` is `null`, passing the returned
+value as the next `start`.
+
+```bash
+start=1
+while [ -n "$start" ] && [ "$start" != "null" ]; do
+  body=$(curl -s "http://$NODE/api/v1/telemetry/epochs/$E/blocks?start=$start&limit=1000")
+  echo "$body" | jq -c '.data.blocks[]'
+  start=$(echo "$body" | jq -r '.data.next_start')
+done
+```
+
+### Rate limits (telemetry)
+
+Per-IP token bucket: `60` requests/minute sustained, burst of `10`. Tune via
+`[telemetry_api] rate_limit_rpm = <int>` in the node config. A 10k-block cold
+sync at `limit=1000` costs 10 bulk requests plus 3 metadata — well under the
+default burst.
 
 ## Common pitfalls
 
@@ -216,5 +268,9 @@ when the ETag matches.
   `CertificateManager` has a valid cert/key. Check node logs for
   `Failed to start HTTPS server`; until then only the HTTP port serves.
 - **`/api/v1/solve` returns 429.** Per-IP rate limit, default 10/min.
+- **Telemetry endpoint returns 429.** Per-IP rate limit, default 60/min
+  with burst 10. For cold sync, prefer
+  `GET /api/v1/telemetry/epochs/{epoch}/blocks?limit=1000` over fetching
+  each block individually.
 - **Telemetry endpoint returns 401.** A `telemetry_access_token` is
   configured; include `Authorization: Bearer <token>`.

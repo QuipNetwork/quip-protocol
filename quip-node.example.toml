@@ -62,7 +62,7 @@ telemetry_dir = "telemetry"  # Directory for telemetry output
 [telemetry_api]
 # enabled = true                  # Defaults to telemetry_enabled value
 # access_token = ""               # Bearer token for REST auth (empty = open access)
-# rate_limit_rpm = 30             # Requests per minute per IP
+# rate_limit_rpm = 60             # Requests per minute per IP (burst floor = 10)
 # max_sse_connections = 20        # Max concurrent SSE connections
 # cache_refresh_interval = 5.0    # Seconds between telemetry dir scans
 

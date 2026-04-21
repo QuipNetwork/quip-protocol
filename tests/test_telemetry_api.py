@@ -206,6 +206,98 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
         resp = await self.client.request("GET", "/health")
         assert resp.status == 200
 
+    async def test_blocks_range_default(self):
+        resp = await self.client.request(
+            "GET", "/api/v1/telemetry/epochs/1775167182/blocks",
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        data = body["data"]
+        assert data["epoch"] == "1775167182"
+        assert data["start"] == 1
+        assert data["count"] == 3
+        assert data["next_start"] is None
+        assert data["limit_cap"] == 1000
+        indices = [b["block_index"] for b in data["blocks"]]
+        assert indices == [1, 2, 3]
+
+    async def test_blocks_range_with_limit(self):
+        resp = await self.client.request(
+            "GET",
+            "/api/v1/telemetry/epochs/1775167182/blocks?start=1&limit=2",
+        )
+        assert resp.status == 200
+        data = (await resp.json())["data"]
+        assert data["count"] == 2
+        assert [b["block_index"] for b in data["blocks"]] == [1, 2]
+        # limit=2 stops at block 2 but epoch's last is 3 → must paginate
+        assert data["next_start"] == 3
+
+    async def test_blocks_range_pagination_end(self):
+        resp = await self.client.request(
+            "GET",
+            "/api/v1/telemetry/epochs/1775167182/blocks?start=3&limit=1000",
+        )
+        data = (await resp.json())["data"]
+        assert data["count"] == 1
+        assert data["next_start"] is None
+
+    async def test_blocks_range_start_clamped_up(self):
+        # Epoch's first_block is 1; asking for start=-0 or below should
+        # either 400 or clamp up. We chose: negative = 400, zero = 400.
+        resp = await self.client.request(
+            "GET",
+            "/api/v1/telemetry/epochs/1775167182/blocks?start=0",
+        )
+        assert resp.status == 400
+        body = await resp.json()
+        assert body["code"] == "INVALID_RANGE"
+
+    async def test_blocks_range_negative_start(self):
+        resp = await self.client.request(
+            "GET",
+            "/api/v1/telemetry/epochs/1775167182/blocks?start=-5",
+        )
+        assert resp.status == 400
+        assert (await resp.json())["code"] == "INVALID_RANGE"
+
+    async def test_blocks_range_non_numeric(self):
+        resp = await self.client.request(
+            "GET",
+            "/api/v1/telemetry/epochs/1775167182/blocks?start=abc",
+        )
+        assert resp.status == 400
+        assert (await resp.json())["code"] == "INVALID_RANGE"
+
+    async def test_blocks_range_limit_capped(self):
+        resp = await self.client.request(
+            "GET",
+            "/api/v1/telemetry/epochs/1775167182/blocks?start=1&limit=5000",
+        )
+        assert resp.status == 200
+        data = (await resp.json())["data"]
+        assert data["limit_cap"] == 1000
+        # The test fixture only has 3 blocks, so count is 3 regardless.
+        assert data["count"] == 3
+
+    async def test_blocks_range_unknown_epoch(self):
+        resp = await self.client.request(
+            "GET", "/api/v1/telemetry/epochs/9999999/blocks",
+        )
+        assert resp.status == 404
+        assert (await resp.json())["code"] == "EPOCH_NOT_FOUND"
+
+    async def test_blocks_range_past_end(self):
+        resp = await self.client.request(
+            "GET",
+            "/api/v1/telemetry/epochs/1775167182/blocks?start=999&limit=10",
+        )
+        assert resp.status == 200
+        data = (await resp.json())["data"]
+        assert data["count"] == 0
+        assert data["blocks"] == []
+        assert data["next_start"] is None
+
 
 # ---------------------------------------------------------------------------
 # Auth-protected telemetry tests

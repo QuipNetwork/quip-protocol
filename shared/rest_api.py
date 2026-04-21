@@ -85,7 +85,7 @@ class RestApiServer:
         logger: Optional[logging.Logger] = None,
         telemetry_cache: Optional['TelemetryCache'] = None,
         telemetry_access_token: str = "",
-        telemetry_rate_limit_rpm: int = 30,
+        telemetry_rate_limit_rpm: int = 60,
         telemetry_max_sse: int = 20,
         solve_rate_limit_rpm: int = 10,
     ):
@@ -118,9 +118,13 @@ class RestApiServer:
         self._telemetry_cache = telemetry_cache
         self._telemetry_token = telemetry_access_token
         tokens_per_sec = telemetry_rate_limit_rpm / 60.0
+        # Burst floor of 10 lets a dashboard make a handful of parallel
+        # reads (status + nodes + epochs + latest + a block) without
+        # tripping 429. The *5 multiplier still scales burst with
+        # sustained rate for higher configured rpms.
         self._telemetry_rate_limiter = PeerRateLimiter(
             tokens_per_second=tokens_per_sec,
-            max_burst=max(int(tokens_per_sec * 5), 3),
+            max_burst=max(int(tokens_per_sec * 5), 10),
         )
         self._telemetry_max_sse = telemetry_max_sse
         self._sse_clients: List[web.StreamResponse] = []
@@ -193,6 +197,10 @@ class RestApiServer:
             )
             app.router.add_get(
                 "/api/v1/telemetry/epochs", self.handle_telemetry_epochs,
+            )
+            app.router.add_get(
+                "/api/v1/telemetry/epochs/{epoch}/blocks",
+                self.handle_telemetry_blocks_range,
             )
             app.router.add_get(
                 "/api/v1/telemetry/epochs/{epoch}/blocks/{block_index}",
@@ -364,6 +372,7 @@ class RestApiServer:
                 {"method": "GET", "path": "/api/v1/telemetry/status", "description": "Telemetry status snapshot"},
                 {"method": "GET", "path": "/api/v1/telemetry/nodes", "description": "Telemetry node roster"},
                 {"method": "GET", "path": "/api/v1/telemetry/epochs", "description": "Available telemetry epochs"},
+                {"method": "GET", "path": "/api/v1/telemetry/epochs/{epoch}/blocks", "description": "Telemetry block range (bulk cold-sync; ?start=&limit=)"},
                 {"method": "GET", "path": "/api/v1/telemetry/epochs/{epoch}/blocks/{block_index}", "description": "Telemetry block detail"},
                 {"method": "GET", "path": "/api/v1/telemetry/latest", "description": "Latest telemetry block"},
                 {"method": "GET", "path": "/api/v1/telemetry/stream", "description": "Server-sent events stream"},
@@ -971,6 +980,75 @@ class RestApiServer:
         if not_modified:
             return not_modified
         return self._etag_response(data, etag)
+
+    # Bulk-range cap. At ~1 KB per block, 1000 blocks ≈ 1 MB per
+    # response — a comfortable trade between fewer round trips on cold
+    # sync and bounded memory / response size on the server.
+    TELEMETRY_RANGE_LIMIT_CAP = 1000
+    TELEMETRY_RANGE_LIMIT_DEFAULT = 100
+
+    async def handle_telemetry_blocks_range(
+        self, request: web.Request,
+    ) -> web.Response:
+        """GET /api/v1/telemetry/epochs/{epoch}/blocks?start=&limit=
+
+        Bulk cold-sync endpoint. Returns up to ``limit`` blocks (capped
+        at ``TELEMETRY_RANGE_LIMIT_CAP``) starting at ``start``.
+        """
+        cache = self._telemetry_cache
+        if cache is None:
+            return self._error_response(
+                "Telemetry not enabled", "TELEMETRY_DISABLED", 503,
+            )
+        epoch = request.match_info["epoch"]
+        info = cache.get_epoch_info(epoch)
+        if info is None:
+            return self._error_response(
+                f"Epoch {epoch} not found", "EPOCH_NOT_FOUND", 404,
+            )
+
+        try:
+            start = int(request.query.get("start", info.first_block))
+            limit = int(request.query.get(
+                "limit", self.TELEMETRY_RANGE_LIMIT_DEFAULT,
+            ))
+        except ValueError:
+            return self._error_response(
+                "start and limit must be integers",
+                "INVALID_RANGE", 400,
+            )
+        if start < 1 or limit < 1:
+            return self._error_response(
+                "start and limit must be positive integers",
+                "INVALID_RANGE", 400,
+            )
+        limit = min(limit, self.TELEMETRY_RANGE_LIMIT_CAP)
+
+        blocks = cache.get_blocks_range(epoch, start, limit)
+        # Cache could have been invalidated between get_epoch_info and
+        # get_blocks_range (refresh loop drops the epoch). Treat the
+        # same as unknown-epoch.
+        if blocks is None:
+            return self._error_response(
+                f"Epoch {epoch} not found", "EPOCH_NOT_FOUND", 404,
+            )
+
+        effective_start = max(start, info.first_block)
+        requested_end = effective_start + limit - 1
+        # next_start advances past the requested window regardless of
+        # missing block files — avoids a client looping on a hole.
+        next_start = (
+            requested_end + 1 if requested_end < info.last_block else None
+        )
+
+        return self._success_response({
+            "epoch": epoch,
+            "start": effective_start,
+            "count": len(blocks),
+            "next_start": next_start,
+            "limit_cap": self.TELEMETRY_RANGE_LIMIT_CAP,
+            "blocks": blocks,
+        })
 
     async def handle_telemetry_latest(
         self, request: web.Request,

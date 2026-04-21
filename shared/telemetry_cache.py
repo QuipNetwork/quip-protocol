@@ -273,6 +273,39 @@ class TelemetryCache:
             self._evict_block_cache()
         return data
 
+    def get_epoch_info(self, epoch: str) -> Optional[EpochInfo]:
+        """Return the cached `EpochInfo` for *epoch*, or None if unknown."""
+        return self._epoch_info.get(epoch)
+
+    def get_blocks_range(
+        self, epoch: str, start: int, limit: int,
+    ) -> Optional[List[dict]]:
+        """Return up to *limit* blocks in *epoch* starting at *start*.
+
+        Reads each block file directly from disk. Bulk-range reads
+        bypass the per-block LRU so a cold sync can't evict the hot
+        entries used by ``/latest`` and the SSE push path.
+
+        Returns None when the epoch is unknown, an empty list when
+        *start* is past the epoch's last block, or a list of blocks
+        in ascending ``block_index`` order. Missing block files inside
+        the range are silently skipped.
+        """
+        info = self._epoch_info.get(epoch)
+        if info is None:
+            return None
+        first = max(start, info.first_block)
+        last = min(info.last_block, first + limit - 1)
+        if first > last:
+            return []
+        epoch_dir = self._dir / epoch
+        blocks: List[dict] = []
+        for idx in range(first, last + 1):
+            data = self._read_json(epoch_dir / f"{idx}.json")
+            if data is not None:
+                blocks.append(data)
+        return blocks
+
     def get_latest(self) -> Optional[dict]:
         """Return the most recent block telemetry with metadata."""
         if not self._latest_block_data:
