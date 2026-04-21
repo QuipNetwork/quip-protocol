@@ -163,6 +163,9 @@ class RestApiServer:
 
         app = web.Application(middlewares=middlewares)
 
+        # Root index (self-describing API map)
+        app.router.add_get("/", self.handle_index)
+
         # Health check
         app.router.add_get("/health", self.handle_health)
 
@@ -209,8 +212,12 @@ class RestApiServer:
             app.router.add_static("/.well-known", well_known, show_index=False)
             self.logger.info(f"Serving static files from {well_known} at /.well-known/")
 
-        # OPTIONS handler for CORS preflight
-        app.router.add_route("OPTIONS", "/{path:.*}", self.handle_options)
+        # Universal catch-all: serves CORS preflight for unknown paths
+        # and returns 404 JSON (not aiohttp's default 405) for any other
+        # method. A method-specific OPTIONS catch-all would create a
+        # resource that matches every path, making unknown GET/POST
+        # return 405 Method Not Allowed instead of 404 Not Found.
+        app.router.add_route("*", "/{path:.*}", self.handle_not_found)
 
         return app
 
@@ -330,9 +337,75 @@ class RestApiServer:
 
     # Handler implementations
 
-    async def handle_options(self, request: web.Request) -> web.Response:
-        """Handle OPTIONS request for CORS preflight."""
-        return web.Response()
+    def _endpoint_index(self) -> List[dict]:
+        """Build the public endpoint catalog served at GET /.
+
+        Telemetry entries only appear when the cache is configured,
+        matching the conditional registration in _create_app.
+        """
+        entries = [
+            {"method": "GET", "path": "/", "description": "API endpoint index (this response)"},
+            {"method": "GET", "path": "/health", "description": "Liveness check"},
+            {"method": "GET", "path": "/api/v1/status", "description": "Node status, peers count, latest block"},
+            {"method": "GET", "path": "/api/v1/system", "description": "Node hardware survey and whitelisted config"},
+            {"method": "GET", "path": "/api/v1/stats", "description": "Mining and network statistics"},
+            {"method": "GET", "path": "/api/v1/peers", "description": "Known peer map"},
+            {"method": "GET", "path": "/api/v1/block/latest", "description": "Latest accepted block"},
+            {"method": "GET", "path": "/api/v1/block/{block_number}", "description": "Block by index"},
+            {"method": "GET", "path": "/api/v1/block/{block_number}/header", "description": "Block header by index"},
+            {"method": "POST", "path": "/api/v1/join", "description": "Announce this node and fetch peers"},
+            {"method": "POST", "path": "/api/v1/block", "description": "Submit a block (debug)"},
+            {"method": "POST", "path": "/api/v1/gossip", "description": "Forward a gossip message"},
+            {"method": "POST", "path": "/api/v1/solve", "description": "Submit Ising solve request (rate-limited)"},
+            {"method": "POST", "path": "/api/v1/heartbeat", "description": "Peer heartbeat"},
+        ]
+        if self._telemetry_cache is not None:
+            entries.extend([
+                {"method": "GET", "path": "/api/v1/telemetry/status", "description": "Telemetry status snapshot"},
+                {"method": "GET", "path": "/api/v1/telemetry/nodes", "description": "Telemetry node roster"},
+                {"method": "GET", "path": "/api/v1/telemetry/epochs", "description": "Available telemetry epochs"},
+                {"method": "GET", "path": "/api/v1/telemetry/epochs/{epoch}/blocks/{block_index}", "description": "Telemetry block detail"},
+                {"method": "GET", "path": "/api/v1/telemetry/latest", "description": "Latest telemetry block"},
+                {"method": "GET", "path": "/api/v1/telemetry/stream", "description": "Server-sent events stream"},
+            ])
+        return entries
+
+    async def handle_index(self, request: web.Request) -> web.Response:
+        """GET / - Self-describing API index.
+
+        Returns the public endpoint catalog so callers can discover
+        routes without reading source or separate docs.
+        """
+        return self._success_response({
+            "name": "QuIP REST API",
+            "version": get_version(),
+            "response_envelope": {
+                "success": "bool",
+                "data": "object (when success=true)",
+                "error": "string (when success=false)",
+                "code": "string error code (when success=false)",
+                "timestamp": "unix seconds",
+            },
+            "documentation": "docs/rest-api.md",
+            "endpoints": self._endpoint_index(),
+        })
+
+    async def handle_not_found(self, request: web.Request) -> web.Response:
+        """Catch-all for unregistered paths.
+
+        CORS preflight (OPTIONS) must succeed on any path so browsers
+        don't reject subsequent requests. Every other method returns a
+        JSON 404 pointing users at the endpoint index, replacing the
+        misleading 405 that aiohttp emits when a path-only catch-all
+        matches the URL but not the method.
+        """
+        if request.method == "OPTIONS":
+            return web.Response()
+        return self._error_response(
+            "Unknown endpoint. See GET / for the endpoint index.",
+            "NOT_FOUND",
+            404,
+        )
 
     async def handle_health(self, request: web.Request) -> web.Response:
         """GET /health - Health check endpoint."""
