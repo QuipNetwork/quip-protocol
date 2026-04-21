@@ -259,6 +259,10 @@ class TelemetryManager:
             try:
                 with os.fdopen(fd, "w") as f:
                     json.dump(payload, f, indent=2, default=str)
+                # tempfile.mkstemp creates files with mode 0o600; relax to
+                # 0o644 so telemetry JSON is readable by the data-dir owner
+                # (and group) regardless of who the node process runs as.
+                os.chmod(tmp_path, 0o644)
                 os.replace(tmp_path, target)
             except BaseException:
                 # Clean up temp file on any failure

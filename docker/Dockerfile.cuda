@@ -51,12 +51,20 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
-    openssl tini busybox-static \
+    openssl tini busybox-static gosu \
     cuda-cudart-12-9 \
     cuda-nvrtc-12-9 \
     && apt-get install -y --no-install-recommends cuda-mps-12-9 2>/dev/null || true \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/python3 /usr/bin/python
+
+# Non-root runtime user. Matches systemd-linux/quip-network-node.service
+# (User=quip / Group=quip). UID/GID 1000 is the default; entrypoint.sh
+# adjusts to PUID/PGID when set. USER stays root so entrypoint.sh can
+# handle chown, crond install, and certbot before dropping to quip.
+RUN groupadd --system --gid 1000 quip \
+    && useradd --system --uid 1000 --gid 1000 --home /home/quip \
+       --create-home --shell /usr/sbin/nologin quip
 
 WORKDIR /app
 

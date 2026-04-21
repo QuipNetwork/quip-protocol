@@ -6,6 +6,7 @@ Provides persistent storage for blockchain epochs with automatic naming and dire
 
 import json
 import gzip
+import os
 import pickle
 import time
 import tempfile
@@ -154,6 +155,10 @@ def save_epoch_json(chain: List[Block], file_path: Path, compress: bool = True) 
                 tmp_path = tmp_file.name
                 final_path = file_path
         
+        # tempfile.NamedTemporaryFile creates files as 0o600; relax to
+        # 0o644 so epoch files are readable by the data-dir owner.
+        os.chmod(tmp_path, 0o644)
+
         # Atomic move
         shutil.move(tmp_path, final_path)
         
@@ -254,6 +259,10 @@ def save_epoch_pickle(chain: List[Block], file_path: Path, compress: bool = True
                 tmp_path = tmp_file.name
                 final_path = file_path
         
+        # tempfile.NamedTemporaryFile creates files as 0o600; relax to
+        # 0o644 so epoch files are readable by the data-dir owner.
+        os.chmod(tmp_path, 0o644)
+
         # Atomic move
         shutil.move(tmp_path, final_path)
         

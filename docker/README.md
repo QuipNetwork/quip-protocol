@@ -124,6 +124,31 @@ Mount a volume at `/data` to persist:
 
 Edit `config.toml` directly for persistent changes — ENV vars only override when non-empty.
 
+## File Ownership (PUID/PGID)
+
+The node runs inside the container as a non-root `quip` user (UID/GID
+1000 by default), so files written under `/data` are readable by your
+host user without `sudo`. If your host user's UID/GID isn't 1000, set
+`PUID` and `PGID` to match — the entrypoint aligns the in-container
+`quip` user at startup and `chown`s `/data`:
+
+```bash
+docker run -d --name quip-cpu \
+  -v ~/quip-data:/data \
+  -e PUID=$(id -u) -e PGID=$(id -g) \
+  -e QUIP_PUBLIC_HOST=myhost.example.com \
+  -p 20049:20049/udp -p 20049:20049/tcp \
+  registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest
+```
+
+- `PUID=0` keeps the container running as root (legacy mode — preserves
+  backwards compatibility with deployments that rely on root-owned
+  `/data`).
+- The recursive `chown` is skipped when `/data` is already owned by the
+  target UID, so restart is cheap even on volumes with many epoch files.
+- TLS private keys under `/data/certs/private/` stay at mode `0600`
+  after the ownership flip.
+
 ## Building Images
 
 ### Single Architecture

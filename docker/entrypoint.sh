@@ -46,6 +46,55 @@ toml_set() {
     fi
 }
 
+# ── Privilege-drop setup ─────────────────────────────────────────
+# The container starts as root so we can handle chown, crond install,
+# and certbot setup. Just before `exec`ing the node we drop to the
+# `quip` user so files written under /data end up owned by the host
+# user (matches systemd-linux/quip-network-node.service).
+#
+# PUID/PGID let operators align the in-container `quip` user to their
+# host UID/GID without rebuilding the image. Defaults match the image
+# (1000:1000). Setting PUID=0 keeps legacy root-mode for backwards
+# compatibility with existing deployments.
+PUID="${PUID:-1000}"
+PGID="${PGID:-1000}"
+DROP_USER=""
+
+handle_privilege_drop() {
+    if [ "$PUID" = "0" ]; then
+        echo "Privilege drop: PUID=0 — running as root (legacy mode)"
+        DROP_USER=""
+        return
+    fi
+
+    # Align the baked-in `quip` user/group to PUID/PGID if they differ.
+    # Fails loudly on conflict — silent mismatch would reintroduce the bug.
+    local cur_uid cur_gid
+    cur_uid=$(id -u quip)
+    cur_gid=$(id -g quip)
+    [ "$cur_gid" != "$PGID" ] && groupmod -g "$PGID" quip
+    [ "$cur_uid" != "$PUID" ] && usermod  -u "$PUID" -g "$PGID" quip
+
+    # `chown -R` on /data is expensive on volumes with many epoch files.
+    # Skip when the top-level owner already matches the target UID —
+    # that's the steady-state case on restart.
+    local data_uid
+    data_uid=$(stat -c '%u' /data 2>/dev/null || echo "")
+    if [ "$data_uid" != "$PUID" ]; then
+        echo "Privilege drop: chown -R quip:quip /data (was uid=$data_uid)"
+        chown -R quip:quip /data
+    else
+        echo "Privilege drop: /data already owned by uid=$PUID, skipping chown"
+    fi
+
+    # Re-tighten TLS private key after the ownership flip.
+    local key_file="/data/certs/private/privkey.pem"
+    [ -f "$key_file" ] && chmod 600 "$key_file"
+
+    DROP_USER="quip:quip"
+    echo "Privilege drop: will exec as uid=$PUID gid=$PGID"
+}
+
 # ── Helper: resolve a value (ENV overrides TOML) ─────────────────
 # Usage: resolve <env_var_name> <toml_key> [toml_type]
 # Sets the shell variable named by env_var_name. If ENV is set, writes to TOML.
@@ -277,9 +326,17 @@ echo "========================================"
 echo "Starting Quip Network Node..."
 echo "========================================"
 
+# Drop privileges from root to quip (unless PUID=0 legacy mode).
+# Must happen after cert/cron setup, which need root.
+handle_privilege_drop
+
 CMD="quip-network-node --config $CONFIG_FILE"
 echo "Command: $CMD"
 echo "----------------------------------------"
 
 # Execute the network node (replace shell process for proper signal handling)
-exec $CMD
+if [ -n "$DROP_USER" ]; then
+    exec gosu "$DROP_USER" $CMD
+else
+    exec $CMD
+fi

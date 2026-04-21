@@ -42,10 +42,19 @@ LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-prot
 ARG QUIP_DOCKER_IMAGE=""
 ENV QUIP_DOCKER_IMAGE=${QUIP_DOCKER_IMAGE}
 
-# Install runtime dependencies (tini for PID 1, busybox for crond)
+# Install runtime dependencies (tini for PID 1, busybox for crond,
+# gosu for dropping privileges from root to quip in the entrypoint).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    openssl tini busybox-static \
+    openssl tini busybox-static gosu \
     && rm -rf /var/lib/apt/lists/*
+
+# Non-root runtime user. Matches systemd-linux/quip-network-node.service
+# (User=quip / Group=quip). UID/GID 1000 is the default; entrypoint.sh
+# adjusts to PUID/PGID when set. USER stays root so entrypoint.sh can
+# handle chown, crond install, and certbot before dropping to quip.
+RUN groupadd --system --gid 1000 quip \
+    && useradd --system --uid 1000 --gid 1000 --home /home/quip \
+       --create-home --shell /usr/sbin/nologin quip
 
 WORKDIR /app
 
