@@ -76,3 +76,6 @@ benchmarks/
 
 # TLS private keys (certbot output in Docker data volume)
 data/certs/private/
+
+# Node runtime output (local telemetry JSON written by TelemetryManager)
+telemetry/
