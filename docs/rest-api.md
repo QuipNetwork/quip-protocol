@@ -89,7 +89,7 @@ curl -sS http://127.0.0.1:20050/health
 ```
 
 ```json
-{"success": true, "data": {"status": "healthy", "node_running": true, "version": "0.1.5"}, ...}
+{"success": true, "data": {"status": "healthy", "node_running": true, "version": "0.1.6"}, ...}
 ```
 
 ### GET /api/v1/status
