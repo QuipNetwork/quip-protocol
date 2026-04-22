@@ -144,7 +144,23 @@ def build_miner_from_spec(spec: Dict[str, Any]):
         raise ValueError(f"Unknown miner kind '{kind}'")
 
 
-def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any], log_queue: Optional[mp.Queue] = None):
+def miner_worker_main(
+    req_q: mp.Queue,
+    resp_q: mp.Queue,
+    spec: Dict[str, Any],
+    stop_event: mpsync.Event,
+    log_queue: Optional[mp.Queue] = None,
+):
+    """Worker loop.
+
+    ``stop_event`` is shared with the parent MinerHandle. The parent sets
+    it from ``cancel()``; the miner polls it during its inner mining loop
+    and returns None as soon as it fires. Sharing the event across the
+    process boundary is what makes cancellation observable while
+    ``mine_block`` is running — the command queue can't deliver a
+    ``stop_mining`` op until ``mine_block`` returns, which defeats the
+    whole point.
+    """
     # Set up logging for child process
     _setup_child_process_logging(log_queue)
     logger.info(f"Building miner: kind={spec.get('kind')}, id={spec.get('id')}")
@@ -154,7 +170,6 @@ def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any], l
     except Exception as e:
         logger.error(f"Failed to build miner {spec.get('id')}: {e}")
         raise
-    current_stop: mpsync.Event = mp.Event()
 
     while True:
         msg = req_q.get()
@@ -164,13 +179,15 @@ def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any], l
 
         if op == "shutdown":
             logger.info(f"Shutting down miner {miner.miner_id}")
-            current_stop.set()
+            stop_event.set()
             return
         elif op == "get_stats":
             data = miner.get_stats()
             resp_q.put({"op": "stats", "data": data, "id": spec.get("id")})
         elif op == "stop_mining":
-            current_stop.set()
+            # Redundant with the parent's direct set(), but keeps the op
+            # available for callers that only have the request queue.
+            stop_event.set()
         elif op == "mine_block":
             prev_block = msg.get("block")
             requirements = msg.get("requirements")
@@ -179,8 +196,14 @@ def miner_worker_main(req_q: mp.Queue, resp_q: mp.Queue, spec: Dict[str, Any], l
             if prev_block is None or requirements is None or node_info is None or prev_timestamp is None:
                 resp_q.put({"op": "error", "message": "Missing node_info, block or requirements", "id": spec.get("id")})
                 continue
-            current_stop = mp.Event()
-            result = miner.mine_block(prev_block, node_info, requirements, prev_timestamp, current_stop)
+            # NOTE: do not clear stop_event here. The parent clears it
+            # in mine() before enqueueing this op; if cancel() lands in
+            # the gap between that enqueue and our dequeue, the parent
+            # has already set() it and a clear here would silently wipe
+            # the cancel — exactly the original bug. Letting a set
+            # event short-circuit mine_block() is the desired behaviour
+            # (the cancellation reached us before mining started).
+            result = miner.mine_block(prev_block, node_info, requirements, prev_timestamp, stop_event)
             if result is not None:
                 resp_q.put(result)
         else:
@@ -194,9 +217,13 @@ class MinerHandle:
         self.spec = spec
         self.req: mp.Queue = mp.Queue()
         self.resp: mp.Queue = mp.Queue()
+        # Shared with the worker so cancel() can signal the active
+        # mine_block() directly, not via the command queue (which the
+        # worker cannot drain while mining).
+        self.stop_event: mpsync.Event = mp.Event()
         self.proc: mp.Process = mp.Process(
             target=miner_worker_main,
-            args=(self.req, self.resp, spec, log_queue),
+            args=(self.req, self.resp, spec, self.stop_event, log_queue),
         )
 
         self.proc.start()
@@ -227,9 +254,27 @@ class MinerHandle:
         return k.upper()
 
     def mine(self, block, node_info, requirements, prev_timestamp: int = 0):
+        # Sole clear point for the shared cancel signal. The worker
+        # never clears it — clearing on either side of the queue would
+        # race with cancel() and silently wipe the signal (the original
+        # bug this MR fixes). Clearing here, before enqueueing, means
+        # any cancel() called between this clear and the worker
+        # dequeueing the op stays observable: the worker enters
+        # mine_block with stop_event already set and short-circuits.
+        self.stop_event.clear()
         self.req.put({"op": "mine_block", "block": block, "node_info": node_info, "requirements": requirements, "prev_timestamp": prev_timestamp})
 
     def cancel(self):
+        """Cancel the current mining operation.
+
+        Signals the running ``mine_block()`` directly via the shared
+        stop event so the inner loop observes the cancel within one
+        iteration; also enqueues the ``stop_mining`` op so callers
+        operating only on the request queue can still trigger a cancel.
+        Idempotent — safe to call when the worker is idle (the set is a
+        no-op cleared by the next ``mine()``).
+        """
+        self.stop_event.set()
         self.req.put({"op": "stop_mining"})
 
     def get_stats(self) -> dict:

@@ -754,6 +754,15 @@ class Node:
 
         self.logger.info(f"Accepted block {block.header.index}-{block.hash.hex()[:8]} from {block.miner_info.miner_id}")
 
+        # Any accepted block makes our current mining target stale. Tear
+        # down the active attempt so the node can pivot to the new tip
+        # rather than race a solution that consensus has already passed.
+        # By the time WE call receive_block on our own win, mine_block()
+        # has already cleared _is_mining in its finally block, so this
+        # path only fires for peer wins and reorgs.
+        if self._is_mining:
+            asyncio.create_task(self.stop_mining())
+
         # Emit an event so we can stop mining and potentially broadcast to other nodes
         asyncio.create_task(self._emit_block_mined(block))
 
@@ -913,10 +922,14 @@ class Node:
             self.logger.info("Mining interrupted")
             self._mining_stop_event.set()
         finally:
-            # Signal cancellation to all workers if result found
-            if result is not None:
-                for h in handles:
-                    h.cancel()
+            # Always signal cancellation to every worker, regardless of
+            # how we're exiting. If WE won, the other miners must stop
+            # their now-wasted search; if a peer won, stop_mining() set
+            # our event but the workers also need a direct nudge so
+            # their mine_block() observes the cancel within one
+            # iteration.
+            for h in handles:
+                h.cancel()
             # Reset mining state
             self._is_mining = False
             self._mining_stop_event = None

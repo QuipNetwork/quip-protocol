@@ -57,6 +57,7 @@ class DWaveMiner(BaseMiner):
         queue_depth: int = 30,
         solver_name: Optional[str] = None,
         region: Optional[str] = None,
+        drain_on_stop: bool = False,
         **cfg
     ):
         """Initialize D-Wave QPU miner.
@@ -69,6 +70,12 @@ class DWaveMiner(BaseMiner):
             queue_depth: Number of QPU jobs to keep in-flight (default: 30).
             solver_name: Optional solver name (e.g. "Advantage2_system1").
             region: Optional D-Wave region (e.g. "na-east-1").
+            drain_on_stop: When True and stop_event fires, stop submitting
+                new QPU jobs but wait for in-flight ones to complete so
+                their results can be inspected. Used by tests that need
+                to examine partial results. Default False: on stop,
+                abandon pending futures immediately to free the node to
+                start the next block as fast as possible.
         """
         init_logger.info(
             f"[QPU] Initializing DWaveMiner with topology: {topology.solver_name}"
@@ -105,8 +112,13 @@ class DWaveMiner(BaseMiner):
             )
 
         self.queue_depth = queue_depth
+        self.drain_on_stop = drain_on_stop
         self._feeder: Optional[IsingFeeder] = None
         self._stream: Optional[Iterator] = None
+        # Stashed by _pre_mine_setup so the streaming iterator can observe
+        # cancellation during its inner poll loop. Needed because
+        # base_miner's outer stop_event check only fires between batches.
+        self._stop_event: Optional[multiprocessing.synchronize.Event] = None
 
         # Register SIGTERM handler for graceful cleanup
         signal.signal(signal.SIGTERM, self._cleanup_handler)
@@ -144,6 +156,9 @@ class DWaveMiner(BaseMiner):
         **kwargs,
     ) -> bool:
         """Check QPU daily budget and create IsingFeeder."""
+        # Stash the stop_event so sample_ising_streaming can poll it
+        # between QPU completions without plumbing it through every call.
+        self._stop_event = stop_event
         if self.time_manager is not None:
             estimate = self.time_manager.should_mine_block()
             if not estimate.should_mine:
@@ -260,8 +275,59 @@ class DWaveMiner(BaseMiner):
         for _ in range(queue_depth):
             submit_one()
 
+        stop_event = self._stop_event
+
+        def _cancel_pending():
+            """Best-effort abandon of in-flight D-Wave futures on stop.
+
+            D-Wave's remote future cancel is advisory — the solver may
+            have already run — but calling it lets the client release
+            network resources. Locally we drop the pending map, which is
+            what frees the node to move on. Per-future failures are
+            logged at debug level so an SDK that drops the cancel API
+            (or a network blip during teardown) leaves an audit trail
+            without spamming production logs.
+            """
+            for _mdl, fut, _defect, fidx in pending.values():
+                cancel_fn = getattr(fut, "cancel", None)
+                if callable(cancel_fn):
+                    try:
+                        cancel_fn()
+                    except Exception as exc:
+                        self.logger.debug(
+                            f"D-Wave future.cancel() failed for job "
+                            f"{fidx} (best-effort): "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+            pending.clear()
+
+        drain_engaged = False
+
         # Stream: poll for completions, yield, refill
         while pending:
+            # Observe cancellation between polls. Default is discard-on-
+            # stop: abandon pending futures and stop yielding so
+            # base_miner's outer loop can exit promptly. With
+            # drain_on_stop=True (test-only), stop submitting new work
+            # but let in-flight jobs complete so callers can still read
+            # their results.
+            if stop_event is not None and stop_event.is_set():
+                if not self.drain_on_stop:
+                    _cancel_pending()
+                    return
+                if not drain_engaged:
+                    # Suppress submit_one() for the remainder of this
+                    # stream so the pipeline winds down naturally as
+                    # pending empties. One-shot — repeated reassignment
+                    # would just churn lambdas every poll.
+                    self.logger.info(
+                        f"[QPU] drain_on_stop engaged with "
+                        f"{len(pending)} jobs in flight; no new "
+                        f"submissions until stream completes"
+                    )
+                    submit_one = lambda: None  # noqa: E731
+                    drain_engaged = True
+
             completed_id = None
             while completed_id is None:
                 for fid, (_, fut, _, _) in pending.items():
@@ -269,12 +335,17 @@ class DWaveMiner(BaseMiner):
                         completed_id = fid
                         break
                 if completed_id is None:
+                    if stop_event is not None and stop_event.is_set() and not self.drain_on_stop:
+                        _cancel_pending()
+                        return
                     time.sleep(0.02)
 
             model, future, defect_info, _ = pending.pop(completed_id)
             raw_ss = future.sampleset
 
-            # Refill the slot immediately (before any reconstruction)
+            # Refill the slot immediately (before any reconstruction).
+            # In drain mode, submit_one is a no-op so the pipeline winds
+            # down naturally as pending empties.
             submit_one()
 
             if defect_info is not None:
