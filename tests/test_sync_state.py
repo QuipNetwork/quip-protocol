@@ -240,3 +240,88 @@ async def test_no_auto_mine_raises_with_no_peers():
 
     with pytest.raises(RuntimeError, match="No peers to synchronize with"):
         await node.check_synchronized()
+
+
+# ---------------------------------------------------------------------------
+# Equal-height fork handling (regression against the degenerate case where
+# check_synchronized triggered a no-op sync for blocks we already held).
+# ---------------------------------------------------------------------------
+
+def _setup_peer_query_node(my_index: int, my_prev_hash: bytes, my_timestamp: int):
+    """Build a node with one compatible peer, ready for a header-query check."""
+    from shared.version import get_version
+
+    node = _make_network_node(auto_mine=True)
+    node._has_ever_had_peers = True
+    node.peers = {"peer1:20049": MagicMock()}
+    node.peer_versions = {"peer1:20049": get_version()}
+    node.max_sync_block_index = 1_000_000
+
+    node.get_latest_block.return_value = MagicMock(header=MagicMock(
+        index=my_index,
+        previous_hash=my_prev_hash,
+        timestamp=my_timestamp,
+    ))
+    return node
+
+
+@pytest.mark.asyncio
+async def test_check_synchronized_equal_height_same_hash():
+    """Equal heights with matching prev_hash → synchronized, no sync."""
+    node = _setup_peer_query_node(183, b"\xaa" * 32, 1000)
+    peer_header = MagicMock(index=183, previous_hash=b"\xaa" * 32, timestamp=999)
+    node.get_peer_block_header = AsyncMock(return_value=peer_header)
+
+    result = await node.check_synchronized()
+
+    assert result == 0
+    assert node.synchronized is True
+    node.logger.warning.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_check_synchronized_equal_height_different_hash():
+    """Equal heights with diverging prev_hash must NOT trigger sync.
+
+    Pre-fix behaviour: logged WARNING and returned peer.index, forcing a
+    no-op sync round-trip through BlockSynchronizer (which skips equal
+    heights). Post-fix: marks synchronized, logs INFO, returns 0.
+    """
+    node = _setup_peer_query_node(183, b"\xaa" * 32, 1000)
+    peer_header = MagicMock(index=183, previous_hash=b"\xbb" * 32, timestamp=1001)
+    node.get_peer_block_header = AsyncMock(return_value=peer_header)
+
+    result = await node.check_synchronized()
+
+    assert result == 0
+    assert node.synchronized is True
+    node.logger.warning.assert_not_called()
+    node.logger.info.assert_called()
+    info_msg = node.logger.info.call_args[0][0]
+    assert "prev_hash mismatch" in info_msg
+    assert "183" in info_msg
+
+
+@pytest.mark.asyncio
+async def test_check_synchronized_peer_ahead():
+    """Peer at index N+1 while local at N → returns N+1 to trigger sync."""
+    node = _setup_peer_query_node(183, b"\xaa" * 32, 1000)
+    peer_header = MagicMock(index=184, previous_hash=b"\xcc" * 32, timestamp=1001)
+    node.get_peer_block_header = AsyncMock(return_value=peer_header)
+
+    result = await node.check_synchronized()
+
+    assert result == 184
+
+
+@pytest.mark.asyncio
+async def test_check_synchronized_we_are_ahead():
+    """Peer at index N-1 while local at N → returns 0, synchronized."""
+    node = _setup_peer_query_node(183, b"\xaa" * 32, 1000)
+    peer_header = MagicMock(index=182, previous_hash=b"\xaa" * 32, timestamp=999)
+    node.get_peer_block_header = AsyncMock(return_value=peer_header)
+
+    result = await node.check_synchronized()
+
+    assert result == 0
+    assert node.synchronized is True
