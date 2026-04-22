@@ -1495,6 +1495,15 @@ class NetworkNode(Node):
                 # No event loop running, skip reset timer
                 self.logger.warning("No event loop running, cannot schedule reset timer")
         
+        # Give the telemetry a chance to detect the epoch key from block
+        # 1 before recording. Needed for nodes that only see block 1 via
+        # sync (not via record_block), which would otherwise leave
+        # _epoch_timestamp=None forever and route every record_block()
+        # to telemetry/genesis/ — a directory TelemetryCache filters out,
+        # making latest_block_index appear permanently stuck. The call
+        # early-returns once the timestamp is set, so the cost after the
+        # first successful detection is a single attribute check.
+        self.telemetry.sync_epoch_from_chain(self.chain)
         # Record block telemetry
         self.telemetry.record_block(block)
 
@@ -1709,8 +1718,25 @@ class NetworkNode(Node):
             raise ValueError("Failed to finalize block")
 
         self.logger.info(f"Candidate Block {wb.header.index}-{wb.hash.hex()[:8]} mined on this node!")
-    
-        if wb.header.index == self.get_latest_block().header.index + 1:
+
+        # Drop the block if the chain tip moved out from under us while we
+        # were finishing. Using the previous-block hash (not just index)
+        # also catches reorgs where the height is unchanged but the tip
+        # is a different block. This check is the last line of defence —
+        # the main savings come from stopping mining when a peer wins
+        # (see Node.receive_block). Anything that still reaches here was
+        # already in flight when the peer landed.
+        current_tip = self.get_latest_block()
+        if previous_block.hash is not None and current_tip.hash is not None:
+            tip_is_unchanged = current_tip.hash == previous_block.hash
+        else:
+            # Hashes missing — fall back to index comparison. Covers the
+            # bootstrap edge case where an unhashed genesis seeds the
+            # chain before any block has been finalized.
+            tip_is_unchanged = (
+                current_tip.header.index == previous_block.header.index
+            )
+        if tip_is_unchanged:
             accepted, reason = await self.receive_block(wb)
             if accepted:
                 self.logger.info(f"Accepted block {wb.header.index}-{wb.hash.hex()[:8]} from {wb.miner_info.miner_id}")
@@ -1718,7 +1744,12 @@ class NetworkNode(Node):
             else:
                 self.logger.warning(f"Own block {wb.header.index}-{wb.hash.hex()[:8]} was rejected: {reason}")
         else:
-            self.logger.info(f"Candidate Block {wb.header.index}-{wb.hash.hex()[:8]} sniped by another miner!")
+            peer_tip = current_tip.hash.hex()[:8] if current_tip.hash else "?"
+            self.logger.info(
+                f"Candidate Block {wb.header.index}-{wb.hash.hex()[:8]} "
+                f"sniped by another miner (tip moved to {peer_tip}); "
+                f"dropping without gossip"
+            )
 
         return result
 

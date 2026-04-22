@@ -57,6 +57,7 @@ def miner_service_main(
     result_queue: mp.Queue,
     spec: Dict[str, Any],
     stop_event: mpsync.Event,
+    cancel_event: mpsync.Event,
 ) -> None:
     """Miner service process entry point.
 
@@ -67,7 +68,11 @@ def miner_service_main(
         cmd_queue: Commands from parent (mine, stop, status, shutdown).
         result_queue: Results sent back to parent.
         spec: Miner spec dict (kind, id, cfg, args).
-        stop_event: Shared event for cooperative shutdown.
+        stop_event: Shared event for cooperative shutdown of the whole service.
+        cancel_event: Shared event for cancelling the *current* mine_block.
+            The parent sets this from ``cancel()``; the mining loop polls
+            it and returns None as soon as it fires. Distinct from
+            stop_event so that a cancel doesn't tear down the service.
     """
     miner_id = spec.get("id", "unknown")
     log = _setup_service_logging(miner_id)
@@ -95,7 +100,7 @@ def miner_service_main(
         })
         return
 
-    ctx = _MinerContext(miner, miner_id, spec, result_queue, log)
+    ctx = _MinerContext(miner, miner_id, spec, result_queue, log, cancel_event)
 
     while not stop_event.is_set():
         try:
@@ -119,13 +124,16 @@ def miner_service_main(
 class _MinerContext:
     """Command dispatch state for the miner service loop."""
 
-    def __init__(self, miner, miner_id, spec, result_queue, log):
+    def __init__(self, miner, miner_id, spec, result_queue, log, mining_stop):
         self.miner = miner
         self.miner_id = miner_id
         self.spec = spec
         self.result_queue = result_queue
         self.log = log
-        self.mining_stop = mp.Event()
+        # Shared with the parent: cancel() sets this from outside, the
+        # mining loop reads it from inside. Do not replace with a fresh
+        # Event per attempt — the parent's reference would go stale.
+        self.mining_stop = mining_stop
         self.is_mining = False
 
     def dispatch(self, msg: dict) -> None:
@@ -168,7 +176,10 @@ class _MinerContext:
             })
             return
 
-        self.mining_stop = mp.Event()
+        # Clear any leftover cancel from a prior attempt. The shared
+        # event stays the same object so parent cancel() calls still
+        # reach us.
+        self.mining_stop.clear()
         self.is_mining = True
 
         try:
@@ -218,11 +229,14 @@ class MinerServiceHandle:
         self.cmd_queue: mp.Queue = mp.Queue()
         self.result_queue: mp.Queue = mp.Queue()
         self._stop_event: mpsync.Event = mp.Event()
+        # Shared with the service process so cancel() can signal an
+        # in-progress mine_block() without going through the cmd queue.
+        self._cancel_event: mpsync.Event = mp.Event()
         self.proc: mp.Process = mp.Process(
             target=miner_service_main,
             args=(
                 self.cmd_queue, self.result_queue,
-                spec, self._stop_event,
+                spec, self._stop_event, self._cancel_event,
             ),
             daemon=True,
         )
@@ -251,6 +265,9 @@ class MinerServiceHandle:
 
     def mine(self, block, node_info, requirements, prev_timestamp: int = 0):
         """Submit a mining job. Non-blocking."""
+        # Clear any leftover cancel before queueing new work so the
+        # service's upcoming _handle_mine doesn't see a stale signal.
+        self._cancel_event.clear()
         self.cmd_queue.put({
             "cmd": "mine",
             "block": block,
@@ -260,7 +277,14 @@ class MinerServiceHandle:
         })
 
     def cancel(self):
-        """Cancel current mining operation."""
+        """Cancel current mining operation.
+
+        Signals the running mine_block() directly via the shared
+        cancel event; also enqueues the "stop" command so the service
+        loop emits the ``{"event": "stopped"}`` acknowledgement once
+        the miner returns.
+        """
+        self._cancel_event.set()
         self.cmd_queue.put({"cmd": "stop"})
 
     def get_stats(self) -> dict:
