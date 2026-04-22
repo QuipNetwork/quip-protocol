@@ -1843,20 +1843,17 @@ class NetworkNode(Node):
             self.logger.warning("Unable to get block headers from peers, assuming synchronized")
             return 0
 
-        if my_latest_block.header.index > net_latest.index:
+        # Equal-height: BlockSynchronizer only fetches strictly longer chains,
+        # so any equal-height fork must be resolved by chain extension, not sync.
+        if my_latest_block.header.index >= net_latest.index:
+            if my_latest_block.header.index == net_latest.index \
+                    and my_latest_block.header.previous_hash != net_latest.previous_hash:
+                self.logger.info(
+                    f"Peer tip differs at equal height {net_latest.index} "
+                    f"(prev_hash mismatch); continuing on local fork"
+                )
             self.set_synchronized()
             return 0
-
-        if my_latest_block.header.index == net_latest.index:
-            # FIXME: maybe put hash in header?
-            # Our prev_hashes match and our timestamps match and my timestamp is older or equal, I am good.
-            if my_latest_block.header.previous_hash == net_latest.previous_hash and my_latest_block.header.timestamp <= net_latest.timestamp:
-                self.set_synchronized()
-                return 0
-            else:
-                self.logger.warning(f"Fork detected at block {my_latest_block.header.index} - our prev_hash differs from network, triggering reorg sync")
-                # Return non-zero to trigger synchronization - longest chain wins
-                return net_latest.index
 
         return net_latest.index
 
