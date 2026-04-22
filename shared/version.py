@@ -39,7 +39,7 @@ def get_version() -> str:
             __version__ = importlib.metadata.version("quip-protocol")
         except importlib.metadata.PackageNotFoundError:
             # Fallback to development version
-            __version__ = "0.1.8"
+            __version__ = "0.1.9"
 
     return __version__
 
