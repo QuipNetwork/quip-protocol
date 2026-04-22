@@ -59,12 +59,18 @@ def _populate_telemetry(base_dir):
     tdir = os.path.join(base_dir, "telemetry")
     os.makedirs(tdir, exist_ok=True)
     _write_json(os.path.join(tdir, "nodes.json"), _make_nodes_json())
-    epoch = "1775167182"
+    epoch = "abababababababab"
+    full_block_1_hash = "ab" * 32
     for i in range(1, 4):
         _write_json(
             os.path.join(tdir, epoch, f"{i}.json"),
-            _make_block_json(i, int(epoch)),
+            _make_block_json(i, 1775167182),
         )
+    _write_json(os.path.join(tdir, "current_epoch.json"), {
+        "epoch": epoch,
+        "block_1_hash": full_block_1_hash,
+        "updated_at": "2026-04-02T23:31:53.610902+00:00",
+    })
     return tdir
 
 
@@ -128,7 +134,7 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
         body = await resp.json()
         assert body["success"] is True
         assert body["data"]["total_blocks"] == 3
-        assert body["data"]["latest_epoch"] == "1775167182"
+        assert body["data"]["latest_epoch"] == "abababababababab"
 
     async def test_status_etag_304(self):
         resp1 = await self.client.request("GET", "/api/v1/telemetry/status")
@@ -166,7 +172,7 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
 
     async def test_block(self):
         resp = await self.client.request(
-            "GET", "/api/v1/telemetry/epochs/1775167182/blocks/1",
+            "GET", "/api/v1/telemetry/epochs/abababababababab/blocks/1",
         )
         assert resp.status == 200
         body = await resp.json()
@@ -174,7 +180,7 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
 
     async def test_block_not_found(self):
         resp = await self.client.request(
-            "GET", "/api/v1/telemetry/epochs/1775167182/blocks/99",
+            "GET", "/api/v1/telemetry/epochs/abababababababab/blocks/99",
         )
         assert resp.status == 404
 
@@ -186,11 +192,11 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
 
     async def test_block_etag_304(self):
         resp1 = await self.client.request(
-            "GET", "/api/v1/telemetry/epochs/1775167182/blocks/1",
+            "GET", "/api/v1/telemetry/epochs/abababababababab/blocks/1",
         )
         etag = resp1.headers.get("ETag")
         resp2 = await self.client.request(
-            "GET", "/api/v1/telemetry/epochs/1775167182/blocks/1",
+            "GET", "/api/v1/telemetry/epochs/abababababababab/blocks/1",
             headers={"If-None-Match": etag},
         )
         assert resp2.status == 304
@@ -200,7 +206,7 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
         assert resp.status == 200
         body = await resp.json()
         assert body["data"]["block_index"] == 3
-        assert body["data"]["epoch"] == "1775167182"
+        assert body["data"]["epoch"] == "abababababababab"
 
     async def test_non_telemetry_unaffected(self):
         resp = await self.client.request("GET", "/health")
@@ -208,12 +214,12 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
 
     async def test_blocks_range_default(self):
         resp = await self.client.request(
-            "GET", "/api/v1/telemetry/epochs/1775167182/blocks",
+            "GET", "/api/v1/telemetry/epochs/abababababababab/blocks",
         )
         assert resp.status == 200
         body = await resp.json()
         data = body["data"]
-        assert data["epoch"] == "1775167182"
+        assert data["epoch"] == "abababababababab"
         assert data["start"] == 1
         assert data["count"] == 3
         assert data["next_start"] is None
@@ -224,7 +230,7 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
     async def test_blocks_range_with_limit(self):
         resp = await self.client.request(
             "GET",
-            "/api/v1/telemetry/epochs/1775167182/blocks?start=1&limit=2",
+            "/api/v1/telemetry/epochs/abababababababab/blocks?start=1&limit=2",
         )
         assert resp.status == 200
         data = (await resp.json())["data"]
@@ -236,7 +242,7 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
     async def test_blocks_range_pagination_end(self):
         resp = await self.client.request(
             "GET",
-            "/api/v1/telemetry/epochs/1775167182/blocks?start=3&limit=1000",
+            "/api/v1/telemetry/epochs/abababababababab/blocks?start=3&limit=1000",
         )
         data = (await resp.json())["data"]
         assert data["count"] == 1
@@ -247,7 +253,7 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
         # either 400 or clamp up. We chose: negative = 400, zero = 400.
         resp = await self.client.request(
             "GET",
-            "/api/v1/telemetry/epochs/1775167182/blocks?start=0",
+            "/api/v1/telemetry/epochs/abababababababab/blocks?start=0",
         )
         assert resp.status == 400
         body = await resp.json()
@@ -256,7 +262,7 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
     async def test_blocks_range_negative_start(self):
         resp = await self.client.request(
             "GET",
-            "/api/v1/telemetry/epochs/1775167182/blocks?start=-5",
+            "/api/v1/telemetry/epochs/abababababababab/blocks?start=-5",
         )
         assert resp.status == 400
         assert (await resp.json())["code"] == "INVALID_RANGE"
@@ -264,7 +270,7 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
     async def test_blocks_range_non_numeric(self):
         resp = await self.client.request(
             "GET",
-            "/api/v1/telemetry/epochs/1775167182/blocks?start=abc",
+            "/api/v1/telemetry/epochs/abababababababab/blocks?start=abc",
         )
         assert resp.status == 400
         assert (await resp.json())["code"] == "INVALID_RANGE"
@@ -272,7 +278,7 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
     async def test_blocks_range_limit_capped(self):
         resp = await self.client.request(
             "GET",
-            "/api/v1/telemetry/epochs/1775167182/blocks?start=1&limit=5000",
+            "/api/v1/telemetry/epochs/abababababababab/blocks?start=1&limit=5000",
         )
         assert resp.status == 200
         data = (await resp.json())["data"]
@@ -290,7 +296,7 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
     async def test_blocks_range_past_end(self):
         resp = await self.client.request(
             "GET",
-            "/api/v1/telemetry/epochs/1775167182/blocks?start=999&limit=10",
+            "/api/v1/telemetry/epochs/abababababababab/blocks?start=999&limit=10",
         )
         assert resp.status == 200
         data = (await resp.json())["data"]

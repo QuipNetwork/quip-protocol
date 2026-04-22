@@ -195,21 +195,40 @@ class TestNodeTelemetry:
 # Tests – block telemetry
 # ---------------------------------------------------------------------------
 
+def _hash(byte: int) -> bytes:
+    """Build a 32-byte hash filled with *byte* — stable/predictable in tests."""
+    return bytes([byte]) * 32
+
+
+def _make_block_with_hash(index, timestamp, block_hash):
+    block = _make_block(index=index, timestamp=timestamp)
+    block.hash = block_hash
+    return block
+
+
 class TestBlockTelemetry:
-    def test_record_block_creates_epoch_dir(self, tmp_path):
+    def test_record_block_uses_block_hash_for_dir_name(self, tmp_path):
+        """Epoch dir name = first 16 hex chars of block 1's hash.
+
+        Content-addressed keying so the dashboard can match the dir to a
+        specific chain instance, not a node-local observation (timestamp).
+        """
         tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
-        block = _make_block(index=1, timestamp=1700000001)
-        tm.record_block(block)
-        assert (tmp_path / "tel" / "1700000001" / "1.json").exists()
+        h = _hash(0xAB)  # hex() -> "abab..."
+        tm.record_block(_make_block_with_hash(1, 1700000001, h))
+
+        expected_dir = h.hex()[:16]  # "abababababababab"
+        assert (tmp_path / "tel" / expected_dir / "1.json").exists()
 
     def test_record_block_writes_json_fields(self, tmp_path):
         tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
-        block = _make_block(index=1, timestamp=1700000001)
-        tm.record_block(block)
+        h = _hash(0xAB)
+        tm.record_block(_make_block_with_hash(1, 1700000001, h))
 
-        data = json.loads((tmp_path / "tel" / "1700000001" / "1.json").read_text())
+        epoch_dir = h.hex()[:16]
+        data = json.loads((tmp_path / "tel" / epoch_dir / "1.json").read_text())
         assert data["block_index"] == 1
-        assert data["block_hash"] == (b"\xff" * 32).hex()
+        assert data["block_hash"] == h.hex()
         assert data["miner"]["miner_id"] == "node1-CPU-0"
         assert data["quantum_proof"]["energy"] == -3950.0
         assert data["quantum_proof"]["mining_time"] == 12.5
@@ -217,40 +236,187 @@ class TestBlockTelemetry:
         assert data["requirements"]["difficulty_energy"] == -4100.0
 
     def test_genesis_dir_before_block_1(self, tmp_path):
+        """Blocks recorded before block 1 is seen land in telemetry/genesis/."""
         tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
-        block = _make_block(index=0, timestamp=1700000000)
-        tm.record_block(block)
+        tm.record_block(_make_block(index=0, timestamp=1700000000))
         assert (tmp_path / "tel" / "genesis" / "0.json").exists()
 
     def test_epoch_set_on_block_1(self, tmp_path):
         tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
-        tm.record_block(_make_block(index=1, timestamp=1700000001))
-        assert tm._epoch_timestamp == 1700000001
-        # Subsequent blocks use same epoch dir
-        tm.record_block(_make_block(index=2, timestamp=1700000050))
-        assert (tmp_path / "tel" / "1700000001" / "2.json").exists()
+        h = _hash(0xCD)
+        tm.record_block(_make_block_with_hash(1, 1700000001, h))
+        assert tm._block_1_hash == h
+        # Subsequent blocks use same epoch dir (derived from block 1's hash)
+        tm.record_block(_make_block_with_hash(2, 1700000050, _hash(0x99)))
+        assert (tmp_path / "tel" / h.hex()[:16] / "2.json").exists()
 
-    def test_epoch_reset_creates_new_dir(self, tmp_path):
+    def test_reset_epoch_clears_block_1_hash(self, tmp_path):
+        """reset_epoch() clears internal state so the next block 1 re-keys."""
         tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
-        tm.record_block(_make_block(index=1, timestamp=1700000001))
-        tm.set_epoch_timestamp(None)
-        tm.record_block(_make_block(index=1, timestamp=1700099999))
+        h_a = _hash(0x01)
+        h_b = _hash(0x02)
+        tm.record_block(_make_block_with_hash(1, 1700000001, h_a))
+        tm.reset_epoch()
+        tm.record_block(_make_block_with_hash(1, 1700099999, h_b))
 
-        assert (tmp_path / "tel" / "1700000001" / "1.json").exists()
-        assert (tmp_path / "tel" / "1700099999" / "1.json").exists()
+        assert (tmp_path / "tel" / h_a.hex()[:16] / "1.json").exists()
+        assert (tmp_path / "tel" / h_b.hex()[:16] / "1.json").exists()
+
+    def test_record_block_writes_current_epoch_marker(self, tmp_path):
+        """Atomic marker file names the live epoch dir for the cache."""
+        tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
+        h = _hash(0xEF)
+        tm.record_block(_make_block_with_hash(1, 1700000001, h))
+
+        marker = tmp_path / "tel" / "current_epoch.json"
+        assert marker.is_file()
+        data = json.loads(marker.read_text())
+        assert data["epoch"] == h.hex()[:16]
+        assert data["block_1_hash"] == h.hex()
+        assert "updated_at" in data
+
+    def test_current_epoch_marker_updates_on_rekey(self, tmp_path):
+        """Reorg at block 1 re-keys: marker must follow the new hash.
+
+        The cache labels dirs live/stale against this marker, so it must
+        track the current canonical chain's block 1 — not the first one
+        ever seen by the node.
+        """
+        tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
+        h_a = _hash(0xAA)
+        h_b = _hash(0xBB)
+
+        tm.record_block(_make_block_with_hash(1, 1700000001, h_a))
+        tm.reset_epoch()
+        tm.record_block(_make_block_with_hash(1, 1700000001, h_b))
+
+        data = json.loads((tmp_path / "tel" / "current_epoch.json").read_text())
+        assert data["epoch"] == h_b.hex()[:16]
+        assert data["block_1_hash"] == h_b.hex()
 
     def test_sync_epoch_from_chain(self, tmp_path):
         tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
-        chain = [_make_block(index=0, timestamp=1700000000),
-                 _make_block(index=1, timestamp=1700000001)]
+        h = _hash(0x11)
+        chain = [
+            _make_block_with_hash(0, 1700000000, _hash(0x00)),
+            _make_block_with_hash(1, 1700000001, h),
+        ]
         tm.sync_epoch_from_chain(chain)
-        assert tm._epoch_timestamp == 1700000001
+        assert tm._block_1_hash == h
 
-    def test_sync_epoch_noop_if_already_set(self, tmp_path):
+    def test_sync_epoch_rekeys_on_block_1_hash_change(self, tmp_path):
+        """If block 1's hash changes (reorg-at-height-1), re-key.
+
+        Follows the canonical chain. Stale dir from the previous block 1
+        remains on disk; the cache marks it stale_fork using the marker.
+        """
         tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
-        tm.set_epoch_timestamp(9999)
-        tm.sync_epoch_from_chain([_make_block(index=1, timestamp=1111)])
-        assert tm._epoch_timestamp == 9999
+        h_a = _hash(0x11)
+        h_b = _hash(0x22)
+
+        tm.sync_epoch_from_chain([_make_block_with_hash(1, 1, h_a)])
+        assert tm._block_1_hash == h_a
+
+        tm.sync_epoch_from_chain([_make_block_with_hash(1, 1, h_b)])
+        assert tm._block_1_hash == h_b
+
+
+# ---------------------------------------------------------------------------
+# Tests – legacy dir migration
+# ---------------------------------------------------------------------------
+
+
+def _write_legacy_block(path, index, block_hash_hex):
+    """Write a legacy-format telemetry block JSON to ``path``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "block_index": index,
+        "block_hash": block_hash_hex,
+        "timestamp": 1_700_000_000 + index,
+        "miner": {"miner_id": "legacy"},
+    }))
+
+
+class TestMigrateLegacyDirs:
+    """Tests for TelemetryManager.migrate_legacy_dirs."""
+
+    def test_renames_timestamp_dir_to_hash_prefix(self, tmp_path):
+        """A timestamp-named dir with a valid block 1 is renamed in place."""
+        tel = tmp_path / "tel"
+        block_1_hash = (b"\xAB" * 32).hex()
+        _write_legacy_block(tel / "1700000001" / "1.json", 1, block_1_hash)
+        _write_legacy_block(tel / "1700000001" / "2.json", 2, "ff" * 32)
+
+        tm = TelemetryManager(str(tel), enabled=True)
+        result = tm.migrate_legacy_dirs()
+
+        new_name = block_1_hash[:16]
+        assert (tel / new_name / "1.json").is_file()
+        assert (tel / new_name / "2.json").is_file()
+        assert not (tel / "1700000001").exists()
+        assert (("1700000001", new_name)) in result["migrated"]
+
+    def test_idempotent_already_migrated(self, tmp_path):
+        """A dir whose name is already 16-hex is left alone."""
+        tel = tmp_path / "tel"
+        hex_name = "abababababababab"
+        _write_legacy_block(tel / hex_name / "1.json", 1, "ab" * 32)
+
+        tm = TelemetryManager(str(tel), enabled=True)
+        result = tm.migrate_legacy_dirs()
+
+        assert (tel / hex_name / "1.json").is_file()
+        assert result["migrated"] == []
+
+    def test_skips_genesis_dir(self, tmp_path):
+        """The genesis dir (pre-block-1 staging) is never migrated."""
+        tel = tmp_path / "tel"
+        _write_legacy_block(tel / "genesis" / "0.json", 0, "00" * 32)
+
+        tm = TelemetryManager(str(tel), enabled=True)
+        result = tm.migrate_legacy_dirs()
+
+        assert (tel / "genesis" / "0.json").is_file()
+        assert result["migrated"] == []
+
+    def test_skips_dir_without_block_1(self, tmp_path):
+        """If 1.json is missing we can't compute the new name — skip."""
+        tel = tmp_path / "tel"
+        _write_legacy_block(tel / "1700000001" / "2.json", 2, "ff" * 32)
+
+        tm = TelemetryManager(str(tel), enabled=True)
+        result = tm.migrate_legacy_dirs()
+
+        assert (tel / "1700000001" / "2.json").is_file()
+        assert result["migrated"] == []
+        assert any("1700000001" in s[0] for s in result["skipped"])
+
+    def test_skips_when_target_already_exists(self, tmp_path):
+        """If the hash-named target already exists, keep both; don't clobber."""
+        tel = tmp_path / "tel"
+        block_1_hash = (b"\xAB" * 32).hex()
+        new_name = block_1_hash[:16]
+
+        _write_legacy_block(tel / "1700000001" / "1.json", 1, block_1_hash)
+        _write_legacy_block(tel / new_name / "1.json", 1, block_1_hash)
+
+        tm = TelemetryManager(str(tel), enabled=True)
+        result = tm.migrate_legacy_dirs()
+
+        assert (tel / "1700000001" / "1.json").is_file()
+        assert (tel / new_name / "1.json").is_file()
+        assert result["migrated"] == []
+
+    def test_disabled_is_noop(self, tmp_path):
+        """With telemetry disabled, migration does nothing."""
+        tel = tmp_path / "tel"
+        _write_legacy_block(tel / "1700000001" / "1.json", 1, "ab" * 32)
+
+        tm = TelemetryManager(str(tel), enabled=False)
+        result = tm.migrate_legacy_dirs()
+
+        assert (tel / "1700000001").exists()
+        assert result == {"migrated": [], "skipped": []}
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,11 @@
 Read-only cache of telemetry directory contents.
 
 Periodically scans the telemetry directory written by TelemetryManager
-and serves cached data to REST and QUIC telemetry endpoints.
+and serves cached data to REST and QUIC telemetry endpoints. Epoch
+directories are hex-keyed (first 16 chars of block 1's hash) and
+``current_epoch.json`` at the top level names the live epoch so stale
+fork directories can be surfaced as ``status: stale_fork`` instead of
+polluting the dashboard's ``latest_epoch`` view.
 
 SPDX-License-Identifier: AGPL-3.0-or-later
 """
@@ -16,6 +20,15 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 
+EPOCH_KEY_LEN = 16
+_HEX_CHARS = frozenset("0123456789abcdef")
+
+
+def _is_epoch_hex(name: str) -> bool:
+    """Return True if *name* is a valid hex-encoded epoch dir name."""
+    return len(name) == EPOCH_KEY_LEN and all(c in _HEX_CHARS for c in name)
+
+
 @dataclass
 class EpochInfo:
     """Cached metadata for one epoch directory."""
@@ -24,6 +37,7 @@ class EpochInfo:
     block_count: int = 0
     first_block: int = 0
     last_block: int = 0
+    status: str = "stale_fork"  # overwritten to 'live' if marker matches
 
 
 class TelemetryCache:
@@ -58,6 +72,7 @@ class TelemetryCache:
         self._nodes_data: Optional[dict] = None
         self._nodes_mtime: float = 0.0
         self._latest_block_data: Optional[dict] = None
+        self._live_epoch: str = ""  # from current_epoch.json; "" if no marker
 
         # Block LRU cache: (epoch, block_index) -> parsed JSON
         self._block_cache: Dict[tuple, dict] = {}
@@ -109,7 +124,16 @@ class TelemetryCache:
             return
 
         self._refresh_nodes()
+        self._refresh_live_epoch()
         self._refresh_epochs()
+
+    def _refresh_live_epoch(self) -> None:
+        """Read current_epoch.json to learn which epoch dir is live."""
+        marker = self._read_json(self._dir / "current_epoch.json")
+        if marker and isinstance(marker.get("epoch"), str):
+            self._live_epoch = marker["epoch"]
+        else:
+            self._live_epoch = ""
 
     def _refresh_nodes(self) -> None:
         """Re-read nodes.json if its mtime changed."""
@@ -135,7 +159,7 @@ class TelemetryCache:
             self.on_nodes_changed(self._nodes_data)
 
     def _refresh_epochs(self) -> None:
-        """Scan epoch directories and detect new blocks."""
+        """Scan epoch directories, label live vs stale, and detect new blocks."""
         epochs: List[str] = []
         epoch_info: Dict[str, EpochInfo] = {}
         total_blocks = 0
@@ -147,20 +171,22 @@ class TelemetryCache:
 
         for entry in entries:
             entry_path = self._dir / entry
-            if not entry_path.is_dir() or not entry.isdigit():
+            if not entry_path.is_dir() or not _is_epoch_hex(entry):
                 continue
             epochs.append(entry)
 
             block_indices = self._list_block_indices(entry_path)
+            status = "live" if entry == self._live_epoch else "stale_fork"
             if block_indices:
                 info = EpochInfo(
                     epoch=entry,
                     block_count=len(block_indices),
                     first_block=min(block_indices),
                     last_block=max(block_indices),
+                    status=status,
                 )
             else:
-                info = EpochInfo(epoch=entry)
+                info = EpochInfo(epoch=entry, status=status)
             epoch_info[entry] = info
             total_blocks += info.block_count
 
@@ -169,19 +195,19 @@ class TelemetryCache:
         self._epoch_info = epoch_info
         self._total_blocks = total_blocks
 
-        # Determine latest block
+        # Latest tracking follows the marker, not max(dir_names). Fork
+        # directories are explicitly excluded from the "latest" view.
         prev_epoch = self._latest_epoch
         prev_index = self._latest_block_index
 
-        if epochs:
-            latest_ep = epochs[-1]
-            self._latest_epoch = latest_ep
-            self._latest_block_index = epoch_info[latest_ep].last_block
+        live_info = epoch_info.get(self._live_epoch) if self._live_epoch else None
+        if live_info is not None:
+            self._latest_epoch = live_info.epoch
+            self._latest_block_index = live_info.last_block
         else:
             self._latest_epoch = ""
             self._latest_block_index = 0
 
-        # Detect new block
         is_new = (
             self._latest_epoch != prev_epoch
             or self._latest_block_index != prev_index
@@ -241,13 +267,14 @@ class TelemetryCache:
         return self._nodes_data
 
     def get_epochs(self) -> List[dict]:
-        """Return epoch listing with block counts."""
+        """Return epoch listing with block counts and live/stale_fork status."""
         return [
             {
                 "epoch": info.epoch,
                 "block_count": info.block_count,
                 "first_block": info.first_block,
                 "last_block": info.last_block,
+                "status": info.status,
             }
             for info in (self._epoch_info.get(e) for e in self._epochs)
             if info is not None

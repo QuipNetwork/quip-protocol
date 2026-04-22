@@ -749,6 +749,9 @@ class NetworkNode(Node):
         self.telemetry._periodic_task = asyncio.create_task(
             self.telemetry.start_periodic_log(interval=600.0)
         )
+        # Rename any pre-hash (timestamp-keyed) telemetry dirs inherited
+        # from older node versions before the cache scans them. Idempotent.
+        self.telemetry.migrate_legacy_dirs()
         self.telemetry.sync_epoch_from_chain(self.chain)
 
     @property
@@ -1495,16 +1498,15 @@ class NetworkNode(Node):
                 # No event loop running, skip reset timer
                 self.logger.warning("No event loop running, cannot schedule reset timer")
         
-        # Give the telemetry a chance to detect the epoch key from block
-        # 1 before recording. Needed for nodes that only see block 1 via
-        # sync (not via record_block), which would otherwise leave
-        # _epoch_timestamp=None forever and route every record_block()
-        # to telemetry/genesis/ — a directory TelemetryCache filters out,
-        # making latest_block_index appear permanently stuck. The call
-        # early-returns once the timestamp is set, so the cost after the
-        # first successful detection is a single attribute check.
+        # Re-sync the telemetry's epoch key from the chain before each
+        # record: needed for nodes that see block 1 only via sync (not
+        # via record_block), which would otherwise leave _block_1_hash
+        # unset and route every record_block() to telemetry/genesis/ —
+        # a directory TelemetryCache filters out, making
+        # latest_block_index appear permanently stuck. Sync also re-keys
+        # on block-1 hash change so telemetry follows the canonical
+        # chain across a reorg-at-height-1.
         self.telemetry.sync_epoch_from_chain(self.chain)
-        # Record block telemetry
         self.telemetry.record_block(block)
 
         # Trigger stats cache update in background
@@ -1585,7 +1587,7 @@ class NetworkNode(Node):
                                        f"last block {head_block.header.index} hash {head_block.hash.hex()[:8]}...")
                 
                 # Reset telemetry epoch for next cycle
-                self.telemetry.set_epoch_timestamp(None)
+                self.telemetry.reset_epoch()
 
                 # Reset to original genesis block (no more new genesis creation)
                 self._index_truncate(0)

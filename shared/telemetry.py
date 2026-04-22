@@ -2,7 +2,13 @@
 Local telemetry output for QUIP network nodes.
 
 Writes node registry (nodes.json) and per-block statistics
-(telemetry/{epoch}/{block}.json) to a configurable directory.
+(telemetry/{epoch}/{block}.json) to a configurable directory. The
+``epoch`` directory name is the first 16 hex characters of block 1's
+hash — content-addressed keying so the dashboard can distinguish
+canonical-chain dirs from stale forks left over from reorgs at height
+1 or from node restarts mid-cycle. A top-level ``current_epoch.json``
+marker names the live epoch so the cache can label each dir as
+``live`` or ``stale_fork`` without guessing.
 
 SPDX-License-Identifier: AGPL-3.0-or-later
 """
@@ -19,6 +25,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from shared.block import Block, MinerInfo
+
+
+EPOCH_KEY_LEN = 16  # hex chars taken from block 1's hash
+_HEX_CHARS = frozenset("0123456789abcdef")
+
+
+def _is_epoch_hex(name: str) -> bool:
+    """Return True if *name* is a valid hex-encoded epoch dir name."""
+    return len(name) == EPOCH_KEY_LEN and all(c in _HEX_CHARS for c in name)
 
 
 @dataclass
@@ -53,7 +68,8 @@ class TelemetryManager:
         self._enabled = enabled
         self._logger = logger or logging.getLogger(__name__)
         self._nodes: Dict[str, NodeRecord] = {}
-        self._epoch_timestamp: Optional[int] = None
+        # Full block-1 hash; the epoch dir name is its first 16 hex chars.
+        self._block_1_hash: Optional[bytes] = None
         self._periodic_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
@@ -153,33 +169,122 @@ class TelemetryManager:
     # ------------------------------------------------------------------
 
     def record_block(self, block: Block) -> None:
-        """Write a per-block telemetry JSON file."""
+        """Write a per-block telemetry JSON file under the live epoch dir."""
         if not self._enabled:
             return
         idx = block.header.index
-        # Auto-detect epoch from block 1
-        if idx == 1 and self._epoch_timestamp is None:
-            self._epoch_timestamp = block.header.timestamp
+        if idx == 1 and self._block_1_hash is None and block.hash:
+            self._block_1_hash = block.hash
 
-        epoch_dir = str(self._epoch_timestamp) if self._epoch_timestamp else "genesis"
-        out_dir = self._dir / epoch_dir
+        out_dir = self._dir / self._epoch_dir_name()
         out_dir.mkdir(parents=True, exist_ok=True)
 
         payload = self._block_to_dict(block)
         self._atomic_write_json(out_dir / f"{idx}.json", payload)
+        self._write_current_epoch_marker()
 
-    def set_epoch_timestamp(self, ts: Optional[int]) -> None:
-        """Set or reset the current epoch directory timestamp."""
-        self._epoch_timestamp = ts
+    def reset_epoch(self) -> None:
+        """Clear the current block-1 hash so the next block 1 re-keys."""
+        self._block_1_hash = None
 
     def sync_epoch_from_chain(self, chain: list) -> None:
-        """Extract block-1 timestamp from an existing chain (mid-epoch join)."""
-        if self._epoch_timestamp is not None:
-            return
+        """Align ``_block_1_hash`` with the chain's canonical block 1.
+
+        Unlike the prior timestamp-keyed behaviour, we update on hash
+        change: a reorg at height 1 means a different canonical chain,
+        and telemetry should follow it. The stale dir from the old block
+        1 stays on disk; the cache labels it ``stale_fork`` using the
+        ``current_epoch.json`` marker.
+        """
         for block in chain:
-            if block.header.index == 1:
-                self._epoch_timestamp = block.header.timestamp
-                break
+            if block.header.index == 1 and block.hash:
+                if self._block_1_hash != block.hash:
+                    self._block_1_hash = block.hash
+                return
+
+    def _epoch_dir_name(self) -> str:
+        """Return the live epoch dir name, or 'genesis' if block 1 unknown."""
+        if self._block_1_hash is None:
+            return "genesis"
+        return self._block_1_hash.hex()[:EPOCH_KEY_LEN]
+
+    def _write_current_epoch_marker(self) -> None:
+        """Write/update the top-level current_epoch.json marker.
+
+        The marker names the live epoch dir and carries the full block-1
+        hash so the cache can distinguish the canonical chain from stale
+        fork dirs without scanning every block 1 on disk.
+        """
+        if self._block_1_hash is None:
+            return
+        payload = {
+            "epoch": self._epoch_dir_name(),
+            "block_1_hash": self._block_1_hash.hex(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._atomic_write_json(self._dir / "current_epoch.json", payload)
+
+    def migrate_legacy_dirs(self) -> Dict[str, List]:
+        """Rename pre-hash telemetry dirs to their content-addressed names.
+
+        Reads ``{dir}/1.json`` from every non-genesis subdirectory that
+        isn't already a 16-char hex name, takes its ``block_hash`` field,
+        and renames the dir to ``block_hash[:16]``. Idempotent; dirs
+        without a usable block 1 or with a pre-existing target are left
+        alone so migration is safe to retry.
+
+        Returns:
+            Summary dict: ``{"migrated": [(old, new), ...], "skipped": [(old, reason), ...]}``.
+        """
+        result: Dict[str, List] = {"migrated": [], "skipped": []}
+        if not self._enabled or not self._dir.is_dir():
+            return result
+
+        for entry in self._dir.iterdir():
+            if not entry.is_dir() or entry.name == "genesis":
+                continue
+            if _is_epoch_hex(entry.name):
+                continue
+
+            reason = self._migrate_one_dir(entry, result)
+            if reason is not None:
+                result["skipped"].append((entry.name, reason))
+
+        return result
+
+    def _migrate_one_dir(
+        self, entry: Path, result: Dict[str, List],
+    ) -> Optional[str]:
+        """Rename a single legacy dir; return a skip-reason or None on success."""
+        block_1 = entry / "1.json"
+        if not block_1.is_file():
+            return "missing block 1"
+        try:
+            data = json.loads(block_1.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            return f"read error: {exc}"
+
+        block_hash_hex = data.get("block_hash")
+        if (
+            not isinstance(block_hash_hex, str)
+            or len(block_hash_hex) < EPOCH_KEY_LEN
+        ):
+            return "invalid block_hash"
+
+        new_name = block_hash_hex[:EPOCH_KEY_LEN]
+        target = self._dir / new_name
+        if target.exists():
+            return f"target {new_name} exists"
+        try:
+            entry.rename(target)
+        except OSError as exc:
+            return f"rename failed: {exc}"
+
+        result["migrated"].append((entry.name, new_name))
+        self._logger.info(
+            "Migrated telemetry dir %s -> %s", entry.name, new_name,
+        )
+        return None
 
     # ------------------------------------------------------------------
     # Lifecycle
