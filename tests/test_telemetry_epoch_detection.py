@@ -105,8 +105,13 @@ def test_on_block_received_detects_epoch_from_chain(tmp_path):
     assert (epoch_dir / "6.json").is_file()
 
 
-def test_sync_epoch_from_chain_is_idempotent(tmp_path):
-    """Repeated calls are cheap — sync early-returns once timestamp is set."""
+def test_sync_epoch_does_not_overwrite_existing_timestamp(tmp_path):
+    """Once detected, the epoch timestamp must not shift on later calls.
+
+    The early-return guard makes the per-block call cheap and prevents
+    the epoch dir from jumping around mid-run if the chain is later
+    rewritten (e.g. via reorg of block 1, however unlikely).
+    """
     tm = TelemetryManager(telemetry_dir=str(tmp_path), enabled=True)
 
     chain = [_block(index=0, timestamp=0), _block(index=1, timestamp=999)]
@@ -150,3 +155,41 @@ def test_subsequent_blocks_all_land_in_detected_epoch(tmp_path):
     )
     # _epoch_timestamp must not drift after initial detection.
     assert node.telemetry._epoch_timestamp == 42_000
+
+
+def test_block_1_arriving_as_incoming_sets_epoch_via_record_block(tmp_path):
+    """Block 1 arriving via gossip on a chain holding only genesis must
+    still land in its own epoch dir, not under genesis/.
+
+    sync_epoch_from_chain runs first but finds no block 1 (only genesis
+    is in the chain at this point — the incoming block has not been
+    appended yet). record_block then sets the epoch via its existing
+    ``idx == 1 and _epoch_timestamp is None`` branch. Both paths must
+    leave the file under {timestamp}/1.json.
+    """
+    node = _bare_network_node(tmp_path)
+    node.chain = [_block(index=0, timestamp=0)]  # genesis only
+
+    incoming = _block(index=1, timestamp=42_000)
+    node._on_block_received(incoming)
+
+    assert (tmp_path / "42000" / "1.json").is_file()
+    assert not (tmp_path / "genesis").exists(), (
+        "block 1 must never land under genesis/ — TelemetryCache "
+        "filters that directory out"
+    )
+    assert node.telemetry._epoch_timestamp == 42_000
+
+
+def test_on_block_received_handles_empty_chain(tmp_path):
+    """An empty chain must not raise (defensive against early-startup races)."""
+    node = _bare_network_node(tmp_path)
+    node.chain = []
+
+    # Should be a no-op for sync_epoch_from_chain (no block 1 to find)
+    # and then write the incoming block to genesis/ since no epoch is
+    # known yet. The contract here is "do not raise" — the genesis
+    # routing is acceptable until block 1 arrives and triggers a real
+    # epoch detection on the next call.
+    node._on_block_received(_block(index=2, timestamp=42_200))
+    assert node.telemetry._epoch_timestamp is None

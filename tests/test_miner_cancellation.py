@@ -139,3 +139,30 @@ def test_miner_service_cancel_interrupts_active_mining():
         )
     finally:
         handle.close()
+
+
+@pytest.mark.timeout(20)
+def test_cancel_on_idle_handle_is_safe():
+    """cancel() must be safe to call when no mine_block is in flight.
+
+    Node.mine_block's ``finally`` block now unconditionally cancels every
+    handle, including paths where mining was never started this attempt.
+    If cancel() ever raised on an idle worker, every shutdown and
+    every "start mining failed validation" path would crash.
+    """
+    spec = {"id": "test-cancel-idle", "kind": "cpu", "args": {}, "cfg": {}}
+    handle = MinerHandle(spec)
+    try:
+        # Let the worker enter its main cmd loop.
+        time.sleep(0.5)
+
+        handle.cancel()  # no mine in flight
+        handle.cancel()  # double-cancel must be a no-op too
+
+        # The worker must still be responsive to commands.
+        stats = handle.get_stats()
+        assert stats is not None, (
+            "cancel() on idle handle left the worker unresponsive"
+        )
+    finally:
+        handle.close()

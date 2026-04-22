@@ -196,9 +196,13 @@ def miner_worker_main(
             if prev_block is None or requirements is None or node_info is None or prev_timestamp is None:
                 resp_q.put({"op": "error", "message": "Missing node_info, block or requirements", "id": spec.get("id")})
                 continue
-            # Clear any cancellation left over from a prior attempt so
-            # this fresh mining pass starts with a quiescent event.
-            stop_event.clear()
+            # NOTE: do not clear stop_event here. The parent clears it
+            # in mine() before enqueueing this op; if cancel() lands in
+            # the gap between that enqueue and our dequeue, the parent
+            # has already set() it and a clear here would silently wipe
+            # the cancel — exactly the original bug. Letting a set
+            # event short-circuit mine_block() is the desired behaviour
+            # (the cancellation reached us before mining started).
             result = miner.mine_block(prev_block, node_info, requirements, prev_timestamp, stop_event)
             if result is not None:
                 resp_q.put(result)
@@ -250,19 +254,26 @@ class MinerHandle:
         return k.upper()
 
     def mine(self, block, node_info, requirements, prev_timestamp: int = 0):
-        # Clear any leftover cancel from the previous attempt before
-        # queueing the new job. The worker also clears it before calling
-        # mine_block; the parent-side clear here protects against races
-        # where cancel() runs between mine() and the worker picking up
-        # the op.
+        # Sole clear point for the shared cancel signal. The worker
+        # never clears it — clearing on either side of the queue would
+        # race with cancel() and silently wipe the signal (the original
+        # bug this MR fixes). Clearing here, before enqueueing, means
+        # any cancel() called between this clear and the worker
+        # dequeueing the op stays observable: the worker enters
+        # mine_block with stop_event already set and short-circuits.
         self.stop_event.clear()
         self.req.put({"op": "mine_block", "block": block, "node_info": node_info, "requirements": requirements, "prev_timestamp": prev_timestamp})
 
     def cancel(self):
-        # Signal the worker directly so the running mine_block() sees
-        # the stop within one of its inner-loop iterations. The op-queue
-        # message is kept as a belt-and-braces idempotent nudge that also
-        # lets observers outside this class trigger a cancel.
+        """Cancel the current mining operation.
+
+        Signals the running ``mine_block()`` directly via the shared
+        stop event so the inner loop observes the cancel within one
+        iteration; also enqueues the ``stop_mining`` op so callers
+        operating only on the request queue can still trigger a cancel.
+        Idempotent — safe to call when the worker is idle (the set is a
+        no-op cleared by the next ``mine()``).
+        """
         self.stop_event.set()
         self.req.put({"op": "stop_mining"})
 

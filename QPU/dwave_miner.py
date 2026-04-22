@@ -282,17 +282,26 @@ class DWaveMiner(BaseMiner):
 
             D-Wave's remote future cancel is advisory — the solver may
             have already run — but calling it lets the client release
-            network resources and logs the intent. Locally we just drop
-            the pending map, which is what frees the node to move on.
+            network resources. Locally we drop the pending map, which is
+            what frees the node to move on. Per-future failures are
+            logged at debug level so an SDK that drops the cancel API
+            (or a network blip during teardown) leaves an audit trail
+            without spamming production logs.
             """
-            for _mdl, fut, _defect, _idx in pending.values():
+            for _mdl, fut, _defect, fidx in pending.values():
                 cancel_fn = getattr(fut, "cancel", None)
                 if callable(cancel_fn):
                     try:
                         cancel_fn()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        self.logger.debug(
+                            f"D-Wave future.cancel() failed for job "
+                            f"{fidx} (best-effort): "
+                            f"{type(exc).__name__}: {exc}"
+                        )
             pending.clear()
+
+        drain_engaged = False
 
         # Stream: poll for completions, yield, refill
         while pending:
@@ -306,9 +315,18 @@ class DWaveMiner(BaseMiner):
                 if not self.drain_on_stop:
                     _cancel_pending()
                     return
-                # Drain mode: suppress submit_one() by swapping in a
-                # no-op for the remainder of this stream.
-                submit_one = lambda: None  # noqa: E731
+                if not drain_engaged:
+                    # Suppress submit_one() for the remainder of this
+                    # stream so the pipeline winds down naturally as
+                    # pending empties. One-shot — repeated reassignment
+                    # would just churn lambdas every poll.
+                    self.logger.info(
+                        f"[QPU] drain_on_stop engaged with "
+                        f"{len(pending)} jobs in flight; no new "
+                        f"submissions until stream completes"
+                    )
+                    submit_one = lambda: None  # noqa: E731
+                    drain_engaged = True
 
             completed_id = None
             while completed_id is None:

@@ -78,6 +78,12 @@ def miner_service_main(
     log = _setup_service_logging(miner_id)
 
     def _signal_handler(_signum, _frame):
+        # Set both events so an in-flight mine_block() observes the
+        # cancel and returns promptly — without this, the service loop
+        # would only check stop_event after the current mine completes
+        # naturally, so SIGTERM would always escalate to SIGKILL on
+        # long-running mining attempts.
+        cancel_event.set()
         stop_event.set()
 
     signal.signal(signal.SIGINT, _signal_handler)
@@ -176,10 +182,13 @@ class _MinerContext:
             })
             return
 
-        # Clear any leftover cancel from a prior attempt. The shared
-        # event stays the same object so parent cancel() calls still
-        # reach us.
-        self.mining_stop.clear()
+        # NOTE: do not clear mining_stop here. The parent clears it in
+        # mine() before enqueueing this op; if cancel() lands in the gap
+        # between that enqueue and our dequeue, the parent has already
+        # set() the event and a clear here would silently wipe the
+        # cancel — exactly the original bug. Letting a set event
+        # short-circuit mine_block() is the desired behaviour (the
+        # cancellation reached us before mining started).
         self.is_mining = True
 
         try:
@@ -264,9 +273,14 @@ class MinerServiceHandle:
         return k.upper()
 
     def mine(self, block, node_info, requirements, prev_timestamp: int = 0):
-        """Submit a mining job. Non-blocking."""
-        # Clear any leftover cancel before queueing new work so the
-        # service's upcoming _handle_mine doesn't see a stale signal.
+        """Submit a mining job. Non-blocking.
+
+        Sole clear point for the shared cancel event. The service
+        process never clears it — clearing on either side of the queue
+        would race with cancel() and silently wipe the signal. Clearing
+        here, before enqueueing, means any cancel() called between this
+        clear and the service dequeueing the op stays observable.
+        """
         self._cancel_event.clear()
         self.cmd_queue.put({
             "cmd": "mine",

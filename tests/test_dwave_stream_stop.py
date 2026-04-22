@@ -11,6 +11,7 @@ Covers two modes:
 """
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
 import threading
 import time
@@ -80,6 +81,10 @@ def _miner_with_sampler(sampler, drain_on_stop: bool) -> DWaveMiner:
     miner.sampler = sampler
     miner.drain_on_stop = drain_on_stop
     miner._stop_event = None
+    # BaseMiner.__init__ sets self.logger = getLogger(f'miner.{miner_id}');
+    # we skip __init__ here, so wire up an equivalent so the streaming
+    # iterator's debug/info logs don't AttributeError.
+    miner.logger = logging.getLogger("miner.test-dwave-stream")
     miner.timing_stats = {
         "preprocessing": [], "sampling": [], "postprocessing": [],
         "quantum_annealing_time": [], "per_sample_overhead": [],
