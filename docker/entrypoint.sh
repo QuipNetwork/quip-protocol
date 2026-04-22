@@ -75,17 +75,13 @@ handle_privilege_drop() {
     [ "$cur_gid" != "$PGID" ] && groupmod -g "$PGID" quip
     [ "$cur_uid" != "$PUID" ] && usermod  -u "$PUID" -g "$PGID" quip
 
-    # `chown -R` on /data is expensive on volumes with many epoch files.
-    # Skip when the top-level owner already matches the target UID —
-    # that's the steady-state case on restart.
-    local data_uid
-    data_uid=$(stat -c '%u' /data 2>/dev/null || echo "")
-    if [ "$data_uid" != "$PUID" ]; then
-        echo "Privilege drop: chown -R quip:quip /data (was uid=$data_uid)"
-        chown -R quip:quip /data
-    else
-        echo "Privilege drop: /data already owned by uid=$PUID, skipping chown"
-    fi
+    # Always recursively chown /data to the target user. A shallow top-level
+    # check is unsafe — subdirs (e.g. /data/logs) can be root-owned while
+    # /data itself matches PUID, leaving the node unable to write its logs.
+    # `chown -R` is a no-op on entries that already match, so this is cheap
+    # in the steady state.
+    echo "Privilege drop: chown -R quip:quip /data"
+    chown -R quip:quip /data
 
     # Re-tighten TLS private key after the ownership flip.
     local key_file="/data/certs/private/privkey.pem"
