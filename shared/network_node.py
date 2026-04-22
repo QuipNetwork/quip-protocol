@@ -583,6 +583,9 @@ class NetworkNode(Node):
                     f"Could not detect public IP, using {self.public_host}"
                 )
 
+        # Register self in telemetry now that public_host is final.
+        self._register_self_in_telemetry()
+
         # Initialize TOFU trust store if enabled
         if self.tofu_enabled:
             import os
@@ -850,6 +853,10 @@ class NetworkNode(Node):
 
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Refresh our own telemetry entry at heartbeat cadence so
+                # ``last_seen``/``last_heartbeat`` do not go stale.
+                self._register_self_in_telemetry()
 
                 # SWIM: create and send indirect probes for suspects
                 await self._run_swim_probes(peer_list)
@@ -3210,6 +3217,26 @@ class NetworkNode(Node):
                 f"(local public address: {self.public_host})"
             )
         return filtered
+
+    def _register_self_in_telemetry(self) -> None:
+        """Insert or refresh this node's own telemetry record.
+
+        Keyed by ``self.public_host`` so the entry matches how we
+        advertise ourselves in STATUS responses and how remote peers
+        identify us when sending heartbeats. Errors are swallowed —
+        telemetry must never kill the node.
+        """
+        try:
+            self.telemetry.update_node(
+                self.public_host,
+                "active",
+                descriptor=self.descriptor(),
+                last_heartbeat=utc_timestamp_float(),
+            )
+        except Exception:
+            self.logger.warning(
+                "Failed to register self in telemetry", exc_info=True,
+            )
 
     async def _validate_peer_address(
         self, claimed: str, real_peer_addr: str, timeout: float = 2.0
