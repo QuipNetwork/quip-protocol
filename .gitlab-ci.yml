@@ -66,59 +66,40 @@ check-version:
     - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_COMMIT_TAG
 
-# CPU image — built per-arch on native runners, then stitched into a
-# multi-arch manifest list. Kaniko has no cross-compile support, so each
-# arch needs its own native runner (amd64 / arm64).
+# CPU image — built multi-arch on the macOS arm64 runner via docker
+# buildx. amd64 is produced under QEMU emulation; Docker Desktop /
+# OrbStack ship binfmt handlers so this needs no extra setup.
+#
+# Runs on the same shell runner as package-macos-arm64 (tags:
+# [macos, arm64]) so we don't depend on separate linux runners being
+# online — the previous per-arch Kaniko jobs were blocked whenever
+# the linux/amd64 or linux/arm64 runner pool was empty.
 
-build-cpu-amd64:
-  extends: .docker_build
-  tags: [linux, amd64]
-  script:
-    - /kaniko/executor
-        --context $CI_PROJECT_DIR
-        --dockerfile docker/Dockerfile.cpu
-        --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
-        --destination $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-amd64
-
-build-cpu-arm64:
-  extends: .docker_build
-  tags: [linux, arm64]
-  script:
-    - /kaniko/executor
-        --context $CI_PROJECT_DIR
-        --dockerfile docker/Dockerfile.cpu
-        --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
-        --destination $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-arm64
-
-manifest-cpu:
+build-cpu:
   stage: build
-  image:
-    name: mplatform/manifest-tool:alpine-v2.2.1
-    entrypoint: [""]
-  tags: [linux, amd64]
-  needs:
-    - build-cpu-amd64
-    - build-cpu-arm64
+  tags: [macos, arm64]
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_COMMIT_TAG
+  before_script:
+    # Isolated buildx builder per job. Create-if-missing is idempotent
+    # across job retries. docker-container driver is required for
+    # multi-platform + --push in one invocation.
+    - docker buildx inspect quip-ci >/dev/null 2>&1 || docker buildx create --name quip-ci --driver docker-container --bootstrap
+    - docker buildx use quip-ci
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
   script:
     - >
-      manifest-tool
-      --username "$CI_REGISTRY_USER"
-      --password "$CI_REGISTRY_PASSWORD"
-      push from-args
-      --platforms linux/amd64,linux/arm64
-      --template "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-ARCH"
-      --target "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA"
-    - >
-      manifest-tool
-      --username "$CI_REGISTRY_USER"
-      --password "$CI_REGISTRY_PASSWORD"
-      push from-args
-      --platforms linux/amd64,linux/arm64
-      --template "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-ARCH"
-      --target "$CI_REGISTRY_IMAGE/$CPU_IMAGE:latest"
+      docker buildx build
+      --platform linux/amd64,linux/arm64
+      --push
+      -t "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA"
+      -t "$CI_REGISTRY_IMAGE/$CPU_IMAGE:latest"
+      -f docker/Dockerfile.cpu
+      --build-arg "QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA"
+      .
+  after_script:
+    - docker logout "$CI_REGISTRY" || true
 
 build-cuda:
   extends: .docker_build
