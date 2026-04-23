@@ -5,12 +5,14 @@ import copy
 import ipaddress
 import json
 import math
+import os
 import random
 import socket
 import struct
 import sys
 import threading
 import time
+from concurrent.futures import ProcessPoolExecutor
 
 from dataclasses import dataclass
 from typing import Dict, Optional, Callable, Any
@@ -80,6 +82,34 @@ class CandidatePeer:
     probe_attempts: int = 0
     last_probe_at: float = 0.0
     descriptor: Optional[Dict[str, Any]] = None
+
+
+def _run_sa_sample_ising(
+    h_dict: Dict[int, float],
+    J_dict: Dict[tuple, float],
+    num_samples: int,
+) -> tuple:
+    """Worker-side Simulated Annealing sampling for SOLVE_REQUEST.
+
+    Defined at module scope so the ``ProcessPoolExecutor`` can
+    invoke it. Creates its own sampler inside the worker (no state
+    carried from the coordinator) and returns plain lists of
+    samples and energies that round-trip cleanly across the
+    process boundary.
+    """
+    from dwave.samplers import SimulatedAnnealingSampler
+    sampler = SimulatedAnnealingSampler()
+    sampleset = sampler.sample_ising(
+        h_dict, J_dict, num_reads=num_samples,
+    )
+    samples: list = []
+    energies: list = []
+    for sample, energy in sampleset.data(['sample', 'energy']):
+        samples.append(
+            [int(sample[i]) for i in sorted(sample.keys())]
+        )
+        energies.append(float(energy))
+    return samples, energies
 
 
 class _ListenerPeerShim:
@@ -371,6 +401,11 @@ class NetworkNode(Node):
         self._listener: Optional[Any] = None  # ListenerProcessHandle
         self._listener_drain_task: Optional[asyncio.Task] = None
         self._listener_snapshot_task: Optional[asyncio.Task] = None
+        # CPU-bound handler executor (BLOCK_REQUEST serialize,
+        # CHAIN_MANIFEST walk, SOLVE_REQUEST sampling). Lazy-init
+        # on first dispatch so nodes that never serve these
+        # requests don't pay the fork cost.
+        self._handler_executor: Optional[ProcessPoolExecutor] = None
 
         # Per-peer rate limiter for incoming QUIC messages
         self._rate_limiter = PeerRateLimiter(
@@ -720,6 +755,12 @@ class NetworkNode(Node):
                     listener.force_stop(timeout=1.0)
                 except Exception:
                     pass
+            executor = getattr(self, "_handler_executor", None)
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
             pool = getattr(self, "_process_pool", None)
             if pool is not None:
                 try:
@@ -756,6 +797,22 @@ class NetworkNode(Node):
             self._listener.shutdown()
             self._listener.force_stop(timeout=3.0)
             self._listener = None
+
+        # 1b. Stop the handler executor. By this point inbound
+        # packets no longer reach us, so any in-flight CPU handler
+        # work is a response that will be dropped anyway; cancel
+        # futures rather than waiting.
+        if self._handler_executor is not None:
+            self.logger.info("Stopping handler executor...")
+            try:
+                self._handler_executor.shutdown(
+                    wait=False, cancel_futures=True,
+                )
+            except Exception:
+                self.logger.debug(
+                    "handler_executor shutdown raised", exc_info=True,
+                )
+            self._handler_executor = None
 
         # 2. Stop outbound — no new gossip/heartbeat/block fetches.
         if self._pool_drain_task:
@@ -1269,6 +1326,24 @@ class NetworkNode(Node):
         except Exception:
             self.logger.debug("telemetry latest snapshot failed", exc_info=True)
         return out
+
+    def _get_handler_executor(self) -> ProcessPoolExecutor:
+        """Return the shared handler executor, creating it on first use.
+
+        Sized to ``max(2, os.cpu_count() // 2)`` so mining and other
+        coordinator work still have CPU to share. The executor is
+        shut down during ``stop()``; until then it persists across
+        individual handler calls to amortize fork cost.
+        """
+        if self._handler_executor is None:
+            workers = max(2, (os.cpu_count() or 4) // 2)
+            self._handler_executor = ProcessPoolExecutor(
+                max_workers=workers,
+            )
+            self.logger.info(
+                f"Handler executor started with {workers} workers"
+            )
+        return self._handler_executor
 
     def _backoff_list_snapshot(self) -> list:
         """Return currently banned peer hosts."""
@@ -3973,7 +4048,13 @@ class NetworkNode(Node):
             return msg.create_response(json.dumps(self._stats_cache).encode('utf-8'))
 
     async def _quic_handle_block_request(self, msg: QuicMessage) -> QuicMessage:
-        """Return a specific block by number (binary format)."""
+        """Return a specific block by number (binary format).
+
+        Block serialization (``block.to_network()``) packs headers,
+        quantum proofs, and transactions and can take several ms for
+        blocks with many samples. Offloaded to the handler executor
+        so a syncing peer's pull doesn't stall the coordinator loop.
+        """
         # Payload is 4-byte big-endian block number
         if len(msg.payload) >= 4:
             block_number = struct.unpack('!I', msg.payload[:4])[0]
@@ -3988,8 +4069,11 @@ class NetworkNode(Node):
         if block is None:
             return msg.create_error_response(f"Block {block_number} not found")
 
-        # Return block in network binary format
-        return msg.create_response(block.to_network())
+        loop = asyncio.get_running_loop()
+        block_bytes = await loop.run_in_executor(
+            self._get_handler_executor(), block.to_network,
+        )
+        return msg.create_response(block_bytes)
 
     async def _quic_handle_block_header_request(self, msg: QuicMessage) -> QuicMessage:
         """Return a specific block header by number (binary format)."""
@@ -4023,6 +4107,11 @@ class NetworkNode(Node):
         canonical chain (divergent genesis, or the client is a
         reorg'd-away fork we don't share). The client treats that as
         "no useful data here" and demotes the peer for the session.
+
+        Chain walk runs on the coordinator loop (O(MAX_MANIFEST_ENTRIES),
+        each step is an in-memory dict access) but the final
+        response encoding is offloaded so a long entry list doesn't
+        stall the loop while we pack bytes.
         """
         try:
             locator, limit = decode_manifest_request(msg.payload)
@@ -4050,7 +4139,12 @@ class NetworkNode(Node):
                     break
                 entries.append((i, blk.hash))
 
-        return msg.create_response(encode_manifest_response(entries))
+        loop = asyncio.get_running_loop()
+        encoded = await loop.run_in_executor(
+            self._get_handler_executor(),
+            encode_manifest_response, entries,
+        )
+        return msg.create_response(encoded)
 
     async def _quic_handle_block_by_hash_request(self, msg: QuicMessage) -> QuicMessage:
         """Return a canonical-chain block by hash, or empty for NOT_FOUND."""
@@ -4124,19 +4218,33 @@ class NetworkNode(Node):
             return msg.create_error_response(f"Unknown miner type: {miner_kind}")
 
         try:
-            # Sample the Ising problem
-            sampleset = sampler.sample_ising(h_dict, J_dict, num_reads=num_samples)
+            if qpu_sampler is not None:
+                # QPU samplers carry authenticated session state that
+                # doesn't cross process boundaries cleanly, so keep
+                # the call in the coordinator loop. It's
+                # network-bound (not CPU-bound) anyway.
+                sampleset = sampler.sample_ising(
+                    h_dict, J_dict, num_reads=num_samples,
+                )
+                samples: list = []
+                energies: list = []
+                for sample, energy in sampleset.data(['sample', 'energy']):
+                    samples.append(
+                        [int(sample[i]) for i in sorted(sample.keys())]
+                    )
+                    energies.append(float(energy))
+            else:
+                # SA sampling is pure CPU; run it in the handler
+                # executor to avoid stalling the coordinator loop.
+                loop = asyncio.get_running_loop()
+                samples, energies = await loop.run_in_executor(
+                    self._get_handler_executor(),
+                    _run_sa_sample_ising,
+                    h_dict, J_dict, num_samples,
+                )
         finally:
             if qpu_sampler is not None:
                 qpu_sampler.close()
-
-        # Extract samples and energies
-        samples = []
-        energies = []
-        for sample, energy in sampleset.data(['sample', 'energy']):
-            sample_list = [int(sample[i]) for i in sorted(sample.keys())]
-            samples.append(sample_list)
-            energies.append(float(energy))
 
         self.logger.info(
             f"Solve completed: {len(samples)} samples with energies "
