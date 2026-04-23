@@ -1150,10 +1150,12 @@ class NetworkNode(Node):
         })
 
     async def _listener_snapshot_loop(self) -> None:
-        """Periodically push peer/ban snapshots to the listener.
+        """Periodically push peer/ban + read-cache snapshots to the listener.
 
-        Keeps the listener's HEARTBEAT fast-path cache fresh without
-        requiring fine-grained invalidation.
+        Keeps the listener's fast-path caches fresh without requiring
+        fine-grained invalidation. The read-cache lets the listener
+        answer STATUS / STATS / PEERS / TELEMETRY_* locally instead
+        of forwarding to the coordinator.
         """
         while self.running and self._listener is not None:
             try:
@@ -1170,6 +1172,7 @@ class NetworkNode(Node):
                     "peers": peers_snapshot,
                     "banned": banned,
                 })
+                listener.send_cmd(self._build_read_snapshot_cmd())
                 await asyncio.sleep(5.0)
             except asyncio.CancelledError:
                 break
@@ -1178,6 +1181,94 @@ class NetworkNode(Node):
                     "Error in listener snapshot loop"
                 )
                 await asyncio.sleep(5.0)
+
+    def _build_read_snapshot_cmd(self) -> dict:
+        """Build the IPC command carrying serialized read responses.
+
+        Each field is ``bytes`` (the JSON payload the handler would
+        normally produce) or ``None`` if not currently buildable. The
+        listener falls back to forwarding on ``None`` or on a stale
+        snapshot.
+        """
+        return {
+            "cmd": "read_snapshot",
+            "status": self._serialize_status_response(),
+            "stats": self._serialize_stats_response(),
+            "peers": self._serialize_peers_response(),
+            "telemetry": self._serialize_telemetry_responses(),
+        }
+
+    def _serialize_status_response(self) -> Optional[bytes]:
+        """Build the STATUS_REQUEST response payload (mirrors the handler)."""
+        try:
+            status_data = {
+                "host": self.public_host,
+                "info": self.info().to_json(),
+                "descriptor": self.descriptor(),
+                "running": self.running,
+                "total_peers": len(self.peers),
+                "uptime": utc_timestamp_float() if self.running else 0,
+            }
+            return json.dumps(status_data).encode("utf-8")
+        except Exception:
+            self.logger.debug("status snapshot build failed", exc_info=True)
+            return None
+
+    def _serialize_stats_response(self) -> Optional[bytes]:
+        """Build the STATS_REQUEST response payload from the stats cache."""
+        if self._stats_cache is None:
+            return None
+        try:
+            return json.dumps(self._stats_cache).encode("utf-8")
+        except Exception:
+            self.logger.debug("stats snapshot build failed", exc_info=True)
+            return None
+
+    def _serialize_peers_response(self) -> Optional[bytes]:
+        """Build the PEERS_REQUEST response payload."""
+        try:
+            healthy = self._healthy_peers_snapshot()
+            peers_data = {
+                host: info.to_json() for host, info in healthy.items()
+            }
+            return json.dumps({"peers": peers_data}).encode("utf-8")
+        except Exception:
+            self.logger.debug("peers snapshot build failed", exc_info=True)
+            return None
+
+    def _serialize_telemetry_responses(self) -> dict:
+        """Build the bundle of TELEMETRY_* response payloads."""
+        out: Dict[str, Any] = {
+            "status": None, "nodes": None, "epochs": None,
+            "latest": None, "blocks": {},
+        }
+        if self.telemetry_cache is None:
+            return out
+        try:
+            out["status"] = json.dumps(
+                self.telemetry_cache.get_status()
+            ).encode("utf-8")
+        except Exception:
+            self.logger.debug("telemetry status snapshot failed", exc_info=True)
+        try:
+            nodes = self.telemetry_cache.get_nodes()
+            if nodes is not None:
+                out["nodes"] = json.dumps(nodes).encode("utf-8")
+        except Exception:
+            self.logger.debug("telemetry nodes snapshot failed", exc_info=True)
+        try:
+            out["epochs"] = json.dumps(
+                {"epochs": self.telemetry_cache.get_epochs()}
+            ).encode("utf-8")
+        except Exception:
+            self.logger.debug("telemetry epochs snapshot failed", exc_info=True)
+        try:
+            latest = self.telemetry_cache.get_latest()
+            if latest is not None:
+                out["latest"] = json.dumps(latest).encode("utf-8")
+        except Exception:
+            self.logger.debug("telemetry latest snapshot failed", exc_info=True)
+        return out
 
     def _backoff_list_snapshot(self) -> list:
         """Return currently banned peer hosts."""

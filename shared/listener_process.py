@@ -48,7 +48,7 @@ import multiprocessing.synchronize
 import signal
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, Tuple
 
 from shared.logging_config import QuipFormatter
 
@@ -123,12 +123,36 @@ class ListenerProcessHandle:
 class _PeerSnapshotCache:
     """Snapshot of coordinator state pushed by the parent.
 
-    Read by the HEARTBEAT fast path inside the listener so it can
-    answer without an IPC round-trip. Updated wholesale on each
-    ``peer_snapshot`` command.
+    Read by local fast-path handlers (HEARTBEAT, STATUS, STATS,
+    PEERS, TELEMETRY_*) so the listener can answer without an IPC
+    round-trip. ``peer_snapshot`` updates versions/banned;
+    ``read_snapshot`` updates the pre-serialized response payloads.
+
+    Each ``*_response`` field holds the *payload* bytes that the
+    listener wraps in a ``QuicMessage.create_response`` when
+    serving. ``None`` or an empty value means "fall back to
+    forwarding the message to the coordinator."
     """
     versions: Dict[str, str] = field(default_factory=dict)
     banned: Set[str] = field(default_factory=set)
+    status_response: Optional[bytes] = None
+    stats_response: Optional[bytes] = None
+    peers_response: Optional[bytes] = None
+    telemetry_status_response: Optional[bytes] = None
+    telemetry_nodes_response: Optional[bytes] = None
+    telemetry_epochs_response: Optional[bytes] = None
+    telemetry_latest_response: Optional[bytes] = None
+    telemetry_block_responses: Dict[Tuple[str, int], bytes] = field(
+        default_factory=dict,
+    )
+    read_snapshot_ts: float = 0.0
+    staleness_limit: float = 30.0
+
+    def read_snapshot_fresh(self) -> bool:
+        """True when the read snapshot is within its staleness limit."""
+        if self.read_snapshot_ts <= 0:
+            return False
+        return (time.time() - self.read_snapshot_ts) < self.staleness_limit
 
 
 def listener_process_main(
@@ -270,6 +294,8 @@ async def _listener_loop(
             elif op == "peer_snapshot":
                 cache.versions = dict(cmd.get("peers") or {})
                 cache.banned = set(cmd.get("banned") or [])
+            elif op == "read_snapshot":
+                _apply_read_snapshot(cache, cmd)
             elif op == "inbound_response":
                 mid = cmd.get("msg_id")
                 fut = pending_forwards.pop(mid, None) if mid is not None else None
@@ -361,10 +387,15 @@ def _build_listener_protocol(
                         msg, self._peer_address, cache, pipe, log,
                     )
                 else:
-                    response = await _forward_to_coordinator(
-                        msg, self._peer_address, pipe,
-                        pending_forwards, alloc_msg_id, forward_timeout,
-                    )
+                    cached = _try_cached_read(msg, cache)
+                    if cached is not None:
+                        response = cached
+                    else:
+                        response = await _forward_to_coordinator(
+                            msg, self._peer_address, pipe,
+                            pending_forwards, alloc_msg_id,
+                            forward_timeout,
+                        )
             except Exception as exc:
                 log.exception(
                     f"Handler error for {msg.msg_type.name}: {exc}"
@@ -388,6 +419,85 @@ def _build_listener_protocol(
                 log.error(f"Failed to send response: {exc}")
 
     return _ListenerProtocol(quic, stream_handler)
+
+
+def _apply_read_snapshot(cache: _PeerSnapshotCache, cmd: dict) -> None:
+    """Replace the cache's read-snapshot fields from an IPC command.
+
+    The coordinator sends already-serialized JSON response bytes
+    for each type. ``None`` means "coordinator couldn't build this
+    right now; keep serving from the coordinator via forward."
+    """
+    cache.status_response = _as_bytes(cmd.get("status"))
+    cache.stats_response = _as_bytes(cmd.get("stats"))
+    cache.peers_response = _as_bytes(cmd.get("peers"))
+    telemetry = cmd.get("telemetry") or {}
+    cache.telemetry_status_response = _as_bytes(telemetry.get("status"))
+    cache.telemetry_nodes_response = _as_bytes(telemetry.get("nodes"))
+    cache.telemetry_epochs_response = _as_bytes(telemetry.get("epochs"))
+    cache.telemetry_latest_response = _as_bytes(telemetry.get("latest"))
+    cache.telemetry_block_responses = {
+        (epoch, int(idx)): _as_bytes(payload)
+        for (epoch, idx), payload in (telemetry.get("blocks") or {}).items()
+        if payload is not None
+    }
+    cache.read_snapshot_ts = time.time()
+
+
+def _as_bytes(value) -> Optional[bytes]:
+    """Normalize bytes/bytearray/None to Optional[bytes]."""
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    return None
+
+
+def _try_cached_read(msg, cache: _PeerSnapshotCache):
+    """Return a response built from the cache, or None to forward.
+
+    Only handles the read-only message types. Returns None if the
+    cache is stale, missing the needed payload, or the message type
+    isn't in the local fast path.
+    """
+    from shared.node_client import QuicMessageType
+    if not cache.read_snapshot_fresh():
+        return None
+
+    t = msg.msg_type
+    if t == QuicMessageType.STATUS_REQUEST:
+        payload = cache.status_response
+    elif t == QuicMessageType.STATS_REQUEST:
+        payload = cache.stats_response
+    elif t == QuicMessageType.PEERS_REQUEST:
+        payload = cache.peers_response
+    elif t == QuicMessageType.TELEMETRY_STATUS_REQUEST:
+        payload = cache.telemetry_status_response
+    elif t == QuicMessageType.TELEMETRY_NODES_REQUEST:
+        payload = cache.telemetry_nodes_response
+    elif t == QuicMessageType.TELEMETRY_EPOCHS_REQUEST:
+        payload = cache.telemetry_epochs_response
+    elif t == QuicMessageType.TELEMETRY_LATEST_REQUEST:
+        payload = cache.telemetry_latest_response
+    elif t == QuicMessageType.TELEMETRY_BLOCK_REQUEST:
+        payload = _lookup_telemetry_block(msg, cache)
+    else:
+        return None
+
+    if payload is None:
+        return None
+    return msg.create_response(payload)
+
+
+def _lookup_telemetry_block(msg, cache: _PeerSnapshotCache) -> Optional[bytes]:
+    """Resolve a TELEMETRY_BLOCK_REQUEST against the local cache."""
+    try:
+        params = json.loads(msg.payload.decode("utf-8"))
+        epoch = params["epoch"]
+        block_index = int(params["block_index"])
+    except (json.JSONDecodeError, KeyError, ValueError):
+        return None
+    return cache.telemetry_block_responses.get((epoch, block_index))
 
 
 def _handle_heartbeat_local(

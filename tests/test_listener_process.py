@@ -220,3 +220,122 @@ class TestForwardedInbound:
             parent_done.set()
             await client.stop()
             await emu
+
+
+class TestListenerReadSnapshot:
+    """When a fresh read snapshot is present, STATUS/STATS/PEERS and
+    TELEMETRY_* are answered from cache without any IPC round-trip
+    to the parent."""
+
+    @pytest.mark.asyncio
+    async def test_status_served_from_cache(self, listener):
+        """STATUS_REQUEST uses cached bytes; no inbound_message event."""
+        handle, port = listener
+        handle.send_cmd({
+            "cmd": "peer_snapshot", "peers": {}, "banned": [],
+        })
+        cached_payload = json.dumps(
+            {"host": "cached-host:1", "cached": True},
+        ).encode("utf-8")
+        handle.send_cmd({
+            "cmd": "read_snapshot",
+            "status": cached_payload,
+            "stats": None, "peers": None, "telemetry": {},
+        })
+        # Give the listener a moment to apply the snapshot command
+        # (it's pumped off the main event loop via run_in_executor).
+        await asyncio.sleep(0.6)
+
+        saw_forward = asyncio.Event()
+
+        async def watch_no_forward():
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                msg = handle.recv()
+                if msg is None:
+                    await asyncio.sleep(0.02)
+                    continue
+                if msg.get("event") == "inbound_message":
+                    saw_forward.set()
+                    return
+
+        watcher = asyncio.create_task(watch_no_forward())
+        client = NodeClient(
+            node_timeout=5.0, verify_tls=False, connect_timeout=2.0,
+        )
+        await client.start()
+        try:
+            ok = await client.connect_to_peer(f"127.0.0.1:{port}")
+            assert ok
+            status = await client.get_peer_status(f"127.0.0.1:{port}")
+            assert status is not None
+            assert status.get("cached") is True
+            assert status.get("host") == "cached-host:1"
+            # No forward event should have been emitted.
+            await asyncio.sleep(0.2)
+            assert not saw_forward.is_set(), (
+                "STATUS_REQUEST should have been served locally"
+            )
+        finally:
+            watcher.cancel()
+            await client.stop()
+
+    @pytest.mark.asyncio
+    async def test_missing_field_falls_back_to_forward(self, listener):
+        """If read_snapshot has None for a field, the listener forwards."""
+        handle, port = listener
+        handle.send_cmd({
+            "cmd": "peer_snapshot", "peers": {}, "banned": [],
+        })
+        # Send a read snapshot with status=None so STATUS must forward.
+        handle.send_cmd({
+            "cmd": "read_snapshot",
+            "status": None, "stats": None, "peers": None,
+            "telemetry": {},
+        })
+        await asyncio.sleep(0.6)
+
+        forwarded = asyncio.Event()
+
+        async def parent_emulator():
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                msg = handle.recv()
+                if msg is None:
+                    await asyncio.sleep(0.02)
+                    continue
+                if msg.get("event") != "inbound_message":
+                    continue
+                msg_id = msg.get("msg_id")
+                raw = base64.b64decode(msg.get("raw_b64", ""))
+                incoming = QuicMessage.from_bytes(raw)
+                if incoming.msg_type != QuicMessageType.STATUS_REQUEST:
+                    continue
+                forwarded.set()
+                resp = incoming.create_response(
+                    json.dumps({"from": "fallback"}).encode(),
+                )
+                handle.send_cmd({
+                    "cmd": "inbound_response",
+                    "msg_id": msg_id,
+                    "payload_b64": base64.b64encode(
+                        resp.to_bytes(),
+                    ).decode("ascii"),
+                })
+                return
+
+        emu = asyncio.create_task(parent_emulator())
+        client = NodeClient(
+            node_timeout=5.0, verify_tls=False, connect_timeout=2.0,
+        )
+        await client.start()
+        try:
+            ok = await client.connect_to_peer(f"127.0.0.1:{port}")
+            assert ok
+            status = await client.get_peer_status(f"127.0.0.1:{port}")
+            assert status is not None
+            assert status.get("from") == "fallback"
+            assert forwarded.is_set()
+        finally:
+            await client.stop()
+            await emu
