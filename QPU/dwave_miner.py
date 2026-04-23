@@ -23,6 +23,27 @@ from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.dwave_topology import DWaveTopology
 
 
+def _best_effort_cancel(future: Any, label: str = "") -> None:
+    """Best-effort cancel of a D-Wave future.
+
+    D-Wave's remote cancel is advisory (the solver may have already
+    run) but invoking it lets the client release network resources.
+    Failures are logged at debug level so flaky networks during
+    teardown don't spam production logs.
+    """
+    cancel_fn = getattr(future, "cancel", None)
+    if not callable(cancel_fn):
+        return
+    try:
+        cancel_fn()
+    except Exception as exc:
+        init_logger.debug(
+            "D-Wave future.cancel() failed%s (best-effort): %s: %s",
+            f" for {label}" if label else "",
+            type(exc).__name__, exc,
+        )
+
+
 def _shift_energies(sampleset: dimod.SampleSet, offset: float) -> dimod.SampleSet:
     """Shift all energies in a sampleset by a constant offset.
 
@@ -278,27 +299,14 @@ class DWaveMiner(BaseMiner):
         stop_event = self._stop_event
 
         def _cancel_pending():
-            """Best-effort abandon of in-flight D-Wave futures on stop.
+            """Abandon in-flight D-Wave futures on stop.
 
-            D-Wave's remote future cancel is advisory — the solver may
-            have already run — but calling it lets the client release
-            network resources. Locally we drop the pending map, which is
-            what frees the node to move on. Per-future failures are
-            logged at debug level so an SDK that drops the cancel API
-            (or a network blip during teardown) leaves an audit trail
-            without spamming production logs.
+            Remote cancel is best-effort (see _best_effort_cancel).
+            Clearing the local map is what frees the mining child to
+            move on to the next block.
             """
             for _mdl, fut, _defect, fidx in pending.values():
-                cancel_fn = getattr(fut, "cancel", None)
-                if callable(cancel_fn):
-                    try:
-                        cancel_fn()
-                    except Exception as exc:
-                        self.logger.debug(
-                            f"D-Wave future.cancel() failed for job "
-                            f"{fidx} (best-effort): "
-                            f"{type(exc).__name__}: {exc}"
-                        )
+                _best_effort_cancel(fut, label=f"job {fidx}")
             pending.clear()
 
         drain_engaged = False
@@ -428,6 +436,13 @@ class DWaveMiner(BaseMiner):
             if self.time_manager is not None:
                 self.time_manager.record_block_time(qpu_total_access)
 
+    #: Hard wall-time cap on the synchronous fallback _sample path.
+    #: Without this, the mining child can block indefinitely inside
+    #: the D-Wave SDK (the underlying sample call has no timeout)
+    #: and stop_event is never observed — which looks to the
+    #: orchestrator like mining silently stopped.
+    SYNC_SAMPLE_TIMEOUT = 60.0
+
     def _sample(
         self,
         h: Dict[int, float],
@@ -438,13 +453,21 @@ class DWaveMiner(BaseMiner):
         annealing_time: float = 120.0,
         **kwargs,
     ) -> dimod.SampleSet:
-        """Synchronous QPU sampling (fallback, not used in streaming)."""
+        """Fallback synchronous QPU sampling with cancel + timeout.
+
+        Uses sample_ising_async + polling so this path is cancellable
+        via stop_event and bounded by SYNC_SAMPLE_TIMEOUT. Used when
+        the streaming _sample_batch path is unavailable (e.g. after
+        a feeder exception tore down the stream generator).
+        """
         h_cast = cast(Mapping[Any, float], h)
         J_cast = cast(Mapping[Tuple[Any, Any], float], J)
 
         topology_label = self.sampler.job_label
         nonce_seed = kwargs.pop('nonce_seed', None)
-        sampleset = self.sampler.sample_ising(
+
+        t0 = time.monotonic()
+        future, defect_info = self.sampler.sample_ising_async(
             h_cast, J_cast,
             num_reads=num_reads,
             answer_mode='raw',
@@ -452,7 +475,33 @@ class DWaveMiner(BaseMiner):
             label=f"{topology_label}_sync",
             nonce_seed=nonce_seed,
         )
+
+        deadline = t0 + self.SYNC_SAMPLE_TIMEOUT
+        stop_event = self._stop_event
+        while not future.done():
+            if stop_event is not None and stop_event.is_set():
+                _best_effort_cancel(future)
+                raise RuntimeError("mining cancelled during _sample")
+            if time.monotonic() >= deadline:
+                _best_effort_cancel(future)
+                raise TimeoutError(
+                    f"QPU _sample exceeded {self.SYNC_SAMPLE_TIMEOUT:.1f}s "
+                    f"(label={topology_label}_sync)"
+                )
+            time.sleep(0.05)
+
+        elapsed = time.monotonic() - t0
+        raw_ss = future.sampleset
+        if defect_info is not None:
+            sampleset = self.sampler.reconstruct_full_sampleset(
+                raw_ss, defect_info,
+            )
+        else:
+            sampleset = raw_ss
         self._record_qpu_timing(sampleset)
+        self.logger.info(
+            f"[QPU] _sample (sync fallback) completed in {elapsed:.2f}s"
+        )
         return sampleset
 
     def _post_mine_cleanup(self) -> None:

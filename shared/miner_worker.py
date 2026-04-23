@@ -203,9 +203,26 @@ def miner_worker_main(
             # the cancel — exactly the original bug. Letting a set
             # event short-circuit mine_block() is the desired behaviour
             # (the cancellation reached us before mining started).
-            result = miner.mine_block(prev_block, node_info, requirements, prev_timestamp, stop_event)
-            if result is not None:
-                resp_q.put(result)
+            try:
+                result = miner.mine_block(prev_block, node_info, requirements, prev_timestamp, stop_event)
+            except Exception as exc:
+                # mine_block is expected to swallow sampling-path
+                # errors via _on_sampling_error. If anything raises
+                # through, dying here leaves the parent putting
+                # future mine_block ops into a queue nobody reads;
+                # mining silently stops and the orchestrator never
+                # knows. Log + report + stay alive so the next
+                # mine() op gets a fresh attempt.
+                import traceback
+                logger.error(
+                    f"[{miner.miner_id}] mine_block raised: "
+                    f"{type(exc).__name__}: {exc}\n"
+                    f"{traceback.format_exc()}"
+                )
+                resp_q.put({"op": "error", "message": f"{type(exc).__name__}: {exc}", "id": spec.get("id")})
+            else:
+                if result is not None:
+                    resp_q.put(result)
         else:
             resp_q.put({"op": "error", "message": f"Unknown op {op}", "id": spec.get("id")})
             logger.info(f"{miner.miner_id}: Unknown op {op}")

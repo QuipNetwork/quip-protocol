@@ -149,19 +149,24 @@ class IsingFeeder:
         if self._stopped:
             return
         still_pending = []
+        failures = 0
         for f in self._futures:
             if f.done():
                 try:
                     self._queue.put_nowait(f.result())
                 except Exception as exc:
+                    failures += 1
                     logger.warning(
-                        "IsingFeeder worker failed: %s",
-                        exc,
+                        "IsingFeeder worker failed: %s (pending=%d, "
+                        "queue=%d, buffer_size=%d)",
+                        exc, len(still_pending),
+                        self._queue.qsize(), self._buffer_size,
                     )
             else:
                 still_pending.append(f)
         self._futures = still_pending
 
+        submitted = 0
         while (
             len(self._futures) + self._queue.qsize()
             < self._buffer_size
@@ -177,6 +182,19 @@ class IsingFeeder:
                 salt,
             )
             self._futures.append(f)
+            submitted += 1
+
+        # Buffer state visibility: log when the feeder is drained
+        # (callers fighting for queue slots) or when workers failed.
+        ready = self._queue.qsize()
+        pending = len(self._futures)
+        if failures or ready == 0:
+            logger.info(
+                "IsingFeeder state: ready=%d pending=%d "
+                "buffer_size=%d submitted=%d failures=%d",
+                ready, pending, self._buffer_size,
+                submitted, failures,
+            )
 
     def __iter__(self):
         return self
@@ -217,6 +235,15 @@ class IsingFeeder:
         Used only during cold start when the buffer hasn't
         filled yet. Once the pipeline is running, use pop()
         (non-blocking) or try_pop() instead.
+
+        No timeout on .result() — cold start of spawn-context
+        workers on a loaded node can exceed any arbitrary bound
+        (heavy imports + topology parse happen on first task).
+        A shorter timeout only orphans the future: pop(0) has
+        already removed it from self._futures, so a timeout means
+        the worker keeps running with no one reading its result.
+        Cancellation is handled one level up via the mining
+        loop's stop_event.
         """
         self._fill()
         try:
@@ -226,7 +253,16 @@ class IsingFeeder:
         assert self._futures, (
             "IsingFeeder: no pending work and empty queue"
         )
-        model = self._futures.pop(0).result(timeout=10.0)
+        fut = self._futures.pop(0)
+        t0 = time.monotonic()
+        model = fut.result()
+        waited = time.monotonic() - t0
+        if waited > 1.0:
+            logger.info(
+                "IsingFeeder.pop_blocking waited %.2fs for a "
+                "worker (pending=%d, queue=%d)",
+                waited, len(self._futures), self._queue.qsize(),
+            )
         self._fill()
         return model
 
