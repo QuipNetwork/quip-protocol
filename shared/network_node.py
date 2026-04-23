@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
 
 from dataclasses import dataclass
 from typing import Dict, Optional, Callable, Any
@@ -386,20 +387,25 @@ class NetworkNode(Node):
         self._connection_worker: Optional['ConnectionWorkerHandle'] = None
         self._connection_request_pending = False
 
-        # Process pool for per-connection peer isolation (initialized in start())
+        # Process pool for per-connection peer isolation (initialized in start()).
+        # Events flow via ``loop.add_reader`` callbacks registered by
+        # the pool itself, so no coordinator-side drain task.
         self._process_pool: Optional[ProcessPool] = None
-        # Pool event drain task (initialized in start())
-        self._pool_drain_task: Optional[asyncio.Task] = None
         # Pending RPC-style requests correlated by request_id. Populated
         # by outbound routing (request_block/status/peers, probe_request)
-        # and resolved by the event drain when the matching event
-        # arrives from a child.
+        # and resolved by the pool event callback when the matching
+        # event arrives from a child.
         self._pending_requests: Dict[int, asyncio.Future] = {}
         self._next_pool_request_id: int = 1
-        # Listener handle + drain tasks, initialized in start().
+        # Listener handle, initialized in start(). The listener pipe is
+        # likewise registered via ``loop.add_reader``; only the
+        # snapshot-push loop runs as a periodic task.
         self._listener: Optional[Any] = None  # ListenerProcessHandle
-        self._listener_drain_task: Optional[asyncio.Task] = None
         self._listener_snapshot_task: Optional[asyncio.Task] = None
+        # Telemetry aggregator process (initialized in start()). Drains
+        # observability datagrams from workers into per-peer JSON files
+        # entirely off the control-plane pipe.
+        self._telemetry_aggregator: Optional[Any] = None
         # CPU-bound handler executor (BLOCK_REQUEST serialize,
         # CHAIN_MANIFEST walk, SOLVE_REQUEST sampling). Lazy-init
         # on first dispatch so nodes that never serve these
@@ -595,13 +601,40 @@ class NetworkNode(Node):
         )
         self._connection_worker.start()
 
-        # Initialize process pool for per-connection peer isolation
+        # Spawn the telemetry aggregator before the pool so workers can
+        # emit observability datagrams from their very first heartbeat
+        # cycle. The aggregator owns the AF_UNIX DGRAM socket and drains
+        # events into ``<telemetry_dir>/gossip/<peer>.json`` with no
+        # coupling to the coordinator's event loop.
+        from shared.telemetry_aggregator import spawn_telemetry_aggregator
+        telemetry_dir = Path(self.config.get("telemetry_dir", "telemetry"))
+        telemetry_dir.mkdir(parents=True, exist_ok=True)
+        telemetry_socket = str(telemetry_dir / "telemetry.sock")
+        self._telemetry_aggregator = spawn_telemetry_aggregator(
+            socket_path=telemetry_socket,
+            telemetry_dir=str(telemetry_dir),
+        )
+        self.logger.info(
+            f"Spawned telemetry aggregator "
+            f"(pid={self._telemetry_aggregator.process.pid}, "
+            f"socket={telemetry_socket})"
+        )
+
+        # Initialize process pool for per-connection peer isolation.
+        # The loop + on_event hookup lets the pool dispatch handle
+        # events directly from ``loop.add_reader`` callbacks, replacing
+        # the prior 100 ms polling drainer.
         pool_cfg = ProcessPoolConfig(
             max_connections=self.max_connections,
             node_timeout=self.node_timeout,
             verify_tls=self.verify_tls,
+            telemetry_socket=telemetry_socket,
         )
-        self._process_pool = ProcessPool(config=pool_cfg, logger=self.logger)
+        self._process_pool = ProcessPool(
+            config=pool_cfg, logger=self.logger,
+            loop=asyncio.get_running_loop(),
+            on_event=self._dispatch_pool_event,
+        )
 
         # Spawn the inbound listener process. It owns the UDP socket
         # and runs aioquic in its own event loop; the coordinator
@@ -686,6 +719,11 @@ class NetworkNode(Node):
             )
             await self.rest_api_server.start()
 
+        # Hoist telemetry disk writes off the coordinator's event loop.
+        # ``update_node``/``record_block`` now enqueue; a dedicated
+        # writer task drains via ``asyncio.to_thread``.
+        self.telemetry.enable_async_writes()
+
         # Start telemetry cache
         if self.telemetry_cache is not None:
             await self.telemetry_cache.start()
@@ -697,12 +735,11 @@ class NetworkNode(Node):
         self.gossip_processor_task = asyncio.create_task(self.gossip_processor_loop())
         self.server_task = asyncio.create_task(self.server_loop())
         self.rebalance_task = asyncio.create_task(self.rebalance_loop())
-        self._pool_drain_task = asyncio.create_task(
-            self._process_pool_event_drain()
-        )
-        self._listener_drain_task = asyncio.create_task(
-            self._listener_event_drain()
-        )
+        # Pool events now flow via ``loop.add_reader`` registered from
+        # within ``ProcessPool.spawn``; no polling drain task needed.
+        # Listener events likewise use add_reader, registered next to
+        # the listener spawn below.
+        self._register_listener_reader()
         self._listener_snapshot_task = asyncio.create_task(
             self._listener_snapshot_loop()
         )
@@ -766,6 +803,12 @@ class NetworkNode(Node):
                     pool.shutdown_all(timeout=1.0)
                 except Exception:
                     pass
+            agg = getattr(self, "_telemetry_aggregator", None)
+            if agg is not None:
+                try:
+                    agg.shutdown(timeout=1.0)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -785,15 +828,21 @@ class NetworkNode(Node):
         self.logger.info("Shutting down network node...")
 
         # 1. Stop inbound first — reject new packets.
-        if self._listener_drain_task:
-            self._listener_drain_task.cancel()
-            self._listener_drain_task = None
         if self._listener_snapshot_task:
             self._listener_snapshot_task.cancel()
             self._listener_snapshot_task = None
         if self._listener is not None:
             self.logger.info("Stopping listener process...")
+            self._unregister_listener_reader()
             self._listener.shutdown()
+            # Flush queued listener commands before SIGTERM so the
+            # shutdown command actually reaches the child.
+            try:
+                await self._listener.aclose(timeout=2.0)
+            except Exception:
+                self.logger.debug(
+                    "listener.aclose raised", exc_info=True,
+                )
             self._listener.force_stop(timeout=3.0)
             self._listener = None
 
@@ -814,17 +863,30 @@ class NetworkNode(Node):
             self._handler_executor = None
 
         # 2. Stop outbound — no new gossip/heartbeat/block fetches.
-        if self._pool_drain_task:
-            self._pool_drain_task.cancel()
-            self._pool_drain_task = None
         if self._process_pool:
             self.logger.info("Stopping process pool...")
+            # Flush each handle's outbound sender on the event loop
+            # first so queued shutdown commands and final RPC replies
+            # reach the workers before we SIGTERM them.
+            try:
+                await self._process_pool.aclose_senders(timeout=2.0)
+            except Exception:
+                self.logger.debug(
+                    "aclose_senders raised", exc_info=True,
+                )
             self._process_pool.shutdown_all(timeout=5.0)
             self._process_pool = None
         if self._connection_worker:
             self.logger.info("Stopping connection worker...")
             self._connection_worker.close()
             self._connection_worker = None
+
+        # 2b. Stop the telemetry aggregator only after the pool is gone,
+        # so workers can't keep emitting to a half-closed socket.
+        if self._telemetry_aggregator is not None:
+            self.logger.info("Stopping telemetry aggregator...")
+            self._telemetry_aggregator.shutdown(timeout=3.0)
+            self._telemetry_aggregator = None
 
         # 3. Stop REST API so no new external queries land on a
         #    half-torn-down coordinator.
@@ -1012,29 +1074,6 @@ class NetworkNode(Node):
         finally:
             self._pending_requests.pop(request_id, None)
 
-    async def _process_pool_event_drain(self) -> None:
-        """Drain events from child processes and dispatch them.
-
-        Runs for the lifetime of the node. Polls the pool every 100 ms
-        (non-blocking) and forwards each event to
-        ``_dispatch_pool_event``. Errors are logged but do not stop
-        the drain.
-        """
-        while self.running:
-            try:
-                if self._process_pool is not None:
-                    events = self._process_pool.poll_events()
-                    for peer, event in events:
-                        self._dispatch_pool_event(peer, event)
-                await asyncio.sleep(0.1)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                self.logger.exception(
-                    "Error in process pool event drain"
-                )
-                await asyncio.sleep(1.0)
-
     def _dispatch_pool_event(self, peer: str, event: dict) -> None:
         """Route a single child event to SWIM, scoring, or an RPC future."""
         ev = event.get("event")
@@ -1053,12 +1092,6 @@ class NetworkNode(Node):
         elif ev == "gossip_result":
             # Counters already recorded in child; nothing else to do.
             pass
-        elif ev == "gossip_stats":
-            self.logger.debug(
-                f"gossip_stats {peer}: sent={event.get('sent')} "
-                f"responded={event.get('responded')} "
-                f"failed={event.get('failed')}"
-            )
         elif ev in ("block_data", "block_header_data", "status_data",
                     "peers_data", "probe_result"):
             rid = event.get("request_id")
@@ -1084,54 +1117,81 @@ class NetworkNode(Node):
             )
             asyncio.create_task(self.remove_node(peer))
 
-    async def _listener_event_drain(self) -> None:
-        """Drain inbound events from the listener process.
+    def _register_listener_reader(self) -> None:
+        """Wire the listener pipe into the event loop via ``add_reader``.
 
-        ``peer_heartbeat`` events update coordinator state without the
-        peer-side HB timeout clock running. ``inbound_message`` events
-        spawn a handler task that invokes the existing dispatcher and
-        returns the response via ``inbound_response``.
+        Replaces the prior polling ``_listener_event_drain``. The
+        callback drains all pending messages on each readable wake
+        and dispatches them synchronously; long-running handlers
+        schedule themselves via ``asyncio.create_task``.
         """
-        while self.running and self._listener is not None:
+        listener = self._listener
+        if listener is None:
+            return
+        try:
+            fd = listener.pipe.fileno()
+        except (OSError, ValueError):
+            return
+        loop = asyncio.get_running_loop()
+        loop.add_reader(fd, self._on_listener_readable)
+
+    def _unregister_listener_reader(self) -> None:
+        """Detach the listener pipe from the loop. Idempotent."""
+        listener = self._listener
+        if listener is None:
+            return
+        try:
+            fd = listener.pipe.fileno()
+        except (OSError, ValueError):
+            return
+        try:
+            asyncio.get_running_loop().remove_reader(fd)
+        except (ValueError, OSError, RuntimeError):
+            pass
+
+    def _on_listener_readable(self) -> None:
+        """Drain listener events from a single readable wake.
+
+        ``peer_heartbeat`` updates coordinator state inline.
+        ``inbound_message`` spawns a handler task. Lifecycle events
+        log. A broken pipe triggers listener teardown on the next
+        cycle via ``listener_died``.
+        """
+        listener = self._listener
+        if listener is None:
+            return
+        while True:
             try:
-                listener = self._listener
-                if listener is None:
-                    break
-                events = []
-                while True:
-                    msg = listener.recv()
-                    if msg is None:
-                        break
-                    events.append(msg)
-                for event in events:
-                    ev = event.get("event")
-                    if ev == "peer_heartbeat":
-                        self._apply_listener_heartbeat(event)
-                    elif ev == "inbound_message":
-                        asyncio.create_task(
-                            self._handle_forwarded_inbound(event)
-                        )
-                    elif ev == "listener_ready":
-                        self.logger.info(
-                            f"Listener ready on port {event.get('port')}"
-                        )
-                    elif ev == "listener_error":
-                        self.logger.error(
-                            f"Listener error: {event.get('message')}"
-                        )
-                    elif ev == "listener_died":
-                        self.logger.error(
-                            f"Listener process died: {event.get('reason')}"
-                        )
-                        break
-                await asyncio.sleep(0.05)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                self.logger.exception(
-                    "Error in listener event drain"
+                if not listener.pipe.poll(0):
+                    return
+                event = listener.pipe.recv()
+            except (BrokenPipeError, OSError, EOFError) as exc:
+                self.logger.error(
+                    f"Listener pipe broken: {exc}"
                 )
-                await asyncio.sleep(1.0)
+                self._unregister_listener_reader()
+                return
+            ev = event.get("event")
+            if ev == "peer_heartbeat":
+                self._apply_listener_heartbeat(event)
+            elif ev == "inbound_message":
+                asyncio.create_task(
+                    self._handle_forwarded_inbound(event)
+                )
+            elif ev == "listener_ready":
+                self.logger.info(
+                    f"Listener ready on port {event.get('port')}"
+                )
+            elif ev == "listener_error":
+                self.logger.error(
+                    f"Listener error: {event.get('message')}"
+                )
+            elif ev == "listener_died":
+                self.logger.error(
+                    f"Listener process died: {event.get('reason')}"
+                )
+                self._unregister_listener_reader()
+                return
 
     def _apply_listener_heartbeat(self, event: dict) -> None:
         """Record an inbound heartbeat reported by the listener.

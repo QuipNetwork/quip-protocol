@@ -48,6 +48,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from shared.logging_config import QuipFormatter
+from shared.pipe_sender import AsyncPipeSender
+from shared.telemetry_sink import configure_sink, get_sink
 
 
 def _setup_child_logging(peer: str) -> logging.Logger:
@@ -64,24 +66,47 @@ def _setup_child_logging(peer: str) -> logging.Logger:
 
 @dataclass
 class ConnectionProcessHandle:
-    """Parent-side handle to a connection child process."""
+    """Parent-side handle to a connection child process.
+
+    Outbound commands go through ``sender`` (an ``AsyncPipeSender``)
+    so that ``send_cmd`` never blocks the coordinator's event loop on
+    a full pipe. Inbound events are still polled via ``recv`` from the
+    coordinator's event-driven reader.
+    """
     peer_address: str
     process: mp.Process
     pipe: mp.connection.Connection
     stop_event: mp.synchronize.Event
+    sender: AsyncPipeSender = field(init=False)
     started_at: float = field(default_factory=time.monotonic)
     last_activity: float = field(default_factory=time.monotonic)
+
+    def __post_init__(self) -> None:
+        # The sender lazy-starts its drainer on first send so this
+        # object is safe to construct in sync contexts (tests). In
+        # production it is constructed from ``ProcessPool.spawn`` on
+        # the coordinator's event-loop thread.
+        self.sender = AsyncPipeSender(
+            self.pipe, maxsize=256, name=self.peer_address,
+        )
 
     def is_alive(self) -> bool:
         return self.process.is_alive()
 
     def send_cmd(self, cmd: dict) -> bool:
-        """Send a command to the child process. Returns False if pipe is broken."""
-        try:
-            self.pipe.send(cmd)
-            return True
-        except (BrokenPipeError, OSError):
-            return False
+        """Enqueue a command for async send. Drops on full queue.
+
+        Non-blocking; the actual ``pipe.send`` runs off-thread via the
+        sender's drainer task. Returns False if the queue is full or
+        the pipe is already known broken.
+        """
+        return self.sender.send_nowait(cmd)
+
+    async def send_cmd_blocking(
+        self, cmd: dict, timeout: float = 5.0,
+    ) -> bool:
+        """Await enqueue with timeout. For lifecycle / critical commands."""
+        return await self.sender.send_blocking(cmd, timeout=timeout)
 
     def poll(self, timeout: float = 0) -> bool:
         """Check if data is available on the pipe."""
@@ -107,13 +132,22 @@ class ConnectionProcessHandle:
         return None
 
     def shutdown(self) -> None:
-        """Request graceful shutdown of the child process."""
+        """Request graceful shutdown of the child process.
+
+        The ``stop_event`` is the primary path; the shutdown command
+        is best-effort (may be dropped on full queue, in which case
+        the child exits via the ``stop_event`` poll loop instead).
+        """
         self.stop_event.set()
         self.send_cmd({"cmd": "shutdown"})
 
     def force_stop(self, timeout: float = 3.0) -> None:
         """Terminate the child process, escalating to kill if needed."""
         self.stop_event.set()
+        # The sender owns an asyncio task; best-effort signal it to
+        # stop accepting new sends. The async ``close`` is handled by
+        # the ProcessPool teardown path which has access to the loop.
+        self.sender._closing = True
         if not self.process.is_alive():
             return
         self.process.terminate()
@@ -121,6 +155,14 @@ class ConnectionProcessHandle:
         if self.process.is_alive():
             self.process.kill()
             self.process.join(timeout=1.0)
+
+    async def aclose(self, timeout: float = 2.0) -> None:
+        """Async-close the outbound sender (drainer task).
+
+        Pool teardown calls this before ``force_stop`` to flush any
+        queued shutdown commands rather than dropping them.
+        """
+        await self.sender.close(timeout=timeout)
 
 
 def connection_process_main(
@@ -130,6 +172,7 @@ def connection_process_main(
     verify_tls: bool,
     stop_event: mp.synchronize.Event,
     connect_timeout: Optional[float] = None,
+    telemetry_socket: Optional[str] = None,
 ) -> None:
     """Child process entry point: own event loop, single QUIC connection.
 
@@ -143,6 +186,11 @@ def connection_process_main(
             (including the close handshake on unreachable peers).
             ``None`` preserves the default ~5 s handshake + up to
             ~10 s cleanup behavior.
+        telemetry_socket: Path to the AF_UNIX DGRAM sink exposed by
+            ``telemetry_aggregator``. When provided, observability
+            events (``gossip_stats`` today) are emitted there instead
+            of the control pipe. ``None`` disables observability
+            emission — useful in tests.
     """
     def _signal_handler(_signum, _frame):
         stop_event.set()
@@ -152,6 +200,9 @@ def connection_process_main(
 
     log = _setup_child_logging(peer_address)
     log.info(f"Connection process started for {peer_address}")
+
+    if telemetry_socket:
+        configure_sink(telemetry_socket)
 
     from shared.event_loop import create_event_loop
     loop = create_event_loop()
@@ -187,6 +238,30 @@ class GossipStats:
 
 _GOSSIP_STATS_INTERVAL = 60.0
 
+_WORKER_SENDER: Optional[AsyncPipeSender] = None
+"""Process-global outbound sender (worker → coord). Initialized by
+``_connection_loop`` at startup and closed in its ``finally``. Module-
+global is safe because one connection_process == one OS process."""
+
+
+async def _send_event(
+    msg: dict, *, critical: bool = False, timeout: float = 5.0,
+) -> bool:
+    """Async send helper for worker → coord events.
+
+    ``critical=True`` awaits enqueue with *timeout*; used for RPC
+    replies and terminal events where a silent drop would strand a
+    coord-side future. ``critical=False`` is drop-newest, used for
+    idempotent/re-emittable events (heartbeat_ok/fail, gossip_result)
+    whose loss the coordinator tolerates.
+    """
+    sender = _WORKER_SENDER
+    if sender is None:
+        return False
+    if critical:
+        return await sender.send_blocking(msg, timeout=timeout)
+    return sender.send_nowait(msg)
+
 
 def _report_gossip_stats(
     stats: 'GossipStats',
@@ -194,7 +269,13 @@ def _report_gossip_stats(
     peer_address: str,
     log: logging.Logger,
 ) -> None:
-    """Log a one-line summary and forward stats to the parent process."""
+    """Log a one-line summary and emit stats via the telemetry sink.
+
+    Pure observability: never crosses the control-plane pipe. Emission
+    is lossy (AF_UNIX DGRAM, non-blocking); the ``pipe`` argument stays
+    in the signature for backward-compatible callers but is unused.
+    """
+    del pipe  # control-plane pipe intentionally unused for observability
     if stats.sent == 0:
         return
     rate = (stats.responded / stats.sent) * 100.0
@@ -203,12 +284,15 @@ def _report_gossip_stats(
         f"responded={stats.responded} failed={stats.failed} "
         f"({rate:.0f}% success)"
     )
-    _send_safe(pipe, {
-        "event": "gossip_stats",
-        "sent": stats.sent,
-        "responded": stats.responded,
-        "failed": stats.failed,
-    })
+    sink = get_sink()
+    if sink is not None:
+        sink.emit({
+            "peer": peer_address,
+            "sent": stats.sent,
+            "responded": stats.responded,
+            "failed": stats.failed,
+            "ts": time.time(),
+        })
 
 
 async def _connection_loop(
@@ -222,6 +306,12 @@ async def _connection_loop(
 ) -> None:
     """Async main loop: establish connection, then process commands."""
     from shared.node_client import NodeClient
+
+    global _WORKER_SENDER
+    _WORKER_SENDER = AsyncPipeSender(
+        pipe, maxsize=128, name=f"worker:{peer_address}", logger=log,
+    )
+    _WORKER_SENDER.start()
 
     client = NodeClient(
         node_timeout=node_timeout,
@@ -242,10 +332,10 @@ async def _connection_loop(
         connected = await connect_task
         if not connected:
             if not stop_event.is_set():
-                _send_safe(pipe, {
+                await _send_event({
                     "event": "disconnected",
                     "reason": "Failed to establish QUIC connection",
-                })
+                }, critical=True)
             return
 
         # Main command loop
@@ -314,6 +404,14 @@ async def _connection_loop(
             await asyncio.wait_for(client.stop(), timeout=2.0)
         except (asyncio.TimeoutError, Exception):
             pass
+        # Drain the outbound sender so queued RPC replies reach the
+        # coordinator before the process exits.
+        sender = _WORKER_SENDER
+        if sender is not None:
+            try:
+                await sender.close(timeout=2.0)
+            except Exception:
+                pass
 
 
 async def _connect_with_cancel(
@@ -358,15 +456,15 @@ async def _handle_heartbeat(
         miner_info = MinerInfo.from_json(json.dumps(miner_info_data))
         ok = await client.send_heartbeat(peer_address, public_host, miner_info)
         if ok:
-            _send_safe(pipe, {"event": "heartbeat_ok"})
+            await _send_event({"event": "heartbeat_ok"})
         else:
-            _send_safe(pipe, {
+            await _send_event({
                 "event": "heartbeat_fail",
                 "reason": "no response",
             })
     except Exception as exc:
         log.debug(f"Heartbeat error: {exc}")
-        _send_safe(pipe, {"event": "heartbeat_fail", "reason": str(exc)})
+        await _send_event({"event": "heartbeat_fail", "reason": str(exc)})
 
 
 async def _handle_gossip(
@@ -389,11 +487,11 @@ async def _handle_gossip(
             stats.responded += 1
         else:
             stats.failed += 1
-        _send_safe(pipe, {"event": "gossip_result", "success": ok})
+        await _send_event({"event": "gossip_result", "success": ok})
     except Exception as exc:
         stats.failed += 1
         log.debug(f"Gossip error: {exc}")
-        _send_safe(pipe, {"event": "gossip_result", "success": False})
+        await _send_event({"event": "gossip_result", "success": False})
 
 
 async def _handle_request_block(
@@ -410,23 +508,23 @@ async def _handle_request_block(
         block = await client.get_peer_block(peer_address, block_num)
         if block is not None:
             block_bytes = block.to_network()
-            _send_safe(pipe, {
+            await _send_event({
                 "event": "block_data",
                 "request_id": request_id,
                 "block_num": block_num,
                 "data": base64.b64encode(block_bytes).decode('ascii'),
-            })
+            }, critical=True)
         else:
-            _send_safe(pipe, {
+            await _send_event({
                 "event": "error",
                 "request_id": request_id,
                 "message": f"Block {block_num} not available from {peer_address}",
-            })
+            }, critical=True)
     except Exception as exc:
         log.debug(f"Block request error: {exc}")
-        _send_safe(pipe, {
+        await _send_event({
             "event": "error", "request_id": request_id, "message": str(exc),
-        })
+        }, critical=True)
 
 
 async def _handle_request_block_header(
@@ -443,23 +541,23 @@ async def _handle_request_block_header(
         header = await client.get_peer_block_header(peer_address, block_num)
         if header is not None:
             header_bytes = header.to_network()
-            _send_safe(pipe, {
+            await _send_event({
                 "event": "block_header_data",
                 "request_id": request_id,
                 "block_num": block_num,
                 "data": base64.b64encode(header_bytes).decode('ascii'),
-            })
+            }, critical=True)
         else:
-            _send_safe(pipe, {
+            await _send_event({
                 "event": "error",
                 "request_id": request_id,
                 "message": f"Header {block_num} not available from {peer_address}",
-            })
+            }, critical=True)
     except Exception as exc:
         log.debug(f"Block header request error: {exc}")
-        _send_safe(pipe, {
+        await _send_event({
             "event": "error", "request_id": request_id, "message": str(exc),
-        })
+        }, critical=True)
 
 
 async def _handle_request_status(
@@ -474,22 +572,22 @@ async def _handle_request_status(
     try:
         status = await client.get_peer_status(peer_address)
         if status is not None:
-            _send_safe(pipe, {
+            await _send_event({
                 "event": "status_data",
                 "request_id": request_id,
                 "data": status,
-            })
+            }, critical=True)
         else:
-            _send_safe(pipe, {
+            await _send_event({
                 "event": "error",
                 "request_id": request_id,
                 "message": f"No status from {peer_address}",
-            })
+            }, critical=True)
     except Exception as exc:
         log.debug(f"Status request error: {exc}")
-        _send_safe(pipe, {
+        await _send_event({
             "event": "error", "request_id": request_id, "message": str(exc),
-        })
+        }, critical=True)
 
 
 async def _handle_request_peers(
@@ -505,11 +603,11 @@ async def _handle_request_peers(
     try:
         protocol = await client._get_connection(peer_address)
         if protocol is None:
-            _send_safe(pipe, {
+            await _send_event({
                 "event": "error",
                 "request_id": request_id,
                 "message": f"No connection to {peer_address}",
-            })
+            }, critical=True)
             return
         response = await protocol.send_request(
             QuicMessageType.PEERS_REQUEST, b'',
@@ -517,22 +615,22 @@ async def _handle_request_peers(
         )
         if response and response.msg_type == QuicMessageType.PEERS_RESPONSE:
             data = json.loads(response.payload.decode('utf-8'))
-            _send_safe(pipe, {
+            await _send_event({
                 "event": "peers_data",
                 "request_id": request_id,
                 "data": data,
-            })
+            }, critical=True)
         else:
-            _send_safe(pipe, {
+            await _send_event({
                 "event": "error",
                 "request_id": request_id,
                 "message": f"No peers response from {peer_address}",
-            })
+            }, critical=True)
     except Exception as exc:
         log.debug(f"Peers request error: {exc}")
-        _send_safe(pipe, {
+        await _send_event({
             "event": "error", "request_id": request_id, "message": str(exc),
-        })
+        }, critical=True)
 
 
 async def _handle_probe_request(
@@ -555,18 +653,18 @@ async def _handle_probe_request(
         result = await client.send_probe_request(
             peer_address, target, probe_id,
         )
-        _send_safe(pipe, {
+        await _send_event({
             "event": "probe_result",
             "request_id": request_id,
             "result": result,
-        })
+        }, critical=True)
     except Exception as exc:
         log.debug(f"Probe request error: {exc}")
-        _send_safe(pipe, {
+        await _send_event({
             "event": "probe_result",
             "request_id": request_id,
             "result": None,
-        })
+        }, critical=True)
 
 
 def _send_safe(pipe: mp.connection.Connection, msg: dict) -> bool:
@@ -583,6 +681,7 @@ def spawn_connection_process(
     node_timeout: float = 10.0,
     verify_tls: bool = False,
     connect_timeout: Optional[float] = None,
+    telemetry_socket: Optional[str] = None,
 ) -> ConnectionProcessHandle:
     """Spawn a new connection process for the given peer.
 
@@ -594,7 +693,7 @@ def spawn_connection_process(
     process = mp.Process(
         target=connection_process_main,
         args=(child_pipe, peer_address, node_timeout, verify_tls,
-              stop_event, connect_timeout),
+              stop_event, connect_timeout, telemetry_socket),
         daemon=True,
     )
     process.start()

@@ -51,9 +51,44 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Set, Tuple
 
 from shared.logging_config import QuipFormatter
+from shared.pipe_sender import AsyncPipeSender
 
 
 _DEFAULT_FORWARD_TIMEOUT = 4.5  # below peer-side HB timeout (5s)
+
+_LISTENER_SENDER: Optional[AsyncPipeSender] = None
+"""Process-global outbound sender (listener → coord). Initialized in
+``_listener_loop`` and closed in its ``finally``. Module-global is safe
+because the listener is its own OS process."""
+
+
+async def _send_event(
+    msg: dict, *, critical: bool = False, timeout: float = 5.0,
+) -> bool:
+    """Async send helper for listener → coord events.
+
+    Mirrors ``connection_process._send_event``: ``critical=True`` awaits
+    enqueue (for ``inbound_message`` forwards that a correlated future
+    is waiting on), otherwise drop-newest (``peer_heartbeat`` and
+    ``listener_ready``).
+    """
+    sender = _LISTENER_SENDER
+    if sender is None:
+        return False
+    if critical:
+        return await sender.send_blocking(msg, timeout=timeout)
+    return sender.send_nowait(msg)
+
+
+def _send_event_nowait(msg: dict) -> bool:
+    """Sync enqueue for async-adjacent sync callers (e.g. the aioquic
+    protocol's ``_handle_heartbeat_local`` is sync but called from an
+    async task on the event-loop thread, so ``put_nowait`` is safe).
+    """
+    sender = _LISTENER_SENDER
+    if sender is None:
+        return False
+    return sender.send_nowait(msg)
 
 
 def _setup_child_logging() -> logging.Logger:
@@ -70,21 +105,37 @@ def _setup_child_logging() -> logging.Logger:
 
 @dataclass
 class ListenerProcessHandle:
-    """Parent-side handle to the listener child process."""
+    """Parent-side handle to the listener child process.
+
+    Outbound commands go through ``sender`` (an ``AsyncPipeSender``),
+    so ``send_cmd`` never blocks the coordinator's event loop on a
+    full pipe. Inbound events are drained from the coordinator's
+    event-driven reader.
+    """
     process: mp.Process
     pipe: mp.connection.Connection
     stop_event: mp.synchronize.Event
+    sender: AsyncPipeSender = field(init=False)
     started_at: float = field(default_factory=time.monotonic)
+
+    def __post_init__(self) -> None:
+        # Sender lazy-starts its drainer on first send.
+        self.sender = AsyncPipeSender(
+            self.pipe, maxsize=256, name="listener",
+        )
 
     def is_alive(self) -> bool:
         return self.process.is_alive()
 
     def send_cmd(self, cmd: dict) -> bool:
-        try:
-            self.pipe.send(cmd)
-            return True
-        except (BrokenPipeError, OSError):
-            return False
+        """Enqueue a command for async send. Drops on full queue."""
+        return self.sender.send_nowait(cmd)
+
+    async def send_cmd_blocking(
+        self, cmd: dict, timeout: float = 5.0,
+    ) -> bool:
+        """Await enqueue with timeout. For lifecycle / critical commands."""
+        return await self.sender.send_blocking(cmd, timeout=timeout)
 
     def poll(self, timeout: float = 0) -> bool:
         try:
@@ -103,13 +154,19 @@ class ListenerProcessHandle:
         return None
 
     def shutdown(self) -> None:
-        """Request graceful shutdown."""
+        """Request graceful shutdown.
+
+        ``stop_event`` is the primary path; the shutdown command is
+        best-effort (may be dropped on full queue, in which case the
+        child exits via the ``stop_event`` poll loop).
+        """
         self.stop_event.set()
         self.send_cmd({"cmd": "shutdown"})
 
     def force_stop(self, timeout: float = 3.0) -> None:
         """Terminate the child, escalating to kill if needed."""
         self.stop_event.set()
+        self.sender._closing = True
         if not self.process.is_alive():
             return
         self.process.terminate()
@@ -117,6 +174,10 @@ class ListenerProcessHandle:
         if self.process.is_alive():
             self.process.kill()
             self.process.join(timeout=1.0)
+
+    async def aclose(self, timeout: float = 2.0) -> None:
+        """Async-close the outbound sender (drainer task)."""
+        await self.sender.close(timeout=timeout)
 
 
 @dataclass
@@ -210,6 +271,12 @@ async def _listener_loop(
     from aioquic.asyncio import serve
     from aioquic.quic.configuration import QuicConfiguration
 
+    global _LISTENER_SENDER
+    _LISTENER_SENDER = AsyncPipeSender(
+        pipe, maxsize=256, name="listener", logger=log,
+    )
+    _LISTENER_SENDER.start()
+
     cache = _PeerSnapshotCache()
     pending_forwards: Dict[int, asyncio.Future] = {}
     next_msg_id = 1
@@ -257,10 +324,10 @@ async def _listener_loop(
         configuration=configuration,
         create_protocol=_create_protocol,
     )
-    _send_safe(pipe, {
+    await _send_event({
         "event": "listener_ready",
         "port": int(config_bundle["port"]),
-    })
+    }, critical=True)
     log.info(
         f"Listener bound to {config_bundle['bind_address']}:"
         f"{config_bundle['port']}"
@@ -314,6 +381,13 @@ async def _listener_loop(
         for fut in pending_forwards.values():
             if not fut.done():
                 fut.set_result(None)
+        # Flush queued events (e.g. last peer_heartbeat) before exit.
+        sender = _LISTENER_SENDER
+        if sender is not None:
+            try:
+                await sender.close(timeout=2.0)
+            except Exception:
+                pass
 
 
 def _build_listener_protocol(
@@ -530,8 +604,10 @@ def _handle_heartbeat_local(
         )
 
     # Coordinator will do full SWIM / telemetry update on its own loop.
+    # Drop-newest: missed heartbeats re-emit on the next inbound, and
+    # blocking here would stall the aioquic handler for every peer.
     if sender:
-        _send_safe(pipe, {
+        _send_event_nowait({
             "event": "peer_heartbeat",
             "peer": sender,
             "version": net_version,
@@ -558,12 +634,15 @@ async def _forward_to_coordinator(
     future: asyncio.Future = asyncio.get_event_loop().create_future()
     pending_forwards[msg_id] = future
     raw_b64 = base64.b64encode(msg.to_bytes()).decode("ascii")
-    ok = _send_safe(pipe, {
+    # Critical: coordinator is about to respond via ``inbound_response``
+    # and the QUIC peer is waiting on the reply. Timeout mirrors the
+    # forward_timeout so we fail fast when the coord is overloaded.
+    ok = await _send_event({
         "event": "inbound_message",
         "msg_id": msg_id,
         "peer": peer_address or "",
         "raw_b64": raw_b64,
-    })
+    }, critical=True, timeout=forward_timeout)
     if not ok:
         pending_forwards.pop(msg_id, None)
         return msg.create_error_response("Coordinator pipe broken")

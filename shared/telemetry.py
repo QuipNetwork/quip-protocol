@@ -36,6 +36,34 @@ def _is_epoch_hex(name: str) -> bool:
     return len(name) == EPOCH_KEY_LEN and all(c in _HEX_CHARS for c in name)
 
 
+def atomic_write_json(target: Path, payload: dict) -> None:
+    """Write *payload* as JSON to *target* via a tempfile + ``os.replace``.
+
+    Module-level counterpart to ``TelemetryManager._atomic_write_json``
+    so sibling processes (``telemetry_aggregator``) can reuse the exact
+    same on-disk write semantics without pulling in the manager class.
+    Raises on failure; the manager catches and logs on behalf of its
+    async callers.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+        # tempfile.mkstemp creates files with mode 0o600; relax to 0o644
+        # so telemetry JSON is readable by the data-dir owner (and group)
+        # regardless of who the node process runs as.
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, target)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
+
+
 @dataclass
 class NodeRecord:
     """Telemetry record for a known network node.
@@ -71,6 +99,13 @@ class TelemetryManager:
         # Full block-1 hash; the epoch dir name is its first 16 hex chars.
         self._block_1_hash: Optional[bytes] = None
         self._periodic_task: Optional[asyncio.Task] = None
+        # Optional off-thread write pipeline. When ``enable_async_writes``
+        # has been called, ``_atomic_write_json`` enqueues onto the
+        # queue and a dedicated task drains it via ``asyncio.to_thread``
+        # so hot paths (heartbeat, peer discovery, block record) never
+        # block the coordinator's event loop on disk I/O.
+        self._write_queue: Optional[asyncio.Queue] = None
+        self._writer_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Node telemetry
@@ -300,10 +335,44 @@ class TelemetryManager:
             pass
 
     def stop(self) -> None:
-        """Cancel the periodic log task."""
+        """Cancel the periodic log task and the async writer."""
         if self._periodic_task and not self._periodic_task.done():
             self._periodic_task.cancel()
             self._periodic_task = None
+        if self._writer_task is not None and not self._writer_task.done():
+            self._writer_task.cancel()
+            self._writer_task = None
+        self._write_queue = None
+
+    def enable_async_writes(self, maxsize: int = 1024) -> None:
+        """Start the serialized off-thread writer.
+
+        Call once from the event loop; after this, ``update_node`` /
+        ``record_block`` enqueue their disk writes instead of running
+        them inline. Safe to call more than once (no-op after the first).
+        """
+        if self._write_queue is not None:
+            return
+        self._write_queue = asyncio.Queue(maxsize=maxsize)
+        self._writer_task = asyncio.create_task(
+            self._writer_loop(), name="telemetry-writer",
+        )
+
+    async def _writer_loop(self) -> None:
+        """Serialized drainer: pop (target, payload) and write off-thread."""
+        queue = self._write_queue
+        assert queue is not None
+        while True:
+            item = await queue.get()
+            if item is None:  # shutdown sentinel
+                return
+            target, payload = item
+            try:
+                await asyncio.to_thread(atomic_write_json, target, payload)
+            except Exception as exc:
+                self._logger.warning(
+                    f"async telemetry write {target} failed: {exc}"
+                )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -355,25 +424,25 @@ class TelemetryManager:
         }
 
     def _atomic_write_json(self, target: Path, payload: dict) -> None:
-        """Write JSON to *target* atomically via temp file + os.replace()."""
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp_path = tempfile.mkstemp(
-                dir=str(target.parent), suffix=".tmp",
-            )
+        """Write JSON to *target* atomically.
+
+        When ``enable_async_writes`` has been called, the write is
+        enqueued for off-thread execution; drops on queue-full with
+        a warning so a stuck disk can't block the event loop. Without
+        async writes the call is inline (still tempfile+rename, just
+        synchronous — used during startup and in tests).
+        """
+        queue = self._write_queue
+        if queue is not None:
             try:
-                with os.fdopen(fd, "w") as f:
-                    json.dump(payload, f, indent=2, default=str)
-                # tempfile.mkstemp creates files with mode 0o600; relax to
-                # 0o644 so telemetry JSON is readable by the data-dir owner
-                # (and group) regardless of who the node process runs as.
-                os.chmod(tmp_path, 0o644)
-                os.replace(tmp_path, target)
-            except BaseException:
-                # Clean up temp file on any failure
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-                raise
+                queue.put_nowait((target, payload))
+            except asyncio.QueueFull:
+                self._logger.warning(
+                    f"telemetry write queue full; dropping {target}"
+                )
+            return
+        try:
+            atomic_write_json(target, payload)
         except Exception as exc:
             self._logger.warning(f"Failed to write telemetry {target}: {exc}")
 
