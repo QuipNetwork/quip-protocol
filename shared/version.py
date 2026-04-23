@@ -5,7 +5,7 @@ This module provides centralized access to the package version and protocol vers
 """
 
 import importlib.metadata
-from typing import Dict, Mapping, Optional, TypeVar
+from typing import Any, Dict, Mapping, Optional, TypeVar
 
 from packaging.version import InvalidVersion, parse as parse_version
 
@@ -78,6 +78,30 @@ def is_version_compatible(peer_version_str: Optional[str]) -> bool:
     local_mm = _major_minor(get_version())
     peer_mm = _major_minor(peer_version_str)
     return local_mm == peer_mm
+
+
+def version_from_descriptor(
+    descriptor: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    """Pull ``runtime.quip_version`` out of a NodeDescriptor dict.
+
+    Callers that receive a descriptor (JOIN response, STATUS response,
+    peer_versions map) use this to seed ``peer_versions`` without
+    waiting for the next inbound heartbeat.
+
+    Returns None for missing, empty, or malformed descriptors — the
+    version gate will then treat the peer as unknown until a heartbeat
+    lands.
+    """
+    if not descriptor:
+        return None
+    runtime = descriptor.get("runtime")
+    if not isinstance(runtime, Mapping):
+        return None
+    version_str = runtime.get("quip_version")
+    if not version_str:
+        return None
+    return version_str
 
 
 def select_compatible_peers(

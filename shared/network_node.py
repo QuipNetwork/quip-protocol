@@ -29,7 +29,7 @@ from shared.system_info import override_public_address
 from shared.version import (
     get_version, PROTOCOL_VERSION,
     is_version_compatible, MIN_COMPATIBLE_VERSION,
-    select_compatible_peers,
+    select_compatible_peers, version_from_descriptor,
 )
 from shared.node_client import (
     NodeClient, QuicMessage, QuicMessageType,
@@ -1580,6 +1580,48 @@ class NetworkNode(Node):
         candidates.sort(key=lambda x: x[1])
         return [p for p, _ in candidates[:count]]
 
+    def _apply_transitive_peer_versions(
+        self, peer_versions_map: Any,
+    ) -> None:
+        """Record versions for peers we learned transitively from a JOIN.
+
+        Without this, transitive peers sit in ``self.peers`` with no
+        entry in ``peer_versions`` and fail the sync gate until they
+        happen to heartbeat us directly — the exact condition behind
+        ``No compatible-version peers available for sync``.
+
+        Tolerates missing/malformed maps so the node doesn't break
+        when talking to older responders that omit the field.
+        """
+        if not isinstance(peer_versions_map, dict):
+            return
+        for host, ver in peer_versions_map.items():
+            if not host or host == self.public_host:
+                continue
+            if not ver:
+                continue
+            self.peer_versions[host] = ver
+
+    def _build_peer_versions_payload(
+        self, peers_payload: Dict[str, str],
+    ) -> Dict[str, str]:
+        """Map each host in ``peers_payload`` to its known version.
+
+        Hosts with no recorded version are omitted — sending empty
+        strings would pollute ``peer_versions`` on the joiner side and
+        make the gate look populated when it isn't. The joiner still
+        learns those peers' versions via heartbeat or refresh later.
+        """
+        payload: Dict[str, str] = {}
+        for host in peers_payload:
+            if host == self.public_host:
+                payload[host] = get_version()
+                continue
+            recorded = self.peer_versions.get(host)
+            if recorded:
+                payload[host] = recorded
+        return payload
+
     def _healthy_peers_snapshot(self) -> Dict[str, MinerInfo]:
         """Return active peers with a recent successful heartbeat.
 
@@ -2465,10 +2507,19 @@ class NetworkNode(Node):
                 )
                 # Record the responder's version so sync filters can
                 # see this peer before the first heartbeat arrives.
-                runtime = responder_descriptor.get("runtime") or {}
-                responder_version = runtime.get("quip_version")
+                responder_version = version_from_descriptor(
+                    responder_descriptor,
+                )
                 if responder_version:
                     self.peer_versions[peer_address] = responder_version
+
+            # Seed versions for transitive peers the responder told us
+            # about. Without this, they'd sit in self.peers until their
+            # own heartbeat landed here — which for NAT'd peers might
+            # never happen.
+            self._apply_transitive_peer_versions(
+                result.get("peer_versions") if isinstance(result, dict) else None
+            )
 
             # Add all nodes from the peer's node list. Transitive peers
             # arrive without a descriptor — we will learn it via their
@@ -2570,10 +2621,14 @@ class NetworkNode(Node):
                     )
                     # Record responder's version so sync filters can
                     # see this peer before the first heartbeat arrives.
-                    runtime = responder_desc.get("runtime") or {}
-                    responder_version = runtime.get("quip_version")
+                    responder_version = version_from_descriptor(
+                        responder_desc,
+                    )
                     if responder_version:
                         self.peer_versions[peer] = responder_version
+                self._apply_transitive_peer_versions(
+                    result.get("peer_versions"),
+                )
                 peers_found = 0
                 # Snapshot the whole peer map as "already announced" so
                 # our gossip_new_node origination guard suppresses a
@@ -2649,6 +2704,8 @@ class NetworkNode(Node):
         if self._is_backed_off(host):
             return False
 
+        descriptor_version = version_from_descriptor(descriptor)
+
         # Already in the active set — update in place.
         if host in self.peers:
             self.add_or_update_peer(host, info)
@@ -2657,6 +2714,8 @@ class NetworkNode(Node):
             self.telemetry.update_node(
                 host, "active", info, descriptor=descriptor,
             )
+            if descriptor_version:
+                self.peer_versions[host] = descriptor_version
             return False  # not new
 
         # Active set has room, or the peer has a live connection.
@@ -2670,6 +2729,8 @@ class NetworkNode(Node):
             self.telemetry.update_node(
                 host, "active", info, descriptor=descriptor,
             )
+            if descriptor_version:
+                self.peer_versions[host] = descriptor_version
             self._has_ever_had_peers = True
             self.logger.info(
                 f"New peer discovered: {host}: "
@@ -2940,6 +3001,9 @@ class NetworkNode(Node):
                 self.telemetry.update_node(
                     host, "active", info, descriptor=descriptor,
                 )
+                peer_version = version_from_descriptor(descriptor)
+                if peer_version:
+                    self.peer_versions[host] = peer_version
 
                 self.logger.debug(f"Refreshed info for peer {host}")
                 return True
@@ -3833,9 +3897,13 @@ class NetworkNode(Node):
                 h: healthy[h].to_json()
                 for h in alt_peers if h in healthy
             }
+            peer_versions_payload = self._build_peer_versions_payload(
+                peers_snapshot,
+            )
             response_data = json.dumps({
                 "status": "at_capacity",
                 "peers": peers_snapshot,
+                "peer_versions": peer_versions_payload,
             })
             return msg.create_response(response_data.encode('utf-8'))
 
@@ -3906,9 +3974,17 @@ class NetworkNode(Node):
             peers_payload[host] = info.to_json()
         peers_payload[self.public_host] = self.info().to_json()
 
+        # Include recorded peer versions so the joiner can sync-gate
+        # transitive peers without waiting for a direct heartbeat. Older
+        # peers that don't know this field simply ignore it.
+        peer_versions_payload = self._build_peer_versions_payload(
+            peers_payload,
+        )
+
         response_data = json.dumps({
             "status": "ok",
             "peers": peers_payload,
+            "peer_versions": peer_versions_payload,
             "descriptor": self.descriptor(),
         })
         return msg.create_response(response_data.encode('utf-8'))

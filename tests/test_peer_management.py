@@ -203,6 +203,248 @@ class TestAddPeerTwoTier:
 
 
 # ---------------------------------------------------------------------------
+# add_peer: peer_versions population from descriptor
+# ---------------------------------------------------------------------------
+
+class TestAddPeerRecordsVersion:
+    """Regression coverage for ``No compatible-version peers available for sync``.
+
+    ``add_peer`` receives a NodeDescriptor for every path where the
+    version is known at admission time (outbound JOIN response,
+    candidate promotion, future gossip-with-descriptor). Extracting
+    ``runtime.quip_version`` here closes the window where a peer sits
+    in ``self.peers`` without a ``peer_versions`` entry, which makes
+    ``select_compatible_peers`` drop them from sync candidates.
+    """
+
+    @pytest.fixture
+    def node(self):
+        return _make_node(max_active=3, max_candidate=5)
+
+    @pytest.mark.asyncio
+    async def test_records_version_from_descriptor(self, node):
+        desc = {"runtime": {"quip_version": "0.1.11"}, "node_id": "x"}
+        await node.add_peer(
+            "10.0.0.1:20001", _make_info("a"), descriptor=desc,
+        )
+        assert node.peer_versions["10.0.0.1:20001"] == "0.1.11"
+
+    @pytest.mark.asyncio
+    async def test_no_version_without_descriptor(self, node):
+        await node.add_peer("10.0.0.1:20001", _make_info("a"))
+        assert "10.0.0.1:20001" not in node.peer_versions
+
+    @pytest.mark.asyncio
+    async def test_no_version_when_descriptor_missing_runtime(self, node):
+        await node.add_peer(
+            "10.0.0.1:20001", _make_info("a"),
+            descriptor={"node_id": "xyz"},
+        )
+        assert "10.0.0.1:20001" not in node.peer_versions
+
+    @pytest.mark.asyncio
+    async def test_no_version_when_version_empty(self, node):
+        desc = {"runtime": {"quip_version": ""}}
+        await node.add_peer(
+            "10.0.0.1:20001", _make_info("a"), descriptor=desc,
+        )
+        assert "10.0.0.1:20001" not in node.peer_versions
+
+    @pytest.mark.asyncio
+    async def test_updates_version_on_re_add(self, node):
+        """A rolling upgrade will re-announce with a bumped version."""
+        await node.add_peer(
+            "10.0.0.1:20001", _make_info("a"),
+            descriptor={"runtime": {"quip_version": "0.1.10"}},
+        )
+        await node.add_peer(
+            "10.0.0.1:20001", _make_info("a"),
+            descriptor={"runtime": {"quip_version": "0.1.11"}},
+        )
+        assert node.peer_versions["10.0.0.1:20001"] == "0.1.11"
+
+    @pytest.mark.asyncio
+    async def test_candidate_promotion_records_version(self, node):
+        # Fill active set so the new peer routes into the candidate pool.
+        for i in range(3):
+            await node.add_peer(
+                f"10.0.0.{i + 1}:20001", _make_info(f"m{i}"),
+            )
+        desc = {"runtime": {"quip_version": "0.1.9"}}
+        await node.add_peer(
+            "10.0.1.1:20001", _make_info("cand"), descriptor=desc,
+        )
+        assert "10.0.1.1:20001" in node._candidate_peers
+        # Version must not leak into peer_versions until promotion — the
+        # candidate is not yet sync-eligible.
+        assert "10.0.1.1:20001" not in node.peer_versions
+
+        # Free a slot and promote. After promotion peer_versions should
+        # carry the version that was captured at candidate time.
+        node.peers.pop("10.0.0.1:20001")
+        promoted = await node._promote_candidate("10.0.1.1:20001")
+        assert promoted is True
+        assert node.peer_versions["10.0.1.1:20001"] == "0.1.9"
+
+
+# ---------------------------------------------------------------------------
+# _apply_transitive_peer_versions: JOIN response consumer side
+# ---------------------------------------------------------------------------
+
+class TestApplyTransitivePeerVersions:
+    """The joiner reads the ``peer_versions`` map returned by the JOIN
+    responder and pre-populates ``self.peer_versions``. Without this,
+    transitive peers (added with ``descriptor=None``) sit in
+    ``self.peers`` but fail the version gate until they heartbeat us,
+    triggering ``No compatible-version peers available for sync``.
+    """
+
+    @pytest.fixture
+    def node(self):
+        return _make_node()
+
+    def test_records_versions_for_transitive_peers(self, node):
+        node._apply_transitive_peer_versions({
+            "10.0.0.1:20001": "0.1.11",
+            "10.0.0.2:20001": "0.1.12",
+        })
+        assert node.peer_versions == {
+            "10.0.0.1:20001": "0.1.11",
+            "10.0.0.2:20001": "0.1.12",
+        }
+
+    def test_skips_self_address(self, node):
+        """We trust our own ``get_version()`` over whatever the peer
+        echoed back at us — keeps the invariant that peer_versions
+        tracks *peers*, not self."""
+        node._apply_transitive_peer_versions({
+            node.public_host: "0.0.1",  # bogus
+            "10.0.0.1:20001": "0.1.11",
+        })
+        assert node.public_host not in node.peer_versions
+        assert node.peer_versions["10.0.0.1:20001"] == "0.1.11"
+
+    def test_skips_empty_values(self, node):
+        node._apply_transitive_peer_versions({
+            "10.0.0.1:20001": "",
+            "10.0.0.2:20001": None,
+            "10.0.0.3:20001": "0.1.11",
+        })
+        assert node.peer_versions == {"10.0.0.3:20001": "0.1.11"}
+
+    def test_tolerates_none_map(self, node):
+        """Older responders omit the field entirely — don't crash."""
+        node._apply_transitive_peer_versions(None)
+        assert node.peer_versions == {}
+
+    def test_tolerates_non_dict(self, node):
+        """Malformed responses shouldn't take the node down."""
+        node._apply_transitive_peer_versions("not-a-dict")
+        assert node.peer_versions == {}
+
+    def test_does_not_overwrite_self_version(self, node):
+        node.peer_versions["10.0.0.1:20001"] = "0.1.11"
+        node._apply_transitive_peer_versions({"10.0.0.1:20001": "0.1.12"})
+        # Latest wins — rolling upgrades should be reflected.
+        assert node.peer_versions["10.0.0.1:20001"] == "0.1.12"
+
+
+# ---------------------------------------------------------------------------
+# _build_peer_versions_payload: JOIN response side
+# ---------------------------------------------------------------------------
+
+class TestBuildPeerVersionsPayload:
+    """The JOIN responder ships a ``peer_versions`` map alongside
+    ``peers_payload``. The joiner uses it to sync-gate transitive peers
+    without waiting for each one to heartbeat the joiner directly.
+    """
+
+    @pytest.fixture
+    def node(self):
+        return _make_node()
+
+    def test_includes_known_versions(self, node):
+        node.peer_versions = {
+            "10.0.0.1:20001": "0.1.11",
+            "10.0.0.2:20001": "0.1.12",
+        }
+        peers_payload = {
+            "10.0.0.1:20001": "info",
+            "10.0.0.2:20001": "info",
+        }
+        result = node._build_peer_versions_payload(peers_payload)
+        assert result == {
+            "10.0.0.1:20001": "0.1.11",
+            "10.0.0.2:20001": "0.1.12",
+        }
+
+    def test_includes_self_with_local_version(self, node):
+        """Responder must advertise its own version — otherwise the
+        joiner would immediately drop the responder from sync."""
+        peers_payload = {node.public_host: "info"}
+        result = node._build_peer_versions_payload(peers_payload)
+        from shared.version import get_version
+        assert result == {node.public_host: get_version()}
+
+    def test_omits_peers_without_recorded_version(self, node):
+        """Empty strings would pollute ``peer_versions`` on the joiner
+        side and make the gate look populated when it isn't."""
+        node.peer_versions = {"10.0.0.1:20001": "0.1.11"}
+        peers_payload = {
+            "10.0.0.1:20001": "info",
+            "10.0.0.2:20001": "info",  # unknown version
+        }
+        result = node._build_peer_versions_payload(peers_payload)
+        assert result == {"10.0.0.1:20001": "0.1.11"}
+
+    def test_empty_payload(self, node):
+        assert node._build_peer_versions_payload({}) == {}
+
+
+# ---------------------------------------------------------------------------
+# refresh_peer_info: records version from fetched descriptor
+# ---------------------------------------------------------------------------
+
+class TestRefreshPeerInfoRecordsVersion:
+    """``refresh_peer_info`` gets a descriptor as part of the STATUS
+    response; record ``runtime.quip_version`` so that peers discovered
+    via gossip/heartbeat (where add_peer was called with ``descriptor=
+    None``) still end up sync-eligible after the first refresh.
+    """
+
+    @pytest.fixture
+    def node(self):
+        return _make_node(max_active=3)
+
+    @pytest.mark.asyncio
+    async def test_records_version_from_fetched_descriptor(self, node):
+        desc = {"runtime": {"quip_version": "0.1.8"}}
+        node.get_peer_status = AsyncMock(return_value={
+            "info": _make_info("x").to_json(),
+            "descriptor": desc,
+        })
+        ok = await node.refresh_peer_info("10.0.0.1:20001")
+        assert ok is True
+        assert node.peer_versions["10.0.0.1:20001"] == "0.1.8"
+
+    @pytest.mark.asyncio
+    async def test_no_version_recorded_when_descriptor_absent(self, node):
+        node.get_peer_status = AsyncMock(return_value={
+            "info": _make_info("x").to_json(),
+        })
+        ok = await node.refresh_peer_info("10.0.0.1:20001")
+        assert ok is True
+        assert "10.0.0.1:20001" not in node.peer_versions
+
+    @pytest.mark.asyncio
+    async def test_no_version_recorded_on_status_failure(self, node):
+        node.get_peer_status = AsyncMock(return_value=None)
+        ok = await node.refresh_peer_info("10.0.0.1:20001")
+        assert ok is False
+        assert "10.0.0.1:20001" not in node.peer_versions
+
+
+# ---------------------------------------------------------------------------
 # remove_peer: cleans up candidates
 # ---------------------------------------------------------------------------
 

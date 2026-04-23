@@ -8,6 +8,7 @@ from shared.version import (
     is_version_compatible,
     MIN_COMPATIBLE_VERSION,
     select_compatible_peers,
+    version_from_descriptor,
 )
 
 
@@ -116,3 +117,39 @@ def test_select_compatible_peers_empty_input():
 def test_select_compatible_peers_all_unknown():
     peers = {"a": "info", "b": "info"}
     assert select_compatible_peers(peers, {}) == {}
+
+
+# ---------------------------------------------------------------------------
+# version_from_descriptor
+# ---------------------------------------------------------------------------
+
+def test_version_from_descriptor_extracts_runtime_version():
+    desc = {"runtime": {"quip_version": "0.1.11"}, "node_id": "n1"}
+    assert version_from_descriptor(desc) == "0.1.11"
+
+
+def test_version_from_descriptor_none_when_descriptor_none():
+    assert version_from_descriptor(None) is None
+
+
+def test_version_from_descriptor_none_when_empty():
+    assert version_from_descriptor({}) is None
+
+
+def test_version_from_descriptor_none_when_runtime_missing():
+    assert version_from_descriptor({"node_id": "n1"}) is None
+
+
+def test_version_from_descriptor_none_when_runtime_empty():
+    assert version_from_descriptor({"runtime": {}}) is None
+
+
+def test_version_from_descriptor_none_when_version_empty_string():
+    assert version_from_descriptor({"runtime": {"quip_version": ""}}) is None
+
+
+def test_version_from_descriptor_tolerates_non_dict_runtime():
+    # A peer sending a malformed descriptor shouldn't raise — we treat
+    # the version as unknown and let is_version_compatible reject it.
+    assert version_from_descriptor({"runtime": None}) is None
+    assert version_from_descriptor({"runtime": "not-a-dict"}) is None

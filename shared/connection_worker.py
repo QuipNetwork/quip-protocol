@@ -11,9 +11,10 @@ Request queue (parent -> worker):
 
 Result queue (worker -> parent):
     {"peer": "host:port", "success": True,  "peers_map": {...},
-     "responder_descriptor": {...} | None}
+     "responder_descriptor": {...} | None,
+     "peer_versions": {host: version, ...} | None}
     {"peer": "host:port", "success": False, "peers_map": None,
-     "responder_descriptor": None}
+     "responder_descriptor": None, "peer_versions": None}
 """
 from __future__ import annotations
 
@@ -57,11 +58,13 @@ async def _try_join_peer(
         )
         peers_map = result.get("peers", {}) if result else None
         responder_descriptor = result.get("descriptor") if result else None
+        peer_versions_map = result.get("peer_versions") if result else None
         result_queue.put({
             "peer": peer,
             "success": result is not None,
             "peers_map": peers_map,
             "responder_descriptor": responder_descriptor,
+            "peer_versions": peer_versions_map,
         })
         if result is not None:
             log.info(f"JOIN succeeded with {peer}")
@@ -74,6 +77,7 @@ async def _try_join_peer(
             "success": False,
             "peers_map": None,
             "responder_descriptor": None,
+            "peer_versions": None,
         })
 
 
