@@ -853,6 +853,17 @@ class NodeClient:
         return response is not None and response.msg_type == QuicMessageType.GOSSIP_RESPONSE
 
     async def join_network_via_peer(self, peer_address: str, join_data: dict, bypass_ban: bool = False) -> Optional[dict]:
+        """Send a JOIN request and return the parsed response payload.
+
+        Returns:
+            ``None`` when the transport fails, the response is an
+            error, or the payload cannot be decoded.
+            Otherwise a dict containing at least a ``status`` field:
+            ``"ok"`` for a successful join, ``"at_capacity"`` when the
+            peer is full and is redirecting us to the ``peers`` list.
+            Callers MUST branch on ``status`` — an ``at_capacity``
+            response is not a successful join.
+        """
         protocol = await self._get_connection(peer_address, bypass_ban=bypass_ban)
         if not protocol:
             self.logger.warning(f"Could not establish connection to {peer_address}")
@@ -861,16 +872,7 @@ class NodeClient:
         response = await protocol.send_request(QuicMessageType.JOIN_REQUEST, payload, timeout=self.node_timeout)
         if response and response.msg_type == QuicMessageType.JOIN_RESPONSE:
             try:
-                data = json.loads(response.payload.decode('utf-8'))
-                # Handle at_capacity redirect: peer is overloaded, try
-                # the suggested alternatives instead
-                if data.get("status") == "at_capacity":
-                    self.logger.info(
-                        f"Peer {peer_address} at capacity, "
-                        f"received {len(data.get('peers', {}))} alternatives"
-                    )
-                    return data
-                return data
+                return json.loads(response.payload.decode('utf-8'))
             except Exception:
                 return None
         elif response and response.msg_type == QuicMessageType.ERROR_RESPONSE:

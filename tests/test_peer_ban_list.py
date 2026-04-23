@@ -11,6 +11,8 @@ from shared.peer_ban_list import (
     COOLDOWN_DURATION,
     MIN_BAN_DURATION,
     MAX_BAN_DURATION,
+    CAPACITY_COOLDOWN_MIN,
+    CAPACITY_COOLDOWN_MAX,
 )
 
 
@@ -225,6 +227,55 @@ def test_format_duration():
     assert PeerBanList._format_duration(3600) == "1.0h"
     assert PeerBanList._format_duration(86400) == "1.0d"
     assert PeerBanList._format_duration(604800) == "7.0d"
+
+
+# --- Capacity cooldown ---
+
+def test_capacity_cooldown_first_hit(ban_list):
+    duration = ban_list.record_capacity_rejection("peer:1")
+    assert duration == CAPACITY_COOLDOWN_MIN
+    assert ban_list.is_banned("peer:1")
+
+
+def test_capacity_cooldown_doubles():
+    bl = PeerBanList()
+    durations = []
+    for _ in range(5):
+        d = bl.record_capacity_rejection("peer:1")
+        durations.append(d)
+        bl._records["peer:1"].banned_until = 0.0  # expire
+
+    assert durations[0] == CAPACITY_COOLDOWN_MIN
+    assert durations[1] == CAPACITY_COOLDOWN_MIN * 2
+    assert durations[2] == CAPACITY_COOLDOWN_MIN * 4
+    assert durations[3] == CAPACITY_COOLDOWN_MIN * 8
+    # 5th hit would be 16x — capped at CAPACITY_COOLDOWN_MAX (15m).
+    assert durations[4] == CAPACITY_COOLDOWN_MAX
+
+
+def test_capacity_cooldown_noop_while_active(ban_list):
+    first = ban_list.record_capacity_rejection("peer:1")
+    assert first > 0
+    # Still in cooldown — shouldn't escalate
+    second = ban_list.record_capacity_rejection("peer:1")
+    assert second == 0.0
+
+
+def test_capacity_cooldown_does_not_inflate_ban_count(ban_list):
+    """Capacity rejections must not graduate peers into the long-ban
+    ladder — they're not misbehavior."""
+    for _ in range(10):
+        ban_list.record_capacity_rejection("peer:1")
+        ban_list._records["peer:1"].banned_until = 0.0
+    assert ban_list.ban_count("peer:1") == 0
+    assert ban_list.failure_count("peer:1") == 0
+
+
+def test_capacity_cooldown_cleared_by_success(ban_list):
+    ban_list.record_capacity_rejection("peer:1")
+    assert ban_list.is_banned("peer:1")
+    ban_list.record_success("peer:1")
+    assert not ban_list.is_banned("peer:1")
 
 
 def test_clear_nonexistent_peer(ban_list):

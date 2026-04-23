@@ -29,6 +29,12 @@ MIN_BAN_DURATION = 120.0        # 2 minutes
 MAX_BAN_DURATION = 14400.0      # 4 hours
 JITTER_RANGE = (0.75, 1.25)    # ±25% randomization
 
+# Capacity-rejection cooldowns — peer is healthy but full. Distinct
+# from failure graduation: we want to back off, but not escalate into
+# a long ban since the peer is not misbehaving.
+CAPACITY_COOLDOWN_MIN = 60.0    # 1 minute
+CAPACITY_COOLDOWN_MAX = 900.0   # 15 minutes
+
 
 @dataclass
 class _BanRecord:
@@ -37,6 +43,7 @@ class _BanRecord:
     ban_count: int = 0
     banned_until: float = 0.0
     last_failure: float = 0.0
+    capacity_count: int = 0
 
 
 class PeerBanList:
@@ -141,6 +148,44 @@ class PeerBanList:
                 record.ban_count, record.failure_count, reason_str,
             )
 
+        return duration
+
+    def record_capacity_rejection(self, peer: str) -> float:
+        """Record an ``at_capacity`` rejection from a peer.
+
+        Separate from ``record_failure`` because capacity rejection is
+        a transient resource signal, not misbehavior. Applies a short
+        cooldown that doubles on repeats (1 min → 2 min → 4 min …) and
+        is capped at ``CAPACITY_COOLDOWN_MAX`` (15 min).
+
+        Does not contribute to ``failure_count`` or the long-ban
+        graduation ladder; a peer that rejects us for capacity then
+        later accepts is recorded via ``record_success`` as normal.
+
+        No-op while the peer is already in cooldown/ban — prevents a
+        retry loop from inflating the backoff.
+
+        Returns:
+            Cooldown duration in seconds, or 0 if no-op.
+        """
+        now = time.monotonic()
+        record = self._records.get(peer)
+
+        if record is not None and now < record.banned_until:
+            return 0.0
+
+        if record is None:
+            record = _BanRecord()
+            self._records[peer] = record
+
+        record.capacity_count += 1
+        raw = CAPACITY_COOLDOWN_MIN * (2 ** (record.capacity_count - 1))
+        duration = min(raw, CAPACITY_COOLDOWN_MAX)
+        record.banned_until = now + duration
+        self.logger.debug(
+            "Capacity cooldown peer %s for %s (capacity #%d)",
+            peer, self._format_duration(duration), record.capacity_count,
+        )
         return duration
 
     def record_success(self, peer: str) -> None:

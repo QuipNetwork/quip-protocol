@@ -1221,6 +1221,14 @@ class NetworkNode(Node):
                     exc_info=True,
                 )
         else:
+            # Skip discovery probes for peers we've recently had to
+            # back off from — they're either banned (misbehavior) or
+            # in a capacity cooldown. Re-probing them immediately
+            # wastes coordinator cycles and pipe traffic.
+            if self._is_backed_off(peer):
+                return
+            if self._load_monitor.is_overloaded():
+                return
             self.logger.info(
                 f"New node discovered via listener heartbeat: {peer}"
             )
@@ -2529,10 +2537,20 @@ class NetworkNode(Node):
         if not self.node_client:
             return False
 
+        is_initial = peer_address in self.initial_peers
+
         # Only enforce bans for non-initial peers. Initial/seed peers
         # must always be retryable so the node can recover from
         # transient network partitions.
-        if peer_address not in self.initial_peers and self._is_backed_off(peer_address):
+        if not is_initial and self._is_backed_off(peer_address):
+            return False
+
+        # Don't originate outbound JOINs when our own pool is full or
+        # shedding. Symmetric with the inbound should_accept_join()
+        # gate at _quic_handle_join — otherwise we'd reject others at
+        # the door while still knocking on theirs. Initial peers are
+        # exempt so partition recovery still works.
+        if not is_initial and not self._load_monitor.should_accept_join():
             return False
 
         try:
@@ -2552,6 +2570,25 @@ class NetworkNode(Node):
             )
             if not result:
                 self.logger.warning(f"Failed to join via {peer_address}")
+                return False
+
+            # Responder is full. Record a cooldown so we stop hammering
+            # it, but keep the alternatives it handed us by falling
+            # through to the normal peer/version ingestion below.
+            if result.get("status") == "at_capacity":
+                cooldown = self._ban_list.record_capacity_rejection(
+                    peer_address,
+                )
+                alt_count = len(result.get("peers") or {})
+                if cooldown:
+                    self.logger.info(
+                        f"Peer {peer_address} at capacity — "
+                        f"{alt_count} alternatives; "
+                        f"cooldown {self._format_ban_remaining(cooldown)}"
+                    )
+                self._apply_transitive_peer_versions(
+                    result.get("peer_versions"),
+                )
                 return False
 
             # Update responder's descriptor in telemetry if present.
@@ -2636,10 +2673,14 @@ class NetworkNode(Node):
         # Always include initial/seed peers (bypass bans)
         peers.extend(self.initial_peers)
 
-        # Add known heartbeat peers that aren't banned
-        for host in self.heartbeats:
-            if host not in initial_set and not self._is_backed_off(host):
-                peers.append(host)
+        # Add known heartbeat peers that aren't banned — but only when
+        # we have room. Under load we stop originating discovery JOINs
+        # to peers beyond the seed set.
+        accepting_new = self._load_monitor.should_accept_join()
+        if accepting_new:
+            for host in self.heartbeats:
+                if host not in initial_set and not self._is_backed_off(host):
+                    peers.append(host)
 
         if not peers:
             return
@@ -3134,8 +3175,16 @@ class NetworkNode(Node):
 
             self._record_recent_message(message.id)
 
-        # Select random peers
-        peers = list(self.peers.keys())
+        # Select random peers, but only ALIVE ones — gossiping to
+        # SUSPECT/DEAD peers just burns 5s RPC timeouts per target,
+        # which starves the coordinator event loop. Peers not yet
+        # tracked by SWIM (state == None) are new and included so
+        # that first-contact gossip works.
+        peers = [
+            peer for peer in self.peers
+            if self._swim_detector.get_state(peer)
+            in (None, PeerState.ALIVE)
+        ]
         if len(peers) <= fanout:
             targets = peers
         else:
@@ -3190,8 +3239,14 @@ class NetworkNode(Node):
         # Record in our inventory
         self._block_inventory.record_have(block_hash)
 
-        # Send IHAVE to peers via scored selection
-        peer_list = list(self.peers.keys())
+        # Send IHAVE to peers via scored selection. Exclude SWIM
+        # SUSPECT/DEAD — block gossip to unreachable peers just burns
+        # 3s RPC timeouts without reaching anyone.
+        peer_list = [
+            peer for peer in self.peers
+            if self._swim_detector.get_state(peer)
+            in (None, PeerState.ALIVE)
+        ]
 
         effective_fanout = self._adaptive_fanout(len(peer_list))
         targets = self._peer_scorer.select_gossip_targets(
@@ -3484,6 +3539,11 @@ class NetworkNode(Node):
                 continue
             if alt_host in self.peers:
                 continue
+            if not self._load_monitor.should_accept_join():
+                self.logger.debug(
+                    f"MIGRATE alternative {alt_host} skipped: local pool full"
+                )
+                return
             try:
                 success = await self.connect_to_peer(alt_host)
                 if success:
@@ -3941,7 +4001,24 @@ class NetworkNode(Node):
 
     async def _quic_handle_join(self, msg: QuicMessage, protocol: Any) -> QuicMessage:
         """Handle join request from a new node."""
-        # Check connection capacity before processing
+        real_peer_address = getattr(protocol, "_peer_address", None) or "?"
+
+        # Parse the payload up front so the rejection log can include
+        # who's asking — a JOIN payload is a small JSON blob so this
+        # is cheap. MinerInfo deserialization still happens below the
+        # capacity check, since it's the expensive part.
+        try:
+            data = json.loads(msg.payload.decode('utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.logger.info(
+                f"Rejecting JOIN from {real_peer_address}: "
+                f"unparseable payload"
+            )
+            return msg.create_error_response("Malformed JOIN payload")
+
+        claimed_address = data.get("host") or "?"
+
+        # Check connection capacity before doing anything expensive
         if not self._load_monitor.should_accept_join():
             # Suggest least-loaded alternative peers when at capacity
             healthy = self._healthy_peers_snapshot()
@@ -3950,8 +4027,9 @@ class NetworkNode(Node):
                 exclude=set(), count=10, peer_list=peer_keys
             )
             self.logger.info(
-                f"Rejecting JOIN (overloaded or at capacity), "
-                f"suggesting {len(alt_peers)} alternative peers"
+                f"Rejecting JOIN from {real_peer_address} "
+                f"(claimed={claimed_address}) — overloaded or at "
+                f"capacity; suggesting {len(alt_peers)} alternatives"
             )
             peers_snapshot = {
                 h: healthy[h].to_json()
@@ -3967,19 +4045,18 @@ class NetworkNode(Node):
             })
             return msg.create_response(response_data.encode('utf-8'))
 
-        data = json.loads(msg.payload.decode('utf-8'))
-        claimed_address = data.get("host")
         info_field = data.get("info")
         new_node_info = MinerInfo.from_json(info_field) if info_field else None
         new_node_descriptor = data.get("descriptor")
 
-        if not claimed_address or not new_node_info:
+        if not data.get("host") or not new_node_info:
             return msg.create_error_response("Missing host or info")
 
         # Validate the claimed address, fallback to real source IP if unreachable
-        real_peer_address = protocol._peer_address
         try:
-            new_node_address = await self._validate_peer_address(claimed_address, real_peer_address)
+            new_node_address = await self._validate_peer_address(
+                data["host"], real_peer_address,
+            )
         except ValueError as e:
             return msg.create_error_response(str(e))
 

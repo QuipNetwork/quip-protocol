@@ -61,6 +61,12 @@ def _setup_child_logging(peer: str) -> logging.Logger:
     handler.setFormatter(QuipFormatter())
     root.addHandler(handler)
     root.setLevel(logging.INFO)
+    # Silence aioquic's ALPN / Negotiated protocol / Duplicate CRYPTO
+    # / Connection close noise. The parent does the same via
+    # logging_config.setup_logging, but child processes get a fresh
+    # logger hierarchy and need the override reapplied.
+    logging.getLogger("quic").setLevel(logging.WARNING)
+    logging.getLogger("aioquic").setLevel(logging.WARNING)
     return logging.getLogger(f"conn[{peer}]")
 
 

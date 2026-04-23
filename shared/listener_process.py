@@ -100,6 +100,9 @@ def _setup_child_logging() -> logging.Logger:
     handler.setFormatter(QuipFormatter())
     root.addHandler(handler)
     root.setLevel(logging.INFO)
+    # Silence aioquic internals — see connection_process for rationale.
+    logging.getLogger("quic").setLevel(logging.WARNING)
+    logging.getLogger("aioquic").setLevel(logging.WARNING)
     return logging.getLogger("listener")
 
 
