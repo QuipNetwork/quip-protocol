@@ -196,20 +196,6 @@ async def test_add_peer_sets_has_ever_had_peers():
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_works_when_desynced():
-    """Heartbeats should be sent even when not synchronized."""
-    node = _make_network_node(auto_mine=True)
-    node._has_ever_had_peers = True
-    # _synchronized is NOT set
-    assert node.synchronized is False
-
-    node.node_client.send_heartbeat = AsyncMock(return_value=True)
-    result = await node.send_heartbeat("peer1:20049")
-    assert result is True
-    node.node_client.send_heartbeat.assert_called_once()
-
-
-@pytest.mark.asyncio
 async def test_chain_reset_clears_has_ever_had_peers():
     """Chain reset should reset _has_ever_had_peers for fresh bootstrap."""
     node = _make_network_node(auto_mine=True)
