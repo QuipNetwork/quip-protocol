@@ -44,8 +44,10 @@ ENV QUIP_DOCKER_IMAGE=${QUIP_DOCKER_IMAGE}
 
 # Install runtime dependencies (tini for PID 1, busybox for crond,
 # gosu for dropping privileges from root to quip in the entrypoint).
+# build-essential is retained for arch builds (notably arm64) where
+# PyPI wheels may be missing for a base dep and pip falls back to source.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    openssl tini busybox-static gosu \
+    openssl tini busybox-static gosu build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root runtime user. Matches systemd-linux/quip-network-node.service
