@@ -373,7 +373,6 @@ class NetworkNode(Node):
         self._max_candidate_peers = int(config.get("max_candidate_peers", 100))
         self._candidate_peers: Dict[str, CandidatePeer] = {}
 
-        self.net_lock = asyncio.Lock()
         self.running = False
         self.heartbeats = {}
         self.peer_versions: dict[str, str] = {}  # peer_host -> version string
@@ -888,8 +887,7 @@ class NetworkNode(Node):
             try:
                 await asyncio.sleep(self.heartbeat_interval)
 
-                async with self.net_lock:
-                    peer_list = list(self.peers.keys())
+                peer_list = list(self.peers.keys())
 
                 self._dispatch_pool_heartbeats(peer_list)
 
@@ -1334,16 +1332,21 @@ class NetworkNode(Node):
         coordinator work still have CPU to share. The executor is
         shut down during ``stop()``; until then it persists across
         individual handler calls to amortize fork cost.
+
+        Uses ``getattr`` so NetworkNode instances constructed via
+        ``object.__new__`` (unit-test stubs) get lazy-init on first
+        use rather than ``AttributeError``.
         """
-        if self._handler_executor is None:
+        existing = getattr(self, "_handler_executor", None)
+        if existing is None:
             workers = max(2, (os.cpu_count() or 4) // 2)
-            self._handler_executor = ProcessPoolExecutor(
-                max_workers=workers,
-            )
+            executor = ProcessPoolExecutor(max_workers=workers)
+            self._handler_executor = executor
             self.logger.info(
                 f"Handler executor started with {workers} workers"
             )
-        return self._handler_executor
+            return executor
+        return existing
 
     def _backoff_list_snapshot(self) -> list:
         """Return currently banned peer hosts."""
@@ -1371,28 +1374,27 @@ class NetworkNode(Node):
                 now_mono = time.monotonic()
                 dead_nodes = []
 
-                async with self.net_lock:
-                    for host in list(self.peers.keys()):
-                        hb_time = self.heartbeats.get(host)
-                        if hb_time is not None:
-                            if current_time - hb_time > self.heartbeat_timeout:
-                                dead_nodes.append(host)
-                        else:
-                            # Never got a heartbeat — use fast timeout.
-                            joined_at = self._swim_detector.get_joined_at(host)
-                            if joined_at is None:
-                                # Peer isn't tracked by SWIM (race with
-                                # remove_peer, or never registered). Assume
-                                # it's past the fast-timeout window and log
-                                # so an add_peer/register mismatch is
-                                # discoverable.
-                                self.logger.debug(
-                                    f"Unproven peer {host} missing from "
-                                    "SWIM detector; evicting via fast timeout"
-                                )
-                                dead_nodes.append(host)
-                            elif now_mono - joined_at > self.node_timeout:
-                                dead_nodes.append(host)
+                for host in list(self.peers.keys()):
+                    hb_time = self.heartbeats.get(host)
+                    if hb_time is not None:
+                        if current_time - hb_time > self.heartbeat_timeout:
+                            dead_nodes.append(host)
+                    else:
+                        # Never got a heartbeat — use fast timeout.
+                        joined_at = self._swim_detector.get_joined_at(host)
+                        if joined_at is None:
+                            # Peer isn't tracked by SWIM (race with
+                            # remove_peer, or never registered). Assume
+                            # it's past the fast-timeout window and log
+                            # so an add_peer/register mismatch is
+                            # discoverable.
+                            self.logger.debug(
+                                f"Unproven peer {host} missing from "
+                                "SWIM detector; evicting via fast timeout"
+                            )
+                            dead_nodes.append(host)
+                        elif now_mono - joined_at > self.node_timeout:
+                            dead_nodes.append(host)
 
                 # Prune stale gossip dedup entries and rate limiter buckets
                 async with self.gossip_lock:
@@ -1456,8 +1458,7 @@ class NetworkNode(Node):
                 load_snapshot = self._load_monitor.snapshot()
                 load_dict = load_snapshot.to_dict()
                 load_dict["sender"] = self.public_host
-                async with self.net_lock:
-                    peer_list = list(self.peers.keys())
+                peer_list = list(self.peers.keys())
                 for peer in peer_list:
                     try:
                         await self.node_client.send_load_info(
@@ -1526,8 +1527,7 @@ class NetworkNode(Node):
             return
 
         # Find least-loaded peers to suggest as alternatives
-        async with self.net_lock:
-            snapshot = list(self.peers.keys())
+        snapshot = list(self.peers.keys())
         alternatives = self._get_least_loaded_peers(
             exclude=set(targets), count=5, peer_list=snapshot
         )
@@ -1557,8 +1557,8 @@ class NetworkNode(Node):
         random selection from the peer list.
 
         Args:
-            peer_list: Pre-copied peer list (caller should copy under
-                net_lock). Falls back to self.peers if not provided.
+            peer_list: Pre-copied peer list. Falls back to self.peers
+                if not provided.
         """
         # Sort peers by load (connection utilization)
         candidates = []
@@ -1583,9 +1583,8 @@ class NetworkNode(Node):
     def _healthy_peers_snapshot(self) -> Dict[str, MinerInfo]:
         """Return active peers with a recent successful heartbeat.
 
-        Must be called while holding net_lock.  Uses
-        ``heartbeat_timeout / 2`` as the recency cutoff so we only
-        share peers that are demonstrably alive.
+        Uses ``heartbeat_timeout / 2`` as the recency cutoff so we
+        only share peers that are demonstrably alive.
         """
         now = utc_timestamp_float()
         cutoff = self.heartbeat_timeout / 2
@@ -2650,46 +2649,45 @@ class NetworkNode(Node):
         if self._is_backed_off(host):
             return False
 
-        async with self.net_lock:
-            # Already in the active set — update in place.
-            if host in self.peers:
-                self.add_or_update_peer(host, info)
-                if self.node_client:
-                    self.node_client.add_peer(host, info)
-                self.telemetry.update_node(
-                    host, "active", info, descriptor=descriptor,
-                )
-                return False  # not new
+        # Already in the active set — update in place.
+        if host in self.peers:
+            self.add_or_update_peer(host, info)
+            if self.node_client:
+                self.node_client.add_peer(host, info)
+            self.telemetry.update_node(
+                host, "active", info, descriptor=descriptor,
+            )
+            return False  # not new
 
-            # Active set has room, or the peer has a live connection.
-            if connected or len(self.peers) < self._max_active_peers:
-                # Remove from candidates if it was queued there.
-                self._candidate_peers.pop(host, None)
+        # Active set has room, or the peer has a live connection.
+        if connected or len(self.peers) < self._max_active_peers:
+            # Remove from candidates if it was queued there.
+            self._candidate_peers.pop(host, None)
 
-                self.add_or_update_peer(host, info)
-                if self.node_client:
-                    self.node_client.add_peer(host, info)
-                self.telemetry.update_node(
-                    host, "active", info, descriptor=descriptor,
-                )
-                self._has_ever_had_peers = True
-                self.logger.info(
-                    f"New peer discovered: {host}: "
-                    f"{info.miner_id} "
-                    f"({info.ecdsa_public_key.hex()[:8]})"
-                )
-                self._on_new_node(host, info)
-                if hasattr(self, '_swim_detector'):
-                    self._swim_detector.add_peer(host)
-                pool = getattr(self, '_process_pool', None)
-                if pool is not None:
-                    pool.spawn(host)
-                asyncio.create_task(self.gossip_new_node(host, info))
-                return True
+            self.add_or_update_peer(host, info)
+            if self.node_client:
+                self.node_client.add_peer(host, info)
+            self.telemetry.update_node(
+                host, "active", info, descriptor=descriptor,
+            )
+            self._has_ever_had_peers = True
+            self.logger.info(
+                f"New peer discovered: {host}: "
+                f"{info.miner_id} "
+                f"({info.ecdsa_public_key.hex()[:8]})"
+            )
+            self._on_new_node(host, info)
+            if hasattr(self, '_swim_detector'):
+                self._swim_detector.add_peer(host)
+            pool = getattr(self, '_process_pool', None)
+            if pool is not None:
+                pool.spawn(host)
+            asyncio.create_task(self.gossip_new_node(host, info))
+            return True
 
-            # Active set full — route to candidate pool.
-            self._add_candidate(host, info, descriptor=descriptor)
-            return False
+        # Active set full — route to candidate pool.
+        self._add_candidate(host, info, descriptor=descriptor)
+        return False
 
     def _add_candidate(
         self,
@@ -2698,7 +2696,7 @@ class NetworkNode(Node):
         descriptor: Optional[Dict[str, Any]] = None,
         source: str = "gossip",
     ) -> None:
-        """Add a peer to the candidate pool (must hold net_lock)."""
+        """Add a peer to the candidate pool."""
         if host in self._candidate_peers:
             # Update info but keep discovery timestamp.
             self._candidate_peers[host].info = info
@@ -2728,11 +2726,10 @@ class NetworkNode(Node):
     async def _promote_candidate(self, host: str) -> bool:
         """Promote a candidate to the active peer set.
 
-        Must be called while NOT holding net_lock (acquires it
-        internally via add_peer).  Returns True on success. On
-        failure (active set filled between probe and promotion,
-        ban list hit, address parse error) the candidate is
-        re-inserted so the next probe cycle can retry.
+        Returns True on success. On failure (active set filled
+        between probe and promotion, ban list hit, address parse
+        error) the candidate is re-inserted so the next probe cycle
+        can retry.
         """
         candidate = self._candidate_peers.pop(host, None)
         if candidate is None:
@@ -2745,9 +2742,8 @@ class NetworkNode(Node):
         if not promoted and host not in self.peers:
             # add_peer rejected the promotion; keep the candidate
             # around rather than losing it silently.
-            async with self.net_lock:
-                if host not in self._candidate_peers:
-                    self._candidate_peers[host] = candidate
+            if host not in self._candidate_peers:
+                self._candidate_peers[host] = candidate
             self.logger.debug(
                 f"Promotion of {host} rejected; returning to candidate pool"
             )
@@ -2759,22 +2755,21 @@ class NetworkNode(Node):
         Called from rebalance_loop (every 60s).  Probes at most 5
         candidates per cycle to avoid blocking.
         """
-        async with self.net_lock:
-            slots = self._max_active_peers - len(self.peers)
-            if slots <= 0:
-                return
-            # Pick oldest candidates that haven't been probed recently.
-            now = time.monotonic()
-            probe_list = []
-            for host, cand in sorted(
-                self._candidate_peers.items(),
-                key=lambda kv: kv[1].discovered_at,
-            ):
-                if now - cand.last_probe_at < 30:
-                    continue  # probed recently, skip
-                probe_list.append(host)
-                if len(probe_list) >= min(slots, 5):
-                    break
+        slots = self._max_active_peers - len(self.peers)
+        if slots <= 0:
+            return
+        # Pick oldest candidates that haven't been probed recently.
+        now = time.monotonic()
+        probe_list = []
+        for host, cand in sorted(
+            self._candidate_peers.items(),
+            key=lambda kv: kv[1].discovered_at,
+        ):
+            if now - cand.last_probe_at < 30:
+                continue  # probed recently, skip
+            probe_list.append(host)
+            if len(probe_list) >= min(slots, 5):
+                break
 
         if self.node_client is None:
             # Probing a candidate requires the QUIC client; without it
@@ -2829,34 +2824,33 @@ class NetworkNode(Node):
 
     async def remove_node(self, host: str):
         """Remove a node from our registry."""
-        async with self.net_lock:
-            if self.remove_peer(host):
-                self.logger.info(f"Node removed: {host}")
-                self.telemetry.remove_node(host)
-                self._on_node_lost(host)
+        if self.remove_peer(host):
+            self.logger.info(f"Node removed: {host}")
+            self.telemetry.remove_node(host)
+            self._on_node_lost(host)
 
-                # Clear synchronized state when all peers are lost
-                if not self.peers and self._has_ever_had_peers:
-                    self._synchronized.clear()
-                    self.logger.warning(
-                        "All peers lost — cleared synchronized state, "
-                        "mining paused until re-sync"
-                    )
+            # Clear synchronized state when all peers are lost
+            if not self.peers and self._has_ever_had_peers:
+                self._synchronized.clear()
+                self.logger.warning(
+                    "All peers lost — cleared synchronized state, "
+                    "mining paused until re-sync"
+                )
 
-                # Update node client to remove peer
-                if self.node_client:
-                    await self.node_client.remove_peer(host)
-                pool = getattr(self, '_process_pool', None)
-                if pool is not None:
-                    pool.kill(host)
-                if hasattr(self, '_swim_detector'):
-                    self._swim_detector.remove_peer(host)
-                if hasattr(self, '_peer_loads'):
-                    self._peer_loads.pop(host, None)
-                if hasattr(self, '_peer_scorer'):
-                    self._peer_scorer.remove_peer(host)
-                if hasattr(self, '_block_inventory'):
-                    self._block_inventory.remove_peer(host)
+            # Update node client to remove peer
+            if self.node_client:
+                await self.node_client.remove_peer(host)
+            pool = getattr(self, '_process_pool', None)
+            if pool is not None:
+                pool.kill(host)
+            if hasattr(self, '_swim_detector'):
+                self._swim_detector.remove_peer(host)
+            if hasattr(self, '_peer_loads'):
+                self._peer_loads.pop(host, None)
+            if hasattr(self, '_peer_scorer'):
+                self._peer_scorer.remove_peer(host)
+            if hasattr(self, '_block_inventory'):
+                self._block_inventory.remove_peer(host)
 
     async def get_peer_status(self, host: str) -> Optional[dict]:
         """Get status information from a peer node.
@@ -2922,8 +2916,7 @@ class NetworkNode(Node):
         if peer_status and 'info' in peer_status:
             try:
                 info = MinerInfo.from_json(peer_status['info'])
-                async with self.net_lock:
-                    self.peers[host] = info
+                self.peers[host] = info
                 descriptor = override_public_address(
                     peer_status.get('descriptor'), host,
                 )
@@ -2940,8 +2933,7 @@ class NetworkNode(Node):
 
     async def refresh_all_peer_info(self):
         """Refresh information for all known peers by calling their status endpoints."""
-        async with self.net_lock:
-            peer_hosts = list(self.peers.keys())
+        peer_hosts = list(self.peers.keys())
 
         for host in peer_hosts:
             await self.refresh_peer_info(host)
@@ -3058,8 +3050,7 @@ class NetworkNode(Node):
         self._block_inventory.record_have(block_hash)
 
         # Send IHAVE to peers via scored selection
-        async with self.net_lock:
-            peer_list = list(self.peers.keys())
+        peer_list = list(self.peers.keys())
 
         effective_fanout = self._adaptive_fanout(len(peer_list))
         targets = self._peer_scorer.select_gossip_targets(
@@ -3350,9 +3341,8 @@ class NetworkNode(Node):
                     f"MIGRATE alternative {alt_host} skipped: backed off"
                 )
                 continue
-            async with self.net_lock:
-                if alt_host in self.peers:
-                    continue
+            if alt_host in self.peers:
+                continue
             try:
                 success = await self.connect_to_peer(alt_host)
                 if success:
@@ -3813,9 +3803,8 @@ class NetworkNode(Node):
         # Check connection capacity before processing
         if not self._load_monitor.should_accept_join():
             # Suggest least-loaded alternative peers when at capacity
-            async with self.net_lock:
-                healthy = self._healthy_peers_snapshot()
-                peer_keys = list(healthy.keys())
+            healthy = self._healthy_peers_snapshot()
+            peer_keys = list(healthy.keys())
             alt_peers = self._get_least_loaded_peers(
                 exclude=set(), count=10, peer_list=peer_keys
             )
@@ -3893,8 +3882,7 @@ class NetworkNode(Node):
 
         # Return only peers with a recent successful heartbeat so we
         # don't propagate stale/unreachable addresses to new joiners.
-        async with self.net_lock:
-            peers_snapshot = self._healthy_peers_snapshot()
+        peers_snapshot = self._healthy_peers_snapshot()
 
         peers_payload: Dict[str, str] = {}
         for host, info in peers_snapshot.items():
@@ -3950,14 +3938,6 @@ class NetworkNode(Node):
         if sender and net_version:
             self.peer_versions[sender] = net_version
 
-        # Hot path: no net_lock. All writes here are single-writer
-        # from the coordinator loop (dict assignments are atomic under
-        # the GIL) and the lock previously contended with add_peer /
-        # cleanup / rebalance for no actual invariant. With the
-        # listener process handling most HEARTBEATs locally via
-        # cached snapshot, this legacy-flag-off path is rare, but
-        # freeing it from the lock still prevents one class of
-        # starvation cascade.
         if sender:
             if sender in self.peers:
                 self.heartbeats[sender] = utc_timestamp_float()
@@ -3975,11 +3955,10 @@ class NetworkNode(Node):
 
     async def _quic_handle_peers(self, msg: QuicMessage) -> QuicMessage:
         """Return list of known healthy nodes."""
-        async with self.net_lock:
-            healthy = self._healthy_peers_snapshot()
-            peers_data = {
-                host: info.to_json() for host, info in healthy.items()
-            }
+        healthy = self._healthy_peers_snapshot()
+        peers_data = {
+            host: info.to_json() for host, info in healthy.items()
+        }
         return msg.create_response(
             json.dumps({"peers": peers_data}).encode('utf-8')
         )
