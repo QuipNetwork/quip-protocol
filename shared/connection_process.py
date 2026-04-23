@@ -11,6 +11,7 @@ Parent -> Child::
     {"cmd": "heartbeat", "public_host": str, "version": str, "miner_info": dict}
     {"cmd": "gossip", "payload": <base64-encoded bytes>}
     {"cmd": "request_block", "request_id": int, "block_num": int}
+    {"cmd": "request_block_header", "request_id": int, "block_num": int}
     {"cmd": "request_status", "request_id": int}
     {"cmd": "request_peers", "request_id": int}
     {"cmd": "probe_request", "request_id": int, "target": str, "probe_id": str}
@@ -22,6 +23,7 @@ Child -> Parent::
     {"event": "heartbeat_fail", "reason": str}
     {"event": "gossip_result", "success": bool}
     {"event": "block_data", "request_id": int, "data": <base64>, "block_num": int}
+    {"event": "block_header_data", "request_id": int, "data": <base64>, "block_num": int}
     {"event": "status_data", "request_id": int, "data": dict}
     {"event": "peers_data", "request_id": int, "data": dict}
     {"event": "probe_result", "request_id": int, "result": Optional[bool]}
@@ -287,6 +289,10 @@ async def _connection_loop(
                 await _handle_request_block(
                     client, pipe, peer_address, cmd, log
                 )
+            elif op == "request_block_header":
+                await _handle_request_block_header(
+                    client, pipe, peer_address, cmd, log
+                )
             elif op == "request_status":
                 await _handle_request_status(
                     client, pipe, peer_address, cmd, log
@@ -418,6 +424,39 @@ async def _handle_request_block(
             })
     except Exception as exc:
         log.debug(f"Block request error: {exc}")
+        _send_safe(pipe, {
+            "event": "error", "request_id": request_id, "message": str(exc),
+        })
+
+
+async def _handle_request_block_header(
+    client: 'NodeClient',
+    pipe: mp.connection.Connection,
+    peer_address: str,
+    cmd: dict,
+    log: logging.Logger,
+) -> None:
+    """Download only the block header from the peer (smaller than full block)."""
+    request_id = cmd.get("request_id")
+    block_num = cmd.get("block_num", 0)
+    try:
+        header = await client.get_peer_block_header(peer_address, block_num)
+        if header is not None:
+            header_bytes = header.to_network()
+            _send_safe(pipe, {
+                "event": "block_header_data",
+                "request_id": request_id,
+                "block_num": block_num,
+                "data": base64.b64encode(header_bytes).decode('ascii'),
+            })
+        else:
+            _send_safe(pipe, {
+                "event": "error",
+                "request_id": request_id,
+                "message": f"Header {block_num} not available from {peer_address}",
+            })
+    except Exception as exc:
+        log.debug(f"Block header request error: {exc}")
         _send_safe(pipe, {
             "event": "error", "request_id": request_id, "message": str(exc),
         })

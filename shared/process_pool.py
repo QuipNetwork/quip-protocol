@@ -218,6 +218,23 @@ class ProcessPool:
             "block_num": block_num,
         })
 
+    def request_block_header(
+        self, peer_address: str, block_num: int, request_id: int,
+    ) -> bool:
+        """Request a specific block's header from a peer.
+
+        Mirrors ``request_block`` but resolves on the
+        ``block_header_data`` event with a smaller payload.
+        """
+        handle = self._handles.get(peer_address)
+        if handle is None:
+            return False
+        return handle.send_cmd({
+            "cmd": "request_block_header",
+            "request_id": request_id,
+            "block_num": block_num,
+        })
+
     def request_status(self, peer_address: str, request_id: int) -> bool:
         """Request status from a peer."""
         handle = self._handles.get(peer_address)

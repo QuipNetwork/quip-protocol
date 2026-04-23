@@ -1059,8 +1059,8 @@ class NetworkNode(Node):
                 f"responded={event.get('responded')} "
                 f"failed={event.get('failed')}"
             )
-        elif ev in ("block_data", "status_data", "peers_data",
-                    "probe_result"):
+        elif ev in ("block_data", "block_header_data", "status_data",
+                    "peers_data", "probe_result"):
             rid = event.get("request_id")
             if rid is None:
                 return
@@ -2899,13 +2899,30 @@ class NetworkNode(Node):
     async def get_peer_block_header(
         self, host: str, block_number: int = 0,
     ) -> Optional[BlockHeader]:
-        """Get only the block header from a peer node.
+        """Get only the block header from a peer node (lighter than full block).
 
-        Uses ``node_client`` directly: the child IPC protocol exposes
-        full-block requests only. Adding a header-only child command
-        would save a few KB per request; not worth the extra IPC
-        surface area until profiling shows it matters.
+        Routes through the per-peer child when one exists; otherwise
+        falls back to ``node_client``.
         """
+        pool = self._process_pool
+        if pool is not None and pool.has_peer(host):
+            event = await self._pool_rpc(
+                lambda rid: pool.request_block_header(
+                    host, block_number, rid,
+                ),
+                timeout=self.node_timeout,
+            )
+            if event is not None and event.get("event") == "block_header_data":
+                try:
+                    return BlockHeader.from_network(
+                        base64.b64decode(event.get("data", ""))
+                    )
+                except Exception:
+                    self.logger.exception(
+                        f"Failed to decode header from {host}"
+                    )
+                    return None
+            return None
         if not self.node_client:
             return None
         return await self.node_client.get_peer_block_header(host, block_number)

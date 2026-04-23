@@ -245,6 +245,14 @@ class TestRequestIdCorrelation:
         # but the send_cmd round-trip succeeds.
         assert pool.request_block(_UNREACHABLE, 42, request_id=1001) is True
 
+    def test_request_block_header_sends_request_id(self, pool):
+        """request_block_header mirrors request_block with its own id."""
+        pool.spawn(_UNREACHABLE)
+        assert (
+            pool.request_block_header(_UNREACHABLE, 42, request_id=1101)
+            is True
+        )
+
     def test_request_status_sends_request_id(self, pool):
         pool.spawn(_UNREACHABLE)
         assert pool.request_status(_UNREACHABLE, request_id=1002) is True
@@ -264,6 +272,7 @@ class TestRequestIdCorrelation:
     def test_rpc_methods_fail_without_peer(self, pool):
         """Unknown peer returns False for all RPC methods."""
         assert pool.request_block("9.9.9.9:1", 0, 1) is False
+        assert pool.request_block_header("9.9.9.9:1", 0, 1) is False
         assert pool.request_status("9.9.9.9:1", 1) is False
         assert pool.request_peers("9.9.9.9:1", 1) is False
         assert pool.send_probe_request("9.9.9.9:1", "x:1", "p", 1) is False
