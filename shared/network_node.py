@@ -1,14 +1,18 @@
 import asyncio
+import atexit
+import base64
 import copy
 import ipaddress
 import json
 import math
+import os
 import random
 import socket
 import struct
 import sys
 import threading
 import time
+from concurrent.futures import ProcessPoolExecutor
 
 from dataclasses import dataclass
 from typing import Dict, Optional, Callable, Any
@@ -39,11 +43,6 @@ from shared.sync_messages import (
     encode_block_by_hash_response,
     encode_manifest_response,
 )
-from aioquic.asyncio import serve
-from aioquic.asyncio.protocol import QuicConnectionProtocol
-from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.connection import QuicConnection
-from aioquic.quic.events import QuicEvent, DatagramFrameReceived, StreamDataReceived, ConnectionTerminated, HandshakeCompleted
 from shared.block_inventory import BlockInventory
 from shared.block_synchronizer import BlockSynchronizer
 from shared.block_store import BlockStore
@@ -83,6 +82,52 @@ class CandidatePeer:
     probe_attempts: int = 0
     last_probe_at: float = 0.0
     descriptor: Optional[Dict[str, Any]] = None
+
+
+def _run_sa_sample_ising(
+    h_dict: Dict[int, float],
+    J_dict: Dict[tuple, float],
+    num_samples: int,
+) -> tuple:
+    """Worker-side Simulated Annealing sampling for SOLVE_REQUEST.
+
+    Defined at module scope so the ``ProcessPoolExecutor`` can
+    invoke it. Creates its own sampler inside the worker (no state
+    carried from the coordinator) and returns plain lists of
+    samples and energies that round-trip cleanly across the
+    process boundary.
+    """
+    from dwave.samplers import SimulatedAnnealingSampler
+    sampler = SimulatedAnnealingSampler()
+    sampleset = sampler.sample_ising(
+        h_dict, J_dict, num_reads=num_samples,
+    )
+    samples: list = []
+    energies: list = []
+    for sample, energy in sampleset.data(['sample', 'energy']):
+        samples.append(
+            [int(sample[i]) for i in sorted(sample.keys())]
+        )
+        energies.append(float(energy))
+    return samples, energies
+
+
+class _ListenerPeerShim:
+    """Stand-in for aioquic's protocol object in forwarded-inbound handling.
+
+    Only the fields touched by ``_handle_quic_message`` need to exist:
+    ``_peer_address`` for rate-limiting/logging, and ``close`` for the
+    version-mismatch disconnect path (a no-op here because the real
+    QUIC connection lives in the listener process; the listener
+    enforces idle-timeout close on its own).
+    """
+    __slots__ = ("_peer_address",)
+
+    def __init__(self, peer_address: str) -> None:
+        self._peer_address = peer_address
+
+    def close(self) -> None:
+        return None
 
 
 # Configure logging
@@ -328,7 +373,6 @@ class NetworkNode(Node):
         self._max_candidate_peers = int(config.get("max_candidate_peers", 100))
         self._candidate_peers: Dict[str, CandidatePeer] = {}
 
-        self.net_lock = asyncio.Lock()
         self.running = False
         self.heartbeats = {}
         self.peer_versions: dict[str, str] = {}  # peer_host -> version string
@@ -344,6 +388,23 @@ class NetworkNode(Node):
 
         # Process pool for per-connection peer isolation (initialized in start())
         self._process_pool: Optional[ProcessPool] = None
+        # Pool event drain task (initialized in start())
+        self._pool_drain_task: Optional[asyncio.Task] = None
+        # Pending RPC-style requests correlated by request_id. Populated
+        # by outbound routing (request_block/status/peers, probe_request)
+        # and resolved by the event drain when the matching event
+        # arrives from a child.
+        self._pending_requests: Dict[int, asyncio.Future] = {}
+        self._next_pool_request_id: int = 1
+        # Listener handle + drain tasks, initialized in start().
+        self._listener: Optional[Any] = None  # ListenerProcessHandle
+        self._listener_drain_task: Optional[asyncio.Task] = None
+        self._listener_snapshot_task: Optional[asyncio.Task] = None
+        # CPU-bound handler executor (BLOCK_REQUEST serialize,
+        # CHAIN_MANIFEST walk, SOLVE_REQUEST sampling). Lazy-init
+        # on first dispatch so nodes that never serve these
+        # requests don't pay the fork cost.
+        self._handler_executor: Optional[ProcessPoolExecutor] = None
 
         # Per-peer rate limiter for incoming QUIC messages
         self._rate_limiter = PeerRateLimiter(
@@ -397,9 +458,6 @@ class NetworkNode(Node):
         self.on_new_node: Optional[Callable] = None
         self.on_node_lost: Optional[Callable] = None
         self.on_block_received: Optional[Callable] = None
-
-        # QUIC server (replaces aiohttp web server)
-        self.quic_server: Optional[QuicServer] = None
 
         # Background tasks
         self.heartbeat_task = None
@@ -482,84 +540,6 @@ class NetworkNode(Node):
 
         self.logger.info(f"Network node {self.node_name} initialized with config {json.dumps(config)}")
 
-    def _create_server_protocol(self, quic: QuicConnection, **kwargs) -> QuicConnectionProtocol:
-        """Create a QUIC protocol handler for incoming connections."""
-        # Note: aioquic passes stream_handler as kwarg, we accept but ignore it
-        node = self
-
-        class _ServerProtocol(QuicConnectionProtocol):
-            def __init__(self, quic_conn: QuicConnection, stream_handler=None):
-                super().__init__(quic_conn, stream_handler)
-                self._peer_address: Optional[str] = None
-                self._stream_buffers: Dict[int, bytearray] = {}
-
-            def quic_event_received(self, event: QuicEvent) -> None:
-                if isinstance(event, HandshakeCompleted):
-                    peername = self._quic._network_paths[0].addr if self._quic._network_paths else None
-                    if peername:
-                        self._peer_address = f"{peername[0]}:{peername[1]}"
-                    node.logger.debug(f"QUIC handshake completed with {self._peer_address}")
-                elif isinstance(event, DatagramFrameReceived):
-                    asyncio.create_task(self._handle_message(event.data))
-                elif isinstance(event, StreamDataReceived):
-                    self._handle_stream_data(event)
-                elif isinstance(event, ConnectionTerminated):
-                    node.logger.debug(
-                        f"Connection terminated with {self._peer_address}: "
-                        f"error_code={event.error_code}, reason={event.reason_phrase}"
-                    )
-                    self._stream_buffers.clear()
-
-            def _handle_stream_data(self, event: StreamDataReceived) -> None:
-                """Handle data received on a QUIC stream."""
-                stream_id = event.stream_id
-                if stream_id not in self._stream_buffers:
-                    self._stream_buffers[stream_id] = bytearray()
-                self._stream_buffers[stream_id].extend(event.data)
-
-                # Check if stream is complete
-                if event.end_stream:
-                    data = bytes(self._stream_buffers.pop(stream_id))
-                    node.logger.debug(f"Stream {stream_id} complete: {len(data)} bytes from {self._peer_address}")
-                    asyncio.create_task(self._handle_message(data, response_stream_id=stream_id))
-
-            async def _handle_message(self, data: bytes, response_stream_id: Optional[int] = None) -> None:
-                """Handle incoming message (from datagram or stream)."""
-                try:
-                    msg = QuicMessage.from_bytes(data)
-                    node.logger.debug(
-                        f"Received {msg.msg_type.name} (id={msg.request_id}) "
-                        f"from {self._peer_address}: {len(msg.payload)} bytes"
-                    )
-                    response = await node._handle_quic_message(msg, self)
-                    if response is not None:
-                        response_bytes = response.to_bytes()
-                        try:
-                            # Use streams for large responses, datagrams for small ones
-                            if len(response_bytes) > MAX_DATAGRAM_MESSAGE_SIZE:
-                                stream_id = self._quic.get_next_available_stream_id()
-                                self._quic.send_stream_data(stream_id, response_bytes, end_stream=True)
-                                node.logger.debug(
-                                    f"Sent {response.msg_type.name} (id={response.request_id}) "
-                                    f"via stream {stream_id}: {len(response_bytes)} bytes"
-                                )
-                            else:
-                                self._quic.send_datagram_frame(response_bytes)
-                                node.logger.debug(
-                                    f"Sent {response.msg_type.name} (id={response.request_id}) "
-                                    f"via datagram: {len(response_bytes)} bytes"
-                                )
-                            self.transmit()
-                        except Exception as send_err:
-                            node.logger.error(f"Failed to send response: {send_err}")
-                except ValueError as e:
-                    node.logger.warning(f"Invalid message from {self._peer_address}: {e}")
-                except Exception as e:
-                    node.logger.exception(f"Error handling message from {self._peer_address}: {e}")
-
-        stream_handler = kwargs.get('stream_handler')
-        return _ServerProtocol(quic, stream_handler)
-
     async def start(self):
         """Start the P2P node."""
         self.running = True
@@ -623,61 +603,47 @@ class NetworkNode(Node):
         )
         self._process_pool = ProcessPool(config=pool_cfg, logger=self.logger)
 
-        # Start QUIC server
+        # Spawn the inbound listener process. It owns the UDP socket
+        # and runs aioquic in its own event loop; the coordinator
+        # runs no QUIC transport of its own.
         cert_file = self.tls_cert_file if self.tls_enabled else None
         key_file = self.tls_key_file if self.tls_enabled else None
         if not cert_file or not key_file:
-            self.logger.warning("No TLS certificates provided, generating self-signed certificate")
+            self.logger.warning(
+                "No TLS certificates provided, "
+                "generating self-signed certificate"
+            )
             cert_file, key_file = generate_self_signed_cert()
 
-        configuration = QuicConfiguration(
-            is_client=False,
-            max_datagram_frame_size=MAX_DATAGRAM_FRAME_SIZE,
-            alpn_protocols=[QUIP_ALPN_PROTOCOL],
-            idle_timeout=300.0,
+        from shared.listener_process import spawn_listener_process
+        self._listener = spawn_listener_process({
+            "bind_address": self.bind_address,
+            "port": self.port,
+            "tls_cert_file": cert_file,
+            "tls_key_file": key_file,
+            "alpn_protocol": QUIP_ALPN_PROTOCOL,
+            "max_datagram_frame_size": MAX_DATAGRAM_FRAME_SIZE,
+            "max_datagram_message_size": MAX_DATAGRAM_MESSAGE_SIZE,
+            "idle_timeout": 300.0,
+        })
+        self.logger.info(
+            f"Spawned listener process (pid={self._listener.process.pid})"
         )
-        configuration.load_cert_chain(cert_file, key_file)
+        # Guard against orphaned child processes on abnormal exit
+        # (uncaught exception, SIGKILL of the coordinator, etc). The
+        # normal shutdown path in stop() is primary; this is a
+        # belt-and-suspenders net.
+        atexit.register(self._atexit_cleanup_children)
 
-        self._quic_server = await serve(
-            host=self.bind_address,
-            port=self.port,
-            configuration=configuration,
-            create_protocol=self._create_server_protocol,
-        )
-
-        # Suppress aioquic assertion errors from malformed packets
-        # (e.g. v1 nodes sending non-INITIAL first packets).
-        # Guard against re-installing the handler on repeated start()
-        # calls — otherwise _default_handler would chain previous
-        # installs and leak memory.
+        # Warn when any coordinator callback stalls the loop for
+        # >250ms. With QUIC transport out of this loop, bursts here
+        # point at CPU-bound work (SPHINCS+ verify, PoW validation,
+        # block processing) that should be offloaded.
         loop = asyncio.get_running_loop()
-        # Log any callback that blocks the event loop for >250ms. Bursts here
-        # cluster around new-block arrivals when synchronous CPU work (SPHINCS+
-        # verify, PoW validation) runs on the main loop and stalls gossip
-        # handlers. Once that work is offloaded, these should become rare.
         loop.slow_callback_duration = 0.25
-        if not getattr(loop, "_quip_quic_handler_installed", False):
-            _default_handler = loop.get_exception_handler()
-
-            def _quic_exception_handler(loop_arg, context):
-                exc = context.get("exception")
-                if (isinstance(exc, AssertionError)
-                        and "first packet must be INITIAL" in str(exc)):
-                    self.logger.debug(
-                        "Dropped malformed QUIC packet "
-                        "(non-INITIAL first packet)"
-                    )
-                    return
-                if _default_handler:
-                    _default_handler(loop_arg, context)
-                else:
-                    loop_arg.default_exception_handler(context)
-
-            loop.set_exception_handler(_quic_exception_handler)
-            loop._quip_quic_handler_installed = True
 
         # Suppress noisy aioquic internal warnings (CRYPTO frame errors
-        # from incompatible peers)
+        # from incompatible peers) on the node_client's connections.
         logging.getLogger("quic").setLevel(logging.ERROR)
 
         self.logger.info(
@@ -731,6 +697,15 @@ class NetworkNode(Node):
         self.gossip_processor_task = asyncio.create_task(self.gossip_processor_loop())
         self.server_task = asyncio.create_task(self.server_loop())
         self.rebalance_task = asyncio.create_task(self.rebalance_loop())
+        self._pool_drain_task = asyncio.create_task(
+            self._process_pool_event_drain()
+        )
+        self._listener_drain_task = asyncio.create_task(
+            self._listener_event_drain()
+        )
+        self._listener_snapshot_task = asyncio.create_task(
+            self._listener_snapshot_loop()
+        )
 
         # have we fully synchronized with the network at least one time?
         self._synchronized = threading.Event()
@@ -763,15 +738,101 @@ class NetworkNode(Node):
         """Mark node as synchronized with the network."""
         self._synchronized.set()
 
+    def _atexit_cleanup_children(self) -> None:
+        """Best-effort teardown of child processes at interpreter exit.
+
+        Runs synchronously (atexit hooks are not async) and must not
+        raise — atexit swallows exceptions. The normal async shutdown
+        path in ``stop()`` is still preferred; this catches the cases
+        where the coordinator exits without it (unhandled exception
+        in ``start()``, SIGKILL, etc.).
+        """
+        try:
+            listener = getattr(self, "_listener", None)
+            if listener is not None:
+                try:
+                    listener.force_stop(timeout=1.0)
+                except Exception:
+                    pass
+            executor = getattr(self, "_handler_executor", None)
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+            pool = getattr(self, "_process_pool", None)
+            if pool is not None:
+                try:
+                    pool.shutdown_all(timeout=1.0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     async def stop(self):
-        """Stop the P2P node."""
-        async with self.net_lock:
-            if not self.running:
-                return
-            self.running = False
+        """Stop the P2P node.
+
+        Ordering matters: listener first (rejects new inbound
+        packets), then outbound process pool, then REST API, then
+        background coordinator tasks and the rest. Stopping inbound
+        before outbound prevents us from processing messages we
+        can't answer; stopping REST before background tasks avoids
+        serving stale cached state while peers are being removed.
+        """
+        if not self.running:
+            return
+        self.running = False
         self.logger.info("Shutting down network node...")
 
-        # Cancel background tasks
+        # 1. Stop inbound first — reject new packets.
+        if self._listener_drain_task:
+            self._listener_drain_task.cancel()
+            self._listener_drain_task = None
+        if self._listener_snapshot_task:
+            self._listener_snapshot_task.cancel()
+            self._listener_snapshot_task = None
+        if self._listener is not None:
+            self.logger.info("Stopping listener process...")
+            self._listener.shutdown()
+            self._listener.force_stop(timeout=3.0)
+            self._listener = None
+
+        # 1b. Stop the handler executor. By this point inbound
+        # packets no longer reach us, so any in-flight CPU handler
+        # work is a response that will be dropped anyway; cancel
+        # futures rather than waiting.
+        if self._handler_executor is not None:
+            self.logger.info("Stopping handler executor...")
+            try:
+                self._handler_executor.shutdown(
+                    wait=False, cancel_futures=True,
+                )
+            except Exception:
+                self.logger.debug(
+                    "handler_executor shutdown raised", exc_info=True,
+                )
+            self._handler_executor = None
+
+        # 2. Stop outbound — no new gossip/heartbeat/block fetches.
+        if self._pool_drain_task:
+            self._pool_drain_task.cancel()
+            self._pool_drain_task = None
+        if self._process_pool:
+            self.logger.info("Stopping process pool...")
+            self._process_pool.shutdown_all(timeout=5.0)
+            self._process_pool = None
+        if self._connection_worker:
+            self.logger.info("Stopping connection worker...")
+            self._connection_worker.close()
+            self._connection_worker = None
+
+        # 3. Stop REST API so no new external queries land on a
+        #    half-torn-down coordinator.
+        if self.rest_api_server:
+            self.logger.info("Stopping REST API server...")
+            await self.rest_api_server.stop()
+
+        # 4. Cancel coordinator background tasks.
         if self.heartbeat_task:
             self.heartbeat_task.cancel()
         if self.cleanup_task:
@@ -784,41 +845,18 @@ class NetworkNode(Node):
             self.server_task.cancel()
         if hasattr(self, 'rebalance_task') and self.rebalance_task:
             self.rebalance_task.cancel()
-        self.telemetry.stop()
         if self.reset_timer_task:
             self.reset_timer_task.cancel()
 
-        # Stop telemetry cache
+        # 5. Telemetry + cache.
+        self.telemetry.stop()
         if self.telemetry_cache is not None:
             await self.telemetry_cache.stop()
 
-        # Stop REST API server if running
-        if self.rest_api_server:
-            self.logger.info("Stopping REST API server...")
-            await self.rest_api_server.stop()
-
-        # Stop connection worker before closing the QUIC client
-        if self._connection_worker:
-            self.logger.info("Stopping connection worker...")
-            self._connection_worker.close()
-            self._connection_worker = None
-
-        # Shut down process pool (per-connection processes)
-        if self._process_pool:
-            self.logger.info("Stopping process pool...")
-            self._process_pool.shutdown_all(timeout=5.0)
-            self._process_pool = None
-
-        self.logger.info("Cancelling QUIC client tasks...")
-        # Close node client
+        # 6. NodeClient (outbound QUIC client for JOIN/MIGRATE paths).
         if self.node_client:
+            self.logger.info("Stopping node client...")
             await self.node_client.stop()
-
-        self.logger.info("Cancelling QUIC server tasks...")
-        # Stop QUIC server
-        if self._quic_server:
-            self._quic_server.close()
-        
 
         all_tasks = asyncio.all_tasks()
         self.logger.info(f"Total active tasks: {len(all_tasks)}")
@@ -839,23 +877,19 @@ class NetworkNode(Node):
     ##########################
 
     async def heartbeat_loop(self):
-        """Send heartbeats to all known nodes with SWIM probing."""
+        """Send heartbeats to all known nodes with SWIM probing.
+
+        Each peer's heartbeat is dispatched to its per-peer child
+        process via ``ProcessPool``; the response is recorded
+        asynchronously by ``_dispatch_pool_event``.
+        """
         while self.running:
             try:
                 await asyncio.sleep(self.heartbeat_interval)
 
-                # Send heartbeat to all nodes
-                tasks = []
-                async with self.net_lock:
-                    peer_list = list(self.peers.keys())
-                    for node_host in peer_list:
-                        task = asyncio.create_task(
-                            self._heartbeat_with_swim(node_host)
-                        )
-                        tasks.append(task)
+                peer_list = list(self.peers.keys())
 
-                if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                self._dispatch_pool_heartbeats(peer_list)
 
                 # Refresh our own telemetry entry at heartbeat cadence so
                 # ``last_seen``/``last_heartbeat`` do not go stale.
@@ -876,24 +910,25 @@ class NetworkNode(Node):
 
             except asyncio.CancelledError:
                 break
-            except Exception as e:
+            except Exception:
                 self.logger.exception("Error in heartbeat loop")
 
-    async def _heartbeat_with_swim(self, node_host: str) -> None:
-        """Send heartbeat and update SWIM/scoring based on result."""
-        ok = await self.send_heartbeat(node_host)
-        if ok:
-            self._swim_detector.record_heartbeat_success(node_host)
-            self._peer_scorer.record_heartbeat_ok(node_host)
-        else:
-            self._swim_detector.record_heartbeat_failure(node_host)
-            self._peer_scorer.record_heartbeat_fail(node_host)
-            state = self._swim_detector.get_state(node_host)
-            if state == PeerState.SUSPECT:
-                self.logger.debug(
-                    f"SWIM: {node_host} now SUSPECT "
-                    f"(direct heartbeat failed)"
-                )
+    def _dispatch_pool_heartbeats(self, peer_list: list[str]) -> None:
+        """Hand a heartbeat command to each peer's child process.
+
+        Fire-and-forget: the result is recorded asynchronously by
+        ``_dispatch_pool_event`` when the child replies. Missing
+        children are spawned lazily (subject to the pool's spawn
+        throttle). This method never blocks on network I/O.
+        """
+        pool = self._process_pool
+        if pool is None:
+            return
+        info_dict = json.loads(self.info().to_json())
+        for host in peer_list:
+            if not pool.has_peer(host):
+                pool.spawn(host)
+            pool.send_heartbeat(host, self.public_host, info_dict)
 
     async def _run_swim_probes(self, peer_list: list[str]) -> None:
         """Send SWIM indirect probe requests for all suspect peers."""
@@ -914,14 +949,417 @@ class NetworkNode(Node):
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _send_swim_probe(self, req) -> None:
-        """Send a single SWIM probe request and record the result."""
-        result = await self.node_client.send_probe_request(
-            req.prober, req.target, req.probe_id
-        )
+        """Send a single SWIM probe request and record the result.
+
+        Routes through the pool when the prober has a running child;
+        otherwise falls back to direct ``node_client`` (e.g. for
+        probers not yet promoted to active).
+        """
+        pool = self._process_pool
+        if pool is not None and pool.has_peer(req.prober):
+            event = await self._pool_rpc(
+                lambda rid: pool.send_probe_request(
+                    req.prober, req.target, req.probe_id, rid,
+                ),
+                timeout=self._swim_detector.probe_timeout,
+            )
+            result = (
+                event.get("result")
+                if event is not None
+                and event.get("event") == "probe_result"
+                else None
+            )
+        else:
+            result = await self.node_client.send_probe_request(
+                req.prober, req.target, req.probe_id
+            )
         if result is not None:
             self._swim_detector.record_probe_result(
                 req.target, req.prober, result
             )
+
+    def _alloc_pool_request_id(self) -> int:
+        """Return the next unique request_id for pool RPC correlation."""
+        rid = self._next_pool_request_id
+        self._next_pool_request_id += 1
+        return rid
+
+    async def _pool_rpc(
+        self,
+        send_cmd: Callable[[int], bool],
+        timeout: float,
+    ) -> Optional[dict]:
+        """Issue an RPC-style pool command and await its correlated event.
+
+        ``send_cmd`` takes a freshly allocated request_id and returns
+        True if the command was successfully handed to a child. The
+        matching event (block_data / status_data / peers_data /
+        probe_result / error) is awaited via ``_pending_requests``.
+        Returns the event dict on success, or ``None`` on send failure
+        or timeout.
+        """
+        request_id = self._alloc_pool_request_id()
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending_requests[request_id] = future
+        try:
+            if not send_cmd(request_id):
+                self._pending_requests.pop(request_id, None)
+                return None
+            try:
+                return await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError:
+                return None
+        finally:
+            self._pending_requests.pop(request_id, None)
+
+    async def _process_pool_event_drain(self) -> None:
+        """Drain events from child processes and dispatch them.
+
+        Runs for the lifetime of the node. Polls the pool every 100 ms
+        (non-blocking) and forwards each event to
+        ``_dispatch_pool_event``. Errors are logged but do not stop
+        the drain.
+        """
+        while self.running:
+            try:
+                if self._process_pool is not None:
+                    events = self._process_pool.poll_events()
+                    for peer, event in events:
+                        self._dispatch_pool_event(peer, event)
+                await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                self.logger.exception(
+                    "Error in process pool event drain"
+                )
+                await asyncio.sleep(1.0)
+
+    def _dispatch_pool_event(self, peer: str, event: dict) -> None:
+        """Route a single child event to SWIM, scoring, or an RPC future."""
+        ev = event.get("event")
+        if ev == "heartbeat_ok":
+            self.heartbeats[peer] = utc_timestamp_float()
+            self._swim_detector.record_heartbeat_success(peer)
+            self._peer_scorer.record_heartbeat_ok(peer)
+        elif ev == "heartbeat_fail":
+            self._swim_detector.record_heartbeat_failure(peer)
+            self._peer_scorer.record_heartbeat_fail(peer)
+            state = self._swim_detector.get_state(peer)
+            if state == PeerState.SUSPECT:
+                self.logger.debug(
+                    f"SWIM: {peer} now SUSPECT (direct heartbeat failed)"
+                )
+        elif ev == "gossip_result":
+            # Counters already recorded in child; nothing else to do.
+            pass
+        elif ev == "gossip_stats":
+            self.logger.debug(
+                f"gossip_stats {peer}: sent={event.get('sent')} "
+                f"responded={event.get('responded')} "
+                f"failed={event.get('failed')}"
+            )
+        elif ev in ("block_data", "block_header_data", "status_data",
+                    "peers_data", "probe_result"):
+            rid = event.get("request_id")
+            if rid is None:
+                return
+            fut = self._pending_requests.get(rid)
+            if fut is not None and not fut.done():
+                fut.set_result(event)
+        elif ev == "error":
+            rid = event.get("request_id")
+            if rid is not None:
+                fut = self._pending_requests.get(rid)
+                if fut is not None and not fut.done():
+                    fut.set_result(event)
+            else:
+                self.logger.debug(
+                    f"Pool error from {peer}: {event.get('message')}"
+                )
+        elif ev == "disconnected":
+            self.logger.info(
+                f"Pool child for {peer} disconnected: "
+                f"{event.get('reason')}"
+            )
+            asyncio.create_task(self.remove_node(peer))
+
+    async def _listener_event_drain(self) -> None:
+        """Drain inbound events from the listener process.
+
+        ``peer_heartbeat`` events update coordinator state without the
+        peer-side HB timeout clock running. ``inbound_message`` events
+        spawn a handler task that invokes the existing dispatcher and
+        returns the response via ``inbound_response``.
+        """
+        while self.running and self._listener is not None:
+            try:
+                listener = self._listener
+                if listener is None:
+                    break
+                events = []
+                while True:
+                    msg = listener.recv()
+                    if msg is None:
+                        break
+                    events.append(msg)
+                for event in events:
+                    ev = event.get("event")
+                    if ev == "peer_heartbeat":
+                        self._apply_listener_heartbeat(event)
+                    elif ev == "inbound_message":
+                        asyncio.create_task(
+                            self._handle_forwarded_inbound(event)
+                        )
+                    elif ev == "listener_ready":
+                        self.logger.info(
+                            f"Listener ready on port {event.get('port')}"
+                        )
+                    elif ev == "listener_error":
+                        self.logger.error(
+                            f"Listener error: {event.get('message')}"
+                        )
+                    elif ev == "listener_died":
+                        self.logger.error(
+                            f"Listener process died: {event.get('reason')}"
+                        )
+                        break
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                self.logger.exception(
+                    "Error in listener event drain"
+                )
+                await asyncio.sleep(1.0)
+
+    def _apply_listener_heartbeat(self, event: dict) -> None:
+        """Record an inbound heartbeat reported by the listener.
+
+        The listener already answered the peer from its cached
+        snapshot; here we update coordinator state (SWIM / scorer /
+        telemetry / heartbeats) on its own loop with no lock contention
+        against the inbound hot path.
+        """
+        peer = event.get("peer")
+        if not peer:
+            return
+        net_version = event.get("version")
+        timestamp = event.get("timestamp", utc_timestamp_float())
+        if net_version:
+            self.peer_versions[peer] = net_version
+        if peer in self.peers:
+            self.heartbeats[peer] = utc_timestamp_float()
+            self._track_peer_timestamp(timestamp)
+            try:
+                self.telemetry.update_node(
+                    peer, "active", last_heartbeat=timestamp,
+                )
+            except Exception:
+                self.logger.debug(
+                    "telemetry.update_node failed for listener heartbeat",
+                    exc_info=True,
+                )
+        else:
+            self.logger.info(
+                f"New node discovered via listener heartbeat: {peer}"
+            )
+            asyncio.create_task(self.refresh_peer_info(peer))
+
+    async def _handle_forwarded_inbound(self, event: dict) -> None:
+        """Run the existing QUIC handler for a listener-forwarded msg."""
+        import base64 as _b64
+        from shared.node_client import QuicMessage
+        listener = self._listener
+        if listener is None:
+            return
+        msg_id = event.get("msg_id")
+        if msg_id is None:
+            return
+        raw_b64 = event.get("raw_b64", "")
+        try:
+            raw = _b64.b64decode(raw_b64)
+            msg = QuicMessage.from_bytes(raw)
+        except Exception as exc:
+            self.logger.warning(
+                f"Invalid forwarded inbound bytes: {exc}"
+            )
+            listener.send_cmd({
+                "cmd": "inbound_response",
+                "msg_id": msg_id, "payload_b64": None,
+            })
+            return
+
+        response = await self._handle_quic_message(
+            msg, _ListenerPeerShim(event.get("peer", "")),
+        )
+        payload_b64: Optional[str] = None
+        if response is not None:
+            payload_b64 = _b64.b64encode(
+                response.to_bytes()
+            ).decode("ascii")
+        listener.send_cmd({
+            "cmd": "inbound_response",
+            "msg_id": msg_id,
+            "payload_b64": payload_b64,
+        })
+
+    async def _listener_snapshot_loop(self) -> None:
+        """Periodically push peer/ban + read-cache snapshots to the listener.
+
+        Keeps the listener's fast-path caches fresh without requiring
+        fine-grained invalidation. The read-cache lets the listener
+        answer STATUS / STATS / PEERS / TELEMETRY_* locally instead
+        of forwarding to the coordinator.
+        """
+        while self.running and self._listener is not None:
+            try:
+                listener = self._listener
+                if listener is None:
+                    break
+                peers_snapshot = {
+                    host: {"version": self.peer_versions.get(host, "")}
+                    for host in list(self.peers.keys())
+                }
+                banned = list(self._backoff_list_snapshot())
+                listener.send_cmd({
+                    "cmd": "peer_snapshot",
+                    "peers": peers_snapshot,
+                    "banned": banned,
+                })
+                listener.send_cmd(self._build_read_snapshot_cmd())
+                await asyncio.sleep(5.0)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                self.logger.exception(
+                    "Error in listener snapshot loop"
+                )
+                await asyncio.sleep(5.0)
+
+    def _build_read_snapshot_cmd(self) -> dict:
+        """Build the IPC command carrying serialized read responses.
+
+        Each field is ``bytes`` (the JSON payload the handler would
+        normally produce) or ``None`` if not currently buildable. The
+        listener falls back to forwarding on ``None`` or on a stale
+        snapshot.
+        """
+        return {
+            "cmd": "read_snapshot",
+            "status": self._serialize_status_response(),
+            "stats": self._serialize_stats_response(),
+            "peers": self._serialize_peers_response(),
+            "telemetry": self._serialize_telemetry_responses(),
+        }
+
+    def _serialize_status_response(self) -> Optional[bytes]:
+        """Build the STATUS_REQUEST response payload (mirrors the handler)."""
+        try:
+            status_data = {
+                "host": self.public_host,
+                "info": self.info().to_json(),
+                "descriptor": self.descriptor(),
+                "running": self.running,
+                "total_peers": len(self.peers),
+                "uptime": utc_timestamp_float() if self.running else 0,
+            }
+            return json.dumps(status_data).encode("utf-8")
+        except Exception:
+            self.logger.debug("status snapshot build failed", exc_info=True)
+            return None
+
+    def _serialize_stats_response(self) -> Optional[bytes]:
+        """Build the STATS_REQUEST response payload from the stats cache."""
+        if self._stats_cache is None:
+            return None
+        try:
+            return json.dumps(self._stats_cache).encode("utf-8")
+        except Exception:
+            self.logger.debug("stats snapshot build failed", exc_info=True)
+            return None
+
+    def _serialize_peers_response(self) -> Optional[bytes]:
+        """Build the PEERS_REQUEST response payload."""
+        try:
+            healthy = self._healthy_peers_snapshot()
+            peers_data = {
+                host: info.to_json() for host, info in healthy.items()
+            }
+            return json.dumps({"peers": peers_data}).encode("utf-8")
+        except Exception:
+            self.logger.debug("peers snapshot build failed", exc_info=True)
+            return None
+
+    def _serialize_telemetry_responses(self) -> dict:
+        """Build the bundle of TELEMETRY_* response payloads."""
+        out: Dict[str, Any] = {
+            "status": None, "nodes": None, "epochs": None,
+            "latest": None, "blocks": {},
+        }
+        if self.telemetry_cache is None:
+            return out
+        try:
+            out["status"] = json.dumps(
+                self.telemetry_cache.get_status()
+            ).encode("utf-8")
+        except Exception:
+            self.logger.debug("telemetry status snapshot failed", exc_info=True)
+        try:
+            nodes = self.telemetry_cache.get_nodes()
+            if nodes is not None:
+                out["nodes"] = json.dumps(nodes).encode("utf-8")
+        except Exception:
+            self.logger.debug("telemetry nodes snapshot failed", exc_info=True)
+        try:
+            out["epochs"] = json.dumps(
+                {"epochs": self.telemetry_cache.get_epochs()}
+            ).encode("utf-8")
+        except Exception:
+            self.logger.debug("telemetry epochs snapshot failed", exc_info=True)
+        try:
+            latest = self.telemetry_cache.get_latest()
+            if latest is not None:
+                out["latest"] = json.dumps(latest).encode("utf-8")
+        except Exception:
+            self.logger.debug("telemetry latest snapshot failed", exc_info=True)
+        return out
+
+    def _get_handler_executor(self) -> ProcessPoolExecutor:
+        """Return the shared handler executor, creating it on first use.
+
+        Sized to ``max(2, os.cpu_count() // 2)`` so mining and other
+        coordinator work still have CPU to share. The executor is
+        shut down during ``stop()``; until then it persists across
+        individual handler calls to amortize fork cost.
+
+        Uses ``getattr`` so NetworkNode instances constructed via
+        ``object.__new__`` (unit-test stubs) get lazy-init on first
+        use rather than ``AttributeError``.
+        """
+        existing = getattr(self, "_handler_executor", None)
+        if existing is None:
+            workers = max(2, (os.cpu_count() or 4) // 2)
+            executor = ProcessPoolExecutor(max_workers=workers)
+            self._handler_executor = executor
+            self.logger.info(
+                f"Handler executor started with {workers} workers"
+            )
+            return executor
+        return existing
+
+    def _backoff_list_snapshot(self) -> list:
+        """Return currently banned peer hosts."""
+        ban_list = getattr(self, "_ban_list", None)
+        if ban_list is None:
+            return []
+        try:
+            return list(ban_list.banned_peers().keys())
+        except Exception:
+            self.logger.debug(
+                "banned_peers() failed", exc_info=True,
+            )
+            return []
 
     async def node_cleanup_loop(self):
         """Remove dead nodes from registry and prune stale state."""
@@ -936,28 +1374,27 @@ class NetworkNode(Node):
                 now_mono = time.monotonic()
                 dead_nodes = []
 
-                async with self.net_lock:
-                    for host in list(self.peers.keys()):
-                        hb_time = self.heartbeats.get(host)
-                        if hb_time is not None:
-                            if current_time - hb_time > self.heartbeat_timeout:
-                                dead_nodes.append(host)
-                        else:
-                            # Never got a heartbeat — use fast timeout.
-                            joined_at = self._swim_detector.get_joined_at(host)
-                            if joined_at is None:
-                                # Peer isn't tracked by SWIM (race with
-                                # remove_peer, or never registered). Assume
-                                # it's past the fast-timeout window and log
-                                # so an add_peer/register mismatch is
-                                # discoverable.
-                                self.logger.debug(
-                                    f"Unproven peer {host} missing from "
-                                    "SWIM detector; evicting via fast timeout"
-                                )
-                                dead_nodes.append(host)
-                            elif now_mono - joined_at > self.node_timeout:
-                                dead_nodes.append(host)
+                for host in list(self.peers.keys()):
+                    hb_time = self.heartbeats.get(host)
+                    if hb_time is not None:
+                        if current_time - hb_time > self.heartbeat_timeout:
+                            dead_nodes.append(host)
+                    else:
+                        # Never got a heartbeat — use fast timeout.
+                        joined_at = self._swim_detector.get_joined_at(host)
+                        if joined_at is None:
+                            # Peer isn't tracked by SWIM (race with
+                            # remove_peer, or never registered). Assume
+                            # it's past the fast-timeout window and log
+                            # so an add_peer/register mismatch is
+                            # discoverable.
+                            self.logger.debug(
+                                f"Unproven peer {host} missing from "
+                                "SWIM detector; evicting via fast timeout"
+                            )
+                            dead_nodes.append(host)
+                        elif now_mono - joined_at > self.node_timeout:
+                            dead_nodes.append(host)
 
                 # Prune stale gossip dedup entries and rate limiter buckets
                 async with self.gossip_lock:
@@ -1021,8 +1458,7 @@ class NetworkNode(Node):
                 load_snapshot = self._load_monitor.snapshot()
                 load_dict = load_snapshot.to_dict()
                 load_dict["sender"] = self.public_host
-                async with self.net_lock:
-                    peer_list = list(self.peers.keys())
+                peer_list = list(self.peers.keys())
                 for peer in peer_list:
                     try:
                         await self.node_client.send_load_info(
@@ -1091,8 +1527,7 @@ class NetworkNode(Node):
             return
 
         # Find least-loaded peers to suggest as alternatives
-        async with self.net_lock:
-            snapshot = list(self.peers.keys())
+        snapshot = list(self.peers.keys())
         alternatives = self._get_least_loaded_peers(
             exclude=set(targets), count=5, peer_list=snapshot
         )
@@ -1122,8 +1557,8 @@ class NetworkNode(Node):
         random selection from the peer list.
 
         Args:
-            peer_list: Pre-copied peer list (caller should copy under
-                net_lock). Falls back to self.peers if not provided.
+            peer_list: Pre-copied peer list. Falls back to self.peers
+                if not provided.
         """
         # Sort peers by load (connection utilization)
         candidates = []
@@ -1148,9 +1583,8 @@ class NetworkNode(Node):
     def _healthy_peers_snapshot(self) -> Dict[str, MinerInfo]:
         """Return active peers with a recent successful heartbeat.
 
-        Must be called while holding net_lock.  Uses
-        ``heartbeat_timeout / 2`` as the recency cutoff so we only
-        share peers that are demonstrably alive.
+        Uses ``heartbeat_timeout / 2`` as the recency cutoff so we
+        only share peers that are demonstrably alive.
         """
         now = utc_timestamp_float()
         cutoff = self.heartbeat_timeout / 2
@@ -2215,43 +2649,45 @@ class NetworkNode(Node):
         if self._is_backed_off(host):
             return False
 
-        async with self.net_lock:
-            # Already in the active set — update in place.
-            if host in self.peers:
-                self.add_or_update_peer(host, info)
-                if self.node_client:
-                    self.node_client.add_peer(host, info)
-                self.telemetry.update_node(
-                    host, "active", info, descriptor=descriptor,
-                )
-                return False  # not new
+        # Already in the active set — update in place.
+        if host in self.peers:
+            self.add_or_update_peer(host, info)
+            if self.node_client:
+                self.node_client.add_peer(host, info)
+            self.telemetry.update_node(
+                host, "active", info, descriptor=descriptor,
+            )
+            return False  # not new
 
-            # Active set has room, or the peer has a live connection.
-            if connected or len(self.peers) < self._max_active_peers:
-                # Remove from candidates if it was queued there.
-                self._candidate_peers.pop(host, None)
+        # Active set has room, or the peer has a live connection.
+        if connected or len(self.peers) < self._max_active_peers:
+            # Remove from candidates if it was queued there.
+            self._candidate_peers.pop(host, None)
 
-                self.add_or_update_peer(host, info)
-                if self.node_client:
-                    self.node_client.add_peer(host, info)
-                self.telemetry.update_node(
-                    host, "active", info, descriptor=descriptor,
-                )
-                self._has_ever_had_peers = True
-                self.logger.info(
-                    f"New peer discovered: {host}: "
-                    f"{info.miner_id} "
-                    f"({info.ecdsa_public_key.hex()[:8]})"
-                )
-                self._on_new_node(host, info)
-                if hasattr(self, '_swim_detector'):
-                    self._swim_detector.add_peer(host)
-                asyncio.create_task(self.gossip_new_node(host, info))
-                return True
+            self.add_or_update_peer(host, info)
+            if self.node_client:
+                self.node_client.add_peer(host, info)
+            self.telemetry.update_node(
+                host, "active", info, descriptor=descriptor,
+            )
+            self._has_ever_had_peers = True
+            self.logger.info(
+                f"New peer discovered: {host}: "
+                f"{info.miner_id} "
+                f"({info.ecdsa_public_key.hex()[:8]})"
+            )
+            self._on_new_node(host, info)
+            if hasattr(self, '_swim_detector'):
+                self._swim_detector.add_peer(host)
+            pool = getattr(self, '_process_pool', None)
+            if pool is not None:
+                pool.spawn(host)
+            asyncio.create_task(self.gossip_new_node(host, info))
+            return True
 
-            # Active set full — route to candidate pool.
-            self._add_candidate(host, info, descriptor=descriptor)
-            return False
+        # Active set full — route to candidate pool.
+        self._add_candidate(host, info, descriptor=descriptor)
+        return False
 
     def _add_candidate(
         self,
@@ -2260,7 +2696,7 @@ class NetworkNode(Node):
         descriptor: Optional[Dict[str, Any]] = None,
         source: str = "gossip",
     ) -> None:
-        """Add a peer to the candidate pool (must hold net_lock)."""
+        """Add a peer to the candidate pool."""
         if host in self._candidate_peers:
             # Update info but keep discovery timestamp.
             self._candidate_peers[host].info = info
@@ -2290,11 +2726,10 @@ class NetworkNode(Node):
     async def _promote_candidate(self, host: str) -> bool:
         """Promote a candidate to the active peer set.
 
-        Must be called while NOT holding net_lock (acquires it
-        internally via add_peer).  Returns True on success. On
-        failure (active set filled between probe and promotion,
-        ban list hit, address parse error) the candidate is
-        re-inserted so the next probe cycle can retry.
+        Returns True on success. On failure (active set filled
+        between probe and promotion, ban list hit, address parse
+        error) the candidate is re-inserted so the next probe cycle
+        can retry.
         """
         candidate = self._candidate_peers.pop(host, None)
         if candidate is None:
@@ -2307,9 +2742,8 @@ class NetworkNode(Node):
         if not promoted and host not in self.peers:
             # add_peer rejected the promotion; keep the candidate
             # around rather than losing it silently.
-            async with self.net_lock:
-                if host not in self._candidate_peers:
-                    self._candidate_peers[host] = candidate
+            if host not in self._candidate_peers:
+                self._candidate_peers[host] = candidate
             self.logger.debug(
                 f"Promotion of {host} rejected; returning to candidate pool"
             )
@@ -2321,22 +2755,21 @@ class NetworkNode(Node):
         Called from rebalance_loop (every 60s).  Probes at most 5
         candidates per cycle to avoid blocking.
         """
-        async with self.net_lock:
-            slots = self._max_active_peers - len(self.peers)
-            if slots <= 0:
-                return
-            # Pick oldest candidates that haven't been probed recently.
-            now = time.monotonic()
-            probe_list = []
-            for host, cand in sorted(
-                self._candidate_peers.items(),
-                key=lambda kv: kv[1].discovered_at,
-            ):
-                if now - cand.last_probe_at < 30:
-                    continue  # probed recently, skip
-                probe_list.append(host)
-                if len(probe_list) >= min(slots, 5):
-                    break
+        slots = self._max_active_peers - len(self.peers)
+        if slots <= 0:
+            return
+        # Pick oldest candidates that haven't been probed recently.
+        now = time.monotonic()
+        probe_list = []
+        for host, cand in sorted(
+            self._candidate_peers.items(),
+            key=lambda kv: kv[1].discovered_at,
+        ):
+            if now - cand.last_probe_at < 30:
+                continue  # probed recently, skip
+            probe_list.append(host)
+            if len(probe_list) >= min(slots, 5):
+                break
 
         if self.node_client is None:
             # Probing a candidate requires the QUIC client; without it
@@ -2391,56 +2824,105 @@ class NetworkNode(Node):
 
     async def remove_node(self, host: str):
         """Remove a node from our registry."""
-        async with self.net_lock:
-            if self.remove_peer(host):
-                self.logger.info(f"Node removed: {host}")
-                self.telemetry.remove_node(host)
-                self._on_node_lost(host)
+        if self.remove_peer(host):
+            self.logger.info(f"Node removed: {host}")
+            self.telemetry.remove_node(host)
+            self._on_node_lost(host)
 
-                # Clear synchronized state when all peers are lost
-                if not self.peers and self._has_ever_had_peers:
-                    self._synchronized.clear()
-                    self.logger.warning(
-                        "All peers lost — cleared synchronized state, "
-                        "mining paused until re-sync"
-                    )
+            # Clear synchronized state when all peers are lost
+            if not self.peers and self._has_ever_had_peers:
+                self._synchronized.clear()
+                self.logger.warning(
+                    "All peers lost — cleared synchronized state, "
+                    "mining paused until re-sync"
+                )
 
-                # Update node client to remove peer
-                if self.node_client:
-                    await self.node_client.remove_peer(host)
-                if hasattr(self, '_swim_detector'):
-                    self._swim_detector.remove_peer(host)
-                if hasattr(self, '_peer_loads'):
-                    self._peer_loads.pop(host, None)
-                if hasattr(self, '_peer_scorer'):
-                    self._peer_scorer.remove_peer(host)
-                if hasattr(self, '_block_inventory'):
-                    self._block_inventory.remove_peer(host)
-
-    async def send_heartbeat(self, node_host: str) -> bool:
-        """Send heartbeat to a specific node.
-
-        Heartbeats are sent regardless of sync state so that desynced
-        nodes can maintain peer connections for re-synchronization.
-        """
-        if not self.node_client:
-            return False
-        return await self.node_client.send_heartbeat(node_host, self.public_host, self.info())
+            # Update node client to remove peer
+            if self.node_client:
+                await self.node_client.remove_peer(host)
+            pool = getattr(self, '_process_pool', None)
+            if pool is not None:
+                pool.kill(host)
+            if hasattr(self, '_swim_detector'):
+                self._swim_detector.remove_peer(host)
+            if hasattr(self, '_peer_loads'):
+                self._peer_loads.pop(host, None)
+            if hasattr(self, '_peer_scorer'):
+                self._peer_scorer.remove_peer(host)
+            if hasattr(self, '_block_inventory'):
+                self._block_inventory.remove_peer(host)
 
     async def get_peer_status(self, host: str) -> Optional[dict]:
-        """Get status information from a peer node."""
+        """Get status information from a peer node.
+
+        Routes through the per-peer child when one exists; otherwise
+        falls back to ``node_client`` (candidates pre-promotion, etc.).
+        """
+        pool = self._process_pool
+        if pool is not None and pool.has_peer(host):
+            event = await self._pool_rpc(
+                lambda rid: pool.request_status(host, rid),
+                timeout=self.node_timeout,
+            )
+            if event is not None and event.get("event") == "status_data":
+                return event.get("data")
+            return None
         if not self.node_client:
             return None
         return await self.node_client.get_peer_status(host)
 
-    async def get_peer_block(self, host: str, block_number: int = 0) -> Optional[Block]:
-        """Get a block from a peer node and log precise download timings."""
+    async def get_peer_block(
+        self, host: str, block_number: int = 0,
+    ) -> Optional[Block]:
+        """Get a block from a peer node."""
+        pool = self._process_pool
+        if pool is not None and pool.has_peer(host):
+            event = await self._pool_rpc(
+                lambda rid: pool.request_block(host, block_number, rid),
+                timeout=self.node_timeout,
+            )
+            if event is not None and event.get("event") == "block_data":
+                try:
+                    return Block.from_network(
+                        base64.b64decode(event.get("data", ""))
+                    )
+                except Exception:
+                    self.logger.exception(
+                        f"Failed to decode block from {host}"
+                    )
+                    return None
+            return None
         if not self.node_client:
             return None
         return await self.node_client.get_peer_block(host, block_number)
 
-    async def get_peer_block_header(self, host: str, block_number: int = 0) -> Optional[BlockHeader]:
-        """Get only the block header from a peer node (lighter and faster)."""
+    async def get_peer_block_header(
+        self, host: str, block_number: int = 0,
+    ) -> Optional[BlockHeader]:
+        """Get only the block header from a peer node (lighter than full block).
+
+        Routes through the per-peer child when one exists; otherwise
+        falls back to ``node_client``.
+        """
+        pool = self._process_pool
+        if pool is not None and pool.has_peer(host):
+            event = await self._pool_rpc(
+                lambda rid: pool.request_block_header(
+                    host, block_number, rid,
+                ),
+                timeout=self.node_timeout,
+            )
+            if event is not None and event.get("event") == "block_header_data":
+                try:
+                    return BlockHeader.from_network(
+                        base64.b64decode(event.get("data", ""))
+                    )
+                except Exception:
+                    self.logger.exception(
+                        f"Failed to decode header from {host}"
+                    )
+                    return None
+            return None
         if not self.node_client:
             return None
         return await self.node_client.get_peer_block_header(host, block_number)
@@ -2451,8 +2933,7 @@ class NetworkNode(Node):
         if peer_status and 'info' in peer_status:
             try:
                 info = MinerInfo.from_json(peer_status['info'])
-                async with self.net_lock:
-                    self.peers[host] = info
+                self.peers[host] = info
                 descriptor = override_public_address(
                     peer_status.get('descriptor'), host,
                 )
@@ -2469,8 +2950,7 @@ class NetworkNode(Node):
 
     async def refresh_all_peer_info(self):
         """Refresh information for all known peers by calling their status endpoints."""
-        async with self.net_lock:
-            peer_hosts = list(self.peers.keys())
+        peer_hosts = list(self.peers.keys())
 
         for host in peer_hosts:
             await self.refresh_peer_info(host)
@@ -2480,7 +2960,15 @@ class NetworkNode(Node):
     #####################
 
     async def gossip_to(self, host: str, message: Message) -> bool:
-        """Send a message to a specific node and log precise timings."""
+        """Send a message to a specific node.
+
+        Routes through the per-peer child when one exists (fire-and-
+        forget; the matching ``gossip_result`` event is collected by
+        the pool drain). Otherwise falls back to ``node_client``.
+        """
+        pool = self._process_pool
+        if pool is not None and pool.has_peer(host):
+            return pool.send_gossip(host, message.to_network())
         if not self.node_client:
             return False
         return await self.node_client.gossip_to(host, message)
@@ -2579,8 +3067,7 @@ class NetworkNode(Node):
         self._block_inventory.record_have(block_hash)
 
         # Send IHAVE to peers via scored selection
-        async with self.net_lock:
-            peer_list = list(self.peers.keys())
+        peer_list = list(self.peers.keys())
 
         effective_fanout = self._adaptive_fanout(len(peer_list))
         targets = self._peer_scorer.select_gossip_targets(
@@ -2871,9 +3358,8 @@ class NetworkNode(Node):
                     f"MIGRATE alternative {alt_host} skipped: backed off"
                 )
                 continue
-            async with self.net_lock:
-                if alt_host in self.peers:
-                    continue
+            if alt_host in self.peers:
+                continue
             try:
                 success = await self.connect_to_peer(alt_host)
                 if success:
@@ -3334,9 +3820,8 @@ class NetworkNode(Node):
         # Check connection capacity before processing
         if not self._load_monitor.should_accept_join():
             # Suggest least-loaded alternative peers when at capacity
-            async with self.net_lock:
-                healthy = self._healthy_peers_snapshot()
-                peer_keys = list(healthy.keys())
+            healthy = self._healthy_peers_snapshot()
+            peer_keys = list(healthy.keys())
             alt_peers = self._get_least_loaded_peers(
                 exclude=set(), count=10, peer_list=peer_keys
             )
@@ -3414,8 +3899,7 @@ class NetworkNode(Node):
 
         # Return only peers with a recent successful heartbeat so we
         # don't propagate stale/unreachable addresses to new joiners.
-        async with self.net_lock:
-            peers_snapshot = self._healthy_peers_snapshot()
+        peers_snapshot = self._healthy_peers_snapshot()
 
         peers_payload: Dict[str, str] = {}
         for host, info in peers_snapshot.items():
@@ -3472,24 +3956,26 @@ class NetworkNode(Node):
             self.peer_versions[sender] = net_version
 
         if sender:
-            async with self.net_lock:
-                if sender in self.peers:
-                    self.heartbeats[sender] = utc_timestamp_float()
-                    self._track_peer_timestamp(timestamp)
-                    self.telemetry.update_node(sender, "active", last_heartbeat=timestamp)
-                else:
-                    self.logger.info(f"New node discovered via heartbeat: {sender}")
-                    asyncio.create_task(self.refresh_peer_info(sender))
+            if sender in self.peers:
+                self.heartbeats[sender] = utc_timestamp_float()
+                self._track_peer_timestamp(timestamp)
+                self.telemetry.update_node(
+                    sender, "active", last_heartbeat=timestamp,
+                )
+            else:
+                self.logger.info(
+                    f"New node discovered via heartbeat: {sender}"
+                )
+                asyncio.create_task(self.refresh_peer_info(sender))
 
         return msg.create_response(json.dumps({"status": "ok"}).encode('utf-8'))
 
     async def _quic_handle_peers(self, msg: QuicMessage) -> QuicMessage:
         """Return list of known healthy nodes."""
-        async with self.net_lock:
-            healthy = self._healthy_peers_snapshot()
-            peers_data = {
-                host: info.to_json() for host, info in healthy.items()
-            }
+        healthy = self._healthy_peers_snapshot()
+        peers_data = {
+            host: info.to_json() for host, info in healthy.items()
+        }
         return msg.create_response(
             json.dumps({"peers": peers_data}).encode('utf-8')
         )
@@ -3558,7 +4044,13 @@ class NetworkNode(Node):
             return msg.create_response(json.dumps(self._stats_cache).encode('utf-8'))
 
     async def _quic_handle_block_request(self, msg: QuicMessage) -> QuicMessage:
-        """Return a specific block by number (binary format)."""
+        """Return a specific block by number (binary format).
+
+        Block serialization (``block.to_network()``) packs headers,
+        quantum proofs, and transactions and can take several ms for
+        blocks with many samples. Offloaded to the handler executor
+        so a syncing peer's pull doesn't stall the coordinator loop.
+        """
         # Payload is 4-byte big-endian block number
         if len(msg.payload) >= 4:
             block_number = struct.unpack('!I', msg.payload[:4])[0]
@@ -3573,8 +4065,11 @@ class NetworkNode(Node):
         if block is None:
             return msg.create_error_response(f"Block {block_number} not found")
 
-        # Return block in network binary format
-        return msg.create_response(block.to_network())
+        loop = asyncio.get_running_loop()
+        block_bytes = await loop.run_in_executor(
+            self._get_handler_executor(), block.to_network,
+        )
+        return msg.create_response(block_bytes)
 
     async def _quic_handle_block_header_request(self, msg: QuicMessage) -> QuicMessage:
         """Return a specific block header by number (binary format)."""
@@ -3608,6 +4103,11 @@ class NetworkNode(Node):
         canonical chain (divergent genesis, or the client is a
         reorg'd-away fork we don't share). The client treats that as
         "no useful data here" and demotes the peer for the session.
+
+        Chain walk runs on the coordinator loop (O(MAX_MANIFEST_ENTRIES),
+        each step is an in-memory dict access) but the final
+        response encoding is offloaded so a long entry list doesn't
+        stall the loop while we pack bytes.
         """
         try:
             locator, limit = decode_manifest_request(msg.payload)
@@ -3635,7 +4135,12 @@ class NetworkNode(Node):
                     break
                 entries.append((i, blk.hash))
 
-        return msg.create_response(encode_manifest_response(entries))
+        loop = asyncio.get_running_loop()
+        encoded = await loop.run_in_executor(
+            self._get_handler_executor(),
+            encode_manifest_response, entries,
+        )
+        return msg.create_response(encoded)
 
     async def _quic_handle_block_by_hash_request(self, msg: QuicMessage) -> QuicMessage:
         """Return a canonical-chain block by hash, or empty for NOT_FOUND."""
@@ -3709,19 +4214,33 @@ class NetworkNode(Node):
             return msg.create_error_response(f"Unknown miner type: {miner_kind}")
 
         try:
-            # Sample the Ising problem
-            sampleset = sampler.sample_ising(h_dict, J_dict, num_reads=num_samples)
+            if qpu_sampler is not None:
+                # QPU samplers carry authenticated session state that
+                # doesn't cross process boundaries cleanly, so keep
+                # the call in the coordinator loop. It's
+                # network-bound (not CPU-bound) anyway.
+                sampleset = sampler.sample_ising(
+                    h_dict, J_dict, num_reads=num_samples,
+                )
+                samples: list = []
+                energies: list = []
+                for sample, energy in sampleset.data(['sample', 'energy']):
+                    samples.append(
+                        [int(sample[i]) for i in sorted(sample.keys())]
+                    )
+                    energies.append(float(energy))
+            else:
+                # SA sampling is pure CPU; run it in the handler
+                # executor to avoid stalling the coordinator loop.
+                loop = asyncio.get_running_loop()
+                samples, energies = await loop.run_in_executor(
+                    self._get_handler_executor(),
+                    _run_sa_sample_ising,
+                    h_dict, J_dict, num_samples,
+                )
         finally:
             if qpu_sampler is not None:
                 qpu_sampler.close()
-
-        # Extract samples and energies
-        samples = []
-        energies = []
-        for sample, energy in sampleset.data(['sample', 'energy']):
-            sample_list = [int(sample[i]) for i in sorted(sample.keys())]
-            samples.append(sample_list)
-            energies.append(float(energy))
 
         self.logger.info(
             f"Solve completed: {len(samples)} samples with energies "

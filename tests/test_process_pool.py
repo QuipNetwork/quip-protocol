@@ -19,10 +19,29 @@ _CONN_TIMEOUT = 5.0
 
 @pytest.fixture
 def pool():
-    """Create a process pool with small limits for testing."""
+    """Create a process pool with small limits for testing.
+
+    ``spawn_cooldown=0`` disables the respawn throttle so unrelated
+    tests (e.g. ``test_after_kill_can_respawn``) stay deterministic.
+    Throttle behavior has its own fixture below.
+    """
     cfg = ProcessPoolConfig(
         max_connections=3, node_timeout=3.0,
         connect_timeout=_FAST_CONNECT_TIMEOUT,
+        spawn_cooldown=0.0,
+    )
+    p = ProcessPool(config=cfg)
+    yield p
+    p.shutdown_all(timeout=5.0)
+
+
+@pytest.fixture
+def throttled_pool():
+    """Process pool with a real spawn cooldown for throttle tests."""
+    cfg = ProcessPoolConfig(
+        max_connections=3, node_timeout=3.0,
+        connect_timeout=_FAST_CONNECT_TIMEOUT,
+        spawn_cooldown=5.0,
     )
     p = ProcessPool(config=cfg)
     yield p
@@ -196,3 +215,64 @@ class TestProcessPool:
         pool.spawn(_UNREACHABLE)
         pool.kill(_UNREACHABLE)
         assert pool.spawn(_UNREACHABLE) is True
+
+
+class TestSpawnThrottle:
+    """Spawn cooldown guards against tight respawn loops."""
+
+    def test_throttle_blocks_immediate_respawn(self, throttled_pool):
+        """spawn() within cooldown after kill() returns False."""
+        assert throttled_pool.spawn(_UNREACHABLE) is True
+        assert throttled_pool.kill(_UNREACHABLE) is True
+        # Immediate respawn should be refused.
+        assert throttled_pool.spawn(_UNREACHABLE) is False
+
+    def test_throttle_allows_spawn_for_different_peer(self, throttled_pool):
+        """Throttle is per-peer; other peers can still spawn."""
+        throttled_pool.spawn(_UNREACHABLE)
+        throttled_pool.kill(_UNREACHABLE)
+        # Different address bypasses the cooldown.
+        assert throttled_pool.spawn("127.0.0.1:2") is True
+
+
+class TestRequestIdCorrelation:
+    """Request-ID threading on RPC-style child commands."""
+
+    def test_request_block_sends_request_id(self, pool):
+        """request_block hands the given id to the child's cmd."""
+        pool.spawn(_UNREACHABLE)
+        # Hand off the command; child won't reply (peer unreachable),
+        # but the send_cmd round-trip succeeds.
+        assert pool.request_block(_UNREACHABLE, 42, request_id=1001) is True
+
+    def test_request_block_header_sends_request_id(self, pool):
+        """request_block_header mirrors request_block with its own id."""
+        pool.spawn(_UNREACHABLE)
+        assert (
+            pool.request_block_header(_UNREACHABLE, 42, request_id=1101)
+            is True
+        )
+
+    def test_request_status_sends_request_id(self, pool):
+        pool.spawn(_UNREACHABLE)
+        assert pool.request_status(_UNREACHABLE, request_id=1002) is True
+
+    def test_request_peers_sends_request_id(self, pool):
+        pool.spawn(_UNREACHABLE)
+        assert pool.request_peers(_UNREACHABLE, request_id=1003) is True
+
+    def test_send_probe_request_sends_request_id(self, pool):
+        pool.spawn(_UNREACHABLE)
+        ok = pool.send_probe_request(
+            _UNREACHABLE, "127.0.0.1:65535", "probe-xyz",
+            request_id=1004,
+        )
+        assert ok is True
+
+    def test_rpc_methods_fail_without_peer(self, pool):
+        """Unknown peer returns False for all RPC methods."""
+        assert pool.request_block("9.9.9.9:1", 0, 1) is False
+        assert pool.request_block_header("9.9.9.9:1", 0, 1) is False
+        assert pool.request_status("9.9.9.9:1", 1) is False
+        assert pool.request_peers("9.9.9.9:1", 1) is False
+        assert pool.send_probe_request("9.9.9.9:1", "x:1", "p", 1) is False
