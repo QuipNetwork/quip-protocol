@@ -35,6 +35,10 @@ class ProcessPoolConfig:
     # a small value (e.g. 1.0) to avoid burning time on QUIC's PTO-
     # backoff close retries.
     connect_timeout: Optional[float] = None
+    # Refuse to respawn a peer's process within this many seconds of
+    # its last kill. Guards against tight spawn/die loops when a peer
+    # is unreachable or crashes its child repeatedly.
+    spawn_cooldown: float = 30.0
 
 
 class ProcessPool:
@@ -57,6 +61,9 @@ class ProcessPool:
         self.config = config or ProcessPoolConfig()
         self.logger = logger or logging.getLogger(__name__)
         self._handles: Dict[str, ConnectionProcessHandle] = {}
+        # Timestamp of the most recent kill per peer, used to enforce
+        # ``config.spawn_cooldown`` against tight respawn loops.
+        self._last_kill_time: Dict[str, float] = {}
 
     @property
     def connection_count(self) -> int:
@@ -81,8 +88,8 @@ class ProcessPool:
         """Spawn a new connection process for a peer.
 
         Returns:
-            True if spawned successfully, False if at capacity or
-            already connected.
+            True if spawned successfully, False if at capacity,
+            already connected, or the peer is still in spawn cooldown.
         """
         if peer_address in self._handles:
             self.logger.debug(f"Already connected to {peer_address}")
@@ -94,6 +101,16 @@ class ProcessPool:
                 f"cannot spawn connection to {peer_address}"
             )
             return False
+
+        last_kill = self._last_kill_time.get(peer_address)
+        if last_kill is not None:
+            elapsed = time.monotonic() - last_kill
+            if elapsed < self.config.spawn_cooldown:
+                self.logger.debug(
+                    f"Spawn for {peer_address} throttled "
+                    f"({elapsed:.1f}s < {self.config.spawn_cooldown}s)"
+                )
+                return False
 
         handle = spawn_connection_process(
             peer_address=peer_address,
@@ -113,6 +130,7 @@ class ProcessPool:
         """Stop and remove a connection process for a peer.
 
         Returns True if the peer had a connection that was removed.
+        Also records a spawn cooldown to suppress immediate respawn.
         """
         handle = self._handles.pop(peer_address, None)
         if handle is None:
@@ -120,6 +138,7 @@ class ProcessPool:
 
         handle.shutdown()
         handle.force_stop(timeout=timeout)
+        self._last_kill_time[peer_address] = time.monotonic()
         self.logger.info(f"Killed connection process for {peer_address}")
         return True
 
@@ -182,22 +201,62 @@ class ProcessPool:
                 sent += 1
         return sent
 
-    def request_block(self, peer_address: str, block_num: int) -> bool:
-        """Request a specific block from a peer."""
+    def request_block(
+        self, peer_address: str, block_num: int, request_id: int,
+    ) -> bool:
+        """Request a specific block from a peer.
+
+        The ``request_id`` lets the caller resolve the matching
+        ``block_data``/``error`` event emitted by the child.
+        """
         handle = self._handles.get(peer_address)
         if handle is None:
             return False
         return handle.send_cmd({
             "cmd": "request_block",
+            "request_id": request_id,
             "block_num": block_num,
         })
 
-    def request_status(self, peer_address: str) -> bool:
+    def request_status(self, peer_address: str, request_id: int) -> bool:
         """Request status from a peer."""
         handle = self._handles.get(peer_address)
         if handle is None:
             return False
-        return handle.send_cmd({"cmd": "request_status"})
+        return handle.send_cmd({
+            "cmd": "request_status", "request_id": request_id,
+        })
+
+    def request_peers(self, peer_address: str, request_id: int) -> bool:
+        """Request peer list from a peer."""
+        handle = self._handles.get(peer_address)
+        if handle is None:
+            return False
+        return handle.send_cmd({
+            "cmd": "request_peers", "request_id": request_id,
+        })
+
+    def send_probe_request(
+        self,
+        prober: str,
+        target: str,
+        probe_id: str,
+        request_id: int,
+    ) -> bool:
+        """Ask ``prober`` (an already-spawned peer) to probe ``target``.
+
+        SWIM indirect probe. Result comes back as a ``probe_result``
+        event tagged with ``request_id``.
+        """
+        handle = self._handles.get(prober)
+        if handle is None:
+            return False
+        return handle.send_cmd({
+            "cmd": "probe_request",
+            "request_id": request_id,
+            "target": target,
+            "probe_id": probe_id,
+        })
 
     def poll_events(self) -> List[Tuple[str, dict]]:
         """Collect all pending events from all child processes.

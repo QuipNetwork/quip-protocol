@@ -10,9 +10,10 @@ Parent -> Child::
 
     {"cmd": "heartbeat", "public_host": str, "version": str, "miner_info": dict}
     {"cmd": "gossip", "payload": <base64-encoded bytes>}
-    {"cmd": "request_block", "block_num": int}
-    {"cmd": "request_status"}
-    {"cmd": "request_peers"}
+    {"cmd": "request_block", "request_id": int, "block_num": int}
+    {"cmd": "request_status", "request_id": int}
+    {"cmd": "request_peers", "request_id": int}
+    {"cmd": "probe_request", "request_id": int, "target": str, "probe_id": str}
     {"cmd": "shutdown"}
 
 Child -> Parent::
@@ -20,11 +21,16 @@ Child -> Parent::
     {"event": "heartbeat_ok"}
     {"event": "heartbeat_fail", "reason": str}
     {"event": "gossip_result", "success": bool}
-    {"event": "block_data", "data": <base64-encoded bytes>}
-    {"event": "status_data", "data": dict}
-    {"event": "peers_data", "data": dict}
+    {"event": "block_data", "request_id": int, "data": <base64>, "block_num": int}
+    {"event": "status_data", "request_id": int, "data": dict}
+    {"event": "peers_data", "request_id": int, "data": dict}
+    {"event": "probe_result", "request_id": int, "result": Optional[bool]}
     {"event": "disconnected", "reason": str}
-    {"event": "error", "message": str}
+    {"event": "error", "request_id": Optional[int], "message": str}
+
+``request_id`` is opaque to the child; the parent uses it to resolve
+``asyncio.Future`` objects waiting on the response. Fire-and-forget
+commands (``heartbeat``, ``gossip``, ``shutdown``) omit it.
 """
 from __future__ import annotations
 
@@ -282,9 +288,17 @@ async def _connection_loop(
                     client, pipe, peer_address, cmd, log
                 )
             elif op == "request_status":
-                await _handle_request_status(client, pipe, peer_address, log)
+                await _handle_request_status(
+                    client, pipe, peer_address, cmd, log
+                )
             elif op == "request_peers":
-                await _handle_request_peers(client, pipe, peer_address, log)
+                await _handle_request_peers(
+                    client, pipe, peer_address, cmd, log
+                )
+            elif op == "probe_request":
+                await _handle_probe_request(
+                    client, pipe, peer_address, cmd, log
+                )
             else:
                 log.warning(f"Unknown command: {op}")
 
@@ -384,6 +398,7 @@ async def _handle_request_block(
     log: logging.Logger,
 ) -> None:
     """Download a specific block from the peer."""
+    request_id = cmd.get("request_id")
     block_num = cmd.get("block_num", 0)
     try:
         block = await client.get_peer_block(peer_address, block_num)
@@ -391,53 +406,69 @@ async def _handle_request_block(
             block_bytes = block.to_network()
             _send_safe(pipe, {
                 "event": "block_data",
+                "request_id": request_id,
                 "block_num": block_num,
                 "data": base64.b64encode(block_bytes).decode('ascii'),
             })
         else:
             _send_safe(pipe, {
                 "event": "error",
+                "request_id": request_id,
                 "message": f"Block {block_num} not available from {peer_address}",
             })
     except Exception as exc:
         log.debug(f"Block request error: {exc}")
-        _send_safe(pipe, {"event": "error", "message": str(exc)})
+        _send_safe(pipe, {
+            "event": "error", "request_id": request_id, "message": str(exc),
+        })
 
 
 async def _handle_request_status(
     client: 'NodeClient',
     pipe: mp.connection.Connection,
     peer_address: str,
+    cmd: dict,
     log: logging.Logger,
 ) -> None:
     """Get status from the peer."""
+    request_id = cmd.get("request_id")
     try:
         status = await client.get_peer_status(peer_address)
         if status is not None:
-            _send_safe(pipe, {"event": "status_data", "data": status})
+            _send_safe(pipe, {
+                "event": "status_data",
+                "request_id": request_id,
+                "data": status,
+            })
         else:
             _send_safe(pipe, {
                 "event": "error",
+                "request_id": request_id,
                 "message": f"No status from {peer_address}",
             })
     except Exception as exc:
         log.debug(f"Status request error: {exc}")
-        _send_safe(pipe, {"event": "error", "message": str(exc)})
+        _send_safe(pipe, {
+            "event": "error", "request_id": request_id, "message": str(exc),
+        })
 
 
 async def _handle_request_peers(
     client: 'NodeClient',
     pipe: mp.connection.Connection,
     peer_address: str,
+    cmd: dict,
     log: logging.Logger,
 ) -> None:
     """Get peer list from the peer."""
     from shared.node_client import QuicMessageType
+    request_id = cmd.get("request_id")
     try:
         protocol = await client._get_connection(peer_address)
         if protocol is None:
             _send_safe(pipe, {
                 "event": "error",
+                "request_id": request_id,
                 "message": f"No connection to {peer_address}",
             })
             return
@@ -447,15 +478,56 @@ async def _handle_request_peers(
         )
         if response and response.msg_type == QuicMessageType.PEERS_RESPONSE:
             data = json.loads(response.payload.decode('utf-8'))
-            _send_safe(pipe, {"event": "peers_data", "data": data})
+            _send_safe(pipe, {
+                "event": "peers_data",
+                "request_id": request_id,
+                "data": data,
+            })
         else:
             _send_safe(pipe, {
                 "event": "error",
+                "request_id": request_id,
                 "message": f"No peers response from {peer_address}",
             })
     except Exception as exc:
         log.debug(f"Peers request error: {exc}")
-        _send_safe(pipe, {"event": "error", "message": str(exc)})
+        _send_safe(pipe, {
+            "event": "error", "request_id": request_id, "message": str(exc),
+        })
+
+
+async def _handle_probe_request(
+    client: 'NodeClient',
+    pipe: mp.connection.Connection,
+    peer_address: str,
+    cmd: dict,
+    log: logging.Logger,
+) -> None:
+    """Ask this peer (the prober) to probe a target on our behalf.
+
+    ``peer_address`` is the prober; the target and probe_id come from
+    the command payload. Result mirrors ``NodeClient.send_probe_request``:
+    True=alive, False=unreachable, None=error/timeout.
+    """
+    request_id = cmd.get("request_id")
+    target = cmd.get("target", "")
+    probe_id = cmd.get("probe_id", "")
+    try:
+        result = await client.send_probe_request(
+            peer_address, target, probe_id,
+        )
+        _send_safe(pipe, {
+            "event": "probe_result",
+            "request_id": request_id,
+            "result": result,
+        })
+    except Exception as exc:
+        log.debug(f"Probe request error: {exc}")
+        _send_safe(pipe, {
+            "event": "probe_result",
+            "request_id": request_id,
+            "result": None,
+        })
 
 
 def _send_safe(pipe: mp.connection.Connection, msg: dict) -> bool:
