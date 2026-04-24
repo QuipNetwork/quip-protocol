@@ -4018,8 +4018,27 @@ class NetworkNode(Node):
 
         claimed_address = data.get("host") or "?"
 
+        # Fast-reject repeat JOINs inside the capacity cooldown. The
+        # first rejection below records the peer via
+        # record_capacity_rejection; subsequent JOINs within the
+        # cooldown window skip the expensive _healthy_peers_snapshot /
+        # alt-peer computation and return a minimal at_capacity
+        # response (same shape, empty alternatives) so clients that
+        # don't honor the backoff can't keep starving the event loop.
+        if claimed_address != "?" and self._is_backed_off(claimed_address):
+            return msg.create_response(json.dumps({
+                "status": "at_capacity",
+                "peers": {},
+                "peer_versions": {},
+            }).encode("utf-8"))
+
         # Check connection capacity before doing anything expensive
         if not self._load_monitor.should_accept_join():
+            # Record cooldown up front so this is the last rejection
+            # that pays the full snapshot/alt cost until it expires.
+            # No-op while already in cooldown (e.g. racing handlers).
+            if claimed_address != "?":
+                self._ban_list.record_capacity_rejection(claimed_address)
             # Suggest least-loaded alternative peers when at capacity
             healthy = self._healthy_peers_snapshot()
             peer_keys = list(healthy.keys())
@@ -4031,6 +4050,21 @@ class NetworkNode(Node):
                 f"(claimed={claimed_address}) — overloaded or at "
                 f"capacity; suggesting {len(alt_peers)} alternatives"
             )
+            # Record the rejected peer's descriptor so fleet-wide version
+            # visibility survives a capacity rejection. Only the cheap
+            # JSON descriptor is captured — MinerInfo parsing stays
+            # deferred per the contract at the top of this handler.
+            descriptor = data.get("descriptor")
+            if (
+                claimed_address != "?"
+                and isinstance(descriptor, dict)
+                and descriptor
+            ):
+                self.telemetry.update_node(
+                    claimed_address,
+                    "rejected_capacity",
+                    descriptor=descriptor,
+                )
             peers_snapshot = {
                 h: healthy[h].to_json()
                 for h in alt_peers if h in healthy

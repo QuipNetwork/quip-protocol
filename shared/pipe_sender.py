@@ -65,6 +65,7 @@ class AsyncPipeSender:
         self._dead = False
         self._closing = False
         self._dropped_full = 0
+        self._dropped_last_logged = 0
         self._drain_task: Optional[asyncio.Task] = None
 
     def start(self) -> None:
@@ -126,11 +127,16 @@ class AsyncPipeSender:
         except asyncio.QueueFull:
             self._dropped_full += 1
             # First drop + every 100 subsequent drops emit a WARN so
-            # backlog is visible without flooding logs.
+            # backlog is visible without flooding logs. Report the
+            # delta since the last log (not cumulative) so a spiking
+            # drop rate is distinguishable from a flat lifetime total.
             if self._dropped_full == 1 or self._dropped_full % 100 == 0:
+                delta = self._dropped_full - self._dropped_last_logged
+                self._dropped_last_logged = self._dropped_full
                 self._logger.warning(
-                    "AsyncPipeSender[%s] queue full; dropped %d messages",
-                    self._name or "?", self._dropped_full,
+                    "AsyncPipeSender[%s] queue full; dropped %d new "
+                    "(total %d)",
+                    self._name or "?", delta, self._dropped_full,
                 )
             return False
 

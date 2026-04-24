@@ -191,6 +191,98 @@ class TestNodeTelemetry:
         assert data["nodes"]["c:20049"]["status"] == "failed"
 
 
+class TestWriteDebounce:
+    """Regression tests for the retry-storm debounce on ``update_node``."""
+
+    def test_same_status_within_window_debounces(self, tmp_path, monkeypatch):
+        tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
+        writes = []
+        orig_write = tm._write_nodes_json
+
+        def spy():
+            writes.append(1)
+            orig_write()
+
+        monkeypatch.setattr(tm, "_write_nodes_json", spy)
+
+        # First call: always writes (new record).
+        tm.update_node("1.2.3.4:20049", "rejected_capacity",
+                       descriptor={"runtime": {"quip_version": "0.1.4"}})
+        assert len(writes) == 1
+
+        # Retry storm: several updates within the debounce window.
+        for _ in range(5):
+            tm.update_node("1.2.3.4:20049", "rejected_capacity",
+                           descriptor={"runtime": {"quip_version": "0.1.4"}})
+        assert len(writes) == 1, "debounced same-status updates must not rewrite"
+
+        # last_seen still advances in memory so a late consumer isn't misled.
+        assert tm._nodes["1.2.3.4:20049"].last_seen >= tm._nodes["1.2.3.4:20049"].first_seen
+
+    def test_debounce_expires_after_window(self, tmp_path, monkeypatch):
+        tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
+        writes = []
+        orig_write = tm._write_nodes_json
+
+        def spy():
+            writes.append(1)
+            orig_write()
+
+        monkeypatch.setattr(tm, "_write_nodes_json", spy)
+
+        base = time.time()
+        monkeypatch.setattr("shared.telemetry.time.time", lambda: base)
+        tm.update_node("peer:20049", "rejected_capacity",
+                       descriptor={"runtime": {"quip_version": "0.1.4"}})
+        assert len(writes) == 1
+
+        # Still inside the window — no new write.
+        monkeypatch.setattr("shared.telemetry.time.time", lambda: base + 10.0)
+        tm.update_node("peer:20049", "rejected_capacity",
+                       descriptor={"runtime": {"quip_version": "0.1.4"}})
+        assert len(writes) == 1
+
+        # Past the window — write fires again.
+        monkeypatch.setattr("shared.telemetry.time.time", lambda: base + 31.0)
+        tm.update_node("peer:20049", "rejected_capacity",
+                       descriptor={"runtime": {"quip_version": "0.1.4"}})
+        assert len(writes) == 2
+
+    def test_status_change_bypasses_debounce(self, tmp_path, monkeypatch):
+        """A transition rejected_capacity -> active must rewrite immediately."""
+        tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
+        writes = []
+        orig_write = tm._write_nodes_json
+
+        def spy():
+            writes.append(1)
+            orig_write()
+
+        monkeypatch.setattr(tm, "_write_nodes_json", spy)
+
+        tm.update_node("peer:20049", "rejected_capacity",
+                       descriptor={"runtime": {"quip_version": "0.1.4"}})
+        tm.update_node("peer:20049", "active", _make_miner_info())
+        assert len(writes) == 2
+
+    def test_active_status_never_debounced(self, tmp_path, monkeypatch):
+        """Heartbeat/liveness updates must not be throttled."""
+        tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
+        writes = []
+        orig_write = tm._write_nodes_json
+
+        def spy():
+            writes.append(1)
+            orig_write()
+
+        monkeypatch.setattr(tm, "_write_nodes_json", spy)
+
+        for _ in range(4):
+            tm.update_node("peer:20049", "active", _make_miner_info(),
+                           last_heartbeat=time.time())
+        assert len(writes) == 4
+
+
 # ---------------------------------------------------------------------------
 # Tests – block telemetry
 # ---------------------------------------------------------------------------

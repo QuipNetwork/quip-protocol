@@ -30,6 +30,14 @@ from shared.block import Block, MinerInfo
 EPOCH_KEY_LEN = 16  # hex chars taken from block 1's hash
 _HEX_CHARS = frozenset("0123456789abcdef")
 
+# Statuses whose updates are debounced to avoid write amplification under
+# retry storms: rejected-capacity JOINs and failed handshakes both repeat
+# at seconds-scale intervals while the record is functionally unchanged.
+# ``active`` is deliberately excluded — heartbeat updates are the primary
+# liveness signal for the dashboard.
+_WRITE_DEBOUNCE_STATUSES = frozenset({"rejected_capacity", "failed"})
+_WRITE_DEBOUNCE_SECONDS = 30.0
+
 
 def _is_epoch_hex(name: str) -> bool:
     """Return True if *name* is a valid hex-encoded epoch dir name."""
@@ -96,6 +104,11 @@ class TelemetryManager:
         self._enabled = enabled
         self._logger = logger or logging.getLogger(__name__)
         self._nodes: Dict[str, NodeRecord] = {}
+        # Per-address timestamp of the last ``_write_nodes_json`` call,
+        # used by the debounce guard in ``update_node``. Tracks writes
+        # (not ``last_seen``) so a steady stream of retries cannot keep
+        # sliding the window forward and silently suppress all writes.
+        self._last_node_write_at: Dict[str, float] = {}
         # Full block-1 hash; the epoch dir name is its first 16 hex chars.
         self._block_1_hash: Optional[bytes] = None
         self._periodic_task: Optional[asyncio.Task] = None
@@ -141,6 +154,9 @@ class TelemetryManager:
             rec = NodeRecord(address=address, first_seen=now)
             self._nodes[address] = rec
 
+        prev_status = rec.status
+        last_written_at = self._last_node_write_at.get(address)
+
         rec.status = status
         rec.last_seen = now
         if last_heartbeat is not None:
@@ -150,6 +166,15 @@ class TelemetryManager:
         if descriptor is not None:
             rec.descriptor = descriptor
 
+        if (
+            status in _WRITE_DEBOUNCE_STATUSES
+            and prev_status == status
+            and last_written_at is not None
+            and (now - last_written_at) < _WRITE_DEBOUNCE_SECONDS
+        ):
+            return
+
+        self._last_node_write_at[address] = now
         self._write_nodes_json()
 
     def remove_node(self, address: str) -> None:

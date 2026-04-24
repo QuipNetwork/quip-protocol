@@ -14,6 +14,12 @@ Message handling is split:
   update SWIM / scorer / telemetry asynchronously. No IPC round-trip
   on the hot path, and no ``net_lock`` contention.
 
+* **JOIN_REQUEST** is answered locally with ``at_capacity`` when the
+  claimed peer is in the banned set (from the coordinator's
+  ``record_capacity_rejection`` ledger). Any other JOIN is forwarded
+  to the coordinator. This shields the coord event loop from JOIN
+  retry storms by peers that don't honor the backoff hint.
+
 * **All other message types** are forwarded to the coordinator via
   IPC (``inbound_message`` event with a correlation ``msg_id``). The
   listener awaits ``inbound_response`` and sends it on QUIC.
@@ -463,6 +469,16 @@ def _build_listener_protocol(
                     response = _handle_heartbeat_local(
                         msg, self._peer_address, cache, pipe, log,
                     )
+                elif msg.msg_type == QuicMessageType.JOIN_REQUEST:
+                    local = _handle_join_local(msg, cache)
+                    if local is not None:
+                        response = local
+                    else:
+                        response = await _forward_to_coordinator(
+                            msg, self._peer_address, pipe,
+                            pending_forwards, alloc_msg_id,
+                            forward_timeout,
+                        )
                 else:
                     cached = _try_cached_read(msg, cache)
                     if cached is not None:
@@ -620,6 +636,37 @@ def _handle_heartbeat_local(
     return msg.create_response(
         json.dumps({"status": "ok"}).encode("utf-8")
     )
+
+
+def _handle_join_local(msg, cache: _PeerSnapshotCache):
+    """Answer JOIN locally when the claimed peer is in the banned set.
+
+    The coordinator's capacity-rejection path records the claimed
+    address in the ban list; the banned set is pushed to the
+    listener every 5s via ``peer_snapshot``. On JOIN retries inside
+    the cooldown window, answer from cache so the coordinator sees
+    zero IPC pressure from the storm. Returns ``None`` to fall
+    through to ``_forward_to_coordinator`` for the first rejection
+    (which does the full snapshot/alt computation).
+
+    Response shape matches the coordinator's fast-reject: same
+    ``status: at_capacity`` envelope with empty alternatives, so
+    clients honoring the protocol see no behavioral difference.
+    """
+    try:
+        data = json.loads(msg.payload.decode("utf-8"))
+    except Exception:
+        return None
+
+    claimed = data.get("host")
+    if not claimed or claimed not in cache.banned:
+        return None
+
+    return msg.create_response(json.dumps({
+        "status": "at_capacity",
+        "peers": {},
+        "peer_versions": {},
+    }).encode("utf-8"))
 
 
 async def _forward_to_coordinator(

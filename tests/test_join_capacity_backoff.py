@@ -10,6 +10,7 @@ Exercises the coordinator-side changes that break the JOIN retry storm:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
@@ -17,8 +18,10 @@ import pytest
 
 from shared.block import MinerInfo
 from shared.network_node import NetworkNode, Message
+from shared.node_client import QuicMessage, QuicMessageType
 from shared.peer_ban_list import PeerBanList, CAPACITY_COOLDOWN_MIN
 from shared.swim_detector import PeerState, SwimDetector
+from shared.telemetry import TelemetryManager
 
 
 def _make_info(miner_id: str = "m1") -> MinerInfo:
@@ -194,3 +197,94 @@ def test_listener_child_silences_aioquic():
         assert logging.getLogger("aioquic").level == logging.WARNING
     finally:
         quic_logger.setLevel(prev)
+
+
+# --- capacity-rejection records descriptor in telemetry ---
+
+@pytest.mark.asyncio
+async def test_capacity_rejection_records_descriptor_in_telemetry(tmp_path):
+    node = _make_node()
+    node.telemetry = TelemetryManager(str(tmp_path / "tel"), enabled=True)
+    node._peer_loads = {}
+    node.heartbeat_timeout = 60.0
+    node._load_monitor.should_accept_join.return_value = False
+
+    join_payload = {
+        "host": "rejected:20049",
+        "version": "0.1.4",
+        "capabilities": ["mining"],
+        "info": _make_info("rejected").to_json(),
+        "descriptor": {
+            "descriptor_version": 1,
+            "node_name": "rejected-node",
+            "public_host": "rejected",
+            "public_port": 20049,
+            "runtime": {
+                "python": "3.13.0",
+                "quip_version": "0.1.4",
+                "protocol_version": 2,
+            },
+            "miners": {"cpu": {"kind": "CPU", "miner_id": "rejected-CPU-1"}},
+        },
+    }
+    msg = QuicMessage(
+        msg_type=QuicMessageType.JOIN_REQUEST,
+        request_id=1,
+        payload=json.dumps(join_payload).encode("utf-8"),
+    )
+    protocol = MagicMock()
+    protocol._peer_address = "203.0.113.5:55555"
+
+    response = await NetworkNode._quic_handle_join(node, msg, protocol)
+
+    # Response shape unchanged — still signals at_capacity to the joiner.
+    assert response.msg_type == QuicMessageType.JOIN_RESPONSE
+    body = json.loads(response.payload.decode("utf-8"))
+    assert body["status"] == "at_capacity"
+
+    # Telemetry recorded the descriptor under claimed address.
+    rec = node.telemetry._nodes.get("rejected:20049")
+    assert rec is not None, "rejected peer missing from telemetry"
+    assert rec.status == "rejected_capacity"
+    assert rec.descriptor["runtime"]["quip_version"] == "0.1.4"
+    assert rec.descriptor["node_name"] == "rejected-node"
+
+    # Nodes.json on disk reflects the same (flattened) record.
+    on_disk = json.loads((tmp_path / "tel" / "nodes.json").read_text())
+    disk_rec = on_disk["nodes"]["rejected:20049"]
+    assert disk_rec["status"] == "rejected_capacity"
+    assert disk_rec["runtime"]["quip_version"] == "0.1.4"
+    # active_count excludes rejected_capacity — rejected peers are not active.
+    assert on_disk["active_count"] == 0
+
+    # Peer must NOT be added to the active set.
+    assert "rejected:20049" not in node.peers
+
+
+@pytest.mark.asyncio
+async def test_capacity_rejection_without_descriptor_skips_telemetry(tmp_path):
+    """Missing descriptor => no telemetry row (avoids empty-record pollution)."""
+    node = _make_node()
+    node.telemetry = TelemetryManager(str(tmp_path / "tel"), enabled=True)
+    node._peer_loads = {}
+    node.heartbeat_timeout = 60.0
+    node._load_monitor.should_accept_join.return_value = False
+
+    join_payload = {
+        "host": "noinfo:20049",
+        "version": "0.1.4",
+        "info": _make_info("noinfo").to_json(),
+        # descriptor intentionally omitted
+    }
+    msg = QuicMessage(
+        msg_type=QuicMessageType.JOIN_REQUEST,
+        request_id=1,
+        payload=json.dumps(join_payload).encode("utf-8"),
+    )
+    protocol = MagicMock()
+    protocol._peer_address = "203.0.113.6:55556"
+
+    response = await NetworkNode._quic_handle_join(node, msg, protocol)
+    assert response.msg_type == QuicMessageType.JOIN_RESPONSE
+
+    assert "noinfo:20049" not in node.telemetry._nodes
