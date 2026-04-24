@@ -176,6 +176,82 @@ class TestNodeTelemetry:
         # Should not overwrite active status
         assert tm._nodes["a.b.c:20049"].status == "active"
 
+    def test_first_seen_survives_restart(self, tmp_path):
+        """A fresh TelemetryManager on the same dir must preserve first_seen."""
+        tm1 = TelemetryManager(str(tmp_path / "tel"), enabled=True)
+        tm1.update_node(
+            "1.2.3.4:20049", "active", _make_miner_info(),
+            descriptor={"node_name": "n1", "runtime": {"quip_version": "0.1.18"}},
+        )
+        orig_first_seen = tm1._nodes["1.2.3.4:20049"].first_seen
+
+        # Mimic a restart: new manager, same directory.
+        time.sleep(0.01)
+        tm2 = TelemetryManager(str(tmp_path / "tel"), enabled=True)
+
+        rec = tm2._nodes.get("1.2.3.4:20049")
+        assert rec is not None, "node not reloaded from nodes.json"
+        assert rec.first_seen == orig_first_seen
+        assert rec.status == "active"
+        assert rec.descriptor["node_name"] == "n1"
+        assert rec.descriptor["runtime"]["quip_version"] == "0.1.18"
+
+    def test_first_seen_preserved_through_initial_peers(self, tmp_path):
+        """record_initial_peers after reload must not overwrite first_seen."""
+        tm1 = TelemetryManager(str(tmp_path / "tel"), enabled=True)
+        tm1.update_node("seed:20049", "active", _make_miner_info())
+        orig_first_seen = tm1._nodes["seed:20049"].first_seen
+
+        time.sleep(0.01)
+        tm2 = TelemetryManager(str(tmp_path / "tel"), enabled=True)
+        tm2.record_initial_peers(["seed:20049"])
+
+        assert tm2._nodes["seed:20049"].first_seen == orig_first_seen
+        # Status must not be downgraded to initial_peer.
+        assert tm2._nodes["seed:20049"].status == "active"
+
+    def test_load_skips_malformed_records(self, tmp_path, caplog):
+        """A broken record is skipped, remaining records load cleanly."""
+        target = tmp_path / "tel" / "nodes.json"
+        target.parent.mkdir(parents=True)
+        target.write_text(json.dumps({
+            "updated_at": "2026-04-24T00:00:00+00:00",
+            "node_count": 2,
+            "active_count": 1,
+            "nodes": {
+                "ok:20049": {
+                    "address": "ok:20049",
+                    "status": "active",
+                    "first_seen": 1000.0,
+                    "last_seen": 2000.0,
+                    "last_heartbeat": 2000.0,
+                },
+                "broken:20049": "not a dict",
+            },
+        }))
+
+        with caplog.at_level(logging.WARNING):
+            tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
+
+        assert "ok:20049" in tm._nodes
+        assert tm._nodes["ok:20049"].first_seen == 1000.0
+        assert "broken:20049" not in tm._nodes
+
+    def test_load_handles_missing_file(self, tmp_path):
+        """A cold directory must not cause __init__ to raise."""
+        tm = TelemetryManager(str(tmp_path / "never-existed"), enabled=True)
+        assert tm._nodes == {}
+
+    def test_load_handles_malformed_json(self, tmp_path, caplog):
+        target = tmp_path / "tel" / "nodes.json"
+        target.parent.mkdir(parents=True)
+        target.write_text("{not valid json")
+
+        with caplog.at_level(logging.WARNING):
+            tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
+
+        assert tm._nodes == {}
+
     def test_multiple_nodes_tracking(self, tmp_path):
         tm = TelemetryManager(str(tmp_path / "tel"), enabled=True)
         tm.update_node("a:20049", "active", _make_miner_info("n1", "CPU"))

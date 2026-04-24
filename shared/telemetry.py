@@ -120,6 +120,14 @@ class TelemetryManager:
         self._write_queue: Optional[asyncio.Queue] = None
         self._writer_task: Optional[asyncio.Task] = None
 
+        # Preserve first_seen (and other per-record history) across
+        # restarts by loading the prior nodes.json. Without this, every
+        # boot reseeds first_seen=now and the "known since" signal is
+        # destroyed. Malformed files or individual records are skipped
+        # with a warning rather than failing startup.
+        if self._enabled:
+            self._load_nodes_json()
+
     # ------------------------------------------------------------------
     # Node telemetry
     # ------------------------------------------------------------------
@@ -202,6 +210,49 @@ class TelemetryManager:
             },
         }
         self._atomic_write_json(target, payload)
+
+    def _load_nodes_json(self) -> None:
+        """Populate ``self._nodes`` from an existing nodes.json, if any.
+
+        Inverse of ``_node_record_to_dict``: NodeRecord fields live at
+        fixed keys, everything else was flattened from the descriptor.
+        Missing/malformed records are skipped with a warning so a
+        corrupted file can't block startup.
+        """
+        target = self._dir / "nodes.json"
+        if not target.is_file():
+            return
+        try:
+            payload = json.loads(target.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            self._logger.warning(
+                f"Failed to load {target}: {exc}; starting with empty "
+                "node registry"
+            )
+            return
+
+        raw_nodes = payload.get("nodes")
+        if not isinstance(raw_nodes, dict):
+            return
+
+        loaded = 0
+        for addr, flat in raw_nodes.items():
+            if not isinstance(flat, dict):
+                continue
+            try:
+                rec = _node_record_from_dict(addr, flat)
+            except (TypeError, ValueError, KeyError) as exc:
+                self._logger.warning(
+                    f"Skipping malformed node entry {addr}: {exc}"
+                )
+                continue
+            self._nodes[addr] = rec
+            loaded += 1
+
+        if loaded:
+            self._logger.info(
+                f"Loaded {loaded} node record(s) from {target}"
+            )
 
     def log_nodes_table(self) -> None:
         """Log a formatted table of all known nodes."""
@@ -496,6 +547,42 @@ def _node_record_to_dict(rec: NodeRecord) -> Dict[str, Any]:
             if key not in out:
                 out[key] = value
     return out
+
+
+# Connection/status fields owned directly by NodeRecord — everything else
+# in the flattened on-disk dict came from the descriptor.
+_NODE_RECORD_FIELDS = frozenset({
+    "address", "status", "first_seen", "last_seen",
+    "last_heartbeat", "ecdsa_public_key_hex",
+})
+
+
+def _node_record_from_dict(address: str, flat: Dict[str, Any]) -> NodeRecord:
+    """Inverse of ``_node_record_to_dict`` used when reloading nodes.json.
+
+    Non-NodeRecord keys are reassembled into ``descriptor``. Coerces
+    numeric timestamps through ``float`` so older files that recorded
+    them as ints still load.
+    """
+    descriptor = {
+        k: v for k, v in flat.items() if k not in _NODE_RECORD_FIELDS
+    } or None
+
+    first_seen_raw = flat.get("first_seen")
+    last_seen_raw = flat.get("last_seen")
+    now = time.time()
+    return NodeRecord(
+        address=flat.get("address") or address,
+        status=flat.get("status") or "active",
+        first_seen=float(first_seen_raw) if first_seen_raw is not None else now,
+        last_seen=float(last_seen_raw) if last_seen_raw is not None else now,
+        last_heartbeat=(
+            float(flat["last_heartbeat"])
+            if flat.get("last_heartbeat") is not None else None
+        ),
+        ecdsa_public_key_hex=flat.get("ecdsa_public_key_hex"),
+        descriptor=descriptor,
+    )
 
 
 def _descriptor_node_label(descriptor: Optional[Dict]) -> str:
