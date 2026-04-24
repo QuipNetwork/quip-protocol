@@ -4002,8 +4002,21 @@ class NetworkNode(Node):
         if await self._can_reach_address(claimed_addr, timeout):
             return claimed_addr
 
-        # Fallback to real connecting IP with claimed port
         fallback = format_host_port(real_host, claimed_port)
+
+        # When the claim already matches the QUIC source IP, QUIC has
+        # cryptographically validated the IP; an extra UDP probe of the
+        # same address adds no signal and its result is ICMP-dependent
+        # (unreliable across middleboxes / trans-oceanic links).  Trust
+        # QUIC and let the peer scorer penalise the peer if subsequent
+        # outbound dials fail.
+        if fallback == claimed_addr:
+            self.logger.info(
+                f"Address {claimed_addr} UDP probe failed; "
+                f"accepting on QUIC source verification"
+            )
+            return claimed_addr
+
         self.logger.warning(
             f"Claimed address {claimed_addr} unreachable, "
             f"falling back to {fallback}"
