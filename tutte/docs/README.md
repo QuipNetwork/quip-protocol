@@ -6,24 +6,25 @@ Detailed documentation for each technique used by the tutte synthesis engine to 
 
 ## Motivation
 
-| # | Document | Description |
-|---|----------|-------------|
-| 0 | [Tutte Polynomials as a Difficulty Mechanism](00_motivation.md) | Why Tutte polynomials are used in Quip Protocol's proof of work |
+| #   | Document                                                        | Description                                                     |
+| --- | --------------------------------------------------------------- | --------------------------------------------------------------- |
+| 0   | [Tutte Polynomials as a Difficulty Mechanism](00_motivation.md) | Why Tutte polynomials are used in Quip Protocol's proof of work |
 
 ## Technique Index
 
-| # | Technique | When Used | Complexity |
-|---|-----------|-----------|------------|
-| 1 | [Family Recognition](01_family_recognition.md) | Trees, cycles, wheels, fans, ladders, prisms, books, gears, Möbius ladders, grids, etc. | **O(n + m)** — fastest path, runs before canonical-key |
-| 2 | [Rainbow Table Lookup](02_rainbow_table_lookup.md) | Canonical-key match against pre-computed polynomials | O(n² × d) — dominated by canonical key computation |
-| 3 | [Base Cases](03_base_cases.md) | Empty graph or single edge | O(1) |
-| 4 | [Disconnected Factorization](04_disconnected_factorization.md) | Graph has multiple connected components | O(n + m) + recursive synthesis per component |
-| 5 | [Cut Vertex Factorization](05_cut_vertex_factorization.md) | Graph has an articulation point | O(n + m) + recursive synthesis per block |
-| 6 | [Treewidth DP](06_treewidth_dp.md) | Graphs ≥ 10 edges with treewidth ≤ 11 (catches most ≤ ~50-edge graphs and the D-Wave cases that fit) | O(2^tw × n) C-extension |
-| 7 | [k-Sum Decomposition (chord rule)](07_k_sum_decomposition.md) | Graphs with k-vertex separators (k=2..7) — treewidth_dp didn't apply or didn't run | **O(C(k,2)) full syntheses** |
-| 8 | [Hierarchical Tiling (chord rule)](08_hierarchical_tiling.md) | Graphs ≥ 20 edges with repeating cell structure — fallback when treewidth_dp doesn't fit | **O(chord_count) full syntheses** |
-| 9 | [Creation-Expansion-Join (CEJ)](09_creation_expansion_join.md) | Final fallback — spanning tree + chord addition | O(chords × synthesis_cost) |
-| 10 | [Rooted Tutte Path DP](10_rooted_tutte_path_dp.md) | (Research) Multi-cell path topologies via boundary-partition convolution — extends to D-Wave Pm3+ | O(n × Bell(W)² × poly²) |
+| #   | Technique                                                      | When Used                                                                                            | Complexity                                             |
+| --- | -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| 1   | [Family Recognition](01_family_recognition.md)                 | Trees, cycles, wheels, fans, ladders, prisms, books, gears, Möbius ladders, grids, etc.              | **O(n + m)** — fastest path, runs before canonical-key |
+| 2   | [Rainbow Table Lookup](02_rainbow_table_lookup.md)             | Canonical-key match against pre-computed polynomials                                                 | O(n² × d) — dominated by canonical key computation     |
+| 3   | [Base Cases](03_base_cases.md)                                 | Empty graph or single edge                                                                           | O(1)                                                   |
+| 4   | [Disconnected Factorization](04_disconnected_factorization.md) | Graph has multiple connected components                                                              | O(n + m) + recursive synthesis per component           |
+| 5   | [Cut Vertex Factorization](05_cut_vertex_factorization.md)     | Graph has an articulation point                                                                      | O(n + m) + recursive synthesis per block               |
+| 6   | [Treewidth DP](06_treewidth_dp.md)                             | Graphs ≥ 10 edges with treewidth ≤ 11 (catches most ≤ ~50-edge graphs and the D-Wave cases that fit) | O(2^tw × n) C-extension                                |
+| 6.5 | [Cotree DP](06_1_cotree_dp.md)                                 | Cographs (P*4-free) where treewidth_dp can't fit (K_12+, large K*{a,b}, threshold graphs)            | **exp(O(n^{2/3}))** — subexponential                   |
+| 7   | [k-Sum Decomposition (chord rule)](07_k_sum_decomposition.md)  | Graphs with k-vertex separators (k=2..7) — treewidth_dp didn't apply or didn't run                   | **O(C(k,2)) full syntheses**                           |
+| 8   | [Hierarchical Tiling (chord rule)](08_hierarchical_tiling.md)  | Graphs ≥ 20 edges with repeating cell structure — fallback when treewidth_dp doesn't fit             | **O(chord_count) full syntheses**                      |
+| 9   | [Creation-Expansion-Join (CEJ)](09_creation_expansion_join.md) | Final fallback — spanning tree + chord addition                                                      | O(chords × synthesis_cost)                             |
+| 10  | [Rooted Tutte Path DP](10_rooted_tutte_path_dp.md)             | (Research) Multi-cell path topologies via boundary-partition convolution — extends to D-Wave Pm3+    | O(n × Bell(W)² × poly²)                                |
 
 ## Pipeline Overview
 
@@ -44,7 +45,10 @@ flowchart TD
     F -- no --> H{6. Treewidth DP\n≥ 10 edges, tw ≤ 11?}
     H -- yes --> H1[C-extension treewidth DP]
     H1 --> R
-    H -- no --> I{7. k-Sum decomposition\n≥ 6 edges + vertex separator?}
+    H -- no --> HC{6.5 Cotree DP\nP_4-free cograph?}
+    HC -- yes --> HC1[compute_tutte_cotree_dp:\nsubexponential exp(O(n^{2/3}))]
+    HC1 --> R
+    HC -- no --> I{7. k-Sum decomposition\n≥ 6 edges + vertex separator?}
     I -- yes --> I1[clique_chord_k_sum:\niterative chord rule]
     I1 --> R
     I -- no --> J{8. Hierarchical tiling\n≥ 20 edges + cell decomposition?}
@@ -56,22 +60,26 @@ flowchart TD
 
 > **Why family recognition runs first**: it costs O(n + m) and skips the expensive canonical-key computation (O(n² × d)) needed for rainbow-table lookup. For known parametric families — trees, cycles, wheels, fans, ladders, prisms, books, gears, Möbius ladders, grids — the polynomial is computed directly from a closed-form formula or constant-coefficient recurrence in `n`. When recognition fails, we fall through to the canonical-key + lookup path.
 
-> **Why treewidth_dp runs first**: it's a cffi-accelerated C extension and wins outright when the graph fits (treewidth ≤ 11). The chord-rule paths take over for graphs whose treewidth exceeds the cap — this is exactly the regime needed for larger D-Wave topologies (Cm₃+, Pm₃+, Z(2,t)+). The chord_rule is *competitive* with treewidth_dp on graphs both can handle (Cm2 chord_rule is ~2× faster; Petersen ~168× faster; Z(1,2) tied; Pm2 chord_rule slower due to 95+ chords) — but the simplest robust ordering is treewidth_dp first, chord_rule for the unreachable rest.
+> **Why treewidth_dp runs first**: it's a cffi-accelerated C extension and wins outright when the graph fits (treewidth ≤ 11). The chord-rule paths take over for graphs whose treewidth exceeds the cap — this is exactly the regime needed for larger D-Wave topologies (Cm₃+, Pm₃+, Z(2,t)+). The chord_rule is _competitive_ with treewidth_dp on graphs both can handle (Cm2 chord_rule is ~2× faster; Petersen ~168× faster; Z(1,2) tied; Pm2 chord_rule slower due to 95+ chords) — but the simplest robust ordering is treewidth_dp first, chord_rule for the unreachable rest.
 
 ## Hierarchical Tiling — How It Works
 
 For a graph with k disjoint cells `C_1, ..., C_k` (each isomorphic to a known minor) connected by some inter-cell edges:
 
 **boundary quotient** (boundary-quotient formula, when no chords in the inter-cell graph):
+
 ```
 T(target) = [∏_i T(C_i)] · T(B) / [∏_i T(B_i)]
 ```
+
 where `B` is the induced subgraph on all boundary nodes (cell vertices touched by inter-cell edges) plus all inter-cell edges plus intra-cell edges among boundary nodes; `B_i` is each cell's boundary-induced subgraph.
 
 **chord recursion** (iterative chord rule, peels off cycle-creating inter-cell edges):
+
 ```
 T(target) = T(target − all chords) + Σ_i T((target − chord_1 − ... − chord_{i-1}) / chord_i)
 ```
+
 Each contraction leaf is synthesized as a multigraph (parallel edges and loops are preserved).
 
 **Cost**: 1 + (chord count) full syntheses. Linear in the cyclic complexity of the inter-cell graph.
@@ -99,9 +107,9 @@ A historical bug fixed in April 2026: the int64 (a, b)-basis DP was used for gra
 
 ## Supporting Theory
 
-| # | Document | Topic |
-|---|----------|-------|
-| 10 | [Chord-Rule Formalization](08_2_chord_rule_formalization.md) | Mathematical formalization (boundary quotient + chord recursion) generalizing Bonin-de Mier Theorem 6 to incomplete-graph boundaries; empirical validation; replacement for Theorem 10 |
+| #   | Document                                                     | Topic                                                                                                                                                                                  |
+| --- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 10  | [Chord-Rule Formalization](08_2_chord_rule_formalization.md) | Mathematical formalization (boundary quotient + chord recursion) generalizing Bonin-de Mier Theorem 6 to incomplete-graph boundaries; empirical validation; replacement for Theorem 10 |
 
 ## Engine Variants
 
@@ -115,20 +123,20 @@ The benchmark suite (`tutte/benchmarks/benchmark.py`) measures wall-clock synthe
 
 ### Engines Compared
 
-| Engine | Description | Default Timeout |
-|--------|-------------|---------|
-| **CEJ** (`SynthesisEngine`) | Techniques 1–9 with growing rainbow table | 60s |
-| **Hybrid** (`HybridSynthesisEngine`) | Algebraic + tiling with growing rainbow table | 60s |
-| **NetworkX** (`nx.tutte_polynomial`) | Reference deletion-contraction (no table) | 30s |
+| Engine                               | Description                                   | Default Timeout |
+| ------------------------------------ | --------------------------------------------- | --------------- |
+| **CEJ** (`SynthesisEngine`)          | Techniques 1–9 with growing rainbow table     | 60s             |
+| **Hybrid** (`HybridSynthesisEngine`) | Algebraic + tiling with growing rainbow table | 60s             |
+| **NetworkX** (`nx.tutte_polynomial`) | Reference deletion-contraction (no table)     | 30s             |
 
 ### Graph Set
 
 Built from three sources, deduplicated by canonical key, sorted by edge count:
 
-| Source | Graphs | Description |
-|--------|--------|-------------|
-| Named graphs | 13 | K₃–K₇, C₅/C₁₀/C₁₅, W₅/W₇, Petersen, Grid 3×3/4×4 |
-| Graph atlas | ~1000 | All connected graphs from `nx.graph_atlas(1..1252)` |
+| Source            | Graphs   | Description                                                                   |
+| ----------------- | -------- | ----------------------------------------------------------------------------- |
+| Named graphs      | 13       | K₃–K₇, C₅/C₁₀/C₁₅, W₅/W₇, Petersen, Grid 3×3/4×4                              |
+| Graph atlas       | ~1000    | All connected graphs from `nx.graph_atlas(1..1252)`                           |
 | D-Wave topologies | up to 49 | Chimera Cm₁–Cm₁₆, Pegasus Pm₁–Pm₁₆, Zephyr Z(1,1) (requires `dwave-networkx`) |
 
 ### Verification

@@ -581,6 +581,7 @@ EVENT_COLORS = {
     "chord_rule": "#ad1457",
     "unified_formula": "#8e24aa",
     "kmatching_formula": "#d81b60",
+    "cotree_dp": "#00838f",
     "synthesis_start": "#9e9e9e",
     "candidate_filter": "#9e9e9e",
 }

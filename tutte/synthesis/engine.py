@@ -39,6 +39,7 @@ from ..graphs.covering import (Cover, Fringe, InterCellInfo,
                                try_heterogeneous_partition,
                                try_hierarchical_partition)
 from ..graphs.series_parallel import compute_sp_tutte_if_applicable
+from ..cotree_dp import compute_tutte_cotree_dp
 from ..logs import EventType, LogLevel, get_log
 from ..lookup.core import MinorEntry, RainbowTable, load_default_table
 from ..polynomial import TuttePolynomial
@@ -582,6 +583,27 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 self._cache[cache_key] = formula_result
                 self._promote_to_table(graph, cache_key, formula_result)
                 return formula_result
+
+        # 7.5. Cotree DP — subexponential exp(O(n^{2/3})) for cographs
+        # (P_4-free graphs). Wins where treewidth_dp can't fit (K_12+) and
+        # the graph is a cograph. Fast no-op (early reject) on non-cographs.
+        try:
+            cotree_poly = compute_tutte_cotree_dp(graph)
+            if cotree_poly is not None:
+                _log.record(EventType.COTREE_DP, "engine",
+                            f"Cotree DP: {n}n {m}e", graph=graph)
+                self._log(f"Cotree DP: {n}n, {m}e")
+                result = SynthesisResult(
+                    polynomial=cotree_poly,
+                    recipe=["Cotree-based DP (subexponential cograph)"],
+                    verified=True,
+                    method="cotree_dp",
+                )
+                self._cache[cache_key] = result
+                self._promote_to_table(graph, cache_key, result)
+                return result
+        except (ValueError, TypeError):
+            pass  # not a cograph, or input rejected — fall through
 
         # 8. Treewidth DP — fast for graphs with treewidth ≤ 11. When this
         # succeeds it's usually the best path for graphs that fit. For graphs
