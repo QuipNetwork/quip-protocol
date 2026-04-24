@@ -7,24 +7,27 @@ Tools for computing Tutte polynomials of graphs via structural decomposition and
 ```mermaid
 graph TD
     P["polynomial.py<br/>TuttePolynomial"] --> G["graph.py<br/>Graph, MultiGraph"]
-    G --> GR["graphs/<br/>SP, covering, minor, k-join"]
+    G --> GR["graphs/<br/>SP, covering, treewidth DP, k_sum (chord rule)"]
     G --> F["factorization.py<br/>GCD, factorization"]
     GR --> L["lookup/<br/>RainbowTable, binary I/O"]
     F --> L
     L --> S["synthesis/<br/>CEJ, algebraic, hybrid engines"]
     GR --> S
-    M["matroids/<br/>Theorem 6, flat lattice"] --> S
+    FR["family_recognition/<br/>closed-form for known families"] --> S
 ```
 
-| Subpackage                            | Description                                                             |
-| ------------------------------------- | ----------------------------------------------------------------------- |
-| [`graphs/`](graphs/README.md)         | Series-parallel recognition, subgraph covering, minor detection, k-join |
-| [`matroids/`](matroids/README.md)     | Graphic matroid, flat lattice, Bonin-de Mier Theorem 6                  |
-| [`lookup/`](lookup/README.md)         | Rainbow table: O(1) polynomial lookup, binary serialization             |
-| [`synthesis/`](synthesis/README.md)   | CEJ, algebraic, and hybrid synthesis engines                            |
-| [`data/`](data/README.md)             | Pre-computed lookup tables and benchmark results                        |
-| [`tests/`](tests/README.md)           | Parametrized test suite (Kirchhoff + NetworkX cross-validation)         |
-| [`benchmarks/`](benchmarks/README.md) | Standalone benchmark suite                                              |
+| Subpackage                                              | Description                                                                                                   |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| [`graphs/`](graphs/README.md)                           | Series-parallel recognition, subgraph covering, treewidth DP, **k-sum chord rule** (`k_sum.py`)               |
+| [`family_recognition/`](family_recognition/__init__.py) | O(n+m) closed-form polynomials for known families: trees, cycles, wheels, fans, ladders, prisms, books, gears |
+| [`lookup/`](lookup/README.md)                           | Rainbow table: O(1) polynomial lookup, binary serialization                                                   |
+| [`synthesis/`](synthesis/README.md)                     | CEJ, algebraic, and hybrid synthesis engines                                                                  |
+| [`data/`](data/README.md)                               | Pre-computed lookup tables and benchmark results                                                              |
+| [`tests/`](tests/README.md)                             | Parametrized test suite (Kirchhoff + NetworkX cross-validation)                                               |
+| [`benchmarks/`](benchmarks/README.md)                   | Standalone benchmark suite                                                                                    |
+| [`docs/`](docs/README.md)                               | Per-technique documentation + chord-rule formalization                                                        |
+
+> **Note (April 2026)**: The legacy `tutte/matroids/` package (Bonin-de Mier Theorem 6 / Theorem 10, flat lattices, BivariateLaurentPoly) has been **retired**. Its functionality is fully subsumed by the chord-rule pipeline in `tutte/graphs/k_sum.py`. See [`docs/08_2_chord_rule_formalization.md`](docs/08_2_chord_rule_formalization.md) for the formalization and validation.
 
 ### Core Modules
 
@@ -35,48 +38,38 @@ graph TD
 | `factorization.py` | Polynomial GCD and factorization                                       |
 | `validation.py`    | Kirchhoff verification, NetworkX cross-checks                          |
 
-## Synthesis Workflows
+## Synthesis Pipeline
 
-### CEJ Engine (Creation-Expansion-Join)
-
-The primary synthesis engine. Computes Tutte polynomials by decomposing graphs into known components.
+Single primary engine (`SynthesisEngine`) tries techniques in order; first success wins. See [`docs/README.md`](docs/README.md) for the full per-step reference.
 
 ```mermaid
 graph TD
-    A[Input Graph G] --> B{Rainbow table hit?}
-    B -->|yes| Z[Return polynomial]
-    B -->|no| C{Disconnected?}
-    C -->|yes| D["T(G₁ ∪ G₂) = T(G₁) × T(G₂)"]
-    D --> Z
-    C -->|no| E{Has cut vertex?}
-    E -->|yes| F["T(G₁ · G₂) = T(G₁) × T(G₂)"]
-    F --> Z
-    E -->|no| G{Series-parallel?}
-    G -->|yes| H["O(n) SP decomposition tree"]
-    H --> Z
-    G -->|no| I{≥20 edges + cell pattern?}
-    I -->|yes| J[Hierarchical tiling]
-    J --> K["T(cell)^k + chord additions"]
-    K --> Z
-    I -->|no| L[Spanning tree expansion]
-    L --> M["T = x^(n-1), add chords"]
-    M --> Z
+    A[Input Graph G] --> Z{1. Family recognition\nO n+m fast path}
+    Z -->|hit| R[Return polynomial]
+    Z -->|miss| B{2. Rainbow table?}
+    B -->|hit| R
+    B -->|miss| C{3. Base case?}
+    C -->|yes| R
+    C -->|no| D{4. Disconnected?}
+    D -->|yes| D1["T G1 cup G2 = T G1 times T G2"]
+    D1 --> R
+    D -->|no| E{5. Cut vertex?}
+    E -->|yes| E1["T G1 dot G2 = T G1 times T G2"]
+    E1 --> R
+    E -->|no| F{6. Treewidth DP\ntw leq 11?}
+    F -->|yes| F1[C-extension treewidth DP]
+    F1 --> R
+    F -->|no| G{7. k-sum decomposition?\nvertex separator}
+    G -->|yes| G1[clique_chord_k_sum:\niterative chord rule on K_k]
+    G1 --> R
+    G -->|no| H{8. Hierarchical tiling?\ngeq 20 edges + cell pattern}
+    H -->|yes| H1[boundary_quotient_tutte:\nboundary quotient + chord recursion]
+    H1 --> R
+    H -->|no| I[9. CEJ: spanning tree + chord additions]
+    I --> R
 ```
 
-### Matroid / Parallel Connection (Theorem 6)
-
-An alternative approach for graphs decomposable into two cells sharing edges. Uses the Bonin-de Mier formula for parallel connections and k-sums of graphic matroids.
-
-```mermaid
-graph TD
-    A[Graph with 2-cell decomposition] --> B[Build graphic matroid M_N of shared edges]
-    B --> C[Enumerate flat lattice L of M_N]
-    C --> D[Compute Mobius function on L]
-    D --> E[For each flat F: contract F in both cells]
-    E --> F[Synthesize T of contracted graphs]
-    F --> G["Theorem 6: R = v^{-r(N)} Σ μ(0,A) (v+1)^|A| f₁(A) f₂(A)"]
-    G --> H[Convert back to T polynomial]
-```
+The chord-rule paths (steps 7 and 8) replaced the matroid-theoretic Theorem 6 / Theorem 10 in April 2026. They share an implementation in `tutte/graphs/k_sum.py` and use only the standard deletion-contraction identity — no flat lattices, no Möbius function. See [`docs/08_2_chord_rule_formalization.md`](docs/08_2_chord_rule_formalization.md).
 
 ## Key Formulas
 
@@ -105,9 +98,9 @@ graph TD
 
 ## Known Limitations
 
-- **Z(1,2)+ synthesis broken**: Graphs above Z(1,1) (22 edges) time out due to 31+ chord additions on 45+ edge intermediate graphs where merged nodes lack cut vertices, falling through to expensive VF2 minor search.
+- **Treewidth cap**: `treewidth_dp` only attempts graphs with treewidth ≤ 11 (configurable). Larger D-Wave topologies (Cm₃+, Pm₃+, Z(2,t)+) exceed this and route through the chord-rule path instead.
+- **Hierarchical tiling currently isomorphic-only**: `try_hierarchical_partition` finds k _identical_ cells. A heterogeneous extension (e.g. Cm₃ = 2 × Cm₂ + 2 × Cm₁) is on the optimization roadmap — `boundary_quotient_tutte` already supports per-cell `T(C_i)`, the gap is in the partitioner.
 - **Exponential worst case**: Deletion-contraction is O(2^m). Practical for ≤25 edges without structural shortcuts.
-- **Matroid approach**: Currently implemented for 2-cell decompositions only. Useful for dense graphs where CEJ chord addition is too slow.
 
 ## Lookup Table
 

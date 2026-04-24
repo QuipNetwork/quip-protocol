@@ -21,8 +21,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 from ..graph import MultiGraph
+from ..logs import EventType, LogLevel, get_log
 from ..polynomial import TuttePolynomial
-from ..logs import get_log, EventType, LogLevel
 
 # Try to import C-accelerated partition merge (5x faster for tw >= 8)
 try:
@@ -1190,10 +1190,22 @@ def compute_treewidth_tutte_if_applicable(
                 f"{mg.node_count()}n {mg.edge_count()}e, cost={cost:.0f}",
                 LogLevel.DEBUG, graph=mg)
 
-    # Use bulk C DP for tw >= 5 when available (5-15x faster).
-    # The C DP uses modular arithmetic with CRT for graphs with > 62 edges
-    # (where int64 coefficients or binomial coefficients would overflow).
-    if td.width >= 5:
+    # Use bulk C DP for 5 <= tw <= 10 when available.
+    # (April 2026) Audit measured C vs Python head-to-head:
+    #   Z(1,1) tw=5 m=22:   C   6ms vs Py    4ms (Py wins 1.7×)
+    #   Cm1    tw=4 m=16:   C   1ms vs Py    2ms (~tie)
+    #   Z(1,2) tw=10 m=76:  C 168s vs Py 1235s (C wins 7.4×)
+    #   Cm2    tw=11 m=80:  C 695s vs Py  207s (**Py wins 3.4×**)
+    # The C path is a clear win for tw=6..10 but a 3.4× regression at tw=11.
+    # Likely cause: at tw=11 with int64-overflowing spanning-tree counts
+    # (Cm2 has 1.2×10^19), the C path's int128/modular-CRT tier becomes
+    # slower than Python bigints. The upper cap (tw <= 10) keeps the win
+    # band and lets Python handle the regression cases.
+    #
+    # Attempted to LOWER this to tw >= 3 but caused a 15% corpus
+    # regression (cffi marshaling overhead dominated for tiny graphs);
+    # reverted. The right gate is `5 <= tw <= 10`.
+    if 5 <= td.width <= 10:
         try:
             from ._treewidth_c import compute_treewidth_tutte_c
             c_result = compute_treewidth_tutte_c(td, mg)

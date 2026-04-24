@@ -2,7 +2,6 @@
 
 from .core import (
     MinorEntry,
-    FlatLatticeData,
     GCDMinorIndex,
     RainbowTable,
     load_default_table,

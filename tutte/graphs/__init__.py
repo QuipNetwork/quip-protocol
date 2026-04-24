@@ -9,16 +9,11 @@ from .series_parallel import (
     compute_sp_chi_coeffs,
     compute_contraction_chi,
 )
-from .k_join import (
-    tutte_k,
-    k_sum,
-    k_sum_multiple,
-    k_join_divide,
+from .k_sum import (
     polynomial_divmod,
     polynomial_divide,
-    TileJoin,
-    compute_cover_polynomial,
-    divide_out_fringe,
+    boundary_quotient_tutte,
+    clique_chord_k_sum,
 )
 from .minor import is_graph_minor
 from .covering import (

@@ -493,26 +493,32 @@ def save_results(results, cej_table=None, hybrid_engine=None, cej_engine=None):
         print(f"Rainbow table saved: {len(cej_table)} entries ({json_path}, {bin_path})",
               flush=True)
 
-    # Merge and save multigraph caches from both engines
+    # Merge and save multigraph caches from both engines. Loads the
+    # existing on-disk table first so previous entries survive — the
+    # benchmark only adds new canonical keys, never overwrites the
+    # data blob.
     merged_mg_cache = {}
     if cej_engine is not None:
         merged_mg_cache.update(cej_engine._multigraph_cache)
     if hybrid_engine is not None:
         merged_mg_cache.update(hybrid_engine._structural_engine._multigraph_cache)
     if len(merged_mg_cache) > 0:
-        from ..lookup.core import save_default_multigraph_table
-        save_default_multigraph_table(merged_mg_cache)
-        print(f"Multigraph cache saved: {len(merged_mg_cache)} entries "
+        from ..lookup.core import (
+            load_default_multigraph_table,
+            save_default_multigraph_table,
+        )
+        existing = load_default_multigraph_table()
+        added = 0
+        for k, v in merged_mg_cache.items():
+            if k not in existing:
+                existing[k] = v
+                added += 1
+        save_default_multigraph_table(existing)
+        print(f"Multigraph cache saved: {len(existing)} entries "
+              f"(+{added} new) "
               f"({os.path.join(base_dir, 'multigraph_lookup_table.json')}, "
               f"{os.path.join(base_dir, 'multigraph_lookup_table.bin')})",
               flush=True)
-
-    # Save contraction cache from hybrid engine
-    if hybrid_engine is not None:
-        cc = hybrid_engine._structural_engine._contraction_cache
-        if len(cc) > 0:
-            hybrid_engine._structural_engine.save_contraction_cache()
-            print(f"Contraction cache saved: {len(cc)} entries", flush=True)
 
     return out_path
 

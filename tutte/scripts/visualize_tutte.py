@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Tutte Engine Visualizer — Flask + vis-network with live SSE streaming.
+Tutte Engine Visualizer — Flask + Sigma.js (WebGL) with live SSE streaming.
 
 Layout:
   Row 1 — Input Graph + Contributing Graphs (side by side)
@@ -19,7 +19,7 @@ URL Parameters:
     rand_n=12&rand_m=18 — Random graph with n nodes and m edges
     timeout=60       — Engine timeout in seconds (default 60)
     threshold=100    — Timeline bottleneck threshold in ms (default 100)
-    engine=synthesis — Engine: "synthesis", "algebraic", or "hybrid"
+    engine=hybrid    — Engine: "hybrid" (default), "synthesis", or "algebraic"
 """
 
 import json
@@ -76,36 +76,68 @@ def _normalize_nx_graph(G):
     """Return G with nodes relabeled to consecutive ints starting at 0.
 
     Several networkx generators (grid_2d_graph, kneser_graph, balanced_tree
-    with certain inputs) use tuple or frozenset node labels that vis.js
-    can't render and that break spring_layout keying in the visualizer.
-    Relabeling to ints keeps every family path uniform.
+    with certain inputs) use tuple or frozenset node labels that break
+    downstream rendering and spring_layout keying. Relabeling to ints keeps
+    every family path uniform. Original labels are preserved under the
+    'original_label' node attribute so compute_layout can use them (e.g.
+    for grid positions).
     """
     if G is None:
         return G
-    return nx.convert_node_labels_to_integers(G)
+    return nx.convert_node_labels_to_integers(G, label_attribute='original_label')
 
 
 def parse_graph(args) -> tuple:
-    """Parse URL parameters into a (nx.Graph, description) tuple.
+    """Parse URL parameters into a (nx.Graph, description, source_hint) tuple.
 
-    The returned graph always has integer node labels (0..n-1) so
-    downstream rendering and engine conversion paths don't need to
-    special-case tuple/frozenset labels from networkx generators.
+    source_hint is one of {'zephyr', 'pegasus', 'chimera', 'grid', None}
+    and feeds compute_layout() so the visualizer can pick a topology-aware
+    layout instead of spring layout for graphs where one exists.
+
+    For D-Wave topologies, the layout function requires the original
+    dnx-generated graph (it rejects anonymous reconstructions), so we
+    compute positions here — while we still have the raw graph — and
+    attach them as graph-level metadata for compute_layout to consume.
+
+    The returned graph always has integer node labels (0..n-1).
     """
-    G, desc = _parse_graph_raw(args)
-    return _normalize_nx_graph(G), desc
+    G_raw, desc, source_hint = _parse_graph_raw(args)
+    if G_raw is None:
+        return None, desc, source_hint
+
+    raw_pos = None
+    if source_hint in ("zephyr", "pegasus", "chimera"):
+        try:
+            import dwave_networkx as dnx
+            fn = {
+                "zephyr": dnx.zephyr_layout,
+                "pegasus": dnx.pegasus_layout,
+                "chimera": dnx.chimera_layout,
+            }[source_hint]
+            raw_pos = fn(G_raw)
+        except Exception:
+            raw_pos = None
+
+    G = _normalize_nx_graph(G_raw)
+    if raw_pos is not None:
+        orig = nx.get_node_attributes(G, "original_label")
+        G.graph["_precomputed_pos"] = {
+            new: (float(raw_pos[orig[new]][0]), float(raw_pos[orig[new]][1]))
+            for new in G.nodes()
+            if orig.get(new) in raw_pos
+        }
+    return G, desc, source_hint
 
 
 def _parse_graph_raw(args) -> tuple:
-    """Inner: returns the raw nx.Graph from the appropriate generator
-    without normalizing node labels."""
+    """Inner: returns (nx.Graph, description, source_hint) without normalizing labels."""
     atlas = args.get("atlas", type=int)
     if atlas is not None:
         try:
             G = nx.graph_atlas(atlas)
-            return G, f"Atlas #{atlas}"
+            return G, f"Atlas #{atlas}", None
         except Exception as e:
-            return None, f"Invalid atlas index: {e}"
+            return None, f"Invalid atlas index: {e}", None
 
     dwave_topo = args.get("dwave_topo", "").strip()
     dwave_m = args.get("dwave_m", type=int)
@@ -116,23 +148,23 @@ def _parse_graph_raw(args) -> tuple:
             if dwave_topo == "zephyr":
                 t = dwave_t if dwave_t is not None else 1
                 G = dnx.zephyr_graph(dwave_m, t)
-                return G, f"Zephyr Z({dwave_m},{t})"
+                return G, f"Zephyr Z({dwave_m},{t})", "zephyr"
             elif dwave_topo == "pegasus":
                 if dwave_m < 2:
-                    return None, "Pegasus requires m >= 2 (P(1) is empty)"
+                    return None, "Pegasus requires m >= 2 (P(1) is empty)", None
                 G = dnx.pegasus_graph(dwave_m)
-                return G, f"Pegasus P({dwave_m})"
+                return G, f"Pegasus P({dwave_m})", "pegasus"
             elif dwave_topo == "chimera":
                 # D-Wave Chimera is specified by a single parameter m (tile grid
                 # is m×m, shore size is fixed at 4 on every D-Wave processor).
                 G = dnx.chimera_graph(dwave_m)
-                return G, f"Chimera C({dwave_m})"
+                return G, f"Chimera C({dwave_m})", "chimera"
             else:
-                return None, f"Unknown D-Wave topology: {dwave_topo}"
+                return None, f"Unknown D-Wave topology: {dwave_topo}", None
         except ImportError:
-            return None, "dwave-networkx not installed"
+            return None, "dwave-networkx not installed", None
         except Exception as e:
-            return None, f"Invalid D-Wave params: {e}"
+            return None, f"Invalid D-Wave params: {e}", None
 
     edges_str = args.get("edges", "").strip()
     if edges_str:
@@ -141,9 +173,9 @@ def _parse_graph_raw(args) -> tuple:
             for part in edges_str.split(","):
                 u, v = part.strip().split("-")
                 G.add_edge(int(u), int(v))
-            return G, f"Custom ({G.number_of_edges()} edges)"
+            return G, f"Custom ({G.number_of_edges()} edges)", None
         except Exception as e:
-            return None, f"Invalid edge list: {e}"
+            return None, f"Invalid edge list: {e}", None
 
     # Random graph: rand_n=12&rand_m=12
     rand_n = args.get("rand_n", type=int)
@@ -151,11 +183,11 @@ def _parse_graph_raw(args) -> tuple:
     if rand_n is not None and rand_m is not None:
         max_edges = rand_n * (rand_n - 1) // 2
         if rand_m > max_edges:
-            return None, f"Too many edges: {rand_n} nodes can have at most {max_edges} edges"
+            return None, f"Too many edges: {rand_n} nodes can have at most {max_edges} edges", None
         if rand_n < 1:
-            return None, "Need at least 1 node"
+            return None, "Need at least 1 node", None
         G = nx.gnm_random_graph(rand_n, rand_m)
-        return G, f"Random G({rand_n},{rand_m}) — {G.number_of_nodes()}n, {G.number_of_edges()}e"
+        return G, f"Random G({rand_n},{rand_m}) — {G.number_of_nodes()}n, {G.number_of_edges()}e", None
 
     # Graph family: family=complete&n=5 or family=grid&n=3&m=4
     family = args.get("family", "").strip()
@@ -164,11 +196,12 @@ def _parse_graph_raw(args) -> tuple:
         m = args.get("m", 0, type=int)
         try:
             G, desc = _build_family_graph(family, n, m)
-            return G, desc
+            hint = "grid" if family == "grid" else None
+            return G, desc, hint
         except Exception as e:
-            return None, f"Invalid family params: {e}"
+            return None, f"Invalid family params: {e}", None
 
-    return None, ""
+    return None, "", None
 
 
 # Map of family name → (generator, needs_m, label_fn)
@@ -294,34 +327,187 @@ def _build_family_graph(family: str, n: int, m: int):
         raise ValueError(f"Unknown family: {family}")
 
 
-def vis_data_json(G) -> tuple:
-    """Convert nx.Graph to vis-network JSON (nodes, edges)."""
-    pos = nx.spring_layout(G, seed=42, scale=250)
+def _size_for_n(n: int) -> float:
+    """Node render size based on graph magnitude — keeps Z(12,4) readable."""
+    if n <= 100:
+        return 8.0
+    if n <= 1000:
+        return 4.0
+    if n <= 10000:
+        return 2.0
+    return 1.0
+
+
+def compute_layout(G, *, source_hint=None):
+    """Return {node_id: (x, y)} for a networkx graph.
+
+    Resolution order:
+    1. `G.graph['_precomputed_pos']` — positions baked in by parse_graph
+       (used for D-Wave topologies, where dnx layout needs the raw graph).
+    2. source_hint=='grid' → (row, col) from preserved original_label.
+    3. Small connected graphs → kamada_kawai.
+    4. Small graphs → spring_layout (seeded).
+    5. Everything else → random_layout; user can click Re-layout for FA2.
+    """
+    n = G.number_of_nodes()
+    if n == 0:
+        return {}
+
+    precomp = G.graph.get("_precomputed_pos") if hasattr(G, "graph") else None
+    if precomp and len(precomp) == n:
+        return dict(precomp)
+
+    if source_hint == "grid":
+        orig = nx.get_node_attributes(G, "original_label")
+        if orig and len(orig) == n:
+            pos = {}
+            for nd, label in orig.items():
+                if isinstance(label, tuple) and len(label) == 2:
+                    pos[nd] = (float(label[0]), float(label[1]))
+            if len(pos) == n:
+                return pos
+
+    if n <= 300:
+        try:
+            if nx.is_connected(G):
+                return nx.kamada_kawai_layout(G)
+        except Exception:
+            pass
+        return nx.spring_layout(G, seed=42)
+
+    return nx.random_layout(G, seed=42)
+
+
+def sigma_graph_json(G, *, source_hint=None, pos=None) -> str:
+    """Serialize G to graphology-importable JSON string.
+
+    Shape: {nodes: [{key, attributes:{label,x,y,size,color}}],
+            edges: [{key, source, target, attributes:{size,color}}]}
+    """
+    if pos is None:
+        pos = compute_layout(G, source_hint=source_hint)
+    n_nodes = G.number_of_nodes()
+    size = _size_for_n(n_nodes)
     nodes = []
-    for n in G.nodes():
+    for nd in G.nodes():
+        p = pos.get(nd, (0.0, 0.0))
         nodes.append({
-            "id": n, "label": str(n),
-            "x": pos[n][0], "y": pos[n][1],
-            "physics": False,
+            "key": nd,
+            "attributes": {
+                "label": str(nd),
+                "x": float(p[0]),
+                "y": float(p[1]),
+                "size": size,
+                "color": "#4f8ef7",
+            },
         })
     edges = []
-    for u, v in G.edges():
-        edges.append({"from": u, "to": v})
-    return json.dumps(nodes), json.dumps(edges)
+    for i, (u, v) in enumerate(G.edges()):
+        edges.append({
+            "key": f"e{i}",
+            "source": u,
+            "target": v,
+            "attributes": {"size": 1.0, "color": "#b0b0b0"},
+        })
+    return json.dumps({"nodes": nodes, "edges": edges})
 
 
-def small_graph_vis(G, div_id) -> str:
-    """Return vis-network JS snippet for a small graph panel."""
-    nodes_json, edges_json = vis_data_json(G)
+def sigma_graph_vis(G, div_id, *, source_hint=None, pos=None, register_as_target=False) -> str:
+    """Return a JS snippet that renders G into div_id via Sigma + graphology.
+
+    When register_as_target=True, the Sigma instance and the graphology
+    graph are exposed on window._targetSigma / window._targetGraph so the
+    Re-layout button can operate on them. A `window._renderInputGraph()`
+    closure is also installed so the Refresh button can fully recreate
+    the renderer (recovering from WebGL context exhaustion).
+    """
+    data_json = sigma_graph_json(G, source_hint=source_hint, pos=pos)
+    if register_as_target:
+        # Self-recreating renderer: defines a function that builds a
+        # fresh graphology Graph + Sigma instance every time it's
+        # called. Installs it on window._renderInputGraph so the
+        # refresh button can re-execute it on demand.
+        return (
+            "(function(){"
+            "window._renderInputGraph = function() {"
+            f"  var data = {data_json};"
+            "  var container = document.getElementById('"
+            f"{div_id}"
+            "');"
+            "  if (!container) return;"
+            "  if (window._targetSigma) {"
+            "    try { window._targetSigma.kill(); } catch(e) {}"
+            "    window._targetSigma = null;"
+            "  }"
+            "  container.innerHTML = '';"
+            "  var graph = new graphology.Graph();"
+            "  graph.import(data);"
+            "  var sigma = new Sigma(graph, container, "
+            "{renderLabels: graph.order <= 1000, labelDensity: 0.5, "
+            "labelGridCellSize: 60, labelRenderedSizeThreshold: 6, "
+            "defaultEdgeColor: '#b0b0b0', minCameraRatio: 0.05, maxCameraRatio: 20});"
+            "  window._targetSigma = sigma;"
+            "  window._targetGraph = graph;"
+            "  return sigma;"
+            "};"
+            "window._renderInputGraph();"
+            "})();"
+        )
     return (
-        f"(function(){{"
-        f"var n=new vis.Network("
-        f"document.getElementById('{div_id}'),"
-        f"{{nodes:new vis.DataSet({nodes_json}),edges:new vis.DataSet({edges_json})}},"
-        f"opts);"
-        f"n.fit({{padding:20}});"
-        f"}})();"
+        "(function(){"
+        f"var graph = new graphology.Graph();"
+        f"graph.import({data_json});"
+        f"var sigma = new Sigma(graph, document.getElementById('{div_id}'), "
+        "{renderLabels: graph.order <= 1000, labelDensity: 0.5, "
+        "labelGridCellSize: 60, labelRenderedSizeThreshold: 6, "
+        "defaultEdgeColor: '#b0b0b0', minCameraRatio: 0.05, maxCameraRatio: 20});"
+        "})();"
     )
+
+
+def _snapshot_to_nx(snapshot):
+    """Convert a log graph snapshot dict to nx.Graph for rendering.
+
+    Snapshot shape: {"nodes": [...], "edges": [[u, v, mult], ...],
+                     "loops": [[n, mult], ...]}.
+
+    Multiplicities and loops are collapsed to simple edges for the
+    Contributing-Graphs cards (the same convention as
+    `_synth_graph_to_nx`).
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    G = nx.Graph()
+    for n in snapshot.get("nodes", []):
+        G.add_node(n)
+    for edge in snapshot.get("edges", []) or []:
+        if not edge:
+            continue
+        u = edge[0]
+        v = edge[1] if len(edge) > 1 else edge[0]
+        if u != v:
+            G.add_edge(u, v)
+    return G
+
+
+def _snapshot_counts(snapshot):
+    """Return (node_count, total_edge_count_including_multiplicities) for
+    a log snapshot dict. Used to label Contributing Graphs cards."""
+    if not isinstance(snapshot, dict):
+        return 0, 0
+    n = len(snapshot.get("nodes", []) or [])
+    m = 0
+    for edge in snapshot.get("edges", []) or []:
+        if not edge:
+            continue
+        mult = edge[2] if len(edge) > 2 else 1
+        m += mult
+    for loop in snapshot.get("loops", []) or []:
+        if not loop:
+            continue
+        mult = loop[1] if len(loop) > 1 else 1
+        m += mult
+    return n, m
 
 
 def _synth_graph_to_nx(g_obj):
@@ -392,6 +578,9 @@ EVENT_COLORS = {
     "verify": "#2e7d32",
     "theorem6": "#e65100",
     "hierarchical": "#e65100",
+    "chord_rule": "#ad1457",
+    "unified_formula": "#8e24aa",
+    "kmatching_formula": "#d81b60",
     "synthesis_start": "#9e9e9e",
     "candidate_filter": "#9e9e9e",
 }
@@ -406,7 +595,9 @@ HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <title>Tutte Engine Visualizer</title>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/dist/vis-network.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/graphology@0.25.4/dist/graphology.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/graphology-library@0.8.0/dist/graphology-library.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/sigma@3.0.1/dist/sigma.min.js"></script>
   <style>
     * {{ box-sizing: border-box; }}
     body {{ font-family: 'SF Mono', 'Menlo', 'Consolas', monospace; margin: 0; padding: 16px; background: #fafafa; }}
@@ -434,7 +625,15 @@ HTML = """<!DOCTYPE html>
     .summary tr:hover {{ background: #fafafa; }}
     .summary .pct-bar {{ display: inline-block; height: 6px; border-radius: 3px; vertical-align: middle; }}
     .minors-grid {{ display: flex; flex-wrap: wrap; gap: 8px; }}
-    .minor-card {{ flex: 1; min-width: 200px; border: 1px solid #eee; border-radius: 4px; padding: 6px; }}
+    .minor-card {{ flex: 1; min-width: 200px; border: 1px solid #eee; border-radius: 4px; padding: 6px; transition: background 0.1s, border-color 0.1s; }}
+    .minor-card.has-provenance {{ border-color: #ff5722; cursor: pointer; }}
+    .minor-card.has-provenance:hover {{ background: #fff3e0; }}
+    .minor-card.prov-active {{ background: #ffe0b2; border-color: #d84315; border-width: 2px; padding: 5px; }}
+    .prov-badge {{ display: inline-block; background: #ff5722; color: white; font-size: 9px; font-weight: bold; padding: 1px 5px; border-radius: 8px; margin-left: 4px; vertical-align: middle; cursor: pointer; user-select: none; }}
+    .prov-badge.active {{ background: #d84315; box-shadow: 0 0 0 2px #ffab91; }}
+    .active-subgraph-chip {{ display: inline-block; color: white; font-size: 10px; font-family: monospace; padding: 2px 7px 2px 8px; border-radius: 10px; margin: 2px 4px 2px 0; cursor: pointer; user-select: none; }}
+    .active-subgraph-chip .x {{ margin-left: 6px; opacity: 0.7; }}
+    .active-subgraph-chip:hover .x {{ opacity: 1; }}
     .minor-label {{ font-size: 11px; font-weight: bold; margin-bottom: 4px; }}
     input[type=number] {{ font-family: inherit; padding: 3px 6px; width: 60px; border: 1px solid #ccc; border-radius: 3px; }}
     input[type=text] {{ font-family: inherit; padding: 3px 6px; width: 100%; border: 1px solid #ccc; border-radius: 3px; }}
@@ -487,7 +686,7 @@ HTML = """<!DOCTYPE html>
           <div class="ctrl-indent"><input type="text" name="edges" value="{edges_val}" placeholder="0-1,1-2,2-3,3-0" style="width:260px" {edges_disabled}></div>
           <label class="ctrl-radio"><input type="radio" name="source" value="random" {random_checked}> Random graph</label>
           <div class="ctrl-indent">
-            nodes=<input type="number" name="rand_n" value="{rand_n_val}" placeholder="12" min="1" max="200" style="width:55px" {random_disabled}>
+            nodes=<input type="number" name="rand_n" value="{rand_n_val}" placeholder="12" min="1" max="50000" style="width:65px" {random_disabled}>
             edges=<input type="number" name="rand_m" value="{rand_m_val}" placeholder="12" min="0" style="width:55px" {random_disabled}>
             <span id="rand-max-edges" style="color:#999;font-size:11px">{rand_max_hint}</span>
           </div>
@@ -507,7 +706,10 @@ HTML = """<!DOCTYPE html>
             <label><input type="checkbox" name="debug" value="1" {debug_checked}> Debug logging</label>
           </div>
           <div class="ctrl-row">
-            <label title="Unchecking skips the direct rainbow-table lookup for the target graph only. Sub-problems still consult the table."><input type="checkbox" name="use_lookup" value="1" {use_lookup_checked}> Lookup target in rainbow table</label>
+            <label title="Master switch — when off the engine consults no rainbow-table entries (top-level OR sub-problems). All polynomials are computed from scratch."><input type="checkbox" id="use-table-cb" name="use_table" value="1" {use_table_checked}> Use lookup table</label>
+          </div>
+          <div class="ctrl-row" style="padding-left:18px;">
+            <label id="use-lookup-label" title="When the master switch is on, also consult the table for the top-level target graph by canonical key. Off → only sub-problems consult the table."><input type="checkbox" id="use-lookup-cb" name="use_lookup" value="1" {use_lookup_checked} {use_lookup_disabled}> Lookup target by canonical key</label>
           </div>
           <div class="ctrl-row" style="margin-top:12px;">
             <button type="submit" class="run-btn" style="background:#555;">Load Graph</button>
@@ -622,8 +824,17 @@ HTML = """<!DOCTYPE html>
   <!-- Row 1: Input Graph + Contributing Graphs side by side -->
   <div class="graphs-row">
     <div class="panel">
-      <h2>Input Graph — {graph_desc}</h2>
+      <h2 style="display:flex;align-items:center;justify-content:space-between;">
+        <span>Input Graph — {graph_desc}</span>
+        <span style="font-weight:normal;">
+          <button type="button" id="clear-highlights" title="Clear all active sub-graph highlights." style="display:none;">&#x2715; subgraphs</button>
+          <button type="button" id="refresh-target" title="Destroy and recreate the renderer (use after WebGL glitches).">&#x23FB;</button>
+          <button type="button" id="relayout-target" title="Run ForceAtlas2 layout on the target graph (uses Barnes-Hut for large graphs).">&#x21BA;</button>
+          <span id="relayout-status" style="font-size:11px;color:#888;margin-left:6px;"></span>
+        </span>
+      </h2>
       <div class="meta">{input_meta}</div>
+      <div id="active-subgraph-labels" style="margin:4px 0;display:none;"></div>
       <div id="input-graph" class="graph-box"></div>
     </div>
     <div class="panel">
@@ -664,11 +875,13 @@ HTML = """<!DOCTYPE html>
   <div class="panel section">
     <h2>Step Graph <span id="step-label" style="font-weight:normal;color:#888;font-size:12px;"></span></h2>
     <div class="controls" id="step-controls">
-      <button type="button" id="step-first">&#x21E4; First</button>
-      <button type="button" id="step-prev">Prev</button>
-      <button type="button" id="step-play">Play</button>
-      <button type="button" id="step-next">Next</button>
-      <button type="button" id="step-last">Last &#x21E5;</button>
+      <button type="button" id="step-first" title="Jump to first graph step.">&#x23EE;&#xFE0E;</button>
+      <button type="button" id="step-prev" title="Previous graph step.">&#x23EA;&#xFE0E;</button>
+      <button type="button" id="step-play" title="Auto-advance through steps.">&#x25B6;&#xFE0E;</button>
+      <button type="button" id="step-next" title="Next graph step.">&#x23E9;&#xFE0E;</button>
+      <button type="button" id="step-last" title="Jump to last graph step.">&#x23ED;&#xFE0E;</button>
+      <button type="button" id="step-relayout" title="Re-run ForceAtlas2 on the currently-displayed step graph.">&#x21BA;</button>
+      <button type="button" id="step-refresh" title="Destroy and recreate the step renderer (use after WebGL glitches).">&#x23FB;</button>
       <span style="color:#666;margin-left:8px">interval</span>
       <input type="number" id="step-interval" value="500" min="50" max="10000" step="50" style="width:70px">ms
       <span id="step-graph-count" style="color:#888;margin-left:12px;"></span>
@@ -678,7 +891,33 @@ HTML = """<!DOCTYPE html>
 
   <script>
     var EVENT_COLORS = {event_colors_json};
-    var opts = {{ edges: {{ smooth: false }}, physics: {{ enabled: false }} }};
+    // Sigma-specific utilities shared by all graph panels.
+    function _sigmaNodeSize(n) {{
+      if (n <= 100) return 8.0;
+      if (n <= 1000) return 4.0;
+      if (n <= 10000) return 2.0;
+      return 1.0;
+    }}
+    function _sigmaSettings(order) {{
+      return {{
+        renderLabels: order <= 1000,
+        labelDensity: 0.5,
+        labelGridCellSize: 60,
+        labelRenderedSizeThreshold: 6,
+        defaultEdgeColor: '#b0b0b0',
+        minCameraRatio: 0.05,
+        maxCameraRatio: 20,
+      }};
+    }}
+    // Cache for Sigma instances attached to minor cards so we can free WebGL
+    // contexts when the contributing-graphs panel re-renders.
+    window._minorSigmas = window._minorSigmas || [];
+    function _killMinorSigmas() {{
+      (window._minorSigmas || []).forEach(function(s) {{
+        try {{ s.kill(); }} catch (e) {{}}
+      }});
+      window._minorSigmas = [];
+    }}
     var _es = null;  // current EventSource
     var _engineTimerId = null;
     var _engineStartedAt = 0;
@@ -714,6 +953,25 @@ HTML = """<!DOCTYPE html>
     window.addEventListener('DOMContentLoaded', function() {{
       // Render input graph
       {input_graph_script}
+
+      // Parent/child checkbox: when "Use lookup table" is unchecked,
+      // disable "Lookup target by canonical key" — the child option
+      // is meaningless without the parent. When the parent re-enables,
+      // the child re-enables (preserving its prior checked state).
+      var _useTableCb = document.getElementById('use-table-cb');
+      var _useLookupCb = document.getElementById('use-lookup-cb');
+      var _useLookupLabel = document.getElementById('use-lookup-label');
+      if (_useTableCb && _useLookupCb) {{
+        function _syncChild() {{
+          var on = _useTableCb.checked;
+          _useLookupCb.disabled = !on;
+          if (_useLookupLabel) {{
+            _useLookupLabel.style.opacity = on ? '' : '0.5';
+          }}
+        }}
+        _useTableCb.addEventListener('change', _syncChild);
+        _syncChild();
+      }}
     }});
 
     function stopEngine() {{
@@ -730,6 +988,14 @@ HTML = """<!DOCTYPE html>
       // Show stop button, hide run button
       document.getElementById('run-engine-btn').style.display = 'none';
       document.getElementById('stop-engine-btn').style.display = '';
+
+      // Free WebGL contexts held by minor cards and step viewer from a
+      // prior run before we clear the containers.
+      _killMinorSigmas();
+      if (window._stepSigmaInstance) {{
+        try {{ window._stepSigmaInstance.kill(); }} catch (e) {{}}
+        window._stepSigmaInstance = null;
+      }}
 
       // Reset UI
       var tbody = document.getElementById('timeline-table');
@@ -785,12 +1051,17 @@ def _run_engine_thread(graph, table, timeout_sec, engine_type, skip_target_looku
                 from tutte.synthesis.hybrid import HybridSynthesisEngine
                 engine = HybridSynthesisEngine(table=table)
                 engine.skip_target_lookup = skip_target_lookup
+                # Promote cache entries to the rainbow table at
+                # end-of-synthesis so cache_hits become lookup_hits
+                # on the next visualizer run.
+                engine.promote_cache_on_finish = True
                 hybrid_result = engine.synthesize(graph)
                 result_holder[0] = SynthesisResult(
                     polynomial=hybrid_result.polynomial,
                     recipe=hybrid_result.recipe,
                     verified=hybrid_result.verified,
                     method=hybrid_result.method,
+                    tiles_used=getattr(hybrid_result, 'tiles_used', 0),
                     minors_used=getattr(hybrid_result, 'minors_used', set()),
                     synthesized_minors=getattr(hybrid_result, 'synthesized_minors', set()),
                     synthesized_graphs=getattr(hybrid_result, 'synthesized_graphs', {}),
@@ -808,6 +1079,7 @@ def _run_engine_thread(graph, table, timeout_sec, engine_type, skip_target_looku
             else:
                 engine = SynthesisEngine(table=table)
                 engine.skip_target_lookup = skip_target_lookup
+                engine.promote_cache_on_finish = True
                 result_holder[0] = engine.synthesize(graph)
         except Exception as e:
             error_holder[0] = str(e)
@@ -833,32 +1105,47 @@ def _run_engine_thread(graph, table, timeout_sec, engine_type, skip_target_looku
 def stream():
     """SSE endpoint: streams events as they're recorded, then final result."""
     timeout_sec = request.args.get("timeout", 60, type=int)
-    engine_type = request.args.get("engine", "synthesis")
+    engine_type = request.args.get("engine", "hybrid")
     threshold_ms = request.args.get("threshold", 100, type=float)
     debug = request.args.get("debug", "0") == "1"
     # form_submitted sentinel distinguishes "no form submit" from "unchecked"
     form_submitted = request.args.get("form_submitted", "0") == "1"
     if form_submitted:
+        use_table = request.args.get("use_table", "0") == "1"
         use_lookup = request.args.get("use_lookup", "0") == "1"
     else:
+        use_table = True
         use_lookup = True
+    # Child can't be on without parent.
+    if not use_table:
+        use_lookup = False
 
-    G_nx, graph_desc = parse_graph(request.args)
+    G_nx, graph_desc, _source_hint = parse_graph(request.args)
     if G_nx is None:
         def error_stream():
             yield f"data: {json.dumps({'type': 'error', 'message': graph_desc or 'No graph'})}\n\n"
         return Response(error_stream(), mimetype="text/event-stream")
 
     graph = Graph.from_networkx(G_nx)
-    # Always load the full table; `skip_target_lookup` only gates the
-    # top-level lookup for the input graph, leaving sub-problem lookups on.
-    table = load_default_table()
+    # Master switch: when use_table is False, pass an empty
+    # RainbowTable so neither the top-level nor sub-problem lookups
+    # find anything. `skip_target_lookup` then only matters when the
+    # table is non-empty.
+    if use_table:
+        table = load_default_table()
+    else:
+        from tutte.lookup.core import RainbowTable
+        table = RainbowTable()
     skip_target_lookup = not use_lookup
 
-    # Reset log, set min_level, enable graph snapshot capture for the viewer.
+    # Reset log and enable graph snapshot capture for the viewer. We
+    # always record at DEBUG level so cache_hit + other DEBUG-level
+    # events (and their graph snapshots) are surfaced in Contributing
+    # Graphs. The `debug` URL param controls UI filtering, not capture
+    # level — the client can hide DEBUG rows without losing snapshots.
     reset_log()
     log_ref = get_log()
-    log_ref.min_level = LogLevel.DEBUG if debug else LogLevel.INFO
+    log_ref.min_level = LogLevel.DEBUG
     log_ref.capture_graphs = True
     global _engine_state
     with _engine_lock:
@@ -949,12 +1236,24 @@ def stream():
                     timed_out = _engine_state["timed_out"]
                     elapsed = _engine_state["elapsed"]
 
+                # Re-send the final snapshot dict so the client picks
+                # up provenance that was added AFTER the snapshot was
+                # first streamed (e.g., the input graph's snapshot is
+                # captured at SYNTHESIS_START with no provenance, then
+                # later cells/inter-cell records augment it). Cheap
+                # because snapshots are small dicts.
+                final_snapshots = {
+                    k: snap for k, snap in log._graph_snapshots.items()
+                    if snap.get("provenance")
+                }
+
                 final = {
                     "type": "done",
                     "timed_out": timed_out,
                     "elapsed": elapsed,
                     "event_count": sent_count,
                     "threshold_ms": threshold_ms,
+                    "snapshots_with_provenance": final_snapshots,
                 }
 
                 if timed_out:
@@ -981,62 +1280,178 @@ def stream():
                         '<span style="color:#2e7d32">YES</span>' if result.verified
                         else '<span style="color:#c62828">NO</span>'
                     )
-                    final["result_html"] = (
-                        f'<dl class="result-grid">'
-                        f'<dt>Method</dt><dd>{result.method}</dd>'
-                        f'<dt>Verified</dt><dd>{verified_str}</dd>'
-                        f'<dt>Tiles</dt><dd>{result.tiles_used}</dd>'
-                        f'<dt>T(1,1)</dt><dd>{t11}</dd>'
-                        f'<dt>Time</dt><dd>{elapsed:.3f}s</dd>'
-                        f'<dt>Polynomial</dt><dd class="poly">{poly_html}</dd>'
-                        f'</dl>'
-                    )
-                    # Build contributing graphs split by provenance:
-                    #  - minors_lookup: entries the engine actually pulled from the rainbow table.
-                    #  - minors_synthesized: sub-graphs the engine synthesized from scratch
-                    #    during this run (may or may not also exist in the table).
-                    lookup_list = []
-                    for key in sorted(result.minors_used or []):
-                        entry = table.get_entry_by_key(key)
-                        if entry is None:
-                            continue
-                        card = {"name": entry.name, "edges": entry.edge_count}
-                        minor_nx = graph_from_entry(entry)
-                        if minor_nx is not None:
-                            nodes_json, edges_json = vis_data_json(minor_nx)
-                            card["nodes"] = nodes_json
-                            card["edges_data"] = edges_json
-                        lookup_list.append(card)
-                        if len(lookup_list) >= 12:
-                            break
+                    # Deferred: Tiles + Sub-graphs are computed after
+                    # the contributing-graphs lists are built below, so
+                    # the result_html is assembled at that point.
+                    _result_meta = {
+                        "method": result.method,
+                        "verified_str": verified_str,
+                        "tiles": result.tiles_used,
+                        "t11": t11,
+                        "elapsed": elapsed,
+                        "poly_html": poly_html,
+                    }
+                    # Build contributing graphs from the EVENT STREAM so
+                    # every unique graph that appeared in the Timeline /
+                    # Step Graph is surfaced here too:
+                    #   lookup_hit + cache_hit → "From Lookup Table"
+                    #   everything else → "Synthesized During Run"
+                    #
+                    # Dedupe by *structural signature* rather than canonical
+                    # key: Graph.canonical_key() and MultiGraph.canonical_key()
+                    # differ for the same underlying structure, so without
+                    # normalization treewidth_dp emits two cards for the same
+                    # graph (engine's simple Graph + treewidth.py's MultiGraph).
+                    # The structural signature is derived from the serialized
+                    # snapshot (sorted nodes + sorted multi-edges + sorted
+                    # loops) and collapses both representations to one.
+                    LOOKUP_EVENT_TYPES = {"lookup_hit", "cache_hit"}
 
-                    synth_list = []
-                    synthesized_graphs = getattr(result, 'synthesized_graphs', {}) or {}
-                    synthesized_minors = getattr(result, 'synthesized_minors', set()) or set()
-                    # Skip ones that came from the lookup table — those appear in lookup_list.
-                    for key in sorted(synthesized_minors - (result.minors_used or set())):
-                        g_obj = synthesized_graphs.get(key)
-                        if g_obj is None:
+                    def _struct_sig(k: str) -> str:
+                        """Return a structural signature derived from the log
+                        snapshot, so simple Graph and MultiGraph of the same
+                        underlying structure map to the same bucket."""
+                        snap = log.graph_snapshot(k)
+                        if not isinstance(snap, dict):
+                            return k  # fallback: unique per canonical_key
+                        nodes = tuple(sorted(snap.get("nodes", []) or []))
+                        edges = []
+                        for e in snap.get("edges", []) or []:
+                            if not e:
+                                continue
+                            u = e[0]
+                            v = e[1] if len(e) > 1 else e[0]
+                            mult = e[2] if len(e) > 2 else 1
+                            edges.append((min(u, v), max(u, v), mult))
+                        loops = []
+                        for ln in snap.get("loops", []) or []:
+                            if not ln:
+                                continue
+                            n = ln[0]
+                            mult = ln[1] if len(ln) > 1 else 1
+                            loops.append((n, mult))
+                        return repr((nodes, tuple(sorted(edges)), tuple(sorted(loops))))
+
+                    lookup_keys_ordered: list = []
+                    synth_keys_ordered: list = []
+                    lookup_sigs: dict = {}   # sig → key (first-seen)
+                    synth_sigs: dict = {}
+
+                    for ev in log.events:
+                        k = ev.graph_key
+                        if not k:
                             continue
-                        minor_nx = _synth_graph_to_nx(g_obj)
-                        nc = getattr(g_obj, 'node_count', lambda: '?')()
-                        ec = getattr(g_obj, 'edge_count', lambda: '?')()
-                        name = (
-                            f"{type(g_obj).__name__} {nc}n {ec}e "
-                            f"[{key[:8]}]"
-                        )
-                        card = {"name": name, "edges": ec}
+                        sig = _struct_sig(k)
+                        etype = ev.event_type.value
+                        if etype in LOOKUP_EVENT_TYPES:
+                            if sig not in lookup_sigs:
+                                lookup_sigs[sig] = k
+                                lookup_keys_ordered.append(k)
+                            # If previously bucketed as synth, promote to
+                            # lookup (lookup/cache wins).
+                            if sig in synth_sigs:
+                                old_k = synth_sigs.pop(sig)
+                                synth_keys_ordered = [
+                                    kk for kk in synth_keys_ordered if kk != old_k
+                                ]
+                        else:
+                            if sig in lookup_sigs:
+                                continue
+                            if sig not in synth_sigs:
+                                synth_sigs[sig] = k
+                                synth_keys_ordered.append(k)
+
+                    # Augment with any rainbow-table entries from
+                    # result.minors_used that didn't fire a graph-bearing
+                    # event (defensive: keeps the old behavior intact).
+                    for k in sorted(result.minors_used or []):
+                        sig = _struct_sig(k)
+                        if sig not in lookup_sigs and sig not in synth_sigs:
+                            lookup_sigs[sig] = k
+                            lookup_keys_ordered.append(k)
+
+                    def _provenance_count(snap) -> int:
+                        if not isinstance(snap, dict):
+                            return 0
+                        prov = snap.get("provenance") or []
+                        return len(prov)
+
+                    def _lookup_card(k: str) -> dict:
+                        entry = table.get_entry_by_key(k)
+                        snap = log.graph_snapshot(k)
+                        prov_n = _provenance_count(snap)
+                        if entry is not None:
+                            card = {"name": entry.name, "edges": entry.edge_count, "key": k, "provenance_count": prov_n}
+                            minor_nx = graph_from_entry(entry)
+                            if minor_nx is not None:
+                                card["sigma_json"] = sigma_graph_json(minor_nx)
+                            return card
+                        # No rainbow-table entry: render from snapshot.
+                        nc, ec = _snapshot_counts(snap)
+                        name = f"cached {nc}n {ec}e [{k[:8]}]"
+                        card = {"name": name, "edges": ec, "key": k, "provenance_count": prov_n}
+                        minor_nx = _snapshot_to_nx(snap) if snap else None
                         if minor_nx is not None:
-                            nodes_json, edges_json = vis_data_json(minor_nx)
-                            card["nodes"] = nodes_json
-                            card["edges_data"] = edges_json
-                        synth_list.append(card)
-                        if len(synth_list) >= 24:
-                            break
+                            card["sigma_json"] = sigma_graph_json(minor_nx)
+                        return card
+
+                    def _synth_card(k: str) -> dict:
+                        # Prefer the richer graph object from
+                        # _synth_accum_graphs when available (supports the
+                        # existing `_synth_graph_to_nx` path); fall back to
+                        # the log snapshot otherwise.
+                        synthesized_graphs = getattr(
+                            result, 'synthesized_graphs', {}
+                        ) or {}
+                        g_obj = synthesized_graphs.get(k)
+                        snap = log.graph_snapshot(k)
+                        prov_n = _provenance_count(snap)
+                        if g_obj is not None:
+                            minor_nx = _synth_graph_to_nx(g_obj)
+                            nc = getattr(g_obj, 'node_count', lambda: '?')()
+                            ec = getattr(g_obj, 'edge_count', lambda: '?')()
+                            name = (
+                                f"{type(g_obj).__name__} {nc}n {ec}e "
+                                f"[{k[:8]}]"
+                            )
+                            card = {"name": name, "edges": ec, "key": k, "provenance_count": prov_n}
+                            if minor_nx is not None:
+                                card["sigma_json"] = sigma_graph_json(minor_nx)
+                            return card
+                        nc, ec = _snapshot_counts(snap)
+                        name = f"snapshot {nc}n {ec}e [{k[:8]}]"
+                        card = {"name": name, "edges": ec, "key": k, "provenance_count": prov_n}
+                        minor_nx = _snapshot_to_nx(snap) if snap else None
+                        if minor_nx is not None:
+                            card["sigma_json"] = sigma_graph_json(minor_nx)
+                        return card
+
+                    lookup_list = [_lookup_card(k) for k in lookup_keys_ordered]
+                    synth_list = [_synth_card(k) for k in synth_keys_ordered]
 
                     final["minors"] = lookup_list  # back-compat: legacy key
                     final["minors_lookup"] = lookup_list
                     final["minors_synthesized"] = synth_list
+
+                    # Build result_html with both Tiles (top-level cell
+                    # partition count) and Sub-graphs (total unique graphs
+                    # contributing to the synthesis, including all cache
+                    # and lookup hits).
+                    total_subgraphs = len(lookup_list) + len(synth_list)
+                    final["result_html"] = (
+                        f'<dl class="result-grid">'
+                        f'<dt>Method</dt><dd>{_result_meta["method"]}</dd>'
+                        f'<dt>Verified</dt><dd>{_result_meta["verified_str"]}</dd>'
+                        f'<dt>Tiles</dt><dd>{_result_meta["tiles"]}'
+                        f' <span style="color:#888;font-size:11px">(top-level cell partition)</span></dd>'
+                        f'<dt>Sub-graphs</dt><dd>{total_subgraphs}'
+                        f' <span style="color:#888;font-size:11px">'
+                        f'({len(lookup_list)} lookup/cache + {len(synth_list)} synthesized)</span></dd>'
+                        f'<dt>T(1,1)</dt><dd>{_result_meta["t11"]}</dd>'
+                        f'<dt>Time</dt><dd>{_result_meta["elapsed"]:.3f}s</dd>'
+                        f'<dt>Polynomial</dt><dd class="poly">{_result_meta["poly_html"]}</dd>'
+                        f'</dl>'
+                    )
                 else:
                     final["result_html"] = (
                         '<div class="error-banner">Engine returned no result.</div>'
@@ -1083,15 +1498,20 @@ def stream():
 def index():
     timeout_sec = request.args.get("timeout", 60, type=int)
     threshold_ms = request.args.get("threshold", 100, type=float)
-    engine_type = request.args.get("engine", "synthesis")
+    engine_type = request.args.get("engine", "hybrid")
     debug = request.args.get("debug", "0") == "1"
-    # use_lookup defaults to ON. Unchecking the form checkbox submits without
+    # use_table + use_lookup default to ON. Unchecking submits without
     # the param, so we detect form submission via a hidden sentinel.
     form_submitted = request.args.get("form_submitted", "0") == "1"
     if form_submitted:
+        use_table = request.args.get("use_table", "0") == "1"
         use_lookup = request.args.get("use_lookup", "0") == "1"
     else:
+        use_table = True
         use_lookup = True
+    # Child can't be on without parent.
+    if not use_table:
+        use_lookup = False
 
     atlas_val = request.args.get("atlas", "")
     dwave_topo_val = request.args.get("dwave_topo", "zephyr")
@@ -1133,7 +1553,7 @@ def index():
     random_disabled = "" if source == "random" else "disabled"
 
     engine_options = ""
-    for opt in ["synthesis", "hybrid", "algebraic"]:
+    for opt in ["hybrid", "synthesis", "algebraic"]:
         sel = " selected" if opt == engine_type else ""
         engine_options += f'<option value="{opt}"{sel}>{opt}</option>'
 
@@ -1149,10 +1569,12 @@ def index():
         sel = " selected" if topo == dwave_topo_val else ""
         dwave_topo_options += f'<option value="{topo}"{sel}>{label}</option>'
 
-    G_nx, graph_desc = parse_graph(request.args)
+    G_nx, graph_desc, source_hint = parse_graph(request.args)
 
     debug_checked = "checked" if debug else ""
     use_lookup_checked = "checked" if use_lookup else ""
+    use_table_checked = "checked" if use_table else ""
+    use_lookup_disabled = "" if use_table else "disabled"
 
     # Compute server-side labels for D-Wave params
     _dwave_labels = {
@@ -1213,6 +1635,8 @@ def index():
         family_options=family_options, n_val=n_val, m_val=m_val,
         edges_val=edges_val, debug_checked=debug_checked,
         use_lookup_checked=use_lookup_checked,
+        use_table_checked=use_table_checked,
+        use_lookup_disabled=use_lookup_disabled,
         rand_n_val=rand_n_val, rand_m_val=rand_m_val,
         rand_max_hint=rand_max_hint,
     )
@@ -1240,16 +1664,87 @@ def index():
     deg_seq = sorted([d for _, d in G_nx.degree()], reverse=True)
     circuit_rank = m - n + (nx.number_connected_components(G_nx) if n > 0 else 0)
 
+    # Cap the rendered degree sequence so HTML stays compact on huge graphs.
+    if len(deg_seq) > 40:
+        _deg_display = f"{deg_seq[:20]} … {deg_seq[-20:]} (len {len(deg_seq)})"
+    else:
+        _deg_display = str(deg_seq)
     input_meta = (
         f"Nodes: {n} &nbsp; Edges: {m} &nbsp; Connected: {connected}<br>"
-        f"Degree seq: {deg_seq}<br>"
+        f"Degree seq: {_deg_display}<br>"
         f"Circuit rank: {circuit_rank}"
     )
 
-    # Build input graph vis-network script
+    # Build input-graph render script (Sigma.js + graphology) and embed
+    # the target canonical key + positions so the step viewer can align
+    # matching snapshots to the same layout.
+    #
+    # For large graphs we skip canonical_key — it runs Weisfeiler-Lehman
+    # on the full graph, which is seconds-to-minutes at Z(12,4) scale.
+    # Losing the key means the step viewer just can't skip layout work on
+    # the first snapshot; the visualizer still works.
+    _KEY_NODE_THRESHOLD = 1500
     input_graph_script = ""
     if n > 0:
-        input_graph_script = small_graph_vis(G_nx, "input-graph")
+        if n <= _KEY_NODE_THRESHOLD:
+            try:
+                _tutte_target = Graph.from_networkx(G_nx)
+                _target_key = _tutte_target.canonical_key()
+            except Exception:
+                _target_key = None
+        else:
+            _target_key = None
+        _target_pos = compute_layout(G_nx, source_hint=source_hint)
+        _render_snippet = sigma_graph_vis(
+            G_nx, "input-graph",
+            source_hint=source_hint, pos=_target_pos,
+            register_as_target=True,
+        )
+        # Only embed the positions dict when we also have a canonical key
+        # to match snapshots against — otherwise nothing in renderStep can
+        # use it, and duplicating 4,800+ coordinates in HTML just bloats
+        # the page.
+        if _target_key is not None:
+            _pos_js = {str(k): [float(v[0]), float(v[1])] for k, v in _target_pos.items()}
+            _pos_embed = f"window._inputGraphPositions = {json.dumps(_pos_js)};\n"
+        else:
+            _pos_embed = "window._inputGraphPositions = null;\n"
+        input_graph_script = (
+            f"window._inputGraphKey = {json.dumps(_target_key)};\n"
+            f"{_pos_embed}"
+            f"window._targetLayoutSource = {json.dumps(source_hint)};\n"
+            f"{_render_snippet}\n"
+            # Re-layout button — runs FA2 (Barnes-Hut for large graphs) on the
+            # target Sigma instance. Disabled if graphology-library is missing.
+            "var _rlBtn = document.getElementById('relayout-target');\n"
+            "var _rlStatus = document.getElementById('relayout-status');\n"
+            "if (_rlBtn) {\n"
+            "  _rlBtn.addEventListener('click', function() {\n"
+            "    if (!window._targetGraph || !window._targetSigma) return;\n"
+            "    if (!window.graphologyLibrary || !window.graphologyLibrary.layoutForceAtlas2) {\n"
+            "      _rlStatus.textContent = 'graphology-library not loaded';\n"
+            "      return;\n"
+            "    }\n"
+            "    _rlBtn.disabled = true; _rlStatus.textContent = 'laying out…';\n"
+            "    setTimeout(function() {\n"
+            "      var t0 = performance.now();\n"
+            "      var n = window._targetGraph.order;\n"
+            "      var bh = n >= 1000;\n"
+            "      window.graphologyLibrary.layoutForceAtlas2.assign(\n"
+            "        window._targetGraph,\n"
+            "        {iterations: n >= 5000 ? 50 : 100,\n"
+            "         settings: {barnesHutOptimize: bh, scalingRatio: 10,\n"
+            "                    gravity: 1, strongGravityMode: false,\n"
+            "                    slowDown: 1, adjustSizes: false}}\n"
+            "      );\n"
+            "      window._targetSigma.refresh();\n"
+            "      var dt = (performance.now() - t0) / 1000;\n"
+            "      _rlStatus.textContent = 'done in ' + dt.toFixed(2) + 's';\n"
+            "      _rlBtn.disabled = false;\n"
+            "    }, 10);\n"
+            "  });\n"
+            "}\n"
+        )
 
     # Build SSE script — connects to /stream with the same query params
     sse_script = """
@@ -1267,8 +1762,92 @@ def index():
       var graphEventIdx = [];              // indices (into allEvents) of events with graph_key
       var stepSnapshots = {};              // canonical_key -> {nodes, edges, loops}
       var stepCursor = -1;                 // position within graphEventIdx
-      var stepNetwork = null;
+      var stepSigma = null;                // current Sigma instance
       var playTimer = null;
+
+      function _buildStepGraph(snap) {
+        var g = new graphology.Graph({multi: true, allowSelfLoops: true});
+        var size = _sigmaNodeSize(snap.nodes.length);
+        snap.nodes.forEach(function(id) {
+          var loopCount = 0;
+          if (snap.loops) {
+            for (var i = 0; i < snap.loops.length; i++) {
+              if (snap.loops[i][0] === id) { loopCount = snap.loops[i][1] || 1; break; }
+            }
+          }
+          g.addNode(id, {
+            label: loopCount > 0 ? (String(id) + ' (loop×' + loopCount + ')') : String(id),
+            size: size,
+            color: loopCount > 0 ? '#e65100' : '#4f8ef7',
+          });
+        });
+        var eid = 0;
+        snap.edges.forEach(function(e) {
+          var mult = e[2] || 1;
+          var thickness = 1 + 0.5 * (mult - 1);
+          g.addEdgeWithKey('e' + (eid++), e[0], e[1],
+            {size: thickness, color: mult > 1 ? '#c62828' : '#b0b0b0'});
+        });
+        if (snap.loops) {
+          snap.loops.forEach(function(l) {
+            g.addEdgeWithKey('l' + (eid++), l[0], l[0],
+              {size: 1, color: '#e65100'});
+          });
+        }
+        return g;
+      }
+
+      function _assignStepPositions(g, key) {
+        // If this snapshot matches the input graph, use the server-computed
+        // layout so the visual stays coherent with the target panel.
+        if (key && window._inputGraphKey && key === window._inputGraphKey &&
+            window._inputGraphPositions) {
+          var positioned = 0;
+          g.forEachNode(function(node) {
+            var p = window._inputGraphPositions[String(node)];
+            if (p) {
+              g.setNodeAttribute(node, 'x', p[0]);
+              g.setNodeAttribute(node, 'y', p[1]);
+              positioned += 1;
+            }
+          });
+          if (positioned === g.order) return;
+        }
+        // Otherwise: random seed + short FA2 pass for readability.
+        if (window.graphologyLibrary && window.graphologyLibrary.layout &&
+            window.graphologyLibrary.layout.random) {
+          window.graphologyLibrary.layout.random.assign(g);
+        } else {
+          g.forEachNode(function(node) {
+            g.setNodeAttribute(node, 'x', Math.random());
+            g.setNodeAttribute(node, 'y', Math.random());
+          });
+        }
+        if (window.graphologyLibrary && window.graphologyLibrary.layoutForceAtlas2) {
+          var n = g.order;
+          // Cap FA2 work on large intermediate snapshots — a few iterations
+          // produce a readable layout; deeper settling costs seconds.
+          var iters = n >= 2000 ? 20 : (n >= 500 ? 40 : 80);
+          window.graphologyLibrary.layoutForceAtlas2.assign(g, {
+            iterations: iters,
+            settings: {barnesHutOptimize: n >= 1000, scalingRatio: 10, gravity: 1},
+          });
+        }
+      }
+
+      function _snapSummary(snap) {
+        // Returns (node_count, edge_count_including_mults, loop_count).
+        var nc = (snap.nodes || []).length;
+        var ec = 0;
+        (snap.edges || []).forEach(function(e) {
+          ec += e.length > 2 ? e[2] : 1;
+        });
+        var lc = 0;
+        (snap.loops || []).forEach(function(l) {
+          lc += l.length > 1 ? l[1] : 1;
+        });
+        return {n: nc, e: ec, l: lc};
+      }
 
       function renderStep(idx) {
         if (graphEventIdx.length === 0) {
@@ -1281,45 +1860,35 @@ def index():
         var evIdx = graphEventIdx[idx];
         var ev = allEvents[evIdx];
         var snap = stepSnapshots[ev.graph_key];
-        document.getElementById('step-label').textContent =
+        var label =
           'event #' + ev.index + ' · ' + ev.event_type + ' · ' + ev.module +
           ' · ' + (idx + 1) + '/' + graphEventIdx.length;
+        if (snap) {
+          var sum = _snapSummary(snap);
+          var keyPrefix = ev.graph_key ? ev.graph_key.substring(0, 10) : '';
+          label += ' · ' + sum.n + 'n ' + sum.e + 'e';
+          if (sum.l > 0) label += ' ' + sum.l + 'loops';
+          if (keyPrefix) label += ' · hash ' + keyPrefix;
+        }
+        document.getElementById('step-label').textContent = label;
+        var container = document.getElementById('step-graph');
         if (!snap) {
-          document.getElementById('step-graph').innerHTML =
+          if (stepSigma) { try { stepSigma.kill(); } catch (e) {} stepSigma = null; }
+          container.innerHTML =
             '<div class="meta" style="padding:12px">snapshot not yet received</div>';
           return;
         }
-        var nodes = snap.nodes.map(function(id) {
-          return {id: id, label: String(id)};
-        });
-        var edges = [];
-        var eid = 0;
-        snap.edges.forEach(function(e) {
-          var mult = e[2] || 1;
-          for (var k = 0; k < mult; k++) {
-            edges.push({id: 'e' + (eid++), from: e[0], to: e[1],
-                        smooth: mult > 1 ? {type: 'curvedCW', roundness: 0.2 * k} : false});
-          }
-        });
-        if (snap.loops) {
-          snap.loops.forEach(function(l) {
-            var mult = l[1] || 1;
-            for (var k = 0; k < mult; k++) {
-              edges.push({id: 'l' + (eid++), from: l[0], to: l[0],
-                          smooth: {type: 'curvedCW', roundness: 0.3 + 0.1 * k}});
-            }
-          });
-        }
-        var container = document.getElementById('step-graph');
+        var g = _buildStepGraph(snap);
+        _assignStepPositions(g, ev.graph_key);
+        if (stepSigma) { try { stepSigma.kill(); } catch (e) {} stepSigma = null; }
         container.innerHTML = '';
-        stepNetwork = new vis.Network(
-          container,
-          {nodes: new vis.DataSet(nodes), edges: new vis.DataSet(edges)},
-          {edges: {smooth: false}, physics: {enabled: true, stabilization: {iterations: 150}}}
-        );
-        stepNetwork.once('stabilizationIterationsDone', function() {
-          stepNetwork.setOptions({physics: {enabled: false}});
-        });
+        stepSigma = new Sigma(g, container, _sigmaSettings(g.order));
+        window._stepSigmaInstance = stepSigma;
+        // Highlights are driven exclusively by toggled cards in the
+        // Contributing Graphs panel — the Step Graph no longer
+        // auto-highlights on navigation. Re-apply whatever is
+        // currently toggled so the input panel stays in sync.
+        _composeAndApplyHighlight();
       }
 
       function stepPrev() { renderStep(stepCursor - 1); }
@@ -1331,16 +1900,19 @@ def index():
         if (playTimer) {
           clearInterval(playTimer);
           playTimer = null;
-          btn.textContent = 'Play';
+          btn.textContent = '\u25B6\uFE0E';  // ▶︎
+          btn.title = 'Auto-advance through steps.';
           return;
         }
         var intervalMs = parseInt(document.getElementById('step-interval').value) || 500;
-        btn.textContent = 'Pause';
+        btn.textContent = '\u23F8\uFE0E';  // ⏸︎
+        btn.title = 'Pause auto-advance.';
         playTimer = setInterval(function() {
           if (stepCursor + 1 >= graphEventIdx.length) {
             clearInterval(playTimer);
             playTimer = null;
-            btn.textContent = 'Play';
+            btn.textContent = '\u25B6\uFE0E';  // ▶︎
+            btn.title = 'Auto-advance through steps.';
             return;
           }
           renderStep(stepCursor + 1);
@@ -1366,6 +1938,58 @@ def index():
       document.getElementById('step-next').addEventListener('click', stepNext);
       document.getElementById('step-last').addEventListener('click', stepLast);
       document.getElementById('step-play').addEventListener('click', togglePlay);
+      document.getElementById('step-relayout').addEventListener('click', function() {
+        // Force FA2 re-run on the currently-displayed step graph.
+        if (!window._stepSigmaInstance) return;
+        var g = window._stepSigmaInstance.getGraph();
+        if (!g || !window.graphologyLibrary ||
+            !window.graphologyLibrary.layoutForceAtlas2) return;
+        // Reseed random positions so FA2 has non-degenerate starting
+        // state, then run a fresh pass.
+        g.forEachNode(function(n) {
+          g.setNodeAttribute(n, 'x', Math.random());
+          g.setNodeAttribute(n, 'y', Math.random());
+        });
+        var n = g.order;
+        var iters = n >= 2000 ? 40 : (n >= 500 ? 80 : 150);
+        try {
+          window.graphologyLibrary.layoutForceAtlas2.assign(g, {
+            iterations: iters,
+            settings: {barnesHutOptimize: n >= 1000, scalingRatio: 10, gravity: 1},
+          });
+          window._stepSigmaInstance.refresh();
+        } catch (e) { console.error('step re-layout failed', e); }
+      });
+      document.getElementById('step-refresh').addEventListener('click', function() {
+        // Destroy + recreate the step renderer. Useful after the
+        // browser ran out of WebGL contexts (after rendering many
+        // other Sigma instances in the Contributing Graphs panel)
+        // and the step graph appears blank or frozen.
+        if (stepCursor >= 0 && stepCursor < graphEventIdx.length) {
+          renderStep(stepCursor);
+        }
+      });
+      document.getElementById('refresh-target').addEventListener('click', function() {
+        // Destroy + recreate the input-graph renderer. Same use case
+        // as step-refresh: recover from WebGL exhaustion. Also drops
+        // the cached "original colors" since the new instance starts
+        // fresh — without this, the next highlight would diff against
+        // the old (killed) renderer's colors.
+        window._targetOriginalColors = null;
+        if (typeof window._renderInputGraph === 'function') {
+          try {
+            window._renderInputGraph();
+            // Re-apply any active highlights to the fresh renderer.
+            _composeAndApplyHighlight();
+          } catch (e) {
+            console.error('refresh-target failed', e);
+          }
+        }
+      });
+      var _clearHL = document.getElementById('clear-highlights');
+      if (_clearHL) {
+        _clearHL.addEventListener('click', _clearAllProvenanceHighlights);
+      }
 
       function flushBatch() {
         rafScheduled = false;
@@ -1441,7 +2065,264 @@ def index():
         selectTimelineRow(parseInt(row.getAttribute('data-ev-index')));
       });
 
-      function renderMinorsSection(list, containerId, emptyText) {
+      // Highlight palette for target-graph provenance overlay.
+      // Multiple instances cycle through these colors.
+      var _PROV_PALETTE = [
+        '#ff5722', '#43a047', '#1e88e5', '#fdd835',
+        '#8e24aa', '#00897b', '#d81b60', '#3949ab'
+      ];
+
+      // Set of canonical keys whose provenance is currently active
+      // (toggled on by clicking the card or badge). Multiple cards
+      // can be active simultaneously — each contributes its instances
+      // to the highlight, with palette colors cycling across the
+      // composed list.
+      window._activeProvenanceKeys = window._activeProvenanceKeys || new Set();
+      // Maps canonical_key → display label (card name) for active
+      // sub-graphs. Populated when cards render so the input-graph
+      // label area can show "name [hash]" for each active toggle.
+      window._provenanceLabels = window._provenanceLabels || {};
+
+      function _shortKey(k) {
+        return (k && k.length > 8) ? k.substring(0, 8) : (k || '');
+      }
+
+      function _labelForKey(k) {
+        var name = window._provenanceLabels[k];
+        if (name) return name;
+        // Fall back to canonical hash digest (8 chars) when we don't
+        // have a card name registered.
+        return _shortKey(k);
+      }
+
+      function _renderActiveSubgraphLabels() {
+        var box = document.getElementById('active-subgraph-labels');
+        if (!box) return;
+        var keys = Array.from(window._activeProvenanceKeys);
+        if (keys.length === 0) {
+          box.style.display = 'none';
+          box.innerHTML = '';
+          return;
+        }
+        box.style.display = '';
+        // Walk active keys in insertion order; assign palette colors
+        // cumulatively to match the composed provenance order in
+        // _composeAndApplyHighlight.
+        var html = '<span style="font-size:10px;color:#666;margin-right:6px;">Active subgraphs:</span>';
+        var paletteIdx = 0;
+        keys.forEach(function(k) {
+          var snap = stepSnapshots[k];
+          var instCount = (snap && snap.provenance) ? snap.provenance.length : 1;
+          var color = _PROV_PALETTE[paletteIdx % _PROV_PALETTE.length];
+          paletteIdx += instCount;  // step palette by # instances of this card
+          var label = _labelForKey(k);
+          html +=
+            '<span class="active-subgraph-chip" data-prov-chip-key="' + k +
+            '" style="background:' + color +
+            '" title="Click to remove this sub-graph from the highlight set">' +
+              label +
+              '<span class="x">\u2715</span>' +
+            '</span>';
+        });
+        box.innerHTML = html;
+        // Wire chip clicks to toggle off.
+        box.querySelectorAll('[data-prov-chip-key]').forEach(function(el) {
+          el.addEventListener('click', function() {
+            _toggleProvenanceKey(el.getAttribute('data-prov-chip-key'));
+          });
+        });
+      }
+
+      function _composeAndApplyHighlight() {
+        // Walk active keys in the order they were toggled (Set iter
+        // order is insertion order in modern browsers) and concat
+        // each snapshot's provenance instances.
+        var combined = [];
+        window._activeProvenanceKeys.forEach(function(k) {
+          var snap = stepSnapshots[k];
+          if (snap && snap.provenance) {
+            snap.provenance.forEach(function(p) { combined.push(p); });
+          }
+        });
+        if (combined.length === 0) {
+          _clearTargetHighlight(true);
+        } else {
+          _highlightTargetGraph(combined);
+        }
+      }
+
+      function _updateClearHighlightsBtn() {
+        var btn = document.getElementById('clear-highlights');
+        if (!btn) return;
+        btn.style.display = window._activeProvenanceKeys.size > 0 ? '' : 'none';
+      }
+
+      function _clearAllProvenanceHighlights() {
+        if (window._activeProvenanceKeys.size === 0) return;
+        var keys = Array.from(window._activeProvenanceKeys);
+        window._activeProvenanceKeys.clear();
+        keys.forEach(function(key) {
+          document.querySelectorAll('[data-prov-key="' + key + '"]')
+            .forEach(function(el) { el.classList.remove('prov-active'); });
+          document.querySelectorAll('[data-prov-badge-key="' + key + '"]')
+            .forEach(function(el) { el.classList.remove('active'); });
+        });
+        _composeAndApplyHighlight();
+        _updateClearHighlightsBtn();
+        _renderActiveSubgraphLabels();
+      }
+
+      function _toggleProvenanceKey(key) {
+        if (!key) return;
+        var snap = stepSnapshots[key];
+        if (!snap || !snap.provenance) return;
+        if (window._activeProvenanceKeys.has(key)) {
+          window._activeProvenanceKeys.delete(key);
+        } else {
+          window._activeProvenanceKeys.add(key);
+        }
+        // Update visual state on every card with this key.
+        document.querySelectorAll('[data-prov-key="' + key + '"]')
+          .forEach(function(el) {
+            if (window._activeProvenanceKeys.has(key)) {
+              el.classList.add('prov-active');
+            } else {
+              el.classList.remove('prov-active');
+            }
+          });
+        document.querySelectorAll('[data-prov-badge-key="' + key + '"]')
+          .forEach(function(el) {
+            if (window._activeProvenanceKeys.has(key)) {
+              el.classList.add('active');
+            } else {
+              el.classList.remove('active');
+            }
+          });
+        _composeAndApplyHighlight();
+        _updateClearHighlightsBtn();
+        _renderActiveSubgraphLabels();
+      }
+
+      function _highlightTargetGraph(provenanceList) {
+        if (!window._targetGraph || !window._targetSigma) return;
+        // First clear any prior highlight (restores original colors).
+        _clearTargetHighlight(false);
+        if (!provenanceList || !provenanceList.length) {
+          try { window._targetSigma.refresh(); } catch (e) {}
+          return;
+        }
+        var g = window._targetGraph;
+        // Save original colors once so we can revert on clear.
+        if (!window._targetOriginalColors) {
+          window._targetOriginalColors = {nodes: {}, edges: {}};
+          g.forEachNode(function(n, attrs) {
+            window._targetOriginalColors.nodes[String(n)] = attrs.color;
+          });
+          g.forEachEdge(function(e, attrs) {
+            window._targetOriginalColors.edges[e] = attrs.color;
+          });
+        }
+        var nodeHL = {};
+        var edgeHL = {};
+        provenanceList.forEach(function(prov, i) {
+          var color = _PROV_PALETTE[i % _PROV_PALETTE.length];
+          (prov.target_nodes || []).forEach(function(n) {
+            nodeHL[String(n)] = color;
+          });
+          (prov.target_edges || []).forEach(function(e) {
+            edgeHL[String(e[0]) + '|' + String(e[1])] = color;
+            edgeHL[String(e[1]) + '|' + String(e[0])] = color;
+          });
+        });
+        g.forEachNode(function(n) {
+          var c = nodeHL[String(n)];
+          if (c) g.setNodeAttribute(n, 'color', c);
+        });
+        g.forEachEdge(function(e, attrs, source, target) {
+          var c = edgeHL[String(source) + '|' + String(target)];
+          if (c) {
+            g.setEdgeAttribute(e, 'color', c);
+            g.setEdgeAttribute(e, 'size', 2.5);
+          }
+        });
+        try { window._targetSigma.refresh(); } catch (e) {}
+      }
+
+      function _clearTargetHighlight(refresh) {
+        if (!window._targetGraph) return;
+        var g = window._targetGraph;
+        var orig = window._targetOriginalColors;
+        if (orig) {
+          g.forEachNode(function(n) {
+            var c = orig.nodes[String(n)];
+            if (c !== undefined) g.setNodeAttribute(n, 'color', c);
+          });
+          g.forEachEdge(function(e) {
+            var c = orig.edges[e];
+            if (c !== undefined) g.setEdgeAttribute(e, 'color', c);
+            g.setEdgeAttribute(e, 'size', 1.0);
+          });
+        }
+        if (refresh !== false && window._targetSigma) {
+          try { window._targetSigma.refresh(); } catch (e) {}
+        }
+      }
+
+      function _runFA2OnGraph(g) {
+        if (!g || !window.graphologyLibrary ||
+            !window.graphologyLibrary.layoutForceAtlas2) return;
+        g.forEachNode(function(n) {
+          g.setNodeAttribute(n, 'x', Math.random());
+          g.setNodeAttribute(n, 'y', Math.random());
+        });
+        var n = g.order;
+        var iters = n >= 2000 ? 40 : (n >= 500 ? 80 : 150);
+        try {
+          window.graphologyLibrary.layoutForceAtlas2.assign(g, {
+            iterations: iters,
+            settings: {barnesHutOptimize: n >= 1000, scalingRatio: 10, gravity: 1},
+          });
+        } catch (e) { console.error('FA2 failed', e); }
+      }
+
+      // Render a single minor card's Sigma graph and wire its
+      // Re-layout button. Factored out so overflow cards can render
+      // lazily on expand.
+      // Returns the Sigma instance so the caller can kill() it on
+      // collapse.
+      function _renderMinorCard(m, divId, btnId) {
+        if (!m.sigma_json) return null;
+        try {
+          var g = new graphology.Graph();
+          g.import(JSON.parse(m.sigma_json));
+          var container = document.getElementById(divId);
+          if (!container) return null;
+          container.innerHTML = '';
+          var s = new Sigma(g, container, _sigmaSettings(g.order));
+          window._minorSigmas.push(s);
+          var btn = document.getElementById(btnId);
+          if (btn) {
+            btn.addEventListener('click', function(e) {
+              e.stopPropagation();
+              _runFA2OnGraph(g);
+              try { s.refresh(); } catch (ex) {}
+            });
+          }
+          return s;
+        } catch (e) {
+          console.error('minor-card render failed', e);
+          return null;
+        }
+      }
+
+      // Render the Contributing-Graphs section. First `initialVisible`
+      // cards render eagerly with Sigma; the rest appear as collapsed
+      // title rows and expand on click (lazy render). This caps FA2
+      // load since browsers struggle to render more than ~5 Sigma
+      // instances at once. Each card has an Expand/Collapse toggle
+      // so users can swap which graphs are rendered without reload.
+      function renderMinorsSection(list, containerId, emptyText, initialVisible) {
+        if (initialVisible === undefined) initialVisible = 3;
         var container = document.getElementById(containerId);
         if (!list || list.length === 0) {
           container.innerHTML = '<div class="meta">' + emptyText + '</div>';
@@ -1452,21 +2333,148 @@ def index():
           var card = document.createElement('div');
           card.className = 'minor-card';
           var divId = containerId + '-card-' + i;
-          card.innerHTML = '<div class="minor-label">' + m.name + ' (' + m.edges + ' edges)</div>'
-            + '<div id="' + divId + '" class="small-graph"></div>';
+          var btnId = divId + '-relayout';
+          var refreshBtnId = divId + '-refresh';
+          var toggleBtnId = divId + '-toggle';
+          var startExpanded = i < initialVisible;
+
+          // Closure-local state tracked per card.
+          var state = { expanded: false, sigma: null };
+
+          function _updateButtons() {
+            var slot = document.getElementById(divId);
+            var relayoutBtn = document.getElementById(btnId);
+            var refreshBtn = document.getElementById(refreshBtnId);
+            var toggleBtn = document.getElementById(toggleBtnId);
+            if (slot) slot.style.display = state.expanded ? '' : 'none';
+            if (relayoutBtn) relayoutBtn.style.display = state.expanded ? '' : 'none';
+            if (refreshBtn) refreshBtn.style.display = state.expanded ? '' : 'none';
+            if (toggleBtn) {
+              // ▲ collapse, ▼ expand.
+              toggleBtn.textContent = state.expanded ? '\u25B2' : '\u25BC';
+              toggleBtn.title = state.expanded
+                ? 'Hide this graph to free render resources.'
+                : 'Expand to render this graph.';
+            }
+          }
+
+          function _expand() {
+            if (state.expanded) return;
+            state.expanded = true;
+            // Make sure the slot is fresh — if a previous Sigma left
+            // any DOM behind the new one would render on top of stale
+            // canvases.
+            var slot = document.getElementById(divId);
+            if (slot) slot.innerHTML = '';
+            state.sigma = _renderMinorCard(m, divId, btnId);
+            _updateButtons();
+            // Wire the per-card power-refresh button to a full
+            // kill+rebuild of this card's Sigma instance — recovers
+            // from WebGL glitches without re-running the engine.
+            var refreshBtn = document.getElementById(refreshBtnId);
+            if (refreshBtn) {
+              refreshBtn.onclick = function() {
+                if (state.sigma) {
+                  try { state.sigma.kill(); } catch (e) {}
+                  var idx = (window._minorSigmas || []).indexOf(state.sigma);
+                  if (idx >= 0) window._minorSigmas.splice(idx, 1);
+                  state.sigma = null;
+                }
+                var s2 = document.getElementById(divId);
+                if (s2) {
+                  while (s2.firstChild) s2.removeChild(s2.firstChild);
+                }
+                state.sigma = _renderMinorCard(m, divId, btnId);
+              };
+            }
+          }
+
+          function _collapse() {
+            if (!state.expanded) return;
+            state.expanded = false;
+            if (state.sigma) {
+              try { state.sigma.kill(); } catch (e) {}
+              // Remove from the global list so re-layout-all doesn't
+              // touch a killed instance.
+              var idx = (window._minorSigmas || []).indexOf(state.sigma);
+              if (idx >= 0) window._minorSigmas.splice(idx, 1);
+              state.sigma = null;
+            }
+            // Hard reset the slot: drop the WebGL canvas + label DOM
+            // so a future expand renders cleanly.
+            var slot = document.getElementById(divId);
+            if (slot) {
+              while (slot.firstChild) slot.removeChild(slot.firstChild);
+            }
+            _updateButtons();
+          }
+
+          var provN = m.provenance_count || 0;
+          var hasProv = provN > 0;
+          if (hasProv) {
+            card.classList.add('has-provenance');
+            if (m.key) {
+              card.setAttribute('data-prov-key', m.key);
+              // Register the display label so the input-graph chip
+              // area can show this card's name even when the card
+              // itself is collapsed/scrolled out of view.
+              window._provenanceLabels[m.key] = m.name || _shortKey(m.key);
+            }
+            // Reflect current toggle state if this key was already
+            // active from a prior card render of the same key.
+            if (m.key && window._activeProvenanceKeys
+                && window._activeProvenanceKeys.has(m.key)) {
+              card.classList.add('prov-active');
+            }
+          }
+          var provBadge = '';
+          if (hasProv) {
+            var badgeActive = (m.key && window._activeProvenanceKeys
+                && window._activeProvenanceKeys.has(m.key)) ? ' active' : '';
+            provBadge =
+              '<span class="prov-badge' + badgeActive +
+              '" data-prov-badge-key="' + (m.key || '') +
+              '" title="Click to toggle highlight of ' + provN +
+              ' instance' + (provN === 1 ? '' : 's') +
+              ' on the input graph">\u25C9 ' + provN + '</span>';
+          }
+          card.innerHTML =
+            '<div class="minor-label" style="display:flex;justify-content:space-between;align-items:center;gap:6px;">' +
+              '<span>' + m.name + ' (' + m.edges + ' edges)' + provBadge + '</span>' +
+              '<span>' +
+                '<button type="button" id="' + toggleBtnId + '" style="font-size:10px;padding:2px 6px;" title="Expand to render this graph.">\u25BC</button> ' +
+                '<button type="button" id="' + btnId + '" style="font-size:10px;padding:2px 6px;display:none;" title="Re-run ForceAtlas2 on this graph card.">\u21BA</button> ' +
+                '<button type="button" id="' + refreshBtnId + '" style="font-size:10px;padding:2px 6px;display:none;" title="Destroy and recreate this renderer (use after WebGL glitches).">\u23FB</button>' +
+              '</span>' +
+            '</div>' +
+            '<div id="' + divId + '" class="small-graph" style="display:none"></div>';
           container.appendChild(card);
-          if (m.nodes) {
-            (function(id, nodesJson, edgesJson) {
-              setTimeout(function() {
-                var net = new vis.Network(
-                  document.getElementById(id),
-                  {nodes: new vis.DataSet(JSON.parse(nodesJson)),
-                   edges: new vis.DataSet(JSON.parse(edgesJson))},
-                  opts
-                );
-                net.fit({padding: 20});
-              }, 50);
-            })(divId, m.nodes, m.edges_data);
+
+          // Click anywhere on the card (or specifically the badge) to
+          // toggle the input-graph highlight for this sub-graph. The
+          // expand/collapse and re-layout buttons stop propagation so
+          // they don't double-toggle.
+          (function(key) {
+            if (!key || !hasProv) return;
+            card.addEventListener('click', function(e) {
+              // Don't toggle when the click bubbled from a button.
+              if (e.target.closest('button')) return;
+              _toggleProvenanceKey(key);
+            });
+          })(m.key);
+
+          // Wire the toggle button to switch states.
+          (function() {
+            var toggleBtn = document.getElementById(toggleBtnId);
+            if (toggleBtn) {
+              toggleBtn.addEventListener('click', function() {
+                if (state.expanded) _collapse(); else _expand();
+              });
+            }
+          })();
+
+          if (startExpanded) {
+            setTimeout(_expand, 50);
           }
         });
       }
@@ -1493,6 +2501,22 @@ def index():
           stopEngine();
           document.getElementById('event-count').textContent = '(' + d.event_count + ' events)';
           document.getElementById('result-container').innerHTML = d.result_html;
+
+          // Merge final snapshots-with-provenance back into the local
+          // stepSnapshots cache. The provenance is added AFTER the
+          // initial snapshot was streamed, so this catch-up is needed.
+          if (d.snapshots_with_provenance) {
+            for (var pk in d.snapshots_with_provenance) {
+              if (d.snapshots_with_provenance.hasOwnProperty(pk)) {
+                if (stepSnapshots[pk]) {
+                  stepSnapshots[pk].provenance =
+                    d.snapshots_with_provenance[pk].provenance;
+                } else {
+                  stepSnapshots[pk] = d.snapshots_with_provenance[pk];
+                }
+              }
+            }
+          }
 
           // Summary
           if (d.summary && d.summary.length > 0) {
@@ -1528,10 +2552,16 @@ def index():
               '</h3>' +
               '<div id="minors-synthesized" class="minors-grid"></div>' +
             '</div>';
+          // Lookup section: show first 3 cards expanded by default
+          // (cheap, most-useful reference graphs).
+          // Synthesized section: all collapsed by default — these are
+          // intermediate multigraphs that can explode in count (Cm2
+          // has 125+), so let the user opt-in per card.
           renderMinorsSection(lookupList, 'minors-lookup',
-            'No rainbow table entries used.');
+            'No rainbow table entries used.', 3);
           renderMinorsSection(synthList, 'minors-synthesized',
-            'No graphs synthesized from scratch (all hits were in the table).');
+            'No graphs synthesized from scratch (all hits were in the table).',
+            0);
         }
 
         else if (d.type === 'error') {

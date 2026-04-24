@@ -26,7 +26,7 @@ from ..family_recognition import recognize_family
 from ..graph import Graph, MultiGraph
 from ..graphs.covering import (compute_fringe, compute_inter_tile_edges,
                                find_disjoint_cover)
-from ..graphs.k_join import polynomial_divide, polynomial_divmod, tutte_k
+from ..graphs.k_sum import polynomial_divide, polynomial_divmod
 from ..graphs.series_parallel import compute_sp_tutte_if_applicable
 from ..logs import EventType, LogLevel, get_log
 from ..lookup.core import MinorEntry, RainbowTable, load_default_table
@@ -50,6 +50,10 @@ class HybridSynthesisResult:
     algebraic_steps: int = 0
     tiling_steps: int = 0
     dc_steps: int = 0  # Should be 0 in ideal case
+    # Number of cell tiles used in the decomposition (surfaced by the
+    # visualizer's Result card). 0 when the path didn't use a
+    # hierarchical tiling (e.g. pure treewidth_dp on a non-cellular graph).
+    tiles_used: int = 0
     minors_used: Set[str] = field(default_factory=set)  # Canonical keys of table entries used
     # Canonical keys of sub-problems the engine synthesized (not table hits).
     synthesized_minors: Set[str] = field(default_factory=set)
@@ -121,11 +125,6 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         if loaded > 0 and verbose:
             print(f"[Hybrid] Loaded {loaded} multigraph cache entries")
 
-        # Load precomputed contraction cache if available
-        cc_loaded = self._structural_engine.load_contraction_cache()
-        if cc_loaded > 0 and verbose:
-            print(f"[Hybrid] Loaded {cc_loaded} contraction cache entries")
-
         # Statistics
         self._stats = {'algebraic': 0, 'tiling': 0, 'dc': 0, 'lookup': 0}
 
@@ -174,7 +173,38 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         if is_top:
             result.synthesized_graphs = dict(self._synth_accum_graphs)
             result.synthesized_minors = set(self._synth_accum_graphs.keys())
+            if getattr(self, 'promote_cache_on_finish', False):
+                self._flush_cache_to_table()
         return result
+
+    def _flush_cache_to_table(self) -> None:
+        """Promote simple-graph cache entries to the rainbow table at
+        end-of-synthesis. See SynthesisEngine._flush_cache_to_table."""
+        from ..graph import compute_signature
+        for cache_key, cached_result in list(self._cache.items()):
+            if cache_key in self.table.entries:
+                continue
+            g = self._synth_accum_graphs.get(cache_key)
+            if g is None or not hasattr(g, 'edges'):
+                continue
+            try:
+                entry = MinorEntry(
+                    name=(
+                        f"auto_{g.node_count()}n{g.edge_count()}e_"
+                        f"{cache_key[:8]}"
+                    ),
+                    polynomial=cached_result.polynomial,
+                    node_count=g.node_count(),
+                    edge_count=g.edge_count(),
+                    canonical_key=cache_key,
+                    spanning_trees=cached_result.polynomial.num_spanning_trees(),
+                    num_terms=cached_result.polynomial.num_terms(),
+                    graph=g,
+                    signature=compute_signature(g),
+                )
+                self.table.add_entry(entry)
+            except Exception:
+                continue
 
     def _synthesize_inner(
         self,
@@ -189,6 +219,8 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
             _log.record(EventType.CACHE_HIT, "hybrid",
                         f"Cache hit: {graph.node_count()}n {graph.edge_count()}e",
                         LogLevel.DEBUG, graph=graph)
+            # Record so the visualizer surfaces cache-hit graphs too.
+            self._record_synth(graph, cache_key)
             return self._cache[cache_key]
 
         n = graph.node_count()
@@ -404,6 +436,31 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
 
         engine = self._structural_engine
 
+        # Formula shortcut (Phase 12 unified + Phase 13 k-matching), BEFORE
+        # treewidth_dp — for targets like Cm2 where the formulas give a
+        # meaningful speedup over direct treewidth_dp (4x on Cm2).
+        # Gate at edge_count ≥ 60 to skip small graphs where detection
+        # overhead outweighs tw_dp savings.
+        if graph.edge_count() >= 60:
+            formula_result = engine._try_formula_shortcircuit(graph, max_depth)
+            if formula_result is not None:
+                _method_event = {
+                    "unified_formula": EventType.UNIFIED_FORMULA,
+                    "kmatching_formula": EventType.KMATCHING_FORMULA,
+                }.get(formula_result.method, EventType.HIERARCHICAL)
+                _log.record(_method_event, "hybrid",
+                            f"Formula shortcut via {formula_result.method}: "
+                            f"{graph.node_count()}n {graph.edge_count()}e",
+                            graph=graph)
+                self._log(f"Formula shortcut: {formula_result.method}")
+                return HybridSynthesisResult(
+                    polynomial=formula_result.polynomial,
+                    method=formula_result.method,
+                    recipe=formula_result.recipe,
+                    verified=formula_result.verified,
+                    tiles_used=formula_result.tiles_used,
+                )
+
         # Treewidth DP (fast for tw <= 10, before expensive k-sum/hierarchical)
         if graph.edge_count() >= 10:
             from ..graphs.treewidth import \
@@ -434,14 +491,25 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                 method=ksum_result.method,
                 recipe=ksum_result.recipe,
                 verified=ksum_result.verified,
+                tiles_used=getattr(ksum_result, 'tiles_used', 0),
             )
 
         # Hierarchical tiling
         if graph.edge_count() >= 20:
             hier_result = engine._try_hierarchical(graph, max_depth)
             if hier_result is not None:
-                _log.record(EventType.HIERARCHICAL, "hybrid",
-                            f"Hierarchical: {graph.node_count()}n {graph.edge_count()}e",
+                # Surface the SPECIFIC hierarchical sub-path for the
+                # visualizer: Phase 12 unified formula, Phase 13
+                # k-matching formula, or generic hierarchical / tw_dp
+                # fallthrough.
+                _method_event = {
+                    "unified_formula": EventType.UNIFIED_FORMULA,
+                    "kmatching_formula": EventType.KMATCHING_FORMULA,
+                    "treewidth_dp": EventType.TREEWIDTH_DP,
+                }.get(hier_result.method, EventType.HIERARCHICAL)
+                _log.record(_method_event, "hybrid",
+                            f"Hierarchical via {hier_result.method}: "
+                            f"{graph.node_count()}n {graph.edge_count()}e",
                             graph=graph)
                 self._log(f"Hierarchical tiling: {hier_result.method}")
                 return HybridSynthesisResult(
@@ -449,6 +517,7 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                     method=hier_result.method,
                     recipe=hier_result.recipe,
                     verified=hier_result.verified,
+                    tiles_used=getattr(hier_result, 'tiles_used', 0),
                 )
 
         return None

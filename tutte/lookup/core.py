@@ -29,18 +29,6 @@ from ..polynomial import TuttePolynomial, encode_varuint, decode_varuint
 # =============================================================================
 
 @dataclass
-class FlatLatticeData:
-    """Serializable flat lattice data for a graphic matroid.
-
-    Stores the flat lattice structure so it can be reconstructed
-    without re-enumerating flats (O(n) vs O(|flats|^2 * |E|)).
-    """
-    flats: List[frozenset]  # List of flats (each a frozenset of (int,int) edges), sorted by rank
-    ranks: List[int]  # Rank of each flat
-    upper_covers: Dict[int, List[int]]  # Hasse diagram: flat_idx -> list of immediate successors
-
-
-@dataclass
 class MinorEntry:
     """An entry in the rainbow table."""
     name: str
@@ -52,7 +40,6 @@ class MinorEntry:
     num_terms: int
     graph: Optional['Graph'] = None  # Stored graph for tiling reconstruction
     signature: Optional['CellSignature'] = None  # Cached signature for fast matching
-    flat_data: Optional[FlatLatticeData] = None  # Cached flat lattice for matroid ops
 
     def get_signature(self) -> Optional['CellSignature']:
         """Get or compute the cell signature for this entry."""
@@ -171,20 +158,9 @@ class RainbowTable:
 
             polynomial = TuttePolynomial.from_coefficients(coeffs)
 
-            # Parse flat lattice data if present
-            flat_data = None
-            if 'flat_data' in entry_data:
-                fd = entry_data['flat_data']
-                flats = [
-                    frozenset(tuple(e) for e in flat_list)
-                    for flat_list in fd['flats']
-                ]
-                upper_covers = {int(k): v for k, v in fd['upper_covers'].items()}
-                flat_data = FlatLatticeData(
-                    flats=flats,
-                    ranks=fd['ranks'],
-                    upper_covers=upper_covers,
-                )
+            # Note: legacy `flat_data` keys in older JSON files are silently
+            # ignored — the matroid/flat-lattice code path was retired in favor
+            # of the chord-rule approach (`tutte/graphs/chord_rule.py`).
 
             entry = MinorEntry(
                 name=entry_data.get('name', 'unknown'),
@@ -194,7 +170,6 @@ class RainbowTable:
                 canonical_key=key,
                 spanning_trees=entry_data.get('spanning_trees', 0),
                 num_terms=entry_data.get('num_terms', len(coeffs)),
-                flat_data=flat_data,
             )
 
             table.entries[key] = entry
@@ -229,15 +204,6 @@ class RainbowTable:
                 'polynomial_str': str(entry.polynomial),
                 'coefficients': coeffs,
             }
-
-            # Serialize flat lattice data if present
-            if entry.flat_data is not None:
-                fd = entry.flat_data
-                entry_dict['flat_data'] = {
-                    'flats': [sorted(list(f)) for f in fd.flats],
-                    'ranks': fd.ranks,
-                    'upper_covers': {str(k): v for k, v in fd.upper_covers.items()},
-                }
 
             graphs[key] = entry_dict
 
@@ -635,7 +601,7 @@ class RainbowTable:
         Returns:
             List of (entry, quotient) tuples where entry.polynomial * quotient = target
         """
-        from ..graphs.k_join import polynomial_divmod
+        from ..graphs.k_sum import polynomial_divmod
 
         results = []
         target_trees = target.num_spanning_trees()
@@ -786,62 +752,3 @@ def save_default_multigraph_table(cache: Dict[str, 'TuttePolynomial']) -> None:
         _json.dump(json_cache, f, indent=2)
 
 
-def load_default_contraction_cache() -> Dict[str, 'TuttePolynomial']:
-    """Load the default contraction cache from the package directory.
-
-    The contraction cache stores pre-computed T(M_i/Z) contractions from
-    the SP-guided bottom-up approach. Keyed by canonical_key of the contracted
-    multigraph, valued by TuttePolynomial.
-
-    Tries binary format first (faster), falls back to JSON.
-
-    Returns:
-        Dict mapping canonical key -> TuttePolynomial.
-    """
-    from ..polynomial import TuttePolynomial
-
-    base_dir = _default_data_dir()
-    bin_path = os.path.join(base_dir, 'contraction_lookup_table.bin')
-    json_path = os.path.join(base_dir, 'contraction_lookup_table.json')
-
-    if os.path.exists(bin_path):
-        try:
-            from .binary import load_contraction_cache
-            cache = load_contraction_cache(bin_path)
-            return _validate_poly_cache(cache, "contraction")
-        except Exception:
-            pass  # Fall through to JSON
-
-    if os.path.exists(json_path):
-        import json as _json
-        with open(json_path) as f:
-            saved = _json.load(f)
-        cache: Dict[str, TuttePolynomial] = {}
-        for key, coeffs_str in saved.items():
-            coeffs = {tuple(map(int, k.split(','))): v for k, v in coeffs_str.items()}
-            cache[key] = TuttePolynomial.from_coefficients(coeffs)
-        return _validate_poly_cache(cache, "contraction")
-
-    return {}
-
-
-def save_default_contraction_cache(cache: Dict[str, 'TuttePolynomial']) -> None:
-    """Save the contraction cache to the default location (binary + JSON).
-
-    Args:
-        cache: Dict mapping canonical key -> TuttePolynomial.
-    """
-    import json as _json
-    from .binary import save_contraction_cache
-
-    base_dir = _default_data_dir()
-    bin_path = os.path.join(base_dir, 'contraction_lookup_table.bin')
-    json_path = os.path.join(base_dir, 'contraction_lookup_table.json')
-
-    save_contraction_cache(cache, bin_path)
-
-    json_cache = {}
-    for key, poly in cache.items():
-        json_cache[key] = {f'{i},{j}': c for i, j, c in poly.terms()}
-    with open(json_path, 'w') as f:
-        _json.dump(json_cache, f, indent=2)

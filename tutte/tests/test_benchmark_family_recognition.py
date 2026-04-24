@@ -18,12 +18,13 @@ import signal
 import time
 
 import networkx as nx
-
+import pytest
 from tutte.graph import Graph
+from tutte.logs import LogLevel, get_log, reset_log
 from tutte.lookup.core import load_default_table
 from tutte.synthesis.engine import SynthesisEngine
-from tutte.validation import _exact_spanning_tree_count, _exact_num_spanning_trees
-from tutte.logs import get_log, reset_log, LogLevel
+from tutte.validation import (_exact_num_spanning_trees,
+                              _exact_spanning_tree_count)
 
 
 class _Timeout(BaseException):
@@ -417,12 +418,18 @@ def _run_pipeline(families, min_e, max_e, timeout_per_graph, samples_per_family=
 # BENCHMARK 1: All families, random sampling (100–200 edges)
 # ===========================================================================
 
+@pytest.mark.slow
 def test_benchmark_family_pipeline():
     """Benchmark engine pipeline with family recognition integrated.
 
     Randomly samples 5 graphs per family (100-200 edges), runs them
     through engine.synthesize(), and verifies correctness + fast path.
     Seed is fixed for reproducibility.
+
+    Marked @pytest.mark.slow because grids with m≥3 currently fall through
+    to k-sum / hierarchical / CEJ (see `grid_recurrence` gap in
+    `tutte/family_recognition/formulas.py`); each grid graph in the 100–200
+    edge range can take many seconds to minutes.
     """
     _run_pipeline(
         families=FAMILY_GENERATORS,
@@ -438,6 +445,7 @@ def test_benchmark_family_pipeline():
 # BENCHMARK 2: Single family selected via FAMILY env var
 # ===========================================================================
 
+@pytest.mark.slow
 def test_benchmark_family():
     """Benchmark a single family selected via the FAMILY env var.
 

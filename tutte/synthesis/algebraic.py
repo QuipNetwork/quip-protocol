@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from ..polynomial import TuttePolynomial
 from ..graph import Graph
 from ..lookup.core import RainbowTable, MinorEntry, GCDMinorIndex, load_default_table
-from ..graphs.k_join import polynomial_divmod, polynomial_divide, tutte_k
+from ..graphs.k_sum import polynomial_divmod, polynomial_divide
 from ..factorization import (
     polynomial_gcd, has_common_factor, monomial_content,
     primitive_part, find_divisibility_chain, try_factorize

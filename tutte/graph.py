@@ -34,15 +34,20 @@ def _compute_canonical_key(G: nx.Graph) -> str:
 
     n = len(G)
 
-    # Initialize node colors with degrees
-    colors: Dict[int, tuple] = {node: (G.degree(node),) for node in G.nodes()}
+    # Initialize node colors with degrees. Colors are integer hashes; each
+    # iteration replaces them with a fresh hash of (old_color, sorted
+    # neighbor colors). Using fixed-size integer hashes avoids the
+    # exponential tuple-nesting blowup that pure-tuple WL would suffer for
+    # graphs with slow color refinement (e.g. paths, where convergence
+    # takes ~n/2 iterations).
+    colors: Dict[int, int] = {node: hash((G.degree(node),)) for node in G.nodes()}
 
     # Iteratively refine colors using neighbor information (WL algorithm)
     for _ in range(n):  # At most n iterations needed for convergence
         new_colors = {}
         for node in G.nodes():
             neighbor_colors = tuple(sorted(colors[nb] for nb in G.neighbors(node)))
-            new_colors[node] = (colors[node], neighbor_colors)
+            new_colors[node] = hash((colors[node], neighbor_colors))
 
         # Check if color partition stabilized
         old_partitions = len(set(colors.values()))
@@ -847,14 +852,32 @@ class MultiGraph:
         Uses WL refinement for node ordering, then encodes edge multiplicities
         and loops in canonical form.
 
+        When the multigraph is actually simple (no parallel edges, no loops),
+        delegates to `Graph.canonical_key()` so that ``MultiGraph.from_graph(g)``
+        and ``g`` produce the same key. Keeps the rainbow table and visualizer
+        Contributing-Graphs dedupe consistent across representations.
+
         Result is memoized on the object (frozen dataclass, key never changes).
         """
         cached = getattr(self, '_canonical_key_cache', None)
         if cached is not None:
             return cached
 
+        # Fast path: if the multigraph is structurally simple, use the
+        # simple-Graph canonical key so both representations match.
+        if not self.loop_counts and all(
+            mult == 1 for mult in self.edge_counts.values()
+        ):
+            simple = Graph(
+                nodes=self.nodes,
+                edges=frozenset(self.edge_counts.keys()),
+            )
+            key = simple.canonical_key()
+            object.__setattr__(self, '_canonical_key_cache', key)
+            return key
+
         if not self.nodes:
-            key = hashlib.sha256(b'empty_multigraph').hexdigest()
+            key = hashlib.sha256(b'empty').hexdigest()
             object.__setattr__(self, '_canonical_key_cache', key)
             return key
 

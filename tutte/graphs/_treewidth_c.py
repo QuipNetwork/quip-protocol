@@ -71,6 +71,16 @@ ffi.cdef("""
         int* out_ab, long long* out_coeffs, int* out_n_terms, int max_out,
         long long dp_prime);
 
+    /* Pseudo-Mersenne variant: dp_prime must equal 2^62 - dp_prime_c.
+       Uses fast pseudo-Mersenne reduction in coeff_mul, ~3x faster. */
+    int treewidth_tutte_dp_ab_mersenne(
+        int n_bags, const int* bag_sizes, const int* bag_verts_flat,
+        int root, const int* children_counts, const int* children_flat,
+        const int* bag_edge_counts, const int* edges_flat,
+        int n_verts, int n_components,
+        int* out_ab, long long* out_coeffs, int* out_n_terms, int max_out,
+        long long dp_prime, long long dp_prime_c);
+
     /* __int128 variant — exact arithmetic, coefficients up to ~2^127.
        Outputs each coefficient as (hi64, lo64) pair for Python reconstruction. */
     int treewidth_tutte_dp_ab128(
@@ -335,8 +345,11 @@ void modular_det_multi(
    ========================================================================= */
 
 /* Global prime for modular arithmetic. 0 = exact int64.
-   Thread-local so parallel CRT prime workers don't race. */
+   Thread-local so parallel CRT prime workers don't race.
+   g_prime_c > 0 indicates pseudo-Mersenne form: g_prime = 2^62 - g_prime_c.
+   This enables fast reduction without __int128 division. */
 static __thread long long g_prime = 0;
+static __thread long long g_prime_c = 0;
 
 static inline long long coeff_add(long long a, long long b) {
     if (g_prime == 0) return a + b;
@@ -349,6 +362,18 @@ static inline long long coeff_add(long long a, long long b) {
 static inline long long coeff_mul(long long a, long long b) {
     if (g_prime == 0) return a * b;
     __int128 prod = (__int128)a * (__int128)b;
+    if (g_prime_c > 0) {
+        /* Pseudo-Mersenne: p = 2^62 - c. Substitute 2^62 ≡ c (mod p). */
+        long long h = (long long)(prod >> 62);
+        long long l = (long long)(prod & ((1LL << 62) - 1));
+        __int128 t1 = (__int128)h * (__int128)g_prime_c + (__int128)l;
+        long long h1 = (long long)(t1 >> 62);
+        long long l1 = (long long)(t1 & ((1LL << 62) - 1));
+        long long t2 = h1 * g_prime_c + l1;
+        if (t2 >= g_prime) t2 -= g_prime;
+        if (t2 >= g_prime) t2 -= g_prime;
+        return t2;
+    }
     return (long long)(prod % (__int128)g_prime);
 }
 
@@ -462,6 +487,25 @@ static Poly* poly_shift(const Poly* p, int delta_key) {
     return r;
 }
 
+/* Thread-local hash-table buffer for poly_mul. Avoids per-call calloc of
+   large hash tables (a dominant bottleneck profiled at ~24% of DP time).
+   Uses a per-slot generation counter so the buffer can be reused without
+   zeroing between calls. */
+static __thread uint16_t* tl_htbuf_keys = NULL;
+static __thread int64_t*  tl_htbuf_vals = NULL;
+static __thread uint32_t* tl_htbuf_gen  = NULL;
+static __thread int       tl_htbuf_cap  = 0;
+static __thread uint32_t  tl_htbuf_gen_counter = 0;
+
+static inline void htbuf_ensure(int cap) {
+    if (cap <= tl_htbuf_cap) return;
+    free(tl_htbuf_keys); free(tl_htbuf_vals); free(tl_htbuf_gen);
+    tl_htbuf_keys = (uint16_t*)malloc(cap * sizeof(uint16_t));
+    tl_htbuf_vals = (int64_t*)malloc(cap * sizeof(int64_t));
+    tl_htbuf_gen  = (uint32_t*)calloc(cap, sizeof(uint32_t));
+    tl_htbuf_cap = cap;
+}
+
 /* Multiply: fast monomial path + general hash-accumulate */
 static Poly* poly_mul(const Poly* p, const Poly* q) {
     if (p->n == 0 || q->n == 0) return poly_zero();
@@ -488,14 +532,21 @@ static Poly* poly_mul(const Poly* p, const Poly* q) {
         r->n = p->n;
         return r;
     }
-    /* General: hash table accumulation */
+    /* General: hash table accumulation using thread-local reusable buffer */
     int total = p->n * q->n;
     int ht_cap = 1;
     while (ht_cap < total * 4) ht_cap <<= 1;
     if (ht_cap < 256) ht_cap = 256;
-    uint16_t* ht_keys = (uint16_t*)calloc(ht_cap, sizeof(uint16_t));
-    int64_t*  ht_vals = (int64_t*)calloc(ht_cap, sizeof(int64_t));
-    uint8_t*  ht_used = (uint8_t*)calloc(ht_cap, sizeof(uint8_t));
+    htbuf_ensure(ht_cap);
+    uint32_t my_gen = ++tl_htbuf_gen_counter;
+    if (my_gen == 0) {
+        /* gen_counter wrapped around; clear once and restart */
+        memset(tl_htbuf_gen, 0, tl_htbuf_cap * sizeof(uint32_t));
+        my_gen = ++tl_htbuf_gen_counter;
+    }
+    uint16_t* ht_keys = tl_htbuf_keys;
+    int64_t*  ht_vals = tl_htbuf_vals;
+    uint32_t* ht_gen  = tl_htbuf_gen;
     int mask = ht_cap - 1;
     int result_n = 0;
     int i, j;
@@ -505,11 +556,11 @@ static Poly* poly_mul(const Poly* p, const Poly* q) {
             uint16_t key = pk + q->keys[j];
             int64_t prod = coeff_mul(pv, q->vals[j]);
             uint32_t h = ((uint32_t)key * 2654435761u) & mask;
-            while (ht_used[h]) {
+            while (ht_gen[h] == my_gen) {
                 if (ht_keys[h] == key) { ht_vals[h] = coeff_add(ht_vals[h], prod); goto next_mul; }
                 h = (h + 1) & mask;
             }
-            ht_used[h] = 1; ht_keys[h] = key; ht_vals[h] = prod; result_n++;
+            ht_gen[h] = my_gen; ht_keys[h] = key; ht_vals[h] = prod; result_n++;
             next_mul:;
         }
     }
@@ -517,7 +568,7 @@ static Poly* poly_mul(const Poly* p, const Poly* q) {
     Poly* r = poly_alloc(result_n > 0 ? result_n : 64);
     int wi = 0;
     for (i = 0; i < ht_cap; i++) {
-        if (ht_used[i] && ht_vals[i] != 0) {
+        if (ht_gen[i] == my_gen && ht_vals[i] != 0) {
             r->keys[wi] = ht_keys[i]; r->vals[wi] = ht_vals[i]; wi++;
         }
     }
@@ -531,7 +582,6 @@ static Poly* poly_mul(const Poly* p, const Poly* q) {
         }
         r->keys[j+1] = key; r->vals[j+1] = val;
     }
-    free(ht_keys); free(ht_vals); free(ht_used);
     return r;
 }
 
@@ -1326,6 +1376,88 @@ int treewidth_tutte_dp_ab_mod(
     return 0;
 }
 
+/* Pseudo-Mersenne variant: runs DP mod dp_prime where dp_prime = 2^62 - dp_prime_c.
+   coeff_mul uses fast high-low split reduction via dp_prime_c (~3x faster than
+   generic __int128 modulo). Emits residues in [0, dp_prime). */
+int treewidth_tutte_dp_ab_mersenne(
+    int n_bags, const int* bag_sizes, const int* bag_verts_flat,
+    int root, const int* children_counts, const int* children_flat,
+    const int* bag_edge_counts, const int* edges_flat,
+    int n_verts, int n_components,
+    int* out_ab, long long* out_coeffs, int* out_n_terms, int max_out,
+    long long dp_prime, long long dp_prime_c)
+{
+    g_prime = dp_prime;
+    g_prime_c = dp_prime_c;
+    memset(ccache, 0, sizeof(ccache));
+
+    TDInfo td;
+    td.n_bags = n_bags;
+    td.bag_sizes = bag_sizes;
+    td.bag_verts_flat = bag_verts_flat;
+    td.children_counts = children_counts;
+    td.children_flat = children_flat;
+    td.bag_edge_counts = bag_edge_counts;
+    td.edges_flat = edges_flat;
+    td.bag_verts_offsets = (int*)malloc(n_bags * sizeof(int));
+    td.children_offsets = (int*)malloc(n_bags * sizeof(int));
+    td.edges_offsets = (int*)malloc(n_bags * sizeof(int));
+    int off = 0;
+    for (int i = 0; i < n_bags; i++) { td.bag_verts_offsets[i] = off; off += bag_sizes[i]; }
+    off = 0;
+    for (int i = 0; i < n_bags; i++) { td.children_offsets[i] = off; off += children_counts[i]; }
+    off = 0;
+    for (int i = 0; i < n_bags; i++) { td.edges_offsets[i] = off; off += bag_edge_counts[i] * 3; }
+
+    int* root_verts; int root_n;
+    DPTable* root_table = process_bag(&td, root, &root_verts, &root_n);
+
+    Poly* final_poly = poly_zero();
+    for (int i = 0; i < root_table->cap; i++) {
+        if (!root_table->used[i]) continue;
+        uint64_t cur_enc = root_table->keys[i];
+        Poly* cur_poly = poly_copy(root_table->vals[i]);
+        for (int j = 0; j < root_n; j++) {
+            ForgetResult fr = encoded_forget(cur_enc, 0);
+            if (fr.is_singleton) {
+                Poly* shifted = poly_shift(cur_poly, KEY_STRIDE + 1);
+                poly_free(cur_poly);
+                cur_poly = shifted;
+            }
+            cur_enc = fr.new_enc;
+        }
+        poly_add_inplace(final_poly, cur_poly);
+        poly_free(cur_poly);
+    }
+
+    int a_shift = n_components;
+    int b_shift = n_verts;
+    int n_out = 0;
+    for (int i = 0; i < final_poly->n && n_out < max_out; i++) {
+        int a_pow = final_poly->keys[i] / KEY_STRIDE;
+        int b_pow = final_poly->keys[i] % KEY_STRIDE;
+        int new_a = a_pow - a_shift;
+        int new_b = b_pow - b_shift;
+        if (new_a < 0 || new_b < 0) continue;
+        out_ab[n_out * 2] = new_a;
+        out_ab[n_out * 2 + 1] = new_b;
+        out_coeffs[n_out] = final_poly->vals[i];
+        n_out++;
+    }
+    *out_n_terms = n_out;
+
+    /* Reset g_prime_c to not leak mersenne mode to other calls on this thread. */
+    g_prime_c = 0;
+
+    poly_free(final_poly);
+    dpt_free(root_table);
+    free(root_verts);
+    free(td.bag_verts_offsets);
+    free(td.children_offsets);
+    free(td.edges_offsets);
+    return 0;
+}
+
 /* =========================================================================
    __int128 DP VARIANTS (for medium-density graphs: 63-120 edges)
    Exact arithmetic with __int128 — no modular reduction, no overflow
@@ -1398,6 +1530,22 @@ static Poly128* poly_shift128(const Poly128* p, int delta) {
     }
     r->n = p->n; return r;
 }
+/* Thread-local hash-table buffer for poly_mul128 (int128 variant). */
+static __thread uint16_t* tl_htbuf128_keys = NULL;
+static __thread __int128* tl_htbuf128_vals = NULL;
+static __thread uint32_t* tl_htbuf128_gen  = NULL;
+static __thread int       tl_htbuf128_cap  = 0;
+static __thread uint32_t  tl_htbuf128_gen_counter = 0;
+
+static inline void htbuf128_ensure(int cap) {
+    if (cap <= tl_htbuf128_cap) return;
+    free(tl_htbuf128_keys); free(tl_htbuf128_vals); free(tl_htbuf128_gen);
+    tl_htbuf128_keys = (uint16_t*)malloc(cap * sizeof(uint16_t));
+    tl_htbuf128_vals = (__int128*)malloc(cap * sizeof(__int128));
+    tl_htbuf128_gen  = (uint32_t*)calloc(cap, sizeof(uint32_t));
+    tl_htbuf128_cap = cap;
+}
+
 static Poly128* poly_mul128(const Poly128* p, const Poly128* q) {
     if (p->n == 0 || q->n == 0) return poly_zero128();
     if (p->n == 1) {
@@ -1421,9 +1569,15 @@ static Poly128* poly_mul128(const Poly128* p, const Poly128* q) {
     int total = p->n * q->n;
     int ht_cap = 1; while (ht_cap < total * 4) ht_cap <<= 1;
     if (ht_cap < 256) ht_cap = 256;
-    uint16_t* ht_keys = (uint16_t*)calloc(ht_cap, sizeof(uint16_t));
-    __int128* ht_vals = (__int128*)calloc(ht_cap, sizeof(__int128));
-    uint8_t*  ht_used = (uint8_t*)calloc(ht_cap, sizeof(uint8_t));
+    htbuf128_ensure(ht_cap);
+    uint32_t my_gen = ++tl_htbuf128_gen_counter;
+    if (my_gen == 0) {
+        memset(tl_htbuf128_gen, 0, tl_htbuf128_cap * sizeof(uint32_t));
+        my_gen = ++tl_htbuf128_gen_counter;
+    }
+    uint16_t* ht_keys = tl_htbuf128_keys;
+    __int128* ht_vals = tl_htbuf128_vals;
+    uint32_t* ht_gen  = tl_htbuf128_gen;
     int mask = ht_cap - 1, result_n = 0, i, j;
     for (i = 0; i < p->n; i++) {
         uint16_t pk = p->keys[i]; __int128 pv = p->vals[i];
@@ -1431,18 +1585,18 @@ static Poly128* poly_mul128(const Poly128* p, const Poly128* q) {
             uint16_t key = pk + q->keys[j];
             __int128 prod = pv * q->vals[j];
             uint32_t h = ((uint32_t)key * 2654435761u) & mask;
-            while (ht_used[h]) {
+            while (ht_gen[h] == my_gen) {
                 if (ht_keys[h] == key) { ht_vals[h] += prod; goto next_mul128; }
                 h = (h + 1) & mask;
             }
-            ht_used[h] = 1; ht_keys[h] = key; ht_vals[h] = prod; result_n++;
+            ht_gen[h] = my_gen; ht_keys[h] = key; ht_vals[h] = prod; result_n++;
             next_mul128:;
         }
     }
     Poly128* r = poly_alloc128(result_n > 0 ? result_n : 64);
     int wi = 0;
     for (i = 0; i < ht_cap; i++) {
-        if (ht_used[i] && ht_vals[i] != 0) {
+        if (ht_gen[i] == my_gen && ht_vals[i] != 0) {
             r->keys[wi] = ht_keys[i]; r->vals[wi] = ht_vals[i]; wi++;
         }
     }
@@ -1455,7 +1609,6 @@ static Poly128* poly_mul128(const Poly128* p, const Poly128* q) {
         }
         r->keys[j+1] = key; r->vals[j+1] = val;
     }
-    free(ht_keys); free(ht_vals); free(ht_used);
     return r;
 }
 
@@ -2147,12 +2300,29 @@ def compute_treewidth_tutte_c(td, mg):
     # Tiered DP strategy based on coefficient bounds:
     # (a,b)-basis coefficient bound ≈ 2^{n_edges}; (x,y) bound larger (needs Python ints).
     # 1. ≤62 edges: exact int64 DP + int64 conversion (fastest).
-    # 2. 63-76 edges: int64 DP + modular conversion with CRT.
-    # 3. 77-120 edges: __int128 DP + Python basis conversion (single DP pass).
-    # 4. >120 edges: full modular DP + CRT (multiple passes).
+    # 2. >62 edges: full modular DP + CRT (multiple passes, parallelized).
+    #
+    # (April 2026): the prior "63-120 edges: __int128 DP" path
+    # was retired after head-to-head testing showed modular CRT is uniformly
+    # faster in that edge range:
+    #   Z(1,2) (24n 76e tw=10): int128 168s vs modular 117s (modular wins 30%)
+    #   Cm2    (32n 80e tw=11): int128 695s vs modular 801s vs Python 207s
+    # On Cm2, ALL C paths lose to Python (caught by `5≤tw≤10` gate at the
+    # caller). Modular CRT is also more portable — `__int128` is GCC/Clang
+    # only, blocking MSVC/Windows builds. The `treewidth_tutte_dp_ab128` C
+    # function and `Poly128` infrastructure remain in source for now but are
+    # dead code; safe to delete after the dead-code audit (see
+    # `tutte/tests/test_int128_dead_code.py`).
+    #
+    # Historical note (earlier April 2026): an even earlier "63-76 edges:
+    # int64 DP + modular conversion" path silently overflowed int64 in the
+    # DP itself for ≥ 63 edges (coefficients can reach 2^E / sqrt(E), well
+    # beyond 2^63). Symptom: T(1,1) was correct but other coefficients were
+    # off by multiples of 2^64. Replaced by the int128 path then retired
+    # entirely in favor of modular CRT.
     n_total_edges = sum(mg.edge_counts.values()) + sum(mg.loop_counts.values())
-    needs_dp_modular = n_total_edges > 120
-    needs_dp_int128 = n_total_edges > 76
+    needs_dp_modular = n_total_edges > 62
+    needs_dp_int128 = False  # int128 path retired (dominated by modular CRT)
     needs_conv_modular = n_total_edges > 62
 
     max_out = 10000
@@ -2256,35 +2426,38 @@ def compute_treewidth_tutte_c(td, mg):
     # bignums, then convert basis once in Python. The (a,b) coefficient bound
     # is ~2^{n_edges}, much tighter than the (x,y) bound ~2^{2·n_edges + n_verts},
     # so we need roughly half as many primes as the full-modular path.
-    # 62-bit primes (safe for coeff_add/coeff_mul) further reduce the count.
+    # 62-bit pseudo-Mersenne primes (form 2^62 - c) enable fast reduction in
+    # coeff_mul, avoiding __int128 division on the hot path.
     log2_ab_bound = n_total_edges + 20
     primes_needed = max(int(log2_ab_bound / 60) + 1, 2)
-    primes = _get_modular_primes(primes_needed, bits=62)
+    primes = _get_modular_primes(primes_needed, bits=62, form='mersenne_below')
+    prime_cs = [(1 << 62) - p for p in primes]
 
     max_ab = max_out * 2
 
-    def _run_one_prime(p_val):
+    def _run_one_prime(prime_and_c):
+        p_val, p_c = prime_and_c
         ab_keys = _ffi.new("int[]", max_ab * 2)
         ab_coeffs = _ffi.new("long long[]", max_ab)
         ab_n = _ffi.new("int*")
-        rc = lib.treewidth_tutte_dp_ab_mod(
+        rc = lib.treewidth_tutte_dp_ab_mersenne(
             n_bags, bag_sizes, bag_verts, td.root,
             children_counts, children_flat,
             bag_edge_counts, edges_flat,
             n_verts, n_components,
-            ab_keys, ab_coeffs, ab_n, max_ab, p_val)
+            ab_keys, ab_coeffs, ab_n, max_ab, p_val, p_c)
         if rc != 0:
             return None
         return {(ab_keys[i * 2], ab_keys[i * 2 + 1]): int(ab_coeffs[i])
                 for i in range(ab_n[0])}
 
-    # Parallelize prime DPs. cffi releases the GIL during C calls, and both
-    # g_prime and ccache are __thread so workers don't race.
+    # Parallelize prime DPs. cffi releases the GIL during C calls; g_prime,
+    # g_prime_c, and ccache are __thread so workers don't race.
     import os
     from concurrent.futures import ThreadPoolExecutor
     max_workers = min(len(primes), max(1, (os.cpu_count() or 2) - 1))
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        all_residues = list(ex.map(_run_one_prime, primes))
+        all_residues = list(ex.map(_run_one_prime, zip(primes, prime_cs)))
     if any(r is None for r in all_residues):
         return None
 

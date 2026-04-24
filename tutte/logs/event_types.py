@@ -6,9 +6,9 @@ no singleton state, no imports beyond stdlib.
 See log_design.md for full design documentation.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Any, Dict, Optional
 
 
 class LogLevel(Enum):
@@ -47,6 +47,9 @@ class EventType(Enum):
     # --- Hierarchical tiling ---
     HIERARCHICAL = "hierarchical"
     THEOREM6 = "theorem6"
+    CHORD_RULE = "chord_rule"
+    UNIFIED_FORMULA = "unified_formula"
+    KMATCHING_FORMULA = "kmatching_formula"
 
     # --- CEJ path (covering.py) ---
     CANDIDATE_FILTER = "candidate_filter"
@@ -84,6 +87,16 @@ class Event:
         graph_key: Canonical key of the graph associated with this event,
                    or None. The snapshot is stored in EventLog._graph_snapshots
                    keyed by this string.
+        provenance: Optional dict mapping the event's graph back to the
+                   top-level target. Schema:
+                       {
+                           "target_nodes": [int, ...],
+                           "target_edges": [[int, int], ...],
+                       }
+                   Used by the visualizer to highlight which nodes/edges
+                   of the input graph the current sub-graph corresponds
+                   to. None when the mapping is unknown (cache hits,
+                   contractions that lose vertex identity, etc.).
     """
 
     timestamp: float
@@ -93,3 +106,4 @@ class Event:
     message: str
     level: LogLevel = LogLevel.INFO
     graph_key: Optional[str] = None
+    provenance: Optional[Dict[str, Any]] = None

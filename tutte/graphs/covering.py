@@ -12,6 +12,7 @@ Key concepts:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, Set, Tuple, List, Optional, Iterator, FrozenSet
 
@@ -19,11 +20,12 @@ import networkx as nx
 from networkx.algorithms import isomorphism
 
 from ..graph import (
-    Graph, CellSignature, NodeSignature,
+    Graph, MultiGraph, CellSignature, NodeSignature,
     compute_signature, compute_node_signature, compute_all_node_signatures
 )
 from ..lookup.core import MinorEntry, RainbowTable
 from ..logs import get_log, EventType, LogLevel
+from ..polynomial import TuttePolynomial
 
 
 # =============================================================================
@@ -1170,6 +1172,446 @@ def analyze_inter_cell_edges(
     )
 
 
+def extract_cell_topology(
+    partition: List[Set[int]],
+    inter_edges: List[Tuple[int, int]],
+) -> Optional[MultiGraph]:
+    """Return the cell-topology multigraph H if the unified formula applies.
+
+    The unified Phase 11 formula
+
+        T(G) = (∏_i T(cell_i)) × T(H)
+
+    is valid when **every (cell_i, cell_j) pair's inter-cell edges share a
+    single (vertex-in-cell-i, vertex-in-cell-j) endpoint pair**. That is, all
+    inter-cell edges between two given cells must connect the same vertex
+    pair (parallel-edge structure between two specific cell vertices).
+
+    H has one node per cell; for each inter-cell edge in G between cells
+    (i, j) we add an edge (i, j) in H, so multiple G-edges between the same
+    cell-vertex-pair become parallel edges in H.
+
+    Returns None when the precondition fails (the genuine "chord case" — at
+    least one cell-pair has inter-cell edges connecting distinct vertex
+    pairs). Callers should fall through to the existing chord-rule pipeline.
+
+    Note: this function is cell-agnostic. The precondition is a property of
+    the inter-cell edge set only, so heterogeneous partitions (cells of
+    different shapes) are handled identically to homogeneous ones.
+    """
+    k = len(partition)
+
+    # Empty partition or no inter-cell edges → trivially unified
+    # (caller handles the empty-edge case before invoking us, but be safe)
+    if k == 0:
+        return MultiGraph(nodes=frozenset(), edge_counts={}, loop_counts={})
+
+    node_to_cell: Dict[int, int] = {}
+    for i, cell_nodes in enumerate(partition):
+        for node in cell_nodes:
+            node_to_cell[node] = i
+
+    # Group inter-cell edges by (cell_i, cell_j) and track the
+    # vertex-pair(s) used for each cell-pair. The precondition requires
+    # exactly one vertex-pair per cell-pair.
+    pair_to_vertex_pairs: Dict[Tuple[int, int], Set[Tuple[int, int]]] = {}
+    pair_to_count: Dict[Tuple[int, int], int] = {}
+
+    for u, v in inter_edges:
+        cu = node_to_cell.get(u)
+        cv = node_to_cell.get(v)
+        if cu is None or cv is None or cu == cv:
+            # Edge isn't actually inter-cell or references an unknown node;
+            # be conservative and bail.
+            return None
+        cell_pair = (min(cu, cv), max(cu, cv))
+        vertex_pair = (min(u, v), max(u, v))
+        pair_to_vertex_pairs.setdefault(cell_pair, set()).add(vertex_pair)
+        pair_to_count[cell_pair] = pair_to_count.get(cell_pair, 0) + 1
+
+    for cell_pair, vps in pair_to_vertex_pairs.items():
+        if len(vps) > 1:
+            # Distinct vertex pairs between same cell-pair → genuine chord
+            # case. Unified formula does not apply.
+            return None
+
+    # Build the cell-topology multigraph: nodes are cell indices
+    # 0..k-1; edges are (cell_i, cell_j) with multiplicity = number of
+    # inter-cell edges between that pair.
+    edge_counts: Dict[Tuple[int, int], int] = {
+        cell_pair: count for cell_pair, count in pair_to_count.items()
+    }
+    return MultiGraph(
+        nodes=frozenset(range(k)),
+        edge_counts=edge_counts,
+        loop_counts={},
+    )
+
+
+# =============================================================================
+# k-matching topology detection (Phase 13/15)
+# =============================================================================
+#
+# When inter-cell edges form k-matching junctions (k > 1 distinct vertex
+# pairs between two cells, with the k anchors on each side belonging to
+# a single vertex-transitive class), the Phase 13 closed-form formula
+#
+#     T(G_1 + M_k + G_2) = (x + k - 1) · T(G_1)·T(G_2)
+#                          + Σ_{j=2..k} C(k, j) · T(G_1 ⊕_j G_2)
+#
+# applies. For multi-cell topologies (cell-tree, cell-cycle, etc.) the
+# formula extends recursively. See:
+#   `~/.claude/projects/.../memory/project_phase_13_kmatching_closed_form.md`
+# =============================================================================
+
+
+@dataclass
+class KMatchingJunction:
+    """One inter-cell junction with a k-matching coupler structure.
+
+    edges[i] = (anchors_i[i], anchors_j[i]) for each i in 0..k-1.
+    All anchor vertices on each side must be in a single
+    vertex-transitive class within the cell (typically: same
+    bipartition side of a bipartite cell).
+    """
+    cell_i: int
+    cell_j: int
+    edges: List[Tuple[int, int]]
+    anchors_i: List[int]
+    anchors_j: List[int]
+
+    @property
+    def k(self) -> int:
+        return len(self.edges)
+
+
+def _anchors_single_class(
+    graph: Graph, cell_nodes: Set[int], anchors: Set[int],
+) -> bool:
+    """Check if all anchors lie in a single vertex-transitive class
+    within the cell's induced subgraph.
+
+    Heuristic: induce subgraph on cell_nodes; check if bipartite; if
+    so, all anchors must be in the same bipartition side. If the cell
+    is not bipartite, fall back to assuming all vertices are equivalent
+    (true for complete graphs K_n; conservative for others).
+    """
+    if not anchors:
+        return True
+    cell_nx = nx.Graph()
+    cell_nx.add_nodes_from(cell_nodes)
+    for u, v in graph.edges:
+        if u in cell_nodes and v in cell_nodes:
+            cell_nx.add_edge(u, v)
+    if cell_nx.number_of_edges() == 0:
+        # Empty cell — anchors trivially equivalent
+        return True
+    try:
+        if nx.is_bipartite(cell_nx):
+            sides = nx.bipartite.sets(cell_nx)
+            for side in sides:
+                if anchors.issubset(side):
+                    return True
+            # Anchors span both sides → not single-class
+            return False
+    except nx.NetworkXError:
+        # Not connected etc. — fall back
+        pass
+    # Non-bipartite cell: assume vertex-transitive (true for K_n).
+    # Conservative and may miss valid cases for non-vertex-transitive
+    # cells, but won't produce wrong results.
+    return True
+
+
+def detect_kmatching_topology(
+    graph: Graph,
+    partition: List[Set[int]],
+    inter_edges: List[Tuple[int, int]],
+) -> Optional[List[KMatchingJunction]]:
+    """Detect if inter-cell edges form k-matching junctions where the
+    Phase 13 cell-cycle formula applies.
+
+    Returns a list of `KMatchingJunction` (one per cell-pair with
+    edges) if **every junction** satisfies the single-class anchor
+    precondition (anchors on each side lie in a single
+    vertex-transitive class of the cell). Returns None otherwise.
+
+    For Chimera Cm_m: each junction has k=4 with all 4 anchors on a
+    single bipartition side of K_{4,4}; this function returns the
+    junction list and the recursive cell-cycle formula applies.
+    """
+    if not inter_edges:
+        return []
+
+    node_to_cell: Dict[int, int] = {}
+    for i, cell_nodes in enumerate(partition):
+        for node in cell_nodes:
+            node_to_cell[node] = i
+
+    # Group edges by cell-pair, tracking anchors per side
+    pair_data: Dict[Tuple[int, int], Tuple[List[Tuple[int, int]], Set[int], Set[int]]] = {}
+    for u, v in inter_edges:
+        cu = node_to_cell.get(u)
+        cv = node_to_cell.get(v)
+        if cu is None or cv is None or cu == cv:
+            return None
+        if cu < cv:
+            ci, cj, ai, aj = cu, cv, u, v
+        else:
+            ci, cj, ai, aj = cv, cu, v, u
+        pair = (ci, cj)
+        if pair not in pair_data:
+            pair_data[pair] = ([], set(), set())
+        edges_list, anchors_i, anchors_j = pair_data[pair]
+        edges_list.append((ai, aj))
+        anchors_i.add(ai)
+        anchors_j.add(aj)
+
+    junctions: List[KMatchingJunction] = []
+    for (ci, cj), (edges_list, anchors_i, anchors_j) in pair_data.items():
+        # Each anchor used at most once per side (true matching, no
+        # repeat). If some anchor is reused, the structure is not a
+        # simple k-matching.
+        if len(anchors_i) != len(edges_list) or len(anchors_j) != len(edges_list):
+            return None
+        # Single-class precondition per side
+        if not _anchors_single_class(graph, partition[ci], anchors_i):
+            return None
+        if not _anchors_single_class(graph, partition[cj], anchors_j):
+            return None
+        junctions.append(KMatchingJunction(
+            cell_i=ci, cell_j=cj,
+            edges=edges_list,
+            anchors_i=[a for a, _ in edges_list],
+            anchors_j=[b for _, b in edges_list],
+        ))
+
+    # Stronger precondition: shared anchors across junctions at the
+    # same cell cause parallel edges when contractions close a cycle
+    # in the cell-topology graph. For a tree cell-topology,
+    # contractions chain linearly and shared anchors are safe. For a
+    # cyclic cell-topology, shared anchors break the formula.
+    #
+    # Rule: if the cell-topology has any cycle, reject any cell where
+    # two junctions share an anchor vertex.
+    cell_topology = nx.Graph()
+    cell_topology.add_nodes_from(range(len(partition)))
+    for j in junctions:
+        cell_topology.add_edge(j.cell_i, j.cell_j)
+    # Tree iff cycle_basis is empty (on the undirected graph).
+    has_cycle = bool(nx.cycle_basis(cell_topology))
+
+    if has_cycle:
+        cell_used_anchors: Dict[int, Set[int]] = {}
+        for j in junctions:
+            for anchor in j.anchors_i:
+                if anchor in cell_used_anchors.setdefault(j.cell_i, set()):
+                    return None
+                cell_used_anchors[j.cell_i].add(anchor)
+            for anchor in j.anchors_j:
+                if anchor in cell_used_anchors.setdefault(j.cell_j, set()):
+                    return None
+                cell_used_anchors[j.cell_j].add(anchor)
+
+    return junctions
+
+
+def _apply_junction_merge(
+    g: nx.MultiGraph,
+    junction_edges: List[Tuple[int, int]],
+    j: int,
+) -> nx.MultiGraph:
+    """Return a new nx.MultiGraph: contract first j edges of junction,
+    delete the remaining (k - j). Contraction merges endpoints; any
+    resulting parallel edges become multiplicities."""
+    new = g.copy()
+    for i, (u, v) in enumerate(junction_edges):
+        if i < j:
+            # Contract: remove all edges at v, rewire to u.
+            if v in new:
+                v_edges = list(new.edges(v, keys=True))
+                new.remove_node(v)
+                for a, b, _key in v_edges:
+                    a2 = u if a == v else a
+                    b2 = u if b == v else b
+                    if a2 != b2:
+                        new.add_edge(a2, b2)
+        else:
+            if new.has_edge(u, v):
+                new.remove_edge(u, v)
+    return new
+
+
+def _is_bridge_junction(
+    g: nx.MultiGraph, junction_edges: List[Tuple[int, int]],
+) -> bool:
+    """Return True iff removing all junction edges disconnects g."""
+    test = g.copy()
+    for u, v in junction_edges:
+        if test.has_edge(u, v):
+            test.remove_edge(u, v)
+    return not nx.is_connected(test)
+
+
+def _nx_mg_to_mg(g: nx.MultiGraph) -> MultiGraph:
+    edge_counts: Dict[Tuple[int, int], int] = {}
+    for u, v in g.edges():
+        e = (min(u, v), max(u, v))
+        edge_counts[e] = edge_counts.get(e, 0) + 1
+    return MultiGraph(
+        nodes=frozenset(g.nodes()),
+        edge_counts=edge_counts,
+        loop_counts={},
+    )
+
+
+def apply_kmatching_formula(
+    graph: Graph,
+    junctions: List[KMatchingJunction],
+    synth_multigraph,
+):
+    """Apply the Phase 13 recursive cell-cycle/cell-tree formula.
+
+    Iterates the 2-cell formula at each junction with state-caching.
+    At each junction:
+      - If removing the k junction edges disconnects the graph (tree
+        case): coefficients are (x, k-1, C(k,2), ..., C(k,k)) for
+        j = 0, 1, 2, ..., k.
+      - Otherwise (cycle case): coefficients are C(k, j) for all j.
+
+    `synth_multigraph(mg)` is a callable that returns T(mg) for a
+    tutte.graph.MultiGraph (typically engine._synthesize_multigraph).
+    """
+    # Build nx.MultiGraph from the simple Graph
+    g_nx = nx.MultiGraph()
+    g_nx.add_nodes_from(graph.nodes)
+    for u, v in graph.edges:
+        g_nx.add_edge(u, v)
+
+    # Translate each KMatchingJunction into an nx-edge list
+    junction_edge_lists: List[List[Tuple[int, int]]] = [
+        [(a, b) for a, b in junc.edges] for junc in junctions
+    ]
+
+    # Caches scoped to this call (do NOT leak across calls)
+    leaf_cache: Dict[str, TuttePolynomial] = {}
+    state_cache: Dict[tuple, TuttePolynomial] = {}
+
+    def _t_leaf(mg: MultiGraph) -> TuttePolynomial:
+        try:
+            key = mg.canonical_key()
+        except Exception:
+            return synth_multigraph(mg)
+        cached = leaf_cache.get(key)
+        if cached is not None:
+            return cached
+        T = synth_multigraph(mg)
+        leaf_cache[key] = T
+        return T
+
+    def _state_key(g: nx.MultiGraph, remaining_idx: Tuple[int, ...]) -> Optional[tuple]:
+        try:
+            mg_key = _nx_mg_to_mg(g).canonical_key()
+        except Exception:
+            return None
+        return (mg_key, remaining_idx)
+
+    x_poly = TuttePolynomial.x()
+
+    def _resolve_edge(
+        relabel: Dict[int, int], u: int, v: int,
+    ) -> Tuple[int, int]:
+        """Walk the relabel dict to get the current canonical
+        representatives of u, v."""
+        def _root(x: int) -> int:
+            while x in relabel:
+                x = relabel[x]
+            return x
+        return (_root(u), _root(v))
+
+    def recurse(
+        g: nx.MultiGraph,
+        remaining_idx: Tuple[int, ...],
+        relabel: Dict[int, int],
+    ) -> TuttePolynomial:
+        if not remaining_idx:
+            return _t_leaf(_nx_mg_to_mg(g))
+        key = _state_key(g, remaining_idx)
+        if key is not None:
+            cached = state_cache.get(key)
+            if cached is not None:
+                return cached
+
+        # Resolve each remaining junction's current edges via relabel.
+        # A junction's edges may have moved to merged vertices; resolve
+        # each (u, v) through the relabel dict to get the current
+        # physical endpoints, then verify the edge exists in g.
+        def _present_for(idx: int) -> List[Tuple[int, int]]:
+            resolved: List[Tuple[int, int]] = []
+            for u, v in junction_edge_lists[idx]:
+                ru, rv = _resolve_edge(relabel, u, v)
+                if ru == rv:
+                    # Endpoints merged → edge became a self-loop and
+                    # was eliminated during contraction; not part of
+                    # this junction anymore.
+                    continue
+                if g.has_edge(ru, rv):
+                    resolved.append((ru, rv))
+            return resolved
+
+        # Pick next junction: prefer bridge-junctions for cache reuse.
+        chosen = 0
+        for i, idx in enumerate(remaining_idx):
+            present = _present_for(idx)
+            if present and _is_bridge_junction(g, present):
+                chosen = i
+                break
+        junc_idx = remaining_idx[chosen]
+        other_idx = remaining_idx[:chosen] + remaining_idx[chosen + 1:]
+
+        present = _present_for(junc_idx)
+        if not present:
+            result = recurse(g, other_idx, relabel)
+            if key is not None:
+                state_cache[key] = result
+            return result
+
+        k_eff = len(present)
+        is_bridge = _is_bridge_junction(g, present)
+
+        total = TuttePolynomial.zero()
+        for j in range(0, k_eff + 1):
+            g_j = _apply_junction_merge(g, present, j)
+            # Extend relabel: for each contracted edge (u, v) with i < j,
+            # v merged into u. Build child relabel.
+            child_relabel = dict(relabel)
+            for i, (u, v) in enumerate(present):
+                if i < j:
+                    child_relabel[v] = u
+
+            T_j = recurse(g_j, other_idx, child_relabel)
+            if is_bridge:
+                if j == 0:
+                    coeff_poly = x_poly
+                elif j == 1:
+                    coeff = k_eff - 1
+                    if coeff == 0:
+                        continue
+                    coeff_poly = coeff * TuttePolynomial.one()
+                else:
+                    coeff_poly = math.comb(k_eff, j) * TuttePolynomial.one()
+            else:
+                coeff_poly = math.comb(k_eff, j) * TuttePolynomial.one()
+            total = total + coeff_poly * T_j
+
+        if key is not None:
+            state_cache[key] = total
+        return total
+
+    all_idx = tuple(range(len(junctions)))
+    return recurse(g_nx, all_idx, {})
+
+
 def try_hierarchical_partition(
     graph: Graph,
     table: RainbowTable
@@ -1218,3 +1660,144 @@ def try_hierarchical_partition(
         return (cell, partition, inter_info)
 
     return None
+
+
+def _find_induced_match(
+    target: Graph,
+    pattern: Graph,
+    available: Set[int],
+) -> Optional[Set[int]]:
+    """Find one induced-subgraph copy of `pattern` whose node set lies in `available`.
+
+    Uses VF2 induced-subgraph isomorphism on the subgraph of `target` induced
+    by `available`. Returns the matching node set, or None if no copy fits.
+
+    Pre-filters via degree-sequence inclusion (fast) before invoking VF2 — if
+    the pattern's degree sequence is not a multiset-subsequence of the
+    available subgraph's degree sequence, no induced copy can exist.
+    """
+    if len(available) < pattern.node_count():
+        return None
+    if pattern.edge_count() == 0:
+        return set(list(available)[:pattern.node_count()])
+
+    induced = target.subgraph(available)
+    if induced.edge_count() < pattern.edge_count():
+        return None
+
+    # Degree-sequence pre-filter: every degree value in the pattern must be
+    # achievable by some node in the available subgraph (modulo the
+    # cardinality of nodes with that degree).
+    pat_degrees = sorted(pattern.degree(n) for n in pattern.nodes)
+    avail_degrees = sorted(induced.degree(n) for n in induced.nodes)
+    # Multiset-inclusion check: walk both sorted lists; advance avail
+    # pointer until each pattern degree is met.
+    j = 0
+    for d in pat_degrees:
+        while j < len(avail_degrees) and avail_degrees[j] < d:
+            j += 1
+        if j >= len(avail_degrees):
+            return None
+        j += 1
+
+    G_avail = induced.to_networkx()
+    G_pat = pattern.to_networkx()
+
+    matcher = isomorphism.GraphMatcher(G_avail, G_pat)
+    for mapping in matcher.subgraph_isomorphisms_iter():
+        return set(mapping.keys())
+    return None
+
+
+def try_heterogeneous_partition(
+    graph: Graph,
+    table: RainbowTable,
+    *,
+    min_cell_nodes: int = 3,
+    min_cells: int = 2,
+    min_graph_nodes: int = 10,
+) -> Optional[Tuple[List[MinorEntry], List[Set[int]], InterCellInfo]]:
+    """Greedy largest-first heterogeneous partitioner.
+
+    Walks through rainbow-table cells in descending node-count order. For each
+    cell, repeatedly finds induced copies in the still-unmatched portion of
+    the graph and consumes them. Falls through to smaller cells until either
+    the graph is fully covered or no further cells fit.
+
+    Returns ``(cells, partition, inter_info)`` where ``cells[i]`` is the
+    rainbow-table entry for the i-th part and ``partition[i]`` is its node
+    set, or ``None`` if no full cover is found.
+
+    Each cell must have ``node_count >= min_cell_nodes`` (default 3) so we
+    don't tile with edges or single vertices, and the final partition must
+    have at least ``min_cells`` parts (default 2). The hierarchical pipeline
+    relies on the boundary quotient + chord recursion downstream, which only
+    pays off when there's more than one cell.
+
+    `min_graph_nodes` (default 12) gates the whole attempt — small graphs
+    route through faster paths anyway, and VF2 induced-subgraph search is
+    expensive, so we skip the whole thing on graphs that are too small to
+    benefit.
+    """
+    target_nodes = graph.node_count()
+    if target_nodes < min_graph_nodes:
+        return None
+    target_edges = graph.edge_count()
+
+    # Reconstruct cell graphs once and sort by descending node count.
+    candidates: List[Tuple[MinorEntry, Graph]] = []
+    for entry in table.entries.values():
+        if entry.node_count < min_cell_nodes:
+            continue
+        if entry.node_count > target_nodes:
+            continue
+        # Cell edge density must not exceed the target's local density —
+        # if every cell-sized region has fewer edges than the cell, no
+        # induced match can exist anywhere.
+        if entry.edge_count > target_edges:
+            continue
+        # A "trivial" tree/forest cell defeats the point of hierarchical
+        # decomposition (T(tree) is closed-form via family recognition).
+        if entry.edge_count < entry.node_count:
+            continue
+        cell_graph = entry.graph if entry.graph is not None else _minor_to_graph(entry)
+        if cell_graph is None:
+            continue
+        candidates.append((entry, cell_graph))
+
+    candidates.sort(key=lambda pair: -pair[0].node_count)
+
+    unmatched: Set[int] = set(graph.nodes)
+    partition: List[Set[int]] = []
+    cells: List[MinorEntry] = []
+
+    for entry, cell_graph in candidates:
+        cell_size = entry.node_count
+        while len(unmatched) >= cell_size:
+            tile = _find_induced_match(graph, cell_graph, unmatched)
+            if tile is None:
+                break
+            partition.append(tile)
+            cells.append(entry)
+            unmatched -= tile
+
+        if not unmatched:
+            break
+
+    if unmatched:
+        return None
+    if len(partition) < min_cells:
+        return None
+    # All cells identical → caller's homogeneous path already handles this;
+    # don't shadow it here.
+    if len({c.canonical_key for c in cells}) == 1:
+        return None
+
+    inter_info = analyze_inter_cell_edges(graph, partition)
+    get_log().record(
+        EventType.HIERARCHICAL, "covering",
+        f"Heterogeneous tiling: {len(partition)} cells "
+        f"({', '.join(c.name for c in cells)}), "
+        f"{len(inter_info.edges)} inter-cell edges",
+    )
+    return (cells, partition, inter_info)

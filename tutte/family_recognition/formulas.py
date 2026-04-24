@@ -20,17 +20,10 @@ from __future__ import annotations
 from typing import Optional
 
 from ..polynomial import TuttePolynomial, cycle_polynomial
-from .constants import (
-    BOOK_A, BOOK_B, BOOK_BASES,
-    FAN_A, FAN_B, FAN_BASES,
-    GEAR_A, GEAR_B, GEAR_C, GEAR_BASES,
-    LADDER_A, LADDER_B, LADDER_BASES,
-    MOBIUS_BASES,
-    PRISM_BASES,
-    WHEEL_A, WHEEL_B, WHEEL_C, WHEEL_BASES,
-    apply_order6_recurrence,
-)
-
+from .constants import (BOOK_A, BOOK_B, BOOK_BASES, FAN_A, FAN_B, FAN_BASES,
+                        GEAR_A, GEAR_B, GEAR_BASES, GEAR_C, LADDER_A, LADDER_B,
+                        LADDER_BASES, MOBIUS_BASES, PRISM_BASES, WHEEL_A,
+                        WHEEL_B, WHEEL_BASES, WHEEL_C, apply_order6_recurrence)
 
 # =============================================================================
 # TIER 1 — CLOSED-FORM FORMULAS
@@ -316,5 +309,11 @@ def grid_recurrence(m: int, n: int) -> Optional[TuttePolynomial]:
     if m == 2:
         return ladder_recurrence(n)
 
-    # m >= 3: transfer matrix approach not yet implemented
+    # m >= 3: transfer matrix has Bell(m) states per column (Bell(3)=5,
+    # Bell(6)=203, Bell(10)=115975). A pure-Python implementation would be
+    # slower than the engine's C-extension treewidth_dp for the same Bell(m)
+    # state space. The k-sum handles m >= 7 grids via
+    # chord-rule paths once treewidth_dp's heuristic decomposition fails.
+    # See `tutte/tests/test_benchmark_family_recognition.py`'s
+    # @pytest.mark.slow marker for the test that exercises this gap.
     return None

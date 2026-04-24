@@ -245,14 +245,19 @@ def _c_modular_det(M):
 _MODULAR_PRIMES_CACHE: dict = {}
 
 
-def _get_modular_primes(n_needed, bits=50):
+def _get_modular_primes(n_needed, bits=50, form='any'):
     """Get at least n_needed distinct primes of the given bit-width.
 
     Uses Miller-Rabin primality test (deterministic for < 2^64).
-    Cached per bit-width. Defaults to 50-bit for backwards compatibility.
+    Cached per (bit-width, form). Defaults to 50-bit for backwards compatibility.
     62-bit is the max safe size for coeff_add/coeff_mul (int64 sum + __int128 prod).
+
+    form='any': primes near 2^bits (default, matches prior behavior).
+    form='mersenne_below': primes of form 2^bits - c with small c. Enables
+      pseudo-Mersenne reduction in C coeff_mul.
     """
-    cached = _MODULAR_PRIMES_CACHE.get(bits)
+    cache_key = (bits, form)
+    cached = _MODULAR_PRIMES_CACHE.get(cache_key)
     if cached is not None and len(cached) >= n_needed:
         return cached[:n_needed]
 
@@ -282,19 +287,25 @@ def _get_modular_primes(n_needed, bits=50):
                 return False
         return True
 
-    starts = {50: (1 << 50) - 27, 62: (1 << 62) - 57}
-    p = starts.get(bits, (1 << bits) | 1)
+    if form == 'mersenne_below':
+        # Primes p = 2^bits - c with small c. Start at 2^bits - 1, step down by 2.
+        p = (1 << bits) - 1
+        step = -2
+    else:
+        starts = {50: (1 << 50) - 27, 62: (1 << 62) - 57}
+        p = starts.get(bits, (1 << bits) | 1)
+        step = 2
 
     primes = []
     target = max(n_needed, 200)
     while len(primes) < target:
         if _is_prime(p):
             primes.append(p)
-        p += 2  # Next odd candidate
+        p += step
         if p % 2 == 0:
-            p += 1
+            p += 1 if step > 0 else -1
 
-    _MODULAR_PRIMES_CACHE[bits] = primes
+    _MODULAR_PRIMES_CACHE[cache_key] = primes
     return primes[:n_needed]
 
 

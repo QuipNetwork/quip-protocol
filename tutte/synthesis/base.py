@@ -11,12 +11,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
-from ..polynomial import TuttePolynomial
 from ..graph import Graph, MultiGraph
 from ..graphs.series_parallel import compute_sp_tutte_multigraph_if_applicable
 from ..graphs.treewidth import compute_treewidth_tutte_if_applicable
-from ..logs import get_log, EventType, LogLevel
-
+from ..logs import EventType, LogLevel, get_log
+from ..polynomial import TuttePolynomial
 
 # =============================================================================
 # UNION-FIND (for bridge/chord classification)
@@ -162,6 +161,9 @@ class BaseMultigraphSynthesizer:
                 _log.record(EventType.CACHE_HIT, "base",
                             f"MG cache hit: {mg.node_count()}n {mg.edge_count()}e",
                             LogLevel.DEBUG, graph=mg)
+                # Record cache-hit multigraphs for the visualizer's
+                # Contributing Graphs panel.
+                self._record_synth(mg, cache_key)
                 return self._multigraph_cache[cache_key]
         elif not self._fast_hash_set_complete:
             cache_key = mg.canonical_key()
@@ -170,6 +172,7 @@ class BaseMultigraphSynthesizer:
                             f"MG cache hit (unindexed): {mg.node_count()}n {mg.edge_count()}e",
                             LogLevel.DEBUG, graph=mg)
                 self._fast_hash_set.add(fh)
+                self._record_synth(mg, cache_key)
                 return self._multigraph_cache[cache_key]
         else:
             cache_key = None  # Guaranteed miss — skip canonical_key
@@ -187,6 +190,35 @@ class BaseMultigraphSynthesizer:
             self._multigraph_cache[cache_key] = sp_poly
             self._fast_hash_set.add(fh)
             return sp_poly
+
+        # (April 2026): recursive hierarchical for simple
+        # multigraphs with enough edges. Chord-rule LEAVES often have cell
+        # structure (Z(1,1) inside a Z(1,2)-leaf, Cm1 inside a Cm2-leaf,
+        # etc.) that decomposes via hierarchical tiling much faster than
+        # treewidth_dp's per-leaf cost (~168s at tw=10, ~207s at tw=11).
+        # Only the SynthesisEngine subclass has `_try_hierarchical`; other
+        # multigraph synthesizers (e.g. test stubs) skip this step via the
+        # hasattr check.
+        if (
+            mg.is_simple()
+            and mg.edge_count() >= 20
+            and hasattr(self, '_try_hierarchical')
+        ):
+            simple = mg.to_simple_graph()
+            if simple is not None:
+                hier_result = self._try_hierarchical(simple, max_depth)
+                if hier_result is not None:
+                    self._log(
+                        f"Hierarchical (multigraph leaf): "
+                        f"{mg.node_count()}n {mg.edge_count()}e"
+                    )
+                    if cache_key is None:
+                        cache_key = mg.canonical_key()
+                    self._multigraph_cache[cache_key] = hier_result.polynomial
+                    self._fast_hash_set.add(fh)
+                    if hasattr(self, '_mg_minors_accum'):
+                        self._mg_minors_accum |= hier_result.minors_used
+                    return hier_result.polynomial
 
         # 4.7 Treewidth-based O(n · B(w+1)²) computation
         # max_width=11: supports up to Chimera(2) graphs (tw=11).

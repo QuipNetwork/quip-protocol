@@ -19,7 +19,7 @@ from .validation import (
 # Graph algorithms
 from .graphs import (
     is_series_parallel, compute_sp_tutte_if_applicable,
-    polynomial_divmod, polynomial_divide, tutte_k,
+    polynomial_divmod, polynomial_divide,
     is_graph_minor,
 )
 
@@ -38,13 +38,4 @@ from .synthesis import (
     compute_tutte_polynomial,
     AlgebraicSynthesisEngine, AlgebraicSynthesisResult,
     HybridSynthesisEngine, HybridSynthesisResult,
-)
-
-# Matroid infrastructure
-from .matroids import (
-    GraphicMatroid, FlatLattice, Edge,
-    enumerate_flats, enumerate_flats_with_hasse,
-    is_cyclic_flat, enumerate_cyclic_flats,
-    BivariateLaurentPoly, theorem6_parallel_connection,
-    precompute_contractions, build_extended_cell_graph,
 )

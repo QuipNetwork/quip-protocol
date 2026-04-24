@@ -61,6 +61,10 @@ class EventLog:
         self.capture_graphs: bool = False
         self._graph_snapshots: Dict[str, Dict[str, Any]] = {}
         self._snapshot_cap_warned: bool = False
+        # Dedup keys for provenance instances (keyed by canonical_key).
+        # Kept out of the snapshot dict so the snapshot stays
+        # JSON-serializable for SSE streaming.
+        self._provenance_seen: Dict[str, set] = {}
 
     def record(
         self,
@@ -70,6 +74,7 @@ class EventLog:
         level: LogLevel = LogLevel.INFO,
         *,
         graph: Optional[Any] = None,
+        provenance: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Append a timestamped event at the current recursion depth.
 
@@ -81,6 +86,11 @@ class EventLog:
         canonical key) and the resulting key is set on the event. The
         snapshot dict is capped at _SNAPSHOT_CAP; overflow is ignored after
         one WARN.
+
+        If `provenance` is given, it's attached to the Event and to the
+        snapshot dict (if any). Schema: ``{"target_nodes": [...],
+        "target_edges": [[u, v], ...]}``. Used by the visualizer to
+        highlight where the sub-graph lives in the input graph.
         """
         if level.value < self.min_level.value:
             if self._scope_stack:
@@ -94,7 +104,7 @@ class EventLog:
 
         graph_key: Optional[str] = None
         if graph is not None and self.capture_graphs:
-            graph_key = self._capture_snapshot(graph, timestamp)
+            graph_key = self._capture_snapshot(graph, timestamp, provenance)
 
         self._events.append(
             Event(
@@ -105,16 +115,41 @@ class EventLog:
                 message=message,
                 level=level,
                 graph_key=graph_key,
+                provenance=provenance,
             )
         )
 
-    def _capture_snapshot(self, graph: Any, timestamp: float) -> Optional[str]:
-        """Serialize `graph` into the snapshot dict, keyed by canonical key."""
+    def _capture_snapshot(
+        self,
+        graph: Any,
+        timestamp: float,
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Serialize `graph` into the snapshot dict, keyed by canonical key.
+
+        Provenance is stored as a list of instances under
+        ``snapshot["provenance"]``: each entry is a separate mapping
+        back to the target graph. Multiple structurally-identical cells
+        (e.g., 4 Cm1 cells in Cm2) collapse to one canonical snapshot
+        but keep distinct provenance entries — the visualizer can
+        highlight all instances.
+        """
         try:
             key = graph.canonical_key()
         except Exception:
             return None
         if key in self._graph_snapshots:
+            existing = self._graph_snapshots[key]
+            if provenance is not None:
+                lst = existing.setdefault("provenance", [])
+                fp = (
+                    tuple(sorted(provenance.get("target_nodes", []))),
+                    tuple(sorted(tuple(e) for e in provenance.get("target_edges", []))),
+                )
+                seen = self._provenance_seen.setdefault(key, set())
+                if fp not in seen:
+                    seen.add(fp)
+                    lst.append(provenance)
             return key
         if len(self._graph_snapshots) >= _SNAPSHOT_CAP:
             if not self._snapshot_cap_warned:
@@ -133,6 +168,13 @@ class EventLog:
         snapshot = _graph_to_snapshot(graph)
         if snapshot is None:
             return None
+        if provenance is not None:
+            snapshot["provenance"] = [provenance]
+            fp = (
+                tuple(sorted(provenance.get("target_nodes", []))),
+                tuple(sorted(tuple(e) for e in provenance.get("target_edges", []))),
+            )
+            self._provenance_seen[key] = {fp}
         self._graph_snapshots[key] = snapshot
         return key
 
@@ -167,6 +209,7 @@ class EventLog:
         self._start_time = None
         self._scope_stack.clear()
         self._graph_snapshots.clear()
+        self._provenance_seen.clear()
         self._snapshot_cap_warned = False
 
     def graph_snapshot(self, key: str) -> Optional[Dict[str, Any]]:
