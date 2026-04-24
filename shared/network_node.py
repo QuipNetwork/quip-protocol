@@ -1090,8 +1090,17 @@ class NetworkNode(Node):
                     f"SWIM: {peer} now SUSPECT (direct heartbeat failed)"
                 )
         elif ev == "gossip_result":
-            # Counters already recorded in child; nothing else to do.
-            pass
+            # Pool child tracks its own sent/failed counters for the
+            # periodic gossip_stats log; the parent feeds the signal
+            # into the peer scorer so unresponsive peers accumulate
+            # negative score and get evicted by the disconnect loop.
+            # Reuses the heartbeat weights (+1.0 / -2.0) since a
+            # gossip RTT is the same quality of responsiveness
+            # signal as a heartbeat response.
+            if event.get("success"):
+                self._peer_scorer.record_heartbeat_ok(peer)
+            else:
+                self._peer_scorer.record_heartbeat_fail(peer)
         elif ev in ("block_data", "block_header_data", "status_data",
                     "peers_data", "probe_result"):
             rid = event.get("request_id")
@@ -3130,13 +3139,22 @@ class NetworkNode(Node):
         Routes through the per-peer child when one exists (fire-and-
         forget; the matching ``gossip_result`` event is collected by
         the pool drain). Otherwise falls back to ``node_client``.
+
+        The direct-path fallback mirrors the pool path's scorer
+        feedback so unresponsive peers are penalized regardless of
+        which transport was used.
         """
         pool = self._process_pool
         if pool is not None and pool.has_peer(host):
             return pool.send_gossip(host, message.to_network())
         if not self.node_client:
             return False
-        return await self.node_client.gossip_to(host, message)
+        ok = await self.node_client.gossip_to(host, message)
+        if ok:
+            self._peer_scorer.record_heartbeat_ok(host)
+        else:
+            self._peer_scorer.record_heartbeat_fail(host)
+        return ok
 
     async def gossip(self, message: Message):
         """Gossip a new message and log timings for the broadcast."""

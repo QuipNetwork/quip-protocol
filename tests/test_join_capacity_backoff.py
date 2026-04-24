@@ -4,6 +4,8 @@ Exercises the coordinator-side changes that break the JOIN retry storm:
   * ``connect_to_peer`` treats ``status == "at_capacity"`` as a
     non-success and records a cooldown.
   * ``gossip_broadcast`` skips peers that SWIM has declared DEAD.
+  * Gossip RTT outcomes (``gossip_result`` events and direct-path
+    fallback) feed the peer scorer so unresponsive peers get evicted.
   * ``_setup_child_logging`` (in ``connection_process`` and
     ``listener_process``) silences aioquic internals.
 """
@@ -20,6 +22,7 @@ from shared.block import MinerInfo
 from shared.network_node import NetworkNode, Message
 from shared.node_client import QuicMessage, QuicMessageType
 from shared.peer_ban_list import PeerBanList, CAPACITY_COOLDOWN_MIN
+from shared.peer_scorer import PeerScorer
 from shared.swim_detector import PeerState, SwimDetector
 from shared.telemetry import TelemetryManager
 
@@ -288,3 +291,78 @@ async def test_capacity_rejection_without_descriptor_skips_telemetry(tmp_path):
     assert response.msg_type == QuicMessageType.JOIN_RESPONSE
 
     assert "noinfo:20049" not in node.telemetry._nodes
+
+
+# --- gossip RTT outcomes feed the peer scorer ---
+
+@pytest.mark.asyncio
+async def test_dispatch_gossip_result_success_records_score():
+    """A successful pool-path gossip bumps the peer score up."""
+    node = _make_node()
+    node._peer_scorer = PeerScorer()
+    node._pending_requests = {}
+
+    NetworkNode._dispatch_pool_event(
+        node, "peer:20049", {"event": "gossip_result", "success": True},
+    )
+
+    assert node._peer_scorer.get_score("peer:20049") > 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_gossip_result_failure_records_score():
+    """A failed pool-path gossip bumps the peer score down."""
+    node = _make_node()
+    node._peer_scorer = PeerScorer()
+    node._pending_requests = {}
+
+    NetworkNode._dispatch_pool_event(
+        node, "peer:20049", {"event": "gossip_result", "success": False},
+    )
+
+    assert node._peer_scorer.get_score("peer:20049") < 0
+
+
+@pytest.mark.asyncio
+async def test_gossip_to_fallback_records_failure():
+    """Direct-path gossip_to (no pool child) records a score penalty
+    on timeout so the disconnect loop eventually evicts stuck peers."""
+    node = _make_node()
+    node._peer_scorer = PeerScorer()
+    node._process_pool = None
+    node.node_client.gossip_to = AsyncMock(return_value=False)
+
+    msg = Message(
+        type="noop",
+        sender=node.public_host,
+        timestamp=1.0,
+        data=b"",
+        id="gossip-fail",
+    )
+    # Call the real gossip_to (bypass the AsyncMock set by _make_node).
+    ok = await NetworkNode.gossip_to(node, "stuck:20049", msg)
+
+    assert ok is False
+    assert node._peer_scorer.get_score("stuck:20049") < 0
+
+
+@pytest.mark.asyncio
+async def test_gossip_to_fallback_records_success():
+    """Direct-path gossip_to success also updates the scorer, matching
+    the pool path so both transports contribute to peer health."""
+    node = _make_node()
+    node._peer_scorer = PeerScorer()
+    node._process_pool = None
+    node.node_client.gossip_to = AsyncMock(return_value=True)
+
+    msg = Message(
+        type="noop",
+        sender=node.public_host,
+        timestamp=1.0,
+        data=b"",
+        id="gossip-ok",
+    )
+    ok = await NetworkNode.gossip_to(node, "good:20049", msg)
+
+    assert ok is True
+    assert node._peer_scorer.get_score("good:20049") > 0
