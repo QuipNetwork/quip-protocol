@@ -544,6 +544,14 @@ class NetworkNode(Node):
         self._stats_cache = None
         self._stats_cache_lock = asyncio.Lock()
 
+        # Rate-limited warning counters for hot-path failures we don't
+        # want to spam logs from. Mirrors the AsyncPipeSender pattern:
+        # log on first occurrence and every 100th thereafter.
+        self._warn_counters: Dict[str, int] = {}
+        # Listener-snapshot publish counter; drives a 60s cache-health
+        # summary line (every 12th iteration of the 5s push loop).
+        self._snapshot_iter: int = 0
+
         self.logger.info(f"Network node {self.node_name} initialized with config {json.dumps(config)}")
 
     async def start(self):
@@ -1281,6 +1289,26 @@ class NetworkNode(Node):
             "payload_b64": payload_b64,
         })
 
+    def _warn_rate_limited(
+        self, key: str, msg: str, *args, exc_info: bool = False,
+    ) -> None:
+        """Emit a WARNING for a repeating hot-path failure with rate limiting.
+
+        Mirrors ``AsyncPipeSender``'s pattern: log the first occurrence
+        and every 100th thereafter. ``key`` selects the counter bucket
+        (e.g. ``"snapshot.status"``) so distinct failure sites count
+        independently. Avoids both invisibility (the prior
+        ``logger.debug`` calls) and unbounded log spam when a failure
+        is persistent.
+        """
+        n = self._warn_counters.get(key, 0) + 1
+        self._warn_counters[key] = n
+        if n == 1 or n % 100 == 0:
+            self.logger.warning(
+                "[%s] " + msg + " (occurrence %d)",
+                key, *args, n, exc_info=exc_info,
+            )
+
     async def _listener_snapshot_loop(self) -> None:
         """Periodically push peer/ban + read-cache snapshots to the listener.
 
@@ -1304,7 +1332,15 @@ class NetworkNode(Node):
                     "peers": peers_snapshot,
                     "banned": banned,
                 })
-                listener.send_cmd(self._build_read_snapshot_cmd())
+                snapshot_cmd = self._build_read_snapshot_cmd()
+                listener.send_cmd(snapshot_cmd)
+                self._snapshot_iter += 1
+                # Every 12 iterations (~60s) log a summary so operators
+                # can see at a glance which fields are present in the
+                # snapshot. A persistently absent field points at a
+                # broken serializer or unpopulated source cache.
+                if self._snapshot_iter % 12 == 1:
+                    self._log_snapshot_health(snapshot_cmd, peers_snapshot)
                 await asyncio.sleep(5.0)
             except asyncio.CancelledError:
                 break
@@ -1313,6 +1349,34 @@ class NetworkNode(Node):
                     "Error in listener snapshot loop"
                 )
                 await asyncio.sleep(5.0)
+
+    def _log_snapshot_health(
+        self, snapshot_cmd: dict, peers_snapshot: dict,
+    ) -> None:
+        """Emit a one-line summary of the current snapshot's contents.
+
+        Drops at INFO so operators see steady-state cache health on a
+        normal log level. Counts bytes per field so a serializer
+        regression that produces empty payloads is also visible.
+        """
+        def _len(b) -> int:
+            return len(b) if isinstance(b, (bytes, bytearray)) else 0
+
+        telemetry = snapshot_cmd.get("telemetry") or {}
+        self.logger.info(
+            "listener-snapshot health: status=%dB stats=%dB peers=%dB "
+            "(%d hosts) telemetry={status=%dB nodes=%dB epochs=%dB "
+            "latest=%dB blocks=%d}",
+            _len(snapshot_cmd.get("status")),
+            _len(snapshot_cmd.get("stats")),
+            _len(snapshot_cmd.get("peers")),
+            len(peers_snapshot),
+            _len(telemetry.get("status")),
+            _len(telemetry.get("nodes")),
+            _len(telemetry.get("epochs")),
+            _len(telemetry.get("latest")),
+            len(telemetry.get("blocks") or {}),
+        )
 
     def _build_read_snapshot_cmd(self) -> dict:
         """Build the IPC command carrying serialized read responses.
@@ -1343,7 +1407,11 @@ class NetworkNode(Node):
             }
             return json.dumps(status_data).encode("utf-8")
         except Exception:
-            self.logger.debug("status snapshot build failed", exc_info=True)
+            self._warn_rate_limited(
+                "snapshot.status",
+                "status snapshot build failed; cache field will be None",
+                exc_info=True,
+            )
             return None
 
     def _serialize_stats_response(self) -> Optional[bytes]:
@@ -1353,7 +1421,11 @@ class NetworkNode(Node):
         try:
             return json.dumps(self._stats_cache).encode("utf-8")
         except Exception:
-            self.logger.debug("stats snapshot build failed", exc_info=True)
+            self._warn_rate_limited(
+                "snapshot.stats",
+                "stats snapshot build failed; cache field will be None",
+                exc_info=True,
+            )
             return None
 
     def _serialize_peers_response(self) -> Optional[bytes]:
@@ -1365,7 +1437,11 @@ class NetworkNode(Node):
             }
             return json.dumps({"peers": peers_data}).encode("utf-8")
         except Exception:
-            self.logger.debug("peers snapshot build failed", exc_info=True)
+            self._warn_rate_limited(
+                "snapshot.peers",
+                "peers snapshot build failed; cache field will be None",
+                exc_info=True,
+            )
             return None
 
     def _serialize_telemetry_responses(self) -> dict:
@@ -1381,25 +1457,41 @@ class NetworkNode(Node):
                 self.telemetry_cache.get_status()
             ).encode("utf-8")
         except Exception:
-            self.logger.debug("telemetry status snapshot failed", exc_info=True)
+            self._warn_rate_limited(
+                "snapshot.telemetry_status",
+                "telemetry status snapshot failed",
+                exc_info=True,
+            )
         try:
             nodes = self.telemetry_cache.get_nodes()
             if nodes is not None:
                 out["nodes"] = json.dumps(nodes).encode("utf-8")
         except Exception:
-            self.logger.debug("telemetry nodes snapshot failed", exc_info=True)
+            self._warn_rate_limited(
+                "snapshot.telemetry_nodes",
+                "telemetry nodes snapshot failed",
+                exc_info=True,
+            )
         try:
             out["epochs"] = json.dumps(
                 {"epochs": self.telemetry_cache.get_epochs()}
             ).encode("utf-8")
         except Exception:
-            self.logger.debug("telemetry epochs snapshot failed", exc_info=True)
+            self._warn_rate_limited(
+                "snapshot.telemetry_epochs",
+                "telemetry epochs snapshot failed",
+                exc_info=True,
+            )
         try:
             latest = self.telemetry_cache.get_latest()
             if latest is not None:
                 out["latest"] = json.dumps(latest).encode("utf-8")
         except Exception:
-            self.logger.debug("telemetry latest snapshot failed", exc_info=True)
+            self._warn_rate_limited(
+                "snapshot.telemetry_latest",
+                "telemetry latest snapshot failed",
+                exc_info=True,
+            )
         return out
 
     def _get_handler_executor(self) -> ProcessPoolExecutor:

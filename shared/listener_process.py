@@ -217,6 +217,15 @@ class _PeerSnapshotCache:
     )
     read_snapshot_ts: float = 0.0
     staleness_limit: float = 30.0
+    # Cache observability counters. ``hits`` increments on a successful
+    # local serve; ``miss_stale`` when the snapshot has aged out;
+    # ``miss_field`` when the snapshot is fresh but the requested field
+    # is None (serializer failed coordinator-side or value not yet
+    # populated). A predominantly ``miss_field`` pattern points at a
+    # broken serializer, ``miss_stale`` at a snapshot-loop issue.
+    hits: int = 0
+    miss_stale: int = 0
+    miss_field: int = 0
 
     def read_snapshot_fresh(self) -> bool:
         """True when the read snapshot is within its staleness limit."""
@@ -342,6 +351,11 @@ async def _listener_loop(
         f"{config_bundle['port']}"
     )
 
+    cache_log_task = asyncio.create_task(
+        _periodic_cache_log(cache, log, stop_event),
+        name="listener-cache-log",
+    )
+
     try:
         while not stop_event.is_set():
             try:
@@ -386,6 +400,11 @@ async def _listener_loop(
                 log.warning(f"Unknown listener cmd: {op}")
     finally:
         server.close()
+        cache_log_task.cancel()
+        try:
+            await cache_log_task
+        except (asyncio.CancelledError, Exception):
+            pass
         # Drop outstanding forwards so their protocol tasks don't hang.
         for fut in pending_forwards.values():
             if not fut.done():
@@ -514,6 +533,43 @@ def _build_listener_protocol(
     return _ListenerProtocol(quic, stream_handler)
 
 
+async def _periodic_cache_log(
+    cache: _PeerSnapshotCache,
+    log: logging.Logger,
+    stop_event: mp.synchronize.Event,
+    interval: float = 60.0,
+) -> None:
+    """Emit a cache-health summary every ``interval`` seconds.
+
+    A predominantly-stale cache (``miss_stale`` rising while ``hits``
+    stays flat) points at the snapshot loop being slow, dead, or its
+    IPC drops being silently dropped. A predominantly-field-missing
+    cache (``miss_field`` rising) points at a coordinator-side
+    serializer failing — the warnings raised by ``_warn_rate_limited``
+    on the parent should pinpoint which one.
+
+    Snapshot age is reported in seconds since the last successful
+    apply; -1 if no snapshot has ever been received.
+    """
+    while not stop_event.is_set():
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            return
+        age = (
+            time.time() - cache.read_snapshot_ts
+            if cache.read_snapshot_ts > 0 else -1.0
+        )
+        log.info(
+            "listener-cache stats: hits=%d miss_stale=%d miss_field=%d "
+            "snapshot_age=%.1fs status=%s stats=%s peers=%s",
+            cache.hits, cache.miss_stale, cache.miss_field, age,
+            "present" if cache.status_response else "ABSENT",
+            "present" if cache.stats_response else "ABSENT",
+            "present" if cache.peers_response else "ABSENT",
+        )
+
+
 def _apply_read_snapshot(cache: _PeerSnapshotCache, cmd: dict) -> None:
     """Replace the cache's read-snapshot fields from an IPC command.
 
@@ -551,10 +607,12 @@ def _try_cached_read(msg, cache: _PeerSnapshotCache):
 
     Only handles the read-only message types. Returns None if the
     cache is stale, missing the needed payload, or the message type
-    isn't in the local fast path.
+    isn't in the local fast path. Updates the cache's hit/miss
+    counters so the listener loop can log periodic health summaries.
     """
     from shared.node_client import QuicMessageType
     if not cache.read_snapshot_fresh():
+        cache.miss_stale += 1
         return None
 
     t = msg.msg_type
@@ -575,10 +633,13 @@ def _try_cached_read(msg, cache: _PeerSnapshotCache):
     elif t == QuicMessageType.TELEMETRY_BLOCK_REQUEST:
         payload = _lookup_telemetry_block(msg, cache)
     else:
+        # Not a read-only message; not a real cache miss — don't count.
         return None
 
     if payload is None:
+        cache.miss_field += 1
         return None
+    cache.hits += 1
     return msg.create_response(payload)
 
 
@@ -704,6 +765,17 @@ async def _forward_to_coordinator(
         return msg.create_error_response("Coordinator timeout")
 
     if payload is None:
+        # Coordinator replied but with payload_b64 == None. This means
+        # ``_handle_quic_message`` returned None (which it shouldn't
+        # for any read message type) or the coordinator failed to
+        # decode the forwarded raw bytes. Either is a contract bug —
+        # surface it loudly so the next failure isn't another silent
+        # drop. The caller's invariant repair returns ERROR_RESPONSE.
+        logging.getLogger("listener").warning(
+            "Coordinator returned payload_b64=None for %s "
+            "(request_id=%d); silent-drop path was triggered",
+            msg.msg_type.name, msg.request_id,
+        )
         return None
     try:
         return QuicMessage.from_bytes(payload)
