@@ -281,6 +281,79 @@ class TestListenerReadSnapshot:
             await client.stop()
 
     @pytest.mark.asyncio
+    async def test_silent_drop_path_returns_error_response(self, listener):
+        """Cache-stale + forward-None must produce ERROR_RESPONSE, never silence.
+
+        Reproduces the production silent-drop scenario: the read
+        snapshot has no status payload (forces a forward), and the
+        coordinator emulator replies with ``payload_b64=None``
+        (mimicking the contract violation where ``_handle_quic_message``
+        returns None). Before the invariant repair, the listener
+        returned silently and the client timed out — now the listener
+        must synthesize an ERROR_RESPONSE so the client can
+        distinguish a degraded node from a dead one.
+        """
+        handle, port = listener
+        handle.send_cmd({
+            "cmd": "peer_snapshot", "peers": {}, "banned": [],
+        })
+        handle.send_cmd({
+            "cmd": "read_snapshot",
+            "status": None, "stats": None, "peers": None,
+            "telemetry": {},
+        })
+        await asyncio.sleep(0.6)
+
+        async def parent_emulator():
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                msg = handle.recv()
+                if msg is None:
+                    await asyncio.sleep(0.02)
+                    continue
+                if msg.get("event") != "inbound_message":
+                    continue
+                msg_id = msg.get("msg_id")
+                raw = base64.b64decode(msg.get("raw_b64", ""))
+                incoming = QuicMessage.from_bytes(raw)
+                if incoming.msg_type != QuicMessageType.STATUS_REQUEST:
+                    continue
+                # Simulate the coordinator returning no payload — the
+                # contract violation that previously caused silent drop.
+                handle.send_cmd({
+                    "cmd": "inbound_response",
+                    "msg_id": msg_id,
+                    "payload_b64": None,
+                })
+                return
+
+        emu = asyncio.create_task(parent_emulator())
+        client = NodeClient(
+            node_timeout=5.0, verify_tls=False, connect_timeout=2.0,
+        )
+        await client.start()
+        try:
+            ok = await client.connect_to_peer(f"127.0.0.1:{port}")
+            assert ok
+            protocol = await client._get_connection(f"127.0.0.1:{port}")
+            assert protocol is not None
+            response = await protocol.send_request(
+                QuicMessageType.STATUS_REQUEST, b"", timeout=5.0,
+            )
+            # The invariant is: every well-formed request gets some
+            # response. Specifically an ERROR_RESPONSE here, with the
+            # request_id preserved so client correlation works.
+            assert response is not None, (
+                "listener silently dropped STATUS_REQUEST"
+            )
+            assert response.msg_type == QuicMessageType.ERROR_RESPONSE
+            assert b"STATUS_REQUEST" in response.payload
+            assert b"cache stale" in response.payload
+        finally:
+            await client.stop()
+            await emu
+
+    @pytest.mark.asyncio
     async def test_missing_field_falls_back_to_forward(self, listener):
         """If read_snapshot has None for a field, the listener forwards."""
         handle, port = listener

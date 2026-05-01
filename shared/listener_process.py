@@ -515,7 +515,19 @@ def _build_listener_protocol(
                 response = msg.create_error_response(str(exc))
 
             if response is None:
-                return
+                # Every well-formed request must elicit a response —
+                # silent drop leaves clients unable to distinguish a
+                # dead node from a degraded one, and bypasses
+                # already-existing client error handling. Reaching
+                # here means the cache was stale AND the coordinator
+                # forward returned None (a contract violation logged
+                # at WARNING by ``_forward_to_coordinator``); convert
+                # the silent drop to an explicit ERROR_RESPONSE so
+                # the client sees what's wrong on the next round-trip.
+                response = msg.create_error_response(
+                    f"unable to serve {msg.msg_type.name}: "
+                    "cache stale and coordinator unreachable",
+                )
 
             try:
                 response_bytes = response.to_bytes()
