@@ -821,10 +821,33 @@ class Node:
 
         Returns a JSON-friendly dict. Cached after first call; call
         ``invalidate_descriptor()`` if miners_config changes.
+
+        ``build_descriptor`` probes hardware via subprocess (sysctl,
+        ioreg, lspci) and can fail on minimal containers, sandboxed
+        environments, or unusual platforms. Previously the exception
+        propagated and poisoned every caller — including the
+        STATUS_REQUEST handler and the listener-snapshot serializer,
+        producing the silent-drop / blank-cache symptom on affected
+        nodes. We now cache a minimal fallback on failure so callers
+        always get a JSON-friendly dict; the ``available: False`` flag
+        is observable to clients that want to flag degraded peers.
         """
         if self._descriptor_cache is None:
-            desc = build_descriptor(self.node_id, self.miners_config)
-            self._descriptor_cache = desc.to_dict()
+            try:
+                desc = build_descriptor(self.node_id, self.miners_config)
+                self._descriptor_cache = desc.to_dict()
+            except Exception as exc:
+                self.logger.warning(
+                    "build_descriptor failed for node %s; "
+                    "using fallback descriptor: %s",
+                    self.node_id, exc, exc_info=True,
+                )
+                self._descriptor_cache = {
+                    "node_id": self.node_id,
+                    "node_name": getattr(self, "node_name", self.node_id),
+                    "available": False,
+                    "error": str(exc),
+                }
         return self._descriptor_cache
 
     def invalidate_descriptor(self) -> None:
