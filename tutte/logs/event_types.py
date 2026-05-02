@@ -51,6 +51,7 @@ class EventType(Enum):
     CHORD_RULE = "chord_rule"
     UNIFIED_FORMULA = "unified_formula"
     KMATCHING_FORMULA = "kmatching_formula"
+    CELL_QUOTIENT_DP = "cell_quotient_dp"
 
     # --- CEJ path (covering.py) ---
     CANDIDATE_FILTER = "candidate_filter"

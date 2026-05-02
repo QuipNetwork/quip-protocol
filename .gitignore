@@ -64,3 +64,8 @@ localhost.pem
 
 # Logs
 *.log
+
+# Research scratch — raw experiment scripts and data dumps. Epitomized
+# results live in tutte/research/ (top level) and ARE tracked in git.
+tutte/research/scripts/
+tutte/research/data/

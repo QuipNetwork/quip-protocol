@@ -39,7 +39,8 @@ from ..graphs.covering import (Cover, Fringe, InterCellInfo,
                                try_heterogeneous_partition,
                                try_hierarchical_partition)
 from ..graphs.series_parallel import compute_sp_tutte_if_applicable
-from ..cotree_dp import compute_tutte_cotree_dp
+from ..cotree_dp import compute_tutte_cotree_dp, compute_tutte_almost_cograph
+from ..roots import compute_cell_quotient_cycle_dp
 from ..logs import EventType, LogLevel, get_log
 from ..lookup.core import MinorEntry, RainbowTable, load_default_table
 from ..polynomial import TuttePolynomial
@@ -605,6 +606,63 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         except (ValueError, TypeError):
             pass  # not a cograph, or input rejected — fall through
 
+        # 7.6. Almost-cograph DP — for graphs that become cographs after
+        # removing a small set of anomaly edges (e.g., D-Wave cells joined by
+        # sparse inter-cell edges). Greedy P_4 elimination + bridge-aware
+        # iterated chord rule on anomalies; the cograph skeleton routes
+        # through cotree_dp. Returns None if anomaly count > max_anomalies.
+        # Gate: cap at 16 anomalies (covers Cm2's 16 inter-cell edges; Cm3's
+        # 48 falls through to existing chord-rule paths).
+        try:
+            almost_poly = compute_tutte_almost_cograph(
+                graph, self, max_anomalies=16,
+            )
+            if almost_poly is not None:
+                _log.record(EventType.COTREE_DP, "engine",
+                            f"Almost-cograph DP: {n}n {m}e", graph=graph)
+                self._log(f"Almost-cograph DP: {n}n, {m}e")
+                result = SynthesisResult(
+                    polynomial=almost_poly,
+                    recipe=["Almost-cograph DP (greedy P_4 elim + chord rule)"],
+                    verified=True,
+                    method="almost_cograph",
+                )
+                self._cache[cache_key] = result
+                self._promote_to_table(graph, cache_key, result)
+                return result
+        except Exception:
+            pass  # any failure — fall through
+
+        # 7.7. Cell-quotient cycle DP — for cell-decomposable graphs whose
+        # cell-quotient is a SIMPLE CYCLE (e.g., D-Wave Cm2's 4-cycle of
+        # K_{4,4} cells). Combines T_rooted of cells with vertex-sum
+        # convolution + identification close. Generic over junction
+        # connectivity (handles M_k matchings, K_{a,b} bipartite, etc. via
+        # auto-detected component count c_J).
+        # Gate: edge_count >= 60 (matches formula shortcut). Only fires
+        # for graphs the formula shortcut and almost-cograph paths haven't
+        # already handled — so a fallback for cycle-topology cases like
+        # Cm2 when those paths return None.
+        if graph.edge_count() >= 60:
+            try:
+                cq_poly = compute_cell_quotient_cycle_dp(graph, self.table)
+                if cq_poly is not None:
+                    _log.record(EventType.CELL_QUOTIENT_DP, "engine",
+                                f"Cell-quotient cycle DP: {n}n {m}e",
+                                graph=graph)
+                    self._log(f"Cell-quotient cycle DP: {n}n, {m}e")
+                    result = SynthesisResult(
+                        polynomial=cq_poly,
+                        recipe=["Cell-quotient cycle DP"],
+                        verified=True,
+                        method="cell_quotient_dp",
+                    )
+                    self._cache[cache_key] = result
+                    self._promote_to_table(graph, cache_key, result)
+                    return result
+            except Exception:
+                pass  # any failure — fall through
+
         # 8. Treewidth DP — fast for graphs with treewidth ≤ 11. When this
         # succeeds it's usually the best path for graphs that fit. For graphs
         # whose treewidth exceeds the cap, returns None and we fall through to
@@ -1158,7 +1216,17 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             return None
 
         homo = try_hierarchical_partition(graph, self.table)
-        het = try_heterogeneous_partition(graph, self.table)
+        # Heterogeneous partition is VF2-heavy (~60-180s/call on 72n+ graphs
+        # because it walks the full ~1000-entry rainbow table). Skip in
+        # recursive sub-syntheses (depth > 1): they produce derived graphs
+        # (e.g., k-sum's PC = target + extra clique edges) that disrupt
+        # cell structure; heterogeneous almost always fails after burning
+        # significant VF2 time. Top-level calls still run both partitioners
+        # so we don't miss legitimate heterogeneous covers on user inputs.
+        if self._synth_depth <= 1:
+            het = try_heterogeneous_partition(graph, self.table)
+        else:
+            het = None
 
         candidates = []
         if homo is not None:

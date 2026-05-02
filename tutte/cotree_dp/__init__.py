@@ -26,9 +26,15 @@ Public API:
 
 from .recognition import CotreeNode, CotreeNodeType
 from .dp import compute_tutte_cotree_dp
+from .almost_cograph import (
+    compute_tutte_almost_cograph,
+    find_anomaly_edges,
+)
 
 __all__ = [
     'CotreeNode',
     'CotreeNodeType',
     'compute_tutte_cotree_dp',
+    'compute_tutte_almost_cograph',
+    'find_anomaly_edges',
 ]

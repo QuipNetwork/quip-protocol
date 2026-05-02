@@ -20,11 +20,14 @@ Detailed documentation for each technique used by the tutte synthesis engine to 
 | 4   | [Disconnected Factorization](04_disconnected_factorization.md) | Graph has multiple connected components                                                              | O(n + m) + recursive synthesis per component           |
 | 5   | [Cut Vertex Factorization](05_cut_vertex_factorization.md)     | Graph has an articulation point                                                                      | O(n + m) + recursive synthesis per block               |
 | 6   | [Treewidth DP](06_treewidth_dp.md)                             | Graphs ≥ 10 edges with treewidth ≤ 11 (catches most ≤ ~50-edge graphs and the D-Wave cases that fit) | O(2^tw × n) C-extension                                |
-| 6.5 | [Cotree DP](06_1_cotree_dp.md)                                 | Cographs (P*4-free) where treewidth_dp can't fit (K_12+, large K*{a,b}, threshold graphs)            | **exp(O(n^{2/3}))** — subexponential                   |
+| 6.5 | [Cotree DP](06_1_cotree_dp.md)                                 | Cographs (P_4-free) where treewidth_dp can't fit (K_12+, large K_{a,b}, threshold graphs)            | **exp(O(n^{2/3}))** — subexponential                   |
+| 6.6 | [Almost-Cograph DP](06_2_almost_cograph_dp.md)                 | Graphs that become cographs after removing ≤ 16 anomaly edges (D-Wave cells joined by sparse inter-cell edges) | 1 cotree DP + O(\|A\|) recursive syntheses     |
+| 6.7 | [Rooted Tutte — Algebraic Framework](06_3_rooted_tutte_framework.md) | *(Theory reference, not a pipeline step)* — math underneath the cell-quotient cycle / grid DPs       | (theory)                                               |
+| 6.8 | [Cell-Quotient Cycle DP](06_4_cell_quotient_cycle_dp.md)       | Cell-decomposable graphs whose cell-quotient is a simple cycle (e.g., D-Wave Cm₂)                    | O(n × Bell(W)² × poly²) per junction step              |
+| 6.9 | [Cell-Quotient Grid DP](06_5_cell_quotient_grid_dp.md)         | Cell-decomposable graphs with `(rows × cols)` grid quotient (synthetic K_n grids; Cm₃ pending anchor-sharing adapter) | O(rows × cols × Bell(W)² × poly²)                      |
 | 7   | [k-Sum Decomposition (chord rule)](07_k_sum_decomposition.md)  | Graphs with k-vertex separators (k=2..7) — treewidth_dp didn't apply or didn't run                   | **O(C(k,2)) full syntheses**                           |
 | 8   | [Hierarchical Tiling (chord rule)](08_hierarchical_tiling.md)  | Graphs ≥ 20 edges with repeating cell structure — fallback when treewidth_dp doesn't fit             | **O(chord_count) full syntheses**                      |
 | 9   | [Creation-Expansion-Join (CEJ)](09_creation_expansion_join.md) | Final fallback — spanning tree + chord addition                                                      | O(chords × synthesis_cost)                             |
-| 10  | [Rooted Tutte Path DP](10_rooted_tutte_path_dp.md)             | (Research) Multi-cell path topologies via boundary-partition convolution — extends to D-Wave Pm3+    | O(n × Bell(W)² × poly²)                                |
 
 ## Pipeline Overview
 
@@ -48,7 +51,13 @@ flowchart TD
     H -- no --> HC{6.5 Cotree DP\nP_4-free cograph?}
     HC -- yes --> HC1[compute_tutte_cotree_dp:\nsubexponential exp(O(n^{2/3}))]
     HC1 --> R
-    HC -- no --> I{7. k-Sum decomposition\n≥ 6 edges + vertex separator?}
+    HC -- no --> HA{6.6 Almost-cograph DP\n≤ 16 anomaly edges?}
+    HA -- yes --> HA1[compute_tutte_almost_cograph:\ncotree DP + chord rule on anomalies]
+    HA1 --> R
+    HA -- no --> HQ{6.8 Cell-quotient cycle DP\ncell-decomposable + cycle quotient?}
+    HQ -- yes --> HQ1[compute_cell_quotient_cycle_dp:\nrooted Tutte composition]
+    HQ1 --> R
+    HQ -- no --> I{7. k-Sum decomposition\n≥ 6 edges + vertex separator?}
     I -- yes --> I1[clique_chord_k_sum:\niterative chord rule]
     I1 --> R
     I -- no --> J{8. Hierarchical tiling\n≥ 20 edges + cell decomposition?}

@@ -1,7 +1,4 @@
-"""Tutte polynomial test suite.
-
-Parametrized correctness tests validating synthesis against Kirchhoff's theorem
-and NetworkX. Run with: python -m pytest tutte/tests/ -v
+"""Tutte polynomial test suite — core engine behavior.
 
 Sections:
     A. Spanning tree verification (Kirchhoff)
@@ -11,6 +8,23 @@ Sections:
     E. D-Wave hardware topologies
     F. Composition formulas
     G. Performance regression
+
+    --- Algebraic formulas (formerly test_formulas.py) ---
+    H. Unified formula (Phase 11/12) — T(G) = (∏ T(cells)) · T(H)
+    I. k-matching formula (Phase 13/15) — closed-form for k-edge matchings
+    J. Multivariate Z (Sokal) — UniformZ + MultivariateTutte
+    K. Bridge-aware chord rule on K_k ⊕_k K_k
+
+    --- Engine pipeline dispatch (formerly test_engine_pipeline.py) ---
+    L. Heterogeneous tiling (Phase 3.1)
+    M. Raised k-sum cap (Phase 3.2)
+    N. Forced-hierarchical regression
+
+    --- Parallel synthesis (formerly test_parallel.py) ---
+    O. Pickling round-trip
+    P. Parallel synthesis correctness
+    Q. Cache merging
+    R. Symmetric chord pairing
 """
 
 import json
@@ -149,7 +163,16 @@ def test_minor_petersen_contains_c5(default_table):
 
 
 def _atlas_graphs():
-    """Generate (index, graph) for connected atlas graphs with >= 1 edge."""
+    """Return cached list of (index, graph) for connected atlas graphs.
+
+    Cached on first call so the parametrize decorator and ids list don't
+    pay a second ~11s pass through `nx.graph_atlas` (collection-time cost
+    that pytest still pays even when the test is deselected via -m).
+    """
+    cache = getattr(_atlas_graphs, "_cache", None)
+    if cache is not None:
+        return cache
+    out = []
     for i in range(1, 1253):
         try:
             G = nx.graph_atlas(i)
@@ -159,13 +182,15 @@ def _atlas_graphs():
             continue
         if not nx.is_connected(G):
             continue
-        yield i, G
+        out.append((i, G))
+    _atlas_graphs._cache = out  # type: ignore[attr-defined]
+    return out
 
 
 @pytest.mark.slow
 @pytest.mark.parametrize(
     "atlas_idx,nx_graph",
-    list(_atlas_graphs()),
+    _atlas_graphs(),
     ids=[f"atlas_{i}" for i, _ in _atlas_graphs()],
 )
 def test_graph_atlas_spanning_trees(atlas_idx, nx_graph, engine):
@@ -555,3 +580,1106 @@ def test_binary_roundtrip_with_minors():
     assert set(decoded.minor_relationships[k4_key]) == {k3_key, p2_key}
     assert k3_key in decoded.minor_relationships
     assert decoded.minor_relationships[k3_key] == [p2_key]
+
+
+# =============================================================================
+# H-K. ALGEBRAIC FORMULAS
+# =============================================================================
+
+# Imports needed for sections H-K
+import dwave_networkx as dnx  # noqa: E402
+from tutte.graph import MultiGraph, k_sum_graph  # noqa: E402
+from tutte.graphs.covering import (  # noqa: E402
+    KMatchingJunction,
+    apply_kmatching_formula,
+    detect_kmatching_topology,
+    extract_cell_topology,
+)
+from tutte.graphs.k_sum import clique_chord_k_sum  # noqa: E402
+from tutte.lookup.core import load_default_table  # noqa: E402
+from tutte.multivariate import MultivariateTutte, UniformZ  # noqa: E402
+from tutte.synthesis.hybrid import HybridSynthesisEngine  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def table():
+    return load_default_table()
+
+
+@pytest.fixture(scope="module")
+def formulas_engine(table):
+    e = SynthesisEngine(table=table, verbose=False)
+    e.skip_target_lookup = True
+    return e
+
+
+@pytest.fixture(scope="module")
+def hybrid_engine(table):
+    return HybridSynthesisEngine(table=table, verbose=False)
+
+
+def _add_edges_set(g: Graph, new_edges) -> Graph:
+    edges = set(g.edges)
+    for u, v in new_edges:
+        edges.add((min(u, v), max(u, v)))
+    return Graph(nodes=g.nodes, edges=frozenset(edges))
+
+
+# =============================================================================
+# H. UNIFIED FORMULA  (T(G) = (∏ T(cells)) · T(H))
+# =============================================================================
+
+
+def test_extract_topology_disjoint_cells_returns_empty_h():
+    partition = [{0, 1, 2}, {3, 4, 5}]
+    H = extract_cell_topology(partition, [])
+    assert H is not None
+    assert len(H.nodes) == 2
+    assert sum(H.edge_counts.values()) == 0
+
+
+def test_extract_topology_one_bridge_returns_single_edge():
+    partition = [{0, 1, 2}, {3, 4, 5}]
+    H = extract_cell_topology(partition, [(0, 3)])
+    assert H is not None
+    assert len(H.nodes) == 2
+    assert H.edge_counts == {(0, 1): 1}
+
+
+def test_extract_topology_two_parallel_returns_multiplicity_two():
+    partition = [{0, 1, 2}, {3, 4, 5}]
+    H = extract_cell_topology(partition, [(0, 3), (0, 3)])
+    assert H is not None
+    assert H.edge_counts == {(0, 1): 2}
+
+
+def test_extract_topology_distinct_pairs_returns_none():
+    """Two inter-cell edges between same cell-pair but DIFFERENT vertex pairs
+    → unified formula breaks → returns None."""
+    partition = [{0, 1, 2}, {3, 4, 5}]
+    H = extract_cell_topology(partition, [(0, 3), (1, 4)])
+    assert H is None
+
+
+def test_extract_topology_three_cells_triangle_of_bridges():
+    partition = [{0, 1, 2}, {3, 4, 5}, {6, 7, 8}]
+    inter = [(0, 3), (3, 6), (0, 6)]
+    H = extract_cell_topology(partition, inter)
+    assert H is not None
+    assert len(H.nodes) == 3
+    assert sorted(H.edge_counts.items()) == [((0, 1), 1), ((0, 2), 1), ((1, 2), 1)]
+
+
+def test_extract_topology_three_cells_one_pair_distinct_returns_none():
+    partition = [{0, 1, 2}, {3, 4, 5}, {6, 7, 8}]
+    inter = [(0, 3), (1, 4), (3, 6)]  # cells (0,1) has TWO distinct pairs
+    H = extract_cell_topology(partition, inter)
+    assert H is None
+
+
+def _two_k3_disjoint() -> Graph:
+    return disjoint_union(complete_graph(3), complete_graph(3))
+
+
+def _two_k3_one_bridge() -> Graph:
+    return _add_edges_set(_two_k3_disjoint(), [(0, 3)])
+
+
+def _three_k3_chain_of_bridges() -> Graph:
+    g = disjoint_union(_two_k3_disjoint(), complete_graph(3))
+    return _add_edges_set(g, [(0, 3), (3, 6)])
+
+
+def _three_k3_triangle_of_bridges() -> Graph:
+    g = disjoint_union(_two_k3_disjoint(), complete_graph(3))
+    return _add_edges_set(g, [(0, 3), (3, 6), (0, 6)])
+
+
+def _two_k3_distinct_pair_chords() -> Graph:
+    return _add_edges_set(_two_k3_disjoint(), [(0, 3), (1, 4)])
+
+
+def test_engine_two_k3_one_bridge_uses_unified_formula(formulas_engine):
+    g = _two_k3_one_bridge()
+    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    assert res is not None
+    assert res.method == "unified_formula"
+    T_k3 = TuttePolynomial.from_coefficients({(2, 0): 1, (1, 0): 1, (0, 1): 1})
+    expected = TuttePolynomial.x() * T_k3 * T_k3
+    assert res.polynomial == expected
+    assert verify_spanning_trees(g, res.polynomial)
+
+
+def test_engine_three_k3_chain_of_bridges_uses_unified_formula(formulas_engine):
+    g = _three_k3_chain_of_bridges()
+    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    assert res is not None
+    assert res.method == "unified_formula"
+    T_k3 = TuttePolynomial.from_coefficients({(2, 0): 1, (1, 0): 1, (0, 1): 1})
+    expected = TuttePolynomial.x(2) * T_k3 * T_k3 * T_k3
+    assert res.polynomial == expected
+
+
+def test_engine_three_k3_triangle_of_bridges_uses_unified_formula(formulas_engine):
+    g = _three_k3_triangle_of_bridges()
+    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    assert res is not None
+    assert res.method == "unified_formula"
+    T_k3 = TuttePolynomial.from_coefficients({(2, 0): 1, (1, 0): 1, (0, 1): 1})
+    expected = T_k3 * T_k3 * T_k3 * T_k3
+    assert res.polynomial == expected
+
+
+def test_engine_chord_case_falls_through(formulas_engine):
+    g = _two_k3_distinct_pair_chords()
+    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    assert res is not None
+    assert res.method != "unified_formula"
+    assert verify_spanning_trees(g, res.polynomial)
+
+
+def _table_entry(table_, name: str):
+    matches = [e for e in table_.entries.values() if e.name == name]
+    assert matches, f"rainbow table missing entry {name!r}"
+    return matches[0]
+
+
+def _analyze_inter(graph: Graph, partition):
+    from tutte.graphs.covering import analyze_inter_cell_edges
+    return analyze_inter_cell_edges(graph, partition)
+
+
+def test_engine_heterogeneous_k3_plus_k4_one_bridge_uses_unified_formula(
+    formulas_engine, table
+):
+    """K₃ + K₄ + 1 bridge: heterogeneous decomposition fed directly."""
+    g = _add_edges_set(
+        disjoint_union(complete_graph(3), complete_graph(4)), [(0, 3)]
+    )
+    partition = [{0, 1, 2}, {3, 4, 5, 6}]
+    cells = [_table_entry(table, "K_3"), _table_entry(table, "K_4")]
+    inter = _analyze_inter(g, partition)
+
+    res = formulas_engine._synthesize_hierarchical(g, cells, partition, inter, max_depth=10)
+    assert res.method == "unified_formula"
+    T_k3 = TuttePolynomial.from_coefficients({(2, 0): 1, (1, 0): 1, (0, 1): 1})
+    T_k4 = formulas_engine.synthesize(complete_graph(4)).polynomial
+    expected = TuttePolynomial.x() * T_k3 * T_k4
+    assert res.polynomial == expected
+    assert verify_spanning_trees(g, res.polynomial)
+
+
+def test_engine_heterogeneous_k3_plus_c4_one_bridge_uses_unified_formula(
+    formulas_engine, table
+):
+    """K₃ + C₄ + 1 bridge with a synthetic MinorEntry for C₄."""
+    from tutte.lookup.core import MinorEntry
+
+    c4 = cycle_graph(4)
+    T_c4 = formulas_engine.synthesize(c4).polynomial
+    c4_entry = MinorEntry(
+        name="C_4",
+        polynomial=T_c4,
+        node_count=c4.node_count(),
+        edge_count=c4.edge_count(),
+        canonical_key=c4.canonical_key(),
+        spanning_trees=int(T_c4.num_spanning_trees()),
+        num_terms=T_c4.num_terms(),
+        graph=c4,
+    )
+
+    g = _add_edges_set(disjoint_union(complete_graph(3), c4), [(0, 3)])
+    partition = [{0, 1, 2}, {3, 4, 5, 6}]
+    cells = [_table_entry(table, "K_3"), c4_entry]
+    inter = _analyze_inter(g, partition)
+
+    res = formulas_engine._synthesize_hierarchical(g, cells, partition, inter, max_depth=10)
+    assert res.method == "unified_formula"
+    T_k3 = TuttePolynomial.from_coefficients({(2, 0): 1, (1, 0): 1, (0, 1): 1})
+    expected = TuttePolynomial.x() * T_k3 * T_c4
+    assert res.polynomial == expected
+
+
+@pytest.mark.slow
+def test_cm2_chord_case_falls_through_to_treewidth_dp(table):
+    """Cm2 chord case must NOT fire unified formula. ~200s."""
+    cm2 = Graph.from_networkx(dnx.chimera_graph(2))
+
+    e_hier = SynthesisEngine(table=table, verbose=False)
+    e_hier.skip_target_lookup = True
+    forced = e_hier._try_hierarchical(cm2, max_depth=10)
+    assert forced is not None
+    assert forced.method != "unified_formula"
+    assert verify_spanning_trees(cm2, forced.polynomial)
+
+
+# =============================================================================
+# I. K-MATCHING FORMULA (Phase 13/15)
+# =============================================================================
+
+
+def _build_2cell_k_matching(cell: Graph, k: int) -> Graph:
+    """Two disjoint cells joined by a k-edge matching on the first k anchors."""
+    g = disjoint_union(cell, cell)
+    offset = max(cell.nodes) + 1
+    anchors = sorted(cell.nodes)[:k]
+    edges = [(a, a + offset) for a in anchors]
+    return _add_edges_set(g, edges)
+
+
+def _build_cell_path_k_matching(cell: Graph, n: int, k: int) -> Graph:
+    g = cell
+    offsets = [0]
+    for _ in range(n - 1):
+        offsets.append(max(g.nodes) + 1)
+        g = disjoint_union(g, cell)
+    anchors = sorted(cell.nodes)[:k]
+    for i in range(n - 1):
+        edges = [(a + offsets[i], a + offsets[i + 1]) for a in anchors]
+        g = _add_edges_set(g, edges)
+    return g
+
+
+def _build_cell_cycle_k_matching(cell: Graph, n: int, k: int) -> Graph:
+    g = _build_cell_path_k_matching(cell, n, k)
+    offset_first = 0
+    offset_last = (n - 1) * (max(cell.nodes) + 1)
+    anchors = sorted(cell.nodes)[:k]
+    edges = [(a + offset_first, a + offset_last) for a in anchors]
+    return _add_edges_set(g, edges)
+
+
+def test_kmatching_detector_two_k3_m2_returns_junction():
+    K3 = complete_graph(3)
+    g = _build_2cell_k_matching(K3, k=2)
+    partition = [{0, 1, 2}, {3, 4, 5}]
+    inter = [(0, 3), (1, 4)]
+    result = detect_kmatching_topology(g, partition, inter)
+    assert result is not None
+    assert len(result) == 1
+    j = result[0]
+    assert j.k == 2
+    assert j.cell_i == 0 and j.cell_j == 1
+    assert set(j.anchors_i) == {0, 1}
+    assert set(j.anchors_j) == {3, 4}
+
+
+def test_kmatching_detector_no_inter_edges_returns_empty():
+    partition = [{0, 1, 2}, {3, 4, 5}]
+    result = detect_kmatching_topology(complete_graph(3), partition, [])
+    assert result == []
+
+
+def test_kmatching_detector_cm1_bipartite_mixed_returns_none():
+    """K_{4,4} cells with mixed-side anchors should fail precondition."""
+    cm1 = Graph.from_networkx(dnx.chimera_graph(1))
+    g = disjoint_union(cm1, cm1)
+    offset = max(cm1.nodes) + 1
+    g = _add_edges_set(g, [(0, 0 + offset), (1, 1 + offset)])
+    partition = [set(cm1.nodes), {n + offset for n in cm1.nodes}]
+    inter = [(0, 0 + offset), (1, 1 + offset)]
+    result = detect_kmatching_topology(g, partition, inter)
+    assert result is None
+
+
+def test_engine_k3_path_m2_uses_kmatching_formula(formulas_engine):
+    g = _build_cell_path_k_matching(complete_graph(3), n=3, k=2)
+    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    assert res is not None
+    assert res.method == "kmatching_formula"
+    direct = formulas_engine.synthesize(g).polynomial
+    assert res.polynomial == direct
+
+
+def test_engine_k4_path_m2_uses_kmatching_formula(formulas_engine):
+    g = _build_cell_path_k_matching(complete_graph(4), n=3, k=2)
+    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    assert res is not None
+    assert res.method == "kmatching_formula"
+    direct = formulas_engine.synthesize(g).polynomial
+    assert res.polynomial == direct
+
+
+def test_engine_small_cell_cycle_falls_through(formulas_engine):
+    """K_3 cycle topology shares anchors → formula must reject + fall through."""
+    g = _build_cell_cycle_k_matching(complete_graph(3), n=3, k=2)
+    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    assert res is not None
+    assert res.method != "kmatching_formula"
+    direct = formulas_engine.synthesize(g).polynomial
+    assert res.polynomial == direct
+
+
+def test_engine_k44_cycle_uses_kmatching_formula(formulas_engine):
+    """Cm1 = K_{4,4} cells joined via M_4 coupler (the actual D-Wave Cm2 case)."""
+    cm1 = Graph.from_networkx(dnx.chimera_graph(1))
+    g = disjoint_union(cm1, cm1)
+    offset = max(cm1.nodes) + 1
+    A_side = [0, 5, 6, 7]
+    B_side = [1, 2, 3, 4]
+    edges = [(A_side[i], B_side[i] + offset) for i in range(4)]
+    g = _add_edges_set(g, edges)
+    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    assert res is not None
+    assert res.method == "kmatching_formula"
+    direct = formulas_engine.synthesize(g).polynomial
+    assert res.polynomial == direct
+
+
+def test_engine_mixed_side_k44_falls_through(formulas_engine):
+    """Mixed-bipartition anchors → formula must NOT fire."""
+    cm1 = Graph.from_networkx(dnx.chimera_graph(1))
+    g = disjoint_union(cm1, cm1)
+    offset = max(cm1.nodes) + 1
+    g = _add_edges_set(g, [(0, 0 + offset), (1, 1 + offset)])
+    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    if res is not None:
+        assert res.method != "kmatching_formula"
+
+
+def test_engine_single_parallel_edge_still_uses_unified_formula(formulas_engine):
+    """Two K_3 + one bridge: unified formula (k=1), not k-matching."""
+    K3 = complete_graph(3)
+    g = _add_edges_set(disjoint_union(K3, K3), [(0, 3)])
+    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    assert res is not None
+    assert res.method == "unified_formula"
+
+
+@pytest.mark.slow
+def test_cm2_uses_kmatching_formula(table):
+    """Cm2 routes through k-matching formula. ~50s wall-clock."""
+    cm2 = Graph.from_networkx(dnx.chimera_graph(2))
+    e_hier = SynthesisEngine(table=table, verbose=False)
+    e_hier.skip_target_lookup = True
+    res = e_hier._try_hierarchical(cm2, max_depth=10)
+    assert res is not None
+    assert res.method == "kmatching_formula"
+    assert res.polynomial.num_terms() == 675
+
+
+# =============================================================================
+# J. MULTIVARIATE Z (Sokal)
+# =============================================================================
+
+
+def _components(graph: Graph) -> int:
+    parent = {v: v for v in graph.nodes}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for u, v in graph.edges:
+        ru, rv = find(u), find(v)
+        if ru != rv:
+            parent[max(ru, rv)] = min(ru, rv)
+    return len({find(v) for v in graph.nodes})
+
+
+def _verify_z_via_sokal(graph: Graph) -> None:
+    n_v = graph.node_count()
+    n_e = graph.edge_count()
+    n_k = _components(graph)
+
+    eng = SynthesisEngine(table=load_default_table(), verbose=False)
+    T = eng.synthesize(graph).polynomial
+
+    Z = UniformZ.from_subgraph_sum(graph)
+    assert Z.evaluate(1, 1) == 2 ** n_e
+
+    test_points = [(2, 2), (3, 2), (2, 3), (3, 3), (4, 2), (-1, 2), (2, -1)]
+    for x_val, y_val in test_points:
+        if x_val == 1 or y_val == 1:
+            continue
+        q_val = (x_val - 1) * (y_val - 1)
+        v_val = y_val - 1
+        t_val = T.evaluate(x_val, y_val)
+        z_val = Z.evaluate(q_val, v_val)
+        # Sokal: Z((x-1)(y-1), y-1) = T(x, y) · (x-1)^{k(G)} · (y-1)^{|V|}
+        rhs = t_val * ((x_val - 1) ** n_k) * ((y_val - 1) ** n_v)
+        assert z_val == rhs
+
+
+def test_uniform_z_zero_one_arithmetic():
+    z = UniformZ.zero()
+    assert z.coeff_count() == 0
+    one = UniformZ.one()
+    assert one.coeff_count() == 1
+    assert one.evaluate(5, 7) == 1
+    assert (one + one).evaluate(5, 7) == 2
+    assert (one * one).evaluate(5, 7) == 1
+    assert (3 * one).evaluate(5, 7) == 3
+    assert (-one).evaluate(5, 7) == -1
+
+
+def test_uniform_z_subgraph_sum_K3():
+    K3 = Graph.from_networkx(nx.complete_graph(3))
+    Z = UniformZ.from_subgraph_sum(K3)
+    assert Z.evaluate(1, 1) == 8
+    assert Z.evaluate(2, 0) == 8
+
+
+def test_uniform_z_path_graph_3():
+    """Path P_3: Z = q^3 + 2q^2 v + q v^2."""
+    P3 = Graph(list(range(3)), [(0, 1), (1, 2)])
+    Z = UniformZ.from_subgraph_sum(P3)
+    expected = {(3, 0): 1, (2, 1): 2, (1, 2): 1}
+    assert Z.to_dict() == expected
+
+
+def test_sokal_identity_K3():
+    _verify_z_via_sokal(Graph.from_networkx(nx.complete_graph(3)))
+
+
+def test_sokal_identity_K4():
+    _verify_z_via_sokal(Graph.from_networkx(nx.complete_graph(4)))
+
+
+def test_sokal_identity_K_2_2():
+    _verify_z_via_sokal(Graph.from_networkx(nx.complete_bipartite_graph(2, 2)))
+
+
+def test_sokal_identity_C5():
+    _verify_z_via_sokal(Graph.from_networkx(nx.cycle_graph(5)))
+
+
+@pytest.mark.skip(
+    reason="engine.synthesize errors on disconnected Graph (set & list bug "
+    "in graph.subgraph); k=2 case validated via UniformZ alone in "
+    "test_uniform_z_disconnected_components"
+)
+def test_sokal_identity_disconnected():
+    g = Graph(list(range(4)), [(0, 1), (2, 3)])
+    _verify_z_via_sokal(g)
+
+
+def test_uniform_z_disconnected_components():
+    """k=2 disconnected: Z = (q^2 + qv)^2 = q^4 + 2q^3 v + q^2 v^2."""
+    g = Graph(list(range(4)), [(0, 1), (2, 3)])
+    Z = UniformZ.from_subgraph_sum(g)
+    expected = {(4, 0): 1, (3, 1): 2, (2, 2): 1}
+    assert Z.to_dict() == expected
+    assert Z.evaluate(1, 1) == 4
+
+
+def test_uniform_z_arithmetic_linear():
+    a = UniformZ.from_dict({(1, 0): 2})
+    b = UniformZ.from_dict({(0, 1): 3})
+    c = UniformZ.from_dict({(1, 1): 5})
+    d = UniformZ.one()
+    lhs = (a + b) * (c + d)
+    rhs = a * c + a * d + b * c + b * d
+    assert lhs == rhs
+
+
+def test_multivariate_tutte_specialize():
+    """MultivariateTutte → UniformZ via specialize_uniform aggregates v powers."""
+    mt = MultivariateTutte.from_dict({
+        (3, frozenset()): 1,
+        (2, frozenset([(0, 1)])): 1,
+        (2, frozenset([(0, 1), (1, 1)])): 1,
+        (1, frozenset([(0, 2)])): 1,
+    })
+    z = mt.specialize_uniform()
+    expected = {
+        (3, 0): 1,
+        (2, 1): 1,
+        (2, 2): 1,
+        (1, 2): 1,
+    }
+    assert z.to_dict() == expected
+
+
+# =============================================================================
+# K. BRIDGE-AWARE CHORD RULE — K_k ⊕_k K_k DEGENERATE CASES
+# =============================================================================
+
+
+@pytest.mark.parametrize("k", [3, 4, 5, 6])
+def test_kk_ksum_kk_returns_one(k, hybrid_engine):
+    """K_k ⊕_k K_k is the empty graph on k vertices, T = 1."""
+    target = k_sum_graph(complete_graph(k), complete_graph(k), k, list(range(k)))
+    assert target.edge_count() == 0
+    assert target.node_count() == k
+
+    result = clique_chord_k_sum(target, tuple(range(k)), k, hybrid_engine)
+    assert result == TuttePolynomial.one()
+    assert result.num_spanning_trees() == 1
+
+
+@pytest.mark.parametrize("k,n_extra", [(2, 2), (3, 1), (3, 2), (4, 1)])
+def test_kk_ksum_knextra_correctness(k, n_extra, hybrid_engine):
+    """K_k ⊕_k K_(k+n_extra) — non-degenerate true k-sum."""
+    g1 = complete_graph(k)
+    g2 = complete_graph(k + n_extra)
+    target = k_sum_graph(g1, g2, k, list(range(k)))
+    result = clique_chord_k_sum(target, tuple(range(k)), k, hybrid_engine)
+    direct = hybrid_engine.synthesize(target).polynomial
+    assert result == direct
+
+
+def test_chord_rule_does_not_regress_petersen(hybrid_engine):
+    """Bridge-aware fix doesn't break Petersen."""
+    from tutte.graphs.covering import try_hierarchical_partition
+    from tutte.graphs.k_sum import boundary_quotient_tutte
+
+    petersen = Graph.from_networkx(nx.petersen_graph())
+    table_local = load_default_table()
+    decomp = try_hierarchical_partition(petersen, table_local)
+    assert decomp is not None
+    cell, partition, inter_info = decomp
+
+    chord_result = boundary_quotient_tutte(
+        petersen, partition, list(inter_info.edges), hybrid_engine,
+    )
+    direct = hybrid_engine.synthesize(petersen).polynomial
+    assert chord_result == direct
+    assert chord_result.num_spanning_trees() == 2000
+
+
+# =============================================================================
+# L-N. ENGINE PIPELINE DISPATCH
+# =============================================================================
+
+from tutte.graphs.covering import (  # noqa: E402
+    try_heterogeneous_partition,
+    try_hierarchical_partition,
+)
+
+
+@pytest.fixture(scope="module")
+def pipeline_engine(table):
+    return SynthesisEngine(table=table, verbose=False)
+
+
+# =============================================================================
+# L. HETEROGENEOUS TILING (Phase 3.1)
+# =============================================================================
+
+
+def _disjoint_blocks_with_bridges(block_sizes, cross_pairs):
+    G = nx.Graph()
+    offsets = []
+    cursor = 0
+    for size in block_sizes:
+        offsets.append(cursor)
+        block = nx.complete_graph(size)
+        G = nx.disjoint_union(G, block)
+        cursor += size
+    for (bi, ni), (bj, nj) in cross_pairs:
+        G.add_edge(offsets[bi] + ni, offsets[bj] + nj)
+    return Graph.from_networkx(G)
+
+
+def test_partitioner_finds_k4_plus_2k3(table):
+    """K_4 + K_3 + K_3 disjoint union: heterogeneous picks K_4 first."""
+    g = _disjoint_blocks_with_bridges([4, 3, 3], cross_pairs=[])
+    assert try_hierarchical_partition(g, table) is None
+    het = try_heterogeneous_partition(g, table)
+    assert het is not None
+    cells, partition, inter_info = het
+    sizes = sorted(len(p) for p in partition)
+    assert sizes == [3, 3, 4]
+    names = sorted(c.name for c in cells)
+    assert names == ["K_3", "K_3", "K_4"]
+    assert len(inter_info.edges) == 0
+
+
+def test_partitioner_rejects_pure_homogeneous(table):
+    g = _disjoint_blocks_with_bridges([3, 3, 3], cross_pairs=[])
+    het = try_heterogeneous_partition(g, table)
+    assert het is None
+
+
+def test_partitioner_returns_none_when_no_cover(table):
+    g = Graph.from_networkx(nx.disjoint_union_all([nx.path_graph(2)] * 5))
+    het = try_heterogeneous_partition(g, table)
+    assert het is None
+
+
+def test_engine_synthesizes_heterogeneous_with_inter_edges(pipeline_engine):
+    g = _disjoint_blocks_with_bridges(
+        [4, 3, 3],
+        cross_pairs=[
+            ((0, 0), (1, 0)),
+            ((0, 1), (1, 1)),
+            ((0, 2), (2, 0)),
+            ((0, 3), (2, 1)),
+            ((1, 2), (2, 2)),
+        ],
+    )
+    result = pipeline_engine.synthesize(g)
+    assert verify_spanning_trees(g, result.polynomial)
+
+
+def test_engine_heterogeneous_matches_direct_synthesis_path(pipeline_engine, table):
+    g = _disjoint_blocks_with_bridges(
+        [4, 3, 3],
+        cross_pairs=[
+            ((0, 0), (1, 0)),
+            ((0, 1), (2, 0)),
+            ((1, 1), (2, 1)),
+        ],
+    )
+    het = try_heterogeneous_partition(g, table)
+    assert het is not None
+    cells, partition, inter_info = het
+
+    pipeline_poly = pipeline_engine.synthesize(g).polynomial
+    forced_poly = pipeline_engine._synthesize_hierarchical(
+        g, cells, partition, inter_info, max_depth=10,
+    ).polynomial
+    assert pipeline_poly == forced_poly
+
+
+def test_petersen_homogeneous_still_wins(pipeline_engine, table):
+    g = Graph.from_networkx(nx.petersen_graph())
+    result = pipeline_engine.synthesize(g)
+    assert verify_spanning_trees(g, result.polynomial)
+    assert result.polynomial.num_spanning_trees() == 2000
+
+
+# =============================================================================
+# M. RAISED K-SUM CAP (Phase 3.2)
+# =============================================================================
+
+
+def test_k_max_default_and_clamping(table):
+    eng_default = SynthesisEngine(table=table, verbose=False)
+    assert eng_default.k_max == 12
+
+    eng_low = SynthesisEngine(table=table, verbose=False, k_max=5)
+    assert eng_low.k_max == 5
+
+    eng_clamped_high = SynthesisEngine(table=table, verbose=False, k_max=99)
+    assert eng_clamped_high.k_max == 20
+
+    eng_clamped_low = SynthesisEngine(table=table, verbose=False, k_max=1)
+    assert eng_clamped_low.k_max == 2
+
+
+def _bipartite_through_router(left_size: int, right_size: int, router_size: int) -> Graph:
+    G = nx.Graph()
+    router = list(range(router_size))
+    left = list(range(router_size, router_size + left_size))
+    right = list(range(router_size + left_size, router_size + left_size + right_size))
+    G.add_nodes_from(router + left + right)
+    for i in range(router_size):
+        for j in range(i + 1, router_size):
+            G.add_edge(router[i], router[j])
+    for i in range(left_size):
+        for j in range(i + 1, left_size):
+            G.add_edge(left[i], left[j])
+    for i in range(right_size):
+        for j in range(i + 1, right_size):
+            G.add_edge(right[i], right[j])
+    for u in left:
+        for v in router:
+            G.add_edge(u, v)
+    for u in right:
+        for v in router:
+            G.add_edge(u, v)
+    return Graph.from_networkx(G)
+
+
+@pytest.mark.parametrize(
+    "router_size",
+    [
+        5,  # fast smoke (~1.4s)
+        pytest.param(6, marks=pytest.mark.slow),  # ~5s
+        pytest.param(7, marks=pytest.mark.slow),  # ~18s
+        pytest.param(8, marks=pytest.mark.slow),  # ~53s
+    ],
+)
+def test_router_separator_synthesis_correct(table, router_size):
+    """Two K_3 cliques bridged by a K_router_size router."""
+    g = _bipartite_through_router(left_size=3, right_size=3, router_size=router_size)
+    eng = SynthesisEngine(table=table, verbose=False)
+    result = eng.synthesize(g)
+    assert verify_spanning_trees(g, result.polynomial)
+
+
+def test_below_min_edges_skipped(table):
+    """C_6 still synthesizes correctly."""
+    g = Graph.from_networkx(nx.cycle_graph(6))
+    eng = SynthesisEngine(table=table, verbose=False)
+    result = eng.synthesize(g)
+    assert result.polynomial.num_spanning_trees() == 6
+
+
+# =============================================================================
+# N. FORCED-HIERARCHICAL REGRESSION
+# =============================================================================
+
+
+def _build_two_k5_with_connector() -> Graph:
+    G = nx.disjoint_union(nx.complete_graph(5), nx.complete_graph(5))
+    G.add_edge(0, 5)
+    G.add_edge(1, 6)
+    G.add_edge(2, 7)
+    G.add_edge(3, 8)
+    return Graph.from_networkx(G)
+
+
+def test_synthetic_hierarchical_matches_default(table):
+    """Synthetic 2×K_5 with 4 chords. Forced hierarchical agrees with default."""
+    g = _build_two_k5_with_connector()
+    assert g.edge_count() >= 20
+
+    e_hier = SynthesisEngine(table=table, verbose=False)
+    e_hier.skip_target_lookup = True
+    forced = e_hier._try_hierarchical(g, max_depth=10)
+    assert forced is not None
+    assert verify_spanning_trees(g, forced.polynomial)
+
+    e_default = SynthesisEngine(table=table, verbose=False)
+    e_default.skip_target_lookup = True
+    default = e_default.synthesize(g)
+    assert forced.polynomial == default.polynomial
+
+
+def test_synthetic_hierarchical_timing_within_10x(table):
+    g = _build_two_k5_with_connector()
+
+    e_default = SynthesisEngine(table=table, verbose=False)
+    e_default.skip_target_lookup = True
+    t0 = time.perf_counter()
+    e_default.synthesize(g)
+    t_default = time.perf_counter() - t0
+
+    e_hier = SynthesisEngine(table=table, verbose=False)
+    e_hier.skip_target_lookup = True
+    t0 = time.perf_counter()
+    res = e_hier._try_hierarchical(g, max_depth=10)
+    t_hier = time.perf_counter() - t0
+
+    assert res is not None
+    assert t_hier < t_default * 10 + 0.5
+
+
+@pytest.mark.slow
+def test_z12_hierarchical_matches_default(table):
+    """Z(1,2) hierarchical takes ~14 minutes cold; slow."""
+    g = Graph.from_networkx(dnx.zephyr_graph(1, 2))
+    e_hier = SynthesisEngine(table=table, verbose=False)
+    e_hier.skip_target_lookup = True
+    forced = e_hier._try_hierarchical(g, max_depth=10)
+    assert forced is not None
+    assert forced.method == "hierarchical_tiling"
+    assert verify_spanning_trees(g, forced.polynomial)
+
+
+@pytest.mark.slow
+def test_cm2_hierarchical_matches_default(table):
+    """Cm2 hierarchical synthesis ~12 minutes; slow."""
+    g = Graph.from_networkx(dnx.chimera_graph(2))
+    e_hier = SynthesisEngine(table=table, verbose=False)
+    e_hier.skip_target_lookup = True
+    forced = e_hier._try_hierarchical(g, max_depth=10)
+    assert forced is not None
+    assert forced.method == "hierarchical_tiling"
+    assert verify_spanning_trees(g, forced.polynomial)
+
+
+@pytest.mark.slow
+def test_pm2_routes_through_chord_rule(table):
+    """Pm2 (40n 164e, 95 chords): routes through chord-rule paths."""
+    g = Graph.from_networkx(dnx.pegasus_graph(2))
+    eng = SynthesisEngine(table=table, verbose=False)
+    eng.skip_target_lookup = True
+    result = eng.synthesize(g)
+    assert verify_spanning_trees(g, result.polynomial)
+    assert result.method != "lookup"
+
+
+# =============================================================================
+# O-R. PARALLEL SYNTHESIS
+# =============================================================================
+
+import pickle  # noqa: E402
+
+from tutte.synthesis.parallel import parallel_synthesize_pair, shutdown_pool  # noqa: E402
+from tutte.synthesis.symmetric import (  # noqa: E402
+    build_symmetric_chord_order,
+    find_cell_automorphism,
+    pair_chords_by_symmetry,
+)
+
+
+# =============================================================================
+# O. PICKLING ROUND-TRIP
+# =============================================================================
+
+
+class TestPickling:
+    """Synthesis types must survive pickle round-trip."""
+
+    def test_multigraph_pickle(self):
+        mg = MultiGraph(
+            nodes=frozenset({0, 1, 2}),
+            edge_counts={(0, 1): 2, (1, 2): 1},
+            loop_counts={0: 1},
+        )
+        mg2 = pickle.loads(pickle.dumps(mg))
+        assert mg == mg2
+        assert mg.nodes == mg2.nodes
+        assert mg.edge_counts == mg2.edge_counts
+        assert mg.loop_counts == mg2.loop_counts
+
+    def test_tutte_polynomial_pickle(self):
+        poly = TuttePolynomial.from_coefficients({(1, 0): 1, (0, 1): 1})
+        poly2 = pickle.loads(pickle.dumps(poly))
+        assert poly == poly2
+
+    def test_complex_polynomial_pickle(self):
+        engine = HybridSynthesisEngine()
+        result = engine.synthesize(complete_graph(5))
+        poly = result.polynomial
+        poly2 = pickle.loads(pickle.dumps(poly))
+        assert poly == poly2
+        assert poly.num_spanning_trees() == poly2.num_spanning_trees()
+
+
+# =============================================================================
+# P. PARALLEL CORRECTNESS
+# =============================================================================
+
+
+class TestParallelCorrectness:
+    """Verify parallel results match sequential."""
+
+    @pytest.fixture(autouse=True)
+    def cleanup(self):
+        yield
+        shutdown_pool()
+
+    def test_parallel_k5(self):
+        engine = HybridSynthesisEngine()
+        g = complete_graph(5)
+        mg = MultiGraph(
+            nodes=g.nodes,
+            edge_counts={e: 1 for e in g.edges},
+            loop_counts={},
+        )
+        edge = next(iter(mg.edge_counts))
+        u, v = edge
+        new_edges = dict(mg.edge_counts)
+        del new_edges[edge]
+        mg_0 = MultiGraph(nodes=mg.nodes, edge_counts=new_edges, loop_counts={})
+        mg_c = mg_0.merge_nodes(u, v)
+
+        seq_poly0 = engine._synthesize_multigraph(mg_0, 10, False)
+        seq_polyc = engine._synthesize_multigraph(mg_c, 10, False)
+        par_poly0, par_polyc = parallel_synthesize_pair(engine, mg_0, mg_c, 10, False)
+
+        assert par_poly0 == seq_poly0
+        assert par_polyc == seq_polyc
+
+    def test_parallel_petersen(self):
+        engine = HybridSynthesisEngine()
+        g = petersen_graph()
+        mg = MultiGraph(
+            nodes=g.nodes,
+            edge_counts={e: 1 for e in g.edges},
+            loop_counts={},
+        )
+        edge = next(iter(mg.edge_counts))
+        u, v = edge
+        new_edges = dict(mg.edge_counts)
+        del new_edges[edge]
+        mg_0 = MultiGraph(nodes=mg.nodes, edge_counts=new_edges, loop_counts={})
+        mg_c = mg_0.merge_nodes(u, v)
+
+        seq_poly0 = engine._synthesize_multigraph(mg_0, 10, False)
+        seq_polyc = engine._synthesize_multigraph(mg_c, 10, False)
+        par_poly0, par_polyc = parallel_synthesize_pair(engine, mg_0, mg_c, 10, False)
+
+        assert par_poly0 == seq_poly0
+        assert par_polyc == seq_polyc
+
+
+# =============================================================================
+# Q. CACHE MERGING
+# =============================================================================
+
+
+class TestCacheMerging:
+    @pytest.fixture(autouse=True)
+    def cleanup(self):
+        yield
+        shutdown_pool()
+
+    def test_cache_grows_after_parallel(self):
+        engine = HybridSynthesisEngine()
+        g = complete_graph(5)
+        mg = MultiGraph(
+            nodes=g.nodes,
+            edge_counts={e: 1 for e in g.edges},
+            loop_counts={},
+        )
+        edge = next(iter(mg.edge_counts))
+        u, v = edge
+        new_edges = dict(mg.edge_counts)
+        del new_edges[edge]
+        mg_0 = MultiGraph(nodes=mg.nodes, edge_counts=new_edges, loop_counts={})
+        mg_c = mg_0.merge_nodes(u, v)
+
+        poly0, polyc = parallel_synthesize_pair(engine, mg_0, mg_c, 10, False)
+        assert poly0.num_spanning_trees() > 0
+        assert polyc.num_spanning_trees() > 0
+
+    def test_merge_worker_cache(self):
+        engine = HybridSynthesisEngine()
+        sentinel_poly = TuttePolynomial.x()
+        engine._multigraph_cache["sentinel_key"] = sentinel_poly
+
+        worker_cache = {
+            "new_key": TuttePolynomial.from_coefficients({(1, 0): 1, (0, 1): 1}),
+            "sentinel_key": TuttePolynomial.one(),
+        }
+        engine._merge_worker_cache(worker_cache)
+
+        assert engine._multigraph_cache["new_key"] == worker_cache["new_key"]
+        assert engine._multigraph_cache["sentinel_key"] == sentinel_poly
+
+
+class TestNestedPrevention:
+    """_in_worker flag prevents nested parallel calls."""
+
+    def test_should_parallelize_blocked_in_worker(self):
+        engine = HybridSynthesisEngine()
+        engine._in_worker = True
+
+        g = complete_graph(5)
+        mg = MultiGraph(
+            nodes=g.nodes,
+            edge_counts={e: 1 for e in g.edges},
+            loop_counts={},
+        )
+        mg2 = mg.merge_nodes(0, 1)
+
+        assert not engine._should_parallelize(mg, mg2)
+
+    def test_should_parallelize_allowed_normally(self):
+        engine = HybridSynthesisEngine()
+        g = complete_graph(10)
+        mg = MultiGraph(
+            nodes=g.nodes,
+            edge_counts={e: 1 for e in g.edges},
+            loop_counts={},
+        )
+        mg2 = MultiGraph(
+            nodes=g.nodes,
+            edge_counts={e: 1 for e in g.edges},
+            loop_counts={},
+        )
+        # 10 nodes < 12 → False
+        assert not engine._should_parallelize(mg, mg2)
+
+        g13 = complete_graph(13)
+        mg_big = MultiGraph(
+            nodes=g13.nodes,
+            edge_counts={e: 1 for e in g13.edges},
+            loop_counts={},
+        )
+        assert engine._should_parallelize(mg_big, mg_big)
+
+
+# =============================================================================
+# R. SYMMETRIC CHORD ORDERING
+# =============================================================================
+
+
+class TestSymmetricOrdering:
+    """Cell automorphism detection and chord pairing."""
+
+    @pytest.fixture
+    def symmetric_graph(self):
+        """Two K4 cells connected by 4 inter-cell edges with full symmetry."""
+        edges = set()
+        for i in range(4):
+            for j in range(i+1, 4):
+                edges.add((i, j))
+        for i in range(4, 8):
+            for j in range(i+1, 8):
+                edges.add((i, j))
+        for i in range(4):
+            edges.add((i, i+4))
+
+        g = Graph(nodes=frozenset(range(8)), edges=frozenset(edges))
+        partition = [{0, 1, 2, 3}, {4, 5, 6, 7}]
+        return g, partition
+
+    def test_find_automorphism(self, symmetric_graph):
+        g, partition = symmetric_graph
+        auto = find_cell_automorphism(g, partition)
+        assert auto is not None
+        for node in partition[0]:
+            assert auto[node] in partition[1]
+
+    def test_find_automorphism_rejects_asymmetric(self):
+        edges = set()
+        for i in range(3):
+            for j in range(i+1, 3):
+                edges.add((i, j))
+        for i in range(3, 6):
+            for j in range(i+1, 6):
+                edges.add((i, j))
+        edges.add((0, 3))
+        edges.add((1, 4))
+
+        g = Graph(nodes=frozenset(range(6)), edges=frozenset(edges))
+        partition = [{0, 1, 2}, {3, 4, 5}]
+        find_cell_automorphism(g, partition)  # should not crash
+
+    def test_pair_chords(self, symmetric_graph):
+        g, partition = symmetric_graph
+        auto = find_cell_automorphism(g, partition)
+        assert auto is not None
+
+        chords = [(0, 4), (1, 5), (2, 6), (3, 7)]
+        pairs, unpaired = pair_chords_by_symmetry(chords, auto, partition)
+
+        total_paired = len(pairs) * 2
+        total = total_paired + len(unpaired)
+        assert total == len(chords)
+
+    def test_build_symmetric_order(self, symmetric_graph):
+        g, partition = symmetric_graph
+        chords = [(0, 4), (1, 5), (2, 6), (3, 7)]
+        ordered, auto = build_symmetric_chord_order(chords, g, partition)
+        assert auto is not None
+        assert len(ordered) == len(chords)
+        assert set(ordered) == set(chords)
+
+    def test_three_cell_returns_none(self):
+        g = Graph(nodes=frozenset(range(3)), edges=frozenset())
+        partition = [{0}, {1}, {2}]
+        ordered, auto = build_symmetric_chord_order([], g, partition)
+        assert auto is None
+
+    def test_z12_automorphism(self):
+        """Z(1,2) has a cell automorphism that preserves all 32 inter-cell edges."""
+        from tutte.graphs.covering import try_hierarchical_partition
+
+        z12 = Graph.from_networkx(dnx.zephyr_graph(1, 2))
+        table_local = load_default_table()
+        result = try_hierarchical_partition(z12, table_local)
+        assert result is not None
+
+        cell_entry, cell_groups, inter_info = result
+        assert len(cell_groups) == 2
+
+        auto = find_cell_automorphism(z12, cell_groups)
+        assert auto is not None
+
+        for node in cell_groups[0]:
+            assert auto[node] in cell_groups[1]
+
+        chords = [e for e in inter_info.edges]
+        pairs, unpaired = pair_chords_by_symmetry(chords, auto, cell_groups)
+        total = len(pairs) * 2 + len(unpaired)
+        assert total == len(chords)
