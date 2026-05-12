@@ -223,6 +223,30 @@ def miner_worker_main(
             else:
                 if result is not None:
                     resp_q.put(result)
+        elif op == "mine_work_item":
+            # Substrate-mode entry point. The controller (Phase 4) pushes a
+            # SubstrateMiningContext through the request queue; the worker
+            # hands it to BaseMiner.mine_work_item which runs the
+            # protocol-neutral search loop. Same stop_event semantics as the
+            # legacy mine_block op — parent's cancel() and clear() bracket
+            # the call.
+            context = msg.get("context")
+            if context is None:
+                resp_q.put({"op": "error", "message": "Missing context for mine_work_item", "id": spec.get("id")})
+                continue
+            try:
+                result = miner.mine_work_item(context, stop_event)
+            except Exception as exc:
+                import traceback
+                logger.error(
+                    f"[{miner.miner_id}] mine_work_item raised: "
+                    f"{type(exc).__name__}: {exc}\n"
+                    f"{traceback.format_exc()}"
+                )
+                resp_q.put({"op": "error", "message": f"{type(exc).__name__}: {exc}", "id": spec.get("id")})
+            else:
+                if result is not None:
+                    resp_q.put(result)
         else:
             resp_q.put({"op": "error", "message": f"Unknown op {op}", "id": spec.get("id")})
             logger.info(f"{miner.miner_id}: Unknown op {op}")
@@ -280,6 +304,17 @@ class MinerHandle:
         # mine_block with stop_event already set and short-circuits.
         self.stop_event.clear()
         self.req.put({"op": "mine_block", "block": block, "node_info": node_info, "requirements": requirements, "prev_timestamp": prev_timestamp})
+
+    def mine_work_item(self, context) -> None:
+        """Dispatch a substrate-mode mining attempt.
+
+        ``context`` is a ``SubstrateMiningContext`` (see ``shared.substrate_types``).
+        Same stop_event semantics as ``mine``: the clear here brackets the
+        enqueue so a cancel landing between clear and the worker dequeue
+        still short-circuits the worker's loop.
+        """
+        self.stop_event.clear()
+        self.req.put({"op": "mine_work_item", "context": context})
 
     def cancel(self):
         """Cancel the current mining operation.
