@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quip-protocol"
-version = "0.1.20"
-description = "Quantum Proof-of-Work Blockchain Implementation"
+version = "0.2.0-dev"
+description = "Quantum mining stack (Substrate-integrated successor to the legacy quip-protocol P2P node)"
 readme = "README.md"
 requires-python = ">=3.10"
 # Base dependencies required for all modes
@@ -20,6 +20,8 @@ dependencies = [
     "blake3>=1.0.5",
     "aioquic>=1.3.0",
     "cryptography>=42.0.0",
+    "substrate-interface>=1.7.4",
+    "scalecodec>=1.2",
 ]
 
 [project.optional-dependencies]
