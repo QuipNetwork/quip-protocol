@@ -108,3 +108,24 @@ async def test_query_miner_unregistered_account(client):
     rando = Sr25519Signer.from_seed(b"\x42" * 32)
     miner_info = await client.query_miner(rando.account_id_bytes())
     assert miner_info is None
+
+
+async def test_query_difficulty_either_returns_or_none(client):
+    """`StorageValue<_, DifficultyConfig>` quirks: substrate-interface returns
+    the `Default::default()` value (all zeros) when storage is empty rather
+    than `None`. `query_difficulty` must honor `meta_info[result_found]`
+    so the bootstrap idempotency check stays correct on a fresh chain."""
+    difficulty = await client.query_difficulty()
+    # On a freshly-built chain `Difficulty` is unset and we expect None. After
+    # Phase 2 bootstrap (or any prior sudo set_difficulty) the storage is
+    # populated and we expect a real SubstrateDifficulty. Either is correct,
+    # but we must never see the all-zeros default-struct case.
+    if difficulty is not None:
+        # If we got a value, at least one field must be non-zero — otherwise
+        # we're back to the "default returned for empty storage" bug.
+        assert any([
+            difficulty.min_solutions,
+            difficulty.max_energy_milli,
+            difficulty.min_diversity_milli,
+            difficulty.min_quality_milli,
+        ]), "query_difficulty returned all-zeros struct; storage is empty"

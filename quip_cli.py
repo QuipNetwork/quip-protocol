@@ -716,6 +716,152 @@ def quip_network_smoketest(target: str, print_only: bool):
         pass
 
 
+# ---------------------------------------------------------------------------
+# quip-miner CLI (Phase 2: bootstrap + faucet-bot + keygen).
+#
+# Substrate-integrated mining frontend. Replaces the legacy P2P-driven
+# `quip-network-node` flow over the v0.1 → v0.2 refactor. Per the integration
+# plan, the cpu/gpu/qpu mining subcommands themselves are added in Phase 4
+# alongside the SubstrateMinerController; Phase 2 only ships the bootstrap
+# tooling so an operator can fund + register a miner account.
+# ---------------------------------------------------------------------------
+
+
+@click.group(name="quip-miner")
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+    default="INFO",
+    show_default=True,
+    help="Logging level for quip-miner subcommands",
+)
+def quip_miner(log_level: str) -> None:
+    """Substrate-integrated quantum mining frontend."""
+    from shared.logging_config import setup_logging  # local import: legacy CLI shouldn't pay the substrate cost
+
+    setup_logging(log_level=log_level.upper(), node_name="quip-miner")
+
+
+@quip_miner.command("keygen")
+@click.option(
+    "--out",
+    "out_path",
+    type=click.Path(dir_okay=False),
+    default="~/.quip-miner/signing.json",
+    show_default=True,
+    help="Where to write the generated keystore",
+)
+@click.option("--overwrite", is_flag=True, help="Replace an existing keystore at --out")
+def quip_miner_keygen(out_path: str, overwrite: bool) -> None:
+    """Generate a fresh sr25519 signing key for quip-miner.
+
+    Writes a JSON keystore (0o600) and prints the SS58 address. The seed is
+    stored in plaintext — adequate for dev workflows where the faucet bot
+    runs alongside. Passphrase-encrypted keystores land in Phase 7.
+    """
+    from pathlib import Path
+
+    from shared.keystore import generate
+
+    keystore = generate(Path(out_path).expanduser(), overwrite=overwrite)
+    click.echo(f"wrote keystore: {keystore.path}")
+    click.echo(f"ss58 address:   {keystore.signer.ss58_address()}")
+    click.echo(f"account_id:     0x{keystore.signer.account_id_bytes().hex()}")
+
+
+@quip_miner.command("bootstrap")
+@click.option(
+    "--node-url",
+    required=True,
+    help="Substrate node WebSocket URL (e.g. ws://localhost:9944)",
+)
+@click.option(
+    "--signer-key",
+    "signer_key_path",
+    type=click.Path(dir_okay=False),
+    default="~/.quip-miner/signing.json",
+    show_default=True,
+    help="Path to the keystore (will be created if missing)",
+)
+@click.option(
+    "--faucet-url",
+    default=None,
+    help="If set, request funding from this faucet bot when balance is low",
+)
+@click.option(
+    "--seed-chain/--no-seed-chain",
+    default=False,
+    help="On a fresh dev chain, sudo-seed QuantumPow.Difficulty and "
+    "QuantumPow.DefaultTopology (default off; requires --sudo-key)",
+)
+@click.option(
+    "--sudo-key",
+    "sudo_key_uri",
+    default="//Alice",
+    show_default=True,
+    help="Substrate URI for the sudo signer (dev only)",
+)
+@click.option(
+    "--seed-topology",
+    "seed_topology_mt",
+    default="2,2",
+    show_default=True,
+    help="Zephyr Z(m,t) parameters for the seed topology when --seed-chain is set",
+)
+def quip_miner_bootstrap(
+    node_url: str,
+    signer_key_path: str,
+    faucet_url: Optional[str],
+    seed_chain: bool,
+    sudo_key_uri: str,
+    seed_topology_mt: str,
+) -> None:
+    """Fund and register a miner account against a substrate chain.
+
+    Idempotent — re-running against a fully-bootstrapped account is a no-op
+    that just verifies state.
+    """
+    import asyncio
+    from pathlib import Path
+
+    from shared.miner_bootstrap import BootstrapConfig, bootstrap
+
+    try:
+        m_str, t_str = seed_topology_mt.split(",")
+        topology_mt = (int(m_str), int(t_str))
+    except (ValueError, AttributeError) as exc:
+        raise click.BadParameter(
+            f"--seed-topology must be 'm,t' (e.g. '2,2'), got {seed_topology_mt!r}"
+        ) from exc
+
+    config = BootstrapConfig(
+        node_url=node_url,
+        signer_key_path=Path(signer_key_path).expanduser(),
+        faucet_url=faucet_url,
+        sudo_key_uri=sudo_key_uri,
+        seed_chain=seed_chain,
+        seed_topology_mt=topology_mt,
+    )
+    result = asyncio.run(bootstrap(config))
+
+    click.echo("bootstrap complete")
+    click.echo(f"  ss58 address       : {result.ss58_address}")
+    click.echo(f"  account_id         : {result.account_id_hex}")
+    click.echo(f"  balance (plancks)  : {result.balance_plancks}")
+    click.echo(f"  miner registered   : {result.miner_registered}")
+    click.echo(f"  topology seeded    : {result.topology_seeded}")
+    click.echo(f"  difficulty seeded  : {result.difficulty_seeded}")
+
+
+# The faucet bot is shipped as a standalone script (`faucet_bot.py` at repo
+# root) so it can be deployed independently of the rest of `quip-protocol`.
+# Run with:
+#
+#     python faucet_bot.py --node-url ws://localhost:9944 --faucet-key //Alice
+#
+# See faucet_bot.py for the full CLI surface.
+
+
 # Entry points for console_scripts
 
 def network_node_main():
@@ -729,4 +875,9 @@ def network_simulator_main():
     multiprocessing.set_start_method('spawn', force=True)
 
     quip_network_simulator(standalone_mode=False)
+
+
+def miner_main():
+    """Entry point for the `quip-miner` console script."""
+    quip_miner(standalone_mode=False)
 
