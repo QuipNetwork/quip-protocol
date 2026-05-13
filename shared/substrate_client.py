@@ -125,6 +125,22 @@ class SubstrateClient:
         does. Required so the returned context is self-sufficient and so a
         missing signer fails fast rather than silently mining under a
         fabricated zero account.
+
+        **Off-by-one note**: The runtime API reads `System::block_number()`
+        and `System::parent_hash()` at the queried block's state. At chain
+        head N that gives `block_number=N`, `parent_hash=hash(N-1)`. The
+        miner's nonce, though, must match what `submit_proof` sees at
+        validation time — when the extrinsic lands in block N+1, where
+        `System::block_number()=N+1` and `System::parent_hash()=hash(N)`.
+
+        We bake that +1 offset into the returned context so
+        `mine_work_item` doesn't need to know about chain timing:
+          - `context.block_number = decoded.block_number + 1`
+          - `context.parent_hash = at` (the head hash, which IS hash(N))
+
+        This only works when `at` is explicit. Callers that pass `at=None`
+        get the raw snapshot values — useful for state probes (Phase 2
+        bootstrap idempotency check) but not for actual mining.
         """
         if len(miner_account_bytes) != 32:
             raise ValueError(
@@ -161,9 +177,18 @@ class SubstrateClient:
         decoded = _decode_mining_snapshot(encoded)
         if decoded is None:
             return None
+        # Apply the +1 offset for mining (see method docstring) when the
+        # caller pinned a specific block hash. Otherwise return raw
+        # snapshot values for state-probe callers.
+        if at is not None:
+            mining_block_number = decoded["block_number"] + 1
+            mining_parent_hash = at
+        else:
+            mining_block_number = decoded["block_number"]
+            mining_parent_hash = decoded["parent_hash"]
         return SubstrateMiningContext(
-            block_number=decoded["block_number"],
-            parent_hash=decoded["parent_hash"],
+            block_number=mining_block_number,
+            parent_hash=mining_parent_hash,
             topology_hash=decoded["topology_hash"],
             nodes=decoded["nodes"],
             edges=decoded["edges"],
@@ -287,14 +312,23 @@ class SubstrateClient:
             block_hash_bytes = bytes.fromhex(_strip_0x(block_hash_hex))
             await callback(block_hash_bytes, number)
 
-        def _dispatch(header: dict, update_nr: int, subscription_id: str):  # noqa: ARG001
-            # substrate-interface delivers either the bare header or wraps
-            # it in `{"header": {...}}` depending on the call path — accept
-            # both. Exceptions inside the callback are silently swallowed by
-            # the reader thread otherwise, so wrap with a log.
+        def _dispatch(obj: dict, update_nr: int, subscription_id: str):  # noqa: ARG001
+            # subscribe_block_headers delivers `{"header": {...}, "author": ...}`
+            # on the main path; some code paths surface the bare header
+            # directly. Accept both. Exceptions on the reader thread are
+            # otherwise silently swallowed.
             try:
-                inner = header.get("header", header)
-                number = _coerce_block_number(inner.get("number"))
+                if isinstance(obj, dict) and isinstance(obj.get("header"), dict):
+                    header = obj["header"]
+                elif isinstance(obj, dict):
+                    header = obj
+                else:
+                    logger.warning(
+                        "subscribe_new_heads: unexpected payload shape: %s",
+                        type(obj).__name__,
+                    )
+                    return
+                number = _coerce_block_number(header.get("number"))
                 future = asyncio.run_coroutine_threadsafe(
                     _handle_head(number), loop
                 )

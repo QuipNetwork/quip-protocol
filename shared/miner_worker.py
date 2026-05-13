@@ -102,11 +102,15 @@ def build_miner_from_spec(spec: Dict[str, Any]):
     args = dict(spec.get("args", {}))
 
     if kind == "cpu":
-        return CPU.SimulatedAnnealingMiner(miner_id, **cfg)
+        # Match the cuda/modal/cuda-gibbs paths: pass both cfg and args so a
+        # `topology=` override in spec.args propagates to the sampler. Phase 4
+        # controller relies on this to bind the miner to the chain's
+        # registered topology.
+        return CPU.SimulatedAnnealingMiner(miner_id, **cfg, **args)
     elif kind == "metal":
         if not GPU.METAL_AVAILABLE:
             raise RuntimeError("Metal miner requested but Metal is not available (requires macOS with Metal support)")
-        return GPU.MetalMiner(miner_id, **cfg)
+        return GPU.MetalMiner(miner_id, **cfg, **args)
     elif kind == "cuda":
         if not GPU.CUDA_AVAILABLE:
             raise RuntimeError("CUDA miner requested but CUDA is not available (requires CuPy and CUDA toolkit)")

@@ -116,18 +116,29 @@ def test_mine_work_item_result_encodes_to_quantum_proof(cpu_miner, relaxed_conte
     stop = mp.Event()
     result = cpu_miner.mine_work_item(relaxed_context, stop)
     proof = encode_quantum_proof(result, relaxed_context)
-    # Shape matches pallet QuantumProof: hex hashes, int nonce/salt, vec
-    # nodes/edges/solutions, milli-precision h_values.
+    # Shape matches pallet QuantumProof. The chain's BoundedVec fields are
+    # 1-field composites in metadata so the encoder wraps every Vec in a
+    # single-element tuple; assertions unpack those wrappers.
     assert proof["topology_hash"] == "0x" + relaxed_context.topology_hash.hex()
     assert proof["nonce"] == result.nonce
-    assert proof["salt"] == "0x" + result.salt.hex()
-    assert set(proof["nodes"]) == set(relaxed_context.nodes)
-    assert len(proof["edges"]) == len(relaxed_context.edges)
-    assert len(proof["solutions"]) >= relaxed_context.difficulty.min_solutions
-    # Every spin in every solution is ±1 (chain rejects 0).
-    for sol in proof["solutions"]:
-        assert all(s in (-1, 1) for s in sol)
-    assert proof["h_values"] == [-1000, 0, 1000]
+
+    salt_bytes, = proof["salt"]
+    assert bytes(salt_bytes) == result.salt
+
+    nodes, = proof["nodes"]
+    assert set(nodes) == set(relaxed_context.nodes)
+
+    edges, = proof["edges"]
+    assert len(edges) == len(relaxed_context.edges)
+
+    solutions, = proof["solutions"]
+    assert len(solutions) >= relaxed_context.difficulty.min_solutions
+    for wrapped_sol in solutions:
+        inner_sol, = wrapped_sol
+        assert all(s in (-1, 1) for s in inner_sol)
+
+    h_values, = proof["h_values"]
+    assert h_values == [-1000, 0, 1000]
 
 
 def test_mine_work_item_observes_stop_event(cpu_miner, relaxed_context):

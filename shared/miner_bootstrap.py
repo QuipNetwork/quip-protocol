@@ -273,23 +273,28 @@ def _difficulty_to_dict(d: SubstrateDifficulty) -> dict:
 
 
 def _build_seed_topology(mt: Tuple[int, int]) -> Tuple[List[int], List[Tuple[int, int]]]:
-    """Generate a Zephyr Z(m,t) graph as `(nodes, edges)` with consecutive node ids.
+    """Generate a Zephyr Z(m,t) graph using sampler-compatible node labels.
 
-    `dwave_networkx.zephyr_graph` assigns coordinate-style node labels. We
-    relabel to dense `0..n-1` indices to match the Rust pallet's
-    `validate_topology_consistency` expectations — see
-    `crates/quantum-validation/src/validation.rs`.
+    The labels are whatever `dwave_networkx.zephyr_graph` assigns (linear ints,
+    but typically non-contiguous depending on Zephyr's tile structure).
+    Critically these are *the same* labels that
+    `dwave_topologies.topologies.zephyr.ZephyrTopology` exposes via its
+    `nodes`/`edges` properties, which is what miners' samplers use as
+    coordinate keys when receiving `h` and `J` dicts.
+
+    Earlier versions of this helper remapped to dense 0..n-1, on the
+    mistaken belief the chain required it. The chain's
+    `validate_topology_consistency` only forbids duplicate node ids — any
+    `u32` label is fine. Remapping created a label mismatch between
+    chain-registered topology and the miner's sampler, causing every proof
+    to fail topology-hash verification.
     """
     m, t = mt
     g = dnx.zephyr_graph(m=m, t=t)
-    label_map = {label: idx for idx, label in enumerate(sorted(g.nodes()))}
-    nodes = sorted(label_map.values())
-    # Pallet expects edges with u < v; networkx guarantees neither order, so
-    # canonicalize before sorting.
+    nodes = sorted(int(n) for n in g.nodes())
     edges = sorted(
-        (min(label_map[u], label_map[v]), max(label_map[u], label_map[v]))
+        (min(int(u), int(v)), max(int(u), int(v)))
         for u, v in g.edges()
-        if label_map[u] != label_map[v]
     )
     return nodes, edges
 
