@@ -306,8 +306,16 @@ class SubstrateClient:
         loop = asyncio.get_running_loop()
 
         async def _handle_head(number: int) -> None:
+            # The dispatch callback can fire after `close()` has cleared
+            # `self._iface` — the reader thread keeps draining for a beat
+            # after the websocket is told to close. Bail quietly in that
+            # window rather than raising AttributeError into the future's
+            # done-callback.
+            iface = self._iface
+            if iface is None:
+                return
             block_hash_hex = await self._run(
-                lambda: self._iface.get_block_hash(block_id=number)
+                lambda: iface.get_block_hash(block_id=number)
             )
             block_hash_bytes = bytes.fromhex(_strip_0x(block_hash_hex))
             await callback(block_hash_bytes, number)
