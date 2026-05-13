@@ -41,9 +41,9 @@ from typing import List, Optional, Tuple
 
 import dwave_networkx as dnx
 
-from shared.keystore import KeystoreFile, load_or_generate
+from shared.hybrid_signer import HybridSigner
+from shared.keystore_hybrid import HybridKeystoreFile, load_or_generate
 from shared.logging_config import get_logger
-from shared.signer import Sr25519Signer
 from shared.substrate_client import SubstrateClient
 from shared.substrate_types import SubstrateDifficulty
 
@@ -57,6 +57,41 @@ DEV_CHAIN_PREFIXES: Tuple[str, ...] = (
     "Local Testnet",
     "quip-local",
 )
+
+
+# Well-known dev master seeds for the hybrid signature scheme. Captured
+# from `cargo run --example dump_dev_seeds -p quip-transaction-crypto`
+# against `quip-protocol-rs` main. Verified byte-for-byte against the
+# Rust-side `ALICE_PINNED_ACCOUNT_HEX` canary in genesis_config_presets.
+# Update via the dump_dev_seeds example if the chain's dev mnemonic /
+# derivation path ever change.
+DEV_HYBRID_SEEDS = {
+    "//Alice": bytes.fromhex(
+        "e5be9a5092b81bca64be81d212e7f2f9eba183bb7a90954f7b76361f6edb5c0a"
+    ),
+    "//Bob": bytes.fromhex(
+        "398f0c28f98885e046333d4a41c19cee4c37368a9832c6502f6cfd182e2aef89"
+    ),
+    "//Alice//stash": bytes.fromhex(
+        "3c881bc4d45926680c64a7f9315eeda3dd287f8d598f3653d7c107799c5422b3"
+    ),
+}
+
+
+def _resolve_dev_signer(uri: str) -> HybridSigner:
+    """Return a HybridSigner for a known dev URI like //Alice.
+
+    Substrate's URI-to-master-seed derivation (BIP39 + soft junctions) is
+    non-trivial to replicate in Python; for dev URIs we use the precomputed
+    seeds dumped from the Rust side. Anything outside `DEV_HYBRID_SEEDS`
+    raises — production paymasters supply their own keystore.
+    """
+    if uri not in DEV_HYBRID_SEEDS:
+        raise ValueError(
+            f"unknown dev URI {uri!r}; known: {sorted(DEV_HYBRID_SEEDS)}. "
+            "Load a hybrid keystore instead via shared.keystore_hybrid.load()."
+        )
+    return HybridSigner.from_master_seed(DEV_HYBRID_SEEDS[uri])
 
 
 logger = get_logger("miner_bootstrap")
@@ -180,7 +215,7 @@ async def _maybe_seed_chain(
     whether *this* call did the seeding. Both are False on re-runs.
     """
     await _assert_dev_chain(client)
-    sudo_signer = Sr25519Signer.from_uri(config.sudo_key_uri)
+    sudo_signer = _resolve_dev_signer(config.sudo_key_uri)
 
     difficulty_seeded = False
     if await client.query_difficulty() is None:
@@ -234,7 +269,7 @@ async def _maybe_seed_chain(
 
 async def _sudo_call(
     client: SubstrateClient,
-    sudo_signer: Sr25519Signer,
+    sudo_signer: HybridSigner,
     inner_module: str,
     inner_function: str,
     inner_params: dict,
@@ -306,7 +341,7 @@ def _build_seed_topology(mt: Tuple[int, int]) -> Tuple[List[int], List[Tuple[int
 
 async def _ensure_funded(
     client: SubstrateClient,
-    keystore: KeystoreFile,
+    keystore: HybridKeystoreFile,
     config: BootstrapConfig,
 ) -> int:
     account = keystore.signer.account_id_bytes()
@@ -378,7 +413,7 @@ def _post_faucet(url: str, *, dest_hex: str, amount: int) -> dict:
 
 async def _ensure_registered(
     client: SubstrateClient,
-    keystore: KeystoreFile,
+    keystore: HybridKeystoreFile,
 ) -> bool:
     account = keystore.signer.account_id_bytes()
     miner_info = await client.query_miner(account)

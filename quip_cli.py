@@ -19,7 +19,7 @@ from typing import Any, Dict, Optional
 
 import click
 
-from shared.keystore import generate
+from shared.keystore_hybrid import generate
 from shared.logging_config import setup_logging
 from shared.miner_bootstrap import BootstrapConfig, bootstrap
 
@@ -53,11 +53,19 @@ def quip_miner_keygen(out_path: str, overwrite: bool) -> None:
     Writes a JSON keystore (0o600) and prints the SS58 address. The seed is
     stored in plaintext — adequate for dev workflows where the faucet bot
     runs alongside. Passphrase-encrypted keystores land in Phase 7.
+
+    v0.2 hybrid chain: keygen produces a sr25519+ML-DSA-44 hybrid keystore
+    by default via `shared.keystore_hybrid`. The legacy sr25519-only
+    `shared.keystore` module is still available for pre-hybrid chains but
+    not exposed via the CLI in v0.2.
     """
     keystore = generate(Path(out_path).expanduser(), overwrite=overwrite)
-    click.echo(f"wrote keystore: {keystore.path}")
-    click.echo(f"ss58 address:   {keystore.signer.ss58_address()}")
-    click.echo(f"account_id:     0x{keystore.signer.account_id_bytes().hex()}")
+    click.echo(f"wrote hybrid keystore: {keystore.path}")
+    click.echo(f"ss58 address:          {keystore.signer.ss58_address()}")
+    click.echo(f"account_id:            0x{keystore.signer.account_id_bytes().hex()}")
+    click.echo(
+        f"public key (1344B):    0x{keystore.signer.public_bytes().hex()[:48]}..."
+    )
 
 
 @quip_miner.command("bootstrap")
@@ -208,14 +216,13 @@ async def _run_miner(
     import signal as signal_module
     from pathlib import Path
 
-    from shared.keystore import load
+    from shared.keystore_hybrid import load
     from shared.miner_core import MinerCore
-    from shared.signer import Sr25519Signer
     from shared.substrate_client import SubstrateClient
     from shared.substrate_miner_controller import SubstrateMinerController
 
     keystore = load(Path(signer_key_path).expanduser())
-    click.echo(f"signer: {keystore.signer.ss58_address()}")
+    click.echo(f"signer: {keystore.signer.ss58_address()} (hybrid)")
 
     # Build the sampler topology and bind it to the miner config.
     topology = _parse_topology(topology_spec)

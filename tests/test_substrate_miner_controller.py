@@ -18,11 +18,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from dwave_topologies.topologies.zephyr import zephyr
-from shared.keystore import generate
-from shared.miner_bootstrap import BootstrapConfig, _maybe_seed_chain
+from shared.keystore_hybrid import generate
+from shared.miner_bootstrap import BootstrapConfig, _maybe_seed_chain, _resolve_dev_signer
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
-from shared.signer import Sr25519Signer
 from shared.substrate_client import SubstrateClient
 from shared.substrate_miner_controller import (
     FATAL_SUBMISSION_ERRORS,
@@ -488,25 +487,21 @@ def _chain_requires_hybrid_signer(url: str) -> bool:
     not _chain_reachable(DEFAULT_URL),
     reason=f"substrate chain not reachable at {DEFAULT_URL}",
 )
-@pytest.mark.skipif(
-    _chain_requires_hybrid_signer(DEFAULT_URL),
-    reason="chain requires hybrid sr25519+ML-DSA-44 signatures; "
-    "end-to-end mining is blocked on Phase 7 (HybridSigner) work",
-)
 @pytest.mark.timeout(180)
 async def test_controller_submits_proof_end_to_end(tmp_path):
     """Spin up a controller against the live chain, mine one proof.
 
-    Inlines bootstrap (sudo-seeds Difficulty + Z(2,2) topology if missing,
+    Inlines bootstrap (sudo-seeds Z(9,2) topology + difficulty if missing,
     funds the signer via direct //Alice transfer, registers as miner) so
     the test doesn't depend on a running faucet bot. Builds a CPU miner
     with the matching topology. Self-contained — works against a fresh
     `docker compose down -v && up -d` chain.
 
-    Skipped automatically when the chain requires hybrid sr25519+ML-DSA-44
-    signatures (Phase 7 unblocker).
+    Phase 7 (hybrid sr25519+ML-DSA-44) update: uses `HybridSigner` for
+    both the test miner keystore and Alice funding. `//Alice` is resolved
+    via `DEV_HYBRID_SEEDS` to its precomputed 32-byte master seed.
     """
-    keystore_path = tmp_path / "signing.json"
+    keystore_path = tmp_path / "hybrid_signing.json"
     keystore = generate(keystore_path)
 
     # Use Z(9,2) — the legacy chain's default. The genesis-style difficulty
@@ -530,14 +525,17 @@ async def test_controller_submits_proof_end_to_end(tmp_path):
         )
 
         # Fund the signer from //Alice directly (no faucet bot needed).
-        alice = Sr25519Signer.from_uri("//Alice")
+        # On the hybrid chain, //Alice resolves to the HybridSigner derived
+        # from the precomputed DEV_HYBRID_SEEDS entry, not the sr25519 URI
+        # derivation — see shared.miner_bootstrap._resolve_dev_signer.
+        alice = _resolve_dev_signer("//Alice")
         balance = await setup_client.query_balance(keystore.signer.account_id_bytes())
         if balance < 2_000_000_000_000:
             await setup_client.submit_extrinsic(
                 "Balances",
                 "transfer_keep_alive",
                 {
-                    "dest": "0x" + keystore.signer.account_id_bytes().hex(),
+                    "dest": {"Id": "0x" + keystore.signer.account_id_bytes().hex()},
                     "value": 10_000_000_000_000,
                 },
                 alice,
