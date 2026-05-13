@@ -23,6 +23,7 @@ from shared.base_miner import (
     _BridgePrevBlock,
     _block_requirements_from_difficulty,
 )
+from shared.work_context import requirements_from_context, resolve_ising
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from shared.quantum_proof_of_work import derive_nonce
@@ -73,16 +74,47 @@ def relaxed_context(cpu_miner) -> SubstrateMiningContext:
 
 
 def test_bridge_prev_block_carries_substrate_fields(relaxed_context):
-    bridge = _BridgePrevBlock.from_context(relaxed_context)
+    bridge = _BridgePrevBlock.from_work_context(relaxed_context)
     # cur_index = prev_block.header.index + 1 must equal context.block_number
     assert bridge.header.index + 1 == relaxed_context.block_number
     assert bridge.hash == relaxed_context.parent_hash
 
 
 def test_bridge_node_info_exposes_hex_account(relaxed_context):
-    bridge = _BridgeNodeInfo.from_context(relaxed_context)
+    bridge = _BridgeNodeInfo.from_work_context(relaxed_context)
     assert bridge.miner_id == "0x" + relaxed_context.miner_account_bytes.hex()
     assert bridge.miner_account_bytes == relaxed_context.miner_account_bytes
+
+
+def test_bridge_prev_block_handles_mempool_context():
+    """Phase 8b: mempool work uses order_id as the prev-block index and a
+    zero-hash placeholder. Subclass hooks that log the index get a
+    meaningful value; the hash is never fed back into the chain."""
+    from shared.mempool_types import MempoolJobContext
+    ctx = MempoolJobContext(
+        order_id=42,
+        nodes=(0, 1, 2),
+        edges=((0, 1), (1, 2)),
+        h_values=(0, 0, 0),
+        j_values=(0, 0),
+    )
+    bridge = _BridgePrevBlock.from_work_context(ctx)
+    assert bridge.header.index == 42
+    assert bridge.hash == b"\x00" * 32
+
+
+def test_bridge_node_info_handles_mempool_context():
+    from shared.mempool_types import MempoolJobContext
+    ctx = MempoolJobContext(
+        order_id=7,
+        nodes=(0, 1),
+        edges=((0, 1),),
+        h_values=(0, 0),
+        j_values=(0,),
+    )
+    bridge = _BridgeNodeInfo.from_work_context(ctx)
+    assert bridge.miner_id == "mempool-order-7"
+    assert bridge.miner_account_bytes == b"\x00" * 32
 
 
 def test_block_requirements_converts_milli_to_float():
@@ -101,6 +133,104 @@ def test_block_requirements_converts_milli_to_float():
     assert req.timeout_to_difficulty_adjustment_decay >= 2**30
 
 
+def test_requirements_from_context_pow_path(relaxed_context):
+    """`requirements_from_context` should produce the same shape the
+    legacy helper does for a PoW context."""
+    legacy = _block_requirements_from_difficulty(relaxed_context.difficulty)
+    via_dispatch = requirements_from_context(relaxed_context)
+    assert via_dispatch.difficulty_energy == legacy.difficulty_energy
+    assert via_dispatch.min_diversity == legacy.min_diversity
+    assert via_dispatch.min_solutions == legacy.min_solutions
+
+
+def test_requirements_from_context_mempool_unset_floors():
+    """Mempool quality floors are Option<T>; unset maps to:
+      - difficulty_energy = +inf (no upper bound)
+      - min_diversity    = 0.0
+      - min_solutions    = 1 (chain requires ≥1 valid submission)"""
+    from shared.mempool_types import MempoolJobContext
+    ctx = MempoolJobContext(
+        order_id=1,
+        nodes=(0, 1),
+        edges=((0, 1),),
+        h_values=(0, 0),
+        j_values=(0,),
+    )
+    req = requirements_from_context(ctx)
+    assert req.difficulty_energy == float("inf")
+    assert req.min_diversity == 0.0
+    assert req.min_solutions == 1
+
+
+def test_requirements_from_context_mempool_with_floors():
+    from shared.mempool_types import MempoolJobContext
+    ctx = MempoolJobContext(
+        order_id=2,
+        nodes=(0, 1),
+        edges=((0, 1),),
+        h_values=(0, 0),
+        j_values=(0,),
+        min_energy_milli=-1500,
+        min_diversity_milli=300,
+        min_solutions=4,
+    )
+    req = requirements_from_context(ctx)
+    assert req.difficulty_energy == -1.5
+    assert req.min_diversity == 0.3
+    assert req.min_solutions == 4
+
+
+def test_resolve_ising_mempool_returns_stored_h_j():
+    """Mempool's resolve_ising surfaces the stored (h, J) dicts directly;
+    nonce is 0 (telemetry placeholder). nodes/edges params are unused on
+    this path since the chain doesn't re-derive the model."""
+    from shared.mempool_types import MempoolJobContext
+    ctx = MempoolJobContext(
+        order_id=99,
+        nodes=(10, 20, 30),
+        edges=((10, 20), (20, 30)),
+        h_values=(1000, -500, 250),     # millivalues
+        j_values=(-100, 750),
+    )
+    h, J, nonce = resolve_ising(
+        ctx, salt=b"\x00" * 32, nodes=ctx.nodes, edges=ctx.edges,
+    )
+    assert h == {10: 1.0, 20: -0.5, 30: 0.25}
+    assert J == {(10, 20): -0.1, (20, 30): 0.75}
+    assert nonce == 0
+
+
+def test_resolve_ising_pow_uses_derive_nonce(relaxed_context, cpu_miner):
+    """PoW's resolve_ising must produce the same (h, J, nonce) as the legacy
+    direct invocation of derive_nonce + generate_ising_model_from_nonce —
+    when called with the sampler's node/edge iteration order."""
+    from shared.quantum_proof_of_work import (
+        derive_nonce,
+        generate_ising_model_from_nonce,
+    )
+    salt = b"\x42" * 32
+    sampler_nodes = list(cpu_miner.sampler.nodes)
+    sampler_edges = list(cpu_miner.sampler.edges)
+    legacy_nonce = derive_nonce(
+        relaxed_context.parent_hash,
+        relaxed_context.miner_account_bytes,
+        relaxed_context.block_number,
+        salt,
+    )
+    legacy_h, legacy_J = generate_ising_model_from_nonce(
+        legacy_nonce,
+        sampler_nodes,
+        sampler_edges,
+        list(relaxed_context.h_values),
+    )
+    h, J, nonce = resolve_ising(
+        relaxed_context, salt=salt, nodes=sampler_nodes, edges=sampler_edges,
+    )
+    assert nonce == legacy_nonce
+    assert h == legacy_h
+    assert J == legacy_J
+
+
 def test_mine_work_item_returns_result(cpu_miner, relaxed_context):
     stop = mp.Event()
     result = cpu_miner.mine_work_item(relaxed_context, stop)
@@ -110,6 +240,39 @@ def test_mine_work_item_returns_result(cpu_miner, relaxed_context):
     assert len(result.salt) == 32
     # node_list and edge_list should match the topology the miner ran with
     assert sorted(result.node_list) == sorted(relaxed_context.nodes)
+
+
+def test_mine_work_item_handles_mempool_context(cpu_miner):
+    """Phase 8b: mine_work_item must accept a MempoolJobContext and mine
+    against the directly-provided (h, J) rather than deriving via nonce.
+
+    Uses an all-zero Ising over the CPU miner's actual topology — every
+    spin assignment has energy 0, so any sample with `min_solutions=1`
+    and no other floors passes the requirements check.
+    """
+    from shared.mempool_types import MempoolJobContext
+
+    nodes = tuple(int(n) for n in cpu_miner.sampler.nodes)
+    edges = tuple((int(u), int(v)) for u, v in cpu_miner.sampler.edges)
+    ctx = MempoolJobContext(
+        order_id=12345,
+        nodes=nodes,
+        edges=edges,
+        h_values=tuple(0 for _ in nodes),     # all-zero field
+        j_values=tuple(0 for _ in edges),     # all-zero coupling
+        min_energy_milli=None,
+        min_diversity_milli=None,
+        min_solutions=1,
+    )
+    stop = mp.Event()
+    result = cpu_miner.mine_work_item(ctx, stop)
+    assert isinstance(result, MiningResult)
+    # mempool's resolve_ising returns 0 as the placeholder nonce
+    assert result.nonce == 0
+    # all-zero ising → any sample has energy 0
+    assert result.energy <= 0.0
+    assert result.num_valid >= 1
+    assert sorted(result.node_list) == sorted(nodes)
 
 
 def test_mine_work_item_result_encodes_to_quantum_proof(cpu_miner, relaxed_context):
