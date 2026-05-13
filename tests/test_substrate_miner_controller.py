@@ -5,14 +5,28 @@ drop paths, dispatch-tracking races, the fatal-receipt raise path, head
 coalescing, subscription-client deadlock guard, topology-pin fail-fast,
 unregistered-miner fail-fast, and the two-client teardown ownership.
 
-The integration test at the bottom drives the controller end-to-end against
-the docker chain (auto-skipped when the chain isn't reachable).
+Integration tests drive the controller end-to-end against the docker chain:
+
+  - `test_controller_submits_proof_end_to_end` — smoke test, one proof
+  - `test_controller_long_haul_multi_block` — Phase 6 verification: at least
+    three proofs over a longer window, zero fatal submission errors, and
+    matching chain-side `MinerInfo.proofs_submitted` counter
+
+Live-chain tests share the `_live_controller` async context manager so the
+bootstrap (seed / fund / register) wiring isn't duplicated; the helper is
+also re-used from `test_telemetry_live_miner.py` for the live-miner
+telemetry assertions.
+
+All integration tests auto-skip when the docker chain isn't reachable.
 """
 from __future__ import annotations
 
 import asyncio
 import os
 import socket
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import AsyncIterator, Tuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -97,6 +111,7 @@ def _bare_controller() -> SubstrateMinerController:
     c._dispatched = {}
     c._consecutive_none_snapshots = 0
     c.topology_hash = None
+    c.core = None  # Phase 6: optional MinerCore for telemetry
     return c
 
 
@@ -483,37 +498,39 @@ def _chain_requires_hybrid_signer(url: str) -> bool:
         return False
 
 
-@pytest.mark.skipif(
-    not _chain_reachable(DEFAULT_URL),
-    reason=f"substrate chain not reachable at {DEFAULT_URL}",
-)
-@pytest.mark.timeout(180)
-async def test_controller_submits_proof_end_to_end(tmp_path):
-    """Spin up a controller against the live chain, mine one proof.
+@asynccontextmanager
+async def _live_controller(
+    tmp_path: Path,
+    *,
+    seed_topology_mt: Tuple[int, int] = (9, 2),
+    core=None,
+) -> AsyncIterator[tuple]:
+    """Bring up a SubstrateMinerController against the docker chain.
 
-    Inlines bootstrap (sudo-seeds Z(9,2) topology + difficulty if missing,
-    funds the signer via direct //Alice transfer, registers as miner) so
-    the test doesn't depend on a running faucet bot. Builds a CPU miner
-    with the matching topology. Self-contained — works against a fresh
-    `docker compose down -v && up -d` chain.
+    Yields `(controller, run_task, handle, keystore, client)`. On exit,
+    signals the controller to shut down, joins the run-task, and tears down
+    the MinerHandle subprocess.
 
-    Phase 7 (hybrid sr25519+ML-DSA-44) update: uses `HybridSigner` for
-    both the test miner keystore and Alice funding. `//Alice` is resolved
-    via `DEV_HYBRID_SEEDS` to its precomputed 32-byte master seed.
+    The bootstrap path mirrors the production `quip-miner bootstrap`
+    workflow: sudo-seed Z(m,t) topology + relaxed difficulty if the chain
+    hasn't been seeded yet, fund the test signer from //Alice (resolved via
+    `DEV_HYBRID_SEEDS` on hybrid chains), and register the signer as a
+    miner. Idempotent — repeated runs against the same chain are fine.
+
+    Pass `core=MinerCore(...)` to wire the controller into a MinerCore so
+    legacy `/api/v1/stats` fields (`total_blocks_attempted` /
+    `total_blocks_won`) update — required by the live-miner telemetry test.
     """
     keystore_path = tmp_path / "hybrid_signing.json"
     keystore = generate(keystore_path)
 
-    # Use Z(9,2) — the legacy chain's default. The genesis-style difficulty
-    # threshold (-2500 milli) is calibrated for that GSE range (≈ -4100).
-    # Smaller graphs like Z(2,2) need a relaxed difficulty to find solutions
-    # at all; we keep this test on the well-calibrated path.
-    seed_topology_mt = (9, 2)
-
     setup_client = SubstrateClient(url=DEFAULT_URL)
     await setup_client.connect()
     try:
-        # Sudo-seed difficulty + topology if missing. The helper is idempotent.
+        # `force_reseed_difficulty=True` matters across tests: the chain's
+        # runtime adjustment tightens min_diversity / max_energy between
+        # proofs, so without a reset the long-haul / telemetry tests run
+        # into infeasible difficulty after the smoke test mines its block.
         await _maybe_seed_chain(
             setup_client,
             BootstrapConfig(
@@ -521,29 +538,34 @@ async def test_controller_submits_proof_end_to_end(tmp_path):
                 signer_key_path=keystore_path,
                 seed_chain=True,
                 seed_topology_mt=seed_topology_mt,
+                force_reseed_difficulty=True,
             ),
         )
 
-        # Fund the signer from //Alice directly (no faucet bot needed).
-        # On the hybrid chain, //Alice resolves to the HybridSigner derived
-        # from the precomputed DEV_HYBRID_SEEDS entry, not the sr25519 URI
-        # derivation — see shared.miner_bootstrap._resolve_dev_signer.
+        # //Alice resolves to the HybridSigner derived from
+        # DEV_HYBRID_SEEDS — not substrate-interface URI derivation — on
+        # hybrid chains. See shared.miner_bootstrap._resolve_dev_signer.
         alice = _resolve_dev_signer("//Alice")
-        balance = await setup_client.query_balance(keystore.signer.account_id_bytes())
+        balance = await setup_client.query_balance(
+            keystore.signer.account_id_bytes()
+        )
         if balance < 2_000_000_000_000:
             await setup_client.submit_extrinsic(
                 "Balances",
                 "transfer_keep_alive",
                 {
-                    "dest": {"Id": "0x" + keystore.signer.account_id_bytes().hex()},
+                    "dest": {
+                        "Id": "0x" + keystore.signer.account_id_bytes().hex()
+                    },
                     "value": 10_000_000_000_000,
                 },
                 alice,
                 wait_for="inblock",
             )
 
-        # Register the miner.
-        if await setup_client.query_miner(keystore.signer.account_id_bytes()) is None:
+        if await setup_client.query_miner(
+            keystore.signer.account_id_bytes()
+        ) is None:
             receipt = await setup_client.submit_extrinsic(
                 "QuantumPow", "register_miner", {}, keystore.signer,
                 wait_for="inblock",
@@ -553,7 +575,8 @@ async def test_controller_submits_proof_end_to_end(tmp_path):
 
         head = await setup_client.get_head()
         snap = await setup_client.get_mining_snapshot(
-            at=head, miner_account_bytes=keystore.signer.account_id_bytes()
+            at=head,
+            miner_account_bytes=keystore.signer.account_id_bytes(),
         )
         if snap is None:
             pytest.fail("chain not seeded after sudo-seed step")
@@ -563,17 +586,18 @@ async def test_controller_submits_proof_end_to_end(tmp_path):
     finally:
         await setup_client.close()
 
-    # Build a CPU miner handle whose sampler topology matches the chain's
-    # registered topology. The bootstrap-seeded labels come from the same
-    # `dwave_networkx.zephyr_graph(m, t)` source the sampler uses, so the
-    # labels match byte-for-byte once the SA sampler is constructed with
-    # `topology=zephyr(m, t)`.
-    spec = {
-        "id": "test-controller-cpu",
-        "kind": "cpu",
-        "args": {"topology": zephyr(*seed_topology_mt)},
-    }
-    handle = MinerHandle(spec=spec)
+    # If a MinerCore was provided, reuse its handle so the controller-driven
+    # `record_dispatch` / `record_result` calls land on the same instance
+    # the telemetry server reads from. Otherwise build a standalone handle.
+    if core is not None and core.miner_handles:
+        handle = core.miner_handles[0]
+    else:
+        spec = {
+            "id": "test-controller-cpu",
+            "kind": "cpu",
+            "args": {"topology": zephyr(*seed_topology_mt)},
+        }
+        handle = MinerHandle(spec=spec)
 
     client = SubstrateClient(url=DEFAULT_URL)
     await client.connect()
@@ -582,28 +606,12 @@ async def test_controller_submits_proof_end_to_end(tmp_path):
         signer=keystore.signer,
         miner_handles=[handle],
         topology_hash=chain_topology_hash,
+        core=core,
     )
-
-    proof_submitted = asyncio.Event()
-
-    async def on_proof(receipt, ctx):
-        proof_submitted.set()
-
-    controller.on_proof_submitted = on_proof
 
     run_task = asyncio.create_task(controller.run())
     try:
-        # Give the controller up to 120s to land a proof. CPU SA on Z(2,2)
-        # at the seeded difficulty finishes in 10-30s typically.
-        try:
-            await asyncio.wait_for(proof_submitted.wait(), timeout=120)
-        except asyncio.TimeoutError:
-            pytest.fail(
-                f"controller did not submit a proof in 120s. stats={controller.stats}"
-            )
-        # At least one proof submitted and zero fatal errors.
-        assert controller.stats.proofs_submitted >= 1
-        assert controller.stats.submission_errors == 0
+        yield controller, run_task, handle, keystore, client
     finally:
         controller.shutdown()
         try:
@@ -611,8 +619,92 @@ async def test_controller_submits_proof_end_to_end(tmp_path):
         except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
             pass
         await client.close()
-        handle.req.put({"op": "shutdown"})
-        handle.proc.join(timeout=5)
-        if handle.proc.is_alive():
-            handle.proc.terminate()
-            handle.proc.join(timeout=2)
+        # When `core` owns the handle, let `core.close()` tear it down; the
+        # caller is responsible for that. Otherwise we built the handle
+        # ourselves and own its lifecycle.
+        if core is None or handle not in core.miner_handles:
+            handle.req.put({"op": "shutdown"})
+            handle.proc.join(timeout=5)
+            if handle.proc.is_alive():
+                handle.proc.terminate()
+                handle.proc.join(timeout=2)
+
+
+@pytest.mark.skipif(
+    not _chain_reachable(DEFAULT_URL),
+    reason=f"substrate chain not reachable at {DEFAULT_URL}",
+)
+@pytest.mark.timeout(180)
+async def test_controller_submits_proof_end_to_end(tmp_path):
+    """Smoke test: spin up a controller against the live chain, mine one proof.
+
+    Self-contained — works against a fresh `docker compose down -v && up -d`
+    chain. The full bootstrap (sudo-seed Z(9,2) + funding + registration)
+    runs inside `_live_controller`.
+    """
+    async with _live_controller(tmp_path) as (
+        controller, _run_task, _handle, _keystore, _client,
+    ):
+        proof_submitted = asyncio.Event()
+
+        async def on_proof(receipt, ctx):
+            proof_submitted.set()
+
+        controller.on_proof_submitted = on_proof
+        try:
+            await asyncio.wait_for(proof_submitted.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            pytest.fail(
+                f"controller did not submit a proof in 120s. "
+                f"stats={controller.stats}"
+            )
+        assert controller.stats.proofs_submitted >= 1
+        assert controller.stats.submission_errors == 0
+
+
+@pytest.mark.skipif(
+    not _chain_reachable(DEFAULT_URL),
+    reason=f"substrate chain not reachable at {DEFAULT_URL}",
+)
+@pytest.mark.timeout(360)
+async def test_controller_long_haul_multi_block(tmp_path):
+    """Phase 6 verification: sustain mining across multiple head changes.
+
+    Mines until at least `TARGET_PROOFS` proofs land, then asserts:
+      - `proofs_submitted` reached the target
+      - zero fatal submission errors accumulated
+      - chain-side `MinerInfo.proofs_submitted` reflects the run
+
+    The CPU SA path on Z(9,2) at the relaxed seed difficulty typically lands
+    a proof every 10-30s; a 5-minute budget for ≥3 proofs gives comfortable
+    headroom even on a slow shared dev machine.
+    """
+    TARGET_PROOFS = 3
+
+    async with _live_controller(tmp_path) as (
+        controller, _run_task, _handle, keystore, client,
+    ):
+        proof_event = asyncio.Event()
+
+        async def on_proof(receipt, ctx):
+            if controller.stats.proofs_submitted >= TARGET_PROOFS:
+                proof_event.set()
+
+        controller.on_proof_submitted = on_proof
+        try:
+            await asyncio.wait_for(proof_event.wait(), timeout=300)
+        except asyncio.TimeoutError:
+            pytest.fail(
+                f"only {controller.stats.proofs_submitted}/{TARGET_PROOFS} "
+                f"proofs in 300s. stats={controller.stats}"
+            )
+
+        assert controller.stats.proofs_submitted >= TARGET_PROOFS
+        assert controller.stats.submission_errors == 0
+        # Chain-side counter should reflect at least one acceptance.
+        # `MinerInfo.proofs_submitted` lags briefly behind the controller's
+        # local counter because the chain only writes after extrinsic
+        # finalization; we don't strictly require equality, just non-zero.
+        info = await client.query_miner(keystore.signer.account_id_bytes())
+        assert info is not None
+        assert info.proofs_submitted >= 1

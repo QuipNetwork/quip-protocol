@@ -294,6 +294,12 @@ class TelemetryApiServer:
           - the block hash
         Dashboards that consumed the v0.1 fields directly need updating;
         the response envelope shape (success/data/timestamp) is preserved.
+
+        substrate-interface's `get_block` returns a structure that mixes
+        plain dicts with `ScaleType` wrappers (e.g. the digest items hold
+        decoded `scale_info::N` objects). Those aren't JSON-serializable as
+        returned, so we coerce through `_to_jsonable` before handing the
+        dict to `json_response`.
         """
         def _query() -> dict:
             block = self.client._iface.get_block(block_hash="0x" + at.hex())  # noqa: SLF001
@@ -301,10 +307,11 @@ class TelemetryApiServer:
 
         block = await self.client._run(_query)  # noqa: SLF001
         header = block.get("header", {}) if isinstance(block, dict) else {}
+        extrinsics = block.get("extrinsics", []) if isinstance(block, dict) else []
         return {
             "hash": "0x" + at.hex(),
-            "header": header,
-            "extrinsic_count": len(block.get("extrinsics", []) or []) if isinstance(block, dict) else 0,
+            "header": _to_jsonable(header),
+            "extrinsic_count": len(extrinsics or []),
         }
 
     # ------------------------------------------------------------------
@@ -332,6 +339,30 @@ class TelemetryApiServer:
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
+
+
+def _to_jsonable(obj: Any) -> Any:
+    """Recursively coerce substrate-interface output to JSON-safe primitives.
+
+    `SubstrateInterface.get_block` returns dicts whose leaves can be raw
+    `ScaleType` instances (e.g. decoded `scale_info::N` objects from the
+    runtime metadata). `json.dumps` rejects those with "is not JSON
+    serializable"; calling `.value` on a ScaleType gives the decoded
+    primitive (str / int / list / dict). Walk the structure and unwrap.
+    """
+    if isinstance(obj, dict):
+        return {k: _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(v) for v in obj]
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    # ScaleType and friends carry the decoded value under `.value`. Fall
+    # back to repr() for anything else so the endpoint stays observable
+    # even if substrate-interface ever changes its return shape.
+    val = getattr(obj, "value", None)
+    if val is not None and val is not obj:
+        return _to_jsonable(val)
+    return repr(obj)
 
 
 def _parse_block_number(request: web.Request):

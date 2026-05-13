@@ -32,7 +32,7 @@ import asyncio
 import queue as _queue
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
@@ -167,12 +167,21 @@ class SubstrateMinerController:
             Callable[[ExtrinsicReceipt, SubstrateMiningContext], Awaitable[None]]
         ] = None,
         subscription_client: Optional[SubstrateClient] = None,
+        core: Optional[Any] = None,
     ) -> None:
         if not miner_handles:
             raise ValueError(
                 "SubstrateMinerController requires at least one MinerHandle"
             )
         self.client = client
+        # Optional MinerCore hook. When provided, the controller calls
+        # `core.record_dispatch()` once per head (not per handle — that would
+        # double-count when more than one miner is attached) and
+        # `core.record_result(winning_miner_id, mining_time)` on chain-accepted
+        # proofs. Keeps `/api/v1/stats`'s legacy `total_blocks_attempted` /
+        # `total_blocks_won` / `wins_per_miner` fields live without coupling
+        # the controller's type to MinerCore.
+        self.core = core
         # substrate-interface holds the websocket in receive mode for the
         # duration of `subscribe_block_headers`, which makes any concurrent
         # submit_extrinsic / state_call on the same connection hang
@@ -418,6 +427,9 @@ class SubstrateMinerController:
             self._dispatched[handle.miner_id] = context
             handle.mine_work_item(context)
         self.stats.contexts_dispatched += len(self.miner_handles)
+        if self.core is not None:
+            # One attempt per head, regardless of how many handles fanned out.
+            self.core.record_dispatch()
 
     async def _handle_result(self, envelope: _ResultEnvelope) -> None:
         self.stats.results_received += 1
@@ -475,6 +487,11 @@ class SubstrateMinerController:
                 receipt.block_hash,
                 self.signer.ss58_address(),
             )
+            if self.core is not None:
+                self.core.record_result(
+                    winning_miner_id=envelope.result.miner_id,
+                    mining_time=float(envelope.result.mining_time),
+                )
             if self.on_proof_submitted is not None:
                 await self.on_proof_submitted(receipt, envelope.context)
         elif outcome is SubmissionOutcome.STALE:
