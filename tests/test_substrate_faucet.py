@@ -40,7 +40,12 @@ def _chain_reachable(url: str) -> bool:
 
 
 def _chain_requires_hybrid_signer(url: str) -> bool:
-    """Same check as test_substrate_miner_controller — see Phase 5b notes."""
+    """Inspect chain metadata for `HybridTxSignature` in the type table.
+
+    Mirrors faucet_bot's own auto-detect — used here only to pick the right
+    test signer type for the balance assertion (a fresh hybrid signer on
+    hybrid chains, vs `Sr25519Signer` on vanilla chains).
+    """
     if not _chain_reachable(url):
         return False
     try:
@@ -61,12 +66,22 @@ pytestmark = [
         not _chain_reachable(DEFAULT_URL),
         reason=f"substrate chain not reachable at {DEFAULT_URL}",
     ),
-    pytest.mark.skipif(
-        _chain_requires_hybrid_signer(DEFAULT_URL),
-        reason="chain requires hybrid sr25519+ML-DSA-44 signatures; faucet "
-        "transfers blocked on Phase 7 (HybridSigner) work",
-    ),
 ]
+
+
+def _fresh_test_account_id_bytes() -> bytes:
+    """Mint a fresh AccountId for the destination of a faucet transfer.
+
+    On hybrid chains the AccountId is derived from the *composite* pubkey
+    via `blake2_256(domain || pubkey)` — `Sr25519Signer.account_id_bytes`
+    won't match because the chain expects the hybrid derivation. We just
+    need any unused 32-byte AccountId for the balance check; producing one
+    from a random hybrid pubkey works on both chain types.
+    """
+    if _chain_requires_hybrid_signer(DEFAULT_URL):
+        signer = faucet_bot._HybridSigner(os.urandom(faucet_bot.MASTER_SEED_LEN))
+        return signer.account_id_bytes()
+    return Sr25519Signer.from_seed(os.urandom(32)).account_id_bytes()
 
 
 def _free_port() -> int:
@@ -95,9 +110,11 @@ async def _running_faucet(port: int) -> AsyncIterator["faucet_bot.SubstrateFauce
 
 async def test_faucet_funds_fresh_account():
     port = _free_port()
-    # Fresh per-test signer so the balance check is unambiguous.
-    test_signer = Sr25519Signer.from_seed(os.urandom(32))
-    dest_hex = "0x" + test_signer.account_id_bytes().hex()
+    # Fresh per-test destination so the balance check is unambiguous. The
+    # chain-mode-appropriate derivation is picked inside the helper so this
+    # test exercises both signing paths.
+    dest_bytes = _fresh_test_account_id_bytes()
+    dest_hex = "0x" + dest_bytes.hex()
     amount = 1_000_000_000_000  # 1 UNIT
 
     async with _running_faucet(port):
@@ -114,7 +131,7 @@ async def test_faucet_funds_fresh_account():
     client = SubstrateClient(url=DEFAULT_URL)
     await client.connect()
     try:
-        balance = await client.query_balance(test_signer.account_id_bytes())
+        balance = await client.query_balance(dest_bytes)
         assert balance == amount, f"expected balance {amount}, got {balance}"
     finally:
         await client.close()
