@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..graph import Graph
 from ..polynomial import TuttePolynomial
@@ -382,6 +382,7 @@ def compute_path_dp_grouped(
     label_offset: int = 0,
     return_pos_layout: bool = False,
     enable_per_cell_compression: bool = False,
+    observer: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[Dict[Tuple, TuttePolynomial], Dict[str, float], int]:
     """Generic path DP supporting per-cell anchor groups + shared-horizontal.
 
@@ -403,6 +404,20 @@ def compute_path_dp_grouped(
             cell_specs[0].left_group must be None (path-start endpoint).
             cell_specs[-1].right_group must be None (path-end endpoint).
         verbose: print per-step diagnostics.
+        observer: optional callable invoked AFTER each junction step and
+            each cell step in the main loop. Receives a dict with keys:
+              step_index (int, 0-based loop index)
+              kind ("junction" or "cell")
+              state_orbit_T_before (snapshot dict before orbit_convolve)
+              state_orbit_T_after (post-convolve state)
+              M_table (the precompute_M_table output for this step)
+              orbit_sizes (out_orbit_sizes for this step)
+              state_cell_groups_before / state_cell_groups_after
+              shared_boundary (pos_jA for junction, pos_jB for cell)
+              div_delta (int contribution to total_div)
+            When observer is set, the cache is BYPASSED so every step
+            fires. Used by extract_chain_transfer_matrix to observe the
+            per-step transfer operator. No behavioral change when None.
 
     Returns:
         (state_T_dict, stats_dict, total_div) — same shape as compute_path_dp.
@@ -449,7 +464,7 @@ def compute_path_dp_grouped(
     cached_total_div: Optional[int] = None
     cached_group_sizes: Optional[Tuple[int, ...]] = None
     cache_key: Optional[Tuple] = None
-    if enable_per_cell_compression:
+    if enable_per_cell_compression and observer is None:
         cache_key = _path_dp_cache_key(
             cell_template, cell_anchor_groups,
             junction_template, junction_anchors_A, junction_anchors_B,
@@ -687,6 +702,10 @@ def compute_path_dp_grouped(
             )
         stats["M_precompute"] += time.perf_counter() - t
 
+        # Snapshot pre-convolve state for observer.
+        if observer is not None:
+            state_orbit_T_before_junc = dict(state_orbit_T)
+            state_cell_groups_before_junc = [list(g) for g in state_cell_groups]
         t = time.perf_counter()
         state_orbit_T = orbit_convolve(
             state_orbit_T, junction_orbit_T, M_j, out_orbit_sizes_junc,
@@ -698,6 +717,23 @@ def compute_path_dp_grouped(
             cell_template, list(cell_anchor_groups[spec_next.left_group]),
         )
         total_div += (len(pos_jB) - junction_c_J)
+        if observer is not None:
+            observer({
+                "step_index": k,
+                "kind": "junction",
+                "state_orbit_T_before": state_orbit_T_before_junc,
+                "state_orbit_T_after": dict(state_orbit_T),
+                "M_table": M_j,
+                "junction_orbit_T": dict(junction_orbit_T),
+                "orbit_sizes": dict(out_orbit_sizes_junc),
+                "state_cell_groups_before": state_cell_groups_before_junc,
+                "state_cell_groups_after": [list(g) for g in out_state_cell_groups],
+                "shared_boundary": list(pos_jA),
+                "extra_boundary": list(pos_jB),
+                "persistent_positions": list(persistent_positions),
+                "div_delta": len(pos_jB) - junction_c_J,
+                "junction_c_J": junction_c_J,
+            })
         state_right_pos = pos_jB
         if enable_per_cell_compression:
             # Construct rep partition per orbit (canonical_key alone isn't a
@@ -846,6 +882,10 @@ def compute_path_dp_grouped(
             )
         stats["M_precompute"] += time.perf_counter() - t
 
+        # Snapshot pre-convolve state for observer.
+        if observer is not None:
+            state_orbit_T_before_cell = dict(state_orbit_T)
+            state_cell_groups_before_cell = [list(g) for g in state_cell_groups]
         t = time.perf_counter()
         state_orbit_T = orbit_convolve(
             state_orbit_T, cell_orbit_T, M_c, out_orbit_sizes_cell,
@@ -853,6 +893,25 @@ def compute_path_dp_grouped(
         stats["convolve"] += time.perf_counter() - t
 
         total_div += (len(pos_jB) - cell_c_J)
+        if observer is not None:
+            observer({
+                "step_index": k,
+                "kind": "cell",
+                "state_orbit_T_before": state_orbit_T_before_cell,
+                "state_orbit_T_after": dict(state_orbit_T),
+                "M_table": M_c,
+                "cell_orbit_T": dict(cell_orbit_T),
+                "orbit_sizes": dict(out_orbit_sizes_cell),
+                "state_cell_groups_before": state_cell_groups_before_cell,
+                "state_cell_groups_after": [list(g) for g in out_state_cell_groups2],
+                "shared_boundary": list(pos_jB),
+                "extra_boundary": list(cell_extra_positions),
+                "persistent_positions": list(persistent_positions),
+                "div_delta": len(pos_jB) - cell_c_J,
+                "cell_c_J": cell_c_J,
+                "keep_shared": keep_shared,
+                "has_shared_horizontal": spec_next.has_shared_horizontal,
+            })
         state_right_pos = new_state_right
         if enable_per_cell_compression:
             state_orbit_partitions = {

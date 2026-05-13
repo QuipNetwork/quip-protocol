@@ -590,6 +590,25 @@ class RainbowTable:
 
         return index
 
+    def find_by_polynomial(self, target: TuttePolynomial) -> Optional[MinorEntry]:
+        """Find a table entry whose polynomial equals `target` exactly.
+
+        Returns the matching MinorEntry, or None if no entry has that
+        polynomial. Used by AlgebraicSynthesisEngine to bottom-out
+        recursive decomposition when the target polynomial is already
+        a known atom.
+
+        Pre-filters by spanning tree count (T(1,1)) for speed; only
+        compares full polynomials on candidates that match T(1,1).
+        """
+        target_trees = target.num_spanning_trees()
+        for entry in self.entries.values():
+            if entry.spanning_trees != target_trees:
+                continue
+            if entry.polynomial == target:
+                return entry
+        return None
+
     def find_factors_of(self, target: TuttePolynomial) -> List[Tuple[MinorEntry, TuttePolynomial]]:
         """Find table entries whose polynomial divides the target (with quotient).
 

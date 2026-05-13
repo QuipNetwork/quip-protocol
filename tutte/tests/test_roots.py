@@ -505,8 +505,14 @@ def test_partition_c_oversized_universe_returns_none():
 @pytest.fixture(autouse=True)
 def _clear_path_dp_cache_fx():
     clear_path_dp_cache()
+    # Also clear the module-level T_rooted cache to avoid cross-test
+    # interference (different cells/specs can canonicalize to the same
+    # key in edge cases, and the cache isn't cleared by `clear_path_dp_cache`).
+    from tutte.roots.rooted_tutte import _T_ROOTED_CACHE
+    _T_ROOTED_CACHE.clear()
     yield
     clear_path_dp_cache()
+    _T_ROOTED_CACHE.clear()
 
 
 def test_cache_hit_same_spec_different_label_offset():
@@ -759,6 +765,243 @@ def test_path_grouped_3cell_K4_M2_disjoint_middle():
     T_marg = _marginalize(T_path, td)
     assert T_marg == T_engine
     assert T_marg.num_spanning_trees() == 36864
+
+
+def test_path_grouped_observer_hook_3cell_K3_M2():
+    """Observer hook fires for each junction + cell step in 3-cell path.
+
+    For n_cells=3: expect 2 junction events + 2 cell events = 4 total.
+    Validate state continuity (state_after of step k == state_before of k+1)
+    and divisor accumulation (sum of div_delta == total_div).
+    """
+    K3 = Graph.from_networkx(nx.complete_graph(3))
+    M2 = Graph(list(range(4)), [(0, 2), (1, 3)])
+    cell_anchor_groups = {0: [0, 1]}
+    specs = [
+        CellRowSpec(cell=0, left_group=None, right_group=0, extra_groups=()),
+        CellRowSpec(cell=1, left_group=0, right_group=0, extra_groups=()),
+        CellRowSpec(cell=2, left_group=0, right_group=None, extra_groups=()),
+    ]
+
+    events = []
+
+    def obs(e):
+        events.append(e)
+
+    T_path, _, td = compute_path_dp_grouped(
+        K3, cell_anchor_groups, M2, [0, 1], [2, 3], specs,
+        observer=obs,
+    )
+
+    # Expect (n_cells-1)*2 = 4 events.
+    assert len(events) == 4, f"expected 4 events, got {len(events)}"
+    # Order: junction, cell, junction, cell.
+    assert [e["kind"] for e in events] == ["junction", "cell", "junction", "cell"]
+    # State continuity: state_after of step k == state_before of step k+1.
+    for k in range(len(events) - 1):
+        after_k = events[k]["state_orbit_T_after"]
+        before_kp1 = events[k + 1]["state_orbit_T_before"]
+        assert after_k == before_kp1, (
+            f"state mismatch between event {k} ({events[k]['kind']}) and "
+            f"event {k+1} ({events[k+1]['kind']})"
+        )
+    # Divisor accumulation: sum of div_delta == total_div.
+    assert sum(e["div_delta"] for e in events) == td, (
+        f"sum(div_delta)={sum(e['div_delta'] for e in events)} != total_div={td}"
+    )
+    # Sanity: every event has an M_table dict.
+    for e in events:
+        assert isinstance(e["M_table"], dict)
+        assert len(e["M_table"]) > 0
+
+
+def test_polynomial_evaluate_mod_matches_int_arithmetic():
+    """`TuttePolynomial.evaluate_mod(x, y, p)` reproduces direct
+    integer-modular evaluation of the polynomial at (x, y).
+    """
+    from tutte.polynomial import TuttePolynomial
+
+    # T(x, y) = 3 x^2 y + 5 x - 2 y^3 + 7
+    T = TuttePolynomial.from_coefficients({
+        (2, 1): 3, (1, 0): 5, (0, 3): -2, (0, 0): 7,
+    })
+    for x, y, p in [(2, 3, 7), (10, 7, 13), (5, 5, 101), (3, 0, 11)]:
+        expected = (3 * x**2 * y + 5 * x - 2 * y**3 + 7) % p
+        assert T.evaluate_mod(x, y, p) == expected, (
+            f"(x={x}, y={y}, p={p}): "
+            f"got {T.evaluate_mod(x, y, p)}, expected {expected}"
+        )
+
+    # Empty polynomial
+    T0 = TuttePolynomial.from_coefficients({})
+    assert T0.evaluate_mod(3, 5, 17) == 0
+
+
+def test_interpolation_1d_roundtrip():
+    """1D Lagrange interpolation recovers the original polynomial."""
+    from tutte.roots.interpolation import lagrange_1d_mod
+
+    # P(x) = 3 x^2 + 5 x + 7 mod 101 — verify roundtrip
+    p = 101
+    coefs_in = [7, 5, 3]
+    pts = [(x, (3 * x**2 + 5 * x + 7) % p) for x in [0, 1, 2, 3, 4]]
+    recovered = lagrange_1d_mod(pts, p)
+    # Trailing zeros are allowed; check the meaningful coefficients.
+    assert recovered[:3] == coefs_in, f"got {recovered}, expected {coefs_in}"
+
+
+def test_interpolation_2d_roundtrip():
+    """Bivariate Lagrange interpolation recovers a 2D polynomial."""
+    from tutte.polynomial import TuttePolynomial
+    from tutte.roots.interpolation import bivariate_lagrange_interpolate_mod
+
+    T = TuttePolynomial.from_coefficients({(2, 1): 2, (1, 0): 3, (0, 2): 5, (0, 0): 7})
+    p = 1009
+    xs = [10, 20, 30]
+    ys = [40, 50, 60]
+    grid = [[T.evaluate_mod(x, y, p) for y in ys] for x in xs]
+    recovered = bivariate_lagrange_interpolate_mod(xs, ys, grid, p)
+    assert recovered == {(2, 1): 2, (1, 0): 3, (0, 2): 5, (0, 0): 7}
+
+
+def test_interpolation_crt_combine_exact_recovery():
+    """CRT-combine across primes recovers exact integer coefficients."""
+    from tutte.polynomial import TuttePolynomial
+    from tutte.roots.interpolation import (
+        bivariate_lagrange_interpolate_mod, crt_combine_coeff_dicts,
+    )
+
+    T = TuttePolynomial.from_coefficients({
+        (3, 1): 12345, (2, 0): -678, (0, 4): 91011,
+    })
+    primes = [1009, 1013, 1019]
+    mod_dicts = []
+    for p in primes:
+        grid = [[T.evaluate_mod(x, y, p) for y in range(5)] for x in range(4)]
+        coefs_mod = bivariate_lagrange_interpolate_mod(
+            list(range(4)), list(range(5)), grid, p,
+        )
+        mod_dicts.append(coefs_mod)
+    exact = crt_combine_coeff_dicts(mod_dicts, primes)
+    assert exact == {(3, 1): 12345, (2, 0): -678, (0, 4): 91011}
+
+
+def test_precompute_M_table_mod_matches_evaluated_polynomial():
+    """`precompute_M_table_mod(..., x_val, y_val, p)` produces the same
+    M-table values as `precompute_M_table(...)` evaluated at `(x_val,
+    y_val) mod p` entry-by-entry. Phase 12.B-2 fast modular M-table:
+    direct int accumulation should be bit-identical to the polynomial
+    path followed by post-hoc modular evaluation.
+    """
+    from tutte.roots.cell_quotient_helpers import (
+        _evaluate_poly_dict_mod, _poly_to_dict, precompute_M_table,
+        precompute_M_table_mod,
+    )
+
+    state_orbits = {
+        ((0,), (1,)): [((0,), (1,))],
+        ((0, 1),): [((0, 1),)],
+    }
+    junc_orbits = {
+        ((0,), (1,)): [((0,), (1,))],
+        ((0, 1),): [((0, 1),)],
+    }
+    shared = [0, 1]
+    extra: list = []
+
+    M_poly = precompute_M_table(
+        state_orbits, junc_orbits, shared_boundary=shared,
+        extra_boundary=extra, out_aut_group=[], state_extra_boundary=[],
+    )
+    for x_val, y_val, p in [(3, 5, 1009), (7, 11, 10007), (100, 200, 10**9 + 7)]:
+        M_int = precompute_M_table_mod(
+            state_orbits, junc_orbits, shared_boundary=shared,
+            extra_boundary=extra, out_aut_group=[],
+            x_val=x_val, y_val=y_val, p=p, state_extra_boundary=[],
+        )
+        assert set(M_int.keys()) == set(M_poly.keys())
+        for key, m_poly in M_poly.items():
+            m_eval = _evaluate_poly_dict_mod(
+                _poly_to_dict(m_poly), x_val, y_val, p,
+            )
+            assert M_int[key] == m_eval, (
+                f"(x={x_val}, y={y_val}, p={p}) M[{key}]: "
+                f"mod-int={M_int[key]} vs poly-evaluated={m_eval}"
+            )
+
+
+def test_precompute_M_table_internal_junction_enumeration_matches_external():
+    """`enumerate_junction_internally=True` reproduces the M-table built from
+    caller-side junction enumeration (the v4 baseline). Uses K_3 + M_2: small
+    enough to enumerate fully, large enough to exercise compression.
+    """
+    from tutte.roots.cell_quotient_helpers import precompute_M_table
+    from tutte.roots.rooted_tutte import all_partitions, t_rooted_cached
+
+    K3 = Graph.from_networkx(nx.complete_graph(3))
+    M2 = Graph(list(range(4)), [(0, 2), (1, 3)])
+
+    state_anchors = [10, 11]
+    junc_anchors = [10, 11, 20, 21]
+    map_M2 = {0: 10, 1: 11, 2: 20, 3: 21}
+    T_M2 = {tuple(sorted(tuple(sorted(map_M2[v] for v in b)) for b in p)): poly
+            for p, poly in t_rooted_cached(M2, [0, 1, 2, 3]).items()}
+
+    state_T = {tuple(sorted(tuple(sorted(map_M2[v] for v in b)) for b in p)): poly
+               for p, poly in t_rooted_cached(K3, [0, 1]).items()}
+    state_anchor_groups = [[10, 11]]
+    junc_anchor_groups = [[10, 20], [11, 21]]
+
+    state_orbit_T = {}
+    state_orbit_part = {}
+    for P, val in state_T.items():
+        canon = per_cell_canonical_key(P, state_anchor_groups)
+        if canon not in state_orbit_T:
+            state_orbit_T[canon] = val
+            state_orbit_part[canon] = [per_cell_orbit_rep(canon, state_anchor_groups)]
+
+    junc_orbit_T = {}
+    junc_orbit_part_singlerep = {}
+    junc_orbit_part_enum = {}
+    for P, val in T_M2.items():
+        canon = per_cell_canonical_key(P, junc_anchor_groups)
+        if canon not in junc_orbit_T:
+            junc_orbit_T[canon] = val
+            junc_orbit_part_singlerep[canon] = [P]
+            junc_orbit_part_enum[canon] = []
+        junc_orbit_part_enum[canon].append(P)
+
+    out_anchor_groups = [[20, 21]]
+
+    M_external = precompute_M_table(
+        state_orbit_part, junc_orbit_part_enum,
+        shared_boundary=state_anchors,
+        extra_boundary=[20, 21],
+        out_aut_group=[],
+        state_extra_boundary=[],
+        out_cell_anchor_groups=out_anchor_groups,
+        state_cell_anchor_groups=state_anchor_groups,
+    )
+    M_internal = precompute_M_table(
+        state_orbit_part, junc_orbit_part_singlerep,
+        shared_boundary=state_anchors,
+        extra_boundary=[20, 21],
+        out_aut_group=[],
+        state_extra_boundary=[],
+        out_cell_anchor_groups=out_anchor_groups,
+        state_cell_anchor_groups=state_anchor_groups,
+        junction_cell_anchor_groups=junc_anchor_groups,
+        enumerate_junction_internally=True,
+    )
+
+    assert set(M_external.keys()) == set(M_internal.keys()), (
+        f"key sets differ: external={len(M_external)}, internal={len(M_internal)}"
+    )
+    for k in M_external:
+        assert M_external[k] == M_internal[k], (
+            f"value mismatch at key {k}: external={M_external[k]}, "
+            f"internal={M_internal[k]}"
+        )
 
 
 # =============================================================================
@@ -1143,3 +1386,230 @@ def test_interleaved_dp_cm2_full():
 
     assert T_ileaved == T_engine
     assert T_ileaved.num_spanning_trees() == count_spanning_trees_kirchhoff(g)
+
+
+@pytest.mark.slow
+def test_pair_orbit_M_table_matches_streamed_on_cm2_row():
+    """`precompute_M_table_pair_orbit` reproduces v5 streamed's M-table on
+    the Cm₂ 2b row-row composition step (K_{4,4} cells joined by a
+    K_{4,4} row T_rooted on row 1's a-side).
+
+    This is the actual use case where compressed × compressed convolution
+    occurs (state after 2a + row 1 both on next_up positions, both
+    compressed by the same row1_scg per-cell groups). The pair-orbit
+    aware path must give the SAME M-table entries as the v5 streamed
+    path (where junction is enumerated internally).
+
+    Slow because it builds the full row DP + 2a state, then computes both
+    M-tables and compares (~2 minutes).
+    """
+    import dwave_networkx as dnx
+    from tutte.graphs.covering import try_hierarchical_partition
+    from tutte.roots.cell_anchor_adapter import (
+        detect_cell_anchor_groups, extract_grid_specs,
+    )
+    from tutte.roots.cell_quotient_grid import (
+        _grid_cell_layout, is_grid_topology,
+    )
+    from tutte.roots.cell_quotient_helpers import (
+        components_touching, orbit_convolve, precompute_M_table,
+        precompute_M_table_pair_orbit,
+    )
+    from tutte.roots.cell_quotient_path import compute_path_dp_grouped
+    from tutte.roots.rooted_tutte import (
+        all_partitions, relabel_partition_dict, t_rooted_cached,
+    )
+
+    g = dnx.chimera_graph(2)
+    G_graph = Graph.from_networkx(g)
+    res = try_hierarchical_partition(G_graph, load_default_table())
+    _cell, partition, inter_info = res
+    cag = detect_cell_anchor_groups(partition, inter_info.edges)
+    adj = {i: set() for i in range(len(partition))}
+    for (a, b) in inter_info.cell_adjacencies:
+        adj[a].add(b)
+        adj[b].add(a)
+    rows, cols = is_grid_topology(adj, len(partition))
+    layout = _grid_cell_layout(len(partition), rows, cols, adj)
+    grid_specs = extract_grid_specs(cag, layout)
+
+    cell_nodes = sorted(partition[0])
+    cell_sub = nx.Graph()
+    for u in cell_nodes:
+        for v in g.neighbors(u):
+            if v in cell_nodes:
+                cell_sub.add_edge(u, v)
+    K44 = Graph.from_networkx(cell_sub)
+    cell_anchor_groups: dict = {}
+    for grp_id, vertices in cag.cell_groups[0]:
+        cell_anchor_groups[grp_id] = [cell_nodes.index(v) for v in vertices]
+    M4 = Graph(list(range(8)), [(i, i + 4) for i in range(4)])
+
+    # Per-row compressed path DP.
+    row_results = []
+    for r in range(rows):
+        row_specs = [spec.to_row_spec() for spec in grid_specs[r]]
+        T_dict, _, td, pos_layout, scg = compute_path_dp_grouped(
+            K44, cell_anchor_groups, M4, [0, 1, 2, 3], [4, 5, 6, 7],
+            row_specs, label_offset=100000 * r, return_pos_layout=True,
+            enable_per_cell_compression=True,
+        )
+        row_results.append({
+            "state_T": T_dict, "td": td, "pos_layout": pos_layout, "scg": scg,
+        })
+
+    # Run 2a step to produce the state input for 2b.
+    prev_down, next_up = [], []
+    for c in range(cols):
+        prev_down.extend(row_results[0]["pos_layout"][c][
+            grid_specs[0][c].down_group
+        ])
+        next_up.extend(row_results[1]["pos_layout"][c][
+            grid_specs[1][c].up_group
+        ])
+    v_a = v_b = 4
+    combined_nodes = list(range(cols * 8))
+    combined_edges = [
+        (c * 8 + u, c * 8 + v)
+        for c in range(cols) for u, v in M4.edges
+    ]
+    combined = Graph(combined_nodes, combined_edges)
+    combined_A = [c * 8 + i for c in range(cols) for i in range(4)]
+    combined_B = [c * 8 + 4 + i for c in range(cols) for i in range(4)]
+    T_combined = t_rooted_cached(combined, combined_A + combined_B)
+    map_c = {combined_A[i]: prev_down[i] for i in range(cols * v_a)}
+    for i in range(cols * v_b):
+        map_c[combined_B[i]] = next_up[i]
+    T_combined_pos = relabel_partition_dict(T_combined, map_c)
+    junc_cell_groups = [[prev_down[i], next_up[i]] for i in range(cols * v_a)]
+    junc_orbit_T, junc_orbit_part = {}, {}
+    for P, val in T_combined_pos.items():
+        canon = per_cell_canonical_key(P, junc_cell_groups)
+        if canon not in junc_orbit_T:
+            junc_orbit_T[canon] = val
+            junc_orbit_part[canon] = [P]
+
+    state_orbit_T = row_results[0]["state_T"]
+    state_scg = row_results[0]["scg"]
+    state_orbit_part = {
+        canon: [per_cell_orbit_rep(canon, state_scg)]
+        for canon in state_orbit_T
+    }
+    row1_scg = row_results[1]["scg"]
+    out_orbit_part_2a: dict = {}
+    for P in all_partitions(next_up):
+        P_tup = tuple(sorted(tuple(sorted(b)) for b in P))
+        canon = per_cell_canonical_key(P_tup, row1_scg)
+        out_orbit_part_2a.setdefault(canon, []).append(P_tup)
+    out_orbit_sizes_2a = {
+        ok: len(parts) for ok, parts in out_orbit_part_2a.items()
+    }
+    M_v = precompute_M_table(
+        state_orbit_part, junc_orbit_part,
+        shared_boundary=prev_down, extra_boundary=next_up,
+        out_aut_group=[], state_extra_boundary=[],
+        out_cell_anchor_groups=row1_scg,
+        state_cell_anchor_groups=state_scg,
+        junction_cell_anchor_groups=junc_cell_groups,
+        enumerate_junction_internally=True,
+    )
+    state_T_2a = orbit_convolve(
+        state_orbit_T, junc_orbit_T, M_v, out_orbit_sizes_2a,
+    )
+
+    # 2b: compute M-table BOTH ways (v5 streamed + v7 pair-orbit aware) and
+    # compare entry-by-entry.
+    row1_orbit_T = row_results[1]["state_T"]
+    state_orbit_part_2b = {
+        canon: [per_cell_orbit_rep(canon, row1_scg)] for canon in state_T_2a
+    }
+    row1_orbit_part = {
+        canon: [per_cell_orbit_rep(canon, row1_scg)] for canon in row1_orbit_T
+    }
+
+    M_v5_streamed = precompute_M_table(
+        state_orbit_part_2b, row1_orbit_part,
+        shared_boundary=next_up, extra_boundary=[],
+        out_aut_group=[], state_extra_boundary=[],
+        state_cell_anchor_groups=row1_scg,
+        junction_cell_anchor_groups=row1_scg,
+        enumerate_junction_internally=True,
+    )
+    M_pair_orbit = precompute_M_table_pair_orbit(
+        state_orbit_part_2b, row1_orbit_part,
+        shared_boundary=next_up, extra_boundary=[],
+        state_extra_boundary=[],
+        state_cell_anchor_groups=row1_scg,
+        junction_cell_anchor_groups=row1_scg,
+    )
+
+    assert set(M_v5_streamed.keys()) == set(M_pair_orbit.keys()), (
+        f"key sets differ: v5={len(M_v5_streamed)}, "
+        f"pair_orbit={len(M_pair_orbit)}"
+    )
+    for k in M_v5_streamed:
+        assert M_v5_streamed[k] == M_pair_orbit[k], (
+            f"value mismatch at {k}: "
+            f"v5={M_v5_streamed[k]}, pair_orbit={M_pair_orbit[k]}"
+        )
+
+
+@pytest.mark.slow
+def test_grid_dp_streamed_kab_cm2_matches_engine():
+    """Cm2 (2x2 K_{4,4} grid) via Phase B Round 6 v5 streamed grid DP.
+
+    Exercises `compute_grid_dp_streamed_kab` end-to-end with detection +
+    grid_specs extraction. Asserts polynomial equality with the engine.
+    ~35-40 s cold (faster than engine's ~55 s `kmatching_formula`).
+    """
+    import dwave_networkx as dnx
+    from tutte.graphs.covering import try_hierarchical_partition
+    from tutte.roots.cell_anchor_adapter import (
+        detect_cell_anchor_groups, extract_grid_specs,
+    )
+    from tutte.roots.cell_quotient_grid import (
+        _grid_cell_layout, compute_grid_dp_streamed_kab, is_grid_topology,
+    )
+
+    g_nx = dnx.chimera_graph(2)
+    G = Graph.from_networkx(g_nx)
+    table = load_default_table()
+    res = try_hierarchical_partition(G, table)
+    assert res is not None, "Cm2 should partition hierarchically"
+    _cell_template, partition, inter_info = res[0], res[1], res[2]
+    cag = detect_cell_anchor_groups(partition, inter_info.edges)
+    adj = {i: set() for i in range(len(partition))}
+    for (a, b) in inter_info.cell_adjacencies:
+        adj[a].add(b)
+        adj[b].add(a)
+    grid = is_grid_topology(adj, len(partition))
+    assert grid == (2, 2), f"Cm2 should be 2x2, got {grid}"
+    rows, cols = grid
+    layout = _grid_cell_layout(len(partition), rows, cols, adj)
+    grid_specs = extract_grid_specs(cag, layout)
+
+    cell_nodes = sorted(partition[0])
+    cell_sub = nx.Graph()
+    for u in cell_nodes:
+        for v in g_nx.neighbors(u):
+            if v in cell_nodes:
+                cell_sub.add_edge(u, v)
+    K44 = Graph.from_networkx(cell_sub)
+    cell_anchor_groups: dict = {}
+    for grp_id, vertices in cag.cell_groups[0]:
+        cell_anchor_groups[grp_id] = [cell_nodes.index(v) for v in vertices]
+    M4 = Graph(list(range(8)), [(i, i + 4) for i in range(4)])
+
+    T_grid = compute_grid_dp_streamed_kab(
+        cell_template=K44,
+        cell_anchor_groups=cell_anchor_groups,
+        horiz_junction_template=M4,
+        horiz_junction_anchors_A=[0, 1, 2, 3],
+        horiz_junction_anchors_B=[4, 5, 6, 7],
+        vert_junction_template=M4,
+        vert_junction_anchors_A=[0, 1, 2, 3],
+        vert_junction_anchors_B=[4, 5, 6, 7],
+        grid_specs=grid_specs,
+    )
+    assert T_grid is not None, "streamed grid DP returned None"
+    assert T_grid.num_spanning_trees() == 11686511179538104320

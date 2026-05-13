@@ -148,6 +148,31 @@ def per_cell_canonical_key(
     Positions in P that don't belong to any cell group are placed in
     a synthetic "outside" group and tracked with a -1 cell index in
     the output tuples.
+
+    PRECONDITION (callers MUST verify, NOT enforced here): the cell
+    graph backing each anchor group must support free S_n permutation
+    of its anchors — the FULL symmetric group on the anchor positions
+    must act on the cell as automorphisms preserving rooted T values.
+    Cells satisfying this: K_n (any n), K_{a,b} (anchors all on one
+    bipartition side). Cells NOT satisfying this: Petersen, cycles,
+    Möbius–Kantor, and other vertex-transitive cells whose Aut group
+    is a proper subgroup of S_n on the anchors.
+
+    Using this function with non-K_n / non-K_{a,b} cells over-collapses
+    partition orbits and yields silently wrong T values when used as a
+    deduplication key. Verified empirically (May 2026):
+    `tutte/research/scripts/cascade_audit_per_cell_canonical.py`.
+    See `tutte/research/cascade_audit_findings.md` for details.
+
+    Current call sites (all safe — K_{4,4} cells only):
+    - cell_quotient_helpers.py
+    - cell_quotient_interleaved.py
+    - cell_quotient_path.py
+
+    Adding any non-K_{a,b} cell type to the roots/ DP requires
+    replacing this with `canonical_partition(P, Aut(cell_graph))` from
+    this same module, which uses the actual Aut group (correct for any
+    cell type, but more expensive).
     """
     pos_to_cell: Dict[int, int] = {}
     for cell_idx, group in enumerate(cell_anchor_groups):
@@ -269,6 +294,58 @@ def per_cell_orbit_rep(
         # gracefully.
         blocks.append(tuple(sorted(block)))
     return tuple(sorted(blocks))
+
+
+def enumerate_per_cell_aut_group(
+    cell_anchor_groups: List[List[int]],
+) -> List[Dict[int, int]]:
+    """Enumerate G = product of S_n per cell-group as Dict[pos→pos] elements.
+
+    G is the per-cell automorphism group: independent S_n permutation
+    within each cell-group, no cross-cell coupling. Positions outside any
+    cell-group are fixed by every element.
+
+    |G| = ∏ over cells of |cell|!. For 3 cells of 4 positions: |G| = 24³
+    = 13 824. For 2 cells of 4 positions: |G| = 576.
+
+    Used by `precompute_M_table_pair_orbit` for pair-orbit-aware
+    convolution where both state and junction are compressed by the same
+    per-cell aut group on shared boundary.
+    """
+    from itertools import permutations, product
+
+    per_group_perms = [list(permutations(group)) for group in cell_anchor_groups]
+    elements: List[Dict[int, int]] = []
+    for perm_combo in product(*per_group_perms):
+        mapping: Dict[int, int] = {}
+        for original_group, new_perm in zip(cell_anchor_groups, perm_combo):
+            for original, new in zip(original_group, new_perm):
+                mapping[original] = new
+        elements.append(mapping)
+    return elements
+
+
+def apply_perm_to_partition(
+    P: Tuple[Tuple[int, ...], ...],
+    perm: Dict[int, int],
+) -> Tuple[Tuple[int, ...], ...]:
+    """Apply position-permutation `perm` to partition `P`; return canonical sorted form."""
+    return tuple(sorted(
+        tuple(sorted(perm.get(v, v) for v in block))
+        for block in P
+    ))
+
+
+def per_cell_partition_stab(
+    P: Tuple[Tuple[int, ...], ...],
+    G_elements: List[Dict[int, int]],
+) -> List[Dict[int, int]]:
+    """Subset of G_elements that fix partition P setwise."""
+    P_canonical = tuple(sorted(tuple(sorted(b)) for b in P))
+    return [
+        σ for σ in G_elements
+        if apply_perm_to_partition(P_canonical, σ) == P_canonical
+    ]
 
 
 def aut_compress_t_rooted_per_cell(

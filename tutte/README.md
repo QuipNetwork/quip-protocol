@@ -9,16 +9,19 @@ graph TD
     P["polynomial.py<br/>TuttePolynomial"] --> G["graph.py<br/>Graph, MultiGraph"]
     G --> GR["graphs/<br/>SP, covering, treewidth DP, k_sum (chord rule)"]
     G --> F["factorization.py<br/>GCD, factorization"]
+    G --> RT["roots/<br/>cell-quotient cycle/grid/tree DPs<br/>(rooted Tutte composition)"]
     GR --> L["lookup/<br/>RainbowTable, binary I/O"]
     F --> L
     L --> S["synthesis/<br/>CEJ, algebraic, hybrid engines"]
     GR --> S
+    RT --> S
     FR["family_recognition/<br/>closed-form for known families"] --> S
 ```
 
 | Subpackage                                              | Description                                                                                                   |
 | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
 | [`graphs/`](graphs/README.md)                           | Series-parallel recognition, subgraph covering, treewidth DP, **k-sum chord rule** (`k_sum.py`)               |
+| [`roots/`](roots/README.md)                             | Rooted Tutte composition for cell-decomposable graphs: cycle, grid, **tree** DPs over cell-quotient topology, plus **orbit-aware hybrid** for cyclic quotients with cross-cell vertex identifications |
 | [`family_recognition/`](family_recognition/__init__.py) | O(n+m) closed-form polynomials for known families: trees, cycles, wheels, fans, ladders, prisms, books, gears |
 | [`lookup/`](lookup/README.md)                           | Rainbow table: O(1) polynomial lookup, binary serialization                                                   |
 | [`synthesis/`](synthesis/README.md)                     | CEJ, algebraic, and hybrid synthesis engines                                                                  |
@@ -100,6 +103,7 @@ The chord-rule paths (steps 7 and 8) replaced the matroid-theoretic Theorem 6 / 
 
 - **Treewidth cap**: `treewidth_dp` only attempts graphs with treewidth ≤ 11 (configurable). Larger D-Wave topologies (Cm₃+, Pm₃+, Z(2,t)+) exceed this and route through the chord-rule path instead.
 - **Hierarchical tiling currently isomorphic-only**: `try_hierarchical_partition` finds k _identical_ cells. A heterogeneous extension (e.g. Cm₃ = 2 × Cm₂ + 2 × Cm₁) is on the optimization roadmap — `boundary_quotient_tutte` already supports per-cell `T(C_i)`, the gap is in the partitioner.
+- **Cm₃ end-to-end polynomial pending**: Phase B Rounds 7-13 (May 2026) solved the memory wall and shipped the precision-safe modular point-value path (`precompute_M_table_mod` + Lagrange + CRT). Single-point pure-Python convolve is ~2-3 h; Round 14 (C ext mirroring the existing polynomial-path `_partition_c.batched_inner_iterations_c`) + multiprocessing across `(x, y, p)` triples is the remaining work to make full polynomial recovery (~26 K modular DP runs) realistic. See [`docs/06_5_cell_quotient_grid_dp.md`](docs/06_5_cell_quotient_grid_dp.md) Rounds 7-13 section.
 - **Exponential worst case**: Deletion-contraction is O(2^m). Practical for ≤25 edges without structural shortcuts.
 
 ## Lookup Table
@@ -158,6 +162,18 @@ Key graph timings (Hybrid engine, empty table):
 - **Petersen** (15 edges): ~1ms Hybrid, ~800ms NX
 - **Chimera C1** (16 edges): ~3ms Hybrid, ~1.5s NX
 - **Zephyr Z(1,1)** (22 edges): ~5ms Hybrid, NX timeout
+- **Chimera C2** (80 edges): ~55s engine (`kmatching_formula`); ~36s
+  via the v5 streamed cell-quotient grid DP (research recipe — see
+  [`docs/06_5_cell_quotient_grid_dp.md`](docs/06_5_cell_quotient_grid_dp.md)
+  Phase B Round 6 section and
+  [`research/scripts/cm2_via_v5_streamed.py`](research/scripts/cm2_via_v5_streamed.py))
+- **Chimera C3** (192 edges): not yet computable end-to-end. Polynomial
+  recovery via Round 13 modular point-value DP (`precompute_M_table_mod`)
+  + bivariate Lagrange + CRT is **mathematically complete** but
+  single-point pure-Python convolve is ~2-3 h (8 784 grid × 3+ primes
+  ≈ 6-9 yr serial). Round 14 mirrors the existing polynomial-path
+  `_partition_c` batched inner loop for modular accumulation
+  (~10× expected), with multiprocessing as the final factor.
 
 ### Optimizations
 

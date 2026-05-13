@@ -258,6 +258,27 @@ class TuttePolynomial:
         return sum(c * (x ** i) * (y ** j)
                    for (i, j), c in self._coeffs.items())
 
+    def evaluate_mod(self, x: int, y: int, p: int) -> int:
+        """Evaluate the polynomial at integer (x, y) modulo prime p.
+
+        All arithmetic is integer/modular — no floats. Used as the
+        building block for integer-DP + Lagrange-interpolation
+        recovery of T(G; x, y) over large graphs (Round 12).
+
+        Caller passes a prime `p`; we use `pow(base, exp, p)` to keep
+        intermediate values bounded even when `x` or `y` is comparable
+        to `p`.
+        """
+        if p <= 0:
+            raise ValueError("modulus must be positive")
+        x_m = x % p
+        y_m = y % p
+        result = 0
+        for (i, j), c in self._coeffs.items():
+            term = (c % p) * pow(x_m, i, p) * pow(y_m, j, p)
+            result = (result + term) % p
+        return result
+
     def num_spanning_trees(self) -> int:
         """T(1,1) = number of spanning trees (exact integer sum of coefficients)."""
         return sum(c for c in self._coeffs.values())

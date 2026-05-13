@@ -461,6 +461,74 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                     tiles_used=formula_result.tiles_used,
                 )
 
+        # Cell-quotient cycle DP (mirrors engine step 7.7) BEFORE treewidth_dp
+        # so cycle-topology graphs win without paying the tw_dp cost.
+        if graph.edge_count() >= 60:
+            from ..roots import compute_cell_quotient_cycle_dp
+            try:
+                cycle_poly = compute_cell_quotient_cycle_dp(
+                    graph, engine.table,
+                )
+                if cycle_poly is not None:
+                    _log.record(EventType.CELL_QUOTIENT_DP, "hybrid",
+                                f"Cell-quotient cycle DP: "
+                                f"{graph.node_count()}n {graph.edge_count()}e",
+                                graph=graph)
+                    self._log(f"Cell-quotient cycle DP: "
+                              f"{graph.node_count()}n, {graph.edge_count()}e")
+                    return HybridSynthesisResult(
+                        polynomial=cycle_poly,
+                        method="cell_quotient_dp",
+                        recipe=["Cell-quotient cycle DP"],
+                        verified=True,
+                    )
+            except Exception:
+                pass
+
+        # Cell-quotient TREE DP (mirrors engine step 7.8) BEFORE treewidth_dp.
+        if graph.edge_count() >= 60:
+            from ..roots import compute_cell_quotient_tree_dp
+            try:
+                tree_poly = compute_cell_quotient_tree_dp(graph, engine.table)
+                if tree_poly is not None:
+                    _log.record(EventType.CELL_QUOTIENT_DP, "hybrid",
+                                f"Cell-quotient tree DP: "
+                                f"{graph.node_count()}n {graph.edge_count()}e",
+                                graph=graph)
+                    self._log(f"Cell-quotient tree DP: "
+                              f"{graph.node_count()}n, {graph.edge_count()}e")
+                    return HybridSynthesisResult(
+                        polynomial=tree_poly,
+                        method="cell_quotient_tree_dp",
+                        recipe=["Cell-quotient tree DP"],
+                        verified=True,
+                    )
+            except Exception:
+                pass
+
+        # Cell-quotient HYBRID DP (mirrors engine step 7.85) BEFORE treewidth_dp.
+        if graph.edge_count() >= 60:
+            from ..roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
+            try:
+                hybrid_poly = compute_cell_quotient_hybrid(
+                    graph, engine.table,
+                )
+                if hybrid_poly is not None:
+                    _log.record(EventType.CELL_QUOTIENT_DP, "hybrid",
+                                f"Cell-quotient hybrid DP: "
+                                f"{graph.node_count()}n {graph.edge_count()}e",
+                                graph=graph)
+                    self._log(f"Cell-quotient hybrid DP: "
+                              f"{graph.node_count()}n, {graph.edge_count()}e")
+                    return HybridSynthesisResult(
+                        polynomial=hybrid_poly,
+                        method="cell_quotient_hybrid_dp",
+                        recipe=["Cell-quotient hybrid (cycle-close + per-leaf synth)"],
+                        verified=True,
+                    )
+            except Exception:
+                pass
+
         # Treewidth DP (fast for tw <= 10, before expensive k-sum/hierarchical)
         if graph.edge_count() >= 10:
             from ..graphs.treewidth import \

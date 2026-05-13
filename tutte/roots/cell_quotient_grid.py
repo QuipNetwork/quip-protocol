@@ -38,6 +38,7 @@ from .cell_quotient_helpers import (
     components_touching,
     enumerate_partitions_per_orbit,
     orbit_convolve,
+    precompute_M_and_convolve_streaming,
     precompute_M_table,
 )
 from .cell_quotient_path import compute_path_dp, compute_path_dp_grouped
@@ -150,9 +151,14 @@ def _grid_cell_layout(
         if not ok:
             continue
 
-        # Fill remaining rows by following down neighbors
+        # Fill remaining rows by following down neighbors.
+        # NOTE: layout[1][0] was pre-set at line 112 (down_nbr); we must
+        # skip re-filling cells that are already set, otherwise the
+        # `placed` set already contains them and `down_candidates` is empty.
         for r in range(1, rows):
             for c in range(cols):
+                if layout[r][c] is not None:
+                    continue
                 cell_above = layout[r - 1][c]
                 if cell_above is None:
                     ok = False
@@ -507,5 +513,243 @@ def compute_grid_dp_grouped(
 
     try:
         return divide_by_x_minus_1_power(T_total, total_div)
+    except ValueError:
+        return None
+
+
+def compute_grid_dp_streamed_kab(
+    cell_template: Graph,
+    cell_anchor_groups: Dict[int, List[int]],
+    horiz_junction_template: Graph,
+    horiz_junction_anchors_A: List[int],
+    horiz_junction_anchors_B: List[int],
+    vert_junction_template: Graph,
+    vert_junction_anchors_A: List[int],
+    vert_junction_anchors_B: List[int],
+    grid_specs: List[List[CellGridSpec]],
+    verbose: bool = False,
+) -> Optional[TuttePolynomial]:
+    """Phase B Round 6 v5 streamed grid DP for K_{a,b}-style cells.
+
+    Uses per-cell compression on inner row DPs (`enable_per_cell_compression`)
+    + `enumerate_junction_internally` + `out_cell_anchor_groups` to keep
+    state orbit-compressed throughout the row-by-row composition. The
+    M_4 vertical junction lifts state's per-cell S_n on the previous row's
+    down-anchors to the next row's up-anchors via the matching-edge
+    structure, so the orbit-shortcut on state side is preserved through
+    to the output canonical key.
+
+    Preconditions (caller MUST verify before invoking):
+    - `cell_template` is bipartite (K_{a,b} family).
+    - All cells in `grid_specs` use disjoint anchor groups per direction
+      (no shared-anchor interior cells, i.e. NOT Cm₃ interior structure).
+    - `vert_junction_template` is a disjoint k-matching M_k (so its
+      per-edge cell groups give the matching-preserving canonical key).
+
+    Returns the polynomial on success, `None` on any structural mismatch.
+
+    Validated on Cm₂ (2×2 K_{4,4} grid) — see
+    `tutte/research/scripts/cm2_via_v5_streamed.py` and the engine
+    benchmark in `tutte/docs/06_5_cell_quotient_grid_dp.md` (Phase B
+    Round 6 section). T(Cm₂)(1,1) = 11686511179538104320 in ~36 s
+    (vs ~55 s via `kmatching_formula`).
+    """
+    from .aut_orbit import (
+        per_cell_canonical_key,
+        per_cell_orbit_rep,
+    )
+    from .rooted_tutte import all_partitions, relabel_partition_dict
+
+    rows = len(grid_specs)
+    if rows < 1:
+        return None
+    cols = len(grid_specs[0])
+    if cols < 1:
+        return None
+    if not all(len(row) == cols for row in grid_specs):
+        return None
+
+    # Step 1: per-row compressed path DP.
+    row_results: List[Dict] = []
+    for r in range(rows):
+        row_specs = [spec.to_row_spec() for spec in grid_specs[r]]
+        result = compute_path_dp_grouped(
+            cell_template, cell_anchor_groups,
+            horiz_junction_template,
+            horiz_junction_anchors_A, horiz_junction_anchors_B,
+            row_specs, verbose=False,
+            label_offset=100000 * r, return_pos_layout=True,
+            enable_per_cell_compression=True,
+        )
+        if not isinstance(result, tuple) or len(result) != 5:
+            # Compression disabled fallback returned wrong shape.
+            return None
+        state_orbit_T, _, td, pos_layout, scg = result
+        row_results.append({
+            "state_T": state_orbit_T, "td": td,
+            "pos_layout": pos_layout, "scg": scg,
+        })
+        if verbose:
+            print(f"  row {r}: {len(state_orbit_T)} orbits, td={td}, "
+                  f"scg sizes={[len(g) for g in scg]}", file=sys.stderr)
+
+    v_a = len(vert_junction_anchors_A)
+    v_b = len(vert_junction_anchors_B)
+    single_c_J_vert = components_touching(
+        vert_junction_template, list(vert_junction_anchors_A),
+    )
+
+    # Initial state: row 0 compressed (single rep per orbit).
+    state_orbit_T = row_results[0]["state_T"]
+    state_scg = row_results[0]["scg"]
+    state_orbit_part = {
+        canon: [per_cell_orbit_rep(canon, state_scg)]
+        for canon in state_orbit_T
+    }
+    total_div = row_results[0]["td"]
+
+    # Step 2: compose rows.
+    for r in range(1, rows):
+        next_scg = row_results[r]["scg"]
+        next_orbit_T = row_results[r]["state_T"]
+        next_pos_layout = row_results[r]["pos_layout"]
+
+        # 2a: vertical M_k junction (cols disjoint copies).
+        prev_down: List[int] = []
+        next_up: List[int] = []
+        for c in range(cols):
+            above = grid_specs[r - 1][c]
+            below = grid_specs[r][c]
+            if above.down_group is None or below.up_group is None:
+                return None
+            prev_down.extend(row_results[r - 1]["pos_layout"][c][above.down_group])
+            next_up.extend(next_pos_layout[c][below.up_group])
+
+        if len(prev_down) != cols * v_a or len(next_up) != cols * v_b:
+            return None
+
+        # Build combined junction template (cols disjoint copies).
+        combined_nodes = list(range(cols * (v_a + v_b)))
+        combined_edges = []
+        for c in range(cols):
+            base = c * (v_a + v_b)
+            for u, v in vert_junction_template.edges:
+                combined_edges.append((base + u, base + v))
+        combined = Graph(combined_nodes, combined_edges)
+        combined_A = [c * (v_a + v_b) + vert_junction_anchors_A[i]
+                      for c in range(cols) for i in range(v_a)]
+        combined_B = [c * (v_a + v_b) + vert_junction_anchors_B[i]
+                      for c in range(cols) for i in range(v_b)]
+        T_combined = t_rooted_cached(combined, combined_A + combined_B)
+        map_c = {combined_A[i]: prev_down[i] for i in range(cols * v_a)}
+        for i in range(cols * v_b):
+            map_c[combined_B[i]] = next_up[i]
+        T_combined_pos = relabel_partition_dict(T_combined, map_c)
+
+        # Per-edge cell groups for the M_k junction's matching-preserving aut.
+        # Assumes vert_junction is an M_k matching: anchor_A[i] paired with
+        # anchor_B[i] via a single edge.
+        junc_cell_groups = [[prev_down[i], next_up[i]]
+                            for i in range(cols * v_a)]
+        junc_orbit_T: Dict[Tuple, TuttePolynomial] = {}
+        junc_orbit_part: Dict[Tuple, List[Tuple]] = {}
+        for P, val in T_combined_pos.items():
+            canon = per_cell_canonical_key(P, junc_cell_groups)
+            if canon not in junc_orbit_T:
+                junc_orbit_T[canon] = val
+                junc_orbit_part[canon] = [P]
+
+        # Out boundary = next_up; compress by next row's per-cell groups.
+        # Use streaming M-table+convolve to bound peak memory (M_v can be
+        # multi-GB for Cm₃-scale problems). Analytical orbit sizing
+        # avoids Bell(|next_up|) enumeration.
+        out_orbit_sizes_2a: Dict[Tuple, int] = {}
+        state_T_2a = precompute_M_and_convolve_streaming(
+            state_orbit_T=state_orbit_T,
+            state_orbit_partitions=state_orbit_part,
+            junction_orbit_T=junc_orbit_T,
+            junction_orbit_partitions=junc_orbit_part,
+            out_orbit_sizes=out_orbit_sizes_2a,
+            shared_boundary=prev_down,
+            extra_boundary=next_up,
+            out_aut_group=[],
+            state_extra_boundary=[],
+            out_cell_anchor_groups=next_scg,
+            state_cell_anchor_groups=state_scg,
+            junction_cell_anchor_groups=junc_cell_groups,
+            enumerate_junction_internally=True,
+        )
+        total_div += (cols * v_a - cols * single_c_J_vert)
+        if verbose:
+            print(f"  row {r} 2a: {len(state_T_2a)} orbits, td={total_div}",
+                  file=sys.stderr)
+
+        # 2b: row composition (state ⊗ row r).
+        state_orbit_part_2b = {
+            canon: [per_cell_orbit_rep(canon, next_scg)]
+            for canon in state_T_2a
+        }
+        row_orbit_part = {
+            canon: [per_cell_orbit_rep(canon, next_scg)]
+            for canon in next_orbit_T
+        }
+
+        # Out for 2b: empty if last row (closed); else next row's b-side
+        # positions for the next vertical junction.
+        if r < rows - 1:
+            out_anchors_2b: List[int] = []
+            out_scg_2b: List[List[int]] = []
+            for c in range(cols):
+                spec_below = grid_specs[r][c]
+                if spec_below.down_group is None:
+                    return None
+                grp = next_pos_layout[c][spec_below.down_group]
+                out_anchors_2b.extend(grp)
+                out_scg_2b.append(list(grp))
+        else:
+            out_anchors_2b = []
+            out_scg_2b = []
+
+        # 2b: streaming M-table + convolve, same memory rationale.
+        out_orbit_sizes_2b: Dict[Tuple, int] = (
+            {} if out_scg_2b else {(): 1}
+        )
+        state_final = precompute_M_and_convolve_streaming(
+            state_orbit_T=state_T_2a,
+            state_orbit_partitions=state_orbit_part_2b,
+            junction_orbit_T=next_orbit_T,
+            junction_orbit_partitions=row_orbit_part,
+            out_orbit_sizes=out_orbit_sizes_2b,
+            shared_boundary=next_up,
+            extra_boundary=out_anchors_2b,
+            out_aut_group=[],
+            state_extra_boundary=[],
+            out_cell_anchor_groups=out_scg_2b if out_scg_2b else None,
+            state_cell_anchor_groups=next_scg,
+            junction_cell_anchor_groups=next_scg,
+            enumerate_junction_internally=True,
+        )
+        total_div += (cols * v_b - 1) + row_results[r]["td"]
+        if verbose:
+            print(f"  row {r} 2b: {len(state_final)} orbits, td={total_div}",
+                  file=sys.stderr)
+
+        # State for next row iteration.
+        state_orbit_T = state_final
+        state_scg = out_scg_2b
+        if out_scg_2b:
+            state_orbit_part = {
+                canon: [per_cell_orbit_rep(canon, out_scg_2b)]
+                for canon in state_orbit_T
+            }
+        else:
+            state_orbit_part = {canon: [()] for canon in state_orbit_T}
+
+    # Marginalize.
+    total = TuttePolynomial.zero()
+    for val in state_orbit_T.values():
+        total = total + val
+    try:
+        return divide_by_x_minus_1_power(total, total_div)
     except ValueError:
         return None

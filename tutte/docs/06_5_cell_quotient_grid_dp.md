@@ -201,6 +201,176 @@ Productionizing Cm₃ requires either:
 - A hybrid where each path-DP step caches contracted-cell polynomials
   in the engine's lookup table for amortization across rows.
 
+## Phase B Round 6: Streaming junction enumeration (2026-05-12)
+
+A new parameter `enumerate_junction_internally: bool = False` on
+[`precompute_M_table`](../roots/cell_quotient_helpers.py) — together with
+a previously under-exercised `out_cell_anchor_groups` argument — unlocks
+the 2D K_{4,4} grid composition for Cm₂ and gives the first known
+production-quality win against the engine's `kmatching_formula` baseline
+(36 s vs 55 s, 1.5×).
+
+### The two ingredients
+
+1. **`enumerate_junction_internally=True`** — when set together with
+   `junction_cell_anchor_groups` and single-rep `junction_orbit_partitions`,
+   `precompute_M_table` calls `_expand_per_cell_orbit_members` *internally*
+   on one junction orbit at a time. The caller hands in compressed
+   orbits (one rep each); the function iterates enumerated members in
+   the inner loop and zeros out the `n_junc` scalar shortcut (which is
+   only sound in trivial-orbit cases — see correctness note in the
+   `precompute_M_table` docstring). This avoids materializing Bell(W)
+   junction partitions in a single dict, which previously OOM'd Cm₃ at
+   ~4.6 GB during external enumeration.
+
+2. **`out_cell_anchor_groups = next_row_scg`** in the 2a (vertical
+   junction) step. The M_4 vertical junction has per-edge cell groups
+   `[[prev_down[i], next_up[i]] for i]`. State's per-cell S_4 on
+   prev_down lifts through this edge structure to a corresponding S_4
+   on next_up. By compressing the *output* of the 2a convolution
+   with the next row's per-cell anchor groups, the orbit-shortcut on
+   state side is preserved through to the out canonical key — so the
+   2a output stays compressed (109 per-cell orbits on Cm₂) instead of
+   expanding to all 1028 partitions on next_up.
+
+The downstream 2b row-row composition then operates state-compressed
+× junction-compressed-then-streamed, shrinking the `M_r` table from
+112 052 entries (v4 external enumeration) to 11 881 entries (9.4×
+smaller).
+
+### Cm₂ timing comparison
+
+| Approach | T(Cm₂) cold time | Notes |
+|---|---|---|
+| Engine `kmatching_formula` (step 7.5) | ~55 s | Current production baseline. |
+| Engine `cell_quotient_cycle_dp` (step 7.7) | ~50 s | Cycle-DP path for the 4-cycle of K_{4,4} cells. |
+| v4 external-enumeration grid DP (research) | ~4 min | First successful 2D K_{4,4} grid; OOM-bound on Cm₃. |
+| **v5 streamed grid DP (research)** | **~36 s** | Compressed state + compressed-streamed junction + compressed out. |
+
+The reference recipe is
+[`tutte/research/scripts/cm2_via_v5_streamed.py`](../research/scripts/cm2_via_v5_streamed.py).
+
+**Engine integration (shipped 2026-05-12)**: a new dispatch step
+**7.45** fires before §7.5 formula short-circuit. It calls
+`compute_cell_quotient_grid_dp_streamed(graph, table)` (in
+[`tutte/roots/__init__.py`](../roots/__init__.py)) which performs
+detection + invokes
+`compute_grid_dp_streamed_kab` in
+[`tutte/roots/cell_quotient_grid.py`](../roots/cell_quotient_grid.py).
+Preconditions checked: 2D grid topology, K_{a,b}-style bipartite
+cells, M_k vertical and horizontal junctions, **no shared-anchor
+cells** (rejects Cm₃'s interior cells; falls through to other
+hierarchical paths). Confirmed on Cm₂: engine dispatches via the new
+step at ~36 s vs the previous `kmatching_formula` route at ~55 s.
+The existing `compute_grid_dp_grouped` (uncompressed) is untouched
+and remains the reference for the disjoint-anchor synthetic K_n grid
+test corpus.
+
+### Cm₃ status (Round 6 baseline)
+
+The v5 recipe runs on Cm₃ row-by-row up to the 2b step but walls at
+6 608 state orbits × Bell(12) ≈ 4 M junction members ≈ 26 B inner
+iterations. An 11-hour CPU run did not produce 2b output. The wall
+is genuine — even with C-extension speed (1 µs/iter) it would take
+~7 h. A pair-orbit-aware compressed × compressed convolution (via
+double-coset enumeration over `G = S_4^N × S_M`) is the documented
+path forward; see the
+[`project_phase_b_round_6_v5_streamed.md`](../../.claude/projects/-Users-colton-quip-stack-quip-protocol/memory/project_phase_b_round_6_v5_streamed.md)
+memory file and task #237.
+
+## Phase B Rounds 7-13: From memory wall to math foundation (2026-05-12)
+
+Rounds 7-11 systematically eliminated the memory and bookkeeping walls
+that bit Round 6's Cm₃ attempt; Round 12 pivoted to point-value
+modular DP + Lagrange interpolation when polynomial allocation proved
+the irreducible cost; Round 13 collapsed the modular M-table to a
+single int per orbit triple.
+
+| Round | Change | Cm₂ result | Cm₃ result |
+|---|---|---|---|
+| 7 | Pair-orbit-aware `precompute_M_table_pair_orbit` via `H`-orbit bucketing on the shared boundary | Matches v5; ~91 s (slower than v5 35 s due to per-pair `|H|` canonicalization) | ~616 B inner ops; still infeasible |
+| 8 | C-ext gate relaxed (`enumerate_junction_internally=True` now allowed) + analytical `out_orbit_part` sizing | ~36 s (regression-free) | Bell(12) wall cleared; new wall = M-table marshaling (2.7 GB OOM) |
+| 9 | `precompute_M_and_convolve_streaming` chunk wrapper accumulates per-chunk | ~36 s | Memory bounded ~1.5 GB; 2a alone 10+ min; total est. 30-60 min |
+| 10 | Raw-dict accumulator (no `TuttePolynomial.__add__` overhead) | ~35 s | Memory ~1.9 GB; per-chunk `_dict_mul` confirmed irreducible cost |
+| 11.A | `chunk_size` 200 → 1000 sensitivity test | regression-free | No timing change — confirmed Python framing isn't the wall |
+| 11.B | `poly_mul_batched_int64` C ext + `_dict_mul_batched` dispatcher (gated at 100K pairs) | ~36 s | Still walled — C compute is the irreducible cost at Cm₃ scale |
+| **12** | **Modular point-value DP**: `TuttePolynomial.evaluate_mod` + 1D/2D Lagrange + CRT combine (`tutte/roots/interpolation.py`); `precompute_M_and_convolve_streaming_mod` validates Cm₂ at 4 (x, y, p) points; oracle recovery exact | ~7-16 s per point | Math foundation ready |
+| **13** | **Fast modular M-table**: `precompute_M_table_mod` — int-mod-p accumulation with no polynomial allocation per chunk | ~8-16 s per point (similar; Cm₂ poly M-table was already small + C-ext-fast) | Path DP 65 s (one-time); state ⊗ junc (2a) ~45 min pure Python → ~2-3 hr/point. Bottleneck moved to per-pair structural ops (`delta` / `join_partitions` / `restrict_partition` / `per_cell_canonical_key`) |
+
+### Round 12: precision-safe point-value path
+
+`TuttePolynomial.evaluate_mod(x, y, p)` (Horner-style, integer-only)
+combined with bivariate Lagrange in
+[`tutte/roots/interpolation.py`](../roots/interpolation.py) and CRT
+combine (via existing `_crt_multi`) gives **bit-exact** polynomial
+recovery from `(d_x + 1)(d_y + 1)` grid evaluations. Defense in depth
+verifies `T(1, 1) = #ST` AND `T(2, 2) = 2^|E|` after recovery — the
+Kirchhoff-alone failure mode (Round 11.A discovery) is closed by the
+second invariant.
+
+For Cm₃: `d_x ≤ 71`, `d_y ≤ 121` ⇒ 72 × 122 = **8 784 grid points**
+× 3-5 50-bit primes for CRT.
+
+Reference scripts:
+
+- [`tutte/research/scripts/cm2_via_modular_interp.py`](../research/scripts/cm2_via_modular_interp.py)
+  — sanity check: evaluates the engine's T(Cm₂) on a grid, interpolates,
+  CRT-combines, asserts exact polynomial recovery + invariants.
+- [`tutte/research/scripts/cm2_via_modular_dp.py`](../research/scripts/cm2_via_modular_dp.py)
+  — runs the v5 streamed DP pipeline in modular arithmetic on Cm₂;
+  4 test points all match `engine.T(Cm₂).evaluate_mod(...)`.
+- [`tutte/research/scripts/cm3_via_modular_dp.py`](../research/scripts/cm3_via_modular_dp.py)
+  — generalized N×N modular DP for Cm₃ benchmarking.
+
+### Round 13: int-mod-p M-table built directly
+
+`precompute_M_table_mod` in
+[`tutte/roots/cell_quotient_helpers.py`](../roots/cell_quotient_helpers.py)
+mirrors `precompute_M_table` exactly (orbits, partitions, anchors,
+`enumerate_junction_internally`) but accumulates `int mod p` per
+`(O_state, O_junc, O_out)` triple. The
+`((x - 1)(y - 1))^d` polynomial dicts become a precomputed list of
+single ints `xy_pow_mod[d] = pow((x - 1)(y - 1) % p, d, p)`.
+Each inner iteration is one modular mul-add — no poly coefficient
+dict to walk.
+
+This removes the **polynomial allocation** wall (each Cm₃ M-entry
+would otherwise grow to hundreds of bidegree coefficients) but
+exposes the **structural** wall: `delta / join_partitions /
+restrict_partition / per_cell_canonical_key` per (state, junc) pair
+is now the dominant cost.
+
+### Current Cm₃ wall and forward path
+
+Cm₃ single-point benchmark (pure Python, Round 13):
+
+| Stage | Time | Notes |
+|---|---|---|
+| Row 0 path DP | 65 s | 6 608 orbits, td = 6 (cached after first call) |
+| Row 1, 2 path DP | 0 s | Cache hit |
+| Vertical M₄ junction (cols-fold combined) | 0.6 s | 4 096 orbits |
+| State ⊗ junction (2a) | ~45 min | **bottleneck** — 6 608 × 4 096 = 27 M pair-iterations |
+| Total single point | ~2-3 hr est. (4 composition steps) | Pure Python |
+
+Full Cm₃ polynomial via interpolation: 8 784 × 3 = ~26 K modular DP
+runs. At 2-3 hr each that's 6-9 years single-threaded.
+
+| Path | Per-point | 26 K runs |
+|---|---|---|
+| Pure Python (Round 13) | 2-3 hr | 6-9 yr single-threaded |
+| + Round 14 C ext (~10×) | 12-18 min | 8-12 mo single |
+| + Round 14 C ext + 8-core mp | 2-3 min | 1-2 mo |
+
+Round 14 (C extension for `precompute_M_table_mod` inner loop) mirrors
+the existing `_partition_c.precompute_M_batched_inner_c` polynomial-path
+wrapper but accumulates ints. The C function
+`batched_inner_iterations_c` already does delta / join / restrict /
+canonical key in C — only the Python aggregation step changes.
+
+See memory file
+[`project_phase_b_round_13_modular_mtable.md`](../../.claude/projects/-Users-colton-quip-stack-quip-protocol/memory/project_phase_b_round_13_modular_mtable.md)
+for the full Round 13 retrospective.
+
 ## Files
 
 | File | Purpose |

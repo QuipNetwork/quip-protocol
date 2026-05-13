@@ -1317,10 +1317,22 @@ def _anchors_single_class(
     except nx.NetworkXError:
         # Not connected etc. — fall back
         pass
-    # Non-bipartite cell: assume vertex-transitive (true for K_n).
-    # Conservative and may miss valid cases for non-vertex-transitive
-    # cells, but won't produce wrong results.
-    return True
+    # Non-bipartite cell: the formula's proof needs k-SET transitivity
+    # of the anchor class, not just vertex-transitivity. K_n (any n)
+    # satisfies this trivially: every k-subset induces K_k. Other
+    # vertex-transitive cells (Petersen, C_n, Möbius–Kantor) DO NOT —
+    # empirical test shows the formula gives wrong results at k ≥ 3
+    # for those. Reference: tutte/research/data/kmatching_non_kn_findings.md
+    # (May 2026). Restrict to K_n by checking edge count equals n(n-1)/2.
+    #
+    # Soundness only — no perf impact on D-Wave production graphs:
+    # Cm_m, Pm_m, Z(m, t) cells are all K_{a,b} (bipartite), so they hit
+    # the bipartite branch above and never reach this check. The
+    # restriction is defensive correctness for hypothetical inputs with
+    # non-K_n vertex-transitive cells.
+    n_cell = len(cell_nodes)
+    expected_complete = n_cell * (n_cell - 1) // 2
+    return cell_nx.number_of_edges() == expected_complete
 
 
 def detect_kmatching_topology(

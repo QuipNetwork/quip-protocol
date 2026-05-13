@@ -95,6 +95,18 @@ where `P_n with c_1, c_n j-glued` is the cell-path `P_n` with `j` anchor pairs o
 
 **Corollary (Chimera Cm2).** `T(Cm2)` factors via the cell-cycle formula applied to the 2×2 cell-grid of K_{4,4} tiles. Empirically: 675-term polynomial matches direct synthesis (`verify_spanning_trees` ✓), with ~4× speedup versus treewidth_dp (51 s vs 196 s cold cache).
 
+> **Update (Phase B Round 6, 2026-05-12).** The cell-quotient grid DP
+> with streaming junction enumeration (see
+> [§6.5 — Cell-Quotient Grid DP](06_5_cell_quotient_grid_dp.md), Phase
+> B Round 6 section) now computes T(Cm2) in ~36 seconds — 1.5× faster
+> than the k-matching formula's 55 s baseline. The k-matching formula
+> still wins on cell topologies that don't admit a 2D-grid quotient
+> (single cell-pairs, cell-trees, cell-cycles where rows/cols ≥ 2 is
+> not detected by `is_grid_topology`), so it remains the appropriate
+> dispatch for those cases. The two paths are complementary: this
+> §8.3 formula is closed-form (no DP state); §6.5 is DP over orbit
+> states, and gains from grid-specific orbit compressions.
+
 ## 5. Recursive Multi-Junction Formula
 
 For cell-topologies with multiple junctions (cell-paths, cell-cycles, general cell-trees, or grids), iterate the formulas of §3 and §4. Each recursion level processes one junction of the cell-topology graph `H`; after `n − 1` reductions of a cell-tree, the sub-problems are single multigraphs that the standalone synthesis pipeline can handle.

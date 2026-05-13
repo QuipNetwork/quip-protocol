@@ -496,6 +496,37 @@ row, then close column-wise junctions. Implemented in
 `tutte/roots/cell_quotient_grid.py`. The interleaved Hamiltonian-path
 variant lives in `tutte/roots/cell_quotient_interleaved.py`.
 
+### Stage 6.10 — Cell-Quotient Tree DP
+
+**Doc**: `tutte/docs/06_6_cell_quotient_tree_dp.md`.
+
+Generalizes the cycle / grid DPs from fixed topology to **arbitrary
+tree topology** in the cell-quotient graph (n cells, n−1 junctions, no
+cycles). Composes T(graph) by post-order recursion over the cell-tree:
+each cell absorbs each child subtree via a junction step (vertex-sum
+convolution at the junction's shared boundary) followed by a cell-merge
+step (vertex-sum at the child's parent-facing boundary).
+
+Implemented in `tutte/roots/cell_quotient_tree.py`. Optional per-cell
+orbit compression behind `enable_per_cell_compression=False` flag —
+correctness validated on K_3/K_4/K_5/K_{4,4} cell trees including
+shared-anchor cases; **50× speedup** on the 5-cell K_{4,4} M_2 Cm₃
+interior pattern with full polynomial match.
+
+Per-cell compression for tree DP required four coupled correctness
+fixes — see the doc for the deep-dive. Briefly: (1) disjoint per-cell
+groups via Aut orbits with per-neighbor anchor-set preservation (fixes
+the K_{a,a} side-swap over-collapse); (2) `keep_shared` fallback when
+junction's diagonal aut can't realize independent S_k × S_k on output;
+(3) "fully-consumed state group" fallback when state's aut on consumed
+positions doesn't lift through fixed P_junc iteration; (4) per-cell
+child expansion at cell-merge to avoid M-table iterating only `[rep]`
+per child orbit.
+
+Not yet wired into the engine pipeline; consumed directly by hybrid
+research scripts that combine cycle-closing chord rule with
+per-leaf tree DP for cyclic cell-quotients (e.g., D-Wave Cm₃ grid).
+
 ### Stage 7 — k-Sum Decomposition (chord rule)
 
 **Doc**: `tutte/docs/07_k_sum_decomposition.md`. **Cost**: `1 + C(k, 2)`
@@ -538,6 +569,24 @@ The full mathematical justification appears in
 `tutte/docs/08_2_chord_rule_formalization.md`. The chord rule replaced an
 older matroid-theoretic implementation (Bonin & de Mier, 2004) in April 2026
 because it is mathematically simpler and computationally competitive.
+
+#### Full-clique separator path (May 2026)
+
+When the k-vertex separator's induced subgraph **already contains** the
+full K_k clique (all C(k, 2) clique edges present in the original graph),
+the parallel completion `PC = G` itself — there's nothing to add. In this
+case the engine peels the EXISTING clique edges via the same chord rule,
+producing a `{k}sum_full_clique_chord_peel` method tag in the synthesis
+result.
+
+Before May 2026, `_find_vertex_separator` skipped these full-clique
+separators with a comment claiming "cut vertex path already handles k=1",
+but only k=1 was actually handled. The fix at
+`tutte/synthesis/engine.py:912` removed the skip and added a new branch
+in `_apply_ksum` to dispatch them. This unblocked a real path for
+graphs whose vertex separator naturally contains a clique (common in
+chemistry/social/D-Wave-derived graphs). Reference:
+`tutte/research/audit_chord_rule_findings.md`.
 
 ### Stage 8 — Hierarchical Tiling (chord rule)
 
@@ -648,13 +697,17 @@ In approximate order from least to most technical:
 3. `tutte/docs/01_family_recognition.md` through `09_creation_expansion_join.md`
    — one per pipeline stage, in order.
 4. `tutte/roots/README.md` — module overview for the cell-quotient DPs.
-5. `tutte/research/multivariate_tutte_results.md` — Phase 18.E.1 NEGATIVE
-   result on Sokal multivariate `Z`. Shows what it looks like when a
-   research direction _doesn't_ pan out.
+5. `tutte/research/data/multivariate_tutte_results.md` — Phase 18.E.1
+   NEGATIVE result on Sokal multivariate `Z`. Shows what it looks like
+   when a research direction _doesn't_ pan out.
 6. `tutte/research/literature_search_2026.md` — catalog of recent
    (2024-2025) Tutte polynomial papers organized by direction.
-7. `tutte/research/cm3_interleaved_attempt.md` — case study of Cm₃ being
-   structurally walled by current architecture.
+7. `tutte/research/data/cm3_interleaved_attempt.md` — case study of
+   Cm₃ being structurally walled by current architecture.
+8. `tutte/research/data/tree_dp_per_cell_compression_findings.md` —
+   the four-fix breakthrough that made per-cell compression correct
+   for cell-tree DP, including the correctness analysis of the
+   `n_state` over-counting issue.
 
 ---
 

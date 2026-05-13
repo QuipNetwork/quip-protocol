@@ -901,7 +901,13 @@ def test_engine_k4_path_m2_uses_kmatching_formula(formulas_engine):
 
 
 def test_engine_small_cell_cycle_falls_through(formulas_engine):
-    """K_3 cycle topology shares anchors → formula must reject + fall through."""
+    """K_3 cycle topology shares anchors → formula must reject + fall through.
+
+    Note (May 2026): the SINGLE-junction §4 formula collapses correctly
+    for K_n cells even with shared anchors, but the engine's MULTI-junction
+    RECURSIVE form does NOT — recursion's parallel-edge bookkeeping
+    breaks. Detector P3 must remain enforced for engine path.
+    Reference: relaxed_shared_anchors_findings.md."""
     g = _build_cell_cycle_k_matching(complete_graph(3), n=3, k=2)
     res = formulas_engine._try_hierarchical(g, max_depth=10)
     assert res is not None
@@ -956,6 +962,177 @@ def test_cm2_uses_kmatching_formula(table):
     assert res is not None
     assert res.method == "kmatching_formula"
     assert res.polynomial.num_terms() == 675
+
+
+# --- Full-clique-separator chord-rule fix (May 2026) ---
+
+
+def _cycle_through_router(left_cycle: int, right_cycle: int, router_size: int) -> Graph:
+    """Two cycles bridged by a complete K_router clique. The router is a
+    full K_router_size separator (all clique edges present)."""
+    G = nx.Graph()
+    router = list(range(router_size))
+    left = list(range(router_size, router_size + left_cycle))
+    right = list(range(
+        router_size + left_cycle,
+        router_size + left_cycle + right_cycle,
+    ))
+    G.add_nodes_from(router + left + right)
+    for i in range(router_size):
+        for j in range(i + 1, router_size):
+            G.add_edge(router[i], router[j])
+    for i in range(left_cycle):
+        G.add_edge(left[i], left[(i + 1) % left_cycle])
+    for i in range(right_cycle):
+        G.add_edge(right[i], right[(i + 1) % right_cycle])
+    for u in left:
+        for v in router:
+            G.add_edge(u, v)
+    for u in right:
+        for v in router:
+            G.add_edge(u, v)
+    return Graph.from_networkx(G)
+
+
+@pytest.mark.parametrize("k", [3, 4, 5])
+def test_full_clique_separator_chord_peel(k, formulas_engine):
+    """Regression: graphs with a full K_k clique separator (k ≥ 3) must be
+    handled by the chord-peel-on-existing-clique-edges path.
+
+    Pre-May 2026, `_find_vertex_separator` skipped `missing == 0` separators,
+    silently dropping these from the k-sum search. The fix dispatches to
+    `_apply_ksum` which now peels the existing K_k clique edges via the
+    chord rule (symmetric to peeling missing edges in the standard case).
+
+    Test verifies polynomial correctness via Kirchhoff matrix-tree theorem
+    on synthetic C_5 + K_k + C_5 router graphs.
+    """
+    g = _cycle_through_router(left_cycle=5, right_cycle=5, router_size=k)
+    separator = tuple(range(k))
+    result = formulas_engine._apply_ksum(g, separator, k)
+    assert result is not None, f"k={k}: _apply_ksum returned None"
+    assert result.method == f"{k}sum_full_clique_chord_peel"
+    assert result.verified
+    expected = count_spanning_trees_kirchhoff(g)
+    assert result.polynomial.num_spanning_trees() == expected, (
+        f"k={k}: T(1,1) = {result.polynomial.num_spanning_trees()} "
+        f"!= Kirchhoff = {expected}"
+    )
+
+
+def test_full_clique_separator_found_by_search(formulas_engine):
+    """`_find_vertex_separator` must NOT skip full-clique separators
+    (missing == 0). Pre-May 2026 it returned None for these; post-fix
+    it returns the separator tuple.
+    """
+    g = _cycle_through_router(left_cycle=5, right_cycle=5, router_size=4)
+    sep = formulas_engine._find_vertex_separator(g, 4)
+    assert sep is not None, "_find_vertex_separator should find K_4 router separator"
+    assert len(sep) == 4
+    # Confirm all C(4, 2) = 6 clique edges are present (i.e., missing == 0)
+    sv = sorted(sep)
+    missing = sum(
+        1 for i in range(4) for j in range(i + 1, 4)
+        if (min(sv[i], sv[j]), max(sv[i], sv[j])) not in g.edges
+    )
+    assert missing == 0, f"Expected full clique separator (missing=0), got {missing}"
+
+
+# --- Verification precision fix (May 2026) ---
+
+
+def test_algebraic_engine_uses_new_atom_polynomials():
+    """Regression: AlgebraicSynthesisEngine must use the new K_8..K_15
+    atoms added in May 2026 to factor composite polynomials. Pre-fix,
+    `RainbowTable.find_by_polynomial` was missing entirely, raising
+    AttributeError on every algebraic synthesis call. The fix added the
+    method (`tutte/lookup/core.py`) and lets the algebraic engine bottom
+    out on cached atom polynomials.
+
+    Test: synthesize T(K_8) * T(K_3) algebraically; verify it factors as
+    [K_8, K_3] (uses the new K_8 atom).
+    """
+    from tutte.lookup.core import load_default_table
+    from tutte.synthesis.algebraic import AlgebraicSynthesisEngine
+    from tutte.synthesis.engine import SynthesisEngine
+
+    table = load_default_table()
+    engine = SynthesisEngine(table=table, verbose=False)
+    T_k8 = engine.synthesize(complete_graph(8)).polynomial
+    T_k3 = engine.synthesize(complete_graph(3)).polynomial
+    target = T_k8 * T_k3
+
+    ae = AlgebraicSynthesisEngine(table=table, verbose=False)
+    result = ae.synthesize_from_polynomial(target)
+    assert result.verified
+    # Decomposition should include K_8 (one of the new atoms) and K_3
+    decomp_set = set(result.decomposition)
+    assert "K_8" in decomp_set, f"Expected K_8 atom in decomposition, got {result.decomposition}"
+    assert "K_3" in decomp_set, f"Expected K_3 atom in decomposition, got {result.decomposition}"
+
+
+def test_verify_spanning_trees_uses_exact_arithmetic_on_dense_graphs():
+    """Regression: verify_spanning_trees and count_spanning_trees_kirchhoff
+    must NOT use float64 `nx.number_of_spanning_trees` on small dense
+    graphs. Pre-fix, K_3+K_9+K_3 (15n 96e, 4.78e14 spanning trees)
+    triggered Gaussian-elimination float overflow in nx — the float
+    result was 478296900000002.06, off by 2 from the exact integer
+    478296900000000. This caused spurious Kirchhoff mismatches on every
+    correct synthesis of dense small graphs and made cotree_dp /
+    almost_cograph appear to produce wrong polynomials when they were
+    actually correct.
+
+    The fix (May 2026): use exact sympy determinant for ALL graph sizes.
+    Sub-millisecond cost on small graphs.
+    """
+    from tutte.polynomial import TuttePolynomial
+    from tutte.validation import (
+        count_spanning_trees_kirchhoff,
+        verify_spanning_trees,
+    )
+
+    # Build K_3+K_9+K_3 router (15n 96e, cograph)
+    G = nx.Graph()
+    router = list(range(9))
+    left = list(range(9, 12))
+    right = list(range(12, 15))
+    G.add_nodes_from(router + left + right)
+    for i in range(9):
+        for j in range(i + 1, 9):
+            G.add_edge(router[i], router[j])
+    for i in range(3):
+        for j in range(i + 1, 3):
+            G.add_edge(left[i], left[j])
+            G.add_edge(right[i], right[j])
+    for u in left + right:
+        for v in router:
+            G.add_edge(u, v)
+    g = Graph.from_networkx(G)
+    assert g.node_count() == 15
+    assert g.edge_count() == 96
+
+    expected = 478296900000000  # exact spanning tree count
+
+    # Exact path: must hit the integer determinant, not float nx.
+    assert count_spanning_trees_kirchhoff(g) == expected, (
+        "count_spanning_trees_kirchhoff must use exact sympy det, not float64 nx, "
+        f"on this dense 15n case. Pre-fix returned 478296900000002 (off by 2)."
+    )
+
+    # Construct a polynomial with T(1,1) = expected (any coefficient layout
+    # summing to `expected` works) and verify it passes verify_spanning_trees.
+    fake_poly = TuttePolynomial.from_coefficients({(0, 0): expected})
+    assert verify_spanning_trees(g, fake_poly), (
+        "verify_spanning_trees must use exact sympy det, not float64 nx, "
+        "on this dense 15n case."
+    )
+
+    # And a polynomial off by 1 must fail verification.
+    wrong_poly = TuttePolynomial.from_coefficients({(0, 0): expected + 1})
+    assert not verify_spanning_trees(g, wrong_poly), (
+        "verify_spanning_trees should reject an off-by-1 polynomial, "
+        "not silently accept it via float-precision rounding."
+    )
 
 
 # =============================================================================
@@ -1393,6 +1570,231 @@ def test_pm2_routes_through_chord_rule(table):
     result = eng.synthesize(g)
     assert verify_spanning_trees(g, result.polynomial)
     assert result.method != "lookup"
+
+
+def test_cell_quotient_tree_dp_path_topology(table):
+    """compute_cell_quotient_tree_dp returns correct polynomial on a
+    K_{4,4} 3-cell M_2 path tree topology graph."""
+    from tutte.roots import compute_cell_quotient_tree_dp
+    from tutte.research.scripts.tree_dp_phase3_branching import build_tree_graph
+
+    K44 = Graph.from_networkx(nx.complete_bipartite_graph(4, 4))
+    edges = [(0, 1), (1, 2)]
+    anchors = {0: {1: [0, 1]}, 1: {0: [0, 1], 2: [0, 1]}, 2: {1: [0, 1]}}
+    t = nx.Graph()
+    t.add_nodes_from({n for e in edges for n in e})
+    t.add_edges_from(edges)
+    g = build_tree_graph(K44, t, anchors)
+    poly = compute_cell_quotient_tree_dp(g, table)
+    assert poly is not None, "tree DP should fire on K_{4,4} M_2 path"
+    assert verify_spanning_trees(g, poly)
+
+
+def test_cell_quotient_tree_dp_branching_topology(table):
+    """compute_cell_quotient_tree_dp returns correct polynomial on a
+    K_{4,4} star (1 center + 4 leaves) M_2 graph."""
+    from tutte.roots import compute_cell_quotient_tree_dp
+    from tutte.research.scripts.tree_dp_phase3_branching import build_tree_graph
+
+    K44 = Graph.from_networkx(nx.complete_bipartite_graph(4, 4))
+    edges = [(0, 1), (0, 2), (0, 3), (0, 4)]
+    anchors = {
+        0: {1: [0, 1], 2: [0, 1], 3: [4, 5], 4: [4, 5]},
+        1: {0: [0, 1]}, 2: {0: [0, 1]},
+        3: {0: [0, 1]}, 4: {0: [0, 1]},
+    }
+    t = nx.Graph()
+    t.add_nodes_from({n for e in edges for n in e})
+    t.add_edges_from(edges)
+    g = build_tree_graph(K44, t, anchors)
+    poly = compute_cell_quotient_tree_dp(g, table)
+    assert poly is not None, "tree DP should fire on K_{4,4} star"
+    assert verify_spanning_trees(g, poly)
+
+
+def test_cell_quotient_tree_dp_returns_none_on_cycle(table):
+    """compute_cell_quotient_tree_dp returns None when cell-quotient
+    has a cycle (cycle DP handles those)."""
+    import dwave_networkx as _dnx
+    from tutte.roots import compute_cell_quotient_tree_dp
+
+    g = Graph.from_networkx(_dnx.chimera_graph(2, 2, 4))  # Cm2: 4-cycle
+    result = compute_cell_quotient_tree_dp(g, table)
+    assert result is None, "tree DP must reject cycle-quotient graphs"
+
+
+def test_cell_quotient_hybrid_3_K3_3_cycle(table):
+    """compute_cell_quotient_hybrid produces correct full polynomial
+    for the smallest non-trivial cyclic cell-quotient: 3 K_3 cells in
+    a 3-cycle joined by single edges."""
+    from tutte.roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
+    from tutte.synthesis.engine import SynthesisEngine
+
+    g_nx = nx.Graph()
+    for c in range(3):
+        base = 3 * c
+        for i in range(base, base + 3):
+            for j in range(i + 1, base + 3):
+                g_nx.add_edge(i, j)
+    for c in range(3):
+        g_nx.add_edge(3 * c, 3 * ((c + 1) % 3))
+    g = Graph.from_networkx(g_nx)
+    poly = compute_cell_quotient_hybrid(g, table)
+    assert poly is not None, "hybrid should fire on cyclic cell-quotient"
+    assert verify_spanning_trees(g, poly)
+    eng = SynthesisEngine(table=table)
+    T_eng = eng.synthesize(g).polynomial
+    assert poly == T_eng, "hybrid polynomial must match engine"
+
+
+def test_cell_quotient_hybrid_returns_none_on_tree(table):
+    """compute_cell_quotient_hybrid returns None when cell-quotient is
+    a tree (tree DP handles those)."""
+    from tutte.roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
+    from tutte.research.scripts.tree_dp_phase3_branching import build_tree_graph
+
+    K44 = Graph.from_networkx(nx.complete_bipartite_graph(4, 4))
+    edges = [(0, 1), (1, 2)]
+    anchors = {0: {1: [0, 1]}, 1: {0: [0, 1], 2: [0, 1]}, 2: {1: [0, 1]}}
+    t = nx.Graph()
+    t.add_nodes_from({n for e in edges for n in e})
+    t.add_edges_from(edges)
+    g = build_tree_graph(K44, t, anchors)
+    result = compute_cell_quotient_hybrid(g, table)
+    assert result is None, "hybrid must reject tree-quotient graphs"
+
+
+def test_cell_quotient_hybrid_K3_M2_3_cycle(table):
+    """k=2 junction in 3-cycle (originally broken until self-loop +
+    contraction-guard fixes)."""
+    from tutte.roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
+    from tutte.synthesis.engine import SynthesisEngine
+
+    g_nx = nx.Graph()
+    for c in range(3):
+        base = 3 * c
+        for i in range(base, base + 3):
+            for j in range(i + 1, base + 3):
+                g_nx.add_edge(i, j)
+    for c in range(3):
+        base_a = 3 * c
+        base_b = 3 * ((c + 1) % 3)
+        g_nx.add_edge(base_a, base_b)
+        g_nx.add_edge(base_a + 1, base_b + 1)
+    g = Graph.from_networkx(g_nx)
+    poly = compute_cell_quotient_hybrid(g, table)
+    assert poly is not None
+    assert verify_spanning_trees(g, poly)
+    eng = SynthesisEngine(table=table)
+    T_eng = eng.synthesize(g).polynomial
+    assert poly == T_eng, "hybrid k=2 polynomial must match engine"
+
+
+def test_cell_quotient_hybrid_4_K3_M2_cycle(table):
+    """4-cycle of K_3 cells joined by M_2 matchings — validates the
+    chord rule on a longer symmetric cycle (cells share NO anchors
+    across junctions, so Path A's C(k, j) shortcut applies). This is
+    the anti-regression for the orbit-aware refactor that ensures
+    symmetric cases retain their fast path."""
+    from tutte.roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
+    from tutte.synthesis.engine import SynthesisEngine
+
+    g_nx = nx.Graph()
+    n_cells = 4
+    for c in range(n_cells):
+        base = 3 * c
+        for i in range(base, base + 3):
+            for j in range(i + 1, base + 3):
+                g_nx.add_edge(i, j)
+    for c in range(n_cells):
+        nxt = (c + 1) % n_cells
+        g_nx.add_edge(3 * c, 3 * nxt)
+        g_nx.add_edge(3 * c + 1, 3 * nxt + 1)
+    g = Graph.from_networkx(g_nx)
+    poly = compute_cell_quotient_hybrid(g, table)
+    assert poly is not None
+    assert verify_spanning_trees(g, poly)
+    eng = SynthesisEngine(table=table)
+    T_eng = eng.synthesize(g).polynomial
+    assert poly == T_eng, "hybrid 4-K_3 M_2 cycle polynomial must match engine"
+
+
+def test_cell_quotient_hybrid_3x3_K3_grid_multicycle(table):
+    """3x3 grid of K_3 cells with M_1 junctions: cell-quotient is a
+    3x3 grid (4 fundamental cycles). Validates the bridge-formula fix
+    for k=1 multi-cycle: T(G) = x*T(G/e) for bridge e (NOT x*T(G-e),
+    which gave wrong answers because the recursive sums on
+    `delete bridge` vs `contract bridge` diverge for chord-rule
+    leaves even though their leaf polynomials agree)."""
+    from tutte.roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
+    from tutte.synthesis.engine import SynthesisEngine
+
+    g_nx = nx.Graph()
+    cells = {}
+    nid = 0
+    for r in range(3):
+        for c in range(3):
+            cn = list(range(nid, nid + 3))
+            nid += 3
+            cells[(r, c)] = cn
+            for i in range(3):
+                for j in range(i + 1, 3):
+                    g_nx.add_edge(cn[i], cn[j])
+    for r in range(3):
+        for c in range(3):
+            if c + 1 < 3:
+                g_nx.add_edge(cells[(r, c)][0], cells[(r, c + 1)][0])
+            if r + 1 < 3:
+                g_nx.add_edge(cells[(r, c)][1], cells[(r + 1, c)][1])
+    g = Graph.from_networkx(g_nx)
+    poly = compute_cell_quotient_hybrid(g, table)
+    assert poly is not None
+    assert verify_spanning_trees(g, poly)
+    eng = SynthesisEngine(table=table)
+    T_eng = eng.synthesize(g).polynomial
+    assert poly == T_eng, "hybrid multi-cycle polynomial must match engine"
+
+
+def test_cell_quotient_hybrid_2x2_K3_grid_M2_cross_anchors(table):
+    """2x2 grid of K_3 cells with M_2 junctions where horizontal uses
+    cell anchors {0, 1} and vertical uses {1, 2} — sharing anchor 1
+    across junction directions. The chord rule's C(k, j) shortcut
+    fails here because the two j=1 sub-cases (contract first vs
+    contract second matching edge) produce non-isomorphic leaves.
+    Orbit-aware enumeration (Path B) correctly handles this."""
+    from tutte.roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
+    from tutte.synthesis.engine import SynthesisEngine
+
+    g_nx = nx.Graph()
+    cells = {}
+    nid = 0
+    for r in range(2):
+        for c in range(2):
+            cn = list(range(nid, nid + 3))
+            nid += 3
+            cells[(r, c)] = cn
+            for i in range(3):
+                for j in range(i + 1, 3):
+                    g_nx.add_edge(cn[i], cn[j])
+    # Horizontal junctions use anchors {0, 1}; vertical uses {1, 2}.
+    for r in range(2):
+        for c in range(2):
+            if c + 1 < 2:
+                for i in range(2):
+                    g_nx.add_edge(cells[(r, c)][i], cells[(r, c + 1)][i])
+            if r + 1 < 2:
+                for i in range(2):
+                    a = i + (2 if i + 2 < 3 else 0)
+                    g_nx.add_edge(cells[(r, c)][a], cells[(r + 1, c)][a])
+    g = Graph.from_networkx(g_nx)
+    poly = compute_cell_quotient_hybrid(g, table)
+    assert poly is not None
+    assert verify_spanning_trees(g, poly)
+    eng = SynthesisEngine(table=table)
+    T_eng = eng.synthesize(g).polynomial
+    assert poly == T_eng, (
+        "2x2 K_3 M_2 grid (cross-junction shared anchors) must match engine"
+    )
 
 
 # =============================================================================

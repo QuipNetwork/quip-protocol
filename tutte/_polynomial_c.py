@@ -30,6 +30,33 @@ ffi.cdef(r"""
         const int* p1_xs, const int* p1_ys, const long long* p1_cs, int n_p1,
         const int* p2_xs, const int* p2_ys, const long long* p2_cs, int n_p2,
         int* out_xs, int* out_ys, long long* out_cs, int out_capacity);
+
+    /* Batched polynomial multiplication.
+       Processes n_pairs polynomial multiplications A_i × B_i in one cffi call,
+       sharing a single scratch hash table across pairs (reset between pairs).
+
+       Polys A and B are flat-encoded: a_offsets[i]..a_offsets[i+1] gives
+       indices into a_xs/a_ys/a_cs for pair i's A poly. Similarly for B.
+       Output polys are flat-encoded into out_xs/out_ys/out_cs;
+       out_offsets[i] gives the start; out_lens[i] gives length of pair i's
+       product.
+
+       Returns 0 on success, -1 on overflow or any per-pair capacity exceeded.
+
+       The pre-allocated `total_out_capacity` must be ≥ Σ n_p1[i] × n_p2[i].
+       The hash table capacity (in elements) is reused; caller passes a
+       sized scratch buffer (`ht_cap`).
+    */
+    int poly_mul_batched_int64(
+        const int* a_xs, const int* a_ys, const long long* a_cs,
+        const int* a_offsets,
+        const int* b_xs, const int* b_ys, const long long* b_cs,
+        const int* b_offsets,
+        int n_pairs,
+        int* out_xs, int* out_ys, long long* out_cs,
+        int* out_offsets,
+        int* out_lens,
+        int total_out_capacity);
 """)
 
 ffi.set_source("_tutte_polynomial_cffi", r"""
@@ -128,6 +155,105 @@ ffi.set_source("_tutte_polynomial_cffi", r"""
 
         free(keys_x); free(keys_y); free(values); free(terms);
         return n_out;
+    }
+
+    /* Per-pair scratch: shared HT reused across all n_pairs muls.
+       Allocates a worst-case HT once (sized by sum of n_p1[i] × n_p2[i])
+       and resets between pairs. Output buffer is contiguous; per-pair
+       lengths reported via out_lens. */
+    int poly_mul_batched_int64(
+        const int* a_xs, const int* a_ys, const long long* a_cs,
+        const int* a_offsets,
+        const int* b_xs, const int* b_ys, const long long* b_cs,
+        const int* b_offsets,
+        int n_pairs,
+        int* out_xs, int* out_ys, long long* out_cs,
+        int* out_offsets,
+        int* out_lens,
+        int total_out_capacity
+    ) {
+        if (n_pairs == 0) return 0;
+
+        /* Compute max HT capacity needed across all pairs:
+           cap_i = 2 * n_p1[i] * n_p2[i]. Reuse the max. */
+        int max_ht_cap = 16;
+        for (int p = 0; p < n_pairs; p++) {
+            int n1 = a_offsets[p+1] - a_offsets[p];
+            int n2 = b_offsets[p+1] - b_offsets[p];
+            int cap = n1 * n2 * 2;
+            if (cap > max_ht_cap) max_ht_cap = cap;
+        }
+        if (max_ht_cap > 16 * 1024 * 1024) return -1;
+
+        int* keys_x = (int*)malloc(max_ht_cap * sizeof(int));
+        int* keys_y = (int*)malloc(max_ht_cap * sizeof(int));
+        int* values = (int*)malloc(max_ht_cap * sizeof(int));
+        Term* terms = (Term*)malloc(max_ht_cap * sizeof(Term));
+        if (!keys_x || !keys_y || !values || !terms) {
+            free(keys_x); free(keys_y); free(values); free(terms);
+            return -1;
+        }
+
+        int out_pos = 0;
+        for (int p = 0; p < n_pairs; p++) {
+            int n1 = a_offsets[p+1] - a_offsets[p];
+            int n2 = b_offsets[p+1] - b_offsets[p];
+            out_offsets[p] = out_pos;
+            if (n1 == 0 || n2 == 0) {
+                out_lens[p] = 0;
+                continue;
+            }
+
+            /* Size the HT for this pair: 2 × n1 × n2, clamped. */
+            int cap = n1 * n2 * 2;
+            if (cap < 16) cap = 16;
+            if (cap > max_ht_cap) {
+                /* Should not happen; guard. */
+                free(keys_x); free(keys_y); free(values); free(terms);
+                return -1;
+            }
+            /* Reset HT entries. */
+            for (int i = 0; i < cap; i++) values[i] = HT_EMPTY;
+
+            int term_count = 0;
+            int a_start = a_offsets[p];
+            int b_start = b_offsets[p];
+            for (int i = 0; i < n1; i++) {
+                int x1 = a_xs[a_start + i];
+                int y1 = a_ys[a_start + i];
+                long long c1 = a_cs[a_start + i];
+                for (int j = 0; j < n2; j++) {
+                    int x = x1 + b_xs[b_start + j];
+                    int y = y1 + b_ys[b_start + j];
+                    long long c = c1 * b_cs[b_start + j];
+                    int slot = ht_lookup_or_insert(keys_x, keys_y, values, cap,
+                                                    terms, &term_count, x, y);
+                    terms[slot].c += c;
+                }
+            }
+
+            /* Compact nonzero terms into out arrays. */
+            int n_out = 0;
+            for (int i = 0; i < term_count; i++) {
+                if (terms[i].c != 0) {
+                    if (out_pos >= total_out_capacity) {
+                        free(keys_x); free(keys_y); free(values); free(terms);
+                        return -1;
+                    }
+                    out_xs[out_pos] = terms[i].x;
+                    out_ys[out_pos] = terms[i].y;
+                    out_cs[out_pos] = terms[i].c;
+                    out_pos++;
+                    n_out++;
+                }
+            }
+            out_lens[p] = n_out;
+        }
+        /* Final offsets sentinel. */
+        out_offsets[n_pairs] = out_pos;
+
+        free(keys_x); free(keys_y); free(values); free(terms);
+        return 0;
     }
 """, extra_compile_args=["-O3"])
 
@@ -251,3 +377,99 @@ def poly_mul(
     except Exception:
         pass
     return poly_mul_python(p1_coeffs, p2_coeffs)
+
+
+def poly_mul_batched_c(
+    pairs: list,
+) -> Optional[list]:
+    """Batched polynomial multiplication via single cffi call.
+
+    `pairs` is a list of `(A_dict, B_dict)` polynomial pairs. Each
+    `_dict` maps `(xpow, ypow) -> coeff`. Returns a list of product
+    dicts, in input order.
+
+    Returns None on overflow or any per-pair error; caller falls back to
+    per-pair `poly_mul`.
+
+    Shares one C-side hash-table allocation across all pairs (reset
+    between pairs). For Cm₃-scale convolves with ~1 M poly muls per
+    streaming chunk, this saves the per-call cffi marshaling overhead
+    that dominates Python dispatch.
+    """
+    if not pairs:
+        return []
+
+    # Overflow guard: bail if any coefficient might overflow int64.
+    for a, b in pairs:
+        for c in a.values():
+            if abs(c) >= _OVERFLOW_GUARD:
+                return None
+        for c in b.values():
+            if abs(c) >= _OVERFLOW_GUARD:
+                return None
+
+    lib, _ffi = _get_lib()
+
+    n_pairs = len(pairs)
+
+    # Flatten A and B into contiguous arrays with offsets.
+    a_xs_list: list = []
+    a_ys_list: list = []
+    a_cs_list: list = []
+    a_offsets_list: list = [0]
+    b_xs_list: list = []
+    b_ys_list: list = []
+    b_cs_list: list = []
+    b_offsets_list: list = [0]
+    total_out_capacity = 0
+    for a, b in pairs:
+        for (x, y), c in a.items():
+            a_xs_list.append(x)
+            a_ys_list.append(y)
+            a_cs_list.append(c)
+        a_offsets_list.append(len(a_xs_list))
+        for (x, y), c in b.items():
+            b_xs_list.append(x)
+            b_ys_list.append(y)
+            b_cs_list.append(c)
+        b_offsets_list.append(len(b_xs_list))
+        total_out_capacity += len(a) * len(b) + 1
+
+    if total_out_capacity > 16 * 1024 * 1024:
+        return None  # safety guard
+
+    a_xs = _ffi.new("int[]", a_xs_list)
+    a_ys = _ffi.new("int[]", a_ys_list)
+    a_cs = _ffi.new("long long[]", a_cs_list)
+    a_offsets = _ffi.new("int[]", a_offsets_list)
+    b_xs = _ffi.new("int[]", b_xs_list)
+    b_ys = _ffi.new("int[]", b_ys_list)
+    b_cs = _ffi.new("long long[]", b_cs_list)
+    b_offsets = _ffi.new("int[]", b_offsets_list)
+    out_xs = _ffi.new("int[]", total_out_capacity)
+    out_ys = _ffi.new("int[]", total_out_capacity)
+    out_cs = _ffi.new("long long[]", total_out_capacity)
+    out_offsets = _ffi.new("int[]", n_pairs + 1)
+    out_lens = _ffi.new("int[]", n_pairs)
+
+    rc = lib.poly_mul_batched_int64(
+        a_xs, a_ys, a_cs, a_offsets,
+        b_xs, b_ys, b_cs, b_offsets,
+        n_pairs,
+        out_xs, out_ys, out_cs,
+        out_offsets, out_lens,
+        total_out_capacity,
+    )
+    if rc != 0:
+        return None
+
+    # Decode output: build N product dicts from the flat arrays.
+    results: list = []
+    for p in range(n_pairs):
+        start = out_offsets[p]
+        n_out = out_lens[p]
+        d: Dict[Tuple[int, int], int] = {}
+        for i in range(n_out):
+            d[(out_xs[start + i], out_ys[start + i])] = out_cs[start + i]
+        results.append(d)
+    return results

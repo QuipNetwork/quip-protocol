@@ -43,6 +43,8 @@ anchors" below.
 | [`cell_quotient_cycle.py`](cell_quotient_cycle.py) | `compute_cycle_dp(cell_template, ..., n_cells)` — cycle-topology DP. Validated on K₃, K₄, K_{4,4} synthetic cycles + real Cm2 (T(1,1) matches engine + Kirchhoff). |
 | [`cell_quotient_path.py`](cell_quotient_path.py) | `compute_path_dp(...)` — same as cycle DP but without the closing step. Returns the boundary-partition-indexed dict for the full path; consumed by grid DP. |
 | [`cell_quotient_grid.py`](cell_quotient_grid.py) | `compute_grid_dp_with_layout(...)` — composes a `(rows × cols)` grid via row path DPs convolved through vertical junctions. Validated on synthetic K_n grids with K_2 and M_k vertical junctions (8 passing tests). |
+| [`cell_quotient_tree.py`](cell_quotient_tree.py) | Two entry points: (1) `compute_tree_dp_recursive(spec, enable_per_cell_compression=False)` — branching cell-tree topology DP via post-order recursion (orbit-compressed). (2) `compute_corrected_leaf_dp(spec)` — brute-force DP for chord-rule leaves with cross-cell vertex identifications, using the corrected `(y-1)^{k-m}/(x-1)^{m-c_comp}` convolution rule (RESOLVED 2026-05-07). See [docs/06_6_cell_quotient_tree_dp.md](../docs/06_6_cell_quotient_tree_dp.md) and `tutte/research/data/step3_milestone_b_design.md`. |
+| [`cell_quotient_hybrid.py`](cell_quotient_hybrid.py) | `compute_cell_quotient_hybrid(graph, table)` — orbit-aware hybrid DP for cyclic cell-quotients. Peels closing junctions via Phase 13 §4 chord rule; Path A handles symmetric junctions with the standard `C(k, j)` formula, Path B uses canonical_key orbit enumeration for asymmetric (cross-junction shared anchors, e.g., 2x2 K_3 M_2 grid). Top-level spec dispatch to `compute_corrected_leaf_dp` bypasses per-leaf engine.synthesize when leaves admit cross-cell-ID structure. See `tutte/research/data/hybrid_cycle_close_findings.md`. |
 | [`cell_anchor_adapter.py`](cell_anchor_adapter.py) | `normalize_cell_anchors_for_cycle` — graph-agnostic detection of cycle topology + per-cell anchor alignment. Bipartite-cell shortcut for K_{a,b} cells; generic VF2-Aut alignment is staged for Phase 18.E.3.j. |
 
 ## Algorithm overview
@@ -99,6 +101,43 @@ formula.
   `dict[(xpow, ypow)] -> coeff` directly, skipping the
   `TuttePolynomial.encode/decode` cycle. Combined with the
   `_polynomial_c` C extension this gives 1.3-12.8× per-mul speedup.
+- **Streaming junction enumeration** (`enumerate_junction_internally`,
+  Phase B Round 6, May 2026) — for 2D K_{4,4} grid composition,
+  `precompute_M_table` accepts compressed junction orbits (one rep
+  each) and expands their per-cell orbit members **internally**, one
+  orbit at a time. Avoids the OOM that bit external full enumeration
+  on Cm₃, and combined with `out_cell_anchor_groups` on the 2a vertical
+  junction step (which lifts state's per-cell aut through M_4 edges to
+  the output boundary) keeps the 2a output orbit-compressed. Result:
+  T(Cm₂) computed in ~36 s vs ~55 s for the engine's `kmatching_formula`
+  baseline (1.5× win, first known method to beat that path on Cm₂).
+  Reference recipe at
+  [`tutte/research/scripts/cm2_via_v5_streamed.py`](../research/scripts/cm2_via_v5_streamed.py);
+  correctness test at
+  `test_precompute_M_table_internal_junction_enumeration_matches_external`.
+
+- **Chunked row composition** (`precompute_M_and_convolve_streaming`,
+  Phase B Round 9-10, May 2026) — wraps `precompute_M_table` in a
+  state-orbit chunk loop with a raw-dict accumulator. Bounds Cm₃ peak
+  memory (~1.9 GB) while exposing per-chunk `_dict_mul` (the polynomial
+  state × junc × M coefficient multiply) as the irreducible cost.
+
+- **Modular point-value DP** (Phase B Rounds 12-13, May 2026) — the
+  precision-safe path for Cm₃-class graphs where Cm₂ polynomial
+  coefficients fit in int64 but Cm₃'s don't (max coefficient ~10⁴⁰).
+  `TuttePolynomial.evaluate_mod` + bivariate Lagrange + CRT recover
+  the exact polynomial from grid evaluations.
+  `precompute_M_table_mod` (Round 13) builds the M-table directly in
+  modular arithmetic — one `int mod p` per `(O_state, O_junc, O_out)`
+  triple, no polynomial allocation per chunk. Reference scripts:
+  [`cm2_via_modular_interp.py`](../research/scripts/cm2_via_modular_interp.py),
+  [`cm2_via_modular_dp.py`](../research/scripts/cm2_via_modular_dp.py),
+  [`cm3_via_modular_dp.py`](../research/scripts/cm3_via_modular_dp.py).
+  Cm₂ recovery is bit-exact in seconds; Cm₃ single-point in pure
+  Python is ~2-3 hr (bottleneck moved to per-pair structural ops),
+  with Round 14 C extension expected to give ~10× speedup. See
+  [docs/06_5_cell_quotient_grid_dp.md](../docs/06_5_cell_quotient_grid_dp.md)
+  Rounds 7-13 section for the full progression.
 
 ## Generalizing for shared anchors (Phase 18.E.3.j)
 

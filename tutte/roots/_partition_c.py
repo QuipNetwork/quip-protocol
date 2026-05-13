@@ -651,6 +651,383 @@ def precompute_M_batched_inner_c(
     return M_dict
 
 
+def precompute_M_batched_inner_c_mod(
+    state_orbit_partitions,           # dict canonical → [rep partition]
+    junc_data_per_orbit,              # dict junc_canonical → list of (P_junc, P_junc_S, P_junc_ext)
+    state_extra_boundary,             # list[int]
+    extra_boundary,                   # list[int]
+    shared_boundary,                  # list[int]
+    out_boundary,                     # list[int]
+    out_cell_anchor_groups,           # list[list[int]] — for canonical key
+    n_state_per_orbit,                # dict canonical → n_state (analytical)
+    xy_pow_mod,                       # list[int] — ((x-1)(y-1))^d mod p for d=0..max_d
+    p,                                # int — the prime modulus
+):
+    """Modular variant of `precompute_M_batched_inner_c` (Phase 13.E / Round 14).
+
+    Returns: dict (O_state, O_junc, O_out_canonical_tuple) → int mod p.
+    Returns None if C extension unavailable, sizes exceed limits, or any error.
+
+    Reuses `batched_inner_iterations_c` for the structural work
+    (delta / join / restrict / per-cell canonical key in C). Only the
+    final Python aggregation changes: instead of accumulating polynomial
+    coefficient dicts per (O_state, O_junc, O_out) bucket, we accumulate
+    a single int mod p per bucket. Removes the inner `for k, v in
+    xy_pow.items()` loop entirely — one modular mul-add per (state, junc)
+    pair.
+
+    Mirrors the polynomial wrapper's behavior exactly except for arithmetic.
+    """
+    full_universe = list(state_extra_boundary) + list(shared_boundary) + list(extra_boundary)
+    n_universe = len(full_universe)
+    if n_universe > 256:
+        return None
+    n_shared = len(shared_boundary)
+    n_out_boundary = len(out_boundary)
+
+    try:
+        lib, _ffi = _get_lib()
+    except Exception:
+        return None
+
+    pos_to_idx = {pos: i for i, pos in enumerate(full_universe)}
+    shared_pos_to_idx = {pos: i for i, pos in enumerate(shared_boundary)}
+
+    try:
+        out_boundary_idx = [pos_to_idx[pos] for pos in out_boundary]
+    except KeyError:
+        return None
+
+    n_cells = len(out_cell_anchor_groups)
+    cell_groups_data = [n_cells]
+    for cell_positions in out_cell_anchor_groups:
+        in_universe = [pos_to_idx[pos] for pos in cell_positions if pos in pos_to_idx]
+        cell_groups_data.append(len(in_universe))
+        cell_groups_data.extend(in_universe)
+
+    junc_orbit_canonicals = list(junc_data_per_orbit.keys())
+    junc_orbit_partition_lists = [junc_data_per_orbit[O_junc] for O_junc in junc_orbit_canonicals]
+
+    junc_flat_metadata = []
+    junc_S_flat = []
+    junc_S_offsets = []
+    junc_S_lens = []
+    junc_ext_flat = []
+    junc_ext_offsets = []
+    junc_ext_lens = []
+
+    for orbit_idx, per_junc_list in enumerate(junc_orbit_partition_lists):
+        for P_junc, P_junc_S, P_junc_ext in per_junc_list:
+            junc_flat_metadata.append((orbit_idx, len(junc_flat_metadata)))
+            try:
+                p_S_data = _encode_partition_to_idx(P_junc_S, shared_pos_to_idx)
+            except KeyError:
+                return None
+            junc_S_offsets.append(len(junc_S_flat))
+            junc_S_lens.append(len(p_S_data))
+            junc_S_flat.extend(p_S_data)
+            try:
+                p_ext_data = _encode_partition_to_idx(P_junc_ext, pos_to_idx)
+            except KeyError:
+                return None
+            junc_ext_offsets.append(len(junc_ext_flat))
+            junc_ext_lens.append(len(p_ext_data))
+            junc_ext_flat.extend(p_ext_data)
+
+    n_junc_total = len(junc_flat_metadata)
+    if n_junc_total == 0:
+        return {}
+
+    junc_S_arr = _ffi.new("int[]", junc_S_flat)
+    junc_S_off_arr = _ffi.new("int[]", junc_S_offsets)
+    junc_S_lens_arr = _ffi.new("int[]", junc_S_lens)
+    junc_ext_arr = _ffi.new("int[]", junc_ext_flat)
+    junc_ext_off_arr = _ffi.new("int[]", junc_ext_offsets)
+    junc_ext_lens_arr = _ffi.new("int[]", junc_ext_lens)
+
+    out_boundary_arr = _ffi.new("int[]", out_boundary_idx) if out_boundary_idx else _ffi.new("int[]", 1)
+    cell_groups_arr = _ffi.new("int[]", cell_groups_data)
+
+    per_junc_max = 2 + 1 + n_universe * (n_cells + 1)
+    out_capacity = n_junc_total * per_junc_max
+    out_buf = _ffi.new("int[]", out_capacity)
+    out_offsets = _ffi.new("int[]", n_junc_total + 1)
+
+    M_int = {}
+
+    for O_state, ps_list in state_orbit_partitions.items():
+        rep_state = ps_list[0]
+        n_state = n_state_per_orbit.get(O_state, len(ps_list))
+        n_state_mod = n_state % p
+        if n_state_mod == 0:
+            continue
+
+        P_state_S = _restrict_partition_py(rep_state, shared_boundary)
+        P_state_ext_list = list(rep_state) + [(v,) for v in extra_boundary]
+        P_state_ext = tuple(sorted(P_state_ext_list))
+
+        try:
+            p_state_ext_data = _encode_partition_to_idx(P_state_ext, pos_to_idx)
+            p_state_S_data = _encode_partition_to_idx(P_state_S, shared_pos_to_idx)
+        except KeyError:
+            return None
+
+        p_state_ext_arr = _ffi.new("int[]", p_state_ext_data)
+        p_state_S_arr = _ffi.new("int[]", p_state_S_data)
+
+        n_written = lib.batched_inner_iterations_c(
+            p_state_ext_arr, len(p_state_ext_data),
+            p_state_S_arr, len(p_state_S_data),
+            junc_ext_arr, junc_ext_off_arr, junc_ext_lens_arr,
+            junc_S_arr, junc_S_off_arr, junc_S_lens_arr,
+            n_junc_total,
+            n_universe, n_shared,
+            out_boundary_arr, n_out_boundary,
+            cell_groups_arr, len(cell_groups_data), n_cells,
+            out_buf, out_capacity, out_offsets,
+        )
+        if n_written < 0:
+            return None
+
+        out_buf_list = _ffi.unpack(out_buf, n_written) if n_written > 0 else []
+        out_offsets_list = _ffi.unpack(out_offsets, n_junc_total + 1)
+        shape_size = n_cells + 1
+        for j_global in range(n_junc_total):
+            orbit_idx, _ = junc_flat_metadata[j_global]
+            O_junc = junc_orbit_canonicals[orbit_idx]
+            seg_start = out_offsets_list[j_global]
+            delta = out_buf_list[seg_start]
+            if delta < 0:
+                continue
+            n_can = out_buf_list[seg_start + 1]
+            if n_can == 0:
+                O_out = ()
+            else:
+                n_blocks = out_buf_list[seg_start + 2]
+                base0 = seg_start + 3
+                flat = out_buf_list[base0:base0 + n_blocks * shape_size]
+                blocks = [tuple(flat[i * shape_size:(i + 1) * shape_size])
+                          for i in range(n_blocks)]
+                O_out = tuple(sorted(blocks))
+
+            target_key = (O_state, O_junc, O_out)
+            add = n_state_mod * xy_pow_mod[delta] % p
+            M_int[target_key] = (M_int.get(target_key, 0) + add) % p
+
+    return M_int
+
+
+def precompute_and_convolve_c_mod(
+    state_orbit_partitions,           # dict canonical → [rep partition]
+    junc_data_per_orbit,              # dict junc_canonical → list of (P_junc, P_junc_S, P_junc_ext)
+    state_extra_boundary,             # list[int]
+    extra_boundary,                   # list[int]
+    shared_boundary,                  # list[int]
+    out_boundary,                     # list[int]
+    out_cell_anchor_groups,           # list[list[int]] — for canonical key
+    n_state_per_orbit,                # dict canonical → n_state (analytical)
+    state_orbit_T_mod,                # dict canonical → int mod p (state value)
+    junction_orbit_T_mod,             # dict canonical → int mod p (junction value)
+    xy_pow_mod,                       # list[int]
+    p,                                # int
+):
+    """Single-pass C-ext: directly accumulate into out_mod[O_out] (Round 16).
+
+    Combines `precompute_M_batched_inner_c_mod` (build M_int per chunk) +
+    streaming-wrapper convolve (M_int × state_T × junc_T → out_mod) into
+    one Python loop. Eliminates:
+    - 3-tuple `(O_state, O_junc, O_out)` keys (replaced with 1-tuple O_out)
+    - Intermediate M_int dict with millions of entries (replaced with a
+      few-thousand-entry out_mod)
+    - Two dict ops per pair (replaced with one)
+
+    For Cm₃ 2b (row composition) where per-pair Python dict ops dominate
+    wall-clock, this is the primary speedup over Round 14/15.
+
+    Returns: dict O_out_canonical_tuple → int mod p (the per-chunk
+    contribution to the final out_mod). Caller accumulates across chunks.
+    """
+    full_universe = list(state_extra_boundary) + list(shared_boundary) + list(extra_boundary)
+    n_universe = len(full_universe)
+    if n_universe > 256:
+        return None
+    n_shared = len(shared_boundary)
+    n_out_boundary = len(out_boundary)
+
+    try:
+        lib, _ffi = _get_lib()
+    except Exception:
+        return None
+
+    pos_to_idx = {pos: i for i, pos in enumerate(full_universe)}
+    shared_pos_to_idx = {pos: i for i, pos in enumerate(shared_boundary)}
+
+    try:
+        out_boundary_idx = [pos_to_idx[pos] for pos in out_boundary]
+    except KeyError:
+        return None
+
+    n_cells = len(out_cell_anchor_groups)
+    cell_groups_data = [n_cells]
+    for cell_positions in out_cell_anchor_groups:
+        in_universe = [pos_to_idx[pos] for pos in cell_positions if pos in pos_to_idx]
+        cell_groups_data.append(len(in_universe))
+        cell_groups_data.extend(in_universe)
+
+    junc_orbit_canonicals = list(junc_data_per_orbit.keys())
+    junc_orbit_partition_lists = [junc_data_per_orbit[O_junc] for O_junc in junc_orbit_canonicals]
+
+    junc_flat_metadata = []  # (orbit_idx, _) — but we also need the orbit canonical to lookup jv.
+    junc_jv_mod = []  # per-flattened-junc jv mod p value
+    junc_S_flat = []
+    junc_S_offsets = []
+    junc_S_lens = []
+    junc_ext_flat = []
+    junc_ext_offsets = []
+    junc_ext_lens = []
+
+    for orbit_idx, per_junc_list in enumerate(junc_orbit_partition_lists):
+        O_junc = junc_orbit_canonicals[orbit_idx]
+        jv = junction_orbit_T_mod.get(O_junc, 0)
+        if jv == 0:
+            # All members of this orbit contribute 0 — skip enumeration.
+            for _ in per_junc_list:
+                junc_flat_metadata.append((orbit_idx, 0))
+                junc_jv_mod.append(0)
+                junc_S_offsets.append(len(junc_S_flat))
+                junc_S_lens.append(0)
+                junc_ext_offsets.append(len(junc_ext_flat))
+                junc_ext_lens.append(0)
+            continue
+        for P_junc, P_junc_S, P_junc_ext in per_junc_list:
+            junc_flat_metadata.append((orbit_idx, 0))
+            junc_jv_mod.append(jv)
+            try:
+                p_S_data = _encode_partition_to_idx(P_junc_S, shared_pos_to_idx)
+            except KeyError:
+                return None
+            junc_S_offsets.append(len(junc_S_flat))
+            junc_S_lens.append(len(p_S_data))
+            junc_S_flat.extend(p_S_data)
+            try:
+                p_ext_data = _encode_partition_to_idx(P_junc_ext, pos_to_idx)
+            except KeyError:
+                return None
+            junc_ext_offsets.append(len(junc_ext_flat))
+            junc_ext_lens.append(len(p_ext_data))
+            junc_ext_flat.extend(p_ext_data)
+
+    n_junc_total = len(junc_flat_metadata)
+    if n_junc_total == 0:
+        return {}
+
+    junc_S_arr = _ffi.new("int[]", junc_S_flat) if junc_S_flat else _ffi.new("int[]", 1)
+    junc_S_off_arr = _ffi.new("int[]", junc_S_offsets)
+    junc_S_lens_arr = _ffi.new("int[]", junc_S_lens)
+    junc_ext_arr = _ffi.new("int[]", junc_ext_flat) if junc_ext_flat else _ffi.new("int[]", 1)
+    junc_ext_off_arr = _ffi.new("int[]", junc_ext_offsets)
+    junc_ext_lens_arr = _ffi.new("int[]", junc_ext_lens)
+
+    out_boundary_arr = _ffi.new("int[]", out_boundary_idx) if out_boundary_idx else _ffi.new("int[]", 1)
+    cell_groups_arr = _ffi.new("int[]", cell_groups_data)
+
+    per_junc_max = 2 + 1 + n_universe * (n_cells + 1)
+    out_capacity = n_junc_total * per_junc_max
+    out_buf = _ffi.new("int[]", out_capacity)
+    out_offsets = _ffi.new("int[]", n_junc_total + 1)
+
+    out_mod = {}
+
+    for O_state, ps_list in state_orbit_partitions.items():
+        sv = state_orbit_T_mod.get(O_state, 0)
+        if sv == 0:
+            continue
+        n_state = n_state_per_orbit.get(O_state, len(ps_list))
+        n_state_mod = n_state % p
+        if n_state_mod == 0:
+            continue
+        sv_n_state = sv * n_state_mod % p
+        if sv_n_state == 0:
+            continue
+
+        rep_state = ps_list[0]
+        P_state_S = _restrict_partition_py(rep_state, shared_boundary)
+        P_state_ext_list = list(rep_state) + [(v,) for v in extra_boundary]
+        P_state_ext = tuple(sorted(P_state_ext_list))
+
+        try:
+            p_state_ext_data = _encode_partition_to_idx(P_state_ext, pos_to_idx)
+            p_state_S_data = _encode_partition_to_idx(P_state_S, shared_pos_to_idx)
+        except KeyError:
+            return None
+
+        p_state_ext_arr = _ffi.new("int[]", p_state_ext_data)
+        p_state_S_arr = _ffi.new("int[]", p_state_S_data)
+
+        n_written = lib.batched_inner_iterations_c(
+            p_state_ext_arr, len(p_state_ext_data),
+            p_state_S_arr, len(p_state_S_data),
+            junc_ext_arr, junc_ext_off_arr, junc_ext_lens_arr,
+            junc_S_arr, junc_S_off_arr, junc_S_lens_arr,
+            n_junc_total,
+            n_universe, n_shared,
+            out_boundary_arr, n_out_boundary,
+            cell_groups_arr, len(cell_groups_data), n_cells,
+            out_buf, out_capacity, out_offsets,
+        )
+        if n_written < 0:
+            return None
+
+        out_buf_list = _ffi.unpack(out_buf, n_written) if n_written > 0 else []
+        out_offsets_list = _ffi.unpack(out_offsets, n_junc_total + 1)
+        shape_size = n_cells + 1
+        # Use bytes as O_out key — much faster construction + hash than
+        # nested tuple-of-tuples. The C output is already canonically sorted,
+        # so slicing the int run directly yields a stable key.
+        for j_global in range(n_junc_total):
+            jv = junc_jv_mod[j_global]
+            if jv == 0:
+                continue
+            seg_start = out_offsets_list[j_global]
+            delta = out_buf_list[seg_start]
+            if delta < 0:
+                continue
+            n_can = out_buf_list[seg_start + 1]
+            if n_can == 0:
+                O_out_bytes = b""
+            else:
+                n_blocks = out_buf_list[seg_start + 2]
+                base0 = seg_start + 3
+                # bytes(memoryview): O(n) but no per-tuple Python alloc.
+                # Each int is 4 bytes (ffi int = C int).
+                O_out_bytes = bytes(_ffi.buffer(
+                    out_buf + base0, n_blocks * shape_size * 4,
+                ))
+            contrib = sv_n_state * jv % p * xy_pow_mod[delta] % p
+            out_mod[O_out_bytes] = (out_mod.get(O_out_bytes, 0) + contrib) % p
+
+    # Decode bytes keys back to canonical-tuple form for downstream
+    # consumers (`per_cell_orbit_size`, `per_cell_orbit_rep` expect
+    # `Tuple[Tuple[int, ...], ...]`). One decode per UNIQUE O_out, which
+    # is far fewer than per-pair (the whole point of bytes accumulation).
+    shape_size = n_cells + 1
+    decoded: Dict[Tuple, int] = {}
+    for O_out_bytes, val in out_mod.items():
+        if not O_out_bytes:
+            O_out = ()
+        else:
+            # Unpack int sequence then group by shape_size.
+            n_ints = len(O_out_bytes) // 4
+            ints = list(_ffi.unpack(_ffi.cast("int*", _ffi.from_buffer(O_out_bytes)), n_ints))
+            n_blocks = n_ints // shape_size
+            O_out = tuple(
+                tuple(ints[i * shape_size:(i + 1) * shape_size])
+                for i in range(n_blocks)
+            )
+        decoded[O_out] = val
+    return decoded
+
+
 def join_partitions_c_wrapper(
     P1: Tuple[Tuple[int, ...], ...],
     P2: Tuple[Tuple[int, ...], ...],

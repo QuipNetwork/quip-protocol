@@ -1,17 +1,25 @@
-"""Phase 8.2 — Warm up the rainbow table with selected D-Wave headers.
+"""Warm up the rainbow table with atom polynomials + selected D-Wave headers.
 
-Synthesizes targets that the default benchmark times out on (Cm2 takes
-~245s, Z(1,2) ~108s; the benchmark's per-target 60s timeout excludes them).
-Adds them to `tutte/data/lookup_table.{json,bin}` so future syntheses of
-Z(1,3), Cm3, Pm3 (which decompose into these cells via the Phase 8.1
-cost-aware partitioner) get instant cell lookup.
+Two value props:
+
+1. **Cell lookup for D-Wave decompositions** (Phase 8.2 motivation): Cm2,
+   Z(1,2) precomputed so Z(1,3), Cm3, Pm3 syntheses get instant cell hits
+   via the cost-aware partitioner.
+
+2. **Atom polynomials for algebraic factorization** (May 2026): the
+   `AlgebraicSynthesisEngine` uses `RainbowTable.find_factors_of(target)`
+   to find table entries whose polynomial divides the target — but this
+   only works if candidate atoms are IN the table. Adding K_8..K_15,
+   K_{a,b} for small (a, b), and other simple cogragh atoms is cheap
+   (cotree_dp synthesizes them in <1s each) and broadens the algebraic
+   engine's effective coverage.
 
 Idempotent: skips targets already in the table.
 
 Usage:
     python -m tutte.scripts.warmup_lookup_table
-    python -m tutte.scripts.warmup_lookup_table --target cm2  # single target
-    python -m tutte.scripts.warmup_lookup_table --timeout 1800  # custom budget
+    python -m tutte.scripts.warmup_lookup_table --target K_10
+    python -m tutte.scripts.warmup_lookup_table --timeout 1800
 """
 
 import argparse
@@ -21,18 +29,45 @@ import sys
 import time
 
 import dwave_networkx as dnx
-
+import networkx as nx
 from tutte.graph import Graph
 from tutte.lookup.binary import save_binary_rainbow_table
 from tutte.lookup.core import load_default_table
 from tutte.synthesis.engine import SynthesisEngine
 from tutte.validation import verify_spanning_trees
 
-
-# Phase 8.4 will extend this list with Z(1,3) / Cm3 once those synthesize.
 TARGETS = [
-    ("Cm2", lambda: dnx.chimera_graph(2)),
+    # D-Wave headers (Phase 8.2) — cell lookups for larger D-Wave decompositions.
     ("Z1_2", lambda: dnx.zephyr_graph(1, 2)),
+    ("Cm2", lambda: dnx.chimera_graph(2)),
+    ("Pm2", lambda: dnx.pegasus_graph(2)),
+
+    # Cograph atom polynomials (May 2026) — fast via cotree_dp (<1s each)
+    # and ESSENTIAL for AlgebraicSynthesisEngine.find_factors_of(target),
+    # which can only find factors that are atoms in the rainbow table.
+    ("K_8",  lambda: nx.complete_graph(8)),
+    ("K_9",  lambda: nx.complete_graph(9)),
+    ("K_10", lambda: nx.complete_graph(10)),
+    ("K_11", lambda: nx.complete_graph(11)),
+    ("K_12", lambda: nx.complete_graph(12)),
+    ("K_13", lambda: nx.complete_graph(13)),
+    ("K_14", lambda: nx.complete_graph(14)),
+    ("K_15", lambda: nx.complete_graph(15)),
+    # Bipartite cograph atoms — common as D-Wave Chimera cell + as algebraic factors.
+    ("K_2_3", lambda: nx.complete_bipartite_graph(2, 3)),
+    ("K_2_4", lambda: nx.complete_bipartite_graph(2, 4)),
+    ("K_3_3", lambda: nx.complete_bipartite_graph(3, 3)),
+    ("K_3_4", lambda: nx.complete_bipartite_graph(3, 4)),
+    ("K_4_4", lambda: nx.complete_bipartite_graph(4, 4)),  # = Cm1
+    ("K_4_5", lambda: nx.complete_bipartite_graph(4, 5)),
+    ("K_5_5", lambda: nx.complete_bipartite_graph(5, 5)),
+    ("K_5_6", lambda: nx.complete_bipartite_graph(5, 6)),
+    ("K_6_6", lambda: nx.complete_bipartite_graph(6, 6)),
+
+    # Still NOT default (intractable / too slow):
+    #   ("Z2_1", lambda: dnx.zephyr_graph(2, 1)), # 40n 114e — saw 3.5 GB / >5 min before kill
+    #   ("Z1_3", lambda: dnx.zephyr_graph(1, 3)), # 36n 162e — known intractable per Phase 8.3
+    #   ("Cm3", lambda: dnx.chimera_graph(3)),    # 72n 192e — known intractable per 18.E.3.l
 ]
 
 
@@ -91,6 +126,24 @@ def main() -> int:
     for name, builder in targets:
         if name in existing:
             print(f"  {name}: already in table — skip", file=sys.stderr)
+            continue
+
+        # Check canonical_key collision BEFORE synthesis (e.g., K_4_4 has
+        # the same canonical_key as the existing Cm1 entry — adding it
+        # would overwrite Cm1, breaking gates that key on cell name).
+        try:
+            g_check = Graph.from_networkx(builder())
+        except Exception as e:
+            print(f"  {name}: builder failed: {e}", file=sys.stderr)
+            continue
+        check_key = g_check.canonical_key()
+        if check_key in table.entries:
+            existing_entry = table.entries[check_key]
+            print(
+                f"  {name}: canonical_key collision with existing entry "
+                f"'{existing_entry.name}' — skip (same polynomial, different name)",
+                file=sys.stderr,
+            )
             continue
 
         print(f"  {name}: synthesizing (budget {args.timeout}s)...", file=sys.stderr,

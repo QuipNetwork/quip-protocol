@@ -93,8 +93,17 @@ def verify_spanning_trees(graph: Graph, poly: TuttePolynomial) -> bool:
     1. Tutte polynomial: T(1,1)
     2. Kirchhoff: determinant of reduced Laplacian matrix
 
-    Uses exact integer arithmetic (sympy) for graphs with >=20 nodes to avoid
-    float64 precision loss. For smaller graphs, float is sufficient.
+    Uses **exact integer arithmetic (sympy)** for ALL graph sizes — the
+    previous float64 path for n < 20 nodes was BUGGY for dense graphs:
+    `nx.number_of_spanning_trees` returns float64 which loses precision
+    during Gaussian elimination even when the final integer fits in
+    float53 (intermediate determinant values can be much larger). This
+    surfaced as spurious "Kirchhoff failures" on K_3+K_9+K_3 router (15n
+    96e, off by +2 in the float64 path) and C_5+K_6+C_5 (16n 85e, off
+    by +1) — see research/audit_chord_rule_findings.md for the audit.
+
+    The exact path is sub-millisecond for small graphs, so there's no
+    performance reason to keep the float64 path.
 
     Args:
         graph: The graph
@@ -106,19 +115,17 @@ def verify_spanning_trees(graph: Graph, poly: TuttePolynomial) -> bool:
     _log = get_log()
     tutte_count = poly.num_spanning_trees()
 
-    n = graph.node_count()
-    if n >= 20:
-        # Use exact integer arithmetic to avoid float precision issues
-        try:
-            kirchhoff_count = _exact_spanning_tree_count(graph)
-        except Exception:
+    # Use count_spanning_trees_kirchhoff which dispatches to fast Bareiss
+    # (n ≤ 100) or C-modular (n > 100) — both are exact integer arithmetic.
+    # Avoids the slow raw `_exact_spanning_tree_count` (sympy det, 15× slower
+    # than Bareiss on a 40n graph: 195ms vs 13ms).
+    try:
+        kirchhoff_count = count_spanning_trees_kirchhoff(graph)
+        if kirchhoff_count == -1:
+            # count_spanning_trees_kirchhoff signals failure with -1.
             return True
-    else:
-        G = graph.to_networkx()
-        try:
-            kirchhoff_count = round(nx.number_of_spanning_trees(G))
-        except Exception:
-            return True
+    except Exception:
+        return True
 
     match = tutte_count == kirchhoff_count
     if not match:
@@ -164,19 +171,23 @@ def _exact_spanning_tree_count(graph: Graph) -> int:
 def count_spanning_trees_kirchhoff(graph: Graph) -> int:
     """Count spanning trees using Kirchhoff's matrix-tree theorem.
 
-    For small graphs (< 20 nodes), uses NetworkX's numpy-based determinant.
-    For medium graphs (20-200 nodes), uses C-accelerated modular Gaussian
-    elimination with CRT for exact integer determinant.
-    For large graphs (> 200 nodes), uses Python Bareiss on the integer
-    Laplacian (slower but always exact).
+    Always uses exact integer arithmetic. Previously dispatched to
+    `nx.number_of_spanning_trees` (float64) for n < 20 nodes, but that
+    path loses precision on dense graphs (intermediate determinant
+    values overflow float53 even when the final integer fits) — see
+    `verify_spanning_trees` docstring for the audit that surfaced this.
+
+    For medium graphs (20-100 nodes), uses Python Bareiss algorithm on
+    the integer Laplacian. For larger graphs (> 100 nodes), uses
+    C-accelerated modular Gaussian elimination with CRT.
     """
     G = graph.to_networkx()
     try:
-        if graph.node_count() < 20:
-            return round(nx.number_of_spanning_trees(G))
         # Build integer Laplacian
         L = nx.laplacian_matrix(G).toarray()
         n = len(L)
+        if n <= 1:
+            return 1
         # Reduced Laplacian: delete first row and column
         M = [[int(L[i][j]) for j in range(1, n)] for i in range(1, n)]
         if n <= 100:

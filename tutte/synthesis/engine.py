@@ -40,7 +40,12 @@ from ..graphs.covering import (Cover, Fringe, InterCellInfo,
                                try_hierarchical_partition)
 from ..graphs.series_parallel import compute_sp_tutte_if_applicable
 from ..cotree_dp import compute_tutte_cotree_dp, compute_tutte_almost_cograph
-from ..roots import compute_cell_quotient_cycle_dp
+from ..roots import (
+    compute_cell_quotient_cycle_dp,
+    compute_cell_quotient_grid_dp_streamed,
+    compute_cell_quotient_tree_dp,
+)
+from ..roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
 from ..logs import EventType, LogLevel, get_log
 from ..lookup.core import MinorEntry, RainbowTable, load_default_table
 from ..polynomial import TuttePolynomial
@@ -554,6 +559,35 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             self._promote_to_table(graph, cache_key, result)
             return result
 
+        # 7.45 Cell-quotient grid DP (Phase B Round 6 streamed). For
+        # cell-decomposable graphs whose cell-quotient is a 2D grid of
+        # K_{a,b}-style cells connected by M_k matchings with disjoint
+        # per-direction anchors (Cm2-style — Cm3 has shared anchors and
+        # is rejected by precondition). Beats the §7.5 formula
+        # short-circuit on Cm2 (~36 s vs ~55 s, 1.5×). Returns None
+        # on any precondition mismatch so the engine falls through.
+        # Same edge_count >= 60 gate as the other hierarchical paths.
+        if graph.edge_count() >= 60:
+            try:
+                grid_streamed_poly = compute_cell_quotient_grid_dp_streamed(
+                    graph, self.table,
+                )
+                if grid_streamed_poly is not None:
+                    _log.record(EventType.CELL_QUOTIENT_DP, "engine",
+                                f"Grid DP (streamed): {n}n {m}e", graph=graph)
+                    self._log(f"Cell-quotient grid DP (streamed): {n}n, {m}e")
+                    result = SynthesisResult(
+                        polynomial=grid_streamed_poly,
+                        recipe=["Cell-quotient grid DP (streamed)"],
+                        verified=True,
+                        method="cell_quotient_grid_dp_streamed",
+                    )
+                    self._cache[cache_key] = result
+                    self._promote_to_table(graph, cache_key, result)
+                    return result
+            except Exception:
+                pass  # any failure — fall through
+
         # 7.5 Hierarchical-formula short-circuit (Phase 12 unified +
         # Phase 13 k-matching). When the graph has a detectable cell
         # decomposition AND its inter-cell structure satisfies the
@@ -656,6 +690,59 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                         recipe=["Cell-quotient cycle DP"],
                         verified=True,
                         method="cell_quotient_dp",
+                    )
+                    self._cache[cache_key] = result
+                    self._promote_to_table(graph, cache_key, result)
+                    return result
+            except Exception:
+                pass  # any failure — fall through
+
+        # 7.8. Cell-quotient TREE DP — for cell-decomposable graphs whose
+        # cell-quotient is a TREE (n cells, n-1 junctions, no cycles).
+        # Generalizes the path/cycle DPs to arbitrary tree topologies.
+        # Combined-aut path inside compute_tree_dp_recursive handles
+        # keep_shared / fully-consumed cases (see
+        # tutte/research/data/combined_aut_findings.md).
+        if graph.edge_count() >= 60:
+            try:
+                tree_poly = compute_cell_quotient_tree_dp(graph, self.table)
+                if tree_poly is not None:
+                    _log.record(EventType.CELL_QUOTIENT_DP, "engine",
+                                f"Cell-quotient tree DP: {n}n {m}e",
+                                graph=graph)
+                    self._log(f"Cell-quotient tree DP: {n}n, {m}e")
+                    result = SynthesisResult(
+                        polynomial=tree_poly,
+                        recipe=["Cell-quotient tree DP"],
+                        verified=True,
+                        method="cell_quotient_tree_dp",
+                    )
+                    self._cache[cache_key] = result
+                    self._promote_to_table(graph, cache_key, result)
+                    return result
+            except Exception:
+                pass  # any failure — fall through
+
+        # 7.85. Cell-quotient HYBRID DP — chord-rule cycle-close + per-leaf
+        # synth for cyclic cell-quotients (e.g., D-Wave Cm₃'s 3×3 grid).
+        # Recursively peels closing junctions; each leaf is synthesized
+        # via the engine's standard pipeline. Self-loop-aware contraction
+        # ensures correct y-factor accounting for parallel-edge leaves.
+        if graph.edge_count() >= 60:
+            try:
+                hybrid_poly = compute_cell_quotient_hybrid(
+                    graph, self.table,
+                )
+                if hybrid_poly is not None:
+                    _log.record(EventType.CELL_QUOTIENT_DP, "engine",
+                                f"Cell-quotient hybrid DP: {n}n {m}e",
+                                graph=graph)
+                    self._log(f"Cell-quotient hybrid DP: {n}n, {m}e")
+                    result = SynthesisResult(
+                        polynomial=hybrid_poly,
+                        recipe=["Cell-quotient hybrid (cycle-close + per-leaf synth)"],
+                        verified=True,
+                        method="cell_quotient_hybrid_dp",
                     )
                     self._cache[cache_key] = result
                     self._promote_to_table(graph, cache_key, result)
@@ -909,13 +996,16 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                         if edge not in graph.edges:
                             missing += 1
 
-                if missing == 0:
-                    # All clique edges present → graph has a clique separator.
-                    # This is a cut-vertex generalization; handle via
-                    # split at clique separator (simpler than k-sum).
-                    # Skip for now — cut vertex path already handles k=1.
-                    continue
-
+                # Accept any separator, including full-clique (missing == 0).
+                # `_apply_ksum` handles missing == 0 by peeling the EXISTING
+                # K_k clique edges via the chord rule (the symmetric case of
+                # adding back missing edges) — same C(k, 2) cost.
+                # NOTE: prior to May 2026, missing == 0 was skipped under the
+                # comment "cut vertex path already handles k=1", but the cut-
+                # vertex path only handles k=1; missing == 0 separators for
+                # k ≥ 2 were silently dropped, blocking the chord rule on
+                # graphs with full clique separators (e.g., router-style
+                # synthetics). See research/audit_chord_rule_findings.md.
                 if best is None or missing < best_missing:
                     best = combo
                     best_missing = missing
@@ -1050,34 +1140,57 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             self._log(f"Found {k}-vertex separator: {separator} "
                       f"({num_missing}/{len(all_clique_edges)} clique edges missing)")
 
-            # Build PC graph by adding missing clique edges
-            pc_edges = graph.edges | frozenset(missing_edges)
-            pc_graph = Graph(nodes=graph.nodes, edges=pc_edges)
-
-            # Apply iterative chord rule to the missing clique edges
-            # (replaces Theorem 10 — see chord_rule.py and docs/07_*.md). Cost
-            # is 1 + num_missing full syntheses, no matroid theory.
-            from ..graphs.k_sum import clique_chord_k_sum
-            poly = clique_chord_k_sum(
-                graph, separator, k, self,
-                missing_edges=missing_edges,
-            )
+            if num_missing > 0:
+                # Standard "true k-sum" path: graph has SOME clique edges
+                # missing. Build PC by adding missing edges back, then peel
+                # them off via chord rule.
+                from ..graphs.k_sum import clique_chord_k_sum
+                poly = clique_chord_k_sum(
+                    graph, separator, k, self,
+                    missing_edges=missing_edges,
+                )
+                method_label = f"{k}sum_chord_rule"
+            else:
+                # Full clique separator: graph has ALL K_k clique edges. Symmetric
+                # case — use the chord rule to PEEL the existing clique edges off
+                # `graph`, getting a chord-free leaf with no shared edges between
+                # cells, then combine via _combine_chord_iteration. Cost: same
+                # 1 + C(k, 2) syntheses as the chord rule for missing > 0.
+                #
+                # T(graph) = (∏ factors) · T(graph − all clique) + Σ prefix·adds
+                #
+                # The chord-free leaf (graph − all clique edges) IS the true
+                # k-sum target where the cells share only the k separator
+                # vertices (no shared edges). Synthesizing it terminates via the
+                # standard pipeline (it has no full-clique separator anymore;
+                # the separator's clique edges are gone).
+                from ..graphs.k_sum import (
+                    _combine_chord_iteration,
+                    _iterative_chord_rule,
+                )
+                smart_order = getattr(self, "chord_smart_order", False)
+                g_chord_free, factors, adds = _iterative_chord_rule(
+                    graph, all_clique_edges, self, smart_order=smart_order,
+                )
+                t_chord_free = self.synthesize(g_chord_free).polynomial
+                poly = _combine_chord_iteration(t_chord_free, factors, adds)
+                method_label = f"{k}sum_full_clique_chord_peel"
 
             if poly is None:
                 return None
 
             # Verify
             if verify_spanning_trees(graph, poly):
-                self._log(f"{k}-vertex separator decomposition via Theorem 10 verified!")
+                self._log(f"{k}-vertex separator decomposition verified! ({method_label})")
                 return SynthesisResult(
                     polynomial=poly,
                     recipe=[f"{k}-vertex separator at {separator} "
                             f"({num_missing} missing)", f"T = {poly}"],
                     verified=True,
-                    method=f"{k}sum_theorem10",
+                    method=method_label,
                 )
             else:
-                self._log(f"{k}-vertex separator Theorem 10 failed Kirchhoff")
+                self._log(f"{k}-vertex separator decomposition failed Kirchhoff ({method_label})")
                 return None
 
         except (KeyError, IndexError) as e:
