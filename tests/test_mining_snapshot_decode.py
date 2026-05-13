@@ -10,7 +10,9 @@ data; this test exists so the decoder is locked down before then.
 """
 from __future__ import annotations
 
-from shared.substrate_client import SubstrateClient
+import pytest
+
+from shared.substrate_client import _decode_mining_snapshot
 from shared.substrate_types import SubstrateDifficulty
 
 
@@ -59,8 +61,7 @@ def _build_snapshot_hex(
 
 
 def test_decode_none():
-    client = SubstrateClient.__new__(SubstrateClient)  # bypass __init__
-    assert client._decode_mining_snapshot("0x00") is None
+    assert _decode_mining_snapshot("0x00") is None
 
 
 def test_decode_populated():
@@ -83,8 +84,7 @@ def test_decode_populated():
         edges=edges,
     )
 
-    client = SubstrateClient.__new__(SubstrateClient)
-    decoded = client._decode_mining_snapshot(encoded)
+    decoded = _decode_mining_snapshot(encoded)
 
     assert decoded is not None
     assert decoded["block_number"] == 42
@@ -109,11 +109,28 @@ def test_decode_zephyr_sized_graph():
         edges=edges,
     )
 
-    client = SubstrateClient.__new__(SubstrateClient)
-    decoded = client._decode_mining_snapshot(encoded)
+    decoded = _decode_mining_snapshot(encoded)
 
     assert decoded is not None
     assert len(decoded["nodes"]) == 1368
     assert len(decoded["edges"]) == 1367
     assert decoded["nodes"][-1] == 1367
     assert decoded["edges"][-1] == (1366, 1367)
+
+
+def test_decode_rejects_trailing_bytes():
+    """A trailing byte after a valid Option::None tag must fail loud — a
+    future runtime upgrade that appends a field would otherwise be silently
+    dropped."""
+    with pytest.raises(ValueError, match="trailing bytes"):
+        _decode_mining_snapshot("0x00ff")
+
+
+def test_decode_field_error_includes_field_name():
+    """Truncating mid-decode reports the failing field, not a generic
+    decoding error."""
+    # Option::Some tag, valid block_number, then ran out of bytes for
+    # parent_hash. Error message should name the failing field.
+    truncated = "0x01" + (5).to_bytes(4, "little").hex() + "ab" * 10
+    with pytest.raises(ValueError, match="parent_hash"):
+        _decode_mining_snapshot(truncated)

@@ -12,6 +12,7 @@ without the Rust repo checked out alongside this one can still run the suite.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -20,36 +21,45 @@ from shared.quantum_proof_of_work import derive_nonce
 
 
 def _fixture_path() -> Path | None:
-    """Search a few well-known locations for the parity fixture."""
-    candidates = [
-        # Sibling checkout (default dev layout).
+    """Search a few well-known locations for the parity fixture.
+
+    Set ``QUIP_RUST_FIXTURE_DIR`` to point at the directory containing
+    ``python_parity.json``. If the env var is set but the file isn't there,
+    we ``pytest.fail`` — silently ignoring an explicit override would let a
+    misconfigured CI mask a real parity break.
+    """
+    env_override = os.environ.get("QUIP_RUST_FIXTURE_DIR")
+    if env_override:
+        override_path = Path(env_override) / "python_parity.json"
+        if not override_path.exists():
+            pytest.fail(
+                f"QUIP_RUST_FIXTURE_DIR={env_override!r} does not contain "
+                "python_parity.json"
+            )
+        return override_path
+
+    sibling = (
         Path(__file__).parent.parent.parent
         / "quip-protocol-rs"
         / "crates"
         / "quantum-validation"
         / "tests"
         / "fixtures"
-        / "python_parity.json",
-        # Override via env var when the sibling is somewhere else.
-    ]
-    import os
-
-    env_override = os.environ.get("QUIP_RUST_FIXTURE_DIR")
-    if env_override:
-        candidates.insert(0, Path(env_override) / "python_parity.json")
-
-    for path in candidates:
-        if path.exists():
-            return path
-    return None
+        / "python_parity.json"
+    )
+    return sibling if sibling.exists() else None
 
 
 def _load_cases():
     path = _fixture_path()
     if path is None:
+        # `allow_module_level=True` so this skips cleanly when called from
+        # the parametrize decorator at collection time. Without it pytest
+        # surfaces a collection error rather than a skip.
         pytest.skip(
-            "Rust parity fixture not found. Check out quip-protocol-rs alongside "
-            "this repo or set QUIP_RUST_FIXTURE_DIR=/path/to/fixtures."
+            "Rust parity fixture not found. Check out quip-protocol-rs "
+            "alongside this repo or set QUIP_RUST_FIXTURE_DIR=/path/to/fixtures.",
+            allow_module_level=True,
         )
     return json.loads(path.read_text())["derive_nonce_cases"]
 

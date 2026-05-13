@@ -31,7 +31,7 @@ from scalecodec.types import GenericExtrinsic
 from substrateinterface import SubstrateInterface
 
 from shared.logging_config import get_logger
-from shared.signer import Signer, Sr25519Signer
+from shared.signer import Signer
 from shared.substrate_types import (
     ExtrinsicReceipt,
     MinerInfo,
@@ -83,16 +83,7 @@ class SubstrateClient:
             return
         iface = self._iface
         self._iface = None
-
-        def _close() -> None:
-            try:
-                iface.close()
-            except AttributeError:
-                # Older substrate-interface versions don't expose close(); the
-                # underlying websocket closes when the object is gc'd.
-                pass
-
-        await self._run(_close)
+        await self._run(iface.close)
 
     # ------------------------------------------------------------------
     # Chain head queries
@@ -108,7 +99,9 @@ class SubstrateClient:
     async def get_block_number(self, at: Optional[bytes] = None) -> int:
         block_hash = _hex(at) if at is not None else None
         header = await self._run(lambda: self._iface.get_block_header(block_hash=block_hash))
-        return int(header["header"]["number"])
+        # Some substrate-interface builds surface `number` as a hex string,
+        # others as an int — accept either.
+        return _coerce_block_number(header["header"]["number"])
 
     # ------------------------------------------------------------------
     # Runtime API: mining snapshot
@@ -116,9 +109,10 @@ class SubstrateClient:
 
     async def get_mining_snapshot(
         self,
+        *,
+        miner_account_bytes: bytes,
         at: Optional[bytes] = None,
         topology_hash: Optional[bytes] = None,
-        miner_account_bytes: Optional[bytes] = None,
     ) -> Optional[SubstrateMiningContext]:
         """Call `QuantumPowApi_mining_snapshot` at the given block hash.
 
@@ -128,9 +122,15 @@ class SubstrateClient:
 
         `miner_account_bytes` is the 32-byte AccountId of the signer; the
         snapshot itself doesn't include this but `SubstrateMiningContext`
-        does. Callers pass it through so the resulting context is
-        self-sufficient.
+        does. Required so the returned context is self-sufficient and so a
+        missing signer fails fast rather than silently mining under a
+        fabricated zero account.
         """
+        if len(miner_account_bytes) != 32:
+            raise ValueError(
+                "miner_account_bytes must be the 32-byte SCALE AccountId32, got "
+                f"{len(miner_account_bytes)}"
+            )
         block_hash = _hex(at) if at is not None else None
         # Encode the parameter: Option<H256>.
         if topology_hash is None:
@@ -148,17 +148,19 @@ class SubstrateClient:
                 ["QuantumPowApi_mining_snapshot", scale_param, block_hash],
             )
         )
+        # Distinguish RPC-level errors (transport, bad method, bad params)
+        # from `Option::None` ("no topology registered yet"). Both used to
+        # look like `result is None`, which silently swallowed real failures.
+        if "error" in raw:
+            raise RuntimeError(
+                f"state_call mining_snapshot rpc error: {raw['error']}"
+            )
         encoded = raw.get("result")
         if encoded is None:
             return None
-        decoded = self._decode_mining_snapshot(encoded)
+        decoded = _decode_mining_snapshot(encoded)
         if decoded is None:
             return None
-        if miner_account_bytes is None:
-            # Caller must provide this for the context to be useful — but we
-            # accept None and return a context with an empty account to make
-            # debugging easier. The controller will reject this in practice.
-            miner_account_bytes = b"\x00" * 32
         return SubstrateMiningContext(
             block_number=decoded["block_number"],
             parent_hash=decoded["parent_hash"],
@@ -168,49 +170,6 @@ class SubstrateClient:
             difficulty=decoded["difficulty"],
             miner_account_bytes=miner_account_bytes,
         )
-
-    def _decode_mining_snapshot(self, encoded_hex: str) -> Optional[dict]:
-        """Decode SCALE `Option<MiningSnapshot<BlockNumber, Hash, Nodes, Edges>>`.
-
-        Layout:
-          - 1 byte option tag (0x00 = None, 0x01 = Some)
-          - block_number: u32 (BlockNumber on this chain)
-          - parent_hash: H256 (32 bytes)
-          - difficulty: DifficultyConfig {min_solutions: u32,
-                max_energy_milli: i64, min_diversity_milli: u32,
-                min_quality_milli: u32}
-          - topology_hash: H256 (32 bytes)
-          - nodes: Vec<u32>
-          - edges: Vec<(u32, u32)>
-        """
-        data = ScaleBytes(encoded_hex)
-        tag = data.get_next_bytes(1)
-        if tag == b"\x00":
-            return None
-        block_number = _decode_u32(data)
-        parent_hash = bytes(data.get_next_bytes(32))
-        min_solutions = _decode_u32(data)
-        max_energy_milli = _decode_i64(data)
-        min_diversity_milli = _decode_u32(data)
-        min_quality_milli = _decode_u32(data)
-        topology_hash = bytes(data.get_next_bytes(32))
-        nodes_len = _decode_compact_u32(data)
-        nodes = [_decode_u32(data) for _ in range(nodes_len)]
-        edges_len = _decode_compact_u32(data)
-        edges = [(_decode_u32(data), _decode_u32(data)) for _ in range(edges_len)]
-        return {
-            "block_number": block_number,
-            "parent_hash": parent_hash,
-            "difficulty": SubstrateDifficulty(
-                min_solutions=min_solutions,
-                max_energy_milli=max_energy_milli,
-                min_diversity_milli=min_diversity_milli,
-                min_quality_milli=min_quality_milli,
-            ),
-            "topology_hash": topology_hash,
-            "nodes": nodes,
-            "edges": edges,
-        }
 
     # ------------------------------------------------------------------
     # Storage queries
@@ -282,7 +241,7 @@ class SubstrateClient:
                 "lands in Phase 7 (hybrid sig support)"
             )
 
-        def _build_and_submit() -> dict:
+        def _build_and_submit() -> Any:
             call = self._iface.compose_call(
                 call_module=call_module,
                 call_function=call_function,
@@ -312,27 +271,39 @@ class SubstrateClient:
         """Block until cancelled, invoking `callback(block_hash, block_number)`
         on every new head.
 
-        Each invocation of `callback` is scheduled on the event loop via
-        `loop.call_soon_threadsafe` to keep the user-supplied coroutine off
-        the substrate-interface worker thread.
+        ``substrate-interface`` invokes the subscription callback on its
+        websocket reader thread. We do **not** make synchronous RPC calls
+        from that thread (that would deadlock the reader waiting on its own
+        response). Instead, the block-hash lookup and the user coroutine are
+        both scheduled on the asyncio loop via ``run_coroutine_threadsafe``,
+        where ``_run`` puts the blocking RPC on the executor.
         """
         loop = asyncio.get_running_loop()
 
-        def _dispatch(header: dict, update_nr: int, subscription_id: str):  # noqa: ARG001
-            raw_number = header.get("number")
-            if isinstance(raw_number, str):
-                number = int(raw_number, 16) if raw_number.startswith("0x") else int(raw_number)
-            else:
-                number = int(raw_number)
-            # substrate-interface's block-header subscription delivers parent
-            # + state roots but not the new block's hash. Resolve it via a
-            # follow-up RPC; the work is dominated by the subsequent snapshot
-            # fetch, so the extra round trip is not a concern.
-            block_hash_hex = self._iface.get_block_hash(block_id=number)
-            block_hash_bytes = bytes.fromhex(_strip_0x(block_hash_hex))
-            asyncio.run_coroutine_threadsafe(
-                callback(block_hash_bytes, number), loop
+        async def _handle_head(number: int) -> None:
+            block_hash_hex = await self._run(
+                lambda: self._iface.get_block_hash(block_id=number)
             )
+            block_hash_bytes = bytes.fromhex(_strip_0x(block_hash_hex))
+            await callback(block_hash_bytes, number)
+
+        def _dispatch(header: dict, update_nr: int, subscription_id: str):  # noqa: ARG001
+            # substrate-interface delivers either the bare header or wraps
+            # it in `{"header": {...}}` depending on the call path — accept
+            # both. Exceptions inside the callback are silently swallowed by
+            # the reader thread otherwise, so wrap with a log.
+            try:
+                inner = header.get("header", header)
+                number = _coerce_block_number(inner.get("number"))
+                future = asyncio.run_coroutine_threadsafe(
+                    _handle_head(number), loop
+                )
+                future.add_done_callback(_log_dispatch_exception)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "subscribe_new_heads dispatch failed at update_nr=%s: %s",
+                    update_nr, exc,
+                )
 
         await self._run(
             lambda: self._iface.subscribe_block_headers(
@@ -363,12 +334,30 @@ def _hex(b: bytes) -> str:
     return "0x" + b.hex()
 
 
+def _read_exact(data: ScaleBytes, n: int) -> bytes:
+    """Read `n` bytes from the SCALE buffer, raising on short reads.
+
+    ``ScaleBytes.get_next_bytes`` silently returns a partial slice when the
+    underlying buffer is exhausted (and bumps the offset past the end), so
+    every subsequent read sees an empty slice. The downstream effect is
+    that decode errors surface several fields *after* the actual
+    truncation. Surfacing the short read at the field where it happened
+    makes error messages diagnostic instead of misleading.
+    """
+    chunk = data.get_next_bytes(n)
+    if len(chunk) != n:
+        raise ValueError(
+            f"short read: wanted {n} bytes, got {len(chunk)}"
+        )
+    return bytes(chunk)
+
+
 def _decode_u32(data: ScaleBytes) -> int:
-    return int.from_bytes(data.get_next_bytes(4), "little")
+    return int.from_bytes(_read_exact(data, 4), "little")
 
 
 def _decode_i64(data: ScaleBytes) -> int:
-    return int.from_bytes(data.get_next_bytes(8), "little", signed=True)
+    return int.from_bytes(_read_exact(data, 8), "little", signed=True)
 
 
 def _decode_compact_u32(data: ScaleBytes) -> int:
@@ -378,36 +367,146 @@ def _decode_compact_u32(data: ScaleBytes) -> int:
       0b00 → single-byte (value in upper 6 bits)
       0b01 → two-byte
       0b10 → four-byte
-      0b11 → big-integer (followed by `((first >> 2) + 4)` little-endian bytes)
+      0b11 → big-integer mode (rejected here: u32 length prefixes never need
+             more than 4 bytes, and a malformed/malicious payload claiming
+             mode 0b11 could otherwise drive an OOM allocation downstream).
     """
-    first = data.get_next_bytes(1)[0]
+    first = _read_exact(data, 1)[0]
     mode = first & 0b11
     if mode == 0:
         return first >> 2
     if mode == 1:
-        return ((first >> 2) | (data.get_next_bytes(1)[0] << 6))
+        return ((first >> 2) | (_read_exact(data, 1)[0] << 6))
     if mode == 2:
-        rest = data.get_next_bytes(3)
+        rest = _read_exact(data, 3)
         return (first >> 2) | (rest[0] << 6) | (rest[1] << 14) | (rest[2] << 22)
-    n_bytes = (first >> 2) + 4
-    return int.from_bytes(data.get_next_bytes(n_bytes), "little")
+    raise ValueError("compact big-integer mode not valid for u32 length prefix")
+
+
+def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
+    """Decode SCALE `Option<MiningSnapshot<BlockNumber, Hash, Nodes, Edges>>`.
+
+    Layout:
+      - 1 byte option tag (0x00 = None, 0x01 = Some)
+      - block_number: u32 (BlockNumber on this chain)
+      - parent_hash: H256 (32 bytes)
+      - difficulty: DifficultyConfig {min_solutions: u32,
+            max_energy_milli: i64, min_diversity_milli: u32,
+            min_quality_milli: u32}
+      - topology_hash: H256 (32 bytes)
+      - nodes: Vec<u32>
+      - edges: Vec<(u32, u32)>
+
+    Decode failures are re-raised with the failing field name so a runtime
+    API shape change (or truncated transport) lands a usable error. Trailing
+    bytes raise — a future runtime upgrade that appends a field would
+    otherwise silently drop it.
+    """
+    data = ScaleBytes(encoded_hex)
+    try:
+        tag = _read_exact(data, 1)
+        if tag[0] == 0:
+            if data.get_remaining_length() != 0:
+                raise ValueError(
+                    f"trailing bytes after Option::None tag: "
+                    f"{data.get_remaining_length()} bytes"
+                )
+            return None
+        block_number = _decode_field("block_number", data, _decode_u32)
+        parent_hash = _decode_field("parent_hash", data, lambda d: _read_exact(d, 32))
+        min_solutions = _decode_field("min_solutions", data, _decode_u32)
+        max_energy_milli = _decode_field("max_energy_milli", data, _decode_i64)
+        min_diversity_milli = _decode_field("min_diversity_milli", data, _decode_u32)
+        min_quality_milli = _decode_field("min_quality_milli", data, _decode_u32)
+        topology_hash = _decode_field("topology_hash", data, lambda d: _read_exact(d, 32))
+        nodes_len = _decode_field("nodes_len", data, _decode_compact_u32)
+        nodes = [_decode_field("nodes[%d]" % i, data, _decode_u32)
+                 for i in range(nodes_len)]
+        edges_len = _decode_field("edges_len", data, _decode_compact_u32)
+        edges = [
+            (
+                _decode_field("edges[%d].0" % i, data, _decode_u32),
+                _decode_field("edges[%d].1" % i, data, _decode_u32),
+            )
+            for i in range(edges_len)
+        ]
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — rewrap with context
+        raise ValueError(f"failed to decode mining snapshot: {exc}") from exc
+
+    if data.get_remaining_length() != 0:
+        raise ValueError(
+            f"trailing bytes after mining snapshot decode: "
+            f"{data.get_remaining_length()} bytes; runtime API shape likely "
+            "changed"
+        )
+    return {
+        "block_number": block_number,
+        "parent_hash": parent_hash,
+        "difficulty": SubstrateDifficulty(
+            min_solutions=min_solutions,
+            max_energy_milli=max_energy_milli,
+            min_diversity_milli=min_diversity_milli,
+            min_quality_milli=min_quality_milli,
+        ),
+        "topology_hash": topology_hash,
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
+def _decode_field(name: str, data: ScaleBytes, fn: Callable[[ScaleBytes], Any]) -> Any:
+    """Run a decoder, re-raising with the failing field name on error."""
+    try:
+        return fn(data)
+    except Exception as exc:  # noqa: BLE001 — rewrap with context
+        raise ValueError(f"failed to decode field {name!r}: {exc}") from exc
+
+
+def _coerce_block_number(raw: Any) -> int:
+    """Accept the `header.number` field as int or hex string."""
+    if isinstance(raw, str):
+        return int(raw, 16) if raw.startswith("0x") else int(raw)
+    if raw is None:
+        raise ValueError("header missing 'number' field")
+    return int(raw)
 
 
 def _coerce_receipt(receipt: Any) -> ExtrinsicReceipt:
-    """Convert a substrate-interface ExtrinsicReceipt to our typed wrapper."""
-    is_error = getattr(receipt, "is_success", None)
+    """Convert a substrate-interface ExtrinsicReceipt to our typed wrapper.
+
+    Fails loud if the receipt does not advertise success/failure: a missing
+    ``is_success`` attribute used to fall through to "success" which masked
+    submission failures from callers that classify by ``receipt.error``.
+    """
+    is_success = getattr(receipt, "is_success", None)
+    if is_success is None:
+        raise RuntimeError(
+            "substrate-interface receipt is missing `is_success`; cannot "
+            "classify outcome (receipt_type=%s)" % type(receipt).__name__
+        )
     error_msg: Optional[str] = None
-    if is_error is False:
+    if is_success is False:
         try:
             error_msg = str(receipt.error_message)
         except AttributeError:
-            error_msg = "unknown error"
+            # Receipt advertised failure but provided no error_message —
+            # surface a grep-able sentinel so callers don't conflate it with
+            # legitimate error strings.
+            error_msg = "substrate-interface receipt missing error_message"
+            logger.error(
+                "extrinsic failed but receipt has no error_message: %s",
+                type(receipt).__name__,
+            )
     events: list = []
     try:
         for ev in receipt.triggered_events or []:
             events.append(ev.value if hasattr(ev, "value") else dict(ev))
-    except (AttributeError, TypeError):
-        pass
+    except (AttributeError, TypeError) as exc:
+        # Don't silently swallow — empty events combined with no error would
+        # look like a successful submission that produced no side effects.
+        logger.warning("failed to decode triggered_events: %s", exc)
     return ExtrinsicReceipt(
         extrinsic_hash=str(getattr(receipt, "extrinsic_hash", "")),
         block_hash=str(getattr(receipt, "block_hash", "") or "") or None,
@@ -417,8 +516,19 @@ def _coerce_receipt(receipt: Any) -> ExtrinsicReceipt:
     )
 
 
+def _log_dispatch_exception(future: Any) -> None:
+    """Log exceptions raised by `subscribe_new_heads` dispatch coroutines.
+
+    Without this hook, exceptions become unretrieved-future warnings at
+    interpreter shutdown — the subscription appears to silently stop.
+    """
+    try:
+        future.result()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("subscribe_new_heads callback raised: %s", exc)
+
+
 __all__ = [
     "SubstrateClient",
     "WaitFor",
-    "Sr25519Signer",
 ]
