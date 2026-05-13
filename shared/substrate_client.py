@@ -250,6 +250,135 @@ class SubstrateClient:
         return int(result.value["data"]["free"])
 
     # ------------------------------------------------------------------
+    # QuantumComputeMempool storage queries
+    # ------------------------------------------------------------------
+
+    async def query_solver(self, account: bytes):
+        """Return `QuantumComputeMempool.Solvers[account]`, or None.
+
+        Late-imports `MempoolSolverInfo` / `MinerType` so the type module
+        only loads when callers actually touch mempool state.
+        """
+        from shared.mempool_types import MempoolSolverInfo, MinerType
+
+        if len(account) != 32:
+            raise ValueError(f"account must be 32 bytes, got {len(account)}")
+        result = await self._run(
+            lambda: self._iface.query(
+                "QuantumComputeMempool", "Solvers", [account]
+            )
+        )
+        if result is None or result.value is None:
+            return None
+        v = result.value
+        return MempoolSolverInfo(
+            account=_decode_account_id(v["account"]),
+            solver_type=MinerType.from_scale_variant(str(v["solver_type"])),
+            registered_at=int(v["registered_at"]),
+            solutions_submitted=int(v["solutions_submitted"]),
+            rewards_earned=int(v["rewards_earned"]),
+        )
+
+    async def query_job_order(self, order_id: int):
+        """Return `QuantumComputeMempool.JobOrders[order_id]`, or None.
+
+        The decoded `JobOrder` carries the full ising problem definition
+        (nodes, edges, h_values, j_values) plus quality floors, reward,
+        mode, and lifecycle status — enough to drive `mine_work_item`
+        without a follow-on query.
+        """
+        from shared.mempool_types import (
+            IsingParams,
+            JobMode,
+            JobOrder,
+            MinerType,
+            OrderStatus,
+            OrderTiming,
+            ResultDelivery,
+            RewardResolution,
+        )
+
+        result = await self._run(
+            lambda: self._iface.query(
+                "QuantumComputeMempool", "JobOrders", [order_id]
+            )
+        )
+        if result is None or result.value is None:
+            return None
+        v = result.value
+
+        # The decoded value tree mixes raw bytes (e.g. spec_id), hex strings,
+        # ints, dicts (for IsingParams), and strings (for OrderStatus + the
+        # JobMode/ResultDelivery/RewardResolution tagged enums).
+        ising = IsingParams.from_scale_value(v["ising_params"])
+        mode = _decode_job_mode(v["mode"])
+        resolution = RewardResolution.from_scale_value(v["resolution"])
+        delivery = _decode_result_delivery(v["delivery"])
+        status = OrderStatus.from_scale_variant(str(v["status"]))
+        timing = OrderTiming(
+            deadline_blocks=int(v["timing"]["deadline_blocks"]),
+            block_wait=int(v["timing"]["block_wait"]),
+        )
+
+        return JobOrder(
+            spec_id=_decode_hash(v["spec_id"]),
+            proposer=_decode_account_id(v["proposer"]),
+            ising_params=ising,
+            reward=int(v["reward"]),
+            mode=mode,
+            resolution=resolution,
+            timing=timing,
+            delivery=delivery,
+            status=status,
+            created_at=int(v["created_at"]),
+            first_solution_at=(
+                int(v["first_solution_at"])
+                if v.get("first_solution_at") is not None
+                else None
+            ),
+            solution_count=int(v["solution_count"]),
+        )
+
+    # ------------------------------------------------------------------
+    # System events
+    # ------------------------------------------------------------------
+
+    async def get_events_at(self, block_hash: bytes) -> list[dict]:
+        """Decode `System.Events` storage at the given block.
+
+        Returns a list of event dicts shaped as
+        `{"module_id": str, "event_id": str, "attributes": dict | list}`.
+        Mempool-side callers filter on `module_id == "QuantumComputeMempool"`
+        and dispatch by `event_id`.
+
+        substrate-interface's `get_events` does the SCALE decode for us;
+        we coerce the iterable to plain Python dicts so the caller doesn't
+        have to deal with ScaleType wrappers.
+        """
+        if len(block_hash) != 32:
+            raise ValueError(f"block_hash must be 32 bytes, got {len(block_hash)}")
+        raw = await self._run(
+            lambda: self._iface.get_events(block_hash="0x" + block_hash.hex())
+        )
+        out: list[dict] = []
+        for er in raw or []:
+            value = getattr(er, "value", er)
+            event_field = value.get("event", value) if isinstance(value, dict) else value
+            if not isinstance(event_field, dict):
+                continue
+            module_id = event_field.get("module_id") or event_field.get("event_module")
+            event_id = event_field.get("event_id") or event_field.get("event_name")
+            attrs = event_field.get("attributes")
+            if attrs is None:
+                attrs = event_field.get("event", {}).get("attributes")
+            out.append({
+                "module_id": str(module_id) if module_id is not None else "",
+                "event_id": str(event_id) if event_id is not None else "",
+                "attributes": attrs,
+            })
+        return out
+
+    # ------------------------------------------------------------------
     # Extrinsic submission
     # ------------------------------------------------------------------
 
@@ -491,6 +620,87 @@ class SubstrateClient:
 
 def _strip_0x(s: str) -> str:
     return s[2:] if s.startswith("0x") else s
+
+
+def _decode_hash(value) -> bytes:
+    """Decode a substrate Hash storage field to 32 raw bytes."""
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return bytes.fromhex(_strip_0x(value))
+    raise ValueError(f"unrecognized Hash shape: {value!r}")
+
+
+def _decode_account_id(value) -> bytes:
+    """Decode an `AccountId32` storage field to 32 raw bytes.
+
+    substrate-interface may surface accounts as raw bytes, hex strings, or
+    SS58 strings depending on the field's typedef. We canonicalize to raw
+    bytes so callers compare with `signer.account_id_bytes()` cleanly.
+    """
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        if value.startswith("0x"):
+            return bytes.fromhex(value[2:])
+        # SS58 — decode via scalecodec's helper.
+        from scalecodec.utils.ss58 import ss58_decode
+        return bytes.fromhex(ss58_decode(value))
+    raise ValueError(f"unrecognized AccountId shape: {value!r}")
+
+
+def _decode_job_mode(value):
+    """Decode a `JobMode` tagged-enum storage value."""
+    from shared.mempool_types import JobMode, MinerType
+
+    if isinstance(value, str):
+        # Bare-string SCALE encoding for the no-field variant.
+        if value == "Open":
+            return JobMode.open()
+        raise ValueError(f"unrecognized JobMode variant: {value!r}")
+    if isinstance(value, dict) and len(value) == 1:
+        (tag, inner), = value.items()
+        if tag == "Open":
+            return JobMode.open()
+        if tag == "Bid":
+            miners_raw = inner.get("miners") if isinstance(inner, dict) else None
+            types_raw = inner.get("miner_types") if isinstance(inner, dict) else None
+            miners = (
+                tuple(_decode_account_id(a) for a in miners_raw)
+                if miners_raw is not None
+                else None
+            )
+            mtypes = (
+                tuple(MinerType.from_scale_variant(str(mt)) for mt in types_raw)
+                if types_raw is not None
+                else None
+            )
+            return JobMode.bid(miners=miners, miner_types=mtypes)
+    raise ValueError(f"unrecognized JobMode shape: {value!r}")
+
+
+def _decode_result_delivery(value):
+    """Decode a `ResultDelivery` tagged-enum storage value."""
+    from shared.mempool_types import ResultDelivery
+
+    if isinstance(value, str):
+        if value == "OnChainOnly":
+            return ResultDelivery.on_chain_only()
+        raise ValueError(f"unrecognized ResultDelivery variant: {value!r}")
+    if isinstance(value, dict) and len(value) == 1:
+        (tag, inner), = value.items()
+        if tag == "OnChainOnly":
+            return ResultDelivery.on_chain_only()
+        endpoint = inner.get("endpoint") if isinstance(inner, dict) else inner
+        if isinstance(endpoint, str):
+            endpoint = bytes.fromhex(_strip_0x(endpoint))
+        elif isinstance(endpoint, list):
+            endpoint = bytes(endpoint)
+        if tag == "Callback":
+            return ResultDelivery.callback(endpoint)
+        if tag == "CallbackWithPoll":
+            return ResultDelivery.callback_with_poll(endpoint)
+    raise ValueError(f"unrecognized ResultDelivery shape: {value!r}")
 
 
 def _encode_compact_u32(n: int) -> bytes:

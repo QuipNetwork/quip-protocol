@@ -158,6 +158,148 @@ def quip_miner_bootstrap(
 # See faucet_bot.py for the full CLI surface.
 
 
+@quip_miner.command("register-solver")
+@click.option(
+    "--node-url",
+    required=True,
+    help="Substrate node WebSocket URL (e.g. ws://localhost:9944)",
+)
+@click.option(
+    "--signer-key",
+    "signer_key_path",
+    type=click.Path(dir_okay=False, exists=True),
+    required=True,
+    help="Path to the signing keystore (run `quip-miner keygen` first)",
+)
+@click.option(
+    "--miner-type",
+    type=click.Choice(
+        ["cpu", "gpu", "qpu", "qpu_ibm", "qpu_ionq", "qpu_pasqal", "asic"],
+        case_sensitive=False,
+    ),
+    required=True,
+    help="Solver hardware family to register under "
+    "(QuantumComputeMempool uses this for mode=Bid miner_type filtering). "
+    "Bare 'qpu' maps to QpuDwave to match the legacy CPU/GPU/QPU triplet.",
+)
+def quip_miner_register_solver(
+    node_url: str,
+    signer_key_path: str,
+    miner_type: str,
+) -> None:
+    """Register the keystore's account as a QuantumComputeMempool solver.
+
+    One-time setup (idempotent if already registered). The solver type is
+    surfaced to job proposers via `mode = Bid{miner_types: [...]}` filters.
+    Use `quip-miner deregister-solver` to opt out.
+    """
+    import asyncio
+    from pathlib import Path
+
+    from shared.keystore_hybrid import load
+    from shared.mempool_types import MinerType
+    from shared.substrate_client import SubstrateClient
+
+    keystore = load(Path(signer_key_path).expanduser())
+    mt = MinerType.from_kind(miner_type)
+
+    async def _do() -> int:
+        client = SubstrateClient(url=node_url)
+        await client.connect()
+        try:
+            existing = await client.query_solver(keystore.signer.account_id_bytes())
+            if existing is not None:
+                if existing.solver_type != mt:
+                    click.echo(
+                        f"solver already registered as {existing.solver_type.name}; "
+                        f"deregister first to change to {mt.name}",
+                        err=True,
+                    )
+                    return 4
+                click.echo(
+                    f"already registered as {mt.name} "
+                    f"(submitted={existing.solutions_submitted}, "
+                    f"earned={existing.rewards_earned} plancks)"
+                )
+                return 0
+
+            receipt = await client.submit_extrinsic(
+                "QuantumComputeMempool",
+                "register_solver",
+                {"solver_type": mt.to_scale_variant()},
+                keystore.signer,
+                wait_for="inblock",
+            )
+            if receipt.error:
+                click.echo(f"register_solver failed: {receipt.error}", err=True)
+                return 3
+            click.echo(
+                f"registered as {mt.name} "
+                f"(extrinsic={receipt.extrinsic_hash}, block={receipt.block_hash})"
+            )
+            return 0
+        finally:
+            await client.close()
+
+    raise SystemExit(asyncio.run(_do()))
+
+
+@quip_miner.command("deregister-solver")
+@click.option("--node-url", required=True, help="Substrate node WebSocket URL")
+@click.option(
+    "--signer-key",
+    "signer_key_path",
+    type=click.Path(dir_okay=False, exists=True),
+    required=True,
+    help="Path to the signing keystore",
+)
+def quip_miner_deregister_solver(node_url: str, signer_key_path: str) -> None:
+    """Deregister the keystore's solver from QuantumComputeMempool.
+
+    Idempotent against an unregistered account (returns 0 with a no-op
+    message). After deregistration, submit_solution / claim_reward
+    extrinsics will fail with `SolverNotRegistered` until you re-register.
+    """
+    import asyncio
+    from pathlib import Path
+
+    from shared.keystore_hybrid import load
+    from shared.substrate_client import SubstrateClient
+
+    keystore = load(Path(signer_key_path).expanduser())
+
+    async def _do() -> int:
+        client = SubstrateClient(url=node_url)
+        await client.connect()
+        try:
+            existing = await client.query_solver(keystore.signer.account_id_bytes())
+            if existing is None:
+                click.echo("solver not registered; nothing to do")
+                return 0
+
+            receipt = await client.submit_extrinsic(
+                "QuantumComputeMempool",
+                "deregister_solver",
+                {},
+                keystore.signer,
+                wait_for="inblock",
+            )
+            if receipt.error:
+                click.echo(
+                    f"deregister_solver failed: {receipt.error}", err=True
+                )
+                return 3
+            click.echo(
+                f"deregistered (extrinsic={receipt.extrinsic_hash}, "
+                f"block={receipt.block_hash})"
+            )
+            return 0
+        finally:
+            await client.close()
+
+    raise SystemExit(asyncio.run(_do()))
+
+
 # --------------------------------------------------------------------------
 # Mining subcommands: cpu / gpu / qpu spawn the controller end-to-end.
 # Topology binding is explicit via --topology zephyr:M,T (defaults to Z(9,2)
