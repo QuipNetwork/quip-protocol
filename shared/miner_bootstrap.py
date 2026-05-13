@@ -7,15 +7,27 @@ Sequence:
 
 1. Load or generate the signing keystore at `signer_key_path`.
 2. Connect to the substrate node.
-3. If `--seed-chain` is set: query `QuantumPow.Difficulty` and the snapshot
-   API. If either is missing, submit `Sudo.sudo(QuantumPow.set_difficulty(...))`
-   and `Sudo.sudo(QuantumPow.register_topology(...))` using a sudo signer
+3. If `--seed-chain` is set (dev-only, see below): query `QuantumPow.Difficulty`
+   and the snapshot API. If either is missing, submit
+   `Sudo.sudo(QuantumPow.set_difficulty(...))` and
+   `Sudo.sudo(QuantumPow.register_topology(...))` using a sudo signer
    (defaults to `//Alice` on a dev chain).
 4. Query the miner's balance. If below `min_balance`, POST to the faucet.
    Wait until the chain reflects the new balance.
 5. Query `QuantumPow.Miners[account]`. If not registered, submit
    `QuantumPow.register_miner()`.
 6. Print a summary line.
+
+The `--seed-chain` path is **dev-only**. `_assert_dev_chain` rejects
+anything whose `system_chain` name doesn't match one of the
+`Development` / `Local Testnet` / `quip-local` prefixes, and the
+default sudo URI (`//Alice`) is the well-known dev key — any real
+runtime configures `pallet_sudo::Key` to a quip-owned account, so a
+mainnet bootstrap attempt would be rejected as a non-sudo origin even
+if the chain-prefix guard were bypassed. Production deploys never
+invoke `--seed-chain`: chainspec ships with topology + difficulty
+baked in, and ad-hoc runtime config goes through ops tooling that
+holds the real sudo key.
 """
 from __future__ import annotations
 
@@ -58,6 +70,10 @@ DEFAULT_SEED_DIFFICULTY = SubstrateDifficulty(
 # Minimum balance before bootstrap considers the account funded. Miner
 # registration reserves `MinerDeposit = UNIT` (= 1e12 plancks on the dev
 # chain), so we leave a comfortable cushion.
+#
+# "Planck" is the Substrate/Polkadot smallest-balance-unit term (analogous
+# to `wei` on Ethereum or `satoshi` on Bitcoin). 1 UNIT = 10^12 plancks on
+# 12-decimal chains.
 DEFAULT_MIN_BALANCE_PLANCKS = 2_000_000_000_000  # 2 UNIT
 
 # Amount the faucet sends per request.

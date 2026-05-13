@@ -57,10 +57,14 @@ DEV_CHAIN_PREFIXES = (
 # One funding per minute per destination address. Keeps a misbehaving caller
 # from draining the funding key, but doesn't get in the way of legitimate
 # bootstrap workflows that run a couple of times back-to-back.
-DEFAULT_RATE_LIMIT_SECONDS = 60.0
+DEFAULT_RATE_LIMIT_SECONDS = 60
 
 # Default funding amount: 1000 UNIT assuming 12-decimal chains (matches
 # standard Substrate dev presets). Override per request.
+#
+# "Planck" is the Substrate/Polkadot term for the smallest divisible balance
+# unit (analogous to `wei` on Ethereum or `satoshi` on Bitcoin). 1 UNIT =
+# 10^12 plancks on 12-decimal chains.
 DEFAULT_AMOUNT_PLANCKS = 1_000_000_000_000_000
 
 
@@ -73,7 +77,7 @@ class FaucetConfig:
     faucet_key_uri: str = "//Alice"
     listen_host: str = "127.0.0.1"
     listen_port: int = 8087
-    rate_limit_seconds: float = DEFAULT_RATE_LIMIT_SECONDS
+    rate_limit_seconds: int = DEFAULT_RATE_LIMIT_SECONDS
     allow_any_chain: bool = False
 
 
@@ -337,7 +341,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--rate-limit-seconds",
-        type=float,
+        type=int,
         default=DEFAULT_RATE_LIMIT_SECONDS,
         help="Seconds between requests per destination address",
     )

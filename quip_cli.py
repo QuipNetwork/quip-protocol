@@ -791,8 +791,10 @@ def quip_miner_keygen(out_path: str, overwrite: bool) -> None:
 @click.option(
     "--seed-chain/--no-seed-chain",
     default=False,
-    help="On a fresh dev chain, sudo-seed QuantumPow.Difficulty and "
-    "QuantumPow.DefaultTopology (default off; requires --sudo-key)",
+    help="DEV-ONLY: on a fresh dev chain (Development / Local Testnet / "
+    "quip-local), sudo-seed QuantumPow.Difficulty and "
+    "QuantumPow.DefaultTopology. Refused against non-dev chains; never "
+    "used in production (default off; requires --sudo-key)",
 )
 @click.option(
     "--sudo-key",
