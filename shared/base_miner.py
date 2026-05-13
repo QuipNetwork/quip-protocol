@@ -35,6 +35,12 @@ from shared.substrate_types import SubstrateMiningContext
 # Global logger for this module
 log = logging.getLogger(__name__)
 
+# Emit a progress log line every N sampling attempts. 10 is a balance between
+# noise (one line per attempt is too chatty for the slow miners) and
+# observability (one line per minute on the typical CPU/GPU cadence).
+PROGRESS_LOG_INTERVAL = 10
+
+
 class BaseMiner(ABC):
     """Abstract base class for concrete miners (Template Method pattern).
 
@@ -777,7 +783,7 @@ class BaseMiner(ABC):
                     return result
 
                 progress += 1
-                if progress % 10 == 0:
+                if progress % PROGRESS_LOG_INTERVAL == 0:
                     best_energy = (
                         min(self.top_attempts[0].sampleset.record.energy)
                         if self.top_attempts

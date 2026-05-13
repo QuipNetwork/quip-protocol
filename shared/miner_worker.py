@@ -13,6 +13,7 @@ It constructs the correct concrete miner from a simple picklable spec dict:
 from __future__ import annotations
 
 import time
+import traceback
 from shared.logging_config import QuipFormatter
 import logging
 import signal
@@ -237,7 +238,6 @@ def miner_worker_main(
             try:
                 result = miner.mine_work_item(context, stop_event)
             except Exception as exc:
-                import traceback
                 logger.error(
                     f"[{miner.miner_id}] mine_work_item raised: "
                     f"{type(exc).__name__}: {exc}\n"
