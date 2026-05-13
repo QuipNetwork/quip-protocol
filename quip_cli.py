@@ -338,134 +338,6 @@ def _parse_topology(spec: str):
     return zephyr(m, t)
 
 
-async def _run_miner(
-    *,
-    kind: str,
-    node_url: str,
-    signer_key_path: str,
-    rest_port: int,
-    topology_spec: str,
-    miner_config: dict,
-):
-    """Shared entry point for `quip-miner cpu|gpu|qpu`.
-
-    Builds the keystore-loaded signer, a `MinerCore` with the requested
-    miner kind, two `SubstrateClient` instances (state + subscription),
-    and a `SubstrateMinerController`. Runs the controller until KeyboardInterrupt.
-    """
-    import asyncio
-    import hashlib
-    import signal as signal_module
-    from pathlib import Path
-
-    from shared.keystore_hybrid import load
-    from shared.miner_core import MinerCore
-    from shared.substrate_client import SubstrateClient
-    from shared.substrate_miner_controller import SubstrateMinerController
-
-    keystore = load(Path(signer_key_path).expanduser())
-    click.echo(f"signer: {keystore.signer.ss58_address()} (hybrid)")
-
-    # Build the sampler topology and bind it to the miner config.
-    topology = _parse_topology(topology_spec)
-    click.echo(
-        f"topology: {topology_spec} ({topology.num_nodes} nodes, "
-        f"{topology.num_edges} edges)"
-    )
-
-    # Inject the topology into whichever miner kind is being constructed.
-    miner_config = _inject_topology(miner_config, kind, topology)
-
-    core = MinerCore(node_id="quip-miner", miners_config=miner_config)
-    if not core.miner_handles:
-        click.echo(
-            f"no miner handles built for kind={kind}; check --num-cpus / "
-            f"GPU/QPU config",
-            err=True,
-        )
-        return 2
-
-    client = SubstrateClient(url=node_url)
-    await client.connect()
-
-    # Verify the sampler topology matches the chain's registered topology
-    # before mining starts. Without this check, every proof would be rejected
-    # with InvalidTopology (Phase 4 confirmed this end-to-end).
-    head = await client.get_head()
-    snapshot = await client.get_mining_snapshot(
-        at=head,
-        miner_account_bytes=keystore.signer.account_id_bytes(),
-    )
-    if snapshot is None:
-        click.echo(
-            "chain has no registered topology; run "
-            "`quip-miner bootstrap --seed-chain` first",
-            err=True,
-        )
-        await client.close()
-        core.close()
-        return 3
-    expected_hash = _zephyr_topology_hash(topology)
-    if snapshot.topology_hash != expected_hash:
-        click.echo(
-            f"topology mismatch: --topology {topology_spec} hashes to "
-            f"0x{expected_hash.hex()} but chain has 0x{snapshot.topology_hash.hex()}; "
-            "either adjust --topology or re-seed the chain",
-            err=True,
-        )
-        await client.close()
-        core.close()
-        return 4
-
-    controller = SubstrateMinerController(
-        client=client,
-        signer=keystore.signer,
-        miner_handles=core.miner_handles,
-        topology_hash=snapshot.topology_hash,
-        core=core,
-    )
-    click.echo(
-        f"controller starting: handles={[h.miner_id for h in core.miner_handles]} "
-        f"topology_hash=0x{snapshot.topology_hash.hex()[:16]}..."
-    )
-
-    # Optional telemetry server. The legacy /api/v1/* surface is preserved
-    # via `shared.telemetry_api`; new operators that don't want HTTP
-    # telemetry pass `--rest-port -1` to skip the bind.
-    telemetry: Optional["TelemetryApiServer"] = None
-    if rest_port is not None and rest_port > 0:
-        from shared.telemetry_api import TelemetryApiServer
-
-        telemetry = TelemetryApiServer(
-            core=core,
-            client=client,
-            signer=keystore.signer,
-            controller=controller,
-            host="127.0.0.1",
-            port=rest_port,
-        )
-        await telemetry.start()
-        click.echo(
-            f"telemetry api: http://127.0.0.1:{rest_port}/api/v1/status"
-        )
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal_module.SIGINT, signal_module.SIGTERM):
-        loop.add_signal_handler(sig, controller.shutdown)
-
-    try:
-        await controller.run()
-    finally:
-        click.echo(
-            f"controller stopped: stats={controller.stats}",
-        )
-        if telemetry is not None:
-            await telemetry.stop()
-        await client.close()
-        core.close()
-    return 0
-
-
 def _inject_topology(miner_config: dict, kind: str, topology) -> dict:
     """Stash the topology in the appropriate miner section's `args`.
 
@@ -525,8 +397,9 @@ _TOPOLOGY_HELP = (
 _REST_PORT_HELP = "Telemetry REST API port (set to -1 to disable; Phase 5b wires this in)"
 
 
-async def _run_mempool_miner(
+async def _run_concurrent_miner(
     *,
+    mode: str,
     miner_kind: str,
     node_url: str,
     signer_key_path: str,
@@ -534,12 +407,17 @@ async def _run_mempool_miner(
     topology_spec: str,
     miner_config: dict,
 ) -> int:
-    """Mempool-mode entry: build a MempoolMinerController over the same
-    `MinerCore` + worker plumbing the PoW path uses.
+    """Unified entry for `--mode pow|mempool|both` on cpu/gpu/qpu.
 
-    Topology binding is independent of the chain's PoW topology — the
-    sampler's nodes/edges hash directly becomes the mempool eligibility
-    filter. (Phase 8d unifies this with PoW mode under one CLI command.)
+    Worker handle allocation rule:
+      - mode=pow:     all handles → SubstrateMinerController
+      - mode=mempool: all handles → MempoolMinerController
+      - mode=both:    half (rounded down) to PoW, remainder to mempool.
+                      Requires ≥2 handles; fails fast otherwise.
+
+    Phase 8d's split is static and per-handle — no dynamic rebalancing.
+    Phase 9 can introduce a shared scheduler that lets one mode use the
+    other's idle worker, plus `--mempool-fraction` for non-half splits.
     """
     import asyncio
     import signal as signal_module
@@ -553,9 +431,14 @@ async def _run_mempool_miner(
     from shared.mempool_types import MinerType
     from shared.miner_core import MinerCore
     from shared.substrate_client import SubstrateClient
+    from shared.substrate_miner_controller import SubstrateMinerController
+
+    if mode not in ("pow", "mempool", "both"):
+        click.echo(f"invalid --mode {mode!r}", err=True)
+        return 2
 
     keystore = load(Path(signer_key_path).expanduser())
-    click.echo(f"signer: {keystore.signer.ss58_address()} (hybrid)")
+    click.echo(f"signer: {keystore.signer.ss58_address()} (hybrid) mode={mode}")
 
     topology = _parse_topology(topology_spec)
     click.echo(
@@ -564,39 +447,97 @@ async def _run_mempool_miner(
     )
 
     miner_config = _inject_topology(miner_config, miner_kind, topology)
-    core = MinerCore(node_id="quip-miner-mempool", miners_config=miner_config)
+    core = MinerCore(node_id=f"quip-miner-{mode}", miners_config=miner_config)
     if not core.miner_handles:
-        click.echo(
-            f"no miner handles built for kind={miner_kind}", err=True
-        )
+        click.echo(f"no miner handles built for kind={miner_kind}", err=True)
         return 2
 
-    sampler = core.miner_handles[0]
-    sampler_nodes = tuple(int(n) for n in topology.nodes)
-    sampler_edges = tuple(
-        (int(u), int(v)) for u, v in topology.edges
+    pow_handles, mempool_handles = _split_handles_for_mode(
+        mode, core.miner_handles
     )
-    sampler_topology_hash = topology_hash_from_nodes_edges(
-        sampler_nodes, sampler_edges
-    )
-
-    solver_type = MinerType.from_kind(miner_kind)
+    if mode == "both" and (not pow_handles or not mempool_handles):
+        click.echo(
+            f"--mode both requires at least 2 worker handles to split; "
+            f"got {len(core.miner_handles)}. Increase --num-cpus / GPU "
+            f"devices.",
+            err=True,
+        )
+        core.close()
+        return 5
 
     client = SubstrateClient(url=node_url)
     await client.connect()
 
-    controller = MempoolMinerController(
-        client=client,
-        signer=keystore.signer,
-        miner_handles=core.miner_handles,
-        sampler_topology_hash=sampler_topology_hash,
-        solver_type=solver_type,
-        core=core,
-    )
-    click.echo(
-        f"mempool controller starting: solver_type={solver_type.name} "
-        f"topology_hash=0x{sampler_topology_hash.hex()[:16]}..."
-    )
+    pow_controller = None
+    pow_topology_hash = None
+    if pow_handles:
+        # PoW requires the sampler's topology to match the chain's
+        # registered DefaultTopology (the chain validates this in
+        # `submit_proof` via `InvalidTopology`).
+        head = await client.get_head()
+        snapshot = await client.get_mining_snapshot(
+            at=head,
+            miner_account_bytes=keystore.signer.account_id_bytes(),
+        )
+        if snapshot is None:
+            click.echo(
+                "PoW mode: chain has no registered topology; run "
+                "`quip-miner bootstrap --seed-chain` first",
+                err=True,
+            )
+            await client.close()
+            core.close()
+            return 3
+        expected_hash = _zephyr_topology_hash(topology)
+        if snapshot.topology_hash != expected_hash:
+            click.echo(
+                f"PoW mode topology mismatch: --topology {topology_spec} "
+                f"hashes to 0x{expected_hash.hex()} but chain has "
+                f"0x{snapshot.topology_hash.hex()}",
+                err=True,
+            )
+            await client.close()
+            core.close()
+            return 4
+        pow_topology_hash = snapshot.topology_hash
+        pow_controller = SubstrateMinerController(
+            client=client,
+            signer=keystore.signer,
+            miner_handles=pow_handles,
+            topology_hash=pow_topology_hash,
+            core=core,
+        )
+        click.echo(
+            f"  pow handles: {[h.miner_id for h in pow_handles]} "
+            f"topology=0x{pow_topology_hash.hex()[:16]}..."
+        )
+
+    mempool_controller = None
+    mempool_client = None
+    if mempool_handles:
+        sampler_nodes = tuple(int(n) for n in topology.nodes)
+        sampler_edges = tuple((int(u), int(v)) for u, v in topology.edges)
+        mempool_topology_hash = topology_hash_from_nodes_edges(
+            sampler_nodes, sampler_edges
+        )
+        # The mempool controller submits + reads via its own
+        # SubstrateClient instance. Sharing `client` with the PoW
+        # controller would serialize their submissions behind the same
+        # asyncio lock, defeating the point of concurrent mode.
+        mempool_client = SubstrateClient(url=node_url)
+        await mempool_client.connect()
+        mempool_controller = MempoolMinerController(
+            client=mempool_client,
+            signer=keystore.signer,
+            miner_handles=mempool_handles,
+            sampler_topology_hash=mempool_topology_hash,
+            solver_type=MinerType.from_kind(miner_kind),
+            core=core,
+        )
+        click.echo(
+            f"  mempool handles: {[h.miner_id for h in mempool_handles]} "
+            f"topology=0x{mempool_topology_hash.hex()[:16]}..."
+        )
 
     telemetry = None
     if rest_port is not None and rest_port > 0:
@@ -606,97 +547,102 @@ async def _run_mempool_miner(
             core=core,
             client=client,
             signer=keystore.signer,
-            controller=None,  # PoW-specific stats; mempool telemetry is a Phase 9 follow-on
+            controller=pow_controller,  # Phase 9: surface mempool stats too
             host="127.0.0.1",
             port=rest_port,
         )
         await telemetry.start()
-        click.echo(
-            f"telemetry api: http://127.0.0.1:{rest_port}/api/v1/status"
-        )
+        click.echo(f"telemetry api: http://127.0.0.1:{rest_port}/api/v1/status")
 
     loop = asyncio.get_running_loop()
+
+    def _signal_shutdown() -> None:
+        if pow_controller is not None:
+            pow_controller.shutdown()
+        if mempool_controller is not None:
+            mempool_controller.shutdown()
+
     for sig in (signal_module.SIGINT, signal_module.SIGTERM):
-        loop.add_signal_handler(sig, controller.shutdown)
+        loop.add_signal_handler(sig, _signal_shutdown)
+
+    tasks: list = []
+    if pow_controller is not None:
+        tasks.append(asyncio.create_task(
+            pow_controller.run(), name="pow-controller"
+        ))
+    if mempool_controller is not None:
+        tasks.append(asyncio.create_task(
+            mempool_controller.run(), name="mempool-controller"
+        ))
 
     try:
-        await controller.run()
+        # Wait until any controller exits (one failing should bring down
+        # the whole process — operators can re-spawn). Once one returns,
+        # signal the other to stop and wait for it to drain.
+        done, pending = await asyncio.wait(
+            tasks, return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in done:
+            exc = t.exception()
+            if exc is not None:
+                click.echo(
+                    f"controller {t.get_name()} exited with error: {exc}",
+                    err=True,
+                )
+        _signal_shutdown()
+        for t in pending:
+            try:
+                await asyncio.wait_for(t, timeout=15.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
     finally:
-        click.echo(f"controller stopped: stats={controller.stats}")
+        if pow_controller is not None:
+            click.echo(f"  pow stats:     {pow_controller.stats}")
+        if mempool_controller is not None:
+            click.echo(f"  mempool stats: {mempool_controller.stats}")
         if telemetry is not None:
             await telemetry.stop()
+        if mempool_client is not None:
+            await mempool_client.close()
         await client.close()
         core.close()
     return 0
 
 
-@quip_miner.command("mempool")
-@click.option("--node-url", required=True, help=_NODE_URL_HELP)
-@click.option(
-    "--signer-key",
-    "signer_key_path",
-    type=click.Path(dir_okay=False),
-    default="~/.quip-miner/signing.json",
-    show_default=True,
-    help=_SIGNER_KEY_HELP,
-)
-@click.option(
-    "--miner-kind",
-    type=click.Choice(["cpu", "gpu", "qpu"], case_sensitive=False),
-    default="cpu",
-    show_default=True,
-    help="Worker hardware family. Must match the kind used in "
-    "`quip-miner register-solver`.",
-)
-@click.option(
-    "--num-cpus",
-    type=int,
-    default=1,
-    show_default=True,
-    help="Number of CPU SA workers (CPU kind only)",
-)
-@click.option(
-    "--topology",
-    "topology_spec",
-    default="zephyr:2,2",
-    show_default=True,
-    help=_TOPOLOGY_HELP,
-)
-@click.option(
-    "--rest-port",
-    type=int,
-    default=-1,
-    show_default=True,
-    help=_REST_PORT_HELP,
-)
-def quip_miner_mempool(
-    node_url: str,
-    signer_key_path: str,
-    miner_kind: str,
-    num_cpus: int,
-    topology_spec: str,
-    rest_port: int,
-) -> None:
-    """Run mempool-mode mining against QuantumComputeMempool.
+def _split_handles_for_mode(mode: str, handles: list) -> tuple:
+    """Split `MinerHandle`s between PoW and mempool controllers.
 
-    Subscribes to JobProposed events, filters by topology + Bid mode,
-    mines each accepted order, submits the solution, and periodically
-    claims rewards for expired orders. The signing keystore must already
-    be registered as a solver — see `quip-miner register-solver`.
+    Returns `(pow_handles, mempool_handles)`. The split is static —
+    handles assigned to PoW only ever mine PoW work, etc. Phase 9 may
+    introduce dynamic re-allocation.
 
-    Phase 8c serves one job at a time, FIFO, with no PoW concurrency.
+      - mode=pow:     (handles, [])
+      - mode=mempool: ([], handles)
+      - mode=both:    floor(n/2) handles to PoW, the rest to mempool.
+                      For odd `n` the remainder favors mempool. For
+                      n=1 this returns ([], handles) — the CLI then
+                      fails fast on the both/empty-PoW combination.
     """
-    import asyncio
+    if mode == "pow":
+        return list(handles), []
+    if mode == "mempool":
+        return [], list(handles)
+    # mode == "both"
+    n = len(handles)
+    pow_count = n // 2
+    return list(handles[:pow_count]), list(handles[pow_count:])
 
-    miner_config = {miner_kind: {"num_cpus": num_cpus} if miner_kind == "cpu" else {}}
-    raise SystemExit(asyncio.run(_run_mempool_miner(
-        miner_kind=miner_kind,
-        node_url=node_url,
-        signer_key_path=signer_key_path,
-        rest_port=rest_port,
-        topology_spec=topology_spec,
-        miner_config=miner_config,
-    )))
+
+_MODE_HELP = (
+    "Work source: pow (chain heads), mempool (QuantumComputeMempool "
+    "JobProposed events), or both (split workers half-and-half; needs "
+    "≥2 handles). Phase 9 will introduce a shared scheduler so one "
+    "mode can use the other's idle worker."
+)
 
 
 @quip_miner.command("cpu")
@@ -708,6 +654,13 @@ def quip_miner_mempool(
     default="~/.quip-miner/signing.json",
     show_default=True,
     help=_SIGNER_KEY_HELP,
+)
+@click.option(
+    "--mode",
+    type=click.Choice(["pow", "mempool", "both"], case_sensitive=False),
+    default="pow",
+    show_default=True,
+    help=_MODE_HELP,
 )
 @click.option(
     "--num-cpus",
@@ -729,16 +682,28 @@ def quip_miner_mempool(
 def quip_miner_cpu(
     node_url: str,
     signer_key_path: str,
+    mode: str,
     num_cpus: int,
     topology_spec: str,
     rest_port: int,
 ) -> None:
-    """Run CPU SA miners against a substrate chain."""
+    """Run CPU SA miners against a substrate chain.
+
+    --mode controls the work source:
+      pow      (default) — mine chain heads via QuantumPow.submit_proof
+      mempool  — solve JobProposed orders via QuantumComputeMempool
+      both     — concurrent: half the workers do PoW, the rest do mempool
+                 (requires --num-cpus 2 or more)
+
+    For mempool / both modes, the signer must be registered as a solver
+    first via `quip-miner register-solver --miner-type cpu`.
+    """
     import asyncio
 
     miner_config = {"cpu": {"num_cpus": num_cpus}}
-    raise SystemExit(asyncio.run(_run_miner(
-        kind="cpu",
+    raise SystemExit(asyncio.run(_run_concurrent_miner(
+        mode=mode,
+        miner_kind="cpu",
         node_url=node_url,
         signer_key_path=signer_key_path,
         rest_port=rest_port,
@@ -765,6 +730,13 @@ def quip_miner_cpu(
     help="GPU backend: local CUDA, Apple Metal, or Modal cloud",
 )
 @click.option(
+    "--mode",
+    type=click.Choice(["pow", "mempool", "both"], case_sensitive=False),
+    default="pow",
+    show_default=True,
+    help=_MODE_HELP,
+)
+@click.option(
     "--topology",
     "topology_spec",
     default="zephyr:9,2",
@@ -778,16 +750,15 @@ def quip_miner_gpu(
     node_url: str,
     signer_key_path: str,
     gpu_backend: str,
+    mode: str,
     topology_spec: str,
     rest_port: int,
 ) -> None:
     """Run a GPU miner (CUDA / Metal / Modal) against a substrate chain.
 
-    GPU end-to-end verification against the chain is a Phase 6 follow-on —
-    the controller and spec wiring work, but `--topology` injection for
-    GPU samplers landed in a single CPU-only path in Phase 5a. CUDA / Metal
-    samplers consume the topology via their `args` dict the same way the
-    CPU path does once that injection is generalised.
+    See `quip-miner cpu --help` for --mode semantics. GPU end-to-end
+    verification against the chain is a Phase 6 follow-on; concurrent
+    mode shares the same caveat about topology injection generalisation.
     """
     import asyncio
 
@@ -801,8 +772,9 @@ def quip_miner_gpu(
     else:
         raise click.BadParameter(f"unknown --gpu-backend: {backend}")
 
-    raise SystemExit(asyncio.run(_run_miner(
-        kind="gpu",
+    raise SystemExit(asyncio.run(_run_concurrent_miner(
+        mode=mode,
+        miner_kind="gpu",
         node_url=node_url,
         signer_key_path=signer_key_path,
         rest_port=rest_port,
@@ -829,6 +801,13 @@ def quip_miner_gpu(
     help="QPU provider",
 )
 @click.option(
+    "--mode",
+    type=click.Choice(["pow", "mempool", "both"], case_sensitive=False),
+    default="pow",
+    show_default=True,
+    help=_MODE_HELP,
+)
+@click.option(
     "--daily-budget",
     type=int,
     default=None,
@@ -848,6 +827,7 @@ def quip_miner_qpu(
     node_url: str,
     signer_key_path: str,
     qpu_type: str,
+    mode: str,
     daily_budget,
     topology_spec: str,
     rest_port: int,
@@ -855,8 +835,9 @@ def quip_miner_qpu(
     """Run a QPU miner against a substrate chain.
 
     Provider credentials come from the environment (e.g. DWAVE_API_KEY).
-    Same Phase 5a caveat as GPU: end-to-end against the chain is a Phase 6
-    item once topology binding generalises beyond CPU.
+    See `quip-miner cpu --help` for --mode semantics. Same Phase 5a caveat
+    as GPU: end-to-end against the chain is a Phase 6 item once topology
+    binding generalises beyond CPU.
     """
     import asyncio
 
@@ -865,8 +846,9 @@ def quip_miner_qpu(
         section["daily_budget"] = daily_budget
     miner_config = {qpu_type: [section]}
 
-    raise SystemExit(asyncio.run(_run_miner(
-        kind="qpu",
+    raise SystemExit(asyncio.run(_run_concurrent_miner(
+        mode=mode,
+        miner_kind="qpu",
         node_url=node_url,
         signer_key_path=signer_key_path,
         rest_port=rest_port,
