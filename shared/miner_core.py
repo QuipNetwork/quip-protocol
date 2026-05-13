@@ -32,10 +32,107 @@ from shared.logging_config import init_component_logger
 from shared.miner_worker import MinerHandle
 
 
-# Config-section discovery, forked from `shared.node`. Phase 5b removes the
-# duplicates when `node.py` is deleted.
-_GPU_DEVICE_SECTIONS = ("cuda", "metal", "modal")
-_QPU_DEVICE_SECTIONS = ("dwave", "ibm", "braket", "pasqal", "ionq", "origin")
+# Config-section discovery + normalization helpers. Moved here in Phase 5b
+# from `shared.node` (now deleted). The normalization rules cover the TOML
+# shapes operators were using for the legacy CLI: `[gpu]` + `[cuda.0]` /
+# `[cuda.1]` subtables for CUDA per-device config, `[metal]` / `[modal]`
+# single-table sections, and `[[cuda]]` / `[[metal]]` array-of-tables for
+# the substrate CLI path that wants to pass a single device dict directly.
+
+_GPU_CFG_KEYS = (
+    "utilization", "yielding", "enabled", "sms_per_nonce",
+)
+
+_GPU_DEVICE_SECTIONS = {
+    "cuda": "cuda",
+    "nvidia": "cuda",   # alias
+    "metal": "metal",
+    "modal": "modal",
+}
+
+_QPU_DEVICE_SECTIONS = (
+    "dwave", "ibm", "braket", "pasqal", "ionq", "origin",
+)
+
+
+def _build_gpu_miner_cfg(
+    section: Dict[str, Any],
+    defaults: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build a miner cfg dict from a TOML section, inheriting `defaults`."""
+    base = dict(defaults) if defaults else {}
+    for key in _GPU_CFG_KEYS:
+        if key in section:
+            base[key] = section[key]
+    return base
+
+
+def _normalize_gpu_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize the TOML GPU layout into `{"devices": [...]}` form."""
+    gpu_cfg = dict(cfg.get("gpu") or {})
+    devices: List[Dict[str, Any]] = []
+    for section_key, dev_type in _GPU_DEVICE_SECTIONS.items():
+        section = cfg.get(section_key)
+        if section is None:
+            continue
+        if dev_type in ("cuda", "modal") and isinstance(section, dict):
+            if any(isinstance(v, dict) for v in section.values()):
+                for dev_id in sorted(section.keys()):
+                    sub = section[dev_id]
+                    if not isinstance(sub, dict):
+                        continue
+                    entry: Dict[str, Any] = {"type": dev_type}
+                    if dev_type == "cuda":
+                        entry["device"] = str(dev_id)
+                    entry.update(sub)
+                    devices.append(entry)
+            else:
+                entry = {"type": dev_type}
+                entry.update(section)
+                devices.append(entry)
+        elif isinstance(section, list):
+            for item in section:
+                entry = {"type": dev_type}
+                entry.update(item)
+                devices.append(entry)
+        elif isinstance(section, dict):
+            entry = {"type": dev_type}
+            entry.update(section)
+            devices.append(entry)
+    if devices:
+        gpu_cfg["devices"] = devices
+    return gpu_cfg
+
+
+def _normalize_qpu_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize the TOML QPU layout into `{"devices": [...]}` form."""
+    qpu_cfg = dict(cfg.get("qpu") or {})
+    devices: List[Dict[str, Any]] = []
+    for section_key in _QPU_DEVICE_SECTIONS:
+        section = cfg.get(section_key)
+        if section is None:
+            continue
+        if isinstance(section, list):
+            for item in section:
+                entry: Dict[str, Any] = {"type": section_key}
+                entry.update(item)
+                devices.append(entry)
+        elif isinstance(section, dict):
+            if any(isinstance(v, dict) for v in section.values()):
+                for sub_id in sorted(section.keys()):
+                    sub = section[sub_id]
+                    if not isinstance(sub, dict):
+                        continue
+                    entry = {"type": section_key}
+                    entry.update(sub)
+                    devices.append(entry)
+            else:
+                entry = {"type": section_key}
+                entry.update(section)
+                devices.append(entry)
+    if devices:
+        qpu_cfg["devices"] = devices
+    return qpu_cfg
 
 
 class MinerCore:
@@ -255,18 +352,7 @@ class MinerCore:
 
 
 def _build_gpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Yield miner specs for each GPU device in the config.
-
-    Defers the normalization to `shared.node` until Phase 5b deletes that
-    module; once it's gone, the normalization moves here. Keeping the
-    delegation in place now means cfg semantics stay identical with the
-    legacy code path.
-    """
-    from shared.node import (  # local import: legacy module deleted in Phase 5b
-        _build_gpu_miner_cfg,
-        _normalize_gpu_config,
-    )
-
+    """Yield miner specs for each GPU device in the config."""
     specs: List[Dict[str, Any]] = []
     gpu_cfg = _normalize_gpu_config(cfg)
     common_cfg = _build_gpu_miner_cfg(gpu_cfg)
@@ -305,8 +391,6 @@ def _build_gpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _build_qpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Yield miner specs for each QPU device in the config."""
-    from shared.node import _normalize_qpu_config  # local import: see above
-
     specs: List[Dict[str, Any]] = []
     qpu_cfg = _normalize_qpu_config(cfg)
     for i, dev in enumerate(qpu_cfg.get("devices", []), start=1):

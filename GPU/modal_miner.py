@@ -10,7 +10,7 @@ from typing import Dict, List, Tuple
 import dimod
 
 from shared.base_miner import BaseMiner
-from shared.block_requirements import BlockRequirements
+from shared.miner_types import BlockRequirements
 from GPU.modal_sampler import ModalSampler
 
 

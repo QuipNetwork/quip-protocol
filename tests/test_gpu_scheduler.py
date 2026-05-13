@@ -316,11 +316,11 @@ class TestBuildGpuMinerCfg:
     """Verify per-device config merging logic."""
 
     def test_empty_section_returns_empty(self):
-        from shared.node import _build_gpu_miner_cfg
+        from shared.miner_core import _build_gpu_miner_cfg
         assert _build_gpu_miner_cfg({}) == {}
 
     def test_extracts_known_keys(self):
-        from shared.node import _build_gpu_miner_cfg
+        from shared.miner_core import _build_gpu_miner_cfg
 
         section = {
             "utilization": 80,
@@ -334,7 +334,7 @@ class TestBuildGpuMinerCfg:
         }
 
     def test_per_device_overrides_common(self):
-        from shared.node import _build_gpu_miner_cfg
+        from shared.miner_core import _build_gpu_miner_cfg
 
         common = _build_gpu_miner_cfg({
             "utilization": 80,
@@ -350,7 +350,7 @@ class TestBuildGpuMinerCfg:
         }
 
     def test_partial_override_keeps_defaults(self):
-        from shared.node import _build_gpu_miner_cfg
+        from shared.miner_core import _build_gpu_miner_cfg
 
         common = _build_gpu_miner_cfg({
             "utilization": 80,
@@ -366,7 +366,7 @@ class TestBuildGpuMinerCfg:
         }
 
     def test_defaults_used_when_no_override(self):
-        from shared.node import _build_gpu_miner_cfg
+        from shared.miner_core import _build_gpu_miner_cfg
 
         common = _build_gpu_miner_cfg({
             "utilization": 100,

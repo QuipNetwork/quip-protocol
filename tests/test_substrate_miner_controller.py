@@ -457,9 +457,41 @@ def _chain_reachable(url: str) -> bool:
         return False
 
 
+def _chain_requires_hybrid_signer(url: str) -> bool:
+    """Detect whether the chain's extrinsic signature type is hybrid.
+
+    The hybrid scheme (sr25519 + ML-DSA-44) merged into `quip-protocol-rs`
+    `main` in mid-2026; chains built from that point reject `MultiSignature`
+    extrinsics. Python-side hybrid signing lands in Phase 7 of the v0.1 -> v0.2
+    refactor — until then, the end-to-end mining flow is structurally
+    blocked. Returns True if the chain's metadata exposes
+    `quip_transaction_crypto::HybridTxSignature` as the signature type so
+    callers can skip the test cleanly with a clear reason.
+    """
+    if not _chain_reachable(url):
+        return False
+    try:
+        from substrateinterface import SubstrateInterface
+        si = SubstrateInterface(url=url)
+        md = si.get_metadata()
+        types_list = md.value[1]['V14']['types']['types']
+        for t in types_list:
+            path = t['type'].get('path') or []
+            if 'HybridTxSignature' in path:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 @pytest.mark.skipif(
     not _chain_reachable(DEFAULT_URL),
     reason=f"substrate chain not reachable at {DEFAULT_URL}",
+)
+@pytest.mark.skipif(
+    _chain_requires_hybrid_signer(DEFAULT_URL),
+    reason="chain requires hybrid sr25519+ML-DSA-44 signatures; "
+    "end-to-end mining is blocked on Phase 7 (HybridSigner) work",
 )
 @pytest.mark.timeout(180)
 async def test_controller_submits_proof_end_to_end(tmp_path):
@@ -470,6 +502,9 @@ async def test_controller_submits_proof_end_to_end(tmp_path):
     the test doesn't depend on a running faucet bot. Builds a CPU miner
     with the matching topology. Self-contained — works against a fresh
     `docker compose down -v && up -d` chain.
+
+    Skipped automatically when the chain requires hybrid sr25519+ML-DSA-44
+    signatures (Phase 7 unblocker).
     """
     keystore_path = tmp_path / "signing.json"
     keystore = generate(keystore_path)

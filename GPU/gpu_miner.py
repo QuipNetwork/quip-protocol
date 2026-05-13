@@ -23,7 +23,7 @@ from typing import (
 
 import dimod
 from shared.base_miner import BaseMiner
-from shared.block_requirements import BlockRequirements
+from shared.miner_types import BlockRequirements
 from shared.ising_feeder import IsingFeeder
 from GPU.gpu_scheduler import (
     KernelScheduler,

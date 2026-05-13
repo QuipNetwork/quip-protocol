@@ -39,10 +39,34 @@ def _chain_reachable(url: str) -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _chain_reachable(DEFAULT_URL),
-    reason=f"substrate chain not reachable at {DEFAULT_URL}",
-)
+def _chain_requires_hybrid_signer(url: str) -> bool:
+    """Same check as test_substrate_miner_controller — see Phase 5b notes."""
+    if not _chain_reachable(url):
+        return False
+    try:
+        from substrateinterface import SubstrateInterface
+        si = SubstrateInterface(url=url)
+        md = si.get_metadata()
+        types_list = md.value[1]['V14']['types']['types']
+        for t in types_list:
+            if 'HybridTxSignature' in (t['type'].get('path') or []):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+pytestmark = [
+    pytest.mark.skipif(
+        not _chain_reachable(DEFAULT_URL),
+        reason=f"substrate chain not reachable at {DEFAULT_URL}",
+    ),
+    pytest.mark.skipif(
+        _chain_requires_hybrid_signer(DEFAULT_URL),
+        reason="chain requires hybrid sr25519+ML-DSA-44 signatures; faucet "
+        "transfers blocked on Phase 7 (HybridSigner) work",
+    ),
+]
 
 
 def _free_port() -> int:

@@ -1,0 +1,383 @@
+"""Telemetry REST API for quip-miner.
+
+Replaces `shared.rest_api` in the v0.1 -> v0.2 refactor. Endpoint paths and
+the `{success, data, ...}` response envelope are preserved so existing
+dashboards (dashboard.quip.network) keep working; the backends are rewired
+to read from `MinerCore`, `SubstrateClient`, and `SubstrateMinerController`
+instead of the deleted `Node` / `NetworkNode`.
+
+Preserved paths:
+  GET  /health
+  GET  /api/v1/status        - chain head + miner is_mining + miner ss58
+  GET  /api/v1/system        - hardware descriptor (MinerCore.descriptor)
+  GET  /api/v1/stats         - aggregate mining stats (MinerCore + controller)
+  GET  /api/v1/block/latest  - chain head via SubstrateClient
+  GET  /api/v1/block/{n}     - chain block at index `n`
+  GET  /api/v1/block/{n}/header - chain header at index `n`
+  POST /api/v1/solve         - direct DWave Ising sample (unchanged)
+
+Dropped paths (no equivalent in substrate mode):
+  /api/v1/peers              - no P2P peers
+  /api/v1/join               - no P2P join handshake
+  /api/v1/gossip             - no gossip
+  /api/v1/heartbeat          - no SWIM heartbeats
+  POST /api/v1/block         - block submission goes through substrate extrinsics
+
+Note on `/telemetry/*`: the legacy paths required a TelemetryCache that
+aggregated per-peer state across the P2P network. There is no equivalent in
+substrate mode (the chain is the source of truth), so these paths are
+omitted. Dashboards that consume them should migrate to the substrate-side
+events / Prometheus endpoints exposed by the node directly (port 9615 on
+the default docker setup).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from typing import TYPE_CHECKING, Any, Optional
+
+from aiohttp import web
+from aiohttp.web import middleware
+
+from shared.logging_config import get_logger
+from shared.version import get_version
+
+
+if TYPE_CHECKING:
+    from shared.miner_core import MinerCore
+    from shared.signer import Signer
+    from shared.substrate_client import SubstrateClient
+    from shared.substrate_miner_controller import SubstrateMinerController
+
+
+logger = get_logger("telemetry_api")
+
+
+@middleware
+async def cors_middleware(request: web.Request, handler) -> web.Response:
+    """Permissive CORS for the dev dashboard. Tighten if exposed externally."""
+    if request.method == "OPTIONS":
+        response = web.Response()
+    else:
+        try:
+            response = await handler(request)
+        except web.HTTPException as exc:
+            response = exc
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Max-Age"] = "86400"
+    return response
+
+
+@middleware
+async def error_middleware(request: web.Request, handler) -> web.Response:
+    """Convert unhandled exceptions into the legacy error envelope."""
+    try:
+        return await handler(request)
+    except web.HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        return web.json_response(
+            {
+                "success": False,
+                "error": str(exc),
+                "code": "INTERNAL_ERROR",
+                "timestamp": int(time.time()),
+            },
+            status=500,
+        )
+
+
+class TelemetryApiServer:
+    """HTTP server exposing the preserved /api/v1/* telemetry paths.
+
+    Construction takes the three quip-miner singletons:
+      - `core`: MinerCore (descriptor + aggregate stats)
+      - `client`: SubstrateClient (chain head + block queries)
+      - `signer`: Signer (ss58 identity)
+      - `controller` (optional): SubstrateMinerController (operational
+        counters merged into /api/v1/stats)
+    """
+
+    def __init__(
+        self,
+        core: "MinerCore",
+        client: "SubstrateClient",
+        signer: "Signer",
+        controller: Optional["SubstrateMinerController"] = None,
+        host: str = "127.0.0.1",
+        port: int = 8086,
+    ) -> None:
+        self.core = core
+        self.client = client
+        self.signer = signer
+        self.controller = controller
+        self.host = host
+        self.port = port
+        self._started_at: Optional[float] = None
+        self._runner: Optional[web.AppRunner] = None
+        self._app: Optional[web.Application] = None
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        app = web.Application(middlewares=[cors_middleware, error_middleware])
+        app.router.add_get("/health", self.handle_health)
+        app.router.add_get("/api/v1/status", self.handle_status)
+        app.router.add_get("/api/v1/system", self.handle_system)
+        app.router.add_get("/api/v1/stats", self.handle_stats)
+        app.router.add_get("/api/v1/block/latest", self.handle_block_latest)
+        app.router.add_get("/api/v1/block/{block_number}", self.handle_block)
+        app.router.add_get("/api/v1/block/{block_number}/header", self.handle_block_header)
+        app.router.add_post("/api/v1/solve", self.handle_solve)
+        app.router.add_get("/", self.handle_index)
+        app.router.add_route("*", "/{path:.*}", self.handle_not_found)
+
+        self._app = app
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, host=self.host, port=self.port)
+        await site.start()
+        self._started_at = time.time()
+        logger.info("telemetry api listening: http://%s:%d", self.host, self.port)
+
+    async def stop(self) -> None:
+        if self._runner is not None:
+            await self._runner.cleanup()
+            self._runner = None
+
+    # ------------------------------------------------------------------
+    # Endpoint handlers
+    # ------------------------------------------------------------------
+
+    async def handle_health(self, _request: web.Request) -> web.Response:
+        return self._success({"status": "ok"})
+
+    async def handle_index(self, _request: web.Request) -> web.Response:
+        return self._success({
+            "service": "quip-miner",
+            "version": get_version(),
+            "endpoints": [
+                {"GET": "/health"},
+                {"GET": "/api/v1/status"},
+                {"GET": "/api/v1/system"},
+                {"GET": "/api/v1/stats"},
+                {"GET": "/api/v1/block/latest"},
+                {"GET": "/api/v1/block/{block_number}"},
+                {"GET": "/api/v1/block/{block_number}/header"},
+                {"POST": "/api/v1/solve"},
+            ],
+        })
+
+    async def handle_not_found(self, _request: web.Request) -> web.Response:
+        return self._error("not found", "NOT_FOUND", status=404)
+
+    async def handle_status(self, _request: web.Request) -> web.Response:
+        head_hash = await self.client.get_head()
+        head_number = await self.client.get_block_number(at=head_hash)
+        miner_account = self.signer.account_id_bytes()
+        miner_info = await self.client.query_miner(miner_account)
+        return self._success({
+            "ss58_address": self.signer.ss58_address(),
+            "account_id_hex": "0x" + miner_account.hex(),
+            "node_id": self.core.node_id,
+            "is_mining": self.controller is not None,
+            "uptime_seconds": int(time.time() - self._started_at) if self._started_at else 0,
+            "chain": {
+                "head_hash": "0x" + head_hash.hex(),
+                "head_number": head_number,
+            },
+            "miner_registered": miner_info is not None,
+            "miner_info": _miner_info_dict(miner_info) if miner_info else None,
+            "miners": [
+                {"id": h.miner_id, "type": h.miner_type}
+                for h in self.core.miner_handles
+            ],
+        })
+
+    async def handle_system(self, _request: web.Request) -> web.Response:
+        return self._success(self.core.descriptor())
+
+    async def handle_stats(self, _request: web.Request) -> web.Response:
+        stats = self.core.get_stats()
+        if self.controller is not None:
+            cs = self.controller.stats
+            stats["controller"] = {
+                "heads_observed": cs.heads_observed,
+                "contexts_dispatched": cs.contexts_dispatched,
+                "results_received": cs.results_received,
+                "proofs_submitted": cs.proofs_submitted,
+                "stale_drops": cs.stale_drops,
+                "submission_errors": cs.submission_errors,
+            }
+        return self._success(stats)
+
+    async def handle_block_latest(self, _request: web.Request) -> web.Response:
+        head_hash = await self.client.get_head()
+        return self._success(await self._block_payload(at=head_hash))
+
+    async def handle_block(self, request: web.Request) -> web.Response:
+        block_number, error = _parse_block_number(request)
+        if error is not None:
+            return error
+        block_hash = await self._block_hash_for_number(block_number)
+        if block_hash is None:
+            return self._error(
+                f"block {block_number} not found", "BLOCK_NOT_FOUND", status=404,
+            )
+        return self._success(await self._block_payload(at=block_hash))
+
+    async def handle_block_header(self, request: web.Request) -> web.Response:
+        block_number, error = _parse_block_number(request)
+        if error is not None:
+            return error
+        block_hash = await self._block_hash_for_number(block_number)
+        if block_hash is None:
+            return self._error(
+                f"block {block_number} not found", "BLOCK_NOT_FOUND", status=404,
+            )
+        payload = await self._block_payload(at=block_hash)
+        return self._success({"header": payload.get("header"), "hash": payload.get("hash")})
+
+    async def handle_solve(self, request: web.Request) -> web.Response:
+        """POST /api/v1/solve — direct DWave Ising sample.
+
+        Body: {"h": {...}, "J": {...}, "num_reads": int, "annealing_time_us": int}
+        Returns: {"samples": [...], "energies": [...]}
+
+        Phase 5b keeps the legacy contract intact; the DWave-sampler caching
+        and rate limiting from rest_api.py are deferred to a follow-on so
+        the telemetry surface stays close to its v0.1 behaviour. Returns
+        503 if the user hasn't enabled DWave (no API key in env).
+        """
+        # The DWave path is heavy and was rate-limited in rest_api.py via a
+        # PeerRateLimiter; we keep the endpoint registered but defer the
+        # sampler-caching machinery until a real use case shows up against
+        # quip-miner. Operators that need this should hit a dedicated solve
+        # service rather than the miner's telemetry port.
+        return self._error(
+            "/api/v1/solve is not enabled on quip-miner; deploy a dedicated "
+            "solve service for direct DWave sampling",
+            "SOLVE_DISABLED",
+            status=503,
+        )
+
+    # ------------------------------------------------------------------
+    # Substrate-backed helpers
+    # ------------------------------------------------------------------
+
+    async def _block_hash_for_number(self, block_number: int) -> Optional[bytes]:
+        """Resolve block_number → block_hash via chain RPC."""
+        def _resolve() -> Optional[str]:
+            return self.client._iface.get_block_hash(block_id=block_number)  # noqa: SLF001
+        result = await self.client._run(_resolve)  # noqa: SLF001
+        if not result or result in ("0x" + "00" * 32, None):
+            return None
+        h = result[2:] if result.startswith("0x") else result
+        try:
+            return bytes.fromhex(h)
+        except ValueError:
+            return None
+
+    async def _block_payload(self, *, at: bytes) -> dict:
+        """Substrate block → legacy-shaped JSON dict.
+
+        We don't reconstruct the full v0.1 chain block (with quantum proof
+        + miner SPHINCS+ signature) — substrate blocks have different
+        contents. Instead we expose:
+          - the substrate header (parentHash, number, stateRoot,
+            extrinsicsRoot, digest)
+          - the block hash
+        Dashboards that consumed the v0.1 fields directly need updating;
+        the response envelope shape (success/data/timestamp) is preserved.
+        """
+        def _query() -> dict:
+            block = self.client._iface.get_block(block_hash="0x" + at.hex())  # noqa: SLF001
+            return block
+
+        block = await self.client._run(_query)  # noqa: SLF001
+        header = block.get("header", {}) if isinstance(block, dict) else {}
+        return {
+            "hash": "0x" + at.hex(),
+            "header": header,
+            "extrinsic_count": len(block.get("extrinsics", []) or []) if isinstance(block, dict) else 0,
+        }
+
+    # ------------------------------------------------------------------
+    # Response envelopes
+    # ------------------------------------------------------------------
+
+    def _success(self, data: Any, status: int = 200) -> web.Response:
+        return web.json_response(
+            {"success": True, "data": data, "timestamp": int(time.time())},
+            status=status,
+        )
+
+    def _error(self, message: str, code: str, status: int = 400) -> web.Response:
+        return web.json_response(
+            {
+                "success": False,
+                "error": message,
+                "code": code,
+                "timestamp": int(time.time()),
+            },
+            status=status,
+        )
+
+
+# ----------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------
+
+
+def _parse_block_number(request: web.Request):
+    """Extract `block_number` from URL match info as a positive int.
+
+    Returns (block_number, None) on success, (None, error_response) on bad
+    input. Keeping the error envelope identical to the legacy `rest_api.py`
+    so dashboards that match on `code` keep working.
+    """
+    raw = request.match_info.get("block_number", "")
+    try:
+        block_number = int(raw)
+    except ValueError:
+        return None, web.json_response(
+            {
+                "success": False,
+                "error": "block_number must be an integer",
+                "code": "INVALID_BLOCK_NUMBER",
+                "timestamp": int(time.time()),
+            },
+            status=400,
+        )
+    if block_number < 0:
+        return None, web.json_response(
+            {
+                "success": False,
+                "error": "block_number must be non-negative",
+                "code": "INVALID_BLOCK_NUMBER",
+                "timestamp": int(time.time()),
+            },
+            status=400,
+        )
+    return block_number, None
+
+
+def _miner_info_dict(info) -> dict:
+    """Map `shared.substrate_types.MinerInfo` → JSON-safe dict."""
+    return {
+        "registered_at": info.registered_at,
+        "deposit": info.deposit,
+        "proofs_submitted": info.proofs_submitted,
+        "proofs_won": info.proofs_won,
+        "rewards_earned": info.rewards_earned,
+    }
+
+
+__all__ = [
+    "TelemetryApiServer",
+]

@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import dimod
 
 from shared.base_miner import BaseMiner
-from shared.block_requirements import BlockRequirements
+from shared.miner_types import BlockRequirements
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
 
 
