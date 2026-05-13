@@ -525,6 +525,180 @@ _TOPOLOGY_HELP = (
 _REST_PORT_HELP = "Telemetry REST API port (set to -1 to disable; Phase 5b wires this in)"
 
 
+async def _run_mempool_miner(
+    *,
+    miner_kind: str,
+    node_url: str,
+    signer_key_path: str,
+    rest_port: int,
+    topology_spec: str,
+    miner_config: dict,
+) -> int:
+    """Mempool-mode entry: build a MempoolMinerController over the same
+    `MinerCore` + worker plumbing the PoW path uses.
+
+    Topology binding is independent of the chain's PoW topology — the
+    sampler's nodes/edges hash directly becomes the mempool eligibility
+    filter. (Phase 8d unifies this with PoW mode under one CLI command.)
+    """
+    import asyncio
+    import signal as signal_module
+    from pathlib import Path
+
+    from shared.keystore_hybrid import load
+    from shared.mempool_miner_controller import (
+        MempoolMinerController,
+        topology_hash_from_nodes_edges,
+    )
+    from shared.mempool_types import MinerType
+    from shared.miner_core import MinerCore
+    from shared.substrate_client import SubstrateClient
+
+    keystore = load(Path(signer_key_path).expanduser())
+    click.echo(f"signer: {keystore.signer.ss58_address()} (hybrid)")
+
+    topology = _parse_topology(topology_spec)
+    click.echo(
+        f"topology: {topology_spec} ({topology.num_nodes} nodes, "
+        f"{topology.num_edges} edges)"
+    )
+
+    miner_config = _inject_topology(miner_config, miner_kind, topology)
+    core = MinerCore(node_id="quip-miner-mempool", miners_config=miner_config)
+    if not core.miner_handles:
+        click.echo(
+            f"no miner handles built for kind={miner_kind}", err=True
+        )
+        return 2
+
+    sampler = core.miner_handles[0]
+    sampler_nodes = tuple(int(n) for n in topology.nodes)
+    sampler_edges = tuple(
+        (int(u), int(v)) for u, v in topology.edges
+    )
+    sampler_topology_hash = topology_hash_from_nodes_edges(
+        sampler_nodes, sampler_edges
+    )
+
+    solver_type = MinerType.from_kind(miner_kind)
+
+    client = SubstrateClient(url=node_url)
+    await client.connect()
+
+    controller = MempoolMinerController(
+        client=client,
+        signer=keystore.signer,
+        miner_handles=core.miner_handles,
+        sampler_topology_hash=sampler_topology_hash,
+        solver_type=solver_type,
+        core=core,
+    )
+    click.echo(
+        f"mempool controller starting: solver_type={solver_type.name} "
+        f"topology_hash=0x{sampler_topology_hash.hex()[:16]}..."
+    )
+
+    telemetry = None
+    if rest_port is not None and rest_port > 0:
+        from shared.telemetry_api import TelemetryApiServer
+
+        telemetry = TelemetryApiServer(
+            core=core,
+            client=client,
+            signer=keystore.signer,
+            controller=None,  # PoW-specific stats; mempool telemetry is a Phase 9 follow-on
+            host="127.0.0.1",
+            port=rest_port,
+        )
+        await telemetry.start()
+        click.echo(
+            f"telemetry api: http://127.0.0.1:{rest_port}/api/v1/status"
+        )
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal_module.SIGINT, signal_module.SIGTERM):
+        loop.add_signal_handler(sig, controller.shutdown)
+
+    try:
+        await controller.run()
+    finally:
+        click.echo(f"controller stopped: stats={controller.stats}")
+        if telemetry is not None:
+            await telemetry.stop()
+        await client.close()
+        core.close()
+    return 0
+
+
+@quip_miner.command("mempool")
+@click.option("--node-url", required=True, help=_NODE_URL_HELP)
+@click.option(
+    "--signer-key",
+    "signer_key_path",
+    type=click.Path(dir_okay=False),
+    default="~/.quip-miner/signing.json",
+    show_default=True,
+    help=_SIGNER_KEY_HELP,
+)
+@click.option(
+    "--miner-kind",
+    type=click.Choice(["cpu", "gpu", "qpu"], case_sensitive=False),
+    default="cpu",
+    show_default=True,
+    help="Worker hardware family. Must match the kind used in "
+    "`quip-miner register-solver`.",
+)
+@click.option(
+    "--num-cpus",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Number of CPU SA workers (CPU kind only)",
+)
+@click.option(
+    "--topology",
+    "topology_spec",
+    default="zephyr:2,2",
+    show_default=True,
+    help=_TOPOLOGY_HELP,
+)
+@click.option(
+    "--rest-port",
+    type=int,
+    default=-1,
+    show_default=True,
+    help=_REST_PORT_HELP,
+)
+def quip_miner_mempool(
+    node_url: str,
+    signer_key_path: str,
+    miner_kind: str,
+    num_cpus: int,
+    topology_spec: str,
+    rest_port: int,
+) -> None:
+    """Run mempool-mode mining against QuantumComputeMempool.
+
+    Subscribes to JobProposed events, filters by topology + Bid mode,
+    mines each accepted order, submits the solution, and periodically
+    claims rewards for expired orders. The signing keystore must already
+    be registered as a solver — see `quip-miner register-solver`.
+
+    Phase 8c serves one job at a time, FIFO, with no PoW concurrency.
+    """
+    import asyncio
+
+    miner_config = {miner_kind: {"num_cpus": num_cpus} if miner_kind == "cpu" else {}}
+    raise SystemExit(asyncio.run(_run_mempool_miner(
+        miner_kind=miner_kind,
+        node_url=node_url,
+        signer_key_path=signer_key_path,
+        rest_port=rest_port,
+        topology_spec=topology_spec,
+        miner_config=miner_config,
+    )))
+
+
 @quip_miner.command("cpu")
 @click.option("--node-url", required=True, help=_NODE_URL_HELP)
 @click.option(

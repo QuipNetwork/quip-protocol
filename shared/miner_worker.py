@@ -158,6 +158,14 @@ def miner_worker_main(
         if op == "shutdown":
             logger.info(f"Shutting down miner {miner.miner_id}")
             stop_event.set()
+            # Wake any drainer blocked on `resp_q.get()`. Without this the
+            # parent-side `loop.run_in_executor(None, handle.resp.get)`
+            # blocks forever after worker exit (until Python 3.14's executor
+            # join timeout — 300s by default — fires during loop shutdown).
+            try:
+                resp_q.put({"op": "shutdown_ack"})
+            except Exception:  # noqa: BLE001 — best-effort
+                pass
             return
         elif op == "get_stats":
             data = miner.get_stats()
