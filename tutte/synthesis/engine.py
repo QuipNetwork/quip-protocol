@@ -46,6 +46,7 @@ from ..roots import (
     compute_cell_quotient_tree_dp,
 )
 from ..roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
+from ..transfer_matrix import compute_tutte_via_transfer_matrix
 from ..logs import EventType, LogLevel, get_log
 from ..lookup.core import MinorEntry, RainbowTable, load_default_table
 from ..polynomial import TuttePolynomial
@@ -455,6 +456,27 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 method="family_recognition",
             )
             # Family recognition is synthesis-from-formula; count the input.
+            self._record_synth(graph)
+            return result
+
+        # 1.5 Transfer matrix for periodic lattice strips — O(V+E) detection
+        # Handles grid (m > 2), triangular, honeycomb, square-octagon and
+        # elongated-triangular strips that family recognition doesn't cover.
+        # Runs before canonical_key to avoid the O(n² log n) cost for lattice
+        # graphs. The transfer-matrix module owns its own C-accelerated sweep
+        # over non-crossing partition states.
+        tm_poly = compute_tutte_via_transfer_matrix(graph)
+        if tm_poly is not None:
+            _log.record(EventType.SYNTHESIS_START, "engine",
+                        f"Transfer matrix: {n}n {m}e", LogLevel.INFO,
+                        graph=graph)
+            self._log(f"Transfer matrix: O(V+E) detection + sweep")
+            result = SynthesisResult(
+                polynomial=tm_poly,
+                recipe=["Transfer matrix"],
+                verified=True,
+                method="transfer_matrix",
+            )
             self._record_synth(graph)
             return result
 

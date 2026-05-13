@@ -1062,6 +1062,20 @@ def test_algebraic_engine_uses_new_atom_polynomials():
     T_k3 = engine.synthesize(complete_graph(3)).polynomial
     target = T_k8 * T_k3
 
+    # Self-warmup: ensure the K_8 and K_3 atoms exist by name in the table.
+    # `make benchmark` wipes table entries that aren't in NAMED_GRAPHS, so
+    # warmup-only atoms can disappear between runs. Add them in-process so
+    # this test doesn't depend on prior `python -m tutte.scripts.warmup_lookup_table`.
+    for name, g in (("K_3", complete_graph(3)), ("K_8", complete_graph(8))):
+        if table.lookup_by_name(name) is None:
+            poly = engine.synthesize(g).polynomial
+            key = g.canonical_key()
+            if key in table.entries:
+                # Same canonical_key under a different name — alias only.
+                table.name_index[name] = key
+            else:
+                table.add(g, name, poly)
+
     ae = AlgebraicSynthesisEngine(table=table, verbose=False)
     result = ae.synthesize_from_polynomial(target)
     assert result.verified

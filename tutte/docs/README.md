@@ -15,6 +15,7 @@ Detailed documentation for each technique used by the tutte synthesis engine to 
 | #   | Technique                                                      | When Used                                                                                            | Complexity                                             |
 | --- | -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
 | 1   | [Family Recognition](01_family_recognition.md)                 | Trees, cycles, wheels, fans, ladders, prisms, books, gears, Möbius ladders, grids, etc.              | **O(n + m)** — fastest path, runs before canonical-key |
+| 1.5 | [Transfer Matrix](01_1_transfer_matrix.md)                     | Periodic lattice strips: grids (`m ≥ 3`), triangular, honeycomb, square-octagon, elongated-triangular | O(V + E) detection + O(length × Catalan(width)²) sweep |
 | 2   | [Rainbow Table Lookup](02_rainbow_table_lookup.md)             | Canonical-key match against pre-computed polynomials                                                 | O(n² × d) — dominated by canonical key computation     |
 | 3   | [Base Cases](03_base_cases.md)                                 | Empty graph or single edge                                                                           | O(1)                                                   |
 | 4   | [Disconnected Factorization](04_disconnected_factorization.md) | Graph has multiple connected components                                                              | O(n + m) + recursive synthesis per component           |
@@ -36,7 +37,9 @@ Detailed documentation for each technique used by the tutte synthesis engine to 
 flowchart TD
     A[Input Graph] --> Z{1. Family recognition?\nO(n+m) fast path}
     Z -- hit --> R[Return polynomial]
-    Z -- miss --> B{2. Rainbow table?}
+    Z -- miss --> ZT{1.5 Transfer matrix?\nperiodic lattice strip}
+    ZT -- hit --> R
+    ZT -- miss --> B{2. Rainbow table?}
     B -- hit --> R
     B -- miss --> C{3. Base case?}
     C -- yes --> R

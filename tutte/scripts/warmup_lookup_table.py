@@ -30,11 +30,51 @@ import time
 
 import dwave_networkx as dnx
 import networkx as nx
-from tutte.graph import Graph
+from tutte.graph import Graph, grid_graph, path_graph, wheel_graph
 from tutte.lookup.binary import save_binary_rainbow_table
 from tutte.lookup.core import load_default_table
 from tutte.synthesis.engine import SynthesisEngine
 from tutte.validation import verify_spanning_trees
+
+
+# --- Family-recognition seed builders ---------------------------------------
+# Seeds for the `_LazyBases` loaders in tutte/family_recognition/constants.py.
+# `recognize_family()` returns None for wheel/fan/ladder/book/gear/prism/möbius
+# graphs unless these seeds are in the rainbow table.
+
+def _build_book(k):
+    """Book graph: k triangles sharing edge (0, 1)."""
+    G = nx.Graph()
+    G.add_edge(0, 1)
+    for i in range(k):
+        v = i + 2
+        G.add_edge(0, v)
+        G.add_edge(1, v)
+    return G
+
+
+def _gear(k):
+    """Gear graph: hub + k rim vertices + k subdivision vertices."""
+    G = nx.Graph()
+    for i in range(k):
+        G.add_edge(0, i + 1)
+        G.add_edge(i + 1, k + 1 + i)
+        G.add_edge(k + 1 + i, (i + 1) % k + 1)
+    return G
+
+
+def _prism(k):
+    """Prism graph C_k × K_2 (circular ladder)."""
+    return nx.circular_ladder_graph(k)
+
+
+def _mobius(k):
+    """Möbius ladder: 2k-cycle with k rungs connecting v_i to v_{i+k}."""
+    G = nx.cycle_graph(2 * k)
+    for i in range(k):
+        G.add_edge(i, i + k)
+    return G
+
 
 TARGETS = [
     # D-Wave headers (Phase 8.2) — cell lookups for larger D-Wave decompositions.
@@ -63,6 +103,32 @@ TARGETS = [
     ("K_5_5", lambda: nx.complete_bipartite_graph(5, 5)),
     ("K_5_6", lambda: nx.complete_bipartite_graph(5, 6)),
     ("K_6_6", lambda: nx.complete_bipartite_graph(6, 6)),
+
+    # Family-recognition recurrence seeds — feed _LazyBases loaders in
+    # tutte/family_recognition/constants.py. Without these, recognize_family
+    # returns None for wheel/fan/ladder/book/gear/prism/möbius graphs.
+    ("K_2", lambda: path_graph(2)),               # F_1 = single edge
+    ("C_4", lambda: nx.cycle_graph(4)),           # L_2
+    ("W_4", lambda: wheel_graph(4)),
+    ("B_2", lambda: _build_book(2)),              # Book k=2
+    ("Gear_3", lambda: _gear(3)),
+    ("Grid_2x3", lambda: grid_graph(2, 3)),       # L_3
+    ("Gear_4", lambda: _gear(4)),
+    ("Gear_5", lambda: _gear(5)),
+    # Prism seeds CL_3..CL_8
+    ("Prism_3", lambda: _prism(3)),
+    ("Prism_4", lambda: _prism(4)),
+    ("Prism_5", lambda: _prism(5)),
+    ("Prism_6", lambda: _prism(6)),
+    ("Prism_7", lambda: _prism(7)),
+    ("Prism_8", lambda: _prism(8)),
+    # Möbius seeds M_3..M_8
+    ("Mobius_3", lambda: _mobius(3)),
+    ("Mobius_4", lambda: _mobius(4)),
+    ("Mobius_5", lambda: _mobius(5)),
+    ("Mobius_6", lambda: _mobius(6)),
+    ("Mobius_7", lambda: _mobius(7)),
+    ("Mobius_8", lambda: _mobius(8)),
 
     # Still NOT default (intractable / too slow):
     #   ("Z2_1", lambda: dnx.zephyr_graph(2, 1)), # 40n 114e — saw 3.5 GB / >5 min before kill
@@ -132,23 +198,36 @@ def main() -> int:
         # the same canonical_key as the existing Cm1 entry — adding it
         # would overwrite Cm1, breaking gates that key on cell name).
         try:
-            g_check = Graph.from_networkx(builder())
+            built = builder()
         except Exception as e:
             print(f"  {name}: builder failed: {e}", file=sys.stderr)
             continue
+        g_check = built if isinstance(built, Graph) else Graph.from_networkx(built)
         check_key = g_check.canonical_key()
         if check_key in table.entries:
             existing_entry = table.entries[check_key]
-            print(
-                f"  {name}: canonical_key collision with existing entry "
-                f"'{existing_entry.name}' — skip (same polynomial, different name)",
-                file=sys.stderr,
-            )
+            if name not in table.name_index:
+                # Alias only — preserves the existing entry's primary name
+                # while making lookup_by_name(name) succeed (e.g. Mobius_3
+                # aliased to K_3_3 so family_recognition can find the seed).
+                table.name_index[name] = check_key
+                added += 1
+                print(
+                    f"  {name}: aliased to existing entry '{existing_entry.name}' "
+                    f"(same canonical_key)",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"  {name}: canonical_key collision with existing entry "
+                    f"'{existing_entry.name}' and name already aliased — skip",
+                    file=sys.stderr,
+                )
             continue
 
         print(f"  {name}: synthesizing (budget {args.timeout}s)...", file=sys.stderr,
               flush=True)
-        g = Graph.from_networkx(builder())
+        g = g_check
         engine = SynthesisEngine(table=table, verbose=False)
         engine.skip_target_lookup = True
 

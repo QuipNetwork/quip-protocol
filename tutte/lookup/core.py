@@ -14,6 +14,7 @@ canonical graph key (SHA256 of graph6 encoding). This enables:
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import json
 import os
 from dataclasses import dataclass, field
@@ -22,6 +23,43 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from ..graph import CellSignature, Graph, compute_signature
 from ..polynomial import TuttePolynomial, encode_varuint, decode_varuint
+
+
+# Per-worker caches populated once via ProcessPoolExecutor's `initializer`.
+# Each task then ships only (major_key, minor_key, mode, max_contractions) over
+# the IPC pipe instead of two graph objects — typically 30 bytes vs ~kilobytes.
+_WORKER_NX_CACHE: Dict[str, object] = {}     # canonical_key -> nx.Graph
+_WORKER_TUTTE_CACHE: Dict[str, 'Graph'] = {} # canonical_key -> tutte Graph
+
+
+def _init_worker_caches(nx_cache, tutte_cache):
+    """ProcessPoolExecutor initializer — runs once per worker."""
+    global _WORKER_NX_CACHE, _WORKER_TUTTE_CACHE
+    _WORKER_NX_CACHE = nx_cache
+    _WORKER_TUTTE_CACHE = tutte_cache
+
+
+def _verify_pair_worker(task):
+    """Worker for parallel Phase-2 minor verification.
+
+    Module-level (not a closure) so it pickles cleanly into ProcessPoolExecutor.
+    Reads graphs from the per-worker caches populated by `_init_worker_caches`.
+    """
+    major_key, minor_key, mode, max_contractions = task
+    if mode == 'mono':
+        # Same node count: VF2 subgraph monomorphism is the full test.
+        from networkx.algorithms.isomorphism import GraphMatcher
+        G_major = _WORKER_NX_CACHE[major_key]
+        G_minor = _WORKER_NX_CACHE[minor_key]
+        result = GraphMatcher(G_major, G_minor).subgraph_is_monomorphic()
+    else:
+        # Different node counts: BFS contraction + isomorphism (may be inconclusive).
+        from ..graphs.minor import is_graph_minor
+        G_major = _WORKER_TUTTE_CACHE[major_key]
+        G_minor = _WORKER_TUTTE_CACHE[minor_key]
+        result = is_graph_minor(G_major, G_minor,
+                                max_contractions=max_contractions)
+    return (major_key, minor_key, result)
 
 
 # =============================================================================
@@ -431,9 +469,7 @@ class RainbowTable:
 
         # Phase 2: verify suspicious pairs with actual graph minor check
         if verify:
-            import sys as _sys
             import time as _time
-            from networkx.algorithms.isomorphism import GraphMatcher as _GM
 
             def _progress(msg):
                 print(msg, flush=True)
@@ -448,56 +484,99 @@ class RainbowTable:
                 if entry.graph is not None:
                     nx_cache[key] = entry.graph.to_networkx()
 
-            # Count total suspicious pairs for progress reporting
-            total_suspicious = 0
+            # Collect every suspicious pair as a flat list of work items.
+            # Workers receive only (G_major, G_minor, needed, max_contractions);
+            # the (major_key, minor_key) is the bookkeeping handle.
+            work_items: List[Tuple[str, str, int]] = []
             for major_key, minor_keys in relationships.items():
                 major_entry = self.entries.get(major_key)
                 if major_entry is None or major_key not in nx_cache:
                     continue
+                major_is_tree = (major_entry.spanning_trees == 1
+                                 and major_entry.edge_count == major_entry.node_count - 1)
                 for minor_key in minor_keys:
                     minor_entry = self.entries.get(minor_key)
                     if minor_entry is None or minor_key not in nx_cache:
                         continue
                     is_minor_tree = (minor_entry.spanning_trees == 1
                                      and minor_entry.edge_count == minor_entry.node_count - 1)
-                    major_is_tree = (major_entry.spanning_trees == 1
-                                     and major_entry.edge_count == major_entry.node_count - 1)
                     same_nodes = (major_entry.node_count == minor_entry.node_count
                                   and major_entry.edge_count != minor_entry.edge_count)
                     if (is_minor_tree and not major_is_tree) or same_nodes:
-                        total_suspicious += 1
+                        needed = major_entry.node_count - minor_entry.node_count
+                        work_items.append((major_key, minor_key, needed))
 
+            total_suspicious = len(work_items)
             _progress(f"  Verifying {total_suspicious} suspicious pairs "
                       f"({len(nx_cache)} graphs cached)...")
 
-            checked = 0
             t_start = _time.perf_counter()
 
-            for major_key, minor_keys in list(relationships.items()):
-                major_entry = self.entries.get(major_key)
-                G_major = nx_cache.get(major_key)
-                if major_entry is None or G_major is None:
-                    continue
+            # Parallel dispatch. Each worker runs VF2 (subgraph monomorphism)
+            # for same-node-count pairs or `is_graph_minor` (BFS contraction)
+            # for different-node-count pairs. Workers see immutable copies of
+            # the nx.Graph + tutte.Graph data via pickle.
+            removed_pairs: Dict[str, Set[str]] = {}
 
-                to_remove = set()
-                for minor_key in list(minor_keys):
-                    minor_entry = self.entries.get(minor_key)
-                    G_minor = nx_cache.get(minor_key)
-                    if minor_entry is None or G_minor is None:
-                        continue
+            def _consume(major_key: str, minor_key: str, result: Optional[bool]) -> None:
+                nonlocal verified, removed, skipped
+                if result is False:
+                    removed_pairs.setdefault(major_key, set()).add(minor_key)
+                    removed += 1
+                elif result is True:
+                    verified += 1
+                else:
+                    skipped += 1
 
-                    # Determine if this pair is "suspicious" (likely false positive)
-                    is_minor_tree = (minor_entry.spanning_trees == 1
-                                     and minor_entry.edge_count == minor_entry.node_count - 1)
-                    major_is_tree = (major_entry.spanning_trees == 1
-                                     and major_entry.edge_count == major_entry.node_count - 1)
-                    same_nodes = (major_entry.node_count == minor_entry.node_count
-                                  and major_entry.edge_count != minor_entry.edge_count)
+            workers = max(1, (os.cpu_count() or 2) - 1)
+            use_parallel = workers > 1 and total_suspicious >= 1000
+            if use_parallel:
+                _progress(f"    parallel workers: {workers}")
+                # Tutte graph cache (for BFS contraction in is_graph_minor)
+                tutte_cache: Dict[str, 'Graph'] = {
+                    k: self.entries[k].graph
+                    for k in nx_cache
+                    if self.entries.get(k) and self.entries[k].graph is not None
+                }
+                # Slim task tuples — graphs come from worker caches populated
+                # once via the initializer, not pickled per task.
+                tasks = [
+                    (major_key, minor_key,
+                     'mono' if needed == 0 else 'minor',
+                     max_contractions)
+                    for major_key, minor_key, needed in work_items
+                ]
 
-                    suspicious = (is_minor_tree and not major_is_tree) or same_nodes
-                    if not suspicious:
-                        continue
-
+                with cf.ProcessPoolExecutor(
+                    max_workers=workers,
+                    initializer=_init_worker_caches,
+                    initargs=(nx_cache, tutte_cache),
+                ) as pool:
+                    checked = 0
+                    for major_key, minor_key, result in pool.map(
+                        _verify_pair_worker, tasks, chunksize=128,
+                    ):
+                        _consume(major_key, minor_key, result)
+                        checked += 1
+                        if total_suspicious > 1000 and checked % 25000 == 0:
+                            elapsed = _time.perf_counter() - t_start
+                            rate = checked / elapsed if elapsed > 0 else 0
+                            remaining = (total_suspicious - checked) / rate if rate > 0 else 0
+                            _progress(f"    {checked}/{total_suspicious} verified "
+                                      f"({elapsed:.0f}s elapsed, ~{remaining:.0f}s remaining)")
+            else:
+                from networkx.algorithms.isomorphism import GraphMatcher as _GM
+                checked = 0
+                for major_key, minor_key, needed in work_items:
+                    G_major = nx_cache[major_key]
+                    G_minor = nx_cache[minor_key]
+                    if needed == 0:
+                        result = _GM(G_major, G_minor).subgraph_is_monomorphic()
+                    else:
+                        result = is_graph_minor(self.entries[major_key].graph,
+                                                self.entries[minor_key].graph,
+                                                max_contractions=max_contractions)
+                    _consume(major_key, minor_key, result)
                     checked += 1
                     if total_suspicious > 1000 and checked % 25000 == 0:
                         elapsed = _time.perf_counter() - t_start
@@ -506,28 +585,10 @@ class RainbowTable:
                         _progress(f"    {checked}/{total_suspicious} verified "
                                   f"({elapsed:.0f}s elapsed, ~{remaining:.0f}s remaining)")
 
-                    needed = major_entry.node_count - minor_entry.node_count
-                    if needed == 0:
-                        # Same node count: subgraph monomorphism IS the full test
-                        # (no contractions needed — edge deletion only)
-                        if _GM(G_major, G_minor).subgraph_is_monomorphic():
-                            verified += 1
-                        else:
-                            to_remove.add(minor_key)
-                            removed += 1
-                    else:
-                        # Different node counts: structural rules + BFS contraction
-                        result = is_graph_minor(major_entry.graph, minor_entry.graph,
-                                               max_contractions=max_contractions)
-                        if result is False:
-                            to_remove.add(minor_key)
-                            removed += 1
-                        elif result is True:
-                            verified += 1
-                        else:
-                            skipped += 1
-
-                minor_keys -= to_remove
+            # Apply removals
+            for major_key, to_remove in removed_pairs.items():
+                if major_key in relationships:
+                    relationships[major_key] -= to_remove
 
             elapsed = _time.perf_counter() - t_start
             _progress(f"  Minor verification: {verified} confirmed, {removed} false positives removed, "

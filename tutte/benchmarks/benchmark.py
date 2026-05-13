@@ -26,7 +26,7 @@ import time
 
 import networkx as nx
 from tutte.graph import (Graph, complete_graph, cycle_graph, grid_graph,
-                         path_graph, petersen_graph, wheel_graph)
+                         petersen_graph, wheel_graph)
 from tutte.lookup import RainbowTable, save_binary_rainbow_table
 from tutte.polynomial import TuttePolynomial
 from tutte.synthesis import HybridSynthesisEngine, SynthesisEngine
@@ -144,7 +144,8 @@ def _build_graph_list():
     # Large D-Wave graphs: no deduplication needed (unique topologies)
     for name, builder in _try_dwave_graphs():
         g = builder()
-        deduped.append((name, g))
+        if g is not None:
+            deduped.append((name, g))
 
     deduped.sort(key=lambda x: (x[1].edge_count(), x[1].node_count(), x[0]))
     return deduped
@@ -233,6 +234,17 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
 
     hybrid_table = RainbowTable()
     hybrid_engine = HybridSynthesisEngine(table=hybrid_table)
+
+    # Pre-warm the cffi `_treewidth_c` JIT (~1.6s) so the first graph that
+    # would trigger it doesn't absorb the compile cost into its CEJ timing.
+    # Without this, the cost ends up on whichever non-trivial graph hits
+    # `_get_lib()` first — typically a small atlas graph (e.g. atlas_151
+    # at ~3s instead of ~3ms), making timings misleading.
+    from tutte.graphs._treewidth_c import _get_lib
+    try:
+        _get_lib()
+    except Exception:
+        pass  # C extension unavailable; engine falls back to pure Python anyway.
 
     graphs = _build_graph_list()
     results = []
