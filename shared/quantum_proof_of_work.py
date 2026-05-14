@@ -19,25 +19,39 @@ from dwave_topologies import DEFAULT_TOPOLOGY
 logger = get_logger('quantum_proof_of_work')
 
 
-def ising_nonce_from_block(prev_hash: bytes, miner_id: str, cur_index: int, salt: bytes) -> int:
-    """Generate deterministic nonce from block parameters using BLAKE3.
+def derive_nonce(
+    parent_hash: bytes,
+    miner: bytes,
+    block_number: int,
+    salt: bytes,
+) -> int:
+    """Generate deterministic nonce from byte-string identity material.
 
-    Matches Rust's derive_nonce() in quip-protocol-rs:
-      - Hashes raw bytes (not hex-encoded strings)
-      - Uses u32 big-endian for block index
-      - Returns u64 (8 bytes)
+    Mirrors `quantum_validation::derive_nonce` in `quip-protocol-rs`. Hashes
+    `parent_hash || miner || block_number_be(4B) || salt` with BLAKE3 and
+    returns the first 8 digest bytes as a big-endian `u64`.
+
+    Use this in Substrate mode where the miner identity is the SCALE-encoded
+    32-byte `AccountId32` (not a human-readable string).
     """
-    if not (0 <= cur_index < 2**32):
-        raise ValueError(
-            f"cur_index must be a u32 (0..2^32-1), got {cur_index}"
-        )
+    if not (0 <= block_number < 2**32):
+        raise ValueError(f"block_number must be a u32 (0..2^32-1), got {block_number}")
     hasher = blake3()
-    hasher.update(prev_hash)
-    hasher.update(miner_id.encode())
-    hasher.update(cur_index.to_bytes(4, 'big'))
+    hasher.update(parent_hash)
+    hasher.update(miner)
+    hasher.update(block_number.to_bytes(4, 'big'))
     hasher.update(salt)
-    digest = hasher.digest()
-    return int.from_bytes(digest[:8], 'big')
+    return int.from_bytes(hasher.digest()[:8], 'big')
+
+
+def ising_nonce_from_block(prev_hash: bytes, miner_id: str, cur_index: int, salt: bytes) -> int:
+    """Legacy nonce helper for the pre-substrate chain.
+
+    Same BLAKE3 construction as `derive_nonce` but the miner identity is a
+    human-readable string. Retained so the legacy `Node` / `NetworkNode`
+    paths keep working until Phase 5 deletes them.
+    """
+    return derive_nonce(prev_hash, miner_id.encode(), cur_index, salt)
 
 
 def generate_ising_model_from_nonce(
