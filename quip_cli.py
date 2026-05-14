@@ -14,6 +14,7 @@ import sys
 import json
 import time
 import asyncio
+from pathlib import Path
 from typing import Any, Dict, Optional, List
 
 import click
@@ -26,11 +27,13 @@ try:  # Python 3.11+
 except ModuleNotFoundError:  # Python 3.10
     import tomli as _toml  # type: ignore
 
-from shared.node import Node
-from shared.network_node import NetworkNode
 from shared.block import load_genesis_block
-from shared.version import get_version
+from shared.keystore import generate
 from shared.logging_config import setup_logging
+from shared.miner_bootstrap import BootstrapConfig, bootstrap
+from shared.network_node import NetworkNode
+from shared.node import Node
+from shared.version import get_version
 
 
 def _set_dwave_env(section: Dict[str, Any]) -> None:
@@ -737,8 +740,6 @@ def quip_network_smoketest(target: str, print_only: bool):
 )
 def quip_miner(log_level: str) -> None:
     """Substrate-integrated quantum mining frontend."""
-    from shared.logging_config import setup_logging  # local import: legacy CLI shouldn't pay the substrate cost
-
     setup_logging(log_level=log_level.upper(), node_name="quip-miner")
 
 
@@ -759,10 +760,6 @@ def quip_miner_keygen(out_path: str, overwrite: bool) -> None:
     stored in plaintext — adequate for dev workflows where the faucet bot
     runs alongside. Passphrase-encrypted keystores land in Phase 7.
     """
-    from pathlib import Path
-
-    from shared.keystore import generate
-
     keystore = generate(Path(out_path).expanduser(), overwrite=overwrite)
     click.echo(f"wrote keystore: {keystore.path}")
     click.echo(f"ss58 address:   {keystore.signer.ss58_address()}")
@@ -823,11 +820,6 @@ def quip_miner_bootstrap(
     Idempotent — re-running against a fully-bootstrapped account is a no-op
     that just verifies state.
     """
-    import asyncio
-    from pathlib import Path
-
-    from shared.miner_bootstrap import BootstrapConfig, bootstrap
-
     try:
         m_str, t_str = seed_topology_mt.split(",")
         topology_mt = (int(m_str), int(t_str))

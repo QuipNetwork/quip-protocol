@@ -74,26 +74,37 @@ def load(path: Path) -> KeystoreFile:
     if not path.exists():
         raise FileNotFoundError(f"keystore not found: {path}")
     _check_mode(path)
-    raw = json.loads(path.read_text())
+    try:
+        raw = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"keystore {path} is malformed JSON: {exc}") from exc
     if raw.get("version") != KEYSTORE_VERSION:
         raise ValueError(
-            f"keystore version {raw.get('version')} not supported; expected "
-            f"{KEYSTORE_VERSION}"
+            f"keystore {path} version {raw.get('version')} not supported; "
+            f"expected {KEYSTORE_VERSION}"
         )
     if raw.get("scheme") != "sr25519":
         raise ValueError(
-            f"keystore scheme {raw.get('scheme')!r} not supported in Phase 2; "
-            "hybrid scheme lands in Phase 7"
+            f"keystore {path} scheme {raw.get('scheme')!r} not supported in "
+            "Phase 2; hybrid scheme lands in Phase 7"
         )
     if raw.get("encrypted"):
         raise ValueError(
-            "keystore is marked encrypted; passphrase-protected keystores are "
-            "not supported yet (planned for Phase 7 alongside HybridSigner)"
+            f"keystore {path} is marked encrypted; passphrase-protected "
+            "keystores are not supported yet (planned for Phase 7 alongside "
+            "HybridSigner)"
         )
+    if "seed_hex" not in raw:
+        raise ValueError(f"keystore {path} is missing required field 'seed_hex'")
     seed_hex = raw["seed_hex"]
     if seed_hex.startswith("0x"):
         seed_hex = seed_hex[2:]
-    seed = bytes.fromhex(seed_hex)
+    try:
+        seed = bytes.fromhex(seed_hex)
+    except ValueError as exc:
+        raise ValueError(
+            f"keystore {path} has malformed 'seed_hex' field: {exc}"
+        ) from exc
     signer = Sr25519Signer.from_seed(seed)
     return KeystoreFile(path=path, signer=signer)
 
@@ -103,7 +114,7 @@ def load_or_generate(path: Path) -> KeystoreFile:
     path = Path(path).expanduser()
     if path.exists():
         return load(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     return generate(path)
 
 
@@ -113,7 +124,7 @@ def load_or_generate(path: Path) -> KeystoreFile:
 
 
 def _write(path: Path, signer: Sr25519Signer, seed: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = {
         "version": KEYSTORE_VERSION,
         "scheme": "sr25519",
@@ -122,11 +133,24 @@ def _write(path: Path, signer: Sr25519Signer, seed: bytes) -> None:
         "ss58": signer.ss58_address(),
         "account_id_hex": "0x" + signer.account_id_bytes().hex(),
     }
-    # Write to a sibling tempfile and rename so a crash mid-write can't leave
-    # a half-populated keystore on disk.
+    # Open the tempfile with O_EXCL + restrictive mode so the seed is never
+    # world-readable, even briefly. `Path.write_text` would create the file
+    # with the process umask (typically 0o644) and a later `chmod` leaves a
+    # race window where another local user can read the seed.
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2) + "\n")
-    os.chmod(tmp, KEYSTORE_FILE_MODE)
+    if tmp.exists():
+        tmp.unlink()
+    fd = os.open(
+        str(tmp),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        KEYSTORE_FILE_MODE,
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(payload, indent=2) + "\n")
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
     tmp.replace(path)
 
 

@@ -40,13 +40,23 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import dwave_networkx as dnx
-from substrateinterface import Keypair, KeypairType
 
 from shared.keystore import KeystoreFile, load_or_generate
 from shared.logging_config import get_logger
 from shared.signer import Sr25519Signer
 from shared.substrate_client import SubstrateClient
 from shared.substrate_types import SubstrateDifficulty
+
+
+# Dev chain names matched by prefix. Mirrors the list in `faucet_bot.py`,
+# which is intentionally standalone — duplicating here keeps both modules
+# loud-by-default about which chains they accept. `--chain=local3` reports
+# "Local Testnet (3 Validators)" so a prefix match keeps the list short.
+DEV_CHAIN_PREFIXES: Tuple[str, ...] = (
+    "Development",
+    "Local Testnet",
+    "quip-local",
+)
 
 
 logger = get_logger("miner_bootstrap")
@@ -143,6 +153,24 @@ async def bootstrap(config: BootstrapConfig) -> BootstrapResult:
 # ----------------------------------------------------------------------
 
 
+async def _assert_dev_chain(client: SubstrateClient) -> None:
+    """Refuse to issue sudo extrinsics against a non-dev chain.
+
+    The module docstring advertises this guard; the chain-side
+    `pallet_sudo::Key != //Alice` rejection is a backstop, not a
+    substitute. A non-dev runtime that happens to have a known sudo key
+    (misconfigured testnet, stale chainspec) would otherwise let
+    `--seed-chain` mutate production state.
+    """
+    chain_name = await client._run(lambda: client._iface.chain)  # noqa: SLF001
+    if not any(chain_name.startswith(p) for p in DEV_CHAIN_PREFIXES):
+        raise RuntimeError(
+            f"refusing --seed-chain against non-dev chain {chain_name!r}; "
+            f"allowed prefixes: {', '.join(DEV_CHAIN_PREFIXES)}"
+        )
+    logger.info("bootstrap verified dev chain: %s", chain_name)
+
+
 async def _maybe_seed_chain(
     client: SubstrateClient, config: BootstrapConfig
 ) -> Tuple[bool, bool]:
@@ -151,6 +179,7 @@ async def _maybe_seed_chain(
     Idempotent: returns `(topology_seeded, difficulty_seeded)` reflecting
     whether *this* call did the seeding. Both are False on re-runs.
     """
+    await _assert_dev_chain(client)
     sudo_signer = Sr25519Signer.from_uri(config.sudo_key_uri)
 
     difficulty_seeded = False
@@ -255,15 +284,13 @@ def _build_seed_topology(mt: Tuple[int, int]) -> Tuple[List[int], List[Tuple[int
     g = dnx.zephyr_graph(m=m, t=t)
     label_map = {label: idx for idx, label in enumerate(sorted(g.nodes()))}
     nodes = sorted(label_map.values())
+    # Pallet expects edges with u < v; networkx guarantees neither order, so
+    # canonicalize before sorting.
     edges = sorted(
-        (label_map[u], label_map[v])
+        (min(label_map[u], label_map[v]), max(label_map[u], label_map[v]))
         for u, v in g.edges()
         if label_map[u] != label_map[v]
     )
-    # Pallet expects edges with u < v; networkx guarantees neither order, so
-    # canonicalize.
-    edges = [(min(u, v), max(u, v)) for u, v in edges]
-    edges.sort()
     return nodes, edges
 
 

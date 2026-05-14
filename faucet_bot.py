@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 
 from aiohttp import web
+from scalecodec.utils.ss58 import ss58_decode
 from substrateinterface import Keypair, KeypairType, SubstrateInterface
 
 
@@ -191,7 +192,6 @@ class SubstrateFaucet:
                     },
                     status=429,
                 )
-            self._last_funded[normalized_dest] = now
 
         logger.info(
             "funding %s with %d plancks from %s",
@@ -205,10 +205,16 @@ class SubstrateFaucet:
                     lambda: self._submit_transfer(dest=dest, amount=amount)
                 )
         except Exception as exc:  # noqa: BLE001 — surface any RPC error to caller
+            # Don't burn the rate-limit slot — the transfer never happened,
+            # so retries should be allowed immediately rather than locking
+            # the caller out for `rate_limit_seconds`.
             logger.exception(
                 "faucet transfer failed: dest=%s amount=%d", dest, amount
             )
             return web.json_response({"error": str(exc)}, status=502)
+        # Commit the rate-limit slot only after the transfer succeeded.
+        async with self._rate_limit_lock:
+            self._last_funded[normalized_dest] = time.monotonic()
 
         if not getattr(receipt, "is_success", True):
             return web.json_response(
@@ -298,10 +304,26 @@ class SubstrateFaucet:
 
 
 def _normalize_dest(dest: str) -> str:
-    """Canonicalize dest as 0x-prefixed lowercase hex for rate-limit keys."""
+    """Canonicalize dest as 0x-prefixed lowercase hex for rate-limit keys.
+
+    Accepts both `0x...` hex and SS58-encoded addresses; both decode to the
+    same 32-byte AccountId, so they share one rate-limit slot. Without SS58
+    canonicalization a caller could alternate representations to bypass the
+    per-destination throttle.
+    """
     if dest.startswith("0x") or dest.startswith("0X"):
         return "0x" + dest[2:].lower()
-    return dest
+    # SS58 → public key bytes. ss58_decode raises on malformed input; we
+    # let that bubble up since the calling validation already passed.
+    try:
+        pubkey_hex = ss58_decode(dest)
+    except Exception:  # noqa: BLE001 — any decode failure → pass through
+        # If it's neither valid hex nor valid SS58, leave it as-is. The
+        # request will be rejected downstream by substrate-interface's own
+        # compose_call validation, with the original dest preserved for
+        # logging.
+        return dest
+    return "0x" + pubkey_hex.lower()
 
 
 def _is_port_free(host: str, port: int) -> bool:
