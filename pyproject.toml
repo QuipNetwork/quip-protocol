@@ -63,7 +63,7 @@ full = [
 ]
 
 dev = [
-    "pytest>=7.4,<9",
+    "pytest>=8.0,<9",
     "pytest-asyncio>=0.23.0",
 ]
 

@@ -50,21 +50,33 @@ def _fixture_path() -> Path | None:
     return sibling if sibling.exists() else None
 
 
+_FIXTURE_PATH = _fixture_path()
+_SKIP_REASON = (
+    "Rust parity fixture not found. Check out quip-protocol-rs alongside "
+    "this repo or set QUIP_RUST_FIXTURE_DIR=/path/to/fixtures."
+)
+
+
 def _load_cases():
-    path = _fixture_path()
-    if path is None:
-        # `allow_module_level=True` so this skips cleanly when called from
-        # the parametrize decorator at collection time. Without it pytest
-        # surfaces a collection error rather than a skip.
-        pytest.skip(
-            "Rust parity fixture not found. Check out quip-protocol-rs "
-            "alongside this repo or set QUIP_RUST_FIXTURE_DIR=/path/to/fixtures.",
-            allow_module_level=True,
-        )
-    return json.loads(path.read_text())["derive_nonce_cases"]
+    # Return a single skipped param when the fixture is missing so pytest
+    # collection succeeds — pytest 8.x errors on bare module-level
+    # pytest.skip(). The non-parametrized tests below still run without
+    # the Rust fixture.
+    if _FIXTURE_PATH is None:
+        return [
+            pytest.param(
+                None,
+                id="fixture-missing",
+                marks=pytest.mark.skip(reason=_SKIP_REASON),
+            )
+        ]
+    return [
+        pytest.param(case, id=case["name"])
+        for case in json.loads(_FIXTURE_PATH.read_text())["derive_nonce_cases"]
+    ]
 
 
-@pytest.mark.parametrize("case", _load_cases(), ids=lambda c: c["name"])
+@pytest.mark.parametrize("case", _load_cases())
 def test_derive_nonce_matches_rust(case):
     parent_hash = bytes.fromhex(case["parent_hash_hex"])
     salt = bytes.fromhex(case["salt_hex"])
