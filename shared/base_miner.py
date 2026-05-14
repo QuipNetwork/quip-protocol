@@ -25,13 +25,21 @@ from shared.energy_utils import (
 )
 from shared.miner_types import IsingSample, MiningResult, Sampler
 from shared.quantum_proof_of_work import (
+    derive_nonce,
     evaluate_sampleset,
     ising_nonce_from_block,
     generate_ising_model_from_nonce,
 )
+from shared.substrate_types import SubstrateMiningContext
 
 # Global logger for this module
 log = logging.getLogger(__name__)
+
+# Emit a progress log line every N sampling attempts. 10 is a balance between
+# noise (one line per attempt is too chatty for the slow miners) and
+# observability (one line per minute on the typical CPU/GPU cadence).
+PROGRESS_LOG_INTERVAL = 10
+
 
 class BaseMiner(ABC):
     """Abstract base class for concrete miners (Template Method pattern).
@@ -610,6 +618,188 @@ class BaseMiner(ABC):
         return None
 
     # ------------------------------------------------------------------
+    # Substrate-mode entry point (Phase 3)
+    # ------------------------------------------------------------------
+
+    def mine_work_item(
+        self,
+        context: SubstrateMiningContext,
+        stop_event: multiprocessing.synchronize.Event,
+        **kwargs,
+    ) -> Optional[MiningResult]:
+        """Protocol-neutral mining loop driven by an on-chain snapshot.
+
+        This is the substrate-mode replacement for ``mine_block``. Key
+        differences vs the legacy path:
+
+        - identity material is the 32-byte SCALE-encoded ``AccountId32`` in
+          ``context.miner_account_bytes``, not a human-readable miner id;
+          nonces come from ``derive_nonce(parent_hash, miner_bytes,
+          block_number, salt)``.
+        - difficulty is a fixed snapshot (``context.difficulty``); no
+          per-loop ``compute_current_requirements`` decay. The controller
+          cancels and restarts on each new chain head instead.
+        - no ``top_attempts`` cache: stale samples are dropped on
+          cancellation rather than re-evaluated under relaxed thresholds.
+        - batch sampling (``_sample_batch``) is intentionally bypassed.
+          ``IsingFeeder`` still uses string-based miner identity, so the
+          batch path would produce nonces that don't match the chain's
+          ``derive_nonce``. Re-enabling batch for substrate mode is a
+          Phase 4 follow-on that updates ``IsingFeeder`` to byte identity.
+
+        Args:
+            context: Atomic on-chain mining context (parent hash, block
+                number, topology, difficulty, miner account, h_values).
+            stop_event: Worker cancellation event. The controller sets
+                this on new-head, deregistration, or shutdown.
+            **kwargs: Forwarded to ``_pre_mine_setup``.
+
+        Returns:
+            A ``MiningResult`` if a valid solution is found before the
+            stop event fires; ``None`` otherwise.
+        """
+        # -- setup --------------------------------------------------------
+        self.mining = True
+        self.top_attempts = []
+        start_time = time.time()
+        self.current_round_attempted = True
+        self.logger.info(
+            f"mine_work_item: block_number={context.block_number} "
+            f"parent=0x{context.parent_hash.hex()[:16]}... "
+            f"topology=0x{context.topology_hash.hex()[:16]}... "
+            f"nodes={len(context.nodes)} edges={len(context.edges)}"
+        )
+
+        # Synthesize legacy types from the substrate context so the hook
+        # methods (``_pre_mine_setup``, ``_adapt_mining_params``,
+        # ``evaluate_sampleset``) keep working unchanged. ``BlockRequirements``
+        # uses float energy / diversity; convert from milli-precision.
+        requirements = _block_requirements_from_difficulty(context.difficulty)
+        bridge_prev_block = _BridgePrevBlock.from_context(context)
+        bridge_node_info = _BridgeNodeInfo.from_context(context)
+
+        # ``prev_timestamp`` is used by the legacy difficulty-decay code path
+        # (which we don't run here) and propagated into ``MiningResult`` for
+        # telemetry. Pass 0 — Phase 6 will swap to a real chain-derived
+        # timestamp once the controller plumbs one through.
+        prev_timestamp = 0
+
+        # One-time miner-specific initialisation. Bridge objects expose
+        # ``.header.index``, ``.hash``, ``.miner_id`` so existing hooks work.
+        if not self._pre_mine_setup(
+            bridge_prev_block, bridge_node_info, requirements,
+            prev_timestamp, stop_event, **kwargs,
+        ):
+            return None
+
+        # Topology and adaptive params: same shape as ``mine_block`` so
+        # subclass hooks behave identically. Adapt once — no decay-driven
+        # re-adaptation in substrate mode.
+        nodes = self.sampler.nodes
+        edges = self.sampler.edges
+        params = self._adapt_mining_params(requirements, nodes, edges)
+        self.logger.info(f"{self.miner_id} - adaptive params: {params}")
+
+        current_num_sweeps = params.get('num_sweeps', 64)
+        num_reads = params.get('num_reads', 100)
+        extra_params = {
+            k: v for k, v in params.items()
+            if k not in ('num_reads', 'num_sweeps')
+        }
+
+        progress = 0
+        try:
+            while self.mining and not stop_event.is_set():
+                # Fresh salt and nonce per iteration. The Rust pallet validates
+                # this exact derivation in ``submit_proof``.
+                salt = random.randbytes(32)
+                nonce = derive_nonce(
+                    context.parent_hash,
+                    context.miner_account_bytes,
+                    context.block_number,
+                    salt,
+                )
+                h, J = generate_ising_model_from_nonce(
+                    nonce, nodes, edges, list(context.h_values),
+                )
+
+                preprocess_start = time.time()
+                self.current_stage = 'preprocessing'
+                self.current_stage_start = preprocess_start
+
+                try:
+                    sample_start = time.time()
+                    self.current_stage = 'sampling'
+                    self.current_stage_start = sample_start
+                    sampleset = self._sample(
+                        h, J,
+                        num_reads=num_reads,
+                        num_sweeps=current_num_sweeps,
+                        nonce_seed=nonce,
+                        **extra_params,
+                    )
+                    sample_time = time.time() - sample_start
+                    self.timing_stats['sampling'].append(sample_time * 1e6)
+                    self.timing_stats['preprocessing'].append(
+                        (sample_start - preprocess_start) * 1e6,
+                    )
+                except Exception as exc:
+                    if self._on_sampling_error(exc, stop_event):
+                        return None
+                    continue
+
+                sampleset = self._post_sample(sampleset)
+                if stop_event.is_set():
+                    return None
+
+                postprocess_start = time.time()
+                self.current_stage = 'postprocessing'
+                self.current_stage_start = postprocess_start
+
+                self.timing_stats['total_samples'] += len(
+                    sampleset.record.energy,
+                )
+                self.timing_stats['blocks_attempted'] += 1
+
+                result = self.evaluate_sampleset(
+                    sampleset, requirements, nodes, edges,
+                    nonce, salt, prev_timestamp, start_time,
+                )
+
+                self.timing_stats['postprocessing'].append(
+                    (time.time() - postprocess_start) * 1e6,
+                )
+
+                if result:
+                    self.logger.info(
+                        f"[work-item block={context.block_number}] mined! "
+                        f"nonce={nonce} salt=0x{salt.hex()[:8]}... "
+                        f"energy={result.energy:.2f} "
+                        f"solutions={result.num_valid} "
+                        f"diversity={result.diversity:.3f} "
+                        f"attempt_time={result.mining_time:.2f}s "
+                        f"total_time={time.time() - start_time:.2f}s"
+                    )
+                    return result
+
+                progress += 1
+                if progress % PROGRESS_LOG_INTERVAL == 0:
+                    best_energy = (
+                        min(self.top_attempts[0].sampleset.record.energy)
+                        if self.top_attempts
+                        else float('inf')
+                    )
+                    self.logger.info(
+                        f"progress: {progress} attempts, "
+                        f"best energy: {best_energy:.2f} | "
+                        f"sweeps={current_num_sweeps} reads={num_reads}"
+                    )
+            self.logger.info("mine_work_item: stopped, no valid result")
+            return None
+        finally:
+            self._post_mine_cleanup()
+
+    # ------------------------------------------------------------------
     # Hook methods (override in subclasses as needed)
     # ------------------------------------------------------------------
 
@@ -720,6 +910,85 @@ class BaseMiner(ABC):
     def evaluate_sampleset(self, sampleset: dimod.SampleSet, requirements: BlockRequirements, nodes: List[int], edges: List[Tuple[int, int]], nonce: int, salt: bytes, prev_timestamp: int, start_time: float) -> Optional[MiningResult]:
         """Convert a sample set into a mining result if it meets requirements, otherwise return None."""
         return evaluate_sampleset(sampleset, requirements, nodes, edges, nonce, salt, prev_timestamp, start_time, self.miner_id, self.miner_type)
+
+
+# ----------------------------------------------------------------------
+# Helpers for ``mine_work_item``
+# ----------------------------------------------------------------------
+
+
+def _block_requirements_from_difficulty(difficulty) -> BlockRequirements:
+    """Synthesize a legacy ``BlockRequirements`` from a substrate
+    ``SubstrateDifficulty``.
+
+    Chain storage uses milli-precision integers; the legacy mining loop and
+    its hooks expect float fields. Convert at this boundary so subclasses
+    (CPU/GPU/QPU) don't need to know about substrate at all.
+
+    ``timeout_to_difficulty_adjustment_decay`` is set to a sentinel
+    ``2**31 - 1`` so any code that accidentally computes decay against it
+    (e.g. ``compute_current_requirements``) is a no-op. Substrate mode has
+    no decay — the controller cancels on head change instead.
+    """
+    return BlockRequirements(
+        difficulty_energy=difficulty.max_energy,
+        min_diversity=difficulty.min_diversity,
+        min_solutions=difficulty.min_solutions,
+        timeout_to_difficulty_adjustment_decay=2**31 - 1,
+    )
+
+
+@dataclass(frozen=True)
+class _BridgePrevBlockHeader:
+    index: int
+
+
+@dataclass(frozen=True)
+class _BridgePrevBlock:
+    """Minimal duck-typed `prev_block` for substrate-mode hook compatibility.
+
+    Concrete miners read ``prev_block.header.index`` and ``prev_block.hash``
+    inside their ``_pre_mine_setup`` overrides. We expose the substrate
+    snapshot's ``block_number`` and ``parent_hash`` under those same names
+    so the hooks run unchanged.
+    """
+
+    header: _BridgePrevBlockHeader
+    hash: bytes
+
+    @classmethod
+    def from_context(cls, context: SubstrateMiningContext) -> "_BridgePrevBlock":
+        # The chain expects the proof to derive the nonce against the
+        # snapshot's `block_number`. The legacy code computes
+        # `cur_index = prev_block.header.index + 1` then derives the nonce
+        # from `cur_index`, so we pre-subtract 1 here to keep the +1 dance
+        # equivalent and minimise blast radius in subclasses.
+        return cls(
+            header=_BridgePrevBlockHeader(index=context.block_number - 1),
+            hash=context.parent_hash,
+        )
+
+
+@dataclass(frozen=True)
+class _BridgeNodeInfo:
+    """Minimal duck-typed `node_info` for substrate-mode hook compatibility.
+
+    Legacy hooks read ``node_info.miner_id`` (a string). Substrate uses
+    raw account bytes; we expose them as a stable hex string so logs and
+    IsingFeeder-free paths keep working. The actual nonce derivation in
+    ``mine_work_item`` uses ``derive_nonce(... miner_account_bytes ...)``
+    directly, so this string is for telemetry only.
+    """
+
+    miner_id: str
+    miner_account_bytes: bytes
+
+    @classmethod
+    def from_context(cls, context: SubstrateMiningContext) -> "_BridgeNodeInfo":
+        return cls(
+            miner_id="0x" + context.miner_account_bytes.hex(),
+            miner_account_bytes=context.miner_account_bytes,
+        )
 
 
 def compare_mining_samples(sample_a: IsingSample, sample_b: IsingSample, requirements: BlockRequirements) -> int:
