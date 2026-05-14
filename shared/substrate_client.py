@@ -556,8 +556,9 @@ def _coerce_receipt(receipt: Any) -> ExtrinsicReceipt:
                 type(receipt).__name__,
             )
     events: list = []
+    raw_events = getattr(receipt, "triggered_events", None) or []
     try:
-        for ev in receipt.triggered_events or []:
+        for ev in raw_events:
             events.append(ev.value if hasattr(ev, "value") else dict(ev))
     except (AttributeError, TypeError) as exc:
         # Don't silently swallow — empty events combined with no error would
