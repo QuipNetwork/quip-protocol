@@ -195,7 +195,7 @@ class SubstrateClient:
 
     async def query_difficulty(self) -> Optional[SubstrateDifficulty]:
         result = await self._run(lambda: self._iface.query("QuantumPow", "Difficulty"))
-        if result is None or result.value is None:
+        if result is None or not _result_was_found(result) or result.value is None:
             return None
         v = result.value
         return SubstrateDifficulty(
@@ -328,6 +328,20 @@ class SubstrateClient:
 
 def _strip_0x(s: str) -> str:
     return s[2:] if s.startswith("0x") else s
+
+
+def _result_was_found(result) -> bool:
+    """Whether a substrate-interface storage query actually hit data.
+
+    Substrate's `StorageValue<_, T>` returns `T::default()` instead of `None`
+    when storage is empty (an OptionQuery quirk in substrate-interface's
+    decoder). The `meta_info` dict carries an explicit `result_found` flag
+    which is the only reliable way to distinguish empty-with-default from
+    actually-stored. Returns True if the field is missing — that path is
+    only taken for query types where the result is unambiguously decoded.
+    """
+    meta = getattr(result, "meta_info", None) or {}
+    return meta.get("result_found", True)
 
 
 def _hex(b: bytes) -> str:
