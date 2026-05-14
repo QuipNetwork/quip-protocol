@@ -228,9 +228,18 @@ def miner_worker_main(
             # Substrate-mode entry point. The controller (Phase 4) pushes a
             # SubstrateMiningContext through the request queue; the worker
             # hands it to BaseMiner.mine_work_item which runs the
-            # protocol-neutral search loop. Same stop_event semantics as the
-            # legacy mine_block op — parent's cancel() and clear() bracket
-            # the call.
+            # protocol-neutral search loop.
+            #
+            # Unlike `mine_block`, we always emit *something* on resp_q
+            # after mine_work_item returns — either the MiningResult or a
+            # `{"op": "work_item_done"}` sentinel. The controller uses the
+            # sentinel to synchronize cancellation: cancel() sets the
+            # shared stop_event, the worker exits the loop, pushes the
+            # sentinel, the controller observes it, then dispatches the
+            # next context. Without this ack the controller's
+            # cancel→clear→dispatch cycle can wipe a cancel before the
+            # worker observes it, leaving the worker mining the old
+            # context against a stop_event tied to the new dispatch.
             context = msg.get("context")
             if context is None:
                 resp_q.put({"op": "error", "message": "Missing context for mine_work_item", "id": spec.get("id")})
@@ -247,6 +256,8 @@ def miner_worker_main(
             else:
                 if result is not None:
                     resp_q.put(result)
+                else:
+                    resp_q.put({"op": "work_item_done", "id": spec.get("id")})
         else:
             resp_q.put({"op": "error", "message": f"Unknown op {op}", "id": spec.get("id")})
             logger.info(f"{miner.miner_id}: Unknown op {op}")
