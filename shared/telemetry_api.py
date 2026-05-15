@@ -30,10 +30,9 @@ omitted. Dashboards that consume them should migrate to the substrate-side
 events / Prometheus endpoints exposed by the node directly (port 9615 on
 the default docker setup).
 """
+
 from __future__ import annotations
 
-import asyncio
-import json
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -79,6 +78,12 @@ async def error_middleware(request: web.Request, handler) -> web.Response:
     except web.HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "unhandled exception in handler for %s %s: %s",
+            request.method,
+            request.path,
+            exc,
+        )
         return web.json_response(
             {
                 "success": False,
@@ -132,7 +137,9 @@ class TelemetryApiServer:
         app.router.add_get("/api/v1/stats", self.handle_stats)
         app.router.add_get("/api/v1/block/latest", self.handle_block_latest)
         app.router.add_get("/api/v1/block/{block_number}", self.handle_block)
-        app.router.add_get("/api/v1/block/{block_number}/header", self.handle_block_header)
+        app.router.add_get(
+            "/api/v1/block/{block_number}/header", self.handle_block_header
+        )
         app.router.add_post("/api/v1/solve", self.handle_solve)
         app.router.add_get("/", self.handle_index)
         app.router.add_route("*", "/{path:.*}", self.handle_not_found)
@@ -158,20 +165,22 @@ class TelemetryApiServer:
         return self._success({"status": "ok"})
 
     async def handle_index(self, _request: web.Request) -> web.Response:
-        return self._success({
-            "service": "quip-miner",
-            "version": get_version(),
-            "endpoints": [
-                {"GET": "/health"},
-                {"GET": "/api/v1/status"},
-                {"GET": "/api/v1/system"},
-                {"GET": "/api/v1/stats"},
-                {"GET": "/api/v1/block/latest"},
-                {"GET": "/api/v1/block/{block_number}"},
-                {"GET": "/api/v1/block/{block_number}/header"},
-                {"POST": "/api/v1/solve"},
-            ],
-        })
+        return self._success(
+            {
+                "service": "quip-miner",
+                "version": get_version(),
+                "endpoints": [
+                    {"GET": "/health"},
+                    {"GET": "/api/v1/status"},
+                    {"GET": "/api/v1/system"},
+                    {"GET": "/api/v1/stats"},
+                    {"GET": "/api/v1/block/latest"},
+                    {"GET": "/api/v1/block/{block_number}"},
+                    {"GET": "/api/v1/block/{block_number}/header"},
+                    {"POST": "/api/v1/solve"},
+                ],
+            }
+        )
 
     async def handle_not_found(self, _request: web.Request) -> web.Response:
         return self._error("not found", "NOT_FOUND", status=404)
@@ -181,23 +190,30 @@ class TelemetryApiServer:
         head_number = await self.client.get_block_number(at=head_hash)
         miner_account = self.signer.account_id_bytes()
         miner_info = await self.client.query_miner(miner_account)
-        return self._success({
-            "ss58_address": self.signer.ss58_address(),
-            "account_id_hex": "0x" + miner_account.hex(),
-            "node_id": self.core.node_id,
-            "is_mining": self.controller is not None,
-            "uptime_seconds": int(time.time() - self._started_at) if self._started_at else 0,
-            "chain": {
-                "head_hash": "0x" + head_hash.hex(),
-                "head_number": head_number,
-            },
-            "miner_registered": miner_info is not None,
-            "miner_info": _miner_info_dict(miner_info) if miner_info else None,
-            "miners": [
-                {"id": h.miner_id, "type": h.miner_type}
-                for h in self.core.miner_handles
-            ],
-        })
+        return self._success(
+            {
+                "ss58_address": self.signer.ss58_address(),
+                "account_id_hex": "0x" + miner_account.hex(),
+                "node_id": self.core.node_id,
+                "is_mining": (
+                    self.controller is not None
+                    and not self.controller._shutdown_event.is_set()  # noqa: SLF001
+                ),
+                "uptime_seconds": int(time.time() - self._started_at)
+                if self._started_at
+                else 0,
+                "chain": {
+                    "head_hash": "0x" + head_hash.hex(),
+                    "head_number": head_number,
+                },
+                "miner_registered": miner_info is not None,
+                "miner_info": _miner_info_dict(miner_info) if miner_info else None,
+                "miners": [
+                    {"id": h.miner_id, "type": h.miner_type}
+                    for h in self.core.miner_handles
+                ],
+            }
+        )
 
     async def handle_system(self, _request: web.Request) -> web.Response:
         return self._success(self.core.descriptor())
@@ -227,7 +243,9 @@ class TelemetryApiServer:
         block_hash = await self._block_hash_for_number(block_number)
         if block_hash is None:
             return self._error(
-                f"block {block_number} not found", "BLOCK_NOT_FOUND", status=404,
+                f"block {block_number} not found",
+                "BLOCK_NOT_FOUND",
+                status=404,
             )
         return self._success(await self._block_payload(at=block_hash))
 
@@ -238,10 +256,14 @@ class TelemetryApiServer:
         block_hash = await self._block_hash_for_number(block_number)
         if block_hash is None:
             return self._error(
-                f"block {block_number} not found", "BLOCK_NOT_FOUND", status=404,
+                f"block {block_number} not found",
+                "BLOCK_NOT_FOUND",
+                status=404,
             )
         payload = await self._block_payload(at=block_hash)
-        return self._success({"header": payload.get("header"), "hash": payload.get("hash")})
+        return self._success(
+            {"header": payload.get("header"), "hash": payload.get("hash")}
+        )
 
     async def handle_solve(self, request: web.Request) -> web.Response:
         """POST /api/v1/solve — direct DWave Ising sample.
@@ -272,8 +294,10 @@ class TelemetryApiServer:
 
     async def _block_hash_for_number(self, block_number: int) -> Optional[bytes]:
         """Resolve block_number → block_hash via chain RPC."""
+
         def _resolve() -> Optional[str]:
             return self.client._iface.get_block_hash(block_id=block_number)  # noqa: SLF001
+
         result = await self.client._run(_resolve)  # noqa: SLF001
         if not result or result in ("0x" + "00" * 32, None):
             return None
@@ -301,6 +325,7 @@ class TelemetryApiServer:
         returned, so we coerce through `_to_jsonable` before handing the
         dict to `json_response`.
         """
+
         def _query() -> dict:
             block = self.client._iface.get_block(block_hash="0x" + at.hex())  # noqa: SLF001
             return block
@@ -350,18 +375,29 @@ def _to_jsonable(obj: Any) -> Any:
     serializable"; calling `.value` on a ScaleType gives the decoded
     primitive (str / int / list / dict). Walk the structure and unwrap.
     """
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    # Render binary as 0x-hex to match the rest of the API surface
+    # (e.g. block hashes, account ids). Without this, raw `bytes` in the
+    # decoded header (parent hash, state root, digest payload) would
+    # stringify via repr() as `b'\\x00...'` — valid Python but useless
+    # to any dashboard parsing the response as hex.
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        return "0x" + bytes(obj).hex()
     if isinstance(obj, dict):
         return {k: _to_jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_to_jsonable(v) for v in obj]
-    if isinstance(obj, (str, int, float, bool)) or obj is None:
-        return obj
-    # ScaleType and friends carry the decoded value under `.value`. Fall
-    # back to repr() for anything else so the endpoint stays observable
-    # even if substrate-interface ever changes its return shape.
-    val = getattr(obj, "value", None)
-    if val is not None and val is not obj:
-        return _to_jsonable(val)
+    # ScaleType and friends carry the decoded value under `.value`. Use
+    # `hasattr` rather than `getattr(..., None)`: a ScaleType that legit
+    # decodes to `None` (e.g. an empty `Option<T>`) should serialize as
+    # JSON `null`, not as `repr(obj)`.
+    if hasattr(obj, "value"):
+        val = obj.value
+        if val is not obj:
+            return _to_jsonable(val)
+    # Fall back to repr() so the endpoint stays observable even if
+    # substrate-interface ever changes its return shape.
     return repr(obj)
 
 
