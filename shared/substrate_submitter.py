@@ -48,14 +48,20 @@ def encode_quantum_proof(
     solutions = [_normalize_spins(sol) for sol in result.solutions]
     h_values_milli = [int(round(v * MILLI_SCALE)) for v in context.h_values]
 
+    # NodesOf<T> / EdgesOf<T> / SolutionsOf<T> / FieldsOf<T> / SaltOf<T> are
+    # all `BoundedVec<...>` which substrate metadata exposes as a 1-field
+    # composite. scalecodec requires the inner Vec wrapped in a single-element
+    # tuple — same rule as the bootstrap's register_topology call.
     return {
         "topology_hash": "0x" + context.topology_hash.hex(),
         "nonce": int(result.nonce),
-        "salt": "0x" + result.salt.hex(),
-        "nodes": nodes,
-        "edges": [(int(u), int(v)) for u, v in edges],
-        "solutions": solutions,
-        "h_values": h_values_milli,
+        "salt": ([int(b) for b in result.salt],),
+        "nodes": (nodes,),
+        "edges": ([(int(u), int(v)) for u, v in edges],),
+        # Inner BoundedVec also needs wrapping — every solution is a
+        # BoundedVec<i8, MaxSpins>, the outer is BoundedVec<_, MaxSolutions>.
+        "solutions": ([(sol,) for sol in solutions],),
+        "h_values": (h_values_milli,),
     }
 
 
@@ -73,12 +79,24 @@ async def submit_proof(
     controller is responsible for classifying them — see Phase 4 plan.
     """
     proof = encode_quantum_proof(result, context)
+    # Logging notes: salt and solutions are now wrapped as `(value,)`
+    # composite tuples (see encode_quantum_proof). The raw bytes/lists
+    # are at index 0 of each.
+    nodes_inner = proof["nodes"][0]
+    edges_inner = proof["edges"][0]
     logger.info(
-        "submitting QuantumPow.submit_proof: nonce=%d salt=%s solutions=%d block=%d",
+        "submitting QuantumPow.submit_proof: nonce=%d salt=0x%s... "
+        "solutions=%d block=%d nodes_count=%d edges_count=%d "
+        "first_node=%s first_edge=%s topology_hash=%s",
         proof["nonce"],
-        proof["salt"][:18] + "...",
-        len(proof["solutions"]),
+        result.salt.hex()[:8],
+        len(proof["solutions"][0]),
         context.block_number,
+        len(nodes_inner),
+        len(edges_inner),
+        nodes_inner[0] if nodes_inner else None,
+        edges_inner[0] if edges_inner else None,
+        proof["topology_hash"],
     )
     return await client.submit_extrinsic(
         call_module="QuantumPow",

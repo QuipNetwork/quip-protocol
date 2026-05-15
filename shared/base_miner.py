@@ -690,13 +690,24 @@ class BaseMiner(ABC):
             bridge_prev_block, bridge_node_info, requirements,
             prev_timestamp, stop_event, **kwargs,
         ):
+            # QPU budget exhausted, GPU device init failed, etc. The legacy
+            # `mine_block` swallowed this case silently; here we surface it
+            # so the worker's resp_q sentinel actually means "tried and
+            # got nothing", not "couldn't start".
+            self.logger.warning(
+                "mine_work_item: _pre_mine_setup returned False, aborting "
+                "attempt for block=%d", context.block_number,
+            )
             return None
 
-        # Topology and adaptive params: same shape as ``mine_block`` so
-        # subclass hooks behave identically. Adapt once — no decay-driven
-        # re-adaptation in substrate mode.
-        nodes = self.sampler.nodes
-        edges = self.sampler.edges
+        # Topology comes from the chain snapshot, not the local sampler.
+        # The Phase 4 controller validates `self.sampler.topology_hash ==
+        # context.topology_hash` at startup, but threading context's nodes
+        # / edges through here directly means a misconfigured sampler
+        # surfaces as a clear sampling exception rather than silently
+        # producing proofs the chain rejects for InvalidTopology.
+        nodes = list(context.nodes)
+        edges = list(context.edges)
         params = self._adapt_mining_params(requirements, nodes, edges)
         self.logger.info(f"{self.miner_id} - adaptive params: {params}")
 
@@ -784,19 +795,17 @@ class BaseMiner(ABC):
 
                 progress += 1
                 if progress % PROGRESS_LOG_INTERVAL == 0:
-                    best_energy = (
-                        min(self.top_attempts[0].sampleset.record.energy)
-                        if self.top_attempts
-                        else float('inf')
-                    )
+                    # `self.top_attempts` is intentionally not maintained in
+                    # substrate mode — no best-energy field to surface here.
                     self.logger.info(
-                        f"progress: {progress} attempts, "
-                        f"best energy: {best_energy:.2f} | "
-                        f"sweeps={current_num_sweeps} reads={num_reads}"
+                        "mine_work_item progress: %d attempts | "
+                        "sweeps=%d reads=%d",
+                        progress, current_num_sweeps, num_reads,
                     )
             self.logger.info("mine_work_item: stopped, no valid result")
             return None
         finally:
+            self.mining = False
             self._post_mine_cleanup()
 
     # ------------------------------------------------------------------

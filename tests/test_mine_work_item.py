@@ -25,6 +25,7 @@ from shared.base_miner import (
 )
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
+from shared.quantum_proof_of_work import derive_nonce
 from shared.substrate_submitter import encode_quantum_proof
 from shared.substrate_types import (
     CANONICAL_H_VALUES,
@@ -115,18 +116,29 @@ def test_mine_work_item_result_encodes_to_quantum_proof(cpu_miner, relaxed_conte
     stop = mp.Event()
     result = cpu_miner.mine_work_item(relaxed_context, stop)
     proof = encode_quantum_proof(result, relaxed_context)
-    # Shape matches pallet QuantumProof: hex hashes, int nonce/salt, vec
-    # nodes/edges/solutions, milli-precision h_values.
+    # Shape matches pallet QuantumProof. The chain's BoundedVec fields are
+    # 1-field composites in metadata so the encoder wraps every Vec in a
+    # single-element tuple; assertions unpack those wrappers.
     assert proof["topology_hash"] == "0x" + relaxed_context.topology_hash.hex()
     assert proof["nonce"] == result.nonce
-    assert proof["salt"] == "0x" + result.salt.hex()
-    assert set(proof["nodes"]) == set(relaxed_context.nodes)
-    assert len(proof["edges"]) == len(relaxed_context.edges)
-    assert len(proof["solutions"]) >= relaxed_context.difficulty.min_solutions
-    # Every spin in every solution is ±1 (chain rejects 0).
-    for sol in proof["solutions"]:
-        assert all(s in (-1, 1) for s in sol)
-    assert proof["h_values"] == [-1000, 0, 1000]
+
+    salt_bytes, = proof["salt"]
+    assert bytes(salt_bytes) == result.salt
+
+    nodes, = proof["nodes"]
+    assert set(nodes) == set(relaxed_context.nodes)
+
+    edges, = proof["edges"]
+    assert len(edges) == len(relaxed_context.edges)
+
+    solutions, = proof["solutions"]
+    assert len(solutions) >= relaxed_context.difficulty.min_solutions
+    for wrapped_sol in solutions:
+        inner_sol, = wrapped_sol
+        assert all(s in (-1, 1) for s in inner_sol)
+
+    h_values, = proof["h_values"]
+    assert h_values == [-1000, 0, 1000]
 
 
 def test_mine_work_item_observes_stop_event(cpu_miner, relaxed_context):
@@ -190,6 +202,96 @@ def test_miner_handle_dispatches_mine_work_item(relaxed_context):
         pytest.fail("worker did not produce a MiningResult before deadline")
     finally:
         handle.cancel()
+        handle.req.put({"op": "shutdown"})
+        handle.proc.join(timeout=5)
+        if handle.proc.is_alive():
+            handle.proc.terminate()
+            handle.proc.join(timeout=2)
+
+
+def test_mine_work_item_nonce_matches_chain_derivation(cpu_miner, relaxed_context):
+    """The produced nonce must equal `derive_nonce(parent_hash,
+    miner_account_bytes, block_number, salt)` — byte-exact against the
+    Rust pallet's validation derivation. A regression that accidentally
+    uses the legacy `ising_nonce_from_block` (string identity) would
+    silently produce proofs the chain rejects."""
+    stop = mp.Event()
+    result = cpu_miner.mine_work_item(relaxed_context, stop)
+    expected = derive_nonce(
+        relaxed_context.parent_hash,
+        relaxed_context.miner_account_bytes,
+        relaxed_context.block_number,
+        result.salt,
+    )
+    assert result.nonce == expected
+
+
+@pytest.mark.timeout(120)
+def test_miner_handle_emits_work_item_done_sentinel_on_cancel(relaxed_context):
+    """When `mine_work_item` returns None (cancelled or no valid result),
+    the worker must put a `{"op": "work_item_done", "id": ...}` sentinel on
+    resp_q so the controller's cancel→clear→dispatch cycle has an
+    observable acknowledgment. Without this the controller would hang on
+    `resp_q.get()` after every cancel."""
+    spec = {"id": "test-cpu-cancel", "kind": "cpu", "args": {}}
+    handle = MinerHandle(spec=spec)
+    try:
+        impossibly_hard = SubstrateMiningContext(
+            block_number=relaxed_context.block_number,
+            parent_hash=relaxed_context.parent_hash,
+            topology_hash=relaxed_context.topology_hash,
+            nodes=relaxed_context.nodes,
+            edges=relaxed_context.edges,
+            difficulty=SubstrateDifficulty(
+                min_solutions=5,
+                max_energy_milli=-10**18,
+                min_diversity_milli=1000,
+                min_quality_milli=1000,
+            ),
+            miner_account_bytes=relaxed_context.miner_account_bytes,
+        )
+        handle.mine_work_item(impossibly_hard)
+        # Cancel after a brief moment so the worker enters the loop and
+        # then observes the stop event.
+        time.sleep(0.5)
+        handle.cancel()
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            try:
+                msg = handle.resp.get(timeout=5)
+            except Exception:
+                continue
+            if isinstance(msg, dict) and msg.get("op") == "work_item_done":
+                assert msg.get("id") == "test-cpu-cancel"
+                return
+            if isinstance(msg, dict) and msg.get("op") == "error":
+                pytest.fail(f"worker errored: {msg.get('message')}")
+            if isinstance(msg, MiningResult):
+                pytest.fail("expected work_item_done sentinel, got a result")
+        pytest.fail("no work_item_done sentinel before deadline")
+    finally:
+        handle.req.put({"op": "shutdown"})
+        handle.proc.join(timeout=5)
+        if handle.proc.is_alive():
+            handle.proc.terminate()
+            handle.proc.join(timeout=2)
+
+
+def test_miner_handle_error_sentinel_on_missing_context():
+    """`op=mine_work_item` with no `context` key must produce an
+    `{"op": "error", ...}` sentinel keyed by miner id. Without this the
+    controller cannot distinguish a stuck worker from a malformed request."""
+    spec = {"id": "test-cpu-bad", "kind": "cpu", "args": {}}
+    handle = MinerHandle(spec=spec)
+    try:
+        handle.stop_event.clear()
+        handle.req.put({"op": "mine_work_item"})  # no "context"
+        msg = handle.resp.get(timeout=20)
+        assert isinstance(msg, dict)
+        assert msg["op"] == "error"
+        assert "context" in msg["message"].lower()
+        assert msg["id"] == "test-cpu-bad"
+    finally:
         handle.req.put({"op": "shutdown"})
         handle.proc.join(timeout=5)
         if handle.proc.is_alive():

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from shared.substrate_client import _decode_mining_snapshot
+from shared.substrate_client import SubstrateClient, _decode_mining_snapshot
 from shared.substrate_types import SubstrateDifficulty
 
 
@@ -134,3 +134,110 @@ def test_decode_field_error_includes_field_name():
     truncated = "0x01" + (5).to_bytes(4, "little").hex() + "ab" * 10
     with pytest.raises(ValueError, match="parent_hash"):
         _decode_mining_snapshot(truncated)
+
+
+# ----------------------------------------------------------------------
+# get_mining_snapshot off-by-one regression test (P1 review finding)
+# ----------------------------------------------------------------------
+
+
+async def _make_snapshot_client_with_fake_rpc(encoded_hex: str) -> SubstrateClient:
+    """Build a SubstrateClient whose `_iface.rpc_request` returns a known
+    snapshot, bypassing connect() / websocket setup."""
+    client = SubstrateClient.__new__(SubstrateClient)
+    client.url = "ws://test.invalid:0"
+    client._iface = None
+    client._lock = None  # type: ignore[assignment]
+
+    class _FakeIface:
+        def rpc_request(self, method, params):  # noqa: D401
+            return {"result": encoded_hex}
+
+    client._iface = _FakeIface()  # type: ignore[assignment]
+
+    # _run wraps blocking calls in a thread; for tests we'd rather execute
+    # synchronously to avoid bringing up an executor. Monkey-patch on the
+    # instance so the production async path stays untouched.
+    async def _direct_run(fn):
+        return fn()
+
+    client._run = _direct_run  # type: ignore[assignment]
+    return client
+
+
+@pytest.mark.parametrize(
+    "raw_block, at_hash, expected_block, expected_parent",
+    [
+        # When `at` is set (mining path), the controller validates against
+        # the block where the extrinsic LANDS — that's raw_block + 1, with
+        # parent_hash = at (the hash of raw_block).
+        (
+            42,
+            b"\xab" * 32,
+            43,
+            b"\xab" * 32,
+        ),
+        (
+            12_345,
+            b"\x10" * 32,
+            12_346,
+            b"\x10" * 32,
+        ),
+        (
+            0,
+            b"\xff" * 32,
+            1,
+            b"\xff" * 32,
+        ),
+    ],
+)
+async def test_get_mining_snapshot_applies_plus_one_offset_when_at_set(
+    raw_block, at_hash, expected_block, expected_parent
+):
+    """Regression: `submit_proof` validates against `System::block_number()`
+    at the block where the extrinsic lands, not the head we queried at.
+    Without the +1 offset every proof was rejected with `InvalidNonce`.
+    """
+    encoded = _build_snapshot_hex(
+        block_number=raw_block,
+        parent_hash=b"\x99" * 32,  # decoder-emitted; should be OVERWRITTEN by `at`
+        difficulty=SubstrateDifficulty(1, -1000, 0, 0),
+        topology_hash=b"\xcd" * 32,
+        nodes=[0, 1, 2, 3],
+        edges=[(0, 1), (1, 2), (2, 3)],
+    )
+    client = await _make_snapshot_client_with_fake_rpc(encoded)
+
+    ctx = await client.get_mining_snapshot(
+        at=at_hash,
+        topology_hash=None,
+        miner_account_bytes=b"\x42" * 32,
+    )
+
+    assert ctx is not None
+    assert ctx.block_number == expected_block
+    assert ctx.parent_hash == expected_parent
+
+
+async def test_get_mining_snapshot_no_offset_when_at_none():
+    """State-probe callers (e.g. bootstrap idempotency check) pass `at=None`
+    and expect the raw snapshot values, not the +1-offset version."""
+    encoded = _build_snapshot_hex(
+        block_number=42,
+        parent_hash=b"\x99" * 32,
+        difficulty=SubstrateDifficulty(1, -1000, 0, 0),
+        topology_hash=b"\xcd" * 32,
+        nodes=[0, 1, 2, 3],
+        edges=[(0, 1), (1, 2), (2, 3)],
+    )
+    client = await _make_snapshot_client_with_fake_rpc(encoded)
+
+    ctx = await client.get_mining_snapshot(
+        at=None,
+        topology_hash=None,
+        miner_account_bytes=b"\x42" * 32,
+    )
+
+    assert ctx is not None
+    assert ctx.block_number == 42  # raw, not 43
+    assert ctx.parent_hash == b"\x99" * 32  # decoded, not overwritten

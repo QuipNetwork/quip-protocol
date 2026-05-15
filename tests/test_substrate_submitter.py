@@ -73,15 +73,19 @@ def test_encode_quantum_proof_field_shape():
     result = _make_result()
     proof = encode_quantum_proof(result, ctx)
 
+    # nodes / edges / solutions / h_values / salt are BoundedVec on the
+    # chain side, which scalecodec wants wrapped as a 1-tuple composite.
+    # Each `proof[field]` is `(inner,)` and the inner solutions are
+    # additionally wrapped per BoundedVec<i8, MaxSpins>.
     assert proof["nonce"] == 12345
     assert proof["topology_hash"] == "0x" + ("22" * 32)
-    assert proof["salt"] == "0x" + ("ab" * 32)
-    assert proof["nodes"] == [0, 1, 2, 3]
-    assert proof["edges"] == [(0, 1), (1, 2), (2, 3)]
+    assert proof["salt"] == ([0xab] * 32,)
+    assert proof["nodes"] == ([0, 1, 2, 3],)
+    assert proof["edges"] == ([(0, 1), (1, 2), (2, 3)],)
     # h_values default = (-1.0, 0.0, 1.0); milli round-trip is exact.
-    assert proof["h_values"] == [-1000, 0, 1000]
-    # Boolean solution normalized to ±1.
-    assert proof["solutions"] == [[-1, 1, -1, 1]]
+    assert proof["h_values"] == ([-1000, 0, 1000],)
+    # Boolean solution normalized to ±1, double-wrapped per BoundedVec.
+    assert proof["solutions"] == ([([-1, 1, -1, 1],)],)
 
 
 def test_encode_falls_back_to_context_nodes_when_empty():
@@ -91,16 +95,16 @@ def test_encode_falls_back_to_context_nodes_when_empty():
     ctx = _make_context()
     result = _make_result(node_list=[], edge_list=[])
     proof = encode_quantum_proof(result, ctx)
-    assert proof["nodes"] == ctx.nodes
-    assert proof["edges"] == list(ctx.edges)
+    assert proof["nodes"] == (ctx.nodes,)
+    assert proof["edges"] == (list(ctx.edges),)
 
 
 def test_encode_uses_result_nodes_when_present():
     ctx = _make_context(nodes=[0, 1, 2, 3], edges=[(0, 1), (1, 2), (2, 3)])
     result = _make_result(node_list=[10, 11], edge_list=[(10, 11)])
     proof = encode_quantum_proof(result, ctx)
-    assert proof["nodes"] == [10, 11]
-    assert proof["edges"] == [(10, 11)]
+    assert proof["nodes"] == ([10, 11],)
+    assert proof["edges"] == ([(10, 11)],)
 
 
 def test_encode_rejects_empty_solutions():
@@ -142,14 +146,10 @@ def test_coerce_edges_rejects_wrong_arity():
 def test_h_values_milli_rounding():
     # Fractional h_values must round, not truncate — silently swapping
     # `round` for `int` would shift the milli value and produce a
-    # different on-chain proof hash. 0.1234 distinguishes them clearly:
-    # round(0.1234 * 1000) == 123, int(0.1234 * 1000) == 123 too (both
-    # toward zero for positive), but round vs int diverge for the
-    # negative case below.
+    # different on-chain proof hash. h_values is a BoundedVec → wrapped
+    # in a 1-tuple by encode_quantum_proof; the inner list is at [0].
     ctx = _make_context(h_values=(-0.7891, 0.0, 1.0))
     proof = encode_quantum_proof(_make_result(), ctx)
-    # round(-789.1) == -789; int(-789.1) == -789 — same here. The
-    # contract we care about is that the result is the *rounded* int.
-    assert proof["h_values"][0] == -789
-    # And that 0.0 stays 0:
-    assert proof["h_values"][1] == 0
+    milli = proof["h_values"][0]
+    assert milli[0] == -789
+    assert milli[1] == 0
