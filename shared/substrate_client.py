@@ -28,9 +28,21 @@ from typing import Any, Awaitable, Callable, Literal, Optional
 
 from scalecodec.base import ScaleBytes
 from scalecodec.types import GenericExtrinsic
+from scalecodec.utils.ss58 import ss58_decode
 from substrateinterface import SubstrateInterface
 
 from shared.logging_config import get_logger
+from shared.mempool_types import (
+    IsingParams,
+    JobMode,
+    JobOrder,
+    MempoolSolverInfo,
+    MinerType,
+    OrderStatus,
+    OrderTiming,
+    ResultDelivery,
+    RewardResolution,
+)
 from shared.signer import Signer
 from shared.substrate_types import (
     ExtrinsicReceipt,
@@ -253,14 +265,8 @@ class SubstrateClient:
     # QuantumComputeMempool storage queries
     # ------------------------------------------------------------------
 
-    async def query_solver(self, account: bytes):
-        """Return `QuantumComputeMempool.Solvers[account]`, or None.
-
-        Late-imports `MempoolSolverInfo` / `MinerType` so the type module
-        only loads when callers actually touch mempool state.
-        """
-        from shared.mempool_types import MempoolSolverInfo, MinerType
-
+    async def query_solver(self, account: bytes) -> Optional[MempoolSolverInfo]:
+        """Return `QuantumComputeMempool.Solvers[account]`, or None."""
         if len(account) != 32:
             raise ValueError(f"account must be 32 bytes, got {len(account)}")
         result = await self._run(
@@ -279,7 +285,7 @@ class SubstrateClient:
             rewards_earned=int(v["rewards_earned"]),
         )
 
-    async def query_job_order(self, order_id: int):
+    async def query_job_order(self, order_id: int) -> Optional[JobOrder]:
         """Return `QuantumComputeMempool.JobOrders[order_id]`, or None.
 
         The decoded `JobOrder` carries the full ising problem definition
@@ -287,17 +293,6 @@ class SubstrateClient:
         mode, and lifecycle status — enough to drive `mine_work_item`
         without a follow-on query.
         """
-        from shared.mempool_types import (
-            IsingParams,
-            JobMode,
-            JobOrder,
-            MinerType,
-            OrderStatus,
-            OrderTiming,
-            ResultDelivery,
-            RewardResolution,
-        )
-
         result = await self._run(
             lambda: self._iface.query(
                 "QuantumComputeMempool", "JobOrders", [order_id]
@@ -365,12 +360,26 @@ class SubstrateClient:
             value = getattr(er, "value", er)
             event_field = value.get("event", value) if isinstance(value, dict) else value
             if not isinstance(event_field, dict):
+                logger.debug(
+                    "get_events_at: skipping non-dict event record: %s",
+                    type(event_field).__name__,
+                )
                 continue
             module_id = event_field.get("module_id") or event_field.get("event_module")
             event_id = event_field.get("event_id") or event_field.get("event_name")
-            attrs = event_field.get("attributes")
+            # substrate-interface may use "attributes" (metadata v14+) or
+            # "params" (older EventRecord path) depending on chain metadata
+            # version. Try both before the nested fallback.
+            attrs = event_field.get("attributes") or event_field.get("params")
             if attrs is None:
-                attrs = event_field.get("event", {}).get("attributes")
+                inner_event = event_field.get("event")
+                if isinstance(inner_event, dict):
+                    attrs = inner_event.get("attributes")
+            if attrs is None and module_id:
+                logger.debug(
+                    "get_events_at: no attributes/params for %s.%s",
+                    module_id, event_id,
+                )
             out.append({
                 "module_id": str(module_id) if module_id is not None else "",
                 "event_id": str(event_id) if event_id is not None else "",
@@ -476,6 +485,10 @@ class SubstrateClient:
 
             if wait_for == "sent":
                 resp = self._iface.rpc_request("author_submitExtrinsic", [ext_hex])
+                if "error" in resp:
+                    raise RuntimeError(
+                        f"author_submitExtrinsic rejected: {resp['error']}"
+                    )
                 return {
                     "extrinsic_hash": ext_hash,
                     "block_hash": None,
@@ -644,15 +657,12 @@ def _decode_account_id(value) -> bytes:
         if value.startswith("0x"):
             return bytes.fromhex(value[2:])
         # SS58 — decode via scalecodec's helper.
-        from scalecodec.utils.ss58 import ss58_decode
         return bytes.fromhex(ss58_decode(value))
     raise ValueError(f"unrecognized AccountId shape: {value!r}")
 
 
-def _decode_job_mode(value):
+def _decode_job_mode(value) -> JobMode:
     """Decode a `JobMode` tagged-enum storage value."""
-    from shared.mempool_types import JobMode, MinerType
-
     if isinstance(value, str):
         # Bare-string SCALE encoding for the no-field variant.
         if value == "Open":
@@ -679,10 +689,8 @@ def _decode_job_mode(value):
     raise ValueError(f"unrecognized JobMode shape: {value!r}")
 
 
-def _decode_result_delivery(value):
+def _decode_result_delivery(value) -> ResultDelivery:
     """Decode a `ResultDelivery` tagged-enum storage value."""
-    from shared.mempool_types import ResultDelivery
-
     if isinstance(value, str):
         if value == "OnChainOnly":
             return ResultDelivery.on_chain_only()
@@ -696,6 +704,10 @@ def _decode_result_delivery(value):
             endpoint = bytes.fromhex(_strip_0x(endpoint))
         elif isinstance(endpoint, list):
             endpoint = bytes(endpoint)
+        if endpoint is None:
+            raise ValueError(
+                f"_decode_result_delivery: {tag!r} requires a non-None endpoint"
+            )
         if tag == "Callback":
             return ResultDelivery.callback(endpoint)
         if tag == "CallbackWithPoll":

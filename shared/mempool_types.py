@@ -7,11 +7,11 @@ as `call_params` and so we can decode storage / event payloads back into
 typed Python.
 
 Coupled to a specific pallet version: regenerate when the Rust types
-change. Parity is exercised by `tests/test_mempool_codec.py`.
+change. Parity is exercised by `tests/test_mempool_types.py`.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import List, Optional, Tuple
 
@@ -94,7 +94,10 @@ class OrderStatus(IntEnum):
 
     @classmethod
     def from_scale_variant(cls, name: str) -> "OrderStatus":
-        return {"Opened": cls.OPENED, "Expired": cls.EXPIRED, "Closed": cls.CLOSED}[name]
+        try:
+            return {"Opened": cls.OPENED, "Expired": cls.EXPIRED, "Closed": cls.CLOSED}[name]
+        except KeyError:
+            raise ValueError(f"unknown SCALE OrderStatus variant: {name!r}")
 
 
 # ----------------------------------------------------------------------
@@ -137,6 +140,11 @@ class RewardResolution:
     @classmethod
     def from_scale_value(cls, value) -> "RewardResolution":
         if isinstance(value, str):
+            if value != "SingleBest":
+                raise ValueError(
+                    f"unknown bare-string RewardResolution variant: {value!r}; "
+                    "only 'SingleBest' has no inner fields"
+                )
             return cls(tag=value)
         if isinstance(value, dict) and len(value) == 1:
             (tag, inner), = value.items()
@@ -209,7 +217,7 @@ class JobMode:
             return {"Open": None}
         if self.tag == "Bid":
             miners_field = (
-                [m for m in self.miners] if self.miners is not None else None
+                ["0x" + m.hex() for m in self.miners] if self.miners is not None else None
             )
             miner_types_field = (
                 [mt.to_scale_variant() for mt in self.miner_types]

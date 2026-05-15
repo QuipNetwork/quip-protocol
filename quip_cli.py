@@ -13,15 +13,16 @@ SubstrateMinerController.
 from __future__ import annotations
 
 import asyncio
-import multiprocessing
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import click
 
-from shared.keystore_hybrid import generate
+from shared.keystore_hybrid import generate, load
 from shared.logging_config import setup_logging
+from shared.mempool_types import MinerType
 from shared.miner_bootstrap import BootstrapConfig, bootstrap
+from shared.substrate_client import SubstrateClient
 
 
 @click.group(name="quip-miner")
@@ -193,20 +194,13 @@ def quip_miner_register_solver(
     surfaced to job proposers via `mode = Bid{miner_types: [...]}` filters.
     Use `quip-miner deregister-solver` to opt out.
     """
-    import asyncio
-    from pathlib import Path
-
-    from shared.keystore_hybrid import load
-    from shared.mempool_types import MinerType
-    from shared.substrate_client import SubstrateClient
-
     keystore = load(Path(signer_key_path).expanduser())
     mt = MinerType.from_kind(miner_type)
 
     async def _do() -> int:
         client = SubstrateClient(url=node_url)
-        await client.connect()
         try:
+            await client.connect()
             existing = await client.query_solver(keystore.signer.account_id_bytes())
             if existing is not None:
                 if existing.solver_type != mt:
@@ -260,18 +254,12 @@ def quip_miner_deregister_solver(node_url: str, signer_key_path: str) -> None:
     message). After deregistration, submit_solution / claim_reward
     extrinsics will fail with `SolverNotRegistered` until you re-register.
     """
-    import asyncio
-    from pathlib import Path
-
-    from shared.keystore_hybrid import load
-    from shared.substrate_client import SubstrateClient
-
     keystore = load(Path(signer_key_path).expanduser())
 
     async def _do() -> int:
         client = SubstrateClient(url=node_url)
-        await client.connect()
         try:
+            await client.connect()
             existing = await client.query_solver(keystore.signer.account_id_bytes())
             if existing is None:
                 click.echo("solver not registered; nothing to do")
@@ -354,7 +342,6 @@ async def _run_miner(
     and a `SubstrateMinerController`. Runs the controller until KeyboardInterrupt.
     """
     import asyncio
-    import hashlib
     import signal as signal_module
     from pathlib import Path
 

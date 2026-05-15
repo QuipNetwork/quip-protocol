@@ -90,13 +90,14 @@ async def test_register_and_deregister_solver(tmp_path):
         # collides), deregister first so the test starts clean.
         existing = await client.query_solver(keystore.signer.account_id_bytes())
         if existing is not None:
-            await client.submit_extrinsic(
+            cleanup = await client.submit_extrinsic(
                 "QuantumComputeMempool",
                 "deregister_solver",
                 {},
                 keystore.signer,
                 wait_for="inblock",
             )
+            assert cleanup.error is None, f"cleanup deregister failed: {cleanup.error}"
 
         receipt = await client.submit_extrinsic(
             "QuantumComputeMempool",
