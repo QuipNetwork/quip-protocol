@@ -24,12 +24,14 @@ What this module deliberately does NOT do yet:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from typing import Any, Awaitable, Callable, Literal, Optional
 
 from scalecodec.base import ScaleBytes
 from scalecodec.types import GenericExtrinsic
 from substrateinterface import SubstrateInterface
 
+from shared.hybrid_signer import HybridSigner
 from shared.logging_config import get_logger
 from shared.signer import Signer
 from shared.substrate_types import (
@@ -319,8 +321,6 @@ class SubstrateClient:
         the SCALE-encoded wire bytes ourselves; submission and
         inclusion-wait both go through substrate-interface's RPC layer.
         """
-        from shared.hybrid_signer import HybridSigner
-
         if not isinstance(signer, HybridSigner):
             raise TypeError(
                 f"hybrid signing requires a HybridSigner, got {type(signer).__name__}"
@@ -368,9 +368,14 @@ class SubstrateClient:
                             "block_hash": res["inblock"],
                             "finalized": False,
                         }
-                elif result in ("dropped", "invalid"):
+                elif isinstance(result, str) and result in _HYBRID_TERMINAL_FAILURES:
+                    # `dropped` / `invalid` / `usurped` / `retracted` /
+                    # `finalityTimeout` are all terminal — without raising
+                    # here the subscription would silently keep waiting and
+                    # callers would hang forever.
+                    self._iface.rpc_request("author_unwatchExtrinsic", [subscription_id])
                     raise ValueError(f"hybrid extrinsic rejected: {result}")
-                # otherwise keep waiting
+                return None  # non-terminal status — keep waiting
 
             response = self._iface.rpc_request(
                 "author_submitAndWatchExtrinsic",
@@ -380,10 +385,34 @@ class SubstrateClient:
             return response
 
         result = await self._run(_do)
+        block_hash = result.get("block_hash")
+        error_msg = None
+        if block_hash:
+            # author_submitAndWatchExtrinsic only reports that the extrinsic
+            # made it into a block — a `System.ExtrinsicFailed` event still
+            # means the chain rejected the dispatch. Without this fetch
+            # callers see `is_success=True` for a chain-rejected proof and
+            # silently treat it as accepted. Fetch the block's events and
+            # surface any ExtrinsicFailed matching our hash.
+            try:
+                error_msg = await self._run(
+                    lambda: _fetch_extrinsic_dispatch_error(
+                        self._iface,
+                        block_hash=block_hash,
+                        ext_hash=result["extrinsic_hash"],
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Event fetch is best-effort — surface the inability to
+                # classify as a non-fatal error rather than letting the
+                # extrinsic look fully successful.
+                error_msg = f"event fetch failed: {exc}"
+                logger.warning("hybrid extrinsic event fetch failed: %s", exc)
         return ExtrinsicReceipt(
             extrinsic_hash=str(result.get("extrinsic_hash") or result.get("result") or ""),
-            block_hash=str(result.get("block_hash") or "") or None,
+            block_hash=str(block_hash or "") or None,
             is_finalized=bool(result.get("finalized", False)),
+            error=error_msg,
         )
 
     # ------------------------------------------------------------------
@@ -470,6 +499,72 @@ class SubstrateClient:
 # ----------------------------------------------------------------------
 
 
+# Terminal transaction-pool states returned by `author_submitAndWatchExtrinsic`
+# that indicate the extrinsic will never finalize. Without enumerating these
+# the subscription handler silently falls through and the caller hangs.
+# Source: substrate-interface `pool::watch::TransactionStatus` variants
+# (`dropped`, `invalid`, `usurped`, `retracted`, `finalityTimeout`).
+_HYBRID_TERMINAL_FAILURES: frozenset = frozenset(
+    {"dropped", "invalid", "usurped", "retracted", "finalitytimeout"}
+)
+
+
+def _fetch_extrinsic_dispatch_error(
+    iface: SubstrateInterface, *, block_hash: str, ext_hash: str
+) -> Optional[str]:
+    """Return a `Module(error=...)` string if the chain rejected dispatch.
+
+    `author_submitAndWatchExtrinsic` only reports "this hit a block" — but
+    the runtime may still emit `System.ExtrinsicFailed` for that extrinsic
+    index. The sr25519 path inspects this via substrate-interface's typed
+    `ExtrinsicReceipt`; the hybrid path bypasses that, so we query the
+    block's events directly and stringify any `ExtrinsicFailed` matching
+    our extrinsic. Returns None on dispatch success.
+    """
+    block = iface.get_block(block_hash=block_hash, include_author=False)
+    if block is None:
+        return None
+    target_hash = _strip_0x(ext_hash).lower()
+    extrinsics = block.get("extrinsics") or []
+    ext_idx: Optional[int] = None
+    for idx, ext in enumerate(extrinsics):
+        eh = getattr(ext, "extrinsic_hash", None) or (
+            ext.get("extrinsic_hash") if isinstance(ext, dict) else None
+        )
+        if eh and _strip_0x(str(eh)).lower() == target_hash:
+            ext_idx = idx
+            break
+    if ext_idx is None:
+        return None
+    events = iface.get_events(block_hash=block_hash) or []
+    for ev in events:
+        v = ev.value if hasattr(ev, "value") else (ev if isinstance(ev, dict) else None)
+        if not isinstance(v, dict):
+            continue
+        phase = v.get("phase") or {}
+        # phase is `{"ApplyExtrinsic": idx}` for in-block events.
+        if isinstance(phase, dict):
+            applied = phase.get("ApplyExtrinsic")
+            if applied is None or int(applied) != ext_idx:
+                continue
+        elif isinstance(phase, (int, str)):
+            # Some decoders flatten phase to the extrinsic index directly.
+            try:
+                if int(phase) != ext_idx:
+                    continue
+            except (ValueError, TypeError):
+                continue
+        else:
+            continue
+        event = v.get("event") or v
+        module_id = event.get("module_id") or event.get("pallet")
+        event_id = event.get("event_id") or event.get("variant") or event.get("name")
+        if module_id == "System" and event_id == "ExtrinsicFailed":
+            attrs = event.get("attributes") or event.get("fields") or {}
+            return f"Module(ExtrinsicFailed, attrs={attrs!r})"
+    return None
+
+
 def _strip_0x(s: str) -> str:
     return s[2:] if s.startswith("0x") else s
 
@@ -501,8 +596,12 @@ def _encode_compact_u128(n: int) -> bytes:
     # Big-int mode: top 6 bits of first byte encode `(n_bytes - 4)`, low 2
     # bits are 0b11. Then little-endian bytes of the value.
     raw = n.to_bytes((n.bit_length() + 7) // 8, "little")
+    # SCALE compact big-int mode caps at 67 bytes: the top 6 bits of the
+    # mode byte encode `n_bytes - 4`, so max n_bytes = (0xff >> 2) + 4 = 67.
     if len(raw) > 67:
-        raise OverflowError("compact value exceeds 64-byte limit")
+        raise OverflowError(
+            f"compact value needs {len(raw)} bytes, exceeds 67-byte SCALE limit"
+        )
     return bytes([((len(raw) - 4) << 2) | 0b11]) + raw
 
 
@@ -535,8 +634,6 @@ def _build_hybrid_signed_extrinsic(
     when > 256 bytes. The signer applies the hybrid domain prefix on top of
     that — see `HybridSigner.sign` / `prepare_message`.
     """
-    import hashlib
-
     # 1. Compose the call bytes via substrate-interface (call shape doesn't
     #    depend on the signer; we just want the SCALE-encoded body).
     call = iface.compose_call(
