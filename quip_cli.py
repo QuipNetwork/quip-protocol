@@ -31,10 +31,94 @@ from shared.mempool_miner_controller import (
 )
 from shared.mempool_types import MinerType
 from shared.miner_bootstrap import BootstrapConfig, bootstrap
+from shared.miner_config import (
+    MinerConfigError,
+    load_miner_config,
+    merge_config,
+    validate_merged,
+)
 from shared.miner_core import MinerCore
 from shared.substrate_client import SubstrateClient
 from shared.substrate_miner_controller import SubstrateMinerController
 from shared.telemetry_api import TelemetryApiServer
+
+
+_VALIDATOR_HELP = (
+    "Substrate validator WebSocket URL (e.g. ws://localhost:9944). "
+    "Repeat to provide a failover list: tried in order at startup, "
+    "and live-failover rotates through them on connection drop. "
+    "Required unless provided via --config."
+)
+_CONFIG_HELP = (
+    "Path to a TOML config file. Keys in the [miner] section serve as "
+    "defaults; CLI flags override. See quip-miner.example.toml."
+)
+_SIGNER_KEY_HELP = "Path to the signing keystore (created by `quip-miner keygen`)"
+_TOPOLOGY_HELP = (
+    "Topology spec for the miner's sampler. Format: 'family:m,t'. Must hash "
+    "to the chain's registered topology — mismatch fails fast at startup."
+)
+_REST_PORT_HELP = (
+    "Telemetry REST API port (default -1 disables; set to a port to serve /api/v1/*)"
+)
+
+
+def _validator_option(f):
+    """Repeatable `--validator URL`. See `_VALIDATOR_HELP` for semantics."""
+    return click.option(
+        "--validator",
+        "validators",
+        multiple=True,
+        help=_VALIDATOR_HELP,
+    )(f)
+
+
+def _config_option(f):
+    """Optional `--config path.toml` for TOML defaults."""
+    return click.option(
+        "--config",
+        "config_path",
+        type=click.Path(dir_okay=False),
+        default=None,
+        help=_CONFIG_HELP,
+    )(f)
+
+
+def _resolve_runtime_config(
+    *,
+    config_path: Optional[str],
+    cli_kwargs: dict,
+    defaults: Optional[dict] = None,
+) -> dict:
+    """Merge TOML config (if any) with CLI kwargs and run validate_merged.
+
+    Precedence: CLI kwargs > TOML > `defaults`. Defaults apply *after*
+    merge so a default-valued CLI arg never shadows a TOML override
+    (e.g. ~/.quip-miner/signing.json as the CLI fallback must not win
+    against a TOML `signer_key = "/tmp/k.json"`).
+
+    Returns the merged dict on success. Raises `click.ClickException` (so
+    `miner_main`'s wrapper formats it as `quip-miner: error: ...`) when
+    the TOML can't be loaded or required keys (`validators`, `signer_key`)
+    are missing.
+    """
+    if config_path is not None:
+        try:
+            toml_data = load_miner_config(Path(config_path).expanduser())
+        except MinerConfigError as exc:
+            raise click.ClickException(str(exc)) from exc
+    else:
+        toml_data = {}
+    merged = merge_config(toml_data, cli_kwargs)
+    if defaults:
+        for key, value in defaults.items():
+            if not merged.get(key):
+                merged[key] = value
+    try:
+        validate_merged(merged)
+    except MinerConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+    return merged
 
 
 @click.group(name="quip-miner")
@@ -78,18 +162,15 @@ def quip_miner_keygen(out_path: str, overwrite: bool) -> None:
 
 
 @quip_miner.command("bootstrap")
-@click.option(
-    "--node-url",
-    required=True,
-    help="Substrate node WebSocket URL (e.g. ws://localhost:9944)",
-)
+@_validator_option
+@_config_option
 @click.option(
     "--signer-key",
     "signer_key_path",
     type=click.Path(dir_okay=False),
-    default="~/.quip-miner/signing.json",
-    show_default=True,
-    help="Path to the keystore (will be created if missing)",
+    default=None,
+    help="Path to the keystore (will be created if missing). "
+    "Falls back to --config `signer_key`, then ~/.quip-miner/signing.json.",
 )
 @click.option(
     "--faucet-url",
@@ -119,8 +200,9 @@ def quip_miner_keygen(out_path: str, overwrite: bool) -> None:
     help="Zephyr Z(m,t) parameters for the seed topology when --seed-chain is set",
 )
 def quip_miner_bootstrap(
-    node_url: str,
-    signer_key_path: str,
+    validators: tuple,
+    config_path: Optional[str],
+    signer_key_path: Optional[str],
     faucet_url: Optional[str],
     seed_chain: bool,
     sudo_key_uri: str,
@@ -139,10 +221,20 @@ def quip_miner_bootstrap(
             f"--seed-topology must be 'm,t' (e.g. '2,2'), got {seed_topology_mt!r}"
         ) from exc
 
+    merged = _resolve_runtime_config(
+        config_path=config_path,
+        cli_kwargs={
+            "validators": validators,
+            "signer_key": signer_key_path,
+            "faucet_url": faucet_url,
+        },
+        defaults={"signer_key": "~/.quip-miner/signing.json"},
+    )
+
     config = BootstrapConfig(
-        node_url=node_url,
-        signer_key_path=Path(signer_key_path).expanduser(),
-        faucet_url=faucet_url,
+        validators=tuple(merged["validators"]),
+        signer_key_path=Path(merged["signer_key"]).expanduser(),
+        faucet_url=merged.get("faucet_url"),
         sudo_key_uri=sudo_key_uri,
         seed_chain=seed_chain,
         seed_topology_mt=topology_mt,
@@ -168,17 +260,15 @@ def quip_miner_bootstrap(
 
 
 @quip_miner.command("register-solver")
-@click.option(
-    "--node-url",
-    required=True,
-    help="Substrate node WebSocket URL (e.g. ws://localhost:9944)",
-)
+@_validator_option
+@_config_option
 @click.option(
     "--signer-key",
     "signer_key_path",
     type=click.Path(dir_okay=False, exists=True),
-    required=True,
-    help="Path to the signing keystore (run `quip-miner keygen` first)",
+    default=None,
+    help="Path to the signing keystore (run `quip-miner keygen` first). "
+    "Falls back to --config `signer_key`.",
 )
 @click.option(
     "--miner-type",
@@ -192,8 +282,9 @@ def quip_miner_bootstrap(
     "Bare 'qpu' maps to QpuDwave to match the legacy CPU/GPU/QPU triplet.",
 )
 def quip_miner_register_solver(
-    node_url: str,
-    signer_key_path: str,
+    validators: tuple,
+    config_path: Optional[str],
+    signer_key_path: Optional[str],
     miner_type: str,
 ) -> None:
     """Register the keystore's account as a QuantumComputeMempool solver.
@@ -202,11 +293,15 @@ def quip_miner_register_solver(
     surfaced to job proposers via `mode = Bid{miner_types: [...]}` filters.
     Use `quip-miner deregister-solver` to opt out.
     """
-    keystore = load(Path(signer_key_path).expanduser())
+    merged = _resolve_runtime_config(
+        config_path=config_path,
+        cli_kwargs={"validators": validators, "signer_key": signer_key_path},
+    )
+    keystore = load(Path(merged["signer_key"]).expanduser())
     mt = MinerType.from_kind(miner_type)
 
     async def _do() -> int:
-        client = SubstrateClient(url=node_url)
+        client = SubstrateClient(urls=tuple(merged["validators"]))
         try:
             await client.connect()
             existing = await client.query_solver(keystore.signer.account_id_bytes())
@@ -247,25 +342,34 @@ def quip_miner_register_solver(
 
 
 @quip_miner.command("deregister-solver")
-@click.option("--node-url", required=True, help="Substrate node WebSocket URL")
+@_validator_option
+@_config_option
 @click.option(
     "--signer-key",
     "signer_key_path",
     type=click.Path(dir_okay=False, exists=True),
-    required=True,
-    help="Path to the signing keystore",
+    default=None,
+    help="Path to the signing keystore. Falls back to --config `signer_key`.",
 )
-def quip_miner_deregister_solver(node_url: str, signer_key_path: str) -> None:
+def quip_miner_deregister_solver(
+    validators: tuple,
+    config_path: Optional[str],
+    signer_key_path: Optional[str],
+) -> None:
     """Deregister the keystore's solver from QuantumComputeMempool.
 
     Idempotent against an unregistered account (returns 0 with a no-op
     message). After deregistration, submit_solution / claim_reward
     extrinsics will fail with `SolverNotRegistered` until you re-register.
     """
-    keystore = load(Path(signer_key_path).expanduser())
+    merged = _resolve_runtime_config(
+        config_path=config_path,
+        cli_kwargs={"validators": validators, "signer_key": signer_key_path},
+    )
+    keystore = load(Path(merged["signer_key"]).expanduser())
 
     async def _do() -> int:
-        client = SubstrateClient(url=node_url)
+        client = SubstrateClient(urls=tuple(merged["validators"]))
         try:
             await client.connect()
             existing = await client.query_solver(keystore.signer.account_id_bytes())
@@ -383,16 +487,6 @@ def _zephyr_topology_hash(topology) -> bytes:
     return hashlib.blake2b(buf, digest_size=32).digest()
 
 
-_NODE_URL_HELP = "Substrate node WebSocket URL (e.g. ws://localhost:9944)"
-_SIGNER_KEY_HELP = "Path to the signing keystore (created by `quip-miner keygen`)"
-_TOPOLOGY_HELP = (
-    "Topology spec for the miner's sampler. Format: 'family:m,t'. Must hash "
-    "to the chain's registered topology — mismatch fails fast at startup."
-)
-_REST_PORT_HELP = (
-    "Telemetry REST API port (default -1 disables; set to a port to serve /api/v1/*)"
-)
-
 # Seconds to wait for a controller to drain after signalling shutdown.
 # Must exceed the longest controller poll interval (<=10s for head-subscription
 # timeout in SubstrateMinerController).
@@ -403,7 +497,7 @@ async def _run_concurrent_miner(
     *,
     mode: str,
     miner_kind: str,
-    node_url: str,
+    validators: tuple,
     signer_key_path: str,
     rest_port: int,
     topology_spec: str,
@@ -463,7 +557,7 @@ async def _run_concurrent_miner(
     mempool_controller = None
 
     try:
-        client = SubstrateClient(url=node_url)
+        client = SubstrateClient(urls=tuple(validators))
         await client.connect()
 
         if pow_handles:
@@ -521,7 +615,7 @@ async def _run_concurrent_miner(
             # lock. In mempool-only mode `client` has no contention -- reuse it.
             mempool_client_ref = client
             if pow_handles:
-                mempool_client = SubstrateClient(url=node_url)
+                mempool_client = SubstrateClient(urls=tuple(validators))
                 await mempool_client.connect()
                 mempool_client_ref = mempool_client
             mempool_controller = MempoolMinerController(
@@ -674,14 +768,15 @@ _MODE_HELP = (
 
 
 @quip_miner.command("cpu")
-@click.option("--node-url", required=True, help=_NODE_URL_HELP)
+@_validator_option
+@_config_option
 @click.option(
     "--signer-key",
     "signer_key_path",
     type=click.Path(dir_okay=False),
-    default="~/.quip-miner/signing.json",
-    show_default=True,
-    help=_SIGNER_KEY_HELP,
+    default=None,
+    help=_SIGNER_KEY_HELP + " Falls back to --config `signer_key`, "
+    "then ~/.quip-miner/signing.json.",
 )
 @click.option(
     "--mode",
@@ -712,8 +807,9 @@ _MODE_HELP = (
     help=_REST_PORT_HELP,
 )
 def quip_miner_cpu(
-    node_url: str,
-    signer_key_path: str,
+    validators: tuple,
+    config_path: Optional[str],
+    signer_key_path: Optional[str],
     mode: str,
     num_cpus: int,
     topology_spec: str,
@@ -730,14 +826,20 @@ def quip_miner_cpu(
     For mempool / both modes, the signer must be registered as a solver
     first via `quip-miner register-solver --miner-type cpu`.
     """
-    import asyncio
-
+    merged = _resolve_runtime_config(
+        config_path=config_path,
+        cli_kwargs={
+            "validators": validators,
+            "signer_key": signer_key_path,
+        },
+        defaults={"signer_key": "~/.quip-miner/signing.json"},
+    )
     miner_config = {"cpu": {"num_cpus": num_cpus}}
     raise SystemExit(asyncio.run(_run_concurrent_miner(
         mode=mode,
         miner_kind="cpu",
-        node_url=node_url,
-        signer_key_path=signer_key_path,
+        validators=tuple(merged["validators"]),
+        signer_key_path=merged["signer_key"],
         rest_port=rest_port,
         topology_spec=topology_spec,
         miner_config=miner_config,
@@ -745,14 +847,15 @@ def quip_miner_cpu(
 
 
 @quip_miner.command("gpu")
-@click.option("--node-url", required=True, help=_NODE_URL_HELP)
+@_validator_option
+@_config_option
 @click.option(
     "--signer-key",
     "signer_key_path",
     type=click.Path(dir_okay=False),
-    default="~/.quip-miner/signing.json",
-    show_default=True,
-    help=_SIGNER_KEY_HELP,
+    default=None,
+    help=_SIGNER_KEY_HELP + " Falls back to --config `signer_key`, "
+    "then ~/.quip-miner/signing.json.",
 )
 @click.option(
     "--gpu-backend",
@@ -783,8 +886,9 @@ def quip_miner_cpu(
     help=_REST_PORT_HELP,
 )
 def quip_miner_gpu(
-    node_url: str,
-    signer_key_path: str,
+    validators: tuple,
+    config_path: Optional[str],
+    signer_key_path: Optional[str],
     gpu_backend: str,
     mode: str,
     topology_spec: str,
@@ -806,11 +910,19 @@ def quip_miner_gpu(
     else:
         raise click.BadParameter(f"unknown --gpu-backend: {backend}")
 
+    merged = _resolve_runtime_config(
+        config_path=config_path,
+        cli_kwargs={
+            "validators": validators,
+            "signer_key": signer_key_path,
+        },
+        defaults={"signer_key": "~/.quip-miner/signing.json"},
+    )
     raise SystemExit(asyncio.run(_run_concurrent_miner(
         mode=mode,
         miner_kind="gpu",
-        node_url=node_url,
-        signer_key_path=signer_key_path,
+        validators=tuple(merged["validators"]),
+        signer_key_path=merged["signer_key"],
         rest_port=rest_port,
         topology_spec=topology_spec,
         miner_config=miner_config,
@@ -818,14 +930,15 @@ def quip_miner_gpu(
 
 
 @quip_miner.command("qpu")
-@click.option("--node-url", required=True, help=_NODE_URL_HELP)
+@_validator_option
+@_config_option
 @click.option(
     "--signer-key",
     "signer_key_path",
     type=click.Path(dir_okay=False),
-    default="~/.quip-miner/signing.json",
-    show_default=True,
-    help=_SIGNER_KEY_HELP,
+    default=None,
+    help=_SIGNER_KEY_HELP + " Falls back to --config `signer_key`, "
+    "then ~/.quip-miner/signing.json.",
 )
 @click.option(
     "--qpu-type",
@@ -862,8 +975,9 @@ def quip_miner_gpu(
     help=_REST_PORT_HELP,
 )
 def quip_miner_qpu(
-    node_url: str,
-    signer_key_path: str,
+    validators: tuple,
+    config_path: Optional[str],
+    signer_key_path: Optional[str],
     qpu_type: str,
     mode: str,
     daily_budget,
@@ -884,11 +998,19 @@ def quip_miner_qpu(
 
     miner_kind = f"qpu_{qpu_type}" if qpu_type in ("ibm", "ionq", "pasqal") else "qpu"
 
+    merged = _resolve_runtime_config(
+        config_path=config_path,
+        cli_kwargs={
+            "validators": validators,
+            "signer_key": signer_key_path,
+        },
+        defaults={"signer_key": "~/.quip-miner/signing.json"},
+    )
     raise SystemExit(asyncio.run(_run_concurrent_miner(
         mode=mode,
         miner_kind=miner_kind,
-        node_url=node_url,
-        signer_key_path=signer_key_path,
+        validators=tuple(merged["validators"]),
+        signer_key_path=merged["signer_key"],
         rest_port=rest_port,
         topology_spec=topology_spec,
         miner_config=miner_config,

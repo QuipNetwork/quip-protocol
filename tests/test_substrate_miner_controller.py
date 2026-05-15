@@ -644,7 +644,7 @@ async def _live_controller(
         await _maybe_seed_chain(
             setup_client,
             BootstrapConfig(
-                node_url=DEFAULT_URL,
+                validators=(DEFAULT_URL,),
                 signer_key_path=keystore_path,
                 seed_chain=True,
                 seed_topology_mt=seed_topology_mt,

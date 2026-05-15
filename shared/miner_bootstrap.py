@@ -127,7 +127,10 @@ DEFAULT_FAUCET_TOP_UP_PLANCKS = 10_000_000_000_000  # 10 UNIT
 
 @dataclass
 class BootstrapConfig:
-    node_url: str
+    # Ordered failover list — `SubstrateClient` tries each in turn at
+    # connect() and live-rotates through them if the connection drops
+    # mid-bootstrap. A single-entry tuple is the legacy single-URL case.
+    validators: Tuple[str, ...]
     signer_key_path: Path
     faucet_url: Optional[str] = None
     sudo_key_uri: str = "//Alice"
@@ -165,7 +168,7 @@ async def bootstrap(config: BootstrapConfig) -> BootstrapResult:
         keystore.signer.ss58_address(),
     )
 
-    client = SubstrateClient(url=config.node_url)
+    client = SubstrateClient(urls=config.validators)
     await client.connect()
     try:
         topology_seeded = False

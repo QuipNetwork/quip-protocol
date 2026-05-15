@@ -131,7 +131,7 @@ async def test_force_reseed_difficulty_overrides_idempotency(monkeypatch):
     )
 
     config = BootstrapConfig(
-        node_url="ws://nowhere",
+        validators=("ws://nowhere",),
         signer_key_path="/tmp/never-read",  # noqa: S108
         seed_chain=True,
         force_reseed_difficulty=True,
@@ -165,7 +165,7 @@ async def test_force_reseed_difficulty_default_is_idempotent(monkeypatch):
     )
 
     config = BootstrapConfig(
-        node_url="ws://nowhere",
+        validators=("ws://nowhere",),
         signer_key_path="/tmp/never-read",  # noqa: S108
         seed_chain=True,
         # force_reseed_difficulty defaults False

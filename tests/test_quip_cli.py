@@ -99,7 +99,7 @@ def test_quip_miner_cpu_config(monkeypatch):
     runner = CliRunner()
     result = runner.invoke(
         quip_cli.quip_miner_cpu,
-        ["--node-url", "ws://localhost:9944", "--num-cpus", "3"],
+        ["--validator", "ws://localhost:9944", "--num-cpus", "3"],
     )
     assert result.exit_code == 0, result.output
     assert captured.get("miner_config") == {"cpu": {"num_cpus": 3}}
@@ -119,7 +119,7 @@ def test_quip_miner_gpu_local_config(monkeypatch):
     runner = CliRunner()
     result = runner.invoke(
         quip_cli.quip_miner_gpu,
-        ["--node-url", "ws://localhost:9944", "--gpu-backend", "local"],
+        ["--validator", "ws://localhost:9944", "--gpu-backend", "local"],
     )
     assert result.exit_code == 0, result.output
     assert captured.get("miner_config") == {"cuda": [{"device": "0"}]}
@@ -139,7 +139,7 @@ def test_quip_miner_gpu_metal_config(monkeypatch):
     runner = CliRunner()
     result = runner.invoke(
         quip_cli.quip_miner_gpu,
-        ["--node-url", "ws://localhost:9944", "--gpu-backend", "metal"],
+        ["--validator", "ws://localhost:9944", "--gpu-backend", "metal"],
     )
     assert result.exit_code == 0, result.output
     assert captured.get("miner_config") == {"metal": [{}]}
@@ -157,7 +157,7 @@ def test_quip_miner_gpu_modal_config(monkeypatch):
     runner = CliRunner()
     result = runner.invoke(
         quip_cli.quip_miner_gpu,
-        ["--node-url", "ws://localhost:9944", "--gpu-backend", "modal"],
+        ["--validator", "ws://localhost:9944", "--gpu-backend", "modal"],
     )
     assert result.exit_code == 0, result.output
     assert captured.get("miner_config") == {"modal": [{"gpu_type": "t4"}]}
@@ -175,7 +175,7 @@ def test_quip_miner_qpu_dwave_with_budget(monkeypatch):
     runner = CliRunner()
     result = runner.invoke(
         quip_cli.quip_miner_qpu,
-        ["--node-url", "ws://localhost:9944", "--qpu-type", "dwave", "--daily-budget", "40s"],
+        ["--validator", "ws://localhost:9944", "--qpu-type", "dwave", "--daily-budget", "40s"],
     )
     assert result.exit_code == 0, result.output
     cfg = captured.get("miner_config", {})
@@ -196,10 +196,108 @@ def test_quip_miner_qpu_ibm_config(monkeypatch):
     runner = CliRunner()
     result = runner.invoke(
         quip_cli.quip_miner_qpu,
-        ["--node-url", "ws://localhost:9944", "--qpu-type", "ibm"],
+        ["--validator", "ws://localhost:9944", "--qpu-type", "ibm"],
     )
     assert result.exit_code == 0, result.output
     cfg = captured.get("miner_config", {})
     assert "ibm" in cfg
     assert cfg["ibm"][0]["type"] == "ibm"
     assert captured.get("miner_kind") == "qpu_ibm"
+
+
+# ── --validator / --config plumbing ─────────────────────────────────────────
+
+
+def test_quip_miner_cpu_multiple_validators_pass_through(monkeypatch):
+    """Repeated --validator flags become a tuple passed to the runner."""
+    captured: Dict[str, Any] = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
+    result = CliRunner().invoke(
+        quip_cli.quip_miner_cpu,
+        [
+            "--validator", "ws://primary:9944",
+            "--validator", "ws://standby:9944",
+            "--num-cpus", "1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured.get("validators") == ("ws://primary:9944", "ws://standby:9944")
+
+
+def test_quip_miner_cpu_missing_validators_fails_fast(monkeypatch):
+    """No --validator and no --config → ClickException with actionable text."""
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", lambda **_: 0)
+    result = CliRunner().invoke(
+        quip_cli.quip_miner_cpu,
+        ["--num-cpus", "1"],
+    )
+    assert result.exit_code != 0
+    assert "validator" in result.output.lower()
+
+
+def test_quip_miner_cpu_config_file_supplies_validators(monkeypatch, tmp_path):
+    """A --config TOML with [miner].validators is enough; no CLI flag needed."""
+    captured: Dict[str, Any] = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text(
+        '[miner]\n'
+        'validators = ["ws://toml:9944"]\n'
+        'signer_key = "/tmp/signing.json"\n'
+    )
+    result = CliRunner().invoke(
+        quip_cli.quip_miner_cpu,
+        ["--config", str(cfg), "--num-cpus", "1"],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured.get("validators") == ("ws://toml:9944",)
+    assert captured.get("signer_key_path") == "/tmp/signing.json"
+
+
+def test_quip_miner_cpu_cli_overrides_config_validators(monkeypatch, tmp_path):
+    """CLI --validator wins over TOML validators."""
+    captured: Dict[str, Any] = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text(
+        '[miner]\n'
+        'validators = ["ws://toml:9944"]\n'
+        'signer_key = "/tmp/signing.json"\n'
+    )
+    result = CliRunner().invoke(
+        quip_cli.quip_miner_cpu,
+        [
+            "--config", str(cfg),
+            "--validator", "ws://cli:9944",
+            "--num-cpus", "1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured.get("validators") == ("ws://cli:9944",)
+
+
+def test_quip_miner_no_longer_accepts_node_url(monkeypatch):
+    """--node-url was removed in v0.2; passing it must fail with click's
+    'No such option' error so operators see the rename clearly."""
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", lambda **_: 0)
+    result = CliRunner().invoke(
+        quip_cli.quip_miner_cpu,
+        ["--node-url", "ws://x:9944", "--num-cpus", "1"],
+    )
+    assert result.exit_code != 0
+    assert "no such option" in result.output.lower() or "--node-url" in result.output
