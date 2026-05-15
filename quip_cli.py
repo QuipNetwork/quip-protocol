@@ -30,7 +30,11 @@ from shared.mempool_miner_controller import (
     topology_hash_from_nodes_edges,
 )
 from shared.mempool_types import MinerType
-from shared.miner_bootstrap import BootstrapConfig, bootstrap
+from shared.miner_bootstrap import (
+    DEFAULT_MIN_BALANCE_PLANCKS,
+    BootstrapConfig,
+    bootstrap,
+)
 from shared.miner_config import (
     MinerConfigError,
     load_miner_config,
@@ -38,7 +42,10 @@ from shared.miner_config import (
     validate_merged,
 )
 from shared.miner_core import MinerCore
-from shared.substrate_client import SubstrateClient
+from shared.substrate_client import (
+    NoValidatorReachable,
+    SubstrateClient,
+)
 from shared.substrate_miner_controller import SubstrateMinerController
 from shared.telemetry_api import TelemetryApiServer
 
@@ -84,6 +91,22 @@ def _config_option(f):
     )(f)
 
 
+def _faucet_url_option(f):
+    """Optional `--faucet-url URL` for auto-topup on underfunded wallets.
+
+    When set, Guard C tops up the wallet through the configured faucet
+    bot before refusing to start. When unset, an underfunded wallet
+    fails fast with `wallet-underfunded`.
+    """
+    return click.option(
+        "--faucet-url",
+        default=None,
+        help="If set, request funding from this faucet bot when balance "
+        "is below the registration threshold. Without --faucet-url, "
+        "underfunded wallets fail fast with `wallet-underfunded`.",
+    )(f)
+
+
 def _resolve_runtime_config(
     *,
     config_path: Optional[str],
@@ -119,6 +142,98 @@ def _resolve_runtime_config(
     except MinerConfigError as exc:
         raise click.ClickException(str(exc)) from exc
     return merged
+
+
+# Fail-fast startup guards. Each helper renders a single-line, machine-
+# parseable error (kebab-case code + key=value pairs) and raises
+# `click.ClickException`; `miner_main` formats it as
+# `quip-miner: error: <code> <kv>...` on stderr and exits 1.
+#
+# Codes:
+#   wallet-not-configured     — keystore path doesn't exist
+#   wallet-load-failed        — keystore exists but couldn't be parsed
+#   validators-unreachable    — every URL in the rotation refused connect
+#   wallet-underfunded        — balance below threshold, no faucet wired
+#   wallet-faucet-failed      — faucet was configured but the top-up failed
+
+
+def _load_keystore_or_fail(path_str: str):
+    """Guard A — wallet configured.
+
+    Returns the loaded hybrid keystore. Raises ClickException with
+    `wallet-not-configured` (missing file) or `wallet-load-failed`
+    (existed but unreadable / wrong schema).
+    """
+    path = Path(path_str).expanduser()
+    if not path.exists():
+        raise click.ClickException(f"wallet-not-configured keystore={path}")
+    try:
+        return load(path)
+    except Exception as exc:  # noqa: BLE001 — surfaced via exception code
+        raise click.ClickException(
+            f"wallet-load-failed keystore={path} error={type(exc).__name__}"
+        ) from exc
+
+
+async def _connect_or_fail(client: SubstrateClient) -> None:
+    """Guard B — validators reachable.
+
+    Wraps `SubstrateClient.connect()`. On `NoValidatorReachable`, renders
+    the structured attempt log as `urls=<csv> reasons=<csv>` and raises
+    ClickException with `validators-unreachable`.
+    """
+    try:
+        await client.connect()
+    except NoValidatorReachable as exc:
+        urls = ",".join(a.url for a in exc.attempts)
+        reasons = ",".join(a.exc_type for a in exc.attempts)
+        raise click.ClickException(
+            f"validators-unreachable urls={urls} reasons={reasons}"
+        ) from exc
+
+
+async def _ensure_funded_or_fail(
+    client: SubstrateClient,
+    keystore,
+    *,
+    faucet_url: Optional[str],
+    min_balance: int,
+) -> int:
+    """Guard C — wallet funded.
+
+    If balance is already at or above threshold, returns the balance.
+    When `faucet_url` is set, reuses `shared.miner_bootstrap._ensure_funded`
+    to top up via the configured faucet bot. Underfunded with no faucet
+    raises `wallet-underfunded`; faucet failure raises
+    `wallet-faucet-failed`.
+    """
+    account = keystore.signer.account_id_bytes()
+    balance = await client.query_balance(account)
+    if balance >= min_balance:
+        return balance
+    if not faucet_url:
+        raise click.ClickException(
+            f"wallet-underfunded ss58={keystore.signer.ss58_address()} "
+            f"balance={balance} threshold={min_balance}"
+        )
+    # Construct a minimal BootstrapConfig just to drive the existing
+    # faucet helper — its `_post_faucet` + settlement-poll behavior is
+    # exactly what we want here.
+    cfg = BootstrapConfig(
+        validators=client.urls,
+        signer_key_path=keystore.path,
+        faucet_url=faucet_url,
+        min_balance_plancks=min_balance,
+    )
+    try:
+        from shared.miner_bootstrap import _ensure_funded  # local: avoid cycle at import
+        return await _ensure_funded(client, keystore, cfg)
+    except Exception as exc:  # noqa: BLE001 — translated to a CLI error code
+        raise click.ClickException(
+            f"wallet-faucet-failed ss58={keystore.signer.ss58_address()} "
+            f"balance={balance} threshold={min_balance} "
+            f"error={type(exc).__name__}"
+        ) from exc
 
 
 @click.group(name="quip-miner")
@@ -239,7 +354,17 @@ def quip_miner_bootstrap(
         seed_chain=seed_chain,
         seed_topology_mt=topology_mt,
     )
-    result = asyncio.run(bootstrap(config))
+    # bootstrap() does its own connect + balance check; translate the two
+    # failures the operator can fix into the same machine-parseable codes
+    # the mining commands use.
+    try:
+        result = asyncio.run(bootstrap(config))
+    except NoValidatorReachable as exc:
+        urls = ",".join(a.url for a in exc.attempts)
+        reasons = ",".join(a.exc_type for a in exc.attempts)
+        raise click.ClickException(
+            f"validators-unreachable urls={urls} reasons={reasons}"
+        ) from exc
 
     click.echo("bootstrap complete")
     click.echo(f"  ss58 address       : {result.ss58_address}")
@@ -297,13 +422,14 @@ def quip_miner_register_solver(
         config_path=config_path,
         cli_kwargs={"validators": validators, "signer_key": signer_key_path},
     )
-    keystore = load(Path(merged["signer_key"]).expanduser())
+    keystore = _load_keystore_or_fail(merged["signer_key"])
     mt = MinerType.from_kind(miner_type)
 
     async def _do() -> int:
         client = SubstrateClient(urls=tuple(merged["validators"]))
         try:
-            await client.connect()
+            # Guard B — validators reachable.
+            await _connect_or_fail(client)
             existing = await client.query_solver(keystore.signer.account_id_bytes())
             if existing is not None:
                 if existing.solver_type != mt:
@@ -366,12 +492,13 @@ def quip_miner_deregister_solver(
         config_path=config_path,
         cli_kwargs={"validators": validators, "signer_key": signer_key_path},
     )
-    keystore = load(Path(merged["signer_key"]).expanduser())
+    keystore = _load_keystore_or_fail(merged["signer_key"])
 
     async def _do() -> int:
         client = SubstrateClient(urls=tuple(merged["validators"]))
         try:
-            await client.connect()
+            # Guard B — validators reachable.
+            await _connect_or_fail(client)
             existing = await client.query_solver(keystore.signer.account_id_bytes())
             if existing is None:
                 click.echo("solver not registered; nothing to do")
@@ -499,6 +626,7 @@ async def _run_concurrent_miner(
     miner_kind: str,
     validators: tuple,
     signer_key_path: str,
+    faucet_url: Optional[str],
     rest_port: int,
     topology_spec: str,
     miner_config: dict,
@@ -520,7 +648,8 @@ async def _run_concurrent_miner(
         click.echo(f"invalid --mode {mode!r}", err=True)
         return 2
 
-    keystore = load(Path(signer_key_path).expanduser())
+    # Guard A — wallet configured (keystore exists + loads).
+    keystore = _load_keystore_or_fail(signer_key_path)
     click.echo(f"signer: {keystore.signer.ss58_address()} (hybrid) mode={mode}")
 
     topology = _parse_topology(topology_spec)
@@ -558,7 +687,15 @@ async def _run_concurrent_miner(
 
     try:
         client = SubstrateClient(urls=tuple(validators))
-        await client.connect()
+        # Guard B — validators reachable.
+        await _connect_or_fail(client)
+        # Guard C — wallet funded (with optional faucet top-up).
+        await _ensure_funded_or_fail(
+            client,
+            keystore,
+            faucet_url=faucet_url,
+            min_balance=DEFAULT_MIN_BALANCE_PLANCKS,
+        )
 
         if pow_handles:
             # PoW requires the sampler's topology to match the chain's
@@ -770,6 +907,7 @@ _MODE_HELP = (
 @quip_miner.command("cpu")
 @_validator_option
 @_config_option
+@_faucet_url_option
 @click.option(
     "--signer-key",
     "signer_key_path",
@@ -810,6 +948,7 @@ def quip_miner_cpu(
     validators: tuple,
     config_path: Optional[str],
     signer_key_path: Optional[str],
+    faucet_url: Optional[str],
     mode: str,
     num_cpus: int,
     topology_spec: str,
@@ -831,6 +970,7 @@ def quip_miner_cpu(
         cli_kwargs={
             "validators": validators,
             "signer_key": signer_key_path,
+            "faucet_url": faucet_url,
         },
         defaults={"signer_key": "~/.quip-miner/signing.json"},
     )
@@ -840,6 +980,7 @@ def quip_miner_cpu(
         miner_kind="cpu",
         validators=tuple(merged["validators"]),
         signer_key_path=merged["signer_key"],
+        faucet_url=merged.get("faucet_url"),
         rest_port=rest_port,
         topology_spec=topology_spec,
         miner_config=miner_config,
@@ -849,6 +990,7 @@ def quip_miner_cpu(
 @quip_miner.command("gpu")
 @_validator_option
 @_config_option
+@_faucet_url_option
 @click.option(
     "--signer-key",
     "signer_key_path",
@@ -889,6 +1031,7 @@ def quip_miner_gpu(
     validators: tuple,
     config_path: Optional[str],
     signer_key_path: Optional[str],
+    faucet_url: Optional[str],
     gpu_backend: str,
     mode: str,
     topology_spec: str,
@@ -915,6 +1058,7 @@ def quip_miner_gpu(
         cli_kwargs={
             "validators": validators,
             "signer_key": signer_key_path,
+            "faucet_url": faucet_url,
         },
         defaults={"signer_key": "~/.quip-miner/signing.json"},
     )
@@ -923,6 +1067,7 @@ def quip_miner_gpu(
         miner_kind="gpu",
         validators=tuple(merged["validators"]),
         signer_key_path=merged["signer_key"],
+        faucet_url=merged.get("faucet_url"),
         rest_port=rest_port,
         topology_spec=topology_spec,
         miner_config=miner_config,
@@ -932,6 +1077,7 @@ def quip_miner_gpu(
 @quip_miner.command("qpu")
 @_validator_option
 @_config_option
+@_faucet_url_option
 @click.option(
     "--signer-key",
     "signer_key_path",
@@ -978,6 +1124,7 @@ def quip_miner_qpu(
     validators: tuple,
     config_path: Optional[str],
     signer_key_path: Optional[str],
+    faucet_url: Optional[str],
     qpu_type: str,
     mode: str,
     daily_budget,
@@ -1003,6 +1150,7 @@ def quip_miner_qpu(
         cli_kwargs={
             "validators": validators,
             "signer_key": signer_key_path,
+            "faucet_url": faucet_url,
         },
         defaults={"signer_key": "~/.quip-miner/signing.json"},
     )
@@ -1011,6 +1159,7 @@ def quip_miner_qpu(
         miner_kind=miner_kind,
         validators=tuple(merged["validators"]),
         signer_key_path=merged["signer_key"],
+        faucet_url=merged.get("faucet_url"),
         rest_port=rest_port,
         topology_spec=topology_spec,
         miner_config=miner_config,
