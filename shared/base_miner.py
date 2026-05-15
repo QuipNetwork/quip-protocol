@@ -21,9 +21,9 @@ from shared.energy_utils import (
     DEFAULT_NUM_NODES,
     DEFAULT_NUM_EDGES,
 )
+from shared.mempool_types import MempoolJobContext
 from shared.miner_types import BlockRequirements, IsingSample, MiningResult, Sampler
 from shared.quantum_proof_of_work import evaluate_sampleset
-from shared.substrate_types import SubstrateMiningContext
 from shared.work_context import (
     WorkContext,
     fresh_salt,
@@ -411,7 +411,7 @@ class BaseMiner(ABC):
             # got nothing", not "couldn't start".
             self.logger.warning(
                 "mine_work_item: _pre_mine_setup returned False, aborting "
-                "attempt for block=%d", context.block_number,
+                "attempt for %s", _work_tag(context),
             )
             return None
 
@@ -608,7 +608,6 @@ class BaseMiner(ABC):
           - Mempool: order_id / nodes / edges
         Both flavors print enough to grep logs for a specific work item.
         """
-        from shared.mempool_types import MempoolJobContext
         if isinstance(context, MempoolJobContext):
             self.logger.info(
                 f"mine_work_item: order_id={context.order_id} "
@@ -662,31 +661,10 @@ class BaseMiner(ABC):
 
 def _work_tag(context: WorkContext) -> str:
     """Short identifier for a work context, used in per-iteration log lines."""
-    from shared.mempool_types import MempoolJobContext
     if isinstance(context, MempoolJobContext):
         return f"order={context.order_id}"
     return f"block={context.block_number}"
 
-
-def _block_requirements_from_difficulty(difficulty) -> BlockRequirements:
-    """Synthesize a legacy ``BlockRequirements`` from a substrate
-    ``SubstrateDifficulty``.
-
-    Chain storage uses milli-precision integers; the legacy mining loop and
-    its hooks expect float fields. Convert at this boundary so subclasses
-    (CPU/GPU/QPU) don't need to know about substrate at all.
-
-    ``timeout_to_difficulty_adjustment_decay`` is set to a sentinel
-    ``2**31 - 1`` so any code that accidentally computes decay against it
-    (e.g. ``compute_current_requirements``) is a no-op. Substrate mode has
-    no decay — the controller cancels on head change instead.
-    """
-    return BlockRequirements(
-        difficulty_energy=difficulty.max_energy,
-        min_diversity=difficulty.min_diversity,
-        min_solutions=difficulty.min_solutions,
-        timeout_to_difficulty_adjustment_decay=2**31 - 1,
-    )
 
 
 @dataclass(frozen=True)
@@ -712,7 +690,6 @@ class _BridgePrevBlock:
 
     @classmethod
     def from_work_context(cls, context: WorkContext) -> "_BridgePrevBlock":
-        from shared.mempool_types import MempoolJobContext
         if isinstance(context, MempoolJobContext):
             return cls(
                 header=_BridgePrevBlockHeader(index=context.order_id),
@@ -742,7 +719,6 @@ class _BridgeNodeInfo:
 
     @classmethod
     def from_work_context(cls, context: WorkContext) -> "_BridgeNodeInfo":
-        from shared.mempool_types import MempoolJobContext
         if isinstance(context, MempoolJobContext):
             return cls(
                 miner_id=f"mempool-order-{context.order_id}",

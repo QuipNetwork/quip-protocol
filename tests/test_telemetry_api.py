@@ -14,7 +14,7 @@ import aiohttp
 import pytest
 
 from shared.miner_core import MinerCore
-from shared.telemetry_api import TelemetryApiServer
+from shared.telemetry_api import TelemetryApiServer, _to_jsonable
 
 
 @pytest.fixture
@@ -159,3 +159,95 @@ async def test_block_number_validation(server):
         async with http.get(_url(server, "/api/v1/block/not-a-number")) as resp:
             assert resp.status == 400
             assert (await resp.json())["code"] == "INVALID_BLOCK_NUMBER"
+
+
+# ----------------------------------------------------------------------
+# _to_jsonable — the walker that fixes the
+# "Object of type scale_info::N is not JSON serializable" 500 on
+# /api/v1/block/latest. Direct unit tests because the live integration
+# test can't hit every code path in CI without docker.
+# ----------------------------------------------------------------------
+
+
+class _FakeScaleType:
+    """Mimics substrate-interface's ScaleType: arbitrary object whose
+    decoded primitive is exposed via `.value`."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __repr__(self):
+        return f"<FakeScaleType {self.value!r}>"
+
+
+def test_to_jsonable_primitives_pass_through():
+    assert _to_jsonable(None) is None
+    assert _to_jsonable("hello") == "hello"
+    assert _to_jsonable(42) == 42
+    assert _to_jsonable(3.14) == 3.14
+    assert _to_jsonable(True) is True
+    assert _to_jsonable(False) is False
+
+
+def test_to_jsonable_bytes_renders_as_hex():
+    """Pre-fix bytes fell through to `repr()` and produced `b'\\x00...'` —
+    valid Python literal but useless to any caller parsing the response
+    as hex. The walker now matches the rest of the API by 0x-prefixing."""
+    assert _to_jsonable(b"\x00\x01\xff") == "0x0001ff"
+    assert _to_jsonable(bytearray(b"\xab")) == "0xab"
+    assert _to_jsonable(memoryview(b"\xcd\xef")) == "0xcdef"
+
+
+def test_to_jsonable_recurses_dict_and_list():
+    obj = {"a": [1, 2, {"b": "c"}], "d": (4, 5)}
+    assert _to_jsonable(obj) == {"a": [1, 2, {"b": "c"}], "d": [4, 5]}
+
+
+def test_to_jsonable_unwraps_scaletype_value():
+    """The core fix: .value-bearing objects are unwrapped recursively."""
+    obj = _FakeScaleType({"inner": [_FakeScaleType(7), 9]})
+    assert _to_jsonable(obj) == {"inner": [7, 9]}
+
+
+def test_to_jsonable_unwraps_scaletype_with_none_value():
+    """A ScaleType decoding to None (e.g. empty `Option<T>`) must
+    serialize as JSON null, not as `repr(obj)`. The pre-fix `val is not None`
+    guard treated None as "no value attr" and fell through to repr()."""
+    obj = _FakeScaleType(None)
+    assert _to_jsonable(obj) is None
+
+
+def test_to_jsonable_unwraps_scaletype_with_falsy_value():
+    """0 and False are valid primitives; they must NOT be treated as
+    "no value present"."""
+    assert _to_jsonable(_FakeScaleType(0)) == 0
+    assert _to_jsonable(_FakeScaleType(False)) is False
+    assert _to_jsonable(_FakeScaleType("")) == ""
+
+
+def test_to_jsonable_self_reference_falls_through_to_repr():
+    """A pathological object whose `.value` returns self must not
+    infinite-recurse — it falls through to repr() as last-resort
+    observability."""
+
+    class SelfRef:
+        @property
+        def value(self):
+            return self
+
+        def __repr__(self):
+            return "<SelfRef>"
+
+    out = _to_jsonable(SelfRef())
+    assert out == "<SelfRef>"
+
+
+def test_to_jsonable_no_value_attr_falls_back_to_repr():
+    """Objects without `.value` (e.g. raw Python class instances that
+    sneak into the substrate-interface output) stringify via repr()."""
+
+    class Plain:
+        def __repr__(self):
+            return "<plain-instance>"
+
+    assert _to_jsonable(Plain()) == "<plain-instance>"

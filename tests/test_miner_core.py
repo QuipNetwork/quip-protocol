@@ -5,6 +5,7 @@ These don't need a substrate chain. They cover MinerCore lifecycle
 get_stats / record_dispatch / record_result aggregate counters that back
 the preserved `/api/v1/stats` telemetry endpoint.
 """
+
 from __future__ import annotations
 
 import time
@@ -37,8 +38,10 @@ def test_miner_core_builds_cpu_handles():
 
 def test_descriptor_uses_builder_callback():
     """Custom descriptor builders are surfaced verbatim through descriptor()."""
+
     def builder():
         return {"node_id": "custom", "cpus": 8, "gpu": "metal"}
+
     core = MinerCore(node_id="d-test", miners_config={}, descriptor_builder=builder)
     try:
         desc = core.descriptor()
@@ -53,10 +56,14 @@ def test_descriptor_falls_back_on_builder_failure():
     """If the descriptor builder raises, MinerCore surfaces the error in the
     cached descriptor rather than letting it propagate. Mirrors the
     resilience added to `Node.descriptor()` in commit 1859a35."""
+
     def bad_builder():
         raise RuntimeError("hardware probe failed")
+
     core = MinerCore(
-        node_id="d-bad", miners_config={}, descriptor_builder=bad_builder,
+        node_id="d-bad",
+        miners_config={},
+        descriptor_builder=bad_builder,
     )
     try:
         desc = core.descriptor()

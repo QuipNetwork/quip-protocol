@@ -36,8 +36,12 @@ def test_ss58_and_hex_canonicalize_to_same_key():
     assert faucet_bot._normalize_dest(ALICE_SS58) == ALICE_HEX
 
 
-def test_malformed_dest_passes_through():
-    # Garbage input is left as-is so the downstream substrate-interface
-    # validation surfaces a clear "bad address" error; we don't want
-    # _normalize_dest to mask that with a decode exception of its own.
-    assert faucet_bot._normalize_dest("not-an-address") == "not-an-address"
+def test_malformed_dest_is_rejected():
+    """Garbage input now returns None so `_handle_faucet` can reject it
+    with HTTP 400 before keying the rate-limit table on it. The original
+    pass-through behaviour let a caller alternate garbage strings to
+    bypass the per-destination throttle entirely (each distinct
+    malformed string was its own slot)."""
+    assert faucet_bot._normalize_dest("not-an-address") is None
+    assert faucet_bot._normalize_dest("") is None
+    assert faucet_bot._normalize_dest("0xtoo-short") is None

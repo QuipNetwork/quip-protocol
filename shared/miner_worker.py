@@ -1,7 +1,7 @@
 """Shared persistent miner worker process and factory.
 
 This worker runs a loop handling commands from the parent process:
-- mine_block {block, requirements}
+- mine_work_item {context}
 - stop_mining
 - get_stats
 - shutdown
@@ -10,6 +10,7 @@ It constructs the correct concrete miner from a simple picklable spec dict:
   {"id": "CPU-1", "kind": "cpu", "args": {...},
    "cfg": {"difficulty_energy": -15500.0, "min_diversity": 0.38, "min_solutions": 70}}
 """
+
 from __future__ import annotations
 
 import logging
@@ -20,9 +21,9 @@ import time
 import traceback
 from typing import Any, Dict, Optional
 
-import CPU
-import GPU
-import QPU
+import CPU  # noqa: E402
+import GPU  # noqa: E402
+import QPU  # noqa: E402
 
 from shared.logging_config import QuipFormatter
 
@@ -72,42 +73,58 @@ def build_miner_from_spec(spec: Dict[str, Any]):
         return CPU.SimulatedAnnealingMiner(miner_id, **cfg, **args)
     elif kind == "metal":
         if not GPU.METAL_AVAILABLE:
-            raise RuntimeError("Metal miner requested but Metal is not available (requires macOS with Metal support)")
+            raise RuntimeError(
+                "Metal miner requested but Metal is not available (requires macOS with Metal support)"
+            )
         return GPU.MetalMiner(miner_id, **cfg, **args)
     elif kind == "cuda":
         if not GPU.CUDA_AVAILABLE:
-            raise RuntimeError("CUDA miner requested but CUDA is not available (requires CuPy and CUDA toolkit)")
+            raise RuntimeError(
+                "CUDA miner requested but CUDA is not available (requires CuPy and CUDA toolkit)"
+            )
         return GPU.CudaMiner(miner_id, **cfg, **args)
     elif kind == "modal":
         if not GPU.MODAL_AVAILABLE:
-            raise RuntimeError("Modal miner requested but Modal is not available (requires modal SDK: pip install modal)")
+            raise RuntimeError(
+                "Modal miner requested but Modal is not available (requires modal SDK: pip install modal)"
+            )
         return GPU.ModalMiner(miner_id, **cfg, **args)
     elif kind == "cuda-gibbs":
         if not GPU.CUDA_AVAILABLE:
             raise RuntimeError(
                 "CUDA Gibbs miner requested but not available "
-                "(requires CuPy and CUDA toolkit)")
+                "(requires CuPy and CUDA toolkit)"
+            )
         return GPU.CudaMiner(
-            miner_id, update_mode="gibbs", **cfg, **args,
+            miner_id,
+            update_mode="gibbs",
+            **cfg,
+            **args,
         )
     elif kind == "qpu":
         # Build QPU time config if daily budget is specified
         time_config = None
         if cfg.get("daily_budget"):
             from QPU.qpu_time_manager import QPUTimeConfig, parse_duration
+
             time_config = QPUTimeConfig(
                 daily_budget_seconds=parse_duration(cfg["daily_budget"]),
                 min_blocks_for_estimation=cfg.get("qpu_min_blocks_for_estimation", 5),
                 ema_alpha=cfg.get("qpu_ema_alpha", 0.3),
             )
             # Remove time config keys from cfg to avoid passing them to miner
-            cfg = {k: v for k, v in cfg.items()
-                   if k not in ("daily_budget", "qpu_min_blocks_for_estimation",
-                                "qpu_ema_alpha", "qpu_type")}
+            cfg = {
+                k: v
+                for k, v in cfg.items()
+                if k
+                not in (
+                    "daily_budget",
+                    "qpu_min_blocks_for_estimation",
+                    "qpu_ema_alpha",
+                    "qpu_type",
+                )
+            }
         return QPU.DWaveMiner(miner_id, time_config=time_config, **cfg)
-    elif kind == "cpu-filtered":
-        from CPU.sa_filtered_miner import SAFilteredMiner
-        return SAFilteredMiner(miner_id, **cfg)
     else:
         raise ValueError(f"Unknown miner kind '{kind}'")
 
@@ -182,7 +199,13 @@ def miner_worker_main(
             # context against a stop_event tied to the new dispatch.
             context = msg.get("context")
             if context is None:
-                resp_q.put({"op": "error", "message": "Missing context for mine_work_item", "id": spec.get("id")})
+                resp_q.put(
+                    {
+                        "op": "error",
+                        "message": "Missing context for mine_work_item",
+                        "id": spec.get("id"),
+                    }
+                )
                 continue
             try:
                 result = miner.mine_work_item(context, stop_event)
@@ -192,19 +215,29 @@ def miner_worker_main(
                     f"{type(exc).__name__}: {exc}\n"
                     f"{traceback.format_exc()}"
                 )
-                resp_q.put({"op": "error", "message": f"{type(exc).__name__}: {exc}", "id": spec.get("id")})
+                resp_q.put(
+                    {
+                        "op": "error",
+                        "message": f"{type(exc).__name__}: {exc}",
+                        "id": spec.get("id"),
+                    }
+                )
             else:
                 if result is not None:
                     resp_q.put(result)
                 else:
                     resp_q.put({"op": "work_item_done", "id": spec.get("id")})
         else:
-            resp_q.put({"op": "error", "message": f"Unknown op {op}", "id": spec.get("id")})
-            logger.info(f"{miner.miner_id}: Unknown op {op}")
+            resp_q.put(
+                {"op": "error", "message": f"Unknown op {op}", "id": spec.get("id")}
+            )
+            logger.warning("%s: Unknown op %s", miner.miner_id, op)
             continue
+
 
 class MinerHandle:
     """Wrapper around a persistent miner worker process."""
+
     def __init__(self, spec: dict, log_queue: Optional[mp.Queue] = None):
         self.spec = spec
         self.req: mp.Queue = mp.Queue()
@@ -239,8 +272,6 @@ class MinerHandle:
             return f"GPU-LOCAL:{d}"
         if k == "metal":
             return "GPU-MPS"
-        if k == "cpu-filtered":
-            return "CPU-Filtered"
         if k == "cuda-gibbs":
             return "GPU-CUDA-Gibbs"
         return k.upper()
@@ -275,7 +306,9 @@ class MinerHandle:
         if isinstance(msg, dict) and msg.get("op") == "stats":
             return msg.get("data", {})
         else:
-            raise ValueError(f"Miner {self.miner_id} did not respond to get_stats: {msg}")
+            raise ValueError(
+                f"Miner {self.miner_id} did not respond to get_stats: {msg}"
+            )
 
     def close(self):
         self.req.put({"op": "shutdown"})
@@ -283,6 +316,6 @@ class MinerHandle:
             time.sleep(1)
             if self.proc.is_alive():
                 self.proc.terminate()
-                self.proc.join(timeout=0.1)       
+                self.proc.join(timeout=0.1)
         except Exception:
             pass

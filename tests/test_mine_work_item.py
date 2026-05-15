@@ -21,7 +21,6 @@ import pytest
 from shared.base_miner import (
     _BridgeNodeInfo,
     _BridgePrevBlock,
-    _block_requirements_from_difficulty,
 )
 from shared.work_context import requirements_from_context, resolve_ising
 from shared.miner_types import MiningResult
@@ -117,30 +116,31 @@ def test_bridge_node_info_handles_mempool_context():
     assert bridge.miner_account_bytes == b"\x00" * 32
 
 
-def test_block_requirements_converts_milli_to_float():
-    difficulty = SubstrateDifficulty(
-        min_solutions=5,
-        max_energy_milli=-2_500_000,
-        min_diversity_milli=200,
-        min_quality_milli=900,
+def test_requirements_from_context_pow_path():
+    """`requirements_from_context` maps PoW milli fields to float requirements."""
+    ctx = SubstrateMiningContext(
+        block_number=1,
+        parent_hash=b"\xab" * 32,
+        topology_hash=b"\xcd" * 32,
+        nodes=[0, 1, 2],
+        edges=[(0, 1), (1, 2)],
+        difficulty=SubstrateDifficulty(
+            min_solutions=5,
+            max_energy_milli=-2_500_000,
+            min_diversity_milli=200,
+            min_quality_milli=0,
+        ),
+        miner_account_bytes=b"\x42" * 32,
+        h_values=CANONICAL_H_VALUES,
     )
-    req = _block_requirements_from_difficulty(difficulty)
+    req = requirements_from_context(ctx)
     assert req.difficulty_energy == -2500.0
     assert req.min_diversity == 0.2
     assert req.min_solutions == 5
-    # Decay is disabled in substrate mode — sentinel is large enough that
-    # compute_current_requirements would no-op even if accidentally called.
+    # Decay is disabled in substrate mode.
     assert req.timeout_to_difficulty_adjustment_decay >= 2**30
-
-
-def test_requirements_from_context_pow_path(relaxed_context):
-    """`requirements_from_context` should produce the same shape the
-    legacy helper does for a PoW context."""
-    legacy = _block_requirements_from_difficulty(relaxed_context.difficulty)
-    via_dispatch = requirements_from_context(relaxed_context)
-    assert via_dispatch.difficulty_energy == legacy.difficulty_energy
-    assert via_dispatch.min_diversity == legacy.min_diversity
-    assert via_dispatch.min_solutions == legacy.min_solutions
+    # h_values are carried through for the PoW path.
+    assert req.h_values is not None
 
 
 def test_requirements_from_context_mempool_unset_floors():
@@ -334,6 +334,90 @@ def test_mine_work_item_observes_stop_event(cpu_miner, relaxed_context):
     # stop is observed, so allow a few seconds. The point is it isn't
     # mining for minutes.
     assert elapsed < 30, f"mine_work_item ignored stop_event for {elapsed:.1f}s"
+
+
+def test_requirements_from_context_mempool_zero_energy_floor():
+    """min_energy_milli=0 is a valid (very relaxed) floor — must NOT map to
+    +inf the way None does. Zero divides to 0.0 which allows any non-positive
+    energy sample."""
+    from shared.mempool_types import MempoolJobContext
+    ctx = MempoolJobContext(
+        order_id=3,
+        nodes=(0, 1),
+        edges=((0, 1),),
+        h_values=(0, 0),
+        j_values=(0,),
+        min_energy_milli=0,
+    )
+    req = requirements_from_context(ctx)
+    assert req.difficulty_energy == 0.0
+    assert req.difficulty_energy != float("inf")
+
+
+def test_mempool_job_context_from_job_order():
+    """from_job_order must copy all IsingParams fields into the context."""
+    from shared.mempool_types import (
+        IsingParams, JobMode, JobOrder, MempoolJobContext,
+        OrderStatus, OrderTiming, ResultDelivery, RewardResolution,
+    )
+    ising = IsingParams(
+        nodes=(10, 20),
+        edges=((10, 20),),
+        h_values=(500, -500),
+        j_values=(250,),
+        min_energy_milli=-1000,
+        min_diversity_milli=100,
+        min_solutions=2,
+    )
+    order = JobOrder(
+        spec_id=b"\x01" * 32,
+        proposer=b"\x02" * 32,
+        ising_params=ising,
+        reward=1000,
+        mode=JobMode.open(),
+        resolution=RewardResolution.single_best(),
+        timing=OrderTiming(deadline_blocks=10, block_wait=1),
+        delivery=ResultDelivery.on_chain_only(),
+        status=OrderStatus.OPENED,
+        created_at=100,
+        first_solution_at=None,
+        solution_count=0,
+    )
+    ctx = MempoolJobContext.from_job_order(order_id=5, order=order)
+    assert ctx.order_id == 5
+    assert ctx.nodes == (10, 20)
+    assert ctx.edges == ((10, 20),)
+    assert ctx.h_values == (500, -500)
+    assert ctx.j_values == (250,)
+    assert ctx.min_energy_milli == -1000
+    assert ctx.min_diversity_milli == 100
+    assert ctx.min_solutions == 2
+
+
+def test_mempool_job_context_rejects_mismatched_h_values():
+    """MempoolJobContext.__post_init__ must raise if h_values length != nodes."""
+    from shared.mempool_types import MempoolJobContext
+    with pytest.raises(ValueError, match="h_values length"):
+        MempoolJobContext(
+            order_id=1,
+            nodes=(0, 1, 2),
+            edges=(),
+            h_values=(0, 0),       # 2 != 3 nodes
+            j_values=(),
+        )
+
+
+def test_mempool_job_context_rejects_mismatched_j_values():
+    """MempoolJobContext.__post_init__ must raise if j_values length != edges."""
+    from shared.mempool_types import MempoolJobContext
+    with pytest.raises(ValueError, match="j_values length"):
+        MempoolJobContext(
+            order_id=1,
+            nodes=(0, 1),
+            edges=((0, 1),),
+            h_values=(0, 0),
+            j_values=(0, 0),       # 2 != 1 edge
+        )
 
 
 @pytest.mark.timeout(120)
