@@ -39,7 +39,8 @@ from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from shared.signer import Signer
-from shared.substrate_client import SubstrateClient
+from shared.substrate_client import NoValidatorReachable, SubstrateClient
+from websocket import WebSocketException
 from shared.substrate_submitter import encode_quantum_proof, submit_proof
 from shared.substrate_types import (
     ExtrinsicReceipt,
@@ -202,8 +203,13 @@ class SubstrateMinerController:
         # indefinitely. We use a dedicated subscription client by default —
         # callers can inject their own (e.g. tests) but it must be a
         # *separate* SubstrateClient instance from `client`.
+        #
+        # Pass the full validator rotation (not just `client.url`) so both
+        # clients share the same failover surface — otherwise a failover on
+        # the submit client could leave the subscription client anchored to
+        # a dead validator.
         if subscription_client is None:
-            subscription_client = SubstrateClient(url=client.url)
+            subscription_client = SubstrateClient(urls=client.urls)
         elif subscription_client is client:
             raise ValueError(
                 "subscription_client must be a separate SubstrateClient "
@@ -636,11 +642,18 @@ class SubstrateMinerController:
                 )
 
     async def _subscribe_heads(self) -> None:
-        """Subscribe to new best heads and post into the head queue.
+        """Subscribe to new best heads, with failover on validator drop.
 
-        Wraps `client.subscribe_new_heads` so any exception in the
-        subscription thread is logged and triggers controller shutdown
-        rather than silently disappearing.
+        Loop semantics:
+          - `subscribe_new_heads` returning normally → clean shutdown path.
+          - `WebSocketException` / `ConnectionError` → trigger one
+            `reconnect()` on the subscription client, then re-subscribe.
+          - `NoValidatorReachable` from reconnect → fail-loud: record the
+            structured attempt log in `stats.last_submission_error` and
+            shut the controller down.
+          - Any other exception (decoder bugs, RPC type errors, etc.) is
+            treated as fatal and shuts down — those are not transient
+            connection loss and should not be retried.
         """
 
         async def callback(block_hash: bytes, block_number: int) -> None:
@@ -650,17 +663,41 @@ class SubstrateMinerController:
             self._latest_head = (block_hash, block_number)
             self._head_signal.set()
 
-        try:
-            await self._subscription_client.subscribe_new_heads(callback)
-        except Exception as exc:
-            self.stats.last_submission_error = (
-                f"head subscription crashed: {type(exc).__name__}: {exc}"
-            )
-            logger.exception("head subscription crashed; triggering shutdown")
-            # We're already on the asyncio loop; no need for
-            # call_soon_threadsafe (the subscription wrapper bridges its
-            # background thread into our awaitable callback).
-            self.shutdown()
+        while not self._shutdown_event.is_set():
+            try:
+                await self._subscription_client.subscribe_new_heads(callback)
+                return  # clean exit — subscribe returned without error
+            except (WebSocketException, ConnectionError) as exc:
+                logger.warning(
+                    "head subscription dropped on %s (%s: %s); failing over",
+                    getattr(self._subscription_client, "current_url", "<unknown>"),
+                    type(exc).__name__,
+                    exc,
+                )
+                try:
+                    await self._subscription_client.reconnect()
+                except NoValidatorReachable as fatal:
+                    self.stats.last_submission_error = (
+                        f"no validators reachable; head subscription cannot "
+                        f"recover: {fatal}"
+                    )
+                    logger.error(
+                        "subscription failover exhausted; triggering shutdown:\n%s",
+                        fatal,
+                    )
+                    self.shutdown()
+                    return
+                # loop iteration: re-subscribe on the new validator
+            except Exception as exc:
+                self.stats.last_submission_error = (
+                    f"head subscription crashed: {type(exc).__name__}: {exc}"
+                )
+                logger.exception("head subscription crashed; triggering shutdown")
+                # We're already on the asyncio loop; no need for
+                # call_soon_threadsafe (the subscription wrapper bridges its
+                # background thread into our awaitable callback).
+                self.shutdown()
+                return
 
     # ------------------------------------------------------------------
     # Teardown

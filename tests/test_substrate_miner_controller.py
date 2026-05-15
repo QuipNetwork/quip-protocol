@@ -453,6 +453,116 @@ async def test_handle_head_resets_consecutive_none_on_success():
 
 
 # ----------------------------------------------------------------------
+# Subscription failover loop (unit)
+# ----------------------------------------------------------------------
+
+
+def _subscribe_controller(subscription_client) -> SubstrateMinerController:
+    """Bare controller wired up enough to exercise `_subscribe_heads`."""
+    c = _bare_controller()
+    c._subscription_client = subscription_client
+    c._shutdown_event = asyncio.Event()
+    c._latest_head = None
+    c._head_signal = asyncio.Event()
+    return c
+
+
+class _FlakySubscriptionClient:
+    """Stub `SubstrateClient`-like object whose `subscribe_new_heads` and
+    `reconnect` behaviors are scripted per test."""
+
+    def __init__(self, subscribe_outcomes, reconnect_outcomes=None):
+        # Each entry is either `None` (return cleanly) or an `Exception`
+        # instance to raise. Consumed in order.
+        self._subscribe_outcomes = list(subscribe_outcomes)
+        self._reconnect_outcomes = list(reconnect_outcomes or [])
+        self.subscribe_calls = 0
+        self.reconnect_calls = 0
+
+    async def subscribe_new_heads(self, callback):
+        self.subscribe_calls += 1
+        if not self._subscribe_outcomes:
+            raise AssertionError("subscribe called more times than scripted")
+        outcome = self._subscribe_outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+
+    async def reconnect(self):
+        self.reconnect_calls += 1
+        if not self._reconnect_outcomes:
+            return
+        outcome = self._reconnect_outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+
+
+async def test_subscribe_heads_clean_exit_no_failover():
+    """A clean subscribe_new_heads return must NOT trigger any failover."""
+    sub = _FlakySubscriptionClient(subscribe_outcomes=[None])
+    controller = _subscribe_controller(sub)
+    await controller._subscribe_heads()
+    assert sub.subscribe_calls == 1
+    assert sub.reconnect_calls == 0
+
+
+async def test_subscribe_heads_failover_then_resubscribes():
+    """A WebSocketException triggers reconnect, then loop re-subscribes."""
+    from websocket import WebSocketConnectionClosedException
+
+    sub = _FlakySubscriptionClient(
+        subscribe_outcomes=[
+            WebSocketConnectionClosedException("socket closed"),
+            None,  # second subscribe call returns cleanly
+        ],
+    )
+    controller = _subscribe_controller(sub)
+    await controller._subscribe_heads()
+    assert sub.subscribe_calls == 2
+    assert sub.reconnect_calls == 1
+
+
+async def test_subscribe_heads_no_validator_reachable_shuts_down():
+    """If reconnect itself can't find a validator, the controller shuts down
+    rather than spinning forever."""
+    from shared.substrate_client import NoValidatorReachable, ValidatorAttempt
+    from websocket import WebSocketConnectionClosedException
+
+    fatal = NoValidatorReachable(
+        attempts=[
+            ValidatorAttempt(url="ws://a:9944", exc_type="OSError", message="down")
+        ]
+    )
+    sub = _FlakySubscriptionClient(
+        subscribe_outcomes=[WebSocketConnectionClosedException("dropped")],
+        reconnect_outcomes=[fatal],
+    )
+    controller = _subscribe_controller(sub)
+    shutdown_calls = []
+    controller.shutdown = lambda: shutdown_calls.append(True) or controller._shutdown_event.set()
+    await controller._subscribe_heads()
+    assert shutdown_calls == [True]
+    assert sub.subscribe_calls == 1
+    assert sub.reconnect_calls == 1
+    # The structured failure is recorded for the operator-facing stats blob.
+    assert "no validators reachable" in (controller.stats.last_submission_error or "").lower()
+
+
+async def test_subscribe_heads_non_connection_exception_still_shuts_down():
+    """Generic exceptions in subscribe must NOT trigger failover — they're
+    bugs, not transient connection loss. Preserves pre-failover behavior."""
+    sub = _FlakySubscriptionClient(
+        subscribe_outcomes=[RuntimeError("decoder explosion")],
+    )
+    controller = _subscribe_controller(sub)
+    shutdown_calls = []
+    controller.shutdown = lambda: shutdown_calls.append(True) or controller._shutdown_event.set()
+    await controller._subscribe_heads()
+    assert shutdown_calls == [True]
+    assert sub.subscribe_calls == 1
+    assert sub.reconnect_calls == 0
+
+
+# ----------------------------------------------------------------------
 # Integration test against live docker chain
 # ----------------------------------------------------------------------
 

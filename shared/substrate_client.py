@@ -137,6 +137,10 @@ class SubstrateClient:
         # currently connected (or the first one before connect()).
         self.url: str = self._urls[0]
         self.current_url: str = self._urls[0]
+        # Public read-only view of the validator rotation. Controllers
+        # propagate this to their separate subscription clients so both
+        # clients see the same failover surface.
+        self.urls: tuple[str, ...] = self._urls
         self._current_index: int = 0
         # Guard against `_run` triggering a reconnect that, while running,
         # encounters another websocket exception. Without this we could

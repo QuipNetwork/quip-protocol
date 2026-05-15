@@ -181,7 +181,9 @@ class MempoolMinerController:
             )
         self.client = client
         if subscription_client is None:
-            subscription_client = SubstrateClient(url=client.url)
+            # Pass the full validator rotation (not just `client.url`) so the
+            # subscription and submit clients share one failover surface.
+            subscription_client = SubstrateClient(urls=client.urls)
         elif subscription_client is client:
             raise ValueError(
                 "subscription_client must be a separate SubstrateClient "
