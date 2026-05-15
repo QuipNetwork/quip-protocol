@@ -10,18 +10,25 @@ removed in the v0.1 -> v0.2 refactor. Their state and orchestration are
 now owned by the substrate node (quip-protocol-rs); miners attach via
 SubstrateMinerController.
 """
+
 from __future__ import annotations
 
 import asyncio
-import multiprocessing
+import hashlib
+import signal as signal_module
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import click
 
-from shared.keystore_hybrid import generate
+from dwave_topologies.topologies.zephyr import zephyr
+from shared.keystore_hybrid import generate, load
 from shared.logging_config import setup_logging
 from shared.miner_bootstrap import BootstrapConfig, bootstrap
+from shared.miner_core import MinerCore
+from shared.substrate_client import SubstrateClient
+from shared.substrate_miner_controller import SubstrateMinerController
+from shared.telemetry_api import TelemetryApiServer
 
 
 @click.group(name="quip-miner")
@@ -48,16 +55,12 @@ def quip_miner(log_level: str) -> None:
 )
 @click.option("--overwrite", is_flag=True, help="Replace an existing keystore at --out")
 def quip_miner_keygen(out_path: str, overwrite: bool) -> None:
-    """Generate a fresh sr25519 signing key for quip-miner.
+    """Generate a fresh hybrid sr25519+ML-DSA-44 signing key for quip-miner.
 
-    Writes a JSON keystore (0o600) and prints the SS58 address. The seed is
-    stored in plaintext — adequate for dev workflows where the faucet bot
-    runs alongside. Passphrase-encrypted keystores land in Phase 7.
-
-    v0.2 hybrid chain: keygen produces a sr25519+ML-DSA-44 hybrid keystore
-    by default via `shared.keystore_hybrid`. The legacy sr25519-only
-    `shared.keystore` module is still available for pre-hybrid chains but
-    not exposed via the CLI in v0.2.
+    Writes a JSON keystore (0o600) holding the 32-byte master seed and
+    prints the SS58 address. The seed is stored in plaintext — adequate
+    for dev workflows where the faucet bot runs alongside.
+    Passphrase-encrypted keystores land in a follow-on.
     """
     keystore = generate(Path(out_path).expanduser(), overwrite=overwrite)
     click.echo(f"wrote hybrid keystore: {keystore.path}")
@@ -175,8 +178,6 @@ def _parse_topology(spec: str):
     miners need them. Returns the sampler-compatible topology object so the
     CLI can plug it straight into the spec's `args["topology"]`.
     """
-    from dwave_topologies.topologies.zephyr import zephyr
-
     if ":" not in spec:
         raise click.BadParameter(
             f"--topology must be 'family:m,t' (got {spec!r}); try 'zephyr:9,2'"
@@ -208,118 +209,97 @@ async def _run_miner(
     """Shared entry point for `quip-miner cpu|gpu|qpu`.
 
     Builds the keystore-loaded signer, a `MinerCore` with the requested
-    miner kind, two `SubstrateClient` instances (state + subscription),
-    and a `SubstrateMinerController`. Runs the controller until KeyboardInterrupt.
+    miner kind, a `SubstrateClient`, and a `SubstrateMinerController`. Runs
+    the controller until KeyboardInterrupt.
     """
-    import asyncio
-    import hashlib
-    import signal as signal_module
-    from pathlib import Path
-
-    from shared.keystore_hybrid import load
-    from shared.miner_core import MinerCore
-    from shared.substrate_client import SubstrateClient
-    from shared.substrate_miner_controller import SubstrateMinerController
-
     keystore = load(Path(signer_key_path).expanduser())
-    click.echo(f"signer: {keystore.signer.ss58_address()} (hybrid)")
+    click.echo(f"signer: {keystore.signer.ss58_address()}")
 
-    # Build the sampler topology and bind it to the miner config.
     topology = _parse_topology(topology_spec)
     click.echo(
         f"topology: {topology_spec} ({topology.num_nodes} nodes, "
         f"{topology.num_edges} edges)"
     )
 
-    # Inject the topology into whichever miner kind is being constructed.
     miner_config = _inject_topology(miner_config, kind, topology)
 
     core = MinerCore(node_id="quip-miner", miners_config=miner_config)
-    if not core.miner_handles:
-        click.echo(
-            f"no miner handles built for kind={kind}; check --num-cpus / "
-            f"GPU/QPU config",
-            err=True,
-        )
-        return 2
-
-    client = SubstrateClient(url=node_url)
-    await client.connect()
-
-    # Verify the sampler topology matches the chain's registered topology
-    # before mining starts. Without this check, every proof would be rejected
-    # with InvalidTopology (Phase 4 confirmed this end-to-end).
-    head = await client.get_head()
-    snapshot = await client.get_mining_snapshot(
-        at=head,
-        miner_account_bytes=keystore.signer.account_id_bytes(),
-    )
-    if snapshot is None:
-        click.echo(
-            "chain has no registered topology; run "
-            "`quip-miner bootstrap --seed-chain` first",
-            err=True,
-        )
-        await client.close()
-        core.close()
-        return 3
-    expected_hash = _zephyr_topology_hash(topology)
-    if snapshot.topology_hash != expected_hash:
-        click.echo(
-            f"topology mismatch: --topology {topology_spec} hashes to "
-            f"0x{expected_hash.hex()} but chain has 0x{snapshot.topology_hash.hex()}; "
-            "either adjust --topology or re-seed the chain",
-            err=True,
-        )
-        await client.close()
-        core.close()
-        return 4
-
-    controller = SubstrateMinerController(
-        client=client,
-        signer=keystore.signer,
-        miner_handles=core.miner_handles,
-        topology_hash=snapshot.topology_hash,
-        core=core,
-    )
-    click.echo(
-        f"controller starting: handles={[h.miner_id for h in core.miner_handles]} "
-        f"topology_hash=0x{snapshot.topology_hash.hex()[:16]}..."
-    )
-
-    # Optional telemetry server. The legacy /api/v1/* surface is preserved
-    # via `shared.telemetry_api`; new operators that don't want HTTP
-    # telemetry pass `--rest-port -1` to skip the bind.
-    telemetry: Optional["TelemetryApiServer"] = None
-    if rest_port is not None and rest_port > 0:
-        from shared.telemetry_api import TelemetryApiServer
-
-        telemetry = TelemetryApiServer(
-            core=core,
-            client=client,
-            signer=keystore.signer,
-            controller=controller,
-            host="127.0.0.1",
-            port=rest_port,
-        )
-        await telemetry.start()
-        click.echo(
-            f"telemetry api: http://127.0.0.1:{rest_port}/api/v1/status"
-        )
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal_module.SIGINT, signal_module.SIGTERM):
-        loop.add_signal_handler(sig, controller.shutdown)
-
     try:
-        await controller.run()
+        if not core.miner_handles:
+            click.echo(
+                f"no miner handles built for kind={kind}; check --num-cpus / "
+                f"GPU/QPU config",
+                err=True,
+            )
+            return 2
+
+        client = SubstrateClient(url=node_url)
+        await client.connect()
+        try:
+            # Verify the sampler topology matches the chain's registered
+            # topology before mining starts. Without this check, every proof
+            # would be rejected with InvalidTopology.
+            head = await client.get_head()
+            snapshot = await client.get_mining_snapshot(
+                at=head,
+                miner_account_bytes=keystore.signer.account_id_bytes(),
+            )
+            if snapshot is None:
+                click.echo(
+                    "chain has no registered topology; run "
+                    "`quip-miner bootstrap --seed-chain` first",
+                    err=True,
+                )
+                return 3
+            expected_hash = _zephyr_topology_hash(topology)
+            if snapshot.topology_hash != expected_hash:
+                click.echo(
+                    f"topology mismatch: --topology {topology_spec} hashes to "
+                    f"0x{expected_hash.hex()} but chain has "
+                    f"0x{snapshot.topology_hash.hex()}; "
+                    "either adjust --topology or re-seed the chain",
+                    err=True,
+                )
+                return 4
+
+            controller = SubstrateMinerController(
+                client=client,
+                signer=keystore.signer,
+                miner_handles=core.miner_handles,
+                topology_hash=snapshot.topology_hash,
+                core=core,
+            )
+            click.echo(
+                f"controller starting: handles={[h.miner_id for h in core.miner_handles]} "
+                f"topology_hash=0x{snapshot.topology_hash.hex()[:16]}..."
+            )
+
+            telemetry: Optional[TelemetryApiServer] = None
+            if rest_port is not None and rest_port > 0:
+                telemetry = TelemetryApiServer(
+                    core=core,
+                    client=client,
+                    signer=keystore.signer,
+                    controller=controller,
+                    host="127.0.0.1",
+                    port=rest_port,
+                )
+                await telemetry.start()
+                click.echo(f"telemetry api: http://127.0.0.1:{rest_port}/api/v1/status")
+
+            loop = asyncio.get_running_loop()
+            for sig in (signal_module.SIGINT, signal_module.SIGTERM):
+                loop.add_signal_handler(sig, controller.shutdown)
+
+            try:
+                await controller.run()
+            finally:
+                click.echo(f"controller stopped: stats={controller.stats}")
+                if telemetry is not None:
+                    await telemetry.stop()
+        finally:
+            await client.close()
     finally:
-        click.echo(
-            f"controller stopped: stats={controller.stats}",
-        )
-        if telemetry is not None:
-            await telemetry.stop()
-        await client.close()
         core.close()
     return 0
 
@@ -337,9 +317,12 @@ def _inject_topology(miner_config: dict, kind: str, topology) -> dict:
         args["topology"] = topology
         section["args"] = args
         out["cpu"] = section
-    # GPU/QPU sections are device-array shaped; topology injection happens
-    # at the spec level via _build_gpu_specs / _build_qpu_specs in a
-    # follow-on once GPU/QPU end-to-end is exercised against the chain.
+    else:
+        click.echo(
+            f"warning: --topology injection not yet implemented for kind={kind!r}; "
+            "GPU/QPU samplers will use their default topology (Phase 6)",
+            err=True,
+        )
     return out
 
 
@@ -349,8 +332,6 @@ def _zephyr_topology_hash(topology) -> bytes:
     Matches `pallets/quantum-pow/src/topology.rs::hash_topology`:
         blake2_256(SCALE((sorted nodes, sorted canonical edges)))
     """
-    import hashlib
-
     nodes = sorted(int(n) for n in topology.nodes)
     edges = sorted(
         (min(int(u), int(v)), max(int(u), int(v))) for u, v in topology.edges
@@ -380,7 +361,9 @@ _TOPOLOGY_HELP = (
     "Topology spec for the miner's sampler. Format: 'family:m,t'. Must hash "
     "to the chain's registered topology — mismatch fails fast at startup."
 )
-_REST_PORT_HELP = "Telemetry REST API port (set to -1 to disable; Phase 5b wires this in)"
+_REST_PORT_HELP = (
+    "Telemetry REST API port (default -1 disables; set to a port to serve /api/v1/*)"
+)
 
 
 @quip_miner.command("cpu")
@@ -408,7 +391,11 @@ _REST_PORT_HELP = "Telemetry REST API port (set to -1 to disable; Phase 5b wires
     help=_TOPOLOGY_HELP,
 )
 @click.option(
-    "--rest-port", type=int, default=-1, show_default=True, help=_REST_PORT_HELP,
+    "--rest-port",
+    type=int,
+    default=-1,
+    show_default=True,
+    help=_REST_PORT_HELP,
 )
 def quip_miner_cpu(
     node_url: str,
@@ -418,17 +405,19 @@ def quip_miner_cpu(
     rest_port: int,
 ) -> None:
     """Run CPU SA miners against a substrate chain."""
-    import asyncio
-
     miner_config = {"cpu": {"num_cpus": num_cpus}}
-    raise SystemExit(asyncio.run(_run_miner(
-        kind="cpu",
-        node_url=node_url,
-        signer_key_path=signer_key_path,
-        rest_port=rest_port,
-        topology_spec=topology_spec,
-        miner_config=miner_config,
-    )))
+    raise SystemExit(
+        asyncio.run(
+            _run_miner(
+                kind="cpu",
+                node_url=node_url,
+                signer_key_path=signer_key_path,
+                rest_port=rest_port,
+                topology_spec=topology_spec,
+                miner_config=miner_config,
+            )
+        )
+    )
 
 
 @quip_miner.command("gpu")
@@ -456,7 +445,11 @@ def quip_miner_cpu(
     help=_TOPOLOGY_HELP,
 )
 @click.option(
-    "--rest-port", type=int, default=-1, show_default=True, help=_REST_PORT_HELP,
+    "--rest-port",
+    type=int,
+    default=-1,
+    show_default=True,
+    help=_REST_PORT_HELP,
 )
 def quip_miner_gpu(
     node_url: str,
@@ -473,8 +466,6 @@ def quip_miner_gpu(
     samplers consume the topology via their `args` dict the same way the
     CPU path does once that injection is generalised.
     """
-    import asyncio
-
     backend = gpu_backend.lower()
     if backend == "local":
         miner_config = {"cuda": [{"device": "0"}]}
@@ -485,14 +476,18 @@ def quip_miner_gpu(
     else:
         raise click.BadParameter(f"unknown --gpu-backend: {backend}")
 
-    raise SystemExit(asyncio.run(_run_miner(
-        kind="gpu",
-        node_url=node_url,
-        signer_key_path=signer_key_path,
-        rest_port=rest_port,
-        topology_spec=topology_spec,
-        miner_config=miner_config,
-    )))
+    raise SystemExit(
+        asyncio.run(
+            _run_miner(
+                kind="gpu",
+                node_url=node_url,
+                signer_key_path=signer_key_path,
+                rest_port=rest_port,
+                topology_spec=topology_spec,
+                miner_config=miner_config,
+            )
+        )
+    )
 
 
 @quip_miner.command("qpu")
@@ -514,9 +509,9 @@ def quip_miner_gpu(
 )
 @click.option(
     "--daily-budget",
-    type=int,
+    type=str,
     default=None,
-    help="Daily QPU access-time budget in microseconds (provider-specific)",
+    help="Daily QPU access-time budget. Format: '30s', '5m', '2h', '1d' (passed to QPUTimeManager)",
 )
 @click.option(
     "--topology",
@@ -526,7 +521,11 @@ def quip_miner_gpu(
     help=_TOPOLOGY_HELP,
 )
 @click.option(
-    "--rest-port", type=int, default=-1, show_default=True, help=_REST_PORT_HELP,
+    "--rest-port",
+    type=int,
+    default=-1,
+    show_default=True,
+    help=_REST_PORT_HELP,
 )
 def quip_miner_qpu(
     node_url: str,
@@ -542,28 +541,34 @@ def quip_miner_qpu(
     Same Phase 5a caveat as GPU: end-to-end against the chain is a Phase 6
     item once topology binding generalises beyond CPU.
     """
-    import asyncio
-
     section: dict = {"type": qpu_type}
     if daily_budget is not None:
         section["daily_budget"] = daily_budget
     miner_config = {qpu_type: [section]}
 
-    raise SystemExit(asyncio.run(_run_miner(
-        kind="qpu",
-        node_url=node_url,
-        signer_key_path=signer_key_path,
-        rest_port=rest_port,
-        topology_spec=topology_spec,
-        miner_config=miner_config,
-    )))
+    raise SystemExit(
+        asyncio.run(
+            _run_miner(
+                kind="qpu",
+                node_url=node_url,
+                signer_key_path=signer_key_path,
+                rest_port=rest_port,
+                topology_spec=topology_spec,
+                miner_config=miner_config,
+            )
+        )
+    )
 
 
 # Entry points for console_scripts
 
 
-
 def miner_main():
     """Entry point for the `quip-miner` console script."""
-    quip_miner(standalone_mode=False)
-
+    try:
+        quip_miner(standalone_mode=False)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        click.echo(f"quip-miner: error: {exc}", err=True)
+        raise SystemExit(1) from exc

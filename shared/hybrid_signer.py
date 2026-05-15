@@ -26,11 +26,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 from dataclasses import dataclass
-from typing import Literal
 
-import blake3
 from dilithium_py.ml_dsa import ML_DSA_44
+from scalecodec.utils.ss58 import ss58_encode
 from substrateinterface import Keypair, KeypairType
 
 from shared.signer import Signer, SignatureKind
@@ -68,10 +68,14 @@ HYBRID_SIG_LEN = SR_SIG_LEN + ML_SIG_LEN       # 2484
 
 def _hkdf_extract_expand(*, salt: bytes, ikm: bytes, info: bytes, length: int) -> bytes:
     """Single-block (length<=32) HKDF-SHA256 extract + expand."""
-    # Extract: PRK = HMAC-SHA256(salt, ikm)
+    if length > 32:
+        # Single-block expand only emits SHA-256 length (32 bytes); a caller
+        # asking for more would silently get a truncated value. Raise so the
+        # contract is loud — multi-block expand can be added if needed.
+        raise ValueError(
+            f"single-block HKDF only supports length<=32, got {length}"
+        )
     prk = hmac.new(salt, ikm, hashlib.sha256).digest()
-    # Expand: T(1) = HMAC-SHA256(PRK, info || 0x01); enough for length<=32.
-    assert length <= 32, "single-block HKDF only — extend if you need >32 bytes"
     t = hmac.new(prk, info + bytes([1]), hashlib.sha256).digest()
     return t[:length]
 
@@ -184,7 +188,6 @@ class HybridSigner(Signer):
     @classmethod
     def generate(cls) -> "HybridSigner":
         """Fresh random master seed; useful for tests + dev keygen."""
-        import os
         return cls.from_master_seed(os.urandom(MASTER_SEED_LEN))
 
     # ------------------------------------------------------------------
@@ -205,8 +208,6 @@ class HybridSigner(Signer):
         Not the same as the sr25519 sub-key's SS58 address — the chain
         identifies accounts by `blake2_256(domain || hybrid_pubkey)`.
         """
-        # Reuse substrate-interface's ss58_encode for prefix-42 formatting.
-        from scalecodec.utils.ss58 import ss58_encode
         return ss58_encode(self.account_id_bytes(), ss58_format=42)
 
     def sign(self, payload: bytes) -> bytes:
@@ -223,8 +224,16 @@ class HybridSigner(Signer):
             sr_sig = bytes.fromhex(sr_sig[2:] if sr_sig.startswith("0x") else sr_sig)
         sr_sig = bytes(sr_sig)
         ml_sig = ML_DSA_44.sign(self._kp.ml_dsa_sk, msg_prime)
-        assert len(sr_sig) == SR_SIG_LEN, f"sr25519 sig {len(sr_sig)} != {SR_SIG_LEN}"
-        assert len(ml_sig) == ML_SIG_LEN, f"ml_dsa sig {len(ml_sig)} != {ML_SIG_LEN}"
+        if len(sr_sig) != SR_SIG_LEN:
+            raise RuntimeError(
+                f"sr25519 signature length {len(sr_sig)} != expected {SR_SIG_LEN}; "
+                f"substrate-interface signing returned an unexpected shape"
+            )
+        if len(ml_sig) != ML_SIG_LEN:
+            raise RuntimeError(
+                f"ML-DSA-44 signature length {len(ml_sig)} != expected {ML_SIG_LEN}; "
+                f"dilithium-py returned an unexpected shape"
+            )
         return sr_sig + ml_sig
 
     def signature_kind(self) -> SignatureKind:
@@ -262,12 +271,18 @@ class HybridSigner(Signer):
         sr_sig = signature[:SR_SIG_LEN]
         ml_sig = signature[SR_SIG_LEN:]
         msg_prime = prepare_message(payload)
-        # substrate-interface verifies sr25519 via Keypair.verify(data, sig).
+        # Both component verifiers can raise on malformed inputs (wrong-shape
+        # signature bytes, internal library asserts). Catch the documented
+        # exception types and treat as verification failure so the function's
+        # `-> bool` contract holds; let unexpected types propagate.
         try:
             sr_ok = self._kp.sr25519.verify(data=msg_prime, signature=sr_sig)
-        except Exception:
+        except (ValueError, TypeError):
             sr_ok = False
-        ml_ok = ML_DSA_44.verify(self._kp.ml_dsa_pk, msg_prime, ml_sig)
+        try:
+            ml_ok = ML_DSA_44.verify(self._kp.ml_dsa_pk, msg_prime, ml_sig)
+        except (ValueError, TypeError):
+            ml_ok = False
         return sr_ok and ml_ok
 
 
