@@ -21,6 +21,7 @@ chain types (`Block`, `BlockSigner`, `BlockRequirements`, etc.). The factory
 helpers for cpu/gpu/qpu specs are forked from `Node._initialize_miners` —
 Phase 5b's deletion sweep removes the original.
 """
+
 from __future__ import annotations
 
 import logging
@@ -175,9 +176,7 @@ class MinerCore:
             "wins_per_miner": {},
         }
 
-        self._summary_miners = [
-            (h.miner_id, h.miner_type) for h in self.miner_handles
-        ]
+        self._summary_miners = [(h.miner_id, h.miner_type) for h in self.miner_handles]
 
         self.logger.info(
             "MinerCore %s initialized with %d handles", node_id, len(self.miner_handles)
@@ -195,26 +194,38 @@ class MinerCore:
             try:
                 h.cancel()
                 h.req.put({"op": "shutdown"})
-            except Exception:  # noqa: BLE001 — best-effort tear-down
-                pass
+            except Exception as exc:  # noqa: BLE001 — best-effort tear-down
+                self.logger.warning(
+                    "close: shutdown signal failed for %s: %s", h.miner_id, exc
+                )
         for h in self.miner_handles:
             try:
                 h.proc.join(timeout=5.0)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("close: join failed for %s: %s", h.miner_id, exc)
             if h.proc.is_alive():
                 try:
                     h.proc.terminate()
                     h.proc.join(timeout=2.0)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.warning(
+                        "close: terminate failed for %s: %s", h.miner_id, exc
+                    )
+                if h.proc.is_alive():
+                    try:
+                        h.proc.kill()
+                        h.proc.join(timeout=1.0)
+                    except Exception as exc:  # noqa: BLE001
+                        self.logger.warning(
+                            "close: kill failed for %s: %s", h.miner_id, exc
+                        )
         self.miner_handles = []
 
         if self._log_listener is not None:
             try:
                 self._log_listener.stop()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("close: log listener stop failed: %s", exc)
             self._log_listener = None
 
     # ------------------------------------------------------------------
@@ -307,6 +318,11 @@ class MinerCore:
                 self._log_queue, *handlers, respect_handler_level=True
             )
             self._log_listener.start()
+        else:
+            logging.getLogger(__name__).warning(
+                "MinerCore: root logger has no handlers; child-process logs will be "
+                "discarded. Call setup_logging() before constructing MinerCore."
+            )
 
     def _initialize_miners(self, cfg: Dict[str, Any]) -> None:
         # CPU section. `cfg["cpu"]["num_cpus"]` defaults to 1 if present.
@@ -327,18 +343,16 @@ class MinerCore:
 
         # GPU section. Forked from Node's normalization path; we keep only
         # the device-section parsing the cuda/metal/modal kinds care about.
-        has_gpu = (
-            cfg.get("gpu") is not None
-            or any(cfg.get(k) is not None for k in _GPU_DEVICE_SECTIONS)
+        has_gpu = cfg.get("gpu") is not None or any(
+            cfg.get(k) is not None for k in _GPU_DEVICE_SECTIONS
         )
         if has_gpu:
             for spec in _build_gpu_specs(self.node_id, cfg):
                 self.miner_handles.append(MinerHandle(spec, self._log_queue))
 
         # QPU section. Same forked pattern.
-        has_qpu = (
-            cfg.get("qpu") is not None
-            or any(cfg.get(k) is not None for k in _QPU_DEVICE_SECTIONS)
+        has_qpu = cfg.get("qpu") is not None or any(
+            cfg.get(k) is not None for k in _QPU_DEVICE_SECTIONS
         )
         if has_qpu:
             for spec in _build_qpu_specs(self.node_id, cfg):
@@ -363,27 +377,33 @@ def _build_gpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
         dev_cfg = _build_gpu_miner_cfg(dev, defaults=common_cfg)
         if dev_type == "cuda":
             device_id = dev.get("device", "0")
-            specs.append({
-                "id": f"{node_id}-GPU-CUDA-{device_id}",
-                "kind": "cuda",
-                "cfg": dev_cfg,
-                "args": {"device": str(device_id)},
-            })
+            specs.append(
+                {
+                    "id": f"{node_id}-GPU-CUDA-{device_id}",
+                    "kind": "cuda",
+                    "cfg": dev_cfg,
+                    "args": {"device": str(device_id)},
+                }
+            )
         elif dev_type == "metal":
-            specs.append({
-                "id": f"{node_id}-GPU-MPS",
-                "kind": "metal",
-                "cfg": dev_cfg,
-                "args": {"device": "mps"},
-            })
+            specs.append(
+                {
+                    "id": f"{node_id}-GPU-MPS",
+                    "kind": "metal",
+                    "cfg": dev_cfg,
+                    "args": {"device": "mps"},
+                }
+            )
         elif dev_type == "modal":
             gpu_type = dev.get("gpu_type", "t4")
-            specs.append({
-                "id": f"{node_id}-GPU-MODAL-{gpu_type}",
-                "kind": "modal",
-                "cfg": dev_cfg,
-                "args": {"gpu_type": str(gpu_type)},
-            })
+            specs.append(
+                {
+                    "id": f"{node_id}-GPU-MODAL-{gpu_type}",
+                    "kind": "modal",
+                    "cfg": dev_cfg,
+                    "args": {"gpu_type": str(gpu_type)},
+                }
+            )
         else:
             raise ValueError(f"Unknown GPU device type: {dev_type}")
     return specs
@@ -397,28 +417,33 @@ def _build_qpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
         dev_type = dev.get("type", "dwave").lower()
         tag = dev_type.upper()
         if dev_type == "dwave":
-            specs.append({
-                "id": f"{node_id}-QPU-{tag}-{i}",
-                "kind": "qpu",
-                "cfg": {
-                    "qpu_type": "dwave",
-                    "daily_budget": dev.get("daily_budget"),
-                    "qpu_min_blocks_for_estimation": dev.get(
-                        "qpu_min_blocks_for_estimation", 5,
-                    ),
-                    "qpu_ema_alpha": dev.get("qpu_ema_alpha", 0.3),
-                },
-            })
+            specs.append(
+                {
+                    "id": f"{node_id}-QPU-{tag}-{i}",
+                    "kind": "qpu",
+                    "cfg": {
+                        "qpu_type": "dwave",
+                        "daily_budget": dev.get("daily_budget"),
+                        "qpu_min_blocks_for_estimation": dev.get(
+                            "qpu_min_blocks_for_estimation",
+                            5,
+                        ),
+                        "qpu_ema_alpha": dev.get("qpu_ema_alpha", 0.3),
+                    },
+                }
+            )
         elif dev_type in ("ibm", "braket", "pasqal", "ionq", "origin"):
-            specs.append({
-                "id": f"{node_id}-QPU-{tag}-{i}",
-                "kind": "qpu",
-                "cfg": {
-                    "qpu_type": dev_type,
-                    "token": dev.get("token"),
-                    "daily_budget": dev.get("daily_budget"),
-                },
-            })
+            specs.append(
+                {
+                    "id": f"{node_id}-QPU-{tag}-{i}",
+                    "kind": "qpu",
+                    "cfg": {
+                        "qpu_type": dev_type,
+                        "token": dev.get("token"),
+                        "daily_budget": dev.get("daily_budget"),
+                    },
+                }
+            )
         else:
             raise ValueError(f"Unknown QPU device type: {dev_type}")
     return specs

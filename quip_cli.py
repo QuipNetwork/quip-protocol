@@ -10,17 +10,31 @@ removed in the v0.1 -> v0.2 refactor. Their state and orchestration are
 now owned by the substrate node (quip-protocol-rs); miners attach via
 SubstrateMinerController.
 """
+
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import signal
+import traceback
 from pathlib import Path
 from typing import Optional
 
 import click
 
-from shared.keystore_hybrid import generate
+from dwave_topologies.topologies.zephyr import zephyr
+from shared.keystore_hybrid import generate, load
 from shared.logging_config import setup_logging
+from shared.mempool_miner_controller import (
+    MempoolMinerController,
+    topology_hash_from_nodes_edges,
+)
+from shared.mempool_types import MinerType
 from shared.miner_bootstrap import BootstrapConfig, bootstrap
+from shared.miner_core import MinerCore
+from shared.substrate_client import SubstrateClient
+from shared.substrate_miner_controller import SubstrateMinerController
+from shared.telemetry_api import TelemetryApiServer
 
 
 @click.group(name="quip-miner")
@@ -47,16 +61,12 @@ def quip_miner(log_level: str) -> None:
 )
 @click.option("--overwrite", is_flag=True, help="Replace an existing keystore at --out")
 def quip_miner_keygen(out_path: str, overwrite: bool) -> None:
-    """Generate a fresh sr25519 signing key for quip-miner.
+    """Generate a fresh hybrid sr25519+ML-DSA-44 signing key for quip-miner.
 
-    Writes a JSON keystore (0o600) and prints the SS58 address. The seed is
-    stored in plaintext — adequate for dev workflows where the faucet bot
-    runs alongside. Passphrase-encrypted keystores land in Phase 7.
-
-    v0.2 hybrid chain: keygen produces a sr25519+ML-DSA-44 hybrid keystore
-    by default via `shared.keystore_hybrid`. The legacy sr25519-only
-    `shared.keystore` module is still available for pre-hybrid chains but
-    not exposed via the CLI in v0.2.
+    Writes a JSON keystore (0o600) holding the 32-byte master seed and
+    prints the SS58 address. The seed is stored in plaintext — adequate
+    for dev workflows where the faucet bot runs alongside.
+    Passphrase-encrypted keystores land in a follow-on.
     """
     keystore = generate(Path(out_path).expanduser(), overwrite=overwrite)
     click.echo(f"wrote hybrid keystore: {keystore.path}")
@@ -192,20 +202,13 @@ def quip_miner_register_solver(
     surfaced to job proposers via `mode = Bid{miner_types: [...]}` filters.
     Use `quip-miner deregister-solver` to opt out.
     """
-    import asyncio
-    from pathlib import Path
-
-    from shared.keystore_hybrid import load
-    from shared.mempool_types import MinerType
-    from shared.substrate_client import SubstrateClient
-
     keystore = load(Path(signer_key_path).expanduser())
     mt = MinerType.from_kind(miner_type)
 
     async def _do() -> int:
         client = SubstrateClient(url=node_url)
-        await client.connect()
         try:
+            await client.connect()
             existing = await client.query_solver(keystore.signer.account_id_bytes())
             if existing is not None:
                 if existing.solver_type != mt:
@@ -259,18 +262,12 @@ def quip_miner_deregister_solver(node_url: str, signer_key_path: str) -> None:
     message). After deregistration, submit_solution / claim_reward
     extrinsics will fail with `SolverNotRegistered` until you re-register.
     """
-    import asyncio
-    from pathlib import Path
-
-    from shared.keystore_hybrid import load
-    from shared.substrate_client import SubstrateClient
-
     keystore = load(Path(signer_key_path).expanduser())
 
     async def _do() -> int:
         client = SubstrateClient(url=node_url)
-        await client.connect()
         try:
+            await client.connect()
             existing = await client.query_solver(keystore.signer.account_id_bytes())
             if existing is None:
                 click.echo("solver not registered; nothing to do")
@@ -316,8 +313,6 @@ def _parse_topology(spec: str):
     miners need them. Returns the sampler-compatible topology object so the
     CLI can plug it straight into the spec's `args["topology"]`.
     """
-    from dwave_topologies.topologies.zephyr import zephyr
-
     if ":" not in spec:
         raise click.BadParameter(
             f"--topology must be 'family:m,t' (got {spec!r}); try 'zephyr:9,2'"
@@ -350,9 +345,12 @@ def _inject_topology(miner_config: dict, kind: str, topology) -> dict:
         args["topology"] = topology
         section["args"] = args
         out["cpu"] = section
-    # GPU/QPU sections are device-array shaped; topology injection happens
-    # at the spec level via _build_gpu_specs / _build_qpu_specs in a
-    # follow-on once GPU/QPU end-to-end is exercised against the chain.
+    else:
+        click.echo(
+            f"warning: --topology injection not yet implemented for kind={kind!r}; "
+            "GPU/QPU samplers will use their default topology (Phase 6)",
+            err=True,
+        )
     return out
 
 
@@ -362,8 +360,6 @@ def _zephyr_topology_hash(topology) -> bytes:
     Matches `pallets/quantum-pow/src/topology.rs::hash_topology`:
         blake2_256(SCALE((sorted nodes, sorted canonical edges)))
     """
-    import hashlib
-
     nodes = sorted(int(n) for n in topology.nodes)
     edges = sorted(
         (min(int(u), int(v)), max(int(u), int(v))) for u, v in topology.edges
@@ -393,7 +389,9 @@ _TOPOLOGY_HELP = (
     "Topology spec for the miner's sampler. Format: 'family:m,t'. Must hash "
     "to the chain's registered topology — mismatch fails fast at startup."
 )
-_REST_PORT_HELP = "Telemetry REST API port (set to -1 to disable; Phase 5b wires this in)"
+_REST_PORT_HELP = (
+    "Telemetry REST API port (default -1 disables; set to a port to serve /api/v1/*)"
+)
 
 # Seconds to wait for a controller to drain after signalling shutdown.
 # Must exceed the longest controller poll interval (<=10s for head-subscription
@@ -423,21 +421,6 @@ async def _run_concurrent_miner(
     Phase 9 can introduce a shared scheduler that lets one mode use the
     other's idle worker, plus `--mempool-fraction` for non-half splits.
     """
-    import asyncio
-    import signal as signal_module
-    import traceback as tb_module
-    from pathlib import Path
-
-    from shared.keystore_hybrid import load
-    from shared.mempool_miner_controller import (
-        MempoolMinerController,
-        topology_hash_from_nodes_edges,
-    )
-    from shared.mempool_types import MinerType
-    from shared.miner_core import MinerCore
-    from shared.substrate_client import SubstrateClient
-    from shared.substrate_miner_controller import SubstrateMinerController
-
     mode = mode.lower()
     if mode not in ("pow", "mempool", "both"):
         click.echo(f"invalid --mode {mode!r}", err=True)
@@ -555,8 +538,6 @@ async def _run_concurrent_miner(
             )
 
         if rest_port is not None and rest_port > 0:
-            from shared.telemetry_api import TelemetryApiServer
-
             telemetry = TelemetryApiServer(
                 core=core,
                 client=client,
@@ -578,7 +559,7 @@ async def _run_concurrent_miner(
                     except Exception:  # noqa: BLE001 -- signal handler must not raise
                         pass
 
-        for sig in (signal_module.SIGINT, signal_module.SIGTERM):
+        for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, _signal_shutdown)
 
         tasks: list[asyncio.Task] = []
@@ -607,7 +588,7 @@ async def _run_concurrent_miner(
             if exc is not None:
                 click.echo(
                     f"controller {t.get_name()} exited with error:\n"
-                    + "".join(tb_module.format_exception(
+                    + "".join(traceback.format_exception(
                         type(exc), exc, exc.__traceback__
                     )),
                     err=True,
@@ -724,7 +705,11 @@ _MODE_HELP = (
     help=_TOPOLOGY_HELP,
 )
 @click.option(
-    "--rest-port", type=int, default=-1, show_default=True, help=_REST_PORT_HELP,
+    "--rest-port",
+    type=int,
+    default=-1,
+    show_default=True,
+    help=_REST_PORT_HELP,
 )
 def quip_miner_cpu(
     node_url: str,
@@ -791,7 +776,11 @@ def quip_miner_cpu(
     help=_TOPOLOGY_HELP,
 )
 @click.option(
-    "--rest-port", type=int, default=-1, show_default=True, help=_REST_PORT_HELP,
+    "--rest-port",
+    type=int,
+    default=-1,
+    show_default=True,
+    help=_REST_PORT_HELP,
 )
 def quip_miner_gpu(
     node_url: str,
@@ -807,8 +796,6 @@ def quip_miner_gpu(
     verification against the chain is a Phase 6 follow-on; concurrent
     mode shares the same caveat about topology injection generalisation.
     """
-    import asyncio
-
     backend = gpu_backend.lower()
     if backend == "local":
         miner_config = {"cuda": [{"device": "0"}]}
@@ -856,9 +843,9 @@ def quip_miner_gpu(
 )
 @click.option(
     "--daily-budget",
-    type=int,
+    type=str,
     default=None,
-    help="Daily QPU access-time budget in microseconds (provider-specific)",
+    help="Daily QPU access-time budget. Format: '30s', '5m', '2h', '1d' (passed to QPUTimeManager)",
 )
 @click.option(
     "--topology",
@@ -868,7 +855,11 @@ def quip_miner_gpu(
     help=_TOPOLOGY_HELP,
 )
 @click.option(
-    "--rest-port", type=int, default=-1, show_default=True, help=_REST_PORT_HELP,
+    "--rest-port",
+    type=int,
+    default=-1,
+    show_default=True,
+    help=_REST_PORT_HELP,
 )
 def quip_miner_qpu(
     node_url: str,
@@ -886,8 +877,6 @@ def quip_miner_qpu(
     as GPU: end-to-end against the chain is a Phase 6 item once topology
     binding generalises beyond CPU.
     """
-    import asyncio
-
     section: dict = {"type": qpu_type}
     if daily_budget is not None:
         section["daily_budget"] = daily_budget
@@ -909,8 +898,12 @@ def quip_miner_qpu(
 # Entry points for console_scripts
 
 
-
 def miner_main():
     """Entry point for the `quip-miner` console script."""
-    quip_miner(standalone_mode=False)
-
+    try:
+        quip_miner(standalone_mode=False)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        click.echo(f"quip-miner: error: {exc}", err=True)
+        raise SystemExit(1) from exc

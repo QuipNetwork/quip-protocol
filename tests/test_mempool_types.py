@@ -12,6 +12,7 @@ from shared.mempool_types import (
     IsingParams,
     JobMode,
     MinerType,
+    OrderStatus,
     ResultDelivery,
     RewardResolution,
     solutions_to_scale,
@@ -100,7 +101,7 @@ def test_job_mode_bid_with_accounts_only():
     miners = (b"\x11" * 32, b"\x22" * 32)
     m = JobMode.bid(miners=miners)
     d = m.to_scale_dict()
-    assert d["Bid"]["miners"] == [miners[0], miners[1]]
+    assert d["Bid"]["miners"] == ["0x" + m.hex() for m in miners]
     assert d["Bid"]["miner_types"] is None
 
 
@@ -112,9 +113,10 @@ def test_job_mode_bid_with_types_only():
 
 
 def test_job_mode_bid_with_both():
-    m = JobMode.bid(miners=(b"\x33" * 32,), miner_types=(MinerType.QPU_DWAVE,))
+    miner_bytes = b"\x33" * 32
+    m = JobMode.bid(miners=(miner_bytes,), miner_types=(MinerType.QPU_DWAVE,))
     d = m.to_scale_dict()
-    assert d["Bid"]["miners"] == [b"\x33" * 32]
+    assert d["Bid"]["miners"] == ["0x" + miner_bytes.hex()]
     assert d["Bid"]["miner_types"] == ["QpuDwave"]
 
 
@@ -224,3 +226,54 @@ def test_solutions_to_scale_copies_input():
     out = solutions_to_scale(inp)
     out[0][0] = 99
     assert inp[0][0] == 1
+
+
+# ----------------------------------------------------------------------
+# OrderStatus
+# ----------------------------------------------------------------------
+
+
+def test_order_status_from_scale_variant_roundtrip():
+    assert OrderStatus.from_scale_variant("Opened") == OrderStatus.OPENED
+    assert OrderStatus.from_scale_variant("Expired") == OrderStatus.EXPIRED
+    assert OrderStatus.from_scale_variant("Closed") == OrderStatus.CLOSED
+
+
+def test_order_status_from_scale_variant_unknown_raises_value_error():
+    with pytest.raises(ValueError, match="unknown SCALE OrderStatus variant"):
+        OrderStatus.from_scale_variant("Disputed")
+
+
+# ----------------------------------------------------------------------
+# RewardResolution encode paths
+# ----------------------------------------------------------------------
+
+
+def test_reward_resolution_top_n_weighted_scale_dict():
+    r = RewardResolution.top_n_weighted(3)
+    assert r.to_scale_dict() == {"TopNWeighted": {"n": 3}}
+
+
+def test_reward_resolution_top_n_equal_scale_dict():
+    r = RewardResolution.top_n_equal(5)
+    assert r.to_scale_dict() == {"TopNEqual": {"n": 5}}
+
+
+def test_reward_resolution_from_string_unknown_raises():
+    with pytest.raises(ValueError, match="bare-string RewardResolution"):
+        RewardResolution.from_scale_value("TopNWeighted")
+
+
+# ----------------------------------------------------------------------
+# ResultDelivery encode paths
+# ----------------------------------------------------------------------
+
+
+def test_result_delivery_callback_scale_dict():
+    r = ResultDelivery.callback(b"http://example.com")
+    assert r.to_scale_dict() == {"Callback": {"endpoint": b"http://example.com"}}
+
+
+def test_result_delivery_callback_with_poll_scale_dict():
+    r = ResultDelivery.callback_with_poll(b"http://example.com")
+    assert r.to_scale_dict() == {"CallbackWithPoll": {"endpoint": b"http://example.com"}}

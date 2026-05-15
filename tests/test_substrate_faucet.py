@@ -21,8 +21,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import faucet_bot  # noqa: E402
 
-from shared.signer import Sr25519Signer
-from shared.substrate_client import SubstrateClient
+from shared.signer import Sr25519Signer  # noqa: E402
+from shared.substrate_client import SubstrateClient  # noqa: E402
+from substrateinterface import SubstrateInterface  # noqa: E402
 
 
 DEFAULT_URL = os.environ.get("QUIP_SUBSTRATE_URL", "ws://localhost:9944")
@@ -40,25 +41,26 @@ def _chain_reachable(url: str) -> bool:
 
 
 def _chain_requires_hybrid_signer(url: str) -> bool:
-    """Inspect chain metadata for `HybridTxSignature` in the type table.
+    """Reuse faucet_bot's own detector against a live chain.
 
-    Mirrors faucet_bot's own auto-detect — used here only to pick the right
-    test signer type for the balance assertion (a fresh hybrid signer on
-    hybrid chains, vs `Sr25519Signer` on vanilla chains).
+    Used only to pick the right test signer type for the balance assertion
+    (a fresh hybrid signer on hybrid chains, vs `Sr25519Signer` on vanilla
+    chains). Delegates to `faucet_bot._chain_uses_hybrid_signature` so the
+    test and the bot stay in lockstep — when the bot's metadata-version
+    fallback ships, this helper inherits it for free.
     """
     if not _chain_reachable(url):
         return False
+    iface = SubstrateInterface(url=url)
     try:
-        from substrateinterface import SubstrateInterface
-        si = SubstrateInterface(url=url)
-        md = si.get_metadata()
-        types_list = md.value[1]['V14']['types']['types']
-        for t in types_list:
-            if 'HybridTxSignature' in (t['type'].get('path') or []):
-                return True
-        return False
+        return faucet_bot._chain_uses_hybrid_signature(iface)
     except Exception:
         return False
+    finally:
+        try:
+            iface.close()
+        except Exception:
+            pass
 
 
 pytestmark = [

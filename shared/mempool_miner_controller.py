@@ -45,14 +45,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import time
+import queue
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from shared.logging_config import get_logger
 from shared.mempool_types import (
-    JobMode,
     JobOrder,
     MempoolJobContext,
     MempoolSolverInfo,
@@ -190,7 +189,7 @@ class MempoolMinerController:
                 "concurrent-safe across subscribe + submit"
             )
         self._subscription_client = subscription_client
-        self._owns_subscription_client = subscription_client is not client
+        self._owns_subscription_client = True
         self.signer = signer
         self.miner_handles = miner_handles
         self.sampler_topology_hash = sampler_topology_hash
@@ -402,7 +401,13 @@ class MempoolMinerController:
 
     async def _consider_order(self, order_id: int) -> None:
         """Fetch a proposed order and decide whether to mine it."""
-        order = await self.client.query_job_order(order_id)
+        try:
+            order = await self.client.query_job_order(order_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "query_job_order failed for order=%d: %s", order_id, exc
+            )
+            return
         if order is None:
             return
         if not self._should_accept_job(order):
@@ -489,6 +494,13 @@ class MempoolMinerController:
                 await self._handle_result(envelope)
         except asyncio.CancelledError:
             return
+        except Exception as exc:
+            logger.exception(
+                "unexpected error in main event loop: %s — initiating shutdown",
+                exc,
+            )
+            self._shutdown_event.set()
+            raise
 
     async def _maybe_dispatch_next(self) -> None:
         if self._active_order is not None:
@@ -496,8 +508,21 @@ class MempoolMinerController:
         if not self._pending:
             return
         order_id = self._pending.popleft()
-        order = await self.client.query_job_order(order_id)
+        try:
+            order = await self.client.query_job_order(order_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "query_job_order failed for order=%d, requeueing: %s",
+                order_id, exc,
+            )
+            self._pending.appendleft(order_id)
+            return
         if order is None or order.status != OrderStatus.OPENED:
+            logger.info(
+                "order=%d not eligible at dispatch time: status=%s",
+                order_id,
+                order.status if order else "not_found",
+            )
             return
         context = MempoolJobContext.from_job_order(order_id, order)
         self._active_order = order_id
@@ -578,8 +603,17 @@ class MempoolMinerController:
                     winning_miner_id=envelope.result.miner_id,
                     mining_time=float(envelope.result.mining_time),
                 )
+            # Clear active order before callback so dispatch isn't blocked
+            # if the callback raises.
+            self._active_order = None
             if self.on_solution_submitted is not None:
-                await self.on_solution_submitted(order_id, envelope.result)
+                try:
+                    await self.on_solution_submitted(order_id, envelope.result)
+                except Exception as exc:
+                    logger.exception(
+                        "on_solution_submitted callback raised for order=%d: %s",
+                        order_id, exc,
+                    )
         elif outcome == "stale":
             self.stats.solution_stale_drops += 1
             logger.info(
@@ -587,6 +621,7 @@ class MempoolMinerController:
                 order_id,
                 receipt.error,
             )
+            self._active_order = None
         else:  # fatal
             self.stats.solution_errors += 1
             self._active_order = None
@@ -594,8 +629,6 @@ class MempoolMinerController:
                 f"submit_solution failed fatally: order={order_id} "
                 f"error={receipt.error}"
             )
-
-        self._active_order = None
 
     # ------------------------------------------------------------------
     # Reward claiming
@@ -651,6 +684,11 @@ class MempoolMinerController:
                     to_remove.append(order_id)
             else:
                 self.stats.claim_errors += 1
+                logger.error(
+                    "claim_reward failed fatally for order=%d: error=%s — giving up",
+                    order_id,
+                    receipt.error,
+                )
                 to_remove.append(order_id)
         for order_id in to_remove:
             self._claimable.discard(order_id)
@@ -664,7 +702,19 @@ class MempoolMinerController:
         loop = asyncio.get_running_loop()
         while not self._shutdown_event.is_set():
             try:
-                msg = await loop.run_in_executor(None, handle.resp.get)
+                msg = await loop.run_in_executor(
+                    None, lambda: handle.resp.get(timeout=5.0)
+                )
+            except queue.Empty:
+                if not handle.proc.is_alive():
+                    logger.error(
+                        "worker %s died unexpectedly: exitcode=%s",
+                        handle.miner_id,
+                        handle.proc.exitcode,
+                    )
+                    if not self._shutdown_event.is_set():
+                        self._shutdown_event.set()
+                continue
             except Exception:  # noqa: BLE001 — queue closed on shutdown
                 return
             if isinstance(msg, MiningResult):
@@ -687,6 +737,15 @@ class MempoolMinerController:
                     self._done_queues[handle.miner_id].put_nowait(None)
                 except asyncio.QueueFull:
                     pass
+            elif isinstance(msg, dict) and msg.get("op") == "error":
+                logger.error(
+                    "worker %s reported error: %s",
+                    handle.miner_id,
+                    msg.get("message", "<no message>"),
+                )
+                self.stats.solution_errors += 1
+            elif isinstance(msg, dict) and msg.get("op") == "shutdown_ack":
+                return
 
     # ------------------------------------------------------------------
     # Subscription cleanup (the substrate-interface subscription thread
@@ -699,8 +758,8 @@ def _classify_solution(error: Optional[str]) -> str:
         return "ok"
     if any(name in error for name in SOLUTION_STALE_ERRORS):
         return "stale"
-    if any(name in error for name in SOLUTION_FATAL_ERRORS):
-        return "fatal"
+    # Unknown error strings are treated as fatal — includes SOLUTION_FATAL_ERRORS
+    # and anything unrecognized (version mismatch, config error, etc.).
     return "fatal"
 
 

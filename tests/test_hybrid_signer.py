@@ -331,3 +331,46 @@ def test_keystore_load_detects_tampered_pubkey(tmp_path: Path):
 
     with pytest.raises(ValueError, match="sr25519_public_hex does not match"):
         load(path)
+
+
+def test_keystore_load_detects_tampered_ml_dsa_pubkey(tmp_path: Path):
+    """Symmetric to `test_keystore_load_detects_tampered_pubkey`: tampering
+    `ml_dsa_public_hex` must also raise. The two branches were originally
+    parallel but only sr25519 was tested — easy regression vector if the
+    ml_dsa branch silently drifts."""
+    path = tmp_path / "hybrid.json"
+    generate(path)
+    raw = json.loads(path.read_text())
+    pubkey_hex = raw["ml_dsa_public_hex"][2:]
+    tampered = list(pubkey_hex)
+    tampered[0] = "f" if tampered[0] != "f" else "e"
+    raw["ml_dsa_public_hex"] = "0x" + "".join(tampered)
+    path.write_text(json.dumps(raw))
+    os.chmod(path, KEYSTORE_FILE_MODE)
+
+    with pytest.raises(ValueError, match="ml_dsa_public_hex does not match"):
+        load(path)
+
+
+@pytest.mark.parametrize("field", ["sr25519_public_hex", "ml_dsa_public_hex"])
+def test_keystore_load_rejects_missing_cached_pubkey(tmp_path: Path, field: str):
+    """A blanked cached pubkey field used to silently disable the tamper
+    check; now it must raise instead."""
+    path = tmp_path / "hybrid.json"
+    generate(path)
+    raw = json.loads(path.read_text())
+    raw[field] = ""
+    path.write_text(json.dumps(raw))
+    os.chmod(path, KEYSTORE_FILE_MODE)
+
+    with pytest.raises(ValueError, match=f"{field} field is missing or empty"):
+        load(path)
+
+
+def test_keystore_write_never_exposes_seed_at_0644(tmp_path: Path):
+    """The master seed must land on disk at 0o600 from the moment the file
+    exists — `write_text` then `chmod` used to leave a brief 0o644 window."""
+    path = tmp_path / "hybrid.json"
+    generate(path)
+    mode = stat.S_IMODE(path.stat().st_mode)
+    assert mode == KEYSTORE_FILE_MODE

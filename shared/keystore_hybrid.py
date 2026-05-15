@@ -32,7 +32,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-from shared.hybrid_signer import HybridSigner, MASTER_SEED_LEN
+from shared.hybrid_signer import HybridSigner
 from shared.logging_config import get_logger
 
 
@@ -107,14 +107,25 @@ def load(path: Path) -> HybridKeystoreFile:
 
     expected_sr = signer.sr25519_public_bytes.hex()
     expected_ml = signer.ml_dsa_public_bytes.hex()
-    cached_sr = _strip_0x(raw.get("sr25519_public_hex") or "")
-    cached_ml = _strip_0x(raw.get("ml_dsa_public_hex") or "")
-    if cached_sr and cached_sr != expected_sr:
+    raw_sr = raw.get("sr25519_public_hex")
+    raw_ml = raw.get("ml_dsa_public_hex")
+    # Require both cached pubkey fields present and non-empty. An attacker
+    # editing the JSON to delete/blank them used to silently disable the
+    # integrity check; now a tampered file fails to load instead.
+    if not isinstance(raw_sr, str) or not raw_sr.strip():
+        raise ValueError(
+            "keystore tampered: sr25519_public_hex field is missing or empty"
+        )
+    if not isinstance(raw_ml, str) or not raw_ml.strip():
+        raise ValueError(
+            "keystore tampered: ml_dsa_public_hex field is missing or empty"
+        )
+    if _strip_0x(raw_sr) != expected_sr:
         raise ValueError(
             "keystore tampered: sr25519_public_hex does not match the key "
             "derived from master_seed_hex"
         )
-    if cached_ml and cached_ml != expected_ml:
+    if _strip_0x(raw_ml) != expected_ml:
         raise ValueError(
             "keystore tampered: ml_dsa_public_hex does not match the key "
             "derived from master_seed_hex"
@@ -148,9 +159,25 @@ def _write(path: Path, signer: HybridSigner) -> None:
         "sr25519_public_hex": "0x" + signer.sr25519_public_bytes.hex(),
         "ml_dsa_public_hex": "0x" + signer.ml_dsa_public_bytes.hex(),
     }
+    # Open the tmp file with O_EXCL and the final mode so the master seed is
+    # never on disk at 0o644: a crash between `write_text` and `chmod` used
+    # to leave a world-readable seed for any concurrent reader.
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2) + "\n")
-    os.chmod(tmp, KEYSTORE_FILE_MODE)
+    if tmp.exists():
+        tmp.unlink()
+    fd = os.open(
+        tmp,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        KEYSTORE_FILE_MODE,
+    )
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(payload, indent=2) + "\n")
+    except BaseException:
+        # Don't leave a half-written temp file behind on error.
+        tmp.unlink(missing_ok=True)
+        raise
+    os.chmod(tmp, KEYSTORE_FILE_MODE)  # belt-and-braces: ignore umask
     tmp.replace(path)
 
 
