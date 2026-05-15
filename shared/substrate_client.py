@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from typing import Any, Awaitable, Callable, Literal, Optional
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Literal, Optional, Sequence
 
 from scalecodec.base import ScaleBytes
 from scalecodec.types import GenericExtrinsic
@@ -60,23 +61,81 @@ logger = get_logger("substrate_client")
 WaitFor = Literal["sent", "inblock", "finalized"]
 
 
+@dataclass(frozen=True)
+class ValidatorAttempt:
+    """One entry in the connect-attempt log surfaced by NoValidatorReachable."""
+
+    url: str
+    exc_type: str
+    message: str
+
+
+class NoValidatorReachable(RuntimeError):
+    """Raised when every URL in a SubstrateClient's validator list refuses.
+
+    Carries the structured attempt log so callers (CLI guards, tests) can
+    inspect each failure programmatically; `str(exc)` renders the operator-
+    facing message.
+    """
+
+    def __init__(self, attempts: Sequence[ValidatorAttempt]) -> None:
+        self.attempts = tuple(attempts)
+        super().__init__(self._render(self.attempts))
+
+    @staticmethod
+    def _render(attempts: Sequence[ValidatorAttempt]) -> str:
+        lines = ["no validators reachable. Attempts:"]
+        for a in attempts:
+            lines.append(f"  {a.url}  -> {a.exc_type}: {a.message}")
+        return "\n".join(lines)
+
+
 class SubstrateClient:
-    """Async-friendly wrapper over a single substrate websocket connection.
+    """Async-friendly wrapper over a substrate websocket with failover.
 
     Usage:
 
+        # Single URL (back-compat):
         client = SubstrateClient(url="ws://localhost:9944")
+
+        # Validator list — tried in order at connect() time:
+        client = SubstrateClient(urls=["ws://primary:9944", "ws://standby:9944"])
+
         await client.connect()
         head = await client.get_head()
-        snapshot = await client.get_mining_snapshot(at=head)
         ...
         await client.close()
 
     The class is intentionally a thin adapter — no caching, no state machine.
     """
 
-    def __init__(self, url: str) -> None:
-        self.url = url
+    def __init__(
+        self,
+        url: Optional[str] = None,
+        *,
+        urls: Optional[Sequence[str]] = None,
+    ) -> None:
+        if url is not None and urls is not None:
+            raise ValueError(
+                "SubstrateClient: pass exactly one of `url=` or `urls=`, not both"
+            )
+        if url is None and urls is None:
+            raise ValueError(
+                "SubstrateClient: pass `url=<str>` or `urls=<list of str>`"
+            )
+        if urls is not None:
+            url_list = list(urls)
+            if not url_list:
+                raise ValueError(
+                    "SubstrateClient: `urls=` must contain at least one validator URL"
+                )
+        else:
+            url_list = [url]  # type: ignore[list-item]
+        self._urls: tuple[str, ...] = tuple(url_list)
+        # `url` retained for back-compat reads — points at whichever URL is
+        # currently connected (or the first one before connect()).
+        self.url: str = self._urls[0]
+        self.current_url: str = self._urls[0]
         self._iface: Optional[SubstrateInterface] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # `SubstrateInterface` keeps a single websocket and isn't safe
@@ -102,9 +161,33 @@ class SubstrateClient:
             return
         self._loop = asyncio.get_running_loop()
         self._call_lock = asyncio.Lock()
-        # SubstrateInterface() opens the websocket eagerly in its constructor.
-        self._iface = await self._run(lambda: SubstrateInterface(url=self.url))
-        logger.info("substrate client connected: url=%s", self.url)
+        attempts: list[ValidatorAttempt] = []
+        for candidate in self._urls:
+            try:
+                # SubstrateInterface() opens the websocket eagerly in its constructor.
+                self._iface = await self._run(
+                    lambda u=candidate: SubstrateInterface(url=u)
+                )
+            except Exception as exc:  # noqa: BLE001 — first-failure log; rethrown below
+                attempts.append(
+                    ValidatorAttempt(
+                        url=candidate,
+                        exc_type=type(exc).__name__,
+                        message=str(exc),
+                    )
+                )
+                logger.warning(
+                    "substrate client could not reach %s: %s: %s",
+                    candidate,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            self.url = candidate
+            self.current_url = candidate
+            logger.info("substrate client connected: url=%s", candidate)
+            return
+        raise NoValidatorReachable(attempts)
 
     async def close(self) -> None:
         if self._iface is None:
