@@ -11,7 +11,7 @@ change. Parity is exercised by `tests/test_mempool_codec.py`.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import List, Optional, Tuple
 
@@ -374,6 +374,18 @@ class MempoolJobContext:
     min_energy_milli: Optional[int] = None
     min_diversity_milli: Optional[int] = None
     min_solutions: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if len(self.h_values) != len(self.nodes):
+            raise ValueError(
+                f"h_values length ({len(self.h_values)}) must match nodes "
+                f"length ({len(self.nodes)})"
+            )
+        if len(self.j_values) != len(self.edges):
+            raise ValueError(
+                f"j_values length ({len(self.j_values)}) must match edges "
+                f"length ({len(self.edges)})"
+            )
 
     @classmethod
     def from_job_order(cls, order_id: int, order: "JobOrder") -> "MempoolJobContext":

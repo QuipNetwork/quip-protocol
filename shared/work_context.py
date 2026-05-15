@@ -29,6 +29,7 @@ from typing import Dict, Tuple, Union
 
 from shared.mempool_types import MempoolJobContext
 from shared.miner_types import BlockRequirements
+from shared.quantum_proof_of_work import derive_nonce, generate_ising_model_from_nonce
 from shared.substrate_types import SubstrateMiningContext
 
 
@@ -70,21 +71,17 @@ def resolve_ising(
     """
     if isinstance(context, MempoolJobContext):
         h = {
-            int(node): float(context.h_values[i]) / 1000.0
-            for i, node in enumerate(context.nodes)
+            int(node): float(hv) / 1000.0
+            for node, hv in zip(context.nodes, context.h_values)
         }
-        J: Dict[Tuple[int, int], float] = {}
-        for i, edge in enumerate(context.edges):
-            u, v = int(edge[0]), int(edge[1])
-            J[(u, v)] = float(context.j_values[i]) / 1000.0
+        J: Dict[Tuple[int, int], float] = {
+            (int(edge[0]), int(edge[1])): float(jv) / 1000.0
+            for edge, jv in zip(context.edges, context.j_values)
+        }
         return h, J, 0
 
-    # PoW path. Late-imports keep the substrate-side PoW utilities out of
-    # the module-load graph for callers that only touch mempool.
-    from shared.quantum_proof_of_work import (
-        derive_nonce,
-        generate_ising_model_from_nonce,
-    )
+    if not isinstance(context, SubstrateMiningContext):
+        raise TypeError(f"resolve_ising: unknown context type {type(context)!r}")
 
     nonce = derive_nonce(
         context.parent_hash,
@@ -136,8 +133,13 @@ def requirements_from_context(context: WorkContext) -> BlockRequirements:
             timeout_to_difficulty_adjustment_decay=_DECAY_DISABLED,
         )
 
-    # PoW path — same translation `_block_requirements_from_difficulty`
-    # has done since Phase 3.
+    if not isinstance(context, SubstrateMiningContext):
+        raise TypeError(
+            f"requirements_from_context: unknown context type {type(context)!r}"
+        )
+
+    # PoW path — mirrors `SubstrateDifficulty.max_energy` / `.min_diversity`
+    # but reads the raw milli fields to avoid an extra property call.
     d = context.difficulty
     return BlockRequirements(
         difficulty_energy=float(d.max_energy_milli) / 1000.0,
