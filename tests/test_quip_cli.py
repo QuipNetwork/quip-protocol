@@ -91,11 +91,11 @@ def test_quip_miner_cpu_config(monkeypatch):
     """quip-miner cpu --num-cpus 3 wires the right miner_config."""
     captured: Dict[str, Any] = {}
 
-    async def fake_run_miner(**kwargs):
+    async def fake_run(**kwargs):
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(quip_cli, "_run_miner", fake_run_miner)
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
     runner = CliRunner()
     result = runner.invoke(
         quip_cli.quip_miner_cpu,
@@ -103,18 +103,19 @@ def test_quip_miner_cpu_config(monkeypatch):
     )
     assert result.exit_code == 0, result.output
     assert captured.get("miner_config") == {"cpu": {"num_cpus": 3}}
-    assert captured.get("kind") == "cpu"
+    assert captured.get("miner_kind") == "cpu"
+    assert captured.get("mode") == "pow"
 
 
 def test_quip_miner_gpu_local_config(monkeypatch):
     """quip-miner gpu --gpu-backend local creates CUDA config."""
     captured: Dict[str, Any] = {}
 
-    async def fake_run_miner(**kwargs):
+    async def fake_run(**kwargs):
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(quip_cli, "_run_miner", fake_run_miner)
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
     runner = CliRunner()
     result = runner.invoke(
         quip_cli.quip_miner_gpu,
@@ -122,18 +123,19 @@ def test_quip_miner_gpu_local_config(monkeypatch):
     )
     assert result.exit_code == 0, result.output
     assert captured.get("miner_config") == {"cuda": [{"device": "0"}]}
-    assert captured.get("kind") == "gpu"
+    assert captured.get("miner_kind") == "gpu"
+    assert captured.get("mode") == "pow"
 
 
 def test_quip_miner_gpu_metal_config(monkeypatch):
     """quip-miner gpu --gpu-backend metal creates Metal config."""
     captured: Dict[str, Any] = {}
 
-    async def fake_run_miner(**kwargs):
+    async def fake_run(**kwargs):
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(quip_cli, "_run_miner", fake_run_miner)
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
     runner = CliRunner()
     result = runner.invoke(
         quip_cli.quip_miner_gpu,
@@ -147,11 +149,11 @@ def test_quip_miner_gpu_modal_config(monkeypatch):
     """quip-miner gpu --gpu-backend modal creates Modal config."""
     captured: Dict[str, Any] = {}
 
-    async def fake_run_miner(**kwargs):
+    async def fake_run(**kwargs):
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(quip_cli, "_run_miner", fake_run_miner)
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
     runner = CliRunner()
     result = runner.invoke(
         quip_cli.quip_miner_gpu,
@@ -165,11 +167,11 @@ def test_quip_miner_qpu_dwave_with_budget(monkeypatch):
     """quip-miner qpu --qpu-type dwave --daily-budget 40s creates DWave config."""
     captured: Dict[str, Any] = {}
 
-    async def fake_run_miner(**kwargs):
+    async def fake_run(**kwargs):
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(quip_cli, "_run_miner", fake_run_miner)
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
     runner = CliRunner()
     result = runner.invoke(
         quip_cli.quip_miner_qpu,
@@ -183,14 +185,14 @@ def test_quip_miner_qpu_dwave_with_budget(monkeypatch):
 
 
 def test_quip_miner_qpu_ibm_config(monkeypatch):
-    """quip-miner qpu --qpu-type ibm creates IBM QPU config."""
+    """quip-miner qpu --qpu-type ibm creates IBM QPU config with qpu_ibm miner_kind."""
     captured: Dict[str, Any] = {}
 
-    async def fake_run_miner(**kwargs):
+    async def fake_run(**kwargs):
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(quip_cli, "_run_miner", fake_run_miner)
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
     runner = CliRunner()
     result = runner.invoke(
         quip_cli.quip_miner_qpu,
@@ -200,3 +202,4 @@ def test_quip_miner_qpu_ibm_config(monkeypatch):
     cfg = captured.get("miner_config", {})
     assert "ibm" in cfg
     assert cfg["ibm"][0]["type"] == "ibm"
+    assert captured.get("miner_kind") == "qpu_ibm"
