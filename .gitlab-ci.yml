@@ -54,6 +54,26 @@ check-version:
 # Docker image builds (Kaniko — no daemon required)
 # ---------------------------------------------------------------------------
 
+# Shared trigger rules + per-branch mutable tag. Referenced from every
+# image-build job so the four Docker pipelines move in lockstep:
+#   main         -> tag :latest         (stable)
+#   v0.2         -> tag :v0.2-preview   (downstream-testable preview)
+#   git tag vX.Y -> tag :latest         (also produces the SHA tag below;
+#                                        true version tagging is a follow-up)
+# The immutable :CI_COMMIT_SHA tag is pushed unconditionally so downstream
+# can pin to a specific build regardless of branch.
+.shared_image_rules:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      variables:
+        MUTABLE_TAG: latest
+    - if: $CI_COMMIT_BRANCH == "v0.2"
+      variables:
+        MUTABLE_TAG: v0.2-preview
+    - if: $CI_COMMIT_TAG
+      variables:
+        MUTABLE_TAG: latest
+
 .docker_build:
   stage: build
   image:
@@ -62,9 +82,7 @@ check-version:
   before_script:
     - mkdir -p /kaniko/.docker
     - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(echo -n ${CI_REGISTRY_USER}:${CI_REGISTRY_PASSWORD} | base64)\"}}}" > /kaniko/.docker/config.json
-  rules:
-    - if: $CI_COMMIT_BRANCH == "main"
-    - if: $CI_COMMIT_TAG
+  rules: !reference [.shared_image_rules, rules]
 
 # CPU image — built per-arch then stitched into a multi-arch manifest.
 # amd64 stays on a linux/amd64 runner via Kaniko (daemonless).
@@ -87,9 +105,7 @@ build-cpu-amd64:
 build-cpu-arm64:
   stage: build
   tags: [macos, arm64]
-  rules:
-    - if: $CI_COMMIT_BRANCH == "main"
-    - if: $CI_COMMIT_TAG
+  rules: !reference [.shared_image_rules, rules]
   before_script:
     # Isolated buildx builder per project. Create-if-missing is
     # idempotent across job retries. docker-container driver is
@@ -118,9 +134,7 @@ manifest-cpu:
   needs:
     - build-cpu-amd64
     - build-cpu-arm64
-  rules:
-    - if: $CI_COMMIT_BRANCH == "main"
-    - if: $CI_COMMIT_TAG
+  rules: !reference [.shared_image_rules, rules]
   script:
     - >
       manifest-tool
@@ -137,7 +151,7 @@ manifest-cpu:
       push from-args
       --platforms linux/amd64,linux/arm64
       --template "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-ARCH"
-      --target "$CI_REGISTRY_IMAGE/$CPU_IMAGE:latest"
+      --target "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$MUTABLE_TAG"
 
 build-cuda:
   extends: .docker_build
@@ -148,7 +162,7 @@ build-cuda:
         --dockerfile docker/Dockerfile.cuda
         --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA
         --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA
-        --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
+        --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$MUTABLE_TAG
 
 # ---------------------------------------------------------------------------
 # PyInstaller native binaries
