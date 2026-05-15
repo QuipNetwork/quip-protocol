@@ -22,7 +22,7 @@ from typing import Optional
 import click
 
 from dwave_topologies.topologies.zephyr import zephyr
-from shared.keystore import generate, load
+from shared.keystore_hybrid import generate, load
 from shared.logging_config import setup_logging
 from shared.miner_bootstrap import BootstrapConfig, bootstrap
 from shared.miner_core import MinerCore
@@ -55,16 +55,20 @@ def quip_miner(log_level: str) -> None:
 )
 @click.option("--overwrite", is_flag=True, help="Replace an existing keystore at --out")
 def quip_miner_keygen(out_path: str, overwrite: bool) -> None:
-    """Generate a fresh sr25519 signing key for quip-miner.
+    """Generate a fresh hybrid sr25519+ML-DSA-44 signing key for quip-miner.
 
-    Writes a JSON keystore (0o600) and prints the SS58 address. The seed is
-    stored in plaintext — adequate for dev workflows where the faucet bot
-    runs alongside. Passphrase-encrypted keystores land in Phase 7.
+    Writes a JSON keystore (0o600) holding the 32-byte master seed and
+    prints the SS58 address. The seed is stored in plaintext — adequate
+    for dev workflows where the faucet bot runs alongside.
+    Passphrase-encrypted keystores land in a follow-on.
     """
     keystore = generate(Path(out_path).expanduser(), overwrite=overwrite)
-    click.echo(f"wrote keystore: {keystore.path}")
-    click.echo(f"ss58 address:   {keystore.signer.ss58_address()}")
-    click.echo(f"account_id:     0x{keystore.signer.account_id_bytes().hex()}")
+    click.echo(f"wrote hybrid keystore: {keystore.path}")
+    click.echo(f"ss58 address:          {keystore.signer.ss58_address()}")
+    click.echo(f"account_id:            0x{keystore.signer.account_id_bytes().hex()}")
+    click.echo(
+        f"public key (1344B):    0x{keystore.signer.public_bytes().hex()[:48]}..."
+    )
 
 
 @quip_miner.command("bootstrap")

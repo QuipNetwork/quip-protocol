@@ -1,11 +1,11 @@
 """Abstract signer interface plus the sr25519 implementation.
 
-Phase 1 only ships `Sr25519Signer`, which matches the docker branch's current
-`MultiSignature` extrinsic signing path. Phase 7 will add `HybridSigner`
-(sr25519 + ML-DSA-44) once the `ru/feature/hybrid-sig-consensus` branch merges
-into docker. Keeping the abstract `Signer` in place from day one lets the
-substrate client, controller, and submitter consume a single typed interface
-without churn when the hybrid scheme lands.
+This module ships `Sr25519Signer`, which targets the historical
+`MultiSignature` extrinsic signing path. The hybrid sr25519 + ML-DSA-44
+implementation (`HybridSigner`) lives in `shared.hybrid_signer` and is
+selected when the chain advertises the `HybridTxSignature` extension.
+The abstract `Signer` interface is what the substrate client, controller,
+and submitter consume — callers don't need to know which scheme is in use.
 """
 from __future__ import annotations
 

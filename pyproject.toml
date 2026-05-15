@@ -18,6 +18,12 @@ dependencies = [
     "blake3>=1.0.5",
     "substrate-interface>=1.7.4",
     "scalecodec>=1.2",
+    # Phase 7: hybrid sr25519+ML-DSA-44 signing. `dilithium-py` is pure
+    # Python (deterministic seed-based keygen for ML-DSA-44). The legacy
+    # `oqs-python` binding to liboqs is faster but doesn't expose seeded
+    # keygen and isn't on PyPI under a stable name — keep dilithium-py as
+    # the canonical path until ML-DSA signing rate becomes a bottleneck.
+    "dilithium-py>=1.0",
 ]
 
 [project.optional-dependencies]
