@@ -100,6 +100,98 @@ async def test_url_and_urls_both_set_rejected():
         SubstrateClient(url="ws://a:9944", urls=["ws://b:9944"])
 
 
+@pytest.mark.asyncio
+async def test_reconnect_rotates_to_next_url():
+    """After connecting to A, reconnect() should land on B."""
+    client = SubstrateClient(urls=["ws://a:9944", "ws://b:9944"])
+    await client.connect()
+    assert client.current_url == "ws://a:9944"
+    await client.reconnect()
+    assert client.current_url == "ws://b:9944"
+    assert _StubInterface.construction_log == [
+        "ws://a:9944",
+        "ws://b:9944",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_rotates_circularly():
+    """[A, B, C] currently on B → reconnect should try C, then A."""
+    client = SubstrateClient(urls=["ws://a:9944", "ws://b:9944", "ws://c:9944"])
+    # Force first-connect to land on B by marking A bad.
+    _StubInterface.bad_urls = {"ws://a:9944"}
+    await client.connect()
+    assert client.current_url == "ws://b:9944"
+    # Now mark B + C bad, A becomes good — reconnect should walk C, then A.
+    _StubInterface.bad_urls = {"ws://b:9944", "ws://c:9944"}
+    _StubInterface.construction_log.clear()
+    await client.reconnect()
+    assert client.current_url == "ws://a:9944"
+    assert _StubInterface.construction_log == ["ws://c:9944", "ws://a:9944"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_raises_when_all_dead():
+    """If every URL refuses during reconnect, raise NoValidatorReachable."""
+    client = SubstrateClient(urls=["ws://a:9944", "ws://b:9944"])
+    await client.connect()
+    _StubInterface.bad_urls = {"ws://a:9944", "ws://b:9944"}
+    with pytest.raises(NoValidatorReachable):
+        await client.reconnect()
+
+
+@pytest.mark.asyncio
+async def test_run_catches_websocket_exception_and_failovers(monkeypatch):
+    """A WebSocketException from a _run call triggers reconnect; the original
+    exception still surfaces to the caller so caller-level retry kicks in."""
+    import websocket as ws_module
+
+    client = SubstrateClient(urls=["ws://a:9944", "ws://b:9944"])
+    await client.connect()
+    assert client.current_url == "ws://a:9944"
+
+    def dying_call():
+        raise ws_module.WebSocketConnectionClosedException("socket closed")
+
+    with pytest.raises(ws_module.WebSocketConnectionClosedException):
+        await client._run(dying_call)
+
+    # _run should have triggered failover so the next call lands on B.
+    assert client.current_url == "ws://b:9944"
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_failover_on_non_connection_exception():
+    """A logical (non-connection) error must NOT trigger failover."""
+    client = SubstrateClient(urls=["ws://a:9944", "ws://b:9944"])
+    await client.connect()
+
+    def app_error():
+        raise ValueError("decoding failed")
+
+    with pytest.raises(ValueError):
+        await client._run(app_error)
+
+    assert client.current_url == "ws://a:9944"
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_recurse_when_reconnect_also_dies():
+    """If _run's failover attempt itself can't find a healthy validator,
+    surface NoValidatorReachable (not the original websocket exception)."""
+    import websocket as ws_module
+
+    client = SubstrateClient(urls=["ws://a:9944", "ws://b:9944"])
+    await client.connect()
+    _StubInterface.bad_urls = {"ws://a:9944", "ws://b:9944"}
+
+    def dying_call():
+        raise ws_module.WebSocketConnectionClosedException("socket closed")
+
+    with pytest.raises(NoValidatorReachable):
+        await client._run(dying_call)
+
+
 def test_no_validator_reachable_str_lists_each_attempt():
     """The exception's str() includes every URL and its failure reason."""
     err = NoValidatorReachable(

@@ -32,6 +32,7 @@ from scalecodec.base import ScaleBytes
 from scalecodec.types import GenericExtrinsic
 from scalecodec.utils.ss58 import ss58_decode
 from substrateinterface import SubstrateInterface
+from websocket import WebSocketException
 
 from shared.hybrid_signer import HybridSigner
 from shared.logging_config import get_logger
@@ -136,6 +137,12 @@ class SubstrateClient:
         # currently connected (or the first one before connect()).
         self.url: str = self._urls[0]
         self.current_url: str = self._urls[0]
+        self._current_index: int = 0
+        # Guard against `_run` triggering a reconnect that, while running,
+        # encounters another websocket exception. Without this we could
+        # recurse failover->failover->… One failover attempt per `_run`,
+        # period.
+        self._reentrant_failover: bool = False
         self._iface: Optional[SubstrateInterface] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # `SubstrateInterface` keeps a single websocket and isn't safe
@@ -161,14 +168,37 @@ class SubstrateClient:
             return
         self._loop = asyncio.get_running_loop()
         self._call_lock = asyncio.Lock()
+        await self._connect_from_index(0)
+
+    async def reconnect(self) -> None:
+        """Drop the current iface and rotate to the next healthy validator.
+
+        Walks `self._urls` circularly starting at (current_index + 1), so a
+        live validator gets picked even if it sits *behind* the dead one in
+        the list. Falls back to the original URL on the final attempt — a
+        transient blip on the primary should still recover.
+
+        Raises `NoValidatorReachable` if every URL refuses.
+        """
+        await self._close_iface()
+        start = (self._current_index + 1) % len(self._urls)
+        await self._connect_from_index(start)
+
+    async def _connect_from_index(self, start: int) -> None:
         attempts: list[ValidatorAttempt] = []
-        for candidate in self._urls:
+        n = len(self._urls)
+        for offset in range(n):
+            idx = (start + offset) % n
+            candidate = self._urls[idx]
             try:
-                # SubstrateInterface() opens the websocket eagerly in its constructor.
-                self._iface = await self._run(
+                # SubstrateInterface() opens the websocket eagerly in its
+                # constructor. Use `_raw_run` here so a connect failure does
+                # NOT trigger the failover-from-_run path; we're already
+                # iterating validators ourselves.
+                self._iface = await self._raw_run(
                     lambda u=candidate: SubstrateInterface(url=u)
                 )
-            except Exception as exc:  # noqa: BLE001 — first-failure log; rethrown below
+            except Exception as exc:  # noqa: BLE001 — logged + collected below
                 attempts.append(
                     ValidatorAttempt(
                         url=candidate,
@@ -185,16 +215,26 @@ class SubstrateClient:
                 continue
             self.url = candidate
             self.current_url = candidate
+            self._current_index = idx
             logger.info("substrate client connected: url=%s", candidate)
             return
         raise NoValidatorReachable(attempts)
 
     async def close(self) -> None:
+        await self._close_iface()
+
+    async def _close_iface(self) -> None:
         if self._iface is None:
             return
         iface = self._iface
         self._iface = None
-        await self._run(iface.close)
+        try:
+            await self._raw_run(iface.close)
+        except Exception as exc:  # noqa: BLE001 — dead-socket close races
+            # A failing close() on a websocket that's already dropped is
+            # routine during failover; don't let it mask the underlying
+            # reconnect work.
+            logger.debug("ignoring substrate iface close() error: %s", exc)
 
     # ------------------------------------------------------------------
     # Chain head queries
@@ -740,12 +780,55 @@ class SubstrateClient:
     # ------------------------------------------------------------------
 
     async def _run(self, fn):
-        """Run a blocking substrate-interface call on the default executor.
+        """Run a blocking substrate-interface call with failover-on-loss.
 
         Almost all callers go through this method, so the `_call_lock`
-        taken here guarantees serial access to the underlying
+        taken inside `_raw_run` guarantees serial access to the underlying
         `SubstrateInterface`. The exception is `subscribe_new_heads`,
         which intentionally bypasses the lock — see its docstring.
+
+        Failover semantics: a `WebSocketException` or `ConnectionError`
+        from the call body triggers one `reconnect()` attempt, then the
+        *original* exception is re-raised so the caller's retry logic
+        runs. The bound-method lambdas in this file capture
+        `self._iface` lazily, so a follow-up call after failover hits
+        the fresh iface. If `reconnect()` itself can't find a healthy
+        validator, `NoValidatorReachable` propagates instead.
+        """
+        try:
+            return await self._raw_run(fn)
+        except (WebSocketException, ConnectionError) as exc:
+            if self._reentrant_failover:
+                # We're already inside a failover attempt — bubble up the
+                # raw error so the outer failover handler sees it.
+                raise
+            logger.warning(
+                "substrate _run failed on %s (%s: %s); attempting failover",
+                self.current_url,
+                type(exc).__name__,
+                exc,
+            )
+            self._reentrant_failover = True
+            try:
+                # May raise NoValidatorReachable — that's the intended
+                # signal upstream. The original exception is shadowed in
+                # that case; operators get the structured attempt log.
+                await self.reconnect()
+            finally:
+                self._reentrant_failover = False
+            # Reconnect succeeded. The current call is still lost — the
+            # underlying lambda was bound to the dead iface, and we can't
+            # safely retry it in general (e.g. a partially-submitted
+            # extrinsic must not be resubmitted blindly). Surface the
+            # original exception so the caller's retry path decides.
+            raise
+
+    async def _raw_run(self, fn):
+        """Lock-guarded executor dispatch without failover plumbing.
+
+        Used internally by `_run` (which wraps this with failover) and by
+        `connect()`/`reconnect()` (which are themselves the failover loop
+        and must not recurse into it).
 
         When `_call_lock` is `None` we're before `connect()` finishes,
         in which case `connect()` itself is the only caller (single-
