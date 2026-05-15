@@ -8,7 +8,6 @@ from abc import ABC, abstractmethod
 import logging
 import multiprocessing
 import multiprocessing.synchronize
-import random
 import time
 import traceback
 from dataclasses import dataclass
@@ -22,13 +21,15 @@ from shared.energy_utils import (
     DEFAULT_NUM_NODES,
     DEFAULT_NUM_EDGES,
 )
+from shared.mempool_types import MempoolJobContext
 from shared.miner_types import BlockRequirements, IsingSample, MiningResult, Sampler
-from shared.quantum_proof_of_work import (
-    derive_nonce,
-    evaluate_sampleset,
-    generate_ising_model_from_nonce,
+from shared.quantum_proof_of_work import evaluate_sampleset
+from shared.work_context import (
+    WorkContext,
+    fresh_salt,
+    requirements_from_context,
+    resolve_ising,
 )
-from shared.substrate_types import SubstrateMiningContext
 
 # Global logger for this module
 log = logging.getLogger(__name__)
@@ -334,35 +335,42 @@ class BaseMiner(ABC):
 
     def mine_work_item(
         self,
-        context: SubstrateMiningContext,
+        context: WorkContext,
         stop_event: multiprocessing.synchronize.Event,
         **kwargs,
     ) -> Optional[MiningResult]:
-        """Protocol-neutral mining loop driven by an on-chain snapshot.
+        """Protocol-neutral mining loop.
 
-        This is the substrate-mode replacement for ``mine_block``. Key
-        differences vs the legacy path:
+        Accepts either work-source flavor:
 
-        - identity material is the 32-byte SCALE-encoded ``AccountId32`` in
-          ``context.miner_account_bytes``, not a human-readable miner id;
-          nonces come from ``derive_nonce(parent_hash, miner_bytes,
-          block_number, salt)``.
-        - difficulty is a fixed snapshot (``context.difficulty``); no
-          per-loop ``compute_current_requirements`` decay. The controller
-          cancels and restarts on each new chain head instead.
-        - no ``top_attempts`` cache: stale samples are dropped on
-          cancellation rather than re-evaluated under relaxed thresholds.
-        - batch sampling (``_sample_batch``) is intentionally bypassed.
-          ``IsingFeeder`` still uses string-based miner identity, so the
-          batch path would produce nonces that don't match the chain's
-          ``derive_nonce``. Re-enabling batch for substrate mode is a
-          Phase 4 follow-on that updates ``IsingFeeder`` to byte identity.
+        - ``SubstrateMiningContext`` (PoW path) — identity is the SCALE
+          ``AccountId32`` in ``miner_account_bytes``; the loop derives a
+          fresh nonce per iteration via
+          ``derive_nonce(parent_hash, miner, block_number, salt)`` and
+          regenerates ``(h, J)`` from it (`generate_ising_model_from_nonce`).
+          The chain checks this exact derivation in ``submit_proof``.
+        - ``MempoolJobContext`` (mempool path) — identity is the
+          ``order_id``; the Ising problem is carried directly in the job
+          order (``h_values``, ``j_values`` as i32 millivalues). No nonce
+          derivation; the chain only validates submitted spins solve the
+          stored model.
+
+        Both paths share:
+
+        - difficulty / quality floors converted to ``BlockRequirements`` at
+          this seam (see ``shared.work_context.requirements_from_context``).
+          No per-loop decay — the controller cancels work on head or
+          job-state change.
+        - the same sampler, adaptive param, evaluate-sampleset, top-attempts
+          surface used by subclasses (CPU/GPU/QPU).
+        - batch sampling (``_sample_batch``) is intentionally bypassed
+          (see Phase 4 follow-on note on ``IsingFeeder`` identity).
 
         Args:
-            context: Atomic on-chain mining context (parent hash, block
-                number, topology, difficulty, miner account, h_values).
+            context: Either a ``SubstrateMiningContext`` (PoW) or
+                ``MempoolJobContext`` (mempool job).
             stop_event: Worker cancellation event. The controller sets
-                this on new-head, deregistration, or shutdown.
+                this on new-head, deregistration, job-expiry, or shutdown.
             **kwargs: Forwarded to ``_pre_mine_setup``.
 
         Returns:
@@ -374,20 +382,16 @@ class BaseMiner(ABC):
         self.top_attempts = []
         start_time = time.time()
         self.current_round_attempted = True
-        self.logger.info(
-            f"mine_work_item: block_number={context.block_number} "
-            f"parent=0x{context.parent_hash.hex()[:16]}... "
-            f"topology=0x{context.topology_hash.hex()[:16]}... "
-            f"nodes={len(context.nodes)} edges={len(context.edges)}"
-        )
+        self._log_work_start(context)
 
-        # Synthesize legacy types from the substrate context so the hook
-        # methods (``_pre_mine_setup``, ``_adapt_mining_params``,
-        # ``evaluate_sampleset``) keep working unchanged. ``BlockRequirements``
-        # uses float energy / diversity; convert from milli-precision.
-        requirements = _block_requirements_from_difficulty(context.difficulty)
-        bridge_prev_block = _BridgePrevBlock.from_context(context)
-        bridge_node_info = _BridgeNodeInfo.from_context(context)
+        # ``BlockRequirements`` synthesized from whichever context flavor
+        # this is — PoW difficulty or mempool quality floors. The bridges
+        # below preserve the existing ``_pre_mine_setup(prev_block,
+        # node_info, ...)`` signature so subclass hooks (notably QPU's
+        # budget check) keep working unchanged.
+        requirements = requirements_from_context(context)
+        bridge_prev_block = _BridgePrevBlock.from_work_context(context)
+        bridge_node_info = _BridgeNodeInfo.from_work_context(context)
 
         # ``prev_timestamp`` is used by the legacy difficulty-decay code path
         # (which we don't run here) and propagated into ``MiningResult`` for
@@ -407,7 +411,7 @@ class BaseMiner(ABC):
             # got nothing", not "couldn't start".
             self.logger.warning(
                 "mine_work_item: _pre_mine_setup returned False, aborting "
-                "attempt for block=%d", context.block_number,
+                "attempt for %s", _work_tag(context),
             )
             return None
 
@@ -432,18 +436,14 @@ class BaseMiner(ABC):
         progress = 0
         try:
             while self.mining and not stop_event.is_set():
-                # Fresh salt and nonce per iteration. The Rust pallet validates
-                # this exact derivation in ``submit_proof``.
-                salt = random.randbytes(32)
-                nonce = derive_nonce(
-                    context.parent_hash,
-                    context.miner_account_bytes,
-                    context.block_number,
-                    salt,
-                )
-                h, J = generate_ising_model_from_nonce(
-                    nonce, nodes, edges, list(context.h_values),
-                )
+                # Fresh salt per iteration. `resolve_ising` dispatches by
+                # context flavor: PoW derives a new nonce + regenerates
+                # (h, J) against the *sampler's* node/edge order (which
+                # `topology_hash` confirms matches the chain's); mempool
+                # uses the stored h_values / j_values directly and the
+                # returned nonce is a placeholder (0) for telemetry only.
+                salt = fresh_salt()
+                h, J, nonce = resolve_ising(context, salt, nodes, edges)
 
                 preprocess_start = time.time()
                 self.current_stage = 'preprocessing'
@@ -494,7 +494,7 @@ class BaseMiner(ABC):
 
                 if result:
                     self.logger.info(
-                        f"[work-item block={context.block_number}] mined! "
+                        f"[work-item {_work_tag(context)}] mined! "
                         f"nonce={nonce} salt=0x{salt.hex()[:8]}... "
                         f"energy={result.energy:.2f} "
                         f"solutions={result.num_valid} "
@@ -600,6 +600,28 @@ class BaseMiner(ABC):
     def _post_mine_cleanup(self) -> None:
         """Called after the mining loop exits (success or stop)."""
 
+    def _log_work_start(self, context: WorkContext) -> None:
+        """Emit the per-iteration setup banner for the active work source.
+
+        Different shapes per context flavor:
+          - PoW: block_number / parent_hash / topology_hash / nodes / edges
+          - Mempool: order_id / nodes / edges
+        Both flavors print enough to grep logs for a specific work item.
+        """
+        if isinstance(context, MempoolJobContext):
+            self.logger.info(
+                f"mine_work_item: order_id={context.order_id} "
+                f"nodes={len(context.nodes)} edges={len(context.edges)} "
+                f"(mempool)"
+            )
+        else:
+            self.logger.info(
+                f"mine_work_item: block_number={context.block_number} "
+                f"parent=0x{context.parent_hash.hex()[:16]}... "
+                f"topology=0x{context.topology_hash.hex()[:16]}... "
+                f"nodes={len(context.nodes)} edges={len(context.edges)}"
+            )
+
     def _on_sampling_error(
         self,
         error: Exception,
@@ -637,25 +659,12 @@ class BaseMiner(ABC):
 # ----------------------------------------------------------------------
 
 
-def _block_requirements_from_difficulty(difficulty) -> BlockRequirements:
-    """Synthesize a legacy ``BlockRequirements`` from a substrate
-    ``SubstrateDifficulty``.
+def _work_tag(context: WorkContext) -> str:
+    """Short identifier for a work context, used in per-iteration log lines."""
+    if isinstance(context, MempoolJobContext):
+        return f"order={context.order_id}"
+    return f"block={context.block_number}"
 
-    Chain storage uses milli-precision integers; the legacy mining loop and
-    its hooks expect float fields. Convert at this boundary so subclasses
-    (CPU/GPU/QPU) don't need to know about substrate at all.
-
-    ``timeout_to_difficulty_adjustment_decay`` is set to a sentinel
-    ``2**31 - 1`` so any code that accidentally computes decay against it
-    (e.g. ``compute_current_requirements``) is a no-op. Substrate mode has
-    no decay — the controller cancels on head change instead.
-    """
-    return BlockRequirements(
-        difficulty_energy=difficulty.max_energy,
-        min_diversity=difficulty.min_diversity,
-        min_solutions=difficulty.min_solutions,
-        timeout_to_difficulty_adjustment_decay=2**31 - 1,
-    )
 
 
 @dataclass(frozen=True)
@@ -668,21 +677,26 @@ class _BridgePrevBlock:
     """Minimal duck-typed `prev_block` for substrate-mode hook compatibility.
 
     Concrete miners read ``prev_block.header.index`` and ``prev_block.hash``
-    inside their ``_pre_mine_setup`` overrides. We expose the substrate
-    snapshot's ``block_number`` and ``parent_hash`` under those same names
-    so the hooks run unchanged.
+    inside their ``_pre_mine_setup`` overrides. Phase 3 introduced this
+    shim for the PoW path; Phase 8b extends it to mempool: for a
+    ``MempoolJobContext`` the index is the ``order_id`` and the hash is
+    zeros (mempool has no parent hash). The values flow into log
+    messages and budget checks but never feed back into the chain, so
+    the placeholders are safe.
     """
 
     header: _BridgePrevBlockHeader
     hash: bytes
 
     @classmethod
-    def from_context(cls, context: SubstrateMiningContext) -> "_BridgePrevBlock":
-        # The chain expects the proof to derive the nonce against the
-        # snapshot's `block_number`. The legacy code computes
-        # `cur_index = prev_block.header.index + 1` then derives the nonce
-        # from `cur_index`, so we pre-subtract 1 here to keep the +1 dance
-        # equivalent and minimise blast radius in subclasses.
+    def from_work_context(cls, context: WorkContext) -> "_BridgePrevBlock":
+        if isinstance(context, MempoolJobContext):
+            return cls(
+                header=_BridgePrevBlockHeader(index=context.order_id),
+                hash=b"\x00" * 32,
+            )
+        # PoW: `cur_index = prev_block.header.index + 1` is what the legacy
+        # subclasses compute, so pre-subtract 1 here to keep the +1 dance.
         return cls(
             header=_BridgePrevBlockHeader(index=context.block_number - 1),
             hash=context.parent_hash,
@@ -693,18 +707,23 @@ class _BridgePrevBlock:
 class _BridgeNodeInfo:
     """Minimal duck-typed `node_info` for substrate-mode hook compatibility.
 
-    Legacy hooks read ``node_info.miner_id`` (a string). Substrate uses
-    raw account bytes; we expose them as a stable hex string so logs and
-    IsingFeeder-free paths keep working. The actual nonce derivation in
-    ``mine_work_item`` uses ``derive_nonce(... miner_account_bytes ...)``
-    directly, so this string is for telemetry only.
+    Legacy hooks read ``node_info.miner_id`` (a string). PoW exposes the
+    chain account as a hex string; mempool uses a synthetic
+    ``mempool-order-<id>`` tag since the order itself, not the solver,
+    identifies the work. ``miner_account_bytes`` is preserved for the
+    PoW path (used by ``IsingFeeder``) and zero-filled for mempool.
     """
 
     miner_id: str
     miner_account_bytes: bytes
 
     @classmethod
-    def from_context(cls, context: SubstrateMiningContext) -> "_BridgeNodeInfo":
+    def from_work_context(cls, context: WorkContext) -> "_BridgeNodeInfo":
+        if isinstance(context, MempoolJobContext):
+            return cls(
+                miner_id=f"mempool-order-{context.order_id}",
+                miner_account_bytes=b"\x00" * 32,
+            )
         return cls(
             miner_id="0x" + context.miner_account_bytes.hex(),
             miner_account_bytes=context.miner_account_bytes,

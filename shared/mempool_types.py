@@ -361,6 +361,55 @@ class JobOrder:
     solution_count: int
 
 
+@dataclass(frozen=True)
+class MempoolJobContext:
+    """Work context for a mempool-side mining task.
+
+    Mirrors the shape of `SubstrateMiningContext` (PoW side) in the fields
+    the mining loop needs (`nodes`, `edges`, plus a way to materialize the
+    Ising problem), but carries mempool-specific identity (`order_id`)
+    and the chain-encoded quality floors from `IsingParams`.
+
+    Construction is normally `MempoolJobContext.from_job_order(order_id,
+    order)` — see Phase 8c's controller for how the order is fetched.
+    """
+
+    order_id: int
+    nodes: Tuple[int, ...]
+    edges: Tuple[Tuple[int, int], ...]
+    h_values: Tuple[int, ...]   # i32 millivalues per node
+    j_values: Tuple[int, ...]   # i32 millivalues per edge
+    min_energy_milli: Optional[int] = None
+    min_diversity_milli: Optional[int] = None
+    min_solutions: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if len(self.h_values) != len(self.nodes):
+            raise ValueError(
+                f"h_values length ({len(self.h_values)}) must match nodes "
+                f"length ({len(self.nodes)})"
+            )
+        if len(self.j_values) != len(self.edges):
+            raise ValueError(
+                f"j_values length ({len(self.j_values)}) must match edges "
+                f"length ({len(self.edges)})"
+            )
+
+    @classmethod
+    def from_job_order(cls, order_id: int, order: "JobOrder") -> "MempoolJobContext":
+        ising = order.ising_params
+        return cls(
+            order_id=order_id,
+            nodes=ising.nodes,
+            edges=ising.edges,
+            h_values=ising.h_values,
+            j_values=ising.j_values,
+            min_energy_milli=ising.min_energy_milli,
+            min_diversity_milli=ising.min_diversity_milli,
+            min_solutions=ising.min_solutions,
+        )
+
+
 # ----------------------------------------------------------------------
 # Event dataclasses (a subset — enough for the Phase 8 controller's
 # subscription path; add more as they're consumed).
@@ -426,6 +475,7 @@ __all__ = [
     "JobMode",
     "JobOrder",
     "JobProposedEvent",
+    "MempoolJobContext",
     "MempoolSolverInfo",
     "MinerType",
     "OrderExpiredEvent",
