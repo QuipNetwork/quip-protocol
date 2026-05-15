@@ -33,7 +33,7 @@ import asyncio
 import queue as _queue
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, Protocol
 
 from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
@@ -48,6 +48,19 @@ from shared.substrate_types import (
 
 
 logger = get_logger("substrate_miner_controller")
+
+
+class _MinerCoreStats(Protocol):
+    """Subset of `shared.miner_core.MinerCore` the controller depends on.
+
+    Structural type rather than direct `MinerCore` import keeps the
+    controller usable without a full MinerCore (e.g., a thin test
+    double), while still catching signature drift at type-check time.
+    """
+
+    def record_dispatch(self) -> None: ...
+
+    def record_result(self, *, winning_miner_id: str, mining_time: float) -> None: ...
 
 
 # Threshold for consecutive `None` snapshots before the controller raises.
@@ -168,12 +181,21 @@ class SubstrateMinerController:
             Callable[[ExtrinsicReceipt, SubstrateMiningContext], Awaitable[None]]
         ] = None,
         subscription_client: Optional[SubstrateClient] = None,
+        core: Optional[_MinerCoreStats] = None,
     ) -> None:
         if not miner_handles:
             raise ValueError(
                 "SubstrateMinerController requires at least one MinerHandle"
             )
         self.client = client
+        # Optional MinerCore hook. When provided, the controller calls
+        # `core.record_dispatch()` once per head (not per handle — that would
+        # double-count when more than one miner is attached) and
+        # `core.record_result(winning_miner_id, mining_time)` on chain-accepted
+        # proofs. Keeps `/api/v1/stats`'s legacy `total_blocks_attempted` /
+        # `total_blocks_won` / `wins_per_miner` fields live without coupling
+        # the controller's type to MinerCore.
+        self.core = core
         # substrate-interface holds the websocket in receive mode for the
         # duration of `subscribe_block_headers`, which makes any concurrent
         # submit_extrinsic / state_call on the same connection hang
@@ -418,6 +440,9 @@ class SubstrateMinerController:
             self._dispatched[handle.miner_id] = context
             handle.mine_work_item(context)
         self.stats.contexts_dispatched += len(self.miner_handles)
+        if self.core is not None:
+            # One attempt per head, regardless of how many handles fanned out.
+            self.core.record_dispatch()
 
     async def _handle_result(self, envelope: _ResultEnvelope) -> None:
         self.stats.results_received += 1
@@ -473,6 +498,11 @@ class SubstrateMinerController:
                 receipt.block_hash,
                 self.signer.ss58_address(),
             )
+            if self.core is not None:
+                self.core.record_result(
+                    winning_miner_id=envelope.result.miner_id,
+                    mining_time=float(envelope.result.mining_time),
+                )
             if self.on_proof_submitted is not None:
                 try:
                     await self.on_proof_submitted(receipt, envelope.context)

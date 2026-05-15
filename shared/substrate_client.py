@@ -67,6 +67,19 @@ class SubstrateClient:
         self.url = url
         self._iface: Optional[SubstrateInterface] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # `SubstrateInterface` keeps a single websocket and isn't safe
+        # against concurrent calls from different threads (its internal
+        # state machine corrupts mid-decode, producing spurious
+        # `No decoding class found` errors and ScaleType objects that
+        # leak into the public return value). Serialize every blocking
+        # call behind this lock — same fix the standalone faucet uses
+        # for the same problem.
+        #
+        # Lazy-instantiated in `connect()` so the `asyncio.Lock` binds
+        # to the running event loop (Lock captures the loop at __init__
+        # time). Don't move this to `SubstrateClient.__init__` — clients
+        # are typically constructed before the loop is set up.
+        self._call_lock: Optional[asyncio.Lock] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -76,6 +89,7 @@ class SubstrateClient:
         if self._iface is not None:
             return
         self._loop = asyncio.get_running_loop()
+        self._call_lock = asyncio.Lock()
         # SubstrateInterface() opens the websocket eagerly in its constructor.
         self._iface = await self._run(lambda: SubstrateInterface(url=self.url))
         logger.info("substrate client connected: url=%s", self.url)
@@ -433,6 +447,14 @@ class SubstrateClient:
         response). Instead, the block-hash lookup and the user coroutine are
         both scheduled on the asyncio loop via ``run_coroutine_threadsafe``,
         where ``_run`` puts the blocking RPC on the executor.
+
+        The subscribe call itself bypasses ``_call_lock``: substrate-interface
+        keeps the websocket in receive mode for the subscription's lifetime,
+        which would otherwise hold the lock forever and deadlock every other
+        ``_run`` caller — including ``_handle_head``'s ``get_block_hash``
+        below. Callers that need to share a client across submissions and
+        subscriptions should pass a dedicated ``subscription_client`` to the
+        controller (the controller already enforces this).
         """
         loop = asyncio.get_running_loop()
 
@@ -478,10 +500,14 @@ class SubstrateClient:
                     update_nr, exc,
                 )
 
-        await self._run(
+        # Bypass `_call_lock` for the long-lived subscribe — see docstring.
+        # `_handle_head` above goes through `_run` which acquires the lock
+        # normally, so the receive-side calls remain properly serialised.
+        await loop.run_in_executor(
+            None,
             lambda: self._iface.subscribe_block_headers(
                 _dispatch, finalized_only=finalized_only
-            )
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -489,9 +515,22 @@ class SubstrateClient:
     # ------------------------------------------------------------------
 
     async def _run(self, fn):
-        """Run a blocking substrate-interface call on the default executor."""
+        """Run a blocking substrate-interface call on the default executor.
+
+        Almost all callers go through this method, so the `_call_lock`
+        taken here guarantees serial access to the underlying
+        `SubstrateInterface`. The exception is `subscribe_new_heads`,
+        which intentionally bypasses the lock — see its docstring.
+
+        When `_call_lock` is `None` we're before `connect()` finishes,
+        in which case `connect()` itself is the only caller (single-
+        threaded setup) and the lock would be redundant.
+        """
         loop = self._loop or asyncio.get_running_loop()
-        return await loop.run_in_executor(None, fn)
+        if self._call_lock is None:
+            return await loop.run_in_executor(None, fn)
+        async with self._call_lock:
+            return await loop.run_in_executor(None, fn)
 
 
 # ----------------------------------------------------------------------

@@ -267,6 +267,7 @@ async def _run_miner(
                 signer=keystore.signer,
                 miner_handles=core.miner_handles,
                 topology_hash=snapshot.topology_hash,
+                core=core,
             )
             click.echo(
                 f"controller starting: handles={[h.miner_id for h in core.miner_handles]} "

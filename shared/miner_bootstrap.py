@@ -136,6 +136,13 @@ class BootstrapConfig:
     seed_difficulty: SubstrateDifficulty = field(
         default_factory=lambda: DEFAULT_SEED_DIFFICULTY
     )
+    # Force a sudo `set_difficulty` even when one is already on chain.
+    # The runtime tightens difficulty between proofs (adjusting min_diversity
+    # / max_energy upward when blocks arrive too fast); long-haul integration
+    # tests need to reset to the relaxed seed each run or the CPU SA can't
+    # keep up. Defaults False so the CLI's `bootstrap` subcommand stays
+    # idempotent in production.
+    force_reseed_difficulty: bool = False
     min_balance_plancks: int = DEFAULT_MIN_BALANCE_PLANCKS
     faucet_top_up_plancks: int = DEFAULT_FAUCET_TOP_UP_PLANCKS
 
@@ -218,8 +225,26 @@ async def _maybe_seed_chain(
     sudo_signer = _resolve_dev_signer(config.sudo_key_uri)
 
     difficulty_seeded = False
-    if await client.query_difficulty() is None:
-        logger.info("seeding QuantumPow.Difficulty via sudo")
+    needs_seed = (
+        await client.query_difficulty() is None or config.force_reseed_difficulty
+    )
+    if needs_seed:
+        if config.force_reseed_difficulty:
+            # Defense in depth: `_assert_dev_chain` above already refused
+            # non-dev chains, but log a loud warning when we're about to
+            # overwrite an existing on-chain difficulty so the action is
+            # never invisible. Production CLI doesn't expose the flag.
+            logger.warning(
+                "force-reseeding QuantumPow.Difficulty via sudo: "
+                "min_solutions=%d max_energy_milli=%d min_diversity_milli=%d "
+                "min_quality_milli=%d",
+                config.seed_difficulty.min_solutions,
+                config.seed_difficulty.max_energy_milli,
+                config.seed_difficulty.min_diversity_milli,
+                config.seed_difficulty.min_quality_milli,
+            )
+        else:
+            logger.info("seeding QuantumPow.Difficulty via sudo (first time)")
         await _sudo_call(
             client,
             sudo_signer,

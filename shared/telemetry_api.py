@@ -318,6 +318,12 @@ class TelemetryApiServer:
           - the block hash
         Dashboards that consumed the v0.1 fields directly need updating;
         the response envelope shape (success/data/timestamp) is preserved.
+
+        substrate-interface's `get_block` returns a structure that mixes
+        plain dicts with `ScaleType` wrappers (e.g. the digest items hold
+        decoded `scale_info::N` objects). Those aren't JSON-serializable as
+        returned, so we coerce through `_to_jsonable` before handing the
+        dict to `json_response`.
         """
 
         def _query() -> dict:
@@ -326,12 +332,11 @@ class TelemetryApiServer:
 
         block = await self.client._run(_query)  # noqa: SLF001
         header = block.get("header", {}) if isinstance(block, dict) else {}
+        extrinsics = block.get("extrinsics", []) if isinstance(block, dict) else []
         return {
             "hash": "0x" + at.hex(),
-            "header": header,
-            "extrinsic_count": len(block.get("extrinsics", []) or [])
-            if isinstance(block, dict)
-            else 0,
+            "header": _to_jsonable(header),
+            "extrinsic_count": len(extrinsics or []),
         }
 
     # ------------------------------------------------------------------
@@ -359,6 +364,41 @@ class TelemetryApiServer:
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
+
+
+def _to_jsonable(obj: Any) -> Any:
+    """Recursively coerce substrate-interface output to JSON-safe primitives.
+
+    `SubstrateInterface.get_block` returns dicts whose leaves can be raw
+    `ScaleType` instances (e.g. decoded `scale_info::N` objects from the
+    runtime metadata). `json.dumps` rejects those with "is not JSON
+    serializable"; calling `.value` on a ScaleType gives the decoded
+    primitive (str / int / list / dict). Walk the structure and unwrap.
+    """
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    # Render binary as 0x-hex to match the rest of the API surface
+    # (e.g. block hashes, account ids). Without this, raw `bytes` in the
+    # decoded header (parent hash, state root, digest payload) would
+    # stringify via repr() as `b'\\x00...'` — valid Python but useless
+    # to any dashboard parsing the response as hex.
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        return "0x" + bytes(obj).hex()
+    if isinstance(obj, dict):
+        return {k: _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(v) for v in obj]
+    # ScaleType and friends carry the decoded value under `.value`. Use
+    # `hasattr` rather than `getattr(..., None)`: a ScaleType that legit
+    # decodes to `None` (e.g. an empty `Option<T>`) should serialize as
+    # JSON `null`, not as `repr(obj)`.
+    if hasattr(obj, "value"):
+        val = obj.value
+        if val is not obj:
+            return _to_jsonable(val)
+    # Fall back to repr() so the endpoint stays observable even if
+    # substrate-interface ever changes its return shape.
+    return repr(obj)
 
 
 def _parse_block_number(request: web.Request):
