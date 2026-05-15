@@ -13,9 +13,8 @@ SubstrateMinerController.
 from __future__ import annotations
 
 import asyncio
-import multiprocessing
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import click
 
@@ -396,6 +395,11 @@ _TOPOLOGY_HELP = (
 )
 _REST_PORT_HELP = "Telemetry REST API port (set to -1 to disable; Phase 5b wires this in)"
 
+# Seconds to wait for a controller to drain after signalling shutdown.
+# Must exceed the longest controller poll interval (<=10s for head-subscription
+# timeout in SubstrateMinerController).
+_SHUTDOWN_GRACE_SECONDS = 15.0
+
 
 async def _run_concurrent_miner(
     *,
@@ -421,6 +425,7 @@ async def _run_concurrent_miner(
     """
     import asyncio
     import signal as signal_module
+    import traceback as tb_module
     from pathlib import Path
 
     from shared.keystore_hybrid import load
@@ -433,6 +438,7 @@ async def _run_concurrent_miner(
     from shared.substrate_client import SubstrateClient
     from shared.substrate_miner_controller import SubstrateMinerController
 
+    mode = mode.lower()
     if mode not in ("pow", "mempool", "both"):
         click.echo(f"invalid --mode {mode!r}", err=True)
         return 2
@@ -465,119 +471,133 @@ async def _run_concurrent_miner(
         core.close()
         return 5
 
-    client = SubstrateClient(url=node_url)
-    await client.connect()
-
-    pow_controller = None
-    pow_topology_hash = None
-    if pow_handles:
-        # PoW requires the sampler's topology to match the chain's
-        # registered DefaultTopology (the chain validates this in
-        # `submit_proof` via `InvalidTopology`).
-        head = await client.get_head()
-        snapshot = await client.get_mining_snapshot(
-            at=head,
-            miner_account_bytes=keystore.signer.account_id_bytes(),
-        )
-        if snapshot is None:
-            click.echo(
-                "PoW mode: chain has no registered topology; run "
-                "`quip-miner bootstrap --seed-chain` first",
-                err=True,
-            )
-            await client.close()
-            core.close()
-            return 3
-        expected_hash = _zephyr_topology_hash(topology)
-        if snapshot.topology_hash != expected_hash:
-            click.echo(
-                f"PoW mode topology mismatch: --topology {topology_spec} "
-                f"hashes to 0x{expected_hash.hex()} but chain has "
-                f"0x{snapshot.topology_hash.hex()}",
-                err=True,
-            )
-            await client.close()
-            core.close()
-            return 4
-        pow_topology_hash = snapshot.topology_hash
-        pow_controller = SubstrateMinerController(
-            client=client,
-            signer=keystore.signer,
-            miner_handles=pow_handles,
-            topology_hash=pow_topology_hash,
-            core=core,
-        )
-        click.echo(
-            f"  pow handles: {[h.miner_id for h in pow_handles]} "
-            f"topology=0x{pow_topology_hash.hex()[:16]}..."
-        )
-
-    mempool_controller = None
+    # Declare all network resources before the try so the finally block can
+    # always clean up whatever was partially constructed on setup failure.
+    client = None
     mempool_client = None
-    if mempool_handles:
-        sampler_nodes = tuple(int(n) for n in topology.nodes)
-        sampler_edges = tuple((int(u), int(v)) for u, v in topology.edges)
-        mempool_topology_hash = topology_hash_from_nodes_edges(
-            sampler_nodes, sampler_edges
-        )
-        # The mempool controller submits + reads via its own
-        # SubstrateClient instance. Sharing `client` with the PoW
-        # controller would serialize their submissions behind the same
-        # asyncio lock, defeating the point of concurrent mode.
-        mempool_client = SubstrateClient(url=node_url)
-        await mempool_client.connect()
-        mempool_controller = MempoolMinerController(
-            client=mempool_client,
-            signer=keystore.signer,
-            miner_handles=mempool_handles,
-            sampler_topology_hash=mempool_topology_hash,
-            solver_type=MinerType.from_kind(miner_kind),
-            core=core,
-        )
-        click.echo(
-            f"  mempool handles: {[h.miner_id for h in mempool_handles]} "
-            f"topology=0x{mempool_topology_hash.hex()[:16]}..."
-        )
-
     telemetry = None
-    if rest_port is not None and rest_port > 0:
-        from shared.telemetry_api import TelemetryApiServer
-
-        telemetry = TelemetryApiServer(
-            core=core,
-            client=client,
-            signer=keystore.signer,
-            controller=pow_controller,  # Phase 9: surface mempool stats too
-            host="127.0.0.1",
-            port=rest_port,
-        )
-        await telemetry.start()
-        click.echo(f"telemetry api: http://127.0.0.1:{rest_port}/api/v1/status")
-
-    loop = asyncio.get_running_loop()
-
-    def _signal_shutdown() -> None:
-        if pow_controller is not None:
-            pow_controller.shutdown()
-        if mempool_controller is not None:
-            mempool_controller.shutdown()
-
-    for sig in (signal_module.SIGINT, signal_module.SIGTERM):
-        loop.add_signal_handler(sig, _signal_shutdown)
-
-    tasks: list = []
-    if pow_controller is not None:
-        tasks.append(asyncio.create_task(
-            pow_controller.run(), name="pow-controller"
-        ))
-    if mempool_controller is not None:
-        tasks.append(asyncio.create_task(
-            mempool_controller.run(), name="mempool-controller"
-        ))
+    pow_controller = None
+    mempool_controller = None
 
     try:
+        client = SubstrateClient(url=node_url)
+        await client.connect()
+
+        if pow_handles:
+            # PoW requires the sampler's topology to match the chain's
+            # registered DefaultTopology (the chain validates this in
+            # `submit_proof` via `InvalidTopology`).
+            try:
+                head = await client.get_head()
+                snapshot = await client.get_mining_snapshot(
+                    at=head,
+                    miner_account_bytes=keystore.signer.account_id_bytes(),
+                )
+            except Exception as exc:
+                click.echo(
+                    f"PoW mode: failed to query chain state: {exc}", err=True
+                )
+                return 3
+            if snapshot is None:
+                click.echo(
+                    "PoW mode: chain has no registered topology; run "
+                    "`quip-miner bootstrap --seed-chain` first",
+                    err=True,
+                )
+                return 3
+            expected_hash = _zephyr_topology_hash(topology)
+            if snapshot.topology_hash != expected_hash:
+                click.echo(
+                    f"PoW mode topology mismatch: --topology {topology_spec} "
+                    f"hashes to 0x{expected_hash.hex()} but chain has "
+                    f"0x{snapshot.topology_hash.hex()}",
+                    err=True,
+                )
+                return 4
+            pow_topology_hash = snapshot.topology_hash
+            pow_controller = SubstrateMinerController(
+                client=client,
+                signer=keystore.signer,
+                miner_handles=pow_handles,
+                topology_hash=pow_topology_hash,
+                core=core,
+            )
+            click.echo(
+                f"  pow handles: {[h.miner_id for h in pow_handles]} "
+                f"topology=0x{pow_topology_hash.hex()[:16]}..."
+            )
+
+        if mempool_handles:
+            sampler_nodes = tuple(int(n) for n in topology.nodes)
+            sampler_edges = tuple((int(u), int(v)) for u, v in topology.edges)
+            mempool_topology_hash = topology_hash_from_nodes_edges(
+                sampler_nodes, sampler_edges
+            )
+            # In `both` mode the mempool controller needs its own client to
+            # avoid serializing submissions behind the PoW client's asyncio
+            # lock. In mempool-only mode `client` has no contention -- reuse it.
+            mempool_client_ref = client
+            if pow_handles:
+                mempool_client = SubstrateClient(url=node_url)
+                await mempool_client.connect()
+                mempool_client_ref = mempool_client
+            mempool_controller = MempoolMinerController(
+                client=mempool_client_ref,
+                signer=keystore.signer,
+                miner_handles=mempool_handles,
+                sampler_topology_hash=mempool_topology_hash,
+                solver_type=MinerType.from_kind(miner_kind),
+                core=core,
+            )
+            click.echo(
+                f"  mempool handles: {[h.miner_id for h in mempool_handles]} "
+                f"topology=0x{mempool_topology_hash.hex()[:16]}..."
+            )
+
+        if rest_port is not None and rest_port > 0:
+            from shared.telemetry_api import TelemetryApiServer
+
+            telemetry = TelemetryApiServer(
+                core=core,
+                client=client,
+                signer=keystore.signer,
+                controller=pow_controller,  # Phase 9: surface mempool stats too
+                host="127.0.0.1",
+                port=rest_port,
+            )
+            await telemetry.start()
+            click.echo(f"telemetry api: http://127.0.0.1:{rest_port}/api/v1/status")
+
+        loop = asyncio.get_running_loop()
+
+        def _signal_shutdown() -> None:
+            for c in (pow_controller, mempool_controller):
+                if c is not None:
+                    try:
+                        c.shutdown()
+                    except Exception:  # noqa: BLE001 -- signal handler must not raise
+                        pass
+
+        for sig in (signal_module.SIGINT, signal_module.SIGTERM):
+            loop.add_signal_handler(sig, _signal_shutdown)
+
+        tasks: list[asyncio.Task] = []
+        if pow_controller is not None:
+            tasks.append(asyncio.create_task(
+                pow_controller.run(), name="pow-controller"
+            ))
+        if mempool_controller is not None:
+            tasks.append(asyncio.create_task(
+                mempool_controller.run(), name="mempool-controller"
+            ))
+
+        if not tasks:
+            click.echo("internal error: no controller tasks created", err=True)
+            return 2
+
+        exit_code = 0
         # Wait until any controller exits (one failing should bring down
-        # the whole process — operators can re-spawn). Once one returns,
+        # the whole process -- operators can re-spawn). Once one returns,
         # signal the other to stop and wait for it to drain.
         done, pending = await asyncio.wait(
             tasks, return_when=asyncio.FIRST_COMPLETED
@@ -586,19 +606,44 @@ async def _run_concurrent_miner(
             exc = t.exception()
             if exc is not None:
                 click.echo(
-                    f"controller {t.get_name()} exited with error: {exc}",
+                    f"controller {t.get_name()} exited with error:\n"
+                    + "".join(tb_module.format_exception(
+                        type(exc), exc, exc.__traceback__
+                    )),
                     err=True,
                 )
+                exit_code = 1
         _signal_shutdown()
         for t in pending:
             try:
-                await asyncio.wait_for(t, timeout=15.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                await asyncio.wait_for(t, timeout=_SHUTDOWN_GRACE_SECONDS)
+            except asyncio.TimeoutError:
+                click.echo(
+                    f"controller {t.get_name()} did not stop within "
+                    f"{_SHUTDOWN_GRACE_SECONDS}s; cancelling",
+                    err=True,
+                )
                 t.cancel()
                 try:
                     await t
-                except (asyncio.CancelledError, Exception):
+                except asyncio.CancelledError:
                     pass
+                except Exception as drain_exc:
+                    click.echo(
+                        f"controller {t.get_name()} raised during cancel: "
+                        f"{drain_exc}",
+                        err=True,
+                    )
+            except asyncio.CancelledError:
+                pass
+            except Exception as drain_exc:
+                click.echo(
+                    f"controller {t.get_name()} raised during drain: {drain_exc}",
+                    err=True,
+                )
+
+        return exit_code
+
     finally:
         if pow_controller is not None:
             click.echo(f"  pow stats:     {pow_controller.stats}")
@@ -608,9 +653,9 @@ async def _run_concurrent_miner(
             await telemetry.stop()
         if mempool_client is not None:
             await mempool_client.close()
-        await client.close()
+        if client is not None:
+            await client.close()
         core.close()
-    return 0
 
 
 def _split_handles_for_mode(mode: str, handles: list) -> tuple:
@@ -627,14 +672,16 @@ def _split_handles_for_mode(mode: str, handles: list) -> tuple:
                       n=1 this returns ([], handles) — the CLI then
                       fails fast on the both/empty-PoW combination.
     """
+    mode = mode.lower()
     if mode == "pow":
         return list(handles), []
     if mode == "mempool":
         return [], list(handles)
-    # mode == "both"
-    n = len(handles)
-    pow_count = n // 2
-    return list(handles[:pow_count]), list(handles[pow_count:])
+    if mode == "both":
+        n = len(handles)
+        pow_count = n // 2
+        return list(handles[:pow_count]), list(handles[pow_count:])
+    raise ValueError(f"unknown mode {mode!r}; expected 'pow', 'mempool', or 'both'")
 
 
 _MODE_HELP = (
@@ -846,9 +893,11 @@ def quip_miner_qpu(
         section["daily_budget"] = daily_budget
     miner_config = {qpu_type: [section]}
 
+    miner_kind = f"qpu_{qpu_type}" if qpu_type in ("ibm", "ionq", "pasqal") else "qpu"
+
     raise SystemExit(asyncio.run(_run_concurrent_miner(
         mode=mode,
-        miner_kind="qpu",
+        miner_kind=miner_kind,
         node_url=node_url,
         signer_key_path=signer_key_path,
         rest_port=rest_port,
