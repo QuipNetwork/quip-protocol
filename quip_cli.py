@@ -13,15 +13,26 @@ SubstrateMinerController.
 from __future__ import annotations
 
 import asyncio
-import multiprocessing
+import hashlib
+import signal
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import click
 
-from shared.keystore_hybrid import generate
+from dwave_topologies.topologies.zephyr import zephyr
+from shared.keystore_hybrid import generate, load
 from shared.logging_config import setup_logging
+from shared.mempool_miner_controller import (
+    MempoolMinerController,
+    topology_hash_from_nodes_edges,
+)
+from shared.mempool_types import MinerType
 from shared.miner_bootstrap import BootstrapConfig, bootstrap
+from shared.miner_core import MinerCore
+from shared.substrate_client import SubstrateClient
+from shared.substrate_miner_controller import SubstrateMinerController
+from shared.telemetry_api import TelemetryApiServer
 
 
 @click.group(name="quip-miner")
@@ -193,13 +204,6 @@ def quip_miner_register_solver(
     surfaced to job proposers via `mode = Bid{miner_types: [...]}` filters.
     Use `quip-miner deregister-solver` to opt out.
     """
-    import asyncio
-    from pathlib import Path
-
-    from shared.keystore_hybrid import load
-    from shared.mempool_types import MinerType
-    from shared.substrate_client import SubstrateClient
-
     keystore = load(Path(signer_key_path).expanduser())
     mt = MinerType.from_kind(miner_type)
 
@@ -260,12 +264,6 @@ def quip_miner_deregister_solver(node_url: str, signer_key_path: str) -> None:
     message). After deregistration, submit_solution / claim_reward
     extrinsics will fail with `SolverNotRegistered` until you re-register.
     """
-    import asyncio
-    from pathlib import Path
-
-    from shared.keystore_hybrid import load
-    from shared.substrate_client import SubstrateClient
-
     keystore = load(Path(signer_key_path).expanduser())
 
     async def _do() -> int:
@@ -317,8 +315,6 @@ def _parse_topology(spec: str):
     miners need them. Returns the sampler-compatible topology object so the
     CLI can plug it straight into the spec's `args["topology"]`.
     """
-    from dwave_topologies.topologies.zephyr import zephyr
-
     if ":" not in spec:
         raise click.BadParameter(
             f"--topology must be 'family:m,t' (got {spec!r}); try 'zephyr:9,2'"
@@ -353,16 +349,6 @@ async def _run_miner(
     miner kind, two `SubstrateClient` instances (state + subscription),
     and a `SubstrateMinerController`. Runs the controller until KeyboardInterrupt.
     """
-    import asyncio
-    import hashlib
-    import signal as signal_module
-    from pathlib import Path
-
-    from shared.keystore_hybrid import load
-    from shared.miner_core import MinerCore
-    from shared.substrate_client import SubstrateClient
-    from shared.substrate_miner_controller import SubstrateMinerController
-
     keystore = load(Path(signer_key_path).expanduser())
     click.echo(f"signer: {keystore.signer.ss58_address()} (hybrid)")
 
@@ -432,10 +418,8 @@ async def _run_miner(
     # Optional telemetry server. The legacy /api/v1/* surface is preserved
     # via `shared.telemetry_api`; new operators that don't want HTTP
     # telemetry pass `--rest-port -1` to skip the bind.
-    telemetry: Optional["TelemetryApiServer"] = None
+    telemetry: Optional[TelemetryApiServer] = None
     if rest_port is not None and rest_port > 0:
-        from shared.telemetry_api import TelemetryApiServer
-
         telemetry = TelemetryApiServer(
             core=core,
             client=client,
@@ -450,7 +434,7 @@ async def _run_miner(
         )
 
     loop = asyncio.get_running_loop()
-    for sig in (signal_module.SIGINT, signal_module.SIGTERM):
+    for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, controller.shutdown)
 
     try:
@@ -491,8 +475,6 @@ def _zephyr_topology_hash(topology) -> bytes:
     Matches `pallets/quantum-pow/src/topology.rs::hash_topology`:
         blake2_256(SCALE((sorted nodes, sorted canonical edges)))
     """
-    import hashlib
-
     nodes = sorted(int(n) for n in topology.nodes)
     edges = sorted(
         (min(int(u), int(v)), max(int(u), int(v))) for u, v in topology.edges
@@ -541,19 +523,6 @@ async def _run_mempool_miner(
     sampler's nodes/edges hash directly becomes the mempool eligibility
     filter. (Phase 8d unifies this with PoW mode under one CLI command.)
     """
-    import asyncio
-    import signal as signal_module
-    from pathlib import Path
-
-    from shared.keystore_hybrid import load
-    from shared.mempool_miner_controller import (
-        MempoolMinerController,
-        topology_hash_from_nodes_edges,
-    )
-    from shared.mempool_types import MinerType
-    from shared.miner_core import MinerCore
-    from shared.substrate_client import SubstrateClient
-
     keystore = load(Path(signer_key_path).expanduser())
     click.echo(f"signer: {keystore.signer.ss58_address()} (hybrid)")
 
@@ -571,7 +540,6 @@ async def _run_mempool_miner(
         )
         return 2
 
-    sampler = core.miner_handles[0]
     sampler_nodes = tuple(int(n) for n in topology.nodes)
     sampler_edges = tuple(
         (int(u), int(v)) for u, v in topology.edges
@@ -600,8 +568,6 @@ async def _run_mempool_miner(
 
     telemetry = None
     if rest_port is not None and rest_port > 0:
-        from shared.telemetry_api import TelemetryApiServer
-
         telemetry = TelemetryApiServer(
             core=core,
             client=client,
@@ -616,7 +582,7 @@ async def _run_mempool_miner(
         )
 
     loop = asyncio.get_running_loop()
-    for sig in (signal_module.SIGINT, signal_module.SIGTERM):
+    for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, controller.shutdown)
 
     try:
@@ -686,8 +652,6 @@ def quip_miner_mempool(
 
     Phase 8c serves one job at a time, FIFO, with no PoW concurrency.
     """
-    import asyncio
-
     miner_config = {miner_kind: {"num_cpus": num_cpus} if miner_kind == "cpu" else {}}
     raise SystemExit(asyncio.run(_run_mempool_miner(
         miner_kind=miner_kind,
@@ -734,8 +698,6 @@ def quip_miner_cpu(
     rest_port: int,
 ) -> None:
     """Run CPU SA miners against a substrate chain."""
-    import asyncio
-
     miner_config = {"cpu": {"num_cpus": num_cpus}}
     raise SystemExit(asyncio.run(_run_miner(
         kind="cpu",
@@ -789,8 +751,6 @@ def quip_miner_gpu(
     samplers consume the topology via their `args` dict the same way the
     CPU path does once that injection is generalised.
     """
-    import asyncio
-
     backend = gpu_backend.lower()
     if backend == "local":
         miner_config = {"cuda": [{"device": "0"}]}
@@ -858,8 +818,6 @@ def quip_miner_qpu(
     Same Phase 5a caveat as GPU: end-to-end against the chain is a Phase 6
     item once topology binding generalises beyond CPU.
     """
-    import asyncio
-
     section: dict = {"type": qpu_type}
     if daily_budget is not None:
         section["daily_budget"] = daily_budget

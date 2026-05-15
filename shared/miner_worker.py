@@ -12,54 +12,44 @@ It constructs the correct concrete miner from a simple picklable spec dict:
 """
 from __future__ import annotations
 
-import time
-import traceback
-from shared.logging_config import QuipFormatter
 import logging
-import signal
-
-# Global logger for this module
-log = None
-
-def _setup_child_process_logging(log_queue=None):
-    """Set up logging for child processes to use QuipFormatter and optionally queue logging."""
-    global log
-
-    # Get root logger
-    root_logger = logging.getLogger()
-
-    # Clear existing handlers to avoid duplicates
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-
-    if log_queue is not None:
-        # Use queue handler to send logs to parent process
-        from logging.handlers import QueueHandler
-        queue_handler = QueueHandler(log_queue)
-        root_logger.addHandler(queue_handler)
-        root_logger.setLevel(logging.DEBUG)  # Let parent process filter
-    else:
-        # Fallback to console logging with QuipFormatter
-        formatter = QuipFormatter()
-        handler = logging.StreamHandler()
-        handler.setFormatter(formatter)
-        root_logger.addHandler(handler)
-        root_logger.setLevel(logging.INFO)
-
-    # Create module logger that will inherit from root
-    module_logger = logging.getLogger(__name__)
-    log = module_logger
-
-# Initialize module logger
-logger = logging.getLogger(__name__)
-
+import logging.handlers
 import multiprocessing as mp
 import multiprocessing.synchronize as mpsync
+import time
+import traceback
 from typing import Any, Dict, Optional
 
 import CPU
 import GPU
 import QPU
+
+from shared.logging_config import QuipFormatter
+
+# Global logger for this module
+log = None
+logger = logging.getLogger(__name__)
+
+
+def _setup_child_process_logging(log_queue=None):
+    """Set up logging for child processes to use QuipFormatter and optionally queue logging."""
+    global log
+
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    if log_queue is not None:
+        queue_handler = logging.handlers.QueueHandler(log_queue)
+        root_logger.addHandler(queue_handler)
+        root_logger.setLevel(logging.DEBUG)
+    else:
+        handler = logging.StreamHandler()
+        handler.setFormatter(QuipFormatter())
+        root_logger.addHandler(handler)
+        root_logger.setLevel(logging.INFO)
+
+    log = logging.getLogger(__name__)
 
 # NOTE: the legacy `_signal_aware_mining_worker` (a dedicated per-attempt
 # child process used by `MinerHandle.mine_with_timeout`) was removed in
