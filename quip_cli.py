@@ -4,6 +4,7 @@ Provides two console commands:
 - quip-network-node: run a single P2P node (cpu/gpu/qpu) backed by shared.network_node.NetworkNode
 - quip-network-simulator: launch multiple nodes using quip-network-node and connect them locally to each other
 """
+
 from __future__ import annotations
 
 import os
@@ -12,7 +13,6 @@ import signal
 import subprocess
 import sys
 import json
-import time
 import asyncio
 from pathlib import Path
 from typing import Any, Dict, Optional, List
@@ -32,7 +32,6 @@ from shared.keystore import generate
 from shared.logging_config import setup_logging
 from shared.miner_bootstrap import BootstrapConfig, bootstrap
 from shared.network_node import NetworkNode
-from shared.node import Node
 from shared.version import get_version
 
 
@@ -71,8 +70,16 @@ def _load_config(path: Optional[str]) -> Dict[str, Any]:
 
     # Forward device-type sections (top-level [cuda.N], [metal], [dwave], etc.)
     _device_sections = (
-        "cuda", "nvidia", "metal", "modal",
-        "dwave", "ibm", "braket", "pasqal", "ionq", "origin",
+        "cuda",
+        "nvidia",
+        "metal",
+        "modal",
+        "dwave",
+        "ibm",
+        "braket",
+        "pasqal",
+        "ionq",
+        "origin",
     )
     for section in _device_sections:
         if section in config:
@@ -96,10 +103,7 @@ def _merge_globals_from_toml(cfg: Dict[str, Any]) -> Dict[str, Any]:
     g = dict(cfg.get("global", {}) or {})
     out: Dict[str, Any] = {}
     for k, v in g.items():
-        if k not in ["cpu", "gpu", "qpu"]:
-            out[k] = v
-        else:
-            out[f"global.k"] = v
+        out[k] = v
     return out
 
 
@@ -117,25 +121,26 @@ def _print_final_config(config: Dict[str, Any], miner_type: str):
     click.echo()
 
 
-
-def _apply_global_overrides(conf: Dict[str, Any],
-                             listen: Optional[str],
-                             port: Optional[int],
-                             public_host: Optional[str],
-                             public_port: Optional[int],
-                             node_name: Optional[str],
-                             secret: Optional[str],
-                             auto_mine: Optional[bool],
-                             peers: Optional[List[str]],
-                             timeout: Optional[int],
-                             heartbeat_interval: Optional[int],
-                             heartbeat_timeout: Optional[int],
-                             fanout: Optional[int],
-                             log_level: Optional[str] = None,
-                             node_log: Optional[str] = None,
-                             http_log: Optional[str] = None,
-                             rest_port: Optional[int] = None,
-                             rest_insecure_port: Optional[int] = None) -> Dict[str, Any]:
+def _apply_global_overrides(
+    conf: Dict[str, Any],
+    listen: Optional[str],
+    port: Optional[int],
+    public_host: Optional[str],
+    public_port: Optional[int],
+    node_name: Optional[str],
+    secret: Optional[str],
+    auto_mine: Optional[bool],
+    peers: Optional[List[str]],
+    timeout: Optional[int],
+    heartbeat_interval: Optional[int],
+    heartbeat_timeout: Optional[int],
+    fanout: Optional[int],
+    log_level: Optional[str] = None,
+    node_log: Optional[str] = None,
+    http_log: Optional[str] = None,
+    rest_port: Optional[int] = None,
+    rest_insecure_port: Optional[int] = None,
+) -> Dict[str, Any]:
     c = dict(conf)
     if listen is not None:
         c["listen"] = listen
@@ -174,7 +179,9 @@ def _apply_global_overrides(conf: Dict[str, Any],
     return c
 
 
-async def _async_run_network_node(config: Dict[str, Any], genesis_config_file: str) -> int:
+async def _async_run_network_node(
+    config: Dict[str, Any], genesis_config_file: str
+) -> int:
     """Create NetworkNode with genesis, start server/tasks, and run until Ctrl-C."""
     # Setup logging before creating NetworkNode
     log_level = config.get("log_level", "INFO")
@@ -187,7 +194,7 @@ async def _async_run_network_node(config: Dict[str, Any], genesis_config_file: s
         log_level=log_level,
         node_log_file=node_log_file,
         http_log_file=http_log_file,
-        node_name=node_name
+        node_name=node_name,
     )
 
     # Load genesis and pass to NetworkNode constructor
@@ -214,6 +221,7 @@ async def _async_run_network_node(config: Dict[str, Any], genesis_config_file: s
 def _run_network_node_sync(config: Dict[str, Any], genesis_config_file: str) -> int:
     # Install uvloop for 2-4x async throughput if available
     from shared.event_loop import install_uvloop_policy
+
     install_uvloop_policy()
 
     try:
@@ -231,12 +239,19 @@ def _run_network_node_sync(config: Dict[str, Any], genesis_config_file: str) -> 
 # quip-network-node
 # -----------------------------
 
+
 @click.group(invoke_without_command=True)
-@click.option("--config", type=click.Path(exists=True, dir_okay=False), help="Path to TOML config file")
+@click.option(
+    "--config",
+    type=click.Path(exists=True, dir_okay=False),
+    help="Path to TOML config file",
+)
 @click.option("--version", is_flag=True, help="Show version and exit")
 @click.option("--debug-config", is_flag=True, help="Print final configuration as JSON")
 @click.pass_context
-def quip_network_node(ctx: click.Context, config: Optional[str], version: bool, debug_config: bool):
+def quip_network_node(
+    ctx: click.Context, config: Optional[str], version: bool, debug_config: bool
+):
     """Run a single quip network node.
 
     Subcommands: cpu, gpu, qpu
@@ -259,45 +274,119 @@ def quip_network_node(ctx: click.Context, config: Optional[str], version: bool, 
         # Check if any miner sections are present
         has_miners = any(k in cfg for k in ("cpu", "gpu", "qpu"))
         if not has_miners:
-            raise click.UsageError("No subcommand given and no miner sections ([cpu], [gpu], [qpu]) found in config")
-        
+            raise click.UsageError(
+                "No subcommand given and no miner sections ([cpu], [gpu], [qpu]) found in config"
+            )
+
         # Apply debug config from global options
         if ctx.obj.get("debug_config", False):
             _print_final_config(cfg, "auto-configured")
-        
+
         # Use genesis_block.json as default genesis config
         genesis_config = cfg.get("genesis_config", "genesis_block.json")
-        
+
         sys.exit(_run_network_node_sync(cfg, genesis_config))
 
 
 # Subcommands: cpu/gpu/qpu. Each builds a NetworkNode config from TOML and CLI flags.
 
+
 @quip_network_node.command(name="cpu")
 # Global network options
-@click.option("--listen", type=str, default=None, help="Address to bind; IPv6 supported (e.g., ::1 or ::). Defaults from [global].listen or 127.0.0.1")
-@click.option("--port", type=int, default=None, help="Port to bind (defaults from [global].port or 20049)")
-@click.option("--public-host", type=str, default=None, help="Public hostname or IP advertised to peers")
-@click.option("--public-port", type=int, default=None, help="Public port advertised to peers (defaults to --port)")
+@click.option(
+    "--listen",
+    type=str,
+    default=None,
+    help="Address to bind; IPv6 supported (e.g., ::1 or ::). Defaults from [global].listen or 127.0.0.1",
+)
+@click.option(
+    "--port",
+    type=int,
+    default=None,
+    help="Port to bind (defaults from [global].port or 20049)",
+)
+@click.option(
+    "--public-host",
+    type=str,
+    default=None,
+    help="Public hostname or IP advertised to peers",
+)
+@click.option(
+    "--public-port",
+    type=int,
+    default=None,
+    help="Public port advertised to peers (defaults to --port)",
+)
 @click.option("--node-name", type=str, default=None, help="Human-readable node name")
-@click.option("--secret", type=str, default=None, help="Deterministic secret for keypair")
-@click.option("--auto-mine/--no-auto-mine", default=None, help="Enable/disable auto-mining when no peers found")
-@click.option("--peer", "peers", multiple=True, help="Peer host:port; use [IPv6]:port for IPv6 (repeat for multiple)")
+@click.option(
+    "--secret", type=str, default=None, help="Deterministic secret for keypair"
+)
+@click.option(
+    "--auto-mine/--no-auto-mine",
+    default=None,
+    help="Enable/disable auto-mining when no peers found",
+)
+@click.option(
+    "--peer",
+    "peers",
+    multiple=True,
+    help="Peer host:port; use [IPv6]:port for IPv6 (repeat for multiple)",
+)
 @click.option("--timeout", type=int, default=None, help="Node/network timeout seconds")
-@click.option("--heartbeat-interval", type=int, default=None, help="Seconds between heartbeats")
-@click.option("--heartbeat-timeout", type=int, default=None, help="Peer heartbeat timeout seconds")
+@click.option(
+    "--heartbeat-interval", type=int, default=None, help="Seconds between heartbeats"
+)
+@click.option(
+    "--heartbeat-timeout", type=int, default=None, help="Peer heartbeat timeout seconds"
+)
 @click.option("--fanout", type=int, default=None, help="Gossip fanout")
 # Logging options
-@click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default=None, help="Logging level")
-@click.option("--node-log", type=str, default=None, help="Path to main node log file (defaults to stderr)")
-@click.option("--http-log", type=str, default=None, help="Path to HTTP log file or 'stderr'/'stdout' for console (suppresses aiohttp logs if not set)")
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+    default=None,
+    help="Logging level",
+)
+@click.option(
+    "--node-log",
+    type=str,
+    default=None,
+    help="Path to main node log file (defaults to stderr)",
+)
+@click.option(
+    "--http-log",
+    type=str,
+    default=None,
+    help="Path to HTTP log file or 'stderr'/'stdout' for console (suppresses aiohttp logs if not set)",
+)
 # REST API options
-@click.option("--rest-port", type=int, default=None, help="REST API HTTPS port (-1 disables, defaults from [global].rest_port or -1)")
-@click.option("--rest-insecure-port", type=int, default=None, help="REST API HTTP port (-1 disables, defaults from [global].rest_insecure_port or 20050)")
+@click.option(
+    "--rest-port",
+    type=int,
+    default=None,
+    help="REST API HTTPS port (-1 disables, defaults from [global].rest_port or -1)",
+)
+@click.option(
+    "--rest-insecure-port",
+    type=int,
+    default=None,
+    help="REST API HTTP port (-1 disables, defaults from [global].rest_insecure_port or 20050)",
+)
 # CPU options
-@click.option("--num-cpus", type=int, default=None, help="Number of CPU miners to spawn (default 1)")
+@click.option(
+    "--num-cpus",
+    type=int,
+    default=None,
+    help="Number of CPU miners to spawn (default 1)",
+)
 # Other
-@click.option("--genesis-config", type=str, default="genesis_block.json", show_default=True, help="Genesis block configuration file")
+@click.option(
+    "--genesis-config",
+    type=str,
+    default="genesis_block.json",
+    show_default=True,
+    help="Genesis block configuration file",
+)
 @click.option("--debug-config", is_flag=True, help="Print final configuration as JSON")
 @click.pass_context
 def cpu(
@@ -331,7 +420,26 @@ def cpu(
     conf.pop("gpu", None)
     conf.pop("qpu", None)
 
-    conf = _apply_global_overrides(conf, listen, port, public_host, public_port, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log, rest_port, rest_insecure_port)
+    conf = _apply_global_overrides(
+        conf,
+        listen,
+        port,
+        public_host,
+        public_port,
+        node_name,
+        secret,
+        auto_mine,
+        list(peers) or None,
+        timeout,
+        heartbeat_interval,
+        heartbeat_timeout,
+        fanout,
+        log_level,
+        node_log,
+        http_log,
+        rest_port,
+        rest_insecure_port,
+    )
 
     # Handle CPU-specific configuration
     cpu_cfg = dict((conf.get("cpu") or {}))
@@ -340,7 +448,6 @@ def cpu(
     if not cpu_cfg:
         cpu_cfg = {"num_cpus": 1}
     conf["cpu"] = cpu_cfg
-
 
     # Use genesis config from TOML if CLI option is default and TOML has it
     if genesis_config == "genesis_block.json" and "genesis_config" in conf:
@@ -355,33 +462,124 @@ def cpu(
 
 @quip_network_node.command(name="gpu")
 # Global network options
-@click.option("--listen", type=str, default=None, help="Address to bind; IPv6 supported (e.g., ::1 or ::). Defaults from [global].listen or 127.0.0.1")
-@click.option("--port", type=int, default=None, help="Port to bind (defaults from [global].port or 20049)")
-@click.option("--public-host", type=str, default=None, help="Public hostname or IP advertised to peers")
-@click.option("--public-port", type=int, default=None, help="Public port advertised to peers (defaults to --port)")
+@click.option(
+    "--listen",
+    type=str,
+    default=None,
+    help="Address to bind; IPv6 supported (e.g., ::1 or ::). Defaults from [global].listen or 127.0.0.1",
+)
+@click.option(
+    "--port",
+    type=int,
+    default=None,
+    help="Port to bind (defaults from [global].port or 20049)",
+)
+@click.option(
+    "--public-host",
+    type=str,
+    default=None,
+    help="Public hostname or IP advertised to peers",
+)
+@click.option(
+    "--public-port",
+    type=int,
+    default=None,
+    help="Public port advertised to peers (defaults to --port)",
+)
 @click.option("--node-name", type=str, default=None, help="Human-readable node name")
-@click.option("--secret", type=str, default=None, help="Deterministic secret for keypair")
-@click.option("--auto-mine/--no-auto-mine", default=None, help="Enable/disable auto-mining when no peers found")
-@click.option("--peer", "peers", multiple=True, help="Peer host:port; use [IPv6]:port for IPv6 (repeat for multiple)")
+@click.option(
+    "--secret", type=str, default=None, help="Deterministic secret for keypair"
+)
+@click.option(
+    "--auto-mine/--no-auto-mine",
+    default=None,
+    help="Enable/disable auto-mining when no peers found",
+)
+@click.option(
+    "--peer",
+    "peers",
+    multiple=True,
+    help="Peer host:port; use [IPv6]:port for IPv6 (repeat for multiple)",
+)
 @click.option("--timeout", type=int, default=None, help="Node/network timeout seconds")
-@click.option("--heartbeat-interval", type=int, default=None, help="Seconds between heartbeats")
-@click.option("--heartbeat-timeout", type=int, default=None, help="Peer heartbeat timeout seconds")
+@click.option(
+    "--heartbeat-interval", type=int, default=None, help="Seconds between heartbeats"
+)
+@click.option(
+    "--heartbeat-timeout", type=int, default=None, help="Peer heartbeat timeout seconds"
+)
 @click.option("--fanout", type=int, default=None, help="Gossip fanout")
 # Logging options
-@click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default=None, help="Logging level")
-@click.option("--node-log", type=str, default=None, help="Path to main node log file (defaults to stderr)")
-@click.option("--http-log", type=str, default=None, help="Path to HTTP log file or 'stderr'/'stdout' for console (suppresses aiohttp logs if not set)")
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+    default=None,
+    help="Logging level",
+)
+@click.option(
+    "--node-log",
+    type=str,
+    default=None,
+    help="Path to main node log file (defaults to stderr)",
+)
+@click.option(
+    "--http-log",
+    type=str,
+    default=None,
+    help="Path to HTTP log file or 'stderr'/'stdout' for console (suppresses aiohttp logs if not set)",
+)
 # REST API options
-@click.option("--rest-port", type=int, default=None, help="REST API HTTPS port (-1 disables, defaults from [global].rest_port or -1)")
-@click.option("--rest-insecure-port", type=int, default=None, help="REST API HTTP port (-1 disables, defaults from [global].rest_insecure_port or 20050)")
+@click.option(
+    "--rest-port",
+    type=int,
+    default=None,
+    help="REST API HTTPS port (-1 disables, defaults from [global].rest_port or -1)",
+)
+@click.option(
+    "--rest-insecure-port",
+    type=int,
+    default=None,
+    help="REST API HTTP port (-1 disables, defaults from [global].rest_insecure_port or 20050)",
+)
 # GPU options
-@click.option("--gpu-backend", type=click.Choice(["local", "modal", "mps"], case_sensitive=False), default=None, help="GPU backend: local|modal|mps")
-@click.option("--device", "devices", multiple=True, help="GPU device(s) for local backend (e.g., 0 1)")
-@click.option("--gpu-type", "gpu_types", multiple=True, help="GPU type(s) for modal backend (e.g., t4 a10g)")
-@click.option("--gpu-utilization", type=int, default=100, help="GPU utilization percentage (1-100, default: 100)")
-@click.option("--yielding", is_flag=True, default=False, help="Yield GPU to other processes (NVML-adaptive nonce scaling)")
+@click.option(
+    "--gpu-backend",
+    type=click.Choice(["local", "modal", "mps"], case_sensitive=False),
+    default=None,
+    help="GPU backend: local|modal|mps",
+)
+@click.option(
+    "--device",
+    "devices",
+    multiple=True,
+    help="GPU device(s) for local backend (e.g., 0 1)",
+)
+@click.option(
+    "--gpu-type",
+    "gpu_types",
+    multiple=True,
+    help="GPU type(s) for modal backend (e.g., t4 a10g)",
+)
+@click.option(
+    "--gpu-utilization",
+    type=int,
+    default=100,
+    help="GPU utilization percentage (1-100, default: 100)",
+)
+@click.option(
+    "--yielding",
+    is_flag=True,
+    default=False,
+    help="Yield GPU to other processes (NVML-adaptive nonce scaling)",
+)
 # Other
-@click.option("--genesis-config", type=str, default="genesis_block.json", show_default=True, help="Genesis block configuration file")
+@click.option(
+    "--genesis-config",
+    type=str,
+    default="genesis_block.json",
+    show_default=True,
+    help="Genesis block configuration file",
+)
 @click.option("--debug-config", is_flag=True, help="Print final configuration as JSON")
 @click.pass_context
 def gpu(
@@ -421,7 +619,26 @@ def gpu(
     conf.pop("qpu", None)
 
     # Apply CLI overrides
-    conf = _apply_global_overrides(conf, listen, port, public_host, public_port, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log, rest_port, rest_insecure_port)
+    conf = _apply_global_overrides(
+        conf,
+        listen,
+        port,
+        public_host,
+        public_port,
+        node_name,
+        secret,
+        auto_mine,
+        list(peers) or None,
+        timeout,
+        heartbeat_interval,
+        heartbeat_timeout,
+        fanout,
+        log_level,
+        node_log,
+        http_log,
+        rest_port,
+        rest_insecure_port,
+    )
 
     # Build GPU config from CLI args as top-level device sections.
     # [gpu] holds global defaults; [cuda.N]/[metal]/[modal] hold devices.
@@ -462,33 +679,106 @@ def gpu(
 
 @quip_network_node.command(name="qpu")
 # Global network options
-@click.option("--listen", type=str, default=None, help="Address to bind; IPv6 supported (e.g., ::1 or ::). Defaults from [global].listen or 127.0.0.1")
-@click.option("--port", type=int, default=None, help="Port to bind (defaults from [global].port or 20049)")
-@click.option("--public-host", type=str, default=None, help="Public hostname or IP advertised to peers")
-@click.option("--public-port", type=int, default=None, help="Public port advertised to peers (defaults to --port)")
+@click.option(
+    "--listen",
+    type=str,
+    default=None,
+    help="Address to bind; IPv6 supported (e.g., ::1 or ::). Defaults from [global].listen or 127.0.0.1",
+)
+@click.option(
+    "--port",
+    type=int,
+    default=None,
+    help="Port to bind (defaults from [global].port or 20049)",
+)
+@click.option(
+    "--public-host",
+    type=str,
+    default=None,
+    help="Public hostname or IP advertised to peers",
+)
+@click.option(
+    "--public-port",
+    type=int,
+    default=None,
+    help="Public port advertised to peers (defaults to --port)",
+)
 @click.option("--node-name", type=str, default=None, help="Human-readable node name")
-@click.option("--secret", type=str, default=None, help="Deterministic secret for keypair")
-@click.option("--auto-mine/--no-auto-mine", default=None, help="Enable/disable auto-mining when no peers found")
-@click.option("--peer", "peers", multiple=True, help="Peer host:port; use [IPv6]:port for IPv6 (repeat for multiple)")
+@click.option(
+    "--secret", type=str, default=None, help="Deterministic secret for keypair"
+)
+@click.option(
+    "--auto-mine/--no-auto-mine",
+    default=None,
+    help="Enable/disable auto-mining when no peers found",
+)
+@click.option(
+    "--peer",
+    "peers",
+    multiple=True,
+    help="Peer host:port; use [IPv6]:port for IPv6 (repeat for multiple)",
+)
 @click.option("--timeout", type=int, default=None, help="Node/network timeout seconds")
-@click.option("--heartbeat-interval", type=int, default=None, help="Seconds between heartbeats")
-@click.option("--heartbeat-timeout", type=int, default=None, help="Peer heartbeat timeout seconds")
+@click.option(
+    "--heartbeat-interval", type=int, default=None, help="Seconds between heartbeats"
+)
+@click.option(
+    "--heartbeat-timeout", type=int, default=None, help="Peer heartbeat timeout seconds"
+)
 @click.option("--fanout", type=int, default=None, help="Gossip fanout")
 # Logging options
-@click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default=None, help="Logging level")
-@click.option("--node-log", type=str, default=None, help="Path to main node log file (defaults to stderr)")
-@click.option("--http-log", type=str, default=None, help="Path to HTTP log file or 'stderr'/'stdout' for console (suppresses aiohttp logs if not set)")
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+    default=None,
+    help="Logging level",
+)
+@click.option(
+    "--node-log",
+    type=str,
+    default=None,
+    help="Path to main node log file (defaults to stderr)",
+)
+@click.option(
+    "--http-log",
+    type=str,
+    default=None,
+    help="Path to HTTP log file or 'stderr'/'stdout' for console (suppresses aiohttp logs if not set)",
+)
 # REST API options
-@click.option("--rest-port", type=int, default=None, help="REST API HTTPS port (-1 disables, defaults from [global].rest_port or -1)")
-@click.option("--rest-insecure-port", type=int, default=None, help="REST API HTTP port (-1 disables, defaults from [global].rest_insecure_port or 20050)")
+@click.option(
+    "--rest-port",
+    type=int,
+    default=None,
+    help="REST API HTTPS port (-1 disables, defaults from [global].rest_port or -1)",
+)
+@click.option(
+    "--rest-insecure-port",
+    type=int,
+    default=None,
+    help="REST API HTTP port (-1 disables, defaults from [global].rest_insecure_port or 20050)",
+)
 # QPU options
 @click.option("--dwave-api-key", type=str, default=None, help="D-Wave API key")
 @click.option("--dwave-api-solver", type=str, default=None, help="D-Wave solver name")
-@click.option("--dwave-region-url", type=str, default=None, help="D-Wave SAPI region endpoint URL")
+@click.option(
+    "--dwave-region-url", type=str, default=None, help="D-Wave SAPI region endpoint URL"
+)
 # QPU time budget options
-@click.option("--qpu-daily-budget", type=str, default=None, help="Daily QPU time budget (e.g., 40s, 2m) - calculate from your Leap allocation")
+@click.option(
+    "--qpu-daily-budget",
+    type=str,
+    default=None,
+    help="Daily QPU time budget (e.g., 40s, 2m) - calculate from your Leap allocation",
+)
 # Other
-@click.option("--genesis-config", type=str, default="genesis_block.json", show_default=True, help="Genesis block configuration file")
+@click.option(
+    "--genesis-config",
+    type=str,
+    default="genesis_block.json",
+    show_default=True,
+    help="Genesis block configuration file",
+)
 @click.option("--debug-config", is_flag=True, help="Print final configuration as JSON")
 @click.pass_context
 def qpu(
@@ -526,7 +816,26 @@ def qpu(
     conf.pop("cpu", None)
 
     # Apply CLI overrides
-    conf = _apply_global_overrides(conf, listen, port, public_host, public_port, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log, rest_port, rest_insecure_port)
+    conf = _apply_global_overrides(
+        conf,
+        listen,
+        port,
+        public_host,
+        public_port,
+        node_name,
+        secret,
+        auto_mine,
+        list(peers) or None,
+        timeout,
+        heartbeat_interval,
+        heartbeat_timeout,
+        fanout,
+        log_level,
+        node_log,
+        http_log,
+        rest_port,
+        rest_insecure_port,
+    )
 
     # Build QPU config — CLI args populate a [dwave] section.
     dwave_cfg = dict(conf.get("dwave") or {})
@@ -567,16 +876,38 @@ def qpu(
 # quip-network-simulator
 # -----------------------------
 
+
 @click.group(name="quip-network-simulator", invoke_without_command=True)
-@click.option("--scenario", type=click.Choice(["mixed", "cpu", "gpu"], case_sensitive=False), default="mixed", show_default=True, help="Network scenario to launch")
+@click.option(
+    "--scenario",
+    type=click.Choice(["mixed", "cpu", "gpu"], case_sensitive=False),
+    default="mixed",
+    show_default=True,
+    help="Network scenario to launch",
+)
 @click.option("--num-cpu", type=int, default=None, help="Override: number of CPU nodes")
 @click.option("--num-gpu", type=int, default=None, help="Override: number of GPU nodes")
 @click.option("--num-qpu", type=int, default=None, help="Override: number of QPU nodes")
-@click.option("--base-port", type=int, default=8080, show_default=True, help="Starting port for first node")
+@click.option(
+    "--base-port",
+    type=int,
+    default=8080,
+    show_default=True,
+    help="Starting port for first node",
+)
 @click.option("--print-only", is_flag=True, help="Only print commands, do not execute")
 @click.option("--version", is_flag=True, help="Show version and exit")
 @click.pass_context
-def quip_network_simulator(ctx: click.Context, scenario: str, num_cpu: Optional[int], num_gpu: Optional[int], num_qpu: Optional[int], base_port: int, print_only: bool, version: bool):
+def quip_network_simulator(
+    ctx: click.Context,
+    scenario: str,
+    num_cpu: Optional[int],
+    num_gpu: Optional[int],
+    num_qpu: Optional[int],
+    base_port: int,
+    print_only: bool,
+    version: bool,
+):
     """Launch a local multi-node network using quip-network-node (separate processes).
 
     Subcommands:
@@ -617,17 +948,24 @@ def quip_network_simulator(ctx: click.Context, scenario: str, num_cpu: Optional[
 
     processes = []
 
-    def _cmd_for(kind: str, port: int, peer: Optional[str], rest_port: int) -> list[str]:
+    def _cmd_for(
+        kind: str, port: int, peer: Optional[str], rest_port: int
+    ) -> list[str]:
         # Pin both listen and public-host to 127.0.0.1: avoids public-IP
         # auto-detection (which causes children to advertise themselves on
         # the host's NAT'd public address and then fail JOINs against real
         # mainnet peers from the genesis config).
         base = [
-            "quip-network-node", kind,
-            "--listen", "127.0.0.1",
-            "--port", str(port),
-            "--public-host", "127.0.0.1",
-            "--rest-insecure-port", str(rest_port),
+            "quip-network-node",
+            kind,
+            "--listen",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--public-host",
+            "127.0.0.1",
+            "--rest-insecure-port",
+            str(rest_port),
         ]
         if peer:
             base += ["--peer", peer]
@@ -688,7 +1026,12 @@ def quip_network_simulator(ctx: click.Context, scenario: str, num_cpu: Optional[
 
 
 @quip_network_simulator.command(name="smoketest")
-@click.argument("target", type=click.Choice(["cpu", "gpu-local", "gpu-metal", "gpu-modal", "qpu"], case_sensitive=False))
+@click.argument(
+    "target",
+    type=click.Choice(
+        ["cpu", "gpu-local", "gpu-metal", "gpu-modal", "qpu"], case_sensitive=False
+    ),
+)
 @click.option("--print-only", is_flag=True, help="Only print command, do not execute")
 def quip_network_smoketest(target: str, print_only: bool):
     """Run a single-node smoke test.
@@ -856,22 +1199,436 @@ def quip_miner_bootstrap(
 # See faucet_bot.py for the full CLI surface.
 
 
+# --------------------------------------------------------------------------
+# Mining subcommands: cpu / gpu / qpu spawn the controller end-to-end.
+# Topology binding is explicit via --topology zephyr:M,T (defaults to Z(9,2)
+# which matches the legacy chain difficulty calibration). The CLI verifies
+# at startup that the sampler's topology hash matches the chain's snapshot;
+# mismatch fails fast with the registered hash printed so the operator can
+# fix --topology or re-seed the chain.
+# --------------------------------------------------------------------------
+
+
+def _parse_topology(spec: str):
+    """Parse a `family:m,t` topology spec and return the topology object.
+
+    Only zephyr is supported in Phase 5a; pegasus/chimera land later if
+    miners need them. Returns the sampler-compatible topology object so the
+    CLI can plug it straight into the spec's `args["topology"]`.
+    """
+    from dwave_topologies.topologies.zephyr import zephyr
+
+    if ":" not in spec:
+        raise click.BadParameter(
+            f"--topology must be 'family:m,t' (got {spec!r}); try 'zephyr:9,2'"
+        )
+    family, params = spec.split(":", 1)
+    if family.lower() != "zephyr":
+        raise click.BadParameter(
+            f"only 'zephyr' topology is supported in Phase 5a (got {family!r})"
+        )
+    try:
+        m_str, t_str = params.split(",")
+        m, t = int(m_str), int(t_str)
+        return zephyr(m, t)
+    except (ValueError, Exception) as exc:
+        raise click.BadParameter(
+            f"--topology zephyr:{params!r} is invalid: {exc}"
+        ) from exc
+
+
+async def _run_miner(
+    *,
+    kind: str,
+    node_url: str,
+    signer_key_path: str,
+    rest_port: int,
+    topology_spec: str,
+    miner_config: dict,
+):
+    """Shared entry point for `quip-miner cpu|gpu|qpu`.
+
+    Builds the keystore-loaded signer, a `MinerCore` with the requested
+    miner kind, two `SubstrateClient` instances (state + subscription),
+    and a `SubstrateMinerController`. Runs the controller until KeyboardInterrupt.
+    """
+    import asyncio
+    import signal as signal_module
+    from pathlib import Path
+
+    from shared.keystore import load
+    from shared.miner_core import MinerCore
+    from shared.substrate_client import SubstrateClient
+    from shared.substrate_miner_controller import SubstrateMinerController
+
+    keystore = load(Path(signer_key_path).expanduser())
+    click.echo(f"signer: {keystore.signer.ss58_address()}")
+
+    # Build the sampler topology and bind it to the miner config.
+    topology = _parse_topology(topology_spec)
+    click.echo(
+        f"topology: {topology_spec} ({topology.num_nodes} nodes, "
+        f"{topology.num_edges} edges)"
+    )
+
+    # Inject the topology into whichever miner kind is being constructed.
+    miner_config = _inject_topology(miner_config, kind, topology)
+
+    core = MinerCore(node_id="quip-miner", miners_config=miner_config)
+    try:
+        if not core.miner_handles:
+            click.echo(
+                f"no miner handles built for kind={kind}; check --num-cpus / "
+                f"GPU/QPU config",
+                err=True,
+            )
+            return 2
+
+        client = SubstrateClient(url=node_url)
+        await client.connect()
+        try:
+            # Verify the sampler topology matches the chain's registered topology
+            # before mining starts. Without this check, every proof would be rejected
+            # with InvalidTopology (Phase 4 confirmed this end-to-end).
+            head = await client.get_head()
+            snapshot = await client.get_mining_snapshot(
+                at=head,
+                miner_account_bytes=keystore.signer.account_id_bytes(),
+            )
+            if snapshot is None:
+                click.echo(
+                    "chain has no registered topology; run "
+                    "`quip-miner bootstrap --seed-chain` first",
+                    err=True,
+                )
+                return 3
+            expected_hash = _zephyr_topology_hash(topology)
+            if snapshot.topology_hash != expected_hash:
+                click.echo(
+                    f"topology mismatch: --topology {topology_spec} hashes to "
+                    f"0x{expected_hash.hex()} but chain has 0x{snapshot.topology_hash.hex()}; "
+                    "either adjust --topology or re-seed the chain",
+                    err=True,
+                )
+                return 4
+
+            controller = SubstrateMinerController(
+                client=client,
+                signer=keystore.signer,
+                miner_handles=core.miner_handles,
+                topology_hash=snapshot.topology_hash,
+            )
+            click.echo(
+                f"controller starting: handles={[h.miner_id for h in core.miner_handles]} "
+                f"topology_hash=0x{snapshot.topology_hash.hex()[:16]}..."
+            )
+
+            loop = asyncio.get_running_loop()
+            for sig in (signal_module.SIGINT, signal_module.SIGTERM):
+                loop.add_signal_handler(sig, controller.shutdown)
+
+            await controller.run()
+            click.echo(f"controller stopped: stats={controller.stats}")
+        finally:
+            await client.close()
+    finally:
+        core.close()
+    return 0
+
+
+def _inject_topology(miner_config: dict, kind: str, topology) -> dict:
+    """Stash the topology in the appropriate miner section's `args`.
+
+    The miner-builder paths in `MinerCore._initialize_miners` forward
+    `args["topology"]` straight to the sampler constructor.
+    """
+    out = dict(miner_config)
+    if kind == "cpu":
+        section = dict(out.get("cpu") or {})
+        args = dict(section.get("args") or {})
+        args["topology"] = topology
+        section["args"] = args
+        out["cpu"] = section
+    else:
+        # GPU/QPU sections are device-array shaped; topology injection happens
+        # at the spec level via _build_gpu_specs / _build_qpu_specs in a
+        # follow-on once GPU/QPU end-to-end is exercised against the chain.
+        click.echo(
+            f"warning: --topology injection not yet implemented for kind={kind!r}; "
+            "GPU/QPU samplers will use their default topology (Phase 6)",
+            err=True,
+        )
+    return out
+
+
+def _zephyr_topology_hash(topology) -> bytes:
+    """Compute the chain's blake2_256 topology hash from a Zephyr graph.
+
+    Matches `pallets/quantum-pow/src/topology.rs::hash_topology`:
+        blake2_256(SCALE((sorted nodes, sorted canonical edges)))
+    """
+    import hashlib
+
+    nodes = sorted(int(n) for n in topology.nodes)
+    edges = sorted(
+        (min(int(u), int(v)), max(int(u), int(v))) for u, v in topology.edges
+    )
+
+    def compact_len(n: int) -> bytes:
+        if n < 0x40:
+            return bytes([n << 2])
+        if n < 0x4000:
+            return ((n << 2) | 0b01).to_bytes(2, "little")
+        if n < 0x40000000:
+            return ((n << 2) | 0b10).to_bytes(4, "little")
+        raise ValueError(f"compact len {n} exceeds 30-bit range")
+
+    buf = compact_len(len(nodes))
+    for n in nodes:
+        buf += n.to_bytes(4, "little")
+    buf += compact_len(len(edges))
+    for u, v in edges:
+        buf += u.to_bytes(4, "little") + v.to_bytes(4, "little")
+    return hashlib.blake2b(buf, digest_size=32).digest()
+
+
+_NODE_URL_HELP = "Substrate node WebSocket URL (e.g. ws://localhost:9944)"
+_SIGNER_KEY_HELP = "Path to the signing keystore (created by `quip-miner keygen`)"
+_TOPOLOGY_HELP = (
+    "Topology spec for the miner's sampler. Format: 'family:m,t'. Must hash "
+    "to the chain's registered topology — mismatch fails fast at startup."
+)
+_REST_PORT_HELP = (
+    "Telemetry REST API port (set to -1 to disable; Phase 5b wires this in)"
+)
+
+
+@quip_miner.command("cpu")
+@click.option("--node-url", required=True, help=_NODE_URL_HELP)
+@click.option(
+    "--signer-key",
+    "signer_key_path",
+    type=click.Path(dir_okay=False),
+    default="~/.quip-miner/signing.json",
+    show_default=True,
+    help=_SIGNER_KEY_HELP,
+)
+@click.option(
+    "--num-cpus",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Number of CPU SA workers to spawn",
+)
+@click.option(
+    "--topology",
+    "topology_spec",
+    default="zephyr:9,2",
+    show_default=True,
+    help=_TOPOLOGY_HELP,
+)
+@click.option(
+    "--rest-port",
+    type=int,
+    default=-1,
+    show_default=True,
+    help=_REST_PORT_HELP,
+)
+def quip_miner_cpu(
+    node_url: str,
+    signer_key_path: str,
+    num_cpus: int,
+    topology_spec: str,
+    rest_port: int,
+) -> None:
+    """Run CPU SA miners against a substrate chain."""
+    import asyncio
+
+    miner_config = {"cpu": {"num_cpus": num_cpus}}
+    raise SystemExit(
+        asyncio.run(
+            _run_miner(
+                kind="cpu",
+                node_url=node_url,
+                signer_key_path=signer_key_path,
+                rest_port=rest_port,
+                topology_spec=topology_spec,
+                miner_config=miner_config,
+            )
+        )
+    )
+
+
+@quip_miner.command("gpu")
+@click.option("--node-url", required=True, help=_NODE_URL_HELP)
+@click.option(
+    "--signer-key",
+    "signer_key_path",
+    type=click.Path(dir_okay=False),
+    default="~/.quip-miner/signing.json",
+    show_default=True,
+    help=_SIGNER_KEY_HELP,
+)
+@click.option(
+    "--gpu-backend",
+    type=click.Choice(["local", "metal", "modal"], case_sensitive=False),
+    default="local",
+    show_default=True,
+    help="GPU backend: local CUDA, Apple Metal, or Modal cloud",
+)
+@click.option(
+    "--topology",
+    "topology_spec",
+    default="zephyr:9,2",
+    show_default=True,
+    help=_TOPOLOGY_HELP,
+)
+@click.option(
+    "--rest-port",
+    type=int,
+    default=-1,
+    show_default=True,
+    help=_REST_PORT_HELP,
+)
+def quip_miner_gpu(
+    node_url: str,
+    signer_key_path: str,
+    gpu_backend: str,
+    topology_spec: str,
+    rest_port: int,
+) -> None:
+    """Run a GPU miner (CUDA / Metal / Modal) against a substrate chain.
+
+    GPU end-to-end verification against the chain is a Phase 6 follow-on —
+    the controller and spec wiring work, but `--topology` injection for
+    GPU samplers landed in a single CPU-only path in Phase 5a. CUDA / Metal
+    samplers consume the topology via their `args` dict the same way the
+    CPU path does once that injection is generalised.
+    """
+    import asyncio
+
+    backend = gpu_backend.lower()
+    if backend == "local":
+        miner_config = {"cuda": [{"device": "0"}]}
+    elif backend == "metal":
+        miner_config = {"metal": [{}]}
+    elif backend == "modal":
+        miner_config = {"modal": [{"gpu_type": "t4"}]}
+    else:
+        raise click.BadParameter(f"unknown --gpu-backend: {backend}")
+
+    raise SystemExit(
+        asyncio.run(
+            _run_miner(
+                kind="gpu",
+                node_url=node_url,
+                signer_key_path=signer_key_path,
+                rest_port=rest_port,
+                topology_spec=topology_spec,
+                miner_config=miner_config,
+            )
+        )
+    )
+
+
+@quip_miner.command("qpu")
+@click.option("--node-url", required=True, help=_NODE_URL_HELP)
+@click.option(
+    "--signer-key",
+    "signer_key_path",
+    type=click.Path(dir_okay=False),
+    default="~/.quip-miner/signing.json",
+    show_default=True,
+    help=_SIGNER_KEY_HELP,
+)
+@click.option(
+    "--qpu-type",
+    type=click.Choice(["dwave", "ibm", "ionq", "pasqal", "braket", "origin"]),
+    default="dwave",
+    show_default=True,
+    help="QPU provider",
+)
+@click.option(
+    "--daily-budget",
+    type=str,
+    default=None,
+    help=(
+        "Daily QPU access-time budget. Format: '30s', '5m', '2h', '1d'. "
+        "Passed to QPUTimeManager; omit to run without a daily cap."
+    ),
+)
+@click.option(
+    "--topology",
+    "topology_spec",
+    default="zephyr:9,2",
+    show_default=True,
+    help=_TOPOLOGY_HELP,
+)
+@click.option(
+    "--rest-port",
+    type=int,
+    default=-1,
+    show_default=True,
+    help=_REST_PORT_HELP,
+)
+def quip_miner_qpu(
+    node_url: str,
+    signer_key_path: str,
+    qpu_type: str,
+    daily_budget,
+    topology_spec: str,
+    rest_port: int,
+) -> None:
+    """Run a QPU miner against a substrate chain.
+
+    Provider credentials come from the environment (e.g. DWAVE_API_KEY).
+    Same Phase 5a caveat as GPU: end-to-end against the chain is a Phase 6
+    item once topology binding generalises beyond CPU.
+    """
+    import asyncio
+
+    section: dict = {"type": qpu_type}
+    if daily_budget is not None:
+        section["daily_budget"] = daily_budget
+    miner_config = {qpu_type: [section]}
+
+    raise SystemExit(
+        asyncio.run(
+            _run_miner(
+                kind="qpu",
+                node_url=node_url,
+                signer_key_path=signer_key_path,
+                rest_port=rest_port,
+                topology_spec=topology_spec,
+                miner_config=miner_config,
+            )
+        )
+    )
+
+
 # Entry points for console_scripts
+
 
 def network_node_main():
     # Set multiprocessing start method to 'spawn' to avoid context mixing issues
-    multiprocessing.set_start_method('spawn', force=True)
+    multiprocessing.set_start_method("spawn", force=True)
 
     quip_network_node(standalone_mode=False)
 
+
 def network_simulator_main():
     # Set multiprocessing start method to 'spawn' to avoid context mixing issues
-    multiprocessing.set_start_method('spawn', force=True)
+    multiprocessing.set_start_method("spawn", force=True)
 
     quip_network_simulator(standalone_mode=False)
 
 
 def miner_main():
     """Entry point for the `quip-miner` console script."""
-    quip_miner(standalone_mode=False)
-
+    try:
+        quip_miner(standalone_mode=False)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        click.echo(f"quip-miner: error: {exc}", err=True)
+        raise SystemExit(1) from exc
