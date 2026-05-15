@@ -1,7 +1,7 @@
 """Shared persistent miner worker process and factory.
 
 This worker runs a loop handling commands from the parent process:
-- mine_block {block, requirements}
+- mine_work_item {context}
 - stop_mining
 - get_stats
 - shutdown
@@ -10,16 +10,17 @@ It constructs the correct concrete miner from a simple picklable spec dict:
   {"id": "CPU-1", "kind": "cpu", "args": {...},
    "cfg": {"difficulty_energy": -15500.0, "min_diversity": 0.38, "min_solutions": 70}}
 """
+
 from __future__ import annotations
 
 import time
 import traceback
 from shared.logging_config import QuipFormatter
 import logging
-import signal
 
 # Global logger for this module
 log = None
+
 
 def _setup_child_process_logging(log_queue=None):
     """Set up logging for child processes to use QuipFormatter and optionally queue logging."""
@@ -35,6 +36,7 @@ def _setup_child_process_logging(log_queue=None):
     if log_queue is not None:
         # Use queue handler to send logs to parent process
         from logging.handlers import QueueHandler
+
         queue_handler = QueueHandler(log_queue)
         root_logger.addHandler(queue_handler)
         root_logger.setLevel(logging.DEBUG)  # Let parent process filter
@@ -50,49 +52,23 @@ def _setup_child_process_logging(log_queue=None):
     module_logger = logging.getLogger(__name__)
     log = module_logger
 
+
 # Initialize module logger
 logger = logging.getLogger(__name__)
 
-import multiprocessing as mp
-import multiprocessing.synchronize as mpsync
-from typing import Any, Dict, Optional
+import multiprocessing as mp  # noqa: E402
+import multiprocessing.synchronize as mpsync  # noqa: E402
+from typing import Any, Dict, Optional  # noqa: E402
 
-import CPU
-import GPU
-import QPU
+import CPU  # noqa: E402
+import GPU  # noqa: E402
+import QPU  # noqa: E402
 
-def _signal_aware_mining_worker(spec: Dict[str, Any], block, node_info, requirements, prev_timestamp: int, mining_queue: mp.Queue, result_queue: mp.Queue):
-    """Dedicated mining worker process that handles mining with signal awareness."""
-    # mining_queue is reserved for future use
-    _ = mining_queue
-    
-    try:
-        # Set up logging for child process
-        _setup_child_process_logging()
-
-        # Build the miner
-        logger.info(f"Building miner in worker: kind={spec.get('kind')}, id={spec.get('id')}")
-        miner = build_miner_from_spec(spec)
-        logger.info(f"Miner built successfully in worker: {miner.miner_type} - {miner.miner_id}")
-
-        # Create a stop event that will never be set (child process doesn't monitor signals)
-        # The parent process will terminate this process via SIGTERM when needed
-        child_stop_event = mp.Event()
-        
-        # Perform the mining operation
-        result = miner.mine_block(block, node_info, requirements, prev_timestamp, child_stop_event)
-        
-        # Send result back to parent
-        if result is not None:
-            result_queue.put(result)
-            
-    except Exception as e:
-        # Log error and exit gracefully
-        import traceback
-        logger.error(f"Mining worker error: {e}")
-        logger.error(f"Traceback:\n{traceback.format_exc()}")
-
-    # Process exits naturally
+# NOTE: the legacy `_signal_aware_mining_worker` (a dedicated per-attempt
+# child process used by `MinerHandle.mine_with_timeout`) was removed in
+# v0.2 along with `BaseMiner.mine_block`. The substrate controller drives
+# cancellation directly via the persistent worker's shared `stop_event`,
+# so the second-process scaffolding is no longer needed.
 
 
 def build_miner_from_spec(spec: Dict[str, Any]):
@@ -109,42 +85,58 @@ def build_miner_from_spec(spec: Dict[str, Any]):
         return CPU.SimulatedAnnealingMiner(miner_id, **cfg, **args)
     elif kind == "metal":
         if not GPU.METAL_AVAILABLE:
-            raise RuntimeError("Metal miner requested but Metal is not available (requires macOS with Metal support)")
+            raise RuntimeError(
+                "Metal miner requested but Metal is not available (requires macOS with Metal support)"
+            )
         return GPU.MetalMiner(miner_id, **cfg, **args)
     elif kind == "cuda":
         if not GPU.CUDA_AVAILABLE:
-            raise RuntimeError("CUDA miner requested but CUDA is not available (requires CuPy and CUDA toolkit)")
+            raise RuntimeError(
+                "CUDA miner requested but CUDA is not available (requires CuPy and CUDA toolkit)"
+            )
         return GPU.CudaMiner(miner_id, **cfg, **args)
     elif kind == "modal":
         if not GPU.MODAL_AVAILABLE:
-            raise RuntimeError("Modal miner requested but Modal is not available (requires modal SDK: pip install modal)")
+            raise RuntimeError(
+                "Modal miner requested but Modal is not available (requires modal SDK: pip install modal)"
+            )
         return GPU.ModalMiner(miner_id, **cfg, **args)
     elif kind == "cuda-gibbs":
         if not GPU.CUDA_AVAILABLE:
             raise RuntimeError(
                 "CUDA Gibbs miner requested but not available "
-                "(requires CuPy and CUDA toolkit)")
+                "(requires CuPy and CUDA toolkit)"
+            )
         return GPU.CudaMiner(
-            miner_id, update_mode="gibbs", **cfg, **args,
+            miner_id,
+            update_mode="gibbs",
+            **cfg,
+            **args,
         )
     elif kind == "qpu":
         # Build QPU time config if daily budget is specified
         time_config = None
         if cfg.get("daily_budget"):
             from QPU.qpu_time_manager import QPUTimeConfig, parse_duration
+
             time_config = QPUTimeConfig(
                 daily_budget_seconds=parse_duration(cfg["daily_budget"]),
                 min_blocks_for_estimation=cfg.get("qpu_min_blocks_for_estimation", 5),
                 ema_alpha=cfg.get("qpu_ema_alpha", 0.3),
             )
             # Remove time config keys from cfg to avoid passing them to miner
-            cfg = {k: v for k, v in cfg.items()
-                   if k not in ("daily_budget", "qpu_min_blocks_for_estimation",
-                                "qpu_ema_alpha", "qpu_type")}
+            cfg = {
+                k: v
+                for k, v in cfg.items()
+                if k
+                not in (
+                    "daily_budget",
+                    "qpu_min_blocks_for_estimation",
+                    "qpu_ema_alpha",
+                    "qpu_type",
+                )
+            }
         return QPU.DWaveMiner(miner_id, time_config=time_config, **cfg)
-    elif kind == "cpu-filtered":
-        from CPU.sa_filtered_miner import SAFilteredMiner
-        return SAFilteredMiner(miner_id, **cfg)
     else:
         raise ValueError(f"Unknown miner kind '{kind}'")
 
@@ -193,41 +185,6 @@ def miner_worker_main(
             # Redundant with the parent's direct set(), but keeps the op
             # available for callers that only have the request queue.
             stop_event.set()
-        elif op == "mine_block":
-            prev_block = msg.get("block")
-            requirements = msg.get("requirements")
-            node_info = msg.get("node_info")
-            prev_timestamp = msg.get("prev_timestamp")
-            if prev_block is None or requirements is None or node_info is None or prev_timestamp is None:
-                resp_q.put({"op": "error", "message": "Missing node_info, block or requirements", "id": spec.get("id")})
-                continue
-            # NOTE: do not clear stop_event here. The parent clears it
-            # in mine() before enqueueing this op; if cancel() lands in
-            # the gap between that enqueue and our dequeue, the parent
-            # has already set() it and a clear here would silently wipe
-            # the cancel — exactly the original bug. Letting a set
-            # event short-circuit mine_block() is the desired behaviour
-            # (the cancellation reached us before mining started).
-            try:
-                result = miner.mine_block(prev_block, node_info, requirements, prev_timestamp, stop_event)
-            except Exception as exc:
-                # mine_block is expected to swallow sampling-path
-                # errors via _on_sampling_error. If anything raises
-                # through, dying here leaves the parent putting
-                # future mine_block ops into a queue nobody reads;
-                # mining silently stops and the orchestrator never
-                # knows. Log + report + stay alive so the next
-                # mine() op gets a fresh attempt.
-                import traceback
-                logger.error(
-                    f"[{miner.miner_id}] mine_block raised: "
-                    f"{type(exc).__name__}: {exc}\n"
-                    f"{traceback.format_exc()}"
-                )
-                resp_q.put({"op": "error", "message": f"{type(exc).__name__}: {exc}", "id": spec.get("id")})
-            else:
-                if result is not None:
-                    resp_q.put(result)
         elif op == "mine_work_item":
             # Substrate-mode entry point. The controller (Phase 4) pushes a
             # SubstrateMiningContext through the request queue; the worker
@@ -246,7 +203,13 @@ def miner_worker_main(
             # context against a stop_event tied to the new dispatch.
             context = msg.get("context")
             if context is None:
-                resp_q.put({"op": "error", "message": "Missing context for mine_work_item", "id": spec.get("id")})
+                resp_q.put(
+                    {
+                        "op": "error",
+                        "message": "Missing context for mine_work_item",
+                        "id": spec.get("id"),
+                    }
+                )
                 continue
             try:
                 result = miner.mine_work_item(context, stop_event)
@@ -256,19 +219,29 @@ def miner_worker_main(
                     f"{type(exc).__name__}: {exc}\n"
                     f"{traceback.format_exc()}"
                 )
-                resp_q.put({"op": "error", "message": f"{type(exc).__name__}: {exc}", "id": spec.get("id")})
+                resp_q.put(
+                    {
+                        "op": "error",
+                        "message": f"{type(exc).__name__}: {exc}",
+                        "id": spec.get("id"),
+                    }
+                )
             else:
                 if result is not None:
                     resp_q.put(result)
                 else:
                     resp_q.put({"op": "work_item_done", "id": spec.get("id")})
         else:
-            resp_q.put({"op": "error", "message": f"Unknown op {op}", "id": spec.get("id")})
-            logger.info(f"{miner.miner_id}: Unknown op {op}")
+            resp_q.put(
+                {"op": "error", "message": f"Unknown op {op}", "id": spec.get("id")}
+            )
+            logger.warning("%s: Unknown op %s", miner.miner_id, op)
             continue
+
 
 class MinerHandle:
     """Wrapper around a persistent miner worker process."""
+
     def __init__(self, spec: dict, log_queue: Optional[mp.Queue] = None):
         self.spec = spec
         self.req: mp.Queue = mp.Queue()
@@ -303,22 +276,9 @@ class MinerHandle:
             return f"GPU-LOCAL:{d}"
         if k == "metal":
             return "GPU-MPS"
-        if k == "cpu-filtered":
-            return "CPU-Filtered"
         if k == "cuda-gibbs":
             return "GPU-CUDA-Gibbs"
         return k.upper()
-
-    def mine(self, block, node_info, requirements, prev_timestamp: int = 0):
-        # Sole clear point for the shared cancel signal. The worker
-        # never clears it — clearing on either side of the queue would
-        # race with cancel() and silently wipe the signal (the original
-        # bug this MR fixes). Clearing here, before enqueueing, means
-        # any cancel() called between this clear and the worker
-        # dequeueing the op stays observable: the worker enters
-        # mine_block with stop_event already set and short-circuits.
-        self.stop_event.clear()
-        self.req.put({"op": "mine_block", "block": block, "node_info": node_info, "requirements": requirements, "prev_timestamp": prev_timestamp})
 
     def mine_work_item(self, context) -> None:
         """Dispatch a substrate-mode mining attempt.
@@ -350,59 +310,9 @@ class MinerHandle:
         if isinstance(msg, dict) and msg.get("op") == "stats":
             return msg.get("data", {})
         else:
-            raise ValueError(f"Miner {self.miner_id} did not respond to get_stats: {msg}")
-
-    def mine_with_timeout(self, block, node_info, requirements, prev_timestamp: int, stop_event) -> Optional[Any]:
-        """Mine a block with signal-responsive timeout using a dedicated child process."""
-        # Create a dedicated mining worker process for this operation
-        mining_queue = mp.Queue()
-        result_queue = mp.Queue()
-        
-        # Create mining process
-        mining_proc = mp.Process(
-            target=_signal_aware_mining_worker,
-            args=(self.spec, block, node_info, requirements, prev_timestamp, mining_queue, result_queue)
-        )
-        
-        mining_proc.start()
-        
-        try:
-            # Monitor stop_event while mining process runs
-            while mining_proc.is_alive():
-                if stop_event.is_set():
-                    # Send SIGTERM for graceful cleanup
-                    mining_proc.terminate()
-                    
-                    # Wait up to 2 seconds for graceful shutdown
-                    mining_proc.join(timeout=2.0)
-                    
-                    # Force kill if still alive
-                    if mining_proc.is_alive():
-                        mining_proc.kill()
-                        mining_proc.join(timeout=0.5)
-                    
-                    return None
-                
-                # Check every 100ms
-                time.sleep(0.1)
-            
-            # Process completed, get result
-            try:
-                result = result_queue.get_nowait()
-                return result
-            except Exception as e:
-                # Queue.Empty is expected when no result, other exceptions should be logged
-                if not str(type(e).__name__) == 'Empty':
-                    logger.debug(f"No result from mining worker: {type(e).__name__}: {e}")
-                return None
-                
-        finally:
-            # Cleanup: ensure process is terminated
-            if mining_proc.is_alive():
-                mining_proc.terminate()
-                mining_proc.join(timeout=1.0)
-                if mining_proc.is_alive():
-                    mining_proc.kill()
+            raise ValueError(
+                f"Miner {self.miner_id} did not respond to get_stats: {msg}"
+            )
 
     def close(self):
         self.req.put({"op": "shutdown"})
@@ -410,6 +320,6 @@ class MinerHandle:
             time.sleep(1)
             if self.proc.is_alive():
                 self.proc.terminate()
-                self.proc.join(timeout=0.1)       
+                self.proc.join(timeout=0.1)
         except Exception:
             pass

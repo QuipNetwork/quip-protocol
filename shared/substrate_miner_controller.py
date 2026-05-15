@@ -26,6 +26,7 @@ Key behaviors:
     into stale (continue) or fatal (exit) buckets.
   - On shutdown: cancel all handles, drain pending results, return.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -401,8 +402,7 @@ class SubstrateMinerController:
 
         self._current_context = context
         logger.info(
-            "new head: block=%d hash=0x%s... topology=0x%s... "
-            "nodes=%d edges=%d",
+            "new head: block=%d hash=0x%s... topology=0x%s... nodes=%d edges=%d",
             context.block_number,
             head_hash.hex()[:16],
             context.topology_hash.hex()[:16],
@@ -448,9 +448,7 @@ class SubstrateMinerController:
         try:
             encode_quantum_proof(envelope.result, envelope.context)
         except ValueError as exc:
-            raise RuntimeError(
-                f"proof encoding failed (bug): {exc}"
-            ) from exc
+            raise RuntimeError(f"proof encoding failed (bug): {exc}") from exc
 
         try:
             receipt = await submit_proof(
@@ -476,7 +474,15 @@ class SubstrateMinerController:
                 self.signer.ss58_address(),
             )
             if self.on_proof_submitted is not None:
-                await self.on_proof_submitted(receipt, envelope.context)
+                try:
+                    await self.on_proof_submitted(receipt, envelope.context)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "on_proof_submitted callback raised (proof was submitted): "
+                        "%s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
         elif outcome is SubmissionOutcome.STALE:
             self.stats.stale_drops += 1
             logger.info(
@@ -492,9 +498,7 @@ class SubstrateMinerController:
                 f"extrinsic={receipt.extrinsic_hash}"
             )
 
-    async def _await_handle_done(
-        self, handle: MinerHandle, *, timeout: float
-    ) -> None:
+    async def _await_handle_done(self, handle: MinerHandle, *, timeout: float) -> None:
         """Wait briefly for the worker to confirm cancellation.
 
         Pops one `work_item_done` sentinel from the handle's done queue
@@ -530,9 +534,7 @@ class SubstrateMinerController:
         loop = asyncio.get_running_loop()
         while not self._shutdown_event.is_set():
             try:
-                msg = await loop.run_in_executor(
-                    None, handle.resp.get, True, 0.5
-                )
+                msg = await loop.run_in_executor(None, handle.resp.get, True, 0.5)
             except _queue.Empty:
                 # Timed-out get; the common case. Loop and retry.
                 continue
@@ -582,6 +584,11 @@ class SubstrateMinerController:
                     self.stats.miner_errors[handle.miner_id],
                     msg.get("message"),
                 )
+                # Emit the same sentinel as work_item_done so
+                # _await_handle_done can synchronize after a mining error.
+                # Without this, every mining exception causes a guaranteed
+                # timeout on the next cancel.
+                self._done_queues[handle.miner_id].put_nowait(None)
             elif isinstance(msg, dict) and msg.get("op") == "stats":
                 # Stats responses are pulled directly by callers of
                 # handle.get_stats(); if one lands here it just means
@@ -590,6 +597,13 @@ class SubstrateMinerController:
                 # handle.get_stats() directly — the drainer dequeues the
                 # response first and blocks the caller forever.
                 pass
+            else:
+                logger.warning(
+                    "handle %s sent unrecognized message type=%s op=%s; dropping",
+                    handle.miner_id,
+                    type(msg).__name__,
+                    msg.get("op") if isinstance(msg, dict) else "n/a",
+                )
 
     async def _subscribe_heads(self) -> None:
         """Subscribe to new best heads and post into the head queue.
@@ -694,9 +708,7 @@ def classify_submission(receipt: ExtrinsicReceipt) -> SubmissionOutcome:
     # mine forever against a chain state we don't understand. Log the raw
     # error here so operators see the unrecognized text in the same line
     # as the classification decision.
-    logger.error(
-        "unrecognized submission error; classifying as fatal: %r", error
-    )
+    logger.error("unrecognized submission error; classifying as fatal: %r", error)
     return SubmissionOutcome.FATAL
 
 

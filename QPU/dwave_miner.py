@@ -16,7 +16,7 @@ init_logger = logging.getLogger(__name__)
 from QPU.dwave_sampler import DWaveSamplerWrapper, DefectInfo
 from QPU.qpu_time_manager import QPUTimeManager, QPUTimeConfig
 from shared.base_miner import BaseMiner
-from shared.block_requirements import BlockRequirements
+from shared.miner_types import BlockRequirements
 from shared.ising_feeder import IsingFeeder
 from shared.ising_model import IsingModel
 from dwave_topologies import DEFAULT_TOPOLOGY

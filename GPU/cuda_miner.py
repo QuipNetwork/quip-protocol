@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import List, Tuple
 
 from GPU.gpu_miner import GPUMiner
-from shared.block_requirements import BlockRequirements
+from shared.miner_types import BlockRequirements
 from dwave_topologies import DEFAULT_TOPOLOGY
 
 try:

@@ -95,12 +95,17 @@ async def test_mining_snapshot_either_returns_or_none(client):
     assert len(snapshot.edges) > 0
 
 
-async def test_query_balance_alice_funded(client):
+async def test_query_balance_returns_int(client):
+    """`query_balance` must return a non-negative int for any account
+    regardless of whether it's funded. Earlier versions of this test
+    asserted `//Alice` had > 10^18 plancks; that assumption broke when
+    the hybrid-sig chain merge changed the genesis account endowments
+    (no MultiSignature accounts are funded by default — funding happens
+    via the hybrid-aware paymaster flow in Phase 7)."""
     alice = Sr25519Signer.from_uri("//Alice")
     balance = await client.query_balance(alice.account_id_bytes())
-    # Alice has the genesis endowment on dev chains — exact amount varies but
-    # it must be very large.
-    assert balance > 10**18, f"//Alice balance unexpectedly small: {balance}"
+    assert isinstance(balance, int)
+    assert balance >= 0
 
 
 async def test_query_miner_unregistered_account(client):

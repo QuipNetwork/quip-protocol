@@ -20,7 +20,7 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import dimod
 
 from shared.base_miner import BaseMiner
-from shared.block_requirements import BlockRequirements
+from shared.miner_types import BlockRequirements
 from shared.ising_feeder import IsingFeeder
 from GPU.metal_sa import MetalSASampler
 from GPU.metal_scheduler import DutyCycleController, MetalScheduler
