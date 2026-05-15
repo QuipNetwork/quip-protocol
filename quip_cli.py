@@ -312,9 +312,12 @@ def _inject_topology(miner_config: dict, kind: str, topology) -> dict:
         args["topology"] = topology
         section["args"] = args
         out["cpu"] = section
-    # GPU/QPU sections are device-array shaped; topology injection happens
-    # at the spec level via _build_gpu_specs / _build_qpu_specs in a
-    # follow-on once GPU/QPU end-to-end is exercised against the chain.
+    else:
+        click.echo(
+            f"warning: --topology injection not yet implemented for kind={kind!r}; "
+            "GPU/QPU samplers will use their default topology (Phase 6)",
+            err=True,
+        )
     return out
 
 
