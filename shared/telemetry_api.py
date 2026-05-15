@@ -375,18 +375,29 @@ def _to_jsonable(obj: Any) -> Any:
     serializable"; calling `.value` on a ScaleType gives the decoded
     primitive (str / int / list / dict). Walk the structure and unwrap.
     """
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    # Render binary as 0x-hex to match the rest of the API surface
+    # (e.g. block hashes, account ids). Without this, raw `bytes` in the
+    # decoded header (parent hash, state root, digest payload) would
+    # stringify via repr() as `b'\\x00...'` — valid Python but useless
+    # to any dashboard parsing the response as hex.
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        return "0x" + bytes(obj).hex()
     if isinstance(obj, dict):
         return {k: _to_jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_to_jsonable(v) for v in obj]
-    if isinstance(obj, (str, int, float, bool)) or obj is None:
-        return obj
-    # ScaleType and friends carry the decoded value under `.value`. Fall
-    # back to repr() for anything else so the endpoint stays observable
-    # even if substrate-interface ever changes its return shape.
-    val = getattr(obj, "value", None)
-    if val is not None and val is not obj:
-        return _to_jsonable(val)
+    # ScaleType and friends carry the decoded value under `.value`. Use
+    # `hasattr` rather than `getattr(..., None)`: a ScaleType that legit
+    # decodes to `None` (e.g. an empty `Option<T>`) should serialize as
+    # JSON `null`, not as `repr(obj)`.
+    if hasattr(obj, "value"):
+        val = obj.value
+        if val is not obj:
+            return _to_jsonable(val)
+    # Fall back to repr() so the endpoint stays observable even if
+    # substrate-interface ever changes its return shape.
     return repr(obj)
 
 

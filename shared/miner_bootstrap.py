@@ -229,10 +229,22 @@ async def _maybe_seed_chain(
         await client.query_difficulty() is None or config.force_reseed_difficulty
     )
     if needs_seed:
-        logger.info(
-            "seeding QuantumPow.Difficulty via sudo (force=%s)",
-            config.force_reseed_difficulty,
-        )
+        if config.force_reseed_difficulty:
+            # Defense in depth: `_assert_dev_chain` above already refused
+            # non-dev chains, but log a loud warning when we're about to
+            # overwrite an existing on-chain difficulty so the action is
+            # never invisible. Production CLI doesn't expose the flag.
+            logger.warning(
+                "force-reseeding QuantumPow.Difficulty via sudo: "
+                "min_solutions=%d max_energy_milli=%d min_diversity_milli=%d "
+                "min_quality_milli=%d",
+                config.seed_difficulty.min_solutions,
+                config.seed_difficulty.max_energy_milli,
+                config.seed_difficulty.min_diversity_milli,
+                config.seed_difficulty.min_quality_milli,
+            )
+        else:
+            logger.info("seeding QuantumPow.Difficulty via sudo (first time)")
         await _sudo_call(
             client,
             sudo_signer,

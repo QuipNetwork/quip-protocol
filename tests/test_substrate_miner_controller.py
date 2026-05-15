@@ -616,8 +616,17 @@ async def _live_controller(
         controller.shutdown()
         try:
             await asyncio.wait_for(run_task, timeout=10)
-        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+        except (asyncio.TimeoutError, asyncio.CancelledError):
             pass
+        except Exception:
+            # Surface a real controller-shutdown bug in test logs rather
+            # than swallowing it. The test has already yielded its
+            # assertions, so we log here and move on rather than masking
+            # the original failure with this one.
+            import logging
+            logging.getLogger(__name__).exception(
+                "controller.run() raised during _live_controller teardown"
+            )
         await client.close()
         # When `core` owns the handle, let `core.close()` tear it down; the
         # caller is responsible for that. Otherwise we built the handle
@@ -679,7 +688,7 @@ async def test_controller_long_haul_multi_block(tmp_path):
     a proof every 10-30s; a 5-minute budget for ≥3 proofs gives comfortable
     headroom even on a slow shared dev machine.
     """
-    TARGET_PROOFS = 3
+    target_proofs = 3
 
     async with _live_controller(tmp_path) as (
         controller, _run_task, _handle, keystore, client,
@@ -687,7 +696,7 @@ async def test_controller_long_haul_multi_block(tmp_path):
         proof_event = asyncio.Event()
 
         async def on_proof(receipt, ctx):
-            if controller.stats.proofs_submitted >= TARGET_PROOFS:
+            if controller.stats.proofs_submitted >= target_proofs:
                 proof_event.set()
 
         controller.on_proof_submitted = on_proof
@@ -695,12 +704,17 @@ async def test_controller_long_haul_multi_block(tmp_path):
             await asyncio.wait_for(proof_event.wait(), timeout=300)
         except asyncio.TimeoutError:
             pytest.fail(
-                f"only {controller.stats.proofs_submitted}/{TARGET_PROOFS} "
+                f"only {controller.stats.proofs_submitted}/{target_proofs} "
                 f"proofs in 300s. stats={controller.stats}"
             )
 
-        assert controller.stats.proofs_submitted >= TARGET_PROOFS
+        assert controller.stats.proofs_submitted >= target_proofs
         assert controller.stats.submission_errors == 0
+        # Phase 5b's stale-result-drop fix: drops should stay near-zero
+        # across multiple proofs. Allow a small tolerance for genuine
+        # head-change races (a proof completes just as a new head arrives),
+        # but a regression that drops every other result would breach this.
+        assert controller.stats.stale_drops <= target_proofs
         # Chain-side counter should reflect at least one acceptance.
         # `MinerInfo.proofs_submitted` lags briefly behind the controller's
         # local counter because the chain only writes after extrinsic

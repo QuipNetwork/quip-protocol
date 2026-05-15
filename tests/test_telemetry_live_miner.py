@@ -21,6 +21,9 @@ import socket
 import aiohttp
 import pytest
 
+from dwave_topologies.topologies.zephyr import zephyr
+from shared.miner_core import MinerCore
+from shared.telemetry_api import TelemetryApiServer
 # Reuse the live-chain bootstrap context manager.
 from tests.test_substrate_miner_controller import (
     DEFAULT_URL,
@@ -56,10 +59,6 @@ async def test_telemetry_reflects_live_miner_state(tmp_path):
            `total_blocks_attempted`, and `total_blocks_won` updating
          - `/api/v1/block/latest` returns chain data shaped correctly
     """
-    from dwave_topologies.topologies.zephyr import zephyr
-    from shared.miner_core import MinerCore
-    from shared.telemetry_api import TelemetryApiServer
-
     seed_topology_mt = (9, 2)
     miners_config = {
         "cpu": {
@@ -85,6 +84,22 @@ async def test_telemetry_reflects_live_miner_state(tmp_path):
                 port=_pick_free_port(),
             )
             await server.start()
+
+            # Set the proof callback BEFORE the smoke HTTP probes — on a
+            # fast box the first proof can land while we're hitting the
+            # status endpoints. If we waited to set the callback, the
+            # event would never fire and the test would time out.
+            proof_seen = asyncio.Event()
+
+            async def on_proof(receipt, ctx):
+                proof_seen.set()
+
+            controller.on_proof_submitted = on_proof
+            # If a proof has already landed before we wired the callback
+            # (the controller has been running since `_live_controller`
+            # yielded), set the event manually.
+            if controller.stats.proofs_submitted >= 1:
+                proof_seen.set()
 
             try:
                 base = f"http://{server.host}:{server.port}"
@@ -124,13 +139,10 @@ async def test_telemetry_reflects_live_miner_state(tmp_path):
                     # Wait for at least one proof acceptance so the stats
                     # endpoint has live numbers to surface. The unit test
                     # in test_telemetry_api.py already exercises the
-                    # zero-state response; here we want non-zero.
-                    proof_seen = asyncio.Event()
-
-                    async def on_proof(receipt, ctx):
-                        proof_seen.set()
-
-                    controller.on_proof_submitted = on_proof
+                    # zero-state response; here we want non-zero. Callback
+                    # was wired before the smoke probes so this `wait` is
+                    # tight: it returns immediately if a proof already
+                    # landed during the smoke loop.
                     try:
                         await asyncio.wait_for(proof_seen.wait(), timeout=150)
                     except asyncio.TimeoutError:

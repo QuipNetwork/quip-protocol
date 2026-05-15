@@ -74,6 +74,11 @@ class SubstrateClient:
         # leak into the public return value). Serialize every blocking
         # call behind this lock — same fix the standalone faucet uses
         # for the same problem.
+        #
+        # Lazy-instantiated in `connect()` so the `asyncio.Lock` binds
+        # to the running event loop (Lock captures the loop at __init__
+        # time). Don't move this to `SubstrateClient.__init__` — clients
+        # are typically constructed before the loop is set up.
         self._call_lock: Optional[asyncio.Lock] = None
 
     # ------------------------------------------------------------------
@@ -442,6 +447,14 @@ class SubstrateClient:
         response). Instead, the block-hash lookup and the user coroutine are
         both scheduled on the asyncio loop via ``run_coroutine_threadsafe``,
         where ``_run`` puts the blocking RPC on the executor.
+
+        The subscribe call itself bypasses ``_call_lock``: substrate-interface
+        keeps the websocket in receive mode for the subscription's lifetime,
+        which would otherwise hold the lock forever and deadlock every other
+        ``_run`` caller — including ``_handle_head``'s ``get_block_hash``
+        below. Callers that need to share a client across submissions and
+        subscriptions should pass a dedicated ``subscription_client`` to the
+        controller (the controller already enforces this).
         """
         loop = asyncio.get_running_loop()
 
@@ -487,10 +500,14 @@ class SubstrateClient:
                     update_nr, exc,
                 )
 
-        await self._run(
+        # Bypass `_call_lock` for the long-lived subscribe — see docstring.
+        # `_handle_head` above goes through `_run` which acquires the lock
+        # normally, so the receive-side calls remain properly serialised.
+        await loop.run_in_executor(
+            None,
             lambda: self._iface.subscribe_block_headers(
                 _dispatch, finalized_only=finalized_only
-            )
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -500,11 +517,14 @@ class SubstrateClient:
     async def _run(self, fn):
         """Run a blocking substrate-interface call on the default executor.
 
-        All callers go through this method, so the `_call_lock` taken here
-        guarantees serial access to the underlying `SubstrateInterface`.
-        Before `connect()` runs the lock is `None`; that path is only used
-        during construction (e.g., to open the websocket itself) where
-        concurrency isn't possible.
+        Almost all callers go through this method, so the `_call_lock`
+        taken here guarantees serial access to the underlying
+        `SubstrateInterface`. The exception is `subscribe_new_heads`,
+        which intentionally bypasses the lock — see its docstring.
+
+        When `_call_lock` is `None` we're before `connect()` finishes,
+        in which case `connect()` itself is the only caller (single-
+        threaded setup) and the lock would be redundant.
         """
         loop = self._loop or asyncio.get_running_loop()
         if self._call_lock is None:

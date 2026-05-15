@@ -33,7 +33,7 @@ import asyncio
 import queue as _queue
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, Protocol
 
 from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
@@ -48,6 +48,19 @@ from shared.substrate_types import (
 
 
 logger = get_logger("substrate_miner_controller")
+
+
+class _MinerCoreStats(Protocol):
+    """Subset of `shared.miner_core.MinerCore` the controller depends on.
+
+    Structural type rather than direct `MinerCore` import keeps the
+    controller usable without a full MinerCore (e.g., a thin test
+    double), while still catching signature drift at type-check time.
+    """
+
+    def record_dispatch(self) -> None: ...
+
+    def record_result(self, *, winning_miner_id: str, mining_time: float) -> None: ...
 
 
 # Threshold for consecutive `None` snapshots before the controller raises.
@@ -168,7 +181,7 @@ class SubstrateMinerController:
             Callable[[ExtrinsicReceipt, SubstrateMiningContext], Awaitable[None]]
         ] = None,
         subscription_client: Optional[SubstrateClient] = None,
-        core: Optional[Any] = None,
+        core: Optional[_MinerCoreStats] = None,
     ) -> None:
         if not miner_handles:
             raise ValueError(
