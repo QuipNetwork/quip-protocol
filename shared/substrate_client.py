@@ -246,10 +246,14 @@ class SubstrateClient:
 
     async def get_head(self) -> bytes:
         """Best block hash as raw bytes."""
-        return bytes.fromhex(_strip_0x(await self._run(self._iface.get_chain_head)))
+        return bytes.fromhex(
+            _strip_0x(await self._run(lambda: self._iface.get_chain_head()))
+        )
 
     async def get_finalized_head(self) -> bytes:
-        return bytes.fromhex(_strip_0x(await self._run(self._iface.get_chain_finalised_head)))
+        return bytes.fromhex(
+            _strip_0x(await self._run(lambda: self._iface.get_chain_finalised_head()))
+        )
 
     async def get_block_number(self, at: Optional[bytes] = None) -> int:
         block_hash = _hex(at) if at is not None else None

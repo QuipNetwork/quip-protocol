@@ -192,6 +192,57 @@ async def test_run_does_not_recurse_when_reconnect_also_dies():
         await client._run(dying_call)
 
 
+@pytest.mark.asyncio
+async def test_head_methods_call_new_iface_after_failover(monkeypatch):
+    """`get_head()` and `get_finalized_head()` must hit the *current*
+    `self._iface` after a failover swap, not a stale captured method.
+
+    Each iface instance records its own call count. After reconnect()
+    the second iface should serve the head/finalized queries.
+    """
+
+    class _IfaceWithHead:
+        _next_id = 0
+
+        def __init__(self, url: str) -> None:
+            self.url = url
+            type(self)._next_id += 1
+            self.id = type(self)._next_id
+            self.head_calls = 0
+            self.finalized_calls = 0
+
+        def get_chain_head(self) -> str:
+            self.head_calls += 1
+            return "0x" + f"{self.id:064x}"
+
+        def get_chain_finalised_head(self) -> str:
+            self.finalized_calls += 1
+            return "0x" + f"{self.id:064x}"
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(sc_module, "SubstrateInterface", _IfaceWithHead)
+
+    client = SubstrateClient(urls=["ws://a:9944", "ws://b:9944"])
+    await client.connect()
+    first_iface = client._iface
+    await client.get_head()
+    assert first_iface.head_calls == 1
+
+    await client.reconnect()
+    second_iface = client._iface
+    assert second_iface is not first_iface
+
+    await client.get_head()
+    await client.get_finalized_head()
+    # New iface received both calls; old iface untouched after reconnect.
+    assert second_iface.head_calls == 1
+    assert second_iface.finalized_calls == 1
+    assert first_iface.head_calls == 1  # unchanged
+    assert first_iface.finalized_calls == 0
+
+
 def test_no_validator_reachable_str_lists_each_attempt():
     """The exception's str() includes every URL and its failure reason."""
     err = NoValidatorReachable(
