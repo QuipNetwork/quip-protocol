@@ -115,7 +115,11 @@ class SubstrateClient:
         url: Optional[str] = None,
         *,
         urls: Optional[Sequence[str]] = None,
+        pool: Optional[Any] = None,
     ) -> None:
+        # `pool` is typed as `Any` to avoid a circular import with
+        # `shared.validator_pool`. Duck-typed: pool just needs an
+        # `async advance_rotation(from_url: str) -> str` method.
         if url is not None and urls is not None:
             raise ValueError(
                 "SubstrateClient: pass exactly one of `url=` or `urls=`, not both"
@@ -147,6 +151,11 @@ class SubstrateClient:
         # recurse failover->failover->… One failover attempt per `_run`,
         # period.
         self._reentrant_failover: bool = False
+        # Optional ValidatorPool. When set, `_run`'s failover handler
+        # delegates the URL choice to the pool instead of running the
+        # client's own circular rotation — so multiple clients sharing
+        # one pool advance in lockstep on a validator death.
+        self._pool: Optional[Any] = pool
         self._iface: Optional[SubstrateInterface] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # `SubstrateInterface` keeps a single websocket and isn't safe
@@ -174,18 +183,32 @@ class SubstrateClient:
         self._call_lock = asyncio.Lock()
         await self._connect_from_index(0)
 
-    async def reconnect(self) -> None:
+    async def reconnect(self, *, target_url: Optional[str] = None) -> None:
         """Drop the current iface and rotate to the next healthy validator.
 
-        Walks `self._urls` circularly starting at (current_index + 1), so a
-        live validator gets picked even if it sits *behind* the dead one in
-        the list. Falls back to the original URL on the final attempt — a
-        transient blip on the primary should still recover.
+        Default walk (no `target_url`): start at `(current_index + 1)`
+        and walk circularly, so a live validator gets picked even if it
+        sits *behind* the dead one in the list, and a transient blip on
+        the primary can still recover by wrap-around.
+
+        Pool-driven walk (`target_url` set): start at the URL the pool
+        chose. If that URL is also dead, the walk continues forward
+        from there — the pool may simply have been one step behind
+        reality.
 
         Raises `NoValidatorReachable` if every URL refuses.
         """
         await self._close_iface()
-        start = (self._current_index + 1) % len(self._urls)
+        if target_url is not None:
+            try:
+                start = self._urls.index(target_url)
+            except ValueError:
+                # Pool gave us a URL we don't know about — shouldn't
+                # happen since pool was built from our URL list, but
+                # be defensive: fall back to the default walk.
+                start = (self._current_index + 1) % len(self._urls)
+        else:
+            start = (self._current_index + 1) % len(self._urls)
         await self._connect_from_index(start)
 
     async def _connect_from_index(self, start: int) -> None:
@@ -821,7 +844,17 @@ class SubstrateClient:
                 # May raise NoValidatorReachable — that's the intended
                 # signal upstream. The original exception is shadowed in
                 # that case; operators get the structured attempt log.
-                await self.reconnect()
+                if self._pool is not None:
+                    # Pool-driven rotation: ask the pool which URL to
+                    # move to. The pool coordinates across all slots so
+                    # exactly one rotation event fires per validator
+                    # death even if multiple slots noticed.
+                    target = await self._pool.advance_rotation(
+                        from_url=self.current_url
+                    )
+                    await self.reconnect(target_url=target)
+                else:
+                    await self.reconnect()
             finally:
                 self._reentrant_failover = False
             # Reconnect succeeded. The current call is still lost — the

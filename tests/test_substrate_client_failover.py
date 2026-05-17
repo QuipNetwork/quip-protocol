@@ -243,6 +243,95 @@ async def test_head_methods_call_new_iface_after_failover(monkeypatch):
     assert first_iface.finalized_calls == 0
 
 
+# ----------------------------------------------------------------------
+# Pool integration — SubstrateClient delegates rotation to a ValidatorPool
+# ----------------------------------------------------------------------
+
+
+class _SpyPool:
+    """Stub ValidatorPool that records advance_rotation calls and returns
+    a scripted sequence of next URLs."""
+
+    def __init__(self, urls, advance_returns):
+        self.urls = tuple(urls)
+        self._advance_returns = list(advance_returns)
+        self.advance_calls: list[str] = []
+
+    async def advance_rotation(self, from_url: str) -> str:
+        self.advance_calls.append(from_url)
+        return self._advance_returns.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_pool_kwarg_defers_failover_to_pool():
+    """With `pool=` set, `_run`'s failover handler calls
+    `pool.advance_rotation(from_url=current)` to pick the next URL —
+    not the client's own circular rotation."""
+    import websocket as ws_module
+
+    pool = _SpyPool(
+        urls=["ws://a:9944", "ws://b:9944", "ws://c:9944"],
+        # Pool says "skip directly to C" even though B comes next in
+        # local rotation — proves the pool is in control.
+        advance_returns=["ws://c:9944"],
+    )
+    client = SubstrateClient(urls=pool.urls, pool=pool)
+    await client.connect()
+    assert client.current_url == "ws://a:9944"
+
+    def dying_call():
+        raise ws_module.WebSocketConnectionClosedException("dropped")
+
+    with pytest.raises(ws_module.WebSocketConnectionClosedException):
+        await client._run(dying_call)
+
+    assert pool.advance_calls == ["ws://a:9944"]
+    assert client.current_url == "ws://c:9944"  # pool's pick, not client's
+
+
+@pytest.mark.asyncio
+async def test_no_pool_uses_local_rotation_unchanged():
+    """Without pool=, the client's own circular rotation runs (existing
+    behavior preserved). Regression for the back-compat shim."""
+    import websocket as ws_module
+
+    client = SubstrateClient(urls=["ws://a:9944", "ws://b:9944"])
+    await client.connect()
+    assert client.current_url == "ws://a:9944"
+
+    def dying_call():
+        raise ws_module.WebSocketConnectionClosedException("dropped")
+
+    with pytest.raises(ws_module.WebSocketConnectionClosedException):
+        await client._run(dying_call)
+
+    # Local rotation, not pool-driven: lands on B (the next URL in list).
+    assert client.current_url == "ws://b:9944"
+
+
+@pytest.mark.asyncio
+async def test_reconnect_target_url_pins_first_attempt():
+    """`reconnect(target_url='ws://c')` starts the rotation walk at C
+    so the client lands on C (or falls forward if C is dead)."""
+    client = SubstrateClient(urls=["ws://a:9944", "ws://b:9944", "ws://c:9944"])
+    await client.connect()
+    assert client.current_url == "ws://a:9944"
+    await client.reconnect(target_url="ws://c:9944")
+    assert client.current_url == "ws://c:9944"
+
+
+@pytest.mark.asyncio
+async def test_reconnect_target_url_falls_forward_when_target_dead():
+    """If the pool's chosen URL turns out to be dead too, the walk
+    continues from there. (Pool might be one step behind reality.)"""
+    _StubInterface.bad_urls = {"ws://c:9944"}
+    client = SubstrateClient(urls=["ws://a:9944", "ws://b:9944", "ws://c:9944"])
+    await client.connect()
+    await client.reconnect(target_url="ws://c:9944")
+    # C was dead, walk wraps to A and lands there.
+    assert client.current_url == "ws://a:9944"
+
+
 def test_no_validator_reachable_str_lists_each_attempt():
     """The exception's str() includes every URL and its failure reason."""
     err = NoValidatorReachable(
