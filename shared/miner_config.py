@@ -1,19 +1,17 @@
 """TOML config loader and CLI-merge helper for `quip-miner`.
 
-Schema:
+Schema (keys actually read by the CLI today):
 
     [miner]
     validators = ["ws://primary:9944", "ws://standby:9944"]
     signer_key = "~/.quip-miner/signing.json"
     faucet_url = "http://localhost:8087"   # optional
-    topology   = "zephyr:9,2"              # default
-    rest_port  = -1
 
-    [miner.cpu]
-    num_cpus = 4
-
-    [miner.gpu]
-    backend = "metal"
+Any other keys in `[miner]` (or nested `[miner.cpu]` / `[miner.gpu]` /
+`[miner.qpu]` subtables) are parsed but ignored — CLI flags are the
+only driver for `topology`, `rest_port`, and per-backend settings in
+v0.2. Don't add keys to this docstring without wiring them through
+`_resolve_runtime_config` first.
 
 CLI flags override TOML on a per-key basis. Empty CLI values
 (`None`, empty tuple/list) do *not* clobber TOML so operators can mix
@@ -25,9 +23,14 @@ strings; type errors fail fast at load time, before we touch the chain.
 """
 from __future__ import annotations
 
-import tomllib
+import sys
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover -- exercised on 3.10 only
+    import tomli as tomllib
 
 
 class MinerConfigError(ValueError):

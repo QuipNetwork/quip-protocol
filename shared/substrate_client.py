@@ -757,11 +757,19 @@ class SubstrateClient:
         async def _handle_head(number: int) -> None:
             # The dispatch callback can fire after `close()` has cleared
             # `self._iface` — the reader thread keeps draining for a beat
-            # after the websocket is told to close. Bail quietly in that
-            # window rather than raising AttributeError into the future's
-            # done-callback.
+            # after the websocket is told to close. Same condition holds
+            # briefly during `reconnect()` between `_close_iface` and the
+            # new `_connect_from_index` assignment. Log at debug so the
+            # in-flight notification isn't silently invisible during a
+            # failover, then bail rather than raising AttributeError into
+            # the future's done-callback.
             iface = self._iface
             if iface is None:
+                logger.debug(
+                    "subscribe_new_heads: dropping head number=%s — "
+                    "iface is None (close() or reconnect() in flight)",
+                    number,
+                )
                 return
             block_hash_hex = await self._run(
                 lambda: iface.get_block_hash(block_id=number)
