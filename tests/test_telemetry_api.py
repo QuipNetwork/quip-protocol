@@ -3,7 +3,9 @@
 import asyncio
 import json
 import os
+import time
 
+import aiohttp
 import pytest
 from aiohttp.test_utils import AioHTTPTestCase
 from unittest.mock import MagicMock
@@ -16,10 +18,7 @@ from shared.telemetry_cache import TelemetryCache
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _write_json(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f)
+from _utils import write_json as _write_json  # noqa: E402
 
 
 def _make_block_json(block_index, epoch_ts):
@@ -60,12 +59,18 @@ def _populate_telemetry(base_dir):
     tdir = os.path.join(base_dir, "telemetry")
     os.makedirs(tdir, exist_ok=True)
     _write_json(os.path.join(tdir, "nodes.json"), _make_nodes_json())
-    epoch = "1775167182"
+    epoch = "abababababababab"
+    full_block_1_hash = "ab" * 32
     for i in range(1, 4):
         _write_json(
             os.path.join(tdir, epoch, f"{i}.json"),
-            _make_block_json(i, int(epoch)),
+            _make_block_json(i, 1775167182),
         )
+    _write_json(os.path.join(tdir, "current_epoch.json"), {
+        "epoch": epoch,
+        "block_1_hash": full_block_1_hash,
+        "updated_at": "2026-04-02T23:31:53.610902+00:00",
+    })
     return tdir
 
 
@@ -129,7 +134,7 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
         body = await resp.json()
         assert body["success"] is True
         assert body["data"]["total_blocks"] == 3
-        assert body["data"]["latest_epoch"] == "1775167182"
+        assert body["data"]["latest_epoch"] == "abababababababab"
 
     async def test_status_etag_304(self):
         resp1 = await self.client.request("GET", "/api/v1/telemetry/status")
@@ -167,7 +172,7 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
 
     async def test_block(self):
         resp = await self.client.request(
-            "GET", "/api/v1/telemetry/epochs/1775167182/blocks/1",
+            "GET", "/api/v1/telemetry/epochs/abababababababab/blocks/1",
         )
         assert resp.status == 200
         body = await resp.json()
@@ -175,7 +180,7 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
 
     async def test_block_not_found(self):
         resp = await self.client.request(
-            "GET", "/api/v1/telemetry/epochs/1775167182/blocks/99",
+            "GET", "/api/v1/telemetry/epochs/abababababababab/blocks/99",
         )
         assert resp.status == 404
 
@@ -187,11 +192,11 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
 
     async def test_block_etag_304(self):
         resp1 = await self.client.request(
-            "GET", "/api/v1/telemetry/epochs/1775167182/blocks/1",
+            "GET", "/api/v1/telemetry/epochs/abababababababab/blocks/1",
         )
         etag = resp1.headers.get("ETag")
         resp2 = await self.client.request(
-            "GET", "/api/v1/telemetry/epochs/1775167182/blocks/1",
+            "GET", "/api/v1/telemetry/epochs/abababababababab/blocks/1",
             headers={"If-None-Match": etag},
         )
         assert resp2.status == 304
@@ -201,11 +206,103 @@ class TestTelemetryEndpoints(AioHTTPTestCase):
         assert resp.status == 200
         body = await resp.json()
         assert body["data"]["block_index"] == 3
-        assert body["data"]["epoch"] == "1775167182"
+        assert body["data"]["epoch"] == "abababababababab"
 
     async def test_non_telemetry_unaffected(self):
         resp = await self.client.request("GET", "/health")
         assert resp.status == 200
+
+    async def test_blocks_range_default(self):
+        resp = await self.client.request(
+            "GET", "/api/v1/telemetry/epochs/abababababababab/blocks",
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        data = body["data"]
+        assert data["epoch"] == "abababababababab"
+        assert data["start"] == 1
+        assert data["count"] == 3
+        assert data["next_start"] is None
+        assert data["limit_cap"] == 1000
+        indices = [b["block_index"] for b in data["blocks"]]
+        assert indices == [1, 2, 3]
+
+    async def test_blocks_range_with_limit(self):
+        resp = await self.client.request(
+            "GET",
+            "/api/v1/telemetry/epochs/abababababababab/blocks?start=1&limit=2",
+        )
+        assert resp.status == 200
+        data = (await resp.json())["data"]
+        assert data["count"] == 2
+        assert [b["block_index"] for b in data["blocks"]] == [1, 2]
+        # limit=2 stops at block 2 but epoch's last is 3 → must paginate
+        assert data["next_start"] == 3
+
+    async def test_blocks_range_pagination_end(self):
+        resp = await self.client.request(
+            "GET",
+            "/api/v1/telemetry/epochs/abababababababab/blocks?start=3&limit=1000",
+        )
+        data = (await resp.json())["data"]
+        assert data["count"] == 1
+        assert data["next_start"] is None
+
+    async def test_blocks_range_start_clamped_up(self):
+        # Epoch's first_block is 1; asking for start=-0 or below should
+        # either 400 or clamp up. We chose: negative = 400, zero = 400.
+        resp = await self.client.request(
+            "GET",
+            "/api/v1/telemetry/epochs/abababababababab/blocks?start=0",
+        )
+        assert resp.status == 400
+        body = await resp.json()
+        assert body["code"] == "INVALID_RANGE"
+
+    async def test_blocks_range_negative_start(self):
+        resp = await self.client.request(
+            "GET",
+            "/api/v1/telemetry/epochs/abababababababab/blocks?start=-5",
+        )
+        assert resp.status == 400
+        assert (await resp.json())["code"] == "INVALID_RANGE"
+
+    async def test_blocks_range_non_numeric(self):
+        resp = await self.client.request(
+            "GET",
+            "/api/v1/telemetry/epochs/abababababababab/blocks?start=abc",
+        )
+        assert resp.status == 400
+        assert (await resp.json())["code"] == "INVALID_RANGE"
+
+    async def test_blocks_range_limit_capped(self):
+        resp = await self.client.request(
+            "GET",
+            "/api/v1/telemetry/epochs/abababababababab/blocks?start=1&limit=5000",
+        )
+        assert resp.status == 200
+        data = (await resp.json())["data"]
+        assert data["limit_cap"] == 1000
+        # The test fixture only has 3 blocks, so count is 3 regardless.
+        assert data["count"] == 3
+
+    async def test_blocks_range_unknown_epoch(self):
+        resp = await self.client.request(
+            "GET", "/api/v1/telemetry/epochs/9999999/blocks",
+        )
+        assert resp.status == 404
+        assert (await resp.json())["code"] == "EPOCH_NOT_FOUND"
+
+    async def test_blocks_range_past_end(self):
+        resp = await self.client.request(
+            "GET",
+            "/api/v1/telemetry/epochs/abababababababab/blocks?start=999&limit=10",
+        )
+        assert resp.status == 200
+        data = (await resp.json())["data"]
+        assert data["count"] == 0
+        assert data["blocks"] == []
+        assert data["next_start"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -299,3 +396,56 @@ class TestTelemetryRateLimit(AioHTTPTestCase):
         # Health should still work
         resp = await self.client.request("GET", "/health")
         assert resp.status == 200
+
+
+# ---------------------------------------------------------------------------
+# SSE shutdown tests
+# ---------------------------------------------------------------------------
+
+async def test_stop_cancels_sse_streams(tmp_path):
+    """stop() must unblock in-flight SSE handlers without waiting 15s.
+
+    The SSE keepalive loop sleeps 15s between pings. Without explicit
+    task cancellation, stop() would return but handler tasks would
+    linger in the sleep, delaying full shutdown and leaking tasks.
+    """
+    tdir = _populate_telemetry(str(tmp_path))
+    cache = TelemetryCache(telemetry_dir=tdir, refresh_interval=60)
+    await cache._refresh()
+
+    server = RestApiServer(
+        network_node=MockNetworkNode(),
+        host="127.0.0.1",
+        port=0,  # random free port
+        tls_port=-1,
+        telemetry_cache=cache,
+        telemetry_access_token="",
+        telemetry_rate_limit_rpm=600,
+    )
+    await server.start()
+    try:
+        # Resolve the ephemeral port the runner bound to.
+        sockets = server._http_runner.addresses
+        assert sockets, "HTTP runner has no bound sockets"
+        host, port = sockets[0][0], sockets[0][1]
+        url = f"http://{host}:{port}/api/v1/telemetry/stream"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                assert resp.status == 200
+                # Give the handler a moment to register and enter sleep.
+                await asyncio.sleep(0.1)
+                assert len(server._sse_clients) == 1
+
+                t0 = time.monotonic()
+                await server.stop()
+                elapsed = time.monotonic() - t0
+    finally:
+        # stop() is idempotent; ensure cleanup even on test failure.
+        if server._http_runner is not None:
+            await server.stop()
+
+    assert elapsed < 2.0, (
+        f"stop() took {elapsed:.2f}s; SSE handler was not cancelled"
+    )
+    assert server._sse_clients == []

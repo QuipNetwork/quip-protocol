@@ -39,6 +39,34 @@ class MockNetworkNode:
         mock_info.version = "0.0.1"
         return mock_info
 
+    def descriptor(self):
+        """Return a minimal NodeDescriptor-shaped dict."""
+        return {
+            "descriptor_version": 1,
+            "node_name": "test-node",
+            "public_host": "127.0.0.1",
+            "public_port": 20049,
+            "auto_mine": False,
+            "log_level": "INFO",
+            "runtime": {
+                "python": "3.14.0",
+                "quip_version": "0.0.1",
+                "protocol_version": 2,
+                "in_docker": False,
+                "docker_image": None,
+            },
+            "miners": {},
+            "system_info": {
+                "os": {"system": "Linux", "release": "test", "machine": "x86_64"},
+                "cpu": {
+                    "logical_cores": 1, "physical_cores": 1,
+                    "brand": "Test CPU", "arch": "x86_64",
+                },
+                "memory_mb": 1024,
+                "gpus": [],
+            },
+        }
+
     def get_latest_block(self):
         """Return mock latest block."""
         return self._create_mock_block(10)
@@ -229,6 +257,60 @@ class TestRestApiEndpoints(AioHTTPTestCase):
         """Test OPTIONS request for CORS preflight."""
         resp = await self.client.request("OPTIONS", "/api/v1/status")
         assert resp.status == 200
+        assert "Access-Control-Allow-Methods" in resp.headers
+
+    async def test_root_index_returns_endpoint_list(self):
+        """GET / returns a self-describing endpoint index."""
+        resp = await self.client.request("GET", "/")
+        assert resp.status == 200
+
+        data = await resp.json()
+        assert data["success"] is True
+        endpoints = data["data"]["endpoints"]
+        paths = {(e["method"], e["path"]) for e in endpoints}
+
+        # Core public endpoints must be discoverable from the index.
+        assert ("GET", "/") in paths
+        assert ("GET", "/health") in paths
+        assert ("GET", "/api/v1/status") in paths
+        assert ("GET", "/api/v1/peers") in paths
+        assert ("GET", "/api/v1/block/latest") in paths
+        assert ("POST", "/api/v1/heartbeat") in paths
+        assert ("POST", "/api/v1/join") in paths
+
+        # Each entry exposes a human-readable description.
+        for entry in endpoints:
+            assert entry.get("description")
+
+    async def test_root_index_omits_telemetry_when_disabled(self):
+        """Index must not advertise telemetry endpoints when disabled."""
+        resp = await self.client.request("GET", "/")
+        assert resp.status == 200
+
+        data = await resp.json()
+        paths = [e["path"] for e in data["data"]["endpoints"]]
+        assert not any(p.startswith("/api/v1/telemetry/") for p in paths)
+
+    async def test_unknown_path_returns_404(self):
+        """Regression: unknown paths returned 405 via OPTIONS catch-all.
+
+        Users hitting '/status' or '/nodes' previously got 405 Method
+        Not Allowed, which made it look like the endpoint existed but
+        required some other format. The fix returns a clear 404 with
+        code=NOT_FOUND pointing to the index.
+        """
+        for path in ("/status", "/nodes", "/does-not-exist"):
+            resp = await self.client.request("GET", path)
+            assert resp.status == 404, f"expected 404 for {path}, got {resp.status}"
+            body = await resp.json()
+            assert body["success"] is False
+            assert body["code"] == "NOT_FOUND"
+
+    async def test_unknown_path_options_returns_cors_200(self):
+        """OPTIONS on unknown paths must still succeed so CORS preflight works."""
+        resp = await self.client.request("OPTIONS", "/does-not-exist")
+        assert resp.status == 200
+        assert resp.headers.get("Access-Control-Allow-Origin") == "*"
         assert "Access-Control-Allow-Methods" in resp.headers
 
 

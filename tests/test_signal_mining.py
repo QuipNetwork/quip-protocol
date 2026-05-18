@@ -107,8 +107,8 @@ class TestSignalResponsiveMining:
         try:
             stop_event = mp.Event()
             
-            # Let it mine for 1 second, then signal stop
-            time.sleep(1.0)
+            # Let the worker spin up briefly, then signal stop
+            time.sleep(0.2)
             signal_time = time.time()
             stop_event.set()
             
@@ -144,8 +144,8 @@ class TestSignalResponsiveMining:
         try:
             stop_event = mp.Event()
             
-            # Let it mine for 1 second, then signal stop
-            time.sleep(1.0)
+            # Let the worker spin up briefly, then signal stop
+            time.sleep(0.2)
             signal_time = time.time()
             stop_event.set()
             
@@ -181,8 +181,8 @@ class TestSignalResponsiveMining:
         try:
             stop_event = mp.Event()
             
-            # Let it mine for 1 second, then signal stop
-            time.sleep(1.0)
+            # Let the worker spin up briefly, then signal stop
+            time.sleep(0.2)
             signal_time = time.time()
             stop_event.set()
             
@@ -218,8 +218,8 @@ class TestSignalResponsiveMining:
         try:
             stop_event = mp.Event()
             
-            # Let it mine for 1 second, then signal stop
-            time.sleep(1.0)
+            # Let the worker spin up briefly, then signal stop
+            time.sleep(0.2)
             signal_time = time.time()
             stop_event.set()
             
@@ -255,8 +255,8 @@ class TestSignalResponsiveMining:
         try:
             stop_event = mp.Event()
             
-            # Let it mine for 1 second, then signal stop
-            time.sleep(1.0)
+            # Let the worker spin up briefly, then signal stop
+            time.sleep(0.2)
             signal_time = time.time()
             stop_event.set()
             

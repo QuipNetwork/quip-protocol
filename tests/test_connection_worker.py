@@ -6,16 +6,20 @@ import pytest
 
 from shared.connection_worker import ConnectionWorkerHandle
 
-# QUIC connection cleanup to unreachable peers takes ~15s (aioquic retries
-# UDP Initial packets, then wait_connected times out, then __aexit__ runs
-# the close handshake). Test deadlines account for this.
-_UNREACHABLE_PEER_TIMEOUT = 20.0
+# Worker passes a short connect_timeout so the underlying NodeClient
+# caps both the QUIC handshake wait AND aioquic's close handshake
+# (by clamping idle_timeout). Unreachable peers fail in ~1 s instead
+# of ~15 s, keeping this file well under its 30 s per-test timeout.
+_FAST_CONNECT_TIMEOUT = 1.0
+_UNREACHABLE_PEER_TIMEOUT = 5.0
 
 
 @pytest.fixture
 def worker():
     """Create a connection worker, tear it down after the test."""
-    handle = ConnectionWorkerHandle(node_timeout=5.0)
+    handle = ConnectionWorkerHandle(
+        node_timeout=5.0, connect_timeout=_FAST_CONNECT_TIMEOUT,
+    )
     handle.start()
     yield handle
     if handle.is_alive():
@@ -77,13 +81,13 @@ def test_worker_crash_recovery():
     handle.close()
 
 
-@pytest.mark.timeout(45)
+@pytest.mark.timeout(15)
 def test_concurrent_peers_faster_than_sequential(worker):
     """Multiple unreachable peers are tried concurrently, not sequentially.
 
-    Each unreachable peer takes ~15s (QUIC handshake timeout + connection
-    cleanup). Sequentially that would be ~45s for 3 peers. Concurrently
-    it should complete in roughly one peer's timeout.
+    With a 1 s connect cap per peer, sequential would be ~3 s for three
+    peers. Concurrent dispatch should complete in roughly one peer's
+    timeout plus the polling margin.
     """
     peers = ["127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3"]
     worker.request_connections(
@@ -97,12 +101,13 @@ def test_concurrent_peers_faster_than_sequential(worker):
     )
 
     t0 = time.perf_counter()
-    collected = _poll_until(worker, count=3, timeout=30.0)
+    collected = _poll_until(worker, count=3, timeout=_UNREACHABLE_PEER_TIMEOUT)
     elapsed = time.perf_counter() - t0
 
     assert len(collected) == 3
-    # Sequential would take ~45s. Concurrent should be ~15s + overhead.
-    assert elapsed < 25.0, f"Took {elapsed:.1f}s, expected < 25s for concurrent peers"
+    # Sequential would be ~3 * connect_timeout. Concurrent should land
+    # near one connect_timeout plus polling margin.
+    assert elapsed < 3.0, f"Took {elapsed:.1f}s, expected < 3s for concurrent peers"
 
 
 def test_close_is_idempotent():

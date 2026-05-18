@@ -6,6 +6,7 @@ Runs alongside the QUIC server on a separate port.
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -84,8 +85,9 @@ class RestApiServer:
         logger: Optional[logging.Logger] = None,
         telemetry_cache: Optional['TelemetryCache'] = None,
         telemetry_access_token: str = "",
-        telemetry_rate_limit_rpm: int = 30,
+        telemetry_rate_limit_rpm: int = 60,
         telemetry_max_sse: int = 20,
+        solve_rate_limit_rpm: int = 10,
     ):
         """
         Initialize the REST API server.
@@ -102,6 +104,7 @@ class RestApiServer:
             telemetry_access_token: Bearer token for telemetry (empty=open).
             telemetry_rate_limit_rpm: Requests/minute per IP for telemetry.
             telemetry_max_sse: Max concurrent SSE connections.
+            solve_rate_limit_rpm: Requests/minute per IP for /api/v1/solve.
         """
         self.node = network_node
         self.host = host
@@ -115,13 +118,41 @@ class RestApiServer:
         self._telemetry_cache = telemetry_cache
         self._telemetry_token = telemetry_access_token
         tokens_per_sec = telemetry_rate_limit_rpm / 60.0
+        # Burst floor of 10 lets a dashboard make a handful of parallel
+        # reads (status + nodes + epochs + latest + a block) without
+        # tripping 429. The *5 multiplier still scales burst with
+        # sustained rate for higher configured rpms.
         self._telemetry_rate_limiter = PeerRateLimiter(
             tokens_per_second=tokens_per_sec,
-            max_burst=max(int(tokens_per_sec * 5), 3),
+            max_burst=max(int(tokens_per_sec * 5), 10),
         )
         self._telemetry_max_sse = telemetry_max_sse
         self._sse_clients: List[web.StreamResponse] = []
+        # Guards check-then-append / iterate-and-remove on _sse_clients.
+        self._sse_lock = asyncio.Lock()
+        # Tracks pending background writes per client so we can drop
+        # slow consumers instead of accumulating unbounded write tasks.
+        self._sse_pending: "dict[web.StreamResponse, int]" = {}
+        # Handler tasks for active SSE streams. stop() cancels these so
+        # clients sleeping in the keepalive loop exit immediately
+        # instead of lingering up to 15s past shutdown.
+        self._sse_tasks: "set[asyncio.Task]" = set()
         self._rate_limit_prune_task: Optional[asyncio.Task] = None
+
+        # /api/v1/solve rate limiter and cached DWaveSampler. Solve is
+        # expensive (Leap RTT + anneal time), so we serve one request
+        # at a time via a shared sampler instead of spinning one up
+        # per request on the event loop thread.
+        solve_tokens_per_sec = solve_rate_limit_rpm / 60.0
+        self._solve_rate_limiter = PeerRateLimiter(
+            tokens_per_second=solve_tokens_per_sec,
+            max_burst=max(int(solve_tokens_per_sec * 5), 3),
+        )
+        self._dwave_sampler: Optional[Any] = None
+        self._dwave_sampler_init_lock = asyncio.Lock()
+        # QPU is a single hardware resource; serialize sample_ising
+        # calls on the cached sampler.
+        self._dwave_sampler_sample_lock = asyncio.Lock()
 
         self._http_runner: Optional[web.AppRunner] = None
         self._https_runner: Optional[web.AppRunner] = None
@@ -136,11 +167,15 @@ class RestApiServer:
 
         app = web.Application(middlewares=middlewares)
 
+        # Root index (self-describing API map)
+        app.router.add_get("/", self.handle_index)
+
         # Health check
         app.router.add_get("/health", self.handle_health)
 
         # API v1 routes
         app.router.add_get("/api/v1/status", self.handle_status)
+        app.router.add_get("/api/v1/system", self.handle_system)
         app.router.add_get("/api/v1/stats", self.handle_stats)
         app.router.add_get("/api/v1/peers", self.handle_peers)
         app.router.add_get("/api/v1/block/latest", self.handle_get_latest_block)
@@ -164,6 +199,10 @@ class RestApiServer:
                 "/api/v1/telemetry/epochs", self.handle_telemetry_epochs,
             )
             app.router.add_get(
+                "/api/v1/telemetry/epochs/{epoch}/blocks",
+                self.handle_telemetry_blocks_range,
+            )
+            app.router.add_get(
                 "/api/v1/telemetry/epochs/{epoch}/blocks/{block_index}",
                 self.handle_telemetry_block,
             )
@@ -181,8 +220,12 @@ class RestApiServer:
             app.router.add_static("/.well-known", well_known, show_index=False)
             self.logger.info(f"Serving static files from {well_known} at /.well-known/")
 
-        # OPTIONS handler for CORS preflight
-        app.router.add_route("OPTIONS", "/{path:.*}", self.handle_options)
+        # Universal catch-all: serves CORS preflight for unknown paths
+        # and returns 404 JSON (not aiohttp's default 405) for any other
+        # method. A method-specific OPTIONS catch-all would create a
+        # resource that matches every path, making unknown GET/POST
+        # return 405 Method Not Allowed instead of 404 Not Found.
+        app.router.add_route("*", "/{path:.*}", self.handle_not_found)
 
         return app
 
@@ -194,9 +237,12 @@ class RestApiServer:
         if self._telemetry_cache is not None:
             self._telemetry_cache.on_new_block = self._sse_push_block
             self._telemetry_cache.on_nodes_changed = self._sse_push_nodes
-            self._rate_limit_prune_task = asyncio.create_task(
-                self._prune_rate_limiter_loop(),
-            )
+
+        # Rate-limiter pruning runs unconditionally: the solve limiter
+        # always exists even when telemetry is disabled.
+        self._rate_limit_prune_task = asyncio.create_task(
+            self._prune_rate_limiter_loop(),
+        )
 
         # Start HTTP server (always)
         self._http_runner = web.AppRunner(self._app)
@@ -234,6 +280,13 @@ class RestApiServer:
         if self._rate_limit_prune_task and not self._rate_limit_prune_task.done():
             self._rate_limit_prune_task.cancel()
 
+        # Cancel in-flight SSE handler tasks. Without this, any client
+        # suspended in the 15s keepalive sleep would linger past
+        # shutdown.  write_eof alone can't interrupt a sleeping task.
+        sse_tasks = list(self._sse_tasks)
+        for task in sse_tasks:
+            task.cancel()
+
         # Close SSE connections
         for client in list(self._sse_clients):
             try:
@@ -242,6 +295,12 @@ class RestApiServer:
                 pass
         self._sse_clients.clear()
 
+        # Wait for cancelled handlers to unwind so their finally
+        # blocks finish cleanup before the app runner tears sockets
+        # down underneath them.
+        if sse_tasks:
+            await asyncio.gather(*sse_tasks, return_exceptions=True)
+
         if self._http_runner:
             await self._http_runner.cleanup()
             self._http_runner = None
@@ -249,6 +308,13 @@ class RestApiServer:
         if self._https_runner:
             await self._https_runner.cleanup()
             self._https_runner = None
+
+        if self._dwave_sampler is not None:
+            try:
+                await asyncio.to_thread(self._dwave_sampler.close)
+            except Exception as e:
+                self.logger.warning(f"Failed to close DWaveSampler: {e}")
+            self._dwave_sampler = None
 
         self.logger.info("REST API server stopped")
 
@@ -279,9 +345,76 @@ class RestApiServer:
 
     # Handler implementations
 
-    async def handle_options(self, request: web.Request) -> web.Response:
-        """Handle OPTIONS request for CORS preflight."""
-        return web.Response()
+    def _endpoint_index(self) -> List[dict]:
+        """Build the public endpoint catalog served at GET /.
+
+        Telemetry entries only appear when the cache is configured,
+        matching the conditional registration in _create_app.
+        """
+        entries = [
+            {"method": "GET", "path": "/", "description": "API endpoint index (this response)"},
+            {"method": "GET", "path": "/health", "description": "Liveness check"},
+            {"method": "GET", "path": "/api/v1/status", "description": "Node status, peers count, latest block"},
+            {"method": "GET", "path": "/api/v1/system", "description": "Node hardware survey and whitelisted config"},
+            {"method": "GET", "path": "/api/v1/stats", "description": "Mining and network statistics"},
+            {"method": "GET", "path": "/api/v1/peers", "description": "Known peer map"},
+            {"method": "GET", "path": "/api/v1/block/latest", "description": "Latest accepted block"},
+            {"method": "GET", "path": "/api/v1/block/{block_number}", "description": "Block by index"},
+            {"method": "GET", "path": "/api/v1/block/{block_number}/header", "description": "Block header by index"},
+            {"method": "POST", "path": "/api/v1/join", "description": "Announce this node and fetch peers"},
+            {"method": "POST", "path": "/api/v1/block", "description": "Submit a block (debug)"},
+            {"method": "POST", "path": "/api/v1/gossip", "description": "Forward a gossip message"},
+            {"method": "POST", "path": "/api/v1/solve", "description": "Submit Ising solve request (rate-limited)"},
+            {"method": "POST", "path": "/api/v1/heartbeat", "description": "Peer heartbeat"},
+        ]
+        if self._telemetry_cache is not None:
+            entries.extend([
+                {"method": "GET", "path": "/api/v1/telemetry/status", "description": "Telemetry status snapshot"},
+                {"method": "GET", "path": "/api/v1/telemetry/nodes", "description": "Telemetry node roster"},
+                {"method": "GET", "path": "/api/v1/telemetry/epochs", "description": "Available telemetry epochs"},
+                {"method": "GET", "path": "/api/v1/telemetry/epochs/{epoch}/blocks", "description": "Telemetry block range (bulk cold-sync; ?start=&limit=)"},
+                {"method": "GET", "path": "/api/v1/telemetry/epochs/{epoch}/blocks/{block_index}", "description": "Telemetry block detail"},
+                {"method": "GET", "path": "/api/v1/telemetry/latest", "description": "Latest telemetry block"},
+                {"method": "GET", "path": "/api/v1/telemetry/stream", "description": "Server-sent events stream"},
+            ])
+        return entries
+
+    async def handle_index(self, request: web.Request) -> web.Response:
+        """GET / - Self-describing API index.
+
+        Returns the public endpoint catalog so callers can discover
+        routes without reading source or separate docs.
+        """
+        return self._success_response({
+            "name": "QuIP REST API",
+            "version": get_version(),
+            "response_envelope": {
+                "success": "bool",
+                "data": "object (when success=true)",
+                "error": "string (when success=false)",
+                "code": "string error code (when success=false)",
+                "timestamp": "unix seconds",
+            },
+            "documentation": "docs/rest-api.md",
+            "endpoints": self._endpoint_index(),
+        })
+
+    async def handle_not_found(self, request: web.Request) -> web.Response:
+        """Catch-all for unregistered paths.
+
+        CORS preflight (OPTIONS) must succeed on any path so browsers
+        don't reject subsequent requests. Every other method returns a
+        JSON 404 pointing users at the endpoint index, replacing the
+        misleading 405 that aiohttp emits when a path-only catch-all
+        matches the URL but not the method.
+        """
+        if request.method == "OPTIONS":
+            return web.Response()
+        return self._error_response(
+            "Unknown endpoint. See GET / for the endpoint index.",
+            "NOT_FOUND",
+            404,
+        )
 
     async def handle_health(self, request: web.Request) -> web.Response:
         """GET /health - Health check endpoint."""
@@ -296,12 +429,17 @@ class RestApiServer:
         status_data = {
             "host": self.node.public_host,
             "info": json.loads(self.node.info().to_json()),
+            "descriptor": self.node.descriptor(),
             "running": self.node.running,
             "total_peers": len(self.node.peers),
             "uptime": utc_timestamp_float() if self.node.running else 0,
             "latest_block": self.node.get_latest_block().header.index if self.node.get_latest_block() else 0
         }
         return self._success_response(status_data)
+
+    async def handle_system(self, request: web.Request) -> web.Response:
+        """GET /api/v1/system - Node hardware survey + whitelisted config."""
+        return self._success_response(self.node.descriptor())
 
     async def handle_stats(self, request: web.Request) -> web.Response:
         """GET /api/v1/stats - Mining and network statistics."""
@@ -389,8 +527,15 @@ class RestApiServer:
             except Exception as e:
                 return self._error_response(f"Invalid 'info' field: {e}", "INVALID_INFO")
 
+        descriptor_field = data.get("descriptor")
         if new_node_info:
-            await self.node.add_peer(new_node_address, new_node_info)
+            from shared.system_info import override_public_address
+            await self.node.add_peer(
+                new_node_address, new_node_info,
+                descriptor=override_public_address(
+                    descriptor_field, new_node_address,
+                ),
+            )
 
         # Return our peer list
         async with self.node.net_lock:
@@ -402,7 +547,11 @@ class RestApiServer:
         }
         peers_payload[self.node.public_host] = json.loads(self.node.info().to_json())
 
-        return self._success_response({"status": "ok", "peers": peers_payload})
+        return self._success_response({
+            "status": "ok",
+            "peers": peers_payload,
+            "descriptor": self.node.descriptor(),
+        })
 
     async def handle_submit_block(self, request: web.Request) -> web.Response:
         """POST /api/v1/block - Submit a new block (DEBUG)."""
@@ -467,6 +616,20 @@ class RestApiServer:
 
     async def handle_solve(self, request: web.Request) -> web.Response:
         """POST /api/v1/solve - Submit quantum annealing solve request."""
+        # Per-IP rate limit: solve is expensive and one abusive peer
+        # could otherwise pin the QPU queue indefinitely.
+        peer_key = request.remote or "unknown"
+        if not self._solve_rate_limiter.allow(peer_key):
+            return web.json_response(
+                {
+                    "success": False,
+                    "error": "Rate limit exceeded",
+                    "code": "RATE_LIMITED",
+                    "timestamp": int(time.time()),
+                },
+                status=429,
+            )
+
         try:
             data = await request.json()
         except json.JSONDecodeError:
@@ -520,27 +683,27 @@ class RestApiServer:
         )
 
         try:
-            # Create appropriate sampler based on miner type
             if miner_kind == "qpu":
-                from dwave.system import DWaveSampler
-                qpu_sampler = DWaveSampler()
-                sampler = qpu_sampler
+                sampler = await self._get_or_create_dwave_sampler()
+                # Serialize concurrent solve requests on the shared
+                # QPU sampler; run the blocking Leap call off-loop.
+                async with self._dwave_sampler_sample_lock:
+                    sampleset = await asyncio.to_thread(
+                        sampler.sample_ising, h_dict, J_dict,
+                        num_reads=num_samples,
+                    )
             elif miner_kind in ["cpu", "metal", "cuda", "modal"]:
                 from dwave.samplers import SimulatedAnnealingSampler
-                qpu_sampler = None
                 sampler = SimulatedAnnealingSampler()
+                sampleset = await asyncio.to_thread(
+                    sampler.sample_ising, h_dict, J_dict,
+                    num_reads=num_samples,
+                )
             else:
                 return self._error_response(
                     f"Unknown miner type: {miner_kind}",
                     "UNKNOWN_MINER_TYPE"
                 )
-
-            try:
-                # Sample the Ising problem
-                sampleset = sampler.sample_ising(h_dict, J_dict, num_reads=num_samples)
-            finally:
-                if qpu_sampler is not None:
-                    qpu_sampler.close()
 
             # Extract samples and energies
             samples = []
@@ -582,6 +745,21 @@ class RestApiServer:
         except Exception as e:
             self.logger.error(f"REST API solve failed: {e}")
             return self._error_response(str(e), "SOLVE_FAILED")
+
+    async def _get_or_create_dwave_sampler(self) -> Any:
+        """Return the cached DWaveSampler, constructing it on first use.
+
+        The D-Wave client performs blocking network I/O on construction
+        (Leap auth + solver handshake), so we do the setup once in a
+        thread and share the instance across requests.
+        """
+        if self._dwave_sampler is not None:
+            return self._dwave_sampler
+        async with self._dwave_sampler_init_lock:
+            if self._dwave_sampler is None:
+                from dwave.system import DWaveSampler
+                self._dwave_sampler = await asyncio.to_thread(DWaveSampler)
+        return self._dwave_sampler
 
     async def handle_heartbeat(self, request: web.Request) -> web.Response:
         """POST /api/v1/heartbeat - Send heartbeat."""
@@ -660,7 +838,10 @@ class RestApiServer:
         if not self._telemetry_token:
             return await handler(request)
         auth = request.headers.get("Authorization", "")
-        if auth == f"Bearer {self._telemetry_token}":
+        expected = f"Bearer {self._telemetry_token}"
+        # Constant-time comparison — a plain `==` leaks token length and
+        # prefix bytes via response timing.
+        if hmac.compare_digest(auth, expected):
             return await handler(request)
         return self._error_response("Unauthorized", "UNAUTHORIZED", 401)
 
@@ -689,7 +870,9 @@ class RestApiServer:
         try:
             while True:
                 await asyncio.sleep(300)
-                self._telemetry_rate_limiter.prune()
+                if self._telemetry_cache is not None:
+                    self._telemetry_rate_limiter.prune()
+                self._solve_rate_limiter.prune()
         except asyncio.CancelledError:
             pass
 
@@ -798,6 +981,75 @@ class RestApiServer:
             return not_modified
         return self._etag_response(data, etag)
 
+    # Bulk-range cap. At ~1 KB per block, 1000 blocks ≈ 1 MB per
+    # response — a comfortable trade between fewer round trips on cold
+    # sync and bounded memory / response size on the server.
+    TELEMETRY_RANGE_LIMIT_CAP = 1000
+    TELEMETRY_RANGE_LIMIT_DEFAULT = 100
+
+    async def handle_telemetry_blocks_range(
+        self, request: web.Request,
+    ) -> web.Response:
+        """GET /api/v1/telemetry/epochs/{epoch}/blocks?start=&limit=
+
+        Bulk cold-sync endpoint. Returns up to ``limit`` blocks (capped
+        at ``TELEMETRY_RANGE_LIMIT_CAP``) starting at ``start``.
+        """
+        cache = self._telemetry_cache
+        if cache is None:
+            return self._error_response(
+                "Telemetry not enabled", "TELEMETRY_DISABLED", 503,
+            )
+        epoch = request.match_info["epoch"]
+        info = cache.get_epoch_info(epoch)
+        if info is None:
+            return self._error_response(
+                f"Epoch {epoch} not found", "EPOCH_NOT_FOUND", 404,
+            )
+
+        try:
+            start = int(request.query.get("start", info.first_block))
+            limit = int(request.query.get(
+                "limit", self.TELEMETRY_RANGE_LIMIT_DEFAULT,
+            ))
+        except ValueError:
+            return self._error_response(
+                "start and limit must be integers",
+                "INVALID_RANGE", 400,
+            )
+        if start < 1 or limit < 1:
+            return self._error_response(
+                "start and limit must be positive integers",
+                "INVALID_RANGE", 400,
+            )
+        limit = min(limit, self.TELEMETRY_RANGE_LIMIT_CAP)
+
+        blocks = cache.get_blocks_range(epoch, start, limit)
+        # Cache could have been invalidated between get_epoch_info and
+        # get_blocks_range (refresh loop drops the epoch). Treat the
+        # same as unknown-epoch.
+        if blocks is None:
+            return self._error_response(
+                f"Epoch {epoch} not found", "EPOCH_NOT_FOUND", 404,
+            )
+
+        effective_start = max(start, info.first_block)
+        requested_end = effective_start + limit - 1
+        # next_start advances past the requested window regardless of
+        # missing block files — avoids a client looping on a hole.
+        next_start = (
+            requested_end + 1 if requested_end < info.last_block else None
+        )
+
+        return self._success_response({
+            "epoch": epoch,
+            "start": effective_start,
+            "count": len(blocks),
+            "next_start": next_start,
+            "limit_cap": self.TELEMETRY_RANGE_LIMIT_CAP,
+            "blocks": blocks,
+        })
+
     async def handle_telemetry_latest(
         self, request: web.Request,
     ) -> web.Response:
@@ -826,18 +1078,29 @@ class RestApiServer:
         self, request: web.Request,
     ) -> web.StreamResponse:
         """GET /api/v1/telemetry/stream — SSE endpoint."""
-        if len(self._sse_clients) >= self._telemetry_max_sse:
-            return self._error_response(
-                "Too many SSE connections", "SSE_LIMIT", 429,
-            )
-
         resp = web.StreamResponse()
         resp.content_type = "text/event-stream"
         resp.headers["Cache-Control"] = "no-cache"
         resp.headers["X-Accel-Buffering"] = "no"
-        await resp.prepare(request)
 
-        self._sse_clients.append(resp)
+        # Hold the lock through the limit check AND prepare+append so
+        # (a) concurrent connects can't all pass the check before any
+        # append, and (b) broadcasts never see an unprepared response.
+        # prepare() only sends headers, so the critical section is
+        # short. _sse_broadcast does not acquire this lock.
+        async with self._sse_lock:
+            if len(self._sse_clients) >= self._telemetry_max_sse:
+                return self._error_response(
+                    "Too many SSE connections", "SSE_LIMIT", 429,
+                )
+            await resp.prepare(request)
+            self._sse_clients.append(resp)
+            self._sse_pending[resp] = 0
+
+        # Register this handler so stop() can cancel it mid-sleep.
+        task = asyncio.current_task()
+        if task is not None:
+            self._sse_tasks.add(task)
         try:
             # Keep connection alive until client disconnects
             while True:
@@ -850,8 +1113,12 @@ class RestApiServer:
         except asyncio.CancelledError:
             pass
         finally:
-            if resp in self._sse_clients:
-                self._sse_clients.remove(resp)
+            async with self._sse_lock:
+                if resp in self._sse_clients:
+                    self._sse_clients.remove(resp)
+                self._sse_pending.pop(resp, None)
+            if task is not None:
+                self._sse_tasks.discard(task)
         return resp
 
     def _sse_push_block(
@@ -870,13 +1137,50 @@ class RestApiServer:
         msg = f"event: nodes\ndata: {payload}\n\n".encode("utf-8")
         self._sse_broadcast(msg)
 
+    # Max outstanding writes allowed per SSE client before we drop it.
+    # A slow client that builds up a backlog is ejected rather than
+    # allowing the queue of pending write tasks to grow unboundedly.
+    _SSE_MAX_PENDING_WRITES = 32
+
     def _sse_broadcast(self, msg: bytes) -> None:
         """Write an SSE message to all connected clients."""
-        dead: List[web.StreamResponse] = []
-        for client in self._sse_clients:
-            try:
-                asyncio.ensure_future(client.write(msg))
-            except Exception:
-                dead.append(client)
-        for client in dead:
+        for client in list(self._sse_clients):
+            pending = self._sse_pending.get(client, 0)
+            if pending >= self._SSE_MAX_PENDING_WRITES:
+                self.logger.warning(
+                    "Dropping slow SSE client: %d pending writes",
+                    pending,
+                )
+                self._sse_drop_client(client)
+                continue
+            self._sse_pending[client] = pending + 1
+            task = asyncio.create_task(self._sse_write_one(client, msg))
+            # Hold a strong reference so the task isn't GC'd mid-write.
+            task.add_done_callback(lambda _t, c=client: self._sse_after_write(c))
+
+    async def _sse_write_one(
+        self, client: web.StreamResponse, msg: bytes,
+    ) -> None:
+        try:
+            await client.write(msg)
+        except (ConnectionResetError, ConnectionAbortedError):
+            self._sse_drop_client(client)
+        except RuntimeError:
+            # aiohttp raises RuntimeError for a range of states: transport
+            # already closed, response not prepared, etc. Log before
+            # dropping so a programming bug doesn't hide as "slow consumer".
+            self.logger.debug(
+                "SSE write raised RuntimeError; dropping client",
+                exc_info=True,
+            )
+            self._sse_drop_client(client)
+
+    def _sse_after_write(self, client: web.StreamResponse) -> None:
+        pending = self._sse_pending.get(client)
+        if pending is not None and pending > 0:
+            self._sse_pending[client] = pending - 1
+
+    def _sse_drop_client(self, client: web.StreamResponse) -> None:
+        if client in self._sse_clients:
             self._sse_clients.remove(client)
+        self._sse_pending.pop(client, None)

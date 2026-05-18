@@ -5,12 +5,8 @@ from unittest.mock import patch
 
 import pytest
 
+from _utils import hash_for as _hash
 from shared.block_inventory import BlockInventory
-
-
-def _hash(n: int) -> bytes:
-    """Create a deterministic test block hash."""
-    return n.to_bytes(32, 'big')
 
 
 class TestBlockInventory:

@@ -174,8 +174,17 @@ def test_simulator_print_only_commands(tmp_path):
     )
     assert result.exit_code == 0, result.output
     out = result.output
-    assert "Running: quip-network-node cpu --port 9000" in out
-    assert "Running: quip-network-node cpu --port 9001 --peer localhost:9000" in out
+    # Simulator pins listen/public-host to 127.0.0.1 and assigns each
+    # child a unique REST port so children don't collide on 20050.
+    assert (
+        "Running: quip-network-node cpu --listen 127.0.0.1 --port 9000 "
+        "--public-host 127.0.0.1 --rest-insecure-port 20050"
+    ) in out
+    assert (
+        "Running: quip-network-node cpu --listen 127.0.0.1 --port 9001 "
+        "--public-host 127.0.0.1 --rest-insecure-port 20051 "
+        "--peer 127.0.0.1:9000"
+    ) in out
 
 
 def test_gpu_mps_backend_creates_metal_section(tmp_path, monkeypatch):

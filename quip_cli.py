@@ -130,7 +130,9 @@ def _apply_global_overrides(conf: Dict[str, Any],
                              fanout: Optional[int],
                              log_level: Optional[str] = None,
                              node_log: Optional[str] = None,
-                             http_log: Optional[str] = None) -> Dict[str, Any]:
+                             http_log: Optional[str] = None,
+                             rest_port: Optional[int] = None,
+                             rest_insecure_port: Optional[int] = None) -> Dict[str, Any]:
     c = dict(conf)
     if listen is not None:
         c["listen"] = listen
@@ -162,6 +164,10 @@ def _apply_global_overrides(conf: Dict[str, Any],
         c["node_log"] = node_log
     if http_log is not None:
         c["http_log"] = http_log
+    if rest_port is not None:
+        c["rest_port"] = int(rest_port)
+    if rest_insecure_port is not None:
+        c["rest_insecure_port"] = int(rest_insecure_port)
     return c
 
 
@@ -282,6 +288,9 @@ def quip_network_node(ctx: click.Context, config: Optional[str], version: bool, 
 @click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default=None, help="Logging level")
 @click.option("--node-log", type=str, default=None, help="Path to main node log file (defaults to stderr)")
 @click.option("--http-log", type=str, default=None, help="Path to HTTP log file or 'stderr'/'stdout' for console (suppresses aiohttp logs if not set)")
+# REST API options
+@click.option("--rest-port", type=int, default=None, help="REST API HTTPS port (-1 disables, defaults from [global].rest_port or -1)")
+@click.option("--rest-insecure-port", type=int, default=None, help="REST API HTTP port (-1 disables, defaults from [global].rest_insecure_port or 20050)")
 # CPU options
 @click.option("--num-cpus", type=int, default=None, help="Number of CPU miners to spawn (default 1)")
 # Other
@@ -305,6 +314,8 @@ def cpu(
     log_level: Optional[str],
     node_log: Optional[str],
     http_log: Optional[str],
+    rest_port: Optional[int],
+    rest_insecure_port: Optional[int],
     num_cpus: Optional[int],
     genesis_config: str,
     debug_config: bool,
@@ -317,7 +328,7 @@ def cpu(
     conf.pop("gpu", None)
     conf.pop("qpu", None)
 
-    conf = _apply_global_overrides(conf, listen, port, public_host, public_port, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
+    conf = _apply_global_overrides(conf, listen, port, public_host, public_port, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log, rest_port, rest_insecure_port)
 
     # Handle CPU-specific configuration
     cpu_cfg = dict((conf.get("cpu") or {}))
@@ -357,6 +368,9 @@ def cpu(
 @click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default=None, help="Logging level")
 @click.option("--node-log", type=str, default=None, help="Path to main node log file (defaults to stderr)")
 @click.option("--http-log", type=str, default=None, help="Path to HTTP log file or 'stderr'/'stdout' for console (suppresses aiohttp logs if not set)")
+# REST API options
+@click.option("--rest-port", type=int, default=None, help="REST API HTTPS port (-1 disables, defaults from [global].rest_port or -1)")
+@click.option("--rest-insecure-port", type=int, default=None, help="REST API HTTP port (-1 disables, defaults from [global].rest_insecure_port or 20050)")
 # GPU options
 @click.option("--gpu-backend", type=click.Choice(["local", "modal", "mps"], case_sensitive=False), default=None, help="GPU backend: local|modal|mps")
 @click.option("--device", "devices", multiple=True, help="GPU device(s) for local backend (e.g., 0 1)")
@@ -384,6 +398,8 @@ def gpu(
     log_level: Optional[str],
     node_log: Optional[str],
     http_log: Optional[str],
+    rest_port: Optional[int],
+    rest_insecure_port: Optional[int],
     gpu_backend: Optional[str],
     devices: List[str],
     gpu_types: List[str],
@@ -402,7 +418,7 @@ def gpu(
     conf.pop("qpu", None)
 
     # Apply CLI overrides
-    conf = _apply_global_overrides(conf, listen, port, public_host, public_port, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
+    conf = _apply_global_overrides(conf, listen, port, public_host, public_port, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log, rest_port, rest_insecure_port)
 
     # Build GPU config from CLI args as top-level device sections.
     # [gpu] holds global defaults; [cuda.N]/[metal]/[modal] hold devices.
@@ -459,6 +475,9 @@ def gpu(
 @click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default=None, help="Logging level")
 @click.option("--node-log", type=str, default=None, help="Path to main node log file (defaults to stderr)")
 @click.option("--http-log", type=str, default=None, help="Path to HTTP log file or 'stderr'/'stdout' for console (suppresses aiohttp logs if not set)")
+# REST API options
+@click.option("--rest-port", type=int, default=None, help="REST API HTTPS port (-1 disables, defaults from [global].rest_port or -1)")
+@click.option("--rest-insecure-port", type=int, default=None, help="REST API HTTP port (-1 disables, defaults from [global].rest_insecure_port or 20050)")
 # QPU options
 @click.option("--dwave-api-key", type=str, default=None, help="D-Wave API key")
 @click.option("--dwave-api-solver", type=str, default=None, help="D-Wave solver name")
@@ -486,6 +505,8 @@ def qpu(
     log_level: Optional[str],
     node_log: Optional[str],
     http_log: Optional[str],
+    rest_port: Optional[int],
+    rest_insecure_port: Optional[int],
     dwave_api_key: Optional[str],
     dwave_api_solver: Optional[str],
     dwave_region_url: Optional[str],
@@ -502,7 +523,7 @@ def qpu(
     conf.pop("cpu", None)
 
     # Apply CLI overrides
-    conf = _apply_global_overrides(conf, listen, port, public_host, public_port, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
+    conf = _apply_global_overrides(conf, listen, port, public_host, public_port, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log, rest_port, rest_insecure_port)
 
     # Build QPU config — CLI args populate a [dwave] section.
     dwave_cfg = dict(conf.get("dwave") or {})
@@ -593,22 +614,42 @@ def quip_network_simulator(ctx: click.Context, scenario: str, num_cpu: Optional[
 
     processes = []
 
-    def _cmd_for(kind: str, port: int, peer: Optional[str]) -> list[str]:
-        base = ["quip-network-node", kind, "--port", str(port)]
+    def _cmd_for(kind: str, port: int, peer: Optional[str], rest_port: int) -> list[str]:
+        # Pin both listen and public-host to 127.0.0.1: avoids public-IP
+        # auto-detection (which causes children to advertise themselves on
+        # the host's NAT'd public address and then fail JOINs against real
+        # mainnet peers from the genesis config).
+        base = [
+            "quip-network-node", kind,
+            "--listen", "127.0.0.1",
+            "--port", str(port),
+            "--public-host", "127.0.0.1",
+            "--rest-insecure-port", str(rest_port),
+        ]
         if peer:
             base += ["--peer", peer]
         return base
 
+    # Assign each child a unique REST HTTP port so they don't collide on
+    # the default 20050. Offset by index so the mapping is stable: the
+    # child on QUIC port base_port + i gets REST on 20050 + i.
+    rest_base = 20050
+
     # Build command list
     peer_addr = None
+    child_index = 0
     for kind, count in order:
         for _ in range(count):
+            rest_port = rest_base + child_index
             if kind == bootstrap_kind and peer_addr is None:
-                cmds.append(_cmd_for(kind, port, None))
-                peer_addr = f"localhost:{port}"
+                cmds.append(_cmd_for(kind, port, None, rest_port))
+                # Use the loopback literal so name resolution doesn't
+                # accidentally pick ::1 before the v4 listener binds.
+                peer_addr = f"127.0.0.1:{port}"
             else:
-                cmds.append(_cmd_for(kind, port, peer_addr))
+                cmds.append(_cmd_for(kind, port, peer_addr, rest_port))
             port += 1
+            child_index += 1
 
     # Print commands
     for c in cmds:

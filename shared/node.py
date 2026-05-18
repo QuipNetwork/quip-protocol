@@ -7,6 +7,7 @@ import logging
 import multiprocessing
 import os
 import socket
+from concurrent.futures import BrokenExecutor, ProcessPoolExecutor
 from queue import Empty
 import time
 from blake3 import blake3
@@ -17,6 +18,45 @@ import aiohttp
 
 from shared.block_requirements import compute_next_block_requirements, validate_block, compute_current_requirements
 
+_SPAWN_CTX = multiprocessing.get_context('spawn')
+
+# Per-worker singleton: ProcessPoolExecutor reuses worker processes across
+# calls, so we instantiate one BlockSigner per worker rather than paying
+# its init cost on every verify.
+_worker_signer: Optional['BlockSigner'] = None
+
+
+def _verify_worker_init() -> None:
+    """ProcessPoolExecutor initializer — one BlockSigner per worker."""
+    global _worker_signer
+    from shared.block_signer import BlockSigner as _BS
+    _worker_signer = _BS(seed=os.urandom(32))
+
+
+def _verify_signature_worker(
+    ecdsa_pk: bytes,
+    wots_pk: bytes,
+    message: bytes,
+    signature: bytes,
+) -> bool:
+    """Worker-side signature check. Uses the per-worker BlockSigner."""
+    global _worker_signer
+    if _worker_signer is None:
+        _verify_worker_init()
+    assert _worker_signer is not None
+    return _worker_signer.verify_combined_signature(
+        ecdsa_pk, wots_pk, message, signature
+    )
+
+
+def _validate_quantum_proof_worker(
+    block: 'Block',
+    prev_block: 'Block',
+) -> bool:
+    """Worker-side PoW check. Blocks cross the process boundary as dataclasses."""
+    block.quantum_proof.compute_derived_fields()
+    return validate_block(block, prev_block)
+
 if TYPE_CHECKING:
     pass
 
@@ -25,6 +65,7 @@ from shared.block_signer import BlockSigner
 from shared.block import Block, MinerInfo
 from shared.miner import Miner, MiningResult
 from shared.logging_config import init_component_logger
+from shared.system_info import build_descriptor
 from shared.time_utils import utc_timestamp_float, utc_timestamp, network_timestamp
 from shared.version import PROTOCOL_VERSION
 # Global logger for this module (set during Node initialization)
@@ -187,6 +228,7 @@ class Node:
         """
         self.node_id = node_id
         self.miners_config = miners_config
+        self._descriptor_cache: Optional[Dict[str, Any]] = None
 
         self.peers: Dict[str, MinerInfo] = {}
 
@@ -247,8 +289,17 @@ class Node:
 
         # Initialize blockchain
         self.chain: List[Block] = []
+        # Secondary index for content-addressed block lookup; kept in
+        # lockstep with ``chain`` via ``_index_append`` / ``_index_truncate``.
+        self.chain_by_hash: Dict[bytes, Block] = {}
         self.chain_lock = asyncio.Lock()
-        self.chain.append(genesis_block)
+        self._index_append(genesis_block)
+
+        # CPU-bound verification (SPHINCS+ signature, PoW) is offloaded to
+        # this pool so the event loop stays responsive for gossip and other
+        # I/O. Lazy-initialized on first check_block to avoid spawn cost
+        # during tests that construct a Node but never verify a block.
+        self._verify_pool: Optional[ProcessPoolExecutor] = None
 
     def _setup_multiprocess_logging(self):
         """Set up logging queue and listener for multiprocessing."""
@@ -392,10 +443,53 @@ class Node:
         if len(self.chain) <= index:
             return None
         return self.chain[index]
-    
+
     def get_latest_block(self) -> Block:
         """Get the latest block from the blockchain."""
         return self.chain[-1]
+
+    def get_block_by_hash(self, block_hash: bytes) -> Optional[Block]:
+        """Get a block from the canonical chain by its hash.
+
+        Returns None if the hash is not currently on the canonical chain
+        (including hashes from blocks that were truncated away during a
+        reorg).
+        """
+        return self.chain_by_hash.get(block_hash)
+
+    def build_locator(self) -> List[bytes]:
+        """Build a Bitcoin-style locator of block hashes from tip to genesis.
+
+        The locator is used by the GET_CHAIN_MANIFEST RPC so a peer can
+        find the latest common ancestor with our chain in a single round
+        trip. Layout: the tip plus the next 10 blocks contiguously, then
+        the step size doubles until genesis. Length grows like
+        ``~11 + log2(tip)``.
+
+        Returns:
+            List of 32-byte block hashes ordered newest-first. Empty when
+            the chain itself is empty. Always terminates with the genesis
+            block's hash when genesis is finalized.
+        """
+        locator: List[bytes] = []
+        if not self.chain:
+            return locator
+
+        index = len(self.chain) - 1
+        step = 1
+        while index > 0:
+            block = self.chain[index]
+            if block.hash is not None:
+                locator.append(block.hash)
+            index = max(0, index - step)
+            if len(locator) > 10:
+                step *= 2
+
+        genesis = self.chain[0]
+        if genesis.hash is not None:
+            locator.append(genesis.hash)
+
+        return locator
 
     def _find_block_by_hash(
         self, target_hash: bytes, full_search: bool = False
@@ -413,6 +507,67 @@ class Node:
             if self.chain[i].hash == target_hash:
                 return self.chain[i]
         return None
+
+    def _index_append(self, block: Block) -> None:
+        """Append a block to ``chain`` and mirror into ``chain_by_hash``.
+
+        Caller is responsible for holding ``chain_lock`` when the append
+        happens outside ``__init__``. Blocks without a finalized ``hash``
+        still land in ``chain`` but are omitted from ``chain_by_hash`` —
+        hash lookups for unfinalized blocks would be meaningless.
+        """
+        self.chain.append(block)
+        if block.hash is not None:
+            self.chain_by_hash[block.hash] = block
+
+    def _index_truncate(self, new_length: int) -> None:
+        """Shrink ``chain`` to ``new_length`` blocks and evict dropped hashes.
+
+        Caller is responsible for holding ``chain_lock`` when the
+        truncate happens outside ``__init__``. No-op when the chain is
+        already that short.
+        """
+        if new_length >= len(self.chain):
+            return
+        dropped = self.chain[new_length:]
+        self.chain = self.chain[:new_length]
+        for block in dropped:
+            if block.hash is not None:
+                self.chain_by_hash.pop(block.hash, None)
+
+    def _ensure_verify_pool(self) -> ProcessPoolExecutor:
+        if self._verify_pool is None:
+            self._verify_pool = ProcessPoolExecutor(
+                max_workers=max(2, (os.cpu_count() or 2) // 2),
+                mp_context=_SPAWN_CTX,
+                initializer=_verify_worker_init,
+            )
+        return self._verify_pool
+
+    async def _run_verify(
+        self,
+        fn: Callable[..., bool],
+        args: tuple,
+        inline_fn: Callable[[], bool],
+    ) -> bool:
+        """Run a CPU-bound verifier off the event loop; inline fallback on failure."""
+        pool = self._ensure_verify_pool()
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(pool, fn, *args)
+        except BrokenExecutor as exc:
+            self.logger.warning(
+                f"executor-fallback: verify pool broken ({exc}), "
+                f"running {fn.__name__} inline — next block will respawn pool"
+            )
+            self._verify_pool = None
+            return inline_fn()
+        except (OSError, EOFError) as exc:
+            self.logger.warning(
+                f"executor-fallback: IPC error ({exc}) in {fn.__name__}, "
+                f"running inline"
+            )
+            return inline_fn()
 
     async def check_block(self, block: Block, force_reorg: bool = False) -> tuple[bool, str | None]:
         """Check if a block is valid and can be accepted.
@@ -498,7 +653,7 @@ class Node:
                     )
                     # Truncate chain to common ancestor (with lock for safety)
                     async with self.chain_lock:
-                        self.chain = self.chain[:ancestor.header.index + 1]
+                        self._index_truncate(ancestor.header.index + 1)
                     prev_block = ancestor
                 else:
                     reason = f"cannot find ancestor with hash {block.header.previous_hash.hex()[:8]}"
@@ -520,19 +675,32 @@ class Node:
             reason = "missing block bytes or signature"
             self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: {reason}")
             return False, reason
-        if not self.crypto.verify_combined_signature(
-            block.miner_info.ecdsa_public_key,
-            block.miner_info.wots_public_key,
-            block_bytes,
-            signature
-        ):
+        sig_valid = await self._run_verify(
+            _verify_signature_worker,
+            (block.miner_info.ecdsa_public_key,
+             block.miner_info.wots_public_key,
+             block_bytes,
+             signature),
+            inline_fn=lambda: self.crypto.verify_combined_signature(
+                block.miner_info.ecdsa_public_key,
+                block.miner_info.wots_public_key,
+                block_bytes,
+                signature,
+            ),
+        )
+        if not sig_valid:
             reason = "invalid signature"
             self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: {reason}")
             return False, reason
 
         # 4. Validate the Quantum Proof and other block artifacts.
         block.quantum_proof.compute_derived_fields()
-        if not validate_block(block, prev_block):
+        qp_valid = await self._run_verify(
+            _validate_quantum_proof_worker,
+            (block, prev_block),
+            inline_fn=lambda: validate_block(block, prev_block),
+        )
+        if not qp_valid:
             reason = "invalid quantum proof"
             self.logger.error(f"Block {block.header.index}-{block.hash.hex()[:8]} rejected: invalid quantum proof (miner: {block.miner_info.miner_id})")
             qpjson = block.quantum_proof.to_json()
@@ -578,13 +746,22 @@ class Node:
             # Reset chain if needed
             if head.header.index >= block.header.index:
                 self.logger.warning(f"Resetting chain to accept block {block.header.index} from previous head {head.header.index})")
-                self.chain = self.chain[:block.header.index]
+                self._index_truncate(block.header.index)
             # Accept the block
-            self.chain.append(block)
+            self._index_append(block)
 
         assert block.hash is not None
 
         self.logger.info(f"Accepted block {block.header.index}-{block.hash.hex()[:8]} from {block.miner_info.miner_id}")
+
+        # Any accepted block makes our current mining target stale. Tear
+        # down the active attempt so the node can pivot to the new tip
+        # rather than race a solution that consensus has already passed.
+        # By the time WE call receive_block on our own win, mine_block()
+        # has already cleared _is_mining in its finally block, so this
+        # path only fires for peer wins and reorgs.
+        if self._is_mining:
+            asyncio.create_task(self.stop_mining())
 
         # Emit an event so we can stop mining and potentially broadcast to other nodes
         asyncio.create_task(self._emit_block_mined(block))
@@ -615,16 +792,67 @@ class Node:
             except Exception as e:
                 self.logger.error(f"Error in block_mined callback: {e}")
 
+    def _derive_miner_type_label(self) -> str:
+        """Short label for this node's active miners (e.g. 'CPU', 'CPU+GPU').
+
+        Historically this field leaked the full TOML config. The
+        documented contract (shared/block.py:MinerInfo.miner_type) is
+        a short string consumed by `calculate_adaptive_parameters`.
+        """
+        kinds = sorted({
+            h.miner_type for h in getattr(self, "miner_handles", [])
+            if getattr(h, "miner_type", None)
+        })
+        return "+".join(kinds) if kinds else "UNKNOWN"
+
     def info(self) -> MinerInfo:
         """Get information about this node."""
         return MinerInfo(
             miner_id=self.node_id,
-            miner_type=f"{json.dumps(self.miners_config)}",
+            miner_type=self._derive_miner_type_label(),
             reward_address=self.crypto.ecdsa_public_key_bytes,
             ecdsa_public_key=self.crypto.ecdsa_public_key_bytes,
             wots_public_key=self.crypto.wots_plus_public_key,
             next_wots_public_key=self.crypto.wots_plus_public_key
         )
+
+    def descriptor(self) -> Dict[str, Any]:
+        """Lazily build and cache the NodeDescriptor for this node.
+
+        Returns a JSON-friendly dict. Cached after first call; call
+        ``invalidate_descriptor()`` if miners_config changes.
+
+        ``build_descriptor`` probes hardware via subprocess (sysctl,
+        ioreg, lspci) and can fail on minimal containers, sandboxed
+        environments, or unusual platforms. Previously the exception
+        propagated and poisoned every caller — including the
+        STATUS_REQUEST handler and the listener-snapshot serializer,
+        producing the silent-drop / blank-cache symptom on affected
+        nodes. We now cache a minimal fallback on failure so callers
+        always get a JSON-friendly dict; the ``available: False`` flag
+        is observable to clients that want to flag degraded peers.
+        """
+        if self._descriptor_cache is None:
+            try:
+                desc = build_descriptor(self.node_id, self.miners_config)
+                self._descriptor_cache = desc.to_dict()
+            except Exception as exc:
+                self.logger.warning(
+                    "build_descriptor failed for node %s; "
+                    "using fallback descriptor: %s",
+                    self.node_id, exc, exc_info=True,
+                )
+                self._descriptor_cache = {
+                    "node_id": self.node_id,
+                    "node_name": getattr(self, "node_name", self.node_id),
+                    "available": False,
+                    "error": str(exc),
+                }
+        return self._descriptor_cache
+
+    def invalidate_descriptor(self) -> None:
+        """Drop the cached descriptor so it will be rebuilt on next read."""
+        self._descriptor_cache = None
 
     async def mine_block(self, previous_block: Block, transactions: List = None) -> Optional[MiningResult]:
         """
@@ -641,7 +869,7 @@ class Node:
             transactions = []
         if not self.chain:
             self.logger.info("No existing chain, previous block is genesis")
-            self.chain.append(previous_block)
+            self._index_append(previous_block)
 
         if (previous_block.header.index) != self.get_latest_block().header.index:
             self.logger.info(f"Node {self.node_id}: Previous block index {previous_block.header.index} does not match latest block index {self.get_latest_block().header.index}, exiting mining task...")
@@ -717,10 +945,14 @@ class Node:
             self.logger.info("Mining interrupted")
             self._mining_stop_event.set()
         finally:
-            # Signal cancellation to all workers if result found
-            if result is not None:
-                for h in handles:
-                    h.cancel()
+            # Always signal cancellation to every worker, regardless of
+            # how we're exiting. If WE won, the other miners must stop
+            # their now-wasted search; if a peer won, stop_mining() set
+            # our event but the workers also need a direct nudge so
+            # their mine_block() observes the cancel within one
+            # iteration.
+            for h in handles:
+                h.cancel()
             # Reset mining state
             self._is_mining = False
             self._mining_stop_event = None
@@ -991,6 +1223,13 @@ class Node:
                 h.close()
             except Exception:
                 pass
+
+        if self._verify_pool is not None:
+            try:
+                self._verify_pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            self._verify_pool = None
 
         # Stop the logging listener
         if self._log_listener:

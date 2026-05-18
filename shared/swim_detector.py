@@ -106,6 +106,16 @@ class SwimDetector:
         health = self._peers.get(peer)
         return health.state if health else None
 
+    def get_joined_at(self, peer: str) -> Optional[float]:
+        """Return the ``time.monotonic()`` value when *peer* was registered.
+
+        Returns ``None`` if the peer is not tracked. Callers use this
+        for first-heartbeat-timeout bookkeeping on NetworkNode without
+        reaching into the detector's private state.
+        """
+        health = self._peers.get(peer)
+        return health.joined_at if health else None
+
     def record_heartbeat_success(self, peer: str) -> None:
         """Record a successful direct heartbeat to peer."""
         health = self._peers.get(peer)

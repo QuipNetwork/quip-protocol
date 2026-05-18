@@ -82,6 +82,18 @@ class IPCRouter:
         self._socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
         self._socket.setsockopt(zmq.LINGER, 1000)
         self._socket.bind(self.bind_address)
+        # Restrict the IPC socket file to the current user. Without
+        # this, any local user on the host can connect to the ROUTER
+        # and impersonate a miner identity on multi-tenant systems.
+        if self.bind_address.startswith("ipc://"):
+            sock_path = self.bind_address[6:]
+            try:
+                os.chmod(sock_path, 0o600)
+            except OSError as exc:
+                self.logger.warning(
+                    "Failed to restrict permissions on IPC socket %s: %s",
+                    sock_path, exc,
+                )
         self.logger.info(f"IPC ROUTER bound to {self.bind_address}")
 
     async def send_to(self, identity: bytes, data: bytes) -> bool:

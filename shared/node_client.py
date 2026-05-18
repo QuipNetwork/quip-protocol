@@ -29,6 +29,12 @@ from aioquic.quic.events import (
 
 from shared.block import Block, BlockHeader, MinerInfo
 from shared.peer_ban_list import PeerBanList
+from shared.sync_messages import (
+    decode_block_by_hash_response,
+    decode_manifest_response,
+    encode_block_by_hash_request,
+    encode_manifest_request,
+)
 from shared.version import get_version, PROTOCOL_VERSION
 from shared.time_utils import utc_timestamp_float
 from shared.address_utils import parse_host_port
@@ -68,6 +74,9 @@ class QuicMessageType(IntEnum):
     # Phase 3: IHAVE/IWANT block propagation
     IHAVE = 0x10              # Announce block availability (hash only)
     IWANT = 0x11              # Request specific blocks by hash
+    # Fork-aware sync: manifest + content-addressed block fetch
+    CHAIN_MANIFEST_REQUEST = 0x12  # Bitcoin-style locator in, (idx, hash) slice out
+    BLOCK_BY_HASH_REQUEST = 0x13   # Fetch a specific block by its hash
     # Telemetry stream API
     TELEMETRY_STATUS_REQUEST = 0x20
     TELEMETRY_NODES_REQUEST = 0x21
@@ -94,6 +103,9 @@ class QuicMessageType(IntEnum):
     # Phase 3 responses
     IHAVE_RESPONSE = 0x90
     IWANT_RESPONSE = 0x91
+    # Fork-aware sync responses
+    CHAIN_MANIFEST_RESPONSE = 0x92
+    BLOCK_BY_HASH_RESPONSE = 0x93
     # Telemetry responses
     TELEMETRY_STATUS_RESPONSE = 0xA0
     TELEMETRY_NODES_RESPONSE = 0xA1
@@ -234,7 +246,16 @@ class _QuicClientProtocol(QuicConnectionProtocol):
         elif isinstance(event, StreamDataReceived):
             self._handle_stream_data(event)
         elif isinstance(event, ConnectionTerminated):
-            self._logger.info(f"ConnectionTerminated ({self._peer_host}): code={event.error_code}, reason={event.reason_phrase}")
+            if event.error_code:
+                self._logger.info(
+                    "ConnectionTerminated (%s): code=%s, reason=%s",
+                    self._peer_host, event.error_code, event.reason_phrase,
+                )
+            else:
+                self._logger.debug(
+                    "ConnectionTerminated (%s): clean close",
+                    self._peer_host,
+                )
             self._connection_closed = True
             self._connected.clear()
             for future in self._pending_requests.values():
@@ -288,8 +309,9 @@ class _QuicClientProtocol(QuicConnectionProtocol):
                 if not future.done():
                     future.set_result(msg)
             else:
-                self._logger.warning(
-                    f"Received response for unknown request_id={msg.request_id} ({self._peer_host})"
+                self._logger.debug(
+                    "Late response for timed-out request_id=%d (%s)",
+                    msg.request_id, self._peer_host,
                 )
         except Exception as e:
             self._logger.warning(f"Invalid response: {e}")
@@ -362,12 +384,45 @@ class TofuVerificationError(Exception):
     pass
 
 
+_MODULE_LOGGER = logging.getLogger(__name__)
+
+
+async def _safe_aexit(ctx: Any) -> None:
+    """Invoke ``ctx.__aexit__`` swallowing any exception, used when we
+    schedule aioquic cleanup as a background task.
+
+    Exceptions here are not actionable — the caller has already moved
+    on — but we log at DEBUG so a spike of cleanup failures is still
+    discoverable via logs.
+    """
+    try:
+        await ctx.__aexit__(None, None, None)
+    except Exception:
+        _MODULE_LOGGER.debug("aioquic cleanup raised", exc_info=True)
+
+
 class NodeClient:
     """QUIC client for QuIP P2P networking with connection pooling and TOFU verification."""
 
     def __init__(self, node_timeout: float = 10.0, logger: Optional[logging.Logger] = None,
-                 verify_tls: bool = False, trust_store: Optional['TrustStore'] = None):
+                 verify_tls: bool = False, trust_store: Optional['TrustStore'] = None,
+                 connect_timeout: Optional[float] = None):
+        """
+        Args:
+            connect_timeout: Upper bound, in seconds, on one connect
+                attempt including aioquic's close handshake on failure.
+                When ``None`` (default, production), the QUIC handshake
+                wait is capped at 5 s and ``idle_timeout`` defaults to
+                300 s — so cleanup to a dead peer can take up to ~10 s
+                while aioquic retries the CONNECTION_CLOSE frame under
+                PTO backoff. Tests that deliberately probe unreachable
+                addresses should set a small value (e.g. 1.0) to get a
+                fast deterministic failure; this also clamps QUIC's
+                idle_timeout so aioquic's PTO-driven close retries
+                give up promptly instead of holding the event loop.
+        """
         self.node_timeout = node_timeout
+        self.connect_timeout = connect_timeout
         self.logger = logger or logging.getLogger(__name__)
         self.verify_tls = verify_tls
         self.trust_store = trust_store
@@ -434,32 +489,59 @@ class NodeClient:
 
             addr, port = parse_host_port(host, DEFAULT_QUIC_PORT)
 
+            # When a test sets a small connect_timeout, also clamp QUIC's
+            # idle_timeout to a small multiple of it. Otherwise aioquic
+            # keeps the connection's PTO backoff running for up to
+            # idle_timeout (300 s default) — visible as the close
+            # handshake taking ~5 s to send a CONNECTION_CLOSE even
+            # after our wait_connected timed out.
+            idle_timeout = (
+                300.0 if self.connect_timeout is None
+                else max(2.0, self.connect_timeout * 2)
+            )
             configuration = QuicConfiguration(
                 is_client=True,
                 max_datagram_frame_size=MAX_DATAGRAM_FRAME_SIZE,
                 alpn_protocols=[QUIP_ALPN_PROTOCOL],
-                idle_timeout=300.0,
+                idle_timeout=idle_timeout,
             )
             if not self.verify_tls:
                 configuration.verify_mode = ssl.CERT_NONE
 
+            handshake_timeout = (
+                5.0 if self.connect_timeout is None else self.connect_timeout
+            )
+            cleanup_timeout = (
+                10.0 if self.connect_timeout is None else self.connect_timeout
+            )
+
             try:
-                # Create connection context manager but don't use 'async with'
-                # since that would close connection when block exits
+                # aioquic's ``connect()`` context awaits ``wait_connected``
+                # inside ``__aenter__`` when ``wait_connected=True``
+                # (the default), which doesn't honor our handshake cap —
+                # it waits until the connection either completes or
+                # times out on ``idle_timeout``. Pass False so
+                # ``__aenter__`` returns immediately after transport
+                # setup, then we bound the wait ourselves below.
                 ctx = connect(
                     host=addr, port=port, configuration=configuration,
                     create_protocol=lambda *a, _h=host, **k: _QuicClientProtocol(*a, logger=self.logger, peer_host=_h, **k),
+                    wait_connected=False,
                 )
-                # Manually enter the context to start the connection
                 protocol = await ctx.__aenter__()
+                # aioquic passes transmit=wait_connected to
+                # protocol.connect(), so with wait_connected=False
+                # the Initial packet is buffered but never sent.
+                # Flush it now to start the handshake.
+                protocol.transmit()
 
-                if await protocol.wait_connected(timeout=5.0):
+                if await protocol.wait_connected(timeout=handshake_timeout):
                     # TOFU verification if trust store is configured
                     if self.trust_store:
                         tofu_ok = await self._verify_tofu(host, protocol)
                         if not tofu_ok:
                             protocol.close()
-                            await ctx.__aexit__(None, None, None)
+                            await self._bounded_aexit(ctx, cleanup_timeout)
                             return None
 
                     # Store both connection and context manager to keep connection alive
@@ -471,7 +553,7 @@ class NodeClient:
                 else:
                     # Connection failed (handshake timeout), clean up
                     self.ban_list.record_failure(host, "QUIC handshake timeout")
-                    await ctx.__aexit__(None, None, None)
+                    await self._bounded_aexit(ctx, cleanup_timeout)
                     return None
             except TofuVerificationError as e:
                 self.logger.error(f"TOFU verification failed for {host}: {e}")
@@ -480,6 +562,34 @@ class NodeClient:
             except Exception as e:
                 self.ban_list.record_failure(host, str(e))
                 return None
+
+    async def _bounded_aexit(self, ctx: Any, timeout: float) -> None:
+        """Bound aioquic's close handshake wait.
+
+        When ``connect_timeout`` is set (tests), we can't trust
+        ``asyncio.wait_for`` to return inside ``timeout`` — aioquic's
+        ``connect()`` ``__aexit__`` performs multi-step cleanup that
+        doesn't always yield back on cancellation, so ``wait_for``
+        ends up waiting for the cancelled task to settle. Instead,
+        schedule the cleanup as a background task and move on; the
+        UDP socket gets closed whenever the event loop next runs it,
+        which for a failed connect to a dead peer is good-enough
+        hygiene (we hold no state to leak).
+
+        When ``connect_timeout`` is None (production), keep the
+        original blocking-awaited cleanup so we don't accumulate
+        orphan tasks under heavy peer churn.
+        """
+        if self.connect_timeout is None:
+            try:
+                await ctx.__aexit__(None, None, None)
+            except Exception:
+                self.logger.debug(
+                    "aioquic cleanup raised in production path",
+                    exc_info=True,
+                )
+            return
+        asyncio.create_task(_safe_aexit(ctx))
 
     async def _verify_tofu(self, host: str, protocol: _QuicClientProtocol) -> bool:
         """
@@ -515,10 +625,8 @@ class NodeClient:
 
     async def _handle_version_mismatch(self, host: str) -> None:
         """Close connection and remove peer after protocol version mismatch."""
-        self.logger.error(
-            f"Protocol version mismatch with {host}, removing peer. "
-            f"Please ensure both nodes are running compatible versions. "
-            f"Run 'pip install -U quip-network' to upgrade."
+        self.logger.debug(
+            "Protocol version mismatch with %s, removing peer", host,
         )
         await self.remove_peer(host)
 
@@ -593,6 +701,72 @@ class NodeClient:
             except Exception:
                 return None
         return None
+
+    async def get_chain_manifest(
+        self,
+        host: str,
+        locator: list,
+        limit: int,
+    ) -> Optional[list]:
+        """Fetch a slice of a peer's canonical chain as (index, hash) tuples.
+
+        The peer uses the Bitcoin-style ``locator`` to find the latest
+        common ancestor and returns up to ``limit`` entries on its
+        canonical chain starting from the next index.
+
+        Args:
+            host: ``host:port`` of the peer to query.
+            locator: Locator hashes tip-first (see
+                ``shared.node.Node.build_locator``).
+            limit: Maximum entries to request; capped at
+                ``MAX_MANIFEST_ENTRIES`` on the wire.
+
+        Returns:
+            List of ``(index, hash)`` tuples in ascending index order,
+            or ``None`` on connection, protocol, or decode failure.
+        """
+        protocol = await self._get_connection(host)
+        if not protocol:
+            return None
+        payload = encode_manifest_request(locator, limit)
+        response = await protocol.send_request(
+            QuicMessageType.CHAIN_MANIFEST_REQUEST, payload, timeout=self.node_timeout
+        )
+        if await self._is_version_error(response, host):
+            return None
+        if response is None or response.msg_type != QuicMessageType.CHAIN_MANIFEST_RESPONSE:
+            return None
+        try:
+            return decode_manifest_response(response.payload)
+        except ValueError as e:
+            self.logger.warning(f"Malformed manifest response from {host}: {e}")
+            return None
+
+    async def get_peer_block_by_hash(
+        self, host: str, block_hash: bytes
+    ) -> Optional[Block]:
+        """Fetch a block from a peer by its hash.
+
+        Returns ``None`` when the peer doesn't have the block on its
+        canonical chain (empty payload), when the connection fails, or
+        when the response payload fails to deserialize.
+        """
+        protocol = await self._get_connection(host)
+        if not protocol:
+            return None
+        payload = encode_block_by_hash_request(block_hash)
+        response = await protocol.send_request(
+            QuicMessageType.BLOCK_BY_HASH_REQUEST, payload, timeout=self.node_timeout
+        )
+        if await self._is_version_error(response, host):
+            return None
+        if response is None or response.msg_type != QuicMessageType.BLOCK_BY_HASH_RESPONSE:
+            return None
+        try:
+            return decode_block_by_hash_response(response.payload)
+        except Exception as e:
+            self.logger.warning(f"Malformed block-by-hash response from {host}: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Telemetry stream API
@@ -679,6 +853,17 @@ class NodeClient:
         return response is not None and response.msg_type == QuicMessageType.GOSSIP_RESPONSE
 
     async def join_network_via_peer(self, peer_address: str, join_data: dict, bypass_ban: bool = False) -> Optional[dict]:
+        """Send a JOIN request and return the parsed response payload.
+
+        Returns:
+            ``None`` when the transport fails, the response is an
+            error, or the payload cannot be decoded.
+            Otherwise a dict containing at least a ``status`` field:
+            ``"ok"`` for a successful join, ``"at_capacity"`` when the
+            peer is full and is redirecting us to the ``peers`` list.
+            Callers MUST branch on ``status`` — an ``at_capacity``
+            response is not a successful join.
+        """
         protocol = await self._get_connection(peer_address, bypass_ban=bypass_ban)
         if not protocol:
             self.logger.warning(f"Could not establish connection to {peer_address}")
@@ -687,16 +872,7 @@ class NodeClient:
         response = await protocol.send_request(QuicMessageType.JOIN_REQUEST, payload, timeout=self.node_timeout)
         if response and response.msg_type == QuicMessageType.JOIN_RESPONSE:
             try:
-                data = json.loads(response.payload.decode('utf-8'))
-                # Handle at_capacity redirect: peer is overloaded, try
-                # the suggested alternatives instead
-                if data.get("status") == "at_capacity":
-                    self.logger.info(
-                        f"Peer {peer_address} at capacity, "
-                        f"received {len(data.get('peers', {}))} alternatives"
-                    )
-                    return data
-                return data
+                return json.loads(response.payload.decode('utf-8'))
             except Exception:
                 return None
         elif response and response.msg_type == QuicMessageType.ERROR_RESPONSE:

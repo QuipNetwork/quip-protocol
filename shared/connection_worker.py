@@ -10,8 +10,11 @@ Request queue (parent -> worker):
     {"op": "shutdown"}
 
 Result queue (worker -> parent):
-    {"peer": "host:port", "success": True,  "peers_map": {...}}
-    {"peer": "host:port", "success": False, "peers_map": None}
+    {"peer": "host:port", "success": True,  "peers_map": {...},
+     "responder_descriptor": {...} | None,
+     "peer_versions": {host: version, ...} | None}
+    {"peer": "host:port", "success": False, "peers_map": None,
+     "responder_descriptor": None, "peer_versions": None}
 """
 from __future__ import annotations
 
@@ -54,10 +57,14 @@ async def _try_join_peer(
             peer, join_data, bypass_ban=bypass_ban,
         )
         peers_map = result.get("peers", {}) if result else None
+        responder_descriptor = result.get("descriptor") if result else None
+        peer_versions_map = result.get("peer_versions") if result else None
         result_queue.put({
             "peer": peer,
             "success": result is not None,
             "peers_map": peers_map,
+            "responder_descriptor": responder_descriptor,
+            "peer_versions": peer_versions_map,
         })
         if result is not None:
             log.info(f"JOIN succeeded with {peer}")
@@ -65,7 +72,13 @@ async def _try_join_peer(
             log.debug(f"JOIN failed with {peer}")
     except Exception as exc:
         log.debug(f"JOIN error with {peer}: {exc}")
-        result_queue.put({"peer": peer, "success": False, "peers_map": None})
+        result_queue.put({
+            "peer": peer,
+            "success": False,
+            "peers_map": None,
+            "responder_descriptor": None,
+            "peer_versions": None,
+        })
 
 
 def connection_worker_main(
@@ -73,6 +86,7 @@ def connection_worker_main(
     result_queue: mp.Queue,
     stop_event: mp.synchronize.Event,
     node_timeout: float,
+    connect_timeout: Optional[float] = None,
 ) -> None:
     """Child process entry point: own event loop, own NodeClient."""
     shutdown_flag = False
@@ -92,7 +106,7 @@ def connection_worker_main(
     asyncio.set_event_loop(loop)
 
     from shared.node_client import NodeClient
-    client = NodeClient(node_timeout=node_timeout)
+    client = NodeClient(node_timeout=node_timeout, connect_timeout=connect_timeout)
 
     async def _run() -> None:
         await client.start()
@@ -139,8 +153,9 @@ def connection_worker_main(
 class ConnectionWorkerHandle:
     """Parent-side wrapper around a persistent connection worker process."""
 
-    def __init__(self, node_timeout: float = 10.0):
+    def __init__(self, node_timeout: float = 10.0, connect_timeout: Optional[float] = None):
         self._node_timeout = node_timeout
+        self._connect_timeout = connect_timeout
         self._request_queue: mp.Queue = mp.Queue()
         self._result_queue: mp.Queue = mp.Queue()
         self._stop_event: mp.synchronize.Event = mp.Event()
@@ -155,6 +170,7 @@ class ConnectionWorkerHandle:
                 self._result_queue,
                 self._stop_event,
                 self._node_timeout,
+                self._connect_timeout,
             ),
             daemon=True,
         )
