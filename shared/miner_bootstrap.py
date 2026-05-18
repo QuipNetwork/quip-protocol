@@ -161,6 +161,12 @@ class BootstrapResult:
 
 
 async def bootstrap(config: BootstrapConfig) -> BootstrapResult:
+    # Local import keeps shared/miner_bootstrap independent of the
+    # validator_pool module's load order — this function is sometimes
+    # invoked from contexts (tests, faucet harness) that don't need
+    # the pool machinery; only the actual bootstrap flow does.
+    from shared.validator_pool import ValidatorPool
+
     keystore = load_or_generate(config.signer_key_path)
     logger.info(
         "using signing keystore: path=%s ss58=%s",
@@ -168,9 +174,15 @@ async def bootstrap(config: BootstrapConfig) -> BootstrapResult:
         keystore.signer.ss58_address(),
     )
 
-    client = SubstrateClient(urls=config.validators)
-    await client.connect()
+    pool = ValidatorPool(urls=config.validators)
     try:
+        # One-shot pool: bootstrap only ever needs the 'rpc' slot.
+        # The internal helpers (_maybe_seed_chain, ensure_funded,
+        # _ensure_registered) take a SubstrateClient directly so they
+        # stay testable without dragging the pool through every
+        # function signature.
+        client = await pool.get("rpc")
+
         topology_seeded = False
         difficulty_seeded = False
         if config.seed_chain:
@@ -178,7 +190,7 @@ async def bootstrap(config: BootstrapConfig) -> BootstrapResult:
                 client, config
             )
 
-        balance = await _ensure_funded(client, keystore, config)
+        balance = await ensure_funded(client, keystore, config)
         miner_registered = await _ensure_registered(client, keystore)
 
         return BootstrapResult(
@@ -190,7 +202,7 @@ async def bootstrap(config: BootstrapConfig) -> BootstrapResult:
             difficulty_seeded=difficulty_seeded,
         )
     finally:
-        await client.close()
+        await pool.close()
 
 
 # ----------------------------------------------------------------------
@@ -367,7 +379,7 @@ def _build_seed_topology(mt: Tuple[int, int]) -> Tuple[List[int], List[Tuple[int
 # ----------------------------------------------------------------------
 
 
-async def _ensure_funded(
+async def ensure_funded(
     client: SubstrateClient,
     keystore: HybridKeystoreFile,
     config: BootstrapConfig,
@@ -475,4 +487,5 @@ __all__ = [
     "DEFAULT_MIN_BALANCE_PLANCKS",
     "DEFAULT_FAUCET_TOP_UP_PLANCKS",
     "bootstrap",
+    "ensure_funded",
 ]
