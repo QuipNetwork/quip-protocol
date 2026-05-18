@@ -353,29 +353,18 @@ async def test_handle_result_raises_on_encoder_value_error(monkeypatch):
 # ----------------------------------------------------------------------
 
 
-def test_init_rejects_same_client_for_subscription():
-    """Passing the same SubstrateClient for both submission and subscription
-    deadlocks substrate-interface (websocket held in receive mode by the
-    subscribe loop). The constructor must reject this foot-gun."""
-    client = MagicMock(spec=SubstrateClient)
-    signer = MagicMock()
-    handle = MagicMock()
-    handle.miner_id = "test-0"
-    with pytest.raises(ValueError, match="separate SubstrateClient"):
-        SubstrateMinerController(
-            client=client,
-            signer=signer,
-            miner_handles=[handle],
-            subscription_client=client,  # the foot-gun
-        )
-
-
 def test_init_rejects_empty_miner_handles():
-    client = MagicMock(spec=SubstrateClient)
+    """Pool-based __init__ still validates that at least one handle is
+    attached. (The old foot-gun check rejecting `subscription_client is
+    client` is gone — the pool guarantees distinct slots by role name,
+    so the bug it prevented is impossible by construction.)"""
+    from shared.validator_pool import ValidatorPool
+
+    pool = ValidatorPool(urls=["ws://test:9944"])
     signer = MagicMock()
     with pytest.raises(ValueError, match="at least one MinerHandle"):
         SubstrateMinerController(
-            client=client,
+            pool=pool,
             signer=signer,
             miner_handles=[],
         )
@@ -709,10 +698,10 @@ async def _live_controller(
         }
         handle = MinerHandle(spec=spec)
 
-    client = SubstrateClient(url=DEFAULT_URL)
-    await client.connect()
+    from shared.validator_pool import ValidatorPool
+    pool = ValidatorPool(urls=[DEFAULT_URL])
     controller = SubstrateMinerController(
-        client=client,
+        pool=pool,
         signer=keystore.signer,
         miner_handles=[handle],
         topology_hash=chain_topology_hash,
@@ -721,6 +710,11 @@ async def _live_controller(
 
     run_task = asyncio.create_task(controller.run())
     try:
+        # Wait for pool to lazy-connect (run() calls pool.get('rpc'))
+        # so the yield's `client` ref is meaningful for tests that use
+        # it after the yield.
+        await asyncio.sleep(0)
+        client = await pool.get("rpc")
         yield controller, run_task, handle, keystore, client
     finally:
         controller.shutdown()
@@ -737,7 +731,7 @@ async def _live_controller(
             logging.getLogger(__name__).exception(
                 "controller.run() raised during _live_controller teardown"
             )
-        await client.close()
+        await pool.close()
         # When `core` owns the handle, let `core.close()` tear it down; the
         # caller is responsible for that. Otherwise we built the handle
         # ourselves and own its lifecycle.

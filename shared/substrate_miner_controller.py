@@ -7,13 +7,16 @@ the chain as a `QuantumPow.submit_proof` extrinsic.
 
 Lifecycle:
 
-    controller = SubstrateMinerController(client, signer, miner_handles)
-    await controller.run()      # blocks until shutdown() or fatal error
-    # ... external signal ...
-    controller.shutdown()       # idempotent
+    pool = ValidatorPool(urls=["ws://primary:9944", "ws://standby:9944"])
+    controller = SubstrateMinerController(pool, signer, miner_handles)
+    try:
+        await controller.run()  # blocks until shutdown() or fatal error
+    finally:
+        controller.shutdown()
+        await pool.close()
 
 The controller does not own the lifecycle of its inputs. Construction of the
-`SubstrateClient`, `Signer`, and `MinerHandle[]` is the caller's job, as is
+`ValidatorPool`, `Signer`, and `MinerHandle[]` is the caller's job, as is
 their cleanup. Phase 5 will wrap this together with `MinerCore` and the
 telemetry API so a single CLI entry point can spin everything up.
 
@@ -35,13 +38,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Awaitable, Callable, Optional, Protocol
 
+from websocket import WebSocketException
+
 from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from shared.signer import Signer
 from shared.substrate_client import NoValidatorReachable, SubstrateClient
-from websocket import WebSocketException
 from shared.substrate_submitter import encode_quantum_proof, submit_proof
+from shared.validator_pool import ValidatorPool
 from shared.substrate_types import (
     ExtrinsicReceipt,
     SubstrateMiningContext,
@@ -150,11 +155,12 @@ class SubstrateMinerController:
     docstring for the full lifecycle.
 
     Args:
-        client: SubstrateClient used for state queries and extrinsic
-            submission. Must NOT also be passed as `subscription_client` —
-            substrate-interface holds the websocket in receive mode during
-            `subscribe_block_headers`, deadlocking any concurrent call on
-            the same connection.
+        pool: ValidatorPool providing slot clients indexed by role. The
+            controller asks the pool for `rpc` (for state queries and
+            extrinsic submission) and `subscribe.pow` (for the head
+            subscription). The pool guarantees distinct clients per
+            role, which sidesteps the substrate-interface deadlock
+            where a single websocket can't both subscribe and submit.
         signer: Signer for the miner account; must be registered in
             `QuantumPow.Miners` before `run()` is invoked (verified at
             startup).
@@ -166,14 +172,11 @@ class SubstrateMinerController:
             mining against a rotated topology.
         on_proof_submitted: Optional async callback invoked after a
             successful `submit_proof`. Use for telemetry / metrics.
-        subscription_client: Optional dedicated SubstrateClient for the
-            head subscription. If `None`, the controller creates and
-            manages its own — see the deadlock note above.
     """
 
     def __init__(
         self,
-        client: SubstrateClient,
+        pool: ValidatorPool,
         signer: Signer,
         miner_handles: list[MinerHandle],
         *,
@@ -181,14 +184,20 @@ class SubstrateMinerController:
         on_proof_submitted: Optional[
             Callable[[ExtrinsicReceipt, SubstrateMiningContext], Awaitable[None]]
         ] = None,
-        subscription_client: Optional[SubstrateClient] = None,
         core: Optional[_MinerCoreStats] = None,
     ) -> None:
         if not miner_handles:
             raise ValueError(
                 "SubstrateMinerController requires at least one MinerHandle"
             )
-        self.client = client
+        self._pool = pool
+        # `client` and `_subscription_client` are populated lazily in
+        # `run()` — `__init__` must not touch the network. Existing
+        # method bodies still reference `self.client` directly; the
+        # type annotation is Optional only during the (synchronous)
+        # constructor window.
+        self.client: Optional[SubstrateClient] = None
+        self._subscription_client: Optional[SubstrateClient] = None
         # Optional MinerCore hook. When provided, the controller calls
         # `core.record_dispatch()` once per head (not per handle — that would
         # double-count when more than one miner is attached) and
@@ -197,27 +206,12 @@ class SubstrateMinerController:
         # `total_blocks_won` / `wins_per_miner` fields live without coupling
         # the controller's type to MinerCore.
         self.core = core
-        # substrate-interface holds the websocket in receive mode for the
-        # duration of `subscribe_block_headers`, which makes any concurrent
-        # submit_extrinsic / state_call on the same connection hang
-        # indefinitely. We use a dedicated subscription client by default —
-        # callers can inject their own (e.g. tests) but it must be a
-        # *separate* SubstrateClient instance from `client`.
-        #
-        # Pass the full validator rotation (not just `client.url`) so both
-        # clients share the same failover surface — otherwise a failover on
-        # the submit client could leave the subscription client anchored to
-        # a dead validator.
-        if subscription_client is None:
-            subscription_client = SubstrateClient(urls=client.urls)
-        elif subscription_client is client:
-            raise ValueError(
-                "subscription_client must be a separate SubstrateClient "
-                "instance — substrate-interface websockets are not "
-                "concurrent-safe across subscribe + submit"
-            )
-        self._subscription_client = subscription_client
-        self._owns_subscription_client = subscription_client is not client
+        # Client slots are pulled from the pool in `run()` — see comment
+        # there. We deliberately do NOT touch the network in __init__.
+        # The pool guarantees the rpc and subscribe slots are distinct
+        # SubstrateClient instances, which sidesteps the substrate-
+        # interface deadlock where a single websocket can't both
+        # subscribe and submit (receive-mode hold).
         self.signer = signer
         self.miner_handles = miner_handles
         self.topology_hash = topology_hash
@@ -264,6 +258,12 @@ class SubstrateMinerController:
 
     async def run(self) -> None:
         """Main loop. Returns on shutdown or fatal error."""
+        # Resolve slot clients from the pool. The pool lazy-connects on
+        # first get(), so this is where we actually touch the network —
+        # __init__ stays synchronous and side-effect free.
+        self.client = await self._pool.get("rpc")
+        self._subscription_client = await self._pool.get("subscribe.pow")
+
         account = self.signer.account_id_bytes()
         await self._verify_registered(account)
 
@@ -277,14 +277,12 @@ class SubstrateMinerController:
             )
             self._drainer_tasks.append(task)
 
-        # Connect the dedicated subscription client (if we own it) and
-        # start the subscription task. The blocking subscribe loop inside
-        # substrate-interface runs on the subscription client's executor
-        # — keeping it off the main client means submit_extrinsic /
-        # state_call traffic doesn't deadlock against an active
-        # subscription.
-        if self._owns_subscription_client:
-            await self._subscription_client.connect()
+        # Start the subscription task. The blocking subscribe loop
+        # inside substrate-interface runs on the subscription client's
+        # executor — keeping it off the main rpc slot means
+        # submit_extrinsic / state_call traffic doesn't deadlock
+        # against an active subscription. Both slots are already
+        # connected (the pool's get() did that).
         self._subscription_task = asyncio.create_task(
             self._subscribe_heads(),
             name="head-subscription",
@@ -364,12 +362,43 @@ class SubstrateMinerController:
                 latest = self._latest_head
                 if latest is not None:
                     head_hash, block_number = latest
-                    await self._handle_head(head_hash, block_number)
+                    try:
+                        await self._handle_head(head_hash, block_number)
+                    except (WebSocketException, ConnectionError) as exc:
+                        # `SubstrateClient._run` reconnects on these but
+                        # re-raises so the caller decides retry vs fail.
+                        # The next head (~6s) will land on the new
+                        # validator; drop this one rather than tearing
+                        # down the controller mid-rotation.
+                        logger.warning(
+                            "head handling hit a connection drop "
+                            "(%s: %s); failover already swung the client, "
+                            "next head will retry",
+                            type(exc).__name__,
+                            exc,
+                        )
                 continue
 
             if result_task in done:
                 envelope = result_task.result()
-                await self._handle_result(envelope)
+                try:
+                    await self._handle_result(envelope)
+                except (WebSocketException, ConnectionError) as exc:
+                    # Same shape as the head path: failover already
+                    # rotated; the chain will surface the result again as
+                    # a stale-drop or accept on the new validator. Don't
+                    # crash the controller.
+                    self.stats.submission_errors += 1
+                    self.stats.last_submission_error = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    logger.warning(
+                        "submit/result handling hit a connection drop "
+                        "(%s: %s); failover swung the client, "
+                        "controller continues",
+                        type(exc).__name__,
+                        exc,
+                    )
                 continue
 
     async def _handle_head(self, head_hash: bytes, block_number: int) -> None:
@@ -735,15 +764,9 @@ class SubstrateMinerController:
                 )
         self._drainer_tasks.clear()
         self._subscription_task = None
-        if self._owns_subscription_client:
-            try:
-                await self._subscription_client.close()
-            except Exception as exc:  # noqa: BLE001 — log cleanup failures
-                logger.warning(
-                    "teardown: subscription_client close raised %s: %s",
-                    type(exc).__name__,
-                    exc,
-                )
+        # Slot clients are owned by the pool; do NOT close them here.
+        # The pool's close() (called from the CLI's outer try/finally)
+        # tears them down at process shutdown.
 
 
 # ----------------------------------------------------------------------
