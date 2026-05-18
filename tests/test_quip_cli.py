@@ -340,15 +340,9 @@ def test_guard_b_validators_unreachable_renders_attempt_log(monkeypatch, tmp_pat
                          message="timed out"),
     ])
 
-    async def _raise_connect(_client):
-        raise fail
-
-    monkeypatch.setattr(quip_cli, "_connect_or_fail", _raise_connect)
-
-    # The replacement above doesn't translate to ClickException — call the
-    # real translator with the prepared exception:
-    async def fake_connect_or_fail(client):
-        # Simulate the real helper: convert NoValidatorReachable -> ClickException
+    # Simulate the real helper: convert NoValidatorReachable -> ClickException.
+    # Signature mirrors the pool-aware `_connect_or_fail(pool, role)`.
+    async def fake_connect_or_fail(_pool, role="rpc"):
         urls = ",".join(a.url for a in fail.attempts)
         reasons = ",".join(a.exc_type for a in fail.attempts)
         import click as _click

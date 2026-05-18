@@ -34,6 +34,7 @@ from shared.miner_bootstrap import (
     DEFAULT_MIN_BALANCE_PLANCKS,
     BootstrapConfig,
     bootstrap,
+    ensure_funded,
 )
 from shared.miner_config import (
     MinerConfigError,
@@ -48,6 +49,7 @@ from shared.substrate_client import (
 )
 from shared.substrate_miner_controller import SubstrateMinerController
 from shared.telemetry_api import TelemetryApiServer
+from shared.validator_pool import ValidatorPool
 
 
 _VALIDATOR_HELP = (
@@ -135,7 +137,12 @@ def _resolve_runtime_config(
     merged = merge_config(toml_data, cli_kwargs)
     if defaults:
         for key, value in defaults.items():
-            if not merged.get(key):
+            # `is None` (not truthy) so an explicit falsy override from
+            # TOML — `rest_port = 0`, `auto_mine = false`, `""` — wins
+            # over the default. `validate_merged` rejects empty signer_key
+            # downstream, so the only "missing" state we paper over here
+            # is genuine absence.
+            if merged.get(key) is None:
                 merged[key] = value
     try:
         validate_merged(merged)
@@ -175,15 +182,21 @@ def _load_keystore_or_fail(path_str: str):
         ) from exc
 
 
-async def _connect_or_fail(client: SubstrateClient) -> None:
+async def _connect_or_fail(
+    pool: "ValidatorPool", role: str = "rpc"
+) -> SubstrateClient:
     """Guard B — validators reachable.
 
-    Wraps `SubstrateClient.connect()`. On `NoValidatorReachable`, renders
-    the structured attempt log as `urls=<csv> reasons=<csv>` and raises
+    Wraps `pool.get(role)` (which lazy-connects the slot's underlying
+    `SubstrateClient`). On `NoValidatorReachable`, renders the
+    structured attempt log as `urls=<csv> reasons=<csv>` and raises
     ClickException with `validators-unreachable`.
+
+    Returns the connected client so the caller can use it directly
+    (e.g., for query_balance during Guard C).
     """
     try:
-        await client.connect()
+        return await pool.get(role)
     except NoValidatorReachable as exc:
         urls = ",".join(a.url for a in exc.attempts)
         reasons = ",".join(a.exc_type for a in exc.attempts)
@@ -226,8 +239,16 @@ async def _ensure_funded_or_fail(
         min_balance_plancks=min_balance,
     )
     try:
-        from shared.miner_bootstrap import _ensure_funded  # local: avoid cycle at import
-        return await _ensure_funded(client, keystore, cfg)
+        return await ensure_funded(client, keystore, cfg)
+    except NoValidatorReachable as exc:
+        # Faucet path stays connected via SubstrateClient; if the rotation
+        # collapses mid-settlement, surface it as the same code the connect
+        # guard uses rather than burying it in `wallet-faucet-failed`.
+        urls = ",".join(a.url for a in exc.attempts)
+        reasons = ",".join(a.exc_type for a in exc.attempts)
+        raise click.ClickException(
+            f"validators-unreachable urls={urls} reasons={reasons}"
+        ) from exc
     except Exception as exc:  # noqa: BLE001 — translated to a CLI error code
         raise click.ClickException(
             f"wallet-faucet-failed ss58={keystore.signer.ss58_address()} "
@@ -421,6 +442,7 @@ def quip_miner_register_solver(
     merged = _resolve_runtime_config(
         config_path=config_path,
         cli_kwargs={"validators": validators, "signer_key": signer_key_path},
+        defaults={"signer_key": "~/.quip-miner/signing.json"},
     )
     keystore = _load_keystore_or_fail(merged["signer_key"])
     mt = MinerType.from_kind(miner_type)
@@ -491,6 +513,7 @@ def quip_miner_deregister_solver(
     merged = _resolve_runtime_config(
         config_path=config_path,
         cli_kwargs={"validators": validators, "signer_key": signer_key_path},
+        defaults={"signer_key": "~/.quip-miner/signing.json"},
     )
     keystore = _load_keystore_or_fail(merged["signer_key"])
 
@@ -679,16 +702,18 @@ async def _run_concurrent_miner(
 
     # Declare all network resources before the try so the finally block can
     # always clean up whatever was partially constructed on setup failure.
-    client = None
-    mempool_client = None
+    pool: Optional[ValidatorPool] = None
     telemetry = None
     pow_controller = None
     mempool_controller = None
 
     try:
-        client = SubstrateClient(urls=tuple(validators))
-        # Guard B — validators reachable.
-        await _connect_or_fail(client)
+        pool = ValidatorPool(urls=tuple(validators))
+        # Guard B — validators reachable. _connect_or_fail returns the
+        # rpc slot client, lazy-connected through the pool. PoW and
+        # mempool controllers share this pool; subscribe slots come
+        # from the same pool and rotate in lockstep.
+        client = await _connect_or_fail(pool, role="rpc")
         # Guard C — wallet funded (with optional faucet top-up).
         await _ensure_funded_or_fail(
             client,
@@ -730,7 +755,7 @@ async def _run_concurrent_miner(
                 return 4
             pow_topology_hash = snapshot.topology_hash
             pow_controller = SubstrateMinerController(
-                client=client,
+                pool=pool,
                 signer=keystore.signer,
                 miner_handles=pow_handles,
                 topology_hash=pow_topology_hash,
@@ -747,16 +772,15 @@ async def _run_concurrent_miner(
             mempool_topology_hash = topology_hash_from_nodes_edges(
                 sampler_nodes, sampler_edges
             )
-            # In `both` mode the mempool controller needs its own client to
-            # avoid serializing submissions behind the PoW client's asyncio
-            # lock. In mempool-only mode `client` has no contention -- reuse it.
-            mempool_client_ref = client
-            if pow_handles:
-                mempool_client = SubstrateClient(urls=tuple(validators))
-                await mempool_client.connect()
-                mempool_client_ref = mempool_client
+            # No more secondary client construction: both controllers
+            # draw from the same pool. Distinct subscribe slots
+            # ('subscribe.pow' vs 'subscribe.mempool') keep the
+            # receive-mode deadlock out by construction; the shared
+            # 'rpc' slot is fine because its _call_lock already
+            # serializes RPC traffic — splitting it across two clients
+            # only hid lock contention, never eliminated it.
             mempool_controller = MempoolMinerController(
-                client=mempool_client_ref,
+                pool=pool,
                 signer=keystore.signer,
                 miner_handles=mempool_handles,
                 sampler_topology_hash=mempool_topology_hash,
@@ -863,10 +887,12 @@ async def _run_concurrent_miner(
             click.echo(f"  mempool stats: {mempool_controller.stats}")
         if telemetry is not None:
             await telemetry.stop()
-        if mempool_client is not None:
-            await mempool_client.close()
-        if client is not None:
-            await client.close()
+        if pool is not None:
+            # One close() tears down every pool-owned slot (rpc,
+            # subscribe.pow, subscribe.mempool). Idempotent against
+            # slots the mempool controller already closed during
+            # teardown.
+            await pool.close()
         core.close()
 
 
@@ -1127,7 +1153,7 @@ def quip_miner_qpu(
     faucet_url: Optional[str],
     qpu_type: str,
     mode: str,
-    daily_budget,
+    daily_budget: Optional[str],
     topology_spec: str,
     rest_port: int,
 ) -> None:
