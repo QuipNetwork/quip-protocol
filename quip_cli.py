@@ -448,10 +448,11 @@ def quip_miner_register_solver(
     mt = MinerType.from_kind(miner_type)
 
     async def _do() -> int:
-        client = SubstrateClient(urls=tuple(merged["validators"]))
+        pool = ValidatorPool(urls=tuple(merged["validators"]))
         try:
-            # Guard B — validators reachable.
-            await _connect_or_fail(client)
+            # Guard B — validators reachable. One-shot pool: a single
+            # 'rpc' slot covers the whole register flow.
+            client = await _connect_or_fail(pool, role="rpc")
             existing = await client.query_solver(keystore.signer.account_id_bytes())
             if existing is not None:
                 if existing.solver_type != mt:
@@ -484,7 +485,7 @@ def quip_miner_register_solver(
             )
             return 0
         finally:
-            await client.close()
+            await pool.close()
 
     raise SystemExit(asyncio.run(_do()))
 
@@ -518,10 +519,10 @@ def quip_miner_deregister_solver(
     keystore = _load_keystore_or_fail(merged["signer_key"])
 
     async def _do() -> int:
-        client = SubstrateClient(urls=tuple(merged["validators"]))
+        pool = ValidatorPool(urls=tuple(merged["validators"]))
         try:
             # Guard B — validators reachable.
-            await _connect_or_fail(client)
+            client = await _connect_or_fail(pool, role="rpc")
             existing = await client.query_solver(keystore.signer.account_id_bytes())
             if existing is None:
                 click.echo("solver not registered; nothing to do")
@@ -545,7 +546,7 @@ def quip_miner_deregister_solver(
             )
             return 0
         finally:
-            await client.close()
+            await pool.close()
 
     raise SystemExit(asyncio.run(_do()))
 
