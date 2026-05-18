@@ -395,15 +395,18 @@ async def test_controller_submits_solution_end_to_end(tmp_path):
     }
     handle = MinerHandle(spec=spec)
 
-    client = SubstrateClient(url=DEFAULT_URL)
-    await client.connect()
+    from shared.validator_pool import ValidatorPool
+    pool = ValidatorPool(urls=[DEFAULT_URL])
     controller = MempoolMinerController(
-        client=client,
+        pool=pool,
         signer=keystore.signer,
         miner_handles=[handle],
         sampler_topology_hash=sampler_topology_hash,
         solver_type=solver_type,
     )
+    # Resolve rpc once so the test fixture's later setup
+    # (events, balances) shares a connected client.
+    client = await pool.get("rpc")
 
     solution_submitted = asyncio.Event()
 
@@ -442,7 +445,7 @@ async def test_controller_submits_solution_end_to_end(tmp_path):
             await asyncio.wait_for(run_task, timeout=10)
         except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
             pass
-        await client.close()
+        await pool.close()
         handle.req.put({"op": "shutdown"})
         handle.proc.join(timeout=5)
         if handle.proc.is_alive():

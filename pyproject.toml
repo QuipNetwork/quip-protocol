@@ -24,6 +24,8 @@ dependencies = [
     # keygen and isn't on PyPI under a stable name — keep dilithium-py as
     # the canonical path until ML-DSA signing rate becomes a bottleneck.
     "dilithium-py>=1.0",
+    # tomllib joined stdlib in 3.11 — fall back to the upstream package on 3.10.
+    "tomli>=2.0.1; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]

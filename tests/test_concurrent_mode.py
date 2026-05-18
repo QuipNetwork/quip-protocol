@@ -159,7 +159,7 @@ def test_cpu_default_mode_is_pow(monkeypatch):
     runner = CliRunner()
     result = runner.invoke(
         quip_miner,
-        ["cpu", "--node-url", "ws://localhost:9944"],
+        ["cpu", "--validator", "ws://localhost:9944"],
         catch_exceptions=False,
     )
     assert result.exit_code == 0
@@ -181,7 +181,7 @@ def test_cpu_mode_mempool_forwarded(monkeypatch):
     runner = CliRunner()
     result = runner.invoke(
         quip_miner,
-        ["cpu", "--node-url", "ws://localhost:9944", "--mode", "mempool"],
+        ["cpu", "--validator", "ws://localhost:9944", "--mode", "mempool"],
         catch_exceptions=False,
     )
     assert result.exit_code == 0
@@ -203,7 +203,7 @@ def test_cpu_mode_both_forwarded(monkeypatch):
     runner = CliRunner()
     result = runner.invoke(
         quip_miner,
-        ["cpu", "--node-url", "ws://localhost:9944", "--mode", "both"],
+        ["cpu", "--validator", "ws://localhost:9944", "--mode", "both"],
         catch_exceptions=False,
     )
     assert result.exit_code == 0

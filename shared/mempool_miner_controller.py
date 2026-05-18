@@ -50,6 +50,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
+from websocket import WebSocketException
+
 from shared.logging_config import get_logger
 from shared.mempool_types import (
     JobOrder,
@@ -62,7 +64,8 @@ from shared.mempool_types import (
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from shared.signer import Signer
-from shared.substrate_client import SubstrateClient
+from shared.substrate_client import NoValidatorReachable, SubstrateClient
+from shared.validator_pool import ValidatorPool
 
 
 logger = get_logger("mempool_miner_controller")
@@ -155,7 +158,7 @@ class MempoolMinerController:
 
     def __init__(
         self,
-        client: SubstrateClient,
+        pool: ValidatorPool,
         signer: Signer,
         miner_handles: List[MinerHandle],
         sampler_topology_hash: bytes,
@@ -166,7 +169,6 @@ class MempoolMinerController:
         on_reward_claimed: Optional[
             Callable[[int, int], Awaitable[None]]
         ] = None,
-        subscription_client: Optional[SubstrateClient] = None,
         claim_poll_interval: float = 30.0,
         core: Optional[Any] = None,
     ) -> None:
@@ -179,17 +181,13 @@ class MempoolMinerController:
                 f"sampler_topology_hash must be 32 bytes, got "
                 f"{len(sampler_topology_hash)}"
             )
-        self.client = client
-        if subscription_client is None:
-            subscription_client = SubstrateClient(url=client.url)
-        elif subscription_client is client:
-            raise ValueError(
-                "subscription_client must be a separate SubstrateClient "
-                "instance — substrate-interface websockets are not "
-                "concurrent-safe across subscribe + submit"
-            )
-        self._subscription_client = subscription_client
-        self._owns_subscription_client = True
+        self._pool = pool
+        # Slot clients lazy-resolved in run() — pool guarantees
+        # 'rpc' and 'subscribe.mempool' are distinct SubstrateClient
+        # instances, sidestepping the substrate-interface
+        # subscribe-during-submit deadlock by construction.
+        self.client: Optional[SubstrateClient] = None
+        self._subscription_client: Optional[SubstrateClient] = None
         self.signer = signer
         self.miner_handles = miner_handles
         self.sampler_topology_hash = sampler_topology_hash
@@ -238,6 +236,12 @@ class MempoolMinerController:
 
     async def run(self) -> None:
         """Main loop. Returns on shutdown or fatal error."""
+        # Resolve slot clients from the pool. Connections open here
+        # (pool.get() lazy-connects), keeping __init__ synchronous
+        # and side-effect free.
+        self.client = await self._pool.get("rpc")
+        self._subscription_client = await self._pool.get("subscribe.mempool")
+
         account = self.signer.account_id_bytes()
         await self._verify_solver_registered(account)
 
@@ -248,8 +252,6 @@ class MempoolMinerController:
             )
             self._drainer_tasks.append(task)
 
-        if self._owns_subscription_client:
-            await self._subscription_client.connect()
         self._subscription_task = asyncio.create_task(
             self._subscribe_heads(),
             name="mempool-head-subscription",
@@ -281,7 +283,11 @@ class MempoolMinerController:
         # task.cancel() doesn't unstick it and the default executor
         # eventually times out at 300s during loop shutdown. Closing the
         # websocket forces the recv to error out so the thread can exit.
-        if self._owns_subscription_client:
+        #
+        # The slot is pool-owned, but close() is idempotent — pool.close()
+        # at process shutdown will see _iface is already None for this
+        # slot and skip cleanly.
+        if self._subscription_client is not None:
             try:
                 await self._subscription_client.close()
             except Exception:  # noqa: BLE001
@@ -333,16 +339,53 @@ class MempoolMinerController:
     # ------------------------------------------------------------------
 
     async def _subscribe_heads(self) -> None:
+        """Subscribe to new best heads with failover on validator drop.
+
+        Mirrors `SubstrateMinerController._subscribe_heads`:
+          - clean return → exit loop
+          - `WebSocketException` / `ConnectionError` → one `reconnect()`
+            on the subscription client, then re-subscribe
+          - `NoValidatorReachable` from reconnect → fatal; record context
+            and trigger shutdown
+          - any other exception → fatal; record and shut down
+        """
+
         async def _on_head(block_hash: bytes, block_number: int) -> None:
             self._latest_head = (block_hash, block_number)
             self._head_signal.set()
 
-        try:
-            await self._subscription_client.subscribe_new_heads(_on_head)
-        except Exception as exc:  # noqa: BLE001 — surface RPC errors to logs
-            if not self._shutdown_event.is_set():
-                logger.exception("head subscription failed: %s", exc)
-                self._shutdown_event.set()
+        while not self._shutdown_event.is_set():
+            try:
+                await self._subscription_client.subscribe_new_heads(_on_head)
+                return
+            except (WebSocketException, ConnectionError) as exc:
+                logger.warning(
+                    "mempool head subscription dropped on %s (%s: %s); "
+                    "failing over",
+                    getattr(
+                        self._subscription_client, "current_url", "<unknown>"
+                    ),
+                    type(exc).__name__,
+                    exc,
+                )
+                try:
+                    await self._subscription_client.reconnect()
+                except NoValidatorReachable as fatal:
+                    logger.error(
+                        "mempool subscription failover exhausted; "
+                        "triggering shutdown:\n%s",
+                        fatal,
+                    )
+                    self._shutdown_event.set()
+                    return
+                # loop iteration: re-subscribe on the new validator
+            except Exception as exc:  # noqa: BLE001 — surface to logs
+                if not self._shutdown_event.is_set():
+                    logger.exception(
+                        "mempool head subscription crashed: %s", exc
+                    )
+                    self._shutdown_event.set()
+                return
 
     async def _refresh_pending_from_storage(self) -> None:
         """Pre-fill the pending queue from any currently-Opened orders.

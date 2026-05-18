@@ -1,0 +1,32 @@
+# quip-miner example config — v0.2 schema
+#
+# Use with any quip-miner subcommand:
+#   quip-miner cpu --config ./quip-miner.example.toml
+#   quip-miner gpu --config ./quip-miner.example.toml --gpu-backend metal
+#   quip-miner qpu --config ./quip-miner.example.toml --qpu-type dwave
+#
+# CLI flags override these defaults on a per-key basis. Empty CLI values
+# (no flag passed, empty multiple=True tuple) fall back to TOML.
+#
+# Replaces the v0.1 quip-node.example.toml. The old [global] table with
+# peer/heartbeat/tofu/trust_db/rest_*/tls_* fields was removed when the
+# v0.2 refactor delegated networking to the substrate validator —
+# quip-miner now connects directly to a validator RPC and that's all.
+
+[miner]
+# Ordered failover list — tried in order at startup, live-rotated on
+# disconnect. Set at least one. CLI: --validator URL (repeatable).
+validators = [
+    "ws://quip-validator:9944",
+    # "wss://validator-2.quip.network/rpc",
+]
+
+# Path to the sr25519 + ML-DSA-44 hybrid keystore. Create with:
+#   quip-miner keygen --out ~/.quip-miner/signing.json
+# CLI: --signer-key PATH
+signer_key = "~/.quip-miner/signing.json"
+
+# Optional. When set, an underfunded wallet is topped up through this
+# faucet bot at startup instead of failing fast. Leave commented out
+# in production (the faucet is dev-only).
+# faucet_url = "http://localhost:8087"

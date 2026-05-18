@@ -1,59 +1,19 @@
-[global]
-node_name = "Quantum Node Name"  # Optional human-readable name for your node.
+# quip-miner gpu — v0.2 example config
+#
+#   quip-miner gpu --config ./quip.network.gpu.example.toml --gpu-backend local
+#   quip-miner gpu --config ./quip.network.gpu.example.toml --gpu-backend metal
+#   quip-miner gpu --config ./quip.network.gpu.example.toml --gpu-backend modal
+#
+# CUDA / Apple Metal / Modal Labs cloud — pick a backend on the CLI.
 
-# Local binding address (ip address) and port to listen to.
-listen = "0.0.0.0"
-port = 20049 # ("QN" -> little endian unsigned int is 0x514E -> 0x4E51 = 20049)
+[miner]
+validators = [
+    "ws://quip-validator:9944",
+]
+signer_key = "~/.quip-miner/signing.json"
+# faucet_url = "http://localhost:8087"
 
-#public_host = "my.dns.or.ip:public_port"
-
-# Optional deterministic key generation
-# Defaults to generate a brand new key on boot.
-secret = "your-secret-here" # Used to generate a deterministic key pair for this node
-
-# Enable mining on startup when no peers can be found.
-# Defaults to exit if a peer cannot be found.
-# auto_mine = true
-
-
-# Peers to try and connect to (defaults shown below)
-# peer = ["qpu-1.nodes.quip.network:20049", "cpu-1.quip.carback.us:20049", "gpu-1.quip.carback.us:20049", "gpu-2.quip.carback.us:20050", "nodes.quip.network:20049"]
-
-timeout = 3  # Timeout for peer connections and communications in seconds
-heartbeat_interval = 15  # Interval for sending heartbeats to peers in seconds
-heartbeat_timeout = 300  # Timeout for waiting for heartbeats from peers in seconds
-# Number of peers to gossip to at a time. Defaults to 3, you should never need to change this.
-# fanout = 3
-
-# TLS/SSL Configuration
-verify_tls = false  # Verify TLS certificates when connecting to peers
-# ca_bundle = "/path/to/ca-certificates.crt"  # Custom CA certificate bundle (optional)
-
-# Logging configuration
-log_level = "INFO"  # DEBUG, INFO, WARNING, ERROR
-node_log = "logs/quip-node.log"  # Path to main node log file (optional, defaults to stderr)
-http_log = "logs/quip-node-http.log"  # Path to HTTP/aiohttp log file (optional, suppresses aiohttp logs if not set)
-
-# if any of the following are defined then they will be spun up as miner processes to mine blocks.
-# By default a single CPU miner is created.
-
-# [cpu]  # Commented out for GPU-only node
-# Limit CPU worker threads; max is number of logical CPUs on your system
-# num_cpus = 4
-
-[gpu]
-# Global GPU defaults
-# utilization = 100
-# yielding = false
-# sms_per_nonce = 4
-
-# Discovery commands:
-#   CUDA:  nvidia-smi --query-gpu=index,name --format=csv,noheader
-#   Metal: system_profiler SPDisplaysDataType | grep 'Chipset Model'
-
-[cuda.0]
-
-[cuda.1]
-
-# Apple Silicon example:
-# [metal]
+# Forward-compat subtable for Phase 6+. Today the GPU miner config is
+# driven entirely by --gpu-backend on the CLI.
+[miner.gpu]
+# backend = "metal"   # local | metal | modal

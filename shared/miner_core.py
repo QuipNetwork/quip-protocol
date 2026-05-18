@@ -10,7 +10,7 @@ those concerns now.
 Lifecycle:
 
     core = MinerCore(node_id="miner-1", miners_config={"cpu": {"num_cpus": 4}})
-    controller = SubstrateMinerController(client, signer, core.miner_handles)
+    controller = SubstrateMinerController(pool, signer, core.miner_handles)
     try:
         await controller.run()
     finally:

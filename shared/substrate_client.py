@@ -25,12 +25,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from typing import Any, Awaitable, Callable, Literal, Optional
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Literal, Optional, Sequence
 
 from scalecodec.base import ScaleBytes
 from scalecodec.types import GenericExtrinsic
 from scalecodec.utils.ss58 import ss58_decode
 from substrateinterface import SubstrateInterface
+from websocket import WebSocketException
 
 from shared.hybrid_signer import HybridSigner
 from shared.logging_config import get_logger
@@ -60,23 +62,100 @@ logger = get_logger("substrate_client")
 WaitFor = Literal["sent", "inblock", "finalized"]
 
 
+@dataclass(frozen=True)
+class ValidatorAttempt:
+    """One entry in the connect-attempt log surfaced by NoValidatorReachable."""
+
+    url: str
+    exc_type: str
+    message: str
+
+
+class NoValidatorReachable(RuntimeError):
+    """Raised when every URL in a SubstrateClient's validator list refuses.
+
+    Carries the structured attempt log so callers (CLI guards, tests) can
+    inspect each failure programmatically; `str(exc)` renders the operator-
+    facing message.
+    """
+
+    def __init__(self, attempts: Sequence[ValidatorAttempt]) -> None:
+        self.attempts = tuple(attempts)
+        super().__init__(self._render(self.attempts))
+
+    @staticmethod
+    def _render(attempts: Sequence[ValidatorAttempt]) -> str:
+        lines = ["no validators reachable. Attempts:"]
+        for a in attempts:
+            lines.append(f"  {a.url}  -> {a.exc_type}: {a.message}")
+        return "\n".join(lines)
+
+
 class SubstrateClient:
-    """Async-friendly wrapper over a single substrate websocket connection.
+    """Async-friendly wrapper over a substrate websocket with failover.
 
     Usage:
 
+        # Single URL (back-compat):
         client = SubstrateClient(url="ws://localhost:9944")
+
+        # Validator list — tried in order at connect() time:
+        client = SubstrateClient(urls=["ws://primary:9944", "ws://standby:9944"])
+
         await client.connect()
         head = await client.get_head()
-        snapshot = await client.get_mining_snapshot(at=head)
         ...
         await client.close()
 
     The class is intentionally a thin adapter — no caching, no state machine.
     """
 
-    def __init__(self, url: str) -> None:
-        self.url = url
+    def __init__(
+        self,
+        url: Optional[str] = None,
+        *,
+        urls: Optional[Sequence[str]] = None,
+        pool: Optional[Any] = None,
+    ) -> None:
+        # `pool` is typed as `Any` to avoid a circular import with
+        # `shared.validator_pool`. Duck-typed: pool just needs an
+        # `async advance_rotation(from_url: str) -> str` method.
+        if url is not None and urls is not None:
+            raise ValueError(
+                "SubstrateClient: pass exactly one of `url=` or `urls=`, not both"
+            )
+        if url is None and urls is None:
+            raise ValueError(
+                "SubstrateClient: pass `url=<str>` or `urls=<list of str>`"
+            )
+        if urls is not None:
+            url_list = list(urls)
+            if not url_list:
+                raise ValueError(
+                    "SubstrateClient: `urls=` must contain at least one validator URL"
+                )
+        else:
+            url_list = [url]  # type: ignore[list-item]
+        self._urls: tuple[str, ...] = tuple(url_list)
+        # `url` retained for back-compat reads — points at whichever URL is
+        # currently connected (or the first one before connect()).
+        self.url: str = self._urls[0]
+        self.current_url: str = self._urls[0]
+        # Public read-only view of the validator rotation. Controllers
+        # propagate this to their separate subscription clients so both
+        # clients see the same failover surface.
+        self.urls: tuple[str, ...] = self._urls
+        self._current_index: int = 0
+        # Guard against `_run` triggering a reconnect that, while running,
+        # encounters another websocket exception. Without this we could
+        # recurse failover->failover->… One failover attempt per `_run`,
+        # period.
+        self._reentrant_failover: bool = False
+        # Optional ValidatorPool. When set, `_run`'s failover handler
+        # delegates the URL choice to the pool instead of running the
+        # client's own circular rotation — so multiple clients sharing
+        # one pool advance in lockstep on a validator death.
+        self._pool: Optional[Any] = pool
         self._iface: Optional[SubstrateInterface] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # `SubstrateInterface` keeps a single websocket and isn't safe
@@ -102,16 +181,87 @@ class SubstrateClient:
             return
         self._loop = asyncio.get_running_loop()
         self._call_lock = asyncio.Lock()
-        # SubstrateInterface() opens the websocket eagerly in its constructor.
-        self._iface = await self._run(lambda: SubstrateInterface(url=self.url))
-        logger.info("substrate client connected: url=%s", self.url)
+        await self._connect_from_index(0)
+
+    async def reconnect(self, *, target_url: Optional[str] = None) -> None:
+        """Drop the current iface and rotate to the next healthy validator.
+
+        Default walk (no `target_url`): start at `(current_index + 1)`
+        and walk circularly, so a live validator gets picked even if it
+        sits *behind* the dead one in the list, and a transient blip on
+        the primary can still recover by wrap-around.
+
+        Pool-driven walk (`target_url` set): start at the URL the pool
+        chose. If that URL is also dead, the walk continues forward
+        from there — the pool may simply have been one step behind
+        reality.
+
+        Raises `NoValidatorReachable` if every URL refuses.
+        """
+        await self._close_iface()
+        if target_url is not None:
+            try:
+                start = self._urls.index(target_url)
+            except ValueError:
+                # Pool gave us a URL we don't know about — shouldn't
+                # happen since pool was built from our URL list, but
+                # be defensive: fall back to the default walk.
+                start = (self._current_index + 1) % len(self._urls)
+        else:
+            start = (self._current_index + 1) % len(self._urls)
+        await self._connect_from_index(start)
+
+    async def _connect_from_index(self, start: int) -> None:
+        attempts: list[ValidatorAttempt] = []
+        n = len(self._urls)
+        for offset in range(n):
+            idx = (start + offset) % n
+            candidate = self._urls[idx]
+            try:
+                # SubstrateInterface() opens the websocket eagerly in its
+                # constructor. Use `_raw_run` here so a connect failure does
+                # NOT trigger the failover-from-_run path; we're already
+                # iterating validators ourselves.
+                self._iface = await self._raw_run(
+                    lambda u=candidate: SubstrateInterface(url=u)
+                )
+            except Exception as exc:  # noqa: BLE001 — logged + collected below
+                attempts.append(
+                    ValidatorAttempt(
+                        url=candidate,
+                        exc_type=type(exc).__name__,
+                        message=str(exc),
+                    )
+                )
+                logger.warning(
+                    "substrate client could not reach %s: %s: %s",
+                    candidate,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            self.url = candidate
+            self.current_url = candidate
+            self._current_index = idx
+            logger.info("substrate client connected: url=%s", candidate)
+            return
+        raise NoValidatorReachable(attempts)
 
     async def close(self) -> None:
+        await self._close_iface()
+
+    async def _close_iface(self) -> None:
         if self._iface is None:
             return
         iface = self._iface
         self._iface = None
-        await self._run(iface.close)
+        try:
+            await self._raw_run(iface.close)
+        except Exception as exc:  # noqa: BLE001 — dead-socket close races
+            # A failing close() on a websocket that's already dropped is
+            # routine during failover; don't let it mask the underlying
+            # reconnect work.
+            logger.debug("ignoring substrate iface close() error: %s", exc)
 
     # ------------------------------------------------------------------
     # Chain head queries
@@ -119,10 +269,14 @@ class SubstrateClient:
 
     async def get_head(self) -> bytes:
         """Best block hash as raw bytes."""
-        return bytes.fromhex(_strip_0x(await self._run(self._iface.get_chain_head)))
+        return bytes.fromhex(
+            _strip_0x(await self._run(lambda: self._iface.get_chain_head()))
+        )
 
     async def get_finalized_head(self) -> bytes:
-        return bytes.fromhex(_strip_0x(await self._run(self._iface.get_chain_finalised_head)))
+        return bytes.fromhex(
+            _strip_0x(await self._run(lambda: self._iface.get_chain_finalised_head()))
+        )
 
     async def get_block_number(self, at: Optional[bytes] = None) -> int:
         block_hash = _hex(at) if at is not None else None
@@ -603,11 +757,19 @@ class SubstrateClient:
         async def _handle_head(number: int) -> None:
             # The dispatch callback can fire after `close()` has cleared
             # `self._iface` — the reader thread keeps draining for a beat
-            # after the websocket is told to close. Bail quietly in that
-            # window rather than raising AttributeError into the future's
-            # done-callback.
+            # after the websocket is told to close. Same condition holds
+            # briefly during `reconnect()` between `_close_iface` and the
+            # new `_connect_from_index` assignment. Log at debug so the
+            # in-flight notification isn't silently invisible during a
+            # failover, then bail rather than raising AttributeError into
+            # the future's done-callback.
             iface = self._iface
             if iface is None:
+                logger.debug(
+                    "subscribe_new_heads: dropping head number=%s — "
+                    "iface is None (close() or reconnect() in flight)",
+                    number,
+                )
                 return
             block_hash_hex = await self._run(
                 lambda: iface.get_block_hash(block_id=number)
@@ -657,12 +819,65 @@ class SubstrateClient:
     # ------------------------------------------------------------------
 
     async def _run(self, fn):
-        """Run a blocking substrate-interface call on the default executor.
+        """Run a blocking substrate-interface call with failover-on-loss.
 
         Almost all callers go through this method, so the `_call_lock`
-        taken here guarantees serial access to the underlying
+        taken inside `_raw_run` guarantees serial access to the underlying
         `SubstrateInterface`. The exception is `subscribe_new_heads`,
         which intentionally bypasses the lock — see its docstring.
+
+        Failover semantics: a `WebSocketException` or `ConnectionError`
+        from the call body triggers one `reconnect()` attempt, then the
+        *original* exception is re-raised so the caller's retry logic
+        runs. The bound-method lambdas in this file capture
+        `self._iface` lazily, so a follow-up call after failover hits
+        the fresh iface. If `reconnect()` itself can't find a healthy
+        validator, `NoValidatorReachable` propagates instead.
+        """
+        try:
+            return await self._raw_run(fn)
+        except (WebSocketException, ConnectionError) as exc:
+            if self._reentrant_failover:
+                # We're already inside a failover attempt — bubble up the
+                # raw error so the outer failover handler sees it.
+                raise
+            logger.warning(
+                "substrate _run failed on %s (%s: %s); attempting failover",
+                self.current_url,
+                type(exc).__name__,
+                exc,
+            )
+            self._reentrant_failover = True
+            try:
+                # May raise NoValidatorReachable — that's the intended
+                # signal upstream. The original exception is shadowed in
+                # that case; operators get the structured attempt log.
+                if self._pool is not None:
+                    # Pool-driven rotation: ask the pool which URL to
+                    # move to. The pool coordinates across all slots so
+                    # exactly one rotation event fires per validator
+                    # death even if multiple slots noticed.
+                    target = await self._pool.advance_rotation(
+                        from_url=self.current_url
+                    )
+                    await self.reconnect(target_url=target)
+                else:
+                    await self.reconnect()
+            finally:
+                self._reentrant_failover = False
+            # Reconnect succeeded. The current call is still lost — the
+            # underlying lambda was bound to the dead iface, and we can't
+            # safely retry it in general (e.g. a partially-submitted
+            # extrinsic must not be resubmitted blindly). Surface the
+            # original exception so the caller's retry path decides.
+            raise
+
+    async def _raw_run(self, fn):
+        """Lock-guarded executor dispatch without failover plumbing.
+
+        Used internally by `_run` (which wraps this with failover) and by
+        `connect()`/`reconnect()` (which are themselves the failover loop
+        and must not recurse into it).
 
         When `_call_lock` is `None` we're before `connect()` finishes,
         in which case `connect()` itself is the only caller (single-
