@@ -1,8 +1,6 @@
 """Unit tests for `shared.miner_config` — TOML loader + CLI merge."""
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from shared.miner_config import (
@@ -107,6 +105,24 @@ def test_merge_unknown_cli_key_passes_through():
     """Extra CLI keys (e.g. num_cpus on the cpu command) get merged in."""
     merged = merge_config({}, {"validators": ("ws://a:9944",), "num_cpus": 4})
     assert merged["num_cpus"] == 4
+
+
+def test_merge_rest_host_and_port_cli_overrides_toml():
+    """`rest_host` / `rest_port` follow the same CLI > TOML precedence."""
+    toml = {"rest_host": "127.0.0.1", "rest_port": 8086}
+    cli = {"rest_host": "0.0.0.0", "rest_port": 9000}
+    merged = merge_config(toml, cli)
+    assert merged["rest_host"] == "0.0.0.0"
+    assert merged["rest_port"] == 9000
+
+
+def test_merge_rest_host_and_port_toml_when_cli_unset():
+    """A TOML `rest_host = "0.0.0.0"` survives an unset CLI flag (None)."""
+    toml = {"rest_host": "0.0.0.0", "rest_port": 8086}
+    cli = {"rest_host": None, "rest_port": None}
+    merged = merge_config(toml, cli)
+    assert merged["rest_host"] == "0.0.0.0"
+    assert merged["rest_port"] == 8086
 
 
 # ----------------------------------------------------------------------

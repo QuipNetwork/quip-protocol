@@ -68,7 +68,13 @@ _TOPOLOGY_HELP = (
     "to the chain's registered topology — mismatch fails fast at startup."
 )
 _REST_PORT_HELP = (
-    "Telemetry REST API port (default -1 disables; set to a port to serve /api/v1/*)"
+    "Telemetry REST API port (default -1 disables; set to a port to serve /api/v1/*). "
+    "Falls back to --config `rest_port`."
+)
+_REST_HOST_HELP = (
+    "Telemetry REST API bind host. Defaults to 127.0.0.1 (loopback-only); set to "
+    "0.0.0.0 to expose on all interfaces inside a container. Falls back to "
+    "--config `rest_host`."
 )
 
 
@@ -652,6 +658,7 @@ async def _run_concurrent_miner(
     signer_key_path: str,
     faucet_url: Optional[str],
     rest_port: int,
+    rest_host: str,
     topology_spec: str,
     miner_config: dict,
 ) -> int:
@@ -799,11 +806,13 @@ async def _run_concurrent_miner(
                 client=client,
                 signer=keystore.signer,
                 controller=pow_controller,  # Phase 9: surface mempool stats too
-                host="127.0.0.1",
+                host=rest_host,
                 port=rest_port,
             )
             await telemetry.start()
-            click.echo(f"telemetry api: http://127.0.0.1:{rest_port}/api/v1/status")
+            click.echo(
+                f"telemetry api: http://{rest_host}:{rest_port}/api/v1/status"
+            )
 
         loop = asyncio.get_running_loop()
 
@@ -967,9 +976,16 @@ _MODE_HELP = (
 @click.option(
     "--rest-port",
     type=int,
-    default=-1,
-    show_default=True,
+    default=None,
+    show_default=False,
     help=_REST_PORT_HELP,
+)
+@click.option(
+    "--rest-host",
+    type=str,
+    default=None,
+    show_default=False,
+    help=_REST_HOST_HELP,
 )
 def quip_miner_cpu(
     validators: tuple,
@@ -979,7 +995,8 @@ def quip_miner_cpu(
     mode: str,
     num_cpus: int,
     topology_spec: str,
-    rest_port: int,
+    rest_port: Optional[int],
+    rest_host: Optional[str],
 ) -> None:
     """Run CPU SA miners against a substrate chain.
 
@@ -998,8 +1015,14 @@ def quip_miner_cpu(
             "validators": validators,
             "signer_key": signer_key_path,
             "faucet_url": faucet_url,
+            "rest_port": rest_port,
+            "rest_host": rest_host,
         },
-        defaults={"signer_key": "~/.quip-miner/signing.json"},
+        defaults={
+            "signer_key": "~/.quip-miner/signing.json",
+            "rest_port": -1,
+            "rest_host": "127.0.0.1",
+        },
     )
     miner_config = {"cpu": {"num_cpus": num_cpus}}
     raise SystemExit(asyncio.run(_run_concurrent_miner(
@@ -1008,7 +1031,8 @@ def quip_miner_cpu(
         validators=tuple(merged["validators"]),
         signer_key_path=merged["signer_key"],
         faucet_url=merged.get("faucet_url"),
-        rest_port=rest_port,
+        rest_port=int(merged["rest_port"]),
+        rest_host=str(merged["rest_host"]),
         topology_spec=topology_spec,
         miner_config=miner_config,
     )))
@@ -1050,9 +1074,16 @@ def quip_miner_cpu(
 @click.option(
     "--rest-port",
     type=int,
-    default=-1,
-    show_default=True,
+    default=None,
+    show_default=False,
     help=_REST_PORT_HELP,
+)
+@click.option(
+    "--rest-host",
+    type=str,
+    default=None,
+    show_default=False,
+    help=_REST_HOST_HELP,
 )
 def quip_miner_gpu(
     validators: tuple,
@@ -1062,7 +1093,8 @@ def quip_miner_gpu(
     gpu_backend: str,
     mode: str,
     topology_spec: str,
-    rest_port: int,
+    rest_port: Optional[int],
+    rest_host: Optional[str],
 ) -> None:
     """Run a GPU miner (CUDA / Metal / Modal) against a substrate chain.
 
@@ -1086,8 +1118,14 @@ def quip_miner_gpu(
             "validators": validators,
             "signer_key": signer_key_path,
             "faucet_url": faucet_url,
+            "rest_port": rest_port,
+            "rest_host": rest_host,
         },
-        defaults={"signer_key": "~/.quip-miner/signing.json"},
+        defaults={
+            "signer_key": "~/.quip-miner/signing.json",
+            "rest_port": -1,
+            "rest_host": "127.0.0.1",
+        },
     )
     raise SystemExit(asyncio.run(_run_concurrent_miner(
         mode=mode,
@@ -1095,7 +1133,8 @@ def quip_miner_gpu(
         validators=tuple(merged["validators"]),
         signer_key_path=merged["signer_key"],
         faucet_url=merged.get("faucet_url"),
-        rest_port=rest_port,
+        rest_port=int(merged["rest_port"]),
+        rest_host=str(merged["rest_host"]),
         topology_spec=topology_spec,
         miner_config=miner_config,
     )))
@@ -1143,9 +1182,16 @@ def quip_miner_gpu(
 @click.option(
     "--rest-port",
     type=int,
-    default=-1,
-    show_default=True,
+    default=None,
+    show_default=False,
     help=_REST_PORT_HELP,
+)
+@click.option(
+    "--rest-host",
+    type=str,
+    default=None,
+    show_default=False,
+    help=_REST_HOST_HELP,
 )
 def quip_miner_qpu(
     validators: tuple,
@@ -1156,7 +1202,8 @@ def quip_miner_qpu(
     mode: str,
     daily_budget: Optional[str],
     topology_spec: str,
-    rest_port: int,
+    rest_port: Optional[int],
+    rest_host: Optional[str],
 ) -> None:
     """Run a QPU miner against a substrate chain.
 
@@ -1178,8 +1225,14 @@ def quip_miner_qpu(
             "validators": validators,
             "signer_key": signer_key_path,
             "faucet_url": faucet_url,
+            "rest_port": rest_port,
+            "rest_host": rest_host,
         },
-        defaults={"signer_key": "~/.quip-miner/signing.json"},
+        defaults={
+            "signer_key": "~/.quip-miner/signing.json",
+            "rest_port": -1,
+            "rest_host": "127.0.0.1",
+        },
     )
     raise SystemExit(asyncio.run(_run_concurrent_miner(
         mode=mode,
@@ -1187,7 +1240,8 @@ def quip_miner_qpu(
         validators=tuple(merged["validators"]),
         signer_key_path=merged["signer_key"],
         faucet_url=merged.get("faucet_url"),
-        rest_port=rest_port,
+        rest_port=int(merged["rest_port"]),
+        rest_host=str(merged["rest_host"]),
         topology_spec=topology_spec,
         miner_config=miner_config,
     )))

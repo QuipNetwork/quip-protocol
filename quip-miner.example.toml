@@ -30,3 +30,9 @@ signer_key = "~/.quip-miner/signing.json"
 # faucet bot at startup instead of failing fast. Leave commented out
 # in production (the faucet is dev-only).
 # faucet_url = "http://localhost:8087"
+
+# Optional telemetry REST API (/api/v1/*). Off by default (rest_port=-1).
+# Set rest_host = "0.0.0.0" to expose on all interfaces inside a container.
+# CLI: --rest-port N / --rest-host HOST override these.
+# rest_port = 8086
+# rest_host = "127.0.0.1"

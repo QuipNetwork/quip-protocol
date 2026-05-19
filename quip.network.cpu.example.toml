@@ -13,6 +13,12 @@ validators = [
 signer_key = "~/.quip-miner/signing.json"
 # faucet_url = "http://localhost:8087"
 
+# Optional telemetry REST API. Off by default (rest_port=-1). Set
+# rest_host = "0.0.0.0" to expose inside a container; CLI flags
+# --rest-port / --rest-host override these.
+# rest_port = 8086
+# rest_host = "127.0.0.1"
+
 # The [miner.cpu] subtable is documented here for forward-compat —
 # Phase 6+ will merge it into the per-command miner_config. For now,
 # use the CLI flags shown below.

@@ -13,6 +13,12 @@ validators = [
 signer_key = "~/.quip-miner/signing.json"
 # faucet_url = "http://localhost:8087"
 
+# Optional telemetry REST API. Off by default (rest_port=-1). Set
+# rest_host = "0.0.0.0" to expose inside a container; CLI flags
+# --rest-port / --rest-host override these.
+# rest_port = 8086
+# rest_host = "127.0.0.1"
+
 # Forward-compat for Phase 6+. Today the QPU miner config is driven by
 # the CLI:
 #   --qpu-type     {dwave,ibm,ionq,pasqal,braket,origin}

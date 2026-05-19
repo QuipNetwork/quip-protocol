@@ -6,11 +6,13 @@ Schema (keys actually read by the CLI today):
     validators = ["ws://primary:9944", "ws://standby:9944"]
     signer_key = "~/.quip-miner/signing.json"
     faucet_url = "http://localhost:8087"   # optional
+    rest_port  = 8086                      # optional, -1 disables
+    rest_host  = "127.0.0.1"               # optional, 0.0.0.0 for containers
 
 Any other keys in `[miner]` (or nested `[miner.cpu]` / `[miner.gpu]` /
 `[miner.qpu]` subtables) are parsed but ignored — CLI flags are the
-only driver for `topology`, `rest_port`, and per-backend settings in
-v0.2. Don't add keys to this docstring without wiring them through
+only driver for `topology` and per-backend settings in v0.2. Don't
+add keys to this docstring without wiring them through
 `_resolve_runtime_config` first.
 
 CLI flags override TOML on a per-key basis. Empty CLI values
