@@ -15,16 +15,16 @@ from shared.quantum_proof_of_work import (
 # Small graph for fast tests
 _NODES = list(range(10))
 _EDGES = [(i, i + 1) for i in range(9)]
-_PREV_HASH = b"testhash"
-_MINER_ID = "test-miner"
+_PREV_HASH = b"testhash".ljust(32, b"\x00")
+_MINER_BYTES = b"test-miner".ljust(32, b"\x00")
 _CUR_INDEX = 0
 
 
 def _make_feeder(**kwargs):
     defaults = dict(
-        prev_hash=_PREV_HASH,
-        miner_id=_MINER_ID,
-        cur_index=_CUR_INDEX,
+        parent_hash=_PREV_HASH,
+        miner_bytes=_MINER_BYTES,
+        block_number=_CUR_INDEX,
         nodes=_NODES,
         edges=_EDGES,
         buffer_size=4,
@@ -34,26 +34,29 @@ def _make_feeder(**kwargs):
     return IsingFeeder(**defaults)
 
 
+_NONCE_BYTES_42 = (42).to_bytes(32, "big")
+
+
 class TestIsingModel:
     def test_fields(self):
         model = IsingModel(
             h={0: 1.0}, J={(0, 1): -1.0},
-            nonce=42, salt=b"salt",
+            nonce=_NONCE_BYTES_42, salt=b"salt",
         )
         assert model.h == {0: 1.0}
         assert model.J == {(0, 1): -1.0}
-        assert model.nonce == 42
+        assert model.nonce == _NONCE_BYTES_42
         assert model.salt == b"salt"
 
     def test_model_immutable(self):
         model = IsingModel(
             h={0: 1.0}, J={(0, 1): -1.0},
-            nonce=42, salt=b"salt",
+            nonce=_NONCE_BYTES_42, salt=b"salt",
         )
         with pytest.raises(
             (AttributeError, dataclasses.FrozenInstanceError),
         ):
-            model.nonce = 99
+            model.nonce = b"\x99" * 32
 
 
 class TestIsingFeeder:
@@ -64,7 +67,8 @@ class TestIsingFeeder:
             assert isinstance(model, IsingModel)
             assert isinstance(model.h, dict)
             assert isinstance(model.J, dict)
-            assert isinstance(model.nonce, int)
+            assert isinstance(model.nonce, bytes)
+            assert len(model.nonce) == 32
             assert isinstance(model.salt, bytes)
             assert len(model.salt) == 32
         finally:
@@ -152,7 +156,9 @@ class TestIsingFeeder:
         try:
             m_before = feeder.pop_blocking()
             feeder.update_block(
-                b"newhash", "new-miner", 1,
+                b"newhash".ljust(32, b"\x00"),
+                b"new-miner".ljust(32, b"\x00"),
+                1,
             )
             m_after = feeder.pop_blocking()
             assert m_before.nonce != m_after.nonce

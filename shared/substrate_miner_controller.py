@@ -33,6 +33,7 @@ Key behaviors:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import queue as _queue
 from dataclasses import dataclass, field
 from enum import Enum
@@ -423,10 +424,18 @@ class SubstrateMinerController:
                 *[self._await_handle_done(h, timeout=0.5) for h in to_drain]
             )
 
+        # Post-MR-!20: the on-chain `derive_nonce` hashes the SCALE-encoded
+        # account ID (`blake2_256(account.encode())`) to produce a width-stable
+        # 32-byte miner identity. For sr25519/AccountId32 this is just
+        # `blake2_256` of the 32-byte pubkey, but routing through the same
+        # helper keeps the contract clear if a wider AccountId is introduced.
+        canonical_miner = hashlib.blake2b(
+            self.signer.account_id_bytes(), digest_size=32
+        ).digest()
         context = await self.client.get_mining_snapshot(
             at=head_hash,
             topology_hash=self.topology_hash,
-            miner_account_bytes=self.signer.account_id_bytes(),
+            miner_account_bytes=canonical_miner,
         )
         if context is None:
             self.stats.none_snapshots_seen += 1

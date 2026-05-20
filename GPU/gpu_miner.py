@@ -177,9 +177,9 @@ class GPUMiner(BaseMiner):
         # workers don't inherit GPU context.
         feeder_seed = kwargs.pop('feeder_seed', None)
         self._feeder = IsingFeeder(
-            prev_hash=prev_block.hash,
-            miner_id=node_info.miner_id,
-            cur_index=cur_index,
+            parent_hash=prev_block.hash,
+            miner_bytes=node_info.miner_account_bytes,
+            block_number=cur_index,
             nodes=self.sampler.nodes,
             edges=self.sampler.edges,
             buffer_size=num_k * 2,

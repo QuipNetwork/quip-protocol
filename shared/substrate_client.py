@@ -376,6 +376,9 @@ class SubstrateClient:
             edges=decoded["edges"],
             difficulty=decoded["difficulty"],
             miner_account_bytes=miner_account_bytes,
+            allowed_h_values=decoded["allowed_h_values"],
+            allowed_j_values=decoded["allowed_j_values"],
+            allowed_spin_values=decoded["allowed_spin_values"],
         )
 
     # ------------------------------------------------------------------
@@ -1234,8 +1237,38 @@ def _decode_u32(data: ScaleBytes) -> int:
     return int.from_bytes(_read_exact(data, 4), "little")
 
 
+def _decode_i32(data: ScaleBytes) -> int:
+    return int.from_bytes(_read_exact(data, 4), "little", signed=True)
+
+
 def _decode_i64(data: ScaleBytes) -> int:
     return int.from_bytes(_read_exact(data, 8), "little", signed=True)
+
+
+def _decode_allowed_value_spec(data: ScaleBytes):
+    """Decode a SCALE-encoded ``AllowedValueSpec<BoundedVec<i32>>``.
+
+    Variant tag byte (0 = Set, 1 = IntegerRange, 2 = ContinuousRange)
+    followed by the variant-specific payload. The pallet's bounded vec
+    encodes as a plain ``Vec<i32>`` on the wire (the bound is enforced
+    by the encoder, not represented in the bytes).
+    """
+    from shared.allowed_value_spec import (
+        AllowedValueContinuousRange,
+        AllowedValueIntegerRange,
+        AllowedValueSet,
+    )
+
+    tag = _read_exact(data, 1)[0]
+    if tag == 0:
+        length = _decode_compact_u32(data)
+        values = tuple(_decode_i32(data) for _ in range(length))
+        return AllowedValueSet(values)
+    if tag == 1:
+        return AllowedValueIntegerRange(min=_decode_i32(data), max=_decode_i32(data))
+    if tag == 2:
+        return AllowedValueContinuousRange(min=_decode_i32(data), max=_decode_i32(data))
+    raise ValueError(f"unknown AllowedValueSpec variant tag: {tag}")
 
 
 def _decode_compact_u32(data: ScaleBytes) -> int:
@@ -1262,9 +1295,9 @@ def _decode_compact_u32(data: ScaleBytes) -> int:
 
 
 def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
-    """Decode SCALE `Option<MiningSnapshot<BlockNumber, Hash, Nodes, Edges>>`.
+    """Decode SCALE ``Option<MiningSnapshot<...>>`` from the runtime API.
 
-    Layout:
+    Layout (post-MR-!20):
       - 1 byte option tag (0x00 = None, 0x01 = Some)
       - block_number: u32 (BlockNumber on this chain)
       - parent_hash: H256 (32 bytes)
@@ -1274,6 +1307,9 @@ def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
       - topology_hash: H256 (32 bytes)
       - nodes: Vec<u32>
       - edges: Vec<(u32, u32)>
+      - allowed_h_values: AllowedValueSpec<BoundedVec<i32>>
+      - allowed_j_values: AllowedValueSpec<BoundedVec<i32>>
+      - allowed_spin_values: AllowedValueSpec<BoundedVec<i32>>
 
     Decode failures are re-raised with the failing field name so a runtime
     API shape change (or truncated transport) lands a usable error. Trailing
@@ -1308,6 +1344,11 @@ def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
             )
             for i in range(edges_len)
         ]
+        allowed_h = _decode_field("allowed_h_values", data, _decode_allowed_value_spec)
+        allowed_j = _decode_field("allowed_j_values", data, _decode_allowed_value_spec)
+        allowed_spin = _decode_field(
+            "allowed_spin_values", data, _decode_allowed_value_spec
+        )
     except ValueError:
         raise
     except Exception as exc:  # noqa: BLE001 — rewrap with context
@@ -1331,6 +1372,9 @@ def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
         "topology_hash": topology_hash,
         "nodes": nodes,
         "edges": edges,
+        "allowed_h_values": allowed_h,
+        "allowed_j_values": allowed_j,
+        "allowed_spin_values": allowed_spin,
     }
 
 

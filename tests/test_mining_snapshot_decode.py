@@ -12,8 +12,41 @@ from __future__ import annotations
 
 import pytest
 
+from shared.allowed_value_spec import (
+    AllowedValueContinuousRange,
+    AllowedValueIntegerRange,
+    AllowedValueSet,
+)
 from shared.substrate_client import SubstrateClient, _decode_mining_snapshot
 from shared.substrate_types import SubstrateDifficulty
+
+
+def _encode_set(values: list[int]) -> bytes:
+    out = b"\x00" + _encode_compact_u32(len(values))
+    for v in values:
+        out += int(v).to_bytes(4, "little", signed=True)
+    return out
+
+
+def _encode_integer_range(lo: int, hi: int) -> bytes:
+    return (
+        b"\x01"
+        + int(lo).to_bytes(4, "little", signed=True)
+        + int(hi).to_bytes(4, "little", signed=True)
+    )
+
+
+def _encode_continuous_range(lo: int, hi: int) -> bytes:
+    return (
+        b"\x02"
+        + int(lo).to_bytes(4, "little", signed=True)
+        + int(hi).to_bytes(4, "little", signed=True)
+    )
+
+
+_DEFAULT_H_BYTES = b""  # filled in after _encode_compact_u32 is defined
+_DEFAULT_J_BYTES = b""
+_DEFAULT_SPIN_BYTES = b""
 
 
 def _encode_compact_u32(n: int) -> bytes:
@@ -38,6 +71,9 @@ def _build_snapshot_hex(
     nodes: list[int],
     edges: list[tuple[int, int]],
     is_some: bool = True,
+    spec_h: bytes | None = None,
+    spec_j: bytes | None = None,
+    spec_spin: bytes | None = None,
 ) -> str:
     parts: list[bytes] = []
     parts.append(b"\x01" if is_some else b"\x00")
@@ -57,6 +93,9 @@ def _build_snapshot_hex(
     for u, v in edges:
         parts.append(u.to_bytes(4, "little"))
         parts.append(v.to_bytes(4, "little"))
+    parts.append(spec_h if spec_h is not None else _encode_set([-1000, 0, 1000]))
+    parts.append(spec_j if spec_j is not None else _encode_set([-1000, 1000]))
+    parts.append(spec_spin if spec_spin is not None else _encode_set([-1000, 1000]))
     return "0x" + b"".join(parts).hex()
 
 
@@ -93,6 +132,31 @@ def test_decode_populated():
     assert decoded["nodes"] == nodes
     assert decoded["edges"] == edges
     assert decoded["difficulty"] == difficulty
+    # Post-MR-!20 fields: three AllowedValueSpec instances.
+    assert decoded["allowed_h_values"] == AllowedValueSet((-1000, 0, 1000))
+    assert decoded["allowed_j_values"] == AllowedValueSet((-1000, 1000))
+    assert decoded["allowed_spin_values"] == AllowedValueSet((-1000, 1000))
+
+
+def test_decode_mixed_spec_variants():
+    """Decoder correctly handles a mix of Set / IntegerRange / ContinuousRange."""
+    encoded = _build_snapshot_hex(
+        block_number=99,
+        parent_hash=b"\x00" * 32,
+        difficulty=SubstrateDifficulty(1, -100, 0, 0),
+        topology_hash=b"\xcd" * 32,
+        nodes=[0, 1],
+        edges=[(0, 1)],
+        spec_h=_encode_integer_range(-3, 3),
+        spec_j=_encode_continuous_range(-1000, 1000),
+        spec_spin=_encode_set([-1000, 1000]),
+    )
+    decoded = _decode_mining_snapshot(encoded)
+    assert decoded["allowed_h_values"] == AllowedValueIntegerRange(min=-3, max=3)
+    assert decoded["allowed_j_values"] == AllowedValueContinuousRange(
+        min=-1000, max=1000
+    )
+    assert decoded["allowed_spin_values"] == AllowedValueSet((-1000, 1000))
 
 
 def test_decode_zephyr_sized_graph():

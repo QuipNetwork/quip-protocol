@@ -16,10 +16,18 @@ from typing import Dict, List, Tuple
 import numpy as np
 from scipy.sparse import csr_matrix
 
+from shared.allowed_value_spec import (
+    AllowedValueSpec,
+    MILLI_SCALE,
+    sample as _sample_spec,
+)
 from shared.chacha8 import ChaCha8Rng
 from shared.quantum_proof_of_work import (
+    DEFAULT_ALLOWED_H,
+    DEFAULT_ALLOWED_J,
+    derive_nonce,
     generate_ising_model_from_nonce,
-    ising_nonce_from_block,
+    _to_nonce_bytes,
 )
 
 
@@ -83,33 +91,35 @@ class IsingTopologyCache:
 
     def greedy_descent_fast(
         self,
-        nonce: int,
+        nonce,
         num_passes: int = 3,
         num_starts: int = 4,
-        h_values: list | None = None,
+        allowed_h: AllowedValueSpec = DEFAULT_ALLOWED_H,
+        allowed_j: AllowedValueSpec = DEFAULT_ALLOWED_J,
     ) -> float:
         """Run greedy descent using array-based Ising generation.
 
-        Reproduces the same RNG logic as generate_ising_model_from_nonce
-        (ChaCha8Rng, h first then J) but outputs numpy arrays directly,
-        avoiding Python dicts.
-        """
-        if h_values is None:
-            h_values = [-1.0, 0.0, 1.0]
+        Reproduces the same RNG logic as
+        :func:`shared.quantum_proof_of_work.generate_ising_model_from_nonce`
+        (ChaCha8Rng seeded from the 32-byte nonce, h first then J) but
+        outputs numpy arrays directly to avoid Python dict overhead.
 
+        ``nonce`` may be either a 32-byte buffer (canonical) or an int that
+        fits in 256 bits (convenience for tools / benchmarks that don't go
+        through :func:`shared.quantum_proof_of_work.derive_nonce`).
+        """
         n = self.n
-        rng = ChaCha8Rng.seed_from_u64(nonce)
-        n_h = len(h_values)
+        rng = ChaCha8Rng.from_seed(_to_nonce_bytes(nonce))
 
         # Generate h values FIRST (matches generate_ising_model_from_nonce)
         h_arr = np.empty(n, dtype=np.float64)
         for i in range(n):
-            h_arr[i] = h_values[rng.next_u32() % n_h]
+            h_arr[i] = _sample_spec(allowed_h, rng) / MILLI_SCALE
 
-        # Generate J values SECOND: ±1 per edge
+        # Generate J values SECOND
         j_vals = np.empty(self.n_edges, dtype=np.float64)
         for i in range(self.n_edges):
-            j_vals[i] = -1.0 if (rng.next_u32() & 1) == 0 else 1.0
+            j_vals[i] = _sample_spec(allowed_j, rng) / MILLI_SCALE
 
         # Fill CSR data using vectorized indexing
         csr_data = np.empty(self._nnz, dtype=np.float64)
@@ -244,40 +254,35 @@ def greedy_descent_energy(
 
 
 def batch_score_nonces(
-    prev_hash: bytes,
-    miner_id: str,
-    cur_index: int,
+    parent_hash: bytes,
+    miner_bytes: bytes,
+    block_number: int,
     nodes: List[int],
     edges: List[Tuple[int, int]],
     batch_size: int = 16,
     keep: int = 4,
-) -> List[Tuple[bytes, int, dict, dict, float]]:
+) -> List[Tuple[bytes, bytes, dict, dict, float]]:
     """Generate and score a batch of nonces using greedy descent.
 
     Scores all nonces via the fast array path, then builds h/J dicts
-    only for the top `keep` candidates (avoiding expensive dict
+    only for the top ``keep`` candidates (avoiding expensive dict
     construction for rejected nonces).
 
-    Args:
-        prev_hash: Previous block hash.
-        miner_id: Miner identifier.
-        cur_index: Current block index.
-        nodes: Topology node IDs.
-        edges: Topology edge tuples.
-        batch_size: Number of nonces to evaluate.
-        keep: Number of top candidates to return with full h/J dicts.
+    ``parent_hash`` and ``miner_bytes`` must each be 32 bytes — the
+    canonical fixed-width inputs to
+    :func:`shared.quantum_proof_of_work.derive_nonce` (post-MR-!20).
 
     Returns:
-        Sorted list of (salt, nonce, h, J, greedy_energy),
-        lowest energy first. Length = min(keep, batch_size).
+        Sorted list of ``(salt, nonce_bytes, h, J, greedy_energy)``,
+        lowest energy first. Length = ``min(keep, batch_size)``.
     """
     cache = _get_cache(nodes, edges)
 
     # Phase 1: fast scoring (array path, no dicts)
-    scored: List[Tuple[bytes, int, float]] = []
+    scored: List[Tuple[bytes, bytes, float]] = []
     for _ in range(batch_size):
         salt = random.randbytes(32)
-        nonce = ising_nonce_from_block(prev_hash, miner_id, cur_index, salt)
+        nonce = derive_nonce(parent_hash, miner_bytes, block_number, salt)
         energy = cache.greedy_descent_fast(nonce)
         scored.append((salt, nonce, energy))
 

@@ -36,13 +36,18 @@ class BlockRequirements:
     min_diversity: float
     min_solutions: int
     timeout_to_difficulty_adjustment_decay: int
-    h_values: Optional[List[float]] = None
+    allowed_h_values: Optional[Any] = None
+    allowed_j_values: Optional[Any] = None
     diversity_range: Optional[Tuple[float, float]] = None
     solutions_range: Optional[Tuple[int, int]] = None
 
     def __post_init__(self):
-        if self.h_values is None:
-            self.h_values = [-1.0, 0.0, 1.0]
+        if self.allowed_h_values is None:
+            from shared.quantum_proof_of_work import DEFAULT_ALLOWED_H
+            self.allowed_h_values = DEFAULT_ALLOWED_H
+        if self.allowed_j_values is None:
+            from shared.quantum_proof_of_work import DEFAULT_ALLOWED_J
+            self.allowed_j_values = DEFAULT_ALLOWED_J
         if self.diversity_range is None:
             from shared.energy_utils import DEFAULT_DIVERSITY_RANGE
             self.diversity_range = DEFAULT_DIVERSITY_RANGE
@@ -53,10 +58,15 @@ class BlockRequirements:
 
 @dataclass
 class MiningResult:
-    """Result of a mining operation."""
+    """Result of a mining operation.
+
+    ``nonce`` is the canonical 32-byte big-endian representation of the
+    PoW puzzle's U256 nonce, matching the on-chain ``QuantumProof.nonce``
+    field (post-MR-!20).
+    """
     miner_id: str
     miner_type: str
-    nonce: int
+    nonce: bytes
     salt: bytes
     timestamp: int
     prev_timestamp: int
@@ -69,9 +79,10 @@ class MiningResult:
     edge_list: List[Tuple[int, int]]
     variable_order: Optional[List[int]] = None
 
+
 @dataclass
 class IsingSample:
-    nonce: int
+    nonce: bytes
     salt: bytes
     sampleset: dimod.SampleSet
 

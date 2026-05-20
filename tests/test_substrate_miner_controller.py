@@ -46,12 +46,16 @@ from shared.substrate_miner_controller import (
     _ResultEnvelope,
     classify_submission,
 )
+from shared.allowed_value_spec import AllowedValueSet
 from shared.substrate_types import (
-    CANONICAL_H_VALUES,
     ExtrinsicReceipt,
     SubstrateDifficulty,
     SubstrateMiningContext,
 )
+
+
+_BIN_SPEC = AllowedValueSet((-1000, 1000))
+_TER_SPEC = AllowedValueSet((-1000, 0, 1000))
 
 
 # ----------------------------------------------------------------------
@@ -73,7 +77,9 @@ def _context(
         edges=[(0, 1), (1, 2), (2, 3)],
         difficulty=SubstrateDifficulty(1, 0, 0, 0),
         miner_account_bytes=b"\x42" * 32,
-        h_values=CANONICAL_H_VALUES,
+        allowed_h_values=_TER_SPEC,
+        allowed_j_values=_BIN_SPEC,
+        allowed_spin_values=_BIN_SPEC,
     )
 
 
@@ -81,7 +87,7 @@ def _mining_result() -> MiningResult:
     return MiningResult(
         miner_id="test",
         miner_type="CPU",
-        nonce=1,
+        nonce=(1).to_bytes(32, "big"),
         salt=b"\x00" * 32,
         timestamp=0,
         prev_timestamp=0,

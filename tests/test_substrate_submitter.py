@@ -1,19 +1,24 @@
 """Unit tests for `shared.substrate_submitter.encode_quantum_proof` and the
-spin/edge normalization helpers.
+spin normalization helper.
 
-The submitter is the float→milli boundary between Python (floats) and
-Substrate (i32/i64 milli units). Locking these tests down means a future
-refactor that drops the rounding, or flips the 0→-1 spin convention, fails
-locally instead of producing chain-rejected proofs.
+The submitter is the float-to-milli boundary between Python (floats) and
+Substrate (bit-packed i8 spins as bytes). Post-MR-!20 the proof no longer
+carries nodes/edges/h_values — those are looked up on chain from the
+registered topology — so the assertions focus on:
+
+  - nonce + salt round-trip as 32-byte arrays
+  - solutions are bit-packed against the registered spin spec
+  - the proof dict no longer carries nodes/edges/h_values
 """
 from __future__ import annotations
 
 import pytest
 
+from shared.allowed_value_spec import AllowedValueSet
 from shared.miner_types import MiningResult
+from shared.packed_solution import unpack_solution
 from shared.substrate_submitter import (
     MILLI_SCALE,
-    _coerce_edges,
     _normalize_spins,
     encode_quantum_proof,
 )
@@ -21,6 +26,10 @@ from shared.substrate_types import (
     SubstrateDifficulty,
     SubstrateMiningContext,
 )
+
+
+_BIN_SPEC = AllowedValueSet((-1000, 1000))
+_TER_SPEC = AllowedValueSet((-1000, 0, 1000))
 
 
 def _make_context(**overrides) -> SubstrateMiningContext:
@@ -37,6 +46,9 @@ def _make_context(**overrides) -> SubstrateMiningContext:
             min_quality_milli=900,
         ),
         miner_account_bytes=b"\x33" * 32,
+        allowed_h_values=_TER_SPEC,
+        allowed_j_values=_BIN_SPEC,
+        allowed_spin_values=_BIN_SPEC,
     )
     defaults.update(overrides)
     return SubstrateMiningContext(**defaults)
@@ -46,7 +58,7 @@ def _make_result(**overrides) -> MiningResult:
     defaults = dict(
         miner_id="test-miner",
         miner_type="CPU",
-        nonce=12345,
+        nonce=bytes.fromhex("aa" * 32),
         salt=b"\xab" * 32,
         timestamp=1_700_000_000,
         prev_timestamp=1_700_000_000 - 6,
@@ -73,38 +85,25 @@ def test_encode_quantum_proof_field_shape():
     result = _make_result()
     proof = encode_quantum_proof(result, ctx)
 
-    # nodes / edges / solutions / h_values / salt are BoundedVec on the
-    # chain side, which scalecodec wants wrapped as a 1-tuple composite.
-    # Each `proof[field]` is `(inner,)` and the inner solutions are
-    # additionally wrapped per BoundedVec<i8, MaxSpins>.
-    assert proof["nonce"] == 12345
     assert proof["topology_hash"] == "0x" + ("22" * 32)
-    assert proof["salt"] == ([0xab] * 32,)
-    assert proof["nodes"] == ([0, 1, 2, 3],)
-    assert proof["edges"] == ([(0, 1), (1, 2), (2, 3)],)
-    # h_values default = (-1.0, 0.0, 1.0); milli round-trip is exact.
-    assert proof["h_values"] == ([-1000, 0, 1000],)
-    # Boolean solution normalized to ±1, double-wrapped per BoundedVec.
-    assert proof["solutions"] == ([([-1, 1, -1, 1],)],)
+    # nonce + salt encode as flat byte-int lists ([u8; 32]).
+    assert bytes(proof["nonce"]) == result.nonce
+    assert bytes(proof["salt"]) == result.salt
 
+    # The post-MR-!20 proof carries ONLY topology_hash, nonce, salt, solutions.
+    assert set(proof.keys()) == {"topology_hash", "nonce", "salt", "solutions"}
 
-def test_encode_falls_back_to_context_nodes_when_empty():
-    # The miner may emit node_list=[] when the full topology was used;
-    # the submitter falls back to the context's node list rather than
-    # producing an empty proof.
-    ctx = _make_context()
-    result = _make_result(node_list=[], edge_list=[])
-    proof = encode_quantum_proof(result, ctx)
-    assert proof["nodes"] == (ctx.nodes,)
-    assert proof["edges"] == (list(ctx.edges),)
-
-
-def test_encode_uses_result_nodes_when_present():
-    ctx = _make_context(nodes=[0, 1, 2, 3], edges=[(0, 1), (1, 2), (2, 3)])
-    result = _make_result(node_list=[10, 11], edge_list=[(10, 11)])
-    proof = encode_quantum_proof(result, ctx)
-    assert proof["nodes"] == ([10, 11],)
-    assert proof["edges"] == ([(10, 11)],)
+    # One submitted solution, bit-packed against the binary spin spec
+    # (1 bit per spin, 4 spins → 1 byte).
+    solutions, = proof["solutions"]
+    assert len(solutions) == 1
+    inner_packed_tuple = solutions[0]
+    packed_bytes, = inner_packed_tuple
+    assert len(packed_bytes) == 1  # 4 spins / 8 bits-per-byte rounded up
+    # Round-trip through unpack_solution to verify the ±1 ordering matches
+    # the input.
+    decoded = unpack_solution(bytes(packed_bytes), 4, ctx.allowed_spin_values)
+    assert decoded == [-1000, 1000, -1000, 1000]
 
 
 def test_encode_rejects_empty_solutions():
@@ -121,6 +120,20 @@ def test_encode_rejects_bad_salt_length():
         encode_quantum_proof(result, ctx)
 
 
+def test_encode_rejects_bad_nonce_shape():
+    ctx = _make_context()
+    # Non-bytes nonce no longer accepted at the submission boundary.
+    with pytest.raises(ValueError, match="32-byte"):
+        encode_quantum_proof(_make_result(nonce=b"\x01" * 16), ctx)
+
+
+def test_encode_rejects_solution_length_mismatch():
+    ctx = _make_context()  # 4 nodes
+    result = _make_result(solutions=[[1, -1, 1]])  # only 3 spins
+    with pytest.raises(ValueError, match="topology node count"):
+        encode_quantum_proof(result, ctx)
+
+
 def test_normalize_spins_boolean_convention():
     assert _normalize_spins([0, 1, 0, 1]) == [-1, 1, -1, 1]
 
@@ -132,24 +145,3 @@ def test_normalize_spins_spin_convention():
 def test_normalize_spins_rejects_invalid_value():
     with pytest.raises(ValueError, match="cannot normalize"):
         _normalize_spins([0, 1, 2])
-
-
-def test_coerce_edges_accepts_tuples_and_lists():
-    assert _coerce_edges([(0, 1), [1, 2]]) == [(0, 1), (1, 2)]
-
-
-def test_coerce_edges_rejects_wrong_arity():
-    with pytest.raises(ValueError, match="2 endpoints"):
-        _coerce_edges([(0, 1, 2)])
-
-
-def test_h_values_milli_rounding():
-    # Fractional h_values must round, not truncate — silently swapping
-    # `round` for `int` would shift the milli value and produce a
-    # different on-chain proof hash. h_values is a BoundedVec → wrapped
-    # in a 1-tuple by encode_quantum_proof; the inner list is at [0].
-    ctx = _make_context(h_values=(-0.7891, 0.0, 1.0))
-    proof = encode_quantum_proof(_make_result(), ctx)
-    milli = proof["h_values"][0]
-    assert milli[0] == -789
-    assert milli[1] == 0

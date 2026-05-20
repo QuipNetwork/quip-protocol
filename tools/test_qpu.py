@@ -44,9 +44,11 @@ sys.stderr.reconfigure(line_buffering=True)
 import numpy as np
 
 from shared.block import create_genesis_block, BlockRequirements
+import hashlib
+
 from shared.quantum_proof_of_work import (
+    derive_nonce,
     generate_ising_model_from_nonce,
-    ising_nonce_from_block,
 )
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies import load_topology
@@ -147,12 +149,10 @@ def generate_nonce(seed: int, topology) -> Tuple[str, Dict]:
 
     prev_block = create_genesis_block()
     salt = random.randbytes(32)
-    nonce = ising_nonce_from_block(
-        prev_block.hash,
-        f"qpu-test-{seed}",
-        1,
-        salt
-    )
+    miner_bytes = hashlib.blake2b(
+        f"qpu-test-{seed}".encode(), digest_size=32,
+    ).digest()
+    nonce = derive_nonce(prev_block.hash, miner_bytes, 1, salt)
 
     nodes = list(topology.nodes)
     edges = list(topology.edges)
