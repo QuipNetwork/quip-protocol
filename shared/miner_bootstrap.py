@@ -428,10 +428,16 @@ async def ensure_funded(
 
 
 def _post_faucet(url: str, *, dest_hex: str, amount: int) -> dict:
-    """Synchronous POST to the faucet. Kept blocking — we wait on chain after."""
+    """Synchronous POST to the faucet. Kept blocking — we wait on chain after.
+
+    Path is `/request` — the canonical contract served by both the bundled
+    `faucet_bot.py` and the standalone `gitlab.com/quip.network/faucet`
+    deployment. The legacy `/faucet` path is still accepted by the bundled
+    bot for back-compat with pre-v0.2 callers.
+    """
     body = json.dumps({"dest": dest_hex, "amount": amount}).encode()
     req = urllib.request.Request(
-        f"{url.rstrip('/')}/faucet",
+        f"{url.rstrip('/')}/request",
         data=body,
         headers={"Content-Type": "application/json"},
         method="POST",
