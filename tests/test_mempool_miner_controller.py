@@ -1,7 +1,7 @@
 """Unit + integration tests for `shared.mempool_miner_controller`.
 
 Unit tests cover:
-  - `topology_hash_from_nodes_edges` parity with `quip_cli._zephyr_topology_hash`
+  - `topology_hash_from_nodes_edges` parity with `quip_cli._topology_hash`
   - `_should_accept_job` mode + topology filtering
   - submission/claim error classifiers
 
@@ -63,14 +63,14 @@ def _chain_reachable(url: str) -> bool:
 
 
 def test_topology_hash_matches_quip_cli_helper():
-    """`topology_hash_from_nodes_edges` and `quip_cli._zephyr_topology_hash`
+    """`topology_hash_from_nodes_edges` and `quip_cli._topology_hash`
     must agree byte-for-byte over the same graph — they both feed into
     job-eligibility filtering and chain-side `register_topology`."""
     import dwave_networkx as dnx
-    from quip_cli import _zephyr_topology_hash
+    from quip_cli import _topology_hash
 
     g = dnx.zephyr_graph(2, 2)
-    via_cli = _zephyr_topology_hash(g)
+    via_cli = _topology_hash(g)
     via_controller = topology_hash_from_nodes_edges(
         tuple(int(n) for n in g.nodes),
         tuple((int(u), int(v)) for u, v in g.edges),

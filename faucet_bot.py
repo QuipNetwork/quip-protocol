@@ -36,7 +36,6 @@ Usage:
 
 Funding request:
     POST /request  {"dest": "0x<32-byte hex>", "amount": <plancks>}
-    (alias: POST /faucet — legacy path, same body)
     Response 200: {"extrinsic_hash": "0x...", "block_hash": "0x...",
                    "amount": N, "dest": "..."}
     Response 429: rate limited (includes retry_after_seconds)
@@ -507,11 +506,8 @@ class SubstrateFaucet:
 
         app = web.Application()
         # `/request` is the canonical path shared with the standalone
-        # `gitlab.com/quip.network/faucet` deployment; `/faucet` is the
-        # legacy alias kept for pre-v0.2 callers and won't be removed
-        # without a deprecation cycle.
+        # `gitlab.com/quip.network/faucet` deployment.
         app.router.add_post("/request", self._handle_faucet)
-        app.router.add_post("/faucet", self._handle_faucet)
         app.router.add_get("/health", self._handle_health)
 
         self._runner = web.AppRunner(app)

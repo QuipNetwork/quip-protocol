@@ -22,6 +22,7 @@ from typing import Optional
 
 import click
 
+from dwave_topologies.topologies.json_loader import load_topology
 from dwave_topologies.topologies.zephyr import zephyr
 from shared.keystore_hybrid import generate, load
 from shared.logging_config import setup_logging
@@ -64,8 +65,11 @@ _CONFIG_HELP = (
 )
 _SIGNER_KEY_HELP = "Path to the signing keystore (created by `quip-miner keygen`)"
 _TOPOLOGY_HELP = (
-    "Topology spec for the miner's sampler. Format: 'family:m,t'. Must hash "
-    "to the chain's registered topology — mismatch fails fast at startup."
+    "Topology for the miner's sampler. Either a hardware name like "
+    "'advantage2_system1' (default — the real QPU graph the chain "
+    "registers) or 'zephyr:M,T' for a synthetic Zephyr Z(M,T) graph "
+    "(dev / benchmark chains). Must hash to the chain's registered "
+    "topology — mismatch fails fast at startup."
 )
 _REST_PORT_HELP = (
     "Telemetry REST API port (default -1 disables; set to a port to serve /api/v1/*). "
@@ -559,38 +563,56 @@ def quip_miner_deregister_solver(
 
 # --------------------------------------------------------------------------
 # Mining subcommands: cpu / gpu / qpu spawn the controller end-to-end.
-# Topology binding is explicit via --topology zephyr:M,T (defaults to Z(9,2)
-# which matches the legacy chain difficulty calibration). The CLI verifies
-# at startup that the sampler's topology hash matches the chain's snapshot;
-# mismatch fails fast with the registered hash printed so the operator can
-# fix --topology or re-seed the chain.
+# Topology binding is explicit via --topology. The default is the
+# Advantage2_system1 hardware topology (the project-wide DEFAULT_TOPOLOGY),
+# which matches what the chain registers. The synthetic 'zephyr:M,T' form
+# stays available for benchmarks and dev chains seeded with a perfect
+# Zephyr graph. The CLI verifies at startup that the sampler's topology
+# hash matches the chain's snapshot; mismatch fails fast with the
+# registered hash printed so the operator can fix --topology or re-seed
+# the chain.
 # --------------------------------------------------------------------------
 
 
 def _parse_topology(spec: str):
-    """Parse a `family:m,t` topology spec into a (`ZephyrTopology`, hash) pair.
+    """Parse a topology spec into a sampler-compatible topology object.
 
-    Only zephyr is supported in Phase 5a; pegasus/chimera land later if
-    miners need them. Returns the sampler-compatible topology object so the
-    CLI can plug it straight into the spec's `args["topology"]`.
+    Accepted forms:
+      - `advantage2_system1` (and other hardware names handled by
+        `load_topology`) — real QPU hardware graph from the bundled JSON.
+      - `zephyr:M,T` — perfect Zephyr Z(M,T) generated on the fly.
+
+    Returns the topology so the CLI can plug it straight into the spec's
+    `args["topology"]`. Hardware names are case-insensitive and accept
+    either `_` or `-` separators.
     """
-    if ":" not in spec:
-        raise click.BadParameter(
-            f"--topology must be 'family:m,t' (got {spec!r}); try 'zephyr:9,2'"
-        )
-    family, params = spec.split(":", 1)
-    if family.lower() != "zephyr":
-        raise click.BadParameter(
-            f"only 'zephyr' topology is supported in Phase 5a (got {family!r})"
-        )
+    if ":" in spec:
+        family, params = spec.split(":", 1)
+        if family.lower() != "zephyr":
+            raise click.BadParameter(
+                f"only 'zephyr:M,T' is supported for synthetic topologies "
+                f"(got {family!r}); for hardware use a bare name like "
+                f"'advantage2_system1'"
+            )
+        try:
+            m_str, t_str = params.split(",")
+            m, t = int(m_str), int(t_str)
+        except ValueError as exc:
+            raise click.BadParameter(
+                f"--topology zephyr params must be 'M,T' (got {params!r})"
+            ) from exc
+        return zephyr(m, t)
+
+    # Bare name → delegate to load_topology (handles Advantage2_system1,
+    # named constants, file paths). load_topology raises ValueError /
+    # FileNotFoundError; translate to click.BadParameter for a clean CLI
+    # error rather than a stack trace.
     try:
-        m_str, t_str = params.split(",")
-        m, t = int(m_str), int(t_str)
-    except ValueError as exc:
+        return load_topology(spec)
+    except (ValueError, FileNotFoundError) as exc:
         raise click.BadParameter(
-            f"--topology zephyr params must be 'm,t' (got {params!r})"
+            f"--topology {spec!r}: {exc}"
         ) from exc
-    return zephyr(m, t)
 
 
 def _inject_topology(miner_config: dict, kind: str, topology) -> dict:
@@ -615,8 +637,11 @@ def _inject_topology(miner_config: dict, kind: str, topology) -> dict:
     return out
 
 
-def _zephyr_topology_hash(topology) -> bytes:
-    """Compute the chain's blake2_256 topology hash from a Zephyr graph.
+def _topology_hash(topology) -> bytes:
+    """Compute the chain's blake2_256 topology hash from any topology graph.
+
+    Works for any object exposing `.nodes` and `.edges` (Zephyr,
+    Advantage2 hardware, raw networkx graphs).
 
     Matches `pallets/quantum-pow/src/topology.rs::hash_topology`:
         blake2_256(SCALE((sorted nodes, sorted canonical edges)))
@@ -752,7 +777,7 @@ async def _run_concurrent_miner(
                     err=True,
                 )
                 return 3
-            expected_hash = _zephyr_topology_hash(topology)
+            expected_hash = _topology_hash(topology)
             if snapshot.topology_hash != expected_hash:
                 click.echo(
                     f"PoW mode topology mismatch: --topology {topology_spec} "
@@ -969,7 +994,7 @@ _MODE_HELP = (
 @click.option(
     "--topology",
     "topology_spec",
-    default="zephyr:9,2",
+    default="advantage2_system1",
     show_default=True,
     help=_TOPOLOGY_HELP,
 )
@@ -1067,7 +1092,7 @@ def quip_miner_cpu(
 @click.option(
     "--topology",
     "topology_spec",
-    default="zephyr:9,2",
+    default="advantage2_system1",
     show_default=True,
     help=_TOPOLOGY_HELP,
 )
@@ -1175,7 +1200,7 @@ def quip_miner_gpu(
 @click.option(
     "--topology",
     "topology_spec",
-    default="zephyr:9,2",
+    default="advantage2_system1",
     show_default=True,
     help=_TOPOLOGY_HELP,
 )

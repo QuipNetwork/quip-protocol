@@ -127,7 +127,7 @@ def topology_hash_from_nodes_edges(
     """Compute the chain's blake2_256 topology hash for a `(nodes, edges)` pair.
 
     Mirrors `pallets/quantum-pow/src/topology.rs::hash_topology` AND
-    `quip_cli._zephyr_topology_hash`; kept here so the mempool controller
+    `quip_cli._topology_hash`; kept here so the mempool controller
     doesn't depend on the CLI module.
     """
     sorted_nodes = sorted(int(n) for n in nodes)

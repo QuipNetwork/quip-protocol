@@ -122,7 +122,7 @@ async def test_faucet_funds_fresh_account():
     async with _running_faucet(port):
         async with aiohttp.ClientSession() as http:
             async with http.post(
-                f"http://127.0.0.1:{port}/faucet",
+                f"http://127.0.0.1:{port}/request",
                 json={"dest": dest_hex, "amount": amount},
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
@@ -152,20 +152,20 @@ async def test_faucet_rejects_bad_request():
     try:
         async with aiohttp.ClientSession() as http:
             async with http.post(
-                f"http://127.0.0.1:{port}/faucet",
+                f"http://127.0.0.1:{port}/request",
                 data="not-json",
                 headers={"Content-Type": "application/json"},
             ) as resp:
                 assert resp.status == 400
 
             async with http.post(
-                f"http://127.0.0.1:{port}/faucet",
+                f"http://127.0.0.1:{port}/request",
                 json={"amount": 100},  # missing dest
             ) as resp:
                 assert resp.status == 400
 
             async with http.post(
-                f"http://127.0.0.1:{port}/faucet",
+                f"http://127.0.0.1:{port}/request",
                 json={"dest": "0x" + "00" * 32, "amount": -1},
             ) as resp:
                 assert resp.status == 400
@@ -187,13 +187,13 @@ async def test_faucet_rate_limits():
         dest_hex = "0x" + os.urandom(32).hex()
         async with aiohttp.ClientSession() as http:
             async with http.post(
-                f"http://127.0.0.1:{port}/faucet",
+                f"http://127.0.0.1:{port}/request",
                 json={"dest": dest_hex, "amount": 1_000_000_000_000},
             ) as resp:
                 assert resp.status == 200
 
             async with http.post(
-                f"http://127.0.0.1:{port}/faucet",
+                f"http://127.0.0.1:{port}/request",
                 json={"dest": dest_hex, "amount": 1_000_000_000_000},
             ) as resp:
                 assert resp.status == 429
