@@ -19,9 +19,14 @@ See the [D-Wave solver-properties reference](https://docs.dwavequantum.com/en/la
 ## Solver ranges
 
 <!-- BEGIN GENERATED -->
-_Last generated: not yet run. Regenerate with `python tools/dump_solver_ranges.py`._
+_Last generated: 2026-05-20 14:23:07 UTC. Regenerate with `python tools/dump_solver_ranges.py`._
 
-_(Run the tool to populate this table — it queries SAPI metadata, no QPU time is consumed.)_
+| Chip ID | Topology | Qubits (active/total) | h_range | j_range | extended_j_range | per_qubit_coupling_range | Regions |
+|---|---|---|---|---|---|---|---|
+| `Advantage_system4.1` | pegasus (16,) | 5627/5760 | [-4, 4] | [-1, 1] | [-2, 1] | [-18, 15] | na-west-1 |
+| `Advantage_system6.4` | pegasus (16,) | 5612/5760 | [-4, 4] | [-1, 1] | [-2, 1] | [-18, 15] | na-west-1 |
+| `Advantage2_system1` | zephyr (12, 4) | 4578/4800 | [-6, 6] | [-1, 1] | [-2, 1] | n/a | na-west-1 |
+| `Advantage2_system4.3` | zephyr (6, 4) | 1203/1248 | [-6, 6] | [-1, 1] | [-2, 1] | n/a | na-east-1 |
 <!-- END GENERATED -->
 
 ## Current QPoW usage vs. headroom
