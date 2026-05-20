@@ -202,6 +202,8 @@ min_solutions = 5
 - Z(10,2): -5470 to -5200 (270 unit range)
 - Z(11,4): -15170 to -14158 (1012 unit range)
 
+**QPU h/J ranges:** See [`docs/dwave-solver-ranges.md`](docs/dwave-solver-ranges.md) for per-solver `h_range`, `j_range`, `extended_j_range`, and `per_qubit_coupling_range`. Regenerate with `python tools/dump_solver_ranges.py`.
+
 **Miner-Specific Configurations:**
 - CPU/SA: num_sweeps=64–4096, reads=64–512 (adaptive)
 - GPU/CUDA: num_sweeps=256–2048
