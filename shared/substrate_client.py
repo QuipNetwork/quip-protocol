@@ -53,6 +53,8 @@ from shared.substrate_types import (
     MinerInfo,
     SubstrateDifficulty,
     SubstrateMiningContext,
+    WinningSolution,
+    WinningSolutionWithNonce,
 )
 
 
@@ -404,6 +406,17 @@ class SubstrateClient:
         )
 
     async def query_difficulty(self) -> Optional[SubstrateDifficulty]:
+        """Return the raw `QuantumPow.Difficulty` storage value.
+
+        This is the *post-adjust baseline* — the value set after the most
+        recent winning proof, **without** decay applied. Use
+        :meth:`query_current_difficulty` for the live threshold a fresh
+        proof would have to clear right now.
+
+        Suitable for "is the chain seeded?" checks and historical
+        comparisons; not suitable for deciding what difficulty a miner
+        currently faces.
+        """
         result = await self._run(lambda: self._iface.query("QuantumPow", "Difficulty"))
         if result is None or not _result_was_found(result) or result.value is None:
             return None
@@ -414,6 +427,81 @@ class SubstrateClient:
             min_diversity_milli=int(v["min_diversity_milli"]),
             min_quality_milli=int(v["min_quality_milli"]),
         )
+
+    async def query_current_difficulty(
+        self, *, at: Optional[bytes] = None
+    ) -> SubstrateDifficulty:
+        """Call `QuantumPowApi_current_difficulty` for the live threshold.
+
+        Returns the difficulty a proof submitted *right now* would have to
+        clear — i.e. the post-adjust baseline (`QuantumPow.Difficulty`)
+        with decay applied for elapsed blocks since the last winning proof.
+        This matches what `submit_proof` validation will actually require.
+
+        Storage queries via :meth:`query_difficulty` return the undecayed
+        baseline and will under-state difficulty whenever the chain has
+        been mining slowly. Use this method whenever miner-facing code
+        needs to reason about the active threshold.
+        """
+        block_hash = _hex(at) if at is not None else None
+        raw = await self._run(
+            lambda: self._iface.rpc_request(
+                "state_call",
+                ["QuantumPowApi_current_difficulty", "0x", block_hash],
+            )
+        )
+        if "error" in raw:
+            raise RuntimeError(
+                f"state_call current_difficulty rpc error: {raw['error']}"
+            )
+        encoded = raw.get("result")
+        if encoded is None:
+            raise RuntimeError(
+                "state_call current_difficulty returned no result"
+            )
+        data = ScaleBytes(encoded)
+        difficulty = _decode_difficulty_config(data)
+        if data.get_remaining_length() != 0:
+            raise ValueError(
+                "trailing bytes after current_difficulty decode: "
+                f"{data.get_remaining_length()} bytes"
+            )
+        return difficulty
+
+    async def query_winning_solution(
+        self, block_number: int, *, at: Optional[bytes] = None
+    ) -> Optional[WinningSolutionWithNonce]:
+        """Call `QuantumPowApi_winning_solution(block_number)`.
+
+        Returns the persisted winning solution for ``block_number`` with
+        the BLAKE3-derived nonce computed server-side. Returns ``None`` for
+        blocks with no recorded winner (e.g. genesis, or pre-state-pruning
+        depth on archival nodes).
+
+        Use this in preference to decoding `QuantumPow.WinningSolutions`
+        storage directly — the runtime API also packages the nonce, saving
+        clients from running BLAKE3 over `(parent_hash, miner, block, salt)`.
+        """
+        if not 0 <= block_number < 2**32:
+            raise ValueError(
+                f"block_number must fit in u32, got {block_number}"
+            )
+        block_hash = _hex(at) if at is not None else None
+        scale_param = "0x" + block_number.to_bytes(4, "little").hex()
+        raw = await self._run(
+            lambda: self._iface.rpc_request(
+                "state_call",
+                ["QuantumPowApi_winning_solution", scale_param, block_hash],
+            )
+        )
+        if "error" in raw:
+            raise RuntimeError(
+                f"state_call winning_solution rpc error: {raw['error']}"
+            )
+        encoded = raw.get("result")
+        if encoded is None:
+            return None
+        return _decode_winning_solution_with_nonce(encoded)
 
     async def query_balance(self, account: bytes) -> int:
         if len(account) != 32:
@@ -1245,6 +1333,36 @@ def _decode_i64(data: ScaleBytes) -> int:
     return int.from_bytes(_read_exact(data, 8), "little", signed=True)
 
 
+def _decode_u128(data: ScaleBytes) -> int:
+    return int.from_bytes(_read_exact(data, 16), "little")
+
+
+def _decode_u256_le(data: ScaleBytes) -> bytes:
+    """Read a 32-byte little-endian ``U256`` and return the raw bytes.
+
+    The Rust pallet returns `nonce: U256` from BLAKE3, which `parity-scale-codec`
+    serialises little-endian. The Python side treats nonces as opaque 32-byte
+    blobs (see ``MiningResult.nonce`` and ``derive_nonce``) — the *byte order*
+    used by miners/validators is the BLAKE3 digest order (big-endian by the
+    `blake3` library convention), so we re-reverse on the wire to recover it.
+    """
+    raw_le = _read_exact(data, 32)
+    return bytes(reversed(raw_le))
+
+
+def _decode_difficulty_config(data: ScaleBytes) -> "SubstrateDifficulty":
+    min_solutions = _decode_field("min_solutions", data, _decode_u32)
+    max_energy_milli = _decode_field("max_energy_milli", data, _decode_i64)
+    min_diversity_milli = _decode_field("min_diversity_milli", data, _decode_u32)
+    min_quality_milli = _decode_field("min_quality_milli", data, _decode_u32)
+    return SubstrateDifficulty(
+        min_solutions=min_solutions,
+        max_energy_milli=max_energy_milli,
+        min_diversity_milli=min_diversity_milli,
+        min_quality_milli=min_quality_milli,
+    )
+
+
 def _decode_allowed_value_spec(data: ScaleBytes):
     """Decode a SCALE-encoded ``AllowedValueSpec<BoundedVec<i32>>``.
 
@@ -1328,10 +1446,7 @@ def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
             return None
         block_number = _decode_field("block_number", data, _decode_u32)
         parent_hash = _decode_field("parent_hash", data, lambda d: _read_exact(d, 32))
-        min_solutions = _decode_field("min_solutions", data, _decode_u32)
-        max_energy_milli = _decode_field("max_energy_milli", data, _decode_i64)
-        min_diversity_milli = _decode_field("min_diversity_milli", data, _decode_u32)
-        min_quality_milli = _decode_field("min_quality_milli", data, _decode_u32)
+        difficulty = _decode_difficulty_config(data)
         topology_hash = _decode_field("topology_hash", data, lambda d: _read_exact(d, 32))
         nodes_len = _decode_field("nodes_len", data, _decode_compact_u32)
         nodes = [_decode_field("nodes[%d]" % i, data, _decode_u32)
@@ -1363,12 +1478,7 @@ def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
     return {
         "block_number": block_number,
         "parent_hash": parent_hash,
-        "difficulty": SubstrateDifficulty(
-            min_solutions=min_solutions,
-            max_energy_milli=max_energy_milli,
-            min_diversity_milli=min_diversity_milli,
-            min_quality_milli=min_quality_milli,
-        ),
+        "difficulty": difficulty,
         "topology_hash": topology_hash,
         "nodes": nodes,
         "edges": edges,
@@ -1376,6 +1486,61 @@ def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
         "allowed_j_values": allowed_j,
         "allowed_spin_values": allowed_spin,
     }
+
+
+def _decode_winning_solution_with_nonce(
+    encoded_hex: str,
+) -> Optional["WinningSolutionWithNonce"]:
+    """Decode SCALE ``Option<WinningSolutionWithNonce<AccountId, Balance, BlockNumber>>``.
+
+    Layout (matches `pallet_quantum_pow::types::WinningSolutionWithNonce`):
+      - 1 byte option tag (0x00 = None, 0x01 = Some)
+      - solution.miner: AccountId32 = [u8; 32]
+      - solution.salt: [u8; 32]
+      - solution.energy_milli: i64
+      - solution.reward: u128 (Balance)
+      - solution.submitted_at: BlockNumber (u32)
+      - solution.difficulty: DifficultyConfig
+      - nonce: U256 (little-endian on the wire; reversed to recover the
+        BLAKE3 digest order Python miners use)
+    """
+    data = ScaleBytes(encoded_hex)
+    tag = _read_exact(data, 1)
+    if tag[0] == 0:
+        if data.get_remaining_length() != 0:
+            raise ValueError(
+                "trailing bytes after winning_solution Option::None tag: "
+                f"{data.get_remaining_length()} bytes"
+            )
+        return None
+    try:
+        miner = _decode_field("miner", data, lambda d: _read_exact(d, 32))
+        salt = _decode_field("salt", data, lambda d: _read_exact(d, 32))
+        energy_milli = _decode_field("energy_milli", data, _decode_i64)
+        reward = _decode_field("reward", data, _decode_u128)
+        submitted_at = _decode_field("submitted_at", data, _decode_u32)
+        difficulty = _decode_difficulty_config(data)
+        nonce = _decode_field("nonce", data, _decode_u256_le)
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — rewrap with context
+        raise ValueError(f"failed to decode winning solution: {exc}") from exc
+    if data.get_remaining_length() != 0:
+        raise ValueError(
+            "trailing bytes after winning_solution decode: "
+            f"{data.get_remaining_length()} bytes; runtime API shape likely changed"
+        )
+    return WinningSolutionWithNonce(
+        solution=WinningSolution(
+            miner=miner,
+            salt=salt,
+            energy_milli=energy_milli,
+            reward=reward,
+            submitted_at=submitted_at,
+            difficulty=difficulty,
+        ),
+        nonce=nonce,
+    )
 
 
 def _decode_field(name: str, data: ScaleBytes, fn: Callable[[ScaleBytes], Any]) -> Any:
