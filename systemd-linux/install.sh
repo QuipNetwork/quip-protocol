@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install quip-network-node as a systemd service on bare-metal Linux.
+# Install quip-miner as a systemd service on bare-metal Linux.
 #
 # Usage: sudo bash install.sh
 #
@@ -19,13 +19,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 CONFIG_FILE="$CONFIG_DIR/config.toml"
-TEMPLATE_FILE="$SCRIPT_DIR/quip-node.systemd.toml"
-SERVICE_FILE="$SCRIPT_DIR/quip-network-node.service"
-GENESIS_SRC="$PROJECT_ROOT/genesis_block_public.json"
-GENESIS_DST="$DATA_DIR/genesis_block.json"
+TEMPLATE_FILE="$SCRIPT_DIR/quip-miner.systemd.toml"
+SERVICE_FILE="$SCRIPT_DIR/quip-miner.service"
+KEYSTORE_FILE="$DATA_DIR/keystore.json"
 
 echo "========================================"
-echo "Quip Network Node — Systemd Installer"
+echo "Quip Miner — Systemd Installer"
 echo "========================================"
 
 # ── Root check ───────────────────────────────────────────────────
@@ -69,74 +68,38 @@ echo "Installing quip-protocol from source..."
 "$INSTALL_DIR/bin/pip" install -U pip setuptools wheel --quiet
 "$INSTALL_DIR/bin/pip" install -e "$PROJECT_ROOT" --quiet
 chown -R "$SERVICE_USER:$SERVICE_GROUP" "$INSTALL_DIR"
-echo "Installation complete: $INSTALL_DIR/bin/quip-network-node"
+echo "Installation complete: $INSTALL_DIR/bin/quip-miner"
 
 # ── 4. Seed configuration ───────────────────────────────────────
 if [ -f "$CONFIG_FILE" ]; then
     echo "Config already exists at $CONFIG_FILE — skipping"
 else
     cp "$TEMPLATE_FILE" "$CONFIG_FILE"
-    SECRET=$(openssl rand -hex 32)
-    sed -i "s/secret = \"GENERATE_ON_FIRST_RUN\"/secret = \"$SECRET\"/" "$CONFIG_FILE"
     chown "$SERVICE_USER:$SERVICE_GROUP" "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
-    echo "Config generated at $CONFIG_FILE (secret randomly generated)"
+    echo "Config seeded at $CONFIG_FILE — edit before starting the service"
 fi
 
-# ── 5. Genesis block ────────────────────────────────────────────
-if [ -f "$GENESIS_DST" ]; then
-    echo "Genesis block already exists at $GENESIS_DST — skipping"
-elif [ -f "$GENESIS_SRC" ]; then
-    cp "$GENESIS_SRC" "$GENESIS_DST"
-    chown "$SERVICE_USER:$SERVICE_GROUP" "$GENESIS_DST"
-    echo "Copied genesis block to $GENESIS_DST"
+# ── 5. Generate signing keystore ────────────────────────────────
+if [ -f "$KEYSTORE_FILE" ]; then
+    echo "Keystore already exists at $KEYSTORE_FILE — skipping"
 else
-    echo "WARNING: Genesis block not found at $GENESIS_SRC"
+    echo "Generating hybrid keystore at $KEYSTORE_FILE..."
+    sudo -u "$SERVICE_USER" "$INSTALL_DIR/bin/quip-miner" keygen --out "$KEYSTORE_FILE"
+    chmod 600 "$KEYSTORE_FILE"
 fi
 
-# ── 6. Hardware detection — CPU ──────────────────────────────────
-NUM_CPUS=$(nproc)
-echo "Detected $NUM_CPUS CPUs"
-if grep -q '^\[cpu\]' "$CONFIG_FILE" && ! grep -q '^num_cpus' "$CONFIG_FILE"; then
-    sed -i '/^\[cpu\]/a num_cpus = '"$NUM_CPUS" "$CONFIG_FILE"
-    echo "Set num_cpus = $NUM_CPUS in config"
-fi
-
-# ── 7. Hardware detection — GPU (optional) ───────────────────────
-if command -v nvidia-smi &>/dev/null; then
-    NUM_GPUS=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader 2>/dev/null | wc -l)
-    if [ "$NUM_GPUS" -gt 0 ]; then
-        echo "Detected $NUM_GPUS NVIDIA GPU(s):"
-        nvidia-smi --query-gpu=gpu_name,compute_cap --format=csv,noheader
-        if ! grep -q '^\[cuda\.' "$CONFIG_FILE"; then
-            {
-                echo ""
-                echo "[gpu]"
-                echo ""
-                for ((i = 0; i < NUM_GPUS; i++)); do
-                    echo "[cuda.$i]"
-                    echo ""
-                done
-            } >> "$CONFIG_FILE"
-            echo "Added GPU sections to config (uncommented and ready)"
-            echo "NOTE: Remove the [cpu] section if you want GPU-only mining"
-        fi
-    fi
-else
-    echo "No NVIDIA GPUs detected (nvidia-smi not found)"
-fi
-
-# ── 8. Patch service file PYTHONPATH ─────────────────────────────
+# ── 6. Patch service file PYTHONPATH ─────────────────────────────
 # Detect the actual Python version in the venv
 PYTHON_VERSION=$("$INSTALL_DIR/bin/python3" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 PATCHED_SERVICE=$(mktemp)
 sed "s|python3\.[0-9]*|python${PYTHON_VERSION}|g" "$SERVICE_FILE" > "$PATCHED_SERVICE"
 
-# ── 9. Install systemd service ──────────────────────────────────
-cp "$PATCHED_SERVICE" /etc/systemd/system/quip-network-node.service
+# ── 7. Install systemd service ──────────────────────────────────
+cp "$PATCHED_SERVICE" /etc/systemd/system/quip-miner.service
 rm -f "$PATCHED_SERVICE"
 systemctl daemon-reload
-systemctl enable quip-network-node
+systemctl enable quip-miner
 echo "Service installed and enabled"
 
 # ── Summary ──────────────────────────────────────────────────────
@@ -145,18 +108,18 @@ echo "========================================"
 echo "Installation complete"
 echo "========================================"
 echo ""
-echo "  Config:  $CONFIG_FILE"
-echo "  Data:    $DATA_DIR"
-echo "  Logs:    $LOG_DIR"
-echo "  Binary:  $INSTALL_DIR/bin/quip-network-node"
-echo "  Service: /etc/systemd/system/quip-network-node.service"
+echo "  Config:   $CONFIG_FILE"
+echo "  Data:     $DATA_DIR"
+echo "  Logs:     $LOG_DIR"
+echo "  Keystore: $KEYSTORE_FILE  (BACK THIS UP)"
+echo "  Binary:   $INSTALL_DIR/bin/quip-miner"
+echo "  Service:  /etc/systemd/system/quip-miner.service"
 echo ""
 echo "Next steps:"
 echo "  1. Edit $CONFIG_FILE"
-echo "     - Set public_host to your public IP or DNS name"
-echo "     - Set node_name"
-echo "     - Configure peers if needed"
+echo "     - Set [miner] validators = [\"wss://...\"]"
+echo "     - Optionally set faucet_url, rest_port, rest_host"
 echo "  2. Start the service:"
-echo "     sudo systemctl start quip-network-node"
+echo "     sudo systemctl start quip-miner"
 echo "  3. View logs:"
-echo "     journalctl -u quip-network-node -f"
+echo "     journalctl -u quip-miner -f"

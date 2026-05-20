@@ -16,27 +16,32 @@ pip install -e .
 
 ## Commands
 
-### Running Network Nodes
+### Running the Miner
 
 ```bash
-# CPU node (bootstrap, standalone single-node mode)
-quip-network-node cpu --listen 127.0.0.1 --port 8085 --public-host 127.0.0.1:8085 \
-  --auto-mine --peer 127.0.0.1:8085 --genesis-config genesis_block_public.json
+# Generate a hybrid sr25519 + ML-DSA-44 signing keystore
+quip-miner keygen --out ~/.quip-miner/signing.json
 
-# GPU node (CUDA)
-quip-network-node gpu --listen 127.0.0.1 --port 8085 --public-host 127.0.0.1:8085 \
-  --auto-mine --peer 127.0.0.1:8085 --gpu-backend local --genesis-config genesis_block_public.json
+# Bootstrap (one-shot reachability + funding check)
+quip-miner bootstrap --validator ws://127.0.0.1:9944 --signer-key ~/.quip-miner/signing.json
 
-# Mac Metal node
-quip-network-node gpu --gpu-backend mps --listen 127.0.0.1 --port 8085 \
-  --auto-mine --peer 127.0.0.1:8085 --genesis-config genesis_block_public.json
+# CPU miner (PoW against a substrate validator)
+quip-miner cpu --validator ws://127.0.0.1:9944 --signer-key ~/.quip-miner/signing.json
 
-# TOML config (see QUIP-node.example.toml)
-quip-network-node --config ./QUIP-node.example.toml
+# CUDA miner
+quip-miner gpu --validator ws://127.0.0.1:9944 --gpu-backend local --signer-key ~/.quip-miner/signing.json
 
-# Network simulator
-quip-network-simulator --scenario mixed
-quip-network-simulator --scenario cpu --base-port 9000
+# Mac Metal miner
+quip-miner gpu --validator ws://127.0.0.1:9944 --gpu-backend metal --signer-key ~/.quip-miner/signing.json
+
+# QPU miner (D-Wave; requires DWAVE_API_KEY in env)
+quip-miner qpu --validator ws://127.0.0.1:9944 --daily-budget 30s --signer-key ~/.quip-miner/signing.json
+
+# Concurrent PoW + mempool on one process
+quip-miner cpu --validator ws://... --mode both --num-cpus 4 --signer-key ~/.quip-miner/signing.json
+
+# TOML config (see quip-miner.example.toml)
+quip-miner cpu --config ./quip-miner.example.toml
 ```
 
 ### Testing
@@ -70,10 +75,11 @@ modal run benchmarks/gpu_benchmark_modal.py
 
 ## Architecture
 
-### CLI Entry Points (`quip_cli.py`)
+### CLI Entry Point (`quip_cli.py`)
 
-- `quip-network-node`: Run a single P2P node (cpu/gpu/qpu subcommands)
-- `quip-network-simulator`: Launch multiple connected nodes for testing
+- `quip-miner`: substrate-attached miner with subcommands
+  `keygen`, `bootstrap`, `cpu`, `gpu`, `qpu`, `mempool`,
+  `register-solver`, `deregister-solver`.
 
 ### Shared Module (`shared/`)
 
@@ -221,7 +227,7 @@ min_solutions = 5
 
 **Docker** (`docker/`): Dockerfile.cpu, Dockerfile.cuda, docker-compose.yml, entrypoint.sh
 
-**Systemd** (`quip-network-node.service`): Production deployment, config at `/etc/quip.network/config.toml`
+**Systemd** (`quip-miner.service`): Bare-metal deployment, config at `/etc/quip.network/config.toml`
 
 **Cloud**: `akash/` and `aws/` directories for cloud deployment configs
 

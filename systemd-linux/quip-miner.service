@@ -1,5 +1,5 @@
 [Unit]
-Description=Quip Network Node
+Description=Quip Miner (substrate)
 After=network.target
 Wants=network.target
 
@@ -9,12 +9,12 @@ User=quip
 Group=quip
 Environment=PATH=/opt/quip/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONPATH=/opt/quip/lib/python3.13/site-packages
-ExecStart=/opt/quip/bin/quip-network-node --config /etc/quip.network/config.toml
+ExecStart=/opt/quip/bin/quip-miner cpu --config /etc/quip.network/config.toml
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=quip-network-node
+SyslogIdentifier=quip-miner
 
 # Security settings
 NoNewPrivileges=yes

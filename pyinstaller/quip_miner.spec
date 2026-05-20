@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""PyInstaller spec for quip-network-node frozen binary."""
+"""PyInstaller spec for quip-miner frozen binary."""
 
 import glob
 import importlib
@@ -158,9 +158,9 @@ datas += copy_metadata("quip-protocol")
 # Analysis
 # ---------------------------------------------------------------------------
 # Use version-stamped boot script if available (built by build.sh)
-_boot = os.path.join(SPECPATH, "boot_network_node_stamped.py")
+_boot = os.path.join(SPECPATH, "boot_miner_stamped.py")
 if not os.path.exists(_boot):
-    _boot = os.path.join(SPECPATH, "boot_network_node.py")
+    _boot = os.path.join(SPECPATH, "boot_miner.py")
 
 a = Analysis(
     [_boot],
@@ -194,7 +194,7 @@ if _removed:
     print(f"  Stripped {_removed} unused CUDA libraries from bundle")
 
 # ---------------------------------------------------------------------------
-# Platform-aware binary name: quip-network-node-{os}-{arch}
+# Platform-aware binary name: quip-miner-{os}-{arch}
 # ---------------------------------------------------------------------------
 _os_map = {"darwin": "macos", "linux": "linux", "windows": "windows"}
 _arch_map = {
@@ -205,7 +205,7 @@ _arch_map = {
 }
 _os = _os_map.get(platform.system().lower(), platform.system().lower())
 _arch = _arch_map.get(platform.machine().lower(), platform.machine().lower())
-binary_name = f"quip-network-node-{_os}-{_arch}"
+binary_name = f"quip-miner-{_os}-{_arch}"
 
 # ---------------------------------------------------------------------------
 # Bundle

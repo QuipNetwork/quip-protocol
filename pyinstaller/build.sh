@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-# Build a frozen binary of quip-network-node for the current platform.
+# Build a frozen binary of quip-miner for the current platform.
 # Usage: bash pyinstaller/build.sh
 
 set -euo pipefail
@@ -28,18 +28,18 @@ except ImportError:
 with open('pyproject.toml', 'rb') as f:
     print(tomllib.load(f)['project']['version'])
 ")
-sed "s/@VERSION@/${VERSION}/" "$SCRIPT_DIR/boot_network_node.py" \
-    > "$SCRIPT_DIR/boot_network_node_stamped.py"
+sed "s/@VERSION@/${VERSION}/" "$SCRIPT_DIR/boot_miner.py" \
+    > "$SCRIPT_DIR/boot_miner_stamped.py"
 
-echo "=== Building quip-network-node ${VERSION} (${ARCH}) ==="
-pyinstaller "$SCRIPT_DIR/quip_network_node.spec" \
+echo "=== Building quip-miner ${VERSION} (${ARCH}) ==="
+pyinstaller "$SCRIPT_DIR/quip_miner.spec" \
     --distpath "$PROJECT_ROOT/dist" \
     --workpath "$PROJECT_ROOT/build/pyinstaller-${ARCH}"
 
 # Smoke test: binary must print version and exit 0
 echo ""
 echo "=== Smoke test ==="
-BINARY=$(find dist -maxdepth 1 -name 'quip-network-node-*' -type f | head -1)
+BINARY=$(find dist -maxdepth 1 -name 'quip-miner-*' -type f | head -1)
 if [ -z "$BINARY" ]; then
     echo "ERROR: No binary found in dist/"
     exit 1

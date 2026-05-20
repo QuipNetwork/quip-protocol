@@ -1,0 +1,35 @@
+# quip-miner CPU image — v0.2 [miner] schema.
+# Copied to /data/config.toml on first run; operators can edit it
+# directly afterwards. Container env vars (QUIP_VALIDATORS, etc.)
+# override these values via CLI flags at launch time.
+
+[miner]
+# Ordered failover list — tried in order at startup, live-rotated on
+# disconnect. Required. CLI: --validator URL (repeatable); env:
+# QUIP_VALIDATORS="ws://a,ws://b".
+validators = [
+    # "wss://validator-1.quip.network/rpc",
+    # "wss://validator-2.quip.network/rpc",
+]
+
+# Hybrid sr25519 + ML-DSA-44 keystore. The entrypoint auto-generates
+# one at this path on first run if missing. CLI: --signer-key PATH;
+# env: QUIP_SIGNER_KEY.
+signer_key = "/data/keystore.json"
+
+# Optional faucet bot for auto-topup when wallet is underfunded at
+# startup. Without this, an underfunded wallet fails fast with
+# `wallet-underfunded`. CLI: --faucet-url URL; env: QUIP_FAUCET_URL.
+# faucet_url = "http://faucet.quip.network"
+
+# Telemetry REST API. Disabled by default (rest_port = -1). Set
+# rest_host = "0.0.0.0" to expose on all interfaces (containers).
+# CLI: --rest-port N / --rest-host HOST; env: QUIP_REST_PORT /
+# QUIP_REST_HOST.
+rest_port = -1
+rest_host = "0.0.0.0"
+
+# Reserved subtables — parsed-but-ignored in v0.2; CLI flags drive
+# per-backend config today.
+# [miner.cpu]
+# num_cpus = 4

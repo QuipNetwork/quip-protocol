@@ -7,8 +7,8 @@ stages:
   - release
 
 variables:
-  CPU_IMAGE: quip-network-node-cpu
-  CUDA_IMAGE: quip-network-node-cuda
+  CPU_IMAGE: quip-miner-cpu
+  CUDA_IMAGE: quip-miner-cuda
 
 # ---------------------------------------------------------------------------
 # Tests (branches only — main/tags skip straight to build)
@@ -176,7 +176,7 @@ build-cuda:
     - bash pyinstaller/build.sh
   artifacts:
     paths:
-      - dist/quip-network-node-*
+      - dist/quip-miner-*
     expire_in: 30 days
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
@@ -224,9 +224,9 @@ release-binaries:
     description: "Release $CI_COMMIT_TAG"
     assets:
       links:
-        - name: quip-network-node-macos-arm64
-          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-macos-arm64?job=package-macos-arm64"
-          filepath: /quip-network-node-macos-arm64
-        - name: quip-network-node-macos-x86_64
-          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-macos-x86_64?job=package-macos-x86_64"
-          filepath: /quip-network-node-macos-x86_64
+        - name: quip-miner-macos-arm64
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-miner-macos-arm64?job=package-macos-arm64"
+          filepath: /quip-miner-macos-arm64
+        - name: quip-miner-macos-x86_64
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-miner-macos-x86_64?job=package-macos-x86_64"
+          filepath: /quip-miner-macos-x86_64
