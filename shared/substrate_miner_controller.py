@@ -1008,10 +1008,13 @@ class SubstrateMinerController:
                 )
                 # A mine_result means the worker's dispatch loop exited
                 # with a winning result and the worker is now idle at the
-                # next req_q.get(). Emit a sentinel so the next head's
-                # cancel-drain doesn't wait 500ms for a `work_item_done`
-                # that will never come (the worker emits *either*
-                # mine_result *or* work_item_done per dispatch, not both).
+                # next req_q.get(). Mark the handle idle so subsequent
+                # heads don't try to cancel a non-existent dispatch and
+                # eat a 500ms timeout when no sentinel is forthcoming.
+                # Also emit a sentinel for any cancel-await already
+                # blocked on this dispatch_id.
+                if handle._active_dispatch_id == dispatch_id:
+                    handle._active_dispatch_id = 0
                 self._done_queues[handle.miner_id].put_nowait(dispatch_id)
             elif isinstance(msg, dict) and msg.get("op") == "work_item_done":
                 # Worker finished its mine_work_item loop with no result —
@@ -1019,9 +1022,10 @@ class SubstrateMinerController:
                 # tagged with the dispatch_id so _await_handle_done can
                 # synchronize on cancellation of that specific dispatch,
                 # not just any sentinel.
-                self._done_queues[handle.miner_id].put_nowait(
-                    msg.get("dispatch_id")
-                )
+                done_dispatch_id = msg.get("dispatch_id")
+                if handle._active_dispatch_id == done_dispatch_id:
+                    handle._active_dispatch_id = 0
+                self._done_queues[handle.miner_id].put_nowait(done_dispatch_id)
             elif isinstance(msg, dict) and msg.get("op") == "error":
                 self.stats.miner_errors[handle.miner_id] = (
                     self.stats.miner_errors.get(handle.miner_id, 0) + 1
@@ -1036,9 +1040,10 @@ class SubstrateMinerController:
                 # _await_handle_done can synchronize after a mining error.
                 # Without this, every mining exception causes a guaranteed
                 # timeout on the next cancel.
-                self._done_queues[handle.miner_id].put_nowait(
-                    msg.get("dispatch_id")
-                )
+                err_dispatch_id = msg.get("dispatch_id")
+                if handle._active_dispatch_id == err_dispatch_id:
+                    handle._active_dispatch_id = 0
+                self._done_queues[handle.miner_id].put_nowait(err_dispatch_id)
             elif isinstance(msg, dict) and msg.get("op") == "stats":
                 # Stats responses are pulled directly by callers of
                 # handle.get_stats(); if one lands here it just means

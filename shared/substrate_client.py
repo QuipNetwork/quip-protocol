@@ -891,8 +891,13 @@ class SubstrateClient:
                     lambda: getattr(self._iface, head_fn_name)()
                 )
                 head_bytes = bytes.fromhex(_strip_0x(head_hex))
+                # Same DigestItem-resilience as the subscribe call: a
+                # header we can't fully SCALE-decode is still useful —
+                # we only need the `number` field.
                 header = await self._run(
-                    lambda: self._iface.get_block_header(block_hash=head_hex)
+                    lambda: self._iface.get_block_header(
+                        block_hash=head_hex, ignore_decoding_errors=True
+                    )
                 )
                 number = _coerce_block_number(header["header"]["number"])
                 await callback(head_bytes, number)
@@ -905,10 +910,18 @@ class SubstrateClient:
 
         try:
             # Bypass `_call_lock` for the long-lived subscribe — see docstring.
+            # `ignore_decoding_errors=True` keeps a header that
+            # substrate-interface can't fully decode (e.g. an unknown
+            # `DigestItem` variant after a runtime upgrade) from killing
+            # the whole subscription. The pump doesn't read the header
+            # payload anyway — it only needs the wake signal — so we
+            # don't lose information by tolerating these decode failures.
             await loop.run_in_executor(
                 None,
                 lambda: self._iface.subscribe_block_headers(
-                    _dispatch, finalized_only=finalized_only
+                    _dispatch,
+                    finalized_only=finalized_only,
+                    ignore_decoding_errors=True,
                 ),
             )
         finally:
