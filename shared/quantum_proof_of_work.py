@@ -1,16 +1,38 @@
-"""Utility functions for quantum proof-of-work (diversity and distances).
+"""Quantum proof-of-work primitives + sampleset evaluation.
 
-Extracted from BaseMiner to be reusable and stateless.
+Two distinct surfaces live in this module:
+
+  - PoW primitives (``derive_nonce``, ``generate_ising_model_from_nonce``).
+    These mirror ``quantum_validation::{derive_nonce, generate_ising_model}``
+    in ``quip-protocol-rs`` and are cross-language-deterministic: identical
+    inputs must produce identical outputs in both languages.
+  - Sampleset evaluation utilities (``evaluate_sampleset``, ``validate_solution``,
+    ``select_diverse_solutions``, ``calculate_diversity``). These are
+    Python-only helpers used by miners to turn a dimod sampleset into a
+    :class:`shared.miner_types.MiningResult`.
+
+Post-MR-!20 wire shape:
+  - ``derive_nonce`` returns the full 256-bit BLAKE3 digest as 32 raw bytes.
+    Inputs are fixed 32-byte buffers (``parent_hash``, ``miner``, ``salt``).
+  - ``generate_ising_model_from_nonce`` seeds ChaCha8Rng from those 32 bytes
+    directly via ``from_seed`` — no PCG32 u64 expansion. h and j are sampled
+    via :class:`shared.allowed_value_spec.AllowedValueSpec`.
 """
 from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Tuple, Dict, Optional, List
+from typing import Any, Tuple, Dict, Optional, List, Union
 
 from blake3 import blake3
 import numpy as np
 
+from shared.allowed_value_spec import (
+    AllowedValueSet,
+    AllowedValueSpec,
+    MILLI_SCALE,
+    sample as _sample_spec,
+)
 from shared.chacha8 import ChaCha8Rng
 from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
@@ -19,78 +41,134 @@ from dwave_topologies import DEFAULT_TOPOLOGY
 logger = get_logger('quantum_proof_of_work')
 
 
+# Default sampling specs (mirror the on-chain v0.2 defaults: ternary h,
+# binary j and spin). Milli-precision integers; multiply by 1/MILLI_SCALE
+# to read as float.
+DEFAULT_ALLOWED_H: AllowedValueSpec = AllowedValueSet((-MILLI_SCALE, 0, MILLI_SCALE))
+DEFAULT_ALLOWED_J: AllowedValueSpec = AllowedValueSet((-MILLI_SCALE, MILLI_SCALE))
+
+
+def _to_nonce_bytes(nonce: Union[int, bytes]) -> bytes:
+    """Coerce a nonce input to its canonical 32-byte big-endian representation.
+
+    The chain-integration path always passes ``bytes`` (the full 256-bit
+    digest from ``derive_nonce``). Tools and tests sometimes pass a small
+    integer for clarity; accept those and big-endian-encode to 32 bytes.
+    Negative integers and oversize bytes raise.
+    """
+    if isinstance(nonce, (bytes, bytearray)):
+        b = bytes(nonce)
+        if len(b) != 32:
+            raise ValueError(
+                f"nonce must be 32 bytes when supplied as bytes, got {len(b)}"
+            )
+        return b
+    if not isinstance(nonce, int):
+        raise TypeError(
+            f"nonce must be int or bytes, got {type(nonce).__name__}"
+        )
+    if nonce < 0 or nonce >= (1 << 256):
+        raise ValueError("nonce int must fit in 256 bits (0..2^256-1)")
+    return nonce.to_bytes(32, "big")
+
+
 def derive_nonce(
     parent_hash: bytes,
     miner: bytes,
     block_number: int,
     salt: bytes,
-) -> int:
-    """Generate deterministic nonce from byte-string identity material.
+) -> bytes:
+    """Derive the canonical 32-byte PoW nonce.
 
-    Mirrors `quantum_validation::derive_nonce` in `quip-protocol-rs`. Hashes
-    `parent_hash || miner || block_number_be(4B) || salt` with BLAKE3 and
-    returns the first 8 digest bytes as a big-endian `u64`.
+    Mirrors ``quantum_validation::derive_nonce`` in ``quip-protocol-rs``
+    (post-MR-!20). Inputs are fixed-size 32-byte buffers so the PoW search
+    space is statically known and identical across every call:
 
-    Use this in Substrate mode where the miner identity is the SCALE-encoded
-    32-byte `AccountId32` (not a human-readable string).
+    - ``parent_hash`` — block header parent hash, 32 bytes
+    - ``miner`` — 32-byte canonical miner identity (typically
+      ``blake2_256(SCALE(account_id))``)
+    - ``block_number`` — current block height (u32)
+    - ``salt`` — the only freely-chosen miner input, 32 bytes
+
+    Returns the full 256-bit BLAKE3 digest as raw bytes. No truncation.
     """
+    if len(parent_hash) != 32:
+        raise ValueError(f"parent_hash must be 32 bytes, got {len(parent_hash)}")
+    if len(miner) != 32:
+        raise ValueError(f"miner must be 32 bytes, got {len(miner)}")
+    if len(salt) != 32:
+        raise ValueError(f"salt must be 32 bytes, got {len(salt)}")
     if not (0 <= block_number < 2**32):
-        raise ValueError(f"block_number must be a u32 (0..2^32-1), got {block_number}")
+        raise ValueError(
+            f"block_number must be a u32 (0..2^32-1), got {block_number}"
+        )
     hasher = blake3()
     hasher.update(parent_hash)
     hasher.update(miner)
-    hasher.update(block_number.to_bytes(4, 'big'))
+    hasher.update(block_number.to_bytes(4, "big"))
     hasher.update(salt)
-    return int.from_bytes(hasher.digest()[:8], 'big')
-
-
-def ising_nonce_from_block(prev_hash: bytes, miner_id: str, cur_index: int, salt: bytes) -> int:
-    """Legacy nonce helper for the pre-substrate chain.
-
-    Same BLAKE3 construction as `derive_nonce` but the miner identity is a
-    human-readable string. Retained so the legacy `Node` / `NetworkNode`
-    paths keep working until Phase 5 deletes them.
-    """
-    return derive_nonce(prev_hash, miner_id.encode(), cur_index, salt)
+    return hasher.digest()
 
 
 def generate_ising_model_from_nonce(
-    nonce: int,
+    nonce: Union[int, bytes],
     nodes: List[int],
     edges: List[Tuple[int, int]],
+    allowed_h: Optional[AllowedValueSpec] = None,
+    allowed_j: Optional[AllowedValueSpec] = None,
+    *,
     h_values: Optional[List[float]] = None,
 ) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float]]:
-    """Generate (h, J) Ising parameters using ChaCha8Rng.
+    """Generate (h, J) Ising parameters deterministically from ``nonce``.
 
-    Matches Rust's generate_ising_model() in quip-protocol-rs:
-      - Uses ChaCha8Rng (not numpy PCG64)
-      - Generates h FIRST, then J
-      - Uses next_u32() % len for h (modulo selection, matches Rust)
-      - Uses next_u32() & 1 for J sign
+    Mirrors ``quantum_validation::generate_ising_model`` in
+    ``quip-protocol-rs`` (post-MR-!20):
+
+    - Seeds :class:`shared.chacha8.ChaCha8Rng` from the full 32-byte nonce
+      via ``from_seed`` (not the legacy ``seed_from_u64`` PCG32 expansion).
+    - Samples one h per node from ``allowed_h`` first, then one j per edge
+      from ``allowed_j``. Both flow through
+      :func:`shared.allowed_value_spec.sample`.
+
+    ``allowed_h`` and ``allowed_j`` default to the chain's v0.2 specs
+    (ternary h, binary j). The legacy ``h_values`` keyword accepts a list
+    of float values for backwards compatibility with diagnostic tools;
+    each float is converted to its milli-precision i32 representation
+    inside an :class:`shared.allowed_value_spec.AllowedValueSet`.
+
+    Returned dictionaries hold floats (``milli / MILLI_SCALE``) to match the
+    rest of the Python miner stack, which works in physical units.
     """
-    if h_values is None:
-        h_values = [-1.0, 0.0, 1.0]
-    if not h_values:
-        raise ValueError("h_values must be non-empty")
     if not nodes:
         raise ValueError("nodes must be non-empty for Ising model generation")
 
-    rng = ChaCha8Rng.seed_from_u64(nonce)
-    n_h = len(h_values)
+    if h_values is not None:
+        if allowed_h is not None:
+            raise ValueError(
+                "pass either `allowed_h` or legacy `h_values`, not both"
+            )
+        from shared.allowed_value_spec import AllowedValueSet as _Set
+        allowed_h = _Set(
+            tuple(int(round(float(v) * MILLI_SCALE)) for v in h_values)
+        )
 
-    # h FIRST: one next_u32() per node
+    if allowed_h is None:
+        allowed_h = DEFAULT_ALLOWED_H
+    if allowed_j is None:
+        allowed_j = DEFAULT_ALLOWED_J
+
+    seed = _to_nonce_bytes(nonce)
+    rng = ChaCha8Rng.from_seed(seed)
+
     h: Dict[int, float] = {}
     for node_id in nodes:
-        index = rng.next_u32() % n_h
-        h[int(node_id)] = h_values[index]
+        h[int(node_id)] = _sample_spec(allowed_h, rng) / MILLI_SCALE
 
-    # J SECOND: one next_u32() per edge
-    J: Dict[Tuple[int, int], float] = {}
+    j: Dict[Tuple[int, int], float] = {}
     for (u, v) in edges:
-        sign = -1.0 if (rng.next_u32() & 1) == 0 else 1.0
-        J[(int(u), int(v))] = sign
+        j[(int(u), int(v))] = _sample_spec(allowed_j, rng) / MILLI_SCALE
 
-    return h, J
+    return h, j
 
 
 def energy_of_solution(solution: List[int], h: Dict[int, float], J: Dict[Tuple[int, int], float], nodes: List[int]) -> float:
@@ -431,88 +509,9 @@ def _validate_topology_consistency(
     return errors
 
 
-def validate_quantum_proof(quantum_proof, miner_id: str, requirements, block_index: int, previous_hash: bytes) -> bool:
-    """Validate quantum proof against requirements and compute metrics.
-    
-    Args:
-        quantum_proof: QuantumProof object containing solutions and metadata
-        miner_id: ID of the miner who created the proof
-        requirements: BlockRequirements object with difficulty settings
-        block_index: Index of the block being validated
-        previous_hash: Hash of the previous block
-        
-    Returns:
-        bool: True if quantum proof is valid, False otherwise
-    """
-    if not quantum_proof:
-        logger.error(f"Block {block_index} rejected: no quantum proof")
-        return False
-
-    solutions = quantum_proof.solutions
-    if not solutions:
-        logger.error(f"Block {block_index} rejected: no solutions in quantum proof")
-        return False
-
-    # For block validation, use the miner_id from the quantum proof
-    nonce = ising_nonce_from_block(previous_hash, miner_id, block_index, quantum_proof.salt)
-    if quantum_proof.nonce != nonce:
-        logger.error(f"Block {block_index} rejected: invalid nonce {quantum_proof.nonce} != {nonce}")
-        return False
-
-    # Get h_values from requirements
-    h_values = getattr(requirements, 'h_values', None)
-
-    h, J = generate_ising_model_from_nonce(
-        nonce,
-        quantum_proof.nodes,
-        quantum_proof.edges,
-        h_values=h_values,
-    )
-
-    # Validate each solution for correctness
-    valid_solutions = []
-    invalid_count = 0
-    
-    for solution in solutions:
-        validation_result = validate_solution(solution, h, J, quantum_proof.nodes, quantum_proof.edges)
-        if validation_result["valid"]:
-            valid_solutions.append(solution)
-        else:
-            invalid_count += 1
-            logger.warning(f"Invalid solution found in quantum proof: {validation_result['errors']}")
-    
-    if invalid_count > 0:
-        logger.error(f"Block {block_index} rejected: {invalid_count} invalid solutions found")
-        return False
-
-    # Compute energies respecting variable order (quantum_proof.nodes)
-    energies = energies_for_solutions(valid_solutions, h, J, quantum_proof.nodes)
-
-    # Find solutions meeting energy threshold
-    energy_valid_indices = [i for i, e in enumerate(energies) if e < requirements.difficulty_energy]
-    energy_valid_solutions = [valid_solutions[i] for i in energy_valid_indices]
-
-    if len(energy_valid_solutions) < requirements.min_solutions:
-        logger.error(f"Block {block_index} rejected: insufficient valid solutions ({len(energy_valid_solutions)} < {requirements.min_solutions})")
-        logger.error(f"Solutions presented in result: {len(solutions)} - energies: {energies}")
-        logger.error(f"Energy threshold: {requirements.difficulty_energy:.2f} (solutions must be < this value)")
-        # Show which solutions failed and by how much
-        for i, e in enumerate(energies):
-            status = "PASS" if e < requirements.difficulty_energy else f"FAIL (gap: {e - requirements.difficulty_energy:.2f})"
-            logger.error(f"  Solution {i}: energy={e:.2f} - {status}")
-        return False
-
-    # Select most diverse subset of min_solutions and check diversity
-    # This ensures we find AT LEAST min_solutions with AT LEAST min_diversity
-    selected_solution_indices = select_diverse_solutions(energy_valid_solutions, requirements.min_solutions)
-    selected_solutions = [energy_valid_solutions[i] for i in selected_solution_indices]
-    diversity = calculate_diversity(selected_solutions)
-
-    if diversity < requirements.min_diversity:
-        logger.error(f"Block {block_index} rejected: insufficient diversity in best {requirements.min_solutions} solutions ({diversity:.3f} < {requirements.min_diversity})")
-        return False
-
-    return True
+# `validate_quantum_proof` was the pre-substrate block-validation path. It
+# trusted nodes/edges/h_values carried inside the proof — a shape removed by
+# quip-protocol-rs MR !20. The on-chain pallet is now the only validator.
 
 
 def validate_solution(spins: List[int], h: Dict[int, float], J: Dict[Tuple[int, int], float], nodes: List[int], edges: Optional[List[Tuple[int, int]]] = None) -> Dict[str, Any]:
@@ -655,7 +654,7 @@ def _energy_stratified_selection(
 
 
 def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tuple[int, int]],
-                      nonce: int, salt: bytes, prev_timestamp: int, start_time: float,
+                      nonce: Union[int, bytes], salt: bytes, prev_timestamp: int, start_time: float,
                       miner_id: str, miner_type: str,
                       h: Optional[Dict[int, float]] = None,
                       J: Optional[Dict[Tuple[int, int], float]] = None,
@@ -729,10 +728,15 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
                     valid_energies.append(all_energies[idx])
         else:
             # SLOW PATH: Full validation for untrusted sources (block validation)
-            # Use pre-computed Ising model if provided, otherwise regenerate
+            # Use pre-computed Ising model if provided, otherwise regenerate.
+            # Requirements may carry `allowed_h_values` / `allowed_j_values`
+            # (post-MR-!20) for non-default sampling distributions.
             if h is None or J is None:
-                h_values = getattr(requirements, 'h_values', None)
-                h, J = generate_ising_model_from_nonce(nonce, nodes, edges, h_values=h_values)
+                allowed_h = getattr(requirements, "allowed_h_values", DEFAULT_ALLOWED_H)
+                allowed_j = getattr(requirements, "allowed_j_values", DEFAULT_ALLOWED_J)
+                h, J = generate_ising_model_from_nonce(
+                    nonce, nodes, edges, allowed_h=allowed_h, allowed_j=allowed_j,
+                )
 
             invalid_solutions = []
             for idx in valid_indices:
@@ -804,7 +808,7 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         result = MiningResult(
             miner_id=miner_id,
             miner_type=miner_type,
-            nonce=nonce,
+            nonce=_to_nonce_bytes(nonce),
             salt=salt,
             timestamp=int(time.time()),
             prev_timestamp=prev_timestamp,

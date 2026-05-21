@@ -14,11 +14,12 @@ class IsingModel:
     Attributes:
         h: Linear biases (node -> field value).
         J: Quadratic couplings ((u, v) -> coupling value).
-        nonce: Blockchain nonce for proof-of-work verification.
-        salt: Random salt used to derive the nonce.
+        nonce: 32-byte big-endian U256 nonce (post-MR-!20). Mirrors the
+            shape of ``QuantumProof.nonce`` on chain.
+        salt: 32-byte salt used to derive the nonce.
     """
 
     h: dict[int, float]
     J: dict[tuple[int, int], float]
-    nonce: int
+    nonce: bytes
     salt: bytes

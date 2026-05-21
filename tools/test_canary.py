@@ -43,10 +43,12 @@ import dimod
 from shared.block import Block, BlockHeader, BlockRequirements, create_genesis_block
 from shared.miner_types import MiningResult
 from shared.time_utils import utc_timestamp
+import hashlib
+
 from shared.quantum_proof_of_work import (
+    derive_nonce,
+    evaluate_sampleset,
     generate_ising_model_from_nonce,
-    ising_nonce_from_block,
-    evaluate_sampleset
 )
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies import load_topology
@@ -433,13 +435,13 @@ def run_canary_test(
         # Generate random salt for nonce generation (reproducible via seed)
         salt = random.randbytes(32)
 
-        # Generate nonce deterministically
-        nonce = ising_nonce_from_block(
-            prev_block.hash,
-            f"canary-test-{seed}",
-            1,  # block index
-            salt
-        )
+        # Generate nonce deterministically. The legacy string miner_id is
+        # mapped to a 32-byte canonical identity via blake2_256 — mirrors
+        # the chain's `blake2_256(SCALE(account_id))` derivation.
+        miner_bytes = hashlib.blake2b(
+            f"canary-test-{seed}".encode(), digest_size=32,
+        ).digest()
+        nonce = derive_nonce(prev_block.hash, miner_bytes, 1, salt)
 
         # Generate Ising model
         h, J = generate_ising_model_from_nonce(nonce, nodes, edges)

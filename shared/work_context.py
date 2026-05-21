@@ -93,7 +93,8 @@ def resolve_ising(
         nonce,
         list(nodes),
         list(edges),
-        list(context.h_values),
+        allowed_h=context.allowed_h_values,
+        allowed_j=context.allowed_j_values,
     )
     return h, J, nonce
 
@@ -146,7 +147,8 @@ def requirements_from_context(context: WorkContext) -> BlockRequirements:
         min_diversity=float(d.min_diversity_milli) / 1000.0,
         min_solutions=int(d.min_solutions),
         timeout_to_difficulty_adjustment_decay=_DECAY_DISABLED,
-        h_values=list(context.h_values),
+        allowed_h_values=context.allowed_h_values,
+        allowed_j_values=context.allowed_j_values,
     )
 
 

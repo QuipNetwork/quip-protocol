@@ -43,8 +43,8 @@ from GPU.metal_sa import MetalSASampler
 from GPU.metal_scheduler import MetalScheduler, _query_iokit_gpu_utilization
 from shared.ising_model import IsingModel
 from shared.quantum_proof_of_work import (
+    derive_nonce,
     generate_ising_model_from_nonce,
-    ising_nonce_from_block,
 )
 
 
@@ -60,9 +60,10 @@ def _make_models(
     models = []
     for _ in range(count):
         salt = rng.bytes(32)
-        nonce = ising_nonce_from_block(
-            b"test_hash_padding_to_32_bytes!!", "miner-test", 1, salt,
-        )
+        # Pad the test miner name to 32 bytes so derive_nonce accepts it.
+        miner_bytes = b"miner-test".ljust(32, b"\x00")
+        parent_hash = b"test_hash_padding_to_32_bytes!!!"
+        nonce = derive_nonce(parent_hash, miner_bytes, 1, salt)
         h, J = generate_ising_model_from_nonce(
             nonce, sampler.nodes, sampler.edges,
         )

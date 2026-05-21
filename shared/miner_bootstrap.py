@@ -41,11 +41,26 @@ from typing import List, Optional, Tuple
 
 import dwave_networkx as dnx
 
+from shared.allowed_value_spec import (
+    AllowedValueSet,
+    MILLI_SCALE as _MILLI_SCALE,
+    scale_dict,
+)
 from shared.hybrid_signer import HybridSigner
 from shared.keystore_hybrid import HybridKeystoreFile, load_or_generate
 from shared.logging_config import get_logger
 from shared.substrate_client import SubstrateClient
 from shared.substrate_types import SubstrateDifficulty
+
+
+# Default puzzle parameters seeded by `--seed-chain` on dev nodes. Mirror
+# the runtime defaults documented in `quip-protocol-rs/runtime/src/configs`:
+#   - h: ternary {-1, 0, +1} → 2 bits per node
+#   - j: binary {-1, +1}     → 1 bit per edge
+#   - spin: binary {-1, +1}  → 1 bit per spin (8x payload reduction)
+_DEFAULT_ALLOWED_H = AllowedValueSet((-_MILLI_SCALE, 0, _MILLI_SCALE))
+_DEFAULT_ALLOWED_J = AllowedValueSet((-_MILLI_SCALE, _MILLI_SCALE))
+_DEFAULT_ALLOWED_SPIN = AllowedValueSet((-_MILLI_SCALE, _MILLI_SCALE))
 
 
 # Dev chain names matched by prefix. Mirrors the list in `faucet_bot.py`,
@@ -290,12 +305,20 @@ async def _maybe_seed_chain(
         # metadata exposes as a 1-field composite. scalecodec wants the inner
         # Vec wrapped in a single-element tuple — see the python_parity
         # encoder doc in py-substrate-interface for the composite shape rule.
+        # Post-MR-!20 also passes the three `AllowedValueSpec` payloads
+        # (h, j, spin) — the chain rejects topologies with an empty spec.
         await _sudo_call(
             client,
             sudo_signer,
             "QuantumPow",
             "register_topology",
-            {"nodes": (nodes,), "edges": (edges,)},
+            {
+                "nodes": (nodes,),
+                "edges": (edges,),
+                "allowed_h_values": scale_dict(_DEFAULT_ALLOWED_H),
+                "allowed_j_values": scale_dict(_DEFAULT_ALLOWED_J),
+                "allowed_spin_values": scale_dict(_DEFAULT_ALLOWED_SPIN),
+            },
         )
         topology_seeded = True
     else:

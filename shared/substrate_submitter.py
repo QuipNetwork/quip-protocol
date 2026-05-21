@@ -4,13 +4,21 @@ Kept separate from `substrate_client.py` so the conversion logic — including
 the float-to-milli boundary — stays reviewable independently of the RPC
 plumbing. Phase 4's controller orchestrates: it calls into here, but neither
 the client nor the controller knows about the proof shape.
+
+Post-MR-!20: the on-chain ``QuantumProof`` carries only
+``{topology_hash, nonce (U256), salt ([u8; 32]), solutions (BoundedVec<BoundedVec<u8>>)}``.
+Nodes, edges, and h-values are looked up from ``RegisteredTopologies`` by
+``topology_hash``. Each solution is bit-packed under the registered
+``allowed_spin_values`` spec (1 byte per 8 binary spins).
 """
 from __future__ import annotations
 
 from typing import List, Tuple
 
+from shared.allowed_value_spec import MILLI_SCALE as _MILLI_SCALE
 from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
+from shared.packed_solution import pack_solution
 from shared.signer import Signer
 from shared.substrate_client import SubstrateClient
 from shared.substrate_types import ExtrinsicReceipt, SubstrateMiningContext
@@ -20,7 +28,7 @@ logger = get_logger("substrate_submitter")
 
 
 # Same convention the Rust pallet uses everywhere: milli = ×1000.
-MILLI_SCALE: int = 1000
+MILLI_SCALE: int = _MILLI_SCALE
 
 
 def encode_quantum_proof(
@@ -29,12 +37,13 @@ def encode_quantum_proof(
 ) -> dict:
     """Build the `QuantumProof` payload expected by `QuantumPow.submit_proof`.
 
-    Floats from the miner are converted to milli-precision i32 at this
-    boundary. Spin values are normalized to ±1 because the Rust pallet rejects
-    anything else (`InvalidSpinValues`).
+    The returned dict matches the post-MR-!20 SCALE struct field-for-field —
+    ``compose_call`` serializes it for us.
 
-    The returned dict matches the SCALE struct field-for-field — `compose_call`
-    serializes it for us.
+    Each solution is bit-packed against ``context.allowed_spin_values`` via
+    :func:`shared.packed_solution.pack_solution`. For the default binary
+    spin spec this is 1 bit per spin; the resulting bytes are submitted as a
+    ``BoundedVec<u8, MaxNodes>`` per solution.
     """
     if not result.solutions:
         raise ValueError("MiningResult has no solutions to submit")
@@ -42,27 +51,48 @@ def encode_quantum_proof(
         raise ValueError(
             f"MiningResult.salt must be 32 bytes, got {len(result.salt)}"
         )
+    if not isinstance(result.nonce, (bytes, bytearray)) or len(result.nonce) != 32:
+        raise ValueError(
+            "MiningResult.nonce must be the 32-byte big-endian U256 digest"
+        )
 
-    nodes = [int(n) for n in (result.node_list or context.nodes)]
-    edges = _coerce_edges(result.edge_list) if result.edge_list else list(context.edges)
-    solutions = [_normalize_spins(sol) for sol in result.solutions]
-    h_values_milli = [int(round(v * MILLI_SCALE)) for v in context.h_values]
+    num_spins = len(context.nodes)
+    spin_spec = context.allowed_spin_values
 
-    # NodesOf<T> / EdgesOf<T> / SolutionsOf<T> / FieldsOf<T> / SaltOf<T> are
-    # all `BoundedVec<...>` which substrate metadata exposes as a 1-field
-    # composite. scalecodec requires the inner Vec wrapped in a single-element
-    # tuple — same rule as the bootstrap's register_topology call.
+    packed_solutions: List[bytes] = []
+    for sol in result.solutions:
+        # Convert ±1 spins back to milli-precision values matching the spec.
+        # (For the default binary spin set {-1000, +1000}, this is just
+        # multiplying by 1000.)
+        milli_spins = [_milli_from_spin(s) for s in _normalize_spins(sol)]
+        if len(milli_spins) != num_spins:
+            raise ValueError(
+                f"solution length {len(milli_spins)} does not match topology "
+                f"node count {num_spins}"
+            )
+        packed_solutions.append(pack_solution(milli_spins, spin_spec))
+
+    # NonceOf / SaltOf are now raw `[u8; 32]`. substrate-interface accepts a
+    # bytes object or a list-of-ints for fixed-size byte arrays; we use the
+    # int-list form to match the existing codebase convention.
+    # SolutionsOf is `BoundedVec<BoundedVec<u8>>` — the outer BoundedVec is
+    # exposed as a 1-tuple composite; each inner BoundedVec<u8> is also a
+    # 1-tuple composite carrying the packed byte list.
     return {
         "topology_hash": "0x" + context.topology_hash.hex(),
-        "nonce": int(result.nonce),
-        "salt": ([int(b) for b in result.salt],),
-        "nodes": (nodes,),
-        "edges": ([(int(u), int(v)) for u, v in edges],),
-        # Inner BoundedVec also needs wrapping — every solution is a
-        # BoundedVec<i8, MaxSpins>, the outer is BoundedVec<_, MaxSolutions>.
-        "solutions": ([(sol,) for sol in solutions],),
-        "h_values": (h_values_milli,),
+        "nonce": [int(b) for b in result.nonce],
+        "salt": [int(b) for b in result.salt],
+        "solutions": ([([int(b) for b in packed],) for packed in packed_solutions],),
     }
+
+
+def _milli_from_spin(spin: int) -> int:
+    """Map a ±1 spin to its milli-precision representation (±MILLI_SCALE)."""
+    if spin == 1:
+        return MILLI_SCALE
+    if spin == -1:
+        return -MILLI_SCALE
+    raise ValueError(f"normalized spin must be ±1, got {spin}")
 
 
 async def submit_proof(
@@ -79,23 +109,15 @@ async def submit_proof(
     controller is responsible for classifying them — see Phase 4 plan.
     """
     proof = encode_quantum_proof(result, context)
-    # Logging notes: salt and solutions are now wrapped as `(value,)`
-    # composite tuples (see encode_quantum_proof). The raw bytes/lists
-    # are at index 0 of each.
-    nodes_inner = proof["nodes"][0]
-    edges_inner = proof["edges"][0]
+    # Salt + solutions are wrapped as composite tuples (see
+    # encode_quantum_proof). The raw bytes/lists are at index 0 of each.
     logger.info(
-        "submitting QuantumPow.submit_proof: nonce=%d salt=0x%s... "
-        "solutions=%d block=%d nodes_count=%d edges_count=%d "
-        "first_node=%s first_edge=%s topology_hash=%s",
-        proof["nonce"],
+        "submitting QuantumPow.submit_proof: nonce=0x%s... salt=0x%s... "
+        "solutions=%d block=%d topology_hash=%s",
+        result.nonce.hex()[:16],
         result.salt.hex()[:8],
         len(proof["solutions"][0]),
         context.block_number,
-        len(nodes_inner),
-        len(edges_inner),
-        nodes_inner[0] if nodes_inner else None,
-        edges_inner[0] if edges_inner else None,
         proof["topology_hash"],
     )
     return await client.submit_extrinsic(

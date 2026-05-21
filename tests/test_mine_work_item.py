@@ -27,11 +27,15 @@ from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from shared.quantum_proof_of_work import derive_nonce
 from shared.substrate_submitter import encode_quantum_proof
+from shared.allowed_value_spec import AllowedValueSet
 from shared.substrate_types import (
-    CANONICAL_H_VALUES,
     SubstrateDifficulty,
     SubstrateMiningContext,
 )
+
+
+_BIN_SPEC = AllowedValueSet((-1000, 1000))
+_TER_SPEC = AllowedValueSet((-1000, 0, 1000))
 
 
 @pytest.fixture(scope="module")
@@ -68,7 +72,9 @@ def relaxed_context(cpu_miner) -> SubstrateMiningContext:
             min_quality_milli=0,
         ),
         miner_account_bytes=b"\x42" * 32,
-        h_values=CANONICAL_H_VALUES,
+        allowed_h_values=_TER_SPEC,
+        allowed_j_values=_BIN_SPEC,
+        allowed_spin_values=_BIN_SPEC,
     )
 
 
@@ -131,7 +137,9 @@ def test_requirements_from_context_pow_path():
             min_quality_milli=0,
         ),
         miner_account_bytes=b"\x42" * 32,
-        h_values=CANONICAL_H_VALUES,
+        allowed_h_values=_TER_SPEC,
+        allowed_j_values=_BIN_SPEC,
+        allowed_spin_values=_BIN_SPEC,
     )
     req = requirements_from_context(ctx)
     assert req.difficulty_energy == -2500.0
@@ -139,8 +147,9 @@ def test_requirements_from_context_pow_path():
     assert req.min_solutions == 5
     # Decay is disabled in substrate mode.
     assert req.timeout_to_difficulty_adjustment_decay >= 2**30
-    # h_values are carried through for the PoW path.
-    assert req.h_values is not None
+    # AllowedValueSpec instances are carried through for the PoW path.
+    assert req.allowed_h_values is not None
+    assert req.allowed_j_values is not None
 
 
 def test_requirements_from_context_mempool_unset_floors():
@@ -221,7 +230,8 @@ def test_resolve_ising_pow_uses_derive_nonce(relaxed_context, cpu_miner):
         legacy_nonce,
         sampler_nodes,
         sampler_edges,
-        list(relaxed_context.h_values),
+        allowed_h=relaxed_context.allowed_h_values,
+        allowed_j=relaxed_context.allowed_j_values,
     )
     h, J, nonce = resolve_ising(
         relaxed_context, salt=salt, nodes=sampler_nodes, edges=sampler_edges,
@@ -267,8 +277,9 @@ def test_mine_work_item_handles_mempool_context(cpu_miner):
     stop = mp.Event()
     result = cpu_miner.mine_work_item(ctx, stop)
     assert isinstance(result, MiningResult)
-    # mempool's resolve_ising returns 0 as the placeholder nonce
-    assert result.nonce == 0
+    # mempool's resolve_ising returns 0 as the placeholder nonce, which
+    # evaluate_sampleset encodes as the 32-byte zero buffer.
+    assert result.nonce == b"\x00" * 32
     # all-zero ising → any sample has energy 0
     assert result.energy <= 0.0
     assert result.num_valid >= 1
@@ -279,29 +290,26 @@ def test_mine_work_item_result_encodes_to_quantum_proof(cpu_miner, relaxed_conte
     stop = mp.Event()
     result = cpu_miner.mine_work_item(relaxed_context, stop)
     proof = encode_quantum_proof(result, relaxed_context)
-    # Shape matches pallet QuantumProof. The chain's BoundedVec fields are
-    # 1-field composites in metadata so the encoder wraps every Vec in a
-    # single-element tuple; assertions unpack those wrappers.
+    # Shape matches the post-MR-!20 pallet QuantumProof. Nonce and salt are
+    # raw [u8; 32] arrays; solutions are BoundedVec<BoundedVec<u8>> of
+    # bit-packed spins.
     assert proof["topology_hash"] == "0x" + relaxed_context.topology_hash.hex()
-    assert proof["nonce"] == result.nonce
+    assert bytes(proof["nonce"]) == result.nonce
+    assert bytes(proof["salt"]) == result.salt
 
-    salt_bytes, = proof["salt"]
-    assert bytes(salt_bytes) == result.salt
-
-    nodes, = proof["nodes"]
-    assert set(nodes) == set(relaxed_context.nodes)
-
-    edges, = proof["edges"]
-    assert len(edges) == len(relaxed_context.edges)
+    # nodes / edges / h_values are NOT in the proof anymore — the chain
+    # looks them up from the registered topology.
+    assert "nodes" not in proof
+    assert "edges" not in proof
+    assert "h_values" not in proof
 
     solutions, = proof["solutions"]
     assert len(solutions) >= relaxed_context.difficulty.min_solutions
+    expected_byte_len = (len(relaxed_context.nodes) + 7) // 8  # 1 bit per spin
     for wrapped_sol in solutions:
         inner_sol, = wrapped_sol
-        assert all(s in (-1, 1) for s in inner_sol)
-
-    h_values, = proof["h_values"]
-    assert h_values == [-1000, 0, 1000]
+        assert len(inner_sol) == expected_byte_len
+        assert all(0 <= b <= 0xFF for b in inner_sol)
 
 
 def test_mine_work_item_observes_stop_event(cpu_miner, relaxed_context):
@@ -323,6 +331,9 @@ def test_mine_work_item_observes_stop_event(cpu_miner, relaxed_context):
             min_quality_milli=1000,
         ),
         miner_account_bytes=relaxed_context.miner_account_bytes,
+        allowed_h_values=relaxed_context.allowed_h_values,
+        allowed_j_values=relaxed_context.allowed_j_values,
+        allowed_spin_values=relaxed_context.allowed_spin_values,
     )
     stop = mp.Event()
     stop.set()
@@ -334,6 +345,52 @@ def test_mine_work_item_observes_stop_event(cpu_miner, relaxed_context):
     # stop is observed, so allow a few seconds. The point is it isn't
     # mining for minutes.
     assert elapsed < 30, f"mine_work_item ignored stop_event for {elapsed:.1f}s"
+
+
+def test_mine_work_item_post_evaluation_stop_check(
+    cpu_miner, relaxed_context, monkeypatch,
+):
+    """Cancel-race regression (SUBMISSIONSTORM.md phase 4): if
+    evaluate_sampleset returns a valid result but stop_event was set
+    during evaluation, mine_work_item must return None — NOT the
+    now-stale result. Without this check, a result produced after
+    cancel still surfaces as fresh against the next dispatch.
+
+    Simulated by monkeypatching `evaluate_sampleset` to also set
+    `stop_event` before returning its result. Without the post-eval
+    check, mine_work_item would return that result; with it, returns
+    None.
+    """
+    stop = mp.Event()
+
+    fake_result = MiningResult(
+        miner_id="test",
+        miner_type="CPU",
+        nonce=(7).to_bytes(32, "big"),
+        salt=b"\x33" * 32,
+        timestamp=0,
+        prev_timestamp=0,
+        solutions=[[1 for _ in relaxed_context.nodes]],
+        energy=-1.0,
+        diversity=0.5,
+        num_valid=1,
+        mining_time=0,
+        node_list=list(relaxed_context.nodes),
+        edge_list=list(relaxed_context.edges),
+        variable_order=list(relaxed_context.nodes),
+    )
+
+    def fake_scoring(*args, **kwargs):
+        stop.set()  # Simulate cancel landing during scoring.
+        return fake_result
+
+    monkeypatch.setattr(cpu_miner, "evaluate_sampleset", fake_scoring)
+    result = cpu_miner.mine_work_item(relaxed_context, stop)
+
+    # Without the post-evaluation stop check this would return
+    # `fake_result`; with the fix it returns None and the controller's
+    # next dispatch is free to start fresh.
+    assert result is None
 
 
 def test_requirements_from_context_mempool_zero_energy_floor():
@@ -431,7 +488,8 @@ def test_miner_handle_dispatches_mine_work_item(relaxed_context):
     spec = {"id": "test-cpu-0", "kind": "cpu", "args": {}}
     handle = MinerHandle(spec=spec)
     try:
-        handle.mine_work_item(relaxed_context)
+        dispatch_id = handle.mine_work_item(relaxed_context)
+        assert dispatch_id == 1
         # Drain response with a generous timeout — CPU SA on Z(9,2) at
         # min_solutions=1 / max_energy=0 typically lands in <10s.
         deadline = time.time() + 100
@@ -440,9 +498,12 @@ def test_miner_handle_dispatches_mine_work_item(relaxed_context):
                 msg = handle.resp.get(timeout=5)
             except Exception:
                 continue
-            if isinstance(msg, MiningResult):
-                assert msg.num_valid >= 1
-                assert msg.energy <= 0
+            if isinstance(msg, dict) and msg.get("op") == "mine_result":
+                result = msg["result"]
+                assert isinstance(result, MiningResult)
+                assert result.num_valid >= 1
+                assert result.energy <= 0
+                assert msg.get("dispatch_id") == dispatch_id
                 return
             if isinstance(msg, dict) and msg.get("op") == "error":
                 pytest.fail(f"worker errored: {msg.get('message')}")
@@ -496,6 +557,9 @@ def test_miner_handle_emits_work_item_done_sentinel_on_cancel(relaxed_context):
                 min_quality_milli=1000,
             ),
             miner_account_bytes=relaxed_context.miner_account_bytes,
+            allowed_h_values=relaxed_context.allowed_h_values,
+            allowed_j_values=relaxed_context.allowed_j_values,
+            allowed_spin_values=relaxed_context.allowed_spin_values,
         )
         handle.mine_work_item(impossibly_hard)
         # Cancel after a brief moment so the worker enters the loop and
@@ -510,10 +574,11 @@ def test_miner_handle_emits_work_item_done_sentinel_on_cancel(relaxed_context):
                 continue
             if isinstance(msg, dict) and msg.get("op") == "work_item_done":
                 assert msg.get("id") == "test-cpu-cancel"
+                assert "dispatch_id" in msg
                 return
             if isinstance(msg, dict) and msg.get("op") == "error":
                 pytest.fail(f"worker errored: {msg.get('message')}")
-            if isinstance(msg, MiningResult):
+            if isinstance(msg, dict) and msg.get("op") == "mine_result":
                 pytest.fail("expected work_item_done sentinel, got a result")
         pytest.fail("no work_item_done sentinel before deadline")
     finally:

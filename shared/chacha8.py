@@ -128,6 +128,16 @@ class ChaCha8Rng:
         key = _seed_from_u64(seed)
         return cls(key)
 
+    @classmethod
+    def from_seed(cls, key: bytes) -> ChaCha8Rng:
+        """Create a ChaCha8Rng directly from a 32-byte key.
+
+        Matches ``rand_core::SeedableRng::from_seed`` for ChaCha8Rng — no
+        PCG32 expansion. Use this when seeding from a full 256-bit nonce
+        (the post-MR-!20 PoW path), not a truncated u64.
+        """
+        return cls(key)
+
     def _refill_buffer(self) -> None:
         """Generate the next 16-word keystream block."""
         self._buffer = _chacha_block(self._state)

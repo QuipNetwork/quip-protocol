@@ -19,8 +19,8 @@ from typing import Optional
 
 from shared.ising_model import IsingModel
 from shared.quantum_proof_of_work import (
+    derive_nonce,
     generate_ising_model_from_nonce,
-    ising_nonce_from_block,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,20 +29,21 @@ _SPAWN_CTX = _mp.get_context('spawn')
 
 
 def _generate_one_model(
-    prev_hash: bytes,
-    miner_id: str,
-    cur_index: int,
+    parent_hash: bytes,
+    miner_bytes: bytes,
+    block_number: int,
     nodes: list,
     edges: list,
     salt: bytes,
 ) -> IsingModel:
-    """Generate one IsingModel in a worker process."""
-    nonce = ising_nonce_from_block(
-        prev_hash, miner_id, cur_index, salt,
-    )
-    h, J = generate_ising_model_from_nonce(
-        nonce, nodes, edges,
-    )
+    """Generate one IsingModel in a worker process.
+
+    ``parent_hash`` and ``miner_bytes`` are the post-MR-!20 fixed 32-byte
+    inputs to ``derive_nonce``. Callers must supply the canonical miner
+    identity (``blake2_256(SCALE(account))`` for substrate accounts).
+    """
+    nonce = derive_nonce(parent_hash, miner_bytes, block_number, salt)
+    h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
     return IsingModel(h=h, J=J, nonce=nonce, salt=salt)
 
 
@@ -98,9 +99,10 @@ class IsingFeeder:
     CUDA driver state from the parent process.
 
     Args:
-        prev_hash: Current block's previous hash.
-        miner_id: Miner identifier string.
-        cur_index: Current block index.
+        parent_hash: Current block's parent hash (32 bytes).
+        miner_bytes: Canonical 32-byte miner identity
+            (``blake2_256(SCALE(account_id))`` for substrate accounts).
+        block_number: Current block number / index.
         nodes: Topology node list.
         edges: Topology edge list.
         buffer_size: Target number of ready + in-flight models.
@@ -110,18 +112,26 @@ class IsingFeeder:
 
     def __init__(
         self,
-        prev_hash: bytes,
-        miner_id: str,
-        cur_index: int,
+        parent_hash: bytes,
+        miner_bytes: bytes,
+        block_number: int,
         nodes: list,
         edges: list,
         buffer_size: int = 8,
         max_workers: int = 2,
         seed: Optional[int] = None,
     ):
-        self._prev_hash = prev_hash
-        self._miner_id = miner_id
-        self._cur_index = cur_index
+        if len(parent_hash) != 32:
+            raise ValueError(
+                f"parent_hash must be 32 bytes, got {len(parent_hash)}"
+            )
+        if len(miner_bytes) != 32:
+            raise ValueError(
+                f"miner_bytes must be 32 bytes, got {len(miner_bytes)}"
+            )
+        self._prev_hash = parent_hash
+        self._miner_id = miner_bytes
+        self._cur_index = block_number
         self._nodes = nodes
         self._edges = edges
         self._buffer_size = buffer_size
@@ -307,18 +317,26 @@ class IsingFeeder:
 
     def update_block(
         self,
-        prev_hash: bytes,
-        miner_id: str,
-        cur_index: int,
+        parent_hash: bytes,
+        miner_bytes: bytes,
+        block_number: int,
     ) -> None:
         """Update generation args when block changes.
 
         Drains stale futures and queue, then refills
         with new block parameters.
         """
-        self._prev_hash = prev_hash
-        self._miner_id = miner_id
-        self._cur_index = cur_index
+        if len(parent_hash) != 32:
+            raise ValueError(
+                f"parent_hash must be 32 bytes, got {len(parent_hash)}"
+            )
+        if len(miner_bytes) != 32:
+            raise ValueError(
+                f"miner_bytes must be 32 bytes, got {len(miner_bytes)}"
+            )
+        self._prev_hash = parent_hash
+        self._miner_id = miner_bytes
+        self._cur_index = block_number
         for f in self._futures:
             f.cancel()
         self._futures.clear()

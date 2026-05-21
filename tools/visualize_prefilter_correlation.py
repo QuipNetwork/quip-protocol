@@ -30,9 +30,11 @@ from shared.nonce_prefilter import (
     IsingTopologyCache,
     greedy_descent_energy,
 )
+import hashlib
+
 from shared.quantum_proof_of_work import (
+    derive_nonce,
     generate_ising_model_from_nonce,
-    ising_nonce_from_block,
 )
 
 
@@ -60,7 +62,7 @@ def collect_data(
     cache = IsingTopologyCache(nodes, edges)
 
     prev_hash = random.randbytes(32)
-    miner_id = "viz-0"
+    miner_bytes = hashlib.blake2b(b"viz-0", digest_size=32).digest()
     cur_index = 1
 
     greedy_by_pass = {p: [] for p in range(1, max_passes + 1)}
@@ -75,9 +77,7 @@ def collect_data(
 
     for i in range(num_nonces):
         salt = random.randbytes(32)
-        nonce = ising_nonce_from_block(
-            prev_hash, miner_id, cur_index, salt,
-        )
+        nonce = derive_nonce(prev_hash, miner_bytes, cur_index, salt)
         h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
 
         # Greedy at each pass count

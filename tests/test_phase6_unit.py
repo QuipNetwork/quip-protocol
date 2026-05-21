@@ -91,7 +91,7 @@ def test_controller_core_attribute_defaults_none():
     to stay no-op in headless deployments."""
     c = SubstrateMinerController.__new__(SubstrateMinerController)
     c.miner_handles = []
-    c._dispatched = {}
+    c._dispatch_contexts = {}
     c.core = None  # default
     assert c.core is None
 
