@@ -8,6 +8,22 @@ import pytest
 from click.testing import CliRunner
 
 import quip_cli
+from shared.quantum_proof_of_work import (
+    DEFAULT_ALLOWED_H,
+    DEFAULT_ALLOWED_J,
+    DEFAULT_ALLOWED_SPIN,
+)
+from shared.topology_hash import topology_hash
+
+
+def _hash(topology) -> bytes:
+    return topology_hash(
+        topology.nodes,
+        topology.edges,
+        DEFAULT_ALLOWED_H,
+        DEFAULT_ALLOWED_J,
+        DEFAULT_ALLOWED_SPIN,
+    )
 
 
 # ── _parse_topology tests ──────────────────────────────────────────────────
@@ -27,9 +43,7 @@ def test_parse_topology_default_is_advantage2_hardware():
     topology = quip_cli._parse_topology("advantage2_system1")
     assert topology.num_nodes == DEFAULT_TOPOLOGY.num_nodes
     assert topology.num_edges == DEFAULT_TOPOLOGY.num_edges
-    assert quip_cli._topology_hash(topology) == quip_cli._topology_hash(
-        DEFAULT_TOPOLOGY
-    )
+    assert _hash(topology) == _hash(DEFAULT_TOPOLOGY)
 
 
 def test_parse_topology_unknown_bare_name():
@@ -80,13 +94,13 @@ def test_inject_topology_gpu_config_unchanged(capsys):
     assert "warning" in captured.err.lower()
 
 
-# ── _topology_hash tests ───────────────────────────────────────────────────
+# ── topology_hash tests ────────────────────────────────────────────────────
 
 
 def test_topology_hash_is_deterministic():
     topology = quip_cli._parse_topology("zephyr:2,2")
-    h1 = quip_cli._topology_hash(topology)
-    h2 = quip_cli._topology_hash(topology)
+    h1 = _hash(topology)
+    h2 = _hash(topology)
     assert h1 == h2
     assert len(h1) == 32
 
@@ -94,7 +108,7 @@ def test_topology_hash_is_deterministic():
 def test_topology_hash_differs_across_specs():
     t1 = quip_cli._parse_topology("zephyr:2,2")
     t2 = quip_cli._parse_topology("zephyr:3,2")
-    assert quip_cli._topology_hash(t1) != quip_cli._topology_hash(t2)
+    assert _hash(t1) != _hash(t2)
 
 
 def test_topology_hash_differs_zephyr_vs_hardware():
@@ -102,9 +116,7 @@ def test_topology_hash_differs_zephyr_vs_hardware():
     bytes — otherwise the chain's mismatch guard couldn't tell them apart."""
     zephyr_topo = quip_cli._parse_topology("zephyr:9,2")
     hw_topo = quip_cli._parse_topology("advantage2_system1")
-    assert quip_cli._topology_hash(zephyr_topo) != quip_cli._topology_hash(
-        hw_topo
-    )
+    assert _hash(zephyr_topo) != _hash(hw_topo)
 
 
 # ── quip-miner subcommand tests ────────────────────────────────────────────

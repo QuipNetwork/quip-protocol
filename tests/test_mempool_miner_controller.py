@@ -1,7 +1,6 @@
 """Unit + integration tests for `shared.mempool_miner_controller`.
 
 Unit tests cover:
-  - `topology_hash_from_nodes_edges` parity with `quip_cli._topology_hash`
   - `_should_accept_job` mode + topology filtering
   - submission/claim error classifiers
 
@@ -29,8 +28,20 @@ from shared.mempool_miner_controller import (
     SOLUTION_STALE_ERRORS,
     _classify_claim,
     _classify_solution,
-    topology_hash_from_nodes_edges,
 )
+from shared.quantum_proof_of_work import (
+    DEFAULT_ALLOWED_H,
+    DEFAULT_ALLOWED_J,
+    DEFAULT_ALLOWED_SPIN,
+)
+from shared.topology_hash import topology_hash
+
+
+def _topology_hash(nodes, edges) -> bytes:
+    """Helper: canonical topology hash with the default allowed-value specs."""
+    return topology_hash(
+        nodes, edges, DEFAULT_ALLOWED_H, DEFAULT_ALLOWED_J, DEFAULT_ALLOWED_SPIN
+    )
 from shared.mempool_types import (
     IsingParams,
     JobMode,
@@ -60,37 +71,6 @@ def _chain_reachable(url: str) -> bool:
 # ----------------------------------------------------------------------
 # Topology hash parity with the CLI helper
 # ----------------------------------------------------------------------
-
-
-def test_topology_hash_matches_quip_cli_helper():
-    """`topology_hash_from_nodes_edges` and `quip_cli._topology_hash`
-    must agree byte-for-byte over the same graph — they both feed into
-    job-eligibility filtering and chain-side `register_topology`."""
-    import dwave_networkx as dnx
-    from quip_cli import _topology_hash
-
-    g = dnx.zephyr_graph(2, 2)
-    via_cli = _topology_hash(g)
-    via_controller = topology_hash_from_nodes_edges(
-        tuple(int(n) for n in g.nodes),
-        tuple((int(u), int(v)) for u, v in g.edges),
-    )
-    assert via_cli == via_controller
-
-
-def test_topology_hash_order_independent():
-    """The hash sorts nodes + canonicalizes edges before hashing, so the
-    input iteration order doesn't matter — important because mempool jobs
-    may carry edges in any order."""
-    h1 = topology_hash_from_nodes_edges(
-        nodes=(0, 1, 2),
-        edges=((0, 1), (1, 2)),
-    )
-    h2 = topology_hash_from_nodes_edges(
-        nodes=(2, 1, 0),
-        edges=((2, 1), (1, 0)),
-    )
-    assert h1 == h2
 
 
 # ----------------------------------------------------------------------
@@ -130,13 +110,16 @@ def test_classify_claim_stale_names(name):
 # ----------------------------------------------------------------------
 
 
-def _bare_controller(account: bytes, solver_type: MinerType, topology_hash: bytes):
+def _bare_controller(account: bytes, solver_type: MinerType, sampler_hash: bytes):
     """Construct a MempoolMinerController bypassing __init__ for filter-only tests."""
     c = MempoolMinerController.__new__(MempoolMinerController)
     c.signer = MagicMock()
     c.signer.account_id_bytes.return_value = account
     c.solver_type = solver_type
-    c.sampler_topology_hash = topology_hash
+    c.sampler_topology_hash = sampler_hash
+    c.allowed_h_values = DEFAULT_ALLOWED_H
+    c.allowed_j_values = DEFAULT_ALLOWED_J
+    c.allowed_spin_values = DEFAULT_ALLOWED_SPIN
     return c
 
 
@@ -169,8 +152,8 @@ def _open_order_with_topology(
 def test_should_accept_topology_mismatch_rejected():
     nodes = (0, 1, 2)
     edges = ((0, 1), (1, 2))
-    sampler_hash = topology_hash_from_nodes_edges(nodes, edges)
-    other_hash = topology_hash_from_nodes_edges((0, 1, 2, 3), ((0, 1),))
+    sampler_hash = _topology_hash(nodes, edges)
+    other_hash = _topology_hash((0, 1, 2, 3), ((0, 1),))
     c = _bare_controller(b"\xAA" * 32, MinerType.CPU, sampler_hash)
     # Job is over a different topology — must be rejected.
     order = _open_order_with_topology(((0, 1, 2, 3), ((0, 1),)), JobMode.open())
@@ -181,7 +164,7 @@ def test_should_accept_topology_mismatch_rejected():
 def test_should_accept_open_mode_passes():
     nodes = (0, 1, 2)
     edges = ((0, 1), (1, 2))
-    sampler_hash = topology_hash_from_nodes_edges(nodes, edges)
+    sampler_hash = _topology_hash(nodes, edges)
     c = _bare_controller(b"\xAA" * 32, MinerType.CPU, sampler_hash)
     order = _open_order_with_topology((nodes, edges), JobMode.open())
     assert c._should_accept_job(order) is True
@@ -190,7 +173,7 @@ def test_should_accept_open_mode_passes():
 def test_should_accept_bid_with_matching_account():
     nodes = (0, 1, 2)
     edges = ((0, 1), (1, 2))
-    sampler_hash = topology_hash_from_nodes_edges(nodes, edges)
+    sampler_hash = _topology_hash(nodes, edges)
     account = b"\xAA" * 32
     c = _bare_controller(account, MinerType.CPU, sampler_hash)
     order = _open_order_with_topology(
@@ -203,7 +186,7 @@ def test_should_accept_bid_with_matching_account():
 def test_should_accept_bid_with_matching_miner_type():
     nodes = (0, 1, 2)
     edges = ((0, 1), (1, 2))
-    sampler_hash = topology_hash_from_nodes_edges(nodes, edges)
+    sampler_hash = _topology_hash(nodes, edges)
     c = _bare_controller(b"\xAA" * 32, MinerType.GPU, sampler_hash)
     order = _open_order_with_topology(
         (nodes, edges),
@@ -215,7 +198,7 @@ def test_should_accept_bid_with_matching_miner_type():
 def test_should_reject_bid_with_no_matching_criteria():
     nodes = (0, 1, 2)
     edges = ((0, 1), (1, 2))
-    sampler_hash = topology_hash_from_nodes_edges(nodes, edges)
+    sampler_hash = _topology_hash(nodes, edges)
     c = _bare_controller(b"\xAA" * 32, MinerType.CPU, sampler_hash)
     order = _open_order_with_topology(
         (nodes, edges),
@@ -250,10 +233,7 @@ async def test_controller_submits_solution_end_to_end(tmp_path):
 
     from CPU.sa_miner import SimulatedAnnealingMiner  # noqa: F401 — ensures sampler module loads
     from shared.keystore_hybrid import generate
-    from shared.mempool_miner_controller import (
-        MempoolMinerController,
-        topology_hash_from_nodes_edges,
-    )
+    from shared.mempool_miner_controller import MempoolMinerController
     from shared.mempool_types import MinerType
     from shared.miner_bootstrap import _resolve_dev_signer
     from shared.miner_core import MinerCore
@@ -271,7 +251,7 @@ async def test_controller_submits_solution_end_to_end(tmp_path):
     topology = zephyr(2, 2)
     sampler_nodes = tuple(int(n) for n in topology.nodes)
     sampler_edges = tuple((int(u), int(v)) for u, v in topology.edges)
-    sampler_topology_hash = topology_hash_from_nodes_edges(
+    sampler_topology_hash = _topology_hash(
         sampler_nodes, sampler_edges
     )
 
@@ -402,6 +382,9 @@ async def test_controller_submits_solution_end_to_end(tmp_path):
         signer=keystore.signer,
         miner_handles=[handle],
         sampler_topology_hash=sampler_topology_hash,
+        allowed_h_values=DEFAULT_ALLOWED_H,
+        allowed_j_values=DEFAULT_ALLOWED_J,
+        allowed_spin_values=DEFAULT_ALLOWED_SPIN,
         solver_type=solver_type,
     )
     # Resolve rpc once so the test fixture's later setup

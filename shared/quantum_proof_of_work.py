@@ -46,6 +46,7 @@ logger = get_logger('quantum_proof_of_work')
 # to read as float.
 DEFAULT_ALLOWED_H: AllowedValueSpec = AllowedValueSet((-MILLI_SCALE, 0, MILLI_SCALE))
 DEFAULT_ALLOWED_J: AllowedValueSpec = AllowedValueSet((-MILLI_SCALE, MILLI_SCALE))
+DEFAULT_ALLOWED_SPIN: AllowedValueSpec = AllowedValueSet((-MILLI_SCALE, MILLI_SCALE))
 
 
 def _to_nonce_bytes(nonce: Union[int, bytes]) -> bytes:

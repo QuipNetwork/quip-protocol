@@ -44,7 +44,6 @@ Eligibility filter (`_should_accept_job`):
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import queue
 from collections import deque
 from dataclasses import dataclass
@@ -52,6 +51,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from websocket import WebSocketException
 
+from shared.allowed_value_spec import AllowedValueSpec
 from shared.logging_config import get_logger
 from shared.mempool_types import (
     JobOrder,
@@ -65,6 +65,7 @@ from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from shared.signer import Signer
 from shared.substrate_client import NoValidatorReachable, SubstrateClient
+from shared.topology_hash import topology_hash
 from shared.validator_pool import ValidatorPool
 
 
@@ -121,38 +122,6 @@ class _MempoolResultEnvelope:
     handle_id: str
 
 
-def topology_hash_from_nodes_edges(
-    nodes: Tuple[int, ...], edges: Tuple[Tuple[int, int], ...]
-) -> bytes:
-    """Compute the chain's blake2_256 topology hash for a `(nodes, edges)` pair.
-
-    Mirrors `pallets/quantum-pow/src/topology.rs::hash_topology` AND
-    `quip_cli._topology_hash`; kept here so the mempool controller
-    doesn't depend on the CLI module.
-    """
-    sorted_nodes = sorted(int(n) for n in nodes)
-    sorted_edges = sorted(
-        (min(int(u), int(v)), max(int(u), int(v))) for u, v in edges
-    )
-
-    def compact_len(n: int) -> bytes:
-        if n < 0x40:
-            return bytes([n << 2])
-        if n < 0x4000:
-            return ((n << 2) | 0b01).to_bytes(2, "little")
-        if n < 0x4000_0000:
-            return ((n << 2) | 0b10).to_bytes(4, "little")
-        raise ValueError(f"compact len {n} out of u32 range")
-
-    buf = compact_len(len(sorted_nodes))
-    for n in sorted_nodes:
-        buf += n.to_bytes(4, "little")
-    buf += compact_len(len(sorted_edges))
-    for u, v in sorted_edges:
-        buf += u.to_bytes(4, "little") + v.to_bytes(4, "little")
-    return hashlib.blake2b(buf, digest_size=32).digest()
-
-
 class MempoolMinerController:
     """Drive a fleet of `MinerHandle`s against the QuantumComputeMempool pallet."""
 
@@ -162,6 +131,9 @@ class MempoolMinerController:
         signer: Signer,
         miner_handles: List[MinerHandle],
         sampler_topology_hash: bytes,
+        allowed_h_values: AllowedValueSpec,
+        allowed_j_values: AllowedValueSpec,
+        allowed_spin_values: AllowedValueSpec,
         solver_type: MinerType,
         on_solution_submitted: Optional[
             Callable[[int, MiningResult], Awaitable[None]]
@@ -191,6 +163,11 @@ class MempoolMinerController:
         self.signer = signer
         self.miner_handles = miner_handles
         self.sampler_topology_hash = sampler_topology_hash
+        # Stored so `_should_accept_job` can hash incoming jobs with the
+        # same canonical form the sampler hash was produced under.
+        self.allowed_h_values = allowed_h_values
+        self.allowed_j_values = allowed_j_values
+        self.allowed_spin_values = allowed_spin_values
         self.solver_type = solver_type
         self.on_solution_submitted = on_solution_submitted
         self.on_reward_claimed = on_reward_claimed
@@ -481,8 +458,12 @@ class MempoolMinerController:
         sampler can't actually solve.
         """
         # Topology match — sampler is bound to one specific graph.
-        job_topology = topology_hash_from_nodes_edges(
-            order.ising_params.nodes, order.ising_params.edges
+        job_topology = topology_hash(
+            order.ising_params.nodes,
+            order.ising_params.edges,
+            self.allowed_h_values,
+            self.allowed_j_values,
+            self.allowed_spin_values,
         )
         if job_topology != self.sampler_topology_hash:
             logger.debug(
@@ -834,5 +815,4 @@ __all__ = [
     "SOLUTION_FATAL_ERRORS",
     "SOLUTION_STALE_ERRORS",
     "CLAIM_STALE_ERRORS",
-    "topology_hash_from_nodes_edges",
 ]
