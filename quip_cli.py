@@ -14,7 +14,6 @@ SubstrateMinerController.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import signal
 import traceback
 from pathlib import Path
@@ -26,10 +25,8 @@ from dwave_topologies.topologies.json_loader import load_topology
 from dwave_topologies.topologies.zephyr import zephyr
 from shared.keystore_hybrid import generate, load
 from shared.logging_config import setup_logging
-from shared.mempool_miner_controller import (
-    MempoolMinerController,
-    topology_hash_from_nodes_edges,
-)
+from shared.mempool_miner_controller import MempoolMinerController
+from shared.topology_hash import topology_hash
 from shared.mempool_types import MinerType
 from shared.miner_bootstrap import (
     DEFAULT_MIN_BALANCE_PLANCKS,
@@ -637,38 +634,6 @@ def _inject_topology(miner_config: dict, kind: str, topology) -> dict:
     return out
 
 
-def _topology_hash(topology) -> bytes:
-    """Compute the chain's blake2_256 topology hash from any topology graph.
-
-    Works for any object exposing `.nodes` and `.edges` (Zephyr,
-    Advantage2 hardware, raw networkx graphs).
-
-    Matches `pallets/quantum-pow/src/topology.rs::hash_topology`:
-        blake2_256(SCALE((sorted nodes, sorted canonical edges)))
-    """
-    nodes = sorted(int(n) for n in topology.nodes)
-    edges = sorted(
-        (min(int(u), int(v)), max(int(u), int(v))) for u, v in topology.edges
-    )
-
-    def compact_len(n: int) -> bytes:
-        if n < 0x40:
-            return bytes([n << 2])
-        if n < 0x4000:
-            return ((n << 2) | 0b01).to_bytes(2, "little")
-        if n < 0x40000000:
-            return ((n << 2) | 0b10).to_bytes(4, "little")
-        raise ValueError(f"compact len {n} exceeds 30-bit range")
-
-    buf = compact_len(len(nodes))
-    for n in nodes:
-        buf += n.to_bytes(4, "little")
-    buf += compact_len(len(edges))
-    for u, v in edges:
-        buf += u.to_bytes(4, "little") + v.to_bytes(4, "little")
-    return hashlib.blake2b(buf, digest_size=32).digest()
-
-
 # Seconds to wait for a controller to drain after signalling shutdown.
 # Must exceed the longest controller poll interval (<=10s for head-subscription
 # timeout in SubstrateMinerController).
@@ -755,10 +720,11 @@ async def _run_concurrent_miner(
             min_balance=DEFAULT_MIN_BALANCE_PLANCKS,
         )
 
-        if pow_handles:
-            # PoW requires the sampler's topology to match the chain's
-            # registered DefaultTopology (the chain validates this in
-            # `submit_proof` via `InvalidTopology`).
+        # Both PoW and mempool need the chain's registered allowed-value
+        # specs to derive a topology hash that matches the chain's
+        # canonical `hash_topology`. Pull the snapshot once.
+        snapshot = None
+        if pow_handles or mempool_handles:
             try:
                 head = await client.get_head()
                 snapshot = await client.get_mining_snapshot(
@@ -767,17 +733,28 @@ async def _run_concurrent_miner(
                 )
             except Exception as exc:
                 click.echo(
-                    f"PoW mode: failed to query chain state: {exc}", err=True
+                    f"failed to query chain state: {exc}", err=True
                 )
                 return 3
             if snapshot is None:
                 click.echo(
-                    "PoW mode: chain has no registered topology; run "
+                    "chain has no registered topology; run "
                     "`quip-miner bootstrap --seed-chain` first",
                     err=True,
                 )
                 return 3
-            expected_hash = _topology_hash(topology)
+
+        if pow_handles:
+            # PoW requires the sampler's topology to match the chain's
+            # registered DefaultTopology (the chain validates this in
+            # `submit_proof` via `InvalidTopology`).
+            expected_hash = topology_hash(
+                topology.nodes,
+                topology.edges,
+                snapshot.allowed_h_values,
+                snapshot.allowed_j_values,
+                snapshot.allowed_spin_values,
+            )
             if snapshot.topology_hash != expected_hash:
                 click.echo(
                     f"PoW mode topology mismatch: --topology {topology_spec} "
@@ -800,10 +777,16 @@ async def _run_concurrent_miner(
             )
 
         if mempool_handles:
-            sampler_nodes = tuple(int(n) for n in topology.nodes)
-            sampler_edges = tuple((int(u), int(v)) for u, v in topology.edges)
-            mempool_topology_hash = topology_hash_from_nodes_edges(
-                sampler_nodes, sampler_edges
+            # Bind the mempool sampler hash to the same canonical form
+            # the chain uses (nodes, edges, allowed_h, allowed_j,
+            # allowed_spin). The allowed-value specs come from the chain
+            # snapshot so client and chain stay in lockstep.
+            mempool_topology_hash = topology_hash(
+                topology.nodes,
+                topology.edges,
+                snapshot.allowed_h_values,
+                snapshot.allowed_j_values,
+                snapshot.allowed_spin_values,
             )
             # No more secondary client construction: both controllers
             # draw from the same pool. Distinct subscribe slots
@@ -817,6 +800,9 @@ async def _run_concurrent_miner(
                 signer=keystore.signer,
                 miner_handles=mempool_handles,
                 sampler_topology_hash=mempool_topology_hash,
+                allowed_h_values=snapshot.allowed_h_values,
+                allowed_j_values=snapshot.allowed_j_values,
+                allowed_spin_values=snapshot.allowed_spin_values,
                 solver_type=MinerType.from_kind(miner_kind),
                 core=core,
             )
