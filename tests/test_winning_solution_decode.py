@@ -41,7 +41,7 @@ def _build_winning_solution_hex(
     reward: int,
     submitted_at: int,
     difficulty: SubstrateDifficulty,
-    last_winning_hash: bytes,
+    last_proof_block_hash: bytes,
     nonce: bytes,
     is_some: bool = True,
 ) -> str:
@@ -54,7 +54,7 @@ def _build_winning_solution_hex(
     parts.append(reward.to_bytes(16, "little"))
     parts.append(submitted_at.to_bytes(4, "little"))
     parts.append(_encode_difficulty(difficulty))
-    parts.append(last_winning_hash)
+    parts.append(last_proof_block_hash)
     # U256 on the wire is little-endian. The Python side stores nonces in
     # BLAKE3-digest order, so we encode the reverse here.
     parts.append(bytes(reversed(nonce)))
@@ -69,7 +69,7 @@ def test_decode_winning_solution_round_trip():
     miner = bytes.fromhex("aa" * 32)
     salt = bytes.fromhex("bb" * 32)
     nonce = bytes.fromhex("cc" * 32)
-    last_winning_hash = bytes.fromhex("dd" * 32)
+    last_proof_block_hash = bytes.fromhex("dd" * 32)
     difficulty = SubstrateDifficulty(
         min_solutions=5,
         max_energy_milli=-4_100_000,
@@ -82,7 +82,7 @@ def test_decode_winning_solution_round_trip():
         reward=10_000_000_000_000_000_000,  # > u64 — exercises u128 decode
         submitted_at=42,
         difficulty=difficulty,
-        last_winning_hash=last_winning_hash,
+        last_proof_block_hash=last_proof_block_hash,
         nonce=nonce,
     )
 
@@ -96,7 +96,7 @@ def test_decode_winning_solution_round_trip():
             reward=10_000_000_000_000_000_000,
             submitted_at=42,
             difficulty=difficulty,
-            last_winning_hash=last_winning_hash,
+            last_proof_block_hash=last_proof_block_hash,
         ),
         nonce=nonce,
     )
@@ -113,7 +113,7 @@ def test_decode_winning_solution_trailing_bytes_rejected():
         reward=0,
         submitted_at=1,
         difficulty=SubstrateDifficulty(1, 0, 0),
-        last_winning_hash=b"\x03" * 32,
+        last_proof_block_hash=b"\x03" * 32,
         nonce=nonce,
     )
     with pytest.raises(ValueError, match="trailing bytes"):
@@ -132,10 +132,10 @@ def test_decode_winning_solution_short_read_surfaces_field_name():
         reward=0,
         submitted_at=1,
         difficulty=SubstrateDifficulty(1, 0, 0),
-        last_winning_hash=b"\x03" * 32,
+        last_proof_block_hash=b"\x03" * 32,
         nonce=b"\x02" * 32,
     )
-    # Chop the last 16 hex bytes (half the U256 nonce — last_winning_hash
+    # Chop the last 16 hex bytes (half the U256 nonce — last_proof_block_hash
     # is fully present, so the decoder fails at `nonce`).
     truncated = encoded[: -32]
     with pytest.raises(ValueError, match="nonce"):

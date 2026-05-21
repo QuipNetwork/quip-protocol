@@ -208,11 +208,11 @@ class DWaveMiner(BaseMiner):
             )
 
         # Create IsingFeeder (same pattern as GPU miners). `prev_block.hash`
-        # is the round seed (`last_winning_hash` — see
+        # is the last proof block hash (`last_proof_block_hash` — see
         # `_BridgePrevBlock.from_work_context` in base_miner.py).
         feeder_seed = kwargs.pop('feeder_seed', None)
         self._feeder = IsingFeeder(
-            last_winning_hash=prev_block.hash,
+            last_proof_block_hash=prev_block.hash,
             miner_bytes=node_info.miner_account_bytes,
             nodes=self.sampler.nodes,
             edges=self.sampler.edges,

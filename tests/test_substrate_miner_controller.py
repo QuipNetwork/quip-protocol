@@ -64,12 +64,12 @@ _TER_SPEC = AllowedValueSet((-1000, 0, 1000))
 
 
 def _context(
-    last_winning_hash: bytes,
+    last_proof_block_hash: bytes,
     *,
     topology_hash: bytes = b"\xcd" * 32,
 ) -> SubstrateMiningContext:
     return SubstrateMiningContext(
-        last_winning_hash=last_winning_hash,
+        last_proof_block_hash=last_proof_block_hash,
         topology_hash=topology_hash,
         nodes=[0, 1, 2, 3],
         edges=[(0, 1), (1, 2), (2, 3)],
@@ -127,6 +127,7 @@ def _bare_controller() -> SubstrateMinerController:
     from collections import OrderedDict
     c._closed_work_keys = OrderedDict()
     c._consecutive_none_snapshots = 0
+    c._highest_handled_block = 0
     c.topology_hash = None
     c.core = None  # Phase 6: optional MinerCore for telemetry
     return c
@@ -183,9 +184,9 @@ def test_classify_outcome_compares_equal_to_string_literal():
 # ----------------------------------------------------------------------
 
 
-async def test_handle_result_drops_stale_envelope_round_seed():
-    """A result whose context.last_winning_hash differs from
-    current_context.last_winning_hash should be dropped without calling
+async def test_handle_result_drops_stale_envelope_last_proof_block_hash():
+    """A result whose context.last_proof_block_hash differs from
+    current_context.last_proof_block_hash should be dropped without calling
     submit_proof — the round has rolled over and the proof is built
     against the wrong nonce."""
     controller = _bare_controller()
@@ -193,7 +194,7 @@ async def test_handle_result_drops_stale_envelope_round_seed():
 
     envelope = _ResultEnvelope(
         result=_mining_result(),
-        context=_context(b"\xbb" * 32),  # stale: different round seed
+        context=_context(b"\xbb" * 32),  # stale: different last proof block hash
         handle_id="test-0",
     )
     await controller._handle_result(envelope)
@@ -445,6 +446,195 @@ async def test_handle_head_resets_consecutive_none_on_success():
 
     await controller._handle_head(b"\xff" * 32, 100)
     assert controller._consecutive_none_snapshots == 0
+
+
+# ----------------------------------------------------------------------
+# Stale-head defense (Phase 2)
+# ----------------------------------------------------------------------
+
+
+async def test_handle_head_drops_lower_block_number():
+    """A head with block_number < _highest_handled_block must be dropped
+    before any mining_snapshot RPC fires. Catches the per-header backlog
+    bug where a slow RPC returned a stale historical head hash."""
+    controller = _bare_controller()
+    controller._highest_handled_block = 312
+    controller.client.get_mining_snapshot = AsyncMock(
+        side_effect=AssertionError(
+            "stale head should be dropped before snapshot RPC fires"
+        )
+    )
+
+    await controller._handle_head(b"\xaa" * 32, 260)
+
+    assert controller.stats.heads_dropped_stale_number == 1
+    controller.client.get_mining_snapshot.assert_not_called()
+
+
+async def test_handle_head_advances_highest_handled_block():
+    """Successful head handling bumps `_highest_handled_block` to the new
+    number so subsequent stale heads can be detected."""
+    controller = _bare_controller()
+    controller.client.get_mining_snapshot = AsyncMock(
+        return_value=_context(b"\x10" * 32)
+    )
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    controller.miner_handles = []
+
+    await controller._handle_head(b"\xff" * 32, 100)
+    assert controller._highest_handled_block == 100
+
+    # A second head at the same number is NOT stale (>=, not >), so it
+    # passes the guard. This preserves the existing "primed-head"
+    # behaviour at startup where the loop is seeded with the current
+    # best head before the subscription fires its first notification.
+    await controller._handle_head(b"\xff" * 32, 100)
+    assert controller.stats.heads_dropped_stale_number == 0
+
+
+async def test_handle_head_skipped_already_won_still_bumps_highest():
+    """The already-won short-circuit must still bump _highest_handled_block
+    so a later head with a number between the closed one and the next
+    canonical block doesn't slip past the stale guard."""
+    from shared.substrate_miner_controller import _work_key
+
+    controller = _bare_controller()
+    ctx = _context(b"\x10" * 32)
+    controller._closed_work_keys[_work_key(ctx)] = None
+    controller.client.get_mining_snapshot = AsyncMock(return_value=ctx)
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    controller.miner_handles = []
+
+    await controller._handle_head(b"\xff" * 32, 200)
+
+    assert controller.stats.heads_skipped_already_won == 1
+    assert controller._highest_handled_block == 200
+
+
+# ----------------------------------------------------------------------
+# Post-OK proof verification (Phase 3b)
+# ----------------------------------------------------------------------
+
+
+async def test_verify_proof_recorded_match_returns_true():
+    from shared.substrate_types import (
+        WinningSolution,
+        WinningSolutionWithNonce,
+    )
+    controller = _bare_controller()
+    pubkey = b"\x42" * 32
+    nonce = b"\x77" * 32
+    controller.signer.account_id_bytes = MagicMock(return_value=pubkey)
+    controller.client.query_last_proof_block_number = AsyncMock(return_value=12)
+    controller.client.query_winning_solution = AsyncMock(
+        return_value=WinningSolutionWithNonce(
+            solution=WinningSolution(
+                miner=pubkey,
+                salt=b"\x00" * 32,
+                energy_milli=-4_200_000,
+                reward=0,
+                submitted_at=12,
+                difficulty=SubstrateDifficulty(1, 0, 0),
+                last_proof_block_hash=b"\x10" * 32,
+            ),
+            nonce=nonce,
+        )
+    )
+
+    ctx = _context(b"\x10" * 32)
+    result = _mining_result()
+    object.__setattr__(result, "nonce", nonce)  # MiningResult is frozen=False; safe
+    envelope = _ResultEnvelope(result=result, context=ctx, handle_id="h1")
+
+    assert await controller._verify_proof_recorded(envelope) is True
+
+
+async def test_verify_proof_recorded_mismatch_returns_false():
+    from shared.substrate_types import (
+        WinningSolution,
+        WinningSolutionWithNonce,
+    )
+    controller = _bare_controller()
+    pubkey = b"\x42" * 32
+    controller.signer.account_id_bytes = MagicMock(return_value=pubkey)
+    controller.client.query_last_proof_block_number = AsyncMock(return_value=12)
+    controller.client.query_winning_solution = AsyncMock(
+        return_value=WinningSolutionWithNonce(
+            solution=WinningSolution(
+                miner=b"\x99" * 32,  # someone else won
+                salt=b"\x00" * 32,
+                energy_milli=-4_200_000,
+                reward=0,
+                submitted_at=12,
+                difficulty=SubstrateDifficulty(1, 0, 0),
+                last_proof_block_hash=b"\x10" * 32,
+            ),
+            nonce=b"\xaa" * 32,
+        )
+    )
+
+    envelope = _ResultEnvelope(
+        result=_mining_result(), context=_context(b"\x10" * 32), handle_id="h1"
+    )
+    assert await controller._verify_proof_recorded(envelope) is False
+    assert controller.stats.proofs_unverified == 0  # only bumped by caller
+
+
+async def test_main_loop_handles_result_before_head_when_both_ready():
+    """If `asyncio.wait` returns both `head_task` and `result_task` in
+    `done`, the loop must process the result first — `result_task.result()`
+    has already consumed an envelope from `_result_queue`. The pre-fix
+    code hit `if head_task in done: ... continue` and silently dropped
+    the result."""
+    controller = _bare_controller()
+    controller._result_queue = asyncio.Queue()
+    controller._head_signal = asyncio.Event()
+    controller._shutdown_event = asyncio.Event()
+    controller._latest_head = (b"\xff" * 32, 42)
+
+    envelope = _ResultEnvelope(
+        result=_mining_result(),
+        context=_context(b"\x10" * 32),
+        handle_id="h1",
+    )
+    await controller._result_queue.put(envelope)
+    controller._head_signal.set()
+
+    seen_envelopes: list[_ResultEnvelope] = []
+    seen_heads: list[tuple[bytes, int]] = []
+
+    async def fake_handle_result(env):
+        seen_envelopes.append(env)
+        # Trip shutdown so the main loop exits after this iteration.
+        controller._shutdown_event.set()
+
+    async def fake_handle_head(h, n):
+        seen_heads.append((h, n))
+
+    controller._handle_result = fake_handle_result  # type: ignore[assignment]
+    controller._handle_head = fake_handle_head  # type: ignore[assignment]
+
+    await controller._main_loop()
+
+    assert seen_envelopes == [envelope], "result was dropped silently"
+    # Head may or may not have run depending on whether shutdown was
+    # observed before the head branch — both behaviours are correct.
+    # The critical invariant is "result was not lost".
+
+
+async def test_verify_proof_recorded_rpc_failure_returns_none():
+    """RPC failure during verification returns None so the caller can
+    proceed with close-on-receipt fallback rather than retry-storming."""
+    controller = _bare_controller()
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    controller.client.query_last_proof_block_number = AsyncMock(
+        side_effect=RuntimeError("rpc dead")
+    )
+
+    envelope = _ResultEnvelope(
+        result=_mining_result(), context=_context(b"\x10" * 32), handle_id="h1"
+    )
+    assert await controller._verify_proof_recorded(envelope) is None
 
 
 # ----------------------------------------------------------------------
@@ -978,7 +1168,7 @@ async def test_handle_result_pairs_late_result_with_dispatch_context(monkeypatch
     # Look up by dispatch_id=1 (the cancelled one) — must yield old_ctx.
     looked_up = controller._dispatch_contexts[("slow-handle", 1)]
     assert looked_up is old_ctx
-    assert looked_up.last_winning_hash == b"\xaa" * 32
+    assert looked_up.last_proof_block_hash == b"\xaa" * 32
 
     # And the envelope built from that lookup is a stale result the
     # controller drops via the work-key check.

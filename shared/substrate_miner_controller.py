@@ -93,7 +93,7 @@ _DISPATCH_CONTEXT_RETENTION = 4
 
 
 # A "work key" uniquely identifies the puzzle a context is mining
-# against: same (last_winning_hash, topology_hash) means the pallet will
+# against: same (last_proof_block_hash, topology_hash) means the pallet will
 # derive the same nonce and therefore the same Ising problem. Used both
 # for stale-result detection AND for marking a work item closed/won
 # after an accepted submission. Unlike the previous (block_number,
@@ -104,7 +104,7 @@ WorkKey = Tuple[bytes, bytes]
 
 
 def _work_key(ctx: "SubstrateMiningContext") -> WorkKey:
-    return (ctx.last_winning_hash, ctx.topology_hash)
+    return (ctx.last_proof_block_hash, ctx.topology_hash)
 
 
 # Submission errors that mean "this proof raced a chain state change; drop
@@ -165,10 +165,20 @@ class ControllerStats:
     # changed) — this counts the storm-prevention path.
     duplicate_result_drops: int = 0
     # Heads observed where the controller skipped dispatch because the
-    # round_seed had already been won this round. Distinct from
+    # last_proof_block_hash had already been won this round. Distinct from
     # duplicate_result_drops (counted per *result*, after mining wasted
     # CPU/GPU time) — this counts the cheap pre-dispatch guard.
     heads_skipped_already_won: int = 0
+    # Heads dropped because their block_number was lower than the
+    # highest one already handled. Non-zero here means the subscription
+    # layer fed us stale historical heads — the symptom that surfaced
+    # the per-header-lookup bug in subscribe_new_heads.
+    heads_dropped_stale_number: int = 0
+    # Submissions that produced an OK receipt but whose post-submit
+    # winning_solution check did not match our miner+nonce. Non-zero
+    # here means we accepted a receipt that the runtime did not
+    # actually record (or recorded against a different submitter).
+    proofs_unverified: int = 0
 
 
 @dataclass
@@ -287,6 +297,13 @@ class SubstrateMinerController:
         # newest matters. maxsize=1 + replace-on-write does that.
         self._latest_head: Optional[tuple[bytes, int]] = None
         self._head_signal = asyncio.Event()
+        # Highest block_number successfully handled. Belt-and-suspenders
+        # against the stale-head backlog bug: even if a regression in
+        # SubstrateClient.subscribe_new_heads starts feeding us historical
+        # block hashes again, this guard short-circuits them before they
+        # can call mining_snapshot at a stale `at` and reopen the
+        # already-won round_seed loop.
+        self._highest_handled_block: int = 0
         self._result_queue: asyncio.Queue[_ResultEnvelope] = asyncio.Queue()
         # Per-handle done-sentinel queue. The worker emits
         # `{"op": "work_item_done"}` when its mining loop exits with no
@@ -413,6 +430,31 @@ class SubstrateMinerController:
             if shutdown_task in done:
                 return
 
+            # Process result first when both are ready: `result_task.result()`
+            # has already dequeued an envelope from `_result_queue` — if we
+            # skipped to the head branch and `continue`d, that envelope
+            # would be silently lost. Heads coalesce via `_latest_head`
+            # and are cheap to re-handle; results don't.
+            if result_task in done:
+                envelope = result_task.result()
+                try:
+                    await self._handle_result(envelope)
+                except (WebSocketException, ConnectionError) as exc:
+                    # Failover already rotated; the chain will surface
+                    # the result again as a stale-drop or accept on the
+                    # new validator. Don't crash the controller.
+                    self.stats.submission_errors += 1
+                    self.stats.last_submission_error = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    logger.warning(
+                        "submit/result handling hit a connection drop "
+                        "(%s: %s); failover swung the client, "
+                        "controller continues",
+                        type(exc).__name__,
+                        exc,
+                    )
+
             if head_task in done:
                 # Snapshot the latest head and clear the signal atomically
                 # so a head arriving mid-handle gets coalesced into the
@@ -436,32 +478,27 @@ class SubstrateMinerController:
                             type(exc).__name__,
                             exc,
                         )
-                continue
-
-            if result_task in done:
-                envelope = result_task.result()
-                try:
-                    await self._handle_result(envelope)
-                except (WebSocketException, ConnectionError) as exc:
-                    # Same shape as the head path: failover already
-                    # rotated; the chain will surface the result again as
-                    # a stale-drop or accept on the new validator. Don't
-                    # crash the controller.
-                    self.stats.submission_errors += 1
-                    self.stats.last_submission_error = (
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                    logger.warning(
-                        "submit/result handling hit a connection drop "
-                        "(%s: %s); failover swung the client, "
-                        "controller continues",
-                        type(exc).__name__,
-                        exc,
-                    )
-                continue
 
     async def _handle_head(self, head_hash: bytes, block_number: int) -> None:
         self.stats.heads_observed += 1
+
+        # Stale-block-number guard. A backlog in the subscription layer
+        # (or a fork that diverged from canonical before our latest
+        # handled block) could feed us an older head — mining_snapshot
+        # at that hash would correctly return a stale round_seed and the
+        # storm-prevention guard further down would idle us on a
+        # closed work_key. Catch it here instead and log loudly.
+        if block_number < self._highest_handled_block:
+            self.stats.heads_dropped_stale_number += 1
+            logger.warning(
+                "dropping stale head number=%d (highest_handled=%d) "
+                "head=0x%s...; subscription backlog or fork",
+                block_number,
+                self._highest_handled_block,
+                head_hash.hex()[:16],
+            )
+            return
+
         # Cancel any in-flight mining on the prior snapshot, then wait in
         # parallel for each handle to ack the cancel. Without this
         # synchronization, cancel() → clear() → dispatch can wipe a cancel
@@ -541,29 +578,35 @@ class SubstrateMinerController:
         self._current_context = context
         self._current_work_key = _work_key(context)
 
-        # If we already won this round, don't redispatch. The round seed
+        # If we already won this round, don't redispatch. The last proof block hash
         # (LastProofBlock's hash) only updates after our winning proof is
         # included and the new round begins — until then, every fresh head
         # in this round carries the same work_key we just closed. Mining
         # the same problem again only produces results we'd drop as
         # duplicates and spams the logs. Sit idle here; the next head
-        # carrying a *new* round_seed will trip past this guard and we'll
+        # carrying a *new* last_proof_block_hash will trip past this guard and we'll
         # dispatch fresh work.
         if self._current_work_key in self._closed_work_keys:
             self.stats.heads_skipped_already_won += 1
             logger.info(
-                "head 0x%s... carries already-won round_seed=0x%s...; "
-                "waiting for next round (skipping dispatch)",
+                "head number=%d 0x%s... carries already-won "
+                "last_proof_block_hash=0x%s...; waiting for next round "
+                "(skipping dispatch)",
+                block_number,
                 head_hash.hex()[:16],
-                context.last_winning_hash.hex()[:16],
+                context.last_proof_block_hash.hex()[:16],
             )
+            # Still a successful head observation — bump so a backlog of
+            # older heads doesn't slip past the stale-number guard.
+            self._highest_handled_block = block_number
             return
 
         logger.info(
-            "new head: head=0x%s... round_seed=0x%s... topology=0x%s... "
-            "nodes=%d edges=%d",
+            "new head: number=%d head=0x%s... last_proof_block_hash=0x%s... "
+            "topology=0x%s... nodes=%d edges=%d",
+            block_number,
             head_hash.hex()[:16],
-            context.last_winning_hash.hex()[:16],
+            context.last_proof_block_hash.hex()[:16],
             context.topology_hash.hex()[:16],
             len(context.nodes),
             len(context.edges),
@@ -582,6 +625,10 @@ class SubstrateMinerController:
         if self.core is not None:
             # One attempt per head, regardless of how many handles fanned out.
             self.core.record_dispatch()
+        # Bump after the full body completes so an early-return path
+        # (None snapshot, topology mismatch, etc.) doesn't lock out
+        # retries at the same block number.
+        self._highest_handled_block = block_number
 
     async def _handle_result(self, envelope: _ResultEnvelope) -> None:
         self.stats.results_received += 1
@@ -598,9 +645,9 @@ class SubstrateMinerController:
             self.stats.duplicate_result_drops += 1
             logger.info(
                 "dropping duplicate result from %s: work_key already won "
-                "(round_seed=0x%s...)",
+                "(last_proof_block_hash=0x%s...)",
                 envelope.handle_id,
-                envelope.context.last_winning_hash.hex()[:16],
+                envelope.context.last_proof_block_hash.hex()[:16],
             )
             return
 
@@ -620,10 +667,10 @@ class SubstrateMinerController:
                 else "<none>"
             )
             logger.info(
-                "dropping stale result from %s: round_seed=0x%s... "
+                "dropping stale result from %s: last_proof_block_hash=0x%s... "
                 "(current=%s)",
                 envelope.handle_id,
-                envelope.context.last_winning_hash.hex()[:16],
+                envelope.context.last_proof_block_hash.hex()[:16],
                 current_seed_hex,
             )
             return
@@ -653,6 +700,32 @@ class SubstrateMinerController:
 
         outcome = classify_submission(receipt)
         if outcome is SubmissionOutcome.OK:
+            # Verify the runtime actually recorded *our* proof before
+            # closing the work key. Without this, a receipt that looked
+            # OK (made it into a block, no obvious ExtrinsicFailed) but
+            # whose proof the runtime silently rejected leaves us idling
+            # on `_closed_work_keys` forever while the chain keeps
+            # advancing the round on someone else's proof. The check
+            # reads `LastProofBlock` and `winning_solution(N)` and
+            # matches miner+nonce against the receipt.
+            #
+            # Best-effort: RPC errors during verification only WARN —
+            # failing closed here would cause the same submission storm
+            # we just stopped, since the next head would re-dispatch
+            # this exact context. Persistent failures stay visible via
+            # stats.proofs_unverified.
+            verified = await self._verify_proof_recorded(envelope)
+            if verified is False:
+                self.stats.proofs_unverified += 1
+                logger.warning(
+                    "submit_proof receipt OK but verification failed for "
+                    "%s (extrinsic=%s block=%s); NOT closing work key — "
+                    "the round will be retried on the next head",
+                    envelope.handle_id,
+                    receipt.extrinsic_hash,
+                    receipt.block_hash,
+                )
+                return
             self.stats.proofs_submitted += 1
             # Mark this work key as won and cancel sibling handles
             # immediately so they don't keep mining (and then submitting
@@ -756,6 +829,68 @@ class SubstrateMinerController:
             # impossible (we haven't issued one yet on this handle).
             if got is None or got == dispatch_id:
                 return
+
+    async def _verify_proof_recorded(self, envelope: _ResultEnvelope) -> Optional[bool]:
+        """Confirm the runtime recorded this miner's proof on chain.
+
+        Returns:
+          - ``True`` if ``QuantumPow.LastProofBlock`` resolves to a
+            ``winning_solution`` whose ``miner`` and ``nonce`` match the
+            envelope's submission.
+          - ``False`` if a winning_solution was returned but does NOT
+            match us (someone else won this round, or the chain rolled
+            back our submission silently).
+          - ``None`` if the verification RPC itself failed — caller
+            should treat as inconclusive and proceed with closing the
+            work key (the alternative is a submission-storm loop, which
+            is worse than a single false-positive close).
+        """
+        try:
+            last_block = await self.client.query_last_proof_block_number()
+            if last_block is None:
+                logger.warning(
+                    "post-OK verify: LastProofBlock is unset — chain may "
+                    "not have committed our proof yet (will trust receipt)"
+                )
+                return None
+            winning = await self.client.query_winning_solution(last_block)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "post-OK verify RPC failed (%s: %s); proceeding with "
+                "close-on-receipt fallback",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        if winning is None:
+            logger.warning(
+                "post-OK verify: winning_solution(%d) returned None; "
+                "chain reported LastProofBlock but no winning solution",
+                last_block,
+            )
+            return False
+        # `winning.solution.miner` is the chain's AccountId32 of the
+        # submitter — that's the raw 32-byte pubkey, NOT the
+        # blake2_256-hashed canonical_miner we put into the snapshot
+        # context for derive_nonce. Compare against the signer's
+        # account_id_bytes directly.
+        expected_miner = self.signer.account_id_bytes()
+        expected_nonce = envelope.result.nonce
+        actual_miner = bytes(winning.solution.miner)
+        actual_nonce = bytes(winning.nonce)
+        if actual_miner == expected_miner and actual_nonce == expected_nonce:
+            return True
+        logger.warning(
+            "post-OK verify mismatch at block %d: "
+            "expected miner=0x%s... nonce=0x%s..., "
+            "actual miner=0x%s... nonce=0x%s...",
+            last_block,
+            expected_miner.hex()[:16],
+            expected_nonce.hex()[:16],
+            actual_miner.hex()[:16],
+            actual_nonce.hex()[:16],
+        )
+        return False
 
     def _mark_work_key_closed(self, key: WorkKey) -> None:
         """Record a work key as won and evict the oldest if over cap."""

@@ -74,7 +74,7 @@ def _to_nonce_bytes(nonce: Union[int, bytes]) -> bytes:
 
 
 def derive_nonce(
-    last_winning_hash: bytes,
+    last_proof_block_hash: bytes,
     miner: bytes,
     salt: bytes,
 ) -> bytes:
@@ -84,7 +84,7 @@ def derive_nonce(
     Inputs are three fixed-size 32-byte buffers so the PoW search space is
     statically known and identical across every call:
 
-    - ``last_winning_hash`` — ``block_hash(LastProofBlock)``, the header
+    - ``last_proof_block_hash`` — ``block_hash(LastProofBlock)``, the header
       hash of the most recent winning block. Stable across the entire
       round (only changes on the next win), so miner submissions don't
       race the txpool / executing-block-number.
@@ -94,16 +94,16 @@ def derive_nonce(
 
     Returns the full 256-bit BLAKE3 digest as raw bytes. No truncation.
     """
-    if len(last_winning_hash) != 32:
+    if len(last_proof_block_hash) != 32:
         raise ValueError(
-            f"last_winning_hash must be 32 bytes, got {len(last_winning_hash)}"
+            f"last_proof_block_hash must be 32 bytes, got {len(last_proof_block_hash)}"
         )
     if len(miner) != 32:
         raise ValueError(f"miner must be 32 bytes, got {len(miner)}")
     if len(salt) != 32:
         raise ValueError(f"salt must be 32 bytes, got {len(salt)}")
     hasher = blake3()
-    hasher.update(last_winning_hash)
+    hasher.update(last_proof_block_hash)
     hasher.update(miner)
     hasher.update(salt)
     return hasher.digest()

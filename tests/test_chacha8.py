@@ -157,7 +157,7 @@ class TestDeriveNonce:
         assert base != derive_nonce(b"\x00" * 32, b"\x00" * 32, b"\xff" * 32)
 
     def test_rejects_short_inputs(self):
-        with pytest.raises(ValueError, match="last_winning_hash"):
+        with pytest.raises(ValueError, match="last_proof_block_hash"):
             derive_nonce(b"\x00" * 16, b"\x00" * 32, b"\x00" * 32)
         with pytest.raises(ValueError, match="miner"):
             derive_nonce(b"\x00" * 32, b"m", b"\x00" * 32)

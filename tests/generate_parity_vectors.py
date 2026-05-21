@@ -10,7 +10,7 @@ Schema for the two PoW sections:
     derive_nonce_cases: [
         {
           "name": str,
-          "last_winning_hash_hex": 32-byte hex,
+          "last_proof_block_hash_hex": 32-byte hex,
           "miner_hex":             32-byte hex,
           "salt_hex":              32-byte hex,
           "expected_nonce_hex":    32-byte hex
@@ -65,7 +65,7 @@ def _spec_to_json(spec) -> Dict[str, Any]:
 
 
 def _build_derive_nonce_cases() -> List[Dict[str, Any]]:
-    """Hand-picked deterministic vectors covering last_winning_hash/miner/salt."""
+    """Hand-picked deterministic vectors covering last_proof_block_hash/miner/salt."""
     base_seed = bytes([0x01] * 32)
     alt_seed = bytes([0x42] * 32)
     alice = bytes([0xA1] * 32)
@@ -82,12 +82,12 @@ def _build_derive_nonce_cases() -> List[Dict[str, Any]]:
         ("alice_max", b"\xff" * 32, alice, b"\xff" * 32),
     ]
     cases: List[Dict[str, Any]] = []
-    for name, last_winning_hash, miner, salt in inputs:
-        nonce = derive_nonce(last_winning_hash, miner, salt)
+    for name, last_proof_block_hash, miner, salt in inputs:
+        nonce = derive_nonce(last_proof_block_hash, miner, salt)
         cases.append(
             {
                 "name": name,
-                "last_winning_hash_hex": last_winning_hash.hex(),
+                "last_proof_block_hash_hex": last_proof_block_hash.hex(),
                 "miner_hex": miner.hex(),
                 "salt_hex": salt.hex(),
                 "expected_nonce_hex": nonce.hex(),

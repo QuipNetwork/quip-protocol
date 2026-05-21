@@ -310,7 +310,7 @@ class SubstrateClient:
         missing signer fails fast rather than silently mining under a
         fabricated zero account.
 
-        The snapshot carries a `last_winning_hash` (the round seed —
+        The snapshot carries a `last_proof_block_hash` (the last proof block hash —
         `block_hash(LastProofBlock)`) which is the only "time" input the
         miner needs. It's stable across an entire round, so no `at`-vs-head
         offset is required.
@@ -351,7 +351,7 @@ class SubstrateClient:
         if decoded is None:
             return None
         return SubstrateMiningContext(
-            last_winning_hash=decoded["last_winning_hash"],
+            last_proof_block_hash=decoded["last_proof_block_hash"],
             topology_hash=decoded["topology_hash"],
             nodes=decoded["nodes"],
             edges=decoded["edges"],
@@ -480,6 +480,21 @@ class SubstrateClient:
         if encoded is None:
             return None
         return _decode_winning_solution_with_nonce(encoded)
+
+    async def query_last_proof_block_number(self) -> Optional[int]:
+        """Return ``QuantumPow.LastProofBlock`` or ``None`` if unset.
+
+        Used after a successful submit_proof to verify the runtime actually
+        recorded *our* proof — paired with ``query_winning_solution`` to
+        compare miner/nonce against the receipt. Storage value is a u32
+        block number.
+        """
+        result = await self._run(
+            lambda: self._iface.query("QuantumPow", "LastProofBlock")
+        )
+        if result is None or not _result_was_found(result) or result.value is None:
+            return None
+        return int(result.value)
 
     async def query_balance(self, account: bytes) -> int:
         if len(account) != 32:
@@ -804,84 +819,106 @@ class SubstrateClient:
         finalized_only: bool = False,
     ) -> None:
         """Block until cancelled, invoking `callback(block_hash, block_number)`
-        on every new head.
+        from a single pump task tied to the *current* best head.
 
-        ``substrate-interface`` invokes the subscription callback on its
+        Pump model (vs. the old per-header dispatch): the websocket reader
+        thread only signals — it never schedules per-number lookups. A
+        single asyncio task waits on the signal, queries ``get_chain_head``
+        (or ``get_chain_finalised_head``) once per wake, fetches the block
+        number, and invokes the callback. If more headers arrived during
+        the work, the signal is set again and the next iteration starts
+        immediately. That coalesces a burst of N headers into one (or two)
+        callback invocations driven by *current* chain state.
+
+        Why this matters: the old model spawned one
+        ``run_coroutine_threadsafe(_handle_head(number))`` per header and
+        each coroutine did its own ``get_block_hash(block_id=number)``
+        through the serialised ``_run`` lock. Under RPC load, those
+        per-number lookups completed out of order and overwrote the
+        controller's "latest head" slot with *historical* hashes —
+        ``mining_snapshot(at=stale_hash)`` then correctly returns a stale
+        ``last_proof_block_hash`` and the miner spins on an already-won
+        round. See incident 2026-05-21 in the v0.2 branch history.
+
+        ``substrate-interface`` invokes the subscribe dispatch on its
         websocket reader thread. We do **not** make synchronous RPC calls
-        from that thread (that would deadlock the reader waiting on its own
-        response). Instead, the block-hash lookup and the user coroutine are
-        both scheduled on the asyncio loop via ``run_coroutine_threadsafe``,
-        where ``_run`` puts the blocking RPC on the executor.
+        from that thread (that would deadlock the reader waiting on its
+        own response); the reader's only job here is
+        ``loop.call_soon_threadsafe(pump_event.set)``.
 
         The subscribe call itself bypasses ``_call_lock``: substrate-interface
         keeps the websocket in receive mode for the subscription's lifetime,
         which would otherwise hold the lock forever and deadlock every other
-        ``_run`` caller — including ``_handle_head``'s ``get_block_hash``
-        below. Callers that need to share a client across submissions and
-        subscriptions should pass a dedicated ``subscription_client`` to the
-        controller (the controller already enforces this).
+        ``_run`` caller. Callers that need to share a client across submissions
+        and subscriptions should pass a dedicated ``subscription_client`` to
+        the controller (the controller already enforces this).
         """
         loop = asyncio.get_running_loop()
+        pump_event = asyncio.Event()
 
-        async def _handle_head(number: int) -> None:
-            # The dispatch callback can fire after `close()` has cleared
-            # `self._iface` — the reader thread keeps draining for a beat
-            # after the websocket is told to close. Same condition holds
-            # briefly during `reconnect()` between `_close_iface` and the
-            # new `_connect_from_index` assignment. Log at debug so the
-            # in-flight notification isn't silently invisible during a
-            # failover, then bail rather than raising AttributeError into
-            # the future's done-callback.
-            iface = self._iface
-            if iface is None:
-                logger.debug(
-                    "subscribe_new_heads: dropping head number=%s — "
-                    "iface is None (close() or reconnect() in flight)",
-                    number,
-                )
-                return
-            block_hash_hex = await self._run(
-                lambda: iface.get_block_hash(block_id=number)
-            )
-            block_hash_bytes = bytes.fromhex(_strip_0x(block_hash_hex))
-            await callback(block_hash_bytes, number)
-
-        def _dispatch(obj: dict, update_nr: int, subscription_id: str):  # noqa: ARG001
-            # subscribe_block_headers delivers `{"header": {...}, "author": ...}`
-            # on the main path; some code paths surface the bare header
-            # directly. Accept both. Exceptions on the reader thread are
-            # otherwise silently swallowed.
+        def _dispatch(obj, update_nr: int, subscription_id: str):  # noqa: ARG001
+            # Reader-thread side: signal only. No RPC, no per-header
+            # bookkeeping. We don't even look at the header payload — the
+            # pump fetches the current best head on its own, so any header
+            # at all is enough to know "something changed".
             try:
-                if isinstance(obj, dict) and isinstance(obj.get("header"), dict):
-                    header = obj["header"]
-                elif isinstance(obj, dict):
-                    header = obj
-                else:
-                    logger.warning(
-                        "subscribe_new_heads: unexpected payload shape: %s",
-                        type(obj).__name__,
-                    )
-                    return
-                number = _coerce_block_number(header.get("number"))
-                future = asyncio.run_coroutine_threadsafe(
-                    _handle_head(number), loop
-                )
-                future.add_done_callback(_log_dispatch_exception)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "subscribe_new_heads dispatch failed at update_nr=%s: %s",
-                    update_nr, exc,
-                )
+                loop.call_soon_threadsafe(pump_event.set)
+            except RuntimeError:
+                # Loop is closed (controller is tearing down). Swallow —
+                # the pump task will be cancelled on the same path.
+                pass
 
-        # Bypass `_call_lock` for the long-lived subscribe — see docstring.
-        # `_handle_head` above goes through `_run` which acquires the lock
-        # normally, so the receive-side calls remain properly serialised.
-        await loop.run_in_executor(
-            None,
-            lambda: self._iface.subscribe_block_headers(
-                _dispatch, finalized_only=finalized_only
-            ),
-        )
+        async def _pump() -> None:
+            head_fn_name = (
+                "get_chain_finalised_head" if finalized_only else "get_chain_head"
+            )
+            while True:
+                await pump_event.wait()
+                pump_event.clear()
+
+                # If close() or reconnect() cleared `_iface` between the
+                # signal arriving and us waking up, swallow this wake.
+                # The next reconnect will install a new iface and the
+                # subscription will resume.
+                iface = self._iface
+                if iface is None:
+                    logger.debug(
+                        "subscribe_new_heads pump: iface is None — skipping"
+                    )
+                    continue
+
+                head_hex = await self._run(
+                    lambda: getattr(self._iface, head_fn_name)()
+                )
+                head_bytes = bytes.fromhex(_strip_0x(head_hex))
+                header = await self._run(
+                    lambda: self._iface.get_block_header(block_hash=head_hex)
+                )
+                number = _coerce_block_number(header["header"]["number"])
+                await callback(head_bytes, number)
+
+        # Prime the pump so the first head is delivered without waiting
+        # for the next chain notification. Important on startup against a
+        # quiet chain.
+        pump_event.set()
+        pump_task = asyncio.create_task(_pump(), name="subscribe-new-heads-pump")
+
+        try:
+            # Bypass `_call_lock` for the long-lived subscribe — see docstring.
+            await loop.run_in_executor(
+                None,
+                lambda: self._iface.subscribe_block_headers(
+                    _dispatch, finalized_only=finalized_only
+                ),
+            )
+        finally:
+            pump_task.cancel()
+            try:
+                await pump_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                logger.exception("subscribe_new_heads pump task crashed")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -974,6 +1011,51 @@ _HYBRID_TERMINAL_FAILURES: frozenset = frozenset(
 )
 
 
+def _canonical_hex(value: Any) -> Optional[str]:
+    """Lower-case hex (no 0x) for `bytes`/`bytearray`/`str`, or None."""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    if isinstance(value, str):
+        return _strip_0x(value).lower()
+    return None
+
+
+def _phase_extrinsic_idx(phase: Any) -> Optional[int]:
+    """Extract the extrinsic index from a SCALE-decoded event phase.
+
+    substrate-interface surfaces ``phase`` in several shapes depending on
+    decoder version / event source:
+
+    - ``{"ApplyExtrinsic": 1}`` — common
+    - ``{"ApplyExtrinsic": {"extrinsic_idx": 1}}`` — newer typed variant
+    - bare int / numeric str — some flattened decoders
+    """
+    if isinstance(phase, dict):
+        applied = phase.get("ApplyExtrinsic")
+        if applied is None:
+            return None
+        if isinstance(applied, dict):
+            # Use explicit None checks — `0` is a legal extrinsic_idx
+            # and `or` would fall through to the second lookup.
+            idx = applied.get("extrinsic_idx")
+            if idx is None:
+                idx = applied.get("index")
+            try:
+                return int(idx) if idx is not None else None
+            except (TypeError, ValueError):
+                return None
+        try:
+            return int(applied)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(phase, (int, str)):
+        try:
+            return int(phase)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _fetch_extrinsic_dispatch_error(
     iface: SubstrateInterface, *, block_hash: str, ext_hash: str
 ) -> Optional[str]:
@@ -984,49 +1066,67 @@ def _fetch_extrinsic_dispatch_error(
     index. The sr25519 path inspects this via substrate-interface's typed
     `ExtrinsicReceipt`; the hybrid path bypasses that, so we query the
     block's events directly and stringify any `ExtrinsicFailed` matching
-    our extrinsic. Returns None on dispatch success.
+    our extrinsic.
+
+    Returns:
+      - ``None`` on confirmed dispatch success (either ExtrinsicSuccess
+        seen, or no failure event found *and* the extrinsic was located).
+      - A non-empty string when dispatch failed OR when we could not
+        locate the extrinsic in the block at all. The "not found" path
+        used to silently return None, masking acceptance failures —
+        callers treat any truthy string as "do not mark this as won".
     """
     block = iface.get_block(block_hash=block_hash, include_author=False)
     if block is None:
-        return None
-    target_hash = _strip_0x(ext_hash).lower()
+        return f"unclassified: get_block returned None for {block_hash}"
+    target_hash = _canonical_hex(ext_hash)
+    if target_hash is None:
+        return f"unclassified: target extrinsic_hash has unsupported shape: {type(ext_hash).__name__}"
     extrinsics = block.get("extrinsics") or []
     ext_idx: Optional[int] = None
     for idx, ext in enumerate(extrinsics):
-        eh = getattr(ext, "extrinsic_hash", None) or (
-            ext.get("extrinsic_hash") if isinstance(ext, dict) else None
-        )
-        if eh and _strip_0x(str(eh)).lower() == target_hash:
+        eh = getattr(ext, "extrinsic_hash", None)
+        if eh is None and isinstance(ext, dict):
+            eh = ext.get("extrinsic_hash")
+        canon = _canonical_hex(eh)
+        if canon is not None and canon == target_hash:
             ext_idx = idx
             break
     if ext_idx is None:
-        return None
+        # Loud non-success — see docstring. The proof receipt looked OK
+        # but we cannot prove the runtime applied *our* extrinsic in
+        # this block, so callers must NOT close the work key.
+        return (
+            f"unclassified: extrinsic {target_hash[:16]}… not found in "
+            f"block {_strip_0x(block_hash)[:16]}… "
+            f"({len(extrinsics)} extrinsics)"
+        )
     events = iface.get_events(block_hash=block_hash) or []
     for ev in events:
         v = ev.value if hasattr(ev, "value") else (ev if isinstance(ev, dict) else None)
         if not isinstance(v, dict):
             continue
-        phase = v.get("phase") or {}
-        # phase is `{"ApplyExtrinsic": idx}` for in-block events.
-        if isinstance(phase, dict):
-            applied = phase.get("ApplyExtrinsic")
-            if applied is None or int(applied) != ext_idx:
-                continue
-        elif isinstance(phase, (int, str)):
-            # Some decoders flatten phase to the extrinsic index directly.
-            try:
-                if int(phase) != ext_idx:
-                    continue
-            except (ValueError, TypeError):
-                continue
-        else:
+        applied_idx = _phase_extrinsic_idx(v.get("phase") or {})
+        if applied_idx != ext_idx:
             continue
         event = v.get("event") or v
-        module_id = event.get("module_id") or event.get("pallet")
-        event_id = event.get("event_id") or event.get("variant") or event.get("name")
+        module_id = (
+            event.get("module_id")
+            or event.get("pallet")
+            or event.get("pallet_name")
+        )
+        event_id = (
+            event.get("event_id")
+            or event.get("variant")
+            or event.get("name")
+            or event.get("event_name")
+        )
         if module_id == "System" and event_id == "ExtrinsicFailed":
             attrs = event.get("attributes") or event.get("fields") or {}
             return f"Module(ExtrinsicFailed, attrs={attrs!r})"
+        if module_id == "System" and event_id == "ExtrinsicSuccess":
+            # Authoritative success for this extrinsic — short-circuit.
+            return None
     return None
 
 
@@ -1393,7 +1493,7 @@ def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
 
     Layout:
       - 1 byte option tag (0x00 = None, 0x01 = Some)
-      - last_winning_hash: H256 (32 bytes) — `block_hash(LastProofBlock)`
+      - last_proof_block_hash: H256 (32 bytes) — `block_hash(LastProofBlock)`
       - difficulty: DifficultyConfig {min_solutions: u32,
             max_energy_milli: i64, min_diversity_milli: u32}
       - topology_hash: H256 (32 bytes)
@@ -1418,8 +1518,8 @@ def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
                     f"{data.get_remaining_length()} bytes"
                 )
             return None
-        last_winning_hash = _decode_field(
-            "last_winning_hash", data, lambda d: _read_exact(d, 32)
+        last_proof_block_hash = _decode_field(
+            "last_proof_block_hash", data, lambda d: _read_exact(d, 32)
         )
         difficulty = _decode_difficulty_config(data)
         topology_hash = _decode_field("topology_hash", data, lambda d: _read_exact(d, 32))
@@ -1451,7 +1551,7 @@ def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
             "changed"
         )
     return {
-        "last_winning_hash": last_winning_hash,
+        "last_proof_block_hash": last_proof_block_hash,
         "difficulty": difficulty,
         "topology_hash": topology_hash,
         "nodes": nodes,
@@ -1475,7 +1575,7 @@ def _decode_winning_solution_with_nonce(
       - solution.reward: u128 (Balance)
       - solution.submitted_at: BlockNumber (u32)
       - solution.difficulty: DifficultyConfig
-      - solution.last_winning_hash: H256 (round seed the proof used)
+      - solution.last_proof_block_hash: H256 (last proof block hash the proof used)
       - nonce: U256 (little-endian on the wire; reversed to recover the
         BLAKE3 digest order Python miners use)
     """
@@ -1495,8 +1595,8 @@ def _decode_winning_solution_with_nonce(
         reward = _decode_field("reward", data, _decode_u128)
         submitted_at = _decode_field("submitted_at", data, _decode_u32)
         difficulty = _decode_difficulty_config(data)
-        last_winning_hash = _decode_field(
-            "last_winning_hash", data, lambda d: _read_exact(d, 32)
+        last_proof_block_hash = _decode_field(
+            "last_proof_block_hash", data, lambda d: _read_exact(d, 32)
         )
         nonce = _decode_field("nonce", data, _decode_u256_le)
     except ValueError:
@@ -1516,7 +1616,7 @@ def _decode_winning_solution_with_nonce(
             reward=reward,
             submitted_at=submitted_at,
             difficulty=difficulty,
-            last_winning_hash=last_winning_hash,
+            last_proof_block_hash=last_proof_block_hash,
         ),
         nonce=nonce,
     )
@@ -1581,18 +1681,6 @@ def _coerce_receipt(receipt: Any) -> ExtrinsicReceipt:
         error=error_msg,
         events=events,
     )
-
-
-def _log_dispatch_exception(future: Any) -> None:
-    """Log exceptions raised by `subscribe_new_heads` dispatch coroutines.
-
-    Without this hook, exceptions become unretrieved-future warnings at
-    interpreter shutdown — the subscription appears to silently stop.
-    """
-    try:
-        future.result()
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("subscribe_new_heads callback raised: %s", exc)
 
 
 __all__ = [

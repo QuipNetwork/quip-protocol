@@ -34,7 +34,7 @@ _TER_SPEC = AllowedValueSet((-1000, 0, 1000))
 
 def _make_context(**overrides) -> SubstrateMiningContext:
     defaults = dict(
-        last_winning_hash=b"\x11" * 32,
+        last_proof_block_hash=b"\x11" * 32,
         topology_hash=b"\x22" * 32,
         nodes=[0, 1, 2, 3],
         edges=[(0, 1), (1, 2), (2, 3)],

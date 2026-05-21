@@ -15,13 +15,13 @@ from shared.quantum_proof_of_work import (
 # Small graph for fast tests
 _NODES = list(range(10))
 _EDGES = [(i, i + 1) for i in range(9)]
-_LAST_WINNING_HASH = b"testhash".ljust(32, b"\x00")
+_LAST_PROOF_BLOCK_HASH = b"testhash".ljust(32, b"\x00")
 _MINER_BYTES = b"test-miner".ljust(32, b"\x00")
 
 
 def _make_feeder(**kwargs):
     defaults = dict(
-        last_winning_hash=_LAST_WINNING_HASH,
+        last_proof_block_hash=_LAST_PROOF_BLOCK_HASH,
         miner_bytes=_MINER_BYTES,
         nodes=_NODES,
         edges=_EDGES,

@@ -4,7 +4,7 @@ Loads the shared fixture maintained alongside the Rust pallet at
 ``crates/quantum-validation/tests/fixtures/python_parity.json`` in the
 ``quip-protocol-rs`` sibling checkout. Fixture schema:
 
-  - ``last_winning_hash_hex`` : 32-byte hex (``block_hash(LastProofBlock)``)
+  - ``last_proof_block_hash_hex`` : 32-byte hex (``block_hash(LastProofBlock)``)
   - ``miner_hex``        : 32-byte hex (the canonical miner identity is
                            ``blake2_256(SCALE(account_id))``; tests pin
                            specific 32-byte buffers directly)
@@ -92,7 +92,7 @@ def _load_cases(key: str):
 @pytest.mark.parametrize("case", _load_cases("derive_nonce_cases"))
 def test_derive_nonce_matches_rust(case):
     actual = derive_nonce(
-        last_winning_hash=bytes.fromhex(case["last_winning_hash_hex"]),
+        last_proof_block_hash=bytes.fromhex(case["last_proof_block_hash_hex"]),
         miner=bytes.fromhex(case["miner_hex"]),
         salt=bytes.fromhex(case["salt_hex"]),
     )
