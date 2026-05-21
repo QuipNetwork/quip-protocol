@@ -382,7 +382,7 @@ class DWaveSamplerWrapper:
         self,
         h: Dict[int, float],
         J: Dict[Tuple[int, int], float],
-        nonce_seed: int,
+        nonce_seed: Union[int, bytes],
     ) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float], Dict[int, int]]:
         """Clamp defective qubits to deterministic spins and adjust neighbors.
 
@@ -396,7 +396,9 @@ class DWaveSamplerWrapper:
         Args:
             h: Linear biases for all nodes (full topology).
             J: Quadratic biases for all edges (full topology).
-            nonce_seed: Seed for deterministic spin assignment (from block nonce).
+            nonce_seed: Seed for deterministic spin assignment. Accepts either
+                the 32-byte block nonce (post-MR-!20 wire shape) or a legacy
+                int seed.
 
         Returns:
             (h_reduced, J_reduced, fixed_spins) where:
@@ -405,6 +407,12 @@ class DWaveSamplerWrapper:
             - fixed_spins: {qubit_id: spin_value} for solution reconstruction
         """
         defective_set = set(self._defective_qubits)
+        # numpy's SeedSequence rejects bytes ("expects int or sequence of
+        # ints for entropy"). Post-MR-!20, `derive_nonce` returns 32 bytes
+        # rather than an int, so the seed needs explicit conversion at
+        # the QPU boundary. big-endian matches the U256 wire encoding.
+        if isinstance(nonce_seed, (bytes, bytearray)):
+            nonce_seed = int.from_bytes(nonce_seed, "big")
         rng = np.random.default_rng(nonce_seed)
 
         # Assign deterministic ±1 spins to defective qubits

@@ -217,6 +217,13 @@ class ControllerStats:
     # layer fed us stale historical heads — the symptom that surfaced
     # the per-header-lookup bug in subscribe_new_heads.
     heads_dropped_stale_number: int = 0
+    # Heads dropped because `_handle_head` raised a non-connection
+    # exception (e.g., snapshot SCALE decode shape drift after a
+    # runtime upgrade, RuntimeError from `state_call`). Non-zero here
+    # means a head was lost but the controller stayed alive. A
+    # persistently growing counter indicates a runtime API shape
+    # mismatch that needs an operator update.
+    heads_dropped_handler_error: int = 0
     # Submissions that produced an OK receipt but whose post-submit
     # winning_solution check did not match our miner+nonce. Non-zero
     # here means we accepted a receipt that the runtime did not
@@ -602,6 +609,27 @@ class SubstrateMinerController:
                             "next head will retry",
                             type(exc).__name__,
                             exc,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        # Non-connection errors from `_handle_head` (e.g.
+                        # snapshot SCALE decode shape drift, RuntimeError
+                        # from `state_call`) would otherwise propagate out
+                        # of `_main_loop` and tear down the controller —
+                        # then `_teardown` runs, `run()` returns, and the
+                        # CLI's `asyncio.wait` shuts everything down on a
+                        # single runtime-API shape mismatch. Drop the
+                        # head, increment a stat, and let the next head
+                        # retry. Operators see the counter + log; a
+                        # persistently broken runtime shape will show up
+                        # as a flatlined `heads_observed` vs. growing
+                        # `heads_dropped_handler_error`.
+                        self.stats.heads_dropped_handler_error += 1
+                        logger.warning(
+                            "head handling raised %s: %s; dropping head "
+                            "0x%s... and waiting for next",
+                            type(exc).__name__,
+                            exc,
+                            head_hash.hex()[:16],
                         )
 
     async def _handle_head(self, head_hash: bytes, block_number: int) -> None:

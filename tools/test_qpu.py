@@ -221,7 +221,7 @@ def run_qpu_test(qpu_miner, h, J, nonce: int, num_reads: int,
     start_time = time.time()
 
     topology_label = qpu_miner.sampler.job_label
-    nonce_hex = hex(nonce)[2:][:8]
+    nonce_hex = nonce.hex()[:8]
     job_label = f"{topology_label}_{nonce_hex}"
 
     sampleset = qpu_miner.sampler.sample_ising(
@@ -372,7 +372,7 @@ def run_streaming(qpu_miner, nonces_and_models, num_reads_list,
 
     def submit_job(idx: int) -> PendingJob:
         seed, nonce, model, num_reads, annealing_time = work_items[idx]
-        nonce_hex = hex(nonce)[2:][:8]
+        nonce_hex = nonce.hex()[:8]
         job_label = f"{topology_label}_{nonce_hex}"
 
         future = qpu_miner.sampler.sample_ising_async(
@@ -697,7 +697,7 @@ def main():
     for seed in seeds:
         nonce, model = generate_nonce(seed, topology)
         nonces_and_models.append((seed, nonce, model))
-        nonce_hex = format(nonce, '064x')
+        nonce_hex = nonce.hex()
         print(f"  Seed {seed}: nonce={nonce_hex[:16]}...")
     print()
 

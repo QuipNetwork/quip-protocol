@@ -938,20 +938,45 @@ class SubstrateClient:
                     )
                     continue
 
-                head_hex = await self._run(
-                    lambda: getattr(self._iface, head_fn_name)()
-                )
-                head_bytes = bytes.fromhex(_strip_0x(head_hex))
-                # Same DigestItem-resilience as the subscribe call: a
-                # header we can't fully SCALE-decode is still useful —
-                # we only need the `number` field.
-                header = await self._run(
-                    lambda: self._iface.get_block_header(
-                        block_hash=head_hex, ignore_decoding_errors=True
+                # Catch broadly: anything that escapes here would silently
+                # kill the pump task while the executor-side subscribe
+                # keeps running and setting `pump_event`. That deadlocks
+                # the controller (head_signal never fires) without any
+                # log or stats counter. Sources of non-connection
+                # exceptions include: header SCALE shape drift after a
+                # runtime upgrade (KeyError on `header["header"]["number"]`),
+                # `_iface` cleared mid-call (AttributeError), and
+                # exceptions raised by `callback`. `_run` already handles
+                # WebSocketException/ConnectionError via failover; any
+                # exception that propagates here means failover gave up
+                # (NoValidatorReachable) or the failure is non-transport.
+                # Log and continue — the next subscribe callback will
+                # re-arm pump_event and we'll retry against the latest
+                # chain state.
+                try:
+                    head_hex = await self._run(
+                        lambda: getattr(self._iface, head_fn_name)()
                     )
-                )
-                number = _coerce_block_number(header["header"]["number"])
-                await callback(head_bytes, number)
+                    head_bytes = bytes.fromhex(_strip_0x(head_hex))
+                    # Same DigestItem-resilience as the subscribe call: a
+                    # header we can't fully SCALE-decode is still useful —
+                    # we only need the `number` field.
+                    header = await self._run(
+                        lambda: self._iface.get_block_header(
+                            block_hash=head_hex, ignore_decoding_errors=True
+                        )
+                    )
+                    number = _coerce_block_number(header["header"]["number"])
+                    await callback(head_bytes, number)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "subscribe_new_heads pump iteration failed "
+                        "(%s: %s); will retry on next chain head",
+                        type(exc).__name__,
+                        exc,
+                    )
 
         # Prime the pump so the first head is delivered without waiting
         # for the next chain notification. Important on startup against a

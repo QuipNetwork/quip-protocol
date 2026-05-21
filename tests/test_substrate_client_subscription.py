@@ -209,3 +209,47 @@ async def test_pump_finalized_only_uses_finalised_endpoint():
 
     assert len(received) >= 1
     assert all(h == bytes.fromhex("11" * 32) for h, _ in received)
+
+
+async def test_pump_survives_callback_exception():
+    """A `callback` that raises (and any other non-connection exception
+    inside the pump iteration) must not kill the pump task. The next
+    chain head should still produce a callback invocation. Regression
+    guard for the silent-controller-hang failure mode where a single
+    runtime API shape drift takes the miner offline with no log."""
+    head_hashes = ["0x" + ("aa" * 32), "0x" + ("bb" * 32)]
+    stop = threading.Event()
+    iface = _FakeIface(head_hashes, stop)
+    client = _build_client(iface)
+
+    received: list[tuple[bytes, int]] = []
+    call_count = [0]
+
+    async def cb(block_hash: bytes, number: int) -> None:
+        call_count[0] += 1
+        if call_count[0] == 1:
+            raise RuntimeError("simulated runtime-API shape drift")
+        received.append((block_hash, number))
+
+    async def driver():
+        for _ in range(50):
+            if iface.captured_callback is not None:
+                break
+            await asyncio.sleep(0)
+        # First wake (priming) — callback raises, pump must survive.
+        iface.captured_callback({"header": {"number": 0}}, 0, "sub-id")
+        await asyncio.sleep(0.05)
+        # Second wake — callback succeeds, proving pump is still alive.
+        iface.captured_callback({"header": {"number": 0}}, 0, "sub-id")
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+        stop.set()
+
+    await asyncio.gather(
+        client.subscribe_new_heads(cb), driver()
+    )
+
+    # Callback was invoked at least twice (once raising, once
+    # succeeding). The second invocation proves the pump survived.
+    assert call_count[0] >= 2, f"pump died after exception; got {call_count[0]}"
+    assert len(received) >= 1, "no successful callback after exception"

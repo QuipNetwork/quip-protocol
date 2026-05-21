@@ -265,7 +265,7 @@ def process_batch(
                 full_failed += 1
 
             nonce_result = {
-                'nonce': nonce,
+                'nonce': nonce.hex(),
                 'salt': salt,
                 'canary': canary_result,
                 'full': {
@@ -281,7 +281,7 @@ def process_batch(
         # If batch fails, mark all as errors
         for nonce, salt, canary_result in zip(batch_nonces, batch_salts, batch_canary_results):
             nonce_result = {
-                'nonce': nonce,
+                'nonce': nonce.hex(),
                 'salt': salt,
                 'canary': canary_result,
                 'full': {'error': str(e)}
@@ -447,7 +447,7 @@ def run_canary_test(
         h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
 
         nonce_result = {
-            'nonce': nonce,
+            'nonce': nonce.hex(),
             'salt': salt.hex(),
             'canary': {},
             'full': {}
