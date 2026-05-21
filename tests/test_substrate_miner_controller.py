@@ -115,6 +115,19 @@ def _bare_controller() -> SubstrateMinerController:
     exercise a single method. Sets up the attributes that method needs."""
     c = SubstrateMinerController.__new__(SubstrateMinerController)
     c.client = MagicMock()
+    # Default get_block_number returns the head_number + 1 if available,
+    # but most tests override either the receipt path or this stub.
+    c.client.get_head = AsyncMock(return_value=b"\xff" * 32)
+    c.client.get_block_number = AsyncMock(return_value=0)
+    # Default subscription client supports the active-refresh helper —
+    # tests that don't exercise refresh ignore it; tests that do
+    # override the AsyncMocks below.
+    c._subscription_client = MagicMock()
+    c._subscription_client.get_head = AsyncMock(return_value=b"\xff" * 32)
+    c._subscription_client.get_block_number = AsyncMock(return_value=0)
+    c._refresh_in_flight = False
+    c._latest_head = None
+    c._head_signal = asyncio.Event()
     c.signer = MagicMock()
     c.signer.account_id_bytes.return_value = b"\x42" * 32
     c.signer.ss58_address.return_value = "5Test"
@@ -493,22 +506,327 @@ async def test_handle_head_advances_highest_handled_block():
 
 
 async def test_handle_head_skipped_already_won_still_bumps_highest():
-    """The already-won short-circuit must still bump _highest_handled_block
-    so a later head with a number between the closed one and the next
-    canonical block doesn't slip past the stale guard."""
-    from shared.substrate_miner_controller import _work_key
+    """The current-already-won branch (head number > accepted_block_number)
+    must still bump _highest_handled_block so a later head with a number
+    between the closed one and the next canonical block doesn't slip past
+    the stale guard."""
+    from shared.substrate_miner_controller import (
+        ClosedWorkRecord,
+        _work_key,
+    )
 
     controller = _bare_controller()
     ctx = _context(b"\x10" * 32)
-    controller._closed_work_keys[_work_key(ctx)] = None
+    controller._closed_work_keys[_work_key(ctx)] = ClosedWorkRecord(
+        accepted_block_hash=b"\xaa" * 32,
+        accepted_block_number=199,  # head 200 is > accepted → current already-won
+        closed_at_monotonic=0.0,
+    )
     controller.client.get_mining_snapshot = AsyncMock(return_value=ctx)
     controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
     controller.miner_handles = []
+    controller._highest_handled_block = 199  # seed past genesis
 
     await controller._handle_head(b"\xff" * 32, 200)
 
     assert controller.stats.heads_skipped_already_won == 1
+    assert controller.stats.stale_post_win_heads_dropped == 0
     assert controller._highest_handled_block == 200
+
+
+# ----------------------------------------------------------------------
+# Stale-post-win, active refresh, zero-seed guard (Phase 4b)
+# ----------------------------------------------------------------------
+
+
+async def test_stale_post_win_head_triggers_refresh():
+    """A subscription head whose number is <= the accepted block number
+    AND the rpc client can't lift it past the accepted block is a
+    stale-post-win event. Don't bump _highest_handled_block and
+    trigger an active refresh."""
+    from shared.substrate_miner_controller import (
+        ClosedWorkRecord,
+        _work_key,
+    )
+
+    controller = _bare_controller()
+    ctx = _context(b"\x10" * 32)
+    controller._closed_work_keys[_work_key(ctx)] = ClosedWorkRecord(
+        accepted_block_hash=b"\xaa" * 32,
+        accepted_block_number=123,
+        closed_at_monotonic=0.0,
+    )
+    controller._highest_handled_block = 121  # last successfully handled
+    controller.client.get_mining_snapshot = AsyncMock(return_value=ctx)
+    # rpc agrees with subscription (no promotion) — isolate the test to
+    # the stale-post-win classification path.
+    controller.client.get_head = AsyncMock(return_value=b"\xff" * 32)
+    controller.client.get_block_number = AsyncMock(return_value=122)
+    # Subscription's polled best head (used by _refresh_latest_head)
+    controller._subscription_client.get_head = AsyncMock(
+        return_value=b"\xcc" * 32
+    )
+    controller._subscription_client.get_block_number = AsyncMock(
+        return_value=125
+    )
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    controller.miner_handles = []
+
+    await controller._handle_head(b"\xff" * 32, 122)
+
+    assert controller.stats.stale_post_win_heads_dropped == 1
+    assert controller.stats.heads_skipped_already_won == 1
+    assert controller.stats.heads_promoted_to_rpc == 0
+    # Must NOT bump — the refreshed head needs to pass the stale guard
+    assert controller._highest_handled_block == 121
+    # Active refresh fired
+    assert controller.stats.heads_refreshed_active == 1
+    assert controller._latest_head == (b"\xcc" * 32, 125)
+    assert controller._head_signal.is_set()
+    # Per-record stale skip counter bumped
+    record = controller._closed_work_keys[_work_key(ctx)]
+    assert record.stale_head_skips == 1
+
+
+async def test_handle_head_promotes_to_rpc_when_ahead():
+    """When the rpc client reports a strictly newer best head than the
+    subscription wake delivered, _handle_head re-anchors to the rpc
+    view before evaluating the snapshot. The subscription_lag_blocks
+    gauge captures the gap."""
+    controller = _bare_controller()
+    ctx = _context(b"\x10" * 32)
+    controller.client.get_head = AsyncMock(return_value=b"\xee" * 32)
+    controller.client.get_block_number = AsyncMock(return_value=510)
+    controller.client.get_mining_snapshot = AsyncMock(return_value=ctx)
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    controller.miner_handles = []
+
+    # Subscription wake at 502; rpc says 510 → promote.
+    await controller._handle_head(b"\xff" * 32, 502)
+
+    assert controller.stats.heads_promoted_to_rpc == 1
+    assert controller.stats.subscription_lag_blocks == 8
+    # Snapshot was called with at=None — node evaluates at its own best.
+    controller.client.get_mining_snapshot.assert_called_once()
+    assert controller.client.get_mining_snapshot.call_args.kwargs["at"] is None
+    # _highest_handled_block was bumped to the promoted value, not the
+    # subscription value.
+    assert controller._highest_handled_block == 510
+
+
+async def test_handle_head_no_promotion_when_rpc_not_ahead():
+    """If the rpc client reports a number <= the subscription's, we
+    keep the subscription head as-is and don't increment the
+    promotion counter."""
+    controller = _bare_controller()
+    ctx = _context(b"\x10" * 32)
+    controller.client.get_head = AsyncMock(return_value=b"\xaa" * 32)
+    controller.client.get_block_number = AsyncMock(return_value=100)
+    controller.client.get_mining_snapshot = AsyncMock(return_value=ctx)
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    controller.miner_handles = []
+
+    await controller._handle_head(b"\xff" * 32, 100)  # equal — no promotion
+
+    assert controller.stats.heads_promoted_to_rpc == 0
+    assert controller.stats.subscription_lag_blocks == 0
+
+
+async def test_handle_head_rpc_promotion_failure_falls_back():
+    """If the rpc-head query raises, the controller logs and continues
+    with the subscription head — failing the promotion must not block
+    head handling."""
+    controller = _bare_controller()
+    ctx = _context(b"\x10" * 32)
+    controller.client.get_head = AsyncMock(
+        side_effect=ConnectionError("rpc dead")
+    )
+    controller.client.get_mining_snapshot = AsyncMock(return_value=ctx)
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    controller.miner_handles = []
+
+    await controller._handle_head(b"\xff" * 32, 100)
+
+    assert controller.stats.heads_promoted_to_rpc == 0
+    # Snapshot still got called — fallback worked.
+    controller.client.get_mining_snapshot.assert_called_once()
+    assert controller._highest_handled_block == 100
+
+
+async def test_handle_head_snapshot_evaluated_at_none():
+    """All happy-path head handling calls get_mining_snapshot with
+    at=None so the node evaluates at its own current best block."""
+    controller = _bare_controller()
+    ctx = _context(b"\x10" * 32)
+    controller.client.get_mining_snapshot = AsyncMock(return_value=ctx)
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    controller.miner_handles = []
+
+    await controller._handle_head(b"\xff" * 32, 100)
+
+    controller.client.get_mining_snapshot.assert_called_once()
+    assert controller.client.get_mining_snapshot.call_args.kwargs["at"] is None
+
+
+async def test_current_already_won_head_debounced_refresh():
+    """Two back-to-back current-already-won heads (number > accepted) must
+    trigger only ONE active refresh inside the debounce window. The first
+    call should refresh; the second (same record, <1s later) should not."""
+    from shared.substrate_miner_controller import (
+        ClosedWorkRecord,
+        _work_key,
+    )
+
+    controller = _bare_controller()
+    ctx = _context(b"\x10" * 32)
+    controller._closed_work_keys[_work_key(ctx)] = ClosedWorkRecord(
+        accepted_block_hash=b"\xaa" * 32,
+        accepted_block_number=199,
+        closed_at_monotonic=0.0,
+    )
+    controller._highest_handled_block = 199
+    controller.client.get_mining_snapshot = AsyncMock(return_value=ctx)
+    controller._subscription_client.get_head = AsyncMock(
+        return_value=b"\xcc" * 32
+    )
+    controller._subscription_client.get_block_number = AsyncMock(
+        return_value=200
+    )
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    controller.miner_handles = []
+
+    await controller._handle_head(b"\xff" * 32, 200)
+    assert controller.stats.heads_refreshed_active == 1
+
+    # Second call inside debounce window: must NOT refresh again.
+    await controller._handle_head(b"\xff" * 32, 201)
+    assert controller.stats.heads_refreshed_active == 1
+    assert controller.stats.heads_skipped_already_won == 2
+
+
+async def test_zero_seed_snapshot_dropped_after_bootstrap():
+    """A snapshot whose last_proof_block_hash is all zeros, observed at a
+    non-genesis head, must be refused (refresh triggered) — it's the
+    transient runtime state at the exact accepted block."""
+    controller = _bare_controller()
+    zero_ctx = _context(b"\x00" * 32)
+    controller.client.get_mining_snapshot = AsyncMock(return_value=zero_ctx)
+    controller._subscription_client.get_head = AsyncMock(
+        return_value=b"\xcc" * 32
+    )
+    controller._subscription_client.get_block_number = AsyncMock(
+        return_value=125
+    )
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    controller.miner_handles = []
+    controller._highest_handled_block = 122  # past genesis
+
+    await controller._handle_head(b"\xff" * 32, 123)
+
+    assert controller.stats.zero_seed_snapshots_dropped == 1
+    assert controller.stats.heads_refreshed_active == 1
+    # _current_work_key NOT set — we refused before computing it
+    assert controller._current_work_key is None
+
+
+async def test_zero_seed_snapshot_allowed_at_genesis():
+    """At genesis (no proof ever submitted, _highest_handled_block == 0),
+    a zero last_proof_block_hash is the legitimate starting state — must
+    NOT be dropped."""
+    controller = _bare_controller()
+    zero_ctx = _context(b"\x00" * 32)
+    controller.client.get_mining_snapshot = AsyncMock(return_value=zero_ctx)
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    controller.miner_handles = []
+    # _highest_handled_block stays at 0 (genesis)
+
+    await controller._handle_head(b"\xff" * 32, 0)
+
+    assert controller.stats.zero_seed_snapshots_dropped == 0
+    # Successfully advanced; work key computed
+    assert controller._current_work_key is not None
+
+
+async def test_mark_work_key_closed_records_block_number(monkeypatch):
+    """After a successful submit_proof, the closed-work-key entry must
+    carry the receipt's block hash resolved into a block number — so
+    `_handle_head` can later classify stale-vs-current heads."""
+    from shared.substrate_miner_controller import (
+        ClosedWorkRecord,
+        _work_key,
+    )
+
+    controller = _bare_controller()
+    ctx = _context(b"\x10" * 32)
+    _set_current(controller, ctx)
+    controller.client.get_block_number = AsyncMock(return_value=42)
+    controller._verify_proof_recorded = AsyncMock(return_value=True)  # type: ignore[assignment]
+
+    async def fake_submit_proof(*args, **kwargs):
+        return ExtrinsicReceipt(
+            extrinsic_hash="0xabc",
+            block_hash="0x" + "bb" * 32,
+        )
+
+    monkeypatch.setattr(
+        "shared.substrate_miner_controller.submit_proof", fake_submit_proof
+    )
+
+    envelope = _ResultEnvelope(result=_mining_result(), context=ctx, handle_id="h1")
+    await controller._handle_result(envelope)
+    # Let the post-win refresh task start (and immediately complete on stubs)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    record = controller._closed_work_keys[_work_key(ctx)]
+    assert isinstance(record, ClosedWorkRecord)
+    assert record.accepted_block_number == 42
+    assert record.accepted_block_hash == b"\xbb" * 32
+
+
+async def test_active_refresh_monotonic_guard():
+    """_refresh_latest_head must never overwrite _latest_head with an
+    older block number — a slow polled response arriving after the
+    subscription delivered a newer head would otherwise regress us."""
+    controller = _bare_controller()
+    controller._latest_head = (b"\xee" * 32, 200)
+    controller._subscription_client.get_head = AsyncMock(
+        return_value=b"\xcc" * 32
+    )
+    controller._subscription_client.get_block_number = AsyncMock(
+        return_value=180  # older than 200
+    )
+
+    await controller._refresh_latest_head("unit test")
+
+    assert controller._latest_head == (b"\xee" * 32, 200)
+    assert controller.stats.heads_refreshed_active == 0
+
+
+async def test_active_refresh_debounces_overlapping_calls():
+    """Two concurrent _refresh_latest_head calls — the second must no-op
+    because the first is in-flight."""
+    controller = _bare_controller()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_get_head():
+        started.set()
+        await release.wait()
+        return b"\xcc" * 32
+
+    controller._subscription_client.get_head = slow_get_head  # type: ignore[assignment]
+    controller._subscription_client.get_block_number = AsyncMock(
+        return_value=300
+    )
+
+    t1 = asyncio.create_task(controller._refresh_latest_head("first"))
+    await started.wait()  # t1 is now inside, _refresh_in_flight=True
+    await controller._refresh_latest_head("second")  # immediate no-op
+    release.set()
+    await t1
+
+    assert controller.stats.heads_refreshed_active == 1
 
 
 # ----------------------------------------------------------------------

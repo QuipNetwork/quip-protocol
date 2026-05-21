@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import queue as _queue
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -105,6 +106,15 @@ WorkKey = Tuple[bytes, bytes]
 
 def _work_key(ctx: "SubstrateMiningContext") -> WorkKey:
     return (ctx.last_proof_block_hash, ctx.topology_hash)
+
+
+# Minimum interval between active head refreshes triggered by the
+# "current already-won" branch (same work key, head number strictly
+# greater than the accepted block). Without a debounce, every head that
+# carries the still-old last_proof_block_hash would kick a refresh —
+# fine, but noisy. One per second per closed key is plenty: the round
+# rolls over on the next block after the runtime catches up.
+_ALREADY_WON_REFRESH_DEBOUNCE_S = 1.0
 
 
 # Submission errors that mean "this proof raced a chain state change; drop
@@ -179,6 +189,56 @@ class ControllerStats:
     # here means we accepted a receipt that the runtime did not
     # actually record (or recorded against a different submitter).
     proofs_unverified: int = 0
+    # Active best-head refreshes the controller initiated outside the
+    # subscription cadence (post-win kick, stale-post-win detect, zero-
+    # seed snapshot). Pairs with stale_post_win_heads_dropped — every
+    # detection should track to at least one refresh.
+    heads_refreshed_active: int = 0
+    # Subscription delivered a head whose number is <= the block that
+    # already accepted our proof for the still-open work key. Means the
+    # subscription path is lagging the rpc path; we refresh actively
+    # instead of idling on it.
+    stale_post_win_heads_dropped: int = 0
+    # Snapshot at a non-genesis head carried last_proof_block_hash =
+    # 0x00..00. Observed transiently at the exact accepted block; the
+    # next block returns the receipt hash. Refusing dispatch here
+    # prevents mining a degenerate seed.
+    zero_seed_snapshots_dropped: int = 0
+    # Gauge — best rpc head number minus latest subscription head number
+    # at the moment a stale-post-win was detected. Non-zero means the
+    # subscription is genuinely behind; zero with stale_post_win > 0
+    # means the lag is at a finer grain than block number.
+    subscription_lag_blocks: int = 0
+    # Heads where the rpc client reported a strictly newer best than the
+    # subscription wake delivered, so `_handle_head` re-anchored to the
+    # rpc view before evaluating the snapshot. Counts the lag we
+    # routinely paper over rather than just the lag we trip on
+    # post-win.
+    heads_promoted_to_rpc: int = 0
+
+
+@dataclass
+class ClosedWorkRecord:
+    """Metadata for an already-won work key.
+
+    Stored as the value in `_closed_work_keys` so the controller can
+    distinguish a *stale* head (number <= accepted_block_number — the
+    subscription is lagging the submission path) from a *current*
+    already-won head (number > accepted_block_number — the runtime
+    just hasn't rolled the round yet). The first wants an active
+    refresh; the second wants a debounced one.
+
+    Why a record (not just the block number): the debounce timer for
+    the "current already-won" branch and the `stale_head_skips`
+    counter both want per-key locality, and bundling them keeps the
+    LRU eviction simple — one cache, one entry per key.
+    """
+
+    accepted_block_hash: bytes
+    accepted_block_number: int
+    closed_at_monotonic: float
+    last_already_won_refresh_monotonic: float = 0.0
+    stale_head_skips: int = 0
 
 
 @dataclass
@@ -284,12 +344,23 @@ class SubstrateMinerController:
         # Set after a successful snapshot fetch; consulted by the
         # storm-prevention check in _handle_result.
         self._current_work_key: Optional[WorkKey] = None
-        # LRU set of work keys for which the chain already accepted one
+        # LRU map of work keys for which the chain already accepted one
         # of our proofs this head. Subsequent same-key results from
         # sibling handles are dropped without resubmission — that's the
-        # actual fix for submission storming. OrderedDict-as-set keeps
-        # eviction simple (popitem(last=False)) and order-aware.
-        self._closed_work_keys: "OrderedDict[WorkKey, None]" = OrderedDict()
+        # actual fix for submission storming. The value carries the
+        # accepted block hash/number so `_handle_head` can distinguish
+        # a stale subscription head (number <= accepted_block_number)
+        # from a current-round head (number > accepted_block_number);
+        # see ClosedWorkRecord. OrderedDict keeps eviction simple
+        # (popitem(last=False)) and order-aware.
+        self._closed_work_keys: "OrderedDict[WorkKey, ClosedWorkRecord]" = (
+            OrderedDict()
+        )
+        # In-flight guard for _refresh_latest_head. The subscription
+        # path can fire multiple stale-post-win events in quick
+        # succession (one per stale head delivered); we only need one
+        # active refresh outstanding at a time.
+        self._refresh_in_flight: bool = False
         # Latest-only head channel. A slow submit_proof can hold the main
         # loop in `_handle_result` for seconds; during that window the
         # chain advances by multiple blocks. We don't want to dispatch
@@ -482,12 +553,61 @@ class SubstrateMinerController:
     async def _handle_head(self, head_hash: bytes, block_number: int) -> None:
         self.stats.heads_observed += 1
 
+        # Subscription wake → "the chain moved" signal. The subscription
+        # client's websocket is in receive mode, and any RPC issued on
+        # it (e.g., the pump's own `get_chain_head`) competes with the
+        # backlog of pending notification frames — head-of-line
+        # blocking. The result, observed in production: subscription
+        # delivers a head whose number is 8+ blocks behind what the rpc
+        # client sees a few ms later (gauge: `subscription_lag_blocks`).
+        #
+        # Promote to the rpc client's view before evaluating the
+        # snapshot. The rpc socket has no subscription holding it; its
+        # `get_head()` returns truly-current state. If the rpc query
+        # fails, fall back to the subscription's head_hash — that's
+        # what we'd have used anyway and the stale-post-win classifier
+        # will catch over-old work keys downstream.
+        subscription_block_number = block_number
+        try:
+            rpc_head = await self.client.get_head()
+            rpc_number = await self.client.get_block_number(at=rpc_head)
+            if rpc_number > block_number:
+                # Update the lag gauge here so it reflects every
+                # observed gap, not just the ones that trip into the
+                # stale-post-win branch below.
+                self.stats.subscription_lag_blocks = (
+                    rpc_number - block_number
+                )
+                logger.debug(
+                    "promoting head %d → %d (rpc ahead of subscription) "
+                    "0x%s... → 0x%s...",
+                    block_number,
+                    rpc_number,
+                    head_hash.hex()[:16],
+                    rpc_head.hex()[:16],
+                )
+                head_hash = rpc_head
+                block_number = rpc_number
+                self.stats.heads_promoted_to_rpc += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "rpc-head promotion failed (using subscription head): %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+
         # Stale-block-number guard. A backlog in the subscription layer
         # (or a fork that diverged from canonical before our latest
         # handled block) could feed us an older head — mining_snapshot
         # at that hash would correctly return a stale round_seed and the
         # storm-prevention guard further down would idle us on a
         # closed work_key. Catch it here instead and log loudly.
+        #
+        # Note: after rpc-head promotion above, `block_number` may be
+        # the rpc view, which is strictly >= the subscription's number.
+        # The guard still catches genuinely stale subscription heads
+        # that the rpc promotion couldn't lift past _highest_handled_block
+        # (e.g., a fork rollback).
         if block_number < self._highest_handled_block:
             self.stats.heads_dropped_stale_number += 1
             logger.warning(
@@ -541,8 +661,21 @@ class SubstrateMinerController:
         canonical_miner = hashlib.blake2b(
             self.signer.account_id_bytes(), digest_size=32
         ).digest()
+        # Evaluate the runtime API at the node's current best block
+        # (at=None), not at the head hash we received. The node's view
+        # is strictly fresher than any (hash, number) we hold — there's
+        # no client→node round-trip between "what's best" and "snapshot
+        # at best." This also collapses the window in which the
+        # zero-seed transient appears: by the time the node processes
+        # state_call, the runtime's LastProofBlock is more likely to
+        # have been repopulated.
+        #
+        # The promoted head/number above is still used for logging,
+        # stale-guard, and `_highest_handled_block` bookkeeping —
+        # snapshot freshness is a separate axis from head-tracking
+        # freshness.
         context = await self.client.get_mining_snapshot(
-            at=head_hash,
+            at=None,
             topology_hash=self.topology_hash,
             miner_account_bytes=canonical_miner,
         )
@@ -575,30 +708,92 @@ class SubstrateMinerController:
                 f"expected 0x{self.topology_hash.hex()}, got 0x{context.topology_hash.hex()}"
             )
 
+        # Zero-seed guard. The mining_snapshot at the *exact* accepted
+        # block has been observed returning last_proof_block_hash = 0x00..00
+        # — a transient runtime state between "proof submitted" and
+        # "round rolled" where the storage item is reset but not yet
+        # repopulated. Block N+1's snapshot returns the real receipt
+        # hash. Dispatching against the zero seed would produce a
+        # degenerate work key the chain will reject; refuse and
+        # actively refresh instead.
+        #
+        # The `_highest_handled_block > 0` clause leaves the legitimate
+        # genesis/bootstrap path alone (no proof has ever been submitted
+        # so a zero last_proof_block_hash is the expected starting state).
+        if (
+            context.last_proof_block_hash == b"\x00" * 32
+            and self._highest_handled_block > 0
+        ):
+            self.stats.zero_seed_snapshots_dropped += 1
+            logger.warning(
+                "snapshot at head %d (0x%s...) carries zero "
+                "last_proof_block_hash; refusing dispatch and refreshing "
+                "(highest_handled=%d)",
+                block_number,
+                head_hash.hex()[:16],
+                self._highest_handled_block,
+            )
+            await self._refresh_latest_head("zero-seed snapshot")
+            return
+
         self._current_context = context
         self._current_work_key = _work_key(context)
 
-        # If we already won this round, don't redispatch. The last proof block hash
-        # (LastProofBlock's hash) only updates after our winning proof is
-        # included and the new round begins — until then, every fresh head
-        # in this round carries the same work_key we just closed. Mining
-        # the same problem again only produces results we'd drop as
-        # duplicates and spams the logs. Sit idle here; the next head
-        # carrying a *new* last_proof_block_hash will trip past this guard and we'll
-        # dispatch fresh work.
-        if self._current_work_key in self._closed_work_keys:
+        # If we already won this round, don't redispatch. Split into
+        # two sub-cases driven by the accepted block number we recorded
+        # at close time:
+        #
+        #   (1) stale post-win — the subscription delivered a head whose
+        #       number is <= the block that accepted our proof. This is
+        #       the lag symptom: the subscription path trails the rpc
+        #       path. Don't bump _highest_handled_block (a refreshed
+        #       head must be allowed past the stale-number guard at the
+        #       top of this method) and kick an active refresh.
+        #
+        #   (2) current already-won — head number is strictly past the
+        #       accepted block but the runtime hasn't rolled the round
+        #       yet (snapshot still returns the same last_proof_block_hash).
+        #       Sit idle as before, but also kick a debounced refresh —
+        #       if the runtime rolled between subscription wake and
+        #       snapshot fetch, we'll see the new round on the next
+        #       refresh-driven dispatch instead of waiting for the
+        #       natural subscription cadence.
+        record = self._closed_work_keys.get(self._current_work_key)
+        if record is not None:
             self.stats.heads_skipped_already_won += 1
+            if block_number <= record.accepted_block_number:
+                record.stale_head_skips += 1
+                self.stats.stale_post_win_heads_dropped += 1
+                logger.info(
+                    "stale post-win head number=%d 0x%s... "
+                    "(accepted at block %d, last_proof_block_hash=0x%s...); "
+                    "refreshing",
+                    block_number,
+                    head_hash.hex()[:16],
+                    record.accepted_block_number,
+                    context.last_proof_block_hash.hex()[:16],
+                )
+                # Sample subscription lag once per stale detection.
+                await self._record_subscription_lag(block_number)
+                await self._refresh_latest_head("stale post-win head")
+                return
+            now = time.monotonic()
+            since_last = now - record.last_already_won_refresh_monotonic
             logger.info(
                 "head number=%d 0x%s... carries already-won "
-                "last_proof_block_hash=0x%s...; waiting for next round "
-                "(skipping dispatch)",
+                "last_proof_block_hash=0x%s... (accepted at block %d); "
+                "waiting for next round (skipping dispatch)",
                 block_number,
                 head_hash.hex()[:16],
                 context.last_proof_block_hash.hex()[:16],
+                record.accepted_block_number,
             )
             # Still a successful head observation — bump so a backlog of
             # older heads doesn't slip past the stale-number guard.
             self._highest_handled_block = block_number
+            if since_last >= _ALREADY_WON_REFRESH_DEBOUNCE_S:
+                record.last_already_won_refresh_monotonic = now
+                await self._refresh_latest_head("current already-won head")
             return
 
         logger.info(
@@ -727,6 +922,44 @@ class SubstrateMinerController:
                 )
                 return
             self.stats.proofs_submitted += 1
+            # Resolve the receipt's block hash → block number so the
+            # work-key record can distinguish stale subscription heads
+            # (number <= accepted) from current already-won heads. The
+            # receipt only carries `block_hash` (hex string); we fetch
+            # the number via the shallow header read.
+            #
+            # Best-effort: a failure here would leave us without a
+            # ground-truth number, so we fall back to `_highest_handled_block + 1`.
+            # The fallback is correct in the common case (we won the
+            # round at or just past the most recent head we processed)
+            # and the subscription will re-converge within one or two
+            # heads even if it's slightly off.
+            accepted_block_hash = b""
+            accepted_block_number = self._highest_handled_block + 1
+            if receipt.block_hash:
+                try:
+                    accepted_block_hash = bytes.fromhex(
+                        receipt.block_hash[2:]
+                        if receipt.block_hash.startswith("0x")
+                        else receipt.block_hash
+                    )
+                    accepted_block_number = await self.client.get_block_number(
+                        at=accepted_block_hash
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "could not resolve accepted block number for "
+                        "receipt block=%s (%s: %s); using fallback=%d",
+                        receipt.block_hash,
+                        type(exc).__name__,
+                        exc,
+                        accepted_block_number,
+                    )
+            record = ClosedWorkRecord(
+                accepted_block_hash=accepted_block_hash,
+                accepted_block_number=accepted_block_number,
+                closed_at_monotonic=time.monotonic(),
+            )
             # Mark this work key as won and cancel sibling handles
             # immediately so they don't keep mining (and then submitting
             # redundant proofs the chain will reject). This is the
@@ -734,12 +967,23 @@ class SubstrateMinerController:
             # the top of _handle_result is the belt-and-suspenders
             # backstop for sibling results that were already in flight
             # when we got here.
-            self._mark_work_key_closed(envelope_key)
+            self._mark_work_key_closed(envelope_key, record)
             self._cancel_siblings_for_won_work(envelope.handle_id)
+            # Kick a single active refresh so we don't wait for the
+            # natural subscription cadence (observed at 30–90 s in
+            # production). The next head whose snapshot reflects the
+            # new round will dispatch fresh work; if the subscription
+            # is already current with the rpc client, the monotonic
+            # guard in _refresh_latest_head no-ops the call.
+            asyncio.create_task(
+                self._refresh_latest_head("post-win kick"),
+                name="refresh-post-win",
+            )
             logger.info(
-                "submit_proof accepted: extrinsic=%s block=%s miner=%s",
+                "submit_proof accepted: extrinsic=%s block=%s number=%d miner=%s",
                 receipt.extrinsic_hash,
                 receipt.block_hash,
+                accepted_block_number,
                 self.signer.ss58_address(),
             )
             if self.core is not None:
@@ -892,14 +1136,113 @@ class SubstrateMinerController:
         )
         return False
 
-    def _mark_work_key_closed(self, key: WorkKey) -> None:
-        """Record a work key as won and evict the oldest if over cap."""
+    async def _refresh_latest_head(self, reason: str) -> None:
+        """Actively re-poll the subscription client for best head.
+
+        The controller is otherwise purely reactive to subscription
+        deliveries. That leaves a gap after a successful submission:
+        the subscription path can deliver heads with numbers <= the
+        block that just accepted our proof (different rpc-node view,
+        a head that was in-flight when the receipt landed, or a
+        post-win head whose snapshot hasn't rolled the round yet).
+        Each of those would idle on the `_closed_work_keys` guard
+        until the *next* natural subscription wake — observed at
+        30–90 s in production.
+
+        This helper feeds `_latest_head` + `_head_signal` from the
+        subscription client out-of-band. Uses the subscription client
+        (not `self.client`) so it never contends with submit_extrinsic
+        traffic on the rpc websocket. A monotonic guard prevents a
+        slow polled response from overwriting a newer head delivered
+        by the subscription pump in the meantime.
+
+        `_refresh_in_flight` debounces overlapping calls — the
+        subscription path can fire many stale-post-win events in
+        rapid succession; one refresh is enough.
+        """
+        if self._subscription_client is None:
+            return
+        if self._refresh_in_flight:
+            return
+        self._refresh_in_flight = True
+        try:
+            try:
+                head = await self._subscription_client.get_head()
+                number = await self._subscription_client.get_block_number(at=head)
+            except Exception as exc:  # noqa: BLE001
+                # Best-effort — failing here would not change behavior,
+                # the next subscription wake will eventually arrive.
+                logger.warning(
+                    "active head refresh (%s) failed: %s: %s",
+                    reason,
+                    type(exc).__name__,
+                    exc,
+                )
+                return
+            prev = self._latest_head
+            if prev is not None and number < prev[1]:
+                logger.debug(
+                    "active head refresh (%s): polled number=%d < latest=%d; "
+                    "ignoring (monotonic guard)",
+                    reason,
+                    number,
+                    prev[1],
+                )
+                return
+            self._latest_head = (head, number)
+            self._head_signal.set()
+            self.stats.heads_refreshed_active += 1
+            logger.info(
+                "active head refresh (%s): number=%d head=0x%s...",
+                reason,
+                number,
+                head.hex()[:16],
+            )
+        finally:
+            self._refresh_in_flight = False
+
+    async def _record_subscription_lag(self, subscription_number: int) -> None:
+        """Update `stats.subscription_lag_blocks` once per detection.
+
+        Called from the stale-post-win branch only — we don't poll on
+        a timer, the gauge is best sampled exactly when we already
+        know the subscription is behind. Uses the rpc client (not the
+        subscription client) so the measurement reflects the
+        path-divergence we actually care about.
+        """
+        if self.client is None:
+            return
+        try:
+            rpc_head = await self.client.get_head()
+            rpc_number = await self.client.get_block_number(at=rpc_head)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "subscription lag sampling failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return
+        lag = max(0, rpc_number - subscription_number)
+        self.stats.subscription_lag_blocks = lag
+
+    def _mark_work_key_closed(
+        self, key: WorkKey, record: ClosedWorkRecord
+    ) -> None:
+        """Record a work key as won and evict the oldest if over cap.
+
+        `record` carries the accepted block hash/number so
+        `_handle_head` can distinguish stale subscription heads from
+        current-round already-won heads.
+        """
         # Move-to-end semantics: if the same key shows up twice (shouldn't,
-        # but be defensive) it stays at the back of the LRU.
+        # but be defensive) it stays at the back of the LRU. We overwrite
+        # the record with the newer one — its accepted_block_number is
+        # by definition >= the previous one.
         if key in self._closed_work_keys:
+            self._closed_work_keys[key] = record
             self._closed_work_keys.move_to_end(key)
         else:
-            self._closed_work_keys[key] = None
+            self._closed_work_keys[key] = record
             while len(self._closed_work_keys) > _CLOSED_WORK_KEYS_CAP:
                 self._closed_work_keys.popitem(last=False)
 

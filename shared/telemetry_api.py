@@ -229,6 +229,16 @@ class TelemetryApiServer:
                 "proofs_submitted": cs.proofs_submitted,
                 "stale_drops": cs.stale_drops,
                 "submission_errors": cs.submission_errors,
+                "heads_skipped_already_won": cs.heads_skipped_already_won,
+                "heads_dropped_stale_number": cs.heads_dropped_stale_number,
+                "heads_refreshed_active": cs.heads_refreshed_active,
+                "stale_post_win_heads_dropped": cs.stale_post_win_heads_dropped,
+                "zero_seed_snapshots_dropped": cs.zero_seed_snapshots_dropped,
+                "subscription_lag_blocks": cs.subscription_lag_blocks,
+                "heads_promoted_to_rpc": cs.heads_promoted_to_rpc,
+                "none_snapshots_seen": cs.none_snapshots_seen,
+                "duplicate_result_drops": cs.duplicate_result_drops,
+                "proofs_unverified": cs.proofs_unverified,
             }
         return self._success(stats)
 
