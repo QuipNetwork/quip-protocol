@@ -4,9 +4,6 @@ These don't need a live chain — they hand-build the SCALE bytes and check that
 the decoder yields the expected `SubstrateMiningContext`. They cover both the
 `None` (option-tag 0x00) case and the populated case, including the
 milli-precision difficulty fields and the variable-length nodes/edges vecs.
-
-Phase 2's chain bootstrap will exercise the same path against real on-chain
-data; this test exists so the decoder is locked down before then.
 """
 from __future__ import annotations
 
@@ -44,11 +41,6 @@ def _encode_continuous_range(lo: int, hi: int) -> bytes:
     )
 
 
-_DEFAULT_H_BYTES = b""  # filled in after _encode_compact_u32 is defined
-_DEFAULT_J_BYTES = b""
-_DEFAULT_SPIN_BYTES = b""
-
-
 def _encode_compact_u32(n: int) -> bytes:
     """Reference SCALE compact encoder for u32. Mirrors the decoder under test."""
     if n < 0:
@@ -64,8 +56,7 @@ def _encode_compact_u32(n: int) -> bytes:
 
 def _build_snapshot_hex(
     *,
-    block_number: int,
-    parent_hash: bytes,
+    last_winning_hash: bytes,
     difficulty: SubstrateDifficulty,
     topology_hash: bytes,
     nodes: list[int],
@@ -79,8 +70,7 @@ def _build_snapshot_hex(
     parts.append(b"\x01" if is_some else b"\x00")
     if not is_some:
         return "0x" + b"".join(parts).hex()
-    parts.append(block_number.to_bytes(4, "little"))
-    parts.append(parent_hash)
+    parts.append(last_winning_hash)
     parts.append(difficulty.min_solutions.to_bytes(4, "little"))
     parts.append(difficulty.max_energy_milli.to_bytes(8, "little", signed=True))
     parts.append(difficulty.min_diversity_milli.to_bytes(4, "little"))
@@ -104,7 +94,7 @@ def test_decode_none():
 
 
 def test_decode_populated():
-    parent_hash = bytes.fromhex("ab" * 32)
+    last_winning_hash = bytes.fromhex("ab" * 32)
     topology_hash = bytes.fromhex("cd" * 32)
     difficulty = SubstrateDifficulty(
         min_solutions=5,
@@ -115,8 +105,7 @@ def test_decode_populated():
     nodes = [0, 1, 2, 3]
     edges = [(0, 1), (1, 2), (2, 3)]
     encoded = _build_snapshot_hex(
-        block_number=42,
-        parent_hash=parent_hash,
+        last_winning_hash=last_winning_hash,
         difficulty=difficulty,
         topology_hash=topology_hash,
         nodes=nodes,
@@ -126,13 +115,11 @@ def test_decode_populated():
     decoded = _decode_mining_snapshot(encoded)
 
     assert decoded is not None
-    assert decoded["block_number"] == 42
-    assert decoded["parent_hash"] == parent_hash
+    assert decoded["last_winning_hash"] == last_winning_hash
     assert decoded["topology_hash"] == topology_hash
     assert decoded["nodes"] == nodes
     assert decoded["edges"] == edges
     assert decoded["difficulty"] == difficulty
-    # Post-MR-!20 fields: three AllowedValueSpec instances.
     assert decoded["allowed_h_values"] == AllowedValueSet((-1000, 0, 1000))
     assert decoded["allowed_j_values"] == AllowedValueSet((-1000, 1000))
     assert decoded["allowed_spin_values"] == AllowedValueSet((-1000, 1000))
@@ -141,8 +128,7 @@ def test_decode_populated():
 def test_decode_mixed_spec_variants():
     """Decoder correctly handles a mix of Set / IntegerRange / ContinuousRange."""
     encoded = _build_snapshot_hex(
-        block_number=99,
-        parent_hash=b"\x00" * 32,
+        last_winning_hash=b"\x00" * 32,
         difficulty=SubstrateDifficulty(1, -100, 0, 0),
         topology_hash=b"\xcd" * 32,
         nodes=[0, 1],
@@ -165,8 +151,7 @@ def test_decode_zephyr_sized_graph():
     nodes = list(range(1368))
     edges = [(i, i + 1) for i in range(1367)]
     encoded = _build_snapshot_hex(
-        block_number=12345,
-        parent_hash=b"\x10" * 32,
+        last_winning_hash=b"\x10" * 32,
         difficulty=SubstrateDifficulty(5, -4_100_000, 150, 900),
         topology_hash=b"\x20" * 32,
         nodes=nodes,
@@ -193,15 +178,16 @@ def test_decode_rejects_trailing_bytes():
 def test_decode_field_error_includes_field_name():
     """Truncating mid-decode reports the failing field, not a generic
     decoding error."""
-    # Option::Some tag, valid block_number, then ran out of bytes for
-    # parent_hash. Error message should name the failing field.
-    truncated = "0x01" + (5).to_bytes(4, "little").hex() + "ab" * 10
-    with pytest.raises(ValueError, match="parent_hash"):
+    # Option::Some tag, then only a partial last_winning_hash. Error
+    # message should name the failing field.
+    truncated = "0x01" + ("ab" * 10)
+    with pytest.raises(ValueError, match="last_winning_hash"):
         _decode_mining_snapshot(truncated)
 
 
 # ----------------------------------------------------------------------
-# get_mining_snapshot off-by-one regression test (P1 review finding)
+# get_mining_snapshot — the round-seed contract means there is no
+# `at`-vs-head offset anymore. The seed is stable across the round.
 # ----------------------------------------------------------------------
 
 
@@ -219,9 +205,6 @@ async def _make_snapshot_client_with_fake_rpc(encoded_hex: str) -> SubstrateClie
 
     client._iface = _FakeIface()  # type: ignore[assignment]
 
-    # _run wraps blocking calls in a thread; for tests we'd rather execute
-    # synchronously to avoid bringing up an executor. Monkey-patch on the
-    # instance so the production async path stays untouched.
     async def _direct_run(fn):
         return fn()
 
@@ -229,42 +212,12 @@ async def _make_snapshot_client_with_fake_rpc(encoded_hex: str) -> SubstrateClie
     return client
 
 
-@pytest.mark.parametrize(
-    "raw_block, at_hash, expected_block, expected_parent",
-    [
-        # When `at` is set (mining path), the controller validates against
-        # the block where the extrinsic LANDS — that's raw_block + 1, with
-        # parent_hash = at (the hash of raw_block).
-        (
-            42,
-            b"\xab" * 32,
-            43,
-            b"\xab" * 32,
-        ),
-        (
-            12_345,
-            b"\x10" * 32,
-            12_346,
-            b"\x10" * 32,
-        ),
-        (
-            0,
-            b"\xff" * 32,
-            1,
-            b"\xff" * 32,
-        ),
-    ],
-)
-async def test_get_mining_snapshot_applies_plus_one_offset_when_at_set(
-    raw_block, at_hash, expected_block, expected_parent
-):
-    """Regression: `submit_proof` validates against `System::block_number()`
-    at the block where the extrinsic lands, not the head we queried at.
-    Without the +1 offset every proof was rejected with `InvalidNonce`.
-    """
+async def test_get_mining_snapshot_returns_round_seed():
+    """The returned context carries the snapshot's `last_winning_hash`
+    verbatim — no chain-state lookup, no offset, no override from `at`."""
+    seed = b"\xab" * 32
     encoded = _build_snapshot_hex(
-        block_number=raw_block,
-        parent_hash=b"\x99" * 32,  # decoder-emitted; should be OVERWRITTEN by `at`
+        last_winning_hash=seed,
         difficulty=SubstrateDifficulty(1, -1000, 0, 0),
         topology_hash=b"\xcd" * 32,
         nodes=[0, 1, 2, 3],
@@ -273,22 +226,21 @@ async def test_get_mining_snapshot_applies_plus_one_offset_when_at_set(
     client = await _make_snapshot_client_with_fake_rpc(encoded)
 
     ctx = await client.get_mining_snapshot(
-        at=at_hash,
+        at=b"\x77" * 32,  # head hash — irrelevant to round seed
         topology_hash=None,
         miner_account_bytes=b"\x42" * 32,
     )
 
     assert ctx is not None
-    assert ctx.block_number == expected_block
-    assert ctx.parent_hash == expected_parent
+    assert ctx.last_winning_hash == seed
 
 
-async def test_get_mining_snapshot_no_offset_when_at_none():
-    """State-probe callers (e.g. bootstrap idempotency check) pass `at=None`
-    and expect the raw snapshot values, not the +1-offset version."""
+async def test_get_mining_snapshot_at_none_returns_same_seed():
+    """State-probe callers (e.g. bootstrap idempotency check) pass `at=None`.
+    The round seed is the same value either way — no offset branch."""
+    seed = b"\x99" * 32
     encoded = _build_snapshot_hex(
-        block_number=42,
-        parent_hash=b"\x99" * 32,
+        last_winning_hash=seed,
         difficulty=SubstrateDifficulty(1, -1000, 0, 0),
         topology_hash=b"\xcd" * 32,
         nodes=[0, 1, 2, 3],
@@ -303,5 +255,4 @@ async def test_get_mining_snapshot_no_offset_when_at_none():
     )
 
     assert ctx is not None
-    assert ctx.block_number == 42  # raw, not 43
-    assert ctx.parent_hash == b"\x99" * 32  # decoded, not overwritten
+    assert ctx.last_winning_hash == seed

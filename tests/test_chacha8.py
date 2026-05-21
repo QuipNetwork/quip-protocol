@@ -143,27 +143,26 @@ class TestChaCha8Rng:
 
 
 class TestDeriveNonce:
-    """Smoke-tests for the new fixed-width derive_nonce surface."""
+    """Smoke-tests for the fixed-width derive_nonce surface."""
 
     def test_returns_32_bytes(self):
-        nonce = derive_nonce(b"\x00" * 32, b"\x00" * 32, 0, b"\x00" * 32)
+        nonce = derive_nonce(b"\x00" * 32, b"\x00" * 32, b"\x00" * 32)
         assert isinstance(nonce, bytes)
         assert len(nonce) == 32
 
     def test_different_inputs_differ(self):
-        base = derive_nonce(b"\x00" * 32, b"\x00" * 32, 0, b"\x00" * 32)
-        assert base != derive_nonce(b"\x01" * 32, b"\x00" * 32, 0, b"\x00" * 32)
-        assert base != derive_nonce(b"\x00" * 32, b"\x01" * 32, 0, b"\x00" * 32)
-        assert base != derive_nonce(b"\x00" * 32, b"\x00" * 32, 1, b"\x00" * 32)
-        assert base != derive_nonce(b"\x00" * 32, b"\x00" * 32, 0, b"\xff" * 32)
+        base = derive_nonce(b"\x00" * 32, b"\x00" * 32, b"\x00" * 32)
+        assert base != derive_nonce(b"\x01" * 32, b"\x00" * 32, b"\x00" * 32)
+        assert base != derive_nonce(b"\x00" * 32, b"\x01" * 32, b"\x00" * 32)
+        assert base != derive_nonce(b"\x00" * 32, b"\x00" * 32, b"\xff" * 32)
 
     def test_rejects_short_inputs(self):
-        with pytest.raises(ValueError, match="parent_hash"):
-            derive_nonce(b"\x00" * 16, b"\x00" * 32, 0, b"\x00" * 32)
+        with pytest.raises(ValueError, match="last_winning_hash"):
+            derive_nonce(b"\x00" * 16, b"\x00" * 32, b"\x00" * 32)
         with pytest.raises(ValueError, match="miner"):
-            derive_nonce(b"\x00" * 32, b"m", 0, b"\x00" * 32)
+            derive_nonce(b"\x00" * 32, b"m", b"\x00" * 32)
         with pytest.raises(ValueError, match="salt"):
-            derive_nonce(b"\x00" * 32, b"\x00" * 32, 0, b"")
+            derive_nonce(b"\x00" * 32, b"\x00" * 32, b"")
 
 
 # ---------------------------------------------------------------------------
@@ -236,20 +235,6 @@ class TestEdgeCases:
             ChaCha8Rng.seed_from_u64(-1)
         with pytest.raises(ValueError, match="u64"):
             ChaCha8Rng.seed_from_u64(2**64)
-
-    def test_derive_nonce_block_number_overflow(self):
-        with pytest.raises(ValueError, match="u32"):
-            derive_nonce(b"\x00" * 32, b"\x00" * 32, 2**32, b"\x00" * 32)
-
-    def test_derive_nonce_block_number_negative(self):
-        with pytest.raises(ValueError, match="u32"):
-            derive_nonce(b"\x00" * 32, b"\x00" * 32, -1, b"\x00" * 32)
-
-    def test_derive_nonce_max_u32(self):
-        nonce = derive_nonce(
-            b"\x00" * 32, b"\x00" * 32, 2**32 - 1, b"\x00" * 32,
-        )
-        assert len(nonce) == 32
 
     def test_counter_carry(self):
         """Verify 64-bit counter carry from state[12] to state[13]."""

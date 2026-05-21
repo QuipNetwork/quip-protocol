@@ -29,20 +29,21 @@ _SPAWN_CTX = _mp.get_context('spawn')
 
 
 def _generate_one_model(
-    parent_hash: bytes,
+    last_winning_hash: bytes,
     miner_bytes: bytes,
-    block_number: int,
     nodes: list,
     edges: list,
     salt: bytes,
 ) -> IsingModel:
     """Generate one IsingModel in a worker process.
 
-    ``parent_hash`` and ``miner_bytes`` are the post-MR-!20 fixed 32-byte
-    inputs to ``derive_nonce``. Callers must supply the canonical miner
-    identity (``blake2_256(SCALE(account))`` for substrate accounts).
+    ``last_winning_hash`` and ``miner_bytes`` are fixed 32-byte inputs to
+    ``derive_nonce``. The hash is ``block_hash(LastProofBlock)`` — the
+    round-scoped seed that only changes when a new proof wins. Callers
+    must supply the canonical miner identity
+    (``blake2_256(SCALE(account))`` for substrate accounts).
     """
-    nonce = derive_nonce(parent_hash, miner_bytes, block_number, salt)
+    nonce = derive_nonce(last_winning_hash, miner_bytes, salt)
     h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
     return IsingModel(h=h, J=J, nonce=nonce, salt=salt)
 
@@ -99,10 +100,10 @@ class IsingFeeder:
     CUDA driver state from the parent process.
 
     Args:
-        parent_hash: Current block's parent hash (32 bytes).
+        last_winning_hash: Round seed for ``derive_nonce``
+            (``block_hash(LastProofBlock)``, 32 bytes).
         miner_bytes: Canonical 32-byte miner identity
             (``blake2_256(SCALE(account_id))`` for substrate accounts).
-        block_number: Current block number / index.
         nodes: Topology node list.
         edges: Topology edge list.
         buffer_size: Target number of ready + in-flight models.
@@ -112,26 +113,25 @@ class IsingFeeder:
 
     def __init__(
         self,
-        parent_hash: bytes,
+        last_winning_hash: bytes,
         miner_bytes: bytes,
-        block_number: int,
         nodes: list,
         edges: list,
         buffer_size: int = 8,
         max_workers: int = 2,
         seed: Optional[int] = None,
     ):
-        if len(parent_hash) != 32:
+        if len(last_winning_hash) != 32:
             raise ValueError(
-                f"parent_hash must be 32 bytes, got {len(parent_hash)}"
+                "last_winning_hash must be 32 bytes, got "
+                f"{len(last_winning_hash)}"
             )
         if len(miner_bytes) != 32:
             raise ValueError(
                 f"miner_bytes must be 32 bytes, got {len(miner_bytes)}"
             )
-        self._prev_hash = parent_hash
+        self._last_winning_hash = last_winning_hash
         self._miner_id = miner_bytes
-        self._cur_index = block_number
         self._nodes = nodes
         self._edges = edges
         self._buffer_size = buffer_size
@@ -184,9 +184,8 @@ class IsingFeeder:
             salt = self._make_salt()
             f = self._pool.submit(
                 _generate_one_model,
-                self._prev_hash,
+                self._last_winning_hash,
                 self._miner_id,
-                self._cur_index,
                 self._nodes,
                 self._edges,
                 salt,
@@ -315,28 +314,30 @@ class IsingFeeder:
 
         _kill_workers(pids)
 
-    def update_block(
+    def update_round(
         self,
-        parent_hash: bytes,
+        last_winning_hash: bytes,
         miner_bytes: bytes,
-        block_number: int,
     ) -> None:
-        """Update generation args when block changes.
+        """Update generation args when a new round starts.
 
-        Drains stale futures and queue, then refills
-        with new block parameters.
+        Call this when ``block_hash(LastProofBlock)`` changes (i.e., a
+        new proof has won and the round seed rolled over). Drains stale
+        futures and queue, then refills with the new seed. Calling on
+        every new chain head is wasteful — the seed only changes on a
+        win.
         """
-        if len(parent_hash) != 32:
+        if len(last_winning_hash) != 32:
             raise ValueError(
-                f"parent_hash must be 32 bytes, got {len(parent_hash)}"
+                "last_winning_hash must be 32 bytes, got "
+                f"{len(last_winning_hash)}"
             )
         if len(miner_bytes) != 32:
             raise ValueError(
                 f"miner_bytes must be 32 bytes, got {len(miner_bytes)}"
             )
-        self._prev_hash = parent_hash
+        self._last_winning_hash = last_winning_hash
         self._miner_id = miner_bytes
-        self._cur_index = block_number
         for f in self._futures:
             f.cancel()
         self._futures.clear()

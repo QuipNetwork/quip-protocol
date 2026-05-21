@@ -174,12 +174,13 @@ class GPUMiner(BaseMiner):
         self._active_nonces = num_k
 
         # Create feeder BEFORE CUDA activation so spawn
-        # workers don't inherit GPU context.
+        # workers don't inherit GPU context. `prev_block.hash` is the
+        # round seed (`last_winning_hash` — see
+        # `_BridgePrevBlock.from_work_context` in base_miner.py).
         feeder_seed = kwargs.pop('feeder_seed', None)
         self._feeder = IsingFeeder(
-            parent_hash=prev_block.hash,
+            last_winning_hash=prev_block.hash,
             miner_bytes=node_info.miner_account_bytes,
-            block_number=cur_index,
             nodes=self.sampler.nodes,
             edges=self.sampler.edges,
             buffer_size=num_k * 2,

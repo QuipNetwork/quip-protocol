@@ -62,8 +62,8 @@ def _make_models(
         salt = rng.bytes(32)
         # Pad the test miner name to 32 bytes so derive_nonce accepts it.
         miner_bytes = b"miner-test".ljust(32, b"\x00")
-        parent_hash = b"test_hash_padding_to_32_bytes!!!"
-        nonce = derive_nonce(parent_hash, miner_bytes, 1, salt)
+        last_winning_hash = b"test_hash_padding_to_32_bytes!!!"
+        nonce = derive_nonce(last_winning_hash, miner_bytes, salt)
         h, J = generate_ising_model_from_nonce(
             nonce, sampler.nodes, sampler.edges,
         )

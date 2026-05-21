@@ -93,15 +93,18 @@ _DISPATCH_CONTEXT_RETENTION = 4
 
 
 # A "work key" uniquely identifies the puzzle a context is mining
-# against: same (block_number, parent_hash, topology_hash) means the
-# pallet will derive the same nonce and therefore the same Ising
-# problem. Used both for stale-result detection AND for marking a
-# work item closed/won after an accepted submission.
-WorkKey = Tuple[int, bytes, bytes]
+# against: same (last_winning_hash, topology_hash) means the pallet will
+# derive the same nonce and therefore the same Ising problem. Used both
+# for stale-result detection AND for marking a work item closed/won
+# after an accepted submission. Unlike the previous (block_number,
+# parent_hash, ...) key, this one only changes when a *round* closes
+# (a proof wins), not on every new block — matching the post-fix nonce
+# contract.
+WorkKey = Tuple[bytes, bytes]
 
 
 def _work_key(ctx: "SubstrateMiningContext") -> WorkKey:
-    return (ctx.block_number, ctx.parent_hash, ctx.topology_hash)
+    return (ctx.last_winning_hash, ctx.topology_hash)
 
 
 # Submission errors that mean "this proof raced a chain state change; drop
@@ -533,9 +536,10 @@ class SubstrateMinerController:
         self._current_context = context
         self._current_work_key = _work_key(context)
         logger.info(
-            "new head: block=%d hash=0x%s... topology=0x%s... nodes=%d edges=%d",
-            context.block_number,
+            "new head: head=0x%s... round_seed=0x%s... topology=0x%s... "
+            "nodes=%d edges=%d",
             head_hash.hex()[:16],
+            context.last_winning_hash.hex()[:16],
             context.topology_hash.hex()[:16],
             len(context.nodes),
             len(context.edges),
@@ -570,27 +574,33 @@ class SubstrateMinerController:
             self.stats.duplicate_result_drops += 1
             logger.info(
                 "dropping duplicate result from %s: work_key already won "
-                "(block=%d)",
+                "(round_seed=0x%s...)",
                 envelope.handle_id,
-                envelope.context.block_number,
+                envelope.context.last_winning_hash.hex()[:16],
             )
             return
 
         # Drop results produced against a stale context. The controller
-        # already moved on to a new head; the chain would reject this proof.
-        # topology_hash is included so a governance call that rotates the
-        # topology within a single block doesn't slip through as a
-        # block/parent-match.
+        # already moved on to a new round; the chain would reject this
+        # proof. topology_hash is included so a governance call that
+        # rotates the topology within a single round doesn't slip through
+        # as a round-seed match.
         if (
             self._current_work_key is None
             or envelope_key != self._current_work_key
         ):
             self.stats.stale_drops += 1
+            current_seed_hex = (
+                "0x" + self._current_work_key[0].hex()[:16] + "..."
+                if self._current_work_key is not None
+                else "<none>"
+            )
             logger.info(
-                "dropping stale result from %s: block=%d (current=%s)",
+                "dropping stale result from %s: round_seed=0x%s... "
+                "(current=%s)",
                 envelope.handle_id,
-                envelope.context.block_number,
-                self._current_work_key[0] if self._current_work_key else "<none>",
+                envelope.context.last_winning_hash.hex()[:16],
+                current_seed_hex,
             )
             return
 

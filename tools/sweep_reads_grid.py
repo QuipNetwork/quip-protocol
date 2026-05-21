@@ -78,14 +78,13 @@ def generate_models(
     # Ising problems. The legacy "miner_id" string is hashed to the
     # 32-byte canonical identity that derive_nonce expects (matches what
     # the chain pallet does with blake2_256(SCALE(account_id))).
-    prev_hash = rng.randbytes(32)
+    last_winning_hash = rng.randbytes(32)
     miner_bytes = hashlib.blake2b(b"grid-bench", digest_size=32).digest()
-    cur_index = 1
 
     models = []
     for _ in range(num_models):
         salt = rng.randbytes(32)
-        nonce = derive_nonce(prev_hash, miner_bytes, cur_index, salt)
+        nonce = derive_nonce(last_winning_hash, miner_bytes, salt)
         h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
         models.append(IsingModel(
             h=h, J=J, nonce=nonce, salt=salt,

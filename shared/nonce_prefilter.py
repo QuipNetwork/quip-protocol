@@ -254,9 +254,8 @@ def greedy_descent_energy(
 
 
 def batch_score_nonces(
-    parent_hash: bytes,
+    last_winning_hash: bytes,
     miner_bytes: bytes,
-    block_number: int,
     nodes: List[int],
     edges: List[Tuple[int, int]],
     batch_size: int = 16,
@@ -268,9 +267,9 @@ def batch_score_nonces(
     only for the top ``keep`` candidates (avoiding expensive dict
     construction for rejected nonces).
 
-    ``parent_hash`` and ``miner_bytes`` must each be 32 bytes — the
-    canonical fixed-width inputs to
-    :func:`shared.quantum_proof_of_work.derive_nonce` (post-MR-!20).
+    ``last_winning_hash`` and ``miner_bytes`` must each be 32 bytes —
+    the canonical fixed-width inputs to
+    :func:`shared.quantum_proof_of_work.derive_nonce`.
 
     Returns:
         Sorted list of ``(salt, nonce_bytes, h, J, greedy_energy)``,
@@ -282,7 +281,7 @@ def batch_score_nonces(
     scored: List[Tuple[bytes, bytes, float]] = []
     for _ in range(batch_size):
         salt = random.randbytes(32)
-        nonce = derive_nonce(parent_hash, miner_bytes, block_number, salt)
+        nonce = derive_nonce(last_winning_hash, miner_bytes, salt)
         energy = cache.greedy_descent_fast(nonce)
         scored.append((salt, nonce, energy))
 

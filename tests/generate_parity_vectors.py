@@ -5,16 +5,15 @@ path given by ``--out``; copy it to ``quip-protocol-rs/crates/
 quantum-validation/tests/fixtures/python_parity.json`` to feed the Rust
 parity tests.
 
-Post-MR-!20 schema for the two new sections:
+Schema for the two PoW sections:
 
     derive_nonce_cases: [
         {
           "name": str,
-          "parent_hash_hex": 32-byte hex,
-          "miner_hex":       32-byte hex,
-          "block_number":    u32,
-          "salt_hex":        32-byte hex,
-          "expected_nonce_hex": 32-byte hex
+          "last_winning_hash_hex": 32-byte hex,
+          "miner_hex":             32-byte hex,
+          "salt_hex":              32-byte hex,
+          "expected_nonce_hex":    32-byte hex
         }
     ]
 
@@ -66,30 +65,30 @@ def _spec_to_json(spec) -> Dict[str, Any]:
 
 
 def _build_derive_nonce_cases() -> List[Dict[str, Any]]:
-    """Hand-picked deterministic vectors covering parent/miner/block/salt."""
-    base_parent = bytes([0x01] * 32)
+    """Hand-picked deterministic vectors covering last_winning_hash/miner/salt."""
+    base_seed = bytes([0x01] * 32)
+    alt_seed = bytes([0x42] * 32)
     alice = bytes([0xA1] * 32)
     bob = bytes([0xB0] * 32)
     salt_a = bytes([0x01] * 32)
     salt_b = bytes([0x02] * 32)
 
     inputs = [
-        ("alice_block42_salt_a", base_parent, alice, 42, salt_a),
-        ("alice_block42_salt_b", base_parent, alice, 42, salt_b),
-        ("bob_block42_salt_a", base_parent, bob, 42, salt_a),
-        ("alice_block43_salt_a", base_parent, alice, 43, salt_a),
-        ("alice_block0_salt_zero", b"\x00" * 32, alice, 0, b"\x00" * 32),
-        ("alice_max_block_salt_max", b"\xff" * 32, alice, 2**32 - 1, b"\xff" * 32),
+        ("alice_seedA_saltA", base_seed, alice, salt_a),
+        ("alice_seedA_saltB", base_seed, alice, salt_b),
+        ("bob_seedA_saltA", base_seed, bob, salt_a),
+        ("alice_seedB_saltA", alt_seed, alice, salt_a),
+        ("alice_zeros", b"\x00" * 32, alice, b"\x00" * 32),
+        ("alice_max", b"\xff" * 32, alice, b"\xff" * 32),
     ]
     cases: List[Dict[str, Any]] = []
-    for name, parent, miner, block_number, salt in inputs:
-        nonce = derive_nonce(parent, miner, block_number, salt)
+    for name, last_winning_hash, miner, salt in inputs:
+        nonce = derive_nonce(last_winning_hash, miner, salt)
         cases.append(
             {
                 "name": name,
-                "parent_hash_hex": parent.hex(),
+                "last_winning_hash_hex": last_winning_hash.hex(),
                 "miner_hex": miner.hex(),
-                "block_number": block_number,
                 "salt_hex": salt.hex(),
                 "expected_nonce_hex": nonce.hex(),
             }

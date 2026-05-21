@@ -15,16 +15,14 @@ from shared.quantum_proof_of_work import (
 # Small graph for fast tests
 _NODES = list(range(10))
 _EDGES = [(i, i + 1) for i in range(9)]
-_PREV_HASH = b"testhash".ljust(32, b"\x00")
+_LAST_WINNING_HASH = b"testhash".ljust(32, b"\x00")
 _MINER_BYTES = b"test-miner".ljust(32, b"\x00")
-_CUR_INDEX = 0
 
 
 def _make_feeder(**kwargs):
     defaults = dict(
-        parent_hash=_PREV_HASH,
+        last_winning_hash=_LAST_WINNING_HASH,
         miner_bytes=_MINER_BYTES,
-        block_number=_CUR_INDEX,
         nodes=_NODES,
         edges=_EDGES,
         buffer_size=4,
@@ -151,14 +149,13 @@ class TestIsingFeeder:
         finally:
             feeder.stop()
 
-    def test_update_block(self):
+    def test_update_round(self):
         feeder = _make_feeder(seed=11)
         try:
             m_before = feeder.pop_blocking()
-            feeder.update_block(
+            feeder.update_round(
                 b"newhash".ljust(32, b"\x00"),
                 b"new-miner".ljust(32, b"\x00"),
-                1,
             )
             m_after = feeder.pop_blocking()
             assert m_before.nonce != m_after.nonce

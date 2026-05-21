@@ -77,7 +77,7 @@ def collect_data(
 
     for i in range(num_nonces):
         salt = random.randbytes(32)
-        nonce = derive_nonce(prev_hash, miner_bytes, cur_index, salt)
+        nonce = derive_nonce(prev_hash, miner_bytes, salt)
         h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
 
         # Greedy at each pass count
