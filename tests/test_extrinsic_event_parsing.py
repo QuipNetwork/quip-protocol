@@ -21,10 +21,10 @@ class _FakeIface:
         self._block = block
         self._events = events
 
-    def get_block(self, *, block_hash, include_author=False):  # noqa: ARG002
+    def get_block(self, **kwargs):  # noqa: ARG002
         return self._block
 
-    def get_events(self, *, block_hash):  # noqa: ARG002
+    def get_events(self, **kwargs):  # noqa: ARG002
         return self._events
 
 
@@ -180,3 +180,55 @@ def test_dispatch_error_get_block_none_returns_unclassified():
     )
     assert err is not None
     assert "get_block returned None" in err
+
+
+# ----------------------------------------------------------------------
+# Decode-error tolerance — see SHALLOW IFACE POLICY in substrate_client.py
+# ----------------------------------------------------------------------
+
+
+class _DecodingFailureIface:
+    """Simulates substrate-interface raising NotImplementedError on an
+    unknown SCALE type even when `ignore_decoding_errors=True` was
+    passed — happens in some versions when the failure is in outer-frame
+    decoding rather than inner field decoding."""
+
+    def get_block(self, **kwargs):  # noqa: ARG002
+        raise NotImplementedError("No decoding class found for 'DigestItem'")
+
+    def get_events(self, **kwargs):  # noqa: ARG002
+        return []
+
+
+def test_dispatch_error_survives_get_block_decode_crash():
+    """A DigestItem-shaped NotImplementedError from get_block must not
+    crash into the controller — it surfaces as a non-None unclassified
+    string so the receipt is treated as non-success and the work_key
+    stays open for retry."""
+    iface = _DecodingFailureIface()
+    err = _fetch_extrinsic_dispatch_error(
+        iface, block_hash="0x" + "cc" * 32, ext_hash="0x" + "aa" * 32
+    )
+    assert err is not None
+    assert "decode failure" in err
+    assert "DigestItem" in err
+
+
+def test_dispatch_error_passes_ignore_decoding_errors_to_get_block():
+    """Regression guard: get_block must be called with
+    ignore_decoding_errors=True so a single bad digest field doesn't
+    take out the whole block read."""
+    seen_kwargs = {}
+
+    class _SpyIface:
+        def get_block(self, **kwargs):
+            seen_kwargs.update(kwargs)
+            return {"extrinsics": [{"extrinsic_hash": "0x" + "aa" * 32}]}
+
+        def get_events(self, **kwargs):  # noqa: ARG002
+            return []
+
+    _fetch_extrinsic_dispatch_error(
+        _SpyIface(), block_hash="0x" + "cc" * 32, ext_hash="0x" + "aa" * 32
+    )
+    assert seen_kwargs.get("ignore_decoding_errors") is True

@@ -20,6 +20,32 @@ What this module deliberately does NOT do yet:
   - own work-item dispatching (that's `substrate_miner_controller.py`)
   - cache anything across calls — each method is stateless beyond the open
     websocket
+
+SHALLOW IFACE POLICY
+--------------------
+substrate-interface SCALE-decodes block headers, blocks, and events on
+the receive side. When a runtime upgrade introduces a `DigestItem` (or
+other) variant the bundled metadata doesn't recognise, that decode
+raises `NotImplementedError` and the call (or worse, the subscription
+reader thread) dies. Three iface methods accept `ignore_decoding_errors`
+to suppress per-field failures and return whatever decoded successfully:
+
+  - `subscribe_block_headers` — pump only needs the wake signal
+  - `get_block_header` — we only consume `header.number`
+  - `get_block` — `_fetch_extrinsic_dispatch_error` only reads
+    `extrinsics[i].extrinsic_hash`
+
+All three are called with `ignore_decoding_errors=True` in this module.
+Adding new shallow-read call sites should follow the same pattern.
+
+Storage queries (`iface.query`) and `iface.get_events` do NOT accept the
+flag and MUST decode their typed value. Decode failures on those paths
+indicate either a metadata-mismatch bug we want to surface immediately
+or a missing pallet definition — silently swallowing them would corrupt
+our model of chain state. Consumers of `get_events_at` and
+`_fetch_extrinsic_dispatch_error` already match event keys defensively
+(`module_id` / `pallet_name`, etc.) so a future renaming on the
+chain-side surfaces as "no match" rather than a crash.
 """
 from __future__ import annotations
 
@@ -282,7 +308,14 @@ class SubstrateClient:
 
     async def get_block_number(self, at: Optional[bytes] = None) -> int:
         block_hash = _hex(at) if at is not None else None
-        header = await self._run(lambda: self._iface.get_block_header(block_hash=block_hash))
+        # Shallow header read — see SHALLOW IFACE POLICY at top of module.
+        # We only need `number`; opaque DigestItem variants from runtime
+        # upgrades must not block us from learning the block height.
+        header = await self._run(
+            lambda: self._iface.get_block_header(
+                block_hash=block_hash, ignore_decoding_errors=True
+            )
+        )
         # Some substrate-interface builds surface `number` as a hex string,
         # others as an int — accept either.
         return _coerce_block_number(header["header"]["number"])
@@ -1089,7 +1122,22 @@ def _fetch_extrinsic_dispatch_error(
         used to silently return None, masking acceptance failures —
         callers treat any truthy string as "do not mark this as won".
     """
-    block = iface.get_block(block_hash=block_hash, include_author=False)
+    # Shallow block read — see SHALLOW IFACE POLICY at top of module.
+    # We only need `extrinsics[i].extrinsic_hash`; if a digest item or
+    # author field doesn't decode (e.g. runtime upgrade), the extrinsics
+    # vec is still intact and that's all we look at.
+    try:
+        block = iface.get_block(
+            block_hash=block_hash,
+            include_author=False,
+            ignore_decoding_errors=True,
+        )
+    except NotImplementedError as exc:
+        # Belt-and-suspenders: even with `ignore_decoding_errors=True`,
+        # some substrate-interface versions raise on unknown types
+        # during outer-frame decoding (vs inner-field decoding). Surface
+        # as a non-OK receipt rather than crashing into the controller.
+        return f"unclassified: get_block decode failure ({exc})"
     if block is None:
         return f"unclassified: get_block returned None for {block_hash}"
     target_hash = _canonical_hex(ext_hash)

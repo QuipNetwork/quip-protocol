@@ -42,7 +42,7 @@ class _FakeIface:
         self._stop_event = stop_event
         self.captured_callback = None  # for tests that need to drive it
 
-    def subscribe_block_headers(self, callback, finalized_only=False):  # noqa: ARG002
+    def subscribe_block_headers(self, callback, **kwargs):  # noqa: ARG002
         self.captured_callback = callback
         # Block (on the executor thread, where the real subscribe runs)
         # until the test asks us to return.
@@ -59,7 +59,7 @@ class _FakeIface:
     def get_chain_finalised_head(self) -> str:
         return self.get_chain_head()
 
-    def get_block_header(self, block_hash: str):  # noqa: ARG002
+    def get_block_header(self, **kwargs):  # noqa: ARG002
         return {"header": {"number": self._head_calls * 10}}
 
 
