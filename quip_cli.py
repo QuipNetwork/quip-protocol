@@ -1258,6 +1258,306 @@ def quip_miner_qpu(
     )))
 
 
+# --------------------------------------------------------------------------
+# `quip-miner identify` — post a signed NodeDescriptor remark.
+#
+# Builds a v0.1-shaped `nodes.json` entry (schema=quip.node_descriptor.v1)
+# from auto-detected hardware + optional --miner-config, canonicalizes to
+# UTF-8 JSON, and submits via System.remark_with_event (falling back to
+# System.remark if the runtime metadata doesn't expose the eventful
+# variant). The signer's account is the canonical identity; the dashboard
+# indexer maps AccountId -> descriptor by scanning these remarks. See
+# MINERSURVEY.md for the wire format and Phase 2 roadmap.
+# --------------------------------------------------------------------------
+
+
+def _load_identify_miners_toml(path: Path) -> dict:
+    """Read a TOML file shaped like `MinerCore`'s `miners_config` arg.
+
+    Unlike `load_miner_config` (which only returns the `[miner]` table),
+    this returns the top-level `cpu` / `gpu` / `qpu` / device sections
+    that `MinerCore._initialize_miners` consumes. `identify` uses this
+    so operators can describe their miner inventory in TOML form:
+
+        [cpu]
+        num_cpus = 2
+
+        [gpu]
+        backend = "cuda"
+        devices = "0,1"
+
+        [dwave]
+        solver = "Advantage2_system1"
+        daily_budget = "5m"
+
+    The `[miner]` section, if present, is ignored — it carries
+    connection/keystore config that's already supplied via CLI flags.
+    """
+    import sys
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:
+        import tomli as tomllib
+
+    if not path.exists():
+        raise click.ClickException(f"miner config not found: {path}")
+    try:
+        with path.open("rb") as fh:
+            raw = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        raise click.ClickException(
+            f"miner config parse failed ({path}): {exc}"
+        ) from exc
+    raw.pop("miner", None)
+    return raw
+
+
+def _identify_specs_from_miner_config(
+    node_id: str, miners_config: dict
+) -> list:
+    """Materialize miner spec dicts from a parsed miner-config TOML.
+
+    Mirrors `MinerCore._initialize_miners` but produces plain dicts
+    instead of spawning `MinerHandle` worker processes — the identify
+    flow only needs the spec shape to populate the `miners` block of
+    the descriptor.
+    """
+    from shared.miner_core import (
+        _GPU_DEVICE_SECTIONS,
+        _QPU_DEVICE_SECTIONS,
+        _build_gpu_specs,
+        _build_qpu_specs,
+    )
+
+    specs: list = []
+    cpu_cfg = miners_config.get("cpu")
+    if cpu_cfg is not None:
+        num_cpus = int(cpu_cfg.get("num_cpus", 1))
+        cpu_args = dict(cpu_cfg.get("args", {}))
+        for i in range(num_cpus):
+            specs.append({
+                "id": f"{node_id}-CPU-{i + 1}",
+                "kind": "cpu",
+                "args": cpu_args,
+            })
+    has_gpu = miners_config.get("gpu") is not None or any(
+        miners_config.get(k) is not None for k in _GPU_DEVICE_SECTIONS
+    )
+    if has_gpu:
+        specs.extend(_build_gpu_specs(node_id, miners_config))
+    has_qpu = miners_config.get("qpu") is not None or any(
+        miners_config.get(k) is not None for k in _QPU_DEVICE_SECTIONS
+    )
+    if has_qpu:
+        specs.extend(_build_qpu_specs(node_id, miners_config))
+    return specs
+
+
+@quip_miner.command("identify")
+@_validator_option
+@_config_option
+@click.option(
+    "--signer-key",
+    "signer_key_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Path to the signing keystore. Falls back to --config `signer_key`, "
+    "then ~/.quip-miner/signing.json.",
+)
+@click.option(
+    "--node-name",
+    required=True,
+    help="Human-readable label for this miner (max 64 UTF-8 bytes). "
+    "Dashboards display this; awards still key off AccountId.",
+)
+@click.option(
+    "--rpc-endpoint",
+    "rpc_endpoints",
+    multiple=True,
+    help="Publicly-advertised RPC endpoint for this miner. Repeat for up "
+    "to 8 entries. Distinct from --validator: that's where we submit, "
+    "this is what dashboards publish.",
+)
+@click.option("--public-host", default=None, help="Public hostname (≤253 bytes)")
+@click.option(
+    "--public-port",
+    type=click.IntRange(1, 65535),
+    default=None,
+    help="Public port (1-65535)",
+)
+@click.option(
+    "--auto-mine/--no-auto-mine",
+    "auto_mine",
+    default=False,
+    help="Mark this node as auto-mining on startup.",
+)
+@click.option(
+    "--descriptor-log-level",
+    "descriptor_log_level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+    default="INFO",
+    show_default=True,
+    help="log_level value to embed in the descriptor (separate from "
+    "the CLI's own --log-level which controls quip-miner output).",
+)
+@click.option(
+    "--miner-config",
+    "miner_config_path",
+    type=click.Path(dir_okay=False, exists=True),
+    default=None,
+    help="Path to a quip-miner.toml whose [cpu]/[gpu]/[qpu]/[cuda]/[metal]/"
+    "[modal]/[dwave] sections describe this node's miner inventory. "
+    "Populates the descriptor's `miners` block.",
+)
+@click.option(
+    "--no-system-info",
+    "skip_system_info",
+    is_flag=True,
+    default=False,
+    help="Skip hardware probe (omits `system_info`). Useful in CI / "
+    "sandboxed environments where subprocess calls aren't permitted.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Print the canonical JSON payload to stdout and exit without "
+    "submitting. Useful for previewing exactly what would land on chain.",
+)
+def quip_miner_identify(
+    validators: tuple,
+    config_path: Optional[str],
+    signer_key_path: Optional[str],
+    node_name: str,
+    rpc_endpoints: tuple,
+    public_host: Optional[str],
+    public_port: Optional[int],
+    auto_mine: bool,
+    descriptor_log_level: str,
+    miner_config_path: Optional[str],
+    skip_system_info: bool,
+    dry_run: bool,
+) -> None:
+    """Post a signed NodeDescriptor remark for this miner.
+
+    The descriptor carries node_name, optional public_host/public_port,
+    advertised rpc_endpoints, auto_mine flag, runtime block (python /
+    quip_version / docker), miners block (from --miner-config), and an
+    auto-detected system_info block (skippable with --no-system-info).
+    Submitted as `System.remark_with_event` so block indexers see the
+    canonical JSON without needing to scan extrinsic call data.
+    """
+    import hashlib
+    from shared.system_info import (
+        DescriptorValidationError,
+        build_descriptor,
+        to_canonical_json,
+        validate_descriptor,
+    )
+
+    merged = _resolve_runtime_config(
+        config_path=config_path,
+        cli_kwargs={
+            "validators": validators,
+            "signer_key": signer_key_path,
+        },
+        defaults={"signer_key": "~/.quip-miner/signing.json"},
+    ) if not dry_run else {
+        # In --dry-run we don't need validators or a connected client —
+        # only the signer (for the account id printed in the preview).
+        "signer_key": signer_key_path or "~/.quip-miner/signing.json",
+        "validators": tuple(validators),
+    }
+
+    keystore = _load_keystore_or_fail(merged["signer_key"])
+    node_id = node_name
+
+    miners_config: dict = {}
+    if miner_config_path is not None:
+        miners_config = _load_identify_miners_toml(
+            Path(miner_config_path).expanduser()
+        )
+    miner_specs = _identify_specs_from_miner_config(node_id, miners_config)
+
+    descriptor = build_descriptor(
+        node_id=node_id,
+        node_name=node_name,
+        public_host=public_host,
+        public_port=public_port,
+        rpc_endpoints=list(rpc_endpoints),
+        auto_mine=auto_mine,
+        log_level=descriptor_log_level.upper(),
+        miner_specs=miner_specs,
+        include_system_info=not skip_system_info,
+    )
+
+    try:
+        validate_descriptor(descriptor)
+    except DescriptorValidationError as exc:
+        raise click.ClickException(f"descriptor-invalid {exc}") from exc
+
+    payload = to_canonical_json(descriptor)
+    payload_hash = hashlib.blake2b(payload, digest_size=32).hexdigest()
+
+    if dry_run:
+        click.echo(payload.decode("utf-8"))
+        click.echo(
+            f"\n# account            : {keystore.signer.ss58_address()}", err=True
+        )
+        click.echo(f"# payload_size_bytes : {len(payload)}", err=True)
+        click.echo(f"# payload_hash       : 0x{payload_hash}", err=True)
+        return
+
+    async def _do() -> int:
+        pool = ValidatorPool(urls=tuple(merged["validators"]))
+        try:
+            client = await _connect_or_fail(pool, role="rpc")
+            prefer_event = await client.has_call("System", "remark_with_event")
+            call_function = "remark_with_event" if prefer_event else "remark"
+            try:
+                receipt = await client.submit_extrinsic(
+                    "System",
+                    call_function,
+                    {"remark": payload},
+                    keystore.signer,
+                    wait_for="inblock",
+                )
+            except Exception as exc:  # noqa: BLE001 — surfaced via CLI code
+                if call_function == "remark":
+                    raise
+                # Some metadata caches answer "yes" but the active
+                # runtime rejects the call at compose time — degrade to
+                # plain remark rather than failing the whole identify.
+                click.echo(
+                    f"remark_with_event submission failed ({exc}); "
+                    f"retrying with plain remark",
+                    err=True,
+                )
+                receipt = await client.submit_extrinsic(
+                    "System",
+                    "remark",
+                    {"remark": payload},
+                    keystore.signer,
+                    wait_for="inblock",
+                )
+                call_function = "remark"
+            if receipt.error:
+                click.echo(f"{call_function} failed: {receipt.error}", err=True)
+                return 3
+            click.echo("identify submitted")
+            click.echo(f"  account            : {keystore.signer.ss58_address()}")
+            click.echo(f"  call               : System.{call_function}")
+            click.echo(f"  extrinsic_hash     : {receipt.extrinsic_hash}")
+            click.echo(f"  block_hash         : {receipt.block_hash}")
+            click.echo(f"  payload_size_bytes : {len(payload)}")
+            click.echo(f"  payload_hash       : 0x{payload_hash}")
+            return 0
+        finally:
+            await pool.close()
+
+    raise SystemExit(asyncio.run(_do()))
+
+
 # Entry points for console_scripts
 
 

@@ -301,6 +301,24 @@ class SubstrateClient:
             _strip_0x(await self._run(lambda: self._iface.get_chain_head()))
         )
 
+    async def has_call(self, module: str, function: str) -> bool:
+        """Return True iff the runtime metadata exposes ``module.function``.
+
+        Used by the ``identify`` flow to prefer ``System.remark_with_event``
+        over plain ``System.remark`` when the runtime supports it.
+        substrate-interface raises ``ValueError`` from
+        ``get_metadata_call_function`` when the call is absent — we treat
+        any exception as "not present" so an unreachable metadata cache
+        falls back rather than crashing the caller.
+        """
+        def _probe() -> bool:
+            try:
+                self._iface.get_metadata_call_function(module, function)
+                return True
+            except Exception:
+                return False
+        return await self._run(_probe)
+
     async def get_finalized_head(self) -> bytes:
         return bytes.fromhex(
             _strip_0x(await self._run(lambda: self._iface.get_chain_finalised_head()))
