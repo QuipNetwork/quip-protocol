@@ -72,15 +72,17 @@ def encode_quantum_proof(
             )
         packed_solutions.append(pack_solution(milli_spins, spin_spec))
 
-    # NonceOf / SaltOf are now raw `[u8; 32]`. substrate-interface accepts a
-    # bytes object or a list-of-ints for fixed-size byte arrays; we use the
-    # int-list form to match the existing codebase convention.
+    # NonceOf is `U256` in the runtime metadata — scalecodec's U256 encoder
+    # rejects list-of-ints (gates on `0 <= int(value) <= 2**256 - 1`). The
+    # MiningResult.nonce is the canonical 32-byte big-endian digest, so pass
+    # the big-endian int directly.
+    # SaltOf is `[u8; 32]` — accepts a list-of-ints.
     # SolutionsOf is `BoundedVec<BoundedVec<u8>>` — the outer BoundedVec is
     # exposed as a 1-tuple composite; each inner BoundedVec<u8> is also a
     # 1-tuple composite carrying the packed byte list.
     return {
         "topology_hash": "0x" + context.topology_hash.hex(),
-        "nonce": [int(b) for b in result.nonce],
+        "nonce": int.from_bytes(result.nonce, "big"),
         "salt": [int(b) for b in result.salt],
         "solutions": ([([int(b) for b in packed],) for packed in packed_solutions],),
     }

@@ -6,7 +6,7 @@ Substrate (bit-packed i8 spins as bytes). Post-MR-!20 the proof no longer
 carries nodes/edges/h_values — those are looked up on chain from the
 registered topology — so the assertions focus on:
 
-  - nonce + salt round-trip as 32-byte arrays
+  - nonce encodes as a U256 int; salt as a 32-byte array
   - solutions are bit-packed against the registered spin spec
   - the proof dict no longer carries nodes/edges/h_values
 """
@@ -86,8 +86,8 @@ def test_encode_quantum_proof_field_shape():
     proof = encode_quantum_proof(result, ctx)
 
     assert proof["topology_hash"] == "0x" + ("22" * 32)
-    # nonce + salt encode as flat byte-int lists ([u8; 32]).
-    assert bytes(proof["nonce"]) == result.nonce
+    # nonce encodes as a U256 (big-endian int); salt as [u8; 32] byte-int list.
+    assert proof["nonce"] == int.from_bytes(result.nonce, "big")
     assert bytes(proof["salt"]) == result.salt
 
     # The post-MR-!20 proof carries ONLY topology_hash, nonce, salt, solutions.
