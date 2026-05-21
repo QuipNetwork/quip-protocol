@@ -40,6 +40,7 @@ from aiohttp import web
 from aiohttp.web import middleware
 
 from shared.logging_config import get_logger
+from shared.miner_survey import build_miner_survey
 from shared.version import get_version
 
 
@@ -134,6 +135,7 @@ class TelemetryApiServer:
         app.router.add_get("/health", self.handle_health)
         app.router.add_get("/api/v1/status", self.handle_status)
         app.router.add_get("/api/v1/system", self.handle_system)
+        app.router.add_get("/api/v1/miner/survey", self.handle_miner_survey)
         app.router.add_get("/api/v1/stats", self.handle_stats)
         app.router.add_get("/api/v1/block/latest", self.handle_block_latest)
         app.router.add_get("/api/v1/block/{block_number}", self.handle_block)
@@ -173,6 +175,7 @@ class TelemetryApiServer:
                     {"GET": "/health"},
                     {"GET": "/api/v1/status"},
                     {"GET": "/api/v1/system"},
+                    {"GET": "/api/v1/miner/survey"},
                     {"GET": "/api/v1/stats"},
                     {"GET": "/api/v1/block/latest"},
                     {"GET": "/api/v1/block/{block_number}"},
@@ -217,6 +220,16 @@ class TelemetryApiServer:
 
     async def handle_system(self, _request: web.Request) -> web.Response:
         return self._success(self.core.descriptor())
+
+    async def handle_miner_survey(self, _request: web.Request) -> web.Response:
+        """Stable, indexer-friendly snapshot of the miner's identity,
+        active handles, and hardware. Schema: `quip.miner_survey.v1`.
+        Prefer this over `/api/v1/system` — the descriptor endpoint
+        returns whatever the legacy descriptor builder produces, while
+        this endpoint guarantees a versioned shape."""
+        return self._success(
+            build_miner_survey(self.core, self.signer, controller=self.controller)
+        )
 
     async def handle_stats(self, _request: web.Request) -> web.Response:
         stats = self.core.get_stats()

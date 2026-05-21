@@ -113,6 +113,49 @@ async def test_stats_returns_minercore_aggregate(server):
             assert data["wins_per_miner"] == {"t-cpu-1": 1}
 
 
+async def test_miner_survey_returns_versioned_schema(server):
+    """`/api/v1/miner/survey` is the indexer-facing endpoint — verify
+    the schema header is present and the required top-level blocks
+    (`account`, `capabilities`, `miners`, `hardware`) are all in place,
+    with the account rendered as 0x-hex."""
+    async with aiohttp.ClientSession() as http:
+        async with http.get(_url(server, "/api/v1/miner/survey")) as resp:
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["success"] is True
+            data = body["data"]
+            assert data["schema"] == "quip.miner_survey.v1"
+            assert data["schema_version"] == 1
+            assert data["node_id"] == "telemetry-test"
+            assert data["account"]["ss58_address"].startswith("5")
+            assert data["account"]["account_id_hex"] == "0x" + ("12" * 32)
+            assert isinstance(data["capabilities"]["miner_types"], list)
+            assert isinstance(data["miners"], list)
+            assert "cpu" in data["hardware"]
+            assert "gpu" in data["hardware"]
+            assert "qpu" in data["hardware"]
+            # Endpoint must be listed in `/` so dashboards can
+            # discover it without hardcoding paths.
+        async with http.get(_url(server, "/")) as resp:
+            paths = [
+                next(iter(e.values())) for e in (await resp.json())["data"]["endpoints"]
+            ]
+            assert "/api/v1/miner/survey" in paths
+
+
+async def test_miner_survey_does_not_hit_chain(server):
+    """The survey endpoint must not depend on substrate RPC. With a
+    mocked client whose methods raise, `/api/v1/miner/survey` must
+    still 200 — only `/api/v1/status` should reach the chain."""
+    server.client.get_head.side_effect = RuntimeError("chain unreachable")
+    server.client.get_block_number.side_effect = RuntimeError("chain unreachable")
+    server.client.query_miner.side_effect = RuntimeError("chain unreachable")
+    async with aiohttp.ClientSession() as http:
+        async with http.get(_url(server, "/api/v1/miner/survey")) as resp:
+            assert resp.status == 200
+            assert (await resp.json())["data"]["schema"] == "quip.miner_survey.v1"
+
+
 async def test_solve_returns_503(server):
     """POST /api/v1/solve is parked in v0.2; the legacy DWave sampler isn't
     wired into the telemetry surface. Verify the error envelope is honest."""
