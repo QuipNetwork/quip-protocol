@@ -6,8 +6,8 @@
 `nodes`, `edges`, quality floors — but materialize the Ising problem
 differently:
 
-  - PoW derives a fresh `nonce` per attempt (`derive_nonce(parent_hash,
-    miner, block_number, salt)`) and feeds it through
+  - PoW derives a fresh `nonce` per attempt (`derive_nonce(
+    last_winning_hash, miner, salt)`) and feeds it through
     `generate_ising_model_from_nonce` to get `(h, J)`. The chain checks
     this derivation in `submit_proof`.
   - Mempool just carries the `(h_values, j_values)` directly inside
@@ -84,9 +84,8 @@ def resolve_ising(
         raise TypeError(f"resolve_ising: unknown context type {type(context)!r}")
 
     nonce = derive_nonce(
-        context.parent_hash,
+        context.last_winning_hash,
         context.miner_account_bytes,
-        context.block_number,
         salt,
     )
     h, J = generate_ising_model_from_nonce(

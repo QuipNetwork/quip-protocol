@@ -59,16 +59,20 @@ class SubstrateDifficulty:
 class SubstrateMiningContext:
     """Protocol-neutral input to one mining attempt.
 
-    Mirrors the Rust ``MiningSnapshot`` (post-MR-!20) plus the per-miner
-    identity material (``miner_account_bytes``). The three
-    ``allowed_*_values`` specs are the on-chain source of truth for how the
-    nonce-seeded RNG samples per-node h, per-edge j, and per-spin solution
-    values — miners must use these exact specs to produce proofs that the
-    pallet will accept.
+    Mirrors the Rust ``MiningSnapshot`` plus the per-miner identity
+    material (``miner_account_bytes``). The three ``allowed_*_values``
+    specs are the on-chain source of truth for how the nonce-seeded RNG
+    samples per-node h, per-edge j, and per-spin solution values — miners
+    must use these exact specs to produce proofs the pallet will accept.
+
+    ``last_winning_hash`` is ``block_hash(LastProofBlock)`` — the only
+    "time" input ``derive_nonce`` consumes. It stays constant across the
+    entire round (only changes when a new proof wins), so a proof derived
+    against it remains valid for as long as the round runs, no matter how
+    deep the txpool gets.
     """
 
-    block_number: int
-    parent_hash: bytes
+    last_winning_hash: bytes
     topology_hash: bytes
     nodes: List[int]
     edges: List[Tuple[int, int]]
@@ -79,9 +83,10 @@ class SubstrateMiningContext:
     allowed_spin_values: AllowedValueSpec
 
     def __post_init__(self) -> None:
-        if len(self.parent_hash) != 32:
+        if len(self.last_winning_hash) != 32:
             raise ValueError(
-                f"parent_hash must be 32 bytes, got {len(self.parent_hash)}"
+                "last_winning_hash must be 32 bytes, got "
+                f"{len(self.last_winning_hash)}"
             )
         if len(self.topology_hash) != 32:
             raise ValueError(
@@ -92,10 +97,6 @@ class SubstrateMiningContext:
                 "miner_account_bytes must be the 32-byte canonical miner "
                 f"identity (blake2_256(SCALE(account_id))), got "
                 f"{len(self.miner_account_bytes)}"
-            )
-        if not (0 <= self.block_number < 2**32):
-            raise ValueError(
-                f"block_number must fit in u32, got {self.block_number}"
             )
 
 
@@ -108,6 +109,12 @@ class WinningSolution:
     had to clear (decay applied, pre-adjust); the next block's threshold
     is whatever ``QuantumPow.Difficulty`` storage holds after the post-win
     adjustment, which is NOT duplicated here.
+
+    ``last_winning_hash`` is the round seed the proof actually used
+    (``block_hash`` of the previous winning block). Storing it makes
+    nonce re-derivation self-contained — no chain-state lookup needed,
+    so it stays correct even after the prior winning block is pruned
+    beyond ``BlockHashCount``.
     """
 
     miner: bytes
@@ -116,12 +123,18 @@ class WinningSolution:
     reward: int
     submitted_at: int
     difficulty: SubstrateDifficulty
+    last_winning_hash: bytes
 
     def __post_init__(self) -> None:
         if len(self.miner) != 32:
             raise ValueError(f"miner must be 32 bytes, got {len(self.miner)}")
         if len(self.salt) != 32:
             raise ValueError(f"salt must be 32 bytes, got {len(self.salt)}")
+        if len(self.last_winning_hash) != 32:
+            raise ValueError(
+                "last_winning_hash must be 32 bytes, got "
+                f"{len(self.last_winning_hash)}"
+            )
 
 
 @dataclass(frozen=True)

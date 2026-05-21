@@ -310,21 +310,10 @@ class SubstrateClient:
         missing signer fails fast rather than silently mining under a
         fabricated zero account.
 
-        **Off-by-one note**: The runtime API reads `System::block_number()`
-        and `System::parent_hash()` at the queried block's state. At chain
-        head N that gives `block_number=N`, `parent_hash=hash(N-1)`. The
-        miner's nonce, though, must match what `submit_proof` sees at
-        validation time — when the extrinsic lands in block N+1, where
-        `System::block_number()=N+1` and `System::parent_hash()=hash(N)`.
-
-        We bake that +1 offset into the returned context so
-        `mine_work_item` doesn't need to know about chain timing:
-          - `context.block_number = decoded.block_number + 1`
-          - `context.parent_hash = at` (the head hash, which IS hash(N))
-
-        This only works when `at` is explicit. Callers that pass `at=None`
-        get the raw snapshot values — useful for state probes (Phase 2
-        bootstrap idempotency check) but not for actual mining.
+        The snapshot carries a `last_winning_hash` (the round seed —
+        `block_hash(LastProofBlock)`) which is the only "time" input the
+        miner needs. It's stable across an entire round, so no `at`-vs-head
+        offset is required.
         """
         if len(miner_account_bytes) != 32:
             raise ValueError(
@@ -361,18 +350,8 @@ class SubstrateClient:
         decoded = _decode_mining_snapshot(encoded)
         if decoded is None:
             return None
-        # Apply the +1 offset for mining (see method docstring) when the
-        # caller pinned a specific block hash. Otherwise return raw
-        # snapshot values for state-probe callers.
-        if at is not None:
-            mining_block_number = decoded["block_number"] + 1
-            mining_parent_hash = at
-        else:
-            mining_block_number = decoded["block_number"]
-            mining_parent_hash = decoded["parent_hash"]
         return SubstrateMiningContext(
-            block_number=mining_block_number,
-            parent_hash=mining_parent_hash,
+            last_winning_hash=decoded["last_winning_hash"],
             topology_hash=decoded["topology_hash"],
             nodes=decoded["nodes"],
             edges=decoded["edges"],
@@ -1415,10 +1394,9 @@ def _decode_compact_u32(data: ScaleBytes) -> int:
 def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
     """Decode SCALE ``Option<MiningSnapshot<...>>`` from the runtime API.
 
-    Layout (post-MR-!20):
+    Layout:
       - 1 byte option tag (0x00 = None, 0x01 = Some)
-      - block_number: u32 (BlockNumber on this chain)
-      - parent_hash: H256 (32 bytes)
+      - last_winning_hash: H256 (32 bytes) — `block_hash(LastProofBlock)`
       - difficulty: DifficultyConfig {min_solutions: u32,
             max_energy_milli: i64, min_diversity_milli: u32,
             min_quality_milli: u32}
@@ -1444,8 +1422,9 @@ def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
                     f"{data.get_remaining_length()} bytes"
                 )
             return None
-        block_number = _decode_field("block_number", data, _decode_u32)
-        parent_hash = _decode_field("parent_hash", data, lambda d: _read_exact(d, 32))
+        last_winning_hash = _decode_field(
+            "last_winning_hash", data, lambda d: _read_exact(d, 32)
+        )
         difficulty = _decode_difficulty_config(data)
         topology_hash = _decode_field("topology_hash", data, lambda d: _read_exact(d, 32))
         nodes_len = _decode_field("nodes_len", data, _decode_compact_u32)
@@ -1476,8 +1455,7 @@ def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
             "changed"
         )
     return {
-        "block_number": block_number,
-        "parent_hash": parent_hash,
+        "last_winning_hash": last_winning_hash,
         "difficulty": difficulty,
         "topology_hash": topology_hash,
         "nodes": nodes,
@@ -1501,6 +1479,7 @@ def _decode_winning_solution_with_nonce(
       - solution.reward: u128 (Balance)
       - solution.submitted_at: BlockNumber (u32)
       - solution.difficulty: DifficultyConfig
+      - solution.last_winning_hash: H256 (round seed the proof used)
       - nonce: U256 (little-endian on the wire; reversed to recover the
         BLAKE3 digest order Python miners use)
     """
@@ -1520,6 +1499,9 @@ def _decode_winning_solution_with_nonce(
         reward = _decode_field("reward", data, _decode_u128)
         submitted_at = _decode_field("submitted_at", data, _decode_u32)
         difficulty = _decode_difficulty_config(data)
+        last_winning_hash = _decode_field(
+            "last_winning_hash", data, lambda d: _read_exact(d, 32)
+        )
         nonce = _decode_field("nonce", data, _decode_u256_le)
     except ValueError:
         raise
@@ -1538,6 +1520,7 @@ def _decode_winning_solution_with_nonce(
             reward=reward,
             submitted_at=submitted_at,
             difficulty=difficulty,
+            last_winning_hash=last_winning_hash,
         ),
         nonce=nonce,
     )

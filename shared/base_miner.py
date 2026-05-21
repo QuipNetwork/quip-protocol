@@ -346,7 +346,7 @@ class BaseMiner(ABC):
         - ``SubstrateMiningContext`` (PoW path) — identity is the SCALE
           ``AccountId32`` in ``miner_account_bytes``; the loop derives a
           fresh nonce per iteration via
-          ``derive_nonce(parent_hash, miner, block_number, salt)`` and
+          ``derive_nonce(last_winning_hash, miner, salt)`` and
           regenerates ``(h, J)`` from it (`generate_ising_model_from_nonce`).
           The chain checks this exact derivation in ``submit_proof``.
         - ``MempoolJobContext`` (mempool path) — identity is the
@@ -630,8 +630,7 @@ class BaseMiner(ABC):
             )
         else:
             self.logger.info(
-                f"mine_work_item: block_number={context.block_number} "
-                f"parent=0x{context.parent_hash.hex()[:16]}... "
+                f"mine_work_item: round_seed=0x{context.last_winning_hash.hex()[:16]}... "
                 f"topology=0x{context.topology_hash.hex()[:16]}... "
                 f"nodes={len(context.nodes)} edges={len(context.edges)}"
             )
@@ -677,7 +676,7 @@ def _work_tag(context: WorkContext) -> str:
     """Short identifier for a work context, used in per-iteration log lines."""
     if isinstance(context, MempoolJobContext):
         return f"order={context.order_id}"
-    return f"block={context.block_number}"
+    return f"round_seed=0x{context.last_winning_hash.hex()[:16]}"
 
 
 
@@ -709,11 +708,15 @@ class _BridgePrevBlock:
                 header=_BridgePrevBlockHeader(index=context.order_id),
                 hash=b"\x00" * 32,
             )
-        # PoW: `cur_index = prev_block.header.index + 1` is what the legacy
-        # subclasses compute, so pre-subtract 1 here to keep the +1 dance.
+        # PoW: the nonce no longer depends on `prev_block.header.index`
+        # (the round-seed contract replaced the block-number input), so
+        # this index is now a non-binding placeholder for legacy subclass
+        # hooks that read it for logging or budget checks. `hash` carries
+        # the round seed so any hook needing a stable per-round identifier
+        # still gets a meaningful 32-byte value.
         return cls(
-            header=_BridgePrevBlockHeader(index=context.block_number - 1),
-            hash=context.parent_hash,
+            header=_BridgePrevBlockHeader(index=0),
+            hash=context.last_winning_hash,
         )
 
 

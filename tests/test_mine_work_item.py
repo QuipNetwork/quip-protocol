@@ -60,8 +60,7 @@ def relaxed_context(cpu_miner) -> SubstrateMiningContext:
     via `Sudo.set_difficulty`, just scaled down so we don't wait minutes.
     """
     return SubstrateMiningContext(
-        block_number=1,
-        parent_hash=b"\xab" * 32,
+        last_winning_hash=b"\xab" * 32,
         topology_hash=b"\xcd" * 32,
         nodes=list(cpu_miner.sampler.nodes),
         edges=[(int(u), int(v)) for u, v in cpu_miner.sampler.edges],
@@ -80,9 +79,10 @@ def relaxed_context(cpu_miner) -> SubstrateMiningContext:
 
 def test_bridge_prev_block_carries_substrate_fields(relaxed_context):
     bridge = _BridgePrevBlock.from_work_context(relaxed_context)
-    # cur_index = prev_block.header.index + 1 must equal context.block_number
-    assert bridge.header.index + 1 == relaxed_context.block_number
-    assert bridge.hash == relaxed_context.parent_hash
+    # PoW: header.index is a placeholder (0) since the nonce no longer
+    # depends on a block-number input; hash carries the round seed.
+    assert bridge.header.index == 0
+    assert bridge.hash == relaxed_context.last_winning_hash
 
 
 def test_bridge_node_info_exposes_hex_account(relaxed_context):
@@ -125,8 +125,7 @@ def test_bridge_node_info_handles_mempool_context():
 def test_requirements_from_context_pow_path():
     """`requirements_from_context` maps PoW milli fields to float requirements."""
     ctx = SubstrateMiningContext(
-        block_number=1,
-        parent_hash=b"\xab" * 32,
+        last_winning_hash=b"\xab" * 32,
         topology_hash=b"\xcd" * 32,
         nodes=[0, 1, 2],
         edges=[(0, 1), (1, 2)],
@@ -221,9 +220,8 @@ def test_resolve_ising_pow_uses_derive_nonce(relaxed_context, cpu_miner):
     sampler_nodes = list(cpu_miner.sampler.nodes)
     sampler_edges = list(cpu_miner.sampler.edges)
     legacy_nonce = derive_nonce(
-        relaxed_context.parent_hash,
+        relaxed_context.last_winning_hash,
         relaxed_context.miner_account_bytes,
-        relaxed_context.block_number,
         salt,
     )
     legacy_h, legacy_J = generate_ising_model_from_nonce(
@@ -317,8 +315,7 @@ def test_mine_work_item_observes_stop_event(cpu_miner, relaxed_context):
     None within one polling cycle. Mirrors how the controller cancels work
     on a new chain head."""
     impossibly_hard = SubstrateMiningContext(
-        block_number=relaxed_context.block_number,
-        parent_hash=relaxed_context.parent_hash,
+        last_winning_hash=relaxed_context.last_winning_hash,
         topology_hash=relaxed_context.topology_hash,
         nodes=relaxed_context.nodes,
         edges=relaxed_context.edges,
@@ -518,17 +515,16 @@ def test_miner_handle_dispatches_mine_work_item(relaxed_context):
 
 
 def test_mine_work_item_nonce_matches_chain_derivation(cpu_miner, relaxed_context):
-    """The produced nonce must equal `derive_nonce(parent_hash,
-    miner_account_bytes, block_number, salt)` — byte-exact against the
-    Rust pallet's validation derivation. A regression that accidentally
-    uses the legacy `ising_nonce_from_block` (string identity) would
-    silently produce proofs the chain rejects."""
+    """The produced nonce must equal `derive_nonce(last_winning_hash,
+    miner_account_bytes, salt)` — byte-exact against the Rust pallet's
+    validation derivation. A regression that accidentally uses the legacy
+    `ising_nonce_from_block` (string identity) would silently produce
+    proofs the chain rejects."""
     stop = mp.Event()
     result = cpu_miner.mine_work_item(relaxed_context, stop)
     expected = derive_nonce(
-        relaxed_context.parent_hash,
+        relaxed_context.last_winning_hash,
         relaxed_context.miner_account_bytes,
-        relaxed_context.block_number,
         result.salt,
     )
     assert result.nonce == expected
@@ -545,8 +541,7 @@ def test_miner_handle_emits_work_item_done_sentinel_on_cancel(relaxed_context):
     handle = MinerHandle(spec=spec)
     try:
         impossibly_hard = SubstrateMiningContext(
-            block_number=relaxed_context.block_number,
-            parent_hash=relaxed_context.parent_hash,
+            last_winning_hash=relaxed_context.last_winning_hash,
             topology_hash=relaxed_context.topology_hash,
             nodes=relaxed_context.nodes,
             edges=relaxed_context.edges,

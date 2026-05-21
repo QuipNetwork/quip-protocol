@@ -153,10 +153,11 @@ class MetalMiner(BaseMiner):
         cur_index = prev_block.header.index + 1
         budget = self._scheduler.get_core_budget()
 
+        # `prev_block.hash` is the round seed (`last_winning_hash` — see
+        # `_BridgePrevBlock.from_work_context` in base_miner.py).
         self._feeder = IsingFeeder(
-            parent_hash=prev_block.hash,
+            last_winning_hash=prev_block.hash,
             miner_bytes=node_info.miner_account_bytes,
-            block_number=cur_index,
             nodes=self.sampler.nodes,
             edges=self.sampler.edges,
             buffer_size=budget * 2,

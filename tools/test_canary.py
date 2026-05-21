@@ -441,7 +441,7 @@ def run_canary_test(
         miner_bytes = hashlib.blake2b(
             f"canary-test-{seed}".encode(), digest_size=32,
         ).digest()
-        nonce = derive_nonce(prev_block.hash, miner_bytes, 1, salt)
+        nonce = derive_nonce(prev_block.hash, miner_bytes, salt)
 
         # Generate Ising model
         h, J = generate_ising_model_from_nonce(nonce, nodes, edges)

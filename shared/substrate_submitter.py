@@ -115,11 +115,11 @@ async def submit_proof(
     # encode_quantum_proof). The raw bytes/lists are at index 0 of each.
     logger.info(
         "submitting QuantumPow.submit_proof: nonce=0x%s... salt=0x%s... "
-        "solutions=%d block=%d topology_hash=%s",
+        "solutions=%d round_seed=0x%s... topology_hash=%s",
         result.nonce.hex()[:16],
         result.salt.hex()[:8],
         len(proof["solutions"][0]),
-        context.block_number,
+        context.last_winning_hash.hex()[:16],
         proof["topology_hash"],
     )
     return await client.submit_extrinsic(

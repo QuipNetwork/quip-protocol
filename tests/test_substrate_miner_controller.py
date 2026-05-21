@@ -64,14 +64,12 @@ _TER_SPEC = AllowedValueSet((-1000, 0, 1000))
 
 
 def _context(
-    block_number: int,
-    parent_hash: bytes,
+    last_winning_hash: bytes,
     *,
     topology_hash: bytes = b"\xcd" * 32,
 ) -> SubstrateMiningContext:
     return SubstrateMiningContext(
-        block_number=block_number,
-        parent_hash=parent_hash,
+        last_winning_hash=last_winning_hash,
         topology_hash=topology_hash,
         nodes=[0, 1, 2, 3],
         edges=[(0, 1), (1, 2), (2, 3)],
@@ -185,15 +183,17 @@ def test_classify_outcome_compares_equal_to_string_literal():
 # ----------------------------------------------------------------------
 
 
-async def test_handle_result_drops_stale_envelope_block_number():
-    """A result whose context.block_number != current_context.block_number
-    should be dropped without calling submit_proof."""
+async def test_handle_result_drops_stale_envelope_round_seed():
+    """A result whose context.last_winning_hash differs from
+    current_context.last_winning_hash should be dropped without calling
+    submit_proof — the round has rolled over and the proof is built
+    against the wrong nonce."""
     controller = _bare_controller()
-    _set_current(controller, _context(100, b"\xaa" * 32))
+    _set_current(controller, _context(b"\xaa" * 32))
 
     envelope = _ResultEnvelope(
         result=_mining_result(),
-        context=_context(99, b"\xbb" * 32),  # stale: different block_number
+        context=_context(b"\xbb" * 32),  # stale: different round seed
         handle_id="test-0",
     )
     await controller._handle_result(envelope)
@@ -201,30 +201,15 @@ async def test_handle_result_drops_stale_envelope_block_number():
     assert controller.stats.proofs_submitted == 0
 
 
-async def test_handle_result_drops_stale_envelope_parent_hash_only():
-    """A result whose context.parent_hash differs but block_number matches
-    (forked chain scenario) should still be dropped."""
-    controller = _bare_controller()
-    _set_current(controller, _context(100, b"\xaa" * 32))
-
-    envelope = _ResultEnvelope(
-        result=_mining_result(),
-        context=_context(100, b"\xff" * 32),  # same block, different parent
-        handle_id="test-0",
-    )
-    await controller._handle_result(envelope)
-    assert controller.stats.stale_drops == 1
-
-
 async def test_handle_result_drops_stale_envelope_topology_hash():
     """A result whose topology_hash differs should be dropped — a
     governance rotation within the block window must not pass through."""
     controller = _bare_controller()
-    _set_current(controller, _context(100, b"\xaa" * 32, topology_hash=b"\x11" * 32))
+    _set_current(controller, _context(b"\xaa" * 32, topology_hash=b"\x11" * 32))
 
     envelope = _ResultEnvelope(
         result=_mining_result(),
-        context=_context(100, b"\xaa" * 32, topology_hash=b"\x22" * 32),
+        context=_context(b"\xaa" * 32, topology_hash=b"\x22" * 32),
         handle_id="test-0",
     )
     await controller._handle_result(envelope)
@@ -239,7 +224,7 @@ async def test_handle_result_drops_when_current_context_none():
 
     envelope = _ResultEnvelope(
         result=_mining_result(),
-        context=_context(100, b"\xaa" * 32),
+        context=_context(b"\xaa" * 32),
         handle_id="test-0",
     )
     await controller._handle_result(envelope)
@@ -259,7 +244,7 @@ async def test_handle_result_raises_on_fatal_receipt(monkeypatch):
     fatal leaves the miner mining forever against a chain it can't
     submit to."""
     controller = _bare_controller()
-    ctx = _context(100, b"\xaa" * 32)
+    ctx = _context(b"\xaa" * 32)
     _set_current(controller, ctx)
 
     async def fake_submit_proof(*args, **kwargs):
@@ -284,7 +269,7 @@ async def test_handle_result_records_rpc_error_text(monkeypatch):
     """When `submit_proof` raises an RPC exception, the controller should
     log+count it AND stash the error text on stats for telemetry."""
     controller = _bare_controller()
-    ctx = _context(100, b"\xaa" * 32)
+    ctx = _context(b"\xaa" * 32)
     _set_current(controller, ctx)
 
     async def fake_submit_proof(*args, **kwargs):
@@ -312,8 +297,8 @@ async def test_dispatch_tracking_pairs_result_with_handle_context(monkeypatch):
     newer `_current_context`. Otherwise the staleness check classifies a
     legitimately-old result as fresh and submits it against the wrong nonce."""
     controller = _bare_controller()
-    old_ctx = _context(100, b"\xaa" * 32)
-    new_ctx = _context(101, b"\xbb" * 32)
+    old_ctx = _context(b"\xaa" * 32)
+    new_ctx = _context(b"\xbb" * 32)
     _set_current(controller, new_ctx)  # controller moved on
     # Old dispatch's immutable context (what the drainer would look up
     # by (handle_id, dispatch_id) and attach to the envelope).
@@ -354,7 +339,7 @@ async def test_handle_result_raises_on_encoder_value_error(monkeypatch):
     not a transient RPC blip — must NOT be silently swallowed by the
     submit_proof except-Exception catch."""
     controller = _bare_controller()
-    ctx = _context(100, b"\xaa" * 32)
+    ctx = _context(b"\xaa" * 32)
     _set_current(controller, ctx)
 
     def fake_encode(result, context):
@@ -418,7 +403,7 @@ async def test_handle_head_topology_hash_mismatch_raises():
     controller = _bare_controller()
     controller.topology_hash = b"\xaa" * 32  # pinned
     controller.client.get_mining_snapshot = AsyncMock(
-        return_value=_context(100, b"\xff" * 32, topology_hash=b"\xbb" * 32)
+        return_value=_context(b"\xff" * 32, topology_hash=b"\xbb" * 32)
     )
     controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
 
@@ -453,7 +438,7 @@ async def test_handle_head_resets_consecutive_none_on_success():
     controller = _bare_controller()
     controller._consecutive_none_snapshots = 3  # simulate prior blips
     controller.client.get_mining_snapshot = AsyncMock(
-        return_value=_context(100, b"\xff" * 32)
+        return_value=_context(b"\xff" * 32)
     )
     controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
     controller.miner_handles = []  # no dispatch needed for this path
@@ -907,7 +892,7 @@ async def test_handle_result_cancels_siblings_on_ok(monkeypatch):
     keep mining the same context and submitting redundant proofs that
     the chain rejects but our RPC still has to process."""
     controller = _bare_controller()
-    ctx = _context(100, b"\xaa" * 32)
+    ctx = _context(b"\xaa" * 32)
     _set_current(controller, ctx)
 
     winner = _FakeHandle("winner")
@@ -942,7 +927,7 @@ async def test_handle_result_drops_duplicate_after_ok(monkeypatch):
     is the belt-and-suspenders behind sibling-cancel for results that
     were already in flight when the first OK landed."""
     controller = _bare_controller()
-    ctx = _context(100, b"\xaa" * 32)
+    ctx = _context(b"\xaa" * 32)
     _set_current(controller, ctx)
     controller.miner_handles = [_FakeHandle("winner"), _FakeHandle("late")]
 
@@ -984,8 +969,8 @@ async def test_handle_result_pairs_late_result_with_dispatch_context(monkeypatch
     handle's currently-active context. Verified through the immutable
     `_dispatch_contexts[(handle_id, dispatch_id)]` map."""
     controller = _bare_controller()
-    old_ctx = _context(100, b"\xaa" * 32)
-    new_ctx = _context(101, b"\xbb" * 32)
+    old_ctx = _context(b"\xaa" * 32)
+    new_ctx = _context(b"\xbb" * 32)
     _set_current(controller, new_ctx)
     controller._dispatch_contexts[("slow-handle", 1)] = old_ctx
     controller._dispatch_contexts[("slow-handle", 2)] = new_ctx
@@ -993,7 +978,7 @@ async def test_handle_result_pairs_late_result_with_dispatch_context(monkeypatch
     # Look up by dispatch_id=1 (the cancelled one) — must yield old_ctx.
     looked_up = controller._dispatch_contexts[("slow-handle", 1)]
     assert looked_up is old_ctx
-    assert looked_up.block_number == 100
+    assert looked_up.last_winning_hash == b"\xaa" * 32
 
     # And the envelope built from that lookup is a stale result the
     # controller drops via the work-key check.

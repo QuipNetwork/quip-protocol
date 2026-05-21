@@ -74,39 +74,37 @@ def _to_nonce_bytes(nonce: Union[int, bytes]) -> bytes:
 
 
 def derive_nonce(
-    parent_hash: bytes,
+    last_winning_hash: bytes,
     miner: bytes,
-    block_number: int,
     salt: bytes,
 ) -> bytes:
     """Derive the canonical 32-byte PoW nonce.
 
-    Mirrors ``quantum_validation::derive_nonce`` in ``quip-protocol-rs``
-    (post-MR-!20). Inputs are fixed-size 32-byte buffers so the PoW search
-    space is statically known and identical across every call:
+    Mirrors ``quantum_validation::derive_nonce`` in ``quip-protocol-rs``.
+    Inputs are three fixed-size 32-byte buffers so the PoW search space is
+    statically known and identical across every call:
 
-    - ``parent_hash`` — block header parent hash, 32 bytes
+    - ``last_winning_hash`` — ``block_hash(LastProofBlock)``, the header
+      hash of the most recent winning block. Stable across the entire
+      round (only changes on the next win), so miner submissions don't
+      race the txpool / executing-block-number.
     - ``miner`` — 32-byte canonical miner identity (typically
       ``blake2_256(SCALE(account_id))``)
-    - ``block_number`` — current block height (u32)
     - ``salt`` — the only freely-chosen miner input, 32 bytes
 
     Returns the full 256-bit BLAKE3 digest as raw bytes. No truncation.
     """
-    if len(parent_hash) != 32:
-        raise ValueError(f"parent_hash must be 32 bytes, got {len(parent_hash)}")
+    if len(last_winning_hash) != 32:
+        raise ValueError(
+            f"last_winning_hash must be 32 bytes, got {len(last_winning_hash)}"
+        )
     if len(miner) != 32:
         raise ValueError(f"miner must be 32 bytes, got {len(miner)}")
     if len(salt) != 32:
         raise ValueError(f"salt must be 32 bytes, got {len(salt)}")
-    if not (0 <= block_number < 2**32):
-        raise ValueError(
-            f"block_number must be a u32 (0..2^32-1), got {block_number}"
-        )
     hasher = blake3()
-    hasher.update(parent_hash)
+    hasher.update(last_winning_hash)
     hasher.update(miner)
-    hasher.update(block_number.to_bytes(4, "big"))
     hasher.update(salt)
     return hasher.digest()
 

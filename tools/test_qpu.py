@@ -152,7 +152,7 @@ def generate_nonce(seed: int, topology) -> Tuple[str, Dict]:
     miner_bytes = hashlib.blake2b(
         f"qpu-test-{seed}".encode(), digest_size=32,
     ).digest()
-    nonce = derive_nonce(prev_block.hash, miner_bytes, 1, salt)
+    nonce = derive_nonce(prev_block.hash, miner_bytes, salt)
 
     nodes = list(topology.nodes)
     edges = list(topology.edges)
