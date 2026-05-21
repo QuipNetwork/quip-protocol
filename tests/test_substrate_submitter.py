@@ -42,7 +42,6 @@ def _make_context(**overrides) -> SubstrateMiningContext:
             min_solutions=5,
             max_energy_milli=-4_100_000,
             min_diversity_milli=150,
-            min_quality_milli=900,
         ),
         miner_account_bytes=b"\x33" * 32,
         allowed_h_values=_TER_SPEC,

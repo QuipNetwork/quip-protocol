@@ -124,7 +124,6 @@ DEFAULT_SEED_DIFFICULTY = SubstrateDifficulty(
     min_solutions=5,
     max_energy_milli=-2_500_000,   # -2500.0
     min_diversity_milli=200,        # 0.2
-    min_quality_milli=0,            # no quality floor on dev chain
 )
 
 # Minimum balance before bootstrap considers the account funded. Miner
@@ -266,12 +265,10 @@ async def _maybe_seed_chain(
             # never invisible. Production CLI doesn't expose the flag.
             logger.warning(
                 "force-reseeding QuantumPow.Difficulty via sudo: "
-                "min_solutions=%d max_energy_milli=%d min_diversity_milli=%d "
-                "min_quality_milli=%d",
+                "min_solutions=%d max_energy_milli=%d min_diversity_milli=%d",
                 config.seed_difficulty.min_solutions,
                 config.seed_difficulty.max_energy_milli,
                 config.seed_difficulty.min_diversity_milli,
-                config.seed_difficulty.min_quality_milli,
             )
         else:
             logger.info("seeding QuantumPow.Difficulty via sudo (first time)")
@@ -366,7 +363,6 @@ def _difficulty_to_dict(d: SubstrateDifficulty) -> dict:
         "min_solutions": d.min_solutions,
         "max_energy_milli": d.max_energy_milli,
         "min_diversity_milli": d.min_diversity_milli,
-        "min_quality_milli": d.min_quality_milli,
     }
 
 

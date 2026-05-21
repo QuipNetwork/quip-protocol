@@ -132,5 +132,4 @@ async def test_query_difficulty_either_returns_or_none(client):
             difficulty.min_solutions,
             difficulty.max_energy_milli,
             difficulty.min_diversity_milli,
-            difficulty.min_quality_milli,
         ]), "query_difficulty returned all-zeros struct; storage is empty"

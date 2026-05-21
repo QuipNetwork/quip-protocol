@@ -74,7 +74,6 @@ def _build_snapshot_hex(
     parts.append(difficulty.min_solutions.to_bytes(4, "little"))
     parts.append(difficulty.max_energy_milli.to_bytes(8, "little", signed=True))
     parts.append(difficulty.min_diversity_milli.to_bytes(4, "little"))
-    parts.append(difficulty.min_quality_milli.to_bytes(4, "little"))
     parts.append(topology_hash)
     parts.append(_encode_compact_u32(len(nodes)))
     for n in nodes:
@@ -100,7 +99,6 @@ def test_decode_populated():
         min_solutions=5,
         max_energy_milli=-4100_000,
         min_diversity_milli=150,
-        min_quality_milli=900,
     )
     nodes = [0, 1, 2, 3]
     edges = [(0, 1), (1, 2), (2, 3)]
@@ -129,7 +127,7 @@ def test_decode_mixed_spec_variants():
     """Decoder correctly handles a mix of Set / IntegerRange / ContinuousRange."""
     encoded = _build_snapshot_hex(
         last_winning_hash=b"\x00" * 32,
-        difficulty=SubstrateDifficulty(1, -100, 0, 0),
+        difficulty=SubstrateDifficulty(1, -100, 0),
         topology_hash=b"\xcd" * 32,
         nodes=[0, 1],
         edges=[(0, 1)],
@@ -152,7 +150,7 @@ def test_decode_zephyr_sized_graph():
     edges = [(i, i + 1) for i in range(1367)]
     encoded = _build_snapshot_hex(
         last_winning_hash=b"\x10" * 32,
-        difficulty=SubstrateDifficulty(5, -4_100_000, 150, 900),
+        difficulty=SubstrateDifficulty(5, -4_100_000, 150),
         topology_hash=b"\x20" * 32,
         nodes=nodes,
         edges=edges,
@@ -218,7 +216,7 @@ async def test_get_mining_snapshot_returns_round_seed():
     seed = b"\xab" * 32
     encoded = _build_snapshot_hex(
         last_winning_hash=seed,
-        difficulty=SubstrateDifficulty(1, -1000, 0, 0),
+        difficulty=SubstrateDifficulty(1, -1000, 0),
         topology_hash=b"\xcd" * 32,
         nodes=[0, 1, 2, 3],
         edges=[(0, 1), (1, 2), (2, 3)],
@@ -241,7 +239,7 @@ async def test_get_mining_snapshot_at_none_returns_same_seed():
     seed = b"\x99" * 32
     encoded = _build_snapshot_hex(
         last_winning_hash=seed,
-        difficulty=SubstrateDifficulty(1, -1000, 0, 0),
+        difficulty=SubstrateDifficulty(1, -1000, 0),
         topology_hash=b"\xcd" * 32,
         nodes=[0, 1, 2, 3],
         edges=[(0, 1), (1, 2), (2, 3)],

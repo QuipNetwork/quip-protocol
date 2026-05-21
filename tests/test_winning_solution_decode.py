@@ -30,7 +30,6 @@ def _encode_difficulty(d: SubstrateDifficulty) -> bytes:
         d.min_solutions.to_bytes(4, "little")
         + d.max_energy_milli.to_bytes(8, "little", signed=True)
         + d.min_diversity_milli.to_bytes(4, "little")
-        + d.min_quality_milli.to_bytes(4, "little")
     )
 
 
@@ -75,7 +74,6 @@ def test_decode_winning_solution_round_trip():
         min_solutions=5,
         max_energy_milli=-4_100_000,
         min_diversity_milli=150,
-        min_quality_milli=900,
     )
     encoded = _build_winning_solution_hex(
         miner=miner,
@@ -114,7 +112,7 @@ def test_decode_winning_solution_trailing_bytes_rejected():
         energy_milli=0,
         reward=0,
         submitted_at=1,
-        difficulty=SubstrateDifficulty(1, 0, 0, 0),
+        difficulty=SubstrateDifficulty(1, 0, 0),
         last_winning_hash=b"\x03" * 32,
         nonce=nonce,
     )
@@ -133,7 +131,7 @@ def test_decode_winning_solution_short_read_surfaces_field_name():
         energy_milli=0,
         reward=0,
         submitted_at=1,
-        difficulty=SubstrateDifficulty(1, 0, 0, 0),
+        difficulty=SubstrateDifficulty(1, 0, 0),
         last_winning_hash=b"\x03" * 32,
         nonce=b"\x02" * 32,
     )
@@ -151,7 +149,6 @@ def test_decode_difficulty_config_matches_storage_shape():
         min_solutions=7,
         max_energy_milli=-3_500_000,
         min_diversity_milli=200,
-        min_quality_milli=850,
     )
     data = ScaleBytes("0x" + _encode_difficulty(expected).hex())
     assert _decode_difficulty_config(data) == expected

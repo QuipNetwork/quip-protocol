@@ -404,7 +404,6 @@ class SubstrateClient:
             min_solutions=int(v["min_solutions"]),
             max_energy_milli=int(v["max_energy_milli"]),
             min_diversity_milli=int(v["min_diversity_milli"]),
-            min_quality_milli=int(v["min_quality_milli"]),
         )
 
     async def query_current_difficulty(
@@ -1333,12 +1332,10 @@ def _decode_difficulty_config(data: ScaleBytes) -> "SubstrateDifficulty":
     min_solutions = _decode_field("min_solutions", data, _decode_u32)
     max_energy_milli = _decode_field("max_energy_milli", data, _decode_i64)
     min_diversity_milli = _decode_field("min_diversity_milli", data, _decode_u32)
-    min_quality_milli = _decode_field("min_quality_milli", data, _decode_u32)
     return SubstrateDifficulty(
         min_solutions=min_solutions,
         max_energy_milli=max_energy_milli,
         min_diversity_milli=min_diversity_milli,
-        min_quality_milli=min_quality_milli,
     )
 
 
@@ -1398,8 +1395,7 @@ def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
       - 1 byte option tag (0x00 = None, 0x01 = Some)
       - last_winning_hash: H256 (32 bytes) — `block_hash(LastProofBlock)`
       - difficulty: DifficultyConfig {min_solutions: u32,
-            max_energy_milli: i64, min_diversity_milli: u32,
-            min_quality_milli: u32}
+            max_energy_milli: i64, min_diversity_milli: u32}
       - topology_hash: H256 (32 bytes)
       - nodes: Vec<u32>
       - edges: Vec<(u32, u32)>

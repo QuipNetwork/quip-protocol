@@ -73,7 +73,7 @@ def _context(
         topology_hash=topology_hash,
         nodes=[0, 1, 2, 3],
         edges=[(0, 1), (1, 2), (2, 3)],
-        difficulty=SubstrateDifficulty(1, 0, 0, 0),
+        difficulty=SubstrateDifficulty(1, 0, 0),
         miner_account_bytes=b"\x42" * 32,
         allowed_h_values=_TER_SPEC,
         allowed_j_values=_BIN_SPEC,

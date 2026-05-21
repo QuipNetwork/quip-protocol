@@ -37,7 +37,6 @@ class SubstrateDifficulty:
     min_solutions: int
     max_energy_milli: int
     min_diversity_milli: int
-    min_quality_milli: int
 
     @property
     def max_energy(self) -> float:
@@ -48,11 +47,6 @@ class SubstrateDifficulty:
     def min_diversity(self) -> float:
         """Diversity floor as a float in [0, 1]."""
         return self.min_diversity_milli / 1000.0
-
-    @property
-    def min_quality(self) -> float:
-        """Quality floor as a float in [0, 1]."""
-        return self.min_quality_milli / 1000.0
 
 
 @dataclass(frozen=True)
