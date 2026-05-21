@@ -177,26 +177,21 @@ def miner_worker_main(
         elif op == "get_stats":
             data = miner.get_stats()
             resp_q.put({"op": "stats", "data": data, "id": spec.get("id")})
-        elif op == "stop_mining":
-            # Redundant with the parent's direct set(), but keeps the op
-            # available for callers that only have the request queue.
-            stop_event.set()
         elif op == "mine_work_item":
-            # Substrate-mode entry point. The controller (Phase 4) pushes a
-            # SubstrateMiningContext through the request queue; the worker
-            # hands it to BaseMiner.mine_work_item which runs the
-            # protocol-neutral search loop.
+            # Substrate-mode entry point. The controller pushes a
+            # SubstrateMiningContext (or MempoolJobContext) through the
+            # request queue; the worker hands it to
+            # BaseMiner.mine_work_item which runs the protocol-neutral
+            # search loop.
             #
-            # Unlike `mine_block`, we always emit *something* on resp_q
-            # after mine_work_item returns — either the MiningResult or a
-            # `{"op": "work_item_done"}` sentinel. The controller uses the
-            # sentinel to synchronize cancellation: cancel() sets the
-            # shared stop_event, the worker exits the loop, pushes the
-            # sentinel, the controller observes it, then dispatches the
-            # next context. Without this ack the controller's
-            # cancel→clear→dispatch cycle can wipe a cancel before the
-            # worker observes it, leaving the worker mining the old
-            # context against a stop_event tied to the new dispatch.
+            # We always emit *something* on resp_q after mine_work_item
+            # returns — either a `mine_result` op wrapping the
+            # MiningResult or a `work_item_done` sentinel. Both responses
+            # carry the same `dispatch_id` the request came in with so
+            # the controller can pair late results with the exact context
+            # they were dispatched against, and reject results from a
+            # dispatch that was already cancelled by the next one.
+            dispatch_id = msg.get("dispatch_id", 0)
             context = msg.get("context")
             if context is None:
                 resp_q.put(
@@ -204,6 +199,7 @@ def miner_worker_main(
                         "op": "error",
                         "message": "Missing context for mine_work_item",
                         "id": spec.get("id"),
+                        "dispatch_id": dispatch_id,
                     }
                 )
                 continue
@@ -220,13 +216,27 @@ def miner_worker_main(
                         "op": "error",
                         "message": f"{type(exc).__name__}: {exc}",
                         "id": spec.get("id"),
+                        "dispatch_id": dispatch_id,
                     }
                 )
             else:
                 if result is not None:
-                    resp_q.put(result)
+                    resp_q.put(
+                        {
+                            "op": "mine_result",
+                            "id": spec.get("id"),
+                            "dispatch_id": dispatch_id,
+                            "result": result,
+                        }
+                    )
                 else:
-                    resp_q.put({"op": "work_item_done", "id": spec.get("id")})
+                    resp_q.put(
+                        {
+                            "op": "work_item_done",
+                            "id": spec.get("id"),
+                            "dispatch_id": dispatch_id,
+                        }
+                    )
         else:
             resp_q.put(
                 {"op": "error", "message": f"Unknown op {op}", "id": spec.get("id")}
@@ -246,6 +256,13 @@ class MinerHandle:
         # mine_block() directly, not via the command queue (which the
         # worker cannot drain while mining).
         self.stop_event: mpsync.Event = mp.Event()
+        # Monotonic generation counter. Bumped on every mine_work_item
+        # dispatch; the worker echoes the id on every response so the
+        # controller can pair a late result with the exact context it
+        # was produced against (rather than whatever's currently
+        # dispatched).
+        self._next_dispatch_id: int = 0
+        self._active_dispatch_id: int = 0
         self.proc: mp.Process = mp.Process(
             target=miner_worker_main,
             args=(self.req, self.resp, spec, self.stop_event, log_queue),
@@ -276,29 +293,47 @@ class MinerHandle:
             return "GPU-CUDA-Gibbs"
         return k.upper()
 
-    def mine_work_item(self, context) -> None:
+    def mine_work_item(self, context) -> int:
         """Dispatch a substrate-mode mining attempt.
 
-        ``context`` is a ``SubstrateMiningContext`` (see ``shared.substrate_types``).
+        ``context`` is a ``SubstrateMiningContext`` or ``MempoolJobContext``.
         Same stop_event semantics as ``mine``: the clear here brackets the
         enqueue so a cancel landing between clear and the worker dequeue
         still short-circuits the worker's loop.
+
+        Returns the dispatch_id assigned to this attempt. Every worker
+        response for this attempt (``mine_result`` / ``work_item_done`` /
+        ``error``) will echo the same id so the caller can pair late
+        results with the right context.
         """
+        self._next_dispatch_id += 1
+        self._active_dispatch_id = self._next_dispatch_id
         self.stop_event.clear()
-        self.req.put({"op": "mine_work_item", "context": context})
+        self.req.put(
+            {
+                "op": "mine_work_item",
+                "context": context,
+                "dispatch_id": self._active_dispatch_id,
+            }
+        )
+        return self._active_dispatch_id
 
     def cancel(self):
         """Cancel the current mining operation.
 
-        Signals the running ``mine_block()`` directly via the shared
-        stop event so the inner loop observes the cancel within one
-        iteration; also enqueues the ``stop_mining`` op so callers
-        operating only on the request queue can still trigger a cancel.
+        Signals the running mining loop directly via the shared
+        ``stop_event`` so the worker observes the cancel within one
+        iteration of its inner loop. We deliberately do NOT also enqueue
+        a ``stop_mining`` op on the request queue: that op can sit in
+        the queue while the worker is busy mining, and then get consumed
+        by a *later* dispatch's clear → mine_work_item → req.get
+        sequence — cancelling the new work with a stale cancel. The
+        ``stop_event`` is the single source of truth for cancellation.
+
         Idempotent — safe to call when the worker is idle (the set is a
-        no-op cleared by the next ``mine()``).
+        no-op cleared by the next ``mine_work_item()``).
         """
         self.stop_event.set()
-        self.req.put({"op": "stop_mining"})
 
     def get_stats(self) -> dict:
         self.req.put({"op": "get_stats"})

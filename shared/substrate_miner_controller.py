@@ -35,9 +35,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import queue as _queue
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Awaitable, Callable, Optional, Protocol
+from typing import Awaitable, Callable, Optional, Protocol, Tuple
 
 from websocket import WebSocketException
 
@@ -74,6 +75,33 @@ class _MinerCoreStats(Protocol):
 # A few in a row at startup is expected (chain may not be seeded yet); ten
 # in a row strongly indicates RPC corruption or a genuinely stuck chain.
 _NONE_SNAPSHOT_FAIL_THRESHOLD = 10
+
+
+# Cap on how many recently-won work keys we remember. Sized for the
+# expected window of late results: a miner with N handles can in the
+# worst case have N-1 pending results land after an OK on the same key,
+# and the head changes every ~6s so older keys are no longer reachable
+# anyway. 16 is generous for the practical N≤8 handle counts.
+_CLOSED_WORK_KEYS_CAP = 16
+
+
+# Per-handle ring buffer of recent dispatch contexts. Indexed by
+# dispatch_id; pruned when older than the most-recent N attempts. Sized
+# to absorb late results from a few cancelled dispatches without ever
+# losing the immutable mapping for an in-flight one.
+_DISPATCH_CONTEXT_RETENTION = 4
+
+
+# A "work key" uniquely identifies the puzzle a context is mining
+# against: same (block_number, parent_hash, topology_hash) means the
+# pallet will derive the same nonce and therefore the same Ising
+# problem. Used both for stale-result detection AND for marking a
+# work item closed/won after an accepted submission.
+WorkKey = Tuple[int, bytes, bytes]
+
+
+def _work_key(ctx: "SubstrateMiningContext") -> WorkKey:
+    return (ctx.block_number, ctx.parent_hash, ctx.topology_hash)
 
 
 # Submission errors that mean "this proof raced a chain state change; drop
@@ -129,6 +157,10 @@ class ControllerStats:
     # from miner_worker.py so callers can spot handles that consistently
     # crash on dispatch.
     miner_errors: dict[str, int] = field(default_factory=dict)
+    # Results dropped because the work key was already won by a prior
+    # sibling submission this head. Distinct from stale_drops (head
+    # changed) — this counts the storm-prevention path.
+    duplicate_result_drops: int = 0
 
 
 @dataclass
@@ -220,11 +252,26 @@ class SubstrateMinerController:
         self.stats = ControllerStats()
 
         self._current_context: Optional[SubstrateMiningContext] = None
-        # Per-handle dispatch tracking. When a result arrives the drainer
-        # pairs it with the context the *handle* was given, not the
-        # controller's latest context. Without this, late results from a
-        # prior head would be silently misclassified as fresh.
-        self._dispatched: dict[str, SubstrateMiningContext] = {}
+        # Per-(handle_id, dispatch_id) immutable context map. Each
+        # mine_work_item dispatch installs a fresh entry; the drainer
+        # pairs results with the exact context they were dispatched
+        # against by looking up (handle_id, dispatch_id) from the
+        # response. Without this immutability, the previous
+        # `_dispatched[handle_id] = ctx` pattern could surface a result
+        # from dispatch N paired with dispatch N+1's context.
+        self._dispatch_contexts: dict[
+            Tuple[str, int], SubstrateMiningContext
+        ] = {}
+        # Current "work key" (block_number, parent_hash, topology_hash).
+        # Set after a successful snapshot fetch; consulted by the
+        # storm-prevention check in _handle_result.
+        self._current_work_key: Optional[WorkKey] = None
+        # LRU set of work keys for which the chain already accepted one
+        # of our proofs this head. Subsequent same-key results from
+        # sibling handles are dropped without resubmission — that's the
+        # actual fix for submission storming. OrderedDict-as-set keeps
+        # eviction simple (popitem(last=False)) and order-aware.
+        self._closed_work_keys: "OrderedDict[WorkKey, None]" = OrderedDict()
         # Latest-only head channel. A slow submit_proof can hold the main
         # loop in `_handle_result` for seconds; during that window the
         # chain advances by multiple blocks. We don't want to dispatch
@@ -239,7 +286,10 @@ class SubstrateMinerController:
         # _await_handle_done pops from it. Using a queue (not an event)
         # so multiple done sentinels don't get coalesced into a single
         # set/clear cycle.
-        self._done_queues: dict[str, asyncio.Queue[None]] = {
+        # Per-handle done-sentinel queue. The drainer pushes the
+        # response's dispatch_id (not None) so _await_handle_done can
+        # block until the *specific* dispatch being cancelled acks.
+        self._done_queues: dict[str, asyncio.Queue[int]] = {
             h.miner_id: asyncio.Queue() for h in miner_handles
         }
         self._shutdown_event = asyncio.Event()
@@ -409,19 +459,33 @@ class SubstrateMinerController:
         # synchronization, cancel() → clear() → dispatch can wipe a cancel
         # before the worker observes it, leaving the worker mining the OLD
         # context against a stop_event tied to the NEW dispatch. The worker
-        # emits a `work_item_done` sentinel when its loop exits with no
-        # result; the drainer surfaces that via _await_handle_done so we
-        # confirm cancellation landed before we re-clear the event.
+        # emits a `work_item_done` sentinel (tagged with the dispatch_id)
+        # when its loop exits with no result; the drainer surfaces that
+        # via _await_handle_done so we confirm cancellation of the
+        # *specific* dispatch we issued before re-clearing the event.
         #
         # Parallel wait (asyncio.gather) keeps total stall to ~0.5s
         # regardless of handle count — sequential waits would block for
         # N×0.5s, significant against a 6s block time.
-        to_drain = [h for h in self.miner_handles if h.miner_id in self._dispatched]
-        for handle in to_drain:
-            handle.cancel()
-        if to_drain:
+        to_drain = [
+            h for h in self.miner_handles
+            if h._active_dispatch_id != 0 and not h.stop_event.is_set()
+        ]
+        cancelled_dispatches: list[tuple[MinerHandle, int]] = []
+        for handle in self.miner_handles:
+            if handle._active_dispatch_id != 0:
+                cancelled_dispatches.append(
+                    (handle, handle._active_dispatch_id)
+                )
+                handle.cancel()
+        if cancelled_dispatches:
             await asyncio.gather(
-                *[self._await_handle_done(h, timeout=0.5) for h in to_drain]
+                *[
+                    self._await_handle_done(
+                        h, dispatch_id=did, timeout=0.5,
+                    )
+                    for h, did in cancelled_dispatches
+                ]
             )
 
         # Post-MR-!20: the on-chain `derive_nonce` hashes the SCALE-encoded
@@ -467,6 +531,7 @@ class SubstrateMinerController:
             )
 
         self._current_context = context
+        self._current_work_key = _work_key(context)
         logger.info(
             "new head: block=%d hash=0x%s... topology=0x%s... nodes=%d edges=%d",
             context.block_number,
@@ -477,12 +542,14 @@ class SubstrateMinerController:
         )
 
         # Dispatch the new context to every handle. Each one will generate
-        # its own salts and explore the search space independently. Track
-        # what was dispatched per handle so late results pair with the
-        # right context (not whatever's current at receive-time).
+        # its own salts and explore the search space independently. The
+        # dispatch_id returned by mine_work_item keys an immutable
+        # (handle_id, dispatch_id) → context map so late results from a
+        # cancelled dispatch can still find their original context.
         for handle in self.miner_handles:
-            self._dispatched[handle.miner_id] = context
-            handle.mine_work_item(context)
+            dispatch_id = handle.mine_work_item(context)
+            self._dispatch_contexts[(handle.miner_id, dispatch_id)] = context
+            self._prune_dispatch_contexts(handle.miner_id, dispatch_id)
         self.stats.contexts_dispatched += len(self.miner_handles)
         if self.core is not None:
             # One attempt per head, regardless of how many handles fanned out.
@@ -490,23 +557,40 @@ class SubstrateMinerController:
 
     async def _handle_result(self, envelope: _ResultEnvelope) -> None:
         self.stats.results_received += 1
+        envelope_key = _work_key(envelope.context)
+
+        # Storm prevention: if we already submitted an accepted proof
+        # for this work key this head, drop sibling/duplicate results
+        # without re-submitting. Distinct from the stale check below —
+        # there the head has moved on; here the head is still current
+        # but we've already won it. Without this, every additional
+        # handle for the same context fires another submit_proof and
+        # spams the chain (and our RPC) with redundant work.
+        if envelope_key in self._closed_work_keys:
+            self.stats.duplicate_result_drops += 1
+            logger.info(
+                "dropping duplicate result from %s: work_key already won "
+                "(block=%d)",
+                envelope.handle_id,
+                envelope.context.block_number,
+            )
+            return
+
         # Drop results produced against a stale context. The controller
         # already moved on to a new head; the chain would reject this proof.
         # topology_hash is included so a governance call that rotates the
         # topology within a single block doesn't slip through as a
         # block/parent-match.
         if (
-            self._current_context is None
-            or envelope.context.block_number != self._current_context.block_number
-            or envelope.context.parent_hash != self._current_context.parent_hash
-            or envelope.context.topology_hash != self._current_context.topology_hash
+            self._current_work_key is None
+            or envelope_key != self._current_work_key
         ):
             self.stats.stale_drops += 1
             logger.info(
                 "dropping stale result from %s: block=%d (current=%s)",
                 envelope.handle_id,
                 envelope.context.block_number,
-                getattr(self._current_context, "block_number", "<none>"),
+                self._current_work_key[0] if self._current_work_key else "<none>",
             )
             return
 
@@ -536,6 +620,15 @@ class SubstrateMinerController:
         outcome = classify_submission(receipt)
         if outcome is SubmissionOutcome.OK:
             self.stats.proofs_submitted += 1
+            # Mark this work key as won and cancel sibling handles
+            # immediately so they don't keep mining (and then submitting
+            # redundant proofs the chain will reject). This is the
+            # primary submission-storm fix; the duplicate-drop check at
+            # the top of _handle_result is the belt-and-suspenders
+            # backstop for sibling results that were already in flight
+            # when we got here.
+            self._mark_work_key_closed(envelope_key)
+            self._cancel_siblings_for_won_work(envelope.handle_id)
             logger.info(
                 "submit_proof accepted: extrinsic=%s block=%s miner=%s",
                 receipt.extrinsic_hash,
@@ -572,27 +665,117 @@ class SubstrateMinerController:
                 f"extrinsic={receipt.extrinsic_hash}"
             )
 
-    async def _await_handle_done(self, handle: MinerHandle, *, timeout: float) -> None:
+    async def _await_handle_done(
+        self,
+        handle: MinerHandle,
+        *,
+        dispatch_id: int,
+        timeout: float,
+    ) -> None:
         """Wait briefly for the worker to confirm cancellation.
 
-        Pops one `work_item_done` sentinel from the handle's done queue
-        with a timeout. If the timeout fires we proceed anyway — but log
-        a WARNING because the worker did NOT ack the cancel in time, and
-        the next dispatch's `stop_event.clear()` may race the prior
-        cancel (the very condition the sentinel was added to prevent).
+        Pops sentinels from the handle's done queue until one carrying
+        the *expected* dispatch_id arrives, or the timeout fires. A
+        sentinel for an older dispatch (one we already moved past)
+        is discarded silently — it can show up when the previous
+        cancel raced its own sentinel and the new dispatch is now
+        cleaning up.
+
+        On timeout we proceed anyway — but log a WARNING because the
+        worker did NOT ack the cancel of this specific dispatch in
+        time, so the next dispatch's stop_event.clear() may race
+        the prior cancel.
         """
         sentinel_queue = self._done_queues.get(handle.miner_id)
         if sentinel_queue is None:
             return
-        try:
-            await asyncio.wait_for(sentinel_queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "handle %s did not ack cancel within %.1fs; dispatching "
-                "anyway — next mine_work_item may race the prior cancel",
-                handle.miner_id,
-                timeout,
-            )
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                logger.warning(
+                    "handle %s did not ack cancel of dispatch_id=%d within "
+                    "%.1fs; dispatching anyway — next mine_work_item may "
+                    "race the prior cancel",
+                    handle.miner_id,
+                    dispatch_id,
+                    timeout,
+                )
+                return
+            try:
+                got = await asyncio.wait_for(
+                    sentinel_queue.get(), timeout=remaining
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "handle %s did not ack cancel of dispatch_id=%d within "
+                    "%.1fs; dispatching anyway — next mine_work_item may "
+                    "race the prior cancel",
+                    handle.miner_id,
+                    dispatch_id,
+                    timeout,
+                )
+                return
+            # Match exactly — older dispatch sentinels arriving here are
+            # already-resolved and can be discarded. A sentinel for a
+            # dispatch newer than the one we're waiting for is logically
+            # impossible (we haven't issued one yet on this handle).
+            if got is None or got == dispatch_id:
+                return
+
+    def _mark_work_key_closed(self, key: WorkKey) -> None:
+        """Record a work key as won and evict the oldest if over cap."""
+        # Move-to-end semantics: if the same key shows up twice (shouldn't,
+        # but be defensive) it stays at the back of the LRU.
+        if key in self._closed_work_keys:
+            self._closed_work_keys.move_to_end(key)
+        else:
+            self._closed_work_keys[key] = None
+            while len(self._closed_work_keys) > _CLOSED_WORK_KEYS_CAP:
+                self._closed_work_keys.popitem(last=False)
+
+    def _cancel_siblings_for_won_work(self, winning_handle_id: str) -> None:
+        """Cancel all handles other than the winner.
+
+        Mirrors mempool_miner_controller.py's pattern: once one
+        submission has been accepted, sibling handles mining the same
+        work item should stop immediately. They may already have a
+        valid result in flight — that's fine, the duplicate-drop check
+        catches it at the top of _handle_result.
+        """
+        for handle in self.miner_handles:
+            if handle.miner_id == winning_handle_id:
+                continue
+            try:
+                handle.cancel()
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                logger.warning(
+                    "sibling cancel failed for %s (winner=%s): %s: %s",
+                    handle.miner_id,
+                    winning_handle_id,
+                    type(exc).__name__,
+                    exc,
+                )
+
+    def _prune_dispatch_contexts(
+        self, handle_id: str, latest_dispatch_id: int
+    ) -> None:
+        """Trim per-handle dispatch contexts to the last N attempts.
+
+        Retains a small ring so late results from a cancelled dispatch
+        can still find their context, but drops anything older than
+        _DISPATCH_CONTEXT_RETENTION attempts back — those are stale
+        beyond any plausible late-result window.
+        """
+        cutoff = latest_dispatch_id - _DISPATCH_CONTEXT_RETENTION
+        if cutoff <= 0:
+            return
+        stale = [
+            (h, d) for (h, d) in self._dispatch_contexts
+            if h == handle_id and d <= cutoff
+        ]
+        for key in stale:
+            self._dispatch_contexts.pop(key, None)
 
     # ------------------------------------------------------------------
     # Background tasks
@@ -627,27 +810,42 @@ class SubstrateMinerController:
                 )
                 self.shutdown()
                 return
-            if isinstance(msg, MiningResult):
-                dispatched = self._dispatched.get(handle.miner_id)
-                if dispatched is None:
+            if isinstance(msg, dict) and msg.get("op") == "mine_result":
+                # Use the response's dispatch_id (not the handle's
+                # current one) to look up the immutable context that was
+                # dispatched alongside this attempt. A late result from
+                # dispatch N must pair with dispatch N's context, even
+                # if dispatch N+1 has already been issued.
+                dispatch_id = msg.get("dispatch_id")
+                key = (handle.miner_id, dispatch_id)
+                context = self._dispatch_contexts.get(key)
+                result = msg.get("result")
+                if context is None or not isinstance(result, MiningResult):
                     logger.warning(
-                        "result from %s ignored: no dispatched context recorded",
+                        "mine_result from %s ignored: dispatch_id=%s "
+                        "context-known=%s result-type=%s",
                         handle.miner_id,
+                        dispatch_id,
+                        context is not None,
+                        type(result).__name__,
                     )
                     continue
                 await self._result_queue.put(
                     _ResultEnvelope(
-                        result=msg,
-                        context=dispatched,
+                        result=result,
+                        context=context,
                         handle_id=handle.miner_id,
                     )
                 )
             elif isinstance(msg, dict) and msg.get("op") == "work_item_done":
                 # Worker finished its mine_work_item loop with no result —
                 # almost always because cancel() was observed. Surface it
-                # so _await_handle_done can synchronize on cancellation
-                # before the next dispatch clears stop_event.
-                self._done_queues[handle.miner_id].put_nowait(None)
+                # tagged with the dispatch_id so _await_handle_done can
+                # synchronize on cancellation of that specific dispatch,
+                # not just any sentinel.
+                self._done_queues[handle.miner_id].put_nowait(
+                    msg.get("dispatch_id")
+                )
             elif isinstance(msg, dict) and msg.get("op") == "error":
                 self.stats.miner_errors[handle.miner_id] = (
                     self.stats.miner_errors.get(handle.miner_id, 0) + 1
@@ -662,7 +860,9 @@ class SubstrateMinerController:
                 # _await_handle_done can synchronize after a mining error.
                 # Without this, every mining exception causes a guaranteed
                 # timeout on the next cancel.
-                self._done_queues[handle.miner_id].put_nowait(None)
+                self._done_queues[handle.miner_id].put_nowait(
+                    msg.get("dispatch_id")
+                )
             elif isinstance(msg, dict) and msg.get("op") == "stats":
                 # Stats responses are pulled directly by callers of
                 # handle.get_stats(); if one lands here it just means
