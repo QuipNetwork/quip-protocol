@@ -493,6 +493,20 @@ class BaseMiner(ABC):
                 )
 
                 if result:
+                    # Post-evaluation cancel check. evaluate_sampleset can
+                    # take meaningful time on dense graphs; if cancel
+                    # raced with a valid result, return None so the next
+                    # dispatch can decide what to do — the controller is
+                    # already moving on. Without this check, a result
+                    # produced after stop_event was set surfaces as
+                    # "fresh" against the new dispatch and may submit a
+                    # proof against a stale context.
+                    if stop_event.is_set():
+                        self.logger.info(
+                            "mine_work_item: valid result produced after "
+                            "cancel; discarding (stop_event set)"
+                        )
+                        return None
                     self.logger.info(
                         f"[work-item {_work_tag(context)}] mined! "
                         f"nonce={nonce} salt=0x{salt.hex()[:8]}... "

@@ -102,6 +102,16 @@ def _mining_result() -> MiningResult:
     )
 
 
+def _set_current(controller, ctx) -> None:
+    """Helper: set both `_current_context` and `_current_work_key` so the
+    staleness check in `_handle_result` finds a baseline to compare against.
+    Phase 4 (storm-prevention) split the work-key check out of the
+    context-equality check, so tests must now seed both."""
+    from shared.substrate_miner_controller import _work_key
+    controller._current_context = ctx
+    controller._current_work_key = _work_key(ctx)
+
+
 def _bare_controller() -> SubstrateMinerController:
     """Controller without calling __init__ — for unit tests that only
     exercise a single method. Sets up the attributes that method needs."""
@@ -112,9 +122,12 @@ def _bare_controller() -> SubstrateMinerController:
     c.signer.ss58_address.return_value = "5Test"
     c.on_proof_submitted = None
     c._current_context = None
+    c._current_work_key = None
     c.stats = ControllerStats()
     c.miner_handles = []
-    c._dispatched = {}
+    c._dispatch_contexts = {}
+    from collections import OrderedDict
+    c._closed_work_keys = OrderedDict()
     c._consecutive_none_snapshots = 0
     c.topology_hash = None
     c.core = None  # Phase 6: optional MinerCore for telemetry
@@ -176,7 +189,7 @@ async def test_handle_result_drops_stale_envelope_block_number():
     """A result whose context.block_number != current_context.block_number
     should be dropped without calling submit_proof."""
     controller = _bare_controller()
-    controller._current_context = _context(100, b"\xaa" * 32)
+    _set_current(controller, _context(100, b"\xaa" * 32))
 
     envelope = _ResultEnvelope(
         result=_mining_result(),
@@ -192,7 +205,7 @@ async def test_handle_result_drops_stale_envelope_parent_hash_only():
     """A result whose context.parent_hash differs but block_number matches
     (forked chain scenario) should still be dropped."""
     controller = _bare_controller()
-    controller._current_context = _context(100, b"\xaa" * 32)
+    _set_current(controller, _context(100, b"\xaa" * 32))
 
     envelope = _ResultEnvelope(
         result=_mining_result(),
@@ -207,7 +220,7 @@ async def test_handle_result_drops_stale_envelope_topology_hash():
     """A result whose topology_hash differs should be dropped — a
     governance rotation within the block window must not pass through."""
     controller = _bare_controller()
-    controller._current_context = _context(100, b"\xaa" * 32, topology_hash=b"\x11" * 32)
+    _set_current(controller, _context(100, b"\xaa" * 32, topology_hash=b"\x11" * 32))
 
     envelope = _ResultEnvelope(
         result=_mining_result(),
@@ -247,7 +260,7 @@ async def test_handle_result_raises_on_fatal_receipt(monkeypatch):
     submit to."""
     controller = _bare_controller()
     ctx = _context(100, b"\xaa" * 32)
-    controller._current_context = ctx
+    _set_current(controller, ctx)
 
     async def fake_submit_proof(*args, **kwargs):
         return ExtrinsicReceipt(
@@ -272,7 +285,7 @@ async def test_handle_result_records_rpc_error_text(monkeypatch):
     log+count it AND stash the error text on stats for telemetry."""
     controller = _bare_controller()
     ctx = _context(100, b"\xaa" * 32)
-    controller._current_context = ctx
+    _set_current(controller, ctx)
 
     async def fake_submit_proof(*args, **kwargs):
         raise ConnectionError("websocket disconnected")
@@ -301,12 +314,14 @@ async def test_dispatch_tracking_pairs_result_with_handle_context(monkeypatch):
     controller = _bare_controller()
     old_ctx = _context(100, b"\xaa" * 32)
     new_ctx = _context(101, b"\xbb" * 32)
-    controller._current_context = new_ctx  # controller moved on
-    controller._dispatched["slow-handle"] = old_ctx  # handle still on old
+    _set_current(controller, new_ctx)  # controller moved on
+    # Old dispatch's immutable context (what the drainer would look up
+    # by (handle_id, dispatch_id) and attach to the envelope).
+    controller._dispatch_contexts[("slow-handle", 1)] = old_ctx
 
     # Simulate the drainer's behavior directly: build the envelope using
-    # the dispatched context (what the controller code does at line ~430).
-    dispatched_ctx = controller._dispatched["slow-handle"]
+    # the dispatched context paired by (handle_id, dispatch_id).
+    dispatched_ctx = controller._dispatch_contexts[("slow-handle", 1)]
     envelope = _ResultEnvelope(
         result=_mining_result(), context=dispatched_ctx, handle_id="slow-handle"
     )
@@ -340,7 +355,7 @@ async def test_handle_result_raises_on_encoder_value_error(monkeypatch):
     submit_proof except-Exception catch."""
     controller = _bare_controller()
     ctx = _context(100, b"\xaa" * 32)
-    controller._current_context = ctx
+    _set_current(controller, ctx)
 
     def fake_encode(result, context):
         raise ValueError("MiningResult has no solutions to submit")
@@ -832,3 +847,214 @@ async def test_controller_long_haul_multi_block(tmp_path):
         info = await client.query_miner(keystore.signer.account_id_bytes())
         assert info is not None
         assert info.proofs_submitted >= 1
+
+
+# ----------------------------------------------------------------------
+# Submission storm / cancel race regressions (see SUBMISSIONSTORM.md)
+# ----------------------------------------------------------------------
+
+
+class _FakeStopEvent:
+    """Drop-in for mp.Event in tests — same `is_set/set/clear` surface."""
+
+    def __init__(self):
+        self._set = False
+
+    def is_set(self):
+        return self._set
+
+    def set(self):
+        self._set = True
+
+    def clear(self):
+        self._set = False
+
+
+class _FakeHandle:
+    """Test double for MinerHandle exposing only what the controller
+    touches in _handle_result / _cancel_siblings_for_won_work.
+
+    The real MinerHandle owns a subprocess; using a fake keeps these
+    regressions fast and deterministic. Mirrors the live API:
+    `miner_id`, `stop_event`, `cancel()`, `mine_work_item()` returning
+    a dispatch_id, plus the `_active_dispatch_id` field the controller
+    reads when deciding which dispatches to drain on a new head.
+    """
+
+    def __init__(self, miner_id: str):
+        self.miner_id = miner_id
+        self.stop_event = _FakeStopEvent()
+        self._next_dispatch_id = 0
+        self._active_dispatch_id = 0
+        self.cancel_calls = 0
+        self.mine_calls: list = []
+
+    def cancel(self):
+        self.cancel_calls += 1
+        self.stop_event.set()
+
+    def mine_work_item(self, context):
+        self._next_dispatch_id += 1
+        self._active_dispatch_id = self._next_dispatch_id
+        self.stop_event.clear()
+        self.mine_calls.append((self._active_dispatch_id, context))
+        return self._active_dispatch_id
+
+
+async def test_handle_result_cancels_siblings_on_ok(monkeypatch):
+    """Submission storm fix: when one handle's proof is accepted, every
+    other handle must be cancelled immediately. Without this, siblings
+    keep mining the same context and submitting redundant proofs that
+    the chain rejects but our RPC still has to process."""
+    controller = _bare_controller()
+    ctx = _context(100, b"\xaa" * 32)
+    _set_current(controller, ctx)
+
+    winner = _FakeHandle("winner")
+    sibling_a = _FakeHandle("sibling-a")
+    sibling_b = _FakeHandle("sibling-b")
+    winner._active_dispatch_id = 1
+    sibling_a._active_dispatch_id = 1
+    sibling_b._active_dispatch_id = 1
+    controller.miner_handles = [winner, sibling_a, sibling_b]
+
+    async def fake_submit_proof(*args, **kwargs):
+        return ExtrinsicReceipt(extrinsic_hash="0xabc")  # OK
+
+    monkeypatch.setattr(
+        "shared.substrate_miner_controller.submit_proof", fake_submit_proof
+    )
+
+    envelope = _ResultEnvelope(
+        result=_mining_result(), context=ctx, handle_id="winner"
+    )
+    await controller._handle_result(envelope)
+
+    assert controller.stats.proofs_submitted == 1
+    assert winner.cancel_calls == 0  # don't cancel the winner
+    assert sibling_a.cancel_calls == 1
+    assert sibling_b.cancel_calls == 1
+
+
+async def test_handle_result_drops_duplicate_after_ok(monkeypatch):
+    """Second result for the same work key — landing after the first was
+    accepted — must be dropped without another submit_proof call. This
+    is the belt-and-suspenders behind sibling-cancel for results that
+    were already in flight when the first OK landed."""
+    controller = _bare_controller()
+    ctx = _context(100, b"\xaa" * 32)
+    _set_current(controller, ctx)
+    controller.miner_handles = [_FakeHandle("winner"), _FakeHandle("late")]
+
+    submit_call_count = 0
+
+    async def fake_submit_proof(*args, **kwargs):
+        nonlocal submit_call_count
+        submit_call_count += 1
+        return ExtrinsicReceipt(extrinsic_hash=f"0x{submit_call_count:04x}")
+
+    monkeypatch.setattr(
+        "shared.substrate_miner_controller.submit_proof", fake_submit_proof
+    )
+
+    # First result lands and gets accepted.
+    await controller._handle_result(
+        _ResultEnvelope(
+            result=_mining_result(), context=ctx, handle_id="winner",
+        )
+    )
+    assert submit_call_count == 1
+    assert controller.stats.proofs_submitted == 1
+
+    # Second result for the same work key — should be dropped without
+    # calling submit_proof a second time.
+    await controller._handle_result(
+        _ResultEnvelope(
+            result=_mining_result(), context=ctx, handle_id="late",
+        )
+    )
+    assert submit_call_count == 1  # unchanged
+    assert controller.stats.proofs_submitted == 1
+    assert controller.stats.duplicate_result_drops == 1
+
+
+async def test_handle_result_pairs_late_result_with_dispatch_context(monkeypatch):
+    """Cancel race fix: a late result from a cancelled dispatch must be
+    associated with the exact context that dispatch was given, not the
+    handle's currently-active context. Verified through the immutable
+    `_dispatch_contexts[(handle_id, dispatch_id)]` map."""
+    controller = _bare_controller()
+    old_ctx = _context(100, b"\xaa" * 32)
+    new_ctx = _context(101, b"\xbb" * 32)
+    _set_current(controller, new_ctx)
+    controller._dispatch_contexts[("slow-handle", 1)] = old_ctx
+    controller._dispatch_contexts[("slow-handle", 2)] = new_ctx
+
+    # Look up by dispatch_id=1 (the cancelled one) — must yield old_ctx.
+    looked_up = controller._dispatch_contexts[("slow-handle", 1)]
+    assert looked_up is old_ctx
+    assert looked_up.block_number == 100
+
+    # And the envelope built from that lookup is a stale result the
+    # controller drops via the work-key check.
+    envelope = _ResultEnvelope(
+        result=_mining_result(), context=looked_up, handle_id="slow-handle",
+    )
+    await controller._handle_result(envelope)
+    assert controller.stats.stale_drops == 1
+
+
+def test_minerhandle_cancel_does_not_enqueue_stop_mining(monkeypatch):
+    """The legacy `MinerHandle.cancel()` queued an untagged `stop_mining`
+    op that could be consumed by a *later* dispatch's req.get and
+    cancel the new work with a stale cancel. The fix is to not queue
+    anything — stop_event is the single signal."""
+    import multiprocessing as mp
+    from shared.miner_worker import MinerHandle
+
+    # Bypass __init__ to avoid spawning a real subprocess.
+    handle = MinerHandle.__new__(MinerHandle)
+    handle.spec = {"id": "test", "kind": "cpu"}
+    handle.req = mp.Queue()
+    handle.resp = mp.Queue()
+    handle.stop_event = mp.Event()
+    handle._next_dispatch_id = 0
+    handle._active_dispatch_id = 0
+
+    handle.cancel()
+    assert handle.stop_event.is_set()
+    # Queue must be empty — no stop_mining op enqueued.
+    import queue
+    try:
+        msg = handle.req.get(timeout=0.05)
+        pytest.fail(f"cancel() enqueued unexpected op: {msg}")
+    except queue.Empty:
+        pass  # expected
+
+
+def test_minerhandle_mine_work_item_returns_dispatch_id():
+    """`mine_work_item` must increment + return the dispatch_id so the
+    controller can key its immutable (handle_id, dispatch_id) →
+    context map by it."""
+    import multiprocessing as mp
+    from shared.miner_worker import MinerHandle
+
+    handle = MinerHandle.__new__(MinerHandle)
+    handle.spec = {"id": "test", "kind": "cpu"}
+    handle.req = mp.Queue()
+    handle.resp = mp.Queue()
+    handle.stop_event = mp.Event()
+    handle._next_dispatch_id = 0
+    handle._active_dispatch_id = 0
+
+    fake_ctx = object()
+    d1 = handle.mine_work_item(fake_ctx)
+    d2 = handle.mine_work_item(fake_ctx)
+    d3 = handle.mine_work_item(fake_ctx)
+    assert (d1, d2, d3) == (1, 2, 3)
+    assert handle._active_dispatch_id == 3
+
+    # And the worker request includes the dispatch_id.
+    msg = handle.req.get(timeout=0.5)
+    assert msg["op"] == "mine_work_item"
+    assert msg["dispatch_id"] == 1

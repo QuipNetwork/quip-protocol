@@ -198,9 +198,13 @@ class MempoolMinerController:
         self.core = core
         self.stats = MempoolControllerStats()
 
-        # Per-handle dispatch tracking. When a result arrives the drainer
-        # pairs it with the context the handle was given.
-        self._dispatched: Dict[str, MempoolJobContext] = {}
+        # Per-(handle_id, dispatch_id) immutable context map. Mirrors
+        # the substrate controller's design so a late result from a
+        # cancelled dispatch can be paired with the exact context it
+        # was produced against, not whatever's currently dispatched.
+        self._dispatch_contexts: Dict[
+            Tuple[str, int], MempoolJobContext
+        ] = {}
         # Pending orders the controller has decided are eligible but hasn't
         # mined yet. FIFO — Phase 9 can swap in a priority queue when the
         # `--mempool-min-reward` / weighted-pick flags land.
@@ -217,7 +221,7 @@ class MempoolMinerController:
         self._latest_head: Optional[Tuple[bytes, int]] = None
         self._head_signal = asyncio.Event()
         self._result_queue: asyncio.Queue[_MempoolResultEnvelope] = asyncio.Queue()
-        self._done_queues: Dict[str, asyncio.Queue[None]] = {
+        self._done_queues: Dict[str, asyncio.Queue[int]] = {
             h.miner_id: asyncio.Queue() for h in miner_handles
         }
         self._shutdown_event = asyncio.Event()
@@ -570,8 +574,8 @@ class MempoolMinerController:
         context = MempoolJobContext.from_job_order(order_id, order)
         self._active_order = order_id
         for handle in self.miner_handles:
-            self._dispatched[handle.miner_id] = context
-            handle.mine_work_item(context)
+            dispatch_id = handle.mine_work_item(context)
+            self._dispatch_contexts[(handle.miner_id, dispatch_id)] = context
         self.stats.contexts_dispatched += len(self.miner_handles)
         if self.core is not None:
             self.core.record_dispatch()
@@ -760,24 +764,34 @@ class MempoolMinerController:
                 continue
             except Exception:  # noqa: BLE001 — queue closed on shutdown
                 return
-            if isinstance(msg, MiningResult):
-                context = self._dispatched.get(handle.miner_id)
-                if context is None:
+            if isinstance(msg, dict) and msg.get("op") == "mine_result":
+                dispatch_id = msg.get("dispatch_id")
+                result = msg.get("result")
+                context = self._dispatch_contexts.get(
+                    (handle.miner_id, dispatch_id)
+                )
+                if context is None or not isinstance(result, MiningResult):
                     logger.warning(
-                        "result from %s with no dispatched context; dropping",
+                        "mine_result from %s ignored: dispatch_id=%s "
+                        "context-known=%s result-type=%s",
                         handle.miner_id,
+                        dispatch_id,
+                        context is not None,
+                        type(result).__name__,
                     )
                     continue
                 await self._result_queue.put(
                     _MempoolResultEnvelope(
-                        result=msg,
+                        result=result,
                         context=context,
                         handle_id=handle.miner_id,
                     )
                 )
             elif isinstance(msg, dict) and msg.get("op") == "work_item_done":
                 try:
-                    self._done_queues[handle.miner_id].put_nowait(None)
+                    self._done_queues[handle.miner_id].put_nowait(
+                        msg.get("dispatch_id")
+                    )
                 except asyncio.QueueFull:
                     pass
             elif isinstance(msg, dict) and msg.get("op") == "error":
