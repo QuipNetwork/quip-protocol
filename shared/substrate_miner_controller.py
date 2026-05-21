@@ -164,6 +164,11 @@ class ControllerStats:
     # sibling submission this head. Distinct from stale_drops (head
     # changed) — this counts the storm-prevention path.
     duplicate_result_drops: int = 0
+    # Heads observed where the controller skipped dispatch because the
+    # round_seed had already been won this round. Distinct from
+    # duplicate_result_drops (counted per *result*, after mining wasted
+    # CPU/GPU time) — this counts the cheap pre-dispatch guard.
+    heads_skipped_already_won: int = 0
 
 
 @dataclass
@@ -535,6 +540,25 @@ class SubstrateMinerController:
 
         self._current_context = context
         self._current_work_key = _work_key(context)
+
+        # If we already won this round, don't redispatch. The round seed
+        # (LastProofBlock's hash) only updates after our winning proof is
+        # included and the new round begins — until then, every fresh head
+        # in this round carries the same work_key we just closed. Mining
+        # the same problem again only produces results we'd drop as
+        # duplicates and spams the logs. Sit idle here; the next head
+        # carrying a *new* round_seed will trip past this guard and we'll
+        # dispatch fresh work.
+        if self._current_work_key in self._closed_work_keys:
+            self.stats.heads_skipped_already_won += 1
+            logger.info(
+                "head 0x%s... carries already-won round_seed=0x%s...; "
+                "waiting for next round (skipping dispatch)",
+                head_hash.hex()[:16],
+                context.last_winning_hash.hex()[:16],
+            )
+            return
+
         logger.info(
             "new head: head=0x%s... round_seed=0x%s... topology=0x%s... "
             "nodes=%d edges=%d",
@@ -847,6 +871,13 @@ class SubstrateMinerController:
                         handle_id=handle.miner_id,
                     )
                 )
+                # A mine_result means the worker's dispatch loop exited
+                # with a winning result and the worker is now idle at the
+                # next req_q.get(). Emit a sentinel so the next head's
+                # cancel-drain doesn't wait 500ms for a `work_item_done`
+                # that will never come (the worker emits *either*
+                # mine_result *or* work_item_done per dispatch, not both).
+                self._done_queues[handle.miner_id].put_nowait(dispatch_id)
             elif isinstance(msg, dict) and msg.get("op") == "work_item_done":
                 # Worker finished its mine_work_item loop with no result —
                 # almost always because cancel() was observed. Surface it

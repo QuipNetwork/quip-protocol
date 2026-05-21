@@ -507,9 +507,14 @@ class BaseMiner(ABC):
                             "cancel; discarding (stop_event set)"
                         )
                         return None
+                    nonce_disp = (
+                        f"0x{nonce.hex()[:16]}..."
+                        if isinstance(nonce, (bytes, bytearray))
+                        else str(nonce)
+                    )
                     self.logger.info(
                         f"[work-item {_work_tag(context)}] mined! "
-                        f"nonce={nonce} salt=0x{salt.hex()[:8]}... "
+                        f"nonce={nonce_disp} salt=0x{salt.hex()[:8]}... "
                         f"energy={result.energy:.2f} "
                         f"solutions={result.num_valid} "
                         f"diversity={result.diversity:.3f} "
