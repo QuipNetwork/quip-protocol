@@ -417,19 +417,27 @@ def _build_qpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
         dev_type = dev.get("type", "dwave").lower()
         tag = dev_type.upper()
         if dev_type == "dwave":
+            cfg_block: Dict[str, Any] = {
+                "qpu_type": "dwave",
+                "daily_budget": dev.get("daily_budget"),
+                "qpu_min_blocks_for_estimation": dev.get(
+                    "qpu_min_blocks_for_estimation",
+                    5,
+                ),
+                "qpu_ema_alpha": dev.get("qpu_ema_alpha", 0.3),
+            }
+            # ``solver`` is operator-asserted (TOML pass-through). The
+            # sampler picks the active solver from ``DWAVE_API_SOLVER``
+            # at runtime; the field is preserved here so descriptor
+            # builders can surface it to dashboards without re-parsing
+            # the TOML.
+            if dev.get("solver") is not None:
+                cfg_block["solver"] = dev["solver"]
             specs.append(
                 {
                     "id": f"{node_id}-QPU-{tag}-{i}",
                     "kind": "qpu",
-                    "cfg": {
-                        "qpu_type": "dwave",
-                        "daily_budget": dev.get("daily_budget"),
-                        "qpu_min_blocks_for_estimation": dev.get(
-                            "qpu_min_blocks_for_estimation",
-                            5,
-                        ),
-                        "qpu_ema_alpha": dev.get("qpu_ema_alpha", 0.3),
-                    },
+                    "cfg": cfg_block,
                 }
             )
         elif dev_type in ("ibm", "braket", "pasqal", "ionq", "origin"):
