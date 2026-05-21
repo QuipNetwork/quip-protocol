@@ -290,11 +290,11 @@ def test_mine_work_item_result_encodes_to_quantum_proof(cpu_miner, relaxed_conte
     stop = mp.Event()
     result = cpu_miner.mine_work_item(relaxed_context, stop)
     proof = encode_quantum_proof(result, relaxed_context)
-    # Shape matches the post-MR-!20 pallet QuantumProof. Nonce and salt are
-    # raw [u8; 32] arrays; solutions are BoundedVec<BoundedVec<u8>> of
-    # bit-packed spins.
+    # Shape matches the post-MR-!20 pallet QuantumProof. Nonce is a U256
+    # int; salt is a `[u8; 32]` array; solutions are BoundedVec<BoundedVec<u8>>
+    # of bit-packed spins.
     assert proof["topology_hash"] == "0x" + relaxed_context.topology_hash.hex()
-    assert bytes(proof["nonce"]) == result.nonce
+    assert proof["nonce"] == int.from_bytes(result.nonce, "big")
     assert bytes(proof["salt"]) == result.salt
 
     # nodes / edges / h_values are NOT in the proof anymore — the chain
