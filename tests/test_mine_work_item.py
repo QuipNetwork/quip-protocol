@@ -347,6 +347,52 @@ def test_mine_work_item_observes_stop_event(cpu_miner, relaxed_context):
     assert elapsed < 30, f"mine_work_item ignored stop_event for {elapsed:.1f}s"
 
 
+def test_mine_work_item_post_evaluation_stop_check(
+    cpu_miner, relaxed_context, monkeypatch,
+):
+    """Cancel-race regression (SUBMISSIONSTORM.md phase 4): if
+    evaluate_sampleset returns a valid result but stop_event was set
+    during evaluation, mine_work_item must return None — NOT the
+    now-stale result. Without this check, a result produced after
+    cancel still surfaces as fresh against the next dispatch.
+
+    Simulated by monkeypatching `evaluate_sampleset` to also set
+    `stop_event` before returning its result. Without the post-eval
+    check, mine_work_item would return that result; with it, returns
+    None.
+    """
+    stop = mp.Event()
+
+    fake_result = MiningResult(
+        miner_id="test",
+        miner_type="CPU",
+        nonce=(7).to_bytes(32, "big"),
+        salt=b"\x33" * 32,
+        timestamp=0,
+        prev_timestamp=0,
+        solutions=[[1 for _ in relaxed_context.nodes]],
+        energy=-1.0,
+        diversity=0.5,
+        num_valid=1,
+        mining_time=0,
+        node_list=list(relaxed_context.nodes),
+        edge_list=list(relaxed_context.edges),
+        variable_order=list(relaxed_context.nodes),
+    )
+
+    def fake_scoring(*args, **kwargs):
+        stop.set()  # Simulate cancel landing during scoring.
+        return fake_result
+
+    monkeypatch.setattr(cpu_miner, "evaluate_sampleset", fake_scoring)
+    result = cpu_miner.mine_work_item(relaxed_context, stop)
+
+    # Without the post-evaluation stop check this would return
+    # `fake_result`; with the fix it returns None and the controller's
+    # next dispatch is free to start fresh.
+    assert result is None
+
+
 def test_requirements_from_context_mempool_zero_energy_floor():
     """min_energy_milli=0 is a valid (very relaxed) floor — must NOT map to
     +inf the way None does. Zero divides to 0.0 which allows any non-positive
@@ -442,7 +488,8 @@ def test_miner_handle_dispatches_mine_work_item(relaxed_context):
     spec = {"id": "test-cpu-0", "kind": "cpu", "args": {}}
     handle = MinerHandle(spec=spec)
     try:
-        handle.mine_work_item(relaxed_context)
+        dispatch_id = handle.mine_work_item(relaxed_context)
+        assert dispatch_id == 1
         # Drain response with a generous timeout — CPU SA on Z(9,2) at
         # min_solutions=1 / max_energy=0 typically lands in <10s.
         deadline = time.time() + 100
@@ -451,9 +498,12 @@ def test_miner_handle_dispatches_mine_work_item(relaxed_context):
                 msg = handle.resp.get(timeout=5)
             except Exception:
                 continue
-            if isinstance(msg, MiningResult):
-                assert msg.num_valid >= 1
-                assert msg.energy <= 0
+            if isinstance(msg, dict) and msg.get("op") == "mine_result":
+                result = msg["result"]
+                assert isinstance(result, MiningResult)
+                assert result.num_valid >= 1
+                assert result.energy <= 0
+                assert msg.get("dispatch_id") == dispatch_id
                 return
             if isinstance(msg, dict) and msg.get("op") == "error":
                 pytest.fail(f"worker errored: {msg.get('message')}")
@@ -524,10 +574,11 @@ def test_miner_handle_emits_work_item_done_sentinel_on_cancel(relaxed_context):
                 continue
             if isinstance(msg, dict) and msg.get("op") == "work_item_done":
                 assert msg.get("id") == "test-cpu-cancel"
+                assert "dispatch_id" in msg
                 return
             if isinstance(msg, dict) and msg.get("op") == "error":
                 pytest.fail(f"worker errored: {msg.get('message')}")
-            if isinstance(msg, MiningResult):
+            if isinstance(msg, dict) and msg.get("op") == "mine_result":
                 pytest.fail("expected work_item_done sentinel, got a result")
         pytest.fail("no work_item_done sentinel before deadline")
     finally:

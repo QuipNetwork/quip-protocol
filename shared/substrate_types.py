@@ -100,6 +100,48 @@ class SubstrateMiningContext:
 
 
 @dataclass(frozen=True)
+class WinningSolution:
+    """Mirror of `pallet_quantum_pow::types::WinningSolution`.
+
+    Persisted in `QuantumPow.WinningSolutions[block_number]` alongside the
+    `BlockWinner` event. ``difficulty`` is the *active* threshold the proof
+    had to clear (decay applied, pre-adjust); the next block's threshold
+    is whatever ``QuantumPow.Difficulty`` storage holds after the post-win
+    adjustment, which is NOT duplicated here.
+    """
+
+    miner: bytes
+    salt: bytes
+    energy_milli: int
+    reward: int
+    submitted_at: int
+    difficulty: SubstrateDifficulty
+
+    def __post_init__(self) -> None:
+        if len(self.miner) != 32:
+            raise ValueError(f"miner must be 32 bytes, got {len(self.miner)}")
+        if len(self.salt) != 32:
+            raise ValueError(f"salt must be 32 bytes, got {len(self.salt)}")
+
+
+@dataclass(frozen=True)
+class WinningSolutionWithNonce:
+    """Mirror of `pallet_quantum_pow::types::WinningSolutionWithNonce`.
+
+    Runtime-API view returned by ``QuantumPowApi_winning_solution`` that
+    augments the persisted solution with the BLAKE3-derived nonce, so
+    clients don't have to run BLAKE3 themselves.
+    """
+
+    solution: WinningSolution
+    nonce: bytes
+
+    def __post_init__(self) -> None:
+        if len(self.nonce) != 32:
+            raise ValueError(f"nonce must be 32 bytes, got {len(self.nonce)}")
+
+
+@dataclass(frozen=True)
 class MinerInfo:
     """Mirror of `pallet_quantum_pow::types::MinerInfo`."""
 
