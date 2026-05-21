@@ -128,6 +128,7 @@ def _bare_controller() -> SubstrateMinerController:
     c._refresh_in_flight = False
     c._latest_head = None
     c._head_signal = asyncio.Event()
+    c._shutdown_event = asyncio.Event()
     c.signer = MagicMock()
     c.signer.account_id_bytes.return_value = b"\x42" * 32
     c.signer.ss58_address.return_value = "5Test"
@@ -573,10 +574,15 @@ async def test_stale_post_win_head_triggers_refresh():
     assert controller.stats.heads_promoted_to_rpc == 0
     # Must NOT bump — the refreshed head needs to pass the stale guard
     assert controller._highest_handled_block == 121
-    # Active refresh fired (polls rpc client, not subscription)
-    assert controller.stats.heads_refreshed_active == 1
-    assert controller._latest_head == (b"\xff" * 32, 122)
-    assert controller._head_signal.is_set()
+    # Refresh was triggered but the rpc client returned the same lagging
+    # number (122) as the subscription, which is <= the accepted floor
+    # (123). The floor guard correctly rejects this rather than
+    # signaling the main loop with a head that can't possibly reflect
+    # the new round.
+    assert controller.stats.heads_refresh_below_floor == 1
+    assert controller.stats.heads_refreshed_active == 0
+    # _latest_head must NOT have been updated to the stale response.
+    assert controller._latest_head is None
     # Per-record stale skip counter bumped
     record = controller._closed_work_keys[_work_key(ctx)]
     assert record.stale_head_skips == 1
@@ -680,19 +686,22 @@ async def test_current_already_won_head_debounced_refresh():
     )
     controller._highest_handled_block = 199
     controller.client.get_mining_snapshot = AsyncMock(return_value=ctx)
-    # rpc client's get_head/get_block_number are used by both rpc-head
-    # promotion (no promotion here since rpc not ahead) and by
-    # _refresh_latest_head. Defaults from _bare_controller return 0,
-    # which is enough — the test asserts on heads_refreshed_active.
+    # rpc client returns 0 by default → refresh polls below the
+    # accepted_block_number=199 floor and is rejected. What we're
+    # really testing here is the *debounce* at the call site, which
+    # gates whether _refresh_latest_head is invoked at all. The floor
+    # rejection lands in `heads_refresh_below_floor`; we assert on
+    # that to confirm refresh was attempted exactly once.
     controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
     controller.miner_handles = []
 
     await controller._handle_head(b"\xff" * 32, 200)
-    assert controller.stats.heads_refreshed_active == 1
+    assert controller.stats.heads_refresh_below_floor == 1
 
-    # Second call inside debounce window: must NOT refresh again.
+    # Second call inside debounce window: refresh must NOT be invoked
+    # again (call-site debounce). Floor counter stays at 1.
     await controller._handle_head(b"\xff" * 32, 201)
-    assert controller.stats.heads_refreshed_active == 1
+    assert controller.stats.heads_refresh_below_floor == 1
     assert controller.stats.heads_skipped_already_won == 2
 
 
@@ -789,6 +798,222 @@ async def test_active_refresh_monotonic_guard():
 
     assert controller._latest_head == (b"\xee" * 32, 200)
     assert controller.stats.heads_refreshed_active == 0
+
+
+async def test_refresh_below_floor_rejected():
+    """When _refresh_latest_head is called with min_block_number=N and
+    the rpc client returns a head whose number is <= N, the response is
+    rejected as a lagging-peer artifact. _latest_head stays unchanged,
+    heads_refreshed_active stays at 0, heads_refresh_below_floor bumps."""
+    controller = _bare_controller()
+    controller._latest_head = None
+    controller._head_signal.clear()
+    controller.client.get_head = AsyncMock(return_value=b"\xee" * 32)
+    controller.client.get_block_number = AsyncMock(return_value=99)
+
+    await controller._refresh_latest_head(
+        "unit test", min_block_number=100
+    )
+
+    assert controller.stats.heads_refresh_below_floor == 1
+    assert controller.stats.heads_refreshed_active == 0
+    assert controller._latest_head is None
+    assert not controller._head_signal.is_set()
+
+
+async def test_refresh_above_floor_accepted():
+    """When the rpc response is strictly above the floor, the refresh
+    updates _latest_head and signals as normal."""
+    controller = _bare_controller()
+    controller.client.get_head = AsyncMock(return_value=b"\xee" * 32)
+    controller.client.get_block_number = AsyncMock(return_value=101)
+
+    await controller._refresh_latest_head(
+        "unit test", min_block_number=100
+    )
+
+    assert controller.stats.heads_refresh_below_floor == 0
+    assert controller.stats.heads_refreshed_active == 1
+    assert controller._latest_head == (b"\xee" * 32, 101)
+    assert controller._head_signal.is_set()
+
+
+async def test_post_win_fast_forward_dispatches_when_round_rolls(monkeypatch):
+    """The fast-forward task polls rpc + snapshot until the snapshot's
+    last_proof_block_hash matches our accepted hash. Then it sets
+    _latest_head and signals the main loop. Stats counter bumps."""
+    controller = _bare_controller()
+    accepted_hash = b"\xaa" * 32
+    accepted_number = 100
+
+    # First two snapshot polls: round hasn't rolled (still old hash).
+    # Third poll: round visibly rolled to accepted_hash.
+    snapshot_calls = {"count": 0}
+
+    async def fake_snapshot(**_kwargs):
+        snapshot_calls["count"] += 1
+        if snapshot_calls["count"] < 3:
+            return _context(b"\xbb" * 32)  # old round
+        return _context(accepted_hash)  # new round visible
+
+    controller.client.get_head = AsyncMock(return_value=b"\xcc" * 32)
+    controller.client.get_block_number = AsyncMock(return_value=101)
+    controller.client.get_mining_snapshot = fake_snapshot  # type: ignore[assignment]
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    # Patch the poll interval to keep the test fast.
+    monkeypatch.setattr(
+        "shared.substrate_miner_controller._POST_WIN_FAST_FORWARD_INTERVAL_S",
+        0.01,
+    )
+
+    await controller._post_win_fast_forward(accepted_hash, accepted_number)
+
+    assert controller.stats.post_win_fast_forwards == 1
+    assert controller.stats.post_win_fast_forward_timeouts == 0
+    assert controller._latest_head == (b"\xcc" * 32, 101)
+    assert controller._head_signal.is_set()
+    assert snapshot_calls["count"] >= 3
+
+
+async def test_post_win_fast_forward_times_out_on_mismatch(monkeypatch):
+    """If the snapshot's last_proof_block_hash never matches our
+    accepted_hash within the deadline (e.g., our proof was reorganized
+    and someone else's hash is now in LastProofBlock), fast-forward
+    polls until the deadline expires, then exits cleanly without
+    updating _latest_head. The subscription path remains the fallback."""
+    controller = _bare_controller()
+    accepted_hash = b"\xaa" * 32
+    accepted_number = 100
+
+    # rpc has advanced past the accepted block but the snapshot's hash
+    # is permanently different — someone else's proof. Fast-forward
+    # polls until the deadline, then times out.
+    controller.client.get_head = AsyncMock(return_value=b"\xcc" * 32)
+    controller.client.get_block_number = AsyncMock(return_value=101)
+    other_hash = b"\xbb" * 32
+    controller.client.get_mining_snapshot = AsyncMock(
+        return_value=_context(other_hash)
+    )
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    monkeypatch.setattr(
+        "shared.substrate_miner_controller._POST_WIN_FAST_FORWARD_INTERVAL_S",
+        0.01,
+    )
+    monkeypatch.setattr(
+        "shared.substrate_miner_controller._POST_WIN_FAST_FORWARD_TIMEOUT_S",
+        0.1,
+    )
+
+    await controller._post_win_fast_forward(accepted_hash, accepted_number)
+
+    assert controller.stats.post_win_fast_forward_timeouts == 1
+    assert controller.stats.post_win_fast_forwards == 0
+    assert controller._latest_head is None
+
+
+async def test_post_win_fast_forward_bounded_by_deadline(monkeypatch):
+    """When rpc never advances past the accepted block, the loop must
+    exit at the deadline rather than spin forever. Timeout counter
+    bumps; no _latest_head update."""
+    controller = _bare_controller()
+    accepted_hash = b"\xaa" * 32
+    accepted_number = 100
+
+    # rpc stays stuck at the accepted block number — fast-forward
+    # continues polling until the deadline expires.
+    controller.client.get_head = AsyncMock(return_value=b"\xcc" * 32)
+    controller.client.get_block_number = AsyncMock(return_value=100)
+    controller.client.get_mining_snapshot = AsyncMock(
+        return_value=_context(b"\xbb" * 32)
+    )
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    # Tight deadline + tight poll interval so the test runs fast.
+    monkeypatch.setattr(
+        "shared.substrate_miner_controller._POST_WIN_FAST_FORWARD_INTERVAL_S",
+        0.01,
+    )
+    monkeypatch.setattr(
+        "shared.substrate_miner_controller._POST_WIN_FAST_FORWARD_TIMEOUT_S",
+        0.1,
+    )
+
+    await controller._post_win_fast_forward(accepted_hash, accepted_number)
+
+    assert controller.stats.post_win_fast_forward_timeouts == 1
+    assert controller.stats.post_win_fast_forwards == 0
+    assert controller._latest_head is None
+
+
+async def test_handle_head_same_work_key_no_cancel():
+    """Two _handle_head calls with snapshots that produce the SAME work
+    key: the second must short-circuit without cancelling any handle
+    and without re-dispatching. Counter bumps."""
+    controller = _bare_controller()
+    ctx = _context(b"\x10" * 32)
+    controller.client.get_mining_snapshot = AsyncMock(return_value=ctx)
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    # Use a tracking fake handle so we can assert cancel was not called.
+    handle = MagicMock()
+    handle.miner_id = "h1"
+    handle._active_dispatch_id = 0  # idle to start
+    handle.stop_event = MagicMock()
+    handle.stop_event.is_set = MagicMock(return_value=False)
+    handle.mine_work_item = MagicMock(return_value=1)
+    handle.cancel = MagicMock()
+    controller.miner_handles = [handle]
+    controller._dispatch_contexts = {}
+    controller._done_queues = {"h1": asyncio.Queue()}
+
+    # First call: fresh work key — should dispatch.
+    await controller._handle_head(b"\xff" * 32, 100)
+    assert handle.mine_work_item.call_count == 1
+    handle._active_dispatch_id = 1  # simulate dispatched
+
+    # Second call: same snapshot → same work key → short-circuit.
+    await controller._handle_head(b"\xff" * 32, 101)
+    assert handle.mine_work_item.call_count == 1  # NOT re-dispatched
+    handle.cancel.assert_not_called()
+    assert controller.stats.heads_same_key_skipped == 1
+    assert controller._highest_handled_block == 101
+
+
+async def test_handle_head_different_work_key_does_cancel():
+    """When the snapshot returns a NEW work key, the controller must
+    cancel any in-flight dispatch on the prior key and start fresh."""
+    controller = _bare_controller()
+    ctx_a = _context(b"\xaa" * 32)
+    ctx_b = _context(b"\xbb" * 32)
+    snapshot_calls = {"count": 0}
+
+    async def fake_snapshot(**_kwargs):
+        snapshot_calls["count"] += 1
+        return ctx_a if snapshot_calls["count"] == 1 else ctx_b
+
+    controller.client.get_mining_snapshot = fake_snapshot  # type: ignore[assignment]
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    handle = MagicMock()
+    handle.miner_id = "h1"
+    handle._active_dispatch_id = 0
+    handle.stop_event = MagicMock()
+    handle.stop_event.is_set = MagicMock(return_value=False)
+    handle.mine_work_item = MagicMock(return_value=1)
+    handle.cancel = MagicMock()
+    controller.miner_handles = [handle]
+    controller._dispatch_contexts = {}
+    controller._done_queues = {"h1": asyncio.Queue()}
+    # Pre-populate the done queue so _await_handle_done returns instantly.
+    controller._done_queues["h1"].put_nowait(1)
+
+    # First head: dispatches against ctx_a.
+    await controller._handle_head(b"\xff" * 32, 100)
+    assert handle.mine_work_item.call_count == 1
+    handle._active_dispatch_id = 1
+
+    # Second head: snapshot returns ctx_b (different key) → cancel + dispatch.
+    await controller._handle_head(b"\xee" * 32, 101)
+    handle.cancel.assert_called()
+    assert handle.mine_work_item.call_count == 2
+    assert controller.stats.heads_same_key_skipped == 0
 
 
 async def test_active_refresh_same_head_no_op():
