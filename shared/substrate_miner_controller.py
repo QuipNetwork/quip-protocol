@@ -117,6 +117,15 @@ def _work_key(ctx: "SubstrateMiningContext") -> WorkKey:
 _ALREADY_WON_REFRESH_DEBOUNCE_S = 1.0
 
 
+# Delay between detecting a zero-seed snapshot and the follow-up
+# refresh. The zero seed appears transiently at the exact accepted
+# block; the runtime repopulates LastProofBlock at block N+1 (~one
+# block time). A short delay both (a) avoids tight refresh→handle
+# loops while the chain is still on the bad block and (b) gives the
+# subscription path room to deliver a fresh wake on its own.
+_ZERO_SEED_REFRESH_DELAY_S = 2.0
+
+
 # Submission errors that mean "this proof raced a chain state change; drop
 # and continue mining the next snapshot". Classification is by `module.Error`
 # pallet error name, matched as substring inside the receipt error message
@@ -727,13 +736,22 @@ class SubstrateMinerController:
             self.stats.zero_seed_snapshots_dropped += 1
             logger.warning(
                 "snapshot at head %d (0x%s...) carries zero "
-                "last_proof_block_hash; refusing dispatch and refreshing "
-                "(highest_handled=%d)",
+                "last_proof_block_hash; refusing dispatch and scheduling "
+                "delayed refresh (highest_handled=%d)",
                 block_number,
                 head_hash.hex()[:16],
                 self._highest_handled_block,
             )
-            await self._refresh_latest_head("zero-seed snapshot")
+            # Delayed (not immediate) — the zero seed clears once the
+            # chain rolls past the accepted block, ~one block time.
+            # Refreshing immediately just re-polls the same bad block
+            # and loops.
+            asyncio.create_task(
+                self._delayed_refresh(
+                    _ZERO_SEED_REFRESH_DELAY_S, "zero-seed snapshot"
+                ),
+                name="refresh-zero-seed-delayed",
+            )
             return
 
         self._current_context = context
@@ -1137,38 +1155,41 @@ class SubstrateMinerController:
         return False
 
     async def _refresh_latest_head(self, reason: str) -> None:
-        """Actively re-poll the subscription client for best head.
+        """Actively re-poll the rpc client for best head.
 
-        The controller is otherwise purely reactive to subscription
-        deliveries. That leaves a gap after a successful submission:
-        the subscription path can deliver heads with numbers <= the
-        block that just accepted our proof (different rpc-node view,
-        a head that was in-flight when the receipt landed, or a
-        post-win head whose snapshot hasn't rolled the round yet).
-        Each of those would idle on the `_closed_work_keys` guard
-        until the *next* natural subscription wake — observed at
-        30–90 s in production.
+        The controller is otherwise reactive to subscription
+        deliveries, which suffer head-of-line blocking on a congested
+        subscription socket — observed in production: notifications
+        arriving 30–90 s late. This helper feeds `_latest_head` +
+        `_head_signal` out-of-band so we don't sit idle waiting for
+        the next natural wake.
 
-        This helper feeds `_latest_head` + `_head_signal` from the
-        subscription client out-of-band. Uses the subscription client
-        (not `self.client`) so it never contends with submit_extrinsic
-        traffic on the rpc websocket. A monotonic guard prevents a
-        slow polled response from overwriting a newer head delivered
-        by the subscription pump in the meantime.
+        Uses the **rpc client** (`self.client`), not the subscription
+        client. An earlier version polled the subscription client to
+        avoid contending with `submit_extrinsic` traffic — but the
+        subscription socket is the very source of lag we're escaping,
+        so polling it returned heads as stale as the subscription
+        itself (e.g., `number=18` when the chain was at 29). The rpc
+        socket is uncontended modulo brief `submit_extrinsic` windows
+        (~3 s, every ~5 s); refresh polls are sub-second and
+        serialize harmlessly behind any in-flight submit via
+        `_call_lock`.
 
-        `_refresh_in_flight` debounces overlapping calls — the
-        subscription path can fire many stale-post-win events in
-        rapid succession; one refresh is enough.
+        A monotonic guard prevents a slow polled response from
+        overwriting a newer head delivered by the subscription pump
+        in the meantime. `_refresh_in_flight` debounces overlapping
+        calls — the subscription path can fire many stale-post-win
+        events in rapid succession; one refresh is enough.
         """
-        if self._subscription_client is None:
+        if self.client is None:
             return
         if self._refresh_in_flight:
             return
         self._refresh_in_flight = True
         try:
             try:
-                head = await self._subscription_client.get_head()
-                number = await self._subscription_client.get_block_number(at=head)
+                head = await self.client.get_head()
+                number = await self.client.get_block_number(at=head)
             except Exception as exc:  # noqa: BLE001
                 # Best-effort — failing here would not change behavior,
                 # the next subscription wake will eventually arrive.
@@ -1189,6 +1210,22 @@ class SubstrateMinerController:
                     prev[1],
                 )
                 return
+            # Same-head no-op: avoid re-signaling the main loop with a
+            # head it just processed. Without this, a zero-seed
+            # detection at block N triggers refresh → polls rpc → still
+            # N → re-signals → main loop processes N again → zero-seed
+            # again → tight loop until the chain advances.
+            # Different hash at the same number is a fork swap — treat
+            # as new and re-process.
+            if prev is not None and prev == (head, number):
+                logger.debug(
+                    "active head refresh (%s): polled head identical to "
+                    "current latest (%d 0x%s...); skipping re-signal",
+                    reason,
+                    number,
+                    head.hex()[:16],
+                )
+                return
             self._latest_head = (head, number)
             self._head_signal.set()
             self.stats.heads_refreshed_active += 1
@@ -1200,6 +1237,17 @@ class SubstrateMinerController:
             )
         finally:
             self._refresh_in_flight = False
+
+    async def _delayed_refresh(self, delay: float, reason: str) -> None:
+        """Fire `_refresh_latest_head(reason)` after `delay` seconds.
+
+        Used by the zero-seed branch: the zero seed appears at the
+        exact accepted block and clears once the chain advances. An
+        immediate refresh would just re-poll the same bad block and
+        loop. A short delay aligns the retry with the next block.
+        """
+        await asyncio.sleep(delay)
+        await self._refresh_latest_head(reason)
 
     async def _record_subscription_lag(self, subscription_number: int) -> None:
         """Update `stats.subscription_lag_blocks` once per detection.

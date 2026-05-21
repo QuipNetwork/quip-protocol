@@ -559,16 +559,10 @@ async def test_stale_post_win_head_triggers_refresh():
     controller._highest_handled_block = 121  # last successfully handled
     controller.client.get_mining_snapshot = AsyncMock(return_value=ctx)
     # rpc agrees with subscription (no promotion) — isolate the test to
-    # the stale-post-win classification path.
+    # the stale-post-win classification path. The rpc client is also
+    # what _refresh_latest_head polls.
     controller.client.get_head = AsyncMock(return_value=b"\xff" * 32)
     controller.client.get_block_number = AsyncMock(return_value=122)
-    # Subscription's polled best head (used by _refresh_latest_head)
-    controller._subscription_client.get_head = AsyncMock(
-        return_value=b"\xcc" * 32
-    )
-    controller._subscription_client.get_block_number = AsyncMock(
-        return_value=125
-    )
     controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
     controller.miner_handles = []
 
@@ -579,9 +573,9 @@ async def test_stale_post_win_head_triggers_refresh():
     assert controller.stats.heads_promoted_to_rpc == 0
     # Must NOT bump — the refreshed head needs to pass the stale guard
     assert controller._highest_handled_block == 121
-    # Active refresh fired
+    # Active refresh fired (polls rpc client, not subscription)
     assert controller.stats.heads_refreshed_active == 1
-    assert controller._latest_head == (b"\xcc" * 32, 125)
+    assert controller._latest_head == (b"\xff" * 32, 122)
     assert controller._head_signal.is_set()
     # Per-record stale skip counter bumped
     record = controller._closed_work_keys[_work_key(ctx)]
@@ -686,12 +680,10 @@ async def test_current_already_won_head_debounced_refresh():
     )
     controller._highest_handled_block = 199
     controller.client.get_mining_snapshot = AsyncMock(return_value=ctx)
-    controller._subscription_client.get_head = AsyncMock(
-        return_value=b"\xcc" * 32
-    )
-    controller._subscription_client.get_block_number = AsyncMock(
-        return_value=200
-    )
+    # rpc client's get_head/get_block_number are used by both rpc-head
+    # promotion (no promotion here since rpc not ahead) and by
+    # _refresh_latest_head. Defaults from _bare_controller return 0,
+    # which is enough — the test asserts on heads_refreshed_active.
     controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
     controller.miner_handles = []
 
@@ -711,12 +703,8 @@ async def test_zero_seed_snapshot_dropped_after_bootstrap():
     controller = _bare_controller()
     zero_ctx = _context(b"\x00" * 32)
     controller.client.get_mining_snapshot = AsyncMock(return_value=zero_ctx)
-    controller._subscription_client.get_head = AsyncMock(
-        return_value=b"\xcc" * 32
-    )
-    controller._subscription_client.get_block_number = AsyncMock(
-        return_value=125
-    )
+    # rpc client mocks (used by both rpc-head promotion and refresh).
+    # Default 0 → no promotion. The refresh polls these too.
     controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
     controller.miner_handles = []
     controller._highest_handled_block = 122  # past genesis
@@ -724,7 +712,9 @@ async def test_zero_seed_snapshot_dropped_after_bootstrap():
     await controller._handle_head(b"\xff" * 32, 123)
 
     assert controller.stats.zero_seed_snapshots_dropped == 1
-    assert controller.stats.heads_refreshed_active == 1
+    # Zero-seed schedules a DELAYED refresh (not immediate) to avoid
+    # looping on the same bad block. The refresh has not fired yet.
+    assert controller.stats.heads_refreshed_active == 0
     # _current_work_key NOT set — we refused before computing it
     assert controller._current_work_key is None
 
@@ -790,10 +780,8 @@ async def test_active_refresh_monotonic_guard():
     subscription delivered a newer head would otherwise regress us."""
     controller = _bare_controller()
     controller._latest_head = (b"\xee" * 32, 200)
-    controller._subscription_client.get_head = AsyncMock(
-        return_value=b"\xcc" * 32
-    )
-    controller._subscription_client.get_block_number = AsyncMock(
+    controller.client.get_head = AsyncMock(return_value=b"\xcc" * 32)
+    controller.client.get_block_number = AsyncMock(
         return_value=180  # older than 200
     )
 
@@ -801,6 +789,44 @@ async def test_active_refresh_monotonic_guard():
 
     assert controller._latest_head == (b"\xee" * 32, 200)
     assert controller.stats.heads_refreshed_active == 0
+
+
+async def test_active_refresh_same_head_no_op():
+    """If _refresh_latest_head polls the rpc client and finds the
+    exact same (head, number) we already hold, it must NOT re-signal —
+    otherwise the main loop processes the same head again, hits the
+    same condition (e.g., zero-seed snapshot), kicks another refresh,
+    and loops tight."""
+    controller = _bare_controller()
+    controller._latest_head = (b"\xaa" * 32, 100)
+    controller.client.get_head = AsyncMock(return_value=b"\xaa" * 32)
+    controller.client.get_block_number = AsyncMock(return_value=100)
+    controller._head_signal.clear()
+
+    await controller._refresh_latest_head("unit test")
+
+    # No signal set — main loop should not re-wake
+    assert not controller._head_signal.is_set()
+    assert controller.stats.heads_refreshed_active == 0
+    # _latest_head unchanged
+    assert controller._latest_head == (b"\xaa" * 32, 100)
+
+
+async def test_active_refresh_same_number_different_hash_re_signals():
+    """A different head hash at the same block number is a fork swap;
+    the refresh must update and re-signal so the new canonical head
+    is processed."""
+    controller = _bare_controller()
+    controller._latest_head = (b"\xaa" * 32, 100)
+    controller.client.get_head = AsyncMock(return_value=b"\xbb" * 32)
+    controller.client.get_block_number = AsyncMock(return_value=100)
+    controller._head_signal.clear()
+
+    await controller._refresh_latest_head("unit test")
+
+    assert controller._head_signal.is_set()
+    assert controller.stats.heads_refreshed_active == 1
+    assert controller._latest_head == (b"\xbb" * 32, 100)
 
 
 async def test_active_refresh_debounces_overlapping_calls():
@@ -815,10 +841,8 @@ async def test_active_refresh_debounces_overlapping_calls():
         await release.wait()
         return b"\xcc" * 32
 
-    controller._subscription_client.get_head = slow_get_head  # type: ignore[assignment]
-    controller._subscription_client.get_block_number = AsyncMock(
-        return_value=300
-    )
+    controller.client.get_head = slow_get_head  # type: ignore[assignment]
+    controller.client.get_block_number = AsyncMock(return_value=300)
 
     t1 = asyncio.create_task(controller._refresh_latest_head("first"))
     await started.wait()  # t1 is now inside, _refresh_in_flight=True
