@@ -27,6 +27,27 @@ from shared.allowed_value_spec import AllowedValueSpec
 
 
 @dataclass(frozen=True)
+class PowConstants:
+    """Pallet constants the miner needs for local decay computation.
+
+    These are ``#[pallet::constant]`` items on ``pallet_quantum_pow``;
+    they're baked into chain metadata at runtime build time and only
+    change with a runtime upgrade. Cached for the session lifetime —
+    re-reading on every head would waste an RPC per block.
+
+    All three ``curve_c_*`` values are per-mille (e.g. ``700`` = ``0.70``)
+    because pallet constants must implement ``Get<_>`` and ``f64`` does
+    not implement ``Encode`` (see ``pallets/quantum-pow/src/lib.rs`` for
+    the explanatory docstring on the Rust side).
+    """
+
+    epoch_length: int
+    curve_c_easy_milli: int
+    curve_c_knee_milli: int
+    curve_c_hard_milli: int
+
+
+@dataclass(frozen=True)
 class SubstrateDifficulty:
     """Mirror of `pallet_quantum_pow::types::DifficultyConfig`.
 

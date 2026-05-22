@@ -134,6 +134,7 @@ def miner_worker_main(
     spec: Dict[str, Any],
     stop_event: mpsync.Event,
     log_queue: Optional[mp.Queue] = None,
+    live_max_energy_milli: Optional["mp.sharedctypes.Synchronized"] = None,
 ):
     """Worker loop.
 
@@ -144,6 +145,14 @@ def miner_worker_main(
     ``mine_block`` is running — the command queue can't deliver a
     ``stop_mining`` op until ``mine_block`` returns, which defeats the
     whole point.
+
+    ``live_max_energy_milli`` is an ``mp.Value('q')`` the parent updates
+    on each new head that crosses a decay-step boundary. The substrate
+    mining loop reads it every iteration to know the chain's *live*
+    energy threshold (not the snapshot-frozen one), which is how the
+    ratchet decides when a stored-best candidate has become eligible.
+    See ``shared/difficulty_decay.py`` for the decay computation and
+    ``shared/substrate_miner_controller.py`` for the write site.
     """
     # Set up logging for child process
     _setup_child_process_logging(log_queue)
@@ -154,6 +163,9 @@ def miner_worker_main(
     except Exception as e:
         logger.error(f"Failed to build miner {spec.get('id')}: {e}")
         raise
+    # Expose the shared threshold to the miner instance so mine_work_item
+    # can read it each iteration without a queue round-trip.
+    miner._live_max_energy_milli = live_max_energy_milli
 
     while True:
         msg = req_q.get()
@@ -202,6 +214,10 @@ def miner_worker_main(
                     }
                 )
                 continue
+            # Stash the dispatch_id on the miner so attempt logs can
+            # correlate with the controller's submission logs. See
+            # shared/mining_attempt_log.py for the cross-process join.
+            miner._current_dispatch_id = dispatch_id
             try:
                 result = miner.mine_work_item(context, stop_event)
             except Exception as exc:
@@ -262,9 +278,24 @@ class MinerHandle:
         # dispatched).
         self._next_dispatch_id: int = 0
         self._active_dispatch_id: int = 0
+        # Shared i64 the controller writes each time the chain's
+        # *live* (decay-applied) energy threshold changes — i.e. when
+        # ``(now - last_proof_block) // epoch_length`` crosses a step
+        # boundary. The worker reads this every mine_work_item
+        # iteration so the ratchet sees the real chain threshold
+        # rather than the snapshot-frozen one. Initialised to 0; the
+        # controller writes the real value before dispatching.
+        self.live_max_energy_milli: "mp.sharedctypes.Synchronized" = mp.Value("q", 0)
         self.proc: mp.Process = mp.Process(
             target=miner_worker_main,
-            args=(self.req, self.resp, spec, self.stop_event, log_queue),
+            args=(
+                self.req,
+                self.resp,
+                spec,
+                self.stop_event,
+                log_queue,
+                self.live_max_energy_milli,
+            ),
         )
 
         self.proc.start()
@@ -333,6 +364,20 @@ class MinerHandle:
         no-op cleared by the next ``mine_work_item()``).
         """
         self.stop_event.set()
+
+    def set_live_threshold_milli(self, max_energy_milli: int) -> None:
+        """Update the chain's live (decay-applied) energy threshold.
+
+        Called by the substrate controller whenever it observes a head
+        that has crossed a decay-step boundary since the last update.
+        Atomically replaces the worker-visible value; the worker reads
+        it each mining iteration to drive the ratchet's submit gate.
+
+        ``max_energy_milli`` is the value the chain would use to
+        validate ``best_energy_milli < max_energy_milli`` *right now*.
+        """
+        with self.live_max_energy_milli.get_lock():
+            self.live_max_energy_milli.value = int(max_energy_milli)
 
     def get_stats(self) -> dict:
         self.req.put({"op": "get_stats"})

@@ -48,6 +48,7 @@ from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from shared.signer import Signer
 from shared.substrate_client import NoValidatorReachable, SubstrateClient
+from shared.mining_attempt_log import SubmissionLogger
 from shared.substrate_submitter import encode_quantum_proof, submit_proof
 from shared.validator_pool import ValidatorPool
 from shared.substrate_types import (
@@ -327,11 +328,16 @@ class _ResultEnvelope:
     context was last dispatched and pairs them here so the submitter has
     everything it needs (and so a result against a stale context can be
     discarded if a head change happened mid-mine).
+
+    ``dispatch_id`` is carried through the envelope so submission log
+    records can correlate against the worker-side attempt log via
+    ``(handle_id, dispatch_id)`` — see ``shared/mining_attempt_log.py``.
     """
 
     result: MiningResult
     context: SubstrateMiningContext
     handle_id: str
+    dispatch_id: int = 0
 
 
 class SubstrateMinerController:
@@ -453,6 +459,18 @@ class SubstrateMinerController:
         # can call mining_snapshot at a stale `at` and reopen the
         # already-won round_seed loop.
         self._highest_handled_block: int = 0
+        # Last energy threshold (milli) pushed to worker handles via
+        # MinerHandle.set_live_threshold_milli(). Used to suppress
+        # redundant writes — the snapshot's max_energy_milli only
+        # changes when the chain crosses a decay-step boundary (every
+        # ``epoch_length`` blocks elapsed since LastProofBlock), so most
+        # heads don't need a refresh. Initialised to 0 (never pushed).
+        self._last_pushed_threshold_milli: int = 0
+        # Per-controller submission log — paired with per-worker attempt
+        # logs via (handle_id, dispatch_id). The query API in
+        # shared.telemetry_api hits both. assign_id() reserves the
+        # next monotonic solution_id; record() writes the outcome.
+        self._submission_log = SubmissionLogger()
         self._result_queue: asyncio.Queue[_ResultEnvelope] = asyncio.Queue()
         # Per-handle done-sentinel queue. The worker emits
         # `{"op": "work_item_done"}` when its mining loop exits with no
@@ -800,6 +818,31 @@ class SubstrateMinerController:
         # The `_highest_handled_block > 0` clause leaves the legitimate
         # genesis/bootstrap path alone (no proof has ever been submitted
         # so a zero last_proof_block_hash is the expected starting state).
+        # Push the chain's live decayed energy threshold to every
+        # worker handle whenever it has actually changed (i.e. this
+        # head crossed an epoch-step decay boundary). The snapshot's
+        # `difficulty.max_energy_milli` is computed by
+        # `current_difficulty_for(block_number)` on the chain side
+        # (lib.rs:679), so what we push here is exactly what the
+        # chain would validate against right now — no client-side
+        # decay replay needed. The worker reads this in the ratchet
+        # path to decide when a stored-best candidate has become
+        # eligible for submission. See shared/difficulty_decay.py
+        # for the equivalent Python computation (tests / debugging).
+        live_threshold = int(context.difficulty.max_energy_milli)
+        if live_threshold != self._last_pushed_threshold_milli:
+            logger.info(
+                "live energy threshold changed: %d → %d milli "
+                "(head=%d, last_proof=0x%s...)",
+                self._last_pushed_threshold_milli,
+                live_threshold,
+                block_number,
+                context.last_proof_block_hash.hex()[:16],
+            )
+            for handle in self.miner_handles:
+                handle.set_live_threshold_milli(live_threshold)
+            self._last_pushed_threshold_milli = live_threshold
+
         if (
             context.last_proof_block_hash == b"\x00" * 32
             and self._highest_handled_block > 0
@@ -1031,6 +1074,14 @@ class SubstrateMinerController:
         except ValueError as exc:
             raise RuntimeError(f"proof encoding failed (bug): {exc}") from exc
 
+        # Reserve a solution_id before the network round-trip so that
+        # even an RPC failure produces a log entry with a stable id.
+        solution_id = self._submission_log.assign_id()
+        result_energy_milli = int(envelope.result.energy * 1000)
+        result_diversity_milli = int(envelope.result.diversity * 1000)
+        snapshot_threshold_milli = int(envelope.context.difficulty.max_energy_milli)
+        last_proof_hex = "0x" + envelope.context.last_proof_block_hash.hex()
+
         try:
             receipt = await submit_proof(
                 self.client, self.signer, envelope.result, envelope.context
@@ -1042,6 +1093,17 @@ class SubstrateMinerController:
                 "submit_proof RPC failed for result from %s: %s",
                 envelope.handle_id,
                 exc,
+            )
+            self._submission_log.record(
+                solution_id=solution_id,
+                miner_id=envelope.handle_id,
+                dispatch_id=envelope.dispatch_id,
+                energy_milli=result_energy_milli,
+                diversity_milli=result_diversity_milli,
+                threshold_milli=snapshot_threshold_milli,
+                last_proof_block_hash_hex=last_proof_hex,
+                outcome="chain_error",
+                error=f"{type(exc).__name__}: {exc}",
             )
             return
 
@@ -1071,6 +1133,19 @@ class SubstrateMinerController:
                     envelope.handle_id,
                     receipt.extrinsic_hash,
                     receipt.block_hash,
+                )
+                self._submission_log.record(
+                    solution_id=solution_id,
+                    miner_id=envelope.handle_id,
+                    dispatch_id=envelope.dispatch_id,
+                    energy_milli=result_energy_milli,
+                    diversity_milli=result_diversity_milli,
+                    threshold_milli=snapshot_threshold_milli,
+                    last_proof_block_hash_hex=last_proof_hex,
+                    outcome="chain_error",
+                    extrinsic_hash=receipt.extrinsic_hash,
+                    chain_block_hash=receipt.block_hash,
+                    error="receipt OK but proof not recorded by chain",
                 )
                 return
             self.stats.proofs_submitted += 1
@@ -1144,6 +1219,19 @@ class SubstrateMinerController:
                 accepted_block_number,
                 self.signer.ss58_address(),
             )
+            self._submission_log.record(
+                solution_id=solution_id,
+                miner_id=envelope.handle_id,
+                dispatch_id=envelope.dispatch_id,
+                energy_milli=result_energy_milli,
+                diversity_milli=result_diversity_milli,
+                threshold_milli=snapshot_threshold_milli,
+                last_proof_block_hash_hex=last_proof_hex,
+                outcome="submitted_inblock",
+                extrinsic_hash=receipt.extrinsic_hash,
+                chain_block_hash=receipt.block_hash,
+                chain_block_number=accepted_block_number,
+            )
             if self.core is not None:
                 self.core.record_result(
                     winning_miner_id=envelope.result.miner_id,
@@ -1166,9 +1254,33 @@ class SubstrateMinerController:
                 receipt.error,
                 receipt.extrinsic_hash,
             )
+            self._submission_log.record(
+                solution_id=solution_id,
+                miner_id=envelope.handle_id,
+                dispatch_id=envelope.dispatch_id,
+                energy_milli=result_energy_milli,
+                diversity_milli=result_diversity_milli,
+                threshold_milli=snapshot_threshold_milli,
+                last_proof_block_hash_hex=last_proof_hex,
+                outcome="rejected_stale",
+                extrinsic_hash=receipt.extrinsic_hash,
+                error=str(receipt.error or ""),
+            )
         else:  # FATAL
             self.stats.submission_errors += 1
             self.stats.last_submission_error = str(receipt.error or "")
+            self._submission_log.record(
+                solution_id=solution_id,
+                miner_id=envelope.handle_id,
+                dispatch_id=envelope.dispatch_id,
+                energy_milli=result_energy_milli,
+                diversity_milli=result_diversity_milli,
+                threshold_milli=snapshot_threshold_milli,
+                last_proof_block_hash_hex=last_proof_hex,
+                outcome="chain_error",
+                extrinsic_hash=receipt.extrinsic_hash,
+                error=str(receipt.error or ""),
+            )
             raise RuntimeError(
                 f"submit_proof failed fatally: error={receipt.error} "
                 f"extrinsic={receipt.extrinsic_hash}"
@@ -1695,6 +1807,7 @@ class SubstrateMinerController:
                         result=result,
                         context=context,
                         handle_id=handle.miner_id,
+                        dispatch_id=int(dispatch_id) if dispatch_id is not None else 0,
                     )
                 )
                 # A mine_result means the worker's dispatch loop exited

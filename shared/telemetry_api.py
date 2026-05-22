@@ -143,6 +143,9 @@ class TelemetryApiServer:
             "/api/v1/block/{block_number}/header", self.handle_block_header
         )
         app.router.add_post("/api/v1/solve", self.handle_solve)
+        app.router.add_get(
+            "/api/v1/mining/attempts", self.handle_mining_attempts,
+        )
         app.router.add_get("/", self.handle_index)
         app.router.add_route("*", "/{path:.*}", self.handle_not_found)
 
@@ -181,6 +184,7 @@ class TelemetryApiServer:
                     {"GET": "/api/v1/block/{block_number}"},
                     {"GET": "/api/v1/block/{block_number}/header"},
                     {"POST": "/api/v1/solve"},
+                    {"GET": "/api/v1/mining/attempts"},
                 ],
             }
         )
@@ -313,6 +317,75 @@ class TelemetryApiServer:
             "solve service for direct DWave sampling",
             "SOLVE_DISABLED",
             status=503,
+        )
+
+    async def handle_mining_attempts(self, request: web.Request) -> web.Response:
+        """GET /api/v1/mining/attempts — query the attempt + submission log.
+
+        Query params (exactly one of the first two must be supplied):
+          - ``solution_id`` (int): returns
+            ``{"submission": {...}, "attempts": [...]}`` — the submission
+            record with that id and every attempt that fed the same
+            (miner_id, dispatch_id).
+          - ``miner_id`` + ``dispatch_id``: returns just the attempt
+            list for that dispatch.
+          - ``limit`` (int, default 1000): caps the attempts list.
+
+        The store is the JSONL files under ``~/.quip-miner/mining_attempts/``
+        produced by the worker (``attempts-*.jsonl``) and controller
+        (``submissions-*.jsonl``). See ``shared/mining_attempt_log.py``
+        for the schema and write paths.
+        """
+        # Imported lazily so the module load doesn't pin a filesystem
+        # path during test setup that imports telemetry_api headlessly.
+        from shared.mining_attempt_log import (
+            query_by_dispatch,
+            query_by_solution_id,
+        )
+
+        params = request.rel_url.query
+        try:
+            limit = int(params.get("limit", "1000"))
+        except ValueError:
+            return self._error("limit must be an integer", "BAD_PARAM")
+        if limit < 1 or limit > 100_000:
+            return self._error(
+                "limit out of range (1..100000)", "BAD_PARAM",
+            )
+
+        if "solution_id" in params:
+            try:
+                solution_id = int(params["solution_id"])
+            except ValueError:
+                return self._error(
+                    "solution_id must be an integer", "BAD_PARAM",
+                )
+            result = query_by_solution_id(solution_id)
+            if result is None:
+                return self._error(
+                    f"solution_id {solution_id} not found",
+                    "NOT_FOUND",
+                    status=404,
+                )
+            # Cap attempts list to limit (oldest first kept).
+            result["attempts"] = result["attempts"][:limit]
+            return self._success(result)
+
+        miner_id = params.get("miner_id")
+        dispatch_id_raw = params.get("dispatch_id")
+        if miner_id and dispatch_id_raw:
+            try:
+                dispatch_id = int(dispatch_id_raw)
+            except ValueError:
+                return self._error(
+                    "dispatch_id must be an integer", "BAD_PARAM",
+                )
+            attempts = query_by_dispatch(miner_id, dispatch_id, limit=limit)
+            return self._success({"attempts": attempts})
+
+        return self._error(
+            "supply either ?solution_id=N or ?miner_id=X&dispatch_id=Y",
+            "BAD_PARAM",
         )
 
     # ------------------------------------------------------------------

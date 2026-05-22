@@ -77,6 +77,7 @@ from shared.signer import Signer
 from shared.substrate_types import (
     ExtrinsicReceipt,
     MinerInfo,
+    PowConstants,
     SubstrateDifficulty,
     SubstrateMiningContext,
     WinningSolution,
@@ -496,6 +497,54 @@ class SubstrateClient:
                 f"{data.get_remaining_length()} bytes"
             )
         return difficulty
+
+    async def query_last_proof_block_number(self) -> int:
+        """Return the ``QuantumPow.LastProofBlock`` storage value.
+
+        The block number — not the hash — of the most recent winning
+        proof. Genesis sentinel is ``0`` (no proof has ever won).
+
+        The number is the second of the two "time" inputs to local
+        decay computation (the other being ``epoch_length``). Unlike
+        ``Difficulty``, this updates on every winning proof, so the
+        controller re-reads it whenever ``last_proof_block_hash``
+        changes in a fresh snapshot.
+        """
+        result = await self._run(
+            lambda: self._iface.query("QuantumPow", "LastProofBlock")
+        )
+        if result is None or result.value is None:
+            return 0
+        return int(result.value)
+
+    async def query_pow_constants(self) -> PowConstants:
+        """Read the four ``pallet_quantum_pow`` constants needed for decay.
+
+        These come from chain metadata, not storage — they're baked at
+        runtime build time and only change with a runtime upgrade. The
+        controller calls this once per session and caches the result;
+        re-reading per head would waste an RPC.
+
+        Returns
+        -------
+        PowConstants
+            ``epoch_length``, ``curve_c_easy_milli``, ``curve_c_knee_milli``,
+            ``curve_c_hard_milli``.
+        """
+
+        def _read() -> PowConstants:
+            epoch_length = self._iface.get_constant("QuantumPow", "EpochLength")
+            c_easy = self._iface.get_constant("QuantumPow", "CurveCEasyMilli")
+            c_knee = self._iface.get_constant("QuantumPow", "CurveCKneeMilli")
+            c_hard = self._iface.get_constant("QuantumPow", "CurveCHardMilli")
+            return PowConstants(
+                epoch_length=int(epoch_length.value),
+                curve_c_easy_milli=int(c_easy.value),
+                curve_c_knee_milli=int(c_knee.value),
+                curve_c_hard_milli=int(c_hard.value),
+            )
+
+        return await self._run(_read)
 
     async def query_winning_solution(
         self, block_number: int, *, at: Optional[bytes] = None
