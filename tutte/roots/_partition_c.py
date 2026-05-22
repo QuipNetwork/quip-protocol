@@ -89,11 +89,317 @@ ffi.cdef(r"""
            Returns total ints written, or -1 on capacity exceeded. */
         int* out_buf, int out_capacity,
         int* out_offsets);
+
+    /* Self-test for the C hash map data structure.
+       Inserts `n_keys` keys (each `key_lens[k]` ints from `keys_flat`
+       at offset `keys_offsets[k]`) with corresponding `values[k]` into
+       a hash map of size `capacity`. Modular accumulation mod `p`.
+       Writes unique keys + summed values to out_*; returns number of
+       unique keys, or -1 on overflow.
+
+       Used to validate the hash-map primitives before wiring into the
+       full aggregation function. */
+    int hashmap_self_test_c(
+        const int* keys_flat, const int* keys_offsets, const int* key_lens,
+        const long long* values, int n_keys,
+        int capacity, int keys_buffer_cap, long long p,
+        int* out_keys_flat, int* out_keys_offsets, int* out_key_lens,
+        long long* out_values, int* out_n_unique);
+
+    /* Aggregate one state-orbit's batched_inner_iterations output
+       into a caller-allocated hash map. Replaces the Python inner loop
+       in `precompute_and_convolve_c_mod` (lines 1142-1162) with a
+       single C call per state orbit.
+
+       The hash map uses caller-provided slot arrays so it persists
+       across multiple calls (one per state orbit) and accumulates
+       contributions until the caller marshals the result.
+
+       Per-junction logic mirrors the Python loop:
+           delta = out_buf[seg_start]
+           if delta < 0: skip
+           n_can = out_buf[seg_start + 1]
+           key bytes = canonical_data segment of length n_blocks * shape_size
+           contrib = sv_n_state_mod * jv_mod * xy_pow_mod[delta] % p
+           hashmap_add(key, contrib)
+
+       Returns 0 on success, -1 on hashmap overflow (caller must size
+       hm_capacity and hm_keys_cap larger and retry).
+
+       Performance: replaces ~27 M Python dict ops on Cm₃ with C-side
+       open-addressing inserts. Projected 5-8× per the design doc
+       `tutte/research/plans/cm3_unlock_design.md`. */
+    int aggregate_buf_to_hashmap_c(
+        const int* out_buf, const int* out_offsets, int n_junc,
+        int shape_size,
+        const long long* junc_jv_mod, long long sv_n_state_mod,
+        const long long* xy_pow_mod, long long p,
+        int* hm_used, int* hm_key_off, int* hm_key_len,
+        long long* hm_values, int hm_capacity,
+        int* hm_keys_buffer, int hm_keys_cap, int* hm_keys_used,
+        int* hm_n_unique);
+
+    /* Marshal a caller-allocated hash map's contents into flat
+       output arrays. Iterates the slot table, copying entries for
+       used slots only. Returns the number of unique keys written.
+
+       Allows the Python caller to defer marshaling until after all
+       state orbits have been aggregated. */
+    int hashmap_marshal_c(
+        const int* hm_used, const int* hm_key_off, const int* hm_key_len,
+        const long long* hm_values, int hm_capacity,
+        const int* hm_keys_buffer,
+        int* out_keys_flat, int* out_keys_offsets, int* out_key_lens,
+        long long* out_values, int out_keys_buffer_cap);
+
+    /* Apply permutation `perm` to encoded partition `P_enc` and
+       write its canonical (lex-sorted blocks, sorted-elements-within-blocks)
+       form to out_canon. `perm` is length n_universe; perm[v] is the
+       image of vertex v under the permutation.
+
+       Encoding: [n_blocks, b1_size, b1_v1, ..., b2_size, b2_v1, ...]
+       Returns: out_canon length, or -1 on overflow or invalid input. */
+    int apply_perm_canonical_c(
+        const int* P_enc, int P_enc_len,
+        const int* perm, int n_universe,
+        int* out_canon, int out_capacity);
+
+    /* For partition P_enc, compute the lex-min canonical
+       encoding across all `n_H` permutations in `H_perms_flat`.
+       H_perms_flat is a flat array of length n_H * n_universe: perm
+       i is at offset i * n_universe.
+
+       This implements the H-canonicalization inner loop of
+       `precompute_M_table_pair_orbit` (R7 prototype in
+       `tutte/roots/cell_quotient_helpers.py:335`) in C. Per
+       `tutte/research/plans/cm3_unlock_design.md`: ~14k ops per pair
+       in Python → projected ~10× speedup in C.
+
+       Returns: lex-min encoding length, or -1 on overflow. */
+    int h_canonicalize_c(
+        const int* P_enc, int P_enc_len,
+        const int* H_perms_flat, int n_H, int n_universe,
+        int* out_canon, int out_capacity);
 """)
 
 ffi.set_source("_tutte_partition_cffi", r"""
     #include <stdlib.h>
     #include <string.h>
+    #include <stdint.h>
+
+    /* === open-addressing hash map for O_out aggregation ===
+       Keys are variable-length int sequences; values are long long mod p.
+       Linear probing with FNV-1a 64-bit hash. Caller provides backing
+       arrays for slots and the key buffer.
+
+       Capacity should be ≥ 2 × expected unique keys for low collision rate.
+       keys_buffer_cap should be ≥ total ints across all unique keys. */
+
+    typedef struct {
+        int* used;          /* slot occupied flag (0/1) */
+        int* key_off;       /* offset into keys_buffer */
+        int* key_len;       /* key length in ints */
+        long long* values;  /* value mod p */
+        int capacity;
+        int* keys_buffer;
+        int keys_cap;
+        int keys_used;
+        int n_unique;
+    } hashmap_t;
+
+    static uint64_t fnv1a_64_ints(const int* data, int n) {
+        uint64_t h = 0xcbf29ce484222325ULL;
+        for (int i = 0; i < n; i++) {
+            uint32_t v = (uint32_t)data[i];
+            for (int b = 0; b < 4; b++) {
+                h ^= (uint64_t)(v & 0xff);
+                h *= 0x100000001b3ULL;
+                v >>= 8;
+            }
+        }
+        return h;
+    }
+
+    static int hashmap_keys_equal(const int* a, int alen,
+                                   const int* b, int blen) {
+        if (alen != blen) return 0;
+        for (int i = 0; i < alen; i++) if (a[i] != b[i]) return 0;
+        return 1;
+    }
+
+    /* Returns 0 on success, -1 on keys_buffer overflow (slot table is
+       caller-sized so won't overflow if capacity is sufficient). */
+    static int hashmap_add(hashmap_t* m, const int* key, int klen,
+                           long long val, long long p) {
+        if (m->capacity <= 0) return -1;
+        uint64_t h = fnv1a_64_ints(key, klen);
+        int slot = (int)(h % (uint64_t)m->capacity);
+        for (int probe = 0; probe < m->capacity; probe++) {
+            if (!m->used[slot]) {
+                /* Empty: insert. */
+                if (m->keys_used + klen > m->keys_cap) return -1;
+                int new_off = m->keys_used;
+                for (int i = 0; i < klen; i++) {
+                    m->keys_buffer[new_off + i] = key[i];
+                }
+                m->keys_used += klen;
+                m->key_off[slot] = new_off;
+                m->key_len[slot] = klen;
+                m->values[slot] = ((val % p) + p) % p;
+                m->used[slot] = 1;
+                m->n_unique++;
+                return 0;
+            }
+            int existing_off = m->key_off[slot];
+            int existing_len = m->key_len[slot];
+            if (hashmap_keys_equal(m->keys_buffer + existing_off,
+                                    existing_len, key, klen)) {
+                long long s = m->values[slot] + val;
+                s %= p;
+                if (s < 0) s += p;
+                m->values[slot] = s;
+                return 0;
+            }
+            slot = (slot + 1) % m->capacity;
+        }
+        return -1;  /* full — caller should size capacity larger */
+    }
+
+    int hashmap_self_test_c(
+        const int* keys_flat, const int* keys_offsets, const int* key_lens,
+        const long long* values, int n_keys,
+        int capacity, int keys_buffer_cap, long long p,
+        int* out_keys_flat, int* out_keys_offsets, int* out_key_lens,
+        long long* out_values, int* out_n_unique)
+    {
+        /* Allocate slot tables on the caller-provided slots. Use the
+           input arrays' last region as scratch... no, allocate inline. */
+        if (capacity <= 0 || keys_buffer_cap <= 0) return -1;
+        int* used = (int*)calloc(capacity, sizeof(int));
+        int* key_off = (int*)calloc(capacity, sizeof(int));
+        int* key_len = (int*)calloc(capacity, sizeof(int));
+        long long* vals = (long long*)calloc(capacity, sizeof(long long));
+        int* keys_buf = (int*)calloc(keys_buffer_cap, sizeof(int));
+        if (!used || !key_off || !key_len || !vals || !keys_buf) {
+            free(used); free(key_off); free(key_len); free(vals); free(keys_buf);
+            return -1;
+        }
+        hashmap_t m;
+        m.used = used; m.key_off = key_off; m.key_len = key_len;
+        m.values = vals; m.capacity = capacity;
+        m.keys_buffer = keys_buf; m.keys_cap = keys_buffer_cap;
+        m.keys_used = 0; m.n_unique = 0;
+
+        int rc = 0;
+        for (int k = 0; k < n_keys; k++) {
+            const int* kk = keys_flat + keys_offsets[k];
+            int kl = key_lens[k];
+            if (hashmap_add(&m, kk, kl, values[k], p) < 0) {
+                rc = -1;
+                break;
+            }
+        }
+
+        if (rc == 0) {
+            /* Marshal results to caller arrays. */
+            int out_idx = 0;
+            int out_off = 0;
+            for (int s = 0; s < capacity; s++) {
+                if (!m.used[s]) continue;
+                out_keys_offsets[out_idx] = out_off;
+                out_key_lens[out_idx] = m.key_len[s];
+                for (int i = 0; i < m.key_len[s]; i++) {
+                    out_keys_flat[out_off + i] = m.keys_buffer[m.key_off[s] + i];
+                }
+                out_off += m.key_len[s];
+                out_values[out_idx] = m.values[s];
+                out_idx++;
+            }
+            *out_n_unique = out_idx;
+        }
+
+        free(used); free(key_off); free(key_len); free(vals); free(keys_buf);
+        return rc == 0 ? m.n_unique : -1;
+    }
+    int aggregate_buf_to_hashmap_c(
+        const int* out_buf, const int* out_offsets, int n_junc,
+        int shape_size,
+        const long long* junc_jv_mod, long long sv_n_state_mod,
+        const long long* xy_pow_mod, long long p,
+        int* hm_used, int* hm_key_off, int* hm_key_len,
+        long long* hm_values, int hm_capacity,
+        int* hm_keys_buffer, int hm_keys_cap, int* hm_keys_used,
+        int* hm_n_unique)
+    {
+        if (sv_n_state_mod == 0) return 0;
+        hashmap_t m;
+        m.used = hm_used; m.key_off = hm_key_off; m.key_len = hm_key_len;
+        m.values = hm_values; m.capacity = hm_capacity;
+        m.keys_buffer = hm_keys_buffer; m.keys_cap = hm_keys_cap;
+        m.keys_used = *hm_keys_used; m.n_unique = *hm_n_unique;
+
+        for (int j = 0; j < n_junc; j++) {
+            long long jv = junc_jv_mod[j];
+            if (jv == 0) continue;
+            int seg_start = out_offsets[j];
+            int delta = out_buf[seg_start];
+            if (delta < 0) continue;
+            int n_can = out_buf[seg_start + 1];
+            const int* key_ptr;
+            int key_len_ints;
+            if (n_can == 0) {
+                key_ptr = NULL;
+                key_len_ints = 0;
+            } else {
+                int n_blocks = out_buf[seg_start + 2];
+                key_ptr = out_buf + seg_start + 3;
+                key_len_ints = n_blocks * shape_size;
+            }
+            long long contrib = (sv_n_state_mod * jv) % p;
+            contrib = (contrib * xy_pow_mod[delta]) % p;
+            if (contrib == 0) continue;
+            int rc = hashmap_add(&m, key_ptr, key_len_ints, contrib, p);
+            if (rc < 0) {
+                /* Persist state back even on failure so caller can diagnose. */
+                *hm_keys_used = m.keys_used;
+                *hm_n_unique = m.n_unique;
+                return -1;
+            }
+        }
+        *hm_keys_used = m.keys_used;
+        *hm_n_unique = m.n_unique;
+        return 0;
+    }
+
+    int hashmap_marshal_c(
+        const int* hm_used, const int* hm_key_off, const int* hm_key_len,
+        const long long* hm_values, int hm_capacity,
+        const int* hm_keys_buffer,
+        int* out_keys_flat, int* out_keys_offsets, int* out_key_lens,
+        long long* out_values, int out_keys_buffer_cap)
+    {
+        int out_idx = 0;
+        int out_off = 0;
+        for (int s = 0; s < hm_capacity; s++) {
+            if (!hm_used[s]) continue;
+            int klen = hm_key_len[s];
+            if (out_off + klen > out_keys_buffer_cap) return -1;
+            out_keys_offsets[out_idx] = out_off;
+            out_key_lens[out_idx] = klen;
+            const int* src = hm_keys_buffer + hm_key_off[s];
+            for (int i = 0; i < klen; i++) {
+                out_keys_flat[out_off + i] = src[i];
+            }
+            out_off += klen;
+            out_values[out_idx] = hm_values[s];
+            out_idx++;
+        }
+        return out_idx;
+    }
+
+    /* === end hash map === */
+
+
 
     /* Path-compressing find. */
     static int uf_find(int* parent, int x) {
@@ -393,6 +699,138 @@ ffi.set_source("_tutte_partition_cffi", r"""
         out_offsets[n_junc] = total_written;
         return total_written;
     }
+
+    /* Apply permutation `perm` to partition P_enc and emit
+       canonical form. */
+    int apply_perm_canonical_c(
+        const int* P_enc, int P_enc_len,
+        const int* perm, int n_universe,
+        int* out_canon, int out_capacity)
+    {
+        if (P_enc_len == 0) {
+            if (out_capacity < 1) return -1;
+            out_canon[0] = 0;
+            return 1;
+        }
+        int n_blocks = P_enc[0];
+        if (n_blocks > 256) return -1;
+
+        /* Decode + apply perm + sort each block. */
+        int blocks[256][256];
+        int block_sizes[256];
+        int idx = 1;
+        for (int b = 0; b < n_blocks; b++) {
+            if (idx >= P_enc_len) return -1;
+            int sz = P_enc[idx++];
+            if (sz > 256) return -1;
+            block_sizes[b] = sz;
+            for (int i = 0; i < sz; i++) {
+                if (idx >= P_enc_len) return -1;
+                int v = P_enc[idx++];
+                if (v < 0 || v >= n_universe) return -1;
+                blocks[b][i] = perm[v];
+            }
+            /* Insertion sort block elements ascending. */
+            for (int i = 1; i < sz; i++) {
+                int x = blocks[b][i];
+                int j = i - 1;
+                while (j >= 0 && blocks[b][j] > x) {
+                    blocks[b][j + 1] = blocks[b][j];
+                    j--;
+                }
+                blocks[b][j + 1] = x;
+            }
+        }
+
+        /* Insertion sort blocks by (first_element, size). Blocks of
+           size 0 are placed last (shouldn't occur in valid input). */
+        int order[256];
+        for (int i = 0; i < n_blocks; i++) order[i] = i;
+        for (int i = 1; i < n_blocks; i++) {
+            int key = order[i];
+            int kfirst = (block_sizes[key] > 0) ? blocks[key][0] : 0x7fffffff;
+            int ksize = block_sizes[key];
+            int j = i - 1;
+            while (j >= 0) {
+                int j_first = (block_sizes[order[j]] > 0) ? blocks[order[j]][0] : 0x7fffffff;
+                int j_size = block_sizes[order[j]];
+                int cmp = 0;
+                if (j_first < kfirst) cmp = -1;
+                else if (j_first > kfirst) cmp = 1;
+                else if (j_size < ksize) cmp = -1;
+                else if (j_size > ksize) cmp = 1;
+                if (cmp <= 0) break;
+                order[j + 1] = order[j];
+                j--;
+            }
+            order[j + 1] = key;
+        }
+
+        /* Emit. */
+        int out_idx = 0;
+        if (out_capacity < 1) return -1;
+        out_canon[out_idx++] = n_blocks;
+        for (int b = 0; b < n_blocks; b++) {
+            int bidx = order[b];
+            int sz = block_sizes[bidx];
+            if (out_idx + 1 + sz > out_capacity) return -1;
+            out_canon[out_idx++] = sz;
+            for (int i = 0; i < sz; i++) {
+                out_canon[out_idx++] = blocks[bidx][i];
+            }
+        }
+        return out_idx;
+    }
+
+    /* Lex-min over H. */
+    int h_canonicalize_c(
+        const int* P_enc, int P_enc_len,
+        const int* H_perms_flat, int n_H, int n_universe,
+        int* out_canon, int out_capacity)
+    {
+        if (n_H == 0) {
+            /* No permutations — output P_enc itself (assumed already
+               canonical by the caller for the identity element). */
+            if (out_capacity < P_enc_len) return -1;
+            for (int i = 0; i < P_enc_len; i++) out_canon[i] = P_enc[i];
+            return P_enc_len;
+        }
+        /* Worst-case canonical length = same as P_enc_len. */
+        int candidate[2048];
+        int best[2048];
+        int best_len = -1;
+        if (P_enc_len > 2048) return -1;
+
+        for (int h = 0; h < n_H; h++) {
+            const int* perm = H_perms_flat + (long long)h * n_universe;
+            int can_len = apply_perm_canonical_c(P_enc, P_enc_len,
+                                                  perm, n_universe,
+                                                  candidate, 2048);
+            if (can_len < 0) return -1;
+            int cmp;
+            if (best_len < 0) {
+                cmp = -1;
+            } else {
+                cmp = 0;
+                int n_cmp = (best_len < can_len) ? best_len : can_len;
+                for (int i = 0; i < n_cmp; i++) {
+                    if (candidate[i] < best[i]) { cmp = -1; break; }
+                    if (candidate[i] > best[i]) { cmp = 1; break; }
+                }
+                if (cmp == 0) {
+                    if (can_len < best_len) cmp = -1;
+                    else if (can_len > best_len) cmp = 1;
+                }
+            }
+            if (cmp < 0) {
+                for (int i = 0; i < can_len; i++) best[i] = candidate[i];
+                best_len = can_len;
+            }
+        }
+        if (best_len < 0 || out_capacity < best_len) return -1;
+        for (int i = 0; i < best_len; i++) out_canon[i] = best[i];
+        return best_len;
+    }
 """, extra_compile_args=["-O3"])
 
 
@@ -663,7 +1101,7 @@ def precompute_M_batched_inner_c_mod(
     xy_pow_mod,                       # list[int] — ((x-1)(y-1))^d mod p for d=0..max_d
     p,                                # int — the prime modulus
 ):
-    """Modular variant of `precompute_M_batched_inner_c` (Phase 13.E / Round 14).
+    """Modular variant of `precompute_M_batched_inner_c`.
 
     Returns: dict (O_state, O_junc, O_out_canonical_tuple) → int mod p.
     Returns None if C extension unavailable, sizes exceed limits, or any error.
@@ -831,18 +1269,17 @@ def precompute_and_convolve_c_mod(
     xy_pow_mod,                       # list[int]
     p,                                # int
 ):
-    """Single-pass C-ext: directly accumulate into out_mod[O_out] (Round 16).
+    """Single-pass C-ext: directly accumulate into out_mod[O_out].
 
     Combines `precompute_M_batched_inner_c_mod` (build M_int per chunk) +
     streaming-wrapper convolve (M_int × state_T × junc_T → out_mod) into
     one Python loop. Eliminates:
     - 3-tuple `(O_state, O_junc, O_out)` keys (replaced with 1-tuple O_out)
-    - Intermediate M_int dict with millions of entries (replaced with a
-      few-thousand-entry out_mod)
+    - Intermediate M_int dict with millions of entries
     - Two dict ops per pair (replaced with one)
 
-    For Cm₃ 2b (row composition) where per-pair Python dict ops dominate
-    wall-clock, this is the primary speedup over Round 14/15.
+    For Cm₃ row composition where per-pair Python dict ops dominate
+    wall-clock, this is the primary C-ext speedup.
 
     Returns: dict O_out_canonical_tuple → int mod p (the per-chunk
     contribution to the final out_mod). Caller accumulates across chunks.
@@ -1028,6 +1465,390 @@ def precompute_and_convolve_c_mod(
     return decoded
 
 
+def precompute_and_aggregate_c_mod(
+    state_orbit_partitions,
+    junc_data_per_orbit,
+    state_extra_boundary,
+    extra_boundary,
+    shared_boundary,
+    out_boundary,
+    out_cell_anchor_groups,
+    n_state_per_orbit,
+    state_orbit_T_mod,
+    junction_orbit_T_mod,
+    xy_pow_mod,
+    p,
+    hm_capacity_hint: int = 0,
+    state_cell_anchor_groups=None,  # enables per-state H-bucketing
+):
+    """C-side hash-map aggregation drop-in for `precompute_and_convolve_c_mod`.
+
+    Same inputs/outputs as `precompute_and_convolve_c_mod` but the
+    per-junction inner aggregation loop runs in C against a
+    Python-allocated hash map that persists across state orbits.
+    The Python wrapper does no per-pair dict ops — only one C call
+    per state orbit (batched_inner_iterations_c + aggregate_buf_to_hashmap_c)
+    plus a single final marshal pass.
+
+    Per `tutte/research/plans/cm3_unlock_design.md`: projected 5-8×
+    speedup on Cm₃ modular point (75 min → 9-15 min) by eliminating
+    ~27 M Python dict updates per point.
+
+    Validates against `precompute_and_convolve_c_mod` on Cm₂; should
+    match bit-for-bit. Falls back to None (caller routes to the Python
+    path) on C-ext or capacity errors.
+
+    `hm_capacity_hint`: if >0, used as initial hashmap slot count.
+    Otherwise sized from junction count × 2 (conservative).
+
+    `state_cell_anchor_groups`: when provided,
+    enables per-state-orbit H-bucketing of junction members. For each
+    state orbit, compute H = stab_G(rep_state) on shared boundary,
+    then group junction members by `h_canonicalize_c_batched`. Only
+    one rep per H-bucket is passed to `batched_inner_iterations_c`,
+    with the bucket size baked into `jv_mod` as a multiplier. Reduces
+    Cm_3 pair-iterations from ~27M → ~2.6M (projected 2-5× end-to-end
+    after Python overhead).
+
+    Bit-for-bit invariance: with state_cell_anchor_groups=None
+    (default), behavior is identical to the pair-aggregation path. With it
+    provided, the new path is mathematically equivalent (H-orbit
+    coherence: f(state, J_1) = f(state, J_2) when J_1, J_2 ∈ same
+    H-orbit, so summing |bucket| × f(state, rep) ≡ summing f over
+    bucket members).
+    """
+    full_universe = list(state_extra_boundary) + list(shared_boundary) + list(extra_boundary)
+    n_universe = len(full_universe)
+    if n_universe > 256:
+        return None
+    n_shared = len(shared_boundary)
+    n_out_boundary = len(out_boundary)
+
+    try:
+        lib, _ffi = _get_lib()
+    except Exception:
+        return None
+
+    pos_to_idx = {pos: i for i, pos in enumerate(full_universe)}
+    shared_pos_to_idx = {pos: i for i, pos in enumerate(shared_boundary)}
+
+    try:
+        out_boundary_idx = [pos_to_idx[pos] for pos in out_boundary]
+    except KeyError:
+        return None
+
+    n_cells = len(out_cell_anchor_groups)
+    cell_groups_data = [n_cells]
+    for cell_positions in out_cell_anchor_groups:
+        in_universe = [pos_to_idx[pos] for pos in cell_positions if pos in pos_to_idx]
+        cell_groups_data.append(len(in_universe))
+        cell_groups_data.extend(in_universe)
+
+    # R19 H-bucketing setup. When state_cell_anchor_groups is provided,
+    # we compute the per-cell aut group G (acting on shared boundary
+    # positions per state_cell_anchor_groups). Inside the state loop we
+    # compute H = stab_G(rep_state) — junctions in the same H-orbit
+    # contribute identically (per per_cell_partition_stab semantics).
+    #
+    # Bit-for-bit invariance vs the pre-R19 chunk-global path: when |H| = 1
+    # the per-state loop uses the chunk-global arrays (no bucketing).
+    # When |H| > 1, the per-state path passes only one rep per H-bucket
+    # to batched_inner_iterations_c with bucket_size baked into jv_mod.
+    # Mathematically: f(state, J_1) = f(state, J_2) when J_1, J_2 ∈
+    # same H-orbit, so Σ_{J ∈ bucket} f(state, J) ≡ |bucket| × f(state, rep).
+    _r19_use = False
+    _G_elements: List[Dict[int, int]] = []
+    _shared_set: set = set()
+    if state_cell_anchor_groups is not None:
+        try:
+            from .aut_orbit import (
+                apply_perm_to_partition as _apply_perm,
+                enumerate_per_cell_aut_group as _enum_aut,
+                per_cell_partition_stab as _stab,
+            )
+            # Restrict cell groups to shared boundary positions. G acts on
+            # shared boundary; H bucketing tests junction equivalence under
+            # actions that fix the state's shared-boundary projection.
+            _shared_set = set(shared_boundary)
+            _shared_cell_groups = [
+                [p for p in grp if p in _shared_set]
+                for grp in state_cell_anchor_groups
+            ]
+            _shared_cell_groups = [g for g in _shared_cell_groups if g]
+            if _shared_cell_groups:
+                _G_elements = _enum_aut(_shared_cell_groups)
+                if len(_G_elements) > 1:
+                    _r19_use = True
+        except Exception:
+            _r19_use = False
+
+    junc_orbit_canonicals = list(junc_data_per_orbit.keys())
+    junc_orbit_partition_lists = [junc_data_per_orbit[O_junc] for O_junc in junc_orbit_canonicals]
+
+    junc_jv_mod_list = []
+    junc_S_flat = []
+    junc_S_offsets = []
+    junc_S_lens = []
+    junc_ext_flat = []
+    junc_ext_offsets = []
+    junc_ext_lens = []
+
+    for orbit_idx, per_junc_list in enumerate(junc_orbit_partition_lists):
+        O_junc = junc_orbit_canonicals[orbit_idx]
+        jv = junction_orbit_T_mod.get(O_junc, 0)
+        if jv == 0:
+            for _ in per_junc_list:
+                junc_jv_mod_list.append(0)
+                junc_S_offsets.append(len(junc_S_flat))
+                junc_S_lens.append(0)
+                junc_ext_offsets.append(len(junc_ext_flat))
+                junc_ext_lens.append(0)
+            continue
+        for P_junc, P_junc_S, P_junc_ext in per_junc_list:
+            junc_jv_mod_list.append(jv)
+            try:
+                p_S_data = _encode_partition_to_idx(P_junc_S, shared_pos_to_idx)
+            except KeyError:
+                return None
+            junc_S_offsets.append(len(junc_S_flat))
+            junc_S_lens.append(len(p_S_data))
+            junc_S_flat.extend(p_S_data)
+            try:
+                p_ext_data = _encode_partition_to_idx(P_junc_ext, pos_to_idx)
+            except KeyError:
+                return None
+            junc_ext_offsets.append(len(junc_ext_flat))
+            junc_ext_lens.append(len(p_ext_data))
+            junc_ext_flat.extend(p_ext_data)
+
+    n_junc_total = len(junc_jv_mod_list)
+    if n_junc_total == 0:
+        return {}
+
+    junc_S_arr = _ffi.new("int[]", junc_S_flat) if junc_S_flat else _ffi.new("int[]", 1)
+    junc_S_off_arr = _ffi.new("int[]", junc_S_offsets)
+    junc_S_lens_arr = _ffi.new("int[]", junc_S_lens)
+    junc_ext_arr = _ffi.new("int[]", junc_ext_flat) if junc_ext_flat else _ffi.new("int[]", 1)
+    junc_ext_off_arr = _ffi.new("int[]", junc_ext_offsets)
+    junc_ext_lens_arr = _ffi.new("int[]", junc_ext_lens)
+    junc_jv_arr = _ffi.new("long long[]", junc_jv_mod_list)
+
+    out_boundary_arr = _ffi.new("int[]", out_boundary_idx) if out_boundary_idx else _ffi.new("int[]", 1)
+    cell_groups_arr = _ffi.new("int[]", cell_groups_data)
+
+    xy_pow_arr = _ffi.new("long long[]", list(xy_pow_mod))
+
+    per_junc_max = 3 + n_universe * (n_cells + 1)
+    out_capacity = n_junc_total * per_junc_max
+    out_buf = _ffi.new("int[]", out_capacity)
+    out_offsets = _ffi.new("int[]", n_junc_total + 1)
+
+    # Hashmap sizing — caller's state-orbit count drives unique-key bound.
+    # Defensive default: 4× n_state_orbits to keep collisions low.
+    n_state_orbits = sum(1 for sv in state_orbit_T_mod.values() if sv)
+    hm_capacity = max(hm_capacity_hint, 4 * max(n_state_orbits, 1), 1024)
+    # Each key is up to n_universe × (n_cells+1) ints. Bound conservatively.
+    max_key_ints = n_universe * (n_cells + 1)
+    hm_keys_cap = hm_capacity * max(max_key_ints, 1)
+
+    hm_used = _ffi.new("int[]", hm_capacity)
+    hm_key_off = _ffi.new("int[]", hm_capacity)
+    hm_key_len = _ffi.new("int[]", hm_capacity)
+    hm_values = _ffi.new("long long[]", hm_capacity)
+    hm_keys_buffer = _ffi.new("int[]", hm_keys_cap)
+    hm_keys_used = _ffi.new("int*")
+    hm_n_unique = _ffi.new("int*")
+    hm_keys_used[0] = 0
+    hm_n_unique[0] = 0
+
+    shape_size = n_cells + 1
+
+    for O_state, ps_list in state_orbit_partitions.items():
+        sv = state_orbit_T_mod.get(O_state, 0)
+        if sv == 0:
+            continue
+        n_state = n_state_per_orbit.get(O_state, len(ps_list))
+        n_state_mod = n_state % p
+        if n_state_mod == 0:
+            continue
+        sv_n_state = sv * n_state_mod % p
+        if sv_n_state == 0:
+            continue
+
+        rep_state = ps_list[0]
+        P_state_S = _restrict_partition_py(rep_state, shared_boundary)
+        P_state_ext_list = list(rep_state) + [(v,) for v in extra_boundary]
+        P_state_ext = tuple(sorted(P_state_ext_list))
+
+        try:
+            p_state_ext_data = _encode_partition_to_idx(P_state_ext, pos_to_idx)
+            p_state_S_data = _encode_partition_to_idx(P_state_S, shared_pos_to_idx)
+        except KeyError:
+            return None
+
+        p_state_ext_arr = _ffi.new("int[]", p_state_ext_data)
+        p_state_S_arr = _ffi.new("int[]", p_state_S_data)
+
+        # R19: per-state H-bucketing. When _r19_use, compute H stabilizer
+        # of rep_state restricted to shared boundary, then group junction
+        # members in same H-orbit. Use one rep per bucket with bucket_size
+        # baked into jv_mod (mod p multiplier). Mathematically equivalent
+        # to summing f(state, J) over all J in the bucket.
+        _per_state_arrays = None
+        if _r19_use:
+            H = _stab(P_state_S, _G_elements)
+            if len(H) > 1:
+                # Build per-state arrays from H-buckets per junc orbit.
+                ps_jv: List[int] = []
+                ps_S_flat: List[int] = []
+                ps_S_off: List[int] = []
+                ps_S_lens: List[int] = []
+                ps_ext_flat: List[int] = []
+                ps_ext_off: List[int] = []
+                ps_ext_lens: List[int] = []
+                bail_r19 = False
+                for orbit_idx, per_junc_list in enumerate(junc_orbit_partition_lists):
+                    O_junc = junc_orbit_canonicals[orbit_idx]
+                    jv = junction_orbit_T_mod.get(O_junc, 0)
+                    if jv == 0:
+                        continue
+                    # Bucket members by H-canonical of P_junc (full).
+                    buckets: Dict[Tuple, Tuple[int, int]] = {}
+                    for member_idx, (P_junc, _ps, _pe) in enumerate(per_junc_list):
+                        h_canon = min(
+                            _apply_perm(P_junc, h) for h in H
+                        )
+                        existing = buckets.get(h_canon)
+                        if existing is None:
+                            buckets[h_canon] = (1, member_idx)
+                        else:
+                            cnt, idx = existing
+                            buckets[h_canon] = (cnt + 1, idx)
+                    for h_canon, (bsize, rep_idx) in buckets.items():
+                        _P_junc, P_junc_S, P_junc_ext = per_junc_list[rep_idx]
+                        jv_scaled = (jv * bsize) % p
+                        if jv_scaled == 0:
+                            continue
+                        ps_jv.append(jv_scaled)
+                        try:
+                            p_S_data = _encode_partition_to_idx(P_junc_S, shared_pos_to_idx)
+                            p_ext_data = _encode_partition_to_idx(P_junc_ext, pos_to_idx)
+                        except KeyError:
+                            bail_r19 = True
+                            break
+                        ps_S_off.append(len(ps_S_flat))
+                        ps_S_lens.append(len(p_S_data))
+                        ps_S_flat.extend(p_S_data)
+                        ps_ext_off.append(len(ps_ext_flat))
+                        ps_ext_lens.append(len(p_ext_data))
+                        ps_ext_flat.extend(p_ext_data)
+                    if bail_r19:
+                        break
+                if not bail_r19 and ps_jv:
+                    _per_state_arrays = (ps_jv, ps_S_flat, ps_S_off, ps_S_lens,
+                                          ps_ext_flat, ps_ext_off, ps_ext_lens)
+
+        if _per_state_arrays is not None:
+            (ps_jv, ps_S_flat, ps_S_off, ps_S_lens,
+             ps_ext_flat, ps_ext_off, ps_ext_lens) = _per_state_arrays
+            n_junc_state = len(ps_jv)
+            ps_S_arr = _ffi.new("int[]", ps_S_flat) if ps_S_flat else _ffi.new("int[]", 1)
+            ps_S_off_arr = _ffi.new("int[]", ps_S_off)
+            ps_S_lens_arr = _ffi.new("int[]", ps_S_lens)
+            ps_ext_arr = _ffi.new("int[]", ps_ext_flat) if ps_ext_flat else _ffi.new("int[]", 1)
+            ps_ext_off_arr = _ffi.new("int[]", ps_ext_off)
+            ps_ext_lens_arr = _ffi.new("int[]", ps_ext_lens)
+            ps_jv_arr = _ffi.new("long long[]", ps_jv)
+            ps_out_capacity = n_junc_state * per_junc_max
+            ps_out_buf = _ffi.new("int[]", ps_out_capacity)
+            ps_out_offsets = _ffi.new("int[]", n_junc_state + 1)
+
+            n_written = lib.batched_inner_iterations_c(
+                p_state_ext_arr, len(p_state_ext_data),
+                p_state_S_arr, len(p_state_S_data),
+                ps_ext_arr, ps_ext_off_arr, ps_ext_lens_arr,
+                ps_S_arr, ps_S_off_arr, ps_S_lens_arr,
+                n_junc_state,
+                n_universe, n_shared,
+                out_boundary_arr, n_out_boundary,
+                cell_groups_arr, len(cell_groups_data), n_cells,
+                ps_out_buf, ps_out_capacity, ps_out_offsets,
+            )
+            if n_written < 0:
+                return None
+            rc = lib.aggregate_buf_to_hashmap_c(
+                ps_out_buf, ps_out_offsets, n_junc_state,
+                shape_size,
+                ps_jv_arr, sv_n_state,
+                xy_pow_arr, p,
+                hm_used, hm_key_off, hm_key_len, hm_values, hm_capacity,
+                hm_keys_buffer, hm_keys_cap, hm_keys_used, hm_n_unique,
+            )
+            if rc < 0:
+                return None
+        else:
+            n_written = lib.batched_inner_iterations_c(
+                p_state_ext_arr, len(p_state_ext_data),
+                p_state_S_arr, len(p_state_S_data),
+                junc_ext_arr, junc_ext_off_arr, junc_ext_lens_arr,
+                junc_S_arr, junc_S_off_arr, junc_S_lens_arr,
+                n_junc_total,
+                n_universe, n_shared,
+                out_boundary_arr, n_out_boundary,
+                cell_groups_arr, len(cell_groups_data), n_cells,
+                out_buf, out_capacity, out_offsets,
+            )
+            if n_written < 0:
+                return None
+
+            rc = lib.aggregate_buf_to_hashmap_c(
+                out_buf, out_offsets, n_junc_total,
+                shape_size,
+                junc_jv_arr, sv_n_state,
+                xy_pow_arr, p,
+                hm_used, hm_key_off, hm_key_len, hm_values, hm_capacity,
+                hm_keys_buffer, hm_keys_cap, hm_keys_used, hm_n_unique,
+            )
+            if rc < 0:
+                return None
+
+    # Marshal hashmap → flat output via C-side dump.
+    n_unique = hm_n_unique[0]
+    if n_unique == 0:
+        return {}
+    out_keys_flat = _ffi.new("int[]", hm_keys_used[0])
+    out_keys_offsets = _ffi.new("int[]", n_unique)
+    out_key_lens = _ffi.new("int[]", n_unique)
+    out_values = _ffi.new("long long[]", n_unique)
+    n_marshaled = lib.hashmap_marshal_c(
+        hm_used, hm_key_off, hm_key_len, hm_values, hm_capacity,
+        hm_keys_buffer,
+        out_keys_flat, out_keys_offsets, out_key_lens,
+        out_values, hm_keys_used[0],
+    )
+    if n_marshaled != n_unique:
+        return None
+
+    # Decode bytes keys to canonical tuples (same format as
+    # precompute_and_convolve_c_mod's output).
+    decoded: Dict[Tuple, int] = {}
+    for k in range(n_unique):
+        key_off = out_keys_offsets[k]
+        key_len = out_key_lens[k]
+        val = int(out_values[k])
+        if key_len == 0:
+            O_out = ()
+        else:
+            n_blocks = key_len // shape_size
+            O_out = tuple(
+                tuple(int(out_keys_flat[key_off + i * shape_size + j])
+                      for j in range(shape_size))
+                for i in range(n_blocks)
+            )
+        decoded[O_out] = val
+    return decoded
+
+
 def join_partitions_c_wrapper(
     P1: Tuple[Tuple[int, ...], ...],
     P2: Tuple[Tuple[int, ...], ...],
@@ -1073,3 +1894,154 @@ def join_partitions_c_wrapper(
         return None  # overflow — fall back
 
     return _decode_partition(out_arr, n_out, idx_to_pos)
+
+
+# =============================================================================
+# H-canonicalize a partition under a permutation group (C-ext)
+# =============================================================================
+
+
+def h_canonicalize_c_wrapper(
+    P: Tuple[Tuple[int, ...], ...],
+    H_perms: List[Dict[int, int]],
+    universe: List[int],
+) -> Optional[Tuple[Tuple[int, ...], ...]]:
+    """C-extension lex-min over H-permutations of partition P.
+
+    Returns the canonical form (sorted blocks, sorted within block)
+    that lexicographically minimizes over all permutations in H, or
+    None on C-ext unavailable / overflow.
+
+    Mirrors the inner loop of `precompute_M_table_pair_orbit`:
+    `h_canon = min(apply_perm_to_partition(P, h) for h in H)`.
+
+    Args:
+        P: encoded partition as nested tuple of vertex tuples.
+        H_perms: list of dicts mapping position → image. All perms
+                 must agree on the universe.
+        universe: list of positions covered by H_perms (the support
+                  of all perms).
+
+    Returns:
+        Canonical-form partition as nested tuple, or None on overflow.
+    """
+    try:
+        lib, _ffi = _get_lib()
+    except Exception:
+        return None
+
+    n_univ = len(universe)
+    if n_univ > 256:
+        return None
+    if not P:
+        return ()
+
+    pos_to_idx = {pos: i for i, pos in enumerate(universe)}
+    idx_to_pos = list(universe)
+
+    # Encode P using pos_to_idx.
+    try:
+        p_data = _encode_partition(P, pos_to_idx)
+    except KeyError:
+        return None
+
+    # Encode H_perms: flat array of length n_H * n_univ.
+    n_H = len(H_perms)
+    if n_H == 0:
+        # No permutations — canonicalize P alone (apply identity).
+        H_flat = list(range(n_univ))
+        n_H = 1
+    else:
+        H_flat = []
+        for perm in H_perms:
+            for pos in universe:
+                tgt = perm.get(pos, pos)
+                if tgt not in pos_to_idx:
+                    return None
+                H_flat.append(pos_to_idx[tgt])
+
+    p_arr = _ffi.new("int[]", p_data)
+    H_arr = _ffi.new("int[]", H_flat)
+
+    out_capacity = max(2 * len(p_data), 32)
+    out_arr = _ffi.new("int[]", out_capacity)
+
+    n_out = lib.h_canonicalize_c(
+        p_arr, len(p_data),
+        H_arr, n_H, n_univ,
+        out_arr, out_capacity,
+    )
+    if n_out < 0:
+        return None
+
+    return _decode_partition(out_arr, n_out, idx_to_pos)
+
+
+def h_canonicalize_c_batched(
+    P_list: List[Tuple[Tuple[int, ...], ...]],
+    H_perms: List[Dict[int, int]],
+    universe: List[int],
+) -> Optional[List[Tuple[Tuple[int, ...], ...]]]:
+    """Batched H-canonicalize: marshal H ONCE, canonicalize many P's.
+
+    For the `precompute_M_table_pair_orbit` inner loop, the per-cell-pair
+    pattern is to canonicalize `len(members)` partitions (~thousands)
+    against the SAME H. Per-call marshaling of H in
+    `h_canonicalize_c_wrapper` costs ~5ms × n_H × n_univ which dominates;
+    this batched variant pre-allocates H_arr once and reuses for all P's.
+
+    Returns list of canonical-form partitions (same length as P_list)
+    or None on C-ext unavailable / overflow.
+    """
+    try:
+        lib, _ffi = _get_lib()
+    except Exception:
+        return None
+
+    n_univ = len(universe)
+    if n_univ > 256:
+        return None
+    if not P_list:
+        return []
+
+    pos_to_idx = {pos: i for i, pos in enumerate(universe)}
+    idx_to_pos = list(universe)
+
+    # Marshal H once.
+    n_H = len(H_perms)
+    if n_H == 0:
+        H_flat = list(range(n_univ))
+        n_H = 1
+    else:
+        H_flat = []
+        for perm in H_perms:
+            for pos in universe:
+                tgt = perm.get(pos, pos)
+                if tgt not in pos_to_idx:
+                    return None
+                H_flat.append(pos_to_idx[tgt])
+    H_arr = _ffi.new("int[]", H_flat)
+
+    # Per-partition reusable output buffer.
+    max_p_data = max(
+        (2 * (1 + sum(1 + len(b) for b in P)) for P in P_list), default=32
+    )
+    out_capacity = max(max_p_data, 32)
+    out_arr = _ffi.new("int[]", out_capacity)
+
+    results = []
+    for P in P_list:
+        try:
+            p_data = _encode_partition(P, pos_to_idx)
+        except KeyError:
+            return None
+        p_arr = _ffi.new("int[]", p_data)
+        n_out = lib.h_canonicalize_c(
+            p_arr, len(p_data),
+            H_arr, n_H, n_univ,
+            out_arr, out_capacity,
+        )
+        if n_out < 0:
+            return None
+        results.append(_decode_partition(out_arr, n_out, idx_to_pos))
+    return results

@@ -2,7 +2,7 @@
 
 ## Summary
 
-Many graphs are *almost* cographs: removing a small set of **anomaly
+Many graphs are _almost_ cographs: removing a small set of **anomaly
 edges** (edges that participate in some induced P₄) leaves a P₄-free
 cograph that the standard cotree DP (technique 7.5) can handle. This
 technique combines
@@ -20,7 +20,7 @@ inclusion-exclusion form, the iterated chord rule gives `O(|A|)`
 leaves.
 
 **Best for:** graphs that are mostly cographs joined by a sparse set
-of inter-cell edges. D-Wave Cm/Pm cells (K_{4,4}, K_4) are themselves
+of inter-cell edges. D-Wave Cm/Pm cells (K\_{4,4}, K_4) are themselves
 cographs; the inter-cell edges are the anomalies. Cm₂ has 16
 inter-cell edges → fits cleanly under the engine's `max_anomalies = 16`
 gate.
@@ -67,7 +67,7 @@ The "middle edge" of an induced P₄ `a − b − c − d` is `b − c`. Removin
 the middle edge breaks that specific P₄ (other induced P₄s may
 remain).
 
-The iterated chord rule classifies each anomaly edge in the *current*
+The iterated chord rule classifies each anomaly edge in the _current_
 graph at each step — bridge, loop, or non-bridge non-loop — and applies
 the corresponding rule:
 
@@ -76,22 +76,21 @@ the corresponding rule:
 - **bridge:** `T(G) = x · T(G − e)`
 - **loop:** `T(G) = y · T(G − e)`
 
-This bridge-awareness was the Phase 1 fix to `tutte/graphs/k_sum.py`
+This bridge-awareness was the fix to `tutte/graphs/k_sum.py`
 that made the chord rule correct for degenerate graphs (e.g.,
 K_3 ⊕_3 K_3 returns T = 1 instead of x² − x − 1).
 
 ## Files
 
-| File | Purpose |
-|---|---|
-| [`tutte/cotree_dp/almost_cograph.py`](../cotree_dp/almost_cograph.py) | `find_anomaly_edges`, `compute_tutte_almost_cograph` |
-| [`tutte/cotree_dp/dp.py`](../cotree_dp/dp.py) | `compute_tutte_cotree_dp` (called on the cograph skeleton) |
-| [`tutte/graphs/k_sum.py`](../graphs/k_sum.py) | `_iterative_chord_rule` — bridge-aware chord rule applied to the anomaly set |
+| File                                                                    | Purpose                                                                                                                        |
+| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| [`tutte/cotree_dp/almost_cograph.py`](../cotree_dp/almost_cograph.py)   | `find_anomaly_edges`, `compute_tutte_almost_cograph`                                                                           |
+| [`tutte/cotree_dp/dp.py`](../cotree_dp/dp.py)                           | `compute_tutte_cotree_dp` (called on the cograph skeleton)                                                                     |
+| [`tutte/graphs/k_sum.py`](../graphs/k_sum.py)                           | `_iterative_chord_rule` — bridge-aware chord rule applied to the anomaly set                                                   |
 | [`tutte/tests/test_almost_cograph.py`](../tests/test_almost_cograph.py) | 27 regression tests — anomaly detection (P_4 → 1 anomaly, C_5 → 2, K_n → 0), polynomial correctness against engine + Kirchhoff |
 
 ## Status
 
-Shipped April 24, 2026 (Phase 18.E.3.b). All 27 tests pass.
 Cascades into the kmatching formula's leaf synthesis: Cm₂ went from
-~943 s pre-integration → ~48 s when each K_{4,4} cell synthesis got
+~943 s pre-integration → ~48 s when each K\_{4,4} cell synthesis got
 the cotree-DP fast path through the almost-cograph dispatch.

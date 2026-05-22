@@ -1,38 +1,27 @@
 """Dynamic-programming methods for Tutte polynomial synthesis.
 
 Houses DP-based syntheses that supplement the engine's general pipeline:
-- Cell-quotient cycle DP (Phase 18.E.3.e/g): closed-form polynomial via
+- Cell-quotient cycle DP: closed-form polynomial via
   rooted-Tutte composition for graphs with cell-quotient cycle topology.
-- Cell-quotient grid DP (Phase 18.E.3.h, planned): extension to grid
+- Cell-quotient grid DP: extension to grid
   topologies (Cm3 and beyond).
 
 All methods are generic over cell template + junction connectivity.
-The directory consolidates DP methods that previously lived in separate
-ad-hoc scripts; future moves of treewidth_dp, cotree_dp, etc. can land
-here too.
 """
 
 from __future__ import annotations
 
 from typing import Dict, List
 
+from .cell_anchor_adapter import (CellAnchorGroups, CellGridSpec, CellRowSpec,
+                                  detect_cell_anchor_groups,
+                                  extract_grid_specs, extract_path_specs,
+                                  normalize_cell_anchors_for_cycle)
 from .cell_quotient_cycle import compute_cycle_dp
-from .cell_quotient_grid import (
-    _grid_cell_layout,
-    compute_grid_dp_grouped,
-    compute_grid_dp_streamed_kab,
-    is_grid_topology,
-)
+from .cell_quotient_grid import (_grid_cell_layout, compute_grid_dp_grouped,
+                                 compute_grid_dp_streamed_kab,
+                                 is_grid_topology)
 from .cell_quotient_path import compute_path_dp, compute_path_dp_grouped
-from .cell_anchor_adapter import (
-    CellAnchorGroups,
-    CellGridSpec,
-    CellRowSpec,
-    detect_cell_anchor_groups,
-    extract_grid_specs,
-    extract_path_specs,
-    normalize_cell_anchors_for_cycle,
-)
 
 
 def compute_cell_quotient_cycle_dp(graph, table) -> "Optional[TuttePolynomial]":
@@ -52,6 +41,12 @@ def compute_cell_quotient_cycle_dp(graph, table) -> "Optional[TuttePolynomial]":
     if result is None:
         return None
     cell_entry, partition, inter_info = result
+
+    # Same n_cells > 6 gate (see late check below for rationale).
+    # Check early to skip normalize_cell_anchors_for_cycle on partitions
+    # we'll reject anyway.
+    if len(partition) > 6 and graph.node_count() > 36:
+        return None
 
     # Build cell template from the actual cell 0 induced subgraph
     # (cell_entry.graph may be None in the rainbow table).
@@ -81,6 +76,14 @@ def compute_cell_quotient_cycle_dp(graph, table) -> "Optional[TuttePolynomial]":
     a = len(lefts[0])
     b = len(rights[0])
     n_cells = len(cells_canonical)
+
+    # State-orbit grows ~Bell((a+b) × n_cells). Cm2 (4 K_{4,4} cells)
+    # succeeds in ~30s; Cm3 (9 cells) hits Bell(18)=10^9-class orbit
+    # explosion in precompute_M_table / orbit_convolve. Skip dispatch
+    # for large cycle topologies so the engine falls through to chord
+    # rule or treewidth_dp instead of stalling for many minutes.
+    if n_cells > 6 and graph.node_count() > 36:
+        return None
 
     # Extract canonical cell template from the RELABELED graph's cell 0
     # (its bipartition may differ from cell_entry.graph's labeling).
@@ -141,7 +144,7 @@ def compute_cell_quotient_grid_dp_streamed(graph, table) -> "Optional[TuttePolyn
     `compute_grid_dp_streamed_kab`. Returns None on any precondition
     mismatch (caller falls through to other engine steps).
 
-    Phase B Round 6 (May 2026): introduced to beat the engine's
+    introduced to beat the engine's
     `kmatching_formula` baseline on Cm₂ (~55 s → ~36 s, 1.5×).
     Does NOT yet handle Cm₃: the existing Cm₃ partition has interior
     cells with shared horizontal+vertical anchors, which this dispatch
@@ -276,9 +279,8 @@ def _build_cell_tree_spec_from_graph(
     from networkx.algorithms.isomorphism import GraphMatcher
 
     from ..graph import Graph
-    from ..graphs.covering import (
-        try_hierarchical_partition, detect_kmatching_topology,
-    )
+    from ..graphs.covering import (detect_kmatching_topology,
+                                   try_hierarchical_partition)
     from .cell_quotient_tree import CellTreeSpec
 
     result = try_hierarchical_partition(graph, table)
@@ -390,6 +392,26 @@ def compute_cell_quotient_tree_dp(graph, table) -> "Optional[TuttePolynomial]":
     if built is None:
         return None
     spec, _junctions, _cell_topology, _isos, _partition = built
+
+    # Same n_cells > 6 gate as cycle_dp: state-orbit cost scales as
+    # ~Bell(boundary_size × n_cells), so 9-cell decompositions (Cm3) hit
+    # exponential blowup. Cm2 (4 cells) still succeeds.
+    if len(_partition) > 6:
+        return None
+
+    # Chain recurrence dispatch: when the cell tree is a chain, the
+    # framework's `S_n / (x-1)^total_div` matches engine T(graph) when the
+    # spec is built consistently.
+    try:
+        from .chain_recurrence import (compute_chain_full_poly_from_spec,
+                                       is_chain_topology)
+        if is_chain_topology(spec.cell_tree):
+            chain_result = compute_chain_full_poly_from_spec(spec)
+            if chain_result is not None:
+                return chain_result
+    except Exception:
+        pass
+
     try:
         return compute_tree_dp_recursive(spec, enable_per_cell_compression=True)
     except Exception:

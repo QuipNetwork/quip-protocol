@@ -20,6 +20,61 @@ import networkx as nx
 # CANONICAL KEY COMPUTATION (isomorphism-invariant graph hashing)
 # =============================================================================
 
+def canonical_node_mapping(G: nx.Graph) -> Dict[int, int]:
+    """Return a deterministic mapping ``original_label → canonical_label``
+    (0..n-1) for the graph's vertices.
+
+    Uses the same WL refinement as `_compute_canonical_key`. Two
+    isomorphic graphs may have DIFFERENT mappings (the canonical labels
+    are the same set 0..n-1 but the original→canonical correspondence
+    differs because vertex labels differ). The KEY guarantee: applying
+    this mapping makes the graph's edge list canonical (same as what
+    `_compute_canonical_key` hashes).
+
+    Used by the persistent T_rooted cache (`tutte/roots/rooted_tutte.py`)
+    to translate partition keys between graphs with the same
+    canonical_key but different original vertex labels.
+    """
+    return _wl_canonical_mapping(G)
+
+
+def _wl_canonical_mapping(G: nx.Graph) -> Dict[int, int]:
+    """Internal: WL canonical labeling computation. Returns
+    {original_label → canonical_label (0..n-1)}.
+    """
+    if len(G) == 0:
+        return {}
+    n = len(G)
+    colors: Dict[int, int] = {node: hash((G.degree(node),)) for node in G.nodes()}
+    for _ in range(n):
+        new_colors = {}
+        for node in G.nodes():
+            neighbor_colors = tuple(sorted(colors[nb] for nb in G.neighbors(node)))
+            new_colors[node] = hash((colors[node], neighbor_colors))
+        old_partitions = len(set(colors.values()))
+        new_partitions = len(set(new_colors.values()))
+        colors = new_colors
+        if new_partitions == old_partitions:
+            break
+    color_to_int = {c: i for i, c in enumerate(sorted(set(colors.values())))}
+    int_colors = {node: color_to_int[colors[node]] for node in G.nodes()}
+    sorted_nodes = sorted(G.nodes(), key=lambda node: int_colors[node])
+    node_to_index = {node: i for i, node in enumerate(sorted_nodes)}
+
+    def canonical_sort_key(idx: int) -> tuple:
+        node = sorted_nodes[idx]
+        color = int_colors[node]
+        neighbor_indices = tuple(sorted(
+            node_to_index[nb] for nb in G.neighbors(node)
+        ))
+        return (color, neighbor_indices)
+
+    indices = list(range(len(sorted_nodes)))
+    indices.sort(key=canonical_sort_key)
+    sorted_nodes = [sorted_nodes[i] for i in indices]
+    return {old: new for new, old in enumerate(sorted_nodes)}
+
+
 def _compute_canonical_key(G: nx.Graph) -> str:
     """Compute a truly canonical key for a NetworkX graph.
 
@@ -32,56 +87,7 @@ def _compute_canonical_key(G: nx.Graph) -> str:
     if len(G) == 0:
         return hashlib.sha256(b'empty').hexdigest()
 
-    n = len(G)
-
-    # Initialize node colors with degrees. Colors are integer hashes; each
-    # iteration replaces them with a fresh hash of (old_color, sorted
-    # neighbor colors). Using fixed-size integer hashes avoids the
-    # exponential tuple-nesting blowup that pure-tuple WL would suffer for
-    # graphs with slow color refinement (e.g. paths, where convergence
-    # takes ~n/2 iterations).
-    colors: Dict[int, int] = {node: hash((G.degree(node),)) for node in G.nodes()}
-
-    # Iteratively refine colors using neighbor information (WL algorithm)
-    for _ in range(n):  # At most n iterations needed for convergence
-        new_colors = {}
-        for node in G.nodes():
-            neighbor_colors = tuple(sorted(colors[nb] for nb in G.neighbors(node)))
-            new_colors[node] = hash((colors[node], neighbor_colors))
-
-        # Check if color partition stabilized
-        old_partitions = len(set(colors.values()))
-        new_partitions = len(set(new_colors.values()))
-        colors = new_colors
-
-        if new_partitions == old_partitions:
-            break
-
-    # Convert colors to integers for efficient sorting
-    color_to_int = {c: i for i, c in enumerate(sorted(set(colors.values())))}
-    int_colors = {node: color_to_int[colors[node]] for node in G.nodes()}
-
-    # Initial sort by WL color
-    sorted_nodes = sorted(G.nodes(), key=lambda node: int_colors[node])
-
-    # Break remaining ties using neighbor indices within sorted list
-    node_to_index = {node: i for i, node in enumerate(sorted_nodes)}
-
-    def canonical_sort_key(idx: int) -> tuple:
-        node = sorted_nodes[idx]
-        color = int_colors[node]
-        # Neighbor indices provide canonical tie-breaking
-        neighbor_indices = tuple(sorted(
-            node_to_index[nb] for nb in G.neighbors(node)
-        ))
-        return (color, neighbor_indices)
-
-    indices = list(range(len(sorted_nodes)))
-    indices.sort(key=canonical_sort_key)
-    sorted_nodes = [sorted_nodes[i] for i in indices]
-
-    # Create mapping to canonical integer labels
-    mapping = {old: new for new, old in enumerate(sorted_nodes)}
+    mapping = _wl_canonical_mapping(G)
 
     # Build canonical edge list
     edges = []
@@ -767,6 +773,47 @@ class MultiGraph:
                     stack.append(neighbor)
 
         return len(visited) == len(self.nodes)
+
+    def connected_components(self) -> List['MultiGraph']:
+        """Return list of connected component subgraphs as MultiGraphs."""
+        if not self.nodes:
+            return []
+
+        visited = set()
+        components: List['MultiGraph'] = []
+
+        for start in self.nodes:
+            if start in visited:
+                continue
+
+            component_nodes = set()
+            stack = [start]
+
+            while stack:
+                node = stack.pop()
+                if node in component_nodes:
+                    continue
+                component_nodes.add(node)
+                visited.add(node)
+                for neighbor in self.neighbors(node):
+                    if neighbor not in component_nodes:
+                        stack.append(neighbor)
+
+            comp_edge_counts = {
+                (u, w): c for (u, w), c in self.edge_counts.items()
+                if u in component_nodes and w in component_nodes
+            }
+            comp_loop_counts = {
+                n: c for n, c in self.loop_counts.items()
+                if n in component_nodes
+            }
+            components.append(MultiGraph(
+                nodes=frozenset(component_nodes),
+                edge_counts=comp_edge_counts,
+                loop_counts=comp_loop_counts,
+            ))
+
+        return components
 
     def in_same_component(self, u: int, v: int) -> bool:
         """Check if nodes u and v are in the same connected component."""

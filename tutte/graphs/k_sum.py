@@ -319,12 +319,59 @@ def _rule_c_star_predict(
 # RULE F — ITERATIVE CHORD RULE (the universal building block)
 # =============================================================================
 
+def _sigma_orbit_chord_order(
+    chord_edges: List[Tuple[int, int]],
+    sigma: Dict[int, int],
+) -> List[Tuple[int, int]]:
+    """Reorder chord_edges so each σ-orbit is contiguous.
+
+    For σ ∈ Aut(target), σ permutes chord_edges into orbits. Processing an
+    orbit's chords back-to-back maximizes engine cache hits on intermediate
+    contractions: contraction polys T(g_i / c_k) for σ-related c_k are
+    isomorphic to T(g_i / c_0) (the orbit's first chord), so the cache fires.
+
+    The ordering preserves the input chord set; only the sequence changes.
+    Chords whose σ-image isn't in the set are placed in their own singleton
+    orbits.
+
+    Per `tutte/research/plans/sigma_chord_rule_design.md` for the
+    σ-equivariant chord rule. Helps Z(1, 3), Pm_2 family targets where the
+    chord rule fires; no effect for graphs that hit tw_dp (e.g., Z(1, 2)).
+    """
+    edge_set = {(min(u, v), max(u, v)) for (u, v) in chord_edges}
+    visited: set = set()
+    ordered: List[Tuple[int, int]] = []
+    for chord in chord_edges:
+        canon = (min(chord), max(chord))
+        if canon in visited:
+            continue
+        # Build orbit starting from canon.
+        orbit: List[Tuple[int, int]] = [chord]
+        visited.add(canon)
+        u, v = chord
+        cur = (sigma.get(u, u), sigma.get(v, v))
+        cur_canon = (min(cur), max(cur))
+        while cur_canon != canon and cur_canon not in visited and cur_canon in edge_set:
+            # Find the original chord (preserve orientation from chord_edges).
+            for c in chord_edges:
+                if (min(c), max(c)) == cur_canon:
+                    orbit.append(c)
+                    break
+            visited.add(cur_canon)
+            u2, v2 = cur
+            cur = (sigma.get(u2, u2), sigma.get(v2, v2))
+            cur_canon = (min(cur), max(cur))
+        ordered.extend(orbit)
+    return ordered
+
+
 def _iterative_chord_rule(
     target: Graph,
     chord_edges: List[Tuple[int, int]],
     engine: 'BaseMultigraphSynthesizer',
     *,
     smart_order: bool = False,
+    sigma: Optional[Dict[int, int]] = None,
 ) -> Tuple[Graph, List[TuttePolynomial], List[TuttePolynomial]]:
     """Bridge-aware iterative deletion-contraction over `chord_edges`.
 
@@ -347,9 +394,16 @@ def _iterative_chord_rule(
     ``|common_neighbors(u, v)|`` in the *original* graph — chords with more
     shared neighbors create denser parallel-edge multigraphs on contraction,
     which the engine's `_synthesize_multigraph` can simplify via the
-    parallel-edge / loop fast paths. 
+    parallel-edge / loop fast paths.
+
+    Set ``sigma`` to a vertex permutation that's an automorphism of ``target``
+    to enable σ-equivariant ordering — chords in the same σ-orbit are processed
+    back-to-back so the engine's canonical_key cache catches isomorphic
+    intermediate contractions. Per `tutte/research/plans/sigma_chord_rule_design.md`.
     """
     _log = get_log()
+    if sigma is not None and len(chord_edges) > 1:
+        chord_edges = _sigma_orbit_chord_order(chord_edges, sigma)
     if smart_order and len(chord_edges) > 1:
         target_neighbors = {
             n: set(target.neighbors(n)) for n in target.nodes
@@ -514,11 +568,31 @@ def boundary_quotient_tutte(
         LogLevel.DEBUG, graph=target,
     )
 
+    # σ-equivariant chord ordering: if target has a free automorphism σ
+    # discoverable by `find_best_sigma`, reorder chords so σ-orbits are
+    # processed contiguously — the engine's canonical_key cache will
+    # catch isomorphic intermediate contractions. Off by default
+    # (controlled by `engine.chord_sigma_order`, default False) to keep
+    # the existing path unchanged until validated on Z(1, 3) / Pm_2.
+    sigma_perm = None
+    if getattr(engine, "chord_sigma_order", False) and chords:
+        try:
+            import networkx as nx
+            from tutte.roots.signed_quotient import find_best_sigma
+            g_nx = nx.Graph()
+            g_nx.add_nodes_from(target.nodes)
+            g_nx.add_edges_from(target.edges)
+            sigma_perm = find_best_sigma(g_nx, require_free=True)
+            if sigma_perm is None:
+                sigma_perm = find_best_sigma(g_nx, require_free=False)
+        except Exception:
+            sigma_perm = None
+
     # Strip chords first (bridge-aware chord recursion). Returns
     # (g_chord_free, factors, adds) for the universal combine formula.
     smart_order = getattr(engine, "chord_smart_order", False)
     g_chord_free, factors, adds = _iterative_chord_rule(
-        target, chords, engine, smart_order=smart_order,
+        target, chords, engine, smart_order=smart_order, sigma=sigma_perm,
     )
     chord_free_inter = [e for e in inter_edges if e not in set(chords)]
 

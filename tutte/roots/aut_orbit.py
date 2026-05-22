@@ -348,6 +348,18 @@ def per_cell_partition_stab(
     ]
 
 
+class PerCellPreconditionViolated(ValueError):
+    """Raised by `aut_compress_t_rooted_per_cell` when its precondition
+    (free S_n action on cell anchors preserves T_rooted values) is
+    violated by the input ``T_rooted`` dict.
+
+    Callers should catch this and fall back to a non-compressed code
+    path (e.g., `aut_compress_t_rooted(..., [])` to use full canonical
+    partitions with no aut compression). Distinct from generic
+    ``ValueError`` so callers can target their except clauses.
+    """
+
+
 def aut_compress_t_rooted_per_cell(
     T_rooted: Dict[Tuple[Tuple[int, ...], ...], TuttePolynomial],
     cell_anchor_groups: List[List[int]],
@@ -360,7 +372,9 @@ def aut_compress_t_rooted_per_cell(
 
     Validates that all partitions in each orbit have the SAME
     polynomial value (T_rooted is invariant within S_n^N orbit).
-    Raises ValueError otherwise.
+    Raises ``PerCellPreconditionViolated`` (a subclass of ValueError)
+    if the precondition fails — callers should catch and fall back
+    to non-compressed compression via `aut_compress_t_rooted(..., [])`.
     """
     orbit_T: Dict[Tuple, TuttePolynomial] = {}
     orbit_partitions: Dict[Tuple, List[Tuple]] = defaultdict(list)
@@ -369,7 +383,7 @@ def aut_compress_t_rooted_per_cell(
         orbit_partitions[canonical].append(P)
         if canonical in orbit_T:
             if orbit_T[canonical] != val:
-                raise ValueError(
+                raise PerCellPreconditionViolated(
                     f"per-cell orbit {canonical} has non-uniform T values: "
                     f"P_existing={orbit_partitions[canonical][0]}, P_new={P}, "
                     f"existing_val={orbit_T[canonical]}, new_val={val}"

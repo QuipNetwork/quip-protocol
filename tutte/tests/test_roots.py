@@ -21,40 +21,23 @@ from typing import List, Set, Tuple
 
 import networkx as nx
 import pytest
-
 from tutte.graph import Graph
 from tutte.lookup.core import load_default_table
 from tutte.polynomial import TuttePolynomial
-from tutte.roots import (
-    CellAnchorGroups,
-    CellGridSpec,
-    CellRowSpec,
-    compute_cell_quotient_cycle_dp,
-    compute_grid_dp_grouped,
-    compute_path_dp_grouped,
-    detect_cell_anchor_groups,
-    extract_path_specs,
-)
-from tutte.roots.aut_orbit import (
-    aut_compress_t_rooted_per_cell,
-    per_cell_canonical_key,
-    per_cell_orbit_rep,
-    per_cell_orbit_size,
-)
-from tutte.roots.cell_quotient_interleaved import (
-    compute_grid_dp_interleaved,
-    grid_path_and_closing_edges,
-    hamiltonian_path_grid,
-)
-from tutte.roots.cell_quotient_path import (
-    clear_path_dp_cache,
-    path_dp_cache_stats,
-)
-from tutte.roots.rooted_tutte import (
-    divide_by_x_minus_1_power,
-    join_partitions,
-)
+from tutte.roots import (CellAnchorGroups, CellGridSpec, CellRowSpec,
+                         compute_cell_quotient_cycle_dp,
+                         compute_grid_dp_grouped, compute_path_dp_grouped,
+                         detect_cell_anchor_groups, extract_path_specs)
 from tutte.roots._partition_c import join_partitions_c_wrapper
+from tutte.roots.aut_orbit import (aut_compress_t_rooted_per_cell,
+                                   per_cell_canonical_key, per_cell_orbit_rep,
+                                   per_cell_orbit_size)
+from tutte.roots.cell_quotient_interleaved import (compute_grid_dp_interleaved,
+                                                   grid_path_and_closing_edges,
+                                                   hamiltonian_path_grid)
+from tutte.roots.cell_quotient_path import (clear_path_dp_cache,
+                                            path_dp_cache_stats)
+from tutte.roots.rooted_tutte import divide_by_x_minus_1_power, join_partitions
 from tutte.synthesis.engine import SynthesisEngine
 
 
@@ -867,9 +850,8 @@ def test_interpolation_2d_roundtrip():
 def test_interpolation_crt_combine_exact_recovery():
     """CRT-combine across primes recovers exact integer coefficients."""
     from tutte.polynomial import TuttePolynomial
-    from tutte.roots.interpolation import (
-        bivariate_lagrange_interpolate_mod, crt_combine_coeff_dicts,
-    )
+    from tutte.roots.interpolation import (bivariate_lagrange_interpolate_mod,
+                                           crt_combine_coeff_dicts)
 
     T = TuttePolynomial.from_coefficients({
         (3, 1): 12345, (2, 0): -678, (0, 4): 91011,
@@ -889,14 +871,14 @@ def test_interpolation_crt_combine_exact_recovery():
 def test_precompute_M_table_mod_matches_evaluated_polynomial():
     """`precompute_M_table_mod(..., x_val, y_val, p)` produces the same
     M-table values as `precompute_M_table(...)` evaluated at `(x_val,
-    y_val) mod p` entry-by-entry. Phase 12.B-2 fast modular M-table:
+    y_val) mod p` entry-by-entry. Wast modular M-table:
     direct int accumulation should be bit-identical to the polynomial
     path followed by post-hoc modular evaluation.
     """
-    from tutte.roots.cell_quotient_helpers import (
-        _evaluate_poly_dict_mod, _poly_to_dict, precompute_M_table,
-        precompute_M_table_mod,
-    )
+    from tutte.roots.cell_quotient_helpers import (_evaluate_poly_dict_mod,
+                                                   _poly_to_dict,
+                                                   precompute_M_table,
+                                                   precompute_M_table_mod)
 
     state_orbits = {
         ((0,), (1,)): [((0,), (1,))],
@@ -1166,21 +1148,6 @@ def test_grid_grouped_2x3_K4_shared():
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    reason=(
-        "Pre-existing bug in `roots/cell_quotient_cycle.py` orbit aggregation. "
-        "`compute_cell_quotient_cycle_dp` produces a polynomial that matches the "
-        "engine at only 1 of 10 random evaluation points (T(1,1) is wrong: "
-        "10271347716390912000 vs correct 11686511179538104320). Root cause is "
-        "an (x-1)^k divisor cancellation that's missing in the orbit-uniformity "
-        "check at `tutte/roots/aut_orbit.py:119` — partitions in the same "
-        "automorphism orbit have polynomials that differ by an unaccounted "
-        "(x-1)^k factor and are rejected as 'non-uniform T values'. Engine path "
-        "(cell_quotient_grid_dp_streamed at engine.py step 7.45) is correct and "
-        "is what production synthesis uses for Cm2."
-    ),
-    strict=True,
-)
 def test_cm2_cell_quotient_dp_matches_engine():
     """Cm2 polynomial via cell-quotient DP matches engine baseline."""
     dnx = pytest.importorskip("dwave_networkx")
@@ -1198,6 +1165,105 @@ def test_cm2_cell_quotient_dp_matches_engine():
     assert cq_poly is not None, "Cell-quotient DP should fire on Cm2"
     assert cq_poly == engine_result.polynomial
     assert cq_poly.num_spanning_trees() == 11_686_511_179_538_104_320
+
+
+def _nx_to_tutte_polynomial(g) -> TuttePolynomial:
+    """Convert nx.tutte_polynomial output (sympy expr) to TuttePolynomial."""
+    import sympy
+    expr = nx.tutte_polynomial(g)
+    expr = sympy.expand(expr)
+    x_sym, y_sym = sympy.symbols("x y")
+    coeffs: dict = {}
+    poly = sympy.Poly(expr, x_sym, y_sym)
+    for monom, c in poly.as_dict().items():
+        i, j = monom
+        coeffs[(int(i), int(j))] = int(c)
+    return TuttePolynomial.from_coefficients(coeffs)
+
+
+def _build_kab_cycle_graph(a: int, b: int, n_cells: int, m: int):
+    """Build K_{a,b} cells in n-cycle with M_m matching junctions.
+
+    Cell left anchors are A-side vertices [0..m-1]; cell right anchors are
+    B-side vertices [a..a+m-1]. Junction is M_m: m edges between cell c's
+    right (B side) and cell c+1's left (A side).
+    """
+    cell_size = a + b
+    g = nx.Graph()
+    for c in range(n_cells):
+        base = cell_size * c
+        for i in range(a):
+            for j in range(a, a + b):
+                g.add_edge(base + i, base + j)
+    for c in range(n_cells):
+        nxt = (c + 1) % n_cells
+        for k in range(m):
+            # cell c's right (B-side first m) → cell c+1's left (A-side first m)
+            g.add_edge(cell_size * c + (a + k), cell_size * nxt + k)
+    cell_edges = [(i, a + j) for i in range(a) for j in range(b)]
+    cell_template = Graph(list(range(a + b)), cell_edges)
+    junction_template = Graph(
+        list(range(2 * m)), [(i, m + i) for i in range(m)],
+    )
+    cell_left = list(range(m))            # A-side first m
+    cell_right = list(range(a, a + m))    # B-side first m
+    return (
+        g, cell_template, cell_left, cell_right,
+        junction_template, list(range(m)), list(range(m, 2 * m)),
+    )
+
+
+def test_cycle_dp_3_K3_3cycle_matches_nx():
+    """3 K_3 cells in a 3-cycle with M_1 junctions — small enough for
+    nx.tutte_polynomial as ground truth.
+    """
+    from tutte.roots.cell_quotient_cycle import compute_cycle_dp
+
+    g = nx.Graph()
+    g.add_nodes_from(range(9))
+    for c in range(3):
+        base = 3 * c
+        for i in range(3):
+            for j in range(i + 1, 3):
+                g.add_edge(base + i, base + j)
+    g.add_edge(2, 3); g.add_edge(5, 6); g.add_edge(8, 0)
+    T_nx = _nx_to_tutte_polynomial(g)
+
+    cell_template = Graph([0, 1, 2], [(0, 1), (0, 2), (1, 2)])
+    junction_template = Graph([0, 1], [(0, 1)])
+    poly, _ = compute_cycle_dp(
+        cell_template, [0], [2],
+        junction_template, [0], [1],
+        n_cells=3,
+    )
+    assert poly == T_nx, (
+        f"compute_cycle_dp gave wrong polynomial.\n"
+        f"  nx:    {T_nx}\n"
+        f"  cq:    {poly}"
+    )
+
+
+def test_cycle_dp_K22_3cycle_M2_matches_nx():
+    """K_{2,2} bipartite cells in a 3-cycle with M_2 junctions — minimal
+    case that exposes the cell-quotient-cycle divisor asymmetry bug
+    reported in `project_cell_quotient_divisor_bug.md` (smaller and
+    faster to iterate on than the Cm₂ test).
+    """
+    from tutte.roots.cell_quotient_cycle import compute_cycle_dp
+
+    g, cell_template, cell_left, cell_right, junction_template, j_A, j_B = (
+        _build_kab_cycle_graph(2, 2, 3, 2)
+    )
+    T_nx = _nx_to_tutte_polynomial(g)
+    poly, _ = compute_cycle_dp(
+        cell_template, cell_left, cell_right,
+        junction_template, j_A, j_B, n_cells=3,
+    )
+    assert poly == T_nx, (
+        f"compute_cycle_dp gave wrong polynomial.\n"
+        f"  nx:    {T_nx}\n"
+        f"  cq:    {poly}"
+    )
 
 
 def test_cell_quotient_dp_returns_none_on_non_cycle():
@@ -1378,20 +1444,6 @@ def _build_cm2_graph():
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    reason=(
-        "Pre-existing bug in `roots/cell_quotient_interleaved.py` orbit "
-        "aggregation. ValueError raised at `tutte/roots/aut_orbit.py:372` — "
-        "two partitions in the same per-cell orbit have polynomials "
-        "differing by an unaccounted (x-1)^4 factor (existing_val=(x-1)^4 vs "
-        "an unrelated polynomial). Same root-cause family as "
-        "`test_cm2_cell_quotient_dp_matches_engine` — divisor cancellation "
-        "missing in cell-quotient DP variants. Engine path "
-        "(cell_quotient_grid_dp_streamed) is correct and used in production."
-    ),
-    raises=ValueError,
-    strict=True,
-)
 def test_interleaved_dp_cm2_full():
     """Cm2 (2x2 K_{4,4} grid): full polynomial == engine AND Kirchhoff
     cross-check. ~1 minute cold (engine ~50s, interleaved ~37s)."""
@@ -1434,20 +1486,17 @@ def test_pair_orbit_M_table_matches_streamed_on_cm2_row():
     """
     import dwave_networkx as dnx
     from tutte.graphs.covering import try_hierarchical_partition
-    from tutte.roots.cell_anchor_adapter import (
-        detect_cell_anchor_groups, extract_grid_specs,
-    )
-    from tutte.roots.cell_quotient_grid import (
-        _grid_cell_layout, is_grid_topology,
-    )
+    from tutte.roots.cell_anchor_adapter import (detect_cell_anchor_groups,
+                                                 extract_grid_specs)
+    from tutte.roots.cell_quotient_grid import (_grid_cell_layout,
+                                                is_grid_topology)
     from tutte.roots.cell_quotient_helpers import (
         components_touching, orbit_convolve, precompute_M_table,
-        precompute_M_table_pair_orbit,
-    )
+        precompute_M_table_pair_orbit)
     from tutte.roots.cell_quotient_path import compute_path_dp_grouped
-    from tutte.roots.rooted_tutte import (
-        all_partitions, relabel_partition_dict, t_rooted_cached,
-    )
+    from tutte.roots.rooted_tutte import (all_partitions,
+                                          relabel_partition_dict,
+                                          t_rooted_cached)
 
     g = dnx.chimera_graph(2)
     G_graph = Graph.from_networkx(g)
@@ -1585,7 +1634,7 @@ def test_pair_orbit_M_table_matches_streamed_on_cm2_row():
 
 @pytest.mark.slow
 def test_grid_dp_streamed_kab_cm2_matches_engine():
-    """Cm2 (2x2 K_{4,4} grid) via Phase B Round 6 v5 streamed grid DP.
+    """Cm2 (2x2 K_{4,4} grid) via streamed grid DP.
 
     Exercises `compute_grid_dp_streamed_kab` end-to-end with detection +
     grid_specs extraction. Asserts polynomial equality with the engine.
@@ -1593,12 +1642,11 @@ def test_grid_dp_streamed_kab_cm2_matches_engine():
     """
     import dwave_networkx as dnx
     from tutte.graphs.covering import try_hierarchical_partition
-    from tutte.roots.cell_anchor_adapter import (
-        detect_cell_anchor_groups, extract_grid_specs,
-    )
-    from tutte.roots.cell_quotient_grid import (
-        _grid_cell_layout, compute_grid_dp_streamed_kab, is_grid_topology,
-    )
+    from tutte.roots.cell_anchor_adapter import (detect_cell_anchor_groups,
+                                                 extract_grid_specs)
+    from tutte.roots.cell_quotient_grid import (_grid_cell_layout,
+                                                compute_grid_dp_streamed_kab,
+                                                is_grid_topology)
 
     g_nx = dnx.chimera_graph(2)
     G = Graph.from_networkx(g_nx)

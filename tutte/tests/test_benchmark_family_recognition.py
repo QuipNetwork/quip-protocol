@@ -17,6 +17,8 @@ import random
 import signal
 import time
 
+import pytest
+
 import networkx as nx
 import pytest
 from tutte.graph import Graph
@@ -463,7 +465,7 @@ def test_benchmark_family():
     family_key = os.environ.get("FAMILY", "").strip().lower()
     if not family_key:
         available = ", ".join(name for name, _ in FAMILY_GENERATORS)
-        raise ValueError(
+        pytest.skip(
             f"FAMILY env var not set. Choose one of: {available}\n"
             f"  Example: FAMILY=Wheel make benchmark-family"
         )

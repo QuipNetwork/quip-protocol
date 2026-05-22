@@ -100,6 +100,11 @@ ffi.cdef("""
         int* out_xy, long long* out_coeffs, int* out_n_terms, int max_out,
         long long conv_prime);
 
+    /* Profiling: read/reset/size the per-thread DP stat counters. */
+    void treewidth_get_stats(long long* out, int n);
+    void treewidth_reset_stats(void);
+    int treewidth_stats_size(void);
+
 """)
 
 ffi.set_source("_treewidth_cffi", r"""
@@ -107,6 +112,7 @@ ffi.set_source("_treewidth_cffi", r"""
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>
 
 /* =========================================================================
    PARTITION ENCODING (4 bits per element, max 16 elements)
@@ -156,6 +162,35 @@ static __thread struct {
     uint8_t  used;
 } ccache[CCACHE_CAP];
 
+/* Profiling counters incremented in hot paths. Read via
+   treewidth_get_stats(); reset via treewidth_reset_stats(). All counts
+   are per-thread so multi-prime parallel runs have separate counters. */
+typedef struct {
+    long long n_poly_mul_monomial;
+    long long n_poly_mul_general;
+    long long n_coeff_mul_inner;     /* cumulative p->n * q->n across general muls */
+    long long sum_poly_mul_n_out;    /* cumulative result size */
+    long long n_cached_connect_hit;
+    long long n_cached_connect_miss;
+    long long n_dpt_add;
+    long long n_merge_tables;
+    long long n_poly_shift;
+    long long n_poly_copy;
+    long long n_poly_add_inplace;
+    long long n_process_bag_calls;
+    long long n_encoded_forget;
+    long long sum_merge_parent_n;    /* sum of parent.n across all merge calls */
+    long long sum_merge_n_groups;    /* sum of n_groups across all merge calls */
+    long long sum_merge_pbo_n_total; /* sum of pbo.n across (merge, group) pairs */
+    long long n_merge_group_iters;   /* count of (merge, group) pairs */
+    /* Per-merge cumulative time (ns) — split into the dominant phases.
+       Only populated when treewidth_record_bag_times=1. */
+    long long ns_total_merge_tables; /* sum over merge_tables calls */
+    long long ns_pbo_build;          /* phase 1: parent → pbo via dpt_add */
+    long long ns_pbo_collect;        /* phase 2: pbo → result via poly_mul+dpt_add */
+} TWStats;
+static __thread TWStats g_tw_stats;
+
 static uint64_t cached_connect(uint64_t enc, int i, int j) {
     uint64_t h64 = enc * 0x9E3779B97F4A7C15ULL + (uint64_t)i * 31 + j;
     uint32_t h = (uint32_t)(h64 >> 43) & CCACHE_MASK;
@@ -163,15 +198,19 @@ static uint64_t cached_connect(uint64_t enc, int i, int j) {
     int probe;
     for (probe = 0; probe < 8; probe++) {
         uint32_t slot = (h + probe) & CCACHE_MASK;
-        if (ccache[slot].used && ccache[slot].enc == enc && ccache[slot].ij == ij)
+        if (ccache[slot].used && ccache[slot].enc == enc && ccache[slot].ij == ij) {
+            g_tw_stats.n_cached_connect_hit++;
             return ccache[slot].val;
+        }
         if (!ccache[slot].used) {
+            g_tw_stats.n_cached_connect_miss++;
             uint64_t result = encoded_connect(enc, i, j);
             ccache[slot].enc = enc; ccache[slot].ij = ij;
             ccache[slot].val = result; ccache[slot].used = 1;
             return result;
         }
     }
+    g_tw_stats.n_cached_connect_miss++;
     return encoded_connect(enc, i, j);
 }
 
@@ -181,6 +220,7 @@ typedef struct {
 } ForgetResult;
 
 static ForgetResult encoded_forget(uint64_t enc, int pos) {
+    g_tw_stats.n_encoded_forget++;
     int n = (int)(enc & 0xF);
     int lbl_i = (int)((enc >> (4 + pos*4)) & 0xF);
     int count = 0;
@@ -432,6 +472,7 @@ static Poly* poly_one(void) {
 }
 
 static Poly* poly_copy(const Poly* src) {
+    g_tw_stats.n_poly_copy++;
     Poly* dst = poly_alloc(src->n > 0 ? src->n : 64);
     memcpy(dst->keys, src->keys, src->n * sizeof(uint16_t));
     memcpy(dst->vals, src->vals, src->n * sizeof(int64_t));
@@ -439,20 +480,32 @@ static Poly* poly_copy(const Poly* src) {
     return dst;
 }
 
+/* Thread-local buffer for poly_add_inplace. Avoids a per-call 80KB stack
+   frame (8192 × uint16_t + 8192 × int64_t) which touches stack pages
+   and hurts L1 cache locality across the 459M+ poly_add_inplace calls
+   in a typical Z(1, 2)-class DP. Grown on demand. */
+static __thread uint16_t* tl_padd_buf_k = NULL;
+static __thread int64_t*  tl_padd_buf_v = NULL;
+static __thread int       tl_padd_buf_cap = 0;
+
+static inline void padd_buf_ensure(int needed) {
+    if (needed <= tl_padd_buf_cap) return;
+    int new_cap = tl_padd_buf_cap > 0 ? tl_padd_buf_cap * 2 : 1024;
+    while (new_cap < needed) new_cap *= 2;
+    free(tl_padd_buf_k); free(tl_padd_buf_v);
+    tl_padd_buf_k = (uint16_t*)malloc(new_cap * sizeof(uint16_t));
+    tl_padd_buf_v = (int64_t*)malloc(new_cap * sizeof(int64_t));
+    tl_padd_buf_cap = new_cap;
+}
+
 /* dst += src (sorted merge) */
 static void poly_add_inplace(Poly* dst, const Poly* src) {
+    g_tw_stats.n_poly_add_inplace++;
     if (src->n == 0) return;
     int needed = dst->n + src->n;
-    uint16_t tk[8192]; int64_t tv[8192];
-    uint16_t* tmp_k; int64_t* tmp_v;
-    int heap = 0;
-    if (needed <= 8192) {
-        tmp_k = tk; tmp_v = tv;
-    } else {
-        tmp_k = (uint16_t*)malloc(needed * sizeof(uint16_t));
-        tmp_v = (int64_t*)malloc(needed * sizeof(int64_t));
-        heap = 1;
-    }
+    padd_buf_ensure(needed);
+    uint16_t* tmp_k = tl_padd_buf_k;
+    int64_t*  tmp_v = tl_padd_buf_v;
     int di = 0, si = 0, wi = 0;
     int dn = dst->n, sn = src->n;
     while (di < dn && si < sn) {
@@ -472,11 +525,12 @@ static void poly_add_inplace(Poly* dst, const Poly* src) {
     memcpy(dst->keys, tmp_k, wi * sizeof(uint16_t));
     memcpy(dst->vals, tmp_v, wi * sizeof(int64_t));
     dst->n = wi;
-    if (heap) { free(tmp_k); free(tmp_v); }
+    /* No heap free needed — buffer is thread-local and reused. */
 }
 
 /* Shift all keys by delta */
 static Poly* poly_shift(const Poly* p, int delta_key) {
+    g_tw_stats.n_poly_shift++;
     Poly* r = poly_alloc(p->n > 0 ? p->n : 64);
     int i;
     for (i = 0; i < p->n; i++) {
@@ -511,6 +565,7 @@ static Poly* poly_mul(const Poly* p, const Poly* q) {
     if (p->n == 0 || q->n == 0) return poly_zero();
     /* Monomial fast paths */
     if (p->n == 1) {
+        g_tw_stats.n_poly_mul_monomial++;
         Poly* r = poly_alloc(q->n);
         uint16_t pk = p->keys[0]; int64_t pv = p->vals[0];
         int i;
@@ -522,6 +577,7 @@ static Poly* poly_mul(const Poly* p, const Poly* q) {
         return r;
     }
     if (q->n == 1) {
+        g_tw_stats.n_poly_mul_monomial++;
         Poly* r = poly_alloc(p->n);
         uint16_t qk = q->keys[0]; int64_t qv = q->vals[0];
         int i;
@@ -533,6 +589,8 @@ static Poly* poly_mul(const Poly* p, const Poly* q) {
         return r;
     }
     /* General: hash table accumulation using thread-local reusable buffer */
+    g_tw_stats.n_poly_mul_general++;
+    g_tw_stats.n_coeff_mul_inner += (long long)p->n * (long long)q->n;
     int total = p->n * q->n;
     int ht_cap = 1;
     while (ht_cap < total * 4) ht_cap <<= 1;
@@ -573,6 +631,7 @@ static Poly* poly_mul(const Poly* p, const Poly* q) {
         }
     }
     r->n = wi;
+    g_tw_stats.sum_poly_mul_n_out += wi;
     /* Insertion sort (polynomials are typically < 500 terms) */
     for (i = 1; i < wi; i++) {
         uint16_t key = r->keys[i]; int64_t val = r->vals[i];
@@ -655,6 +714,7 @@ static void dpt_set(DPTable* t, uint64_t key, Poly* val) {
 
 /* Add poly to existing entry (or create new) */
 static void dpt_add(DPTable* t, uint64_t key, const Poly* val) {
+    g_tw_stats.n_dpt_add++;
     Poly* existing = dpt_get(t, key);
     if (existing) { poly_add_inplace(existing, val); }
     else { dpt_set(t, key, poly_copy(val)); }
@@ -737,6 +797,7 @@ static uint64_t apply_conn_merge(uint64_t enc, const ConnKey* ck,
 static DPTable* merge_tables(DPTable* parent, DPTable* child,
                               const int* parent_verts, int n_parent,
                               const int* shared_verts, int n_shared) {
+    g_tw_stats.n_merge_tables++;
     if (n_shared == 0) {
         /* No shared: multiply by sum of child polys */
         Poly* child_sum = poly_zero();
@@ -800,6 +861,12 @@ static DPTable* merge_tables(DPTable* parent, DPTable* child,
 
     DPTable* result = dpt_alloc(parent->n * 2);
 
+    g_tw_stats.sum_merge_parent_n += parent->n;
+    g_tw_stats.sum_merge_n_groups += n_groups;
+
+    struct timespec ts_a, ts_b, ts_c;
+    clock_gettime(CLOCK_MONOTONIC, &ts_a);
+
     for (int gi = 0; gi < n_groups; gi++) {
         /* Group parents by output merged partition */
         DPTable* pbo = dpt_alloc(parent->n);
@@ -808,6 +875,9 @@ static DPTable* merge_tables(DPTable* parent, DPTable* child,
             uint64_t merged = apply_conn_merge(parent->keys[i], &cg_keys[gi], shared_pos);
             dpt_add(pbo, merged, parent->vals[i]);
         }
+        g_tw_stats.sum_merge_pbo_n_total += pbo->n;
+        g_tw_stats.n_merge_group_iters++;
+        clock_gettime(CLOCK_MONOTONIC, &ts_b);
         /* Multiply each grouped parent by child group poly */
         for (i = 0; i < pbo->cap; i++) {
             if (!pbo->used[i]) continue;
@@ -816,6 +886,12 @@ static DPTable* merge_tables(DPTable* parent, DPTable* child,
             poly_free(prod);
         }
         dpt_free(pbo);
+        clock_gettime(CLOCK_MONOTONIC, &ts_c);
+        g_tw_stats.ns_pbo_build += (ts_b.tv_sec - ts_a.tv_sec) * 1000000000LL
+                                 + (ts_b.tv_nsec - ts_a.tv_nsec);
+        g_tw_stats.ns_pbo_collect += (ts_c.tv_sec - ts_b.tv_sec) * 1000000000LL
+                                   + (ts_c.tv_nsec - ts_b.tv_nsec);
+        ts_a = ts_c;
     }
 
     for (i = 0; i < n_groups; i++) poly_free(cg_polys[i]);
@@ -844,6 +920,7 @@ typedef struct {
 static DPTable* process_bag(TDInfo* td, int bag_idx, int** out_verts, int* out_n);
 
 static DPTable* process_bag(TDInfo* td, int bag_idx, int** out_verts, int* out_n) {
+    g_tw_stats.n_process_bag_calls++;
     int bag_size = td->bag_sizes[bag_idx];
     const int* bag_v = td->bag_verts_flat + td->bag_verts_offsets[bag_idx];
 
@@ -2120,6 +2197,23 @@ int basis_convert_ab_to_xy(
     #undef BINOM2
     return 0;
 }
+
+/* =========================================================================
+   PROFILING EXPORTERS — read/reset per-thread g_tw_stats counters.
+   Order MUST match the TWStats struct field order.
+   ========================================================================= */
+void treewidth_get_stats(long long* out, int n) {
+    long long* src = (long long*)&g_tw_stats;
+    int size = (int)(sizeof(TWStats) / sizeof(long long));
+    int copy = n < size ? n : size;
+    for (int i = 0; i < copy; i++) out[i] = src[i];
+}
+void treewidth_reset_stats(void) {
+    memset(&g_tw_stats, 0, sizeof(g_tw_stats));
+}
+int treewidth_stats_size(void) {
+    return (int)(sizeof(TWStats) / sizeof(long long));
+}
 """)
 
 # Build/load
@@ -2177,13 +2271,23 @@ class BatchMerger:
 
         if n_parents > self._enc_cap:
             new_cap = max(n_parents, self._enc_cap * 2, 1024)
-            self._enc_buf = _ffi.new("long long[]", new_cap)
-            self._out_buf = _ffi.new("long long[]", new_cap)
+            # `unsigned long long[]` accepts the full uint64 range that
+            # `encode_partition` can produce for bags up to 15 elements
+            # (tw≤14). Signed `long long[]` here would overflow at the top
+            # nibble for tw=14 bags. Buffers are typed once and reused.
+            self._enc_buf = _ffi.new("unsigned long long[]", new_cap)
+            self._out_buf = _ffi.new("unsigned long long[]", new_cap)
             self._enc_cap = new_cap
 
         enc_list = list(parent_encs)
-        for i, e in enumerate(enc_list):
-            self._enc_buf[i] = e
+        try:
+            for i, e in enumerate(enc_list):
+                self._enc_buf[i] = e
+        except OverflowError:
+            # Encoding exceeds uint64 (header nibble already at length 16
+            # for tw=15+ bags). Signal Python fallback so the caller's
+            # `else` branch uses `encoded_merge_for_conn` instead.
+            return None, None, 0
 
         if conn_key not in self._pairs_cache:
             n_pairs = len(conn_key)
@@ -2203,8 +2307,13 @@ class BatchMerger:
             self._sp_cache[sp_key] = (sp, n_shared)
         sp, n_shared = self._sp_cache[sp_key]
 
+        # Cast unsigned buffers to long long* for the cdef signature; the
+        # bit pattern is preserved and the C code treats encodings as
+        # opaque bag-state keys (no arithmetic comparisons on signedness).
         self._lib.batch_merge(
-            self._enc_buf, n_parents, pairs_flat, n_pairs, sp, n_shared, self._out_buf)
+            _ffi.cast("long long*", self._enc_buf), n_parents,
+            pairs_flat, n_pairs, sp, n_shared,
+            _ffi.cast("long long*", self._out_buf))
         return enc_list, self._out_buf, n_parents
 
 

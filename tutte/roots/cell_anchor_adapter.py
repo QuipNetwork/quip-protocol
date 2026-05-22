@@ -442,7 +442,7 @@ def _find_cell_aut_to_canonical(
     map exists.
     """
     # Currently this is a placeholder using the simple bipartite-swap
-    # approach for K_{4,4} cells. For full generality (Phase 18.E.3.h),
+    # approach for K_{4,4} cells. For full generality,
     # iterate VF2 isomorphisms with anchor-set constraints.
     raise NotImplementedError(
         "Generic VF2-based aut finder pending; "
@@ -622,7 +622,7 @@ def normalize_cell_anchors_for_cycle(
 
     # Align via bipartite swap if cell is bipartite (covers K_{a,b} cells
     # like Cm's K_{4,4}). For non-bipartite cells, generic Aut-based
-    # alignment (Phase 18.E.3.h) — currently raises.
+    # alignment — currently raises.
     nxg = nx.Graph()
     nxg.add_nodes_from(cell_template.nodes)
     nxg.add_edges_from(cell_template.edges)

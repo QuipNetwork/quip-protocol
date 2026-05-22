@@ -578,6 +578,14 @@ def compute_path_dp_grouped(
 
     t = time.perf_counter()
     if enable_per_cell_compression and state_cell_groups:
+        # NOTE: this can raise `PerCellPreconditionViolated` (subclass of
+        # ValueError) when the input T_rooted dict has partitions
+        # whose per-cell canonical key collides with non-equal polynomial
+        # values. Symptom seen with persistent T_rooted cache auto-load
+        # on Cm_2 modular DP. Task #301 tracks the underlying fix
+        # (the downstream key format isn't compatible with a fallback
+        # to aut_compress_t_rooted, so a real fix needs to tighten
+        # per_cell_canonical_key itself).
         state_orbit_T, state_orbit_partitions = aut_compress_t_rooted_per_cell(
             state_partition, state_cell_groups,
         )

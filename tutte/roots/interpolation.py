@@ -1,6 +1,6 @@
 """Bivariate Lagrange interpolation over a prime field.
 
-Used by Round 12 (integer DP + CRT) to recover the Tutte polynomial
+Used by the integer-DP + CRT pathway to recover the Tutte polynomial
 coefficients from point-value evaluations modulo a prime, then later
 CRT-combine across primes for exact integer coefficients.
 

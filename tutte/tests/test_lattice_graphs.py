@@ -2225,6 +2225,7 @@ _LATTICE_BUILDERS = {
     ),
 }
 
+@pytest.mark.slow
 def test_lattice_interactive():
     """Verify transfer matrix Tutte polynomial for a user-specified lattice.
 

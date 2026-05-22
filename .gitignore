@@ -69,3 +69,5 @@ localhost.pem
 # results live in tutte/research/ (top level) and ARE tracked in git.
 tutte/research/scripts/
 tutte/research/data/
+tutte/research/docs/
+tutte/research/plans/

@@ -661,21 +661,66 @@ def compute_best_tree_decomposition(
     if ordering is not None:
         _consider(_build_decomposition(mg, ordering, adj))
 
-    # minfill with random tie-breaking
-    # Use more seeds for higher treewidth graphs where decomposition quality matters more.
-    # For tw>=9 (e.g. Z(1,2)), DP cost varies up to 3x between orderings.
-    if best_td is not None and best_td.width >= 9:
+    # mindegree deterministic baseline. Sometimes finds a different elimination
+    # ordering than minfill (e.g. on graphs with high-fill-in vertices that
+    # are nonetheless low-degree). Cheap (~ms) — always worth trying.
+    ordering = _elimination_ordering(adj, nodes, heuristic="mindegree", max_width=max_width)
+    if ordering is not None:
+        _consider(_build_decomposition(mg, ordering, adj))
+
+    # minfill with random tie-breaking.
+    # Search budget scales with treewidth — per-bag DP cost is
+    # ~Bell(tw+1) × 2^(tw+1), so each width reduction in the chosen
+    # ordering compounds the savings. Decomposition-ordering search is
+    # O(20ms × n_seeds) which dwarfs the DP cost only for tw ≤ 5; for
+    # tw ≥ 12 the search itself amortizes against multi-minute DPs.
+    #
+    # Early-exit: after N consecutive seeds without improvement OR a
+    # time budget, stop. Avoids burning seeds when the heuristic has
+    # converged — common for highly symmetric graphs like
+    # K_{n,n}-derived families where minfill_random hits the same local
+    # optimum repeatedly.
+    if best_td is None:
+        n_seeds = 20
+        no_improve_cap = 20  # essentially: no early exit if nothing found
+        time_budget = None
+    elif best_td.width >= 12:
+        n_seeds = 500   # tw 12-15 band: per-point DP runs in minutes
+        no_improve_cap = 80
+        time_budget = 30.0  # seconds
+    elif best_td.width >= 9:
         n_seeds = 200
-    elif best_td is not None and best_td.width >= 8:
+        no_improve_cap = 60
+        time_budget = 10.0
+    elif best_td.width >= 8:
         n_seeds = 50
+        no_improve_cap = 30
+        time_budget = 5.0
     else:
         n_seeds = 20
+        no_improve_cap = 20
+        time_budget = None
+
+    import time as _time
+    deadline = (_time.time() + time_budget) if time_budget is not None else None
+    no_improve = 0
     for seed in range(n_seeds):
+        prev_best_width = best_td.width if best_td is not None else float("inf")
+        prev_best_cost = best_cost
         ordering = _elimination_ordering(
             adj, nodes, heuristic="minfill_random", seed=seed, max_width=max_width
         )
         if ordering is not None:
             _consider(_build_decomposition(mg, ordering, adj))
+        new_best_width = best_td.width if best_td is not None else float("inf")
+        if new_best_width < prev_best_width or best_cost < prev_best_cost:
+            no_improve = 0
+        else:
+            no_improve += 1
+        if no_improve >= no_improve_cap:
+            break
+        if deadline is not None and _time.time() > deadline:
+            break
 
     # Apply edge redistribution to minimize DP cost
     if best_td is not None:
@@ -1060,10 +1105,17 @@ def _merge_tables(
 
         parents_by_output: Dict[int, Poly] = {}
 
-        # Use C batch merge if available (5x faster for partition encoding)
+        # Use C batch merge if available (5x faster for partition encoding).
+        # When the C merger returns (None, None, 0) the encoding exceeds
+        # uint64 bounds (tw≥15 bag); fall through to the pure-Python branch.
+        c_result = None
         if _c_batch_merge is not None:
-            enc_list, out_buf, n = _c_batch_merge(
+            c_result = _c_batch_merge(
                 parent_table.keys(), conn_key, shared_positions_in_parent)
+            if c_result[0] is None:
+                c_result = None
+        if c_result is not None:
+            enc_list, out_buf, n = c_result
             for i in range(n):
                 merged_enc = out_buf[i]
                 parent_poly = parent_table[enc_list[i]]

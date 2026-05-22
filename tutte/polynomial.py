@@ -87,6 +87,12 @@ def decode_varsint(data: bytes, offset: int = 0) -> Tuple[int, int]:
 # TUTTE POLYNOMIAL CLASS
 # =============================================================================
 
+# Cache for common single-term polynomials (one, zero, x, y). Hot-path
+# SP reduction and chord-rule iteration request these thousands of
+# times each; caching saves the encode/decode roundtrip.
+_ONE_TERM_CACHE: Dict[Tuple, 'TuttePolynomial'] = {}
+
+
 @dataclass(frozen=True)
 class TuttePolynomial:
     """Represents a Tutte polynomial as an immutable bitstring.
@@ -126,6 +132,14 @@ class TuttePolynomial:
             raise ValueError("Power must be non-negative")
         if power == 0:
             return cls.one()
+        # Hot path: bare x is requested thousands of times during SP
+        # reduction and chord-rule iteration. Cache it.
+        if power == 1:
+            cached = _ONE_TERM_CACHE.get(('x', 1))
+            if cached is None:
+                cached = cls.from_coefficients({(1, 0): 1})
+                _ONE_TERM_CACHE[('x', 1)] = cached
+            return cached
         return cls.from_coefficients({(power, 0): 1})
 
     @classmethod
@@ -135,17 +149,31 @@ class TuttePolynomial:
             raise ValueError("Power must be non-negative")
         if power == 0:
             return cls.one()
+        if power == 1:
+            cached = _ONE_TERM_CACHE.get(('y', 1))
+            if cached is None:
+                cached = cls.from_coefficients({(0, 1): 1})
+                _ONE_TERM_CACHE[('y', 1)] = cached
+            return cached
         return cls.from_coefficients({(0, power): 1})
 
     @classmethod
     def one(cls) -> 'TuttePolynomial':
         """Create constant 1 (empty graph on one vertex)."""
-        return cls.from_coefficients({(0, 0): 1})
+        cached = _ONE_TERM_CACHE.get(('one',))
+        if cached is None:
+            cached = cls.from_coefficients({(0, 0): 1})
+            _ONE_TERM_CACHE[('one',)] = cached
+        return cached
 
     @classmethod
     def zero(cls) -> 'TuttePolynomial':
         """Create constant 0."""
-        return cls.from_coefficients({})
+        cached = _ONE_TERM_CACHE.get(('zero',))
+        if cached is None:
+            cached = cls.from_coefficients({})
+            _ONE_TERM_CACHE[('zero',)] = cached
+        return cached
 
     def __add__(self, other: 'TuttePolynomial') -> 'TuttePolynomial':
         """Add two Tutte polynomials."""
@@ -263,7 +291,7 @@ class TuttePolynomial:
 
         All arithmetic is integer/modular — no floats. Used as the
         building block for integer-DP + Lagrange-interpolation
-        recovery of T(G; x, y) over large graphs (Round 12).
+        recovery of T(G; x, y) over large graphs.
 
         Caller passes a prime `p`; we use `pow(base, exp, p)` to keep
         intermediate values bounded even when `x` or `y` is comparable

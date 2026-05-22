@@ -7,7 +7,7 @@ computes T(graph) by:
 2. Path-DP through n-1 cell-junction steps using vertex-sum convolution.
 3. Cycle-close at last junction via identification formula.
 
-Key innovations (Phase 18.E.3.e Week 3):
+Key innovations:
 - c_J auto-detection for disconnected junctions (M_k matchings):
   divisor = (x-1)^{|S| - c_J(S)} instead of (x-1)^{|S|-1}.
 - Orbit-level M_precompute (143× speedup): pick rep_state ∈ O_state.
@@ -31,21 +31,12 @@ from typing import Dict, List, Tuple
 
 from ..graph import Graph
 from ..polynomial import TuttePolynomial
-from .aut_orbit import (
-    aut_compress_t_rooted,
-    build_relabel_aut,
-)
-from .cell_quotient_helpers import (
-    components_touching,
-    enumerate_partitions_cached,
-    orbit_convolve,
-    precompute_M_table,
-)
-from .rooted_tutte import (
-    divide_by_x_minus_1_power,
-    relabel_partition_dict,
-    t_rooted_cached,
-)
+from .aut_orbit import aut_compress_t_rooted, build_relabel_aut
+from .cell_quotient_helpers import (components_touching,
+                                    enumerate_partitions_cached,
+                                    orbit_convolve, precompute_M_table)
+from .rooted_tutte import (divide_by_x_minus_1_power, relabel_partition_dict,
+                           t_rooted_cached)
 
 
 def compute_cycle_dp(

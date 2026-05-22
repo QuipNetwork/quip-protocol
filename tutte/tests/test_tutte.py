@@ -10,14 +10,14 @@ Sections:
     G. Performance regression
 
     --- Algebraic formulas (formerly test_formulas.py) ---
-    H. Unified formula (Phase 11/12) — T(G) = (∏ T(cells)) · T(H)
-    I. k-matching formula (Phase 13/15) — closed-form for k-edge matchings
+    H. Unified formula — T(G) = (∏ T(cells)) · T(H)
+    I. k-matching formula — closed-form for k-edge matchings
     J. Multivariate Z (Sokal) — UniformZ + MultivariateTutte
     K. Bridge-aware chord rule on K_k ⊕_k K_k
 
     --- Engine pipeline dispatch (formerly test_engine_pipeline.py) ---
-    L. Heterogeneous tiling (Phase 3.1)
-    M. Raised k-sum cap (Phase 3.2)
+    L. Heterogeneous tiling 
+    M. Raised k-sum cap 
     N. Forced-hierarchical regression
 
     --- Parallel synthesis (formerly test_parallel.py) ---
@@ -33,14 +33,14 @@ import time
 
 import networkx as nx
 import pytest
-from tutte.graph import (Graph, complete_graph, cut_vertex_join,
-                              cycle_graph, disjoint_union, grid_graph,
-                              path_graph, petersen_graph, wheel_graph)
+from tutte.graph import (Graph, complete_graph, cut_vertex_join, cycle_graph,
+                         disjoint_union, grid_graph, path_graph,
+                         petersen_graph, wheel_graph)
 from tutte.polynomial import TuttePolynomial
 from tutte.synthesis import SynthesisEngine
 from tutte.validation import (compute_tutte_networkx,
-                                   count_spanning_trees_kirchhoff,
-                                   verify_spanning_trees)
+                              count_spanning_trees_kirchhoff,
+                              verify_spanning_trees)
 
 # =============================================================================
 # A. SPANNING TREE VERIFICATION (Kirchhoff)
@@ -513,9 +513,8 @@ def test_high_degree_tree_minor():
 
 def test_binary_roundtrip():
     """Encode→decode preserves all entries and polynomials."""
-    from tutte.lookup import (RainbowTable,
-                                          encode_rainbow_table_binary,
-                                          decode_rainbow_table_binary)
+    from tutte.lookup import (RainbowTable, decode_rainbow_table_binary,
+                              encode_rainbow_table_binary)
 
     table = RainbowTable()
     k3 = complete_graph(3)
@@ -545,9 +544,8 @@ def test_binary_roundtrip():
 
 def test_binary_roundtrip_with_minors():
     """Minor relationships survive binary encode→decode roundtrip."""
-    from tutte.lookup import (RainbowTable,
-                                          encode_rainbow_table_binary,
-                                          decode_rainbow_table_binary)
+    from tutte.lookup import (RainbowTable, decode_rainbow_table_binary,
+                              encode_rainbow_table_binary)
 
     table = RainbowTable()
     k3 = complete_graph(3)
@@ -589,12 +587,10 @@ def test_binary_roundtrip_with_minors():
 # Imports needed for sections H-K
 import dwave_networkx as dnx  # noqa: E402
 from tutte.graph import MultiGraph, k_sum_graph  # noqa: E402
-from tutte.graphs.covering import (  # noqa: E402
-    KMatchingJunction,
-    apply_kmatching_formula,
-    detect_kmatching_topology,
-    extract_cell_topology,
-)
+from tutte.graphs.covering import (KMatchingJunction,  # noqa: E402
+                                   apply_kmatching_formula,
+                                   detect_kmatching_topology,
+                                   extract_cell_topology)
 from tutte.graphs.k_sum import clique_chord_k_sum  # noqa: E402
 from tutte.lookup.core import load_default_table  # noqa: E402
 from tutte.multivariate import MultivariateTutte, UniformZ  # noqa: E402
@@ -814,7 +810,7 @@ def test_cm2_chord_case_falls_through_to_treewidth_dp(table):
 
 
 # =============================================================================
-# I. K-MATCHING FORMULA (Phase 13/15)
+# I. K-MATCHING FORMULA 
 # =============================================================================
 
 
@@ -1100,10 +1096,8 @@ def test_verify_spanning_trees_uses_exact_arithmetic_on_dense_graphs():
     Sub-millisecond cost on small graphs.
     """
     from tutte.polynomial import TuttePolynomial
-    from tutte.validation import (
-        count_spanning_trees_kirchhoff,
-        verify_spanning_trees,
-    )
+    from tutte.validation import (count_spanning_trees_kirchhoff,
+                                  verify_spanning_trees)
 
     # Build K_3+K_9+K_3 router (15n 96e, cograph)
     G = nx.Graph()
@@ -1335,10 +1329,8 @@ def test_chord_rule_does_not_regress_petersen(hybrid_engine):
 # L-N. ENGINE PIPELINE DISPATCH
 # =============================================================================
 
-from tutte.graphs.covering import (  # noqa: E402
-    try_heterogeneous_partition,
-    try_hierarchical_partition,
-)
+from tutte.graphs.covering import (try_heterogeneous_partition,  # noqa: E402
+                                   try_hierarchical_partition)
 
 
 @pytest.fixture(scope="module")
@@ -1347,7 +1339,7 @@ def pipeline_engine(table):
 
 
 # =============================================================================
-# L. HETEROGENEOUS TILING (Phase 3.1)
+# L. HETEROGENEOUS TILING 
 # =============================================================================
 
 
@@ -1434,7 +1426,7 @@ def test_petersen_homogeneous_still_wins(pipeline_engine, table):
 
 
 # =============================================================================
-# M. RAISED K-SUM CAP (Phase 3.2)
+# M. RAISED K-SUM CAP 
 # =============================================================================
 
 
@@ -1589,8 +1581,9 @@ def test_pm2_routes_through_chord_rule(table):
 def test_cell_quotient_tree_dp_path_topology(table):
     """compute_cell_quotient_tree_dp returns correct polynomial on a
     K_{4,4} 3-cell M_2 path tree topology graph."""
+    from tutte.research.scripts.tree_dp_branching import \
+        build_tree_graph
     from tutte.roots import compute_cell_quotient_tree_dp
-    from tutte.research.scripts.tree_dp_phase3_branching import build_tree_graph
 
     K44 = Graph.from_networkx(nx.complete_bipartite_graph(4, 4))
     edges = [(0, 1), (1, 2)]
@@ -1607,8 +1600,9 @@ def test_cell_quotient_tree_dp_path_topology(table):
 def test_cell_quotient_tree_dp_branching_topology(table):
     """compute_cell_quotient_tree_dp returns correct polynomial on a
     K_{4,4} star (1 center + 4 leaves) M_2 graph."""
+    from tutte.research.scripts.tree_dp_branching import \
+        build_tree_graph
     from tutte.roots import compute_cell_quotient_tree_dp
-    from tutte.research.scripts.tree_dp_phase3_branching import build_tree_graph
 
     K44 = Graph.from_networkx(nx.complete_bipartite_graph(4, 4))
     edges = [(0, 1), (0, 2), (0, 3), (0, 4)]
@@ -1664,8 +1658,9 @@ def test_cell_quotient_hybrid_3_K3_3_cycle(table):
 def test_cell_quotient_hybrid_returns_none_on_tree(table):
     """compute_cell_quotient_hybrid returns None when cell-quotient is
     a tree (tree DP handles those)."""
+    from tutte.research.scripts.tree_dp_branching import \
+        build_tree_graph
     from tutte.roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
-    from tutte.research.scripts.tree_dp_phase3_branching import build_tree_graph
 
     K44 = Graph.from_networkx(nx.complete_bipartite_graph(4, 4))
     edges = [(0, 1), (1, 2)]
@@ -1817,13 +1812,11 @@ def test_cell_quotient_hybrid_2x2_K3_grid_M2_cross_anchors(table):
 
 import pickle  # noqa: E402
 
-from tutte.synthesis.parallel import parallel_synthesize_pair, shutdown_pool  # noqa: E402
+from tutte.synthesis.parallel import (parallel_synthesize_pair,  # noqa: E402
+                                      shutdown_pool)
 from tutte.synthesis.symmetric import (  # noqa: E402
-    build_symmetric_chord_order,
-    find_cell_automorphism,
-    pair_chords_by_symmetry,
-)
-
+    build_symmetric_chord_order, find_cell_automorphism,
+    pair_chords_by_symmetry)
 
 # =============================================================================
 # O. PICKLING ROUND-TRIP

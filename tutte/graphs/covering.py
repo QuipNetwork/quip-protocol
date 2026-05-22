@@ -14,19 +14,17 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, Set, Tuple, List, Optional, Iterator, FrozenSet
+from typing import Dict, FrozenSet, Iterator, List, Optional, Set, Tuple
 
 import networkx as nx
 from networkx.algorithms import isomorphism
 
-from ..graph import (
-    Graph, MultiGraph, CellSignature, NodeSignature,
-    compute_signature, compute_node_signature, compute_all_node_signatures
-)
+from ..graph import (CellSignature, Graph, MultiGraph, NodeSignature,
+                     compute_all_node_signatures, compute_node_signature,
+                     compute_signature)
+from ..logs import EventType, LogLevel, get_log
 from ..lookup.core import MinorEntry, RainbowTable
-from ..logs import get_log, EventType, LogLevel
 from ..polynomial import TuttePolynomial
-
 
 # =============================================================================
 # DATA CLASSES
@@ -303,6 +301,31 @@ def find_disjoint_cover(
     return cover
 
 
+_ATLAS_CACHE: Optional[List[Optional[Graph]]] = None
+
+
+def _graph_atlas_cached(n: int) -> Optional[Graph]:
+    """Return atlas index `n` from a one-shot bulk-loaded atlas cache.
+
+    Each `nx.graph_atlas(n)` call walks the gzip-compressed atlas DB
+    (~37ms per call). With ~1000 atlas entries in the default rainbow
+    table, repeated lookups dominate `find_cell_candidates` /
+    `try_heterogeneous_partition` (~36s wall on a cold table). Bulk-load
+    via `nx.graph_atlas_g()` once and serve from memory thereafter.
+    """
+    global _ATLAS_CACHE
+    if _ATLAS_CACHE is None:
+        import networkx as nx
+        atlas_list = list(nx.graph_atlas_g())
+        _ATLAS_CACHE = [
+            Graph.from_networkx(g) if g is not None and g.number_of_nodes() > 0 else None
+            for g in atlas_list
+        ]
+    if 0 <= n < len(_ATLAS_CACHE):
+        return _ATLAS_CACHE[n]
+    return None
+
+
 def _minor_to_graph(minor: MinorEntry) -> Optional[Graph]:
     """Reconstruct a graph from a minor entry.
 
@@ -313,9 +336,31 @@ def _minor_to_graph(minor: MinorEntry) -> Optional[Graph]:
     if minor.graph is not None:
         return minor.graph
 
-    from ..graph import complete_graph, cycle_graph, path_graph, star_graph, wheel_graph
+    from ..graph import (complete_graph, cycle_graph, path_graph, star_graph,
+                         wheel_graph)
+
+    def _mobius_ladder_nx(n: int):
+        """Möbius ladder ML_n: 2n vertices, cycle plus n diametric rungs."""
+        import networkx as nx
+        g = nx.cycle_graph(2 * n)
+        for i in range(n):
+            g.add_edge(i, i + n)
+        return g
 
     name = minor.name
+
+    # Complete bipartite graphs: K_{a,b}
+    # IMPORTANT: check K_{a,b} BEFORE K_n since K_{4,4} would otherwise
+    # match the K_n prefix and fail int(name[2:]) on "{4,4}".
+    if name.startswith('K_{') and ',' in name and name.endswith('}'):
+        try:
+            import networkx as nx
+            inner = name[3:-1]  # strip "K_{" and "}"
+            a_s, b_s = inner.split(',')
+            a, b = int(a_s.strip()), int(b_s.strip())
+            return Graph.from_networkx(nx.complete_bipartite_graph(a, b))
+        except (ValueError, ImportError):
+            pass
 
     # Complete graphs
     if name.startswith('K_'):
@@ -361,6 +406,7 @@ def _minor_to_graph(minor: MinorEntry) -> Optional[Graph]:
     if name.startswith('Z(') and ',' in name:
         try:
             import dwave_networkx as dnx
+
             # Parse "Z(m,t)" format
             inner = name[2:-1]  # Remove "Z(" and ")"
             m, t = inner.split(',')
@@ -389,6 +435,221 @@ def _minor_to_graph(minor: MinorEntry) -> Optional[Graph]:
             G = dnx.chimera_graph(m)
             return Graph.from_networkx(G)
         except (ValueError, ImportError):
+            pass
+
+    # NetworkX graph-atlas entries: atlas_N → nx.graph_atlas(N).
+    # The atlas covers all connected simple graphs up to 7 vertices
+    # (~1200 entries) — these are frequent rainbow-table candidates
+    # for small subgraph matching. Reconstruction is O(1) lookup via
+    # `_graph_atlas_cached`.
+    #
+    # NOTE: atlas reconstruction is GATED behind opt-in because it
+    # surfaces ~1000 extra "anonymous" candidates that are valid
+    # induced subgraphs of many target graphs but rarely the cell
+    # structure the downstream cell-quotient / k-matching consumers
+    # need. Without gating, K_4 path / K_3 cycle tests pick
+    # atlas_142-style cells over the intended K_n cells, then
+    # downstream specialization fails. Specific paths that benefit
+    # from atlas cells (small-graph tilings, family recognition) call
+    # `_graph_atlas_cached` directly.
+    if name.startswith('atlas_'):
+        return None
+
+    # Pan graphs: Pan_N → cycle C_N with a pendant edge (NetworkX has no
+    # builder; construct directly).
+    if name.startswith('Pan_'):
+        try:
+            import networkx as nx
+            n = int(name[4:])
+            if n < 3:
+                return None
+            g_nx = nx.cycle_graph(n)
+            g_nx.add_edge(0, n)  # pendant
+            return Graph.from_networkx(g_nx)
+        except ValueError:
+            pass
+
+    # Fan graphs: Fan_N → join of single vertex with path P_N.
+    if name.startswith('Fan_'):
+        try:
+            import networkx as nx
+            n = int(name[4:])
+            if n < 1:
+                return None
+            # F_n is K_1 + P_n; for n=1 it's just edge.
+            path = nx.path_graph(n)
+            g_nx = nx.Graph()
+            g_nx.add_nodes_from(path.nodes())
+            g_nx.add_edges_from(path.edges())
+            apex = n
+            g_nx.add_node(apex)
+            for v in range(n):
+                g_nx.add_edge(apex, v)
+            return Graph.from_networkx(g_nx)
+        except ValueError:
+            pass
+
+    # Helm graphs: Helm_N → wheel W_N with a pendant on each rim.
+    if name.startswith('Helm_'):
+        try:
+            import networkx as nx
+            n = int(name[5:])
+            if n < 3:
+                return None
+            g_nx = nx.wheel_graph(n + 1)
+            for v in range(1, n + 1):
+                g_nx.add_edge(v, n + 1 + v - 1)
+            return Graph.from_networkx(g_nx)
+        except ValueError:
+            pass
+
+    # Ladder graphs: Ladder_N → P_N × K_2.
+    if name.startswith('Ladder_'):
+        try:
+            import networkx as nx
+            n = int(name[7:])
+            if n < 2:
+                return None
+            return Graph.from_networkx(nx.ladder_graph(n))
+        except ValueError:
+            pass
+
+    # Möbius–Kantor / Möbius ladders: Mobius_N or MoebiusLadder_N.
+    if name.startswith('MoebiusLadder_') or name.startswith('MobiusLadder_'):
+        try:
+            import networkx as nx
+            n = int(name.split('_')[-1])
+            return Graph.from_networkx(nx.mobius_kantor_graph()) if n == 8 \
+                else None
+        except (ValueError, AttributeError):
+            pass
+
+    # Prism graphs: Prism_N → circular ladder CL_N.
+    if name.startswith('Prism_'):
+        try:
+            import networkx as nx
+            n = int(name[6:])
+            if n < 3:
+                return None
+            return Graph.from_networkx(nx.circular_ladder_graph(n))
+        except ValueError:
+            pass
+
+    # Book graphs: Book_N → N triangles sharing an edge.
+    if name.startswith('Book_'):
+        try:
+            import networkx as nx
+            n = int(name[5:])
+            if n < 1:
+                return None
+            # B_n = K_1 ∨ S_n (or star with each leaf joined to apex2).
+            g_nx = nx.Graph()
+            g_nx.add_edge(0, 1)  # shared edge
+            for k in range(n):
+                v = 2 + k
+                g_nx.add_edge(0, v)
+                g_nx.add_edge(1, v)
+            return Graph.from_networkx(g_nx)
+        except ValueError:
+            pass
+
+    # Gear graphs: Gear_N → wheel W_N with each rim edge subdivided.
+    # NetworkX has no built-in `gear_graph`; build explicitly.
+    if name.startswith('Gear_'):
+        try:
+            import networkx as nx
+            n = int(name[5:])
+            if n < 3:
+                return None
+            # Gear G_n: hub h, rim vertices r_0..r_{n-1}, subdivision
+            # vertices s_0..s_{n-1} between consecutive rim vertices.
+            g_nx = nx.Graph()
+            hub = 2 * n
+            for i in range(n):
+                g_nx.add_edge(hub, i)              # spokes
+                g_nx.add_edge(i, n + i)             # rim → subdiv
+                g_nx.add_edge(n + i, (i + 1) % n)   # subdiv → next rim
+            return Graph.from_networkx(g_nx)
+        except (ValueError, AttributeError):
+            pass
+
+    # Wheel_N alias for W_N.
+    if name.startswith('Wheel_'):
+        try:
+            n = int(name[6:])
+            return wheel_graph(n)
+        except ValueError:
+            pass
+
+    # Möbius ladder: Mobius_N → ML_N (cycle on 2N vertices + N diametrically
+    # opposite "rung" edges). All values of N use the same ladder construction
+    # — Mobius_8 is the Möbius ladder ML_8, NOT the (similarly-sized)
+    # Möbius–Kantor graph GP(8,3).
+    if name.startswith('Mobius_'):
+        try:
+            n = int(name[7:])
+            if n < 3:
+                return None
+            return Graph.from_networkx(_mobius_ladder_nx(n))
+        except ValueError:
+            pass
+
+    # Grid_AxB → nx.grid_2d_graph(A, B) with integer relabel.
+    if name.startswith('Grid_') and 'x' in name[5:]:
+        try:
+            import networkx as nx
+            inner = name[5:]
+            a_s, b_s = inner.split('x')
+            a, b = int(a_s), int(b_s)
+            g_nx = nx.grid_2d_graph(a, b)
+            return Graph.from_networkx(nx.convert_node_labels_to_integers(g_nx))
+        except ValueError:
+            pass
+
+    # Petersen
+    if name == 'Petersen':
+        try:
+            import networkx as nx
+            return Graph.from_networkx(nx.petersen_graph())
+        except (ImportError, AttributeError):
+            pass
+
+    # Heawood
+    if name == 'Heawood':
+        try:
+            import networkx as nx
+            return Graph.from_networkx(nx.heawood_graph())
+        except (ImportError, AttributeError):
+            pass
+
+    # Desargues
+    if name == 'Desargues':
+        try:
+            import networkx as nx
+            return Graph.from_networkx(nx.desargues_graph())
+        except (ImportError, AttributeError):
+            pass
+
+    # Dodecahedral
+    if name == 'Dodecahedral':
+        try:
+            import networkx as nx
+            return Graph.from_networkx(nx.dodecahedral_graph())
+        except (ImportError, AttributeError):
+            pass
+
+    # Sunlet graphs: Sunlet_N → cycle C_N with a pendant at each vertex.
+    if name.startswith('Sunlet_'):
+        try:
+            import networkx as nx
+            n = int(name[7:])
+            if n < 3:
+                return None
+            g_nx = nx.cycle_graph(n)
+            for v in range(n):
+                g_nx.add_edge(v, n + v)
+            return Graph.from_networkx(g_nx)
+        except ValueError:
             pass
 
     return None
@@ -580,19 +841,12 @@ def find_cell_candidates(
     candidates = []
 
     for entry in table.entries.values():
-        # Skip entries without stored graphs (can't use as tiles)
-        if entry.graph is None:
-            # Try to reconstruct from name
-            pattern = _minor_to_graph(entry)
-            if pattern is None:
-                continue
-        else:
-            pattern = entry.graph
-
         cell_nodes = entry.node_count
         cell_edges = entry.edge_count
 
-        # Filter 1: node count must divide evenly
+        # Filter 1 (cheap): node count must divide evenly. Do this BEFORE
+        # any reconstruction or signature work to avoid touching entries
+        # that can't possibly tile.
         if cell_nodes <= 0 or target_nodes % cell_nodes != 0:
             continue
 
@@ -600,19 +854,27 @@ def find_cell_candidates(
         if k < min_cells:
             continue
 
-        # Filter 2: edge count consistency
-        # k disjoint cells have k * cell_edges edges
-        # Inter-cell edges add to this
+        # Filter 2 (cheap): edge count consistency.
         cell_total_edges = k * cell_edges
         inter_cell_edges = target_edges - cell_total_edges
 
         if inter_cell_edges < 0:
             continue  # Would need negative inter-cell edges
 
-        # Filter 3: degree sequence compatibility
-        # Each cell contributes its degree sequence
-        # Inter-cell edges add 2 to the degree sum
-        cell_sig = compute_signature(pattern)
+        # Filter 3: degree sequence compatibility. Needs the cell graph
+        # (for its degree sequence); reconstruct on demand and CACHE
+        # back onto the entry so future calls skip the work.
+        if entry.graph is None:
+            pattern = _minor_to_graph(entry)
+            if pattern is None:
+                continue
+            entry.graph = pattern  # cache the reconstruction
+        else:
+            pattern = entry.graph
+
+        if entry.signature is None:
+            entry.signature = compute_signature(pattern)
+        cell_sig = entry.signature
         cell_degree_sum = sum(cell_sig.degree_sequence)
         target_degree_sum = sum(target_sig.degree_sequence)
 
@@ -624,7 +886,10 @@ def find_cell_candidates(
 
         candidates.append(entry)
 
-    # Sort by edge count descending (prefer larger tiles)
+    # Sort by edge count descending (prefer larger tiles). This is the
+    # engine's long-standing default; the partition trial loop in
+    # `try_hierarchical_partition` filters candidates that can't
+    # actually tile the graph, so we don't need a smarter heuristic.
     return sorted(candidates, key=lambda e: e.edge_count, reverse=True)
 
 
@@ -710,7 +975,9 @@ def _verify_partition_structure(
 def _partition_by_structure(
     graph: Graph,
     cell_graph: Graph,
-    k: int
+    k: int,
+    max_matches: int = 200,
+    time_budget_seconds: Optional[float] = None,
 ) -> Optional[List[Set[int]]]:
     """Partition using VF2 to find disjoint isomorphic copies.
 
@@ -718,9 +985,16 @@ def _partition_by_structure(
     groups where the *induced subgraph* is isomorphic to the cell.
 
     Strategy:
-    1. Find all subgraph isomorphisms using VF2 (on small cells, this is fast)
-    2. Find k disjoint copies that cover all nodes
-    3. Return the partition
+    1. Find subgraph isomorphisms via VF2, capped by `max_matches` and
+       a per-call wall-clock budget. When `time_budget_seconds` is
+       None (default), the budget is computed from graph size:
+       `0.05s × max(20, n)`, giving ~1s for n=20 graphs, ~3.6s for
+       Pm3-sized n=72, etc. Pm2 cProfile (May 21 2026) showed VF2
+       in this routine consumed ~90% of cold-cache time iterating
+       candidate cells that all failed to tile Pegasus.
+    2. Find k disjoint copies that cover all nodes via
+       `_find_disjoint_partition` (separately budgeted).
+    3. Return the partition.
     """
     cell_size = cell_graph.node_count()
     total_nodes = graph.node_count()
@@ -728,15 +1002,24 @@ def _partition_by_structure(
     if total_nodes != k * cell_size:
         return None
 
+    # Dynamic budget: ~0.01s per node, floored at 0.3s. Pm2 (40n) → 0.4s;
+    # Cm3 (72n) → 0.72s; Pm3 (128n) → 1.28s. Small graphs (n<30) still
+    # get 0.3s minimum so the K_{4,4} success path on small inputs isn't
+    # interrupted.
+    if time_budget_seconds is None:
+        time_budget_seconds = max(0.3, 0.01 * total_nodes)
+
     # Use VF2 to find all isomorphic copies of cell in graph
     G_target = graph.to_networkx()
     G_pattern = cell_graph.to_networkx()
 
     matcher = isomorphism.GraphMatcher(G_target, G_pattern)
 
-    # Collect all matches as sets of nodes
+    # Collect all matches as sets of nodes (budget VF2 by both count and time).
     all_matches: List[Set[int]] = []
     seen_node_sets: Set[FrozenSet[int]] = set()
+    import time as _time
+    deadline = _time.monotonic() + time_budget_seconds
 
     for mapping in matcher.subgraph_isomorphisms_iter():
         nodes = frozenset(mapping.keys())
@@ -744,8 +1027,11 @@ def _partition_by_structure(
             seen_node_sets.add(nodes)
             all_matches.append(set(nodes))
 
-        # Limit search for large graphs
-        if len(all_matches) > 1000:
+        if len(all_matches) >= max_matches:
+            break
+        # Wall-clock budget — check every 8 dedup'd matches to amortize
+        # the time() call across VF2's inner loop.
+        if (len(all_matches) & 7) == 0 and _time.monotonic() >= deadline:
             break
 
     if len(all_matches) < k:
@@ -760,11 +1046,21 @@ def _partition_by_structure(
 def _find_disjoint_partition(
     matches: List[Set[int]],
     k: int,
-    total_nodes: int
+    total_nodes: int,
+    max_iterations: int = 100_000,
 ) -> Optional[List[Set[int]]]:
     """Find k disjoint matches that cover all nodes.
 
     Uses backtracking search to find a valid partition.
+
+    Bounded by ``max_iterations`` (default 100k) backtrack frame entries —
+    graphs that admit a homogeneous tiling usually find one in the first
+    few hundred frames; graphs that DON'T admit one (e.g. Pm_m, Z(1, t)
+    when no clean tiling exists) used to burn unbounded time exhausting
+    the search. cProfile of Pm2 showed 44.7M backtrack calls over 605s
+    of CPU; capping at 100k drops the worst-case to sub-second per attempt.
+    Returns None on budget exhaustion (false negatives are acceptable —
+    upstream falls back to other partitioners).
     """
     if k == 0:
         return []
@@ -775,17 +1071,26 @@ def _find_disjoint_partition(
     # Sort matches by node indices for deterministic behavior
     matches = sorted(matches, key=lambda m: tuple(sorted(m)))
 
+    iterations = [0]
+    budget_exhausted = [False]
+
     def backtrack(
         index: int,
         used: Set[int],
         partition: List[Set[int]]
     ) -> Optional[List[Set[int]]]:
+        iterations[0] += 1
+        if iterations[0] > max_iterations:
+            budget_exhausted[0] = True
+            return None
         if len(partition) == k:
             if len(used) == total_nodes:
                 return partition.copy()
             return None
 
         for i in range(index, len(matches)):
+            if budget_exhausted[0]:
+                return None
             match = matches[i]
 
             # Check if this match is disjoint from already used nodes
@@ -1020,15 +1325,19 @@ def _grow_cell(
                     best_node = node
 
         if best_node is None:
-            # No matching node in frontier, expand frontier
-            new_frontier = []
+            # No matching node in frontier, expand frontier to all
+            # un-used cell-reachable nodes. If expansion adds nothing
+            # beyond what's already in `frontier`, growth is wedged —
+            # break to avoid infinite loop (no anchor exists that
+            # matches the remaining signature multiset).
+            new_frontier = set()
             for node in cell_nodes:
                 for neighbor in graph.neighbors(node):
                     if neighbor not in cell_nodes and neighbor not in used_nodes:
-                        new_frontier.append(neighbor)
-            if not new_frontier:
+                        new_frontier.add(neighbor)
+            if not new_frontier or new_frontier <= set(frontier):
                 break
-            frontier = new_frontier
+            frontier = list(new_frontier)
         else:
             cell_nodes.add(best_node)
             sig = target_sigs[best_node]
@@ -1178,7 +1487,7 @@ def extract_cell_topology(
 ) -> Optional[MultiGraph]:
     """Return the cell-topology multigraph H if the unified formula applies.
 
-    The unified Phase 11 formula
+    The unified formula
 
         T(G) = (∏_i T(cell_i)) × T(H)
 
@@ -1249,19 +1558,18 @@ def extract_cell_topology(
 
 
 # =============================================================================
-# k-matching topology detection (Phase 13/15)
+# k-matching topology detection 
 # =============================================================================
 #
 # When inter-cell edges form k-matching junctions (k > 1 distinct vertex
 # pairs between two cells, with the k anchors on each side belonging to
-# a single vertex-transitive class), the Phase 13 closed-form formula
+# a single vertex-transitive class), the closed-form formula
 #
 #     T(G_1 + M_k + G_2) = (x + k - 1) · T(G_1)·T(G_2)
 #                          + Σ_{j=2..k} C(k, j) · T(G_1 ⊕_j G_2)
 #
 # applies. For multi-cell topologies (cell-tree, cell-cycle, etc.) the
-# formula extends recursively. See:
-#   `~/.claude/projects/.../memory/project_phase_13_kmatching_closed_form.md`
+# formula extends recursively.
 # =============================================================================
 
 
@@ -1283,6 +1591,70 @@ class KMatchingJunction:
     @property
     def k(self) -> int:
         return len(self.edges)
+
+
+@dataclass
+class BipartiteJunction:
+    """Generalized inter-cell junction with arbitrary bipartite structure.
+
+    The strict k-matching contract (each anchor appears in exactly one
+    inter-cell edge) is relaxed to:
+
+    - The set of inter-cell edges between cell_i and cell_j forms a
+      bipartite graph (trivially true since edges cross cells).
+    - Each anchor on either side MAY have degree > 1 (multi-edge anchor).
+    - The junction subgraph may be disconnected (multiple components).
+
+    Unlike `KMatchingJunction`, the `edges` list is the actual edge
+    multiset (no requirement that each anchor appears exactly once);
+    `anchors_i` and `anchors_j` are deduplicated vertex lists.
+
+    The chain / cycle DP machinery downstream uses ``junction_template``
+    (the actual junction graph as a Graph object) instead of building
+    an M_k matching template. T_rooted on the junction template is
+    computed via `t_rooted_smart` which decomposes disconnected
+    junctions into per-component pieces (much faster than naïve
+    2^|E| brute force when the junction splits).
+
+    Example: Z(1, 2) inter-cell structure between its two Z(1, 1)
+    cells: 32 edges split into 2 disconnected bipartite components
+    of 16 edges each. Anchors have degree sequence [2,2,2,2,2,2,4,4,4,4]
+    on each side. Cannot be expressed as a `KMatchingJunction`; this
+    class captures it directly.
+    """
+    cell_i: int
+    cell_j: int
+    edges: List[Tuple[int, int]]
+    anchors_i: List[int]  # deduplicated, sorted
+    anchors_j: List[int]  # deduplicated, sorted
+
+    @property
+    def edge_count(self) -> int:
+        return len(self.edges)
+
+    def to_junction_graph(self) -> "Graph":
+        """Return the junction subgraph as a Graph (anchors_i first, then anchors_j).
+
+        Vertex ordering: ``anchors_i + anchors_j`` (cell-i side, then cell-j side).
+        Edges are translated to use vertex IDs from this combined list.
+        """
+        from ..graph import Graph as TutteGraph
+        # Build vertex list in fixed order: cell-i side first, then cell-j side.
+        # Renumber locally so the Graph nodes start at 0 (anchors_i_local =
+        # 0..len(anchors_i)-1, anchors_j_local = len(anchors_i)..len(both)).
+        n_i = len(self.anchors_i)
+        ai_map = {v: i for i, v in enumerate(self.anchors_i)}
+        aj_map = {v: n_i + i for i, v in enumerate(self.anchors_j)}
+        nodes = list(range(n_i + len(self.anchors_j)))
+        edges_local = []
+        for (u, v) in self.edges:
+            if u in ai_map and v in aj_map:
+                edges_local.append((ai_map[u], aj_map[v]))
+            elif u in aj_map and v in ai_map:
+                edges_local.append((ai_map[v], aj_map[u]))
+            else:
+                raise ValueError(f"Junction edge {(u, v)} doesn't match anchors")
+        return TutteGraph(nodes, edges_local)
 
 
 def _anchors_single_class(
@@ -1341,7 +1713,7 @@ def detect_kmatching_topology(
     inter_edges: List[Tuple[int, int]],
 ) -> Optional[List[KMatchingJunction]]:
     """Detect if inter-cell edges form k-matching junctions where the
-    Phase 13 cell-cycle formula applies.
+    cell-cycle formula applies.
 
     Returns a list of `KMatchingJunction` (one per cell-pair with
     edges) if **every junction** satisfies the single-class anchor
@@ -1428,6 +1800,68 @@ def detect_kmatching_topology(
     return junctions
 
 
+def detect_bipartite_junction_topology(
+    graph: Graph,
+    partition: List[Set[int]],
+    inter_edges: List[Tuple[int, int]],
+) -> Optional[List[BipartiteJunction]]:
+    """Generalized junction detection — accepts non-matching bipartite junctions.
+
+    Drops two restrictions from `detect_kmatching_topology`:
+
+    1. **No matching restriction**: an anchor on either side may participate
+       in MULTIPLE inter-cell edges (degree > 1 allowed).
+    2. **No single-class restriction**: anchors may span multiple
+       vertex-transitive classes within the cell — the consumer handles
+       this via the actual junction graph (not an M_k template), so cell
+       symmetries that the formula relies on aren't required.
+
+    Returns one `BipartiteJunction` per cell-pair with edges. Always
+    succeeds if `inter_edges` are non-empty and partition cell IDs are
+    valid (returns `None` only on malformed input).
+
+    The trade-off vs k-matching detection: the chain DP consumer must
+    use the actual junction graph for T_rooted (via `t_rooted_smart`)
+    rather than the optimized M_k template path. Worth it for graphs
+    like Z(1, 2) where the inter-cell structure is genuinely non-matching.
+    """
+    if not inter_edges:
+        return []
+
+    node_to_cell: Dict[int, int] = {}
+    for i, cell_nodes in enumerate(partition):
+        for node in cell_nodes:
+            node_to_cell[node] = i
+
+    pair_data: Dict[Tuple[int, int], Tuple[List[Tuple[int, int]], Set[int], Set[int]]] = {}
+    for u, v in inter_edges:
+        cu = node_to_cell.get(u)
+        cv = node_to_cell.get(v)
+        if cu is None or cv is None or cu == cv:
+            return None
+        if cu < cv:
+            ci, cj, ai, aj = cu, cv, u, v
+        else:
+            ci, cj, ai, aj = cv, cu, v, u
+        pair = (ci, cj)
+        if pair not in pair_data:
+            pair_data[pair] = ([], set(), set())
+        edges_list, anchors_i, anchors_j = pair_data[pair]
+        edges_list.append((ai, aj))
+        anchors_i.add(ai)
+        anchors_j.add(aj)
+
+    junctions: List[BipartiteJunction] = []
+    for (ci, cj), (edges_list, anchors_i, anchors_j) in pair_data.items():
+        junctions.append(BipartiteJunction(
+            cell_i=ci, cell_j=cj,
+            edges=edges_list,
+            anchors_i=sorted(anchors_i),
+            anchors_j=sorted(anchors_j),
+        ))
+    return junctions
+
+
 def _apply_junction_merge(
     g: nx.MultiGraph,
     junction_edges: List[Tuple[int, int]],
@@ -1482,7 +1916,7 @@ def apply_kmatching_formula(
     junctions: List[KMatchingJunction],
     synth_multigraph,
 ):
-    """Apply the Phase 13 recursive cell-cycle/cell-tree formula.
+    """Apply the recursive cell-cycle/cell-tree formula.
 
     Iterates the 2-cell formula at each junction with state-caching.
     At each junction:
@@ -1624,6 +2058,18 @@ def apply_kmatching_formula(
     return recurse(g_nx, all_idx, {})
 
 
+# Cache: (graph_canonical_key, table_id) → partition result.
+# `engine.synthesize` calls this 6+ times per graph (cell_quotient_grid,
+# cycle, tree, bipartite_junction, per_component, hybrid all retry). Without
+# caching, each call repeats find_cell_candidates + VF2 partitioning. For
+# Pegasus-like graphs with non-tree cell topology this is the bottleneck
+# (>500s wasted on Pm_2 after the May 17 K_{a,b} reconstruction fix
+# unblocked atlas_49 / K_4 as candidates). Keyed by (canon, id(table)) so
+# different tables don't collide.
+_HIER_PARTITION_CACHE: Dict[Tuple[str, int], Optional[Tuple]] = {}
+_HET_PARTITION_CACHE: Dict[Tuple[str, int, int, int, int], Optional[Tuple]] = {}
+
+
 def try_hierarchical_partition(
     graph: Graph,
     table: RainbowTable
@@ -1642,13 +2088,45 @@ def try_hierarchical_partition(
 
     Returns:
         (cell_entry, partition, inter_cell_info) or None if no tiling found
+
+    Cached by `(graph.canonical_key(), id(table))`. Cache is module-scoped
+    so the same engine invocation's cell-quotient cascade reuses one
+    partition lookup rather than re-running VF2 6+ times.
     """
+    cache_key: Optional[Tuple[str, int]]
+    try:
+        cache_key = (graph.canonical_key(), id(table))
+    except Exception:
+        cache_key = None
+    if cache_key is not None and cache_key in _HIER_PARTITION_CACHE:
+        return _HIER_PARTITION_CACHE[cache_key]
+
     _log = get_log()
     # Find candidate tiles
     candidates = find_cell_candidates(graph, table)
     _log.record(EventType.CANDIDATE_FILTER, "covering",
                 f"Hierarchical: {len(candidates)} cell candidates for {graph.node_count()}n {graph.edge_count()}e",
                 LogLevel.DEBUG, graph=graph)
+
+    # Reorder candidates: prioritize K_{a,b}, K_n, Z*, Cm* (high-payoff for
+    # D-Wave structured graphs) BEFORE Ladder/Prism/Mobius (which are
+    # symmetric and cause VF2 to exhaustively explore symmetric paths
+    # when no match exists — Cm3 with Ladder_12 candidate took 1249s).
+    # Empirically (May 22 2026), this reordering means K_{4,4} candidate
+    # for Cm3 gets tried EARLY instead of after multi-minute exhaustion.
+    def _name_priority(name: str) -> int:
+        # Lower number = higher priority (tried first)
+        if name.startswith('K_'):
+            return 0  # K_n, K_{a,b}
+        if name.startswith(('Cm', 'Pm', 'Z')):
+            return 1  # D-Wave family aliases
+        if name.startswith('Grid_'):
+            return 2  # Grid_n×m
+        if name.startswith(('C_', 'W_', 'P_', 'S_')):
+            return 3  # Cycle/Wheel/Path/Star
+        # Ladder_, Prism_, Mobius_, Book_, Fan_, Pan_, etc. — high VF2 cost
+        return 9
+    candidates = sorted(candidates, key=lambda c: (_name_priority(c.name), -c.node_count))
 
     for cell in candidates:
         cell_size = cell.node_count
@@ -1669,9 +2147,23 @@ def try_hierarchical_partition(
                     f"Tiled with {cell.name}: {len(partition)} cells, "
                     f"{len(inter_info.edges)} inter-cell edges")
 
-        return (cell, partition, inter_info)
+        result = (cell, partition, inter_info)
+        if cache_key is not None:
+            _HIER_PARTITION_CACHE[cache_key] = result
+        return result
 
+    if cache_key is not None:
+        _HIER_PARTITION_CACHE[cache_key] = None
     return None
+
+
+def clear_hierarchical_partition_cache() -> None:
+    """Clear the hierarchical / heterogeneous partition result caches.
+
+    Useful for tests that mutate the rainbow table mid-run.
+    """
+    _HIER_PARTITION_CACHE.clear()
+    _HET_PARTITION_CACHE.clear()
 
 
 def _find_induced_match(
@@ -1728,6 +2220,7 @@ def try_heterogeneous_partition(
     min_cell_nodes: int = 3,
     min_cells: int = 2,
     min_graph_nodes: int = 10,
+    max_graph_nodes: int = 100,
 ) -> Optional[Tuple[List[MinorEntry], List[Set[int]], InterCellInfo]]:
     """Greedy largest-first heterogeneous partitioner.
 
@@ -1750,13 +2243,55 @@ def try_heterogeneous_partition(
     route through faster paths anyway, and VF2 induced-subgraph search is
     expensive, so we skip the whole thing on graphs that are too small to
     benefit.
+
+    `max_graph_nodes` (default 100) gates large graphs: VF2 induced-subgraph
+    search scales poorly with graph size. Empirically Pm3 (128n/704e) gets
+    stuck for >6 min in a single dispatch call here on a ~1000-entry table
+    — much longer than the engine's other fallbacks. Skip to let chord rule
+    or treewidth_dp take over.
+
+    Cached by `(graph.canonical_key(), id(table), min_cell_nodes,
+    min_cells, min_graph_nodes)`. Chord-rule contractions on D-Wave
+    decompositions repeatedly call this on intermediates that mostly
+    return None; the cache turns repeated VF2 sweeps into O(1) misses.
     """
     target_nodes = graph.node_count()
     if target_nodes < min_graph_nodes:
         return None
+    if target_nodes > max_graph_nodes:
+        return None
     target_edges = graph.edge_count()
 
+    cache_key: Optional[Tuple[str, int, int, int, int]]
+    try:
+        cache_key = (
+            graph.canonical_key(), id(table),
+            min_cell_nodes, min_cells, min_graph_nodes,
+        )
+    except Exception:
+        cache_key = None
+    if cache_key is not None and cache_key in _HET_PARTITION_CACHE:
+        return _HET_PARTITION_CACHE[cache_key]
+
     # Reconstruct cell graphs once and sort by descending node count.
+    # Restrict to "canonical" cell families (K_n, K_{a,b}, cycles, D-Wave
+    # families). Named families like Pan_, Fan_, Helm_, Mobius_ are
+    # reconstructible but they're noise as cells: their induced-subgraph
+    # copies often overlap K_n / K_{a,b} matches at the same node count,
+    # and the greedy partitioner picks them first, leaving incomplete
+    # remainder.
+    #
+    # D-Wave family cells (Cm_, Pm_, Z*) are explicit structural
+    # candidates — Z(1,3) decomposes as Z(1,2)+Z(1,1) (24+12=36n) and
+    # similar heterogeneous patterns matter for the engine's downstream
+    # cell-quotient DPs. Cm1 = K_{4,4} aliases would collide but that
+    # specific entry isn't currently in the rainbow table.
+    canonical_prefix = ('K_', 'C_', 'W_', 'P_', 'S_', 'Cm', 'Pm')
+    canonical_names = {
+        'Petersen', 'Heawood', 'MoebiusKantor', 'Desargues', 'Dodecahedral',
+        # D-Wave Zephyr cells (no consistent prefix — Z1_1, Z1_2, ...)
+        'Z1_1', 'Z1_2', 'Z1_3', 'Z2_1', 'Z2_2',
+    }
     candidates: List[Tuple[MinorEntry, Graph]] = []
     for entry in table.entries.values():
         if entry.node_count < min_cell_nodes:
@@ -1772,20 +2307,86 @@ def try_heterogeneous_partition(
         # decomposition (T(tree) is closed-form via family recognition).
         if entry.edge_count < entry.node_count:
             continue
-        cell_graph = entry.graph if entry.graph is not None else _minor_to_graph(entry)
-        if cell_graph is None:
+        # Restrict to canonical cell families (see above).
+        if not (
+            entry.name.startswith(canonical_prefix)
+            or entry.name in canonical_names
+        ):
             continue
+        if entry.graph is None:
+            cell_graph = _minor_to_graph(entry)
+            if cell_graph is None:
+                continue
+            entry.graph = cell_graph  # cache reconstruction
+        else:
+            cell_graph = entry.graph
         candidates.append((entry, cell_graph))
 
-    candidates.sort(key=lambda pair: -pair[0].node_count)
+    # Sort by (node_count DESC, edge_count DESC, prefer_canonical_name):
+    # largest cells first, then densest among same-size cells, with
+    # K_/C_/W_/P_/S_-prefixed names preferred over D-Wave aliases
+    # (Cm_, Pm_, Z*) when both refer to the same canonical structure.
+    # This is the implicit alias selection — e.g. K_{4,4} over Cm1.
+    _classical_prefixes = ('K_', 'C_', 'W_', 'P_', 'S_')
+
+    def _name_priority(name: str) -> int:
+        # 0 = classical (K_/C_/...), 1 = named families, 2 = D-Wave (Cm/Pm/Z*).
+        if name.startswith(_classical_prefixes):
+            return 0
+        if name.startswith(('Cm', 'Pm', 'Z')):
+            return 2
+        return 1
+
+    candidates.sort(key=lambda pair: (
+        -pair[0].node_count,
+        -pair[0].edge_count,
+        _name_priority(pair[0].name),
+    ))
+
+    # Deduplicate by canonical_key — aliased entries (e.g., Cm1 vs
+    # K_{4,4} for the same 8n 16e bipartite graph) would otherwise
+    # both appear and the greedy partitioner would double-match the
+    # same shape. After the sort, the first occurrence of each
+    # canonical key wins, preferring classical names.
+    deduped: List[Tuple[MinorEntry, Graph]] = []
+    seen_canon: Set[str] = set()
+    for entry, cell_graph in candidates:
+        try:
+            canon = entry.canonical_key
+        except Exception:
+            canon = None
+        if canon is not None:
+            if canon in seen_canon:
+                continue
+            seen_canon.add(canon)
+        deduped.append((entry, cell_graph))
+    candidates = deduped
 
     unmatched: Set[int] = set(graph.nodes)
     partition: List[Set[int]] = []
     cells: List[MinorEntry] = []
 
+    # Dynamic wall-clock budget for the entire candidate loop. Each
+    # _find_induced_match call is a VF2 search that proves no-match by
+    # exhaustion when the pattern doesn't fit. Budget scales with graph
+    # size + candidate count: `2s + 0.5 × n_candidates + 0.1 × n_nodes`.
+    # For Pm2 (40n, ~39 candidates) → ~25.5s; for Cm3 (72n) → ~37s.
+    # Budget-exhausted → return None (cached negative; engine falls
+    # through to chord rule / treewidth_dp).
+    n_cands_het = max(1, len(candidates))
+    n_nodes_het = graph.node_count()
+    budget_seconds_het = 2.0 + 0.5 * n_cands_het + 0.1 * n_nodes_het
+    import time as _time
+    deadline = _time.monotonic() + budget_seconds_het
+
     for entry, cell_graph in candidates:
         cell_size = entry.node_count
         while len(unmatched) >= cell_size:
+            if _time.monotonic() >= deadline:
+                # Bail out; partial partition is incomplete by definition.
+                if cache_key is not None:
+                    _HET_PARTITION_CACHE[cache_key] = None
+                return None
             tile = _find_induced_match(graph, cell_graph, unmatched)
             if tile is None:
                 break
@@ -1797,12 +2398,18 @@ def try_heterogeneous_partition(
             break
 
     if unmatched:
+        if cache_key is not None:
+            _HET_PARTITION_CACHE[cache_key] = None
         return None
     if len(partition) < min_cells:
+        if cache_key is not None:
+            _HET_PARTITION_CACHE[cache_key] = None
         return None
     # All cells identical → caller's homogeneous path already handles this;
     # don't shadow it here.
     if len({c.canonical_key for c in cells}) == 1:
+        if cache_key is not None:
+            _HET_PARTITION_CACHE[cache_key] = None
         return None
 
     inter_info = analyze_inter_cell_edges(graph, partition)
@@ -1812,4 +2419,7 @@ def try_heterogeneous_partition(
         f"({', '.join(c.name for c in cells)}), "
         f"{len(inter_info.edges)} inter-cell edges",
     )
-    return (cells, partition, inter_info)
+    result = (cells, partition, inter_info)
+    if cache_key is not None:
+        _HET_PARTITION_CACHE[cache_key] = result
+    return result

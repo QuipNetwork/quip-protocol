@@ -26,30 +26,26 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
+from ..cotree_dp import compute_tutte_almost_cograph, compute_tutte_cotree_dp
 from ..family_recognition import recognize_family
 from ..graph import Graph, MultiGraph, compute_signature
-from ..graphs.covering import (Cover, Fringe, InterCellInfo,
-                               KMatchingJunction, Tile,
-                               analyze_tile_connections,
-                               apply_kmatching_formula,
-                               compute_fringe,
+from ..graphs.covering import (Cover, Fringe, InterCellInfo, KMatchingJunction,
+                               Tile, analyze_tile_connections,
+                               apply_kmatching_formula, compute_fringe,
                                compute_inter_tile_edges,
                                detect_kmatching_topology,
                                extract_cell_topology, find_disjoint_cover,
                                try_heterogeneous_partition,
                                try_hierarchical_partition)
 from ..graphs.series_parallel import compute_sp_tutte_if_applicable
-from ..cotree_dp import compute_tutte_cotree_dp, compute_tutte_almost_cograph
-from ..roots import (
-    compute_cell_quotient_cycle_dp,
-    compute_cell_quotient_grid_dp_streamed,
-    compute_cell_quotient_tree_dp,
-)
-from ..roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
-from ..transfer_matrix import compute_tutte_via_transfer_matrix
 from ..logs import EventType, LogLevel, get_log
 from ..lookup.core import MinorEntry, RainbowTable, load_default_table
 from ..polynomial import TuttePolynomial
+from ..roots import (compute_cell_quotient_cycle_dp,
+                     compute_cell_quotient_grid_dp_streamed,
+                     compute_cell_quotient_tree_dp)
+from ..roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
+from ..transfer_matrix import compute_tutte_via_transfer_matrix
 from ..validation import verify_spanning_trees
 from .base import BaseMultigraphSynthesizer, SynthesisResult, UnionFind
 
@@ -91,18 +87,34 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 per attempt, so larger k is uniformly more expensive.
         """
         self.table = table if table is not None else load_default_table()
+        # Auto-load the rooted-Tutte lookup table from `tutte/data/`.
+        # Tries `rooted_lookup.bin` first, falls back to JSON. Partitions
+        # are stored in canonical labels (per WL refinement) and translated
+        # to the runtime graph's actual labels on cache hit, so any
+        # isomorphic graph reuses the same entry regardless of labeling.
+        try:
+            from ..roots.rooted_tutte import load_default_rooted_lookup
+            load_default_rooted_lookup()
+        except Exception:
+            pass  # best-effort; engine still works via on-demand compute
         self.verbose = verbose
         self.auto_promote = auto_promote
         self.promote_cache_on_finish = promote_cache_on_finish
         self.k_max = max(2, min(k_max, 20))
-        # (April 2026): default True after cold-cache A/B
-        # showed no regressions (corpus median -2.8%, Z(1,1) regression
-        # vanished). Smart ordering sorts chord edges by descending
+        # Smart ordering sorts chord edges by descending
         # |common_neighbors(u, v)| in the original graph, so high-impact
         # contractions happen early and the engine's parallel-edge / loop fast
         # paths fire sooner. Set to False to revert if a regression surfaces
         # for a chord-rule-heavy target (Pm3+, Cm3+, Z(2,t)+).
         self.chord_smart_order: bool = True
+        # σ-equivariant chord ordering: when set, `_iterative_chord_rule`
+        # reorders chords so σ-orbits are contiguous, maximizing
+        # engine.canonical_key cache hits on isomorphic intermediate
+        # contractions. Petersen measured ~1.44× speedup with results
+        # matching bit-for-bit; larger chord-rule targets (Pm_2, Z(1,3))
+        # expected to see larger gains because |Aut| × orbit-pair savings
+        # scale with cell count.
+        self.chord_sigma_order: bool = True
         self._cache: Dict[str, SynthesisResult] = {}
         self._multigraph_cache: Dict[str, TuttePolynomial] = {}  # For multigraph polynomials
         self._fast_hash_set: Set[str] = set()  # Fast hashes of all cached multigraphs
@@ -416,10 +428,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             pass
         try:
             if self._multigraph_cache:
-                from ..lookup.core import (
-                    load_default_multigraph_table,
-                    save_default_multigraph_table,
-                )
+                from ..lookup.core import (load_default_multigraph_table,
+                                           save_default_multigraph_table)
                 existing = load_default_multigraph_table()
                 # Merge in-memory cache into the on-disk table. Only
                 # add entries not already present; do not overwrite.
@@ -581,7 +591,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             self._promote_to_table(graph, cache_key, result)
             return result
 
-        # 7.45 Cell-quotient grid DP (Phase B Round 6 streamed). For
+        # 7.45 Cell-quotient grid DP. For
         # cell-decomposable graphs whose cell-quotient is a 2D grid of
         # K_{a,b}-style cells connected by M_k matchings with disjoint
         # per-direction anchors (Cm2-style — Cm3 has shared anchors and
@@ -610,8 +620,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             except Exception:
                 pass  # any failure — fall through
 
-        # 7.5 Hierarchical-formula short-circuit (Phase 12 unified +
-        # Phase 13 k-matching). When the graph has a detectable cell
+        # 7.5 Hierarchical-formula short-circuit 
+        # When the graph has a detectable cell
         # decomposition AND its inter-cell structure satisfies the
         # preconditions of the unified or k-matching formula, these
         # closed-form paths can beat `treewidth_dp` (Cm2: ~4× speedup
@@ -661,6 +671,35 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 return result
         except (ValueError, TypeError):
             pass  # not a cograph, or input rejected — fall through
+
+        # Small-graph treewidth_dp short-circuit. For small graphs (n ≤ 20)
+        # treewidth is often ≤ 10 and treewidth_dp completes in ms-seconds —
+        # much faster than almost_cograph which can chord-rule for many
+        # seconds on dense cubic graphs (e.g. Heawood: 17.9s almost_cograph
+        # vs 1.45s treewidth_dp, ~12×). Skip when n > 20 so D-Wave cells
+        # still hit cell-quotient paths first.
+        if n <= 20 and m >= 10:
+            try:
+                from ..graphs.treewidth import \
+                    compute_treewidth_tutte_if_applicable
+                full_mg = MultiGraph.from_graph(graph)
+                tw_poly = compute_treewidth_tutte_if_applicable(full_mg, max_width=8)
+                if tw_poly is not None:
+                    _log.record(EventType.TREEWIDTH_DP, "engine",
+                                f"Treewidth DP (small-graph short-circuit): {n}n {m}e",
+                                graph=graph)
+                    self._log(f"Treewidth DP (small short-circuit): {n}n, {m}e")
+                    result = SynthesisResult(
+                        polynomial=tw_poly,
+                        recipe=["Treewidth DP (small-graph short-circuit)"],
+                        verified=True,
+                        method="treewidth_dp",
+                    )
+                    self._cache[cache_key] = result
+                    self._promote_to_table(graph, cache_key, result)
+                    return result
+            except Exception:
+                pass
 
         # 7.6. Almost-cograph DP — for graphs that become cographs after
         # removing a small set of anomaly edges (e.g., D-Wave cells joined by
@@ -745,6 +784,76 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             except Exception:
                 pass  # any failure — fall through
 
+        # 7.82. Cell-quotient BIPARTITE-JUNCTION DP — generalisation of
+        # the k-matching path that accepts non-matching bipartite
+        # junctions (asymmetric anchor degrees, disconnected junction
+        # subgraphs). Unblocks Z(m, t) families whose inter-cell graph
+        # has multi-degree anchors (e.g. Z(1, 2) has degree sequence
+        # [2,2,2,2,2,2,4,4,4,4] on each side of each junction
+        # component). Cell-template T_rooted on the full anchor
+        # boundary remains the bottleneck; this entry merely WIRES the
+        # path. See `tutte/roots/cell_quotient_bipartite_junction.py`.
+        if graph.edge_count() >= 60:
+            try:
+                from ..roots.cell_quotient_bipartite_junction import (
+                    compute_cell_quotient_bipartite_junction_dp,
+                )
+                bj_poly = compute_cell_quotient_bipartite_junction_dp(
+                    graph, self.table,
+                )
+                if bj_poly is not None:
+                    _log.record(EventType.CELL_QUOTIENT_DP, "engine",
+                                f"Cell-quotient bipartite-junction DP: {n}n {m}e",
+                                graph=graph)
+                    self._log(f"Cell-quotient bipartite-junction DP: {n}n, {m}e")
+                    result = SynthesisResult(
+                        polynomial=bj_poly,
+                        recipe=["Cell-quotient bipartite-junction DP"],
+                        verified=True,
+                        method="cell_quotient_bipartite_junction_dp",
+                    )
+                    self._cache[cache_key] = result
+                    self._promote_to_table(graph, cache_key, result)
+                    return result
+            except Exception:
+                pass  # any failure — fall through
+
+        # Per-component bipartite-junction DP. When the standard
+        # bipartite-junction DP returns None due to the `max_cell_boundary=8`
+        # guard OR an intractable joint partition dict, factor a disconnected
+        # junction into its connected components and process each as a
+        # separate convolution step, avoiding the
+        # Bell(|joint_junction_boundary|) wall. Effective on Z(1, 2) family
+        # where the inter-cell graph splits into 2 components of 12 anchors
+        # each (Bell(12) ≈ 4M ≪ Bell(24) ≈ 10^17).
+        if graph.edge_count() >= 60:
+            try:
+                from ..roots.cell_quotient_bipartite_junction import (
+                    compute_bipartite_junction_per_component_dp,
+                )
+                # Cap per-cell boundary at 8 to keep precompute_M_table's
+                # Bell-style inner iteration bounded. Cells with larger
+                # anchor sets (e.g. Z(1, 1) at 12) defer to treewidth_dp.
+                pcdp_poly = compute_bipartite_junction_per_component_dp(
+                    graph, self.table, max_cell_boundary=8,
+                )
+                if pcdp_poly is not None:
+                    _log.record(EventType.CELL_QUOTIENT_DP, "engine",
+                                f"Cell-quotient bipartite-junction per-component DP: {n}n {m}e",
+                                graph=graph)
+                    self._log(f"Cell-quotient bipartite-junction per-component DP: {n}n, {m}e")
+                    result = SynthesisResult(
+                        polynomial=pcdp_poly,
+                        recipe=["Cell-quotient bipartite-junction per-component DP"],
+                        verified=True,
+                        method="cell_quotient_bipartite_junction_per_component_dp",
+                    )
+                    self._cache[cache_key] = result
+                    self._promote_to_table(graph, cache_key, result)
+                    return result
+            except Exception:
+                pass
+
         # 7.85. Cell-quotient HYBRID DP — chord-rule cycle-close + per-leaf
         # synth for cyclic cell-quotients (e.g., D-Wave Cm₃'s 3×3 grid).
         # Recursively peels closing junctions; each leaf is synthesized
@@ -769,6 +878,60 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                     self._cache[cache_key] = result
                     self._promote_to_table(graph, cache_key, result)
                     return result
+            except Exception:
+                pass  # any failure — fall through
+
+        # 7.88 Cross-cell chord-peel — peel the SMALLEST inter-atom
+        # junction edge set rather than internal clique edges. The chord
+        # rule's per-step cost is dominated by the recursive sub-synth
+        # on the contraction multigraph (~6-8s for Z(1,2)-class
+        # intermediates), so fewer chord edges = fewer expensive synths.
+        # Inter-atom junctions are typically much smaller than the
+        # total internal-clique-edge count: for Z(1,2) (2 K_4 atoms
+        # with two K_{2,2} bridge components), smallest junction is 4
+        # edges → ~47s vs 95s with 12 internal edges (~2× speedup).
+        # Generalizes to any graph with detectable disjoint dense atoms
+        # connected by a small bipartite junction.
+        #
+        # Gated to:
+        #   - top-level synthesis (depth == 1) to avoid cascading
+        #   - n ≤ 30 nodes — per-step sub-synth cost scales as 2^tw·m;
+        #     graphs above this are usually well-served by cell_quotient
+        #     or treewidth_dp, and cross-cell's per-step cost on 40+v/160e
+        #     multigraphs (e.g. Pm_2 contractions) was measured >> baseline.
+        # See [[project_cross_cell_chord_peel]].
+        if (graph.edge_count() >= 60
+                and graph.node_count() <= 30
+                and self._synth_depth == 1):
+            try:
+                cross_result = self._try_cross_cell_chord_peel(graph, max_depth)
+                if cross_result is not None:
+                    _log.record(EventType.CHORD_RULE, "engine",
+                                f"Cross-cell chord-peel: {n}n {m}e", graph=graph)
+                    self._log(f"Cross-cell chord-peel: {n}n, {m}e")
+                    self._cache[cache_key] = cross_result
+                    self._promote_to_table(graph, cache_key, cross_result)
+                    return cross_result
+            except Exception:
+                pass  # any failure — fall through
+
+        # 7.9 Clique-atom chord-peel. For graphs with detectable disjoint
+        # K_k cliques (k ∈ [3, 6]), peel all internal edges of the cheapest
+        # configuration via the production chord rule with σ-aware ordering.
+        # Z(1,2): 2 K_4 atoms, 12 chord edges → ~95s vs 138s baseline (1.45×).
+        # Generalizes K_4 peeling to graphs with K_3/K_5/K_6 atom structure.
+        # Returns None on no viable atoms or chord-rule failure → falls
+        # through to step 8 treewidth_dp. Gated at edge_count ≥ 60.
+        if graph.edge_count() >= 60:
+            try:
+                peel_result = self._try_clique_atom_chord_peel(graph, max_depth)
+                if peel_result is not None:
+                    _log.record(EventType.CHORD_RULE, "engine",
+                                f"Clique-atom chord-peel: {n}n {m}e", graph=graph)
+                    self._log(f"Clique-atom chord-peel: {n}n, {m}e")
+                    self._cache[cache_key] = peel_result
+                    self._promote_to_table(graph, cache_key, peel_result)
+                    return peel_result
             except Exception:
                 pass  # any failure — fall through
 
@@ -816,8 +979,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             result = self._try_hierarchical(graph, max_depth)
             if result is not None:
                 # Record the SPECIFIC formula/path that succeeded so
-                # the visualizer surfaces the actual dispatch (Phase
-                # 12 unified formula, Phase 13 k-matching formula, or
+                # the visualizer surfaces the actual dispatch (
+                # unified formula, k-matching formula, or
                 # the generic hierarchical/treewidth fallthrough).
                 _method_event = {
                     "unified_formula": EventType.UNIFIED_FORMULA,
@@ -985,7 +1148,11 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         best = None
         best_missing = None  # prefer fewer missing edges (cheaper inclusion-exclusion)
         checked = 0
-        max_checks = 200_000  # limit search time (~2s for 24-node graphs)
+        # Scale max_checks down for large graphs — cProfile showed 5.4s per
+        # call on 36-node Z(1,3) at the old 200k cap (32s wasted searching
+        # for separators that don't exist at high k). For n >= 30, drop to
+        # 50k (~1.3s/call); under 30n the original 200k cap stays.
+        max_checks = 50_000 if graph.node_count() >= 30 else 200_000
 
         for combo in combinations(candidates, k):
             checked += 1
@@ -1021,12 +1188,9 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 # Accept any separator, including full-clique (missing == 0).
                 # `_apply_ksum` handles missing == 0 by peeling the EXISTING
                 # K_k clique edges via the chord rule (the symmetric case of
-                # adding back missing edges) — same C(k, 2) cost.
-                # NOTE: prior to May 2026, missing == 0 was skipped under the
-                # comment "cut vertex path already handles k=1", but the cut-
-                # vertex path only handles k=1; missing == 0 separators for
-                # k ≥ 2 were silently dropped, blocking the chord rule on
-                # graphs with full clique separators (e.g., router-style
+                # adding back missing edges) — same C(k, 2) cost. Without
+                # this, the chord rule is silently dropped on graphs with
+                # full clique separators for k ≥ 2 (e.g., router-style
                 # synthetics). See research/audit_chord_rule_findings.md.
                 if best is None or missing < best_missing:
                     best = combo
@@ -1186,10 +1350,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 # vertices (no shared edges). Synthesizing it terminates via the
                 # standard pipeline (it has no full-clique separator anymore;
                 # the separator's clique edges are gone).
-                from ..graphs.k_sum import (
-                    _combine_chord_iteration,
-                    _iterative_chord_rule,
-                )
+                from ..graphs.k_sum import (_combine_chord_iteration,
+                                            _iterative_chord_rule)
                 smart_order = getattr(self, "chord_smart_order", False)
                 g_chord_free, factors, adds = _iterative_chord_rule(
                     graph, all_clique_edges, self, smart_order=smart_order,
@@ -1312,6 +1474,235 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                     },
                 )
 
+    def _try_cross_cell_chord_peel(
+        self,
+        graph: Graph,
+        max_depth: int,
+        max_junction_size: int = 6,
+    ) -> Optional[SynthesisResult]:
+        """Chord-peel the SMALLEST inter-atom junction edge set.
+
+        Finds disjoint named-family atoms (K_n cliques, K_{a,b} complete
+        bipartite, ...) via `tutte/graphs/atom_detection.py`, then peels
+        the smallest connected bipartite junction between any two atoms
+        using the production chord rule.
+
+        Rationale: the chord rule's wall is dominated by its per-step
+        sub-synth on a contraction multigraph (~6-8s for Z(1,2)-class
+        intermediates). Peeling fewer chord edges = fewer expensive
+        sub-synths, AND the recursive synth on g_chord_free can find
+        more structure (the dense atoms are still intact).
+
+        Empirical (Z(1,2), 2 K_4 atoms with two K_{2,2} junctions):
+          - 4 inter-atom edges (one K_{2,2}): ~47s
+          - 12 internal K_4 edges: ~95s
+          - baseline treewidth_dp: ~138s
+
+        Generalizes to any graph with detectable dense atoms connected
+        by a small bipartite junction:
+          - K_n atoms (cliques): Z(m,t), Pegasus, triangulated planar
+          - K_{a,b} atoms (bipartite): Chimera Cm cells (K_{4,4}),
+            bipartite data graphs, recommendation/knowledge graphs.
+
+        Returns None when:
+          - <2 disjoint atoms found in any family
+          - smallest junction has > max_junction_size edges
+          - chord rule itself raises
+        """
+        from ..graphs.atom_detection import (find_disjoint_atoms,
+                                             find_smallest_junction, _to_nx)
+        atoms = find_disjoint_atoms(graph)
+        if len(atoms) < 2:
+            return None
+        chord_edges = find_smallest_junction(graph, atoms)
+        if not chord_edges or len(chord_edges) > max_junction_size:
+            return None
+
+        # σ-aware ordering improves intermediate-cache hits when σ exists
+        nxg = _to_nx(graph)
+        sigma = None
+        try:
+            from ..roots.signed_quotient import find_best_sigma
+            sigma = find_best_sigma(nxg, require_free=True)
+        except Exception:
+            sigma = None
+
+        try:
+            from ..graphs.k_sum import (_combine_chord_iteration,
+                                        _iterative_chord_rule)
+            g_chord_free, factors, adds = _iterative_chord_rule(
+                graph, chord_edges, self, sigma=sigma,
+            )
+            t_chord_free = self.synthesize(g_chord_free, max_depth).polynomial
+            poly = _combine_chord_iteration(t_chord_free, factors, adds)
+        except Exception:
+            return None
+
+        atom_family = atoms[0].family
+        return SynthesisResult(
+            polynomial=poly,
+            recipe=[
+                f"Cross-cell chord-peel "
+                f"({atom_family} atoms × {len(atoms)}, "
+                f"{len(chord_edges)} inter-atom edges, "
+                f"sigma={sigma is not None})"
+            ],
+            verified=True,
+            method="cross_cell_chord_peel",
+        )
+
+    def _try_clique_atom_chord_peel(
+        self,
+        graph: Graph,
+        max_depth: int,
+        min_k: int = 3,
+        max_k: int = 6,
+    ) -> Optional[SynthesisResult]:
+        """Try chord-peel decomposition with disjoint K_k clique atoms.
+
+        Generalizes K_4 atom peeling to any clique size k ∈ [min_k, max_k].
+        For each k, finds disjoint K_k cliques greedily and computes the
+        chord-edge count = (#atoms) × C(k, 2). The chord rule's per-step
+        cost is roughly constant for graphs in the same density class
+        (~9s for Z(1,2)-class 23-24v intermediates), so total wall is
+        proportional to total chord edges. We pick the k minimizing total
+        chord-edge count — gated by a treewidth-aware cost estimator
+        (replaces an ad-hoc 18-edge cap).
+
+        Tie-break: prefer larger k (denser tiles tend to align better with
+        σ-orbit structure when σ exists, improving cache hits).
+
+        For Z(1,2) (no K_5+, 2 disjoint K_4 atoms {4,5,16,17}, {6,7,18,19}):
+        k=4 chosen, 12 chord edges → ~95s vs 138s baseline (1.45×).
+
+        Generalizes to:
+          - K_3-rich graphs (planar triangulations, etc.)
+          - K_5 / K_6 atom graphs (more dense substructure)
+          - Any structured data graph with detectable clique atoms
+
+        Returns None when:
+          - no disjoint K_k atom for any k ∈ [min_k, max_k]
+          - all viable configurations exceed `max_chord_edges` budget
+          - chord rule itself raises
+
+        The chord rule's per-step contraction sub-synth recurses through
+        the engine's normal pipeline, so post-peeling structure benefits
+        from cell-quotient/treewidth/SP paths.
+        """
+        import networkx as nx
+        # Single pass through find_cliques to gather all maximal cliques
+        nxg = nx.Graph()
+        nxg.add_nodes_from(graph.nodes)
+        nxg.add_edges_from(graph.edges)
+        all_cliques = list(nx.find_cliques(nxg))
+        # find_cliques returns MAXIMAL cliques. For sub-cliques (e.g., K_3
+        # inside a K_4), we have to enumerate sub-cliques of each maximal
+        # clique. But for chord-peeling we WANT large atoms when possible,
+        # so we iterate from max_k down. A K_k inside a larger K_m can
+        # always be found as a sub-clique of the K_m. We only consider
+        # atoms of EXACTLY size k (and ignore sub-atoms within a single
+        # parent clique for disjointness).
+        best: Optional[Tuple[int, int, List[Tuple[int, int]]]] = None
+        # tuple: (k_chosen, total_chord_edges, chord_edge_list)
+        for k in range(max_k, min_k - 1, -1):
+            # Collect every K_k as either (a) a maximal clique of size k,
+            # or (b) a size-k subset of a larger maximal clique. For
+            # disjointness, the latter overlaps the former so we just
+            # union them and dedupe.
+            k_cliques: List[FrozenSet[int]] = []
+            seen_sets: Set[FrozenSet[int]] = set()
+            from itertools import combinations
+            for c in all_cliques:
+                if len(c) >= k:
+                    if len(c) == k:
+                        fc = frozenset(c)
+                        if fc not in seen_sets:
+                            seen_sets.add(fc)
+                            k_cliques.append(fc)
+                    else:
+                        # Only emit one canonical sub-K_k per parent
+                        # clique to avoid explosion (C(m, k) sub-cliques
+                        # per parent). The first lex sub-clique suffices —
+                        # disjoint-selection will skip overlapping atoms.
+                        for sub in combinations(sorted(c), k):
+                            fc = frozenset(sub)
+                            if fc not in seen_sets:
+                                seen_sets.add(fc)
+                                k_cliques.append(fc)
+                                break  # one sub-K_k per parent
+            if not k_cliques:
+                continue
+            # Greedy disjoint selection
+            disjoint_atoms: List[FrozenSet[int]] = []
+            used_verts: Set[int] = set()
+            for atom in k_cliques:
+                if not (atom & used_verts):
+                    disjoint_atoms.append(atom)
+                    used_verts |= atom
+            if not disjoint_atoms:
+                continue
+            total = len(disjoint_atoms) * (k * (k - 1) // 2)
+            # Build chord-edge list
+            chord_edges: List[Tuple[int, int]] = []
+            for atom in disjoint_atoms:
+                vs = sorted(atom)
+                for i in range(k):
+                    for j in range(i + 1, k):
+                        chord_edges.append((vs[i], vs[j]))
+            if best is None or total < best[1]:
+                best = (k, total, chord_edges)
+        if best is None:
+            return None
+        k_best, total_edges, chord_edges = best
+        # Cost-aware gate (replaces ad-hoc 18-edge cap, May 19 2026).
+        # Per-step cost is roughly baseline × per_step_ratio where
+        # per_step_ratio grows with treewidth (engine sub-synth caching
+        # benefits diminish at higher tw). Calibrated empirically:
+        # Z(1,2) tw=10: per-step ~8s / baseline ~138s = 0.058
+        # higher tw → less cache reuse → ratio increases
+        # Formula: per_step_ratio ≈ 0.05 + 0.02 × max(0, tw - 10)
+        # Gate: chord_edges × per_step_ratio < 0.85 (peel beats baseline)
+        try:
+            from ..graphs.treewidth import compute_best_tree_decomposition
+            full_mg = MultiGraph.from_graph(graph)
+            td = compute_best_tree_decomposition(full_mg, max_width=20)
+            tw = td.width if td is not None else 12
+        except Exception:
+            tw = 12  # conservative fallback
+        per_step_ratio = 0.05 + 0.02 * max(0, tw - 10)
+        peel_total_ratio = total_edges * per_step_ratio
+        if peel_total_ratio >= 0.85:
+            return None  # peel likely slower than baseline treewidth_dp
+        # σ-aware ordering improves intermediate-cache hits when σ exists
+        sigma = None
+        try:
+            from ..roots.signed_quotient import find_best_sigma
+            sigma = find_best_sigma(nxg, require_free=True)
+        except Exception:
+            sigma = None
+        # Run chord rule
+        try:
+            from ..graphs.k_sum import (_combine_chord_iteration,
+                                        _iterative_chord_rule)
+            g_chord_free, factors, adds = _iterative_chord_rule(
+                graph, chord_edges, self, sigma=sigma,
+            )
+            t_chord_free = self.synthesize(g_chord_free, max_depth).polynomial
+            poly = _combine_chord_iteration(t_chord_free, factors, adds)
+        except Exception:
+            return None
+        n_atoms = total_edges // (k_best * (k_best - 1) // 2)
+        return SynthesisResult(
+            polynomial=poly,
+            recipe=[
+                f"K_{k_best} clique-atom chord-peel "
+                f"({n_atoms} disjoint atoms, "
+                f"{total_edges} chord edges, sigma={sigma is not None})"
+            ],
+            verified=True,
+            method="clique_atom_chord_peel",
+        )
+
     def _try_formula_shortcircuit(
         self,
         graph: Graph,
@@ -1319,7 +1710,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
     ) -> Optional[SynthesisResult]:
         """Closed-form shortcut for hierarchical graphs BEFORE treewidth_dp.
 
-        Attempts the Phase 12 unified formula and the Phase 13 k-matching
+        Attempts the unified formula and the k-matching
         cell-cycle formula *without* falling through to treewidth_dp or the
         chord rule. Returns None if neither formula applies — the caller
         should continue to the standard pipeline.
@@ -1338,8 +1729,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                                        detect_kmatching_topology,
                                        extract_cell_topology,
                                        find_cell_candidates,
-                                       try_hierarchical_partition,
-                                       try_heterogeneous_partition)
+                                       try_heterogeneous_partition,
+                                       try_hierarchical_partition)
         from ..graphs.k_sum import _classify_bridges_chords
 
         # Fast gate: skip the shortcut if no D-Wave-style cell candidate
@@ -1386,7 +1777,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             # target graph. Also one for the inter-cell edge set.
             self._emit_partition_provenance(graph, cells, partition, inter_info)
 
-            # Try Phase 12 unified formula
+            # Try unified formula
             H = extract_cell_topology(partition, list(inter_info.edges))
             if H is not None:
                 T_H = self._synthesize_multigraph(H)
@@ -1406,7 +1797,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                         minors_used=all_minors,
                     )
 
-            # Try Phase 13 k-matching formula
+            # Try k-matching formula
             junctions = detect_kmatching_topology(
                 graph, partition, list(inter_info.edges)
             )
@@ -1442,16 +1833,15 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
     ) -> Optional[SynthesisResult]:
         """Try hierarchical tiling for graphs with repeating cell structure.
 
-        (April 2026): cost-aware dispatch. Computes BOTH the
-        homogeneous and heterogeneous partitions when available, predicts the
-        chord-rule cost (`len(_classify_bridges_chords(...)[1])`) for each,
-        and picks the partition with the fewest chord edges. On tie, prefers
-        homogeneous (simpler `T(cell)^k` base polynomial).
+        Cost-aware dispatch: compute BOTH the homogeneous and heterogeneous
+        partitions when available, predict the chord-rule cost
+        (`len(_classify_bridges_chords(...)[1])`) for each, and pick the
+        partition with the fewest chord edges. On tie, prefer homogeneous
+        (simpler `T(cell)^k` base polynomial).
 
-        Why: Z(1,3) decomposes as 3×Z(1,1) homogeneously with
-        96 inter-cell chord edges (intractable) but as Z(1,2)+Z(1,1)
-        heterogeneously with ~10-20 chord edges. The previous "homogeneous
-        always wins, heterogeneous is fallback" dispatch picked the bad
+        Why: Z(1,3) decomposes as 3×Z(1,1) homogeneously with ~96 inter-cell
+        chord edges (intractable) but as Z(1,2)+Z(1,1) heterogeneously with
+        ~10-20 chord edges. "Homogeneous always wins" would pick the bad
         decomposition.
         """
         from ..graphs.k_sum import _classify_bridges_chords
@@ -1459,7 +1849,15 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         self._log("Trying hierarchical tiling...")
 
         homo = try_hierarchical_partition(graph, self.table)
-        het = try_heterogeneous_partition(graph, self.table)
+        # Heterogeneous partition VF2 cost is significant on 40+ node graphs.
+        # Skip in recursive sub-syntheses (depth > 1): chord-rule contractions
+        # produce derived graphs that almost never have heterogeneous covers;
+        # the het-cache catches repeats but the first miss per intermediate
+        # still costs VF2. Top-level still runs both.
+        if self._synth_depth <= 1:
+            het = try_heterogeneous_partition(graph, self.table)
+        else:
+            het = None
 
         # Filter homogeneous through the original "is it worth it" gates.
         homo_cells = None  # type: Optional[List[MinorEntry]]
@@ -1580,7 +1978,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         # the source location when the user hovers the sub-graph card.
         self._emit_partition_provenance(graph, cells, partition, inter_info)
 
-        # Step 2: Phase-12 unified-formula short-circuit.
+        # Step 2: unified-formula short-circuit.
         # When every cell-pair's inter-cell edges share a single
         # vertex-pair, T(G) = (∏ T(cells)) × T(H), where H is the
         # cell-topology multigraph. Cell-agnostic: works for both
@@ -1619,7 +2017,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                         fringe_edges=0,
                         minors_used=all_minors,
                     )
-                # Verification failed - this would mean the Phase 11
+                # Verification failed - this would mean the 
                 # proof is wrong for this configuration. Fall through to
                 # the existing pipeline so we still return a correct
                 # polynomial; log loudly so the case can be investigated.
@@ -1628,7 +2026,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                     "to product formula / chord rule"
                 )
 
-        # Step 2.5: Phase-13 k-matching cell-cycle formula.
+        # Step 2.5: k-matching cell-cycle formula.
         # When each cell-pair's inter-cell edges form a k-matching
         # (distinct vertex pairs) AND anchors per side lie in a single
         # vertex-transitive class (e.g., same bipartition side of a

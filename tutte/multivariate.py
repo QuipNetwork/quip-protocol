@@ -9,7 +9,7 @@ identity (Sokal 2005)
 
     T(G; x, y) = (x − 1)^{−r(E)} (y − 1)^{−|V|} · Z(G; (x − 1)(y − 1), y − 1)
 
-For our research use (Phase 18.E.1), Z is the natural object for two
+For our research use, Z is the natural object for two
 reasons that the (x, y) basis hides:
 
 1. Deletion-contraction is linear in each v_e:
@@ -34,7 +34,7 @@ This module implements two representations:
   for empirical size/mul-cost comparison vs `TuttePolynomial`. The
   conversion `to_tutte()` lives here.
 
-The Phase 18.E.1.a empirical experiment (research/scripts/...) uses
+The empirical experiment (research/scripts/...) uses
 `UniformZ` for the size compare; `MultivariateTutte` is the substrate
 for any future per-edge algebraic identity hunt.
 
@@ -54,7 +54,6 @@ from typing import Dict, FrozenSet, Iterable, Tuple
 
 from .polynomial import TuttePolynomial
 
-
 # ---------- UniformZ (collapsed uniform-v) ----------
 
 @dataclass(frozen=True)
@@ -64,7 +63,7 @@ class UniformZ:
     Internal: dict mapping `(q_power, v_power) -> integer coefficient`.
     Sparse — zero coefficients are not stored.
 
-    This is the right object for the Phase 18.E.1.a empirical
+    This is the right object for the empirical
     comparison: same expressive power as `TuttePolynomial(x, y)` after
     conversion, but its monomial structure may be more compact for
     structured graphs (cells / cell-quotient compositions).
@@ -185,7 +184,7 @@ class UniformZ:
             f"{c}·q^{q}·v^{v}" for (q, v), c in self.coeffs
         ) + ")"
 
-    # Sizing helpers (for the Phase 18.E.1.a empirical comparison)
+    # Sizing helpers (for the empirical comparison)
     def coeff_count(self) -> int:
         return sum(1 for _, c in self.coeffs if c != 0)
 
@@ -270,7 +269,7 @@ class UniformZ:
         # research script lands the correct Sokal identity expansion.
         raise NotImplementedError(
             "UniformZ.to_tutte: Sokal identity expansion deferred to "
-            "Phase 18.E.1.a research script. Use evaluate() for "
+            "a research script. Use evaluate() for "
             "numeric values; the empirical comparison harness needs "
             "size/mul measurements, not full conversion."
         )
@@ -301,7 +300,7 @@ class MultivariateTutte:
       "absent" half by 1/q (handles component-count drop on contraction).
 
     For empirical use the `UniformZ` representation is faster; this
-    class is the substrate for the Phase 18.E.1.b closed-form k-sum
+    class is the substrate for the closed-form k-sum
     identity hunt where per-edge differentiation matters.
     """
 

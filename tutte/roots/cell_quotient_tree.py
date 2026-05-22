@@ -45,31 +45,18 @@ import networkx as nx
 
 from ..graph import Graph
 from ..polynomial import TuttePolynomial
-from .aut_orbit import (
-    aut_compress_t_rooted,
-    aut_compress_t_rooted_per_cell,
-    build_relabel_aut,
-    canonical_partition,
-    compute_cell_aut,
-    per_cell_canonical_key,
-    per_cell_orbit_rep,
-    per_cell_orbit_size,
-)
-from .cell_quotient_helpers import (
-    components_touching,
-    enumerate_partitions_per_orbit,
-    orbit_convolve,
-    precompute_M_table,
-)
-from .rooted_tutte import (
-    delta,
-    divide_by_x_minus_1_power,
-    join_partitions,
-    relabel_partition_dict,
-    restrict_partition,
-    t_rooted_cached,
-)
-
+from .aut_orbit import (aut_compress_t_rooted, aut_compress_t_rooted_per_cell,
+                        build_relabel_aut, canonical_partition,
+                        compute_cell_aut, per_cell_canonical_key,
+                        per_cell_orbit_rep, per_cell_orbit_size)
+from .cell_quotient_helpers import (components_touching,
+                                    enumerate_partitions_per_orbit,
+                                    orbit_convolve,
+                                    precompute_M_and_convolve_streaming_mod,
+                                    precompute_M_table)
+from .rooted_tutte import (delta, divide_by_x_minus_1_power, join_partitions,
+                           relabel_partition_dict, restrict_partition,
+                           t_rooted_cached)
 
 # =============================================================================
 # Spec / data structures
@@ -80,7 +67,8 @@ from .rooted_tutte import (
 class CellTreeSpec:
     """Specification for a cell-tree topology DP.
 
-    See tree_dp_design.md for full semantics. Phase 2: linear path only.
+    Semantics: linear-path tree topology over isomorphic cells joined by
+    a single junction template.
 
     `cross_cell_identifications`: optional list of
     ``(cell_i, anchor_template_i, cell_j, anchor_template_j)`` tuples
@@ -115,12 +103,12 @@ class CellTreeSpec:
 
 
 # =============================================================================
-# Phase 2: linear path tree DP — mirrors compute_path_dp
+# Linear-path tree DP — mirrors compute_path_dp
 # =============================================================================
 
 
 def compute_tree_dp_simple(spec: CellTreeSpec) -> TuttePolynomial:
-    """Phase 2: tree DP for LINEAR PATH topology (degenerate tree).
+    """Tree DP for LINEAR PATH topology (degenerate tree).
 
     Uses precompute_M_table + orbit_convolve from cell_quotient_helpers
     for correct rooted-Tutte composition. Empty aut groups → no orbit
@@ -130,7 +118,7 @@ def compute_tree_dp_simple(spec: CellTreeSpec) -> TuttePolynomial:
     assert nx.is_tree(tree), "Input must be a tree"
     leaves = [n for n in tree.nodes() if tree.degree(n) == 1]
     assert len(leaves) == 2, (
-        f"Phase 2 supports only linear path (2 leaves); got {len(leaves)} leaves"
+        f"compute_tree_dp_simple supports only linear path (2 leaves); got {len(leaves)} leaves"
     )
 
     leaf_a = min(leaves)
@@ -284,8 +272,239 @@ def compute_tree_dp_simple(spec: CellTreeSpec) -> TuttePolynomial:
     return final_poly
 
 
+def _try_chain_recurrence_mod(
+    spec: "CellTreeSpec", x_val: int, y_val: int, p: int, path_order: list
+) -> "Optional[int]":
+    """Attempt to evaluate T(graph) mod p via the chain recurrence
+    algebra. Returns None if the chain framework doesn't apply.
+
+    Requires:
+    - Linear path topology (already enforced by caller)
+    - At least one interior cell (n_cells >= 3) — leaves don't have
+      two-sided anchor groups
+    """
+    n_cells = len(path_order)
+    if n_cells < 3:
+        return None
+
+    interior_cell = path_order[1]
+    interior_groups = spec.cell_anchor_groups.get(interior_cell, {})
+    nbr_ids = sorted(interior_groups.keys())
+    if len(nbr_ids) != 2:
+        return None
+    left_nbr, right_nbr = nbr_ids
+    left_anchors = list(interior_groups[left_nbr])
+    right_anchors = list(interior_groups[right_nbr])
+
+    # Chain framework requires DISJOINT anchor groups. K_3 chain with
+    # anchors=[0,1] shares vertices between left and right, which the
+    # framework can't handle (needs cross-cell identifications instead).
+    if set(left_anchors) & set(right_anchors):
+        return None
+
+    chain_cell_anchor_groups = {0: left_anchors, 1: right_anchors}
+
+    from tutte.roots.chain_recurrence import compute_chain_recurrence_mod
+    try:
+        T_mod, _cache = compute_chain_recurrence_mod(
+            cell_template=spec.cell_template,
+            cell_anchor_groups=chain_cell_anchor_groups,
+            connector_template=spec.junction_template,
+            junction_anchors_A=list(spec.junction_anchors_A),
+            junction_anchors_B=list(spec.junction_anchors_B),
+            left_anchor_group=0,
+            right_anchor_group=1,
+            n_cells=n_cells,
+            x_val=x_val,
+            y_val=y_val,
+            p=p,
+        )
+        return T_mod
+    except Exception:
+        return None
+
+
+def compute_tree_dp_simple_mod(
+    spec: CellTreeSpec, x_val: int, y_val: int, p: int,
+) -> int:
+    """Modular variant of `compute_tree_dp_simple` —
+
+    Evaluates `T(G; x_val, y_val) mod p` for a linear-path tree-quotient
+    cell-decomposable graph WITHOUT materializing the full polynomial.
+
+    Same DP structure as the polynomial version, but each per-cell /
+    per-junction T_rooted polynomial is **evaluated at (x_val, y_val)
+    mod p before convolution**. The convolution itself uses the modular
+    M-table machinery (`precompute_M_and_convolve_streaming_mod`).
+
+    This is the first non-Chimera entrypoint into the modular DP path
+    — any graph whose cell-quotient is a linear path can be evaluated
+    point-by-point via this function.
+
+    Limitations:
+    - Linear path only (2 leaves in cell_tree). Branching trees would
+      need a modular port of `compute_tree_dp_recursive`.
+    - No orbit compression (empty aut group throughout). Cells with
+      non-trivial automorphism could be sped up by porting
+      `aut_compress_t_rooted_per_cell`.
+    """
+    tree = spec.cell_tree
+    assert nx.is_tree(tree), "Input must be a tree"
+    leaves = [n for n in tree.nodes() if tree.degree(n) == 1]
+    assert len(leaves) == 2, (
+        f"compute_tree_dp_simple_mod supports linear path only; got {len(leaves)} leaves"
+    )
+
+    leaf_a = min(leaves)
+    leaf_b = max(leaves)
+    order = nx.shortest_path(tree, leaf_a, leaf_b)
+    n_cells = len(order)
+    assert n_cells >= 2
+
+    # Chain recurrence fast path: for modular evaluation, runs in O(r²)
+    # integer ops per cell where r = n_orbits.
+    try:
+        result = _try_chain_recurrence_mod(spec, x_val, y_val, p, order)
+        if result is not None:
+            return result
+    except Exception:
+        pass  # Fall through to standard path DP
+
+    cell_template = spec.cell_template
+    junction_template = spec.junction_template
+
+    # Allocate per-cell anchor positions (matches polynomial version).
+    pos: Dict[int, Dict[int, List[int]]] = {}
+    for cell_idx in tree.nodes():
+        base = 10000 * (cell_idx + 1)
+        pos[cell_idx] = {}
+        groups = spec.cell_anchor_groups.get(cell_idx, {})
+        all_vertices_used = set()
+        for nbr_anchors in groups.values():
+            all_vertices_used.update(nbr_anchors)
+        vertex_to_pos: Dict[int, int] = {}
+        for i, v in enumerate(sorted(all_vertices_used)):
+            vertex_to_pos[v] = base + i
+        for nbr in sorted(groups.keys()):
+            anchors = groups[nbr]
+            pos[cell_idx][nbr] = [vertex_to_pos[a] for a in anchors]
+
+    # === Initialize state with cell 0 ===
+    cell_0 = order[0]
+    cell_1 = order[1]
+    cell_0_outward_anchors = spec.cell_anchor_groups[cell_0][cell_1]
+    cell_0_outward_pos = pos[cell_0][cell_1]
+
+    T_cell0 = t_rooted_cached(cell_template, cell_0_outward_anchors)
+    label_map_0 = {a: q for a, q in zip(cell_0_outward_anchors, cell_0_outward_pos)}
+    state_partition_poly = relabel_partition_dict(T_cell0, label_map_0)
+
+    # Evaluate each partition's polynomial at (x_val, y_val) mod p ONCE.
+    state_orbit_T_mod: Dict[Tuple, int] = {
+        P: T.evaluate_mod(x_val, y_val, p)
+        for P, T in state_partition_poly.items()
+    }
+    state_orbit_partitions: Dict[Tuple, List[Tuple]] = {P: [P] for P in state_orbit_T_mod}
+
+    total_div = 0
+    junction_c_J = components_touching(
+        junction_template, list(spec.junction_anchors_A)
+    )
+
+    # === Process each subsequent cell ===
+    for step in range(1, n_cells):
+        cur_cell = order[step]
+        prev_cell = order[step - 1]
+        next_cell = order[step + 1] if step + 1 < n_cells else None
+
+        prev_outward_pos = pos[prev_cell][cur_cell]
+        cur_inward_pos = pos[cur_cell][prev_cell]
+
+        # --- Junction step ---
+        junction_anchor_list = list(spec.junction_anchors_A) + list(spec.junction_anchors_B)
+        junction_pos_list = list(prev_outward_pos) + list(cur_inward_pos)
+        junction_label_map = {a: q for a, q in zip(junction_anchor_list, junction_pos_list)}
+        T_junction = t_rooted_cached(junction_template, junction_anchor_list)
+        T_junction_pos = relabel_partition_dict(T_junction, junction_label_map)
+        junction_orbit_T_mod: Dict[Tuple, int] = {
+            P: T.evaluate_mod(x_val, y_val, p)
+            for P, T in T_junction_pos.items()
+        }
+        junction_orbit_partitions: Dict[Tuple, List[Tuple]] = {
+            P: [P] for P in junction_orbit_T_mod
+        }
+
+        out_orbit_sizes_junc: Dict[Tuple, int] = {}
+        state_orbit_T_mod = precompute_M_and_convolve_streaming_mod(
+            state_orbit_T_mod, state_orbit_partitions,
+            junction_orbit_T_mod, junction_orbit_partitions,
+            out_orbit_sizes_junc,
+            p=p, x_val=x_val, y_val=y_val,
+            shared_boundary=list(prev_outward_pos),
+            extra_boundary=list(cur_inward_pos),
+            out_aut_group=[],
+            state_extra_boundary=[],
+        )
+        total_div += len(prev_outward_pos) - junction_c_J
+        state_orbit_partitions = {P: [P] for P in state_orbit_T_mod}
+
+        # --- Cell step ---
+        if next_cell is not None:
+            cur_outward_pos = pos[cur_cell][next_cell]
+            cur_anchor_list = (list(spec.cell_anchor_groups[cur_cell][prev_cell])
+                               + list(spec.cell_anchor_groups[cur_cell][next_cell]))
+            cur_pos_list = list(cur_inward_pos) + list(cur_outward_pos)
+        else:
+            cur_outward_pos = []
+            cur_anchor_list = list(spec.cell_anchor_groups[cur_cell][prev_cell])
+            cur_pos_list = list(cur_inward_pos)
+
+        T_cur = t_rooted_cached(cell_template, cur_anchor_list)
+        cur_label_map = {a: q for a, q in zip(cur_anchor_list, cur_pos_list)}
+        T_cur_pos = relabel_partition_dict(T_cur, cur_label_map)
+        cell_orbit_T_mod: Dict[Tuple, int] = {
+            P: T.evaluate_mod(x_val, y_val, p)
+            for P, T in T_cur_pos.items()
+        }
+        cell_orbit_partitions: Dict[Tuple, List[Tuple]] = {
+            P: [P] for P in cell_orbit_T_mod
+        }
+
+        out_orbit_sizes_cell: Dict[Tuple, int] = {}
+        state_orbit_T_mod = precompute_M_and_convolve_streaming_mod(
+            state_orbit_T_mod, state_orbit_partitions,
+            cell_orbit_T_mod, cell_orbit_partitions,
+            out_orbit_sizes_cell,
+            p=p, x_val=x_val, y_val=y_val,
+            shared_boundary=list(cur_inward_pos),
+            extra_boundary=list(cur_outward_pos),
+            out_aut_group=[],
+            state_extra_boundary=[],
+        )
+        c_cell = components_touching(
+            cell_template, list(spec.cell_anchor_groups[cur_cell][prev_cell])
+        )
+        total_div += len(cur_inward_pos) - c_cell
+        state_orbit_partitions = {P: [P] for P in state_orbit_T_mod}
+
+    # === Final: sum across remaining state ===
+    total = sum(state_orbit_T_mod.values()) % p
+
+    if total_div > 0:
+        base = (x_val - 1) % p
+        if base == 0:
+            raise ValueError(
+                f"x_val ({x_val}) ≡ 1 mod {p}; cannot divide by (x-1)^{total_div}"
+            )
+        denom = pow(base, total_div, p)
+        denom_inv = pow(denom, p - 2, p)
+        total = total * denom_inv % p
+
+    return total
+
+
 # =============================================================================
-# Phase 3: Recursive tree DP — handles branching
+# Recursive tree DP — handles branching
 # =============================================================================
 
 
@@ -971,7 +1190,7 @@ def compute_tree_dp_recursive(
     spec: CellTreeSpec,
     enable_per_cell_compression: bool = False,
 ) -> TuttePolynomial:
-    """Phase 3: tree DP via post-order recursion. Handles BRANCHING.
+    """Tree DP via post-order recursion. Handles BRANCHING.
 
     For each cell, recursively compute T_rooted of the subtree rooted at
     each of its children. Then absorb each child's T_rooted into the

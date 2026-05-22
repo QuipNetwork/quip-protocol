@@ -13,10 +13,10 @@ convolutions.
 
 **Status**: prototype with optional per-cell orbit compression behind
 `enable_per_cell_compression=False` flag. Default uncompressed mode
-validated on 9 path + 4 branching test cases including 5-cell K_{4,4}
+validated on 9 path + 4 branching test cases including 5-cell K*{4,4}
 M_2 Cm₃ interior pattern (full polynomial match against engine).
 Per-cell mode validated on 7 cases including K_5 claw shared M_3 and
-K_{4,4} mixed-direction; **50× speedup** on 5-cell K_{4,4} M_2 Cm₃
+K*{4,4} mixed-direction; **50× speedup** on 5-cell K\_{4,4} M_2 Cm₃
 pattern (12.7 s → 0.3 s) with full polynomial match.
 
 The tree DP is a building block: combined with cycle-closing chord
@@ -39,7 +39,7 @@ research scripts. Future engine integration would dispatch when:
 
 If the cell-quotient is a cycle or grid, dispatch to the
 specialized cycle/grid DP instead. If the cell-quotient has cycles
-but admits a chord-rule peeling (Phase 13 §4 cycle close, see
+but admits a chord-rule peeling (cycle close, see
 [`08_3_kmatching_formula.md`](08_3_kmatching_formula.md)), the tree
 DP becomes the per-leaf computation in a hybrid path.
 
@@ -88,7 +88,7 @@ multiple neighbor groups (shared anchors), the SAME position label is
 allocated. This ensures the partition state correctly tracks shared
 anchors across multiple junctions.
 
-For example, K_{4,4} cell with H neighbors using A-side anchors
+For example, K\_{4,4} cell with H neighbors using A-side anchors
 [0, 1, 2, 3] and V neighbors using B-side anchors [4, 5, 6, 7]: each
 H neighbor gets the same 4 positions for the A-side; each V neighbor
 gets the same 4 positions for the B-side; the H and V anchor sets
@@ -129,13 +129,14 @@ the next bug.
 ### Fix 1 — Disjoint per-cell groups via Aut orbits
 
 `_compute_aut_orbits_on_positions` with `preserve_anchor_sets`:
+
 - Compute `Aut(cell_template)` via VF2.
 - Filter to auts that map the anchor SET to itself, AND preserve
   each per-neighbor anchor set as a SET.
 - Compute orbits of valid auts on positions.
 - Each orbit is one per-cell group.
 
-Without `preserve_anchor_sets`: K_{4,4} cell with disjoint A/B side
+Without `preserve_anchor_sets`: K\_{4,4} cell with disjoint A/B side
 anchors gets ONE orbit (the bipartite-side-swap aut maps A → B). The
 filter keeps S_4 × S_4 acting independently on each side.
 
@@ -188,16 +189,16 @@ step's fully-consumed fallback).
 All 7 per-cell test cases pass with full polynomial match
 (`tutte/research/scripts/tree_dp_per_cell_compression_test.py`):
 
-| Case                                    | uncompressed | compressed | speedup |
-|-----------------------------------------|--------------|------------|---------|
-| K_3 2-cell path M_2                     | 2.0 s        | 0.001 s    | 1527×   |
-| K_3 3-cell path M_2                     | 0.002 s      | 0.002 s    | 1×      |
-| K_4 claw M_2 shared                     | 0.008 s      | 0.009 s    | 1×      |
-| K_4 claw M_2 disjoint                   | 0.022 s      | 0.026 s    | 1×      |
-| K_5 claw M_3 shared                     | 0.16 s       | 0.45 s     | 0.35×   |
-| K_{4,4} 3-cell path M_2                 | 7.1 s        | 0.07 s     | 100×    |
-| K_{4,4} 3-cell mixed-direction          | 12.5 s       | 4.5 s      | 2.8×    |
-| **5-cell K_{4,4} Cm₃ pattern M_2**      | 12.7 s       | 0.3 s      | **50×** |
+| Case                                | uncompressed | compressed | speedup |
+| ----------------------------------- | ------------ | ---------- | ------- |
+| K_3 2-cell path M_2                 | 2.0 s        | 0.001 s    | 1527×   |
+| K_3 3-cell path M_2                 | 0.002 s      | 0.002 s    | 1×      |
+| K_4 claw M_2 shared                 | 0.008 s      | 0.009 s    | 1×      |
+| K_4 claw M_2 disjoint               | 0.022 s      | 0.026 s    | 1×      |
+| K_5 claw M_3 shared                 | 0.16 s       | 0.45 s     | 0.35×   |
+| K\_{4,4} 3-cell path M_2            | 7.1 s        | 0.07 s     | 100×    |
+| K\_{4,4} 3-cell mixed-direction     | 12.5 s       | 4.5 s      | 2.8×    |
+| **5-cell K\_{4,4} Cm₃ pattern M_2** | 12.7 s       | 0.3 s      | **50×** |
 
 The K_5 claw 0.35× regression reflects the cost of repeated state
 expansion at every junction step (no persistent per-cell positions
@@ -212,7 +213,7 @@ genuinely helps, the speedup is dramatic (50–1500×).
 - **No `junction_cell_anchor_groups` support** in
   `precompute_M_table` — child must be expanded to uncompressed at
   cell-merge step (loses some compression).
-- **5-cell K_{4,4} M_4 (Cm₃ interior wall) does not complete in 30
+- **5-cell K\_{4,4} M_4 (Cm₃ interior wall) does not complete in 30
   minutes** with per-cell alone. The interior cell triggers
   `keep_shared=True` at the first H child junction step (since other
   H children share the same A-side anchors), expanding state to
@@ -238,22 +239,22 @@ genuinely helps, the speedup is dramatic (50–1500×).
 
 `tutte/roots/cell_quotient_tree.py`:
 
-| Symbol                                | Purpose                                                       |
-|---------------------------------------|---------------------------------------------------------------|
-| `CellTreeSpec`                        | Dataclass: cell template, junction template, cell-tree, anchor groups, junction A/B anchors, root cell. |
-| `compute_tree_dp_simple(spec)`        | Linear-path-only path DP (Phase 2 prototype).                |
-| `compute_tree_dp_recursive(spec, enable_per_cell_compression=False)` | Branching tree DP via post-order recursion. Per-cell compression behind opt-in flag. |
-| `_allocate_tree_positions(spec)`      | Per-(cell, neighbor) position allocation with shared-anchor dedup. |
-| `_compute_aut_orbits_on_positions(...)` | Cell-aut orbit computation with `preserve_anchor_sets`.    |
-| `_initial_cell_groups(...)`           | Wraps the orbit computation for initial state setup.         |
-| `_state_groups_after_*`               | Per-cell group evolution through junction / cell-merge / marginalize steps with subset removal. |
-| `_expand_per_cell_state(...)`         | Orbit-member enumeration via S_n^N permutations.             |
-| `_marginalize_state(...)`             | Standard (uncompressed) marginalization.                     |
-| `_marginalize_state_per_cell(...)`    | Per-cell-aware marginalization with re-canonicalization.     |
-| `compute_corrected_leaf_dp(spec)`     | Brute-force leaf DP for chord-rule leaves with cross-cell vertex identifications. Uses corrected `(y-1)^{k-m}/(x-1)^{m-c_comp}` convolution rule (RESOLVED 2026-05-07). |
-| `_merge_cells_corrected(...)`         | Per-pair convolution applying the corrected formula for shared positions. |
-| `build_leaf_graph_from_spec(spec)`    | Constructs the implicit leaf graph for ground-truth validation. |
-| `_allocate_positions_with_ids(spec)`  | Position allocator that includes `cross_cell_identifications` endpoints (the standard `_allocate_tree_positions` skips them). |
+| Symbol                                                               | Purpose                                                                                                                                                                 |
+| -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CellTreeSpec`                                                       | Dataclass: cell template, junction template, cell-tree, anchor groups, junction A/B anchors, root cell.                                                                 |
+| `compute_tree_dp_simple(spec)`                                       | Linear-path-only path DP.                                                                                                                                               |
+| `compute_tree_dp_recursive(spec, enable_per_cell_compression=False)` | Branching tree DP via post-order recursion. Per-cell compression behind opt-in flag.                                                                                    |
+| `_allocate_tree_positions(spec)`                                     | Per-(cell, neighbor) position allocation with shared-anchor dedup.                                                                                                      |
+| `_compute_aut_orbits_on_positions(...)`                              | Cell-aut orbit computation with `preserve_anchor_sets`.                                                                                                                 |
+| `_initial_cell_groups(...)`                                          | Wraps the orbit computation for initial state setup.                                                                                                                    |
+| `_state_groups_after_*`                                              | Per-cell group evolution through junction / cell-merge / marginalize steps with subset removal.                                                                         |
+| `_expand_per_cell_state(...)`                                        | Orbit-member enumeration via S_n^N permutations.                                                                                                                        |
+| `_marginalize_state(...)`                                            | Standard (uncompressed) marginalization.                                                                                                                                |
+| `_marginalize_state_per_cell(...)`                                   | Per-cell-aware marginalization with re-canonicalization.                                                                                                                |
+| `compute_corrected_leaf_dp(spec)`                                    | Brute-force leaf DP for chord-rule leaves with cross-cell vertex identifications. Uses corrected `(y-1)^{k-m}/(x-1)^{m-c_comp}` convolution rule (RESOLVED 2026-05-07). |
+| `_merge_cells_corrected(...)`                                        | Per-pair convolution applying the corrected formula for shared positions.                                                                                               |
+| `build_leaf_graph_from_spec(spec)`                                   | Constructs the implicit leaf graph for ground-truth validation.                                                                                                         |
+| `_allocate_positions_with_ids(spec)`                                 | Position allocator that includes `cross_cell_identifications` endpoints (the standard `_allocate_tree_positions` skips them).                                           |
 
 ## Cross-cell vertex-identification convolution (Step 3.B.3 — RESOLVED)
 
@@ -267,6 +268,7 @@ T_combined[P_comb] = Σ_{(P_1, P_2) → P_comb}
 ```
 
 where:
+
 - `k` = number of shared positions (vertex identifications),
 - `m` = merge events on shared positions = `|P_1| + |P_2| - |P_comb|`,
 - `c_comp` = #components in the full graph being merged (1 for connected

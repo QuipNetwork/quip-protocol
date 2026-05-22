@@ -4,7 +4,7 @@ Generic helpers for the cell-quotient cycle DP. Operate on the rooted-Tutte
 partition framework with Aut-orbit compression. All generic — work for any
 cell template + junction template combination, not D-Wave-specific.
 
-Major optimizations (Phase 18.E.3.e Week 3):
+Major optimizations:
 1. Orbit-level M_precompute (143× speedup): pick rep_state ∈ O_state,
    iterate all P_junc, multiply by |O_state|. Validated mathematically.
 2. Position-invariant `enumerate_partitions_cached` (7× speedup): cache
@@ -26,21 +26,12 @@ import networkx as nx
 
 from ..graph import Graph
 from ..polynomial import TuttePolynomial
-from .aut_orbit import (
-    apply_perm_to_partition,
-    build_relabel_aut,
-    canonical_partition,
-    enumerate_per_cell_aut_group,
-    per_cell_canonical_key,
-    per_cell_orbit_size,
-    per_cell_partition_stab,
-)
-from .rooted_tutte import (
-    all_partitions,
-    delta,
-    join_partitions,
-    restrict_partition,
-)
+from .aut_orbit import (apply_perm_to_partition, build_relabel_aut,
+                        canonical_partition, enumerate_per_cell_aut_group,
+                        per_cell_canonical_key, per_cell_orbit_size,
+                        per_cell_partition_stab)
+from .rooted_tutte import (all_partitions, delta, join_partitions,
+                           restrict_partition)
 
 
 def components_touching(template: Graph, boundary: List[int]) -> int:
@@ -450,6 +441,19 @@ def precompute_M_table_pair_orbit(
 
     M_dict: Dict[Tuple, Dict[Tuple[int, int], int]] = defaultdict(dict)
 
+    # Try the C-ext batched H-canonicalize for the inner bucketing loop.
+    # The Python `min(apply_perm_to_partition(P, h) for h in H)` is the
+    # per-cell-pair hot spot for Cm_3-scale problems (~14k Python ops per
+    # pair × ~44M pairs). `h_canonicalize_c_batched` marshals H once per
+    # call, then loops in C — measured ~8× faster than Python on
+    # 1000 P × |H|=5000. Universe for H is shared+extra
+    # (state_extra fixed by G); compute once.
+    try:
+        from ._partition_c import h_canonicalize_c_batched as _hcb
+    except Exception:
+        _hcb = None  # type: ignore[assignment]
+    _hcb_universe = list(shared_boundary) + list(extra_boundary)
+
     for O_state, ps_list in state_orbit_partitions.items():
         rep_state = ps_list[0]
         H = state_stab[O_state]
@@ -465,15 +469,28 @@ def precompute_M_table_pair_orbit(
             # H acts on FULL partition (extras fixed by G); two P_junc's in
             # the same H-orbit give the same f-contribution.
             buckets: Dict[Tuple, List] = {}  # h_canon → [count, P_junc_rep]
-            for P_junc in members:
-                h_canon = min(
-                    apply_perm_to_partition(P_junc, h)
-                    for h in H
-                )
-                if h_canon not in buckets:
-                    buckets[h_canon] = [1, P_junc]
-                else:
-                    buckets[h_canon][0] += 1
+            # Gate the C-ext call: per-call marshaling of H costs ~|H|×n_univ
+            # cffi ops; only pays off when |members|×|H| is large enough.
+            # Threshold from empirical perf: ~5000 inner iterations equivalent.
+            use_hcb = (_hcb is not None
+                       and len(members) * len(H) >= 5000)
+            c_canons = _hcb(members, H, _hcb_universe) if use_hcb else None
+            if c_canons is None:
+                # Python fallback: per-pair min over H.
+                for P_junc in members:
+                    h_canon = min(
+                        apply_perm_to_partition(P_junc, h) for h in H
+                    )
+                    if h_canon not in buckets:
+                        buckets[h_canon] = [1, P_junc]
+                    else:
+                        buckets[h_canon][0] += 1
+            else:
+                for P_junc, h_canon in zip(members, c_canons):
+                    if h_canon not in buckets:
+                        buckets[h_canon] = [1, P_junc]
+                    else:
+                        buckets[h_canon][0] += 1
 
             for h_canon, (h_orbit_size, P_junc_full) in buckets.items():
                 pair_orbit_count = h_orbit_size  # H-orbit size in O_junc
@@ -538,8 +555,8 @@ def precompute_M_and_convolve_streaming(
     integer coefficient dicts) throughout the streaming loop — only at
     the very end do we apply the orbit-size division and wrap into
     `TuttePolynomial` objects. This avoids the encode/decode cycle that
-    `TuttePolynomial.__add__` incurs on every chunk per key (the
-    pre-Round-10 bottleneck on Cm₃-scale problems).
+    `TuttePolynomial.__add__` incurs on every chunk per key (a major
+    bottleneck on Cm₃-scale problems before the raw-dict path).
 
     `out_orbit_sizes` may be incomplete (e.g., when populated analytically
     from M-table keys). Any `O_out` not present uses
@@ -689,12 +706,12 @@ def precompute_M_table_mod(
     enumerate_junction_internally: bool = False,
     junc_data: Optional[Dict[Tuple, list]] = None,
 ) -> Dict[Tuple[Tuple, Tuple, Tuple], int]:
-    """Fast modular variant of `precompute_M_table` (Phase 12.B-2).
+    """Fast modular variant of `precompute_M_table`.
 
     Each `M[O_state, O_junc, O_out]` entry is a single integer mod `p` —
     the polynomial M-table entry evaluated at `(x_val, y_val) mod p` —
     accumulated directly without any polynomial allocation. Replaces the
-    Phase 12.B-1 path that built a polynomial M-table and then evaluated
+    path that built a polynomial M-table and then evaluated
     each entry post-hoc. Expected ~100× speedup at Cm₃ scale because the
     inner loop replaces a per-pair polynomial multiply-accumulate (O(terms)
     int operations on ~hundreds-of-term coefficient dicts) with a single
@@ -836,7 +853,7 @@ def precompute_M_and_convolve_streaming_mod(
     """Modular variant of `precompute_M_and_convolve_streaming`.
 
     Operates in integers mod `p` throughout via `precompute_M_table_mod`
-    (Phase 12.B-2 fast path) — each chunk's M-table is built as ints
+    — each chunk's M-table is built as ints
     directly, with no polynomial allocation. `state_orbit_T_mod` and
     `junction_orbit_T_mod` map orbit canonical → `T_orbit(x_val, y_val)
     mod p`. Output: orbit canonical → integer mod p.
@@ -862,9 +879,9 @@ def precompute_M_and_convolve_streaming_mod(
         junction_cell_anchor_groups, enumerate_junction_internally,
     )
 
-    # Try Round 16 single-pass C-ext (collapses M_int build + convolve
-    # into one Python loop with 1-tuple O_out key). Only available when
-    # full C-ext gating is satisfied AND state/junc values are non-empty.
+    # Try single-pass C-ext (collapses M_int build + convolve into one
+    # Python loop with 1-tuple O_out key). Only available when full C-ext
+    # gating is satisfied AND state/junc values are non-empty.
     n_state_total = len(state_orbit_partitions)
     n_junc_total = sum(len(pj) for pj in junc_data.values())
     can_use_single_pass = (
@@ -883,12 +900,23 @@ def precompute_M_and_convolve_streaming_mod(
 
         if can_use_single_pass:
             try:
-                from ._partition_c import precompute_and_convolve_c_mod
+                # C-side hash-map aggregation eliminates Python dict ops in
+                # the inner aggregation loop. Activated via env var
+                # TUTTE_R18_AGGREGATE (default on); falls back transparently
+                # to the per-chunk convolve on capacity errors.
+                import os
+                use_r18 = os.environ.get("TUTTE_R18_AGGREGATE", "1") != "0"
+                if use_r18:
+                    from ._partition_c import precompute_and_aggregate_c_mod
+                    chunk_compute = precompute_and_aggregate_c_mod
+                else:
+                    from ._partition_c import precompute_and_convolve_c_mod
+                    chunk_compute = precompute_and_convolve_c_mod
                 n_state_per_orbit = {
                     O_state: per_cell_orbit_size(O_state, state_cell_anchor_groups)
                     for O_state in chunk_state_part
                 }
-                chunk_out_mod = precompute_and_convolve_c_mod(
+                chunk_out_mod = chunk_compute(
                     state_orbit_partitions=chunk_state_part,
                     junc_data_per_orbit=junc_data,
                     state_extra_boundary=state_extra,
@@ -905,6 +933,29 @@ def precompute_M_and_convolve_streaming_mod(
                                 for d in range(len(shared_boundary) + 1)],
                     p=p,
                 )
+                if chunk_out_mod is None and use_r18:
+                    # Hash-map aggregator returned None (capacity overflow
+                    # or similar) — fall back to the per-chunk convolve
+                    # for this chunk before resorting to the two-pass
+                    # Python path below.
+                    from ._partition_c import precompute_and_convolve_c_mod
+                    chunk_out_mod = precompute_and_convolve_c_mod(
+                        state_orbit_partitions=chunk_state_part,
+                        junc_data_per_orbit=junc_data,
+                        state_extra_boundary=state_extra,
+                        extra_boundary=extra_boundary,
+                        shared_boundary=shared_boundary,
+                        out_boundary=(state_extra + list(shared_boundary) + list(extra_boundary))
+                                     if keep_shared
+                                     else (state_extra + list(extra_boundary)),
+                        out_cell_anchor_groups=out_cell_anchor_groups,
+                        n_state_per_orbit=n_state_per_orbit,
+                        state_orbit_T_mod=state_orbit_T_mod,
+                        junction_orbit_T_mod=junction_orbit_T_mod,
+                        xy_pow_mod=[pow(((x_val - 1) * (y_val - 1)) % p, d, p)
+                                    for d in range(len(shared_boundary) + 1)],
+                        p=p,
+                    )
                 if chunk_out_mod is not None:
                     for O_out, val in chunk_out_mod.items():
                         if out_cell_anchor_groups is not None and O_out not in out_orbit_sizes:
@@ -966,12 +1017,11 @@ def _expand_per_cell_orbit_members(
 
     Returns a list of distinct partitions in canonical-sorted form.
 
-    Early-terminates once `per_cell_orbit_size` worth of members have been
-    found (Round 15 optimization). The orbit size is an analytical
-    invariant of the canonical key — for Cm₃ row partitions, most orbits
-    are tiny while `|S_n^N|` is huge, so brute-forcing all perm combos
-    wastes ~99% of iterations. This change cuts row-junction expansion
-    from ~90 minutes to seconds on Cm₃ 2b.
+    Early-terminates once `per_cell_orbit_size` worth of members have
+    been found. The orbit size is an analytical invariant of the
+    canonical key — for Cm₃ row partitions, most orbits are tiny while
+    `|S_n^N|` is huge, so brute-forcing all perm combos wastes ~99% of
+    iterations.
     """
     from itertools import permutations, product
     canonical = per_cell_canonical_key(rep, cell_anchor_groups)
@@ -1107,7 +1157,8 @@ except Exception:
     _poly_mul_dispatch = None
 
 try:
-    from .._polynomial_c import poly_mul_batched_c as _poly_mul_batched_dispatch
+    from .._polynomial_c import \
+        poly_mul_batched_c as _poly_mul_batched_dispatch
 except Exception:
     _poly_mul_batched_dispatch = None
 

@@ -3,7 +3,7 @@ cell-quotients.
 
 For graphs with cell-decomposable structure where the cell-quotient
 contains cycles (e.g., D-Wave Cm graphs), this module peels one
-closing junction at a time using the Phase 13 §4 chord rule and
+closing junction at a time using the §4 chord rule and
 computes each leaf via a configurable per-leaf synth callable.
 
 The recursion has two paths through `recurse()`:
@@ -44,12 +44,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 import networkx as nx
 
 from ..graph import Graph, MultiGraph
+from ..graphs.covering import (KMatchingJunction, _apply_junction_merge,
+                               _is_bridge_junction, _nx_mg_to_mg,
+                               detect_kmatching_topology,
+                               try_hierarchical_partition)
 from ..polynomial import TuttePolynomial
-from ..graphs.covering import (
-    KMatchingJunction, _apply_junction_merge,
-    _is_bridge_junction, _nx_mg_to_mg,
-    detect_kmatching_topology, try_hierarchical_partition,
-)
 from .cell_quotient_tree import CellTreeSpec, compute_tree_dp_recursive
 
 
@@ -130,7 +129,7 @@ def _spec_canonical_key(spec: CellTreeSpec) -> str:
 def _combine_results_with_chord_rule(
     j_polys: List[TuttePolynomial], k: int, is_bridge: bool,
 ) -> TuttePolynomial:
-    """Phase 13 §4 cycle-close coefficients.
+    """§4 cycle-close coefficients.
 
     Bridge case (closing the only path between two cell components):
         T = x · T_0 + (k-1) · T_1 + Σ_{j>=2} C(k, j) · T_j
@@ -414,7 +413,7 @@ def compute_cell_quotient_hybrid(
     Detects whether `graph` decomposes hierarchically into K_n cells
     joined by k-matching junctions where the cell-quotient has CYCLES
     (so the cycle DP and tree DP don't apply). Recursively peels
-    closing junctions via Phase 13 §4 chord rule, computing each leaf
+    closing junctions via chord rule, computing each leaf
     via `synth_fn` (defaults to `engine.synthesize` for correctness).
 
     Returns None if:
@@ -428,6 +427,12 @@ def compute_cell_quotient_hybrid(
         return None
     _cell_entry, partition, inter_info = result
     if not partition or not inter_info.edges:
+        return None
+    # Gate large-cell-count graphs with large cells. The orbit explosion in
+    # cycle/tree DPs scales with both n_cells AND cell-size (boundary). 3x3
+    # K_3 grids (9 cells × 3 nodes) stay tractable; Cm3 (9 cells × 8-node
+    # K_{4,4} cells) walls. Use graph size as a proxy for cell complexity.
+    if len(partition) > 6 and graph.node_count() > 36:
         return None
     junctions = _detect_kmatching_topology_no_p3(
         graph, partition, list(inter_info.edges),
@@ -582,9 +587,7 @@ def compute_cell_quotient_hybrid(
         """
         if initial_spec is None or isos is None:
             return None
-        from .cell_quotient_tree import (
-            CellTreeSpec, compute_corrected_leaf_dp,
-        )
+        from .cell_quotient_tree import CellTreeSpec, compute_corrected_leaf_dp
         junc = junctions[junc_idx]
         cell_i = junc.cell_i
         cell_j = junc.cell_j

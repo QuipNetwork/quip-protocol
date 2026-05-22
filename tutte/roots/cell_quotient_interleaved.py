@@ -20,7 +20,7 @@ split preservation).
 Generic across cell template + junction connectivity. Validated via
 the same tests that cover cycle DP plus grid-specific synthetic cases.
 
-Key insight (Phase 18.E.3.l): state size stays bounded by `2 × cell_anchors`
+Key insight: state size stays bounded by `2 × cell_anchors`
 throughout, regardless of grid dimensions. For Cm3 (3×3 K_{4,4} grid):
 state has at most 2 K_{4,4} groups = 8 verts → Bell(8) = 4140 partitions
 → ~100 per-cell orbits. Avoids the row-DP's same-boundary convolve wall.
@@ -35,25 +35,13 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from ..graph import Graph
 from ..polynomial import TuttePolynomial
-from .aut_orbit import (
-    aut_compress_t_rooted,
-    aut_compress_t_rooted_per_cell,
-    build_relabel_aut,
-    per_cell_canonical_key,
-    per_cell_orbit_rep,
-    per_cell_orbit_size,
-)
-from .cell_quotient_helpers import (
-    components_touching,
-    orbit_convolve,
-    precompute_M_table,
-)
-from .rooted_tutte import (
-    all_partitions,
-    divide_by_x_minus_1_power,
-    relabel_partition_dict,
-    t_rooted_cached,
-)
+from .aut_orbit import (aut_compress_t_rooted, aut_compress_t_rooted_per_cell,
+                        build_relabel_aut, per_cell_canonical_key,
+                        per_cell_orbit_rep, per_cell_orbit_size)
+from .cell_quotient_helpers import (components_touching, orbit_convolve,
+                                    precompute_M_table)
+from .rooted_tutte import (all_partitions, divide_by_x_minus_1_power,
+                           relabel_partition_dict, t_rooted_cached)
 
 
 def hamiltonian_path_grid(
@@ -939,7 +927,7 @@ def compute_grid_dp_interleaved(
                           f"{sum(len(g) for g in state_cell_groups)} verts",
                           file=sys.stderr)
 
-        # ----- Inline closing dispatch (Rung 3) -----
+        # ----- Inline closing dispatch -----
         # After each path step, scan pending closings; process any whose
         # endpoints are both in state. Iterate (a closing may unblock another).
         while True:

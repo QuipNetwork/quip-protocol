@@ -1,4 +1,4 @@
-"""Almost-cograph Tutte computation (Phase 18.E.3.b).
+"""Almost-cograph Tutte computation.
 
 A graph is "almost a cograph" if removing a small set of *anomaly edges* —
 edges that participate in induced P_4s — leaves a cograph (P_4-free graph).
@@ -19,7 +19,7 @@ enumeration, the iterated chord rule gives O(|A|) leaves.
 
 Best for graphs that are mostly cographs: D-Wave Cm/Pm cells (which ARE
 cographs) joined by a sparse set of inter-cell edges (which are the
-anomalies). Per Phase 18.E.5.b cmtw analysis, Cm2 has 4 inter-cell
+anomalies). Per cmtw analysis, Cm2 has 4 inter-cell
 edge bundles → expected anomaly count ~16 (4 bundles × 4 edges); Cm3
 has 12 → ~48. Capping at max_anomalies=20 covers Cm2 cleanly; Cm3
 falls through to the existing pipeline.
@@ -32,12 +32,12 @@ Public API:
 from __future__ import annotations
 
 from itertools import combinations
-from typing import List, Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from ..graph import Graph
 from ..polynomial import TuttePolynomial
-from .recognition import _build_cotree
 from .dp import compute_tutte_cotree_dp
+from .recognition import _build_cotree
 
 if TYPE_CHECKING:
     from ..synthesis.base import BaseMultigraphSynthesizer
@@ -102,6 +102,7 @@ def _delete_edge(graph: Graph, u: int, v: int) -> Graph:
 def find_anomaly_edges(
     graph: Graph,
     max_anomalies: int = 20,
+    max_nodes: int = 60,
 ) -> Optional[List[Tuple[int, int]]]:
     """Find edges whose removal makes `graph` a cograph (greedy P_4 elimination).
 
@@ -109,6 +110,12 @@ def find_anomaly_edges(
         - [] if `graph` is already a cograph.
         - [edges...] (length ≤ max_anomalies) if greedy elimination succeeds.
         - None if more than max_anomalies eliminations are required.
+        - None immediately if `graph` has more than `max_nodes` nodes
+          (default 60) — `_find_induced_p4_middle_edge` is O(n^4) per
+          iter (≤max_anomalies+1 iters). C(72,4)=1.06M × 17 iters ≈ 9
+          min on Cm3 alone; Pm3 (128n) is >>1hr. Empirically Cm2 (32n)
+          uses grid_dp_streamed not almost_cograph, so cap 60 keeps
+          Cm2 working while skipping Cm3+ and Pm3+.
 
     The greedy heuristic finds A locally-optimally per step but does NOT
     guarantee minimum |A|. For the structured graphs we target (cells +
@@ -116,6 +123,8 @@ def find_anomaly_edges(
 
     Complexity: O(n^4) per iteration × at most `max_anomalies` iterations.
     """
+    if graph.node_count() > max_nodes:
+        return None
     g = graph
     anomalies: List[Tuple[int, int]] = []
 
@@ -171,7 +180,7 @@ def compute_tutte_almost_cograph(
 
     # Apply iterated chord rule on anomalies.
     # Skeleton (graph minus all anomalies) is a cograph by construction.
-    from ..graphs.k_sum import _iterative_chord_rule, _combine_chord_iteration
+    from ..graphs.k_sum import _combine_chord_iteration, _iterative_chord_rule
 
     g_skeleton, factors, adds = _iterative_chord_rule(
         graph, anomalies, engine, smart_order=False,

@@ -168,6 +168,27 @@ class TestNotRecognized:
             nx.complete_bipartite_graph(3, 3), "K_{3,3}", expected_recognized=True
         )
 
+    def test_k22_m2_chain_not_misidentified_as_grid(self):
+        """K_{2,2}+M_2 chain of 2 cells (8v, 10e, deg counts {2:4, 3:4},
+        bipartite) shares (n, m, degrees, bipartiteness) with the 2×4
+        grid (= ladder L_4) but is structurally distinct.
+
+        Regression for the May 14, 2026 detect_grid_dims false-positive
+        bug: pre-fix, recognize_family returned T(L_4) instead of None,
+        causing engine.synthesize to silently produce wrong polynomials
+        for chain-of-K_{2,2}-cells inputs.
+        """
+        # Build the chain explicitly
+        nxG = nx.Graph()
+        edges = [
+            (0, 2), (0, 3), (1, 2), (1, 3),  # cell 0: K_{2,2}
+            (4, 6), (4, 7), (5, 6), (5, 7),  # cell 1: K_{2,2}
+            (2, 4), (3, 5),                   # M_2 junction
+        ]
+        nxG.add_edges_from(edges)
+        # Should NOT be recognized as a grid/ladder/etc.
+        _verify_recognition(nxG, "K22_M2_chain_2cells", expected_recognized=False)
+
     def test_complete_bipartite_k44(self):
         """K_{4,4}: 4-regular, not a recognized family."""
         _verify_recognition(

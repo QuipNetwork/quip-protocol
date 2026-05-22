@@ -2,7 +2,7 @@
 
 Two value props:
 
-1. **Cell lookup for D-Wave decompositions** (Phase 8.2 motivation): Cm2,
+1. **Cell lookup for D-Wave decompositions**: Cm2,
    Z(1,2) precomputed so Z(1,3), Cm3, Pm3 syntheses get instant cell hits
    via the cost-aware partitioner.
 
@@ -35,7 +35,6 @@ from tutte.lookup.binary import save_binary_rainbow_table
 from tutte.lookup.core import load_default_table
 from tutte.synthesis.engine import SynthesisEngine
 from tutte.validation import verify_spanning_trees
-
 
 # --- Family-recognition seed builders ---------------------------------------
 # Seeds for the `_LazyBases` loaders in tutte/family_recognition/constants.py.
@@ -77,9 +76,15 @@ def _mobius(k):
 
 
 TARGETS = [
-    # D-Wave headers (Phase 8.2) — cell lookups for larger D-Wave decompositions.
+    # D-Wave headers — cell lookups for larger D-Wave decompositions.
+    # Cm1 is K_{4,4} structurally; included as an alias so `find_by_name("Cm1")`
+    # works once added. Pm1 (and similarly Z(0,*)) are empty graphs in dwave_networkx
+    # and intentionally omitted.
+    ("Cm1", lambda: dnx.chimera_graph(1)),
+    ("Z1_1", lambda: dnx.zephyr_graph(1, 1)),
     ("Z1_2", lambda: dnx.zephyr_graph(1, 2)),
     ("Cm2", lambda: dnx.chimera_graph(2)),
+    ("Cm3", lambda: dnx.chimera_graph(3)),       # 72n 192e — runs only with --target Cm3 + a large --timeout
     ("Pm2", lambda: dnx.pegasus_graph(2)),
 
     # Cograph atom polynomials (May 2026) — fast via cotree_dp (<1s each)
@@ -132,8 +137,7 @@ TARGETS = [
 
     # Still NOT default (intractable / too slow):
     #   ("Z2_1", lambda: dnx.zephyr_graph(2, 1)), # 40n 114e — saw 3.5 GB / >5 min before kill
-    #   ("Z1_3", lambda: dnx.zephyr_graph(1, 3)), # 36n 162e — known intractable per Phase 8.3
-    #   ("Cm3", lambda: dnx.chimera_graph(3)),    # 72n 192e — known intractable per 18.E.3.l
+    #   ("Z1_3", lambda: dnx.zephyr_graph(1, 3)), # 36n 162e
 ]
 
 

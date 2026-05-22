@@ -535,4 +535,82 @@ def detect_grid_dims(
     if fp.degree_counts.get(4, 0) != expected_deg4:
         return None
 
+    # Degree counts alone don't pin down grid topology — e.g., the
+    # K_{2,2}+M_2 chain (8v, 10e, {2:4, 3:4}) shares the same fingerprint
+    # as a 2×4 grid but is not one. Verify actual grid structure.
+    if m_dim == 2:
+        # P_2 × P_n is exactly the ladder L_n
+        return (m_dim, n_dim) if verify_ladder(graph, n_dim) else None
+    if not _verify_grid_structure(graph, m_dim, n_dim):
+        return None
     return (m_dim, n_dim)
+
+
+def _verify_grid_structure(graph: Graph, m_dim: int, n_dim: int) -> bool:
+    """Verify that `graph` is isomorphic to P_m × P_n by tracing the
+    grid structure: identify corners, walk along the boundary, then
+    fill in interior rows.
+
+    Complexity: O(n + m) — same as verify_ladder.
+    """
+    n_v = graph.node_count()
+    if n_v != m_dim * n_dim:
+        return False
+    if m_dim < 2 or n_dim < 2:
+        return False
+
+    # Find corner vertices (degree 2). Should be exactly 4.
+    corners = [v for v in graph.nodes if graph.degree(v) == 2]
+    if len(corners) != 4:
+        return False
+
+    # Pick a corner and trace its m-path side (longer dimension first).
+    # A corner's two neighbors are: one degree-2 (only at L_2 corner-corner
+    # adjacency) or both degree-3 (border vertices for grids m>=3, n>=3).
+    corner = corners[0]
+    nbrs = list(graph.neighbors(corner))
+    if len(nbrs) != 2:
+        return False
+
+    # Walk one direction to count the side length.
+    def walk_border_from(start, first_step):
+        """Walk along the border (degree-2/3 vertices) from start through first_step."""
+        path = [start, first_step]
+        prev, curr = start, first_step
+        while graph.degree(curr) >= 3:
+            # On a border, curr has 1 prev and exactly 1 next-border-vertex
+            # plus interior connections (if any). Find the unvisited neighbor
+            # that's also on the border (degree 2 or 3).
+            cand = None
+            for nb in graph.neighbors(curr):
+                if nb == prev:
+                    continue
+                if graph.degree(nb) <= 3:  # border vertex
+                    if cand is not None:
+                        # Multiple border neighbors — not a clean grid border
+                        return None
+                    cand = nb
+            if cand is None:
+                return None
+            path.append(cand)
+            prev, curr = curr, cand
+            if graph.degree(curr) == 2:
+                # Reached the next corner
+                break
+        return path
+
+    side1 = walk_border_from(corner, nbrs[0])
+    side2 = walk_border_from(corner, nbrs[1])
+    if side1 is None or side2 is None:
+        return False
+
+    # Sides should match {m_dim, n_dim} in length
+    sides = sorted([len(side1), len(side2)])
+    if sides != [min(m_dim, n_dim), max(m_dim, n_dim)]:
+        return False
+
+    # Cheap final check: total edges = 2mn - m - n
+    if graph.edge_count() != 2 * m_dim * n_dim - m_dim - n_dim:
+        return False
+
+    return True

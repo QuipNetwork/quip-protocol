@@ -36,21 +36,166 @@ from tutte.validation import count_spanning_trees_kirchhoff
 # Named graph set (merged with atlas below)
 # ---------------------------------------------------------------------------
 
+def _complete_bipartite(a, b):
+    """Build K_{a,b} as a Graph with vertices 0..a-1 (one side) | a..a+b-1 (other)."""
+    import networkx as nx
+    return Graph.from_networkx(nx.complete_bipartite_graph(a, b))
+
+
+def _named_nx(builder, *args):
+    """Wrap a networkx graph builder into our Graph type."""
+    return Graph.from_networkx(builder(*args))
+
+
+# Reasonable-size representatives of the standard graph families,
+# beyond what the atlas suite already covers (atlas: up to 7 nodes).
+# Sorted later by (edges, nodes, name) so they land at their natural
+# difficulty rung in the merged benchmark list. The K_n and K_{a,b}
+# entries also seed the rainbow table with cells the engine's
+# cell-quotient / chord-rule paths use to recognise structured cells
+# in subsequent Chimera / Pegasus / Zephyr graphs — without K_{4,4}
+# in the table, Cm_2 falls through to `treewidth_dp` (~140 s) instead
+# of `cell_quotient_grid_dp_streamed` / `chord_rule` (~5–40 s).
 NAMED_GRAPHS = [
+    # Complete graphs K_n.
     ("K_3", lambda: complete_graph(3)),
     ("K_4", lambda: complete_graph(4)),
     ("K_5", lambda: complete_graph(5)),
     ("K_6", lambda: complete_graph(6)),
     ("K_7", lambda: complete_graph(7)),
+    ("K_8", lambda: complete_graph(8)),
+    ("K_9", lambda: complete_graph(9)),
+    ("K_10", lambda: complete_graph(10)),
+    ("K_11", lambda: complete_graph(11)),
+    ("K_12", lambda: complete_graph(12)),
+    # Complete bipartite K_{a,b}. Elementary D-Wave / cell-quotient
+    # atoms — K_{4,4} is the Chimera cell, K_{3,3} appears in Pegasus.
+    ("K_{2,2}", lambda: _complete_bipartite(2, 2)),
+    ("K_{2,3}", lambda: _complete_bipartite(2, 3)),
+    ("K_{2,4}", lambda: _complete_bipartite(2, 4)),
+    ("K_{2,5}", lambda: _complete_bipartite(2, 5)),
+    ("K_{3,3}", lambda: _complete_bipartite(3, 3)),
+    ("K_{3,4}", lambda: _complete_bipartite(3, 4)),
+    ("K_{3,5}", lambda: _complete_bipartite(3, 5)),
+    ("K_{4,4}", lambda: _complete_bipartite(4, 4)),  # Chimera/Pegasus cell
+    ("K_{4,5}", lambda: _complete_bipartite(4, 5)),
+    ("K_{5,5}", lambda: _complete_bipartite(5, 5)),
+    # Cycles C_n.
     ("C_5", lambda: cycle_graph(5)),
     ("C_10", lambda: cycle_graph(10)),
     ("C_15", lambda: cycle_graph(15)),
+    ("C_20", lambda: cycle_graph(20)),
+    ("C_30", lambda: cycle_graph(30)),
+    ("C_50", lambda: cycle_graph(50)),
+    ("C_100", lambda: cycle_graph(100)),
+    # Wheels W_n.
     ("W_5", lambda: wheel_graph(5)),
     ("W_7", lambda: wheel_graph(7)),
-    ("Petersen", lambda: petersen_graph()),
+    ("W_9", lambda: wheel_graph(9)),
+    ("W_11", lambda: wheel_graph(11)),
+    ("W_15", lambda: wheel_graph(15)),
+    # Grids m × n.
     ("Grid_3x3", lambda: grid_graph(3, 3)),
     ("Grid_4x4", lambda: grid_graph(4, 4)),
+    ("Grid_5x5", lambda: grid_graph(5, 5)),
+    ("Grid_6x6", lambda: grid_graph(6, 6)),
+    # Named graphs (cubic / vertex-transitive structure cases).
+    ("Petersen", lambda: petersen_graph()),
+    ("Heawood", lambda: _named_nx(nx.heawood_graph)),
+    ("MoebiusKantor", lambda: _named_nx(nx.moebius_kantor_graph)),
+    ("Desargues", lambda: _named_nx(nx.desargues_graph)),
+    ("Dodecahedral", lambda: _named_nx(nx.dodecahedral_graph)),
 ]
+
+
+def _family_recognition_graphs():
+    """Representatives of every family that `tutte.family_recognition` handles.
+
+    These graphs all have closed-form / recurrence-based Tutte polynomials
+    in the recognition engine and ALSO serve as elementary atoms that other
+    decomposition paths can recognize as cells. Sizes chosen to span the
+    O(1) base-case window through the recurrence-driven regime.
+
+    Family → builder mapping:
+      - Wheel W_k: `wheel_graph(k)` — rim k vertices, k+1 total.
+      - Fan F_k: nx.lollipop_graph not quite — use direct construction.
+      - Ladder L_k = P_k × K_2: `nx.ladder_graph(k)` — 2k vertices.
+      - Book B_k: k triangles sharing one edge.
+      - Gear G_k: hub + k-rim + k subdiv = 2k+1 vertices.
+      - Prism CL_k = C_k × K_2: `nx.circular_ladder_graph(k)`.
+      - Möbius M_k: 2k-cycle with k diameter chords.
+      - Pan (cycle + 1 pendant), Sunlet (cycle + pendant per vertex),
+        Helm (wheel + pendant per rim).
+    """
+    from ..family_recognition._seed_builders import (
+        book_graph, gear_graph, mobius_graph, prism_graph,
+    )
+    out = []
+
+    def _fan(k):
+        """Fan F_k: path P_k joined to a single hub vertex."""
+        G = nx.Graph()
+        for i in range(k):
+            G.add_edge(0, i + 1)  # hub-to-path-vertex
+        for i in range(k - 1):
+            G.add_edge(i + 1, i + 2)  # path edges
+        return Graph.from_networkx(G)
+
+    def _pan(n):
+        """Pan: cycle C_n with one pendant edge."""
+        G = nx.cycle_graph(n)
+        G.add_edge(0, n)  # pendant at vertex 0
+        return Graph.from_networkx(G)
+
+    def _sunlet(k):
+        """Sunlet: cycle C_k with a pendant at every cycle vertex."""
+        G = nx.cycle_graph(k)
+        for i in range(k):
+            G.add_edge(i, k + i)
+        return Graph.from_networkx(G)
+
+    def _helm(k):
+        """Helm H_k: wheel with k rim vertices + a pendant per rim vertex.
+
+        Uses the family_recognition convention `wheel_recurrence(k)` ⇒
+        k rim vertices. `nx.wheel_graph(n)` has n total nodes, so we
+        call `nx.wheel_graph(k + 1)` here: hub at 0, rim at 1..k, then
+        add pendants k+1..2k.
+        """
+        G = nx.wheel_graph(k + 1)  # k rim vertices (hub at 0)
+        for i in range(1, k + 1):
+            G.add_edge(i, k + i)
+        return Graph.from_networkx(G)
+
+    # Wheels — already partially named; add larger k.
+    for k in (3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20):
+        out.append((f"Wheel_{k}", lambda k=k: Graph.from_networkx(nx.wheel_graph(k))))
+    # Fans.
+    for k in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15):
+        out.append((f"Fan_{k}", lambda k=k: _fan(k)))
+    # Ladders.
+    for k in (2, 3, 4, 5, 6, 7, 8, 10, 12, 15):
+        out.append((f"Ladder_{k}", lambda k=k: Graph.from_networkx(nx.ladder_graph(k))))
+    # Books.
+    for k in (1, 2, 3, 4, 5, 6, 7, 8, 10):
+        out.append((f"Book_{k}", lambda k=k: book_graph(k)))
+    # Gears.
+    for k in (3, 4, 5, 6, 7, 8, 10, 12):
+        out.append((f"Gear_{k}", lambda k=k: gear_graph(k)))
+    # Prisms.
+    for k in (3, 4, 5, 6, 7, 8, 9, 10, 12):
+        out.append((f"Prism_{k}", lambda k=k: prism_graph(k)))
+    # Möbius ladders.
+    for k in (3, 4, 5, 6, 7, 8, 10):
+        out.append((f"Mobius_{k}", lambda k=k: mobius_graph(k)))
+    # Pans, sunlets, helms.
+    for n in (3, 4, 5, 7, 10, 15):
+        out.append((f"Pan_{n}", lambda n=n: _pan(n)))
+    for k in (3, 4, 5, 7, 10):
+        out.append((f"Sunlet_{k}", lambda k=k: _sunlet(k)))
+    for k in (3, 4, 5, 7, 10):
+        out.append((f"Helm_{k}", lambda k=k: _helm(k)))
+    return out
 
 
 def _try_dwave_graphs():
@@ -126,6 +271,9 @@ def _build_graph_list():
     for name, builder in NAMED_GRAPHS:
         small.append((name, builder()))
 
+    for name, builder in _family_recognition_graphs():
+        small.append((name, builder()))
+
     for name, g in _atlas_graphs():
         small.append((name, g))
 
@@ -147,7 +295,7 @@ def _build_graph_list():
         if g is not None:
             deduped.append((name, g))
 
-    deduped.sort(key=lambda x: (x[1].edge_count(), x[1].node_count(), x[0]))
+    deduped.sort(key=lambda x: (x[1].node_count(), x[1].edge_count(), x[0]))
     return deduped
 
 
@@ -160,8 +308,17 @@ _ERROR = "ERROR"
 
 
 def _time_fn(fn, timeout_s=60):
-    """Time a function. Returns (elapsed_ms, result, None) on success,
-    (None, None, _TIMEOUT) on timeout, or (None, None, _ERROR) on exception."""
+    """Time a function with a SIGALRM-based timeout.
+
+    Returns (elapsed_ms, result, None) on success, (None, None, _TIMEOUT)
+    on timeout, or (None, None, _ERROR) on exception.
+
+    SIGALRM delivery is queued during C extension calls (it fires only
+    when control returns to Python), so this primitive does NOT preempt
+    long C-ext computations like the treewidth-DP cffi path on Cm/Pm/Z
+    graphs. For those, use `_time_fn_hard` which spawns a subprocess
+    and SIGKILLs on timeout.
+    """
     class _TimeoutExc(BaseException):
         """Inherits BaseException so it won't be caught by `except Exception`
         inside networkx/sympy internals."""
@@ -189,6 +346,125 @@ def _time_fn(fn, timeout_s=60):
             signal.alarm(0)
             if old is not None:
                 signal.signal(signal.SIGALRM, old)
+
+
+# Edge-count threshold above which the benchmark switches from in-process
+# SIGALRM timeouts to subprocess-level timeouts. Below this, the synthesis
+# is mostly in Python paths where SIGALRM fires correctly and subprocess
+# spawn overhead (~0.5–1 s on macOS) would dominate. Above this, the
+# treewidth-DP cffi call typically dominates and SIGALRM cannot interrupt
+# it — we need OS-level termination via `Process.terminate()` (SIGTERM)
+# escalating to `Process.kill()` (SIGKILL) on stubborn cases.
+_HARD_TIMEOUT_EDGE_THRESHOLD = 60
+
+
+def _synth_worker_entry(synth_label, nodes_list, edges_list, table_dump, q):
+    """Subprocess entrypoint for `_time_fn_hard`.
+
+    Rebuilds the rainbow table from `table_dump` (so cell-quotient paths
+    can recognize K_{4,4}-shaped cells accumulated from earlier benchmark
+    graphs), instantiates the requested engine, synthesizes the graph,
+    sends the result back via the queue.
+
+    On crash or exception the parent sees `q.get(timeout=…)` raise
+    `queue.Empty` and treats the run as TIMEOUT/ERROR.
+    """
+    try:
+        import pickle
+        from tutte.graph import Graph
+        from tutte.lookup.core import RainbowTable
+        graph = Graph(
+            nodes=frozenset(nodes_list),
+            edges=frozenset((min(u, v), max(u, v)) for u, v in edges_list),
+        )
+        # Restore the accumulated rainbow table — without K_{4,4} etc.
+        # cell-quotient paths return None and dispatch falls all the way
+        # through to treewidth_dp (where the timeout was unenforceable).
+        table = pickle.loads(table_dump) if table_dump else RainbowTable()
+        if synth_label == "cej":
+            from tutte.synthesis.engine import SynthesisEngine
+            eng = SynthesisEngine(table=table)
+        else:
+            from tutte.synthesis.hybrid import HybridSynthesisEngine
+            eng = HybridSynthesisEngine(table=table)
+        result = eng.synthesize(graph)
+        poly_bytes = result.polynomial.to_bytes()
+        trees = result.polynomial.num_spanning_trees()
+        q.put(("ok", trees, poly_bytes, getattr(result, "method", "?")))
+    except Exception as e:
+        q.put(("err", type(e).__name__, str(e)))
+
+
+class _SubprocResult:
+    """Result shim for `_time_fn_hard`.
+
+    The benchmark's downstream code accesses three attributes on the
+    synthesis result: ``.polynomial`` (the TuttePolynomial), ``.method``
+    (a label string used in logging), and ``.minors_used`` (passed to
+    ``table.add(...)`` for minor-relationship tracking). The subprocess
+    can't easily return a full SynthesisResult — it sends back just the
+    polynomial bytes + method label and lets the parent reconstruct.
+    Minors-used isn't available across the boundary so we pass an empty
+    set; that only affects minor-relationship indexing, not correctness.
+    """
+
+    __slots__ = ("polynomial", "method", "minors_used")
+
+    def __init__(self, payload):
+        trees, poly, method = payload
+        self.polynomial = poly
+        self.method = method
+        self.minors_used = set()
+
+
+def _time_fn_hard(synth_label, graph, table, timeout_s):
+    """Time `engine.synthesize(graph)` with a HARD subprocess-level timeout.
+
+    Spawns a fresh subprocess (`spawn` start method so cffi is reloaded
+    cleanly), runs the synthesis there with the parent's accumulated
+    `table` snapshot pickled into the worker's startup, terminates on
+    timeout via SIGTERM → SIGKILL. Returns the same 3-tuple shape as
+    `_time_fn`: `(elapsed_ms, (trees, poly, method), None)` on success,
+    `(None, None, _TIMEOUT)`, or `(None, None, _ERROR)`.
+
+    Cost: ~0.5–1 s per call on macOS for the spawn + pickle round-trip.
+    Worth it for graphs where the alternative is an unkillable C-ext
+    call running for minutes past the benchmark's stated timeout.
+    """
+    import multiprocessing as mp
+    import pickle
+    try:
+        table_dump = pickle.dumps(table) if table is not None else b""
+    except Exception:
+        table_dump = b""
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    p = ctx.Process(
+        target=_synth_worker_entry,
+        args=(synth_label, list(graph.nodes), list(graph.edges), table_dump, q),
+    )
+    t0 = time.perf_counter()
+    p.start()
+    try:
+        result = q.get(timeout=timeout_s + 5)  # +5 s grace for pickle/import
+    except Exception:
+        p.terminate()
+        p.join(timeout=1.0)
+        if p.is_alive():
+            p.kill()
+            p.join(timeout=1.0)
+        return None, None, _TIMEOUT
+    elapsed = (time.perf_counter() - t0) * 1000
+    p.join(timeout=1.0)
+    if p.is_alive():
+        p.kill()
+    if isinstance(result, tuple) and result[0] == "ok":
+        _, trees, poly_bytes, method = result
+        from ..polynomial import TuttePolynomial
+        return round(elapsed, 3), (trees, TuttePolynomial.from_bytes(poly_bytes), method), None
+    return None, None, _ERROR
+
+
 
 
 def _tutte_networkx(G_nx):
@@ -235,16 +511,61 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
     hybrid_table = RainbowTable()
     hybrid_engine = HybridSynthesisEngine(table=hybrid_table)
 
-    # Pre-warm the cffi `_treewidth_c` JIT (~1.6s) so the first graph that
-    # would trigger it doesn't absorb the compile cost into its CEJ timing.
-    # Without this, the cost ends up on whichever non-trivial graph hits
-    # `_get_lib()` first — typically a small atlas graph (e.g. atlas_151
-    # at ~3s instead of ~3ms), making timings misleading.
-    from tutte.graphs._treewidth_c import _get_lib
+    # Pre-warm ALL cffi JIT caches so first-touch compile costs don't get
+    # absorbed into a specific graph's CEJ/Hybrid timing. Each `_get_lib`
+    # call triggers cffi.verify/compile (~1-2s each). Without this, the
+    # cost ends up on whichever atlas graph first hits an unprimed C ext.
+    _CFFI_LOADERS = []
     try:
-        _get_lib()
-    except Exception:
-        pass  # C extension unavailable; engine falls back to pure Python anyway.
+        from tutte.graphs._treewidth_c import _get_lib as _tw_get_lib
+        _CFFI_LOADERS.append(("_treewidth_c", _tw_get_lib))
+    except ImportError:
+        pass
+    try:
+        from tutte.roots._partition_c import _get_lib as _part_get_lib
+        _CFFI_LOADERS.append(("_partition_c", _part_get_lib))
+    except ImportError:
+        pass
+    try:
+        from tutte._polynomial_c import _get_lib as _poly_get_lib
+        _CFFI_LOADERS.append(("_polynomial_c", _poly_get_lib))
+    except ImportError:
+        pass
+    try:
+        from tutte.graphs._signed_elim_c import _get_lib as _signed_get_lib
+        _CFFI_LOADERS.append(("_signed_elim_c", _signed_get_lib))
+    except ImportError:
+        pass
+
+    print(f"Pre-warming {len(_CFFI_LOADERS)} cffi extensions...", flush=True)
+    for name, loader in _CFFI_LOADERS:
+        try:
+            t0 = time.perf_counter()
+            loader()
+            warm_ms = (time.perf_counter() - t0) * 1000
+            print(f"  {name}: {warm_ms:.0f}ms", flush=True)
+        except Exception as e:
+            print(f"  {name}: skipped ({type(e).__name__})", flush=True)
+
+    # Pre-warm family_recognition lazy state: rainbow-table load + base-case
+    # seeds for wheel/fan/ladder/etc. recurrences. Without this, the first
+    # graph in the loop that triggers `recognize_family` (typically K_4)
+    # absorbs ~300ms of cached-table load + ~1s of rooted-lookup load into
+    # its CEJ timing — turning a 1ms operation into a 1s reported regression.
+    try:
+        t0 = time.perf_counter()
+        from ..family_recognition.constants import _get_cached_table
+        _get_cached_table()
+        # Trigger every base-case lazy load via tiny synth on K_3, K_4, K_5
+        # which together hit wheel/cycle/fan/star/complete bases.
+        from ..family_recognition import recognize_family
+        from ..graph import complete_graph
+        for size in (3, 4, 5):
+            recognize_family(complete_graph(size))
+        warm_ms = (time.perf_counter() - t0) * 1000
+        print(f"  family_recognition seeds: {warm_ms:.0f}ms", flush=True)
+    except Exception as e:
+        print(f"  family_recognition seeds: skipped ({type(e).__name__})", flush=True)
 
     graphs = _build_graph_list()
     results = []
@@ -274,9 +595,19 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
         kirchhoff = count_spanning_trees_kirchhoff(graph) if will_attempt else -1
 
         # --- CEJ engine ---
+        # For graphs above `_HARD_TIMEOUT_EDGE_THRESHOLD`, the in-process
+        # SIGALRM timeout cannot interrupt the treewidth-DP cffi call,
+        # so we spawn a subprocess and SIGKILL on timeout. Below the
+        # threshold, the in-process SIGALRM is faster and reliable.
+        use_hard_timeout = m > _HARD_TIMEOUT_EDGE_THRESHOLD
         if m > cej_max_solved + 100:
             # Way beyond frontier — skip without wasting timeout
             cej_ms, cej_result, cej_err = None, None, "UNSOLVED"
+        elif use_hard_timeout:
+            cej_ms, cej_payload, cej_err = _time_fn_hard(
+                "cej", graph, cej_table, timeout_s,
+            )
+            cej_result = _SubprocResult(cej_payload) if cej_payload else None
         else:
             cej_ms, cej_result, cej_err = _time_fn(
                 lambda: cej_engine.synthesize(graph), timeout_s
@@ -295,6 +626,11 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
         # --- Hybrid engine ---
         if m > hybrid_max_solved + 100:
             hybrid_ms, hybrid_result, hybrid_err = None, None, "UNSOLVED"
+        elif use_hard_timeout:
+            hybrid_ms, hybrid_payload, hybrid_err = _time_fn_hard(
+                "hybrid", graph, hybrid_table, timeout_s,
+            )
+            hybrid_result = _SubprocResult(hybrid_payload) if hybrid_payload else None
         else:
             hybrid_ms, hybrid_result, hybrid_err = _time_fn(
                 lambda: hybrid_engine.synthesize(graph), timeout_s
@@ -530,6 +866,42 @@ def save_results(results, cej_table=None, hybrid_engine=None, cej_engine=None):
               f"(+{added} new) "
               f"({os.path.join(base_dir, 'multigraph_lookup_table.json')}, "
               f"{os.path.join(base_dir, 'multigraph_lookup_table.bin')})",
+              flush=True)
+
+    # Persist the rooted-Tutte lookup table populated during the run.
+    # Uses the `_T_ROOTED_GRAPHS` sidecar to recover originating Graphs
+    # for canonical-label serialization. Then runs the warmup script so
+    # the shipped table also has the standard cell library (K_n,
+    # K_{a,b}, Z(1,1)) regardless of which benchmark graphs ran.
+    try:
+        from ..roots.rooted_tutte import save_rooted_lookup_default
+        n_json, n_bin = save_rooted_lookup_default()
+        print(f"Rooted lookup saved: {n_json} entries "
+              f"({os.path.join(base_dir, 'rooted_lookup_table.json')}, "
+              f"{os.path.join(base_dir, 'rooted_lookup_table.bin')})",
+              flush=True)
+    except Exception as e:
+        print(f"[warn] Rooted lookup save failed: {type(e).__name__}: {e}",
+              flush=True)
+
+    # Run the warmup so the standard cell library (K_n, K_{a,b}, Z(1,1))
+    # is always present in the shipped lookup. Common cells take seconds
+    # except Z(1,1) (~5 min) — pass `--small` via env to skip the long
+    # Z(1,1) brute when the benchmark wasn't going to need it anyway.
+    try:
+        import subprocess
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        script = os.path.join(repo_root, "scripts", "warmup_rooted_lookup.py")
+        if os.path.exists(script):
+            warmup_args = [sys.executable, script]
+            if os.environ.get("TUTTE_BENCHMARK_SKIP_Z11") == "1":
+                warmup_args.append("--small")
+            print(f"\nRunning rooted-lookup warmup ({' '.join(warmup_args[1:])})...",
+                  flush=True)
+            warm_env = dict(os.environ, PYTHONPATH=repo_root)
+            subprocess.run(warmup_args, env=warm_env, check=False)
+    except Exception as e:
+        print(f"[warn] Rooted lookup warmup failed: {type(e).__name__}: {e}",
               flush=True)
 
     return out_path

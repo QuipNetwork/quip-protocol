@@ -30,22 +30,14 @@ from typing import Dict, List, Optional, Set, Tuple
 from ..graph import Graph
 from ..polynomial import TuttePolynomial
 from .aut_orbit import build_relabel_aut
-from .cell_anchor_adapter import (
-    CellGridSpec,
-    _build_cycle_order,
-)
-from .cell_quotient_helpers import (
-    components_touching,
-    enumerate_partitions_per_orbit,
-    orbit_convolve,
-    precompute_M_and_convolve_streaming,
-    precompute_M_table,
-)
+from .cell_anchor_adapter import CellGridSpec, _build_cycle_order
+from .cell_quotient_helpers import (components_touching,
+                                    enumerate_partitions_per_orbit,
+                                    orbit_convolve,
+                                    precompute_M_and_convolve_streaming,
+                                    precompute_M_table)
 from .cell_quotient_path import compute_path_dp, compute_path_dp_grouped
-from .rooted_tutte import (
-    divide_by_x_minus_1_power,
-    t_rooted_cached,
-)
+from .rooted_tutte import divide_by_x_minus_1_power, t_rooted_cached
 
 
 def is_grid_topology(cell_quotient_adj: dict, n_cells: int) -> Optional[Tuple[int, int]]:
@@ -529,7 +521,7 @@ def compute_grid_dp_streamed_kab(
     grid_specs: List[List[CellGridSpec]],
     verbose: bool = False,
 ) -> Optional[TuttePolynomial]:
-    """Phase B Round 6 v5 streamed grid DP for K_{a,b}-style cells.
+    """Streamed grid DP for K_{a,b}-style cells.
 
     Uses per-cell compression on inner row DPs (`enable_per_cell_compression`)
     + `enumerate_junction_internally` + `out_cell_anchor_groups` to keep
@@ -550,14 +542,11 @@ def compute_grid_dp_streamed_kab(
 
     Validated on Cm₂ (2×2 K_{4,4} grid) — see
     `tutte/research/scripts/cm2_via_v5_streamed.py` and the engine
-    benchmark in `tutte/docs/06_5_cell_quotient_grid_dp.md` (Phase B
-    Round 6 section). T(Cm₂)(1,1) = 11686511179538104320 in ~36 s
+    benchmark in `tutte/docs/06_5_cell_quotient_grid_dp.md`. 
+    T(Cm₂)(1,1) = 11686511179538104320 in ~36 s
     (vs ~55 s via `kmatching_formula`).
     """
-    from .aut_orbit import (
-        per_cell_canonical_key,
-        per_cell_orbit_rep,
-    )
+    from .aut_orbit import per_cell_canonical_key, per_cell_orbit_rep
     from .rooted_tutte import all_partitions, relabel_partition_dict
 
     rows = len(grid_specs)

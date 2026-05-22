@@ -436,9 +436,9 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
 
         engine = self._structural_engine
 
-        # Formula shortcut (Phase 12 unified + Phase 13 k-matching), BEFORE
-        # treewidth_dp — for targets like Cm2 where the formulas give a
-        # meaningful speedup over direct treewidth_dp (4x on Cm2).
+        # Formula shortcut (unified topology + k-matching closed forms),
+        # BEFORE treewidth_dp — for targets like Cm2 where the formulas give a
+        # meaningful speedup over direct treewidth_dp (~4× on Cm2).
         # Gate at edge_count ≥ 60 to skip small graphs where detection
         # overhead outweighs tw_dp savings.
         if graph.edge_count() >= 60:
@@ -506,6 +506,64 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
             except Exception:
                 pass
 
+        # Cell-quotient BIPARTITE-JUNCTION DP (engine step 7.82) — handles
+        # non-matching bipartite junctions (e.g., Z(m, t) families).
+        if graph.edge_count() >= 60:
+            from ..roots.cell_quotient_bipartite_junction import (
+                compute_cell_quotient_bipartite_junction_dp,
+            )
+            try:
+                bj_poly = compute_cell_quotient_bipartite_junction_dp(
+                    graph, engine.table,
+                )
+                if bj_poly is not None:
+                    _log.record(EventType.CELL_QUOTIENT_DP, "hybrid",
+                                f"Cell-quotient bipartite-junction DP: "
+                                f"{graph.node_count()}n {graph.edge_count()}e",
+                                graph=graph)
+                    self._log(f"Cell-quotient bipartite-junction DP: "
+                              f"{graph.node_count()}n, {graph.edge_count()}e")
+                    return HybridSynthesisResult(
+                        polynomial=bj_poly,
+                        method="cell_quotient_bipartite_junction_dp",
+                        recipe=["Cell-quotient bipartite-junction DP"],
+                        verified=True,
+                    )
+            except Exception:
+                pass
+
+        # Per-component bipartite-junction DP (engine step 7.83) — splits
+        # disconnected junctions into per-component sub-junctions, sidesteps
+        # the Bell(joint_boundary) wall. Z(1, 2) lands here when the
+        # persistent rooted cache holds T_rooted(cell, all-anchors).
+        if graph.edge_count() >= 60:
+            from ..roots.cell_quotient_bipartite_junction import (
+                compute_bipartite_junction_per_component_dp,
+            )
+            try:
+                # max_cell_boundary=8 — boundaries up to 8 proceed
+                # directly; 9..12 are gated by cache hit (persistent
+                # rooted-lookup); anything larger bails. Z(1, 2) cells
+                # are 12-anchor and rely on the persistent cache.
+                pcdp_poly = compute_bipartite_junction_per_component_dp(
+                    graph, engine.table, max_cell_boundary=8,
+                )
+                if pcdp_poly is not None:
+                    _log.record(EventType.CELL_QUOTIENT_DP, "hybrid",
+                                f"Cell-quotient bipartite-junction per-component DP: "
+                                f"{graph.node_count()}n {graph.edge_count()}e",
+                                graph=graph)
+                    self._log(f"Cell-quotient bipartite-junction per-component DP: "
+                              f"{graph.node_count()}n, {graph.edge_count()}e")
+                    return HybridSynthesisResult(
+                        polynomial=pcdp_poly,
+                        method="cell_quotient_bipartite_junction_per_component_dp",
+                        recipe=["Cell-quotient bipartite-junction per-component DP"],
+                        verified=True,
+                    )
+            except Exception:
+                pass
+
         # Cell-quotient HYBRID DP (mirrors engine step 7.85) BEFORE treewidth_dp.
         if graph.edge_count() >= 60:
             from ..roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
@@ -525,6 +583,68 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                         method="cell_quotient_hybrid_dp",
                         recipe=["Cell-quotient hybrid (cycle-close + per-leaf synth)"],
                         verified=True,
+                    )
+            except Exception:
+                pass
+
+        # Cross-cell chord-peel (mirrors engine step 7.88) — peel the
+        # SMALLEST inter-atom junction edge set rather than internal
+        # clique edges. Empirically much faster than internal peeling
+        # because chord rule cost is dominated by per-step sub-synth;
+        # fewer edges = fewer expensive sub-synths. Z(1,2): 4 inter-atom
+        # edges → ~47s vs ~95s with 12 internal edges.
+        # Gated to top-level synthesis (depth == 1) and small graphs
+        # (n ≤ 30) — see engine 7.88 + [[project_cross_cell_chord_peel]].
+        if (graph.edge_count() >= 60
+                and graph.node_count() <= 30
+                and self._synth_depth == 1):
+            try:
+                # Manually bump engine's depth so its own cross_cell gate
+                # (`engine._synth_depth == 1`) blocks the recursive call
+                # on g_chord_free — otherwise we cascade and pay the
+                # per-step contraction cost twice (measured 77s vs 47s).
+                engine._synth_depth += 1
+                try:
+                    cross_result = engine._try_cross_cell_chord_peel(graph, max_depth)
+                finally:
+                    engine._synth_depth -= 1
+                if cross_result is not None:
+                    _log.record(EventType.CHORD_RULE, "hybrid",
+                                f"Cross-cell chord-peel: "
+                                f"{graph.node_count()}n {graph.edge_count()}e",
+                                graph=graph)
+                    self._log(f"Cross-cell chord-peel: "
+                              f"{graph.node_count()}n, {graph.edge_count()}e")
+                    return HybridSynthesisResult(
+                        polynomial=cross_result.polynomial,
+                        method=cross_result.method,
+                        recipe=cross_result.recipe,
+                        verified=cross_result.verified,
+                    )
+            except Exception:
+                pass
+
+        # Clique-atom chord-peel (mirrors engine step 7.9) — for graphs with
+        # detectable disjoint K_k cliques (k ∈ [3, 6]), peel internal edges
+        # via the production chord rule with σ-aware ordering. Z(1,2):
+        # k=4 chosen, ~95s vs ~138s baseline (1.45×). Generalizes to
+        # K_3/K_5/K_6 atom structure. Falls through to treewidth_dp on
+        # no viable atoms or any chord-rule failure.
+        if graph.edge_count() >= 60:
+            try:
+                peel_result = engine._try_clique_atom_chord_peel(graph, max_depth)
+                if peel_result is not None:
+                    _log.record(EventType.CHORD_RULE, "hybrid",
+                                f"Clique-atom chord-peel: "
+                                f"{graph.node_count()}n {graph.edge_count()}e",
+                                graph=graph)
+                    self._log(f"Clique-atom chord-peel: "
+                              f"{graph.node_count()}n, {graph.edge_count()}e")
+                    return HybridSynthesisResult(
+                        polynomial=peel_result.polynomial,
+                        method=peel_result.method,
+                        recipe=peel_result.recipe,
+                        verified=peel_result.verified,
                     )
             except Exception:
                 pass
@@ -567,9 +687,8 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
             hier_result = engine._try_hierarchical(graph, max_depth)
             if hier_result is not None:
                 # Surface the SPECIFIC hierarchical sub-path for the
-                # visualizer: Phase 12 unified formula, Phase 13
-                # k-matching formula, or generic hierarchical / tw_dp
-                # fallthrough.
+                # visualizer: unified-topology formula, k-matching formula,
+                # or generic hierarchical / tw_dp fallthrough.
                 _method_event = {
                     "unified_formula": EventType.UNIFIED_FORMULA,
                     "kmatching_formula": EventType.KMATCHING_FORMULA,

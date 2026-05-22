@@ -6,15 +6,15 @@ A closed-form expression for the Tutte polynomial of a multi-cell graph whose in
 
 ## How we got here
 
-The k-matching formula was discovered through an algebraic-pattern hunt in April 2026, motivated by the observation that the Phase 11 unified formula (§8.unified) fails on D-Wave Chimera targets because their inter-cell couplers are the *distinct-vertex-pair* chord case, not the *shared-vertex-pair* parallel case.
+The k-matching formula was discovered through an algebraic-pattern hunt in April 2026, motivated by the observation that the unified formula (§8.unified) fails on D-Wave Chimera targets because their inter-cell couplers are the _distinct-vertex-pair_ chord case, not the _shared-vertex-pair_ parallel case.
 
-1. **2-cell polynomial-divmod scan.** We computed `T(G_1 + M_k + G_2)` for K_3, K_4, K_{4,4}=Cm1 cells with `k = 1..4` matching edges. Divmod against `T(G_1)·T(G_2)` gave misleading near-matches for small k (the divmod quotient coincidentally equaled `T(P_k)` = k parallel edges for k ≤ 3), but the remainder was non-zero and grew with cell size. No clean factorization exists in this basis.
+1. **2-cell polynomial-divmod scan.** We computed `T(G_1 + M_k + G_2)` for K*3, K_4, K*{4,4}=Cm1 cells with `k = 1..4` matching edges. Divmod against `T(G_1)·T(G_2)` gave misleading near-matches for small k (the divmod quotient coincidentally equaled `T(P_k)` = k parallel edges for k ≤ 3), but the remainder was non-zero and grew with cell size. No clean factorization exists in this basis.
 
 2. **Bridge-aware iterated chord rule.** Formally unrolling the chord rule on the k matching edges — with a bridge factor `x` at the last step because the final remaining inter-cell edge becomes a bridge — produced a 2-dimensional recurrence `P(p, q)` on (anchor-identifications, remaining-chords). Solving the recurrence with a hockey-stick identity gave the single-cell-pair closed form (Section 3).
 
 3. **Multi-cell extension.** For a cell-PATH of `M_k` matchings, applying the 2-cell formula at the last junction gives a valid recurrence in `n` (cell count). For a cell-CYCLE, the closing edges are all chords (no bridge factor) and a direct binomial closure works.
 
-4. **Precondition discovery.** On K_3 cells in cycle topology the formula gave wrong answers; on K_{4,4} cells the formula gave correct answers. The distinguishing property is whether junctions at the same cell share anchor vertices: when a contraction at one junction can create parallel edges with another junction's edge, the closed-form formula breaks. K_{4,4} cells sidestep this because horizontal and vertical couplers use disjoint bipartition sides.
+4. **Precondition discovery.** On K*3 cells in cycle topology the formula gave wrong answers; on K*{4,4} cells the formula gave correct answers. The distinguishing property is whether junctions at the same cell share anchor vertices: when a contraction at one junction can create parallel edges with another junction's edge, the closed-form formula breaks. K\_{4,4} cells sidestep this because horizontal and vertical couplers use disjoint bipartition sides.
 
 ## 1. Setup
 
@@ -33,9 +33,9 @@ We say the inter-cell structure is a **k-matching topology** when:
 
 ### 1.1 Why the preconditions
 
-Preconditions (P1) and (P2) establish that the cell-pair inter-cell structure is (up to cell automorphism) a true k-matching on equivalent anchors. Precondition (P3) rules out *feedback* in the contraction dynamics: when `H` has a cycle AND two junctions at the same cell share an anchor vertex, contracting a chord edge at one junction relabels that anchor and creates a parallel edge with the other junction's edge — violating the bookkeeping that the closed form relies on.
+Preconditions (P1) and (P2) establish that the cell-pair inter-cell structure is (up to cell automorphism) a true k-matching on equivalent anchors. Precondition (P3) rules out _feedback_ in the contraction dynamics: when `H` has a cycle AND two junctions at the same cell share an anchor vertex, contracting a chord edge at one junction relabels that anchor and creates a parallel edge with the other junction's edge — violating the bookkeeping that the closed form relies on.
 
-K_{4,4} Chimera cells satisfy (P3) automatically because each cell's horizontal-coupler anchors are its `A`-side vertices and its vertical-coupler anchors are its `B`-side vertices, which are disjoint. Small complete-graph cells (`K_3`, `K_4`) with cycle-topology decompositions generally violate (P3).
+K\_{4,4} Chimera cells satisfy (P3) automatically because each cell's horizontal-coupler anchors are its `A`-side vertices and its vertical-coupler anchors are its `B`-side vertices, which are disjoint. Small complete-graph cells (`K_3`, `K_4`) with cycle-topology decompositions generally violate (P3).
 
 ## 2. Theorem (Single-Cell-Pair Closed Form)
 
@@ -54,17 +54,17 @@ Two observations collapse the expansion:
 
 1. **Isomorphism equivalence.** By vertex-transitivity of anchors, `H_S` depends only on `|S| = j`, so all `C(k, j)` subsets of size `j` contribute the same polynomial `T(G_1 ⊕_j G_2)`.
 
-2. **Bridge factor at step `j = 1`.** The only step where an intermediate edge *is* a bridge is when `j = 1` — specifically, when the contraction sub-tree reaches the state "one matching edge remains, no contractions yet." There, `T(H) = x · T(H − e)`, where `T(H − e) = T(G_1 ∪ G_2) = T(G_1) · T(G_2)`. Summing this `x · P(0, 0)` contribution with the binomial `(k − 1) · P(1, 0) = (k − 1) · T(G_1) · T(G_2)` (from the `j = 1` subsets that contract one edge after other non-first chord steps) yields the `(x + k − 1) · T(G_1) · T(G_2)` leading term.
+2. **Bridge factor at step `j = 1`.** The only step where an intermediate edge _is_ a bridge is when `j = 1` — specifically, when the contraction sub-tree reaches the state "one matching edge remains, no contractions yet." There, `T(H) = x · T(H − e)`, where `T(H − e) = T(G_1 ∪ G_2) = T(G_1) · T(G_2)`. Summing this `x · P(0, 0)` contribution with the binomial `(k − 1) · P(1, 0) = (k − 1) · T(G_1) · T(G_2)` (from the `j = 1` subsets that contract one edge after other non-first chord steps) yields the `(x + k − 1) · T(G_1) · T(G_2)` leading term.
 
 The remaining `j ≥ 2` subsets give the binomial sum `Σ C(k, j) · T(G_1 ⊕_j G_2)`. □
 
 **Special cases.**
 
-| k | Formula | Justification |
-|---|---|---|
-| `k = 0` (disjoint) | `T(G_1) · T(G_2)` | Disjoint factorization; formula gives `(x − 1) · T(G_1) T(G_2)` which is incorrect — handle `k = 0` separately. |
-| `k = 1` (bridge) | `x · T(G_1) · T(G_2)` | Formula yields `(x + 0) · T(G_1) T(G_2)` ✓. |
-| `k = 2` | `(x + 1) · T(G_1) T(G_2) + T(G_1 ⊕_2 G_2)` | Validated on K_3, K_4, K_{4,4}. |
+| k                  | Formula                                    | Justification                                                                                                   |
+| ------------------ | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| `k = 0` (disjoint) | `T(G_1) · T(G_2)`                          | Disjoint factorization; formula gives `(x − 1) · T(G_1) T(G_2)` which is incorrect — handle `k = 0` separately. |
+| `k = 1` (bridge)   | `x · T(G_1) · T(G_2)`                      | Formula yields `(x + 0) · T(G_1) T(G_2)` ✓.                                                                     |
+| `k = 2`            | `(x + 1) · T(G_1) T(G_2) + T(G_1 ⊕_2 G_2)` | Validated on K*3, K_4, K*{4,4}.                                                                                 |
 
 ## 3. Theorem (Cell-Path Recurrence)
 
@@ -77,7 +77,7 @@ T_n = (x + k − 1) · T_{n-1} · T(c)
 
 with base case `T_1 = T(c)`.
 
-**Proof.** Apply the single-cell-pair closed form (§2) at the last junction. The `G_1`-role is taken by the `(n−1)`-cell path `P_{n-1}`, and `G_2`-role by `c_n`. The anchor vertices on the `c_n` side are a vertex-transitive set in `c_n` by assumption; the anchor vertices on the `P_{n-1}` side are a vertex-transitive subset of `c_{n-1}` because the previous junction — if it used the same vertex class of `c_{n-1}` — shares anchors with this one, but on the *other* side of the cell, so the two anchor sets are distinct vertex-transitive classes within `c_{n-1}`. When that's not the case (e.g. `K_3` cells with only three vertices), (P3) fails and the formula does not apply. □
+**Proof.** Apply the single-cell-pair closed form (§2) at the last junction. The `G_1`-role is taken by the `(n−1)`-cell path `P_{n-1}`, and `G_2`-role by `c_n`. The anchor vertices on the `c_n` side are a vertex-transitive set in `c_n` by assumption; the anchor vertices on the `P_{n-1}` side are a vertex-transitive subset of `c_{n-1}` because the previous junction — if it used the same vertex class of `c_{n-1}` — shares anchors with this one, but on the _other_ side of the cell, so the two anchor sets are distinct vertex-transitive classes within `c_{n-1}`. When that's not the case (e.g. `K_3` cells with only three vertices), (P3) fails and the formula does not apply. □
 
 **Note on precondition for the cell-path case.** Path topology has no cycles, so (P3) is automatically satisfied — shared anchors across junctions of a single cell do not cause parallel-edge feedback because contractions chain linearly along the path. Empirically verified on K_3 and K_4 cell paths where anchor sharing does occur.
 
@@ -93,12 +93,12 @@ where `P_n with c_1, c_n j-glued` is the cell-path `P_n` with `j` anchor pairs o
 
 **Proof sketch.** Apply the chord rule to the `k` closing-junction matching edges. None of these is a bridge (the cell-path already connects `c_1` to `c_n` transitively via `c_2, …, c_{n-1}`), so the `j = 1` bridge factor of §2 is absent. Each subset `S ⊆ {1, …, k}` of contracted edges gives `T(P_n` with `c_1, c_n` sharing `|S|` anchors`)`. By vertex-transitivity (P2) of the anchors and disjoint-anchors (P3) within each cell, all `C(k, |S|)` subsets of size `|S|` give isomorphic multigraphs, and the sum collapses to the stated binomial. □
 
-**Corollary (Chimera Cm2).** `T(Cm2)` factors via the cell-cycle formula applied to the 2×2 cell-grid of K_{4,4} tiles. Empirically: 675-term polynomial matches direct synthesis (`verify_spanning_trees` ✓), with ~4× speedup versus treewidth_dp (51 s vs 196 s cold cache).
+**Corollary (Chimera Cm2).** `T(Cm2)` factors via the cell-cycle formula applied to the 2×2 cell-grid of K\_{4,4} tiles. Empirically: 675-term polynomial matches direct synthesis (`verify_spanning_trees` ✓), with ~4× speedup versus treewidth_dp (51 s vs 196 s cold cache).
 
-> **Update (Phase B Round 6, 2026-05-12).** The cell-quotient grid DP
+> **Update Cell-Quotients.** The cell-quotient grid DP
 > with streaming junction enumeration (see
-> [§6.5 — Cell-Quotient Grid DP](06_5_cell_quotient_grid_dp.md), Phase
-> B Round 6 section) now computes T(Cm2) in ~36 seconds — 1.5× faster
+> [§6.5 — Cell-Quotient Grid DP](06_5_cell_quotient_grid_dp.md), now
+> computes T(Cm2) in ~36 seconds — 1.5× faster
 > than the k-matching formula's 55 s baseline. The k-matching formula
 > still wins on cell topologies that don't admit a 2D-grid quotient
 > (single cell-pairs, cell-trees, cell-cycles where rows/cols ≥ 2 is
@@ -111,7 +111,7 @@ where `P_n with c_1, c_n j-glued` is the cell-path `P_n` with `j` anchor pairs o
 
 For cell-topologies with multiple junctions (cell-paths, cell-cycles, general cell-trees, or grids), iterate the formulas of §3 and §4. Each recursion level processes one junction of the cell-topology graph `H`; after `n − 1` reductions of a cell-tree, the sub-problems are single multigraphs that the standalone synthesis pipeline can handle.
 
-**Bridge/cycle classification at each recursion level.** At each level, classify the current junction as a *bridge junction* (removing all its edges disconnects the current graph) or a *cycle junction* (alternative paths remain). Use the §2 formula with bridge factor for bridge junctions, and the §4 binomial-only formula for cycle junctions. A `verify_spanning_trees` check on the final result catches precondition violations.
+**Bridge/cycle classification at each recursion level.** At each level, classify the current junction as a _bridge junction_ (removing all its edges disconnects the current graph) or a _cycle junction_ (alternative paths remain). Use the §2 formula with bridge factor for bridge junctions, and the §4 binomial-only formula for cycle junctions. A `verify_spanning_trees` check on the final result catches precondition violations.
 
 **Cache structure.** Two caches defeat the combinatorial growth:
 
@@ -126,27 +126,27 @@ On Chimera Cm2 (4 junctions), the state cache provides a 3.2× speedup versus a 
 
 Implementation: `tutte/graphs/covering.py:detect_kmatching_topology` and `apply_kmatching_formula`, wired as step 2.5 of `tutte/synthesis/engine.py:_synthesize_hierarchical` (between the unified formula of §8.unified and the product formula / chord rule of §8.2).
 
-| target | cells | junctions | k | method fires | T match |
-|---|---:|---:|---:|---|---|
-| 2 K_3 + M_2 | 2 × K_3 | 1 | 2 | ✓ | ✓ |
-| K_3 path M_2 (3 cells) | 3 × K_3 | 2 | 2 | ✓ | ✓ |
-| K_4 path M_2 (3 cells) | 3 × K_4 | 2 | 2 | ✓ | ✓ |
-| K_3 cycle M_2 (3 cells) | 3 × K_3 | 3 | 2 | ✗ (precondition P3) | fall-through ✓ |
-| Cm1 + M_4 + Cm1 (2 K_{4,4}) | 2 × Cm1 | 1 | 4 | ✓ | ✓ (143 terms) |
-| Cm2 = dnx.chimera_graph(2) | 4 × Cm1 | 4 | 4 | ✓ | ✓ (675 terms) |
+| target                      |   cells | junctions |   k | method fires        | T match        |
+| --------------------------- | ------: | --------: | --: | ------------------- | -------------- |
+| 2 K_3 + M_2                 | 2 × K_3 |         1 |   2 | ✓                   | ✓              |
+| K_3 path M_2 (3 cells)      | 3 × K_3 |         2 |   2 | ✓                   | ✓              |
+| K_4 path M_2 (3 cells)      | 3 × K_4 |         2 |   2 | ✓                   | ✓              |
+| K_3 cycle M_2 (3 cells)     | 3 × K_3 |         3 |   2 | ✗ (precondition P3) | fall-through ✓ |
+| Cm1 + M*4 + Cm1 (2 K*{4,4}) | 2 × Cm1 |         1 |   4 | ✓                   | ✓ (143 terms)  |
+| Cm2 = dnx.chimera_graph(2)  | 4 × Cm1 |         4 |   4 | ✓                   | ✓ (675 terms)  |
 
 The K_3 cycle row is informative: the small complete-graph cell has only 3 vertices, forcing any two junctions to share anchor vertices. Combined with the cycle topology, this violates (P3). The detector correctly identifies the violation and returns `None`, letting the synthesis pipeline fall through to the chord rule, which handles the case correctly (at higher cost).
 
 ### Performance on Cm2
 
-| method | wall clock | method tag |
-|---|---:|---|
-| treewidth_dp (direct, C-extension) | 196 s | `treewidth_dp` |
-| k-matching formula | 51 s | `kmatching_formula` |
+| method                             | wall clock | method tag          |
+| ---------------------------------- | ---------: | ------------------- |
+| treewidth_dp (direct, C-extension) |      196 s | `treewidth_dp`      |
+| k-matching formula                 |       51 s | `kmatching_formula` |
 
 **~4× speedup on Cm2.** The k-matching formula's advantage grows with graph size: direct synthesis is dominated by the width-11 tree-decomposition DP (per-node state ∝ `Bell(12)² ≈ 1.8 × 10¹³`), while the k-matching recursion reduces to 124 multigraph syntheses on graphs of size ≤ 32 nodes, each handled quickly by the standard pipeline.
 
-For Chimera Cm3 (72n 192e, tree-decomposition width 15 per Phase 10 measurement), direct synthesis is infeasible; the k-matching recursion theoretically applies but the naive implementation (Phase 14 attempt) hit an exponential state-cache wall due to insufficient symmetry exploitation. Opening a path on Cm3 is the subject of future work.
+For Chimera Cm3 (72n 192e, tree-decomposition width 15), direct synthesis is infeasible; the k-matching recursion theoretically applies but the naive implementation hit an exponential state-cache wall due to insufficient symmetry exploitation. Opening a path on Cm3 is the subject of future work.
 
 ## 7. Failure Modes and Detector Design
 
@@ -192,23 +192,23 @@ The chord rule is the universal fallback when preconditions fail. The k-matching
 
 ## 9. Open Questions
 
-1. **Multi-junction cache compression.** Empirically, the state cache on Cm2 compresses `5^4 = 625` recursion paths into 124 unique leaves. For Cm3 (`5^12 = 2.4 × 10^8`) the naive state cache doesn't fit in RAM in a 1-hour budget. A *symmetry-aware* state key (quotienting by the `D_4` symmetry of the 3×3 cell-topology grid) could reduce the state space by ~8×; additional savings from leaf-cell isomorphism detection are plausible but not yet characterized.
+1. **Multi-junction cache compression.** Empirically, the state cache on Cm2 compresses `5^4 = 625` recursion paths into 124 unique leaves. For Cm3 (`5^12 = 2.4 × 10^8`) the naive state cache doesn't fit in RAM in a 1-hour budget. A _symmetry-aware_ state key (quotienting by the `D_4` symmetry of the 3×3 cell-topology grid) could reduce the state space by ~8×; additional savings from leaf-cell isomorphism detection are plausible but not yet characterized.
 
-2. **Pegasus and Zephyr cell decomposition.** Phase 14.c structural analysis showed that Pegasus `Pm2, Pm3` and Zephyr `Z(1,2), Z(1,3)` have non-trivial cell structures (cells are not K_{4,4}; some tiles are oriented in multiple "types") that our standard cell detector misses. If proper cells can be identified and the preconditions verified, the formula may extend to these families.
+2. **Pegasus and Zephyr cell decomposition.** structural analysis showed that Pegasus `Pm2, Pm3` and Zephyr `Z(1,2), Z(1,3)` have non-trivial cell structures (cells are not K\_{4,4}; some tiles are oriented in multiple "types") that our standard cell detector misses. If proper cells can be identified and the preconditions verified, the formula may extend to these families.
 
-3. **Beyond matching junctions.** Chimera has `M_k` junctions where all `k` edges connect anchors in a single bipartition class. Pegasus has "mixed" junctions with edges connecting multiple classes. A generalization that tracks *per-edge* anchor classes (rather than per-junction) would extend the applicability.
+3. **Beyond matching junctions.** Chimera has `M_k` junctions where all `k` edges connect anchors in a single bipartition class. Pegasus has "mixed" junctions with edges connecting multiple classes. A generalization that tracks _per-edge_ anchor classes (rather than per-junction) would extend the applicability.
 
 4. **Precondition (P2) tightening.** For bipartite cells, "single bipartition side" is a clean precondition. For non-bipartite cells we assume vertex-transitivity of anchors; this is a conservative simplification. A precise characterization of "sufficient cell symmetry" in terms of automorphism-group orbits would clarify what cells the formula supports.
 
-5. **Closed form for `T(G_1 ⊕_j G_2)` on Chimera cells.** The `T(G_1 ⊕_j G_2)` terms for K_{4,4} cells are bipartite graphs with boundary identifications. Knowing these in closed form (via table lookup or analytic formula) would reduce the k-matching dispatch to `O(k)` polynomial arithmetic for Chimera — potentially making even Cm3-sized targets tractable.
+5. **Closed form for `T(G_1 ⊕_j G_2)` on Chimera cells.** The `T(G_1 ⊕_j G_2)` terms for K\_{4,4} cells are bipartite graphs with boundary identifications. Knowing these in closed form (via table lookup or analytic formula) would reduce the k-matching dispatch to `O(k)` polynomial arithmetic for Chimera — potentially making even Cm3-sized targets tractable.
 
 ## 10. References
 
-- §8.2 *Chord-Rule Formalization* — the universal deletion-contraction-based decomposition that the k-matching formula specializes.
-- §8.unified *Unified Cell-Topology Formula* — the Phase 11/12 parallel-case companion to the k-matching chord case.
-- Tutte, W. T. (1947). *A ring in graph theory.* Mathematical Proceedings of the Cambridge Philosophical Society.
-- Brylawski, T. H. (1971). *A combinatorial model for series-parallel networks.* Transactions of the AMS.
-- Bonin, J. & de Mier, A. (2004). *T-uniqueness of some families of k-chordal matroids.* Advances in Applied Mathematics.
+- §8.2 _Chord-Rule Formalization_ — the universal deletion-contraction-based decomposition that the k-matching formula specializes.
+- §8.unified _Unified Cell-Topology Formula_ — the parallel-case companion to the k-matching chord case.
+- Tutte, W. T. (1947). _A ring in graph theory._ Mathematical Proceedings of the Cambridge Philosophical Society.
+- Brylawski, T. H. (1971). _A combinatorial model for series-parallel networks._ Transactions of the AMS.
+- Bonin, J. & de Mier, A. (2004). _T-uniqueness of some families of k-chordal matroids._ Advances in Applied Mathematics.
 - This codebase: `tutte/graphs/covering.py`, `tutte/synthesis/engine.py`, `tutte/tests/test_kmatching_formula.py`.
 
 ---
