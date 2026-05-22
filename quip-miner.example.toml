@@ -36,3 +36,29 @@ signer_key = "~/.quip-miner/signing.json"
 # CLI: --rest-port N / --rest-host HOST override these.
 # rest_port = 8086
 # rest_host = "127.0.0.1"
+
+# v0.1 compatibility aliases. `listen` maps to rest_host, `port` to
+# rest_port. If both an alias and its canonical key are present, the
+# canonical key wins.
+# listen = "0.0.0.0"
+# port   = 8086
+
+# Identification metadata — published on every miner startup as a
+# signed NodeDescriptor remark (System.remark_with_event). Dashboards
+# index miners by AccountId; these fields are the human-readable
+# overlay. Failures log a warning and never block mining.
+#
+# node_name defaults to the system hostname; set this if you want a
+# stable label across deployments.
+# node_name   = "rig-01"
+# public_host = "miner.example.com"
+# public_port = 8086
+
+# Logging.
+# log_level (DEBUG/INFO/WARNING/ERROR) — defaults to INFO via the
+# top-level --log-level flag.
+# node_log — path to a rotating log file (10MB × 5 backups) attached
+# alongside the stderr handler. Useful for systemd-managed deployments
+# that want a stable log location separate from journald.
+# log_level = "INFO"
+# node_log  = "/var/log/quip-miner.log"

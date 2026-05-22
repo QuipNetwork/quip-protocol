@@ -151,3 +151,80 @@ def test_validate_missing_validators_key_raises():
 def test_validate_missing_signer_key_raises():
     with pytest.raises(MinerConfigError, match="signer_key"):
         validate_merged({"validators": ["ws://a:9944"]})
+
+
+# ----------------------------------------------------------------------
+# v0.1 alias resolution (listen/port -> rest_host/rest_port)
+# ----------------------------------------------------------------------
+
+
+def test_load_aliases_listen_and_port_to_rest_host_rest_port(tmp_path):
+    """v0.1 [global].listen and .port (which configured the removed QUIC
+    server) map onto the v0.2 telemetry rest_host/rest_port."""
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[miner]\n'
+        'validators = ["ws://a:9944"]\n'
+        'listen = "0.0.0.0"\n'
+        'port = 8087\n'
+    )
+    cfg = load_miner_config(p)
+    assert cfg["rest_host"] == "0.0.0.0"
+    assert cfg["rest_port"] == 8087
+    assert "listen" not in cfg
+    assert "port" not in cfg
+
+
+def test_load_canonical_wins_when_both_alias_and_canonical_present(tmp_path):
+    """If both `listen` and `rest_host` are set, the canonical key wins
+    silently — operators can stage v0.2 overrides in a v0.1-shaped file
+    without breaking the file for v0.1 readers."""
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[miner]\n'
+        'validators = ["ws://a:9944"]\n'
+        'listen = "0.0.0.0"\n'
+        'rest_host = "127.0.0.1"\n'
+        'port = 8087\n'
+        'rest_port = 9999\n'
+    )
+    cfg = load_miner_config(p)
+    assert cfg["rest_host"] == "127.0.0.1"
+    assert cfg["rest_port"] == 9999
+    assert "listen" not in cfg
+    assert "port" not in cfg
+
+
+def test_load_only_alias_present_no_canonical(tmp_path):
+    """Alias alone (no canonical) — should still get promoted."""
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[miner]\n'
+        'validators = ["ws://a:9944"]\n'
+        'port = 8086\n'
+    )
+    cfg = load_miner_config(p)
+    assert cfg["rest_port"] == 8086
+    assert "rest_host" not in cfg
+
+
+def test_load_passes_through_identification_keys(tmp_path):
+    """node_name, public_host, public_port, log_level, node_log are
+    loaded verbatim — the CLI threads them into auto-identify and
+    setup_logging at startup."""
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[miner]\n'
+        'validators = ["ws://a:9944"]\n'
+        'node_name = "rig-01"\n'
+        'public_host = "miner.example.com"\n'
+        'public_port = 8086\n'
+        'log_level = "DEBUG"\n'
+        'node_log = "/var/log/quip-miner.log"\n'
+    )
+    cfg = load_miner_config(p)
+    assert cfg["node_name"] == "rig-01"
+    assert cfg["public_host"] == "miner.example.com"
+    assert cfg["public_port"] == 8086
+    assert cfg["log_level"] == "DEBUG"
+    assert cfg["node_log"] == "/var/log/quip-miner.log"

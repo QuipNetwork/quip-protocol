@@ -14,7 +14,10 @@ SubstrateMinerController.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import logging
 import signal
+import socket
 import traceback
 from pathlib import Path
 from typing import Optional
@@ -46,8 +49,138 @@ from shared.substrate_client import (
     SubstrateClient,
 )
 from shared.substrate_miner_controller import SubstrateMinerController
+from shared.system_info import (
+    DescriptorValidationError,
+    build_descriptor,
+    to_canonical_json,
+    validate_descriptor,
+)
 from shared.telemetry_api import TelemetryApiServer
 from shared.validator_pool import ValidatorPool
+
+
+_AUTO_IDENTIFY_LOGGER = logging.getLogger("quip_miner.auto_identify")
+
+
+def _default_node_name() -> str:
+    """Return the system hostname, or 'quip-miner' if unavailable.
+
+    Used as the auto-identify fallback when neither --node-name nor TOML
+    `node_name` is set. We deliberately avoid SS58-prefix fallbacks here —
+    dashboards already key off the AccountId; the descriptor's node_name
+    is a human-readable label and should default to something an operator
+    would recognise (the rig's hostname)."""
+    try:
+        name = socket.gethostname()
+    except OSError:
+        return "quip-miner"
+    return name or "quip-miner"
+
+
+async def _auto_identify(
+    client: SubstrateClient,
+    keystore,
+    *,
+    node_name: Optional[str],
+    public_host: Optional[str],
+    public_port: Optional[int],
+    log_level: Optional[str],
+    miners_config: dict,
+) -> None:
+    """Submit a signed NodeDescriptor remark using an already-connected client.
+
+    Called once on every miner startup after the funding check. The user-
+    facing contract is: identify failures never block mining — the call
+    catches all exceptions and logs a warning. The descriptor's `miners`
+    block is built from the same TOML-shaped dict that `MinerCore` used
+    to spawn worker handles, so the descriptor always reflects the
+    actual launched topology.
+    """
+    effective_name = (node_name or _default_node_name())[:64]
+    miner_specs = _identify_specs_from_miner_config(
+        effective_name, miners_config
+    )
+    try:
+        descriptor = build_descriptor(
+            node_id=effective_name,
+            node_name=effective_name,
+            public_host=public_host,
+            public_port=public_port,
+            rpc_endpoints=[],
+            auto_mine=True,
+            log_level=(log_level or "INFO").upper(),
+            miner_specs=miner_specs,
+            include_system_info=True,
+        )
+        validate_descriptor(descriptor)
+    except DescriptorValidationError as exc:
+        _AUTO_IDENTIFY_LOGGER.warning(
+            "auto-identify skipped: descriptor invalid (%s); "
+            "mining continues",
+            exc,
+        )
+        return
+    except Exception as exc:  # noqa: BLE001 — observability path
+        _AUTO_IDENTIFY_LOGGER.warning(
+            "auto-identify skipped: descriptor build failed "
+            "(%s: %s); mining continues",
+            type(exc).__name__,
+            exc,
+        )
+        return
+
+    payload = to_canonical_json(descriptor)
+    payload_hash = hashlib.blake2b(payload, digest_size=32).hexdigest()
+    try:
+        prefer_event = await client.has_call("System", "remark_with_event")
+        call_function = "remark_with_event" if prefer_event else "remark"
+        try:
+            receipt = await client.submit_extrinsic(
+                "System",
+                call_function,
+                {"remark": payload},
+                keystore.signer,
+                wait_for="inblock",
+            )
+        except Exception as exc:  # noqa: BLE001 — retry below or warn
+            if call_function == "remark":
+                raise
+            _AUTO_IDENTIFY_LOGGER.warning(
+                "auto-identify: remark_with_event failed (%s); "
+                "retrying with plain remark",
+                exc,
+            )
+            receipt = await client.submit_extrinsic(
+                "System",
+                "remark",
+                {"remark": payload},
+                keystore.signer,
+                wait_for="inblock",
+            )
+            call_function = "remark"
+        if receipt.error:
+            _AUTO_IDENTIFY_LOGGER.warning(
+                "auto-identify: %s rejected (%s); mining continues",
+                call_function,
+                receipt.error,
+            )
+            return
+        _AUTO_IDENTIFY_LOGGER.info(
+            "auto-identify submitted: account=%s call=System.%s "
+            "extrinsic=%s payload_size=%d payload_hash=0x%s",
+            keystore.signer.ss58_address(),
+            call_function,
+            receipt.extrinsic_hash,
+            len(payload),
+            payload_hash,
+        )
+    except Exception as exc:  # noqa: BLE001 — observability path
+        _AUTO_IDENTIFY_LOGGER.warning(
+            "auto-identify skipped: submission failed (%s: %s); "
+            "mining continues",
+            type(exc).__name__,
+            exc,
+        )
 
 
 _VALIDATOR_HELP = (
@@ -98,6 +231,49 @@ def _config_option(f):
         default=None,
         help=_CONFIG_HELP,
     )(f)
+
+
+def _identification_options(f):
+    """Shared identification flags applied to cpu/gpu/qpu/mempool.
+
+    These populate the NodeDescriptor that auto-identify submits on every
+    startup. All four are optional — node_name falls back to the system
+    hostname, the rest are simply omitted from the descriptor when unset.
+    Each one accepts a TOML override via the matching key in `[miner]`.
+    """
+    f = click.option(
+        "--node-log",
+        "node_log",
+        type=click.Path(dir_okay=False),
+        default=None,
+        help="Path to a rotating log file (10MB x5 backups) attached "
+        "alongside stderr. Falls back to --config `node_log`.",
+    )(f)
+    f = click.option(
+        "--public-port",
+        "public_port",
+        type=click.IntRange(1, 65535),
+        default=None,
+        help="Publicly-advertised port for this miner (1-65535). "
+        "Embedded in the NodeDescriptor for dashboards; does not bind. "
+        "Falls back to --config `public_port`.",
+    )(f)
+    f = click.option(
+        "--public-host",
+        "public_host",
+        default=None,
+        help="Publicly-advertised hostname for this miner (≤253 bytes). "
+        "Embedded in the NodeDescriptor; does not bind. Falls back to "
+        "--config `public_host`.",
+    )(f)
+    f = click.option(
+        "--node-name",
+        "node_name",
+        default=None,
+        help="Human-readable label for this miner (max 64 UTF-8 bytes). "
+        "Defaults to the system hostname. Falls back to --config `node_name`.",
+    )(f)
+    return f
 
 
 def _faucet_url_option(f):
@@ -651,6 +827,10 @@ async def _run_concurrent_miner(
     rest_host: str,
     topology_spec: str,
     miner_config: dict,
+    node_name: Optional[str] = None,
+    public_host: Optional[str] = None,
+    public_port: Optional[int] = None,
+    node_log: Optional[str] = None,
 ) -> int:
     """Unified entry for `--mode pow|mempool|both` on cpu/gpu/qpu.
 
@@ -668,6 +848,17 @@ async def _run_concurrent_miner(
     if mode not in ("pow", "mempool", "both"):
         click.echo(f"invalid --mode {mode!r}", err=True)
         return 2
+
+    # node_log is opt-in (TOML or CLI). When set, re-run setup_logging
+    # so a RotatingFileHandler is attached alongside the stderr handler
+    # that the click group installed. The current root level is preserved.
+    if node_log:
+        current_level = logging.getLevelName(logging.getLogger().level)
+        setup_logging(
+            log_level=current_level,
+            node_log_file=node_log,
+            node_name=node_name or _default_node_name(),
+        )
 
     # Guard A — wallet configured (keystore exists + loads).
     keystore = _load_keystore_or_fail(signer_key_path)
@@ -718,6 +909,21 @@ async def _run_concurrent_miner(
             keystore,
             faucet_url=faucet_url,
             min_balance=DEFAULT_MIN_BALANCE_PLANCKS,
+        )
+
+        # Auto-identify: publish a signed NodeDescriptor remark so
+        # dashboards can map our AccountId → node_name + advertised
+        # hardware. Runs on every startup; failures log a warning and
+        # never block mining. There is no opt-out — dashboard visibility
+        # is part of the miner contract.
+        await _auto_identify(
+            client,
+            keystore,
+            node_name=node_name,
+            public_host=public_host,
+            public_port=public_port,
+            log_level=None,
+            miners_config=miner_config,
         )
 
         # Both PoW and mempool need the chain's registered allowed-value
@@ -998,6 +1204,7 @@ _MODE_HELP = (
     show_default=False,
     help=_REST_HOST_HELP,
 )
+@_identification_options
 def quip_miner_cpu(
     validators: tuple,
     config_path: Optional[str],
@@ -1008,6 +1215,10 @@ def quip_miner_cpu(
     topology_spec: str,
     rest_port: Optional[int],
     rest_host: Optional[str],
+    node_name: Optional[str],
+    public_host: Optional[str],
+    public_port: Optional[int],
+    node_log: Optional[str],
 ) -> None:
     """Run CPU SA miners against a substrate chain.
 
@@ -1028,6 +1239,10 @@ def quip_miner_cpu(
             "faucet_url": faucet_url,
             "rest_port": rest_port,
             "rest_host": rest_host,
+            "node_name": node_name,
+            "public_host": public_host,
+            "public_port": public_port,
+            "node_log": node_log,
         },
         defaults={
             "signer_key": "~/.quip-miner/signing.json",
@@ -1046,6 +1261,10 @@ def quip_miner_cpu(
         rest_host=str(merged["rest_host"]),
         topology_spec=topology_spec,
         miner_config=miner_config,
+        node_name=merged.get("node_name"),
+        public_host=merged.get("public_host"),
+        public_port=merged.get("public_port"),
+        node_log=merged.get("node_log"),
     )))
 
 
@@ -1096,6 +1315,7 @@ def quip_miner_cpu(
     show_default=False,
     help=_REST_HOST_HELP,
 )
+@_identification_options
 def quip_miner_gpu(
     validators: tuple,
     config_path: Optional[str],
@@ -1106,6 +1326,10 @@ def quip_miner_gpu(
     topology_spec: str,
     rest_port: Optional[int],
     rest_host: Optional[str],
+    node_name: Optional[str],
+    public_host: Optional[str],
+    public_port: Optional[int],
+    node_log: Optional[str],
 ) -> None:
     """Run a GPU miner (CUDA / Metal / Modal) against a substrate chain.
 
@@ -1131,6 +1355,10 @@ def quip_miner_gpu(
             "faucet_url": faucet_url,
             "rest_port": rest_port,
             "rest_host": rest_host,
+            "node_name": node_name,
+            "public_host": public_host,
+            "public_port": public_port,
+            "node_log": node_log,
         },
         defaults={
             "signer_key": "~/.quip-miner/signing.json",
@@ -1148,6 +1376,10 @@ def quip_miner_gpu(
         rest_host=str(merged["rest_host"]),
         topology_spec=topology_spec,
         miner_config=miner_config,
+        node_name=merged.get("node_name"),
+        public_host=merged.get("public_host"),
+        public_port=merged.get("public_port"),
+        node_log=merged.get("node_log"),
     )))
 
 
@@ -1204,6 +1436,7 @@ def quip_miner_gpu(
     show_default=False,
     help=_REST_HOST_HELP,
 )
+@_identification_options
 def quip_miner_qpu(
     validators: tuple,
     config_path: Optional[str],
@@ -1215,6 +1448,10 @@ def quip_miner_qpu(
     topology_spec: str,
     rest_port: Optional[int],
     rest_host: Optional[str],
+    node_name: Optional[str],
+    public_host: Optional[str],
+    public_port: Optional[int],
+    node_log: Optional[str],
 ) -> None:
     """Run a QPU miner against a substrate chain.
 
@@ -1238,6 +1475,10 @@ def quip_miner_qpu(
             "faucet_url": faucet_url,
             "rest_port": rest_port,
             "rest_host": rest_host,
+            "node_name": node_name,
+            "public_host": public_host,
+            "public_port": public_port,
+            "node_log": node_log,
         },
         defaults={
             "signer_key": "~/.quip-miner/signing.json",
@@ -1255,6 +1496,10 @@ def quip_miner_qpu(
         rest_host=str(merged["rest_host"]),
         topology_spec=topology_spec,
         miner_config=miner_config,
+        node_name=merged.get("node_name"),
+        public_host=merged.get("public_host"),
+        public_port=merged.get("public_port"),
+        node_log=merged.get("node_log"),
     )))
 
 
@@ -1447,14 +1692,6 @@ def quip_miner_identify(
     Submitted as `System.remark_with_event` so block indexers see the
     canonical JSON without needing to scan extrinsic call data.
     """
-    import hashlib
-    from shared.system_info import (
-        DescriptorValidationError,
-        build_descriptor,
-        to_canonical_json,
-        validate_descriptor,
-    )
-
     merged = _resolve_runtime_config(
         config_path=config_path,
         cli_kwargs={

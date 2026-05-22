@@ -3,11 +3,28 @@
 Schema (keys actually read by the CLI today):
 
     [miner]
-    validators = ["ws://primary:9944", "ws://standby:9944"]
-    signer_key = "~/.quip-miner/signing.json"
-    faucet_url = "http://localhost:8087"   # optional
-    rest_port  = 8086                      # optional, -1 disables
-    rest_host  = "127.0.0.1"               # optional, 0.0.0.0 for containers
+    validators  = ["ws://primary:9944", "ws://standby:9944"]
+    signer_key  = "~/.quip-miner/signing.json"
+    faucet_url  = "http://localhost:8087"   # optional
+    rest_port   = 8086                      # optional, -1 disables
+    rest_host   = "127.0.0.1"               # optional, 0.0.0.0 for containers
+
+    # Identification metadata (used for auto-identify on startup;
+    # also published in the NodeDescriptor remark dashboards consume).
+    node_name   = "rig-01"                  # optional, defaults to hostname
+    public_host = "miner.example.com"       # optional, ≤253 bytes
+    public_port = 8086                      # optional, 1..65535
+    log_level   = "INFO"                    # optional, DEBUG/INFO/WARNING/ERROR
+    node_log    = "/var/log/quip-miner.log" # optional rotating file handler
+
+    # v0.1 compatibility aliases — `listen` → `rest_host`, `port` → `rest_port`.
+    # These are convenience for v0.1 migrants; if both an alias and its
+    # canonical key are present, the canonical key wins and the alias is
+    # silently ignored (no warning — TOML is the operator's source of truth
+    # and rejecting on duplicate keys would break legitimate "v0.1 base
+    # config + v0.2 override" layering).
+    listen      = "0.0.0.0"                 # alias for rest_host
+    port        = 8086                      # alias for rest_port
 
 Any other keys in `[miner]` (or nested `[miner.cpu]` / `[miner.gpu]` /
 `[miner.qpu]` subtables) are parsed but ignored — CLI flags are the
@@ -61,6 +78,7 @@ def load_miner_config(path: Path) -> dict[str, Any]:
         )
     miner_dict = dict(miner)
     _validate_validators_field(miner_dict.get("validators"))
+    _apply_v01_aliases(miner_dict)
     return miner_dict
 
 
@@ -115,6 +133,32 @@ def validate_merged(merged: Mapping[str, Any]) -> None:
             "signer_key is required. Pass --signer-key PATH or add "
             "`signer_key = \"~/.quip-miner/signing.json\"` to --config"
         )
+
+
+_V01_ALIASES: dict[str, str] = {
+    # v0.1 [global].listen / .port served the QUIC server. v0.2 has only
+    # the telemetry REST API as a listen surface, so map both to the rest_*
+    # canonical keys. If a config sets both `listen` and `rest_host` the
+    # canonical wins — the operator can stage v0.2 settings inside a v0.1
+    # config without breaking the file for v0.1 users.
+    "listen": "rest_host",
+    "port": "rest_port",
+}
+
+
+def _apply_v01_aliases(miner_dict: dict[str, Any]) -> None:
+    """Promote v0.1 alias keys to their v0.2 canonical names in-place.
+
+    Canonical-wins-on-collision: if both keys are present, the alias is
+    silently dropped. No warning — see the [miner] schema docstring for
+    rationale.
+    """
+    for alias, canonical in _V01_ALIASES.items():
+        if alias not in miner_dict:
+            continue
+        if canonical not in miner_dict:
+            miner_dict[canonical] = miner_dict[alias]
+        del miner_dict[alias]
 
 
 def _validate_validators_field(value: Any) -> None:

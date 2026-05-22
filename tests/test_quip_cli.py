@@ -467,3 +467,230 @@ def test_quip_miner_no_longer_accepts_node_url(monkeypatch):
     )
     assert result.exit_code != 0
     assert "no such option" in result.output.lower() or "--node-url" in result.output
+
+
+# ----------------------------------------------------------------------
+# Identification flags are threaded through to _run_concurrent_miner
+# ----------------------------------------------------------------------
+
+
+def test_quip_miner_cpu_identification_flags_threaded(monkeypatch):
+    """--node-name/--public-host/--public-port/--node-log on the cpu
+    subcommand reach _run_concurrent_miner so auto-identify can build
+    the descriptor and setup_logging can attach the file handler."""
+    captured: Dict[str, Any] = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
+    runner = CliRunner()
+    result = runner.invoke(
+        quip_cli.quip_miner_cpu,
+        [
+            "--validator", "ws://localhost:9944",
+            "--node-name", "rig-01",
+            "--public-host", "miner.example.com",
+            "--public-port", "8086",
+            "--node-log", "/tmp/quip-miner.log",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured.get("node_name") == "rig-01"
+    assert captured.get("public_host") == "miner.example.com"
+    assert captured.get("public_port") == 8086
+    assert captured.get("node_log") == "/tmp/quip-miner.log"
+
+
+def test_quip_miner_gpu_identification_flags_threaded(monkeypatch):
+    captured: Dict[str, Any] = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
+    runner = CliRunner()
+    result = runner.invoke(
+        quip_cli.quip_miner_gpu,
+        [
+            "--validator", "ws://localhost:9944",
+            "--gpu-backend", "local",
+            "--node-name", "gpu-rig",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured.get("node_name") == "gpu-rig"
+    assert captured.get("public_host") is None  # absent → propagates as None
+
+
+def test_quip_miner_cpu_identification_via_toml(monkeypatch, tmp_path):
+    """[miner] node_name / public_host / public_port / node_log in TOML
+    are surfaced to _run_concurrent_miner."""
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[miner]\n'
+        'validators = ["ws://localhost:9944"]\n'
+        'signer_key = "~/.quip-miner/signing.json"\n'
+        'node_name = "toml-rig"\n'
+        'public_host = "toml.example.com"\n'
+        'public_port = 9099\n'
+        'node_log = "/var/log/quip-miner.log"\n'
+    )
+    captured: Dict[str, Any] = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
+    result = CliRunner().invoke(
+        quip_cli.quip_miner_cpu,
+        ["--config", str(p)],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured.get("node_name") == "toml-rig"
+    assert captured.get("public_host") == "toml.example.com"
+    assert captured.get("public_port") == 9099
+    assert captured.get("node_log") == "/var/log/quip-miner.log"
+
+
+def test_quip_miner_cpu_listen_port_aliased_to_rest(monkeypatch, tmp_path):
+    """TOML alias resolution: listen → rest_host, port → rest_port. CLI
+    receives the canonical values."""
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[miner]\n'
+        'validators = ["ws://localhost:9944"]\n'
+        'signer_key = "~/.quip-miner/signing.json"\n'
+        'listen = "0.0.0.0"\n'
+        'port = 8087\n'
+    )
+    captured: Dict[str, Any] = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("rest_host") == "0.0.0.0"
+    assert captured.get("rest_port") == 8087
+
+
+# ----------------------------------------------------------------------
+# _auto_identify behavior
+# ----------------------------------------------------------------------
+
+
+def test_default_node_name_falls_back_to_quip_miner(monkeypatch):
+    """If gethostname raises OSError, fall back to 'quip-miner'."""
+    import socket
+
+    def boom():
+        raise OSError("no hostname")
+
+    monkeypatch.setattr(socket, "gethostname", boom)
+    assert quip_cli._default_node_name() == "quip-miner"
+
+
+def test_default_node_name_empty_string_falls_back(monkeypatch):
+    """Empty hostname still falls back to 'quip-miner'."""
+    import socket
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "")
+    assert quip_cli._default_node_name() == "quip-miner"
+
+
+def test_auto_identify_submission_failure_logs_warning_and_returns(
+    monkeypatch, caplog
+):
+    """Per the user's failure policy: identify failures never block
+    mining. The helper catches everything, logs a warning, and returns
+    normally so _run_concurrent_miner can proceed to controllers."""
+    import asyncio
+    import logging
+
+    class FakeClient:
+        async def has_call(self, *_a, **_kw):
+            return True
+
+        async def submit_extrinsic(self, *_a, **_kw):
+            raise RuntimeError("validator rejected extrinsic")
+
+    class FakeSigner:
+        def ss58_address(self):
+            return "5FakeAccountId00000000000000000000000000000000000"
+
+        def account_id_bytes(self):
+            return b"\x00" * 32
+
+    class FakeKeystore:
+        signer = FakeSigner()
+
+    caplog.set_level(logging.WARNING, logger="quip_miner.auto_identify")
+    asyncio.run(quip_cli._auto_identify(
+        FakeClient(),
+        FakeKeystore(),
+        node_name="test-rig",
+        public_host=None,
+        public_port=None,
+        log_level=None,
+        miners_config={"cpu": {"num_cpus": 1}},
+    ))
+    assert any(
+        "auto-identify" in rec.message and "validator rejected" in rec.message
+        for rec in caplog.records
+    ), [r.message for r in caplog.records]
+
+
+def test_auto_identify_falls_back_to_remark_after_remark_with_event_fails(
+    monkeypatch, caplog
+):
+    """If remark_with_event compose-time fails (cached metadata vs.
+    active runtime mismatch), the helper retries with plain remark."""
+    import asyncio
+    import logging
+
+    class FakeReceipt:
+        error = None
+        extrinsic_hash = "0xabc"
+        block_hash = "0xdef"
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        async def has_call(self, *_a, **_kw):
+            return True  # answer "yes" → preferred is remark_with_event
+
+        async def submit_extrinsic(self, module, call, _args, _signer, **_kw):
+            self.calls.append(call)
+            if call == "remark_with_event":
+                raise RuntimeError("runtime rejected call")
+            return FakeReceipt()
+
+    class FakeSigner:
+        def ss58_address(self):
+            return "5FakeAccountId00000000000000000000000000000000000"
+
+        def account_id_bytes(self):
+            return b"\x00" * 32
+
+    class FakeKeystore:
+        signer = FakeSigner()
+
+    client = FakeClient()
+    caplog.set_level(logging.WARNING, logger="quip_miner.auto_identify")
+    asyncio.run(quip_cli._auto_identify(
+        client,
+        FakeKeystore(),
+        node_name="test-rig",
+        public_host=None,
+        public_port=None,
+        log_level=None,
+        miners_config={"cpu": {"num_cpus": 1}},
+    ))
+    assert client.calls == ["remark_with_event", "remark"], client.calls
