@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -28,6 +27,16 @@ from shared.mempool_miner_controller import (
     SOLUTION_STALE_ERRORS,
     _classify_claim,
     _classify_solution,
+)
+from shared.mempool_types import (
+    IsingParams,
+    JobMode,
+    JobOrder,
+    MinerType,
+    OrderStatus,
+    OrderTiming,
+    ResultDelivery,
+    RewardResolution,
 )
 from shared.quantum_proof_of_work import (
     DEFAULT_ALLOWED_H,
@@ -42,16 +51,6 @@ def _topology_hash(nodes, edges) -> bytes:
     return topology_hash(
         nodes, edges, DEFAULT_ALLOWED_H, DEFAULT_ALLOWED_J, DEFAULT_ALLOWED_SPIN
     )
-from shared.mempool_types import (
-    IsingParams,
-    JobMode,
-    JobOrder,
-    MinerType,
-    OrderStatus,
-    OrderTiming,
-    ResultDelivery,
-    RewardResolution,
-)
 
 
 DEFAULT_URL = os.environ.get("QUIP_SUBSTRATE_URL", "ws://localhost:9944")
@@ -211,6 +210,99 @@ def test_should_reject_bid_with_no_matching_criteria():
 
 
 # ----------------------------------------------------------------------
+# Active-order dispatch-gate tracking
+# ----------------------------------------------------------------------
+
+
+def _bare_active_order_controller(num_handles: int = 3):
+    """Construct a MempoolMinerController with the minimum state to exercise
+    `_record_handle_terminal_for_active` and `_clear_active_order`."""
+    from shared.mempool_miner_controller import MempoolControllerStats
+
+    c = MempoolMinerController.__new__(MempoolMinerController)
+    c._active_order = None
+    c._active_order_done_handles = set()
+    c._dispatch_contexts = {}
+    c.miner_handles = [MagicMock(miner_id=f"h{i}") for i in range(num_handles)]
+    c.stats = MempoolControllerStats()
+    return c
+
+
+def test_record_handle_terminal_one_error_leaves_active_order_set():
+    """A single handle erroring on the active order MUST NOT clear
+    `_active_order` — siblings may still produce a valid result that
+    `_handle_result` would otherwise drop as stale."""
+    c = _bare_active_order_controller(num_handles=3)
+    ctx = MagicMock(order_id=42)
+    c._dispatch_contexts[("h0", 1)] = ctx
+    c._dispatch_contexts[("h1", 2)] = ctx
+    c._dispatch_contexts[("h2", 3)] = ctx
+    c._active_order = 42
+
+    c._record_handle_terminal_for_active("h0", 1)
+
+    assert c._active_order == 42, "premature clear loses sibling work"
+    assert c._active_order_done_handles == {"h0"}
+
+
+def test_record_handle_terminal_all_handles_done_clears():
+    """When every handle has reported terminal for the active order
+    without a winning submission, the gate must release so the next
+    JobProposed is accepted."""
+    c = _bare_active_order_controller(num_handles=3)
+    ctx = MagicMock(order_id=42)
+    c._dispatch_contexts[("h0", 1)] = ctx
+    c._dispatch_contexts[("h1", 2)] = ctx
+    c._dispatch_contexts[("h2", 3)] = ctx
+    c._active_order = 42
+
+    c._record_handle_terminal_for_active("h0", 1)
+    c._record_handle_terminal_for_active("h1", 2)
+    assert c._active_order == 42  # still waiting on h2
+    c._record_handle_terminal_for_active("h2", 3)
+
+    assert c._active_order is None
+    assert c._active_order_done_handles == set()
+
+
+def test_record_handle_terminal_ignores_stale_dispatch_ids():
+    """Terminal events for dispatches that don't match the active order
+    (e.g., a late cancel-completion from a previous order) must not
+    advance the done-handles counter."""
+    c = _bare_active_order_controller(num_handles=2)
+    old_ctx = MagicMock(order_id=41)
+    cur_ctx = MagicMock(order_id=42)
+    c._dispatch_contexts[("h0", 1)] = old_ctx  # previous order
+    c._dispatch_contexts[("h0", 5)] = cur_ctx  # current order
+    c._dispatch_contexts[("h1", 6)] = cur_ctx
+    c._active_order = 42
+
+    c._record_handle_terminal_for_active("h0", 1)  # stale: from order 41
+    assert c._active_order_done_handles == set()
+    assert c._active_order == 42
+
+    c._record_handle_terminal_for_active("h0", 5)
+    c._record_handle_terminal_for_active("h1", 6)
+    assert c._active_order is None
+
+
+def test_record_handle_terminal_no_op_when_no_active_order():
+    """Terminal events after the active order has already cleared (e.g.,
+    a winning submission already completed and `_handle_result` cleared
+    the gate) must be no-ops."""
+    c = _bare_active_order_controller(num_handles=2)
+    ctx = MagicMock(order_id=42)
+    c._dispatch_contexts[("h0", 1)] = ctx
+    # _active_order already cleared (e.g., by _handle_result success path)
+    c._active_order = None
+
+    c._record_handle_terminal_for_active("h0", 1)
+
+    assert c._active_order is None
+    assert c._active_order_done_handles == set()
+
+
+# ----------------------------------------------------------------------
 # Live-chain integration test
 # ----------------------------------------------------------------------
 
@@ -236,7 +328,6 @@ async def test_controller_submits_solution_end_to_end(tmp_path):
     from shared.mempool_miner_controller import MempoolMinerController
     from shared.mempool_types import MinerType
     from shared.miner_bootstrap import _resolve_dev_signer
-    from shared.miner_core import MinerCore
     from shared.miner_worker import MinerHandle
     from shared.substrate_client import SubstrateClient
 
@@ -389,7 +480,7 @@ async def test_controller_submits_solution_end_to_end(tmp_path):
     )
     # Resolve rpc once so the test fixture's later setup
     # (events, balances) shares a connected client.
-    client = await pool.get("rpc")
+    await pool.get("rpc")
 
     solution_submitted = asyncio.Event()
 

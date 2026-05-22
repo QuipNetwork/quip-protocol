@@ -211,6 +211,49 @@ async def test_pump_finalized_only_uses_finalised_endpoint():
     assert all(h == bytes.fromhex("11" * 32) for h, _ in received)
 
 
+async def test_pump_propagates_no_validator_reachable():
+    """When the pump's `_run` raises `NoValidatorReachable` (failover
+    exhausted), `subscribe_new_heads` must propagate the exception out
+    instead of swallowing it in the cleanup `finally`. The outer
+    `_subscribe_heads` relies on seeing the exhausted-failover signal
+    to shut the controller down — without this, the controller would
+    wait on a dead subscription forever."""
+    from shared.substrate_client import NoValidatorReachable, ValidatorAttempt
+
+    head_hashes = ["0x" + ("aa" * 32)]
+    stop = threading.Event()
+    iface = _FakeIface(head_hashes, stop)
+    client = _build_client(iface)
+
+    # Override `_run` to raise NoValidatorReachable on the first call,
+    # simulating exhausted failover.
+    async def _failing_run(fn):  # noqa: ARG001
+        raise NoValidatorReachable([
+            ValidatorAttempt(url="ws://primary", exc_type="OSError", message="down"),
+        ])
+
+    client._run = _failing_run  # type: ignore[assignment]
+
+    async def cb(block_hash: bytes, number: int) -> None:
+        pass  # never reached — pump dies first
+
+    async def driver():
+        for _ in range(50):
+            if iface.captured_callback is not None:
+                break
+            await asyncio.sleep(0)
+        # Wake the pump so it tries to call `_run` (which raises).
+        iface.captured_callback({"header": {"number": 0}}, 0, "sub-id")
+        await asyncio.sleep(0.05)
+        # Unblock the outer subscribe so the finally runs.
+        stop.set()
+
+    with pytest.raises(NoValidatorReachable):
+        await asyncio.gather(
+            client.subscribe_new_heads(cb), driver()
+        )
+
+
 async def test_pump_survives_callback_exception():
     """A `callback` that raises (and any other non-connection exception
     inside the pump iteration) must not kill the pump task. The next

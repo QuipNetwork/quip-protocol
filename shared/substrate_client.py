@@ -1009,12 +1009,23 @@ class SubstrateClient:
             )
         finally:
             pump_task.cancel()
+            pump_exc: Optional[BaseException] = None
             try:
                 await pump_task
             except asyncio.CancelledError:
                 pass
+            except NoValidatorReachable as exc:
+                # Failover exhausted inside the pump. Capture and
+                # re-raise after the finally completes so the outer
+                # caller (controller's `_subscribe_heads`) sees the
+                # exhausted-failover signal and shuts down instead of
+                # waiting on a dead subscription. Without this, the
+                # `except Exception` branch below would log + swallow.
+                pump_exc = exc
             except Exception:  # noqa: BLE001
                 logger.exception("subscribe_new_heads pump task crashed")
+            if pump_exc is not None:
+                raise pump_exc
 
     # ------------------------------------------------------------------
     # Internal helpers

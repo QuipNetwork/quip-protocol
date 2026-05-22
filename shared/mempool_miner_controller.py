@@ -190,6 +190,12 @@ class MempoolMinerController:
         self._pending_seen: Set[int] = set()
         # Order currently being mined (one at a time in 8c).
         self._active_order: Optional[int] = None
+        # Handles that have reported a terminal event (error or
+        # work_item_done without a winning result) for `_active_order`.
+        # `_active_order` is cleared only when this set covers every
+        # handle — clearing on the first error would drop legitimate
+        # sibling results that arrive a few ms later.
+        self._active_order_done_handles: Set[str] = set()
         # Orders we've submitted a solution for; the chain will eventually
         # emit OrderExpired for these, at which point we try to claim.
         self._submitted_orders: Set[int] = set()
@@ -574,6 +580,7 @@ class MempoolMinerController:
             return
         context = MempoolJobContext.from_job_order(order_id, order)
         self._active_order = order_id
+        self._active_order_done_handles = set()
         for handle in self.miner_handles:
             dispatch_id = handle.mine_work_item(context)
             self._dispatch_contexts[(handle.miner_id, dispatch_id)] = context
@@ -585,6 +592,33 @@ class MempoolMinerController:
             order_id,
             len(self.miner_handles),
         )
+
+    def _clear_active_order(self) -> None:
+        self._active_order = None
+        self._active_order_done_handles = set()
+
+    def _record_handle_terminal_for_active(
+        self, handle_id: str, dispatch_id: int
+    ) -> None:
+        """Mark `handle_id` as done (error or cancel-completion) for the
+        active order. Clears `_active_order` only when every handle has
+        reported terminal — clearing earlier would cause `_handle_result`
+        to drop legitimate sibling results that arrive moments later.
+        """
+        if self._active_order is None:
+            return
+        context = self._dispatch_contexts.get((handle_id, dispatch_id))
+        if context is None or context.order_id != self._active_order:
+            return
+        self._active_order_done_handles.add(handle_id)
+        if len(self._active_order_done_handles) >= len(self.miner_handles):
+            logger.warning(
+                "all %d handles terminated without submission for order=%d; "
+                "releasing dispatch gate",
+                len(self.miner_handles),
+                self._active_order,
+            )
+            self._clear_active_order()
 
     async def _handle_result(self, envelope: _MempoolResultEnvelope) -> None:
         self.stats.results_received += 1
@@ -634,7 +668,7 @@ class MempoolMinerController:
             logger.exception(
                 "submit_solution RPC failed for order=%d: %s", order_id, exc
             )
-            self._active_order = None
+            self._clear_active_order()
             return
 
         outcome = _classify_solution(receipt.error)
@@ -653,7 +687,7 @@ class MempoolMinerController:
                 )
             # Clear active order before callback so dispatch isn't blocked
             # if the callback raises.
-            self._active_order = None
+            self._clear_active_order()
             if self.on_solution_submitted is not None:
                 try:
                     await self.on_solution_submitted(order_id, envelope.result)
@@ -669,10 +703,10 @@ class MempoolMinerController:
                 order_id,
                 receipt.error,
             )
-            self._active_order = None
+            self._clear_active_order()
         else:  # fatal
             self.stats.solution_errors += 1
-            self._active_order = None
+            self._clear_active_order()
             raise RuntimeError(
                 f"submit_solution failed fatally: order={order_id} "
                 f"error={receipt.error}"
@@ -802,26 +836,36 @@ class MempoolMinerController:
                     )
                 )
             elif isinstance(msg, dict) and msg.get("op") == "work_item_done":
+                done_dispatch_id = msg.get("dispatch_id")
                 try:
-                    self._done_queues[handle.miner_id].put_nowait(
-                        msg.get("dispatch_id")
-                    )
+                    self._done_queues[handle.miner_id].put_nowait(done_dispatch_id)
                 except asyncio.QueueFull:
                     pass
+                # Cancel-completion counts as terminal for the active
+                # order. Clears `_active_order` only if every handle has
+                # reported terminal without a successful submission.
+                self._record_handle_terminal_for_active(
+                    handle.miner_id, done_dispatch_id
+                )
             elif isinstance(msg, dict) and msg.get("op") == "error":
+                err_dispatch_id = msg.get("dispatch_id")
                 logger.error(
-                    "worker %s reported error: %s",
+                    "worker %s reported error (dispatch=%s): %s",
                     handle.miner_id,
+                    err_dispatch_id,
                     msg.get("message", "<no message>"),
                 )
                 self.stats.solution_errors += 1
-                # Clear the active-order gate so the next JobProposed
-                # isn't blocked forever. Without this, a single worker
-                # exception locks `_maybe_dispatch_next` (which gates on
-                # `self._active_order is None`) and silently disables
-                # all future mining until process restart.
-                if self._active_order is not None:
-                    self._active_order = None
+                # Record this handle as terminal. We MUST NOT clear
+                # `_active_order` here unconditionally — siblings may
+                # still be mining the same order and `_handle_result`
+                # gates on `order_id == self._active_order`, so an early
+                # clear would drop legitimate sibling submissions as
+                # stale. The helper only releases the gate when every
+                # handle has reported terminal.
+                self._record_handle_terminal_for_active(
+                    handle.miner_id, err_dispatch_id
+                )
             elif isinstance(msg, dict) and msg.get("op") == "shutdown_ack":
                 return
 

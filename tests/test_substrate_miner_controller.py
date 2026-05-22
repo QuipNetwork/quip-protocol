@@ -1189,6 +1189,52 @@ async def test_main_loop_handles_result_before_head_when_both_ready():
     # The critical invariant is "result was not lost".
 
 
+async def test_main_loop_reraises_operator_fail_loud_from_handle_head():
+    """`_OperatorFailLoud` (consecutive-None escalation, topology mismatch)
+    must escape `_main_loop` so the operator sees the configured error
+    instead of an infinite log spam. Without re-raise, a stuck chain or
+    misconfigured topology hash silently degrades into "no mining."""
+    from shared.substrate_miner_controller import _OperatorFailLoud
+
+    controller = _bare_controller()
+    controller._result_queue = asyncio.Queue()
+    controller._latest_head = (b"\xff" * 32, 42)
+    controller._head_signal.set()
+
+    async def fake_handle_head(h, n):
+        raise _OperatorFailLoud("topology mismatch")
+
+    controller._handle_head = fake_handle_head  # type: ignore[assignment]
+
+    with pytest.raises(_OperatorFailLoud, match="topology mismatch"):
+        await controller._main_loop()
+    assert controller.stats.heads_dropped_handler_error == 0
+
+
+async def test_main_loop_drops_plain_runtime_error_from_handle_head():
+    """Plain `RuntimeError` from `_handle_head` (e.g. `state_call` RPC error
+    surfaced as RuntimeError by the substrate client) must be dropped and
+    counted, not re-raised. Re-raising would tear the controller down on
+    every transient RPC blip."""
+    controller = _bare_controller()
+    controller._result_queue = asyncio.Queue()
+
+    async def fake_handle_head(h, n):
+        # Set shutdown before raising so the loop drops this head, then
+        # exits at the top of the next iteration instead of waiting on
+        # `_head_signal.wait()` forever.
+        controller._shutdown_event.set()
+        raise RuntimeError("state_call mining_snapshot rpc error: timeout")
+
+    controller._handle_head = fake_handle_head  # type: ignore[assignment]
+    controller._latest_head = (b"\xff" * 32, 42)
+    controller._head_signal.set()
+
+    # Should NOT raise; loop drops the head, then exits via shutdown.
+    await controller._main_loop()
+    assert controller.stats.heads_dropped_handler_error == 1
+
+
 async def test_verify_proof_recorded_rpc_failure_returns_none():
     """RPC failure during verification returns None so the caller can
     proceed with close-on-receipt fallback rather than retry-storming."""

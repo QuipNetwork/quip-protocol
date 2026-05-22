@@ -344,38 +344,3 @@ class MinerHandle:
                 f"Miner {self.miner_id} did not respond to get_stats: {msg}"
             )
 
-    def close(self):
-        try:
-            self.req.put({"op": "shutdown"})
-        except Exception as exc:  # noqa: BLE001 — pipe may already be torn down
-            logger.warning(
-                "close: shutdown enqueue failed for %s: %s",
-                self.miner_id,
-                exc,
-            )
-        self.proc.join(timeout=2.0)
-        if self.proc.is_alive():
-            logger.warning(
-                "close: %s did not exit after shutdown signal; sending SIGTERM",
-                self.miner_id,
-            )
-            try:
-                self.proc.terminate()
-                self.proc.join(timeout=1.0)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "close: terminate failed for %s: %s", self.miner_id, exc
-                )
-        if self.proc.is_alive():
-            logger.error(
-                "close: %s ignored SIGTERM; sending SIGKILL "
-                "(hardware cleanup may not have run)",
-                self.miner_id,
-            )
-            try:
-                self.proc.kill()
-                self.proc.join(timeout=1.0)
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "close: kill failed for %s: %s", self.miner_id, exc
-                )

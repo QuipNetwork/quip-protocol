@@ -78,6 +78,23 @@ class _MinerCoreStats(Protocol):
 _NONE_SNAPSHOT_FAIL_THRESHOLD = 10
 
 
+class _OperatorFailLoud(RuntimeError):
+    """Marker exception for `_handle_head` paths the operator must see.
+
+    Raised explicitly in `_handle_head` for misconfiguration / stuck-chain
+    conditions that the controller cannot recover from without operator
+    intervention (consecutive-None-snapshot escalation, topology-hash
+    mismatch). `_main_loop` re-raises this class but not bare
+    `RuntimeError` — the substrate client's `state_call` helpers raise
+    plain `RuntimeError` for transient RPC errors, which must remain in
+    the drop-and-retry-next-head branch.
+
+    Inherits from `RuntimeError` for compatibility with existing tests
+    that use `pytest.raises(RuntimeError)` — the controller's
+    `except _OperatorFailLoud` clause still only matches this subclass.
+    """
+
+
 # Cap on how many recently-won work keys we remember. Sized for the
 # expected window of late results: a miner with N handles can in the
 # worst case have N-1 pending results land after an OK on the same key,
@@ -610,16 +627,21 @@ class SubstrateMinerController:
                             type(exc).__name__,
                             exc,
                         )
-                    except RuntimeError:
-                        # `_handle_head` raises `RuntimeError` only as an
-                        # operator-fail-loud signal: consecutive-None-
+                    except _OperatorFailLoud:
+                        # `_handle_head` raises `_OperatorFailLoud` for
+                        # operator-must-see conditions: consecutive-None-
                         # snapshot escalation (chain stuck / RPC broken)
-                        # or topology-hash mismatch (operator
-                        # misconfiguration). These must not be swallowed
-                        # by the generic-drop branch below — they need to
-                        # tear the controller down so the operator sees
-                        # the configured error message instead of an
-                        # infinite log spam.
+                        # or topology-hash mismatch (misconfiguration).
+                        # These must not be swallowed by the generic-drop
+                        # branch below — they need to tear the controller
+                        # down so the operator sees the configured error
+                        # message instead of an infinite log spam.
+                        #
+                        # Bare `RuntimeError` is NOT caught here on
+                        # purpose: substrate-client `state_call` raises
+                        # plain RuntimeError on transient RPC errors, and
+                        # those must remain in the drop-and-retry-next-
+                        # head branch.
                         raise
                     except Exception as exc:  # noqa: BLE001
                         # Non-connection, non-fail-loud errors from
@@ -748,7 +770,7 @@ class SubstrateMinerController:
                 self._consecutive_none_snapshots,
             )
             if self._consecutive_none_snapshots >= _NONE_SNAPSHOT_FAIL_THRESHOLD:
-                raise RuntimeError(
+                raise _OperatorFailLoud(
                     f"mining_snapshot returned None for "
                     f"{self._consecutive_none_snapshots} consecutive heads "
                     "— chain may be stuck or RPC is broken. Run "
@@ -761,7 +783,7 @@ class SubstrateMinerController:
             self.topology_hash is not None
             and context.topology_hash != self.topology_hash
         ):
-            raise RuntimeError(
+            raise _OperatorFailLoud(
                 "configured --topology-hash does not match snapshot: "
                 f"expected 0x{self.topology_hash.hex()}, got 0x{context.topology_hash.hex()}"
             )
