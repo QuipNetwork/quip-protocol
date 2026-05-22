@@ -657,7 +657,8 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
                       miner_id: str, miner_type: str,
                       h: Optional[Dict[int, float]] = None,
                       J: Optional[Dict[Tuple[int, int], float]] = None,
-                      skip_validation: bool = True):
+                      skip_validation: bool = True,
+                      strict_energy: bool = True):
     """Convert a sample set into a mining result if it meets requirements, otherwise return None.
 
     Args:
@@ -675,6 +676,14 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         J: Optional pre-computed coupling parameters (avoids regeneration)
         skip_validation: If True, skip per-solution validation (faster for mining).
                         Set to False for block validation from other miners.
+        strict_energy: If True (default), require best_energy <= difficulty_energy
+                        and discard the sample otherwise. If False (substrate
+                        ratchet path), the energy gate is dropped — every
+                        sample considered, MiningResult returned whenever
+                        diversity + min_solutions still pass. Caller decides
+                        whether the returned best_energy is currently
+                        eligible for chain submission against the *live*
+                        decayed threshold.
 
     Returns:
         MiningResult if successful, None if requirements not met
@@ -688,6 +697,13 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
     diversity = 0.0
     result = None
 
+    # Lenient mode keeps the same diversity + min_solutions invariants but
+    # drops the energy gate. Effectively the "candidate set" becomes all
+    # samples (not just samples under the energy threshold), so a result
+    # that's just above the (decay-stale) snapshot threshold can still be
+    # stored as a ratchet candidate.
+    effective_energy_filter = difficulty_energy if strict_energy else float("inf")
+
     try:
         # Best Energy - use sampler-reported energy for fast early exit
         all_energies = sampleset.record.energy
@@ -698,17 +714,20 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
 
         # FAST PATH: Early exit if best energy doesn't meet threshold
         # This avoids expensive Ising model regeneration and energy recalculation
-        if best_energy > difficulty_energy:
+        if strict_energy and best_energy > difficulty_energy:
             raise ValueError(f"Best energy {best_energy} exceeds difficulty energy {difficulty_energy}")
 
         # Count how many samples meet threshold before expensive operations
-        valid_count = np.sum(all_energies <= difficulty_energy)
+        valid_count = np.sum(all_energies <= effective_energy_filter)
         if valid_count < min_solutions:
             raise ValueError(f"Insufficient valid solutions: {valid_count} < {min_solutions}")
 
         # Process results from this mining attempt
-        # Find all solutions meeting energy threshold
-        valid_indices = np.where(all_energies < difficulty_energy)[0]
+        # Find all solutions meeting energy threshold (or all, in lenient mode)
+        if strict_energy:
+            valid_indices = np.where(all_energies < difficulty_energy)[0]
+        else:
+            valid_indices = np.arange(len(all_energies))
 
         # Get unique solutions that meet energy threshold
         # Track best energy among valid solutions

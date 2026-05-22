@@ -142,8 +142,17 @@ def _bare_controller() -> SubstrateMinerController:
     c._closed_work_keys = OrderedDict()
     c._consecutive_none_snapshots = 0
     c._highest_handled_block = 0
+    c._last_pushed_threshold_milli = 0
     c.topology_hash = None
     c.core = None  # Phase 6: optional MinerCore for telemetry
+    # Submission log is created by __init__; bare controllers used in
+    # unit tests either don't exercise the submit path or patch the
+    # log explicitly. Tests that touch _handle_result will set this.
+    from shared.mining_attempt_log import SubmissionLogger
+    import tempfile
+    c._submission_log = SubmissionLogger(
+        log_dir=Path(tempfile.mkdtemp(prefix="quip-test-")),
+    )
     return c
 
 

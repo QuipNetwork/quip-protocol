@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import logging
+import math
 import multiprocessing
 import multiprocessing.synchronize
 import time
@@ -23,7 +24,9 @@ from shared.energy_utils import (
 )
 from shared.mempool_types import MempoolJobContext
 from shared.miner_types import BlockRequirements, IsingSample, MiningResult, Sampler
+from shared.mining_attempt_log import AttemptLogger
 from shared.quantum_proof_of_work import evaluate_sampleset
+from shared.substrate_types import SubstrateMiningContext
 from shared.work_context import (
     WorkContext,
     fresh_salt,
@@ -433,6 +436,31 @@ class BaseMiner(ABC):
             if k not in ('num_reads', 'num_sweeps')
         }
 
+        # Substrate ratchet state. Only the PoW path opts into the
+        # decay-aware "store best, submit when chain catches up" loop;
+        # mempool jobs have hard quality floors that don't decay so
+        # they keep the strict-energy behaviour.
+        is_substrate = isinstance(context, SubstrateMiningContext)
+        live_threshold_var = getattr(self, '_live_max_energy_milli', None)
+        # Seed the worker's live-threshold view with the snapshot value
+        # in case the controller hasn't written one yet (e.g. tests, or
+        # the very first dispatch before the head-handler runs).
+        if is_substrate and live_threshold_var is not None:
+            with live_threshold_var.get_lock():
+                if live_threshold_var.value == 0:
+                    live_threshold_var.value = context.difficulty.max_energy_milli
+        stored_best: Optional[MiningResult] = None
+        # Lazily build the per-worker attempt log. Mempool jobs share
+        # the same writer for cross-mode forensics; the ``result_kind``
+        # field on each row distinguishes the two paths.
+        attempt_log: AttemptLogger = (
+            getattr(self, '_attempt_logger', None)
+            or AttemptLogger(self.miner_id)
+        )
+        if not hasattr(self, '_attempt_logger'):
+            self._attempt_logger = attempt_log
+        dispatch_id_for_log = int(getattr(self, '_current_dispatch_id', 0))
+
         progress = 0
         try:
             while self.mining and not stop_event.is_set():
@@ -483,14 +511,141 @@ class BaseMiner(ABC):
                 )
                 self.timing_stats['blocks_attempted'] += 1
 
-                result = self.evaluate_sampleset(
-                    sampleset, requirements, nodes, edges,
-                    nonce, salt, prev_timestamp, start_time,
-                )
+                # Per-iteration log fields (filled below per code path).
+                attempt_log_kwargs: Dict[str, Any] = {
+                    "dispatch_id": dispatch_id_for_log,
+                    "iter_num": progress + 1,
+                    "nonce_hex": (
+                        f"0x{nonce.hex()}"
+                        if isinstance(nonce, (bytes, bytearray))
+                        else hex(int(nonce))
+                    ),
+                    "salt_hex": f"0x{salt.hex()}",
+                    "best_energy_milli": int(
+                        float(np.min(sampleset.record.energy)) * 1000
+                    ),
+                    "num_samples": len(sampleset.record.energy),
+                    "post_processed": False,
+                    "stored_as_best": False,
+                    "result_kind": "rejected",
+                }
+                stored_replaced = False
 
-                self.timing_stats['postprocessing'].append(
-                    (time.time() - postprocess_start) * 1e6,
+                if is_substrate:
+                    # ---- Ratchet path (substrate / PoW) -------------
+                    # Read the chain's *live* (decay-applied) energy
+                    # threshold the controller pushed via shared mem.
+                    # When the chain decays past our stored best, the
+                    # next iteration's check returns the stored result.
+                    if live_threshold_var is not None:
+                        with live_threshold_var.get_lock():
+                            live_threshold_milli = int(live_threshold_var.value)
+                    else:
+                        live_threshold_milli = int(
+                            requirements.difficulty_energy * 1000,
+                        )
+
+                    # Post-processing gate: only run the expensive
+                    # diverse-selection if this iteration might improve
+                    # what we've already stored. Matches the user-
+                    # stated invariant — "post process only when it
+                    # might meet the threshold energy target, except
+                    # the target is the last min energy that met
+                    # requirements." Use stored_best's energy when we
+                    # have one; otherwise the initial snapshot energy.
+                    iter_best_energy = float(
+                        np.min(sampleset.record.energy),
+                    )
+                    ratchet_threshold = (
+                        stored_best.energy
+                        if stored_best is not None
+                        else requirements.difficulty_energy
+                    )
+
+                    result = None
+                    if iter_best_energy < ratchet_threshold:
+                        # Lenient eval — diversity + min_solutions
+                        # still required, but no energy gate. The
+                        # ratchet itself enforces "only improvements
+                        # land" via the comparison below.
+                        result = self.evaluate_sampleset(
+                            sampleset, requirements, nodes, edges,
+                            nonce, salt, prev_timestamp, start_time,
+                            strict_energy=False,
+                        )
+                        attempt_log_kwargs["post_processed"] = True
+                        if result is not None and (
+                            stored_best is None
+                            or result.energy < stored_best.energy
+                        ):
+                            stored_best = result
+                            stored_replaced = True
+
+                    self.timing_stats['postprocessing'].append(
+                        (time.time() - postprocess_start) * 1e6,
+                    )
+
+                    # Submit gate. If chain's live decayed threshold
+                    # has already eased past our best, return now —
+                    # the chain will accept it.
+                    if (
+                        stored_best is not None
+                        and int(stored_best.energy * 1000) < live_threshold_milli
+                    ):
+                        result = stored_best
+                    else:
+                        result = None
+
+                    attempt_log_kwargs.update(
+                        threshold_milli=live_threshold_milli,
+                        ratchet_threshold_milli=int(ratchet_threshold * 1000),
+                        num_valid=(result.num_valid if result is not None else None),
+                        diversity_milli=(
+                            int(result.diversity * 1000)
+                            if result is not None else None
+                        ),
+                        stored_as_best=stored_replaced,
+                        result_kind=(
+                            "submitted" if result is not None
+                            else "stored" if stored_replaced
+                            else "rejected"
+                        ),
+                    )
+                else:
+                    # ---- Mempool path (unchanged strict semantics) ---
+                    result = self.evaluate_sampleset(
+                        sampleset, requirements, nodes, edges,
+                        nonce, salt, prev_timestamp, start_time,
+                    )
+
+                    self.timing_stats['postprocessing'].append(
+                        (time.time() - postprocess_start) * 1e6,
+                    )
+                    # Mempool path may have ``difficulty_energy = +inf``
+                    # (unbounded threshold for jobs with no min_energy
+                    # floor). int() would overflow — use None instead.
+                    threshold_milli_log: Optional[int] = None
+                    if math.isfinite(requirements.difficulty_energy):
+                        threshold_milli_log = int(
+                            requirements.difficulty_energy * 1000,
+                        )
+                    attempt_log_kwargs.update(
+                        post_processed=True,
+                        threshold_milli=threshold_milli_log,
+                        num_valid=(result.num_valid if result is not None else None),
+                        diversity_milli=(
+                            int(result.diversity * 1000)
+                            if result is not None else None
+                        ),
+                        result_kind=(
+                            "submitted" if result is not None else "rejected"
+                        ),
+                    )
+
+                attempt_log_kwargs["mining_time_us"] = int(
+                    (time.time() - preprocess_start) * 1e6
                 )
+                attempt_log.record(**attempt_log_kwargs)
 
                 if result:
                     # Post-evaluation cancel check. evaluate_sampleset can
@@ -667,9 +822,16 @@ class BaseMiner(ABC):
         })
         return stats
 
-    def evaluate_sampleset(self, sampleset: dimod.SampleSet, requirements: BlockRequirements, nodes: List[int], edges: List[Tuple[int, int]], nonce: int, salt: bytes, prev_timestamp: int, start_time: float) -> Optional[MiningResult]:
-        """Convert a sample set into a mining result if it meets requirements, otherwise return None."""
-        return evaluate_sampleset(sampleset, requirements, nodes, edges, nonce, salt, prev_timestamp, start_time, self.miner_id, self.miner_type)
+    def evaluate_sampleset(self, sampleset: dimod.SampleSet, requirements: BlockRequirements, nodes: List[int], edges: List[Tuple[int, int]], nonce: int, salt: bytes, prev_timestamp: int, start_time: float, *, strict_energy: bool = True) -> Optional[MiningResult]:
+        """Convert a sample set into a mining result if it meets requirements, otherwise return None.
+
+        ``strict_energy=False`` enables the substrate ratchet's lenient
+        mode: diversity + min_solutions are still required but the
+        energy gate is dropped, so candidates that don't yet beat the
+        chain's snapshot threshold can still be captured as the new
+        ``stored_best`` for later submission when decay catches up.
+        """
+        return evaluate_sampleset(sampleset, requirements, nodes, edges, nonce, salt, prev_timestamp, start_time, self.miner_id, self.miner_type, strict_energy=strict_energy)
 
 
 # ----------------------------------------------------------------------
