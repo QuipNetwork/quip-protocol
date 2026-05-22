@@ -610,11 +610,22 @@ class SubstrateMinerController:
                             type(exc).__name__,
                             exc,
                         )
+                    except RuntimeError:
+                        # `_handle_head` raises `RuntimeError` only as an
+                        # operator-fail-loud signal: consecutive-None-
+                        # snapshot escalation (chain stuck / RPC broken)
+                        # or topology-hash mismatch (operator
+                        # misconfiguration). These must not be swallowed
+                        # by the generic-drop branch below — they need to
+                        # tear the controller down so the operator sees
+                        # the configured error message instead of an
+                        # infinite log spam.
+                        raise
                     except Exception as exc:  # noqa: BLE001
-                        # Non-connection errors from `_handle_head` (e.g.
-                        # snapshot SCALE decode shape drift, RuntimeError
-                        # from `state_call`) would otherwise propagate out
-                        # of `_main_loop` and tear down the controller —
+                        # Non-connection, non-fail-loud errors from
+                        # `_handle_head` (e.g. snapshot SCALE decode shape
+                        # drift) would otherwise propagate out of
+                        # `_main_loop` and tear down the controller —
                         # then `_teardown` runs, `run()` returns, and the
                         # CLI's `asyncio.wait` shuts everything down on a
                         # single runtime-API shape mismatch. Drop the
@@ -649,7 +660,6 @@ class SubstrateMinerController:
         # fails, fall back to the subscription's head_hash — that's
         # what we'd have used anyway and the stale-post-win classifier
         # will catch over-old work keys downstream.
-        subscription_block_number = block_number
         try:
             rpc_head = await self.client.get_head()
             rpc_number = await self.client.get_block_number(at=rpc_head)
@@ -1598,6 +1608,25 @@ class SubstrateMinerController:
         main loop can `await` on.
         """
         loop = asyncio.get_running_loop()
+        try:
+            await self._drain_handle_loop(handle, loop)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            # An unhandled exception in the drainer would otherwise just
+            # log via asyncio's unhandled-task hook and the main loop
+            # would keep waiting on a queue nothing pushes to. Fail loud:
+            # the controller can't make progress without this handle's
+            # results, so trigger shutdown.
+            logger.exception(
+                "drainer for %s crashed; triggering shutdown",
+                handle.miner_id,
+            )
+            self.shutdown()
+
+    async def _drain_handle_loop(
+        self, handle: MinerHandle, loop: asyncio.AbstractEventLoop
+    ) -> None:
         while not self._shutdown_event.is_set():
             try:
                 msg = await loop.run_in_executor(None, handle.resp.get, True, 0.5)

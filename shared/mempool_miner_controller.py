@@ -130,6 +130,7 @@ class MempoolMinerController:
         pool: ValidatorPool,
         signer: Signer,
         miner_handles: List[MinerHandle],
+        *,
         sampler_topology_hash: bytes,
         allowed_h_values: AllowedValueSpec,
         allowed_j_values: AllowedValueSpec,
@@ -255,8 +256,13 @@ class MempoolMinerController:
         for handle in self.miner_handles:
             try:
                 handle.cancel()
-            except Exception:  # noqa: BLE001 — best-effort
-                pass
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                logger.warning(
+                    "teardown: cancel failed for %s: %s: %s",
+                    handle.miner_id,
+                    type(exc).__name__,
+                    exc,
+                )
 
         # Close the subscription websocket BEFORE awaiting cancellations.
         # `subscribe_block_headers` runs in a thread that's blocked on the
@@ -271,23 +277,37 @@ class MempoolMinerController:
         if self._subscription_client is not None:
             try:
                 await self._subscription_client.close()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "teardown: subscription close raised %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
 
         for task in [self._subscription_task, self._claim_task]:
             if task is not None and not task.done():
                 task.cancel()
                 try:
                     await task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                except asyncio.CancelledError:
                     pass
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "teardown: task %s raised during cancellation",
+                        task.get_name(),
+                    )
         for task in self._drainer_tasks:
             if not task.done():
                 task.cancel()
                 try:
                     await task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                except asyncio.CancelledError:
                     pass
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "teardown: drainer task %s raised during cancellation",
+                        task.get_name(),
+                    )
 
     # ------------------------------------------------------------------
     # Startup checks
@@ -743,7 +763,20 @@ class MempoolMinerController:
                     if not self._shutdown_event.is_set():
                         self._shutdown_event.set()
                 continue
-            except Exception:  # noqa: BLE001 — queue closed on shutdown
+            except (EOFError, BrokenPipeError, OSError) as exc:
+                # Pipe broken / worker gone. Mirror the substrate
+                # controller's drainer: fail loud and trigger shutdown
+                # rather than silently exiting (which would leave the
+                # controller running with no signal that one handle's
+                # results will never arrive).
+                logger.error(
+                    "handle %s response queue broken (%s: %s): "
+                    "worker process likely died; shutting down",
+                    handle.miner_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                self._shutdown_event.set()
                 return
             if isinstance(msg, dict) and msg.get("op") == "mine_result":
                 dispatch_id = msg.get("dispatch_id")
@@ -782,6 +815,13 @@ class MempoolMinerController:
                     msg.get("message", "<no message>"),
                 )
                 self.stats.solution_errors += 1
+                # Clear the active-order gate so the next JobProposed
+                # isn't blocked forever. Without this, a single worker
+                # exception locks `_maybe_dispatch_next` (which gates on
+                # `self._active_order is None`) and silently disables
+                # all future mining until process restart.
+                if self._active_order is not None:
+                    self._active_order = None
             elif isinstance(msg, dict) and msg.get("op") == "shutdown_ack":
                 return
 

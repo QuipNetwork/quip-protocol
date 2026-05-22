@@ -970,6 +970,13 @@ class SubstrateClient:
                     await callback(head_bytes, number)
                 except asyncio.CancelledError:
                     raise
+                except NoValidatorReachable:
+                    # Failover gave up — keep retrying on pump_event is
+                    # pointless because the subscription is also dead.
+                    # Propagate so the outer `_subscribe_heads` (or the
+                    # controller wrapping it) sees the exhausted-failover
+                    # state and escalates instead of silently going inert.
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "subscribe_new_heads pump iteration failed "
@@ -1185,7 +1192,10 @@ def _fetch_extrinsic_dispatch_error(
         return f"unclassified: get_block returned None for {block_hash}"
     target_hash = _canonical_hex(ext_hash)
     if target_hash is None:
-        return f"unclassified: target extrinsic_hash has unsupported shape: {type(ext_hash).__name__}"
+        return (
+            "unclassified: target extrinsic_hash has unsupported shape: "
+            f"{type(ext_hash).__name__}"
+        )
     extrinsics = block.get("extrinsics") or []
     ext_idx: Optional[int] = None
     for idx, ext in enumerate(extrinsics):

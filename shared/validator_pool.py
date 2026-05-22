@@ -130,8 +130,18 @@ class ValidatorPool:
                     )
                 except ValueError:
                     # client.current_url isn't in our list — should be
-                    # impossible since we passed self._urls. Defensive.
-                    pass
+                    # impossible since we passed self._urls. Defensive,
+                    # but log loud: silently leaving _current_index stale
+                    # would cause subsequent advance_rotation() calls to
+                    # compare against the wrong URL and never advance.
+                    logger.error(
+                        "validator pool invariant violation: "
+                        "client.current_url=%s not in pool._urls=%s — "
+                        "pool pointer left stale at index %d",
+                        client.current_url,
+                        self._urls,
+                        self._current_index,
+                    )
             self._owned_slots[role] = client
             return client
 

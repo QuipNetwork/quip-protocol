@@ -13,7 +13,7 @@ Nodes, edges, and h-values are looked up from ``RegisteredTopologies`` by
 """
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List
 
 from shared.allowed_value_spec import MILLI_SCALE as _MILLI_SCALE
 from shared.logging_config import get_logger
@@ -154,17 +154,6 @@ def _normalize_spins(solution) -> List[int]:
             raise ValueError(
                 f"spin value {v!r} is not 0, 1, or -1; cannot normalize"
             )
-    return out
-
-
-def _coerce_edges(edges) -> List[Tuple[int, int]]:
-    """Accept edges as list[tuple] or list[list[int]]; emit list[tuple]."""
-    out: List[Tuple[int, int]] = []
-    for e in edges:
-        if len(e) != 2:
-            raise ValueError(f"edge must have 2 endpoints, got {e!r}")
-        u, v = e
-        out.append((int(u), int(v)))
     return out
 
 
