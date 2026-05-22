@@ -631,6 +631,10 @@ def test_auto_identify_submission_failure_logs_warning_and_returns(
         signer = FakeSigner()
 
     caplog.set_level(logging.WARNING, logger="quip_miner.auto_identify")
+    # Stub public-IP detection so the test doesn't hit the network.
+    async def _no_probe():
+        return None
+    monkeypatch.setattr(quip_cli, "_detect_public_ip", _no_probe)
     asyncio.run(quip_cli._auto_identify(
         FakeClient(),
         FakeKeystore(),
@@ -684,6 +688,9 @@ def test_auto_identify_falls_back_to_remark_after_remark_with_event_fails(
 
     client = FakeClient()
     caplog.set_level(logging.WARNING, logger="quip_miner.auto_identify")
+    async def _no_probe():
+        return None
+    monkeypatch.setattr(quip_cli, "_detect_public_ip", _no_probe)
     asyncio.run(quip_cli._auto_identify(
         client,
         FakeKeystore(),
@@ -694,3 +701,185 @@ def test_auto_identify_falls_back_to_remark_after_remark_with_event_fails(
         miners_config={"cpu": {"num_cpus": 1}},
     ))
     assert client.calls == ["remark_with_event", "remark"], client.calls
+
+
+# ----------------------------------------------------------------------
+# _detect_public_ip behaviour
+# ----------------------------------------------------------------------
+
+
+def test_detect_public_ip_uses_first_successful_service(monkeypatch):
+    """Walk the service list in order, return the first parseable IP.
+    Probes that error are skipped, not retried."""
+    import asyncio
+    import urllib.error
+
+    call_order: list[str] = []
+
+    def fake_urlopen(req, timeout=5.0, context=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        call_order.append(url)
+        # First service errors, second returns a valid IP.
+        if url == quip_cli._PUBLIC_IP_SERVICES[0]:
+            raise urllib.error.URLError("simulated DNS failure")
+        class _Resp:
+            def read(self_inner):
+                return b"203.0.113.42\n"
+            def __enter__(self_inner):
+                return self_inner
+            def __exit__(self_inner, *_a):
+                return False
+        return _Resp()
+
+    monkeypatch.setattr(quip_cli.urllib.request, "urlopen", fake_urlopen)
+    ip = asyncio.run(quip_cli._detect_public_ip(timeout=0.01))
+    assert ip == "203.0.113.42"
+    # First service was attempted then we moved on; we did NOT skip
+    # straight to a later one.
+    assert call_order[0] == quip_cli._PUBLIC_IP_SERVICES[0]
+    assert call_order[1] == quip_cli._PUBLIC_IP_SERVICES[1]
+
+
+def test_detect_public_ip_rejects_non_ip_response(monkeypatch):
+    """A service that returns HTML or a hostname must be skipped — we
+    only want a parseable IPv4/IPv6 address in the descriptor."""
+    import asyncio
+
+    bodies = iter([b"<html>nope</html>", b"2001:db8::1\n"])
+
+    def fake_urlopen(req, timeout=5.0, context=None):
+        body = next(bodies)
+        class _Resp:
+            def read(self_inner):
+                return body
+            def __enter__(self_inner):
+                return self_inner
+            def __exit__(self_inner, *_a):
+                return False
+        return _Resp()
+
+    monkeypatch.setattr(quip_cli.urllib.request, "urlopen", fake_urlopen)
+    ip = asyncio.run(quip_cli._detect_public_ip(timeout=0.01))
+    # IPv6 was the second response and parses cleanly.
+    assert ip == "2001:db8::1"
+
+
+def test_detect_public_ip_all_fail_returns_none(monkeypatch, caplog):
+    """When every probe errors, we get None and a warning explaining
+    how to skip detection."""
+    import asyncio
+    import logging
+    import urllib.error
+
+    def fake_urlopen(req, timeout=5.0, context=None):
+        raise urllib.error.URLError("simulated offline")
+
+    monkeypatch.setattr(quip_cli.urllib.request, "urlopen", fake_urlopen)
+    caplog.set_level(logging.WARNING, logger="quip_miner.auto_identify")
+    ip = asyncio.run(quip_cli._detect_public_ip(timeout=0.01))
+    assert ip is None
+    assert any(
+        "could not detect public IP" in rec.message
+        for rec in caplog.records
+    ), [r.message for r in caplog.records]
+
+
+def test_auto_identify_uses_detected_public_ip_when_unset(monkeypatch):
+    """When public_host is None, _auto_identify queries _detect_public_ip
+    and threads the result into the NodeDescriptor it submits."""
+    import asyncio
+
+    async def _fake_probe():
+        return "198.51.100.7"
+    monkeypatch.setattr(quip_cli, "_detect_public_ip", _fake_probe)
+
+    captured: dict = {}
+    real_build = quip_cli.build_descriptor
+    def fake_build(**kwargs):
+        captured.update(kwargs)
+        return real_build(**kwargs)
+    monkeypatch.setattr(quip_cli, "build_descriptor", fake_build)
+
+    class FakeReceipt:
+        error = None
+        extrinsic_hash = "0xabc"
+        block_hash = "0xdef"
+
+    class FakeClient:
+        async def has_call(self, *_a, **_kw):
+            return False  # take the plain `remark` path
+        async def submit_extrinsic(self, *_a, **_kw):
+            return FakeReceipt()
+
+    class FakeSigner:
+        def ss58_address(self):
+            return "5FakeAccountId00000000000000000000000000000000000"
+        def account_id_bytes(self):
+            return b"\x00" * 32
+
+    class FakeKeystore:
+        signer = FakeSigner()
+
+    asyncio.run(quip_cli._auto_identify(
+        FakeClient(),
+        FakeKeystore(),
+        node_name="test-rig",
+        public_host=None,
+        public_port=None,
+        log_level=None,
+        miners_config={"cpu": {"num_cpus": 1}},
+    ))
+    assert captured.get("public_host") == "198.51.100.7"
+
+
+def test_auto_identify_skips_detection_when_public_host_set(monkeypatch):
+    """An explicitly configured public_host short-circuits detection —
+    we never reach out to check.quip.network when the operator already
+    told us what to advertise."""
+    import asyncio
+
+    called = []
+
+    async def _fake_probe():
+        called.append(True)
+        return "should.not.be.used"
+    monkeypatch.setattr(quip_cli, "_detect_public_ip", _fake_probe)
+
+    captured: dict = {}
+    real_build = quip_cli.build_descriptor
+    def fake_build(**kwargs):
+        captured.update(kwargs)
+        return real_build(**kwargs)
+    monkeypatch.setattr(quip_cli, "build_descriptor", fake_build)
+
+    class FakeReceipt:
+        error = None
+        extrinsic_hash = "0xabc"
+        block_hash = "0xdef"
+
+    class FakeClient:
+        async def has_call(self, *_a, **_kw):
+            return False
+        async def submit_extrinsic(self, *_a, **_kw):
+            return FakeReceipt()
+
+    class FakeSigner:
+        def ss58_address(self):
+            return "5FakeAccountId00000000000000000000000000000000000"
+        def account_id_bytes(self):
+            return b"\x00" * 32
+
+    class FakeKeystore:
+        signer = FakeSigner()
+
+    asyncio.run(quip_cli._auto_identify(
+        FakeClient(),
+        FakeKeystore(),
+        node_name="test-rig",
+        public_host="miner.example.com",
+        public_port=None,
+        log_level=None,
+        miners_config={"cpu": {"num_cpus": 1}},
+    ))
+    assert called == [], "detection ran despite explicit public_host"
+    assert captured.get("public_host") == "miner.example.com"

@@ -50,6 +50,13 @@ signer_key = "~/.quip-miner/signing.json"
 #
 # node_name defaults to the system hostname; set this if you want a
 # stable label across deployments.
+#
+# public_host is auto-detected on startup via check.quip.network (with
+# ipify / icanhazip / checkip.amazonaws.com / ident.me as fallbacks)
+# when this key is unset and no --public-host flag is passed. Set
+# explicitly to skip the probe — required when the host is behind a
+# NAT/load-balancer whose external address differs from what those
+# services see, or in air-gapped environments.
 # node_name   = "rig-01"
 # public_host = "miner.example.com"
 # public_port = 8086

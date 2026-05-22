@@ -15,10 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import logging
 import signal
 import socket
+import ssl
 import traceback
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -77,6 +81,76 @@ def _default_node_name() -> str:
     return name or "quip-miner"
 
 
+# Public-IP detection services queried when the operator did not set
+# `public_host`. check.quip.network is the project-controlled primary;
+# the rest are well-known fallbacks so detection still works when the
+# primary is down. Each returns the caller's public IP in plain text.
+# Order matters: we stop at the first service that returns a parseable
+# IP address.
+_PUBLIC_IP_SERVICES: tuple[str, ...] = (
+    "https://check.quip.network",
+    "https://api.ipify.org",
+    "https://icanhazip.com",
+    "https://ipecho.net/plain",
+    "https://checkip.amazonaws.com",
+    "https://ident.me",
+)
+
+
+async def _detect_public_ip(timeout: float = 5.0) -> Optional[str]:
+    """Best-effort discovery of this host's public IP for the NodeDescriptor.
+
+    Tries `_PUBLIC_IP_SERVICES` in order; returns the first response that
+    parses as an IPv4/IPv6 address. Returns None when every service times
+    out, errors, or replies with garbage. Failures are logged at debug —
+    auto-identify still proceeds with `public_host=None`.
+
+    Behaviour intentionally mirrors v0.1's `get_public_ip()` so operators
+    upgrading from v0.1 see the same detected IP.
+    """
+    loop = asyncio.get_event_loop()
+    ssl_context = ssl.create_default_context()
+    for service in _PUBLIC_IP_SERVICES:
+        def fetch(url: str = service) -> str:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "quip-miner/auto-identify"}
+            )
+            with urllib.request.urlopen(
+                req, timeout=timeout, context=ssl_context
+            ) as resp:
+                return resp.read().decode("utf-8").strip()
+        try:
+            ip = await loop.run_in_executor(None, fetch)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            _AUTO_IDENTIFY_LOGGER.debug(
+                "public IP probe failed via %s: %s", service, exc
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001 — observability path
+            _AUTO_IDENTIFY_LOGGER.debug(
+                "public IP probe errored via %s: %s: %s",
+                service, type(exc).__name__, exc,
+            )
+            continue
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            _AUTO_IDENTIFY_LOGGER.debug(
+                "public IP probe via %s returned non-IP %r", service, ip
+            )
+            continue
+        _AUTO_IDENTIFY_LOGGER.info(
+            "auto-identify: detected public IP %s via %s", ip, service
+        )
+        return ip
+    _AUTO_IDENTIFY_LOGGER.warning(
+        "auto-identify: could not detect public IP; descriptor will omit "
+        "public_host. Set --public-host or `public_host = ...` in the "
+        "miner config to skip detection."
+    )
+    return None
+
+
 async def _auto_identify(
     client: SubstrateClient,
     keystore,
@@ -97,6 +171,13 @@ async def _auto_identify(
     actual launched topology.
     """
     effective_name = (node_name or _default_node_name())[:64]
+    # When the operator did not configure public_host, query
+    # check.quip.network (and fallbacks) to fill it in — matches v0.1
+    # behaviour. Detection is best-effort: if every service is
+    # unreachable, the descriptor goes out with public_host=None.
+    effective_public_host = public_host
+    if effective_public_host is None:
+        effective_public_host = await _detect_public_ip()
     miner_specs = _identify_specs_from_miner_config(
         effective_name, miners_config
     )
@@ -104,7 +185,7 @@ async def _auto_identify(
         descriptor = build_descriptor(
             node_id=effective_name,
             node_name=effective_name,
-            public_host=public_host,
+            public_host=effective_public_host,
             public_port=public_port,
             rpc_endpoints=[],
             auto_mine=True,
@@ -264,7 +345,8 @@ def _identification_options(f):
         default=None,
         help="Publicly-advertised hostname for this miner (≤253 bytes). "
         "Embedded in the NodeDescriptor; does not bind. Falls back to "
-        "--config `public_host`.",
+        "--config `public_host`, then auto-detection via "
+        "check.quip.network (with ipify/icanhazip fallbacks).",
     )(f)
     f = click.option(
         "--node-name",
