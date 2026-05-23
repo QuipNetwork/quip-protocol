@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from shared.miner_bootstrap import DEV_HYBRID_SEEDS, _resolve_dev_signer
-from shared.substrate_client import (
+from substrate.client import (
     _HYBRID_TERMINAL_FAILURES,
     _encode_compact_u128,
     _encode_compact_u32,

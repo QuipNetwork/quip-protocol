@@ -48,7 +48,7 @@ from shared.miner_config import (
     validate_merged,
 )
 from shared.miner_core import MinerCore
-from shared.substrate_client import (
+from substrate.client import (
     NoValidatorReachable,
     SubstrateClient,
 )

@@ -20,7 +20,7 @@ from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
 from shared.packed_solution import pack_solution
 from shared.signer import Signer
-from shared.substrate_client import SubstrateClient
+from substrate.client import SubstrateClient
 from substrate.types import ExtrinsicReceipt, SubstrateMiningContext
 
 

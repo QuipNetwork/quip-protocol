@@ -47,7 +47,7 @@ from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from shared.signer import Signer
-from shared.substrate_client import NoValidatorReachable, SubstrateClient
+from substrate.client import NoValidatorReachable, SubstrateClient
 from shared.mining_attempt_log import SubmissionLogger
 from shared.substrate_submitter import encode_quantum_proof, submit_proof
 from shared.validator_pool import ValidatorPool

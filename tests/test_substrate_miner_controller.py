@@ -36,7 +36,7 @@ from shared.keystore_hybrid import generate
 from shared.miner_bootstrap import BootstrapConfig, _maybe_seed_chain, _resolve_dev_signer
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
-from shared.substrate_client import SubstrateClient
+from substrate.client import SubstrateClient
 from shared.substrate_miner_controller import (
     FATAL_SUBMISSION_ERRORS,
     STALE_SUBMISSION_ERRORS,
@@ -1379,7 +1379,7 @@ async def test_subscribe_heads_failover_then_resubscribes():
 async def test_subscribe_heads_no_validator_reachable_shuts_down():
     """If reconnect itself can't find a validator, the controller shuts down
     rather than spinning forever."""
-    from shared.substrate_client import NoValidatorReachable, ValidatorAttempt
+    from substrate.client import NoValidatorReachable, ValidatorAttempt
     from websocket import WebSocketConnectionClosedException
 
     fatal = NoValidatorReachable(

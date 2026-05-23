@@ -1,4 +1,4 @@
-"""Integration tests for `shared.substrate_client.SubstrateClient`.
+"""Integration tests for `substrate.client.SubstrateClient`.
 
 These require a live docker-compose chain at `ws://localhost:9944`. The whole
 module is skipped if the chain is unreachable, so the suite stays green for
@@ -17,7 +17,7 @@ import socket
 import pytest
 
 from shared.signer import Sr25519Signer
-from shared.substrate_client import SubstrateClient
+from substrate.client import SubstrateClient
 
 
 DEFAULT_URL = os.environ.get("QUIP_SUBSTRATE_URL", "ws://localhost:9944")

@@ -329,7 +329,7 @@ async def test_controller_submits_solution_end_to_end(tmp_path):
     from shared.mempool_types import MinerType
     from shared.miner_bootstrap import _resolve_dev_signer
     from shared.miner_worker import MinerHandle
-    from shared.substrate_client import SubstrateClient
+    from substrate.client import SubstrateClient
 
     # Fresh hybrid keystore for this test run — keeps state independent
     # from any leftover registration on the chain.

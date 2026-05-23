@@ -17,7 +17,7 @@ import threading
 
 import pytest
 
-from shared.substrate_client import SubstrateClient
+from substrate.client import SubstrateClient
 
 
 # ----------------------------------------------------------------------
@@ -218,7 +218,7 @@ async def test_pump_propagates_no_validator_reachable():
     `_subscribe_heads` relies on seeing the exhausted-failover signal
     to shut the controller down — without this, the controller would
     wait on a dead subscription forever."""
-    from shared.substrate_client import NoValidatorReachable, ValidatorAttempt
+    from substrate.client import NoValidatorReachable, ValidatorAttempt
 
     head_hashes = ["0x" + ("aa" * 32)]
     stop = threading.Event()

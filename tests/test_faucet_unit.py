@@ -80,9 +80,9 @@ def test_hybrid_terminal_failures_covers_all_dead_states():
 
 def test_hybrid_terminal_failures_matches_shared():
     """Pin the faucet's inline copy against the canonical version in
-    `shared.substrate_client`. Drift between the two would re-introduce
+    `substrate.client`. Drift between the two would re-introduce
     exactly the bug class MR !82 + !83 cleaned up."""
-    from shared.substrate_client import _HYBRID_TERMINAL_FAILURES as shared_set
+    from substrate.client import _HYBRID_TERMINAL_FAILURES as shared_set
     assert faucet_bot._HYBRID_TERMINAL_FAILURES == shared_set
 
 

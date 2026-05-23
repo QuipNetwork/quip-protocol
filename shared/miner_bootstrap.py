@@ -49,7 +49,7 @@ from shared.allowed_value_spec import (
 from shared.hybrid_signer import HybridSigner
 from shared.keystore_hybrid import HybridKeystoreFile, load_or_generate
 from shared.logging_config import get_logger
-from shared.substrate_client import SubstrateClient
+from substrate.client import SubstrateClient
 from substrate.types import SubstrateDifficulty
 
 

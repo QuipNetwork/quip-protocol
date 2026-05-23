@@ -8,7 +8,7 @@ return None when it cannot locate the target extrinsic in the block.
 """
 from __future__ import annotations
 
-from shared.substrate_client import _fetch_extrinsic_dispatch_error
+from substrate.client import _fetch_extrinsic_dispatch_error
 
 
 # ----------------------------------------------------------------------

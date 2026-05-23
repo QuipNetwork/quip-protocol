@@ -352,7 +352,7 @@ def test_guard_b_validators_unreachable_renders_attempt_log(monkeypatch, tmp_pat
     """All validators refuse → `validators-unreachable urls=... reasons=...`."""
     # Stub: a real keystore file so Guard A passes, then a SubstrateClient
     # whose connect() raises NoValidatorReachable so Guard B fires.
-    from shared.substrate_client import NoValidatorReachable, ValidatorAttempt
+    from substrate.client import NoValidatorReachable, ValidatorAttempt
 
     fake_keystore_path = tmp_path / "signing.json"
     fake_keystore_path.write_text("{}")  # contents unused — _load is stubbed

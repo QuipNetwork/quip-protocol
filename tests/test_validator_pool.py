@@ -20,8 +20,8 @@ import asyncio
 
 import pytest
 
-from shared import substrate_client as sc_module
-from shared.substrate_client import NoValidatorReachable, SubstrateClient
+from substrate import client as sc_module
+from substrate.client import NoValidatorReachable, SubstrateClient
 from shared.validator_pool import ValidatorPool
 
 

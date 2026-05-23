@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import faucet_bot  # noqa: E402
 
 from shared.signer import Sr25519Signer  # noqa: E402
-from shared.substrate_client import SubstrateClient  # noqa: E402
+from substrate.client import SubstrateClient  # noqa: E402
 from substrateinterface import SubstrateInterface  # noqa: E402
 
 

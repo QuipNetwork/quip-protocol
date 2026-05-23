@@ -20,7 +20,7 @@ from shared.miner_bootstrap import (
     DEFAULT_SEED_DIFFICULTY,
     _maybe_seed_chain,
 )
-from shared.substrate_client import SubstrateClient
+from substrate.client import SubstrateClient
 from shared.substrate_miner_controller import (
     ControllerStats,
     SubstrateMinerController,

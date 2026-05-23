@@ -64,7 +64,7 @@ from shared.mempool_types import (
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from shared.signer import Signer
-from shared.substrate_client import NoValidatorReachable, SubstrateClient
+from substrate.client import NoValidatorReachable, SubstrateClient
 from shared.topology_hash import topology_hash
 from shared.validator_pool import ValidatorPool
 

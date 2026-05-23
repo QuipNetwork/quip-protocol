@@ -47,7 +47,7 @@ from shared.version import get_version
 if TYPE_CHECKING:
     from shared.miner_core import MinerCore
     from shared.signer import Signer
-    from shared.substrate_client import SubstrateClient
+    from substrate.client import SubstrateClient
     from shared.substrate_miner_controller import SubstrateMinerController
 
 

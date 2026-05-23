@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from shared.substrate_client import (
+from substrate.client import (
     _decode_difficulty_config,
     _decode_winning_solution_with_nonce,
 )

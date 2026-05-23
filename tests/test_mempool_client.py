@@ -29,7 +29,7 @@ from shared.mempool_types import (
     RewardResolution,
 )
 from shared.miner_bootstrap import _resolve_dev_signer
-from shared.substrate_client import SubstrateClient
+from substrate.client import SubstrateClient
 
 
 DEFAULT_URL = os.environ.get("QUIP_SUBSTRATE_URL", "ws://localhost:9944")

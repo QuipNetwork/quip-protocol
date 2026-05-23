@@ -28,7 +28,7 @@ import asyncio
 from typing import Mapping, Optional, Sequence
 
 from shared.logging_config import get_logger
-from shared.substrate_client import SubstrateClient
+from substrate.client import SubstrateClient
 
 
 logger = get_logger("validator_pool")
