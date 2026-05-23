@@ -50,7 +50,7 @@ from shared.hybrid_signer import HybridSigner
 from shared.keystore_hybrid import HybridKeystoreFile, load_or_generate
 from shared.logging_config import get_logger
 from shared.substrate_client import SubstrateClient
-from shared.substrate_types import SubstrateDifficulty
+from substrate.types import SubstrateDifficulty
 
 
 # Default puzzle parameters seeded by `--seed-chain` on dev nodes. Mirror

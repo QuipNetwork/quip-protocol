@@ -22,7 +22,7 @@ from shared.substrate_submitter import (
     _normalize_spins,
     encode_quantum_proof,
 )
-from shared.substrate_types import (
+from substrate.types import (
     SubstrateDifficulty,
     SubstrateMiningContext,
 )

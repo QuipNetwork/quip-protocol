@@ -26,7 +26,7 @@ from shared.mempool_types import MempoolJobContext
 from shared.miner_types import BlockRequirements, IsingSample, MiningResult, Sampler
 from shared.mining_attempt_log import AttemptLogger
 from shared.quantum_proof_of_work import evaluate_sampleset
-from shared.substrate_types import SubstrateMiningContext
+from substrate.types import SubstrateMiningContext
 from shared.work_context import (
     WorkContext,
     fresh_salt,

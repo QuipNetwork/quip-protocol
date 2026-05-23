@@ -26,7 +26,7 @@ from shared.difficulty_decay import (
     apply_decay,
     current_difficulty,
 )
-from shared.substrate_types import SubstrateDifficulty
+from substrate.types import SubstrateDifficulty
 
 
 # ----------------------------------------------------------------------

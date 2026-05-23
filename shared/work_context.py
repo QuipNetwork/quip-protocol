@@ -30,7 +30,7 @@ from typing import Dict, Tuple, Union
 from shared.mempool_types import MempoolJobContext
 from shared.miner_types import BlockRequirements
 from shared.quantum_proof_of_work import derive_nonce, generate_ising_model_from_nonce
-from shared.substrate_types import SubstrateMiningContext
+from substrate.types import SubstrateMiningContext
 
 
 WorkContext = Union[SubstrateMiningContext, MempoolJobContext]

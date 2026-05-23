@@ -15,7 +15,7 @@ from shared.allowed_value_spec import (
     AllowedValueSet,
 )
 from shared.substrate_client import SubstrateClient, _decode_mining_snapshot
-from shared.substrate_types import SubstrateDifficulty
+from substrate.types import SubstrateDifficulty
 
 
 def _encode_set(values: list[int]) -> bytes:

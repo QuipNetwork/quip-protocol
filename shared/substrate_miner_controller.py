@@ -51,7 +51,7 @@ from shared.substrate_client import NoValidatorReachable, SubstrateClient
 from shared.mining_attempt_log import SubmissionLogger
 from shared.substrate_submitter import encode_quantum_proof, submit_proof
 from shared.validator_pool import ValidatorPool
-from shared.substrate_types import (
+from substrate.types import (
     ExtrinsicReceipt,
     SubstrateMiningContext,
 )

@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from shared.substrate_types import SubstrateDifficulty
+from substrate.types import SubstrateDifficulty
 
 
 # Mirrors `pallets/quantum-pow/src/difficulty.rs`.

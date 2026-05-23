@@ -17,7 +17,7 @@ import pytest
 from click.testing import CliRunner
 
 from shared.keystore_hybrid import generate
-from shared.substrate_types import ExtrinsicReceipt
+from substrate.types import ExtrinsicReceipt
 
 
 def _keystore(tmp_path: Path) -> Path:

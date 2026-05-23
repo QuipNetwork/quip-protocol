@@ -333,7 +333,7 @@ class MempoolSolverInfo:
     """Storage-side `SolverInfo` for a registered solver.
 
     Named with the `Mempool` prefix to avoid colliding with `MinerInfo`
-    from `shared.substrate_types` (which describes a PoW miner).
+    from `substrate.types` (which describes a PoW miner).
     """
 
     account: bytes

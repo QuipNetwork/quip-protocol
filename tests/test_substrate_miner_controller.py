@@ -47,7 +47,7 @@ from shared.substrate_miner_controller import (
     classify_submission,
 )
 from shared.allowed_value_spec import AllowedValueSet
-from shared.substrate_types import (
+from substrate.types import (
     ExtrinsicReceipt,
     SubstrateDifficulty,
     SubstrateMiningContext,
@@ -1141,7 +1141,7 @@ async def test_active_refresh_debounces_overlapping_calls():
 
 
 async def test_verify_proof_recorded_match_returns_true():
-    from shared.substrate_types import (
+    from substrate.types import (
         WinningSolution,
         WinningSolutionWithNonce,
     )
@@ -1174,7 +1174,7 @@ async def test_verify_proof_recorded_match_returns_true():
 
 
 async def test_verify_proof_recorded_mismatch_returns_false():
-    from shared.substrate_types import (
+    from substrate.types import (
         WinningSolution,
         WinningSolutionWithNonce,
     )

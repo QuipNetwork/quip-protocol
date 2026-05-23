@@ -17,7 +17,7 @@ from shared.substrate_client import (
     _decode_difficulty_config,
     _decode_winning_solution_with_nonce,
 )
-from shared.substrate_types import (
+from substrate.types import (
     SubstrateDifficulty,
     WinningSolution,
     WinningSolutionWithNonce,

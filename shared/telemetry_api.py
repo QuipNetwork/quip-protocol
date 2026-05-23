@@ -535,7 +535,7 @@ def _parse_block_number(request: web.Request):
 
 
 def _miner_info_dict(info) -> dict:
-    """Map `shared.substrate_types.MinerInfo` → JSON-safe dict."""
+    """Map `substrate.types.MinerInfo` → JSON-safe dict."""
     return {
         "registered_at": info.registered_at,
         "deposit": info.deposit,

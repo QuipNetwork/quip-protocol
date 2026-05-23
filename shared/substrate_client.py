@@ -74,7 +74,7 @@ from shared.mempool_types import (
     RewardResolution,
 )
 from shared.signer import Signer
-from shared.substrate_types import (
+from substrate.types import (
     ExtrinsicReceipt,
     MinerInfo,
     PowConstants,

@@ -21,7 +21,7 @@ from shared.miner_types import MiningResult
 from shared.packed_solution import pack_solution
 from shared.signer import Signer
 from shared.substrate_client import SubstrateClient
-from shared.substrate_types import ExtrinsicReceipt, SubstrateMiningContext
+from substrate.types import ExtrinsicReceipt, SubstrateMiningContext
 
 
 logger = get_logger("substrate_submitter")
