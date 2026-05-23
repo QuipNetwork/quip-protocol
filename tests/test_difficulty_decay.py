@@ -1,4 +1,4 @@
-"""Parity tests for ``shared.difficulty_decay`` against the Rust impl.
+"""Parity tests for ``substrate.difficulty_decay`` against the Rust impl.
 
 The Rust source of truth lives at
 ``pallets/quantum-pow/src/difficulty.rs``; structural invariants are
@@ -17,7 +17,7 @@ import math
 
 import pytest
 
-from shared.difficulty_decay import (
+from substrate.difficulty_decay import (
     DECAY_RATE_MILLI,
     MIN_DECAY_DELTA_MILLI,
     Direction,
