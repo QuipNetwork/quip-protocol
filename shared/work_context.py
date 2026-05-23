@@ -40,12 +40,17 @@ class WorkContext(Protocol):
         ...
 
 
-def resolve_ising(context, salt, nodes, edges):
+def resolve_ising(
+    context: WorkContext,
+    salt: bytes,
+    nodes: Sequence[int],
+    edges: Sequence[Tuple[int, int]],
+) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float], int]:
     """Delegate to the context's own `resolve_ising`. Kept for call-site stability."""
     return context.resolve_ising(salt, nodes, edges)
 
 
-def requirements_from_context(context) -> BlockRequirements:
+def requirements_from_context(context: WorkContext) -> BlockRequirements:
     """Delegate to the context's own `requirements`. Kept for call-site stability."""
     return context.requirements()
 
