@@ -109,12 +109,15 @@ async def test_writer_atomic_write_no_partial_files(tmp_path: Path):
 
     async def reader_loop():
         """Read the snapshot many times concurrently with writer; never see partial JSON."""
+        reads_succeeded = 0
         for _ in range(50):
             data = read_snapshot(snapshot_path)
             if data is not None:
                 # If we got data, it must be the full payload.
                 assert len(data["big_list"]) == 1000
+                reads_succeeded += 1
             await asyncio.sleep(0.001)
+        assert reads_succeeded > 0, "writer never produced a readable snapshot"
         shutdown_event.set()
 
     await asyncio.gather(writer.run(shutdown_event), reader_loop())
