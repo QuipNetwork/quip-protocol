@@ -103,3 +103,12 @@ def test_advance_after_failure_with_wrong_url_is_a_noop_on_state():
     # We still advance from current to the next URL.
     result = fo.advance_after_failure("http://b")  # not the current one
     assert result == "http://b"  # we've advanced from a→b
+
+
+def test_duplicate_urls_are_deduplicated():
+    """Duplicates would defeat set-membership all-down detection; constructor strips them."""
+    fo = SubstrateUrlFailover(["http://a", "http://a", "http://b"])
+    assert fo.current() == "http://a"
+    assert fo.advance_after_failure("http://a") == "http://b"
+    with pytest.raises(AllUrlsDown):
+        fo.advance_after_failure("http://b")

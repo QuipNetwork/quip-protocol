@@ -13,7 +13,7 @@ Contract:
       the caller should wait before retrying.
     * `reset_after_backoff()` is called by the caller after sleeping
       the backoff; clears the bad set so a new cycle can begin.
-    * `confirm_success(url)` is called after any successful RPC; resets
+    * `confirm_success()` is called after any successful RPC; resets
       both the bad set and the backoff schedule.
 """
 from __future__ import annotations
@@ -54,7 +54,9 @@ class SubstrateUrlFailover:
     ) -> None:
         if not urls:
             raise ValueError("SubstrateUrlFailover requires at least one URL")
-        self._urls = list(urls)
+        # Deduplicate while preserving order; duplicates would prevent the
+        # all-down detection (set-membership) from firing.
+        self._urls = list(dict.fromkeys(urls))
         self._idx = 0
         self._bad: set[str] = set()
         self._initial_backoff_s = float(initial_backoff_s)
