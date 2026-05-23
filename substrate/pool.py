@@ -31,10 +31,13 @@ logger = logging.getLogger(__name__)
 
 # Errors that indicate the connection to the validator is broken, not
 # that the chain returned a bad result. The pool swaps on these.
+# ``ConnectionError`` already covers BrokenPipeError, ConnectionResetError,
+# and ConnectionAbortedError. We intentionally do NOT catch generic
+# ``OSError`` here — that would treat FileNotFoundError, PermissionError,
+# etc. as connection failures and trigger spurious swaps.
 _CONNECTION_ERRORS: tuple[type[BaseException], ...] = (
     ConnectionError,
     TimeoutError,
-    OSError,
     # WebSocketException and substrate-interface's own connection errors
     # will be added here when wiring against the real client.
 )
