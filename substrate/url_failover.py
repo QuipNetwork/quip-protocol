@@ -18,7 +18,10 @@ Contract:
 """
 from __future__ import annotations
 
+import logging
 from typing import Sequence
+
+logger = logging.getLogger(__name__)
 
 
 class AllUrlsDown(Exception):
@@ -72,10 +75,16 @@ class SubstrateUrlFailover:
         (still advances from current to next) to avoid skipping URLs
         on caller races.
         """
+        if failed_url != self._urls[self._idx]:
+            logger.warning(
+                "advance_after_failure called with %s but current URL is %s; "
+                "advancing from current anyway",
+                failed_url, self._urls[self._idx],
+            )
         self._bad.add(self._urls[self._idx])
         self._idx = (self._idx + 1) % len(self._urls)
 
-        if self._urls[self._idx] in self._bad and self._bad.issuperset(self._urls):
+        if self._bad.issuperset(self._urls):
             backoff = self._next_backoff_s
             self._next_backoff_s = min(self._next_backoff_s * 2.0, self._max_backoff_s)
             raise AllUrlsDown(backoff)
@@ -86,7 +95,7 @@ class SubstrateUrlFailover:
         """Clear the bad set after the caller has slept the backoff."""
         self._bad.clear()
 
-    def confirm_success(self, url: str) -> None:
-        """A successful RPC against `url`. Reset bad set and backoff schedule."""
+    def confirm_success(self) -> None:
+        """Note a successful RPC. Reset bad set and backoff schedule."""
         self._bad.clear()
         self._next_backoff_s = self._initial_backoff_s

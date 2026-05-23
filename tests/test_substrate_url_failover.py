@@ -76,7 +76,7 @@ def test_confirm_success_resets_backoff_and_bad_set():
         fo.advance_after_failure("http://b")
     except AllUrlsDown:
         fo.reset_after_backoff()
-    fo.confirm_success(fo.current())
+    fo.confirm_success()
     # Should be able to fail-rotate from start again
     next_url = fo.advance_after_failure(fo.current())
     assert next_url in ("http://a", "http://b")
