@@ -6,6 +6,7 @@ invokes the named method on its SubstrateClient, and puts the result
 """
 from __future__ import annotations
 
+import asyncio
 import multiprocessing as mp
 import time
 
@@ -40,6 +41,14 @@ class _FakeClient:
 
     def close(self):
         pass
+
+
+class _SlowHeadClient(_FakeClient):
+    """Fake client whose get_head sleeps long enough for shutdown to beat it."""
+
+    def get_head(self):
+        time.sleep(2.0)
+        return b"\x00" * 32
 
 
 class _BadExcClient:
@@ -206,3 +215,73 @@ def test_validator_handle_unpicklable_exception_does_not_hang_parent():
         if proc.is_alive():
             proc.terminate()
             proc.join()
+
+
+@pytest.mark.asyncio
+async def test_handle_send_returns_result(monkeypatch):
+    """`await handle.send("get_head", {})` returns the child's result."""
+    handle = ValidatorHandle(
+        url="http://test",
+        client_factory=_FakeClient,  # test seam wired through ValidatorHandle
+    )
+    handle.start()
+    try:
+        result = await handle.send("get_head", {})
+        assert result == b"\xab" * 32
+    finally:
+        await handle.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_handle_send_raises_on_exception():
+    """If the child raises, `await handle.send(...)` re-raises the same exception type."""
+    handle = ValidatorHandle(
+        url="http://test",
+        client_factory=_FakeClient,
+    )
+    handle.start()
+    try:
+        with pytest.raises(RuntimeError, match="simulated failure"):
+            await handle.send("query_difficulty", {})
+    finally:
+        await handle.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_handle_concurrent_sends_resolve_independently():
+    """Two concurrent send() calls each get the right response."""
+    handle = ValidatorHandle(
+        url="http://test",
+        client_factory=_FakeClient,
+    )
+    handle.start()
+    try:
+        results = await asyncio.gather(
+            handle.send("get_head", {}),
+            handle.send("get_block_number", {}),
+        )
+        assert results[0] == b"\xab" * 32
+        assert results[1] == 42
+    finally:
+        await handle.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_handle_shutdown_cancels_inflight_futures():
+    """Shutting the handle cancels all in-flight Futures with ValidatorSwapped."""
+    from substrate.validator_handle import ValidatorSwapped
+
+    handle = ValidatorHandle(
+        url="http://test",
+        client_factory=_SlowHeadClient,
+    )
+    handle.start()
+    try:
+        inflight = asyncio.create_task(handle.send("get_head", {}))
+        await asyncio.sleep(0.05)  # let request reach child
+        await handle.shutdown()
+        with pytest.raises(ValidatorSwapped):
+            await inflight
+    finally:
+        if not handle.is_shutdown:
+            await handle.shutdown()

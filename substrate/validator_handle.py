@@ -131,11 +131,122 @@ def validator_main(
         logger.info("validator_main exiting: url=%s", url)
 
 
-class ValidatorHandle:
-    """Parent-side proxy for a validator child process.
+class ValidatorSwapped(Exception):
+    """In-flight RPC was cancelled because the handle is being shut down or swapped."""
 
-    Spawns a child running `validator_main`, tracks in-flight Futures by
-    `request_id`, and exposes an async send-receive API for `ValidatorPool`.
+
+class ValidatorHandle:
+    """Parent-side proxy for one validator child process.
+
+    Args:
+        url: Validator URL the child will connect to.
+        client_factory: Optional test seam; passed to `validator_main`.
+        rpc_call_timeout_s: Per-RPC timeout (forwarded to child).
+        req_q_size: Bound on the request queue. Default 64.
     """
 
-    pass
+    def __init__(
+        self,
+        url: str,
+        *,
+        client_factory: Optional[Callable[[str], Any]] = None,
+        rpc_call_timeout_s: float = 10.0,
+        req_q_size: int = 64,
+    ) -> None:
+        self.url = url
+        self._client_factory = client_factory
+        self._rpc_call_timeout_s = rpc_call_timeout_s
+        self._req_q: mp.Queue = mp.Queue(maxsize=req_q_size)
+        self._resp_q: mp.Queue = mp.Queue()
+        self._shutdown_event = mp.Event()
+        self._proc: Optional[mp.Process] = None
+        self._next_request_id = 1
+        self._inflight: dict[int, asyncio.Future] = {}
+        self._drainer_task: Optional[asyncio.Task] = None
+        self.is_shutdown = False
+
+    def start(self) -> None:
+        """Spawn the child process and start the response drainer."""
+        self._proc = mp.Process(
+            target=validator_main,
+            args=(
+                self.url,
+                self._req_q,
+                self._resp_q,
+                self._shutdown_event,
+                self._rpc_call_timeout_s,
+                self._client_factory,
+            ),
+        )
+        self._proc.start()
+        loop = asyncio.get_running_loop()
+        self._drainer_task = loop.create_task(self._drain_responses(loop))
+
+    async def send(self, op: str, args: dict[str, Any]) -> Any:
+        """Send an RPC request to the child and await the response.
+
+        Raises:
+            ValidatorSwapped: if `shutdown()` is called while this
+                request is in flight.
+            Anything the underlying client method raised.
+        """
+        if self.is_shutdown:
+            raise ValidatorSwapped(f"handle for {self.url} is already shut down")
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._inflight[request_id] = fut
+        await loop.run_in_executor(
+            None,
+            self._req_q.put,
+            RpcRequest(request_id=request_id, op=op, args=args),
+        )
+        return await fut
+
+    async def shutdown(self) -> None:
+        """Signal shutdown, cancel in-flight Futures, await child exit."""
+        if self.is_shutdown:
+            return
+        self.is_shutdown = True
+        self._shutdown_event.set()
+        # Cancel every in-flight future with ValidatorSwapped.
+        for fut in list(self._inflight.values()):
+            if not fut.done():
+                fut.set_exception(ValidatorSwapped(f"handle for {self.url} shutting down"))
+        self._inflight.clear()
+        # Wait for child exit (with timeout).
+        if self._proc is not None:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._proc.join, 5.0)
+            if self._proc.is_alive():
+                logger.warning("ValidatorHandle %s: child did not exit; terminating", self.url)
+                self._proc.terminate()
+                await loop.run_in_executor(None, self._proc.join, 2.0)
+        if self._drainer_task is not None:
+            self._drainer_task.cancel()
+            try:
+                await self._drainer_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _drain_responses(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Pull `RpcResponse`s off resp_q and resolve matching Futures."""
+        while not self.is_shutdown:
+            try:
+                resp = await loop.run_in_executor(None, self._resp_q.get, True, 0.5)
+            except Exception:
+                # queue.Empty after timeout; loop.
+                continue
+            if not isinstance(resp, RpcResponse):
+                logger.warning("ValidatorHandle %s: ignoring non-RpcResponse: %r", self.url, resp)
+                continue
+            fut = self._inflight.pop(resp.request_id, None)
+            if fut is None:
+                continue  # response for an already-cancelled request
+            if fut.done():
+                continue
+            if resp.exception is not None:
+                fut.set_exception(resp.exception)
+            else:
+                fut.set_result(resp.result)
