@@ -204,3 +204,38 @@ async def test_event_manager_supports_async_callbacks():
     await task
     assert len(received) == 1
     assert received[0]["head_number"] == 10
+
+
+@pytest.mark.asyncio
+async def test_event_manager_force_swap_timeout_does_not_disable_watchdog():
+    """If pool.force_swap() hangs, the watchdog still re-arms via timeout."""
+
+    class _HangingSwapPool(_FakePool):
+        async def force_swap(self) -> None:
+            self.force_swap_calls += 1
+            # hang forever — but the event manager must time us out
+            await asyncio.sleep(3600)
+
+    pool = _HangingSwapPool()
+    pool.script(_snap(10))  # only one snapshot, then idle
+    em = ChainEventManager(
+        pool=pool,
+        state_key=_state_key,
+        snapshot_op="get_mining_snapshot",
+        snapshot_args={},
+        blocktime_s=0.01,
+        settled_poll_pct=0.5,
+        catch_up_poll_pct=0.1,
+        stale_blocktime_multiplier=1.0,
+        dead_blocktime_multiplier=3.0,  # 3 × 0.01s = 0.03s dead threshold
+    )
+    em.subscribe("new_head", lambda p: None)
+    task = asyncio.create_task(em.run())
+    # Let the watchdog fire multiple times — if force_swap hung the watchdog
+    # would only count once. With timeout-re-arming, expect multiple swap attempts.
+    await asyncio.sleep(0.25)
+    em.request_shutdown()
+    await task
+    # Without the timeout, force_swap_calls would be 1 (stuck). With timeout
+    # re-arming, we expect ≥ 2 attempts within 0.25s / (0.03s dead threshold).
+    assert pool.force_swap_calls >= 2

@@ -118,9 +118,11 @@ class ChainEventManager:
                     logger.warning("event manager: event_q full; dropping oldest")
                     try:
                         self._event_q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                    self._event_q.put_nowait(("new_head", payload))
+                        self._event_q.put_nowait(("new_head", payload))
+                    except (asyncio.QueueEmpty, asyncio.QueueFull):
+                        logger.warning(
+                            "event manager: could not recover from full queue; dropping event"
+                        )
 
             # Watchdog
             elapsed_since_change = now - self._last_change_at
@@ -131,7 +133,12 @@ class ChainEventManager:
                 )
                 self._force_swap_inflight = True
                 try:
-                    await self._pool.force_swap()
+                    await asyncio.wait_for(self._pool.force_swap(), timeout=self._dead_s)
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "event manager: force_swap exceeded %.2fs timeout; will retry next watchdog tick",
+                        self._dead_s,
+                    )
                 finally:
                     self._force_swap_inflight = False
                 # Reset baseline so we don't immediately force_swap again
