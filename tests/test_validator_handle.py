@@ -299,3 +299,64 @@ async def test_handle_send_after_shutdown_raises_validator_swapped():
     await handle.shutdown()
     with pytest.raises(ValidatorSwapped):
         await handle.send("get_head", {})
+
+
+# ---------------------------------------------------------------------------
+# Async client support — child must drive coroutines on its persistent loop.
+# ---------------------------------------------------------------------------
+
+
+class _AsyncClient:
+    """Fake SubstrateClient with async methods and async connect/close."""
+
+    def __init__(self, url):
+        self.url = url
+        self.connected = False
+
+    async def connect(self):
+        await asyncio.sleep(0)  # yield to prove the loop is real
+        self.connected = True
+
+    async def get_head(self):
+        if not self.connected:
+            raise RuntimeError("child did not call connect() at startup")
+        return b"\xcd" * 32
+
+    async def get_block_number(self, at=None):
+        return 99
+
+    async def query_failure(self):
+        raise RuntimeError("async simulated failure")
+
+    async def close(self):
+        self.connected = False
+
+
+@pytest.mark.asyncio
+async def test_handle_with_async_client_returns_awaited_result():
+    """Child drives async client methods to completion and returns the value."""
+    handle = ValidatorHandle(
+        url="http://async-test",
+        client_factory=_AsyncClient,
+    )
+    handle.start()
+    try:
+        result = await handle.send("get_head", {})
+        assert result == b"\xcd" * 32
+    finally:
+        await handle.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_handle_with_async_client_propagates_exception():
+    """Exceptions raised inside an awaited coroutine surface to the parent."""
+    handle = ValidatorHandle(
+        url="http://async-test",
+        client_factory=_AsyncClient,
+    )
+    handle.start()
+    try:
+        with pytest.raises(RuntimeError, match="async simulated failure"):
+            await handle.send("query_failure", {})
+    finally:
+        await handle.shutdown()

@@ -12,6 +12,7 @@ serialized by `mp.Queue` and re-raised in the parent.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import multiprocessing as mp
 import multiprocessing.synchronize
@@ -91,6 +92,27 @@ def validator_main(
     else:
         client = _client_factory(url)
 
+    # SubstrateClient methods are async, so the child owns a persistent
+    # asyncio event loop. The loop also persists the client's WS/HTTP
+    # connection across RPC calls (creating a fresh loop per call would
+    # tear down the connection each time).
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # If the client exposes an async ``connect()``, drive it once at
+    # startup so the first RPC doesn't pay the connect cost. Sync clients
+    # (test fakes) skip this branch.
+    connect = getattr(client, "connect", None)
+    if callable(connect):
+        try:
+            maybe_coro = connect()
+            if inspect.iscoroutine(maybe_coro):
+                loop.run_until_complete(maybe_coro)
+        except Exception:
+            logger.exception("validator_main: client.connect() failed; child exiting")
+            loop.close()
+            return
+
     logger.info("validator_main started: url=%s pid=%d", url, mp.current_process().pid)
     try:
         while not shutdown_event.is_set():
@@ -107,6 +129,13 @@ def validator_main(
             try:
                 method = getattr(client, req.op)
                 result = method(**req.args)
+                # If the method is async, drive its coroutine to completion
+                # on the child's persistent loop. Bound the await with the
+                # per-call timeout so a hung RPC doesn't stall the child.
+                if inspect.iscoroutine(result):
+                    result = loop.run_until_complete(
+                        asyncio.wait_for(result, timeout=rpc_call_timeout_s)
+                    )
             except BaseException as exc:  # noqa: BLE001
                 # Eagerly test picklability: mp.Queue serialises in a background
                 # thread, so a try/except around put() won't catch the error.
@@ -125,9 +154,14 @@ def validator_main(
                 resp_q.put(RpcResponse(request_id=req.request_id, result=result))
     finally:
         try:
-            client.close()
+            close = getattr(client, "close", None)
+            if callable(close):
+                close_result = close()
+                if inspect.iscoroutine(close_result):
+                    loop.run_until_complete(close_result)
         except Exception:
             logger.exception("validator_main: client.close() raised during shutdown")
+        loop.close()
         logger.info("validator_main exiting: url=%s", url)
 
 
