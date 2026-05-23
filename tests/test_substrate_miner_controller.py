@@ -986,6 +986,54 @@ async def test_handle_head_same_work_key_no_cancel():
     assert controller._highest_handled_block == 101
 
 
+async def test_handle_head_same_work_key_all_idle_redispatches():
+    """Regression: when every handle is idle and a same-key head arrives,
+    the controller must re-dispatch — not short-circuit. Without this
+    defense-in-depth, any `_handle_result` path that returns without
+    closing the work key (verify-mismatch, RPC submit error, etc.)
+    leaves the worker idle while `_current_work_key` is still set, and
+    every subsequent head with the same `last_proof_block_hash` falls
+    into the same-key branch and skips dispatch. Result: the miner
+    silently stops until someone else rolls the round."""
+    controller = _bare_controller()
+    ctx = _context(b"\x10" * 32)
+    controller.client.get_mining_snapshot = AsyncMock(return_value=ctx)
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    handle = MagicMock()
+    handle.miner_id = "h1"
+    handle._active_dispatch_id = 0
+    handle.stop_event = MagicMock()
+    handle.stop_event.is_set = MagicMock(return_value=False)
+    handle.mine_work_item = MagicMock(return_value=1)
+    handle.cancel = MagicMock()
+    controller.miner_handles = [handle]
+    controller._dispatch_contexts = {}
+    controller._done_queues = {"h1": asyncio.Queue()}
+
+    # First head: fresh work key → dispatch.
+    await controller._handle_head(b"\xff" * 32, 100)
+    assert handle.mine_work_item.call_count == 1
+    handle._active_dispatch_id = 1
+
+    # Simulate the failure mode: mining finished, drainer cleared
+    # _active_dispatch_id, but _handle_result returned without closing
+    # the work key (e.g., verify mismatch path) — so _current_work_key
+    # is still set and every handle is idle.
+    handle._active_dispatch_id = 0
+
+    # Second head with same snapshot: must re-dispatch, NOT short-circuit.
+    await controller._handle_head(b"\xff" * 32, 101)
+    assert handle.mine_work_item.call_count == 2, (
+        "expected redispatch when same-key head arrives with all handles idle"
+    )
+    # Cancel must NOT have been called (nothing to cancel).
+    handle.cancel.assert_not_called()
+    # Counter NOT bumped — this isn't a normal short-circuit, it's a
+    # backstop that recovered from a deadlock condition.
+    assert controller.stats.heads_same_key_skipped == 0
+    assert controller._highest_handled_block == 101
+
+
 async def test_handle_head_different_work_key_does_cancel():
     """When the snapshot returns a NEW work key, the controller must
     cancel any in-flight dispatch on the prior key and start fresh."""

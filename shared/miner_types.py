@@ -78,6 +78,17 @@ class MiningResult:
     node_list: List[int]
     edge_list: List[Tuple[int, int]]
     variable_order: Optional[List[int]] = None
+    # Independently-recomputed energy of the WORST submitted solution
+    # (least negative among the diverse-selected set), in the same float
+    # units as ``energy``. The chain's ``validate_proof`` filters each
+    # submitted solution with strict ``energy < max_energy_milli`` before
+    # checking ``valid_solution_count >= min_solutions``, so the submission
+    # passes only when every solution clears — i.e. when this floor is
+    # below the chain threshold. ``energy`` (best of the set) is kept for
+    # ratchet/display purposes and is unsafe to gate submission on.
+    # ``None`` means the worst-case wasn't recomputed; fall back to
+    # ``energy`` (legacy behavior) at the cost of possible chain rejection.
+    submit_floor_energy: Optional[float] = None
 
 
 @dataclass

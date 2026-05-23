@@ -600,3 +600,83 @@ def test_miner_handle_error_sentinel_on_missing_context():
         if handle.proc.is_alive():
             handle.proc.terminate()
             handle.proc.join(timeout=2)
+
+
+# ----------------------------------------------------------------------
+# submit_floor_energy parity — chain rejects on the WORST selected
+# solution, not the best. evaluate_sampleset must surface the worst-case
+# so the substrate submit gate doesn't ship a proof the chain will reject.
+# ----------------------------------------------------------------------
+
+
+def test_evaluate_sampleset_submit_floor_is_worst_recomputed_energy():
+    """``submit_floor_energy`` must be the MAX (least negative) of the
+    independently-recomputed Ising energies for the diverse-selected
+    solutions — not the sampler-reported value and not the BEST.
+
+    Motivation: the chain re-derives each submitted solution's energy
+    via ``energy_of_solution`` (i64 milli) and filters with strict
+    ``< max_energy_milli`` before checking
+    ``valid_solution_count >= min_solutions``. Sampler-reported energies
+    drift from chain-computed ones at the milli boundary, so submitting
+    on the headline best can ship a proof where mid-pack solutions fail
+    the chain's per-solution check and trigger
+    ``Error::InsufficientSolutions`` — observed in production at block
+    126 of the local deployment when the ratchet's threshold sat 3 milli
+    above the actual sampler ceiling.
+    """
+    import dimod
+    from shared.quantum_proof_of_work import evaluate_sampleset
+    from shared.miner_types import BlockRequirements
+
+    nodes = [0, 1, 2, 3]
+    edges = [(0, 1), (1, 2), (2, 3)]
+    # 5 distinct samples — all-ones plus four single-flips.
+    samples = [
+        [1, 1, 1, 1],
+        [1, 1, 1, -1],
+        [1, 1, -1, 1],
+        [1, -1, 1, 1],
+        [-1, 1, 1, 1],
+    ]
+    # Sampler reports a misleading flat -100 for every sample. If the
+    # floor were sourced from the sampler it would be -100 and the test
+    # would fail — pinning the recompute-is-authoritative invariant.
+    sampleset = dimod.SampleSet.from_samples(
+        samples, vartype=dimod.SPIN, energy=[-100.0] * 5,
+    )
+
+    h = {0: -1.0, 1: -1.0, 2: -1.0, 3: -1.0}
+    J = {(0, 1): -1.0, (1, 2): -1.0, (2, 3): -1.0}
+    # True Ising energies (manually verified):
+    #   [1,1,1,1]  -> -7  (all ferromagnetic, all couplers satisfied)
+    #   [1,1,1,-1] -> -3
+    #   [1,1,-1,1] -> -1
+    #   [1,-1,1,1] -> -1
+    #   [-1,1,1,1] -> -3
+    # worst = -1; best = -7.
+
+    requirements = BlockRequirements(
+        difficulty_energy=-2.0,
+        min_diversity=0.0,
+        min_solutions=5,
+        timeout_to_difficulty_adjustment_decay=10_000,
+    )
+
+    result = evaluate_sampleset(
+        sampleset, requirements, nodes, edges,
+        nonce=b"\x00" * 32, salt=b"\x00" * 32,
+        prev_timestamp=0, start_time=time.time(),
+        miner_id="test", miner_type="CPU",
+        h=h, J=J,
+        # Lenient — accept all 5, mirroring the substrate ratchet path
+        # where evaluate_sampleset is called with strict_energy=False.
+        strict_energy=False,
+    )
+
+    assert result is not None
+    assert result.submit_floor_energy == pytest.approx(-1.0), (
+        "submit_floor_energy must be the WORST recomputed energy "
+        "across the selected 5 — that's what the chain effectively "
+        f"gates against. got {result.submit_floor_energy}"
+    )

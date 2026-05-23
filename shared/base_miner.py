@@ -585,14 +585,27 @@ class BaseMiner(ABC):
                         (time.time() - postprocess_start) * 1e6,
                     )
 
-                    # Submit gate. If chain's live decayed threshold
-                    # has already eased past our best, return now —
-                    # the chain will accept it.
-                    if (
-                        stored_best is not None
-                        and int(stored_best.energy * 1000) < live_threshold_milli
-                    ):
-                        result = stored_best
+                    # Submit gate. If the chain's live decayed threshold
+                    # has already eased past the WORST of the selected
+                    # solutions, return now — the chain re-derives each
+                    # submitted solution's energy and filters with strict
+                    # ``< max_energy_milli`` before counting; gating on
+                    # ``energy`` (best of set) would let through proofs
+                    # whose mid-pack solutions get rejected, producing
+                    # ``InsufficientSolutions`` despite the headline
+                    # energy clearing. ``submit_floor_energy`` is the
+                    # chain-equivalent recompute, so it's what the gate
+                    # must compare against.
+                    if stored_best is not None:
+                        floor_energy = (
+                            stored_best.submit_floor_energy
+                            if stored_best.submit_floor_energy is not None
+                            else stored_best.energy
+                        )
+                        if int(floor_energy * 1000) < live_threshold_milli:
+                            result = stored_best
+                        else:
+                            result = None
                     else:
                         result = None
 

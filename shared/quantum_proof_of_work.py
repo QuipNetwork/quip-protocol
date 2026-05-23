@@ -819,6 +819,32 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         if diversity < min_diversity:
             raise ValueError(f"Insufficient diversity: {diversity} < {min_diversity}")
 
+        # Independently recompute energies for the SELECTED solutions and
+        # take the worst-case (max) as the submit floor. The chain's
+        # ``validate_proof`` filters each submitted solution with strict
+        # ``energy < max_energy_milli`` before checking
+        # ``valid_solution_count >= min_solutions`` (see
+        # ``pallets/quantum-pow/src/lib.rs:858``), so submission passes
+        # only when EVERY solution clears the threshold. Sampler-reported
+        # energies (``valid_energies``) can drift from chain-computed
+        # ones at the milli boundary — at the tail of a long mining
+        # round the headline best is only a few milli below the threshold
+        # while other diverse-selected solutions sit even closer, and
+        # those silently fail chain validation. The recompute uses the
+        # canonical Ising formula, matching the chain.
+        if h is None or J is None:
+            allowed_h = getattr(requirements, "allowed_h_values", DEFAULT_ALLOWED_H)
+            allowed_j = getattr(requirements, "allowed_j_values", DEFAULT_ALLOWED_J)
+            h_for_floor, J_for_floor = generate_ising_model_from_nonce(
+                nonce, nodes, edges, allowed_h=allowed_h, allowed_j=allowed_j,
+            )
+        else:
+            h_for_floor, J_for_floor = h, J
+        selected_energies = energies_for_solutions(
+            filtered_solutions, h_for_floor, J_for_floor, nodes,
+        )
+        submit_floor_energy = max(selected_energies) if selected_energies else best_energy
+
         # Create mining result for this attempt
         mining_time = time.time() - start_time
 
@@ -837,7 +863,8 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
             mining_time=int(mining_time),
             node_list=nodes,
             edge_list=edges,
-            variable_order=nodes
+            variable_order=nodes,
+            submit_floor_energy=submit_floor_energy,
         )
     except ValueError as e:
         # Use module logger for consistency

@@ -948,9 +948,32 @@ class SubstrateMinerController:
         # would truncate the attempt every ~6 s and never let SA
         # converge.
         if new_work_key == self._current_work_key:
-            self.stats.heads_same_key_skipped += 1
-            self._highest_handled_block = block_number
-            return
+            # Defense-in-depth: the short-circuit assumes a same-key head
+            # means mining is already in flight. That holds in the happy
+            # path, but any `_handle_result` early-return that leaves
+            # `_current_work_key` set without re-dispatching (verify
+            # mismatch, RPC submit error, future code paths) will trip
+            # this branch with every handle idle and silently freeze the
+            # miner until something else rolls the round. Detect that
+            # exact state and re-dispatch instead of returning. The
+            # primary verify-mismatch path re-dispatches inline (see
+            # `_handle_result`); this is the backstop for the rest.
+            all_idle = all(
+                h._active_dispatch_id == 0 for h in self.miner_handles
+            )
+            if not all_idle:
+                self.stats.heads_same_key_skipped += 1
+                self._highest_handled_block = block_number
+                return
+            logger.warning(
+                "same-key head with all handles idle (work_key=0x%s..., "
+                "head=%d) — re-dispatching same context to resume mining",
+                new_work_key[0].hex()[:16],
+                block_number,
+            )
+            # Fall through to the dispatch block below so the same code
+            # path handles redispatch. `_current_context` is still the
+            # context for this key, so the loop below will use it.
 
         # Work key changed — cancel any in-flight mining on the *prior*
         # key, then wait in parallel for each handle to ack the cancel.
@@ -1126,14 +1149,6 @@ class SubstrateMinerController:
             verified = await self._verify_proof_recorded(envelope)
             if verified is False:
                 self.stats.proofs_unverified += 1
-                logger.warning(
-                    "submit_proof receipt OK but verification failed for "
-                    "%s (extrinsic=%s block=%s); NOT closing work key — "
-                    "the round will be retried on the next head",
-                    envelope.handle_id,
-                    receipt.extrinsic_hash,
-                    receipt.block_hash,
-                )
                 self._submission_log.record(
                     solution_id=solution_id,
                     miner_id=envelope.handle_id,
@@ -1147,6 +1162,59 @@ class SubstrateMinerController:
                     chain_block_hash=receipt.block_hash,
                     error="receipt OK but proof not recorded by chain",
                 )
+                # Re-dispatch immediately on the same context. The
+                # worker is idle (mine_result drainer already cleared
+                # `_active_dispatch_id`), and waiting for the next head
+                # would deadlock: the verify-mismatch path leaves
+                # `_current_work_key` set, so every subsequent head
+                # carrying the same `last_proof_block_hash` falls into
+                # the same-key short-circuit at the top of
+                # `_handle_head` and skips dispatch. Without an active
+                # re-dispatch here, the worker sits idle until someone
+                # else wins the round and rolls `LastProofBlock`.
+                if (
+                    envelope_key == self._current_work_key
+                    and self._current_context is not None
+                ):
+                    redispatch_context = self._current_context
+                    redispatched: list[str] = []
+                    for handle in self.miner_handles:
+                        if handle._active_dispatch_id != 0:
+                            continue
+                        new_dispatch_id = handle.mine_work_item(redispatch_context)
+                        self._dispatch_contexts[
+                            (handle.miner_id, new_dispatch_id)
+                        ] = redispatch_context
+                        self._prune_dispatch_contexts(
+                            handle.miner_id, new_dispatch_id,
+                        )
+                        redispatched.append(handle.miner_id)
+                    if redispatched:
+                        self.stats.contexts_dispatched += len(redispatched)
+                    logger.warning(
+                        "submit_proof receipt OK but verification failed for "
+                        "%s (extrinsic=%s block=%s); NOT closing work key — "
+                        "re-dispatched %d handle(s) on same context: %s",
+                        envelope.handle_id,
+                        receipt.extrinsic_hash,
+                        receipt.block_hash,
+                        len(redispatched),
+                        redispatched,
+                    )
+                else:
+                    # Work key already rolled while we were verifying —
+                    # the natural head path will dispatch the new round.
+                    logger.warning(
+                        "submit_proof receipt OK but verification failed for "
+                        "%s (extrinsic=%s block=%s); work key already "
+                        "advanced (envelope_key matches=%s, current_context=%s) — "
+                        "deferring to next head",
+                        envelope.handle_id,
+                        receipt.extrinsic_hash,
+                        receipt.block_hash,
+                        envelope_key == self._current_work_key,
+                        self._current_context is not None,
+                    )
                 return
             self.stats.proofs_submitted += 1
             # Resolve the receipt's block hash → block number so the
