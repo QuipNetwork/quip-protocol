@@ -661,8 +661,10 @@ class SubstrateMinerController:
             name="quip-telemetry",
         )
         self._telemetry_proc.start()
+        # ``pid`` can be ``None`` if a test seam overrides Process.start() to
+        # a no-op; use %s so the format succeeds either way.
         logger.info(
-            "spawned telemetry sibling: pid=%d port=%d",
+            "spawned telemetry sibling: pid=%s port=%d",
             self._telemetry_proc.pid,
             self._telemetry_port,
         )
