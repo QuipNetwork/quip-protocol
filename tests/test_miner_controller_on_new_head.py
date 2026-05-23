@@ -1,16 +1,17 @@
 """Verify SubstrateMinerController exposes an on_new_head async callback.
 
-The callback receives a snapshot dict (as the event manager will deliver)
-and (in this narrow-scope commit) performs a subset of what legacy
-_handle_head does: push live_threshold_milli to each handle, dispatch
-fresh work on work-key change, short-circuit on same work key.
+The callback receives a `SubstrateMiningContext` (what `get_mining_snapshot`
+returns through the event manager) and (in this narrow-scope commit)
+performs a subset of what legacy `_handle_head` does: push
+`live_threshold_milli` to each handle, dispatch fresh work on work-key
+change, short-circuit on same work key.
 
-Cancel-on-key-change and other legacy behaviors are deferred to Task 11
-(startup wiring) before _handle_head is deleted in Task 13.
+Cancel-on-key-change and other legacy behaviors are deferred to later
+tasks before `_handle_head` is deleted.
 """
 from __future__ import annotations
 
-import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -48,16 +49,34 @@ def controller():
     ctrl._last_pushed_threshold_milli = 0
     ctrl._closed_work_keys = {}
     ctrl._highest_handled_block = 0
-    # Add anything else `on_new_head` reads from controller state.
     return ctrl, handle
+
+
+def _make_context(
+    *,
+    threshold_milli: int,
+    last_proof_block_hash: bytes = b"\x00" * 32,
+    topology_hash: bytes = b"\xab" * 32,
+) -> SimpleNamespace:
+    """Build a SubstrateMiningContext-shaped object with attribute access.
+
+    Tests use SimpleNamespace rather than the real dataclass to avoid the
+    __post_init__ validation (32-byte length checks on hash fields, etc.)
+    that's unrelated to the behavior under test.
+    """
+    return SimpleNamespace(
+        last_proof_block_hash=last_proof_block_hash,
+        topology_hash=topology_hash,
+        difficulty=SimpleNamespace(max_energy_milli=threshold_milli),
+    )
 
 
 @pytest.mark.asyncio
 async def test_on_new_head_pushes_threshold_change(controller):
-    """A snapshot with a new threshold value triggers set_live_threshold_milli on each handle."""
+    """A context with a new threshold value triggers set_live_threshold_milli on each handle."""
     ctrl, handle = controller
-    snapshot = _make_snapshot(threshold_milli=-5000, head_number=10)
-    await ctrl.on_new_head(snapshot)
+    ctx = _make_context(threshold_milli=-5000)
+    await ctrl.on_new_head(ctx)
     assert handle.threshold_pushes == [-5000]
 
 
@@ -66,52 +85,33 @@ async def test_on_new_head_does_not_push_same_threshold(controller):
     """If threshold is unchanged, no push (matches existing controller behaviour)."""
     ctrl, handle = controller
     ctrl._last_pushed_threshold_milli = -5000
-    snapshot = _make_snapshot(threshold_milli=-5000, head_number=10)
-    await ctrl.on_new_head(snapshot)
+    ctx = _make_context(threshold_milli=-5000)
+    await ctrl.on_new_head(ctx)
     assert handle.threshold_pushes == []
 
 
 @pytest.mark.asyncio
 async def test_on_new_head_dispatches_on_work_key_change(controller):
-    """A snapshot with a new (last_proof_block_hash, topology_hash) dispatches work."""
+    """A context with a new (last_proof_block_hash, topology_hash) dispatches work."""
     ctrl, handle = controller
-    snapshot = _make_snapshot(
+    ctx = _make_context(
         threshold_milli=-5000,
-        head_number=10,
         last_proof_block_hash=b"\x01" * 32,
     )
-    await ctrl.on_new_head(snapshot)
+    await ctrl.on_new_head(ctx)
     assert len(handle.dispatched_contexts) == 1
 
 
 @pytest.mark.asyncio
 async def test_on_new_head_skips_dispatch_on_same_work_key(controller):
-    """A snapshot with the same work key as currently mining does not redispatch."""
+    """A context with the same work key as currently mining does not redispatch."""
     ctrl, handle = controller
     ctrl._current_work_key = (b"\x01" * 32, b"\xab" * 32)
-    snapshot = _make_snapshot(
+    ctx = _make_context(
         threshold_milli=-5000,
-        head_number=10,
         last_proof_block_hash=b"\x01" * 32,
         topology_hash=b"\xab" * 32,
     )
     handle._active_dispatch_id = 1  # currently mining
-    await ctrl.on_new_head(snapshot)
+    await ctrl.on_new_head(ctx)
     assert handle.dispatched_contexts == []  # no new dispatch
-
-
-def _make_snapshot(
-    *,
-    threshold_milli: int,
-    head_number: int,
-    last_proof_block_hash: bytes = b"\x00" * 32,
-    topology_hash: bytes = b"\xab" * 32,
-) -> dict:
-    """Construct a snapshot payload matching what get_mining_snapshot returns."""
-    return {
-        "head_number": head_number,
-        "last_proof_block_hash": last_proof_block_hash,
-        "topology_hash": topology_hash,
-        "difficulty_milli": threshold_milli,
-        # … other fields the controller reads
-    }

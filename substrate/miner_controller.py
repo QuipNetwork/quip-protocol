@@ -689,61 +689,54 @@ class SubstrateMinerController:
     # in Task 13 once the event-manager path is the only entry.
     # -------------------------------------------------------------------------
 
-    async def on_new_head(self, snapshot: dict) -> None:
-        """Event-manager callback: a new chain snapshot has arrived.
+    async def on_new_head(self, ctx: "SubstrateMiningContext") -> None:
+        """Event-manager callback: a new chain mining context has arrived.
 
-        Receives a mining snapshot dict from ChainEventManager. Narrow
-        scope for this commit:
+        Receives the ``SubstrateMiningContext`` that
+        ``pool.send("get_mining_snapshot", ...)`` returns. Narrow scope
+        for this commit:
 
         - Push the live decayed energy threshold to each handle if it changed.
         - Dispatch fresh mining work on work-key change
-          (last_proof_block_hash, topology_hash).
+          (``last_proof_block_hash``, ``topology_hash``).
         - Short-circuit if handles are already mining the same work key.
 
         Behaviors from legacy ``_handle_head`` that are NOT yet migrated:
         cancel-on-key-change, closed-work-key handling, zero-seed guard,
         stale-block-number guard, RPC head promotion. These are wired in
-        Task 11 (startup wiring) before ``_handle_head`` is deleted in
-        Task 13. Until then, dispatching a new key while old work is still
-        running will leave the prior workers mining the old context in
-        parallel — acceptable during the transition only.
+        before ``_handle_head`` is deleted. Until then, dispatching a new
+        key while old work is still running will leave the prior workers
+        mining the old context in parallel — acceptable during the
+        transition only.
 
         Args:
-            snapshot: dict with at minimum the keys
-                ``head_number``, ``difficulty_milli``,
-                ``last_proof_block_hash``, and ``topology_hash``.
+            ctx: A ``SubstrateMiningContext`` (or duck-type with the same
+                attributes: ``last_proof_block_hash``, ``topology_hash``,
+                and ``difficulty.max_energy_milli``).
         """
-        block_number: int = snapshot["head_number"]
-        live_threshold: int = snapshot["difficulty_milli"]
-        last_proof_block_hash: bytes = snapshot["last_proof_block_hash"]
-        topology_hash: bytes = snapshot["topology_hash"]
+        live_threshold = int(ctx.difficulty.max_energy_milli)
 
-        # Push the chain's live decayed energy threshold to each handle
-        # if it has changed since the last push.
         if live_threshold != self._last_pushed_threshold_milli:
             for handle in self.miner_handles:
                 handle.set_live_threshold_milli(live_threshold)
             self._last_pushed_threshold_milli = live_threshold
 
-        new_work_key = (last_proof_block_hash, topology_hash)
+        new_work_key = (ctx.last_proof_block_hash, ctx.topology_hash)
 
         if new_work_key == self._current_work_key:
             all_idle = all(
                 h._active_dispatch_id == 0 for h in self.miner_handles
             )
             if not all_idle:
-                # Mining already in progress on the same key — skip.
                 return
             # All handles are idle on a key we've seen before; fall through
             # to re-dispatch (e.g., handles were cancelled externally).
 
-        # Dispatch fresh work to each handle.
-        # TODO Task 11: translate snapshot to SubstrateMiningContext before dispatch.
-        # TODO Task 11: call handle.cancel() on active handles before dispatch
-        # on key change (legacy _handle_head does this; omitted in the narrow
+        # TODO: call handle.cancel() on active handles before dispatch on
+        # key change (legacy _handle_head does this; omitted in the narrow
         # scope so dispatching during transition leaves old workers running).
         for handle in self.miner_handles:
-            handle.mine_work_item(snapshot)
+            handle.mine_work_item(ctx)
         self._current_work_key = new_work_key
 
     async def _handle_head(self, head_hash: bytes, block_number: int) -> None:
