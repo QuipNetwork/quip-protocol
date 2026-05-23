@@ -1,219 +1,175 @@
-"""Role-indexed validator connection pool for the quip-miner.
+"""ValidatorPool — async RPC surface with hot-active swap.
 
-`substrate-interface`'s subscribe call holds the websocket in
-receive-mode for the entire subscription lifetime, deadlocking any
-concurrent RPC on the same connection. The historical fix has been
-"every controller owns two `SubstrateClient` instances" — one for
-subscribe, one for everything else. That works but propagates the
-URL rotation across N independent state machines and makes adding a
-new role (e.g. telemetry-side reads, a Prometheus scraper) a
-multi-file refactor.
+The pool owns one active `ValidatorHandle` at a time. Every RPC call
+routes to the active handle. On a connection-class error:
+    * The active handle is shut down.
+    * The URL failover rotates to the next URL.
+    * A new handle is spawned on the next URL.
+    * Idempotent ops (`query_*`, `get_*`) auto-retry up to
+      `max_swap_retries` against the new handle.
+    * `submit_extrinsic` is NOT auto-retried — it raises
+      `ValidatorSwapped` so the caller (who has domain knowledge)
+      decides. This avoids double-submit when finality lag means the
+      original validator accepted the tx but the next one hasn't seen
+      it yet.
 
-`ValidatorPool` makes the constraint explicit: the pool owns one URL
-rotation pointer; callers ask for slots by role name (`rpc`,
-`subscribe.pow`, `subscribe.mempool`, …) and the pool lazy-constructs
-a dedicated `SubstrateClient` per role.
-
-Failover coordination is forward-only and idempotent under races:
-when a slot's `_run()` detects a websocket drop, it calls
-`pool.advance_rotation(from_url=...)`. The pool checks whether
-`from_url` matches its current pointer — if yes, advance; if no
-(another slot raced first), return the current pointer unchanged.
-This means a single dead validator triggers exactly one rotation
-event regardless of how many slots noticed.
+Non-connection errors (e.g. a `RuntimeError` from the chain RPC
+saying "no topology registered") pass through unchanged. The pool
+only swaps on connection-class failures.
 """
 from __future__ import annotations
 
 import asyncio
-from typing import Mapping, Optional, Sequence
+import logging
+from typing import Any, Callable, Optional
 
-from shared.logging_config import get_logger
-from substrate.client import SubstrateClient
+from substrate.url_failover import AllUrlsDown, SubstrateUrlFailover
+from substrate.validator_handle import ValidatorHandle, ValidatorSwapped
+
+logger = logging.getLogger(__name__)
 
 
-logger = get_logger("validator_pool")
+# Errors that indicate the connection to the validator is broken, not
+# that the chain returned a bad result. The pool swaps on these.
+_CONNECTION_ERRORS: tuple[type[BaseException], ...] = (
+    ConnectionError,
+    TimeoutError,
+    OSError,
+    # WebSocketException and substrate-interface's own connection errors
+    # will be added here when wiring against the real client.
+)
+
+
+# Idempotent operations the pool may auto-retry across swaps.
+# Anything not in this set raises ValidatorSwapped to the caller instead.
+_IDEMPOTENT_OPS = frozenset({
+    "get_head",
+    "get_block_number",
+    "get_finalized_head",
+    "get_mining_snapshot",
+    "query_miner",
+    "query_difficulty",
+    "query_current_difficulty",
+    "query_last_proof_block_number",
+    "query_pow_constants",
+    "query_balance",
+    "query_solver",
+    "query_job_order",
+    "query_winning_solution",
+    "get_events_at",
+})
 
 
 class ValidatorPool:
-    """Connection holder indexed by role.
+    """Owns one active ValidatorHandle; routes RPCs; handles swap.
 
-    Lifetime:
-      - `__init__` does NOT open any connections; it just records the
-        URL list.
-      - `get(role)` lazy-constructs the slot on first call, connects
-        it to `current_url`, and caches it for subsequent calls.
-      - `close()` closes every constructed slot. Idempotent. Test
-        slots (injected via `test_slots=`) are not closed — they are
-        caller-owned.
-
-    Threading:
-      - All async methods are safe under concurrent callers thanks to
-        `_rotation_lock`.
-      - Individual `SubstrateClient` instances retain their own
-        `_call_lock` for SCALE-decoder safety; the pool does not
-        serialize calls across slots.
+    Args:
+        urls: List of validator URLs to rotate through.
+        failover: `SubstrateUrlFailover` instance (allows shared
+            configuration of backoff parameters).
+        handle_factory: Function `(url) -> ValidatorHandle`. Production
+            code passes `ValidatorHandle`; tests pass a fake factory.
+        max_swap_retries: Maximum times an idempotent op retries across
+            swaps before raising the underlying connection error.
     """
 
     def __init__(
         self,
-        urls: Sequence[str],
-        *,
-        test_slots: Optional[Mapping[str, object]] = None,
+        urls: list[str],
+        failover: SubstrateUrlFailover,
+        handle_factory: Callable[[str], ValidatorHandle],
+        max_swap_retries: int = 3,
     ) -> None:
-        url_list = list(urls)
-        if not url_list:
-            raise ValueError(
-                "ValidatorPool: `urls=` must contain at least one validator URL"
-            )
-        self._urls: tuple[str, ...] = tuple(url_list)
-        self._current_index: int = 0
-        # Pre-constructed mock clients keyed by role. When a `get(role)`
-        # call hits a name in this map, the mapped object is returned
-        # directly without any real-network construction.
-        self._test_slots: dict[str, object] = dict(test_slots or {})
-        # Owned (real) slots that the pool constructed itself. These
-        # are the ones `close()` tears down.
-        self._owned_slots: dict[str, SubstrateClient] = {}
-        # Async lock guarding rotation and slot-construction critical
-        # sections. Lazy-binds in connect()-style methods so the lock
-        # captures the running event loop.
-        self._rotation_lock: Optional[asyncio.Lock] = None
+        self._urls = urls
+        self._failover = failover
+        self._handle_factory = handle_factory
+        self._max_swap_retries = max_swap_retries
+        self._active: Optional[ValidatorHandle] = None
+        self._swap_lock = asyncio.Lock()
 
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
+    def active_url(self) -> Optional[str]:
+        return self._active.url if self._active is not None else None
 
-    @property
-    def urls(self) -> tuple[str, ...]:
-        return self._urls
+    async def start(self) -> None:
+        """Spawn the first validator handle on the first URL."""
+        url = self._failover.current()
+        self._active = self._handle_factory(url)
+        self._active.start()
 
-    @property
-    def current_url(self) -> str:
-        return self._urls[self._current_index]
+    async def shutdown(self) -> None:
+        """Shut down the active handle (if any)."""
+        if self._active is not None:
+            await self._active.shutdown()
+            self._active = None
 
-    # ------------------------------------------------------------------
-    # Slot access
-    # ------------------------------------------------------------------
+    async def send(self, op: str, args: dict[str, Any]) -> Any:
+        """Route an RPC call to the active handle, with swap-on-failure.
 
-    async def get(self, role: str) -> object:
-        """Return the slot client for `role`, lazy-constructing on first
-        access. Subsequent calls for the same role return the same
-        instance.
-
-        Returns the injected object directly when `role` is in
-        `test_slots`; otherwise constructs a real `SubstrateClient`
-        and connects it to the pool's current URL.
+        For idempotent ops, retries up to `max_swap_retries` across swaps.
+        For non-idempotent ops (notably `submit_extrinsic`), raises
+        `ValidatorSwapped` on a swap and leaves retry decision to caller.
         """
-        if role in self._test_slots:
-            return self._test_slots[role]
-        lock = self._ensure_lock()
-        async with lock:
-            existing = self._owned_slots.get(role)
-            if existing is not None:
-                return existing
-            client = SubstrateClient(urls=self._urls)
-            # Pin to the pool's current URL on construction. Today
-            # `SubstrateClient.connect()` walks all URLs and lands on
-            # the first reachable — that's fine: if the pool's current
-            # URL is reachable, it lands there; if not, the client's
-            # own walk picks the next reachable one and we resync the
-            # pool pointer below.
-            await client.connect()
-            if client.current_url != self.current_url:
-                # The pool was anchored to a dead URL; sync forward.
-                try:
-                    self._current_index = self._urls.index(client.current_url)
-                    logger.info(
-                        "validator pool: anchor URL was unreachable; "
-                        "synced pool pointer to %s",
-                        client.current_url,
-                    )
-                except ValueError:
-                    # client.current_url isn't in our list — should be
-                    # impossible since we passed self._urls. Defensive,
-                    # but log loud: silently leaving _current_index stale
-                    # would cause subsequent advance_rotation() calls to
-                    # compare against the wrong URL and never advance.
-                    logger.error(
-                        "validator pool invariant violation: "
-                        "client.current_url=%s not in pool._urls=%s — "
-                        "pool pointer left stale at index %d",
-                        client.current_url,
-                        self._urls,
-                        self._current_index,
-                    )
-            self._owned_slots[role] = client
-            return client
-
-    # ------------------------------------------------------------------
-    # Rotation coordination
-    # ------------------------------------------------------------------
-
-    async def advance_rotation(self, from_url: str) -> str:
-        """Move the rotation pointer forward if `from_url` matches the
-        pool's current pointer; otherwise return the current URL
-        unchanged.
-
-        This is the contract slots' failover handlers use: "I'm on
-        `from_url` and it just died — what do I move to?" The check
-        prevents two slots that both noticed the same death from
-        double-advancing the pointer.
-        """
-        lock = self._ensure_lock()
-        async with lock:
-            if from_url != self.current_url:
-                # Either the pool already advanced past this URL
-                # (another slot noticed the death first) or the slot
-                # reported a URL that isn't ours (shouldn't happen).
-                # Either way, return current — let the slot reconnect
-                # to wherever we're pointing now.
-                return self.current_url
-            old_url = self.current_url
-            self._current_index = (self._current_index + 1) % len(self._urls)
-            new_url = self.current_url
-            logger.warning(
-                "validator pool: advancing rotation from %s to %s",
-                old_url,
-                new_url,
-            )
-            return new_url
-
-    # ------------------------------------------------------------------
-    # Teardown
-    # ------------------------------------------------------------------
-
-    async def close(self) -> None:
-        """Close every pool-owned slot. Idempotent.
-
-        Test slots (injected via `test_slots=`) are caller-owned and
-        are NOT closed here — the test that constructed them is
-        responsible for their lifetime.
-        """
-        slots = self._owned_slots
-        self._owned_slots = {}
-        for role, client in slots.items():
+        attempts = 0
+        while True:
+            if self._active is None:
+                raise RuntimeError("pool not started")
+            handle = self._active
             try:
-                await client.close()
-            except Exception as exc:  # noqa: BLE001 — cleanup, log + continue
+                result = await handle.send(op, args)
+                self._failover.confirm_success()
+                return result
+            except _CONNECTION_ERRORS as conn_exc:
                 logger.warning(
-                    "validator pool: close() error on slot %r: %s: %s",
-                    role,
-                    type(exc).__name__,
-                    exc,
+                    "pool: connection-class error on %s op=%s: %s; swapping",
+                    handle.url, op, conn_exc,
                 )
+                all_down = await self._swap_after_failure(handle.url)
+                if op not in _IDEMPOTENT_OPS:
+                    raise ValidatorSwapped(
+                        f"swapped during non-idempotent op {op}; caller must decide"
+                    ) from conn_exc
+                attempts += 1
+                if all_down or attempts >= self._max_swap_retries:
+                    logger.error(
+                        "pool: idempotent op %s exhausted retries (all_down=%s attempts=%d)",
+                        op, all_down, attempts,
+                    )
+                    raise
+                # loop and try on the new active handle
 
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
+    async def force_swap(self) -> None:
+        """Kill the active handle and spawn the next URL (no retry logic)."""
+        if self._active is None:
+            return
+        current_url = self._active.url
+        await self._swap_after_failure(current_url)
 
-    def _ensure_lock(self) -> asyncio.Lock:
-        """Lazy-instantiate the rotation lock on first async use so it
-        binds to the currently running event loop. `asyncio.Lock`
-        captures the loop at __init__ time, and pool construction
-        typically happens before the loop is set up."""
-        if self._rotation_lock is None:
-            self._rotation_lock = asyncio.Lock()
-        return self._rotation_lock
+    async def _swap_after_failure(self, failed_url: str) -> bool:
+        """Internal: kill the current handle, rotate URL, spawn new handle.
 
-
-__all__ = ["ValidatorPool"]
+        Returns:
+            True if all URLs were exhausted (AllUrlsDown fired), False otherwise.
+        """
+        async with self._swap_lock:
+            # Idempotent within the lock — multiple racing callers
+            # only swap once.
+            if self._active is None or self._active.url != failed_url:
+                return False
+            old = self._active
+            all_down = False
+            try:
+                next_url = self._failover.advance_after_failure(failed_url)
+            except AllUrlsDown as down:
+                all_down = True
+                logger.error(
+                    "pool: all validator URLs down; backing off %.2fs",
+                    down.backoff_s,
+                )
+                await asyncio.sleep(down.backoff_s)
+                self._failover.reset_after_backoff()
+                next_url = self._failover.current()
+            await old.shutdown()
+            self._active = self._handle_factory(next_url)
+            self._active.start()
+            logger.info("pool: swapped to %s", next_url)
+            return all_down

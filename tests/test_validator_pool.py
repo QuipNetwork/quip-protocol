@@ -1,244 +1,166 @@
-"""Unit tests for \`substrate.pool.ValidatorPool\`.
+"""Tests for the rewritten substrate.pool.ValidatorPool.
 
-The pool sits between the controllers and the `SubstrateClient`
-instances they would otherwise own directly. These tests cover the
-parts that matter for that role:
-
-- slot caching (one client per role, reused across get() calls)
-- lazy connect (no network in __init__ / get() — only when the slot is
-  asked to do work; matches today's controller behavior)
-- forward-only rotation pointer that's idempotent under concurrent
-  `advance_rotation` calls (the "two slots noticed the same death"
-  race)
-- close() closes every constructed slot, is idempotent, and doesn't
-  touch un-instantiated slots
-- test_slots injection lets unit tests skip the connect step entirely
+The pool exposes an async RPC surface, routes calls to the currently-
+active ValidatorHandle, and handles hot-active swap on connection
+failure with idempotent-only auto-retry.
 """
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import pytest
 
-from substrate import client as sc_module
-from substrate.client import NoValidatorReachable, SubstrateClient
-from substrate.pool import ValidatorPool
+from substrate.pool import ValidatorPool, ValidatorSwapped
+from substrate.url_failover import SubstrateUrlFailover
 
 
-class _StubInterface:
-    """Same shape as the stub used in test_substrate_client_failover."""
+class _FakeHandle:
+    """In-process stand-in for ValidatorHandle — no mp.Process spawned."""
 
-    bad_urls: set[str] = set()
-    construction_log: list[str] = []
-
-    def __init__(self, url: str) -> None:
-        type(self).construction_log.append(url)
-        if url in type(self).bad_urls:
-            raise ConnectionRefusedError(f"stub refused: {url}")
+    def __init__(self, url: str, *, behaviour: dict[str, Any] | None = None) -> None:
         self.url = url
+        self.is_shutdown = False
+        self._behaviour = behaviour or {}
+        self.calls: list[tuple[str, dict]] = []
 
-    def close(self) -> None:  # pragma: no cover — close path not exercised here
+    def start(self) -> None:
         pass
 
+    async def send(self, op: str, args: dict) -> Any:
+        self.calls.append((op, args))
+        if self.is_shutdown:
+            raise ValidatorSwapped(f"{self.url} already shut down")
+        behaviour = self._behaviour.get(op)
+        if behaviour is None:
+            return f"{self.url}:{op}"
+        if isinstance(behaviour, Exception):
+            raise behaviour
+        if callable(behaviour):
+            return behaviour()
+        return behaviour
 
-@pytest.fixture(autouse=True)
-def _patch_substrate_interface(monkeypatch):
-    _StubInterface.bad_urls = set()
-    _StubInterface.construction_log = []
-    monkeypatch.setattr(sc_module, "SubstrateInterface", _StubInterface)
-    yield
-
-
-# ----------------------------------------------------------------------
-# Construction / validation
-# ----------------------------------------------------------------------
-
-
-def test_empty_urls_rejected():
-    with pytest.raises(ValueError, match="at least one validator URL"):
-        ValidatorPool(urls=[])
+    async def shutdown(self) -> None:
+        self.is_shutdown = True
 
 
-def test_current_url_starts_at_first_entry():
-    pool = ValidatorPool(urls=["ws://a:9944", "ws://b:9944"])
-    assert pool.current_url == "ws://a:9944"
-    assert pool.urls == ("ws://a:9944", "ws://b:9944")
+def _make_pool(handle_specs: list[dict]) -> ValidatorPool:
+    """Build a pool with one fake handle per URL."""
+    urls = [spec["url"] for spec in handle_specs]
+    failover = SubstrateUrlFailover(urls, initial_backoff_s=0.01, max_backoff_s=0.05)
+    fakes_by_url = {
+        spec["url"]: _FakeHandle(spec["url"], behaviour=spec.get("behaviour", {}))
+        for spec in handle_specs
+    }
 
+    def handle_factory(url: str) -> _FakeHandle:
+        return fakes_by_url[url]
 
-# ----------------------------------------------------------------------
-# get() — slot lifecycle
-# ----------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_get_lazy_connects_on_first_call():
-    pool = ValidatorPool(urls=["ws://a:9944"])
-    # Before any get(), no client constructed.
-    assert _StubInterface.construction_log == []
-    client = await pool.get("rpc")
-    # After get(), the slot is built and connected.
-    assert isinstance(client, SubstrateClient)
-    assert client.current_url == "ws://a:9944"
-    assert _StubInterface.construction_log == ["ws://a:9944"]
-
-
-@pytest.mark.asyncio
-async def test_get_caches_slot_per_role():
-    """Same role → same client instance. Different roles → different."""
-    pool = ValidatorPool(urls=["ws://a:9944"])
-    rpc1 = await pool.get("rpc")
-    rpc2 = await pool.get("rpc")
-    sub = await pool.get("subscribe.pow")
-    assert rpc1 is rpc2
-    assert sub is not rpc1
-    # Two clients constructed total (one per role).
-    assert _StubInterface.construction_log == ["ws://a:9944", "ws://a:9944"]
-
-
-@pytest.mark.asyncio
-async def test_get_propagates_no_validator_reachable():
-    """If the slot can't connect to any URL, get() raises."""
-    _StubInterface.bad_urls = {"ws://a:9944", "ws://b:9944"}
-    pool = ValidatorPool(urls=["ws://a:9944", "ws://b:9944"])
-    with pytest.raises(NoValidatorReachable):
-        await pool.get("rpc")
-
-
-# ----------------------------------------------------------------------
-# advance_rotation() — forward-only, idempotent under races
-# ----------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_advance_rotation_moves_pointer_forward():
-    pool = ValidatorPool(urls=["ws://a:9944", "ws://b:9944", "ws://c:9944"])
-    assert pool.current_url == "ws://a:9944"
-    next_url = await pool.advance_rotation(from_url="ws://a:9944")
-    assert next_url == "ws://b:9944"
-    assert pool.current_url == "ws://b:9944"
-
-
-@pytest.mark.asyncio
-async def test_advance_rotation_wraps_circularly():
-    pool = ValidatorPool(urls=["ws://a:9944", "ws://b:9944"])
-    await pool.advance_rotation(from_url="ws://a:9944")  # → b
-    next_url = await pool.advance_rotation(from_url="ws://b:9944")  # → a
-    assert next_url == "ws://a:9944"
-
-
-@pytest.mark.asyncio
-async def test_advance_rotation_is_idempotent_under_race():
-    """Two slots both notice 'a' is dead and both call advance(from_url='a').
-    Only one rotation must happen. Second caller learns the pool is already
-    on 'b' and just gets that back — does NOT advance to 'c'."""
-    pool = ValidatorPool(urls=["ws://a:9944", "ws://b:9944", "ws://c:9944"])
-    first = await pool.advance_rotation(from_url="ws://a:9944")
-    second = await pool.advance_rotation(from_url="ws://a:9944")  # stale request
-    assert first == "ws://b:9944"
-    assert second == "ws://b:9944"
-    assert pool.current_url == "ws://b:9944"  # NOT 'c'
-
-
-@pytest.mark.asyncio
-async def test_advance_rotation_handles_concurrent_callers():
-    """Two coroutines call advance() simultaneously from the same stale URL.
-    The pool's internal lock must serialize them so only one advance happens."""
-    pool = ValidatorPool(urls=["ws://a:9944", "ws://b:9944", "ws://c:9944"])
-    results = await asyncio.gather(
-        pool.advance_rotation(from_url="ws://a:9944"),
-        pool.advance_rotation(from_url="ws://a:9944"),
-    )
-    assert results == ["ws://b:9944", "ws://b:9944"]
-    assert pool.current_url == "ws://b:9944"
-
-
-@pytest.mark.asyncio
-async def test_advance_rotation_from_unknown_url_returns_current():
-    """If a slot reports a URL that isn't even in the rotation (shouldn't
-    happen but defend), don't advance — just return current."""
-    pool = ValidatorPool(urls=["ws://a:9944", "ws://b:9944"])
-    next_url = await pool.advance_rotation(from_url="ws://stale:9944")
-    assert next_url == "ws://a:9944"
-    assert pool.current_url == "ws://a:9944"
-
-
-# ----------------------------------------------------------------------
-# test_slots injection
-# ----------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_test_slots_inject_returns_provided_client_without_connect():
-    fake_client = object()  # sentinel — pool must not call anything on it
     pool = ValidatorPool(
-        urls=["ws://a:9944"],
-        test_slots={"subscribe.pow": fake_client},
+        urls=urls,
+        failover=failover,
+        handle_factory=handle_factory,
+        max_swap_retries=3,
     )
-    got = await pool.get("subscribe.pow")
-    assert got is fake_client
-    # No real SubstrateInterface was constructed.
-    assert _StubInterface.construction_log == []
+    pool._fakes_by_url = fakes_by_url  # for assertions
+    return pool
 
 
 @pytest.mark.asyncio
-async def test_test_slots_only_overrides_named_roles():
-    """A test_slots map covers some roles; the rest fall through to real
-    construction."""
-    fake_subscribe = object()
-    pool = ValidatorPool(
-        urls=["ws://a:9944"],
-        test_slots={"subscribe.pow": fake_subscribe},
-    )
-    sub = await pool.get("subscribe.pow")
-    rpc = await pool.get("rpc")
-    assert sub is fake_subscribe
-    assert isinstance(rpc, SubstrateClient)
-
-
-# ----------------------------------------------------------------------
-# close()
-# ----------------------------------------------------------------------
+async def test_pool_routes_to_active_handle():
+    """An RPC call hits the currently-active handle."""
+    pool = _make_pool([{"url": "http://a"}, {"url": "http://b"}])
+    await pool.start()
+    try:
+        result = await pool.send("get_head", {})
+        assert result == "http://a:get_head"
+        assert pool._fakes_by_url["http://a"].calls == [("get_head", {})]
+        assert pool._fakes_by_url["http://b"].calls == []
+    finally:
+        await pool.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_close_closes_every_constructed_slot():
-    pool = ValidatorPool(urls=["ws://a:9944"])
-    rpc = await pool.get("rpc")
-    sub = await pool.get("subscribe.pow")
-    assert rpc._iface is not None
-    assert sub._iface is not None
-    await pool.close()
-    assert rpc._iface is None
-    assert sub._iface is None
+async def test_pool_swaps_on_connection_error_and_retries_idempotent_op():
+    """On ConnectionError, pool kills active, swaps, retries on next URL."""
+    pool = _make_pool([
+        {"url": "http://a", "behaviour": {"get_head": ConnectionError("dead")}},
+        {"url": "http://b", "behaviour": {"get_head": b"\xab" * 32}},
+    ])
+    await pool.start()
+    try:
+        # get_head is idempotent → auto-retry across swap → succeeds on B
+        result = await pool.send("get_head", {})
+        assert result == b"\xab" * 32
+        assert pool._fakes_by_url["http://a"].is_shutdown
+    finally:
+        await pool.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_close_is_idempotent():
-    pool = ValidatorPool(urls=["ws://a:9944"])
-    await pool.get("rpc")
-    await pool.close()
-    # Second close shouldn't raise.
-    await pool.close()
+async def test_pool_does_NOT_auto_retry_submit_extrinsic():
+    """submit_extrinsic raises ValidatorSwapped; pool does not retry on its own."""
+    pool = _make_pool([
+        {"url": "http://a", "behaviour": {"submit_extrinsic": ConnectionError("dead")}},
+        {"url": "http://b"},
+    ])
+    await pool.start()
+    try:
+        with pytest.raises(ValidatorSwapped):
+            await pool.send("submit_extrinsic", {"signed": b"\x00"})
+        # B did NOT receive a submit_extrinsic call
+        assert pool._fakes_by_url["http://b"].calls == []
+        # A was swapped out, though
+        assert pool._fakes_by_url["http://a"].is_shutdown
+    finally:
+        await pool.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_close_with_no_slots_constructed():
-    """A pool that was never asked for a slot can still be closed."""
-    pool = ValidatorPool(urls=["ws://a:9944"])
-    await pool.close()  # should not raise
+async def test_pool_exhausts_retries_then_raises():
+    """Idempotent op that fails on every URL eventually raises after max_swap_retries."""
+    pool = _make_pool([
+        {"url": "http://a", "behaviour": {"get_head": ConnectionError("dead")}},
+        {"url": "http://b", "behaviour": {"get_head": ConnectionError("dead")}},
+    ])
+    await pool.start()
+    try:
+        with pytest.raises(ConnectionError):
+            await pool.send("get_head", {})
+    finally:
+        await pool.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_close_does_not_touch_test_slot_objects():
-    """test_slots are caller-owned; pool shouldn't try to .close() them."""
-    closed_calls = []
+async def test_pool_force_swap_kills_active_and_spawns_next():
+    """force_swap() rotates to the next URL regardless of in-flight state."""
+    pool = _make_pool([{"url": "http://a"}, {"url": "http://b"}])
+    await pool.start()
+    try:
+        # initially active = A
+        assert pool.active_url() == "http://a"
+        await pool.force_swap()
+        assert pool.active_url() == "http://b"
+        # an RPC now hits B
+        await pool.send("get_head", {})
+        assert pool._fakes_by_url["http://b"].calls == [("get_head", {})]
+    finally:
+        await pool.shutdown()
 
-    class _FakeClient:
-        async def close(self):
-            closed_calls.append(True)
 
-    fake = _FakeClient()
-    pool = ValidatorPool(urls=["ws://a:9944"], test_slots={"rpc": fake})
-    await pool.get("rpc")
-    await pool.close()
-    assert closed_calls == []  # caller closes their injected objects
+@pytest.mark.asyncio
+async def test_pool_passes_non_connection_errors_through_immediately():
+    """A non-connection error (e.g. RuntimeError from the chain) is NOT a reason to swap."""
+    pool = _make_pool([
+        {"url": "http://a", "behaviour": {"get_head": RuntimeError("chain returned None")}},
+        {"url": "http://b"},
+    ])
+    await pool.start()
+    try:
+        with pytest.raises(RuntimeError, match="chain returned None"):
+            await pool.send("get_head", {})
+        # A is still active; no swap happened
+        assert pool.active_url() == "http://a"
+        assert not pool._fakes_by_url["http://a"].is_shutdown
+    finally:
+        await pool.shutdown()
