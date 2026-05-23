@@ -1,45 +1,47 @@
 """Protocol-neutral seam between mining work-sources and `BaseMiner`.
 
-`BaseMiner.mine_work_item` is shared between the PoW path (chain head →
-`SubstrateMiningContext`) and the mempool path (`JobProposed` event →
-`MempoolJobContext`). The two contexts carry the same essentials —
-`nodes`, `edges`, quality floors — but materialize the Ising problem
-differently:
+`WorkContext` is a structural Protocol describing the shape both PoW
+(`substrate.types.SubstrateMiningContext`) and mempool
+(`shared.mempool_types.MempoolJobContext`) work-source contexts satisfy.
+Defining it as a Protocol (rather than `Union[...]`) keeps `shared/` from
+having to import its specializations — the substrate package can depend
+on `shared/`, but not the other way around.
 
-  - PoW derives a fresh `nonce` per attempt (`derive_nonce(
-    last_proof_block_hash, miner, salt)`) and feeds it through
-    `generate_ising_model_from_nonce` to get `(h, J)`. The chain checks
-    this derivation in `submit_proof`.
-  - Mempool just carries the `(h_values, j_values)` directly inside
-    `IsingParams`; the chain takes whatever solver submitted spins solve
-    against and validates energy + diversity, not the model.
-
-`resolve_ising(context, salt)` dispatches between these two paths.
-`requirements_from_context(context)` maps both kinds of quality floor
-into a `BlockRequirements` so `evaluate_sampleset` sees one shape.
-
-Keeping this in its own module keeps `base_miner.py` free of mempool
-imports — the mempool types and the mining loop both depend on
-`work_context` but not on each other.
+`resolve_ising(context, salt)` dispatches between PoW and mempool paths
+via `isinstance` against the concrete types. `requirements_from_context`
+does the same. Both will be replaced with method-based dispatch in a
+follow-up so `shared/` no longer references the concrete types at all.
 """
 from __future__ import annotations
 
 import random
-from typing import Dict, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    Protocol,
+    Sequence,
+    Tuple,
+    runtime_checkable,
+)
 
-from shared.mempool_types import MempoolJobContext
 from shared.miner_types import BlockRequirements
 from shared.quantum_proof_of_work import derive_nonce, generate_ising_model_from_nonce
-from substrate.types import SubstrateMiningContext
 
 
-WorkContext = Union[SubstrateMiningContext, MempoolJobContext]
+@runtime_checkable
+class WorkContext(Protocol):
+    """Structural shape required by `base_miner.mine_work_item`.
+
+    Both `SubstrateMiningContext` and `MempoolJobContext` satisfy this
+    Protocol without explicit inheritance. The Protocol enumerates only
+    fields the mining loop and its dispatch helpers actually read.
+    """
+
+    nodes: Sequence[int]
+    edges: Sequence[Tuple[int, int]]
 
 
-# Sentinel timeout for legacy difficulty decay paths. Phase 3 documents
-# why substrate-mode mining never touches `compute_current_requirements`;
-# we pass the same large value the v0.1 helper used (`2**31 - 1`) so any
-# code that does sneak through treats decay as effectively-disabled.
+# Sentinel timeout for legacy difficulty decay paths.
 _DECAY_DISABLED = 2**31 - 1
 
 
@@ -51,24 +53,13 @@ def resolve_ising(
 ) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float], int]:
     """Return `(h, J, telemetry_nonce)` for one mining iteration.
 
-    `nodes` and `edges` are the *sampler's* topology iteration order. The
-    PoW chain validates proofs by re-deriving `(h, J)` against the
-    iteration order of its registered topology — the controller already
-    verified the sampler's `topology_hash` matches the chain's, so
-    passing the sampler's order through here keeps on-chain validation
-    byte-for-byte compatible. (Phase 4 caught this off-by-one; Phase 8b
-    pins the contract via this parameter.)
-
-    - PoW path: derives a fresh nonce from `salt` + chain identity
-      material, regenerates `(h, J)` via ChaCha8 the same way the pallet
-      does. `salt` + `nonce` become part of the on-chain commitment.
-    - Mempool path: maps the chain-carried `h_values` / `j_values`
-      millivalues (i32) into float dicts indexed by `context.nodes` /
-      `context.edges` (the chain only checks that submitted spins solve
-      the stored model — there's no re-derivation step, so `nodes` /
-      `edges` are unused here). `salt` is unused. `telemetry_nonce` is
-      `0`; preserved in `MiningResult` for stats compatibility.
+    Dispatches PoW vs mempool via `isinstance`. The PoW branch derives a
+    fresh nonce from chain identity material; the mempool branch maps
+    chain-carried `(h_values, j_values)` directly.
     """
+    from shared.mempool_types import MempoolJobContext
+    from substrate.types import SubstrateMiningContext
+
     if isinstance(context, MempoolJobContext):
         h = {
             int(node): float(hv) / 1000.0
@@ -99,19 +90,10 @@ def resolve_ising(
 
 
 def requirements_from_context(context: WorkContext) -> BlockRequirements:
-    """Build `BlockRequirements` from a work context's quality floors.
+    """Build `BlockRequirements` from a work context's quality floors."""
+    from shared.mempool_types import MempoolJobContext
+    from substrate.types import SubstrateMiningContext
 
-    The mining loop and `evaluate_sampleset` both consume `BlockRequirements`;
-    this is the single point where chain-shaped difficulty (PoW) or
-    optional quality floors (mempool) are translated into the same shape.
-
-    Mempool semantics for unset floors:
-      - `min_energy_milli=None`     → no upper bound on energy (use +inf)
-      - `min_diversity_milli=None`  → no lower bound on diversity (0.0)
-      - `min_solutions=None`        → at least 1 solution (the pallet
-        rejects `NoSolutionsSubmitted` for an empty submission, so 1 is
-        the natural floor)
-    """
     if isinstance(context, MempoolJobContext):
         difficulty_energy = (
             float(context.min_energy_milli) / 1000.0
@@ -138,8 +120,6 @@ def requirements_from_context(context: WorkContext) -> BlockRequirements:
             f"requirements_from_context: unknown context type {type(context)!r}"
         )
 
-    # PoW path — mirrors `SubstrateDifficulty.max_energy` / `.min_diversity`
-    # but reads the raw milli fields to avoid an extra property call.
     d = context.difficulty
     return BlockRequirements(
         difficulty_energy=float(d.max_energy_milli) / 1000.0,
@@ -152,11 +132,7 @@ def requirements_from_context(context: WorkContext) -> BlockRequirements:
 
 
 def fresh_salt() -> bytes:
-    """32-byte random salt for one mining iteration.
-
-    Used identically by both work-source paths — PoW feeds it through
-    `derive_nonce`, mempool ignores it but keeps the call shape uniform.
-    """
+    """32-byte random salt for one mining iteration."""
     return random.randbytes(32)
 
 
