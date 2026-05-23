@@ -683,6 +683,58 @@ class SubstrateMinerController:
                             head_hash.hex()[:16],
                         )
 
+    # -------------------------------------------------------------------------
+    # on_new_head — new event-manager entry point (Task 9/10).
+    # _handle_head below remains the legacy subscription path, to be removed
+    # in Task 13 once the event-manager path is the only entry.
+    # -------------------------------------------------------------------------
+
+    async def on_new_head(self, snapshot: dict) -> None:
+        """Event-manager callback: a new chain snapshot has arrived.
+
+        Receives a mining snapshot dict from ChainEventManager and performs
+        the work that _handle_head does today:
+
+        - Push the live decayed energy threshold to each handle if it changed.
+        - Dispatch fresh mining work on work-key change
+          (last_proof_block_hash, topology_hash).
+        - Short-circuit if handles are already mining the same work key.
+
+        Args:
+            snapshot: dict with at minimum the keys
+                ``head_number``, ``difficulty_milli``,
+                ``last_proof_block_hash``, and ``topology_hash``.
+        """
+        block_number: int = snapshot["head_number"]
+        live_threshold: int = snapshot["difficulty_milli"]
+        last_proof_block_hash: bytes = snapshot["last_proof_block_hash"]
+        topology_hash: bytes = snapshot["topology_hash"]
+
+        # Push the chain's live decayed energy threshold to each handle
+        # if it has changed since the last push.
+        if live_threshold != self._last_pushed_threshold_milli:
+            for handle in self.miner_handles:
+                handle.set_live_threshold_milli(live_threshold)
+            self._last_pushed_threshold_milli = live_threshold
+
+        new_work_key = (last_proof_block_hash, topology_hash)
+
+        if new_work_key == self._current_work_key:
+            all_idle = all(
+                h._active_dispatch_id == 0 for h in self.miner_handles
+            )
+            if not all_idle:
+                # Mining already in progress on the same key — skip.
+                return
+            # All handles are idle on a key we've seen before; fall through
+            # to re-dispatch (e.g., handles were cancelled externally).
+
+        # Dispatch fresh work to each handle.
+        # TODO Task 11: translate snapshot to SubstrateMiningContext before dispatch.
+        for handle in self.miner_handles:
+            handle.mine_work_item(snapshot)
+        self._current_work_key = new_work_key
+
     async def _handle_head(self, head_hash: bytes, block_number: int) -> None:
         self.stats.heads_observed += 1
 
