@@ -34,12 +34,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import queue as _queue
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Awaitable, Callable, Optional, Protocol, Tuple
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Optional, Protocol, Tuple
 
 from websocket import WebSocketException
 
@@ -78,6 +80,47 @@ class _MinerCoreStats(Protocol):
 # A few in a row at startup is expected (chain may not be seeded yet); ten
 # in a row strongly indicates RPC corruption or a genuinely stuck chain.
 _NONE_SNAPSHOT_FAIL_THRESHOLD = 10
+
+
+def build_stats_snapshot_for_telemetry(controller) -> dict[str, Any]:
+    """Serialize the controller's live stats into a JSON-safe dict.
+
+    Called periodically by StatsSnapshotWriter (Plan 2). The telemetry
+    sibling process reads the resulting file on each /api/v1/stats
+    request — no live IPC between the two processes.
+
+    Every counter that operators rely on for diagnostics must be
+    included here. The original silent-subscription-death bug was
+    diagnosed via `controller.stats.heads_observed` — this snapshot
+    is the channel that keeps that visibility intact after the
+    telemetry-process split.
+    """
+    s = controller.stats
+
+    def _g(attr: str, default: int = 0) -> int:
+        return getattr(s, attr, default)
+
+    return {
+        "heads_observed": _g("heads_observed"),
+        "contexts_dispatched": _g("contexts_dispatched"),
+        "results_received": _g("results_received"),
+        "proofs_submitted": _g("proofs_submitted"),
+        "stale_drops": _g("stale_drops"),
+        "submission_errors": _g("submission_errors"),
+        "heads_skipped_already_won": _g("heads_skipped_already_won"),
+        "heads_dropped_stale_number": _g("heads_dropped_stale_number"),
+        "heads_refreshed_active": _g("heads_refreshed_active"),
+        "stale_post_win_heads_dropped": _g("stale_post_win_heads_dropped"),
+        "zero_seed_snapshots_dropped": _g("zero_seed_snapshots_dropped"),
+        "subscription_lag_blocks": _g("subscription_lag_blocks"),
+        "heads_promoted_to_rpc": _g("heads_promoted_to_rpc"),
+        "post_win_fast_forwards": _g("post_win_fast_forwards"),
+        "heads_same_key_skipped": _g("heads_same_key_skipped"),
+        "none_snapshots_seen": _g("none_snapshots_seen"),
+        "duplicate_result_drops": _g("duplicate_result_drops"),
+        "proofs_unverified": _g("proofs_unverified"),
+        "active_url": getattr(controller, "pool_active_url", None),
+    }
 
 
 class _OperatorFailLoud(RuntimeError):
@@ -331,6 +374,7 @@ class SubstrateMinerController:
             Callable[[ExtrinsicReceipt, SubstrateMiningContext], Awaitable[None]]
         ] = None,
         core: Optional[_MinerCoreStats] = None,
+        runtime_dir: Optional[Path] = None,
     ) -> None:
         if not miner_handles:
             raise ValueError(
@@ -427,10 +471,26 @@ class SubstrateMinerController:
         # Running count of consecutive None snapshots; reset on a successful
         # snapshot. Escalates to RuntimeError after _NONE_SNAPSHOT_FAIL_THRESHOLD.
         self._consecutive_none_snapshots = 0
+        self._runtime_dir: Path = (
+            runtime_dir
+            if runtime_dir is not None
+            else Path(os.environ.get("QUIP_RUNTIME_DIR", "/tmp/quip"))
+        )
+        # Stats snapshot writer — set in run(); None before startup.
+        self._stats_snapshot_path: Optional[Path] = None
+        self._stats_writer: Optional["StatsSnapshotWriter"] = None
+        self._stats_writer_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    @property
+    def pool_active_url(self) -> Optional[str]:
+        """Current active validator URL (or None if pool not started)."""
+        if self.pool is None:
+            return None
+        return self.pool.active_url()
 
     def shutdown(self) -> None:
         """Signal a graceful shutdown. Safe to call from any thread/task."""
@@ -465,6 +525,27 @@ class SubstrateMinerController:
         # ChainEventManager. The event manager polls the snapshot at
         # adaptive cadence and fires on_new_head on state change.
         await self._start_event_manager(account)
+
+        # Stats snapshot writer — atomic JSON dump to runtime_dir every
+        # interval. The telemetry sibling process reads this file via
+        # `read_snapshot()` to serve `/api/v1/stats` without sharing live
+        # IPC with the controller.
+        from shared.stats_snapshot import StatsSnapshotWriter
+
+        self._stats_snapshot_path = self._runtime_dir / "telemetry-stats.json"
+        self._stats_writer = StatsSnapshotWriter(
+            path=self._stats_snapshot_path,
+            get_snapshot=lambda: build_stats_snapshot_for_telemetry(self),
+            interval_s=1.0,
+        )
+        self._stats_writer_task = asyncio.create_task(
+            supervise(
+                self._stats_writer.run(self._shutdown_event),
+                name="stats-snapshot-writer",
+                on_failure=self._shutdown_event.set,
+            ),
+            name="stats-snapshot-writer",
+        )
 
         try:
             await self._main_loop()
@@ -1386,11 +1467,16 @@ class SubstrateMinerController:
             self.events.request_shutdown()
         if self._event_manager_task is not None:
             self._event_manager_task.cancel()
+        # Cancel the stats snapshot writer before awaiting tasks.
+        if self._stats_writer_task is not None:
+            self._stats_writer_task.cancel()
         # Await cancellations. Narrow catch: CancelledError is expected,
         # other exceptions are real cleanup failures worth surfacing.
         extras: list[asyncio.Task] = []
         if self._event_manager_task is not None:
             extras.append(self._event_manager_task)
+        if self._stats_writer_task is not None:
+            extras.append(self._stats_writer_task)
         for task in self._drainer_tasks + extras:
             try:
                 await task
@@ -1448,5 +1534,6 @@ __all__ = [
     "FATAL_SUBMISSION_ERRORS",
     "SubmissionOutcome",
     "SubstrateMinerController",
+    "build_stats_snapshot_for_telemetry",
     "classify_submission",
 ]
