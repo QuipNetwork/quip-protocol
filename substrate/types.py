@@ -114,6 +114,39 @@ class SubstrateMiningContext:
                 f"{len(self.miner_account_bytes)}"
             )
 
+    def resolve_ising(self, salt, nodes, edges):
+        """Derive (h, J, nonce) for this attempt. PoW path: nonce → ChaCha8 → (h, J)."""
+        # Local import avoids pulling shared.* at module load time for substrate.types
+        from shared.quantum_proof_of_work import derive_nonce, generate_ising_model_from_nonce
+
+        nonce = derive_nonce(
+            self.last_proof_block_hash,
+            self.miner_account_bytes,
+            salt,
+        )
+        h, J = generate_ising_model_from_nonce(
+            nonce,
+            list(nodes),
+            list(edges),
+            allowed_h=self.allowed_h_values,
+            allowed_j=self.allowed_j_values,
+        )
+        return h, J, nonce
+
+    def requirements(self):
+        """Build BlockRequirements from this snapshot's difficulty."""
+        from shared.miner_types import BlockRequirements
+
+        d = self.difficulty
+        return BlockRequirements(
+            difficulty_energy=float(d.max_energy_milli) / 1000.0,
+            min_diversity=float(d.min_diversity_milli) / 1000.0,
+            min_solutions=int(d.min_solutions),
+            timeout_to_difficulty_adjustment_decay=2**31 - 1,
+            allowed_h_values=self.allowed_h_values,
+            allowed_j_values=self.allowed_j_values,
+        )
+
 
 @dataclass(frozen=True)
 class WinningSolution:

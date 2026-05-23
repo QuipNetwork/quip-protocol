@@ -409,6 +409,42 @@ class MempoolJobContext:
             min_solutions=ising.min_solutions,
         )
 
+    def resolve_ising(self, salt, nodes, edges):
+        """Map chain-carried (h_values, j_values) directly. Salt and nodes unused."""
+        h = {
+            int(node): float(hv) / 1000.0
+            for node, hv in zip(self.nodes, self.h_values)
+        }
+        J = {
+            (int(edge[0]), int(edge[1])): float(jv) / 1000.0
+            for edge, jv in zip(self.edges, self.j_values)
+        }
+        return h, J, 0  # 0 = placeholder nonce for telemetry
+
+    def requirements(self):
+        """Build BlockRequirements from this job's quality floors."""
+        from shared.miner_types import BlockRequirements
+
+        difficulty_energy = (
+            float(self.min_energy_milli) / 1000.0
+            if self.min_energy_milli is not None
+            else float("inf")
+        )
+        min_diversity = (
+            float(self.min_diversity_milli) / 1000.0
+            if self.min_diversity_milli is not None
+            else 0.0
+        )
+        min_solutions = (
+            int(self.min_solutions) if self.min_solutions is not None else 1
+        )
+        return BlockRequirements(
+            difficulty_energy=difficulty_energy,
+            min_diversity=min_diversity,
+            min_solutions=min_solutions,
+            timeout_to_difficulty_adjustment_decay=2**31 - 1,
+        )
+
 
 # ----------------------------------------------------------------------
 # Event dataclasses (a subset — enough for the Phase 8 controller's
