@@ -16,6 +16,7 @@ from substrate.validator_handle import (
     RpcRequest,
     RpcResponse,
     ValidatorHandle,
+    ValidatorSwapped,
     validator_main,
 )
 
@@ -285,3 +286,16 @@ async def test_handle_shutdown_cancels_inflight_futures():
     finally:
         if not handle.is_shutdown:
             await handle.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_handle_send_after_shutdown_raises_validator_swapped():
+    """send() called after shutdown raises ValidatorSwapped, not a hang."""
+    handle = ValidatorHandle(
+        url="http://test",
+        client_factory=_FakeClient,
+    )
+    handle.start()
+    await handle.shutdown()
+    with pytest.raises(ValidatorSwapped):
+        await handle.send("get_head", {})

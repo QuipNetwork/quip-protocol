@@ -166,7 +166,14 @@ class ValidatorHandle:
         self.is_shutdown = False
 
     def start(self) -> None:
-        """Spawn the child process and start the response drainer."""
+        """Spawn the child process and start the response drainer.
+
+        Note:
+            Must be called from within a running asyncio event loop
+            (i.e., from an ``async`` function or ``asyncio.run`` context).
+            `asyncio.get_running_loop()` will raise `RuntimeError` if there
+            is no running loop.
+        """
         self._proc = mp.Process(
             target=validator_main,
             args=(
@@ -197,6 +204,11 @@ class ValidatorHandle:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         self._inflight[request_id] = fut
+        # Re-check after registration: if shutdown() ran in the race window,
+        # cancel this future ourselves so the caller doesn't hang.
+        if self.is_shutdown:
+            self._inflight.pop(request_id, None)
+            raise ValidatorSwapped(f"handle for {self.url} was shut down during send")
         await loop.run_in_executor(
             None,
             self._req_q.put,
@@ -235,8 +247,7 @@ class ValidatorHandle:
         while not self.is_shutdown:
             try:
                 resp = await loop.run_in_executor(None, self._resp_q.get, True, 0.5)
-            except Exception:
-                # queue.Empty after timeout; loop.
+            except queue.Empty:
                 continue
             if not isinstance(resp, RpcResponse):
                 logger.warning("ValidatorHandle %s: ignoring non-RpcResponse: %r", self.url, resp)
