@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import multiprocessing as mp
 import os
 import queue as _queue
 import time
@@ -375,6 +376,7 @@ class SubstrateMinerController:
         ] = None,
         core: Optional[_MinerCoreStats] = None,
         runtime_dir: Optional[Path] = None,
+        telemetry_port: Optional[int] = None,
     ) -> None:
         if not miner_handles:
             raise ValueError(
@@ -480,6 +482,13 @@ class SubstrateMinerController:
         self._stats_snapshot_path: Optional[Path] = None
         self._stats_writer: Optional["StatsSnapshotWriter"] = None
         self._stats_writer_task: Optional[asyncio.Task] = None
+        # Opt-in telemetry sibling process. When telemetry_port is None
+        # (default), legacy in-process TelemetryApiServer is used and the
+        # sibling is never spawned. Set to an integer port to spawn the
+        # aiohttp-based sibling on that port.
+        self._telemetry_port: Optional[int] = telemetry_port
+        self._telemetry_proc: Optional[mp.Process] = None
+        self._telemetry_shutdown_event = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -505,6 +514,9 @@ class SubstrateMinerController:
 
         account = self.signer.account_id_bytes()
         await self._verify_registered(account)
+
+        # Spawn the telemetry sibling process (no-op if telemetry_port is None).
+        self._spawn_telemetry_sibling()
 
         # Drainer tasks consume each handle's resp queue and post into our
         # asyncio result queue. Start them before the first dispatch so we
@@ -614,6 +626,46 @@ class SubstrateMinerController:
             name="chain-event-manager",
         )
         logger.info("ChainEventManager started; polling get_mining_snapshot")
+
+    # ------------------------------------------------------------------
+    # Telemetry sibling
+    # ------------------------------------------------------------------
+
+    def _spawn_telemetry_sibling(self) -> None:
+        """Spawn the telemetry process as a sibling.
+
+        Called from ``run()``. Only spawns if ``self._telemetry_port`` is
+        set; ``None`` means legacy in-process telemetry mode (the CLI
+        constructs ``TelemetryApiServer`` directly and ignores this).
+        """
+        if self._telemetry_port is None:
+            return
+        from shared.telemetry_process import telemetry_main
+
+        # Validator URLs are derived from the pool's authoritative list.
+        # Telemetry uses its own client; this is just URL bootstrap.
+        validator_urls = list(self.pool.urls) if self.pool is not None else []
+
+        self._telemetry_shutdown_event = mp.Event()
+        self._telemetry_proc = mp.Process(
+            target=telemetry_main,
+            kwargs={
+                "listen_host": "0.0.0.0",
+                "listen_port": self._telemetry_port,
+                "stats_snapshot_path": str(
+                    self._runtime_dir / "telemetry-stats.json"
+                ),
+                "validator_urls": validator_urls,
+                "shutdown_event": self._telemetry_shutdown_event,
+            },
+            name="quip-telemetry",
+        )
+        self._telemetry_proc.start()
+        logger.info(
+            "spawned telemetry sibling: pid=%d port=%d",
+            self._telemetry_proc.pid,
+            self._telemetry_port,
+        )
 
     # ------------------------------------------------------------------
     # Startup checks
@@ -1489,6 +1541,19 @@ class SubstrateMinerController:
                 )
         self._drainer_tasks.clear()
         self._event_manager_task = None
+        # Telemetry sibling shutdown.
+        if self._telemetry_shutdown_event is not None:
+            self._telemetry_shutdown_event.set()
+        if self._telemetry_proc is not None:
+            self._telemetry_proc.join(timeout=5)
+            if self._telemetry_proc.is_alive():
+                logger.warning(
+                    "telemetry sibling did not exit; terminating"
+                )
+                self._telemetry_proc.terminate()
+                self._telemetry_proc.join(timeout=2)
+            self._telemetry_proc = None
+            self._telemetry_shutdown_event = None
         # Slot clients are owned by the pool; do NOT close them here.
         # The pool's close() (called from the CLI's outer try/finally)
         # tears them down at process shutdown. The pool's own shutdown()
