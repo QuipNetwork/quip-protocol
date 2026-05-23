@@ -1,9 +1,12 @@
 """Verify SubstrateMinerController exposes an on_new_head async callback.
 
 The callback receives a snapshot dict (as the event manager will deliver)
-and performs the work today's _handle_head does: cancel handles on
-work-key change, push live_threshold_milli to each handle, dispatch
-fresh work on key change.
+and (in this narrow-scope commit) performs a subset of what legacy
+_handle_head does: push live_threshold_milli to each handle, dispatch
+fresh work on work-key change, short-circuit on same work key.
+
+Cancel-on-key-change and other legacy behaviors are deferred to Task 11
+(startup wiring) before _handle_head is deleted in Task 13.
 """
 from __future__ import annotations
 

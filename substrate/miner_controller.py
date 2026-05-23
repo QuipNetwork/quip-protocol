@@ -692,13 +692,21 @@ class SubstrateMinerController:
     async def on_new_head(self, snapshot: dict) -> None:
         """Event-manager callback: a new chain snapshot has arrived.
 
-        Receives a mining snapshot dict from ChainEventManager and performs
-        the work that _handle_head does today:
+        Receives a mining snapshot dict from ChainEventManager. Narrow
+        scope for this commit:
 
         - Push the live decayed energy threshold to each handle if it changed.
         - Dispatch fresh mining work on work-key change
           (last_proof_block_hash, topology_hash).
         - Short-circuit if handles are already mining the same work key.
+
+        Behaviors from legacy ``_handle_head`` that are NOT yet migrated:
+        cancel-on-key-change, closed-work-key handling, zero-seed guard,
+        stale-block-number guard, RPC head promotion. These are wired in
+        Task 11 (startup wiring) before ``_handle_head`` is deleted in
+        Task 13. Until then, dispatching a new key while old work is still
+        running will leave the prior workers mining the old context in
+        parallel — acceptable during the transition only.
 
         Args:
             snapshot: dict with at minimum the keys
@@ -731,6 +739,9 @@ class SubstrateMinerController:
 
         # Dispatch fresh work to each handle.
         # TODO Task 11: translate snapshot to SubstrateMiningContext before dispatch.
+        # TODO Task 11: call handle.cancel() on active handles before dispatch
+        # on key change (legacy _handle_head does this; omitted in the narrow
+        # scope so dispatching during transition leaves old workers running).
         for handle in self.miner_handles:
             handle.mine_work_item(snapshot)
         self._current_work_key = new_work_key
