@@ -78,20 +78,82 @@ class ValidatorPool:
 
     def __init__(
         self,
-        urls: list[str],
-        failover: SubstrateUrlFailover,
-        handle_factory: Callable[[str], ValidatorHandle],
+        urls,
+        failover: Optional[SubstrateUrlFailover] = None,
+        handle_factory: Optional[Callable[[str], ValidatorHandle]] = None,
         max_swap_retries: int = 3,
     ) -> None:
-        self._urls = urls
+        # Accept tuples/lists; normalise to list for internal mutation.
+        urls_list = list(urls) if urls is not None else []
+        if not urls_list:
+            raise ValueError(
+                "ValidatorPool requires at least one validator URL"
+            )
+        self._urls = urls_list
+        # Sensible defaults so legacy callers `ValidatorPool(urls=...)` keep
+        # working. Tests inject custom failover/handle_factory for isolation.
+        if failover is None:
+            failover = SubstrateUrlFailover(urls_list)
+        if handle_factory is None:
+            def handle_factory(url: str) -> ValidatorHandle:  # noqa: E306
+                return ValidatorHandle(url=url)
         self._failover = failover
         self._handle_factory = handle_factory
         self._max_swap_retries = max_swap_retries
         self._active: Optional[ValidatorHandle] = None
         self._swap_lock = asyncio.Lock()
+        # Legacy slot cache: role -> direct SubstrateClient. Populated lazily
+        # by ``get(role)`` so callers that haven't been migrated to PoolClient
+        # keep working. These connections do NOT participate in hot-active
+        # swap; new code should use ``send()`` or ``PoolClient`` instead.
+        self._slot_clients: dict[str, Any] = {}
+
+    @property
+    def urls(self) -> tuple[str, ...]:
+        """Legacy attribute: the immutable tuple of validator URLs."""
+        return tuple(self._urls)
+
+    @property
+    def current_url(self) -> str:
+        """Legacy attribute: the URL currently in use by the failover rotation."""
+        return self._failover.current()
 
     def active_url(self) -> Optional[str]:
         return self._active.url if self._active is not None else None
+
+    async def get(self, role: str) -> Any:
+        """Legacy API: return a per-role direct SubstrateClient.
+
+        Lazy-connects on first call. Each role gets its own client (the
+        rationale being that substrate-interface's websocket holds receive
+        mode during an active subscription, so submit_extrinsic on the same
+        socket can deadlock — separate sockets per role avoid that).
+
+        Note:
+            Direct slot clients do NOT participate in hot-active swap. New
+            code should use :meth:`send` or :class:`PoolClient` for that.
+            ``get(role)`` exists for callers not yet migrated.
+        """
+        if role not in self._slot_clients:
+            from substrate.client import SubstrateClient
+            client = SubstrateClient(self.current_url)
+            await client.connect()
+            self._slot_clients[role] = client
+        return self._slot_clients[role]
+
+    async def close(self) -> None:
+        """Legacy API: close every constructed slot client AND the active handle.
+
+        Idempotent. Safe to call from shutdown paths that don't know which
+        of ``get(role)`` or ``send(op, args)`` was used.
+        """
+        for client in self._slot_clients.values():
+            try:
+                await client.close()
+            except Exception:
+                logger.exception("pool.close: slot client close failed")
+        self._slot_clients.clear()
+        await self.shutdown()
 
     async def start(self) -> None:
         """Spawn the first validator handle on the first URL."""
