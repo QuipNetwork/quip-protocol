@@ -72,10 +72,10 @@ async def test_call_lock_is_none_pre_connect():
 
 
 # ----------------------------------------------------------------------
-# Controller → MinerCore wiring is exercised by the live integration
-# test in `tests/test_telemetry_live_miner.py`. The dispatch + result
-# paths are inline in `_handle_head` / `_handle_result` and not cleanly
-# unit-testable without standing up a substantial chunk of the runtime.
+# Controller → MinerCore wiring is exercised end-to-end against a
+# running validator. The dispatch + result paths are inline in
+# ``on_new_head`` / ``_handle_result`` and not cleanly unit-testable
+# without standing up a substantial chunk of the runtime.
 # The Protocol typing on `core` (added in this MR) plus the live test
 # together pin the contract; a unit test that mirrored the call sites
 # would just duplicate the type annotation in test form.

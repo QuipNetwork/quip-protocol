@@ -80,12 +80,6 @@ class _MinerCoreStats(Protocol):
     def record_result(self, *, winning_miner_id: str, mining_time: float) -> None: ...
 
 
-# Threshold for consecutive `None` snapshots before the controller raises.
-# A few in a row at startup is expected (chain may not be seeded yet); ten
-# in a row strongly indicates RPC corruption or a genuinely stuck chain.
-_NONE_SNAPSHOT_FAIL_THRESHOLD = 10
-
-
 def build_stats_snapshot_for_telemetry(controller) -> dict[str, Any]:
     """Serialize the controller's live state into a JSON-safe dict.
 
@@ -535,9 +529,6 @@ class SubstrateMinerController:
         # cadence and dispatches on_new_head when state changes.
         self._event_manager_task: Optional[asyncio.Task] = None
         self.events = None  # set in run()
-        # Running count of consecutive None snapshots; reset on a successful
-        # snapshot. Escalates to RuntimeError after _NONE_SNAPSHOT_FAIL_THRESHOLD.
-        self._consecutive_none_snapshots = 0
         self._runtime_dir: Path = (
             runtime_dir
             if runtime_dir is not None
@@ -814,8 +805,9 @@ class SubstrateMinerController:
         the chain has no registered topology yet).
 
         Guards (in order):
-            1. ``None`` snapshot → bump counter; escalate after
-               ``_NONE_SNAPSHOT_FAIL_THRESHOLD`` consecutive.
+            1. ``None`` snapshot → bump ``stats.none_snapshots_seen``
+               and return. Persistent None is handled by the event
+               manager's watchdog (force_swap on no state change).
             2. Topology hash mismatch vs ``self.topology_hash`` → fail
                loud via ``_OperatorFailLoud``.
             3. Push ``live_threshold_milli`` to each handle if changed.

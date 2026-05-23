@@ -1,13 +1,10 @@
 """Verify SubstrateMinerController exposes an on_new_head async callback.
 
 The callback receives a `SubstrateMiningContext` (what `get_mining_snapshot`
-returns through the event manager) and (in this narrow-scope commit)
-performs a subset of what legacy `_handle_head` does: push
-`live_threshold_milli` to each handle, dispatch fresh work on work-key
-change, short-circuit on same work key.
-
-Cancel-on-key-change and other legacy behaviors are deferred to later
-tasks before `_handle_head` is deleted.
+returns through the event manager) and runs the full guard chain:
+push ``live_threshold_milli`` to each handle, dispatch fresh work on
+work-key change, short-circuit on same work key, drop on zero-seed,
+fail loud on topology mismatch.
 """
 from __future__ import annotations
 
@@ -141,11 +138,10 @@ async def test_on_new_head_skips_dispatch_on_same_work_key(controller):
 async def test_on_new_head_skips_dispatch_on_closed_work_key(controller):
     """If we've already won this round, on_new_head must NOT redispatch.
 
-    Both legacy `_handle_head` and the new `on_new_head` run concurrently
-    during the migration. The legacy path adds the work key to
-    `_closed_work_keys` on a successful submission; `on_new_head` would
-    otherwise still try to dispatch when its next poll fires, producing
-    a proof the chain would reject (stale round).
+    ``_handle_result`` adds the work key to ``_closed_work_keys`` on a
+    successful submission; without this guard, the next event-manager
+    poll would dispatch again, producing a proof the chain would reject
+    (stale round).
     """
     ctrl, handle = controller
     work_key = (b"\x01" * 32, b"\xab" * 32)
@@ -162,9 +158,8 @@ async def test_on_new_head_skips_dispatch_on_closed_work_key(controller):
 
 
 # ---------------------------------------------------------------------------
-# Migrated legacy guards: None snapshot, topology mismatch, zero seed.
-# These were previously only in `_handle_head` (subscription path); they're
-# now in `on_new_head` so the legacy path can be deleted.
+# Guards on the event-manager path: None snapshot, topology mismatch,
+# zero seed.
 # ---------------------------------------------------------------------------
 
 

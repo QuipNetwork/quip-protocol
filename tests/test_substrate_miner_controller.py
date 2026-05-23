@@ -131,7 +131,6 @@ def _bare_controller() -> SubstrateMinerController:
     c._dispatch_contexts = {}
     from collections import OrderedDict
     c._closed_work_keys = OrderedDict()
-    c._consecutive_none_snapshots = 0
     c._highest_handled_block = 0
     c._last_pushed_threshold_milli = 0
     c.topology_hash = None
@@ -409,7 +408,7 @@ async def test_verify_registered_fails_when_miner_missing():
 async def test_mark_work_key_closed_records_block_number(monkeypatch):
     """After a successful submit_proof, the closed-work-key entry must
     carry the receipt's block hash resolved into a block number — so
-    `_handle_head` can later classify stale-vs-current heads."""
+    `_handle_result` can later classify stale-vs-current heads."""
     from substrate.miner_controller import (
         ClosedWorkRecord,
         _work_key,
