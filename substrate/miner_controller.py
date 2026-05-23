@@ -43,6 +43,7 @@ from typing import Awaitable, Callable, Optional, Protocol, Tuple
 
 from websocket import WebSocketException
 
+from shared.asyncio_supervise import supervise
 from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
@@ -523,9 +524,14 @@ class SubstrateMinerController:
         # asyncio result queue. Start them before the first dispatch so we
         # never miss an early result.
         for handle in self.miner_handles:
+            drain_name = f"drain-{handle.miner_id}"
             task = asyncio.create_task(
-                self._drain_handle(handle),
-                name=f"drain-{handle.miner_id}",
+                supervise(
+                    self._drain_handle(handle),
+                    name=drain_name,
+                    on_failure=self._shutdown_event.set,
+                ),
+                name=drain_name,
             )
             self._drainer_tasks.append(task)
 
@@ -536,7 +542,11 @@ class SubstrateMinerController:
         # against an active subscription. Both slots are already
         # connected (the pool's get() did that).
         self._subscription_task = asyncio.create_task(
-            self._subscribe_heads(),
+            supervise(
+                self._subscribe_heads(),
+                name="head-subscription",
+                on_failure=self._shutdown_event.set,
+            ),
             name="head-subscription",
         )
 
@@ -618,7 +628,11 @@ class SubstrateMinerController:
         )
         self.events.subscribe("new_head", self.on_new_head)
         self._event_manager_task = asyncio.create_task(
-            self.events.run(),
+            supervise(
+                self.events.run(),
+                name="chain-event-manager",
+                on_failure=self._shutdown_event.set,
+            ),
             name="chain-event-manager",
         )
         logger.info("ChainEventManager started; polling get_mining_snapshot")
@@ -1408,9 +1422,13 @@ class SubstrateMinerController:
             # _POST_WIN_FAST_FORWARD_TIMEOUT_S so a stalled chain
             # doesn't spin forever.
             asyncio.create_task(
-                self._post_win_fast_forward(
-                    record.accepted_block_hash,
-                    record.accepted_block_number,
+                supervise(
+                    self._post_win_fast_forward(
+                        record.accepted_block_hash,
+                        record.accepted_block_number,
+                    ),
+                    name="post-win-fast-forward",
+                    on_failure=self._shutdown_event.set,
                 ),
                 name="post-win-fast-forward",
             )
