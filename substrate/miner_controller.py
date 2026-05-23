@@ -815,6 +815,14 @@ class SubstrateMinerController:
 
         new_work_key = (ctx.last_proof_block_hash, ctx.topology_hash)
 
+        # Closed-work-key guard: if we already won this round, never
+        # dispatch a fresh proof attempt against the same key. The legacy
+        # _handle_head has the same guard with extra stale-head logging —
+        # we keep it minimal here because the legacy path still runs and
+        # owns the operator-visible bookkeeping.
+        if new_work_key in self._closed_work_keys:
+            return
+
         if new_work_key == self._current_work_key:
             all_idle = all(
                 h._active_dispatch_id == 0 for h in self.miner_handles

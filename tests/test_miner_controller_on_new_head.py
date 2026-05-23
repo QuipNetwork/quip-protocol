@@ -115,3 +115,27 @@ async def test_on_new_head_skips_dispatch_on_same_work_key(controller):
     handle._active_dispatch_id = 1  # currently mining
     await ctrl.on_new_head(ctx)
     assert handle.dispatched_contexts == []  # no new dispatch
+
+
+@pytest.mark.asyncio
+async def test_on_new_head_skips_dispatch_on_closed_work_key(controller):
+    """If we've already won this round, on_new_head must NOT redispatch.
+
+    Both legacy `_handle_head` and the new `on_new_head` run concurrently
+    during the migration. The legacy path adds the work key to
+    `_closed_work_keys` on a successful submission; `on_new_head` would
+    otherwise still try to dispatch when its next poll fires, producing
+    a proof the chain would reject (stale round).
+    """
+    ctrl, handle = controller
+    work_key = (b"\x01" * 32, b"\xab" * 32)
+    # Mark the key as already-won — value can be anything; the check is
+    # membership-only.
+    ctrl._closed_work_keys[work_key] = object()
+    ctx = _make_context(
+        threshold_milli=-5000,
+        last_proof_block_hash=work_key[0],
+        topology_hash=work_key[1],
+    )
+    await ctrl.on_new_head(ctx)
+    assert handle.dispatched_contexts == []
