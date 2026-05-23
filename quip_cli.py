@@ -279,8 +279,7 @@ _TOPOLOGY_HELP = (
     "topology — mismatch fails fast at startup."
 )
 _REST_PORT_HELP = (
-    "Telemetry REST API port (default -1 disables; set to a port to serve /api/v1/*). "
-    "Falls back to --config `rest_port`."
+    "Telemetry REST API port (default 8086). Falls back to --config `rest_port`."
 )
 _REST_HOST_HELP = (
     "Telemetry REST API bind host. Defaults to 127.0.0.1 (loopback-only); set to "
@@ -1028,7 +1027,8 @@ async def _run_concurrent_miner(
                 return 3
 
         # Resolve telemetry port. The sibling process is unconditional;
-        # a non-positive `rest_port` collapses to the default (8086).
+        # any non-positive `rest_port` (legacy `-1` default, `0`, `None`)
+        # collapses to 8086.
         telemetry_port = rest_port if rest_port and rest_port > 0 else 8086
 
         if pow_handles:
