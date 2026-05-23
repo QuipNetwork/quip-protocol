@@ -15,10 +15,25 @@ import asyncio
 import logging
 import multiprocessing as mp
 import multiprocessing.synchronize
+import multiprocessing.reduction
+import queue
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _is_picklable(obj: object) -> bool:
+    """Return True if *obj* can be serialised by the multiprocessing queue.
+
+    mp.Queue uses ``multiprocessing.reduction.ForkingPickler`` internally, so
+    we probe with the same pickler rather than the plain ``pickle`` module.
+    """
+    try:
+        multiprocessing.reduction.ForkingPickler.dumps(obj)
+        return True
+    except Exception:
+        return False
 
 
 @dataclass(frozen=True)
@@ -81,8 +96,8 @@ def validator_main(
         while not shutdown_event.is_set():
             try:
                 req = req_q.get(timeout=0.1)
-            except Exception:
-                # Queue.get raises queue.Empty on timeout; loop and check shutdown.
+            except queue.Empty:
+                # Loop back and check shutdown_event.
                 continue
 
             if not isinstance(req, RpcRequest):
@@ -92,10 +107,22 @@ def validator_main(
             try:
                 method = getattr(client, req.op)
                 result = method(**req.args)
-                resp_q.put(RpcResponse(request_id=req.request_id, result=result))
             except BaseException as exc:  # noqa: BLE001
-                # Send the exception back; parent decides whether to retry / fail.
-                resp_q.put(RpcResponse(request_id=req.request_id, exception=exc))
+                # Eagerly test picklability: mp.Queue serialises in a background
+                # thread, so a try/except around put() won't catch the error.
+                exc_to_send: BaseException = exc
+                if not _is_picklable(exc):
+                    exc_to_send = RuntimeError(f"{type(exc).__name__}: {exc}")
+                resp_q.put(RpcResponse(request_id=req.request_id, exception=exc_to_send))
+                continue
+            # Guard against unpicklable results too.
+            if not _is_picklable(result):
+                safe = RuntimeError(
+                    f"result for op={req.op!r} is not picklable"
+                )
+                resp_q.put(RpcResponse(request_id=req.request_id, exception=safe))
+            else:
+                resp_q.put(RpcResponse(request_id=req.request_id, result=result))
     finally:
         try:
             client.close()

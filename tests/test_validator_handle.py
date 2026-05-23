@@ -42,6 +42,37 @@ class _FakeClient:
         pass
 
 
+class _BadExcClient:
+    """Fake client whose method raises an exception with an unpicklable attribute."""
+
+    def __init__(self, url):
+        self.url = url
+
+    def explode(self):
+        class _Unpicklable:
+            def __reduce__(self):
+                raise TypeError("not picklable")
+
+        exc = RuntimeError("boom")
+        exc.bad_attr = _Unpicklable()  # type: ignore[attr-defined]
+        raise exc
+
+    def close(self):
+        pass
+
+
+def _run_validator_with_bad_exc_client(req_q, resp_q, shutdown_event, url):
+    """Spawn-target wrapper that injects _BadExcClient."""
+    validator_main(
+        url=url,
+        req_q=req_q,
+        resp_q=resp_q,
+        shutdown_event=shutdown_event,
+        rpc_call_timeout_s=10.0,
+        _client_factory=_BadExcClient,
+    )
+
+
 def _run_validator_with_fake_client(req_q, resp_q, shutdown_event, url):
     """Spawn-target wrapper that injects _FakeClient instead of real one."""
     validator_main(
@@ -74,7 +105,11 @@ def test_validator_handle_round_trip_normal_call():
     finally:
         shutdown_event.set()
         proc.join(timeout=5)
-        assert not proc.is_alive()
+        was_alive = proc.is_alive()
+        if was_alive:
+            proc.terminate()
+            proc.join()
+        assert not was_alive, "child process did not exit cleanly within 5s"
 
 
 def test_validator_handle_propagates_exceptions():
@@ -97,6 +132,9 @@ def test_validator_handle_propagates_exceptions():
     finally:
         shutdown_event.set()
         proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()
 
 
 def test_validator_handle_shutdown_event_clean_exit():
@@ -141,3 +179,30 @@ def test_validator_handle_multiple_requests_ordered():
     finally:
         shutdown_event.set()
         proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()
+
+
+def test_validator_handle_unpicklable_exception_does_not_hang_parent():
+    """If a method raises an unpicklable exception, parent still gets a response."""
+    req_q = mp.Queue()
+    resp_q = mp.Queue()
+    shutdown_event = mp.Event()
+    proc = mp.Process(
+        target=_run_validator_with_bad_exc_client,
+        args=(req_q, resp_q, shutdown_event, "http://test"),
+    )
+    proc.start()
+    try:
+        req_q.put(RpcRequest(request_id=1, op="explode", args={}))
+        resp = resp_q.get(timeout=5)
+        assert resp.request_id == 1
+        assert resp.exception is not None
+        assert "RuntimeError" in str(resp.exception) or "boom" in str(resp.exception)
+    finally:
+        shutdown_event.set()
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()
