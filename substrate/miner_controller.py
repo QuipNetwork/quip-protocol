@@ -609,7 +609,15 @@ class SubstrateMinerController:
         await self.pool.start()
 
         def state_key(snapshot):
-            """Dedup key: same (last_proof_block_hash, threshold) → no event."""
+            """Dedup key: same (last_proof_block_hash, threshold) → no event.
+
+            ``None`` snapshots (chain has no topology registered yet) collapse
+            to a stable sentinel so the event manager doesn't crash, and so
+            consecutive Nones look like "no state change" to the dedup —
+            ``on_new_head`` itself owns the consecutive-None escalation.
+            """
+            if snapshot is None:
+                return ("none-snapshot",)
             return (
                 snapshot.last_proof_block_hash,
                 int(snapshot.difficulty.max_energy_milli),
@@ -781,63 +789,142 @@ class SubstrateMinerController:
     # in Task 13 once the event-manager path is the only entry.
     # -------------------------------------------------------------------------
 
-    async def on_new_head(self, ctx: "SubstrateMiningContext") -> None:
+    async def on_new_head(self, ctx: "Optional[SubstrateMiningContext]") -> None:
         """Event-manager callback: a new chain mining context has arrived.
 
         Receives the ``SubstrateMiningContext`` that
-        ``pool.send("get_mining_snapshot", ...)`` returns. Narrow scope
-        for this commit:
+        ``pool.send("get_mining_snapshot", ...)`` returns (or ``None`` if
+        the chain has no registered topology yet). Performs the same set
+        of guards as the legacy ``_handle_head`` path, just without the
+        subscription-specific bits (RPC head promotion, stale-block
+        number guard — both unnecessary when polling).
 
-        - Push the live decayed energy threshold to each handle if it changed.
-        - Dispatch fresh mining work on work-key change
-          (``last_proof_block_hash``, ``topology_hash``).
-        - Short-circuit if handles are already mining the same work key.
-
-        Behaviors from legacy ``_handle_head`` that are NOT yet migrated:
-        cancel-on-key-change, closed-work-key handling, zero-seed guard,
-        stale-block-number guard, RPC head promotion. These are wired in
-        before ``_handle_head`` is deleted. Until then, dispatching a new
-        key while old work is still running will leave the prior workers
-        mining the old context in parallel — acceptable during the
-        transition only.
-
-        Args:
-            ctx: A ``SubstrateMiningContext`` (or duck-type with the same
-                attributes: ``last_proof_block_hash``, ``topology_hash``,
-                and ``difficulty.max_energy_milli``).
+        Guards (in order):
+            1. ``None`` snapshot → bump counter; escalate after
+               ``_NONE_SNAPSHOT_FAIL_THRESHOLD`` consecutive.
+            2. Topology hash mismatch vs ``self.topology_hash`` → fail
+               loud via ``_OperatorFailLoud``.
+            3. Push ``live_threshold_milli`` to each handle if changed.
+            4. Zero-seed guard (chain transient between win + round-roll).
+            5. Closed-work-key short-circuit (we already won this round).
+            6. Same-key short-circuit (mining in progress on same key).
+            7. Cancel any prior dispatch (key changed) and wait for ack.
+            8. Dispatch fresh work to each handle.
         """
-        live_threshold = int(ctx.difficulty.max_energy_milli)
+        self.stats.heads_observed += 1
 
+        # 1. None snapshot — chain isn't seeded with a topology yet, or
+        # the runtime is in a transient state between rounds. Bump the
+        # stat and return. The event manager's watchdog (force_swap on
+        # no state change for ``dead_blocktime_multiplier × blocktime_s``)
+        # handles the validator-side variant; a chain-stuck-globally
+        # escalation can be added as a separate subscriber later.
+        if ctx is None:
+            self.stats.none_snapshots_seen += 1
+            logger.warning(
+                "event manager: get_mining_snapshot returned None"
+            )
+            return
+
+        # 2. Topology mismatch — operator configured a different topology
+        # than the chain is using. Fail loud rather than silently mining
+        # the wrong puzzle.
+        if (
+            self.topology_hash is not None
+            and ctx.topology_hash != self.topology_hash
+        ):
+            raise _OperatorFailLoud(
+                "configured --topology-hash does not match snapshot: "
+                f"expected 0x{self.topology_hash.hex()}, got "
+                f"0x{ctx.topology_hash.hex()}"
+            )
+
+        # 3. Live threshold push (decay-driven; only when changed).
+        live_threshold = int(ctx.difficulty.max_energy_milli)
         if live_threshold != self._last_pushed_threshold_milli:
+            logger.info(
+                "live energy threshold changed: %d → %d milli "
+                "(last_proof=0x%s...)",
+                self._last_pushed_threshold_milli,
+                live_threshold,
+                ctx.last_proof_block_hash.hex()[:16],
+            )
             for handle in self.miner_handles:
                 handle.set_live_threshold_milli(live_threshold)
             self._last_pushed_threshold_milli = live_threshold
 
+        # 4. Zero-seed guard. The chain transiently returns
+        # ``last_proof_block_hash = 0x00..00`` between accepting a proof
+        # and rolling the round. Dispatching against that would produce a
+        # degenerate work key the chain will reject; refuse and wait for
+        # the next poll to see a real seed. The genesis/bootstrap window
+        # (``_highest_handled_block == 0``) is the legitimate zero state.
+        if (
+            ctx.last_proof_block_hash == b"\x00" * 32
+            and self._highest_handled_block > 0
+        ):
+            self.stats.zero_seed_snapshots_dropped += 1
+            logger.warning(
+                "snapshot carries zero last_proof_block_hash; refusing "
+                "dispatch (highest_handled=%d)",
+                self._highest_handled_block,
+            )
+            return
+
         new_work_key = (ctx.last_proof_block_hash, ctx.topology_hash)
 
-        # Closed-work-key guard: if we already won this round, never
-        # dispatch a fresh proof attempt against the same key. The legacy
-        # _handle_head has the same guard with extra stale-head logging —
-        # we keep it minimal here because the legacy path still runs and
-        # owns the operator-visible bookkeeping.
+        # 5. Closed-work-key: we already won this round.
         if new_work_key in self._closed_work_keys:
             return
 
+        # 6. Same-key short-circuit: mining already in progress.
         if new_work_key == self._current_work_key:
             all_idle = all(
                 h._active_dispatch_id == 0 for h in self.miner_handles
             )
             if not all_idle:
+                self.stats.heads_same_key_skipped += 1
                 return
-            # All handles are idle on a key we've seen before; fall through
-            # to re-dispatch (e.g., handles were cancelled externally).
+            # All handles are idle on a known key — fall through to
+            # re-dispatch (workers may have been cancelled externally).
 
-        # TODO: call handle.cancel() on active handles before dispatch on
-        # key change (legacy _handle_head does this; omitted in the narrow
-        # scope so dispatching during transition leaves old workers running).
+        # 7. Work key changed — cancel any prior dispatch, wait for ack.
+        # Parallel wait keeps total stall to ~0.5s regardless of handle
+        # count. Without this synchronization, cancel() → clear() →
+        # dispatch can wipe a cancel before the worker observes it.
+        cancelled_dispatches: list[tuple[MinerHandle, int]] = []
         for handle in self.miner_handles:
-            handle.mine_work_item(ctx)
+            if handle._active_dispatch_id != 0:
+                cancelled_dispatches.append(
+                    (handle, handle._active_dispatch_id)
+                )
+                handle.cancel()
+        if cancelled_dispatches:
+            await asyncio.gather(
+                *[
+                    self._await_handle_done(h, dispatch_id=did, timeout=0.5)
+                    for h, did in cancelled_dispatches
+                ]
+            )
+
+        # 8. Dispatch.
+        self._current_context = ctx
         self._current_work_key = new_work_key
+        logger.info(
+            "new head (event manager): last_proof=0x%s... topology=0x%s... "
+            "nodes=%d edges=%d",
+            ctx.last_proof_block_hash.hex()[:16],
+            ctx.topology_hash.hex()[:16],
+            len(ctx.nodes),
+            len(ctx.edges),
+        )
+        for handle in self.miner_handles:
+            dispatch_id = handle.mine_work_item(ctx)
+            self._dispatch_contexts[(handle.miner_id, dispatch_id)] = ctx
+            self._prune_dispatch_contexts(handle.miner_id, dispatch_id)
+        self.stats.contexts_dispatched += len(self.miner_handles)
+        if self.core is not None:
+            self.core.record_dispatch()
 
     async def _handle_head(self, head_hash: bytes, block_number: int) -> None:
         self.stats.heads_observed += 1

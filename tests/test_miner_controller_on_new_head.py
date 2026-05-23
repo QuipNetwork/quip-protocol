@@ -40,7 +40,12 @@ class _FakeMinerHandle:
 
 @pytest.fixture
 def controller():
-    """A controller wired with fakes only, no real pool/event manager."""
+    """A controller wired with fakes only, no real pool/event manager.
+
+    Sets the minimum set of attributes ``on_new_head`` reads. The
+    full-fat fields (drainer tasks, queues, signer, etc.) are not touched
+    because the tests don't exercise paths that need them.
+    """
     handle = _FakeMinerHandle("miner-1")
     ctrl = SubstrateMinerController.__new__(SubstrateMinerController)
     ctrl.miner_handles = [handle]
@@ -49,13 +54,24 @@ def controller():
     ctrl._last_pushed_threshold_milli = 0
     ctrl._closed_work_keys = {}
     ctrl._highest_handled_block = 0
+    ctrl._dispatch_contexts = {}
+    ctrl.topology_hash = None
+    ctrl.core = None
+    # Stats: SimpleNamespace stub matching the attrs on_new_head touches.
+    ctrl.stats = SimpleNamespace(
+        heads_observed=0,
+        none_snapshots_seen=0,
+        zero_seed_snapshots_dropped=0,
+        heads_same_key_skipped=0,
+        contexts_dispatched=0,
+    )
     return ctrl, handle
 
 
 def _make_context(
     *,
     threshold_milli: int,
-    last_proof_block_hash: bytes = b"\x00" * 32,
+    last_proof_block_hash: bytes = b"\x01" * 32,  # non-zero default (avoids zero-seed guard)
     topology_hash: bytes = b"\xab" * 32,
 ) -> SimpleNamespace:
     """Build a SubstrateMiningContext-shaped object with attribute access.
@@ -68,6 +84,10 @@ def _make_context(
         last_proof_block_hash=last_proof_block_hash,
         topology_hash=topology_hash,
         difficulty=SimpleNamespace(max_energy_milli=threshold_milli),
+        # on_new_head logs len(nodes) / len(edges) on dispatch; provide empty
+        # sequences so the log line doesn't crash.
+        nodes=(),
+        edges=(),
     )
 
 
@@ -139,3 +159,64 @@ async def test_on_new_head_skips_dispatch_on_closed_work_key(controller):
     )
     await ctrl.on_new_head(ctx)
     assert handle.dispatched_contexts == []
+
+
+# ---------------------------------------------------------------------------
+# Migrated legacy guards: None snapshot, topology mismatch, zero seed.
+# These were previously only in `_handle_head` (subscription path); they're
+# now in `on_new_head` so the legacy path can be deleted.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_on_new_head_none_snapshot_is_no_op(controller):
+    """None snapshot (no topology registered) bumps a stat and returns."""
+    ctrl, handle = controller
+    await ctrl.on_new_head(None)
+    assert handle.threshold_pushes == []
+    assert handle.dispatched_contexts == []
+    assert ctrl.stats.none_snapshots_seen == 1
+
+
+@pytest.mark.asyncio
+async def test_on_new_head_topology_mismatch_fails_loud(controller):
+    """Configured topology_hash != snapshot.topology_hash → _OperatorFailLoud."""
+    from substrate.miner_controller import _OperatorFailLoud
+
+    ctrl, handle = controller
+    ctrl.topology_hash = b"\xab" * 32  # expected
+    ctx = _make_context(
+        threshold_milli=-5000,
+        topology_hash=b"\xcd" * 32,  # snapshot mismatches
+    )
+    with pytest.raises(_OperatorFailLoud, match="does not match snapshot"):
+        await ctrl.on_new_head(ctx)
+
+
+@pytest.mark.asyncio
+async def test_on_new_head_zero_seed_guard_blocks_dispatch(controller):
+    """A zero last_proof_block_hash with handled_block > 0 must skip dispatch."""
+    ctrl, handle = controller
+    ctrl._highest_handled_block = 100  # not genesis any more
+    ctx = _make_context(
+        threshold_milli=-5000,
+        last_proof_block_hash=b"\x00" * 32,  # the transient zero state
+    )
+    await ctrl.on_new_head(ctx)
+    assert handle.dispatched_contexts == []
+    assert ctrl.stats.zero_seed_snapshots_dropped == 1
+
+
+@pytest.mark.asyncio
+async def test_on_new_head_zero_seed_allowed_during_bootstrap(controller):
+    """Zero last_proof_block_hash is OK at genesis (highest_handled_block == 0)."""
+    ctrl, handle = controller
+    # _highest_handled_block stays at 0 (default) — bootstrap state.
+    ctx = _make_context(
+        threshold_milli=-5000,
+        last_proof_block_hash=b"\x00" * 32,
+    )
+    await ctrl.on_new_head(ctx)
+    # Threshold was pushed (it's a normal dispatch path) AND mine_work_item ran.
+    assert handle.threshold_pushes == [-5000]
+    assert len(handle.dispatched_contexts) == 1
