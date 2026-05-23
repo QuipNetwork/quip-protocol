@@ -5,10 +5,7 @@ Provides the `quip-miner` console command with subcommands:
 - bootstrap  - fund + register a miner account against a substrate chain
 - cpu / gpu / qpu - run a miner against a substrate chain
 
-The legacy `quip-network-node` / `quip-network-simulator` commands were
-removed in the v0.1 -> v0.2 refactor. Their state and orchestration are
-now owned by the substrate node (quip-protocol-rs); miners attach via
-SubstrateMinerController.
+Runtime architecture is documented in ARCHITECTURE.md at the repo root.
 """
 
 from __future__ import annotations

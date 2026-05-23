@@ -47,39 +47,18 @@ class QuipFormatter(logging.Formatter):
         """Parse logger name and extract component and identifier."""
         logger_name = record.name
 
-        # Handle miner loggers: miner.{miner_id}
+        # Miner loggers: miner.{miner_id} (created by shared/miner_worker.py)
         if logger_name.startswith('miner.'):
             miner_id = logger_name.split('.', 1)[1]
             return 'miner', miner_id
 
-        # Handle network node loggers: network_node.{node_id}
-        if logger_name.startswith('network_node.'):
-            node_id = logger_name.split('.', 1)[1]
-            return 'network_node', node_id
-
-        # Handle node loggers: node.{node_id}
-        if logger_name.startswith('node.'):
-            node_id = logger_name.split('.', 1)[1]
-            return 'node', node_id
-
-        # Handle legacy shared.* loggers for backward compatibility
-        if logger_name.startswith('shared.'):
-            component = logger_name[7:]  # Remove 'shared.' prefix
-            return component, 'legacy'
-
-        # Handle other module-level loggers by extracting meaningful names
+        # Module-level loggers (e.g. 'substrate.miner_controller', 'shared.base_miner')
         if '.' in logger_name:
             parts = logger_name.split('.')
             if len(parts) >= 2:
-                # For loggers like 'quantum_blockchain_network', 'blockchain_base', etc.
-                if 'blockchain' in logger_name:
-                    return 'blockchain', parts[-1]
-                elif 'network' in logger_name:
-                    return 'network', parts[-1]
-                elif 'miner' in logger_name:
+                if 'miner' in logger_name:
                     return 'miner', parts[-1]
-                else:
-                    return parts[0], parts[-1]
+                return parts[0], parts[-1]
 
         # Fallback for other loggers
         return 'unknown', logger_name
@@ -144,12 +123,6 @@ def setup_logging(
 
     root_logger.addHandler(console_handler)
 
-    # Suppress verbose aioquic connection logs
-    # (version negotiation, ALPN, duplicate CRYPTO)
-    quic_logger = logging.getLogger("quic")
-    quic_logger.setLevel(logging.WARNING)
-    quic_logger.propagate = True
-
     # Configure aiohttp logging
     if http_log_file:
         # Create aiohttp logger
@@ -192,39 +165,12 @@ def setup_logging(
         aiohttp_logger.setLevel(logging.CRITICAL)
         aiohttp_logger.propagate = False
 
-    # Create component-specific loggers
-    loggers = {}
-
-    # NetworkNode logger - use node_name parameter
-    network_node_logger = logging.getLogger(f'network_node.{node_name}')
-    network_node_logger.setLevel(numeric_level)
-    loggers['network_node'] = network_node_logger
-
-    # Node logger - use node_name parameter
-    node_logger = logging.getLogger(f'node.{node_name}')
-    node_logger.setLevel(numeric_level)
-    loggers['node'] = node_logger
-
-    # Configure miner parent logger to ensure all miner.* loggers inherit proper formatting
+    # Configure miner parent logger so all miner.* children inherit formatting
     miner_parent_logger = logging.getLogger('miner')
     miner_parent_logger.setLevel(numeric_level)
-    # Ensure propagation is enabled (should be default, but let's be explicit)
     miner_parent_logger.propagate = True
-    loggers['miner'] = miner_parent_logger
 
-    # Keep individual miner type loggers for backward compatibility
-    miner_types = ['cpu_miner', 'gpu_miner', 'qpu_miner', 'sa_miner']
-    for miner_type in miner_types:
-        miner_logger = logging.getLogger(f'miner.{miner_type}')
-        miner_logger.setLevel(numeric_level)
-        loggers[miner_type] = miner_logger
-
-    # Blockchain logger
-    blockchain_logger = logging.getLogger('quantum_blockchain')
-    blockchain_logger.setLevel(numeric_level)
-    loggers['blockchain'] = blockchain_logger
-
-    return loggers
+    return {'miner': miner_parent_logger}
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -232,7 +178,7 @@ def get_logger(name: str) -> logging.Logger:
     Get a logger for a specific component.
 
     Args:
-        name: Logger name (e.g., 'network_node', 'cpu_miner', etc.)
+        name: Logger name (e.g., 'miner', 'base_miner', etc.)
 
     Returns:
         Configured logger instance
@@ -300,7 +246,7 @@ def init_component_logger(component: str, identifier: str) -> logging.Logger:
     for use by static functions in the module.
 
     Args:
-        component: Component type (e.g., 'network_node', 'miner', 'node')
+        component: Component type (e.g., 'miner', 'substrate')
         identifier: Unique identifier for this instance
 
     Returns:
