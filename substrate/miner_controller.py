@@ -487,6 +487,15 @@ class SubstrateMinerController:
         self._shutdown_event = asyncio.Event()
         self._drainer_tasks: list[asyncio.Task] = []
         self._subscription_task: Optional[asyncio.Task] = None
+        # Public alias for the pool, matching the Plan 3 design. Same object
+        # as ``self._pool``; both names point to the back-compat-shimmed
+        # ValidatorPool. New event-manager wiring uses ``self.pool``.
+        self.pool = pool
+        # ChainEventManager task — set in run() after the event manager
+        # is constructed. Polls the pool's new send() path at adaptive
+        # cadence and dispatches on_new_head when state changes.
+        self._event_manager_task: Optional[asyncio.Task] = None
+        self.events = None  # set in run()
         # Running count of consecutive None snapshots; reset on a successful
         # snapshot. Escalates to RuntimeError after _NONE_SNAPSHOT_FAIL_THRESHOLD.
         self._consecutive_none_snapshots = 0
@@ -531,6 +540,22 @@ class SubstrateMinerController:
             name="head-subscription",
         )
 
+        # New: spawn the pool's active validator child and start the
+        # ChainEventManager. The legacy subscription above feeds
+        # _handle_head; the new path feeds on_new_head. Both run
+        # simultaneously — same-key short-circuit and threshold-dedup
+        # make duplicate fires safe. The legacy subscription is removed
+        # in a follow-up once the new path is proven in production.
+        try:
+            await self._start_event_manager(account)
+        except Exception:
+            # Non-fatal: legacy subscription path still works. Log loudly
+            # so operators see the regression rather than a silent fallback.
+            logger.exception(
+                "event manager startup failed; continuing on legacy "
+                "subscription path only"
+            )
+
         # Prime the loop with the current head so we don't sit idle waiting
         # for the next slot. block_number is informational only here
         # (the head handler re-fetches the snapshot at this hash and uses
@@ -544,6 +569,59 @@ class SubstrateMinerController:
             await self._main_loop()
         finally:
             await self._teardown()
+
+    # ------------------------------------------------------------------
+    # Event manager wiring
+    # ------------------------------------------------------------------
+
+    async def _start_event_manager(self, account: bytes) -> None:
+        """Spawn the pool's active validator child and start the event manager.
+
+        Polls ``get_mining_snapshot`` at adaptive cadence (default 85% of
+        blocktime; 10% when overdue) and fires ``on_new_head`` when the
+        snapshot's ``(last_proof_block_hash, max_energy_milli)`` changes.
+        The watchdog calls ``pool.force_swap()`` if no change is observed
+        for ``dead_blocktime_multiplier × blocktime_s``.
+        """
+        # Defer imports to keep the legacy path importable even if these
+        # modules grow heavier dependencies later.
+        from substrate.event_manager import ChainEventManager
+
+        # The on-chain `derive_nonce` hashes the SCALE-encoded account ID
+        # to produce a width-stable 32-byte miner identity. Same blake2b
+        # form used by _handle_head — kept in lock-step so both paths see
+        # the same snapshot.
+        canonical_miner = hashlib.blake2b(account, digest_size=32).digest()
+
+        # Spawn the pool's active validator child. This is when the new
+        # path actually touches the network; before this, ``send()`` would
+        # raise "pool not started".
+        await self.pool.start()
+
+        def state_key(snapshot):
+            """Dedup key: same (last_proof_block_hash, threshold) → no event."""
+            return (
+                snapshot.last_proof_block_hash,
+                int(snapshot.difficulty.max_energy_milli),
+            )
+
+        self.events = ChainEventManager(
+            pool=self.pool,
+            state_key=state_key,
+            snapshot_op="get_mining_snapshot",
+            snapshot_args={
+                "miner_account_bytes": canonical_miner,
+                "at": None,
+                "topology_hash": self.topology_hash,
+            },
+            blocktime_s=6.0,
+        )
+        self.events.subscribe("new_head", self.on_new_head)
+        self._event_manager_task = asyncio.create_task(
+            self.events.run(),
+            name="chain-event-manager",
+        )
+        logger.info("ChainEventManager started; polling get_mining_snapshot")
 
     # ------------------------------------------------------------------
     # Startup checks
@@ -2066,11 +2144,21 @@ class SubstrateMinerController:
             task.cancel()
         if self._subscription_task is not None:
             self._subscription_task.cancel()
+        # Signal the event manager to stop polling. Its internal loops
+        # observe the flag and exit cleanly; the task itself is awaited
+        # below via the unified cancellation sweep.
+        if self.events is not None:
+            self.events.request_shutdown()
+        if self._event_manager_task is not None:
+            self._event_manager_task.cancel()
         # Await cancellations. Narrow catch: CancelledError is expected,
         # other exceptions are real cleanup failures worth surfacing.
-        for task in self._drainer_tasks + (
-            [self._subscription_task] if self._subscription_task else []
-        ):
+        extras: list[asyncio.Task] = []
+        if self._subscription_task is not None:
+            extras.append(self._subscription_task)
+        if self._event_manager_task is not None:
+            extras.append(self._event_manager_task)
+        for task in self._drainer_tasks + extras:
             try:
                 await task
             except asyncio.CancelledError:
@@ -2082,9 +2170,11 @@ class SubstrateMinerController:
                 )
         self._drainer_tasks.clear()
         self._subscription_task = None
+        self._event_manager_task = None
         # Slot clients are owned by the pool; do NOT close them here.
         # The pool's close() (called from the CLI's outer try/finally)
-        # tears them down at process shutdown.
+        # tears them down at process shutdown. The pool's own shutdown()
+        # — invoked by close() — shuts down the active ValidatorHandle.
 
 
 # ----------------------------------------------------------------------
