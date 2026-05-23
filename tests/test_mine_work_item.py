@@ -26,7 +26,7 @@ from shared.work_context import requirements_from_context, resolve_ising
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from shared.quantum_proof_of_work import derive_nonce
-from shared.substrate_submitter import encode_quantum_proof
+from substrate.submitter import encode_quantum_proof
 from shared.allowed_value_spec import AllowedValueSet
 from substrate.types import (
     SubstrateDifficulty,

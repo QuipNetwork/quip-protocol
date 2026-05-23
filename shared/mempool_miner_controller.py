@@ -649,7 +649,7 @@ class MempoolMinerController:
         # `solutions: BoundedVec<BoundedVec<i8, MaxNodes>, MaxSolutions>`
         # — both layers are 1-field composites in substrate metadata,
         # so each inner solution AND the outer list need 1-tuple wrapping.
-        # Matches `shared.substrate_submitter.encode_quantum_proof` shape.
+        # Matches `substrate.submitter.encode_quantum_proof` shape.
         solutions_wrapped = ([(sol,) for sol in solutions],)
 
         try:

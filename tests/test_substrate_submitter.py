@@ -1,4 +1,4 @@
-"""Unit tests for `shared.substrate_submitter.encode_quantum_proof` and the
+"""Unit tests for `substrate.submitter.encode_quantum_proof` and the
 spin normalization helper.
 
 The submitter is the float-to-milli boundary between Python (floats) and
@@ -17,7 +17,7 @@ import pytest
 from shared.allowed_value_spec import AllowedValueSet
 from shared.miner_types import MiningResult
 from shared.packed_solution import unpack_solution
-from shared.substrate_submitter import (
+from substrate.submitter import (
     MILLI_SCALE,
     _normalize_spins,
     encode_quantum_proof,

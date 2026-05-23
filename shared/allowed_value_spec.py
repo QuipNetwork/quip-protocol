@@ -7,7 +7,7 @@ The variant determines both the sampling distribution and the on-chain
 bit-width used when a value is encoded in a SCALE payload.
 
 All milli-precision values are i32 (multiply by ``MILLI_SCALE`` to read as
-float). The shared scale constant lives in ``shared.substrate_submitter`` —
+float). The shared scale constant lives in ``substrate.submitter`` —
 re-exported here as ``MILLI_SCALE`` so callers don't need both imports.
 """
 from __future__ import annotations
@@ -289,7 +289,7 @@ def scale_dict(spec: AllowedValueSpec) -> dict:
     interface accepts ``{"VariantName": payload}`` for SCALE enums. The
     ``Set`` payload is a ``BoundedVec<i32>`` which substrate-interface wants
     wrapped in a 1-tuple — same rule as ``BoundedVec`` elsewhere in the
-    codebase (see ``shared/substrate_submitter.py``).
+    codebase (see ``substrate/submitter.py``).
     """
     if isinstance(spec, AllowedValueSet):
         return {"Set": (list(int(v) for v in spec.values),)}

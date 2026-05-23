@@ -49,7 +49,7 @@ from shared.miner_worker import MinerHandle
 from shared.signer import Signer
 from substrate.client import NoValidatorReachable, SubstrateClient
 from shared.mining_attempt_log import SubmissionLogger
-from shared.substrate_submitter import encode_quantum_proof, submit_proof
+from substrate.submitter import encode_quantum_proof, submit_proof
 from shared.validator_pool import ValidatorPool
 from substrate.types import (
     ExtrinsicReceipt,
