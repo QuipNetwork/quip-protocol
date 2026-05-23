@@ -52,7 +52,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Literal, Optional, Sequence
+from typing import Any, Callable, Literal, Optional, Sequence
 
 from scalecodec.base import ScaleBytes
 from scalecodec.types import GenericExtrinsic
@@ -909,172 +909,6 @@ class SubstrateClient:
             error=error_msg,
         )
 
-    # ------------------------------------------------------------------
-    # Subscriptions
-    # ------------------------------------------------------------------
-
-    async def subscribe_new_heads(
-        self,
-        callback: Callable[[bytes, int], Awaitable[None]],
-        finalized_only: bool = False,
-    ) -> None:
-        """Block until cancelled, invoking `callback(block_hash, block_number)`
-        from a single pump task tied to the *current* best head.
-
-        Pump model (vs. the old per-header dispatch): the websocket reader
-        thread only signals — it never schedules per-number lookups. A
-        single asyncio task waits on the signal, queries ``get_chain_head``
-        (or ``get_chain_finalised_head``) once per wake, fetches the block
-        number, and invokes the callback. If more headers arrived during
-        the work, the signal is set again and the next iteration starts
-        immediately. That coalesces a burst of N headers into one (or two)
-        callback invocations driven by *current* chain state.
-
-        Why this matters: the old model spawned one
-        ``run_coroutine_threadsafe(_handle_head(number))`` per header and
-        each coroutine did its own ``get_block_hash(block_id=number)``
-        through the serialised ``_run`` lock. Under RPC load, those
-        per-number lookups completed out of order and overwrote the
-        controller's "latest head" slot with *historical* hashes —
-        ``mining_snapshot(at=stale_hash)`` then correctly returns a stale
-        ``last_proof_block_hash`` and the miner spins on an already-won
-        round. See incident 2026-05-21 in the v0.2 branch history.
-
-        ``substrate-interface`` invokes the subscribe dispatch on its
-        websocket reader thread. We do **not** make synchronous RPC calls
-        from that thread (that would deadlock the reader waiting on its
-        own response); the reader's only job here is
-        ``loop.call_soon_threadsafe(pump_event.set)``.
-
-        The subscribe call itself bypasses ``_call_lock``: substrate-interface
-        keeps the websocket in receive mode for the subscription's lifetime,
-        which would otherwise hold the lock forever and deadlock every other
-        ``_run`` caller. Callers that need to share a client across submissions
-        and subscriptions should pass a dedicated ``subscription_client`` to
-        the controller (the controller already enforces this).
-        """
-        loop = asyncio.get_running_loop()
-        pump_event = asyncio.Event()
-
-        def _dispatch(obj, update_nr: int, subscription_id: str):  # noqa: ARG001
-            # Reader-thread side: signal only. No RPC, no per-header
-            # bookkeeping. We don't even look at the header payload — the
-            # pump fetches the current best head on its own, so any header
-            # at all is enough to know "something changed".
-            try:
-                loop.call_soon_threadsafe(pump_event.set)
-            except RuntimeError:
-                # Loop is closed (controller is tearing down). Swallow —
-                # the pump task will be cancelled on the same path.
-                pass
-
-        async def _pump() -> None:
-            head_fn_name = (
-                "get_chain_finalised_head" if finalized_only else "get_chain_head"
-            )
-            while True:
-                await pump_event.wait()
-                pump_event.clear()
-
-                # If close() or reconnect() cleared `_iface` between the
-                # signal arriving and us waking up, swallow this wake.
-                # The next reconnect will install a new iface and the
-                # subscription will resume.
-                iface = self._iface
-                if iface is None:
-                    logger.debug(
-                        "subscribe_new_heads pump: iface is None — skipping"
-                    )
-                    continue
-
-                # Catch broadly: anything that escapes here would silently
-                # kill the pump task while the executor-side subscribe
-                # keeps running and setting `pump_event`. That deadlocks
-                # the controller (head_signal never fires) without any
-                # log or stats counter. Sources of non-connection
-                # exceptions include: header SCALE shape drift after a
-                # runtime upgrade (KeyError on `header["header"]["number"]`),
-                # `_iface` cleared mid-call (AttributeError), and
-                # exceptions raised by `callback`. `_run` already handles
-                # WebSocketException/ConnectionError via failover; any
-                # exception that propagates here means failover gave up
-                # (NoValidatorReachable) or the failure is non-transport.
-                # Log and continue — the next subscribe callback will
-                # re-arm pump_event and we'll retry against the latest
-                # chain state.
-                try:
-                    head_hex = await self._run(
-                        lambda: getattr(self._iface, head_fn_name)()
-                    )
-                    head_bytes = bytes.fromhex(_strip_0x(head_hex))
-                    # Same DigestItem-resilience as the subscribe call: a
-                    # header we can't fully SCALE-decode is still useful —
-                    # we only need the `number` field.
-                    header = await self._run(
-                        lambda: self._iface.get_block_header(
-                            block_hash=head_hex, ignore_decoding_errors=True
-                        )
-                    )
-                    number = _coerce_block_number(header["header"]["number"])
-                    await callback(head_bytes, number)
-                except asyncio.CancelledError:
-                    raise
-                except NoValidatorReachable:
-                    # Failover gave up — keep retrying on pump_event is
-                    # pointless because the subscription is also dead.
-                    # Propagate so the outer `_subscribe_heads` (or the
-                    # controller wrapping it) sees the exhausted-failover
-                    # state and escalates instead of silently going inert.
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "subscribe_new_heads pump iteration failed "
-                        "(%s: %s); will retry on next chain head",
-                        type(exc).__name__,
-                        exc,
-                    )
-
-        # Prime the pump so the first head is delivered without waiting
-        # for the next chain notification. Important on startup against a
-        # quiet chain.
-        pump_event.set()
-        pump_task = asyncio.create_task(_pump(), name="subscribe-new-heads-pump")
-
-        try:
-            # Bypass `_call_lock` for the long-lived subscribe — see docstring.
-            # `ignore_decoding_errors=True` keeps a header that
-            # substrate-interface can't fully decode (e.g. an unknown
-            # `DigestItem` variant after a runtime upgrade) from killing
-            # the whole subscription. The pump doesn't read the header
-            # payload anyway — it only needs the wake signal — so we
-            # don't lose information by tolerating these decode failures.
-            await loop.run_in_executor(
-                None,
-                lambda: self._iface.subscribe_block_headers(
-                    _dispatch,
-                    finalized_only=finalized_only,
-                    ignore_decoding_errors=True,
-                ),
-            )
-        finally:
-            pump_task.cancel()
-            pump_exc: Optional[BaseException] = None
-            try:
-                await pump_task
-            except asyncio.CancelledError:
-                pass
-            except NoValidatorReachable as exc:
-                # Failover exhausted inside the pump. Capture and
-                # re-raise after the finally completes so the outer
-                # caller (controller's `_subscribe_heads`) sees the
-                # exhausted-failover signal and shuts down instead of
-                # waiting on a dead subscription. Without this, the
-                # `except Exception` branch below would log + swallow.
-                pump_exc = exc
-            except Exception:  # noqa: BLE001
-                logger.exception("subscribe_new_heads pump task crashed")
-            if pump_exc is not None:
-                raise pump_exc
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1083,10 +917,9 @@ class SubstrateClient:
     async def _run(self, fn):
         """Run a blocking substrate-interface call with failover-on-loss.
 
-        Almost all callers go through this method, so the `_call_lock`
-        taken inside `_raw_run` guarantees serial access to the underlying
-        `SubstrateInterface`. The exception is `subscribe_new_heads`,
-        which intentionally bypasses the lock — see its docstring.
+        All callers go through this method, so the `_call_lock` taken
+        inside `_raw_run` guarantees serial access to the underlying
+        `SubstrateInterface`.
 
         Failover semantics: a `WebSocketException` or `ConnectionError`
         from the call body triggers one `reconnect()` attempt, then the
