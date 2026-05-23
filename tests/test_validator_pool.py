@@ -1,4 +1,4 @@
-"""Unit tests for `shared.validator_pool.ValidatorPool`.
+"""Unit tests for \`substrate.pool.ValidatorPool\`.
 
 The pool sits between the controllers and the `SubstrateClient`
 instances they would otherwise own directly. These tests cover the
@@ -22,7 +22,7 @@ import pytest
 
 from substrate import client as sc_module
 from substrate.client import NoValidatorReachable, SubstrateClient
-from shared.validator_pool import ValidatorPool
+from substrate.pool import ValidatorPool
 
 
 class _StubInterface:

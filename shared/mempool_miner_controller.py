@@ -66,7 +66,7 @@ from shared.miner_worker import MinerHandle
 from shared.signer import Signer
 from substrate.client import NoValidatorReachable, SubstrateClient
 from shared.topology_hash import topology_hash
-from shared.validator_pool import ValidatorPool
+from substrate.pool import ValidatorPool
 
 
 logger = get_logger("mempool_miner_controller")

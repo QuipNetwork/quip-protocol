@@ -388,7 +388,7 @@ def test_init_rejects_empty_miner_handles():
     attached. (The old foot-gun check rejecting `subscription_client is
     client` is gone — the pool guarantees distinct slots by role name,
     so the bug it prevented is impossible by construction.)"""
-    from shared.validator_pool import ValidatorPool
+    from substrate.pool import ValidatorPool
 
     pool = ValidatorPool(urls=["ws://test:9944"])
     signer = MagicMock()
@@ -1564,7 +1564,7 @@ async def _live_controller(
         }
         handle = MinerHandle(spec=spec)
 
-    from shared.validator_pool import ValidatorPool
+    from substrate.pool import ValidatorPool
     pool = ValidatorPool(urls=[DEFAULT_URL])
     controller = SubstrateMinerController(
         pool=pool,

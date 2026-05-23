@@ -179,7 +179,7 @@ async def bootstrap(config: BootstrapConfig) -> BootstrapResult:
     # validator_pool module's load order — this function is sometimes
     # invoked from contexts (tests, faucet harness) that don't need
     # the pool machinery; only the actual bootstrap flow does.
-    from shared.validator_pool import ValidatorPool
+    from substrate.pool import ValidatorPool
 
     keystore = load_or_generate(config.signer_key_path)
     logger.info(

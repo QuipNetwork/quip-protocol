@@ -147,7 +147,7 @@ class SubstrateClient:
         pool: Optional[Any] = None,
     ) -> None:
         # `pool` is typed as `Any` to avoid a circular import with
-        # `shared.validator_pool`. Duck-typed: pool just needs an
+        # \`substrate.pool\`. Duck-typed: pool just needs an
         # `async advance_rotation(from_url: str) -> str` method.
         if url is not None and urls is not None:
             raise ValueError(

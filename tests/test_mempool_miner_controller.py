@@ -466,7 +466,7 @@ async def test_controller_submits_solution_end_to_end(tmp_path):
     }
     handle = MinerHandle(spec=spec)
 
-    from shared.validator_pool import ValidatorPool
+    from substrate.pool import ValidatorPool
     pool = ValidatorPool(urls=[DEFAULT_URL])
     controller = MempoolMinerController(
         pool=pool,

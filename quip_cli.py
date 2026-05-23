@@ -60,7 +60,7 @@ from shared.system_info import (
     validate_descriptor,
 )
 from shared.telemetry_api import TelemetryApiServer
-from shared.validator_pool import ValidatorPool
+from substrate.pool import ValidatorPool
 
 
 _AUTO_IDENTIFY_LOGGER = logging.getLogger("quip_miner.auto_identify")
