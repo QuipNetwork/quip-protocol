@@ -680,3 +680,76 @@ def test_evaluate_sampleset_submit_floor_is_worst_recomputed_energy():
         "across the selected 5 — that's what the chain effectively "
         f"gates against. got {result.submit_floor_energy}"
     )
+
+
+def test_attempt_log_records_num_valid_and_diversity_on_stored_iteration(
+    cpu_miner, relaxed_context,
+):
+    """An iteration that post-processes (``post_processed=true``) but does
+    NOT submit must still record ``num_valid`` and ``diversity_milli`` on
+    the per-iteration attempt log — diagnostic loss otherwise (we can't
+    see how close stored / rejected attempts came to the chain floor).
+
+    Drives ``mine_work_item`` through one substrate-ratchet iteration with
+    a live decay threshold so strict the submit gate cannot pass, then
+    asserts the captured ``AttemptLogger.record(...)`` kwargs carry
+    integer ``num_valid`` and ``diversity_milli`` for the stored case
+    (``result_kind="stored"``). Regression for the case where the submit
+    gate rebinds the local ``result`` to ``None`` before log kwargs are
+    assembled.
+    """
+    from unittest.mock import MagicMock
+
+    # Capture every record() call made by the loop.
+    captured = []
+    recording_logger = MagicMock()
+    recording_logger.record.side_effect = lambda **kw: (
+        captured.append(kw), stop.set(),
+    )
+
+    # Force the submit gate to fail: set the live threshold so far below
+    # any reachable Ising energy that no floor can clear it. The post-
+    # processing branch still fires because ratchet_threshold (= the
+    # context's relaxed difficulty_energy) is easily beaten.
+    live_var = mp.Value('q', -10**18)
+
+    # Install both onto the miner. ``mine_work_item`` reads
+    # ``_attempt_logger`` and ``_live_max_energy_milli`` directly off
+    # ``self``; module-scope fixture means we must clean up after.
+    cpu_miner._attempt_logger = recording_logger
+    cpu_miner._live_max_energy_milli = live_var
+
+    stop = mp.Event()
+    try:
+        result = cpu_miner.mine_work_item(relaxed_context, stop)
+    finally:
+        del cpu_miner._attempt_logger
+        del cpu_miner._live_max_energy_milli
+
+    # Submit gate forced to fail → loop returns None (stop was set by
+    # the mock as soon as one record was emitted).
+    assert result is None
+    assert captured, "expected at least one AttemptLogger.record call"
+
+    # Find an iteration that post-processed; the test setup guarantees
+    # the first such record will be ``stored`` (no prior stored_best to
+    # beat, so any valid post-processed result becomes stored) — submit
+    # blocked by the impossibly-low live threshold.
+    post_processed = [k for k in captured if k.get("post_processed")]
+    assert post_processed, (
+        "expected at least one post_processed=True record; got "
+        f"{[k.get('result_kind') for k in captured]}"
+    )
+    rec = post_processed[0]
+    assert rec["result_kind"] == "stored", (
+        f"expected result_kind='stored' (submit gate forced to fail), "
+        f"got {rec['result_kind']}"
+    )
+    assert isinstance(rec["num_valid"], int) and rec["num_valid"] >= 1, (
+        f"num_valid must be a populated int on post-processed stored "
+        f"iteration, got {rec['num_valid']!r}"
+    )
+    assert isinstance(rec["diversity_milli"], int), (
+        f"diversity_milli must be a populated int on post-processed "
+        f"stored iteration, got {rec['diversity_milli']!r}"
+    )

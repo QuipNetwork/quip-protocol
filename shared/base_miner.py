@@ -563,6 +563,14 @@ class BaseMiner(ABC):
                     )
 
                     result = None
+                    # Values captured from the post-processed eval so the
+                    # submit-gate's later rebind of `result` doesn't
+                    # destroy them — we want them logged on every
+                    # ``post_processed=true`` iteration, not just the
+                    # submitted ones. No new computation: these are
+                    # already produced by ``evaluate_sampleset``.
+                    post_num_valid: Optional[int] = None
+                    post_diversity_milli: Optional[int] = None
                     if iter_best_energy < ratchet_threshold:
                         # Lenient eval — diversity + min_solutions
                         # still required, but no energy gate. The
@@ -574,12 +582,15 @@ class BaseMiner(ABC):
                             strict_energy=False,
                         )
                         attempt_log_kwargs["post_processed"] = True
-                        if result is not None and (
-                            stored_best is None
-                            or result.energy < stored_best.energy
-                        ):
-                            stored_best = result
-                            stored_replaced = True
+                        if result is not None:
+                            post_num_valid = result.num_valid
+                            post_diversity_milli = int(result.diversity * 1000)
+                            if (
+                                stored_best is None
+                                or result.energy < stored_best.energy
+                            ):
+                                stored_best = result
+                                stored_replaced = True
 
                     self.timing_stats['postprocessing'].append(
                         (time.time() - postprocess_start) * 1e6,
@@ -612,11 +623,8 @@ class BaseMiner(ABC):
                     attempt_log_kwargs.update(
                         threshold_milli=live_threshold_milli,
                         ratchet_threshold_milli=int(ratchet_threshold * 1000),
-                        num_valid=(result.num_valid if result is not None else None),
-                        diversity_milli=(
-                            int(result.diversity * 1000)
-                            if result is not None else None
-                        ),
+                        num_valid=post_num_valid,
+                        diversity_milli=post_diversity_milli,
                         stored_as_best=stored_replaced,
                         result_kind=(
                             "submitted" if result is not None
