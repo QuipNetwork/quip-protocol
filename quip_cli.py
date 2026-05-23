@@ -52,7 +52,7 @@ from substrate.client import (
     NoValidatorReachable,
     SubstrateClient,
 )
-from shared.substrate_miner_controller import SubstrateMinerController
+from substrate.miner_controller import SubstrateMinerController
 from shared.system_info import (
     DescriptorValidationError,
     build_descriptor,

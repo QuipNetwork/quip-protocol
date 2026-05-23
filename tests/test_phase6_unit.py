@@ -21,7 +21,7 @@ from shared.miner_bootstrap import (
     _maybe_seed_chain,
 )
 from substrate.client import SubstrateClient
-from shared.substrate_miner_controller import (
+from substrate.miner_controller import (
     ControllerStats,
     SubstrateMinerController,
 )

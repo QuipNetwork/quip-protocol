@@ -1,4 +1,4 @@
-"""Unit + integration tests for `shared.substrate_miner_controller`.
+"""Unit + integration tests for `substrate.miner_controller`.
 
 Unit tests cover the submission-error classification logic, stale-result
 drop paths, dispatch-tracking races, the fatal-receipt raise path, head
@@ -37,7 +37,7 @@ from shared.miner_bootstrap import BootstrapConfig, _maybe_seed_chain, _resolve_
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from substrate.client import SubstrateClient
-from shared.substrate_miner_controller import (
+from substrate.miner_controller import (
     FATAL_SUBMISSION_ERRORS,
     STALE_SUBMISSION_ERRORS,
     ControllerStats,
@@ -105,7 +105,7 @@ def _set_current(controller, ctx) -> None:
     staleness check in `_handle_result` finds a baseline to compare against.
     Phase 4 (storm-prevention) split the work-key check out of the
     context-equality check, so tests must now seed both."""
-    from shared.substrate_miner_controller import _work_key
+    from substrate.miner_controller import _work_key
     controller._current_context = ctx
     controller._current_work_key = _work_key(ctx)
 
@@ -278,7 +278,7 @@ async def test_handle_result_raises_on_fatal_receipt(monkeypatch):
         )
 
     monkeypatch.setattr(
-        "shared.substrate_miner_controller.submit_proof", fake_submit_proof
+        "substrate.miner_controller.submit_proof", fake_submit_proof
     )
 
     envelope = _ResultEnvelope(result=_mining_result(), context=ctx, handle_id="test-0")
@@ -300,7 +300,7 @@ async def test_handle_result_records_rpc_error_text(monkeypatch):
         raise ConnectionError("websocket disconnected")
 
     monkeypatch.setattr(
-        "shared.substrate_miner_controller.submit_proof", fake_submit_proof
+        "substrate.miner_controller.submit_proof", fake_submit_proof
     )
 
     envelope = _ResultEnvelope(result=_mining_result(), context=ctx, handle_id="test-0")
@@ -342,7 +342,7 @@ async def test_dispatch_tracking_pairs_result_with_handle_context(monkeypatch):
         return ExtrinsicReceipt(extrinsic_hash="0xabc")
 
     monkeypatch.setattr(
-        "shared.substrate_miner_controller.submit_proof", fake_submit_proof
+        "substrate.miner_controller.submit_proof", fake_submit_proof
     )
 
     await controller._handle_result(envelope)
@@ -370,7 +370,7 @@ async def test_handle_result_raises_on_encoder_value_error(monkeypatch):
         raise ValueError("MiningResult has no solutions to submit")
 
     monkeypatch.setattr(
-        "shared.substrate_miner_controller.encode_quantum_proof", fake_encode
+        "substrate.miner_controller.encode_quantum_proof", fake_encode
     )
 
     envelope = _ResultEnvelope(result=_mining_result(), context=ctx, handle_id="test-0")
@@ -439,7 +439,7 @@ async def test_handle_head_none_snapshot_tracks_consecutive_count():
     """`None` snapshots increment a counter and escalate to RuntimeError
     after _NONE_SNAPSHOT_FAIL_THRESHOLD — otherwise an RPC-broken chain
     looks identical to "no work right now"."""
-    from shared.substrate_miner_controller import _NONE_SNAPSHOT_FAIL_THRESHOLD
+    from substrate.miner_controller import _NONE_SNAPSHOT_FAIL_THRESHOLD
 
     controller = _bare_controller()
     controller.client.get_mining_snapshot = AsyncMock(return_value=None)
@@ -520,7 +520,7 @@ async def test_handle_head_skipped_already_won_still_bumps_highest():
     must still bump _highest_handled_block so a later head with a number
     between the closed one and the next canonical block doesn't slip past
     the stale guard."""
-    from shared.substrate_miner_controller import (
+    from substrate.miner_controller import (
         ClosedWorkRecord,
         _work_key,
     )
@@ -554,7 +554,7 @@ async def test_stale_post_win_head_triggers_refresh():
     AND the rpc client can't lift it past the accepted block is a
     stale-post-win event. Don't bump _highest_handled_block and
     trigger an active refresh."""
-    from shared.substrate_miner_controller import (
+    from substrate.miner_controller import (
         ClosedWorkRecord,
         _work_key,
     )
@@ -681,7 +681,7 @@ async def test_current_already_won_head_debounced_refresh():
     """Two back-to-back current-already-won heads (number > accepted) must
     trigger only ONE active refresh inside the debounce window. The first
     call should refresh; the second (same record, <1s later) should not."""
-    from shared.substrate_miner_controller import (
+    from substrate.miner_controller import (
         ClosedWorkRecord,
         _work_key,
     )
@@ -759,7 +759,7 @@ async def test_mark_work_key_closed_records_block_number(monkeypatch):
     """After a successful submit_proof, the closed-work-key entry must
     carry the receipt's block hash resolved into a block number — so
     `_handle_head` can later classify stale-vs-current heads."""
-    from shared.substrate_miner_controller import (
+    from substrate.miner_controller import (
         ClosedWorkRecord,
         _work_key,
     )
@@ -777,7 +777,7 @@ async def test_mark_work_key_closed_records_block_number(monkeypatch):
         )
 
     monkeypatch.setattr(
-        "shared.substrate_miner_controller.submit_proof", fake_submit_proof
+        "substrate.miner_controller.submit_proof", fake_submit_proof
     )
 
     envelope = _ResultEnvelope(result=_mining_result(), context=ctx, handle_id="h1")
@@ -871,7 +871,7 @@ async def test_post_win_fast_forward_dispatches_when_round_rolls(monkeypatch):
     controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
     # Patch the poll interval to keep the test fast.
     monkeypatch.setattr(
-        "shared.substrate_miner_controller._POST_WIN_FAST_FORWARD_INTERVAL_S",
+        "substrate.miner_controller._POST_WIN_FAST_FORWARD_INTERVAL_S",
         0.01,
     )
 
@@ -905,11 +905,11 @@ async def test_post_win_fast_forward_times_out_on_mismatch(monkeypatch):
     )
     controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
     monkeypatch.setattr(
-        "shared.substrate_miner_controller._POST_WIN_FAST_FORWARD_INTERVAL_S",
+        "substrate.miner_controller._POST_WIN_FAST_FORWARD_INTERVAL_S",
         0.01,
     )
     monkeypatch.setattr(
-        "shared.substrate_miner_controller._POST_WIN_FAST_FORWARD_TIMEOUT_S",
+        "substrate.miner_controller._POST_WIN_FAST_FORWARD_TIMEOUT_S",
         0.1,
     )
 
@@ -938,11 +938,11 @@ async def test_post_win_fast_forward_bounded_by_deadline(monkeypatch):
     controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
     # Tight deadline + tight poll interval so the test runs fast.
     monkeypatch.setattr(
-        "shared.substrate_miner_controller._POST_WIN_FAST_FORWARD_INTERVAL_S",
+        "substrate.miner_controller._POST_WIN_FAST_FORWARD_INTERVAL_S",
         0.01,
     )
     monkeypatch.setattr(
-        "shared.substrate_miner_controller._POST_WIN_FAST_FORWARD_TIMEOUT_S",
+        "substrate.miner_controller._POST_WIN_FAST_FORWARD_TIMEOUT_S",
         0.1,
     )
 
@@ -1251,7 +1251,7 @@ async def test_main_loop_reraises_operator_fail_loud_from_handle_head():
     must escape `_main_loop` so the operator sees the configured error
     instead of an infinite log spam. Without re-raise, a stuck chain or
     misconfigured topology hash silently degrades into "no mining."""
-    from shared.substrate_miner_controller import _OperatorFailLoud
+    from substrate.miner_controller import _OperatorFailLoud
 
     controller = _bare_controller()
     controller._result_queue = asyncio.Queue()
@@ -1767,7 +1767,7 @@ async def test_handle_result_cancels_siblings_on_ok(monkeypatch):
         return ExtrinsicReceipt(extrinsic_hash="0xabc")  # OK
 
     monkeypatch.setattr(
-        "shared.substrate_miner_controller.submit_proof", fake_submit_proof
+        "substrate.miner_controller.submit_proof", fake_submit_proof
     )
 
     envelope = _ResultEnvelope(
@@ -1799,7 +1799,7 @@ async def test_handle_result_drops_duplicate_after_ok(monkeypatch):
         return ExtrinsicReceipt(extrinsic_hash=f"0x{submit_call_count:04x}")
 
     monkeypatch.setattr(
-        "shared.substrate_miner_controller.submit_proof", fake_submit_proof
+        "substrate.miner_controller.submit_proof", fake_submit_proof
     )
 
     # First result lands and gets accepted.

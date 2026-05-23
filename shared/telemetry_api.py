@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from shared.miner_core import MinerCore
     from shared.signer import Signer
     from substrate.client import SubstrateClient
-    from shared.substrate_miner_controller import SubstrateMinerController
+    from substrate.miner_controller import SubstrateMinerController
 
 
 logger = get_logger("telemetry_api")
