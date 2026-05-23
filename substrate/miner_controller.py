@@ -827,7 +827,7 @@ class SubstrateMinerController:
         # chain would validate against right now — no client-side
         # decay replay needed. The worker reads this in the ratchet
         # path to decide when a stored-best candidate has become
-        # eligible for submission. See shared/difficulty_decay.py
+        # eligible for submission. See substrate/difficulty_decay.py
         # for the equivalent Python computation (tests / debugging).
         live_threshold = int(context.difficulty.max_energy_milli)
         if live_threshold != self._last_pushed_threshold_milli:

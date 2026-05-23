@@ -50,13 +50,20 @@ def test_work_context_module_has_no_substrate_imports():
     repo_root = pathlib.Path(__file__).parent.parent
     src = (repo_root / "shared" / "work_context.py").read_text()
     # Strip docstrings and comments before scanning so docstring references don't trip the test.
+    # A line containing an EVEN number of `"""` opens and closes within itself
+    # (single-line docstring) — net state unchanged. An ODD count toggles the
+    # in_docstring state for the lines that follow.
     code_lines = []
     in_triple = False
     for line in src.splitlines():
         stripped = line.lstrip()
-        if '"""' in stripped:
-            # Toggle for triple-quote start/end (handles both opening and closing).
-            in_triple = not in_triple
+        triple_count = stripped.count('"""')
+        if triple_count > 0:
+            # Single-line `"""foo"""` keeps in_triple state stable; multi-line
+            # opening or closing toggles it. Either way the line itself is part
+            # of a docstring — skip it.
+            if triple_count % 2 == 1:
+                in_triple = not in_triple
             continue
         if in_triple:
             continue

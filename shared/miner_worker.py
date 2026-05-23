@@ -151,8 +151,8 @@ def miner_worker_main(
     mining loop reads it every iteration to know the chain's *live*
     energy threshold (not the snapshot-frozen one), which is how the
     ratchet decides when a stored-best candidate has become eligible.
-    See ``shared/difficulty_decay.py`` for the decay computation and
-    ``shared/substrate_miner_controller.py`` for the write site.
+    See ``substrate/difficulty_decay.py`` for the decay computation and
+    ``substrate/miner_controller.py`` for the write site.
     """
     # Set up logging for child process
     _setup_child_process_logging(log_queue)

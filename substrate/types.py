@@ -21,9 +21,13 @@ byte-for-byte on the Ising puzzle.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 from shared.allowed_value_spec import AllowedValueSpec
+
+if TYPE_CHECKING:
+    # Type-only — avoids the substrate ↔ shared cycle at runtime.
+    from shared.miner_types import BlockRequirements
 
 
 @dataclass(frozen=True)
@@ -114,7 +118,12 @@ class SubstrateMiningContext:
                 f"{len(self.miner_account_bytes)}"
             )
 
-    def resolve_ising(self, salt, nodes, edges):
+    def resolve_ising(
+        self,
+        salt: bytes,
+        nodes: Sequence[int],
+        edges: Sequence[Tuple[int, int]],
+    ) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float], int]:
         """Derive (h, J, nonce) for this attempt. PoW path: nonce → ChaCha8 → (h, J)."""
         # Local import avoids pulling shared.* at module load time for substrate.types
         from shared.quantum_proof_of_work import derive_nonce, generate_ising_model_from_nonce
@@ -133,7 +142,7 @@ class SubstrateMiningContext:
         )
         return h, J, nonce
 
-    def requirements(self):
+    def requirements(self) -> "BlockRequirements":
         """Build BlockRequirements from this snapshot's difficulty."""
         from shared.miner_types import BlockRequirements
 

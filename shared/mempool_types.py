@@ -13,7 +13,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:
+    from shared.miner_types import BlockRequirements
 
 
 class MinerType(IntEnum):
@@ -409,7 +412,12 @@ class MempoolJobContext:
             min_solutions=ising.min_solutions,
         )
 
-    def resolve_ising(self, salt, nodes, edges):
+    def resolve_ising(
+        self,
+        salt: bytes,
+        nodes: Sequence[int],
+        edges: Sequence[Tuple[int, int]],
+    ) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float], int]:
         """Map chain-carried (h_values, j_values) directly. Salt and nodes unused."""
         h = {
             int(node): float(hv) / 1000.0
@@ -421,7 +429,7 @@ class MempoolJobContext:
         }
         return h, J, 0  # 0 = placeholder nonce for telemetry
 
-    def requirements(self):
+    def requirements(self) -> "BlockRequirements":
         """Build BlockRequirements from this job's quality floors."""
         from shared.miner_types import BlockRequirements
 
