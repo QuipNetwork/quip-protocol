@@ -28,6 +28,7 @@ quip_protocol.egg-info/
 # AI assistant config (project instructions live in AGENTS.md)
 .claude/
 CLAUDE.md
+docs/superpowers/
 
 # Test results and data files
 test_results/
