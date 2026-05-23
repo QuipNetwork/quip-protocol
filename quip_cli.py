@@ -56,7 +56,6 @@ from shared.system_info import (
     to_canonical_json,
     validate_descriptor,
 )
-from shared.telemetry_api import TelemetryApiServer
 from substrate.pool import ValidatorPool
 
 
@@ -971,7 +970,6 @@ async def _run_concurrent_miner(
     # Declare all network resources before the try so the finally block can
     # always clean up whatever was partially constructed on setup failure.
     pool: Optional[ValidatorPool] = None
-    telemetry = None
     pow_controller = None
     mempool_controller = None
 
@@ -1029,6 +1027,10 @@ async def _run_concurrent_miner(
                 )
                 return 3
 
+        # Resolve telemetry port. The sibling process is unconditional;
+        # a non-positive `rest_port` collapses to the default (8086).
+        telemetry_port = rest_port if rest_port and rest_port > 0 else 8086
+
         if pow_handles:
             # PoW requires the sampler's topology to match the chain's
             # registered DefaultTopology (the chain validates this in
@@ -1055,6 +1057,7 @@ async def _run_concurrent_miner(
                 miner_handles=pow_handles,
                 topology_hash=pow_topology_hash,
                 core=core,
+                telemetry_port=telemetry_port,
             )
             click.echo(
                 f"  pow handles: {[h.miner_id for h in pow_handles]} "
@@ -1096,19 +1099,10 @@ async def _run_concurrent_miner(
                 f"topology=0x{mempool_topology_hash.hex()[:16]}..."
             )
 
-        if rest_port is not None and rest_port > 0:
-            telemetry = TelemetryApiServer(
-                core=core,
-                client=client,
-                signer=keystore.signer,
-                controller=pow_controller,  # Phase 9: surface mempool stats too
-                host=rest_host,
-                port=rest_port,
-            )
-            await telemetry.start()
-            click.echo(
-                f"telemetry api: http://{rest_host}:{rest_port}/api/v1/status"
-            )
+        click.echo(
+            f"telemetry api: http://{rest_host}:{telemetry_port}/api/v1/status "
+            "(sibling process)"
+        )
 
         loop = asyncio.get_running_loop()
 
@@ -1191,8 +1185,6 @@ async def _run_concurrent_miner(
             click.echo(f"  pow stats:     {pow_controller.stats}")
         if mempool_controller is not None:
             click.echo(f"  mempool stats: {mempool_controller.stats}")
-        if telemetry is not None:
-            await telemetry.stop()
         if pool is not None:
             # One close() tears down every pool-owned slot (rpc,
             # subscribe.pow, subscribe.mempool). Idempotent against

@@ -1,4 +1,8 @@
-"""Verify the controller spawns the telemetry sibling iff telemetry_port is set."""
+"""Verify the controller always spawns the telemetry sibling.
+
+The sibling process is the sole telemetry surface — there is no
+in-process server. Tests cover the default port and a custom override.
+"""
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -35,18 +39,21 @@ def _make_ctrl(monkeypatch, tmp_path, telemetry_port):
     return ctrl, spawned
 
 
-def test_controller_spawns_telemetry_when_port_set(monkeypatch, tmp_path):
-    ctrl, spawned = _make_ctrl(monkeypatch, tmp_path, telemetry_port=9999)
+def test_controller_spawns_telemetry_with_default_port(monkeypatch, tmp_path):
+    """Default constructor port (8086) reaches the sibling kwargs."""
+    ctrl, spawned = _make_ctrl(monkeypatch, tmp_path, telemetry_port=8086)
     ctrl._spawn_telemetry_sibling()
     assert len(spawned) == 1
-    assert spawned[0]._kwargs["listen_port"] == 9999
+    assert spawned[0]._kwargs["listen_port"] == 8086
     assert spawned[0]._kwargs["validator_urls"] == ["http://test:9944"]
     assert spawned[0]._kwargs["stats_snapshot_path"] == str(
         tmp_path / "telemetry-stats.json"
     )
 
 
-def test_controller_does_not_spawn_when_port_is_none(monkeypatch, tmp_path):
-    ctrl, spawned = _make_ctrl(monkeypatch, tmp_path, telemetry_port=None)
+def test_controller_spawns_telemetry_with_custom_port(monkeypatch, tmp_path):
+    """A custom telemetry_port flows through to the sibling kwargs."""
+    ctrl, spawned = _make_ctrl(monkeypatch, tmp_path, telemetry_port=9999)
     ctrl._spawn_telemetry_sibling()
-    assert spawned == []
+    assert len(spawned) == 1
+    assert spawned[0]._kwargs["listen_port"] == 9999

@@ -29,7 +29,9 @@ def test_telemetry_process_starts_and_serves_stats(tmp_path: Path):
     from shared.telemetry_process import telemetry_main
 
     stats_path = tmp_path / "telemetry-stats.json"
-    stats_path.write_text(json.dumps({"heads_observed": 42, "active_url": "http://a"}))
+    stats_path.write_text(json.dumps(
+        {"controller": {"heads_observed": 42, "active_url": "http://a"}}
+    ))
 
     port = _free_port()
     shutdown_event = mp.Event()
@@ -61,8 +63,8 @@ def test_telemetry_process_starts_and_serves_stats(tmp_path: Path):
 
         data = json.loads(resp)
         assert data["success"] is True
-        assert data["data"]["heads_observed"] == 42
-        assert data["data"]["active_url"] == "http://a"
+        assert data["data"]["controller"]["heads_observed"] == 42
+        assert data["data"]["controller"]["active_url"] == "http://a"
     finally:
         shutdown_event.set()
         proc.join(timeout=5)

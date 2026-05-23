@@ -48,11 +48,14 @@ from websocket import WebSocketException
 
 from shared.asyncio_supervise import supervise
 from shared.logging_config import get_logger
+from shared.miner_survey import build_miner_survey
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
+from shared.mining_attempt_log import DEFAULT_LOG_DIR, SubmissionLogger
 from shared.signer import Signer
+from shared.stats_snapshot import StatsSnapshotWriter
+from shared.telemetry_process import telemetry_main
 from substrate.client import SubstrateClient
-from shared.mining_attempt_log import SubmissionLogger
 from substrate.submitter import encode_quantum_proof, submit_proof
 from substrate.pool import ValidatorPool
 from substrate.types import (
@@ -84,24 +87,34 @@ _NONE_SNAPSHOT_FAIL_THRESHOLD = 10
 
 
 def build_stats_snapshot_for_telemetry(controller) -> dict[str, Any]:
-    """Serialize the controller's live stats into a JSON-safe dict.
+    """Serialize the controller's live state into a JSON-safe dict.
 
-    Called periodically by StatsSnapshotWriter (Plan 2). The telemetry
-    sibling process reads the resulting file on each /api/v1/stats
-    request — no live IPC between the two processes.
+    Called periodically by ``StatsSnapshotWriter``. The telemetry
+    sibling process reads the resulting file on every endpoint hit
+    that needs in-process data (counters, hardware descriptor,
+    miner survey, identity) — there is no live IPC between the two
+    processes, so this is the channel that keeps dashboard visibility
+    intact after the telemetry-process split.
 
-    Every counter that operators rely on for diagnostics must be
-    included here. The original silent-subscription-death bug was
-    diagnosed via `controller.stats.heads_observed` — this snapshot
-    is the channel that keeps that visibility intact after the
-    telemetry-process split.
+    Top-level keys:
+      - ``controller``: operational counters (the original
+        silent-subscription-death bug was diagnosed via
+        ``controller.stats.heads_observed`` — keep every counter
+        operators rely on here).
+      - ``node_id``, ``ss58_address``, ``account_id_hex``, ``miners``:
+        identity surfaced by ``/api/v1/status``.
+      - ``descriptor``: hardware descriptor surfaced by ``/api/v1/system``.
+      - ``miner_survey``: ``quip.miner_survey.v1`` payload surfaced by
+        ``/api/v1/miner/survey``.
+      - ``attempts_dir``: filesystem path the telemetry sibling reads
+        the mining-attempts JSONL store from.
     """
     s = controller.stats
 
     def _g(attr: str, default: int = 0) -> int:
         return getattr(s, attr, default)
 
-    return {
+    controller_counters = {
         "heads_observed": _g("heads_observed"),
         "contexts_dispatched": _g("contexts_dispatched"),
         "results_received": _g("results_received"),
@@ -115,12 +128,64 @@ def build_stats_snapshot_for_telemetry(controller) -> dict[str, Any]:
         "zero_seed_snapshots_dropped": _g("zero_seed_snapshots_dropped"),
         "subscription_lag_blocks": _g("subscription_lag_blocks"),
         "heads_promoted_to_rpc": _g("heads_promoted_to_rpc"),
+        "heads_refresh_below_floor": _g("heads_refresh_below_floor"),
         "post_win_fast_forwards": _g("post_win_fast_forwards"),
+        "post_win_fast_forward_timeouts": _g("post_win_fast_forward_timeouts"),
         "heads_same_key_skipped": _g("heads_same_key_skipped"),
         "none_snapshots_seen": _g("none_snapshots_seen"),
         "duplicate_result_drops": _g("duplicate_result_drops"),
         "proofs_unverified": _g("proofs_unverified"),
         "active_url": getattr(controller, "pool_active_url", None),
+    }
+
+    core = getattr(controller, "core", None)
+    signer = getattr(controller, "signer", None)
+
+    node_id: Optional[str] = None
+    miners_list: list[dict[str, str]] = []
+    descriptor: dict[str, Any] = {}
+    survey: dict[str, Any] = {}
+    if core is not None:
+        node_id = getattr(core, "node_id", None)
+        miners_list = [
+            {"id": h.miner_id, "type": h.miner_type}
+            for h in getattr(core, "miner_handles", [])
+        ]
+        try:
+            descriptor = core.descriptor()
+        except Exception as exc:  # noqa: BLE001 — keep snapshot writeable
+            descriptor = {"error": f"{type(exc).__name__}: {exc}"}
+        if signer is not None:
+            try:
+                survey = build_miner_survey(core, signer, controller=controller)
+            except Exception as exc:  # noqa: BLE001
+                survey = {"error": f"{type(exc).__name__}: {exc}"}
+
+    ss58_address: Optional[str] = None
+    account_id_hex: Optional[str] = None
+    if signer is not None:
+        try:
+            ss58_address = signer.ss58_address()
+            account_id_hex = "0x" + signer.account_id_bytes().hex()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "snapshot: signer identity unavailable: %s: %s",
+                type(exc).__name__, exc,
+            )
+
+    attempts_dir = str(
+        getattr(controller, "_attempts_dir", DEFAULT_LOG_DIR)
+    )
+
+    return {
+        "controller": controller_counters,
+        "node_id": node_id,
+        "ss58_address": ss58_address,
+        "account_id_hex": account_id_hex,
+        "miners": miners_list,
+        "descriptor": descriptor,
+        "miner_survey": survey,
+        "attempts_dir": attempts_dir,
     }
 
 
@@ -376,7 +441,7 @@ class SubstrateMinerController:
         ] = None,
         core: Optional[_MinerCoreStats] = None,
         runtime_dir: Optional[Path] = None,
-        telemetry_port: Optional[int] = None,
+        telemetry_port: int = 8086,
     ) -> None:
         if not miner_handles:
             raise ValueError(
@@ -480,15 +545,18 @@ class SubstrateMinerController:
         )
         # Stats snapshot writer — set in run(); None before startup.
         self._stats_snapshot_path: Optional[Path] = None
-        self._stats_writer: Optional["StatsSnapshotWriter"] = None
+        self._stats_writer: Optional[StatsSnapshotWriter] = None
         self._stats_writer_task: Optional[asyncio.Task] = None
-        # Opt-in telemetry sibling process. When telemetry_port is None
-        # (default), legacy in-process TelemetryApiServer is used and the
-        # sibling is never spawned. Set to an integer port to spawn the
-        # aiohttp-based sibling on that port.
-        self._telemetry_port: Optional[int] = telemetry_port
+        # Telemetry sibling process — the sole telemetry surface. The
+        # controller process owns no HTTP server; the sibling reads the
+        # stats snapshot file and queries the chain via its own
+        # SubstrateClient.
+        self._telemetry_port: int = int(telemetry_port)
         self._telemetry_proc: Optional[mp.Process] = None
         self._telemetry_shutdown_event = None
+        # Mining-attempts log directory — surfaced into the snapshot so
+        # the telemetry sibling reads the same JSONL store.
+        self._attempts_dir: Path = DEFAULT_LOG_DIR
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -540,10 +608,8 @@ class SubstrateMinerController:
 
         # Stats snapshot writer — atomic JSON dump to runtime_dir every
         # interval. The telemetry sibling process reads this file via
-        # `read_snapshot()` to serve `/api/v1/stats` without sharing live
-        # IPC with the controller.
-        from shared.stats_snapshot import StatsSnapshotWriter
-
+        # `read_snapshot()` to serve every endpoint that needs in-process
+        # data; there is no live IPC.
         self._stats_snapshot_path = self._runtime_dir / "telemetry-stats.json"
         self._stats_writer = StatsSnapshotWriter(
             path=self._stats_snapshot_path,
@@ -634,16 +700,11 @@ class SubstrateMinerController:
     def _spawn_telemetry_sibling(self) -> None:
         """Spawn the telemetry process as a sibling.
 
-        Called from ``run()``. Only spawns if ``self._telemetry_port`` is
-        set; ``None`` means legacy in-process telemetry mode (the CLI
-        constructs ``TelemetryApiServer`` directly and ignores this).
+        Called unconditionally from ``run()``. The sibling is now the
+        only telemetry surface — there is no in-process server.
+        Validator URLs are derived from the pool's authoritative list;
+        the sibling owns its own SubstrateClient.
         """
-        if self._telemetry_port is None:
-            return
-        from shared.telemetry_process import telemetry_main
-
-        # Validator URLs are derived from the pool's authoritative list.
-        # Telemetry uses its own client; this is just URL bootstrap.
         validator_urls = list(self.pool.urls) if self.pool is not None else []
 
         self._telemetry_shutdown_event = mp.Event()

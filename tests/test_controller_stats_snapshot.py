@@ -39,9 +39,9 @@ async def test_controller_writes_stats_snapshot(tmp_path: Path):
 
     snap = read_snapshot(snapshot_path)
     assert snap is not None
-    assert snap["heads_observed"] == 100
-    assert snap["proofs_submitted"] == 17
-    assert snap["active_url"] == "http://validator-a"
+    assert snap["controller"]["heads_observed"] == 100
+    assert snap["controller"]["proofs_submitted"] == 17
+    assert snap["controller"]["active_url"] == "http://validator-a"
 
 
 def _fake_controller_for(stats: dict):
