@@ -1271,10 +1271,17 @@ class SubstrateMinerController:
         cancel raced its own sentinel and the new dispatch is now
         cleaning up.
 
-        On timeout we proceed anyway — but log a WARNING because the
-        worker did NOT ack the cancel of this specific dispatch in
-        time, so the next dispatch's stop_event.clear() may race
-        the prior cancel.
+        On timeout we proceed anyway. This is logged at DEBUG, not
+        WARNING: under steady SA load the worker is inside an
+        uninterruptible ``sample_ising`` call that takes 30-45s, so
+        it physically cannot ack within the 0.5s budget. The downstream
+        guards (``dispatch_id`` check in ``_handle_result`` + the
+        ``_closed_work_keys`` short-circuit) make the cancel→clear race
+        harmless — stale results from the old dispatch land, get
+        dropped, and the new dispatch proceeds. The wait remains as a
+        fast-path optimization for the rare case where the worker IS
+        between SA calls (buffer refill, attempt boundary) and can
+        ack within a millisecond.
         """
         sentinel_queue = self._done_queues.get(handle.miner_id)
         if sentinel_queue is None:
@@ -1283,10 +1290,10 @@ class SubstrateMinerController:
         while True:
             remaining = deadline - asyncio.get_event_loop().time()
             if remaining <= 0:
-                logger.warning(
+                logger.debug(
                     "handle %s did not ack cancel of dispatch_id=%d within "
-                    "%.1fs; dispatching anyway — next mine_work_item may "
-                    "race the prior cancel",
+                    "%.1fs; dispatching anyway (downstream guards handle "
+                    "the stale result)",
                     handle.miner_id,
                     dispatch_id,
                     timeout,
@@ -1297,10 +1304,10 @@ class SubstrateMinerController:
                     sentinel_queue.get(), timeout=remaining
                 )
             except asyncio.TimeoutError:
-                logger.warning(
+                logger.debug(
                     "handle %s did not ack cancel of dispatch_id=%d within "
-                    "%.1fs; dispatching anyway — next mine_work_item may "
-                    "race the prior cancel",
+                    "%.1fs; dispatching anyway (downstream guards handle "
+                    "the stale result)",
                     handle.miner_id,
                     dispatch_id,
                     timeout,
