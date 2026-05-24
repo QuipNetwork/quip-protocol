@@ -325,41 +325,6 @@ class RandomIsingFeeder:
 
         _kill_workers(pids)
 
-    def update_round(
-        self,
-        last_proof_block_hash: bytes,
-        miner_bytes: bytes,
-    ) -> None:
-        """Update generation args when a new round starts.
-
-        Call this when ``block_hash(LastProofBlock)`` changes (i.e., a
-        new proof has won and the last proof block hash rolled over). Drains stale
-        futures and queue, then refills with the new seed. Calling on
-        every new chain head is wasteful — the seed only changes on a
-        win.
-        """
-        if len(last_proof_block_hash) != 32:
-            raise ValueError(
-                "last_proof_block_hash must be 32 bytes, got "
-                f"{len(last_proof_block_hash)}"
-            )
-        if len(miner_bytes) != 32:
-            raise ValueError(
-                f"miner_bytes must be 32 bytes, got {len(miner_bytes)}"
-            )
-        self._last_proof_block_hash = last_proof_block_hash
-        self._miner_id = miner_bytes
-        for f in self._futures:
-            f.cancel()
-        self._futures.clear()
-        while not self._queue.empty():
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                break
-        self._fill()
-
-
 class FixedIsingFeeder:
     """Cycles through a fixed list of pre-baked ``IsingModel``s forever.
 

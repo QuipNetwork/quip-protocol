@@ -149,20 +149,6 @@ class TestRandomIsingFeeder:
         finally:
             feeder.stop()
 
-    def test_update_round(self):
-        feeder = _make_feeder(seed=11)
-        try:
-            m_before = feeder.pop_blocking()
-            feeder.update_round(
-                b"newhash".ljust(32, b"\x00"),
-                b"new-miner".ljust(32, b"\x00"),
-            )
-            m_after = feeder.pop_blocking()
-            assert m_before.nonce != m_after.nonce
-        finally:
-            feeder.stop()
-
-
 def _make_model(seed: int = 0) -> IsingModel:
     """Build a small deterministic IsingModel for FixedIsingFeeder tests."""
     return IsingModel(
