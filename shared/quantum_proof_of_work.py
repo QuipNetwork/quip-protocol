@@ -698,57 +698,54 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
     diversity = 0.0
     result = None
 
-    # Energy filter for the diverse-selection pool.
-    #
-    # Strict mode: gates on the snapshot difficulty (legacy non-substrate
-    # path / mempool jobs with hard floors).
-    #
-    # Lenient mode + live threshold: gates on the *live* (decay-applied)
-    # chain target. Picking diversity from samples above this threshold
-    # inflates ``submit_floor_energy = max(selected_energies)`` past the
-    # chain's strict ``energy < max_energy_milli`` filter, so the submit
-    # gate (correctly) refuses to ship a bundle the chain would reject.
-    # Constraining the pool to below-target samples keeps the floor
-    # under the target by construction. When the chain decays on a
-    # future iter, ``live_threshold_energy`` slides up and new samples
-    # enter the pool automatically.
-    #
-    # Lenient mode + no live (legacy / tests): preserves the original
-    # "accept everything constraint-valid" behavior.
-    if strict_energy:
-        energy_filter = difficulty_energy
-    elif live_threshold_energy is not None:
-        energy_filter = live_threshold_energy
-    else:
-        energy_filter = float("inf")
-
     try:
-        # Best Energy - use sampler-reported energy for fast early exit
         all_energies = sampleset.record.energy
         if len(all_energies) == 0:
             raise ValueError("No samples in sampleset")
 
         best_energy = float(np.min(all_energies))
 
-        # FAST PATH: Early exit if best energy doesn't meet threshold.
-        # Matches the chain's strict ``<`` filter, so a result whose
-        # sampler-reported best matches the target down to the last
-        # milli isn't admitted (it'd fail chain validation anyway).
-        if best_energy >= energy_filter:
+        # Pool selection for the diverse-K. Three modes:
+        #
+        # 1. Strict (legacy / mempool): the pool is the snapshot's
+        #    below-target subset. If best doesn't clear, bail fast —
+        #    nothing in this mode can be stashed for later.
+        #
+        # 2. Lenient + live threshold (substrate ratchet, common case):
+        #    tighten to the below-target subset *when* it has enough
+        #    samples to satisfy min_solutions. That keeps
+        #    ``submit_floor_energy = max(selected_energies)`` under the
+        #    live target by construction, so the submit gate fires.
+        #    When the subset is too thin (e.g. just after a chain
+        #    re-snapshot when the target is artificially tight), fall
+        #    back to the full constraint-valid pool. The candidate
+        #    can't submit now, but it lands in the top-K stash for
+        #    visibility AND for future submission once
+        #    ``BlockDecayInterval`` raises the live target past its
+        #    floor — no re-mining needed.
+        #
+        # 3. Lenient + no live (tests / legacy): preserve original
+        #    "everything constraint-valid is eligible" behavior.
+        if strict_energy:
+            if best_energy > difficulty_energy:
+                raise ValueError(
+                    f"Best energy {best_energy} exceeds difficulty energy {difficulty_energy}"
+                )
+            valid_indices = np.where(all_energies < difficulty_energy)[0]
+        elif live_threshold_energy is not None:
+            below_target = np.where(all_energies < live_threshold_energy)[0]
+            if len(below_target) >= min_solutions:
+                valid_indices = below_target
+            else:
+                # Fall back to full pool so the iter still stashes.
+                valid_indices = np.arange(len(all_energies))
+        else:
+            valid_indices = np.arange(len(all_energies))
+
+        if len(valid_indices) < min_solutions:
             raise ValueError(
-                f"Best energy {best_energy} does not clear filter {energy_filter}"
+                f"Insufficient valid solutions: {len(valid_indices)} < {min_solutions}"
             )
-
-        # Count how many samples meet threshold before expensive operations.
-        valid_count = np.sum(all_energies < energy_filter)
-        if valid_count < min_solutions:
-            raise ValueError(f"Insufficient valid solutions: {valid_count} < {min_solutions}")
-
-        # Build the diverse-selection pool. ``valid_indices`` is the
-        # set of samples eligible for ``select_diverse_solutions`` —
-        # we already pre-filtered to below-threshold above, so this is
-        # just "all energies meeting the filter".
-        valid_indices = np.where(all_energies < energy_filter)[0]
 
         # Get unique solutions that meet energy threshold
         # Track best energy among valid solutions
