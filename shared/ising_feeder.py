@@ -1,12 +1,22 @@
-"""Background Ising model generator with ProcessPoolExecutor.
+"""Pluggable Ising-model feeders shared by every miner backend.
 
-Uses processes with 'spawn' context to avoid inheriting CUDA
-state from the parent. Ising model generation involves
-Python-level dict comprehension that holds the GIL, so threads
-would serialize the work.
+Two implementations live here:
+
+- :class:`RandomIsingFeeder` — background generator using a
+  :class:`concurrent.futures.ProcessPoolExecutor` (spawn context, to avoid
+  inheriting CUDA driver state). Used by the PoW path, where every iteration
+  needs a fresh ``(salt -> nonce -> h, J)`` derivation.
+- :class:`FixedIsingFeeder` — in-memory adapter for mempool jobs, where the
+  Ising problem is carried directly in the job order and ``BaseMiner`` just
+  needs to keep replaying the same model(s) across sampler iterations.
+
+Both expose the same ``pop`` / ``pop_blocking`` / ``try_pop`` / ``pop_n`` /
+``__iter__`` / ``stop`` surface so ``BaseMiner.mine_work_item`` can pop
+models from a feeder without caring which backend supplied it.
 """
 from __future__ import annotations
 
+import itertools
 import logging
 import multiprocessing as _mp
 import os
@@ -15,7 +25,7 @@ import random
 import signal as _signal
 import time
 from concurrent.futures import ProcessPoolExecutor
-from typing import Optional
+from typing import Iterator, List, Optional, Sequence
 
 from shared.ising_model import IsingModel
 from shared.quantum_proof_of_work import (
@@ -74,7 +84,7 @@ def _kill_workers(pids: list[int], timeout: float = 3.0):
 
     for pid in alive:
         logger.warning(
-            "IsingFeeder: worker %d did not exit after "
+            "RandomIsingFeeder: worker %d did not exit after "
             "SIGTERM, sending SIGKILL", pid,
         )
         try:
@@ -92,8 +102,8 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-class IsingFeeder:
-    """Keeps a buffer of pre-generated IsingModels full.
+class RandomIsingFeeder:
+    """Keeps a buffer of freshly-derived ``IsingModel``s ready to pop.
 
     Uses a ProcessPoolExecutor (spawn context) to generate
     models in background processes. Spawn avoids inheriting
@@ -168,7 +178,7 @@ class IsingFeeder:
                 except Exception as exc:
                     failures += 1
                     logger.warning(
-                        "IsingFeeder worker failed: %s (pending=%d, "
+                        "RandomIsingFeeder worker failed: %s (pending=%d, "
                         "queue=%d, buffer_size=%d)",
                         exc, len(still_pending),
                         self._queue.qsize(), self._buffer_size,
@@ -200,7 +210,7 @@ class IsingFeeder:
         pending = len(self._futures)
         if failures or ready == 0:
             logger.info(
-                "IsingFeeder state: ready=%d pending=%d "
+                "RandomIsingFeeder state: ready=%d pending=%d "
                 "buffer_size=%d submitted=%d failures=%d",
                 ready, pending, self._buffer_size,
                 submitted, failures,
@@ -231,10 +241,10 @@ class IsingFeeder:
                 self._fill()
                 return model
         assert self._futures, (
-            "IsingFeeder: no pending work and empty queue"
+            "RandomIsingFeeder: no pending work and empty queue"
         )
         assert False, (
-            f"IsingFeeder buffer underrun: "
+            f"RandomIsingFeeder buffer underrun: "
             f"{len(self._futures)} futures pending, "
             f"none ready. Increase buffer_size."
         )
@@ -261,7 +271,7 @@ class IsingFeeder:
         except queue.Empty:
             pass
         assert self._futures, (
-            "IsingFeeder: no pending work and empty queue"
+            "RandomIsingFeeder: no pending work and empty queue"
         )
         fut = self._futures.pop(0)
         t0 = time.monotonic()
@@ -269,7 +279,7 @@ class IsingFeeder:
         waited = time.monotonic() - t0
         if waited > 1.0:
             logger.info(
-                "IsingFeeder.pop_blocking waited %.2fs for a "
+                "RandomIsingFeeder.pop_blocking waited %.2fs for a "
                 "worker (pending=%d, queue=%d)",
                 waited, len(self._futures), self._queue.qsize(),
             )
@@ -348,3 +358,84 @@ class IsingFeeder:
             except queue.Empty:
                 break
         self._fill()
+
+
+class FixedIsingFeeder:
+    """Cycles through a fixed list of pre-baked ``IsingModel``s forever.
+
+    Adapter used by the mempool mining path, where the Ising problem is
+    carried directly in the job order rather than derived per-iteration.
+    The job currently always supplies a single ``(h, J)`` pair, so the
+    typical instance wraps a one-element list; cycling that list with
+    :func:`itertools.cycle` keeps yielding the same model so the sampler
+    can re-roll its internal RNG and find different solutions over many
+    iterations. The list-of-models shape is forward-looking — future
+    mempool jobs may carry several problems per order, and this feeder
+    will round-robin them without changes to ``BaseMiner``.
+
+    No background pool, no salt generation, no round seeding: the values
+    were already finalised when the order landed on chain. ``stop()`` is
+    a no-op kept for API parity with :class:`RandomIsingFeeder` so
+    ``BaseMiner.mine_work_item`` can call it unconditionally.
+
+    Args:
+        models: One or more pre-built ``IsingModel`` instances. The list
+            is cycled in-order; length must be ``>= 1``.
+
+    Raises:
+        ValueError: If ``models`` is empty.
+    """
+
+    def __init__(self, models: Sequence[IsingModel]) -> None:
+        if len(models) < 1:
+            raise ValueError(
+                "FixedIsingFeeder requires at least one IsingModel, "
+                f"got {len(models)}"
+            )
+        # Materialise the input — accepting a Sequence keeps the
+        # constructor flexible (lists, tuples, generators that have
+        # already been list()-ed). Cycle works on the materialised copy
+        # so the feeder is independent of the caller's container.
+        self._models: List[IsingModel] = list(models)
+        self._cycle: Iterator[IsingModel] = itertools.cycle(self._models)
+        self._stopped = False
+
+    def __iter__(self) -> "FixedIsingFeeder":
+        return self
+
+    def __next__(self) -> IsingModel:
+        return self.pop_blocking()
+
+    def pop(self) -> IsingModel:
+        """Return the next model in the cycle. Never blocks."""
+        return next(self._cycle)
+
+    def pop_blocking(self) -> IsingModel:
+        """Same as :meth:`pop` — no async path to wait on."""
+        return next(self._cycle)
+
+    def try_pop(self) -> Optional[IsingModel]:
+        """Non-blocking pop. Always returns a model (the list is non-empty)."""
+        return next(self._cycle)
+
+    def pop_n(self, n: int) -> List[IsingModel]:
+        """Pop ``n`` models, cycling as needed.
+
+        Args:
+            n: Number of models to return; must be positive.
+
+        Returns:
+            A list of ``n`` models drawn in cycle order.
+        """
+        assert n > 0, "n must be positive"
+        return [next(self._cycle) for _ in range(n)]
+
+    def stop(self) -> None:
+        """No-op shutdown. Idempotent — safe to call multiple times."""
+        self._stopped = True
+
+
+__all__ = [
+    "FixedIsingFeeder",
+    "RandomIsingFeeder",
+]

@@ -15,6 +15,9 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
+from shared.ising_feeder import FixedIsingFeeder
+from shared.ising_model import IsingModel
+
 if TYPE_CHECKING:
     from shared.miner_types import BlockRequirements
 
@@ -428,6 +431,44 @@ class MempoolJobContext:
             for edge, jv in zip(self.edges, self.j_values)
         }
         return h, J, 0  # 0 = placeholder nonce for telemetry
+
+    def make_feeder(
+        self,
+        nodes: Sequence[int],
+        edges: Sequence[Tuple[int, int]],
+        *,
+        buffer_size: int = 8,
+    ) -> FixedIsingFeeder:
+        """Return a ``FixedIsingFeeder`` wrapping the order's stored (h, J).
+
+        Mempool work uses pre-baked Ising parameters straight off the
+        chain, so no derivation is needed. The placeholder ``nonce`` /
+        ``salt`` bytes mirror what :meth:`resolve_ising` returned in the
+        old inline path — telemetry only; the chain doesn't re-derive
+        them. ``nodes`` / ``edges`` mirror ``WorkContext.make_feeder``'s
+        signature but go unused here because the model is already
+        finalised against the chain-stored node/edge order.
+
+        ``buffer_size`` is accepted for API parity with
+        :class:`RandomIsingFeeder` and intentionally ignored — the
+        fixed model list has fixed length.
+        """
+        del nodes, edges, buffer_size  # See docstring.
+        h = {
+            int(node): float(hv) / 1000.0
+            for node, hv in zip(self.nodes, self.h_values)
+        }
+        J = {
+            (int(edge[0]), int(edge[1])): float(jv) / 1000.0
+            for edge, jv in zip(self.edges, self.j_values)
+        }
+        model = IsingModel(
+            h=h,
+            J=J,
+            nonce=b"\x00" * 32,  # placeholder; chain doesn't re-derive
+            salt=b"\x00" * 32,   # placeholder; salt unused on this path
+        )
+        return FixedIsingFeeder(models=[model])
 
     def requirements(self) -> "BlockRequirements":
         """Build BlockRequirements from this job's quality floors."""

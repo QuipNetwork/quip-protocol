@@ -3,7 +3,7 @@
 
 """Unified GPU miner base class for CUDA SA and Gibbs kernels.
 
-Owns the shared pipeline infrastructure: IsingFeeder for
+Owns the shared pipeline infrastructure: RandomIsingFeeder for
 background model generation, KernelScheduler for SM budget,
 SIGTERM cleanup, sparse topology filtering, and the streaming
 mining loop via sample_ising_streaming().
@@ -24,7 +24,7 @@ from typing import (
 import dimod
 from shared.base_miner import BaseMiner
 from shared.miner_types import BlockRequirements
-from shared.ising_feeder import IsingFeeder
+from shared.ising_feeder import RandomIsingFeeder
 from GPU.gpu_scheduler import (
     KernelScheduler,
     configure_mps_thread_limit,
@@ -50,13 +50,19 @@ _STALL_SAFETY_FACTOR = 5.0
 class GPUMiner(BaseMiner):
     """Shared pipeline base for CUDA GPU miners.
 
-    Provides IsingFeeder, KernelScheduler, SIGTERM cleanup,
+    Provides RandomIsingFeeder, KernelScheduler, SIGTERM cleanup,
     the streaming mining loop, sparse topology filtering, and
     adaptive parameter calculation.
 
     Subclasses create a sampler (CudaSASampler or
     CudaGibbsSampler) and pass it to __init__.
     """
+
+    # Keep the feeder roughly 2x the per-iteration nonce batch. Old code
+    # sized it as ``num_k * 2`` from the live SM budget; 16 covers the
+    # common case (4–8 in-flight kernels on a typical GPU) without
+    # over-spawning Python workers.
+    FEEDER_BUFFER_SIZE = 16
 
     def __init__(
         self,
@@ -106,7 +112,7 @@ class GPUMiner(BaseMiner):
         )
 
         # Pipeline state (reset per mine_block call)
-        self._feeder: Optional[IsingFeeder] = None
+        self._feeder: Optional[RandomIsingFeeder] = None
         self._stream: Optional[Iterator] = None
 
         if threading.current_thread() is threading.main_thread():
@@ -143,12 +149,12 @@ class GPUMiner(BaseMiner):
     # ----------------------------------------------------------
 
     def _pre_mine_setup(self, *args, **kwargs) -> bool:
-        """Create IsingFeeder, then activate CUDA device.
+        """Activate the CUDA device and size adaptive batching.
 
-        Order matters: IsingFeeder spawns worker processes
-        via 'spawn' context. Creating it BEFORE CUDA
-        activation ensures workers start from a clean
-        state with no inherited GPU driver handles.
+        The Ising feeder is now built by ``BaseMiner.mine_work_item``
+        via ``context.make_feeder(...)`` immediately before the loop;
+        this hook handles the GPU-specific setup that needs a live
+        CUDA context (SM budget sizing, device activation).
         """
         # Extract block context from BaseMiner's positional
         # args — no CUDA needed for this.
@@ -159,8 +165,6 @@ class GPUMiner(BaseMiner):
                 "Missing prev_block or node_info",
             )
             return False
-
-        cur_index = prev_block.header.index + 1
 
         # get_sm_budget() uses cached _device_sms — no
         # CUDA call needed.
@@ -173,30 +177,12 @@ class GPUMiner(BaseMiner):
         self._max_nonces = num_k
         self._active_nonces = num_k
 
-        # Create feeder BEFORE CUDA activation so spawn
-        # workers don't inherit GPU context. `prev_block.hash` is the
-        # last proof block hash (`last_proof_block_hash` — see
-        # `_BridgePrevBlock.from_work_context` in base_miner.py).
-        feeder_seed = kwargs.pop('feeder_seed', None)
-        self._feeder = IsingFeeder(
-            last_proof_block_hash=prev_block.hash,
-            miner_bytes=node_info.miner_account_bytes,
-            nodes=self.sampler.nodes,
-            edges=self.sampler.edges,
-            buffer_size=num_k * 2,
-            seed=feeder_seed,
-        )
-
-        # Now activate CUDA — safe because feeder workers
-        # are already forked from clean state.
         try:
             cp.cuda.Device(int(self.device)).use()
         except Exception as e:
             self.logger.error(
                 f"Failed to set device context: {e}",
             )
-            self._feeder.stop()
-            self._feeder = None
             return False
 
         self._stream = None
@@ -355,7 +341,7 @@ class GPUMiner(BaseMiner):
 
     def _cleanup_handler(self, signum, frame):
         """Handle SIGTERM: stop feeder, signal kernel, exit."""
-        # Stop the IsingFeeder first — its ProcessPoolExecutor
+        # Stop the RandomIsingFeeder first — its ProcessPoolExecutor
         # workers will block atexit if not shut down.
         if self._feeder is not None:
             self._feeder.stop()

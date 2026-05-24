@@ -29,9 +29,7 @@ from shared.quantum_proof_of_work import evaluate_sampleset
 from substrate.types import SubstrateMiningContext
 from shared.work_context import (
     WorkContext,
-    fresh_salt,
     requirements_from_context,
-    resolve_ising,
 )
 
 # Global logger for this module
@@ -123,6 +121,14 @@ class BaseMiner(ABC):
         # Track top 3 mining results
         self.top_attempts: List[IsingSample] = []
 
+        # Feeder slot. ``mine_work_item`` writes here just before the
+        # loop and clears it in ``finally``. Subclasses (GPU/QPU/Metal)
+        # used to assign in their own ``_pre_mine_setup``; now the base
+        # class is authoritative, but their pipelines still read this
+        # attribute via ``self._feeder`` (e.g. streaming samplers and
+        # SIGTERM handlers), so it must exist before any subclass runs.
+        self._feeder: Optional[Any] = None
+
 
     def update_top_samples(self, sampleset: dimod.SampleSet, nonce: int, salt: bytes, requirements: BlockRequirements):
         """Update the top 3 results list with a new mining result."""
@@ -198,6 +204,15 @@ class BaseMiner(ABC):
             summary_lines.append(f"  Beta Schedule: {self.adaptive_params['beta_schedule']}")
 
         return "\n".join(summary_lines)
+
+    # --- Feeder buffer size (override in subclasses) ---
+    # ``BaseMiner.mine_work_item`` builds a feeder via
+    # ``context.make_feeder(nodes, edges, buffer_size=FEEDER_BUFFER_SIZE)``
+    # right before the mining loop. CPU SA is single-threaded and doesn't
+    # need much pipelining; GPU and QPU miners override this with larger
+    # values so the background generator stays ahead of the kernel/QPU
+    # pipeline (see GPUMiner / DWaveMiner overrides).
+    FEEDER_BUFFER_SIZE: int = 4
 
     # --- Adaptive parameter bounds (override in subclasses) ---
     # SA/GPU miners use sweeps + reads; QPU miners use annealing_time + reads.
@@ -367,7 +382,7 @@ class BaseMiner(ABC):
         - the same sampler, adaptive param, evaluate-sampleset, top-attempts
           surface used by subclasses (CPU/GPU/QPU).
         - batch sampling (``_sample_batch``) is intentionally bypassed
-          (see Phase 4 follow-on note on ``IsingFeeder`` identity).
+          (see Phase 4 follow-on note on feeder identity).
 
         Args:
             context: Either a ``SubstrateMiningContext`` (PoW) or
@@ -461,17 +476,29 @@ class BaseMiner(ABC):
             self._attempt_logger = attempt_log
         dispatch_id_for_log = int(getattr(self, '_current_dispatch_id', 0))
 
+        # Build the feeder for this attempt. Each context flavor picks
+        # the right backing implementation (RandomIsingFeeder for PoW,
+        # FixedIsingFeeder for mempool); the loop just pops models. We
+        # own the lifecycle here — ``finally`` stops and clears it so a
+        # subsequent dispatch starts from a clean state. Surfacing the
+        # feeder on ``self`` keeps the existing GPU/QPU streaming
+        # samplers (which read ``self._feeder`` from
+        # ``_sample_batch``) working unchanged; that path is bypassed
+        # by this loop but the field still has to be present.
+        self._feeder = context.make_feeder(
+            nodes, edges, buffer_size=self.FEEDER_BUFFER_SIZE,
+        )
+
         progress = 0
         try:
             while self.mining and not stop_event.is_set():
-                # Fresh salt per iteration. `resolve_ising` dispatches by
-                # context flavor: PoW derives a new nonce + regenerates
-                # (h, J) against the *sampler's* node/edge order (which
-                # `topology_hash` confirms matches the chain's); mempool
-                # uses the stored h_values / j_values directly and the
-                # returned nonce is a placeholder (0) for telemetry only.
-                salt = fresh_salt()
-                h, J, nonce = resolve_ising(context, salt, nodes, edges)
+                # Pull the next pre-built model from the feeder. The
+                # PoW feeder derives a fresh ``(salt -> nonce -> h, J)``
+                # in a background process; the mempool feeder cycles
+                # the order's stored ``(h, J)`` and returns placeholder
+                # nonce/salt bytes the chain doesn't re-derive.
+                model = self._feeder.pop_blocking()
+                h, J, nonce, salt = model.h, model.J, model.nonce, model.salt
 
                 preprocess_start = time.time()
                 self.current_stage = 'preprocessing'
@@ -712,6 +739,16 @@ class BaseMiner(ABC):
             return None
         finally:
             self.mining = False
+            # Tear down the feeder before delegating to subclass cleanup.
+            # Subclass ``_post_mine_cleanup`` and SIGTERM handlers
+            # tolerate ``self._feeder is None`` (they all gate on
+            # ``is not None``), so leaving the field cleared here means
+            # the next dispatch starts from a known-empty state.
+            if self._feeder is not None:
+                try:
+                    self._feeder.stop()
+                finally:
+                    self._feeder = None
             self._post_mine_cleanup()
 
     # ------------------------------------------------------------------
@@ -916,7 +953,7 @@ class _BridgeNodeInfo:
     chain account as a hex string; mempool uses a synthetic
     ``mempool-order-<id>`` tag since the order itself, not the solver,
     identifies the work. ``miner_account_bytes`` is preserved for the
-    PoW path (used by ``IsingFeeder``) and zero-filled for mempool.
+    PoW path (used by the feeder) and zero-filled for mempool.
     """
 
     miner_id: str

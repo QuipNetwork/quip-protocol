@@ -17,7 +17,7 @@ from QPU.dwave_sampler import DWaveSamplerWrapper, DefectInfo
 from QPU.qpu_time_manager import QPUTimeManager, QPUTimeConfig
 from shared.base_miner import BaseMiner
 from shared.miner_types import BlockRequirements
-from shared.ising_feeder import IsingFeeder
+from shared.ising_feeder import RandomIsingFeeder
 from shared.ising_model import IsingModel
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.dwave_topology import DWaveTopology
@@ -68,6 +68,10 @@ def _shift_energies(sampleset: dimod.SampleSet, offset: float) -> dimod.SampleSe
 
 
 class DWaveMiner(BaseMiner):
+    # Old code sized the feeder as ``queue_depth * 2`` (default 60).
+    # Keep that headroom so the streaming sampler can saturate the
+    # D-Wave cloud queue without blocking on Python-side derivation.
+    FEEDER_BUFFER_SIZE = 60
 
     def __init__(
         self,
@@ -134,7 +138,7 @@ class DWaveMiner(BaseMiner):
 
         self.queue_depth = queue_depth
         self.drain_on_stop = drain_on_stop
-        self._feeder: Optional[IsingFeeder] = None
+        self._feeder: Optional[RandomIsingFeeder] = None
         self._stream: Optional[Iterator] = None
         # Stashed by _pre_mine_setup so the streaming iterator can observe
         # cancellation during its inner poll loop. Needed because
@@ -176,7 +180,14 @@ class DWaveMiner(BaseMiner):
         stop_event: multiprocessing.synchronize.Event,
         **kwargs,
     ) -> bool:
-        """Check QPU daily budget and create IsingFeeder."""
+        """Check the QPU daily budget before mining can begin.
+
+        The Ising feeder is now built by ``BaseMiner.mine_work_item``
+        via ``context.make_feeder(...)``; this hook is kept solely for
+        the budget gate (``time_manager.should_mine_block()``), which
+        must run before any QPU calls so we don't burn budget on an
+        already-exhausted day.
+        """
         # Stash the stop_event so sample_ising_streaming can poll it
         # between QPU completions without plumbing it through every call.
         self._stop_event = stop_event
@@ -206,19 +217,6 @@ class DWaveMiner(BaseMiner):
                 f"Estimated: {estimate.estimated_block_time_us / 1e6:.2f}s "
                 f"({estimate.confidence} confidence)"
             )
-
-        # Create IsingFeeder (same pattern as GPU miners). `prev_block.hash`
-        # is the last proof block hash (`last_proof_block_hash` — see
-        # `_BridgePrevBlock.from_work_context` in base_miner.py).
-        feeder_seed = kwargs.pop('feeder_seed', None)
-        self._feeder = IsingFeeder(
-            last_proof_block_hash=prev_block.hash,
-            miner_bytes=node_info.miner_account_bytes,
-            nodes=self.sampler.nodes,
-            edges=self.sampler.edges,
-            buffer_size=self.queue_depth * 2,
-            seed=feeder_seed,
-        )
         return True
 
     def _adapt_mining_params(
@@ -242,7 +240,7 @@ class DWaveMiner(BaseMiner):
 
     def sample_ising_streaming(
         self,
-        feeder: IsingFeeder,
+        feeder: RandomIsingFeeder,
         *,
         num_reads: int,
         annealing_time: float,
@@ -261,7 +259,7 @@ class DWaveMiner(BaseMiner):
         without the ~1s cost of copying 4,500+ spin dicts.
 
         Args:
-            feeder: IsingFeeder providing pre-generated IsingModels.
+            feeder: RandomIsingFeeder providing pre-generated IsingModels.
             num_reads: QPU reads per problem.
             annealing_time: Annealing time in microseconds.
             queue_depth: Number of concurrent in-flight QPU jobs.

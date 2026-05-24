@@ -1,4 +1,4 @@
-"""Tests for IsingModel dataclass and IsingFeeder."""
+"""Tests for IsingModel dataclass, RandomIsingFeeder, and FixedIsingFeeder."""
 from __future__ import annotations
 
 import dataclasses
@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from shared.ising_feeder import IsingFeeder
+from shared.ising_feeder import FixedIsingFeeder, RandomIsingFeeder
 from shared.ising_model import IsingModel
 from shared.quantum_proof_of_work import (
     generate_ising_model_from_nonce,
@@ -29,7 +29,7 @@ def _make_feeder(**kwargs):
         max_workers=1,
     )
     defaults.update(kwargs)
-    return IsingFeeder(**defaults)
+    return RandomIsingFeeder(**defaults)
 
 
 _NONCE_BYTES_42 = (42).to_bytes(32, "big")
@@ -57,7 +57,7 @@ class TestIsingModel:
             model.nonce = b"\x99" * 32
 
 
-class TestIsingFeeder:
+class TestRandomIsingFeeder:
     def test_pop_returns_ising_model(self):
         feeder = _make_feeder(seed=1)
         try:
@@ -159,5 +159,70 @@ class TestIsingFeeder:
             )
             m_after = feeder.pop_blocking()
             assert m_before.nonce != m_after.nonce
+        finally:
+            feeder.stop()
+
+
+def _make_model(seed: int = 0) -> IsingModel:
+    """Build a small deterministic IsingModel for FixedIsingFeeder tests."""
+    return IsingModel(
+        h={0: float(seed), 1: -float(seed)},
+        J={(0, 1): float(seed) * 0.5},
+        nonce=(seed).to_bytes(32, "big"),
+        salt=bytes([seed % 256] * 32),
+    )
+
+
+class TestFixedIsingFeeder:
+    def test_single_model_cycles_forever(self):
+        """One-element list → every pop returns the same model."""
+        model = _make_model(seed=7)
+        feeder = FixedIsingFeeder(models=[model])
+        try:
+            for _ in range(5):
+                got = feeder.pop_blocking()
+                assert got is model
+        finally:
+            feeder.stop()
+
+    def test_multi_model_cycles_in_order(self):
+        """Multi-element list → pops yield the input order, then repeat."""
+        a, b, c = _make_model(1), _make_model(2), _make_model(3)
+        feeder = FixedIsingFeeder(models=[a, b, c])
+        try:
+            sequence = [feeder.pop_blocking() for _ in range(7)]
+            # First round: a, b, c. Second round restarts. Seventh = a.
+            assert sequence == [a, b, c, a, b, c, a]
+        finally:
+            feeder.stop()
+
+    def test_stop_is_idempotent(self):
+        """``stop()`` is a no-op kept for API parity; safe to call repeatedly."""
+        feeder = FixedIsingFeeder(models=[_make_model(seed=4)])
+        feeder.stop()
+        feeder.stop()  # second call must not raise
+        assert feeder._stopped
+
+    def test_rejects_empty_models(self):
+        with pytest.raises(ValueError, match="at least one IsingModel"):
+            FixedIsingFeeder(models=[])
+
+    def test_pop_n_cycles(self):
+        a, b = _make_model(10), _make_model(11)
+        feeder = FixedIsingFeeder(models=[a, b])
+        try:
+            assert feeder.pop_n(5) == [a, b, a, b, a]
+        finally:
+            feeder.stop()
+
+    def test_iteration_protocol(self):
+        """``__iter__`` returns self; ``next()`` cycles indefinitely."""
+        model = _make_model(seed=2)
+        feeder = FixedIsingFeeder(models=[model])
+        try:
+            it = iter(feeder)
+            assert it is feeder
+            assert next(it) is model
+            assert next(it) is model
         finally:
             feeder.stop()

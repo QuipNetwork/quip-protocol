@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""GPU miner using Metal/MPS with IsingFeeder streaming pipeline.
+"""GPU miner using Metal/MPS with RandomIsingFeeder streaming pipeline.
 
-Mirrors GPUMiner (gpu_miner.py) architecture: IsingFeeder for
+Mirrors GPUMiner (gpu_miner.py) architecture: RandomIsingFeeder for
 background model generation, MetalScheduler for core budget and
 IOKit-based yielding, and batched streaming dispatch via
 MetalSASampler.sample_ising_streaming().
@@ -21,7 +21,7 @@ import dimod
 
 from shared.base_miner import BaseMiner
 from shared.miner_types import BlockRequirements
-from shared.ising_feeder import IsingFeeder
+from shared.ising_feeder import RandomIsingFeeder
 from GPU.metal_sa import MetalSASampler
 from GPU.metal_scheduler import DutyCycleController, MetalScheduler
 
@@ -59,12 +59,17 @@ _STALL_SAFETY_FACTOR = 5.0
 
 
 class MetalMiner(BaseMiner):
-    """Metal GPU miner with IsingFeeder streaming pipeline.
+    """Metal GPU miner with RandomIsingFeeder streaming pipeline.
 
     Architecture mirrors GPUMiner: background model generation
-    via IsingFeeder, core budget via MetalScheduler, and batched
+    via RandomIsingFeeder, core budget via MetalScheduler, and batched
     multi-problem dispatch via sample_ising_streaming().
     """
+
+    # Keep the feeder large enough to keep Metal threadgroup dispatch fed
+    # without starving on Python-side derivation. Matches the old default
+    # of ``budget * 2`` for typical Apple Silicon core counts (~10).
+    FEEDER_BUFFER_SIZE = 16
 
     # Metal MPS strategy: fewer sweeps, more reads
     ADAPT_MIN_SWEEPS = 64
@@ -131,7 +136,7 @@ class MetalMiner(BaseMiner):
         )
 
         # Pipeline state (reset per mine_block call)
-        self._feeder: Optional[IsingFeeder] = None
+        self._feeder: Optional[RandomIsingFeeder] = None
         self._stream: Optional[Iterator] = None
         self._active_tg = self._scheduler.get_core_budget()
         self._max_tg = self._active_tg
@@ -141,7 +146,13 @@ class MetalMiner(BaseMiner):
     # ── BaseMiner hooks ──────────────────────────────────
 
     def _pre_mine_setup(self, *args, **kwargs) -> bool:
-        """Create IsingFeeder for this block."""
+        """Per-attempt setup. Feeder is built by ``BaseMiner.mine_work_item``.
+
+        Kept as an override (instead of using BaseMiner's default no-op)
+        so the validation of ``prev_block`` / ``node_info`` runs early
+        — the controller treats a ``False`` here as "skip this attempt"
+        rather than letting the loop crash on missing context fields.
+        """
         prev_block = args[0] if len(args) > 0 else None
         node_info = args[1] if len(args) > 1 else None
         if prev_block is None or node_info is None:
@@ -149,19 +160,6 @@ class MetalMiner(BaseMiner):
                 "Missing prev_block or node_info",
             )
             return False
-
-        cur_index = prev_block.header.index + 1
-        budget = self._scheduler.get_core_budget()
-
-        # `prev_block.hash` is the last proof block hash (`last_proof_block_hash` — see
-        # `_BridgePrevBlock.from_work_context` in base_miner.py).
-        self._feeder = IsingFeeder(
-            last_proof_block_hash=prev_block.hash,
-            miner_bytes=node_info.miner_account_bytes,
-            nodes=self.sampler.nodes,
-            edges=self.sampler.edges,
-            buffer_size=budget * 2,
-        )
 
         self._stream = None
         return True

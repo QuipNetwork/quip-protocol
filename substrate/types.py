@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 from shared.allowed_value_spec import AllowedValueSpec
+from shared.ising_feeder import RandomIsingFeeder
 
 if TYPE_CHECKING:
     # Type-only — avoids the substrate ↔ shared cycle at runtime.
@@ -168,6 +169,29 @@ class SubstrateMiningContext:
             timeout_to_difficulty_adjustment_decay=2**31 - 1,
             allowed_h_values=self.allowed_h_values,
             allowed_j_values=self.allowed_j_values,
+        )
+
+    def make_feeder(
+        self,
+        nodes: Sequence[int],
+        edges: Sequence[Tuple[int, int]],
+        *,
+        buffer_size: int = 8,
+    ) -> RandomIsingFeeder:
+        """Return a ``RandomIsingFeeder`` rooted at this snapshot's round seed.
+
+        ``last_proof_block_hash`` and ``miner_account_bytes`` together
+        identify the round + miner under PoW; the feeder rolls fresh
+        salts internally and derives ``(nonce, h, J)`` from them. The
+        loop owns the feeder lifecycle — it stops the feeder when the
+        mining attempt ends.
+        """
+        return RandomIsingFeeder(
+            last_proof_block_hash=self.last_proof_block_hash,
+            miner_bytes=self.miner_account_bytes,
+            nodes=list(nodes),
+            edges=list(edges),
+            buffer_size=buffer_size,
         )
 
 

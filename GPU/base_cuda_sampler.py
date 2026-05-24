@@ -882,7 +882,7 @@ class BaseCudaSampler(abc.ABC):
         def _pull_blocking() -> Optional[IsingModel]:
             """Wait for a model (cold start only).
 
-            Uses IsingFeeder.pop_blocking() when available,
+            Uses RandomIsingFeeder.pop_blocking() when available,
             otherwise falls back to next(model_iter).
             """
             nonlocal _exhausted

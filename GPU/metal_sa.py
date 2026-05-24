@@ -713,7 +713,7 @@ class MetalSASampler:
         positions — no adjacency sorting or degree counting.
 
         Args:
-            models: Iterable of IsingModel (typically an IsingFeeder).
+            models: Iterable of IsingModel (typically a RandomIsingFeeder).
             num_reads: SA reads per problem.
             num_sweeps: Total sweeps per run.
             max_threadgroups: Max problems per batch dispatch.

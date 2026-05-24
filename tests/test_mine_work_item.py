@@ -210,6 +210,60 @@ def test_resolve_ising_mempool_returns_stored_h_j():
     assert nonce == 0
 
 
+def test_make_feeder_pow_returns_random_feeder(relaxed_context):
+    """``SubstrateMiningContext.make_feeder`` builds a RandomIsingFeeder
+    seeded with the snapshot's round identity. Each pop derives a fresh
+    salt + nonce — the loop relies on this in lieu of the old inline
+    ``fresh_salt()`` / ``resolve_ising()`` calls."""
+    from shared.ising_feeder import RandomIsingFeeder
+    from shared.ising_model import IsingModel
+
+    feeder = relaxed_context.make_feeder(
+        relaxed_context.nodes, relaxed_context.edges, buffer_size=2,
+    )
+    try:
+        assert isinstance(feeder, RandomIsingFeeder)
+        model = feeder.pop_blocking()
+        assert isinstance(model, IsingModel)
+        # PoW path: each iteration must derive a fresh nonce from a
+        # fresh salt; the next pop must produce a different one.
+        model_b = feeder.pop_blocking()
+        assert model.salt != model_b.salt
+        assert model.nonce != model_b.nonce
+    finally:
+        feeder.stop()
+
+
+def test_make_feeder_mempool_returns_fixed_feeder():
+    """``MempoolJobContext.make_feeder`` builds a FixedIsingFeeder that
+    cycles the order's stored (h, J) — placeholder nonce / salt are
+    zero bytes (chain doesn't re-derive)."""
+    from shared.ising_feeder import FixedIsingFeeder
+    from shared.mempool_types import MempoolJobContext
+
+    ctx = MempoolJobContext(
+        order_id=99,
+        nodes=(10, 20, 30),
+        edges=((10, 20), (20, 30)),
+        h_values=(1000, -500, 250),
+        j_values=(-100, 750),
+    )
+    feeder = ctx.make_feeder(ctx.nodes, ctx.edges)
+    try:
+        assert isinstance(feeder, FixedIsingFeeder)
+        m = feeder.pop_blocking()
+        # h, J decoded from milli; chain-side floats.
+        assert m.h == {10: 1.0, 20: -0.5, 30: 0.25}
+        assert m.J == {(10, 20): -0.1, (20, 30): 0.75}
+        # Same model on repeat — cycle of length 1.
+        m2 = feeder.pop_blocking()
+        assert m2 is m
+        assert m.nonce == b"\x00" * 32
+        assert m.salt == b"\x00" * 32
+    finally:
+        feeder.stop()
+
+
 def test_resolve_ising_pow_uses_derive_nonce(relaxed_context, cpu_miner):
     """PoW's resolve_ising must produce the same (h, J, nonce) as the legacy
     direct invocation of derive_nonce + generate_ising_model_from_nonce —

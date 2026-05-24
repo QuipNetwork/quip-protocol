@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import random
 from typing import (
+    Any,
     Dict,
     Protocol,
     Sequence,
@@ -37,6 +38,26 @@ class WorkContext(Protocol):
         ...
 
     def requirements(self) -> BlockRequirements:
+        ...
+
+    def make_feeder(
+        self,
+        nodes: Sequence[int],
+        edges: Sequence[Tuple[int, int]],
+        *,
+        buffer_size: int = 8,
+    ) -> Any:
+        """Construct the feeder ``BaseMiner.mine_work_item`` pops from.
+
+        Each context flavor picks the right backing implementation: PoW
+        contexts return a :class:`shared.ising_feeder.RandomIsingFeeder`
+        that derives a fresh ``(salt -> nonce -> h, J)`` per iteration;
+        mempool contexts return a :class:`FixedIsingFeeder` cycling the
+        single ``(h, J)`` carried in the job order. Return type is
+        duck-typed deliberately — both implementations expose the same
+        ``pop_blocking`` / ``stop`` surface, so the loop doesn't need a
+        nominal supertype.
+        """
         ...
 
 
