@@ -769,11 +769,17 @@ def test_attempt_log_records_num_valid_and_diversity_on_stored_iteration(
         captured.append(kw), stop.set(),
     )
 
-    # Force the submit gate to fail: set the live threshold so far below
-    # any reachable Ising energy that no floor can clear it. The post-
-    # processing branch still fires because ratchet_threshold (= the
-    # context's relaxed difficulty_energy) is easily beaten.
-    live_var = mp.Value('q', -10**18)
+    # Use a live threshold that matches the snapshot (max_energy_milli=0
+    # in relaxed_context). With min_solutions=1 the ratchet and submit
+    # gates compare the same energy against the same threshold, so an
+    # iter that post-processes will also submit — and `num_valid` +
+    # `diversity_milli` must still be populated on the submitted record.
+    # (The previous setup forced submit to fail by setting live well
+    # below any reachable energy, but that exploited an old bug where
+    # the ratchet gate read the dispatch snapshot while the submit gate
+    # read live; both gates now read live, so that contradiction is
+    # no longer expressible with min_solutions=1.)
+    live_var = mp.Value('q', 0)
 
     # Install both onto the miner. ``mine_work_item`` reads
     # ``_attempt_logger`` and ``_live_max_energy_milli`` directly off
@@ -783,35 +789,34 @@ def test_attempt_log_records_num_valid_and_diversity_on_stored_iteration(
 
     stop = mp.Event()
     try:
-        result = cpu_miner.mine_work_item(relaxed_context, stop)
+        cpu_miner.mine_work_item(relaxed_context, stop)
     finally:
         del cpu_miner._attempt_logger
         del cpu_miner._live_max_energy_milli
 
-    # Submit gate forced to fail → loop returns None (stop was set by
-    # the mock as soon as one record was emitted).
-    assert result is None
     assert captured, "expected at least one AttemptLogger.record call"
 
-    # Find an iteration that post-processed; the test setup guarantees
-    # the first such record will be ``stored`` (no prior stored_best to
-    # beat, so any valid post-processed result becomes stored) — submit
-    # blocked by the impossibly-low live threshold.
+    # Find an iteration that post-processed; assert num_valid and
+    # diversity_milli are populated regardless of whether the result
+    # was stored or submitted. The regression we're guarding against
+    # is the submit gate rebinding the local ``result`` to None
+    # before log kwargs are assembled — the values are captured into
+    # ``post_num_valid`` / ``post_diversity_milli`` earlier in the
+    # iteration so the rebind can't strip them.
     post_processed = [k for k in captured if k.get("post_processed")]
     assert post_processed, (
         "expected at least one post_processed=True record; got "
         f"{[k.get('result_kind') for k in captured]}"
     )
     rec = post_processed[0]
-    assert rec["result_kind"] == "stored", (
-        f"expected result_kind='stored' (submit gate forced to fail), "
-        f"got {rec['result_kind']}"
+    assert rec["result_kind"] in ("stored", "submitted"), (
+        f"expected result_kind in (stored, submitted), got {rec['result_kind']}"
     )
     assert isinstance(rec["num_valid"], int) and rec["num_valid"] >= 1, (
-        f"num_valid must be a populated int on post-processed stored "
+        f"num_valid must be a populated int on post-processed "
         f"iteration, got {rec['num_valid']!r}"
     )
     assert isinstance(rec["diversity_milli"], int), (
         f"diversity_milli must be a populated int on post-processed "
-        f"stored iteration, got {rec['diversity_milli']!r}"
+        f"iteration, got {rec['diversity_milli']!r}"
     )

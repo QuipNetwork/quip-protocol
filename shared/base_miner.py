@@ -579,14 +579,21 @@ class BaseMiner(ABC):
                     # might meet the threshold energy target, except
                     # the target is the last min energy that met
                     # requirements." Use stored_best's energy when we
-                    # have one; otherwise the initial snapshot energy.
+                    # have one; otherwise the chain's *live* (decayed)
+                    # threshold — using requirements.difficulty_energy
+                    # here would freeze the gate at the dispatch-snapshot
+                    # value and lock the miner out of submissions when
+                    # decay eases the chain target mid-dispatch (a
+                    # single dispatch can outlive many decay events
+                    # whenever no proof has landed to refresh the work
+                    # key).
                     iter_best_energy = float(
                         np.min(sampleset.record.energy),
                     )
                     ratchet_threshold = (
                         stored_best.energy
                         if stored_best is not None
-                        else requirements.difficulty_energy
+                        else live_threshold_milli / 1000.0
                     )
 
                     result = None
