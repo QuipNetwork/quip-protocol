@@ -117,6 +117,59 @@ async def test_pool_does_NOT_auto_retry_submit_extrinsic():
 
 
 @pytest.mark.asyncio
+async def test_pool_does_NOT_auto_retry_submit_signed_extrinsic():
+    """submit_signed_extrinsic is non-idempotent; pool raises ValidatorSwapped."""
+    pool = _make_pool([
+        {
+            "url": "http://a",
+            "behaviour": {"submit_signed_extrinsic": ConnectionError("dead")},
+        },
+        {"url": "http://b"},
+    ])
+    await pool.start()
+    try:
+        with pytest.raises(ValidatorSwapped):
+            await pool.send(
+                "submit_signed_extrinsic",
+                {"extrinsic_hex": "0xabcd", "wait_for": "inblock"},
+            )
+        # B did NOT receive a submit_signed_extrinsic call
+        assert pool._fakes_by_url["http://b"].calls == []
+        # A was swapped out, though
+        assert pool._fakes_by_url["http://a"].is_shutdown
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pool_routes_submit_signed_extrinsic_to_active_handle():
+    """Happy path: submit_signed_extrinsic reaches the active child with its hex."""
+    pool = _make_pool([
+        {
+            "url": "http://a",
+            "behaviour": {"submit_signed_extrinsic": "receipt-sentinel"},
+        },
+        {"url": "http://b"},
+    ])
+    await pool.start()
+    try:
+        result = await pool.send(
+            "submit_signed_extrinsic",
+            {"extrinsic_hex": "0xdeadbeef", "wait_for": "finalized"},
+        )
+        assert result == "receipt-sentinel"
+        assert pool._fakes_by_url["http://a"].calls == [
+            (
+                "submit_signed_extrinsic",
+                {"extrinsic_hex": "0xdeadbeef", "wait_for": "finalized"},
+            ),
+        ]
+        assert pool._fakes_by_url["http://b"].calls == []
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_pool_exhausts_retries_then_raises():
     """Idempotent op that fails on every URL eventually raises after max_swap_retries."""
     pool = _make_pool([

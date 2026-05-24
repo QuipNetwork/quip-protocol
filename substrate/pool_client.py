@@ -9,18 +9,14 @@ hot-active swap + idempotent-retry semantics for free: every method here
 forwards to ``await self._pool.send(op_name, kwargs_dict)``.
 
 Scope:
-    * READ ops only (idempotent — pool auto-retries across swaps).
-    * Mirrors the subset of ``SubstrateClient`` methods the controller
-      actually uses.
+    * READ ops (idempotent — pool auto-retries across swaps).
+    * ``submit_signed_extrinsic`` — non-idempotent write. The pool raises
+      ``ValidatorSwapped`` on mid-flight swap and lets the caller decide
+      whether to re-sign (with a fresh nonce) and resubmit.
 
-NOT in scope yet:
-    * ``submit_extrinsic`` — signing requires sending a ``Signer`` (which
-      holds key material) across the mp.Queue IPC boundary, which is
-      both a pickling problem and a security smell. Submitter migration
-      is a separate task: refactor to sign in the parent and ship raw
-      signed bytes to the child via a new ``submit_signed_extrinsic``
-      RPC. Until then, callers needing submit_extrinsic must hold a
-      direct ``SubstrateClient`` connection.
+Signing stays in the calling process: callers pair this submit path
+with ``SubstrateClient.build_signed_extrinsic`` so key material never
+crosses the mp.Queue IPC boundary.
 """
 from __future__ import annotations
 
@@ -116,14 +112,21 @@ class PoolClient:
         return await self._pool.send("get_events_at", {"block_hash": block_hash})
 
     # ------------------------------------------------------------------
-    # Submitter path — see module docstring "NOT in scope yet".
+    # Submission: sign in parent, ship hex.
     # ------------------------------------------------------------------
 
-    async def submit_extrinsic(self, *args, **kwargs):
-        raise NotImplementedError(
-            "PoolClient.submit_extrinsic is not implemented: signing "
-            "requires shipping signer key material across IPC. Use a "
-            "direct SubstrateClient connection for submission until the "
-            "submitter is refactored to sign in the parent and send "
-            "raw signed bytes through the pool."
+    async def submit_signed_extrinsic(
+        self,
+        extrinsic_hex: str,
+        wait_for: str = "inblock",
+    ):
+        """Submit pre-built signed extrinsic via the active validator child.
+
+        The pool routes this through the swap-aware ``send()`` path. As a
+        non-idempotent op, a mid-flight swap raises ``ValidatorSwapped``
+        — the caller must re-sign (with a fresh nonce) and resubmit.
+        """
+        return await self._pool.send(
+            "submit_signed_extrinsic",
+            {"extrinsic_hex": extrinsic_hex, "wait_for": wait_for},
         )

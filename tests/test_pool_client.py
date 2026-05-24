@@ -157,9 +157,31 @@ async def test_pool_exception_propagates():
 
 
 @pytest.mark.asyncio
-async def test_submit_extrinsic_raises_not_implemented():
-    """Document boundary: submit_extrinsic is intentionally unsupported."""
+async def test_submit_signed_extrinsic_forwards_hex_and_wait_for():
     pool = _RecordingPool()
+    pool.scripted["submit_signed_extrinsic"] = "receipt-sentinel"
     client = PoolClient(pool)
-    with pytest.raises(NotImplementedError, match="signing"):
-        await client.submit_extrinsic()
+    result = await client.submit_signed_extrinsic(
+        "0xdeadbeef", wait_for="finalized",
+    )
+    assert result == "receipt-sentinel"
+    assert pool.calls == [
+        (
+            "submit_signed_extrinsic",
+            {"extrinsic_hex": "0xdeadbeef", "wait_for": "finalized"},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_submit_signed_extrinsic_default_wait_is_inblock():
+    pool = _RecordingPool()
+    pool.scripted["submit_signed_extrinsic"] = "receipt"
+    client = PoolClient(pool)
+    await client.submit_signed_extrinsic("0xabc123")
+    assert pool.calls == [
+        (
+            "submit_signed_extrinsic",
+            {"extrinsic_hex": "0xabc123", "wait_for": "inblock"},
+        )
+    ]

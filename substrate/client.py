@@ -740,90 +740,130 @@ class SubstrateClient:
         signer: Signer,
         wait_for: WaitFor = "inblock",
     ) -> ExtrinsicReceipt:
-        """Compose, sign, and submit an extrinsic.
+        """Compose, sign, and submit an extrinsic on this connection.
 
-        Branches on `signer.signature_kind()`:
-          - Sr25519: delegates to substrate-interface's
-            `create_signed_extrinsic` (works on `MultiSignature` chains).
-          - Hybrid:  bypasses substrate-interface entirely because the
-            chain's `Signature` type is now `HybridTxSignature`
-            (composite struct), not `MultiSignature` (enum). We build the
-            wire bytes manually via `_build_hybrid_signed_extrinsic`.
+        Convenience wrapper that pairs :meth:`build_signed_extrinsic`
+        with :meth:`submit_signed_extrinsic`. Callers that want
+        swap-aware submission should call the two halves separately and
+        ship the hex through ``ValidatorPool`` — see ``PoolClient``.
         """
-        kind = signer.signature_kind()
-        if kind == "Sr25519":
-            return await self._submit_sr25519_extrinsic(
-                call_module, call_function, call_params, signer, wait_for,
-            )
-        if kind == "Hybrid":
-            return await self._submit_hybrid_extrinsic(
-                call_module, call_function, call_params, signer, wait_for,
-            )
-        raise NotImplementedError(
-            f"submit_extrinsic does not support signature_kind={kind}"
+        ext_hex = await self.build_signed_extrinsic(
+            call_module, call_function, call_params, signer,
         )
+        return await self.submit_signed_extrinsic(ext_hex, wait_for=wait_for)
 
-    async def _submit_sr25519_extrinsic(
+    async def build_signed_extrinsic(
         self,
         call_module: str,
         call_function: str,
         call_params: dict,
         signer: Signer,
-        wait_for: WaitFor,
-    ) -> ExtrinsicReceipt:
+    ) -> str:
+        """Compose + sign an extrinsic locally; return hex-encoded wire bytes.
+
+        Branches on ``signer.signature_kind()``:
+          - Sr25519: substrate-interface's ``create_signed_extrinsic``
+            (works on ``MultiSignature`` chains); we then extract the
+            SCALE bytes via ``extrinsic.data.to_hex()``.
+          - Hybrid:  manual SCALE assembly via
+            ``_build_hybrid_signed_extrinsic`` — substrate-interface
+            doesn't know about the chain's ``HybridTxSignature`` envelope.
+
+        Pair with :meth:`submit_signed_extrinsic` so the signer's key
+        material can stay in the calling process even when the submit
+        side crosses an IPC boundary (e.g., ``ValidatorPool.send``).
+        """
+        kind = signer.signature_kind()
+        if kind == "Sr25519":
+            return await self._build_sr25519_extrinsic_hex(
+                call_module, call_function, call_params, signer,
+            )
+        if kind == "Hybrid":
+            return await self._build_hybrid_extrinsic_hex(
+                call_module, call_function, call_params, signer,
+            )
+        raise NotImplementedError(
+            f"build_signed_extrinsic does not support signature_kind={kind}"
+        )
+
+    async def _build_sr25519_extrinsic_hex(
+        self,
+        call_module: str,
+        call_function: str,
+        call_params: dict,
+        signer: Signer,
+    ) -> str:
         keypair = signer.keypair  # type: ignore[attr-defined]
 
-        def _build_and_submit() -> Any:
+        def _build() -> str:
             call = self._iface.compose_call(
                 call_module=call_module,
                 call_function=call_function,
                 call_params=call_params,
             )
             extrinsic: GenericExtrinsic = self._iface.create_signed_extrinsic(
-                call=call, keypair=keypair
+                call=call, keypair=keypair,
             )
-            return self._iface.submit_extrinsic(
-                extrinsic,
-                wait_for_inclusion=wait_for == "inblock",
-                wait_for_finalization=wait_for == "finalized",
-            )
+            return extrinsic.data.to_hex()
 
-        receipt = await self._run(_build_and_submit)
-        return _coerce_receipt(receipt)
+        return await self._run(_build)
 
-    async def _submit_hybrid_extrinsic(
+    async def _build_hybrid_extrinsic_hex(
         self,
         call_module: str,
         call_function: str,
         call_params: dict,
         signer: Signer,
-        wait_for: WaitFor,
-    ) -> ExtrinsicReceipt:
-        """Build, sign with HybridSigner, and submit a v4 extrinsic.
-
-        substrate-interface 1.8.1 doesn't know about the new chain's
-        `HybridTxSignature` envelope, `AuthorizeCall` / `WeightReclaim`
-        signed extensions, or the metadata-hash mode field. We construct
-        the SCALE-encoded wire bytes ourselves; submission and
-        inclusion-wait both go through substrate-interface's RPC layer.
-        """
+    ) -> str:
         if not isinstance(signer, HybridSigner):
             raise TypeError(
                 f"hybrid signing requires a HybridSigner, got {type(signer).__name__}"
             )
 
-        def _do() -> dict:
-            ext_bytes, ext_hash = _build_hybrid_signed_extrinsic(
+        def _build() -> str:
+            ext_bytes, _ext_hash = _build_hybrid_signed_extrinsic(
                 iface=self._iface,
                 signer=signer,
                 call_module=call_module,
                 call_function=call_function,
                 call_params=call_params,
             )
-            ext_hex = "0x" + ext_bytes.hex()
+            return "0x" + ext_bytes.hex()
 
+        return await self._run(_build)
+
+    async def submit_signed_extrinsic(
+        self,
+        extrinsic_hex: str,
+        wait_for: WaitFor = "inblock",
+    ) -> ExtrinsicReceipt:
+        """Submit a pre-signed extrinsic; return the typed receipt.
+
+        ``extrinsic_hex`` is the SCALE-encoded signed extrinsic with or
+        without a ``0x`` prefix — typically the output of
+        :meth:`build_signed_extrinsic`. The extrinsic hash is computed
+        locally from the bytes (``blake2_256``), so callers don't need
+        to ship it through IPC alongside the hex.
+
+        ``wait_for``:
+          - ``"sent"``: return as soon as the node accepts the extrinsic.
+          - ``"inblock"``: wait until inclusion in a block (default).
+          - ``"finalized"``: wait until the including block is finalized.
+
+        For inclusion/finalization, fetches block events to surface
+        ``System.ExtrinsicFailed`` as ``receipt.error`` — without this
+        callers would treat chain-rejected dispatches as successful.
+        """
+        if not extrinsic_hex.startswith("0x"):
+            extrinsic_hex = "0x" + extrinsic_hex
+        raw = bytes.fromhex(extrinsic_hex[2:])
+        ext_hash = "0x" + hashlib.blake2b(raw, digest_size=32).hexdigest()
+
+        def _do() -> dict:
             if wait_for == "sent":
-                resp = self._iface.rpc_request("author_submitExtrinsic", [ext_hex])
+                resp = self._iface.rpc_request(
+                    "author_submitExtrinsic", [extrinsic_hex]
+                )
                 if "error" in resp:
                     raise RuntimeError(
                         f"author_submitExtrinsic rejected: {resp['error']}"
@@ -837,22 +877,26 @@ class SubstrateClient:
 
             # Inclusion/finalization: use the subscription RPC with a
             # result_handler that pulls the next status update. Mirrors
-            # `substrate_interface.SubstrateInterface.submit_extrinsic` so the
-            # error-handling path is well-trodden.
+            # `substrate_interface.SubstrateInterface.submit_extrinsic` so
+            # the error-handling path is well-trodden.
             def _result_handler(message, update_nr, subscription_id):  # noqa: ARG001
                 params = message.get("params") or {}
                 result = params.get("result")
                 if isinstance(result, dict):
                     res = {k.lower(): v for k, v in result.items()}
                     if "finalized" in res and wait_for == "finalized":
-                        self._iface.rpc_request("author_unwatchExtrinsic", [subscription_id])
+                        self._iface.rpc_request(
+                            "author_unwatchExtrinsic", [subscription_id]
+                        )
                         return {
                             "extrinsic_hash": ext_hash,
                             "block_hash": res["finalized"],
                             "finalized": True,
                         }
                     if "inblock" in res and wait_for == "inblock":
-                        self._iface.rpc_request("author_unwatchExtrinsic", [subscription_id])
+                        self._iface.rpc_request(
+                            "author_unwatchExtrinsic", [subscription_id]
+                        )
                         return {
                             "extrinsic_hash": ext_hash,
                             "block_hash": res["inblock"],
@@ -863,27 +907,26 @@ class SubstrateClient:
                     # `finalityTimeout` are all terminal — without raising
                     # here the subscription would silently keep waiting and
                     # callers would hang forever.
-                    self._iface.rpc_request("author_unwatchExtrinsic", [subscription_id])
-                    raise ValueError(f"hybrid extrinsic rejected: {result}")
+                    self._iface.rpc_request(
+                        "author_unwatchExtrinsic", [subscription_id]
+                    )
+                    raise ValueError(f"extrinsic rejected: {result}")
                 return None  # non-terminal status — keep waiting
 
-            response = self._iface.rpc_request(
+            return self._iface.rpc_request(
                 "author_submitAndWatchExtrinsic",
-                [ext_hex],
+                [extrinsic_hex],
                 result_handler=_result_handler,
             )
-            return response
 
         result = await self._run(_do)
         block_hash = result.get("block_hash")
         error_msg = None
         if block_hash:
-            # author_submitAndWatchExtrinsic only reports that the extrinsic
-            # made it into a block — a `System.ExtrinsicFailed` event still
-            # means the chain rejected the dispatch. Without this fetch
-            # callers see `is_success=True` for a chain-rejected proof and
-            # silently treat it as accepted. Fetch the block's events and
-            # surface any ExtrinsicFailed matching our hash.
+            # author_submitAndWatchExtrinsic only reports inclusion — a
+            # `System.ExtrinsicFailed` event still means the chain rejected
+            # the dispatch. Without this fetch callers see is_success=True
+            # for a chain-rejected proof.
             try:
                 error_msg = await self._run(
                     lambda: _fetch_extrinsic_dispatch_error(
@@ -897,9 +940,11 @@ class SubstrateClient:
                 # classify as a non-fatal error rather than letting the
                 # extrinsic look fully successful.
                 error_msg = f"event fetch failed: {exc}"
-                logger.warning("hybrid extrinsic event fetch failed: %s", exc)
+                logger.warning("extrinsic event fetch failed: %s", exc)
         return ExtrinsicReceipt(
-            extrinsic_hash=str(result.get("extrinsic_hash") or result.get("result") or ""),
+            extrinsic_hash=str(
+                result.get("extrinsic_hash") or result.get("result") or ""
+            ),
             block_hash=str(block_hash or "") or None,
             is_finalized=bool(result.get("finalized", False)),
             error=error_msg,
@@ -1623,50 +1668,6 @@ def _coerce_block_number(raw: Any) -> int:
     if raw is None:
         raise ValueError("header missing 'number' field")
     return int(raw)
-
-
-def _coerce_receipt(receipt: Any) -> ExtrinsicReceipt:
-    """Convert a substrate-interface ExtrinsicReceipt to our typed wrapper.
-
-    Fails loud if the receipt does not advertise success/failure: a missing
-    ``is_success`` attribute used to fall through to "success" which masked
-    submission failures from callers that classify by ``receipt.error``.
-    """
-    is_success = getattr(receipt, "is_success", None)
-    if is_success is None:
-        raise RuntimeError(
-            "substrate-interface receipt is missing `is_success`; cannot "
-            "classify outcome (receipt_type=%s)" % type(receipt).__name__
-        )
-    error_msg: Optional[str] = None
-    if is_success is False:
-        try:
-            error_msg = str(receipt.error_message)
-        except AttributeError:
-            # Receipt advertised failure but provided no error_message —
-            # surface a grep-able sentinel so callers don't conflate it with
-            # legitimate error strings.
-            error_msg = "substrate-interface receipt missing error_message"
-            logger.error(
-                "extrinsic failed but receipt has no error_message: %s",
-                type(receipt).__name__,
-            )
-    events: list = []
-    raw_events = getattr(receipt, "triggered_events", None) or []
-    try:
-        for ev in raw_events:
-            events.append(ev.value if hasattr(ev, "value") else dict(ev))
-    except (AttributeError, TypeError) as exc:
-        # Don't silently swallow — empty events combined with no error would
-        # look like a successful submission that produced no side effects.
-        logger.warning("failed to decode triggered_events: %s", exc)
-    return ExtrinsicReceipt(
-        extrinsic_hash=str(getattr(receipt, "extrinsic_hash", "")),
-        block_hash=str(getattr(receipt, "block_hash", "") or "") or None,
-        is_finalized=bool(getattr(receipt, "finalized", False)),
-        error=error_msg,
-        events=events,
-    )
 
 
 __all__ = [
