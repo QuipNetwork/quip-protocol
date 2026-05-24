@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional, Sequence
 
@@ -806,7 +807,11 @@ class SubstrateClient:
             )
             return extrinsic.data.to_hex()
 
-        return await self._run(_build)
+        # Build is pure compose+sign: it reads chain metadata + nonce
+        # but does NOT broadcast anything, so retrying after a WS
+        # reconnect is safe. Submission is the non-idempotent step,
+        # handled separately by ``submit_signed_extrinsic``.
+        return await self._run(_build, idempotent=True)
 
     async def _build_hybrid_extrinsic_hex(
         self,
@@ -830,7 +835,9 @@ class SubstrateClient:
             )
             return "0x" + ext_bytes.hex()
 
-        return await self._run(_build)
+        # Same idempotent-retry rationale as the sr25519 path: build is
+        # pure compose+sign with no broadcast side effect.
+        return await self._run(_build, idempotent=True)
 
     async def submit_signed_extrinsic(
         self,
@@ -955,24 +962,36 @@ class SubstrateClient:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _run(self, fn):
+    async def _run(self, fn, *, idempotent: bool = False):
         """Run a blocking substrate-interface call with failover-on-loss.
 
         All callers go through this method, so the `_call_lock` taken
         inside `_raw_run` guarantees serial access to the underlying
         `SubstrateInterface`.
 
-        Failover semantics: a `WebSocketException` or `ConnectionError`
-        from the call body triggers one `reconnect()` attempt, then the
-        *original* exception is re-raised so the caller's retry logic
-        runs. The bound-method lambdas in this file capture
-        `self._iface` lazily, so a follow-up call after failover hits
-        the fresh iface. If `reconnect()` itself can't find a healthy
-        validator, `NoValidatorReachable` propagates instead.
+        Failover semantics: a connection-class error (``WebSocketException``,
+        ``ConnectionError``, or a ``json.JSONDecodeError`` from an empty
+        response frame — substrate-interface doesn't realise the WS is
+        dead and tries to parse ``""`` as JSON) triggers one
+        ``reconnect()`` attempt.
+
+        After the reconnect, behaviour depends on ``idempotent``:
+          - ``idempotent=False`` (default, the safe choice for arbitrary
+            extrinsic-submitting callers): re-raise the original exception
+            so the caller decides whether to retry. A partially-submitted
+            extrinsic must NOT be resubmitted blindly.
+          - ``idempotent=True``: the caller is asserting this call has no
+            chain side effects (pure read, or compose+sign with the
+            extrinsic not yet broadcast). We retry the call once on the
+            fresh iface. If the retry also fails, the second exception
+            propagates.
+
+        ``reconnect()`` itself can raise ``NoValidatorReachable`` if no
+        URL in the failover list comes back up; that propagates instead.
         """
         try:
             return await self._raw_run(fn)
-        except (WebSocketException, ConnectionError) as exc:
+        except (WebSocketException, ConnectionError, json.JSONDecodeError) as exc:
             logger.warning(
                 "substrate _run failed on %s (%s: %s); attempting failover",
                 self.current_url,
@@ -980,16 +999,22 @@ class SubstrateClient:
                 exc,
             )
             # May raise NoValidatorReachable — that's the intended
-            # signal upstream. The original exception is shadowed in
-            # that case; operators get the structured attempt log.
-            # `reconnect()` does not call `_run`, so no recursion risk.
+            # signal upstream. `reconnect()` does not call `_run`, so
+            # no recursion risk.
             await self.reconnect()
-            # Reconnect succeeded. The current call is still lost — the
-            # underlying lambda was bound to the dead iface, and we can't
-            # safely retry it in general (e.g. a partially-submitted
-            # extrinsic must not be resubmitted blindly). Surface the
-            # original exception so the caller's retry path decides.
-            raise
+            if not idempotent:
+                # Surface the original exception so the caller's retry
+                # path decides. Default for any path that could have
+                # broadcast a non-idempotent extrinsic.
+                raise
+            # Idempotent path: retry once on the fresh iface. The
+            # lambdas in this file capture ``self._iface`` lazily, so
+            # the retry hits the post-reconnect iface naturally.
+            logger.info(
+                "retrying idempotent call on %s after reconnect",
+                self.current_url,
+            )
+            return await self._raw_run(fn)
 
     async def _raw_run(self, fn):
         """Lock-guarded executor dispatch without failover plumbing.
