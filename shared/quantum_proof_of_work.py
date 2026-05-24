@@ -698,12 +698,29 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
     diversity = 0.0
     result = None
 
-    # Lenient mode keeps the same diversity + min_solutions invariants but
-    # drops the energy gate. Effectively the "candidate set" becomes all
-    # samples (not just samples under the energy threshold), so a result
-    # that's just above the (decay-stale) snapshot threshold can still be
-    # stored as a ratchet candidate.
-    effective_energy_filter = difficulty_energy if strict_energy else float("inf")
+    # Energy filter for the diverse-selection pool.
+    #
+    # Strict mode: gates on the snapshot difficulty (legacy non-substrate
+    # path / mempool jobs with hard floors).
+    #
+    # Lenient mode + live threshold: gates on the *live* (decay-applied)
+    # chain target. Picking diversity from samples above this threshold
+    # inflates ``submit_floor_energy = max(selected_energies)`` past the
+    # chain's strict ``energy < max_energy_milli`` filter, so the submit
+    # gate (correctly) refuses to ship a bundle the chain would reject.
+    # Constraining the pool to below-target samples keeps the floor
+    # under the target by construction. When the chain decays on a
+    # future iter, ``live_threshold_energy`` slides up and new samples
+    # enter the pool automatically.
+    #
+    # Lenient mode + no live (legacy / tests): preserves the original
+    # "accept everything constraint-valid" behavior.
+    if strict_energy:
+        energy_filter = difficulty_energy
+    elif live_threshold_energy is not None:
+        energy_filter = live_threshold_energy
+    else:
+        energy_filter = float("inf")
 
     try:
         # Best Energy - use sampler-reported energy for fast early exit
@@ -713,22 +730,25 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
 
         best_energy = float(np.min(all_energies))
 
-        # FAST PATH: Early exit if best energy doesn't meet threshold
-        # This avoids expensive Ising model regeneration and energy recalculation
-        if strict_energy and best_energy > difficulty_energy:
-            raise ValueError(f"Best energy {best_energy} exceeds difficulty energy {difficulty_energy}")
+        # FAST PATH: Early exit if best energy doesn't meet threshold.
+        # Matches the chain's strict ``<`` filter, so a result whose
+        # sampler-reported best matches the target down to the last
+        # milli isn't admitted (it'd fail chain validation anyway).
+        if best_energy >= energy_filter:
+            raise ValueError(
+                f"Best energy {best_energy} does not clear filter {energy_filter}"
+            )
 
-        # Count how many samples meet threshold before expensive operations
-        valid_count = np.sum(all_energies <= effective_energy_filter)
+        # Count how many samples meet threshold before expensive operations.
+        valid_count = np.sum(all_energies < energy_filter)
         if valid_count < min_solutions:
             raise ValueError(f"Insufficient valid solutions: {valid_count} < {min_solutions}")
 
-        # Process results from this mining attempt
-        # Find all solutions meeting energy threshold (or all, in lenient mode)
-        if strict_energy:
-            valid_indices = np.where(all_energies < difficulty_energy)[0]
-        else:
-            valid_indices = np.arange(len(all_energies))
+        # Build the diverse-selection pool. ``valid_indices`` is the
+        # set of samples eligible for ``select_diverse_solutions`` —
+        # we already pre-filtered to below-threshold above, so this is
+        # just "all energies meeting the filter".
+        valid_indices = np.where(all_energies < energy_filter)[0]
 
         # Get unique solutions that meet energy threshold
         # Track best energy among valid solutions
