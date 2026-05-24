@@ -35,6 +35,7 @@ RUN pip install --no-cache-dir --upgrade pip wheel && \
 COPY pyproject.toml README.md LICENSE ./
 COPY quip_cli.py ./
 COPY shared/ ./shared/
+COPY substrate/ ./substrate/
 COPY CPU/ ./CPU/
 COPY GPU/ ./GPU/
 COPY QPU/ ./QPU/

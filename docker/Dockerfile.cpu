@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY pyproject.toml README.md LICENSE ./
 COPY shared/ ./shared/
+COPY substrate/ ./substrate/
 COPY CPU/ ./CPU/
 COPY GPU/ ./GPU/
 COPY QPU/ ./QPU/
