@@ -617,6 +617,7 @@ class BaseMiner(ABC):
                     # already produced by ``evaluate_sampleset``.
                     post_num_valid: Optional[int] = None
                     post_diversity_milli: Optional[int] = None
+                    post_num_meeting_target: Optional[int] = None
                     if iter_best_energy < ratchet_threshold:
                         # Lenient eval — diversity + min_solutions
                         # still required, but no energy gate. The
@@ -626,11 +627,15 @@ class BaseMiner(ABC):
                             sampleset, requirements, nodes, edges,
                             nonce, salt, prev_timestamp, start_time,
                             strict_energy=False,
+                            live_threshold_energy=(
+                                live_threshold_milli / 1000.0
+                            ),
                         )
                         attempt_log_kwargs["post_processed"] = True
                         if result is not None:
                             post_num_valid = result.num_valid
                             post_diversity_milli = int(result.diversity * 1000)
+                            post_num_meeting_target = result.num_meeting_target
                             # Insert into the bounded heap. Always
                             # admits when there's room; otherwise the
                             # iter only got here because it beat the
@@ -690,6 +695,7 @@ class BaseMiner(ABC):
                         threshold_milli=live_threshold_milli,
                         ratchet_threshold_milli=ratchet_threshold_milli_log,
                         num_valid=post_num_valid,
+                        num_solutions_meeting_target=post_num_meeting_target,
                         diversity_milli=post_diversity_milli,
                         stored_as_best=stored_replaced,
                         result_kind=(
@@ -919,7 +925,7 @@ class BaseMiner(ABC):
         })
         return stats
 
-    def evaluate_sampleset(self, sampleset: dimod.SampleSet, requirements: BlockRequirements, nodes: List[int], edges: List[Tuple[int, int]], nonce: int, salt: bytes, prev_timestamp: int, start_time: float, *, strict_energy: bool = True) -> Optional[MiningResult]:
+    def evaluate_sampleset(self, sampleset: dimod.SampleSet, requirements: BlockRequirements, nodes: List[int], edges: List[Tuple[int, int]], nonce: int, salt: bytes, prev_timestamp: int, start_time: float, *, strict_energy: bool = True, live_threshold_energy: Optional[float] = None) -> Optional[MiningResult]:
         """Convert a sample set into a mining result if it meets requirements, otherwise return None.
 
         ``strict_energy=False`` enables the substrate ratchet's lenient
@@ -927,8 +933,15 @@ class BaseMiner(ABC):
         energy gate is dropped, so candidates that don't yet beat the
         chain's snapshot threshold can still be stashed in the
         ``top_k`` heap for later submission when decay catches up.
+
+        ``live_threshold_energy`` (float, ratchet path only) is the
+        chain's *live* (decay-applied) target. When provided, the
+        returned result populates ``num_meeting_target`` with the count
+        of constraint-satisfying samples whose chain-recomputed energy
+        would clear that target — purely diagnostic, surfaced in the
+        per-iter JSONL for the dashboard.
         """
-        return evaluate_sampleset(sampleset, requirements, nodes, edges, nonce, salt, prev_timestamp, start_time, self.miner_id, self.miner_type, strict_energy=strict_energy)
+        return evaluate_sampleset(sampleset, requirements, nodes, edges, nonce, salt, prev_timestamp, start_time, self.miner_id, self.miner_type, strict_energy=strict_energy, live_threshold_energy=live_threshold_energy)
 
 
 # ----------------------------------------------------------------------

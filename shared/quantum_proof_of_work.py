@@ -658,7 +658,8 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
                       h: Optional[Dict[int, float]] = None,
                       J: Optional[Dict[Tuple[int, int], float]] = None,
                       skip_validation: bool = True,
-                      strict_energy: bool = True):
+                      strict_energy: bool = True,
+                      live_threshold_energy: Optional[float] = None):
     """Convert a sample set into a mining result if it meets requirements, otherwise return None.
 
     Args:
@@ -845,6 +846,25 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         )
         submit_floor_energy = max(selected_energies) if selected_energies else best_energy
 
+        # Count batch solutions whose chain-recomputed energy would
+        # survive the live decayed target if submitted now. We recompute
+        # for ALL valid solutions (not just the K diverse-selected) so
+        # the count matches what the chain would actually accept.
+        # Sampler-reported energies (``valid_energies``) drift sub-milli
+        # from chain-computed ones on most backends but cross the
+        # boundary often enough at the round tail to be misleading — so
+        # we eat the extra matmul to keep the diagnostic honest. Only
+        # done when a threshold is provided; mempool jobs (no decay)
+        # skip this and leave the field None.
+        num_meeting_target: Optional[int] = None
+        if live_threshold_energy is not None and valid_solutions:
+            all_recomputed = energies_for_solutions(
+                valid_solutions, h_for_floor, J_for_floor, nodes,
+            )
+            num_meeting_target = int(
+                sum(1 for e in all_recomputed if e < live_threshold_energy)
+            )
+
         # Create mining result for this attempt
         mining_time = time.time() - start_time
 
@@ -865,6 +885,7 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
             edge_list=edges,
             variable_order=nodes,
             submit_floor_energy=submit_floor_energy,
+            num_meeting_target=num_meeting_target,
         )
     except ValueError as e:
         # Use module logger for consistency
