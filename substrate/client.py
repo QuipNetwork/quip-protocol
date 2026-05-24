@@ -344,7 +344,19 @@ class SubstrateClient:
                 "miner_account_bytes must be the 32-byte SCALE AccountId32, got "
                 f"{len(miner_account_bytes)}"
             )
-        block_hash = _hex(at) if at is not None else None
+        # Resolve the target block. When `at` is None we want the current
+        # best head — the mempool controller relies on `block_hash` /
+        # `block_number` advancing every block, so we cannot collapse this
+        # to "let the RPC pick"; we have to read the head ourselves.
+        if at is None:
+            resolved_block_hash = bytes.fromhex(
+                _strip_0x(await self._run(lambda: self._iface.get_chain_head()))
+            )
+        else:
+            if len(at) != 32:
+                raise ValueError(f"at must be 32 bytes, got {len(at)}")
+            resolved_block_hash = at
+        block_hash = _hex(resolved_block_hash)
         # Encode the parameter: Option<H256>.
         if topology_hash is None:
             scale_param = "0x00"
@@ -374,6 +386,16 @@ class SubstrateClient:
         decoded = _decode_mining_snapshot(encoded)
         if decoded is None:
             return None
+        # Pull the block number for `resolved_block_hash`. The mempool
+        # controller routes events per-block, so it needs the number; the
+        # PoW controller carries it as ride-along data.
+        header = await self._run(
+            lambda: self._iface.get_block_header(
+                block_hash=_hex(resolved_block_hash),
+                ignore_decoding_errors=True,
+            )
+        )
+        block_number = _coerce_block_number(header["header"]["number"])
         return SubstrateMiningContext(
             last_proof_block_hash=decoded["last_proof_block_hash"],
             topology_hash=decoded["topology_hash"],
@@ -384,6 +406,8 @@ class SubstrateClient:
             allowed_h_values=decoded["allowed_h_values"],
             allowed_j_values=decoded["allowed_j_values"],
             allowed_spin_values=decoded["allowed_spin_values"],
+            block_hash=resolved_block_hash,
+            block_number=block_number,
         )
 
     # ------------------------------------------------------------------

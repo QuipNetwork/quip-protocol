@@ -19,6 +19,8 @@ def test_substrate_mining_context_satisfies_protocol():
         allowed_h_values=None,
         allowed_j_values=None,
         allowed_spin_values=None,
+        block_hash=b"\x00" * 32,
+        block_number=0,
     )
     # runtime_checkable Protocol: isinstance() works.
     assert isinstance(ctx, WorkContext)

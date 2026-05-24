@@ -648,7 +648,14 @@ class SubstrateMinerController:
         await self.pool.start()
 
         def state_key(snapshot):
-            """Dedup key: same (last_proof_block_hash, threshold) → no event.
+            """Dedup key: fires on every new block.
+
+            Including ``block_hash`` makes the event manager dispatch on
+            every block, which is what the mempool path needs (each block
+            may carry new mempool events). The PoW path's existing
+            same-work-key short-circuits in ``on_new_head`` absorb the
+            extra invocations cheaply when ``last_proof_block_hash`` /
+            ``max_energy_milli`` haven't changed.
 
             ``None`` snapshots (chain has no topology registered yet) collapse
             to a stable sentinel so the event manager doesn't crash, and so
@@ -660,6 +667,7 @@ class SubstrateMinerController:
             return (
                 snapshot.last_proof_block_hash,
                 int(snapshot.difficulty.max_energy_milli),
+                snapshot.block_hash,
             )
 
         self.events = ChainEventManager(

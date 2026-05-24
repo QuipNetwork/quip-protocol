@@ -100,6 +100,12 @@ class SubstrateMiningContext:
     allowed_h_values: AllowedValueSpec
     allowed_j_values: AllowedValueSpec
     allowed_spin_values: AllowedValueSpec
+    # Best-block hash + number the snapshot was resolved against. Used by
+    # the mempool controller, which reacts to every block (each may carry
+    # `JobProposed` / `OrderExpired` events). The PoW controller ignores
+    # them — its work key only changes when ``last_proof_block_hash`` does.
+    block_hash: bytes
+    block_number: int
 
     def __post_init__(self) -> None:
         if len(self.last_proof_block_hash) != 32:
@@ -116,6 +122,14 @@ class SubstrateMiningContext:
                 "miner_account_bytes must be the 32-byte canonical miner "
                 f"identity (blake2_256(SCALE(account_id))), got "
                 f"{len(self.miner_account_bytes)}"
+            )
+        if len(self.block_hash) != 32:
+            raise ValueError(
+                f"block_hash must be 32 bytes, got {len(self.block_hash)}"
+            )
+        if self.block_number < 0:
+            raise ValueError(
+                f"block_number must be non-negative, got {self.block_number}"
             )
 
     def resolve_ising(

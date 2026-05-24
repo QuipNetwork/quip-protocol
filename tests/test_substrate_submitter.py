@@ -47,6 +47,8 @@ def _make_context(**overrides) -> SubstrateMiningContext:
         allowed_h_values=_TER_SPEC,
         allowed_j_values=_BIN_SPEC,
         allowed_spin_values=_BIN_SPEC,
+        block_hash=b"\x77" * 32,
+        block_number=1,
     )
     defaults.update(overrides)
     return SubstrateMiningContext(**defaults)

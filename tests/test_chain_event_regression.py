@@ -32,18 +32,28 @@ import pytest
 from substrate.event_manager import ChainEventManager
 
 
-def _ctx(threshold_milli: int, last_proof_block_hash: bytes = b"\x00" * 32):
+def _ctx(
+    threshold_milli: int,
+    last_proof_block_hash: bytes = b"\x00" * 32,
+    block_hash: bytes = b"\x00" * 32,
+):
     return SimpleNamespace(
         last_proof_block_hash=last_proof_block_hash,
         topology_hash=b"\xab" * 32,
         difficulty=SimpleNamespace(max_energy_milli=threshold_milli),
+        block_hash=block_hash,
     )
 
 
 def _state_key(snapshot):
+    # 3-tuple matches the production state_key in both SubstrateMinerController
+    # and MempoolMinerController: ``block_hash`` ensures the event manager
+    # fires on every block, so the silent-subscription bug surfaces as a
+    # stalled poll-loop counter rather than a stale-threshold drift.
     return (
         snapshot.last_proof_block_hash,
         int(snapshot.difficulty.max_energy_milli),
+        snapshot.block_hash,
     )
 
 

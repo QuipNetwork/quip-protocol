@@ -73,6 +73,8 @@ def relaxed_context(cpu_miner) -> SubstrateMiningContext:
         allowed_h_values=_TER_SPEC,
         allowed_j_values=_BIN_SPEC,
         allowed_spin_values=_BIN_SPEC,
+        block_hash=b"\x55" * 32,
+        block_number=1,
     )
 
 
@@ -137,6 +139,8 @@ def test_requirements_from_context_pow_path():
         allowed_h_values=_TER_SPEC,
         allowed_j_values=_BIN_SPEC,
         allowed_spin_values=_BIN_SPEC,
+        block_hash=b"\x66" * 32,
+        block_number=2,
     )
     req = requirements_from_context(ctx)
     assert req.difficulty_energy == -2500.0
@@ -328,6 +332,8 @@ def test_mine_work_item_observes_stop_event(cpu_miner, relaxed_context):
         allowed_h_values=relaxed_context.allowed_h_values,
         allowed_j_values=relaxed_context.allowed_j_values,
         allowed_spin_values=relaxed_context.allowed_spin_values,
+        block_hash=relaxed_context.block_hash,
+        block_number=relaxed_context.block_number,
     )
     stop = mp.Event()
     stop.set()
@@ -551,6 +557,8 @@ def test_miner_handle_emits_work_item_done_sentinel_on_cancel(relaxed_context):
             allowed_h_values=relaxed_context.allowed_h_values,
             allowed_j_values=relaxed_context.allowed_j_values,
             allowed_spin_values=relaxed_context.allowed_spin_values,
+            block_hash=relaxed_context.block_hash,
+            block_number=relaxed_context.block_number,
         )
         handle.mine_work_item(impossibly_hard)
         # Cancel after a brief moment so the worker enters the loop and

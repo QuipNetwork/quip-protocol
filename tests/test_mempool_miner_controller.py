@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+from collections import deque
 from unittest.mock import MagicMock
 
 import pytest
@@ -300,6 +301,289 @@ def test_record_handle_terminal_no_op_when_no_active_order():
 
     assert c._active_order is None
     assert c._active_order_done_handles == set()
+
+
+# ----------------------------------------------------------------------
+# on_new_block — event-manager entry point (post-migration)
+# ----------------------------------------------------------------------
+
+
+def _bare_event_controller(num_handles: int = 1):
+    """Bare controller wired for ``on_new_block`` / ``_handle_result`` tests.
+
+    Bypasses ``__init__`` (no pool/network). Sets only the attributes the
+    code paths under test read; everything else stays unset so a regression
+    that introduces a new dependency fails loudly rather than silently.
+    """
+    from shared.mempool_miner_controller import MempoolControllerStats
+
+    c = MempoolMinerController.__new__(MempoolMinerController)
+    c._active_order = None
+    c._active_order_done_handles = set()
+    c._dispatch_contexts = {}
+    c._pending = deque()
+    c._pending_seen = set()
+    c._submitted_orders = set()
+    c._claimable = set()
+    c.miner_handles = [MagicMock(miner_id=f"h{i}") for i in range(num_handles)]
+    c.stats = MempoolControllerStats()
+    c.client = MagicMock()
+    c.signer = MagicMock()
+    c.signer.account_id_bytes.return_value = b"\xAA" * 32
+    c.solver_type = MinerType.CPU
+    c.sampler_topology_hash = b"\xCD" * 32
+    c.allowed_h_values = DEFAULT_ALLOWED_H
+    c.allowed_j_values = DEFAULT_ALLOWED_J
+    c.allowed_spin_values = DEFAULT_ALLOWED_SPIN
+    c.on_solution_submitted = None
+    c.on_reward_claimed = None
+    c.core = None
+    return c
+
+
+def _make_ctx(*, block_number: int = 7, block_hash_byte: int = 0x11):
+    """Build a ``SubstrateMiningContext``-shaped object via SimpleNamespace.
+
+    Mempool only reads ``ctx.block_hash`` and ``ctx.block_number``; the
+    real dataclass would force us to fill PoW-only fields we don't care
+    about here. Mirrors ``test_miner_controller_on_new_head.py``'s pattern.
+    """
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        block_hash=bytes([block_hash_byte]) * 32,
+        block_number=block_number,
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_new_block_none_ctx_is_noop():
+    """``ctx is None`` (no topology registered yet) must not process events."""
+    c = _bare_event_controller()
+    process_calls = []
+
+    async def fake_process_head(block_hash, block_number):
+        process_calls.append((block_hash, block_number))
+
+    c._process_head = fake_process_head  # type: ignore[assignment]
+    await c.on_new_block(None)
+    assert process_calls == []
+
+
+@pytest.mark.asyncio
+async def test_on_new_block_routes_to_process_head():
+    """A real ctx routes ``block_hash`` + ``block_number`` into ``_process_head``."""
+    c = _bare_event_controller()
+    process_calls = []
+
+    async def fake_process_head(block_hash, block_number):
+        process_calls.append((block_hash, block_number))
+
+    c._process_head = fake_process_head  # type: ignore[assignment]
+    ctx = _make_ctx(block_number=42, block_hash_byte=0x33)
+    await c.on_new_block(ctx)
+    assert process_calls == [(bytes([0x33]) * 32, 42)]
+
+
+# ----------------------------------------------------------------------
+# Per-block event routing — JobProposed / OrderExpired through _process_head
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_process_head_routes_job_proposed_through_consider():
+    """A ``JobProposed`` event in the block's events list is routed."""
+    c = _bare_event_controller()
+    block_hash = b"\x10" * 32
+
+    async def fake_get_events_at(bh):
+        assert bh == block_hash
+        return [
+            {
+                "module_id": "QuantumComputeMempool",
+                "event_id": "JobProposed",
+                "attributes": {"order_id": 5},
+            }
+        ]
+
+    c.client.get_events_at = fake_get_events_at
+
+    considered: list[int] = []
+
+    async def fake_consider(order_id):
+        considered.append(order_id)
+
+    c._consider_order = fake_consider  # type: ignore[assignment]
+    await c._process_head(block_hash, 100)
+    assert considered == [5]
+    assert c.stats.events_seen == 1
+    assert c.stats.heads_observed == 1
+
+
+@pytest.mark.asyncio
+async def test_process_head_routes_order_expired_to_claimable():
+    """``OrderExpired`` for a previously-submitted order joins ``_claimable``."""
+    c = _bare_event_controller()
+    c._submitted_orders.add(99)
+
+    async def fake_get_events_at(bh):
+        return [
+            {
+                "module_id": "QuantumComputeMempool",
+                "event_id": "OrderExpired",
+                "attributes": {"order_id": 99},
+            }
+        ]
+
+    c.client.get_events_at = fake_get_events_at
+    await c._process_head(b"\x10" * 32, 100)
+    assert 99 in c._claimable
+
+
+@pytest.mark.asyncio
+async def test_process_head_ignores_non_mempool_events():
+    """Events from other pallets are not counted as mempool events."""
+    c = _bare_event_controller()
+
+    async def fake_get_events_at(bh):
+        return [
+            {
+                "module_id": "System",
+                "event_id": "ExtrinsicSuccess",
+                "attributes": {},
+            }
+        ]
+
+    c.client.get_events_at = fake_get_events_at
+    await c._process_head(b"\x10" * 32, 100)
+    assert c.stats.events_seen == 0
+    assert c.stats.heads_observed == 1
+
+
+# ----------------------------------------------------------------------
+# _handle_result — submission path coverage
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_result_stale_order_dropped():
+    """Late results from a previously-cancelled order are dropped, not submitted."""
+    from shared.mempool_miner_controller import _MempoolResultEnvelope
+
+    c = _bare_event_controller()
+    c._active_order = 100
+
+    ctx = MagicMock(order_id=99)  # different from active
+    envelope = _MempoolResultEnvelope(
+        result=MagicMock(solutions=[[1, -1]]),
+        context=ctx,
+        handle_id="h0",
+    )
+
+    submit_calls = []
+
+    async def fake_submit(*args, **kwargs):
+        submit_calls.append((args, kwargs))
+        return MagicMock(error=None)
+
+    c.client.submit_extrinsic = fake_submit
+    await c._handle_result(envelope)
+    assert submit_calls == []
+    assert c.stats.results_received == 1
+    assert c.stats.solutions_submitted == 0
+
+
+@pytest.mark.asyncio
+async def test_handle_result_ok_marks_submitted_and_clears_active():
+    """A successful submission records the order in ``_submitted_orders`` and
+    clears ``_active_order`` so the dispatch gate can release."""
+    from shared.mempool_miner_controller import _MempoolResultEnvelope
+    from shared.miner_types import MiningResult
+
+    c = _bare_event_controller(num_handles=2)
+    c._active_order = 42
+
+    result = MiningResult(
+        miner_id="h0",
+        miner_type="CPU",
+        nonce=b"\x00" * 32,
+        salt=b"\x00" * 32,
+        timestamp=0,
+        prev_timestamp=0,
+        solutions=[[1, -1]],
+        energy=-1.0,
+        diversity=0.5,
+        num_valid=1,
+        mining_time=10,
+        node_list=[],
+        edge_list=[],
+    )
+    ctx = MagicMock(order_id=42)
+    envelope = _MempoolResultEnvelope(
+        result=result, context=ctx, handle_id="h0",
+    )
+
+    async def fake_submit(*args, **kwargs):
+        return MagicMock(error=None, extrinsic_hash="0xdeadbeef")
+
+    c.client.submit_extrinsic = fake_submit
+    await c._handle_result(envelope)
+    assert c._active_order is None
+    assert 42 in c._submitted_orders
+    assert c.stats.solutions_submitted == 1
+
+
+# ----------------------------------------------------------------------
+# Claim loop — direct exercise of _claim_expired_orders
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claim_expired_orders_success_removes_from_claimable():
+    """A claimable order with an OK receipt is removed from ``_claimable``
+    and the rewards counter advances."""
+    c = _bare_event_controller()
+    c._claimable.add(7)
+
+    async def fake_submit(*args, **kwargs):
+        return MagicMock(error=None, extrinsic_hash="0xfeed")
+
+    c.client.submit_extrinsic = fake_submit
+    await c._claim_expired_orders()
+    assert 7 not in c._claimable
+    assert c.stats.rewards_claimed == 1
+
+
+@pytest.mark.asyncio
+async def test_claim_expired_orders_not_expired_retries_next_tick():
+    """``OrderNotExpired`` keeps the order in ``_claimable`` for retry."""
+    c = _bare_event_controller()
+    c._claimable.add(7)
+
+    async def fake_submit(*args, **kwargs):
+        return MagicMock(
+            error="Module(error=OrderNotExpired)", extrinsic_hash="0xfeed",
+        )
+
+    c.client.submit_extrinsic = fake_submit
+    await c._claim_expired_orders()
+    assert 7 in c._claimable
+    assert c.stats.rewards_claimed == 0
+
+
+@pytest.mark.asyncio
+async def test_claim_expired_orders_not_winner_gives_up():
+    """``NotWinner`` is stale-class-but-terminal — drop, don't retry."""
+    c = _bare_event_controller()
+    c._claimable.add(7)
+
+    async def fake_submit(*args, **kwargs):
+        return MagicMock(
+            error="Module(error=NotWinner)", extrinsic_hash="0xfeed",
+        )
+
+    c.client.submit_extrinsic = fake_submit
+    await c._claim_expired_orders()
+    assert 7 not in c._claimable
 
 
 # ----------------------------------------------------------------------

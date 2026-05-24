@@ -78,6 +78,8 @@ def _context(
         allowed_h_values=_TER_SPEC,
         allowed_j_values=_BIN_SPEC,
         allowed_spin_values=_BIN_SPEC,
+        block_hash=b"\x99" * 32,
+        block_number=1,
     )
 
 

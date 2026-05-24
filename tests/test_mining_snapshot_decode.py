@@ -201,6 +201,17 @@ async def _make_snapshot_client_with_fake_rpc(encoded_hex: str) -> SubstrateClie
         def rpc_request(self, method, params):  # noqa: D401
             return {"result": encoded_hex}
 
+        def get_chain_head(self):  # noqa: D401
+            # Fixed hex for tests — get_mining_snapshot uses this when
+            # `at=None` to resolve the target block before SCALE-encoding.
+            return "0x" + ("ee" * 32)
+
+        def get_block_header(self, block_hash=None, ignore_decoding_errors=False):
+            # Phase 2 cleanup: get_mining_snapshot resolves block_number
+            # via a shallow header read so the mempool controller can route
+            # per-block events. Return a stable height for these tests.
+            return {"header": {"number": "0x1234"}}
+
     client._iface = _FakeIface()  # type: ignore[assignment]
 
     async def _direct_run(fn):

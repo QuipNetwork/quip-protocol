@@ -17,6 +17,8 @@ def test_substrate_context_has_resolve_ising_method():
         allowed_h_values=None,
         allowed_j_values=None,
         allowed_spin_values=None,
+        block_hash=b"\x00" * 32,
+        block_number=0,
     )
     assert callable(getattr(ctx, "resolve_ising", None))
     assert callable(getattr(ctx, "requirements", None))

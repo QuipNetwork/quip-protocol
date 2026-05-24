@@ -15,10 +15,11 @@ Lifecycle:
 Behavior summary:
 
   - Fail-fast at startup if the signer isn't in `QuantumComputeMempool.Solvers`.
-  - Subscribe to new heads (using a separate `SubstrateClient` instance —
-    `substrate-interface` holds the websocket in receive mode during the
-    subscription, so a shared connection deadlocks against `submit_extrinsic`).
-  - On each new head: poll `System.Events` for `QuantumComputeMempool`
+  - Subscribe to chain events via the shared `ChainEventManager` — the same
+    event source `SubstrateMinerController` uses. The manager polls
+    `get_mining_snapshot` at adaptive cadence; the state key includes
+    ``block_hash`` so it fires on every block (mempool reacts per-block).
+  - On each new block: poll `System.Events` for `QuantumComputeMempool`
     activity, route `JobProposed` to the pending queue (after eligibility
     filtering) and `OrderExpired` to the claimable set.
   - When idle: dequeue the next pending order, fetch the full `JobOrder`,
@@ -44,14 +45,14 @@ Eligibility filter (`_should_accept_job`):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import queue
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
-from websocket import WebSocketException
-
 from shared.allowed_value_spec import AllowedValueSpec
+from shared.asyncio_supervise import supervise
 from shared.logging_config import get_logger
 from shared.mempool_types import (
     JobOrder,
@@ -64,9 +65,11 @@ from shared.mempool_types import (
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from shared.signer import Signer
-from substrate.client import NoValidatorReachable, SubstrateClient
 from shared.topology_hash import topology_hash
+from substrate.client import SubstrateClient
+from substrate.event_manager import ChainEventManager
 from substrate.pool import ValidatorPool
+from substrate.types import SubstrateMiningContext
 
 
 logger = get_logger("mempool_miner_controller")
@@ -155,12 +158,12 @@ class MempoolMinerController:
                 f"{len(sampler_topology_hash)}"
             )
         self._pool = pool
-        # Slot clients lazy-resolved in run() — pool guarantees
-        # 'rpc' and 'subscribe.mempool' are distinct SubstrateClient
-        # instances, sidestepping the substrate-interface
-        # subscribe-during-submit deadlock by construction.
+        self.pool = pool
+        # Slot clients lazy-resolved in run(); the 'rpc' slot handles
+        # storage reads + extrinsic submissions. Block-tick wakeups now
+        # come from the shared ChainEventManager, not a dedicated
+        # subscription socket.
         self.client: Optional[SubstrateClient] = None
-        self._subscription_client: Optional[SubstrateClient] = None
         self.signer = signer
         self.miner_handles = miner_handles
         self.sampler_topology_hash = sampler_topology_hash
@@ -201,18 +204,17 @@ class MempoolMinerController:
         self._submitted_orders: Set[int] = set()
         # Orders for which we saw OrderExpired and have not yet claimed.
         self._claimable: Set[int] = set()
-        # Latest-only head channel — same shape as the PoW controller's.
-        self._latest_head: Optional[Tuple[bytes, int]] = None
-        self._head_signal = asyncio.Event()
         self._result_queue: asyncio.Queue[_MempoolResultEnvelope] = asyncio.Queue()
         self._done_queues: Dict[str, asyncio.Queue[int]] = {
             h.miner_id: asyncio.Queue() for h in miner_handles
         }
         self._shutdown_event = asyncio.Event()
         self._drainer_tasks: List[asyncio.Task] = []
-        self._subscription_task: Optional[asyncio.Task] = None
+        # ChainEventManager — set in run(); polls the validator pool and
+        # dispatches `new_head` to `on_new_block` on every block.
+        self.events: Optional[ChainEventManager] = None
+        self._event_manager_task: Optional[asyncio.Task] = None
         self._claim_task: Optional[asyncio.Task] = None
-        self._last_event_block: Optional[bytes] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -228,7 +230,6 @@ class MempoolMinerController:
         # (pool.get() lazy-connects), keeping __init__ synchronous
         # and side-effect free.
         self.client = await self._pool.get("rpc")
-        self._subscription_client = await self._pool.get("subscribe.mempool")
 
         account = self.signer.account_id_bytes()
         await self._verify_solver_registered(account)
@@ -240,22 +241,102 @@ class MempoolMinerController:
             )
             self._drainer_tasks.append(task)
 
-        self._subscription_task = asyncio.create_task(
-            self._subscribe_heads(),
-            name="mempool-head-subscription",
-        )
+        await self._start_event_manager(account)
+
         self._claim_task = asyncio.create_task(
             self._periodic_claim_loop(),
             name="mempool-reward-claim",
         )
 
-        # Prime: also process any open orders that pre-date our subscription.
-        await self._refresh_pending_from_storage()
-
         try:
             await self._main_loop()
         finally:
             await self._teardown()
+
+    async def _start_event_manager(self, account: bytes) -> None:
+        """Wire the shared ChainEventManager into mempool's per-block path.
+
+        Mirrors ``SubstrateMinerController._start_event_manager``. The
+        state key includes ``block_hash`` so every new block fires
+        ``new_head`` — mempool must react to each block because each may
+        carry new ``JobProposed`` / ``OrderExpired`` events. Same key on
+        the PoW side is harmless: its ``on_new_head`` short-circuits on
+        an unchanged work key.
+
+        Args:
+            account: The signer's raw 32-byte AccountId. Blake2-256 hashed
+                here to derive the canonical miner identity the runtime
+                expects for ``derive_nonce`` — kept consistent with the
+                PoW path even though mempool doesn't consume the nonce.
+        """
+        canonical_miner = hashlib.blake2b(account, digest_size=32).digest()
+
+        # Idempotency: in ``--mode both`` the PoW controller also calls
+        # ``pool.start()``. Skip the redundant spawn (leaks a handle and
+        # leaves the original orphaned), but stay correct when mempool is
+        # the only controller running.
+        if self.pool.active_url() is None:
+            await self.pool.start()
+
+        def state_key(snapshot):
+            """Dedup key: fires on every new block.
+
+            ``None`` snapshots collapse to a stable sentinel; the mempool
+            path simply skips them (``on_new_block`` guards ``ctx is None``).
+            """
+            if snapshot is None:
+                return ("none-snapshot",)
+            return (
+                snapshot.last_proof_block_hash,
+                int(snapshot.difficulty.max_energy_milli),
+                snapshot.block_hash,
+            )
+
+        self.events = ChainEventManager(
+            pool=self.pool,
+            state_key=state_key,
+            snapshot_op="get_mining_snapshot",
+            snapshot_args={
+                "miner_account_bytes": canonical_miner,
+                "at": None,
+                "topology_hash": None,
+            },
+            blocktime_s=6.0,
+        )
+        self.events.subscribe("new_head", self.on_new_block)
+        self._event_manager_task = asyncio.create_task(
+            supervise(
+                self.events.run(),
+                name="mempool-chain-event-manager",
+                on_failure=self._shutdown_event.set,
+            ),
+            name="mempool-chain-event-manager",
+        )
+        logger.info(
+            "MempoolMinerController: ChainEventManager started"
+        )
+
+    async def on_new_block(
+        self, ctx: Optional[SubstrateMiningContext]
+    ) -> None:
+        """Event-manager callback: route per-block mempool events.
+
+        The shared ``ChainEventManager`` fires this with the snapshot
+        currently returned by ``get_mining_snapshot`` (or ``None`` when
+        no topology is registered). Mempool only needs ``ctx.block_hash``
+        and ``ctx.block_number`` from it; everything else is PoW-only.
+
+        Args:
+            ctx: Snapshot for the latest best block, or ``None`` if the
+                chain has no topology registered yet.
+        """
+        if ctx is None:
+            logger.debug(
+                "mempool on_new_block: snapshot is None — no topology "
+                "registered yet, skipping event poll"
+            )
+            return
+        await self._process_head(ctx.block_hash, ctx.block_number)
 
     async def _teardown(self) -> None:
         self._shutdown_event.set()
@@ -270,27 +351,13 @@ class MempoolMinerController:
                     exc,
                 )
 
-        # Close the subscription websocket BEFORE awaiting cancellations.
-        # `subscribe_block_headers` runs in a thread that's blocked on the
-        # underlying socket recv; without breaking the socket, asyncio's
-        # task.cancel() doesn't unstick it and the default executor
-        # eventually times out at 300s during loop shutdown. Closing the
-        # websocket forces the recv to error out so the thread can exit.
-        #
-        # The slot is pool-owned, but close() is idempotent — pool.close()
-        # at process shutdown will see _iface is already None for this
-        # slot and skip cleanly.
-        if self._subscription_client is not None:
-            try:
-                await self._subscription_client.close()
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(
-                    "teardown: subscription close raised %s: %s",
-                    type(exc).__name__,
-                    exc,
-                )
+        # Signal the event manager to stop polling; its supervised task
+        # observes the shutdown and exits cleanly. We still cancel below
+        # as belt-and-suspenders in case the supervise wrapper is stuck.
+        if self.events is not None:
+            self.events.request_shutdown()
 
-        for task in [self._subscription_task, self._claim_task]:
+        for task in [self._event_manager_task, self._claim_task]:
             if task is not None and not task.done():
                 task.cancel()
                 try:
@@ -314,6 +381,7 @@ class MempoolMinerController:
                         "teardown: drainer task %s raised during cancellation",
                         task.get_name(),
                     )
+        self._event_manager_task = None
 
     # ------------------------------------------------------------------
     # Startup checks
@@ -342,76 +410,8 @@ class MempoolMinerController:
         )
 
     # ------------------------------------------------------------------
-    # Head subscription + event polling
+    # Per-block event polling
     # ------------------------------------------------------------------
-
-    async def _subscribe_heads(self) -> None:
-        """Subscribe to new best heads with failover on validator drop.
-
-        Mirrors `SubstrateMinerController._subscribe_heads`:
-          - clean return → exit loop
-          - `WebSocketException` / `ConnectionError` → one `reconnect()`
-            on the subscription client, then re-subscribe
-          - `NoValidatorReachable` from reconnect → fatal; record context
-            and trigger shutdown
-          - any other exception → fatal; record and shut down
-        """
-
-        async def _on_head(block_hash: bytes, block_number: int) -> None:
-            self._latest_head = (block_hash, block_number)
-            self._head_signal.set()
-
-        while not self._shutdown_event.is_set():
-            try:
-                await self._subscription_client.subscribe_new_heads(_on_head)
-                return
-            except (WebSocketException, ConnectionError) as exc:
-                logger.warning(
-                    "mempool head subscription dropped on %s (%s: %s); "
-                    "failing over",
-                    getattr(
-                        self._subscription_client, "current_url", "<unknown>"
-                    ),
-                    type(exc).__name__,
-                    exc,
-                )
-                try:
-                    await self._subscription_client.reconnect()
-                except NoValidatorReachable as fatal:
-                    logger.error(
-                        "mempool subscription failover exhausted; "
-                        "triggering shutdown:\n%s",
-                        fatal,
-                    )
-                    self._shutdown_event.set()
-                    return
-                # loop iteration: re-subscribe on the new validator
-            except Exception as exc:  # noqa: BLE001 — surface to logs
-                if not self._shutdown_event.is_set():
-                    logger.exception(
-                        "mempool head subscription crashed: %s", exc
-                    )
-                    self._shutdown_event.set()
-                return
-
-    async def _refresh_pending_from_storage(self) -> None:
-        """Pre-fill the pending queue from any currently-Opened orders.
-
-        Without this, a miner that starts up between two head intervals
-        would miss every order proposed before its subscription started.
-        We bound the lookback to recent orders by walking `NextOrderId`
-        downward and stopping at the first closed/expired one we hit, but
-        that adds runtime API plumbing — for 8c just iterate forward from
-        `0` and let the per-order open-check skip the closed ones.
-
-        substrate-interface doesn't surface bulk storage iteration cleanly
-        for us through `SubstrateClient`; this method is left as a no-op
-        in 8c. The head-subscription event polling catches all
-        post-startup orders, which is the common-case anyway.
-        """
-        # Phase 9 follow-on: add `iter_storage_map` to SubstrateClient and
-        # walk JobOrders. For now, intentionally empty.
-        return None
 
     async def _process_head(self, block_hash: bytes, block_number: int) -> None:
         """Poll events at the given block and route mempool ones."""
@@ -522,27 +522,24 @@ class MempoolMinerController:
             await self._wait_for_event()
 
     async def _wait_for_event(self) -> None:
-        """Block until either a new head arrives, a result lands, or shutdown."""
-        head_task = asyncio.create_task(self._head_signal.wait())
+        """Block until either a result lands or shutdown is requested.
+
+        Per-block wakeups are routed via ``on_new_block`` from the shared
+        ``ChainEventManager`` (subscriber callback) — they don't need to
+        race the result queue. The main loop only blocks on the two
+        intrinsic states: "a result needs handling" and "shutdown".
+        """
         result_task = asyncio.create_task(self._result_queue.get())
         shutdown_task = asyncio.create_task(self._shutdown_event.wait())
         try:
             done, pending = await asyncio.wait(
-                [head_task, result_task, shutdown_task],
+                [result_task, shutdown_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for task in pending:
                 task.cancel()
             if shutdown_task in done:
                 return
-            if head_task in done:
-                self._head_signal.clear()
-                head = self._latest_head
-                if head is not None:
-                    block_hash, block_number = head
-                    if block_hash != self._last_event_block:
-                        self._last_event_block = block_hash
-                        await self._process_head(block_hash, block_number)
             if result_task in done:
                 envelope = result_task.result()
                 await self._handle_result(envelope)
