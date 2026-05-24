@@ -693,7 +693,6 @@ async def _live_controller(
     # after a submission) need a direct SubstrateClient — the controller
     # now keeps its build_client private and reads/submits go through
     # the swap-aware pool.
-    from substrate.client import SubstrateClient
     client = SubstrateClient(urls=[DEFAULT_URL])
     await client.connect()
     run_task = asyncio.create_task(controller.run())

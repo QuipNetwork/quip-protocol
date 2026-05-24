@@ -576,6 +576,10 @@ class SubstrateMinerController:
         self.build_client = SubstrateClient(urls=self._pool.urls)
         await self.build_client.connect()
         self.pool_client = PoolClient(self._pool)
+        # Pool must be live before any pool_client.send() — including the
+        # startup registration check below. ``_start_event_manager`` skips
+        # the redundant spawn via the ``active_url() is None`` guard.
+        await self._pool.start()
 
         account = self.signer.account_id_bytes()
         await self._verify_registered(account)
@@ -648,10 +652,12 @@ class SubstrateMinerController:
         # to produce a width-stable 32-byte miner identity.
         canonical_miner = hashlib.blake2b(account, digest_size=32).digest()
 
-        # Spawn the pool's active validator child. This is when the new
-        # path actually touches the network; before this, ``send()`` would
-        # raise "pool not started".
-        await self.pool.start()
+        # Pool is usually already started by ``run()`` so the startup
+        # registration check can read through it. Guard against the
+        # double-spawn (which would orphan the first handle) but stay
+        # correct if a future caller invokes this in isolation.
+        if self.pool.active_url() is None:
+            await self.pool.start()
 
         def state_key(snapshot):
             """Dedup key: fires on every new block.

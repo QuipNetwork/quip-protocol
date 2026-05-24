@@ -236,6 +236,11 @@ class MempoolMinerController:
         self.build_client = SubstrateClient(urls=self._pool.urls)
         await self.build_client.connect()
         self.pool_client = PoolClient(self._pool)
+        # Pool must be live before any pool_client.send() — including the
+        # startup registration check below. ``_start_event_manager`` skips
+        # the redundant spawn via the existing ``active_url() is None`` guard.
+        if self._pool.active_url() is None:
+            await self._pool.start()
 
         account = self.signer.account_id_bytes()
         await self._verify_solver_registered(account)
