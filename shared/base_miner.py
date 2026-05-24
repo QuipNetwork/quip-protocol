@@ -214,6 +214,17 @@ class BaseMiner(ABC):
     # pipeline (see GPUMiner / DWaveMiner overrides).
     FEEDER_BUFFER_SIZE: int = 4
 
+    # --- Substrate ratchet: bounded top-K stash ---
+    # The PoW path stashes the K best-energy candidates across iterations
+    # so the submit gate has multiple shots when the chain's live decay
+    # eases. Only the lowest-energy candidate is ever submitted, but the
+    # spares carry insurance (best may fail evaluate_sampleset re-checks
+    # under tighter thresholds, or its ``submit_floor_energy`` may sit
+    # above the live floor while a worse-energy candidate's floor clears).
+    # First K iters post-process unconditionally to fill the stash; after
+    # that the ratchet gates on the heap's worst-energy entry.
+    TOP_K_STORE: int = 5
+
     # --- Adaptive parameter bounds (override in subclasses) ---
     # SA/GPU miners use sweeps + reads; QPU miners use annealing_time + reads.
     ADAPT_MIN_SWEEPS: int = 64
@@ -464,7 +475,10 @@ class BaseMiner(ABC):
             with live_threshold_var.get_lock():
                 if live_threshold_var.value == 0:
                     live_threshold_var.value = context.difficulty.max_energy_milli
-        stored_best: Optional[MiningResult] = None
+        # Sorted ASC by energy; len <= TOP_K_STORE. ``top_k[0]`` is the
+        # best candidate; ``top_k[-1]`` is the eviction target.
+        top_k: List[MiningResult] = []
+        top_k_cap: int = self.TOP_K_STORE
         # Lazily build the per-worker attempt log. Mempool jobs share
         # the same writer for cross-mode forensics; the ``result_kind``
         # field on each row distinguishes the two paths.
@@ -572,15 +586,14 @@ class BaseMiner(ABC):
                             requirements.difficulty_energy * 1000,
                         )
 
-                    # Post-processing gate: store the best we've mined,
-                    # not the best the chain wants. The ratchet is about
-                    # *local progress* — every iter that improves over
-                    # what we've already stored gets post-processed and
-                    # may replace the stored candidate. When stored_best
-                    # is None we have no prior to compare against, so the
-                    # first iter post-processes unconditionally; that
-                    # gives every subsequent iter a real candidate to
-                    # beat. Submission against the chain's live (decayed)
+                    # Post-processing gate: stash the K best candidates
+                    # we've mined, not the best the chain wants. The
+                    # ratchet is about *local progress* — until the
+                    # stash is full, every iter post-processes
+                    # unconditionally so we build a baseline; once full,
+                    # only iters beating the heap's worst-energy entry
+                    # earn the expensive ``evaluate_sampleset`` call.
+                    # Submission against the chain's live (decayed)
                     # threshold is a separate decision handled by the
                     # submit gate below — gating storage on the chain
                     # target would lock the miner out of building a
@@ -590,8 +603,8 @@ class BaseMiner(ABC):
                         np.min(sampleset.record.energy),
                     )
                     ratchet_threshold = (
-                        stored_best.energy
-                        if stored_best is not None
+                        top_k[-1].energy
+                        if len(top_k) >= top_k_cap
                         else float("inf")
                     )
 
@@ -618,21 +631,26 @@ class BaseMiner(ABC):
                         if result is not None:
                             post_num_valid = result.num_valid
                             post_diversity_milli = int(result.diversity * 1000)
-                            if (
-                                stored_best is None
-                                or result.energy < stored_best.energy
-                            ):
-                                stored_best = result
+                            # Insert into the bounded heap. Always
+                            # admits when there's room; otherwise the
+                            # iter only got here because it beat the
+                            # worst-energy entry (ratchet gate above),
+                            # so we evict that tail and re-sort.
+                            if len(top_k) < top_k_cap:
+                                top_k.append(result)
+                                top_k.sort(key=lambda r: r.energy)
+                                stored_replaced = True
+                            elif result.energy < top_k[-1].energy:
+                                top_k[-1] = result
+                                top_k.sort(key=lambda r: r.energy)
                                 stored_replaced = True
 
                     self.timing_stats['postprocessing'].append(
                         (time.time() - postprocess_start) * 1e6,
                     )
 
-                    # Submit gate. If the chain's live decayed threshold
-                    # has already eased past the WORST of the selected
-                    # solutions, return now — the chain re-derives each
-                    # submitted solution's energy and filters with strict
+                    # Submit gate. The chain re-derives each submitted
+                    # solution's energy and filters with strict
                     # ``< max_energy_milli`` before counting; gating on
                     # ``energy`` (best of set) would let through proofs
                     # whose mid-pack solutions get rejected, producing
@@ -640,18 +658,25 @@ class BaseMiner(ABC):
                     # energy clearing. ``submit_floor_energy`` is the
                     # chain-equivalent recompute, so it's what the gate
                     # must compare against.
-                    if stored_best is not None:
+                    #
+                    # Walk the stash in energy-ascending order (best
+                    # first). Prefer the best candidate whose floor
+                    # clears; fall back to worse-energy stash entries
+                    # if a better candidate's floor sits above the
+                    # live threshold (the two can diverge — a tighter
+                    # solution set can have a lower best but a higher
+                    # worst, leaving a wider-spread candidate eligible
+                    # for submission while the headline winner isn't).
+                    result = None
+                    for candidate in top_k:
                         floor_energy = (
-                            stored_best.submit_floor_energy
-                            if stored_best.submit_floor_energy is not None
-                            else stored_best.energy
+                            candidate.submit_floor_energy
+                            if candidate.submit_floor_energy is not None
+                            else candidate.energy
                         )
                         if int(floor_energy * 1000) < live_threshold_milli:
-                            result = stored_best
-                        else:
-                            result = None
-                    else:
-                        result = None
+                            result = candidate
+                            break
 
                     # ratchet_threshold is float("inf") on the first iter
                     # before anything is stored — log None there since
@@ -900,8 +925,8 @@ class BaseMiner(ABC):
         ``strict_energy=False`` enables the substrate ratchet's lenient
         mode: diversity + min_solutions are still required but the
         energy gate is dropped, so candidates that don't yet beat the
-        chain's snapshot threshold can still be captured as the new
-        ``stored_best`` for later submission when decay catches up.
+        chain's snapshot threshold can still be stashed in the
+        ``top_k`` heap for later submission when decay catches up.
         """
         return evaluate_sampleset(sampleset, requirements, nodes, edges, nonce, salt, prev_timestamp, start_time, self.miner_id, self.miner_type, strict_energy=strict_energy)
 
