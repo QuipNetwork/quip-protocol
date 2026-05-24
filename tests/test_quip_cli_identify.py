@@ -147,23 +147,25 @@ class _StubClient:
         )
 
 
-class _StubPool:
-    """ValidatorPool stand-in that hands out the same stub client."""
-
-    def __init__(self, client):
-        self._client = client
-
-    async def get(self, role):  # noqa: ARG002
-        return self._client
-
-    async def close(self):
-        pass
-
-
 def _patch_pool_and_client(monkeypatch, client):
-    """Wire `quip_cli.ValidatorPool` to return our stub."""
+    """Wire `quip_cli.SubstrateClient` to return our stub.
+
+    After the pool.get("rpc") removal, ``identify`` calls
+    ``SubstrateClient(urls=...)`` directly via ``_connect_or_fail``. The
+    stub client has its own ``connect()`` / ``close()`` to satisfy that
+    contract; everything else mirrors the original ``_StubClient``.
+    """
     import quip_cli
-    monkeypatch.setattr(quip_cli, "ValidatorPool", lambda urls: _StubPool(client))
+
+    async def _connect():
+        return None
+
+    async def _close():
+        return None
+
+    client.connect = _connect
+    client.close = _close
+    monkeypatch.setattr(quip_cli, "SubstrateClient", lambda urls: client)
 
 
 def test_submit_prefers_remark_with_event(tmp_path, monkeypatch):

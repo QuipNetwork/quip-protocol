@@ -69,6 +69,7 @@ from shared.topology_hash import topology_hash
 from substrate.client import SubstrateClient
 from substrate.event_manager import ChainEventManager
 from substrate.pool import ValidatorPool
+from substrate.pool_client import PoolClient
 from substrate.types import SubstrateMiningContext
 
 
@@ -159,11 +160,13 @@ class MempoolMinerController:
             )
         self._pool = pool
         self.pool = pool
-        # Slot clients lazy-resolved in run(); the 'rpc' slot handles
-        # storage reads + extrinsic submissions. Block-tick wakeups now
-        # come from the shared ChainEventManager, not a dedicated
-        # subscription socket.
-        self.client: Optional[SubstrateClient] = None
+        # Parent-process SubstrateClient for compose+sign only (signer key
+        # material never crosses an IPC boundary). Storage reads and
+        # extrinsic submissions both go through ``pool_client`` (swap-
+        # aware). Connections open in ``run()`` so ``__init__`` stays
+        # synchronous and side-effect free.
+        self.build_client: Optional[SubstrateClient] = None
+        self.pool_client: Optional[PoolClient] = None
         self.signer = signer
         self.miner_handles = miner_handles
         self.sampler_topology_hash = sampler_topology_hash
@@ -226,10 +229,13 @@ class MempoolMinerController:
 
     async def run(self) -> None:
         """Main loop. Returns on shutdown or fatal error."""
-        # Resolve slot clients from the pool. Connections open here
-        # (pool.get() lazy-connects), keeping __init__ synchronous
-        # and side-effect free.
-        self.client = await self._pool.get("rpc")
+        # Build a parent-process SubstrateClient for compose+sign only;
+        # reads and submissions both go through the swap-aware pool via
+        # PoolClient. Signer key material never crosses the mp.Queue IPC
+        # boundary.
+        self.build_client = SubstrateClient(urls=self._pool.urls)
+        await self.build_client.connect()
+        self.pool_client = PoolClient(self._pool)
 
         account = self.signer.account_id_bytes()
         await self._verify_solver_registered(account)
@@ -382,13 +388,22 @@ class MempoolMinerController:
                         task.get_name(),
                     )
         self._event_manager_task = None
+        # Close the parent-side build client. The pool's active validator
+        # handle is torn down by ``pool.close()`` from the CLI's outer
+        # try/finally.
+        if self.build_client is not None:
+            try:
+                await self.build_client.close()
+            except Exception:  # noqa: BLE001 — log, don't mask teardown
+                logger.exception("teardown: build_client.close() raised")
+            self.build_client = None
 
     # ------------------------------------------------------------------
     # Startup checks
     # ------------------------------------------------------------------
 
     async def _verify_solver_registered(self, account: bytes) -> None:
-        info: Optional[MempoolSolverInfo] = await self.client.query_solver(account)
+        info: Optional[MempoolSolverInfo] = await self.pool_client.query_solver(account)
         if info is None:
             raise RuntimeError(
                 f"signer {self.signer.ss58_address()} is not registered as a "
@@ -417,7 +432,7 @@ class MempoolMinerController:
         """Poll events at the given block and route mempool ones."""
         self.stats.heads_observed += 1
         try:
-            events = await self.client.get_events_at(block_hash)
+            events = await self.pool_client.get_events_at(block_hash)
         except Exception as exc:  # noqa: BLE001 — surface but don't fatal-out
             logger.exception(
                 "get_events_at failed for block=%d hash=0x%s: %s",
@@ -452,7 +467,7 @@ class MempoolMinerController:
     async def _consider_order(self, order_id: int) -> None:
         """Fetch a proposed order and decide whether to mine it."""
         try:
-            order = await self.client.query_job_order(order_id)
+            order = await self.pool_client.query_job_order(order_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "query_job_order failed for order=%d: %s", order_id, exc
@@ -560,7 +575,7 @@ class MempoolMinerController:
             return
         order_id = self._pending.popleft()
         try:
-            order = await self.client.query_job_order(order_id)
+            order = await self.pool_client.query_job_order(order_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "query_job_order failed for order=%d, requeueing: %s",
@@ -650,7 +665,7 @@ class MempoolMinerController:
         solutions_wrapped = ([(sol,) for sol in solutions],)
 
         try:
-            receipt = await self.client.submit_extrinsic(
+            extrinsic_hex = await self.build_client.build_signed_extrinsic(
                 "QuantumComputeMempool",
                 "submit_solution",
                 {
@@ -658,7 +673,9 @@ class MempoolMinerController:
                     "solutions": solutions_wrapped,
                 },
                 self.signer,
-                wait_for="inblock",
+            )
+            receipt = await self.pool_client.submit_signed_extrinsic(
+                extrinsic_hex, wait_for="inblock",
             )
         except Exception as exc:  # noqa: BLE001 — surface RPC errors to logs
             self.stats.solution_errors += 1
@@ -732,12 +749,14 @@ class MempoolMinerController:
         to_remove: List[int] = []
         for order_id in list(self._claimable):
             try:
-                receipt = await self.client.submit_extrinsic(
+                extrinsic_hex = await self.build_client.build_signed_extrinsic(
                     "QuantumComputeMempool",
                     "claim_reward",
                     {"order_id": order_id},
                     self.signer,
-                    wait_for="inblock",
+                )
+                receipt = await self.pool_client.submit_signed_extrinsic(
+                    extrinsic_hex, wait_for="inblock",
                 )
             except Exception as exc:  # noqa: BLE001 — keep trying other orders
                 logger.exception(

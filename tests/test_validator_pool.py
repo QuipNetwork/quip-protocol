@@ -220,14 +220,12 @@ async def test_pool_passes_non_connection_errors_through_immediately():
 
 
 # ---------------------------------------------------------------------------
-# Legacy back-compat: ValidatorPool(urls=...) + pool.get(role) + properties.
-# These keep production callers (quip_cli, miner_bootstrap, miner_controller)
-# working while they migrate to PoolClient.
+# Constructor surface.
 # ---------------------------------------------------------------------------
 
 
 def test_pool_constructible_with_urls_only_defaults():
-    """Legacy callers `ValidatorPool(urls=[...])` work — failover + factory default."""
+    """Callers `ValidatorPool(urls=[...])` work — failover + factory default."""
     pool = ValidatorPool(urls=["ws://a:9944", "ws://b:9944"])
     assert pool.urls == ("ws://a:9944", "ws://b:9944")
     assert pool.current_url == "ws://a:9944"
@@ -237,38 +235,3 @@ def test_pool_constructor_rejects_empty_urls():
     """Empty URL list is a usage error — fail fast."""
     with pytest.raises(ValueError, match="at least one validator URL"):
         ValidatorPool(urls=[])
-
-
-@pytest.mark.asyncio
-async def test_pool_get_role_returns_cached_client_per_role():
-    """get('rpc') and get('subscribe.pow') return distinct clients; same role returns same instance."""
-    pool = ValidatorPool(urls=["ws://a:9944"])
-
-    # Stub SubstrateClient so we don't touch the network.
-    class _StubClient:
-        def __init__(self, url):
-            self.url = url
-            self.connected = False
-
-        async def connect(self):
-            self.connected = True
-
-        async def close(self):
-            self.connected = False
-
-    import substrate.pool as pool_module
-    import substrate.client as client_module
-    original = client_module.SubstrateClient
-    client_module.SubstrateClient = _StubClient
-    try:
-        c1 = await pool.get("rpc")
-        c2 = await pool.get("rpc")
-        c3 = await pool.get("subscribe.pow")
-        assert c1 is c2  # same role → cached
-        assert c1 is not c3  # distinct role → distinct instance
-        assert c1.connected
-        # close() tears down every constructed slot.
-        await pool.close()
-        assert not c1.connected
-    finally:
-        client_module.SubstrateClient = original

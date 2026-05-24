@@ -1,12 +1,9 @@
 """Async client shim that exposes the SubstrateClient method surface
 but routes calls through a ValidatorPool.
 
-The controller has ~16 ``await self.client.X(...)`` call sites. Migrating
-each one to ``await self.pool.send("X", {...})`` would touch a lot of code
-and lose the type-checked attribute access. PoolClient is a thin shim
-that preserves the existing call-site shape while gaining the pool's
-hot-active swap + idempotent-retry semantics for free: every method here
-forwards to ``await self._pool.send(op_name, kwargs_dict)``.
+Preserves familiar ``await client.X(...)`` ergonomics while gaining the
+pool's hot-active swap + idempotent-retry semantics for free: every
+method forwards to ``await self._pool.send(op_name, kwargs_dict)``.
 
 Scope:
     * READ ops (idempotent — pool auto-retries across swaps).

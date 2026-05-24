@@ -116,11 +116,13 @@ def _bare_controller() -> SubstrateMinerController:
     """Controller without calling __init__ — for unit tests that only
     exercise a single method. Sets up the attributes that method needs."""
     c = SubstrateMinerController.__new__(SubstrateMinerController)
-    c.client = MagicMock()
-    # Default get_block_number returns the head_number + 1 if available,
-    # but most tests override either the receipt path or this stub.
-    c.client.get_head = AsyncMock(return_value=b"\xff" * 32)
-    c.client.get_block_number = AsyncMock(return_value=0)
+    # After the pool.get("rpc") removal: parent owns build_client (compose+
+    # sign only) and pool_client (swap-aware reads + submit).
+    c.build_client = MagicMock()
+    c.pool_client = MagicMock()
+    # Default get_block_number returns 0; tests override as needed.
+    c.pool_client.get_head = AsyncMock(return_value=b"\xff" * 32)
+    c.pool_client.get_block_number = AsyncMock(return_value=0)
     c._shutdown_event = asyncio.Event()
     c.signer = MagicMock()
     c.signer.account_id_bytes.return_value = b"\x42" * 32
@@ -402,7 +404,7 @@ async def test_verify_registered_fails_when_miner_missing():
     isn't in `QuantumPow.Miners`. Without this fail-fast, the controller
     would silently dispatch work whose proofs the chain will reject."""
     controller = _bare_controller()
-    controller.client.query_miner = AsyncMock(return_value=None)
+    controller.pool_client.query_miner = AsyncMock(return_value=None)
     with pytest.raises(RuntimeError, match="not in QuantumPow.Miners"):
         await controller._verify_registered(b"\x42" * 32)
 
@@ -419,7 +421,7 @@ async def test_mark_work_key_closed_records_block_number(monkeypatch):
     controller = _bare_controller()
     ctx = _context(b"\x10" * 32)
     _set_current(controller, ctx)
-    controller.client.get_block_number = AsyncMock(return_value=42)
+    controller.pool_client.get_block_number = AsyncMock(return_value=42)
     controller._verify_proof_recorded = AsyncMock(return_value=True)  # type: ignore[assignment]
 
     async def fake_submit_proof(*args, **kwargs):
@@ -458,8 +460,8 @@ async def test_verify_proof_recorded_match_returns_true():
     pubkey = b"\x42" * 32
     nonce = b"\x77" * 32
     controller.signer.account_id_bytes = MagicMock(return_value=pubkey)
-    controller.client.query_last_proof_block_number = AsyncMock(return_value=12)
-    controller.client.query_winning_solution = AsyncMock(
+    controller.pool_client.query_last_proof_block_number = AsyncMock(return_value=12)
+    controller.pool_client.query_winning_solution = AsyncMock(
         return_value=WinningSolutionWithNonce(
             solution=WinningSolution(
                 miner=pubkey,
@@ -490,8 +492,8 @@ async def test_verify_proof_recorded_mismatch_returns_false():
     controller = _bare_controller()
     pubkey = b"\x42" * 32
     controller.signer.account_id_bytes = MagicMock(return_value=pubkey)
-    controller.client.query_last_proof_block_number = AsyncMock(return_value=12)
-    controller.client.query_winning_solution = AsyncMock(
+    controller.pool_client.query_last_proof_block_number = AsyncMock(return_value=12)
+    controller.pool_client.query_winning_solution = AsyncMock(
         return_value=WinningSolutionWithNonce(
             solution=WinningSolution(
                 miner=b"\x99" * 32,  # someone else won
@@ -519,7 +521,7 @@ async def test_verify_proof_recorded_rpc_failure_returns_none():
     proceed with close-on-receipt fallback rather than retry-storming."""
     controller = _bare_controller()
     controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
-    controller.client.query_last_proof_block_number = AsyncMock(
+    controller.pool_client.query_last_proof_block_number = AsyncMock(
         side_effect=RuntimeError("rpc dead")
     )
 
@@ -687,13 +689,18 @@ async def _live_controller(
         core=core,
     )
 
+    # Tests that use the yielded ``client`` (e.g., to query the chain
+    # after a submission) need a direct SubstrateClient — the controller
+    # now keeps its build_client private and reads/submits go through
+    # the swap-aware pool.
+    from substrate.client import SubstrateClient
+    client = SubstrateClient(urls=[DEFAULT_URL])
+    await client.connect()
     run_task = asyncio.create_task(controller.run())
     try:
-        # Wait for pool to lazy-connect (run() calls pool.get('rpc'))
-        # so the yield's `client` ref is meaningful for tests that use
-        # it after the yield.
+        # Yield after one scheduler tick so controller.run() has reached
+        # at least its initial setup.
         await asyncio.sleep(0)
-        client = await pool.get("rpc")
         yield controller, run_task, handle, keystore, client
     finally:
         controller.shutdown()
@@ -710,6 +717,7 @@ async def _live_controller(
             logging.getLogger(__name__).exception(
                 "controller.run() raised during _live_controller teardown"
             )
+        await client.close()
         await pool.close()
         # When `core` owns the handle, let `core.close()` tear it down; the
         # caller is responsible for that. Otherwise we built the handle

@@ -17,7 +17,7 @@ import asyncio
 import os
 import socket
 from collections import deque
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -327,7 +327,11 @@ def _bare_event_controller(num_handles: int = 1):
     c._claimable = set()
     c.miner_handles = [MagicMock(miner_id=f"h{i}") for i in range(num_handles)]
     c.stats = MempoolControllerStats()
-    c.client = MagicMock()
+    # After the pool.get("rpc") removal: parent owns build_client (compose+sign
+    # only) and pool_client (swap-aware reads + submit). The MagicMock surface
+    # lets each test wire just the methods it cares about.
+    c.build_client = MagicMock()
+    c.pool_client = MagicMock()
     c.signer = MagicMock()
     c.signer.account_id_bytes.return_value = b"\xAA" * 32
     c.solver_type = MinerType.CPU
@@ -405,7 +409,7 @@ async def test_process_head_routes_job_proposed_through_consider():
             }
         ]
 
-    c.client.get_events_at = fake_get_events_at
+    c.pool_client.get_events_at = fake_get_events_at
 
     considered: list[int] = []
 
@@ -434,7 +438,7 @@ async def test_process_head_routes_order_expired_to_claimable():
             }
         ]
 
-    c.client.get_events_at = fake_get_events_at
+    c.pool_client.get_events_at = fake_get_events_at
     await c._process_head(b"\x10" * 32, 100)
     assert 99 in c._claimable
 
@@ -453,7 +457,7 @@ async def test_process_head_ignores_non_mempool_events():
             }
         ]
 
-    c.client.get_events_at = fake_get_events_at
+    c.pool_client.get_events_at = fake_get_events_at
     await c._process_head(b"\x10" * 32, 100)
     assert c.stats.events_seen == 0
     assert c.stats.heads_observed == 1
@@ -485,7 +489,8 @@ async def test_handle_result_stale_order_dropped():
         submit_calls.append((args, kwargs))
         return MagicMock(error=None)
 
-    c.client.submit_extrinsic = fake_submit
+    c.build_client.build_signed_extrinsic = AsyncMock(return_value="0xdeadbeef")
+    c.pool_client.submit_signed_extrinsic = fake_submit
     await c._handle_result(envelope)
     assert submit_calls == []
     assert c.stats.results_received == 1
@@ -525,7 +530,8 @@ async def test_handle_result_ok_marks_submitted_and_clears_active():
     async def fake_submit(*args, **kwargs):
         return MagicMock(error=None, extrinsic_hash="0xdeadbeef")
 
-    c.client.submit_extrinsic = fake_submit
+    c.build_client.build_signed_extrinsic = AsyncMock(return_value="0xdeadbeef")
+    c.pool_client.submit_signed_extrinsic = fake_submit
     await c._handle_result(envelope)
     assert c._active_order is None
     assert 42 in c._submitted_orders
@@ -547,7 +553,8 @@ async def test_claim_expired_orders_success_removes_from_claimable():
     async def fake_submit(*args, **kwargs):
         return MagicMock(error=None, extrinsic_hash="0xfeed")
 
-    c.client.submit_extrinsic = fake_submit
+    c.build_client.build_signed_extrinsic = AsyncMock(return_value="0xdeadbeef")
+    c.pool_client.submit_signed_extrinsic = fake_submit
     await c._claim_expired_orders()
     assert 7 not in c._claimable
     assert c.stats.rewards_claimed == 1
@@ -564,7 +571,8 @@ async def test_claim_expired_orders_not_expired_retries_next_tick():
             error="Module(error=OrderNotExpired)", extrinsic_hash="0xfeed",
         )
 
-    c.client.submit_extrinsic = fake_submit
+    c.build_client.build_signed_extrinsic = AsyncMock(return_value="0xdeadbeef")
+    c.pool_client.submit_signed_extrinsic = fake_submit
     await c._claim_expired_orders()
     assert 7 in c._claimable
     assert c.stats.rewards_claimed == 0
@@ -581,7 +589,8 @@ async def test_claim_expired_orders_not_winner_gives_up():
             error="Module(error=NotWinner)", extrinsic_hash="0xfeed",
         )
 
-    c.client.submit_extrinsic = fake_submit
+    c.build_client.build_signed_extrinsic = AsyncMock(return_value="0xdeadbeef")
+    c.pool_client.submit_signed_extrinsic = fake_submit
     await c._claim_expired_orders()
     assert 7 not in c._claimable
 
@@ -762,10 +771,6 @@ async def test_controller_submits_solution_end_to_end(tmp_path):
         allowed_spin_values=DEFAULT_ALLOWED_SPIN,
         solver_type=solver_type,
     )
-    # Resolve rpc once so the test fixture's later setup
-    # (events, balances) shares a connected client.
-    await pool.get("rpc")
-
     solution_submitted = asyncio.Event()
 
     async def on_solution(order_id, result):

@@ -21,6 +21,7 @@ from shared.miner_types import MiningResult
 from shared.packed_solution import pack_solution
 from shared.signer import Signer
 from substrate.client import SubstrateClient
+from substrate.pool_client import PoolClient
 from substrate.types import ExtrinsicReceipt, SubstrateMiningContext
 
 
@@ -98,13 +99,20 @@ def _milli_from_spin(spin: int) -> int:
 
 
 async def submit_proof(
-    client: SubstrateClient,
+    build_client: SubstrateClient,
+    pool_client: PoolClient,
     signer: Signer,
     result: MiningResult,
     context: SubstrateMiningContext,
     wait_for: str = "inblock",
 ) -> ExtrinsicReceipt:
     """Encode and submit one proof. Returns the typed extrinsic receipt.
+
+    ``build_client`` composes + signs the extrinsic in the parent process
+    (key material never crosses an IPC boundary). ``pool_client`` ships
+    the hex through the swap-aware validator pool — a mid-flight swap
+    raises ``ValidatorSwapped`` and the caller decides whether to
+    re-sign with a fresh nonce.
 
     Stale-submission errors (`InvalidNonce`, `TopologyNotRegistered`,
     `InvalidTopology`, `ProofLimitReached`) come back as `receipt.error`. The
@@ -122,12 +130,14 @@ async def submit_proof(
         context.last_proof_block_hash.hex()[:16],
         proof["topology_hash"],
     )
-    return await client.submit_extrinsic(
+    extrinsic_hex = await build_client.build_signed_extrinsic(
         call_module="QuantumPow",
         call_function="submit_proof",
         call_params={"proof": proof},
         signer=signer,
-        wait_for=wait_for,
+    )
+    return await pool_client.submit_signed_extrinsic(
+        extrinsic_hex, wait_for=wait_for,
     )
 
 

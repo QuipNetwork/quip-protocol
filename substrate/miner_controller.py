@@ -56,8 +56,9 @@ from shared.signer import Signer
 from shared.stats_snapshot import StatsSnapshotWriter
 from shared.telemetry_process import telemetry_main
 from substrate.client import SubstrateClient
-from substrate.submitter import encode_quantum_proof, submit_proof
 from substrate.pool import ValidatorPool
+from substrate.pool_client import PoolClient
+from substrate.submitter import encode_quantum_proof, submit_proof
 from substrate.types import (
     ExtrinsicReceipt,
     SubstrateMiningContext,
@@ -442,11 +443,15 @@ class SubstrateMinerController:
                 "SubstrateMinerController requires at least one MinerHandle"
             )
         self._pool = pool
-        # `client` is populated lazily in `run()` — `__init__` must not
-        # touch the network. Existing method bodies still reference
-        # `self.client` directly; the type annotation is Optional only
-        # during the (synchronous) constructor window.
-        self.client: Optional[SubstrateClient] = None
+        # `build_client` is populated lazily in `run()` — `__init__` must
+        # not touch the network. The parent process keeps an in-parent
+        # SubstrateClient solely for compose + sign work (signer key
+        # material never crosses an IPC boundary). Submissions go through
+        # ``pool_client.submit_signed_extrinsic`` (swap-aware) instead.
+        self.build_client: Optional[SubstrateClient] = None
+        # ``pool_client`` is the swap-aware read+submit surface; constructed
+        # in ``run()`` once the pool's URL list is known.
+        self.pool_client: Optional[PoolClient] = None
         # Optional MinerCore hook. When provided, the controller calls
         # `core.record_dispatch()` once per head (not per handle — that would
         # double-count when more than one miner is attached) and
@@ -455,8 +460,6 @@ class SubstrateMinerController:
         # `total_blocks_won` / `wins_per_miner` fields live without coupling
         # the controller's type to MinerCore.
         self.core = core
-        # Client slot is pulled from the pool in `run()` — see comment
-        # there. We deliberately do NOT touch the network in __init__.
         self.signer = signer
         self.miner_handles = miner_handles
         self.topology_hash = topology_hash
@@ -566,10 +569,13 @@ class SubstrateMinerController:
 
     async def run(self) -> None:
         """Main loop. Returns on shutdown or fatal error."""
-        # Resolve slot clients from the pool. The pool lazy-connects on
-        # first get(), so this is where we actually touch the network —
-        # __init__ stays synchronous and side-effect free.
-        self.client = await self._pool.get("rpc")
+        # Build a parent-process SubstrateClient for compose+sign only;
+        # reads and submissions both go through the swap-aware pool via
+        # PoolClient. Signer key material never crosses the mp.Queue IPC
+        # boundary — see ``substrate.submitter.submit_proof``.
+        self.build_client = SubstrateClient(urls=self._pool.urls)
+        await self.build_client.connect()
+        self.pool_client = PoolClient(self._pool)
 
         account = self.signer.account_id_bytes()
         await self._verify_registered(account)
@@ -734,7 +740,7 @@ class SubstrateMinerController:
     # ------------------------------------------------------------------
 
     async def _verify_registered(self, account: bytes) -> None:
-        miner_info = await self.client.query_miner(account)
+        miner_info = await self.pool_client.query_miner(account)
         if miner_info is None:
             raise RuntimeError(
                 f"signer account 0x{account.hex()} is not in "
@@ -1004,7 +1010,11 @@ class SubstrateMinerController:
 
         try:
             receipt = await submit_proof(
-                self.client, self.signer, envelope.result, envelope.context
+                self.build_client,
+                self.pool_client,
+                self.signer,
+                envelope.result,
+                envelope.context,
             )
         except Exception as exc:  # noqa: BLE001 — surface RPC errors to logs
             self.stats.submission_errors += 1
@@ -1135,7 +1145,7 @@ class SubstrateMinerController:
                         if receipt.block_hash.startswith("0x")
                         else receipt.block_hash
                     )
-                    accepted_block_number = await self.client.get_block_number(
+                    accepted_block_number = await self.pool_client.get_block_number(
                         at=accepted_block_hash
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -1313,14 +1323,14 @@ class SubstrateMinerController:
             is worse than a single false-positive close).
         """
         try:
-            last_block = await self.client.query_last_proof_block_number()
+            last_block = await self.pool_client.query_last_proof_block_number()
             if last_block is None:
                 logger.warning(
                     "post-OK verify: LastProofBlock is unset — chain may "
                     "not have committed our proof yet (will trust receipt)"
                 )
                 return None
-            winning = await self.client.query_winning_solution(last_block)
+            winning = await self.pool_client.query_winning_solution(last_block)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "post-OK verify RPC failed (%s: %s); proceeding with "
@@ -1617,10 +1627,15 @@ class SubstrateMinerController:
                 self._telemetry_proc.join(timeout=2)
             self._telemetry_proc = None
             self._telemetry_shutdown_event = None
-        # Slot clients are owned by the pool; do NOT close them here.
-        # The pool's close() (called from the CLI's outer try/finally)
-        # tears them down at process shutdown. The pool's own shutdown()
-        # — invoked by close() — shuts down the active ValidatorHandle.
+        # Close the parent-side build client. The pool's active validator
+        # handle is torn down by ``pool.close()`` from the CLI's outer
+        # try/finally, not here.
+        if self.build_client is not None:
+            try:
+                await self.build_client.close()
+            except Exception:  # noqa: BLE001 — log, don't mask teardown
+                logger.exception("teardown: build_client.close() raised")
+            self.build_client = None
 
 
 # ----------------------------------------------------------------------

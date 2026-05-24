@@ -102,11 +102,6 @@ class ValidatorPool:
         self._max_swap_retries = max_swap_retries
         self._active: Optional[ValidatorHandle] = None
         self._swap_lock = asyncio.Lock()
-        # Legacy slot cache: role -> direct SubstrateClient. Populated lazily
-        # by ``get(role)`` so callers that haven't been migrated to PoolClient
-        # keep working. These connections do NOT participate in hot-active
-        # swap; new code should use ``send()`` or ``PoolClient`` instead.
-        self._slot_clients: dict[str, Any] = {}
 
     @property
     def urls(self) -> tuple[str, ...]:
@@ -121,38 +116,8 @@ class ValidatorPool:
     def active_url(self) -> Optional[str]:
         return self._active.url if self._active is not None else None
 
-    async def get(self, role: str) -> Any:
-        """Legacy API: return a per-role direct SubstrateClient.
-
-        Lazy-connects on first call. Each role gets its own client (the
-        rationale being that substrate-interface's websocket holds receive
-        mode during an active subscription, so submit_extrinsic on the same
-        socket can deadlock — separate sockets per role avoid that).
-
-        Note:
-            Direct slot clients do NOT participate in hot-active swap. New
-            code should use :meth:`send` or :class:`PoolClient` for that.
-            ``get(role)`` exists for callers not yet migrated.
-        """
-        if role not in self._slot_clients:
-            from substrate.client import SubstrateClient
-            client = SubstrateClient(self.current_url)
-            await client.connect()
-            self._slot_clients[role] = client
-        return self._slot_clients[role]
-
     async def close(self) -> None:
-        """Legacy API: close every constructed slot client AND the active handle.
-
-        Idempotent. Safe to call from shutdown paths that don't know which
-        of ``get(role)`` or ``send(op, args)`` was used.
-        """
-        for client in self._slot_clients.values():
-            try:
-                await client.close()
-            except Exception:
-                logger.exception("pool.close: slot client close failed")
-        self._slot_clients.clear()
+        """Shut down the active validator handle. Idempotent."""
         await self.shutdown()
 
     async def start(self) -> None:

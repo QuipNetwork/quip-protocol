@@ -175,12 +175,6 @@ class BootstrapResult:
 
 
 async def bootstrap(config: BootstrapConfig) -> BootstrapResult:
-    # Local import keeps shared/miner_bootstrap independent of the
-    # validator_pool module's load order — this function is sometimes
-    # invoked from contexts (tests, faucet harness) that don't need
-    # the pool machinery; only the actual bootstrap flow does.
-    from substrate.pool import ValidatorPool
-
     keystore = load_or_generate(config.signer_key_path)
     logger.info(
         "using signing keystore: path=%s ss58=%s",
@@ -188,15 +182,14 @@ async def bootstrap(config: BootstrapConfig) -> BootstrapResult:
         keystore.signer.ss58_address(),
     )
 
-    pool = ValidatorPool(urls=config.validators)
+    # Bootstrap is a one-shot: there's no long-running loop that benefits
+    # from the pool's hot-active validator swap. A direct SubstrateClient
+    # over the configured URL list (with its own walk-on-connect failover)
+    # is enough, and avoids spawning a validator child process just to
+    # tear it down moments later.
+    client = SubstrateClient(urls=config.validators)
+    await client.connect()
     try:
-        # One-shot pool: bootstrap only ever needs the 'rpc' slot.
-        # The internal helpers (_maybe_seed_chain, ensure_funded,
-        # _ensure_registered) take a SubstrateClient directly so they
-        # stay testable without dragging the pool through every
-        # function signature.
-        client = await pool.get("rpc")
-
         topology_seeded = False
         difficulty_seeded = False
         if config.seed_chain:
@@ -216,7 +209,7 @@ async def bootstrap(config: BootstrapConfig) -> BootstrapResult:
             difficulty_seeded=difficulty_seeded,
         )
     finally:
-        await pool.close()
+        await client.close()
 
 
 # ----------------------------------------------------------------------

@@ -442,27 +442,28 @@ def _load_keystore_or_fail(path_str: str):
         ) from exc
 
 
-async def _connect_or_fail(
-    pool: "ValidatorPool", role: str = "rpc"
-) -> SubstrateClient:
+async def _connect_or_fail(urls: tuple[str, ...]) -> SubstrateClient:
     """Guard B — validators reachable.
 
-    Wraps `pool.get(role)` (which lazy-connects the slot's underlying
-    `SubstrateClient`). On `NoValidatorReachable`, renders the
-    structured attempt log as `urls=<csv> reasons=<csv>` and raises
-    ClickException with `validators-unreachable`.
+    Constructs a direct ``SubstrateClient`` over the configured URL list
+    (with its own walk-on-connect failover). One-shot CLI subcommands
+    (register, deregister, identify, …) don't run long enough to benefit
+    from the pool's hot-active swap, so they skip the pool entirely.
 
-    Returns the connected client so the caller can use it directly
-    (e.g., for query_balance during Guard C).
+    On ``NoValidatorReachable``, renders the structured attempt log as
+    ``urls=<csv> reasons=<csv>`` and raises ``ClickException`` with
+    ``validators-unreachable``.
     """
+    client = SubstrateClient(urls=urls)
     try:
-        return await pool.get(role)
+        await client.connect()
     except NoValidatorReachable as exc:
-        urls = ",".join(a.url for a in exc.attempts)
+        url_csv = ",".join(a.url for a in exc.attempts)
         reasons = ",".join(a.exc_type for a in exc.attempts)
         raise click.ClickException(
-            f"validators-unreachable urls={urls} reasons={reasons}"
+            f"validators-unreachable urls={url_csv} reasons={reasons}"
         ) from exc
+    return client
 
 
 async def _ensure_funded_or_fail(
@@ -708,11 +709,10 @@ def quip_miner_register_solver(
     mt = MinerType.from_kind(miner_type)
 
     async def _do() -> int:
-        pool = ValidatorPool(urls=tuple(merged["validators"]))
+        # One-shot CLI: skip the pool — direct client over the URL list
+        # is enough.
+        client = await _connect_or_fail(tuple(merged["validators"]))
         try:
-            # Guard B — validators reachable. One-shot pool: a single
-            # 'rpc' slot covers the whole register flow.
-            client = await _connect_or_fail(pool, role="rpc")
             existing = await client.query_solver(keystore.signer.account_id_bytes())
             if existing is not None:
                 if existing.solver_type != mt:
@@ -745,7 +745,7 @@ def quip_miner_register_solver(
             )
             return 0
         finally:
-            await pool.close()
+            await client.close()
 
     raise SystemExit(asyncio.run(_do()))
 
@@ -779,10 +779,8 @@ def quip_miner_deregister_solver(
     keystore = _load_keystore_or_fail(merged["signer_key"])
 
     async def _do() -> int:
-        pool = ValidatorPool(urls=tuple(merged["validators"]))
+        client = await _connect_or_fail(tuple(merged["validators"]))
         try:
-            # Guard B — validators reachable.
-            client = await _connect_or_fail(pool, role="rpc")
             existing = await client.query_solver(keystore.signer.account_id_bytes())
             if existing is None:
                 click.echo("solver not registered; nothing to do")
@@ -806,7 +804,7 @@ def quip_miner_deregister_solver(
             )
             return 0
         finally:
-            await pool.close()
+            await client.close()
 
     raise SystemExit(asyncio.run(_do()))
 
@@ -972,13 +970,16 @@ async def _run_concurrent_miner(
     pow_controller = None
     mempool_controller = None
 
+    setup_client: Optional[SubstrateClient] = None
     try:
         pool = ValidatorPool(urls=tuple(validators))
-        # Guard B — validators reachable. _connect_or_fail returns the
-        # rpc slot client, lazy-connected through the pool. PoW and
-        # mempool controllers share this pool; subscribe slots come
-        # from the same pool and rotate in lockstep.
-        client = await _connect_or_fail(pool, role="rpc")
+        # Guard B — validators reachable. The setup client is a direct
+        # SubstrateClient used for the startup sequence (Guards B/C,
+        # auto-identify, initial topology-snapshot read). It's closed
+        # before controllers start; the controllers each own their own
+        # in-parent build_client and route reads + submissions through
+        # the swap-aware pool.
+        client = setup_client = await _connect_or_fail(tuple(validators))
         # Guard C — wallet funded (with optional faucet top-up).
         await _ensure_funded_or_fail(
             client,
@@ -1076,13 +1077,6 @@ async def _run_concurrent_miner(
                 snapshot.allowed_j_values,
                 snapshot.allowed_spin_values,
             )
-            # No more secondary client construction: both controllers
-            # draw from the same pool. Distinct subscribe slots
-            # ('subscribe.pow' vs 'subscribe.mempool') keep the
-            # receive-mode deadlock out by construction; the shared
-            # 'rpc' slot is fine because its _call_lock already
-            # serializes RPC traffic — splitting it across two clients
-            # only hid lock contention, never eliminated it.
             mempool_controller = MempoolMinerController(
                 pool=pool,
                 signer=keystore.signer,
@@ -1103,6 +1097,11 @@ async def _run_concurrent_miner(
             f"telemetry api: http://{rest_host}:{telemetry_port}/api/v1/status "
             "(sibling process)"
         )
+
+        # Setup done — close the direct client so controllers own the
+        # only live parent-side connections from here on.
+        await setup_client.close()
+        setup_client = None
 
         loop = asyncio.get_running_loop()
 
@@ -1185,11 +1184,11 @@ async def _run_concurrent_miner(
             click.echo(f"  pow stats:     {pow_controller.stats}")
         if mempool_controller is not None:
             click.echo(f"  mempool stats: {mempool_controller.stats}")
+        if setup_client is not None:
+            # Setup failed before the controllers took over; clean up
+            # the standalone connection.
+            await setup_client.close()
         if pool is not None:
-            # One close() tears down every pool-owned slot (rpc,
-            # subscribe.pow, subscribe.mempool). Idempotent against
-            # slots the mempool controller already closed during
-            # teardown.
             await pool.close()
         core.close()
 
@@ -1817,9 +1816,8 @@ def quip_miner_identify(
         return
 
     async def _do() -> int:
-        pool = ValidatorPool(urls=tuple(merged["validators"]))
+        client = await _connect_or_fail(tuple(merged["validators"]))
         try:
-            client = await _connect_or_fail(pool, role="rpc")
             prefer_event = await client.has_call("System", "remark_with_event")
             call_function = "remark_with_event" if prefer_event else "remark"
             try:
@@ -1861,7 +1859,7 @@ def quip_miner_identify(
             click.echo(f"  payload_hash       : 0x{payload_hash}")
             return 0
         finally:
-            await pool.close()
+            await client.close()
 
     raise SystemExit(asyncio.run(_do()))
 
