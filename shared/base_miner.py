@@ -572,28 +572,27 @@ class BaseMiner(ABC):
                             requirements.difficulty_energy * 1000,
                         )
 
-                    # Post-processing gate: only run the expensive
-                    # diverse-selection if this iteration might improve
-                    # what we've already stored. Matches the user-
-                    # stated invariant — "post process only when it
-                    # might meet the threshold energy target, except
-                    # the target is the last min energy that met
-                    # requirements." Use stored_best's energy when we
-                    # have one; otherwise the chain's *live* (decayed)
-                    # threshold — using requirements.difficulty_energy
-                    # here would freeze the gate at the dispatch-snapshot
-                    # value and lock the miner out of submissions when
-                    # decay eases the chain target mid-dispatch (a
-                    # single dispatch can outlive many decay events
-                    # whenever no proof has landed to refresh the work
-                    # key).
+                    # Post-processing gate: store the best we've mined,
+                    # not the best the chain wants. The ratchet is about
+                    # *local progress* — every iter that improves over
+                    # what we've already stored gets post-processed and
+                    # may replace the stored candidate. When stored_best
+                    # is None we have no prior to compare against, so the
+                    # first iter post-processes unconditionally; that
+                    # gives every subsequent iter a real candidate to
+                    # beat. Submission against the chain's live (decayed)
+                    # threshold is a separate decision handled by the
+                    # submit gate below — gating storage on the chain
+                    # target would lock the miner out of building a
+                    # baseline whenever the live threshold is harder
+                    # than what SA is producing.
                     iter_best_energy = float(
                         np.min(sampleset.record.energy),
                     )
                     ratchet_threshold = (
                         stored_best.energy
                         if stored_best is not None
-                        else live_threshold_milli / 1000.0
+                        else float("inf")
                     )
 
                     result = None
@@ -654,9 +653,17 @@ class BaseMiner(ABC):
                     else:
                         result = None
 
+                    # ratchet_threshold is float("inf") on the first iter
+                    # before anything is stored — log None there since
+                    # there's no meaningful prior to display.
+                    ratchet_threshold_milli_log = (
+                        int(ratchet_threshold * 1000)
+                        if math.isfinite(ratchet_threshold)
+                        else None
+                    )
                     attempt_log_kwargs.update(
                         threshold_milli=live_threshold_milli,
-                        ratchet_threshold_milli=int(ratchet_threshold * 1000),
+                        ratchet_threshold_milli=ratchet_threshold_milli_log,
                         num_valid=post_num_valid,
                         diversity_milli=post_diversity_milli,
                         stored_as_best=stored_replaced,
