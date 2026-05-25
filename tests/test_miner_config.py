@@ -4,9 +4,15 @@ from __future__ import annotations
 import pytest
 
 from shared.miner_config import (
+    ALL_BACKEND_SECTIONS,
+    CPU_BACKEND_SECTIONS,
+    GPU_BACKEND_SECTIONS,
     MinerConfigError,
+    QPU_BACKEND_SECTIONS,
+    load_backend_config,
     load_miner_config,
     merge_config,
+    present_backend_groups,
     validate_merged,
 )
 
@@ -206,6 +212,196 @@ def test_load_only_alias_present_no_canonical(tmp_path):
     cfg = load_miner_config(p)
     assert cfg["rest_port"] == 8086
     assert "rest_host" not in cfg
+
+
+# ----------------------------------------------------------------------
+# load_backend_config — v0.1-shape hardware inventory tables
+# ----------------------------------------------------------------------
+
+
+def test_load_backend_missing_file_raises(tmp_path):
+    missing = tmp_path / "nope.toml"
+    with pytest.raises(MinerConfigError, match=str(missing)):
+        load_backend_config(missing)
+
+
+def test_load_backend_no_sections_returns_empty(tmp_path):
+    """A TOML with only `[miner]` (no backend tables) yields {}."""
+    p = tmp_path / "miner-only.toml"
+    p.write_text('[miner]\nvalidators = ["ws://a:9944"]\n')
+    assert load_backend_config(p) == {}
+
+
+def test_load_backend_cpu_section(tmp_path):
+    p = tmp_path / "cpu.toml"
+    p.write_text(
+        '[miner]\n'
+        'validators = ["ws://a:9944"]\n'
+        '[cpu]\n'
+        'num_cpus = 4\n'
+    )
+    backends = load_backend_config(p)
+    assert backends == {"cpu": {"num_cpus": 4}}
+
+
+def test_load_backend_gpu_defaults_plus_cuda_devices(tmp_path):
+    """`[gpu]` defaults + per-device `[cuda.N]` is the v0.1 layout
+    `_normalize_gpu_config` expects."""
+    p = tmp_path / "gpu.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[gpu]\n'
+        'utilization = 80\n'
+        'yielding = true\n'
+        'sms_per_nonce = 4\n'
+        '[cuda.0]\n'
+        '[cuda.1]\n'
+        'utilization = 50\n'
+    )
+    backends = load_backend_config(p)
+    assert backends["gpu"] == {"utilization": 80, "yielding": True, "sms_per_nonce": 4}
+    # tomllib gives `[cuda.0]` / `[cuda.1]` as nested tables under "cuda";
+    # `_normalize_gpu_config` handles dict-of-dicts plus arrays-of-tables.
+    assert "0" in backends["cuda"]
+    assert backends["cuda"]["1"] == {"utilization": 50}
+
+
+def test_load_backend_metal_and_modal(tmp_path):
+    p = tmp_path / "mac-cloud.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[metal]\n'
+        'utilization = 100\n'
+        '[modal]\n'
+        'gpu_type = "a10g"\n'
+    )
+    backends = load_backend_config(p)
+    assert backends["metal"] == {"utilization": 100}
+    assert backends["modal"] == {"gpu_type": "a10g"}
+
+
+def test_load_backend_dwave_with_all_fields(tmp_path):
+    """All v0.1 D-Wave keys round-trip — solver/daily_budget/region/EMA tuning."""
+    p = tmp_path / "qpu.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[dwave]\n'
+        'daily_budget = "60s"\n'
+        'solver = "Advantage2_system1"\n'
+        'dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"\n'
+        'qpu_min_blocks_for_estimation = 5\n'
+        'qpu_ema_alpha = 0.3\n'
+    )
+    backends = load_backend_config(p)
+    assert backends["dwave"] == {
+        "daily_budget": "60s",
+        "solver": "Advantage2_system1",
+        "dwave_region_url": "https://na-west-1.cloud.dwavesys.com/sapi/v2/",
+        "qpu_min_blocks_for_estimation": 5,
+        "qpu_ema_alpha": 0.3,
+    }
+
+
+def test_load_backend_all_qpu_vendors_recognised(tmp_path):
+    """ibm/braket/pasqal/ionq/origin must all be parsed — they each carry
+    a vendor token. Missing any one breaks `register-solver --miner-type`
+    flows that need to see the inventory."""
+    p = tmp_path / "every-vendor.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[ibm]\ntoken = "ibm-tok"\n'
+        '[braket]\ntoken = "braket-tok"\n'
+        '[pasqal]\ntoken = "pasqal-tok"\n'
+        '[ionq]\ntoken = "ionq-tok"\n'
+        '[origin]\ntoken = "origin-tok"\n'
+    )
+    backends = load_backend_config(p)
+    for vendor in ("ibm", "braket", "pasqal", "ionq", "origin"):
+        assert backends[vendor]["token"] == f"{vendor}-tok"
+
+
+def test_load_backend_ignores_miner_section(tmp_path):
+    """`[miner]` is consumed by load_miner_config; load_backend_config
+    must not double-include it (otherwise CLI conflict detection would
+    misfire on every config file)."""
+    p = tmp_path / "mixed.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\nsigner_key = "/tmp/k.json"\n'
+        '[cpu]\nnum_cpus = 2\n'
+    )
+    backends = load_backend_config(p)
+    assert "miner" not in backends
+    assert "cpu" in backends
+
+
+def test_load_backend_ignores_unknown_top_level_tables(tmp_path):
+    """Forward-compat: unknown top-level tables (e.g. `[experimental]`)
+    are silently dropped rather than rejected — TOML is the operator's
+    file, we just don't claim to understand keys we don't wire up."""
+    p = tmp_path / "future.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[cpu]\nnum_cpus = 1\n'
+        '[experimental]\nbeta = true\n'
+    )
+    backends = load_backend_config(p)
+    assert set(backends.keys()) == {"cpu"}
+
+
+def test_load_backend_rejects_non_table_section(tmp_path):
+    """`[cpu]` must be a table — a scalar value at the section name is
+    almost certainly a typo and we want to surface it early. Scalar
+    needs to be at the top level (before any `[table]`) to land at the
+    document root rather than inside whatever table preceded it."""
+    p = tmp_path / "broken.toml"
+    p.write_text(
+        'cpu = 4\n'
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+    )
+    with pytest.raises(MinerConfigError, match=r"\[cpu\]"):
+        load_backend_config(p)
+
+
+def test_load_backend_array_of_tables(tmp_path):
+    """`[[cuda]]` array-of-tables form is the substrate-CLI legacy path
+    `_normalize_gpu_config` accepts. Must round-trip."""
+    p = tmp_path / "aot.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[[cuda]]\ndevice = "0"\n'
+        '[[cuda]]\ndevice = "1"\nutilization = 70\n'
+    )
+    backends = load_backend_config(p)
+    assert backends["cuda"] == [{"device": "0"}, {"device": "1", "utilization": 70}]
+
+
+# ----------------------------------------------------------------------
+# present_backend_groups — used by CLI conflict detection
+# ----------------------------------------------------------------------
+
+
+def test_present_backend_groups_empty():
+    assert present_backend_groups({}) == {"cpu": [], "gpu": [], "qpu": []}
+
+
+def test_present_backend_groups_mixed():
+    backends = {"cpu": {}, "cuda": {}, "metal": {}, "dwave": {}, "ibm": {}}
+    groups = present_backend_groups(backends)
+    assert groups["cpu"] == ["cpu"]
+    # Order matches the canonical group tuple, not insertion order.
+    assert groups["gpu"] == ["cuda", "metal"]
+    assert groups["qpu"] == ["dwave", "ibm"]
+
+
+def test_backend_section_groupings_dont_overlap():
+    """Each section name belongs to exactly one group — the conflict
+    detector relies on this disjointness to attribute a TOML section
+    to the right CLI subcommand."""
+    cpu, gpu, qpu = set(CPU_BACKEND_SECTIONS), set(GPU_BACKEND_SECTIONS), set(QPU_BACKEND_SECTIONS)
+    assert cpu & gpu == set()
+    assert cpu & qpu == set()
+    assert gpu & qpu == set()
+    assert cpu | gpu | qpu == set(ALL_BACKEND_SECTIONS)
 
 
 def test_load_passes_through_identification_keys(tmp_path):

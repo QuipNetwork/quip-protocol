@@ -33,7 +33,12 @@ signer_key = "/data/keystore.json"
 rest_port = -1
 rest_host = "0.0.0.0"
 
-# Reserved subtable — parsed-but-ignored in v0.2; CLI flags
-# (--gpu-backend local|metal|modal) drive backend selection.
-# [miner.gpu]
-# backend = "local"
+# GPU inventory — uncomment to declare per-device tuning. When any
+# of `[gpu]`, `[cuda.N]`, `[nvidia.N]`, `[metal]`, `[modal]` is set,
+# passing `--gpu-backend` on the command line raises
+# `config-conflict`; pick one source.
+# [gpu]
+# utilization = 100
+# yielding    = false
+# [cuda.0]
+# [cuda.1]

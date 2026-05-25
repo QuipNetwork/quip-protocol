@@ -19,8 +19,9 @@ signer_key = "~/.quip-miner/signing.json"
 # rest_port = 8086
 # rest_host = "127.0.0.1"
 
-# The [miner.cpu] subtable is documented here for forward-compat —
-# Phase 6+ will merge it into the per-command miner_config. For now,
-# use the CLI flags shown below.
-[miner.cpu]
-# num_cpus = 4   # CLI: --num-cpus N
+# CPU worker pool — number of SA workers to spawn. When this section
+# is set, passing `--num-cpus N` on the command line fails with
+# `config-conflict`; pick one source. Defaults to 1 when [cpu] is
+# absent and no --num-cpus flag is passed.
+[cpu]
+num_cpus = 4

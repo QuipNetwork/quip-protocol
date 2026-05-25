@@ -21,3 +21,17 @@ signer_key = "/var/lib/quip.network/keystore.json"
 # in bare-metal deployments — front with nginx/Caddy if exposing.
 rest_port = -1
 rest_host = "127.0.0.1"
+
+# Hardware inventory — uncomment the section(s) for this rig. When
+# set, the matching CLI flag (`--num-cpus`, `--gpu-backend`,
+# `--qpu-type`) raises `config-conflict` if also passed.
+# [cpu]
+# num_cpus = 4
+#
+# [gpu]
+# utilization = 100
+# [cuda.0]
+# [cuda.1]
+#
+# [dwave]
+# daily_budget = "60s"

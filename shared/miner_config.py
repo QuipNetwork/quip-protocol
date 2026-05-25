@@ -1,6 +1,20 @@
 """TOML config loader and CLI-merge helper for `quip-miner`.
 
-Schema (keys actually read by the CLI today):
+Two slices of the TOML are read by separate loaders:
+
+  * `load_miner_config(path)` → the `[miner]` table (connection,
+    keystore, telemetry, identification — see schema below).
+  * `load_backend_config(path)` → the v0.1-shape backend inventory
+    tables that describe what hardware this rig runs (`[cpu]`,
+    `[gpu]`, `[cuda.N]`, `[nvidia.N]`, `[metal]`, `[modal]`, `[qpu]`,
+    `[dwave]`, `[ibm]`, `[braket]`, `[pasqal]`, `[ionq]`, `[origin]`).
+
+Splitting the loaders preserves the original v0.1 file shape (where
+backend tables sit at the top level next to `[global]`) while keeping
+the v0.2 `[miner]` table as the canonical home for connection +
+keystore + identification.
+
+[miner] schema (keys actually read by the CLI today):
 
     [miner]
     validators  = ["ws://primary:9944", "ws://standby:9944"]
@@ -26,15 +40,17 @@ Schema (keys actually read by the CLI today):
     listen      = "0.0.0.0"                 # alias for rest_host
     port        = 8086                      # alias for rest_port
 
-Any other keys in `[miner]` (or nested `[miner.cpu]` / `[miner.gpu]` /
-`[miner.qpu]` subtables) are parsed but ignored — CLI flags are the
-only driver for `topology` and per-backend settings in v0.2. Don't
-add keys to this docstring without wiring them through
-`_resolve_runtime_config` first.
+CLI flags override TOML on a per-key basis for the `[miner]` table.
+Empty CLI values (`None`, empty tuple/list) do *not* clobber TOML so
+operators can mix `--config defaults.toml` with overrides for a single
+run.
 
-CLI flags override TOML on a per-key basis. Empty CLI values
-(`None`, empty tuple/list) do *not* clobber TOML so operators can mix
-`--config defaults.toml` with overrides for a single run.
+Backend tables follow a stricter rule: if the TOML defines a backend
+section AND the operator passes a conflicting CLI flag (`--num-cpus`,
+`--gpu-backend`, `--qpu-type`, `--daily-budget`), the CLI fails fast
+with a `config-conflict` error. This avoids the v0.1 ambiguity where
+operators couldn't tell whether the TOML or the flag drove a given
+miner. Use one or the other.
 
 `validators` is the canonical key for the failover-ordered list of
 substrate validator WebSocket URLs. The TOML form must be a list of
@@ -64,13 +80,7 @@ def load_miner_config(path: Path) -> dict[str, Any]:
     file". Raises `MinerConfigError` for missing files, parse errors, or
     schema violations the CLI can surface verbatim.
     """
-    if not path.exists():
-        raise MinerConfigError(f"miner config not found: {path}")
-    try:
-        with path.open("rb") as fh:
-            raw = tomllib.load(fh)
-    except tomllib.TOMLDecodeError as exc:
-        raise MinerConfigError(f"miner config parse failed ({path}): {exc}") from exc
+    raw = _load_toml(path)
     miner = raw.get("miner", {})
     if not isinstance(miner, Mapping):
         raise MinerConfigError(
@@ -80,6 +90,87 @@ def load_miner_config(path: Path) -> dict[str, Any]:
     _validate_validators_field(miner_dict.get("validators"))
     _apply_v01_aliases(miner_dict)
     return miner_dict
+
+
+# Names of the v0.1 top-level tables that describe miner hardware
+# inventory. The grouping is used both for backend discovery in
+# `load_backend_config` and for CLI conflict detection in
+# `present_backend_groups`.
+CPU_BACKEND_SECTIONS: tuple[str, ...] = ("cpu",)
+GPU_BACKEND_SECTIONS: tuple[str, ...] = ("gpu", "cuda", "nvidia", "metal", "modal")
+QPU_BACKEND_SECTIONS: tuple[str, ...] = (
+    "qpu",
+    "dwave",
+    "ibm",
+    "braket",
+    "pasqal",
+    "ionq",
+    "origin",
+)
+ALL_BACKEND_SECTIONS: tuple[str, ...] = (
+    *CPU_BACKEND_SECTIONS,
+    *GPU_BACKEND_SECTIONS,
+    *QPU_BACKEND_SECTIONS,
+)
+
+
+def load_backend_config(path: Path) -> dict[str, Any]:
+    """Read a TOML file and return the v0.1-shape backend inventory tables.
+
+    Returns a dict containing only the recognised hardware-inventory
+    sections (`[cpu]`, `[gpu]`, `[cuda.N]`, `[nvidia.N]`, `[metal]`,
+    `[modal]`, `[qpu]`, `[dwave]`, `[ibm]`, `[braket]`, `[pasqal]`,
+    `[ionq]`, `[origin]`). Values are returned verbatim — the consumer
+    (`MinerCore._initialize_miners`, via `_build_gpu_specs` /
+    `_build_qpu_specs`) already handles the per-device sub-table /
+    array-of-tables shapes the v0.1 schema supports.
+
+    Returns `{}` when the file has no recognised backend sections.
+    Raises `MinerConfigError` for missing files or parse errors.
+    """
+    raw = _load_toml(path)
+    out: dict[str, Any] = {}
+    for section in ALL_BACKEND_SECTIONS:
+        value = raw.get(section)
+        if value is None:
+            continue
+        # Allow both `[gpu]` (mapping) and `[[cuda]]` (list of tables) —
+        # `_normalize_gpu_config` / `_normalize_qpu_config` accept both.
+        if not isinstance(value, (Mapping, list)):
+            raise MinerConfigError(
+                f"miner config: [{section}] must be a table or array of tables, "
+                f"got {type(value).__name__}"
+            )
+        out[section] = value
+    return out
+
+
+def present_backend_groups(backends: Mapping[str, Any]) -> dict[str, list[str]]:
+    """Bucket the section names in `backends` by hardware group.
+
+    Returns `{"cpu": [...], "gpu": [...], "qpu": [...]}` listing the
+    section names present in each group. Empty list when the group has
+    no sections. Callers use this for conflict detection against the
+    cpu/gpu/qpu CLI flags.
+    """
+    return {
+        "cpu": [s for s in CPU_BACKEND_SECTIONS if s in backends],
+        "gpu": [s for s in GPU_BACKEND_SECTIONS if s in backends],
+        "qpu": [s for s in QPU_BACKEND_SECTIONS if s in backends],
+    }
+
+
+def _load_toml(path: Path) -> dict[str, Any]:
+    """Read + parse a TOML file. Shared by both load_* entry points."""
+    if not path.exists():
+        raise MinerConfigError(f"miner config not found: {path}")
+    try:
+        with path.open("rb") as fh:
+            return tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        raise MinerConfigError(
+            f"miner config parse failed ({path}): {exc}"
+        ) from exc
 
 
 def merge_config(
@@ -179,8 +270,14 @@ def _validate_validators_field(value: Any) -> None:
 
 
 __all__ = [
+    "ALL_BACKEND_SECTIONS",
+    "CPU_BACKEND_SECTIONS",
+    "GPU_BACKEND_SECTIONS",
     "MinerConfigError",
+    "QPU_BACKEND_SECTIONS",
+    "load_backend_config",
     "load_miner_config",
     "merge_config",
+    "present_backend_groups",
     "validate_merged",
 ]

@@ -39,9 +39,14 @@ from shared.miner_bootstrap import (
     ensure_funded,
 )
 from shared.miner_config import (
+    CPU_BACKEND_SECTIONS,
+    GPU_BACKEND_SECTIONS,
     MinerConfigError,
+    QPU_BACKEND_SECTIONS,
+    load_backend_config,
     load_miner_config,
     merge_config,
+    present_backend_groups,
     validate_merged,
 )
 from shared.miner_core import MinerCore
@@ -891,6 +896,82 @@ def _inject_topology(miner_config: dict, kind: str, topology) -> dict:
 _SHUTDOWN_GRACE_SECONDS = 15.0
 
 
+def _load_backends_or_fail(config_path: Optional[str]) -> dict:
+    """Read the v0.1-shape backend tables from --config; `{}` if no --config.
+
+    Wraps `load_backend_config` so loader errors surface as the same
+    `quip-miner: error: <code>` formatting the rest of the CLI uses
+    (via `miner_main`'s wrapper).
+    """
+    if config_path is None:
+        return {}
+    try:
+        return load_backend_config(Path(config_path).expanduser())
+    except MinerConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _check_backend_conflicts(
+    ctx: click.Context,
+    backends: dict,
+    *,
+    group: str,
+    flag_param_pairs: tuple,
+) -> None:
+    """Fail fast when TOML defines a backend section and a conflicting
+    CLI flag was passed.
+
+    Rule (per operator request): TOML and CLI must not both describe
+    the same backend — there's no ambiguity-resolving precedence, the
+    operator picks one source. Click's `get_parameter_source` is what
+    tells us a value came from `COMMANDLINE` vs a `DEFAULT` filled in
+    by Click itself; we only error on the former so default-valued
+    flags don't poison a TOML-driven run.
+
+    `flag_param_pairs` is `((cli_label, click_param_name), ...)` — the
+    label is what we surface to the operator (e.g. `--num-cpus`), the
+    param name is the function-arg key Click registers.
+    """
+    sections = present_backend_groups(backends).get(group, [])
+    if not sections:
+        return
+
+    explicit_flags: list[str] = []
+    for cli_label, param_name in flag_param_pairs:
+        source = ctx.get_parameter_source(param_name)
+        if source == click.core.ParameterSource.COMMANDLINE:
+            explicit_flags.append(cli_label)
+    if not explicit_flags:
+        return
+
+    section_csv = ", ".join(f"[{s}]" for s in sections)
+    flag_csv = " ".join(explicit_flags)
+    raise click.UsageError(
+        f"config-conflict: --config defines {section_csv} but also passed "
+        f"{flag_csv}. Pick one source for {group.upper()} inventory — remove "
+        f"the conflicting CLI flag(s) or drop the TOML section."
+    )
+
+
+def _qpu_miner_kind_from_backends(backends: dict, fallback: str) -> str:
+    """Derive the substrate `miner_kind` from TOML QPU sections.
+
+    Matches the v0.2 CLI's mapping: bare `qpu` for D-Wave, `qpu_<type>`
+    for IBM / IonQ / Pasqal. When TOML has multiple QPU vendors (rare
+    in practice — operators typically pick one), the first match in
+    section-declaration order wins. Falls back to `fallback` (the CLI
+    --qpu-type value) when no recognised vendor section is present.
+    """
+    for section in QPU_BACKEND_SECTIONS:
+        if section == "qpu":
+            # `[qpu]` alone doesn't bind a vendor — keep walking for an
+            # explicit `[dwave]`/`[ibm]`/etc. before falling back.
+            continue
+        if section in backends:
+            return f"qpu_{section}" if section in ("ibm", "ionq", "pasqal") else "qpu"
+    return f"qpu_{fallback}" if fallback in ("ibm", "ionq", "pasqal") else "qpu"
+
+
 async def _run_concurrent_miner(
     *,
     mode: str,
@@ -1275,7 +1356,9 @@ _MODE_HELP = (
     help=_REST_HOST_HELP,
 )
 @_identification_options
+@click.pass_context
 def quip_miner_cpu(
+    ctx: click.Context,
     validators: tuple,
     config_path: Optional[str],
     signer_key_path: Optional[str],
@@ -1320,7 +1403,21 @@ def quip_miner_cpu(
             "rest_host": "127.0.0.1",
         },
     )
-    miner_config = {"cpu": {"num_cpus": num_cpus}}
+    backends = _load_backends_or_fail(config_path)
+    _check_backend_conflicts(
+        ctx,
+        backends,
+        group="cpu",
+        flag_param_pairs=(("--num-cpus", "num_cpus"),),
+    )
+    if "cpu" in backends:
+        # TOML drives inventory verbatim — MinerCore._initialize_miners
+        # reads `cpu.num_cpus` and `cpu.args` directly. Coerce the
+        # tomllib Mapping → plain dict so downstream consumers can
+        # mutate without surprises.
+        miner_config = {"cpu": dict(backends["cpu"])}
+    else:
+        miner_config = {"cpu": {"num_cpus": num_cpus}}
     raise SystemExit(asyncio.run(_run_concurrent_miner(
         mode=mode,
         miner_kind="cpu",
@@ -1386,7 +1483,9 @@ def quip_miner_cpu(
     help=_REST_HOST_HELP,
 )
 @_identification_options
+@click.pass_context
 def quip_miner_gpu(
+    ctx: click.Context,
     validators: tuple,
     config_path: Optional[str],
     signer_key_path: Optional[str],
@@ -1407,15 +1506,31 @@ def quip_miner_gpu(
     verification against the chain is a Phase 6 follow-on; concurrent
     mode shares the same caveat about topology injection generalisation.
     """
-    backend = gpu_backend.lower()
-    if backend == "local":
-        miner_config = {"cuda": [{"device": "0"}]}
-    elif backend == "metal":
-        miner_config = {"metal": [{}]}
-    elif backend == "modal":
-        miner_config = {"modal": [{"gpu_type": "t4"}]}
+    backends = _load_backends_or_fail(config_path)
+    _check_backend_conflicts(
+        ctx,
+        backends,
+        group="gpu",
+        flag_param_pairs=(("--gpu-backend", "gpu_backend"),),
+    )
+    has_gpu_toml = any(s in backends for s in GPU_BACKEND_SECTIONS)
+    if has_gpu_toml:
+        # TOML inventory drives the miner config — `_build_gpu_specs`
+        # handles `[gpu]` defaults plus any of `[cuda.N]` / `[nvidia.N]`
+        # / `[metal]` / `[modal]` device sections.
+        miner_config = {
+            s: backends[s] for s in GPU_BACKEND_SECTIONS if s in backends
+        }
     else:
-        raise click.BadParameter(f"unknown --gpu-backend: {backend}")
+        backend = gpu_backend.lower()
+        if backend == "local":
+            miner_config = {"cuda": [{"device": "0"}]}
+        elif backend == "metal":
+            miner_config = {"metal": [{}]}
+        elif backend == "modal":
+            miner_config = {"modal": [{"gpu_type": "t4"}]}
+        else:
+            raise click.BadParameter(f"unknown --gpu-backend: {backend}")
 
     merged = _resolve_runtime_config(
         config_path=config_path,
@@ -1507,7 +1622,9 @@ def quip_miner_gpu(
     help=_REST_HOST_HELP,
 )
 @_identification_options
+@click.pass_context
 def quip_miner_qpu(
+    ctx: click.Context,
     validators: tuple,
     config_path: Optional[str],
     signer_key_path: Optional[str],
@@ -1530,12 +1647,30 @@ def quip_miner_qpu(
     as GPU: end-to-end against the chain is a Phase 6 item once topology
     binding generalises beyond CPU.
     """
-    section: dict = {"type": qpu_type}
-    if daily_budget is not None:
-        section["daily_budget"] = daily_budget
-    miner_config = {qpu_type: [section]}
-
-    miner_kind = f"qpu_{qpu_type}" if qpu_type in ("ibm", "ionq", "pasqal") else "qpu"
+    backends = _load_backends_or_fail(config_path)
+    _check_backend_conflicts(
+        ctx,
+        backends,
+        group="qpu",
+        flag_param_pairs=(
+            ("--qpu-type", "qpu_type"),
+            ("--daily-budget", "daily_budget"),
+        ),
+    )
+    has_qpu_toml = any(s in backends for s in QPU_BACKEND_SECTIONS)
+    if has_qpu_toml:
+        miner_config = {
+            s: backends[s] for s in QPU_BACKEND_SECTIONS if s in backends
+        }
+        miner_kind = _qpu_miner_kind_from_backends(backends, fallback=qpu_type)
+    else:
+        section: dict = {"type": qpu_type}
+        if daily_budget is not None:
+            section["daily_budget"] = daily_budget
+        miner_config = {qpu_type: [section]}
+        miner_kind = (
+            f"qpu_{qpu_type}" if qpu_type in ("ibm", "ionq", "pasqal") else "qpu"
+        )
 
     merged = _resolve_runtime_config(
         config_path=config_path,

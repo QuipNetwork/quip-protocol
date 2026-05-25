@@ -29,7 +29,8 @@ signer_key = "/data/keystore.json"
 rest_port = -1
 rest_host = "0.0.0.0"
 
-# Reserved subtables — parsed-but-ignored in v0.2; CLI flags drive
-# per-backend config today.
-# [miner.cpu]
+# CPU worker pool. When set, `--num-cpus N` on the command line
+# raises `config-conflict` — pick one source. Defaults to 1 when
+# unset and no --num-cpus flag is passed.
+# [cpu]
 # num_cpus = 4

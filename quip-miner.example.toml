@@ -2,16 +2,22 @@
 #
 # Use with any quip-miner subcommand:
 #   quip-miner cpu --config ./quip-miner.example.toml
-#   quip-miner gpu --config ./quip-miner.example.toml --gpu-backend metal
-#   quip-miner qpu --config ./quip-miner.example.toml --qpu-type dwave
+#   quip-miner gpu --config ./quip-miner.example.toml
+#   quip-miner qpu --config ./quip-miner.example.toml
 #
-# CLI flags override these defaults on a per-key basis. Empty CLI values
-# (no flag passed, empty multiple=True tuple) fall back to TOML.
+# Two slices of this file are read by separate loaders:
 #
-# Replaces the v0.1 quip-node.example.toml. The old [global] table with
-# peer/heartbeat/tofu/trust_db/rest_*/tls_* fields was removed when the
-# v0.2 refactor delegated networking to the substrate validator —
-# quip-miner now connects directly to a validator RPC and that's all.
+#   * `[miner]` — connection / keystore / telemetry / identification.
+#     CLI flags override these on a per-key basis (CLI > TOML); empty
+#     CLI values fall back to TOML so `--config defaults.toml` + a
+#     single override flag is a valid per-run pattern.
+#
+#   * `[cpu]` / `[gpu]` / `[cuda.N]` / `[nvidia.N]` / `[metal]` /
+#     `[modal]` / `[qpu]` / `[dwave]` / `[ibm]` / `[braket]` /
+#     `[pasqal]` / `[ionq]` / `[origin]` — hardware inventory in the
+#     v0.1 layout. The matching CLI subcommand (`cpu`/`gpu`/`qpu`)
+#     reads the relevant group. TOML + a conflicting CLI flag fail
+#     fast with `config-conflict` — pick one source per backend group.
 
 [miner]
 # Ordered failover list — tried in order at startup, live-rotated on
@@ -69,3 +75,76 @@ signer_key = "~/.quip-miner/signing.json"
 # that want a stable log location separate from journald.
 # log_level = "INFO"
 # node_log  = "/var/log/quip-miner.log"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Hardware inventory (v0.1-shape backend tables).
+#
+# Uncomment the section(s) for the hardware this rig actually runs.
+# When a section is present, the matching `quip-miner <cmd>` subcommand
+# reads it instead of synthesizing inventory from CLI flags. Passing a
+# CLI flag that would override (`--num-cpus`, `--gpu-backend`,
+# `--qpu-type`, `--daily-budget`) when the corresponding TOML section
+# is set raises `config-conflict`.
+# ──────────────────────────────────────────────────────────────────────
+
+# CPU SA worker pool. Read by `quip-miner cpu`.
+# [cpu]
+# num_cpus = 4   # number of SA workers; defaults to 1 when [cpu] is unset
+
+# GPU global defaults inherited by each per-device section below.
+# Read by `quip-miner gpu` alongside `[cuda.N]` / `[metal]` / `[modal]`.
+# [gpu]
+# utilization   = 100   # 1-100, percentage of SMs to use
+# yielding      = false # true = yield to other GPU users between batches
+# sms_per_nonce = 4     # CUDA-only; tunes per-streaming-multiprocessor scheduling
+
+# CUDA / NVIDIA per-device sections. One subtable per device ordinal.
+# `[nvidia.N]` is an alias for `[cuda.N]`. Discover ordinals with:
+#   nvidia-smi --query-gpu=index,name --format=csv,noheader
+# [cuda.0]
+# [cuda.1]
+# utilization = 50
+# yielding    = true
+
+# Apple Silicon (Metal Performance Shaders). Single GPU per node.
+# [metal]
+# utilization = 100
+
+# Modal cloud GPUs. Set `gpu_type` to the Modal class (t4, a10g, …).
+# [modal]
+# gpu_type = "a10g"
+
+# QPU global defaults — currently no shared keys; vendor sections below
+# carry all settings. Reserved for future inheritance.
+# [qpu]
+
+# D-Wave annealer. Credentials come from environment vars
+# (DWAVE_API_KEY) — never store them in this file.
+# [dwave]
+# daily_budget                   = "60s"   # wall-clock QPU access budget per UTC day
+# solver                         = "Advantage2_system1"
+# dwave_region_url               = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+# qpu_min_blocks_for_estimation  = 5
+# qpu_ema_alpha                  = 0.3
+
+# Gate-model providers — token from environment, never inline.
+# [ibm]
+# token        = "..."  # IBMQ_TOKEN
+# daily_budget = "5m"
+
+# [braket]
+# token        = "..."  # AWS credentials via boto3 profile in practice
+# daily_budget = "5m"
+
+# [pasqal]
+# token        = "..."  # PASQAL_TOKEN
+# daily_budget = "5m"
+
+# [ionq]
+# token        = "..."  # IONQ_API_KEY
+# daily_budget = "5m"
+
+# [origin]
+# token        = "..."  # ORIGIN_TOKEN
+# daily_budget = "5m"

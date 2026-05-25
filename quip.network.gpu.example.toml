@@ -1,10 +1,11 @@
 # quip-miner gpu — v0.2 example config
 #
-#   quip-miner gpu --config ./quip.network.gpu.example.toml --gpu-backend local
-#   quip-miner gpu --config ./quip.network.gpu.example.toml --gpu-backend metal
-#   quip-miner gpu --config ./quip.network.gpu.example.toml --gpu-backend modal
+#   quip-miner gpu --config ./quip.network.gpu.example.toml
 #
-# CUDA / Apple Metal / Modal Labs cloud — pick a backend on the CLI.
+# CUDA / Apple Metal / Modal Labs cloud. Uncomment whichever device
+# section(s) describe this rig. Passing `--gpu-backend` on the command
+# line when any GPU device section is set in this file raises
+# `config-conflict` — pick one source for the inventory.
 
 [miner]
 validators = [
@@ -19,7 +20,29 @@ signer_key = "~/.quip-miner/signing.json"
 # rest_port = 8086
 # rest_host = "127.0.0.1"
 
-# Forward-compat subtable for Phase 6+. Today the GPU miner config is
-# driven entirely by --gpu-backend on the CLI.
-[miner.gpu]
-# backend = "metal"   # local | metal | modal
+# Global GPU defaults — inherited by every device section below.
+# Per-device sections override individual keys.
+[gpu]
+utilization   = 100    # 1-100, percentage of SMs to use per worker
+yielding      = false  # true = yield to other GPU users between batches
+# sms_per_nonce = 4    # CUDA-only; per-streaming-multiprocessor scheduling
+
+# ── CUDA / NVIDIA ─────────────────────────────────────────────────────
+# One subtable per device ordinal. Discover with:
+#   nvidia-smi --query-gpu=index,name --format=csv,noheader
+# `[nvidia.N]` is accepted as an alias for `[cuda.N]`.
+[cuda.0]
+[cuda.1]
+# utilization = 50
+# yielding    = true
+
+# ── Apple Silicon (Metal) ─────────────────────────────────────────────
+# Uncomment for Apple Silicon rigs. Single GPU per node.
+# [metal]
+# utilization = 100
+
+# ── Modal cloud GPU ───────────────────────────────────────────────────
+# Uncomment for Modal-hosted cloud GPUs. `gpu_type` picks the class
+# (t4, a10g, a100, etc. — see Modal's catalog).
+# [modal]
+# gpu_type = "a10g"

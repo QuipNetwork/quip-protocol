@@ -883,3 +883,200 @@ def test_auto_identify_skips_detection_when_public_host_set(monkeypatch):
     ))
     assert called == [], "detection ran despite explicit public_host"
     assert captured.get("public_host") == "miner.example.com"
+
+
+# ── Backend-section TOML wiring (v0.1-shape inventory) ────────────────────
+
+
+def _write_backend_toml(tmp_path, body: str, *, with_signer: bool = True):
+    """Helper: write a TOML with [miner] + a backend section snippet."""
+    cfg = tmp_path / "miner.toml"
+    miner_section = '[miner]\nvalidators = ["ws://toml:9944"]\n'
+    if with_signer:
+        miner_section += 'signer_key = "/tmp/signing.json"\n'
+    cfg.write_text(miner_section + body)
+    return cfg
+
+
+def _stub_runner(monkeypatch) -> Dict[str, Any]:
+    captured: Dict[str, Any] = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
+    return captured
+
+
+def test_quip_miner_cpu_toml_drives_num_cpus(monkeypatch, tmp_path):
+    """`[cpu] num_cpus = 4` in TOML produces a 4-CPU miner_config without
+    a --num-cpus flag. Restores the v0.1 path where the operator drives
+    inventory from the file."""
+    captured = _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(tmp_path, "[cpu]\nnum_cpus = 4\n")
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert captured["miner_config"] == {"cpu": {"num_cpus": 4}}
+
+
+def test_quip_miner_cpu_toml_plus_num_cpus_flag_is_conflict(monkeypatch, tmp_path):
+    """TOML `[cpu]` + explicit `--num-cpus` → UsageError. Matches the
+    operator-requested rule: pick one source of truth per backend."""
+    _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(tmp_path, "[cpu]\nnum_cpus = 4\n")
+    result = CliRunner().invoke(
+        quip_cli.quip_miner_cpu,
+        ["--config", str(cfg), "--num-cpus", "2"],
+    )
+    assert result.exit_code != 0
+    assert "config-conflict" in result.output
+    assert "--num-cpus" in result.output
+    assert "[cpu]" in result.output
+
+
+def test_quip_miner_cpu_default_num_cpus_with_toml_cpu_section_ok(monkeypatch, tmp_path):
+    """The click default for --num-cpus (1) must NOT trip the conflict
+    detector — only an explicit COMMANDLINE source does. This is what
+    makes `quip-miner cpu --config x.toml` work without re-passing
+    every flag."""
+    captured = _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(tmp_path, "[cpu]\nnum_cpus = 8\n")
+    # No --num-cpus on the cmdline → click fills in default 1, but
+    # `get_parameter_source` reports DEFAULT, not COMMANDLINE.
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert captured["miner_config"] == {"cpu": {"num_cpus": 8}}
+
+
+def test_quip_miner_cpu_cli_only_still_works(monkeypatch):
+    """No --config → backends={} → CLI synthesis like before. Regression
+    guard for the most common operator path."""
+    captured = _stub_runner(monkeypatch)
+    result = CliRunner().invoke(
+        quip_cli.quip_miner_cpu,
+        ["--validator", "ws://x:9944", "--num-cpus", "3"],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["miner_config"] == {"cpu": {"num_cpus": 3}}
+
+
+def test_quip_miner_gpu_toml_drives_cuda_devices(monkeypatch, tmp_path):
+    """`[cuda.0]` + `[cuda.1]` produce a two-device inventory that
+    `MinerCore._build_gpu_specs` consumes via _normalize_gpu_config."""
+    captured = _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(
+        tmp_path,
+        '[gpu]\nutilization = 80\n'
+        '[cuda.0]\n'
+        '[cuda.1]\nutilization = 50\n',
+    )
+    result = CliRunner().invoke(quip_cli.quip_miner_gpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    mc = captured["miner_config"]
+    assert mc["gpu"] == {"utilization": 80}
+    assert "0" in mc["cuda"] and "1" in mc["cuda"]
+    assert mc["cuda"]["1"] == {"utilization": 50}
+
+
+def test_quip_miner_gpu_toml_plus_backend_flag_is_conflict(monkeypatch, tmp_path):
+    """`[cuda.0]` in TOML + `--gpu-backend local` → UsageError."""
+    _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(tmp_path, "[cuda.0]\n")
+    result = CliRunner().invoke(
+        quip_cli.quip_miner_gpu,
+        ["--config", str(cfg), "--gpu-backend", "metal"],
+    )
+    assert result.exit_code != 0
+    assert "config-conflict" in result.output
+    assert "--gpu-backend" in result.output
+    assert "[cuda]" in result.output
+
+
+def test_quip_miner_gpu_metal_toml(monkeypatch, tmp_path):
+    """A bare `[metal]` table — Apple Silicon rig — works without any
+    `--gpu-backend` flag."""
+    captured = _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(tmp_path, "[metal]\nutilization = 100\n")
+    result = CliRunner().invoke(quip_cli.quip_miner_gpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert captured["miner_config"] == {"metal": {"utilization": 100}}
+
+
+def test_quip_miner_gpu_modal_toml_with_gpu_type(monkeypatch, tmp_path):
+    """[modal] gpu_type = "a10g" picks the cloud GPU class from TOML."""
+    captured = _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(tmp_path, '[modal]\ngpu_type = "a10g"\n')
+    result = CliRunner().invoke(quip_cli.quip_miner_gpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert captured["miner_config"]["modal"] == {"gpu_type": "a10g"}
+
+
+def test_quip_miner_qpu_dwave_toml(monkeypatch, tmp_path):
+    """`[dwave]` daily_budget/solver passed verbatim — what
+    `_build_qpu_specs` reads to populate the QPU sampler's cfg block."""
+    captured = _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(
+        tmp_path,
+        '[dwave]\n'
+        'daily_budget = "60s"\n'
+        'solver = "Advantage2_system1"\n',
+    )
+    result = CliRunner().invoke(quip_cli.quip_miner_qpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert captured["miner_config"]["dwave"] == {
+        "daily_budget": "60s",
+        "solver": "Advantage2_system1",
+    }
+    # miner_kind defaults to bare "qpu" for D-Wave (matches the v0.2
+    # mempool register-solver mapping QpuDwave).
+    assert captured["miner_kind"] == "qpu"
+
+
+def test_quip_miner_qpu_ibm_toml_gives_qpu_ibm_kind(monkeypatch, tmp_path):
+    """`[ibm]` in TOML → miner_kind='qpu_ibm' so the mempool controller
+    registers under MinerType.QpuIbm without operator needing --qpu-type."""
+    captured = _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(tmp_path, '[ibm]\ntoken = "ibm-xyz"\n')
+    result = CliRunner().invoke(quip_cli.quip_miner_qpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert captured["miner_kind"] == "qpu_ibm"
+    assert captured["miner_config"]["ibm"] == {"token": "ibm-xyz"}
+
+
+def test_quip_miner_qpu_toml_plus_qpu_type_flag_is_conflict(monkeypatch, tmp_path):
+    """`[dwave]` + `--qpu-type ibm` is unambiguously contradictory →
+    UsageError."""
+    _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(tmp_path, '[dwave]\ndaily_budget = "60s"\n')
+    result = CliRunner().invoke(
+        quip_cli.quip_miner_qpu,
+        ["--config", str(cfg), "--qpu-type", "ibm"],
+    )
+    assert result.exit_code != 0
+    assert "config-conflict" in result.output
+
+
+def test_quip_miner_qpu_toml_plus_daily_budget_flag_is_conflict(monkeypatch, tmp_path):
+    """`[dwave]` + `--daily-budget 5m` → UsageError. --daily-budget is a
+    QPU-section flag so it counts as a conflict alongside --qpu-type."""
+    _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(tmp_path, '[dwave]\ndaily_budget = "60s"\n')
+    result = CliRunner().invoke(
+        quip_cli.quip_miner_qpu,
+        ["--config", str(cfg), "--daily-budget", "5m"],
+    )
+    assert result.exit_code != 0
+    assert "config-conflict" in result.output
+    assert "--daily-budget" in result.output
+
+
+def test_quip_miner_qpu_default_qpu_type_with_toml_dwave_ok(monkeypatch, tmp_path):
+    """Click's default --qpu-type=dwave must NOT trip the conflict
+    detector against a TOML `[dwave]` section (DEFAULT, not COMMANDLINE).
+    Same DEFAULT-vs-COMMANDLINE rationale as the CPU test."""
+    captured = _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(tmp_path, '[dwave]\ndaily_budget = "120s"\n')
+    result = CliRunner().invoke(quip_cli.quip_miner_qpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert captured["miner_config"]["dwave"]["daily_budget"] == "120s"

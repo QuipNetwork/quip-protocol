@@ -1,10 +1,12 @@
 # quip-miner qpu — v0.2 example config
 #
-#   quip-miner qpu --config ./quip.network.qpu.example.toml --qpu-type dwave
+#   quip-miner qpu --config ./quip.network.qpu.example.toml
 #
 # Quantum-annealer / gate-model providers. Credentials come from
 # environment variables (e.g. DWAVE_API_KEY) — never store them in
-# this file.
+# this file. Passing `--qpu-type` or `--daily-budget` on the command
+# line when any vendor section below is set raises `config-conflict`;
+# pick one source for the inventory.
 
 [miner]
 validators = [
@@ -13,16 +15,44 @@ validators = [
 signer_key = "~/.quip-miner/signing.json"
 # faucet_url = "http://localhost:8087"
 
-# Optional telemetry REST API. Off by default (rest_port=-1). Set
-# rest_host = "0.0.0.0" to expose inside a container; CLI flags
-# --rest-port / --rest-host override these.
+# Optional telemetry REST API. Off by default (rest_port=-1).
 # rest_port = 8086
 # rest_host = "127.0.0.1"
 
-# Forward-compat for Phase 6+. Today the QPU miner config is driven by
-# the CLI:
-#   --qpu-type     {dwave,ibm,ionq,pasqal,braket,origin}
-#   --daily-budget {e.g. 40s, 5m, 2h, 1d}  — wall-clock QPU access budget
-[miner.qpu]
-# type = "dwave"
-# daily_budget = "40s"
+# ── D-Wave annealer ───────────────────────────────────────────────────
+# QPU access-time budget (per UTC day) is the main knob. The sampler's
+# active solver and region come from environment variables —
+# DWAVE_API_SOLVER and DWAVE_REGION_URL — at runtime; `solver` and
+# `dwave_region_url` here are operator-asserted pass-through values
+# surfaced to dashboards. EMA + min-blocks tune the pacing estimator
+# inside QPUTimeManager.
+[dwave]
+daily_budget                   = "60s"
+# solver                         = "Advantage2_system1"
+# dwave_region_url               = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+# qpu_min_blocks_for_estimation  = 5
+# qpu_ema_alpha                  = 0.3
+
+# ── Gate-model providers ──────────────────────────────────────────────
+# Uncomment one. `token` is conventionally an environment-variable
+# reference; do not paste secrets into this file. `daily_budget` caps
+# wall-clock access per UTC day same as the D-Wave section.
+# [ibm]
+# token        = "..."
+# daily_budget = "5m"
+
+# [braket]
+# token        = "..."
+# daily_budget = "5m"
+
+# [pasqal]
+# token        = "..."
+# daily_budget = "5m"
+
+# [ionq]
+# token        = "..."
+# daily_budget = "5m"
+
+# [origin]
+# token        = "..."
+# daily_budget = "5m"
