@@ -693,8 +693,8 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
     min_diversity = requirements.min_diversity
     min_solutions = requirements.min_solutions
     best_energy = float('inf')
-    valid_count = 0
-    valid_solutions = []
+    num_valid_full = 0
+    num_meeting = 0
     diversity = 0.0
     result = None
 
@@ -705,63 +705,40 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
 
         best_energy = float(np.min(all_energies))
 
-        # Pool selection for the diverse-K. Three modes:
-        #
-        # 1. Strict (legacy / mempool): the pool is the snapshot's
-        #    below-target subset. If best doesn't clear, bail fast —
-        #    nothing in this mode can be stashed for later.
-        #
-        # 2. Lenient + live threshold (substrate ratchet, common case):
-        #    tighten to the below-target subset *when* it has enough
-        #    samples to satisfy min_solutions. That keeps
-        #    ``submit_floor_energy = max(selected_energies)`` under the
-        #    live target by construction, so the submit gate fires.
-        #    When the subset is too thin (e.g. just after a chain
-        #    re-snapshot when the target is artificially tight), fall
-        #    back to the full constraint-valid pool. The candidate
-        #    can't submit now, but it lands in the top-K stash for
-        #    visibility AND for future submission once
-        #    ``BlockDecayInterval`` raises the live target past its
-        #    floor — no re-mining needed.
-        #
-        # 3. Lenient + no live (tests / legacy): preserve original
-        #    "everything constraint-valid is eligible" behavior.
-        if strict_energy:
-            if best_energy > difficulty_energy:
-                raise ValueError(
-                    f"Best energy {best_energy} exceeds difficulty energy {difficulty_energy}"
-                )
-            valid_indices = np.where(all_energies < difficulty_energy)[0]
-        elif live_threshold_energy is not None:
-            below_target = np.where(all_energies < live_threshold_energy)[0]
-            if len(below_target) >= min_solutions:
-                valid_indices = below_target
-            else:
-                # Fall back to full pool so the iter still stashes.
-                valid_indices = np.arange(len(all_energies))
-        else:
-            valid_indices = np.arange(len(all_energies))
-
-        if len(valid_indices) < min_solutions:
+        # Strict mode bail-fast: nothing below-target in the snapshot
+        # means nothing useful in this iter. (Lenient mode falls through
+        # to pool-fallback below, where the iter can still stash.)
+        if strict_energy and best_energy > difficulty_energy:
             raise ValueError(
-                f"Insufficient valid solutions: {len(valid_indices)} < {min_solutions}"
+                f"Best energy {best_energy} exceeds difficulty energy {difficulty_energy}"
             )
 
-        # Get unique solutions that meet energy threshold
-        # Track best energy among valid solutions
-        valid_solutions = []
-        valid_energies = []
-        seen = set()
+        # Dedup the FULL batch into the constraint-valid set, BEFORE any
+        # target filter. This is the universe both diagnostics
+        # (``num_valid``, ``num_meeting_target``) and the diverse-K
+        # selection draw from.
+        #
+        # ``num_valid`` answers "did the topology sampler produce
+        # diverse-enough unique solutions?". ``num_meeting_target``
+        # answers "of those, how many would the chain accept?". Keeping
+        # them on the same denominator means the operator can read the
+        # ratio: equal = sampler is producing exclusively below-target
+        # (post-decay submission window); ``num_meeting_target`` ≪
+        # ``num_valid`` = sampler is healthy but target is tight
+        # (decay-wait phase).
+        full_unique_solutions: List[List[int]] = []
+        full_unique_energies: List[float] = []
+        seen: set = set()
 
         if skip_validation:
             # FAST PATH: Trust sampler output, skip per-solution validation
             # This is safe during mining since we control the sampler
-            for idx in valid_indices:
+            for idx in range(len(all_energies)):
                 solution = tuple(sampleset.record.sample[idx])
                 if solution not in seen:
                     seen.add(solution)
-                    valid_solutions.append(list(solution))
-                    valid_energies.append(all_energies[idx])
+                    full_unique_solutions.append(list(solution))
+                    full_unique_energies.append(all_energies[idx])
         else:
             # SLOW PATH: Full validation for untrusted sources (block validation)
             # Use pre-computed Ising model if provided, otherwise regenerate.
@@ -775,7 +752,7 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
                 )
 
             invalid_solutions = []
-            for idx in valid_indices:
+            for idx in range(len(all_energies)):
                 solution = tuple(sampleset.record.sample[idx])
                 if solution not in seen:
                     seen.add(solution)
@@ -784,8 +761,8 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
                     # Validate solution format and correctness
                     validation_result = validate_solution(solution_list, h, J, nodes, edges)
                     if validation_result["valid"]:
-                        valid_solutions.append(solution_list)
-                        valid_energies.append(all_energies[idx])
+                        full_unique_solutions.append(solution_list)
+                        full_unique_energies.append(all_energies[idx])
                     else:
                         invalid_solutions.append({
                             "solution": solution_list,
@@ -796,6 +773,43 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
             if invalid_solutions:
                 local_logger = logging.getLogger(__name__)
                 local_logger.warning(f"Found {len(invalid_solutions)} invalid solutions with errors: {[s['errors'] for s in invalid_solutions[:3]]}")
+
+        # Pool selection for diverse-K. Three modes:
+        #
+        # 1. Strict (legacy / mempool): pool = below snapshot target.
+        #    (best-vs-difficulty already enforced above.)
+        #
+        # 2. Lenient + live threshold (substrate ratchet, common case):
+        #    tighten pool to below-target *when* it has enough samples
+        #    to satisfy min_solutions, so the diverse-K's recomputed
+        #    floor stays under the live target and the submit gate
+        #    fires. When the subset is too thin (e.g. right after a
+        #    chain re-snapshot), fall back to the full constraint-valid
+        #    set — the iter can't submit now but it lands in the top-K
+        #    stash for visibility and future submission once
+        #    ``BlockDecayInterval`` raises the live target past its
+        #    floor.
+        #
+        # 3. Lenient + no live (tests / legacy): use full pool.
+        if strict_energy:
+            pool_indices = [
+                i for i, e in enumerate(full_unique_energies)
+                if e < difficulty_energy
+            ]
+        elif live_threshold_energy is not None:
+            below_target = [
+                i for i, e in enumerate(full_unique_energies)
+                if e < live_threshold_energy
+            ]
+            if len(below_target) >= min_solutions:
+                pool_indices = below_target
+            else:
+                pool_indices = list(range(len(full_unique_solutions)))
+        else:
+            pool_indices = list(range(len(full_unique_solutions)))
+
+        valid_solutions = [full_unique_solutions[i] for i in pool_indices]
+        valid_energies = [full_unique_energies[i] for i in pool_indices]
 
         if len(valid_solutions) < min_solutions:
             raise ValueError(f"Insufficient valid solutions: {len(valid_solutions)} < {min_solutions}")
@@ -863,24 +877,29 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         )
         submit_floor_energy = max(selected_energies) if selected_energies else best_energy
 
-        # Count batch solutions whose chain-recomputed energy would
-        # survive the live decayed target if submitted now. We recompute
-        # for ALL valid solutions (not just the K diverse-selected) so
-        # the count matches what the chain would actually accept.
-        # Sampler-reported energies (``valid_energies``) drift sub-milli
-        # from chain-computed ones on most backends but cross the
-        # boundary often enough at the round tail to be misleading — so
-        # we eat the extra matmul to keep the diagnostic honest. Only
-        # done when a threshold is provided; mempool jobs (no decay)
-        # skip this and leave the field None.
+        # Count FULL-batch unique constraint-valid solutions whose
+        # chain-recomputed energy would survive the live decayed target
+        # if submitted now. The denominator is the full constraint-valid
+        # set, NOT the pool — otherwise ``num_meeting_target`` collapses
+        # to ``num_valid`` when the pool is the below-target subset, and
+        # the operator loses the diagnostic ratio.
+        #
+        # Sampler-reported energies drift sub-milli from chain-computed
+        # ones on most backends but cross the boundary often enough at
+        # the round tail to be misleading, so we eat the extra matmul to
+        # keep the diagnostic honest. Only done when a threshold is
+        # provided; mempool jobs (no decay) skip this and leave the
+        # field None.
+        num_valid_full = len(full_unique_solutions)
         num_meeting_target: Optional[int] = None
-        if live_threshold_energy is not None and valid_solutions:
-            all_recomputed = energies_for_solutions(
-                valid_solutions, h_for_floor, J_for_floor, nodes,
+        if live_threshold_energy is not None and full_unique_solutions:
+            full_recomputed = energies_for_solutions(
+                full_unique_solutions, h_for_floor, J_for_floor, nodes,
             )
             num_meeting_target = int(
-                sum(1 for e in all_recomputed if e < live_threshold_energy)
+                sum(1 for e in full_recomputed if e < live_threshold_energy)
             )
+            num_meeting = num_meeting_target
 
         # Create mining result for this attempt
         mining_time = time.time() - start_time
@@ -896,7 +915,7 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
             solutions=filtered_solutions,
             energy=best_energy,
             diversity=diversity,
-            num_valid=len(valid_solutions),
+            num_valid=len(full_unique_solutions),
             mining_time=int(mining_time),
             node_list=nodes,
             edge_list=edges,
@@ -909,5 +928,5 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         logger.debug(f"Failed to meet requirements: {e}")
     finally:
         # Log every mining attempt (successful or not) for analysis
-        logger.info(f"[{miner_id}] Mining attempt - Energy: {best_energy:.0f}, Valid: {valid_count} (best {min_solutions} diversity: {diversity:.3f}) (requirements: energy<={difficulty_energy:.0f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
+        logger.info(f"[{miner_id}] Mining attempt - Energy: {best_energy:.0f}, Valid: {num_valid_full} Meeting: {num_meeting} (best {min_solutions} diversity: {diversity:.3f}) (requirements: energy<={difficulty_energy:.0f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
     return result
