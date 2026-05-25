@@ -358,3 +358,289 @@ def test_all_allowed_log_levels_pass(level):
         node_id="x", log_level=level, include_system_info=False,
     )
     validate_descriptor(desc)
+
+
+# ----------------------------------------------------------------------
+# End-to-end: TOML backend tables → descriptor → System.remark payload
+#
+# Regression tests for the security boundary under the v0.2 regime where
+# `[ibm] token = "..."` and similar credential-carrying TOML sections
+# now flow through `load_backend_config` into the cpu/gpu/qpu CLI
+# subcommands' miner_config dict (which `_auto_identify` then feeds
+# into the on-startup System.remark via `_identify_specs_from_miner_config`
+# → `build_descriptor` → `to_canonical_json`).
+#
+# These exercise the FULL chain — loader, spec builder, descriptor
+# pipeline, canonical serializer — and assert on the bytes that would
+# actually land on chain. The unit-level tests above check individual
+# scrubbing layers; these check the system-wide property: "no value
+# the operator wrote inside a `token =` key in TOML ever appears in a
+# remark payload."
+# ----------------------------------------------------------------------
+
+
+import textwrap as _textwrap
+
+
+def _build_canonical_payload_from_toml(tmp_path, toml_body: str, node_id: str = "rig"):
+    """Helper: TOML → load_backend_config → _build_qpu_specs +
+    _build_gpu_specs → build_descriptor → to_canonical_json bytes."""
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import _build_gpu_specs, _build_qpu_specs
+
+    p = tmp_path / "miner.toml"
+    p.write_text(_textwrap.dedent(toml_body))
+    backends = load_backend_config(p)
+
+    specs = []
+    if any(k in backends for k in ("gpu", "cuda", "nvidia", "metal", "modal")):
+        specs.extend(_build_gpu_specs(node_id, backends))
+    if any(
+        k in backends
+        for k in ("qpu", "dwave", "ibm", "braket", "pasqal", "ionq", "origin")
+    ):
+        specs.extend(_build_qpu_specs(node_id, backends))
+    if "cpu" in backends:
+        num_cpus = int(backends["cpu"].get("num_cpus", 1))
+        for i in range(num_cpus):
+            specs.append(
+                {"id": f"{node_id}-CPU-{i + 1}", "kind": "cpu", "args": {}}
+            )
+
+    desc = build_descriptor(
+        node_id=node_id,
+        node_name=node_id,
+        miner_specs=specs,
+        include_system_info=False,
+    )
+    validate_descriptor(desc)
+    return desc, to_canonical_json(desc)
+
+
+@pytest.mark.parametrize(
+    "vendor,sentinel",
+    [
+        ("ibm", "ibm-shouldnotleak-9f3e2a"),
+        ("braket", "braket-shouldnotleak-b7c1d4"),
+        ("pasqal", "pasqal-shouldnotleak-77a8b2"),
+        ("ionq", "ionq-shouldnotleak-c0ffee"),
+        ("origin", "origin-shouldnotleak-deadbeef"),
+    ],
+)
+def test_qpu_token_does_not_leak_to_remark_payload(tmp_path, vendor, sentinel):
+    """Each gate-model vendor's `token = "<value>"` in TOML must not
+    appear anywhere in the canonical System.remark bytes.
+
+    Regression guard: the spec builder DOES copy the token into the
+    spec's cfg block (it's used in-process by the QPU sampler), so the
+    scrubbing layer that protects the on-chain payload is the whitelist
+    at `_qpu_spec_entry` (`_QPU_HANDLE_FIELD_WHITELIST`). If a future
+    contributor adds `"token"` to that whitelist or routes the spec
+    through a code path that bypasses `summarize_miners_from_specs`,
+    this test catches it.
+    """
+    desc, payload = _build_canonical_payload_from_toml(
+        tmp_path,
+        f"""
+        [miner]
+        validators = ["ws://a:9944"]
+        [{vendor}]
+        token = "{sentinel}"
+        daily_budget = "5m"
+        """,
+    )
+    text = payload.decode("utf-8")
+    assert sentinel not in text, (
+        f"{vendor} token leaked to remark payload:\n{text}"
+    )
+    # Belt-and-braces: the vendor entry exists, just sans token.
+    assert vendor in desc.miners
+    assert desc.miners[vendor].get("daily_budget") == "5m"
+    assert "token" not in desc.miners[vendor]
+
+
+def test_dwave_region_url_does_not_leak_to_remark_payload(tmp_path):
+    """`dwave_region_url` is not credential-shaped but also not on the
+    QPU whitelist — should never reach the descriptor. Catches a regression
+    where someone widens the whitelist to "all fields the operator set"."""
+    _, payload = _build_canonical_payload_from_toml(
+        tmp_path,
+        """
+        [miner]
+        validators = ["ws://a:9944"]
+        [dwave]
+        daily_budget = "60s"
+        solver = "Advantage2_system1"
+        dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+        qpu_min_blocks_for_estimation = 7
+        qpu_ema_alpha = 0.25
+        """,
+    )
+    text = payload.decode("utf-8")
+    assert "dwave_region_url" not in text
+    assert "na-west-1" not in text
+    assert "qpu_min_blocks_for_estimation" not in text
+    assert "qpu_ema_alpha" not in text
+    # The two whitelisted keys ARE present.
+    assert "Advantage2_system1" in text
+    assert "60s" in text
+
+
+def test_dwave_qpu_token_via_toml_does_not_leak(tmp_path):
+    """Defensive: D-Wave's TOML doesn't conventionally carry `token`
+    (the SDK reads `DWAVE_API_KEY` from env), but a confused operator
+    might paste one in. The spec builder doesn't copy `token` from a
+    `[dwave]` table, so this should be a no-op — but verify."""
+    _, payload = _build_canonical_payload_from_toml(
+        tmp_path,
+        """
+        [miner]
+        validators = ["ws://a:9944"]
+        [dwave]
+        daily_budget = "60s"
+        token = "dwave-shouldnotleak-12345"
+        """,
+    )
+    assert "dwave-shouldnotleak-12345" not in payload.decode("utf-8")
+
+
+def test_credential_smuggled_through_solver_field_is_rejected_end_to_end(tmp_path):
+    """`solver = "DWAVE_API_KEY=secret_value_12345"` in TOML: the strict
+    solver-name regex drops the value at `_qpu_spec_entry`, AND the
+    descriptor-wide value walk in `validate_descriptor` would catch it
+    if anything slipped through. Both layers verified together here."""
+    desc, payload = _build_canonical_payload_from_toml(
+        tmp_path,
+        """
+        [miner]
+        validators = ["ws://a:9944"]
+        [dwave]
+        daily_budget = "60s"
+        solver = "Advantage2_system1"
+        """,
+    )
+    assert desc.miners["dwave"].get("solver") == "Advantage2_system1"
+
+    # Now the malicious variant.
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import _build_qpu_specs
+
+    p = tmp_path / "leaky.toml"
+    p.write_text(_textwrap.dedent("""
+        [miner]
+        validators = ["ws://a:9944"]
+        [dwave]
+        daily_budget = "60s"
+        solver = "DWAVE_API_KEY=secret_value_12345"
+    """))
+    backends = load_backend_config(p)
+    specs = _build_qpu_specs("rig", backends)
+    desc = build_descriptor(
+        node_id="rig",
+        node_name="rig",
+        miner_specs=specs,
+        include_system_info=False,
+    )
+    # `_qpu_spec_entry` dropped the suspicious solver — descriptor passes
+    # validation but with `solver` absent from the dwave entry.
+    validate_descriptor(desc)
+    assert "solver" not in desc.miners["dwave"]
+    payload = to_canonical_json(desc)
+    assert "DWAVE_API_KEY" not in payload.decode("utf-8")
+    assert "secret_value_12345" not in payload.decode("utf-8")
+
+
+def test_credential_smuggled_through_daily_budget_is_rejected(tmp_path):
+    """`daily_budget` IS on the whitelist — so the value-level scan in
+    `validate_descriptor` is what catches credentials smuggled through it.
+    A JWT-shaped value should make `validate_descriptor` raise."""
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import _build_qpu_specs
+
+    p = tmp_path / "leaky.toml"
+    p.write_text(_textwrap.dedent("""
+        [miner]
+        validators = ["ws://a:9944"]
+        [ibm]
+        token = "ibm-real-token"
+        daily_budget = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzZWNyZXQiOiJzaG91bGRub3RsZWFrIn0"
+    """))
+    backends = load_backend_config(p)
+    specs = _build_qpu_specs("rig", backends)
+    desc = build_descriptor(
+        node_id="rig",
+        node_name="rig",
+        miner_specs=specs,
+        include_system_info=False,
+    )
+    with pytest.raises(
+        DescriptorValidationError, match="credential-shaped-value"
+    ):
+        validate_descriptor(desc)
+
+
+def test_multi_vendor_toml_no_secret_appears_in_payload(tmp_path):
+    """Realistic mixed-rig TOML — every vendor section populated with a
+    credential. Single pass asserts no sentinel survives serialization.
+    The closest real-world equivalent to what an operator might write."""
+    sentinels = {
+        "ibm": "ibm-sentinel-aaaaa",
+        "braket": "braket-sentinel-bbbbb",
+        "pasqal": "pasqal-sentinel-ccccc",
+        "ionq": "ionq-sentinel-ddddd",
+        "origin": "origin-sentinel-eeeee",
+    }
+    toml = '[miner]\nvalidators = ["ws://a:9944"]\n'
+    toml += '[dwave]\ndaily_budget = "60s"\nsolver = "Advantage2_system1"\n'
+    for vendor, token in sentinels.items():
+        toml += f'[{vendor}]\ntoken = "{token}"\ndaily_budget = "5m"\n'
+    desc, payload = _build_canonical_payload_from_toml(tmp_path, toml)
+    text = payload.decode("utf-8")
+    for vendor, token in sentinels.items():
+        assert token not in text, f"{vendor} token leaked"
+        # And the vendor entry made it through (sans token).
+        assert vendor in desc.miners
+
+
+def test_cpu_args_passed_through_toml_args_table_does_not_leak(tmp_path):
+    """`[cpu]` can carry an `args` subtable used to forward sampler
+    config (e.g. topology). Verify a forbidden key smuggled into
+    `[cpu.args]` doesn't leak. The CPU whitelist is `{"num_cpus"}` —
+    nothing else from `[cpu]` makes it past `_cpu_spec_entry`."""
+    desc, payload = _build_canonical_payload_from_toml(
+        tmp_path,
+        """
+        [miner]
+        validators = ["ws://a:9944"]
+        [cpu]
+        num_cpus = 2
+        [cpu.args]
+        api_key = "cpu-args-shouldnotleak-secret123"
+        """,
+    )
+    text = payload.decode("utf-8")
+    assert "cpu-args-shouldnotleak-secret123" not in text
+    assert "api_key" not in text
+    # The legitimate `num_cpus` made it through.
+    assert desc.miners["cpu"]["num_cpus"] == 2
+
+
+def test_modal_gpu_type_passes_but_secret_in_modal_table_does_not(tmp_path):
+    """Modal cloud GPUs: `gpu_type` is whitelisted, but any other
+    operator-set keys (including a stray `token`) must be scrubbed."""
+    desc, payload = _build_canonical_payload_from_toml(
+        tmp_path,
+        """
+        [miner]
+        validators = ["ws://a:9944"]
+        [modal]
+        gpu_type = "a10g"
+        token = "modal-shouldnotleak-xyz123"
+        """,
+    )
+    text = payload.decode("utf-8")
+    assert "modal-shouldnotleak-xyz123" not in text
+    # Modal entry survives with gpu_type intact.
+    modal_entries = [v for k, v in desc.miners.items() if k.startswith("modal")]
+    assert modal_entries
+    assert modal_entries[0].get("gpu_type") == "a10g"

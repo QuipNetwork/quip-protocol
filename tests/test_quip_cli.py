@@ -1080,3 +1080,129 @@ def test_quip_miner_qpu_default_qpu_type_with_toml_dwave_ok(monkeypatch, tmp_pat
     result = CliRunner().invoke(quip_cli.quip_miner_qpu, ["--config", str(cfg)])
     assert result.exit_code == 0, result.output
     assert captured["miner_config"]["dwave"]["daily_budget"] == "120s"
+
+
+# ── _auto_identify secret-leakage guard (TOML → remark) ────────────────
+
+
+def _capture_auto_identify_payload(monkeypatch, miners_config: Dict[str, Any]) -> bytes:
+    """Run _auto_identify with a fake client and return the bytes that
+    would have been submitted as System.remark. Exercises the same
+    code path that cpu/gpu/qpu subcommands invoke on every startup."""
+    import asyncio
+    captured: Dict[str, Any] = {}
+
+    class FakeReceipt:
+        error = None
+        extrinsic_hash = "0xabc"
+        block_hash = "0xdef"
+
+    class FakeClient:
+        async def has_call(self, *_a, **_kw):
+            return False  # use plain `remark`, simpler shape
+
+        async def submit_extrinsic(self, module, call, args, _signer, **_kw):
+            captured["module"] = module
+            captured["call"] = call
+            captured["remark"] = args["remark"]
+            return FakeReceipt()
+
+    class FakeSigner:
+        def ss58_address(self):
+            return "5FakeAccount" + "0" * 38
+        def account_id_bytes(self):
+            return b"\x00" * 32
+
+    class FakeKeystore:
+        signer = FakeSigner()
+
+    async def _no_probe():
+        return None
+    monkeypatch.setattr(quip_cli, "_detect_public_ip", _no_probe)
+
+    asyncio.run(quip_cli._auto_identify(
+        FakeClient(),
+        FakeKeystore(),
+        node_name="rig",
+        public_host="rig.example.com",
+        public_port=None,
+        log_level=None,
+        miners_config=miners_config,
+    ))
+    assert "remark" in captured, "_auto_identify did not call submit_extrinsic"
+    assert captured["module"] == "System"
+    return captured["remark"]
+
+
+def test_auto_identify_does_not_leak_tokens_from_toml_loaded_miners_config(
+    monkeypatch, tmp_path,
+):
+    """Full live-startup integration: write a TOML with every QPU
+    vendor's `token`, load it through `load_backend_config`, hand the
+    resulting dict to `_auto_identify`, and inspect the bytes that
+    would land on chain via `System.remark`.
+
+    This is the regression test the v0.2 backend-table restoration
+    needs. The descriptor pipeline is the only layer between the
+    in-memory `miners_config` dict and the on-chain remark; if any
+    refactor in that layer regresses, this catches it."""
+    from shared.miner_config import load_backend_config
+
+    p = tmp_path / "all-vendors.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[ibm]\ntoken = "ibm-startup-sentinel-aaaaa"\n'
+        '[braket]\ntoken = "braket-startup-sentinel-bbbbb"\n'
+        '[pasqal]\ntoken = "pasqal-startup-sentinel-ccccc"\n'
+        '[ionq]\ntoken = "ionq-startup-sentinel-ddddd"\n'
+        '[origin]\ntoken = "origin-startup-sentinel-eeeee"\n'
+    )
+    miners_config = load_backend_config(p)
+    remark_bytes = _capture_auto_identify_payload(monkeypatch, miners_config)
+
+    text = remark_bytes.decode("utf-8")
+    for sentinel in (
+        "ibm-startup-sentinel-aaaaa",
+        "braket-startup-sentinel-bbbbb",
+        "pasqal-startup-sentinel-ccccc",
+        "ionq-startup-sentinel-ddddd",
+        "origin-startup-sentinel-eeeee",
+    ):
+        assert sentinel not in text, (
+            f"secret leaked to System.remark payload: {sentinel}\n"
+            f"payload was: {text}"
+        )
+
+    # The vendor entries DID make it into the descriptor (the legitimate
+    # signal indexers need); just without the credentials.
+    import json
+    body = json.loads(text)
+    miners = body.get("miners", {})
+    for vendor in ("ibm", "braket", "pasqal", "ionq", "origin"):
+        assert vendor in miners, f"{vendor} entry missing from descriptor"
+        assert "token" not in miners[vendor]
+
+
+def test_auto_identify_blocks_credential_smuggled_through_solver(
+    monkeypatch, tmp_path,
+):
+    """Live-startup path: a TOML where the operator pastes a credential
+    into the solver field. The strict solver-name regex at
+    `_qpu_spec_entry` drops the value before it reaches the descriptor,
+    so the remark gets submitted (with `solver` absent) — _auto_identify
+    is best-effort by contract, it doesn't block mining on identify
+    failures. Assert the bad value never leaves the process."""
+    from shared.miner_config import load_backend_config
+
+    p = tmp_path / "smuggle.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[dwave]\n'
+        'daily_budget = "60s"\n'
+        'solver = "DWAVE_API_KEY=smuggle-via-solver-1234"\n'
+    )
+    miners_config = load_backend_config(p)
+    remark_bytes = _capture_auto_identify_payload(monkeypatch, miners_config)
+    text = remark_bytes.decode("utf-8")
+    assert "DWAVE_API_KEY" not in text
+    assert "smuggle-via-solver-1234" not in text
