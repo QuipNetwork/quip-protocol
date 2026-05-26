@@ -33,13 +33,13 @@ flowchart TD
     SP1 --> R
     SP -- no --> CQ{7. Cell-quotient + formulas?\nedge_count >= 60}
     CQ -- hit --> R
-    CQ -- miss --> TW{8. Treewidth DP\nedge_count >= 10, tw <= 11}
+    CQ -- miss --> DCP{7.88 Decomposition + Chord-Peel\nedge >= 20, n <= 30,\nunified atom + cell pipeline}
+    DCP -- hit --> R
+    DCP -- miss --> TW{8. Treewidth DP\nedge_count >= 10, tw <= 11}
     TW -- hit --> R
     TW -- miss --> KS{9. k-sum decomposition\nedge_count >= 6 + vertex separator}
     KS -- hit --> R
-    KS -- miss --> HI{10. Hierarchical tiling\nedge_count >= 20 + cell decomposition}
-    HI -- hit --> R
-    HI -- miss --> CEJ[11. CEJ: spanning tree + chord addition]
+    KS -- miss --> CEJ[12. CEJ: spanning tree + chord addition]
     CEJ --> R
 ```
 
@@ -105,11 +105,13 @@ same family of techniques (e.g., cell-quotient DPs).
 | #    | Technique                                                | When Used                                                                  | Complexity                            |
 | ---- | -------------------------------------------------------- | -------------------------------------------------------------------------- | ------------------------------------- |
 | 7    | [k-Sum Decomposition](07_k_sum_decomposition.md)         | Graphs with `k`-vertex separators (`k = 2..7`)                              | **`1 + C(k, 2)` full syntheses**      |
-| 8    | [Hierarchical Tiling](08_hierarchical_tiling.md)         | Graphs ≥ 20 edges with repeating cell structure; fallback when treewidth_dp doesn't fit | **`O(chord_count)` full syntheses**   |
+| 7.88 | [Decomposition + Chord-Peel](08_5_decomposition_chord_peel.md) | Unified atom + cell decomposition discovery → closed-form formulas (`unified`, `kmatching`) → cost-gated chord-rule. Replaces legacy 7.88a/7.88/7.9/10. | **`O(chord_count)` full syntheses + Phase D recursive residue peel** |
 | 8.1  | [Find and Partition Cells](08_1_find_and_partition_cells.md) | _(Theory reference)_ — how `try_hierarchical_partition` discovers candidates | `O(VF2-cost)` per candidate           |
 | 8.2  | [Chord-Rule Formalization](08_2_chord_rule_formalization.md) | _(Theory reference)_ — mathematical justification for the chord rule        | (theory)                              |
-| 8.3  | [k-Matching Formula](08_3_kmatching_formula.md)          | Cells joined by `M_k` perfect matching between vertex-transitive cells; closed form | `O(k)` recursive syntheses (one per `k-j` term) |
-| 8.4  | [Cross-Cell Chord-Peel](08_4_cross_cell_chord_peel.md)   | Disjoint K_n / K_{a,b} atoms with a small bipartite junction; peel junction edges instead of internal-clique | **`O(junction_size)` syntheses** (e.g. Z(1,2) = 4) |
+| 8.3  | [k-Matching Formula](08_3_kmatching_formula.md)          | Cells joined by `M_k` perfect matching between vertex-transitive cells; closed form (Phase B sub-path of 7.88) | `O(k)` recursive syntheses (one per `k-j` term) |
+| 8.4  | [Cross-Cell Chord-Peel](08_4_cross_cell_chord_peel.md)   | _(Merged into 7.88)_ — conceptual reference for inter-atom junction peel | **`O(junction_size)` syntheses** (e.g. Z(1,2) = 4) |
+| 8.6  | [Unified Chord-Junction Theorem](08_6_unified_chord_junction.md) | Bivariate I-E closed form for chord-junction cell pairs; symmetric + asymmetric; persistent merger cache (255 K_{4,4} + 78 Z(1,1) entries). Generalises 8.3 and the chain framework (6.7). | **1 base synth + O(2^\|V_k\|) cache lookups** (warm), `2^\|V_k\|` syntheses (cold) |
+| 8    | [Hierarchical Tiling](08_hierarchical_tiling.md)         | _(Merged into 7.88)_ — conceptual reference for boundary-quotient + chord recursion | **`O(chord_count)` full syntheses**   |
 | 9    | [Creation-Expansion-Join](09_creation_expansion_join.md) | Final fallback — spanning tree + chord addition                            | `O(chords × synthesis_cost)`          |
 
 ## Hierarchical Tiling — how it works

@@ -3,6 +3,8 @@
 A closed-form expression for the Tutte polynomial of a multi-cell graph whose inter-cell edges form k-edge matchings on vertex-transitive anchor sets. Extends the chord rule (§8.2) from a linear recursion to a polynomial-coefficient formula that short-circuits deletion-contraction when the cell-topology satisfies specific structural preconditions. Directly applies to D-Wave Chimera targets.
 
 > **Status**: working draft. Single-cell-pair and cell-tree forms have proof sketches; the cell-cycle extension is empirical-only. Preconditions are tight in the sense that violations have been verified to break the formula (Sections 5, 7).
+>
+> **Relation to the unified theorem**: §8.6 (the Unified Bivariate Chord-Junction Theorem, May 25 2026) is a strict generalisation. The k-matching formula is the special case where the chord pattern is a perfect matching on vertex-transitive anchors. The two are mathematically equivalent on that case via the cut-vertex identity `T(G ∪_v G) = T(G)²` (see §8.6 §3). At runtime, `_try_unified_chord_junction` runs *before* `apply_kmatching_formula` so the matching case enjoys O(1) merger-cache lookups instead of `O(k)` recursive syntheses — the engine reports the same `kmatching_formula` method label either way.
 
 ## How we got here
 

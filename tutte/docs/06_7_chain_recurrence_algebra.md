@@ -17,6 +17,8 @@ polynomial of an `r × r` polynomial-valued transfer matrix `M(x, y)`,
 and `r = n_orbits` is the number of aut-orbit classes of the
 boundary-partition state space under the cell's automorphism group.
 
+> **Relation to the unified theorem (§8.6)**: the chain recurrence and the unified bivariate chord-junction theorem are two dual descriptions of the same algebra. The order `r = n_orbits` of the recurrence equals the number of distinct merger types under the cell's automorphism group; e.g. `K_{4, 4} + M_4` has `r = 5` matching the 5 mergers `(T(K_{4, 4})², 4·M_1, 6·M_2, 4·M_3, M_4)`. The unified theorem is easiest to cache per chord-junction; the recurrence is easiest to evaluate for very long chains. See §8.6 §4.
+
 **This is a re-derivation of a classical result** (Noy & Ribò 2007,
 [Linear Recurrence Relations for Graph Polynomials][noy-ribo]). Our
 contribution is:

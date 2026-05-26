@@ -191,25 +191,35 @@ class BaseMultigraphSynthesizer:
             self._fast_hash_set.add(fh)
             return sp_poly
 
-        # (April 2026): recursive hierarchical for simple
-        # multigraphs with enough edges. Chord-rule LEAVES often have cell
-        # structure (Z(1,1) inside a Z(1,2)-leaf, Cm1 inside a Cm2-leaf,
-        # etc.) that decomposes via hierarchical tiling much faster than
-        # treewidth_dp's per-leaf cost (~168s at tw=10, ~207s at tw=11).
-        # Only the SynthesisEngine subclass has `_try_hierarchical`; other
-        # multigraph synthesizers (e.g. test stubs) skip this step via the
-        # hasattr check.
+        # Cell-decomposition-only chord-peel for simple multigraph
+        # contractions. Chord-rule LEAVES occasionally have cell structure
+        # (Z(1,1) inside a Z(1,2)-leaf, Cm1 inside a Cm2-leaf) that
+        # decomposes via the merged dispatcher faster than treewidth_dp.
+        # We pass `skip_atoms=True` so only the gated cell discovery
+        # fires — atom discovery would succeed on almost every contraction
+        # and cascade chord-rule indefinitely (each contraction →
+        # _synthesize_multigraph → here → another chord-peel → more
+        # contractions...). The legacy `_try_hierarchical` got this gate
+        # for free because cell partition discovery rarely matched a
+        # contracted intermediate; the merged dispatcher's atom path is
+        # too eager, so we explicitly suppress it here. Only the
+        # SynthesisEngine subclass has this method; other multigraph
+        # synthesizers (e.g. test stubs) skip via the hasattr check.
         if (
             mg.is_simple()
             and mg.edge_count() >= 20
-            and hasattr(self, '_try_hierarchical')
+            and hasattr(self, '_try_decomposition_chord_peel')
         ):
             simple = mg.to_simple_graph()
             if simple is not None:
-                hier_result = self._try_hierarchical(simple, max_depth)
+                hier_result = self._try_decomposition_chord_peel(
+                    simple, max_depth,
+                    recurse_residue=False,
+                    skip_atoms=True,
+                )
                 if hier_result is not None:
                     self._log(
-                        f"Hierarchical (multigraph leaf): "
+                        f"Decomposition+peel (multigraph leaf): "
                         f"{mg.node_count()}n {mg.edge_count()}e"
                     )
                     if cache_key is None:
@@ -221,9 +231,12 @@ class BaseMultigraphSynthesizer:
                     return hier_result.polynomial
 
         # 4.7 Treewidth-based O(n · B(w+1)²) computation
-        # max_width=11: supports up to Chimera(2) graphs (tw=11).
-        # Parent grouping reduces _poly_mul calls from B(w+1)² to B(w)² per merge.
-        tw_poly = compute_treewidth_tutte_if_applicable(mg, max_width=11)
+        # max_width=10: matches engine.py:999 + hybrid.py:640 gate.
+        # Python tw_dp at tw=11 takes 3-10+ min on n=40 graphs; the
+        # C-ext is gated 5 <= tw <= 10. For multigraph contractions
+        # produced during chord-rule, falling through to chord-rule
+        # recursion is faster than Python tw_dp at tw=11.
+        tw_poly = compute_treewidth_tutte_if_applicable(mg, max_width=10)
         if tw_poly is not None:
             self._log(f"Treewidth-based: {mg.node_count()} nodes, {mg.edge_count()} edges")
             if cache_key is None:

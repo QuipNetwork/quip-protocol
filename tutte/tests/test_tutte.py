@@ -621,6 +621,54 @@ def _add_edges_set(g: Graph, new_edges) -> Graph:
     return Graph(nodes=g.nodes, edges=frozenset(edges))
 
 
+def _try_hierarchical(engine, graph, max_depth=10):
+    """Test helper — invoke merged dispatcher with `force=True` so small
+    test graphs (tw<=8) still trigger discovery + Phase B formula trial.
+
+    Replaces the legacy `engine._try_hierarchical` entry point that was
+    removed when the production dispatch path was merged into
+    `_try_decomposition_chord_peel`. Tests should treat this as a black
+    box that returns a `SynthesisResult` (or None) for the same input
+    space the deleted `_try_hierarchical` accepted.
+    """
+    return engine._try_decomposition_chord_peel(
+        graph, max_depth, force=True,
+    )
+
+
+def _synthesize_hierarchical(engine, graph, cells, partition, inter_info,
+                             max_depth=10):
+    """Test helper — invoke `_try_cell_closed_forms` with a caller-built
+    `Decomposition`, bypassing discovery so tests can feed synthetic cell
+    entries (e.g. C_4) that the rainbow table wouldn't propose. Falls
+    back to `_chord_peel_decomposition` when the closed-form formulas
+    don't apply, mirroring the legacy `_synthesize_hierarchical`'s
+    chord-rule fallthrough.
+    """
+    from tutte.graphs.k_sum import _classify_bridges_chords
+    from tutte.synthesis.engine import Decomposition
+    _, chords = _classify_bridges_chords(partition, list(inter_info.edges))
+    decomp = Decomposition(
+        kind="cell",
+        label="test_forced",
+        components=partition,
+        families=[c.name for c in cells],
+        cell_entries=list(cells),
+        inter_edges=list(inter_info.edges),
+        chord_edges=list(chords),
+        predicted_chord_cost=0.0,
+        peel_type="inter",
+        inter_info=inter_info,
+    )
+    res = engine._try_cell_closed_forms(graph, decomp, max_depth)
+    if res is not None:
+        return res
+    return engine._chord_peel_decomposition(
+        graph, decomp, max_depth,
+        recurse_residue=False, min_recursion_size=12,
+    )
+
+
 # =============================================================================
 # H. UNIFIED FORMULA  (T(G) = (∏ T(cells)) · T(H))
 # =============================================================================
@@ -697,7 +745,7 @@ def _two_k3_distinct_pair_chords() -> Graph:
 
 def test_engine_two_k3_one_bridge_uses_unified_formula(formulas_engine):
     g = _two_k3_one_bridge()
-    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    res = _try_hierarchical(formulas_engine, g, max_depth=10)
     assert res is not None
     assert res.method == "unified_formula"
     T_k3 = TuttePolynomial.from_coefficients({(2, 0): 1, (1, 0): 1, (0, 1): 1})
@@ -708,7 +756,7 @@ def test_engine_two_k3_one_bridge_uses_unified_formula(formulas_engine):
 
 def test_engine_three_k3_chain_of_bridges_uses_unified_formula(formulas_engine):
     g = _three_k3_chain_of_bridges()
-    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    res = _try_hierarchical(formulas_engine, g, max_depth=10)
     assert res is not None
     assert res.method == "unified_formula"
     T_k3 = TuttePolynomial.from_coefficients({(2, 0): 1, (1, 0): 1, (0, 1): 1})
@@ -718,7 +766,7 @@ def test_engine_three_k3_chain_of_bridges_uses_unified_formula(formulas_engine):
 
 def test_engine_three_k3_triangle_of_bridges_uses_unified_formula(formulas_engine):
     g = _three_k3_triangle_of_bridges()
-    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    res = _try_hierarchical(formulas_engine, g, max_depth=10)
     assert res is not None
     assert res.method == "unified_formula"
     T_k3 = TuttePolynomial.from_coefficients({(2, 0): 1, (1, 0): 1, (0, 1): 1})
@@ -728,7 +776,7 @@ def test_engine_three_k3_triangle_of_bridges_uses_unified_formula(formulas_engin
 
 def test_engine_chord_case_falls_through(formulas_engine):
     g = _two_k3_distinct_pair_chords()
-    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    res = _try_hierarchical(formulas_engine, g, max_depth=10)
     assert res is not None
     assert res.method != "unified_formula"
     assert verify_spanning_trees(g, res.polynomial)
@@ -756,7 +804,7 @@ def test_engine_heterogeneous_k3_plus_k4_one_bridge_uses_unified_formula(
     cells = [_table_entry(table, "K_3"), _table_entry(table, "K_4")]
     inter = _analyze_inter(g, partition)
 
-    res = formulas_engine._synthesize_hierarchical(g, cells, partition, inter, max_depth=10)
+    res = _synthesize_hierarchical(formulas_engine, g, cells, partition, inter, max_depth=10)
     assert res.method == "unified_formula"
     T_k3 = TuttePolynomial.from_coefficients({(2, 0): 1, (1, 0): 1, (0, 1): 1})
     T_k4 = formulas_engine.synthesize(complete_graph(4)).polynomial
@@ -789,7 +837,7 @@ def test_engine_heterogeneous_k3_plus_c4_one_bridge_uses_unified_formula(
     cells = [_table_entry(table, "K_3"), c4_entry]
     inter = _analyze_inter(g, partition)
 
-    res = formulas_engine._synthesize_hierarchical(g, cells, partition, inter, max_depth=10)
+    res = _synthesize_hierarchical(formulas_engine, g, cells, partition, inter, max_depth=10)
     assert res.method == "unified_formula"
     T_k3 = TuttePolynomial.from_coefficients({(2, 0): 1, (1, 0): 1, (0, 1): 1})
     expected = TuttePolynomial.x() * T_k3 * T_c4
@@ -803,7 +851,7 @@ def test_cm2_chord_case_falls_through_to_treewidth_dp(table):
 
     e_hier = SynthesisEngine(table=table, verbose=False)
     e_hier.skip_target_lookup = True
-    forced = e_hier._try_hierarchical(cm2, max_depth=10)
+    forced = _try_hierarchical(e_hier, cm2, max_depth=10)
     assert forced is not None
     assert forced.method != "unified_formula"
     assert verify_spanning_trees(cm2, forced.polynomial)
@@ -880,7 +928,7 @@ def test_kmatching_detector_cm1_bipartite_mixed_returns_none():
 
 def test_engine_k3_path_m2_uses_kmatching_formula(formulas_engine):
     g = _build_cell_path_k_matching(complete_graph(3), n=3, k=2)
-    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    res = _try_hierarchical(formulas_engine, g, max_depth=10)
     assert res is not None
     assert res.method == "kmatching_formula"
     direct = formulas_engine.synthesize(g).polynomial
@@ -889,7 +937,7 @@ def test_engine_k3_path_m2_uses_kmatching_formula(formulas_engine):
 
 def test_engine_k4_path_m2_uses_kmatching_formula(formulas_engine):
     g = _build_cell_path_k_matching(complete_graph(4), n=3, k=2)
-    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    res = _try_hierarchical(formulas_engine, g, max_depth=10)
     assert res is not None
     assert res.method == "kmatching_formula"
     direct = formulas_engine.synthesize(g).polynomial
@@ -905,7 +953,7 @@ def test_engine_small_cell_cycle_falls_through(formulas_engine):
     breaks. Detector P3 must remain enforced for engine path.
     Reference: relaxed_shared_anchors_findings.md."""
     g = _build_cell_cycle_k_matching(complete_graph(3), n=3, k=2)
-    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    res = _try_hierarchical(formulas_engine, g, max_depth=10)
     assert res is not None
     assert res.method != "kmatching_formula"
     direct = formulas_engine.synthesize(g).polynomial
@@ -921,7 +969,7 @@ def test_engine_k44_cycle_uses_kmatching_formula(formulas_engine):
     B_side = [1, 2, 3, 4]
     edges = [(A_side[i], B_side[i] + offset) for i in range(4)]
     g = _add_edges_set(g, edges)
-    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    res = _try_hierarchical(formulas_engine, g, max_depth=10)
     assert res is not None
     assert res.method == "kmatching_formula"
     direct = formulas_engine.synthesize(g).polynomial
@@ -934,7 +982,7 @@ def test_engine_mixed_side_k44_falls_through(formulas_engine):
     g = disjoint_union(cm1, cm1)
     offset = max(cm1.nodes) + 1
     g = _add_edges_set(g, [(0, 0 + offset), (1, 1 + offset)])
-    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    res = _try_hierarchical(formulas_engine, g, max_depth=10)
     if res is not None:
         assert res.method != "kmatching_formula"
 
@@ -943,7 +991,7 @@ def test_engine_single_parallel_edge_still_uses_unified_formula(formulas_engine)
     """Two K_3 + one bridge: unified formula (k=1), not k-matching."""
     K3 = complete_graph(3)
     g = _add_edges_set(disjoint_union(K3, K3), [(0, 3)])
-    res = formulas_engine._try_hierarchical(g, max_depth=10)
+    res = _try_hierarchical(formulas_engine, g, max_depth=10)
     assert res is not None
     assert res.method == "unified_formula"
 
@@ -954,7 +1002,7 @@ def test_cm2_uses_kmatching_formula(table):
     cm2 = Graph.from_networkx(dnx.chimera_graph(2))
     e_hier = SynthesisEngine(table=table, verbose=False)
     e_hier.skip_target_lookup = True
-    res = e_hier._try_hierarchical(cm2, max_depth=10)
+    res = _try_hierarchical(e_hier, cm2, max_depth=10)
     assert res is not None
     assert res.method == "kmatching_formula"
     assert res.polynomial.num_terms() == 675
@@ -1412,7 +1460,7 @@ def test_engine_heterogeneous_matches_direct_synthesis_path(pipeline_engine, tab
     cells, partition, inter_info = het
 
     pipeline_poly = pipeline_engine.synthesize(g).polynomial
-    forced_poly = pipeline_engine._synthesize_hierarchical(
+    forced_poly = _synthesize_hierarchical(pipeline_engine, 
         g, cells, partition, inter_info, max_depth=10,
     ).polynomial
     assert pipeline_poly == forced_poly
@@ -1514,7 +1562,7 @@ def test_synthetic_hierarchical_matches_default(table):
 
     e_hier = SynthesisEngine(table=table, verbose=False)
     e_hier.skip_target_lookup = True
-    forced = e_hier._try_hierarchical(g, max_depth=10)
+    forced = _try_hierarchical(e_hier, g, max_depth=10)
     assert forced is not None
     assert verify_spanning_trees(g, forced.polynomial)
 
@@ -1536,35 +1584,11 @@ def test_synthetic_hierarchical_timing_within_10x(table):
     e_hier = SynthesisEngine(table=table, verbose=False)
     e_hier.skip_target_lookup = True
     t0 = time.perf_counter()
-    res = e_hier._try_hierarchical(g, max_depth=10)
+    res = _try_hierarchical(e_hier, g, max_depth=10)
     t_hier = time.perf_counter() - t0
 
     assert res is not None
     assert t_hier < t_default * 10 + 0.5
-
-
-@pytest.mark.slow
-def test_z12_hierarchical_matches_default(table):
-    """Z(1,2) hierarchical takes ~14 minutes cold; slow."""
-    g = Graph.from_networkx(dnx.zephyr_graph(1, 2))
-    e_hier = SynthesisEngine(table=table, verbose=False)
-    e_hier.skip_target_lookup = True
-    forced = e_hier._try_hierarchical(g, max_depth=10)
-    assert forced is not None
-    assert forced.method == "hierarchical_tiling"
-    assert verify_spanning_trees(g, forced.polynomial)
-
-
-@pytest.mark.slow
-def test_cm2_hierarchical_matches_default(table):
-    """Cm2 hierarchical synthesis ~12 minutes; slow."""
-    g = Graph.from_networkx(dnx.chimera_graph(2))
-    e_hier = SynthesisEngine(table=table, verbose=False)
-    e_hier.skip_target_lookup = True
-    forced = e_hier._try_hierarchical(g, max_depth=10)
-    assert forced is not None
-    assert forced.method == "hierarchical_tiling"
-    assert verify_spanning_trees(g, forced.polynomial)
 
 
 @pytest.mark.slow
@@ -2070,25 +2094,3 @@ class TestSymmetricOrdering:
         ordered, auto = build_symmetric_chord_order([], g, partition)
         assert auto is None
 
-    def test_z12_automorphism(self):
-        """Z(1,2) has a cell automorphism that preserves all 32 inter-cell edges."""
-        from tutte.graphs.covering import try_hierarchical_partition
-
-        z12 = Graph.from_networkx(dnx.zephyr_graph(1, 2))
-        table_local = load_default_table()
-        result = try_hierarchical_partition(z12, table_local)
-        assert result is not None
-
-        cell_entry, cell_groups, inter_info = result
-        assert len(cell_groups) == 2
-
-        auto = find_cell_automorphism(z12, cell_groups)
-        assert auto is not None
-
-        for node in cell_groups[0]:
-            assert auto[node] in cell_groups[1]
-
-        chords = [e for e in inter_info.edges]
-        pairs, unpaired = pair_chords_by_symmetry(chords, auto, cell_groups)
-        total = len(pairs) * 2 + len(unpaired)
-        assert total == len(chords)

@@ -574,7 +574,8 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
              "poly_mismatch": 0}
 
     hdr = (f"{'#':>5} {'Graph':<20} {'N':>3} {'M':>3} {'Trees':>14} "
-           f"{'CEJ':>10} {'Hybrid':>10} {'NetworkX':>10}")
+           f"{'CEJ':>10} {'CEJ method':<32} "
+           f"{'Hybrid':>10} {'Hybrid method':<32} {'NetworkX':>10}")
     print(f"Benchmarking {len(graphs)} graphs (3 engines, empty tables)")
     print(hdr)
     print("-" * len(hdr))
@@ -585,9 +586,16 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
     hybrid_max_solved = 0
     nx_max_solved = 0
 
+    import sys as _sys
     for idx, (name, graph) in enumerate(graphs, 1):
         n, m = graph.node_count(), graph.edge_count()
         G_nx = graph.to_networkx()
+
+        # Hang indicator: print "starting" line BEFORE any synth so we see
+        # exactly which graph is in flight if the harness hangs. Written to
+        # stderr to keep stdout clean for downstream parsers.
+        print(f"  [start {idx:>5}] {name:<22} n={n:>3} m={m:>3}",
+              file=_sys.stderr, flush=True)
 
         # Ground truth via Kirchhoff — only compute if we'll attempt synthesis
         # (avoids expensive exact determinant on huge unsolvable graphs)
@@ -686,8 +694,19 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
         hybrid_col = _fmt(hybrid_ms) if hybrid_status == "OK" else hybrid_status
         nx_col = _fmt(nx_ms) if nx_ok else nx_status
 
+        # Method labels (truncated for column width; full method in JSON).
+        cej_method = (
+            getattr(cej_result, "method", "?") if cej_ok else "-"
+        )
+        hybrid_method = (
+            getattr(hybrid_result, "method", "?") if hybrid_ok else "-"
+        )
+        cej_method_col = (cej_method or "?")[:30]
+        hybrid_method_col = (hybrid_method or "?")[:30]
+
         print(f"{idx:>5} {name:<20} {n:>3} {m:>3} {trees_str:>14} "
-              f"{cej_col:>10} {hybrid_col:>10} {nx_col:>10}",
+              f"{cej_col:>10} {cej_method_col:<32} "
+              f"{hybrid_col:>10} {hybrid_method_col:<32} {nx_col:>10}",
               flush=True)
 
         results.append({
@@ -704,6 +723,10 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
                 "cej": cej_status,
                 "hybrid": hybrid_status,
                 "networkx": nx_status,
+            },
+            "method": {
+                "cej": cej_method if cej_ok else None,
+                "hybrid": hybrid_method if hybrid_ok else None,
             },
             "polynomial_match": poly_match,
         })
@@ -741,6 +764,65 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
             return sum(lst) / len(lst) if lst else None
         print(f"{m:>5} {b['count']:>5}  "
               f"{_fmt(avg(b['cej'])):>10} {_fmt(avg(b['hybrid'])):>10} {_fmt(avg(b['nx'])):>10}")
+
+    # ------------------------------------------------------------------
+    # Method-firing breakdown — answers "which dispatch paths actually
+    # carry the load" and "where are hybrid + CEJ diverging".
+    # ------------------------------------------------------------------
+    from collections import Counter
+    cej_methods = Counter(
+        r["method"]["cej"] for r in results if r["method"]["cej"]
+    )
+    hybrid_methods = Counter(
+        r["method"]["hybrid"] for r in results if r["method"]["hybrid"]
+    )
+    cej_by_method_time = {}
+    hybrid_by_method_time = {}
+    for r in results:
+        cm = r["method"]["cej"]; ct = r["timings_ms"]["synthesis_cej"]
+        hm = r["method"]["hybrid"]; ht = r["timings_ms"]["synthesis_hybrid"]
+        if cm and ct is not None:
+            cej_by_method_time.setdefault(cm, []).append(ct)
+        if hm and ht is not None:
+            hybrid_by_method_time.setdefault(hm, []).append(ht)
+
+    print(f"\n--- Method-firing breakdown (CEJ engine) ---")
+    print(f"{'Method':<40} {'Count':>6} {'Avg ms':>10} {'Max ms':>10}")
+    print("-" * 70)
+    for method, count in cej_methods.most_common():
+        times = cej_by_method_time.get(method, [])
+        avg = sum(times) / len(times) if times else 0
+        mx = max(times) if times else 0
+        print(f"{method:<40} {count:>6} {avg:>10.1f} {mx:>10.1f}")
+
+    print(f"\n--- Method-firing breakdown (Hybrid engine) ---")
+    print(f"{'Method':<40} {'Count':>6} {'Avg ms':>10} {'Max ms':>10}")
+    print("-" * 70)
+    for method, count in hybrid_methods.most_common():
+        times = hybrid_by_method_time.get(method, [])
+        avg = sum(times) / len(times) if times else 0
+        mx = max(times) if times else 0
+        print(f"{method:<40} {count:>6} {avg:>10.1f} {mx:>10.1f}")
+
+    # CEJ vs Hybrid method divergence — which graphs the two engines
+    # route differently. Useful for "is hybrid actually different?"
+    divergent = [
+        r for r in results
+        if r["method"]["cej"] and r["method"]["hybrid"]
+        and r["method"]["cej"] != r["method"]["hybrid"]
+    ]
+    if divergent:
+        print(f"\n--- CEJ vs Hybrid method divergence ({len(divergent)} graphs) ---")
+        print(f"{'Graph':<20} {'M':>3} {'CEJ method':<32} {'Hybrid method':<32}")
+        print("-" * 90)
+        for r in divergent[:20]:
+            print(f"{r['name']:<20} {r['edges']:>3} "
+                  f"{(r['method']['cej'] or '?')[:30]:<32} "
+                  f"{(r['method']['hybrid'] or '?')[:30]:<32}")
+        if len(divergent) > 20:
+            print(f"... and {len(divergent) - 20} more")
+    else:
+        print("\n--- CEJ vs Hybrid: no method divergence ---")
 
     sys.stdout.flush()
     return results, cej_table, hybrid_engine, cej_engine
@@ -792,6 +874,28 @@ def compare_results(file1, file2):
                 geo_mean *= s
             geo_mean **= (1 / len(speedups))
             print(f"Geometric mean speedup: {geo_mean:.2f}x over {len(speedups)} graphs")
+
+    # Method-change report: which graphs now route through a different
+    # dispatch path. Even when wall time is unchanged, a route change
+    # is a flag worth surfacing (e.g. a new fast path firing).
+    for engine_label in ("cej", "hybrid"):
+        method_changes = []
+        for name in common:
+            r1, r2 = results1[name], results2[name]
+            m1 = (r1.get("method") or {}).get(engine_label)
+            m2 = (r2.get("method") or {}).get(engine_label)
+            if m1 and m2 and m1 != m2:
+                method_changes.append((name, r1["edges"], m1, m2))
+        if method_changes:
+            print(f"\n--- {engine_label.upper()} method changes "
+                  f"({len(method_changes)} graphs) ---")
+            print(f"{'Graph':<20} {'M':>3}  {b1[:25]:<26} -> {b2[:25]:<26}")
+            print("-" * 80)
+            for name, m, old, new in method_changes[:30]:
+                print(f"{name:<20} {m:>3}  "
+                      f"{(old or '?')[:24]:<26} -> {(new or '?')[:24]:<26}")
+            if len(method_changes) > 30:
+                print(f"... and {len(method_changes) - 30} more")
 
 
 # ---------------------------------------------------------------------------

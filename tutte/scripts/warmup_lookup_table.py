@@ -87,6 +87,15 @@ TARGETS = [
     ("Cm3", lambda: dnx.chimera_graph(3)),       # 72n 192e — runs only with --target Cm3 + a large --timeout
     ("Pm2", lambda: dnx.pegasus_graph(2)),
 
+    # Cm(m, n) rectangular variants — share intermediate canonical_keys
+    # with square Cm_m via the engine's recursive synthesize() cache.
+    # Warming populates lookup so Cm(2,2)/Cm(3,3) syntheses can hit
+    # cached substructures from Cm(1,2)/Cm(2,3) syntheses.
+    ("Cm1_2", lambda: dnx.chimera_graph(1, 2)),  # 16n 36e
+    ("Cm1_3", lambda: dnx.chimera_graph(1, 3)),  # 24n 56e
+    ("Cm1_4", lambda: dnx.chimera_graph(1, 4)),  # 32n 76e
+    ("Cm2_3", lambda: dnx.chimera_graph(2, 3)),  # 48n 124e — slow cold; consider --target gating
+
     # Cograph atom polynomials (May 2026) — fast via cotree_dp (<1s each)
     # and ESSENTIAL for AlgebraicSynthesisEngine.find_factors_of(target),
     # which can only find factors that are atoms in the rainbow table.
@@ -292,6 +301,28 @@ def main() -> int:
         f"{bin_path} ({bin_size} bytes).",
         file=sys.stderr,
     )
+
+    # Also populate the multigraph cache with chord-peel intermediates.
+    # `warmup_chord_peel_cache` runs Z(1,2)-class targets through the
+    # merged dispatcher with `promote_cache_on_finish=True`, so every
+    # contraction multigraph produced by chord-rule gets merged into
+    # `tutte/data/multigraph_lookup_table.{bin,json}`. Without this step
+    # the heterogeneous chord-peel path on Z(1,2) takes 150s cold; with
+    # cached intermediates, both legacy and het paths drop to ~1.1s.
+    if not args.dry_run:
+        try:
+            from .warmup_chord_peel_cache import main as _chord_peel_main
+            print("\n=== Populating chord-peel multigraph cache ===",
+                  file=sys.stderr)
+            _orig_argv = sys.argv
+            sys.argv = ["warmup_chord_peel_cache", "--mode", "both"]
+            try:
+                _chord_peel_main()
+            finally:
+                sys.argv = _orig_argv
+        except Exception as e:
+            print(f"  chord-peel cache warmup failed: {e}", file=sys.stderr)
+
     return 0
 
 

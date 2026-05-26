@@ -1,5 +1,14 @@
 # 8.4 Cross-Cell Chord-Peel
 
+> **MERGED** (May 23, 2026): the standalone `_try_cross_cell_chord_peel`
+> and `_try_clique_atom_chord_peel` dispatchers have been folded into
+> `_try_decomposition_chord_peel`
+> ([8.5 Decomposition + Chord-Peel — Unified Dispatcher](08_5_decomposition_chord_peel.md)).
+> This document remains as the conceptual reference for why peeling
+> small inter-atom junctions is faster than peeling internal-clique
+> edges. The legacy methods are still on disk behind
+> `TUTTE_USE_LEGACY_DISPATCH=1` for debugging.
+
 Peel the **smallest connected inter-atom junction** edge set, not internal
 clique edges, when a graph decomposes into disjoint named-family atoms
 (K_n, K_{a,b}, …) connected by small bipartite junctions.

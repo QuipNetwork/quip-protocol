@@ -246,6 +246,32 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
             self._record_synth(graph, cache_key)
             return result
 
+        # 1.5 Transfer matrix for periodic lattice strips — mirrors engine
+        # step 1.5. O(V+E) detection + C-accelerated sweep over non-crossing
+        # partition states. Handles grid (m > 2), triangular, honeycomb,
+        # square-octagon, elongated-triangular strips. Returns None on
+        # non-lattice inputs. Known regression class: wider grids
+        # (width ≥ 6) where Catalan(w)² > 2^tw — a width-aware gate is
+        # a separate follow-up that should be applied to BOTH engines.
+        try:
+            from ..transfer_matrix import compute_tutte_via_transfer_matrix
+            tm_poly = compute_tutte_via_transfer_matrix(graph)
+            if tm_poly is not None:
+                _log.record(EventType.SYNTHESIS_START, "hybrid",
+                            f"Transfer matrix: {n}n {m}e", LogLevel.INFO,
+                            graph=graph)
+                self._log(f"Transfer matrix: O(V+E) detection + sweep")
+                result = HybridSynthesisResult(
+                    polynomial=tm_poly,
+                    method="transfer_matrix",
+                    recipe=["Transfer matrix"],
+                    verified=True,
+                )
+                self._cache[cache_key] = result
+                return result
+        except Exception:
+            pass
+
         # 2. Direct rainbow table lookup (optionally skipped at top-level).
         is_top_call = self._synth_depth == 1
         if not (is_top_call and self.skip_target_lookup):
@@ -296,9 +322,179 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
             _log.record(EventType.FACTORIZE, "hybrid",
                         f"Disconnected: {len(components)} components",
                         graph=graph)
+            # Per-component snapshot + provenance for the visualizer.
+            self._structural_engine._emit_subgraph_provenance(
+                graph, [c.nodes for c in components], EventType.FACTORIZE,
+                lambda i, vs: f"Connected component {i + 1}: {len(vs)}v",
+            )
             result = self._synthesize_disconnected(components, max_depth)
             self._cache[cache_key] = result
             return result
+
+        # 3.5. Block-cut / cut-vertex factorization.
+        # T(G) = ∏ T(block_i) for biconnected blocks. Structure gate:
+        #   - 0 articulation points  → biconnected, skip (try 2-sum next)
+        #   - 1 articulation point   → use cut_vertex (single split, cheapest)
+        #   - 2+ articulation points → use block-cut (one pass for all
+        #                              blocks; subsumes recursive cut_vertex)
+        try:
+            import networkx as _nx
+            nxg = graph.to_networkx()
+            arts = list(_nx.articulation_points(nxg))
+        except Exception:
+            arts = []
+        if len(arts) >= 2:
+            # Block-cut decomposition: one pass, all blocks at once.
+            blocks = list(_nx.biconnected_components(nxg))
+            _log.record(EventType.FACTORIZE, "hybrid",
+                        f"Block-cut: {len(blocks)} blocks, "
+                        f"{len(arts)} articulation points", graph=graph)
+            # Per-block snapshot + provenance via shared engine helper.
+            self._structural_engine._emit_subgraph_provenance(
+                graph, blocks, EventType.FACTORIZE,
+                lambda i, vs: f"Block {i + 1}: {len(vs)}v",
+            )
+            self._log(f"Block-cut decomposition: {len(blocks)} blocks")
+            poly = TuttePolynomial.one()
+            recipe = [
+                f"Block-cut decomposition: {len(blocks)} biconnected blocks, "
+                f"{len(arts)} articulation points"
+            ]
+            all_minors: Set[str] = set()
+            for i, block_vs in enumerate(blocks):
+                # Each block is a set of vertices; induced subgraph is biconnected.
+                block_subgraph = Graph(
+                    nodes=frozenset(block_vs),
+                    edges=frozenset(
+                        (min(u, v), max(u, v))
+                        for (u, v) in graph.edges
+                        if u in block_vs and v in block_vs
+                    ),
+                )
+                comp_result = self.synthesize(block_subgraph, max_depth)
+                poly = poly * comp_result.polynomial
+                recipe.append(
+                    f"  Block {i + 1} ({len(block_vs)} verts): "
+                    f"{comp_result.polynomial}"
+                )
+                all_minors |= comp_result.minors_used
+            result = HybridSynthesisResult(
+                polynomial=poly,
+                method="block_cut",
+                recipe=recipe,
+                verified=True,
+                minors_used=all_minors,
+            )
+            self._cache[cache_key] = result
+            return result
+        if len(arts) == 1:
+            # Single articulation point — recursive cut_vertex is the simple path.
+            cut = arts[0]
+            _log.record(EventType.FACTORIZE, "hybrid",
+                        f"Cut vertex at {cut}", graph=graph)
+            self._log(f"Cut vertex factorization at node {cut}")
+            cut_components = graph.split_at_cut_vertex(cut)
+            # Per-component snapshot + provenance for the visualizer.
+            self._structural_engine._emit_subgraph_provenance(
+                graph, [c.nodes for c in cut_components], EventType.FACTORIZE,
+                lambda i, vs: f"Cut-vertex component {i + 1}: {len(vs)}v",
+            )
+            poly = TuttePolynomial.one()
+            recipe = [
+                f"Cut vertex factorization at node {cut}: "
+                f"{len(cut_components)} components"
+            ]
+            all_minors: Set[str] = set()
+            for i, comp in enumerate(cut_components):
+                comp_result = self.synthesize(comp, max_depth)
+                poly = poly * comp_result.polynomial
+                recipe.append(f"  Component {i + 1}: {comp_result.polynomial}")
+                all_minors |= comp_result.minors_used
+            result = HybridSynthesisResult(
+                polynomial=poly,
+                method="cut_vertex",
+                recipe=recipe,
+                verified=True,
+                minors_used=all_minors,
+            )
+            self._cache[cache_key] = result
+            return result
+
+        # 3.7. Early 2-sum / SPQR-style decomposition for biconnected graphs.
+        # Strict superset of cut_vertex: catches 2-vertex separators (cycles
+        # glued at an edge, K_4 with hanging edge, etc.) that have no single
+        # articulation point.
+        #
+        # Gate (in cheap-first order to avoid per-graph overhead):
+        #   1. m ≥ 80 (cheap) — small graphs are handled cheaply by the
+        #      downstream cascade (treewidth_dp finishes in <100ms for
+        #      tw≤10). Without this gate, the per-graph node_connectivity
+        #      + treewidth_min_degree probes (each ~10-50ms on n=20..60
+        #      graphs) regressed Z(1,2)_inter (25→65ms) and Grid_6x6
+        #      (118→299ms). Pm2 (m=164) and other m≥80 graphs are the
+        #      only realistic 2-cut candidates anyway.
+        #   2. graph is biconnected (already known: arts == [])
+        #   3. node_connectivity == 2 (cheap O(V·E) max-flow probe)
+        #   4. treewidth upper bound > 8 — defer to tw_dp on low-tw graphs.
+        if (graph.edge_count() >= 80
+                and graph.node_count() >= 6
+                and not arts):
+            try:
+                import networkx as _nx
+                _nxg = graph.to_networkx()
+                kappa = _nx.node_connectivity(_nxg)
+            except Exception:
+                kappa = 0
+            invoke_ksum = False
+            if kappa == 2:
+                try:
+                    from networkx.algorithms.approximation import (
+                        treewidth_min_degree,
+                    )
+                    tw_upper, _ = treewidth_min_degree(_nxg)
+                    invoke_ksum = tw_upper > 8
+                except Exception:
+                    invoke_ksum = False
+            if invoke_ksum:
+                try:
+                    ksum_result = self._structural_engine._try_ksum_decomposition(
+                        graph,
+                    )
+                except Exception:
+                    ksum_result = None
+                if ksum_result is not None:
+                    _log.record(EventType.FACTORIZE, "hybrid",
+                                f"Early 2-sum: "
+                                f"{graph.node_count()}n {graph.edge_count()}e",
+                                graph=graph)
+                    # Per-side snapshot + provenance via shared engine helper.
+                    try:
+                        sep = set(_nx.minimum_node_cut(_nxg))
+                        residual = _nxg.copy()
+                        residual.remove_nodes_from(sep)
+                        sides = [
+                            set(c) | sep
+                            for c in _nx.connected_components(residual)
+                        ]
+                        self._structural_engine._emit_subgraph_provenance(
+                            graph, sides, EventType.FACTORIZE,
+                            lambda i, vs: (
+                                f"2-sum side {i + 1}: {len(vs)}v "
+                                f"(incl. 2-separator)"
+                            ),
+                        )
+                    except Exception:
+                        pass
+                    self._log(f"Early 2-sum: {ksum_result.method}")
+                    result = HybridSynthesisResult(
+                        polynomial=ksum_result.polynomial,
+                        method=ksum_result.method,
+                        recipe=list(ksum_result.recipe),
+                        verified=ksum_result.verified,
+                        minors_used=ksum_result.minors_used,
+                    )
+                    self._cache[cache_key] = result
+                    return result
 
         # 4. Try structural decompositions (series-parallel, k-sum, hierarchical)
         if graph.edge_count() >= 6:
@@ -434,6 +630,59 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                 verified=True,
             )
 
+        # Cotree DP — subexponential exp(O(n^{2/3})) for cographs (P_4-free).
+        # Mirrors engine step 7.5. Wins on K_n for n ≥ 5 (K_12 alone is
+        # the difference between Hybrid timing out and completing in ~1.8s)
+        # and on D-Wave K_{4,4} cells. Fast no-op on non-cographs.
+        try:
+            from ..cotree_dp import compute_tutte_cotree_dp
+            cotree_poly = compute_tutte_cotree_dp(graph)
+            if cotree_poly is not None:
+                _log.record(EventType.COTREE_DP, "hybrid",
+                            f"Cotree DP: {graph.node_count()}n {graph.edge_count()}e",
+                            graph=graph)
+                self._log(f"Cotree DP: {graph.node_count()}n, "
+                          f"{graph.edge_count()}e")
+                return HybridSynthesisResult(
+                    polynomial=cotree_poly,
+                    method="cotree_dp",
+                    recipe=["Cotree-based DP (subexponential cograph)"],
+                    verified=True,
+                )
+        except (ValueError, TypeError):
+            pass
+
+        # Almost-cograph DP — for graphs that become cographs after
+        # removing ≤ 16 anomaly edges (e.g. D-Wave cells joined by
+        # sparse inter-cell edges). Mirrors engine step 7.6.
+        #
+        # Gate: n ≤ 20. The probe is ~50ms even when it returns None
+        # (greedy P_4 elimination on n=24 graphs). For n > 20, defer
+        # to downstream paths (treewidth_dp will handle low-tw cases
+        # in ms). Regressed Z(1,2)_inter (n=24) 25ms → 65ms before
+        # this gate.
+        if graph.node_count() <= 20:
+            try:
+                from ..cotree_dp import compute_tutte_almost_cograph
+                almost_poly = compute_tutte_almost_cograph(
+                    graph, self._structural_engine, max_anomalies=16,
+                )
+                if almost_poly is not None:
+                    _log.record(EventType.COTREE_DP, "hybrid",
+                                f"Almost-cograph DP: "
+                                f"{graph.node_count()}n {graph.edge_count()}e",
+                                graph=graph)
+                    self._log(f"Almost-cograph DP: {graph.node_count()}n, "
+                              f"{graph.edge_count()}e")
+                    return HybridSynthesisResult(
+                        polynomial=almost_poly,
+                        method="almost_cograph",
+                        recipe=["Almost-cograph DP (greedy P_4 elim + chord rule)"],
+                        verified=True,
+                    )
+            except Exception:
+                pass
+
         engine = self._structural_engine
 
         # Formula shortcut (unified topology + k-matching closed forms),
@@ -461,6 +710,35 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                     tiles_used=formula_result.tiles_used,
                 )
 
+        # Cell-quotient grid DP (streamed) — mirrors engine step 7.45.
+        # For cell-decomposable graphs whose cell-quotient is a 2D grid of
+        # K_{a,b} cells with M_k matching connectors and DISJOINT per-
+        # direction anchors (Cm2 fits; Cm3 has shared anchors so this
+        # rejects and falls through). Cm2: ~27s vs the older
+        # cell_quotient_cycle_dp's 45s on the same target.
+        if graph.edge_count() >= 60:
+            try:
+                from ..roots import compute_cell_quotient_grid_dp_streamed
+                grid_poly = compute_cell_quotient_grid_dp_streamed(
+                    graph, engine.table,
+                )
+                if grid_poly is not None:
+                    _log.record(EventType.CELL_QUOTIENT_DP, "hybrid",
+                                f"Grid DP (streamed): "
+                                f"{graph.node_count()}n {graph.edge_count()}e",
+                                graph=graph)
+                    self._structural_engine._maybe_emit_cell_partition(graph)
+                    self._log(f"Cell-quotient grid DP (streamed): "
+                              f"{graph.node_count()}n, {graph.edge_count()}e")
+                    return HybridSynthesisResult(
+                        polynomial=grid_poly,
+                        method="cell_quotient_grid_dp_streamed",
+                        recipe=["Cell-quotient grid DP (streamed)"],
+                        verified=True,
+                    )
+            except Exception:
+                pass  # precondition miss or import error — fall through
+
         # Cell-quotient cycle DP (mirrors engine step 7.7) BEFORE treewidth_dp
         # so cycle-topology graphs win without paying the tw_dp cost.
         if graph.edge_count() >= 60:
@@ -474,6 +752,7 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                                 f"Cell-quotient cycle DP: "
                                 f"{graph.node_count()}n {graph.edge_count()}e",
                                 graph=graph)
+                    self._structural_engine._maybe_emit_cell_partition(graph)
                     self._log(f"Cell-quotient cycle DP: "
                               f"{graph.node_count()}n, {graph.edge_count()}e")
                     return HybridSynthesisResult(
@@ -495,6 +774,7 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                                 f"Cell-quotient tree DP: "
                                 f"{graph.node_count()}n {graph.edge_count()}e",
                                 graph=graph)
+                    self._structural_engine._maybe_emit_cell_partition(graph)
                     self._log(f"Cell-quotient tree DP: "
                               f"{graph.node_count()}n, {graph.edge_count()}e")
                     return HybridSynthesisResult(
@@ -521,6 +801,7 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                                 f"Cell-quotient bipartite-junction DP: "
                                 f"{graph.node_count()}n {graph.edge_count()}e",
                                 graph=graph)
+                    self._structural_engine._maybe_emit_cell_partition(graph)
                     self._log(f"Cell-quotient bipartite-junction DP: "
                               f"{graph.node_count()}n, {graph.edge_count()}e")
                     return HybridSynthesisResult(
@@ -553,6 +834,7 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                                 f"Cell-quotient bipartite-junction per-component DP: "
                                 f"{graph.node_count()}n {graph.edge_count()}e",
                                 graph=graph)
+                    self._structural_engine._maybe_emit_cell_partition(graph)
                     self._log(f"Cell-quotient bipartite-junction per-component DP: "
                               f"{graph.node_count()}n, {graph.edge_count()}e")
                     return HybridSynthesisResult(
@@ -576,6 +858,7 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                                 f"Cell-quotient hybrid DP: "
                                 f"{graph.node_count()}n {graph.edge_count()}e",
                                 graph=graph)
+                    self._structural_engine._maybe_emit_cell_partition(graph)
                     self._log(f"Cell-quotient hybrid DP: "
                               f"{graph.node_count()}n, {graph.edge_count()}e")
                     return HybridSynthesisResult(
@@ -587,74 +870,61 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
             except Exception:
                 pass
 
-        # Cross-cell chord-peel (mirrors engine step 7.88) — peel the
-        # SMALLEST inter-atom junction edge set rather than internal
-        # clique edges. Empirically much faster than internal peeling
-        # because chord rule cost is dominated by per-step sub-synth;
-        # fewer edges = fewer expensive sub-synths. Z(1,2): 4 inter-atom
-        # edges → ~47s vs ~95s with 12 internal edges.
-        # Gated to top-level synthesis (depth == 1) and small graphs
-        # (n ≤ 30) — see engine 7.88 + [[project_cross_cell_chord_peel]].
-        if (graph.edge_count() >= 60
-                and graph.node_count() <= 30
-                and self._synth_depth == 1):
+        # Unified decomposition + chord-peel (mirrors engine step 7.88) —
+        # replaces legacy cross-cell + clique-atom + hierarchical paths
+        # with a single dispatcher that discovers atom AND cell
+        # decompositions, tries cell-only closed forms (unified_formula
+        # / kmatching_formula / product_formula), then runs cost-gated
+        # chord-rule on the cheapest. Same gate as engine 7.88.
+        # Upper edge-count gate dropped — the dispatcher's cache-aware
+        # probe (engine.py Phase C) now decides per-graph whether to
+        # accept chord-peel based on whether the first trial contraction
+        # hits the multigraph cache. Hybrid stays in parity with engine.
+        if (graph.edge_count() >= 20 and self._synth_depth <= 2):
             try:
-                # Manually bump engine's depth so its own cross_cell gate
-                # (`engine._synth_depth == 1`) blocks the recursive call
-                # on g_chord_free — otherwise we cascade and pay the
-                # per-step contraction cost twice (measured 77s vs 47s).
-                engine._synth_depth += 1
-                try:
-                    cross_result = engine._try_cross_cell_chord_peel(graph, max_depth)
-                finally:
-                    engine._synth_depth -= 1
-                if cross_result is not None:
-                    _log.record(EventType.CHORD_RULE, "hybrid",
-                                f"Cross-cell chord-peel: "
+                # Bump engine depth to match hybrid depth so the engine's
+                # own depth-gated recursion in Phase D residue peel
+                # behaves consistently (the residue re-enters
+                # engine.synthesize, not hybrid.synthesize).
+                engine._synth_depth = self._synth_depth
+                dp_result = engine._try_decomposition_chord_peel(
+                    graph, max_depth,
+                )
+                if dp_result is not None:
+                    _method_event = {
+                        "unified_formula": EventType.UNIFIED_FORMULA,
+                        "kmatching_formula": EventType.KMATCHING_FORMULA,
+                        "product_formula": EventType.HIERARCHICAL,
+                    }.get(dp_result.method, EventType.CHORD_RULE)
+                    _log.record(_method_event, "hybrid",
+                                f"Decomposition+peel via {dp_result.method}: "
                                 f"{graph.node_count()}n {graph.edge_count()}e",
                                 graph=graph)
-                    self._log(f"Cross-cell chord-peel: "
-                              f"{graph.node_count()}n, {graph.edge_count()}e")
-                    return HybridSynthesisResult(
-                        polynomial=cross_result.polynomial,
-                        method=cross_result.method,
-                        recipe=cross_result.recipe,
-                        verified=cross_result.verified,
+                    self._log(
+                        f"Decomposition+peel: "
+                        f"{graph.node_count()}n, {graph.edge_count()}e "
+                        f"({dp_result.method})"
                     )
-            except Exception:
-                pass
-
-        # Clique-atom chord-peel (mirrors engine step 7.9) — for graphs with
-        # detectable disjoint K_k cliques (k ∈ [3, 6]), peel internal edges
-        # via the production chord rule with σ-aware ordering. Z(1,2):
-        # k=4 chosen, ~95s vs ~138s baseline (1.45×). Generalizes to
-        # K_3/K_5/K_6 atom structure. Falls through to treewidth_dp on
-        # no viable atoms or any chord-rule failure.
-        if graph.edge_count() >= 60:
-            try:
-                peel_result = engine._try_clique_atom_chord_peel(graph, max_depth)
-                if peel_result is not None:
-                    _log.record(EventType.CHORD_RULE, "hybrid",
-                                f"Clique-atom chord-peel: "
-                                f"{graph.node_count()}n {graph.edge_count()}e",
-                                graph=graph)
-                    self._log(f"Clique-atom chord-peel: "
-                              f"{graph.node_count()}n, {graph.edge_count()}e")
                     return HybridSynthesisResult(
-                        polynomial=peel_result.polynomial,
-                        method=peel_result.method,
-                        recipe=peel_result.recipe,
-                        verified=peel_result.verified,
+                        polynomial=dp_result.polynomial,
+                        method=dp_result.method,
+                        recipe=dp_result.recipe,
+                        verified=dp_result.verified,
+                        tiles_used=getattr(dp_result, 'tiles_used', 0),
                     )
             except Exception:
                 pass
 
         # Treewidth DP (fast for tw <= 10, before expensive k-sum/hierarchical)
+        # Gate matches engine.py:999 (max_width=10): Python tw_dp at tw=11
+        # takes 3-10+ min on n=40 graphs (e.g. Z(2,1) measured stuck >10 min,
+        # May 24). C-ext is gated 5 <= tw <= 10. Graphs at tw=11 fall through
+        # to chord-rule / spanning-tree paths.
         if graph.edge_count() >= 10:
             from ..graphs.treewidth import \
                 compute_treewidth_tutte_if_applicable
             full_mg = MultiGraph.from_graph(graph)
-            tw_poly = compute_treewidth_tutte_if_applicable(full_mg, max_width=11)
+            tw_poly = compute_treewidth_tutte_if_applicable(full_mg, max_width=10)
             if tw_poly is not None:
                 _log.record(EventType.TREEWIDTH_DP, "hybrid",
                             f"Treewidth DP: {graph.node_count()}n {graph.edge_count()}e",
@@ -681,31 +951,6 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
                 verified=ksum_result.verified,
                 tiles_used=getattr(ksum_result, 'tiles_used', 0),
             )
-
-        # Hierarchical tiling
-        if graph.edge_count() >= 20:
-            hier_result = engine._try_hierarchical(graph, max_depth)
-            if hier_result is not None:
-                # Surface the SPECIFIC hierarchical sub-path for the
-                # visualizer: unified-topology formula, k-matching formula,
-                # or generic hierarchical / tw_dp fallthrough.
-                _method_event = {
-                    "unified_formula": EventType.UNIFIED_FORMULA,
-                    "kmatching_formula": EventType.KMATCHING_FORMULA,
-                    "treewidth_dp": EventType.TREEWIDTH_DP,
-                }.get(hier_result.method, EventType.HIERARCHICAL)
-                _log.record(_method_event, "hybrid",
-                            f"Hierarchical via {hier_result.method}: "
-                            f"{graph.node_count()}n {graph.edge_count()}e",
-                            graph=graph)
-                self._log(f"Hierarchical tiling: {hier_result.method}")
-                return HybridSynthesisResult(
-                    polynomial=hier_result.polynomial,
-                    method=hier_result.method,
-                    recipe=hier_result.recipe,
-                    verified=hier_result.verified,
-                    tiles_used=getattr(hier_result, 'tiles_used', 0),
-                )
 
         return None
 

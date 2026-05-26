@@ -357,3 +357,188 @@ def load_multigraph_lookup_table(path: str) -> Dict[str, 'TuttePolynomial']:
     return decode_multigraph_lookup_table(data)
 
 
+# =============================================================================
+# MERGER LOOKUP TABLE — chord-junction mergers T(G ∪_{V_T} G)
+# =============================================================================
+#
+# Stores precomputed merger polynomials indexed by (base_canonical_key, V_T).
+# Schema mirrors `multigraph_lookup_table` (raw 32-byte canonical keys +
+# binary polynomial) but adds the V_T tuple, source/family metadata, and a
+# secondary merger canonical key. See `tutte/lookup/merger.py` for the
+# data model. Magic header `"MRGT"`, version `1`.
+
+
+def _encode_optional_string(value) -> bytes:
+    """Encode an Optional[str] as ``[len varuint][utf8 bytes]``.
+
+    Empty/None values are stored as length 0; the decoder distinguishes
+    None from "" via a presence flag prepended by the caller.
+    """
+    if value is None:
+        return encode_varuint(0)
+    raw = value.encode('utf-8')
+    return encode_varuint(len(raw)) + raw
+
+
+def _decode_optional_string(data: bytes, offset: int):
+    length, offset = decode_varuint(data, offset)
+    if length == 0:
+        return None, offset
+    raw = data[offset:offset + length].decode('utf-8')
+    return raw, offset + length
+
+
+def encode_merger_lookup_table(table) -> bytes:
+    """Encode a `MergerTable` to compact binary format.
+
+    Format:
+        Header:
+            [magic: 4 bytes]   = "MRGT"
+            [version: 1 byte]  = 1
+            [num_entries: varuint]
+
+        Entry Section (per entry):
+            [base_canonical_key: 32 bytes raw]
+            [num_v_t: varuint] [v_t[0]: varuint] ... [v_t[k-1]: varuint]
+            [merger_present: 1 byte] (0/1)
+            [merger_canonical_key: 32 bytes raw]   (only if merger_present)
+            [base_name: optional-string]
+            [family_tag: optional-string]
+            [base_node_count: varuint]
+            [base_edge_count: varuint]
+            [merger_node_count: varuint]
+            [merger_edge_count: varuint]
+            [poly_len: varuint] [poly_bytes: bytes]
+
+    `MergerTable` is imported lazily to avoid a circular import with
+    `tutte.lookup.merger`, which depends on this module via `binary.py`
+    exporting `load_merger_lookup_table`.
+    """
+    result = bytearray()
+
+    result.extend(b"MRGT")
+    result.append(1)  # version
+    result.extend(encode_varuint(len(table.by_source)))
+
+    for entry in table.by_source.values():
+        # Base canonical key — 32 raw bytes
+        result.extend(bytes.fromhex(entry.base_canonical_key))
+
+        # V_T tuple
+        result.extend(encode_varuint(len(entry.v_t)))
+        for v in entry.v_t:
+            result.extend(encode_varuint(v))
+
+        # Optional merger canonical key (32 raw bytes if present)
+        if entry.merger_canonical_key is not None:
+            result.append(1)
+            result.extend(bytes.fromhex(entry.merger_canonical_key))
+        else:
+            result.append(0)
+
+        # Optional strings
+        result.extend(_encode_optional_string(entry.base_name))
+        result.extend(_encode_optional_string(entry.family_tag))
+
+        # Counters
+        result.extend(encode_varuint(entry.base_node_count))
+        result.extend(encode_varuint(entry.base_edge_count))
+        result.extend(encode_varuint(entry.merger_node_count))
+        result.extend(encode_varuint(entry.merger_edge_count))
+
+        # Polynomial
+        poly_bytes = entry.polynomial.to_bytes()
+        result.extend(encode_varuint(len(poly_bytes)))
+        result.extend(poly_bytes)
+
+    return bytes(result)
+
+
+def decode_merger_lookup_table(data: bytes):
+    """Decode a `MergerTable` from binary format. See encoder for schema."""
+    from ..polynomial import TuttePolynomial
+    from .merger import MergerEntry, MergerTable
+
+    offset = 0
+    if data[offset:offset + 4] != b"MRGT":
+        raise ValueError("Invalid magic header -- not a merger lookup table binary")
+    offset += 4
+
+    version = data[offset]
+    offset += 1
+    if version != 1:
+        raise ValueError(f"Unsupported merger lookup table version: {version}")
+
+    num_entries, offset = decode_varuint(data, offset)
+
+    table = MergerTable()
+    for _ in range(num_entries):
+        # Base canonical key
+        base_canonical_key = data[offset:offset + 32].hex()
+        offset += 32
+
+        # V_T tuple
+        v_t_len, offset = decode_varuint(data, offset)
+        v_t_items = []
+        for _ in range(v_t_len):
+            v, offset = decode_varuint(data, offset)
+            v_t_items.append(v)
+        v_t = tuple(v_t_items)
+
+        # Optional merger canonical key
+        merger_present = data[offset]
+        offset += 1
+        if merger_present:
+            merger_canonical_key = data[offset:offset + 32].hex()
+            offset += 32
+        else:
+            merger_canonical_key = None
+
+        # Optional strings
+        base_name, offset = _decode_optional_string(data, offset)
+        family_tag, offset = _decode_optional_string(data, offset)
+
+        # Counters
+        base_node_count, offset = decode_varuint(data, offset)
+        base_edge_count, offset = decode_varuint(data, offset)
+        merger_node_count, offset = decode_varuint(data, offset)
+        merger_edge_count, offset = decode_varuint(data, offset)
+
+        # Polynomial
+        poly_len, offset = decode_varuint(data, offset)
+        poly_bytes = data[offset:offset + poly_len]
+        offset += poly_len
+        polynomial = TuttePolynomial.from_bytes(poly_bytes)
+
+        entry = MergerEntry(
+            base_canonical_key=base_canonical_key,
+            v_t=v_t,
+            polynomial=polynomial,
+            merger_canonical_key=merger_canonical_key,
+            base_name=base_name,
+            family_tag=family_tag,
+            base_node_count=base_node_count,
+            base_edge_count=base_edge_count,
+            merger_node_count=merger_node_count,
+            merger_edge_count=merger_edge_count,
+        )
+        table.add_entry(entry)
+
+    return table
+
+
+def save_merger_lookup_table(table, path: str) -> int:
+    """Save a `MergerTable` to a binary file. Returns size in bytes."""
+    blob = encode_merger_lookup_table(table)
+    with open(path, 'wb') as f:
+        f.write(blob)
+    return len(blob)
+
+
+def load_merger_lookup_table(path: str):
+    """Load a `MergerTable` from a binary file."""
+    with open(path, 'rb') as f:
+        data = f.read()
+    return decode_merger_lookup_table(data)
+
+

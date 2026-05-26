@@ -46,6 +46,20 @@ __all__ = [
 ]
 
 
+def _transfer_wins(width: int, length: int) -> bool:
+    """Predicate: should transfer_matrix run for a (width, length) strip?
+
+    Per warm-cache benchmark (research/scripts/profile_transfer_vs_tw.py,
+    2026-05-25): transfer wins for narrow strips, treewidth_dp wins for
+    wider ones because Catalan(width)² grows faster than 2^width.
+    """
+    if width <= 4:
+        return True
+    if width == 5:
+        return length <= 5
+    return False
+
+
 def compute_tutte_via_transfer_matrix(
     graph: Graph,
 ) -> Optional[TuttePolynomial]:
@@ -77,6 +91,25 @@ def compute_tutte_via_transfer_matrix(
         return None
 
     width, length, transition_patterns, num_vertices, first_col_edges = strip
+
+    # Cost gate: per the warm-cache profile in
+    # `tutte/research/scripts/profile_transfer_vs_tw.py` (2026-05-25),
+    # the transfer-matrix sweep is only competitive against treewidth_dp
+    # for narrow strips. Catalan(width)² grows much faster than 2^width:
+    #
+    #   width  Catalan² / 2^width   transfer wins?
+    #     3        25 /     8        yes (4× on square)
+    #     4       196 /    16        yes (5× on square; 4× on long strips)
+    #     5      1764 /    32        marginal (1.2× on square, loses on length≥10)
+    #     6     17424 /    64        no (3.7× slower on square, 5× on length=10)
+    #     7    184041 /   128        no (14× slower on square)
+    #
+    # Heuristic:
+    #   - width ≤ 4: always prefer transfer
+    #   - width == 5: prefer transfer when length ≤ 5
+    #   - width ≥ 6: defer to treewidth_dp
+    if not _transfer_wins(width, length):
+        return None
 
     # transition_patterns is a list of edge-pattern lists from detect_periodic_strip.
     # Single-element for grid/triangular, two-element for honeycomb.

@@ -1,5 +1,16 @@
 # 5. Hierarchical Tiling — Chord Rule
 
+> **MERGED** (May 23, 2026): the standalone `_try_hierarchical` /
+> `_synthesize_hierarchical` dispatcher (legacy engine step 10) has
+> been folded into `_try_decomposition_chord_peel`
+> ([8.5 Decomposition + Chord-Peel — Unified Dispatcher](08_5_decomposition_chord_peel.md))
+> at engine step 7.88. Cell-only closed-form formulas
+> (`unified_formula`, `kmatching_formula`) are preserved verbatim in
+> Phase B of the new dispatcher. The internal `treewidth_dp` and
+> `product_formula` fallbacks were removed (the chord-rule path
+> subsumes them correctly). Legacy method still on disk behind
+> `TUTTE_USE_LEGACY_DISPATCH=1` for debugging.
+
 ## Summary
 
 For graphs with a **repeating cell structure**, the engine partitions the input into k disjoint copies of a known cell `C` (from the rainbow table) plus a multigraph of inter-cell edges. The Tutte polynomial is then computed via the **chord rule** (deletion-contraction applied iteratively to the inter-cell chord edges) plus a **boundary-quotient formula** for the chord-free residual. Both pieces are implemented in `tutte/graphs/k_sum.py`.

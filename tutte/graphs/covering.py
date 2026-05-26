@@ -13,6 +13,7 @@ Key concepts:
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, Iterator, List, Optional, Set, Tuple
 
@@ -130,10 +131,133 @@ class Fringe:
 # SUBGRAPH ISOMORPHISM
 # =============================================================================
 
+def _wl_color_multiset(g: Graph, rounds: int = 2) -> "Counter":
+    """Compute multiset of WL colors after `rounds` of 1-WL refinement.
+
+    Round 0: color = degree.
+    Round k: color = (old_color, sorted multiset of neighbor old_colors).
+
+    Used by `can_pattern_fit_by_wl` as a stronger structural filter than
+    pure degree multiset. WL colors are STANDALONE — computed inside the
+    graph itself, not relative to a containing target.
+    """
+    from collections import Counter
+
+    nx_g = g.to_networkx()
+    nodes = list(nx_g.nodes())
+    colors = {v: nx_g.degree(v) for v in nodes}
+    for _ in range(max(0, rounds - 1)):
+        new = {}
+        for v in nodes:
+            new[v] = (colors[v], tuple(sorted(colors[u] for u in nx_g.neighbors(v))))
+        if Counter(new.values()) == Counter(colors.values()):
+            break  # fixed point
+        colors = new
+    return Counter(colors.values())
+
+
+def can_pattern_fit_by_wl(
+    target: Graph, pattern: Graph, rounds: int = 2
+) -> bool:
+    """WL-based structural pre-filter — is `pattern` POSSIBLY a subgraph of `target`?
+
+    Necessary condition for subgraph isomorphism:
+      - count(P-nodes with WL color c) ≤ count(T-nodes with WL color compatible with c)
+
+    Standalone WL is not sufficient (P's WL colors are computed inside P,
+    not inside T), so we use the **degree-monotone variant**: a P-node of
+    degree d maps to a T-node of degree ≥ d. We apply this round-by-round
+    using WL multisets, comparing cumulative counts at each degree
+    threshold.
+
+    Returns True if pattern *could* fit (caller still runs VF2 to confirm).
+    Returns False if pattern *definitely* cannot fit. O((n+m)·rounds).
+    """
+    from collections import Counter
+
+    if pattern.node_count() > target.node_count():
+        return False
+    if pattern.edge_count() > target.edge_count():
+        return False
+
+    # Round 1 (degree): cheapest, catches gross mismatches.
+    t_degs = Counter()
+    for v in target.nodes:
+        d = sum(1 for e in target.edges if v in e)
+        t_degs[d] += 1
+    p_degs = Counter()
+    for v in pattern.nodes:
+        d = sum(1 for e in pattern.edges if v in e)
+        p_degs[d] += 1
+
+    all_thresholds = sorted(set(t_degs) | set(p_degs), reverse=True)
+    t_cum = 0
+    p_cum = 0
+    for d in all_thresholds:
+        t_cum += t_degs.get(d, 0)
+        p_cum += p_degs.get(d, 0)
+        if p_cum > t_cum:
+            return False
+
+    # Round 2+ (degree + sorted neighbor degrees): stronger, catches
+    # "wrong local structure" cases the degree filter alone passes.
+    if rounds < 2:
+        return True
+    t_wl = _wl_color_multiset(target, rounds=rounds)
+    p_wl = _wl_color_multiset(pattern, rounds=rounds)
+
+    # Each P-color must map to a "compatible" T-color. A WL color is
+    # (deg, sorted_nbr_degs). T's compatible colors have deg' ≥ deg AND
+    # for each pattern neighbor-degree d, T-nbr-multiset has a sufficient
+    # count of degrees ≥ d (Hall-condition style on neighbor-degree).
+    def t_compat_count(p_color) -> int:
+        if isinstance(p_color, int):
+            p_deg = p_color
+            p_nbr_degs = ()
+        else:
+            p_deg, p_nbr_degs = p_color
+        p_nbr_sorted = sorted(p_nbr_degs, reverse=True)
+        count = 0
+        for t_color, t_n in t_wl.items():
+            if isinstance(t_color, int):
+                t_deg = t_color
+                t_nbr_degs = ()
+            else:
+                t_deg, t_nbr_degs = t_color
+            if t_deg < p_deg:
+                continue
+            t_nbr_sorted = sorted(t_nbr_degs, reverse=True)
+            if len(t_nbr_sorted) < len(p_nbr_sorted):
+                continue
+            ok = True
+            for i, pd in enumerate(p_nbr_sorted):
+                if t_nbr_sorted[i] < pd:
+                    ok = False
+                    break
+            if ok:
+                count += t_n
+        return count
+
+    # For each P-color, total T-capacity must accommodate it. Strong
+    # version: ordered Hall — sort P-colors by required capacity desc,
+    # greedily assign. Approximation: just check per-color capacity
+    # against single P-class size.
+    for p_color, p_n in p_wl.items():
+        if t_compat_count(p_color) < p_n:
+            return False
+    return True
+
+
+# Back-compat alias for callers using the older degree-only name.
+def can_pattern_fit_by_degree_multiset(target: Graph, pattern: Graph) -> bool:
+    return can_pattern_fit_by_wl(target, pattern, rounds=1)
+
+
 def find_subgraph_isomorphisms(
     target: Graph,
     pattern: Graph,
-    max_matches: int = 100
+    max_matches: int = 100,
+    max_search_time_s: Optional[float] = None,
 ) -> List[Dict[int, int]]:
     """Find all subgraph isomorphisms of pattern in target.
 
@@ -143,6 +267,13 @@ def find_subgraph_isomorphisms(
         target: Graph to search in
         pattern: Pattern graph to find
         max_matches: Maximum number of matches to return
+        max_search_time_s: Optional wall-clock budget. The deadline is
+            checked BETWEEN yields from VF2's iterator. VF2 cannot be
+            interrupted mid-yield, so this only bounds total search if
+            VF2 yields periodically — fine for dense symmetric targets
+            (Z(1,3) yields ~900 K_{4,4} subgraphs quickly) but a hard
+            hang between yields will not be interrupted. Default None
+            preserves legacy behavior.
 
     Returns:
         List of node mappings {pattern_node: target_node}
@@ -152,12 +283,15 @@ def find_subgraph_isomorphisms(
 
     matcher = isomorphism.GraphMatcher(G_target, G_pattern)
 
+    deadline = (time.time() + max_search_time_s) if max_search_time_s else None
     matches = []
     for mapping in matcher.subgraph_isomorphisms_iter():
         # mapping is {target_node: pattern_node}, we want the inverse
         inverse_mapping = {v: k for k, v in mapping.items()}
         matches.append(inverse_mapping)
         if len(matches) >= max_matches:
+            break
+        if deadline is not None and time.time() >= deadline:
             break
 
     return matches
@@ -200,7 +334,8 @@ def find_disjoint_cover(
     graph: Graph,
     minor: MinorEntry,
     table: RainbowTable,
-    max_depth: int = 5
+    max_depth: int = 5,
+    max_search_time_s: Optional[float] = None,
 ) -> Cover:
     """Greedily tile graph with disjoint copies of minor.
 
@@ -215,6 +350,8 @@ def find_disjoint_cover(
         minor: Minor to use as primary tile
         table: Rainbow table for finding smaller minors
         max_depth: Maximum recursion depth
+        max_search_time_s: Optional per-VF2-call budget; propagates to
+            the recursive smaller-minor search.
 
     Returns:
         Cover with all tiles and any uncovered edges
@@ -236,8 +373,20 @@ def find_disjoint_cover(
     if pattern.edge_count() > graph.edge_count():
         return cover
 
+    # WL-based structural pre-filter (O((n+m)·k) for k WL rounds): cheap
+    # necessary check before launching VF2. Uses degree + sorted neighbor
+    # degrees (2-round WL). Filters out candidates where pattern's local
+    # structure is incompatible with target's — VF2 would otherwise hang
+    # exploring impossible mappings.
+    if not can_pattern_fit_by_wl(graph, pattern, rounds=2):
+        return cover
+
     # Find all occurrences
-    matches = find_subgraph_isomorphisms(graph, pattern, max_matches=50)
+    matches = find_subgraph_isomorphisms(
+        graph, pattern,
+        max_matches=50,
+        max_search_time_s=max_search_time_s,
+    )
     _log.record(EventType.VF2_MATCH, "covering",
                 f"Disjoint cover: {len(matches)} placements of {minor.name}",
                 LogLevel.DEBUG, graph=graph)
@@ -285,7 +434,8 @@ def find_disjoint_cover(
 
                 # Recursively cover remaining edges
                 sub_cover = find_disjoint_cover(
-                    remaining_graph, smaller, table, max_depth - 1
+                    remaining_graph, smaller, table, max_depth - 1,
+                    max_search_time_s=max_search_time_s,
                 )
                 for tile in sub_cover.tiles:
                     if cover.add_tile(tile):
@@ -2067,7 +2217,34 @@ def apply_kmatching_formula(
 # unblocked atlas_49 / K_4 as candidates). Keyed by (canon, id(table)) so
 # different tables don't collide.
 _HIER_PARTITION_CACHE: Dict[Tuple[str, int], Optional[Tuple]] = {}
+# Multi-partition cache for `iter_hierarchical_partitions`: stores the
+# full priority-ordered list of valid tilings (not just the first match).
+_HIER_PARTITIONS_ALL_CACHE: Dict[Tuple[str, int], List[Tuple]] = {}
 _HET_PARTITION_CACHE: Dict[Tuple[str, int, int, int, int], Optional[Tuple]] = {}
+
+
+def _hierarchical_candidate_priority(name: str) -> int:
+    """Priority for ordering rainbow-table candidates in VF2 partition search.
+
+    Lower number = higher priority. K_n/K_{a,b} first (high-payoff for
+    D-Wave; Cm3 with Ladder_12 candidate took 1249s without this gate).
+    D-Wave family aliases next. Asymmetric Book/Pan/Sunlet before
+    vertex-transitive Ladder/Prism/Mobius/Fan — empirically (May 22 2026)
+    Z(2,1) Mobius_10/Ladder_10/Prism_10/Fan_9 each burned 9-25s on
+    no-match exhaustion before Book_3 succeeded in 0.01s.
+    """
+    if name.startswith('K_'):
+        return 0  # K_n, K_{a,b}
+    if name.startswith(('Cm', 'Pm', 'Z')):
+        return 1  # D-Wave family aliases
+    if name.startswith('Grid_'):
+        return 2  # Grid_n×m
+    if name.startswith(('C_', 'W_', 'P_', 'S_')):
+        return 3  # Cycle/Wheel/Path/Star
+    if name.startswith(('Book_', 'Pan_', 'Sunlet_')):
+        return 5  # Asymmetric, fast VF2 reject
+    # Ladder_, Prism_, Mobius_, Fan_ — vertex-transitive/symmetric.
+    return 9
 
 
 def try_hierarchical_partition(
@@ -2092,6 +2269,9 @@ def try_hierarchical_partition(
     Cached by `(graph.canonical_key(), id(table))`. Cache is module-scoped
     so the same engine invocation's cell-quotient cascade reuses one
     partition lookup rather than re-running VF2 6+ times.
+
+    For callers that need MULTIPLE valid tilings (e.g., to try a
+    closed-form formula on each), use `iter_hierarchical_partitions`.
     """
     cache_key: Optional[Tuple[str, int]]
     try:
@@ -2108,25 +2288,10 @@ def try_hierarchical_partition(
                 f"Hierarchical: {len(candidates)} cell candidates for {graph.node_count()}n {graph.edge_count()}e",
                 LogLevel.DEBUG, graph=graph)
 
-    # Reorder candidates: prioritize K_{a,b}, K_n, Z*, Cm* (high-payoff for
-    # D-Wave structured graphs) BEFORE Ladder/Prism/Mobius (which are
-    # symmetric and cause VF2 to exhaustively explore symmetric paths
-    # when no match exists — Cm3 with Ladder_12 candidate took 1249s).
-    # Empirically (May 22 2026), this reordering means K_{4,4} candidate
-    # for Cm3 gets tried EARLY instead of after multi-minute exhaustion.
-    def _name_priority(name: str) -> int:
-        # Lower number = higher priority (tried first)
-        if name.startswith('K_'):
-            return 0  # K_n, K_{a,b}
-        if name.startswith(('Cm', 'Pm', 'Z')):
-            return 1  # D-Wave family aliases
-        if name.startswith('Grid_'):
-            return 2  # Grid_n×m
-        if name.startswith(('C_', 'W_', 'P_', 'S_')):
-            return 3  # Cycle/Wheel/Path/Star
-        # Ladder_, Prism_, Mobius_, Book_, Fan_, Pan_, etc. — high VF2 cost
-        return 9
-    candidates = sorted(candidates, key=lambda c: (_name_priority(c.name), -c.node_count))
+    candidates = sorted(
+        candidates,
+        key=lambda c: (_hierarchical_candidate_priority(c.name), -c.node_count),
+    )
 
     for cell in candidates:
         cell_size = cell.node_count
@@ -2157,12 +2322,71 @@ def try_hierarchical_partition(
     return None
 
 
+def iter_hierarchical_partitions(
+    graph: Graph,
+    table: RainbowTable,
+    max_partitions: int = 4,
+) -> List[Tuple[MinorEntry, List[Set[int]], InterCellInfo]]:
+    """Return up to `max_partitions` valid homogeneous tilings in priority order.
+
+    Same candidate iteration as `try_hierarchical_partition` but collects
+    multiple successful partitions instead of stopping at the first. The
+    merged decomposition-chord-peel dispatcher uses this to try closed-form
+    formulas against several partitions before falling back to chord-rule —
+    Z(1,2) tiles as both 4× K_{3,3} and 2× Z1_1; only the latter may admit
+    the product formula on a given inter-cell topology.
+
+    Bounded at 4 partitions to cap VF2 cost on graphs admitting many
+    distinct tilings.
+
+    Cached separately from the single-result cache so repeat calls with
+    different `max_partitions` still work (the cache stores the full
+    priority-ordered list, sliced on read).
+    """
+    cache_key: Optional[Tuple[str, int]]
+    try:
+        cache_key = (graph.canonical_key(), id(table))
+    except Exception:
+        cache_key = None
+    if cache_key is not None and cache_key in _HIER_PARTITIONS_ALL_CACHE:
+        return _HIER_PARTITIONS_ALL_CACHE[cache_key][:max_partitions]
+
+    _log = get_log()
+    candidates = find_cell_candidates(graph, table)
+    candidates = sorted(
+        candidates,
+        key=lambda c: (_hierarchical_candidate_priority(c.name), -c.node_count),
+    )
+
+    results: List[Tuple[MinorEntry, List[Set[int]], InterCellInfo]] = []
+    for cell in candidates:
+        if len(results) >= max_partitions:
+            break
+        cell_size = cell.node_count
+        k = graph.node_count() // cell_size
+        partition = partition_into_cells(graph, cell, k)
+        if partition is None:
+            continue
+        if not verify_cell_partition(graph, partition, cell):
+            continue
+        inter_info = analyze_inter_cell_edges(graph, partition)
+        _log.record(EventType.HIERARCHICAL, "covering",
+                    f"Tiled with {cell.name}: {len(partition)} cells, "
+                    f"{len(inter_info.edges)} inter-cell edges")
+        results.append((cell, partition, inter_info))
+
+    if cache_key is not None:
+        _HIER_PARTITIONS_ALL_CACHE[cache_key] = results
+    return results[:max_partitions]
+
+
 def clear_hierarchical_partition_cache() -> None:
     """Clear the hierarchical / heterogeneous partition result caches.
 
     Useful for tests that mutate the rainbow table mid-run.
     """
     _HIER_PARTITION_CACHE.clear()
+    _HIER_PARTITIONS_ALL_CACHE.clear()
     _HET_PARTITION_CACHE.clear()
 
 
