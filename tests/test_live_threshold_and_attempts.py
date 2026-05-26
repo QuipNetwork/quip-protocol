@@ -73,6 +73,7 @@ def test_attempt_logger_writes_jsonl_record(tmp_path: Path) -> None:
         stored_as_best=True,
         result_kind="stored",
         mining_time_us=15_000,
+        qpu_access_time_us=8_432,
     )
 
     # Exactly one .jsonl file exists, with our miner_id in the name.
@@ -90,7 +91,36 @@ def test_attempt_logger_writes_jsonl_record(tmp_path: Path) -> None:
     assert record["best_energy_milli"] == -3_950_000
     assert record["stored_as_best"] is True
     assert record["result_kind"] == "stored"
+    assert record["qpu_access_time_us"] == 8_432, (
+        "qpu_access_time_us must be written for QPU-backed iterations so the "
+        "dashboard can compute real QPU time per attempt"
+    )
     assert isinstance(record["ts_ns"], int)
+
+
+def test_attempt_logger_qpu_access_time_defaults_to_none(tmp_path: Path) -> None:
+    """Non-QPU iterations (and QPU iterations without timing info) must
+    still produce a record with the field explicitly present as ``None``
+    so downstream parsers can rely on a uniform schema rather than a
+    presence check."""
+    logger = AttemptLogger("miner-cpu", log_dir=tmp_path)
+    logger.record(
+        dispatch_id=1,
+        iter_num=1,
+        nonce_hex="0x0",
+        salt_hex="0x0",
+        best_energy_milli=0,
+        num_samples=1,
+        post_processed=False,
+        stored_as_best=False,
+        result_kind="rejected",
+    )
+
+    files = sorted(tmp_path.glob("attempts-miner-cpu-*.jsonl"))
+    with files[0].open() as fh:
+        record = json.loads(fh.read().strip())
+    assert "qpu_access_time_us" in record
+    assert record["qpu_access_time_us"] is None
 
 
 def test_submission_logger_assigns_monotonic_ids(tmp_path: Path) -> None:

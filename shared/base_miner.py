@@ -518,6 +518,16 @@ class BaseMiner(ABC):
                 self.current_stage = 'preprocessing'
                 self.current_stage_start = preprocess_start
 
+                # Snapshot the QPU access-time list length so we can pick
+                # up the entry this iteration appends (if any). QPU miners
+                # call ``_record_qpu_timing`` inside ``_sample`` which
+                # appends to ``timing_stats['qpu_access_time']`` only when
+                # the sampleset carries D-Wave timing info — non-QPU
+                # backends never touch the list, so the snapshot reads
+                # back as "no new entry".
+                qpu_access_len_before = len(
+                    self.timing_stats['qpu_access_time'],
+                )
                 try:
                     sample_start = time.time()
                     self.current_stage = 'sampling'
@@ -538,6 +548,15 @@ class BaseMiner(ABC):
                     if self._on_sampling_error(exc, stop_event):
                         return None
                     continue
+
+                # D-Wave reports ``qpu_programming_time + qpu_sampling_time``
+                # in microseconds; we forward as-is. ``None`` when no entry
+                # was appended this iteration (CPU/CUDA/etc. backends, or a
+                # QPU sampleset without timing info).
+                qpu_access_time_us: Optional[int] = None
+                qpu_access_list = self.timing_stats['qpu_access_time']
+                if len(qpu_access_list) > qpu_access_len_before:
+                    qpu_access_time_us = int(qpu_access_list[-1])
 
                 sampleset = self._post_sample(sampleset)
                 if stop_event.is_set():
@@ -738,6 +757,7 @@ class BaseMiner(ABC):
                 attempt_log_kwargs["mining_time_us"] = int(
                     (time.time() - preprocess_start) * 1e6
                 )
+                attempt_log_kwargs["qpu_access_time_us"] = qpu_access_time_us
                 attempt_log.record(**attempt_log_kwargs)
 
                 if result:

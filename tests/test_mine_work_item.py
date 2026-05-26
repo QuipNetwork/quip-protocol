@@ -820,3 +820,81 @@ def test_attempt_log_records_num_valid_and_diversity_on_stored_iteration(
         f"diversity_milli must be a populated int on post-processed "
         f"iteration, got {rec['diversity_milli']!r}"
     )
+
+
+def test_attempt_log_records_qpu_access_time_us_when_sample_records_qpu_timing(
+    cpu_miner, relaxed_context,
+):
+    """The mining loop must forward D-Wave's per-iteration QPU access
+    time into the attempt log so the dashboard can graph real QPU time.
+
+    Simulates a QPU iteration by wrapping ``_sample`` so it appends a
+    fake microsecond value to ``timing_stats['qpu_access_time']`` —
+    the same list the production ``_record_qpu_timing`` writes to.
+    The base mining loop snapshots that list before and after each
+    sample and pulls out the new entry; the captured record must carry
+    it as ``qpu_access_time_us``.
+    """
+    from unittest.mock import MagicMock
+
+    INJECTED_QPU_TIME_US = 12_345
+
+    captured = []
+    recording_logger = MagicMock()
+    recording_logger.record.side_effect = lambda **kw: (
+        captured.append(kw), stop.set(),
+    )
+
+    original_sample = cpu_miner._sample
+
+    def _sample_with_qpu_timing(*args, **kwargs):
+        sampleset = original_sample(*args, **kwargs)
+        cpu_miner.timing_stats['qpu_access_time'].append(INJECTED_QPU_TIME_US)
+        return sampleset
+
+    cpu_miner._sample = _sample_with_qpu_timing
+    cpu_miner._attempt_logger = recording_logger
+    stop = mp.Event()
+    try:
+        cpu_miner.mine_work_item(relaxed_context, stop)
+    finally:
+        cpu_miner._sample = original_sample
+        del cpu_miner._attempt_logger
+        # Don't leak the injected timing values into the module-scoped
+        # miner fixture — other tests assert on timing_stats contents.
+        cpu_miner.timing_stats['qpu_access_time'].clear()
+
+    assert captured, "expected at least one AttemptLogger.record call"
+    rec = captured[0]
+    assert rec["qpu_access_time_us"] == INJECTED_QPU_TIME_US, (
+        "mining loop must forward the per-iteration qpu_access_time "
+        "appended inside _sample() to the attempt-log record"
+    )
+
+
+def test_attempt_log_qpu_access_time_us_is_none_for_non_qpu_backends(
+    cpu_miner, relaxed_context,
+):
+    """CPU/CUDA/etc. backends do not write to
+    ``timing_stats['qpu_access_time']``. The attempt record must still
+    carry the key — value ``None`` — so downstream parsers can rely on
+    a uniform schema rather than presence checks."""
+    from unittest.mock import MagicMock
+
+    captured = []
+    recording_logger = MagicMock()
+    recording_logger.record.side_effect = lambda **kw: (
+        captured.append(kw), stop.set(),
+    )
+
+    cpu_miner._attempt_logger = recording_logger
+    stop = mp.Event()
+    try:
+        cpu_miner.mine_work_item(relaxed_context, stop)
+    finally:
+        del cpu_miner._attempt_logger
+
+    assert captured, "expected at least one AttemptLogger.record call"
+    rec = captured[0]
+    assert "qpu_access_time_us" in rec
+    assert rec["qpu_access_time_us"] is None

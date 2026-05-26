@@ -144,6 +144,7 @@ class AttemptLogger:
         ratchet_threshold_milli: Optional[int] = None,
         result_kind: str = "rejected",
         mining_time_us: Optional[int] = None,
+        qpu_access_time_us: Optional[int] = None,
         error: Optional[str] = None,
     ) -> None:
         """Write one attempt record.
@@ -153,6 +154,11 @@ class AttemptLogger:
           - ``"stored"`` — became the new ``stored_best`` candidate
           - ``"submitted"`` — chain threshold crossed; returned for submit
           - ``"error"`` — sampling / post-processing raised
+
+        ``qpu_access_time_us`` is D-Wave's ``qpu_programming_time +
+        qpu_sampling_time`` (microseconds) for this iteration's sampleset
+        when a QPU backend produced it. ``None`` for CPU/CUDA/etc. backends
+        and for QPU iterations whose sampleset arrived without timing info.
         """
         record = {
             "type": "attempt",
@@ -179,6 +185,7 @@ class AttemptLogger:
             "stored_as_best": stored_as_best,
             "result_kind": result_kind,
             "mining_time_us": mining_time_us,
+            "qpu_access_time_us": qpu_access_time_us,
             "error": error,
         }
         try:
