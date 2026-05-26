@@ -141,6 +141,7 @@ def _parse_graph_raw(args) -> tuple:
 
     dwave_topo = args.get("dwave_topo", "").strip()
     dwave_m = args.get("dwave_m", type=int)
+    dwave_n = args.get("dwave_n", type=int)
     dwave_t = args.get("dwave_t", type=int)
     if dwave_topo and dwave_m is not None:
         try:
@@ -155,10 +156,13 @@ def _parse_graph_raw(args) -> tuple:
                 G = dnx.pegasus_graph(dwave_m)
                 return G, f"Pegasus P({dwave_m})", "pegasus"
             elif dwave_topo == "chimera":
-                # D-Wave Chimera is specified by a single parameter m (tile grid
-                # is m×m, shore size is fixed at 4 on every D-Wave processor).
-                G = dnx.chimera_graph(dwave_m)
-                return G, f"Chimera C({dwave_m})", "chimera"
+                # D-Wave Chimera is m×n tiles with shore size 4. When dwave_n
+                # is omitted, default to a square m×m grid.
+                n = dwave_n if dwave_n is not None else dwave_m
+                G = dnx.chimera_graph(dwave_m, n=n)
+                if dwave_m == n:
+                    return G, f"Chimera C({dwave_m})", "chimera"
+                return G, f"Chimera C({dwave_m},{n})", "chimera"
             else:
                 return None, f"Unknown D-Wave topology: {dwave_topo}", None
         except ImportError:
@@ -188,6 +192,84 @@ def _parse_graph_raw(args) -> tuple:
             return None, "Need at least 1 node", None
         G = nx.gnm_random_graph(rand_n, rand_m)
         return G, f"Random G({rand_n},{rand_m}) — {G.number_of_nodes()}n, {G.number_of_edges()}e", None
+
+    # Cell builder: cell_builder=1 + cb_* params
+    if args.get("cell_builder", "0") == "1":
+        try:
+            from tutte.graphs.cell_builder import build_cell_graph
+
+            def _cell_params(prefix: str, ctype: str) -> dict:
+                """Build the param dict for one cell, including ONLY the keys
+                that ctype actually consumes — otherwise stray defaults
+                like n=4 silently change a Chimera m=1 cell into n=4."""
+                t = ctype.lower()
+                if t in ("k_n", "kn", "complete",
+                         "c_n", "cn", "cycle",
+                         "p_n", "pn", "path"):
+                    return {"n": args.get(f"{prefix}n", 4, type=int)}
+                if t in ("k_a_b", "kab", "complete_bipartite"):
+                    return {
+                        "a": args.get(f"{prefix}a", 4, type=int),
+                        "b": args.get(f"{prefix}b", 4, type=int),
+                    }
+                if t in ("chimera", "cm"):
+                    p = {"m": args.get(f"{prefix}m", 1, type=int)}
+                    n2 = args.get(f"{prefix}n2", type=int)
+                    if n2 is not None:
+                        p["n"] = n2
+                    return p
+                if t in ("pegasus", "pm"):
+                    return {"m": args.get(f"{prefix}m", 2, type=int)}
+                if t in ("zephyr", "z"):
+                    return {
+                        "m": args.get(f"{prefix}m", 1, type=int),
+                        "t": args.get(f"{prefix}t", 1, type=int),
+                    }
+                if t in ("z11", "z_1_1", "zephyr11",
+                         "cm1", "chimera1",
+                         "pm2", "pegasus2"):
+                    return {}  # legacy fixed-shape cells
+                return {}
+
+            cell_type = args.get("cb_cell_type", "K_a_b")
+            cell_params = _cell_params("cb_cell_", cell_type)
+            junction_type = args.get("cb_junction_type", "matching")
+            jt = junction_type.lower()
+            if jt in ("matching", "m_k", "mk"):
+                junction_params = {"k": args.get("cb_junction_k", 4, type=int)}
+            elif jt in ("k_a_b_junction", "kab_junction",
+                        "complete_bipartite_junction"):
+                junction_params = {
+                    "a": args.get("cb_junction_a", 4, type=int),
+                    "b": args.get("cb_junction_b", 4, type=int),
+                }
+            else:
+                junction_params = {}
+            family_type = args.get("cb_family_type", "path")
+            ft = family_type.lower()
+            if ft == "grid":
+                family_params = {
+                    "rows": args.get("cb_family_rows", 2, type=int),
+                    "cols": args.get("cb_family_cols", 2, type=int),
+                }
+            elif ft == "interleaved":
+                family_params = {
+                    "count": args.get("cb_family_count", 4, type=int),
+                    "pattern": args.get("cb_family_pattern", "path"),
+                }
+            else:  # path / cycle
+                family_params = {"count": args.get("cb_family_count", 3, type=int)}
+            alt_cell_type = args.get("cb_alt_cell_type", "").strip() or None
+            alt_cell_params = None
+            if alt_cell_type:
+                alt_cell_params = _cell_params("cb_alt_cell_", alt_cell_type)
+            G, label = build_cell_graph(
+                cell_type, cell_params, junction_type, junction_params,
+                family_type, family_params, alt_cell_type, alt_cell_params,
+            )
+            return G, label, None
+        except Exception as e:
+            return None, f"Invalid cell builder params: {e}", None
 
     # Graph family: family=complete&n=5 or family=grid&n=3&m=4
     family = args.get("family", "").strip()
@@ -325,6 +407,33 @@ def _build_family_graph(family: str, n: int, m: int):
         return nx.random_regular_graph(k, num_nodes), f"Regular({k},{num_nodes})"
     else:
         raise ValueError(f"Unknown family: {family}")
+
+
+def _build_baseline_graph(choice: str) -> tuple:
+    """Build a small baseline graph for cell-builder comparison.
+
+    Returns (nx.Graph, label). All baselines are small (<= 32 vertices) so
+    the second engine run completes within a few seconds. Used by /stream
+    when cb_compare_baseline=1.
+    """
+    choice = choice.strip()
+    if choice == "K_5":
+        return nx.complete_graph(5), "K_5"
+    if choice == "K_4_4":
+        return nx.complete_bipartite_graph(4, 4), "K_{4,4}"
+    if choice == "C_5":
+        return nx.cycle_graph(5), "C_5"
+    if choice == "Cm1":
+        import dwave_networkx as dnx
+        G = dnx.chimera_graph(1)
+        mapping = {old: new for new, old in enumerate(sorted(G.nodes))}
+        return nx.relabel_nodes(G, mapping), "Cm1 (K_{4,4})"
+    if choice == "Z11":
+        import dwave_networkx as dnx
+        G = dnx.zephyr_graph(1, t=1)
+        mapping = {old: new for new, old in enumerate(sorted(G.nodes))}
+        return nx.relabel_nodes(G, mapping), "Z(1,1)"
+    raise ValueError(f"Unknown baseline choice {choice!r}")
 
 
 def _size_for_n(n: int) -> float:
@@ -676,6 +785,7 @@ HTML = """<!DOCTYPE html>
           <div class="ctrl-indent">
             <select name="dwave_topo" id="dwave-topo-select" {dwave_disabled}>{dwave_topo_options}</select>
             <span id="dwave-m-wrap"><span id="dwave-m-label">{dwave_m_label}</span>=<input type="number" name="dwave_m" value="{dwave_m_val}" placeholder="1" min="1" style="width:50px" {dwave_disabled}></span>
+            <span id="dwave-n-wrap" style="{dwave_n_display}">n=<input type="number" name="dwave_n" value="{dwave_n_val}" placeholder="(=m)" min="1" style="width:55px" {dwave_disabled}></span>
             <span id="dwave-t-wrap" style="{dwave_t_display}"><span id="dwave-t-label">{dwave_t_label}</span>=<input type="number" name="dwave_t" value="{dwave_t_val}" placeholder="1" min="1" style="width:50px" {dwave_disabled}></span>
           </div>
           <label class="ctrl-radio"><input type="radio" name="source" value="family" {family_checked}> Graph family</label>
@@ -691,6 +801,45 @@ HTML = """<!DOCTYPE html>
             nodes=<input type="number" name="rand_n" value="{rand_n_val}" placeholder="12" min="1" max="50000" style="width:65px" {random_disabled}>
             edges=<input type="number" name="rand_m" value="{rand_m_val}" placeholder="12" min="0" style="width:55px" {random_disabled}>
             <span id="rand-max-edges" style="color:#999;font-size:11px">{rand_max_hint}</span>
+          </div>
+          <label class="ctrl-radio"><input type="radio" name="source" value="cell_builder" {cell_builder_checked}> Cell builder</label>
+          <input type="hidden" name="cell_builder" id="cb-flag" value="{cb_flag_val}">
+          <div class="ctrl-indent" style="display:flex;flex-direction:column;gap:3px;">
+            <div class="ctrl-row">
+              <span style="min-width:60px">Cell:</span>
+              <select name="cb_cell_type" id="cb-cell-type" {cb_disabled}>{cb_cell_type_options}</select>
+              <span id="cb-cell-n-wrap">n=<input type="number" name="cb_cell_n" value="{cb_cell_n_val}" min="1" style="width:45px" {cb_disabled}></span>
+              <span id="cb-cell-ab-wrap" style="display:none">a=<input type="number" name="cb_cell_a" value="{cb_cell_a_val}" min="1" style="width:40px" {cb_disabled}> b=<input type="number" name="cb_cell_b" value="{cb_cell_b_val}" min="1" style="width:40px" {cb_disabled}></span>
+              <span id="cb-cell-m-wrap" style="display:none">m=<input type="number" name="cb_cell_m" value="{cb_cell_m_val}" min="1" style="width:40px" {cb_disabled}></span>
+              <span id="cb-cell-n2-wrap" style="display:none">n=<input type="number" name="cb_cell_n2" value="{cb_cell_n2_val}" placeholder="(=m)" min="1" style="width:55px" {cb_disabled}></span>
+              <span id="cb-cell-t-wrap" style="display:none">t=<input type="number" name="cb_cell_t" value="{cb_cell_t_val}" min="1" style="width:40px" {cb_disabled}></span>
+            </div>
+            <div class="ctrl-row">
+              <span style="min-width:60px">Junction:</span>
+              <select name="cb_junction_type" id="cb-junction-type" {cb_disabled}>{cb_junction_type_options}</select>
+              <span id="cb-junction-k-wrap">k=<input type="number" name="cb_junction_k" value="{cb_junction_k_val}" min="1" style="width:40px" {cb_disabled}></span>
+              <span id="cb-junction-ab-wrap" style="display:none">a=<input type="number" name="cb_junction_a" value="{cb_junction_a_val}" min="1" style="width:40px" {cb_disabled}> b=<input type="number" name="cb_junction_b" value="{cb_junction_b_val}" min="1" style="width:40px" {cb_disabled}></span>
+            </div>
+            <div class="ctrl-row">
+              <span style="min-width:60px">Family:</span>
+              <select name="cb_family_type" id="cb-family-type" {cb_disabled}>{cb_family_type_options}</select>
+              <span id="cb-family-count-wrap">count=<input type="number" name="cb_family_count" value="{cb_family_count_val}" min="2" style="width:45px" {cb_disabled}></span>
+              <span id="cb-family-grid-wrap" style="display:none">rows=<input type="number" name="cb_family_rows" value="{cb_family_rows_val}" min="1" style="width:40px" {cb_disabled}> cols=<input type="number" name="cb_family_cols" value="{cb_family_cols_val}" min="1" style="width:40px" {cb_disabled}></span>
+              <span id="cb-family-pattern-wrap" style="display:none">pattern=<select name="cb_family_pattern" {cb_disabled}><option value="path"{cb_pattern_path_sel}>path</option><option value="cycle"{cb_pattern_cycle_sel}>cycle</option></select></span>
+            </div>
+            <div class="ctrl-row" id="cb-alt-cell-wrap" style="display:none">
+              <span style="min-width:60px">Alt cell:</span>
+              <select name="cb_alt_cell_type" id="cb-alt-cell-type" {cb_disabled}>{cb_alt_cell_type_options}</select>
+              <span id="cb-alt-cell-n-wrap">n=<input type="number" name="cb_alt_cell_n" value="{cb_alt_cell_n_val}" min="1" style="width:45px" {cb_disabled}></span>
+              <span id="cb-alt-cell-ab-wrap" style="display:none">a=<input type="number" name="cb_alt_cell_a" value="{cb_alt_cell_a_val}" min="1" style="width:40px" {cb_disabled}> b=<input type="number" name="cb_alt_cell_b" value="{cb_alt_cell_b_val}" min="1" style="width:40px" {cb_disabled}></span>
+              <span id="cb-alt-cell-m-wrap" style="display:none">m=<input type="number" name="cb_alt_cell_m" value="{cb_alt_cell_m_val}" min="1" style="width:40px" {cb_disabled}></span>
+              <span id="cb-alt-cell-n2-wrap" style="display:none">n=<input type="number" name="cb_alt_cell_n2" value="{cb_alt_cell_n2_val}" placeholder="(=m)" min="1" style="width:55px" {cb_disabled}></span>
+              <span id="cb-alt-cell-t-wrap" style="display:none">t=<input type="number" name="cb_alt_cell_t" value="{cb_alt_cell_t_val}" min="1" style="width:40px" {cb_disabled}></span>
+            </div>
+            <div class="ctrl-row">
+              <label title="Synthesize the constructed graph and an optional baseline, then surface ✓/✗ at (0,1), (1,0), (1,1), (2,2)."><input type="checkbox" name="cb_compare_baseline" value="1" {cb_compare_checked} {cb_disabled}> Compare to baseline:</label>
+              <select name="cb_baseline_choice" {cb_disabled}>{cb_baseline_options}</select>
+            </div>
           </div>
         </div>
         <!-- Settings -->
@@ -732,6 +881,7 @@ HTML = """<!DOCTYPE html>
         form.querySelector('input[name="atlas"]').disabled = (sel !== 'atlas');
         form.querySelector('select[name="dwave_topo"]').disabled = (sel !== 'dwave');
         form.querySelector('input[name="dwave_m"]').disabled = (sel !== 'dwave');
+        form.querySelector('input[name="dwave_n"]').disabled = (sel !== 'dwave');
         form.querySelector('input[name="dwave_t"]').disabled = (sel !== 'dwave');
         form.querySelector('select[name="family"]').disabled = (sel !== 'family');
         form.querySelector('input[name="n"]').disabled = (sel !== 'family');
@@ -739,8 +889,16 @@ HTML = """<!DOCTYPE html>
         form.querySelector('input[name="edges"]').disabled = (sel !== 'edges');
         form.querySelector('input[name="rand_n"]').disabled = (sel !== 'random');
         form.querySelector('input[name="rand_m"]').disabled = (sel !== 'random');
+        // Cell builder inputs: all cb_* fields share the same disabled gate.
+        var cbInputs = form.querySelectorAll('[name^="cb_"]');
+        cbInputs.forEach(function(el) {{ el.disabled = (sel !== 'cell_builder'); }});
+        // Toggle the cell_builder=1 hidden flag so the server only fires the
+        // cell_builder branch when the radio is selected.
+        var cbFlag = document.getElementById('cb-flag');
+        if (cbFlag) cbFlag.value = (sel === 'cell_builder') ? '1' : '0';
         if (sel === 'dwave') updateDwave();
         if (sel === 'random') updateRandMax();
+        if (sel === 'cell_builder') updateCellBuilder();
       }}
       radios.forEach(function(r) {{ r.addEventListener('change', update); }});
       update();
@@ -790,9 +948,12 @@ HTML = """<!DOCTYPE html>
       }};
       function updateDwave() {{
         var topo = dsel.value;
-        // Zephyr needs (m, t). Pegasus and Chimera both take just m.
+        // Zephyr needs (m, t). Pegasus takes just m. Chimera takes (m, n) where
+        // n is optional and defaults to m.
         var showT = (topo === 'zephyr');
+        var showN = (topo === 'chimera');
         document.getElementById('dwave-t-wrap').style.display = showT ? '' : 'none';
+        document.getElementById('dwave-n-wrap').style.display = showN ? '' : 'none';
         var labels = dwaveLabels[topo] || ['m', 't'];
         document.getElementById('dwave-m-label').textContent = labels[0];
         document.getElementById('dwave-t-label').textContent = labels[1] || 't';
@@ -820,6 +981,69 @@ HTML = """<!DOCTYPE html>
       }}
       randN.addEventListener('input', updateRandMax);
       updateRandMax();
+
+      // Cell builder: show/hide cell, junction, family, alt-cell params.
+      // Cell types that take different parameter shapes:
+      //   n only      → K_n, C_n, P_n
+      //   a, b        → K_{{a,b}}
+      //   m           → chimera (n optional), pegasus, zephyr (t separate)
+      //   n (2nd)     → chimera only (optional second grid dim)
+      //   t           → zephyr only
+      var cellNeedsN = {{'K_n':1,'C_n':1,'P_n':1}};
+      var cellNeedsAB = {{'K_a_b':1}};
+      var cellNeedsM = {{'chimera':1,'pegasus':1,'zephyr':1}};
+      var cellNeedsN2 = {{'chimera':1}};
+      var cellNeedsT = {{'zephyr':1}};
+      // Junction types: matching/k_a_b_junction takes (a,b) or k.
+      // single_edge/shared_vertex take nothing.
+      var junctionNeedsK = {{'matching':1}};
+      var junctionNeedsAB = {{'k_a_b_junction':1}};
+      // Family types: path/cycle/interleaved take count; grid takes rows,cols.
+      var familyNeedsCount = {{'path':1,'cycle':1,'interleaved':1}};
+      var familyNeedsGrid = {{'grid':1}};
+      var familyNeedsPattern = {{'interleaved':1}};
+      var familyNeedsAlt = {{'interleaved':1}};
+
+      function _cbSetWrap(id, kind, table) {{
+        var el = document.getElementById(id);
+        if (el) el.style.display = table[kind] ? '' : 'none';
+      }}
+
+      function updateCellBuilder() {{
+        // Guard: this function may be invoked from update() during the
+        // initial IIFE run before the cellNeeds* tables below have been
+        // assigned. `var` hoists the names, but the dict assignments run
+        // in source order. Bail out until they exist.
+        if (typeof cellNeedsN === 'undefined') return;
+        var cType = document.getElementById('cb-cell-type').value;
+        _cbSetWrap('cb-cell-n-wrap', cType, cellNeedsN);
+        _cbSetWrap('cb-cell-ab-wrap', cType, cellNeedsAB);
+        _cbSetWrap('cb-cell-m-wrap', cType, cellNeedsM);
+        _cbSetWrap('cb-cell-n2-wrap', cType, cellNeedsN2);
+        _cbSetWrap('cb-cell-t-wrap', cType, cellNeedsT);
+
+        var jType = document.getElementById('cb-junction-type').value;
+        _cbSetWrap('cb-junction-k-wrap', jType, junctionNeedsK);
+        _cbSetWrap('cb-junction-ab-wrap', jType, junctionNeedsAB);
+
+        var fType = document.getElementById('cb-family-type').value;
+        _cbSetWrap('cb-family-count-wrap', fType, familyNeedsCount);
+        _cbSetWrap('cb-family-grid-wrap', fType, familyNeedsGrid);
+        _cbSetWrap('cb-family-pattern-wrap', fType, familyNeedsPattern);
+        _cbSetWrap('cb-alt-cell-wrap', fType, familyNeedsAlt);
+
+        var aType = document.getElementById('cb-alt-cell-type').value;
+        _cbSetWrap('cb-alt-cell-n-wrap', aType, cellNeedsN);
+        _cbSetWrap('cb-alt-cell-ab-wrap', aType, cellNeedsAB);
+        _cbSetWrap('cb-alt-cell-m-wrap', aType, cellNeedsM);
+        _cbSetWrap('cb-alt-cell-n2-wrap', aType, cellNeedsN2);
+        _cbSetWrap('cb-alt-cell-t-wrap', aType, cellNeedsT);
+      }}
+      document.getElementById('cb-cell-type').addEventListener('change', updateCellBuilder);
+      document.getElementById('cb-junction-type').addEventListener('change', updateCellBuilder);
+      document.getElementById('cb-family-type').addEventListener('change', updateCellBuilder);
+      document.getElementById('cb-alt-cell-type').addEventListener('change', updateCellBuilder);
+      updateCellBuilder();
     }})();
   </script>
 
@@ -1110,6 +1334,8 @@ def stream():
     engine_type = request.args.get("engine", "hybrid")
     threshold_ms = request.args.get("threshold", 100, type=float)
     debug = request.args.get("debug", "0") == "1"
+    cb_compare_baseline = request.args.get("cb_compare_baseline", "0") == "1"
+    cb_baseline_choice = request.args.get("cb_baseline_choice", "Cm1")
     # form_submitted sentinel distinguishes "no form submit" from "unchecked"
     form_submitted = request.args.get("form_submitted", "0") == "1"
     if form_submitted:
@@ -1293,6 +1519,57 @@ def stream():
                         "elapsed": elapsed,
                         "poly_html": poly_html,
                     }
+
+                    # Optional baseline comparison: synth a small baseline
+                    # graph on a fresh engine, then compare evaluations at
+                    # (0,1), (1,0), (1,1), (2,2). Synchronous: small
+                    # baselines (<= 32 vertices) finish in < a few seconds.
+                    _result_meta["baseline_html"] = ""
+                    if cb_compare_baseline:
+                        try:
+                            from tutte.graphs.cell_builder import compare_to_baseline
+                            from tutte.synthesis.engine import SynthesisEngine
+                            from tutte.synthesis.hybrid import HybridSynthesisEngine
+                            base_nx, base_label = _build_baseline_graph(
+                                cb_baseline_choice,
+                            )
+                            base_graph = Graph.from_networkx(base_nx)
+                            base_engine_cls = (
+                                HybridSynthesisEngine
+                                if engine_type == "hybrid"
+                                else SynthesisEngine
+                            )
+                            base_engine = base_engine_cls(verbose=False)
+                            base_engine.skip_target_lookup = skip_target_lookup
+                            base_result = base_engine.synthesize(base_graph)
+                            comparison = compare_to_baseline(
+                                result.polynomial, base_result.polynomial,
+                            )
+                            rows = []
+                            for (x, y), info in comparison.items():
+                                ok = info["dominates"]
+                                mark = (
+                                    '<span style="color:#2e7d32">&#x2713;</span>'
+                                    if ok else
+                                    '<span style="color:#c62828">&#x2717;</span>'
+                                )
+                                rows.append(
+                                    f'<tr><td>{mark}</td>'
+                                    f'<td>T({x},{y})</td>'
+                                    f'<td>{info["constructed"]}</td>'
+                                    f'<td>{info["baseline"]}</td></tr>'
+                                )
+                            _result_meta["baseline_html"] = (
+                                f'<table style="font-size:11px;border-collapse:collapse;">'
+                                f'<thead><tr><th></th><th>Point</th>'
+                                f'<th>Constructed</th><th>Baseline ({base_label})</th></tr></thead>'
+                                f'<tbody>{"".join(rows)}</tbody></table>'
+                            )
+                        except Exception as e:
+                            _result_meta["baseline_html"] = (
+                                f'<span style="color:#c62828">'
+                                f'Baseline comparison failed: {e}</span>'
+                            )
                     # Build contributing graphs from the EVENT STREAM so
                     # every unique graph that appeared in the Timeline /
                     # Step Graph is surfaced here too:
@@ -1440,6 +1717,10 @@ def stream():
                     # contributing to the synthesis, including all cache
                     # and lookup hits).
                     total_subgraphs = len(lookup_list) + len(synth_list)
+                    baseline_dt = (
+                        f'<dt>Baseline</dt><dd>{_result_meta["baseline_html"]}</dd>'
+                        if _result_meta["baseline_html"] else ""
+                    )
                     final["result_html"] = (
                         f'<dl class="result-grid">'
                         f'<dt>Method</dt><dd>{_result_meta["method"]}</dd>'
@@ -1451,6 +1732,7 @@ def stream():
                         f'({len(lookup_list)} lookup/cache + {len(synth_list)} synthesized)</span></dd>'
                         f'<dt>T(1,1)</dt><dd>{_result_meta["t11"]}</dd>'
                         f'<dt>Time</dt><dd>{_result_meta["elapsed"]:.3f}s</dd>'
+                        f'{baseline_dt}'
                         f'<dt>Polynomial</dt><dd class="poly">{_result_meta["poly_html"]}</dd>'
                         f'</dl>'
                     )
@@ -1518,6 +1800,7 @@ def index():
     atlas_val = request.args.get("atlas", "")
     dwave_topo_val = request.args.get("dwave_topo", "zephyr")
     dwave_m_val = request.args.get("dwave_m", "1")
+    dwave_n_val = request.args.get("dwave_n", "")
     dwave_t_val = request.args.get("dwave_t", "1")
     edges_val = request.args.get("edges", "")
     family_val = request.args.get("family", "")
@@ -1526,6 +1809,33 @@ def index():
 
     rand_n_val = request.args.get("rand_n", "12")
     rand_m_val = request.args.get("rand_m", "12")
+
+    # Cell builder values (mirrored from request args, with sensible defaults)
+    cb_cell_type_val = request.args.get("cb_cell_type", "K_a_b")
+    cb_cell_n_val = request.args.get("cb_cell_n", "4")
+    cb_cell_a_val = request.args.get("cb_cell_a", "4")
+    cb_cell_b_val = request.args.get("cb_cell_b", "4")
+    cb_cell_m_val = request.args.get("cb_cell_m", "1")
+    cb_cell_n2_val = request.args.get("cb_cell_n2", "")
+    cb_cell_t_val = request.args.get("cb_cell_t", "1")
+    cb_junction_type_val = request.args.get("cb_junction_type", "matching")
+    cb_junction_k_val = request.args.get("cb_junction_k", "4")
+    cb_junction_a_val = request.args.get("cb_junction_a", "4")
+    cb_junction_b_val = request.args.get("cb_junction_b", "4")
+    cb_family_type_val = request.args.get("cb_family_type", "path")
+    cb_family_count_val = request.args.get("cb_family_count", "3")
+    cb_family_rows_val = request.args.get("cb_family_rows", "2")
+    cb_family_cols_val = request.args.get("cb_family_cols", "2")
+    cb_family_pattern_val = request.args.get("cb_family_pattern", "path")
+    cb_alt_cell_type_val = request.args.get("cb_alt_cell_type", "C_n")
+    cb_alt_cell_n_val = request.args.get("cb_alt_cell_n", "8")
+    cb_alt_cell_a_val = request.args.get("cb_alt_cell_a", "4")
+    cb_alt_cell_b_val = request.args.get("cb_alt_cell_b", "4")
+    cb_alt_cell_m_val = request.args.get("cb_alt_cell_m", "1")
+    cb_alt_cell_n2_val = request.args.get("cb_alt_cell_n2", "")
+    cb_alt_cell_t_val = request.args.get("cb_alt_cell_t", "1")
+    cb_compare_baseline = request.args.get("cb_compare_baseline", "0") == "1"
+    cb_baseline_choice_val = request.args.get("cb_baseline_choice", "Cm1")
 
     # Determine which source is active
     source = request.args.get("source", "")
@@ -1540,6 +1850,8 @@ def index():
             source = "edges"
         elif request.args.get("rand_n"):
             source = "random"
+        elif request.args.get("cell_builder") == "1":
+            source = "cell_builder"
         else:
             source = "atlas"
 
@@ -1548,11 +1860,14 @@ def index():
     family_checked = "checked" if source == "family" else ""
     edges_checked = "checked" if source == "edges" else ""
     random_checked = "checked" if source == "random" else ""
+    cell_builder_checked = "checked" if source == "cell_builder" else ""
     atlas_disabled = "" if source == "atlas" else "disabled"
     dwave_disabled = "" if source == "dwave" else "disabled"
     family_disabled = "" if source == "family" else "disabled"
     edges_disabled = "" if source == "edges" else "disabled"
     random_disabled = "" if source == "random" else "disabled"
+    cb_disabled = "" if source == "cell_builder" else "disabled"
+    cb_flag_val = "1" if source == "cell_builder" else "0"
 
     engine_options = ""
     for opt in ["hybrid", "synthesis", "algebraic"]:
@@ -1570,6 +1885,59 @@ def index():
     for topo, label in [("zephyr", "Zephyr Z(m, t)"), ("pegasus", "Pegasus P(m)"), ("chimera", "Chimera C(m)")]:
         sel = " selected" if topo == dwave_topo_val else ""
         dwave_topo_options += f'<option value="{topo}"{sel}>{label}</option>'
+
+    # Build cell-builder dropdowns
+    _cb_cell_choices = [
+        ("K_n", "K_n (complete)"),
+        ("K_a_b", "K_{a,b} (bipartite)"),
+        ("C_n", "C_n (cycle)"),
+        ("P_n", "P_n (path)"),
+        ("chimera", "Chimera Cm(m, n)"),
+        ("pegasus", "Pegasus Pm(m)"),
+        ("zephyr", "Zephyr Z(m, t)"),
+    ]
+    cb_cell_type_options = "".join(
+        f'<option value="{k}"{" selected" if k == cb_cell_type_val else ""}>{lbl}</option>'
+        for k, lbl in _cb_cell_choices
+    )
+    cb_alt_cell_type_options = "".join(
+        f'<option value="{k}"{" selected" if k == cb_alt_cell_type_val else ""}>{lbl}</option>'
+        for k, lbl in _cb_cell_choices
+    )
+    _cb_junction_choices = [
+        ("matching", "matching M_k"),
+        ("single_edge", "single edge"),
+        ("shared_vertex", "shared vertex"),
+        ("k_a_b_junction", "K_{a,b} junction"),
+    ]
+    cb_junction_type_options = "".join(
+        f'<option value="{k}"{" selected" if k == cb_junction_type_val else ""}>{lbl}</option>'
+        for k, lbl in _cb_junction_choices
+    )
+    _cb_family_choices = [
+        ("path", "path"),
+        ("cycle", "cycle"),
+        ("grid", "grid"),
+        ("interleaved", "interleaved"),
+    ]
+    cb_family_type_options = "".join(
+        f'<option value="{k}"{" selected" if k == cb_family_type_val else ""}>{lbl}</option>'
+        for k, lbl in _cb_family_choices
+    )
+    cb_pattern_path_sel = " selected" if cb_family_pattern_val == "path" else ""
+    cb_pattern_cycle_sel = " selected" if cb_family_pattern_val == "cycle" else ""
+    cb_compare_checked = "checked" if cb_compare_baseline else ""
+    _cb_baseline_choices = [
+        ("K_5", "K_5"),
+        ("K_4_4", "K_{4,4}"),
+        ("C_5", "C_5"),
+        ("Cm1", "Cm1 (K_{4,4})"),
+        ("Z11", "Z(1,1)"),
+    ]
+    cb_baseline_options = "".join(
+        f'<option value="{k}"{" selected" if k == cb_baseline_choice_val else ""}>{lbl}</option>'
+        for k, lbl in _cb_baseline_choices
+    )
 
     G_nx, graph_desc, source_hint = parse_graph(request.args)
 
@@ -1589,6 +1957,8 @@ def index():
     dwave_t_display = "" if dwave_topo_val == "zephyr" else "display:none"
     if not dwave_t_label:
         dwave_t_label = "t"
+    # Only Chimera exposes the optional second grid dimension n.
+    dwave_n_display = "" if dwave_topo_val == "chimera" else "display:none"
 
     # Compute server-side labels for family params
     _family_labels = {
@@ -1622,10 +1992,12 @@ def index():
         rand_max_hint = ""
 
     ctrl_vars = dict(
-        atlas_val=atlas_val, dwave_m_val=dwave_m_val, dwave_t_val=dwave_t_val,
+        atlas_val=atlas_val, dwave_m_val=dwave_m_val,
+        dwave_n_val=dwave_n_val, dwave_t_val=dwave_t_val,
         dwave_topo_options=dwave_topo_options,
         dwave_m_label=dwave_m_label, dwave_t_label=dwave_t_label,
         dwave_t_display=dwave_t_display,
+        dwave_n_display=dwave_n_display,
         n_label=n_label, m_label=m_label,
         timeout_val=timeout_sec, engine_options=engine_options,
         atlas_checked=atlas_checked, dwave_checked=dwave_checked,
@@ -1641,6 +2013,35 @@ def index():
         use_lookup_disabled=use_lookup_disabled,
         rand_n_val=rand_n_val, rand_m_val=rand_m_val,
         rand_max_hint=rand_max_hint,
+        cell_builder_checked=cell_builder_checked,
+        cb_disabled=cb_disabled,
+        cb_flag_val=cb_flag_val,
+        cb_cell_type_options=cb_cell_type_options,
+        cb_cell_n_val=cb_cell_n_val,
+        cb_cell_a_val=cb_cell_a_val,
+        cb_cell_b_val=cb_cell_b_val,
+        cb_cell_m_val=cb_cell_m_val,
+        cb_cell_n2_val=cb_cell_n2_val,
+        cb_cell_t_val=cb_cell_t_val,
+        cb_junction_type_options=cb_junction_type_options,
+        cb_junction_k_val=cb_junction_k_val,
+        cb_junction_a_val=cb_junction_a_val,
+        cb_junction_b_val=cb_junction_b_val,
+        cb_family_type_options=cb_family_type_options,
+        cb_family_count_val=cb_family_count_val,
+        cb_family_rows_val=cb_family_rows_val,
+        cb_family_cols_val=cb_family_cols_val,
+        cb_pattern_path_sel=cb_pattern_path_sel,
+        cb_pattern_cycle_sel=cb_pattern_cycle_sel,
+        cb_alt_cell_type_options=cb_alt_cell_type_options,
+        cb_alt_cell_n_val=cb_alt_cell_n_val,
+        cb_alt_cell_a_val=cb_alt_cell_a_val,
+        cb_alt_cell_b_val=cb_alt_cell_b_val,
+        cb_alt_cell_m_val=cb_alt_cell_m_val,
+        cb_alt_cell_n2_val=cb_alt_cell_n2_val,
+        cb_alt_cell_t_val=cb_alt_cell_t_val,
+        cb_compare_checked=cb_compare_checked,
+        cb_baseline_options=cb_baseline_options,
     )
 
     # No graph provided — empty state

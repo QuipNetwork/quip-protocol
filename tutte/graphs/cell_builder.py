@@ -60,24 +60,42 @@ def _make_cell(cell_type: str, params: Dict[str, Any]) -> Tuple[nx.Graph, str]:
             raise ValueError("P_n requires n >= 2")
         return nx.path_graph(n), f"P_{n}"
     if t in ("z11", "z_1_1", "zephyr11"):
-        import dwave_networkx as dnx
-        G = dnx.zephyr_graph(1, t=1)
-        # Relabel 0..n-1 for canonical handling.
-        mapping = {old: new for new, old in enumerate(sorted(G.nodes))}
-        return nx.relabel_nodes(G, mapping), "Z(1,1)"
+        # Legacy shortcut for Z(1, 1).
+        return _make_cell("zephyr", {"m": 1, "t": 1})
     if t in ("cm1", "chimera1"):
-        import dwave_networkx as dnx
-        G = dnx.chimera_graph(1)  # K_{4,4}
-        mapping = {old: new for new, old in enumerate(sorted(G.nodes))}
-        return nx.relabel_nodes(G, mapping), "Cm1 (K_{4,4})"
+        # Legacy shortcut for Chimera C(1) = K_{4,4}.
+        return _make_cell("chimera", {"m": 1})
     if t in ("pm2", "pegasus2"):
-        # Pm1 is empty in dwave_networkx; the smallest non-trivial Pegasus
-        # cell is the 8-vertex K_{4,4} sub-cell or the full Pm2 super-cell
-        # (~40 vertices). Use Pm2 as the "small Pegasus" cell template.
+        # Legacy shortcut for Pegasus P(2).
+        return _make_cell("pegasus", {"m": 2})
+    if t in ("zephyr", "z"):
         import dwave_networkx as dnx
-        G = dnx.pegasus_graph(2)
+        m = int(params.get("m", 1))
+        zt = int(params.get("t", 1))
+        if m < 1 or zt < 1:
+            raise ValueError("Zephyr requires m >= 1 and t >= 1")
+        G = dnx.zephyr_graph(m, t=zt)
         mapping = {old: new for new, old in enumerate(sorted(G.nodes))}
-        return nx.relabel_nodes(G, mapping), "Pm2"
+        return nx.relabel_nodes(G, mapping), f"Z({m},{zt})"
+    if t in ("chimera", "cm"):
+        import dwave_networkx as dnx
+        m = int(params.get("m", 1))
+        # n defaults to m for the square form; explicit n makes it rectangular.
+        n = int(params.get("n", m))
+        if m < 1 or n < 1:
+            raise ValueError("Chimera requires m >= 1 and n >= 1")
+        G = dnx.chimera_graph(m, n=n)
+        mapping = {old: new for new, old in enumerate(sorted(G.nodes))}
+        label = f"Cm({m})" if m == n else f"Cm({m},{n})"
+        return nx.relabel_nodes(G, mapping), label
+    if t in ("pegasus", "pm"):
+        import dwave_networkx as dnx
+        m = int(params.get("m", 2))
+        if m < 2:
+            raise ValueError("Pegasus requires m >= 2 (P(1) is empty)")
+        G = dnx.pegasus_graph(m)
+        mapping = {old: new for new, old in enumerate(sorted(G.nodes))}
+        return nx.relabel_nodes(G, mapping), f"Pm({m})"
     raise ValueError(f"Unknown cell_type {cell_type!r}")
 
 
@@ -100,16 +118,20 @@ def _default_anchors(
             f"junction k={k} exceeds cell |V|={n}"
         )
     t = cell_type.lower()
-    if t in ("z11", "z_1_1", "zephyr11"):
-        # Z(1,1) decomposes as K_4 + C_8 + 8 chords (degree 5 = K_4 verts,
-        # degree 3 = C_8 verts). Prefer K_4 vertices (higher degree first).
+    if t in ("z11", "z_1_1", "zephyr11", "zephyr", "z"):
+        # Zephyr cells: prefer higher-degree vertices first. For Z(1,1) this
+        # surfaces the K_4 vertices; for larger Zephyr it surfaces the
+        # densely-connected internal nodes.
         deg_sorted = sorted(
             cell_graph.nodes,
             key=lambda v: (-cell_graph.degree(v), v),
         )
         return deg_sorted[:k]
-    if t in ("cm1", "chimera1", "k_a_b", "kab", "complete_bipartite"):
-        # K_{a,b}: prefer one side. The relabeling puts side A as 0..a-1.
+    if t in ("cm1", "chimera1", "chimera", "cm",
+             "k_a_b", "kab", "complete_bipartite",
+             "pegasus", "pm", "pm2", "pegasus2"):
+        # K_{a,b} / Chimera / Pegasus: prefer one side of the bipartition.
+        # The relabeling puts side A as 0..a-1.
         return list(range(min(k, n)))
     # Default: first k.
     return list(range(k))
