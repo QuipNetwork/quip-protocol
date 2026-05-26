@@ -546,3 +546,79 @@ def test_mode_names_matches_expected_subcommands():
     slots by index, so reordering MODE_NAMES would silently change which
     mode binds which port across container restarts."""
     assert MODE_NAMES == ("cpu", "gpu", "qpu")
+
+
+# ----------------------------------------------------------------------
+# Mempool + multi-backend fail-fast (W4a)
+# ----------------------------------------------------------------------
+
+
+def test_resolve_modes_mempool_single_backend_ok():
+    """Single backend + --mine-mode mempool works as before — the
+    constraint only fires when there are multiple groups competing
+    for the same substrate-account solver registration."""
+    assert resolve_modes({"cpu": {"num_cpus": 4}}, mine_mode="mempool") == ["cpu"]
+    assert resolve_modes({"dwave": {}}, mine_mode="both") == ["qpu"]
+
+
+def test_resolve_modes_pow_mode_allows_multi_backend():
+    """PoW path has no per-account solver registration — multi-backend
+    containers work fine and each child submits proofs independently."""
+    backends = {"cpu": {}, "dwave": {}}
+    assert resolve_modes(backends, mine_mode="pow") == ["cpu", "qpu"]
+
+
+def test_resolve_modes_no_mine_mode_skips_guard():
+    """When the caller doesn't pass --mine-mode (e.g. operator running
+    one-shot `quip-miner resolve-modes` without a PoW intent), the
+    multi-backend guard is skipped — the constraint belongs to
+    mempool, not to backend resolution itself."""
+    backends = {"cpu": {}, "dwave": {}}
+    assert resolve_modes(backends) == ["cpu", "qpu"]
+
+
+def test_resolve_modes_mempool_multi_backend_rejected():
+    """The headline case — multi-backend config + --mine-mode mempool
+    must fail at launch with a clear code so the operator sees the
+    architectural constraint instead of getting silent
+    solver-registration failures from N-1 children at runtime."""
+    backends = {"cpu": {}, "dwave": {}}
+    with pytest.raises(ModeResolutionError) as excinfo:
+        resolve_modes(backends, mine_mode="mempool")
+    assert excinfo.value.code == "multi-backend-not-allowed-in-mempool-mode"
+    # Error names every group so the operator knows what to drop.
+    assert "cpu" in str(excinfo.value)
+    assert "dwave" in str(excinfo.value)
+
+
+def test_resolve_modes_both_mode_multi_backend_rejected():
+    """--mine-mode both is a superset of mempool's constraint — also
+    rejected for multi-backend."""
+    backends = {"cpu": {}, "cuda": {"0": {}}}
+    with pytest.raises(ModeResolutionError) as excinfo:
+        resolve_modes(backends, mine_mode="both")
+    assert excinfo.value.code == "multi-backend-not-allowed-in-mempool-mode"
+
+
+def test_resolve_modes_mempool_case_insensitive():
+    """`MEMPOOL` / `Both` / etc. all trigger the guard. Bash callers
+    may pass through whatever the operator set in QUIP_MINE_MODE; the
+    guard normalises rather than insisting on lowercase."""
+    backends = {"cpu": {}, "dwave": {}}
+    for variant in ("MEMPOOL", "Mempool", "MeMpOoL", "BOTH", "Both"):
+        with pytest.raises(ModeResolutionError) as excinfo:
+            resolve_modes(backends, mine_mode=variant)
+        assert (
+            excinfo.value.code == "multi-backend-not-allowed-in-mempool-mode"
+        ), variant
+
+
+def test_resolve_mode_singular_also_respects_mine_mode():
+    """The singular wrapper threads `mine_mode` through to the plural
+    impl so one-shot callers benefit from the same guard."""
+    with pytest.raises(ModeResolutionError) as excinfo:
+        resolve_mode({"cpu": {}, "dwave": {}}, mine_mode="mempool")
+    # Multi-backend triggers BOTH the mempool guard AND the
+    # single-mode rejection — the mempool one fires first since it's
+    # architecturally more specific.
+    assert excinfo.value.code == "multi-backend-not-allowed-in-mempool-mode"

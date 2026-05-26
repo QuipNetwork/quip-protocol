@@ -97,7 +97,7 @@ fi
 # Defer to `quip-miner resolve-modes` so the bash glue doesn't have to
 # parse TOML. The Python side is the single source of truth on which
 # section names belong to which group. Returns one mode per line.
-RESOLVE_ARGS=(resolve-modes --config "$CONFIG_FILE")
+RESOLVE_ARGS=(resolve-modes --config "$CONFIG_FILE" --mine-mode "$MINE_MODE")
 if [ -n "${QUIP_DEFAULT_MODE:-}" ]; then
     RESOLVE_ARGS+=(--default "$QUIP_DEFAULT_MODE")
 fi

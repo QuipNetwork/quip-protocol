@@ -145,3 +145,94 @@ def test_telemetry_process_responds_to_shutdown_event(tmp_path: Path):
         if proc.is_alive():
             proc.terminate()
             proc.join()
+
+
+def test_telemetry_process_aggregator_mode_merges_per_kind_snapshots(tmp_path: Path):
+    """End-to-end: start telemetry_main in aggregator mode with two
+    per-kind snapshot files; verify /api/v1/stats returns the merged
+    view (summed counters, unioned miners, per-mode breakdown)."""
+    from shared.stats_snapshot import snapshot_filename_for
+    from shared.telemetry_process import telemetry_main
+
+    snap_dir = tmp_path / "runtime"
+    snap_dir.mkdir()
+    (snap_dir / snapshot_filename_for("cpu")).write_text(json.dumps({
+        "mode": "cpu",
+        "controller": {"heads_observed": 50, "proofs_submitted": 3, "active_url": "ws://a"},
+        "node_id": "rig-01",
+        "ss58_address": "5GPP",
+        "miners": [{"id": "rig-CPU-1", "type": "CPU"}],
+        "descriptor": {"cpus": 8},
+        "miner_survey": {"v": "quip.miner_survey.v1"},
+    }))
+    (snap_dir / snapshot_filename_for("qpu")).write_text(json.dumps({
+        "mode": "qpu",
+        "controller": {"heads_observed": 50, "proofs_submitted": 2, "active_url": "ws://b"},
+        "node_id": "rig-01",
+        "ss58_address": "5GPP",
+        "miners": [{"id": "rig-QPU-DWAVE-1", "type": "QPU"}],
+        "descriptor": {"cpus": 8},
+        "miner_survey": {"v": "quip.miner_survey.v1"},
+    }))
+
+    port = _free_port()
+    shutdown_event = mp.Event()
+    proc = mp.Process(
+        target=telemetry_main,
+        kwargs={
+            "listen_host": "127.0.0.1",
+            "listen_port": port,
+            "snapshot_dir": str(snap_dir),
+            "validator_urls": [],
+            "shutdown_event": shutdown_event,
+        },
+    )
+    proc.start()
+    try:
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            try:
+                import urllib.request
+                stats_raw = urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/v1/stats", timeout=0.5,
+                ).read()
+                break
+            except Exception:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("aggregator did not start in 5s")
+
+        stats = json.loads(stats_raw)
+        assert stats["success"] is True
+        ctrl = stats["data"]["controller"]
+        # Summed across the two snapshots.
+        assert ctrl["heads_observed"] == 100
+        assert ctrl["proofs_submitted"] == 5
+        # First-found active_url (cpu snapshot comes first alphabetically).
+        assert ctrl["active_url"] == "ws://a"
+        # Unioned miners, dedup by id.
+        miner_ids = {m["id"] for m in stats["data"]["miners"]}
+        assert miner_ids == {"rig-CPU-1", "rig-QPU-DWAVE-1"}
+        # Per-mode breakdown is present and bucketed correctly.
+        modes = stats["data"]["modes"]
+        assert set(modes.keys()) == {"cpu", "qpu"}
+        assert modes["cpu"]["controller"]["proofs_submitted"] == 3
+        assert modes["qpu"]["controller"]["proofs_submitted"] == 2
+
+        # /api/v1/status also surfaces `modes` for the dashboard.
+        status_raw = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/v1/status", timeout=2.0,
+        ).read()
+        status = json.loads(status_raw)
+        assert status["success"] is True
+        # is_mining was the bug — snapshot_dir mode would crash on
+        # `stats_snapshot_path.stat()`. Now derives from newest file
+        # mtime across the dir; freshly written snapshots are <5s old.
+        assert status["data"]["is_mining"] is True
+        assert set(status["data"]["modes"].keys()) == {"cpu", "qpu"}
+    finally:
+        shutdown_event.set()
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()

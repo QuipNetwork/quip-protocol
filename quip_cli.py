@@ -560,10 +560,19 @@ def quip_miner(log_level: str) -> None:
     "config asks for a mode outside this set. Set by Docker images "
     "via QUIP_IMAGE_SUPPORTS; omit for unrestricted resolution.",
 )
+@click.option(
+    "--mine-mode",
+    "mine_mode",
+    type=click.Choice(["pow", "mempool", "both"], case_sensitive=False),
+    default=None,
+    help="See `quip-miner resolve-modes --help`. Same guard, single-mode "
+    "convenience caller.",
+)
 def quip_miner_resolve_mode(
     config_path: Optional[str],
     default_mode: Optional[str],
     image_supports_csv: Optional[str],
+    mine_mode: Optional[str],
 ) -> None:
     """Resolve the quip-miner subcommand for a config file.
 
@@ -601,6 +610,7 @@ def quip_miner_resolve_mode(
             backends,
             default=default_mode.lower() if default_mode else None,
             image_supports=image_supports,
+            mine_mode=mine_mode.lower() if mine_mode else None,
         )
     except ModeResolutionError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -623,10 +633,22 @@ def quip_miner_resolve_mode(
     default=None,
     help="Comma-separated subset of {cpu,gpu,qpu} this container can run.",
 )
+@click.option(
+    "--mine-mode",
+    "mine_mode",
+    type=click.Choice(["pow", "mempool", "both"], case_sensitive=False),
+    default=None,
+    help="Work source the miner will run with (mirrors quip-miner cpu/gpu/qpu's "
+    "--mode flag). When mempool or both, a multi-backend config is rejected with "
+    "`multi-backend-not-allowed-in-mempool-mode` — a single substrate account can "
+    "only register as one solver type, so the other children would silently fail "
+    "registration.",
+)
 def quip_miner_resolve_modes(
     config_path: Optional[str],
     default_mode: Optional[str],
     image_supports_csv: Optional[str],
+    mine_mode: Optional[str],
 ) -> None:
     """Resolve the quip-miner subcommand(s) for a config file.
 
@@ -661,6 +683,7 @@ def quip_miner_resolve_modes(
             backends,
             default=default_mode.lower() if default_mode else None,
             image_supports=image_supports,
+            mine_mode=mine_mode.lower() if mine_mode else None,
         )
     except ModeResolutionError as exc:
         raise click.ClickException(str(exc)) from exc

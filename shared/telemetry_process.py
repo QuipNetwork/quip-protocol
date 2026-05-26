@@ -177,12 +177,17 @@ async def _run(
     shutdown_event: mp.synchronize.Event,
 ) -> None:
     """Set up the aiohttp app, connect a `SubstrateClient`, serve until shutdown."""
-    failover = SubstrateUrlFailover(
-        validator_urls, initial_backoff_s=1.0, max_backoff_s=60.0,
-    )
+    # No validator URLs is a legitimate config (snapshot-only deployments,
+    # tests). The chain-backed endpoints degrade to 503; everything that
+    # reads the snapshot keeps working.
+    failover: Optional[SubstrateUrlFailover] = None
+    if validator_urls:
+        failover = SubstrateUrlFailover(
+            validator_urls, initial_backoff_s=1.0, max_backoff_s=60.0,
+        )
 
     client: Optional[SubstrateClient] = None
-    if validator_urls:
+    if failover is not None:
         client = SubstrateClient(url=failover.current())
         try:
             await client.connect()
@@ -269,6 +274,35 @@ def _error(message: str, code: str, status: int = 400) -> web.Response:
     )
 
 
+def _snapshot_freshest_mtime(request: web.Request) -> float:
+    """Most-recent mtime across the snapshot source(s), 0.0 if unknown.
+
+    In single-snapshot mode this is just `stats_snapshot_path.stat().st_mtime`.
+    In aggregator mode we take the MAX mtime across every per-mode file —
+    `is_mining` should report True as long as *any* child is writing
+    snapshots (a dead cpu child shouldn't mark the gpu child as offline).
+    """
+    snapshot_dir: Optional[Path] = request.app["snapshot_dir"]
+    if snapshot_dir is not None:
+        pattern = "telemetry-stats-*.json"
+        latest = 0.0
+        for path in snapshot_dir.glob(pattern):
+            try:
+                mt = path.stat().st_mtime
+            except OSError:
+                continue
+            if mt > latest:
+                latest = mt
+        return latest
+    path: Optional[Path] = request.app["stats_snapshot_path"]
+    if path is None:
+        return 0.0
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _read_snapshot_or_503(
     request: web.Request,
 ) -> Tuple[Optional[dict], Optional[web.Response]]:
@@ -304,8 +338,8 @@ async def _get_client(request: web.Request) -> Optional[SubstrateClient]:
     next handler call retries from there.
     """
     client: Optional[SubstrateClient] = request.app["client"]
-    failover: SubstrateUrlFailover = request.app["failover"]
-    if client is None:
+    failover: Optional[SubstrateUrlFailover] = request.app["failover"]
+    if client is None or failover is None:
         return None
     if client._iface is not None:  # noqa: SLF001 — already connected
         return client
@@ -436,11 +470,7 @@ async def _handle_status(request: web.Request) -> web.Response:
     if error_resp is not None:
         return error_resp
 
-    path: Path = request.app["stats_snapshot_path"]
-    try:
-        snapshot_mtime = path.stat().st_mtime
-    except OSError:
-        snapshot_mtime = 0.0
+    snapshot_mtime = _snapshot_freshest_mtime(request)
     is_mining = (time.time() - snapshot_mtime) < _SNAPSHOT_FRESHNESS_S
 
     started_at = request.app.get("started_at") or time.time()
@@ -485,6 +515,11 @@ async def _handle_status(request: web.Request) -> web.Response:
             "miner_registered": miner_registered,
             "miner_info": miner_info_dict,
             "miners": snapshot.get("miners", []),
+            # Per-mode breakdown — populated in aggregator mode (one
+            # entry per active backend group: cpu / gpu / qpu); empty
+            # dict in legacy single-process mode where there's only
+            # one set of counters and no need to distinguish them.
+            "modes": snapshot.get("modes", {}),
         }
     )
 

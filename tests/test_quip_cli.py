@@ -1339,3 +1339,56 @@ def test_resolve_modes_no_config_no_default_errors():
     result = CliRunner().invoke(quip_cli.quip_miner, ["resolve-modes"])
     assert result.exit_code != 0
     assert "no-mode-resolvable" in result.output
+
+
+# ── --mine-mode guard (W4a) ───────────────────────────────────────────
+
+
+def test_resolve_modes_mempool_multi_backend_cli_errors(tmp_path):
+    """End-to-end via the CLI: --mine-mode mempool + multi-backend
+    config → non-zero exit with the kebab-case error code on stderr
+    for the entrypoint to grep."""
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[cpu]\nnum_cpus = 2\n'
+        '[dwave]\ndaily_budget = "60s"\n'
+    )
+    result = CliRunner().invoke(
+        quip_cli.quip_miner,
+        ["resolve-modes", "--config", str(cfg), "--mine-mode", "mempool"],
+    )
+    assert result.exit_code != 0
+    assert "multi-backend-not-allowed-in-mempool-mode" in result.output
+
+
+def test_resolve_modes_pow_multi_backend_cli_ok(tmp_path):
+    """--mine-mode pow with multi-backend → 2 modes, no error.
+    Mirror of the test above with the safe mine-mode value."""
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[cpu]\nnum_cpus = 2\n'
+        '[dwave]\n'
+    )
+    result = CliRunner().invoke(
+        quip_cli.quip_miner,
+        ["resolve-modes", "--config", str(cfg), "--mine-mode", "pow"],
+    )
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().splitlines() == ["cpu", "qpu"]
+
+
+def test_resolve_modes_mempool_single_backend_cli_ok(tmp_path):
+    """Single backend + mempool is the supported path — no error."""
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[dwave]\ndaily_budget = "60s"\n'
+    )
+    result = CliRunner().invoke(
+        quip_cli.quip_miner,
+        ["resolve-modes", "--config", str(cfg), "--mine-mode", "mempool"],
+    )
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "qpu"
