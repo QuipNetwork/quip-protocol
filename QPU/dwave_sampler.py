@@ -128,6 +128,7 @@ class DWaveSamplerWrapper:
         job_label_prefix: Optional[str] = None,
         solver_name: Optional[str] = None,
         region: Optional[str] = None,
+        token: Optional[str] = None,
     ):
         """
         Initialize D-Wave sampler wrapper.
@@ -144,6 +145,12 @@ class DWaveSamplerWrapper:
                         If None, uses DWAVE_API_SOLVER env var.
             region: Optional D-Wave region (e.g. "na-east-1").
                    If None, uses default from config.
+            token: Optional D-Wave API token. Passed verbatim to
+                  `DWaveSampler(token=...)`. When unset the SDK falls
+                  back to DWAVE_API_KEY env var → ~/.config/dwave/dwave.conf
+                  → fails with "API token not defined". Honoring an
+                  explicit kwarg lets a TOML `[dwave].token` value win
+                  without requiring operators to also set the env var.
         """
         self.topology = topology
         self.topology_name = topology.solver_name
@@ -166,12 +173,21 @@ class DWaveSamplerWrapper:
 
         self.job_label_prefix = job_label_prefix
 
-        # Check for API key before attempting connection
-        api_key = os.environ.get('DWAVE_API_KEY')
-        if not api_key:
-            logger.warning("[QPU] DWAVE_API_KEY environment variable not set!")
+        # Token resolution order: explicit kwarg (TOML `[dwave].token`)
+        # → DWAVE_API_KEY env var → SDK config file. Only warn when none
+        # of those are present; the SDK itself will fail loudly at the
+        # DWaveSampler() call below.
+        if token:
+            logger.debug(f"[QPU] using explicit D-Wave token (length: {len(token)})")
         else:
-            logger.debug(f"[QPU] DWAVE_API_KEY set (length: {len(api_key)})")
+            api_key = os.environ.get('DWAVE_API_KEY')
+            if not api_key:
+                logger.warning(
+                    "[QPU] no D-Wave token set (DWAVE_API_KEY env unset, "
+                    "no token kwarg, no SDK config file)"
+                )
+            else:
+                logger.debug(f"[QPU] DWAVE_API_KEY set (length: {len(api_key)})")
 
         # Initialize base QPU sampler
         logger.info("[QPU] Connecting to D-Wave API...")
@@ -181,6 +197,8 @@ class DWaveSamplerWrapper:
                 sampler_kwargs['solver'] = solver_name
             if region is not None:
                 sampler_kwargs['region'] = region
+            if token is not None:
+                sampler_kwargs['token'] = token
             base_sampler = DWaveSampler(**sampler_kwargs)
             logger.info(f"[QPU] Connected to solver: {base_sampler.properties.get('chip_id', 'unknown')}")
             logger.info(f"[QPU] Qubits available: {len(base_sampler.nodelist)}")

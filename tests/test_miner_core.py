@@ -229,9 +229,9 @@ def test_toml_modal_section_with_gpu_type_picks_correct_class(tmp_path):
 
 def test_toml_dwave_section_round_trips_all_keys(tmp_path):
     """Full D-Wave key set survives the loader → spec-builder boundary.
-    daily_budget / solver / qpu_min_blocks_for_estimation / qpu_ema_alpha
-    must all land in the QPU sampler's cfg block — the indexer surfaces
-    these in the system descriptor."""
+    Token + region + solver translate into the SDK-canonical kwargs
+    (token / region / solver_name) the DWaveSampler constructor
+    expects; budget/tuning keys pass through verbatim for QPUTimeManager."""
     from shared.miner_config import load_backend_config
     from shared.miner_core import _build_qpu_specs
 
@@ -241,6 +241,8 @@ def test_toml_dwave_section_round_trips_all_keys(tmp_path):
         '[dwave]\n'
         'daily_budget = "60s"\n'
         'solver = "Advantage2_system1"\n'
+        'region = "na-west-1"\n'
+        'token = "dwave-secret-xyz"\n'
         'qpu_min_blocks_for_estimation = 7\n'
         'qpu_ema_alpha = 0.25\n'
     )
@@ -250,9 +252,55 @@ def test_toml_dwave_section_round_trips_all_keys(tmp_path):
     cfg = specs[0]["cfg"]
     assert cfg["qpu_type"] == "dwave"
     assert cfg["daily_budget"] == "60s"
+    # The cfg key matches the operator-facing TOML spelling (`solver`)
+    # so the descriptor scrubber's whitelist surfaces it directly.
+    # build_miner_from_spec translates to DWaveMiner's `solver_name`
+    # kwarg at the constructor boundary.
     assert cfg["solver"] == "Advantage2_system1"
+    assert cfg["region"] == "na-west-1"
+    # `token` is now passed through — this was the root cause of the
+    # "API token not defined" error operators hit when they set
+    # `[dwave].token` in TOML expecting it to be honored.
+    assert cfg["token"] == "dwave-secret-xyz"
     assert cfg["qpu_min_blocks_for_estimation"] == 7
     assert cfg["qpu_ema_alpha"] == 0.25
+
+
+def test_toml_dwave_token_does_not_leak_to_descriptor(tmp_path):
+    """Defense-in-depth regression: even though the dwave cfg now
+    carries `token`, the descriptor pipeline's whitelist
+    (`_QPU_HANDLE_FIELD_WHITELIST = {"solver", "daily_budget"}`)
+    must still drop it before /api/v1/status canonicalization.
+    Catches the case where someone widens the whitelist or routes the
+    spec through a non-scrubbing code path."""
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import _build_qpu_specs
+    from shared.system_info import (
+        build_descriptor,
+        to_canonical_json,
+        validate_descriptor,
+    )
+
+    p = tmp_path / "leaky.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[dwave]\n'
+        'token = "dwave-MUST-NOT-LEAK-abc123"\n'
+        'daily_budget = "60s"\n'
+    )
+    backends = load_backend_config(p)
+    specs = _build_qpu_specs("rig", backends)
+    # In-process: token IS in the spec (the sampler needs it).
+    assert specs[0]["cfg"]["token"] == "dwave-MUST-NOT-LEAK-abc123"
+    # On-chain: token must NOT appear in the canonical descriptor JSON.
+    desc = build_descriptor(
+        node_id="rig", node_name="rig",
+        miner_specs=specs, include_system_info=False,
+    )
+    validate_descriptor(desc)
+    payload = to_canonical_json(desc)
+    assert "dwave-MUST-NOT-LEAK-abc123" not in payload.decode("utf-8")
+    assert "token" not in desc.miners["dwave"]
 
 
 def test_toml_ibm_section_produces_ibm_spec_with_token(tmp_path):

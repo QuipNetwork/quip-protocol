@@ -426,13 +426,21 @@ def _build_qpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
                 ),
                 "qpu_ema_alpha": dev.get("qpu_ema_alpha", 0.3),
             }
-            # ``solver`` is operator-asserted (TOML pass-through). The
-            # sampler picks the active solver from ``DWAVE_API_SOLVER``
-            # at runtime; the field is preserved here so descriptor
-            # builders can surface it to dashboards without re-parsing
-            # the TOML.
+            # TOML keys flow into the cfg dict 1:1 — operator-facing
+            # names match what they put in the file. The
+            # build_miner_from_spec boundary translates `solver` →
+            # `solver_name` (DWaveMiner's kwarg) before instantiation.
+            # The descriptor scrubber's whitelist
+            # (`_QPU_HANDLE_FIELD_WHITELIST = {"solver", "daily_budget"}`)
+            # surfaces `solver` to dashboards directly. `token` flows
+            # through to DWaveSampler so a TOML-set token works without
+            # also requiring DWAVE_API_KEY env.
             if dev.get("solver") is not None:
                 cfg_block["solver"] = dev["solver"]
+            if dev.get("region") is not None:
+                cfg_block["region"] = dev["region"]
+            if dev.get("token") is not None:
+                cfg_block["token"] = dev["token"]
             specs.append(
                 {
                     "id": f"{node_id}-QPU-{tag}-{i}",

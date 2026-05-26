@@ -123,6 +123,14 @@ def build_miner_from_spec(spec: Dict[str, Any]):
                     "qpu_type",
                 )
             }
+        # Translate operator-facing `solver` → DWaveMiner's
+        # `solver_name` kwarg. The cfg dict uses the v0.1 / descriptor
+        # spelling (`solver`); the constructor uses the disambiguated
+        # name to make clear it's the solver identifier, not the
+        # sampler instance.
+        if "solver" in cfg:
+            cfg = {**cfg, "solver_name": cfg["solver"]}
+            cfg.pop("solver")
         return QPU.DWaveMiner(miner_id, time_config=time_config, **cfg)
     else:
         raise ValueError(f"Unknown miner kind '{kind}'")

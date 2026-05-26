@@ -82,6 +82,7 @@ class DWaveMiner(BaseMiner):
         queue_depth: int = 30,
         solver_name: Optional[str] = None,
         region: Optional[str] = None,
+        token: Optional[str] = None,
         drain_on_stop: bool = False,
         **cfg
     ):
@@ -95,6 +96,10 @@ class DWaveMiner(BaseMiner):
             queue_depth: Number of QPU jobs to keep in-flight (default: 30).
             solver_name: Optional solver name (e.g. "Advantage2_system1").
             region: Optional D-Wave region (e.g. "na-east-1").
+            token: Optional D-Wave API token. When unset the SDK falls
+                back to the `DWAVE_API_KEY` env var; when set, it wins
+                over env. Matches the operator's expectation that a
+                TOML `[dwave].token` value is honored verbatim.
             drain_on_stop: When True and stop_event fires, stop submitting
                 new QPU jobs but wait for in-flight ones to complete so
                 their results can be inspected. Used by tests that need
@@ -111,6 +116,7 @@ class DWaveMiner(BaseMiner):
                 embedding_file=embedding_file,
                 solver_name=solver_name,
                 region=region,
+                token=token,
             )
             init_logger.info(
                 f"[QPU] Sampler ready: {len(sampler.nodes)} nodes, "
