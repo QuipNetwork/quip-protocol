@@ -106,8 +106,11 @@ class AttemptLogger:
         self,
         miner_id: str,
         log_dir: Path = DEFAULT_LOG_DIR,
+        *,
+        miner_type: str = "",
     ) -> None:
         self.miner_id = miner_id
+        self.miner_type = miner_type
         self.log_dir = log_dir
         self._appender_by_date: dict[str, _JsonlAppender] = {}
 
@@ -155,6 +158,12 @@ class AttemptLogger:
             "type": "attempt",
             "ts_ns": _now_ns(),
             "miner_id": self.miner_id,
+            # `miner_type` mirrors `MinerHandle.miner_type` (CPU / CUDA /
+            # METAL / MODAL / QPU). Lets the indexer + dashboard show
+            # which backend produced an attempt without parsing miner_id.
+            # Empty string for legacy callers that didn't pass it; the
+            # parser tolerates both.
+            "miner_type": self.miner_type,
             "dispatch_id": dispatch_id,
             "iter": iter_num,
             "nonce": nonce_hex,
@@ -254,6 +263,7 @@ class SubmissionLogger:
         threshold_milli: int,
         last_proof_block_hash_hex: str,
         outcome: str,
+        miner_type: str = "",
         extrinsic_hash: Optional[str] = None,
         chain_block_hash: Optional[str] = None,
         chain_block_number: Optional[int] = None,
@@ -274,6 +284,12 @@ class SubmissionLogger:
             "ts_ns": _now_ns(),
             "solution_id": solution_id,
             "miner_id": miner_id,
+            # `miner_type` of the WINNING backend (which MinerHandle
+            # produced the submitted result). Lets dashboards report
+            # which backend type cleared the chain target without
+            # parsing miner_id. Empty string for legacy rows; the
+            # parser tolerates both.
+            "miner_type": miner_type,
             "dispatch_id": dispatch_id,
             "energy_milli": energy_milli,
             "diversity_milli": diversity_milli,

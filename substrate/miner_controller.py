@@ -1033,6 +1033,7 @@ class SubstrateMinerController:
             self._submission_log.record(
                 solution_id=solution_id,
                 miner_id=envelope.handle_id,
+                miner_type=envelope.result.miner_type,
                 dispatch_id=envelope.dispatch_id,
                 energy_milli=result_energy_milli,
                 diversity_milli=result_diversity_milli,
@@ -1065,6 +1066,7 @@ class SubstrateMinerController:
                 self._submission_log.record(
                     solution_id=solution_id,
                     miner_id=envelope.handle_id,
+                    miner_type=envelope.result.miner_type,
                     dispatch_id=envelope.dispatch_id,
                     energy_milli=result_energy_milli,
                     diversity_milli=result_diversity_milli,
@@ -1191,6 +1193,7 @@ class SubstrateMinerController:
             self._submission_log.record(
                 solution_id=solution_id,
                 miner_id=envelope.handle_id,
+                miner_type=envelope.result.miner_type,
                 dispatch_id=envelope.dispatch_id,
                 energy_milli=result_energy_milli,
                 diversity_milli=result_diversity_milli,
@@ -1226,6 +1229,7 @@ class SubstrateMinerController:
             self._submission_log.record(
                 solution_id=solution_id,
                 miner_id=envelope.handle_id,
+                miner_type=envelope.result.miner_type,
                 dispatch_id=envelope.dispatch_id,
                 energy_milli=result_energy_milli,
                 diversity_milli=result_diversity_milli,
@@ -1241,6 +1245,7 @@ class SubstrateMinerController:
             self._submission_log.record(
                 solution_id=solution_id,
                 miner_id=envelope.handle_id,
+                miner_type=envelope.result.miner_type,
                 dispatch_id=envelope.dispatch_id,
                 energy_milli=result_energy_milli,
                 diversity_milli=result_diversity_milli,

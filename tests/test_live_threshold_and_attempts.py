@@ -215,3 +215,62 @@ def test_query_by_solution_id_missing_returns_none(tmp_path: Path) -> None:
     an empty join — the API caller needs to distinguish 'no such
     submission' (404) from 'submission exists but no attempts'."""
     assert query_by_solution_id(999_999, log_dir=tmp_path) is None
+
+
+def test_attempt_logger_writes_miner_type(tmp_path: Path) -> None:
+    """`miner_type` (CPU / CUDA / METAL / MODAL / QPU) is fixed per
+    AttemptLogger and written into every record. Dashboard reads it
+    to attribute attempts to the right backend in multi-process
+    containers without parsing miner_id."""
+    logger = AttemptLogger("miner-cpu-1", log_dir=tmp_path, miner_type="CPU")
+    logger.record(
+        dispatch_id=1, iter_num=0,
+        nonce_hex="0x00", salt_hex="0x00",
+        best_energy_milli=-1_000_000, num_samples=64,
+        post_processed=True, stored_as_best=False,
+        result_kind="rejected",
+    )
+    files = sorted(tmp_path.glob("attempts-*.jsonl"))
+    record = json.loads(files[0].read_text().splitlines()[0])
+    assert record["miner_type"] == "CPU"
+
+
+def test_attempt_logger_miner_type_defaults_to_empty(tmp_path: Path) -> None:
+    """Legacy callers that don't pass `miner_type` still produce a
+    well-formed record — the dashboard's parser tolerates an empty
+    miner_type so old miners keep working through the upgrade."""
+    logger = AttemptLogger("miner-legacy", log_dir=tmp_path)
+    logger.record(
+        dispatch_id=1, iter_num=0,
+        nonce_hex="0x00", salt_hex="0x00",
+        best_energy_milli=-1_000_000, num_samples=64,
+        post_processed=True, stored_as_best=False,
+    )
+    files = sorted(tmp_path.glob("attempts-*.jsonl"))
+    record = json.loads(files[0].read_text().splitlines()[0])
+    assert record["miner_type"] == ""
+
+
+def test_submission_logger_writes_miner_type_per_call(tmp_path: Path) -> None:
+    """`miner_type` is a per-call parameter on SubmissionLogger.record
+    because the controller-side logger aggregates submissions from
+    every backend type. Each row carries the type of the winning
+    handle so the dashboard can render the Backend column for the
+    Recent Performance table."""
+    log = SubmissionLogger(log_dir=tmp_path)
+    sid = log.assign_id()
+    log.record(
+        solution_id=sid,
+        miner_id="rig-QPU-DWAVE-1",
+        miner_type="QPU",
+        dispatch_id=1,
+        energy_milli=-14_000_000,
+        diversity_milli=400,
+        threshold_milli=-13_500_000,
+        last_proof_block_hash_hex="0xabc",
+        outcome="submitted_inblock",
+    )
+    files = sorted(tmp_path.glob("submissions-*.jsonl"))
+    record = json.loads(files[0].read_text().splitlines()[0])
+    assert record["miner_type"] == "QPU"
+    assert record["miner_id"] == "rig-QPU-DWAVE-1"

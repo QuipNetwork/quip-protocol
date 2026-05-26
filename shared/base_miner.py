@@ -484,7 +484,7 @@ class BaseMiner(ABC):
         # field on each row distinguishes the two paths.
         attempt_log: AttemptLogger = (
             getattr(self, '_attempt_logger', None)
-            or AttemptLogger(self.miner_id)
+            or AttemptLogger(self.miner_id, miner_type=self.miner_type)
         )
         if not hasattr(self, '_attempt_logger'):
             self._attempt_logger = attempt_log
