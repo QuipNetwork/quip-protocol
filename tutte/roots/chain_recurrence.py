@@ -144,16 +144,37 @@ def compute_chain_full_poly_from_spec(spec) -> "Optional[TuttePolynomial]":
         return None
 
     # Translate the spec's per-neighbor anchor groups to the chain
-    # framework's per-side groups (group 0 = "left", group 1 = "right").
+    # framework's per-side groups. There are two distinct cases:
+    #
+    # 1. **Different-anchor cells** (e.g. the validated K_{4,4} chain test
+    #    fixture where left = shore A, right = shore B): the interior
+    #    cell has two DISTINCT anchor sets, one per neighbor. Use group 0
+    #    for left, group 1 for right.
+    #
+    # 2. **Shared-anchor cells** (real Chimera Cm(1, n) interior cells —
+    #    the same 4 K_{4,4} vertices serve as both the left and right
+    #    junction anchors): the spec has the same anchor list for both
+    #    neighbors. The chain framework's `left_anchor_group ==
+    #    right_anchor_group` mode handles this (per the validated
+    #    `extract_chain_transfer_matrix.py:k44_m4_chain` fixture which
+    #    uses `right_anchor_group=0` for the a-a Chimera chain). Without
+    #    this case, the divisor accounting (`divide_by_x_minus_1_power`)
+    #    raises "Polynomial not divisible by (x-1) at y^j" because we
+    #    over-count one (x-1) factor per step.
     nbr_ids = sorted(cell_anchor_groups_raw.keys())
     if len(nbr_ids) == 1:
         # Leaf cell — can't extract chain template from it.
         return None
     left_neighbor, right_neighbor = nbr_ids[0], nbr_ids[1]
-    cell_anchor_groups = {
-        0: cell_anchor_groups_raw[left_neighbor],
-        1: cell_anchor_groups_raw[right_neighbor],
-    }
+    left_anchors = list(cell_anchor_groups_raw[left_neighbor])
+    right_anchors = list(cell_anchor_groups_raw[right_neighbor])
+    shared_anchors = sorted(left_anchors) == sorted(right_anchors)
+    if shared_anchors:
+        cell_anchor_groups = {0: left_anchors}
+        right_group = 0
+    else:
+        cell_anchor_groups = {0: left_anchors, 1: right_anchors}
+        right_group = 1
 
     # Junction anchors A/B come from the spec.
     junction_anchors_A = list(spec.junction_anchors_A)
@@ -167,7 +188,7 @@ def compute_chain_full_poly_from_spec(spec) -> "Optional[TuttePolynomial]":
             junction_anchors_A=junction_anchors_A,
             junction_anchors_B=junction_anchors_B,
             left_anchor_group=0,
-            right_anchor_group=1,
+            right_anchor_group=right_group,
             verify_position_invariance=False,
         )
     except Exception:

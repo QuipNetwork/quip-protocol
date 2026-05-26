@@ -129,37 +129,25 @@ def _pegasus_cells() -> List[CellSpec]:
 
 
 def _zephyr_cells() -> List[CellSpec]:
-    """Zephyr cells: Z(1,1) atomic cell + K_{4,4} sub-cells.
+    """Zephyr cells: Z(1,1) atomic cell.
 
-    Per the ``probe_zephyr_cell_template.py`` empirical probe:
-      * ``Z(1,1)``: 12 vertices, 22 edges. Decomposes structurally as
-        ``K_4`` on {2, 3, 8, 9} + ``C_8`` on the remaining 8 vertices,
-        joined by 8 chord edges (degree pattern: K_4 verts = 5, C_8
-        verts = 3). NO ``K_{4,4}`` subgraphs.
-      * ``Z(1,2)``: 24 vertices, 76 edges, two disjoint ``K_{4,4}``
-        sub-cells (44% coverage) + 12-edge inter-cell junction.
-      * ``Z(1,3)``: 36 vertices, 162 edges, two ``K_{4,4}`` sub-cells
-        (44% coverage) + 24-edge junction.
+    Z(1,1) has 12 boundary vertices; the unified chord-junction theorem
+    on Z(1, 2) and similar uses V_T subsets of ALL sizes 1..12 (per
+    ``project_z1t_chain_framework_infeasible.md`` — Z(1, 2) decomposes
+    as 2 Z(1, 1) cells with a 32-edge junction over all 12 anchors).
 
-    For Z(1,2) and Z(1,3) the engine's rainbow table identifies the
-    K_{4,4} sub-cells; the K_{4,4} entries (cached under
-    ``_chimera_cells()``) cover those chord junctions via the merger
-    canonical-key index.
-
-    For Z(m≥2, 1) graphs, Z(1,1) acts as the atomic boundary cell.
-    Each ``Z(1,1) ∪_{V_T} Z(1,1)`` merger is bounded by 24 − |V_T|
-    vertices; in practice the engine's treewidth-DP small-graph short-
-    circuit handles each merger in well under 1 second (verified
-    empirically: 7 representative V_T values all completed in < 0.1s
-    cold). Warming sizes 1 and 2 — ``C(12,1) + C(12,2) = 78`` entries —
-    populates in seconds.
+    Generates all ``2^12 - 1 = 4095`` non-empty V_T subsets. Aut(Z(1,1))
+    has order 8, so the natural orbit count is ≈ 512 — the warmup loop
+    detects duplicate merger canonical keys and reuses the cached
+    polynomial, so the actual cold compute is ≈ 1.5 minutes
+    (vs ~11 minutes without dedup).
     """
     Z11 = _z11_graph()
     if Z11 is None:
         return []
     V = sorted(Z11.nodes)
     v_t_orbits: List[Tuple[int, ...]] = []
-    for r in (1, 2):
+    for r in range(1, len(V) + 1):
         for combo in combinations(V, r):
             v_t_orbits.append(combo)
     return [("Z(1,1)", Z11, v_t_orbits)]
@@ -228,13 +216,23 @@ def _warmup_one(
                 print(f"  [skip] {family}/{name} V_T={v_t} (already cached)")
             continue
         merger = build_symmetric_merger(base, v_t)
-        t0 = time.time()
-        polynomial = engine._synthesize_multigraph(merger)
-        elapsed = time.time() - t0
         try:
             merger_key = merger.canonical_key()
         except Exception:
             merger_key = None
+        # Aut-equivalent V_T subsets produce mergers with the same
+        # canonical_key. Reuse the cached polynomial instead of resynth.
+        # For Z(1,1) (Aut order 8) this saves ~7× compute.
+        cached = (
+            table.lookup_by_merger(merger_key) if merger_key is not None else None
+        )
+        if cached is not None:
+            polynomial = cached.polynomial
+            elapsed = 0.0
+        else:
+            t0 = time.time()
+            polynomial = engine._synthesize_multigraph(merger)
+            elapsed = time.time() - t0
         entry = MergerEntry(
             base_canonical_key=base_key,
             v_t=v_t,

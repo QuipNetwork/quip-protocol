@@ -767,6 +767,57 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             self._promote_to_table(graph, cache_key, result)
             return result
 
+        # 7.4 Chain recurrence — for cell-decomposable graphs whose
+        # cell-quotient is a LINEAR PATH (n >= 3 cells). Uses
+        # `compute_chain_full_poly_from_spec` which extracts a transfer
+        # matrix from the (cell, junction) template, then iterates it n-1
+        # times. For Chimera Cm(1, n) (n=K_{4,4} cells joined by M_4
+        # matchings with shared-anchor interior cells), the transfer
+        # matrix has order r=5, so cost is O(n·r) per evaluation point.
+        # Cm(1, 6) solves in ~1s vs 60s+ timeout via the engine's
+        # alternative paths.
+        #
+        # Gate edge_count >= 80 to skip small graphs (Cm(1, 3) at 56e
+        # and Cm(1, 4) at 76e) where treewidth_dp at tw=4 is faster
+        # (~0.1s vs ~5s for spec build + chain extraction).
+        if graph.edge_count() >= 80:
+            try:
+                from ..roots.cell_quotient_bipartite_junction import (
+                    build_bipartite_junction_spec,
+                )
+                from ..roots.chain_recurrence import (
+                    compute_chain_full_poly_from_spec,
+                    is_chain_topology,
+                )
+                _spec_built = build_bipartite_junction_spec(graph, self.table)
+                if (_spec_built is not None
+                        and is_chain_topology(_spec_built[0].cell_tree)
+                        and _spec_built[0].cell_tree.number_of_nodes() >= 3):
+                    chain_poly = compute_chain_full_poly_from_spec(_spec_built[0])
+                    if (chain_poly is not None
+                            and verify_spanning_trees(graph, chain_poly)):
+                        _log.record(EventType.HIERARCHICAL, "engine",
+                                    f"Chain recurrence: {n}n {m}e, "
+                                    f"{_spec_built[0].cell_tree.number_of_nodes()} cells",
+                                    graph=graph)
+                        self._log(f"Chain recurrence: {n}n, {m}e")
+                        result = SynthesisResult(
+                            polynomial=chain_poly,
+                            recipe=[
+                                f"Chain recurrence: "
+                                f"{_spec_built[0].cell_tree.number_of_nodes()} cells"
+                            ],
+                            verified=True,
+                            method="chain_recurrence",
+                            tiles_used=_spec_built[0].cell_tree.number_of_nodes(),
+                            fringe_edges=0,
+                        )
+                        self._cache[cache_key] = result
+                        self._promote_to_table(graph, cache_key, result)
+                        return result
+            except Exception:
+                pass  # any failure — fall through
+
         # 7.45 Cell-quotient grid DP. For
         # cell-decomposable graphs whose cell-quotient is a 2D grid of
         # K_{a,b}-style cells connected by M_k matchings with disjoint
@@ -1221,6 +1272,15 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
 
         Returns SynthesisResult if successful, None otherwise.
         """
+        # Depth gate: kmatching-formula leaves (e.g. Cm(2,3) at depth 3-5)
+        # recurse here repeatedly, each call running `_find_vertex_separator`
+        # for up to 50k combinations. Mirror `_try_decomposition_chord_peel`'s
+        # depth-2 cap to bound recursion: at depth > 2, defer to treewidth_dp
+        # (step 8) / CEJ (step 12), both of which terminate without
+        # combinatorial separator search.
+        if self._synth_depth > 2:
+            return None
+
         # Collect all separators across k values
         candidates = []
         # Approximate min-edge gates: roughly C(k, 2) + a small constant for
@@ -1894,7 +1954,15 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 km_poly = self._try_unified_chord_junction(
                     graph, junctions, partition,
                 )
-                if km_poly is None:
+                # apply_kmatching_formula recurses one junction at a time,
+                # producing k_eff^|junctions| leaf evaluations. For chains
+                # with > 3 junctions (Cm(1, n) for n >= 5, multi-cell
+                # Zephyr) this explodes: Cm(1, 6) has 5 K_{4,4}+M_4
+                # junctions = 5^5 = 3125 leaves where each leaf re-enters
+                # the engine and hits expensive ksum/treewidth_dp paths.
+                # Defer to step 7.82 (bipartite_junction_dp) which solves
+                # these in O(n) via the per-cell tree DP.
+                if km_poly is None and len(junctions) <= 3:
                     try:
                         km_poly = apply_kmatching_formula(
                             graph, junctions, self._synthesize_multigraph
@@ -1920,13 +1988,18 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         return None
 
     # Fast-path threshold for the unified chord-junction theorem. When
-    # the chord junction has |V_k| ≤ this many anchors, the I-E sum over
-    # 2^|V_k| subsets is small enough to beat `apply_kmatching_formula`
-    # even on a cold cache (and is essentially free when the merger
-    # session cache is warm). Kept at 6 (2^6 = 64 sub-syntheses) because
-    # the D-Wave families top out at |V_k| = 4 (K_{4,4}), |V_k| ≤ 6
-    # (Pegasus / Zephyr boundary cells).
-    _UNIFIED_CHORD_JUNCTION_MAX_VK = 6
+    # the chord junction has |V_k| ≤ this many anchors, the I-E sum
+    # over 2^|V_k| subsets is small enough to beat
+    # `apply_kmatching_formula` even on a cold cache (and is essentially
+    # free when the merger persistent cache is warm). At |V_k| = 12 the
+    # sum has 4096 terms; with the Z(1,1) merger cache populated
+    # (per `project_vf2_thread_budget_and_z11_warmup.md`, 4095 entries
+    # covering all V_T subsets of Z(1,1)) each term is an O(1) lookup,
+    # so Z(1, 2) decomposed as 2 Z(1,1) cells solves via this path in
+    # << 1s. Without the cache, |V_k| ≥ 8 is impractically slow due
+    # to cold merger synthesis cost. Cap at 12 to match Z(1,1)'s
+    # 12-vertex boundary.
+    _UNIFIED_CHORD_JUNCTION_MAX_VK = 12
 
     def _try_unified_chord_junction(
         self,

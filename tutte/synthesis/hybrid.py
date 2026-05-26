@@ -685,6 +685,48 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
 
         engine = self._structural_engine
 
+        # Chain recurrence — for linear cell-quotient chains with at least
+        # 4 cells. Beats apply_kmatching_formula on Chimera Cm(1, n)
+        # (which has n-1 junctions producing 5^(n-1) leaves in kmatching)
+        # and beats try_heterogeneous_partition VF2 search inside
+        # formula_shortcircuit. Mirrors engine step 7.4.
+        #
+        # Gate edge_count >= 80 so we skip Cm(1, 3) (56 edges, 3 cells)
+        # where treewidth_dp at tw=4 is faster (~0.1s vs ~5s setup).
+        # Cm(1, 4) has 76 edges → also skipped; Cm(1, 5)+ catches it.
+        if graph.edge_count() >= 80:
+            try:
+                from ..roots.cell_quotient_bipartite_junction import (
+                    build_bipartite_junction_spec,
+                )
+                from ..roots.chain_recurrence import (
+                    compute_chain_full_poly_from_spec,
+                    is_chain_topology,
+                )
+                _spec_built = build_bipartite_junction_spec(graph, engine.table)
+                if (_spec_built is not None
+                        and is_chain_topology(_spec_built[0].cell_tree)
+                        and _spec_built[0].cell_tree.number_of_nodes() >= 3):
+                    chain_poly = compute_chain_full_poly_from_spec(_spec_built[0])
+                    if (chain_poly is not None
+                            and verify_spanning_trees(graph, chain_poly)):
+                        n_cells = _spec_built[0].cell_tree.number_of_nodes()
+                        _log.record(EventType.HIERARCHICAL, "hybrid",
+                                    f"Chain recurrence: "
+                                    f"{graph.node_count()}n {graph.edge_count()}e, "
+                                    f"{n_cells} cells",
+                                    graph=graph)
+                        self._log(f"Chain recurrence: {n_cells} cells")
+                        return HybridSynthesisResult(
+                            polynomial=chain_poly,
+                            method="chain_recurrence",
+                            recipe=[f"Chain recurrence: {n_cells} cells"],
+                            verified=True,
+                            tiles_used=n_cells,
+                        )
+            except Exception:
+                pass  # any failure — fall through to formula_shortcircuit
+
         # Formula shortcut (unified topology + k-matching closed forms),
         # BEFORE treewidth_dp — for targets like Cm2 where the formulas give a
         # meaningful speedup over direct treewidth_dp (~4× on Cm2).

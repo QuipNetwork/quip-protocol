@@ -1171,17 +1171,46 @@ def _partition_by_structure(
     import time as _time
     deadline = _time.monotonic() + time_budget_seconds
 
-    for mapping in matcher.subgraph_isomorphisms_iter():
+    # Hard wall-clock budget: networkx VF2 is pure-Python but spends most
+    # time backtracking inside `subgraph_isomorphisms_iter`. If VF2 yields
+    # zero matches (Cm_3 worst case), the loop body never runs and the
+    # in-loop deadline check can't fire. Run the iter in a daemon thread
+    # so the consumer side can enforce the deadline regardless of yield
+    # frequency. The thread continues spinning briefly after exit but is
+    # bounded by the same deadline (and is killed at process shutdown).
+    import threading, queue
+    q: queue.Queue = queue.Queue(maxsize=64)
+    sentinel = object()
+
+    def _producer() -> None:
+        try:
+            for m in matcher.subgraph_isomorphisms_iter():
+                if _time.monotonic() >= deadline:
+                    break
+                q.put(m)
+        except Exception:
+            pass
+        finally:
+            q.put(sentinel)
+
+    producer_thread = threading.Thread(target=_producer, daemon=True)
+    producer_thread.start()
+
+    while True:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            mapping = q.get(timeout=min(remaining, 0.25))
+        except queue.Empty:
+            continue  # re-check deadline
+        if mapping is sentinel:
+            break
         nodes = frozenset(mapping.keys())
         if nodes not in seen_node_sets:
             seen_node_sets.add(nodes)
             all_matches.append(set(nodes))
-
         if len(all_matches) >= max_matches:
-            break
-        # Wall-clock budget — check every 8 dedup'd matches to amortize
-        # the time() call across VF2's inner loop.
-        if (len(all_matches) & 7) == 0 and _time.monotonic() >= deadline:
             break
 
     if len(all_matches) < k:
