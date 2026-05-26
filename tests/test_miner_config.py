@@ -424,3 +424,125 @@ def test_load_passes_through_identification_keys(tmp_path):
     assert cfg["public_port"] == 8086
     assert cfg["log_level"] == "DEBUG"
     assert cfg["node_log"] == "/var/log/quip-miner.log"
+
+
+# ----------------------------------------------------------------------
+# resolve_mode / resolve_modes — Docker entrypoint dispatch
+# ----------------------------------------------------------------------
+
+from shared.miner_config import (  # noqa: E402
+    MODE_NAMES,
+    ModeResolutionError,
+    resolve_mode,
+    resolve_modes,
+)
+
+
+def test_resolve_modes_cpu_only_section():
+    assert resolve_modes({"cpu": {"num_cpus": 4}}) == ["cpu"]
+
+
+def test_resolve_modes_dwave_section_resolves_to_qpu():
+    assert resolve_modes({"dwave": {"daily_budget": "60s"}}) == ["qpu"]
+
+
+def test_resolve_modes_cuda_section_resolves_to_gpu():
+    assert resolve_modes({"cuda": {"0": {}}}) == ["gpu"]
+
+
+def test_resolve_modes_metal_section_resolves_to_gpu():
+    assert resolve_modes({"metal": {}}) == ["gpu"]
+
+
+def test_resolve_modes_modal_section_resolves_to_gpu():
+    assert resolve_modes({"modal": {"gpu_type": "a10g"}}) == ["gpu"]
+
+
+def test_resolve_modes_multi_group_returns_canonical_order():
+    """`[cpu]` + `[dwave]` → two children (cpu before qpu by canonical
+    MODE_NAMES order). The supervisor uses this order to allocate
+    --rest-port slots deterministically across restarts."""
+    backends = {"cpu": {}, "dwave": {}}
+    assert resolve_modes(backends) == ["cpu", "qpu"]
+
+
+def test_resolve_modes_all_three_groups_returns_all_three():
+    backends = {"cpu": {}, "cuda": {"0": {}}, "dwave": {}}
+    assert resolve_modes(backends) == ["cpu", "gpu", "qpu"]
+
+
+def test_resolve_modes_empty_with_default_returns_default():
+    assert resolve_modes({}, default="cpu") == ["cpu"]
+
+
+def test_resolve_modes_empty_no_default_raises():
+    with pytest.raises(ModeResolutionError) as excinfo:
+        resolve_modes({})
+    assert excinfo.value.code == "no-mode-resolvable"
+
+
+def test_resolve_modes_unsupported_mode_raises():
+    """`[cuda.0]` in a config with image_supports=cpu,qpu → error."""
+    with pytest.raises(ModeResolutionError) as excinfo:
+        resolve_modes({"cuda": {"0": {}}}, image_supports=["cpu", "qpu"])
+    assert excinfo.value.code == "unsupported-mode"
+
+
+def test_resolve_modes_partial_unsupported_in_multi_group_raises():
+    """`[cpu]` + `[cuda.0]` in a cpu-only image: cpu is supported but
+    cuda isn't — the whole resolution must fail rather than silently
+    drop the unsupported group."""
+    with pytest.raises(ModeResolutionError) as excinfo:
+        resolve_modes(
+            {"cpu": {}, "cuda": {"0": {}}},
+            image_supports=["cpu", "qpu"],
+        )
+    assert excinfo.value.code == "unsupported-mode"
+    # Error must name the offending section so the operator knows what to fix.
+    assert "cuda" in str(excinfo.value)
+
+
+def test_resolve_modes_default_unsupported_raises():
+    """If config is empty and the operator-supplied default isn't in
+    image-supports, that's an operator misconfiguration — error."""
+    with pytest.raises(ModeResolutionError) as excinfo:
+        resolve_modes({}, default="gpu", image_supports=["cpu", "qpu"])
+    assert excinfo.value.code == "unsupported-mode"
+
+
+def test_resolve_modes_bad_default_raises():
+    with pytest.raises(ModeResolutionError) as excinfo:
+        resolve_modes({}, default="tpu")
+    assert excinfo.value.code == "bad-default"
+
+
+def test_resolve_modes_bad_image_supports_raises():
+    with pytest.raises(ModeResolutionError) as excinfo:
+        resolve_modes({"cpu": {}}, image_supports=["cpu", "tpu"])
+    assert excinfo.value.code == "bad-image-supports"
+
+
+def test_resolve_mode_single_mode_passes_through():
+    """resolve_mode is the convenience wrapper for callers that only
+    handle one mode — single-group config returns the single mode."""
+    assert resolve_mode({"cpu": {"num_cpus": 4}}) == "cpu"
+    assert resolve_mode({"dwave": {}}) == "qpu"
+
+
+def test_resolve_mode_multi_group_raises_for_single_caller():
+    """resolve_mode rejects multi-group configs so the (rare) single-mode
+    callers fail loudly instead of silently dropping a backend."""
+    with pytest.raises(ModeResolutionError) as excinfo:
+        resolve_mode({"cpu": {}, "dwave": {}})
+    assert excinfo.value.code == "multi-backend-not-single-mode"
+
+
+def test_resolve_mode_empty_with_default():
+    assert resolve_mode({}, default="qpu") == "qpu"
+
+
+def test_mode_names_matches_expected_subcommands():
+    """Pin the canonical ordering — the entrypoint allocates --rest-port
+    slots by index, so reordering MODE_NAMES would silently change which
+    mode binds which port across container restarts."""
+    assert MODE_NAMES == ("cpu", "gpu", "qpu")

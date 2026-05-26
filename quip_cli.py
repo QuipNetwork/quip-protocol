@@ -41,12 +41,16 @@ from shared.miner_bootstrap import (
 from shared.miner_config import (
     CPU_BACKEND_SECTIONS,
     GPU_BACKEND_SECTIONS,
+    MODE_NAMES,
     MinerConfigError,
+    ModeResolutionError,
     QPU_BACKEND_SECTIONS,
     load_backend_config,
     load_miner_config,
     merge_config,
     present_backend_groups,
+    resolve_mode,
+    resolve_modes,
     validate_merged,
 )
 from shared.miner_core import MinerCore
@@ -534,6 +538,134 @@ async def _ensure_funded_or_fail(
 def quip_miner(log_level: str) -> None:
     """Substrate-integrated quantum mining frontend."""
     setup_logging(log_level=log_level.upper(), node_name="quip-miner")
+
+
+@quip_miner.command("resolve-mode")
+@_config_option
+@click.option(
+    "--default",
+    "default_mode",
+    type=click.Choice(list(MODE_NAMES), case_sensitive=False),
+    default=None,
+    help="Mode to use when --config has no backend sections. Without "
+    "this and an empty config, resolution fails with `no-mode-resolvable`.",
+)
+@click.option(
+    "--image-supports",
+    "image_supports_csv",
+    default=None,
+    help="Comma-separated subset of {cpu,gpu,qpu} this container is "
+    "built to run. Resolution fails with `unsupported-mode` when the "
+    "config asks for a mode outside this set. Set by Docker images "
+    "via QUIP_IMAGE_SUPPORTS; omit for unrestricted resolution.",
+)
+def quip_miner_resolve_mode(
+    config_path: Optional[str],
+    default_mode: Optional[str],
+    image_supports_csv: Optional[str],
+) -> None:
+    """Resolve the quip-miner subcommand for a config file.
+
+    Reads the v0.1-shape backend tables (`[cpu]`, `[gpu]`, `[cuda.N]`,
+    `[metal]`, `[modal]`, `[qpu]`, `[dwave]`, `[ibm]`, `[braket]`,
+    `[pasqal]`, `[ionq]`, `[origin]`) and prints the matching subcommand
+    on stdout (one of cpu/gpu/qpu). Exits non-zero with a kebab-case
+    error code on stderr when resolution is ambiguous, unsupported by
+    the image, or unspecified.
+
+    Designed for entrypoint scripts that need to dispatch:
+
+        MODE=$(quip-miner resolve-mode --config /data/config.toml \
+                  --default cpu --image-supports cpu,qpu) || exit 1
+        exec quip-miner "$MODE" --config /data/config.toml ...
+    """
+    if config_path is None:
+        backends: dict = {}
+    else:
+        try:
+            backends = load_backend_config(Path(config_path).expanduser())
+        except MinerConfigError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    image_supports: Optional[list] = None
+    if image_supports_csv is not None:
+        image_supports = [
+            tok.strip().lower()
+            for tok in image_supports_csv.split(",")
+            if tok.strip()
+        ]
+
+    try:
+        resolved = resolve_mode(
+            backends,
+            default=default_mode.lower() if default_mode else None,
+            image_supports=image_supports,
+        )
+    except ModeResolutionError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(resolved)
+
+
+@quip_miner.command("resolve-modes")
+@_config_option
+@click.option(
+    "--default",
+    "default_mode",
+    type=click.Choice(list(MODE_NAMES), case_sensitive=False),
+    default=None,
+    help="Mode to use when --config has no backend sections.",
+)
+@click.option(
+    "--image-supports",
+    "image_supports_csv",
+    default=None,
+    help="Comma-separated subset of {cpu,gpu,qpu} this container can run.",
+)
+def quip_miner_resolve_modes(
+    config_path: Optional[str],
+    default_mode: Optional[str],
+    image_supports_csv: Optional[str],
+) -> None:
+    """Resolve the quip-miner subcommand(s) for a config file.
+
+    Like `resolve-mode` but returns the *full* list — one mode per
+    line — when the config declares multiple backend groups. The
+    Docker entrypoint uses this to drive the per-mode child-process
+    supervisor:
+
+        mapfile -t MODES < <(quip-miner resolve-modes --config $CFG ...)
+        for mode in "${MODES[@]}"; do
+            quip-miner "$mode" --config "$CFG" ... &
+        done
+    """
+    if config_path is None:
+        backends: dict = {}
+    else:
+        try:
+            backends = load_backend_config(Path(config_path).expanduser())
+        except MinerConfigError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    image_supports: Optional[list] = None
+    if image_supports_csv is not None:
+        image_supports = [
+            tok.strip().lower()
+            for tok in image_supports_csv.split(",")
+            if tok.strip()
+        ]
+
+    try:
+        modes = resolve_modes(
+            backends,
+            default=default_mode.lower() if default_mode else None,
+            image_supports=image_supports,
+        )
+    except ModeResolutionError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    for mode in modes:
+        click.echo(mode)
 
 
 @quip_miner.command("keygen")

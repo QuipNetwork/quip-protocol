@@ -7,6 +7,15 @@
 # `quip-miner $MODE --config /data/config.toml` with CLI flags from
 # env vars overriding the TOML defaults.
 #
+# Mode resolution is config-driven via `quip-miner resolve-modes`:
+# config.toml's [cpu]/[gpu]/[cuda.N]/[metal]/[modal]/[qpu]/[dwave]/
+# [ibm]/[braket]/[pasqal]/[ionq]/[origin] sections pick which
+# subcommand(s) run. One process per active group — the entrypoint
+# spawns each as a separate `quip-miner <mode>` child and supervises
+# them. QUIP_IMAGE_SUPPORTS rejects modes the image doesn't have
+# libraries for. QUIP_DEFAULT_MODE is the fallback when config has
+# zero backend sections.
+#
 # Persistent state under /data:
 #   config.toml      — copied from /app/quip-miner.docker.toml on first
 #                      run; operators can edit it directly afterwards.
@@ -23,19 +32,8 @@ echo "Start time: $(date)"
 CONFIG_FILE="/data/config.toml"
 TEMPLATE_FILE="/app/quip-miner.docker.toml"
 KEYSTORE_FILE="${QUIP_SIGNER_KEY:-/data/keystore.json}"
-# Image baseline (CPU image sets QUIP_MODE=cpu, CUDA image sets =gpu);
-# operators can still override on `docker run -e QUIP_MODE=...`.
-MODE="${QUIP_MODE:-cpu}"
 # pow | mempool | both — passed to `quip-miner $MODE --mode`.
 MINE_MODE="${QUIP_MINE_MODE:-pow}"
-
-case "$MODE" in
-    cpu|gpu|qpu) ;;
-    *)
-        echo "ERROR: QUIP_MODE='$MODE' is invalid. Expected cpu, gpu, or qpu." >&2
-        exit 2
-        ;;
-esac
 
 # ── Privilege-drop setup ─────────────────────────────────────────
 # Container starts as root so we can chown /data and generate the
@@ -92,52 +90,113 @@ else
     echo "Using existing keystore at $KEYSTORE_FILE"
 fi
 
-# ── Build CLI args from env vars ─────────────────────────────────
+# ── Resolve subcommand(s) from config ────────────────────────────
+# Defer to `quip-miner resolve-modes` so the bash glue doesn't have to
+# parse TOML. The Python side is the single source of truth on which
+# section names belong to which group. Returns one mode per line.
+RESOLVE_ARGS=(resolve-modes --config "$CONFIG_FILE")
+if [ -n "${QUIP_DEFAULT_MODE:-}" ]; then
+    RESOLVE_ARGS+=(--default "$QUIP_DEFAULT_MODE")
+fi
+if [ -n "${QUIP_IMAGE_SUPPORTS:-}" ]; then
+    RESOLVE_ARGS+=(--image-supports "$QUIP_IMAGE_SUPPORTS")
+fi
+
+# `set -e` would mask an error from the assigning subshell; capture
+# both streams and inspect exit code explicitly.
+if ! MODES_RAW="$(quip-miner "${RESOLVE_ARGS[@]}" 2>&1)"; then
+    echo "ERROR: mode resolution failed:" >&2
+    echo "$MODES_RAW" >&2
+    exit 3
+fi
+mapfile -t MODES <<< "$MODES_RAW"
+echo "Resolved ${#MODES[@]} mode(s) from config: ${MODES[*]}"
+
+# ── Build CLI args common to every child ─────────────────────────
 # Precedence: ENV > TOML > defaults. ENV overrides land as CLI flags
-# that the quip-miner CLI already prefers over TOML values.
-CLI_ARGS=(--config "$CONFIG_FILE" --signer-key "$KEYSTORE_FILE" --mode "$MINE_MODE")
+# that the quip-miner CLI already prefers over TOML values. Per-child
+# overrides (telemetry port) are appended after these.
+COMMON_ARGS=(--config "$CONFIG_FILE" --signer-key "$KEYSTORE_FILE" --mode "$MINE_MODE")
 
 # QUIP_VALIDATORS="ws://a,ws://b" → --validator ws://a --validator ws://b
 if [ -n "${QUIP_VALIDATORS:-}" ]; then
     IFS=',' read -ra _VALIDATORS <<< "$QUIP_VALIDATORS"
     for url in "${_VALIDATORS[@]}"; do
         url="$(echo "$url" | xargs)"
-        [ -n "$url" ] && CLI_ARGS+=(--validator "$url")
+        [ -n "$url" ] && COMMON_ARGS+=(--validator "$url")
     done
 fi
 
 if [ -n "${QUIP_FAUCET_URL:-}" ]; then
-    CLI_ARGS+=(--faucet-url "$QUIP_FAUCET_URL")
-fi
-
-if [ -n "${QUIP_REST_PORT:-}" ]; then
-    CLI_ARGS+=(--rest-port "$QUIP_REST_PORT")
+    COMMON_ARGS+=(--faucet-url "$QUIP_FAUCET_URL")
 fi
 
 if [ -n "${QUIP_REST_HOST:-}" ]; then
-    CLI_ARGS+=(--rest-host "$QUIP_REST_HOST")
+    COMMON_ARGS+=(--rest-host "$QUIP_REST_HOST")
 fi
 
+# Telemetry port: each child binds a distinct port allocated from a
+# base (default 8086). Operators can pin the base via QUIP_REST_PORT;
+# children get base, base+1, base+2 in resolved-mode order.
+REST_PORT_BASE="${QUIP_REST_PORT:-8086}"
+
 # ── Hardware probe (GPU only — informational) ────────────────────
-if [ "$MODE" = "gpu" ] && command -v nvidia-smi >/dev/null 2>&1; then
+if [[ " ${MODES[*]} " == *" gpu "* ]] && command -v nvidia-smi >/dev/null 2>&1; then
     echo "----------------------------------------"
     nvidia-smi --query-gpu=gpu_name,compute_cap --format=csv,noheader || true
     echo "----------------------------------------"
 fi
 
-# ── Launch ───────────────────────────────────────────────────────
-echo "========================================"
-echo "Starting quip-miner $MODE..."
-echo "========================================"
-
 handle_privilege_drop
 
-CMD=(quip-miner "$MODE" "${CLI_ARGS[@]}")
-echo "Command: ${CMD[*]}"
-echo "----------------------------------------"
+# ── Multi-process supervisor ─────────────────────────────────────
+# One `quip-miner <mode>` process per resolved mode. The supervisor
+# forwards SIGTERM/SIGINT to all children, and if any child dies
+# (clean or otherwise) the whole container exits — operators or
+# orchestrators (compose/k8s) re-spawn from there. Single-mode
+# operation is just the N=1 case; no special path.
+declare -a CHILD_PIDS=()
 
-if [ -n "$DROP_USER" ]; then
-    exec gosu "$DROP_USER" "${CMD[@]}"
+shutdown_children() {
+    local sig="${1:-TERM}"
+    for pid in "${CHILD_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "-$sig" "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
+# Trap once; signal handler is idempotent.
+trap 'shutdown_children TERM' TERM INT
+
+echo "========================================"
+for i in "${!MODES[@]}"; do
+    mode="${MODES[$i]}"
+    port=$((REST_PORT_BASE + i))
+    CMD=(quip-miner "$mode" "${COMMON_ARGS[@]}" --rest-port "$port")
+    echo "Starting [$((i + 1))/${#MODES[@]}]: ${CMD[*]}"
+    if [ -n "$DROP_USER" ]; then
+        gosu "$DROP_USER" "${CMD[@]}" &
+    else
+        "${CMD[@]}" &
+    fi
+    CHILD_PIDS+=($!)
+done
+echo "========================================"
+echo "Supervisor: ${#CHILD_PIDS[@]} child(ren) running, pids=${CHILD_PIDS[*]}"
+
+# Wait for any child to exit. `wait -n` returns the exit code of the
+# first completed child; we then tear down the rest and propagate.
+EXIT_CODE=0
+if wait -n "${CHILD_PIDS[@]}"; then
+    EXIT_CODE=0
 else
-    exec "${CMD[@]}"
+    EXIT_CODE=$?
 fi
+echo "Supervisor: a child exited with code $EXIT_CODE; tearing down siblings"
+shutdown_children TERM
+
+# Drain remaining children. `wait` without args waits for all
+# outstanding background jobs.
+wait || true
+exit "$EXIT_CODE"

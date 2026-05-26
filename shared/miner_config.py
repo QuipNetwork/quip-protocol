@@ -60,7 +60,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional, Sequence
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -158,6 +158,133 @@ def present_backend_groups(backends: Mapping[str, Any]) -> dict[str, list[str]]:
         "gpu": [s for s in GPU_BACKEND_SECTIONS if s in backends],
         "qpu": [s for s in QPU_BACKEND_SECTIONS if s in backends],
     }
+
+
+MODE_NAMES: tuple[str, ...] = ("cpu", "gpu", "qpu")
+
+
+class ModeResolutionError(MinerConfigError):
+    """Operator-actionable problem in `resolve_mode`.
+
+    Subclasses `MinerConfigError` so the CLI's existing error-formatting
+    path handles it the same way as load/validate errors. The `code`
+    attribute is the machine-parseable kebab-case identifier the
+    entrypoint scripts can grep for.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code} {message}")
+        self.code = code
+
+
+def resolve_modes(
+    backends: Mapping[str, Any],
+    *,
+    default: Optional[str] = None,
+    image_supports: Optional[Sequence[str]] = None,
+) -> list[str]:
+    """Pick the quip-miner subcommands (subset of `cpu` / `gpu` / `qpu`)
+    that should run for the given config.
+
+    Resolution rules, in order:
+
+      1. If `backends` declares one or more active groups → return them
+         in canonical order (cpu, gpu, qpu) — one mode per group.
+         Each becomes a separate `quip-miner <mode>` process under the
+         entrypoint supervisor.
+      2. If `backends` is empty and `default` is provided → return
+         `[default]` (a single fallback mode).
+      3. Otherwise → raise `no-mode-resolvable`.
+
+    `image_supports`, when provided, restricts the acceptable answers
+    to that subset of `MODE_NAMES`. Any resolved mode outside the
+    supported list raises `unsupported-mode` — the image can't run
+    hardware it doesn't have libraries for.
+
+    Returns a list of one or more modes (always non-empty when no
+    error). Raises `ModeResolutionError` with a kebab-case `code` on
+    any rule failure.
+    """
+    if image_supports is not None:
+        supports = tuple(image_supports)
+        unknown = [m for m in supports if m not in MODE_NAMES]
+        if unknown:
+            raise ModeResolutionError(
+                "bad-image-supports",
+                f"unknown modes in image-supports={list(supports)}; "
+                f"expected subset of {list(MODE_NAMES)}",
+            )
+    else:
+        supports = MODE_NAMES
+
+    if default is not None and default not in MODE_NAMES:
+        raise ModeResolutionError(
+            "bad-default",
+            f"default={default!r} is not a valid mode; "
+            f"expected one of {list(MODE_NAMES)}",
+        )
+
+    groups = present_backend_groups(backends)
+    active = [g for g in MODE_NAMES if groups[g]]
+
+    if active:
+        unsupported = [g for g in active if g not in supports]
+        if unsupported:
+            details = ", ".join(
+                f"{g}={groups[g]}" for g in unsupported
+            )
+            raise ModeResolutionError(
+                "unsupported-mode",
+                f"config requires mode(s) the image cannot run: {details}; "
+                f"image supports {list(supports)}. Either run a different "
+                f"image (gpu image for [cuda.N], any image for [dwave]) or "
+                f"remove the offending section from config.",
+            )
+        return active
+
+    # No active groups in config — fall back to default.
+    if default is None:
+        raise ModeResolutionError(
+            "no-mode-resolvable",
+            f"config has no backend sections and no --default given; "
+            f"add one of [cpu]/[gpu]/[cuda.N]/[metal]/[modal]/[qpu]/"
+            f"[dwave]/[ibm]/[braket]/[pasqal]/[ionq]/[origin] to the "
+            f"config, or pass --default {{cpu,gpu,qpu}}.",
+        )
+    if default not in supports:
+        raise ModeResolutionError(
+            "unsupported-mode",
+            f"default={default} is not in image-supports={list(supports)}. "
+            f"Pass --default to a supported mode or add a backend section "
+            f"to config.",
+        )
+    return [default]
+
+
+def resolve_mode(
+    backends: Mapping[str, Any],
+    *,
+    default: Optional[str] = None,
+    image_supports: Optional[Sequence[str]] = None,
+) -> str:
+    """Single-mode variant of `resolve_modes` — convenience for callers
+    that won't supervise multiple processes.
+
+    Errors with `multi-backend-not-single-mode` when the config
+    resolves to more than one mode. The supervisor entrypoint uses
+    `resolve_modes` instead; this is for one-shot tooling and tests.
+    """
+    modes = resolve_modes(
+        backends, default=default, image_supports=image_supports
+    )
+    if len(modes) > 1:
+        raise ModeResolutionError(
+            "multi-backend-not-single-mode",
+            f"config resolves to multiple modes ({modes}); caller wanted "
+            f"a single mode. Use `resolve_modes` and supervise one "
+            f"process per mode.",
+        )
+    return modes[0]
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -273,11 +400,15 @@ __all__ = [
     "ALL_BACKEND_SECTIONS",
     "CPU_BACKEND_SECTIONS",
     "GPU_BACKEND_SECTIONS",
+    "MODE_NAMES",
     "MinerConfigError",
+    "ModeResolutionError",
     "QPU_BACKEND_SECTIONS",
     "load_backend_config",
     "load_miner_config",
     "merge_config",
     "present_backend_groups",
+    "resolve_mode",
+    "resolve_modes",
     "validate_merged",
 ]

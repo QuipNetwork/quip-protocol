@@ -65,8 +65,13 @@ COPY docker/quip-miner.cpu.toml /app/quip-miner.docker.toml
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Image baseline: cpu mode. Operators override on `docker run -e ...`.
-ENV QUIP_MODE=cpu
+# Mode resolution is config-driven (see entrypoint.sh).
+# QUIP_IMAGE_SUPPORTS = modes this image's libraries can run.
+#   cpu image has dwave-ocean-sdk (base dep) → qpu works.
+#   No cupy / no Apple Metal → cuda / metal sections error out.
+# QUIP_DEFAULT_MODE  = fallback when config.toml has no backend sections.
+ENV QUIP_IMAGE_SUPPORTS=cpu,qpu
+ENV QUIP_DEFAULT_MODE=cpu
 ENV QUIP_MINE_MODE=pow
 
 # Persistent /data: holds config.toml + keystore.json across restarts.

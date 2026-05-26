@@ -1206,3 +1206,136 @@ def test_auto_identify_blocks_credential_smuggled_through_solver(
     text = remark_bytes.decode("utf-8")
     assert "DWAVE_API_KEY" not in text
     assert "smuggle-via-solver-1234" not in text
+
+
+# ── resolve-mode / resolve-modes CLI subcommands ──────────────────────
+
+
+def test_resolve_mode_dwave_only(monkeypatch, tmp_path):
+    """Operator hands a `[dwave]`-only config to the CPU image: the
+    entrypoint asks resolve-mode, gets `qpu`, and dispatches there
+    (instead of the legacy hardcoded `cpu`)."""
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[dwave]\ndaily_budget = "60s"\n'
+    )
+    result = CliRunner().invoke(
+        quip_cli.quip_miner, ["resolve-mode", "--config", str(cfg)]
+    )
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "qpu"
+
+
+def test_resolve_mode_unsupported_in_cpu_image(tmp_path):
+    """CUDA section in a config given to a cpu-only image → error code
+    `unsupported-mode`, non-zero exit, descriptive stderr the entrypoint
+    surfaces to the operator."""
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[cuda.0]\n'
+    )
+    result = CliRunner().invoke(
+        quip_cli.quip_miner,
+        ["resolve-mode", "--config", str(cfg), "--image-supports", "cpu,qpu"],
+    )
+    assert result.exit_code != 0
+    assert "unsupported-mode" in result.output
+
+
+def test_resolve_mode_empty_config_with_default(tmp_path):
+    """No backend sections + --default cpu → cpu. Models the bare
+    `docker run` first-startup case where config.toml is still the
+    template (only `[miner]` populated)."""
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text('[miner]\nvalidators = ["ws://a:9944"]\n')
+    result = CliRunner().invoke(
+        quip_cli.quip_miner,
+        ["resolve-mode", "--config", str(cfg), "--default", "cpu"],
+    )
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "cpu"
+
+
+def test_resolve_mode_multi_group_single_caller_errors(tmp_path):
+    """resolve-mode (singular) refuses multi-group configs so the rare
+    one-mode caller fails loudly instead of dropping a backend."""
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[cpu]\nnum_cpus = 2\n'
+        '[dwave]\ndaily_budget = "60s"\n'
+    )
+    result = CliRunner().invoke(
+        quip_cli.quip_miner, ["resolve-mode", "--config", str(cfg)]
+    )
+    assert result.exit_code != 0
+    assert "multi-backend-not-single-mode" in result.output
+
+
+def test_resolve_modes_multi_group_returns_all_active(tmp_path):
+    """resolve-modes (plural) is what the entrypoint calls: emits one
+    mode per line so bash mapfile builds the supervisor's child list."""
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[cpu]\nnum_cpus = 2\n'
+        '[cuda.0]\n'
+        '[dwave]\ndaily_budget = "60s"\n'
+    )
+    result = CliRunner().invoke(
+        quip_cli.quip_miner, ["resolve-modes", "--config", str(cfg)]
+    )
+    assert result.exit_code == 0, result.output
+    lines = result.output.strip().splitlines()
+    assert lines == ["cpu", "gpu", "qpu"]
+
+
+def test_resolve_modes_single_group(tmp_path):
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n[cpu]\nnum_cpus = 4\n'
+    )
+    result = CliRunner().invoke(
+        quip_cli.quip_miner, ["resolve-modes", "--config", str(cfg)]
+    )
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().splitlines() == ["cpu"]
+
+
+def test_resolve_modes_image_supports_partial_unsupported_errors(tmp_path):
+    """`[cpu]` + `[cuda.0]` on a cpu-only image: even though cpu is
+    runnable, the operator's intent (run both) can't be honoured.
+    Better to fail fast than to silently drop the gpu child."""
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[cpu]\nnum_cpus = 2\n'
+        '[cuda.0]\n'
+    )
+    result = CliRunner().invoke(
+        quip_cli.quip_miner,
+        [
+            "resolve-modes", "--config", str(cfg),
+            "--image-supports", "cpu,qpu",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "unsupported-mode" in result.output
+    assert "cuda" in result.output
+
+
+def test_resolve_modes_no_config_argument(monkeypatch, tmp_path):
+    """Without --config: backends={}. With --default, returns [default]."""
+    result = CliRunner().invoke(
+        quip_cli.quip_miner, ["resolve-modes", "--default", "cpu"],
+    )
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "cpu"
+
+
+def test_resolve_modes_no_config_no_default_errors():
+    result = CliRunner().invoke(quip_cli.quip_miner, ["resolve-modes"])
+    assert result.exit_code != 0
+    assert "no-mode-resolvable" in result.output

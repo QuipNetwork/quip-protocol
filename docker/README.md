@@ -58,22 +58,48 @@ View logs:
 docker logs -f quip-miner
 ```
 
+## Mode resolution
+
+The subcommand(s) the container runs (`quip-miner cpu` / `gpu` / `qpu`)
+are picked by reading `/data/config.toml`:
+
+1. The entrypoint calls `quip-miner resolve-modes --config /data/config.toml`.
+2. Each declared backend group becomes one process. `[cpu]` → `quip-miner cpu`,
+   `[gpu]`/`[cuda.N]`/`[metal]`/`[modal]` → `quip-miner gpu`,
+   `[qpu]`/`[dwave]`/`[ibm]`/`[braket]`/`[pasqal]`/`[ionq]`/`[origin]`
+   → `quip-miner qpu`.
+3. A bash supervisor forwards SIGTERM/SIGINT to every child and tears
+   down the container if any child exits.
+
+A config asking for hardware the image can't run (e.g. `[cuda.0]` on
+the CPU image, which lacks `cupy`) is rejected with
+`unsupported-mode` before any child starts.
+
+When `config.toml` has zero backend sections (first boot from the
+template), the image-set `QUIP_DEFAULT_MODE` provides the fallback
+(`cpu` on the cpu image, `gpu` on the cuda image).
+
 ## Environment variables
 
 ENV vars are converted to CLI flags at launch time. The CLI's
 precedence (`CLI > TOML > defaults`) means ENV-supplied values
 override the TOML, and the TOML overrides image defaults.
 
-| Variable | CLI flag | Default |
-|----------|----------|---------|
+| Variable | CLI flag / role | Default |
+|----------|-----------------|---------|
 | `QUIP_VALIDATORS` | `--validator URL` (comma-split, repeated) | empty — TOML must provide |
 | `QUIP_SIGNER_KEY` | `--signer-key PATH` | `/data/keystore.json` |
 | `QUIP_FAUCET_URL` | `--faucet-url URL` | unset (fails fast if underfunded) |
-| `QUIP_MODE` | (chooses subcommand) | `cpu` (cpu image) / `gpu` (cuda image) |
+| `QUIP_IMAGE_SUPPORTS` | comma-separated subset of `cpu,gpu,qpu` the image can run | image-set: `cpu,qpu` (cpu image) / `cpu,gpu,qpu` (cuda image) |
+| `QUIP_DEFAULT_MODE` | fallback mode when config has no backend sections | image-set: `cpu` (cpu image) / `gpu` (cuda image) |
 | `QUIP_MINE_MODE` | `--mode pow\|mempool\|both` | `pow` |
-| `QUIP_REST_PORT` | `--rest-port N` | `-1` (telemetry disabled) |
+| `QUIP_REST_PORT` | base port for `--rest-port` (each child binds base+i) | `8086` |
 | `QUIP_REST_HOST` | `--rest-host HOST` | `0.0.0.0` (in-container default) |
-| `PUID` / `PGID` | (runtime uid/gid mapping) | `1000:1000` |
+| `PUID` / `PGID` | runtime uid/gid mapping | `1000:1000` |
+
+There is intentionally **no** `QUIP_MODE` env var — mode is config-
+driven, not flag-driven. To force a specific subcommand, put the
+corresponding section in `config.toml`.
 
 Operators can edit `/data/config.toml` directly for persistent settings; the schema is documented in [`quip-miner.example.toml`](../quip-miner.example.toml).
 
