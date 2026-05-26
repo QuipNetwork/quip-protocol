@@ -230,6 +230,18 @@ def test_telemetry_process_aggregator_mode_merges_per_kind_snapshots(tmp_path: P
         # mtime across the dir; freshly written snapshots are <5s old.
         assert status["data"]["is_mining"] is True
         assert set(status["data"]["modes"].keys()) == {"cpu", "qpu"}
+
+        # Regression: /api/v1/mining/attempts must not crash in
+        # snapshot_dir mode. Previously it called read_snapshot() with
+        # request.app["stats_snapshot_path"] (None in aggregator mode),
+        # raising "expected str, bytes or os.PathLike object, not NoneType".
+        attempts_raw = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/v1/mining/attempts?miner_id=rig-CPU-1&dispatch_id=0",
+            timeout=2.0,
+        ).read()
+        attempts = json.loads(attempts_raw)
+        assert attempts["success"] is True
+        assert "attempts" in attempts["data"]
     finally:
         shutdown_event.set()
         proc.join(timeout=5)

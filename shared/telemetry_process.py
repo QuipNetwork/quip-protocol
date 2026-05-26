@@ -612,7 +612,7 @@ async def _handle_mining_attempts(request: web.Request) -> web.Response:
     snapshot) produced by the worker and controller. See
     ``shared/mining_attempt_log.py`` for the schema.
     """
-    snapshot = read_snapshot(request.app["stats_snapshot_path"])
+    snapshot, _err = _read_snapshot_or_503(request)
     attempts_dir = (
         Path(snapshot["attempts_dir"])
         if snapshot is not None and snapshot.get("attempts_dir")
