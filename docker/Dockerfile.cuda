@@ -44,12 +44,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Python + minimal CUDA libs for CuPy RawKernel + entrypoint deps
 # (tini, gosu). Only cuda-cudart (runtime) and libnvrtc (kernel
 # compilation) are needed — GPU code uses custom CUDA kernels via
-# cp.RawModule, not cuBLAS/cuFFT/etc.
+# cp.RawModule, not cuBLAS/cuFFT/etc. The -dev package supplies the
+# CUDA C++ headers (cuda_runtime.h) that NVRTC needs at JIT time;
+# without it, miner build crashes with "Failed to find CUDA headers".
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     tini gosu \
     cuda-cudart-12-9 \
+    cuda-cudart-dev-12-9 \
     cuda-nvrtc-12-9 \
     && apt-get install -y --no-install-recommends cuda-mps-12-9 2>/dev/null || true \
     && rm -rf /var/lib/apt/lists/* \
