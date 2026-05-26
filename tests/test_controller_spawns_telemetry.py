@@ -36,6 +36,10 @@ def _make_ctrl(monkeypatch, tmp_path, telemetry_port):
     ctrl._telemetry_proc = None
     ctrl._telemetry_shutdown_event = None
     ctrl.pool = SimpleNamespace(urls=("http://test:9944",))
+    # New (Wave 3) attributes — kept defaulted so the legacy single-
+    # process spawn path matches the v0.2-early behavior.
+    ctrl.snapshot_kind = ""
+    ctrl._spawn_telemetry_sibling_enabled = True  # noqa: SLF001
     return ctrl, spawned
 
 
@@ -46,8 +50,10 @@ def test_controller_spawns_telemetry_with_default_port(monkeypatch, tmp_path):
     assert len(spawned) == 1
     assert spawned[0]._kwargs["listen_port"] == 8086
     assert spawned[0]._kwargs["validator_urls"] == ["http://test:9944"]
+    # Default snapshot filename: empty snapshot_kind resolves to
+    # `telemetry-stats-default.json` (per `snapshot_filename_for("")`).
     assert spawned[0]._kwargs["stats_snapshot_path"] == str(
-        tmp_path / "telemetry-stats.json"
+        tmp_path / "telemetry-stats-default.json"
     )
 
 

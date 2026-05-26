@@ -53,7 +53,7 @@ from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from shared.mining_attempt_log import DEFAULT_LOG_DIR, SubmissionLogger
 from shared.signer import Signer
-from shared.stats_snapshot import StatsSnapshotWriter
+from shared.stats_snapshot import StatsSnapshotWriter, snapshot_filename_for
 from shared.telemetry_process import telemetry_main
 from substrate.client import SubstrateClient
 from substrate.pool import ValidatorPool
@@ -173,6 +173,11 @@ def build_stats_snapshot_for_telemetry(controller) -> dict[str, Any]:
     )
 
     return {
+        # `mode` lets the aggregator (multi-process container) bucket
+        # this snapshot by backend without parsing handle ids. Defaults
+        # to the controller's `snapshot_kind` field (set by the CLI from
+        # the chosen subcommand: cpu/gpu/qpu).
+        "mode": getattr(controller, "snapshot_kind", "") or "default",
         "controller": controller_counters,
         "node_id": node_id,
         "ss58_address": ss58_address,
@@ -437,6 +442,8 @@ class SubstrateMinerController:
         core: Optional[_MinerCoreStats] = None,
         runtime_dir: Optional[Path] = None,
         telemetry_port: int = 8086,
+        snapshot_kind: str = "",
+        spawn_telemetry_sibling: bool = True,
     ) -> None:
         if not miner_handles:
             raise ValueError(
@@ -537,6 +544,18 @@ class SubstrateMinerController:
             if runtime_dir is not None
             else Path(os.environ.get("QUIP_RUNTIME_DIR", "/tmp/quip"))
         )
+        # `snapshot_kind` tags the per-process snapshot file so a
+        # multi-process container (entrypoint supervisor spawning one
+        # quip-miner per active backend group) doesn't have N children
+        # racing the same file. Default of "" picks the legacy
+        # single-snapshot filename for one-shot / single-mode usage.
+        self.snapshot_kind: str = snapshot_kind
+        # When False, the controller skips the in-process telemetry
+        # sibling — used by the Docker entrypoint which spawns a single
+        # aggregating sibling outside any child process via
+        # `quip-miner telemetry`. Named with the `_spawn_..._enabled`
+        # suffix to avoid shadowing the same-named method.
+        self._spawn_telemetry_sibling_enabled: bool = spawn_telemetry_sibling
         # Stats snapshot writer — set in run(); None before startup.
         self._stats_snapshot_path: Optional[Path] = None
         self._stats_writer: Optional[StatsSnapshotWriter] = None
@@ -611,7 +630,7 @@ class SubstrateMinerController:
         # interval. The telemetry sibling process reads this file via
         # `read_snapshot()` to serve every endpoint that needs in-process
         # data; there is no live IPC.
-        self._stats_snapshot_path = self._runtime_dir / "telemetry-stats.json"
+        self._stats_snapshot_path = self._runtime_dir / snapshot_filename_for(self.snapshot_kind)
         self._stats_writer = StatsSnapshotWriter(
             path=self._stats_snapshot_path,
             get_snapshot=lambda: build_stats_snapshot_for_telemetry(self),
@@ -711,11 +730,22 @@ class SubstrateMinerController:
     def _spawn_telemetry_sibling(self) -> None:
         """Spawn the telemetry process as a sibling.
 
-        Called unconditionally from ``run()``. The sibling is now the
-        only telemetry surface — there is no in-process server.
+        Called from ``run()``. Skipped when ``spawn_telemetry_sibling``
+        is False — the Docker entrypoint sets this to centralise
+        telemetry into a single aggregating sibling that reads every
+        child's per-kind snapshot via ``read_all_snapshots`` rather
+        than competing for ``telemetry_port``.
+
         Validator URLs are derived from the pool's authoritative list;
         the sibling owns its own SubstrateClient.
         """
+        if not self._spawn_telemetry_sibling_enabled:
+            logger.info(
+                "telemetry sibling spawn skipped (spawn_telemetry_sibling=False); "
+                "snapshot still written to %s",
+                self._runtime_dir / snapshot_filename_for(self.snapshot_kind),
+            )
+            return
         validator_urls = list(self.pool.urls) if self.pool is not None else []
 
         self._telemetry_shutdown_event = mp.Event()
@@ -725,7 +755,7 @@ class SubstrateMinerController:
                 "listen_host": "0.0.0.0",
                 "listen_port": self._telemetry_port,
                 "stats_snapshot_path": str(
-                    self._runtime_dir / "telemetry-stats.json"
+                    self._runtime_dir / snapshot_filename_for(self.snapshot_kind)
                 ),
                 "validator_urls": validator_urls,
                 "shutdown_event": self._telemetry_shutdown_event,

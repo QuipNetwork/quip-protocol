@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import ipaddress
 import logging
+import os
 import signal
 import socket
 import ssl
@@ -668,6 +669,79 @@ def quip_miner_resolve_modes(
         click.echo(mode)
 
 
+@quip_miner.command("telemetry")
+@click.option(
+    "--snapshot-dir",
+    type=click.Path(file_okay=False, dir_okay=True),
+    required=True,
+    help="Directory containing per-mode telemetry-stats-*.json files. "
+    "The aggregator globs every matching file and merges them via "
+    "shared.stats_snapshot.merge_snapshots on each /api/v1/* request.",
+)
+@click.option(
+    "--rest-host",
+    default="0.0.0.0",
+    show_default=True,
+    help="aiohttp bind address.",
+)
+@click.option(
+    "--rest-port",
+    type=int,
+    default=8086,
+    show_default=True,
+    help="aiohttp listen port.",
+)
+@click.option(
+    "--validator",
+    "validators",
+    multiple=True,
+    help="Optional validator WebSocket URL for chain-backed endpoints "
+    "(/api/v1/block/*, /api/v1/solve). Repeatable for failover. Omit "
+    "if the aggregator should only surface controller state, not "
+    "chain reads.",
+)
+def quip_miner_telemetry(
+    snapshot_dir: str,
+    rest_host: str,
+    rest_port: int,
+    validators: tuple,
+) -> None:
+    """Run the standalone telemetry aggregator.
+
+    Used by the Docker entrypoint to host a single /api/v1 surface
+    for a multi-process container. Each `quip-miner <mode>` child
+    writes its own snapshot file into `snapshot_dir`; this process
+    reads all of them on every request and merges into a unified
+    view (summed counters, unioned miners, first-non-empty
+    descriptor/survey/identity).
+
+    Standalone — no controller, no MinerCore, no signer. Pure
+    aggregator + chain-read proxy.
+    """
+    import multiprocessing as mp
+    from shared.telemetry_process import telemetry_main
+
+    snap_dir = Path(snapshot_dir).expanduser()
+    snap_dir.mkdir(parents=True, exist_ok=True)
+
+    shutdown_event = mp.Event()
+    # Hook SIGINT here so a Ctrl-C in standalone runs exits cleanly;
+    # under the Docker supervisor, SIGTERM from the entrypoint's
+    # `kill -TERM` does the same via telemetry_main's own handler.
+    import signal as _signal
+    def _on_sigint(*_a):
+        shutdown_event.set()
+    _signal.signal(_signal.SIGINT, _on_sigint)
+
+    telemetry_main(
+        listen_host=rest_host,
+        listen_port=int(rest_port),
+        snapshot_dir=str(snap_dir),
+        validator_urls=list(validators),
+        shutdown_event=shutdown_event,
+    )
+
+
 @quip_miner.command("keygen")
 @click.option(
     "--out",
@@ -1085,6 +1159,18 @@ def _check_backend_conflicts(
     )
 
 
+def _telemetry_external_via_env() -> bool:
+    """True when an external aggregator owns the REST surface.
+
+    Set by the Docker entrypoint when it spawns `quip-miner telemetry`
+    as a separate sibling. Each `quip-miner <mode>` child then writes
+    its snapshot but skips its own in-process telemetry sibling —
+    otherwise N children would all try to bind the same port.
+    """
+    val = os.environ.get("QUIP_TELEMETRY_EXTERNAL", "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
 def _qpu_miner_kind_from_backends(backends: dict, fallback: str) -> str:
     """Derive the substrate `miner_kind` from TOML QPU sections.
 
@@ -1272,6 +1358,18 @@ async def _run_concurrent_miner(
                 topology_hash=pow_topology_hash,
                 core=core,
                 telemetry_port=telemetry_port,
+                # Tag the per-process snapshot file with the miner_kind
+                # so multi-process containers don't race the same path.
+                # `_run_concurrent_miner` is invoked once per
+                # quip-miner subcommand (cpu/gpu/qpu), so kind is fixed
+                # for the lifetime of this controller.
+                snapshot_kind=miner_kind,
+                # In the Docker entrypoint, the supervisor sets
+                # QUIP_TELEMETRY_EXTERNAL=1 to indicate a separate
+                # `quip-miner telemetry` aggregator owns the REST
+                # surface — controllers then skip their in-process
+                # sibling spawn but still write snapshots.
+                spawn_telemetry_sibling=not _telemetry_external_via_env(),
             )
             click.echo(
                 f"  pow handles: {[h.miner_id for h in pow_handles]} "

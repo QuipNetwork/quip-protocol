@@ -79,6 +79,32 @@ When `config.toml` has zero backend sections (first boot from the
 template), the image-set `QUIP_DEFAULT_MODE` provides the fallback
 (`cpu` on the cpu image, `gpu` on the cuda image).
 
+## Telemetry aggregation
+
+Multi-process containers run a single `quip-miner telemetry`
+aggregator alongside the per-mode mining children:
+
+```
+docker container
+├── quip-miner telemetry   (binds QUIP_REST_PORT, default 8086)
+├── quip-miner cpu         (writes telemetry-stats-cpu.json)
+├── quip-miner gpu         (writes telemetry-stats-gpu.json)
+└── quip-miner qpu         (writes telemetry-stats-qpu.json)
+```
+
+The aggregator globs `$QUIP_RUNTIME_DIR/telemetry-stats-*.json` on
+every `/api/v1/*` request, merges them
+(`shared.stats_snapshot.merge_snapshots`), and serves the unified
+view to the indexer. Counters sum across modes; `miners[]` is
+unioned; `node_id` / `ss58_address` / `descriptor` take the first
+non-empty value; per-mode breakdown is exposed under the new
+`modes` key for operators investigating per-backend behaviour.
+
+Each `quip-miner <mode>` child runs with `--rest-port -1`
+(in-process sibling disabled) + `QUIP_TELEMETRY_EXTERNAL=1`. The
+indexer still sees one endpoint per container — the aggregator
+hides the multi-process fan-out.
+
 ## Environment variables
 
 ENV vars are converted to CLI flags at launch time. The CLI's
@@ -93,8 +119,9 @@ override the TOML, and the TOML overrides image defaults.
 | `QUIP_IMAGE_SUPPORTS` | comma-separated subset of `cpu,gpu,qpu` the image can run | image-set: `cpu,qpu` (cpu image) / `cpu,gpu,qpu` (cuda image) |
 | `QUIP_DEFAULT_MODE` | fallback mode when config has no backend sections | image-set: `cpu` (cpu image) / `gpu` (cuda image) |
 | `QUIP_MINE_MODE` | `--mode pow\|mempool\|both` | `pow` |
-| `QUIP_REST_PORT` | base port for `--rest-port` (each child binds base+i) | `8086` |
-| `QUIP_REST_HOST` | `--rest-host HOST` | `0.0.0.0` (in-container default) |
+| `QUIP_REST_PORT` | aggregator's `--rest-port` (single operator-facing /api/v1 port; children disable their in-process sibling) | `8086` |
+| `QUIP_REST_HOST` | `--rest-host HOST` (aggregator bind address) | `0.0.0.0` |
+| `QUIP_RUNTIME_DIR` | shared snapshot dir; aggregator reads, children write | `/data/runtime` |
 | `PUID` / `PGID` | runtime uid/gid mapping | `1000:1000` |
 
 There is intentionally **no** `QUIP_MODE` env var — mode is config-

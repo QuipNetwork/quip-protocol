@@ -58,8 +58,11 @@ handle_privilege_drop() {
     [ "$cur_gid" != "$PGID" ] && groupmod -g "$PGID" quip
     [ "$cur_uid" != "$PUID" ] && usermod  -u "$PUID" -g "$PGID" quip
 
-    echo "Privilege drop: chown -R quip:quip /data"
+    echo "Privilege drop: chown -R quip:quip /data ${QUIP_RUNTIME_DIR:-}"
     chown -R quip:quip /data
+    if [ -n "${QUIP_RUNTIME_DIR:-}" ] && [ -d "$QUIP_RUNTIME_DIR" ]; then
+        chown -R quip:quip "$QUIP_RUNTIME_DIR"
+    fi
 
     # Re-tighten keystore after the ownership flip.
     [ -f "$KEYSTORE_FILE" ] && chmod 600 "$KEYSTORE_FILE"
@@ -135,10 +138,23 @@ if [ -n "${QUIP_REST_HOST:-}" ]; then
     COMMON_ARGS+=(--rest-host "$QUIP_REST_HOST")
 fi
 
-# Telemetry port: each child binds a distinct port allocated from a
-# base (default 8086). Operators can pin the base via QUIP_REST_PORT;
-# children get base, base+1, base+2 in resolved-mode order.
-REST_PORT_BASE="${QUIP_REST_PORT:-8086}"
+# Telemetry: in a multi-process container the operator-facing
+# /api/v1 surface is served by a SINGLE `quip-miner telemetry`
+# aggregator that reads all children's per-mode snapshots from a
+# shared directory. Each child writes
+# `<RUNTIME_DIR>/telemetry-stats-<mode>.json` and disables its own
+# in-process telemetry sibling via QUIP_TELEMETRY_EXTERNAL=1.
+#
+# Operators expose ONE port (QUIP_REST_PORT, default 8086) — the
+# aggregator. Per-child rest ports are forced to -1 (disabled).
+REST_PORT_OPERATOR="${QUIP_REST_PORT:-8086}"
+REST_HOST_OPERATOR="${QUIP_REST_HOST:-0.0.0.0}"
+RUNTIME_DIR="${QUIP_RUNTIME_DIR:-/data/runtime}"
+mkdir -p "$RUNTIME_DIR"
+# Ownership of $RUNTIME_DIR is fixed inside handle_privilege_drop()
+# alongside /data — same chown sweep, same target user.
+export QUIP_RUNTIME_DIR="$RUNTIME_DIR"
+export QUIP_TELEMETRY_EXTERNAL=1
 
 # ── Hardware probe (GPU only — informational) ────────────────────
 if [[ " ${MODES[*]} " == *" gpu "* ]] && command -v nvidia-smi >/dev/null 2>&1; then
@@ -169,17 +185,44 @@ shutdown_children() {
 # Trap once; signal handler is idempotent.
 trap 'shutdown_children TERM' TERM INT
 
+run_as_drop_user() {
+    if [ -n "$DROP_USER" ]; then
+        gosu "$DROP_USER" "$@"
+    else
+        "$@"
+    fi
+}
+
 echo "========================================"
+# Telemetry aggregator first — it should be ready (snapshot dir
+# exists, listener bound) before children start writing snapshots.
+TELEMETRY_CMD=(
+    quip-miner telemetry
+    --snapshot-dir "$RUNTIME_DIR"
+    --rest-host "$REST_HOST_OPERATOR"
+    --rest-port "$REST_PORT_OPERATOR"
+)
+if [ -n "${QUIP_VALIDATORS:-}" ]; then
+    IFS=',' read -ra _VALIDATORS <<< "$QUIP_VALIDATORS"
+    for url in "${_VALIDATORS[@]}"; do
+        url="$(echo "$url" | xargs)"
+        [ -n "$url" ] && TELEMETRY_CMD+=(--validator "$url")
+    done
+fi
+echo "Starting telemetry aggregator: ${TELEMETRY_CMD[*]}"
+run_as_drop_user "${TELEMETRY_CMD[@]}" &
+CHILD_PIDS+=($!)
+
+# Per-mode miner children. Each writes its snapshot to
+# $RUNTIME_DIR/telemetry-stats-<mode>.json (via QUIP_RUNTIME_DIR) and
+# skips its own in-process telemetry sibling
+# (QUIP_TELEMETRY_EXTERNAL=1). --rest-port -1 is belt-and-braces:
+# even if the env var were missed, the controller wouldn't bind.
 for i in "${!MODES[@]}"; do
     mode="${MODES[$i]}"
-    port=$((REST_PORT_BASE + i))
-    CMD=(quip-miner "$mode" "${COMMON_ARGS[@]}" --rest-port "$port")
+    CMD=(quip-miner "$mode" "${COMMON_ARGS[@]}" --rest-port -1)
     echo "Starting [$((i + 1))/${#MODES[@]}]: ${CMD[*]}"
-    if [ -n "$DROP_USER" ]; then
-        gosu "$DROP_USER" "${CMD[@]}" &
-    else
-        "${CMD[@]}" &
-    fi
+    run_as_drop_user "${CMD[@]}" &
     CHILD_PIDS+=($!)
 done
 echo "========================================"

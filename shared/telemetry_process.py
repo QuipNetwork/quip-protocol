@@ -40,7 +40,11 @@ from shared.mining_attempt_log import (
     query_by_dispatch,
     query_by_solution_id,
 )
-from shared.stats_snapshot import read_snapshot
+from shared.stats_snapshot import (
+    merge_snapshots,
+    read_all_snapshots,
+    read_snapshot,
+)
 from shared.version import get_version
 from substrate.client import SubstrateClient
 from substrate.url_failover import AllUrlsDown, SubstrateUrlFailover
@@ -58,25 +62,44 @@ _SNAPSHOT_FRESHNESS_S = 5.0
 def telemetry_main(
     listen_host: str,
     listen_port: int,
-    stats_snapshot_path: str,
     validator_urls: list[str],
     shutdown_event: mp.synchronize.Event,
+    *,
+    stats_snapshot_path: Optional[str] = None,
+    snapshot_dir: Optional[str] = None,
 ) -> None:
     """Child process entry point for telemetry.
 
     Args:
         listen_host: aiohttp bind address.
         listen_port: aiohttp listen port.
-        stats_snapshot_path: file path the controller writes via
-            ``StatsSnapshotWriter``. Used as the source of truth for
-            controller-side state (counters, descriptor, survey,
-            identity).
         validator_urls: URLs to try for direct chain queries. Telemetry
             owns its own `SubstrateClient`; no pool/event-manager
             involvement.
         shutdown_event: Set by the parent (or by SIGTERM handler) to
             request graceful exit.
+        stats_snapshot_path: single-snapshot mode — file path the
+            controller writes via ``StatsSnapshotWriter``. Used by the
+            legacy single-controller spawn (controller spawns sibling
+            on its own port).
+        snapshot_dir: multi-snapshot aggregator mode — directory the
+            entrypoint creates and per-mode controllers write to. The
+            sibling globs ``telemetry-stats-*.json`` here and merges
+            via ``merge_snapshots`` on every API hit. Used by the
+            Docker multi-process supervisor (one telemetry sibling
+            per container, N controller children).
+
+    Exactly one of ``stats_snapshot_path`` / ``snapshot_dir`` must be
+    provided. The aggregator mode degrades gracefully when individual
+    snapshots are missing or mid-write — those snapshots are skipped
+    for the duration of one request.
     """
+    if (stats_snapshot_path is None) == (snapshot_dir is None):
+        raise ValueError(
+            "telemetry_main: pass exactly one of stats_snapshot_path "
+            "(single-snapshot legacy mode) or snapshot_dir (aggregator)"
+        )
+
     def _sigterm(signum, frame):
         logger.info("telemetry process received SIGTERM")
         shutdown_event.set()
@@ -86,7 +109,8 @@ def telemetry_main(
     asyncio.run(_run(
         listen_host=listen_host,
         listen_port=listen_port,
-        stats_snapshot_path=Path(stats_snapshot_path),
+        stats_snapshot_path=Path(stats_snapshot_path) if stats_snapshot_path else None,
+        snapshot_dir=Path(snapshot_dir) if snapshot_dir else None,
         validator_urls=validator_urls,
         shutdown_event=shutdown_event,
     ))
@@ -147,7 +171,8 @@ async def _error_middleware(request: web.Request, handler) -> web.Response:
 async def _run(
     listen_host: str,
     listen_port: int,
-    stats_snapshot_path: Path,
+    stats_snapshot_path: Optional[Path],
+    snapshot_dir: Optional[Path],
     validator_urls: list[str],
     shutdown_event: mp.synchronize.Event,
 ) -> None:
@@ -173,7 +198,12 @@ async def _run(
     started_at = time.time()
 
     app = web.Application(middlewares=[_cors_middleware, _error_middleware])
+    # Exactly one of these is set; `_read_snapshot_or_503` picks the
+    # right path. Aggregator mode (snapshot_dir) merges every per-mode
+    # file the children write; legacy mode (stats_snapshot_path) reads
+    # a single file as before.
     app["stats_snapshot_path"] = stats_snapshot_path
+    app["snapshot_dir"] = snapshot_dir
     app["failover"] = failover
     app["client"] = client
     app["started_at"] = started_at
@@ -242,9 +272,21 @@ def _error(message: str, code: str, status: int = 400) -> web.Response:
 def _read_snapshot_or_503(
     request: web.Request,
 ) -> Tuple[Optional[dict], Optional[web.Response]]:
-    """Read the stats snapshot or return a (None, 503-response) tuple."""
-    path: Path = request.app["stats_snapshot_path"]
-    snap = read_snapshot(path)
+    """Read the stats snapshot or return a (None, 503-response) tuple.
+
+    In single-snapshot mode (legacy) reads the path the controller
+    writes. In aggregator mode (Docker entrypoint) globs every
+    per-mode file in the snapshot dir and merges them — handlers see
+    a single virtual snapshot with summed counters + per-mode
+    breakdown under the new `modes` key.
+    """
+    snapshot_dir: Optional[Path] = request.app["snapshot_dir"]
+    if snapshot_dir is not None:
+        snaps = read_all_snapshots(snapshot_dir)
+        snap = merge_snapshots(snaps)
+    else:
+        path: Path = request.app["stats_snapshot_path"]
+        snap = read_snapshot(path)
     if snap is None:
         return None, _error(
             "stats snapshot not yet available",
