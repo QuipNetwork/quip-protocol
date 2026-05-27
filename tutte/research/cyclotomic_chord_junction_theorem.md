@@ -992,3 +992,209 @@ The theorem does NOT directly help D-Wave (Chimera/Pegasus) graphs
 since their cell structure is not tree-based. But it could help
 arbitrary random/random-tree graphs that decompose into chord-attached
 pieces.
+
+## EXTENSION: Sokal-Z Generalized Chord-Junction Theorem (May 26, 2026)
+
+**Status**: Formula **shipped** in `tutte/roots/sokal_z_chord_junction.py`
+with 12 regression tests covering matching, parallel, K_{2,2}, and
+3-edge non-matching patterns on K_2/K_3/K_4/C_4 cells (all pass). The
+shipped prototype enumerates $A_J \subseteq E_J$ directly via
+multi-point evaluation + bivariate Lagrange interpolation, gated at
+$2^{|E_J|} \leq 65536$ ($|E_J| \leq 16$). The two remaining unlocks —
+tree-DP over $H_J$ for $|E_J| > 16$ (Z(1, 2) tractability) and engine
+cascade wiring — are the next phases (tasks #438, #439).
+
+### Motivation
+
+The original unified theorem $T(G \oplus_M G) = (x-1)\,T(G)^2 + \sum_{\emptyset
+\neq S \subseteq V_k} T(G \cup_{V_S} G)$ requires a **chord matching**:
+each anchor $v \in V_k$ has exactly one chord edge to its counterpart on
+the other cell. Real D-Wave graphs violate this:
+
+- **Z(1, 2)**: 2 disjoint Z(1, 1) cells connected by **32 edges** over
+  12 anchors per side, with degree distribution $\{2: 16, 4: 8\}$ —
+  NOT a matching.
+- **Cm(2, n)** inter-row connections also frequently use multi-edge
+  patterns.
+
+### Generalized statement (Sokal Z basis)
+
+Let $G_1, G_2$ be two cell graphs and $E_J \subseteq V_k^A \times V_k^B$
+an **arbitrary** bipartite set of chord edges between cell anchors.
+Then the multivariate Tutte (Sokal Z) polynomial satisfies
+
+$$Z(G_1 \oplus_{E_J} G_2;\, q, v) \;=\; \sum_{A_J \subseteq E_J} v^{|A_J|}
+\cdot Z\bigl(G_1 \cup_{\varphi(A_J)} G_2;\, q, v\bigr)$$
+
+where:
+
+- $\varphi(A_J)$ is the **equivalence relation** on $V_k^A \cup V_k^B$
+  induced by the connected components of the bipartite graph
+  $(V_k^A \cup V_k^B,\, A_J)$.
+- $G_1 \cup_\varphi G_2$ is the **merger graph**: take the disjoint union
+  $G_1 \sqcup G_2$ and identify all vertices in each $\varphi$-class
+  into a single vertex.
+
+### Why Sokal Z avoids the bridge complication
+
+Tutte's chord-rule branches based on whether an edge is a bridge, loop,
+or neither. The unified theorem's $(x-1)$ prefactor on $T(G)^2$ encodes
+the bridge case for matching chord junctions; for non-matching, bridges
+and loops can appear mid-expansion in complex ways. **Sokal Z's
+subset-sum** $\sum_A q^{c(A)} v^{|A|}$ has no such branching — each
+edge independently contributes $v$ if in $A_J$, regardless of bridge
+status. The reorganization by $\varphi$ falls out cleanly.
+
+### Specialization back to the bridge-aware (matching) form
+
+When $E_J$ is a **perfect matching** between $V_k^A$ and $V_k^B$ (one
+chord per anchor, with anchor $v_i^A \leftrightarrow v_i^B$):
+
+- Each subset $A_J \subseteq E_J$ corresponds bijectively to a subset
+  $V_T \subseteq V_k$ of anchor positions with chord present.
+- The induced $\varphi(A_J)$ has classes $\{(v_i^A, v_i^B) : v_i \in V_T\}$
+  (each $V_T$-anchor merged with its counterpart) plus singletons for
+  $V_k \setminus V_T$.
+- $|A_J| = |V_T|$, and the merger $G_1 \cup_{\varphi(A_J)} G_2$
+  equals the symmetric merger $G \cup_{V_T} G$ used in the original
+  theorem.
+
+So the generalized formula collapses to
+
+$$Z(G \oplus_M G;\, q, v) \;=\; \sum_{V_T \subseteq V_k} v^{|V_T|} \cdot
+Z(G \cup_{V_T} G;\, q, v)$$
+
+Converting via $T(G; x, y) = (x-1)^{-r(G)}\,(y-1)^{c(G) - |V(G)|}\,
+Z(G;\, (x-1)(y-1),\, y-1)$ and pulling out the $V_T = \emptyset$ term
+(which equals $Z(G)^2 = (x-1)^{2r}\,(y-1)^{2(n-c)} T(G)^2$) recovers
+the bridge-aware form $T(G \oplus_M G) = (x-1)\,T(G)^2 + \sum_{V_T} T(G
+\cup_{V_T} G)$. The $(x-1)$ prefactor is the Z↔T conversion artifact at
+the matching specialization, not a structural property of the chord
+junction — that's why it disappears in the Z-basis statement.
+
+### Tractability via tree decomposition of $H_J$
+
+The direct sum has $2^{|E_J|}$ terms. For Z(1, 2), $|E_J| = 32$ so naive
+enumeration is $2^{32} \approx 4 \times 10^9$. Reorganization by
+$\varphi$ partitions gives at most $\mathrm{Bell}(|V_k^A \cup V_k^B|)$
+terms — still $\approx 10^{17}$ for $V_k = 24$.
+
+**The unlock**: the bipartite junction graph $H_J = (V_k^A \cup V_k^B,
+E_J)$ typically has very low treewidth for structured graphs. Empirical
+measurements:
+
+| Target | $|V(H_J)|$ | $|E(H_J)|$ | components | $tw(H_J)$ | $|\mathrm{Aut}(H_J)|$ |
+|--------|----------|------------|------------|-----------|----------------------|
+| Z(1, 2) | 24 | 32 | 2 | 2 | 128 |
+
+A tree-DP over $H_J$ enumerates only the $\varphi$-equivalence relations
+**compatible** with the junction connectivity (each $\varphi$-class is
+connected via $E_J$). The cost is
+
+$$O\!\left(|V(H_J)| \cdot \mathrm{Bell}(tw + 1)^{\text{components}}
+\big/ |\mathrm{Aut}(H_J)|\right)$$
+
+For Z(1, 2): $O(24 \cdot 5^2 \cdot 2 / 128) \approx 10$ orbit-classes —
+versus $\sim 10^{17}$ naive. **Reduction of $\sim 10^{16}\times$.**
+
+### Algorithm
+
+For each cell-pair $G_1 \oplus_{E_J} G_2$:
+
+1. **Detect $H_J$** as the bipartite graph on $V_k^A \cup V_k^B$ with
+   inter-cell edges from $E_J$.
+2. **Tree DP over $H_J$** to enumerate equivalence relations $\varphi$
+   on $V_k^A \cup V_k^B$ such that each $\varphi$-class is connected
+   under $E_J$.
+3. **For each $\varphi$**:
+   - **Coefficient**: product over $\varphi$-classes $C$ of the
+     connected-spanning-subgraph polynomial of $E_J$ restricted to $C$:
+     $P_C(v) = \sum_{A_C \subseteq E_J[C],\,\text{spans } C} v^{|A_C|}$.
+   - **Merger Z**: lookup or compute $Z(G_1 \cup_\varphi G_2;\, q, v)$.
+     For symmetric mergers ($G_1 = G_2$, $\varphi$ pairs $V_k^A$ with
+     $V_k^B$ via identity matching), use the merger cache populated by
+     `warmup_merger_lookup.py`. For asymmetric or non-canonical
+     $\varphi$, compute on demand.
+4. **Sum**: $Z = \sum_\varphi (\prod_C P_C(v)) \cdot Z(\text{merger}_\varphi)$.
+5. **Convert** $Z(q, v) \to T(x, y)$ via the standard substitution.
+
+### Where this unlocks
+
+- **Z(1, 2)** via 2-cell Z(1, 1) decomposition: tractable directly
+  (per the H_J structure above).
+- **Z(1, 3) heterogeneous** (Z(1, 2) + Z(1, 1) cells): asymmetric
+  variant of the theorem applies with two different cell templates.
+- **Cm(2, n) cross-row junctions**: similar bipartite structure;
+  needs probing.
+
+### Open theoretical questions
+
+1. **Z↔T conversion identity**: state the explicit formula for converting
+   the Sokal Z generalized result back to T-basis for arbitrary $E_J$,
+   including the multi-edge case (where loops can appear after
+   contraction).
+2. **Asymmetric cells**: extend to $G_1 \neq G_2$. The merger cache and
+   coefficient computation generalize, but the canonical-key index needs
+   a bipartite extension.
+3. **Three-cell extensions**: when the cell-quotient has 3+ cells with
+   pairwise junctions, can a generalized Sokal Z framework apply
+   tile-by-tile?
+
+### Empirical validation (May 26, 2026)
+
+Probe in `tutte/research/scripts/probe_sokal_z_arbitrary_junction.py`
+verified the Sokal-Z formula directly on 5 small cases. The shipped
+module `tutte/roots/sokal_z_chord_junction.py` then validated the
+full Z→T conversion + multi-point Lagrange interpolation pipeline on
+12 cases in `tutte/tests/test_sokal_z_chord_junction.py`:
+
+- K_2 ⊕ K_2 with 1 chord (matching) ✓
+- K_2 ⊕ K_2 with M_2 chord (matching) ✓
+- K_2 ⊕ K_2 with 2 **parallel** chord at same anchor pair ✓
+- K_2 ⊕ K_2 with 3 **non-matching** chord (0,0)+(0,1)+(1,1) ✓
+- K_2 ⊕ K_2 with K_{2,2} chord ✓
+- K_3 ⊕ K_3 with M_2 chord ✓
+- K_3 ⊕ K_3 with M_3 chord ✓
+- K_4 ⊕ K_4 with M_3 chord ✓
+- K_4 ⊕ K_4 with M_4 chord ✓
+- K_4 ⊕ K_4 with 2 parallel + 2 matching chord ✓
+- C_4 ⊕ C_4 with K_{2,2} chord ✓
+- `compute_sokal_z_chord_junction` returns `None` past max_subsets gate ✓
+
+### Z↔T conversion (correct form)
+
+The Z↔T conversion used in the shipped module is
+
+$$Z(G;\, q,\, v) \;=\; (x-1)^{c(E)} \,(y-1)^{|V|} \cdot T(G;\, x, y)$$
+
+where $q = (x-1)(y-1),\, v = y - 1$. Equivalently,
+
+$$T(G;\, x, y) \;=\; (x-1)^{-c(E)} \,(y-1)^{-|V|} \cdot Z(G;\, (x-1)(y-1), y-1).$$
+
+Note this is **not** the rank-nullity form $(x-1)^{r(E)} (y-1)^{|V|-c(E)}$;
+the direct derivation through $Z = \sum_A q^{c(A)} v^{|A|}$ gives the
+$(x-1)^{c(E)} (y-1)^{|V|}$ form above. The prototype caught the rank-nullity
+mistake via a multi-point integer-arithmetic mismatch on the parallel-chord
+test case.
+
+### Implementation roadmap (status)
+
+- **DONE**: `tutte/roots/sokal_z_chord_junction.py` — brute-force
+  $A_J \subseteq E_J$ enumeration, multi-point evaluation, bivariate
+  Lagrange interpolation. Default gate $2^{|E_J|} \leq 65536$.
+- **DONE**: `compute_sokal_z_chord_junction_per_component` —
+  per-$H_J$-component $A_J$ enumeration + cross-product. Handles
+  $|E_J| > 16$ when each component is small. Gated on per-component
+  $\varphi$ count and cross-product size.
+- **DONE**: Engine wiring — `SynthesisEngine._try_sokal_z_chord_junction`
+  fires in `_try_formula_shortcircuit` as a 2-cell fallback after the
+  k-matching attempt fails. Integration test:
+  `test_engine_sokal_z_dispatch_helper`.
+- **TASK #440** (pending): true bag-by-bag tree-DP over $H_J$ that
+  emits compatible $\varphi$ partitions + coefficient polynomials
+  without materializing all $\varphi$ explicitly. Required for
+  Z(1, 2) where the per-component path has 17K compatible $\varphi$
+  per component and the 297M cross-product trips the gate. May also
+  need cell-Aut orbit compression on $\varphi$ partitions.
+- **Until #440 lands**, Z(1, 2) routes through the signed-DP path
+  (~33s) instead of Sokal-Z.

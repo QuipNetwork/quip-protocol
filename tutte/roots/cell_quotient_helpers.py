@@ -663,20 +663,95 @@ def _build_junc_data_mod(
     devastating for Cm₃-scale where there are 4096 junction orbits with
     ~200 ms expansion each).
     """
+    import os as _os, time as _t
+    _DBG = _os.environ.get("TUTTE_DEBUG_AGG", "0") != "0"
+    if _DBG:
+        _t0 = _t.time()
+        print(f"  [build_junc_data] enum={enumerate_junction_internally} "
+              f"n_orbits={len(junction_orbit_partitions)} "
+              f"jcag={junction_cell_anchor_groups is not None}", flush=True)
     junc_data: Dict[Tuple, list] = {}
     if enumerate_junction_internally and junction_cell_anchor_groups is not None:
+        # Pre-build G_flat ONCE for the cell_anchor_groups; reuse across
+        # all orbit expansions. Universe = union of cell_anchor_groups
+        # positions + any positions in junction partitions (which are fixed
+        # by the per-cell perms but need to appear in the universe).
+        universe_set: set = set()
+        for grp in junction_cell_anchor_groups:
+            for v in grp:
+                universe_set.add(v)
+        for _, pj_list in junction_orbit_partitions.items():
+            for P in pj_list:
+                for block in P:
+                    for v in block:
+                        universe_set.add(v)
+        universe = list(universe_set)
+
+        _g_build_t0 = _t.time() if _DBG else 0
+        G_flat, n_G = _build_per_cell_aut_flat(
+            junction_cell_anchor_groups, universe,
+        )
+        if _DBG:
+            print(f"  [build_junc_data] G_flat built: n_G={n_G} n_universe={len(universe)} "
+                  f"({_t.time()-_g_build_t0:.2f}s)", flush=True)
+
+        # Try C-ext path; fall back to Python if unavailable.
+        _use_c = True
+        try:
+            from ._partition_c import _get_lib
+            lib, _ffi = _get_lib()
+            G_arr_cffi = _ffi.new("int[]", G_flat)
+        except Exception:
+            _use_c = False
+
+        _expansion_t = 0.0
+        _restrict_t = 0.0
+        _n_done = 0
+        _n_members_total = 0
+        _c_used = 0
+        _py_fallback = 0
         for O_junc, pj_list in junction_orbit_partitions.items():
             rep = pj_list[0]
-            members = _expand_per_cell_orbit_members(
-                rep, junction_cell_anchor_groups,
-            )
+            _t1 = _t.time() if _DBG else 0
+            members = None
+            if _use_c:
+                canonical = per_cell_canonical_key(rep, junction_cell_anchor_groups)
+                target_size = per_cell_orbit_size(canonical, junction_cell_anchor_groups)
+                members = _expand_per_cell_orbit_members_c_batch(
+                    rep, target_size, universe, G_arr_cffi, n_G, lib, _ffi,
+                )
+                if members is not None:
+                    _c_used += 1
+            if members is None:
+                members = _expand_per_cell_orbit_members(
+                    rep, junction_cell_anchor_groups,
+                )
+                _py_fallback += 1
+            if _DBG:
+                _expansion_t += _t.time() - _t1
+                _t2 = _t.time()
             per_junc = []
             for P_junc in members:
                 P_junc_S = restrict_partition(P_junc, shared_boundary)
                 P_junc_ext_list = list(P_junc) + [(v,) for v in state_extra_boundary]
                 P_junc_ext = tuple(sorted(P_junc_ext_list))
                 per_junc.append((P_junc, P_junc_S, P_junc_ext))
+            if _DBG:
+                _restrict_t += _t.time() - _t2
+                _n_members_total += len(members)
+                _n_done += 1
+                if _n_done % 500 == 0:
+                    _elapsed = _t.time() - _t0
+                    print(f"  [build_junc_data] {_n_done}/{len(junction_orbit_partitions)} orbits "
+                          f"({_n_members_total} members), exp={_expansion_t:.1f}s "
+                          f"restrict={_restrict_t:.1f}s total={_elapsed:.1f}s "
+                          f"c={_c_used} py={_py_fallback}", flush=True)
             junc_data[O_junc] = per_junc
+        if _DBG:
+            print(f"  [build_junc_data] DONE: {_n_done} orbits, {_n_members_total} members, "
+                  f"exp={_expansion_t:.1f}s restrict={_restrict_t:.1f}s total={_t.time()-_t0:.1f}s "
+                  f"c={_c_used} py={_py_fallback}",
+                  flush=True)
     else:
         for O_junc, pj_list in junction_orbit_partitions.items():
             per_junc = []
@@ -686,6 +761,8 @@ def _build_junc_data_mod(
                 P_junc_ext = tuple(sorted(P_junc_ext_list))
                 per_junc.append((P_junc, P_junc_S, P_junc_ext))
             junc_data[O_junc] = per_junc
+        if _DBG:
+            print(f"  [build_junc_data] DONE (non-enum): {_t.time()-_t0:.1f}s", flush=True)
     return junc_data
 
 
@@ -916,23 +993,33 @@ def precompute_M_and_convolve_streaming_mod(
                     O_state: per_cell_orbit_size(O_state, state_cell_anchor_groups)
                     for O_state in chunk_state_part
                 }
-                chunk_out_mod = chunk_compute(
-                    state_orbit_partitions=chunk_state_part,
-                    junc_data_per_orbit=junc_data,
-                    state_extra_boundary=state_extra,
-                    extra_boundary=extra_boundary,
-                    shared_boundary=shared_boundary,
-                    out_boundary=(state_extra + list(shared_boundary) + list(extra_boundary))
+                # R19 H-bucketing activation: pass state_cell_anchor_groups to
+                # precompute_and_aggregate_c_mod so the per-state-orbit
+                # stabilizer H = stab_G(state_rep|shared_boundary) is computed
+                # and used to bucket junction members. For non-R18 path
+                # (precompute_and_convolve_c_mod), R19 isn't supported, so we
+                # only pass when using R18.
+                _aggregate_kwargs = {
+                    "state_orbit_partitions": chunk_state_part,
+                    "junc_data_per_orbit": junc_data,
+                    "state_extra_boundary": state_extra,
+                    "extra_boundary": extra_boundary,
+                    "shared_boundary": shared_boundary,
+                    "out_boundary": (state_extra + list(shared_boundary) + list(extra_boundary))
                                  if keep_shared
                                  else (state_extra + list(extra_boundary)),
-                    out_cell_anchor_groups=out_cell_anchor_groups,
-                    n_state_per_orbit=n_state_per_orbit,
-                    state_orbit_T_mod=state_orbit_T_mod,
-                    junction_orbit_T_mod=junction_orbit_T_mod,
-                    xy_pow_mod=[pow(((x_val - 1) * (y_val - 1)) % p, d, p)
+                    "out_cell_anchor_groups": out_cell_anchor_groups,
+                    "n_state_per_orbit": n_state_per_orbit,
+                    "state_orbit_T_mod": state_orbit_T_mod,
+                    "junction_orbit_T_mod": junction_orbit_T_mod,
+                    "xy_pow_mod": [pow(((x_val - 1) * (y_val - 1)) % p, d, p)
                                 for d in range(len(shared_boundary) + 1)],
-                    p=p,
-                )
+                    "p": p,
+                }
+                if use_r18:
+                    # R19 only available via precompute_and_aggregate_c_mod.
+                    _aggregate_kwargs["state_cell_anchor_groups"] = state_cell_anchor_groups
+                chunk_out_mod = chunk_compute(**_aggregate_kwargs)
                 if chunk_out_mod is None and use_r18:
                     # Hash-map aggregator returned None (capacity overflow
                     # or similar) — fall back to the per-chunk convolve
@@ -1006,6 +1093,81 @@ def precompute_M_and_convolve_streaming_mod(
             val = val * inv % p
         result[O_out] = val
     return result
+
+
+def _build_per_cell_aut_flat(
+    cell_anchor_groups: List[List[int]],
+    universe: List[int],
+) -> Tuple[List[int], int]:
+    """Build flat array of all per-cell S_n^N perm-images for a fixed
+    universe. Universe must include all positions in cell_anchor_groups
+    plus any other positions that appear in partitions to be canonicalized
+    (those are fixed by the perms).
+
+    Returns (G_flat, n_G) where G_flat[g * n_universe + i] = image of
+    universe[i] under perm g (encoded as index into universe).
+    """
+    from itertools import permutations, product
+    pos_to_idx = {pos: i for i, pos in enumerate(universe)}
+    per_group_perms = [list(permutations(g)) for g in cell_anchor_groups]
+    n_G = 1
+    for pgp in per_group_perms:
+        n_G *= len(pgp)
+    G_flat: List[int] = []
+    for perm_combo in product(*per_group_perms):
+        relabel = {}
+        for orig_g, new_perm in zip(cell_anchor_groups, perm_combo):
+            for orig, new in zip(orig_g, new_perm):
+                relabel[orig] = new
+        for pos in universe:
+            tgt = relabel.get(pos, pos)
+            G_flat.append(pos_to_idx[tgt])
+    return G_flat, n_G
+
+
+def _expand_per_cell_orbit_members_c_batch(
+    rep: Tuple[Tuple[int, ...], ...],
+    target_size: int,
+    universe: List[int],
+    G_arr,  # cffi int[] for G_flat
+    n_G: int,
+    lib, _ffi,
+):
+    """C-ext orbit expansion with pre-built G array (caller-owned).
+
+    Returns list of canonical-sorted partition tuples, or None on overflow.
+    """
+    from ..roots._partition_c import _encode_partition, _decode_partition
+    n_univ = len(universe)
+    if n_univ > 256:
+        return None
+    pos_to_idx = {pos: i for i, pos in enumerate(universe)}
+    idx_to_pos = list(universe)
+    try:
+        rep_enc = _encode_partition(rep, pos_to_idx)
+    except KeyError:
+        return None
+    rep_arr = _ffi.new("int[]", rep_enc)
+    # Output capacity: each member's encoding ≈ rep_enc_len. Allow target_size × 2.
+    out_capacity = max(target_size * len(rep_enc) * 2, 1024)
+    out_arr = _ffi.new("int[]", out_capacity)
+    out_off_arr = _ffi.new("int[]", target_size + 2)
+    n_found = lib.expand_orbit_members_c(
+        rep_arr, len(rep_enc),
+        G_arr, n_G, n_univ,
+        target_size,
+        out_arr, out_off_arr, out_capacity,
+        target_size,
+    )
+    if n_found < 0:
+        return None
+    members = []
+    for m_idx in range(n_found):
+        m_start = out_off_arr[m_idx]
+        m_end = out_off_arr[m_idx + 1]
+        m_enc = [int(out_arr[i]) for i in range(m_start, m_end)]
+        members.append(_decode_partition(m_enc, len(m_enc), idx_to_pos))
+    return members
 
 
 def _expand_per_cell_orbit_members(

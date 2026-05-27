@@ -1156,8 +1156,16 @@ def _partition_by_structure(
     # Cm3 (72n) → 0.72s; Pm3 (128n) → 1.28s. Small graphs (n<30) still
     # get 0.3s minimum so the K_{4,4} success path on small inputs isn't
     # interrupted.
+    # NOTE (May 26 2026): on Cm_3 (72n), K_{4,4} VF2 succeeds in ~0.7-0.8s
+    # which races the 0.72s budget — ~60% of trials timed out, falling through
+    # to Fan_1 (size-2 cells) which breaks the cell-quotient grid DP path.
+    # Smarter budget: scale by cell_size × node_count to give larger budgets
+    # for the cases where VF2 takes longer (large cells embedded in large
+    # targets). For K_{4,4} (8n) in Cm_3 (72n): 0.02 × 72 + 0.05 × 8 = 1.84s.
+    # For Z(1,2) (24n) with K_{3,3}-class cells (6n): 0.01 × 24 + 0.05 × 6 = 0.54s.
+    # Keep 0.3s floor for tiny graphs.
     if time_budget_seconds is None:
-        time_budget_seconds = max(0.3, 0.01 * total_nodes)
+        time_budget_seconds = max(0.3, 0.01 * total_nodes + 0.05 * cell_size)
 
     # Use VF2 to find all isomorphic copies of cell in graph
     G_target = graph.to_networkx()
@@ -2255,17 +2263,23 @@ _HET_PARTITION_CACHE: Dict[Tuple[str, int, int, int, int], Optional[Tuple]] = {}
 def _hierarchical_candidate_priority(name: str) -> int:
     """Priority for ordering rainbow-table candidates in VF2 partition search.
 
-    Lower number = higher priority. K_n/K_{a,b} first (high-payoff for
-    D-Wave; Cm3 with Ladder_12 candidate took 1249s without this gate).
-    D-Wave family aliases next. Asymmetric Book/Pan/Sunlet before
-    vertex-transitive Ladder/Prism/Mobius/Fan — empirically (May 22 2026)
-    Z(2,1) Mobius_10/Ladder_10/Prism_10/Fan_9 each burned 9-25s on
-    no-match exhaustion before Book_3 succeeded in 0.01s.
+    Lower number = higher priority. D-Wave native cells (Cm, Pm, Z)
+    first because when they DO tile a target, they give the FEWEST-cell
+    partition, which is what the unified chord-junction theorem needs
+    (e.g., Z(1, 2) prefers 2× Z1_1 over 4× K_{3,3} — both valid, but
+    only the former lets the engine use the Z(1, 1) merger cache).
+    K_n/K_{a,b} are universal fallbacks. Asymmetric Book/Pan/Sunlet
+    before vertex-transitive Ladder/Prism/Mobius/Fan — empirically
+    (May 22 2026) Z(2,1) Mobius_10/Ladder_10/Prism_10/Fan_9 each
+    burned 9-25s on no-match exhaustion before Book_3 succeeded in
+    0.01s. Cm3 with Ladder_12 candidate took 1249s before the K-first
+    gate landed; D-Wave cells are still gated above Ladder so that
+    regression doesn't recur.
     """
-    if name.startswith('K_'):
-        return 0  # K_n, K_{a,b}
     if name.startswith(('Cm', 'Pm', 'Z')):
-        return 1  # D-Wave family aliases
+        return 0  # D-Wave native cells — prefer fewest-cell partition
+    if name.startswith('K_'):
+        return 1  # K_n, K_{a,b} — universal fallback
     if name.startswith('Grid_'):
         return 2  # Grid_n×m
     if name.startswith(('C_', 'W_', 'P_', 'S_')):

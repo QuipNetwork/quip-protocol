@@ -1985,7 +1985,94 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                         minors_used=all_minors,
                     )
 
+            # Sokal-Z generalized chord-junction (fallback for 2-cell
+            # partitions with non-matching / multi-edge / dense E_J that
+            # the unified theorem can't handle). See
+            # `tutte/roots/sokal_z_chord_junction.py`. Gated on small
+            # H_J components — true tree-DP for large components is
+            # task #438 follow-up.
+            if k_cells == 2:
+                sokal_z_poly = self._try_sokal_z_chord_junction(
+                    graph, cells, partition, inter_info,
+                )
+                if (sokal_z_poly is not None
+                        and verify_spanning_trees(graph, sokal_z_poly)):
+                    recipe.append(
+                        f"Sokal-Z chord-junction: {len(inter_info.edges)} "
+                        f"chord edges"
+                    )
+                    return SynthesisResult(
+                        polynomial=sokal_z_poly,
+                        recipe=recipe,
+                        verified=True,
+                        method="sokal_z_chord_junction",
+                        tiles_used=k_cells,
+                        fringe_edges=0,
+                        minors_used=all_minors,
+                    )
+
         return None
+
+    def _try_sokal_z_chord_junction(
+        self,
+        graph: 'Graph',
+        cells: List,
+        partition: List[Set[int]],
+        inter_info,
+    ) -> Optional[TuttePolynomial]:
+        """Dispatch the Sokal-Z generalized chord-junction theorem.
+
+        Handles 2-cell partitions with **arbitrary** chord junctions
+        (matching, multi-edge, non-matching) that the unified theorem
+        rejects. Gated to small H_J components — large components
+        (Z(1, 2)-class, |E_J| > 16 with dense connectivity) fall
+        through and rely on tree-DP follow-up (task #438).
+        """
+        if len(partition) != 2:
+            return None
+        cell_left_verts = sorted(partition[0])
+        cell_right_verts = sorted(partition[1])
+        relabel_left = {v: idx for idx, v in enumerate(cell_left_verts)}
+        relabel_right = {v: idx for idx, v in enumerate(cell_right_verts)}
+        left_set = set(cell_left_verts)
+        right_set = set(cell_right_verts)
+
+        # Build cell graphs
+        def _induced(relabel: Dict[int, int]) -> 'Graph':
+            edges: Set[Tuple[int, int]] = set()
+            for (u, v) in graph.edges:
+                if u in relabel and v in relabel:
+                    a, b = relabel[u], relabel[v]
+                    edges.add((min(a, b), max(a, b)))
+            return Graph(
+                nodes=frozenset(relabel.values()),
+                edges=frozenset(edges),
+            )
+
+        cell_left = _induced(relabel_left)
+        cell_right = _induced(relabel_right)
+
+        # Build chord-edge list in (left_relabel, right_relabel) form
+        chord_pairs: List[Tuple[int, int]] = []
+        for (a, b) in inter_info.edges:
+            if a in left_set and b in right_set:
+                chord_pairs.append((relabel_left[a], relabel_right[b]))
+            elif b in left_set and a in right_set:
+                chord_pairs.append((relabel_left[b], relabel_right[a]))
+            else:
+                return None
+        if not chord_pairs:
+            return None
+        try:
+            from ..roots.sokal_z_chord_junction import (
+                compute_sokal_z_chord_junction,
+            )
+            return compute_sokal_z_chord_junction(
+                cell_left, cell_right, chord_pairs,
+                self._synthesize_multigraph,
+            )
+        except Exception:
+            return None
 
     # Fast-path threshold for the unified chord-junction theorem. When
     # the chord junction has |V_k| ≤ this many anchors, the I-E sum

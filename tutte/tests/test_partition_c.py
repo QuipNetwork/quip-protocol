@@ -211,3 +211,130 @@ def test_h_canon_batched_matches_python_reference():
     py = [min(apply_perm_to_partition(P, h) for h in H) for P in P_list]
     c = h_canonicalize_c_batched(P_list, H, universe)
     assert c == py
+
+
+def test_expand_orbit_members_c_matches_python():
+    """C-ext orbit expansion matches Python `_expand_per_cell_orbit_members`."""
+    from tutte.roots.cell_quotient_helpers import (
+        _build_per_cell_aut_flat,
+        _expand_per_cell_orbit_members,
+        _expand_per_cell_orbit_members_c_batch,
+        per_cell_canonical_key,
+        per_cell_orbit_size,
+    )
+    from tutte.roots._partition_c import _get_lib
+
+    cell_anchor_groups = [[0, 1, 2, 3], [4, 5, 6, 7]]
+    universe = [0, 1, 2, 3, 4, 5, 6, 7]
+
+    # Several test partitions of varying structures.
+    test_reps = [
+        ((0,), (1,), (2,), (3,), (4,), (5,), (6,), (7,)),  # all singletons
+        ((0, 1), (2, 3), (4, 5), (6, 7)),  # within-cell pairs
+        ((0, 4), (1, 5), (2, 6), (3, 7)),  # cross-cell pairs
+        ((0, 1, 2, 3), (4, 5, 6, 7)),  # whole cells
+        ((0, 4, 1, 5), (2, 6, 3, 7)),  # mixed
+    ]
+
+    G_flat, n_G = _build_per_cell_aut_flat(cell_anchor_groups, universe)
+    lib, _ffi = _get_lib()
+    G_arr = _ffi.new("int[]", G_flat)
+
+    for rep in test_reps:
+        canonical = per_cell_canonical_key(rep, cell_anchor_groups)
+        target_size = per_cell_orbit_size(canonical, cell_anchor_groups)
+        py_members = sorted(_expand_per_cell_orbit_members(rep, cell_anchor_groups))
+        c_members = _expand_per_cell_orbit_members_c_batch(
+            rep, target_size, universe, G_arr, n_G, lib, _ffi,
+        )
+        assert c_members is not None, f"C-ext returned None for rep={rep}"
+        c_members_sorted = sorted(c_members)
+        assert c_members_sorted == py_members, (
+            f"rep={rep}: c={c_members_sorted}, py={py_members}"
+        )
+
+
+def test_expand_orbit_members_c_three_cells():
+    """C-ext orbit expansion works for 3 cells (Cm_3 row scale)."""
+    from tutte.roots.cell_quotient_helpers import (
+        _build_per_cell_aut_flat,
+        _expand_per_cell_orbit_members,
+        _expand_per_cell_orbit_members_c_batch,
+        per_cell_canonical_key,
+        per_cell_orbit_size,
+    )
+    from tutte.roots._partition_c import _get_lib
+
+    # Cm_3 row scale: 3 cells of 4 each (|G| = 24^3 = 13824).
+    cell_anchor_groups = [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]]
+    universe = list(range(12))
+
+    test_reps = [
+        ((0,), (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,)),
+        ((0, 4), (1, 5), (2, 6), (3, 7), (8,), (9,), (10,), (11,)),
+        ((0, 4, 8), (1, 5, 9), (2, 6, 10), (3, 7, 11)),
+    ]
+
+    G_flat, n_G = _build_per_cell_aut_flat(cell_anchor_groups, universe)
+    assert n_G == 24 ** 3
+    lib, _ffi = _get_lib()
+    G_arr = _ffi.new("int[]", G_flat)
+
+    for rep in test_reps:
+        canonical = per_cell_canonical_key(rep, cell_anchor_groups)
+        target_size = per_cell_orbit_size(canonical, cell_anchor_groups)
+        py_members = sorted(_expand_per_cell_orbit_members(rep, cell_anchor_groups))
+        c_members = _expand_per_cell_orbit_members_c_batch(
+            rep, target_size, universe, G_arr, n_G, lib, _ffi,
+        )
+        assert c_members is not None
+        c_members_sorted = sorted(c_members)
+        assert c_members_sorted == py_members, (
+            f"rep={rep}: |c|={len(c_members_sorted)} |py|={len(py_members)}"
+        )
+
+
+def test_set_stabilizer_c_matches_python():
+    """C-ext set_stabilizer_c matches Python `per_cell_partition_stab`."""
+    from tutte.roots._partition_c import _encode_partition, _get_lib
+    from tutte.roots.aut_orbit import (
+        enumerate_per_cell_aut_group,
+        per_cell_partition_stab,
+    )
+
+    cell_anchor_groups = [[0, 1, 2, 3], [4, 5, 6, 7]]
+    universe = [0, 1, 2, 3, 4, 5, 6, 7]
+    G_elements = enumerate_per_cell_aut_group(cell_anchor_groups)
+    assert len(G_elements) == 24 * 24  # 576
+
+    # Build G_flat for C call.
+    pos_to_idx = {pos: i for i, pos in enumerate(universe)}
+    G_flat = []
+    for g_perm in G_elements:
+        for pos in universe:
+            tgt = g_perm.get(pos, pos)
+            G_flat.append(pos_to_idx[tgt])
+
+    lib, _ffi = _get_lib()
+    G_arr = _ffi.new("int[]", G_flat)
+    out_arr = _ffi.new("int[]", len(G_elements))
+
+    test_partitions = [
+        ((0,), (1,), (2,), (3,), (4,), (5,), (6,), (7,)),  # singletons → |H| = full
+        ((0, 1), (2, 3), (4, 5), (6, 7)),  # 4 pairs
+        ((0, 4), (1, 5), (2, 6), (3, 7)),  # cross pairs
+        ((0, 1, 2, 3), (4, 5, 6, 7)),  # whole-cell blocks → |H| = full
+    ]
+    for P in test_partitions:
+        py_stab = per_cell_partition_stab(P, G_elements)
+        P_enc = _encode_partition(P, pos_to_idx)
+        P_arr = _ffi.new("int[]", P_enc)
+        n_stab = lib.set_stabilizer_c(
+            P_arr, len(P_enc),
+            G_arr, len(G_elements), len(universe),
+            out_arr, len(G_elements),
+        )
+        assert n_stab >= 0, f"C error for P={P}"
+        assert n_stab == len(py_stab), (
+            f"P={P}: C n_stab={n_stab}, py |H|={len(py_stab)}"
+        )

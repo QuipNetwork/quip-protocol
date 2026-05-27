@@ -243,3 +243,55 @@ def test_modular_dp_matches_engine(case, engine_polynomials):
                 f"{case.name}: modular_dp({x},{y},{p}) = {modular}, "
                 f"engine.evaluate_mod = {engine_mod} (Δ={modular - engine_mod})"
             )
+
+
+def test_cm2_modular_dp_under_15s():
+    """Cm_2 modular DP at (3, 5) mod 1009 should complete in < 15s.
+
+    Regression guard for the cell-quotient-mod-DP path (R18 aggregation,
+    R19 H-bucketing off-by-default, C-ext orbit expansion). Cm_2 baseline
+    on 2026-05-26 was ~12s including initial path-DP build (~6s). The 15s
+    cap catches regressions of ~25%+.
+
+    Sets TUTTE_R19_ENABLE=0 (default) to keep timing predictable; R19
+    H-bucketing is currently a net regression in modular int mode.
+    """
+    import time
+    import os
+    os.environ.setdefault("TUTTE_R19_ENABLE", "0")
+    from tutte.graphs.covering import clear_hierarchical_partition_cache
+    clear_hierarchical_partition_cache()
+    from tutte.research.scripts.cm3_via_modular_dp import chimera_modular_dp
+
+    t0 = time.time()
+    got = chimera_modular_dp(2, 3, 5, 1009, verbose=False)
+    elapsed = time.time() - t0
+    assert got == 842, f"T(Cm_2; 3, 5) mod 1009 = {got}, expected 842"
+    assert elapsed < 15.0, f"Cm_2 modular DP took {elapsed:.1f}s (must be < 15s)"
+
+
+@pytest.mark.slow
+def test_cm3_modular_dp_completes_under_10min():
+    """Cm_3 modular DP at one point should complete in < 10 minutes.
+
+    Regression guard for the Cm_3 modular DP path. Current bottleneck
+    (May 26 2026) is the per-state state×row composition which runs C
+    inner loops over ~4M junction members × ~500 states per chunk × 14
+    chunks. Estimated wall ~17-25 min per modular point.
+
+    Marked @pytest.mark.slow so it's not run by default — invoke with
+    `pytest -m slow tutte/tests/test_modular.py::test_cm3_modular_dp_completes_under_10min`.
+    Skipped by default in CI.
+    """
+    import time
+    import os
+    os.environ.setdefault("TUTTE_R19_ENABLE", "0")
+    from tutte.graphs.covering import clear_hierarchical_partition_cache
+    clear_hierarchical_partition_cache()
+    from tutte.research.scripts.cm3_via_modular_dp import chimera_modular_dp
+
+    t0 = time.time()
+    got = chimera_modular_dp(3, 3, 5, 1009, verbose=False)
+    elapsed = time.time() - t0
+    assert isinstance(got, int)
+    assert elapsed < 600.0, f"Cm_3 modular DP took {elapsed:.1f}s (must be < 10min)"

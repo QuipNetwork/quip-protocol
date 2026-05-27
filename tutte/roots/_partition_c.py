@@ -180,6 +180,57 @@ ffi.cdef(r"""
         const int* P_enc, int P_enc_len,
         const int* H_perms_flat, int n_H, int n_universe,
         int* out_canon, int out_capacity);
+
+    /* Batched H-canonicalize: process n_partitions partitions in one
+       C call. Inputs:
+         P_flat: flat buffer with all partition encodings concatenated.
+         P_offsets[i]: start offset of partition i in P_flat (length n+1
+                       with P_offsets[n] = total length).
+         H_perms_flat, n_H, n_universe: as in h_canonicalize_c.
+         out_flat: output buffer for canonical encodings.
+         out_offsets[i]: start offset of partition i's canonical in out_flat
+                         (length n+1, written by C).
+         out_capacity: total size of out_flat.
+       Returns: total bytes written to out_flat, or -1 on overflow. */
+    int h_canonicalize_batch_c(
+        const int* P_flat, const int* P_offsets, int n_partitions,
+        const int* H_perms_flat, int n_H, int n_universe,
+        int* out_flat, int* out_offsets, int out_capacity);
+
+    /* Compute set-stabilizer of partition P_enc under permutation group G.
+       For each perm in G_perms_flat (length n_G * n_universe), check if
+       applying it to P leaves the partition setwise invariant. Output:
+       out_stab_indices[i] = index into G_perms_flat for the i-th stabilizer
+       element (i < returned n_stab).
+
+       Returns: number of stabilizer perms found, or -1 on error.
+
+       This replaces `per_cell_partition_stab` Python loop:
+         [σ for σ in G_elements if apply_perm_to_partition(P, σ) == P]
+       For Cm_3: 6608 states × 576 G-perms × Python apply_perm = 30+s
+       bottleneck. C-side: same arithmetic in microseconds. */
+    int set_stabilizer_c(
+        const int* P_enc, int P_enc_len,
+        const int* G_perms_flat, int n_G, int n_universe,
+        int* out_stab_indices, int out_capacity);
+
+    /* Enumerate per-cell orbit members of partition rep under permutation
+       group G_perms_flat (n_G perms × n_universe), early-terminating once
+       target_size distinct canonical members found.
+
+       Output:
+         out_members_flat: concatenated canonical encodings of each member.
+         out_members_offsets[i]: start offset of member i in out_members_flat
+                                  (length max_members+1; out_members_offsets[n]
+                                  = total length).
+       Returns: number of distinct members found (≤ target_size), or -1 on
+       overflow. */
+    int expand_orbit_members_c(
+        const int* rep_enc, int rep_enc_len,
+        const int* G_perms_flat, int n_G, int n_universe,
+        int target_size,
+        int* out_members_flat, int* out_members_offsets, int out_capacity,
+        int max_members);
 """)
 
 ffi.set_source("_tutte_partition_cffi", r"""
@@ -830,6 +881,190 @@ ffi.set_source("_tutte_partition_cffi", r"""
         if (best_len < 0 || out_capacity < best_len) return -1;
         for (int i = 0; i < best_len; i++) out_canon[i] = best[i];
         return best_len;
+    }
+
+    /* Batched H-canonicalize: amortizes Python-side overhead by processing
+       many partitions in one cffi call. For Cm_3 R19 path: ~6608 state
+       orbits × ~4096 junction members each = ~27M partitions, where per-call
+       cffi overhead in h_canonicalize_c batched-via-Python was the wall. */
+    int h_canonicalize_batch_c(
+        const int* P_flat, const int* P_offsets, int n_partitions,
+        const int* H_perms_flat, int n_H, int n_universe,
+        int* out_flat, int* out_offsets, int out_capacity)
+    {
+        int out_pos = 0;
+        for (int i = 0; i < n_partitions; i++) {
+            int p_start = P_offsets[i];
+            int p_len = P_offsets[i + 1] - p_start;
+            out_offsets[i] = out_pos;
+            int remaining = out_capacity - out_pos;
+            if (remaining < 0) return -1;
+            int n_out;
+            if (n_H == 0) {
+                if (remaining < p_len) return -1;
+                for (int j = 0; j < p_len; j++) out_flat[out_pos + j] = P_flat[p_start + j];
+                n_out = p_len;
+            } else {
+                n_out = h_canonicalize_c(
+                    P_flat + p_start, p_len,
+                    H_perms_flat, n_H, n_universe,
+                    out_flat + out_pos, remaining);
+                if (n_out < 0) return -1;
+            }
+            out_pos += n_out;
+        }
+        out_offsets[n_partitions] = out_pos;
+        return out_pos;
+    }
+
+    /* Hash a partition encoding via FNV-1a 64-bit. */
+    static uint64_t partition_hash(const int* enc, int enc_len) {
+        uint64_t h = 14695981039346656037ULL;
+        for (int i = 0; i < enc_len; i++) {
+            int v = enc[i];
+            h ^= (uint64_t)v;
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    /* Compare two encoded partitions. */
+    static int partition_equal(const int* a, int alen, const int* b, int blen) {
+        if (alen != blen) return 0;
+        for (int i = 0; i < alen; i++) {
+            if (a[i] != b[i]) return 0;
+        }
+        return 1;
+    }
+
+    /* Enumerate distinct canonical orbit members under G perms with
+       early termination at target_size. Uses open-addressing hash set
+       over canonical encodings. Caller's out_members_flat acts as the
+       backing store for hash slots' keys (no extra alloc). */
+    int expand_orbit_members_c(
+        const int* rep_enc, int rep_enc_len,
+        const int* G_perms_flat, int n_G, int n_universe,
+        int target_size,
+        int* out_members_flat, int* out_members_offsets, int out_capacity,
+        int max_members)
+    {
+        if (rep_enc_len > 2048) return -1;
+
+        /* Hash set: slots × 2 capacity for low collisions. Power of 2. */
+        int hs_cap = 1;
+        while (hs_cap < max_members * 2 && hs_cap < (1 << 20)) hs_cap <<= 1;
+        if (hs_cap < 16) hs_cap = 16;
+        /* Allocate small hash-set on stack via VLA-like static buffer.
+           For large hs_cap (up to 1M), use heap. */
+        int* hs_member_idx = (int*)malloc((size_t)hs_cap * sizeof(int));
+        if (hs_member_idx == NULL) return -1;
+        for (int i = 0; i < hs_cap; i++) hs_member_idx[i] = -1;
+        int hs_mask = hs_cap - 1;
+
+        int candidate[2048];
+        int n_found = 0;
+        int out_pos = 0;
+        out_members_offsets[0] = 0;
+
+        /* Identity perm = rep's canonical form (first member). */
+        int identity[256];
+        if (n_universe > 256) { free(hs_member_idx); return -1; }
+        for (int i = 0; i < n_universe; i++) identity[i] = i;
+        int can_len_first = apply_perm_canonical_c(
+            rep_enc, rep_enc_len, identity, n_universe, candidate, 2048);
+        if (can_len_first < 0) { free(hs_member_idx); return -1; }
+        if (out_pos + can_len_first > out_capacity) { free(hs_member_idx); return -1; }
+        for (int i = 0; i < can_len_first; i++) out_members_flat[out_pos + i] = candidate[i];
+        out_pos += can_len_first;
+        out_members_offsets[1] = out_pos;
+        n_found = 1;
+        uint64_t h_first = partition_hash(candidate, can_len_first);
+        int slot = (int)(h_first & (uint64_t)hs_mask);
+        while (hs_member_idx[slot] != -1) slot = (slot + 1) & hs_mask;
+        hs_member_idx[slot] = 0;  /* index 0 */
+
+        if (n_found >= target_size || n_found >= max_members) {
+            free(hs_member_idx);
+            return n_found;
+        }
+
+        for (int g = 1; g < n_G; g++) {
+            const int* perm = G_perms_flat + (long long)g * n_universe;
+            int can_len = apply_perm_canonical_c(
+                rep_enc, rep_enc_len, perm, n_universe, candidate, 2048);
+            if (can_len < 0) { free(hs_member_idx); return -1; }
+
+            /* Hash lookup. */
+            uint64_t h = partition_hash(candidate, can_len);
+            int slot2 = (int)(h & (uint64_t)hs_mask);
+            int found = 0;
+            while (hs_member_idx[slot2] != -1) {
+                int m_idx = hs_member_idx[slot2];
+                int m_start = out_members_offsets[m_idx];
+                int m_end = out_members_offsets[m_idx + 1];
+                if (partition_equal(
+                        out_members_flat + m_start, m_end - m_start,
+                        candidate, can_len)) {
+                    found = 1;
+                    break;
+                }
+                slot2 = (slot2 + 1) & hs_mask;
+            }
+            if (found) continue;
+
+            /* New member: append. */
+            if (n_found >= max_members) { free(hs_member_idx); return -1; }
+            if (out_pos + can_len > out_capacity) { free(hs_member_idx); return -1; }
+            for (int i = 0; i < can_len; i++) out_members_flat[out_pos + i] = candidate[i];
+            out_pos += can_len;
+            hs_member_idx[slot2] = n_found;
+            n_found++;
+            out_members_offsets[n_found] = out_pos;
+            if (n_found >= target_size) {
+                free(hs_member_idx);
+                return n_found;
+            }
+        }
+        free(hs_member_idx);
+        return n_found;
+    }
+
+    /* Set-stabilizer: enumerate perms σ in G with σ(P) == P (setwise).
+       Stabilizer check: canonicalize P once (sorted blocks, sorted within),
+       then for each σ, compute canonicalized σ(P) and compare. Both canonical
+       forms are equal iff σ stabilizes P setwise. */
+    int set_stabilizer_c(
+        const int* P_enc, int P_enc_len,
+        const int* G_perms_flat, int n_G, int n_universe,
+        int* out_stab_indices, int out_capacity)
+    {
+        if (P_enc_len > 2048) return -1;
+        /* Pre-canonicalize P (apply identity perm). */
+        int identity[256];
+        for (int i = 0; i < n_universe; i++) identity[i] = i;
+        int P_canon[2048];
+        int P_canon_len = apply_perm_canonical_c(
+            P_enc, P_enc_len, identity, n_universe, P_canon, 2048);
+        if (P_canon_len < 0) return -1;
+
+        int candidate[2048];
+        int n_stab = 0;
+        for (int g = 0; g < n_G; g++) {
+            const int* perm = G_perms_flat + (long long)g * n_universe;
+            int can_len = apply_perm_canonical_c(
+                P_enc, P_enc_len, perm, n_universe, candidate, 2048);
+            if (can_len < 0) return -1;
+            if (can_len != P_canon_len) continue;
+            int match = 1;
+            for (int i = 0; i < can_len; i++) {
+                if (candidate[i] != P_canon[i]) { match = 0; break; }
+            }
+            if (match) {
+                if (n_stab >= out_capacity) return -1;
+                out_stab_indices[n_stab++] = g;
+            }
+        }
+        return n_stab;
     }
 """, extra_compile_args=["-O3"])
 
@@ -1517,12 +1752,19 @@ def precompute_and_aggregate_c_mod(
     H-orbit, so summing |bucket| × f(state, rep) ≡ summing f over
     bucket members).
     """
+    import os as _os, time as _t
+    _DBG = _os.environ.get("TUTTE_DEBUG_AGG", "0") != "0"
+    _t_entry = _t.time()
     full_universe = list(state_extra_boundary) + list(shared_boundary) + list(extra_boundary)
     n_universe = len(full_universe)
     if n_universe > 256:
         return None
     n_shared = len(shared_boundary)
     n_out_boundary = len(out_boundary)
+    if _DBG:
+        n_junc_orbits_dbg = len(junc_data_per_orbit)
+        n_junc_members_dbg = sum(len(pl) for pl in junc_data_per_orbit.values())
+        print(f"  [agg] entry: n_states={len(state_orbit_partitions)} n_juncs={n_junc_orbits_dbg} members={n_junc_members_dbg} n_universe={n_universe} n_shared={n_shared} scag={state_cell_anchor_groups is not None}", flush=True)
 
     try:
         lib, _ffi = _get_lib()
@@ -1582,6 +1824,38 @@ def precompute_and_aggregate_c_mod(
         except Exception:
             _r19_use = False
 
+    # R19 gating: only activate when total bucketing cost is amortized.
+    # Note that with the batched C-ext h_canonicalize_batch_c the per-state
+    # Python overhead is small, so the gate is mostly a safety net.
+    #
+    # IMPORTANT (May 26 2026 measurement): R19 H-bucketing is a net REGRESSION
+    # on both Cm_2 (~21s vs 12s baseline) and Cm_3 (~21s/chunk vs 1.1s/chunk
+    # baseline). The C-ext `batched_inner_iterations_c` is already extremely
+    # fast (~2.5ms per state for 4096 junction members at Cm_3 scale), so the
+    # H-canonicalize overhead in R19 always exceeds the savings.
+    #
+    # Therefore R19 is now DEFAULT-DISABLED (`TUTTE_R19_ENABLE=0` by default).
+    # Set TUTTE_R19_ENABLE=1 to opt in for graphs where the inner loop is
+    # genuinely costly (e.g., polynomial-mode pair-orbit DP, not the
+    # modular int path).
+    if _r19_use:
+        import os
+        if os.environ.get("TUTTE_R19_ENABLE", "0") == "0":
+            _r19_use = False
+    if _r19_use:
+        import os
+        _r19_gate_threshold = int(os.environ.get("TUTTE_R19_MIN_WORK", "100000"))
+        # Cheap estimator of bucketing work: state_orbits × G × junc_members
+        n_state_orbits_active = sum(
+            1 for sv in state_orbit_T_mod.values() if sv
+        )
+        n_junc_members = sum(
+            len(per_junc_list) for per_junc_list in junc_data_per_orbit.values()
+        )
+        est_work = n_state_orbits_active * max(len(_G_elements), 1) * n_junc_members
+        if est_work < _r19_gate_threshold:
+            _r19_use = False
+
     junc_orbit_canonicals = list(junc_data_per_orbit.keys())
     junc_orbit_partition_lists = [junc_data_per_orbit[O_junc] for O_junc in junc_orbit_canonicals]
 
@@ -1633,6 +1907,97 @@ def precompute_and_aggregate_c_mod(
     junc_ext_lens_arr = _ffi.new("int[]", junc_ext_lens)
     junc_jv_arr = _ffi.new("long long[]", junc_jv_mod_list)
 
+    # R19: pre-flatten ALL P_junc encodings (full universe = shared+extra)
+    # ONCE so per-state batched canonicalization can use them. Universe for
+    # H-canonicalization is the FULL partition universe (shared+extra_boundary
+    # positions appearing in any P_junc). H acts as identity on positions
+    # outside shared_boundary, so they pass through unchanged.
+    _r19_P_junc_flat: List[int] = []
+    _r19_P_junc_offsets: List[int] = [0]
+    _r19_jv_per_member: List[int] = []  # parallel to canonicalize-batch output
+    _r19_orbit_idx_per_member: List[int] = []
+    _r19_member_in_orbit: List[int] = []  # index of member within its orbit's per_junc_list
+    _r19_universe_pos: List[int] = []  # universe positions (shared first, then extra unique)
+    _r19_h_universe_idx: Dict[int, int] = {}  # pos → index in universe (for H encoding)
+    _r19_canon_capacity = 0  # max single-canonical length (for output buffer sizing)
+    if _r19_use:
+        try:
+            # Build full universe for P_junc encoding: shared_boundary positions
+            # first (these are the ones that H permutes), then extra positions
+            # discovered in P_junc partitions.
+            _r19_universe_pos = list(shared_boundary)
+            _r19_h_universe_idx = {pos: i for i, pos in enumerate(_r19_universe_pos)}
+            for orbit_idx, per_junc_list in enumerate(junc_orbit_partition_lists):
+                O_junc = junc_orbit_canonicals[orbit_idx]
+                jv = junction_orbit_T_mod.get(O_junc, 0)
+                if jv == 0:
+                    continue
+                for member_idx, (P_junc, _ps, _pe) in enumerate(per_junc_list):
+                    for block in P_junc:
+                        for v in block:
+                            if v not in _r19_h_universe_idx:
+                                _r19_h_universe_idx[v] = len(_r19_universe_pos)
+                                _r19_universe_pos.append(v)
+            _r19_n_univ = len(_r19_universe_pos)
+            # Encode each P_junc against full universe.
+            for orbit_idx, per_junc_list in enumerate(junc_orbit_partition_lists):
+                O_junc = junc_orbit_canonicals[orbit_idx]
+                jv = junction_orbit_T_mod.get(O_junc, 0)
+                if jv == 0:
+                    continue
+                for member_idx, (P_junc, _ps, _pe) in enumerate(per_junc_list):
+                    # Encode P_junc using h_universe_idx mapping.
+                    enc = [len(P_junc)]
+                    for block in P_junc:
+                        enc.append(len(block))
+                        for v in block:
+                            enc.append(_r19_h_universe_idx[v])
+                    _r19_P_junc_flat.extend(enc)
+                    _r19_P_junc_offsets.append(len(_r19_P_junc_flat))
+                    _r19_jv_per_member.append(jv)
+                    _r19_orbit_idx_per_member.append(orbit_idx)
+                    _r19_member_in_orbit.append(member_idx)
+                    if len(enc) > _r19_canon_capacity:
+                        _r19_canon_capacity = len(enc)
+            _r19_n_members = len(_r19_jv_per_member)
+            if _r19_n_members == 0 or _r19_n_univ > 256:
+                _r19_use = False
+            else:
+                _r19_P_flat_arr = _ffi.new("int[]", _r19_P_junc_flat)
+                _r19_P_off_arr = _ffi.new("int[]", _r19_P_junc_offsets)
+                # Output capacity for canonicals: sum of per-member upper bound.
+                _r19_canon_out_cap = sum(
+                    _r19_P_junc_offsets[i + 1] - _r19_P_junc_offsets[i]
+                    for i in range(_r19_n_members)
+                )
+                _r19_canon_out_arr = _ffi.new("int[]", max(_r19_canon_out_cap, 1))
+                _r19_canon_out_off_arr = _ffi.new("int[]", _r19_n_members + 1)
+
+                # Pre-flatten G_elements as C array for set_stabilizer_c.
+                # Each perm maps shared_boundary positions → permuted positions.
+                # Encode as length n_G * n_universe (positions outside
+                # shared_boundary map to themselves).
+                _r19_G_flat: List[int] = []
+                _r19_G_bail = False
+                for g_perm in _G_elements:
+                    for pos in _r19_universe_pos:
+                        tgt = g_perm.get(pos, pos)
+                        idx = _r19_h_universe_idx.get(tgt)
+                        if idx is None:
+                            _r19_G_bail = True
+                            break
+                        _r19_G_flat.append(idx)
+                    if _r19_G_bail:
+                        break
+                if _r19_G_bail:
+                    _r19_use_c_stab = False
+                else:
+                    _r19_G_flat_arr = _ffi.new("int[]", _r19_G_flat)
+                    _r19_stab_out_arr = _ffi.new("int[]", max(len(_G_elements), 1))
+                    _r19_use_c_stab = True
+        except Exception:
+            _r19_use = False
+
     out_boundary_arr = _ffi.new("int[]", out_boundary_idx) if out_boundary_idx else _ffi.new("int[]", 1)
     cell_groups_arr = _ffi.new("int[]", cell_groups_data)
 
@@ -1662,6 +2027,14 @@ def precompute_and_aggregate_c_mod(
     hm_n_unique[0] = 0
 
     shape_size = n_cells + 1
+
+    if _DBG:
+        _t_pre_loop = _t.time()
+        print(f"  [agg] pre-loop done: {_t_pre_loop-_t_entry:.2f}s, r19={_r19_use}, n_G={len(_G_elements)}, n_members={len(_r19_jv_per_member) if _r19_use else 0}", flush=True)
+    _state_loop_t0 = _t.time()
+    _n_processed = 0
+    _n_r19_used = 0
+    _state_loop_progress_interval = 50
 
     for O_state, ps_list in state_orbit_partitions.items():
         sv = state_orbit_T_mod.get(O_state, 0)
@@ -1694,38 +2067,128 @@ def precompute_and_aggregate_c_mod(
         # members in same H-orbit. Use one rep per bucket with bucket_size
         # baked into jv_mod (mod p multiplier). Mathematically equivalent
         # to summing f(state, J) over all J in the bucket.
+        #
+        # Implementation: uses batched C-ext `h_canonicalize_batch_c` to
+        # avoid per-member Python `apply_perm_to_partition` overhead which
+        # dominated the naive R19 wiring (~30s for Cm_2 vs ~5s baseline).
         _per_state_arrays = None
         if _r19_use:
-            H = _stab(P_state_S, _G_elements)
-            if len(H) > 1:
-                # Build per-state arrays from H-buckets per junc orbit.
-                ps_jv: List[int] = []
-                ps_S_flat: List[int] = []
-                ps_S_off: List[int] = []
-                ps_S_lens: List[int] = []
-                ps_ext_flat: List[int] = []
-                ps_ext_off: List[int] = []
-                ps_ext_lens: List[int] = []
-                bail_r19 = False
-                for orbit_idx, per_junc_list in enumerate(junc_orbit_partition_lists):
-                    O_junc = junc_orbit_canonicals[orbit_idx]
-                    jv = junction_orbit_T_mod.get(O_junc, 0)
-                    if jv == 0:
-                        continue
-                    # Bucket members by H-canonical of P_junc (full).
-                    buckets: Dict[Tuple, Tuple[int, int]] = {}
-                    for member_idx, (P_junc, _ps, _pe) in enumerate(per_junc_list):
-                        h_canon = min(
-                            _apply_perm(P_junc, h) for h in H
+            # C-side set-stabilizer: encode P_state_S on _r19_universe_pos and
+            # call set_stabilizer_c, which returns indices into _G_elements.
+            # H_arr is then a sub-array of _r19_G_flat_arr indexed by those.
+            if _r19_use_c_stab:
+                # Encode P_state_S on _r19_h_universe_idx (only shared positions
+                # appear; others would not appear in shared-boundary partition).
+                try:
+                    P_state_S_enc = [len(P_state_S)]
+                    for block in P_state_S:
+                        P_state_S_enc.append(len(block))
+                        for v in block:
+                            idx = _r19_h_universe_idx.get(v)
+                            if idx is None:
+                                raise KeyError(v)
+                            P_state_S_enc.append(idx)
+                    P_state_S_arr_for_stab = _ffi.new("int[]", P_state_S_enc)
+                    n_stab = lib.set_stabilizer_c(
+                        P_state_S_arr_for_stab, len(P_state_S_enc),
+                        _r19_G_flat_arr, len(_G_elements), _r19_n_univ,
+                        _r19_stab_out_arr, len(_G_elements),
+                    )
+                except (KeyError, Exception):
+                    n_stab = -1
+            else:
+                n_stab = -1
+
+            if n_stab < 0:
+                # Fall back to Python stab.
+                H = _stab(P_state_S, _G_elements)
+                n_H_effective = len(H)
+                H_flat: List[int] = []
+                bail_h = False
+                for perm in H:
+                    for pos in _r19_universe_pos:
+                        tgt = perm.get(pos, pos)
+                        idx = _r19_h_universe_idx.get(tgt)
+                        if idx is None:
+                            bail_h = True
+                            break
+                        H_flat.append(idx)
+                    if bail_h:
+                        break
+                if not bail_h and n_H_effective > 1:
+                    H_arr = _ffi.new("int[]", H_flat)
+                else:
+                    H_arr = None
+                    n_H_effective = 0
+            else:
+                # Build H flat array from selected G perms (slice _r19_G_flat).
+                n_H_effective = n_stab
+                if n_stab > 1:
+                    H_flat = []
+                    for i in range(n_stab):
+                        g_idx = _r19_stab_out_arr[i]
+                        H_flat.extend(_r19_G_flat[g_idx * _r19_n_univ:(g_idx + 1) * _r19_n_univ])
+                    H_arr = _ffi.new("int[]", H_flat)
+                else:
+                    H_arr = None  # |H| = 1 ⇒ no bucketing
+
+            # Per-state |H| gate: if |H| is too large, R19 canonicalize cost
+            # exceeds savings. For Cm_3 with G=13824, |H| can be in thousands
+            # — at which point processing all members directly is faster.
+            # Threshold: |H| × n_members × avg_canon_cost < threshold.
+            # avg_canon_cost ~ universe_size = 12-24.
+            _r19_h_max = int(_os.environ.get("TUTTE_R19_MAX_H", "200"))
+            if n_H_effective > _r19_h_max:
+                if _DBG and _n_processed < 5:
+                    print(f"  [agg] skip R19 for state {_n_processed}: |H|={n_H_effective} > {_r19_h_max}", flush=True)
+                n_H_effective = 0
+                H_arr = None
+
+            if n_H_effective > 1 and H_arr is not None:
+                # Run batched canonicalize over ALL members.
+                n_written = lib.h_canonicalize_batch_c(
+                    _r19_P_flat_arr, _r19_P_off_arr, _r19_n_members,
+                    H_arr, n_H_effective, _r19_n_univ,
+                    _r19_canon_out_arr, _r19_canon_out_off_arr,
+                    _r19_canon_out_cap,
+                )
+                if n_written >= 0:
+                    # Bucket members by canonical bytes.
+                    # canon_bytes per member: slice _r19_canon_out_arr by
+                    # _r19_canon_out_off_arr[i:i+1].
+                    buckets: Dict[bytes, Tuple[int, int]] = {}
+                    for m_idx in range(_r19_n_members):
+                        c_start = _r19_canon_out_off_arr[m_idx]
+                        c_end = _r19_canon_out_off_arr[m_idx + 1]
+                        # Get bytes (use buffer slice for hashable key).
+                        canon_bytes = bytes(
+                            _ffi.buffer(
+                                _r19_canon_out_arr + c_start,
+                                (c_end - c_start) * _ffi.sizeof("int")
+                            )
                         )
-                        existing = buckets.get(h_canon)
+                        existing = buckets.get(canon_bytes)
                         if existing is None:
-                            buckets[h_canon] = (1, member_idx)
+                            buckets[canon_bytes] = (1, m_idx)
                         else:
                             cnt, idx = existing
-                            buckets[h_canon] = (cnt + 1, idx)
-                    for h_canon, (bsize, rep_idx) in buckets.items():
-                        _P_junc, P_junc_S, P_junc_ext = per_junc_list[rep_idx]
+                            buckets[canon_bytes] = (cnt + 1, idx)
+
+                    # Build per-state arrays from buckets.
+                    ps_jv: List[int] = []
+                    ps_S_flat: List[int] = []
+                    ps_S_off: List[int] = []
+                    ps_S_lens: List[int] = []
+                    ps_ext_flat: List[int] = []
+                    ps_ext_off: List[int] = []
+                    ps_ext_lens: List[int] = []
+                    bail_r19 = False
+                    for _canon_bytes, (bsize, rep_m_idx) in buckets.items():
+                        orbit_idx = _r19_orbit_idx_per_member[rep_m_idx]
+                        member_idx = _r19_member_in_orbit[rep_m_idx]
+                        per_junc_list = junc_orbit_partition_lists[orbit_idx]
+                        _P_junc, P_junc_S, P_junc_ext = per_junc_list[member_idx]
+                        jv = _r19_jv_per_member[rep_m_idx]
                         jv_scaled = (jv * bsize) % p
                         if jv_scaled == 0:
                             continue
@@ -1742,11 +2205,9 @@ def precompute_and_aggregate_c_mod(
                         ps_ext_off.append(len(ps_ext_flat))
                         ps_ext_lens.append(len(p_ext_data))
                         ps_ext_flat.extend(p_ext_data)
-                    if bail_r19:
-                        break
-                if not bail_r19 and ps_jv:
-                    _per_state_arrays = (ps_jv, ps_S_flat, ps_S_off, ps_S_lens,
-                                          ps_ext_flat, ps_ext_off, ps_ext_lens)
+                    if not bail_r19 and ps_jv:
+                        _per_state_arrays = (ps_jv, ps_S_flat, ps_S_off, ps_S_lens,
+                                              ps_ext_flat, ps_ext_off, ps_ext_lens)
 
         if _per_state_arrays is not None:
             (ps_jv, ps_S_flat, ps_S_off, ps_S_lens,
@@ -1811,6 +2272,16 @@ def precompute_and_aggregate_c_mod(
             )
             if rc < 0:
                 return None
+
+        _n_processed += 1
+        if _per_state_arrays is not None:
+            _n_r19_used += 1
+        if _DBG and _n_processed % _state_loop_progress_interval == 0:
+            _elapsed = _t.time() - _state_loop_t0
+            print(f"  [agg] {_n_processed} states done, r19_used={_n_r19_used}, {_elapsed:.1f}s elapsed", flush=True)
+
+    if _DBG:
+        print(f"  [agg] state loop done: {_n_processed} states, r19_used={_n_r19_used}, {_t.time()-_state_loop_t0:.1f}s", flush=True)
 
     # Marshal hashmap → flat output via C-side dump.
     n_unique = hm_n_unique[0]
