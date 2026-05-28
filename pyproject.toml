@@ -83,7 +83,7 @@ include = ["shared*", "substrate*", "dwave_topologies*", "CPU*", "GPU*", "QPU*"]
 [tool.setuptools.package-data]
 dwave_topologies = ["topologies/*.json.gz", "embeddings/*.json.gz"]
 GPU = ["*.cu", "*.metal"]
-"*" = ["genesis_block_public.json"]
+"*" = ["genesis_block.json"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

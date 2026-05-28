@@ -18,9 +18,8 @@ proj_root = os.path.abspath(os.path.join(SPECPATH, ".."))
 # Data files
 # ---------------------------------------------------------------------------
 datas = [
-    # Genesis block configurations
+    # Genesis block configuration
     (os.path.join(proj_root, "genesis_block.json"), "."),
-    (os.path.join(proj_root, "genesis_block_public.json"), "."),
     # GPU kernel source files
     (os.path.join(proj_root, "GPU", "*.cu"), "GPU"),
     (os.path.join(proj_root, "GPU", "*.metal"), "GPU"),
