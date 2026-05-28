@@ -15,6 +15,8 @@ import pytest
 
 from tutte.graph import Graph, MultiGraph
 from tutte.roots.sokal_z_chord_junction import (
+    _enumerate_component_phi_terms,
+    _tree_dp_component_phi_terms,
     compute_sokal_z_chord_junction,
     compute_sokal_z_chord_junction_per_component,
 )
@@ -152,6 +154,75 @@ def test_engine_sokal_z_dispatch_helper(engine_and_synth):
     result = engine._try_sokal_z_chord_junction(g, cells, partition, inter)
     assert result is not None
     assert result == expected
+
+
+@pytest.mark.parametrize("name,nodes,edges", [
+    ("3-edge triangle K_3", [0, 1, 2], [(0, 1), (1, 2), (0, 2)]),
+    ("K_{2,3} bipartite", [0, 1, 2, 3, 4],
+        [(0, 2), (0, 3), (0, 4), (1, 2), (1, 3), (1, 4)]),
+    ("K_{2,4} bipartite", [0, 1, 2, 3, 4, 5],
+        [(0, 2), (0, 3), (0, 4), (0, 5),
+         (1, 2), (1, 3), (1, 4), (1, 5)]),
+    ("K_4 dense", [0, 1, 2, 3],
+        [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]),
+    ("P_5 path", [0, 1, 2, 3, 4],
+        [(0, 1), (1, 2), (2, 3), (3, 4)]),
+    ("multi-edge component", [0, 1, 2],
+        [(0, 1), (0, 1), (1, 2), (1, 2), (0, 2)]),
+    ("isolated vertex + edge", [0, 1, 2], [(0, 1)]),
+    ("two parallel only", [0, 1], [(0, 1), (0, 1), (0, 1)]),
+])
+def test_tree_dp_matches_brute_force(name, nodes, edges):
+    """Tree-DP and brute-force enumeration produce identical {φ → coef} dicts."""
+    brute = _enumerate_component_phi_terms(edges, nodes)
+    tree = _tree_dp_component_phi_terms(edges, nodes)
+    assert brute == tree, (
+        f"{name}: tree_dp={tree} != brute={brute}"
+    )
+
+
+def test_tree_dp_handles_dense_junction(engine_and_synth):
+    """End-to-end: C_4 ⊕ C_4 with 14-chord junction matches direct synthesis.
+
+    The 14-edge component routes through tree-DP (above threshold=13);
+    output must equal direct construction.
+    """
+    engine, synth = engine_and_synth
+    # 14 chord edges all in one H_J component: K_{2,7}-shaped
+    chord = [(a, b) for a in range(2) for b in range(4)]  # K_{2,4} = 8 edges
+    chord += [(0, 0), (0, 1), (1, 2), (1, 3), (0, 2), (1, 0)]  # +6 more = 14
+    t_via_z = compute_sokal_z_chord_junction(C4, C4, chord, synth)
+    t_direct = _direct_tutte(C4, C4, chord, engine)
+    assert t_via_z is not None
+    assert t_via_z == t_direct
+
+
+def test_per_component_with_aut_matches_direct_on_k4_k44_k4(engine_and_synth):
+    """Per-component path with Aut compression must match direct synthesis.
+
+    Regression: K_4 cells with full K_{4,4} chord junction = K_8. Aut(K_8)
+    has order 40320, but only the 1152-element cell-preserving subgroup
+    is a valid Aut for the chord-junction Z. Without cell-coloring,
+    over-aggregation produces wrong polynomials. This test guards both
+    brute-force and tree-DP per-component paths against that regression.
+    """
+    engine, synth = engine_and_synth
+    chord = [(a, b) for a in range(4) for b in range(4)]  # K_{4,4}, 16 edges
+    direct = _direct_tutte(K4, K4, chord, engine)
+    for tree_dp_thresh, label in [(999, "brute"), (13, "tree-DP")]:
+        result = compute_sokal_z_chord_junction_per_component(
+            K4, K4, chord, synth,
+            max_phi_per_component=5000,
+            max_phi_cross_product=10_000_000,
+            use_aut_compression=True,
+            tree_dp_edge_threshold=tree_dp_thresh,
+        )
+        assert result is not None, f"{label} returned None"
+        assert result == direct, (
+            f"{label} polynomial differs from direct: "
+            f"#ST direct={direct.evaluate(1, 1)}, "
+            f"#ST {label}={result.evaluate(1, 1)}"
+        )
 
 
 def test_sokal_z_returns_none_when_per_component_intractable(engine_and_synth):

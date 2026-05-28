@@ -993,16 +993,18 @@ since their cell structure is not tree-based. But it could help
 arbitrary random/random-tree graphs that decompose into chord-attached
 pieces.
 
-## EXTENSION: Sokal-Z Generalized Chord-Junction Theorem (May 26, 2026)
+## EXTENSION: Sokal-Z Generalized Chord-Junction Theorem (May 26-27, 2026)
 
-**Status**: Formula **shipped** in `tutte/roots/sokal_z_chord_junction.py`
-with 12 regression tests covering matching, parallel, K_{2,2}, and
-3-edge non-matching patterns on K_2/K_3/K_4/C_4 cells (all pass). The
-shipped prototype enumerates $A_J \subseteq E_J$ directly via
-multi-point evaluation + bivariate Lagrange interpolation, gated at
-$2^{|E_J|} \leq 65536$ ($|E_J| \leq 16$). The two remaining unlocks —
-tree-DP over $H_J$ for $|E_J| > 16$ (Z(1, 2) tractability) and engine
-cascade wiring — are the next phases (tasks #438, #439).
+**Status (May 27)**: Theorem + brute-force formula + per-H_J-component
+enumeration + **edge-by-edge tree DP** all shipped in
+`tutte/roots/sokal_z_chord_junction.py`. 24 regression tests pass
+covering matching, parallel, K_{2,2}, 3-edge non-matching, large
+multi-edge components, and tree-DP equivalence against brute-force on
+8 graph families (triangle, K_{2,3}, K_{2,4}, K_4, P_5, multi-edge,
+isolated vertex + edge, parallel-only). Engine dispatch wired at
+`engine._try_sokal_z_chord_junction`. The remaining tuning step
+(raising `max_phi_per_component` from 200 → ~5000 to admit Z(1,2)'s
+2,297 post-Aut φ) is gate-level; the algorithm itself scales.
 
 ### Motivation
 
@@ -1072,30 +1074,51 @@ the bridge-aware form $T(G \oplus_M G) = (x-1)\,T(G)^2 + \sum_{V_T} T(G
 the matching specialization, not a structural property of the chord
 junction — that's why it disappears in the Z-basis statement.
 
-### Tractability via tree decomposition of $H_J$
+### Tractability via tree decomposition of $H_J$ (SHIPPED, May 27)
 
 The direct sum has $2^{|E_J|}$ terms. For Z(1, 2), $|E_J| = 32$ so naive
 enumeration is $2^{32} \approx 4 \times 10^9$. Reorganization by
 $\varphi$ partitions gives at most $\mathrm{Bell}(|V_k^A \cup V_k^B|)$
-terms — still $\approx 10^{17}$ for $V_k = 24$.
+terms.
 
-**The unlock**: the bipartite junction graph $H_J = (V_k^A \cup V_k^B,
-E_J)$ typically has very low treewidth for structured graphs. Empirical
-measurements:
+The **unlock**: decompose $H_J$ into connected components, then run an
+**edge-by-edge DP** on each component. State = labeled partition of
+component vertices; for each junction edge (a, b) branch on edge ∈ A_J
+(merge classes of a, b; +1 to v-polynomial) vs edge ∉ A_J. Per-component
+cost is $O(|E_c| \cdot |\text{reachable partitions}|)$ where reachable
+partitions ≤ $\mathrm{Bell}(|V_c|)$ and typically much smaller for
+sparse $H_J$.
 
-| Target | $|V(H_J)|$ | $|E(H_J)|$ | components | $tw(H_J)$ | $|\mathrm{Aut}(H_J)|$ |
-|--------|----------|------------|------------|-----------|----------------------|
-| Z(1, 2) | 24 | 32 | 2 | 2 | 128 |
+Empirical measurements (`tutte/research/scripts/probe_sokal_z_tree_dp_perf.py`):
 
-A tree-DP over $H_J$ enumerates only the $\varphi$-equivalence relations
-**compatible** with the junction connectivity (each $\varphi$-class is
-connected via $E_J$). The cost is
+| Component       | $|V|$ | $|E|$ | $2^{|E|}$ | Brute    | Tree-DP  | Speedup   |
+|-----------------|------|------|-----------|----------|----------|-----------|
+| K_{2,4}         | 6    | 8    | 256       | 2.5ms    | 0.4ms    | 6.6×      |
+| K_{3,4}         | 7    | 12   | 4K        | 43.4ms   | 2.7ms    | 16.2×     |
+| K_{4,4}         | 8    | 16   | 65K       | 768ms    | 13.6ms   | 56.3×     |
+| K_{3,6}         | 9    | 18   | 262K      | 3.45s    | 44.6ms   | 77.4×     |
+| K_{4,5}         | 9    | 20   | 1M        | 13.7s    | 98.2ms   | 139.6×    |
+| K_{4,6}         | 10   | 24   | 16M       | (~4min)  | 498ms    | (~500×)   |
+| K_{4,8}         | 12   | 32   | 4B        | (days)   | 12.6s    | (massive) |
 
-$$O\!\left(|V(H_J)| \cdot \mathrm{Bell}(tw + 1)^{\text{components}}
-\big/ |\mathrm{Aut}(H_J)|\right)$$
+**Z(1, 2) empirical** (`probe_z12_sokal_z_path.py`): cell-pair has 2
+H_J components, each with 12 verts / 16 edges / degree distribution
+$\{4: 4, 2: 8\}$. Tree-DP enumerates 17,236 pre-Aut φ per component in
+~105ms (vs 768ms brute force, 7.3×). Cell-preserving |Aut|=4 (excludes
+cell-swap; see correctness note below) compresses to 4,417 post-Aut φ
+per component → cross-product 19.5M φ-tuples. Downstream cross-product
+loop dominates; tree-DP itself is no longer the bottleneck.
 
-For Z(1, 2): $O(24 \cdot 5^2 \cdot 2 / 128) \approx 10$ orbit-classes —
-versus $\sim 10^{17}$ naive. **Reduction of $\sim 10^{16}\times$.**
+**Correctness note (May 27, 2026)**: an earlier version of
+`_component_aut_perms` restricted to autos of the full chord-joined
+graph fixing the component set, but did NOT exclude autos that swap
+cell-A and cell-B vertices in invalid ways. For K_n+K_n+K_n style graphs
+this is incorrect — the full graph (e.g., K_8 for K_4+K_{4,4}+K_4) has
+much larger Aut than the cell-preserving subgroup, and the
+over-aggregation produces wrong polynomials. Fix: color cell vertices in
+the VF2 search via `node_match`, restricting to cell-preserving autos.
+Regression captured at
+`tutte/tests/test_sokal_z_chord_junction.py::test_per_component_with_aut_matches_direct_on_k4_k44_k4`.
 
 ### Algorithm
 

@@ -270,7 +270,45 @@ cache lookups, sub-second polynomial assembly. Without the unified
 theorem the legacy chord rule does 16 sub-syntheses (each a full chord-
 recursion leaf, several seconds each).
 
-## 9. References
+## 9. Sokal-Z generalization for non-matching junctions
+
+The unified theorem above requires the chord pattern to be a **matching**:
+each anchor in `V_k^A` joins exactly one anchor in `V_k^B`. D-Wave graphs
+violate this — Z(1, 2)'s cell-pair has 32 chord edges over 12 anchors
+per side with degree distribution `{2: 16, 4: 8}`, not a matching.
+
+The **Sokal-Z generalization** (`tutte/roots/sokal_z_chord_junction.py`)
+covers arbitrary `E_J ⊆ V_k^A × V_k^B`:
+
+```
+Z(G_1 ⊕_{E_J} G_2; q, v) = Σ_{A_J ⊆ E_J} v^|A_J| · Z(merger(φ(A_J)); q, v)
+```
+
+where `φ(A_J)` is the partition of `V_k^A ∪ V_k^B` into connected
+components of `(V_k^A ∪ V_k^B, A_J)`. The result converts back to
+`T(x, y)` via multi-point evaluation + bivariate Lagrange interpolation
+(see research doc).
+
+Two enumeration paths:
+
+1. **Brute force** (`compute_sokal_z_chord_junction`): iterates all
+   `2^|E_J|` subsets directly. Gated at `|E_J| ≤ 16` (`max_subsets = 65536`).
+2. **Per-H_J-component + tree-DP** (`compute_sokal_z_chord_junction_per_component`):
+   decomposes `H_J = (V_k^A ∪ V_k^B, E_J)` into connected components,
+   runs edge-by-edge DP per component, then cross-products φ tuples.
+   Tree-DP state space ≤ `Bell(|V_c|)` per component; auto-engages when
+   `|component_edges| ≥ tree_dp_edge_threshold` (default 13).
+
+Empirical tree-DP speedups (`probe_sokal_z_tree_dp_perf.py`):
+K_{4,4} 56×, K_{4,5} 140×, K_{4,8} (Z(1,2)-scale 32-edge component) days → 12.6s.
+
+Dispatch is wired at `engine._try_sokal_z_chord_junction`, called for
+2-cell partitions whose junction the matching-based unified theorem
+rejects. See [§9 in the research doc](../research/cyclotomic_chord_junction_theorem.md#extension-sokal-z-generalized-chord-junction-theorem-may-26-27-2026)
+for the full theorem statement, proof sketch, and per-D-Wave-target
+H_J structure tables.
+
+## 10. References
 
 - **Theorem & empirical validation**: `tutte/research/cyclotomic_chord_junction_theorem.md`
   (research note with probes, intermediate hypotheses, and proof

@@ -344,6 +344,20 @@ DP path. See `_try_formula_shortcircuit` in
   and `K_{4,4}` (D-Wave Chimera cell), so Cm_2-class targets land
   here. Doc: `tutte/docs/08_3_kmatching_formula.md`.
 
+- **Sokal-Z generalized chord-junction** (2-cell partitions only):
+  when the chord junction has non-matching / multi-edge / dense `E_J`
+  that the unified theorem can't accept, fall through to the Sokal Z
+  basis formula `Z(G_1 ⊕_{E_J} G_2; q, v) = Σ_{A_J ⊆ E_J} v^|A_J|
+  Z(merger(φ(A_J)); q, v)`. Enumeration over `A_J` is by
+  per-H_J-component edge-by-edge tree DP (O(|E_c| · Bell(|V_c|))) +
+  Aut-orbit compression of φ partitions. Result converts back to
+  T(x, y) via multi-point evaluation + bivariate Lagrange. Handles
+  Z(1,2)-class junctions (32 chord edges over 24 anchors) once
+  per-component gates are tuned for the size; the algorithm itself
+  scales to component sizes ≥ 32 edges in seconds. Doc:
+  `tutte/docs/08_6_unified_chord_junction.md` §9 and research note
+  `tutte/research/cyclotomic_chord_junction_theorem.md` § EXTENSION.
+
 #### 7.5b Cotree DP
 
 **Doc**: `tutte/docs/06_1_cotree_dp.md`. **Cost**:

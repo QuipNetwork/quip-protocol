@@ -130,22 +130,110 @@ def _enumerate_component_phi_terms(
     return sigs
 
 
+def _tree_dp_component_phi_terms(
+    component_edges: List[Tuple[int, int]],
+    component_nodes: List[int],
+) -> Dict[Tuple[FrozenSet[int], ...], Dict[int, int]]:
+    """Edge-by-edge DP equivalent to `_enumerate_component_phi_terms`.
+
+    Replaces brute-force 2^|component_edges| enumeration with a DP whose
+    state count is bounded by Bell(|component_nodes|): each state is a
+    labeled partition of component_nodes. For each edge (a, b) in turn,
+    branch on edge ∈ A_J (merge classes of a and b, +1 to polynomial)
+    vs edge ∉ A_J (partition unchanged).
+
+    Output is byte-identical to the brute-force function for the same
+    inputs — only the enumeration cost differs:
+      brute-force: O(2^|E| · |V|)
+      tree-DP:     O(|E| · |reachable_partitions|) where reachable
+                   ≤ Bell(|V|) and typically much smaller for sparse H_J.
+
+    Use when 2^|component_edges| exceeds a tractable threshold (≥ 16-18).
+    Below that, brute force is faster due to constant-factor overhead.
+    """
+    nodes_sorted = sorted(component_nodes)
+    init_partition = tuple(
+        frozenset({v}) for v in nodes_sorted
+    )
+    states: Dict[Tuple[FrozenSet[int], ...], Dict[int, int]] = {
+        init_partition: {0: 1}
+    }
+
+    def _canonical(parts: Set[FrozenSet[int]]) -> Tuple[FrozenSet[int], ...]:
+        return tuple(sorted(parts, key=lambda c: (len(c), sorted(c))))
+
+    for (a, b) in component_edges:
+        new_states: Dict[Tuple[FrozenSet[int], ...], Dict[int, int]] = {}
+        for partition, coef_dict in states.items():
+            # Branch 1: edge NOT in A_J — partition unchanged, polynomial unchanged.
+            slot1 = new_states.get(partition)
+            if slot1 is None:
+                new_states[partition] = dict(coef_dict)
+            else:
+                for k, c in coef_dict.items():
+                    slot1[k] = slot1.get(k, 0) + c
+
+            # Branch 2: edge IN A_J — merge classes containing a and b.
+            cls_a = None
+            cls_b = None
+            for cls in partition:
+                if a in cls:
+                    cls_a = cls
+                if b in cls:
+                    cls_b = cls
+                if cls_a is not None and cls_b is not None:
+                    break
+            if cls_a is cls_b:
+                # Already merged — partition unchanged, +1 to polynomial.
+                slot2 = new_states.setdefault(partition, {})
+                for k, c in coef_dict.items():
+                    slot2[k + 1] = slot2.get(k + 1, 0) + c
+            else:
+                merged = cls_a | cls_b
+                new_part_set = set(partition)
+                new_part_set.discard(cls_a)
+                new_part_set.discard(cls_b)
+                new_part_set.add(merged)
+                new_partition = _canonical(new_part_set)
+                slot2 = new_states.setdefault(new_partition, {})
+                for k, c in coef_dict.items():
+                    slot2[k + 1] = slot2.get(k + 1, 0) + c
+
+        states = new_states
+
+    # Match brute-force output key ordering.
+    return {
+        tuple(sorted(p, key=lambda c: (len(c), sorted(c)))): coef
+        for p, coef in states.items()
+    }
+
+
 def _component_aut_perms(
     component_edges: List[Tuple[int, int]],
     component_nodes: List[int],
     *,
     full_graph: Optional[nx.Graph] = None,
+    cell_A_verts: Optional[Set[int]] = None,
+    cell_B_verts: Optional[Set[int]] = None,
 ) -> List[Dict[int, int]]:
     """Return component-vertex permutations from Aut acting on H_J component.
 
-    If `full_graph` is None (legacy behavior, **unsafe** for arbitrary
-    cells): returns Aut(H_J component) directly. This may include
-    permutations that don't extend to cell-graph automorphisms; safe
-    only when the cell graphs have rich symmetry (e.g., K_n).
+    If `full_graph` is None (legacy, **unsafe** for arbitrary cells):
+    returns Aut(H_J component) directly. May include permutations that
+    don't extend to merger automorphisms; safe only when the cells have
+    rich symmetry (e.g., K_n).
 
-    If `full_graph` is the full chord-joined graph G_1 ⊕ G_2 + E_J,
-    returns its Aut restricted to component_nodes. These are
-    GUARANTEED to extend to merger automorphisms — the safe path.
+    If `full_graph` is the full chord-joined graph G_1 ⊕ G_2 + E_J AND
+    `cell_A_verts`, `cell_B_verts` are provided, restricts to auts that
+    preserve the cell bipartition (no cell-A↔cell-B mixing). This is
+    required for correctness when the full graph's natural Aut would
+    permit vertex moves that break the cell structure (e.g., K_4+K_{4,4}+K_4
+    has Aut = S_8 of order 40320, but cell-preserving Aut is only 1152).
+    Cells get distinct color labels via `node_match`.
+
+    If `full_graph` is provided WITHOUT cell coloring, falls back to
+    "restrict to autos fixing the component set" — UNSAFE for K_n+K_n+K_n
+    style graphs because it lets cell-A and cell-B vertices interchange.
     """
     from networkx.algorithms.isomorphism import GraphMatcher
     if full_graph is None:
@@ -153,10 +241,29 @@ def _component_aut_perms(
         comp.add_nodes_from(component_nodes)
         comp.add_edges_from(component_edges)
         return [m for m in GraphMatcher(comp, comp).isomorphisms_iter()]
+
+    # Build a color-attributed copy of full_graph so VF2's node_match
+    # forbids cell-A↔cell-B vertex moves.
+    if cell_A_verts is not None and cell_B_verts is not None:
+        colored = full_graph.copy()
+        for v in colored.nodes():
+            if v in cell_A_verts:
+                colored.nodes[v]['cell'] = 'A'
+            elif v in cell_B_verts:
+                colored.nodes[v]['cell'] = 'B'
+            else:
+                colored.nodes[v]['cell'] = 'other'
+
+        def _nm(n1, n2):
+            return n1.get('cell') == n2.get('cell')
+        gm = GraphMatcher(colored, colored, node_match=_nm)
+    else:
+        gm = GraphMatcher(full_graph, full_graph)
+
     comp_set = set(component_nodes)
     perms: List[Dict[int, int]] = []
     seen: Set[Tuple[Tuple[int, int], ...]] = set()
-    for m in GraphMatcher(full_graph, full_graph).isomorphisms_iter():
+    for m in gm.isomorphisms_iter():
         # Only keep auts that fix the component set (component → component).
         if not all(m[v] in comp_set for v in component_nodes):
             continue
@@ -232,6 +339,7 @@ def compute_sokal_z_chord_junction_per_component(
     max_phi_per_component: int = 200,
     max_phi_cross_product: int = 10_000_000,
     use_aut_compression: bool = True,
+    tree_dp_edge_threshold: int = 13,
 ) -> Optional[TuttePolynomial]:
     """Compute T via per-H_J-component Sokal-Z enumeration.
 
@@ -306,14 +414,24 @@ def compute_sokal_z_chord_junction_per_component(
     per_comp_phi: List[Dict[Tuple[FrozenSet[int], ...], Dict[int, int]]] = []
     cross_product = 1
     for i, (comp, c_edges) in enumerate(zip(components, component_edges)):
-        if (1 << len(c_edges)) > 1 << 18:  # per-component subset cap
-            return None
-        sigs = _enumerate_component_phi_terms(c_edges, comp)
+        if len(c_edges) >= tree_dp_edge_threshold:
+            sigs = _tree_dp_component_phi_terms(c_edges, comp)
+        else:
+            if (1 << len(c_edges)) > 1 << 18:  # brute-force subset cap
+                return None
+            sigs = _enumerate_component_phi_terms(c_edges, comp)
         if use_aut_compression:
             # Use auts from the FULL chord-joined graph restricted to
-            # this component — guaranteed to extend to merger autos.
+            # this component, with cell coloring so cell-A↔cell-B mixing
+            # is disallowed (required for correctness on K_n+K_n+K_n style
+            # graphs where the naive full-graph Aut is too large).
+            cell_A_vset = set(range(cell_A_offset,
+                                    cell_A_offset + n_A))
+            cell_B_vset = set(range(cell_B_offset,
+                                    cell_B_offset + n_B))
             aut_perms = _component_aut_perms(
                 c_edges, comp, full_graph=full_graph_nx,
+                cell_A_verts=cell_A_vset, cell_B_verts=cell_B_vset,
             )
             sigs = _aut_orbit_compress_phi_terms(sigs, aut_perms)
         if len(sigs) > max_phi_per_component:
