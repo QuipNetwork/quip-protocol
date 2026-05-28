@@ -126,7 +126,7 @@ def build_miner_from_spec(spec: Dict[str, Any]):
         # Build QPU time config if daily budget is specified
         time_config = None
         if cfg.get("daily_budget"):
-            from QPU.qpu_time_manager import QPUTimeConfig, parse_duration
+            from QPU.DWave.qpu_time_manager import QPUTimeConfig, parse_duration
             time_config = QPUTimeConfig(
                 daily_budget_seconds=parse_duration(cfg["daily_budget"]),
                 min_blocks_for_estimation=cfg.get("qpu_min_blocks_for_estimation", 5),

@@ -22,8 +22,6 @@ from typing import Optional, Dict, Tuple, Any, List
 
 import dimod
 
-init_logger = logging.getLogger(__name__)
-
 from QPU.IBM.ibm_qaoa_solver import QAOASolverWrapper, QAOAFuture
 from shared.base_miner import BaseMiner, MiningResult
 from shared.quantum_proof_of_work import (
@@ -32,6 +30,8 @@ from shared.quantum_proof_of_work import (
 )
 from shared.block_requirements import compute_current_requirements
 from shared.energy_utils import energy_to_difficulty
+
+init_logger = logging.getLogger(__name__)
 
 
 class IBMQAOAMiner(BaseMiner):
@@ -385,7 +385,11 @@ class IBMQAOAMiner(BaseMiner):
                     )
 
             except Exception as e:
-                self.logger.error(f"Error processing QAOA result: {e}")
+                self.logger.error(
+                    f"Error processing QAOA result (nonce={nonce}, "
+                    f"salt={salt.hex()[:8]}): {e}",
+                    exc_info=True,
+                )
 
         self.logger.info("Stopping mining, no valid results found")
         return None

@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
+import queue
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any, cast
 
@@ -126,6 +128,12 @@ class _OptResult:
 # QAOA Future — lightweight wrapper for async solve
 # ---------------------------------------------------------------------------
 
+# How long the parent waits on the result queue before deciding the child has
+# died or hung. The child always enqueues a result in finally, so reaching
+# this timeout is a hard error (process killed, OS OOM, etc.), not a slow solve.
+_RESULT_QUEUE_TIMEOUT_S = 5
+
+
 class QAOAFuture:
     """Future-like object for asynchronous QAOA execution via multiprocessing.
 
@@ -155,15 +163,21 @@ class QAOAFuture:
         """
         if not self._done:
             try:
-                self._result = self._result_queue.get(timeout=5)
-            except Exception:
-                # Child process died without putting a result
-                if not self._process.is_alive():
-                    logger.error("[QAOA] Child process died without returning a result")
-                    self._result = None
+                self._result = self._result_queue.get(timeout=_RESULT_QUEUE_TIMEOUT_S)
+            except queue.Empty:
+                # The child should always enqueue a result via finally; if we
+                # hit Empty the child either died (segfault, OS kill) or hung
+                # (rare — e.g., blocked in a C extension that ignores SIGTERM).
+                if self._process.is_alive():
+                    logger.error(
+                        "[QAOA] Child still alive after %ss but produced no "
+                        "result; terminating to avoid an unbounded wait",
+                        _RESULT_QUEUE_TIMEOUT_S,
+                    )
+                    self._process.terminate()
                 else:
-                    # Still running, keep waiting
-                    self._result = self._result_queue.get()
+                    logger.error("[QAOA] Child process died without returning a result")
+                self._result = None
             self._process.join()
             self._done = True
         return self._result
@@ -224,12 +238,20 @@ def _qaoa_solve_in_process(
         params: Per-solve parameter overrides (p, shots, etc.).
         result_queue: Queue to send the resulting SampleSet back.
     """
+    sampleset = None
     try:
         solver = QAOASolverWrapper(**solver_config)
         sampleset = solver.solve_ising(h, J, stop_event=stop_event, params=params)
-        result_queue.put(sampleset)
     except Exception as e:
-        logger.error(f"[QAOA] Process solve failed: {e}")
+        # Log the full traceback inside the child; the parent only sees None.
+        logger.error(f"[QAOA] Process solve failed: {e}\n{traceback.format_exc()}")
+    finally:
+        # Always enqueue a result so the parent's get() never blocks forever.
+        # On failure we send None; the parent treats it as an interrupted solve.
+        try:
+            result_queue.put(sampleset)
+        except Exception as put_err:
+            logger.error(f"[QAOA] Failed to enqueue child result: {put_err}")
 
 
 # ---------------------------------------------------------------------------

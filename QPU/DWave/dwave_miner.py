@@ -11,14 +11,14 @@ from typing import Dict, List, Optional, Tuple, cast, Mapping, Any
 
 import dimod
 
-init_logger = logging.getLogger(__name__)
-
 from QPU.DWave.dwave_sampler import DWaveSamplerWrapper
 from QPU.DWave.qpu_time_manager import QPUTimeManager, QPUTimeConfig
 from shared.base_miner import BaseMiner
 from shared.block_requirements import BlockRequirements
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.dwave_topology import DWaveTopology
+
+init_logger = logging.getLogger(__name__)
 
 
 class DWaveMiner(BaseMiner):

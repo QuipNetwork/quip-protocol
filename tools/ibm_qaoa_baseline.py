@@ -104,6 +104,17 @@ except ImportError:
 
 from dwave_topologies import DEFAULT_TOPOLOGY
 
+# Platform-conditional memory probes: resource is Unix-only stdlib, psutil is
+# an optional third-party dep used as a Windows fallback. Either may be absent.
+try:
+    import resource
+except ImportError:
+    resource = None
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -118,23 +129,18 @@ def _get_memory_mb():
                 which captures the high-water mark even after C++ memory
                 (like AerSimulator's state vector) is freed.
     """
-    try:
-        import resource
+    if resource is not None:
         rusage = resource.getrusage(resource.RUSAGE_SELF)
         rss_kb = rusage.ru_maxrss
         if sys.platform == "darwin":
             return rss_kb / (1024 * 1024)  # bytes -> MB on macOS
         return rss_kb / 1024  # KB -> MB on Linux
-    except ImportError:
-        pass
-    try:
-        import psutil
+    if psutil is not None:
         mem = psutil.Process(os.getpid()).memory_info()
         # peak_wset is Windows-only; falls back to rss on other platforms
         peak = getattr(mem, 'peak_wset', None) or mem.rss
         return peak / (1024 * 1024)
-    except ImportError:
-        return None
+    return None
 
 
 def _extract_subgraph(
@@ -259,12 +265,12 @@ def pipeline_test(
     if shots_list is None:
         shots_list = [512, 1024]
 
-    print("🔬 IBM QAOA Pipeline Test (protocol-style problems)")
+    print("IBM QAOA Pipeline Test (protocol-style problems)")
     print("=" * 55)
-    print(f"⏰ Timeout: {timeout_minutes} min | 🔁 Solves per config: {num_solves}")
+    print(f"Timeout: {timeout_minutes} min | Solves per config: {num_solves}")
 
     if not IBM_AVAILABLE:
-        print("❌ IBM QAOA not available (missing qiskit / qiskit-aer)")
+        print("IBM QAOA not available (missing qiskit / qiskit-aer)")
         return None
 
     nodes = DEFAULT_TOPOLOGY.nodes
@@ -272,19 +278,19 @@ def pipeline_test(
 
     if subgraph_size is not None:
         nodes, edges = _extract_subgraph(nodes, edges, subgraph_size)
-        print(f"✂️ Subgraph: {len(nodes)} nodes, {len(edges)} edges "
+        print(f"Subgraph: {len(nodes)} nodes, {len(edges)} edges "
               f"(from {len(DEFAULT_TOPOLOGY.nodes)}-node topology)")
     else:
-        print(f"🕸️ Topology: {len(nodes)} nodes, {len(edges)} edges")
+        print(f"Topology: {len(nodes)} nodes, {len(edges)} edges")
 
     expected_gse = expected_solution_energy(
         num_nodes=len(nodes), num_edges=len(edges)
     )
-    print(f"📐 Expected GSE (empirical): {expected_gse:.1f}")
+    print(f"Expected GSE (empirical): {expected_gse:.1f}")
 
     mem_before = _get_memory_mb()
     if mem_before is not None:
-        print(f"💾 Memory before solver init: {mem_before:.1f} MB")
+        print(f"Memory before solver init: {mem_before:.1f} MB")
 
     results = {
         'mode': 'pipeline',
@@ -303,7 +309,7 @@ def pipeline_test(
         for p in p_values for opt in optimizers for s in shots_list
     ]
 
-    print(f"\n🧪 {len(configs)} configs x {num_solves} solves "
+    print(f"\n{len(configs)} configs x {num_solves} solves "
           f"= {len(configs) * num_solves} total solves")
     print(f"  p:          {p_values}")
     print(f"  optimizers: {optimizers}")
@@ -314,7 +320,7 @@ def pipeline_test(
 
     for cfg_idx, cfg in enumerate(configs):
         if time.time() - total_start > timeout_s:
-            print(f"\n⏰ Timeout ({timeout_minutes} min) reached")
+            print(f"\nTimeout ({timeout_minutes} min) reached")
             break
 
         p, optimizer, shots = cfg['p'], cfg['optimizer'], cfg['shots']
@@ -330,12 +336,12 @@ def pipeline_test(
                 final_shots=final_shots,
             )
         except Exception as e:
-            print(f"  ❌ Failed to build solver: {e}")
+            print(f"  Failed to build solver: {e}")
             continue
 
         mem_after_init = _get_memory_mb()
         if mem_after_init is not None:
-            print(f"  💾 Memory after solver init: {mem_after_init:.1f} MB")
+            print(f"  Memory after solver init: {mem_after_init:.1f} MB")
 
         solve_energies: List[float] = []
         solve_times: List[float] = []
@@ -346,7 +352,7 @@ def pipeline_test(
 
         for solve_idx in range(num_solves):
             if time.time() - total_start > timeout_s:
-                print(f"  ⏰ Timeout reached during solve {solve_idx + 1}")
+                print(f"  Timeout reached during solve {solve_idx + 1}")
                 break
 
             nonce = random.randint(0, 2**32 - 1)
@@ -402,7 +408,7 @@ def pipeline_test(
                 if mem_now is not None and mem_now > peak_mem:
                     peak_mem = mem_now
 
-                status = "✅ MiningResult" if pipeline_ok else "⚠️  None"
+                status = "MiningResult" if pipeline_ok else "None"
                 print(f"energy={min_energy:.1f}, avg={avg_energy:.1f}, "
                       f"diversity={diversity:.3f}, solutions={num_valid}, "
                       f"time={solve_time:.1f}s {status}")
@@ -419,7 +425,7 @@ def pipeline_test(
         avg_diversity = (sum(solve_diversities) / len(solve_diversities)
                          if solve_diversities else 0.0)
 
-        print(f"\n  📊 Config summary:")
+        print(f"\n  Config summary:")
         print(f"    Best energy:       {best_energy:.1f}")
         print(f"    Avg solve time:    {avg_time:.1f}s ({avg_time/60:.1f} min)")
         print(f"    Avg diversity:     {avg_diversity:.3f}")
@@ -448,12 +454,12 @@ def pipeline_test(
     # Summary
     total_runtime = time.time() - total_start
     print(f"\n{'=' * 55}")
-    print(f"📊 Pipeline Test Summary (total: {total_runtime/60:.1f} min)")
+    print(f"Pipeline Test Summary (total: {total_runtime/60:.1f} min)")
     print(f"{'=' * 55}")
 
     if results['tests']:
         best = min(results['tests'], key=lambda r: r['best_energy'])
-        print(f"🏆 Best energy: {best['best_energy']:.1f}")
+        print(f"Best energy: {best['best_energy']:.1f}")
         print(f"  Config: p={best['p']}, {best['optimizer']}, "
               f"{best['shots']} shots")
         print(f"  Avg solve time: {best['avg_solve_time_seconds']:.1f}s")
@@ -463,9 +469,9 @@ def pipeline_test(
             for r in results['tests']
         )
         total_solves = sum(r['num_solves'] for r in results['tests'])
-        print(f"\n✅ Pipeline pass rate: {total_passes}/{total_solves}")
+        print(f"\nPipeline pass rate: {total_passes}/{total_solves}")
 
-        print(f"\n⏱️  Time vs Energy:")
+        print(f"\n Time vs Energy:")
         for r in results['tests']:
             print(f"  p={r['p']} {r['optimizer']:>10s} {r['shots']:5d} shots -> "
                   f"{r['best_energy']:8.1f} energy, "
@@ -475,12 +481,12 @@ def pipeline_test(
         mem_values = [r['peak_memory_mb'] for r in results['tests']
                       if r['peak_memory_mb'] is not None]
         if mem_values:
-            print(f"\n💾 Peak memory: {max(mem_values):.1f} MB")
+            print(f"\nPeak memory: {max(mem_values):.1f} MB")
 
     if output_file:
         with open(output_file, 'w') as f:
             json.dump(results, f, indent=2)
-        print(f"\n💾 Results saved to {output_file}")
+        print(f"\nResults saved to {output_file}")
 
     return results
 
@@ -505,17 +511,17 @@ def known_problems_test(
       found_energy / optimal_energy
     Ratio of 1.0 = found exact ground state.  > 0.90 = good.
     """
-    print("🔬 IBM QAOA Known-Problems Test (solution quality)")
+    print("IBM QAOA Known-Problems Test (solution quality)")
     print("=" * 55)
-    print(f"🔧 Solver: p={p}, optimizer={optimizer}, shots={shots}")
-    print(f"🔁 Solves per problem: {num_solves}")
-    print(f"📏 Max qubits: {max_qubits}")
+    print(f"Solver: p={p}, optimizer={optimizer}, shots={shots}")
+    print(f"Solves per problem: {num_solves}")
+    print(f"Max qubits: {max_qubits}")
 
     if not IBM_AVAILABLE:
-        print("❌ IBM QAOA not available (missing qiskit / qiskit-aer)")
+        print("IBM QAOA not available (missing qiskit / qiskit-aer)")
         return None
 
-    print("\n📋 Loading problems from basic_ising_problems.py + hard_ising_problems.py...")
+    print("\nLoading problems from basic_ising_problems.py + hard_ising_problems.py...")
     problems = _load_known_problems(max_qubits=max_qubits)
     print(f"  {len(problems)} problems loaded "
           f"(filtered to <= {max_qubits} qubits)\n")
@@ -554,7 +560,7 @@ def known_problems_test(
                 final_shots=4 * shots,
             )
         except Exception as e:
-            print(f"  ❌ Failed to build solver: {e}")
+            print(f"  Failed to build solver: {e}")
             continue
 
         solve_energies: List[float] = []
@@ -608,21 +614,21 @@ def known_problems_test(
         avg_time = sum(solve_times) / len(solve_times)
 
         if best_ratio >= 0.90:
-            verdict = "✅🎉 Excellent!"
+            verdict = "Excellent!"
             verdict_label = "Excellent"
         elif best_ratio >= 0.80:
-            verdict = "✅🌈 Very Good!"
+            verdict = "Very Good!"
             verdict_label = "Very Good"
         elif best_ratio >= 0.70:
-            verdict = "✅🎖️ Good!"
+            verdict = "Good!"
             verdict_label = "Good"
         elif best_ratio >= 0.60:
-            verdict = "✅⚡ Fair!"
+            verdict = "Fair!"
             verdict_label = "Fair"
         else:
-            verdict = "❌🥶 Poor!"
+            verdict = "Poor!"
             verdict_label = "Poor"
-        print(f"\n  📊 Summary: best={best_energy:.1f}, "
+        print(f"\n  Summary: best={best_energy:.1f}, "
               f"best_ratio={best_ratio:.3f}, "
               f"avg_ratio={avg_ratio:.3f}, "
               f"avg_time={avg_time:.2f}s -> {verdict}\n")
@@ -647,7 +653,7 @@ def known_problems_test(
     # Summary
     total_runtime = time.time() - total_start
     print(f"{'=' * 55}")
-    print(f"📊 Known-Problems Summary (total: {total_runtime:.1f}s)")
+    print(f"Known-Problems Summary (total: {total_runtime:.1f}s)")
     print(f"{'=' * 55}")
 
     if results['problems']:
@@ -670,23 +676,23 @@ def known_problems_test(
         fair = sum(1 for r in all_ratios if 0.60 <= r < 0.70)
         poor = sum(1 for r in all_ratios if r < 0.60)
 
-        print(f"\n🏆 Overall avg approx ratio: {avg_overall:.3f}")
-        print(f"📉 Worst ratio:             {min_ratio:.3f}")
-        print(f"🎉 Excellent (>= 90%%):      {excellent}/{len(all_ratios)}")
-        print(f"🌈 Very Good (80-90%%):      {very_good}/{len(all_ratios)}")
-        print(f"🎖️ Good (70-80%%):           {good}/{len(all_ratios)}")
-        print(f"⚡ Fair (60-70%%):           {fair}/{len(all_ratios)}")
-        print(f"🥶 Poor (< 60%%):            {poor}/{len(all_ratios)}")
+        print(f"\nOverall avg approx ratio: {avg_overall:.3f}")
+        print(f"Worst ratio:             {min_ratio:.3f}")
+        print(f"Excellent (>= 90%%):      {excellent}/{len(all_ratios)}")
+        print(f"Very Good (80-90%%):      {very_good}/{len(all_ratios)}")
+        print(f"Good (70-80%%):           {good}/{len(all_ratios)}")
+        print(f"Fair (60-70%%):           {fair}/{len(all_ratios)}")
+        print(f"Poor (< 60%%):            {poor}/{len(all_ratios)}")
 
         mem_values = [r['peak_memory_mb'] for r in results['problems']
                       if r['peak_memory_mb'] is not None]
         if mem_values:
-            print(f"\n💾 Peak memory: {max(mem_values):.1f} MB")
+            print(f"\nPeak memory: {max(mem_values):.1f} MB")
 
     if output_file:
         with open(output_file, 'w') as f:
             json.dump(results, f, indent=2)
-        print(f"\n💾 Results saved to {output_file}")
+        print(f"\nResults saved to {output_file}")
 
     return results
 
@@ -844,9 +850,9 @@ Examples:
         )
 
     if results:
-        print(f"\n✅ IBM QAOA baseline test complete!")
+        print(f"\nIBM QAOA baseline test complete!")
     else:
-        print(f"\n❌ IBM QAOA baseline test failed!")
+        print(f"\nIBM QAOA baseline test failed!")
 
 
 if __name__ == "__main__":
