@@ -568,6 +568,36 @@ class BaseMiner(ABC):
         batch_miner_id = bridge_node_info.miner_id
         batch_cur_index = bridge_prev_block.header.index
 
+        # --- Out-of-band result pump (streaming backends only) ----------
+        # CPU/GPU/Metal keep the inline path below (STREAMING_PUMP=False).
+        self._dropped_results = 0
+        result_queue: Optional["queue.Queue"] = None
+        pump_thread: Optional[threading.Thread] = None
+        pump_stop: Optional[threading.Event] = None
+        if self.STREAMING_PUMP:
+            result_queue = queue.Queue(maxsize=self.RESULT_QUEUE_MAXSIZE)
+            pump_stop = threading.Event()
+            # The QPU stream observes this so its in-flight next() unblocks
+            # on shutdown before we join the pump and close the generator.
+            self._pump_stop = pump_stop
+            sample_kwargs = {
+                "prev_hash": batch_prev_hash,
+                "miner_id": batch_miner_id,
+                "cur_index": batch_cur_index,
+                "nodes": nodes,
+                "edges": edges,
+                "num_reads": num_reads,
+                "num_sweeps": current_num_sweeps,
+                "extra": extra_params,
+            }
+            pump_thread = threading.Thread(
+                target=self._result_pump,
+                args=(result_queue, pump_stop, sample_kwargs),
+                name=f"qpu-pump-{self.miner_id}",
+                daemon=True,
+            )
+            pump_thread.start()
+
         progress = 0
         try:
             while self.mining and not stop_event.is_set():
@@ -582,46 +612,63 @@ class BaseMiner(ABC):
                 self.current_stage = 'preprocessing'
                 self.current_stage_start = preprocess_start
 
-                # Snapshot the QPU access-time list length so we can pick
-                # up the entry this iteration appends (if any). QPU miners
-                # call ``_record_qpu_timing`` inside ``_sample`` /
-                # ``_sample_batch`` which appends to
-                # ``timing_stats['qpu_access_time']`` only when the
-                # sampleset carries D-Wave timing info — non-QPU backends
-                # never touch the list, so the snapshot reads back as
-                # "no new entry".
-                qpu_access_len_before = len(
-                    self.timing_stats['qpu_access_time'],
-                )
+                # Per-iteration QPU access time in microseconds (D-Wave
+                # ``qpu_programming_time + qpu_sampling_time``). In pump mode
+                # the pump thread extracts it and ships it on the result; on
+                # the inline path the branch below snapshots the shared
+                # ``timing_stats['qpu_access_time']`` list around the sample.
+                # ``None`` when no entry was produced (non-QPU backends, or a
+                # QPU sampleset without timing info).
+                qpu_access_time_us: Optional[int] = None
                 try:
                     sample_start = time.time()
                     self.current_stage = 'sampling'
                     self.current_stage_start = sample_start
-                    # Prefer the streaming pipeline. ``_sample_batch``
-                    # pulls from ``self._feeder`` internally and keeps
-                    # ``queue_depth`` QPU jobs in flight; it returns one
-                    # ``(nonce, salt, sampleset)`` per call. Backends
-                    # without batch streaming (CPU) return ``None`` — only
-                    # then do we pop a single model and sample it directly.
-                    batch = self._sample_batch(
-                        batch_prev_hash, batch_miner_id, batch_cur_index,
-                        nodes, edges,
-                        num_reads=num_reads,
-                        num_sweeps=current_num_sweeps,
-                        **extra_params,
-                    )
-                    if batch is not None:
-                        nonce, salt, sampleset = batch[0]
+                    if result_queue is not None:
+                        # Pump mode: block on the queue, but wake to check
+                        # stop_event. _PUMP_DONE means the stream ended.
+                        item = None
+                        while not stop_event.is_set():
+                            try:
+                                item = result_queue.get(timeout=0.1)
+                                break
+                            except queue.Empty:
+                                continue
+                        if stop_event.is_set():
+                            return None
+                        if item is _PUMP_DONE:
+                            break  # stream exhausted; exit the loop
+                        nonce = item.nonce
+                        salt = item.salt
+                        sampleset = item.sampleset
+                        qpu_access_time_us = item.qpu_access_time_us
                     else:
-                        model = self._feeder.pop_blocking()
-                        nonce, salt = model.nonce, model.salt
-                        sampleset = self._sample(
-                            model.h, model.J,
+                        # Inline path (CPU/GPU/Metal): unchanged.
+                        qpu_access_len_before = len(
+                            self.timing_stats['qpu_access_time'],
+                        )
+                        batch = self._sample_batch(
+                            batch_prev_hash, batch_miner_id, batch_cur_index,
+                            nodes, edges,
                             num_reads=num_reads,
                             num_sweeps=current_num_sweeps,
-                            nonce_seed=nonce,
                             **extra_params,
                         )
+                        if batch is not None:
+                            nonce, salt, sampleset = batch[0]
+                        else:
+                            model = self._feeder.pop_blocking()
+                            nonce, salt = model.nonce, model.salt
+                            sampleset = self._sample(
+                                model.h, model.J,
+                                num_reads=num_reads,
+                                num_sweeps=current_num_sweeps,
+                                nonce_seed=nonce,
+                                **extra_params,
+                            )
+                        qpu_access_list = self.timing_stats['qpu_access_time']
+                        if len(qpu_access_list) > qpu_access_len_before:
+                            qpu_access_time_us = int(qpu_access_list[-1])
                     sample_time = time.time() - sample_start
                     self.timing_stats['sampling'].append(sample_time * 1e6)
                     self.timing_stats['preprocessing'].append(
@@ -631,15 +678,6 @@ class BaseMiner(ABC):
                     if self._on_sampling_error(exc, stop_event):
                         return None
                     continue
-
-                # D-Wave reports ``qpu_programming_time + qpu_sampling_time``
-                # in microseconds; we forward as-is. ``None`` when no entry
-                # was appended this iteration (CPU/CUDA/etc. backends, or a
-                # QPU sampleset without timing info).
-                qpu_access_time_us: Optional[int] = None
-                qpu_access_list = self.timing_stats['qpu_access_time']
-                if len(qpu_access_list) > qpu_access_len_before:
-                    qpu_access_time_us = int(qpu_access_list[-1])
 
                 sampleset = self._post_sample(sampleset)
                 if stop_event.is_set():
@@ -924,11 +962,26 @@ class BaseMiner(ABC):
             return None
         finally:
             self.mining = False
+            if self._dropped_results:
+                self.logger.info(
+                    "mine_work_item: %d QPU results dropped under "
+                    "result-queue backpressure", self._dropped_results,
+                )
+            # Stop the pump first: signal it, let the QPU stream observe the
+            # stop and return from its in-flight next(), then join. Only
+            # after the pump thread is dead is it safe for _post_mine_cleanup
+            # to close the generator (close() on a generator executing in
+            # another thread raises "already executing").
+            if pump_stop is not None:
+                pump_stop.set()
+            if pump_thread is not None:
+                pump_thread.join(timeout=5.0)
+                if pump_thread.is_alive():
+                    self.logger.warning(
+                        "mine_work_item: result pump did not join in 5s",
+                    )
+            self._pump_stop = None
             # Tear down the feeder before delegating to subclass cleanup.
-            # Subclass ``_post_mine_cleanup`` and SIGTERM handlers
-            # tolerate ``self._feeder is None`` (they all gate on
-            # ``is not None``), so leaving the field cleared here means
-            # the next dispatch starts from a known-empty state.
             if self._feeder is not None:
                 try:
                     self._feeder.stop()
