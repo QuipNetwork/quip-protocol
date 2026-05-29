@@ -678,6 +678,22 @@ def test_submission_rejects_non_int(tmp_path):
         load_submission_config(p)
 
 
+def test_submission_accepts_tip_at_u128_max(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text(f"[submission]\ntip_plancks = {(1 << 128) - 1}\n")
+    cfg = load_submission_config(p)
+    assert cfg.tip_plancks == (1 << 128) - 1
+
+
+def test_submission_rejects_tip_above_u128_max(tmp_path):
+    # A tip above the chain's u128 Balance range encodes locally but the
+    # runtime rejects it — fail at load time, not at the first proof.
+    p = tmp_path / "config.toml"
+    p.write_text(f"[submission]\ntip_plancks = {1 << 128}\n")
+    with pytest.raises(MinerConfigError, match="u128 max"):
+        load_submission_config(p)
+
+
 def test_submission_rejects_bool_for_int_field(tmp_path):
     # bool is an int subclass; reject so `tip_plancks = true` fails loud.
     p = tmp_path / "config.toml"

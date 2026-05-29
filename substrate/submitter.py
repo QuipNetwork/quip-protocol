@@ -21,6 +21,7 @@ from typing import Awaitable, Callable, List, Optional
 from shared.allowed_value_spec import MILLI_SCALE as _MILLI_SCALE
 from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
+from substrate.validator_handle import ValidatorSwapped
 from shared.packed_solution import pack_solution
 from shared.signer import Signer
 from substrate.client import SubstrateClient
@@ -75,12 +76,13 @@ class SubmitRetryAction(str, Enum):
       - ``RETRY``: transient/timing failure (connection drop, RPC error,
         ``InsufficientEnergy``, ``ProofLimitReached``). Loop again after
         backoff; reconnect first.
-      - ``STOP_ROUND_STALE``: the round advanced (``InvalidNonce`` etc.).
-        The nonce is dead — stop this round, re-mine the next snapshot.
-      - ``STOP_FATAL``: the candidate or config is bad
-        (``InsufficientSolutions`` / ``InsufficientDiversity`` /
-        ``TopologyNotRegistered`` is round-stale, but bad-config errors
-        land here). Stop; retrying cannot help.
+      - ``STOP_ROUND_STALE``: the round advanced — the nonce is dead, so
+        resubmitting can never succeed (``InvalidNonce`` /
+        ``TopologyNotRegistered`` / ``InvalidTopology``). Stop this round,
+        re-mine the next snapshot.
+      - ``STOP_FATAL``: the candidate or config is genuinely bad
+        (``InsufficientSolutions`` / ``InsufficientDiversity``), or the
+        error string is unrecognized. Stop; retrying cannot help.
     """
 
     SUCCESS = "success"
@@ -288,6 +290,13 @@ async def submit_with_retry(
         ``ConnectionError`` / ``OSError`` / generic ``RuntimeError`` from an
         RPC) → RETRY. ``submit_proof`` already reconnects first via its
         ``ensure_live`` probe.
+      - ``ValidatorSwapped`` (the pool hot-swapped validators mid-submit) →
+        RETRY. This is safe here *only* because each attempt re-composes
+        and re-signs the extrinsic from scratch: ``submit_proof`` calls
+        ``build_client.build_signed_extrinsic`` every iteration, which
+        re-reads the account nonce against the (now swapped-in) validator
+        and produces a fresh signature. We never re-broadcast a stale
+        pre-signed hex — that would carry a dead nonce and be rejected.
       - Receipt errors → classified by :func:`_classify_receipt`:
         ``InsufficientEnergy`` / ``ProofLimitReached`` → RETRY;
         ``InvalidNonce`` / ``TopologyNotRegistered`` / ``InvalidTopology``
@@ -300,9 +309,12 @@ async def submit_with_retry(
     the per-attempt linear backoff; ``sleeper`` is injected so tests run
     with zero real delay — defaults to :func:`asyncio.sleep`.
 
-    Returns the terminal :class:`SubmitResult`; does not raise for a
-    single transient failure (only re-raises nothing — fatal stops are
-    returned, not raised).
+    Returns the terminal :class:`SubmitResult`; does not raise for a single
+    transient failure (transient + ``ValidatorSwapped`` failures are
+    retried, then returned as ``RETRY``; classified stops are returned, not
+    raised). The only exceptions that propagate are programming errors
+    (e.g. a ``ValueError`` from proof encoding) — never a network/swap
+    failure.
     """
     if max_retries < 0:
         raise ValueError(f"max_retries must be non-negative, got {max_retries}")
@@ -372,9 +384,12 @@ async def submit_with_retry(
 
 
 # Exception classes that mean "the submit failed in a way a later attempt
-# might survive" — connection drops, timeouts, and the RuntimeError the
-# client raises for RPC-layer errors. Caught by submit_with_retry so a
-# single network blip never tears down the fire loop.
+# might survive" — connection drops, timeouts, the RuntimeError the client
+# raises for RPC-layer errors, and a mid-submit validator swap. Caught by
+# submit_with_retry so a single network blip never tears down the fire loop.
+# ValidatorSwapped is only safe to retry because submit_proof re-signs from
+# scratch each attempt (fresh nonce against the swapped-in validator) — see
+# the submit_with_retry docstring.
 _TRANSIENT_SUBMIT_EXCEPTIONS = (
     BrokenPipeError,
     ConnectionError,
@@ -382,6 +397,7 @@ _TRANSIENT_SUBMIT_EXCEPTIONS = (
     OSError,
     asyncio.TimeoutError,
     RuntimeError,
+    ValidatorSwapped,
 )
 
 

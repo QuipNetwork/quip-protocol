@@ -174,8 +174,6 @@ def test_hybrid_nonzero_tip_changes_bytes_and_embeds_compact_tip():
     assert ext_tip != ext_zero
     # The tip is SCALE compact-u128 encoded; those bytes must be present.
     assert _encode_compact_u128(tip) in ext_tip
-    # And the zero-tip compact (a single 0x00) layout differs.
-    assert len(ext_tip) != len(ext_zero) or ext_tip != ext_zero
 
 
 # ----------------------------------------------------------------------
@@ -502,6 +500,53 @@ async def test_stops_on_insufficient_diversity_fatal():
 async def test_topology_not_registered_is_round_stale():
     result, _ = await _run([_err_receipt("TopologyNotRegistered")])
     assert result.action is SubmitRetryAction.STOP_ROUND_STALE
+
+
+async def test_invalid_topology_is_round_stale():
+    result, _ = await _run([_err_receipt("InvalidTopology")])
+    assert result.action is SubmitRetryAction.STOP_ROUND_STALE
+
+
+async def test_unknown_error_is_fatal_not_retried():
+    # Guards against a future infinite-retry regression: an unrecognized
+    # pallet error must STOP_FATAL, never loop. Asserting attempts==1 pins
+    # that the loop did not retry it.
+    result, sleeper = await _run(
+        [_err_receipt("SomeBrandNewPalletError")], max_retries=5
+    )
+    assert result.action is SubmitRetryAction.STOP_FATAL
+    assert result.attempts == 1
+    assert sleeper.delays == []
+
+
+async def test_retry_on_validator_swapped_then_success():
+    # ValidatorSwapped means the pool hot-swapped validators mid-submit.
+    # Because submit_proof re-signs from scratch each attempt (fresh nonce
+    # against the new validator), submit_with_retry treats it as a
+    # retryable transient — it must NOT propagate, and the next attempt
+    # succeeds.
+    from substrate.validator_handle import ValidatorSwapped
+
+    result, _ = await _run(
+        [ValidatorSwapped("pool swapped mid-submit"), _ok_receipt()],
+        retry_backoff_ms=0,
+    )
+    assert result.action is SubmitRetryAction.SUCCESS
+    assert result.attempts == 2
+
+
+async def test_validator_swapped_does_not_escape_when_persistent():
+    # A persistent swap exhausts retries and returns RETRY — never raises
+    # ValidatorSwapped out of submit_with_retry.
+    from substrate.validator_handle import ValidatorSwapped
+
+    result, _ = await _run(
+        [ValidatorSwapped("swap"), ValidatorSwapped("swap")],
+        max_retries=1,
+        retry_backoff_ms=0,
+    )
+    assert result.action is SubmitRetryAction.RETRY
+    assert result.attempts == 2
 
 
 async def test_respects_max_retries_then_returns_retry():

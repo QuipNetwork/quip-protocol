@@ -132,11 +132,17 @@ def load_submission_config(path: Path) -> SubmissionConfig:
     return _parse_submission_table(section)
 
 
+# The chain encodes the tip as a `Compact<Balance>` where Balance is u128.
+# A tip above this encodes fine locally but the runtime rejects it — catch
+# the fail-slow at config-load time instead.
+_U128_MAX: int = (1 << 128) - 1
+
+
 def _parse_submission_table(section: Mapping[str, Any]) -> SubmissionConfig:
     """Validate + coerce a ``[submission]`` mapping to a config dataclass."""
     defaults = SubmissionConfig()
     tip = _require_non_negative_int(
-        section, "tip_plancks", defaults.tip_plancks
+        section, "tip_plancks", defaults.tip_plancks, maximum=_U128_MAX
     )
     max_retries = _require_non_negative_int(
         section, "max_retries", defaults.max_retries
@@ -152,9 +158,18 @@ def _parse_submission_table(section: Mapping[str, Any]) -> SubmissionConfig:
 
 
 def _require_non_negative_int(
-    section: Mapping[str, Any], key: str, default: int
+    section: Mapping[str, Any],
+    key: str,
+    default: int,
+    *,
+    maximum: Optional[int] = None,
 ) -> int:
-    """Read ``key`` as a non-negative int, defaulting when absent."""
+    """Read ``key`` as a non-negative int, defaulting when absent.
+
+    When ``maximum`` is given, values above it raise — used to keep
+    ``tip_plancks`` within the chain's u128 ``Balance`` range so an
+    over-large tip fails at load time rather than at submit time.
+    """
     if key not in section:
         return default
     value = section[key]
@@ -167,6 +182,11 @@ def _require_non_negative_int(
     if value < 0:
         raise MinerConfigError(
             f"miner config: [submission].{key} must be non-negative, got {value}"
+        )
+    if maximum is not None and value > maximum:
+        raise MinerConfigError(
+            f"miner config: [submission].{key} must be <= {maximum} "
+            f"(u128 max), got {value}"
         )
     return value
 
