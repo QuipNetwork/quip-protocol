@@ -77,8 +77,8 @@ class _SetupAbortThrottle:
 
     Logs the first occurrence of a given work-tag at WARNING; subsequent
     identical tags are silently dropped until evicted from the bounded
-    cache.  The cache is an :class:`~collections.OrderedDict` used as an
-    LRU-style FIFO so the oldest tag is evicted first when the cap is hit.
+    cache.  The cache is an :class:`~collections.OrderedDict` used as a
+    FIFO so the oldest tag is evicted first when the cap is hit.
 
     This keeps ``mine_work_item``'s "aborting attempt" warning visible for
     the first paced head in each round without spamming thousands of lines

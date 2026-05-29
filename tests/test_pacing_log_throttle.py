@@ -6,12 +6,6 @@ or real BaseMiner subclass with a live sampler is constructed here.
 """
 from __future__ import annotations
 
-import logging
-from collections import OrderedDict
-from typing import List, Optional
-
-import pytest
-
 from QPU.dwave_miner import _PacingRateLimiter
 from shared.base_miner import _SetupAbortThrottle
 
