@@ -226,8 +226,32 @@ def miner_worker_main(
             # correlate with the controller's submission logs. See
             # shared/mining_attempt_log.py for the cross-process join.
             miner._current_dispatch_id = dispatch_id
+
+            # Anticipatory-submission preview channel. The miner calls
+            # this whenever its best-by-floor stashed candidate improves;
+            # we forward it to the controller as a lightweight
+            # ``{"op": "preview"}`` message (same id/dispatch_id shape as
+            # results) WITHOUT ending the dispatch. The controller stashes
+            # the latest best preview per work key so Task 6b can predict
+            # the decay-block and pre-submit. Best-effort: a put failure
+            # must not break mining.
+            def _emit_preview(payload: Dict[str, Any]) -> None:
+                try:
+                    resp_q.put(
+                        {
+                            "op": "preview",
+                            "id": spec.get("id"),
+                            "dispatch_id": dispatch_id,
+                            "data": payload,
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    logger.debug("preview put failed (ignored): %s", exc)
+
             try:
-                result = miner.mine_work_item(context, stop_event)
+                result = miner.mine_work_item(
+                    context, stop_event, preview_cb=_emit_preview,
+                )
             except Exception as exc:
                 logger.error(
                     f"[{miner.miner_id}] mine_work_item raised: "

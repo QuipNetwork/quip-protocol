@@ -46,11 +46,13 @@ _CONNECTION_ERRORS: tuple[type[BaseException], ...] = (
 # Idempotent operations the pool may auto-retry across swaps.
 # Anything not in this set raises ValidatorSwapped to the caller instead.
 _IDEMPOTENT_OPS = frozenset({
+    "ensure_connected",
     "get_head",
     "get_block_number",
     "get_finalized_head",
     "get_mining_snapshot",
     "query_miner",
+    "query_proofs_submitted",
     "query_difficulty",
     "query_current_difficulty",
     "query_last_proof_block_number",

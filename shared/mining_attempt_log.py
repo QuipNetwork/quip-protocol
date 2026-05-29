@@ -590,12 +590,19 @@ class SubmissionLogger:
         last_proof_block_hash_hex: str,
         outcome: str,
         miner_type: str = "",
+        num_valid: Optional[int] = None,
         extrinsic_hash: Optional[str] = None,
         chain_block_hash: Optional[str] = None,
         chain_block_number: Optional[int] = None,
+        pow_sequence: Optional[int] = None,
         error: Optional[str] = None,
     ) -> None:
         """Write the per-dispatch submission record + index entry.
+
+        ``num_valid`` is the count of unique samples that met the energy
+        threshold at submit time (sourced from ``MiningResult.num_valid``).
+        Written into ``submission.json`` so the dashboard's "Solutions"
+        column has a stable, consistent value.
 
         Also attaches the submission to the winning miner's
         ``metadata-{miner_id}.json`` so dispatch-level queries see the
@@ -612,10 +619,12 @@ class SubmissionLogger:
             "energy_milli": energy_milli,
             "diversity_milli": diversity_milli,
             "threshold_milli": threshold_milli,
+            "num_valid": num_valid,
             "last_proof_block_hash": last_proof_block_hash_hex,
             "extrinsic_hash": extrinsic_hash,
             "chain_block_hash": chain_block_hash,
             "chain_block_number": chain_block_number,
+            "pow_sequence": pow_sequence,
             "outcome": outcome,
             "error": error,
         }

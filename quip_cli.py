@@ -46,8 +46,10 @@ from shared.miner_config import (
     MinerConfigError,
     ModeResolutionError,
     QPU_BACKEND_SECTIONS,
+    SubmissionConfig,
     load_backend_config,
     load_miner_config,
+    load_submission_config,
     merge_config,
     present_backend_groups,
     resolve_mode,
@@ -1140,6 +1142,22 @@ def _load_backends_or_fail(config_path: Optional[str]) -> dict:
         raise click.ClickException(str(exc)) from exc
 
 
+def _load_submission_config_or_default(
+    config_path: Optional[str],
+) -> SubmissionConfig:
+    """Read the ``[submission]`` table from --config; defaults if no --config.
+
+    Wraps `load_submission_config` so a malformed knob surfaces as the
+    CLI's standard error formatting rather than a raw traceback.
+    """
+    if config_path is None:
+        return SubmissionConfig()
+    try:
+        return load_submission_config(Path(config_path).expanduser())
+    except MinerConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def _check_backend_conflicts(
     ctx: click.Context,
     backends: dict,
@@ -1228,6 +1246,7 @@ async def _run_concurrent_miner(
     public_host: Optional[str] = None,
     public_port: Optional[int] = None,
     node_log: Optional[str] = None,
+    submission_config: Optional[SubmissionConfig] = None,
 ) -> int:
     """Unified entry for `--mode pow|mempool|both` on cpu/gpu/qpu.
 
@@ -1245,6 +1264,10 @@ async def _run_concurrent_miner(
     if mode not in ("pow", "mempool", "both"):
         click.echo(f"invalid --mode {mode!r}", err=True)
         return 2
+
+    # Submission tuning (tip + retry bounds). Defaults reproduce pre-tip
+    # behavior, so an old config or a caller that omits this is unchanged.
+    submission_config = submission_config or SubmissionConfig()
 
     # node_log is opt-in (TOML or CLI). When set, re-run setup_logging
     # so a RotatingFileHandler is attached alongside the stderr handler
@@ -1393,6 +1416,7 @@ async def _run_concurrent_miner(
                 # surface — controllers then skip their in-process
                 # sibling spawn but still write snapshots.
                 spawn_telemetry_sibling=not _telemetry_external_via_env(),
+                submission_config=submission_config,
             )
             click.echo(
                 f"  pow handles: {[h.miner_id for h in pow_handles]} "
@@ -1685,6 +1709,7 @@ def quip_miner_cpu(
         public_host=merged.get("public_host"),
         public_port=merged.get("public_port"),
         node_log=merged.get("node_log"),
+        submission_config=_load_submission_config_or_default(config_path),
     )))
 
 
@@ -1818,6 +1843,7 @@ def quip_miner_gpu(
         public_host=merged.get("public_host"),
         public_port=merged.get("public_port"),
         node_log=merged.get("node_log"),
+        submission_config=_load_submission_config_or_default(config_path),
     )))
 
 
@@ -1958,6 +1984,7 @@ def quip_miner_qpu(
         public_host=merged.get("public_host"),
         public_port=merged.get("public_port"),
         node_log=merged.get("node_log"),
+        submission_config=_load_submission_config_or_default(config_path),
     )))
 
 

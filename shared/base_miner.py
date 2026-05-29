@@ -5,6 +5,7 @@ Contains core mining logic and defines abstract methods for miner-specific imple
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 import logging
 import math
 import multiprocessing
@@ -46,6 +47,10 @@ log = logging.getLogger(__name__)
 # observability (one line per minute on the typical CPU/GPU cadence).
 PROGRESS_LOG_INTERVAL = 10
 
+# Sentinel for "no preview emitted yet" in the preview-throttle state.
+# Kept as a plain int so the strict-improvement comparison stays integer.
+_MILLI_INF = 1 << 62
+
 
 @dataclass(frozen=True)
 class _PumpedResult:
@@ -66,6 +71,42 @@ class _PumpedResult:
 # (not a class attribute) so subclasses can't accidentally shadow it and
 # break the consumer's ``is`` identity check.
 _PUMP_DONE = object()
+
+# Maximum number of work-tags remembered by _SetupAbortThrottle.
+_SETUP_ABORT_TAG_LIMIT = 32
+
+
+class _SetupAbortThrottle:
+    """Rate-limiter for the ``_pre_mine_setup`` returned-False warning.
+
+    Logs the first occurrence of a given work-tag at WARNING; subsequent
+    identical tags are silently dropped until evicted from the bounded
+    cache.  The cache is an :class:`~collections.OrderedDict` used as a
+    FIFO so the oldest tag is evicted first when the cap is hit.
+
+    This keeps ``mine_work_item``'s "aborting attempt" warning visible for
+    the first paced head in each round without spamming thousands of lines
+    over a long pacing window.
+    """
+
+    def __init__(self, max_tags: int = _SETUP_ABORT_TAG_LIMIT) -> None:
+        self._max = max_tags
+        # OrderedDict preserves insertion order; we evict the first item
+        # (oldest) when full so the set stays bounded.
+        self._seen: "OrderedDict[str, None]" = OrderedDict()
+
+    def should_log(self, tag: str) -> bool:
+        """Return True (and record tag) if the caller should emit a log line."""
+        if tag in self._seen:
+            return False
+        # Evict oldest entry if at capacity before inserting the new one.
+        while len(self._seen) >= self._max:
+            self._seen.popitem(last=False)
+        self._seen[tag] = None
+        return True
+
+    def __len__(self) -> int:
+        return len(self._seen)
 
 
 class BaseMiner(ABC):
@@ -164,6 +205,13 @@ class BaseMiner(ABC):
         # running so the QPU stream can observe shutdown (Task 3 reads
         # this); None when no pump is active.
         self._pump_stop: Optional[threading.Event] = None
+
+        # Throttle for the "_pre_mine_setup returned False" warning so
+        # pacing during a budget exhaustion window doesn't produce one
+        # WARNING line per head (~every 6 s). The first occurrence for
+        # each work-tag still surfaces; repeats are suppressed until the
+        # tag is evicted from the bounded cache.
+        self._setup_abort_throttle = _SetupAbortThrottle()
 
     def update_top_samples(self, sampleset: dimod.SampleSet, nonce: int, salt: bytes, requirements: BlockRequirements):
         """Update the top 3 results list with a new mining result."""
@@ -418,6 +466,7 @@ class BaseMiner(ABC):
         self,
         context: WorkContext,
         stop_event: multiprocessing.synchronize.Event,
+        preview_cb: Optional[Any] = None,
         **kwargs,
     ) -> Optional[MiningResult]:
         """Protocol-neutral mining loop.
@@ -452,6 +501,14 @@ class BaseMiner(ABC):
                 ``MempoolJobContext`` (mempool job).
             stop_event: Worker cancellation event. The controller sets
                 this on new-head, deregistration, job-expiry, or shutdown.
+            preview_cb: Optional callable invoked (substrate/PoW path only)
+                whenever the best-by-floor stashed candidate improves —
+                i.e. a strictly lower ``submit_floor_energy`` enters/leads
+                ``top_k``. Receives a lightweight, picklable payload dict
+                (see the call site) carrying enough for the controller to
+                encode+submit the candidate later. Default ``None`` = no-op
+                so existing callers are unaffected. A failing callback never
+                breaks mining (wrapped in try/except, logged at debug).
             **kwargs: Forwarded to ``_pre_mine_setup``.
 
         Returns:
@@ -490,10 +547,15 @@ class BaseMiner(ABC):
             # `mine_block` swallowed this case silently; here we surface it
             # so the worker's resp_q sentinel actually means "tried and
             # got nothing", not "couldn't start".
-            self.logger.warning(
-                "mine_work_item: _pre_mine_setup returned False, aborting "
-                "attempt for %s", _work_tag(context),
-            )
+            # Rate-limited: only log the first occurrence for each work-tag
+            # so pacing during budget exhaustion doesn't produce a WARNING
+            # line on every chain head (~every 6 s).
+            tag = _work_tag(context)
+            if self._setup_abort_throttle.should_log(tag):
+                self.logger.warning(
+                    "mine_work_item: _pre_mine_setup returned False, aborting "
+                    "attempt for %s", tag,
+                )
             return None
 
         # Topology comes from the chain snapshot, not the local sampler.
@@ -531,6 +593,11 @@ class BaseMiner(ABC):
         # best candidate; ``top_k[-1]`` is the eviction target.
         top_k: List[MiningResult] = []
         top_k_cap: int = self.TOP_K_STORE
+        # Anticipatory-submission preview throttle. Tracks the best
+        # (lowest) ``submit_floor_energy`` we've previewed to the
+        # controller so far; we only emit a fresh preview on a strict
+        # improvement. ``inf`` = nothing previewed yet.
+        previewed_floor_milli: int = _MILLI_INF
         # Lazily build the per-worker attempt log. Mempool jobs share
         # the same writer for cross-mode forensics; the ``result_kind``
         # field on each row distinguishes the two paths.
@@ -813,6 +880,21 @@ class BaseMiner(ABC):
                                 top_k.sort(key=lambda r: r.energy)
                                 stored_replaced = True
 
+                    # Anticipatory-submission preview. When the stash gains
+                    # a candidate whose best-by-floor improves on anything
+                    # we've previewed, hand the controller a lightweight,
+                    # picklable snapshot so Task 6b can predict the
+                    # decay-block at which it clears and pre-submit. This is
+                    # purely a preview — the local submit gate below is
+                    # still the only thing that returns a result. Throttled
+                    # to strict floor improvements; failures never break
+                    # mining.
+                    if preview_cb is not None and stored_replaced:
+                        previewed_floor_milli = self._maybe_emit_preview(
+                            preview_cb, top_k, previewed_floor_milli,
+                            dispatch_id_for_log,
+                        )
+
                     self.timing_stats['postprocessing'].append(
                         (time.time() - postprocess_start) * 1e6,
                     )
@@ -958,14 +1040,15 @@ class BaseMiner(ABC):
                             "cancel; discarding (stop_event set)"
                         )
                         return None
-                    nonce_disp = (
-                        f"0x{nonce.hex()[:16]}..."
-                        if isinstance(nonce, (bytes, bytearray))
-                        else str(nonce)
-                    )
+                    # Use result.nonce / result.salt — the submitted
+                    # candidate — not the loop-local nonce/salt, which may
+                    # belong to a different iteration when the submit gate
+                    # returns a stashed top-k entry.
+                    result_nonce_disp = f"0x{result.nonce.hex()[:16]}..."
                     self.logger.info(
                         f"[work-item {_work_tag(context)}] mined! "
-                        f"nonce={nonce_disp} salt=0x{salt.hex()[:8]}... "
+                        f"nonce={result_nonce_disp} "
+                        f"salt=0x{result.salt.hex()[:8]}... "
                         f"energy={result.energy:.2f} "
                         f"solutions={result.num_valid} "
                         f"diversity={result.diversity:.3f} "
@@ -1019,6 +1102,72 @@ class BaseMiner(ABC):
             if attempt_logger is not None:
                 attempt_logger.flush()
             self._post_mine_cleanup()
+
+    # ------------------------------------------------------------------
+    # Anticipatory-submission preview (substrate / PoW ratchet path)
+    # ------------------------------------------------------------------
+
+    def _maybe_emit_preview(
+        self,
+        preview_cb: Any,
+        top_k: List[MiningResult],
+        previewed_floor_milli: int,
+        dispatch_id: int,
+    ) -> int:
+        """Emit a best-candidate preview if the best-by-floor improved.
+
+        Walks ``top_k`` for the candidate with the lowest
+        ``submit_floor_energy`` (the chain-equivalent floor the controller
+        must gate on). If that floor is a strict improvement over
+        ``previewed_floor_milli``, builds a lightweight picklable payload
+        and hands it to ``preview_cb``.
+
+        Returns the (possibly updated) ``previewed_floor_milli`` so the
+        caller can persist the throttle state. A failing callback or
+        payload build never propagates — mining must not break on a
+        preview hiccup.
+        """
+        if not top_k:
+            return previewed_floor_milli
+        # Best-by-floor across the stash (not best-by-energy): the chain
+        # gates strictly on the floor, so that's what determines whether a
+        # candidate could be submitted as decay eases.
+        best = min(
+            top_k,
+            key=lambda r: (
+                r.submit_floor_energy
+                if r.submit_floor_energy is not None
+                else r.energy
+            ),
+        )
+        best_floor = (
+            best.submit_floor_energy
+            if best.submit_floor_energy is not None
+            else best.energy
+        )
+        best_floor_milli = int(best_floor * 1000)
+        if best_floor_milli >= previewed_floor_milli:
+            # No strict improvement over what we already previewed.
+            return previewed_floor_milli
+        try:
+            payload = {
+                "dispatch_id": dispatch_id,
+                "miner_type": self.miner_type,
+                "nonce": best.nonce,
+                "salt": best.salt,
+                "solutions": best.solutions,
+                "submit_floor_energy": best_floor,
+                "energy": best.energy,
+                "num_valid": best.num_valid,
+                "diversity": best.diversity,
+            }
+            preview_cb(payload)
+        except Exception as exc:  # noqa: BLE001 — preview is best-effort
+            self.logger.debug("preview_cb failed (ignored): %s", exc)
+            # Don't advance the throttle on failure so a later identical
+            # improvement still gets a chance to emit.
+            return previewed_floor_milli
+        return best_floor_milli
 
     # ------------------------------------------------------------------
     # Out-of-band result pump

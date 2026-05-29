@@ -298,6 +298,50 @@ def test_solution_store_writes_packed_spins(tmp_path: Path) -> None:
     assert len(rec["top_5_solutions_hex"]) == 5
 
 
+def test_submission_logger_record_writes_pow_sequence(tmp_path: Path) -> None:
+    """``pow_sequence`` (miner's cumulative proofs_submitted from chain) must
+    be written into submission.json when provided, and must default to None so
+    existing records without the field stay schema-compatible."""
+    log = SubmissionLogger(log_dir=tmp_path)
+
+    # With pow_sequence set.
+    sid = log.assign_id()
+    log.record(
+        solution_id=sid,
+        miner_id="rig-q",
+        dispatch_id=200,
+        energy_milli=-4_200_000,
+        diversity_milli=210,
+        threshold_milli=-4_000_000,
+        last_proof_block_hash_hex="0x" + "aa" * 32,
+        outcome="rejected_stale",
+        pow_sequence=42,
+    )
+    sub_path = tmp_path / "200" / "submission.json"
+    rec = json.loads(sub_path.read_text())
+    assert rec["pow_sequence"] == 42, (
+        "pow_sequence must be written into submission.json for not-won outcomes "
+        "so the dashboard can display the miner's cumulative proofs_submitted"
+    )
+
+    # Default: pow_sequence omitted → None in record.
+    sid2 = log.assign_id()
+    log.record(
+        solution_id=sid2,
+        miner_id="rig-q",
+        dispatch_id=201,
+        energy_milli=-4_200_000,
+        diversity_milli=210,
+        threshold_milli=-4_000_000,
+        last_proof_block_hash_hex="0x" + "bb" * 32,
+        outcome="rejected_stale",
+    )
+    sub_path2 = tmp_path / "201" / "submission.json"
+    rec2 = json.loads(sub_path2.read_text())
+    assert "pow_sequence" in rec2, "pow_sequence key must always be present"
+    assert rec2["pow_sequence"] is None, "pow_sequence must default to None"
+
+
 def test_query_stored_solutions_returns_sorted_by_iter(tmp_path: Path) -> None:
     """query_stored_solutions returns all matching files sorted by iter
     (the leading 06d in the filename guarantees fs-sort order)."""
@@ -353,6 +397,51 @@ def test_attempt_logger_miner_type_defaults_to_empty(tmp_path: Path) -> None:
     files = sorted(tmp_path.glob("1/attempts-miner-legacy.jsonl"))
     record = json.loads(files[0].read_text().splitlines()[0])
     assert record["miner_type"] == ""
+
+
+def test_submission_logger_record_writes_num_valid(tmp_path: Path) -> None:
+    """num_valid from MiningResult must land in submission.json so the
+    dashboard 'Solutions' column has a stable value per submission."""
+    log = SubmissionLogger(log_dir=tmp_path)
+    sid = log.assign_id()
+    log.record(
+        solution_id=sid,
+        miner_id="rig-QPU-1",
+        dispatch_id=55,
+        energy_milli=-14_000_000,
+        diversity_milli=400,
+        threshold_milli=-13_500_000,
+        last_proof_block_hash_hex="0xabc",
+        outcome="submitted_inblock",
+        num_valid=7,
+    )
+    sub_path = tmp_path / "55" / "submission.json"
+    record = json.loads(sub_path.read_text())
+    assert record["num_valid"] == 7, (
+        "num_valid must be written to submission.json so dashboard "
+        "'Solutions' column is populated"
+    )
+
+
+def test_submission_logger_record_num_valid_defaults_to_none(tmp_path: Path) -> None:
+    """Omitting num_valid must produce null in submission.json — old
+    submission records stay readable without a schema migration."""
+    log = SubmissionLogger(log_dir=tmp_path)
+    sid = log.assign_id()
+    log.record(
+        solution_id=sid,
+        miner_id="rig-CPU-1",
+        dispatch_id=56,
+        energy_milli=-5_000_000,
+        diversity_milli=200,
+        threshold_milli=-4_900_000,
+        last_proof_block_hash_hex="0xdef",
+        outcome="submitted_inblock",
+    )
+    sub_path = tmp_path / "56" / "submission.json"
+    record = json.loads(sub_path.read_text())
+    assert "num_valid" in record, "num_valid key must always be present"
+    assert record["num_valid"] is None
 
 
 def test_submission_logger_writes_miner_type_per_call(tmp_path: Path) -> None:

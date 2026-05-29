@@ -210,6 +210,91 @@ def current_difficulty(
     return apply_decay(base_difficulty, steps, curve)
 
 
+def block_when_energy_clears(
+    floor_energy_milli: int,
+    current_block: int,
+    *,
+    base_difficulty: SubstrateDifficulty,
+    last_proof_block: int,
+    epoch_length: int,
+    curve: Optional[EnergyCurve],
+    search_limit: int,
+) -> Optional[int]:
+    """First block ``B >= current_block`` whose live floor clears a candidate.
+
+    Returns the first block number at which
+    ``current_difficulty(B, ...).max_energy_milli > floor_energy_milli`` —
+    i.e. the first block at which a candidate whose chain-recomputed floor
+    energy is ``floor_energy_milli`` would pass the chain's strict
+    ``best_energy_milli < max_energy_milli`` gate.
+
+    The threshold is monotonic in block number (decay only eases
+    ``max_energy_milli`` upward, and only at multiples of ``epoch_length``
+    blocks since ``last_proof_block``), so we evaluate it once per
+    decay-step boundary and return the first boundary block that clears.
+
+    Args:
+        floor_energy_milli: The candidate's chain-equivalent floor energy
+            (milli). This is the value the chain gates with strict ``<``.
+        current_block: Start searching at/after this block.
+        base_difficulty: The on-chain ``Difficulty`` storage value (the
+            decay baseline; only changes when a proof wins).
+        last_proof_block: Block of the last winning proof. ``0`` is the
+            genesis sentinel (no decay applies).
+        epoch_length: Blocks per decay step. ``0`` disables decay.
+        curve: Topology energy curve. ``None`` disables decay.
+        search_limit: Maximum number of blocks to look ahead from
+            ``current_block`` (inclusive). Return ``None`` if no clearing
+            block is found within ``[current_block, current_block +
+            search_limit]``.
+
+    Returns:
+        The first block number ``B`` at which the floor clears, or
+        ``None`` if it never clears within the search window.
+    """
+    if search_limit < 0:
+        return None
+
+    last_block = current_block + search_limit
+
+    # Already clearing at the start block? (Also the only branch that can
+    # fire when decay is disabled — current_difficulty returns the base
+    # value at every block, so either current_block clears or nothing in
+    # the window will.)
+    if current_difficulty(
+        current_block, base_difficulty, last_proof_block, epoch_length, curve,
+    ).max_energy_milli > floor_energy_milli:
+        return current_block
+
+    if (
+        last_proof_block == 0
+        or epoch_length == 0
+        or curve is None
+    ):
+        # Decay disabled: the threshold is constant, and current_block
+        # didn't clear, so no block in the window will.
+        return None
+
+    # The threshold only changes at decay-step boundaries:
+    # ``last_proof_block + k * epoch_length`` for integer k. Walk the
+    # boundaries strictly after current_block (the start was checked
+    # above) up to last_block; the first boundary that clears is the
+    # answer (monotonic easing guarantees it stays cleared after).
+    elapsed = current_block - last_proof_block
+    # First boundary strictly greater than current_block. ``elapsed`` may
+    # be negative if current_block precedes last_proof_block; floor-div
+    # handles that and the +1 lands on the next boundary.
+    next_step = (elapsed // epoch_length) + 1
+    boundary = last_proof_block + next_step * epoch_length
+    while boundary <= last_block:
+        if boundary >= current_block and current_difficulty(
+            boundary, base_difficulty, last_proof_block, epoch_length, curve,
+        ).max_energy_milli > floor_energy_milli:
+            return boundary
+        boundary += epoch_length
+    return None
+
+
 # ----------------------------------------------------------------------
 # Internal helpers
 # ----------------------------------------------------------------------
@@ -272,4 +357,5 @@ __all__ = [
     "adjust_energy_along_curve",
     "apply_decay",
     "current_difficulty",
+    "block_when_energy_clears",
 ]

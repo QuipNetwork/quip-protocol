@@ -19,6 +19,24 @@ signer_key = "~/.quip-miner/signing.json"
 # rest_port = 8086
 # rest_host = "127.0.0.1"
 
+# ── Proof submission ──────────────────────────────────────────────────
+# Tuning for the submit_proof extrinsic. The chain awards the round to the
+# lowest-energy proof *within a block*, so the race is about landing in the
+# right block, not broadcasting first.
+[submission]
+# Transaction tip in plancks (the chain's base unit). A non-zero tip raises
+# the extrinsic's transaction-pool priority so a busy block includes our
+# proof ahead of un-tipped traffic. Default 0 = no tip (unchanged wire
+# bytes). Set a small tip only if you observe proofs missing inclusion.
+tip_plancks      = 0
+# Resilient submit retry (used by the anticipatory fire loop). max_retries
+# is the number of *additional* attempts after the first; retry_backoff_ms
+# is the per-attempt linear backoff. Transient drops, InsufficientEnergy
+# (fired a hair early), and ProofLimitReached (block full) are retried; a
+# round advancing (InvalidNonce) or a bad candidate stops the loop.
+max_retries      = 3
+retry_backoff_ms = 250
+
 # ── D-Wave annealer ───────────────────────────────────────────────────
 # QPU access-time budget (per UTC day) is the main knob. The sampler's
 # active solver and region come from environment variables —
