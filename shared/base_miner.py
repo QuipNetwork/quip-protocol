@@ -47,6 +47,10 @@ log = logging.getLogger(__name__)
 # observability (one line per minute on the typical CPU/GPU cadence).
 PROGRESS_LOG_INTERVAL = 10
 
+# Sentinel for "no preview emitted yet" in the preview-throttle state.
+# Kept as a plain int so the strict-improvement comparison stays integer.
+_MILLI_INF = 1 << 62
+
 
 @dataclass(frozen=True)
 class _PumpedResult:
@@ -462,6 +466,7 @@ class BaseMiner(ABC):
         self,
         context: WorkContext,
         stop_event: multiprocessing.synchronize.Event,
+        preview_cb: Optional[Any] = None,
         **kwargs,
     ) -> Optional[MiningResult]:
         """Protocol-neutral mining loop.
@@ -496,6 +501,14 @@ class BaseMiner(ABC):
                 ``MempoolJobContext`` (mempool job).
             stop_event: Worker cancellation event. The controller sets
                 this on new-head, deregistration, job-expiry, or shutdown.
+            preview_cb: Optional callable invoked (substrate/PoW path only)
+                whenever the best-by-floor stashed candidate improves —
+                i.e. a strictly lower ``submit_floor_energy`` enters/leads
+                ``top_k``. Receives a lightweight, picklable payload dict
+                (see the call site) carrying enough for the controller to
+                encode+submit the candidate later. Default ``None`` = no-op
+                so existing callers are unaffected. A failing callback never
+                breaks mining (wrapped in try/except, logged at debug).
             **kwargs: Forwarded to ``_pre_mine_setup``.
 
         Returns:
@@ -580,6 +593,11 @@ class BaseMiner(ABC):
         # best candidate; ``top_k[-1]`` is the eviction target.
         top_k: List[MiningResult] = []
         top_k_cap: int = self.TOP_K_STORE
+        # Anticipatory-submission preview throttle. Tracks the best
+        # (lowest) ``submit_floor_energy`` we've previewed to the
+        # controller so far; we only emit a fresh preview on a strict
+        # improvement. ``inf`` = nothing previewed yet.
+        previewed_floor_milli: int = _MILLI_INF
         # Lazily build the per-worker attempt log. Mempool jobs share
         # the same writer for cross-mode forensics; the ``result_kind``
         # field on each row distinguishes the two paths.
@@ -862,6 +880,21 @@ class BaseMiner(ABC):
                                 top_k.sort(key=lambda r: r.energy)
                                 stored_replaced = True
 
+                    # Anticipatory-submission preview. When the stash gains
+                    # a candidate whose best-by-floor improves on anything
+                    # we've previewed, hand the controller a lightweight,
+                    # picklable snapshot so Task 6b can predict the
+                    # decay-block at which it clears and pre-submit. This is
+                    # purely a preview — the local submit gate below is
+                    # still the only thing that returns a result. Throttled
+                    # to strict floor improvements; failures never break
+                    # mining.
+                    if preview_cb is not None and stored_replaced:
+                        previewed_floor_milli = self._maybe_emit_preview(
+                            preview_cb, top_k, previewed_floor_milli,
+                            dispatch_id_for_log,
+                        )
+
                     self.timing_stats['postprocessing'].append(
                         (time.time() - postprocess_start) * 1e6,
                     )
@@ -1069,6 +1102,71 @@ class BaseMiner(ABC):
             if attempt_logger is not None:
                 attempt_logger.flush()
             self._post_mine_cleanup()
+
+    # ------------------------------------------------------------------
+    # Anticipatory-submission preview (substrate / PoW ratchet path)
+    # ------------------------------------------------------------------
+
+    def _maybe_emit_preview(
+        self,
+        preview_cb: Any,
+        top_k: List[MiningResult],
+        previewed_floor_milli: int,
+        dispatch_id: int,
+    ) -> int:
+        """Emit a best-candidate preview if the best-by-floor improved.
+
+        Walks ``top_k`` for the candidate with the lowest
+        ``submit_floor_energy`` (the chain-equivalent floor the controller
+        must gate on). If that floor is a strict improvement over
+        ``previewed_floor_milli``, builds a lightweight picklable payload
+        and hands it to ``preview_cb``.
+
+        Returns the (possibly updated) ``previewed_floor_milli`` so the
+        caller can persist the throttle state. A failing callback or
+        payload build never propagates — mining must not break on a
+        preview hiccup.
+        """
+        if not top_k:
+            return previewed_floor_milli
+        # Best-by-floor across the stash (not best-by-energy): the chain
+        # gates strictly on the floor, so that's what determines whether a
+        # candidate could be submitted as decay eases.
+        best = min(
+            top_k,
+            key=lambda r: (
+                r.submit_floor_energy
+                if r.submit_floor_energy is not None
+                else r.energy
+            ),
+        )
+        best_floor = (
+            best.submit_floor_energy
+            if best.submit_floor_energy is not None
+            else best.energy
+        )
+        best_floor_milli = int(best_floor * 1000)
+        if best_floor_milli >= previewed_floor_milli:
+            # No strict improvement over what we already previewed.
+            return previewed_floor_milli
+        try:
+            payload = {
+                "dispatch_id": dispatch_id,
+                "nonce": best.nonce,
+                "salt": best.salt,
+                "solutions": best.solutions,
+                "submit_floor_energy": best_floor,
+                "energy": best.energy,
+                "num_valid": best.num_valid,
+                "diversity": best.diversity,
+            }
+            preview_cb(payload)
+        except Exception as exc:  # noqa: BLE001 — preview is best-effort
+            self.logger.debug("preview_cb failed (ignored): %s", exc)
+            # Don't advance the throttle on failure so a later identical
+            # improvement still gets a chance to emit.
+            return previewed_floor_milli
+        return best_floor_milli
 
     # ------------------------------------------------------------------
     # Out-of-band result pump

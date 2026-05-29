@@ -1174,3 +1174,85 @@ async def test_handle_result_not_won_pow_sequence_none_on_rpc_failure(monkeypatc
         "pow_sequence must be None (not absent, not an exception) when the "
         "chain RPC is unavailable at submission time"
     )
+
+
+# ----------------------------------------------------------------------
+# Anticipatory-submission preview store (Task 6a)
+# ----------------------------------------------------------------------
+
+
+def _preview_msg(dispatch_id: int, *, floor: float, miner_id: str = "p0") -> dict:
+    """Build a worker `{"op": "preview"}` resp_q message."""
+    return {
+        "op": "preview",
+        "id": miner_id,
+        "dispatch_id": dispatch_id,
+        "data": {
+            "dispatch_id": dispatch_id,
+            "nonce": (7).to_bytes(32, "big"),
+            "salt": b"\x11" * 32,
+            "solutions": [[1, -1, 1, -1]],
+            "submit_floor_energy": floor,
+            "energy": floor,
+            "num_valid": 3,
+            "diversity": 0.5,
+        },
+    }
+
+
+def test_store_preview_lands_in_store_keyed_by_work_key():
+    """A `{"op":"preview"}` message must land in `_latest_preview` keyed by
+    the dispatched context's work key — and must NOT produce a result or
+    submission."""
+    from substrate.miner_controller import _work_key
+
+    controller = _bare_controller()
+    controller._latest_preview = {}
+    controller._result_queue = asyncio.Queue()
+    handle = _FakeHandle("p0")
+    ctx = _context(b"\xaa" * 32)
+    controller._dispatch_contexts[("p0", 1)] = ctx
+
+    controller._store_preview(handle, _preview_msg(1, floor=-2.0))
+
+    key = _work_key(ctx)
+    assert key in controller._latest_preview
+    entry = controller._latest_preview[key]
+    assert entry["submit_floor_energy"] == -2.0
+    assert entry["handle_id"] == "p0"
+    assert entry["context"] is ctx
+    # No result/submission side effects.
+    assert controller._result_queue.empty()
+    assert controller.stats.proofs_submitted == 0
+
+
+def test_store_preview_keeps_lowest_floor_for_work_key():
+    """When multiple previews arrive for the same work key, the store keeps
+    the lowest (best) submit_floor_energy; a worse floor is ignored."""
+    from substrate.miner_controller import _work_key
+
+    controller = _bare_controller()
+    controller._latest_preview = {}
+    handle = _FakeHandle("p0")
+    ctx = _context(b"\xaa" * 32)
+    controller._dispatch_contexts[("p0", 1)] = ctx
+    key = _work_key(ctx)
+
+    controller._store_preview(handle, _preview_msg(1, floor=-2.0))
+    # Worse floor (less negative) → ignored.
+    controller._store_preview(handle, _preview_msg(1, floor=-1.0))
+    assert controller._latest_preview[key]["submit_floor_energy"] == -2.0
+    # Better floor (more negative) → replaces.
+    controller._store_preview(handle, _preview_msg(1, floor=-3.5))
+    assert controller._latest_preview[key]["submit_floor_energy"] == -3.5
+
+
+def test_store_preview_dropped_when_no_dispatch_context():
+    """A preview for an unknown dispatch_id is dropped (no context to key
+    against) — must not raise or populate the store."""
+    controller = _bare_controller()
+    controller._latest_preview = {}
+    handle = _FakeHandle("p0")
+    # No _dispatch_contexts entry for dispatch_id=99.
+    controller._store_preview(handle, _preview_msg(99, floor=-2.0))
+    assert controller._latest_preview == {}

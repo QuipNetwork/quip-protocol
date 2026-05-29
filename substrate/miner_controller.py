@@ -523,6 +523,14 @@ class SubstrateMinerController:
         # next monotonic solution_id; record() writes the outcome.
         self._submission_log = SubmissionLogger()
         self._result_queue: asyncio.Queue[_ResultEnvelope] = asyncio.Queue()
+        # Anticipatory-submission preview store (Task 6a primitive).
+        # Latest best-by-floor candidate previewed by a worker, keyed by
+        # WorkKey (last_proof_block_hash, topology_hash). The drainer
+        # routes ``{"op": "preview"}`` messages here WITHOUT creating a
+        # _ResultEnvelope or submitting; Task 6b reads this to predict the
+        # decay-block at which the candidate clears and pre-submit. Keeps
+        # the lowest ``submit_floor_energy`` seen for each work key.
+        self._latest_preview: dict[WorkKey, dict] = {}
         # Per-handle done-sentinel queue. The worker emits
         # `{"op": "work_item_done"}` when its mining loop exits with no
         # result; the drainer pushes that into the handle's queue and
@@ -1527,6 +1535,54 @@ class SubstrateMinerController:
         for key in stale:
             self._dispatch_contexts.pop(key, None)
 
+    def _store_preview(self, handle: MinerHandle, msg: dict) -> None:
+        """Stash a worker best-candidate preview keyed by work key.
+
+        Resolves the preview's ``dispatch_id`` to the immutable context it
+        was dispatched against (so previews from a stale dispatch land
+        under the right work key), then keeps the lowest-floor preview per
+        work key. Pure storage — no submission, no _ResultEnvelope. Task 6b
+        reads ``self._latest_preview`` to drive prediction/firing.
+        """
+        dispatch_id = msg.get("dispatch_id")
+        data = msg.get("data")
+        if not isinstance(data, dict):
+            logger.warning(
+                "preview from %s ignored: malformed data (type=%s)",
+                handle.miner_id,
+                type(data).__name__,
+            )
+            return
+        context = self._dispatch_contexts.get((handle.miner_id, dispatch_id))
+        if context is None:
+            logger.debug(
+                "preview from %s dropped: no context for dispatch_id=%s",
+                handle.miner_id,
+                dispatch_id,
+            )
+            return
+        key = _work_key(context)
+        entry = {
+            "handle_id": handle.miner_id,
+            "dispatch_id": dispatch_id,
+            "context": context,
+            **data,
+        }
+        prev = self._latest_preview.get(key)
+        # Keep the lowest (best) submit_floor_energy seen for this work
+        # key. Workers already throttle to strict improvements, but two
+        # handles can preview the same key; this picks the better one.
+        if prev is not None:
+            prev_floor = prev.get("submit_floor_energy")
+            new_floor = entry.get("submit_floor_energy")
+            if (
+                prev_floor is not None
+                and new_floor is not None
+                and new_floor >= prev_floor
+            ):
+                return
+        self._latest_preview[key] = entry
+
     # ------------------------------------------------------------------
     # Background tasks
     # ------------------------------------------------------------------
@@ -1645,6 +1701,13 @@ class SubstrateMinerController:
                 if handle._active_dispatch_id == err_dispatch_id:
                     handle._active_dispatch_id = 0
                 self._done_queues[handle.miner_id].put_nowait(err_dispatch_id)
+            elif isinstance(msg, dict) and msg.get("op") == "preview":
+                # Anticipatory-submission preview (Task 6a). Stash the
+                # worker's latest best-by-floor candidate keyed by the
+                # work key it was dispatched against. Do NOT build a
+                # _ResultEnvelope and do NOT submit — that's Task 6b's
+                # job; this drainer only delivers the primitive.
+                self._store_preview(handle, msg)
             elif isinstance(msg, dict) and msg.get("op") == "stats":
                 # Stats responses are pulled directly by callers of
                 # handle.get_stats(); if one lands here it just means

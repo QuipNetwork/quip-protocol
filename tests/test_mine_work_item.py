@@ -711,6 +711,122 @@ def test_miner_handle_error_sentinel_on_missing_context():
 
 
 # ----------------------------------------------------------------------
+# Anticipatory-submission preview channel (Task 6a)
+# ----------------------------------------------------------------------
+
+
+def test_mine_work_item_emits_preview_on_floor_improvement(
+    cpu_miner, relaxed_context, monkeypatch,
+):
+    """A ``preview_cb`` must fire when a strictly-better-floor candidate is
+    stashed, with a payload carrying the fields the controller needs to
+    encode+submit later. It must NOT fire again without a strict floor
+    improvement (throttle).
+
+    Drives ``mine_work_item`` with a stubbed ``evaluate_sampleset`` that
+    returns successively-improving then non-improving floors so the
+    throttle behaviour is deterministic:
+      - iter 1: floor -1.0 → first stash → preview fires.
+      - iter 2: floor -2.0 (better) → preview fires again.
+      - iter 3: floor -1.5 (worse than best -2.0) → still stored in the
+        bounded heap but best-by-floor unchanged → preview does NOT fire.
+    Stops after iter 3.
+    """
+    previews: list = []
+
+    def capture(payload):
+        previews.append(payload)
+
+    floors = [-1.0, -2.0, -1.5]
+    energies = [-1.0, -2.0, -1.5]
+    iter_idx = [0]
+
+    def fake_evaluate(sampleset, requirements, nodes, edges,
+                      nonce, salt, prev_timestamp, start_time,
+                      strict_energy=True, live_threshold_energy=None):
+        i = iter_idx[0]
+        iter_idx[0] += 1
+        if i >= len(floors):
+            stop.set()
+            return None
+        n = len(nodes)
+        return MiningResult(
+            miner_id="test",
+            miner_type="CPU",
+            nonce=(i + 1).to_bytes(32, "big"),
+            salt=bytes([i + 1]) * 32,
+            timestamp=0,
+            prev_timestamp=0,
+            solutions=[[-1] * n],
+            energy=energies[i],
+            diversity=1.0,
+            num_valid=3,
+            mining_time=0,
+            node_list=list(nodes),
+            edge_list=list(edges),
+            submit_floor_energy=floors[i],
+        )
+
+    # Live threshold strict enough that the submit gate never passes for
+    # any of our fake floors (-1.0/-2.0/-1.5 → milli -1000/-2000/-1500):
+    # submit needs floor_milli < live, and -2000 < -3000 is False. This
+    # keeps the loop running through all three iters so we can observe the
+    # throttle. The precheck ``near_live`` gate must NOT short-circuit the
+    # lenient evaluate, so we widen the precheck margin to admit every iter
+    # regardless of the real sampler's energy.
+    live_var = mp.Value("q", -3000)
+    monkeypatch.setattr(cpu_miner, "RATCHET_PRECHECK_MARGIN_MILLI", 10**18)
+    stop = mp.Event()
+    cpu_miner._live_max_energy_milli = live_var
+    monkeypatch.setattr(cpu_miner, "evaluate_sampleset", fake_evaluate)
+    try:
+        cpu_miner.mine_work_item(relaxed_context, stop, preview_cb=capture)
+    finally:
+        del cpu_miner._live_max_energy_milli
+
+    assert len(previews) == 2, (
+        f"expected exactly 2 previews (iter1 -1.0, iter2 -2.0; iter3 -1.5 "
+        f"is no improvement), got {len(previews)}: "
+        f"{[p['submit_floor_energy'] for p in previews]}"
+    )
+    # First preview: the iter-1 candidate (floor -1.0).
+    p0 = previews[0]
+    for field in (
+        "dispatch_id", "nonce", "salt", "solutions",
+        "submit_floor_energy", "energy", "num_valid", "diversity",
+    ):
+        assert field in p0, f"preview payload missing required field {field!r}"
+    assert p0["submit_floor_energy"] == -1.0
+    assert p0["nonce"] == (1).to_bytes(32, "big")
+    # Second preview: the improved iter-2 candidate (floor -2.0).
+    assert previews[1]["submit_floor_energy"] == -2.0
+    assert previews[1]["nonce"] == (2).to_bytes(32, "big")
+
+
+def test_mine_work_item_preview_cb_default_none_is_noop(
+    cpu_miner, relaxed_context,
+):
+    """Backward-compat: callers passing no ``preview_cb`` (the default)
+    mine exactly as before — no error, a normal result comes back."""
+    stop = mp.Event()
+    result = cpu_miner.mine_work_item(relaxed_context, stop)
+    assert isinstance(result, MiningResult)
+
+
+def test_mine_work_item_preview_cb_failure_does_not_break_mining(
+    cpu_miner, relaxed_context,
+):
+    """A throwing ``preview_cb`` must never break the mining loop — the
+    dispatch still completes and returns a valid result."""
+    def boom(_payload):
+        raise RuntimeError("preview channel exploded")
+
+    stop = mp.Event()
+    result = cpu_miner.mine_work_item(relaxed_context, stop, preview_cb=boom)
+    assert isinstance(result, MiningResult)
+
+
+# ----------------------------------------------------------------------
 # submit_floor_energy parity — chain rejects on the WORST selected
 # solution, not the best. evaluate_sampleset must surface the worst-case
 # so the substrate submit gate doesn't ship a proof the chain will reject.
