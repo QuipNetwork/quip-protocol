@@ -380,3 +380,62 @@ def test_submission_logger_writes_miner_type_per_call(tmp_path: Path) -> None:
     record = json.loads(sub_path.read_text())
     assert record["miner_type"] == "QPU"
     assert record["miner_id"] == "rig-QPU-DWAVE-1"
+
+
+# ----------------------------------------------------------------------
+# MetadataLogger batched-write tests
+# ----------------------------------------------------------------------
+
+
+def test_metadata_logger_flushes_periodically_not_every_attempt(tmp_path):
+    """MetadataLogger must not rewrite the JSON on every rejected attempt;
+    it batches writes and exposes a final flush()."""
+    from shared.mining_attempt_log import MetadataLogger
+
+    ml = MetadataLogger("m", 0, log_dir=tmp_path, miner_type="QPU")
+    ml.FLUSH_EVERY = 5
+    path = tmp_path / "0" / "metadata-m.json"
+
+    for _ in range(4):
+        ml.update_from_attempt(
+            best_energy_milli=-100, result_kind="rejected",
+            qpu_access_time_us=10, mining_time_us=20,
+        )
+    assert not path.exists(), "metadata written before flush threshold"
+
+    ml.update_from_attempt(
+        best_energy_milli=-100, result_kind="rejected",
+        qpu_access_time_us=10, mining_time_us=20,
+    )
+    assert path.exists()
+    import json as _json
+    assert _json.loads(path.read_text())["n_attempts"] == 5
+
+
+def test_metadata_logger_flushes_immediately_on_stored(tmp_path):
+    from shared.mining_attempt_log import MetadataLogger
+    ml = MetadataLogger("m", 0, log_dir=tmp_path, miner_type="QPU")
+    ml.FLUSH_EVERY = 100
+    path = tmp_path / "0" / "metadata-m.json"
+    ml.update_from_attempt(
+        best_energy_milli=-100, result_kind="stored",
+        qpu_access_time_us=10, mining_time_us=20,
+    )
+    assert path.exists(), "stored events must flush immediately"
+
+
+def test_metadata_logger_final_flush_writes_pending(tmp_path):
+    from shared.mining_attempt_log import MetadataLogger
+    ml = MetadataLogger("m", 0, log_dir=tmp_path, miner_type="QPU")
+    ml.FLUSH_EVERY = 100
+    path = tmp_path / "0" / "metadata-m.json"
+    for _ in range(3):
+        ml.update_from_attempt(
+            best_energy_milli=-100, result_kind="rejected",
+            qpu_access_time_us=10, mining_time_us=20,
+        )
+    assert not path.exists()
+    ml.flush()
+    assert path.exists()
+    import json as _json
+    assert _json.loads(path.read_text())["n_attempts"] == 3

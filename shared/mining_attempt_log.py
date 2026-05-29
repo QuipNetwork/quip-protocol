@@ -290,6 +290,17 @@ class AttemptLogger:
                 "AttemptLogger.metadata update failed: %s", exc,
             )
 
+    def flush(self) -> None:
+        """Flush all per-dispatch metadata loggers owned by this worker."""
+        for ml in self._metadata_by_dispatch.values():
+            try:
+                ml.flush()
+            except OSError as exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "AttemptLogger.flush: %s", exc,
+                )
+
 
 # ----------------------------------------------------------------------
 # MetadataLogger — per-dispatch per-miner aggregate (rewritten on update)
@@ -304,6 +315,12 @@ class MetadataLogger:
     rewrite is via tmp-file + os.replace so concurrent readers never
     see a partial file.
     """
+
+    # Flush the aggregate JSON to disk at most once per this many attempts
+    # (plus immediately on stored/submitted/error events and on final
+    # flush()). Rewriting on every rejected attempt was the per-iter floor
+    # on slow mounted volumes.
+    FLUSH_EVERY: int = 25
 
     def __init__(
         self,
@@ -326,6 +343,7 @@ class MetadataLogger:
         # In-memory snapshot of the aggregate. Loaded lazily from disk
         # so restarts pick up where we left off within a dispatch.
         self._state: Optional[dict] = None
+        self._pending_since_flush = 0
 
     def _initial_state(self) -> dict:
         return {
@@ -396,7 +414,22 @@ class MetadataLogger:
             if state.get("first_ts_ns") is None:
                 state["first_ts_ns"] = now
             state["last_ts_ns"] = now
-            self._write_atomic(state)
+            self._pending_since_flush += 1
+            force = result_kind in ("stored", "submitted", "error")
+            if force or self._pending_since_flush >= self.FLUSH_EVERY:
+                self._write_atomic(state)
+                self._pending_since_flush = 0
+
+    def flush(self) -> None:
+        """Write any buffered aggregate state to disk.
+
+        Called at dispatch end so the final counts land even when the last
+        batch hadn't reached FLUSH_EVERY. Idempotent; cheap when clean.
+        """
+        with self._lock:
+            if self._state is not None and self._pending_since_flush:
+                self._write_atomic(self._state)
+                self._pending_since_flush = 0
 
     def attach_submission(self, submission: dict) -> None:
         """Record that this dispatch was submitted (called by controller)."""

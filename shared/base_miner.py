@@ -1014,6 +1014,10 @@ class BaseMiner(ABC):
                     self._feeder.stop()
                 finally:
                     self._feeder = None
+            # Persist any buffered aggregate metadata for this dispatch.
+            attempt_logger = getattr(self, "_attempt_logger", None)
+            if attempt_logger is not None:
+                attempt_logger.flush()
             self._post_mine_cleanup()
 
     # ------------------------------------------------------------------
