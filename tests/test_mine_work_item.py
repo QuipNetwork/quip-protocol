@@ -1082,3 +1082,87 @@ def test_attempt_log_qpu_access_time_us_is_none_for_non_qpu_backends(
     rec = captured[0]
     assert "qpu_access_time_us" in rec
     assert rec["qpu_access_time_us"] is None
+
+
+def test_stored_solution_iter_matches_attempt_iter(
+    cpu_miner, relaxed_context, tmp_path,
+):
+    """The ``iter`` field in stored-solution files must equal the ``iter``
+    field in the attempt-log row for the same iteration.
+
+    Before the fix, attempt-log rows used ``progress + 1`` (1-based) while
+    ``SolutionStore.record`` received ``progress`` (0-based), so the two
+    records for the SAME iteration carried different ``iter`` values and
+    cross-referencing via ``query_by_dispatch`` / ``query_stored_solutions``
+    was broken.
+
+    Drives ``mine_work_item`` through one substrate-ratchet iteration that
+    produces a stored or submitted candidate, then reads back both artefacts
+    and asserts their ``iter`` values are equal.
+    """
+    from shared.mining_attempt_log import (
+        AttemptLogger,
+        SolutionStore,
+        query_by_dispatch,
+        query_stored_solutions,
+    )
+
+    DISPATCH_ID = 9900
+
+    real_logger = AttemptLogger(
+        cpu_miner.miner_id, log_dir=tmp_path, miner_type=cpu_miner.miner_type,
+    )
+    real_store = SolutionStore(cpu_miner.miner_id, log_dir=tmp_path)
+
+    # Stop after the first stored/submitted record so we don't run forever.
+    stop = mp.Event()
+    original_record = real_logger.record
+
+    def _record_and_maybe_stop(**kw):
+        original_record(**kw)
+        if kw.get("result_kind") in ("stored", "submitted"):
+            stop.set()
+
+    real_logger.record = _record_and_maybe_stop  # type: ignore[method-assign]
+
+    live_var = mp.Value('q', 0)
+    cpu_miner._attempt_logger = real_logger
+    cpu_miner._solution_store = real_store
+    cpu_miner._current_dispatch_id = DISPATCH_ID
+    cpu_miner._live_max_energy_milli = live_var
+    try:
+        cpu_miner.mine_work_item(relaxed_context, stop)
+    finally:
+        del cpu_miner._attempt_logger
+        del cpu_miner._solution_store
+        del cpu_miner._current_dispatch_id
+        del cpu_miner._live_max_energy_milli
+
+    # Read back attempt rows and find the stored/submitted one.
+    attempt_rows = query_by_dispatch(
+        cpu_miner.miner_id, DISPATCH_ID, log_dir=tmp_path,
+    )
+    stored_rows = [
+        r for r in attempt_rows
+        if r.get("result_kind") in ("stored", "submitted")
+    ]
+    assert stored_rows, (
+        "expected at least one stored/submitted attempt row; "
+        f"got result_kinds={[r.get('result_kind') for r in attempt_rows]}"
+    )
+    attempt_iter = stored_rows[0]["iter"]
+
+    # Read back the stored solution record.
+    sol_records = query_stored_solutions(
+        DISPATCH_ID, log_dir=tmp_path, miner_id=cpu_miner.miner_id,
+    )
+    assert sol_records, (
+        "expected at least one stored-solution file; "
+        "SolutionStore.record was not called for a stored/submitted iter"
+    )
+    solution_iter = sol_records[0]["iter"]
+
+    assert attempt_iter == solution_iter, (
+        f"attempt-log iter ({attempt_iter}) != stored-solution iter "
+        f"({solution_iter}); cross-reference is broken"
+    )

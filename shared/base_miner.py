@@ -933,7 +933,7 @@ class BaseMiner(ABC):
                     )
                     solution_store.record(
                         dispatch_id=dispatch_id_for_log,
-                        iter_num=progress,
+                        iter_num=progress + 1,
                         nonce_hex=nonce_hex,
                         salt_hex=salt.hex(),
                         top_5_solutions_hex=[
