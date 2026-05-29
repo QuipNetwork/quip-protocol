@@ -14,17 +14,54 @@ Two regression surfaces motivate these tests:
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 
 from shared.mining_attempt_log import (
     AttemptLogger,
     SolutionStore,
     SubmissionLogger,
+    _default_log_dir,
     query_by_dispatch,
     query_by_solution_id,
     query_stored_solutions,
 )
+
+
+def test_default_log_dir_env_precedence(monkeypatch, tmp_path: Path) -> None:
+    """The attempts root must follow the Docker data volume.
+
+    Regression: the loggers defaulted to ~/.quip-miner/mining_attempts,
+    which inside the container is the ephemeral home — not the mounted
+    /data volume — so operators never saw mining attempts. The dir now
+    honors QUIP_MINING_ATTEMPTS_DIR, then $QUIP_RUNTIME_DIR/mining_attempts
+    (which the entrypoint points at /data/runtime), then the home default.
+    """
+    explicit = tmp_path / "explicit"
+    monkeypatch.setenv("QUIP_MINING_ATTEMPTS_DIR", str(explicit))
+    monkeypatch.setenv("QUIP_RUNTIME_DIR", str(tmp_path / "runtime"))
+    assert _default_log_dir() == explicit
+
+    # Explicit unset → fall back to the runtime (data-volume) dir.
+    monkeypatch.delenv("QUIP_MINING_ATTEMPTS_DIR")
+    assert _default_log_dir() == tmp_path / "runtime" / "mining_attempts"
+
+    # Neither set → home default (bare/local/dev runs).
+    monkeypatch.delenv("QUIP_RUNTIME_DIR")
+    assert _default_log_dir() == Path("~/.quip-miner/mining_attempts").expanduser()
+
+
+def test_default_log_dir_writes_under_runtime(monkeypatch, tmp_path: Path) -> None:
+    """End-to-end: an AttemptLogger using the resolved default lands the
+    JSONL under the runtime (data-volume) dir, not the home dir."""
+    monkeypatch.setenv("QUIP_RUNTIME_DIR", str(tmp_path))
+    logger = AttemptLogger("rig-1", log_dir=_default_log_dir())
+    logger.record(
+        dispatch_id=7, iter_num=1, nonce_hex="0xab", salt_hex="0xcd",
+        best_energy_milli=-14_000_000, num_samples=10, result_kind="rejected",
+        post_processed=False, stored_as_best=False,
+    )
+    written = tmp_path / "mining_attempts" / "7" / "attempts-rig-1.jsonl"
+    assert written.exists(), f"attempt not written under {written}"
 
 
 # ----------------------------------------------------------------------

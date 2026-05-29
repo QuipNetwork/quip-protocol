@@ -39,13 +39,41 @@ Query primitives:
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterable, Iterator, List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 
-DEFAULT_LOG_DIR: Path = Path("~/.quip-miner/mining_attempts").expanduser()
+def _default_log_dir() -> Path:
+    """Resolve the per-dispatch attempts archive root.
+
+    Precedence:
+      1. ``QUIP_MINING_ATTEMPTS_DIR`` — explicit override.
+      2. ``$QUIP_RUNTIME_DIR/mining_attempts`` — the Docker image exports
+         ``QUIP_RUNTIME_DIR=/data/runtime`` (the mounted volume), so
+         attempts persist there and are visible to operators / readable
+         by the telemetry aggregator instead of being written to the
+         container's ephemeral home.
+      3. ``~/.quip-miner/mining_attempts`` — bare/local/dev default.
+
+    Resolved once at import. Both the worker (``AttemptLogger`` /
+    ``SolutionStore``), the controller snapshot's ``attempts_dir``, and
+    the telemetry reader pivot on this value, so they stay consistent as
+    long as every process shares the same environment (they do: the
+    entrypoint exports ``QUIP_RUNTIME_DIR`` before spawning children).
+    """
+    explicit = os.environ.get("QUIP_MINING_ATTEMPTS_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    runtime = os.environ.get("QUIP_RUNTIME_DIR")
+    if runtime:
+        return Path(runtime).expanduser() / "mining_attempts"
+    return Path("~/.quip-miner/mining_attempts").expanduser()
+
+
+DEFAULT_LOG_DIR: Path = _default_log_dir()
 
 
 # ----------------------------------------------------------------------
