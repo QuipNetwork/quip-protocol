@@ -21,7 +21,9 @@ from tutte.graph import Graph
 from tutte.graphs.k_sum import (
     _combine_chord_iteration, _iterative_chord_rule, _sigma_orbit_chord_order,
 )
-from tutte.graphs.sigma_equivariant_dp import compute_tutte_per_orbit_mod
+# sigma_equivariant_dp is deprecated (correct but no speed advantage, never wired
+# into the engine). Moved to tutte/deprecated/; these per-orbit tests still run.
+from tutte.deprecated.sigma_equivariant_dp import compute_tutte_per_orbit_mod
 from tutte.synthesis.engine import SynthesisEngine
 
 

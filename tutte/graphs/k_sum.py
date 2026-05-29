@@ -274,7 +274,7 @@ def _rule_c_star_predict(
     # Note: a tempting "trivial-boundary short-circuit" — if boundary_nodes ==
     # target.nodes, the formula tautologically reduces to T(target) = T(B).
     # We intentionally do NOT short-circuit here: recursing through
-    # engine.synthesize(target) would re-enter _try_hierarchical and loop. The
+    # engine.synthesize(target) would re-enter the decomposition path and loop. The
     # full formula still computes T(target) correctly via the per-cell + B
     # synthesis (which itself benefits from family recognition / lookup /
     # treewidth_dp on B, which is the full target in this case).
@@ -571,11 +571,11 @@ def boundary_quotient_tutte(
     # σ-equivariant chord ordering: if target has a free automorphism σ
     # discoverable by `find_best_sigma`, reorder chords so σ-orbits are
     # processed contiguously — the engine's canonical_key cache will
-    # catch isomorphic intermediate contractions. Off by default
-    # (controlled by `engine.chord_sigma_order`, default False) to keep
-    # the existing path unchanged until validated on Z(1, 3) / Pm_2.
+    # catch isomorphic intermediate contractions. On by default
+    # (`engine.chord_sigma_order`, default True); Petersen measured a ~1.44×
+    # speedup with bit-for-bit identical results (see test_sigma.py).
     sigma_perm = None
-    if getattr(engine, "chord_sigma_order", False) and chords:
+    if getattr(engine, "chord_sigma_order", True) and chords:
         try:
             import networkx as nx
             from tutte.roots.signed_quotient import find_best_sigma

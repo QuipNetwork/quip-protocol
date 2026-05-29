@@ -1605,7 +1605,7 @@ def test_pm2_routes_through_chord_rule(table):
 def test_cell_quotient_tree_dp_path_topology(table):
     """compute_cell_quotient_tree_dp returns correct polynomial on a
     K_{4,4} 3-cell M_2 path tree topology graph."""
-    from tutte.research.scripts.tree_dp_branching import \
+    from tutte.tests.tree_dp_branching import \
         build_tree_graph
     from tutte.roots import compute_cell_quotient_tree_dp
 
@@ -1624,7 +1624,7 @@ def test_cell_quotient_tree_dp_path_topology(table):
 def test_cell_quotient_tree_dp_branching_topology(table):
     """compute_cell_quotient_tree_dp returns correct polynomial on a
     K_{4,4} star (1 center + 4 leaves) M_2 graph."""
-    from tutte.research.scripts.tree_dp_branching import \
+    from tutte.tests.tree_dp_branching import \
         build_tree_graph
     from tutte.roots import compute_cell_quotient_tree_dp
 
@@ -1682,7 +1682,7 @@ def test_cell_quotient_hybrid_3_K3_3_cycle(table):
 def test_cell_quotient_hybrid_returns_none_on_tree(table):
     """compute_cell_quotient_hybrid returns None when cell-quotient is
     a tree (tree DP handles those)."""
-    from tutte.research.scripts.tree_dp_branching import \
+    from tutte.tests.tree_dp_branching import \
         build_tree_graph
     from tutte.roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
 

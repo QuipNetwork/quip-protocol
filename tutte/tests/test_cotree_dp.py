@@ -695,7 +695,7 @@ class TestCellSelCacheGrowth:
         """
         import time
         import tutte.cotree_dp.dp as dp_mod
-        from tutte.cotree_dp.combinatorics import _cellsel_cache
+        from tutte.cotree_dp.subgraph import _cellsel_cache
 
         n = 30
         g = complete_graph(n)

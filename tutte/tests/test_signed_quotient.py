@@ -5,7 +5,7 @@ import pytest
 import sympy
 import networkx as nx
 
-from tutte.roots.signed_quotient import (
+from tutte.deprecated.signed_quotient_pipeline import (
     build_quotient_with_monodromy,
     compute_t_fix_sigma_quotient_mod,
     compute_t_signed_quotient_mod,
@@ -13,8 +13,8 @@ from tutte.roots.signed_quotient import (
     evaluate_t_signed_mod,
     interpolate_t_signed_mod,
 )
-from tutte.research.scripts.signed_graph_tutte_prototype import compute_t_signed
-from tutte.research.scripts.verify_t_fix_sigma import compute_t_fix_sigma_brute
+from tutte.tests.signed_graph_tutte_prototype import compute_t_signed
+from tutte.tests.verify_t_fix_sigma import compute_t_fix_sigma_brute
 
 
 def _validate(g, perm, x_v, y_v, p):
@@ -190,7 +190,7 @@ def test_derive_t_free_sigma_via_cover_cube():
 
     Cube antipodal σ is the smallest free 2-fold cover for testing.
     """
-    from tutte.roots.signed_quotient import derive_t_free_sigma_mod_via_cover
+    from tutte.deprecated.signed_quotient_pipeline import derive_t_free_sigma_mod_via_cover
 
     g = nx.hypercube_graph(3)
     nm = {n: i for i, n in enumerate(sorted(g.nodes()))}
@@ -247,7 +247,7 @@ def test_decompose_t_polynomial_via_sigma_cube_full():
 
     Cube bidegree ≤ (7, 5). Use 8×6 grid for full recovery.
     """
-    from tutte.roots.signed_quotient import decompose_t_polynomial_via_sigma
+    from tutte.deprecated.signed_quotient_pipeline import decompose_t_polynomial_via_sigma
 
     g = nx.hypercube_graph(3)
     nm = {n: i for i, n in enumerate(sorted(g.nodes()))}
@@ -289,7 +289,7 @@ def test_compute_t_via_sigma_auto_dnx_lookup_hit():
     """
     import time
     import dwave_networkx as dnx
-    from tutte.roots.signed_quotient import compute_t_via_sigma_auto
+    from tutte.deprecated.signed_quotient_pipeline import compute_t_via_sigma_auto
 
     g = dnx.chimera_graph(2)
     t0 = time.time()
@@ -323,7 +323,7 @@ def test_compute_t_via_pipeline_z12_lookup():
     """
     import time
     import dwave_networkx as dnx
-    from tutte.roots.signed_quotient import compute_t_via_pipeline
+    from tutte.deprecated.signed_quotient_pipeline import compute_t_via_pipeline
 
     g = dnx.zephyr_graph(1, 2)
     t0 = time.time()
@@ -350,7 +350,7 @@ def test_compute_t_via_pipeline_k22_m2_chain_routes_via_cell_quotient_tree():
     `_seed_common_cell_templates` augments K_{2,2} with its graph,
     enabling detection. Validates against `nx.tutte_polynomial`.
     """
-    from tutte.roots.signed_quotient import compute_t_via_pipeline
+    from tutte.deprecated.signed_quotient_pipeline import compute_t_via_pipeline
     from tutte.synthesis.engine import SynthesisEngine
 
     def build_k22_m2_chain(n_cells):
@@ -393,7 +393,7 @@ def test_compute_t_signed_via_pipeline_z12_under_60s():
     """
     import time
     import dwave_networkx as dnx
-    from tutte.roots.signed_quotient import compute_t_signed_via_pipeline
+    from tutte.deprecated.signed_quotient_pipeline import compute_t_signed_via_pipeline
 
     g = dnx.zephyr_graph(1, 2)
     t0 = time.time()
@@ -421,7 +421,7 @@ def test_z12_three_scalar_pipeline_entry_points_cross_validate():
     """
     import time
     import dwave_networkx as dnx
-    from tutte.roots.signed_quotient import (
+    from tutte.deprecated.signed_quotient_pipeline import (
         compute_t_polynomial_via_pipeline,
         compute_t_signed_via_pipeline,
         compute_t_via_pipeline,
@@ -465,7 +465,7 @@ def test_compute_t_signed_polynomial_adaptive_via_pipeline_cm1():
     (matches the explicit 10×10 grid recovery).
     """
     import dwave_networkx as dnx
-    from tutte.roots.signed_quotient import \
+    from tutte.deprecated.signed_quotient_pipeline import \
         compute_t_signed_polynomial_adaptive_via_pipeline
 
     g = dnx.chimera_graph(1)
@@ -487,7 +487,7 @@ def test_compute_t_decomposition_via_pipeline_cm1():
     the lift identity T_fix + T_free = T at point (2, 3) mod 1009.
     """
     import dwave_networkx as dnx
-    from tutte.roots.signed_quotient import compute_t_decomposition_via_pipeline
+    from tutte.deprecated.signed_quotient_pipeline import compute_t_decomposition_via_pipeline
 
     g = dnx.chimera_graph(1)
     xs = list(range(2, 11))
@@ -524,7 +524,7 @@ def test_compute_t_polynomial_via_pipeline_z12_lookup():
     = 25,117,827,740,467,200; T(2,3) mod 1009 = 629.
     """
     import dwave_networkx as dnx
-    from tutte.roots.signed_quotient import compute_t_polynomial_via_pipeline
+    from tutte.deprecated.signed_quotient_pipeline import compute_t_polynomial_via_pipeline
 
     g = dnx.zephyr_graph(1, 2)
     poly, framework = compute_t_polynomial_via_pipeline(g)
@@ -546,7 +546,7 @@ def test_compute_t_signed_polynomial_via_pipeline_cm1():
     matches the single-point value (479) from the scalar pipeline.
     """
     import dwave_networkx as dnx
-    from tutte.roots.signed_quotient import compute_t_signed_polynomial_via_pipeline
+    from tutte.deprecated.signed_quotient_pipeline import compute_t_signed_polynomial_via_pipeline
 
     g = dnx.chimera_graph(1)
     xs = list(range(2, 12))
@@ -577,7 +577,7 @@ def test_compute_t_signed_via_pipeline_cm1_chimera():
     """
     import time
     import dwave_networkx as dnx
-    from tutte.roots.signed_quotient import compute_t_signed_via_pipeline
+    from tutte.deprecated.signed_quotient_pipeline import compute_t_signed_via_pipeline
 
     g = dnx.chimera_graph(1)
     t0 = time.time()
@@ -603,7 +603,7 @@ def test_compute_t_via_pipeline_cube_fallback():
     import time
     from tutte.synthesis.engine import SynthesisEngine
     from tutte.lookup import RainbowTable
-    from tutte.roots.signed_quotient import compute_t_via_pipeline
+    from tutte.deprecated.signed_quotient_pipeline import compute_t_via_pipeline
 
     g = nx.hypercube_graph(3)
     g = nx.convert_node_labels_to_integers(g)

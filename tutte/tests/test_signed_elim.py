@@ -20,7 +20,7 @@ from tutte.graphs._signed_elim_c import (
     decode_state, encode_state, step_edge_batch, step_forget_batch,
 )
 from tutte.graphs.signed_elim_dp import compute_signed_tutte_elim_mod
-from tutte.research.scripts.signed_graph_tutte_prototype import compute_t_signed
+from tutte.tests.signed_graph_tutte_prototype import compute_t_signed
 
 
 # ---------------------------------------------------------------------------

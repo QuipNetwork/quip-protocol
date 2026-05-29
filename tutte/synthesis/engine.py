@@ -271,136 +271,6 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             self._fast_hash_set_complete = False
         return count
 
-    def _collect_simple_intermediates(
-        self,
-        mg: MultiGraph,
-        out: Dict[str, Graph],
-    ) -> None:
-        """Recursively trace batch reduction to collect simple graph intermediates.
-
-        Follows the same reduction path as _synthesize_multigraph but only
-        collects the Graph objects that will eventually need synthesis,
-        without actually computing polynomials.
-        """
-        # Skip loops
-        if mg.total_loop_count() > 0:
-            mg = mg.remove_loops()
-
-        # Skip parallel-only
-        if mg.is_just_parallel_edges():
-            return
-
-        # Skip disconnected — recurse into components
-        if not mg.is_connected():
-            start = next(iter(mg.nodes))
-            visited = {start}
-            stack = [start]
-            while stack:
-                node = stack.pop()
-                for neighbor in mg.neighbors(node):
-                    if neighbor not in visited:
-                        visited.add(neighbor)
-                        stack.append(neighbor)
-            comp1_edges = {e: c for e, c in mg.edge_counts.items() if e[0] in visited}
-            comp1_loops = {n: c for n, c in mg.loop_counts.items() if n in visited}
-            comp1 = MultiGraph(nodes=frozenset(visited), edge_counts=comp1_edges, loop_counts=comp1_loops)
-            rest_nodes = mg.nodes - visited
-            rest_edges = {e: c for e, c in mg.edge_counts.items() if e[0] in rest_nodes}
-            rest_loops = {n: c for n, c in mg.loop_counts.items() if n in rest_nodes}
-            rest = MultiGraph(nodes=frozenset(rest_nodes), edge_counts=rest_edges, loop_counts=rest_loops)
-            self._collect_simple_intermediates(comp1, out)
-            self._collect_simple_intermediates(rest, out)
-            return
-
-        # Cut vertex
-        cut = mg.has_cut_vertex()
-        if cut is not None:
-            components = mg.split_at_cut_vertex(cut)
-            if len(components) > 1:
-                for comp in components:
-                    self._collect_simple_intermediates(comp, out)
-                return
-
-        # Cache check
-        cache_key = mg.canonical_key()
-        if cache_key in self._multigraph_cache:
-            return
-
-        # Simple graph — this is what we want to collect
-        if mg.is_simple():
-            simple = mg.to_simple_graph()
-            if simple is not None:
-                sk = simple.canonical_key()
-                if sk not in self._cache and sk not in self.table.entries:
-                    out[sk] = simple
-                return
-
-        # Batch reduce parallel — recurse into G_0 and G_c
-        max_mult_edge = max(mg.edge_counts.keys(), key=lambda e: mg.edge_counts[e])
-        if mg.edge_counts[max_mult_edge] > 1:
-            u, v = max_mult_edge
-            new_edge_counts = dict(mg.edge_counts)
-            del new_edge_counts[max_mult_edge]
-            mg_0 = MultiGraph(nodes=mg.nodes, edge_counts=new_edge_counts, loop_counts=mg.loop_counts)
-            mg_c = mg_0.merge_nodes(u, v)
-            if mg_0.in_same_component(u, v):
-                self._collect_simple_intermediates(mg_0, out)
-            self._collect_simple_intermediates(mg_c, out)
-
-    def precompute_intermediate_simple_graphs(
-        self,
-        extended_cell: Graph,
-        lattice: 'FlatLattice',
-        shared_edges: list,
-    ) -> int:
-        """Pre-compute simple graph intermediates from flat contractions.
-
-        For each flat in the lattice, contracts the extended cell graph,
-        traces the batch reduction to find simple graph intermediates,
-        deduplicates, sorts by size, and synthesizes smallest-first.
-        Auto-promotes each result to the rainbow table.
-
-        Returns the number of new entries added.
-        """
-        from ..matroids.parallel_connection import _contract_edges_in_graph
-
-        # Collect all simple graph intermediates
-        all_intermediates: Dict[str, Graph] = {}
-        for z_idx in range(lattice.num_flats):
-            z_flat = lattice.flat_by_idx(z_idx)
-            if not z_flat:
-                mg = MultiGraph.from_graph(extended_cell)
-            else:
-                mg = _contract_edges_in_graph(extended_cell, z_flat)
-            self._collect_simple_intermediates(mg, all_intermediates)
-
-        if not all_intermediates:
-            return 0
-
-        # Sort by edge count (smallest first for bottom-up synthesis)
-        sorted_graphs = sorted(
-            all_intermediates.items(),
-            key=lambda kv: (kv[1].edge_count(), kv[1].node_count()),
-        )
-
-        self._log(f"Pre-computing {len(sorted_graphs)} intermediate simple graphs")
-
-        count = 0
-        for sk, simple in sorted_graphs:
-            if sk in self.table.entries:
-                continue
-            result = self.synthesize(simple)
-            count += 1
-            if count % 50 == 0:
-                self._log(f"  Pre-computed {count}/{len(sorted_graphs)}")
-
-        # Resort the table once after all promotions
-        if count > 0:
-            self.table.resort()
-
-        self._log(f"Pre-computed {count} new intermediate graphs")
-        return count
-
     def synthesize(
         self,
         graph: Graph,
@@ -854,8 +724,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         # preconditions of the unified or k-matching formula, these
         # closed-form paths can beat `treewidth_dp` (Cm2: ~4× speedup
         # vs tw_dp). The formula-only shortcut avoids the internal
-        # tw_dp fall-through inside `_synthesize_hierarchical`, so we
-        # only commit to the hierarchical path when the formula
+        # tw_dp fall-through inside the decomposition path, so we
+        # only commit to that path when the formula
         # actually applies.
         #
         # Gate: edge_count ≥ 60. This filters out small structured
@@ -2340,7 +2210,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         from ..graphs.k_sum import _classify_bridges_chords
         if len(partition) < 2:
             return None
-        # Apply the same "is it worth it" gate as legacy _try_hierarchical:
+        # Apply the cell "is it worth it" gate:
         # cells must have at least one cycle (edge_count >= node_count) so
         # the chord-rule has non-trivial atomic Tutte polynomials to consume.
         # Heterogeneous partitions are vetted by the partitioner itself; for
@@ -2566,17 +2436,10 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                     minors_used=all_minors,
                 )
 
-        # NOTE: product_formula `T(G) = (∏ T(cells)) × ∏ T(inter_components)`
-        # was historically tried here as a final cell-only closed form.
-        # It works ONLY for partitions whose inter-cell graph splits into
-        # truly independent components (uncommon in D-Wave topologies).
-        # Empirically it added ~16s of recursive sub-synth on Z(1,2)
-        # without ever succeeding. The chord-rule path (Phase C) computes
-        # the correct polynomial in this case anyway; product_formula was
-        # only a speed optimization for a structural class our other
-        # paths already cover. Removed for the merge — if a future caller
-        # needs it, route via the legacy `_synthesize_hierarchical`
-        # (still on disk behind TUTTE_USE_LEGACY_DISPATCH=1).
+        # No cell-only closed form applies here; fall through to the cascade.
+        # (A product_formula T(G)=∏T(cells)·∏T(inter) was tried historically but
+        # only helped partitions whose inter-cell graph splits into independent
+        # components — a class the chord-rule path already covers — so it was removed.)
         return None
 
     def _chord_peel_decomposition(
@@ -2699,7 +2562,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
 
         Method labels emitted:
           - `unified_formula`, `kmatching_formula`, `product_formula`
-            (preserved from the legacy `_synthesize_hierarchical`)
+            (cell-level closed forms)
           - `decomposition_chord_peel_cell_inter` (cell chord-rule)
           - `decomposition_chord_peel_atom_inter` (inter-atom chord-rule)
           - `decomposition_chord_peel_atom_intra` (intra-atom chord-rule
@@ -2872,40 +2735,6 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             return
         self._cache[cache_key] = result
         self._promote_to_table(graph, cache_key, result)
-
-    def _build_inter_cell_graph(
-        self,
-        graph: Graph,
-        partition: List[Set[int]],
-        inter_info: InterCellInfo
-    ) -> Graph:
-        """Build the subgraph of just inter-cell edges.
-
-        This creates a graph containing only:
-        - Nodes that are endpoints of inter-cell edges
-        - The inter-cell edges themselves
-
-        Args:
-            graph: Full graph
-            partition: List of node sets (one per cell)
-            inter_info: Information about inter-cell edges
-
-        Returns:
-            Graph containing only inter-cell structure
-        """
-        inter_nodes: Set[int] = set()
-        inter_edges: Set[Tuple[int, int]] = set()
-
-        for u, v in inter_info.edges:
-            inter_nodes.add(u)
-            inter_nodes.add(v)
-            edge = (min(u, v), max(u, v))
-            inter_edges.add(edge)
-
-        return Graph(
-            nodes=frozenset(inter_nodes),
-            edges=frozenset(inter_edges)
-        )
 
     def _synthesize_connected(
         self,
@@ -3439,59 +3268,6 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             method="spanning_tree_expansion_fast",
             minors_used=new_minors,
         )
-
-    # =========================================================================
-    # EDGE ADDITION UTILITIES
-    # =========================================================================
-
-    def _add_edges_to_graph(
-        self,
-        base_graph: Graph,
-        base_poly: TuttePolynomial,
-        edges_to_add: List[Tuple[int, int]]
-    ) -> TuttePolynomial:
-        """Add edges using the edge addition formula.
-
-        For each edge e=(u,v) added to graph G:
-        T(G + e) = T(G) + T(G/{u,v})
-
-        where G/{u,v} is G with nodes u,v merged.
-
-        Args:
-            base_graph: Starting graph
-            base_poly: Polynomial for base_graph
-            edges_to_add: List of edges to add
-
-        Returns:
-            Polynomial for graph with all edges added
-        """
-        if not edges_to_add:
-            return base_poly
-
-        self._log(f"Adding {len(edges_to_add)} edges via edge addition formula")
-
-        current_poly = base_poly
-        current_mg = MultiGraph.from_graph(base_graph)
-
-        for u, v in edges_to_add:
-            # Compute T(G/{u,v}) - the polynomial for merged graph
-            merged = current_mg.merge_nodes(u, v)
-            merged_poly = self._synthesize_multigraph(merged, skip_minor_search=True)
-
-            # T(G + e) = T(G) + T(G/{u,v})
-            current_poly = current_poly + merged_poly
-
-            # Update current multigraph by adding the edge
-            edge = (min(u, v), max(u, v))
-            new_edge_counts = dict(current_mg.edge_counts)
-            new_edge_counts[edge] = new_edge_counts.get(edge, 0) + 1
-            current_mg = MultiGraph(
-                nodes=current_mg.nodes,
-                edge_counts=new_edge_counts,
-                loop_counts=current_mg.loop_counts
-            )
-
-        return current_poly
 
 # =============================================================================
 # CONVENIENCE FUNCTIONS

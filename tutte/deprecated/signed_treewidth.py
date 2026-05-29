@@ -24,7 +24,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
-from .treewidth import compute_tree_decomposition, TreeDecomposition
+from ..graphs.treewidth import compute_tree_decomposition, TreeDecomposition
 from ..graph import MultiGraph
 
 

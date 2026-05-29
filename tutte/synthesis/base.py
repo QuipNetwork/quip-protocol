@@ -199,7 +199,7 @@ class BaseMultigraphSynthesizer:
         # fires — atom discovery would succeed on almost every contraction
         # and cascade chord-rule indefinitely (each contraction →
         # _synthesize_multigraph → here → another chord-peel → more
-        # contractions...). The legacy `_try_hierarchical` got this gate
+        # contractions...). The earlier hierarchical dispatch got this gate
         # for free because cell partition discovery rarely matched a
         # contracted intermediate; the merged dispatcher's atom path is
         # too eager, so we explicitly suppress it here. Only the

@@ -88,18 +88,15 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
         self,
         table: Optional[RainbowTable] = None,
         verbose: bool = False,
-        prefer_algebraic: bool = True
     ):
         """Initialize hybrid synthesis engine.
 
         Args:
             table: Rainbow table for lookups (loads default if None)
             verbose: Print progress information
-            prefer_algebraic: Try algebraic decomposition before tiling
         """
         self.table = table if table is not None else load_default_table()
         self.verbose = verbose
-        self.prefer_algebraic = prefer_algebraic
 
         # Caches
         self._cache: Dict[str, HybridSynthesisResult] = {}
@@ -995,34 +992,6 @@ class HybridSynthesisEngine(BaseMultigraphSynthesizer):
             )
 
         return None
-
-    def _find_all_cut_vertices_and_split(
-        self,
-        graph: Graph
-    ) -> Optional[List[Graph]]:
-        """Find all cut vertices and split graph into 2-connected blocks.
-
-        Returns None if graph is 2-connected (no cut vertices).
-        Otherwise returns list of blocks (each containing their cut vertices).
-        """
-        cut_vertices = graph.find_all_cut_vertices()
-        if not cut_vertices:
-            return None
-
-        # Recursively split at cut vertices
-        blocks = []
-        remaining = [graph]
-
-        while remaining:
-            g = remaining.pop()
-            cut = g.has_cut_vertex()
-            if cut is None:
-                blocks.append(g)
-            else:
-                parts = g.split_at_cut_vertex(cut)
-                remaining.extend(parts)
-
-        return blocks
 
     def _synthesize_via_tiling(
         self,

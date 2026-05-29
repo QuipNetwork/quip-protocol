@@ -32,7 +32,10 @@ from tutte.roots._partition_c import join_partitions_c_wrapper
 from tutte.roots.aut_orbit import (aut_compress_t_rooted_per_cell,
                                    per_cell_canonical_key, per_cell_orbit_rep,
                                    per_cell_orbit_size)
-from tutte.roots.cell_quotient_interleaved import (compute_grid_dp_interleaved,
+# cell_quotient_interleaved is deprecated (validated but architecturally walled at
+# Cm3; superseded by cell_quotient_grid_dp_streamed). Moved to tutte/deprecated/;
+# these tests still run against it there.
+from tutte.deprecated.cell_quotient_interleaved import (compute_grid_dp_interleaved,
                                                    grid_path_and_closing_edges,
                                                    hamiltonian_path_grid)
 from tutte.roots.cell_quotient_path import (clear_path_dp_cache,
@@ -822,7 +825,7 @@ def test_polynomial_evaluate_mod_matches_int_arithmetic():
 
 def test_interpolation_1d_roundtrip():
     """1D Lagrange interpolation recovers the original polynomial."""
-    from tutte.roots.interpolation import lagrange_1d_mod
+    from tutte.deprecated.interpolation import lagrange_1d_mod
 
     # P(x) = 3 x^2 + 5 x + 7 mod 101 — verify roundtrip
     p = 101
@@ -836,7 +839,7 @@ def test_interpolation_1d_roundtrip():
 def test_interpolation_2d_roundtrip():
     """Bivariate Lagrange interpolation recovers a 2D polynomial."""
     from tutte.polynomial import TuttePolynomial
-    from tutte.roots.interpolation import bivariate_lagrange_interpolate_mod
+    from tutte.deprecated.interpolation import bivariate_lagrange_interpolate_mod
 
     T = TuttePolynomial.from_coefficients({(2, 1): 2, (1, 0): 3, (0, 2): 5, (0, 0): 7})
     p = 1009
@@ -850,7 +853,7 @@ def test_interpolation_2d_roundtrip():
 def test_interpolation_crt_combine_exact_recovery():
     """CRT-combine across primes recovers exact integer coefficients."""
     from tutte.polynomial import TuttePolynomial
-    from tutte.roots.interpolation import (bivariate_lagrange_interpolate_mod,
+    from tutte.deprecated.interpolation import (bivariate_lagrange_interpolate_mod,
                                            crt_combine_coeff_dicts)
 
     T = TuttePolynomial.from_coefficients({

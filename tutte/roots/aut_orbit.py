@@ -166,7 +166,6 @@ def per_cell_canonical_key(
 
     Current call sites (all safe — K_{4,4} cells only):
     - cell_quotient_helpers.py
-    - cell_quotient_interleaved.py
     - cell_quotient_path.py
 
     Adding any non-K_{a,b} cell type to the roots/ DP requires

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from tutte.roots.sparse_interp import (
+from tutte.deprecated.sparse_interp import (
     bm_recover_recurrence,
     prony_interpolate_geometric,
     adaptive_lagrange_2d_mod,

@@ -35,12 +35,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from ..graph import Graph
 from ..polynomial import TuttePolynomial
-from .aut_orbit import (aut_compress_t_rooted, aut_compress_t_rooted_per_cell,
+from ..roots.aut_orbit import (aut_compress_t_rooted, aut_compress_t_rooted_per_cell,
                         build_relabel_aut, per_cell_canonical_key,
                         per_cell_orbit_rep, per_cell_orbit_size)
-from .cell_quotient_helpers import (components_touching, orbit_convolve,
+from ..roots.cell_quotient_helpers import (components_touching, orbit_convolve,
                                     precompute_M_table)
-from .rooted_tutte import (all_partitions, divide_by_x_minus_1_power,
+from ..roots.rooted_tutte import (all_partitions, divide_by_x_minus_1_power,
                            relabel_partition_dict, t_rooted_cached)
 
 

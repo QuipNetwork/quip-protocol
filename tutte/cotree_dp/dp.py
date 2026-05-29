@@ -3,7 +3,7 @@
 Orchestrates the algorithm from Gimenez et al. (2006):
   1. Build the cotree via modular decomposition (recognition.py)
   2. Compute subgraph signature tables bottom-up on the cotree (subgraph.py),
-     using CellSel (combinatorics.py) for edge counting at ⊗ nodes
+     using CellSel (the combinatorics helpers in subgraph.py) for edge counting at ⊗ nodes
   3. Extract the Tutte polynomial from the final table via the
      rank-nullity formulation in the (x-1, y-1) basis
 
@@ -26,8 +26,8 @@ from .subgraph import (
     leaf_subgraph_table,
     disjoint_union_subgraph_combine,
     complete_union_subgraph_combine,
+    clear_cellsel_cache,
 )
-from .combinatorics import clear_cellsel_cache
 
 # Maximum vertex count for cotree DP. The signature table grows as
 # exp(pi * sqrt(2n/3)) by the Hardy-Ramanujan asymptotic formula for
