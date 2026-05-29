@@ -49,7 +49,7 @@ from ..graphs.covering import (KMatchingJunction, _apply_junction_merge,
                                detect_kmatching_topology,
                                try_hierarchical_partition)
 from ..polynomial import TuttePolynomial
-from .cell_quotient_tree import CellTreeSpec, compute_tree_dp_recursive
+from ..roots.cell_quotient_tree import CellTreeSpec, compute_tree_dp_recursive
 
 
 def _is_bridge_in_cell_topology(
@@ -587,7 +587,7 @@ def compute_cell_quotient_hybrid(
         """
         if initial_spec is None or isos is None:
             return None
-        from .cell_quotient_tree import CellTreeSpec, compute_corrected_leaf_dp
+        from ..roots.cell_quotient_tree import CellTreeSpec, compute_corrected_leaf_dp
         junc = junctions[junc_idx]
         cell_i = junc.cell_i
         cell_j = junc.cell_j

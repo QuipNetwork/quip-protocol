@@ -7,7 +7,7 @@ Sections:
     D. compute_path_dp_grouped module-level cache (cell_quotient_path)
     E. compute_path_dp_grouped — generic path DP with shared-anchor support
     F. compute_grid_dp_grouped — generic grid DP (disjoint + shared anchors)
-    G. compute_cell_quotient_cycle_dp — engine-level cycle dispatch
+    G. compute_cycle_dp — cycle-topology cell-quotient DP (deprecated/)
     H. Hamiltonian path / closing-edge helpers (interleaved DP)
     I. Synthetic K_3 grids (interleaved DP, fast)
     J. Cm2 (interleaved DP, slow)
@@ -25,7 +25,6 @@ from tutte.graph import Graph
 from tutte.lookup.core import load_default_table
 from tutte.polynomial import TuttePolynomial
 from tutte.roots import (CellAnchorGroups, CellGridSpec, CellRowSpec,
-                         compute_cell_quotient_cycle_dp,
                          compute_grid_dp_grouped, compute_path_dp_grouped,
                          detect_cell_anchor_groups, extract_path_specs)
 from tutte.roots._partition_c import join_partitions_c_wrapper
@@ -1161,28 +1160,8 @@ def test_grid_grouped_2x3_K4_shared():
 
 
 # =============================================================================
-# G. compute_cell_quotient_cycle_dp (engine-level dispatch)
+# G. compute_cycle_dp (cycle-topology cell-quotient DP, deprecated/)
 # =============================================================================
-
-
-@pytest.mark.slow
-def test_cm2_cell_quotient_dp_matches_engine():
-    """Cm2 polynomial via cell-quotient DP matches engine baseline."""
-    dnx = pytest.importorskip("dwave_networkx")
-
-    g = Graph.from_networkx(dnx.chimera_graph(2))
-    assert g.node_count() == 32
-    assert g.edge_count() == 80
-
-    table = load_default_table()
-    engine = SynthesisEngine(table=table, verbose=False)
-    engine.skip_target_lookup = True
-    engine_result = engine.synthesize(g)
-
-    cq_poly = compute_cell_quotient_cycle_dp(g, table)
-    assert cq_poly is not None, "Cell-quotient DP should fire on Cm2"
-    assert cq_poly == engine_result.polynomial
-    assert cq_poly.num_spanning_trees() == 11_686_511_179_538_104_320
 
 
 def _nx_to_tutte_polynomial(g) -> TuttePolynomial:
@@ -1235,7 +1214,7 @@ def test_cycle_dp_3_K3_3cycle_matches_nx():
     """3 K_3 cells in a 3-cycle with M_1 junctions — small enough for
     nx.tutte_polynomial as ground truth.
     """
-    from tutte.roots.cell_quotient_cycle import compute_cycle_dp
+    from tutte.deprecated.cell_quotient_cycle import compute_cycle_dp
 
     g = nx.Graph()
     g.add_nodes_from(range(9))
@@ -1267,7 +1246,7 @@ def test_cycle_dp_K22_3cycle_M2_matches_nx():
     reported in `project_cell_quotient_divisor_bug.md` (smaller and
     faster to iterate on than the Cm₂ test).
     """
-    from tutte.roots.cell_quotient_cycle import compute_cycle_dp
+    from tutte.deprecated.cell_quotient_cycle import compute_cycle_dp
 
     g, cell_template, cell_left, cell_right, junction_template, j_A, j_B = (
         _build_kab_cycle_graph(2, 2, 3, 2)
@@ -1282,18 +1261,6 @@ def test_cycle_dp_K22_3cycle_M2_matches_nx():
         f"  nx:    {T_nx}\n"
         f"  cq:    {poly}"
     )
-
-
-def test_cell_quotient_dp_returns_none_on_non_cycle():
-    g = Graph.from_networkx(nx.petersen_graph())
-    table = load_default_table()
-    assert compute_cell_quotient_cycle_dp(g, table) is None
-
-
-def test_cell_quotient_dp_returns_none_on_simple_graphs():
-    g = Graph.from_networkx(nx.complete_graph(5))
-    table = load_default_table()
-    assert compute_cell_quotient_cycle_dp(g, table) is None
 
 
 # =============================================================================

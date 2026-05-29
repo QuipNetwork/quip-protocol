@@ -31,11 +31,11 @@ from typing import Dict, List, Tuple
 
 from ..graph import Graph
 from ..polynomial import TuttePolynomial
-from .aut_orbit import aut_compress_t_rooted, build_relabel_aut
-from .cell_quotient_helpers import (components_touching,
+from ..roots.aut_orbit import aut_compress_t_rooted, build_relabel_aut
+from ..roots.cell_quotient_helpers import (components_touching,
                                     enumerate_partitions_cached,
                                     orbit_convolve, precompute_M_table)
-from .rooted_tutte import (divide_by_x_minus_1_power, relabel_partition_dict,
+from ..roots.rooted_tutte import (divide_by_x_minus_1_power, relabel_partition_dict,
                            t_rooted_cached)
 
 

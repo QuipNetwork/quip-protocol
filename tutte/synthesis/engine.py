@@ -43,10 +43,7 @@ from ..logs import EventType, LogLevel, get_log
 from ..lookup.core import MinorEntry, RainbowTable, load_default_table
 from ..lookup.merger import MergerTable, load_default_merger_table
 from ..polynomial import TuttePolynomial
-from ..roots import (compute_cell_quotient_cycle_dp,
-                     compute_cell_quotient_grid_dp_streamed,
-                     compute_cell_quotient_tree_dp)
-from ..roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
+from ..roots import compute_cell_quotient_grid_dp_streamed
 from ..transfer_matrix import compute_tutte_via_transfer_matrix
 from ..validation import verify_spanning_trees
 from .base import BaseMultigraphSynthesizer, SynthesisResult, UnionFind
@@ -785,119 +782,6 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 return result
         except Exception:
             pass  # any failure — fall through
-
-        # 7.7. Cell-quotient cycle DP — for cell-decomposable graphs whose
-        # cell-quotient is a SIMPLE CYCLE (e.g., D-Wave Cm2's 4-cycle of
-        # K_{4,4} cells). Combines T_rooted of cells with vertex-sum
-        # convolution + identification close. Generic over junction
-        # connectivity (handles M_k matchings, K_{a,b} bipartite, etc. via
-        # auto-detected component count c_J).
-        # Gate: edge_count >= 60 (matches formula shortcut). Only fires
-        # for graphs the formula shortcut and almost-cograph paths haven't
-        # already handled — so a fallback for cycle-topology cases like
-        # Cm2 when those paths return None.
-        if graph.edge_count() >= 60:
-            try:
-                cq_poly = compute_cell_quotient_cycle_dp(graph, self.table)
-                if cq_poly is not None:
-                    return self._emit_cell_quotient_result(
-                        graph, cache_key, cq_poly,
-                        method='cell_quotient_dp', recipe='Cell-quotient cycle DP',
-                        label='Cell-quotient cycle DP',
-                    )
-            except Exception:
-                pass  # any failure — fall through
-
-        # 7.8. Cell-quotient TREE DP — for cell-decomposable graphs whose
-        # cell-quotient is a TREE (n cells, n-1 junctions, no cycles).
-        # Generalizes the path/cycle DPs to arbitrary tree topologies.
-        # Combined-aut path inside compute_tree_dp_recursive handles
-        # keep_shared / fully-consumed cases (see
-        # tutte/research/data/combined_aut_findings.md).
-        if graph.edge_count() >= 60:
-            try:
-                tree_poly = compute_cell_quotient_tree_dp(graph, self.table)
-                if tree_poly is not None:
-                    return self._emit_cell_quotient_result(
-                        graph, cache_key, tree_poly,
-                        method='cell_quotient_tree_dp', recipe='Cell-quotient tree DP',
-                        label='Cell-quotient tree DP',
-                    )
-            except Exception:
-                pass  # any failure — fall through
-
-        # 7.82. Cell-quotient BIPARTITE-JUNCTION DP — generalisation of
-        # the k-matching path that accepts non-matching bipartite
-        # junctions (asymmetric anchor degrees, disconnected junction
-        # subgraphs). Unblocks Z(m, t) families whose inter-cell graph
-        # has multi-degree anchors (e.g. Z(1, 2) has degree sequence
-        # [2,2,2,2,2,2,4,4,4,4] on each side of each junction
-        # component). Cell-template T_rooted on the full anchor
-        # boundary remains the bottleneck; this entry merely WIRES the
-        # path. See `tutte/roots/cell_quotient_bipartite_junction.py`.
-        if graph.edge_count() >= 60:
-            try:
-                from ..roots.cell_quotient_bipartite_junction import (
-                    compute_cell_quotient_bipartite_junction_dp,
-                )
-                bj_poly = compute_cell_quotient_bipartite_junction_dp(
-                    graph, self.table,
-                )
-                if bj_poly is not None:
-                    return self._emit_cell_quotient_result(
-                        graph, cache_key, bj_poly,
-                        method='cell_quotient_bipartite_junction_dp', recipe='Cell-quotient bipartite-junction DP',
-                        label='Cell-quotient bipartite-junction DP',
-                    )
-            except Exception:
-                pass  # any failure — fall through
-
-        # Per-component bipartite-junction DP. When the standard
-        # bipartite-junction DP returns None due to the `max_cell_boundary=8`
-        # guard OR an intractable joint partition dict, factor a disconnected
-        # junction into its connected components and process each as a
-        # separate convolution step, avoiding the
-        # Bell(|joint_junction_boundary|) wall. Effective on Z(1, 2) family
-        # where the inter-cell graph splits into 2 components of 12 anchors
-        # each (Bell(12) ≈ 4M ≪ Bell(24) ≈ 10^17).
-        if graph.edge_count() >= 60:
-            try:
-                from ..roots.cell_quotient_bipartite_junction import (
-                    compute_bipartite_junction_per_component_dp,
-                )
-                # Cap per-cell boundary at 8 to keep precompute_M_table's
-                # Bell-style inner iteration bounded. Cells with larger
-                # anchor sets (e.g. Z(1, 1) at 12) defer to treewidth_dp.
-                pcdp_poly = compute_bipartite_junction_per_component_dp(
-                    graph, self.table, max_cell_boundary=8,
-                )
-                if pcdp_poly is not None:
-                    return self._emit_cell_quotient_result(
-                        graph, cache_key, pcdp_poly,
-                        method='cell_quotient_bipartite_junction_per_component_dp', recipe='Cell-quotient bipartite-junction per-component DP',
-                        label='Cell-quotient bipartite-junction per-component DP',
-                    )
-            except Exception:
-                pass
-
-        # 7.85. Cell-quotient HYBRID DP — chord-rule cycle-close + per-leaf
-        # synth for cyclic cell-quotients (e.g., D-Wave Cm₃'s 3×3 grid).
-        # Recursively peels closing junctions; each leaf is synthesized
-        # via the engine's standard pipeline. Self-loop-aware contraction
-        # ensures correct y-factor accounting for parallel-edge leaves.
-        if graph.edge_count() >= 60:
-            try:
-                hybrid_poly = compute_cell_quotient_hybrid(
-                    graph, self.table,
-                )
-                if hybrid_poly is not None:
-                    return self._emit_cell_quotient_result(
-                        graph, cache_key, hybrid_poly,
-                        method='cell_quotient_hybrid_dp', recipe='Cell-quotient hybrid (cycle-close + per-leaf synth)',
-                        label='Cell-quotient hybrid DP',
-                    )
-            except Exception:
-                pass  # any failure — fall through
 
         # 7.88 Unified decomposition + chord-peel — discovers atom AND cell
         # decompositions in one pass, tries cell-only closed-form formulas

@@ -74,7 +74,7 @@ class CellTreeSpec:
     ``(cell_i, anchor_template_i, cell_j, anchor_template_j)`` tuples
     declaring that two anchor positions in DIFFERENT cells are
     physically the same vertex. Used by the hybrid cycle-close path
-    (`tutte/roots/cell_quotient_hybrid.py`) to represent contracted
+    (`tutte/deprecated/cell_quotient_hybrid.py`) to represent contracted
     junction endpoints. Within-cell shared anchors (same template
     index in multiple neighbor groups of one cell) are handled
     automatically by `_allocate_tree_positions` and do NOT need

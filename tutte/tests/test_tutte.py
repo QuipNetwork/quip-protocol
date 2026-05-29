@@ -1613,7 +1613,7 @@ def test_cell_quotient_hybrid_3_K3_3_cycle(table):
     """compute_cell_quotient_hybrid produces correct full polynomial
     for the smallest non-trivial cyclic cell-quotient: 3 K_3 cells in
     a 3-cycle joined by single edges."""
-    from tutte.roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
+    from tutte.deprecated.cell_quotient_hybrid import compute_cell_quotient_hybrid
     from tutte.synthesis.engine import SynthesisEngine
 
     g_nx = nx.Graph()
@@ -1638,7 +1638,7 @@ def test_cell_quotient_hybrid_returns_none_on_tree(table):
     a tree (tree DP handles those)."""
     from tutte.tests.tree_dp_branching import \
         build_tree_graph
-    from tutte.roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
+    from tutte.deprecated.cell_quotient_hybrid import compute_cell_quotient_hybrid
 
     K44 = Graph.from_networkx(nx.complete_bipartite_graph(4, 4))
     edges = [(0, 1), (1, 2)]
@@ -1654,7 +1654,7 @@ def test_cell_quotient_hybrid_returns_none_on_tree(table):
 def test_cell_quotient_hybrid_K3_M2_3_cycle(table):
     """k=2 junction in 3-cycle (originally broken until self-loop +
     contraction-guard fixes)."""
-    from tutte.roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
+    from tutte.deprecated.cell_quotient_hybrid import compute_cell_quotient_hybrid
     from tutte.synthesis.engine import SynthesisEngine
 
     g_nx = nx.Graph()
@@ -1683,7 +1683,7 @@ def test_cell_quotient_hybrid_4_K3_M2_cycle(table):
     across junctions, so Path A's C(k, j) shortcut applies). This is
     the anti-regression for the orbit-aware refactor that ensures
     symmetric cases retain their fast path."""
-    from tutte.roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
+    from tutte.deprecated.cell_quotient_hybrid import compute_cell_quotient_hybrid
     from tutte.synthesis.engine import SynthesisEngine
 
     g_nx = nx.Graph()
@@ -1713,7 +1713,7 @@ def test_cell_quotient_hybrid_3x3_K3_grid_multicycle(table):
     which gave wrong answers because the recursive sums on
     `delete bridge` vs `contract bridge` diverge for chord-rule
     leaves even though their leaf polynomials agree)."""
-    from tutte.roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
+    from tutte.deprecated.cell_quotient_hybrid import compute_cell_quotient_hybrid
     from tutte.synthesis.engine import SynthesisEngine
 
     g_nx = nx.Graph()
@@ -1749,7 +1749,7 @@ def test_cell_quotient_hybrid_2x2_K3_grid_M2_cross_anchors(table):
     fails here because the two j=1 sub-cases (contract first vs
     contract second matching edge) produce non-isomorphic leaves.
     Orbit-aware enumeration (Path B) correctly handles this."""
-    from tutte.roots.cell_quotient_hybrid import compute_cell_quotient_hybrid
+    from tutte.deprecated.cell_quotient_hybrid import compute_cell_quotient_hybrid
     from tutte.synthesis.engine import SynthesisEngine
 
     g_nx = nx.Graph()
