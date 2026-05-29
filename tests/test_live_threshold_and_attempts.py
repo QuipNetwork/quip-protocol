@@ -19,9 +19,11 @@ from pathlib import Path
 
 from shared.mining_attempt_log import (
     AttemptLogger,
+    SolutionStore,
     SubmissionLogger,
     query_by_dispatch,
     query_by_solution_id,
+    query_stored_solutions,
 )
 
 
@@ -76,8 +78,8 @@ def test_attempt_logger_writes_jsonl_record(tmp_path: Path) -> None:
         qpu_access_time_us=8_432,
     )
 
-    # Exactly one .jsonl file exists, with our miner_id in the name.
-    files = sorted(tmp_path.glob("attempts-miner-1-*.jsonl"))
+    # Per-dispatch layout: file lives under {dispatch_id}/attempts-{miner}.jsonl
+    files = sorted(tmp_path.glob("42/attempts-miner-1.jsonl"))
     assert len(files) == 1
 
     with files[0].open() as fh:
@@ -116,7 +118,7 @@ def test_attempt_logger_qpu_access_time_defaults_to_none(tmp_path: Path) -> None
         result_kind="rejected",
     )
 
-    files = sorted(tmp_path.glob("attempts-miner-cpu-*.jsonl"))
+    files = sorted(tmp_path.glob("1/attempts-miner-cpu.jsonl"))
     with files[0].open() as fh:
         record = json.loads(fh.read().strip())
     assert "qpu_access_time_us" in record
@@ -240,6 +242,41 @@ def test_query_by_dispatch_returns_only_matching_attempts(
     assert attempts[0]["dispatch_id"] == 2
 
 
+def test_solution_store_writes_packed_spins(tmp_path: Path) -> None:
+    """SolutionStore archives top-5 spin configs per stored attempt."""
+    store = SolutionStore("miner-q", log_dir=tmp_path)
+    store.record(
+        dispatch_id=99, iter_num=3,
+        nonce_hex="deadbeef" + "00" * 28, salt_hex="cafe" + "00" * 30,
+        top_5_solutions_hex=["a1b2", "c3d4", "e5f6", "0708", "1a2b"],
+        top_5_energies=[-100.5, -99.0, -98.5, -97.0, -96.0],
+        result_kind="submitted",
+    )
+    # File at {dispatch}/solutions/{iter:06d}-{nonce8}
+    path = tmp_path / "99" / "solutions" / "000003-deadbeef"
+    assert path.exists()
+    rec = json.loads(path.read_text())
+    assert rec["nonce_hex"].startswith("deadbeef")
+    assert rec["result_kind"] == "submitted"
+    assert len(rec["top_5_solutions_hex"]) == 5
+
+
+def test_query_stored_solutions_returns_sorted_by_iter(tmp_path: Path) -> None:
+    """query_stored_solutions returns all matching files sorted by iter
+    (the leading 06d in the filename guarantees fs-sort order)."""
+    store = SolutionStore("miner-q", log_dir=tmp_path)
+    for it in (12, 3, 27):
+        store.record(
+            dispatch_id=5, iter_num=it,
+            nonce_hex=f"{it:064x}", salt_hex="00" * 32,
+            top_5_solutions_hex=[f"{it:04x}"] * 5,
+            top_5_energies=[float(it)] * 5,
+            result_kind="stored",
+        )
+    records = query_stored_solutions(5, log_dir=tmp_path)
+    assert [r["iter"] for r in records] == [3, 12, 27]
+
+
 def test_query_by_solution_id_missing_returns_none(tmp_path: Path) -> None:
     """A query for an id that was never recorded must return None, not
     an empty join — the API caller needs to distinguish 'no such
@@ -260,7 +297,7 @@ def test_attempt_logger_writes_miner_type(tmp_path: Path) -> None:
         post_processed=True, stored_as_best=False,
         result_kind="rejected",
     )
-    files = sorted(tmp_path.glob("attempts-*.jsonl"))
+    files = sorted(tmp_path.glob("1/attempts-miner-cpu-1.jsonl"))
     record = json.loads(files[0].read_text().splitlines()[0])
     assert record["miner_type"] == "CPU"
 
@@ -276,7 +313,7 @@ def test_attempt_logger_miner_type_defaults_to_empty(tmp_path: Path) -> None:
         best_energy_milli=-1_000_000, num_samples=64,
         post_processed=True, stored_as_best=False,
     )
-    files = sorted(tmp_path.glob("attempts-*.jsonl"))
+    files = sorted(tmp_path.glob("1/attempts-miner-legacy.jsonl"))
     record = json.loads(files[0].read_text().splitlines()[0])
     assert record["miner_type"] == ""
 
@@ -300,7 +337,9 @@ def test_submission_logger_writes_miner_type_per_call(tmp_path: Path) -> None:
         last_proof_block_hash_hex="0xabc",
         outcome="submitted_inblock",
     )
-    files = sorted(tmp_path.glob("submissions-*.jsonl"))
-    record = json.loads(files[0].read_text().splitlines()[0])
+    # Per-dispatch layout: submission.json is a single JSON object,
+    # not a JSONL line; lives at {dispatch_id}/submission.json.
+    sub_path = tmp_path / "1" / "submission.json"
+    record = json.loads(sub_path.read_text())
     assert record["miner_type"] == "QPU"
     assert record["miner_id"] == "rig-QPU-DWAVE-1"

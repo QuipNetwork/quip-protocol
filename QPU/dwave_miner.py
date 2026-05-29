@@ -84,6 +84,8 @@ class DWaveMiner(BaseMiner):
         region: Optional[str] = None,
         token: Optional[str] = None,
         drain_on_stop: bool = False,
+        num_reads: Optional[int] = None,
+        annealing_time_us: Optional[float] = None,
         **cfg
     ):
         """Initialize D-Wave QPU miner.
@@ -106,6 +108,14 @@ class DWaveMiner(BaseMiner):
                 to examine partial results. Default False: on stop,
                 abandon pending futures immediately to free the node to
                 start the next block as fast as possible.
+            num_reads: Optional override for QPU reads per submission.
+                ``None`` (default) uses the hardcoded throughput-tuned
+                value from ``_adapt_mining_params``. Set via TOML
+                ``[dwave].num_reads`` to retune (e.g. raise for solution
+                quality).
+            annealing_time_us: Optional override for anneal duration in
+                microseconds. ``None`` uses the hardcoded default. Set
+                via TOML ``[dwave].annealing_time_us``.
         """
         init_logger.info(
             f"[QPU] Initializing DWaveMiner with topology: {topology.solver_name}"
@@ -144,6 +154,26 @@ class DWaveMiner(BaseMiner):
 
         self.queue_depth = queue_depth
         self.drain_on_stop = drain_on_stop
+        # Operator-tunable overrides for the per-submission cost knobs.
+        # Validated lightly here; the D-Wave SDK rejects out-of-range
+        # values per-solver with a clear error at first submission.
+        if num_reads is not None and num_reads < 1:
+            raise ValueError(
+                f"num_reads must be >= 1 if set, got {num_reads}"
+            )
+        if annealing_time_us is not None and annealing_time_us <= 0:
+            raise ValueError(
+                "annealing_time_us must be > 0 if set, got "
+                f"{annealing_time_us}"
+            )
+        self._num_reads_override = num_reads
+        self._annealing_time_override = annealing_time_us
+        if num_reads is not None or annealing_time_us is not None:
+            self.logger.info(
+                "[QPU] parameter override active: num_reads=%s "
+                "annealing_time_us=%s",
+                num_reads, annealing_time_us,
+            )
         self._feeder: Optional[RandomIsingFeeder] = None
         self._stream: Optional[Iterator] = None
         # Stashed by _pre_mine_setup so the streaming iterator can observe
@@ -231,16 +261,35 @@ class DWaveMiner(BaseMiner):
         nodes: List[int],
         edges: List[Tuple[int, int]],
     ) -> dict:
-        """Return fixed optimal QPU parameters.
+        """Return QPU sampler parameters for this submission.
 
-        Based on "Multi-Solver QPU Parameter Grid Test" (2026-03-30):
-        512 reads x 120us is the universal optimum across all D-Wave
-        solvers and architectures, within 0.1% of absolute best while
-        using ~4x less QPU time than higher settings.
+        Defaults are the throughput-tuned values from the QPU
+        time-to-solution study (``qpu_tts_test/``, 2026-05): 112 reads x
+        80us — the QPU-TTS optimum (~22s normalized time-to-solution,
+        ~5x faster than the older 512x120 quality-tuned setting).
+        ``p_success`` plateaus above ~96-128 reads, so extra reads only
+        add QPU access time; 80us maximizes top-5 diversity (the binding
+        chain-validation gate) within the productive anneal range.
+
+        Operators tuning for solution quality rather than throughput can
+        override via TOML ``[dwave].num_reads`` and
+        ``[dwave].annealing_time_us``; see
+        ``tools/qpu_throughput_canary.py`` for the canary + sweep flow
+        that informs those values.
         """
+        num_reads = (
+            self._num_reads_override
+            if self._num_reads_override is not None
+            else 112
+        )
+        annealing_time = (
+            self._annealing_time_override
+            if self._annealing_time_override is not None
+            else 80.0
+        )
         return {
-            'num_reads': 512,
-            'annealing_time': 120.0,
+            'num_reads': num_reads,
+            'annealing_time': annealing_time,
             'energy_threshold': current_requirements.difficulty_energy,
         }
 
@@ -350,7 +399,12 @@ class DWaveMiner(BaseMiner):
                     if stop_event is not None and stop_event.is_set() and not self.drain_on_stop:
                         _cancel_pending()
                         return
-                    time.sleep(0.02)
+                    # 5ms poll: at production throughput one job per ~60ms
+                    # the difference vs 20ms is small per-cycle but worth a
+                    # few percent over a long mining session, and matters
+                    # more when shorter (num_reads, annealing_time) push
+                    # the per-job time down.
+                    time.sleep(0.005)
 
             model, future, defect_info, _ = pending.pop(completed_id)
             raw_ss = future.sampleset
@@ -359,6 +413,17 @@ class DWaveMiner(BaseMiner):
             # In drain mode, submit_one is a no-op so the pipeline winds
             # down naturally as pending empties.
             submit_one()
+
+            if job_index % 100 == 0:
+                feeder_stats = feeder.stats()
+                self.logger.info(
+                    "[QPU] stream depth: in_flight=%d/%d "
+                    "feeder_ready=%d/%d drained=%d wait_total=%.2fs",
+                    len(pending), queue_depth,
+                    feeder_stats['ready'], feeder_stats['buffer_size'],
+                    feeder_stats['drained_count'],
+                    feeder_stats['pop_wait_total_s'],
+                )
 
             if defect_info is not None:
                 # Check if best QPU energy + offset could meet threshold
@@ -397,7 +462,7 @@ class DWaveMiner(BaseMiner):
         Lazily creates the streaming iterator on first call. Returns one
         (nonce, salt, sampleset) per call — matching the GPU miner pattern.
         """
-        annealing_time = kwargs.pop('annealing_time', 120.0)
+        annealing_time = kwargs.pop('annealing_time', 80.0)
         energy_threshold = kwargs.pop('energy_threshold', 0.0)
 
         if self._stream is None:
@@ -454,7 +519,7 @@ class DWaveMiner(BaseMiner):
         *,
         num_reads: int,
         num_sweeps: int,
-        annealing_time: float = 120.0,
+        annealing_time: float = 80.0,
         **kwargs,
     ) -> dimod.SampleSet:
         """Fallback synchronous QPU sampling with cancel + timeout.

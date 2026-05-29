@@ -73,6 +73,13 @@ class MiningResult:
     solutions: List[List[int]]
     energy: float
     diversity: float
+    # Count of unique samples whose energy meets the target threshold —
+    # in snapshot/strict mode, ``energy < requirements.difficulty_energy``
+    # measured against sampler energies; in ratchet mode,
+    # ``energy < live_threshold_energy`` measured against chain-recomputed
+    # energies. This is the count the chain actually accepts ("≥
+    # min_solutions below max_energy"). The pre-dedup read count is
+    # implied by the configured num_reads; not reported here.
     num_valid: int
     mining_time: int
     node_list: List[int]
@@ -89,16 +96,6 @@ class MiningResult:
     # ``None`` means the worst-case wasn't recomputed; fall back to
     # ``energy`` (legacy behavior) at the cost of possible chain rejection.
     submit_floor_energy: Optional[float] = None
-    # Count of constraint-satisfying samples in this batch whose
-    # energy strictly clears the *live* (decay-applied) chain target,
-    # i.e. how many of the diverse-valid solutions would survive the
-    # chain's ``energy < max_energy_milli`` filter if submitted right
-    # now. Diagnostic for the dashboard "Solutions" column — distinct
-    # from ``num_valid`` (constraint-satisfying count, threshold-blind).
-    # ``None`` when the caller didn't pass a live threshold (e.g.
-    # mempool path, which has no decay) or the ratchet's lenient eval
-    # had no valid solutions at all.
-    num_meeting_target: Optional[int] = None
 
 
 @dataclass

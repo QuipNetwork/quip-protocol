@@ -76,8 +76,10 @@ _QPU_HANDLE_FIELD_WHITELIST = frozenset({
     # Match the v0.1 ``nodes.json`` shape exactly: dashboards care about
     # the solver name and daily budget. Internal estimation knobs
     # (``qpu_min_blocks_for_estimation``, ``qpu_ema_alpha``) are operator
-    # tuning, not identity — they don't leave the node.
-    "solver", "daily_budget",
+    # tuning, not identity — they don't leave the node. The throughput
+    # overrides ``num_reads`` / ``annealing_time_us`` are deliberately
+    # surfaced so dashboards can show which params each miner is running.
+    "solver", "daily_budget", "num_reads", "annealing_time_us",
 })
 
 # Case-insensitive substrings that ban a key from any telemetry

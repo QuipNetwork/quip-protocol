@@ -441,6 +441,13 @@ def _build_qpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
                 cfg_block["region"] = dev["region"]
             if dev.get("token") is not None:
                 cfg_block["token"] = dev["token"]
+            # Throughput-tuning overrides: flow through to DWaveMiner
+            # __init__ as kwargs of the same name. Absent => use the
+            # hardcoded quality defaults in ``_adapt_mining_params``.
+            if dev.get("num_reads") is not None:
+                cfg_block["num_reads"] = dev["num_reads"]
+            if dev.get("annealing_time_us") is not None:
+                cfg_block["annealing_time_us"] = dev["annealing_time_us"]
             specs.append(
                 {
                     "id": f"{node_id}-QPU-{tag}-{i}",

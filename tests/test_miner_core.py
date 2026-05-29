@@ -266,6 +266,40 @@ def test_toml_dwave_section_round_trips_all_keys(tmp_path):
     assert cfg["qpu_ema_alpha"] == 0.25
 
 
+def test_toml_dwave_throughput_overrides_round_trip(tmp_path):
+    """``[dwave].num_reads`` and ``annealing_time_us`` flow into the spec
+    cfg so DWaveMiner.__init__ picks them up. Absent keys do not appear
+    so the constructor's default of None drives the
+    ``_adapt_mining_params`` fallback to the throughput-tuned hardcoded
+    values (112 reads x 80us)."""
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import _build_qpu_specs
+
+    p = tmp_path / "throughput.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[dwave]\n'
+        'daily_budget = "60s"\n'
+        'num_reads = 128\n'
+        'annealing_time_us = 20.0\n'
+    )
+    backends = load_backend_config(p)
+    specs = _build_qpu_specs("rig", backends)
+    cfg = specs[0]["cfg"]
+    assert cfg["num_reads"] == 128
+    assert cfg["annealing_time_us"] == 20.0
+
+    p2 = tmp_path / "no_overrides.toml"
+    p2.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[dwave]\ndaily_budget = "60s"\n'
+    )
+    backends2 = load_backend_config(p2)
+    cfg2 = _build_qpu_specs("rig", backends2)[0]["cfg"]
+    assert "num_reads" not in cfg2
+    assert "annealing_time_us" not in cfg2
+
+
 def test_toml_dwave_token_does_not_leak_to_descriptor(tmp_path):
     """Defense-in-depth regression: even though the dwave cfg now
     carries `token`, the descriptor pipeline's whitelist

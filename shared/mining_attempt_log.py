@@ -1,64 +1,84 @@
-"""Append-only JSONL log for mining attempts and submissions.
+"""Per-dispatch on-disk attempts archive.
 
-Two parallel write paths feed the same query API:
+Layout (one directory per dispatch_id):
 
-  - **Attempts** (worker process, one per mining iteration). Tagged
-    with ``(miner_id, dispatch_id, iter_num)`` and the per-iteration
-    metrics ``evaluate_sampleset`` already produces. Written from the
-    child mining-worker process, so each worker owns its own file —
-    no inter-process locking needed.
-  - **Submissions** (controller process, one per ``submit_proof``
-    extrinsic). Tagged with a monotonic ``solution_id`` the controller
-    assigns at submit time. Carries ``(miner_id, dispatch_id)`` so the
-    query layer can correlate back to the attempts that fed it.
+    {base_dir}/
+      next_solution_id              # monotonic counter persisted across restarts
+      submissions_index.jsonl       # append-only {solution_id, dispatch_id, ...}
+                                    # — fast solution_id → dispatch_id lookup
+      {dispatch_id}/
+        attempts-{miner_id}.jsonl   # append-on-event: one line per annealer return
+                                    # Includes solution_meta scalars + submission ref
+                                    # on the iter that submitted (if any).
+        metadata-{miner_id}.json    # plain JSON, rewritten on every event:
+                                    # aggregate per (dispatch, miner) — n_attempts,
+                                    # n_stored, n_submitted, best_energy_seen, ...
+        submission.json             # written when controller submits to chain
+                                    # (only one per dispatch, by definition).
+        solutions/
+          {iter:06d}-{nonce8}       # binary file: hex of top-5 packed spins
+                                    # Written ONLY when an attempt is
+                                    # "stored" or "submitted".
 
-Files live under ``~/.quip-miner/mining_attempts/`` and rotate by date.
-Per-worker files use ``attempts-{miner_id}-{YYYY-MM-DD}.jsonl``;
-controller files use ``submissions-{YYYY-MM-DD}.jsonl``. The naming is
-deliberately readable rather than compact — operators dig through
-these by hand when triaging a missed-reward complaint.
+The previous flat date-keyed layout
+(``attempts-{miner_id}-{date}.jsonl`` + ``submissions-{date}.jsonl``)
+is replaced wholesale. Operators querying historical attempts will
+need data migration if running this on an existing log directory.
 
-Query primitives (consumed by the telemetry API in
-``shared.telemetry_api``):
+Query primitives:
 
-  - ``query_by_solution_id(n)`` → ``{submission, attempts}`` view
-  - ``query_by_dispatch(miner_id, dispatch_id, limit)`` → just the
-    attempts that fed that dispatch
-
-"Solution #" is the controller's monotonic counter, not the chain's
-winning block number — many submissions never make it to a win (stale
-context, sibling raced us, chain rejected). Tracking attempts against
-the locally-assigned id lets you ask "what did we try when we
-submitted #42?" even if #42 didn't win.
+  - ``query_by_solution_id(n)`` → ``{submission, attempts}`` —
+    looks up dispatch_id via ``submissions_index.jsonl`` then reads
+    the per-dispatch dir.
+  - ``query_by_dispatch(miner_id, dispatch_id, limit)`` → ``[attempts]``
+    — reads the per-dispatch ``attempts-{miner_id}.jsonl`` directly.
+  - ``query_stored_solutions(dispatch_id, miner_id=None)`` → list of
+    ``{iter, nonce_hex, top_5_solutions_hex, top_5_energies}`` — reads
+    files from the per-dispatch ``solutions/`` folder.
 """
 from __future__ import annotations
 
 import json
 import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional
+from typing import Any, Iterable, Iterator, List, Optional, Tuple
 
 
 DEFAULT_LOG_DIR: Path = Path("~/.quip-miner/mining_attempts").expanduser()
 
 
-def _today_utc() -> str:
-    """``YYYY-MM-DD`` in UTC. Matches how operators read these files
-    across timezones — dispatching at 23:55 local vs. 00:05 local
-    shouldn't fragment a debugging session across two files for
-    arbitrary reasons."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+# ----------------------------------------------------------------------
+# Filename helpers
+# ----------------------------------------------------------------------
 
 
 def _safe_filename_part(s: str) -> str:
-    """Strip filesystem-unsafe chars from miner_id for the filename."""
+    """Strip filesystem-unsafe chars from a string for filename use."""
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in s)
 
 
+def _now_ns() -> int:
+    """Nanosecond-precision UTC timestamp. Iteration-level events are
+    sub-microsecond on GPU paths; ms granularity would collapse them
+    onto a single bucket and make per-attempt ordering impossible to
+    reconstruct."""
+    return time.time_ns()
+
+
+def _dispatch_dir(log_dir: Path, dispatch_id: int) -> Path:
+    """Per-dispatch directory: ``{log_dir}/{dispatch_id}/``."""
+    return log_dir / str(dispatch_id)
+
+
+def _solution_filename(iter_num: int, nonce_hex: str) -> str:
+    """``{iter:06d}-{nonce_first8}`` — sortable by iter, content-addressed."""
+    nonce_short = nonce_hex[:8] if nonce_hex else "0" * 8
+    return f"{iter_num:06d}-{nonce_short}"
+
+
 # ----------------------------------------------------------------------
-# Writers
+# Append helper (worker-side files)
 # ----------------------------------------------------------------------
 
 
@@ -66,12 +86,12 @@ class _JsonlAppender:
     """Append-only JSONL file with a tiny in-process lock.
 
     The lock is per-instance, not per-file — concurrent writers to the
-    same file from different processes would race. In practice each
-    instance is owned by exactly one process (the worker for attempts,
-    the controller for submissions) so this is sufficient. Each
-    ``write`` is a single small line, well under POSIX's
-    ``PIPE_BUF`` atomicity guarantee, so even if cross-process writes
-    landed in the same file the line boundaries wouldn't tear.
+    same file from different processes would race. Each instance is
+    owned by exactly one process (the worker for attempts, the
+    controller for submissions). Each ``write`` is a single small line
+    well under POSIX's ``PIPE_BUF`` atomicity guarantee, so even if
+    cross-process writes landed in the same file the line boundaries
+    wouldn't tear.
     """
 
     def __init__(self, path: Path) -> None:
@@ -92,14 +112,20 @@ class _JsonlAppender:
                 fh.write(line)
 
 
-class AttemptLogger:
-    """Worker-side per-iteration logger.
+# ----------------------------------------------------------------------
+# AttemptLogger — per-iteration attempt records (worker-side)
+# ----------------------------------------------------------------------
 
-    Constructed lazily in the worker process (so each ``MinerHandle``
-    has its own file). ``record`` is non-throwing — a failed write
-    logs a warning but never blocks mining. The file path is chosen
-    once at construction and reused; rotation across UTC midnight
-    creates a new file on the next call.
+
+class AttemptLogger:
+    """Per-iteration mining attempt logger.
+
+    One instance per worker process; not safe to share across processes
+    (the in-process lock won't synchronize). Writes one JSONL line per
+    annealer return to ``{base}/{dispatch_id}/attempts-{miner_id}.jsonl``.
+
+    ``record`` is non-throwing — a failed write logs a warning but
+    never blocks mining.
     """
 
     def __init__(
@@ -112,19 +138,31 @@ class AttemptLogger:
         self.miner_id = miner_id
         self.miner_type = miner_type
         self.log_dir = log_dir
-        self._appender_by_date: dict[str, _JsonlAppender] = {}
+        self._appender_by_dispatch: dict[int, _JsonlAppender] = {}
+        self._metadata_by_dispatch: dict[int, MetadataLogger] = {}
 
-    def _appender(self) -> _JsonlAppender:
-        date = _today_utc()
-        existing = self._appender_by_date.get(date)
+    def _appender(self, dispatch_id: int) -> _JsonlAppender:
+        existing = self._appender_by_dispatch.get(dispatch_id)
         if existing is not None:
             return existing
-        path = self.log_dir / (
-            f"attempts-{_safe_filename_part(self.miner_id)}-{date}.jsonl"
+        path = (
+            _dispatch_dir(self.log_dir, dispatch_id)
+            / f"attempts-{_safe_filename_part(self.miner_id)}.jsonl"
         )
         new = _JsonlAppender(path)
-        self._appender_by_date[date] = new
+        self._appender_by_dispatch[dispatch_id] = new
         return new
+
+    def _metadata(self, dispatch_id: int) -> "MetadataLogger":
+        existing = self._metadata_by_dispatch.get(dispatch_id)
+        if existing is not None:
+            return existing
+        ml = MetadataLogger(
+            self.miner_id, dispatch_id,
+            log_dir=self.log_dir, miner_type=self.miner_type,
+        )
+        self._metadata_by_dispatch[dispatch_id] = ml
+        return ml
 
     def record(
         self,
@@ -138,16 +176,20 @@ class AttemptLogger:
         post_processed: bool,
         stored_as_best: bool,
         num_valid: Optional[int] = None,
-        num_solutions_meeting_target: Optional[int] = None,
         diversity_milli: Optional[int] = None,
         threshold_milli: Optional[int] = None,
         ratchet_threshold_milli: Optional[int] = None,
         result_kind: str = "rejected",
         mining_time_us: Optional[int] = None,
         qpu_access_time_us: Optional[int] = None,
+        feeder_ready: Optional[int] = None,
+        feeder_drained_count: Optional[int] = None,
+        feeder_pop_wait_total_s: Optional[float] = None,
+        solution_meta: Optional[dict] = None,
+        solution_id: Optional[int] = None,
         error: Optional[str] = None,
     ) -> None:
-        """Write one attempt record.
+        """Write one attempt record + update the dispatch metadata.
 
         ``result_kind`` is the per-iteration outcome:
           - ``"rejected"`` — iteration didn't beat the ratchet's gate
@@ -155,20 +197,25 @@ class AttemptLogger:
           - ``"submitted"`` — chain threshold crossed; returned for submit
           - ``"error"`` — sampling / post-processing raised
 
-        ``qpu_access_time_us`` is D-Wave's ``qpu_programming_time +
-        qpu_sampling_time`` (microseconds) for this iteration's sampleset
-        when a QPU backend produced it. ``None`` for CPU/CUDA/etc. backends
-        and for QPU iterations whose sampleset arrived without timing info.
+        ``num_valid`` is the count of unique samples meeting the energy
+        threshold (snapshot or live decayed). The chain accepts when
+        ``num_valid >= min_solutions``.
+
+        ``solution_meta`` is the scalar diagnostic dict produced by
+        :func:`shared.quantum_proof_of_work.compute_solution_meta` —
+        embedded inline in the JSONL line.
+
+        ``solution_id`` is set only when this iter resulted in a
+        submission; lets ``query_by_solution_id`` back-resolve.
+
+        Side effect: metadata-{miner_id}.json gets rewritten with the
+        updated aggregate (n_attempts, n_stored, n_submitted,
+        best_energy_seen, qpu_time_total_us).
         """
         record = {
             "type": "attempt",
             "ts_ns": _now_ns(),
             "miner_id": self.miner_id,
-            # `miner_type` mirrors `MinerHandle.miner_type` (CPU / CUDA /
-            # METAL / MODAL / QPU). Lets the indexer + dashboard show
-            # which backend produced an attempt without parsing miner_id.
-            # Empty string for legacy callers that didn't pass it; the
-            # parser tolerates both.
             "miner_type": self.miner_type,
             "dispatch_id": dispatch_id,
             "iter": iter_num,
@@ -177,7 +224,6 @@ class AttemptLogger:
             "best_energy_milli": best_energy_milli,
             "num_samples": num_samples,
             "num_valid": num_valid,
-            "num_solutions_meeting_target": num_solutions_meeting_target,
             "diversity_milli": diversity_milli,
             "threshold_milli": threshold_milli,
             "ratchet_threshold_milli": ratchet_threshold_milli,
@@ -186,77 +232,287 @@ class AttemptLogger:
             "result_kind": result_kind,
             "mining_time_us": mining_time_us,
             "qpu_access_time_us": qpu_access_time_us,
+            "feeder_ready": feeder_ready,
+            "feeder_drained_count": feeder_drained_count,
+            "feeder_pop_wait_total_s": feeder_pop_wait_total_s,
+            "solution_meta": solution_meta,
+            "solution_id": solution_id,
             "error": error,
         }
         try:
-            self._appender().write(record)
+            self._appender(dispatch_id).write(record)
         except OSError as exc:
-            # Don't let a disk-full / readonly fs break the mining
-            # loop. Surface as a warning so operators notice.
             import logging
             logging.getLogger(__name__).warning(
                 "AttemptLogger.record: write failed: %s", exc,
             )
+            return
+
+        # Update aggregate metadata. Failures here also don't block.
+        try:
+            self._metadata(dispatch_id).update_from_attempt(
+                best_energy_milli=best_energy_milli,
+                result_kind=result_kind,
+                qpu_access_time_us=qpu_access_time_us,
+                mining_time_us=mining_time_us,
+            )
+        except OSError as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "AttemptLogger.metadata update failed: %s", exc,
+            )
+
+
+# ----------------------------------------------------------------------
+# MetadataLogger — per-dispatch per-miner aggregate (rewritten on update)
+# ----------------------------------------------------------------------
+
+
+class MetadataLogger:
+    """Per-dispatch per-miner aggregate JSON file.
+
+    Lives at ``{base}/{dispatch_id}/metadata-{miner_id}.json``. Not a
+    JSONL — it's a single JSON object rewritten on every update. Each
+    rewrite is via tmp-file + os.replace so concurrent readers never
+    see a partial file.
+    """
+
+    def __init__(
+        self,
+        miner_id: str,
+        dispatch_id: int,
+        log_dir: Path = DEFAULT_LOG_DIR,
+        *,
+        miner_type: str = "",
+    ) -> None:
+        self.miner_id = miner_id
+        self.dispatch_id = dispatch_id
+        self.log_dir = log_dir
+        self.miner_type = miner_type
+        self._lock = threading.Lock()
+        self._path = (
+            _dispatch_dir(log_dir, dispatch_id)
+            / f"metadata-{_safe_filename_part(miner_id)}.json"
+        )
+        self._tmp_path = self._path.with_suffix(".json.tmp")
+        # In-memory snapshot of the aggregate. Loaded lazily from disk
+        # so restarts pick up where we left off within a dispatch.
+        self._state: Optional[dict] = None
+
+    def _initial_state(self) -> dict:
+        return {
+            "miner_id": self.miner_id,
+            "miner_type": self.miner_type,
+            "dispatch_id": self.dispatch_id,
+            "n_attempts": 0,
+            "n_stored": 0,
+            "n_submitted": 0,
+            "n_errored": 0,
+            "best_energy_milli": None,
+            "qpu_time_total_us": 0,
+            "mining_time_total_us": 0,
+            "first_ts_ns": None,
+            "last_ts_ns": None,
+            "submission": None,
+        }
+
+    def _load_or_init(self) -> dict:
+        if self._state is not None:
+            return self._state
+        if self._path.exists():
+            try:
+                with self._path.open("r", encoding="utf-8") as fh:
+                    self._state = json.load(fh)
+                return self._state
+            except (OSError, json.JSONDecodeError):
+                pass
+        self._state = self._initial_state()
+        return self._state
+
+    def _write_atomic(self, state: dict) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._tmp_path.open("w", encoding="utf-8") as fh:
+            json.dump(state, fh, separators=(",", ":"), default=str)
+        import os
+        os.replace(self._tmp_path, self._path)
+
+    def update_from_attempt(
+        self,
+        *,
+        best_energy_milli: int,
+        result_kind: str,
+        qpu_access_time_us: Optional[int],
+        mining_time_us: Optional[int],
+    ) -> None:
+        with self._lock:
+            state = self._load_or_init()
+            state["n_attempts"] += 1
+            if result_kind == "stored":
+                state["n_stored"] += 1
+            elif result_kind == "submitted":
+                state["n_submitted"] += 1
+            elif result_kind == "error":
+                state["n_errored"] += 1
+            best = state.get("best_energy_milli")
+            if best is None or best_energy_milli < best:
+                state["best_energy_milli"] = best_energy_milli
+            if qpu_access_time_us is not None:
+                state["qpu_time_total_us"] = (
+                    state.get("qpu_time_total_us", 0) + qpu_access_time_us
+                )
+            if mining_time_us is not None:
+                state["mining_time_total_us"] = (
+                    state.get("mining_time_total_us", 0) + mining_time_us
+                )
+            now = _now_ns()
+            if state.get("first_ts_ns") is None:
+                state["first_ts_ns"] = now
+            state["last_ts_ns"] = now
+            self._write_atomic(state)
+
+    def attach_submission(self, submission: dict) -> None:
+        """Record that this dispatch was submitted (called by controller)."""
+        with self._lock:
+            state = self._load_or_init()
+            state["submission"] = submission
+            self._write_atomic(state)
+
+
+# ----------------------------------------------------------------------
+# SolutionStore — binary archive of top-5 spin configs (worker-side)
+# ----------------------------------------------------------------------
+
+
+class SolutionStore:
+    """Top-5 packed-spin archive for stored/submitted attempts.
+
+    Files at ``{base}/{dispatch_id}/solutions/{iter:06d}-{nonce8}``.
+    Content is JSON (small, ~6KB per file) carrying
+    ``{nonce_hex, top_5_solutions_hex, top_5_energies}``. We use JSON
+    not raw bytes because operators need to see the energies alongside
+    the spin packing.
+
+    One instance per worker. The per-dispatch dir is created lazily;
+    write failures log a warning but never block mining.
+    """
+
+    def __init__(
+        self, miner_id: str, log_dir: Path = DEFAULT_LOG_DIR,
+    ) -> None:
+        self.miner_id = miner_id
+        self.log_dir = log_dir
+
+    def _path(self, dispatch_id: int, iter_num: int, nonce_hex: str) -> Path:
+        return (
+            _dispatch_dir(self.log_dir, dispatch_id)
+            / "solutions"
+            / _solution_filename(iter_num, nonce_hex)
+        )
+
+    def record(
+        self,
+        *,
+        dispatch_id: int,
+        iter_num: int,
+        nonce_hex: str,
+        salt_hex: str,
+        top_5_solutions_hex: List[str],
+        top_5_energies: List[float],
+        result_kind: str,
+    ) -> None:
+        """Write a stored solution file. ``result_kind`` is preserved
+        for auditing (so a reader can tell whether this attempt also
+        submitted to chain)."""
+        path = self._path(dispatch_id, iter_num, nonce_hex)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "miner_id": self.miner_id,
+                "dispatch_id": dispatch_id,
+                "iter": iter_num,
+                "nonce_hex": nonce_hex,
+                "salt_hex": salt_hex,
+                "result_kind": result_kind,
+                "top_5_solutions_hex": top_5_solutions_hex,
+                "top_5_energies": top_5_energies,
+            }
+            with path.open("w", encoding="utf-8") as fh:
+                json.dump(record, fh, separators=(",", ":"), default=str)
+        except OSError as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "SolutionStore.record: write failed: %s", exc,
+            )
+
+
+# ----------------------------------------------------------------------
+# SubmissionLogger — controller-side per-dispatch submission record
+# ----------------------------------------------------------------------
 
 
 class SubmissionLogger:
-    """Controller-side per-submission logger.
+    """Controller-side submission archive.
 
-    One instance per controller. Owns the monotonic ``solution_id``
-    counter — callers don't pass an id, they receive one back.
+    One instance per controller process. Owns the monotonic
+    ``solution_id`` counter, persisted in ``{base}/next_solution_id``
+    so restarts don't reset.
+
+    Writes two artifacts per submission:
+
+    - ``{base}/{dispatch_id}/submission.json`` — the submission record
+      (single object, rewritten if called more than once for the same
+      dispatch). Also attached to the winner miner's metadata.json.
+    - ``{base}/submissions_index.jsonl`` — append-only
+      ``{solution_id, dispatch_id, miner_id, ts_ns}`` for
+      fast solution_id → dispatch_id lookup.
     """
 
     def __init__(self, log_dir: Path = DEFAULT_LOG_DIR) -> None:
         self.log_dir = log_dir
-        self._appender_by_date: dict[str, _JsonlAppender] = {}
         self._lock = threading.Lock()
-        self._next_solution_id: int = self._scan_for_max_solution_id() + 1
+        self._counter_path = log_dir / "next_solution_id"
+        self._index_path = log_dir / "submissions_index.jsonl"
+        self._index_appender = _JsonlAppender(self._index_path)
+        self._next_solution_id: int = self._restore_counter()
 
-    def _scan_for_max_solution_id(self) -> int:
-        """Recover the high-water mark from existing files on disk.
-
-        The ``solution_id`` must be monotonic across process restarts
-        too — a restart should not reset to 1 and shadow older
-        entries. Scan the most recent files for the highest id and
-        resume from there + 1.
-        """
-        if not self.log_dir.exists():
-            return 0
+    def _restore_counter(self) -> int:
+        """Read the persisted counter, falling back to scanning the
+        index file (then defaulting to 1). The counter file lets
+        startup be O(1); the scan is the resilience path for cases
+        where the counter file went missing but the index survived."""
+        try:
+            return int(self._counter_path.read_text().strip()) + 1
+        except (OSError, ValueError):
+            pass
         highest = 0
-        for path in sorted(self.log_dir.glob("submissions-*.jsonl"), reverse=True):
+        if self._index_path.exists():
             try:
-                with path.open("r", encoding="utf-8") as fh:
+                with self._index_path.open("r") as fh:
                     for line in fh:
                         try:
-                            record = json.loads(line)
+                            rec = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        sol = record.get("solution_id")
-                        if isinstance(sol, int) and sol > highest:
-                            highest = sol
-                # One file is enough; older files can only contain
-                # smaller ids by definition.
-                if highest > 0:
-                    break
+                        sid = rec.get("solution_id")
+                        if isinstance(sid, int) and sid > highest:
+                            highest = sid
             except OSError:
-                continue
-        return highest
+                pass
+        return highest + 1
 
-    def _appender(self) -> _JsonlAppender:
-        date = _today_utc()
-        existing = self._appender_by_date.get(date)
-        if existing is not None:
-            return existing
-        path = self.log_dir / f"submissions-{date}.jsonl"
-        new = _JsonlAppender(path)
-        self._appender_by_date[date] = new
-        return new
+    def _persist_counter(self, used: int) -> None:
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            self._counter_path.write_text(str(used))
+        except OSError:
+            pass
 
     def assign_id(self) -> int:
         """Reserve the next ``solution_id`` for an imminent submit."""
         with self._lock:
             sid = self._next_solution_id
             self._next_solution_id += 1
+            self._persist_counter(sid)
             return sid
 
     def record(
@@ -276,26 +532,18 @@ class SubmissionLogger:
         chain_block_number: Optional[int] = None,
         error: Optional[str] = None,
     ) -> None:
-        """Write one submission record.
+        """Write the per-dispatch submission record + index entry.
 
-        ``outcome`` is one of:
-          - ``"submitted_inblock"`` / ``"submitted_finalized"`` —
-            chain saw it (the storming-prevention check passes still
-            log under these)
-          - ``"rejected_stale"`` — controller dropped before submit
-          - ``"rejected_duplicate"`` — sibling already won this round
-          - ``"chain_error"`` — extrinsic failed (see ``error``)
+        Also attaches the submission to the winning miner's
+        ``metadata-{miner_id}.json`` so dispatch-level queries see the
+        whole picture.
         """
+        ts = _now_ns()
         record = {
             "type": "submission",
-            "ts_ns": _now_ns(),
+            "ts_ns": ts,
             "solution_id": solution_id,
             "miner_id": miner_id,
-            # `miner_type` of the WINNING backend (which MinerHandle
-            # produced the submitted result). Lets dashboards report
-            # which backend type cleared the chain target without
-            # parsing miner_id. Empty string for legacy rows; the
-            # parser tolerates both.
             "miner_type": miner_type,
             "dispatch_id": dispatch_id,
             "energy_milli": energy_milli,
@@ -308,12 +556,43 @@ class SubmissionLogger:
             "outcome": outcome,
             "error": error,
         }
+        # Per-dispatch submission.json.
+        sub_path = _dispatch_dir(self.log_dir, dispatch_id) / "submission.json"
         try:
-            self._appender().write(record)
+            sub_path.parent.mkdir(parents=True, exist_ok=True)
+            with sub_path.open("w", encoding="utf-8") as fh:
+                json.dump(record, fh, separators=(",", ":"), default=str)
         except OSError as exc:
             import logging
             logging.getLogger(__name__).warning(
-                "SubmissionLogger.record: write failed: %s", exc,
+                "SubmissionLogger.record: write %s failed: %s",
+                sub_path, exc,
+            )
+
+        # Attach to winning miner's metadata.json (best effort).
+        try:
+            MetadataLogger(
+                miner_id, dispatch_id, log_dir=self.log_dir,
+                miner_type=miner_type,
+            ).attach_submission(record)
+        except OSError as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "SubmissionLogger.record: metadata attach failed: %s", exc,
+            )
+
+        # Append to global index for solution_id → dispatch_id lookup.
+        try:
+            self._index_appender.write({
+                "solution_id": solution_id,
+                "dispatch_id": dispatch_id,
+                "miner_id": miner_id,
+                "ts_ns": ts,
+            })
+        except OSError as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "SubmissionLogger.record: index append failed: %s", exc,
             )
 
 
@@ -337,6 +616,18 @@ def _iter_jsonl(path: Path) -> Iterator[dict]:
         return
 
 
+def _resolve_solution_id(
+    solution_id: int, log_dir: Path,
+) -> Optional[Tuple[int, str]]:
+    """Look up ``(dispatch_id, miner_id)`` for a given solution_id via
+    the submissions_index. Returns None if not found."""
+    index_path = log_dir / "submissions_index.jsonl"
+    for rec in _iter_jsonl(index_path):
+        if rec.get("solution_id") == solution_id:
+            return (rec.get("dispatch_id"), rec.get("miner_id"))
+    return None
+
+
 def query_by_solution_id(
     solution_id: int,
     *,
@@ -344,31 +635,28 @@ def query_by_solution_id(
 ) -> Optional[dict]:
     """Return ``{submission, attempts}`` for the given ``solution_id``.
 
-    Linear scan over submission files (descending by date) until we
-    find the submission. Then scan the relevant per-miner attempt file
-    for entries matching the submission's ``(miner_id, dispatch_id)``.
+    Resolves the solution_id via the global submissions_index, then
+    reads the per-dispatch ``submission.json`` and
+    ``attempts-{miner_id}.jsonl`` from the dispatch directory.
 
-    Returns ``None`` if the solution_id was never assigned.
+    Returns None when solution_id has no index entry (treat as 404).
     """
-    if not log_dir.exists():
+    resolved = _resolve_solution_id(solution_id, log_dir)
+    if resolved is None:
         return None
+    dispatch_id, miner_id = resolved
+    if dispatch_id is None or miner_id is None:
+        return None
+
+    sub_path = _dispatch_dir(log_dir, dispatch_id) / "submission.json"
     submission: Optional[dict] = None
-    for path in sorted(log_dir.glob("submissions-*.jsonl"), reverse=True):
-        for record in _iter_jsonl(path):
-            if record.get("solution_id") == solution_id:
-                submission = record
-                break
-        if submission is not None:
-            break
-    if submission is None:
-        return None
-    attempts = list(
-        _query_attempts_for(
-            miner_id=submission["miner_id"],
-            dispatch_id=submission["dispatch_id"],
-            log_dir=log_dir,
-        )
-    )
+    try:
+        with sub_path.open("r", encoding="utf-8") as fh:
+            submission = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        submission = None
+
+    attempts = list(query_by_dispatch(miner_id, dispatch_id, log_dir=log_dir))
     return {"submission": submission, "attempts": attempts}
 
 
@@ -377,53 +665,56 @@ def query_by_dispatch(
     dispatch_id: int,
     *,
     log_dir: Path = DEFAULT_LOG_DIR,
-    limit: int = 1000,
+    limit: Optional[int] = None,
 ) -> List[dict]:
-    """Return attempt records for a given ``(miner_id, dispatch_id)``."""
-    attempts = list(_query_attempts_for(
-        miner_id=miner_id, dispatch_id=dispatch_id, log_dir=log_dir,
-    ))
-    return attempts[:limit]
+    """Return attempt records for a single (miner, dispatch)."""
+    path = (
+        _dispatch_dir(log_dir, dispatch_id)
+        / f"attempts-{_safe_filename_part(miner_id)}.jsonl"
+    )
+    out: List[dict] = []
+    for rec in _iter_jsonl(path):
+        out.append(rec)
+        if limit is not None and len(out) >= limit:
+            break
+    return out
 
 
-def _query_attempts_for(
-    *,
-    miner_id: str,
+def query_stored_solutions(
     dispatch_id: int,
-    log_dir: Path,
-) -> Iterable[dict]:
-    if not log_dir.exists():
-        return
-    safe_miner = _safe_filename_part(miner_id)
-    pattern = f"attempts-{safe_miner}-*.jsonl"
-    # Search most recent file first; older dispatches naturally live
-    # in older files, but the typical query is for a recent one.
-    for path in sorted(log_dir.glob(pattern), reverse=True):
-        for record in _iter_jsonl(path):
-            if (
-                record.get("miner_id") == miner_id
-                and record.get("dispatch_id") == dispatch_id
-            ):
-                yield record
+    *,
+    log_dir: Path = DEFAULT_LOG_DIR,
+    miner_id: Optional[str] = None,
+) -> List[dict]:
+    """List archived top-5 spin configs for stored/submitted attempts.
 
-
-# ----------------------------------------------------------------------
-# Internals
-# ----------------------------------------------------------------------
-
-
-def _now_ns() -> int:
-    """Nanosecond-precision UTC timestamp. ``ts_ns`` not ``ts`` because
-    iteration-level events are sub-microsecond on GPU paths; using ms
-    would collapse them onto a single bucket and make per-attempt
-    ordering impossible to reconstruct."""
-    return time.time_ns()
+    Reads the per-dispatch ``solutions/`` folder. Optionally filters
+    by miner_id (matched against the record's ``miner_id`` field).
+    Returns records sorted by iter ascending.
+    """
+    sol_dir = _dispatch_dir(log_dir, dispatch_id) / "solutions"
+    if not sol_dir.is_dir():
+        return []
+    out: List[dict] = []
+    for path in sorted(sol_dir.iterdir()):
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                rec = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if miner_id is not None and rec.get("miner_id") != miner_id:
+            continue
+        out.append(rec)
+    return out
 
 
 __all__ = [
     "DEFAULT_LOG_DIR",
     "AttemptLogger",
+    "MetadataLogger",
+    "SolutionStore",
     "SubmissionLogger",
     "query_by_solution_id",
     "query_by_dispatch",
+    "query_stored_solutions",
 ]
