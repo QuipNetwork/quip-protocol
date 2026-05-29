@@ -80,9 +80,11 @@ class PoolClient:
     async def query_proofs_submitted(self, account: bytes):
         """Return the miner's cumulative ``proofs_submitted`` counter, or None.
 
-        Routes through the pool's idempotent-retry path. Returns None when the
-        miner is not registered or the RPC fails — never raises into the submit
-        path.
+        Routes through the pool's idempotent-retry path; returns None when the
+        miner is not registered. May raise if the pool exhausts its swap
+        retries — submit-path callers should use the controller's
+        ``_query_proofs_submitted_safe`` wrapper, which centralizes the
+        no-raise guarantee.
         """
         return await self._pool.send("query_proofs_submitted", {"account": account})
 

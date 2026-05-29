@@ -1099,13 +1099,7 @@ class SubstrateMinerController:
             # verified is None → RPC failed, inconclusive
             if verified is not None and verified < 0:
                 self.stats.proofs_unverified += 1
-                pow_seq_mismatch: Optional[int] = None
-                try:
-                    pow_seq_mismatch = await self.pool_client.query_proofs_submitted(
-                        self.signer.account_id_bytes()
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
+                pow_seq_mismatch = await self._query_proofs_submitted_safe()
                 self._submission_log.record(
                     solution_id=solution_id,
                     miner_id=envelope.handle_id,

@@ -522,6 +522,24 @@ async def test_verify_proof_recorded_mismatch_returns_negative():
 
 
 
+async def test_verify_proof_recorded_no_winning_solution_returns_negative():
+    """When LastProofBlock is set but winning_solution(N) returns None, the
+    chain reported a proof block with no recorded solution — treat as not-won
+    (the -1 sentinel), distinct from an inconclusive RPC failure (None)."""
+    controller = _bare_controller()
+    controller.signer.account_id_bytes = MagicMock(return_value=b"\x42" * 32)
+    controller.pool_client.query_last_proof_block_number = AsyncMock(return_value=12)
+    controller.pool_client.query_winning_solution = AsyncMock(return_value=None)
+
+    envelope = _ResultEnvelope(
+        result=_mining_result(), context=_context(b"\x10" * 32), handle_id="h1"
+    )
+    result = await controller._verify_proof_recorded(envelope)
+    assert result is not None and result < 0, (
+        "expected negative sentinel when winning_solution(N) returns None"
+    )
+
+
 async def test_verify_proof_recorded_rpc_failure_returns_none():
     """RPC failure during verification returns None so the caller can
     proceed with close-on-receipt fallback rather than retry-storming."""
