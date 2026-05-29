@@ -47,7 +47,6 @@ graph TD
 | ------------------ | -------------------------------------------------------------------------------------------------------- |
 | `graph.py`         | `Graph` and `MultiGraph` classes, graph builders, WL-canonical hashing                                   |
 | `polynomial.py`    | `TuttePolynomial` class with bitstring encoding, modular evaluation                                      |
-| `multivariate.py`  | Multivariate Z polynomial (Sokal) and helpers                                                            |
 | `factorization.py` | Polynomial GCD and factorization                                                                         |
 | `validation.py`    | Kirchhoff spanning-tree verification, NetworkX cross-checks                                              |
 

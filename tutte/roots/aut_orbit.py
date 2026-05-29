@@ -307,7 +307,7 @@ def enumerate_per_cell_aut_group(
     |G| = ∏ over cells of |cell|!. For 3 cells of 4 positions: |G| = 24³
     = 13 824. For 2 cells of 4 positions: |G| = 576.
 
-    Used by `precompute_M_table_pair_orbit` for pair-orbit-aware
+    Supports pair-orbit-aware
     convolution where both state and junction are compressed by the same
     per-cell aut group on shared boundary.
     """

@@ -86,12 +86,6 @@ def test_4_cycle_unbalanced():
            [((0, 2), 0), ((1, 2), 1), ((1, 3), 1), ((0, 3), 1)])
 
 
-def test_min_fuzz_case():
-    """Smallest case that historically exposed the canonicalization bug."""
-    _check([0, 1, 2, 3],
-           [((0, 2), 0), ((1, 2), 1), ((1, 3), 1), ((0, 3), 1)])
-
-
 def test_random_fuzz_5v_8e():
     """Specific previously-failing fuzz case (seed 5)."""
     _check([0, 1, 2, 3, 4],

@@ -1,5 +1,13 @@
 # 6.9 — Signed-Graph DP and σ-Equivariant Decomposition
 
+> **Status (2026-05):** The σ-equivariant cover DP (`sigma_equivariant_dp.py`)
+> and the treewidth-based signed DP (`signed_treewidth.py`) were validated but
+> never beat the general path, so they were moved to
+> [`tutte/deprecated/`](../deprecated/README.md). What remains **live** is the
+> σ-finder `find_best_sigma` (`roots/signed_quotient.py`, used by the engine's
+> chord-ordering) and the elimination-order signed DP `graphs/signed_elim_dp.py`.
+> This document is retained as the theory reference for that work.
+
 ## Summary
 
 For a graph `G` that admits an order-2 automorphism `σ ∈ Aut(G)`, the
@@ -140,7 +148,7 @@ part-swap σ (3 σ-fixed edges).
     - `compute_t_fix_sigma_mod(nodes, edges_with_signs, r_E_G, x, y, p)`
       — σ-invariant Tutte of cover; per-edge multipliers handle free
       and non-free cases.
-- `tutte/graphs/sigma_equivariant_dp.py`:
+- `tutte/deprecated/sigma_equivariant_dp.py` (moved from `graphs/` — see status note above):
     - `compute_tutte_per_orbit_mod(...)` — per-orbit batched DP that
       correctly handles σ-canonicalization (processes σ-paired edges
       together so σ-action commutes with edge order).

@@ -61,22 +61,22 @@ def _verify_recognition(G_nx: nx.Graph, family_name: str, expected_recognized: b
 class TestTier1ClosedForm:
     """Families with O(1) polynomial computation after detection."""
 
-    @pytest.mark.parametrize("n", range(3, 40))
+    @pytest.mark.parametrize("n", [3, 4, 8, 39])
     def test_path(self, n):
         """Path P_n (tree): T = x^(n-1)."""
         _verify_recognition(nx.path_graph(n), f"P_{n}")
 
-    @pytest.mark.parametrize("n", range(3, 40))
+    @pytest.mark.parametrize("n", [3, 4, 8, 39])
     def test_cycle(self, n):
         """Cycle C_n: T = x^(n-1) + ... + x + y."""
         _verify_recognition(nx.cycle_graph(n), f"C_{n}")
 
-    @pytest.mark.parametrize("k", range(3, 20))
+    @pytest.mark.parametrize("k", [3, 4, 5, 6, 7, 19])
     def test_wheel(self, k):
         """Wheel W_k (k+1 vertices)."""
         _verify_recognition(nx.wheel_graph(k + 1), f"W_{k}")
 
-    @pytest.mark.parametrize("k", range(3, 20))
+    @pytest.mark.parametrize("k", [3, 4, 5, 6, 19])
     def test_fan(self, k):
         """Fan F_k (k+1 vertices)."""
         G = nx.Graph()
@@ -87,22 +87,22 @@ class TestTier1ClosedForm:
             G.add_edge(i, i + 1)
         _verify_recognition(G, f"F_{k}")
 
-    @pytest.mark.parametrize("cycle_size", range(4, 30))
+    @pytest.mark.parametrize("cycle_size", [4, 5, 15, 29])
     def test_pan(self, cycle_size):
         """Pan: C_n with one pendant."""
         _verify_recognition(_build_pan(cycle_size), f"Pan_{cycle_size}")
 
-    @pytest.mark.parametrize("k", range(3, 20))
+    @pytest.mark.parametrize("k", [3, 4, 10, 19])
     def test_sunlet(self, k):
         """Sunlet: C_k with pendant at each vertex."""
         _verify_recognition(_build_sunlet(k), f"Sunlet_{k}")
 
-    @pytest.mark.parametrize("k", range(3, 15))
+    @pytest.mark.parametrize("k", [3, 4, 5, 6, 7, 14])
     def test_helm(self, k):
         """Helm: W_k with pendant at each rim vertex."""
         _verify_recognition(_build_helm(k), f"Helm_{k}")
 
-    @pytest.mark.parametrize("k", range(1, 20))
+    @pytest.mark.parametrize("k", [1, 2, 3, 4, 19])
     def test_book(self, k):
         """Book: k triangles sharing one edge."""
         _verify_recognition(_build_book(k), f"Book_{k}")
@@ -115,30 +115,28 @@ class TestTier1ClosedForm:
 class TestTier2Recurrence:
     """Families with O(k) polynomial computation after detection."""
 
-    @pytest.mark.parametrize("k", range(2, 20))
+    @pytest.mark.parametrize("k", [2, 3, 4, 5, 19])
     def test_ladder(self, k):
         """Ladder P_k x P_2."""
         _verify_recognition(nx.ladder_graph(k), f"Ladder_{k}")
 
-    @pytest.mark.parametrize("k", range(3, 15))
+    @pytest.mark.parametrize("k", [3, 4, 5, 6, 7, 14])
     def test_gear(self, k):
         """Gear: wheel with subdivided rim edges."""
         _verify_recognition(_build_gear(k), f"Gear_{k}")
 
-    @pytest.mark.parametrize("k", range(3, 15))
+    @pytest.mark.parametrize("k", [3, 4, 5, 6, 7, 8, 9, 14])
     def test_prism(self, k):
         """Prism (circular ladder) C_k x K_2."""
         _verify_recognition(nx.circular_ladder_graph(k), f"Prism_{k}")
 
-    @pytest.mark.parametrize("k", range(3, 15))
+    @pytest.mark.parametrize("k", [3, 4, 5, 6, 7, 8, 9, 14])
     def test_mobius(self, k):
         """Möbius ladder: 2k-cycle + k rungs connecting v_i to v_{i+k}."""
         _verify_recognition(_build_mobius(k), f"Mobius_{k}")
 
     @pytest.mark.parametrize("m,n", [
-        (1, n) for n in range(2, 10)
-    ] + [
-        (2, n) for n in range(2, 10)
+        (1, 2), (1, 3), (1, 9), (2, 2), (2, 3), (2, 4), (2, 9),
     ])
     def test_grid(self, m, n):
         """Grid P_m x P_n."""

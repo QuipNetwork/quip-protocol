@@ -331,6 +331,39 @@ def _coefficient_polyval(coeff_dict: Dict[int, int], v_val: int) -> int:
     return sum(c * (v_val ** k) for k, c in coeff_dict.items())
 
 
+def _sokal_z_eval_and_interpolate(terms, c_total, n_total, n_edges_total):
+    """Multi-point eval of the Sokal-Z chord-junction formula + bivariate interp.
+
+    Shared tail of the matching (`compute_sokal_z_chord_junction`) and
+    per-component (`..._per_component`) entry points. `terms` is a list of
+    `(t_poly, c_M, v_M, weight)` where `weight(v_val) -> int` is the per-merger
+    coefficient (v**|A_J| in the matching case; a coef-dict polyval in the
+    per-component case). Reconstructs T via
+    Z_M = (x-1)^c_M (y-1)^v_M T(M;x,y), Z = sum weight(v) Z_M,
+    T = Z / ((x-1)^c_total (y-1)^n_total).
+    """
+    r_total = n_total - c_total
+    deg_x_max = r_total
+    deg_y_max = n_edges_total - r_total
+    # Distinct points avoiding x=1, y=1 (conversion singularities).
+    xs = list(range(2, deg_x_max + 3))
+    ys = list(range(2, deg_y_max + 3))
+    values: Dict[Tuple[int, int], int] = {}
+    for x_val in xs:
+        for y_val in ys:
+            v_val = y_val - 1
+            z_sum = 0
+            for (t_poly, c_M, v_M, weight) in terms:
+                t_val = t_poly.evaluate(x_val, y_val)
+                z_M = (x_val - 1) ** c_M * (y_val - 1) ** v_M * t_val
+                z_sum += weight(v_val) * z_M
+            denom = (x_val - 1) ** c_total * (y_val - 1) ** n_total
+            values[(x_val, y_val)] = (z_sum // denom if isinstance(z_sum, int)
+                                      else z_sum / denom)
+    coeffs = _bivariate_interpolate(values, deg_x_max, deg_y_max, xs, ys)
+    return TuttePolynomial.from_coefficients(coeffs)
+
+
 def compute_sokal_z_chord_junction_per_component(
     cell_A: Graph, cell_B: Graph,
     chord_edges: List[Tuple[int, int]],
@@ -497,40 +530,13 @@ def compute_sokal_z_chord_junction_per_component(
         for k, c in combined.items():
             slot[k] = slot.get(k, 0) + c
 
-    merger_T_data: List[Tuple[TuttePolynomial, int, int, Dict[int, int]]] = [
+    terms = [
         (merger_T_cache[k][0], merger_T_cache[k][1], merger_T_cache[k][2],
-         contrib[k])
+         (lambda vv, _cd=contrib[k]: _coefficient_polyval(_cd, vv)))
         for k in contrib
     ]
-
-    # Now evaluate the Sokal Z formula at sufficient points + interpolate
-    n_edges_total = (cell_A.edge_count() + cell_B.edge_count() + n_chord)
-    r_total = n_total - c_total
-    deg_x_max = r_total
-    deg_y_max = n_edges_total - r_total
-
-    xs = list(range(2, deg_x_max + 3))
-    ys = list(range(2, deg_y_max + 3))
-    values: Dict[Tuple[int, int], int] = {}
-    for x_val in xs:
-        for y_val in ys:
-            v_val = y_val - 1
-            z_sum = 0
-            for (t_poly, c_M, v_M, coef_dict) in merger_T_data:
-                t_val = t_poly.evaluate(x_val, y_val)
-                z_M = ((x_val - 1) ** c_M
-                       * (y_val - 1) ** v_M
-                       * t_val)
-                coef_v = _coefficient_polyval(coef_dict, v_val)
-                z_sum += coef_v * z_M
-            denom = ((x_val - 1) ** c_total
-                     * (y_val - 1) ** n_total)
-            t_val_total = (z_sum // denom if isinstance(z_sum, int)
-                           else z_sum / denom)
-            values[(x_val, y_val)] = t_val_total
-
-    coeffs = _bivariate_interpolate(values, deg_x_max, deg_y_max, xs, ys)
-    return TuttePolynomial.from_coefficients(coeffs)
+    n_edges_total = cell_A.edge_count() + cell_B.edge_count() + n_chord
+    return _sokal_z_eval_and_interpolate(terms, c_total, n_total, n_edges_total)
 
 
 def compute_sokal_z_chord_junction(
@@ -644,45 +650,13 @@ def compute_sokal_z_chord_junction(
         _, c_M, v_M = merger_T_cache[merger_key]
         contrib_terms.append((len(A_J), c_M, v_M, merger_key))
 
-    # ---- Step 2: multi-point evaluation + interpolation ----
-    # Determine degree bounds. T(G_1 ⊕ G_2 + E_J) has degree:
-    #   - x-degree ≤ r(E) = |V| - c
-    #   - y-degree ≤ |E| - r(E) = |E| - |V| + c
-    # For G_1 ⊕ G_2 + E_J: |V| = n_total, |E| = |E_A| + |E_B| + |E_J|.
-    n_edges_total = (cell_A.edge_count() + cell_B.edge_count()
-                     + n_chord)
-    r_total = n_total - c_total
-    deg_x_max = r_total
-    deg_y_max = n_edges_total - r_total
-
-    # Pick distinct evaluation points: (i, j) for i in [2..deg_x+2], j in [2..deg_y+2].
-    # Avoid x=1, y=1 (singularities in conversion).
-    xs = list(range(2, deg_x_max + 3))
-    ys = list(range(2, deg_y_max + 3))
-    values: Dict[Tuple[int, int], int] = {}
-    for x_val in xs:
-        for y_val in ys:
-            q_val = (x_val - 1) * (y_val - 1)
-            v_val = y_val - 1
-            z_sum = 0
-            for (size, c_M, v_M, mkey) in contrib_terms:
-                t_poly, _, _ = merger_T_cache[mkey]
-                t_val = t_poly.evaluate(x_val, y_val)
-                # Z(M; q, v) = (x-1)^c(M) (y-1)^|V(M)| · T(M; x, y)
-                # (per T = (x-1)^{-c} (y-1)^{-|V|} Z((x-1)(y-1), y-1))
-                z_M = ((x_val - 1) ** c_M
-                       * (y_val - 1) ** v_M
-                       * t_val)
-                z_sum += (v_val ** size) * z_M
-            # T_total = Z_total / ((x-1)^c_total (y-1)^|V_total|)
-            denom = ((x_val - 1) ** c_total
-                     * (y_val - 1) ** n_total)
-            t_val_total = z_sum // denom if isinstance(z_sum, int) else z_sum / denom
-            values[(x_val, y_val)] = t_val_total
-
-    # ---- Step 3: bivariate Lagrange interpolation ----
-    coeffs = _bivariate_interpolate(values, deg_x_max, deg_y_max, xs, ys)
-    return TuttePolynomial.from_coefficients(coeffs)
+    # ---- Step 2: multi-point eval + bivariate Lagrange interpolation ----
+    terms = [
+        (merger_T_cache[mkey][0], c_M, v_M, (lambda vv, _s=size: vv ** _s))
+        for (size, c_M, v_M, mkey) in contrib_terms
+    ]
+    n_edges_total = cell_A.edge_count() + cell_B.edge_count() + n_chord
+    return _sokal_z_eval_and_interpolate(terms, c_total, n_total, n_edges_total)
 
 
 def _bivariate_interpolate(

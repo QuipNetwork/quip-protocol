@@ -285,7 +285,7 @@ that bit Cm₃ attempts:
   `TuttePolynomial.__add__` per-chunk encode/decode overhead.
 - **Modular point-value DP**: `TuttePolynomial.evaluate_mod` +
   1D/2D Lagrange interpolation + CRT combine
-  (`tutte/roots/interpolation.py`) replaced full polynomial allocation
+  (`tutte/deprecated/interpolation.py`) replaced full polynomial allocation
   with single-int accumulation at each `(x, y, p)` grid point. Validated
   on Cm₂ to recover the engine polynomial bit-for-bit.
 - **Fast modular M-table**: `precompute_M_table_mod` mirrors
@@ -300,7 +300,7 @@ that bit Cm₃ attempts:
 
 `TuttePolynomial.evaluate_mod(x, y, p)` (Horner-style, integer-only)
 combined with bivariate Lagrange in
-[`tutte/roots/interpolation.py`](../roots/interpolation.py) and CRT
+[`tutte/deprecated/interpolation.py`](../deprecated/interpolation.py) and CRT
 combine (via existing `_crt_multi`) gives **bit-exact** polynomial
 recovery from `(d_x + 1)(d_y + 1)` grid evaluations. Defense in depth
 verifies `T(1, 1) = #ST` AND `T(2, 2) = 2^|E|` after recovery — the

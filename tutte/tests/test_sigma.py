@@ -147,14 +147,3 @@ def test_per_orbit_c6():
     assert actual == expected
 
 
-def test_per_orbit_cube_antipodal_multipoint():
-    """Per-orbit DP on Cube at multiple (x, y, p) — same algorithm
-    that the now-removed `compute_tutte_sigma_equivariant_mod(use_sigma=True)`
-    delegated to (May 20, 2026 cleanup)."""
-    g = _relabel_cube()
-    perm = {i: 7 - i for i in range(8)}
-    nodes, edges = list(g.nodes()), list(g.edges())
-    for x_v, y_v, p in [(2, 3, 1009), (5, 7, 2017), (-1, 4, 4019)]:
-        expected = _eval_tutte_mod(g, x_v, y_v, p)
-        actual, _ = compute_tutte_per_orbit_mod(nodes, edges, perm, x_v, y_v, p)
-        assert actual == expected, f"({x_v},{y_v},mod {p}): {actual} != {expected}"

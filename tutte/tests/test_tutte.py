@@ -593,7 +593,7 @@ from tutte.graphs.covering import (KMatchingJunction,  # noqa: E402
                                    extract_cell_topology)
 from tutte.graphs.k_sum import clique_chord_k_sum  # noqa: E402
 from tutte.lookup.core import load_default_table  # noqa: E402
-from tutte.multivariate import MultivariateTutte, UniformZ  # noqa: E402
+from tutte.roots.multivariate import MultivariateTutte, UniformZ  # noqa: E402
 from tutte.synthesis.hybrid import HybridSynthesisEngine  # noqa: E402
 
 

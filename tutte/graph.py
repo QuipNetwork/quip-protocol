@@ -308,6 +308,24 @@ class Graph:
         )
         return Graph(nodes=new_nodes, edges=new_edges)
 
+    def induced_relabeled(self, relabel: Dict[int, int]) -> 'Graph':
+        """Induced subgraph on ``relabel.keys()`` with vertices renamed.
+
+        Keeps only edges whose endpoints are both in ``relabel`` and renames
+        each kept edge ``(u, v)`` to ``(relabel[u], relabel[v])``; the node set
+        is ``relabel.values()``. Unlike :meth:`subgraph` (which preserves the
+        original labels), this relabels — typically to ``0..k-1`` for a cell.
+        """
+        new_edges: Set[Tuple[int, int]] = set()
+        for (u, v) in self.edges:
+            if u in relabel and v in relabel:
+                a, b = relabel[u], relabel[v]
+                new_edges.add((min(a, b), max(a, b)))
+        return Graph(
+            nodes=frozenset(relabel.values()),
+            edges=frozenset(new_edges),
+        )
+
     def edge_induced_subgraph(self, edges: Set[Tuple[int, int]]) -> 'Graph':
         """Return edge-induced subgraph."""
         normalized_edges = set()

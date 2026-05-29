@@ -126,7 +126,7 @@ On Chimera Cm2 (4 junctions), the state cache provides a 3.2× speedup versus a 
 
 ## 6. Empirical Validation
 
-Implementation: `tutte/graphs/covering.py:detect_kmatching_topology` and `apply_kmatching_formula`, wired as step 2.5 of `tutte/synthesis/engine.py:_synthesize_hierarchical` (between the unified formula of §8.unified and the product formula / chord rule of §8.2).
+Implementation: `tutte/graphs/covering.py:detect_kmatching_topology` and `apply_kmatching_formula`, wired into `tutte/synthesis/engine.py:_try_formula_shortcircuit` (engine step 7.5), which tries the unified formula then the k-matching formula before falling through to the cell-quotient / chord-rule paths.
 
 | target                      |   cells | junctions |   k | method fires        | T match        |
 | --------------------------- | ------: | --------: | --: | ------------------- | -------------- |

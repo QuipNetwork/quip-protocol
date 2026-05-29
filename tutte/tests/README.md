@@ -42,7 +42,7 @@ Fixtures and CLI options live in [`conftest.py`](conftest.py).
 | `test_signed_elim.py`                      | Signed-graph elimination DP (`signed_elim_dp.py`).                                                                      |
 | `test_signed_quotient.py`                  | Signed/twisted Tutte on σ-quotient graphs.                                                                              |
 | `test_sigma.py`                            | σ-equivariant unsigned Tutte DP on 2-fold covers.                                                                       |
-| `test_sparse_interp.py`                    | Sparse Lagrange interpolation helpers used by modular point-value paths.                                                |
+| `test_sparse_interp.py`                    | Sparse Lagrange interpolation helpers (`tutte/deprecated/sparse_interp.py` — superseded, kept for reference).            |
 | `test_zephyr_engine.py`                    | End-to-end engine on D-Wave Zephyr targets (Z(1, 1), Z(1, 2)).                                                          |
 
 ## Markers

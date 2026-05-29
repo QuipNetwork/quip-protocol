@@ -73,7 +73,7 @@ from tutte.validation import (
     compute_tutte_networkx,
     _exact_num_spanning_trees,
 )
-import tutte.transfer_matrix._c_extension as _c_ext
+import tutte.transfer_matrix._transfer_matrix_c as _c_ext
 
 
 

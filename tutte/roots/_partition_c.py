@@ -170,8 +170,7 @@ ffi.cdef(r"""
        i is at offset i * n_universe.
 
        This implements the H-canonicalization inner loop of
-       `precompute_M_table_pair_orbit` (R7 prototype in
-       `tutte/roots/cell_quotient_helpers.py:335`) in C. Per
+       the pair-orbit M-table DP (R7 prototype, since removed) in C. Per
        `tutte/research/plans/cm3_unlock_design.md`: ~14k ops per pair
        in Python → projected ~10× speedup in C.
 
@@ -2383,7 +2382,7 @@ def h_canonicalize_c_wrapper(
     that lexicographically minimizes over all permutations in H, or
     None on C-ext unavailable / overflow.
 
-    Mirrors the inner loop of `precompute_M_table_pair_orbit`:
+    Mirrors the pair-orbit H-canonicalization inner loop:
     `h_canon = min(apply_perm_to_partition(P, h) for h in H)`.
 
     Args:
@@ -2455,7 +2454,7 @@ def h_canonicalize_c_batched(
 ) -> Optional[List[Tuple[Tuple[int, ...], ...]]]:
     """Batched H-canonicalize: marshal H ONCE, canonicalize many P's.
 
-    For the `precompute_M_table_pair_orbit` inner loop, the per-cell-pair
+    For the pair-orbit H-canonicalization inner loop, the per-cell-pair
     pattern is to canonicalize `len(members)` partitions (~thousands)
     against the SAME H. Per-call marshaling of H in
     `h_canonicalize_c_wrapper` costs ~5ms × n_H × n_univ which dominates;

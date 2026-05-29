@@ -871,6 +871,22 @@ def test_interpolation_crt_combine_exact_recovery():
     assert exact == {(3, 1): 12345, (2, 0): -678, (0, 4): 91011}
 
 
+def _evaluate_poly_dict_mod(d, x, y, p):
+    """Evaluate a polynomial coefficient dict at (x, y) modulo p.
+
+    Relocated test oracle (formerly in tutte.roots.cell_quotient_helpers;
+    removed from the live module in the 2026-05 cleanup — it only ever
+    backed the test below).
+    """
+    if p <= 0:
+        raise ValueError("modulus must be positive")
+    x_m, y_m = x % p, y % p
+    result = 0
+    for (i, j), c in d.items():
+        result = (result + (c % p) * pow(x_m, i, p) * pow(y_m, j, p)) % p
+    return result
+
+
 def test_precompute_M_table_mod_matches_evaluated_polynomial():
     """`precompute_M_table_mod(..., x_val, y_val, p)` produces the same
     M-table values as `precompute_M_table(...)` evaluated at `(x_val,
@@ -878,8 +894,7 @@ def test_precompute_M_table_mod_matches_evaluated_polynomial():
     direct int accumulation should be bit-identical to the polynomial
     path followed by post-hoc modular evaluation.
     """
-    from tutte.roots.cell_quotient_helpers import (_evaluate_poly_dict_mod,
-                                                   _poly_to_dict,
+    from tutte.roots.cell_quotient_helpers import (_poly_to_dict,
                                                    precompute_M_table,
                                                    precompute_M_table_mod)
 
@@ -1473,168 +1488,6 @@ def test_interleaved_dp_cm2_full():
 
 
 @pytest.mark.slow
-def test_pair_orbit_M_table_matches_streamed_on_cm2_row():
-    """`precompute_M_table_pair_orbit` reproduces v5 streamed's M-table on
-    the Cm₂ 2b row-row composition step (K_{4,4} cells joined by a
-    K_{4,4} row T_rooted on row 1's a-side).
-
-    This is the actual use case where compressed × compressed convolution
-    occurs (state after 2a + row 1 both on next_up positions, both
-    compressed by the same row1_scg per-cell groups). The pair-orbit
-    aware path must give the SAME M-table entries as the v5 streamed
-    path (where junction is enumerated internally).
-
-    Slow because it builds the full row DP + 2a state, then computes both
-    M-tables and compares (~2 minutes).
-    """
-    import dwave_networkx as dnx
-    from tutte.graphs.covering import try_hierarchical_partition
-    from tutte.roots.cell_anchor_adapter import (detect_cell_anchor_groups,
-                                                 extract_grid_specs)
-    from tutte.roots.cell_quotient_grid import (_grid_cell_layout,
-                                                is_grid_topology)
-    from tutte.roots.cell_quotient_helpers import (
-        components_touching, orbit_convolve, precompute_M_table,
-        precompute_M_table_pair_orbit)
-    from tutte.roots.cell_quotient_path import compute_path_dp_grouped
-    from tutte.roots.rooted_tutte import (all_partitions,
-                                          relabel_partition_dict,
-                                          t_rooted_cached)
-
-    g = dnx.chimera_graph(2)
-    G_graph = Graph.from_networkx(g)
-    res = try_hierarchical_partition(G_graph, load_default_table())
-    _cell, partition, inter_info = res
-    cag = detect_cell_anchor_groups(partition, inter_info.edges)
-    adj = {i: set() for i in range(len(partition))}
-    for (a, b) in inter_info.cell_adjacencies:
-        adj[a].add(b)
-        adj[b].add(a)
-    rows, cols = is_grid_topology(adj, len(partition))
-    layout = _grid_cell_layout(len(partition), rows, cols, adj)
-    grid_specs = extract_grid_specs(cag, layout)
-
-    cell_nodes = sorted(partition[0])
-    cell_sub = nx.Graph()
-    for u in cell_nodes:
-        for v in g.neighbors(u):
-            if v in cell_nodes:
-                cell_sub.add_edge(u, v)
-    K44 = Graph.from_networkx(cell_sub)
-    cell_anchor_groups: dict = {}
-    for grp_id, vertices in cag.cell_groups[0]:
-        cell_anchor_groups[grp_id] = [cell_nodes.index(v) for v in vertices]
-    M4 = Graph(list(range(8)), [(i, i + 4) for i in range(4)])
-
-    # Per-row compressed path DP.
-    row_results = []
-    for r in range(rows):
-        row_specs = [spec.to_row_spec() for spec in grid_specs[r]]
-        T_dict, _, td, pos_layout, scg = compute_path_dp_grouped(
-            K44, cell_anchor_groups, M4, [0, 1, 2, 3], [4, 5, 6, 7],
-            row_specs, label_offset=100000 * r, return_pos_layout=True,
-            enable_per_cell_compression=True,
-        )
-        row_results.append({
-            "state_T": T_dict, "td": td, "pos_layout": pos_layout, "scg": scg,
-        })
-
-    # Run 2a step to produce the state input for 2b.
-    prev_down, next_up = [], []
-    for c in range(cols):
-        prev_down.extend(row_results[0]["pos_layout"][c][
-            grid_specs[0][c].down_group
-        ])
-        next_up.extend(row_results[1]["pos_layout"][c][
-            grid_specs[1][c].up_group
-        ])
-    v_a = v_b = 4
-    combined_nodes = list(range(cols * 8))
-    combined_edges = [
-        (c * 8 + u, c * 8 + v)
-        for c in range(cols) for u, v in M4.edges
-    ]
-    combined = Graph(combined_nodes, combined_edges)
-    combined_A = [c * 8 + i for c in range(cols) for i in range(4)]
-    combined_B = [c * 8 + 4 + i for c in range(cols) for i in range(4)]
-    T_combined = t_rooted_cached(combined, combined_A + combined_B)
-    map_c = {combined_A[i]: prev_down[i] for i in range(cols * v_a)}
-    for i in range(cols * v_b):
-        map_c[combined_B[i]] = next_up[i]
-    T_combined_pos = relabel_partition_dict(T_combined, map_c)
-    junc_cell_groups = [[prev_down[i], next_up[i]] for i in range(cols * v_a)]
-    junc_orbit_T, junc_orbit_part = {}, {}
-    for P, val in T_combined_pos.items():
-        canon = per_cell_canonical_key(P, junc_cell_groups)
-        if canon not in junc_orbit_T:
-            junc_orbit_T[canon] = val
-            junc_orbit_part[canon] = [P]
-
-    state_orbit_T = row_results[0]["state_T"]
-    state_scg = row_results[0]["scg"]
-    state_orbit_part = {
-        canon: [per_cell_orbit_rep(canon, state_scg)]
-        for canon in state_orbit_T
-    }
-    row1_scg = row_results[1]["scg"]
-    out_orbit_part_2a: dict = {}
-    for P in all_partitions(next_up):
-        P_tup = tuple(sorted(tuple(sorted(b)) for b in P))
-        canon = per_cell_canonical_key(P_tup, row1_scg)
-        out_orbit_part_2a.setdefault(canon, []).append(P_tup)
-    out_orbit_sizes_2a = {
-        ok: len(parts) for ok, parts in out_orbit_part_2a.items()
-    }
-    M_v = precompute_M_table(
-        state_orbit_part, junc_orbit_part,
-        shared_boundary=prev_down, extra_boundary=next_up,
-        out_aut_group=[], state_extra_boundary=[],
-        out_cell_anchor_groups=row1_scg,
-        state_cell_anchor_groups=state_scg,
-        junction_cell_anchor_groups=junc_cell_groups,
-        enumerate_junction_internally=True,
-    )
-    state_T_2a = orbit_convolve(
-        state_orbit_T, junc_orbit_T, M_v, out_orbit_sizes_2a,
-    )
-
-    # 2b: compute M-table BOTH ways (v5 streamed + v7 pair-orbit aware) and
-    # compare entry-by-entry.
-    row1_orbit_T = row_results[1]["state_T"]
-    state_orbit_part_2b = {
-        canon: [per_cell_orbit_rep(canon, row1_scg)] for canon in state_T_2a
-    }
-    row1_orbit_part = {
-        canon: [per_cell_orbit_rep(canon, row1_scg)] for canon in row1_orbit_T
-    }
-
-    M_v5_streamed = precompute_M_table(
-        state_orbit_part_2b, row1_orbit_part,
-        shared_boundary=next_up, extra_boundary=[],
-        out_aut_group=[], state_extra_boundary=[],
-        state_cell_anchor_groups=row1_scg,
-        junction_cell_anchor_groups=row1_scg,
-        enumerate_junction_internally=True,
-    )
-    M_pair_orbit = precompute_M_table_pair_orbit(
-        state_orbit_part_2b, row1_orbit_part,
-        shared_boundary=next_up, extra_boundary=[],
-        state_extra_boundary=[],
-        state_cell_anchor_groups=row1_scg,
-        junction_cell_anchor_groups=row1_scg,
-    )
-
-    assert set(M_v5_streamed.keys()) == set(M_pair_orbit.keys()), (
-        f"key sets differ: v5={len(M_v5_streamed)}, "
-        f"pair_orbit={len(M_pair_orbit)}"
-    )
-    for k in M_v5_streamed:
-        assert M_v5_streamed[k] == M_pair_orbit[k], (
-            f"value mismatch at {k}: "
-            f"v5={M_v5_streamed[k]}, pair_orbit={M_pair_orbit[k]}"
-        )
-
-
 @pytest.mark.slow
 def test_grid_dp_streamed_kab_cm2_matches_engine():
     """Cm2 (2x2 K_{4,4} grid) via streamed grid DP.

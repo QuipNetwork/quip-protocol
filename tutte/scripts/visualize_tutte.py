@@ -196,7 +196,7 @@ def _parse_graph_raw(args) -> tuple:
     # Cell builder: cell_builder=1 + cb_* params
     if args.get("cell_builder", "0") == "1":
         try:
-            from tutte.graphs.cell_builder import build_cell_graph
+            from tutte.scripts.cell_builder import build_cell_graph
 
             def _cell_params(prefix: str, ctype: str) -> dict:
                 """Build the param dict for one cell, including ONLY the keys
@@ -1527,7 +1527,7 @@ def stream():
                     _result_meta["baseline_html"] = ""
                     if cb_compare_baseline:
                         try:
-                            from tutte.graphs.cell_builder import compare_to_baseline
+                            from tutte.scripts.cell_builder import compare_to_baseline
                             from tutte.synthesis.engine import SynthesisEngine
                             from tutte.synthesis.hybrid import HybridSynthesisEngine
                             base_nx, base_label = _build_baseline_graph(

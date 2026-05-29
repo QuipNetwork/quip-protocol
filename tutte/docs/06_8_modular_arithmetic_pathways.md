@@ -78,7 +78,7 @@ The grid needs at least `(d_x + 1)(d_y + 1)` points where
 `(d_x, d_y)` is the polynomial's bidegree. For Cm₂: bidegree (31, 18) →
 need ~600 grid points minimum (with verification: 700+).
 
-Implementation: `tutte/roots/interpolation.py`
+Implementation: `tutte/deprecated/interpolation.py`
 
 ### Step 3 — CRT reconstruction across primes
 
@@ -140,7 +140,7 @@ Design notes live in
 ## Files
 
 - `tutte/polynomial.py:evaluate_mod` — single-point modular evaluation of a TuttePolynomial
-- `tutte/roots/interpolation.py` — 1D and 2D Lagrange + CRT combine
+- `tutte/deprecated/interpolation.py` — 1D and 2D Lagrange + CRT combine
 - `tutte/roots/cell_quotient_helpers.py:precompute_M_and_convolve_streaming_mod` — modular streaming convolve
 - `tutte/roots/_partition_c.py:precompute_M_batched_inner_c_mod` — C-ext dispatch
 - `tutte/research/scripts/cm_modular_interp.py` — multiprocessing wrapper for Cm₂/Cm₃

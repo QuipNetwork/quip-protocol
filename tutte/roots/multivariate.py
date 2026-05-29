@@ -52,7 +52,7 @@ from dataclasses import dataclass
 from math import comb
 from typing import Dict, FrozenSet, Iterable, Tuple
 
-from .polynomial import TuttePolynomial
+from ..polynomial import TuttePolynomial
 
 # ---------- UniformZ (collapsed uniform-v) ----------
 

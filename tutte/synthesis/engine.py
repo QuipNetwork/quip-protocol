@@ -702,19 +702,11 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                     graph, self.table,
                 )
                 if grid_streamed_poly is not None:
-                    _log.record(EventType.CELL_QUOTIENT_DP, "engine",
-                                f"Grid DP (streamed): {n}n {m}e", graph=graph)
-                    self._maybe_emit_cell_partition(graph)
-                    self._log(f"Cell-quotient grid DP (streamed): {n}n, {m}e")
-                    result = SynthesisResult(
-                        polynomial=grid_streamed_poly,
-                        recipe=["Cell-quotient grid DP (streamed)"],
-                        verified=True,
-                        method="cell_quotient_grid_dp_streamed",
+                    return self._emit_cell_quotient_result(
+                        graph, cache_key, grid_streamed_poly,
+                        method='cell_quotient_grid_dp_streamed', recipe='Cell-quotient grid DP (streamed)',
+                        label='Cell-quotient grid DP (streamed)', record_label='Grid DP (streamed)',
                     )
-                    self._cache[cache_key] = result
-                    self._promote_to_table(graph, cache_key, result)
-                    return result
             except Exception:
                 pass  # any failure — fall through
 
@@ -840,20 +832,11 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             try:
                 cq_poly = compute_cell_quotient_cycle_dp(graph, self.table)
                 if cq_poly is not None:
-                    _log.record(EventType.CELL_QUOTIENT_DP, "engine",
-                                f"Cell-quotient cycle DP: {n}n {m}e",
-                                graph=graph)
-                    self._maybe_emit_cell_partition(graph)
-                    self._log(f"Cell-quotient cycle DP: {n}n, {m}e")
-                    result = SynthesisResult(
-                        polynomial=cq_poly,
-                        recipe=["Cell-quotient cycle DP"],
-                        verified=True,
-                        method="cell_quotient_dp",
+                    return self._emit_cell_quotient_result(
+                        graph, cache_key, cq_poly,
+                        method='cell_quotient_dp', recipe='Cell-quotient cycle DP',
+                        label='Cell-quotient cycle DP',
                     )
-                    self._cache[cache_key] = result
-                    self._promote_to_table(graph, cache_key, result)
-                    return result
             except Exception:
                 pass  # any failure — fall through
 
@@ -867,20 +850,11 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
             try:
                 tree_poly = compute_cell_quotient_tree_dp(graph, self.table)
                 if tree_poly is not None:
-                    _log.record(EventType.CELL_QUOTIENT_DP, "engine",
-                                f"Cell-quotient tree DP: {n}n {m}e",
-                                graph=graph)
-                    self._maybe_emit_cell_partition(graph)
-                    self._log(f"Cell-quotient tree DP: {n}n, {m}e")
-                    result = SynthesisResult(
-                        polynomial=tree_poly,
-                        recipe=["Cell-quotient tree DP"],
-                        verified=True,
-                        method="cell_quotient_tree_dp",
+                    return self._emit_cell_quotient_result(
+                        graph, cache_key, tree_poly,
+                        method='cell_quotient_tree_dp', recipe='Cell-quotient tree DP',
+                        label='Cell-quotient tree DP',
                     )
-                    self._cache[cache_key] = result
-                    self._promote_to_table(graph, cache_key, result)
-                    return result
             except Exception:
                 pass  # any failure — fall through
 
@@ -902,20 +876,11 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                     graph, self.table,
                 )
                 if bj_poly is not None:
-                    _log.record(EventType.CELL_QUOTIENT_DP, "engine",
-                                f"Cell-quotient bipartite-junction DP: {n}n {m}e",
-                                graph=graph)
-                    self._maybe_emit_cell_partition(graph)
-                    self._log(f"Cell-quotient bipartite-junction DP: {n}n, {m}e")
-                    result = SynthesisResult(
-                        polynomial=bj_poly,
-                        recipe=["Cell-quotient bipartite-junction DP"],
-                        verified=True,
-                        method="cell_quotient_bipartite_junction_dp",
+                    return self._emit_cell_quotient_result(
+                        graph, cache_key, bj_poly,
+                        method='cell_quotient_bipartite_junction_dp', recipe='Cell-quotient bipartite-junction DP',
+                        label='Cell-quotient bipartite-junction DP',
                     )
-                    self._cache[cache_key] = result
-                    self._promote_to_table(graph, cache_key, result)
-                    return result
             except Exception:
                 pass  # any failure — fall through
 
@@ -939,20 +904,11 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                     graph, self.table, max_cell_boundary=8,
                 )
                 if pcdp_poly is not None:
-                    _log.record(EventType.CELL_QUOTIENT_DP, "engine",
-                                f"Cell-quotient bipartite-junction per-component DP: {n}n {m}e",
-                                graph=graph)
-                    self._maybe_emit_cell_partition(graph)
-                    self._log(f"Cell-quotient bipartite-junction per-component DP: {n}n, {m}e")
-                    result = SynthesisResult(
-                        polynomial=pcdp_poly,
-                        recipe=["Cell-quotient bipartite-junction per-component DP"],
-                        verified=True,
-                        method="cell_quotient_bipartite_junction_per_component_dp",
+                    return self._emit_cell_quotient_result(
+                        graph, cache_key, pcdp_poly,
+                        method='cell_quotient_bipartite_junction_per_component_dp', recipe='Cell-quotient bipartite-junction per-component DP',
+                        label='Cell-quotient bipartite-junction per-component DP',
                     )
-                    self._cache[cache_key] = result
-                    self._promote_to_table(graph, cache_key, result)
-                    return result
             except Exception:
                 pass
 
@@ -967,20 +923,11 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                     graph, self.table,
                 )
                 if hybrid_poly is not None:
-                    _log.record(EventType.CELL_QUOTIENT_DP, "engine",
-                                f"Cell-quotient hybrid DP: {n}n {m}e",
-                                graph=graph)
-                    self._maybe_emit_cell_partition(graph)
-                    self._log(f"Cell-quotient hybrid DP: {n}n, {m}e")
-                    result = SynthesisResult(
-                        polynomial=hybrid_poly,
-                        recipe=["Cell-quotient hybrid (cycle-close + per-leaf synth)"],
-                        verified=True,
-                        method="cell_quotient_hybrid_dp",
+                    return self._emit_cell_quotient_result(
+                        graph, cache_key, hybrid_poly,
+                        method='cell_quotient_hybrid_dp', recipe='Cell-quotient hybrid (cycle-close + per-leaf synth)',
+                        label='Cell-quotient hybrid DP',
                     )
-                    self._cache[cache_key] = result
-                    self._promote_to_table(graph, cache_key, result)
-                    return result
             except Exception:
                 pass  # any failure — fall through
 
@@ -1908,19 +1855,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         right_set = set(cell_right_verts)
 
         # Build cell graphs
-        def _induced(relabel: Dict[int, int]) -> 'Graph':
-            edges: Set[Tuple[int, int]] = set()
-            for (u, v) in graph.edges:
-                if u in relabel and v in relabel:
-                    a, b = relabel[u], relabel[v]
-                    edges.add((min(a, b), max(a, b)))
-            return Graph(
-                nodes=frozenset(relabel.values()),
-                edges=frozenset(edges),
-            )
-
-        cell_left = _induced(relabel_left)
-        cell_right = _induced(relabel_right)
+        cell_left = graph.induced_relabeled(relabel_left)
+        cell_right = graph.induced_relabeled(relabel_right)
 
         # Build chord-edge list in (left_relabel, right_relabel) form
         chord_pairs: List[Tuple[int, int]] = []
@@ -2002,19 +1938,8 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         relabel_i_set = set(cell_i_verts)
         relabel_j_set = set(cell_j_verts)
 
-        def _induced(relabel: Dict[int, int]) -> 'Graph':
-            edges: Set[Tuple[int, int]] = set()
-            for (u, v) in graph.edges:
-                if u in relabel and v in relabel:
-                    a, b = relabel[u], relabel[v]
-                    edges.add((min(a, b), max(a, b)))
-            return Graph(
-                nodes=frozenset(relabel.values()),
-                edges=frozenset(edges),
-            )
-
-        cell_i = _induced(relabel_i)
-        cell_j = _induced(relabel_j)
+        cell_i = graph.induced_relabeled(relabel_i)
+        cell_j = graph.induced_relabeled(relabel_j)
 
         try:
             V_k_i = sorted(relabel_i[v] for v in junc.anchors_i)
@@ -2736,6 +2661,26 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         self._cache[cache_key] = result
         self._promote_to_table(graph, cache_key, result)
 
+    def _emit_cell_quotient_result(self, graph, cache_key, poly, *,
+                                   method, recipe, label, record_label=None):
+        """Finalize a cell-quotient dispatch hit: log, build result, cache, promote.
+
+        Shared tail of the cell-quotient DP dispatch arms (grid-streamed / cycle /
+        tree / bipartite-junction / per-component / hybrid) — each differs only in
+        the dispatch fn plus these labels.
+        """
+        n, m = graph.node_count(), graph.edge_count()
+        _log.record(EventType.CELL_QUOTIENT_DP, "engine",
+                    f"{record_label or label}: {n}n {m}e", graph=graph)
+        self._maybe_emit_cell_partition(graph)
+        self._log(f"{label}: {n}n, {m}e")
+        result = SynthesisResult(
+            polynomial=poly, recipe=[recipe], verified=True, method=method,
+        )
+        self._cache[cache_key] = result
+        self._promote_to_table(graph, cache_key, result)
+        return result
+
     def _synthesize_connected(
         self,
         graph: Graph,
@@ -2888,116 +2833,112 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
     def _synthesize_from_k2(
         self,
         graph: Graph,
-        max_depth: int
+        max_depth: int,
+        *,
+        sort_chords: bool = False,
+        fast: bool = False,
     ) -> SynthesisResult:
-        """Build polynomial from spanning tree + edge addition.
+        """Build polynomial from spanning tree + edge addition (CEJ fallback).
 
-        Algorithm:
-        1. Find a spanning tree of the graph
-        2. Start with T(spanning tree) = x^(n-1)
-        3. For each non-tree edge (chord), use edge addition:
-           T(G + e) = T(G) + T(G/{u,v})
+        Find a spanning tree (T = x^(n-1)), then add each non-tree edge (chord)
+        via T(G + e) = T(G) + T(G/{u,v}).
 
-        This is the "create-expand" algorithm.
+        ``fast=True`` is the multigraph fast path: it sorts chords by a
+        contraction-priority heuristic and propagates ``max_depth`` into the
+        recursive multigraph synthesis. Chord order does NOT change the result
+        (Tutte is order-invariant — see NOTE), so the two modes differ only in
+        performance, recipe text, and the emitted method tag.
         """
-        self._log("Building via spanning tree + edge addition")
+        self._log("Building via spanning tree + edge addition"
+                  + (" (fast path)" if fast else ""))
 
         n = graph.node_count()
-        m = graph.edge_count()
-
         if n == 0:
             return SynthesisResult(
                 polynomial=TuttePolynomial.one(),
                 recipe=["Empty graph"],
                 verified=True,
-                method="base_case"
+                method="base_case",
             )
 
         # Snapshot accumulator to diff later
         pre_minors = set(self._mg_minors_accum)
-
-        recipe = ["Spanning tree + edge addition"]
+        recipe = ["Spanning tree + edge addition (fast)" if fast
+                  else "Spanning tree + edge addition"]
 
         # Find a spanning tree using BFS
-        G_nx = graph.to_networkx()
         tree_edges = set()
         visited = set()
         start = next(iter(graph.nodes))
         queue = [start]
         visited.add(start)
-
         while queue:
             node = queue.pop(0)
             for neighbor in graph.neighbors(node):
                 if neighbor not in visited:
                     visited.add(neighbor)
                     queue.append(neighbor)
-                    edge = (min(node, neighbor), max(node, neighbor))
-                    tree_edges.add(edge)
+                    tree_edges.add((min(node, neighbor), max(node, neighbor)))
 
-        # Non-tree edges (chords)
         chords = [e for e in graph.edges if e not in tree_edges]
-
-        # NOTE: chord-ordering optimizations from `_iterative_chord_rule`
-        # do NOT transfer here. Both σ-orbit and smart-order
-        # (descending |common neighbors|) REGRESSED Z(1,3) in empirical
-        # measurement (May 23-24, 2026):
-        #   - baseline natural order: chord 68/127 in 600s (8.8s/chord)
-        #   - σ-orbit:               chord 58/127 in 600s (stalls)
-        #   - smart-order:           chord 60/127 in 600s
-        # `_iterative_chord_rule` contracts all chords against the SAME
-        # starting graph (T(G/c) cache hits via σ symmetry); this loop
-        # ADDS each chord to current_mg, so the graph evolves and σ-orbit
-        # isomorphism fails. Smart-order clusters dense-structure chords
-        # first → partial graph density rises rapidly → later sparse-chord
-        # additions on a dense graph hit expensive treewidth_dp.
-        # See [[project_wl_filter_and_largegraph_gate]] for the broader
-        # `_synthesize_connected → _synthesize_from_k2` work on Z(1,3).
+        if sort_chords:
+            # Prefer chords whose contraction is more likely to create cut
+            # vertices (fewer shared neighbours between endpoints).
+            def chord_priority(e):
+                u, v = e
+                nu, nv = graph.neighbors(u), graph.neighbors(v)
+                return (len(nu & nv), min(len(nu), len(nv)))
+            chords.sort(key=chord_priority)
+        # NOTE: chord-ordering optimizations from `_iterative_chord_rule` do NOT
+        # transfer to this additive loop. Both sigma-orbit and smart-order
+        # REGRESSED Z(1,3) empirically (May 2026): this loop ADDS each chord to
+        # current_mg, so the graph evolves and sigma-orbit isomorphism / cache
+        # hits fail. The `sort_chords` heuristic above is the only ordering that
+        # helped (fast path). See [[project_wl_filter_and_largegraph_gate]].
 
         self._log(f"Spanning tree: {len(tree_edges)} edges, chords: {len(chords)}")
-        recipe.append(f"Spanning tree: {len(tree_edges)} edges, T = x^{len(tree_edges)}")
-        recipe.append(f"Chords to add: {len(chords)}")
+        recipe.append(f"Spanning tree: {len(tree_edges)} edges"
+                      + ("" if fast else f", T = x^{len(tree_edges)}"))
+        recipe.append(f"Chords: {len(chords)}" if fast
+                      else f"Chords to add: {len(chords)}")
 
         # Start with spanning tree polynomial: x^(n-1)
         poly = TuttePolynomial.x(len(tree_edges))
-
-        # Build the current graph (starting with spanning tree)
         current_mg = MultiGraph(
             nodes=graph.nodes,
             edge_counts={e: 1 for e in tree_edges},
-            loop_counts={}
+            loop_counts={},
         )
 
-        # Add each chord using edge addition formula
+        # Add each chord via the edge-addition formula.
         for i, (u, v) in enumerate(chords):
-            # T(G + e) = T(G) + T(G/{u,v})
             merged = current_mg.merge_nodes(u, v)
-            merged_poly = self._synthesize_multigraph(merged, skip_minor_search=True)
-
+            if fast:
+                merged_poly = self._synthesize_multigraph(
+                    merged, max_depth, skip_minor_search=True)
+            else:
+                merged_poly = self._synthesize_multigraph(
+                    merged, skip_minor_search=True)
             poly = poly + merged_poly
-
-            # Update current graph
             edge = (min(u, v), max(u, v))
             new_edge_counts = dict(current_mg.edge_counts)
             new_edge_counts[edge] = new_edge_counts.get(edge, 0) + 1
             current_mg = MultiGraph(
                 nodes=current_mg.nodes,
                 edge_counts=new_edge_counts,
-                loop_counts=current_mg.loop_counts
+                loop_counts=current_mg.loop_counts,
             )
+            if not fast:
+                self._log(f"Added chord {i+1}/{len(chords)}: ({u},{v})")
 
-            self._log(f"Added chord {i+1}/{len(chords)}: ({u},{v})")
-
-        recipe.append(f"Final polynomial has {poly.num_terms()} terms")
-
-        # Harvest minors discovered during chord addition
+        recipe.append(f"Final: {poly.num_terms()} terms" if fast
+                      else f"Final polynomial has {poly.num_terms()} terms")
         new_minors = self._mg_minors_accum - pre_minors
-
         return SynthesisResult(
             polynomial=poly,
             recipe=recipe,
             verified=True,
-            method="spanning_tree_expansion",
+            method="spanning_tree_expansion_fast" if fast else "spanning_tree_expansion",
             minors_used=new_minors,
         )
 
@@ -3160,114 +3101,12 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 return result
 
         # 5. Direct spanning tree expansion (skip minor search)
-        result = self._synthesize_from_k2_fast(graph, max_depth)
+        result = self._synthesize_from_k2(graph, max_depth, sort_chords=True, fast=True)
         ck = _ensure_cache_key()
         self._cache[ck] = result
         self._fast_simple_hash_set.add(fh)
         self._promote_to_table(graph, ck, result)
         return result
-
-    def _synthesize_from_k2_fast(
-        self,
-        graph: Graph,
-        max_depth: int
-    ) -> SynthesisResult:
-        """Spanning tree expansion with fast path for merged graphs.
-
-        Same as _synthesize_from_k2 but uses skip_minor_search=True for
-        recursive multigraph synthesis.
-        """
-        self._log("Building via spanning tree + edge addition (fast path)")
-
-        n = graph.node_count()
-
-        if n == 0:
-            return SynthesisResult(
-                polynomial=TuttePolynomial.one(),
-                recipe=["Empty graph"],
-                verified=True,
-                method="base_case"
-            )
-
-        # Snapshot accumulator to diff later
-        pre_minors = set(self._mg_minors_accum)
-
-        recipe = ["Spanning tree + edge addition (fast)"]
-
-        # Find spanning tree using BFS
-        tree_edges = set()
-        visited = set()
-        start = next(iter(graph.nodes))
-        queue = [start]
-        visited.add(start)
-
-        while queue:
-            node = queue.pop(0)
-            for neighbor in graph.neighbors(node):
-                if neighbor not in visited:
-                    visited.add(neighbor)
-                    queue.append(neighbor)
-                    edge = (min(node, neighbor), max(node, neighbor))
-                    tree_edges.add(edge)
-
-        # Chords — sorted by priority: prefer edges whose contraction is more
-        # likely to create cut vertices (fewer shared neighbors between endpoints)
-        chords = [e for e in graph.edges if e not in tree_edges]
-
-        def chord_priority(e):
-            u, v = e
-            nu = graph.neighbors(u)
-            nv = graph.neighbors(v)
-            shared = len(nu & nv)
-            min_deg = min(len(nu), len(nv))
-            return (shared, min_deg)
-
-        chords.sort(key=chord_priority)
-
-        self._log(f"Spanning tree: {len(tree_edges)} edges, chords: {len(chords)}")
-        recipe.append(f"Spanning tree: {len(tree_edges)} edges")
-        recipe.append(f"Chords: {len(chords)}")
-
-        # Start with spanning tree polynomial
-        poly = TuttePolynomial.x(len(tree_edges))
-
-        # Build current multigraph
-        current_mg = MultiGraph(
-            nodes=graph.nodes,
-            edge_counts={e: 1 for e in tree_edges},
-            loop_counts={}
-        )
-
-        # Add chords with skip_minor_search=True
-        for i, (u, v) in enumerate(chords):
-            merged = current_mg.merge_nodes(u, v)
-            # Use skip_minor_search=True for recursive synthesis
-            merged_poly = self._synthesize_multigraph(merged, max_depth, skip_minor_search=True)
-
-            poly = poly + merged_poly
-
-            # Update current graph
-            edge = (min(u, v), max(u, v))
-            new_edge_counts = dict(current_mg.edge_counts)
-            new_edge_counts[edge] = new_edge_counts.get(edge, 0) + 1
-            current_mg = MultiGraph(
-                nodes=current_mg.nodes,
-                edge_counts=new_edge_counts,
-                loop_counts=current_mg.loop_counts
-            )
-
-        recipe.append(f"Final: {poly.num_terms()} terms")
-
-        # Harvest minors discovered during chord addition
-        new_minors = self._mg_minors_accum - pre_minors
-
-        return SynthesisResult(
-            polynomial=poly,
-            recipe=recipe,
-            verified=True,
-            method="spanning_tree_expansion_fast",
-            minors_used=new_minors,
-        )
 
 # =============================================================================
 # CONVENIENCE FUNCTIONS

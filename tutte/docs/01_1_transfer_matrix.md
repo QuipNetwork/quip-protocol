@@ -104,7 +104,7 @@ The five supported families all admit a periodic unit-cell representation:
      `T(G; x, y)`.
 ```
 
-The C extension (`_c_extension.py`) fuses steps 4 and 5 into a single
+The C extension (`_transfer_matrix_c.py`) fuses steps 4 and 5 into a single
 `sweep_in_c` call. For widths where polynomial coefficients exceed int64, a
 Chinese-Remainder-Theorem (CRT) path multiplexes the sweep over several primes
 and reconstructs the integer coefficients at the end.
@@ -147,7 +147,7 @@ In both cases the engine continues past step 1.5 to canonical-key lookup.
 | `tutte/transfer_matrix/lattice_recognition.py`   | Family-specific O(V + E) recognition; returns `StripProperties`             |
 | `tutte/transfer_matrix/core.py`                  | Non-crossing partition enumeration; transfer matrix construction            |
 | `tutte/transfer_matrix/sweep.py`                 | Pure-Python matrix-vector sweep + initial vector builder                    |
-| `tutte/transfer_matrix/_c_extension.py`          | cffi-built C extension: full sweep + CRT combine for large coefficients      |
+| `tutte/transfer_matrix/_transfer_matrix_c.py`          | cffi-built C extension: full sweep + CRT combine for large coefficients      |
 | `tutte/transfer_matrix/extraction.py`            | FK-state-vector → Tutte polynomial via binomial conversion                  |
 
 ## Related Techniques

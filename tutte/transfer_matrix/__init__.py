@@ -118,12 +118,12 @@ def compute_tutte_via_transfer_matrix(
     # Try C-accelerated path.
     try:
         if is_single_period:
-            from ._c_extension import c_transfer_matrix_sweep
+            from ._transfer_matrix_c import c_transfer_matrix_sweep
             ab_result = c_transfer_matrix_sweep(
                 width, length, transition_patterns[0], num_vertices
             )
         else:
-            from ._c_extension import c_transfer_matrix_sweep_multi
+            from ._transfer_matrix_c import c_transfer_matrix_sweep_multi
             fc = first_col_edges if first_col_edges is not None else [
                 (i, i + 1) for i in range(width - 1)
             ]

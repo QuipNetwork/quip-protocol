@@ -201,7 +201,7 @@ When `_synthesize_multigraph` converts a multigraph to a simple graph with `skip
 3. Base cases (empty graph, single edge)
 4. Disconnected factorization
 5. Cut vertex factorization
-6. Direct spanning tree expansion via `_synthesize_from_k2_fast`, which itself passes `skip_minor_search=True` to recursive multigraph synthesis calls
+6. Direct spanning tree expansion via `_synthesize_from_k2(..., fast=True)`, which passes `skip_minor_search=True` to recursive multigraph synthesis calls
 
 This avoids the O(n!) worst-case VF2 cost on intermediate contracted graphs that are unlikely to match known rainbow table entries.
 

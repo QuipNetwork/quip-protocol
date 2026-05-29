@@ -78,7 +78,7 @@ detect_periodic_strip → unit-cell edges → build_transfer_matrix
 | `lattice_recognition.py`   | Family-specific O(V + E) recognition; returns `StripProperties`             |
 | `core.py`                  | Non-crossing partition enumeration; transfer matrix construction            |
 | `sweep.py`                 | Pure-Python matrix-vector sweep + initial vector builder                    |
-| `_c_extension.py`          | cffi-built C extension: full sweep + CRT combine for large coefficients      |
+| `_transfer_matrix_c.py`          | cffi-built C extension: full sweep + CRT combine for large coefficients      |
 | `extraction.py`            | FK-state-vector → Tutte polynomial via binomial conversion `(a, b) → (x, y)` |
 
 ## Complexity
