@@ -33,6 +33,17 @@ daily_budget                   = "60s"
 # qpu_min_blocks_for_estimation  = 5
 # qpu_ema_alpha                  = 0.3
 
+# Per-submission cost knobs. Defaults (112 reads, 80us anneal) are the
+# throughput-tuned values from the 2026-05 QPU time-to-solution study
+# (qpu_tts_test/): the QPU-TTS optimum, ~5x faster than the older
+# 512x120 quality-tuned setting. p_success plateaus above ~96-128
+# reads, so higher values mostly add QPU access time. Operators tuning
+# for solution *quality* rather than throughput can raise these; see
+# the canary's --mode sweep output (tools/qpu_throughput_canary.py)
+# for the normalized time-to-solution at each grid point.
+# num_reads                      = 112
+# annealing_time_us              = 80.0
+
 # ── Gate-model providers ──────────────────────────────────────────────
 # Uncomment one. `token` is conventionally an environment-variable
 # reference; do not paste secrets into this file. `daily_budget` caps
