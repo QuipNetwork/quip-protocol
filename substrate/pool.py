@@ -51,6 +51,7 @@ _IDEMPOTENT_OPS = frozenset({
     "get_finalized_head",
     "get_mining_snapshot",
     "query_miner",
+    "query_proofs_submitted",
     "query_difficulty",
     "query_current_difficulty",
     "query_last_proof_block_number",

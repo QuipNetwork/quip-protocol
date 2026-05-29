@@ -298,6 +298,50 @@ def test_solution_store_writes_packed_spins(tmp_path: Path) -> None:
     assert len(rec["top_5_solutions_hex"]) == 5
 
 
+def test_submission_logger_record_writes_pow_sequence(tmp_path: Path) -> None:
+    """``pow_sequence`` (miner's cumulative proofs_submitted from chain) must
+    be written into submission.json when provided, and must default to None so
+    existing records without the field stay schema-compatible."""
+    log = SubmissionLogger(log_dir=tmp_path)
+
+    # With pow_sequence set.
+    sid = log.assign_id()
+    log.record(
+        solution_id=sid,
+        miner_id="rig-q",
+        dispatch_id=200,
+        energy_milli=-4_200_000,
+        diversity_milli=210,
+        threshold_milli=-4_000_000,
+        last_proof_block_hash_hex="0x" + "aa" * 32,
+        outcome="rejected_stale",
+        pow_sequence=42,
+    )
+    sub_path = tmp_path / "200" / "submission.json"
+    rec = json.loads(sub_path.read_text())
+    assert rec["pow_sequence"] == 42, (
+        "pow_sequence must be written into submission.json for not-won outcomes "
+        "so the dashboard can display the miner's cumulative proofs_submitted"
+    )
+
+    # Default: pow_sequence omitted → None in record.
+    sid2 = log.assign_id()
+    log.record(
+        solution_id=sid2,
+        miner_id="rig-q",
+        dispatch_id=201,
+        energy_milli=-4_200_000,
+        diversity_milli=210,
+        threshold_milli=-4_000_000,
+        last_proof_block_hash_hex="0x" + "bb" * 32,
+        outcome="rejected_stale",
+    )
+    sub_path2 = tmp_path / "201" / "submission.json"
+    rec2 = json.loads(sub_path2.read_text())
+    assert "pow_sequence" in rec2, "pow_sequence key must always be present"
+    assert rec2["pow_sequence"] is None, "pow_sequence must default to None"
+
+
 def test_query_stored_solutions_returns_sorted_by_iter(tmp_path: Path) -> None:
     """query_stored_solutions returns all matching files sorted by iter
     (the leading 06d in the filename guarantees fs-sort order)."""

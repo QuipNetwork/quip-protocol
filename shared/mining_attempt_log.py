@@ -594,6 +594,7 @@ class SubmissionLogger:
         extrinsic_hash: Optional[str] = None,
         chain_block_hash: Optional[str] = None,
         chain_block_number: Optional[int] = None,
+        pow_sequence: Optional[int] = None,
         error: Optional[str] = None,
     ) -> None:
         """Write the per-dispatch submission record + index entry.
@@ -623,6 +624,7 @@ class SubmissionLogger:
             "extrinsic_hash": extrinsic_hash,
             "chain_block_hash": chain_block_hash,
             "chain_block_number": chain_block_number,
+            "pow_sequence": pow_sequence,
             "outcome": outcome,
             "error": error,
         }

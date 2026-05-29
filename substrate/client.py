@@ -433,6 +433,18 @@ class SubstrateClient:
             rewards_earned=int(v["rewards_earned"]),
         )
 
+    async def query_proofs_submitted(self, account: bytes) -> Optional[int]:
+        """Return ``QuantumPow.Miners[account].proofs_submitted``, or ``None``.
+
+        Returns None when the miner is not registered or the RPC fails. Safe
+        to call on the hot path — callers should treat None as "unavailable"
+        and not raise. Use ``query_miner`` when the full ``MinerInfo`` is needed.
+        """
+        info = await self.query_miner(account)
+        if info is None:
+            return None
+        return info.proofs_submitted
+
     async def query_difficulty(self) -> Optional[SubstrateDifficulty]:
         """Return the raw `QuantumPow.Difficulty` storage value.
 

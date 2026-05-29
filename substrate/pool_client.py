@@ -77,6 +77,15 @@ class PoolClient:
     async def query_miner(self, account: bytes):
         return await self._pool.send("query_miner", {"account": account})
 
+    async def query_proofs_submitted(self, account: bytes):
+        """Return the miner's cumulative ``proofs_submitted`` counter, or None.
+
+        Routes through the pool's idempotent-retry path. Returns None when the
+        miner is not registered or the RPC fails — never raises into the submit
+        path.
+        """
+        return await self._pool.send("query_proofs_submitted", {"account": account})
+
     async def query_difficulty(self):
         return await self._pool.send("query_difficulty", {})
 

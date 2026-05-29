@@ -1060,6 +1060,7 @@ class SubstrateMinerController:
                 envelope.handle_id,
                 exc,
             )
+            pow_seq_rpc_err = await self._query_proofs_submitted_safe()
             self._submission_log.record(
                 solution_id=solution_id,
                 miner_id=envelope.handle_id,
@@ -1071,6 +1072,7 @@ class SubstrateMinerController:
                 last_proof_block_hash_hex=last_proof_hex,
                 outcome="chain_error",
                 num_valid=envelope.result.num_valid,
+                pow_sequence=pow_seq_rpc_err,
                 error=f"{type(exc).__name__}: {exc}",
             )
             return
@@ -1092,8 +1094,18 @@ class SubstrateMinerController:
             # this exact context. Persistent failures stay visible via
             # stats.proofs_unverified.
             verified = await self._verify_proof_recorded(envelope)
-            if verified is False:
+            # verified >= 0  → won, value is the PoW block number
+            # verified < 0   → mismatch (-1 sentinel)
+            # verified is None → RPC failed, inconclusive
+            if verified is not None and verified < 0:
                 self.stats.proofs_unverified += 1
+                pow_seq_mismatch: Optional[int] = None
+                try:
+                    pow_seq_mismatch = await self.pool_client.query_proofs_submitted(
+                        self.signer.account_id_bytes()
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 self._submission_log.record(
                     solution_id=solution_id,
                     miner_id=envelope.handle_id,
@@ -1107,6 +1119,7 @@ class SubstrateMinerController:
                     num_valid=envelope.result.num_valid,
                     extrinsic_hash=receipt.extrinsic_hash,
                     chain_block_hash=receipt.block_hash,
+                    pow_sequence=pow_seq_mismatch,
                     error="receipt OK but proof not recorded by chain",
                 )
                 # Re-dispatch immediately on the same context. The
@@ -1222,6 +1235,13 @@ class SubstrateMinerController:
                 accepted_block_number,
                 self.signer.ss58_address(),
             )
+            # Use the verify-path's LastProofBlock as the authoritative won
+            # block number when available (verified >= 0). Fall back to the
+            # receipt-derived accepted_block_number when verify returned None
+            # (inconclusive RPC failure).
+            won_block_number: Optional[int] = (
+                verified if (verified is not None and verified >= 0) else None
+            )
             self._submission_log.record(
                 solution_id=solution_id,
                 miner_id=envelope.handle_id,
@@ -1235,7 +1255,8 @@ class SubstrateMinerController:
                 num_valid=envelope.result.num_valid,
                 extrinsic_hash=receipt.extrinsic_hash,
                 chain_block_hash=receipt.block_hash,
-                chain_block_number=accepted_block_number,
+                chain_block_number=won_block_number if won_block_number is not None
+                    else accepted_block_number,
             )
             if self.core is not None:
                 self.core.record_result(
@@ -1259,6 +1280,7 @@ class SubstrateMinerController:
                 receipt.error,
                 receipt.extrinsic_hash,
             )
+            pow_seq_stale = await self._query_proofs_submitted_safe()
             self._submission_log.record(
                 solution_id=solution_id,
                 miner_id=envelope.handle_id,
@@ -1271,11 +1293,13 @@ class SubstrateMinerController:
                 outcome="rejected_stale",
                 num_valid=envelope.result.num_valid,
                 extrinsic_hash=receipt.extrinsic_hash,
+                pow_sequence=pow_seq_stale,
                 error=str(receipt.error or ""),
             )
         else:  # FATAL
             self.stats.submission_errors += 1
             self.stats.last_submission_error = str(receipt.error or "")
+            pow_seq_fatal = await self._query_proofs_submitted_safe()
             self._submission_log.record(
                 solution_id=solution_id,
                 miner_id=envelope.handle_id,
@@ -1288,6 +1312,7 @@ class SubstrateMinerController:
                 outcome="chain_error",
                 num_valid=envelope.result.num_valid,
                 extrinsic_hash=receipt.extrinsic_hash,
+                pow_sequence=pow_seq_fatal,
                 error=str(receipt.error or ""),
             )
             raise RuntimeError(
@@ -1360,20 +1385,35 @@ class SubstrateMinerController:
             if got is None or got == dispatch_id:
                 return
 
-    async def _verify_proof_recorded(self, envelope: _ResultEnvelope) -> Optional[bool]:
+    async def _query_proofs_submitted_safe(self) -> Optional[int]:
+        """Return ``QuantumPow.Miners[self.signer].proofs_submitted``, or None.
+
+        Best-effort — swallows all exceptions so callers on the hot submit
+        path are never blocked by a transient RPC failure. Returns None when
+        the miner is unregistered, when the chain is unreachable, or on any
+        other error.
+        """
+        try:
+            return await self.pool_client.query_proofs_submitted(
+                self.signer.account_id_bytes()
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _verify_proof_recorded(self, envelope: _ResultEnvelope) -> Optional[int]:
         """Confirm the runtime recorded this miner's proof on chain.
 
         Returns:
-          - ``True`` if ``QuantumPow.LastProofBlock`` resolves to a
-            ``winning_solution`` whose ``miner`` and ``nonce`` match the
-            envelope's submission.
-          - ``False`` if a winning_solution was returned but does NOT
-            match us (someone else won this round, or the chain rolled
-            back our submission silently).
-          - ``None`` if the verification RPC itself failed — caller
-            should treat as inconclusive and proceed with closing the
-            work key (the alternative is a submission-storm loop, which
-            is worse than a single false-positive close).
+          - A non-negative ``int`` (the won PoW block number, i.e.
+            ``QuantumPow.LastProofBlock``) if the winning solution at that
+            block matches our miner address and nonce.
+          - ``-1`` if a winning solution was returned but does NOT match us
+            (someone else won this round, or the chain rolled back our
+            submission silently). Use ``< 0`` to test for this case.
+          - ``None`` if the verification RPC itself failed — caller should
+            treat as inconclusive and proceed with closing the work key
+            (the alternative is a submission-storm loop, which is worse than
+            a single false-positive close).
         """
         try:
             last_block = await self.pool_client.query_last_proof_block_number()
@@ -1398,7 +1438,7 @@ class SubstrateMinerController:
                 "chain reported LastProofBlock but no winning solution",
                 last_block,
             )
-            return False
+            return -1
         # `winning.solution.miner` is the chain's AccountId32 of the
         # submitter — that's the raw 32-byte pubkey, NOT the
         # blake2_256-hashed canonical_miner we put into the snapshot
@@ -1409,7 +1449,7 @@ class SubstrateMinerController:
         actual_miner = bytes(winning.solution.miner)
         actual_nonce = bytes(winning.nonce)
         if actual_miner == expected_miner and actual_nonce == expected_nonce:
-            return True
+            return last_block
         logger.warning(
             "post-OK verify mismatch at block %d: "
             "expected miner=0x%s... nonce=0x%s..., "
@@ -1420,7 +1460,7 @@ class SubstrateMinerController:
             actual_miner.hex()[:16],
             actual_nonce.hex()[:16],
         )
-        return False
+        return -1
 
     def _mark_work_key_closed(
         self, key: WorkKey, record: ClosedWorkRecord

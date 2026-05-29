@@ -422,7 +422,8 @@ async def test_mark_work_key_closed_records_block_number(monkeypatch):
     ctx = _context(b"\x10" * 32)
     _set_current(controller, ctx)
     controller.pool_client.get_block_number = AsyncMock(return_value=42)
-    controller._verify_proof_recorded = AsyncMock(return_value=True)  # type: ignore[assignment]
+    # Return the won block number (42 here matches the get_block_number stub).
+    controller._verify_proof_recorded = AsyncMock(return_value=42)  # type: ignore[assignment]
 
     async def fake_submit_proof(*args, **kwargs):
         return ExtrinsicReceipt(
@@ -451,7 +452,8 @@ async def test_mark_work_key_closed_records_block_number(monkeypatch):
 # ----------------------------------------------------------------------
 
 
-async def test_verify_proof_recorded_match_returns_true():
+async def test_verify_proof_recorded_match_returns_won_block_number():
+    """On a verified win _verify_proof_recorded returns the won PoW block number."""
     from substrate.types import (
         WinningSolution,
         WinningSolutionWithNonce,
@@ -481,10 +483,13 @@ async def test_verify_proof_recorded_match_returns_true():
     object.__setattr__(result, "nonce", nonce)  # MiningResult is frozen=False; safe
     envelope = _ResultEnvelope(result=result, context=ctx, handle_id="h1")
 
-    assert await controller._verify_proof_recorded(envelope) is True
+    won_block = await controller._verify_proof_recorded(envelope)
+    assert won_block == 12, "expected won PoW block number 12"
+    assert won_block is not None and won_block >= 0
 
 
-async def test_verify_proof_recorded_mismatch_returns_false():
+async def test_verify_proof_recorded_mismatch_returns_negative():
+    """On a mismatch (someone else won) _verify_proof_recorded returns -1."""
     from substrate.types import (
         WinningSolution,
         WinningSolutionWithNonce,
@@ -511,7 +516,8 @@ async def test_verify_proof_recorded_mismatch_returns_false():
     envelope = _ResultEnvelope(
         result=_mining_result(), context=_context(b"\x10" * 32), handle_id="h1"
     )
-    assert await controller._verify_proof_recorded(envelope) is False
+    result = await controller._verify_proof_recorded(envelope)
+    assert result is not None and result < 0, "expected negative sentinel for mismatch"
     assert controller.stats.proofs_unverified == 0  # only bumped by caller
 
 
@@ -1023,3 +1029,126 @@ def test_minerhandle_mine_work_item_returns_dispatch_id():
     msg = handle.req.get(timeout=0.5)
     assert msg["op"] == "mine_work_item"
     assert msg["dispatch_id"] == 1
+
+
+# ----------------------------------------------------------------------
+# Chain-derived Sol# (Task 4): chain_block_number / pow_sequence wiring
+# ----------------------------------------------------------------------
+
+
+async def test_handle_result_won_records_chain_block_number(monkeypatch):
+    """On a verified win, submission.json must record ``chain_block_number``
+    as the won PoW block number returned by ``_verify_proof_recorded`` (i.e.
+    ``QuantumPow.LastProofBlock``), not just the receipt-derived block number.
+    This is the chain-derived Sol# for won proofs."""
+    import json
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    controller.miner_handles = [_FakeHandle("winner")]
+
+    async def fake_submit_proof(*args, **kwargs):
+        return ExtrinsicReceipt(
+            extrinsic_hash="0xabc",
+            block_hash="0x" + "bb" * 32,
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+    # Stub verify to return the won block number (77).
+    controller._verify_proof_recorded = AsyncMock(return_value=77)  # type: ignore[assignment]
+    # get_block_number used for accepted_block_number fallback.
+    controller.pool_client.get_block_number = AsyncMock(return_value=99)
+
+    envelope = _ResultEnvelope(
+        result=_mining_result(), context=ctx, handle_id="winner",
+    )
+    await controller._handle_result(envelope)
+
+    # Won path: chain_block_number must be the verify-path's block (77), not 99.
+    assert controller.stats.proofs_submitted == 1
+    sub_path = controller._submission_log.log_dir / str(envelope.dispatch_id) / "submission.json"
+    record = json.loads(sub_path.read_text())
+    assert record["outcome"] == "submitted_inblock"
+    assert record["chain_block_number"] == 77, (
+        "chain_block_number on a won proof must be LastProofBlock from the "
+        "verify path, not the receipt-derived block number"
+    )
+
+
+async def test_handle_result_not_won_records_pow_sequence(monkeypatch):
+    """On a stale (not-won) outcome, submission.json must record ``pow_sequence``
+    as the miner's ``QuantumPow.Miners.proofs_submitted`` counter so the
+    dashboard can display a stable, chain-derived Sol# even without a won block."""
+    import json
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    controller.miner_handles = [_FakeHandle("loser")]
+
+    async def fake_submit_proof(*args, **kwargs):
+        return ExtrinsicReceipt(
+            extrinsic_hash="0xabc",
+            error="Module(error=InvalidNonce, pallet='QuantumPow', index=0)",
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+    # query_proofs_submitted should return the miner's current cumulative count.
+    controller.pool_client.query_proofs_submitted = AsyncMock(return_value=55)
+
+    envelope = _ResultEnvelope(
+        result=_mining_result(), context=ctx, handle_id="loser",
+    )
+    await controller._handle_result(envelope)
+
+    assert controller.stats.stale_drops == 1
+    sub_path = controller._submission_log.log_dir / str(envelope.dispatch_id) / "submission.json"
+    record = json.loads(sub_path.read_text())
+    assert record["outcome"] == "rejected_stale"
+    assert record["pow_sequence"] == 55, (
+        "pow_sequence must be written for not-won outcomes so the dashboard "
+        "can display the miner's cumulative proofs_submitted as Sol#"
+    )
+
+
+async def test_handle_result_not_won_pow_sequence_none_on_rpc_failure(monkeypatch):
+    """If ``query_proofs_submitted`` fails (e.g. chain unreachable), the
+    submission must still be logged with ``pow_sequence=None`` — never raised."""
+    import json
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    controller.miner_handles = [_FakeHandle("loser")]
+
+    async def fake_submit_proof(*args, **kwargs):
+        return ExtrinsicReceipt(
+            extrinsic_hash="0xabc",
+            error="Module(error=InvalidNonce, pallet='QuantumPow', index=0)",
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+    controller.pool_client.query_proofs_submitted = AsyncMock(
+        side_effect=ConnectionError("rpc dead")
+    )
+
+    envelope = _ResultEnvelope(
+        result=_mining_result(), context=ctx, handle_id="loser",
+    )
+    # Must not raise.
+    await controller._handle_result(envelope)
+
+    sub_path = controller._submission_log.log_dir / str(envelope.dispatch_id) / "submission.json"
+    record = json.loads(sub_path.read_text())
+    assert record["outcome"] == "rejected_stale"
+    assert record["pow_sequence"] is None, (
+        "pow_sequence must be None (not absent, not an exception) when the "
+        "chain RPC is unavailable at submission time"
+    )
