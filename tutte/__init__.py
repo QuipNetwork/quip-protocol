@@ -9,7 +9,7 @@ from .graph import (
 )
 from .factorization import (
     polynomial_gcd, has_common_factor, monomial_content,
-    primitive_part, find_divisibility_chain, try_factorize,
+    primitive_part,
 )
 from .validation import (
     verify_spanning_trees, count_spanning_trees_kirchhoff,
@@ -31,11 +31,8 @@ from .lookup import (
     build_basic_table, sympy_to_tutte,
 )
 
-# Synthesis engines
+# Synthesis engine
 from .synthesis import (
     SynthesisEngine, SynthesisResult, BaseMultigraphSynthesizer, UnionFind,
-    synthesize, synthesize_algebraic, decompose_polynomial,
-    compute_tutte_polynomial,
-    AlgebraicSynthesisEngine, AlgebraicSynthesisResult,
-    HybridSynthesisEngine, HybridSynthesisResult,
+    synthesize, compute_tutte_polynomial,
 )

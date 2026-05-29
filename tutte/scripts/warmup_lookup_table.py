@@ -6,13 +6,10 @@ Two value props:
    Z(1,2) precomputed so Z(1,3), Cm3, Pm3 syntheses get instant cell hits
    via the cost-aware partitioner.
 
-2. **Atom polynomials for algebraic factorization** (May 2026): the
-   `AlgebraicSynthesisEngine` uses `RainbowTable.find_factors_of(target)`
-   to find table entries whose polynomial divides the target — but this
-   only works if candidate atoms are IN the table. Adding K_8..K_15,
-   K_{a,b} for small (a, b), and other simple cogragh atoms is cheap
-   (cotree_dp synthesizes them in <1s each) and broadens the algebraic
-   engine's effective coverage.
+2. **Cograph atom polynomials** (May 2026): K_8..K_15, K_{a,b} for small
+   (a, b), and other simple cograph atoms, seeded as reusable table
+   cells/minors. Cheap to compute (cotree_dp synthesizes them in <1s
+   each) and lets later syntheses recognise them as known minors.
 
 Idempotent: skips targets already in the table.
 
@@ -96,9 +93,8 @@ TARGETS = [
     ("Cm1_4", lambda: dnx.chimera_graph(1, 4)),  # 32n 76e
     ("Cm2_3", lambda: dnx.chimera_graph(2, 3)),  # 48n 124e — slow cold; consider --target gating
 
-    # Cograph atom polynomials (May 2026) — fast via cotree_dp (<1s each)
-    # and ESSENTIAL for AlgebraicSynthesisEngine.find_factors_of(target),
-    # which can only find factors that are atoms in the rainbow table.
+    # Cograph atom polynomials (May 2026) — fast via cotree_dp (<1s each),
+    # seeded as reusable table cells/minors for later syntheses.
     ("K_8",  lambda: nx.complete_graph(8)),
     ("K_9",  lambda: nx.complete_graph(9)),
     ("K_10", lambda: nx.complete_graph(10)),
@@ -107,7 +103,7 @@ TARGETS = [
     ("K_13", lambda: nx.complete_graph(13)),
     ("K_14", lambda: nx.complete_graph(14)),
     ("K_15", lambda: nx.complete_graph(15)),
-    # Bipartite cograph atoms — common as D-Wave Chimera cell + as algebraic factors.
+    # Bipartite cograph atoms — common as D-Wave Chimera cells.
     ("K_2_3", lambda: nx.complete_bipartite_graph(2, 3)),
     ("K_2_4", lambda: nx.complete_bipartite_graph(2, 4)),
     ("K_3_3", lambda: nx.complete_bipartite_graph(3, 3)),
@@ -288,16 +284,15 @@ def main() -> int:
     if args.dry_run:
         print(
             f"\n--dry-run: would write {len(table.entries)} entries to "
-            f"{json_path} and {bin_path}",
+            f"{bin_path}",
             file=sys.stderr,
         )
         return 0
 
     table.resort()
-    table.save(json_path)
     bin_size = save_binary_rainbow_table(table, bin_path)
     print(
-        f"\nSaved {len(table.entries)} entries — {json_path} and "
+        f"\nSaved {len(table.entries)} entries — "
         f"{bin_path} ({bin_size} bytes).",
         file=sys.stderr,
     )

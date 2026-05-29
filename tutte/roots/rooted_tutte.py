@@ -344,28 +344,24 @@ def clear_t_rooted_cache() -> None:
     _T_ROOTED_GRAPHS.clear()
 
 
-def save_rooted_lookup_default() -> Tuple[int, int]:
-    """Save the in-process `_T_ROOTED_CACHE` to the default lookup files.
+def save_rooted_lookup_default() -> int:
+    """Save the in-process `_T_ROOTED_CACHE` to the default lookup file.
 
-    Writes both `tutte/data/rooted_lookup_table.json` and
-    `rooted_lookup_table.bin`. Uses the `_T_ROOTED_GRAPHS` sidecar to
-    obtain the originating Graph for each cache entry, so callers don't
-    need to thread graphs through the API.
+    Writes `tutte/data/rooted_lookup_table.bin`. Uses the
+    `_T_ROOTED_GRAPHS` sidecar to obtain the originating Graph for each
+    cache entry, so callers don't need to thread graphs through the API.
 
-    Returns ``(n_json, n_bin)``: the number of entries saved into each
-    file. Entries without a tracked Graph (e.g. those loaded from the
-    persistent lookup at startup) are silently skipped — they're already
-    on disk.
+    Returns ``n_bin``: the number of entries saved. Entries without a
+    tracked Graph (e.g. those loaded from the persistent lookup at
+    startup) are silently skipped — they're already on disk.
     """
     import os
     base_dir = os.path.join(
         os.path.dirname(os.path.dirname(__file__)), "data",
     )
-    json_path = os.path.join(base_dir, "rooted_lookup_table.json")
     bin_path = os.path.join(base_dir, "rooted_lookup_table.bin")
-    n_json = save_rooted_lookup(json_path, dict(_T_ROOTED_GRAPHS))
     n_bin = save_rooted_lookup_binary(bin_path, dict(_T_ROOTED_GRAPHS))
-    return n_json, n_bin
+    return n_bin
 
 
 _DEFAULT_ROOTED_LOOKUP_LOADED: bool = False

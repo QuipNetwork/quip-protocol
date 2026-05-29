@@ -5,7 +5,7 @@ when reducing k parallel edges between u,v, T(G₀) and T(G_c) are independent
 and can be computed on separate cores.
 
 Uses ProcessPoolExecutor with 2 workers. Each worker gets its own
-HybridSynthesisEngine with a snapshot of the main cache. New cache entries
+SynthesisEngine with a snapshot of the main cache. New cache entries
 discovered by workers are merged back into the main engine.
 """
 
@@ -26,10 +26,10 @@ _worker_engine = None
 
 
 def _init_worker(cache_snapshot_bytes: bytes, verbose: bool) -> None:
-    """Initialize worker process with its own HybridSynthesisEngine."""
+    """Initialize worker process with its own SynthesisEngine."""
     global _worker_engine
-    from .hybrid import HybridSynthesisEngine
-    _worker_engine = HybridSynthesisEngine(verbose=verbose)
+    from .engine import SynthesisEngine
+    _worker_engine = SynthesisEngine(verbose=verbose)
     cache_snapshot = pickle.loads(cache_snapshot_bytes)
     _worker_engine._multigraph_cache.update(cache_snapshot)
     _worker_engine._fast_hash_set_complete = False

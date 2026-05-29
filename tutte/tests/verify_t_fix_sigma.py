@@ -14,7 +14,7 @@ from __future__ import annotations
 import sympy
 import networkx as nx
 
-from tutte.graphs.signed_elim_dp import compute_t_fix_sigma_mod
+from tutte.deprecated.signed_elim_dp import compute_t_fix_sigma_mod
 from tutte.tests.signed_graph_tutte_prototype import (
     build_quotient_with_monodromy,
     rank_subgraph,

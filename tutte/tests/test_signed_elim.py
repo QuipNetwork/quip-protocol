@@ -16,10 +16,10 @@ from __future__ import annotations
 import pytest
 import sympy
 
-from tutte.graphs._signed_elim_c import (
+from tutte.deprecated._signed_elim_c import (
     decode_state, encode_state, step_edge_batch, step_forget_batch,
 )
-from tutte.graphs.signed_elim_dp import compute_signed_tutte_elim_mod
+from tutte.deprecated.signed_elim_dp import compute_signed_tutte_elim_mod
 from tutte.tests.signed_graph_tutte_prototype import compute_t_signed
 
 
@@ -112,7 +112,7 @@ def test_encode_decode_roundtrip():
 
 def test_c_ext_compiles():
     """C extension compiles and is callable."""
-    from tutte.graphs._signed_elim_c import _get_lib
+    from tutte.deprecated._signed_elim_c import _get_lib
     lib, ffi = _get_lib()
     assert lib is not None
     assert ffi is not None

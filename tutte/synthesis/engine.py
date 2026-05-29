@@ -239,13 +239,10 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         from ..lookup.binary import save_binary_rainbow_table
 
         base_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data')
-        if json_path is None:
-            json_path = os.path.join(base_dir, 'lookup_table.json')
         if bin_path is None:
             bin_path = os.path.join(base_dir, 'lookup_table.bin')
 
         self.table.resort()
-        self.table.save(json_path)
         save_binary_rainbow_table(self.table, bin_path)
 
     def save_multigraph_cache(self) -> None:
@@ -761,35 +758,6 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
                 return result
         except (ValueError, TypeError):
             pass  # not a cograph, or input rejected — fall through
-
-        # Small-graph treewidth_dp short-circuit. For small graphs (n ≤ 20)
-        # treewidth is often ≤ 10 and treewidth_dp completes in ms-seconds —
-        # much faster than almost_cograph which can chord-rule for many
-        # seconds on dense cubic graphs (e.g. Heawood: 17.9s almost_cograph
-        # vs 1.45s treewidth_dp, ~12×). Skip when n > 20 so D-Wave cells
-        # still hit cell-quotient paths first.
-        if n <= 20 and m >= 10:
-            try:
-                from ..graphs.treewidth import \
-                    compute_treewidth_tutte_if_applicable
-                full_mg = MultiGraph.from_graph(graph)
-                tw_poly = compute_treewidth_tutte_if_applicable(full_mg, max_width=8)
-                if tw_poly is not None:
-                    _log.record(EventType.TREEWIDTH_DP, "engine",
-                                f"Treewidth DP (small-graph short-circuit): {n}n {m}e",
-                                graph=graph)
-                    self._log(f"Treewidth DP (small short-circuit): {n}n, {m}e")
-                    result = SynthesisResult(
-                        polynomial=tw_poly,
-                        recipe=["Treewidth DP (small-graph short-circuit)"],
-                        verified=True,
-                        method="treewidth_dp",
-                    )
-                    self._cache[cache_key] = result
-                    self._promote_to_table(graph, cache_key, result)
-                    return result
-            except Exception:
-                pass
 
         # 7.6. Almost-cograph DP — for graphs that become cographs after
         # removing a small set of anomaly edges (e.g., D-Wave cells joined by
@@ -3119,97 +3087,14 @@ def synthesize(graph: Graph, verbose: bool = False, method: str = "auto") -> Syn
     Args:
         graph: Graph to compute polynomial for
         verbose: Print progress information
-        method: Synthesis method:
-            - "auto": Tiling for small graphs (<=12 edges), hybrid for larger
-            - "tiling": Tiling-based (spanning tree + edge addition)
-            - "algebraic": Pure algebraic decomposition
-            - "hybrid": Combined tiling + pattern recognition
+        method: Retained for backward compatibility; all values now route
+            through the single SynthesisEngine.
 
     Returns:
         SynthesisResult with computed polynomial
     """
-    if method == "algebraic":
-        from .algebraic import AlgebraicSynthesisEngine
-        engine = AlgebraicSynthesisEngine(verbose=verbose)
-        alg_result = engine.synthesize(graph)
-        return SynthesisResult(
-            polynomial=alg_result.polynomial,
-            recipe=alg_result.recipe,
-            verified=alg_result.verified,
-            method=alg_result.method
-        )
-
-    if method == "hybrid":
-        from .hybrid import HybridSynthesisEngine
-        engine = HybridSynthesisEngine(verbose=verbose)
-        hybrid_result = engine.synthesize(graph)
-        return SynthesisResult(
-            polynomial=hybrid_result.polynomial,
-            recipe=hybrid_result.recipe,
-            verified=hybrid_result.verified,
-            method=hybrid_result.method
-        )
-
-    if method == "tiling":
-        engine = SynthesisEngine(verbose=verbose)
-        return engine.synthesize(graph)
-
-    # Auto mode: pick best engine based on graph size
-    # Hybrid excels on larger graphs (>12 edges) due to better
-    # pattern recognition for intermediate multigraphs.
-    # Tiling has lower overhead for small graphs.
-    if graph.edge_count() > 12:
-        from .hybrid import HybridSynthesisEngine
-        engine = HybridSynthesisEngine(verbose=verbose)
-        hybrid_result = engine.synthesize(graph)
-        return SynthesisResult(
-            polynomial=hybrid_result.polynomial,
-            recipe=hybrid_result.recipe,
-            verified=hybrid_result.verified,
-            method=hybrid_result.method
-        )
-    else:
-        engine = SynthesisEngine(verbose=verbose)
-        return engine.synthesize(graph)
-
-
-def synthesize_algebraic(graph: Graph, verbose: bool = False) -> 'AlgebraicSynthesisResult':
-    """Synthesize polynomial using algebraic decomposition.
-
-    This method computes the polynomial using GCD-based factorization
-    rather than graph tiling. It's particularly useful when:
-    - The polynomial has clear algebraic structure
-    - You want to understand the decomposition of a polynomial
-    - Graph tiling is inefficient for the particular graph
-
-    Args:
-        graph: Graph to compute polynomial for
-        verbose: Print progress information
-
-    Returns:
-        AlgebraicSynthesisResult with decomposition details
-    """
-    from .algebraic import AlgebraicSynthesisEngine
-    engine = AlgebraicSynthesisEngine(verbose=verbose)
+    engine = SynthesisEngine(verbose=verbose)
     return engine.synthesize(graph)
-
-
-def decompose_polynomial(polynomial: TuttePolynomial, verbose: bool = False):
-    """Decompose a known polynomial into algebraic factors.
-
-    Given a Tutte polynomial, find its decomposition in terms of
-    known graph polynomials from the rainbow table.
-
-    Args:
-        polynomial: Polynomial to decompose
-        verbose: Print progress information
-
-    Returns:
-        AlgebraicSynthesisResult with decomposition
-    """
-    from .algebraic import AlgebraicSynthesisEngine
-    engine = AlgebraicSynthesisEngine(verbose=verbose)
-    return engine.synthesize_from_polynomial(polynomial)
 
 
 def compute_tutte_polynomial(graph: Graph, method: str = "auto") -> TuttePolynomial:

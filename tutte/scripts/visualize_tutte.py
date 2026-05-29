@@ -19,7 +19,8 @@ URL Parameters:
     rand_n=12&rand_m=18 — Random graph with n nodes and m edges
     timeout=60       — Engine timeout in seconds (default 60)
     threshold=100    — Timeline bottleneck threshold in ms (default 100)
-    engine=hybrid    — Engine: "hybrid" (default), "synthesis", or "algebraic"
+
+The visualizer uses the single ``SynthesisEngine`` for all synthesis.
 """
 
 import json
@@ -1273,40 +1274,23 @@ def _run_engine_thread(graph, table, timeout_sec, engine_type, skip_target_looku
 
     def target():
         try:
-            if engine_type == "hybrid":
-                from tutte.synthesis.hybrid import HybridSynthesisEngine
-                engine = HybridSynthesisEngine(table=table)
-                engine.skip_target_lookup = skip_target_lookup
-                # Promote cache entries to the rainbow table at
-                # end-of-synthesis so cache_hits become lookup_hits
-                # on the next visualizer run.
-                engine.promote_cache_on_finish = True
-                hybrid_result = engine.synthesize(graph)
-                result_holder[0] = SynthesisResult(
-                    polynomial=hybrid_result.polynomial,
-                    recipe=hybrid_result.recipe,
-                    verified=hybrid_result.verified,
-                    method=hybrid_result.method,
-                    tiles_used=getattr(hybrid_result, 'tiles_used', 0),
-                    minors_used=getattr(hybrid_result, 'minors_used', set()),
-                    synthesized_minors=getattr(hybrid_result, 'synthesized_minors', set()),
-                    synthesized_graphs=getattr(hybrid_result, 'synthesized_graphs', {}),
-                )
-            elif engine_type == "algebraic":
-                from tutte.synthesis.algebraic import AlgebraicSynthesisEngine
-                engine = AlgebraicSynthesisEngine(table=table)
-                alg_result = engine.synthesize(graph)
-                result_holder[0] = SynthesisResult(
-                    polynomial=alg_result.polynomial,
-                    recipe=alg_result.recipe,
-                    verified=alg_result.verified,
-                    method=alg_result.method,
-                )
-            else:
-                engine = SynthesisEngine(table=table)
-                engine.skip_target_lookup = skip_target_lookup
-                engine.promote_cache_on_finish = True
-                result_holder[0] = engine.synthesize(graph)
+            engine = SynthesisEngine(table=table)
+            engine.skip_target_lookup = skip_target_lookup
+            # Promote cache entries to the rainbow table at
+            # end-of-synthesis so cache_hits become lookup_hits
+            # on the next visualizer run.
+            engine.promote_cache_on_finish = True
+            synth_result = engine.synthesize(graph)
+            result_holder[0] = SynthesisResult(
+                polynomial=synth_result.polynomial,
+                recipe=synth_result.recipe,
+                verified=synth_result.verified,
+                method=synth_result.method,
+                tiles_used=getattr(synth_result, 'tiles_used', 0),
+                minors_used=getattr(synth_result, 'minors_used', set()),
+                synthesized_minors=getattr(synth_result, 'synthesized_minors', set()),
+                synthesized_graphs=getattr(synth_result, 'synthesized_graphs', {}),
+            )
         except Exception as e:
             error_holder[0] = str(e)
 
@@ -1331,7 +1315,7 @@ def _run_engine_thread(graph, table, timeout_sec, engine_type, skip_target_looku
 def stream():
     """SSE endpoint: streams events as they're recorded, then final result."""
     timeout_sec = request.args.get("timeout", 60, type=int)
-    engine_type = request.args.get("engine", "hybrid")
+    engine_type = request.args.get("engine", "synthesis")
     threshold_ms = request.args.get("threshold", 100, type=float)
     debug = request.args.get("debug", "0") == "1"
     cb_compare_baseline = request.args.get("cb_compare_baseline", "0") == "1"
@@ -1529,17 +1513,11 @@ def stream():
                         try:
                             from tutte.scripts.cell_builder import compare_to_baseline
                             from tutte.synthesis.engine import SynthesisEngine
-                            from tutte.synthesis.hybrid import HybridSynthesisEngine
                             base_nx, base_label = _build_baseline_graph(
                                 cb_baseline_choice,
                             )
                             base_graph = Graph.from_networkx(base_nx)
-                            base_engine_cls = (
-                                HybridSynthesisEngine
-                                if engine_type == "hybrid"
-                                else SynthesisEngine
-                            )
-                            base_engine = base_engine_cls(verbose=False)
+                            base_engine = SynthesisEngine(verbose=False)
                             base_engine.skip_target_lookup = skip_target_lookup
                             base_result = base_engine.synthesize(base_graph)
                             comparison = compare_to_baseline(
@@ -1782,7 +1760,7 @@ def stream():
 def index():
     timeout_sec = request.args.get("timeout", 60, type=int)
     threshold_ms = request.args.get("threshold", 100, type=float)
-    engine_type = request.args.get("engine", "hybrid")
+    engine_type = request.args.get("engine", "synthesis")
     debug = request.args.get("debug", "0") == "1"
     # use_table + use_lookup default to ON. Unchecking submits without
     # the param, so we detect form submission via a hidden sentinel.
@@ -1870,7 +1848,7 @@ def index():
     cb_flag_val = "1" if source == "cell_builder" else "0"
 
     engine_options = ""
-    for opt in ["hybrid", "synthesis", "algebraic"]:
+    for opt in ["synthesis"]:
         sel = " selected" if opt == engine_type else ""
         engine_options += f'<option value="{opt}"{sel}>{opt}</option>'
 

@@ -73,19 +73,15 @@ def main():
     # cache key → originating Graph mapping. `save_rooted_lookup_default`
     # uses that mapping internally so we don't have to thread it manually
     # (and stay in sync with cache-key format changes).
-    n_json, n_bin = save_rooted_lookup_default()
+    n_bin = save_rooted_lookup_default()
     base_dir = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "data",
     )
-    json_path = os.path.join(base_dir, "rooted_lookup_table.json")
     bin_path = os.path.join(base_dir, "rooted_lookup_table.bin")
-    print(f"\nSaved {n_json} entries to {json_path}")
-    print(f"Saved {n_bin} entries to {bin_path}")
-    json_size = os.path.getsize(json_path)
+    print(f"\nSaved {n_bin} entries to {bin_path}")
     bin_size = os.path.getsize(bin_path)
-    print(f"  JSON: {json_size:,} bytes  |  BIN: {bin_size:,} bytes "
-          f"(ratio {json_size / max(1, bin_size):.1f}x)")
+    print(f"  BIN: {bin_size:,} bytes")
     print(f"Total computation: {total_t:.2f}s")
 
 

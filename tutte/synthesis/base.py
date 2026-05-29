@@ -54,8 +54,8 @@ class UnionFind:
 class BaseMultigraphSynthesizer:
     """Base class for multigraph synthesis with pattern recognition.
 
-    This class provides the shared multigraph synthesis logic used by both
-    SynthesisEngine and HybridSynthesisEngine. Subclasses must implement:
+    This class provides the shared multigraph synthesis logic used by
+    SynthesisEngine. Subclasses must implement:
     - synthesize(graph) -> result with polynomial attribute
     - _log(msg) -> logging function
     - _multigraph_cache -> dict for caching multigraph polynomials

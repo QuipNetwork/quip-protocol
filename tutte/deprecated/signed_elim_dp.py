@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
-from .treewidth import _elimination_ordering
+from ..graphs.treewidth import _elimination_ordering
 
 
 SignedActiveState = Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[bool, ...], int]

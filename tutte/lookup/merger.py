@@ -319,15 +319,13 @@ def load_default_merger_table() -> MergerTable:
 
 
 def save_default_merger_table(table: MergerTable) -> None:
-    """Save the merger table to the default location (binary + JSON mirror)."""
+    """Save the merger table to the default location (binary)."""
     from .binary import save_merger_lookup_table
 
     base_dir = _default_data_dir()
     bin_path = os.path.join(base_dir, "merger_lookup_table.bin")
-    json_path = os.path.join(base_dir, "merger_lookup_table.json")
 
     save_merger_lookup_table(table, bin_path)
-    table.save(json_path)
 
 
 __all__ = [

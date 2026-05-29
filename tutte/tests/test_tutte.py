@@ -373,7 +373,7 @@ def test_cut_vertex_c4_c5(engine):
 def _load_benchmark_baseline():
     """Load baseline timings from benchmark_results.json.
 
-    Returns dict of {name: {"synthesis_cej": ms, "synthesis_hybrid": ms}}.
+    Returns dict of {name: {"synthesis_cej": ms}}.
     Returns empty dict if file is missing.
     """
     path = os.path.join(os.path.dirname(__file__), "benchmark_results.json")
@@ -386,7 +386,6 @@ def _load_benchmark_baseline():
         timings = r.get("timings_ms", {})
         baseline[r["name"]] = {
             "synthesis_cej": timings.get("synthesis_cej"),
-            "synthesis_hybrid": timings.get("synthesis_hybrid"),
         }
     return baseline
 
@@ -593,8 +592,7 @@ from tutte.graphs.covering import (KMatchingJunction,  # noqa: E402
                                    extract_cell_topology)
 from tutte.graphs.k_sum import clique_chord_k_sum  # noqa: E402
 from tutte.lookup.core import load_default_table  # noqa: E402
-from tutte.roots.multivariate import MultivariateTutte, UniformZ  # noqa: E402
-from tutte.synthesis.hybrid import HybridSynthesisEngine  # noqa: E402
+from tutte.deprecated.multivariate import MultivariateTutte, UniformZ  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -611,7 +609,7 @@ def formulas_engine(table):
 
 @pytest.fixture(scope="module")
 def hybrid_engine(table):
-    return HybridSynthesisEngine(table=table, verbose=False)
+    return SynthesisEngine(table=table, verbose=False)
 
 
 def _add_edges_set(g: Graph, new_edges) -> Graph:
@@ -1083,50 +1081,6 @@ def test_full_clique_separator_found_by_search(formulas_engine):
 
 
 # --- Verification precision fix (May 2026) ---
-
-
-def test_algebraic_engine_uses_new_atom_polynomials():
-    """Regression: AlgebraicSynthesisEngine must use the new K_8..K_15
-    atoms added in May 2026 to factor composite polynomials. Pre-fix,
-    `RainbowTable.find_by_polynomial` was missing entirely, raising
-    AttributeError on every algebraic synthesis call. The fix added the
-    method (`tutte/lookup/core.py`) and lets the algebraic engine bottom
-    out on cached atom polynomials.
-
-    Test: synthesize T(K_8) * T(K_3) algebraically; verify it factors as
-    [K_8, K_3] (uses the new K_8 atom).
-    """
-    from tutte.lookup.core import load_default_table
-    from tutte.synthesis.algebraic import AlgebraicSynthesisEngine
-    from tutte.synthesis.engine import SynthesisEngine
-
-    table = load_default_table()
-    engine = SynthesisEngine(table=table, verbose=False)
-    T_k8 = engine.synthesize(complete_graph(8)).polynomial
-    T_k3 = engine.synthesize(complete_graph(3)).polynomial
-    target = T_k8 * T_k3
-
-    # Self-warmup: ensure the K_8 and K_3 atoms exist by name in the table.
-    # `make benchmark` wipes table entries that aren't in NAMED_GRAPHS, so
-    # warmup-only atoms can disappear between runs. Add them in-process so
-    # this test doesn't depend on prior `python -m tutte.scripts.warmup_lookup_table`.
-    for name, g in (("K_3", complete_graph(3)), ("K_8", complete_graph(8))):
-        if table.lookup_by_name(name) is None:
-            poly = engine.synthesize(g).polynomial
-            key = g.canonical_key()
-            if key in table.entries:
-                # Same canonical_key under a different name — alias only.
-                table.name_index[name] = key
-            else:
-                table.add(g, name, poly)
-
-    ae = AlgebraicSynthesisEngine(table=table, verbose=False)
-    result = ae.synthesize_from_polynomial(target)
-    assert result.verified
-    # Decomposition should include K_8 (one of the new atoms) and K_3
-    decomp_set = set(result.decomposition)
-    assert "K_8" in decomp_set, f"Expected K_8 atom in decomposition, got {result.decomposition}"
-    assert "K_3" in decomp_set, f"Expected K_3 atom in decomposition, got {result.decomposition}"
 
 
 def test_verify_spanning_trees_uses_exact_arithmetic_on_dense_graphs():
@@ -1838,9 +1792,6 @@ import pickle  # noqa: E402
 
 from tutte.synthesis.parallel import (parallel_synthesize_pair,  # noqa: E402
                                       shutdown_pool)
-from tutte.synthesis.symmetric import (  # noqa: E402
-    build_symmetric_chord_order, find_cell_automorphism,
-    pair_chords_by_symmetry)
 
 # =============================================================================
 # O. PICKLING ROUND-TRIP
@@ -1868,7 +1819,7 @@ class TestPickling:
         assert poly == poly2
 
     def test_complex_polynomial_pickle(self):
-        engine = HybridSynthesisEngine()
+        engine = SynthesisEngine()
         result = engine.synthesize(complete_graph(5))
         poly = result.polynomial
         poly2 = pickle.loads(pickle.dumps(poly))
@@ -1890,7 +1841,7 @@ class TestParallelCorrectness:
         shutdown_pool()
 
     def test_parallel_k5(self):
-        engine = HybridSynthesisEngine()
+        engine = SynthesisEngine()
         g = complete_graph(5)
         mg = MultiGraph(
             nodes=g.nodes,
@@ -1912,7 +1863,7 @@ class TestParallelCorrectness:
         assert par_polyc == seq_polyc
 
     def test_parallel_petersen(self):
-        engine = HybridSynthesisEngine()
+        engine = SynthesisEngine()
         g = petersen_graph()
         mg = MultiGraph(
             nodes=g.nodes,
@@ -1946,7 +1897,7 @@ class TestCacheMerging:
         shutdown_pool()
 
     def test_cache_grows_after_parallel(self):
-        engine = HybridSynthesisEngine()
+        engine = SynthesisEngine()
         g = complete_graph(5)
         mg = MultiGraph(
             nodes=g.nodes,
@@ -1965,7 +1916,7 @@ class TestCacheMerging:
         assert polyc.num_spanning_trees() > 0
 
     def test_merge_worker_cache(self):
-        engine = HybridSynthesisEngine()
+        engine = SynthesisEngine()
         sentinel_poly = TuttePolynomial.x()
         engine._multigraph_cache["sentinel_key"] = sentinel_poly
 
@@ -1983,7 +1934,7 @@ class TestNestedPrevention:
     """_in_worker flag prevents nested parallel calls."""
 
     def test_should_parallelize_blocked_in_worker(self):
-        engine = HybridSynthesisEngine()
+        engine = SynthesisEngine()
         engine._in_worker = True
 
         g = complete_graph(5)
@@ -1997,7 +1948,7 @@ class TestNestedPrevention:
         assert not engine._should_parallelize(mg, mg2)
 
     def test_should_parallelize_allowed_normally(self):
-        engine = HybridSynthesisEngine()
+        engine = SynthesisEngine()
         g = complete_graph(10)
         mg = MultiGraph(
             nodes=g.nodes,
@@ -2019,78 +1970,3 @@ class TestNestedPrevention:
             loop_counts={},
         )
         assert engine._should_parallelize(mg_big, mg_big)
-
-
-# =============================================================================
-# R. SYMMETRIC CHORD ORDERING
-# =============================================================================
-
-
-class TestSymmetricOrdering:
-    """Cell automorphism detection and chord pairing."""
-
-    @pytest.fixture
-    def symmetric_graph(self):
-        """Two K4 cells connected by 4 inter-cell edges with full symmetry."""
-        edges = set()
-        for i in range(4):
-            for j in range(i+1, 4):
-                edges.add((i, j))
-        for i in range(4, 8):
-            for j in range(i+1, 8):
-                edges.add((i, j))
-        for i in range(4):
-            edges.add((i, i+4))
-
-        g = Graph(nodes=frozenset(range(8)), edges=frozenset(edges))
-        partition = [{0, 1, 2, 3}, {4, 5, 6, 7}]
-        return g, partition
-
-    def test_find_automorphism(self, symmetric_graph):
-        g, partition = symmetric_graph
-        auto = find_cell_automorphism(g, partition)
-        assert auto is not None
-        for node in partition[0]:
-            assert auto[node] in partition[1]
-
-    def test_find_automorphism_rejects_asymmetric(self):
-        edges = set()
-        for i in range(3):
-            for j in range(i+1, 3):
-                edges.add((i, j))
-        for i in range(3, 6):
-            for j in range(i+1, 6):
-                edges.add((i, j))
-        edges.add((0, 3))
-        edges.add((1, 4))
-
-        g = Graph(nodes=frozenset(range(6)), edges=frozenset(edges))
-        partition = [{0, 1, 2}, {3, 4, 5}]
-        find_cell_automorphism(g, partition)  # should not crash
-
-    def test_pair_chords(self, symmetric_graph):
-        g, partition = symmetric_graph
-        auto = find_cell_automorphism(g, partition)
-        assert auto is not None
-
-        chords = [(0, 4), (1, 5), (2, 6), (3, 7)]
-        pairs, unpaired = pair_chords_by_symmetry(chords, auto, partition)
-
-        total_paired = len(pairs) * 2
-        total = total_paired + len(unpaired)
-        assert total == len(chords)
-
-    def test_build_symmetric_order(self, symmetric_graph):
-        g, partition = symmetric_graph
-        chords = [(0, 4), (1, 5), (2, 6), (3, 7)]
-        ordered, auto = build_symmetric_chord_order(chords, g, partition)
-        assert auto is not None
-        assert len(ordered) == len(chords)
-        assert set(ordered) == set(chords)
-
-    def test_three_cell_returns_none(self):
-        g = Graph(nodes=frozenset(range(3)), edges=frozenset())
-        partition = [{0}, {1}, {2}]
-        ordered, auto = build_symmetric_chord_order([], g, partition)
-        assert auto is None
-

@@ -6,7 +6,6 @@ Graphs are sorted by edge count so simpler ones seed the table first.
 
 Engines benchmarked:
     - CEJ (SynthesisEngine): creation-expansion-join with growing rainbow table
-    - Hybrid (HybridSynthesisEngine): algebraic + tiling with growing rainbow table
     - NetworkX (nx.tutte_polynomial): reference implementation via deletion-contraction
 
 Standalone usage:
@@ -30,7 +29,7 @@ from tutte.graph import (Graph, complete_graph, cycle_graph, grid_graph,
                          petersen_graph, wheel_graph)
 from tutte.lookup import RainbowTable, save_binary_rainbow_table
 from tutte.polynomial import TuttePolynomial
-from tutte.synthesis import HybridSynthesisEngine, SynthesisEngine
+from tutte.synthesis import SynthesisEngine
 from tutte.validation import count_spanning_trees_kirchhoff
 
 # ---------------------------------------------------------------------------
@@ -382,12 +381,8 @@ def _synth_worker_entry(synth_label, nodes_list, edges_list, table_dump, q):
         # cell-quotient paths return None and dispatch falls all the way
         # through to treewidth_dp (where the timeout was unenforceable).
         table = pickle.loads(table_dump) if table_dump else RainbowTable()
-        if synth_label == "cej":
-            from tutte.synthesis.engine import SynthesisEngine
-            eng = SynthesisEngine(table=table)
-        else:
-            from tutte.synthesis.hybrid import HybridSynthesisEngine
-            eng = HybridSynthesisEngine(table=table)
+        from tutte.synthesis.engine import SynthesisEngine
+        eng = SynthesisEngine(table=table)
         result = eng.synthesize(graph)
         poly_bytes = result.polynomial.to_bytes()
         trees = result.polynomial.num_spanning_trees()
@@ -526,9 +521,8 @@ def _fmt(ms):
 def run_benchmarks(timeout_s=60, nx_timeout_s=30):
     """Run benchmarks from empty rainbow tables.
 
-    Three engines are benchmarked independently:
+    Two engines are benchmarked independently:
       - CEJ (SynthesisEngine) with its own growing table
-      - Hybrid (HybridSynthesisEngine) with its own growing table
       - NetworkX (nx.tutte_polynomial) as reference (no table)
 
     After each graph, if an engine produced a correct result, the polynomial
@@ -537,11 +531,8 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
     cej_table = RainbowTable()
     cej_engine = SynthesisEngine(cej_table)
 
-    hybrid_table = RainbowTable()
-    hybrid_engine = HybridSynthesisEngine(table=hybrid_table)
-
     # Pre-warm ALL cffi JIT caches so first-touch compile costs don't get
-    # absorbed into a specific graph's CEJ/Hybrid timing. Each `_get_lib`
+    # absorbed into a specific graph's CEJ timing. Each `_get_lib`
     # call triggers cffi.verify/compile (~1-2s each). Without this, the
     # cost ends up on whichever atlas graph first hits an unprimed C ext.
     _CFFI_LOADERS = []
@@ -560,12 +551,6 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
         _CFFI_LOADERS.append(("_polynomial_c", _poly_get_lib))
     except ImportError:
         pass
-    try:
-        from tutte.graphs._signed_elim_c import _get_lib as _signed_get_lib
-        _CFFI_LOADERS.append(("_signed_elim_c", _signed_get_lib))
-    except ImportError:
-        pass
-
     print(f"Pre-warming {len(_CFFI_LOADERS)} cffi extensions...", flush=True)
     for name, loader in _CFFI_LOADERS:
         try:
@@ -598,21 +583,19 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
 
     graphs = _build_graph_list()
     results = []
-    stats = {"cej_ok": 0, "hybrid_ok": 0, "nx_ok": 0,
-             "cej_fail": 0, "hybrid_fail": 0, "nx_fail": 0,
+    stats = {"cej_ok": 0, "nx_ok": 0,
+             "cej_fail": 0, "nx_fail": 0,
              "poly_mismatch": 0}
 
     hdr = (f"{'#':>5} {'Graph':<20} {'N':>3} {'M':>3} {'Trees':>14} "
-           f"{'CEJ':>10} {'CEJ method':<32} "
-           f"{'Hybrid':>10} {'Hybrid method':<32} {'NetworkX':>10}")
-    print(f"Benchmarking {len(graphs)} graphs (3 engines, empty tables)")
+           f"{'CEJ':>10} {'CEJ method':<32} {'NetworkX':>10}")
+    print(f"Benchmarking {len(graphs)} graphs (2 engines, empty tables)")
     print(hdr)
     print("-" * len(hdr))
 
     # Track which edge counts have been proven unsolvable per engine,
     # so we don't waste timeout_s on every C2-C16 graph.
     cej_max_solved = 0
-    hybrid_max_solved = 0
     nx_max_solved = 0
     # Families on which NetworkX has already timed out — later (larger)
     # members are skipped without re-attempting (see `_nx_family_key`).
@@ -631,7 +614,7 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
 
         # Ground truth via Kirchhoff — only compute if we'll attempt synthesis
         # (avoids expensive exact determinant on huge unsolvable graphs)
-        will_attempt = (m <= cej_max_solved + 100 or m <= hybrid_max_solved + 100)
+        will_attempt = (m <= cej_max_solved + 100)
         kirchhoff = count_spanning_trees_kirchhoff(graph) if will_attempt else -1
 
         # --- CEJ engine ---
@@ -662,29 +645,6 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
         else:
             stats["cej_fail"] += 1
             cej_status = cej_err or "WRONG"
-
-        # --- Hybrid engine ---
-        if m > hybrid_max_solved + 100:
-            hybrid_ms, hybrid_result, hybrid_err = None, None, "UNSOLVED"
-        elif use_hard_timeout:
-            hybrid_ms, hybrid_payload, hybrid_err = _time_fn_hard(
-                "hybrid", graph, hybrid_table, timeout_s,
-            )
-            hybrid_result = _SubprocResult(hybrid_payload) if hybrid_payload else None
-        else:
-            hybrid_ms, hybrid_result, hybrid_err = _time_fn(
-                lambda: hybrid_engine.synthesize(graph), timeout_s
-            )
-        hybrid_ok = (hybrid_result is not None
-                     and hybrid_result.polynomial.num_spanning_trees() == kirchhoff)
-        if hybrid_ok:
-            hybrid_table.add(graph, name, hybrid_result.polynomial, hybrid_result.minors_used)
-            stats["hybrid_ok"] += 1
-            hybrid_status = "OK"
-            hybrid_max_solved = max(hybrid_max_solved, m)
-        else:
-            stats["hybrid_fail"] += 1
-            hybrid_status = hybrid_err or "WRONG"
 
         # --- NetworkX ---
         # Two give-up rules keep the reference oracle from burning a full
@@ -717,7 +677,7 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
             nx_status = nx_err or "WRONG"
 
         # --- Polynomial cross-validation ---
-        poly_match = {"cej_vs_nx": None, "hybrid_vs_nx": None}
+        poly_match = {"cej_vs_nx": None}
         if nx_ok:
             if cej_ok:
                 match = cej_result.polynomial == nx_result
@@ -725,33 +685,21 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
                 if not match:
                     cej_status = "POLY_MISMATCH"
                     stats["poly_mismatch"] += 1
-            if hybrid_ok:
-                match = hybrid_result.polynomial == nx_result
-                poly_match["hybrid_vs_nx"] = match
-                if not match:
-                    hybrid_status = "POLY_MISMATCH"
-                    stats["poly_mismatch"] += 1
 
         trees_str = f"{kirchhoff:,}" if kirchhoff >= 0 else "?"
 
         # Show failure reason inline when not OK
         cej_col = _fmt(cej_ms) if cej_status == "OK" else cej_status
-        hybrid_col = _fmt(hybrid_ms) if hybrid_status == "OK" else hybrid_status
         nx_col = _fmt(nx_ms) if nx_ok else nx_status
 
         # Method labels (truncated for column width; full method in JSON).
         cej_method = (
             getattr(cej_result, "method", "?") if cej_ok else "-"
         )
-        hybrid_method = (
-            getattr(hybrid_result, "method", "?") if hybrid_ok else "-"
-        )
         cej_method_col = (cej_method or "?")[:30]
-        hybrid_method_col = (hybrid_method or "?")[:30]
 
         print(f"{idx:>5} {name:<20} {n:>3} {m:>3} {trees_str:>14} "
-              f"{cej_col:>10} {cej_method_col:<32} "
-              f"{hybrid_col:>10} {hybrid_method_col:<32} {nx_col:>10}",
+              f"{cej_col:>10} {cej_method_col:<32} {nx_col:>10}",
               flush=True)
 
         results.append({
@@ -761,17 +709,14 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
             "spanning_trees": kirchhoff,
             "timings_ms": {
                 "synthesis_cej": cej_ms,
-                "synthesis_hybrid": hybrid_ms,
                 "networkx": nx_ms,
             },
             "status": {
                 "cej": cej_status,
-                "hybrid": hybrid_status,
                 "networkx": nx_status,
             },
             "method": {
                 "cej": cej_method if cej_ok else None,
-                "hybrid": hybrid_method if hybrid_ok else None,
             },
             "polynomial_match": poly_match,
         })
@@ -780,8 +725,6 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
     print("-" * len(hdr))
     print(f"CEJ:     {stats['cej_ok']} ok, {stats['cej_fail']} failed "
           f"({len(cej_table)} table entries)")
-    print(f"Hybrid:  {stats['hybrid_ok']} ok, {stats['hybrid_fail']} failed "
-          f"({len(hybrid_table)} table entries)")
     print(f"NetworkX:{stats['nx_ok']} ok, {stats['nx_fail']} failed")
     if stats["poly_mismatch"]:
         print(f"WARNING: {stats['poly_mismatch']} polynomial mismatches vs NetworkX!")
@@ -793,43 +736,36 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
     for r in results:
         m = r["edges"]
         if m not in by_edges:
-            by_edges[m] = {"count": 0, "cej": [], "hybrid": [], "nx": []}
+            by_edges[m] = {"count": 0, "cej": [], "nx": []}
         by_edges[m]["count"] += 1
-        for key in ("synthesis_cej", "synthesis_hybrid", "networkx"):
+        for key in ("synthesis_cej", "networkx"):
             short = key.replace("synthesis_", "").replace("networkx", "nx")
             t = r["timings_ms"][key]
             if t is not None:
                 by_edges[m][short].append(t)
 
-    print(f"\n{'Edges':>5} {'Count':>5}  {'CEJ avg':>10} {'Hybrid avg':>10} {'NX avg':>10}")
+    print(f"\n{'Edges':>5} {'Count':>5}  {'CEJ avg':>10} {'NX avg':>10}")
     print("-" * 50)
     for m in sorted(by_edges):
         b = by_edges[m]
         def avg(lst):
             return sum(lst) / len(lst) if lst else None
         print(f"{m:>5} {b['count']:>5}  "
-              f"{_fmt(avg(b['cej'])):>10} {_fmt(avg(b['hybrid'])):>10} {_fmt(avg(b['nx'])):>10}")
+              f"{_fmt(avg(b['cej'])):>10} {_fmt(avg(b['nx'])):>10}")
 
     # ------------------------------------------------------------------
     # Method-firing breakdown — answers "which dispatch paths actually
-    # carry the load" and "where are hybrid + CEJ diverging".
+    # carry the load" for the CEJ engine.
     # ------------------------------------------------------------------
     from collections import Counter
     cej_methods = Counter(
         r["method"]["cej"] for r in results if r["method"]["cej"]
     )
-    hybrid_methods = Counter(
-        r["method"]["hybrid"] for r in results if r["method"]["hybrid"]
-    )
     cej_by_method_time = {}
-    hybrid_by_method_time = {}
     for r in results:
         cm = r["method"]["cej"]; ct = r["timings_ms"]["synthesis_cej"]
-        hm = r["method"]["hybrid"]; ht = r["timings_ms"]["synthesis_hybrid"]
         if cm and ct is not None:
             cej_by_method_time.setdefault(cm, []).append(ct)
-        if hm and ht is not None:
-            hybrid_by_method_time.setdefault(hm, []).append(ht)
 
     print(f"\n--- Method-firing breakdown (CEJ engine) ---")
     print(f"{'Method':<40} {'Count':>6} {'Avg ms':>10} {'Max ms':>10}")
@@ -840,37 +776,8 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
         mx = max(times) if times else 0
         print(f"{method:<40} {count:>6} {avg:>10.1f} {mx:>10.1f}")
 
-    print(f"\n--- Method-firing breakdown (Hybrid engine) ---")
-    print(f"{'Method':<40} {'Count':>6} {'Avg ms':>10} {'Max ms':>10}")
-    print("-" * 70)
-    for method, count in hybrid_methods.most_common():
-        times = hybrid_by_method_time.get(method, [])
-        avg = sum(times) / len(times) if times else 0
-        mx = max(times) if times else 0
-        print(f"{method:<40} {count:>6} {avg:>10.1f} {mx:>10.1f}")
-
-    # CEJ vs Hybrid method divergence — which graphs the two engines
-    # route differently. Useful for "is hybrid actually different?"
-    divergent = [
-        r for r in results
-        if r["method"]["cej"] and r["method"]["hybrid"]
-        and r["method"]["cej"] != r["method"]["hybrid"]
-    ]
-    if divergent:
-        print(f"\n--- CEJ vs Hybrid method divergence ({len(divergent)} graphs) ---")
-        print(f"{'Graph':<20} {'M':>3} {'CEJ method':<32} {'Hybrid method':<32}")
-        print("-" * 90)
-        for r in divergent[:20]:
-            print(f"{r['name']:<20} {r['edges']:>3} "
-                  f"{(r['method']['cej'] or '?')[:30]:<32} "
-                  f"{(r['method']['hybrid'] or '?')[:30]:<32}")
-        if len(divergent) > 20:
-            print(f"... and {len(divergent) - 20} more")
-    else:
-        print("\n--- CEJ vs Hybrid: no method divergence ---")
-
     sys.stdout.flush()
-    return results, cej_table, hybrid_engine, cej_engine
+    return results, cej_table, cej_engine
 
 
 # ---------------------------------------------------------------------------
@@ -895,7 +802,7 @@ def compare_results(file1, file2):
                     key=lambda n: (results1[n]["edges"], n))
 
     # Compare each engine
-    for engine_key in ("synthesis_cej", "synthesis_hybrid", "networkx"):
+    for engine_key in ("synthesis_cej", "networkx"):
         label = engine_key.replace("synthesis_", "").upper()
         print(f"\n--- {label} ---")
         print(f"{'Graph':<20} {'M':>3}  {b1:>10}  {b2:>10}  {'Speedup':>8}")
@@ -923,7 +830,7 @@ def compare_results(file1, file2):
     # Method-change report: which graphs now route through a different
     # dispatch path. Even when wall time is unchanged, a route change
     # is a flag worth surfacing (e.g. a new fast path firing).
-    for engine_label in ("cej", "hybrid"):
+    for engine_label in ("cej",):
         method_changes = []
         for name in common:
             r1, r2 = results1[name], results2[name]
@@ -947,7 +854,7 @@ def compare_results(file1, file2):
 # Save / CLI
 # ---------------------------------------------------------------------------
 
-def save_results(results, cej_table=None, hybrid_engine=None, cej_engine=None):
+def save_results(results, cej_table=None, cej_engine=None):
     """Save benchmark results to JSON and optionally save rainbow/multigraph tables."""
     try:
         branch = subprocess.check_output(
@@ -983,22 +890,17 @@ def save_results(results, cej_table=None, hybrid_engine=None, cej_engine=None):
         print(f"Found {total_minors} minor relationships across "
               f"{len(relationships)} entries ({elapsed:.1f}s)", flush=True)
 
-        json_path = os.path.join(base_dir, "lookup_table.json")
         bin_path = os.path.join(base_dir, "lookup_table.bin")
-        cej_table.save(json_path)
         save_binary_rainbow_table(cej_table, bin_path)
-        print(f"Rainbow table saved: {len(cej_table)} entries ({json_path}, {bin_path})",
+        print(f"Rainbow table saved: {len(cej_table)} entries ({bin_path})",
               flush=True)
 
-    # Merge and save multigraph caches from both engines. Loads the
-    # existing on-disk table first so previous entries survive — the
-    # benchmark only adds new canonical keys, never overwrites the
-    # data blob.
+    # Save the CEJ engine's multigraph cache. Loads the existing on-disk
+    # table first so previous entries survive — the benchmark only adds
+    # new canonical keys, never overwrites the data blob.
     merged_mg_cache = {}
     if cej_engine is not None:
         merged_mg_cache.update(cej_engine._multigraph_cache)
-    if hybrid_engine is not None:
-        merged_mg_cache.update(hybrid_engine._structural_engine._multigraph_cache)
     if len(merged_mg_cache) > 0:
         from ..lookup.core import (
             load_default_multigraph_table,
@@ -1013,8 +915,7 @@ def save_results(results, cej_table=None, hybrid_engine=None, cej_engine=None):
         save_default_multigraph_table(existing)
         print(f"Multigraph cache saved: {len(existing)} entries "
               f"(+{added} new) "
-              f"({os.path.join(base_dir, 'multigraph_lookup_table.json')}, "
-              f"{os.path.join(base_dir, 'multigraph_lookup_table.bin')})",
+              f"({os.path.join(base_dir, 'multigraph_lookup_table.bin')})",
               flush=True)
 
     # Persist the rooted-Tutte lookup table populated during the run.
@@ -1024,10 +925,9 @@ def save_results(results, cej_table=None, hybrid_engine=None, cej_engine=None):
     # K_{a,b}, Z(1,1)) regardless of which benchmark graphs ran.
     try:
         from ..roots.rooted_tutte import save_rooted_lookup_default
-        n_json, n_bin = save_rooted_lookup_default()
-        print(f"Rooted lookup saved: {n_json} entries "
-              f"({os.path.join(base_dir, 'rooted_lookup_table.json')}, "
-              f"{os.path.join(base_dir, 'rooted_lookup_table.bin')})",
+        n_bin = save_rooted_lookup_default()
+        print(f"Rooted lookup saved: {n_bin} entries "
+              f"({os.path.join(base_dir, 'rooted_lookup_table.bin')})",
               flush=True)
     except Exception as e:
         print(f"[warn] Rooted lookup save failed: {type(e).__name__}: {e}",
@@ -1066,7 +966,7 @@ def main():
     )
     parser.add_argument(
         "--timeout", type=int, default=60,
-        help="Per-graph timeout in seconds for CEJ/hybrid (default: 60)",
+        help="Per-graph timeout in seconds for CEJ (default: 60)",
     )
     parser.add_argument(
         "--nx-timeout", type=int, default=30,
@@ -1077,8 +977,8 @@ def main():
     if args.compare:
         compare_results(args.compare[0], args.compare[1])
     else:
-        results, cej_table, hybrid_engine, cej_engine = run_benchmarks(timeout_s=args.timeout, nx_timeout_s=args.nx_timeout)
-        save_results(results, cej_table, hybrid_engine, cej_engine)
+        results, cej_table, cej_engine = run_benchmarks(timeout_s=args.timeout, nx_timeout_s=args.nx_timeout)
+        save_results(results, cej_table, cej_engine)
 
 
 if __name__ == "__main__":

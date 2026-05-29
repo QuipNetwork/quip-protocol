@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 
 import networkx as nx
 
-from tutte.graphs.signed_elim_dp import (
+from .signed_elim_dp import (
     compute_signed_tutte_elim_mod,
     compute_t_fix_sigma_mod,
 )
@@ -303,7 +303,7 @@ def derive_t_free_sigma_mod_via_cover(
     this takes >60s per modular point. Quotient signed-DP is much faster
     but only gives T_fix^σ. Use this only when you need T_free^σ from-scratch.
     """
-    from tutte.graphs._signed_elim_c import sigma_orbit_dp_full
+    from ._signed_elim_c import sigma_orbit_dp_full
 
     # Build int-relabeled graph + σ.
     nm = {v: i for i, v in enumerate(sorted(g.nodes()))}
@@ -455,7 +455,7 @@ def decompose_t_polynomial_via_sigma(
         )
     else:
         # From-scratch: T(G) via σ-orbit cover DP grid + interpolation.
-        from tutte.graphs._signed_elim_c import sigma_orbit_dp_full
+        from ._signed_elim_c import sigma_orbit_dp_full
 
         # Map nodes + perm to ints.
         nm = {v: i for i, v in enumerate(sorted(g.nodes()))}
@@ -552,7 +552,7 @@ def compute_t_via_sigma_auto(
     # Path 2: σ-DP via free σ on cover → direct T(G).
     perm = find_best_sigma(g, require_free=True)
     if perm is not None:
-        from tutte.graphs._signed_elim_c import sigma_orbit_dp_full
+        from ._signed_elim_c import sigma_orbit_dp_full
         nm = {v: i for i, v in enumerate(sorted(g.nodes()))}
         n_v = len(nm)
         edges_int = [(nm[u], nm[v]) for u, v in g.edges()]
@@ -728,7 +728,7 @@ def compute_t_via_pipeline(
     # Path 2: σ-DP free σ on cover.
     perm = find_best_sigma(g, require_free=True)
     if perm is not None:
-        from tutte.graphs._signed_elim_c import sigma_orbit_dp_full
+        from ._signed_elim_c import sigma_orbit_dp_full
         nm = {v: i for i, v in enumerate(sorted(g.nodes()))}
         n_v = len(nm)
         edges_int = [(nm[u], nm[v]) for u, v in g.edges()]

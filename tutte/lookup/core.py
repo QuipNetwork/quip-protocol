@@ -704,9 +704,8 @@ class RainbowTable:
         """Find a table entry whose polynomial equals `target` exactly.
 
         Returns the matching MinorEntry, or None if no entry has that
-        polynomial. Used by AlgebraicSynthesisEngine to bottom-out
-        recursive decomposition when the target polynomial is already
-        a known atom.
+        polynomial. (Retained as a table utility; the algebraic
+        decomposition path that previously used it has been removed.)
 
         Pre-filters by spanning tree count (T(1,1)) for speed; only
         compares full polynomials on candidates that match T(1,1).
@@ -865,19 +864,11 @@ def save_default_multigraph_table(cache: Dict[str, 'TuttePolynomial']) -> None:
     Args:
         cache: Dict mapping canonical key -> TuttePolynomial.
     """
-    import json as _json
     from .binary import save_multigraph_lookup_table
 
     base_dir = _default_data_dir()
     bin_path = os.path.join(base_dir, 'multigraph_lookup_table.bin')
-    json_path = os.path.join(base_dir, 'multigraph_lookup_table.json')
 
     save_multigraph_lookup_table(cache, bin_path)
-
-    json_cache = {}
-    for key, poly in cache.items():
-        json_cache[key] = {f'{i},{j}': c for i, j, c in poly.terms()}
-    with open(json_path, 'w') as f:
-        _json.dump(json_cache, f, indent=2)
 
 
