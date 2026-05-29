@@ -399,7 +399,12 @@ class DWaveMiner(BaseMiner):
                     if stop_event is not None and stop_event.is_set() and not self.drain_on_stop:
                         _cancel_pending()
                         return
-                    time.sleep(0.02)
+                    # 5ms poll: at production throughput one job per ~60ms
+                    # the difference vs 20ms is small per-cycle but worth a
+                    # few percent over a long mining session, and matters
+                    # more when shorter (num_reads, annealing_time) push
+                    # the per-job time down.
+                    time.sleep(0.005)
 
             model, future, defect_info, _ = pending.pop(completed_id)
             raw_ss = future.sampleset
@@ -408,6 +413,17 @@ class DWaveMiner(BaseMiner):
             # In drain mode, submit_one is a no-op so the pipeline winds
             # down naturally as pending empties.
             submit_one()
+
+            if job_index % 100 == 0:
+                feeder_stats = feeder.stats()
+                self.logger.info(
+                    "[QPU] stream depth: in_flight=%d/%d "
+                    "feeder_ready=%d/%d drained=%d wait_total=%.2fs",
+                    len(pending), queue_depth,
+                    feeder_stats['ready'], feeder_stats['buffer_size'],
+                    feeder_stats['drained_count'],
+                    feeder_stats['pop_wait_total_s'],
+                )
 
             if defect_info is not None:
                 # Check if best QPU energy + offset could meet threshold

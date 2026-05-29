@@ -37,8 +37,10 @@ from aiohttp.web import middleware
 
 from shared.mining_attempt_log import (
     DEFAULT_LOG_DIR,
+    _resolve_solution_id,
     query_by_dispatch,
     query_by_solution_id,
+    query_stored_solutions,
 )
 from shared.stats_snapshot import (
     merge_snapshots,
@@ -225,6 +227,7 @@ async def _run(
     )
     app.router.add_post("/api/v1/solve", _handle_solve)
     app.router.add_get("/api/v1/mining/attempts", _handle_mining_attempts)
+    app.router.add_get("/api/v1/mining/solutions", _handle_mining_solutions)
     app.router.add_get("/", _handle_index)
     app.router.add_route("*", "/{path:.*}", _handle_not_found)
 
@@ -398,6 +401,7 @@ async def _handle_index(request: web.Request) -> web.Response:
                 {"GET": "/api/v1/block/{block_number}/header"},
                 {"POST": "/api/v1/solve"},
                 {"GET": "/api/v1/mining/attempts"},
+                {"GET": "/api/v1/mining/solutions"},
             ],
         }
     )
@@ -656,6 +660,74 @@ async def _handle_mining_attempts(request: web.Request) -> web.Response:
 
     return _error(
         "supply either ?solution_id=N or ?miner_id=X&dispatch_id=Y",
+        "BAD_PARAM",
+    )
+
+
+async def _handle_mining_solutions(request: web.Request) -> web.Response:
+    """GET /api/v1/mining/solutions — list archived top-5 spin configs.
+
+    Query params (exactly one of the first two):
+      - ``solution_id`` (int): resolves to the winning miner's dispatch
+        via ``submissions_index.jsonl``, returns the stored solutions
+        for that (miner, dispatch).
+      - ``dispatch_id`` (int): returns all stored solutions for the
+        dispatch across all miners (or filtered by ``miner_id``).
+      - ``miner_id`` (str, optional with ``dispatch_id``): filters to
+        one miner's stored solutions.
+
+    Returns ``{stored: [{iter, nonce_hex, salt_hex, result_kind,
+    top_5_solutions_hex, top_5_energies}, ...]}`` sorted by iter.
+
+    ``top_5_solutions_hex`` are 1-bit-per-spin packed (4578 nodes →
+    1146 hex chars / solution). Decode with numpy.unpackbits +
+    transformation 0→-1, 1→+1 to recover Ising spin vectors.
+    """
+    snapshot, _err = _read_snapshot_or_503(request)
+    attempts_dir = (
+        Path(snapshot["attempts_dir"])
+        if snapshot is not None and snapshot.get("attempts_dir")
+        else DEFAULT_LOG_DIR
+    )
+
+    params = request.rel_url.query
+    miner_id_filter = params.get("miner_id")
+
+    if "solution_id" in params:
+        try:
+            solution_id = int(params["solution_id"])
+        except ValueError:
+            return _error("solution_id must be an integer", "BAD_PARAM")
+        resolved = _resolve_solution_id(solution_id, attempts_dir)
+        if resolved is None:
+            return _error(
+                f"solution_id {solution_id} not found",
+                "NOT_FOUND",
+                status=404,
+            )
+        dispatch_id, miner_id = resolved
+        stored = query_stored_solutions(
+            dispatch_id, log_dir=attempts_dir, miner_id=miner_id,
+        )
+        return _success({
+            "solution_id": solution_id,
+            "dispatch_id": dispatch_id,
+            "miner_id": miner_id,
+            "stored": stored,
+        })
+
+    if "dispatch_id" in params:
+        try:
+            dispatch_id = int(params["dispatch_id"])
+        except ValueError:
+            return _error("dispatch_id must be an integer", "BAD_PARAM")
+        stored = query_stored_solutions(
+            dispatch_id, log_dir=attempts_dir, miner_id=miner_id_filter,
+        )
+        return _success({"dispatch_id": dispatch_id, "stored": stored})
+
+    return _error(
+        "supply either ?solution_id=N or ?dispatch_id=N",
         "BAD_PARAM",
     )
 

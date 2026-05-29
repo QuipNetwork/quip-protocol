@@ -285,6 +285,70 @@ def calculate_diversity(solutions: List[List[int]]) -> float:
     return float(np.mean(distances)) if distances else 0.0
 
 
+def pack_spins_hex(solution: List[int]) -> str:
+    """Compact-encode a {-1, +1} spin vector as hex of packed bits.
+
+    1 bit per spin (1 = +1, 0 = -1). 4578-node topology compresses to
+    ~573 bytes / 1146 hex chars per solution — small enough to archive
+    top-5 per stored attempt without blowing up disk usage.
+    """
+    bits = np.array(
+        [(s + 1) // 2 for s in solution], dtype=np.uint8,
+    )
+    return np.packbits(bits).tobytes().hex()
+
+
+def compute_solution_meta(
+    sampleset, threshold: float,
+) -> Tuple[Dict[str, Any], List[List[int]], List[float]]:
+    """Solution metadata + top-5 captures for one sampleset.
+
+    Returns ``(meta, top_5_solutions, top_5_energies)`` where:
+
+    - ``meta``: scalar fields safe to embed in the attempts JSONL —
+      ``n_unique_total``, ``n_unique_below_threshold``,
+      ``top_5_diversity``, ``top_5_energy_ceiling``.
+    - ``top_5_solutions``: up to 5 spin vectors sorted by ascending
+      energy (i.e., best-energy first). Caller decides whether to
+      archive — production writes them via ``SolutionStore`` only for
+      ``stored`` / ``submitted`` attempts; canary writes on the same
+      criterion.
+    - ``top_5_energies``: matching energies, same order.
+
+    Diversity is mean pairwise Hamming distance over the top-5 unique
+    samples — the same K that the chain's ``min_solutions`` gate
+    typically uses, so this measurement directly reflects whether the
+    sampler is producing diverse enough below-target candidates.
+    """
+    try:
+        energies = list(sampleset.record.energy)
+    except AttributeError:
+        return {}, [], []
+    if not energies:
+        return {}, [], []
+
+    seen: Dict[Tuple[int, ...], float] = {}
+    for idx in range(len(energies)):
+        spins = tuple(sampleset.record.sample[idx])
+        if spins not in seen or energies[idx] < seen[spins]:
+            seen[spins] = float(energies[idx])
+    unique_sorted = sorted(seen.items(), key=lambda kv: kv[1])
+    sols = [list(s) for s, _ in unique_sorted]
+    es = [e for _, e in unique_sorted]
+
+    top_5 = sols[:5]
+    top_5_es = es[:5]
+    meta = {
+        "n_unique_total": len(sols),
+        "n_unique_below_threshold": sum(1 for e in es if e < threshold),
+        "top_5_diversity": (
+            calculate_diversity(top_5) if len(top_5) >= 2 else 0.0
+        ),
+        "top_5_energy_ceiling": top_5_es[-1] if top_5_es else None,
+    }
+    return meta, top_5, top_5_es
+
+
 def _calculate_set_diversity(indices: List[int], dist_matrix: np.ndarray) -> float:
     """Calculate average pairwise distance for a set of solutions."""
     if len(indices) < 2:
@@ -693,8 +757,13 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
     min_diversity = requirements.min_diversity
     min_solutions = requirements.min_solutions
     best_energy = float('inf')
-    num_valid_full = 0
-    num_meeting = 0
+    # num_valid = count of unique solutions that meet the energy gate
+    # (sampler energies in snapshot mode; recomputed energies against the
+    # live decayed threshold in ratchet mode). This is the only count
+    # that matters for chain acceptance — "did we produce ≥ min_solutions
+    # below-target samples?". The pre-dedup read count is implied by
+    # the configured num_reads, not reported here.
+    num_valid = 0
     diversity = 0.0
     result = None
 
@@ -714,18 +783,9 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
             )
 
         # Dedup the FULL batch into the constraint-valid set, BEFORE any
-        # target filter. This is the universe both diagnostics
-        # (``num_valid``, ``num_meeting_target``) and the diverse-K
-        # selection draw from.
-        #
-        # ``num_valid`` answers "did the topology sampler produce
-        # diverse-enough unique solutions?". ``num_meeting_target``
-        # answers "of those, how many would the chain accept?". Keeping
-        # them on the same denominator means the operator can read the
-        # ratio: equal = sampler is producing exclusively below-target
-        # (post-decay submission window); ``num_meeting_target`` ≪
-        # ``num_valid`` = sampler is healthy but target is tight
-        # (decay-wait phase).
+        # target filter. The dedup pool feeds both ``num_valid``
+        # (count of below-target solutions) and the diverse-K selection
+        # used to compute diversity.
         full_unique_solutions: List[List[int]] = []
         full_unique_energies: List[float] = []
         seen: set = set()
@@ -774,6 +834,18 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
                 local_logger = logging.getLogger(__name__)
                 local_logger.warning(f"Found {len(invalid_solutions)} invalid solutions with errors: {[s['errors'] for s in invalid_solutions[:3]]}")
 
+        # Set num_valid here so it reflects actual sampleset shape even
+        # when later validation raises. Without this, the finally-block
+        # log line would print "Valid: 0" on any "insufficient valid
+        # solutions" rejection, making it impossible to tell whether the
+        # sampler produced 0 below-target solutions or 4 (just shy of
+        # min_solutions=5). In ratchet mode this gets recomputed against
+        # the live decayed threshold using chain-recomputed energies; see
+        # the post-success-path block below.
+        num_valid = sum(
+            1 for e in full_unique_energies if e < difficulty_energy
+        )
+
         # Pool selection for diverse-K. Three modes:
         #
         # 1. Strict (legacy / mempool): pool = below snapshot target.
@@ -810,6 +882,16 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
 
         valid_solutions = [full_unique_solutions[i] for i in pool_indices]
         valid_energies = [full_unique_energies[i] for i in pool_indices]
+
+        # Diversity snapshot over whatever below-target solutions we
+        # have, even if fewer than min_solutions. Without this the log
+        # prints diversity=0.000 (the init value) on any "Insufficient
+        # valid solutions" rejection, hiding whether the sampler is
+        # producing diverse-but-too-few samples vs. clustering in one
+        # basin. Recomputed below with farthest-point selection when we
+        # have enough to reach the success path.
+        if len(valid_solutions) >= 2:
+            diversity = calculate_diversity(valid_solutions)
 
         if len(valid_solutions) < min_solutions:
             raise ValueError(f"Insufficient valid solutions: {len(valid_solutions)} < {min_solutions}")
@@ -877,29 +959,21 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         )
         submit_floor_energy = max(selected_energies) if selected_energies else best_energy
 
-        # Count FULL-batch unique constraint-valid solutions whose
-        # chain-recomputed energy would survive the live decayed target
-        # if submitted now. The denominator is the full constraint-valid
-        # set, NOT the pool — otherwise ``num_meeting_target`` collapses
-        # to ``num_valid`` when the pool is the below-target subset, and
-        # the operator loses the diagnostic ratio.
-        #
-        # Sampler-reported energies drift sub-milli from chain-computed
-        # ones on most backends but cross the boundary often enough at
-        # the round tail to be misleading, so we eat the extra matmul to
-        # keep the diagnostic honest. Only done when a threshold is
-        # provided; mempool jobs (no decay) skip this and leave the
-        # field None.
-        num_valid_full = len(full_unique_solutions)
-        num_meeting_target: Optional[int] = None
+        # In ratchet mode, upgrade num_valid to the chain-recomputed
+        # count against the live decayed threshold. Sampler-reported
+        # energies drift sub-milli from chain-computed ones on most
+        # backends but cross the boundary often enough at the round
+        # tail to be misleading, so we eat the extra matmul to keep
+        # the diagnostic honest. Skipped for mempool / snapshot-only
+        # paths — num_valid stays as the sampler-energy count set
+        # right after dedup.
         if live_threshold_energy is not None and full_unique_solutions:
             full_recomputed = energies_for_solutions(
                 full_unique_solutions, h_for_floor, J_for_floor, nodes,
             )
-            num_meeting_target = int(
+            num_valid = int(
                 sum(1 for e in full_recomputed if e < live_threshold_energy)
             )
-            num_meeting = num_meeting_target
 
         # Create mining result for this attempt
         mining_time = time.time() - start_time
@@ -915,18 +989,17 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
             solutions=filtered_solutions,
             energy=best_energy,
             diversity=diversity,
-            num_valid=len(full_unique_solutions),
+            num_valid=num_valid,
             mining_time=int(mining_time),
             node_list=nodes,
             edge_list=edges,
             variable_order=nodes,
             submit_floor_energy=submit_floor_energy,
-            num_meeting_target=num_meeting_target,
         )
     except ValueError as e:
         # Use module logger for consistency
         logger.debug(f"Failed to meet requirements: {e}")
     finally:
         # Log every mining attempt (successful or not) for analysis
-        logger.info(f"[{miner_id}] Mining attempt - Energy: {best_energy:.0f}, Valid: {num_valid_full} Meeting: {num_meeting} (best {min_solutions} diversity: {diversity:.3f}) (requirements: energy<={difficulty_energy:.0f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
+        logger.info(f"[{miner_id}] Mining attempt - Energy: {best_energy:.0f}, Valid: {num_valid} (best {min_solutions} diversity: {diversity:.3f}) (requirements: energy<={difficulty_energy:.0f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
     return result

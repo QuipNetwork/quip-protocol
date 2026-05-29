@@ -157,6 +157,18 @@ class RandomIsingFeeder:
         self._futures: list = []
         self._queue: queue.Queue[IsingModel] = queue.Queue()
         self._stopped = False
+        # Throughput diagnostics: continuously updated in _fill() and
+        # pop_blocking(). Read by telemetry to confirm the buffer stays
+        # full under load (drained_count > 0 means the QPU stream out-ran
+        # the worker pool).
+        self._stats: dict = {
+            'max_depth_seen': 0,
+            'min_depth_seen': 0,
+            'drained_count': 0,
+            'pop_wait_total_s': 0.0,
+            'pop_wait_count': 0,
+        }
+        self._min_depth_init = False
         self._fill()
 
     def _make_salt(self) -> bytes:
@@ -208,6 +220,7 @@ class RandomIsingFeeder:
         # (callers fighting for queue slots) or when workers failed.
         ready = self._queue.qsize()
         pending = len(self._futures)
+        self._record_depth(ready)
         if failures or ready == 0:
             logger.info(
                 "RandomIsingFeeder state: ready=%d pending=%d "
@@ -215,6 +228,43 @@ class RandomIsingFeeder:
                 ready, pending, self._buffer_size,
                 submitted, failures,
             )
+
+    def _record_depth(self, ready: int) -> None:
+        s = self._stats
+        if ready == 0:
+            s['drained_count'] += 1
+        if ready > s['max_depth_seen']:
+            s['max_depth_seen'] = ready
+        if not self._min_depth_init or ready < s['min_depth_seen']:
+            s['min_depth_seen'] = ready
+            self._min_depth_init = True
+
+    def stats(self) -> dict:
+        """Snapshot of feeder activity counters plus current depth.
+
+        Returns:
+            Dict with cumulative counters (``max_depth_seen``,
+            ``min_depth_seen``, ``drained_count``, ``pop_wait_total_s``,
+            ``pop_wait_count``) plus point-in-time ``ready``, ``pending``,
+            and ``buffer_size``. Safe to call from the same process that
+            owns the feeder.
+        """
+        snap = dict(self._stats)
+        snap['ready'] = self._queue.qsize()
+        snap['pending'] = len(self._futures)
+        snap['buffer_size'] = self._buffer_size
+        return snap
+
+    def reset_stats(self) -> None:
+        """Zero the cumulative counters (point-in-time fields unaffected)."""
+        self._stats = {
+            'max_depth_seen': 0,
+            'min_depth_seen': 0,
+            'drained_count': 0,
+            'pop_wait_total_s': 0.0,
+            'pop_wait_count': 0,
+        }
+        self._min_depth_init = False
 
     def __iter__(self):
         return self
@@ -277,6 +327,8 @@ class RandomIsingFeeder:
         t0 = time.monotonic()
         model = fut.result()
         waited = time.monotonic() - t0
+        self._stats['pop_wait_total_s'] += waited
+        self._stats['pop_wait_count'] += 1
         if waited > 1.0:
             logger.info(
                 "RandomIsingFeeder.pop_blocking waited %.2fs for a "
@@ -398,6 +450,29 @@ class FixedIsingFeeder:
     def stop(self) -> None:
         """No-op shutdown. Idempotent — safe to call multiple times."""
         self._stopped = True
+
+    def stats(self) -> dict:
+        """Static snapshot matching :meth:`RandomIsingFeeder.stats`.
+
+        The cycling adapter has no buffer to drain, so the depth and
+        wait counters are pinned at values that say "always full, never
+        waited" — callers downstream can read the same dict shape
+        regardless of which feeder backend is active.
+        """
+        n = len(self._models)
+        return {
+            'max_depth_seen': n,
+            'min_depth_seen': n,
+            'drained_count': 0,
+            'pop_wait_total_s': 0.0,
+            'pop_wait_count': 0,
+            'ready': n,
+            'pending': 0,
+            'buffer_size': n,
+        }
+
+    def reset_stats(self) -> None:
+        """No-op for API parity with :class:`RandomIsingFeeder`."""
 
 
 __all__ = [

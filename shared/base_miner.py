@@ -24,8 +24,12 @@ from shared.energy_utils import (
 )
 from shared.mempool_types import MempoolJobContext
 from shared.miner_types import BlockRequirements, IsingSample, MiningResult, Sampler
-from shared.mining_attempt_log import AttemptLogger
-from shared.quantum_proof_of_work import evaluate_sampleset
+from shared.mining_attempt_log import AttemptLogger, SolutionStore
+from shared.quantum_proof_of_work import (
+    compute_solution_meta,
+    evaluate_sampleset,
+    pack_spins_hex,
+)
 from substrate.types import SubstrateMiningContext
 from shared.work_context import (
     WorkContext,
@@ -488,6 +492,16 @@ class BaseMiner(ABC):
         )
         if not hasattr(self, '_attempt_logger'):
             self._attempt_logger = attempt_log
+        # SolutionStore is the per-worker writer for top-5 spin
+        # archives. Only called when an iter is stored or submitted —
+        # see the call sites further down. Same lazy-cache idiom as
+        # attempt_log so we re-use one instance across dispatches.
+        solution_store: SolutionStore = (
+            getattr(self, '_solution_store', None)
+            or SolutionStore(self.miner_id)
+        )
+        if not hasattr(self, '_solution_store'):
+            self._solution_store = solution_store
         dispatch_id_for_log = int(getattr(self, '_current_dispatch_id', 0))
 
         # Build the feeder for this attempt. Each context flavor picks
@@ -636,7 +650,6 @@ class BaseMiner(ABC):
                     # already produced by ``evaluate_sampleset``.
                     post_num_valid: Optional[int] = None
                     post_diversity_milli: Optional[int] = None
-                    post_num_meeting_target: Optional[int] = None
                     if iter_best_energy < ratchet_threshold:
                         # Lenient eval — diversity + min_solutions
                         # still required, but no energy gate. The
@@ -654,7 +667,6 @@ class BaseMiner(ABC):
                         if result is not None:
                             post_num_valid = result.num_valid
                             post_diversity_milli = int(result.diversity * 1000)
-                            post_num_meeting_target = result.num_meeting_target
                             # Insert into the bounded heap. Always
                             # admits when there's room; otherwise the
                             # iter only got here because it beat the
@@ -714,7 +726,6 @@ class BaseMiner(ABC):
                         threshold_milli=live_threshold_milli,
                         ratchet_threshold_milli=ratchet_threshold_milli_log,
                         num_valid=post_num_valid,
-                        num_solutions_meeting_target=post_num_meeting_target,
                         diversity_milli=post_diversity_milli,
                         stored_as_best=stored_replaced,
                         result_kind=(
@@ -758,7 +769,47 @@ class BaseMiner(ABC):
                     (time.time() - preprocess_start) * 1e6
                 )
                 attempt_log_kwargs["qpu_access_time_us"] = qpu_access_time_us
+                if self._feeder is not None:
+                    fstats = self._feeder.stats()
+                    attempt_log_kwargs["feeder_ready"] = fstats["ready"]
+                    attempt_log_kwargs["feeder_drained_count"] = (
+                        fstats["drained_count"]
+                    )
+                    attempt_log_kwargs["feeder_pop_wait_total_s"] = (
+                        fstats["pop_wait_total_s"]
+                    )
+                # Compute solution_meta scalars + capture top-5
+                # solutions. Meta is always embedded in the attempt
+                # log; top-5 spins go to disk only when this iter is
+                # stored or submitted (see write below).
+                sol_meta, top_5_sols, top_5_es = compute_solution_meta(
+                    sampleset, requirements.difficulty_energy,
+                )
+                attempt_log_kwargs["solution_meta"] = sol_meta
                 attempt_log.record(**attempt_log_kwargs)
+
+                # SolutionStore — archive top-5 spin configs only when
+                # the chain ratchet kept this candidate. The result_kind
+                # set on the attempt drives the gate; "submitted" and
+                # "stored" both qualify since both produce a candidate
+                # we (or someone) might reproduce for analysis.
+                attempt_result_kind = attempt_log_kwargs.get("result_kind")
+                if attempt_result_kind in ("stored", "submitted") and top_5_sols:
+                    nonce_hex = (
+                        nonce.hex() if isinstance(nonce, (bytes, bytearray))
+                        else f"{int(nonce):064x}"
+                    )
+                    solution_store.record(
+                        dispatch_id=dispatch_id_for_log,
+                        iter_num=progress,
+                        nonce_hex=nonce_hex,
+                        salt_hex=salt.hex(),
+                        top_5_solutions_hex=[
+                            pack_spins_hex(s) for s in top_5_sols
+                        ],
+                        top_5_energies=top_5_es,
+                        result_kind=attempt_result_kind,
+                    )
 
                 if result:
                     # Post-evaluation cancel check. evaluate_sampleset can
@@ -943,6 +994,8 @@ class BaseMiner(ABC):
             "miner_id": self.miner_id,
             "miner_type": self.miner_type,
         })
+        if self._feeder is not None:
+            stats["feeder_stats"] = self._feeder.stats()
         return stats
 
     def evaluate_sampleset(self, sampleset: dimod.SampleSet, requirements: BlockRequirements, nodes: List[int], edges: List[Tuple[int, int]], nonce: int, salt: bytes, prev_timestamp: int, start_time: float, *, strict_energy: bool = True, live_threshold_energy: Optional[float] = None) -> Optional[MiningResult]:
@@ -956,10 +1009,9 @@ class BaseMiner(ABC):
 
         ``live_threshold_energy`` (float, ratchet path only) is the
         chain's *live* (decay-applied) target. When provided, the
-        returned result populates ``num_meeting_target`` with the count
-        of constraint-satisfying samples whose chain-recomputed energy
-        would clear that target — purely diagnostic, surfaced in the
-        per-iter JSONL for the dashboard.
+        returned result's ``num_valid`` counts samples whose
+        chain-recomputed energy clears that live target (rather than
+        the snapshot ``difficulty_energy``).
         """
         return evaluate_sampleset(sampleset, requirements, nodes, edges, nonce, salt, prev_timestamp, start_time, self.miner_id, self.miner_type, strict_energy=strict_energy, live_threshold_energy=live_threshold_energy)
 

@@ -149,6 +149,39 @@ class TestRandomIsingFeeder:
         finally:
             feeder.stop()
 
+    def test_stats_shape_and_updates(self):
+        feeder = _make_feeder(seed=11, buffer_size=4)
+        try:
+            for _ in range(3):
+                feeder.pop_blocking()
+            snap = feeder.stats()
+            assert set(snap) >= {
+                'max_depth_seen', 'min_depth_seen', 'drained_count',
+                'pop_wait_total_s', 'pop_wait_count', 'ready',
+                'pending', 'buffer_size',
+            }
+            assert snap['buffer_size'] == 4
+            assert snap['max_depth_seen'] >= 0
+            assert snap['pop_wait_total_s'] >= 0.0
+            # pop_wait_count only increments when pop_blocking actually
+            # blocks on a worker; depending on timing it may be 0.
+            assert snap['pop_wait_count'] >= 0
+        finally:
+            feeder.stop()
+
+    def test_reset_stats_zeros_counters(self):
+        feeder = _make_feeder(seed=13)
+        try:
+            feeder.pop_blocking()
+            feeder.reset_stats()
+            snap = feeder.stats()
+            assert snap['max_depth_seen'] == 0
+            assert snap['drained_count'] == 0
+            assert snap['pop_wait_total_s'] == 0.0
+            assert snap['pop_wait_count'] == 0
+        finally:
+            feeder.stop()
+
 def _make_model(seed: int = 0) -> IsingModel:
     """Build a small deterministic IsingModel for FixedIsingFeeder tests."""
     return IsingModel(
@@ -210,5 +243,20 @@ class TestFixedIsingFeeder:
             assert it is feeder
             assert next(it) is model
             assert next(it) is model
+        finally:
+            feeder.stop()
+
+    def test_stats_matches_random_shape(self):
+        """``stats()`` keys mirror RandomIsingFeeder for API parity."""
+        feeder = FixedIsingFeeder(models=[_make_model(1), _make_model(2)])
+        try:
+            snap = feeder.stats()
+            assert set(snap) == {
+                'max_depth_seen', 'min_depth_seen', 'drained_count',
+                'pop_wait_total_s', 'pop_wait_count', 'ready',
+                'pending', 'buffer_size',
+            }
+            assert snap['drained_count'] == 0
+            assert snap['buffer_size'] == 2
         finally:
             feeder.stop()
