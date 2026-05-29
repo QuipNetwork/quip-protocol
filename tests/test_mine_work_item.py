@@ -13,6 +13,7 @@ a very-relaxed difficulty so the loop terminates in a few seconds. Verifies:
 """
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
 import time
 
@@ -1167,4 +1168,169 @@ def test_stored_solution_iter_matches_attempt_iter(
     assert attempt_iter == solution_iter, (
         f"attempt-log iter ({attempt_iter}) != stored-solution iter "
         f"({solution_iter}); cross-reference is broken"
+    )
+
+
+def test_mined_log_nonce_comes_from_result_not_loop_variable(
+    cpu_miner, relaxed_context, caplog,
+):
+    """The ``mined!`` INFO log line must display the *submitted* result's
+    nonce (``result.nonce``), not the loop's last-iterated nonce variable.
+
+    In the substrate-ratchet path the submit gate walks ``top_k`` and
+    returns the best-energy stashed candidate, which may have been produced
+    by an *earlier* iteration with a different nonce than the current one.
+    Before the fix the log used the loop variable ``nonce``/``salt``, so
+    operators saw nonce X in the ``mined!`` line while the submitter used
+    nonce Y from the returned result.
+
+    Setup:
+    - Iter 1: ``evaluate_sampleset`` returns ``result_A`` (nonce_A, energy -2.0,
+      floor -1.5).  Live threshold is -3000 milli so the submit gate fails
+      (int(-1500) < -3000 is False) but ``result_A`` is stored in ``top_k``.
+    - After iter 1's ``AttemptLogger.record`` fires, the live threshold is
+      relaxed to 0 milli.
+    - Iter 2: a fresh nonce (``nonce_B``) is drawn from the feeder.
+      ``evaluate_sampleset`` returns ``result_B`` (nonce_B, energy -1.8,
+      floor -1.5).  Submit gate walks top_k = [result_A, result_B] sorted
+      by energy; result_A is better (-2.0 < -1.8), its floor (-1500 milli)
+      < 0 milli → submit gate selects ``result_A``.  The loop variable
+      ``nonce`` at this point is ``nonce_B``.
+
+    Assertion: the ``mined!`` log line contains ``result_A.nonce.hex()[:16]``
+    and does NOT contain ``nonce_B.hex()[:16]`` (which are different).
+    """
+    from unittest.mock import MagicMock
+
+    # Predetermined nonce for the stashed result from iter 1 (32 bytes).
+    nonce_A = bytes(range(32))
+    salt_A = b"\xaa" * 32
+
+    # Tracking state shared across the mock closures.
+    iter_count = [0]
+    captured_iter2_loop_nonce: list = []
+
+    def fake_evaluate(sampleset, requirements, nodes, edges,
+                      nonce, salt, prev_timestamp, start_time,
+                      strict_energy=True, live_threshold_energy=None):
+        iter_count[0] += 1
+        n = len(nodes)
+        fake_solutions = [[-1] * n]
+        if iter_count[0] == 1:
+            # Iter 1: return result_A with predetermined nonce_A.
+            return MiningResult(
+                miner_id="test",
+                miner_type="CPU",
+                nonce=nonce_A,
+                salt=salt_A,
+                timestamp=0,
+                prev_timestamp=0,
+                solutions=fake_solutions,
+                energy=-2.0,
+                diversity=1.0,
+                num_valid=1,
+                mining_time=0,
+                node_list=list(nodes),
+                edge_list=list(edges),
+                submit_floor_energy=-1.5,  # int(-1500) < -3000 → False → no submit
+            )
+        else:
+            # Iter 2+: record the loop's nonce (iter 2's nonce_B) for the
+            # divergence assertion, then return result_B (also with nonce=nonce
+            # from this iter — but submit gate will prefer result_A from top_k).
+            if iter_count[0] == 2:
+                captured_iter2_loop_nonce.append(nonce)
+            return MiningResult(
+                miner_id="test",
+                miner_type="CPU",
+                nonce=nonce,   # result_B.nonce == loop nonce for this iter
+                salt=salt,
+                timestamp=0,
+                prev_timestamp=0,
+                solutions=fake_solutions,
+                energy=-1.8,
+                diversity=1.0,
+                num_valid=1,
+                mining_time=0,
+                node_list=list(nodes),
+                edge_list=list(edges),
+                submit_floor_energy=-1.5,  # int(-1500) < 0 → True → submittable
+            )
+
+    # Live threshold starts very strict (-3000 milli) so iter 1 stores but
+    # does not submit.  After iter 1's record() fires we relax to 0 so iter 2's
+    # submit gate can pass for the stashed result_A.
+    live_var = mp.Value('q', -3000)
+
+    recording_logger = MagicMock()
+
+    def _on_record(**kw):
+        # After the first record (iter 1), relax the live threshold so that
+        # the submit gate passes on iter 2.
+        if kw.get("result_kind") == "stored":
+            with live_var.get_lock():
+                live_var.value = 0
+
+    recording_logger.record.side_effect = _on_record
+
+    stop = mp.Event()
+    cpu_miner._attempt_logger = recording_logger
+    cpu_miner._live_max_energy_milli = live_var
+    monkeypatched_evaluate = cpu_miner.evaluate_sampleset
+    cpu_miner.evaluate_sampleset = fake_evaluate  # type: ignore[method-assign]
+
+    returned_result = None
+    logger_name = cpu_miner.logger.name
+    try:
+        with caplog.at_level(logging.INFO, logger=logger_name):
+            returned_result = cpu_miner.mine_work_item(relaxed_context, stop)
+    finally:
+        cpu_miner.evaluate_sampleset = monkeypatched_evaluate
+        del cpu_miner._attempt_logger
+        del cpu_miner._live_max_energy_milli
+
+    assert returned_result is not None, (
+        "mine_work_item must return a result when a candidate clears the "
+        "live threshold; returned None instead"
+    )
+    # The submit gate chose result_A (better energy) from top_k — even though
+    # the loop's last nonce was nonce_B (iter 2).  The returned result must
+    # carry nonce_A.
+    assert returned_result.nonce == nonce_A, (
+        f"expected submit gate to return result_A (nonce_A), "
+        f"got nonce={returned_result.nonce.hex()}"
+    )
+
+    # Verify iter 2 ran so we actually tested the divergence scenario.
+    assert captured_iter2_loop_nonce, (
+        "evaluate_sampleset was never called for iter 2; "
+        "the divergence scenario was never exercised"
+    )
+    nonce_B = captured_iter2_loop_nonce[0]
+    assert nonce_B != nonce_A, (
+        "iter-2 loop nonce equals nonce_A — divergence scenario collapsed; "
+        "adjust the test setup so the two iters produce different loop nonces"
+    )
+
+    # Core assertion: the ``mined!`` line must log result.nonce (nonce_A),
+    # not the loop variable nonce (nonce_B).
+    mined_lines = [r.message for r in caplog.records if "mined!" in r.message]
+    assert mined_lines, (
+        "no 'mined!' INFO log line found; check logger name or caplog setup"
+    )
+    mined_line = mined_lines[0]
+
+    expected_nonce_prefix = nonce_A.hex()[:16]
+    assert expected_nonce_prefix in mined_line, (
+        f"mined! log must show submitted result's nonce "
+        f"(0x{expected_nonce_prefix}...) but got: {mined_line!r}"
+    )
+
+    # Regression check: the loop's last-iterated nonce (nonce_B) must NOT
+    # appear in the log line.
+    wrong_nonce_prefix = nonce_B.hex()[:16]
+    assert wrong_nonce_prefix not in mined_line, (
+        f"mined! log shows loop variable's nonce (0x{wrong_nonce_prefix}...) "
+        f"instead of the submitted result's nonce — "
+        f"this is the pre-fix bug; log line: {mined_line!r}"
     )

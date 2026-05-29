@@ -1007,14 +1007,15 @@ class BaseMiner(ABC):
                             "cancel; discarding (stop_event set)"
                         )
                         return None
-                    nonce_disp = (
-                        f"0x{nonce.hex()[:16]}..."
-                        if isinstance(nonce, (bytes, bytearray))
-                        else str(nonce)
-                    )
+                    # Use result.nonce / result.salt — the submitted
+                    # candidate — not the loop-local nonce/salt, which may
+                    # belong to a different iteration when the submit gate
+                    # returns a stashed top-k entry.
+                    result_nonce_disp = f"0x{result.nonce.hex()[:16]}..."
                     self.logger.info(
                         f"[work-item {_work_tag(context)}] mined! "
-                        f"nonce={nonce_disp} salt=0x{salt.hex()[:8]}... "
+                        f"nonce={result_nonce_disp} "
+                        f"salt=0x{result.salt.hex()[:8]}... "
                         f"energy={result.energy:.2f} "
                         f"solutions={result.num_valid} "
                         f"diversity={result.diversity:.3f} "
