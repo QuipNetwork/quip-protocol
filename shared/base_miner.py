@@ -5,6 +5,7 @@ Contains core mining logic and defines abstract methods for miner-specific imple
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 import logging
 import math
 import multiprocessing
@@ -66,6 +67,42 @@ class _PumpedResult:
 # (not a class attribute) so subclasses can't accidentally shadow it and
 # break the consumer's ``is`` identity check.
 _PUMP_DONE = object()
+
+# Maximum number of work-tags remembered by _SetupAbortThrottle.
+_SETUP_ABORT_TAG_LIMIT = 32
+
+
+class _SetupAbortThrottle:
+    """Rate-limiter for the ``_pre_mine_setup`` returned-False warning.
+
+    Logs the first occurrence of a given work-tag at WARNING; subsequent
+    identical tags are silently dropped until evicted from the bounded
+    cache.  The cache is an :class:`~collections.OrderedDict` used as an
+    LRU-style FIFO so the oldest tag is evicted first when the cap is hit.
+
+    This keeps ``mine_work_item``'s "aborting attempt" warning visible for
+    the first paced head in each round without spamming thousands of lines
+    over a long pacing window.
+    """
+
+    def __init__(self, max_tags: int = _SETUP_ABORT_TAG_LIMIT) -> None:
+        self._max = max_tags
+        # OrderedDict preserves insertion order; we evict the first item
+        # (oldest) when full so the set stays bounded.
+        self._seen: "OrderedDict[str, None]" = OrderedDict()
+
+    def should_log(self, tag: str) -> bool:
+        """Return True (and record tag) if the caller should emit a log line."""
+        if tag in self._seen:
+            return False
+        # Evict oldest entry if at capacity before inserting the new one.
+        while len(self._seen) >= self._max:
+            self._seen.popitem(last=False)
+        self._seen[tag] = None
+        return True
+
+    def __len__(self) -> int:
+        return len(self._seen)
 
 
 class BaseMiner(ABC):
@@ -164,6 +201,13 @@ class BaseMiner(ABC):
         # running so the QPU stream can observe shutdown (Task 3 reads
         # this); None when no pump is active.
         self._pump_stop: Optional[threading.Event] = None
+
+        # Throttle for the "_pre_mine_setup returned False" warning so
+        # pacing during a budget exhaustion window doesn't produce one
+        # WARNING line per head (~every 6 s). The first occurrence for
+        # each work-tag still surfaces; repeats are suppressed until the
+        # tag is evicted from the bounded cache.
+        self._setup_abort_throttle = _SetupAbortThrottle()
 
     def update_top_samples(self, sampleset: dimod.SampleSet, nonce: int, salt: bytes, requirements: BlockRequirements):
         """Update the top 3 results list with a new mining result."""
@@ -490,10 +534,15 @@ class BaseMiner(ABC):
             # `mine_block` swallowed this case silently; here we surface it
             # so the worker's resp_q sentinel actually means "tried and
             # got nothing", not "couldn't start".
-            self.logger.warning(
-                "mine_work_item: _pre_mine_setup returned False, aborting "
-                "attempt for %s", _work_tag(context),
-            )
+            # Rate-limited: only log the first occurrence for each work-tag
+            # so pacing during budget exhaustion doesn't produce a WARNING
+            # line on every chain head (~every 6 s).
+            tag = _work_tag(context)
+            if self._setup_abort_throttle.should_log(tag):
+                self.logger.warning(
+                    "mine_work_item: _pre_mine_setup returned False, aborting "
+                    "attempt for %s", tag,
+                )
             return None
 
         # Topology comes from the chain snapshot, not the local sampler.
