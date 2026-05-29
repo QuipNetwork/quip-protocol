@@ -1562,9 +1562,10 @@ class SubstrateMinerController:
             )
             return
         key = _work_key(context)
+        # ``data`` already carries ``dispatch_id`` (the worker echoes it in
+        # the payload), so we don't repeat it here — ``**data`` provides it.
         entry = {
             "handle_id": handle.miner_id,
-            "dispatch_id": dispatch_id,
             "context": context,
             **data,
         }

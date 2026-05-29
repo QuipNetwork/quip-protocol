@@ -213,6 +213,7 @@ def current_difficulty(
 def block_when_energy_clears(
     floor_energy_milli: int,
     current_block: int,
+    *,
     base_difficulty: SubstrateDifficulty,
     last_proof_block: int,
     epoch_length: int,
