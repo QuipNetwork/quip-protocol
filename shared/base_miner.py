@@ -1152,6 +1152,7 @@ class BaseMiner(ABC):
         try:
             payload = {
                 "dispatch_id": dispatch_id,
+                "miner_type": self.miner_type,
                 "nonce": best.nonce,
                 "salt": best.salt,
                 "solutions": best.solutions,

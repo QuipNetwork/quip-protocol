@@ -792,12 +792,15 @@ def test_mine_work_item_emits_preview_on_floor_improvement(
     # First preview: the iter-1 candidate (floor -1.0).
     p0 = previews[0]
     for field in (
-        "dispatch_id", "nonce", "salt", "solutions",
+        "dispatch_id", "miner_type", "nonce", "salt", "solutions",
         "submit_floor_energy", "energy", "num_valid", "diversity",
     ):
         assert field in p0, f"preview payload missing required field {field!r}"
     assert p0["submit_floor_energy"] == -1.0
     assert p0["nonce"] == (1).to_bytes(32, "big")
+    # The preview carries the real source backend so the controller's
+    # anticipatory path records accurate per-backend attribution.
+    assert p0["miner_type"] == "CPU"
     # Second preview: the improved iter-2 candidate (floor -2.0).
     assert previews[1]["submit_floor_energy"] == -2.0
     assert previews[1]["nonce"] == (2).to_bytes(32, "big")

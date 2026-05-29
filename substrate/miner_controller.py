@@ -1837,6 +1837,12 @@ class SubstrateMinerController:
         if submit_result.action is SubmitRetryAction.STOP_ROUND_STALE:
             # Nonce bound to a round that advanced — the candidate is dead.
             self.stats.stale_drops += 1
+            # Audit parity with _handle_result's STALE path: write a
+            # rejected_stale row (with chain-derived Sol#) so anticipatory
+            # stale drops are visible in the submission log, then evict.
+            await self._record_anticipatory_stale(
+                ctx, result, preview, error=submit_result.error,
+            )
             logger.info(
                 "anticipatory fire STOP_ROUND_STALE for work_key 0x%s... "
                 "(error=%s); discarding preview + pending state",
@@ -1857,21 +1863,55 @@ class SubstrateMinerController:
         )
         self._evict_anticipatory_state(key)
 
+    async def _record_anticipatory_stale(
+        self,
+        ctx: SubstrateMiningContext,
+        result: MiningResult,
+        preview: dict,
+        *,
+        error: Optional[str],
+    ) -> None:
+        """Write a ``rejected_stale`` submission-log row for a STOP_ROUND_STALE fire.
+
+        Mirrors ``_handle_result``'s STALE path so anticipatory stale drops
+        are visible in the audit log (with the chain-derived Sol# from a
+        best-effort ``proofs_submitted`` read), not just bumped in stats.
+        ``miner_type`` is the real source backend carried through the preview.
+        """
+        pow_seq_stale = await self._query_proofs_submitted_safe()
+        self._submission_log.record(
+            solution_id=self._submission_log.assign_id(),
+            miner_id=str(preview.get("handle_id", "anticipatory")),
+            miner_type=result.miner_type,
+            dispatch_id=int(preview.get("dispatch_id", 0) or 0),
+            energy_milli=int(float(preview.get("energy", 0.0)) * 1000),
+            diversity_milli=int(float(preview.get("diversity", 0.0)) * 1000),
+            threshold_milli=int(ctx.difficulty.max_energy_milli),
+            last_proof_block_hash_hex="0x" + ctx.last_proof_block_hash.hex(),
+            outcome="rejected_stale",
+            num_valid=int(preview.get("num_valid", 0)),
+            pow_sequence=pow_seq_stale,
+            error=str(error or ""),
+        )
+
     def _result_from_preview(
         self, ctx: SubstrateMiningContext, preview: dict
     ) -> Optional[MiningResult]:
         """Reconstruct a ``MiningResult`` from a stored preview entry.
 
         The preview carries the submission-load-bearing fields the worker
-        emitted (nonce / salt / solutions / energy / num_valid / diversity);
-        the remaining ``MiningResult`` fields are display-only and filled
-        with neutral defaults. Returns ``None`` on a malformed preview
-        (logged) so the fire path degrades to a no-op rather than crashing.
+        emitted (miner_type / nonce / salt / solutions / energy / num_valid /
+        diversity); the remaining ``MiningResult`` fields are display-only and
+        filled with neutral defaults. ``miner_type`` is the real source
+        backend (cpu/gpu/qpu) so per-backend dashboard attribution stays
+        accurate on the anticipatory path. Returns ``None`` on a malformed
+        preview (logged) so the fire path degrades to a no-op rather than
+        crashing.
         """
         try:
             return MiningResult(
                 miner_id=str(preview.get("handle_id", "anticipatory")),
-                miner_type="anticipatory",
+                miner_type=str(preview.get("miner_type", "UNKNOWN")),
                 nonce=preview["nonce"],
                 salt=preview["salt"],
                 timestamp=0,
@@ -1996,7 +2036,10 @@ class SubstrateMinerController:
         log_common = {
             "solution_id": solution_id,
             "miner_id": handle_id,
-            "miner_type": "anticipatory",
+            # Real source backend (cpu/gpu/qpu) carried through the preview,
+            # so per-backend dashboard attribution stays accurate — NOT the
+            # "anticipatory" path marker.
+            "miner_type": result.miner_type,
             "dispatch_id": int(preview.get("dispatch_id", 0) or 0),
             "energy_milli": int(float(preview.get("energy", 0.0)) * 1000),
             "diversity_milli": int(float(preview.get("diversity", 0.0)) * 1000),

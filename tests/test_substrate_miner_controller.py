@@ -1194,6 +1194,7 @@ def _preview_msg(dispatch_id: int, *, floor: float, miner_id: str = "p0") -> dic
         "dispatch_id": dispatch_id,
         "data": {
             "dispatch_id": dispatch_id,
+            "miner_type": "cpu",
             "nonce": (7).to_bytes(32, "big"),
             "salt": b"\x11" * 32,
             "solutions": [[1, -1, 1, -1]],
@@ -1301,6 +1302,7 @@ def _store_preview_entry(controller, ctx, *, floor: float = -3.0) -> None:
         "handle_id": "p0",
         "context": ctx,
         "dispatch_id": 1,
+        "miner_type": "cpu",
         "nonce": (7).to_bytes(32, "big"),
         "salt": b"\x11" * 32,
         "solutions": [[1, -1, 1, -1]],
@@ -1392,10 +1394,19 @@ async def test_anticipatory_fires_at_b_star_minus_one_success(monkeypatch):
 
     assert controller.stats.proofs_submitted == 1
     assert key in controller._closed_work_keys
-    # The fired proof was reconstructed from the preview.
+    # The fired proof was reconstructed from the preview, carrying the real
+    # source backend (cpu), not the "anticipatory" path marker.
     assert captured["result"].nonce == (7).to_bytes(32, "big")
     assert captured["result"].num_valid == 3
+    assert captured["result"].miner_type == "cpu"
     assert captured["context"] is ctx
+    # The submission-log row records the real backend for per-backend
+    # dashboard attribution (not "anticipatory").
+    import json
+    sub_path = controller._submission_log.log_dir / "1" / "submission.json"
+    record = json.loads(sub_path.read_text())
+    assert record["outcome"] == "submitted_inblock"
+    assert record["miner_type"] == "cpu"
 
 
 async def test_anticipatory_verify_fail_records_chain_error_and_refires(monkeypatch):
@@ -1480,8 +1491,11 @@ async def test_anticipatory_retry_keeps_preview_for_next_head(monkeypatch):
 async def test_anticipatory_round_stale_discards_preview(monkeypatch):
     """STOP_ROUND_STALE means the nonce is dead — discard the preview and
     any pending anticipatory state."""
+    import json
+
     controller = _bare_controller()
     _stub_predictor_inputs(controller)
+    controller.pool_client.query_proofs_submitted = AsyncMock(return_value=88)
     ctx = _ctx_at_block(b"\xaa" * 32, 19)
     _store_preview_entry(controller, ctx)
     from substrate.miner_controller import _work_key
@@ -1489,7 +1503,10 @@ async def test_anticipatory_round_stale_discards_preview(monkeypatch):
 
     async def fake_submit_with_retry(*args, **kwargs):
         from substrate.submitter import SubmitResult, SubmitRetryAction
-        return SubmitResult(action=SubmitRetryAction.STOP_ROUND_STALE)
+        return SubmitResult(
+            action=SubmitRetryAction.STOP_ROUND_STALE,
+            error="Module(error=InvalidNonce, pallet='QuantumPow', index=0)",
+        )
 
     monkeypatch.setattr(
         "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
@@ -1505,6 +1522,14 @@ async def test_anticipatory_round_stale_discards_preview(monkeypatch):
     assert key not in controller._latest_preview  # discarded
     assert key not in controller._anticipatory_fired
     assert controller.stats.stale_drops == 1
+    # Audit parity: a rejected_stale row is written (real backend, chain Sol#).
+    sub_path = controller._submission_log.log_dir / "1" / "submission.json"
+    record = json.loads(sub_path.read_text())
+    assert record["outcome"] == "rejected_stale"
+    assert record["miner_type"] == "cpu"
+    assert record["num_valid"] == 3
+    assert record["pow_sequence"] == 88
+    assert "InvalidNonce" in record["error"]
 
 
 async def test_anticipatory_no_fire_when_b_star_none(monkeypatch):
