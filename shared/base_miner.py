@@ -763,6 +763,10 @@ class BaseMiner(ABC):
                     # live target) skip the expensive diversity/selection
                     # work and log a lightweight rejected row. Mirrors the
                     # strict fast-bail the canary gets for free.
+                    # NOTE: if the miner never lands within margin of the live
+                    # target (e.g. hardware underperforming), the stash stays
+                    # empty and nothing submits — expected; every skipped iter
+                    # still logs as "rejected".
                     iter_best_milli = int(iter_best_energy * 1000)
                     near_live = iter_best_milli <= (
                         live_threshold_milli + self.RATCHET_PRECHECK_MARGIN_MILLI

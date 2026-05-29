@@ -908,8 +908,6 @@ def test_precheck_skips_evaluate_for_no_hope_iter(
 
     recording_logger.record.side_effect = _capture
 
-    original_sample = cpu_miner._sample
-
     def fake_sample(*args, **kwargs):
         # Return the bad-energy sampleset regardless of (h, J).
         return bad_ss
@@ -1000,6 +998,11 @@ def test_precheck_evaluates_iter_near_live_threshold(
     assert spy_calls, (
         "evaluate_sampleset MUST be called when iter best energy "
         f"({GOOD_ENERGY}) is within margin of live threshold (0 milli)"
+    )
+    assert captured, "expected at least one AttemptLogger.record call"
+    rec = captured[0]
+    assert rec.get("post_processed") is True, (
+        f"near-live iter must have post_processed=True, got {rec.get('post_processed')!r}"
     )
 
 
