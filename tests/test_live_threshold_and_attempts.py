@@ -355,6 +355,51 @@ def test_attempt_logger_miner_type_defaults_to_empty(tmp_path: Path) -> None:
     assert record["miner_type"] == ""
 
 
+def test_submission_logger_record_writes_num_valid(tmp_path: Path) -> None:
+    """num_valid from MiningResult must land in submission.json so the
+    dashboard 'Solutions' column has a stable value per submission."""
+    log = SubmissionLogger(log_dir=tmp_path)
+    sid = log.assign_id()
+    log.record(
+        solution_id=sid,
+        miner_id="rig-QPU-1",
+        dispatch_id=55,
+        energy_milli=-14_000_000,
+        diversity_milli=400,
+        threshold_milli=-13_500_000,
+        last_proof_block_hash_hex="0xabc",
+        outcome="submitted_inblock",
+        num_valid=7,
+    )
+    sub_path = tmp_path / "55" / "submission.json"
+    record = json.loads(sub_path.read_text())
+    assert record["num_valid"] == 7, (
+        "num_valid must be written to submission.json so dashboard "
+        "'Solutions' column is populated"
+    )
+
+
+def test_submission_logger_record_num_valid_defaults_to_none(tmp_path: Path) -> None:
+    """Omitting num_valid must produce null in submission.json — old
+    submission records stay readable without a schema migration."""
+    log = SubmissionLogger(log_dir=tmp_path)
+    sid = log.assign_id()
+    log.record(
+        solution_id=sid,
+        miner_id="rig-CPU-1",
+        dispatch_id=56,
+        energy_milli=-5_000_000,
+        diversity_milli=200,
+        threshold_milli=-4_900_000,
+        last_proof_block_hash_hex="0xdef",
+        outcome="submitted_inblock",
+    )
+    sub_path = tmp_path / "56" / "submission.json"
+    record = json.loads(sub_path.read_text())
+    assert "num_valid" in record, "num_valid key must always be present"
+    assert record["num_valid"] is None
+
+
 def test_submission_logger_writes_miner_type_per_call(tmp_path: Path) -> None:
     """`miner_type` is a per-call parameter on SubmissionLogger.record
     because the controller-side logger aggregates submissions from

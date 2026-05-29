@@ -1070,6 +1070,7 @@ class SubstrateMinerController:
                 threshold_milli=snapshot_threshold_milli,
                 last_proof_block_hash_hex=last_proof_hex,
                 outcome="chain_error",
+                num_valid=envelope.result.num_valid,
                 error=f"{type(exc).__name__}: {exc}",
             )
             return
@@ -1103,6 +1104,7 @@ class SubstrateMinerController:
                     threshold_milli=snapshot_threshold_milli,
                     last_proof_block_hash_hex=last_proof_hex,
                     outcome="chain_error",
+                    num_valid=envelope.result.num_valid,
                     extrinsic_hash=receipt.extrinsic_hash,
                     chain_block_hash=receipt.block_hash,
                     error="receipt OK but proof not recorded by chain",
@@ -1230,6 +1232,7 @@ class SubstrateMinerController:
                 threshold_milli=snapshot_threshold_milli,
                 last_proof_block_hash_hex=last_proof_hex,
                 outcome="submitted_inblock",
+                num_valid=envelope.result.num_valid,
                 extrinsic_hash=receipt.extrinsic_hash,
                 chain_block_hash=receipt.block_hash,
                 chain_block_number=accepted_block_number,
@@ -1266,6 +1269,7 @@ class SubstrateMinerController:
                 threshold_milli=snapshot_threshold_milli,
                 last_proof_block_hash_hex=last_proof_hex,
                 outcome="rejected_stale",
+                num_valid=envelope.result.num_valid,
                 extrinsic_hash=receipt.extrinsic_hash,
                 error=str(receipt.error or ""),
             )
@@ -1282,6 +1286,7 @@ class SubstrateMinerController:
                 threshold_milli=snapshot_threshold_milli,
                 last_proof_block_hash_hex=last_proof_hex,
                 outcome="chain_error",
+                num_valid=envelope.result.num_valid,
                 extrinsic_hash=receipt.extrinsic_hash,
                 error=str(receipt.error or ""),
             )
