@@ -160,6 +160,11 @@ class BaseMiner(ABC):
         # Reset per dispatch by mine_work_item; logged at dispatch end.
         self._dropped_results: int = 0
 
+        # Streaming-pump shutdown signal. Set while a pump thread is
+        # running so the QPU stream can observe shutdown (Task 3 reads
+        # this); None when no pump is active.
+        self._pump_stop: Optional[threading.Event] = None
+
     def update_top_samples(self, sampleset: dimod.SampleSet, nonce: int, salt: bytes, requirements: BlockRequirements):
         """Update the top 3 results list with a new mining result."""
 
@@ -670,6 +675,9 @@ class BaseMiner(ABC):
                         if len(qpu_access_list) > qpu_access_len_before:
                             qpu_access_time_us = int(qpu_access_list[-1])
                     sample_time = time.time() - sample_start
+                    # In pump mode sample_time is queue-dequeue latency (~0µs),
+                    # not QPU access time — qpu_access_time_us carries the real
+                    # QPU figure.
                     self.timing_stats['sampling'].append(sample_time * 1e6)
                     self.timing_stats['preprocessing'].append(
                         (sample_start - preprocess_start) * 1e6,
@@ -978,7 +986,9 @@ class BaseMiner(ABC):
                 pump_thread.join(timeout=5.0)
                 if pump_thread.is_alive():
                     self.logger.warning(
-                        "mine_work_item: result pump did not join in 5s",
+                        "mine_work_item: result pump did not join in 5s — "
+                        "pump thread still alive (QPU stream pump-stop wiring "
+                        "closes this race)",
                     )
             self._pump_stop = None
             # Tear down the feeder before delegating to subclass cleanup.

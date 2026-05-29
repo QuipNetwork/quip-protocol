@@ -252,10 +252,13 @@ def test_mine_work_item_streams_results_and_drops_under_backpressure():
     stop = mp.Event()
 
     done = threading.Event()
+    raised: list = []
 
     def _run():
         try:
             miner.mine_work_item(ctx, stop)
+        except BaseException as exc:  # noqa: BLE001 — surface to the test
+            raised.append(exc)
         finally:
             done.set()
 
@@ -269,6 +272,10 @@ def test_mine_work_item_streams_results_and_drops_under_backpressure():
 
     assert not t.is_alive(), "mine_work_item did not stop on stop_event"
     assert done.is_set()
+    # No exception may leak from the loop. _sample raises AssertionError if
+    # the pump path ever fell through to the single-shot path, so a leaked
+    # exception here is a real regression — not a silently-swallowed one.
+    assert raised == [], f"mine_work_item raised: {raised[0] if raised else None}"
     # Fast producer (instant batch) outran the 20ms-per-result consumer
     # with a depth-2 queue: the pump must have dropped results rather
     # than stalling lockstep with the consumer.
@@ -276,5 +283,3 @@ def test_mine_work_item_streams_results_and_drops_under_backpressure():
         "expected backpressure drops; pump appears to be running in "
         "lockstep with the consumer instead of streaming ahead"
     )
-    # The single-shot path must never run when STREAMING_PUMP is on.
-    # (_sample raises if called — covered by the AssertionError above.)
