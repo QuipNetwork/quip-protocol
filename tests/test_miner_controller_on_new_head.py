@@ -9,6 +9,7 @@ fail loud on topology mismatch.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -54,6 +55,22 @@ def controller():
     ctrl._dispatch_contexts = {}
     ctrl.topology_hash = None
     ctrl.core = None
+    # Anticipatory-submission state (Task 6b). on_new_head reads
+    # `_latest_preview` on every head; these tests never store a preview,
+    # so `_maybe_anticipatory_fire` short-circuits at the empty-store check
+    # and the fire path is a clean no-op. The pool_client stub returns None
+    # from every predictor query so that even if a preview were present,
+    # `_anticipatory_inputs` would return None (no fire) rather than hit
+    # the network.
+    ctrl._latest_preview = {}
+    ctrl._anticipatory_fired = set()
+    ctrl._base_difficulty_by_key = {}
+    ctrl._pow_constants = None
+    ctrl.pool_client = SimpleNamespace(
+        query_difficulty=AsyncMock(return_value=None),
+        query_last_proof_block_number=AsyncMock(return_value=None),
+        query_pow_constants=AsyncMock(return_value=None),
+    )
     # Stats: SimpleNamespace stub matching the attrs on_new_head touches.
     ctrl.stats = SimpleNamespace(
         heads_observed=0,
@@ -95,6 +112,32 @@ async def test_on_new_head_pushes_threshold_change(controller):
     ctx = _make_context(threshold_milli=-5000)
     await ctrl.on_new_head(ctx)
     assert handle.threshold_pushes == [-5000]
+
+
+@pytest.mark.asyncio
+async def test_maybe_anticipatory_fire_noop_without_preview(controller):
+    """No preview stored → clean no-op (no exception, no chain reads)."""
+    ctrl, _ = controller
+    await ctrl._maybe_anticipatory_fire(
+        _make_context(threshold_milli=-5000), (b"\x01" * 32, b"\xab" * 32)
+    )
+    # Never reached the predictor-input queries.
+    ctrl.pool_client.query_difficulty.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_maybe_anticipatory_fire_noop_when_inputs_none(controller):
+    """A preview present but predictor inputs unresolvable (query_* → None)
+    must be a clean no-op rather than raise."""
+    ctrl, _ = controller
+    ctx = _make_context(threshold_milli=-5000)
+    ctx.block_number = 5
+    key = (b"\x01" * 32, b"\xab" * 32)
+    ctrl._latest_preview[key] = {"submit_floor_energy": -3.0}
+    await ctrl._maybe_anticipatory_fire(ctx, key)
+    # Inputs returned None (query_difficulty → None) → no fire, preview kept.
+    ctrl.pool_client.query_difficulty.assert_awaited()
+    assert key in ctrl._latest_preview
 
 
 @pytest.mark.asyncio
