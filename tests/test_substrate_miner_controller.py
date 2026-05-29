@@ -151,6 +151,11 @@ def _bare_controller() -> SubstrateMinerController:
     c._submission_log = SubmissionLogger(
         log_dir=Path(tempfile.mkdtemp(prefix="quip-test-")),
     )
+    # Anticipatory-submission state (Task 6b).
+    c._latest_preview = {}
+    c._pow_constants = None
+    c._base_difficulty_by_key = {}
+    c._anticipatory_fired = set()
     return c
 
 
@@ -1256,3 +1261,367 @@ def test_store_preview_dropped_when_no_dispatch_context():
     # No _dispatch_contexts entry for dispatch_id=99.
     controller._store_preview(handle, _preview_msg(99, floor=-2.0))
     assert controller._latest_preview == {}
+
+
+# ----------------------------------------------------------------------
+# Anticipatory submission (Task 6b)
+# ----------------------------------------------------------------------
+
+
+def _stub_predictor_inputs(controller, *, last_proof_block: int = 10) -> None:
+    """Wire fake chain reads so `_anticipatory_inputs` resolves without RPC.
+
+    The decay math itself is covered by `test_difficulty_decay.py`; these
+    tests pin the controller's orchestration, so we feed concrete inputs
+    and (separately) stub the predictor's `B*` output.
+    """
+    from substrate.types import PowConstants
+
+    controller.pool_client.query_pow_constants = AsyncMock(
+        return_value=PowConstants(
+            epoch_length=5,
+            curve_c_easy_milli=800,
+            curve_c_knee_milli=750,
+            curve_c_hard_milli=700,
+        )
+    )
+    controller.pool_client.query_difficulty = AsyncMock(
+        return_value=SubstrateDifficulty(1, -1000, 0)
+    )
+    controller.pool_client.query_last_proof_block_number = AsyncMock(
+        return_value=last_proof_block
+    )
+
+
+def _store_preview_entry(controller, ctx, *, floor: float = -3.0) -> None:
+    """Populate `_latest_preview[work_key(ctx)]` directly."""
+    from substrate.miner_controller import _work_key
+
+    controller._latest_preview[_work_key(ctx)] = {
+        "handle_id": "p0",
+        "context": ctx,
+        "dispatch_id": 1,
+        "nonce": (7).to_bytes(32, "big"),
+        "salt": b"\x11" * 32,
+        "solutions": [[1, -1, 1, -1]],
+        "submit_floor_energy": floor,
+        "energy": floor,
+        "num_valid": 3,
+        "diversity": 0.5,
+    }
+
+
+def _ctx_at_block(last_proof_block_hash: bytes, block_number: int):
+    """A context at a specific head block number."""
+    return SubstrateMiningContext(
+        last_proof_block_hash=last_proof_block_hash,
+        topology_hash=b"\xcd" * 32,
+        nodes=[0, 1, 2, 3],
+        edges=[(0, 1), (1, 2), (2, 3)],
+        difficulty=SubstrateDifficulty(1, 0, 0),
+        miner_account_bytes=b"\x42" * 32,
+        allowed_h_values=_TER_SPEC,
+        allowed_j_values=_BIN_SPEC,
+        allowed_spin_values=_BIN_SPEC,
+        block_hash=b"\x99" * 32,
+        block_number=block_number,
+    )
+
+
+async def test_anticipatory_no_fire_before_b_star_minus_one(monkeypatch):
+    """With B*=20, a head at block 18 (< B*-1=19) must NOT fire."""
+    controller = _bare_controller()
+    _stub_predictor_inputs(controller)
+    ctx = _ctx_at_block(b"\xaa" * 32, 18)
+    _store_preview_entry(controller, ctx)
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+
+    fired = False
+
+    async def fake_submit_with_retry(*args, **kwargs):
+        nonlocal fired
+        fired = True
+        from substrate.submitter import SubmitResult, SubmitRetryAction
+        return SubmitResult(action=SubmitRetryAction.SUCCESS)
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
+    )
+    monkeypatch.setattr(
+        "substrate.miner_controller.block_when_energy_clears",
+        lambda *a, **k: 20,
+    )
+
+    await controller._maybe_anticipatory_fire(ctx, key)
+    assert fired is False
+    assert controller.stats.proofs_submitted == 0
+
+
+async def test_anticipatory_fires_at_b_star_minus_one_success(monkeypatch):
+    """At block 19 (= B*-1 for B*=20), the controller fires and on SUCCESS
+    verifies, records, and marks the work key closed."""
+    controller = _bare_controller()
+    _stub_predictor_inputs(controller)
+    controller._verify_proof_recorded = AsyncMock(return_value=42)
+    ctx = _ctx_at_block(b"\xaa" * 32, 19)
+    _store_preview_entry(controller, ctx)
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+
+    captured = {}
+
+    async def fake_submit_with_retry(build, pool, signer, result, context, **kwargs):
+        from substrate.submitter import SubmitResult, SubmitRetryAction
+        captured["result"] = result
+        captured["context"] = context
+        return SubmitResult(
+            action=SubmitRetryAction.SUCCESS,
+            receipt=ExtrinsicReceipt(extrinsic_hash="0xabc"),
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
+    )
+    monkeypatch.setattr(
+        "substrate.miner_controller.block_when_energy_clears",
+        lambda *a, **k: 20,
+    )
+
+    await controller._maybe_anticipatory_fire(ctx, key)
+
+    assert controller.stats.proofs_submitted == 1
+    assert key in controller._closed_work_keys
+    # The fired proof was reconstructed from the preview.
+    assert captured["result"].nonce == (7).to_bytes(32, "big")
+    assert captured["result"].num_valid == 3
+    assert captured["context"] is ctx
+
+
+async def test_anticipatory_retry_keeps_preview_for_next_head(monkeypatch):
+    """A RETRY-exhausted fire must keep the preview and clear the mid-fire
+    mark so a later head can fire again."""
+    controller = _bare_controller()
+    _stub_predictor_inputs(controller)
+    ctx = _ctx_at_block(b"\xaa" * 32, 19)
+    _store_preview_entry(controller, ctx)
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+
+    async def fake_submit_with_retry(*args, **kwargs):
+        from substrate.submitter import SubmitResult, SubmitRetryAction
+        return SubmitResult(action=SubmitRetryAction.RETRY, attempts=4)
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
+    )
+    monkeypatch.setattr(
+        "substrate.miner_controller.block_when_energy_clears",
+        lambda *a, **k: 20,
+    )
+
+    await controller._maybe_anticipatory_fire(ctx, key)
+
+    assert controller.stats.proofs_submitted == 0
+    assert key not in controller._closed_work_keys
+    assert key in controller._latest_preview  # preview retained
+    assert key not in controller._anticipatory_fired  # mid-fire mark cleared
+
+
+async def test_anticipatory_round_stale_discards_preview(monkeypatch):
+    """STOP_ROUND_STALE means the nonce is dead — discard the preview and
+    any pending anticipatory state."""
+    controller = _bare_controller()
+    _stub_predictor_inputs(controller)
+    ctx = _ctx_at_block(b"\xaa" * 32, 19)
+    _store_preview_entry(controller, ctx)
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+
+    async def fake_submit_with_retry(*args, **kwargs):
+        from substrate.submitter import SubmitResult, SubmitRetryAction
+        return SubmitResult(action=SubmitRetryAction.STOP_ROUND_STALE)
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
+    )
+    monkeypatch.setattr(
+        "substrate.miner_controller.block_when_energy_clears",
+        lambda *a, **k: 20,
+    )
+
+    await controller._maybe_anticipatory_fire(ctx, key)
+
+    assert controller.stats.proofs_submitted == 0
+    assert key not in controller._latest_preview  # discarded
+    assert key not in controller._anticipatory_fired
+    assert controller.stats.stale_drops == 1
+
+
+async def test_anticipatory_no_fire_when_b_star_none(monkeypatch):
+    """If the candidate never clears within the horizon (B*=None), do
+    nothing this head."""
+    controller = _bare_controller()
+    _stub_predictor_inputs(controller)
+    ctx = _ctx_at_block(b"\xaa" * 32, 19)
+    _store_preview_entry(controller, ctx)
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+
+    fired = False
+
+    async def fake_submit_with_retry(*args, **kwargs):
+        nonlocal fired
+        fired = True
+        from substrate.submitter import SubmitResult, SubmitRetryAction
+        return SubmitResult(action=SubmitRetryAction.SUCCESS)
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
+    )
+    monkeypatch.setattr(
+        "substrate.miner_controller.block_when_energy_clears",
+        lambda *a, **k: None,
+    )
+
+    await controller._maybe_anticipatory_fire(ctx, key)
+    assert fired is False
+
+
+def test_evict_anticipatory_state_prunes_all():
+    """Eviction drops the preview, the cached base difficulty, and the
+    fired mark for a work key."""
+    controller = _bare_controller()
+    ctx = _ctx_at_block(b"\xaa" * 32, 19)
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+    _store_preview_entry(controller, ctx)
+    controller._base_difficulty_by_key[key] = SubstrateDifficulty(1, -1000, 0)
+    controller._anticipatory_fired.add(key)
+
+    controller._evict_anticipatory_state(key)
+
+    assert key not in controller._latest_preview
+    assert key not in controller._base_difficulty_by_key
+    assert key not in controller._anticipatory_fired
+
+
+async def test_dedup_worker_result_after_anticipatory_fire(monkeypatch):
+    """After an anticipatory SUCCESS for a work key, a worker-returned
+    result for the same key must not double-submit."""
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+    # Simulate "anticipatory fire in progress / done" for this key.
+    controller._anticipatory_fired.add(key)
+
+    submit_calls = 0
+
+    async def fake_submit_proof(*args, **kwargs):
+        nonlocal submit_calls
+        submit_calls += 1
+        return ExtrinsicReceipt(extrinsic_hash="0xabc")
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+
+    await controller._handle_result(
+        _ResultEnvelope(result=_mining_result(), context=ctx, handle_id="p0")
+    )
+    assert submit_calls == 0  # worker result was a no-op
+    assert controller.stats.duplicate_result_drops == 1
+
+
+async def test_rollover_evicts_stale_preview_and_skips_fire(monkeypatch):
+    """A new head with a different last_proof_block_hash must evict the old
+    preview and NOT fire the stale candidate."""
+    from substrate.miner_controller import _work_key
+
+    controller = _bare_controller()
+    controller.events = None
+    controller.miner_handles = [_FakeHandle("p0")]
+    controller.core = None
+    controller._done_queues = {}
+    controller.signer.account_id_bytes.return_value = b"\x42" * 32
+
+    old_ctx = _ctx_at_block(b"\xaa" * 32, 18)
+    old_key = _work_key(old_ctx)
+    _store_preview_entry(controller, old_ctx)
+    controller._base_difficulty_by_key[old_key] = SubstrateDifficulty(1, -1000, 0)
+    # Controller is currently on the old key.
+    controller._current_context = old_ctx
+    controller._current_work_key = old_key
+
+    fired = False
+
+    async def fake_submit_with_retry(*args, **kwargs):
+        nonlocal fired
+        fired = True
+        from substrate.submitter import SubmitResult, SubmitRetryAction
+        return SubmitResult(action=SubmitRetryAction.SUCCESS)
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
+    )
+    # Predictor would say "fire now" if it ran — proves the eviction, not
+    # an early-return, is what prevents the stale fire.
+    monkeypatch.setattr(
+        "substrate.miner_controller.block_when_energy_clears",
+        lambda *a, **k: 0,
+    )
+    _stub_predictor_inputs(controller)
+
+    # New round rolls in.
+    new_ctx = _ctx_at_block(b"\xbb" * 32, 19)
+    await controller.on_new_head(new_ctx)
+
+    assert old_key not in controller._latest_preview  # evicted on rollover
+    assert old_key not in controller._base_difficulty_by_key
+    assert fired is False  # the stale candidate never fired
+
+
+async def test_anticipatory_fire_paced_worker_idle(monkeypatch):
+    """Even when the worker is paced (idle, no dispatch result), a captured
+    preview drives a fire at B*-1 through `on_new_head`."""
+    from substrate.miner_controller import _work_key
+
+    controller = _bare_controller()
+    controller.events = None
+    handle = _FakeHandle("p0")  # idle: _active_dispatch_id == 0
+    controller.miner_handles = [handle]
+    controller.core = None
+    controller._done_queues = {}
+    controller._verify_proof_recorded = AsyncMock(return_value=42)
+    _stub_predictor_inputs(controller)
+
+    ctx = _ctx_at_block(b"\xaa" * 32, 19)
+    key = _work_key(ctx)
+    _store_preview_entry(controller, ctx)
+    # Controller already mining this key (so it's the active key), worker idle.
+    controller._current_context = ctx
+    controller._current_work_key = key
+
+    async def fake_submit_with_retry(*args, **kwargs):
+        from substrate.submitter import SubmitResult, SubmitRetryAction
+        return SubmitResult(
+            action=SubmitRetryAction.SUCCESS,
+            receipt=ExtrinsicReceipt(extrinsic_hash="0xabc"),
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
+    )
+    monkeypatch.setattr(
+        "substrate.miner_controller.block_when_energy_clears",
+        lambda *a, **k: 20,
+    )
+
+    await controller.on_new_head(ctx)
+
+    assert controller.stats.proofs_submitted == 1
+    assert key in controller._closed_work_keys
+    # Worker was never dispatched (the SUCCESS fire closed the round first).
+    assert handle.mine_calls == []
