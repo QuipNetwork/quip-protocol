@@ -1133,6 +1133,7 @@ def test_stored_solution_iter_matches_attempt_iter(
     try:
         cpu_miner.mine_work_item(relaxed_context, stop)
     finally:
+        real_logger.record = original_record  # type: ignore[method-assign]
         del cpu_miner._attempt_logger
         del cpu_miner._solution_store
         del cpu_miner._current_dispatch_id
@@ -1151,6 +1152,7 @@ def test_stored_solution_iter_matches_attempt_iter(
         f"got result_kinds={[r.get('result_kind') for r in attempt_rows]}"
     )
     attempt_iter = stored_rows[0]["iter"]
+    assert attempt_iter >= 1, f"expected 1-based iter, got {attempt_iter}"
 
     # Read back the stored solution record.
     sol_records = query_stored_solutions(
