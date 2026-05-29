@@ -353,9 +353,14 @@ class DWaveMiner(BaseMiner):
             submit_one()
 
         stop_event = self._stop_event
+        # getattr default guards tests that bypass BaseMiner.__init__ via
+        # object.__new__; production always has self._pump_stop set (to None
+        # until mine_work_item starts a pump).
         pump_stop = getattr(self, "_pump_stop", None)
 
         def _stop_requested() -> bool:
+            # stop_event/pump_stop captured once at stream start; stable for
+            # this stream's lifetime (a new dispatch builds a fresh stream).
             if stop_event is not None and stop_event.is_set():
                 return True
             return pump_stop is not None and pump_stop.is_set()
