@@ -9,6 +9,8 @@ import logging
 import math
 import multiprocessing
 import multiprocessing.synchronize
+import queue
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -43,6 +45,20 @@ log = logging.getLogger(__name__)
 # noise (one line per attempt is too chatty for the slow miners) and
 # observability (one line per minute on the typical CPU/GPU cadence).
 PROGRESS_LOG_INTERVAL = 10
+
+
+@dataclass(frozen=True)
+class _PumpedResult:
+    """One QPU result handed from the pump thread to the consumer loop.
+
+    Carries the QPU access time extracted on the pump thread so the
+    consumer doesn't have to race the shared ``timing_stats`` list.
+    """
+
+    nonce: int | bytes
+    salt: bytes
+    sampleset: Any
+    qpu_access_time_us: Optional[int]
 
 
 class BaseMiner(ABC):
@@ -132,6 +148,10 @@ class BaseMiner(ABC):
         # attribute via ``self._feeder`` (e.g. streaming samplers and
         # SIGTERM handlers), so it must exist before any subclass runs.
         self._feeder: Optional[Any] = None
+
+        # Count of QPU results dropped under result-queue backpressure.
+        # Reset per dispatch by mine_work_item; logged at dispatch end.
+        self._dropped_results: int = 0
 
 
     def update_top_samples(self, sampleset: dimod.SampleSet, nonce: int, salt: bytes, requirements: BlockRequirements):
@@ -228,6 +248,26 @@ class BaseMiner(ABC):
     # First K iters post-process unconditionally to fill the stash; after
     # that the ratchet gates on the heap's worst-energy entry.
     TOP_K_STORE: int = 5
+
+    # --- Out-of-band result pump (streaming backends only) ---
+    # When True, mine_work_item runs _sample_batch on a background pump
+    # thread and consumes results off a bounded queue, so per-result
+    # processing never blocks the QPU pipeline. CPU/GPU/Metal keep the
+    # inline single-shot / batch path (STREAMING_PUMP stays False).
+    STREAMING_PUMP: bool = False
+    # Bounded result queue depth. Sized to the in-flight QPU job count so
+    # the consumer has headroom equal to what the cloud holds; on full the
+    # pump drops the newest result (rare safety valve) and counts it.
+    RESULT_QUEUE_MAXSIZE: int = 32
+    # Sentinel pushed by the pump when the stream is exhausted so the
+    # consumer's blocking get() unblocks and the loop can exit.
+    _PUMP_DONE = object()
+    # Ratchet pre-check: skip the expensive lenient evaluate unless the
+    # iter's cheap best-energy is within this many milli of the live
+    # (decayed) threshold — i.e. it could plausibly submit now or after a
+    # little decay. Larger = more evaluates (safer, slower); 0 = only
+    # iters already at/below the live target. Tunable per backend.
+    RATCHET_PRECHECK_MARGIN_MILLI: int = 2000
 
     # --- Adaptive parameter bounds (override in subclasses) ---
     # SA/GPU miners use sweeps + reads; QPU miners use annealing_time + reads.
@@ -892,6 +932,62 @@ class BaseMiner(ABC):
                 finally:
                     self._feeder = None
             self._post_mine_cleanup()
+
+    # ------------------------------------------------------------------
+    # Out-of-band result pump
+    # ------------------------------------------------------------------
+
+    def _result_pump(
+        self,
+        result_queue: "queue.Queue",
+        pump_stop: threading.Event,
+        sample_kwargs: Dict[str, Any],
+    ) -> None:
+        """Drive the streaming sampler on a background thread.
+
+        Repeatedly calls ``_sample_batch`` (the only ``next()`` driver of
+        the QPU generator) and pushes ``_PumpedResult`` onto a bounded
+        queue. On a full queue the newest result is dropped and counted —
+        the QPU pump must never block. Pushes ``_PUMP_DONE`` on exit so the
+        consumer's blocking ``get`` always unblocks.
+        """
+        try:
+            while not pump_stop.is_set():
+                before = len(self.timing_stats["qpu_access_time"])
+                batch = self._sample_batch(
+                    sample_kwargs["prev_hash"],
+                    sample_kwargs["miner_id"],
+                    sample_kwargs["cur_index"],
+                    sample_kwargs["nodes"],
+                    sample_kwargs["edges"],
+                    num_reads=sample_kwargs["num_reads"],
+                    num_sweeps=sample_kwargs["num_sweeps"],
+                    **sample_kwargs["extra"],
+                )
+                if batch is None:
+                    break  # stream exhausted
+                nonce, salt, sampleset = batch[0]
+                qpu_list = self.timing_stats["qpu_access_time"]
+                qpu_us = (
+                    int(qpu_list[-1]) if len(qpu_list) > before else None
+                )
+                item = _PumpedResult(nonce, salt, sampleset, qpu_us)
+                try:
+                    result_queue.put_nowait(item)
+                except queue.Full:
+                    self._dropped_results += 1
+        except Exception as exc:  # pump must not crash silently
+            self.logger.error("result pump error: %s", exc)
+        finally:
+            try:
+                result_queue.put_nowait(self._PUMP_DONE)
+            except queue.Full:
+                # Consumer already gone; drain one slot and signal.
+                try:
+                    result_queue.get_nowait()
+                    result_queue.put_nowait(self._PUMP_DONE)
+                except queue.Empty:
+                    pass
 
     # ------------------------------------------------------------------
     # Hook methods (override in subclasses as needed)
