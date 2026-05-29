@@ -506,39 +506,47 @@ class BaseMiner(ABC):
 
         # Build the feeder for this attempt. Each context flavor picks
         # the right backing implementation (RandomIsingFeeder for PoW,
-        # FixedIsingFeeder for mempool); the loop just pops models. We
-        # own the lifecycle here — ``finally`` stops and clears it so a
-        # subsequent dispatch starts from a clean state. Surfacing the
-        # feeder on ``self`` keeps the existing GPU/QPU streaming
-        # samplers (which read ``self._feeder`` from
-        # ``_sample_batch``) working unchanged; that path is bypassed
-        # by this loop but the field still has to be present.
+        # FixedIsingFeeder for mempool). We own the lifecycle here —
+        # ``finally`` stops and clears it so a subsequent dispatch starts
+        # from a clean state. Streaming-capable backends (QPU async
+        # pipeline, GPU multi-problem dispatch) read ``self._feeder`` from
+        # ``_sample_batch`` and keep ``queue_depth`` jobs in flight — that
+        # is what gives the QPU its throughput. Backends without batch
+        # streaming pop the feeder one model at a time (see the loop).
         self._feeder = context.make_feeder(
             nodes, edges, buffer_size=self.FEEDER_BUFFER_SIZE,
         )
 
+        # Positional args for the legacy ``_sample_batch`` signature. The
+        # QPU/GPU streaming impls ignore them — their feeder already
+        # encapsulates the round seed and miner identity — but the base
+        # contract requires (prev_hash, miner_id, cur_index).
+        batch_prev_hash = bridge_prev_block.hash
+        batch_miner_id = bridge_node_info.miner_id
+        batch_cur_index = bridge_prev_block.header.index
+
         progress = 0
         try:
             while self.mining and not stop_event.is_set():
-                # Pull the next pre-built model from the feeder. The
-                # PoW feeder derives a fresh ``(salt -> nonce -> h, J)``
-                # in a background process; the mempool feeder cycles
-                # the order's stored ``(h, J)`` and returns placeholder
-                # nonce/salt bytes the chain doesn't re-derive.
-                model = self._feeder.pop_blocking()
-                h, J, nonce, salt = model.h, model.J, model.nonce, model.salt
-
+                # Each iteration sources one (nonce, salt, sampleset):
+                # streaming backends via ``_sample_batch`` (which pulls
+                # models from the feeder internally), or the single-shot
+                # path which pops one model. The PoW feeder derives a
+                # fresh ``salt -> nonce -> (h, J)`` per model in a
+                # background process; the mempool feeder cycles the
+                # order's stored ``(h, J)``.
                 preprocess_start = time.time()
                 self.current_stage = 'preprocessing'
                 self.current_stage_start = preprocess_start
 
                 # Snapshot the QPU access-time list length so we can pick
                 # up the entry this iteration appends (if any). QPU miners
-                # call ``_record_qpu_timing`` inside ``_sample`` which
-                # appends to ``timing_stats['qpu_access_time']`` only when
-                # the sampleset carries D-Wave timing info — non-QPU
-                # backends never touch the list, so the snapshot reads
-                # back as "no new entry".
+                # call ``_record_qpu_timing`` inside ``_sample`` /
+                # ``_sample_batch`` which appends to
+                # ``timing_stats['qpu_access_time']`` only when the
+                # sampleset carries D-Wave timing info — non-QPU backends
+                # never touch the list, so the snapshot reads back as
+                # "no new entry".
                 qpu_access_len_before = len(
                     self.timing_stats['qpu_access_time'],
                 )
@@ -546,13 +554,31 @@ class BaseMiner(ABC):
                     sample_start = time.time()
                     self.current_stage = 'sampling'
                     self.current_stage_start = sample_start
-                    sampleset = self._sample(
-                        h, J,
+                    # Prefer the streaming pipeline. ``_sample_batch``
+                    # pulls from ``self._feeder`` internally and keeps
+                    # ``queue_depth`` QPU jobs in flight; it returns one
+                    # ``(nonce, salt, sampleset)`` per call. Backends
+                    # without batch streaming (CPU) return ``None`` — only
+                    # then do we pop a single model and sample it directly.
+                    batch = self._sample_batch(
+                        batch_prev_hash, batch_miner_id, batch_cur_index,
+                        nodes, edges,
                         num_reads=num_reads,
                         num_sweeps=current_num_sweeps,
-                        nonce_seed=nonce,
                         **extra_params,
                     )
+                    if batch is not None:
+                        nonce, salt, sampleset = batch[0]
+                    else:
+                        model = self._feeder.pop_blocking()
+                        nonce, salt = model.nonce, model.salt
+                        sampleset = self._sample(
+                            model.h, model.J,
+                            num_reads=num_reads,
+                            num_sweeps=current_num_sweeps,
+                            nonce_seed=nonce,
+                            **extra_params,
+                        )
                     sample_time = time.time() - sample_start
                     self.timing_stats['sampling'].append(sample_time * 1e6)
                     self.timing_stats['preprocessing'].append(

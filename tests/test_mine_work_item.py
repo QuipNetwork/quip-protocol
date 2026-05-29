@@ -306,6 +306,51 @@ def test_mine_work_item_returns_result(cpu_miner, relaxed_context):
     assert sorted(result.node_list) == sorted(relaxed_context.nodes)
 
 
+def test_mine_work_item_drives_streaming_batch_when_available(
+    cpu_miner, relaxed_context, monkeypatch,
+):
+    """When a backend implements ``_sample_batch`` (the streaming pipeline
+    used by QPU async dispatch and GPU multi-problem dispatch), the mine
+    loop MUST drive it and must NOT fall back to the single-shot
+    ``_sample``. Regression for the production bypass that quietly ran
+    every QPU/GPU dispatch through the slow synchronous path.
+    """
+    import types
+
+    calls = {"batch": 0, "sample": 0}
+    real_sample = cpu_miner._sample
+
+    def fake_batch(self, prev_hash, miner_id, cur_index, nodes, edges,
+                   *, num_reads, num_sweeps, **kw):
+        # Mirror the QPU/GPU pattern: pull from the loop-owned feeder
+        # internally and return (nonce, salt, sampleset). The loop must
+        # NOT also pop the feeder itself.
+        calls["batch"] += 1
+        model = self._feeder.pop_blocking()
+        ss = real_sample(
+            model.h, model.J, num_reads=num_reads, num_sweeps=num_sweeps,
+            nonce_seed=model.nonce, **kw,
+        )
+        return [(model.nonce, model.salt, ss)]
+
+    def forbidden_sample(self, *a, **k):
+        calls["sample"] += 1
+        raise AssertionError(
+            "_sample called although _sample_batch is available — "
+            "the streaming bypass regressed"
+        )
+
+    monkeypatch.setattr(cpu_miner, "_sample_batch",
+                        types.MethodType(fake_batch, cpu_miner))
+    monkeypatch.setattr(cpu_miner, "_sample",
+                        types.MethodType(forbidden_sample, cpu_miner))
+
+    result = cpu_miner.mine_work_item(relaxed_context, mp.Event())
+    assert isinstance(result, MiningResult)
+    assert calls["batch"] >= 1, "streaming _sample_batch was never called"
+    assert calls["sample"] == 0, "loop used single-shot _sample, not streaming"
+
+
 def test_mine_work_item_handles_mempool_context(cpu_miner):
     """Phase 8b: mine_work_item must accept a MempoolJobContext and mine
     against the directly-provided (h, J) rather than deriving via nonce.
