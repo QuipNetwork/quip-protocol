@@ -424,6 +424,18 @@ def test_metadata_logger_flushes_immediately_on_stored(tmp_path):
     assert path.exists(), "stored events must flush immediately"
 
 
+def test_metadata_logger_flushes_immediately_on_submitted(tmp_path):
+    from shared.mining_attempt_log import MetadataLogger
+    ml = MetadataLogger("m", 0, log_dir=tmp_path, miner_type="QPU")
+    ml.FLUSH_EVERY = 100
+    path = tmp_path / "0" / "metadata-m.json"
+    ml.update_from_attempt(
+        best_energy_milli=-100, result_kind="submitted",
+        qpu_access_time_us=10, mining_time_us=20,
+    )
+    assert path.exists(), "submitted events must flush immediately"
+
+
 def test_metadata_logger_final_flush_writes_pending(tmp_path):
     from shared.mining_attempt_log import MetadataLogger
     ml = MetadataLogger("m", 0, log_dir=tmp_path, miner_type="QPU")

@@ -10,7 +10,9 @@ Layout (one directory per dispatch_id):
         attempts-{miner_id}.jsonl   # append-on-event: one line per annealer return
                                     # Includes solution_meta scalars + submission ref
                                     # on the iter that submitted (if any).
-        metadata-{miner_id}.json    # plain JSON, rewritten on every event:
+        metadata-{miner_id}.json    # plain JSON, batched write (every FLUSH_EVERY
+                                    # attempts, or immediately on stored/submitted/
+                                    # error and at dispatch-end flush()):
                                     # aggregate per (dispatch, miner) — n_attempts,
                                     # n_stored, n_submitted, best_energy_seen, ...
         submission.json             # written when controller submits to chain
@@ -236,9 +238,9 @@ class AttemptLogger:
         ``solution_id`` is set only when this iter resulted in a
         submission; lets ``query_by_solution_id`` back-resolve.
 
-        Side effect: metadata-{miner_id}.json gets rewritten with the
-        updated aggregate (n_attempts, n_stored, n_submitted,
-        best_energy_seen, qpu_time_total_us).
+        Side effect: updates the in-memory dispatch aggregate; written to
+        disk every FLUSH_EVERY attempts or immediately on
+        stored/submitted/error (and at dispatch-end via flush()).
         """
         record = {
             "type": "attempt",
@@ -311,9 +313,9 @@ class MetadataLogger:
     """Per-dispatch per-miner aggregate JSON file.
 
     Lives at ``{base}/{dispatch_id}/metadata-{miner_id}.json``. Not a
-    JSONL — it's a single JSON object rewritten on every update. Each
-    rewrite is via tmp-file + os.replace so concurrent readers never
-    see a partial file.
+    JSONL — it's a single JSON object written in batches (see
+    FLUSH_EVERY) — not on every update. Each rewrite is via tmp-file +
+    os.replace so concurrent readers never see a partial file.
     """
 
     # Flush the aggregate JSON to disk at most once per this many attempts
