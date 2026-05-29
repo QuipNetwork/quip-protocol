@@ -381,7 +381,8 @@ def _compute_distance_matrix_vectorized(solutions: List[List[int]]) -> np.ndarra
     n_features = arr.shape[1]
     gram = arr @ arr.T                              # n × n, one GEMM
     dist = (n_features - np.abs(gram)) / 2.0
-    # Diagonal is exactly 0 mathematically; guard float rounding.
+    # Defensive no-op: the diagonal is exactly 0 by construction
+    # (row·row = N), set explicitly for clarity.
     np.fill_diagonal(dist, 0.0)
     return dist.astype(np.float64)
 

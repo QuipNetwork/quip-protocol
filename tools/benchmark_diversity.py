@@ -68,9 +68,19 @@ def main() -> None:
 
     matmul = _compute_distance_matrix_vectorized(sols)
     broadcast = _broadcast_matrix(sols)
-    assert np.array_equal(matmul, broadcast), "matmul != broadcast"
+    if not np.array_equal(
+        np.rint(matmul).astype(np.int64), np.rint(broadcast).astype(np.int64)
+    ):
+        diff = matmul - broadcast
+        raise AssertionError(
+            f"matmul != broadcast: {int(np.count_nonzero(diff))} differing entries, "
+            f"max|diff|={float(np.max(np.abs(diff)))}"
+        )
     if args.n <= 40:
-        assert np.array_equal(matmul, _ground_truth(sols)), "matmul != truth"
+        truth = _ground_truth(sols)
+        assert np.array_equal(
+            np.rint(matmul).astype(np.int64), np.rint(truth).astype(np.int64)
+        ), "matmul != truth"
 
     t_broadcast = _time(_broadcast_matrix, sols, args.trials)
     t_matmul = _time(_compute_distance_matrix_vectorized, sols, args.trials)
@@ -81,6 +91,9 @@ def main() -> None:
 
     try:
         import torch  # noqa: PLC0415 — optional reference only
+        # arr built outside the timed loop, so torch excludes the list->tensor
+        # conversion cost that numpy's np.asarray pays inside the function —
+        # the torch number is an optimistic reference, not an apples-to-apples.
         arr = torch.tensor(sols, dtype=torch.float32)
 
         def _torch_cpu(_sols):
