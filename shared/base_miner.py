@@ -61,6 +61,13 @@ class _PumpedResult:
     qpu_access_time_us: Optional[int]
 
 
+# Sentinel pushed by the pump when the stream is exhausted so the
+# consumer's blocking get() unblocks and the loop can exit. Module-level
+# (not a class attribute) so subclasses can't accidentally shadow it and
+# break the consumer's ``is`` identity check.
+_PUMP_DONE = object()
+
+
 class BaseMiner(ABC):
     """Abstract base class for concrete miners (Template Method pattern).
 
@@ -152,7 +159,6 @@ class BaseMiner(ABC):
         # Count of QPU results dropped under result-queue backpressure.
         # Reset per dispatch by mine_work_item; logged at dispatch end.
         self._dropped_results: int = 0
-
 
     def update_top_samples(self, sampleset: dimod.SampleSet, nonce: int, salt: bytes, requirements: BlockRequirements):
         """Update the top 3 results list with a new mining result."""
@@ -259,9 +265,6 @@ class BaseMiner(ABC):
     # the consumer has headroom equal to what the cloud holds; on full the
     # pump drops the newest result (rare safety valve) and counts it.
     RESULT_QUEUE_MAXSIZE: int = 32
-    # Sentinel pushed by the pump when the stream is exhausted so the
-    # consumer's blocking get() unblocks and the loop can exit.
-    _PUMP_DONE = object()
     # Ratchet pre-check: skip the expensive lenient evaluate unless the
     # iter's cheap best-energy is within this many milli of the live
     # (decayed) threshold — i.e. it could plausibly submit now or after a
@@ -980,12 +983,15 @@ class BaseMiner(ABC):
             self.logger.error("result pump error: %s", exc)
         finally:
             try:
-                result_queue.put_nowait(self._PUMP_DONE)
+                result_queue.put_nowait(_PUMP_DONE)
             except queue.Full:
-                # Consumer already gone; drain one slot and signal.
+                # Consumer already gone; drain one slot and signal. The
+                # evicted slot held a real _PumpedResult, so count it as
+                # dropped before reusing the freed space for the sentinel.
                 try:
                     result_queue.get_nowait()
-                    result_queue.put_nowait(self._PUMP_DONE)
+                    self._dropped_results += 1
+                    result_queue.put_nowait(_PUMP_DONE)
                 except queue.Empty:
                     pass
 
