@@ -72,6 +72,9 @@ class DWaveMiner(BaseMiner):
     # Keep that headroom so the streaming sampler can saturate the
     # D-Wave cloud queue without blocking on Python-side derivation.
     FEEDER_BUFFER_SIZE = 60
+    # QPU is the async-streaming backend: drive the stream on a pump thread
+    # so per-result processing never blocks the cloud pipeline.
+    STREAMING_PUMP = True
 
     def __init__(
         self,
@@ -350,6 +353,12 @@ class DWaveMiner(BaseMiner):
             submit_one()
 
         stop_event = self._stop_event
+        pump_stop = getattr(self, "_pump_stop", None)
+
+        def _stop_requested() -> bool:
+            if stop_event is not None and stop_event.is_set():
+                return True
+            return pump_stop is not None and pump_stop.is_set()
 
         def _cancel_pending():
             """Abandon in-flight D-Wave futures on stop.
@@ -372,7 +381,7 @@ class DWaveMiner(BaseMiner):
             # drain_on_stop=True (test-only), stop submitting new work
             # but let in-flight jobs complete so callers can still read
             # their results.
-            if stop_event is not None and stop_event.is_set():
+            if _stop_requested():
                 if not self.drain_on_stop:
                     _cancel_pending()
                     return
@@ -396,7 +405,7 @@ class DWaveMiner(BaseMiner):
                         completed_id = fid
                         break
                 if completed_id is None:
-                    if stop_event is not None and stop_event.is_set() and not self.drain_on_stop:
+                    if _stop_requested() and not self.drain_on_stop:
                         _cancel_pending()
                         return
                     # 5ms poll: at production throughput one job per ~60ms
