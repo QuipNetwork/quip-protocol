@@ -755,6 +755,19 @@ class BaseMiner(ABC):
                         if len(top_k) >= top_k_cap
                         else float("inf")
                     )
+                    # Pre-check: only pay the lenient evaluate when the iter
+                    # both (a) would improve the running top_k baseline and
+                    # (b) is within RATCHET_PRECHECK_MARGIN_MILLI of the live
+                    # (decayed) threshold — i.e. could submit now or after a
+                    # little decay. No-hope iters (best far worse than the
+                    # live target) skip the expensive diversity/selection
+                    # work and log a lightweight rejected row. Mirrors the
+                    # strict fast-bail the canary gets for free.
+                    iter_best_milli = int(iter_best_energy * 1000)
+                    near_live = iter_best_milli <= (
+                        live_threshold_milli + self.RATCHET_PRECHECK_MARGIN_MILLI
+                    )
+                    improves_stash = iter_best_energy < ratchet_threshold
 
                     result = None
                     # Values captured from the post-processed eval so the
@@ -765,7 +778,7 @@ class BaseMiner(ABC):
                     # already produced by ``evaluate_sampleset``.
                     post_num_valid: Optional[int] = None
                     post_diversity_milli: Optional[int] = None
-                    if iter_best_energy < ratchet_threshold:
+                    if improves_stash and near_live:
                         # Lenient eval — diversity + min_solutions
                         # still required, but no energy gate. The
                         # ratchet itself enforces "only improvements

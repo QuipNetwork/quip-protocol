@@ -867,6 +867,142 @@ def test_attempt_log_records_num_valid_and_diversity_on_stored_iteration(
     )
 
 
+def test_precheck_skips_evaluate_for_no_hope_iter(
+    cpu_miner, relaxed_context, monkeypatch,
+):
+    """Pre-check must skip the expensive lenient ``evaluate_sampleset`` when
+    the iter's best energy is FAR above (worse than) the live threshold plus
+    ``RATCHET_PRECHECK_MARGIN_MILLI``.
+
+    Arranges a fake sampler that returns a sampleset whose best energy is
+    +100.0 (100_000 milli) — far above the live threshold of 0 milli plus the
+    2000-milli margin. The spy on ``evaluate_sampleset`` must NOT be called,
+    and the attempt log must record ``result_kind="rejected"`` with
+    ``post_processed=False``.
+    """
+    import dimod
+    from unittest.mock import MagicMock
+
+    # Sampleset with a single sample at energy +100 — no-hope (far above live).
+    BAD_ENERGY = 100.0
+    bad_ss = dimod.SampleSet.from_samples(
+        [{n: 1 for n in relaxed_context.nodes}],
+        vartype=dimod.SPIN,
+        energy=[BAD_ENERGY],
+    )
+
+    # Spy on evaluate_sampleset — must NOT be called for a no-hope iter.
+    spy_calls = []
+
+    def spy_evaluate(sampleset, *args, **kwargs):
+        spy_calls.append(sampleset)
+        return None
+
+    # Capture the first attempt-log record, then stop.
+    captured = []
+    recording_logger = MagicMock()
+
+    def _capture(**kw):
+        captured.append(kw)
+        stop.set()
+
+    recording_logger.record.side_effect = _capture
+
+    original_sample = cpu_miner._sample
+
+    def fake_sample(*args, **kwargs):
+        # Return the bad-energy sampleset regardless of (h, J).
+        return bad_ss
+
+    stop = mp.Event()
+    # Live threshold = 0 milli. With RATCHET_PRECHECK_MARGIN_MILLI=2000,
+    # iter_best_milli = 100_000 >> 0 + 2000 so near_live is False.
+    live_var = mp.Value('q', 0)
+
+    monkeypatch.setattr(cpu_miner, "_sample", fake_sample)
+    monkeypatch.setattr(cpu_miner, "evaluate_sampleset", spy_evaluate)
+    cpu_miner._attempt_logger = recording_logger
+    cpu_miner._live_max_energy_milli = live_var
+    try:
+        cpu_miner.mine_work_item(relaxed_context, stop)
+    finally:
+        del cpu_miner._attempt_logger
+        del cpu_miner._live_max_energy_milli
+
+    assert captured, "expected at least one AttemptLogger.record call"
+    rec = captured[0]
+    assert not spy_calls, (
+        "evaluate_sampleset must NOT be called for a no-hope iter "
+        f"(best_energy={BAD_ENERGY}, live_threshold_milli=0, margin=2000)"
+    )
+    assert rec["result_kind"] == "rejected", (
+        f"no-hope iter must be logged as 'rejected', got {rec['result_kind']!r}"
+    )
+    assert rec["post_processed"] is False, (
+        f"no-hope iter must have post_processed=False, got {rec['post_processed']!r}"
+    )
+
+
+def test_precheck_evaluates_iter_near_live_threshold(
+    cpu_miner, relaxed_context, monkeypatch,
+):
+    """Pre-check must call ``evaluate_sampleset`` when the iter's best energy
+    is at or below the live threshold — i.e. clearly within the
+    ``RATCHET_PRECHECK_MARGIN_MILLI`` window.
+
+    Arranges a fake sampler that returns a sampleset whose best energy is
+    -1.0 (-1000 milli) — below the live threshold of 0 milli. The spy on
+    ``evaluate_sampleset`` MUST be called for that iter.
+    """
+    import dimod
+    from unittest.mock import MagicMock
+
+    # Sampleset with best energy -1.0 — clearly within margin of threshold 0.
+    GOOD_ENERGY = -1.0
+    good_ss = dimod.SampleSet.from_samples(
+        [{n: -1 for n in relaxed_context.nodes}],
+        vartype=dimod.SPIN,
+        energy=[GOOD_ENERGY],
+    )
+
+    spy_calls = []
+
+    def spy_evaluate(sampleset, *args, **kwargs):
+        spy_calls.append(sampleset)
+        return None  # Return None so the loop continues; stop via logger.
+
+    captured = []
+    recording_logger = MagicMock()
+
+    def _capture(**kw):
+        captured.append(kw)
+        stop.set()
+
+    recording_logger.record.side_effect = _capture
+
+    def fake_sample(*args, **kwargs):
+        return good_ss
+
+    stop = mp.Event()
+    # Live threshold = 0 milli; GOOD_ENERGY milli = -1000 << 0 + 2000.
+    live_var = mp.Value('q', 0)
+
+    monkeypatch.setattr(cpu_miner, "_sample", fake_sample)
+    monkeypatch.setattr(cpu_miner, "evaluate_sampleset", spy_evaluate)
+    cpu_miner._attempt_logger = recording_logger
+    cpu_miner._live_max_energy_milli = live_var
+    try:
+        cpu_miner.mine_work_item(relaxed_context, stop)
+    finally:
+        del cpu_miner._attempt_logger
+        del cpu_miner._live_max_energy_milli
+
+    assert spy_calls, (
+        "evaluate_sampleset MUST be called when iter best energy "
+        f"({GOOD_ENERGY}) is within margin of live threshold (0 milli)"
+    )
+
+
 def test_attempt_log_records_qpu_access_time_us_when_sample_records_qpu_timing(
     cpu_miner, relaxed_context,
 ):
