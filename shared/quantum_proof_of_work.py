@@ -365,43 +365,25 @@ def _calculate_set_diversity(indices: List[int], dist_matrix: np.ndarray) -> flo
 
 
 def _compute_distance_matrix_vectorized(solutions: List[List[int]]) -> np.ndarray:
-    """Compute symmetric Hamming distance matrix using vectorized operations.
+    """Symmetric (flip-invariant) Hamming distance matrix via one GEMM.
 
-    Uses PyTorch MPS/CUDA when available for large matrices (5x speedup on
-    GPU at 500+ solutions). Falls back to numpy for small matrices or when
-    no GPU is available.
+    For spins in {-1, +1}, ``Sᵢ·Sⱼ = N − 2·hamming(i, j)``, so the
+    flip-invariant distance ``min(hamming, N − hamming)`` is::
+
+        D = (N − |S · Sᵀ|) / 2
+
+    This is a single BLAS matrix multiply with O(n²) memory — milliseconds
+    at n≈112, N≈4578 — versus materializing an n×n×N tensor and counting.
+    float32 is exact here: every product is ±1 and the sums stay integers
+    well under 2²⁴.
     """
-    arr = np.array(solutions, dtype=np.int8)
-    n_solutions = arr.shape[0]
-
-    # GPU acceleration for large matrices (amortizes transfer overhead)
-    if n_solutions >= 200:
-        try:
-            import torch
-            device = None
-            if torch.backends.mps.is_available():
-                device = 'mps'
-            elif torch.cuda.is_available():
-                device = 'cuda'
-
-            if device is not None:
-                t = torch.from_numpy(arr).to(torch.int8).to(device)
-                a1 = t.unsqueeze(1)
-                a2 = t.unsqueeze(0)
-                dist_normal = (a1 != a2).sum(dim=2)
-                dist_inverted = (a1 != -a2).sum(dim=2)
-                return torch.minimum(
-                    dist_normal, dist_inverted
-                ).cpu().numpy().astype(np.float64)
-        except Exception:
-            pass  # Fall through to numpy
-
-    # Numpy path (fast for small matrices, no GPU needed)
-    a1 = arr[:, np.newaxis, :]
-    a2 = arr[np.newaxis, :, :]
-    dist_normal = np.count_nonzero(a1 != a2, axis=2)
-    dist_inverted = np.count_nonzero(a1 != -a2, axis=2)
-    return np.minimum(dist_normal, dist_inverted).astype(np.float64)
+    arr = np.asarray(solutions, dtype=np.float32)  # n × N, values ±1
+    n_features = arr.shape[1]
+    gram = arr @ arr.T                              # n × n, one GEMM
+    dist = (n_features - np.abs(gram)) / 2.0
+    # Diagonal is exactly 0 mathematically; guard float rounding.
+    np.fill_diagonal(dist, 0.0)
+    return dist.astype(np.float64)
 
 
 def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> List[int]:
