@@ -126,16 +126,39 @@ async def test_maybe_anticipatory_fire_noop_without_preview(controller):
 
 
 @pytest.mark.asyncio
-async def test_maybe_anticipatory_fire_noop_when_inputs_none(controller):
-    """A preview present but predictor inputs unresolvable (query_* → None)
-    must be a clean no-op rather than raise."""
+async def test_maybe_anticipatory_fire_noop_when_constants_none(controller):
+    """A preview present but ``query_pow_constants`` → None must short-circuit
+    cleanly (no AttributeError on ``constants.curve_c_*``), keeping the
+    preview, and must NOT even reach ``query_difficulty``."""
     ctrl, _ = controller
     ctx = _make_context(threshold_milli=-5000)
     ctx.block_number = 5
     key = (b"\x01" * 32, b"\xab" * 32)
     ctrl._latest_preview[key] = {"submit_floor_energy": -3.0}
     await ctrl._maybe_anticipatory_fire(ctx, key)
-    # Inputs returned None (query_difficulty → None) → no fire, preview kept.
+    # constants None → return before querying difficulty.
+    ctrl.pool_client.query_pow_constants.assert_awaited()
+    ctrl.pool_client.query_difficulty.assert_not_called()
+    assert key in ctrl._latest_preview
+
+
+@pytest.mark.asyncio
+async def test_maybe_anticipatory_fire_noop_when_difficulty_none(controller):
+    """Constants present but ``query_difficulty`` → None must be a clean
+    no-op rather than raise; preview is kept for a later head."""
+    ctrl, _ = controller
+    ctrl._pow_constants = SimpleNamespace(
+        epoch_length=5,
+        curve_c_easy_milli=800,
+        curve_c_knee_milli=750,
+        curve_c_hard_milli=700,
+    )
+    ctx = _make_context(threshold_milli=-5000)
+    ctx.block_number = 5
+    key = (b"\x01" * 32, b"\xab" * 32)
+    ctrl._latest_preview[key] = {"submit_floor_energy": -3.0}
+    await ctrl._maybe_anticipatory_fire(ctx, key)
+    # difficulty None → no fire, preview kept.
     ctrl.pool_client.query_difficulty.assert_awaited()
     assert key in ctrl._latest_preview
 

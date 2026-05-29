@@ -1689,6 +1689,8 @@ class SubstrateMinerController:
             if self._pow_constants is None:
                 self._pow_constants = await self.pool_client.query_pow_constants()
             constants = self._pow_constants
+            if constants is None:
+                return None
             base = self._base_difficulty_by_key.get(key)
             if base is None:
                 base = await self.pool_client.query_difficulty()
@@ -1893,6 +1895,76 @@ class SubstrateMinerController:
             )
             return None
 
+    async def _resolve_accepted_block(
+        self, receipt_block: Optional[str]
+    ) -> Tuple[bytes, int]:
+        """Resolve a receipt's block hash → ``(hash_bytes, block_number)``.
+
+        Best-effort, mirroring the OK branch of ``_handle_result``: a
+        failure to decode or look up the number falls back to
+        ``(b"", self._highest_handled_block + 1)`` — correct in the common
+        case (we won at/just past the last processed head) and the
+        subscription re-converges within a head or two.
+        """
+        accepted_block_number = self._highest_handled_block + 1
+        accepted_block_hash = b""
+        if not receipt_block:
+            return accepted_block_hash, accepted_block_number
+        try:
+            accepted_block_hash = bytes.fromhex(
+                receipt_block[2:]
+                if receipt_block.startswith("0x")
+                else receipt_block
+            )
+            accepted_block_number = await self.pool_client.get_block_number(
+                at=accepted_block_hash
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "anticipatory: could not resolve accepted block number "
+                "for receipt block=%s (%s: %s); using fallback=%d",
+                receipt_block,
+                type(exc).__name__,
+                exc,
+                accepted_block_number,
+            )
+        return accepted_block_hash, accepted_block_number
+
+    async def _record_anticipatory_verify_fail(
+        self,
+        ctx: SubstrateMiningContext,
+        key: WorkKey,
+        log_common: dict,
+        *,
+        extrinsic_hash: Optional[str],
+        receipt_block: Optional[str],
+    ) -> None:
+        """Handle an anticipatory fire that got receipt OK but failed verify.
+
+        Mirrors ``_handle_result``'s verified-False path: bump
+        ``proofs_unverified``, clear the mid-fire mark (but keep the preview
+        + work key open so the next head re-fires), and write a
+        ``chain_error`` submission-log row so the failure is visible rather
+        than silently dropped.
+        """
+        self.stats.proofs_unverified += 1
+        self._anticipatory_fired.discard(key)
+        pow_seq_mismatch = await self._query_proofs_submitted_safe()
+        self._submission_log.record(
+            **log_common,
+            outcome="chain_error",
+            extrinsic_hash=extrinsic_hash,
+            chain_block_hash=receipt_block,
+            pow_sequence=pow_seq_mismatch,
+            error="receipt OK but proof not recorded by chain",
+        )
+        logger.warning(
+            "anticipatory fire receipt OK but verification failed for "
+            "work_key 0x%s... (extrinsic=%s); NOT closing key",
+            ctx.last_proof_block_hash.hex()[:16],
+            extrinsic_hash,
+        )
+
     async def _record_anticipatory_success(
         self,
         ctx: SubstrateMiningContext,
@@ -1919,47 +1991,36 @@ class SubstrateMinerController:
             dispatch_id=int(preview.get("dispatch_id", 0) or 0),
         )
         solution_id = self._submission_log.assign_id()
-        result_energy_milli = int(float(preview.get("energy", 0.0)) * 1000)
-        result_diversity_milli = int(float(preview.get("diversity", 0.0)) * 1000)
-        snapshot_threshold_milli = int(ctx.difficulty.max_energy_milli)
-        last_proof_hex = "0x" + ctx.last_proof_block_hash.hex()
+        # Shared submission-log fields for both the success and verify-fail
+        # rows — keeps the two record() calls in sync.
+        log_common = {
+            "solution_id": solution_id,
+            "miner_id": handle_id,
+            "miner_type": "anticipatory",
+            "dispatch_id": int(preview.get("dispatch_id", 0) or 0),
+            "energy_milli": int(float(preview.get("energy", 0.0)) * 1000),
+            "diversity_milli": int(float(preview.get("diversity", 0.0)) * 1000),
+            "threshold_milli": int(ctx.difficulty.max_energy_milli),
+            "last_proof_block_hash_hex": "0x" + ctx.last_proof_block_hash.hex(),
+            "num_valid": int(preview.get("num_valid", 0)),
+        }
+        receipt_block = receipt.block_hash if receipt is not None else None
+        extrinsic_hash = receipt.extrinsic_hash if receipt is not None else None
 
         verified = await self._verify_proof_recorded(envelope)
         # verified < 0 → chain recorded a different proof; treat as not-won.
         if verified is not None and verified < 0:
-            self.stats.proofs_unverified += 1
-            self._anticipatory_fired.discard(key)
-            logger.warning(
-                "anticipatory fire receipt OK but verification failed for "
-                "work_key 0x%s... (extrinsic=%s); NOT closing key",
-                ctx.last_proof_block_hash.hex()[:16],
-                receipt.extrinsic_hash if receipt is not None else None,
+            await self._record_anticipatory_verify_fail(
+                ctx, key, log_common,
+                extrinsic_hash=extrinsic_hash,
+                receipt_block=receipt_block,
             )
             return
 
         self.stats.proofs_submitted += 1
-        accepted_block_number = self._highest_handled_block + 1
-        accepted_block_hash = b""
-        receipt_block = receipt.block_hash if receipt is not None else None
-        if receipt_block:
-            try:
-                accepted_block_hash = bytes.fromhex(
-                    receipt_block[2:]
-                    if receipt_block.startswith("0x")
-                    else receipt_block
-                )
-                accepted_block_number = await self.pool_client.get_block_number(
-                    at=accepted_block_hash
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "anticipatory: could not resolve accepted block number "
-                    "for receipt block=%s (%s: %s); using fallback=%d",
-                    receipt_block,
-                    type(exc).__name__,
-                    exc,
-                    accepted_block_number,
-                )
+        accepted_block_hash, accepted_block_number = (
+            await self._resolve_accepted_block(receipt_block)
+        )
         record = ClosedWorkRecord(
             accepted_block_hash=accepted_block_hash,
             accepted_block_number=accepted_block_number,
@@ -1971,17 +2032,9 @@ class SubstrateMinerController:
             verified if (verified is not None and verified >= 0) else None
         )
         self._submission_log.record(
-            solution_id=solution_id,
-            miner_id=handle_id,
-            miner_type="anticipatory",
-            dispatch_id=int(preview.get("dispatch_id", 0) or 0),
-            energy_milli=result_energy_milli,
-            diversity_milli=result_diversity_milli,
-            threshold_milli=snapshot_threshold_milli,
-            last_proof_block_hash_hex=last_proof_hex,
+            **log_common,
             outcome="submitted_inblock",
-            num_valid=int(preview.get("num_valid", 0)),
-            extrinsic_hash=receipt.extrinsic_hash if receipt is not None else None,
+            extrinsic_hash=extrinsic_hash,
             chain_block_hash=receipt_block,
             chain_block_number=won_block_number
             if won_block_number is not None

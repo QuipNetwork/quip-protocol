@@ -1398,6 +1398,55 @@ async def test_anticipatory_fires_at_b_star_minus_one_success(monkeypatch):
     assert captured["context"] is ctx
 
 
+async def test_anticipatory_verify_fail_records_chain_error_and_refires(monkeypatch):
+    """An anticipatory fire with receipt OK but ``_verify_proof_recorded``
+    returning -1 (chain recorded a different proof) must: NOT close the work
+    key, clear ``_anticipatory_fired`` (so the next head re-fires), and write
+    a ``chain_error`` submission-log row so the failure is visible."""
+    import json
+
+    controller = _bare_controller()
+    _stub_predictor_inputs(controller)
+    controller._verify_proof_recorded = AsyncMock(return_value=-1)
+    controller.pool_client.query_proofs_submitted = AsyncMock(return_value=77)
+    ctx = _ctx_at_block(b"\xaa" * 32, 19)
+    _store_preview_entry(controller, ctx)
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+
+    async def fake_submit_with_retry(*args, **kwargs):
+        from substrate.submitter import SubmitResult, SubmitRetryAction
+        return SubmitResult(
+            action=SubmitRetryAction.SUCCESS,
+            receipt=ExtrinsicReceipt(extrinsic_hash="0xabc", block_hash="0xdef"),
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
+    )
+    monkeypatch.setattr(
+        "substrate.miner_controller.block_when_energy_clears",
+        lambda *a, **k: 20,
+    )
+
+    await controller._maybe_anticipatory_fire(ctx, key)
+
+    # Not won: key stays open, mid-fire mark cleared so a later head re-fires,
+    # preview retained.
+    assert controller.stats.proofs_submitted == 0
+    assert controller.stats.proofs_unverified == 1
+    assert key not in controller._closed_work_keys
+    assert key not in controller._anticipatory_fired
+    assert key in controller._latest_preview
+    # A chain_error submission-log row was written (dispatch_id=1 from preview).
+    sub_path = controller._submission_log.log_dir / "1" / "submission.json"
+    record = json.loads(sub_path.read_text())
+    assert record["outcome"] == "chain_error"
+    assert record["num_valid"] == 3
+    assert record["pow_sequence"] == 77
+    assert record["error"] == "receipt OK but proof not recorded by chain"
+
+
 async def test_anticipatory_retry_keeps_preview_for_next_head(monkeypatch):
     """A RETRY-exhausted fire must keep the preview and clear the mid-fire
     mark so a later head can fire again."""
