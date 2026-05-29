@@ -249,6 +249,41 @@ class SubstrateClient:
             return
         raise NoValidatorReachable(attempts)
 
+    async def ensure_connected(self) -> bool:
+        """Cheap pre-submit liveness probe; reconnect if the socket is dead.
+
+        Long mining gaps let an idle validator websocket drop without the
+        client noticing — the failure then surfaces as a ``BrokenPipeError``
+        at submit time, where it eats the failover round-trip on the
+        critical proof path. Calling this immediately before a submit moves
+        that cost off the hot path: a one-shot ``system_health`` RPC confirms
+        the socket, and any connection-class failure triggers the existing
+        :meth:`reconnect` (validator rotation) before we sign + ship.
+
+        Returns ``True`` if the existing connection answered the probe,
+        ``False`` if a reconnect was performed. Propagates
+        ``NoValidatorReachable`` when reconnect finds no live validator —
+        the caller cannot submit anyway, so failing loud here is correct.
+        """
+        if self._iface is None:
+            await self.connect()
+            return False
+        try:
+            await self._raw_run(
+                lambda: self._iface.rpc_request("system_health", [])
+            )
+            return True
+        except (WebSocketException, ConnectionError, OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "ensure_connected: health probe failed on %s (%s: %s); "
+                "reconnecting before submit",
+                self.current_url,
+                type(exc).__name__,
+                exc,
+            )
+            await self.reconnect()
+            return False
+
     async def close(self) -> None:
         await self._close_iface()
 
@@ -771,6 +806,8 @@ class SubstrateClient:
         call_function: str,
         call_params: dict,
         signer: Signer,
+        *,
+        tip: int = 0,
     ) -> str:
         """Compose + sign an extrinsic locally; return hex-encoded wire bytes.
 
@@ -782,18 +819,26 @@ class SubstrateClient:
             ``_build_hybrid_signed_extrinsic`` — substrate-interface
             doesn't know about the chain's ``HybridTxSignature`` envelope.
 
+        ``tip`` is the ``ChargeTransactionPayment`` tip in the chain's base
+        unit (plancks). A higher tip raises the extrinsic's transaction-pool
+        priority, improving the odds of inclusion in the next block — the
+        proof race is won by being in the right block, not by being first to
+        broadcast. ``tip=0`` reproduces the exact pre-tip wire bytes.
+
         Pair with :meth:`submit_signed_extrinsic` so the signer's key
         material can stay in the calling process even when the submit
         side crosses an IPC boundary (e.g., ``ValidatorPool.send``).
         """
+        if tip < 0:
+            raise ValueError(f"tip must be non-negative, got {tip}")
         kind = signer.signature_kind()
         if kind == "Sr25519":
             return await self._build_sr25519_extrinsic_hex(
-                call_module, call_function, call_params, signer,
+                call_module, call_function, call_params, signer, tip=tip,
             )
         if kind == "Hybrid":
             return await self._build_hybrid_extrinsic_hex(
-                call_module, call_function, call_params, signer,
+                call_module, call_function, call_params, signer, tip=tip,
             )
         raise NotImplementedError(
             f"build_signed_extrinsic does not support signature_kind={kind}"
@@ -805,6 +850,8 @@ class SubstrateClient:
         call_function: str,
         call_params: dict,
         signer: Signer,
+        *,
+        tip: int = 0,
     ) -> str:
         keypair = signer.keypair  # type: ignore[attr-defined]
 
@@ -815,7 +862,7 @@ class SubstrateClient:
                 call_params=call_params,
             )
             extrinsic: GenericExtrinsic = self._iface.create_signed_extrinsic(
-                call=call, keypair=keypair,
+                call=call, keypair=keypair, tip=tip,
             )
             return extrinsic.data.to_hex()
 
@@ -831,6 +878,8 @@ class SubstrateClient:
         call_function: str,
         call_params: dict,
         signer: Signer,
+        *,
+        tip: int = 0,
     ) -> str:
         if not isinstance(signer, HybridSigner):
             raise TypeError(
@@ -844,6 +893,7 @@ class SubstrateClient:
                 call_module=call_module,
                 call_function=call_function,
                 call_params=call_params,
+                tip=tip,
             )
             return "0x" + ext_bytes.hex()
 
@@ -1325,6 +1375,7 @@ def _build_hybrid_signed_extrinsic(
     call_module: str,
     call_function: str,
     call_params: dict,
+    tip: int = 0,
 ) -> tuple[bytes, str]:
     """Construct a hybrid-signed extrinsic byte-by-byte.
 
@@ -1383,7 +1434,7 @@ def _build_hybrid_signed_extrinsic(
         + b"\x00"                            # CheckMortality: Era::immortal
         + _encode_compact_u32(int(nonce))    # CheckNonce
         + b""                                # CheckWeight
-        + _encode_compact_u128(0)            # ChargeTransactionPayment tip=0
+        + _encode_compact_u128(tip)          # ChargeTransactionPayment tip
         + b"\x00"                            # CheckMetadataHash: Mode::Disabled
         + b""                                # WeightReclaim
     )

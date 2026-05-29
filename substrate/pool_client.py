@@ -41,6 +41,18 @@ class PoolClient:
     # Best-block / finalized-head primitives.
     # ------------------------------------------------------------------
 
+    async def ensure_connected(self) -> bool:
+        """Pre-submit liveness probe routed through the pool.
+
+        Forwards to the active validator child's
+        :meth:`SubstrateClient.ensure_connected`. As an idempotent op, a
+        dead socket surfaces as a connection-class error that the pool
+        turns into a hot-active swap — so a stale validator is replaced
+        before the (non-idempotent) submit that follows. Returns the
+        child's bool (``True`` = existing connection answered).
+        """
+        return await self._pool.send("ensure_connected", {})
+
     async def get_head(self) -> bytes:
         return await self._pool.send("get_head", {})
 

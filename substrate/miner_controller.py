@@ -48,6 +48,7 @@ from websocket import WebSocketException
 
 from shared.asyncio_supervise import supervise
 from shared.logging_config import get_logger
+from shared.miner_config import SubmissionConfig
 from shared.miner_survey import build_miner_survey
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
@@ -444,6 +445,7 @@ class SubstrateMinerController:
         telemetry_port: int = 8086,
         snapshot_kind: str = "",
         spawn_telemetry_sibling: bool = True,
+        submission_config: Optional[SubmissionConfig] = None,
     ) -> None:
         if not miner_handles:
             raise ValueError(
@@ -469,6 +471,11 @@ class SubstrateMinerController:
         self.core = core
         self.signer = signer
         self.miner_handles = miner_handles
+        # Submission tuning (tip + retry bounds). Defaults reproduce the
+        # pre-tip, no-extra-retry behavior, so an old config or a caller
+        # that omits this keeps working unchanged. Task 6's anticipatory
+        # fire loop reads `max_retries` / `retry_backoff_ms` from here.
+        self.submission_config = submission_config or SubmissionConfig()
         self.topology_hash = topology_hash
         self.on_proof_submitted = on_proof_submitted
         self.stats = ControllerStats()
@@ -1051,6 +1058,7 @@ class SubstrateMinerController:
                 self.signer,
                 envelope.result,
                 envelope.context,
+                tip=self.submission_config.tip_plancks,
             )
         except Exception as exc:  # noqa: BLE001 — surface RPC errors to logs
             self.stats.submission_errors += 1

@@ -139,6 +139,10 @@ def _bare_controller() -> SubstrateMinerController:
     c._last_pushed_threshold_milli = 0
     c.topology_hash = None
     c.core = None  # Phase 6: optional MinerCore for telemetry
+    # Submission tuning (tip + retry bounds); defaults reproduce pre-tip
+    # behavior. _handle_result reads submission_config.tip_plancks.
+    from shared.miner_config import SubmissionConfig
+    c.submission_config = SubmissionConfig()
     # Submission log is created by __init__; bare controllers used in
     # unit tests either don't exercise the submit path or patch the
     # log explicitly. Tests that touch _handle_result will set this.

@@ -59,6 +59,7 @@ strings; type errors fail fast at load time, before we touch the chain.
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -90,6 +91,84 @@ def load_miner_config(path: Path) -> dict[str, Any]:
     _validate_validators_field(miner_dict.get("validators"))
     _apply_v01_aliases(miner_dict)
     return miner_dict
+
+
+@dataclass(frozen=True)
+class SubmissionConfig:
+    """Tuning for the ``submit_proof`` extrinsic, from the ``[submission]`` table.
+
+    ``tip_plancks`` is the ``ChargeTransactionPayment`` tip (chain base unit)
+    threaded into the signed extrinsic to raise its transaction-pool
+    priority — the round goes to the lowest-energy proof *within a block*,
+    so inclusion in the right block is the race. ``max_retries`` /
+    ``retry_backoff_ms`` bound the resilient submit loop
+    (:func:`substrate.submitter.submit_with_retry`): ``max_retries`` is the
+    number of *additional* attempts after the first; backoff is linear per
+    attempt. Defaults are no-tip + 3 retries + 250 ms so omitting the
+    section reproduces today's behavior.
+    """
+
+    tip_plancks: int = 0
+    max_retries: int = 3
+    retry_backoff_ms: int = 250
+
+
+def load_submission_config(path: Path) -> SubmissionConfig:
+    """Read the ``[submission]`` table into a :class:`SubmissionConfig`.
+
+    Returns defaults when the file has no ``[submission]`` section, so a
+    config that predates this feature behaves exactly as before. Raises
+    :class:`MinerConfigError` for a non-table section or out-of-range
+    values — these reach the submit path, so a malformed knob should fail
+    at load time, not at the first proof.
+    """
+    raw = _load_toml(path)
+    section = raw.get("submission", {})
+    if not isinstance(section, Mapping):
+        raise MinerConfigError(
+            "miner config: [submission] must be a table, got "
+            f"{type(section).__name__}"
+        )
+    return _parse_submission_table(section)
+
+
+def _parse_submission_table(section: Mapping[str, Any]) -> SubmissionConfig:
+    """Validate + coerce a ``[submission]`` mapping to a config dataclass."""
+    defaults = SubmissionConfig()
+    tip = _require_non_negative_int(
+        section, "tip_plancks", defaults.tip_plancks
+    )
+    max_retries = _require_non_negative_int(
+        section, "max_retries", defaults.max_retries
+    )
+    backoff = _require_non_negative_int(
+        section, "retry_backoff_ms", defaults.retry_backoff_ms
+    )
+    return SubmissionConfig(
+        tip_plancks=tip,
+        max_retries=max_retries,
+        retry_backoff_ms=backoff,
+    )
+
+
+def _require_non_negative_int(
+    section: Mapping[str, Any], key: str, default: int
+) -> int:
+    """Read ``key`` as a non-negative int, defaulting when absent."""
+    if key not in section:
+        return default
+    value = section[key]
+    # bool is an int subclass; reject it so `tip_plancks = true` fails loud.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise MinerConfigError(
+            f"miner config: [submission].{key} must be a non-negative "
+            f"integer, got {value!r}"
+        )
+    if value < 0:
+        raise MinerConfigError(
+            f"miner config: [submission].{key} must be non-negative, got {value}"
+        )
+    return value
 
 
 # Names of the v0.1 top-level tables that describe miner hardware
