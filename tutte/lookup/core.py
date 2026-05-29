@@ -17,6 +17,7 @@ from __future__ import annotations
 import concurrent.futures as cf
 import json
 import os
+import signal
 from dataclasses import dataclass, field
 from math import gcd as math_gcd
 from typing import Dict, List, Optional, Set, Tuple
@@ -39,26 +40,72 @@ def _init_worker_caches(nx_cache, tutte_cache):
     _WORKER_TUTTE_CACHE = tutte_cache
 
 
+# Per-pair wall-clock bound for Phase-2 minor verification. VF2 subgraph
+# monomorphism on a pair of large, highly-symmetric graphs (e.g. two
+# same-node-count D-Wave entries) is effectively unbounded and will wedge a
+# worker indefinitely. NetworkX's VF2 and `is_graph_minor` are pure Python,
+# so SIGALRM fires between bytecodes and interrupts them cleanly. A pair that
+# can't be decided in this budget is reported inconclusive (None) — the
+# Phase-1 coefficient-domination relationship is then retained unverified,
+# exactly like an `is_graph_minor` max_contractions miss (verification only
+# ever *removes* false positives, so retaining one is harmless for synthesis).
+_MINOR_VERIFY_TIMEOUT_S = 5.0
+
+
+class _PairTimeout(BaseException):
+    """Raised by the SIGALRM handler. Inherits BaseException so the pure-Python
+    VF2 / minor internals (which catch `Exception`) can't swallow it."""
+
+
+def _run_pair_check_bounded(fn, timeout_s=_MINOR_VERIFY_TIMEOUT_S):
+    """Run `fn()` under a SIGALRM wall-clock bound.
+
+    Returns `fn()`'s result, or None if it didn't finish in `timeout_s`.
+    Falls back to running unbounded on platforms without SIGALRM (Windows).
+    Must be called from a process's main thread — true for both the serial
+    path and ProcessPoolExecutor workers (each runs tasks in its main thread).
+    """
+    if not hasattr(signal, "SIGALRM"):
+        return fn()
+
+    def _handler(signum, frame):
+        raise _PairTimeout()
+
+    old = signal.signal(signal.SIGALRM, _handler)
+    signal.setitimer(signal.ITIMER_REAL, timeout_s)
+    try:
+        return fn()
+    except _PairTimeout:
+        return None
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
 def _verify_pair_worker(task):
     """Worker for parallel Phase-2 minor verification.
 
     Module-level (not a closure) so it pickles cleanly into ProcessPoolExecutor.
     Reads graphs from the per-worker caches populated by `_init_worker_caches`.
+    Each pair runs under a per-pair wall-clock bound (`_run_pair_check_bounded`)
+    so a pathological VF2 can't wedge the worker (and thus the whole pool).
     """
     major_key, minor_key, mode, max_contractions = task
-    if mode == 'mono':
-        # Same node count: VF2 subgraph monomorphism is the full test.
-        from networkx.algorithms.isomorphism import GraphMatcher
-        G_major = _WORKER_NX_CACHE[major_key]
-        G_minor = _WORKER_NX_CACHE[minor_key]
-        result = GraphMatcher(G_major, G_minor).subgraph_is_monomorphic()
-    else:
+
+    def _check():
+        if mode == 'mono':
+            # Same node count: VF2 subgraph monomorphism is the full test.
+            from networkx.algorithms.isomorphism import GraphMatcher
+            G_major = _WORKER_NX_CACHE[major_key]
+            G_minor = _WORKER_NX_CACHE[minor_key]
+            return GraphMatcher(G_major, G_minor).subgraph_is_monomorphic()
         # Different node counts: BFS contraction + isomorphism (may be inconclusive).
         from ..graphs.minor import is_graph_minor
         G_major = _WORKER_TUTTE_CACHE[major_key]
         G_minor = _WORKER_TUTTE_CACHE[minor_key]
-        result = is_graph_minor(G_major, G_minor,
-                                max_contractions=max_contractions)
+        return is_graph_minor(G_major, G_minor, max_contractions=max_contractions)
+
+    result = _run_pair_check_bounded(_check)
     return (major_key, minor_key, result)
 
 
@@ -571,11 +618,13 @@ class RainbowTable:
                     G_major = nx_cache[major_key]
                     G_minor = nx_cache[minor_key]
                     if needed == 0:
-                        result = _GM(G_major, G_minor).subgraph_is_monomorphic()
+                        result = _run_pair_check_bounded(
+                            lambda: _GM(G_major, G_minor).subgraph_is_monomorphic())
                     else:
-                        result = is_graph_minor(self.entries[major_key].graph,
-                                                self.entries[minor_key].graph,
-                                                max_contractions=max_contractions)
+                        result = _run_pair_check_bounded(
+                            lambda: is_graph_minor(self.entries[major_key].graph,
+                                                   self.entries[minor_key].graph,
+                                                   max_contractions=max_contractions))
                     _consume(major_key, minor_key, result)
                     checked += 1
                     if total_suspicious > 1000 and checked % 25000 == 0:

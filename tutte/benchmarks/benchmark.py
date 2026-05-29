@@ -19,6 +19,7 @@ Pytest integration: run with --benchmark flag to collect timings automatically.
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -480,6 +481,34 @@ def _tutte_networkx(G_nx):
     return TuttePolynomial.from_coefficients(coeffs)
 
 
+def _nx_family_key(name):
+    """Group benchmark graph names into scaling families for the NetworkX
+    give-up rule.
+
+    The graph list is sorted by size, so members of a family appear in
+    increasing difficulty. Once NetworkX times out on one member, every
+    later member is strictly harder for its deletion-contraction recursion
+    — there's no point spending another `nx_timeout_s` proving it. Atlas
+    graphs and unparametrised one-offs (Petersen, Heawood, …) are each
+    their own family so a single timeout never suppresses unrelated graphs.
+    """
+    if name.startswith("atlas_"):
+        return name  # each atlas graph independent — not a size-scaling series
+    if name.startswith("K_{"):
+        return "K_{a,b}"  # bipartite completes (name has no trailing integer)
+    if name.startswith("Grid_"):
+        return "Grid"  # Grid_RxC has no bare trailing integer
+    if name.startswith("Z1_") and "inter" not in name:
+        return "Zephyr"  # Z1_1, Z1_2, … (the inter-cell component is its own graph)
+    # Generic: strip a trailing size parameter — "K_3"->"K", "C_10"->"C",
+    # "Wheel_5"->"Wheel", "Cm12"->"Cm", "Pm3"->"Pm". Names with no trailing
+    # integer fall through to their full name (their own family).
+    m = re.match(r"^([A-Za-z]+)_?\d+$", name)
+    if m:
+        return m.group(1)
+    return name
+
+
 def _fmt(ms):
     if ms is None:
         return "-"
@@ -585,6 +614,9 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
     cej_max_solved = 0
     hybrid_max_solved = 0
     nx_max_solved = 0
+    # Families on which NetworkX has already timed out — later (larger)
+    # members are skipped without re-attempting (see `_nx_family_key`).
+    nx_timed_out_families = set()
 
     import sys as _sys
     for idx, (name, graph) in enumerate(graphs, 1):
@@ -655,12 +687,25 @@ def run_benchmarks(timeout_s=60, nx_timeout_s=30):
             hybrid_status = hybrid_err or "WRONG"
 
         # --- NetworkX ---
-        if m > nx_max_solved + 10:
+        # Two give-up rules keep the reference oracle from burning a full
+        # nx_timeout_s on graphs it can't finish:
+        #   1. Per-family: once NetworkX times out on one member of a
+        #      scaling family (K_n, C_n, Cm, …), every later member is
+        #      strictly harder, so skip the rest of that family outright.
+        #   2. Global frontier: don't attempt anything more than 10 edges
+        #      past the largest graph NetworkX has actually solved (guards
+        #      the first member of a family already far beyond its ceiling).
+        nx_fam = _nx_family_key(name)
+        if nx_fam in nx_timed_out_families:
+            nx_ms, nx_result, nx_err = None, None, "FAMILY_TIMEOUT"
+        elif m > nx_max_solved + 10:
             nx_ms, nx_result, nx_err = None, None, "UNSOLVED"
         else:
             nx_ms, nx_result, nx_err = _time_fn(
                 lambda: _tutte_networkx(G_nx), nx_timeout_s
             )
+            if nx_err == _TIMEOUT:
+                nx_timed_out_families.add(nx_fam)
         nx_ok = (nx_result is not None
                  and nx_result.num_spanning_trees() == kirchhoff)
         if nx_ok:

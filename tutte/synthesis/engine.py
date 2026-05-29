@@ -2669,6 +2669,7 @@ class SynthesisEngine(BaseMultigraphSynthesizer):
         tree / bipartite-junction / per-component / hybrid) — each differs only in
         the dispatch fn plus these labels.
         """
+        _log = get_log()
         n, m = graph.node_count(), graph.edge_count()
         _log.record(EventType.CELL_QUOTIENT_DP, "engine",
                     f"{record_label or label}: {n}n {m}e", graph=graph)
