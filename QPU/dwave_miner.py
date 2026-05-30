@@ -211,9 +211,13 @@ class DWaveMiner(BaseMiner):
     # Keep that headroom so the streaming sampler can saturate the
     # D-Wave cloud queue without blocking on Python-side derivation.
     FEEDER_BUFFER_SIZE = 60
-    # QPU is the async-streaming backend: drive the stream on a pump thread
-    # so per-result processing never blocks the cloud pipeline.
+    # QPU is the async-streaming backend: drive the stream in a separate
+    # process so per-result processing never blocks the cloud pipeline.
     STREAMING_PUMP = True
+    # The sampler + feeder live in the stream-driver process (see
+    # QPU/stream_driver.py + build_production_stream); BaseMiner skips the
+    # worker-side feeder and spawns that process instead of a pump thread.
+    DRIVER_OWNS_FEEDER = True
 
     def __init__(
         self,
@@ -310,6 +314,13 @@ class DWaveMiner(BaseMiner):
 
         self.queue_depth = queue_depth
         self.drain_on_stop = drain_on_stop
+        # Connection config for the stream-driver process. The worker-side
+        # miner is built with connect=False (no sampler); BaseMiner's
+        # _start_result_pump forwards these to build_production_stream so the
+        # driver process can construct its own connected DWaveMiner.
+        self.solver_name = solver_name
+        self.region = region
+        self.token = token
         # Operator-tunable overrides for the per-submission cost knobs.
         # Validated lightly here; the D-Wave SDK rejects out-of-range
         # values per-solver with a clear error at first submission.
