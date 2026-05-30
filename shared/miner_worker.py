@@ -190,6 +190,15 @@ def miner_worker_main(
         if op == "shutdown":
             logger.info(f"Shutting down miner {miner.miner_id}")
             stop_event.set()
+            # Reap the persistent QPU stream-driver process (if any) and its
+            # shared ring. The driver is a non-daemon child; without this the
+            # worker's interpreter-exit join would block on it forever.
+            try:
+                close = getattr(miner, "close", None)
+                if callable(close):
+                    close()
+            except Exception as exc:  # noqa: BLE001 — best-effort teardown
+                logger.error("miner.close() during shutdown failed: %s", exc)
             # Wake any drainer blocked on `resp_q.get()`. Without this the
             # parent-side `loop.run_in_executor(None, handle.resp.get)`
             # blocks forever after worker exit (until Python 3.14's executor
