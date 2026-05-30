@@ -374,17 +374,23 @@ def test_mine_work_item_stops_promptly_on_stop_event():
 class _DecayCandidateMiner(_DriverMiner):
     """Driver-path miner whose stream candidate clears only a looser decay.
 
-    ``evaluate_sampleset`` returns a fixed stashed candidate (floor -14500)
-    whenever it receives a sampleset — modelling 'the worker can fully
-    evaluate the reconstructed candidate'. The submit gate (live threshold)
-    decides whether it actually submits.
+    ``evaluate_sampleset`` returns the stashed candidate (floor -14500) on the
+    FIRST sampleset only, then ``None`` — so the candidate is stashed exactly
+    once and must PERSIST in ``top_k`` across later iterations for the submit
+    gate to fire after decay. (If a rule-1 regression cleared the stash on a
+    decay iteration, the candidate would be gone and the gate would never
+    fire — the test would hang→fail, which is the contract.)
     """
 
     def __init__(self):
         super().__init__(factory=_FAKE_CTX)  # infinite fake stream
+        self._eval_calls = 0
 
     def evaluate_sampleset(self, sampleset, requirements, nodes, edges,
                            nonce, salt, *args, **kwargs):
+        self._eval_calls += 1
+        if self._eval_calls > 1:
+            return None  # stash exactly once; candidate must persist
         return MiningResult(
             miner_id=self.miner_id, miner_type=self.miner_type,
             nonce=bytes(nonce) if not isinstance(nonce, bytes) else nonce,
