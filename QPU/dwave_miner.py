@@ -368,9 +368,9 @@ class DWaveMiner(BaseMiner):
     # QPU is the async-streaming backend: drive the stream in a separate
     # process so per-result processing never blocks the cloud pipeline.
     STREAMING_PUMP = True
-    # The sampler + feeder live in the stream-driver process (see
-    # QPU/stream_driver.py + build_production_stream); BaseMiner skips the
-    # worker-side feeder and spawns that process instead of a pump thread.
+    # The sampler + feeder live in the persistent stream-driver process (see
+    # QPU/stream_driver.py + build_persistent_context); BaseMiner skips the
+    # worker-side feeder and _ensure_driver spawns/reuses that process.
     DRIVER_OWNS_FEEDER = True
 
     def __init__(
@@ -468,9 +468,9 @@ class DWaveMiner(BaseMiner):
 
         self.queue_depth = queue_depth
         self.drain_on_stop = drain_on_stop
-        # Connection config for the stream-driver process. The worker-side
-        # miner is built with connect=False (no sampler); BaseMiner's
-        # _start_result_pump forwards these to build_production_stream so the
+        # Connection config for the persistent stream-driver process. The
+        # worker-side miner is built with connect=False (no sampler);
+        # _ensure_driver passes these to build_persistent_context so the
         # driver process can construct its own connected DWaveMiner.
         self.solver_name = solver_name
         self.region = region
