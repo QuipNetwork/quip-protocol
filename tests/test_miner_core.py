@@ -12,6 +12,8 @@ import time
 
 import pytest
 
+from dwave_topologies import DEFAULT_TOPOLOGY
+
 from shared.miner_core import MinerCore
 
 
@@ -23,8 +25,36 @@ def test_miner_core_builds_no_handles_for_empty_config():
         core.close()
 
 
+def test_minercore_injects_topology_into_every_handle_spec():
+    core = MinerCore(
+        node_id="topo-cpu", miners_config={"cpu": {"num_cpus": 2}},
+        topology=DEFAULT_TOPOLOGY,
+    )
+    try:
+        assert len(core.miner_handles) == 2
+        for h in core.miner_handles:
+            assert h.spec["args"]["topology"] is DEFAULT_TOPOLOGY
+    finally:
+        core.close()
+
+
+def test_minercore_requires_topology_when_building_handles():
+    import pytest
+    with pytest.raises(ValueError, match="requires a topology"):
+        MinerCore(node_id="no-topo", miners_config={"cpu": {"num_cpus": 1}})
+
+
+def test_minercore_empty_config_needs_no_topology():
+    core = MinerCore(node_id="empty-ok", miners_config={})
+    try:
+        assert core.miner_handles == []
+    finally:
+        core.close()
+
+
 def test_miner_core_builds_cpu_handles():
-    core = MinerCore(node_id="cpu-test", miners_config={"cpu": {"num_cpus": 2}})
+    core = MinerCore(node_id="cpu-test", miners_config={"cpu": {"num_cpus": 2}},
+                     topology=DEFAULT_TOPOLOGY)
     try:
         assert len(core.miner_handles) == 2
         assert all(h.miner_type == "CPU" for h in core.miner_handles)
@@ -74,7 +104,8 @@ def test_descriptor_falls_back_on_builder_failure():
 
 
 def test_descriptor_default_when_no_builder():
-    core = MinerCore(node_id="d-default", miners_config={"cpu": {"num_cpus": 1}})
+    core = MinerCore(node_id="d-default", miners_config={"cpu": {"num_cpus": 1}},
+                     topology=DEFAULT_TOPOLOGY)
     try:
         desc = core.descriptor()
         assert desc["node_id"] == "d-default"
@@ -113,7 +144,8 @@ def test_get_stats_handles_zero_attempts():
 
 
 def test_close_is_idempotent():
-    core = MinerCore(node_id="close-test", miners_config={"cpu": {"num_cpus": 1}})
+    core = MinerCore(node_id="close-test", miners_config={"cpu": {"num_cpus": 1}},
+                     topology=DEFAULT_TOPOLOGY)
     core.close()
     # Second close on an already-shut-down core is a no-op.
     core.close()
@@ -123,7 +155,8 @@ def test_close_is_idempotent():
 @pytest.mark.timeout(60)
 def test_handles_terminate_on_close():
     """After close(), every worker process is dead (or terminating)."""
-    core = MinerCore(node_id="term-test", miners_config={"cpu": {"num_cpus": 2}})
+    core = MinerCore(node_id="term-test", miners_config={"cpu": {"num_cpus": 2}},
+                     topology=DEFAULT_TOPOLOGY)
     procs = [h.proc for h in core.miner_handles]
     assert all(p.is_alive() for p in procs)
     core.close()
@@ -155,7 +188,8 @@ def test_toml_cpu_round_trip_through_miner_core(tmp_path):
         '[cpu]\nnum_cpus = 4\n'
     )
     backends = load_backend_config(p)
-    core = MinerCore(node_id="toml-cpu", miners_config=backends)
+    core = MinerCore(node_id="toml-cpu", miners_config=backends,
+                     topology=DEFAULT_TOPOLOGY)
     try:
         assert len(core.miner_handles) == 4
         assert all(h.miner_type == "CPU" for h in core.miner_handles)
