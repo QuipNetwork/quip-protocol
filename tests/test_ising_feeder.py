@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import time
+import weakref
 
 import pytest
 
@@ -260,3 +261,64 @@ class TestFixedIsingFeeder:
             assert snap['buffer_size'] == 2
         finally:
             feeder.stop()
+
+
+class TestRandomIsingFeederFinalizer:
+    """Tests for the weakref.finalize pool backstop on RandomIsingFeeder.
+
+    The finalizer ensures concurrent.futures' atexit join is a no-op even
+    when stop() is never called — eliminating the SIGTERM-during-finalization
+    window that produces "Exception ignored in: <module 'threading' ...>" noise.
+    """
+
+    def test_finalizer_alive_after_init(self):
+        """Finalizer is alive immediately after construction."""
+        feeder = _make_feeder(seed=20)
+        try:
+            assert feeder._finalizer.alive
+        finally:
+            feeder.stop()
+
+    def test_stop_detaches_finalizer(self):
+        """stop() detaches the finalizer so the pool isn't double-shutdown."""
+        feeder = _make_feeder(seed=21)
+        feeder.stop()
+        assert not feeder._finalizer.alive, (
+            "stop() must call _finalizer.detach() to cancel the backstop"
+        )
+
+    def test_finalizer_shuts_down_pool(self):
+        """Calling the finalizer directly shuts down the pool.
+
+        After shutdown, submitting new work raises RuntimeError — confirming
+        the pool is closed and the atexit join would be a no-op.
+        """
+        feeder = _make_feeder(seed=22)
+        pool = feeder._pool
+
+        # Manually fire the finalizer (simulates GC without stop()).
+        feeder._finalizer()
+
+        # Pool should be shut down: new submissions must raise.
+        with pytest.raises(RuntimeError):
+            pool.submit(lambda: None)
+
+    def test_finalizer_fires_on_gc_without_stop(self):
+        """Dropping all references triggers the finalizer via GC."""
+        feeder = _make_feeder(seed=23)
+        pool = feeder._pool
+        # Keep a weakref to verify the feeder is actually collected.
+        feeder_ref = weakref.ref(feeder)
+
+        del feeder
+        # Force a GC cycle so CPython's reference counting picks it up.
+        import gc
+        gc.collect()
+
+        # Feeder should be gone.
+        assert feeder_ref() is None, (
+            "Feeder should have been GC-ed after del + gc.collect()"
+        )
+        # Pool should be shut down (finalizer fired during GC).
+        with pytest.raises(RuntimeError):
+            pool.submit(lambda: None)

@@ -11,6 +11,7 @@ import math
 import multiprocessing
 import multiprocessing.synchronize
 import queue
+import sys
 import threading
 import time
 import traceback
@@ -1329,6 +1330,21 @@ class BaseMiner(ABC):
                 f"topology=0x{context.topology_hash.hex()[:16]}... "
                 f"nodes={len(context.nodes)} edges={len(context.edges)}"
             )
+
+    @staticmethod
+    def _graceful_exit() -> None:
+        """Exit the process gracefully, guarding against interpreter finalization.
+
+        SIGTERM handlers that call ``sys.exit(0)`` during interpreter shutdown
+        raise ``SystemExit`` in a context where it cannot propagate, producing
+        the "Exception ignored in: <module 'threading' ...>" noise on stderr.
+        This guard suppresses that by returning early when the interpreter is
+        already finalizing — the process is exiting anyway, so no action is
+        needed.
+        """
+        if sys.is_finalizing():
+            return
+        sys.exit(0)
 
     def _on_sampling_error(
         self,

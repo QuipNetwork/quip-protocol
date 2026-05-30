@@ -24,6 +24,7 @@ import queue
 import random
 import signal as _signal
 import time
+import weakref
 from concurrent.futures import ProcessPoolExecutor
 from typing import Iterator, List, Optional, Sequence
 
@@ -102,6 +103,27 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _shutdown_pool_quietly(pool: ProcessPoolExecutor) -> None:
+    """Best-effort shutdown of a ProcessPoolExecutor from a weakref finalizer.
+
+    Called by ``weakref.finalize`` when a ``RandomIsingFeeder`` is GC-ed or
+    the interpreter exits without ``stop()`` being called.  Must never raise:
+    a finalizer that propagates an exception is silently ignored by the GC but
+    can corrupt interpreter state during shutdown.
+
+    Rationale: ``concurrent.futures`` registers an ``atexit`` hook
+    (``_python_exit``) that joins the management thread of every
+    still-alive executor.  If the feeder isn't ``stop()``-ed the join blocks
+    during interpreter finalization — creating the window where a SIGTERM
+    lands and ``_cleanup_handler``'s ``sys.exit(0)`` raises in a bad context.
+    Shutting down with ``wait=False`` here makes the atexit join a no-op.
+    """
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+
 class RandomIsingFeeder:
     """Keeps a buffer of freshly-derived ``IsingModel``s ready to pop.
 
@@ -153,6 +175,13 @@ class RandomIsingFeeder:
         self._pool = ProcessPoolExecutor(
             max_workers=max_workers,
             mp_context=_SPAWN_CTX,
+        )
+        # Backstop: shut down the pool even if stop() is never called.
+        # weakref.finalize runs at GC time or interpreter-exit, which makes
+        # the concurrent.futures atexit join a no-op (nothing left to join).
+        # stop() detaches this finalizer to avoid double-shutdown.
+        self._finalizer = weakref.finalize(
+            self, _shutdown_pool_quietly, self._pool,
         )
         self._futures: list = []
         self._queue: queue.Queue[IsingModel] = queue.Queue()
@@ -376,6 +405,10 @@ class RandomIsingFeeder:
         )
 
         _kill_workers(pids)
+
+        # Detach the weakref finalizer so it doesn't double-shutdown the
+        # already-closed pool when this feeder is later garbage-collected.
+        self._finalizer.detach()
 
 class FixedIsingFeeder:
     """Cycles through a fixed list of pre-baked ``IsingModel``s forever.

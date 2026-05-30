@@ -55,8 +55,9 @@ class SimulatedAnnealingMiner(BaseMiner):
             if hasattr(self, 'logger'):
                 self.logger.error(f"Error during CPU miner cleanup: {e}")
 
-        # Exit gracefully
-        sys.exit(0)
+        # Exit gracefully — guard against raising SystemExit during
+        # interpreter finalization (would produce "Exception ignored" noise).
+        self._graceful_exit()
 
     def _adapt_mining_params(
         self,
