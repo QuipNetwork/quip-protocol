@@ -69,6 +69,10 @@ def _coalesce_ctl_q(ctx, ctl_q) -> str:
                 latest_switch = cmd
         elif cmd[0] == "threshold":
             latest_threshold = cmd
+    # Apply switch BEFORE threshold: when both target the live generation in
+    # one drain, the threshold update must override the threshold embedded in
+    # the switch tuple (a decay that landed in the same tick as the head
+    # change). Reordering these would let the stale switch-threshold win.
     if latest_switch is not None:
         ctx.apply_command(latest_switch)
     if latest_threshold is not None and (

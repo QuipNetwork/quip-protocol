@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import time
 
 from shared.proc_util import terminate_join
 from shared.shared_sample_ring import SharedSampleRing
@@ -103,6 +104,44 @@ def test_driver_factory_error_yields_none_not_hang():
         assert desc_q.get(timeout=10.0) is None, (
             "factory error did not produce end-of-stream None"
         )
+    finally:
+        stop.set()
+        assert terminate_join(proc, 5.0)
+        ring.close_unlink()
+
+
+def test_driver_switch_mid_stream_advances_generation():
+    """A switch mid-stream advances the descriptor generation; the driver
+    drops the straddler from the old generation (its stale-discard filter)."""
+    ctx = mp.get_context("spawn")
+    ring = SharedSampleRing(slots=4, max_rows=8, max_cols=3)
+    desc_q, ctl_q, stop = ctx.Queue(), ctx.Queue(), ctx.Event()
+    proc = _spawn_driver(
+        ring,
+        desc_q,
+        ctl_q,
+        stop,
+        _FAKE_CTX,
+        {"num_reads": 8, "nodes": [0, 1, 2], "n": 0},  # infinite
+    )
+    ctl_q.put(("switch", 1, b"\x01" * 32, b"\x02" * 32, 0, 8, 80.0))
+    try:
+        first = desc_q.get(timeout=10.0)
+        assert first[6] == 1
+        ring.release(first[0])
+        # Advance to generation 2 mid-stream.
+        ctl_q.put(("switch", 2, b"\x09" * 32, b"\x02" * 32, 0, 8, 80.0))
+        deadline = time.monotonic() + 10.0
+        saw_gen2 = False
+        while time.monotonic() < deadline:
+            item = desc_q.get(timeout=10.0)
+            ring.release(item[0])
+            gen = item[6]
+            assert gen in (1, 2), f"unexpected generation {gen}"
+            if gen == 2:
+                saw_gen2 = True
+                break
+        assert saw_gen2, "descriptors never advanced to the new generation"
     finally:
         stop.set()
         assert terminate_join(proc, 5.0)
