@@ -14,6 +14,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from dwave_topologies import DEFAULT_TOPOLOGY
+
 from shared.miner_core import MinerCore
 from shared.miner_survey import (
     SCHEMA_NAME,
@@ -85,6 +87,7 @@ def test_cpu_core_exposes_capabilities_and_hardware():
     core = MinerCore(
         node_id="quip-miner-cpu",
         miners_config={"cpu": {"num_cpus": 2}},
+        topology=DEFAULT_TOPOLOGY,
     )
     try:
         survey = build_miner_survey(core, _signer())
@@ -100,8 +103,10 @@ def test_cpu_core_exposes_capabilities_and_hardware():
         assert entry["type"] == "CPU"
         assert entry["backend"] == "simulated_annealing"
         assert entry["device"] is None
-        # No topology injected — should be null, not absent.
-        assert entry["topology"] is None
+        # The chain topology now reaches every miner (incl. CPU), so the
+        # survey reports it rather than null.
+        assert entry["topology"] is not None
+        assert entry["topology"]["num_nodes"] == DEFAULT_TOPOLOGY.num_nodes
         # CPU spec has no extra cfg beyond `args`; merged should be a dict.
         assert isinstance(entry["config"], dict)
 
@@ -144,10 +149,11 @@ def test_client_block_is_static():
 def test_topology_metadata_pulled_from_spec_args():
     """When a topology object lives in `spec.args["topology"]`, the
     survey extracts num_nodes / num_edges / solver_name / shape."""
-    core = MinerCore(node_id="quip-miner-topo", miners_config={"cpu": {"num_cpus": 1}})
+    core = MinerCore(node_id="quip-miner-topo", miners_config={"cpu": {"num_cpus": 1}},
+                     topology=DEFAULT_TOPOLOGY)
     try:
-        # Inject after the fact — mirrors what `_inject_topology` does
-        # in `quip_cli._run_concurrent_miner` before MinerCore boots.
+        # Overwrite after the fact — MinerCore stamps args["topology"] at
+        # build time; we replace it with a synthetic one to control the values.
         handle = core.miner_handles[0]
         handle.spec.setdefault("args", {})["topology"] = _fake_topology()
         survey = build_miner_survey(core, _signer())
@@ -168,7 +174,8 @@ def test_topology_metadata_pulled_from_spec_args():
 def test_topology_hash_pulled_from_controller():
     """When a controller with `topology_hash=<bytes>` is supplied, the
     survey renders it as 0x-hex on every handle that carries a topology."""
-    core = MinerCore(node_id="quip-miner-hash", miners_config={"cpu": {"num_cpus": 1}})
+    core = MinerCore(node_id="quip-miner-hash", miners_config={"cpu": {"num_cpus": 1}},
+                     topology=DEFAULT_TOPOLOGY)
     try:
         core.miner_handles[0].spec.setdefault("args", {})["topology"] = _fake_topology()
         controller = SimpleNamespace(topology_hash=bytes.fromhex("ab" * 32))
@@ -182,7 +189,8 @@ def test_topology_hash_pulled_from_controller():
 def test_topology_shape_falls_back_to_mt_attrs():
     """If `properties.topology.shape` is missing/non-list, the builder
     derives the shape list from the topology's `m`/`t` attrs."""
-    core = MinerCore(node_id="quip-miner-shape", miners_config={"cpu": {"num_cpus": 1}})
+    core = MinerCore(node_id="quip-miner-shape", miners_config={"cpu": {"num_cpus": 1}},
+                     topology=DEFAULT_TOPOLOGY)
     try:
         topo = _fake_topology(properties={})
         core.miner_handles[0].spec.setdefault("args", {})["topology"] = topo
@@ -203,7 +211,8 @@ def test_non_jsonable_args_are_filtered_from_config():
     spec.args must not crash the survey or pollute `config` with
     non-serializable entries. Only the `topology` key is allowed to be
     a Python object — and even that one is filtered out of `config`."""
-    core = MinerCore(node_id="quip-miner-junk", miners_config={"cpu": {"num_cpus": 1}})
+    core = MinerCore(node_id="quip-miner-junk", miners_config={"cpu": {"num_cpus": 1}},
+                     topology=DEFAULT_TOPOLOGY)
     try:
         handle = core.miner_handles[0]
         args = handle.spec.setdefault("args", {})
@@ -234,7 +243,8 @@ def test_secret_config_keys_are_redacted():
     `/api/v1/stats`; a D-Wave `token` carried in the spec cfg would leak
     in cleartext. Non-secret keys (solver, num_reads) must still survive.
     """
-    core = MinerCore(node_id="quip-miner-secret", miners_config={"cpu": {"num_cpus": 1}})
+    core = MinerCore(node_id="quip-miner-secret", miners_config={"cpu": {"num_cpus": 1}},
+                     topology=DEFAULT_TOPOLOGY)
     try:
         handle = core.miner_handles[0]
         handle.spec["cfg"] = {
@@ -272,7 +282,8 @@ def test_secret_config_keys_are_redacted():
 
 def test_pow_capability_true_when_handles_present():
     core = MinerCore(
-        node_id="quip-miner-pow", miners_config={"cpu": {"num_cpus": 1}}
+        node_id="quip-miner-pow", miners_config={"cpu": {"num_cpus": 1}},
+        topology=DEFAULT_TOPOLOGY,
     )
     try:
         survey = build_miner_survey(core, _signer())
@@ -285,7 +296,8 @@ def test_miner_types_are_sorted_and_deduplicated():
     """`capabilities.miner_types` must be deterministic — sort it so
     indexers can compare across snapshots without normalizing
     themselves."""
-    core = MinerCore(node_id="quip-miner-sort", miners_config={"cpu": {"num_cpus": 3}})
+    core = MinerCore(node_id="quip-miner-sort", miners_config={"cpu": {"num_cpus": 3}},
+                     topology=DEFAULT_TOPOLOGY)
     try:
         survey = build_miner_survey(core, _signer())
     finally:
@@ -302,7 +314,8 @@ def test_miner_types_are_sorted_and_deduplicated():
 def test_controller_without_topology_hash_attr_handled():
     """A controller object that doesn't expose `topology_hash` (or has
     it set to None) renders the field as null instead of crashing."""
-    core = MinerCore(node_id="quip-miner-noattr", miners_config={"cpu": {"num_cpus": 1}})
+    core = MinerCore(node_id="quip-miner-noattr", miners_config={"cpu": {"num_cpus": 1}},
+                     topology=DEFAULT_TOPOLOGY)
     try:
         core.miner_handles[0].spec.setdefault("args", {})["topology"] = _fake_topology()
         controller = SimpleNamespace()  # no `topology_hash` at all
@@ -314,7 +327,8 @@ def test_controller_without_topology_hash_attr_handled():
 
 @pytest.mark.parametrize("bad_hash", [b"", None])
 def test_controller_with_empty_topology_hash_renders_null(bad_hash):
-    core = MinerCore(node_id="quip-miner-empty-hash", miners_config={"cpu": {"num_cpus": 1}})
+    core = MinerCore(node_id="quip-miner-empty-hash", miners_config={"cpu": {"num_cpus": 1}},
+                     topology=DEFAULT_TOPOLOGY)
     try:
         core.miner_handles[0].spec.setdefault("args", {})["topology"] = _fake_topology()
         controller = SimpleNamespace(topology_hash=bad_hash)

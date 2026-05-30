@@ -153,7 +153,7 @@ def _device(spec: Dict[str, Any], kind: str) -> Optional[str]:
 
 # ----------------------------------------------------------------------
 # Topology info — pulled from the sampler topology object stashed in
-# spec["args"]["topology"] by `_inject_topology` in quip_cli. The object
+# spec["args"]["topology"] by `MinerCore._attach_topology`. The object
 # is a `DWaveTopology`-shaped class (Zephyr / Chimera / Pegasus / JSON
 # hardware), so we duck-type the attributes we expose. The chain-bound
 # `topology_hash` is only available when the controller has one pinned.
