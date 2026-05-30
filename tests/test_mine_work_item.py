@@ -33,6 +33,14 @@ from substrate.types import (
     SubstrateDifficulty,
     SubstrateMiningContext,
 )
+from dwave_topologies.topologies.zephyr import zephyr
+
+# Small Z(2,2) topology (80 nodes, 356 edges) used for the MinerHandle
+# subprocess tests. The full DEFAULT_TOPOLOGY (Advantage2, 4578 nodes) makes
+# each SA batch take tens of seconds, which blows through the cancel-test
+# drain deadline. Z(2,2) keeps individual batches under 0.5 s so
+# stop_event is observed promptly after cancel().
+_WORKER_TOPOLOGY = zephyr(2, 2)
 
 
 _BIN_SPEC = AllowedValueSet((-1000, 1000))
@@ -41,13 +49,18 @@ _TER_SPEC = AllowedValueSet((-1000, 0, 1000))
 
 @pytest.fixture(scope="module")
 def cpu_miner():
-    """Module-scoped CPU SA miner. Creating the SA sampler is expensive
-    (loads the default Zephyr topology) so we keep one instance across all
-    tests in this module."""
+    """Module-scoped CPU SA miner backed by _WORKER_TOPOLOGY (Z(2,2), 80
+    nodes).  Creating the SA sampler is expensive (loads a topology) so we
+    keep one instance across all tests in this module.
+
+    Z(2,2) keeps individual SA batches under ~0.5 s, which matters both for
+    the direct mine_work_item tests (faster loops) and for the MinerHandle
+    cancel test (stop_event observed promptly between batches).
+    """
     # Local imports — keep the test module import-cheap. The SA miner pulls in
     # dimod / dwave-neal which take several hundred ms to import.
     from CPU.sa_miner import SimulatedAnnealingMiner
-    miner = SimulatedAnnealingMiner(miner_id="test")
+    miner = SimulatedAnnealingMiner(miner_id="test", topology=_WORKER_TOPOLOGY)
     yield miner
 
 
@@ -585,7 +598,7 @@ def test_miner_handle_dispatches_mine_work_item(relaxed_context):
     a `MiningResult` comes back via the response queue. Same scaffolding the
     Phase 4 controller will use.
     """
-    spec = {"id": "test-cpu-0", "kind": "cpu", "args": {}}
+    spec = {"id": "test-cpu-0", "kind": "cpu", "args": {"topology": _WORKER_TOPOLOGY}}
     handle = MinerHandle(spec=spec)
     try:
         dispatch_id = handle.mine_work_item(relaxed_context)
@@ -640,7 +653,7 @@ def test_miner_handle_emits_work_item_done_sentinel_on_cancel(relaxed_context):
     resp_q so the controller's cancel→clear→dispatch cycle has an
     observable acknowledgment. Without this the controller would hang on
     `resp_q.get()` after every cancel."""
-    spec = {"id": "test-cpu-cancel", "kind": "cpu", "args": {}}
+    spec = {"id": "test-cpu-cancel", "kind": "cpu", "args": {"topology": _WORKER_TOPOLOGY}}
     handle = MinerHandle(spec=spec)
     try:
         impossibly_hard = SubstrateMiningContext(
@@ -692,7 +705,7 @@ def test_miner_handle_error_sentinel_on_missing_context():
     """`op=mine_work_item` with no `context` key must produce an
     `{"op": "error", ...}` sentinel keyed by miner id. Without this the
     controller cannot distinguish a stuck worker from a malformed request."""
-    spec = {"id": "test-cpu-bad", "kind": "cpu", "args": {}}
+    spec = {"id": "test-cpu-bad", "kind": "cpu", "args": {"topology": _WORKER_TOPOLOGY}}
     handle = MinerHandle(spec=spec)
     try:
         handle.stop_event.clear()
