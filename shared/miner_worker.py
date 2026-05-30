@@ -133,8 +133,9 @@ def build_miner_from_spec(spec: Dict[str, Any]):
             cfg.pop("solver")
         # connect=False: the worker miner owns the budget gate, param
         # adaptation, and dispatch loop but holds NO D-Wave connection. The
-        # single D-Wave connection lives in the stream-driver process, which
-        # build_production_stream builds with the default connect=True.
+        # single D-Wave connection lives in the persistent stream-driver
+        # process built by build_persistent_context (via
+        # BaseMiner._ensure_driver) with the default connect=True.
         return QPU.DWaveMiner(
             miner_id, time_config=time_config, connect=False, **cfg
         )
