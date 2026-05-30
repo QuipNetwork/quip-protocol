@@ -279,6 +279,92 @@ def test_query_by_dispatch_returns_only_matching_attempts(
     assert attempts[0]["dispatch_id"] == 2
 
 
+def test_attempt_logger_resets_reused_dispatch_id_across_processes(
+    tmp_path: Path,
+) -> None:
+    """A fresh AttemptLogger (new worker process after controller restart)
+    must clear a reused dispatch_id's stale artifacts on first use.
+
+    ``dispatch_id`` is a controller-local counter that resets to 0 on
+    restart, so run N+1 reuses ids from run N. The append-only attempts
+    JSONL and the cumulative metadata aggregate would otherwise accrete
+    iterations across runs — breaking the dashboard's iter-as-recency
+    assumption. The first write to a dispatch_id in a new process must
+    start that dispatch's files clean.
+    """
+    def _rec(log: AttemptLogger, did: int, it: int) -> None:
+        log.record(
+            dispatch_id=did, iter_num=it,
+            nonce_hex="0x00", salt_hex="0x00",
+            best_energy_milli=0, num_samples=1,
+            post_processed=False, stored_as_best=False,
+            result_kind="rejected",
+        )
+
+    # Run 1: three attempts under dispatch_id=5, then flush so the
+    # aggregate metadata lands on disk (a real run persists it via
+    # FLUSH_EVERY / stored-submitted events / dispatch-end flush).
+    run1 = AttemptLogger("rig-01", log_dir=tmp_path)
+    for it in (1, 2, 3):
+        _rec(run1, 5, it)
+    run1.flush()
+    assert len(query_by_dispatch("rig-01", 5, log_dir=tmp_path)) == 3
+    assert json.loads(
+        (tmp_path / "5" / "metadata-rig-01.json").read_text()
+    )["n_attempts"] == 3
+
+    # Run 2: a brand-new logger (simulates the restarted worker process)
+    # reuses dispatch_id=5 and records a single attempt.
+    run2 = AttemptLogger("rig-01", log_dir=tmp_path)
+    _rec(run2, 5, 1)
+    run2.flush()
+
+    attempts = query_by_dispatch("rig-01", 5, log_dir=tmp_path)
+    assert len(attempts) == 1, (
+        "reused dispatch_id must not accrete prior-run attempts; "
+        f"got {len(attempts)}"
+    )
+    assert attempts[0]["iter"] == 1
+
+    # The aggregate metadata must reflect only run 2, not 3 + 1 = 4.
+    meta_path = tmp_path / "5" / "metadata-rig-01.json"
+    meta = json.loads(meta_path.read_text())
+    assert meta["n_attempts"] == 1, (
+        f"metadata aggregate must reset on reuse; got {meta['n_attempts']}"
+    )
+
+
+def test_attempt_logger_reset_is_per_miner_not_whole_dispatch_dir(
+    tmp_path: Path,
+) -> None:
+    """Resetting a reused dispatch_id must only clear THIS miner's files —
+    a concurrent miner sharing the same numeric dispatch dir keeps its data.
+    """
+    def _rec(log: AttemptLogger, did: int, it: int) -> None:
+        log.record(
+            dispatch_id=did, iter_num=it,
+            nonce_hex="0x00", salt_hex="0x00",
+            best_energy_milli=0, num_samples=1,
+            post_processed=False, stored_as_best=False,
+            result_kind="rejected",
+        )
+
+    cpu = AttemptLogger("rig-cpu", log_dir=tmp_path)
+    qpu = AttemptLogger("rig-qpu", log_dir=tmp_path)
+    _rec(cpu, 5, 1)
+    _rec(qpu, 5, 1)
+    _rec(qpu, 5, 2)
+
+    # CPU "restarts" and reuses dispatch_id=5 — must not touch QPU's file.
+    cpu2 = AttemptLogger("rig-cpu", log_dir=tmp_path)
+    _rec(cpu2, 5, 1)
+
+    assert len(query_by_dispatch("rig-cpu", 5, log_dir=tmp_path)) == 1
+    assert len(query_by_dispatch("rig-qpu", 5, log_dir=tmp_path)) == 2, (
+        "a sibling miner's attempts in the same dispatch dir must survive"
+    )
+
+
 def test_solution_store_writes_packed_spins(tmp_path: Path) -> None:
     """SolutionStore archives top-5 spin configs per stored attempt."""
     store = SolutionStore("miner-q", log_dir=tmp_path)

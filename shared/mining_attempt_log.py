@@ -175,6 +175,13 @@ class AttemptLogger:
         existing = self._appender_by_dispatch.get(dispatch_id)
         if existing is not None:
             return existing
+        # First touch of this dispatch_id in this process. dispatch_id is a
+        # controller-local counter that resets to 0 on restart, so a fresh
+        # run reuses ids from a prior run; clear the stale artifacts before
+        # the first append so a reused id doesn't accrete iterations across
+        # runs. Within one process the counter is strictly monotonic, so
+        # this fires exactly once per dispatch and never mid-run.
+        self._reset_dispatch_artifacts(dispatch_id)
         path = (
             _dispatch_dir(self.log_dir, dispatch_id)
             / f"attempts-{_safe_filename_part(self.miner_id)}.jsonl"
@@ -182,6 +189,30 @@ class AttemptLogger:
         new = _JsonlAppender(path)
         self._appender_by_dispatch[dispatch_id] = new
         return new
+
+    def _reset_dispatch_artifacts(self, dispatch_id: int) -> None:
+        """Remove this miner's stale per-dispatch artifacts on first use.
+
+        Clears only ``attempts-{miner_id}.jsonl`` and
+        ``metadata-{miner_id}.json`` for this miner — a concurrent miner
+        sharing the same numeric dispatch dir (each handle runs its own
+        dispatch_id counter) keeps its files. Missing files are fine; any
+        other OS error is logged, never raised — clearing must not block
+        mining.
+        """
+        dispatch_dir = _dispatch_dir(self.log_dir, dispatch_id)
+        safe = _safe_filename_part(self.miner_id)
+        for name in (f"attempts-{safe}.jsonl", f"metadata-{safe}.json"):
+            try:
+                (dispatch_dir / name).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "AttemptLogger: could not clear stale %s in dispatch "
+                    "%d: %s", name, dispatch_id, exc,
+                )
 
     def _metadata(self, dispatch_id: int) -> "MetadataLogger":
         existing = self._metadata_by_dispatch.get(dispatch_id)
@@ -342,8 +373,11 @@ class MetadataLogger:
             / f"metadata-{_safe_filename_part(miner_id)}.json"
         )
         self._tmp_path = self._path.with_suffix(".json.tmp")
-        # In-memory snapshot of the aggregate. Loaded lazily from disk
-        # so restarts pick up where we left off within a dispatch.
+        # In-memory snapshot of the aggregate, loaded lazily from disk so a
+        # second reader within the same run (e.g. the controller attaching a
+        # submission) sees the persisted counts. Cross-run reuse of a
+        # dispatch_id does NOT resume prior state: AttemptLogger clears the
+        # stale file on first use (see _reset_dispatch_artifacts).
         self._state: Optional[dict] = None
         self._pending_since_flush = 0
 
