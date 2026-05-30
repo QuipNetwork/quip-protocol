@@ -10,7 +10,9 @@ Layout (one directory per dispatch_id):
         attempts-{miner_id}.jsonl   # append-on-event: one line per annealer return
                                     # Includes solution_meta scalars + submission ref
                                     # on the iter that submitted (if any).
-        metadata-{miner_id}.json    # plain JSON, rewritten on every event:
+        metadata-{miner_id}.json    # plain JSON, batched write (every FLUSH_EVERY
+                                    # attempts, or immediately on stored/submitted/
+                                    # error and at dispatch-end flush()):
                                     # aggregate per (dispatch, miner) — n_attempts,
                                     # n_stored, n_submitted, best_energy_seen, ...
         submission.json             # written when controller submits to chain
@@ -236,9 +238,9 @@ class AttemptLogger:
         ``solution_id`` is set only when this iter resulted in a
         submission; lets ``query_by_solution_id`` back-resolve.
 
-        Side effect: metadata-{miner_id}.json gets rewritten with the
-        updated aggregate (n_attempts, n_stored, n_submitted,
-        best_energy_seen, qpu_time_total_us).
+        Side effect: updates the in-memory dispatch aggregate; written to
+        disk every FLUSH_EVERY attempts or immediately on
+        stored/submitted/error (and at dispatch-end via flush()).
         """
         record = {
             "type": "attempt",
@@ -290,6 +292,17 @@ class AttemptLogger:
                 "AttemptLogger.metadata update failed: %s", exc,
             )
 
+    def flush(self) -> None:
+        """Flush all per-dispatch metadata loggers owned by this worker."""
+        for ml in self._metadata_by_dispatch.values():
+            try:
+                ml.flush()
+            except OSError as exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "AttemptLogger.flush: %s", exc,
+                )
+
 
 # ----------------------------------------------------------------------
 # MetadataLogger — per-dispatch per-miner aggregate (rewritten on update)
@@ -300,10 +313,16 @@ class MetadataLogger:
     """Per-dispatch per-miner aggregate JSON file.
 
     Lives at ``{base}/{dispatch_id}/metadata-{miner_id}.json``. Not a
-    JSONL — it's a single JSON object rewritten on every update. Each
-    rewrite is via tmp-file + os.replace so concurrent readers never
-    see a partial file.
+    JSONL — it's a single JSON object written in batches (see
+    FLUSH_EVERY) — not on every update. Each rewrite is via tmp-file +
+    os.replace so concurrent readers never see a partial file.
     """
+
+    # Flush the aggregate JSON to disk at most once per this many attempts
+    # (plus immediately on stored/submitted/error events and on final
+    # flush()). Rewriting on every rejected attempt was the per-iter floor
+    # on slow mounted volumes.
+    FLUSH_EVERY: int = 25
 
     def __init__(
         self,
@@ -326,6 +345,7 @@ class MetadataLogger:
         # In-memory snapshot of the aggregate. Loaded lazily from disk
         # so restarts pick up where we left off within a dispatch.
         self._state: Optional[dict] = None
+        self._pending_since_flush = 0
 
     def _initial_state(self) -> dict:
         return {
@@ -396,7 +416,22 @@ class MetadataLogger:
             if state.get("first_ts_ns") is None:
                 state["first_ts_ns"] = now
             state["last_ts_ns"] = now
-            self._write_atomic(state)
+            self._pending_since_flush += 1
+            force = result_kind in ("stored", "submitted", "error")
+            if force or self._pending_since_flush >= self.FLUSH_EVERY:
+                self._write_atomic(state)
+                self._pending_since_flush = 0
+
+    def flush(self) -> None:
+        """Write any buffered aggregate state to disk.
+
+        Called at dispatch end so the final counts land even when the last
+        batch hadn't reached FLUSH_EVERY. Idempotent; cheap when clean.
+        """
+        with self._lock:
+            if self._state is not None and self._pending_since_flush:
+                self._write_atomic(self._state)
+                self._pending_since_flush = 0
 
     def attach_submission(self, submission: dict) -> None:
         """Record that this dispatch was submitted (called by controller)."""
@@ -555,12 +590,19 @@ class SubmissionLogger:
         last_proof_block_hash_hex: str,
         outcome: str,
         miner_type: str = "",
+        num_valid: Optional[int] = None,
         extrinsic_hash: Optional[str] = None,
         chain_block_hash: Optional[str] = None,
         chain_block_number: Optional[int] = None,
+        pow_sequence: Optional[int] = None,
         error: Optional[str] = None,
     ) -> None:
         """Write the per-dispatch submission record + index entry.
+
+        ``num_valid`` is the count of unique samples that met the energy
+        threshold at submit time (sourced from ``MiningResult.num_valid``).
+        Written into ``submission.json`` so the dashboard's "Solutions"
+        column has a stable, consistent value.
 
         Also attaches the submission to the winning miner's
         ``metadata-{miner_id}.json`` so dispatch-level queries see the
@@ -577,10 +619,12 @@ class SubmissionLogger:
             "energy_milli": energy_milli,
             "diversity_milli": diversity_milli,
             "threshold_milli": threshold_milli,
+            "num_valid": num_valid,
             "last_proof_block_hash": last_proof_block_hash_hex,
             "extrinsic_hash": extrinsic_hash,
             "chain_block_hash": chain_block_hash,
             "chain_block_number": chain_block_number,
+            "pow_sequence": pow_sequence,
             "outcome": outcome,
             "error": error,
         }

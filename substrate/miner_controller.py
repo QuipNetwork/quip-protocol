@@ -48,6 +48,7 @@ from websocket import WebSocketException
 
 from shared.asyncio_supervise import supervise
 from shared.logging_config import get_logger
+from shared.miner_config import SubmissionConfig
 from shared.miner_survey import build_miner_survey
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
@@ -58,9 +59,17 @@ from shared.telemetry_process import telemetry_main
 from substrate.client import SubstrateClient
 from substrate.pool import ValidatorPool
 from substrate.pool_client import PoolClient
-from substrate.submitter import encode_quantum_proof, submit_proof
+from substrate.difficulty_decay import EnergyCurve, block_when_energy_clears
+from substrate.submitter import (
+    SubmitRetryAction,
+    encode_quantum_proof,
+    submit_proof,
+    submit_with_retry,
+)
 from substrate.types import (
     ExtrinsicReceipt,
+    PowConstants,
+    SubstrateDifficulty,
     SubstrateMiningContext,
 )
 
@@ -216,6 +225,15 @@ _CLOSED_WORK_KEYS_CAP = 16
 # to absorb late results from a few cancelled dispatches without ever
 # losing the immutable mapping for an in-flight one.
 _DISPATCH_CONTEXT_RETENTION = 4
+
+
+# How far ahead (in blocks) the anticipatory predictor looks for the
+# decay block at which a previewed candidate clears. The energy threshold
+# eases one step per ``epoch_length`` blocks, so this caps how many decay
+# steps out we'll wait for a marginal candidate before treating it as
+# "won't clear in any useful window". Sized generously — at the default
+# 6 s blocktime this is ~10 min of look-ahead.
+_ANTICIPATORY_SEARCH_LIMIT = 100
 
 
 # A "work key" uniquely identifies the puzzle a context is mining
@@ -444,6 +462,7 @@ class SubstrateMinerController:
         telemetry_port: int = 8086,
         snapshot_kind: str = "",
         spawn_telemetry_sibling: bool = True,
+        submission_config: Optional[SubmissionConfig] = None,
     ) -> None:
         if not miner_handles:
             raise ValueError(
@@ -469,6 +488,11 @@ class SubstrateMinerController:
         self.core = core
         self.signer = signer
         self.miner_handles = miner_handles
+        # Submission tuning (tip + retry bounds). Defaults reproduce the
+        # pre-tip, no-extra-retry behavior, so an old config or a caller
+        # that omits this keeps working unchanged. Task 6's anticipatory
+        # fire loop reads `max_retries` / `retry_backoff_ms` from here.
+        self.submission_config = submission_config or SubmissionConfig()
         self.topology_hash = topology_hash
         self.on_proof_submitted = on_proof_submitted
         self.stats = ControllerStats()
@@ -516,6 +540,27 @@ class SubstrateMinerController:
         # next monotonic solution_id; record() writes the outcome.
         self._submission_log = SubmissionLogger()
         self._result_queue: asyncio.Queue[_ResultEnvelope] = asyncio.Queue()
+        # Anticipatory-submission preview store (Task 6a primitive).
+        # Latest best-by-floor candidate previewed by a worker, keyed by
+        # WorkKey (last_proof_block_hash, topology_hash). The drainer
+        # routes ``{"op": "preview"}`` messages here WITHOUT creating a
+        # _ResultEnvelope or submitting; Task 6b reads this to predict the
+        # decay-block at which the candidate clears and pre-submit. Keeps
+        # the lowest ``submit_floor_energy`` seen for each work key.
+        self._latest_preview: dict[WorkKey, dict] = {}
+        # Anticipatory-submission state (Task 6b).
+        # ``_pow_constants`` caches the four decay constants
+        # (epoch_length + curve c-triple) for the session — they only
+        # change with a runtime upgrade, so a single RPC at first use
+        # suffices. ``_base_difficulty_by_key`` caches the UNDECAYED
+        # ``QuantumPow.Difficulty`` baseline per work key (it only changes
+        # when a proof wins = a new work key), and ``_anticipatory_fired``
+        # records work keys whose preview the controller has already
+        # SUCCESS-submitted (or is mid-fire on) so the worker's later
+        # returned result for the same key is treated as a no-op.
+        self._pow_constants: Optional[PowConstants] = None
+        self._base_difficulty_by_key: dict[WorkKey, SubstrateDifficulty] = {}
+        self._anticipatory_fired: set[WorkKey] = set()
         # Per-handle done-sentinel queue. The worker emits
         # `{"op": "work_item_done"}` when its mining loop exits with no
         # result; the drainer pushes that into the handle's queue and
@@ -929,8 +974,33 @@ class SubstrateMinerController:
 
         new_work_key = (ctx.last_proof_block_hash, ctx.topology_hash)
 
+        # Work-key rollover: a new round started. Evict any preview +
+        # anticipatory state bound to a *different* key so we never act on
+        # a dead round's candidate, and so ``_latest_preview`` doesn't grow
+        # unbounded (6a left it unpruned). Done before the closed/same-key
+        # short-circuits so the eviction happens even on heads we otherwise
+        # skip dispatch for.
+        if (
+            self._current_work_key is not None
+            and new_work_key != self._current_work_key
+        ):
+            self._evict_anticipatory_state(self._current_work_key)
+
         # 5. Closed-work-key: we already won this round.
         if new_work_key in self._closed_work_keys:
+            return
+
+        # Anticipatory submission (Task 6b): if a worker previewed a
+        # best-by-floor candidate for this work key, predict the decay
+        # block at which it clears and fire at B*-1. Runs on every head for
+        # the active key — BEFORE the same-key short-circuit below — so it
+        # drives even when ``_pre_mine_setup`` paced the worker (the
+        # preview was captured before pacing) and the worker is idle. The
+        # fire path marks the work key closed on SUCCESS, so the
+        # closed-work-key guard above absorbs subsequent heads.
+        await self._maybe_anticipatory_fire(ctx, new_work_key)
+        if new_work_key in self._closed_work_keys:
+            # A SUCCESS fire just closed the round; don't also dispatch.
             return
 
         # 6. Same-key short-circuit: mining already in progress.
@@ -1003,6 +1073,23 @@ class SubstrateMinerController:
             )
             return
 
+        # De-dup with the anticipatory path: if the controller has already
+        # SUCCESS-submitted (or is mid-fire on) this work key via the
+        # preview-driven fire loop, the worker's own returned result is a
+        # confirmation, not a new submission. Drop it without a second
+        # submit_proof. (The SUCCESS case also lands in _closed_work_keys
+        # above; this catches the window where a fire is in progress but
+        # the key isn't closed yet.)
+        if envelope_key in self._anticipatory_fired:
+            self.stats.duplicate_result_drops += 1
+            logger.info(
+                "dropping result from %s: work_key already handled by "
+                "anticipatory fire (last_proof_block_hash=0x%s...)",
+                envelope.handle_id,
+                envelope.context.last_proof_block_hash.hex()[:16],
+            )
+            return
+
         # Drop results produced against a stale context. The controller
         # already moved on to a new round; the chain would reject this
         # proof. topology_hash is included so a governance call that
@@ -1051,6 +1138,7 @@ class SubstrateMinerController:
                 self.signer,
                 envelope.result,
                 envelope.context,
+                tip=self.submission_config.tip_plancks,
             )
         except Exception as exc:  # noqa: BLE001 — surface RPC errors to logs
             self.stats.submission_errors += 1
@@ -1060,6 +1148,7 @@ class SubstrateMinerController:
                 envelope.handle_id,
                 exc,
             )
+            pow_seq_rpc_err = await self._query_proofs_submitted_safe()
             self._submission_log.record(
                 solution_id=solution_id,
                 miner_id=envelope.handle_id,
@@ -1070,6 +1159,8 @@ class SubstrateMinerController:
                 threshold_milli=snapshot_threshold_milli,
                 last_proof_block_hash_hex=last_proof_hex,
                 outcome="chain_error",
+                num_valid=envelope.result.num_valid,
+                pow_sequence=pow_seq_rpc_err,
                 error=f"{type(exc).__name__}: {exc}",
             )
             return
@@ -1091,8 +1182,12 @@ class SubstrateMinerController:
             # this exact context. Persistent failures stay visible via
             # stats.proofs_unverified.
             verified = await self._verify_proof_recorded(envelope)
-            if verified is False:
+            # verified >= 0  → won, value is the PoW block number
+            # verified < 0   → mismatch (-1 sentinel)
+            # verified is None → RPC failed, inconclusive
+            if verified is not None and verified < 0:
                 self.stats.proofs_unverified += 1
+                pow_seq_mismatch = await self._query_proofs_submitted_safe()
                 self._submission_log.record(
                     solution_id=solution_id,
                     miner_id=envelope.handle_id,
@@ -1103,8 +1198,10 @@ class SubstrateMinerController:
                     threshold_milli=snapshot_threshold_milli,
                     last_proof_block_hash_hex=last_proof_hex,
                     outcome="chain_error",
+                    num_valid=envelope.result.num_valid,
                     extrinsic_hash=receipt.extrinsic_hash,
                     chain_block_hash=receipt.block_hash,
+                    pow_sequence=pow_seq_mismatch,
                     error="receipt OK but proof not recorded by chain",
                 )
                 # Re-dispatch immediately on the same context. The
@@ -1220,6 +1317,13 @@ class SubstrateMinerController:
                 accepted_block_number,
                 self.signer.ss58_address(),
             )
+            # Use the verify-path's LastProofBlock as the authoritative won
+            # block number when available (verified >= 0). Fall back to the
+            # receipt-derived accepted_block_number when verify returned None
+            # (inconclusive RPC failure).
+            won_block_number: Optional[int] = (
+                verified if (verified is not None and verified >= 0) else None
+            )
             self._submission_log.record(
                 solution_id=solution_id,
                 miner_id=envelope.handle_id,
@@ -1230,9 +1334,11 @@ class SubstrateMinerController:
                 threshold_milli=snapshot_threshold_milli,
                 last_proof_block_hash_hex=last_proof_hex,
                 outcome="submitted_inblock",
+                num_valid=envelope.result.num_valid,
                 extrinsic_hash=receipt.extrinsic_hash,
                 chain_block_hash=receipt.block_hash,
-                chain_block_number=accepted_block_number,
+                chain_block_number=won_block_number if won_block_number is not None
+                    else accepted_block_number,
             )
             if self.core is not None:
                 self.core.record_result(
@@ -1256,6 +1362,7 @@ class SubstrateMinerController:
                 receipt.error,
                 receipt.extrinsic_hash,
             )
+            pow_seq_stale = await self._query_proofs_submitted_safe()
             self._submission_log.record(
                 solution_id=solution_id,
                 miner_id=envelope.handle_id,
@@ -1266,12 +1373,15 @@ class SubstrateMinerController:
                 threshold_milli=snapshot_threshold_milli,
                 last_proof_block_hash_hex=last_proof_hex,
                 outcome="rejected_stale",
+                num_valid=envelope.result.num_valid,
                 extrinsic_hash=receipt.extrinsic_hash,
+                pow_sequence=pow_seq_stale,
                 error=str(receipt.error or ""),
             )
         else:  # FATAL
             self.stats.submission_errors += 1
             self.stats.last_submission_error = str(receipt.error or "")
+            pow_seq_fatal = await self._query_proofs_submitted_safe()
             self._submission_log.record(
                 solution_id=solution_id,
                 miner_id=envelope.handle_id,
@@ -1282,7 +1392,9 @@ class SubstrateMinerController:
                 threshold_milli=snapshot_threshold_milli,
                 last_proof_block_hash_hex=last_proof_hex,
                 outcome="chain_error",
+                num_valid=envelope.result.num_valid,
                 extrinsic_hash=receipt.extrinsic_hash,
+                pow_sequence=pow_seq_fatal,
                 error=str(receipt.error or ""),
             )
             raise RuntimeError(
@@ -1355,20 +1467,35 @@ class SubstrateMinerController:
             if got is None or got == dispatch_id:
                 return
 
-    async def _verify_proof_recorded(self, envelope: _ResultEnvelope) -> Optional[bool]:
+    async def _query_proofs_submitted_safe(self) -> Optional[int]:
+        """Return ``QuantumPow.Miners[self.signer].proofs_submitted``, or None.
+
+        Best-effort — swallows all exceptions so callers on the hot submit
+        path are never blocked by a transient RPC failure. Returns None when
+        the miner is unregistered, when the chain is unreachable, or on any
+        other error.
+        """
+        try:
+            return await self.pool_client.query_proofs_submitted(
+                self.signer.account_id_bytes()
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _verify_proof_recorded(self, envelope: _ResultEnvelope) -> Optional[int]:
         """Confirm the runtime recorded this miner's proof on chain.
 
         Returns:
-          - ``True`` if ``QuantumPow.LastProofBlock`` resolves to a
-            ``winning_solution`` whose ``miner`` and ``nonce`` match the
-            envelope's submission.
-          - ``False`` if a winning_solution was returned but does NOT
-            match us (someone else won this round, or the chain rolled
-            back our submission silently).
-          - ``None`` if the verification RPC itself failed — caller
-            should treat as inconclusive and proceed with closing the
-            work key (the alternative is a submission-storm loop, which
-            is worse than a single false-positive close).
+          - A non-negative ``int`` (the won PoW block number, i.e.
+            ``QuantumPow.LastProofBlock``) if the winning solution at that
+            block matches our miner address and nonce.
+          - ``-1`` if a winning solution was returned but does NOT match us
+            (someone else won this round, or the chain rolled back our
+            submission silently). Use ``< 0`` to test for this case.
+          - ``None`` if the verification RPC itself failed — caller should
+            treat as inconclusive and proceed with closing the work key
+            (the alternative is a submission-storm loop, which is worse than
+            a single false-positive close).
         """
         try:
             last_block = await self.pool_client.query_last_proof_block_number()
@@ -1393,7 +1520,7 @@ class SubstrateMinerController:
                 "chain reported LastProofBlock but no winning solution",
                 last_block,
             )
-            return False
+            return -1
         # `winning.solution.miner` is the chain's AccountId32 of the
         # submitter — that's the raw 32-byte pubkey, NOT the
         # blake2_256-hashed canonical_miner we put into the snapshot
@@ -1404,7 +1531,7 @@ class SubstrateMinerController:
         actual_miner = bytes(winning.solution.miner)
         actual_nonce = bytes(winning.nonce)
         if actual_miner == expected_miner and actual_nonce == expected_nonce:
-            return True
+            return last_block
         logger.warning(
             "post-OK verify mismatch at block %d: "
             "expected miner=0x%s... nonce=0x%s..., "
@@ -1415,7 +1542,7 @@ class SubstrateMinerController:
             actual_miner.hex()[:16],
             actual_nonce.hex()[:16],
         )
-        return False
+        return -1
 
     def _mark_work_key_closed(
         self, key: WorkKey, record: ClosedWorkRecord
@@ -1479,6 +1606,504 @@ class SubstrateMinerController:
         ]
         for key in stale:
             self._dispatch_contexts.pop(key, None)
+
+    def _store_preview(self, handle: MinerHandle, msg: dict) -> None:
+        """Stash a worker best-candidate preview keyed by work key.
+
+        Resolves the preview's ``dispatch_id`` to the immutable context it
+        was dispatched against (so previews from a stale dispatch land
+        under the right work key), then keeps the lowest-floor preview per
+        work key. Pure storage — no submission, no _ResultEnvelope. Task 6b
+        reads ``self._latest_preview`` to drive prediction/firing.
+        """
+        dispatch_id = msg.get("dispatch_id")
+        data = msg.get("data")
+        if not isinstance(data, dict):
+            logger.warning(
+                "preview from %s ignored: malformed data (type=%s)",
+                handle.miner_id,
+                type(data).__name__,
+            )
+            return
+        context = self._dispatch_contexts.get((handle.miner_id, dispatch_id))
+        if context is None:
+            logger.debug(
+                "preview from %s dropped: no context for dispatch_id=%s",
+                handle.miner_id,
+                dispatch_id,
+            )
+            return
+        key = _work_key(context)
+        # ``data`` already carries ``dispatch_id`` (the worker echoes it in
+        # the payload), so we don't repeat it here — ``**data`` provides it.
+        entry = {
+            "handle_id": handle.miner_id,
+            "context": context,
+            **data,
+        }
+        prev = self._latest_preview.get(key)
+        # Keep the lowest (best) submit_floor_energy seen for this work
+        # key. Workers already throttle to strict improvements, but two
+        # handles can preview the same key; this picks the better one.
+        if prev is not None:
+            prev_floor = prev.get("submit_floor_energy")
+            new_floor = entry.get("submit_floor_energy")
+            if (
+                prev_floor is not None
+                and new_floor is not None
+                and new_floor >= prev_floor
+            ):
+                return
+        self._latest_preview[key] = entry
+
+    # ------------------------------------------------------------------
+    # Anticipatory submission (Task 6b)
+    # ------------------------------------------------------------------
+
+    def _evict_anticipatory_state(self, key: WorkKey) -> None:
+        """Drop all preview + fire state bound to a closed work key.
+
+        Called on work-key rollover (a new round) and on STOP_* fire
+        outcomes. Keeps ``_latest_preview`` from growing unbounded and
+        guarantees we never act on a dead round's candidate.
+        """
+        self._latest_preview.pop(key, None)
+        self._base_difficulty_by_key.pop(key, None)
+        self._anticipatory_fired.discard(key)
+
+    async def _anticipatory_inputs(
+        self, ctx: SubstrateMiningContext, key: WorkKey
+    ) -> Optional[Tuple[SubstrateDifficulty, int, PowConstants, EnergyCurve]]:
+        """Gather + cache the decay-predictor inputs for ``key``.
+
+        Returns ``(base_difficulty, last_proof_block, constants, curve)``
+        or ``None`` if any chain read fails (best-effort — a transient RPC
+        failure must not crash the head loop; the next head retries).
+
+        ``constants`` (epoch_length + curve c-triple) are session-cached;
+        ``base_difficulty`` is cached per work key because it only changes
+        when a proof wins (a new key). ``last_proof_block`` is re-read each
+        call — cheap, and it's the genesis sentinel that gates decay.
+        """
+        try:
+            if self._pow_constants is None:
+                self._pow_constants = await self.pool_client.query_pow_constants()
+            constants = self._pow_constants
+            if constants is None:
+                return None
+            base = self._base_difficulty_by_key.get(key)
+            if base is None:
+                base = await self.pool_client.query_difficulty()
+                if base is None:
+                    return None
+                self._base_difficulty_by_key[key] = base
+            last_proof_block = await self.pool_client.query_last_proof_block_number()
+        except Exception as exc:  # noqa: BLE001 — best-effort on hot path
+            logger.warning(
+                "anticipatory: chain read for predictor inputs failed "
+                "(%s: %s); skipping this head",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        if last_proof_block is None:
+            last_proof_block = 0
+        curve = EnergyCurve.from_topology(
+            num_nodes=len(ctx.nodes),
+            num_edges=len(ctx.edges),
+            c_easy_milli=constants.curve_c_easy_milli,
+            c_knee_milli=constants.curve_c_knee_milli,
+            c_hard_milli=constants.curve_c_hard_milli,
+        )
+        return base, int(last_proof_block), constants, curve
+
+    async def _maybe_anticipatory_fire(
+        self, ctx: SubstrateMiningContext, key: WorkKey
+    ) -> None:
+        """Predict the decay block for the active preview and fire at B*-1.
+
+        Drives the controller-side anticipatory submission:
+
+        1. Look up the best-by-floor preview stored for ``key``. No preview
+           → nothing to do.
+        2. Predict ``B*`` — the first block at which the candidate's floor
+           clears the (decayed) chain threshold — via the local decay
+           predictor. ``None`` (won't clear within the horizon) → wait.
+        3. Once the head reached ``B* - 1``, fire ``submit_with_retry`` and
+           branch on the typed action.
+
+        Best-effort: any unexpected error is logged and swallowed so a
+        preview hiccup never tears down the head loop.
+        """
+        preview = self._latest_preview.get(key)
+        if preview is None:
+            return
+        # Already SUCCESS-fired / mid-fire on this key — don't re-enter.
+        if key in self._anticipatory_fired or key in self._closed_work_keys:
+            return
+
+        inputs = await self._anticipatory_inputs(ctx, key)
+        if inputs is None:
+            return
+        base, last_proof_block, constants, curve = inputs
+
+        # The candidate's chain-equivalent floor (worst submitted solution),
+        # in milli. The chain gates strictly: clears when the live
+        # max_energy_milli > floor_energy_milli.
+        floor = preview.get("submit_floor_energy")
+        if floor is None:
+            return
+        floor_energy_milli = int(float(floor) * 1000)
+
+        b_star = block_when_energy_clears(
+            floor_energy_milli,
+            int(ctx.block_number),
+            base_difficulty=base,
+            last_proof_block=last_proof_block,
+            epoch_length=int(constants.epoch_length),
+            curve=curve,
+            search_limit=_ANTICIPATORY_SEARCH_LIMIT,
+        )
+        if b_star is None:
+            # Won't clear within the look-ahead window; wait for more decay.
+            return
+        if int(ctx.block_number) < b_star - 1:
+            # Too early — the floor hasn't (nearly) cleared yet.
+            return
+
+        await self._fire_preview(ctx, key, preview, b_star)
+
+    async def _fire_preview(
+        self,
+        ctx: SubstrateMiningContext,
+        key: WorkKey,
+        preview: dict,
+        b_star: int,
+    ) -> None:
+        """Build the candidate proof from a preview and submit-with-retry.
+
+        Branches on the typed :class:`SubmitRetryAction`:
+          - ``SUCCESS``  → verify + record + mark key closed (stop firing).
+          - ``RETRY``    → keep the preview; a later head fires again.
+          - ``STOP_ROUND_STALE`` → evict preview + pending state (dead round).
+          - ``STOP_FATAL``       → discard the candidate (await a better preview).
+        """
+        result = self._result_from_preview(ctx, preview)
+        if result is None:
+            return
+        # Mark mid-fire BEFORE awaiting so a worker result that lands during
+        # the submit round-trip is de-duped (treated as confirmation).
+        self._anticipatory_fired.add(key)
+        handle_id = str(preview.get("handle_id", "anticipatory"))
+        logger.info(
+            "anticipatory fire: work_key last_proof=0x%s... block=%d B*=%d "
+            "floor=%.4f handle=%s",
+            ctx.last_proof_block_hash.hex()[:16],
+            ctx.block_number,
+            b_star,
+            float(preview.get("submit_floor_energy", 0.0)),
+            handle_id,
+        )
+        submit_result = await submit_with_retry(
+            self.build_client,
+            self.pool_client,
+            self.signer,
+            result,
+            ctx,
+            tip=self.submission_config.tip_plancks,
+            max_retries=self.submission_config.max_retries,
+            retry_backoff_ms=self.submission_config.retry_backoff_ms,
+        )
+
+        if submit_result.action is SubmitRetryAction.SUCCESS:
+            await self._record_anticipatory_success(
+                ctx, key, preview, result,
+                handle_id=handle_id, receipt=submit_result.receipt,
+            )
+            return
+        if submit_result.action is SubmitRetryAction.RETRY:
+            # Retries exhausted this fire only. Keep the preview and clear
+            # the mid-fire mark so a later head (decay only eases further)
+            # can fire again. Do NOT abandon.
+            self._anticipatory_fired.discard(key)
+            logger.info(
+                "anticipatory fire RETRY-exhausted for work_key 0x%s... "
+                "(attempts=%d, error=%s); will retry on a later head",
+                ctx.last_proof_block_hash.hex()[:16],
+                submit_result.attempts,
+                submit_result.error,
+            )
+            return
+        if submit_result.action is SubmitRetryAction.STOP_ROUND_STALE:
+            # Nonce bound to a round that advanced — the candidate is dead.
+            self.stats.stale_drops += 1
+            # Audit parity with _handle_result's STALE path: write a
+            # rejected_stale row (with chain-derived Sol#) so anticipatory
+            # stale drops are visible in the submission log, then evict.
+            await self._record_anticipatory_stale(
+                ctx, result, preview, error=submit_result.error,
+            )
+            logger.info(
+                "anticipatory fire STOP_ROUND_STALE for work_key 0x%s... "
+                "(error=%s); discarding preview + pending state",
+                ctx.last_proof_block_hash.hex()[:16],
+                submit_result.error,
+            )
+            self._evict_anticipatory_state(key)
+            return
+        # STOP_FATAL — this candidate is genuinely bad; discard it and wait
+        # for a better preview to supersede it.
+        self.stats.submission_errors += 1
+        self.stats.last_submission_error = submit_result.error
+        logger.warning(
+            "anticipatory fire STOP_FATAL for work_key 0x%s... (error=%s); "
+            "discarding candidate, awaiting a better preview",
+            ctx.last_proof_block_hash.hex()[:16],
+            submit_result.error,
+        )
+        self._evict_anticipatory_state(key)
+
+    async def _record_anticipatory_stale(
+        self,
+        ctx: SubstrateMiningContext,
+        result: MiningResult,
+        preview: dict,
+        *,
+        error: Optional[str],
+    ) -> None:
+        """Write a ``rejected_stale`` submission-log row for a STOP_ROUND_STALE fire.
+
+        Mirrors ``_handle_result``'s STALE path so anticipatory stale drops
+        are visible in the audit log (with the chain-derived Sol# from a
+        best-effort ``proofs_submitted`` read), not just bumped in stats.
+        ``miner_type`` is the real source backend carried through the preview.
+        """
+        pow_seq_stale = await self._query_proofs_submitted_safe()
+        self._submission_log.record(
+            solution_id=self._submission_log.assign_id(),
+            miner_id=str(preview.get("handle_id", "anticipatory")),
+            miner_type=result.miner_type,
+            dispatch_id=int(preview.get("dispatch_id", 0) or 0),
+            energy_milli=int(float(preview.get("energy", 0.0)) * 1000),
+            diversity_milli=int(float(preview.get("diversity", 0.0)) * 1000),
+            threshold_milli=int(ctx.difficulty.max_energy_milli),
+            last_proof_block_hash_hex="0x" + ctx.last_proof_block_hash.hex(),
+            outcome="rejected_stale",
+            num_valid=int(preview.get("num_valid", 0)),
+            pow_sequence=pow_seq_stale,
+            error=str(error or ""),
+        )
+
+    def _result_from_preview(
+        self, ctx: SubstrateMiningContext, preview: dict
+    ) -> Optional[MiningResult]:
+        """Reconstruct a ``MiningResult`` from a stored preview entry.
+
+        The preview carries the submission-load-bearing fields the worker
+        emitted (miner_type / nonce / salt / solutions / energy / num_valid /
+        diversity); the remaining ``MiningResult`` fields are display-only and
+        filled with neutral defaults. ``miner_type`` is the real source
+        backend (cpu/gpu/qpu) so per-backend dashboard attribution stays
+        accurate on the anticipatory path. Returns ``None`` on a malformed
+        preview (logged) so the fire path degrades to a no-op rather than
+        crashing.
+        """
+        try:
+            return MiningResult(
+                miner_id=str(preview.get("handle_id", "anticipatory")),
+                miner_type=str(preview.get("miner_type", "UNKNOWN")),
+                nonce=preview["nonce"],
+                salt=preview["salt"],
+                timestamp=0,
+                prev_timestamp=0,
+                solutions=preview["solutions"],
+                energy=float(preview.get("energy", 0.0)),
+                diversity=float(preview.get("diversity", 0.0)),
+                num_valid=int(preview.get("num_valid", 0)),
+                mining_time=0,
+                node_list=list(ctx.nodes),
+                edge_list=list(ctx.edges),
+                submit_floor_energy=preview.get("submit_floor_energy"),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning(
+                "anticipatory: malformed preview for work_key 0x%s... "
+                "(%s: %s); skipping fire",
+                ctx.last_proof_block_hash.hex()[:16],
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    async def _resolve_accepted_block(
+        self, receipt_block: Optional[str]
+    ) -> Tuple[bytes, int]:
+        """Resolve a receipt's block hash → ``(hash_bytes, block_number)``.
+
+        Best-effort, mirroring the OK branch of ``_handle_result``: a
+        failure to decode or look up the number falls back to
+        ``(b"", self._highest_handled_block + 1)`` — correct in the common
+        case (we won at/just past the last processed head) and the
+        subscription re-converges within a head or two.
+        """
+        accepted_block_number = self._highest_handled_block + 1
+        accepted_block_hash = b""
+        if not receipt_block:
+            return accepted_block_hash, accepted_block_number
+        try:
+            accepted_block_hash = bytes.fromhex(
+                receipt_block[2:]
+                if receipt_block.startswith("0x")
+                else receipt_block
+            )
+            accepted_block_number = await self.pool_client.get_block_number(
+                at=accepted_block_hash
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "anticipatory: could not resolve accepted block number "
+                "for receipt block=%s (%s: %s); using fallback=%d",
+                receipt_block,
+                type(exc).__name__,
+                exc,
+                accepted_block_number,
+            )
+        return accepted_block_hash, accepted_block_number
+
+    async def _record_anticipatory_verify_fail(
+        self,
+        ctx: SubstrateMiningContext,
+        key: WorkKey,
+        log_common: dict,
+        *,
+        extrinsic_hash: Optional[str],
+        receipt_block: Optional[str],
+    ) -> None:
+        """Handle an anticipatory fire that got receipt OK but failed verify.
+
+        Mirrors ``_handle_result``'s verified-False path: bump
+        ``proofs_unverified``, clear the mid-fire mark (but keep the preview
+        + work key open so the next head re-fires), and write a
+        ``chain_error`` submission-log row so the failure is visible rather
+        than silently dropped.
+        """
+        self.stats.proofs_unverified += 1
+        self._anticipatory_fired.discard(key)
+        pow_seq_mismatch = await self._query_proofs_submitted_safe()
+        self._submission_log.record(
+            **log_common,
+            outcome="chain_error",
+            extrinsic_hash=extrinsic_hash,
+            chain_block_hash=receipt_block,
+            pow_sequence=pow_seq_mismatch,
+            error="receipt OK but proof not recorded by chain",
+        )
+        logger.warning(
+            "anticipatory fire receipt OK but verification failed for "
+            "work_key 0x%s... (extrinsic=%s); NOT closing key",
+            ctx.last_proof_block_hash.hex()[:16],
+            extrinsic_hash,
+        )
+
+    async def _record_anticipatory_success(
+        self,
+        ctx: SubstrateMiningContext,
+        key: WorkKey,
+        preview: dict,
+        result: MiningResult,
+        *,
+        handle_id: str,
+        receipt: Optional[ExtrinsicReceipt],
+    ) -> None:
+        """Verify, record, and close a work key after a SUCCESS fire.
+
+        ``result`` is the candidate proof already reconstructed (and
+        validated non-``None``) by :meth:`_fire_preview`. Mirrors the OK
+        branch of ``_handle_result``: run the post-OK proof-recorded verify,
+        write a submission-log row (with num_valid + chain-derived Sol#),
+        bump counters, mark the work key closed so sibling/worker results
+        for it become no-ops, and cancel siblings.
+        """
+        envelope = _ResultEnvelope(
+            result=result,
+            context=ctx,
+            handle_id=handle_id,
+            dispatch_id=int(preview.get("dispatch_id", 0) or 0),
+        )
+        solution_id = self._submission_log.assign_id()
+        # Shared submission-log fields for both the success and verify-fail
+        # rows — keeps the two record() calls in sync.
+        log_common = {
+            "solution_id": solution_id,
+            "miner_id": handle_id,
+            # Real source backend (cpu/gpu/qpu) carried through the preview,
+            # so per-backend dashboard attribution stays accurate — NOT the
+            # "anticipatory" path marker.
+            "miner_type": result.miner_type,
+            "dispatch_id": int(preview.get("dispatch_id", 0) or 0),
+            "energy_milli": int(float(preview.get("energy", 0.0)) * 1000),
+            "diversity_milli": int(float(preview.get("diversity", 0.0)) * 1000),
+            "threshold_milli": int(ctx.difficulty.max_energy_milli),
+            "last_proof_block_hash_hex": "0x" + ctx.last_proof_block_hash.hex(),
+            "num_valid": int(preview.get("num_valid", 0)),
+        }
+        receipt_block = receipt.block_hash if receipt is not None else None
+        extrinsic_hash = receipt.extrinsic_hash if receipt is not None else None
+
+        verified = await self._verify_proof_recorded(envelope)
+        # verified < 0 → chain recorded a different proof; treat as not-won.
+        if verified is not None and verified < 0:
+            await self._record_anticipatory_verify_fail(
+                ctx, key, log_common,
+                extrinsic_hash=extrinsic_hash,
+                receipt_block=receipt_block,
+            )
+            return
+
+        self.stats.proofs_submitted += 1
+        accepted_block_hash, accepted_block_number = (
+            await self._resolve_accepted_block(receipt_block)
+        )
+        record = ClosedWorkRecord(
+            accepted_block_hash=accepted_block_hash,
+            accepted_block_number=accepted_block_number,
+            closed_at_monotonic=time.monotonic(),
+        )
+        self._mark_work_key_closed(key, record)
+        self._cancel_siblings_for_won_work(handle_id)
+        won_block_number: Optional[int] = (
+            verified if (verified is not None and verified >= 0) else None
+        )
+        self._submission_log.record(
+            **log_common,
+            outcome="submitted_inblock",
+            extrinsic_hash=extrinsic_hash,
+            chain_block_hash=receipt_block,
+            chain_block_number=won_block_number
+            if won_block_number is not None
+            else accepted_block_number,
+        )
+        if self.core is not None:
+            self.core.record_result(
+                winning_miner_id=handle_id,
+                mining_time=0.0,
+            )
+        logger.info(
+            "anticipatory fire accepted: extrinsic=%s block=%s number=%d",
+            receipt.extrinsic_hash if receipt is not None else None,
+            receipt_block,
+            accepted_block_number,
+        )
+        if self.on_proof_submitted is not None and receipt is not None:
+            try:
+                await self.on_proof_submitted(receipt, ctx)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "on_proof_submitted callback raised (proof was submitted): "
+                    "%s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
 
     # ------------------------------------------------------------------
     # Background tasks
@@ -1598,6 +2223,13 @@ class SubstrateMinerController:
                 if handle._active_dispatch_id == err_dispatch_id:
                     handle._active_dispatch_id = 0
                 self._done_queues[handle.miner_id].put_nowait(err_dispatch_id)
+            elif isinstance(msg, dict) and msg.get("op") == "preview":
+                # Anticipatory-submission preview (Task 6a). Stash the
+                # worker's latest best-by-floor candidate keyed by the
+                # work key it was dispatched against. Do NOT build a
+                # _ResultEnvelope and do NOT submit — that's Task 6b's
+                # job; this drainer only delivers the primitive.
+                self._store_preview(handle, msg)
             elif isinstance(msg, dict) and msg.get("op") == "stats":
                 # Stats responses are pulled directly by callers of
                 # handle.get_stats(); if one lands here it just means

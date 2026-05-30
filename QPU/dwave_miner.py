@@ -67,11 +67,70 @@ def _shift_energies(sampleset: dimod.SampleSet, offset: float) -> dimod.SampleSe
     )
 
 
+# Default interval between repeated pacing log lines (seconds).
+_PACING_LOG_INTERVAL = 60.0
+
+
+class _PacingRateLimiter:
+    """Rate-limiter for the QPU budget-pacing log line.
+
+    Emits at most once per ``log_interval`` seconds AND always on the
+    first entry into the paced state or when the wait-bucket changes.
+    Call :meth:`reset` when mining resumes so the next pacing episode
+    is treated as a fresh entry.
+
+    The clock is injectable (``now`` parameter on :meth:`should_log`)
+    so unit tests can drive time deterministically without monkeypatching
+    a global.
+    """
+
+    def __init__(self, log_interval: float = _PACING_LOG_INTERVAL) -> None:
+        self._interval = log_interval
+        self._last_log_time: Optional[float] = None  # None ↔ "not paced yet"
+        self._last_bucket: Optional[str] = None
+
+    def should_log(self, now: float, wait_bucket: str) -> bool:
+        """Return True if a log line should be emitted.
+
+        Args:
+            now: Current monotonic time (seconds).
+            wait_bucket: Human-readable wait estimate (e.g. ``"2h"`` or
+                ``"45m"``).  A change in this value forces a log even if
+                the interval has not elapsed.
+
+        Returns:
+            ``True`` when the caller should log; ``False`` to suppress.
+        """
+        if self._last_log_time is None:
+            # First time entering the paced state — always log.
+            self._last_log_time = now
+            self._last_bucket = wait_bucket
+            return True
+
+        bucket_changed = wait_bucket != self._last_bucket
+        interval_elapsed = (now - self._last_log_time) >= self._interval
+
+        if bucket_changed or interval_elapsed:
+            self._last_log_time = now
+            self._last_bucket = wait_bucket
+            return True
+
+        return False
+
+    def reset(self) -> None:
+        """Mark that mining has resumed; the next paced call logs again."""
+        self._last_log_time = None
+        self._last_bucket = None
+
+
 class DWaveMiner(BaseMiner):
     # Old code sized the feeder as ``queue_depth * 2`` (default 60).
     # Keep that headroom so the streaming sampler can saturate the
     # D-Wave cloud queue without blocking on Python-side derivation.
     FEEDER_BUFFER_SIZE = 60
+    # QPU is the async-streaming backend: drive the stream on a pump thread
+    # so per-result processing never blocks the cloud pipeline.
+    STREAMING_PUMP = True
 
     def __init__(
         self,
@@ -181,6 +240,12 @@ class DWaveMiner(BaseMiner):
         # base_miner's outer stop_event check only fires between batches.
         self._stop_event: Optional[multiprocessing.synchronize.Event] = None
 
+        # Rate-limiter for the budget-pacing log line. Suppresses the
+        # per-head "[QPU] Pacing block …" spam when the daily budget is
+        # exhausted; the first entry and any bucket/interval change still
+        # surface. reset() is called when mining resumes.
+        self._pacing_rl = _PacingRateLimiter()
+
         # Register SIGTERM handler for graceful cleanup
         signal.signal(signal.SIGTERM, self._cleanup_handler)
 
@@ -236,15 +301,21 @@ class DWaveMiner(BaseMiner):
                     if estimate.seconds_until_can_mine < 3600
                     else f"{estimate.seconds_until_can_mine / 3600:.1f}h"
                 )
-                self.logger.info(
-                    f"[QPU] Pacing block {cur_index} - waiting {wait_str} "
-                    f"for limit to catch up. "
-                    f"Used: {estimate.cumulative_used_us / 1e6:.2f}s, "
-                    f"Limit: {estimate.proportional_limit_us / 1e6:.2f}s "
-                    f"({estimate.elapsed_fraction * 100:.1f}% of day)"
-                )
+                if self._pacing_rl.should_log(
+                    now=time.monotonic(), wait_bucket=wait_str
+                ):
+                    self.logger.info(
+                        f"[QPU] Pacing block {cur_index} - waiting {wait_str} "
+                        f"for limit to catch up. "
+                        f"Used: {estimate.cumulative_used_us / 1e6:.2f}s, "
+                        f"Limit: {estimate.proportional_limit_us / 1e6:.2f}s "
+                        f"({estimate.elapsed_fraction * 100:.1f}% of day)"
+                    )
                 return False
 
+            # Mining can proceed — reset the pacing rate-limiter so the
+            # next pacing episode is treated as a fresh entry.
+            self._pacing_rl.reset()
             self.logger.info(
                 f"[QPU] Budget check passed. Used: "
                 f"{estimate.cumulative_used_us / 1e6:.2f}s / "
@@ -350,6 +421,17 @@ class DWaveMiner(BaseMiner):
             submit_one()
 
         stop_event = self._stop_event
+        # getattr default guards tests that bypass BaseMiner.__init__ via
+        # object.__new__; production always has self._pump_stop set (to None
+        # until mine_work_item starts a pump).
+        pump_stop = getattr(self, "_pump_stop", None)
+
+        def _stop_requested() -> bool:
+            # stop_event/pump_stop captured once at stream start; stable for
+            # this stream's lifetime (a new dispatch builds a fresh stream).
+            if stop_event is not None and stop_event.is_set():
+                return True
+            return pump_stop is not None and pump_stop.is_set()
 
         def _cancel_pending():
             """Abandon in-flight D-Wave futures on stop.
@@ -372,7 +454,7 @@ class DWaveMiner(BaseMiner):
             # drain_on_stop=True (test-only), stop submitting new work
             # but let in-flight jobs complete so callers can still read
             # their results.
-            if stop_event is not None and stop_event.is_set():
+            if _stop_requested():
                 if not self.drain_on_stop:
                     _cancel_pending()
                     return
@@ -396,7 +478,7 @@ class DWaveMiner(BaseMiner):
                         completed_id = fid
                         break
                 if completed_id is None:
-                    if stop_event is not None and stop_event.is_set() and not self.drain_on_stop:
+                    if _stop_requested() and not self.drain_on_stop:
                         _cancel_pending()
                         return
                     # 5ms poll: at production throughput one job per ~60ms

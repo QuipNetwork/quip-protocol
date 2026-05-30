@@ -9,8 +9,10 @@ from shared.miner_config import (
     GPU_BACKEND_SECTIONS,
     MinerConfigError,
     QPU_BACKEND_SECTIONS,
+    SubmissionConfig,
     load_backend_config,
     load_miner_config,
+    load_submission_config,
     merge_config,
     present_backend_groups,
     validate_merged,
@@ -622,3 +624,97 @@ def test_resolve_mode_singular_also_respects_mine_mode():
     # single-mode rejection — the mempool one fires first since it's
     # architecturally more specific.
     assert excinfo.value.code == "multi-backend-not-allowed-in-mempool-mode"
+
+
+# ----------------------------------------------------------------------
+# load_submission_config — [submission] table
+# ----------------------------------------------------------------------
+
+
+def test_submission_defaults_when_section_absent(tmp_path):
+    """No [submission] table -> default tip=0, retries=3, backoff=250."""
+    p = tmp_path / "config.toml"
+    p.write_text('[miner]\nvalidators = ["ws://a:9944"]\n')
+    cfg = load_submission_config(p)
+    assert cfg == SubmissionConfig(
+        tip_plancks=0, max_retries=3, retry_backoff_ms=250
+    )
+
+
+def test_submission_parses_all_keys(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text(
+        "[submission]\n"
+        "tip_plancks = 5000\n"
+        "max_retries = 7\n"
+        "retry_backoff_ms = 100\n"
+    )
+    cfg = load_submission_config(p)
+    assert cfg.tip_plancks == 5000
+    assert cfg.max_retries == 7
+    assert cfg.retry_backoff_ms == 100
+
+
+def test_submission_partial_section_keeps_defaults(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text("[submission]\ntip_plancks = 42\n")
+    cfg = load_submission_config(p)
+    assert cfg.tip_plancks == 42
+    assert cfg.max_retries == 3
+    assert cfg.retry_backoff_ms == 250
+
+
+def test_submission_rejects_negative_tip(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text("[submission]\ntip_plancks = -1\n")
+    with pytest.raises(MinerConfigError, match="non-negative"):
+        load_submission_config(p)
+
+
+def test_submission_rejects_non_int(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text('[submission]\nmax_retries = "lots"\n')
+    with pytest.raises(MinerConfigError, match="integer"):
+        load_submission_config(p)
+
+
+def test_submission_accepts_tip_at_u128_max(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text(f"[submission]\ntip_plancks = {(1 << 128) - 1}\n")
+    cfg = load_submission_config(p)
+    assert cfg.tip_plancks == (1 << 128) - 1
+
+
+def test_submission_rejects_tip_above_u128_max(tmp_path):
+    # A tip above the chain's u128 Balance range encodes locally but the
+    # runtime rejects it — fail at load time, not at the first proof.
+    p = tmp_path / "config.toml"
+    p.write_text(f"[submission]\ntip_plancks = {1 << 128}\n")
+    with pytest.raises(MinerConfigError, match="u128 max"):
+        load_submission_config(p)
+
+
+def test_submission_rejects_bool_for_int_field(tmp_path):
+    # bool is an int subclass; reject so `tip_plancks = true` fails loud.
+    p = tmp_path / "config.toml"
+    p.write_text("[submission]\ntip_plancks = true\n")
+    with pytest.raises(MinerConfigError, match="integer"):
+        load_submission_config(p)
+
+
+def test_submission_rejects_non_table(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text('submission = "oops"\n')
+    with pytest.raises(MinerConfigError, match="must be a table"):
+        load_submission_config(p)
+
+
+def test_example_toml_submission_section_loads():
+    from pathlib import Path
+
+    example = Path(__file__).resolve().parents[1] / "quip.network.qpu.example.toml"
+    cfg = load_submission_config(example)
+    # Pins the shipped defaults so a stray edit to the example file fails CI.
+    assert cfg == SubmissionConfig(
+        tip_plancks=0, max_retries=3, retry_backoff_ms=250
+    )

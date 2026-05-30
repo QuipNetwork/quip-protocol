@@ -13,6 +13,7 @@ a very-relaxed difficulty so the loop terminates in a few seconds. Verifies:
 """
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
 import time
 
@@ -710,6 +711,125 @@ def test_miner_handle_error_sentinel_on_missing_context():
 
 
 # ----------------------------------------------------------------------
+# Anticipatory-submission preview channel (Task 6a)
+# ----------------------------------------------------------------------
+
+
+def test_mine_work_item_emits_preview_on_floor_improvement(
+    cpu_miner, relaxed_context, monkeypatch,
+):
+    """A ``preview_cb`` must fire when a strictly-better-floor candidate is
+    stashed, with a payload carrying the fields the controller needs to
+    encode+submit later. It must NOT fire again without a strict floor
+    improvement (throttle).
+
+    Drives ``mine_work_item`` with a stubbed ``evaluate_sampleset`` that
+    returns successively-improving then non-improving floors so the
+    throttle behaviour is deterministic:
+      - iter 1: floor -1.0 → first stash → preview fires.
+      - iter 2: floor -2.0 (better) → preview fires again.
+      - iter 3: floor -1.5 (worse than best -2.0) → still stored in the
+        bounded heap but best-by-floor unchanged → preview does NOT fire.
+    Stops after iter 3.
+    """
+    previews: list = []
+
+    def capture(payload):
+        previews.append(payload)
+
+    floors = [-1.0, -2.0, -1.5]
+    energies = [-1.0, -2.0, -1.5]
+    iter_idx = [0]
+
+    def fake_evaluate(sampleset, requirements, nodes, edges,
+                      nonce, salt, prev_timestamp, start_time,
+                      strict_energy=True, live_threshold_energy=None):
+        i = iter_idx[0]
+        iter_idx[0] += 1
+        if i >= len(floors):
+            stop.set()
+            return None
+        n = len(nodes)
+        return MiningResult(
+            miner_id="test",
+            miner_type="CPU",
+            nonce=(i + 1).to_bytes(32, "big"),
+            salt=bytes([i + 1]) * 32,
+            timestamp=0,
+            prev_timestamp=0,
+            solutions=[[-1] * n],
+            energy=energies[i],
+            diversity=1.0,
+            num_valid=3,
+            mining_time=0,
+            node_list=list(nodes),
+            edge_list=list(edges),
+            submit_floor_energy=floors[i],
+        )
+
+    # Live threshold strict enough that the submit gate never passes for
+    # any of our fake floors (-1.0/-2.0/-1.5 → milli -1000/-2000/-1500):
+    # submit needs floor_milli < live, and -2000 < -3000 is False. This
+    # keeps the loop running through all three iters so we can observe the
+    # throttle. The precheck ``near_live`` gate must NOT short-circuit the
+    # lenient evaluate, so we widen the precheck margin to admit every iter
+    # regardless of the real sampler's energy.
+    live_var = mp.Value("q", -3000)
+    monkeypatch.setattr(cpu_miner, "RATCHET_PRECHECK_MARGIN_MILLI", 10**18)
+    stop = mp.Event()
+    cpu_miner._live_max_energy_milli = live_var
+    monkeypatch.setattr(cpu_miner, "evaluate_sampleset", fake_evaluate)
+    try:
+        cpu_miner.mine_work_item(relaxed_context, stop, preview_cb=capture)
+    finally:
+        del cpu_miner._live_max_energy_milli
+
+    assert len(previews) == 2, (
+        f"expected exactly 2 previews (iter1 -1.0, iter2 -2.0; iter3 -1.5 "
+        f"is no improvement), got {len(previews)}: "
+        f"{[p['submit_floor_energy'] for p in previews]}"
+    )
+    # First preview: the iter-1 candidate (floor -1.0).
+    p0 = previews[0]
+    for field in (
+        "dispatch_id", "miner_type", "nonce", "salt", "solutions",
+        "submit_floor_energy", "energy", "num_valid", "diversity",
+    ):
+        assert field in p0, f"preview payload missing required field {field!r}"
+    assert p0["submit_floor_energy"] == -1.0
+    assert p0["nonce"] == (1).to_bytes(32, "big")
+    # The preview carries the real source backend so the controller's
+    # anticipatory path records accurate per-backend attribution.
+    assert p0["miner_type"] == "CPU"
+    # Second preview: the improved iter-2 candidate (floor -2.0).
+    assert previews[1]["submit_floor_energy"] == -2.0
+    assert previews[1]["nonce"] == (2).to_bytes(32, "big")
+
+
+def test_mine_work_item_preview_cb_default_none_is_noop(
+    cpu_miner, relaxed_context,
+):
+    """Backward-compat: callers passing no ``preview_cb`` (the default)
+    mine exactly as before — no error, a normal result comes back."""
+    stop = mp.Event()
+    result = cpu_miner.mine_work_item(relaxed_context, stop)
+    assert isinstance(result, MiningResult)
+
+
+def test_mine_work_item_preview_cb_failure_does_not_break_mining(
+    cpu_miner, relaxed_context,
+):
+    """A throwing ``preview_cb`` must never break the mining loop — the
+    dispatch still completes and returns a valid result."""
+    def boom(_payload):
+        raise RuntimeError("preview channel exploded")
+
+    stop = mp.Event()
+    result = cpu_miner.mine_work_item(relaxed_context, stop, preview_cb=boom)
+    assert isinstance(result, MiningResult)
+
+
+# ----------------------------------------------------------------------
 # submit_floor_energy parity — chain rejects on the WORST selected
 # solution, not the best. evaluate_sampleset must surface the worst-case
 # so the substrate submit gate doesn't ship a proof the chain will reject.
@@ -867,6 +987,145 @@ def test_attempt_log_records_num_valid_and_diversity_on_stored_iteration(
     )
 
 
+def test_precheck_skips_evaluate_for_no_hope_iter(
+    cpu_miner, relaxed_context, monkeypatch,
+):
+    """Pre-check must skip the expensive lenient ``evaluate_sampleset`` when
+    the iter's best energy is FAR above (worse than) the live threshold plus
+    ``RATCHET_PRECHECK_MARGIN_MILLI``.
+
+    Arranges a fake sampler that returns a sampleset whose best energy is
+    +100.0 (100_000 milli) — far above the live threshold of 0 milli plus the
+    2000-milli margin. The spy on ``evaluate_sampleset`` must NOT be called,
+    and the attempt log must record ``result_kind="rejected"`` with
+    ``post_processed=False``.
+    """
+    import dimod
+    from unittest.mock import MagicMock
+
+    # Sampleset with a single sample at energy +100 — no-hope (far above live).
+    BAD_ENERGY = 100.0
+    bad_ss = dimod.SampleSet.from_samples(
+        [{n: 1 for n in relaxed_context.nodes}],
+        vartype=dimod.SPIN,
+        energy=[BAD_ENERGY],
+    )
+
+    # Spy on evaluate_sampleset — must NOT be called for a no-hope iter.
+    spy_calls = []
+
+    def spy_evaluate(sampleset, *args, **kwargs):
+        spy_calls.append(sampleset)
+        return None
+
+    # Capture the first attempt-log record, then stop.
+    captured = []
+    recording_logger = MagicMock()
+
+    def _capture(**kw):
+        captured.append(kw)
+        stop.set()
+
+    recording_logger.record.side_effect = _capture
+
+    def fake_sample(*args, **kwargs):
+        # Return the bad-energy sampleset regardless of (h, J).
+        return bad_ss
+
+    stop = mp.Event()
+    # Live threshold = 0 milli. With RATCHET_PRECHECK_MARGIN_MILLI=2000,
+    # iter_best_milli = 100_000 >> 0 + 2000 so near_live is False.
+    live_var = mp.Value('q', 0)
+
+    monkeypatch.setattr(cpu_miner, "_sample", fake_sample)
+    monkeypatch.setattr(cpu_miner, "evaluate_sampleset", spy_evaluate)
+    cpu_miner._attempt_logger = recording_logger
+    cpu_miner._live_max_energy_milli = live_var
+    try:
+        cpu_miner.mine_work_item(relaxed_context, stop)
+    finally:
+        del cpu_miner._attempt_logger
+        del cpu_miner._live_max_energy_milli
+
+    assert captured, "expected at least one AttemptLogger.record call"
+    rec = captured[0]
+    assert not spy_calls, (
+        "evaluate_sampleset must NOT be called for a no-hope iter "
+        f"(best_energy={BAD_ENERGY}, live_threshold_milli=0, margin=2000)"
+    )
+    assert rec["result_kind"] == "rejected", (
+        f"no-hope iter must be logged as 'rejected', got {rec['result_kind']!r}"
+    )
+    assert rec["post_processed"] is False, (
+        f"no-hope iter must have post_processed=False, got {rec['post_processed']!r}"
+    )
+
+
+def test_precheck_evaluates_iter_near_live_threshold(
+    cpu_miner, relaxed_context, monkeypatch,
+):
+    """Pre-check must call ``evaluate_sampleset`` when the iter's best energy
+    is at or below the live threshold — i.e. clearly within the
+    ``RATCHET_PRECHECK_MARGIN_MILLI`` window.
+
+    Arranges a fake sampler that returns a sampleset whose best energy is
+    -1.0 (-1000 milli) — below the live threshold of 0 milli. The spy on
+    ``evaluate_sampleset`` MUST be called for that iter.
+    """
+    import dimod
+    from unittest.mock import MagicMock
+
+    # Sampleset with best energy -1.0 — clearly within margin of threshold 0.
+    GOOD_ENERGY = -1.0
+    good_ss = dimod.SampleSet.from_samples(
+        [{n: -1 for n in relaxed_context.nodes}],
+        vartype=dimod.SPIN,
+        energy=[GOOD_ENERGY],
+    )
+
+    spy_calls = []
+
+    def spy_evaluate(sampleset, *args, **kwargs):
+        spy_calls.append(sampleset)
+        return None  # Return None so the loop continues; stop via logger.
+
+    captured = []
+    recording_logger = MagicMock()
+
+    def _capture(**kw):
+        captured.append(kw)
+        stop.set()
+
+    recording_logger.record.side_effect = _capture
+
+    def fake_sample(*args, **kwargs):
+        return good_ss
+
+    stop = mp.Event()
+    # Live threshold = 0 milli; GOOD_ENERGY milli = -1000 << 0 + 2000.
+    live_var = mp.Value('q', 0)
+
+    monkeypatch.setattr(cpu_miner, "_sample", fake_sample)
+    monkeypatch.setattr(cpu_miner, "evaluate_sampleset", spy_evaluate)
+    cpu_miner._attempt_logger = recording_logger
+    cpu_miner._live_max_energy_milli = live_var
+    try:
+        cpu_miner.mine_work_item(relaxed_context, stop)
+    finally:
+        del cpu_miner._attempt_logger
+        del cpu_miner._live_max_energy_milli
+
+    assert spy_calls, (
+        "evaluate_sampleset MUST be called when iter best energy "
+        f"({GOOD_ENERGY}) is within margin of live threshold (0 milli)"
+    )
+    assert captured, "expected at least one AttemptLogger.record call"
+    rec = captured[0]
+    assert rec.get("post_processed") is True, (
+        f"near-live iter must have post_processed=True, got {rec.get('post_processed')!r}"
+    )
+
+
 def test_attempt_log_records_qpu_access_time_us_when_sample_records_qpu_timing(
     cpu_miner, relaxed_context,
 ):
@@ -943,3 +1202,254 @@ def test_attempt_log_qpu_access_time_us_is_none_for_non_qpu_backends(
     rec = captured[0]
     assert "qpu_access_time_us" in rec
     assert rec["qpu_access_time_us"] is None
+
+
+def test_stored_solution_iter_matches_attempt_iter(
+    cpu_miner, relaxed_context, tmp_path,
+):
+    """The ``iter`` field in stored-solution files must equal the ``iter``
+    field in the attempt-log row for the same iteration.
+
+    Before the fix, attempt-log rows used ``progress + 1`` (1-based) while
+    ``SolutionStore.record`` received ``progress`` (0-based), so the two
+    records for the SAME iteration carried different ``iter`` values and
+    cross-referencing via ``query_by_dispatch`` / ``query_stored_solutions``
+    was broken.
+
+    Drives ``mine_work_item`` through one substrate-ratchet iteration that
+    produces a stored or submitted candidate, then reads back both artefacts
+    and asserts their ``iter`` values are equal.
+    """
+    from shared.mining_attempt_log import (
+        AttemptLogger,
+        SolutionStore,
+        query_by_dispatch,
+        query_stored_solutions,
+    )
+
+    DISPATCH_ID = 9900
+
+    real_logger = AttemptLogger(
+        cpu_miner.miner_id, log_dir=tmp_path, miner_type=cpu_miner.miner_type,
+    )
+    real_store = SolutionStore(cpu_miner.miner_id, log_dir=tmp_path)
+
+    # Stop after the first stored/submitted record so we don't run forever.
+    stop = mp.Event()
+    original_record = real_logger.record
+
+    def _record_and_maybe_stop(**kw):
+        original_record(**kw)
+        if kw.get("result_kind") in ("stored", "submitted"):
+            stop.set()
+
+    real_logger.record = _record_and_maybe_stop  # type: ignore[method-assign]
+
+    live_var = mp.Value('q', 0)
+    cpu_miner._attempt_logger = real_logger
+    cpu_miner._solution_store = real_store
+    cpu_miner._current_dispatch_id = DISPATCH_ID
+    cpu_miner._live_max_energy_milli = live_var
+    try:
+        cpu_miner.mine_work_item(relaxed_context, stop)
+    finally:
+        real_logger.record = original_record  # type: ignore[method-assign]
+        del cpu_miner._attempt_logger
+        del cpu_miner._solution_store
+        del cpu_miner._current_dispatch_id
+        del cpu_miner._live_max_energy_milli
+
+    # Read back attempt rows and find the stored/submitted one.
+    attempt_rows = query_by_dispatch(
+        cpu_miner.miner_id, DISPATCH_ID, log_dir=tmp_path,
+    )
+    stored_rows = [
+        r for r in attempt_rows
+        if r.get("result_kind") in ("stored", "submitted")
+    ]
+    assert stored_rows, (
+        "expected at least one stored/submitted attempt row; "
+        f"got result_kinds={[r.get('result_kind') for r in attempt_rows]}"
+    )
+    attempt_iter = stored_rows[0]["iter"]
+    assert attempt_iter >= 1, f"expected 1-based iter, got {attempt_iter}"
+
+    # Read back the stored solution record.
+    sol_records = query_stored_solutions(
+        DISPATCH_ID, log_dir=tmp_path, miner_id=cpu_miner.miner_id,
+    )
+    assert sol_records, (
+        "expected at least one stored-solution file; "
+        "SolutionStore.record was not called for a stored/submitted iter"
+    )
+    solution_iter = sol_records[0]["iter"]
+
+    assert attempt_iter == solution_iter, (
+        f"attempt-log iter ({attempt_iter}) != stored-solution iter "
+        f"({solution_iter}); cross-reference is broken"
+    )
+
+
+def test_mined_log_nonce_comes_from_result_not_loop_variable(
+    cpu_miner, relaxed_context, caplog,
+):
+    """The ``mined!`` INFO log line must display the *submitted* result's
+    nonce (``result.nonce``), not the loop's last-iterated nonce variable.
+
+    In the substrate-ratchet path the submit gate walks ``top_k`` and
+    returns the best-energy stashed candidate, which may have been produced
+    by an *earlier* iteration with a different nonce than the current one.
+    Before the fix the log used the loop variable ``nonce``/``salt``, so
+    operators saw nonce X in the ``mined!`` line while the submitter used
+    nonce Y from the returned result.
+
+    Setup:
+    - Iter 1: ``evaluate_sampleset`` returns ``result_A`` (nonce_A, energy -2.0,
+      floor -1.5).  Live threshold is -3000 milli so the submit gate fails
+      (int(-1500) < -3000 is False) but ``result_A`` is stored in ``top_k``.
+    - After iter 1's ``AttemptLogger.record`` fires, the live threshold is
+      relaxed to 0 milli.
+    - Iter 2: a fresh nonce (``nonce_B``) is drawn from the feeder.
+      ``evaluate_sampleset`` returns ``result_B`` (nonce_B, energy -1.8,
+      floor -1.5).  Submit gate walks top_k = [result_A, result_B] sorted
+      by energy; result_A is better (-2.0 < -1.8), its floor (-1500 milli)
+      < 0 milli → submit gate selects ``result_A``.  The loop variable
+      ``nonce`` at this point is ``nonce_B``.
+
+    Assertion: the ``mined!`` log line contains ``result_A.nonce.hex()[:16]``
+    and does NOT contain ``nonce_B.hex()[:16]`` (which are different).
+    """
+    from unittest.mock import MagicMock
+
+    # Predetermined nonce for the stashed result from iter 1 (32 bytes).
+    nonce_A = bytes(range(32))
+    salt_A = b"\xaa" * 32
+
+    # Tracking state shared across the mock closures.
+    iter_count = [0]
+    captured_iter2_loop_nonce: list = []
+
+    def fake_evaluate(sampleset, requirements, nodes, edges,
+                      nonce, salt, prev_timestamp, start_time,
+                      strict_energy=True, live_threshold_energy=None):
+        iter_count[0] += 1
+        n = len(nodes)
+        fake_solutions = [[-1] * n]
+        if iter_count[0] == 1:
+            # Iter 1: return result_A with predetermined nonce_A.
+            return MiningResult(
+                miner_id="test",
+                miner_type="CPU",
+                nonce=nonce_A,
+                salt=salt_A,
+                timestamp=0,
+                prev_timestamp=0,
+                solutions=fake_solutions,
+                energy=-2.0,
+                diversity=1.0,
+                num_valid=1,
+                mining_time=0,
+                node_list=list(nodes),
+                edge_list=list(edges),
+                submit_floor_energy=-1.5,  # int(-1500) < -3000 → False → no submit
+            )
+        else:
+            # Iter 2+: record the loop's nonce (iter 2's nonce_B) for the
+            # divergence assertion, then return result_B (also with nonce=nonce
+            # from this iter — but submit gate will prefer result_A from top_k).
+            if iter_count[0] == 2:
+                captured_iter2_loop_nonce.append(nonce)
+            return MiningResult(
+                miner_id="test",
+                miner_type="CPU",
+                nonce=nonce,   # result_B.nonce == loop nonce for this iter
+                salt=salt,
+                timestamp=0,
+                prev_timestamp=0,
+                solutions=fake_solutions,
+                energy=-1.8,
+                diversity=1.0,
+                num_valid=1,
+                mining_time=0,
+                node_list=list(nodes),
+                edge_list=list(edges),
+                submit_floor_energy=-1.5,  # int(-1500) < 0 → True → submittable
+            )
+
+    # Live threshold starts very strict (-3000 milli) so iter 1 stores but
+    # does not submit.  After iter 1's record() fires we relax to 0 so iter 2's
+    # submit gate can pass for the stashed result_A.
+    live_var = mp.Value('q', -3000)
+
+    recording_logger = MagicMock()
+
+    def _on_record(**kw):
+        # After the first record (iter 1), relax the live threshold so that
+        # the submit gate passes on iter 2.
+        if kw.get("result_kind") == "stored":
+            with live_var.get_lock():
+                live_var.value = 0
+
+    recording_logger.record.side_effect = _on_record
+
+    stop = mp.Event()
+    cpu_miner._attempt_logger = recording_logger
+    cpu_miner._live_max_energy_milli = live_var
+    monkeypatched_evaluate = cpu_miner.evaluate_sampleset
+    cpu_miner.evaluate_sampleset = fake_evaluate  # type: ignore[method-assign]
+
+    returned_result = None
+    logger_name = cpu_miner.logger.name
+    try:
+        with caplog.at_level(logging.INFO, logger=logger_name):
+            returned_result = cpu_miner.mine_work_item(relaxed_context, stop)
+    finally:
+        cpu_miner.evaluate_sampleset = monkeypatched_evaluate
+        del cpu_miner._attempt_logger
+        del cpu_miner._live_max_energy_milli
+
+    assert returned_result is not None, (
+        "mine_work_item must return a result when a candidate clears the "
+        "live threshold; returned None instead"
+    )
+    # The submit gate chose result_A (better energy) from top_k — even though
+    # the loop's last nonce was nonce_B (iter 2).  The returned result must
+    # carry nonce_A.
+    assert returned_result.nonce == nonce_A, (
+        f"expected submit gate to return result_A (nonce_A), "
+        f"got nonce={returned_result.nonce.hex()}"
+    )
+
+    # Verify iter 2 ran so we actually tested the divergence scenario.
+    assert captured_iter2_loop_nonce, (
+        "evaluate_sampleset was never called for iter 2; "
+        "the divergence scenario was never exercised"
+    )
+    nonce_B = captured_iter2_loop_nonce[0]
+    assert nonce_B != nonce_A, (
+        "iter-2 loop nonce equals nonce_A — divergence scenario collapsed; "
+        "adjust the test setup so the two iters produce different loop nonces"
+    )
+
+    # Core assertion: the ``mined!`` line must log result.nonce (nonce_A),
+    # not the loop variable nonce (nonce_B).
+    mined_lines = [r.message for r in caplog.records if "mined!" in r.message]
+    assert mined_lines, (
+        "no 'mined!' INFO log line found; check logger name or caplog setup"
+    )
+    mined_line = mined_lines[0]
+
+    expected_nonce_prefix = nonce_A.hex()[:16]
+    assert expected_nonce_prefix in mined_line, (
+        f"mined! log must show submitted result's nonce "
+        f"(0x{expected_nonce_prefix}...) but got: {mined_line!r}"
+    )
+
+    # Regression check: the loop's last-iterated nonce (nonce_B) must NOT
+    # appear in the log line.
+    wrong_nonce_prefix = nonce_B.hex()[:16]
+    assert wrong_nonce_prefix not in mined_line, (
+        f"mined! log shows loop variable's nonce (0x{wrong_nonce_prefix}...) "
+        f"instead of the submitted result's nonce — "
+        f"this is the pre-fix bug; log line: {mined_line!r}"
+    )
