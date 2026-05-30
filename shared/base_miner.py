@@ -1105,6 +1105,7 @@ class BaseMiner(ABC):
             "solver_name": getattr(self, "solver_name", None),
             "region": getattr(self, "region", None),
             "token": getattr(self, "token", None),
+            "topology": getattr(self, "topology", None),
         }
         driver_proc = spawn_worker(
             stream_driver_main,

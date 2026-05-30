@@ -554,3 +554,34 @@ def test_close_driver_reaps_and_unlinks():
     from multiprocessing import shared_memory
     with pytest.raises(FileNotFoundError):
         shared_memory.SharedMemory(name=names[0])
+
+
+def test_ensure_driver_forwards_topology_in_factory_kwargs():
+    """The chain topology on the worker miner must ride factory_kwargs to the
+    driver (so build_persistent_context gets it)."""
+    import shared.base_miner as bm
+
+    miner = _DriverMiner()
+    sentinel = object()
+    miner.topology = sentinel
+    sample_ctx = {
+        "num_reads": 8, "nodes": [0, 1, 2], "edges": [],
+        "annealing_time": 80.0, "energy_threshold": -1.0,
+        "last_proof_block_hash": b"\xab" * 32, "miner_bytes": b"\x42" * 32,
+    }
+    captured = {}
+    _orig = bm.spawn_worker
+
+    def _spy(target, args, **kwargs):
+        # args = (ring_args, desc_q, ctl_q, driver_stop, factory_dotted,
+        #         factory_kwargs)
+        captured["factory_kwargs"] = args[5]
+        return _orig(target, args, **kwargs)
+
+    try:
+        bm.spawn_worker = _spy
+        assert miner._ensure_driver(sample_ctx) is True
+        assert captured["factory_kwargs"]["topology"] is sentinel
+    finally:
+        bm.spawn_worker = _orig
+        miner._close_driver()
