@@ -64,6 +64,14 @@ def build_miner_from_spec(spec: Dict[str, Any]):
     cfg = dict(spec.get("cfg", {}))
     args = dict(spec.get("args", {}))
 
+    topology = args.get("topology")
+    if topology is None:
+        raise ValueError(
+            f"build_miner_from_spec: kind={kind!r} requires a topology "
+            "(spec args['topology']); none was wired — the chain topology "
+            "must reach every miner"
+        )
+
     if kind == "cpu":
         # Match the cuda/modal/cuda-gibbs paths: pass both cfg and args so a
         # `topology=` override in spec.args propagates to the sampler. Phase 4
@@ -137,7 +145,8 @@ def build_miner_from_spec(spec: Dict[str, Any]):
         # process built by build_persistent_context (via
         # BaseMiner._ensure_driver) with the default connect=True.
         return QPU.DWaveMiner(
-            miner_id, time_config=time_config, connect=False, **cfg
+            miner_id, time_config=time_config, connect=False,
+            topology=topology, **cfg
         )
     else:
         raise ValueError(f"Unknown miner kind '{kind}'")
