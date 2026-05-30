@@ -75,6 +75,29 @@ _PUMP_DONE = object()
 # Maximum number of work-tags remembered by _SetupAbortThrottle.
 _SETUP_ABORT_TAG_LIMIT = 32
 
+# Result-acquisition control signals returned by ``_acquire_result`` so the
+# loop in ``mine_work_item`` can reproduce the original inline ``return None``
+# / ``break`` / ``continue`` semantics without a helper hijacking control flow.
+_ACQUIRE_OK = "ok"  # payload present; process this iteration
+_ACQUIRE_STOP = "stop"  # stop_event fired -> caller returns None
+_ACQUIRE_DONE = "done"  # stream exhausted (_PUMP_DONE) -> caller breaks
+_ACQUIRE_CONTINUE = "continue"  # recoverable sampling error -> caller continues
+
+
+@dataclass(frozen=True)
+class _AcquireResult:
+    """Outcome of one ``_acquire_result`` call.
+
+    ``action`` is one of the ``_ACQUIRE_*`` constants. The payload fields are
+    only meaningful when ``action`` is :data:`_ACQUIRE_OK`.
+    """
+
+    action: str
+    nonce: Any = None
+    salt: bytes = b""
+    sampleset: Any = None
+    qpu_access_time_us: Optional[int] = None
+
 
 @dataclass
 class _MiningLoopState:
@@ -681,6 +704,20 @@ class BaseMiner(ABC):
         batch_miner_id = bridge_node_info.miner_id
         batch_cur_index = bridge_prev_block.header.index
 
+        # Sampling inputs bundled once for the inline ``_acquire_result``
+        # path and the streaming pump (identical keys — the pump consumes
+        # this same dict shape).
+        sample_ctx = {
+            "prev_hash": batch_prev_hash,
+            "miner_id": batch_miner_id,
+            "cur_index": batch_cur_index,
+            "nodes": nodes,
+            "edges": edges,
+            "num_reads": num_reads,
+            "num_sweeps": current_num_sweeps,
+            "extra": extra_params,
+        }
+
         # --- Out-of-band result pump (streaming backends only) ----------
         # CPU/GPU/Metal keep the inline path below (STREAMING_PUMP=False).
         self._dropped_results = 0
@@ -693,19 +730,9 @@ class BaseMiner(ABC):
             # The QPU stream observes this so its in-flight next() unblocks
             # on shutdown before we join the pump and close the generator.
             self._pump_stop = pump_stop
-            sample_kwargs = {
-                "prev_hash": batch_prev_hash,
-                "miner_id": batch_miner_id,
-                "cur_index": batch_cur_index,
-                "nodes": nodes,
-                "edges": edges,
-                "num_reads": num_reads,
-                "num_sweeps": current_num_sweeps,
-                "extra": extra_params,
-            }
             pump_thread = threading.Thread(
                 target=self._result_pump,
-                args=(result_queue, pump_stop, sample_kwargs),
+                args=(result_queue, pump_stop, sample_ctx),
                 name=f"qpu-pump-{self.miner_id}",
                 daemon=True,
             )
@@ -725,75 +752,23 @@ class BaseMiner(ABC):
                 self.current_stage = 'preprocessing'
                 self.current_stage_start = preprocess_start
 
-                # Per-iteration QPU access time in microseconds (D-Wave
-                # ``qpu_programming_time + qpu_sampling_time``). In pump mode
-                # the pump thread extracts it and ships it on the result; on
-                # the inline path the branch below snapshots the shared
-                # ``timing_stats['qpu_access_time']`` list around the sample.
-                # ``None`` when no entry was produced (non-QPU backends, or a
-                # QPU sampleset without timing info).
-                qpu_access_time_us: Optional[int] = None
-                try:
-                    sample_start = time.time()
-                    self.current_stage = 'sampling'
-                    self.current_stage_start = sample_start
-                    if result_queue is not None:
-                        # Pump mode: block on the queue, but wake to check
-                        # stop_event. _PUMP_DONE means the stream ended.
-                        item = None
-                        while not stop_event.is_set():
-                            try:
-                                item = result_queue.get(timeout=0.1)
-                                break
-                            except queue.Empty:
-                                continue
-                        if stop_event.is_set():
-                            return None
-                        if item is _PUMP_DONE:
-                            break  # stream exhausted; exit the loop
-                        nonce = item.nonce
-                        salt = item.salt
-                        sampleset = item.sampleset
-                        qpu_access_time_us = item.qpu_access_time_us
-                    else:
-                        # Inline path (CPU/GPU/Metal): unchanged.
-                        qpu_access_len_before = len(
-                            self.timing_stats['qpu_access_time'],
-                        )
-                        batch = self._sample_batch(
-                            batch_prev_hash, batch_miner_id, batch_cur_index,
-                            nodes, edges,
-                            num_reads=num_reads,
-                            num_sweeps=current_num_sweeps,
-                            **extra_params,
-                        )
-                        if batch is not None:
-                            nonce, salt, sampleset = batch[0]
-                        else:
-                            model = self._feeder.pop_blocking()
-                            nonce, salt = model.nonce, model.salt
-                            sampleset = self._sample(
-                                model.h, model.J,
-                                num_reads=num_reads,
-                                num_sweeps=current_num_sweeps,
-                                nonce_seed=nonce,
-                                **extra_params,
-                            )
-                        qpu_access_list = self.timing_stats['qpu_access_time']
-                        if len(qpu_access_list) > qpu_access_len_before:
-                            qpu_access_time_us = int(qpu_access_list[-1])
-                    sample_time = time.time() - sample_start
-                    # In pump mode sample_time is queue-dequeue latency (~0µs),
-                    # not QPU access time — qpu_access_time_us carries the real
-                    # QPU figure.
-                    self.timing_stats['sampling'].append(sample_time * 1e6)
-                    self.timing_stats['preprocessing'].append(
-                        (sample_start - preprocess_start) * 1e6,
-                    )
-                except Exception as exc:
-                    if self._on_sampling_error(exc, stop_event):
-                        return None
+                # Source one (nonce, salt, sampleset) plus the per-iteration
+                # QPU access time. The returned signal directs the loop's
+                # stop / stream-exhausted / sampling-error control flow.
+                acquired = self._acquire_result(
+                    stop_event, result_queue, preprocess_start,
+                    sample_ctx=sample_ctx,
+                )
+                if acquired.action == _ACQUIRE_STOP:
+                    return None
+                if acquired.action == _ACQUIRE_DONE:
+                    break  # stream exhausted; exit the loop
+                if acquired.action == _ACQUIRE_CONTINUE:
                     continue
+                nonce = acquired.nonce
+                salt = acquired.salt
+                sampleset = acquired.sampleset
+                qpu_access_time_us = acquired.qpu_access_time_us
 
                 sampleset = self._post_sample(sampleset)
                 if stop_event.is_set():
@@ -891,6 +866,99 @@ class BaseMiner(ABC):
             return None
         finally:
             self._teardown_dispatch(pump_stop, pump_thread)
+
+    def _acquire_result(
+        self,
+        stop_event: multiprocessing.synchronize.Event,
+        result_queue: Optional["queue.Queue"],
+        preprocess_start: float,
+        *,
+        sample_ctx: Dict[str, Any],
+    ) -> _AcquireResult:
+        """Source one ``(nonce, salt, sampleset)`` for a loop iteration.
+
+        Pump mode (``result_queue`` set) blocks on the queue, waking to check
+        ``stop_event``; the inline path calls ``_sample_batch`` (falling back
+        to a single ``_sample`` on the popped feeder model). Appends the
+        sampling / preprocessing timings on success. Returns an
+        :class:`_AcquireResult` whose ``action`` reproduces the original
+        inline control flow exactly:
+
+        - :data:`_ACQUIRE_STOP` — ``stop_event`` fired (caller returns None).
+        - :data:`_ACQUIRE_DONE` — stream exhausted (caller breaks the loop).
+        - :data:`_ACQUIRE_CONTINUE` — recoverable sampling error and
+          ``_on_sampling_error`` returned falsey (caller continues).
+        - :data:`_ACQUIRE_OK` — payload populated; process the iteration.
+
+        A sampling error where ``_on_sampling_error`` returns truthy maps to
+        :data:`_ACQUIRE_STOP` (the original ``return None``).
+        """
+        qpu_access_time_us: Optional[int] = None
+        try:
+            sample_start = time.time()
+            self.current_stage = 'sampling'
+            self.current_stage_start = sample_start
+            if result_queue is not None:
+                # Pump mode: block on the queue, but wake to check
+                # stop_event. _PUMP_DONE means the stream ended.
+                item = None
+                while not stop_event.is_set():
+                    try:
+                        item = result_queue.get(timeout=0.1)
+                        break
+                    except queue.Empty:
+                        continue
+                if stop_event.is_set():
+                    return _AcquireResult(_ACQUIRE_STOP)
+                if item is _PUMP_DONE:
+                    return _AcquireResult(_ACQUIRE_DONE)
+                nonce = item.nonce
+                salt = item.salt
+                sampleset = item.sampleset
+                qpu_access_time_us = item.qpu_access_time_us
+            else:
+                # Inline path (CPU/GPU/Metal): unchanged.
+                qpu_access_len_before = len(
+                    self.timing_stats['qpu_access_time'],
+                )
+                batch = self._sample_batch(
+                    sample_ctx["prev_hash"], sample_ctx["miner_id"],
+                    sample_ctx["cur_index"],
+                    sample_ctx["nodes"], sample_ctx["edges"],
+                    num_reads=sample_ctx["num_reads"],
+                    num_sweeps=sample_ctx["num_sweeps"],
+                    **sample_ctx["extra"],
+                )
+                if batch is not None:
+                    nonce, salt, sampleset = batch[0]
+                else:
+                    model = self._feeder.pop_blocking()
+                    nonce, salt = model.nonce, model.salt
+                    sampleset = self._sample(
+                        model.h, model.J,
+                        num_reads=sample_ctx["num_reads"],
+                        num_sweeps=sample_ctx["num_sweeps"],
+                        nonce_seed=nonce,
+                        **sample_ctx["extra"],
+                    )
+                qpu_access_list = self.timing_stats['qpu_access_time']
+                if len(qpu_access_list) > qpu_access_len_before:
+                    qpu_access_time_us = int(qpu_access_list[-1])
+            sample_time = time.time() - sample_start
+            # In pump mode sample_time is queue-dequeue latency (~0µs),
+            # not QPU access time — qpu_access_time_us carries the real
+            # QPU figure.
+            self.timing_stats['sampling'].append(sample_time * 1e6)
+            self.timing_stats['preprocessing'].append(
+                (sample_start - preprocess_start) * 1e6,
+            )
+        except Exception as exc:
+            if self._on_sampling_error(exc, stop_event):
+                return _AcquireResult(_ACQUIRE_STOP)
+            return _AcquireResult(_ACQUIRE_CONTINUE)
+        return _AcquireResult(
+            _ACQUIRE_OK, nonce, salt, sampleset, qpu_access_time_us,
+        )
 
     def _teardown_dispatch(
         self,
