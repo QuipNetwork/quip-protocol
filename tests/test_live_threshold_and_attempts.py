@@ -355,7 +355,19 @@ def test_attempt_logger_reset_is_per_miner_not_whole_dispatch_dir(
     _rec(qpu, 5, 1)
     _rec(qpu, 5, 2)
 
-    # CPU "restarts" and reuses dispatch_id=5 — must not touch QPU's file.
+    # Both miners archive a solution into the shared dispatch-5 solutions/.
+    SolutionStore("rig-cpu", log_dir=tmp_path).record(
+        dispatch_id=5, iter_num=1, nonce_hex="aaaa" + "00" * 30,
+        salt_hex="00" * 32, top_5_solutions_hex=["a1"],
+        top_5_energies=[-1.0], result_kind="stored",
+    )
+    SolutionStore("rig-qpu", log_dir=tmp_path).record(
+        dispatch_id=5, iter_num=2, nonce_hex="bbbb" + "00" * 30,
+        salt_hex="00" * 32, top_5_solutions_hex=["b2"],
+        top_5_energies=[-2.0], result_kind="stored",
+    )
+
+    # CPU "restarts" and reuses dispatch_id=5 — must not touch QPU's files.
     cpu2 = AttemptLogger("rig-cpu", log_dir=tmp_path)
     _rec(cpu2, 5, 1)
 
@@ -363,6 +375,12 @@ def test_attempt_logger_reset_is_per_miner_not_whole_dispatch_dir(
     assert len(query_by_dispatch("rig-qpu", 5, log_dir=tmp_path)) == 2, (
         "a sibling miner's attempts in the same dispatch dir must survive"
     )
+    assert query_stored_solutions(
+        5, log_dir=tmp_path, miner_id="rig-cpu",
+    ) == [], "the restarted miner's stale solutions must be cleared"
+    assert len(
+        query_stored_solutions(5, log_dir=tmp_path, miner_id="rig-qpu")
+    ) == 1, "a sibling miner's stored solutions must survive the reset"
 
 
 def test_solution_store_writes_packed_spins(tmp_path: Path) -> None:

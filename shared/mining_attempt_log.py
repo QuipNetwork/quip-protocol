@@ -193,26 +193,49 @@ class AttemptLogger:
     def _reset_dispatch_artifacts(self, dispatch_id: int) -> None:
         """Remove this miner's stale per-dispatch artifacts on first use.
 
-        Clears only ``attempts-{miner_id}.jsonl`` and
-        ``metadata-{miner_id}.json`` for this miner — a concurrent miner
-        sharing the same numeric dispatch dir (each handle runs its own
-        dispatch_id counter) keeps its files. Missing files are fine; any
-        other OS error is logged, never raised — clearing must not block
-        mining.
+        Clears this miner's ``attempts-{miner_id}.jsonl``,
+        ``metadata-{miner_id}.json``, and its ``solutions/`` files for the
+        dispatch. All of these are partitioned by ``dispatch_id`` — a
+        controller-local counter that resets on restart — so a reused id
+        would otherwise accrete prior-run data. A concurrent miner sharing
+        the same numeric dispatch dir (each handle runs its own dispatch_id
+        counter) keeps its files: the attempts/metadata names embed the
+        miner id, and solution files are matched on the ``miner_id`` field
+        in their JSON body (the same key ``query_stored_solutions`` filters
+        on). Missing files are fine; any other OS error is logged, never
+        raised — clearing must not block mining.
         """
         dispatch_dir = _dispatch_dir(self.log_dir, dispatch_id)
         safe = _safe_filename_part(self.miner_id)
         for name in (f"attempts-{safe}.jsonl", f"metadata-{safe}.json"):
+            self._unlink_quietly(dispatch_dir / name, dispatch_id)
+        # solutions/ filenames are {iter:06d}-{nonce8} — no miner id — and
+        # multiple miners write into one dispatch's folder, so select this
+        # miner's files by the body's miner_id before deleting.
+        sol_dir = dispatch_dir / "solutions"
+        if not sol_dir.is_dir():
+            return
+        for path in sol_dir.iterdir():
             try:
-                (dispatch_dir / name).unlink()
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "AttemptLogger: could not clear stale %s in dispatch "
-                    "%d: %s", name, dispatch_id, exc,
-                )
+                rec = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if rec.get("miner_id") == self.miner_id:
+                self._unlink_quietly(path, dispatch_id)
+
+    @staticmethod
+    def _unlink_quietly(path: Path, dispatch_id: int) -> None:
+        """Unlink ``path``; ignore missing, log (never raise) other errors."""
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "AttemptLogger: could not clear stale %s in dispatch "
+                "%d: %s", path.name, dispatch_id, exc,
+            )
 
     def _metadata(self, dispatch_id: int) -> "MetadataLogger":
         existing = self._metadata_by_dispatch.get(dispatch_id)
