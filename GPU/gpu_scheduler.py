@@ -20,8 +20,8 @@ State machine per slot:
 
 import enum
 import logging
+import multiprocessing as mp
 import os
-import threading
 from typing import List, Optional
 
 import cupy as cp
@@ -35,6 +35,29 @@ try:
     NVML_AVAILABLE = True
 except ImportError:
     NVML_AVAILABLE = False
+
+
+# Module-level globals used only inside the monitor child process.
+_NVML_INDEX: int = 0
+_NVML_HANDLE = None  # type: ignore[assignment]
+
+
+def poll_nvml_gpu_util() -> int:
+    """Zero-arg NVML utilization poll for the monitor process.
+
+    The spawned monitor re-imports this module and calls nvmlInit() once on
+    first use; the device index comes from QUIP_NVML_INDEX (set when the
+    scheduler spawns the monitor).
+
+    Returns:
+        GPU utilization percentage 0-100, or 0 on error.
+    """
+    global _NVML_INDEX, _NVML_HANDLE  # noqa: PLW0603
+    if _NVML_HANDLE is None:
+        pynvml.nvmlInit()
+        _NVML_INDEX = int(os.environ.get("QUIP_NVML_INDEX", "0"))
+        _NVML_HANDLE = pynvml.nvmlDeviceGetHandleByIndex(_NVML_INDEX)
+    return int(pynvml.nvmlDeviceGetUtilizationRates(_NVML_HANDLE).gpu)
 
 
 def _is_mps_active() -> bool:
@@ -284,9 +307,9 @@ class KernelScheduler:
 
         # NVML monitor (only when yielding=True)
         self._nvml_handle = None
-        self._nvml_thread = None
-        self._nvml_stop = threading.Event()
-        self._external_util_pct = 0
+        self._util_value = mp.get_context("spawn").Value("i", 0)
+        self._util_proc = None
+        self._util_stop = None
         self._poll_interval = poll_interval
 
         # Hysteresis: require 2 stable readings before scaling
@@ -297,7 +320,7 @@ class KernelScheduler:
             self._start_nvml_monitor()
 
     def _start_nvml_monitor(self) -> None:
-        """Start NVML polling thread for yielding mode."""
+        """Start NVML utilization monitor process for yielding mode."""
         if not NVML_AVAILABLE:
             logger.warning(
                 "pynvml not installed — yielding mode will "
@@ -306,22 +329,12 @@ class KernelScheduler:
             return
 
         try:
+            # Initialize NVML in the parent to get a handle for process
+            # enumeration (count_external_gpu_processes). The monitor child
+            # does its own nvmlInit() via poll_nvml_gpu_util().
             pynvml.nvmlInit()
             self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(
                 self._device_id,
-            )
-            self._nvml_thread = threading.Thread(
-                target=self._poll_loop,
-                daemon=True,
-                name=(f"SmBudgetMonitor-{self._device_id}"),
-            )
-            self._nvml_thread.start()
-            logger.info(
-                "NVML monitor started for device %d "
-                "(yielding, ceiling=%d%%, poll=%.1fs)",
-                self._device_id,
-                self._gpu_utilization_pct,
-                self._poll_interval,
             )
         except Exception as e:
             logger.warning(
@@ -329,18 +342,26 @@ class KernelScheduler:
                 e,
             )
             self._nvml_handle = None
+            return
 
-    def _poll_loop(self) -> None:
-        """Daemon thread: poll NVML utilization."""
-        while not self._nvml_stop.is_set():
-            try:
-                util = pynvml.nvmlDeviceGetUtilizationRates(
-                    self._nvml_handle,
-                )
-                self._external_util_pct = util.gpu
-            except Exception:
-                pass  # Keep last known value
-            self._nvml_stop.wait(self._poll_interval)
+        os.environ["QUIP_NVML_INDEX"] = str(self._device_id)
+        from GPU.util_monitor import util_monitor_main
+        from shared.proc_util import spawn_worker
+
+        self._util_stop = mp.get_context("spawn").Event()
+        self._util_proc = spawn_worker(
+            util_monitor_main,
+            (self._util_value, self._util_stop, self._poll_interval,
+             "GPU.gpu_scheduler:poll_nvml_gpu_util"),
+            name=f"nvml-monitor-{self._device_id}",
+        )
+        logger.info(
+            "NVML monitor process started for device %d "
+            "(yielding, ceiling=%d%%, poll=%.1fs)",
+            self._device_id,
+            self._gpu_utilization_pct,
+            self._poll_interval,
+        )
 
     def get_sm_budget(self) -> int:
         """SM budget is always static from config.
@@ -363,7 +384,7 @@ class KernelScheduler:
         """
         if not self._yielding or self._nvml_handle is None:
             return False
-        return self._external_util_pct > 90
+        return self._util_value.value > 90
 
     def count_external_gpu_processes(self) -> int:
         """Count non-self processes using this GPU.
@@ -439,7 +460,7 @@ class KernelScheduler:
         if external_count <= 0:
             return max_nonces
 
-        total_util = self._external_util_pct
+        total_util = self._util_value.value
         our_est = (
             self._gpu_utilization_pct
             * active_nonces
@@ -493,10 +514,11 @@ class KernelScheduler:
         return None
 
     def stop(self) -> None:
-        """Synchronize streams and stop NVML polling thread."""
+        """Synchronize streams and stop NVML monitor process."""
         self._compute_stream.synchronize()
         for slot in self.slots:
             slot.stream.synchronize()
-        self._nvml_stop.set()
-        if self._nvml_thread is not None:
-            self._nvml_thread.join(timeout=2.0)
+        if self._util_proc is not None:
+            self._util_stop.set()
+            from shared.proc_util import terminate_join
+            terminate_join(self._util_proc, 2.0)
