@@ -14,65 +14,49 @@ vertex-sum convolution.
 
 ## When the engine uses this package
 
-`tutte/synthesis/engine.py::_synthesize_inner` dispatches to several
-entry points in this package, each gated to `edge_count ≥ 60`:
+`tutte/synthesis/engine.py::_synthesize_inner` dispatches to two live
+entry points in this package:
 
-| Entry point                                          | Trigger                                                                                       |
-| ---------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `compute_cell_quotient_grid_dp_streamed`             | 2D-grid cell-quotient of `K_{a,b}` cells with disjoint per-direction anchors (Cm_2 fits)      |
-| `compute_cell_quotient_cycle_dp`                     | Cell-quotient is a simple cycle (Cm_2 cycle topology)                                         |
-| `compute_cell_quotient_tree_dp`                      | Cell-quotient is a tree (`n` cells, `n − 1` junctions, no cycles)                              |
-| `compute_cell_quotient_bipartite_junction_dp`        | Non-matching bipartite junctions (Z(m, t) families with multi-degree anchors)                  |
-| `compute_bipartite_junction_per_component_dp`        | Splits a disconnected junction into per-component sub-junctions to bound joint-boundary Bell counts |
-| `compute_cell_quotient_hybrid`                       | Chord-rule cycle-close + per-leaf synthesis for cyclic cell-quotients (Cm_3's 3×3 grid)         |
+| Entry point                                          | Engine step | Trigger                                                                                       |
+| ---------------------------------------------------- | ----------- | --------------------------------------------------------------------------------------------- |
+| `compute_chain_full_poly_from_spec`                  | 7.4 (`edge_count ≥ 80`) | Cell-quotient is a linear chain of ≥ 3 cells; extracts a transfer matrix and iterates it (Chimera Cm(1, n)) |
+| `compute_cell_quotient_grid_dp_streamed`             | 7.45 (`edge_count ≥ 60`) | 2D-grid cell-quotient of `K_{a,b}` cells with disjoint per-direction anchors (Cm_2 fits)      |
 
-All dispatchers share the precondition: `try_hierarchical_partition`
+Both dispatchers share the precondition: `try_hierarchical_partition`
 (in `tutte/graphs/covering.py`) must return a cell decomposition. If
 no decomposition is found or the cell-quotient topology doesn't match,
 the entry returns `None` and the engine falls through.
+
+The remaining cell-quotient routines in this package
+(`compute_cell_quotient_tree_dp`,
+`compute_cell_quotient_bipartite_junction_dp` and its per-component
+variant) are **chain-recurrence infrastructure**: the chain path
+(7.4) builds its `(cell, junction)` spec via
+`build_bipartite_junction_spec` and carries it as a `CellTreeSpec`.
+They are no longer dispatched directly from the engine cascade. The
+former cycle and hybrid cell-quotient DPs moved to
+[`../deprecated/`](../deprecated/README.md).
 
 ## Module map
 
 | File                                                                       | Purpose                                                                                                                                                                                       |
 | -------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`__init__.py`](__init__.py)                                               | Public engine entries (`compute_cell_quotient_cycle_dp`, `compute_cell_quotient_tree_dp`, `compute_cell_quotient_grid_dp_streamed`) plus re-exports.                                          |
+| [`__init__.py`](__init__.py)                                               | Public engine entries (`compute_cell_quotient_grid_dp_streamed`, `compute_cell_quotient_tree_dp`) plus re-exports.                                                                            |
 | [`rooted_tutte.py`](rooted_tutte.py)                                       | Brute-force `T_rooted` (cells of ≤ 16 edges); boundary primitives (`join_partitions`, `delta`, `restrict_partition`, `divide_by_x_minus_1_power`); persistent rooted-lookup load/save.        |
 | [`aut_orbit.py`](aut_orbit.py)                                             | Aut-based orbit canonicaliser: `compute_cell_aut` (VF2), `canonical_partition` (lex-min over aut), `aut_compress_t_rooted`, `build_relabel_aut`. Generic over any cell with non-trivial aut.    |
 | [`cell_anchor_adapter.py`](cell_anchor_adapter.py)                         | Graph-agnostic cycle / grid / tree topology detection plus per-cell anchor alignment (`normalize_cell_anchors_for_cycle`, `detect_cell_anchor_groups`, `extract_grid_specs`, `extract_path_specs`). |
 | [`cell_quotient_helpers.py`](cell_quotient_helpers.py)                     | Hot-path helpers: `precompute_M_table` (orbit-level), `orbit_convolve` (raw-dict arithmetic + `_polynomial_c.poly_mul`), `enumerate_partitions_cached`, junction component count `c_J`.        |
-| [`cell_quotient_cycle.py`](cell_quotient_cycle.py)                         | `compute_cycle_dp(cell_template, ..., n_cells)` — cycle-topology DP with explicit identification close.                                                                                       |
 | [`cell_quotient_path.py`](cell_quotient_path.py)                           | `compute_path_dp(...)` — path-of-cells DP (no closing step). Returns the boundary-partition-indexed dict; consumed by `cell_quotient_grid.py`.                                                |
 | [`cell_quotient_grid.py`](cell_quotient_grid.py)                           | `compute_grid_dp_streamed_kab(...)` — composes a 2D grid via row path DPs convolved through vertical junctions; streaming version avoids OOM on Cm_3-scale targets.                            |
-| [`cell_quotient_tree.py`](cell_quotient_tree.py)                           | `compute_tree_dp_recursive` — branching cell-tree topology DP via post-order recursion (orbit-compressed). `CellTreeSpec` carries the topology + per-cell anchor groups.                       |
-| [`cell_quotient_hybrid.py`](cell_quotient_hybrid.py)                       | `compute_cell_quotient_hybrid` — chord-rule cycle-close + per-leaf synth for cyclic cell-quotients (Cm_3's grid topology).                                                                    |
-| [`cell_quotient_bipartite_junction.py`](cell_quotient_bipartite_junction.py) | `compute_cell_quotient_bipartite_junction_dp` + per-component variant. Generalises the k-matching path to non-matching bipartite junctions; per-component variant bounds joint Bell counts.    |
+| [`cell_quotient_tree.py`](cell_quotient_tree.py)                           | `compute_tree_dp_recursive` — branching cell-tree topology DP via post-order recursion (orbit-compressed). `CellTreeSpec` carries the topology + per-cell anchor groups; the chain-recurrence path builds on it. Live chain-recurrence infrastructure. |
+| [`cell_quotient_bipartite_junction.py`](cell_quotient_bipartite_junction.py) | `build_bipartite_junction_spec` (consumed by the chain-recurrence path) + `compute_cell_quotient_bipartite_junction_dp` and its per-component variant. Generalises the k-matching path to non-matching bipartite junctions; per-component variant bounds joint Bell counts. Live chain-recurrence infrastructure. |
 | [`chain_recurrence.py`](chain_recurrence.py)                               | Constructive re-derivation of Noy & Ribò (2007) for chain-of-cells families. Faddeev-LeVerrier mod p extracts the order-`r` recurrence in ms per modular point.                              |
 | [`chord_junction_closed_form.py`](chord_junction_closed_form.py)            | Unified bivariate chord-junction theorem (matching `E_J`). Symmetric + asymmetric closed forms over `2^|V_k|` merger terms. Backed by persistent merger lookup table.                          |
 | [`sokal_z_chord_junction.py`](sokal_z_chord_junction.py)                    | Sokal-Z generalization for **arbitrary** `E_J` (non-matching / multi-edge). Brute-force + per-H_J-component + edge-by-edge tree-DP enumeration; multi-point eval + bivariate Lagrange interpolation. Handles Z(1,2)-class junctions where the matching-only theorem fails. |
 | [`signed_quotient.py`](signed_quotient.py)                                  | Live σ-finder `find_best_sigma` for the σ-equivariant chord-ordering path (used by the engine + `graphs/k_sum.py`). The test-only signed-DP-via-interpolation pipeline moved to [`../deprecated/`](../deprecated/README.md). |
-| [`multivariate.py`](multivariate.py)                                        | Reference Sokal multivariate `Z(G; q, vₑ)` ring (`UniformZ`, `MultivariateTutte`) + the Z↔T identity that underpins the chord-junction theory. Used as a cross-check oracle in tests. (Moved here from the package root in the 2026-05 cleanup.) |
 | [`_partition_c.py`](_partition_c.py)                                       | cffi C extension wrappers for partition / canonicalisation hot paths (`apply_perm_canonical_c`, `h_canonicalize_c_batched`, `precompute_M_batched_inner_c_mod`).                              |
 
 ## Algorithm overview
-
-### Cycle DP — three phases
-
-1.  **Path DP through `n − 1` junction-cell pairs.** Maintain
-    `state_orbit_T` (orbit-compressed boundary-partition-indexed
-    `T_rooted`) plus an accumulating `(x − 1)` divisor power. Each step
-    convolves the current state with the next junction
-    (`precompute_M_table` → `orbit_convolve`), then with the next cell.
-2.  **Cycle close, step 1.** Convolve the state with the closing
-    junction to a fresh boundary. The state now spans
-    `state_left ∪ pos_cB_FRESH`.
-3.  **Cycle close, step 2 — identification.** Identify
-    `state_left[i] ≡ pos_cB_FRESH[i]` for each `i`. The chain-aware
-    union-find formula
-
-        T(cycle) = (x − 1)^{−a} · Σ_P ((x − 1)(y − 1))^{actually_same(P)} · T_rooted_int[P]
-
-    where `actually_same(P) = a − n_merges(P)`, correctly accounts for
-    identifications that chain through `P`'s blocks.
 
 ### Tree DP — post-order recursion
 
@@ -153,8 +137,10 @@ boundary positions is the remaining work to unlock Cm_3 via this path.
 
 ## Testing
 
-`tutte/tests/test_roots.py` covers the cycle / grid / tree /
-interleaved DPs against the engine + Kirchhoff oracle.
+`tutte/tests/test_roots.py` covers the live grid / tree DPs against
+the engine + Kirchhoff oracle (it also exercises the deprecated cycle
+and interleaved DPs from their new home in
+[`../deprecated/`](../deprecated/README.md) so they don't bit-rot).
 `tutte/tests/test_cell_quotient_bipartite_junction.py` covers the
 bipartite-junction DP including the per-component decomposition.
 `tutte/tests/test_chain_recurrence.py` covers chain + cycle
@@ -165,7 +151,7 @@ recurrences (the Noy-Ribò re-derivation).
 - [`tutte/docs/06_3_rooted_tutte_framework.md`](../docs/06_3_rooted_tutte_framework.md)
   — algebraic foundation for rooted Tutte composition
 - [`tutte/docs/06_4_cell_quotient_cycle_dp.md`](../docs/06_4_cell_quotient_cycle_dp.md)
-  — cycle DP deep dive
+  — cycle DP deep dive (module now in [`../deprecated/`](../deprecated/README.md))
 - [`tutte/docs/06_5_cell_quotient_grid_dp.md`](../docs/06_5_cell_quotient_grid_dp.md)
   — grid DP and streaming variants
 - [`tutte/docs/06_6_cell_quotient_tree_dp.md`](../docs/06_6_cell_quotient_tree_dp.md)

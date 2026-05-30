@@ -11,7 +11,8 @@ matrix (§6.7) when stacked into a chain.
 > **Status**: proved May 25 2026. Symmetric and asymmetric forms shipped
 > in `tutte/roots/chord_junction_closed_form.py`; engine dispatch wired
 > at `tutte/synthesis/engine.py::_try_unified_chord_junction`; persistent
-> merger cache in `tutte/data/merger_lookup_table.{bin, json}`.
+> merger cache in `tutte/data/merger_lookup_table.bin` (the `.bin` is
+> authoritative; the JSON mirror is no longer written).
 
 ## 1. Statement
 
@@ -63,8 +64,7 @@ all-empty term into the `(x − 1)` coefficient yields the formula above.
 A complete proof is in
 [`tutte/research/cyclotomic_chord_junction_theorem.md`](../research/cyclotomic_chord_junction_theorem.md);
 empirical validation across `K_2`, `K_3`, `P_3`, `C_4`, diamond, `K_4`,
-`K_{4,4}` (Chimera cell), and a `1×3` Chimera chain is locked in by
-`tutte/tests/test_unified_chord_junction.py`.
+`K_{4,4}` (Chimera cell), and a `1×3` Chimera chain is locked in.
 
 ## 3. Equivalence with `apply_kmatching_formula`
 
@@ -131,7 +131,9 @@ recurrence form. They share the same merger values internally.
 ## 5. Merger lookup table
 
 The persistent cache lives at
-`tutte/data/merger_lookup_table.{bin, json}`, parallel to the existing
+`tutte/data/merger_lookup_table.bin` (the authoritative format; the JSON
+mirror is no longer written, though `load_default_merger_table` still
+reads a `.json` if one is present), parallel to the existing
 `lookup_table`, `multigraph_lookup_table`, and `rooted_lookup_table`.
 Each entry is a `MergerEntry` (`tutte/lookup/merger.py`):
 
@@ -189,10 +191,11 @@ Current contents (post Step 6/7):
 Both tiers bound `|V_k| ≤ 6` (`_UNIFIED_CHORD_JUNCTION_MAX_VK`) — `2^6
 = 64` sub-syntheses is the break-even against the legacy chord rule.
 
-The `HybridSynthesisEngine` composes a `SynthesisEngine` internally
-and delegates `_try_decomposition_chord_peel` to it
-(`tutte/synthesis/hybrid.py::607`), so the hybrid engine inherits the
-unified-chord-junction fast path without separate wiring.
+The Round 3 cleanup collapsed the former `HybridSynthesisEngine` /
+`AlgebraicSynthesisEngine` into the single `SynthesisEngine` (a.k.a.
+CEJ), so `_try_decomposition_chord_peel` — and with it the
+unified-chord-junction fast path — now lives in one place with no
+separate hybrid wiring to keep in sync.
 
 ## 6. Specialisations
 
@@ -323,11 +326,6 @@ H_J structure tables.
   `--family {chimera, pegasus, zephyr, all}`.
 - **Engine wiring**: `tutte/synthesis/engine.py` —
   `_try_unified_chord_junction`, `_UNIFIED_CHORD_JUNCTION_MAX_VK`.
-- **Tests**: `tutte/tests/test_unified_chord_junction.py` (theorem
-  validation), `tutte/tests/test_chord_junction_closed_form.py`
-  (production module), `tutte/tests/test_merger_lookup.py` (cache
-  contract), `tutte/tests/test_engine_unified_chord_dispatch.py`
-  (engine integration).
 - **Related**:
   - §8.3 [k-Matching Formula](08_3_kmatching_formula.md) — the symmetric
     matching special case.

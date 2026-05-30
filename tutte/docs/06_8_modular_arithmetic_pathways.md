@@ -144,8 +144,6 @@ Design notes live in
 - `tutte/roots/cell_quotient_helpers.py:precompute_M_and_convolve_streaming_mod` — modular streaming convolve
 - `tutte/roots/_partition_c.py:precompute_M_batched_inner_c_mod` — C-ext dispatch
 - `tutte/research/scripts/cm_modular_interp.py` — multiprocessing wrapper for Cm₂/Cm₃
-- `tutte/tests/test_modular_tree_dp.py` — 5 modular cell-tree DP tests
-- `tutte/tests/test_modular_vs_engine.py` — validation backbone across 13 graph families
 
 ## See also
 

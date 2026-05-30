@@ -85,12 +85,12 @@ same family of techniques (e.g., cell-quotient DPs).
 | #    | Technique                                                            | When Used                                                                                                                                                   | Complexity                                       |
 | ---- | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
 | 6.3  | [Rooted Tutte — Algebraic Framework](06_3_rooted_tutte_framework.md) | _(Theory reference)_ — math underneath the cell-quotient DPs                                                                                                | (theory)                                         |
-| 6.4  | [Cell-Quotient Cycle DP](06_4_cell_quotient_cycle_dp.md)             | Cell-decomposable graphs whose cell-quotient is a simple cycle (Cm_2)                                                                                       | `O(n × Bell(W)² × poly²)` per junction step      |
+| 6.4  | [Cell-Quotient Cycle DP](06_4_cell_quotient_cycle_dp.md)             | _(No longer dispatched)_ — cell-quotient cycle topology (Cm_2). Module moved to [`../deprecated/`](../deprecated/README.md); cycle targets now route through the grid DP / chain recurrence. | `O(n × Bell(W)² × poly²)` per junction step      |
 | 6.5  | [Cell-Quotient Grid DP](06_5_cell_quotient_grid_dp.md)               | Cell-decomposable graphs with `(rows × cols)` grid quotient; the streamed `K_{a,b}` path is the engine's go-to for Cm_2-style grids                          | `O(rows × cols × Bell(W)² × poly²)`              |
 | 6.6  | [Cell-Quotient Tree DP](06_6_cell_quotient_tree_dp.md)               | Cell-decomposable graphs with arbitrary tree quotient                                                                                                       | `O(n × Bell(W)² × poly²)`                        |
 | 6.7  | [Chain & Cycle Recurrence Algebra](06_7_chain_recurrence_algebra.md) | Chain-of-cells families; explicit re-derivation of Noy-Ribò 2007 with order `r = n_orbits` and Faddeev-LeVerrier mod p                                       | `O(r)` modular muls per cell after one-time `M` extraction |
 | 6.8  | [Modular Arithmetic Pathways](06_8_modular_arithmetic_pathways.md)   | Graphs whose coefficients overflow `int64` mid-DP; modular point-value evaluation + Lagrange interpolation + CRT                                            | per-point cost × grid × `n_primes`               |
-| 6.9  | [Signed-Graph DP & σ-Equivariant Decomposition](06_9_signed_equivariant_dp.md) | Graphs with order-2 automorphism σ; computes `T_fix^σ` via Zaslavsky-frame DP on the σ-quotient                                              | depends on quotient treewidth                    |
+| 6.9  | [Signed-Graph DP & σ-Equivariant Decomposition](06_9_signed_equivariant_dp.md) | The live σ-finder (`find_best_sigma`) still feeds the σ-equivariant chord-ordering path; the signed-graph DP that computed `T_fix^σ` on the σ-quotient moved to [`../deprecated/`](../deprecated/README.md). | depends on quotient treewidth                    |
 
 ### General-purpose DPs
 
@@ -98,7 +98,7 @@ same family of techniques (e.g., cell-quotient DPs).
 | ---- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
 | 6.1  | [Cotree DP](06_1_cotree_dp.md)                     | Cographs (`P_4`-free); also reached when treewidth DP can't fit (K_12+, large K_{a,b}, threshold graphs)   | `exp(O(n^{2/3}))` — subexponential                                   |
 | 6.2  | [Almost-Cograph DP](06_2_almost_cograph_dp.md)     | Graphs that become cographs after removing ≤ 16 anomaly edges                                              | 1 cotree DP + `O(|A|)` recursive syntheses                           |
-| 6    | [Treewidth DP](06_treewidth_dp.md)                 | Graphs ≥ 10 edges with treewidth ≤ 11; small-graph short-circuit at `tw ≤ 8` for `n ≤ 20`                  | `O(2^tw × n)` C extension                                            |
+| 6    | [Treewidth DP](06_treewidth_dp.md)                 | Graphs ≥ 10 edges with treewidth ≤ 11                                                                       | `O(2^tw × n)` C extension                                            |
 
 ### Chord-rule fallbacks
 
@@ -190,12 +190,12 @@ exceeding `int64`, the modular-CRT path activates at `m > 62`.
 The synthesis engine is split across several subpackages; each has its
 own README with module-level details:
 
-- [`tutte/synthesis/`](../synthesis/README.md) — `SynthesisEngine`,
-  `HybridSynthesisEngine`, and the shared `BaseMultigraphSynthesizer`.
+- [`tutte/synthesis/`](../synthesis/README.md) — `SynthesisEngine` and
+  the shared `BaseMultigraphSynthesizer`.
 - [`tutte/graphs/`](../graphs/README.md) — series-parallel, treewidth
-  DP, k-sum chord rule, signed/σ-equivariant DPs.
-- [`tutte/roots/`](../roots/README.md) — cell-quotient cycle / grid /
-  tree DPs, chain recurrence, modular point-value pathways.
+  DP, k-sum chord rule.
+- [`tutte/roots/`](../roots/README.md) — cell-quotient grid / tree
+  DPs, chain recurrence, modular point-value pathways.
 - [`tutte/lookup/`](../lookup/README.md) — rainbow table, canonical
   keys, binary serialisation.
 - [`tutte/transfer_matrix/`](../transfer_matrix/README.md) — periodic
@@ -203,31 +203,28 @@ own README with module-level details:
 - [`tutte/data/`](../data/README.md) — pre-computed lookup tables.
 - [`tutte/tests/`](../tests/README.md) — parametrised test suite.
 - [`tutte/benchmarks/`](../benchmarks/README.md) — standalone benchmark
-  sweep (CEJ + Hybrid + NetworkX).
+  sweep (CEJ + NetworkX).
 
-## Engine variants
+## Engine
 
-- **`SynthesisEngine`** — primary cascade (steps 1–11 above).
-- **`HybridSynthesisEngine`** — structural-first variant; delegates to
-  `SynthesisEngine` for the structural decomposition step.
-- **`AlgebraicSynthesisEngine`** — polynomial-level GCD decomposition,
-  used by the visualizer for explanatory output.
+- **`SynthesisEngine`** — the single cascade (steps 1–9 above). There
+  is no separate hybrid or algebraic engine; all techniques live in
+  this one cascade.
 
 ## Benchmarks
 
 The benchmark suite (`tutte/benchmarks/benchmark.py`) measures
-wall-clock synthesis time across three engines, starting from an
-empty rainbow table. After each successful synthesis, the computed
-polynomial is added to the engine's rainbow table so subsequent
-graphs may use it as a tile or minor. Graphs are processed in
-ascending order of edge count.
+wall-clock synthesis time for the CEJ engine against NetworkX,
+starting from an empty rainbow table. After each successful synthesis,
+the computed polynomial is added to the engine's rainbow table so
+subsequent graphs may use it as a tile or minor. Graphs are processed
+in ascending order of edge count.
 
 ### Engines compared
 
 | Engine                               | Description                                   | Default Timeout |
 | ------------------------------------ | --------------------------------------------- | --------------- |
-| **CEJ** (`SynthesisEngine`)          | Steps 1–11 with growing rainbow table         | 60s             |
-| **Hybrid** (`HybridSynthesisEngine`) | Algebraic + tiling with growing rainbow table | 60s             |
+| **CEJ** (`SynthesisEngine`)          | Steps 1–9 with growing rainbow table          | 60s             |
 | **NetworkX** (`nx.tutte_polynomial`) | Reference deletion-contraction (no table)     | 30s             |
 
 ### Graph set

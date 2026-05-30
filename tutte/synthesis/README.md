@@ -1,20 +1,16 @@
 # tutte.synthesis
 
-Synthesis engines for computing Tutte polynomials. Two production
-engines (`SynthesisEngine` and `HybridSynthesisEngine`) share the same
-cascade of structural fast paths; they differ in the order of
-algebraic vs structural steps.
+Synthesis engine for computing Tutte polynomials. A single engine,
+`SynthesisEngine`, runs a cascade of structural and algebraic fast
+paths; the first to succeed wins.
 
 ## Modules
 
-| Module          | Description                                                                                                          |
-| --------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `base.py`       | `UnionFind`, `BaseMultigraphSynthesizer`, `SynthesisResult` — shared infrastructure for all engines                  |
-| `engine.py`     | `SynthesisEngine` — primary cascade: family recognition, lookup, cell-quotient DPs, treewidth DP, chord rule, CEJ    |
-| `hybrid.py`     | `HybridSynthesisEngine` — structural-first variant that prioritises treewidth DP and the closed-form formulas        |
-| `algebraic.py`  | `AlgebraicSynthesisEngine` — polynomial-level GCD/factorization decomposition used by the visualizer                 |
-| `parallel.py`   | `parallel_synthesize_pair` — multiprocess helper for synthesizing two graphs in parallel                             |
-| `symmetric.py`  | `find_cell_automorphism`, `build_symmetric_chord_order` — symmetry-aware chord ordering for the iterative chord rule |
+| Module        | Description                                                                                                                       |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `base.py`     | `UnionFind`, `BaseMultigraphSynthesizer`, `SynthesisResult` — shared multigraph-synthesis infrastructure                          |
+| `engine.py`   | `SynthesisEngine` — the cascade: family recognition, lookup, cell-quotient grid / chain recurrence, treewidth DP, chord rule, CEJ |
+| `parallel.py` | `parallel_synthesize_pair` — multiprocess helper for synthesizing two graphs in parallel                                          |
 
 ## Engine cascade
 
@@ -39,28 +35,24 @@ order; the first to succeed wins. The cascade as it stands today:
 7. **Series-parallel** — `compute_sp_tutte_if_applicable(graph)` in
    `tutte/graphs/series_parallel.py`. `O(n + m)` recognition plus
    `O(n)` SP-tree synthesis.
-8. **Cell-quotient and closed-form paths** (gated to `edge_count ≥ 60`):
+8. **Cell-quotient and closed-form paths** (gated by edge count):
+   - **Chain recurrence** — `compute_chain_full_poly_from_spec` for
+     cell-decomposable graphs whose cell-quotient is a chain (e.g.
+     Chimera chains). Uses `build_bipartite_junction_spec` →
+     `CellTreeSpec` (`roots/cell_quotient_bipartite_junction.py`,
+     `roots/cell_quotient_tree.py`).
    - `compute_cell_quotient_grid_dp_streamed` — 2D-grid cell-quotient
      for `K_{a,b}`-style cells with disjoint per-direction anchors
      (Cm_2-style).
    - `_try_formula_shortcircuit` — unified formula (cell-pairs share a
      single vertex-pair connection) and k-matching formula (matchings
      between vertex-transitive cells).
-   - `compute_tutte_cotree_dp` — subexponential
-     `exp(O(n^{2/3}))` for cographs.
-   - Small-graph treewidth_dp short-circuit (`n ≤ 20`, `m ≥ 10`,
-     `max_width=8`) — beats almost-cograph on dense cubic graphs like
-     Heawood/Petersen.
+   - `compute_tutte_cotree_dp` — subexponential `exp(O(n^{2/3}))` for
+     cographs.
    - `compute_tutte_almost_cograph` — cotree DP plus chord rule on up
-     to 16 anomaly edges.
-   - `compute_cell_quotient_cycle_dp` — cycle-topology cell-quotient.
-   - `compute_cell_quotient_tree_dp` — tree-topology cell-quotient.
-   - `compute_cell_quotient_bipartite_junction_dp` and
-     `compute_bipartite_junction_per_component_dp` — non-matching
-     bipartite junctions; per-component variant avoids Bell-number
-     walls on joint boundary partitions.
-   - `compute_cell_quotient_hybrid` — chord-rule cycle-close plus
-     per-leaf synthesis for cyclic cell-quotients.
+     to 16 anomaly edges. Reached before treewidth DP (the small-graph
+     treewidth short-circuit was removed, so cograph-ish graphs route
+     here directly).
 9. **Treewidth DP** — `compute_treewidth_tutte_if_applicable` for
    `edge_count ≥ 10` and `tw ≤ 11`. C extension gated to
    `5 ≤ tw ≤ 10`; Python fallback above.
@@ -85,45 +77,35 @@ The full per-stage doc index is in
 ```mermaid
 graph TD
     B["BaseMultigraphSynthesizer<br/>(base.py)"] --> E["SynthesisEngine<br/>(engine.py)"]
-    B --> A["AlgebraicSynthesisEngine<br/>(algebraic.py)"]
-    E --> H["HybridSynthesisEngine<br/>(hybrid.py)"]
-    A --> H
 ```
 
-`HybridSynthesisEngine` instantiates a `SynthesisEngine` internally for
-its structural decomposition step (`_try_structural`); the two share
-the multigraph cache to avoid double-computing chord-rule leaves.
+`SynthesisEngine` extends `BaseMultigraphSynthesizer`, which holds the
+shared multigraph cache and chord-rule machinery.
 
 ## Usage
 
 ```python
 from tutte.lookup import load_default_table
-from tutte.synthesis import SynthesisEngine, HybridSynthesisEngine
+from tutte.synthesis import SynthesisEngine
 
 table = load_default_table()
-
-# Primary engine
 result = SynthesisEngine(table).synthesize(graph)
-
-# Structural-first variant (preferred for benchmarking; same correctness)
-result = HybridSynthesisEngine(table).synthesize(graph)
 ```
 
-Both engines auto-load the rooted-Tutte lookup table from
-`tutte/data/` at construction time (best-effort; the engine works
-without it).
+The engine auto-loads the rooted-Tutte lookup table from `tutte/data/`
+at construction time (best-effort; the engine works without it).
 
 ## Engine flags
 
-| Flag                          | Default | Effect                                                                                                                                                       |
-| ----------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `verbose`                     | `False` | Print per-stage progress                                                                                                                                     |
-| `auto_promote`                | `False` | Promote every synthesized simple graph to the rainbow table                                                                                                  |
-| `promote_cache_on_finish`     | `False` | At the end of each top-level `synthesize()`, flush cache entries to the persistent lookup tables                                                             |
-| `k_max`                       | `12`    | Max `k` for the k-sum vertex-separator search (clamped to 20)                                                                                                |
-| `chord_smart_order`           | `True`  | Sort chord edges by descending `|N(u) ∩ N(v)|` so parallel-edge / loop fast paths fire sooner                                                                |
-| `chord_sigma_order`           | `True`  | Reorder chords so σ-orbits are contiguous, maximising canonical-key cache hits on isomorphic intermediate contractions                                       |
-| `skip_target_lookup`          | `False` | Top-level call skips the rainbow-table lookup (sub-problems may still hit it) — used by the visualizer                                                       |
+| Flag                      | Default | Effect                                                                                                                |
+| ------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------- |
+| `verbose`                 | `False` | Print per-stage progress                                                                                              |
+| `auto_promote`            | `False` | Promote every synthesized simple graph to the rainbow table                                                           |
+| `promote_cache_on_finish` | `False` | At the end of each top-level `synthesize()`, flush cache entries to the persistent lookup tables                      |
+| `k_max`                   | `12`    | Max `k` for the k-sum vertex-separator search (clamped to 20)                                                          |
+| `chord_smart_order`       | `True`  | Sort chord edges by descending `|N(u) ∩ N(v)|` so parallel-edge / loop fast paths fire sooner                         |
+| `chord_sigma_order`       | `True`  | Reorder chords so σ-orbits are contiguous, maximising canonical-key cache hits on isomorphic intermediate contractions |
+| `skip_target_lookup`      | `False` | Top-level call skips the rainbow-table lookup (sub-problems may still hit it) — used by the visualizer                 |
 
 ## Related docs
 

@@ -2,8 +2,8 @@
 
 Graph algorithms backing the synthesis engine: series-parallel
 recognition, subgraph covering and hierarchical tiling, treewidth DP
-(with a C extension), the chord-rule k-sum, and signed / σ-equivariant
-DPs that support research paths.
+(with a C extension), the chord-rule k-sum, graph-minor detection, and
+named-family atom detection.
 
 ## Modules
 
@@ -15,8 +15,6 @@ DPs that support research paths.
 | `k_sum.py`                | Chord-rule k-sum (`clique_chord_k_sum`) and boundary quotient (`boundary_quotient_tutte`) — the production path for graphs with vertex separators or hierarchical structure. |
 | `treewidth.py`            | Python tree-decomposition + bag DP wrapper. Dispatches to the C extension when the graph fits.                                                                              |
 | `_treewidth_c.py`         | cffi C extension: bag DP in int64 with `unsigned long long[]` overflow-aware batch reduction, and a modular-CRT path for `m > 62`. C path gated to `5 ≤ tw ≤ 10`.            |
-| `signed_elim_dp.py`       | Vertex-elimination DP for signed/twisted Tutte on a quotient graph; supports modular point evaluation for full-polynomial recovery via interpolation.                       |
-| `_signed_elim_c.py`       | cffi C extension for the signed-elim inner loop.                                                                                                                            |
 | `atom_detection.py`       | Named-family atom finders (K_n cliques, K_{a,b} complete bipartite) and inter-atom junction analysis. Used by `_try_cross_cell_chord_peel` (engine step 7.88) to peel the smallest connected bipartite junction between disjoint dense atoms. See [docs/08_4](../docs/08_4_cross_cell_chord_peel.md). |
 
 ## Module dependencies
@@ -31,8 +29,6 @@ graph TD
     M --> G[tutte.graph]
     TW[treewidth.py] --> TWC[_treewidth_c.py]
     TW --> P
-    SED[signed_elim_dp.py] --> SEC[_signed_elim_c.py]
-    SED --> P
 ```
 
 ## Key algorithms
@@ -76,12 +72,12 @@ bag-by-bag DP in C. The C path is gated to `5 ≤ tw ≤ 10`; the modular-
 CRT path activates at `m > 62` to avoid `int64` overflow on larger
 graphs.
 
-**Signed** — `signed_elim_dp.py` (+ `_signed_elim_c.py`) computes Tutte
-polynomials of signed graphs (edges with ± labels, Zaslavsky's frame
-matroid) via vertex-elimination DP; it feeds the σ-equivariant chord-
-ordering path. (The earlier treewidth-based `signed_treewidth.py` and the
-`sigma_equivariant_dp.py` 2-fold-cover DP were superseded and moved to
-[`../deprecated/`](../deprecated/README.md).) Background:
+**Signed** — the live signed piece is `find_best_sigma` in
+[`../roots/signed_quotient.py`](../roots/signed_quotient.py). The signed-graph
+elimination DP (`signed_elim_dp.py` + `_signed_elim_c.py`, edges with ± labels,
+Zaslavsky's frame matroid) and the earlier treewidth-based `signed_treewidth.py`
+/ `sigma_equivariant_dp.py` 2-fold-cover DP have no live engine consumer and
+were moved to [`../deprecated/`](../deprecated/README.md). Background:
 [`tutte/docs/06_9_signed_equivariant_dp.md`](../docs/06_9_signed_equivariant_dp.md)
 and the matching section of
 [`tutte/research/engine_workflow_primer.md`](../research/engine_workflow_primer.md).

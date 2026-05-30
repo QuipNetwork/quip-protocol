@@ -23,26 +23,29 @@ for back-compat.
 
 ## Data files
 
-The default tables live in [`tutte/data/`](../data/README.md):
+The default tables live in [`tutte/data/`](../data/README.md). The `.bin`
+file is authoritative; JSON mirrors are no longer written, and loaders fall
+back to `.json` only when the `.bin` is missing. To inspect the binary
+tables, use the visualizer
+[`tutte/scripts/visualize_tutte.py`](../scripts/visualize_tutte.py).
 
-| File                                    | Purpose                                                                                  |
-| --------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `lookup_table.bin` / `.json`            | Simple-graph rainbow table (canonical key → polynomial + minor relationships)             |
-| `multigraph_lookup_table.bin` / `.json` | Multigraph cache populated by `SynthesisEngine` during chord-rule contractions            |
-| `rooted_lookup_table.bin` / `.json`     | Cached `T_rooted(cell, boundary)` entries keyed by canonical labels (loaded by the engine at construction) |
+| File                            | Purpose                                                                                  |
+| ------------------------------- | ---------------------------------------------------------------------------------------- |
+| `lookup_table.bin`              | Simple-graph rainbow table (canonical key → polynomial + minor relationships)             |
+| `multigraph_lookup_table.bin`   | Multigraph cache populated by `SynthesisEngine` during chord-rule contractions            |
+| `rooted_lookup_table.bin`       | Cached `T_rooted(cell, boundary)` entries keyed by canonical labels (loaded by the engine at construction) |
 
 ## Data flow
 
 ```mermaid
 graph LR
     B["bootstrap.py<br/>build_basic_table()"] --> C["core.py<br/>RainbowTable"]
-    C --> |save| D["data/lookup_table.json"]
     C --> |encode| E["binary.py"]
     E --> |save| F["data/lookup_table.bin"]
     F --> |load| E
     E --> |decode| C
-    D --> |load| C
-    C --> |"get_entry(key)"| S[Synthesis engines]
+    D["data/lookup_table.json<br/>(fallback only)"] -.-> |"load if .bin missing"| C
+    C --> |"get_entry(key)"| S[SynthesisEngine]
     S --> |"promote_cache_on_finish"| C
 ```
 

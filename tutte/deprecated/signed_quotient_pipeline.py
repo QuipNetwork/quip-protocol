@@ -2,8 +2,8 @@
 
 Brute-force evaluation + 2D-Lagrange-interpolation machinery for computing the
 Tutte polynomial via σ-quotients (signed graphs). None of this is on a live
-engine path; it is retained for the test suite (test_signed_quotient.py,
-test_zephyr_engine.py) and as a research reference. The live σ-finder
+engine path; it is retained for the test suite (test_signed_quotient.py)
+and as a research reference. The live σ-finder
 `find_best_sigma` stays in `tutte/roots/signed_quotient.py`.
 """
 from __future__ import annotations

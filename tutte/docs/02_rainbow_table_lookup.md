@@ -102,11 +102,17 @@ Additional entries are added during test runs and benchmarks. The table grows as
 
 ### Persistence
 
-Two formats:
-- **Binary** (`lookup_table.bin`, ~465 KB) — compact bitstring encoding, loaded by default
-- **JSON** (`lookup_table.json`, ~17 MB) — human-readable fallback
+- **Binary** (`lookup_table.bin`) — compact bitstring encoding, the
+  **authoritative** format. This is what is loaded by default and the only
+  format written by the bootstrap/warmup path.
+- **JSON** (`lookup_table.json`, ~17 MB) — human-readable mirror. As of the
+  Round 3 cleanup the JSON mirror is **no longer written** (the `.bin` is
+  authoritative); `load_default_table()` still tries the binary first and
+  falls back to a `.json` only if one happens to be present on disk.
 
-`load_default_table()` tries binary first, falls back to JSON.
+To inspect the binary tables (rainbow, multigraph, rooted, merger) directly,
+use the visualizer at `tutte/scripts/visualize_tutte.py`, which loads them via
+`load_default_table()`.
 
 ## Example
 
@@ -135,7 +141,7 @@ Step 3: Return T(Petersen) immediately
 
 The rainbow table also supports methods used by other techniques (not by the simple lookup path):
 - **`find_minors_of(graph)`** — find all table entries that could be structural minors of a graph. If comprehensive minor relationships have been pre-computed via `compute_minor_relationships()` (indicated by the `_structural_minors_computed` flag), the method performs an O(1) lookup of the graph's canonical key in the `minor_relationships` dictionary. Otherwise, it falls back to size-based filtering: entries are excluded if their node count or edge count exceeds that of the input graph. Results are sorted by complexity (descending). Used by hierarchical tiling (technique 5) and creation-expansion-join (technique 6).
-- **`find_factors_of(polynomial)`** — find all table entries whose polynomial divides a target polynomial. Pre-filters by spanning tree count divisibility (`T(1,1)` of the entry must divide `T(1,1)` of the target), then attempts polynomial division. Used by `AlgebraicSynthesisEngine` (a separate engine variant, not part of the numbered pipeline).
+- **`find_factors_of(polynomial)`** — find all table entries whose polynomial divides a target polynomial. Pre-filters by spanning tree count divisibility (`T(1,1)` of the entry must divide `T(1,1)` of the target), then attempts polynomial division. This was used by the former `AlgebraicSynthesisEngine`, which was removed in the Round 3 cleanup (there is now a single `SynthesisEngine`); the method remains on the table but currently has no caller in the pipeline.
 - **`compute_minor_relationships()`** — pre-compute structural minor relationships between all entries. Phase 1 uses coefficient domination (if H is a minor of G, every coefficient of T(H) <= T(G)). Phase 2 verifies suspicious pairs with actual `is_graph_minor()` checks.
 - **`compute_gcd_relationships()`** — index polynomial GCD relationships between entries. Pre-filters by `gcd(spanning_trees_i, spanning_trees_j) != 1`.
 

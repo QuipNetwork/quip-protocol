@@ -1,12 +1,13 @@
 # 6.9 — Signed-Graph DP and σ-Equivariant Decomposition
 
-> **Status (2026-05):** The σ-equivariant cover DP (`sigma_equivariant_dp.py`)
-> and the treewidth-based signed DP (`signed_treewidth.py`) were validated but
-> never beat the general path, so they were moved to
-> [`tutte/deprecated/`](../deprecated/README.md). What remains **live** is the
-> σ-finder `find_best_sigma` (`roots/signed_quotient.py`, used by the engine's
-> chord-ordering) and the elimination-order signed DP `graphs/signed_elim_dp.py`.
-> This document is retained as the theory reference for that work.
+> **Status (2026-05):** The σ-equivariant cover DP (`sigma_equivariant_dp.py`),
+> the treewidth-based signed DP (`signed_treewidth.py`), and the
+> elimination-order signed DP (`signed_elim_dp.py` + its `_signed_elim_c.py`
+> C extension) were validated but never beat the general path, so they were
+> moved to [`tutte/deprecated/`](../deprecated/README.md). What remains **live**
+> is the σ-finder `find_best_sigma` (`roots/signed_quotient.py`, used by the
+> engine's chord-ordering). This document is retained as the theory reference
+> for that work; the DP module paths below now point into `tutte/deprecated/`.
 
 ## Summary
 
@@ -125,7 +126,8 @@ part-swap σ (3 σ-fixed edges).
 - `evaluate_t_signed_mod(nodes, edges_with_signs, x, y, p)` —
   Zaslavsky's signed-graph Tutte polynomial of the quotient signed
   graph at one `(x, y, p)` point. Wraps
-  `signed_elim_dp.compute_signed_tutte_elim_mod`.
+  `signed_elim_dp.compute_signed_tutte_elim_mod` (now in
+  `tutte/deprecated/`).
 - `compute_t_fix_sigma_quotient_mod(g, perm, x, y, p)` — σ-invariant
   Tutte polynomial of the **cover** `G` at one point, computed via
   the lift identity by running DP on the **quotient**.
@@ -141,7 +143,7 @@ part-swap σ (3 σ-fixed edges).
 
 ### Low-level DPs
 
-- `tutte/graphs/signed_elim_dp.py`:
+- `tutte/deprecated/signed_elim_dp.py` (moved from `graphs/` — see status note above):
     - `compute_signed_tutte_elim_mod(nodes, edges_with_signs, x, y, p)`
       — signed-graph (Zaslavsky frame-matroid) Tutte via
       vertex-elimination DP.
@@ -160,13 +162,11 @@ part-swap σ (3 σ-fixed edges).
 
 ### Validation
 
-- `tutte/tests/test_signed_elim_dp.py` — 10 tests, signed-DP small
-  cases.
+- `tutte/tests/test_signed_elim.py` — 10 tests, signed-DP small
+  cases (imports the DPs from `tutte/deprecated/`).
 - `tutte/tests/test_signed_quotient.py` — 10 tests, high-level API.
 - `tutte/tests/test_sigma.py` — 9 tests, σ-equivariant DP
   (chord ordering + per-orbit batched DP).
-- `tutte/tests/test_zephyr_engine.py` — 2 tests, engine performance
-  on `Z(1, 2)`.
 
 ## Reference performance
 

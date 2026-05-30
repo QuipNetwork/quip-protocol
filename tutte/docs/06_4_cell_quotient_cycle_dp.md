@@ -1,4 +1,4 @@
-# 6.4 — Cell-Quotient Cycle Dynamic Programming (engine step 7.7)
+# 6.4 — Cell-Quotient Cycle Dynamic Programming (deprecated)
 
 ## Summary
 
@@ -20,9 +20,14 @@ takes ~50 s cold.
 
 ## When it is used
 
-Engine step **7.7** in `tutte/synthesis/engine.py:_synthesize_inner`,
-between almost-cograph DP (7.6) and treewidth DP (8). The dispatch
-fires when:
+**Deprecated** — the cycle-DP code now lives in
+`tutte/deprecated/cell_quotient_cycle.py` and its engine dispatch
+(formerly step 7.7) was removed in the Round 3 cleanup. The
+description below documents the original dispatch contract for
+historical reference.
+
+The original engine dispatch fired in `SynthesisEngine._synthesize_inner`
+when:
 
 1. `graph.edge_count() >= 60` (matches the formula-shortcut gate).
 2. `try_hierarchical_partition(graph, table)` returns a valid cell
@@ -32,12 +37,12 @@ fires when:
 4. `cell_anchor_adapter.normalize_cell_anchors_for_cycle` succeeds at
    aligning per-cell anchors to a single canonical template.
 
-If any precondition fails, the entry returns `None` and the engine
-falls through to treewidth DP.
+If any precondition failed, the entry returned `None` and the engine
+fell through to treewidth DP.
 
-The technique is positioned _after_ the formula shortcut (step 7.5)
+The technique was positioned _after_ the formula shortcut (step 7.5)
 and almost-cograph (step 7.6) — both of those handle Cm₂-shape
-graphs faster when applicable. Cell-quotient cycle DP catches the
+graphs faster when applicable. Cell-quotient cycle DP caught the
 cases they don't.
 
 ## Algorithm — three phases
@@ -129,13 +134,11 @@ shortcut on Cm₂ (~49 s).
 
 | File                                                                        | Purpose                                                                                      |
 | --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| [`tutte/roots/__init__.py`](../roots/__init__.py)                           | Engine entry: `compute_cell_quotient_cycle_dp(graph, table)`                                 |
-| [`tutte/roots/cell_quotient_cycle.py`](../roots/cell_quotient_cycle.py)     | `compute_cycle_dp(...)` — the three-phase DP                                                 |
+| [`tutte/deprecated/cell_quotient_cycle.py`](../deprecated/cell_quotient_cycle.py) | `compute_cycle_dp(...)` — the three-phase DP (now in `tutte/deprecated/`; engine dispatch removed) |
 | [`tutte/roots/cell_anchor_adapter.py`](../roots/cell_anchor_adapter.py)     | `normalize_cell_anchors_for_cycle` — graph-agnostic cycle detection + alignment              |
 | [`tutte/roots/cell_quotient_helpers.py`](../roots/cell_quotient_helpers.py) | `precompute_M_table`, `orbit_convolve`, `enumerate_partitions_cached`, `components_touching` |
 | [`tutte/roots/aut_orbit.py`](../roots/aut_orbit.py)                         | Aut-based orbit canonicalizer                                                                |
 | [`tutte/roots/rooted_tutte.py`](../roots/rooted_tutte.py)                   | Brute-force `T_rooted` + boundary primitives                                                 |
-| [`tutte/tests/test_cell_quotient_dp.py`](../tests/test_cell_quotient_dp.py) | Engine integration + Cm₂ regression                                                          |
 | [`tutte/_polynomial_c.py`](../_polynomial_c.py)                             | C-extension polynomial multiply (cffi)                                                       |
 
 ## References

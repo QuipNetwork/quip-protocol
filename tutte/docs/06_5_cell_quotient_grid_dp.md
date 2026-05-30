@@ -22,7 +22,7 @@ the anchor-sharing-aware adapter needed for D-Wave Cm₃.
 
 ## When it is used
 
-Once integrated, the dispatch will fire from engine step 7.7 _before_
+Once integrated, the dispatch will fire from engine step 7.45 _before_
 falling through to treewidth DP, when:
 
 1. `try_hierarchical_partition(graph, table)` returns a valid cell
@@ -122,9 +122,7 @@ class CellRowSpec:
 For Cm₂ row 0 (cells 0, 1) with disjoint K\_{4,4} anchors: every cell
 has `left_group != right_group` → `has_shared_horizontal == False`.
 For Cm₃ row 1 (cells 3, 4, 5): interior cell 4 has
-`left_group == right_group` → `has_shared_horizontal == True`. The
-test in `tutte/tests/test_anchor_groups.py:test_extract_path_specs_cm3_middle_row_shared`
-locks this in.
+`left_group == right_group` → `has_shared_horizontal == True`.
 
 ## Limitation: anchor sharing in path / grid DP
 
@@ -188,7 +186,8 @@ junction step, and `M_precompute` iterates `Bell(8)²` partition pairs
 per cell-step (~17M operations). Without multi-cell orbit
 compression (cell template aut acting on per-cell anchor blocks
 within the multi-cell state), Cm₃ row composition is hours of
-wall-clock per row. The cycle DP at engine step 7.7 has per-cell
+wall-clock per row. The cycle DP (now in `tutte/deprecated/`; its
+engine dispatch step 7.7 was removed) has per-cell
 orbit compression but doesn't lift to multi-cell boundaries.
 Productionizing Cm₃ requires either:
 
@@ -242,7 +241,7 @@ smaller).
 | Approach                                   | T(Cm₂) cold time | Notes                                                             |
 | ------------------------------------------ | ---------------- | ----------------------------------------------------------------- |
 | Engine `kmatching_formula` (step 7.5)      | ~55 s            | Current production baseline.                                      |
-| Engine `cell_quotient_cycle_dp` (step 7.7) | ~50 s            | Cycle-DP path for the 4-cycle of K\_{4,4} cells.                  |
+| `cell_quotient_cycle_dp` (deprecated, was step 7.7) | ~50 s   | Cycle-DP path for the 4-cycle of K\_{4,4} cells; now in `tutte/deprecated/`. |
 | v4 external-enumeration grid DP (research) | ~4 min           | First successful 2D K\_{4,4} grid; OOM-bound on Cm₃.              |
 | **v5 streamed grid DP (research)**         | **~36 s**        | Compressed state + compressed-streamed junction + compressed out. |
 
@@ -360,7 +359,6 @@ restrict / canonical-key + accumulation into a single C pass.
 | [`tutte/roots/cell_quotient_grid.py`](../roots/cell_quotient_grid.py)           | `compute_grid_dp_with_layout`, `is_grid_topology`, `_grid_cell_layout` |
 | [`tutte/roots/cell_quotient_path.py`](../roots/cell_quotient_path.py)           | `compute_path_dp` — path DP consumed per row                           |
 | [`tutte/roots/cell_anchor_adapter.py`](../roots/cell_anchor_adapter.py)         | Cell anchor normalization                                              |
-| [`tutte/tests/test_cell_quotient_grid.py`](../tests/test_cell_quotient_grid.py) | 8 regression tests on synthetic K_n grids                              |
 
 > **Cm₃ unlock path design** lives at
 > [`tutte/research/plans/cm3_unlock_design.md`](../research/plans/cm3_unlock_design.md).

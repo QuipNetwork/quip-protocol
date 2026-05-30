@@ -211,7 +211,7 @@ The chord rule is the universal fallback when preconditions fail. The k-matching
 - Tutte, W. T. (1947). _A ring in graph theory._ Mathematical Proceedings of the Cambridge Philosophical Society.
 - Brylawski, T. H. (1971). _A combinatorial model for series-parallel networks._ Transactions of the AMS.
 - Bonin, J. & de Mier, A. (2004). _T-uniqueness of some families of k-chordal matroids._ Advances in Applied Mathematics.
-- This codebase: `tutte/graphs/covering.py`, `tutte/synthesis/engine.py`, `tutte/tests/test_kmatching_formula.py`.
+- This codebase: `tutte/graphs/covering.py`, `tutte/synthesis/engine.py`.
 
 ---
 

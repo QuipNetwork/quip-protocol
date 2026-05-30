@@ -87,7 +87,6 @@ K_3 ⊕_3 K_3 returns T = 1 instead of x² − x − 1).
 | [`tutte/cotree_dp/almost_cograph.py`](../cotree_dp/almost_cograph.py)   | `find_anomaly_edges`, `compute_tutte_almost_cograph`                                                                           |
 | [`tutte/cotree_dp/dp.py`](../cotree_dp/dp.py)                           | `compute_tutte_cotree_dp` (called on the cograph skeleton)                                                                     |
 | [`tutte/graphs/k_sum.py`](../graphs/k_sum.py)                           | `_iterative_chord_rule` — bridge-aware chord rule applied to the anomaly set                                                   |
-| [`tutte/tests/test_almost_cograph.py`](../tests/test_almost_cograph.py) | 27 regression tests — anomaly detection (P_4 → 1 anomaly, C_5 → 2, K_n → 0), polynomial correctness against engine + Kirchhoff |
 
 ## Status
 

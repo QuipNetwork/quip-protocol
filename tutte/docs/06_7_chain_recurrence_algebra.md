@@ -335,7 +335,6 @@ colors).
 ### Regression tests
 
 - `tutte/tests/test_chain_recurrence.py` — 5 chain templates (K*{2,2}, K*{3,3}, K*4+M_2, K_5+M_2, K*{2,2} modular)
-- `tutte/tests/test_chain_recurrence_cycle.py` — 8 cycle tests (K\_{2,2}+M_2 empirical + symbolic)
 
 ## See also
 

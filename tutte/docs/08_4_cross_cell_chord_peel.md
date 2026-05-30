@@ -112,9 +112,11 @@ atoms connected by a small bipartite junction:
 
 ## Engine wiring
 
-`SynthesisEngine._try_cross_cell_chord_peel` is engine step 7.88,
-between cell-quotient hybrid (7.85) and clique-atom chord-peel (7.9).
-Mirror in `HybridSynthesisEngine._try_structural`.
+The cross-cell peel runs at engine step 7.88, between cell-quotient
+hybrid (7.85) and clique-atom chord-peel (7.9). As noted in the banner
+above, the standalone `_try_cross_cell_chord_peel` method has been folded
+into `SynthesisEngine._try_decomposition_chord_peel`; the legacy method
+is still on disk behind `TUTTE_USE_LEGACY_DISPATCH=1`.
 
 ### Gating
 
@@ -131,13 +133,17 @@ Mirror in `HybridSynthesisEngine._try_structural`.
 * `max_junction_size = 6` — junctions larger than 6 edges are
   unlikely to beat treewidth_dp's per-step cost.
 
-### Hybrid depth tracking
+### Hybrid depth tracking (historical)
 
-`HybridSynthesisEngine` calls `engine._try_cross_cell_chord_peel`
+> The separate `HybridSynthesisEngine` was removed in the Round 3 cleanup
+> (there is now one `SynthesisEngine`); this note is retained for the
+> depth-tracking lesson it records.
+
+`HybridSynthesisEngine` called `engine._try_cross_cell_chord_peel`
 directly rather than going through `engine.synthesize`. The engine's
-own `_synth_depth` therefore doesn't auto-increment. Hybrid must
+own `_synth_depth` therefore didn't auto-increment. Hybrid had to
 **manually bump** `engine._synth_depth += 1` around the call so the
-engine's recursive-cascade gate (`_synth_depth == 1`) fires. Without
+engine's recursive-cascade gate (`_synth_depth == 1`) fired. Without
 this fix, hybrid measured 77 s vs engine 47 s on Z(1,2).
 
 ## When it doesn't fire

@@ -14,13 +14,13 @@ graphs.
 ```mermaid
 graph TD
     P["polynomial.py<br/>TuttePolynomial"] --> G["graph.py<br/>Graph, MultiGraph"]
-    G --> GR["graphs/<br/>SP, covering, treewidth DP,<br/>k_sum (chord rule), signed-graph DP"]
+    G --> GR["graphs/<br/>SP, covering, treewidth DP,<br/>k_sum (chord rule)"]
     G --> F["factorization.py<br/>GCD, factorization"]
-    G --> RT["roots/<br/>cell-quotient cycle/grid/tree DPs,<br/>bipartite-junction DP, chain recurrence,<br/>rooted-Tutte composition + modular variants"]
+    G --> RT["roots/<br/>cell-quotient grid/tree DPs,<br/>bipartite-junction DP, chain recurrence,<br/>rooted-Tutte composition + modular variants"]
     G --> CT["cotree_dp/<br/>almost-cograph cotree DP"]
     GR --> L["lookup/<br/>RainbowTable, binary I/O"]
     F --> L
-    L --> S["synthesis/<br/>CEJ engine + hybrid synthesis"]
+    L --> S["synthesis/<br/>CEJ engine"]
     GR --> S
     RT --> S
     CT --> S
@@ -29,15 +29,15 @@ graph TD
 
 | Subpackage                                              | Description                                                                                                                                                                                                                                                                          |
 | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [`graphs/`](graphs/README.md)                           | Series-parallel recognition, subgraph covering with hierarchical / heterogeneous partitioners, treewidth DP (C extension), k-sum chord rule (`k_sum.py`), signed-graph elimination DP, σ-equivariant DP                                                                              |
-| [`roots/`](roots/README.md)                             | Rooted-Tutte composition for cell-decomposable graphs: cycle / grid / tree / bipartite-junction / interleaved DPs over cell-quotient topology, chain-recurrence framework, modular point-value variants for Cm-style targets, k-matching closed form                                |
+| [`graphs/`](graphs/README.md)                           | Series-parallel recognition, subgraph covering with hierarchical / heterogeneous partitioners, treewidth DP (C extension), k-sum chord rule (`k_sum.py`)                                                                                                                             |
+| [`roots/`](roots/README.md)                             | Rooted-Tutte composition for cell-decomposable graphs: grid / tree / bipartite-junction DPs over cell-quotient topology, chain-recurrence framework, modular point-value variants for Cm-style targets, k-matching closed form                                                      |
 | [`cotree_dp/`](cotree_dp/almost_cograph.py)             | Almost-cograph cotree DP (path-of-modules generalization of P_4-free graphs)                                                                                                                                                                                                         |
 | [`family_recognition/`](family_recognition/__init__.py) | O(n+m) closed-form polynomials for known families: trees, cycles, wheels, fans, ladders, prisms, books, gears, Möbius ladders                                                                                                                                                        |
 | [`lookup/`](lookup/README.md)                           | Rainbow table: O(1) polynomial lookup by canonical key, binary serialization                                                                                                                                                                                                         |
-| [`synthesis/`](synthesis/README.md)                     | `SynthesisEngine` (cascade) + `HybridSynthesisEngine` (structural-first variant)                                                                                                                                                                                                     |
+| [`synthesis/`](synthesis/README.md)                     | `SynthesisEngine` (cascade)                                                                                                                                                                                                                                                          |
 | [`data/`](data/README.md)                               | Pre-computed lookup tables and benchmark results                                                                                                                                                                                                                                     |
 | [`tests/`](tests/README.md)                             | Parametrized test suite (Kirchhoff + NetworkX cross-validation)                                                                                                                                                                                                                      |
-| [`benchmarks/`](benchmarks/README.md)                   | Standalone CEJ / Hybrid / NetworkX benchmark with empty-table cold-start measurements                                                                                                                                                                                                |
+| [`benchmarks/`](benchmarks/README.md)                   | Standalone CEJ / NetworkX benchmark with empty-table cold-start measurements                                                                                                                                                                                                         |
 | [`docs/`](docs/README.md)                               | Per-technique documentation                                                                                                                                                                                                                                                          |
 | [`research/`](research/)                                | Engine workflow primer, literature survey, and prototype scripts that feed production paths                                                                                                                                                                                          |
 
@@ -52,11 +52,9 @@ graph TD
 
 ## Synthesis Pipeline
 
-Single primary engine (`SynthesisEngine`) tries techniques in order;
-first success wins. The structural-first `HybridSynthesisEngine`
-re-orders steps to prioritise treewidth DP on graphs without a
-recognisable cell structure. See [`docs/README.md`](docs/README.md) for
-the full per-step reference.
+A single engine (`SynthesisEngine`) tries techniques in order; first
+success wins. See [`docs/README.md`](docs/README.md) for the full
+per-step reference.
 
 ```mermaid
 graph TD
@@ -68,22 +66,20 @@ graph TD
     C -->|yes| R
     C -->|no| D{4. Disconnected / cut vertex /\nbridge / series-parallel?}
     D -->|yes| R
-    D -->|no| F{5. Cell-quotient DPs?\ntree / cycle / grid / hybrid /\nbipartite-junction / interleaved}
+    D -->|no| F{5. Cell-quotient DPs?\ngrid / chain recurrence /\nbipartite-junction}
     F -->|hit| R
-    F -->|miss| F1{6. Small-graph treewidth DP\nn<=20, m>=10}
-    F1 -->|hit| R
-    F1 -->|miss| F2{7. Almost-cograph cotree DP}
+    F -->|miss| F2{6. Almost-cograph cotree DP}
     F2 -->|hit| R
-    F2 -->|miss| G{8. Treewidth DP\ntw <= 11}
+    F2 -->|miss| G{7. Treewidth DP\ntw <= 11}
     G -->|hit| R
-    G -->|miss| H{9. k-sum / hierarchical tiling\ndecomposition?}
+    G -->|miss| H{8. k-sum / hierarchical tiling\ndecomposition?}
     H -->|hit| H1[Chord rule on K_k separator OR\nboundary quotient + chord recursion]
     H1 --> R
-    H -->|miss| I[10. CEJ: spanning tree + chord additions]
+    H -->|miss| I[9. CEJ: spanning tree + chord additions]
     I --> R
 ```
 
-The chord-rule paths (step 9) use only the standard
+The chord-rule paths (step 8) use only the standard
 deletion-contraction identity — no flat lattices, no Möbius function.
 See [`docs/08_2_chord_rule_formalization.md`](docs/08_2_chord_rule_formalization.md).
 
@@ -137,7 +133,9 @@ See [`docs/08_2_chord_rule_formalization.md`](docs/08_2_chord_rule_formalization
 ## Lookup Table
 
 Pre-computed Tutte polynomials for graph minors in
-`data/lookup_table.bin` (binary) with a JSON sidecar.
+`data/lookup_table.bin`. The binary table is authoritative; the JSON
+mirror is no longer written. Inspect table contents with the
+visualizer `scripts/visualize_tutte.py`.
 
 ```python
 from tutte.lookup import load_default_table
@@ -166,7 +164,7 @@ python -m pytest tutte/tests/ -v --benchmark
 ## Running Benchmarks
 
 ```bash
-# Standalone benchmark sweep (CEJ + Hybrid + NetworkX, empty tables)
+# Standalone benchmark sweep (CEJ + NetworkX, empty tables)
 python -m tutte.benchmarks.benchmark --timeout 300 --nx-timeout 300
 
 # Compare two benchmark runs
@@ -175,12 +173,11 @@ python -m tutte.benchmarks.benchmark --compare run_a.json run_b.json
 
 ## Performance vs NetworkX
 
-After pre-warming cffi extensions and `family_recognition` seeds, both
-the CEJ and Hybrid engines are strictly faster than
-`nx.tutte_polynomial()` on every graph in the benchmark suite where
-NetworkX completes.
+After pre-warming cffi extensions and `family_recognition` seeds, the
+CEJ engine is strictly faster than `nx.tutte_polynomial()` on every
+graph in the benchmark suite where NetworkX completes.
 
-| Edges | Graphs | Hybrid avg | NX avg   | Speedup    |
+| Edges | Graphs | CEJ avg    | NX avg   | Speedup    |
 | ----- | ------ | ---------- | -------- | ---------- |
 | 1-5   | ~200   | 0.1-0.5 ms | 0.5-5 ms | 5-10×      |
 | 6-10  | ~500   | 0.3-2 ms   | 5-100 ms | 20-50×     |
@@ -188,7 +185,7 @@ NetworkX completes.
 | 16-20 | ~50    | 2-10 ms    | 1-30 s   | 500-5 000× |
 | 21+   | ~10    | 3-10 ms    | TIMEOUT  | -          |
 
-Sample headline timings (Hybrid engine, empty table after pre-warm):
+Sample headline timings (the engine, empty table after pre-warm):
 
 - **Petersen** (15 e): ~1 ms vs NX ~800 ms
 - **Cm_1 = K_{4,4}** (16 e): ~3 ms vs NX ~1.3 s
@@ -205,7 +202,7 @@ Sample headline timings (Hybrid engine, empty table after pre-warm):
 | `_HIER_PARTITION_CACHE`   | Recovers Pm_2 from a 4× VF2 regression              | Module-scoped cache for `try_hierarchical_partition` results               |
 | Idempotent rooted-lookup load | Eliminates 1+ s per inner engine constructor    | Process-global flag in `load_default_rooted_lookup`                        |
 | σ-equivariant chord order | Petersen 2.33 s → 1.62 s (1.44×)                    | Reorders chords so σ-orbits are contiguous → more canonical-key cache hits |
-| Cell-quotient DPs (grid / tree / cycle / bipartite-junction) | Cm_2 ~36 s, Z(1, 2) tractable | T_rooted of the cell composed via the cell-quotient transfer matrix       |
+| Cell-quotient DPs (grid / tree / bipartite-junction) | Cm_2 ~36 s, Z(1, 2) tractable | T_rooted of the cell composed via the cell-quotient transfer matrix       |
 | Modular DP + interpolation | Recovers full polynomial via Lagrange + CRT       | Avoids precision overflow on Cm-scale targets                              |
 
 ## Usage

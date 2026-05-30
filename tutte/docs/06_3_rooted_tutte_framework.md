@@ -1,11 +1,12 @@
 # 6.3 — Rooted Tutte Polynomial: Algebraic Framework
 
 The **rooted Tutte polynomial** is the algebraic foundation underneath
-the cell-quotient cycle DP (technique 6.4, engine step 7.7) and the
-cell-quotient grid DP (technique 6.5). This document is a _shared
-theory reference_, not a separate pipeline step — the engine never
-dispatches to "rooted Tutte" directly; it dispatches to the
-cycle/grid DPs which are built on this framework.
+the cell-quotient cycle DP (technique 6.4; now deprecated, was engine
+step 7.7) and the cell-quotient grid DP (technique 6.5, engine step
+7.45). This document is a _shared theory reference_, not a separate
+pipeline step — the engine never dispatches to "rooted Tutte"
+directly; it dispatches to the grid DP (and the chain recurrence at
+step 7.4) which are built on this framework.
 
 For the productionized algorithms and engine placement see:
 
@@ -127,10 +128,10 @@ formula doesn't apply).
 
 ## Status and limits
 
-- **Cycle topology with disjoint per-cell anchors** — productionized
-  in `tutte/roots/cell_quotient_cycle.py`, wired into the engine at
-  step 7.7. Validated on real Cm2 against `kmatching_formula` and
-  Kirchhoff.
+- **Cycle topology with disjoint per-cell anchors** — implemented
+  in `tutte/deprecated/cell_quotient_cycle.py` (deprecated; its engine
+  dispatch step 7.7 was removed in the Round 3 cleanup). Validated on
+  real Cm2 against `kmatching_formula` and Kirchhoff.
 - **Grid topology with disjoint per-cell anchors** — productionized in
   `tutte/roots/cell_quotient_grid.py`. Validated on synthetic K_n
   grids; engine integration pending the anchor-sharing-aware adapter
@@ -152,7 +153,7 @@ formula doesn't apply).
 | `tutte/roots/rooted_tutte.py`          | Brute-force `T_rooted` + boundary primitives (`join`, `delta`, `restrict`, `divide_by_x_minus_1_power`)  |
 | `tutte/roots/aut_orbit.py`             | Aut-based orbit canonicalizer (generic over any cell with non-trivial automorphism)                      |
 | `tutte/roots/cell_quotient_helpers.py` | Hot-path `precompute_M_table` + `orbit_convolve` + `enumerate_partitions_cached` + `components_touching` |
-| `tutte/roots/cell_quotient_cycle.py`   | Engine entry: `compute_cycle_dp` (technique 7.7)                                                         |
+| `tutte/deprecated/cell_quotient_cycle.py` | `compute_cycle_dp` (technique 6.4; deprecated, engine dispatch step 7.7 removed)                      |
 | `tutte/roots/cell_quotient_path.py`    | `compute_path_dp` — cycle DP minus the close step (consumed by grid DP)                                  |
 | `tutte/roots/cell_quotient_grid.py`    | `compute_grid_dp_with_layout` — row-by-row composition via path DP + vertical convolution                |
 | `tutte/roots/cell_anchor_adapter.py`   | `normalize_cell_anchors_for_cycle` — graph-agnostic cycle detection + per-cell anchor alignment          |

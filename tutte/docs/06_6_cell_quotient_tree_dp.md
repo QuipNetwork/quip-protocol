@@ -37,11 +37,12 @@ research scripts. Future engine integration would dispatch when:
 3. `cell_anchor_groups` is provided per `(cell_idx, neighbor_idx)`
    pair.
 
-If the cell-quotient is a cycle or grid, dispatch to the
-specialized cycle/grid DP instead. If the cell-quotient has cycles
-but admits a chord-rule peeling (cycle close, see
+If the cell-quotient is a grid, dispatch to the specialized grid DP
+instead (engine step 7.45); the cycle DP is deprecated (now in
+`tutte/deprecated/cell_quotient_cycle.py`). If the cell-quotient has
+cycles but admits a chord-rule peeling (cycle close, see
 [`08_3_kmatching_formula.md`](08_3_kmatching_formula.md)), the tree
-DP becomes the per-leaf computation in a hybrid path.
+DP becomes the per-leaf computation in a chord-rule-peeled path.
 
 ## Algorithm — post-order recursion over the cell-tree
 
@@ -231,9 +232,11 @@ genuinely helps, the speedup is dramatic (50–1500×).
    cell-quotient (e.g., Cm₃ grid), with each leaf computed via this
    tree DP. Tree DP works correctly on tree-topology leaves; the
    chord rule handles cycle closing with bridge-aware coefficients.
-3. **Engine integration** — add a step 7.7.5 between
-   cell-quotient cycle DP and treewidth DP that dispatches to tree
-   DP when the cell-quotient is a tree.
+3. **Engine integration** — add a dispatch step (e.g., near the
+   cell-quotient grid DP at step 7.45, ahead of treewidth DP) that
+   dispatches to tree DP when the cell-quotient is a tree. (Note:
+   the original cell-quotient cycle DP dispatch step 7.7 was removed
+   in the Round 3 cleanup; cycle DP now lives in `tutte/deprecated/`.)
 
 ## Implementation
 
@@ -258,9 +261,11 @@ genuinely helps, the speedup is dramatic (50–1500×).
 
 ## Cross-cell vertex-identification convolution (Step 3.B.3 — RESOLVED)
 
-For chord-rule leaves of the cycle-close hybrid (`compute_cell_quotient_hybrid`),
-cells may share vertices via `cross_cell_identifications` (from the closing
-junction's contracted edges). The convolution rule for these merges:
+For chord-rule leaves of the cycle-close hybrid (`compute_cell_quotient_hybrid`,
+now in `tutte/deprecated/cell_quotient_hybrid.py`; its engine dispatch was
+removed in the Round 3 cleanup), cells may share vertices via
+`cross_cell_identifications` (from the closing junction's contracted edges).
+The convolution rule for these merges:
 
 ```
 T_combined[P_comb] = Σ_{(P_1, P_2) → P_comb}
@@ -277,8 +282,8 @@ where:
 When `m - c_comp < 0`, the divisor becomes a `(x-1)^{c_comp - m}` multiplier.
 
 `compute_corrected_leaf_dp` is invoked from
-`cell_quotient_hybrid.py:_try_spec_leaf_dispatch` when the closing
-junction's removal yields a tree-quotient cell-topology. See
+`tutte/deprecated/cell_quotient_hybrid.py:_try_spec_leaf_dispatch` when the
+closing junction's removal yields a tree-quotient cell-topology. See
 `tutte/research/data/step3_milestone_b_design.md` for derivation
 and validation table.
 
