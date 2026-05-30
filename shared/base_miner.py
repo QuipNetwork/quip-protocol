@@ -1220,6 +1220,21 @@ class BaseMiner(ABC):
                 stored_replaced = self._insert_into_stash(
                     state.top_k, state.top_k_cap, result,
                 )
+        else:
+            # Pre-check skipped the expensive lenient evaluate — and with
+            # it the per-attempt line evaluate_sampleset logs from its
+            # finally block. Emit a lightweight heartbeat so operators keep
+            # per-attempt energy visibility on no-hope iters. Shares the
+            # "[id] Mining attempt - Energy:" prefix with the full evaluated
+            # line so a single log grep catches both. num_valid / diversity
+            # are intentionally omitted: computing them is exactly the work
+            # the gate skips.
+            self.logger.info(
+                "[%s] Mining attempt - Energy: %.0f (pre-check skip: "
+                "improves_stash=%s near_live=%s, live threshold<=%.0f)",
+                self.miner_id, iter_best_energy, improves_stash, near_live,
+                live_threshold_milli / 1000.0,
+            )
 
         # Anticipatory-submission preview. When the stash gains a candidate
         # whose best-by-floor improves on anything we've previewed, hand the

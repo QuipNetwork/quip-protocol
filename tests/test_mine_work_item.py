@@ -1061,6 +1061,80 @@ def test_precheck_skips_evaluate_for_no_hope_iter(
     )
 
 
+def test_precheck_skip_still_logs_per_attempt_heartbeat(
+    cpu_miner, relaxed_context, monkeypatch,
+):
+    """A pre-check-skipped (no-hope) iter must still emit a per-attempt
+    console heartbeat.
+
+    The per-attempt ``[miner] Mining attempt - Energy: ...`` line
+    historically came from ``evaluate_sampleset``'s finally block, which the
+    old ratchet called on every iteration. The throughput pre-check gate
+    skips ``evaluate_sampleset`` for no-hope iters, which silently dropped
+    that line (regression: long runs of attempts logged nothing). The
+    ratchet must emit a lightweight heartbeat for skipped iters so operators
+    keep per-attempt energy visibility without paying for the diversity
+    computation.
+    """
+    import dimod
+    from unittest.mock import MagicMock
+
+    # Best energy +100 — far above live threshold 0 + 2000-milli margin.
+    BAD_ENERGY = 100.0
+    bad_ss = dimod.SampleSet.from_samples(
+        [{n: 1 for n in relaxed_context.nodes}],
+        vartype=dimod.SPIN,
+        energy=[BAD_ENERGY],
+    )
+
+    spy_calls = []
+
+    def spy_evaluate(sampleset, *args, **kwargs):
+        spy_calls.append(sampleset)
+        return None
+
+    captured = []
+    recording_logger = MagicMock()
+
+    def _capture(**kw):
+        captured.append(kw)
+        stop.set()
+
+    recording_logger.record.side_effect = _capture
+
+    def fake_sample(*args, **kwargs):
+        return bad_ss
+
+    stop = mp.Event()
+    live_var = mp.Value('q', 0)
+
+    log_spy = MagicMock()
+    monkeypatch.setattr(cpu_miner, "_sample", fake_sample)
+    monkeypatch.setattr(cpu_miner, "evaluate_sampleset", spy_evaluate)
+    monkeypatch.setattr(cpu_miner, "logger", log_spy)
+    cpu_miner._attempt_logger = recording_logger
+    cpu_miner._live_max_energy_milli = live_var
+    try:
+        cpu_miner.mine_work_item(relaxed_context, stop)
+    finally:
+        del cpu_miner._attempt_logger
+        del cpu_miner._live_max_energy_milli
+
+    assert not spy_calls, (
+        "evaluate_sampleset must NOT run for the no-hope iter (heartbeat "
+        "must not re-introduce the expensive evaluate)"
+    )
+    info_formats = [
+        str(call.args[0])
+        for call in log_spy.info.call_args_list
+        if call.args
+    ]
+    assert any("Mining attempt" in m for m in info_formats), (
+        "pre-check-skipped iter must emit a per-attempt 'Mining attempt' "
+        f"heartbeat; got info logs: {info_formats}"
+    )
+
+
 def test_precheck_evaluates_iter_near_live_threshold(
     cpu_miner, relaxed_context, monkeypatch,
 ):
