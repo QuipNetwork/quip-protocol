@@ -826,168 +826,12 @@ class BaseMiner(ABC):
                     "stored_as_best": False,
                     "result_kind": "rejected",
                 }
-                stored_replaced = False
 
                 if is_substrate:
-                    # ---- Ratchet path (substrate / PoW) -------------
-                    # Read the chain's *live* (decay-applied) energy
-                    # threshold the controller pushed via shared mem.
-                    # When the chain decays past our stored best, the
-                    # next iteration's check returns the stored result.
-                    if live_threshold_var is not None:
-                        with live_threshold_var.get_lock():
-                            live_threshold_milli = int(live_threshold_var.value)
-                    else:
-                        live_threshold_milli = int(
-                            requirements.difficulty_energy * 1000,
-                        )
-
-                    # Post-processing gate: stash the K best candidates
-                    # we've mined, not the best the chain wants. The
-                    # ratchet is about *local progress* — until the
-                    # stash is full, every iter post-processes
-                    # unconditionally so we build a baseline; once full,
-                    # only iters beating the heap's worst-energy entry
-                    # earn the expensive ``evaluate_sampleset`` call.
-                    # Submission against the chain's live (decayed)
-                    # threshold is a separate decision handled by the
-                    # submit gate below — gating storage on the chain
-                    # target would lock the miner out of building a
-                    # baseline whenever the live threshold is harder
-                    # than what SA is producing.
-                    iter_best_energy = float(
-                        np.min(sampleset.record.energy),
-                    )
-                    ratchet_threshold = (
-                        top_k[-1].energy
-                        if len(top_k) >= top_k_cap
-                        else float("inf")
-                    )
-                    # Pre-check: only pay the lenient evaluate when the iter
-                    # both (a) would improve the running top_k baseline and
-                    # (b) is within RATCHET_PRECHECK_MARGIN_MILLI of the live
-                    # (decayed) threshold — i.e. could submit now or after a
-                    # little decay. No-hope iters (best far worse than the
-                    # live target) skip the expensive diversity/selection
-                    # work and log a lightweight rejected row. Mirrors the
-                    # strict fast-bail the canary gets for free.
-                    # NOTE: if the miner never lands within margin of the live
-                    # target (e.g. hardware underperforming), the stash stays
-                    # empty and nothing submits — expected; every skipped iter
-                    # still logs as "rejected".
-                    iter_best_milli = int(iter_best_energy * 1000)
-                    near_live = iter_best_milli <= (
-                        live_threshold_milli + self.RATCHET_PRECHECK_MARGIN_MILLI
-                    )
-                    improves_stash = iter_best_energy < ratchet_threshold
-
-                    result = None
-                    # Values captured from the post-processed eval so the
-                    # submit-gate's later rebind of `result` doesn't
-                    # destroy them — we want them logged on every
-                    # ``post_processed=true`` iteration, not just the
-                    # submitted ones. No new computation: these are
-                    # already produced by ``evaluate_sampleset``.
-                    post_num_valid: Optional[int] = None
-                    post_diversity_milli: Optional[int] = None
-                    if improves_stash and near_live:
-                        # Lenient eval — diversity + min_solutions
-                        # still required, but no energy gate. The
-                        # ratchet itself enforces "only improvements
-                        # land" via the comparison below.
-                        result = self.evaluate_sampleset(
-                            sampleset, requirements, nodes, edges,
-                            nonce, salt, prev_timestamp, start_time,
-                            strict_energy=False,
-                            live_threshold_energy=(
-                                live_threshold_milli / 1000.0
-                            ),
-                        )
-                        attempt_log_kwargs["post_processed"] = True
-                        if result is not None:
-                            post_num_valid = result.num_valid
-                            post_diversity_milli = int(result.diversity * 1000)
-                            # Insert into the bounded heap. Always
-                            # admits when there's room; otherwise the
-                            # iter only got here because it beat the
-                            # worst-energy entry (ratchet gate above),
-                            # so we evict that tail and re-sort.
-                            if len(top_k) < top_k_cap:
-                                top_k.append(result)
-                                top_k.sort(key=lambda r: r.energy)
-                                stored_replaced = True
-                            elif result.energy < top_k[-1].energy:
-                                top_k[-1] = result
-                                top_k.sort(key=lambda r: r.energy)
-                                stored_replaced = True
-
-                    # Anticipatory-submission preview. When the stash gains
-                    # a candidate whose best-by-floor improves on anything
-                    # we've previewed, hand the controller a lightweight,
-                    # picklable snapshot so Task 6b can predict the
-                    # decay-block at which it clears and pre-submit. This is
-                    # purely a preview — the local submit gate below is
-                    # still the only thing that returns a result. Throttled
-                    # to strict floor improvements; failures never break
-                    # mining.
-                    if preview_cb is not None and stored_replaced:
-                        previewed_floor_milli = self._maybe_emit_preview(
-                            preview_cb, top_k, previewed_floor_milli,
-                            dispatch_id_for_log,
-                        )
-
-                    self.timing_stats['postprocessing'].append(
-                        (time.time() - postprocess_start) * 1e6,
-                    )
-
-                    # Submit gate. The chain re-derives each submitted
-                    # solution's energy and filters with strict
-                    # ``< max_energy_milli`` before counting; gating on
-                    # ``energy`` (best of set) would let through proofs
-                    # whose mid-pack solutions get rejected, producing
-                    # ``InsufficientSolutions`` despite the headline
-                    # energy clearing. ``submit_floor_energy`` is the
-                    # chain-equivalent recompute, so it's what the gate
-                    # must compare against.
-                    #
-                    # Walk the stash in energy-ascending order (best
-                    # first). Prefer the best candidate whose floor
-                    # clears; fall back to worse-energy stash entries
-                    # if a better candidate's floor sits above the
-                    # live threshold (the two can diverge — a tighter
-                    # solution set can have a lower best but a higher
-                    # worst, leaving a wider-spread candidate eligible
-                    # for submission while the headline winner isn't).
-                    result = None
-                    for candidate in top_k:
-                        floor_energy = (
-                            candidate.submit_floor_energy
-                            if candidate.submit_floor_energy is not None
-                            else candidate.energy
-                        )
-                        if int(floor_energy * 1000) < live_threshold_milli:
-                            result = candidate
-                            break
-
-                    # ratchet_threshold is float("inf") on the first iter
-                    # before anything is stored — log None there since
-                    # there's no meaningful prior to display.
-                    ratchet_threshold_milli_log = (
-                        int(ratchet_threshold * 1000)
-                        if math.isfinite(ratchet_threshold)
-                        else None
-                    )
-                    attempt_log_kwargs.update(
-                        threshold_milli=live_threshold_milli,
-                        ratchet_threshold_milli=ratchet_threshold_milli_log,
-                        num_valid=post_num_valid,
-                        diversity_milli=post_diversity_milli,
-                        stored_as_best=stored_replaced,
-                        result_kind=(
-                            "submitted" if result is not None
-                            else "stored" if stored_replaced
-                            else "rejected"
-                        ),
+                    result = self._run_substrate_ratchet(
+                        loop_state, sampleset, nonce, salt, postprocess_start,
+                        preview_cb=preview_cb,
+                        attempt_log_kwargs=attempt_log_kwargs,
                     )
                 else:
                     result = self._run_mempool_eval(
@@ -1132,6 +976,159 @@ class BaseMiner(ABC):
         if attempt_logger is not None:
             attempt_logger.flush()
         self._post_mine_cleanup()
+
+    def _run_substrate_ratchet(
+        self,
+        state: _MiningLoopState,
+        sampleset: Any,
+        nonce: Any,
+        salt: bytes,
+        postprocess_start: float,
+        *,
+        preview_cb: Optional[Any],
+        attempt_log_kwargs: Dict[str, Any],
+    ) -> Optional[MiningResult]:
+        """Substrate / PoW ratchet path (the ``is_substrate`` branch).
+
+        Reads the chain's live (decay-applied) threshold, runs the lenient
+        pre-checked ``evaluate_sampleset``, maintains ``state.top_k`` in
+        place, emits an anticipatory preview, applies the submit gate, and
+        updates ``attempt_log_kwargs``. Returns the submittable
+        ``MiningResult`` (or ``None``). Mutates ``state.top_k`` and
+        ``state.previewed_floor_milli`` in place. Behaviour is identical to
+        the original inline ratchet branch.
+        """
+        # Read the chain's *live* (decay-applied) energy threshold the
+        # controller pushed via shared mem. When the chain decays past our
+        # stored best, the next iteration's check returns the stored result.
+        if state.live_threshold_var is not None:
+            with state.live_threshold_var.get_lock():
+                live_threshold_milli = int(state.live_threshold_var.value)
+        else:
+            live_threshold_milli = int(
+                state.requirements.difficulty_energy * 1000,
+            )
+
+        # Post-processing gate: stash the K best candidates we've mined, not
+        # the best the chain wants. Until the stash is full, every iter
+        # post-processes unconditionally to build a baseline; once full, only
+        # iters beating the heap's worst-energy entry earn the expensive
+        # ``evaluate_sampleset`` call. Submission against the chain's live
+        # (decayed) threshold is a separate decision handled by the submit
+        # gate below — gating storage on the chain target would lock the
+        # miner out of building a baseline whenever the live threshold is
+        # harder than what SA is producing.
+        iter_best_energy = float(np.min(sampleset.record.energy))
+        ratchet_threshold = (
+            state.top_k[-1].energy
+            if len(state.top_k) >= state.top_k_cap
+            else float("inf")
+        )
+        # Pre-check: only pay the lenient evaluate when the iter both (a)
+        # would improve the running top_k baseline and (b) is within
+        # RATCHET_PRECHECK_MARGIN_MILLI of the live (decayed) threshold —
+        # i.e. could submit now or after a little decay. No-hope iters skip
+        # the expensive diversity/selection work and log a lightweight
+        # rejected row. NOTE: if the miner never lands within margin of the
+        # live target (e.g. hardware underperforming), the stash stays empty
+        # and nothing submits — expected; every skipped iter still logs as
+        # "rejected".
+        iter_best_milli = int(iter_best_energy * 1000)
+        near_live = iter_best_milli <= (
+            live_threshold_milli + self.RATCHET_PRECHECK_MARGIN_MILLI
+        )
+        improves_stash = iter_best_energy < ratchet_threshold
+
+        result = None
+        stored_replaced = False
+        # Values captured from the post-processed eval so the submit-gate's
+        # later rebind of `result` doesn't destroy them — logged on every
+        # ``post_processed=true`` iteration, not just submitted ones.
+        post_num_valid: Optional[int] = None
+        post_diversity_milli: Optional[int] = None
+        if improves_stash and near_live:
+            # Lenient eval — diversity + min_solutions still required, but no
+            # energy gate. The ratchet itself enforces "only improvements
+            # land" via the comparison below.
+            result = self.evaluate_sampleset(
+                sampleset, state.requirements, state.nodes, state.edges,
+                nonce, salt, state.prev_timestamp, state.start_time,
+                strict_energy=False,
+                live_threshold_energy=(live_threshold_milli / 1000.0),
+            )
+            attempt_log_kwargs["post_processed"] = True
+            if result is not None:
+                post_num_valid = result.num_valid
+                post_diversity_milli = int(result.diversity * 1000)
+                # Insert into the bounded heap. Always admits when there's
+                # room; otherwise the iter only got here because it beat the
+                # worst-energy entry (ratchet gate above), so we evict that
+                # tail and re-sort.
+                if len(state.top_k) < state.top_k_cap:
+                    state.top_k.append(result)
+                    state.top_k.sort(key=lambda r: r.energy)
+                    stored_replaced = True
+                elif result.energy < state.top_k[-1].energy:
+                    state.top_k[-1] = result
+                    state.top_k.sort(key=lambda r: r.energy)
+                    stored_replaced = True
+
+        # Anticipatory-submission preview. When the stash gains a candidate
+        # whose best-by-floor improves on anything we've previewed, hand the
+        # controller a lightweight, picklable snapshot. This is purely a
+        # preview — the local submit gate below is still the only thing that
+        # returns a result. Throttled to strict floor improvements; failures
+        # never break mining.
+        if preview_cb is not None and stored_replaced:
+            state.previewed_floor_milli = self._maybe_emit_preview(
+                preview_cb, state.top_k, state.previewed_floor_milli,
+                state.dispatch_id_for_log,
+            )
+
+        self.timing_stats['postprocessing'].append(
+            (time.time() - postprocess_start) * 1e6,
+        )
+
+        # Submit gate. The chain re-derives each submitted solution's energy
+        # and filters with strict ``< max_energy_milli`` before counting;
+        # gating on ``energy`` (best of set) would let through proofs whose
+        # mid-pack solutions get rejected. ``submit_floor_energy`` is the
+        # chain-equivalent recompute, so it's what the gate must compare
+        # against. Walk the stash in energy-ascending order (best first);
+        # prefer the best candidate whose floor clears, falling back to
+        # worse-energy stash entries when a better candidate's floor sits
+        # above the live threshold (the two can diverge).
+        result = None
+        for candidate in state.top_k:
+            floor_energy = (
+                candidate.submit_floor_energy
+                if candidate.submit_floor_energy is not None
+                else candidate.energy
+            )
+            if int(floor_energy * 1000) < live_threshold_milli:
+                result = candidate
+                break
+
+        # ratchet_threshold is float("inf") on the first iter before anything
+        # is stored — log None there since there's no meaningful prior.
+        ratchet_threshold_milli_log = (
+            int(ratchet_threshold * 1000)
+            if math.isfinite(ratchet_threshold)
+            else None
+        )
+        attempt_log_kwargs.update(
+            threshold_milli=live_threshold_milli,
+            ratchet_threshold_milli=ratchet_threshold_milli_log,
+            num_valid=post_num_valid,
+            diversity_milli=post_diversity_milli,
+            stored_as_best=stored_replaced,
+            result_kind=(
+                "submitted" if result is not None
+                else "stored" if stored_replaced
+                else "rejected"
+            ),
+        )
+        return result
 
     def _run_mempool_eval(
         self,
