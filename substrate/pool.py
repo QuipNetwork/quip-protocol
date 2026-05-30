@@ -61,6 +61,7 @@ _IDEMPOTENT_OPS = frozenset({
     "query_solver",
     "query_job_order",
     "query_winning_solution",
+    "query_winning_solution_count",
     "get_events_at",
 })
 

@@ -27,8 +27,9 @@ class _FakeMinerHandle:
     def set_live_threshold_milli(self, value: int) -> None:
         self.threshold_pushes.append(value)
 
-    def mine_work_item(self, context) -> int:
+    def mine_work_item(self, context, *, solution_number=None) -> int:
         self.dispatched_contexts.append(context)
+        self.last_solution_number = solution_number
         self._active_dispatch_id += 1
         return self._active_dispatch_id
 
@@ -66,10 +67,15 @@ def controller():
     ctrl._anticipatory_fired = set()
     ctrl._base_difficulty_by_key = {}
     ctrl._pow_constants = None
+    # Per-round solution-number cache (the on-disk archive key). The stub
+    # returns a fixed WinningSolutions count so dispatch resolves a stable
+    # solution number without hitting the network.
+    ctrl._solution_number_by_work_key = {}
     ctrl.pool_client = SimpleNamespace(
         query_difficulty=AsyncMock(return_value=None),
         query_last_proof_block_number=AsyncMock(return_value=None),
         query_pow_constants=AsyncMock(return_value=None),
+        query_winning_solution_count=AsyncMock(return_value=195),
     )
     # Stats: SimpleNamespace stub matching the attrs on_new_head touches.
     ctrl.stats = SimpleNamespace(

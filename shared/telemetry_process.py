@@ -26,7 +26,6 @@ import asyncio
 import logging
 import multiprocessing as mp
 import multiprocessing.synchronize
-import os
 import signal
 import time
 from pathlib import Path
@@ -37,9 +36,8 @@ from aiohttp.web import middleware
 
 from shared.mining_attempt_log import (
     DEFAULT_LOG_DIR,
-    _resolve_solution_id,
-    query_by_dispatch,
     query_by_solution_id,
+    query_by_solution_number,
     query_stored_solutions,
 )
 from shared.stats_snapshot import (
@@ -603,12 +601,11 @@ async def _handle_mining_attempts(request: web.Request) -> web.Response:
     """GET /api/v1/mining/attempts — query the attempt + submission log.
 
     Query params (exactly one of the first two must be supplied):
-      - ``solution_id`` (int): returns
-        ``{"submission": {...}, "attempts": [...]}`` — the submission
-        record with that id and every attempt that fed the same
-        ``(miner_id, dispatch_id)``.
-      - ``miner_id`` + ``dispatch_id``: returns just the attempt
-        list for that dispatch.
+      - ``solution_number`` (int; ``solution_id`` accepted as an alias):
+        returns ``{"submission": {...}, "attempts": [...]}`` — the
+        submission record for that solution and the winning miner's attempts.
+      - ``miner_id`` + ``solution_number``: returns just the attempt list
+        for that (miner, solution).
       - ``limit`` (int, default 1000): caps the attempts list.
 
     The store is the JSONL files under ``~/.quip-miner/mining_attempts/``
@@ -631,35 +628,36 @@ async def _handle_mining_attempts(request: web.Request) -> web.Response:
     if limit < 1 or limit > 100_000:
         return _error("limit out of range (1..100000)", "BAD_PARAM")
 
-    if "solution_id" in params:
+    sol_raw = params.get("solution_number", params.get("solution_id"))
+    miner_id = params.get("miner_id")
+
+    if miner_id and sol_raw is not None:
         try:
-            solution_id = int(params["solution_id"])
+            solution_number = int(sol_raw)
         except ValueError:
-            return _error("solution_id must be an integer", "BAD_PARAM")
-        result = query_by_solution_id(solution_id, log_dir=attempts_dir)
+            return _error("solution_number must be an integer", "BAD_PARAM")
+        attempts = query_by_solution_number(
+            miner_id, solution_number, log_dir=attempts_dir, limit=limit,
+        )
+        return _success({"attempts": attempts})
+
+    if sol_raw is not None:
+        try:
+            solution_number = int(sol_raw)
+        except ValueError:
+            return _error("solution_number must be an integer", "BAD_PARAM")
+        result = query_by_solution_id(solution_number, log_dir=attempts_dir)
         if result is None:
             return _error(
-                f"solution_id {solution_id} not found",
+                f"solution_number {solution_number} not found",
                 "NOT_FOUND",
                 status=404,
             )
         result["attempts"] = result["attempts"][:limit]
         return _success(result)
 
-    miner_id = params.get("miner_id")
-    dispatch_id_raw = params.get("dispatch_id")
-    if miner_id and dispatch_id_raw:
-        try:
-            dispatch_id = int(dispatch_id_raw)
-        except ValueError:
-            return _error("dispatch_id must be an integer", "BAD_PARAM")
-        attempts = query_by_dispatch(
-            miner_id, dispatch_id, log_dir=attempts_dir, limit=limit,
-        )
-        return _success({"attempts": attempts})
-
     return _error(
-        "supply either ?solution_id=N or ?miner_id=X&dispatch_id=Y",
+        "supply ?solution_number=N or ?miner_id=X&solution_number=N",
         "BAD_PARAM",
     )
 
@@ -667,14 +665,12 @@ async def _handle_mining_attempts(request: web.Request) -> web.Response:
 async def _handle_mining_solutions(request: web.Request) -> web.Response:
     """GET /api/v1/mining/solutions — list archived top-5 spin configs.
 
-    Query params (exactly one of the first two):
-      - ``solution_id`` (int): resolves to the winning miner's dispatch
-        via ``submissions_index.jsonl``, returns the stored solutions
-        for that (miner, dispatch).
-      - ``dispatch_id`` (int): returns all stored solutions for the
-        dispatch across all miners (or filtered by ``miner_id``).
-      - ``miner_id`` (str, optional with ``dispatch_id``): filters to
-        one miner's stored solutions.
+    Query params:
+      - ``solution_number`` (int; ``solution_id`` accepted as an alias):
+        returns the stored solutions for that solution across all miners
+        (or filtered by ``miner_id``).
+      - ``miner_id`` (str, optional): filters to one miner's stored
+        solutions.
 
     Returns ``{stored: [{iter, nonce_hex, salt_hex, result_kind,
     top_5_solutions_hex, top_5_energies}, ...]}`` sorted by iter.
@@ -692,44 +688,21 @@ async def _handle_mining_solutions(request: web.Request) -> web.Response:
 
     params = request.rel_url.query
     miner_id_filter = params.get("miner_id")
+    sol_raw = params.get("solution_number", params.get("solution_id"))
 
-    if "solution_id" in params:
+    if sol_raw is not None:
         try:
-            solution_id = int(params["solution_id"])
+            solution_number = int(sol_raw)
         except ValueError:
-            return _error("solution_id must be an integer", "BAD_PARAM")
-        resolved = _resolve_solution_id(solution_id, attempts_dir)
-        if resolved is None:
-            return _error(
-                f"solution_id {solution_id} not found",
-                "NOT_FOUND",
-                status=404,
-            )
-        dispatch_id, miner_id = resolved
+            return _error("solution_number must be an integer", "BAD_PARAM")
         stored = query_stored_solutions(
-            dispatch_id, log_dir=attempts_dir, miner_id=miner_id,
+            solution_number, log_dir=attempts_dir, miner_id=miner_id_filter,
         )
-        return _success({
-            "solution_id": solution_id,
-            "dispatch_id": dispatch_id,
-            "miner_id": miner_id,
-            "stored": stored,
-        })
-
-    if "dispatch_id" in params:
-        try:
-            dispatch_id = int(params["dispatch_id"])
-        except ValueError:
-            return _error("dispatch_id must be an integer", "BAD_PARAM")
-        stored = query_stored_solutions(
-            dispatch_id, log_dir=attempts_dir, miner_id=miner_id_filter,
+        return _success(
+            {"solution_number": solution_number, "stored": stored}
         )
-        return _success({"dispatch_id": dispatch_id, "stored": stored})
 
-    return _error(
-        "supply either ?solution_id=N or ?dispatch_id=N",
-        "BAD_PARAM",
-    )
+    return _error("supply ?solution_number=N", "BAD_PARAM")
 
 
 # ----------------------------------------------------------------------

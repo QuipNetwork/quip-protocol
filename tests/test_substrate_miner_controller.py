@@ -102,14 +102,24 @@ def _mining_result() -> MiningResult:
     )
 
 
+# Solution number the test harness seeds for the active round. Submissions
+# for that round land under {SOLN}/submission.json (the on-disk key is the
+# chain-global solution number, not dispatch_id).
+_TEST_SOLUTION_NUMBER = 196
+
+
 def _set_current(controller, ctx) -> None:
-    """Helper: set both `_current_context` and `_current_work_key` so the
-    staleness check in `_handle_result` finds a baseline to compare against.
+    """Helper: set `_current_context`, `_current_work_key`, and the round's
+    solution number so the staleness check in `_handle_result` finds a
+    baseline and submissions resolve the on-disk archive key.
     Phase 4 (storm-prevention) split the work-key check out of the
     context-equality check, so tests must now seed both."""
     from substrate.miner_controller import _work_key
     controller._current_context = ctx
     controller._current_work_key = _work_key(ctx)
+    controller._solution_number_by_work_key[_work_key(ctx)] = (
+        _TEST_SOLUTION_NUMBER
+    )
 
 
 def _bare_controller() -> SubstrateMinerController:
@@ -156,6 +166,10 @@ def _bare_controller() -> SubstrateMinerController:
     c._pow_constants = None
     c._base_difficulty_by_key = {}
     c._anticipatory_fired = set()
+    # Per-round solution-number cache (on-disk archive key). Empty by
+    # default; _set_current seeds it for the active round so submissions
+    # land under the matching {solution_number}/ dir.
+    c._solution_number_by_work_key = {}
     return c
 
 
@@ -891,7 +905,7 @@ class _FakeHandle:
         self.cancel_calls += 1
         self.stop_event.set()
 
-    def mine_work_item(self, context):
+    def mine_work_item(self, context, *, solution_number=None):
         self._next_dispatch_id += 1
         self._active_dispatch_id = self._next_dispatch_id
         self.stop_event.clear()
@@ -1096,7 +1110,7 @@ async def test_handle_result_won_records_chain_block_number(monkeypatch):
 
     # Won path: chain_block_number must be the verify-path's block (77), not 99.
     assert controller.stats.proofs_submitted == 1
-    sub_path = controller._submission_log.log_dir / str(envelope.dispatch_id) / "submission.json"
+    sub_path = controller._submission_log.log_dir / str(_TEST_SOLUTION_NUMBER) / "submission.json"
     record = json.loads(sub_path.read_text())
     assert record["outcome"] == "submitted_inblock"
     assert record["chain_block_number"] == 77, (
@@ -1134,7 +1148,7 @@ async def test_handle_result_not_won_records_pow_sequence(monkeypatch):
     await controller._handle_result(envelope)
 
     assert controller.stats.stale_drops == 1
-    sub_path = controller._submission_log.log_dir / str(envelope.dispatch_id) / "submission.json"
+    sub_path = controller._submission_log.log_dir / str(_TEST_SOLUTION_NUMBER) / "submission.json"
     record = json.loads(sub_path.read_text())
     assert record["outcome"] == "rejected_stale"
     assert record["pow_sequence"] == 55, (
@@ -1172,7 +1186,7 @@ async def test_handle_result_not_won_pow_sequence_none_on_rpc_failure(monkeypatc
     # Must not raise.
     await controller._handle_result(envelope)
 
-    sub_path = controller._submission_log.log_dir / str(envelope.dispatch_id) / "submission.json"
+    sub_path = controller._submission_log.log_dir / str(_TEST_SOLUTION_NUMBER) / "submission.json"
     record = json.loads(sub_path.read_text())
     assert record["outcome"] == "rejected_stale"
     assert record["pow_sequence"] is None, (
@@ -1298,6 +1312,11 @@ def _store_preview_entry(controller, ctx, *, floor: float = -3.0) -> None:
     """Populate `_latest_preview[work_key(ctx)]` directly."""
     from substrate.miner_controller import _work_key
 
+    # Seed the round's solution number so an anticipatory fire's submission
+    # record lands under {_TEST_SOLUTION_NUMBER}/ (the on-disk archive key).
+    controller._solution_number_by_work_key[_work_key(ctx)] = (
+        _TEST_SOLUTION_NUMBER
+    )
     controller._latest_preview[_work_key(ctx)] = {
         "handle_id": "p0",
         "context": ctx,
@@ -1403,7 +1422,7 @@ async def test_anticipatory_fires_at_b_star_minus_one_success(monkeypatch):
     # The submission-log row records the real backend for per-backend
     # dashboard attribution (not "anticipatory").
     import json
-    sub_path = controller._submission_log.log_dir / "1" / "submission.json"
+    sub_path = controller._submission_log.log_dir / str(_TEST_SOLUTION_NUMBER) / "submission.json"
     record = json.loads(sub_path.read_text())
     assert record["outcome"] == "submitted_inblock"
     assert record["miner_type"] == "cpu"
@@ -1450,7 +1469,7 @@ async def test_anticipatory_verify_fail_records_chain_error_and_refires(monkeypa
     assert key not in controller._anticipatory_fired
     assert key in controller._latest_preview
     # A chain_error submission-log row was written (dispatch_id=1 from preview).
-    sub_path = controller._submission_log.log_dir / "1" / "submission.json"
+    sub_path = controller._submission_log.log_dir / str(_TEST_SOLUTION_NUMBER) / "submission.json"
     record = json.loads(sub_path.read_text())
     assert record["outcome"] == "chain_error"
     assert record["num_valid"] == 3
@@ -1523,7 +1542,7 @@ async def test_anticipatory_round_stale_discards_preview(monkeypatch):
     assert key not in controller._anticipatory_fired
     assert controller.stats.stale_drops == 1
     # Audit parity: a rejected_stale row is written (real backend, chain Sol#).
-    sub_path = controller._submission_log.log_dir / "1" / "submission.json"
+    sub_path = controller._submission_log.log_dir / str(_TEST_SOLUTION_NUMBER) / "submission.json"
     record = json.loads(sub_path.read_text())
     assert record["outcome"] == "rejected_stale"
     assert record["miner_type"] == "cpu"

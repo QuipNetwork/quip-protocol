@@ -121,6 +121,38 @@ class NoValidatorReachable(RuntimeError):
         return "\n".join(lines)
 
 
+# Page size for `state_getKeysPaged` storage-key enumeration (e.g. counting
+# `WinningSolutions`). 1000 is the conventional substrate RPC page cap.
+_KEYS_PAGE_SIZE = 1000
+
+
+def _count_map_keys(
+    iface, storage_module: str, storage_function: str,
+    *, page_size: int = _KEYS_PAGE_SIZE,
+) -> int:
+    """Count the keys of a storage map via ``state_getKeysPaged``.
+
+    Enumerates *keys only* under the map's storage prefix (cheap — no value
+    decode), paging until a short/empty page. Synchronous; callers wrap it
+    in ``_run``. Returns ``0`` for an empty map.
+    """
+    prefix = iface.generate_storage_hash(
+        storage_module=storage_module, storage_function=storage_function,
+    )
+    total = 0
+    start = None
+    while True:
+        page = iface.rpc_request("state_getKeysPaged", [prefix, page_size, start])
+        keys = page.get("result") or []
+        if not keys:
+            break
+        total += len(keys)
+        if len(keys) < page_size:
+            break
+        start = keys[-1]
+    return total
+
+
 class SubstrateClient:
     """Async-friendly wrapper over a substrate websocket with failover.
 
@@ -542,25 +574,6 @@ class SubstrateClient:
             )
         return difficulty
 
-    async def query_last_proof_block_number(self) -> int:
-        """Return the ``QuantumPow.LastProofBlock`` storage value.
-
-        The block number — not the hash — of the most recent winning
-        proof. Genesis sentinel is ``0`` (no proof has ever won).
-
-        The number is the second of the two "time" inputs to local
-        decay computation (the other being ``epoch_length``). Unlike
-        ``Difficulty``, this updates on every winning proof, so the
-        controller re-reads it whenever ``last_proof_block_hash``
-        changes in a fresh snapshot.
-        """
-        result = await self._run(
-            lambda: self._iface.query("QuantumPow", "LastProofBlock")
-        )
-        if result is None or result.value is None:
-            return 0
-        return int(result.value)
-
     async def query_pow_constants(self) -> PowConstants:
         """Read the four ``pallet_quantum_pow`` constants needed for decay.
 
@@ -639,6 +652,25 @@ class SubstrateClient:
         if result is None or not _result_was_found(result) or result.value is None:
             return None
         return int(result.value)
+
+    async def query_winning_solution_count(self) -> int:
+        """Return the number of recorded ``QuantumPow.WinningSolutions``.
+
+        The chain stores no solution counter — solutions are keyed in the
+        ``WinningSolutions`` map by the block number they won at. The ordinal
+        *solution number* is therefore the count of that map's keys, and the
+        solution currently being mined is ``count + 1`` (computed by the
+        controller, cached per round). Enumerates *keys only* via
+        ``state_getKeysPaged`` over the storage prefix — one cheap RPC per
+        ``KEYS_PAGE_SIZE`` keys, not a full value scan. Returns ``0`` on a
+        fresh chain with no winners yet.
+        """
+
+        return await self._run(
+            lambda: _count_map_keys(
+                self._iface, "QuantumPow", "WinningSolutions",
+            )
+        )
 
     async def query_balance(self, account: bytes) -> int:
         if len(account) != 32:
