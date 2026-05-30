@@ -237,6 +237,22 @@ class PersistentStreamContext:
             model, future, defect_info, _, submit_gen = self._pending.pop(
                 completed_id,
             )
+            # Throughput diagnostic (restored from the legacy
+            # sample_ising_streaming path): periodically log the in-flight
+            # depth + feeder state so operators can tell a D-Wave-bound stream
+            # (in_flight stays near queue_depth) from a driver/feeder stall
+            # (in_flight collapses). Logger falls back to the module logger so
+            # the no-QPU context tests (fake miner without .logger) don't break.
+            if self._job_index % 50 == 0 and self._feeder is not None:
+                fstats = self._feeder.stats()
+                logger = getattr(self._miner, "logger", init_logger)
+                logger.info(
+                    "[QPU] stream depth: in_flight=%d/%d feeder_ready=%d/%d "
+                    "drained=%d wait_total=%.2fs",
+                    len(self._pending), self._queue_depth,
+                    fstats["ready"], fstats["buffer_size"],
+                    fstats["drained_count"], fstats["pop_wait_total_s"],
+                )
             sampleset = self._gate_sampleset(future.sampleset, defect_info)
             yield model, sampleset, submit_gen
 
