@@ -11,6 +11,7 @@ the descriptor queue; the sample matrix is written zero-copy into the ring.
 from __future__ import annotations
 
 import importlib
+import inspect
 from typing import Any, Dict
 
 import numpy as np
@@ -21,6 +22,18 @@ from shared.shared_sample_ring import SharedSampleRing
 def _resolve(dotted: str):
     module_name, _, attr = dotted.partition(":")
     return getattr(importlib.import_module(module_name), attr)
+
+
+def _maybe_with_stop(fn, kwargs: Dict[str, Any], stop_event) -> Dict[str, Any]:
+    """Add ``stop_event`` to ``kwargs`` only if ``fn`` accepts that kwarg.
+
+    The production factory consumes ``stop_event`` so its streaming loop can
+    observe cancellation; test fakes don't declare it. Inspecting the
+    signature keeps both callers working without a dual code path.
+    """
+    if "stop_event" in inspect.signature(fn).parameters:
+        return {**kwargs, "stop_event": stop_event}
+    return kwargs
 
 
 def _extract_qpu_us(sampleset) -> int:
@@ -41,7 +54,11 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, stop_event,
     """
     ring = SharedSampleRing(**ring_args)
     make_stream = _resolve(stream_factory_dotted)
-    stream = make_stream(**factory_kwargs)
+    result = make_stream(**_maybe_with_stop(make_stream, factory_kwargs, stop_event))
+    if isinstance(result, tuple):
+        stream, cleanup = result
+    else:
+        stream, cleanup = result, (lambda: None)
     dropped = 0
     try:
         for model, sampleset in stream:
@@ -63,5 +80,8 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, stop_event,
                 ring.release(slot)
                 dropped += 1
     finally:
-        desc_q.put(None)
-        ring.close_unlink()
+        try:
+            cleanup()
+        finally:
+            desc_q.put(None)
+            ring.close_unlink()

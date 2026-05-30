@@ -67,6 +67,32 @@ class _PumpedResult:
     qpu_access_time_us: Optional[int]
 
 
+class _SharedRecord:
+    """record-like facade exposing ``.sample`` / ``.energy`` ndarrays."""
+
+    __slots__ = ("sample", "energy")
+
+    def __init__(self, sample, energy):
+        self.sample = sample
+        self.energy = energy
+
+
+class _SharedSampleSet:
+    """Minimal sampleset facade over zero-copy shared-ring views.
+
+    ``evaluate_sampleset`` / ``compute_solution_meta`` only read
+    ``record.sample`` and ``record.energy``; QPU timing is carried
+    out-of-band in the descriptor, so ``.info`` is an empty dict on this
+    path.
+    """
+
+    __slots__ = ("record", "info")
+
+    def __init__(self, sample, energy):
+        self.record = _SharedRecord(sample, energy)
+        self.info: Dict[str, Any] = {}
+
+
 # Sentinel pushed by the pump when the stream is exhausted so the
 # consumer's blocking get() unblocks and the loop can exit. Module-level
 # (not a class attribute) so subclasses can't accidentally shadow it and

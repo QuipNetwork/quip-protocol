@@ -67,6 +67,89 @@ def _shift_energies(sampleset: dimod.SampleSet, offset: float) -> dimod.SampleSe
     )
 
 
+def build_production_stream(
+    *,
+    miner_id: str,
+    num_reads: int,
+    annealing_time: float,
+    queue_depth: int,
+    energy_threshold: float,
+    nodes: List[int],
+    edges: List[Tuple[int, int]],
+    last_proof_block_hash: bytes,
+    miner_bytes: bytes,
+    feeder_buffer_size: int,
+    solver_name: Optional[str] = None,
+    region: Optional[str] = None,
+    token: Optional[str] = None,
+    stop_event: Optional[multiprocessing.synchronize.Event] = None,
+) -> Tuple[Iterator[Tuple[IsingModel, dimod.SampleSet]], Any]:
+    """Build the production QPU stream inside the stream-driver process.
+
+    Constructs a :class:`DWaveMiner` (its own D-Wave client), a
+    :class:`RandomIsingFeeder`, and returns ``(stream, cleanup)`` where
+    ``stream`` is the iterator from
+    :meth:`DWaveMiner.sample_ising_streaming` and ``cleanup()`` stops the
+    feeder and closes the sampler. Runs ONLY in the stream-driver process;
+    it is never instantiated in tests because it connects to D-Wave.
+
+    Args:
+        miner_id: Unique identifier for this miner.
+        num_reads: QPU reads per submission.
+        annealing_time: Annealing time in microseconds.
+        queue_depth: Number of concurrent in-flight QPU jobs.
+        energy_threshold: Current difficulty energy gate.
+        nodes: Topology node list (must match the configured solver).
+        edges: Topology edge list.
+        last_proof_block_hash: 32-byte ``block_hash(LastProofBlock)`` seed.
+        miner_bytes: Canonical 32-byte miner identity.
+        feeder_buffer_size: Target ready + in-flight feeder depth.
+        solver_name: Optional D-Wave solver name.
+        region: Optional D-Wave region.
+        token: Optional D-Wave API token (passed through verbatim).
+        stop_event: Optional event the streaming loop polls for cancellation.
+
+    Returns:
+        Tuple of ``(stream, cleanup)``.
+    """
+    miner = DWaveMiner(
+        miner_id=miner_id,
+        queue_depth=queue_depth,
+        solver_name=solver_name,
+        region=region,
+        token=token,
+    )
+    feeder = RandomIsingFeeder(
+        last_proof_block_hash=last_proof_block_hash,
+        miner_bytes=miner_bytes,
+        nodes=nodes,
+        edges=edges,
+        buffer_size=feeder_buffer_size,
+    )
+    if stop_event is not None:
+        miner._stop_event = stop_event
+    stream = miner.sample_ising_streaming(
+        feeder,
+        num_reads=num_reads,
+        annealing_time=annealing_time,
+        queue_depth=queue_depth,
+        energy_threshold=energy_threshold,
+    )
+
+    def cleanup() -> None:
+        try:
+            feeder.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if hasattr(miner, "sampler") and hasattr(miner.sampler, "close"):
+                miner.sampler.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    return stream, cleanup
+
+
 # Default interval between repeated pacing log lines (seconds).
 _PACING_LOG_INTERVAL = 60.0
 
