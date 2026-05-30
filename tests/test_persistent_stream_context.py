@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 
+import dimod
 import numpy as np
 
 from QPU.dwave_miner import PersistentStreamContext, _should_reconstruct
@@ -128,6 +129,115 @@ def test_context_threshold_command_does_not_bump_generation():
         ctx.apply_command(("threshold", 5, -14800_000))
         assert ctx.generation == 5
         assert ctx._energy_threshold_milli == -14800_000
+    finally:
+        stop.set()
+        ctx.cleanup()
+
+
+def test_threshold_command_leaves_feeder_and_pending_untouched():
+    """A 'threshold' update must NOT reseed the feeder or cancel in-flight work.
+
+    Decay (rule 1) is a gate-only update: it changes what the driver
+    reconstructs but leaves the feeder object and every in-flight submission
+    in place. A switch (rule: head change) is the only thing that may rebuild
+    the feeder / clear ``_pending``. This pins that a threshold command is a
+    pure no-op against both.
+    """
+    stop = mp.get_context("spawn").Event()
+    ctx = _make_ctx(stop)
+    try:
+        ctx.apply_command(
+            ("switch", 3, b"\x01" * 32, b"\x02" * 32, -14900_000, 4, 80.0)
+        )
+        # Populate _pending with a real in-flight submission (the fake future
+        # is already 'done', but it stays in _pending until iter_results pops
+        # it — we never iterate here, so it persists for the assertion).
+        ctx._submit_one()
+        feeder_before = ctx._feeder
+        pending_before = dict(ctx._pending)
+        assert pending_before, "expected one in-flight submission"
+
+        ctx.apply_command(("threshold", 3, -14800_000))
+
+        assert ctx._feeder is feeder_before  # same object, no reseed/re-fork
+        assert ctx._pending == pending_before  # no cancel, in-flight intact
+        assert ctx.generation == 3  # no generation bump
+        assert ctx._energy_threshold_milli == -14800_000  # gate did move
+    finally:
+        stop.set()
+        ctx.cleanup()
+
+
+class _GatingSampler(_FakeSampler):
+    """Sampler whose results carry a defect so the reconstruction gate runs."""
+
+    def __init__(self, best_energy):
+        super().__init__()
+        self._best = best_energy
+        self.reconstructed_calls = 0
+
+    def sample_ising_async(
+        self,
+        h,
+        J,
+        *,
+        num_reads,
+        answer_mode,
+        annealing_time,
+        label,
+        nonce_seed,
+    ):
+        # Build a real dimod SampleSet: the non-reconstruct branch of the gate
+        # runs ``_shift_energies`` which needs a recarray-backed sampleset
+        # (record.shape/dtype, variables, vartype). A bare stub object would
+        # raise AttributeError there before the loosened threshold could be
+        # exercised. (Plan-test correction.)
+        ss = dimod.SampleSet.from_samples(
+            (np.ones((num_reads, 3), np.int8), [0, 1, 2]),
+            vartype="SPIN",
+            energy=np.full(num_reads, self._best, np.float64),
+        )
+        fut = type("F", (), {})()
+        fut.sampleset = ss
+        fut.done = lambda: True
+        fut.cancel = lambda: None
+        defect = type("D", (), {})()
+        defect.energy_offset = 0.0
+        return fut, defect
+
+    def reconstruct_full_sampleset(self, raw_ss, defect_info):
+        self.reconstructed_calls += 1
+        raw_ss.reconstructed = True
+        return raw_ss
+
+
+def test_driver_gate_reconstructs_after_loosening_threshold():
+    """A sampleset raw at a strict threshold reconstructs once it loosens."""
+    stop = mp.get_context("spawn").Event()
+    miner = _FakeMiner()
+    miner.sampler = _GatingSampler(best_energy=-14850.0)  # approx -14850
+    ctx = PersistentStreamContext(
+        miner=miner,
+        nodes=[0, 1, 2],
+        edges=[(0, 1), (1, 2)],
+        feeder_buffer_size=4,
+        num_reads=4,
+        annealing_time=80.0,
+        energy_threshold_milli=-14900_000,  # strict: -14850 not below -14900
+        precheck_margin_milli=0,
+        queue_depth=1,
+        stop_event=stop,
+    )
+    try:
+        ctx.apply_command(
+            ("switch", 1, b"\x01" * 32, b"\x02" * 32, -14900_000, 4, 80.0)
+        )
+        results = ctx.iter_results()
+        _m, ss, _g = next(results)
+        assert getattr(ss, "reconstructed", False) is False  # raw under strict
+        ctx.apply_command(("threshold", 1, -14800_000))  # loosen past -14850
+        _m, ss2, _g = next(results)
+        assert ss2.reconstructed is True  # now reconstructed full-width
     finally:
         stop.set()
         ctx.cleanup()

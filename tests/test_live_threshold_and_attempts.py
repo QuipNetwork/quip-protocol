@@ -28,6 +28,27 @@ from shared.mining_attempt_log import (
 )
 
 
+def _make_attempt_logger(miner):
+    from shared.mining_attempt_log import AttemptLogger
+    log = AttemptLogger(miner.miner_id, miner_type=miner.miner_type)
+    miner._attempt_logger = log
+    return log
+
+
+def _make_solution_store(miner):
+    from shared.mining_attempt_log import SolutionStore
+    store = SolutionStore(miner.miner_id)
+    miner._solution_store = store
+    return store
+
+
+def _energy_sampleset(energy):
+    import numpy as np
+    from shared.base_miner import _SharedSampleSet
+    rows = len(energy)
+    return _SharedSampleSet(np.ones((rows, 3), np.int8), energy.astype(np.float64))
+
+
 def test_default_log_dir_env_precedence(monkeypatch, tmp_path: Path) -> None:
     """The attempts root must follow the Docker data volume.
 
@@ -537,3 +558,65 @@ def test_metadata_logger_final_flush_writes_pending(tmp_path):
     assert path.exists()
     import json as _json
     assert _json.loads(path.read_text())["n_attempts"] == 3
+
+
+def test_decay_within_generation_preserves_stash(monkeypatch):
+    """A live-threshold decay (same generation) must NOT clear top_k.
+
+    Conversely, a new dispatch (new generation) starts a fresh stash. This
+    guards rule 1 of the decay contract under the persistent-driver model.
+    """
+    import numpy as np
+    from shared.base_miner import _MiningLoopState
+    from shared.miner_types import BlockRequirements, MiningResult
+    from tests.test_base_miner_pump import _DriverMiner
+
+    miner = _DriverMiner()
+    # A live-threshold shared value the ratchet reads.
+    import multiprocessing as mp
+    miner._live_max_energy_milli = mp.Value("q", -14000_000)
+    # ctl_q absent -> threshold forwarding is a no-op (unit isolation).
+    miner._ctl_q = None
+
+    req = BlockRequirements(
+        difficulty_energy=-14000.0, min_diversity=0.0, min_solutions=1,
+        timeout_to_difficulty_adjustment_decay=10 ** 9,
+    )
+    state = _MiningLoopState(
+        requirements=req, nodes=[0, 1, 2], edges=[(0, 1), (1, 2)],
+        prev_timestamp=0, start_time=0.0, solution_number_for_log=0,
+        dispatch_id_for_log=0, attempt_log=miner._attempt_logger
+        if hasattr(miner, "_attempt_logger") else _make_attempt_logger(miner),
+        solution_store=_make_solution_store(miner),
+        live_threshold_var=miner._live_max_energy_milli,
+        top_k_cap=5, top_k=[], previewed_floor_milli=1 << 62, generation=1,
+    )
+
+    # Force evaluate_sampleset to stash one candidate (floor -14500).
+    cand = MiningResult(
+        miner_id=miner.miner_id, miner_type="QPU", nonce=b"\x01" * 32,
+        salt=b"\x02" * 32, timestamp=0, prev_timestamp=0,
+        solutions=[[1, -1, 1]], energy=-14600.0, diversity=1.0, num_valid=1,
+        mining_time=0, node_list=[0, 1, 2], edge_list=[(0, 1), (1, 2)],
+        submit_floor_energy=-14500.0,
+    )
+    monkeypatch.setattr(miner, "evaluate_sampleset",
+                        lambda *a, **k: cand)
+
+    ss = _energy_sampleset(np.full(4, -14600.0))  # within margin of -14000
+    logkw = {}
+    miner._run_substrate_ratchet(state, ss, b"\x01" * 32, b"\x02" * 32, 0.0,
+                                 preview_cb=None, attempt_log_kwargs=logkw)
+    assert len(state.top_k) == 1  # stashed
+
+    # Decay the live threshold (same generation) — stash must persist.
+    with miner._live_max_energy_milli.get_lock():
+        miner._live_max_energy_milli.value = -14550_000
+    logkw2 = {}
+    # A worse-energy iter that won't displace the stash; the point is that the
+    # decay did not clear it.
+    ss2 = _energy_sampleset(np.full(4, -14100.0))
+    monkeypatch.setattr(miner, "evaluate_sampleset", lambda *a, **k: None)
+    miner._run_substrate_ratchet(state, ss2, b"\x03" * 32, b"\x04" * 32, 0.0,
+                                 preview_cb=None, attempt_log_kwargs=logkw2)
+    assert len(state.top_k) == 1, "decay within a generation cleared the stash"

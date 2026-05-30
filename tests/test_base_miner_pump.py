@@ -22,6 +22,7 @@ from shared.base_miner import (
     _ACQUIRE_STOP,
     _SharedSampleSet,
 )
+from shared.miner_types import MiningResult
 from shared.proc_util import terminate_join
 from shared.shared_sample_ring import SharedSampleRing
 from substrate.types import SubstrateDifficulty, SubstrateMiningContext
@@ -363,3 +364,181 @@ def test_mine_work_item_stops_promptly_on_stop_event():
         assert miner._driver_proc is not None and miner._driver_proc.is_alive()
     finally:
         miner._close_driver()
+
+
+# ----------------------------------------------------------------------
+# Headline regression: lookahead -> decay -> aggressive submit (end-to-end)
+# ----------------------------------------------------------------------
+
+
+class _DecayCandidateMiner(_DriverMiner):
+    """Driver-path miner whose stream candidate clears only a looser decay.
+
+    ``evaluate_sampleset`` returns a fixed stashed candidate (floor -14500)
+    whenever it receives a sampleset — modelling 'the worker can fully
+    evaluate the reconstructed candidate'. The submit gate (live threshold)
+    decides whether it actually submits.
+    """
+
+    def __init__(self):
+        super().__init__(factory=_FAKE_CTX)  # infinite fake stream
+
+    def evaluate_sampleset(self, sampleset, requirements, nodes, edges,
+                           nonce, salt, *args, **kwargs):
+        return MiningResult(
+            miner_id=self.miner_id, miner_type=self.miner_type,
+            nonce=bytes(nonce) if not isinstance(nonce, bytes) else nonce,
+            salt=salt, timestamp=0, prev_timestamp=0,
+            solutions=[[1, -1, 1]], energy=-14600.0, diversity=1.0,
+            num_valid=1, mining_time=0, node_list=list(nodes),
+            edge_list=list(edges), submit_floor_energy=-14500.0,
+        )
+
+
+def test_aggressive_submit_on_decay_end_to_end():
+    """HEADLINE GUARD: lookahead → decay → aggressive submit survives the
+    persistent multiprocessing model.
+
+    The candidate clears a future, looser decay level (floor -14500) but not
+    the strict initial live threshold (-14800). Asserts, in order:
+      1. Under the strict threshold it is stashed, not submitted (the dispatch
+         keeps running) and preview_cb fired (anticipatory path).
+      2. Decaying the live threshold past the floor — with NO head change —
+         makes mine_work_item return that exact candidate.
+      3. Throughout, the driver pid is unchanged and the generation did not
+         bump (decay stayed within one round); decay was forwarded as a
+         'threshold' command, never a second 'switch'.
+    """
+    import threading
+    import time as _t
+
+    ctx = _streaming_context()
+    miner = _DecayCandidateMiner()
+    # Strict live threshold the candidate's floor (-14500) does NOT clear.
+    miner._live_max_energy_milli = mp.Value("q", -14800_000)
+
+    previews: list = []
+    result_box: list = []
+
+    # Spy on ctl_q puts to prove decay is a threshold update, not a switch.
+    sent: list = []
+
+    orig_ensure = miner._ensure_driver
+
+    def _ensure_spy(sample_ctx):
+        ready = orig_ensure(sample_ctx)
+        if ready and miner._ctl_q is not None and not getattr(
+            miner._ctl_q, "_quip_spied", False,
+        ):
+            real_put = miner._ctl_q.put
+
+            def _put(item, *a, **k):
+                sent.append(item[0] if isinstance(item, tuple) else item)
+                return real_put(item, *a, **k)
+
+            miner._ctl_q.put = _put
+            miner._ctl_q._quip_spied = True
+        return ready
+
+    miner._ensure_driver = _ensure_spy
+
+    stop = mp.Event()
+
+    def _run():
+        result_box.append(
+            miner.mine_work_item(ctx, stop, preview_cb=previews.append),
+        )
+
+    t = threading.Thread(target=_run, name="decay-mine")
+    t.start()
+    try:
+        # Phase 1: candidate stashed + previewed, but NOT submitted (strict).
+        deadline = _t.monotonic() + 10.0
+        while not previews and _t.monotonic() < deadline:
+            _t.sleep(0.02)
+        assert previews, "candidate was never previewed (lookahead broken)"
+        assert not result_box, "submitted under the strict threshold (rule 1 broke)"
+        gen_at_stash = miner._generation
+        pid = miner._driver_proc.pid
+
+        # Phase 2: decay past the floor with NO head change -> submit fires.
+        with miner._live_max_energy_milli.get_lock():
+            miner._live_max_energy_milli.value = -14400_000
+        t.join(timeout=15.0)
+        assert not t.is_alive(), "submit gate did not fire on decay (rule 3)"
+        result = result_box[0]
+        assert result is not None
+        assert result.submit_floor_energy == -14500.0
+
+        # Phase 3: same generation, same driver pid; decay was a 'threshold'.
+        assert miner._generation == gen_at_stash
+        assert miner._driver_proc.pid == pid
+        assert sent.count("switch") == 1, "decay caused a spurious round switch"
+        assert "threshold" in sent, "decay was not forwarded to the driver gate"
+    finally:
+        stop.set()
+        t.join(timeout=15.0)
+        miner._close_driver()
+
+
+# ----------------------------------------------------------------------
+# Teardown semantics against the persistent model
+# ----------------------------------------------------------------------
+
+
+class _WinningMiner(_DriverMiner):
+    """First evaluated sampleset is a winner (exercises win early-return)."""
+
+    def __init__(self):
+        super().__init__(factory=_FAKE_CTX)
+
+    def evaluate_sampleset(self, sampleset, requirements, nodes, edges,
+                           nonce, salt, *args, **kwargs):
+        return MiningResult(
+            miner_id=self.miner_id, miner_type=self.miner_type,
+            nonce=bytes(nonce) if not isinstance(nonce, bytes) else nonce,
+            salt=salt, timestamp=0, prev_timestamp=0,
+            solutions=[[1, -1, 1]], energy=-15000.0, diversity=1.0,
+            num_valid=1, mining_time=0, node_list=list(nodes),
+            edge_list=list(edges), submit_floor_energy=-15000.0,
+        )
+
+
+def test_win_then_close_no_buffererror():
+    """A win returns cleanly with the driver still alive; close() unlinks."""
+    ctx = _streaming_context()
+    miner = _WinningMiner()
+    stop = mp.Event()
+    try:
+        result = miner.mine_work_item(ctx, stop)
+        assert result is not None and result.energy == -15000.0
+        # Driver + ring persist after a win (not torn down per-dispatch).
+        assert miner._driver_proc is not None and miner._driver_proc.is_alive()
+        assert miner._ring is not None
+    finally:
+        miner._close_driver()  # must not raise BufferError
+    assert miner._ring is None
+    assert miner._driver_proc is None
+
+
+def test_close_driver_reaps_and_unlinks():
+    """_close_driver reaps the process and unlinks the ring with no leak."""
+    ctx = _streaming_context()
+    miner = _DriverMiner()
+    stop = mp.Event()
+    import threading
+    import time as _t
+    t = threading.Thread(target=lambda: miner.mine_work_item(ctx, stop))
+    t.start()
+    _t.sleep(0.4)
+    names = list(miner._ring.names)
+    stop.set()
+    t.join(timeout=15.0)
+    miner._close_driver()
+    assert miner._driver_proc is None
+    assert miner._ring is None
+    # Segments are unlinked: re-attaching by name must fail.
+    import pytest
+    from multiprocessing import shared_memory
+    with pytest.raises(FileNotFoundError):
+        shared_memory.SharedMemory(name=names[0])
